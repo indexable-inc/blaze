@@ -241,7 +241,9 @@ fn soft(cx: &Cx<'_, '_>, features: &Features, spans: &pre::Spans) -> Stash {
             }
         }
     }
-    for gated in &spans[Pre::MinSpecialization as usize] {
+    // `default fn` under `#![blaze::specialization]` needs neither feature.
+    let blaze = hir_ty::specialization_mode(cx.db, cx.krate.base()) == hir_ty::SpecializationMode::Blaze;
+    for gated in spans[Pre::MinSpecialization as usize].iter().filter(|_| !blaze) {
         if is_gated(cx, features, "specialization", gated.at) && is_gated(cx, features, "min_specialization", gated.at) {
             warn(&mut stash, "specialization", gated, "specialization is experimental");
         }

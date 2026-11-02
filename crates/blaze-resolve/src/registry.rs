@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use crate::dependency::Dependency;
 use crate::interning::InternedString;
@@ -116,7 +117,7 @@ pub trait Registry {
 /// A registry held in memory: the resolver's tests, and sources already read.
 #[derive(Default, Debug, Clone)]
 pub struct MemRegistry {
-    packages: HashMap<InternedString, Vec<IndexSummary>>,
+    packages: HashMap<InternedString, Vec<IndexSummary>, Global>,
 }
 
 impl MemRegistry {

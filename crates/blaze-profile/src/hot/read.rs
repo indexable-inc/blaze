@@ -5,6 +5,7 @@ use std::sync::{Arc, atomic::AtomicU64};
 
 use blaze_graph::wait::WaitKind;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use parking_lot::Mutex;
 
 use super::{CountMin, Counters, DdSketch, PartRef, Quantile, Shared, record};
@@ -84,7 +85,7 @@ struct Summed {
     count_min: CountMin,
     waits: Vec<DdSketch>,
     /// Each ring's listed keys and their exact ticks, by ring number.
-    listed: HashMap<(u16, u64), u64>,
+    listed: HashMap<(u16, u64), u64, Global>,
     torn: u64,
 }
 
@@ -95,7 +96,7 @@ impl Summed {
             count_min: CountMin::new(),
             // alloc: a read's sum, once a read
             waits: (0..record::KINDS).map(|_| DdSketch::new()).collect(),
-            listed: HashMap::default(),
+            listed: HashMap::new_in(Global),
             torn: 0,
         }
     }
@@ -185,13 +186,13 @@ fn copy(summed: &Summed) -> Summed {
 
 fn hot(summed: &Summed, top: usize, since: Since) -> Hot {
     let scale = clock::Scale::now();
-    let mut lower: HashMap<u64, u64> = HashMap::default();
+    let mut lower: HashMap<u64, u64, Global> = HashMap::new_in(Global);
     for (&(_, key), exact) in &summed.listed {
         let it = lower.entry(key).or_default();
         *it = it.saturating_add(*exact);
     }
     // Keys whose names are one (a name given a new number in a later generation) are summed.
-    let mut named: HashMap<(&'static str, Function), (u64, u64)> = HashMap::default();
+    let mut named: HashMap<(&'static str, Function), (u64, u64), Global> = HashMap::new_in(Global);
     for (key, lower) in lower {
         let (site, function) = record::of(key);
         let Some(meta) = flight::meta(site) else { continue };

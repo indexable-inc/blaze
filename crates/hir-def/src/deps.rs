@@ -36,10 +36,11 @@ use std::sync::Arc;
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 pub use crate::deps::signatures::{BODY_KEY_DOMAIN, IdKind, PortableId, PortableIds, body_key};
 pub use crate::deps::{
-    filed::{checked_reads, file_by_reads, find_by_reads},
+    filed::{checked_reads, closure_expansion_reads, file_by_reads, find_by_reads, outside_reads},
     image::{Held, IMAGE_SCHEMA, ImageBuf, ImageError, ImageRef, Part, PartBytes, write_image},
     key::{KEY_DOMAIN, KeyInputs, PRODUCER, absolute, eligible, key_inputs, keys},
     reads::{READS_DOMAIN, Reads, SLOTS, image_key, slot},
@@ -115,7 +116,7 @@ impl std::fmt::Debug for Image {
 #[blaze_query::input(singleton, debug)]
 pub struct DepImages {
     #[returns(ref)]
-    pub images: Arc<HashMap<Crate, Image>>,
+    pub images: Arc<HashMap<Crate, Image, Global>>,
 }
 
 /// The image `krate` is read from, if it is: what every reader of one crate's image goes

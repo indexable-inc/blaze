@@ -650,7 +650,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 ));
             }
         };
-        if !ptr.to_usize().is_multiple_of(align) {
+        if !ptr.to_usize(self.cached_ptr_size).is_multiple_of(align) {
             // alloc: error path
             return Err(MirEvalError::UndefinedBehavior(format!(
                 "`{intrinsic}` of a pointer that is not aligned to {align} bytes"
@@ -838,7 +838,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     if M::CHECKS {
                         self.machine.expose(self.ptr(ptr))?;
                     }
-                    result.extend_from_slice(&ptr.to_bytes());
+                    result.extend_from_slice(&ptr.to_bytes(self.cached_ptr_size));
                 }
                 destination.write_from_bytes(self, &result)
             }
@@ -852,8 +852,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let mut shadow = M::Shadow::default();
                 if M::CHECKS {
                     for i in 0..len {
-                        let addr = Address::from_bytes(&bytes[i * size..(i + 1) * size])?;
-                        let prov = self.machine.from_exposed(addr.to_usize() as u64);
+                        let addr = Address::from_bytes(&bytes[i * size..(i + 1) * size], self.cached_ptr_size)?;
+                        let prov = self.machine.from_exposed(addr.to_usize(self.cached_ptr_size) as u64);
                         shadow.put(i * size, &M::Shadow::pointer(size, prov));
                     }
                 }

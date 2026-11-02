@@ -8,6 +8,7 @@ use std::fmt;
 use std::path::Path;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use serde::Deserialize;
 use serde_untagged::UntaggedEnumVisitor;
 
@@ -271,7 +272,7 @@ impl EnvConfigValue {
     }
 }
 
-pub type EnvConfig = HashMap<String, EnvConfigValue>;
+pub type EnvConfig = HashMap<String, EnvConfigValue, Global>;
 
 /// A token or key, which `Debug` does not show.
 #[derive(Clone, Deserialize)]

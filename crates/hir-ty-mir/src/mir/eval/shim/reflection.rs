@@ -3,15 +3,18 @@
 //! nightly (`rustc_const_eval`'s `const_eval/machine.rs`, `const_eval/type_info.rs`,
 //! `const_eval/type_info/adt.rs` and `const_eval/dyn_trait.rs`): a value of one of core's
 //! `type_info` types is written field by field, by the names rustc writes, and a field or variant
-//! rustc does not know is refused rather than guessed. A field's id stands for the field, as
-//! rustc's field representing type does.
+//! rustc does not know is refused rather than guessed. A field's id is its field representing
+//! type's (`FieldRepresentingType<Base, VARIANT, FIELD>`), as in rustc.
 
 use hir_ty::db::HirDatabase;
 use hir_def::{AttrDefId, EnumVariantId};
 
 use crate::mir::eval::word_bytes;
+use rustc_type_ir::inherent::AdtDef as _;
+
 use crate::next_solver::{
-    Binder, BoundExistentialPredicates, ExistentialPredicate, TypingMode,
+    Binder, BoundExistentialPredicates, Const, DbInterner, ExistentialPredicate, FnSigKind,
+    ScalarInt, TypingMode, ValTree, ValTreeKind,
     infer::{
         DbInternerInferExt,
         traits::{Obligation, ObligationCause},
@@ -69,7 +72,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     },
                     _ => 0,
                 };
-                destination.write_from_bytes(self, &word_bytes(len))?;
+                destination.write_from_bytes(self, &word_bytes(len, self.cached_ptr_size))?;
             }
             Intrinsic::TypeIdElementTy | Intrinsic::TypeIdPointsTo => {
                 let [id] = args else { not_supported!("{intrinsic} args") };
@@ -100,7 +103,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Intrinsic::TypeIdSizeOf => {
                 let [id] = args else { not_supported!("type_id_size_of args") };
                 let ty = self.type_id_of(id)?;
-                let size = self.size_align_of(ty, locals)?.map(|(size, _)| word_bytes(size));
+                let size = self.size_align_of(ty, locals)?.map(|(size, _)| word_bytes(size, self.cached_ptr_size));
                 let usize = Ty::new_uint(self.interner(), rustc_type_ir::UintTy::Usize);
                 self.write_option(destination, usize, size, locals)?;
             }
@@ -108,12 +111,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let [id] = args else { not_supported!("type_id_variants args") };
                 let ty = self.type_id_of(id)?;
                 let variants = self.reflected_variants(ty)?;
-                destination.write_from_bytes(self, &word_bytes(variants))?;
+                destination.write_from_bytes(self, &word_bytes(variants, self.cached_ptr_size))?;
             }
             Intrinsic::TypeIdVariantName => {
                 let [id, variant] = args else { not_supported!("type_id_variant_name args") };
                 let ty = self.type_id_of(id)?;
-                let variant = from_bytes!(usize, self.read_scalar(variant.interval)?);
+                let variant = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(variant.interval)?);
                 let TyKind::Adt(adt, _) = ty.kind() else {
                     // rustc's `span_bug!`.
                     not_supported!("type_id_variant_name of {ty:?}, which is not an ADT")
@@ -134,7 +137,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     not_supported!("type_id_variant_non_exhaustive args")
                 };
                 let ty = self.type_id_of(id)?;
-                let variant = from_bytes!(usize, self.read_scalar(variant.interval)?);
+                let variant = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(variant.interval)?);
                 let TyKind::Adt(adt, _) = ty.kind() else {
                     // rustc's `span_bug!`.
                     not_supported!("type_id_variant_non_exhaustive of {ty:?}, which is not an ADT")
@@ -163,17 +166,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Intrinsic::TypeIdFields => {
                 let [id, variant] = args else { not_supported!("type_id_fields args") };
                 let ty = self.type_id_of(id)?;
-                let variant = from_bytes!(usize, self.read_scalar(variant.interval)?);
+                let variant = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(variant.interval)?);
                 let fields = self.reflected_fields(ty, variant)?;
-                destination.write_from_bytes(self, &word_bytes(fields.len()))?;
+                destination.write_from_bytes(self, &word_bytes(fields.len(), self.cached_ptr_size))?;
             }
             Intrinsic::TypeIdFieldRepresentingType => {
                 let [id, variant, field] = args else {
                     not_supported!("type_id_field_representing_type args")
                 };
                 let base = self.type_id_of(id)?;
-                let variant = from_bytes!(usize, self.read_scalar(variant.interval)?);
-                let field = from_bytes!(usize, self.read_scalar(field.interval)?);
+                let variant = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(variant.interval)?);
+                let field = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(field.interval)?);
                 let fields = self.reflected_fields(base, variant)?.len();
                 if field >= fields {
                     // alloc: error path
@@ -181,30 +184,34 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "field {field} of a variant with {fields}"
                     )));
                 }
-                let id = self.type_id(TypeIdOf::Field { base, variant, field });
+                // rustc's id of a field is its field representing type's, so it equals
+                // `TypeId::of::<field_of!(..)>()` and is a real type's id at run time.
+                let frt = self.field_representing_type(base, variant, field)?;
+                let id = self.type_id(frt);
                 destination.write_from_bytes(self, &id)?;
             }
             Intrinsic::FieldRepresentingTypeActualTypeId
             | Intrinsic::FieldRepresentingTypeName
             | Intrinsic::FieldRepresentingTypeOffset => {
                 let [id] = args else { not_supported!("{intrinsic} args") };
-                let Some(&TypeIdOf::Field { base, variant, field }) = self.type_id_entry(id)?
-                else {
-                    not_supported!("{intrinsic} of a `TypeId` that is not a field's")
-                };
-                let (field_name, field_ty) =
-                    self.reflected_fields(base, variant)?.swap_remove(field);
+                let frt = self.type_id_of(id)?;
+                let info = self.field_info(frt, intrinsic)?;
                 match intrinsic {
                     Intrinsic::FieldRepresentingTypeActualTypeId => {
-                        let id = self.type_id_bytes(field_ty)?;
+                        let id = self.type_id_bytes(info.ty)?;
                         destination.write_from_bytes(self, &id)?;
                     }
                     Intrinsic::FieldRepresentingTypeName => {
-                        self.write_str(destination, &field_name)?
+                        self.write_str(destination, info.name.0.as_str())?
                     }
                     _ => {
-                        let offset = self.reflected_offset(base, variant, field, locals)?;
-                        destination.write_from_bytes(self, &word_bytes(offset))?;
+                        let offset = self.reflected_offset(
+                            info.base,
+                            info.variant_idx.as_usize(),
+                            info.field_idx.as_usize(),
+                            locals,
+                        )?;
+                        destination.write_from_bytes(self, &word_bytes(offset, self.cached_ptr_size))?;
                     }
                 }
             }
@@ -243,10 +250,182 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         Ok(true)
     }
 
+    /// Answers one of `core::reflect`'s intrinsics (`#![feature(blaze_comptime)]`,
+    /// docs/v2/plan/design/comptime.md) from its type arguments: a field's or variant's facts,
+    /// read by [`hir_ty::comptime::reflected_member`], the rule the solver's candidates and the
+    /// `for const` expansion read, so the three agree on which member a type stands for. Each is
+    /// called only from a constant's initializer (`Field::INDEX`, `Struct::NAME`), so it is
+    /// answered once the constant's `Self` is a member, after the expansion put it there; a
+    /// type argument that is no member is refused, naming it, never answered by a guess.
+    pub(super) fn exec_blaze_reflection_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        generic_args: GenericArgs<'db>,
+        destination: Interval,
+    ) -> Result<'db, ()> {
+        let arg = |at: usize| -> Result<'db, Ty<'db>> {
+            match generic_args.as_slice().get(at).and_then(|it| it.ty()) {
+                Some(ty) => self.type_id_ty(ty),
+                None => not_supported!("{intrinsic}: no type argument {at}"),
+            }
+        };
+        let interner = self.interner();
+        let member = |ty: Ty<'db>| hir_ty::comptime::reflected_member(interner, ty).map(|(it, _)| it);
+        use hir_ty::comptime::ReflectedMember;
+        match intrinsic {
+            Intrinsic::BlazeAdtName => {
+                let ty = arg(0)?;
+                let name = self.reflected_adt_name(ty)?;
+                self.write_str(destination, &name)?;
+            }
+            Intrinsic::BlazeFieldIndex => {
+                let frt = arg(0)?;
+                let index = match (member(frt), frt.kind()) {
+                    (Some(ReflectedMember::Field(_) | ReflectedMember::TupleField(_)), TyKind::Adt(_, args)) => {
+                        // `FIELD` is a `u32`.
+                        match hir_ty::comptime::index_value(args.const_at(2)) {
+                            Some(it) => it as usize,
+                            None => not_supported!("{intrinsic} of {frt:?}: no field index"),
+                        }
+                    }
+                    _ => not_supported!("{intrinsic} of {frt:?}, which is no field of a struct, tuple or variant"),
+                };
+                destination.write_from_bytes(self, &word_bytes(index, self.cached_ptr_size))?;
+            }
+            Intrinsic::BlazeFieldAttrs => {
+                let frt = arg(0)?;
+                if !matches!(member(frt), Some(ReflectedMember::Field(_) | ReflectedMember::TupleField(_))) {
+                    not_supported!("{intrinsic} of {frt:?}, which is no field of a struct, tuple or variant");
+                }
+                // No field carries a `#[blaze::attr(..)]` yet: it is none of blaze's inert
+                // attributes (`hir_def::nameres::attr_resolution`), so on a field it resolves as
+                // a macro or is refused, and no program blaze accepts has one. The empty list is
+                // then every field's answer; reading the attribute goes here once it is inert.
+                let addr = self.heap_allocate(0, self.ptr_size())?;
+                self.write_pointer(destination.addr, addr)?;
+                destination
+                    .slice(self.ptr_size()..2 * self.ptr_size())
+                    .write_from_bytes(self, &word_bytes(0, self.cached_ptr_size))?;
+            }
+            Intrinsic::BlazeVariantIndex => {
+                let vrt = arg(0)?;
+                let Some(ReflectedMember::Variant(variant)) = member(vrt) else {
+                    not_supported!("{intrinsic} of {vrt:?}, which is no variant of an enum")
+                };
+                let index = variant.index(self.db);
+                destination.write_from_bytes(self, &word_bytes(index, self.cached_ptr_size))?;
+            }
+            Intrinsic::BlazeVariantDiscriminant => {
+                let (vrt, enum_ty) = (arg(0)?, arg(1)?);
+                let Some(ReflectedMember::Variant(variant)) = member(vrt) else {
+                    not_supported!("{intrinsic} of {vrt:?}, which is no variant of an enum")
+                };
+                let of_enum = matches!(
+                    enum_ty.kind(),
+                    TyKind::Adt(adt, _) if adt.def_id() == AdtId::EnumId(variant.lookup(self.db).parent)
+                );
+                if !of_enum {
+                    not_supported!("{intrinsic} of {vrt:?} as a variant of {enum_ty:?}, another type");
+                }
+                let discriminant = self.const_eval_discriminant(variant)?;
+                // `<E as DiscriminantKind>::Discriminant`, as `discriminant_value` writes it.
+                let bytes = discriminant.to_le_bytes();
+                if destination.size > bytes.len() {
+                    not_supported!("{intrinsic} of {vrt:?}: a discriminant wider than 16 bytes");
+                }
+                destination.write_from_bytes(self, &bytes[..destination.size])?;
+            }
+            _ => not_supported!("{intrinsic} is none of `core::reflect`'s intrinsics"),
+        }
+        Ok(())
+    }
+
+    /// `blaze_adt_name::<T>()`: the identifier of the struct or enum `T`, the variant's of a
+    /// `VariantOf<E, v>`, empty for a tuple. Anything else is refused, naming it.
+    fn reflected_adt_name(&self, ty: Ty<'db>) -> Result<'db, String> {
+        let lang = self.lang_items();
+        let name = match ty.kind() {
+            TyKind::Tuple(_) => return Ok(String::new()), // alloc: empty, allocates nothing
+            TyKind::Adt(adt, args) => match adt.def_id() {
+                AdtId::StructId(it) if Some(it) == lang.ReflectVariantOf => {
+                    let (TyKind::Adt(base, _), Some(v)) =
+                        // `VARIANT` is a `u32`.
+                        (args.type_at(0).kind(), hir_ty::comptime::index_value(args.const_at(1)))
+                    else {
+                        not_supported!("`blaze_adt_name` of {ty:?}: no enum and variant")
+                    };
+                    let AdtId::EnumId(e) = base.def_id() else {
+                        not_supported!("`blaze_adt_name` of {ty:?}: a `VariantOf` of no enum")
+                    };
+                    let variants = &e.enum_variants(self.db).variants;
+                    match variants.get_index(v as usize) {
+                        Some((name, _)) => name.clone(), // clone: an interned `Name`
+                        None => not_supported!("`blaze_adt_name` of {ty:?}: no variant {v}"),
+                    }
+                }
+                AdtId::StructId(it) => StructSignature::of(self.db, it).name.clone(), // clone: an interned `Name`
+                AdtId::EnumId(it) => hir_def::signatures::EnumSignature::of(self.db, it).name.clone(), // clone: an interned `Name`
+                AdtId::UnionId(_) => not_supported!("`blaze_adt_name` of the union {ty:?}, which is no `Struct`"),
+            },
+            _ => not_supported!("`blaze_adt_name` of {ty:?}, which is no struct, enum or tuple"),
+        };
+        Ok(name.as_str().to_owned()) // alloc: once per reflected constant
+    }
+
     /// The bytes of the `TypeId` of `ty`, as a `TypeId` is of it.
     fn type_id_bytes(&mut self, ty: Ty<'db>) -> Result<'db, Vec<u8>> {
         let ty = self.type_id_ty(ty)?;
-        Ok(self.type_id(TypeIdOf::Ty(ty)).to_vec()) // alloc: reflection shim, only for a `type_info` intrinsic
+        Ok(self.type_id(ty).to_vec()) // alloc: reflection shim, only for a `type_info` intrinsic
+    }
+
+    /// `FieldRepresentingType<base, VARIANT, FIELD>`, the type that stands for field `field` of
+    /// variant `variant` of `base`, as rustc's `Ty::new_field_representing_type` makes it.
+    fn field_representing_type(
+        &self,
+        base: Ty<'db>,
+        variant: usize,
+        field: usize,
+    ) -> Result<'db, Ty<'db>> {
+        let Some(frt) = self.lang_items().FieldRepresentingType else {
+            not_supported!(
+                "a field's `TypeId` of {base:?}: no `FieldRepresentingType` \
+                 (lang item `field_representing_type`) in core"
+            )
+        };
+        let interner = self.interner();
+        let index = |it: usize| -> Result<'db, Const<'db>> {
+            let Ok(it) = u32::try_from(it) else {
+                not_supported!("field {field} of variant {variant} of {base:?}: past `u32`")
+            };
+            let leaf = ValTree::new(ValTreeKind::Leaf(ScalarInt::from(it)));
+            Ok(Const::new_value(interner, leaf, interner.default_types().types.u32))
+        };
+        let args =
+            GenericArgs::new_from_slice(&[base.into(), index(variant)?.into(), index(field)?.into()]);
+        Ok(Ty::new_adt(interner, frt.into(), args))
+    }
+
+    /// What the field representing type `frt`, given to `intrinsic`, stands for, as rustc
+    /// reads it (`AdtDef::field_representing_type_info`).
+    fn field_info(
+        &self,
+        frt: Ty<'db>,
+        intrinsic: Intrinsic,
+    ) -> Result<'db, rustc_type_ir::FieldInfo<DbInterner<'db>>> {
+        if let TyKind::Adt(def, args) = frt.kind()
+            && let Some(info) = def.field_representing_type_info(self.interner(), args)
+        {
+            return Ok(info);
+        }
+        not_supported!("{intrinsic} of {frt:?}, which is not a field representing type")
+    }
+
+    /// `field_offset::<F>()`: where the field the field representing type `frt` stands for is
+    /// in a value of its base, as rustc's `field_offset` answers (`Field::OFFSET`).
+    pub(super) fn field_offset(&mut self, frt: Ty<'db>, locals: &Locals<'db>) -> Result<'db, usize> {
+        let frt = self.type_id_ty(frt)?;
+        let info = self.field_info(frt, Intrinsic::FieldOffset)?;
+        self.reflected_offset(info.base, info.variant_idx.as_usize(), info.field_idx.as_usize(), locals)
     }
 
     /// `bytes` the evaluator computed, which carry no pointer.
@@ -301,10 +480,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// A `&'static [_]` or `&'static str` of `len` elements at `addr`, memory the evaluator
     /// made, carrying the provenance of that allocation.
     fn reflected_ref(&self, addr: Address, len: usize) -> Made<M::Shadow> {
-        let mut bytes = addr.to_bytes().to_vec(); // alloc: reflection shim, only for a `type_info` intrinsic
+        let mut bytes = addr.to_bytes(self.cached_ptr_size).to_vec(); // alloc: reflection shim, only for a `type_info` intrinsic
         let mut shadow = M::Shadow::pointer(bytes.len(), self.ptr(addr).prov);
         let at = bytes.len();
-        bytes.extend(word_bytes(len));
+        bytes.extend(word_bytes(len, self.cached_ptr_size));
         if M::CHECKS {
             shadow.put(at, &M::Shadow::init(bytes.len() - at));
         }
@@ -675,15 +854,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     /// The `FnPtr` of a function pointer with `inputs`, `output` and `kind`, as rustc's
-    /// `write_fn_ptr_type_info` makes it. This front end has no `#[rustc_splat]`, so no
-    /// argument is splatted, which rustc encodes as `u8::MAX`
-    /// (`FnSigKind::NO_SPLATTED_ARG_INDEX`).
+    /// `write_fn_ptr_type_info` makes it. The splatted input is `FnSigKind`'s, `u8::MAX`
+    /// (`FnSigKind::NO_SPLATTED_ARG_INDEX`) when none is.
     fn reflected_fn_ptr(
         &mut self,
         fn_ptr: Ty<'db>,
         inputs: &[Ty<'db>],
         output: Ty<'db>,
-        kind: rustc_type_ir::FnSigKind<crate::next_solver::DbInterner<'db>>,
+        kind: FnSigKind<'db>,
         locals: &Locals<'db>,
     ) -> Result<'db, Made<M::Shadow>> {
         self.reflected_struct(fn_ptr, locals, &mut |this, name, field| match name {
@@ -708,8 +886,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }),
             "output" => this.reflected_type_id(output),
             "variadic" => Ok(Self::made(vec![kind.c_variadic() as u8])), // alloc: reflection shim, only for a `type_info` intrinsic
-            "is_splatted" => Ok(Self::made(vec![0])), // alloc: reflection shim, only for a `type_info` intrinsic
-            "splatted_index" => Ok(Self::made(vec![u8::MAX])), // alloc: reflection shim, only for a `type_info` intrinsic
+            "is_splatted" => Ok(Self::made(vec![kind.splatted().is_some() as u8])), // alloc: reflection shim, only for a `type_info` intrinsic
+            "splatted_index" => {
+                let index = kind.splatted().unwrap_or(FnSigKind::NO_SPLATTED_ARG_INDEX);
+                Ok(Self::made(vec![index])) // alloc: reflection shim, only for a `type_info` intrinsic
+            }
             other => not_supported!("the field `{other}` of `FnPtr`, which rustc does not write"),
         })
     }
@@ -747,7 +928,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Obligation::new(interner, ObligationCause::dummy(), param_env, clause)
         }));
         let holds = ocx.evaluate_obligations_error_on_ambiguity().is_empty();
-        let vtable = holds.then(|| word_bytes(self.vtable_map.id(ty)));
+        let vtable = holds.then(|| word_bytes(self.vtable_map.id(ty), self.cached_ptr_size));
         let Some(dyn_metadata) = self.lang_items().DynMetadata else {
             not_supported!("no `DynMetadata` in core")
         };

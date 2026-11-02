@@ -2,7 +2,7 @@
 //! `$CARGO_HOME`, their `include`s, `--config` arguments and `CARGO_*` variables, merged by
 //! cargo's rules (`src/context/mod.rs` and `config_value.rs` there).
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use annotate_snippets::{Level, Renderer};
 use anyhow::{Context as _, anyhow, bail};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::radix;
 use url::Url;
 
@@ -65,7 +66,7 @@ pub enum ConfigValue {
     Integer(i64, Definition),
     String(String, Definition),
     List(Vec<ConfigValue>, Definition),
-    Table(HashMap<String, ConfigValue>, Definition),
+    Table(HashMap<String, ConfigValue, Global>, Definition),
     Boolean(bool, Definition),
 }
 
@@ -259,12 +260,16 @@ pub struct Config<F: Files> {
     cli: Vec<String>,
     /// The files are read at the first value asked for, and again at the next while they fail:
     /// a broken config file is an error only to what reads configuration, as in cargo.
-    values: OnceCell<HashMap<String, ConfigValue>>,
+    #[expect(clippy::disallowed_types, reason = "the configuration's parts, each read the first time it is asked for: per config, not global")]
+    values: std::cell::OnceCell<HashMap<String, ConfigValue, Global>>,
     /// `$CARGO_HOME/credentials.toml`, once [`Config::load_credentials`] read it: kept apart
     /// from the files' values, as cargo keeps it, for [`Config::credentials_token`] only.
-    credentials: OnceCell<HashMap<String, ConfigValue>>,
-    build_config: OnceCell<CargoBuildConfig>,
-    target_cfgs: OnceCell<Vec<(String, target::TargetCfgConfig)>>,
+    #[expect(clippy::disallowed_types, reason = "the configuration's parts, each read the first time it is asked for: per config, not global")]
+    credentials: std::cell::OnceCell<HashMap<String, ConfigValue, Global>>,
+    #[expect(clippy::disallowed_types, reason = "the configuration's parts, each read the first time it is asked for: per config, not global")]
+    build_config: std::cell::OnceCell<CargoBuildConfig>,
+    #[expect(clippy::disallowed_types, reason = "the configuration's parts, each read the first time it is asked for: per config, not global")]
+    target_cfgs: std::cell::OnceCell<Vec<(String, target::TargetCfgConfig)>>,
     unstable: CliUnstable,
     warnings: RefCell<Vec<String>>,
 }
@@ -325,6 +330,9 @@ impl CliUnstable {
             "build-std" => self.build_std = Some(list()),
             "build-std-features" => self.build_std_features = Some(list()),
             "codegen-backend" => self.codegen_backend = bool_flag()?,
+            // blaze's own: proc macros built for wasm32-wasip1 and run as wasm modules, which
+            // the unit graph reads (`blaze_units::load`); nothing of the configuration's.
+            "wasm-macros" => {}
             _ => bail!("blaze does not read `-Z {name}` yet"),
         }
         Ok(())
@@ -370,10 +378,10 @@ impl<F: Files> Config<F> {
             home,
             env,
             cli: Vec::new(),
-            values: OnceCell::new(),
-            credentials: OnceCell::new(),
-            build_config: OnceCell::new(),
-            target_cfgs: OnceCell::new(),
+            values: Default::default(),
+            credentials: Default::default(),
+            build_config: Default::default(),
+            target_cfgs: Default::default(),
             unstable: CliUnstable::default(),
             warnings: RefCell::new(Vec::new()),
         })
@@ -430,7 +438,7 @@ impl<F: Files> Config<F> {
         }
     }
 
-    fn values(&self) -> anyhow::Result<&HashMap<String, ConfigValue>> {
+    fn values(&self) -> anyhow::Result<&HashMap<String, ConfigValue, Global>> {
         if let Some(values) = self.values.get() {
             return Ok(values);
         }
@@ -465,10 +473,10 @@ impl<F: Files> Config<F> {
         self.env.get(key).map(String::as_str)
     }
 
-    fn load_values(&self) -> anyhow::Result<HashMap<String, ConfigValue>> {
-        let mut cfg = CV::Table(HashMap::default(), Definition::BuiltIn);
+    fn load_values(&self) -> anyhow::Result<HashMap<String, ConfigValue, Global>> {
+        let mut cfg = CV::Table(HashMap::new_in(Global), Definition::BuiltIn);
         self.walk_tree(&self.cwd, &self.home, |path| {
-            let value = self.load_file(path, &mut HashSet::default(), true, false)?;
+            let value = self.load_file(path, &mut HashSet::new_in(Global), true, false)?;
             cfg.merge(value, false)
                 .with_context(|| format!("failed to merge configuration at `{}`", path.display()))
         })
@@ -487,7 +495,7 @@ impl<F: Files> Config<F> {
         home: &Path,
         mut walk: impl FnMut(&Path) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        let mut seen_dir = HashSet::default();
+        let mut seen_dir = HashSet::new_in(Global);
         let stop = self.env("__CARGO_TEST_ROOT").map(PathBuf::from);
         for current in paths::ancestors(pwd, stop.as_deref()) {
             let config_root = current.join(".cargo");
@@ -510,7 +518,7 @@ impl<F: Files> Config<F> {
     fn load_file(
         &self,
         path: &Path,
-        seen: &mut HashSet<PathBuf>,
+        seen: &mut HashSet<PathBuf, Global>,
         includes: bool,
         cli: bool,
     ) -> anyhow::Result<ConfigValue> {
@@ -535,11 +543,11 @@ impl<F: Files> Config<F> {
     fn load_includes(
         &self,
         mut value: ConfigValue,
-        seen: &mut HashSet<PathBuf>,
+        seen: &mut HashSet<PathBuf, Global>,
         cli: bool,
     ) -> anyhow::Result<ConfigValue> {
         let includes = include_paths(&mut value, true)?;
-        let mut root = CV::Table(HashMap::default(), value.definition().clone());
+        let mut root = CV::Table(HashMap::new_in(Global), value.definition().clone());
         for include in includes {
             let Some(abs_path) = self.include_path(&include) else { continue };
             self.load_file(&abs_path, seen, true, cli)
@@ -570,7 +578,7 @@ impl<F: Files> Config<F> {
     /// `load_values_unmerged`.
     pub fn load_values_unmerged(&self) -> anyhow::Result<Vec<ConfigValue>> {
         let mut result = Vec::new();
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new_in(Global);
         self.walk_tree(&self.cwd, &self.home, |path| {
             let mut cv = self.load_file(path, &mut seen, false, false)?;
             self.load_unmerged_include(&mut cv, &mut seen, &mut result)?;
@@ -584,7 +592,7 @@ impl<F: Files> Config<F> {
     fn load_unmerged_include(
         &self,
         cv: &mut ConfigValue,
-        seen: &mut HashSet<PathBuf>,
+        seen: &mut HashSet<PathBuf, Global>,
         output: &mut Vec<ConfigValue>,
     ) -> anyhow::Result<()> {
         for include in include_paths(cv, false)? {
@@ -613,7 +621,7 @@ impl<F: Files> Config<F> {
         let mut root = CV::Table(values, Definition::BuiltIn);
         root.merge(loaded, true)?;
         match root {
-            CV::Table(map, _) => self.values = OnceCell::from(map),
+            CV::Table(map, _) => self.values = map.into(),
             _ => unreachable!(),
         }
         Ok(())
@@ -621,11 +629,11 @@ impl<F: Files> Config<F> {
 
     /// The `--config` arguments merged into one table.
     pub fn cli_args_as_table(&self) -> anyhow::Result<ConfigValue> {
-        let mut loaded = CV::Table(HashMap::default(), Definition::Cli(None));
+        let mut loaded = CV::Table(HashMap::new_in(Global), Definition::Cli(None));
         for arg in &self.cli {
             let arg_as_path = self.cwd.join(arg);
             let table = if !arg.is_empty() && self.files.exists(&arg_as_path) {
-                self.load_file(&arg_as_path, &mut HashSet::default(), true, true).with_context(
+                self.load_file(&arg_as_path, &mut HashSet::new_in(Global), true, true).with_context(
                     || format!("failed to load config from `{}`", arg_as_path.display()),
                 )?
             } else {
@@ -644,7 +652,7 @@ impl<F: Files> Config<F> {
                 }
                 let value = CV::from_toml(Definition::Cli(None), toml::Value::Table(doc))
                     .with_context(|| format!("failed to convert --config argument `{arg}`"))?;
-                self.load_includes(value, &mut HashSet::default(), true)
+                self.load_includes(value, &mut HashSet::new_in(Global), true)
                     .context("failed to load --config include")?
             };
             loaded
@@ -689,7 +697,7 @@ impl<F: Files> Config<F> {
 
     fn get_cv_in(
         key: &ConfigKey,
-        vals: &HashMap<String, ConfigValue>,
+        vals: &HashMap<String, ConfigValue, Global>,
     ) -> anyhow::Result<Option<ConfigValue>> {
         if key.is_root() {
             return Ok(Some(CV::Table(vals.clone(), Definition::Path(PathBuf::new()))));
@@ -796,7 +804,7 @@ impl<F: Files> Config<F> {
     pub(crate) fn get_table(
         &self,
         key: &ConfigKey,
-    ) -> anyhow::Result<OptValue<HashMap<String, ConfigValue>>> {
+    ) -> anyhow::Result<OptValue<HashMap<String, ConfigValue, Global>>> {
         match self.get_cv(key)? {
             Some(CV::Table(val, definition)) => Ok(Some(Value { val, definition })),
             Some(val) => Err(self.expected("table", key, &val)),
@@ -990,17 +998,17 @@ impl<F: Files> Config<F> {
         self.credentials().map(|_| ())
     }
 
-    fn credentials(&self) -> anyhow::Result<&HashMap<String, ConfigValue>> {
+    fn credentials(&self) -> anyhow::Result<&HashMap<String, ConfigValue, Global>> {
         if let Some(credentials) = self.credentials.get() {
             return Ok(credentials);
         }
-        let mut credentials = HashMap::default();
+        let mut credentials = HashMap::new_in(Global);
         if let Some(path) = self.get_file_path(&self.home, "credentials") {
-            let value = self.load_file(&path, &mut HashSet::default(), true, false)?;
+            let value = self.load_file(&path, &mut HashSet::new_in(Global), true, false)?;
             let CV::Table(mut map, def) = value else { unreachable!() };
             if let Some(token) = map.remove("token") {
                 map.entry("registry".to_owned()).or_insert_with(|| {
-                    CV::Table(HashMap::from_iter([("token".to_owned(), token)]), def)
+                    CV::Table(HashMap::from_iter_in([("token".to_owned(), token)], Global), def)
                 });
             }
             credentials = map;
@@ -1069,16 +1077,16 @@ impl Config<Disk> {
             Some(token) => {
                 let def = Definition::Path(path.clone());
                 let table = CV::Table(
-                    HashMap::from_iter([(
+                    HashMap::from_iter_in([(
                         "token".to_owned(),
                         CV::String(token.to_owned(), def.clone()),
-                    )]),
+                    )], Global),
                     def.clone(),
                 );
                 let (key, mut value) = match registry {
                     Some(registry) => (
                         "registries",
-                        CV::Table(HashMap::from_iter([(registry.to_owned(), table)]), def.clone()),
+                        CV::Table(HashMap::from_iter_in([(registry.to_owned(), table)], Global), def.clone()),
                     ),
                     None => ("registry", table),
                 };

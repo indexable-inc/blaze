@@ -92,11 +92,19 @@ facts allow without changing anything else here.
 ## Code dedupe
 
 After instantiation, functions whose `content::code_id` is equal are one function: callers'
-relocations name one representative (the least key), to a fixpoint, as ICF merges. Never
+relocations name one representative (the least key), to a fixpoint, as ICF merges. The code ID
+takes each relocation by what it names, never an address. Every relocation that named a
+function merged away is renamed, in code, data, unwind tables and statics' values, and a
+renamed static's digest is made again, so the linker places one copy and every reference
+reaches it. The fixpoint ends within one round per candidate and one more; past that it is a
+`DedupeError` and the build stops. Each round rehashes only the functions it renamed. Never
 merged: a function whose address is `Address::Significant` (an exported symbol), any static
-(statics are `Target::Static`, by which item they are), and a patchable function of a live
-build (each keeps its slot). Rust functions' addresses are not unique (rustc marks them
-`unnamed_addr`), so merging the rest changes no program. Data objects are one per content ID.
+(statics are `Target::Static`, by which item they are), a patchable or tiered function of a
+live build (each keeps its slot), and a covered, counting or instrumented function. Rust
+functions' addresses are not unique (rustc marks them `unnamed_addr`), so merging the rest
+changes no program. Data objects are one per content ID. The span `codegen dedupe` records the
+folded count, rounds and bytes saved. See
+[icf.md](v2/plan/lanes/codegen/icf.md).
 
 ## Folding functions that differ only in constants (#1292)
 

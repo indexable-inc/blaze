@@ -18,6 +18,7 @@
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_items::{
     ItemId, ItemKey,
@@ -135,10 +136,10 @@ fn relative<'db>(db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> Opt
 /// The index of each target among `body`'s resolutions ([`Target`]), empty when its paths
 /// could not be hashed (it then has no identity, and no record).
 #[blaze_query::tracked(returns(ref))]
-fn target_indices(db: &Db, body: DefWithBodyId) -> HashMap<Target, u32> {
-    let Ok(names) = names_of(db, body) else { return HashMap::default() };
+fn target_indices(db: &Db, body: DefWithBodyId) -> HashMap<Target, u32, Global> {
+    let Ok(names) = names_of(db, body) else { return HashMap::new_in(Global) };
     // alloc: the query's value, once per body a record is written or read for
-    let mut indices = HashMap::default();
+    let mut indices = HashMap::new_in(Global);
     for (at, &target) in names.targets.iter().enumerate() {
         indices.insert(target, u32::try_from(at).expect("more than 2^32 targets of one body"));
     }

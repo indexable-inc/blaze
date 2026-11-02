@@ -5,13 +5,15 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, hash_map::Entry},
+    collections::BinaryHeap,
     iter, mem,
     ops::Range,
 };
+use blaze_hash::hash_map::Entry;
 
 use base_db::{BuiltDependency, Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_mem::Tag;
 use cfg::{CfgAtom, CfgExpr, CfgOptions};
 use either::Either;
@@ -114,7 +116,7 @@ pub(super) fn collect_defs(
         unresolved_macros: Vec::new(), // alloc: empty
         expand_eager_with_unresolved_args: false,
         deferred_eager_call: false,
-        mod_dirs: HashMap::default(),
+        mod_dirs: HashMap::new_in(Global),
         cfg_options,
         proc_macros,
         from_glob_import: Default::default(),
@@ -316,7 +318,7 @@ struct Imports<'db> {
     indeterminate: Vec<(u32, PerNs)>,
     /// Plain imports by the module and the name they bind, in index order: head and tail of a
     /// list linked through `next_named`.
-    named: HashMap<(ModuleId, Name), (u32, u32)>,
+    named: HashMap<(ModuleId, Name), (u32, u32), Global>,
     next_named: Vec<u32>,
     phase: Phase,
     pending_unresolved: BinaryHeap<Reverse<u32>>,
@@ -324,7 +326,7 @@ struct Imports<'db> {
     pending_indeterminate: BinaryHeap<Reverse<u32>>,
     deferred_indeterminate: Vec<u32>,
     /// Head of each key's list of waiting imports in `edges`.
-    waits: HashMap<WaitOn, u32>,
+    waits: HashMap<WaitOn, u32, Global>,
     edges: Vec<WaitEdge>,
     /// Head of the edges unlinked from every key, reused before `edges` grows.
     free_edge: u32,
@@ -350,14 +352,14 @@ impl<'db> Imports<'db> {
             queued: Vec::new(),
             seq: Vec::new(),
             indeterminate: Vec::new(),
-            named: HashMap::default(),
+            named: HashMap::new_in(Global),
             next_named: Vec::new(),
             phase: Phase::Idle,
             pending_unresolved: BinaryHeap::new(),
             deferred_unresolved: Vec::new(),
             pending_indeterminate: BinaryHeap::new(),
             deferred_indeterminate: Vec::new(),
-            waits: HashMap::default(),
+            waits: HashMap::new_in(Global),
             edges: Vec::new(),
             free_edge: NONE,
             any_waiters: Vec::new(),
@@ -636,17 +638,17 @@ struct ImporterEdge<K, T> {
 struct ImporterLists<K, T> {
     edges: Vec<ImporterEdge<K, T>>,
     /// Head and tail of each source's list.
-    heads: HashMap<K, (u32, u32)>,
+    heads: HashMap<K, (u32, u32), Global>,
     /// The edge of each `(source, importer)`.
-    by_pair: HashMap<(K, K), u32>,
+    by_pair: HashMap<(K, K), u32, Global>,
 }
 
 impl<K: Copy + Eq + std::hash::Hash, T: Copy> ImporterLists<K, T> {
     fn new() -> Self {
         ImporterLists {
             edges: Vec::new(), // alloc: empty
-            heads: HashMap::default(),
-            by_pair: HashMap::default(),
+            heads: HashMap::new_in(Global),
+            by_pair: HashMap::new_in(Global),
         }
     }
 
@@ -777,8 +779,8 @@ struct DefCollector<'db> {
     // We'd like to avoid emitting a diagnostics avalanche when some `extern crate` doesn't
     // resolve. When we emit diagnostics for unresolved imports, we only do so if the import
     // doesn't start with an unresolved crate's name.
-    unresolved_extern_crates: HashSet<Name>,
-    mod_dirs: HashMap<ModuleId, ModDir>,
+    unresolved_extern_crates: HashSet<Name, Global>,
+    mod_dirs: HashMap<ModuleId, ModDir, Global>,
     cfg_options: &'db CfgOptions,
     /// List of procedural macros defined by this crate. This is read from the dynamic library
     /// built by the build system, and is the list of proc-macros we can actually expand. It is
@@ -794,16 +796,16 @@ struct DefCollector<'db> {
     /// This also stores the attributes to skip when we resolve derive helpers and non-macro
     /// non-builtin attributes in general.
     // FIXME: There has to be a better way to do this
-    skip_attrs: HashMap<InFile<ModItemId>, AttrId>,
+    skip_attrs: HashMap<InFile<ModItemId>, AttrId, Global>,
     /// When we expand attributes, we need to censor all previous active attributes
     /// on the same item. Therefore, this holds all active attributes that we already
     /// expanded.
-    prev_active_attrs: HashMap<AstId<ast::Item>, SmallVec<[AttrId; 1]>>,
+    prev_active_attrs: HashMap<AstId<ast::Item>, SmallVec<[AttrId; 1]>, Global>,
     /// To save memory, we do not really expand builtin derives. Instead, we save them as a `BuiltinDeriveImplId`.
     ///
     /// However, we can only do that when the derive is directly above the item, and there is no attribute in between.
     /// Otherwise, all sorts of weird things can happen, like the item name resolving to something else.
-    deferred_builtin_derives: HashMap<AstId<ast::Item>, Vec<DeferredBuiltinDerive>>,
+    deferred_builtin_derives: HashMap<AstId<ast::Item>, Vec<DeferredBuiltinDerive>, Global>,
     /// Each macro path that resolved, in the order it did.
     resolved_macro_paths: Vec<ResolvedMacroPath>,
     derive_helper_uses: Vec<DeriveHelperUse>,
@@ -813,7 +815,7 @@ struct DefCollector<'db> {
 
 impl<'db> DefCollector<'db> {
     fn seed_with_top_level(&mut self) {
-        let _p = tracing::info_span!("seed_with_top_level").entered();
+        let _p = tracing::info_span!(target: "blaze", "seed_with_top_level").entered();
 
         let file_id = self.def_map.krate.root_file_id(self.db);
         let item_tree = file_item_tree(self.db, file_id.into(), self.def_map.krate);
@@ -826,6 +828,13 @@ impl<'db> DefCollector<'db> {
 
         // Process other crate-level attributes.
         for attr in &*attrs {
+            if let [tool, name] = attr.path.segments()
+                && tool.symbol().as_str() == "blaze"
+                && name.symbol().as_str() == "arbitrary_ints"
+            {
+                crate_data.arbitrary_ints = true;
+                continue;
+            }
             let Some(attr_name) = attr.path.as_ident() else { continue };
 
             match () {
@@ -978,17 +987,17 @@ impl<'db> DefCollector<'db> {
     }
 
     fn resolution_loop(&mut self) {
-        let _p = tracing::info_span!("DefCollector::resolution_loop").entered();
+        let _p = tracing::info_span!(target: "blaze", "DefCollector::resolution_loop").entered();
 
         // main name resolution fixed-point loop.
         let mut i = 0;
         'resolve_attr: loop {
-            let _p = tracing::info_span!("resolve_macros loop").entered();
+            let _p = tracing::info_span!(target: "blaze", "resolve_macros loop").entered();
             'resolve_macros: loop {
                 blaze_query::db::unwind_if_cancelled(self.db);
 
                 {
-                    let _p = tracing::info_span!("resolve_imports loop").entered();
+                    let _p = tracing::info_span!(target: "blaze", "resolve_imports loop").entered();
 
                     'resolve_imports: loop {
                         if self.resolve_imports() == ReachedFixedPoint::Yes {
@@ -1028,7 +1037,7 @@ impl<'db> DefCollector<'db> {
     }
 
     fn collect(&mut self) {
-        let _p = tracing::info_span!("DefCollector::collect").entered();
+        let _p = tracing::info_span!(target: "blaze", "DefCollector::collect").entered();
 
         self.resolution_loop();
 
@@ -2811,7 +2820,7 @@ impl<'db> DefCollector<'db> {
 
     fn finish(mut self) -> (DefMap, LocalDefMap) {
         // Emit diagnostics for all remaining unexpanded macros.
-        let _p = tracing::info_span!("DefCollector::finish").entered();
+        let _p = tracing::info_span!(target: "blaze", "DefCollector::finish").entered();
 
         for directive in &self.unresolved_macros {
             match &directive.kind {
@@ -3011,7 +3020,7 @@ impl<'db> DefCollector<'db> {
                 );
             }
         }
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new_in(Global);
         uses.retain(|&it| seen.insert(it));
         NameRecords {
             uses: uses.into_boxed_slice(),
@@ -3051,7 +3060,7 @@ impl<'db> ModCollector<'_, 'db> {
         let module_id = self.module_id;
         let consider_deferred_derives =
             |file_id: HirFileId,
-             deferred_derives: &mut HashMap<_, Vec<DeferredBuiltinDerive>>,
+             deferred_derives: &mut HashMap<_, Vec<DeferredBuiltinDerive>, Global>,
              ast_id: FileAstId<ast::Adt>,
              id: AdtId,
              def_map: &mut DefMap| {

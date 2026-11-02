@@ -60,6 +60,7 @@ const UNIX_ONLY: &str =
 /// replaced by another of its tag, names nothing.
 pub(crate) mod tagged {
     use blaze_hash::HashMap;
+    use std::alloc::Global;
     use blaze_mem::{Slab, Tag as MemTag};
 
     use crate::Tag;
@@ -76,7 +77,7 @@ pub(crate) mod tagged {
 
     pub(crate) struct Tagged<T> {
         slab: Slab<Entry<T>>,
-        by_tag: HashMap<Tag, Id<T>>,
+        by_tag: HashMap<Tag, Id<T>, Global>,
     }
 
     impl<T> Tagged<T> {
@@ -89,7 +90,7 @@ pub(crate) mod tagged {
                 Err(error) => panic!("{error}"),
             };
             // alloc: once per driver, the room of the tags in flight at once.
-            let by_tag = HashMap::with_capacity_and_hasher(reserve, Default::default());
+            let by_tag = HashMap::with_capacity_in(reserve, Global);
             Tagged { slab, by_tag }
         }
 
@@ -164,6 +165,7 @@ pub(crate) mod tagged {
     #[cfg(test)]
     mod tests {
         use blaze_hash::HashMap;
+        use std::alloc::Global;
 
         use super::Tagged;
         use crate::{Tag, sim::Rng};
@@ -173,7 +175,7 @@ pub(crate) mod tagged {
             for seed in 0..50 {
                 let mut rng = Rng::new(seed);
                 let mut tagged = Tagged::new(4);
-                let mut model: HashMap<Tag, u64> = HashMap::default();
+                let mut model: HashMap<Tag, u64, Global> = HashMap::new_in(Global);
                 let mut ids = Vec::new();
                 for step in 0..2000u64 {
                     let tag = Tag(rng.below(16));
@@ -914,6 +916,10 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::set_mode(path, mode)?;
             Ok(Done::Moded)
         }),
+        Effect::Seal { file, mode, .. } => at(root, &file, |path| {
+            fs::seal(path, mode)?;
+            Ok(Done::Moded)
+        }),
         Effect::Private { dir, .. } => Ok(Done::Private(at(root, &dir, |path| fs::private(path, &dir))?)),
         Effect::Times { file, modified_ns, .. } => at(root, &file, |path| {
             fs::set_times(path, modified_ns)?;
@@ -927,7 +933,8 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             at(root, &to, |to| fs::link(from, to))?;
             Ok(Done::Linked)
         }),
-        Effect::Stat { file, .. } => Ok(Done::Stat(at(root, &file, |path| fs::stat(path))?)),
+        Effect::Stat { file, .. } => Ok(Done::Stat(at(root, &file, |path| fs::stat(path, true))?)),
+        Effect::Lstat { file, .. } => Ok(Done::Stat(at(root, &file, |path| fs::stat(path, false))?)),
         #[cfg(unix)]
         Effect::Stamp { files, .. } => Ok(Done::Stamped(fs::stamps(root, &files)?)),
         #[cfg(unix)]

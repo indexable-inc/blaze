@@ -6,11 +6,14 @@
 //! the check: [`metadata`] prints the same JSON, held by the tests to the output cargo printed
 //! for each fixture, recorded once.
 
+#![feature(allocator_api)]
+
 pub mod config;
 pub mod dependency;
 pub mod diagnostic;
 pub mod features;
 pub mod files;
+pub mod home;
 pub mod manifest;
 pub mod metadata;
 pub mod paths;

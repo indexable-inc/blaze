@@ -352,6 +352,12 @@ impl<'db> BestObligation<'db> {
                 // We always handle rigid alias candidates separately as we may not add them for
                 // aliases whose trait bound doesn't hold.
                 candidates.retain(|c| !matches!(c.kind(), inspect::ProbeKind::RigidAlias { .. }));
+                // blaze: an impl over the markers of `#![blaze::arbitrary_ints]`
+                // (`impl<T: ArbitraryInt> Clone for T`) whose marker does not hold is as if it
+                // were never listed, as it is not for the types the impl index skips it for
+                // (`crate::arbitrary_ints`): the error of `T: Clone` for a parameter `T` stays
+                // the one it was without the impl.
+                candidates.retain(|candidate| !self.int_marker_fails(goal, candidate));
                 // If there are multiple candidates, we can still recurse into a single one if all
                 // others fail due to boring reasons. Currently that's if we fail to normalize
                 // while considering the candidate.
@@ -371,6 +377,40 @@ impl<'db> BestObligation<'db> {
         }
 
         candidates
+    }
+
+    /// blaze: whether `candidate` is an impl bounded by a marker of `#![blaze::arbitrary_ints]`
+    /// (`ArbitraryInt`, `ArbitrarySigned`, `IntFrom`, `IntTryFrom`) that does not hold.
+    fn int_marker_fails(
+        &self,
+        goal: &inspect::InspectGoal<'_, 'db>,
+        candidate: &inspect::InspectCandidate<'_, 'db>,
+    ) -> bool {
+        let inspect::ProbeKind::TraitCandidate {
+            source: CandidateSource::Impl(AnyImplId::ImplId(impl_)),
+            ..
+        } = candidate.kind()
+        else {
+            return false;
+        };
+        let interner = goal.infcx().interner;
+        if crate::arbitrary_ints::int_gates(interner.db, impl_)
+            == crate::arbitrary_ints::IntGates::NONE
+        {
+            return false;
+        }
+        let lang = interner.lang_items();
+        let markers = [lang.ArbitraryInt, lang.ArbitrarySigned, lang.IntFrom, lang.IntTryFrom];
+        goal.infcx().probe(|_| {
+            candidate.instantiate_nested_goals(self.span()).iter().any(|nested| {
+                nested
+                    .goal()
+                    .predicate
+                    .as_trait_clause()
+                    .is_some_and(|it| markers.contains(&Some(it.def_id().0)))
+                    && nested.result().is_err()
+            })
+        })
     }
 
     /// HACK: We walk the nested obligations for a well-formed arg manually,

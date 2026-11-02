@@ -6,6 +6,7 @@
 
 use blaze_codegen::{ExecTable, InstanceKey, driver::Built};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_testsel::{Bound, FnId, Image, Record, Selector, Version};
 use blaze_usercode::test::Executed;
@@ -58,7 +59,7 @@ pub(crate) fn record(executed: Executed) -> Record {
 /// the store, so a selector is always the only writer of its suite's history. The lock is
 /// taken twice per suite per run, never per test.
 #[derive(Default)]
-pub(crate) struct Selectors(Mutex<HashMap<ContentId, Held>>);
+pub(crate) struct Selectors(Mutex<HashMap<ContentId, Held, Global>>);
 
 /// A selector, with the binary its image is of.
 struct Held {

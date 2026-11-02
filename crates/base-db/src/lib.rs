@@ -19,6 +19,7 @@ mod input;
 pub mod maintain;
 mod named;
 mod reparse;
+mod settings;
 mod source_path;
 mod table;
 pub mod target;
@@ -40,7 +41,7 @@ pub use crate::{
     },
     db::{Db, Reader, RunOrder, Shared, executions, set_run_order},
     editioned_file_id::EditionedFileId,
-    files::{AliasError, Files},
+    files::{AliasError, ExpansionRead, Files, ReadBy},
     input::{
         BuiltCrateData, BuiltDependency, Crate, CrateBuilder, CrateBuilderId, CrateDataBuilder,
         CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateType, CrateTypes,
@@ -51,6 +52,7 @@ pub use crate::{
     maintain::{Maintained, Maintainer, Reads, Written},
     named::NAMED_PATHS_DOMAIN,
     reparse::Reparse,
+    settings::{BorrowckMode, FrontSettings},
     view::{ViewChange, ViewError, ViewFile, ViewRoot},
 };
 pub use crate::{
@@ -58,6 +60,7 @@ pub use crate::{
     source_path::{AnchoredPath, AnchoredPathBuf, VfsPath},
 };
 use blaze_hash::HashSet;
+use std::alloc::Global;
 pub use blaze_ids::ContentId;
 use blaze_ids::Hasher;
 use blaze_query::db::{Durability, Setter};
@@ -100,7 +103,7 @@ pub const DEFAULT_BORROWCK_LRU_CAP: u16 = 2024;
 #[blaze_query::input(singleton, debug)]
 pub struct LibraryRoots {
     #[returns(ref)]
-    pub roots: HashSet<SourceRootId>,
+    pub roots: HashSet<SourceRootId, Global>,
 }
 
 /// The set of "local" (that is, from the current workspace) roots.
@@ -108,7 +111,7 @@ pub struct LibraryRoots {
 #[blaze_query::input(singleton, debug)]
 pub struct LocalRoots {
     #[returns(ref)]
-    pub roots: HashSet<SourceRootId>,
+    pub roots: HashSet<SourceRootId, Global>,
 }
 
 /// The variables of the process a build is for, which `env!` and `option_env!` read where

@@ -17,20 +17,33 @@ doctest = false
 base-db.workspace = true
 blaze-diagnostics.workspace = true
 blaze-hash.workspace = true
+blaze-ids.workspace = true
 blaze-intent.workspace = true
+# The PGO names of blaze's own profiles and the item keys they hash, for the profile lints.
+blaze-items.workspace = true
 blaze-mem.workspace = true
 blaze-phf.workspace = true
+# The rule of which spans the flight recorder keeps, for `blaze::unrecorded_span`.
+blaze-profile.workspace = true
+blaze-serde.workspace = true
 cfg.workspace = true
 either.workspace = true
 hir.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
+# What each catch-all of a `match` stands for, for `blaze::wildcard_arm`.
+hir-ty-matchck.workspace = true
 hir-ty-mir.workspace = true
+hir-ty-pure.workspace = true
+# `borrow_workaround` checks its rewrite of a body's MIR with the borrow checker.
+hir-ty-borrowck.workspace = true
 hir-ty-suspend.workspace = true
 intern.workspace = true
 memchr.workspace = true
 rustc_type_ir.workspace = true
+# The symbols of a profile of a program rustc built, for the profile lints.
+rustc-demangle.workspace = true
 blaze-query.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

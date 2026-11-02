@@ -26,7 +26,6 @@ use hir_ty::{
 };
 use intern::Symbol;
 use rustc_type_ir::inherent::IntoKind;
-use std::sync::OnceLock;
 use syntax::view::{self as ast, AstNode as _};
 
 use crate::{lints::bodies::BodyCx, model::Span};
@@ -167,6 +166,8 @@ impl<'db> Solver<'db> {
         let env = db.trait_environment(b.owner.generic_def(db));
         let interner = DbInterner::new_with(db, b.owner.krate(db));
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+        // With what the body's `for const` loops assume of their binders, as inference had it.
+        let env = hir_ty::comptime_env::body_env(&infcx, b.infer, env);
         Solver { infcx, env }
     }
 
@@ -218,58 +219,3 @@ pub(crate) fn in_external_macro(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
     let Some(call) = node.file_id.macro_file() else { return false };
     hir::Crate::from(call.loc(b.db()).def.krate) != b.cx.krate
 }
-
-macro_rules! items {
-    ($($name:ident),* $(,)?) => {
-        /// The diagnostic items the passes ask about, each interned once for the process so a
-        /// question is a pointer compare.
-        #[allow(non_snake_case)]
-        pub(super) struct Items {
-            $(pub(super) $name: Symbol,)*
-        }
-
-        /// [`Items`], interned on first use; after that a read is one acquire load.
-        pub(super) fn items() -> &'static Items {
-            static ITEMS: OnceLock<Items> = OnceLock::new();
-            ITEMS.get_or_init(|| Items { $($name: Symbol::intern(stringify!($name)),)* })
-        }
-    };
-}
-
-items!(
-    assume_init,
-    const_ptr_cast,
-    cstring_type,
-    maybe_uninit_uninit,
-    maybe_uninit_zeroed,
-    mem_discriminant,
-    mem_uninitialized,
-    mem_variant_count,
-    mem_zeroed,
-    ptr_cast,
-    ptr_cast_const,
-    ptr_cast_mut,
-    ptr_const_is_null,
-    ptr_copy,
-    ptr_copy_nonoverlapping,
-    ptr_from_ref,
-    ptr_is_null,
-    ptr_null,
-    ptr_null_mut,
-    ptr_read,
-    ptr_read_unaligned,
-    ptr_replace,
-    ptr_swap,
-    ptr_swap_nonoverlapping,
-    ptr_write,
-    ptr_write_bytes,
-    ptr_write_unaligned,
-    ptr_write_volatile,
-    slice_from_raw_parts,
-    slice_from_raw_parts_mut,
-    transmute,
-    unsafe_cell_raw_get,
-    Cell,
-    SyncUnsafeCell,
-    Vec,
-);

@@ -47,6 +47,11 @@ const DEFAULT_PRIORITY: u32 = 65535;
 /// The global the module defines first, and the table it has.
 const STACK_POINTER: u32 = 0;
 const TABLE: u32 = 0;
+/// The global the module defines second, `__memory_base`: where its data starts for code
+/// built position-independent, which in a module that is not is 0, as wasm-ld has it. The C
+/// runtime rustc ships for wasm32-wasip1 (wasi-sdk's `crt1-reactor.o`) is built so: its
+/// `_initialize` reads its flag at `__memory_base` plus an `R_WASM_MEMORY_ADDR_REL_SLEB`.
+const MEMORY_BASE: u32 = 1;
 
 pub(crate) fn writer(output: &Output) -> Result<Wasm, LinkError> {
     if output.format != Format::Wasm {
@@ -179,6 +184,19 @@ fn heap_base(regions: &[Region]) -> u64 {
     heap.next_multiple_of(STACK_ALIGN)
 }
 
+/// `__heap_end`: the end of the module's memory as it starts, the pages up to the heap's
+/// start (at least one), which is where wasm-ld puts it with no `--initial-memory`; wasi-libc's
+/// `malloc` takes the memory from `__heap_base` to it before it grows the memory. The module's
+/// memory section has as many pages ([`module`]).
+fn heap_end(regions: &[Region]) -> u64 {
+    initial_pages(regions) * PAGE
+}
+
+/// How many pages the module's memory has as it starts: to the heap's start, at least one.
+fn initial_pages(regions: &[Region]) -> u64 {
+    heap_base(regions).div_ceil(PAGE).max(1)
+}
+
 /// The name of a C identifier, of which wasm-ld defines `__start_` and `__stop_` symbols.
 fn is_c_identifier(name: &str) -> bool {
     let mut chars = name.chars();
@@ -272,7 +290,11 @@ impl Writer for Wasm {
         Some(match name {
             "__stack_pointer" => Special::Absolute(STACK_POINTER.into()),
             "__indirect_function_table" => Special::Absolute(TABLE.into()),
+            "__memory_base" => Special::Absolute(MEMORY_BASE.into()),
             "__heap_base" => Special::Placed(heap_base),
+            "__heap_end" => Special::Placed(heap_end),
+            // The address past the first page, which wasi-libc reads its page size from.
+            "__wasm_first_page_end" => Special::Absolute(PAGE),
             "__data_end" => Special::Placed(data_end),
             "__dso_handle" => Special::Absolute(self.stack),
             "__global_base" | "__stack_low" => Special::Absolute(0),
@@ -466,6 +488,8 @@ mod tests {
         let wasm = writer(&output(Arch::Wasm32, command(), None)).unwrap();
         assert_eq!(wasm.special("__stack_pointer"), Some(Special::Absolute(0)));
         assert_eq!(wasm.special("__indirect_function_table"), Some(Special::Absolute(0)));
+        assert_eq!(wasm.special("__memory_base"), Some(Special::Absolute(1)));
+        assert_eq!(wasm.special("__wasm_first_page_end"), Some(Special::Absolute(1 << 16)));
         assert_eq!(wasm.special("__dso_handle"), Some(Special::Absolute(1 << 20)));
         assert_eq!(wasm.special("__stack_high"), Some(Special::Absolute(1 << 20)));
         assert_eq!(

@@ -130,6 +130,9 @@ pub struct FnType {
     pub is_varargs: bool,
     pub is_unsafe: bool,
     pub abi: ExternAbi,
+    /// The input written with `#[rustc_splat]` (the first one, as rustc takes it), below
+    /// `u8::MAX`; `None` for a C-variadic pointer, as rustc's lowering drops it there.
+    pub splatted: Option<u8>,
 }
 
 impl FnType {
@@ -658,9 +661,24 @@ impl TypeColumns<Frozen> {
                     ty(*inner)?;
                     below(raw(*expr), exprs, "an expression id past its arena")?;
                 }
-                TypeRef::Fn(FnType { params, binder: _, is_varargs: _, is_unsafe: _, abi: _ }) => {
+                TypeRef::Fn(FnType {
+                    params,
+                    binder: _,
+                    is_varargs,
+                    is_unsafe: _,
+                    abi: _,
+                    splatted,
+                }) => {
                     if params.is_empty() {
                         return Err("a fn pointer without its return type");
+                    }
+                    if let Some(index) = splatted {
+                        if *is_varargs {
+                            return Err("a C-variadic fn pointer with a splatted input");
+                        }
+                        if usize::from(*index) + 1 >= params.len() || *index == u8::MAX {
+                            return Err("a fn pointer's splatted input past its inputs");
+                        }
                     }
                     params.iter().try_for_each(|&(_, param)| ty(param))?;
                 }
@@ -742,9 +760,10 @@ mod tests {
             fn_type: FnType {
                 binder: Some(Box::new([name("'a")])),
                 params: Box::new([(Some(name("x")), t(0)), (None, t(1))]),
-                is_varargs: true,
+                is_varargs: false,
                 is_unsafe: false,
                 abi: ExternAbi::Rust,
+                splatted: Some(0),
             },
             bounds: vec![
                 TypeBound::Path(PathId::from_type_ref_unchecked(t(0)), TraitBoundModifier::Maybe),

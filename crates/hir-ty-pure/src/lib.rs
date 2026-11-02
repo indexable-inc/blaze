@@ -19,8 +19,14 @@
 //! other. That is the design, not a fallback.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
+pub mod effect_attrs;
+pub mod effects;
+mod function;
+mod home;
 mod identity;
+mod memory;
 pub mod models;
 mod values;
 mod walk;
@@ -35,6 +41,12 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 use blaze_ids::ContentId;
 use intern::Symbol;
 
+pub use effects::{EFFECTS, EffectDef, EffectSet, PURE, Rule};
+pub use function::{
+    EffectProof, FnPurity, Place, PureProof, Refusal, Step, Trusted, check, check_generic,
+    fn_memory, fn_purity, fn_purity_generic, instance_effects,
+};
+pub use memory::{Access, MemoryEffects};
 pub use walk::{main_of, script_purity};
 /// What a pure script's code may do, as its proof says: what the first sandboxed run of it is
 /// checked against (`blaze_usercode::pure::check`), and what its key is made of.

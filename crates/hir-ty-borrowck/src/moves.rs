@@ -616,7 +616,10 @@ impl<'db> Ctx<'_, 'db> {
                 TyKind::Adt(def, _) if self.has_destructor(def.def_id()) => None,
                 _ => Some(*elem),
             },
-            ProjectionElem::Index(_) | ProjectionElem::Subslice { .. } => None,
+            // Not a path of its own: a move out of one is refused (`MoveErrorKind::ReflectedField`).
+            ProjectionElem::Index(_)
+            | ProjectionElem::Subslice { .. }
+            | ProjectionElem::ReflectedField(_) => None,
             &ProjectionElem::ConstantIndex { offset, from_end, .. } => match ty.ty.kind() {
                 TyKind::Array(_, len) => {
                     let len = try_const_usize(self.db, len)? as u64;

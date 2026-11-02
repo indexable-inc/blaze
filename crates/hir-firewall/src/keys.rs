@@ -10,6 +10,7 @@
 
 use base_db::{Db, EditionedFileId, FileId, FileText};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_query::db::{AsId, Database as _, FromId, Id};
 use hir_def::{BlockIdLt, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, Lookup, ModuleIdLt};
 use hir_expand::{AstId, HirFileId};
@@ -43,7 +44,7 @@ pub(crate) struct Edited {
 /// macro call is a body's when its expansion is in the body's syntax, and the first to intern
 /// it is the lowering of the body it is written in. Item macro calls are interned before any
 /// body is asked for: the module checks run first.
-pub(crate) type Interned = HashMap<Id, u32>;
+pub(crate) type Interned = HashMap<Id, u32, Global>;
 
 /// What a key is to the edit of a body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

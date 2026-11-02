@@ -900,7 +900,7 @@ fn main() {
             171..182 'PhantomData': PhantomData<i32>
             189..190 's': S<i32>
             189..201 's.g(|_x| {})': ()
-            193..200 '|_x| {}': impl FnOnce(&'? i32)
+            193..200 '|_x| {}': impl FnOnce(&'?0.0 i32)
             194..196 '_x': &'? i32
             198..200 '{}': ()
             207..208 's': S<i32>
@@ -2263,7 +2263,7 @@ type Bar = impl Foo;
 async fn f<A, B, C>() -> Bar {}
 "#,
         expect![[r#"
-            64..66 '{}': ()
+            64..66 '{}': {unknown}
         "#]],
     );
 }
@@ -2763,10 +2763,10 @@ where
 }
 "#,
         expect![[r#"
-            214..223 'filter_fn': dyn Fn(&'? T) -> bool + 'static
+            214..223 'filter_fn': dyn Fn(&'?0.0 T) -> bool + 'static
             253..360 '{     ...     }': Filter<'a, 'b, T>
             263..354 'Self {...     }': Filter<'a, 'b, T>
-            293..302 'filter_fn': dyn Fn(&'? T) -> bool + 'static
+            293..302 'filter_fn': dyn Fn(&'?0.0 T) -> bool + 'static
             319..323 'None': Option<T>
             340..343 '&()': &'? ()
             341..343 '()': ()

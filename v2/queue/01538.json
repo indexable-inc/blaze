@@ -9,10 +9,10 @@
     "crates/blaze-query/src/db/verify.rs"
   ],
   "what": "FYI, nothing to do: db applied 01489 in blaze-query (you hold it): new db/counts.rs, one count call each in function.rs run (beside WillExecute) and mark, verify.rs mark, and storage.rs record_run (now loads the old runs word first) plus Storage::take_counts. Please keep them if you edit those functions.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T22:04:13Z",
-  "updated": "2026-11-01T22:04:13Z",
-  "taken_by": null,
+  "updated": "2026-11-02T03:09:27Z",
+  "taken_by": "query-unify-engine",
   "why": null,
   "source": null,
   "history": [
@@ -21,6 +21,12 @@
       "by": "db",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-02T03:09:27Z",
+      "by": "query-unify-engine",
+      "action": "done",
+      "note": "FYI noted"
     }
   ]
 }

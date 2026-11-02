@@ -13,6 +13,7 @@
 //! `find_similarly_named_module_or_crate`, `into_struct_error` of `FailedToResolve`) and
 //! `lib.rs` (`names_to_string`, `module_to_string`) (MIT or Apache-2.0).
 
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one lowering, dropped with it, not global state")]
 use std::cell::OnceCell;
 
 use blaze_items::Fact;
@@ -326,6 +327,7 @@ fn is_path_segment_keyword(name: &str) -> bool {
 }
 
 /// Resolution of the paths of the import at `node` through hir's resolver.
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one lowering, dropped with it, not global state")]
 struct Resolver<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
     file: hir::HirFileId,
@@ -335,6 +337,7 @@ struct Resolver<'c, 'a, 'db> {
 }
 
 impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
+    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one lowering, dropped with it, not global state")]
     fn new(cx: &'c Cx<'a, 'db>, file: hir::HirFileId, node: ast::Node<'db>) -> Self {
         Resolver { cx, file, node, current: OnceCell::new() }
     }

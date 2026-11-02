@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use crate::corpus::{Corpus, Value};
 use crate::error::{Error, InternalSnafu, LintNoNodeSnafu};
@@ -223,12 +224,12 @@ struct Source {
 #[derive(Debug, Default)]
 struct LineSuppression {
     all: Option<Source>,
-    rules: HashMap<String, Source>,
+    rules: HashMap<String, Source, Global>,
 }
 
 /// Per-file, per-line suppression entries gathered from comment nodes.
 struct Suppressions {
-    by_file: Vec<HashMap<usize, LineSuppression>>,
+    by_file: Vec<HashMap<usize, LineSuppression, Global>>,
 }
 
 impl Suppressions {
@@ -238,7 +239,7 @@ impl Suppressions {
             .iter()
             .enumerate()
             .map(|(file_index, file)| {
-                let mut lines: HashMap<usize, LineSuppression> = HashMap::default();
+                let mut lines: HashMap<usize, LineSuppression, Global> = HashMap::new_in(Global);
                 for info in &file.nodes {
                     if !info.kind.contains("comment") {
                         continue;

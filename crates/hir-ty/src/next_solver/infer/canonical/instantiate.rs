@@ -156,7 +156,8 @@ impl<'db, 'a> TypeFolder<DbInterner<'db>> for CanonicalInstantiator<'db, 'a> {
                 } else if let Some(&t) = self.cache.get(&t) {
                     t
                 } else {
-                    let res = t.super_fold_with(self);
+                    // One guard per level of the type, as deep as a program builds it (rule 17).
+                    let res = stdx::ensure_sufficient_stack(|| t.super_fold_with(self));
                     assert!(self.cache.insert(t, res));
                     res
                 }
@@ -375,10 +376,24 @@ impl<'db> InferCtxt<'db> {
         // input. See the example above.
         let mut opt_values: IndexVec<BoundVar, Option<GenericArg<'db>>> =
             IndexVec::from_elem_n(None, query_response.var_kinds.len());
+        // The input placeholder each placeholder variable of the result stands for, by index:
+        // the original value at a position whose result is that variable and which is the same
+        // placeholder (up to its universe). An input that was an inference variable unified
+        // with a placeholder is not one: it is unified with whatever the variable maps to below.
+        let mut placeholder_values: IndexVec<BoundVar, Option<GenericArg<'db>>> =
+            IndexVec::from_elem_n(None, query_response.var_kinds.len());
 
         for (original_value, result_value) in
             iter::zip(&original_values.var_values, result_values.var_values)
         {
+            if let Some(b) = canonical_var(result_value)
+                && is_same_placeholder(
+                    query_response.var_kinds.as_slice()[b.as_usize()],
+                    *original_value,
+                )
+            {
+                placeholder_values[b] = Some(*original_value);
+            }
             match result_value.kind() {
                 GenericArgKind::Type(result_value) => {
                     // We disable the instantiation guess for inference variables
@@ -420,7 +435,18 @@ impl<'db> InferCtxt<'db> {
         let variables = query_response.var_kinds;
         let var_values =
             CanonicalVarValues::instantiate(interner, variables, |var_values, kind| {
-                if kind.universe() != UniverseIndex::ROOT {
+                // A placeholder the query was given maps back to the input's, whatever its
+                // universe: a query answered in the caller's own context
+                // (`instantiate_canonical_as_caller`) gives it back in the caller's universe,
+                // not the root, and a new placeholder there would be another type. Only an
+                // input that is that placeholder: one the query unified an input inference
+                // variable with (an environment's, named as an input of its own by
+                // `canonicalize_query_naming`) must constrain that variable, not become it.
+                if !kind.is_existential()
+                    && let Some(k) = placeholder_values[BoundVar::new(var_values.len())]
+                {
+                    k
+                } else if kind.universe() != UniverseIndex::ROOT {
                     // A variable from inside a binder of the query. While ideally these shouldn't
                     // exist at all, we have to deal with them for now.
                     self.instantiate_canonical_var(cause.span(), kind, var_values, |u| {
@@ -571,5 +597,40 @@ mod tests {
                 assert!(instantiate_value(tcx, &var_values, value) == expected);
             }
         });
+    }
+}
+
+/// The canonical variable `arg` is, if it is one.
+fn canonical_var(arg: GenericArg<'_>) -> Option<BoundVar> {
+    match arg.kind() {
+        GenericArgKind::Type(ty) => match ty.kind() {
+            TyKind::Bound(BoundVarIndexKind::Canonical, b) => Some(b.var),
+            _ => None,
+        },
+        GenericArgKind::Lifetime(region) => match region.kind() {
+            RegionKind::ReBound(BoundVarIndexKind::Canonical, b) => Some(b.var),
+            _ => None,
+        },
+        GenericArgKind::Const(konst) => match konst.kind() {
+            ConstKind::Bound(BoundVarIndexKind::Canonical, b) => Some(b.var),
+            _ => None,
+        },
+    }
+}
+
+/// Whether `original` is the placeholder the canonical variable `kind` stands for, up to its
+/// universe (a query resets an input's to the root; a response keeps the answering context's).
+fn is_same_placeholder<'db>(kind: CanonicalVarKind<'db>, original: GenericArg<'db>) -> bool {
+    match (kind, original.kind()) {
+        (CanonicalVarKind::PlaceholderTy(p), GenericArgKind::Type(ty)) => {
+            matches!(ty.kind(), TyKind::Placeholder(o) if o.bound == p.bound)
+        }
+        (CanonicalVarKind::PlaceholderRegion(p), GenericArgKind::Lifetime(region)) => {
+            matches!(region.kind(), RegionKind::RePlaceholder(o) if o.bound == p.bound)
+        }
+        (CanonicalVarKind::PlaceholderConst(p), GenericArgKind::Const(konst)) => {
+            matches!(konst.kind(), ConstKind::Placeholder(o) if o.bound == p.bound)
+        }
+        _ => false,
     }
 }

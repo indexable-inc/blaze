@@ -23,6 +23,7 @@ base-db.workspace = true
 blaze-cas.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
+blaze-graph.workspace = true
 blaze-ids.workspace = true
 blaze-profile.workspace = true
 blaze-usercode.workspace = true
@@ -48,6 +49,7 @@ libc.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-query.workspace = true
+blaze-serde.workspace = true
 blaze-units.workspace = true
 blaze-vfs.workspace = true
 either.workspace = true

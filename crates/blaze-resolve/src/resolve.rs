@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 
 use crate::dependency::Dependency;
 use crate::graph::Graph;
@@ -76,30 +77,30 @@ pub type LockfileMetadata = BTreeMap<String, String>;
 /// read from a lock file has no dependencies on its edges and no features.
 #[derive(Clone)]
 pub struct Resolve {
-    graph: Graph<PackageId, HashSet<Dependency>>,
+    graph: Graph<PackageId, HashSet<Dependency, Global>>,
     /// `[replace]`: the package replaced and its replacement.
-    replacements: HashMap<PackageId, PackageId>,
-    reverse_replacements: HashMap<PackageId, PackageId>,
-    features: HashMap<PackageId, Vec<InternedString>>,
+    replacements: HashMap<PackageId, PackageId, Global>,
+    reverse_replacements: HashMap<PackageId, PackageId, Global>,
+    features: HashMap<PackageId, Vec<InternedString>, Global>,
     /// The sha256 of each package's `.crate`, `None` for sources without one (path, git).
-    checksums: HashMap<PackageId, Option<String>>,
+    checksums: HashMap<PackageId, Option<String>, Global>,
     metadata: LockfileMetadata,
     /// `[patch]` entries that matched nothing, kept as `[[patch.unused]]`.
     unused_patches: Vec<PackageId>,
     version: ResolveVersion,
-    summaries: HashMap<PackageId, Summary>,
+    summaries: HashMap<PackageId, Summary, Global>,
 }
 
 impl Resolve {
     pub fn new(
-        graph: Graph<PackageId, HashSet<Dependency>>,
-        replacements: HashMap<PackageId, PackageId>,
-        features: HashMap<PackageId, Vec<InternedString>>,
-        checksums: HashMap<PackageId, Option<String>>,
+        graph: Graph<PackageId, HashSet<Dependency, Global>>,
+        replacements: HashMap<PackageId, PackageId, Global>,
+        features: HashMap<PackageId, Vec<InternedString>, Global>,
+        checksums: HashMap<PackageId, Option<String>, Global>,
         metadata: LockfileMetadata,
         unused_patches: Vec<PackageId>,
         version: ResolveVersion,
-        summaries: HashMap<PackageId, Summary>,
+        summaries: HashMap<PackageId, Summary, Global>,
     ) -> Resolve {
         let reverse_replacements = replacements.iter().map(|(&p, &r)| (r, p)).collect();
         Resolve {
@@ -197,12 +198,12 @@ unable to verify that `{0}` is the same as when the lockfile was generated
         self.graph.len()
     }
 
-    pub fn graph(&self) -> &Graph<PackageId, HashSet<Dependency>> {
+    pub fn graph(&self) -> &Graph<PackageId, HashSet<Dependency, Global>> {
         &self.graph
     }
 
     /// The packages `pkg` depends on, replacements applied.
-    pub fn deps(&self, pkg: PackageId) -> impl Iterator<Item = (PackageId, &HashSet<Dependency>)> {
+    pub fn deps(&self, pkg: PackageId) -> impl Iterator<Item = (PackageId, &HashSet<Dependency, Global>)> {
         self.deps_not_replaced(pkg)
             .map(move |(id, deps)| (self.replacement(id).unwrap_or(id), deps))
     }
@@ -210,7 +211,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
     pub fn deps_not_replaced(
         &self,
         pkg: PackageId,
-    ) -> impl Iterator<Item = (PackageId, &HashSet<Dependency>)> {
+    ) -> impl Iterator<Item = (PackageId, &HashSet<Dependency, Global>)> {
         self.graph.edges(&pkg).map(|(id, deps)| (*id, deps))
     }
 
@@ -228,7 +229,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
         self.replacements.get(&pkg).cloned()
     }
 
-    pub fn replacements(&self) -> &HashMap<PackageId, PackageId> {
+    pub fn replacements(&self) -> &HashMap<PackageId, PackageId, Global> {
         &self.replacements
     }
 
@@ -244,7 +245,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
         to: PackageId,
         to_crate_name: &str,
     ) -> Result<(InternedString, Option<InternedString>)> {
-        let empty_set = HashSet::default();
+        let empty_set = HashSet::new_in(Global);
         let deps = if from == to { &empty_set } else { self.dependencies_listed(from, to) };
 
         let target_crate_name = || (to_crate_name.to_owned(), None);
@@ -265,7 +266,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
         Ok((InternedString::new(&extern_crate_name), dep_name))
     }
 
-    fn dependencies_listed(&self, from: PackageId, to: PackageId) -> &HashSet<Dependency> {
+    fn dependencies_listed(&self, from: PackageId, to: PackageId) -> &HashSet<Dependency, Global> {
         // We've got a dependency on `from` to `to`, but this dependency edge
         // may be affected by [replace]. If the `to` package is listed as the
         // target of a replacement (aka the key of a reverse replacement map)
@@ -304,7 +305,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
             .collect();
     }
 
-    pub fn checksums(&self) -> &HashMap<PackageId, Option<String>> {
+    pub fn checksums(&self) -> &HashMap<PackageId, Option<String>, Global> {
         &self.checksums
     }
 
@@ -328,7 +329,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
         &self.summaries[&pkg_id]
     }
 
-    pub fn summaries(&self) -> &HashMap<PackageId, Summary> {
+    pub fn summaries(&self) -> &HashMap<PackageId, Summary, Global> {
         &self.summaries
     }
 }

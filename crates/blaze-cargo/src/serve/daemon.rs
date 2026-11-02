@@ -1,7 +1,7 @@
 //! The daemon's loop: one driver, and every state machine of the daemon stepped by it.
 //!
 //! - A completion goes to what asked for it, by its tag: the server, the VFS, the database, the
-//!   store, the checkouts' watchers and cookies and the watches outside views, the jobs (their lock writes, modes and user
+//!   store, the checkouts' watchers and their flushes and the watches outside views, the jobs (their lock writes, modes and user
 //!   code), the image, or the loop's own (the start).
 //! - What arrives goes through [`Heads`] (a request on a checkout waits for its watcher) to the
 //!   session; what the session answers goes to the server. The VFS is flushed after every
@@ -63,7 +63,7 @@ const SERVER: u64 = 1 << 32;
 const VFS: u64 = 2 << 32;
 const DB: u64 = 3 << 32;
 const STORE: u64 = 4 << 32;
-const COOKIES: u64 = 5 << 32;
+const FLUSHES: u64 = 5 << 32;
 const JOBS: u64 = 6 << 32;
 const JOBS_END: u64 = 7 << 32;
 /// The watches of directories outside views ([`blaze_vfs::Outside`]).
@@ -129,6 +129,9 @@ pub struct Still {
     /// The worker pool's jobs parked on a wait.
     pub parked: usize,
     pub waits: Vec<StillWait>,
+    /// Lowerings the loop holds until their root's kept front end is stored, which have no
+    /// node of their own ([`Jobs::held_lowerings`]).
+    pub lowerings: Vec<super::job::HeldLowering>,
 }
 
 pub struct StillWait {
@@ -164,6 +167,12 @@ impl fmt::Display for Still {
         if self.waits.len() > STILL_NAMED {
             write!(f, "\n  and {} more", self.waits.len() - STILL_NAMED)?;
         }
+        for it in self.lowerings.iter().take(STILL_NAMED) {
+            write!(f, "\n  {it}")?;
+        }
+        if self.lowerings.len() > STILL_NAMED {
+            write!(f, "\n  and {} more lowerings held", self.lowerings.len() - STILL_NAMED)?;
+        }
         Ok(())
     }
 }
@@ -195,6 +204,7 @@ macro_rules! world {
             vfs: &mut $daemon.vfs,
             db: &$daemon.db,
             store: &mut $daemon.store,
+            macros: &$daemon.macros,
             std: &mut $daemon.std,
             plane: &mut $daemon.plane,
             mounts: &mut $daemon.mounts,
@@ -216,6 +226,10 @@ pub struct Options {
     /// [`super::build_id`]), under the driver's root: each std key's outputs in a directory of
     /// its own, their records and outputs in the shared store `store` beside them.
     pub std: FileName,
+    /// Where workspaces' build directories are when nothing names one ([`super::builds`]),
+    /// under the driver's root: each workspace's in a directory of its root's id, never in the
+    /// checkout ([`blaze_units::query::BuildConfig::builds`]).
+    pub builds: FileName,
     /// The daemon as a writer of that store: one per state directory.
     pub writer: ContentId,
     pub socket: FileName,
@@ -229,6 +243,9 @@ pub struct Options {
     /// The daemon's `PATH` and `HOME`, an agent's invocation's whole environment.
     pub env: Vec<(String, String)>,
     pub host: String,
+    /// The toolchain whose proc-macro ABI and library the host's proc macros are built with:
+    /// what the daemon's kept expansions are keyed by ([`proc_macro_api::kept::Expansions`]).
+    pub toolchain: ContentId,
     pub color: bool,
     /// Which blaze the daemon is: its executable's hash and that file as it started
     /// ([`super::build_of`]), which a client compares with its own before it sends a request.
@@ -271,6 +288,9 @@ pub struct Daemon<D: Driver, S: Steps> {
     db: Arc<Database>,
     /// Only the loop writes it; workers read it through [`Store::reader`], with no lock.
     store: Store,
+    /// Its proc macros, whose expansions are kept in `store`: made once as it starts and lent
+    /// to every job ([`JobInput::macros`](super::work::JobInput::macros)).
+    macros: Arc<blaze_macro_eval::Macros>,
     /// The standard library's records and outputs, shared with every daemon of this build
     /// ([`Options::std`]); written and read as `store` is.
     std: Store,
@@ -306,13 +326,20 @@ pub struct Daemon<D: Driver, S: Steps> {
     still_since: Option<u64>,
     /// The effects in flight that end on their own, by tag ([`ends_alone`]): what can still
     /// move a build, where the driver's count holds every watch, listen and receive too.
-    ending: blaze_hash::HashMap<Tag, u32>,
+    ending: blaze_hash::HashMap<Tag, u32, std::alloc::Global>,
     /// The plane's nodes that settled: with the spans closed, the progress the watchdog reads.
     settled: u64,
     /// When the plots were last written, on the driver's clock.
     plotted: Duration,
     /// When the memory by tag was last logged, on the driver's clock.
     memory_logged: Duration,
+    /// The collector of what blaze keeps on disk ([`super::gc`]): `blaze serve`'s daemon's
+    /// alone ([`Daemon::collect`]), as a test's daemons share no disk of their own.
+    gc: Option<super::gc::Gc>,
+    /// Builds that failed for want of space, their finish held under the collector's hold id
+    /// until the urgent run they asked for ends and the volumes are measured after it
+    /// ([`super::gc::Gc::hold`]); then told, their error saying what the run found.
+    held: Vec<(u64, Said)>,
 }
 
 /// What of its image a start did not use, each by a rule: the image was written by another
@@ -673,6 +700,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// and listens. Fails naming what could not be read, when the image is damaged, or when
     /// another daemon listens; what of the image it did not use by a rule is [`Daemon::started`].
     pub fn start(mut driver: D, options: Options, steps: Arc<S>, runner: Runner<Step<S>>) -> Result<Daemon<D, S>, StartError> {
+        // Restart to first answer is budgeted (harness/v2/budgets.py `restart-first-answer-*`):
+        // each phase of the start is a span of its own, so a slow start names its phase.
+        let _start = tracing::info_span!(target: "blaze", "daemon start").entered();
         let state = options.state.clone();
         let journal = under(&state, "journal");
         let db_dir = under(&state, "db");
@@ -700,6 +730,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let began = driver.now();
         let mut done = Vec::new();
         let socket = format!("/{}", options.socket);
+        // Waits on the driver for the journal's read, the image's map, the socket's check and
+        // both stores' opens.
+        let reading = tracing::info_span!(target: "blaze", "daemon start: read the state", dir = %state).entered();
         loop {
             let read_all = read.journal.is_some() && read.image.is_some() && read.socket_free;
             let opened = |it: &Store| it.ready() || it.broken().is_some();
@@ -746,12 +779,21 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
             }
         }
+        drop(reading);
         if let Some(broken) = store.broken() {
             return Err(broken.to_string().into());
         }
         if let Some(broken) = std.broken() {
             return Err(format!("the standard library's shared store: {broken}").into());
         }
+        // Every expansion from here on reads the daemon's own store, with no lock.
+        let keeping = proc_macro_api::kept::Keeping::new(proc_macro_api::kept::Expansions {
+            store: store.reader(),
+            toolchain: options.toolchain,
+            environment: proc_macro_api::kept::Environment::new(),
+        })
+        .map_err(|why| format!("keeping proc-macro expansions: {why}"))?;
+        let macros = blaze_macro_eval::Macros::new(proc_macro_api::kept::Keeps::In(keeping));
         let mapping = read.image.flatten();
         let mut started = Started::default();
         // clone: a count of the mapping, shared by the VFS and the image the rest read.
@@ -768,13 +810,19 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             Err(fault) => return Err(StartError::image(&image, fault)),
         };
         // First: every other section names symbols by their IDs in this table.
-        let restored = opened.as_ref().map(|it| (it.clone(), intern::restore_symbols(it.clone(), &on_pool)));
+        let restored = {
+            let _span = tracing::info_span!(target: "blaze", "daemon start: restore the symbols").entered();
+            opened.as_ref().map(|it| (it.clone(), intern::restore_symbols(it.clone(), &on_pool)))
+        };
+        let restoring = tracing::info_span!(target: "blaze", "daemon start: restore the VFS").entered();
         let (mut vfs, recovered) = Vfs::restore(journal.clone(), VFS, &read.journal.unwrap_or_default(), mapping);
         vfs.hash_on(on_pool);
         started.journal_cut = recovered.skipped;
         started.heads_dropped = recovered.heads_dropped;
         vfs_used(recovered.image, &mut started).map_err(|fault| StartError::image(&image, ImageFault::Vfs(fault)))?;
+        drop(restoring);
         let config = blaze_query::Config { tree: Some(Arc::new(vfs.reader())), dir: Some(db_dir), tags: DB };
+        let opening_db = tracing::info_span!(target: "blaze", "daemon start: open the database").entered();
         let mut db = match restored {
             None => Database::new(config),
             Some((_, Err(error))) => {
@@ -801,6 +849,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             }
         };
         steps.register(&mut db);
+        drop(opening_db);
+        let learning = tracing::info_span!(target: "blaze", "daemon start: restore the plane's history").entered();
         let history = match opened.as_deref() {
             None => History::new(HistoryConfig::default()),
             Some(opened) => {
@@ -810,8 +860,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 history
             }
         };
+        drop(learning);
         // Before any front end's database is made: each reads the trees installed when made.
         if let Some(opened) = &opened {
+            let _span = tracing::info_span!(target: "blaze", "daemon start: install the library's trees").entered();
             match super::image::trees(opened) {
                 Ok(Some(trees)) => _ = base_db::trees::install(Arc::new(trees)),
                 Ok(None) => {}
@@ -851,6 +903,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let jobs = Jobs::new(Setup {
             views: format!("/{state}/views"),
             std: format!("/{}", options.std),
+            builds: format!("/{}", options.builds),
             host: options.host,
             env: options.env,
             color: options.color,
@@ -869,10 +922,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             vfs,
             db: Arc::new(db),
             store,
+            macros,
             std,
             plane,
             mounts,
-            heads: Heads::new(COOKIES, WATCHERS, RUNS, Outside::new(options.outside, "/", OUTSIDE)),
+            heads: Heads::new(FLUSHES, WATCHERS, RUNS, Outside::new(options.outside, "/", OUTSIDE)),
             images: Images::new(image, IMAGE),
             jobs,
             steps,
@@ -892,11 +946,23 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             step_watch: Watchdog::new(Watchdog::STEP_BOUND),
             dump_watch: Watchdog::new(Watchdog::STEP_BOUND / 2),
             still_since: None,
-            ending: blaze_hash::HashMap::default(),
+            ending: blaze_hash::HashMap::new_in(std::alloc::Global),
             settled: 0,
             plotted: Duration::ZERO,
             memory_logged: Duration::ZERO,
+            gc: None,
+            held: Vec::new(), // alloc: none until a build runs out of space
         })
+    }
+
+    /// Collects what blaze keeps on disk with `gc`, in the background of its turns.
+    pub fn collect(&mut self, gc: super::gc::Gc) {
+        self.gc = Some(gc);
+    }
+
+    /// The collector, when it collects.
+    pub fn gc(&self) -> Option<&super::gc::Gc> {
+        self.gc.as_ref()
     }
 
     /// Where it listens, for people.
@@ -947,6 +1013,16 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         &self.vfs
     }
 
+    /// The lowerings held for their root's kept front end to be stored, as a stall names them.
+    pub fn held_lowerings(&self) -> Vec<super::job::HeldLowering> {
+        self.jobs.held_lowerings()
+    }
+
+    /// How many kept front ends are being stored ([`super::job`]'s `store_kept`).
+    pub fn storing(&self) -> usize {
+        self.jobs.storing()
+    }
+
     pub fn db(&self) -> &Database {
         &self.db
     }
@@ -954,6 +1030,33 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// Written only by the loop; read elsewhere through [`Store::reader`].
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// When the first job waiting for the store gives up, on the injected clock
+    /// ([`super::job::Jobs::next_deadline`]).
+    #[cfg(test)]
+    pub(super) fn store_deadline(&self) -> Option<Duration> {
+        self.jobs.next_deadline()
+    }
+
+    /// Asks the store to place `key` at `to` as a build would: store traffic that is no step of
+    /// its commit, for a test that it does not count as the commit's progress.
+    #[cfg(test)]
+    pub(super) fn place_for_test(&mut self, key: &blaze_cas::Key, to: FileName) -> Option<Tag> {
+        self.store.place(key, to, &mut self.effects)
+    }
+
+    /// The store, for a test to make a writer of its own: puts in a segment other than the
+    /// loop's, as a worker's are.
+    #[cfg(test)]
+    pub(super) fn store_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+
+    /// Flushes the store as a job's put does: a commit begun outside any job.
+    #[cfg(test)]
+    pub(super) fn flush_store_for_test(&mut self) {
+        self.store.flush(&mut self.effects);
     }
 
     /// The standard library's store, shared with this build's other daemons.
@@ -1012,6 +1115,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         };
         let until = self.session.deadline().map(|at| Duration::from_nanos(at.saturating_sub(ns(self.driver.now()))));
         let wait = until.map_or(wait, |until| wait.min(until));
+        // A job's wait for the store to make its puts durable has a deadline of its own.
+        let jobs_until = self.jobs.next_deadline().map(|at| at.saturating_sub(self.driver.now()));
+        let wait = jobs_until.map_or(wait, |until| wait.min(until));
         let wait = self.observe.wait(self.driver.now()).map_or(wait, |until| wait.min(until));
         self.submit();
         let mut done = std::mem::take(&mut self.done);
@@ -1026,7 +1132,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.dispatch(completion);
         }
         self.done = done;
+        self.expire_jobs();
         self.step_plane();
+        self.store_broke();
         self.observed();
         self.watch();
         self.plot();
@@ -1035,6 +1143,34 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let parts = Parts { db: &self.db, front, vfs: &mut self.vfs, predict: self.plane.predict(), effects: &mut self.effects };
         self.images.step(parts, idle);
         self.between();
+        // A stalled job's leases end once its tasks let go of it.
+        self.jobs.release_leases();
+        if self.stopping.is_none()
+            && let Some(gc) = &mut self.gc
+        {
+            gc.turn(self.jobs.idle(), self.heads.checkouts());
+            let answers = gc.take_answers();
+            let released = gc.take_released();
+            if !answers.is_empty() {
+                self.send(answers);
+            }
+            if !released.is_empty() {
+                self.release_held(released);
+            }
+        }
+        if self.stopping.is_some()
+            && let Some(gc) = &mut self.gc
+        {
+            let abandoned = gc.abandon();
+            if !abandoned.is_empty() {
+                self.send(abandoned);
+            }
+        }
+        if self.stopping.is_some() && !self.held.is_empty() {
+            // alloc: once a stop with builds held
+            let stopped = self.held.iter().map(|(id, _)| (*id, None)).collect();
+            self.release_held_as(stopped);
+        }
         self.stepping_stop();
         self.submit();
         !matches!(self.stopping, Some(Stopping::Over))
@@ -1176,6 +1312,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             loops: self.plane.loops_running(),
             parked: pool.parked(),
             waits,
+            lowerings: self.jobs.held_lowerings(),
         };
         let said = still.to_string();
         tracing::error!("{said}");
@@ -1199,6 +1336,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let memory = blaze_mem::tag::snapshot();
         blaze_profile::plot(Plot::FrameBytes, memory.get(blaze_mem::Tag::Frames).live);
         blaze_profile::plot(Plot::LiveBytes, memory.live());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(bytes) = crate::raw::memory::footprint(std::process::id()) {
+            blaze_profile::plot(Plot::Footprint, bytes);
+        }
         if now.saturating_sub(self.memory_logged) >= MEMORY_LOG_EVERY {
             self.memory_logged = now;
             let said = MemoryLine(&memory).to_string(); // alloc: one line each MEMORY_LOG_EVERY
@@ -1215,6 +1356,47 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.session.tick(&mut cx!(self), now);
         if due {
             self.after_session();
+        }
+    }
+
+    /// The daemon's own store broke, this turn or before: in its completion's dispatch, or in
+    /// job code that put into it or began a commit (a put it could not keep, a commit it
+    /// could not start). Checked once a turn, after the plane stepped, wherever it broke: each
+    /// job waiting on the store fails naming why, then the daemon stops, as it does for the
+    /// shared store, so the next request starts a fresh daemon.
+    ///
+    /// Every live job is failed with the store's reason, not only those at their gate, and
+    /// that whether or not the daemon already failed for another reason: a build still running
+    /// as the daemon stops is answered naming the store, not hung up on.
+    fn store_broke(&mut self) {
+        let (tell_jobs, fail) = (!self.jobs.idle(), self.failed.is_none());
+        if !(tell_jobs || fail) {
+            return;
+        }
+        let Some(broken) = self.store.broken() else { return };
+        // alloc: the error, only in a turn of the break with a job or the daemon left to tell
+        let why = format!("the daemon's store: {broken}");
+        if tell_jobs {
+            let error = ApiError::new(why, None);
+            let mut said = self.spare.said.pop().unwrap_or_default();
+            self.jobs.store_broke(&mut world!(self, said), &error);
+            self.said(said);
+            if fail {
+                self.fail(Failed::Store(error.what));
+            }
+        } else {
+            self.fail(Failed::Store(why));
+        }
+    }
+
+    /// Jobs whose wait for the store is past its deadline fail. Run after the turn's
+    /// completions are dispatched, so a commit step that answered this turn counts before
+    /// the deadline is judged.
+    fn expire_jobs(&mut self) {
+        if self.jobs.next_deadline().is_some_and(|at| at <= self.driver.now()) {
+            let mut said = self.spare.said.pop().unwrap_or_default();
+            self.jobs.expire(&mut world!(self, said));
+            self.said(said);
         }
     }
 
@@ -1244,9 +1426,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
             }
             DB..STORE => self.db.complete(completion, &mut self.effects),
-            STORE..COOKIES => {
+            STORE..FLUSHES => {
                 debug_assert!(self.store.owns(completion.tag), "the store's tags are its");
                 self.store.complete(completion, &mut self.effects);
+                // A step of its commit answered: a wait for it to make puts durable runs out
+                // only when the commit stands still, never because placements or reads come.
+                self.jobs.commit_moved(self.driver.now(), self.store.commit_steps());
                 let placed = self.store.placed();
                 let mut said = self.spare.said.pop().unwrap_or_default();
                 self.jobs.placed(&mut world!(self, said), placed);
@@ -1266,7 +1451,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 self.jobs.looked(&mut world!(self, said));
                 self.said(said);
             }
-            COOKIES..JOBS | OUTSIDE..OUTSIDE_END | WATCHERS..RUNS => {
+            FLUSHES..JOBS | OUTSIDE..OUTSIDE_END | WATCHERS..RUNS => {
                 debug_assert!(self.heads.owns(completion.tag), "the checkouts' tags are theirs");
                 let mut out = self.spare.out.pop().unwrap_or_default();
                 self.heads.complete(&mut self.vfs, completion, &mut self.effects, &mut out);
@@ -1297,9 +1482,28 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     self.send(replies);
                 }
                 Out::Pass(Arrived::Request { from, request: Request::Live }) => self.observe.subscribe(from, self.driver.now()),
+                // `blaze cache gc` while this daemon holds the areas: its collector runs it
+                // (review N14), answered as the run records ([`super::gc::Gc::ask`]).
+                Out::Pass(Arrived::Request { from, request: Request::Gc { dry_run } }) => match &mut self.gc {
+                    Some(gc) if self.stopping.is_none() => gc.ask(from, dry_run),
+                    _ => {
+                        let what = match self.stopping {
+                            Some(_) => "the daemon is stopping: its collector runs no more",
+                            None => "this daemon runs no collector (only `blaze serve`'s does)",
+                        };
+                        let error = ApiError::new(what, Some("blaze cache gc".to_owned())); // alloc: error path
+                        self.server.reply(Reply { to: from, response: blaze_api::Response::Error(error) }, &mut self.effects);
+                        self.server.reply(Reply { to: from, response: blaze_api::Response::Done { ok: false } }, &mut self.effects);
+                    }
+                },
                 Out::Pass(Arrived::Request { from, request: Request::Sql { sql, last_s } }) => {
                     let mut replies = std::mem::take(&mut self.replies);
                     self.observe.query(from, sql, last_s, &mut replies);
+                    self.send(replies);
+                }
+                Out::Pass(Arrived::Request { from, request: Request::Rebuilt { all, cwd, item } }) => {
+                    let mut replies = std::mem::take(&mut self.replies);
+                    self.observe.rebuilt(from, cwd, item, all, self.driver.now(), &mut replies);
                     self.send(replies);
                 }
                 Out::Pass(arrived) => {
@@ -1359,14 +1563,28 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.replies = replies;
     }
 
-    /// What the jobs said, told to the session.
-    fn said(&mut self, mut said: Vec<Said>) {
+    /// What the jobs said, told to the session; a build that failed for want of space held
+    /// first ([`Daemon::hold_for_space`]).
+    fn said(&mut self, said: Vec<Said>) {
+        self.said_as(said, true);
+    }
+
+    /// What the jobs said, told to the session, a finish out of space held when `hold`.
+    fn said_as(&mut self, mut said: Vec<Said>, hold: bool) {
         if said.is_empty() {
             self.spare.said.push(said);
             return;
         }
         let mut replies = std::mem::take(&mut self.replies);
         for it in said.drain(..) {
+            let it = if hold {
+                match self.hold_for_space(it) {
+                    Some(it) => it,
+                    None => continue,
+                }
+            } else {
+                it
+            };
             match it {
                 Said::Report(job, response) => self.session.report(&mut cx!(self), job, response, &mut replies),
                 Said::Finish(job, ok, error, queries) => {
@@ -1377,6 +1595,54 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.spare.said.push(said);
         self.replies = replies;
         self.after_session();
+    }
+
+    /// A job that failed for want of space ([`blaze_gc::space::is_no_space`]) held while the
+    /// daemon collects, when what is full is a volume the collector collects
+    /// ([`super::gc::Gc::hold_for`], review N7): the collector runs urgently, and the finish is
+    /// told once that run freed the space and was measured, or the hold's bound passed
+    /// ([`Daemon::release_held`]). `None` when held.
+    fn hold_for_space(&mut self, it: Said) -> Option<Said> {
+        if self.stopping.is_some() {
+            return Some(it);
+        }
+        let at = match &it {
+            Said::Finish(_, false, Some(error), _) if blaze_gc::space::is_no_space(&error.what) => error.at.as_deref(),
+            _ => return Some(it),
+        };
+        let Some(gc) = &mut self.gc else { return Some(it) };
+        let Some(id) = gc.hold_for(at) else { return Some(it) };
+        self.held.push((id, it));
+        None
+    }
+
+    /// The held finishes the collector let go told, each error saying how its hold ended.
+    fn release_held(&mut self, released: Vec<(u64, blaze_gc::plan::Released)>) {
+        // alloc: once a release, a held build or a few
+        let released = released.into_iter().map(|(id, why)| (id, Some(why))).collect();
+        self.release_held_as(released);
+    }
+
+    /// The held finishes of `released` told, each error extended with how its hold ended
+    /// (`None`: the daemon stopped while it was held), never held again.
+    fn release_held_as(&mut self, released: Vec<(u64, Option<blaze_gc::plan::Released>)>) {
+        let mut said = self.spare.said.pop().unwrap_or_default();
+        for (id, why) in released {
+            let Some(at) = self.held.iter().position(|(held, _)| *held == id) else {
+                tracing::warn!(target: "blaze", hold = id, "the collector let go of a build hold the daemon does not have");
+                continue;
+            };
+            let (_, mut it) = self.held.swap_remove(at);
+            if let Said::Finish(_, _, Some(error), _) = &mut it {
+                // alloc: the error's text, once a held build
+                match &why {
+                    Some(why) => error.what = format!("{}; {why}", error.what),
+                    None => error.what = format!("{}; the daemon stopped while the build waited for gc to free space", error.what),
+                }
+            }
+            said.push(it);
+        }
+        self.said_as(said, false);
     }
 
     /// The plane's thread tasks that ended taken, and what it did given to the jobs, until it
@@ -1412,7 +1678,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 db.reclaim();
             }
             self.vfs.collect_if_due(&self.mounts.roots());
-            self.heads.sweep(&mut self.effects);
+            self.heads.sweep();
             // The requests that read a corrupt group failed with it; the image is not used
             // past it.
             let corrupt = self.db.take_corrupt().into_iter().next().or_else(|| self.vfs.corrupt());

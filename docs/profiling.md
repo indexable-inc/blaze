@@ -29,6 +29,10 @@ several readers.
 
 DuckDB is never linked into blaze. `blaze debug sql` runs the pinned DuckDB CLI.
 
+To profile any other Rust program (not blaze's builds), use ix-prof and `blaze pprof`, described in
+[ix-prof.md](ix-prof.md). Its format is specified in [ix-prof-format.md](ix-prof-format.md).
+blaze-profile names sampled addresses with ix-prof's symbolizer (`crates/blaze-profile/src/symbols.rs`).
+
 ## The schema
 
 Defined once, in `crates/blaze-profile/src/schema.rs`. The Arrow schema of each table, the
@@ -73,23 +77,41 @@ outermost first. `?` marks a nullable column.
 | frame_grow_copies | u64? | blocks its thread's task frames moved to grow them while it was open; null when not counted or closed on another thread |
 | frame_copied_bytes | u64? | bytes those moves copied |
 | awaits | utf8? | what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it |
-| owner | u64? | who runs what a `wait` waits for (the job or thread running the awaited key; null when not known), or who holds a `hold`. A `hold` span (a key held across a suspension, such as a codegen round) names its holder here, so its waiters' `owner` matches it |
+| owner | u64? | who runs what a `wait` waits for (for a key, the job running it, as `switches.job` names it; null when not known), or the job that holds a `hold`. A `hold` span (a key held across a suspension, such as a codegen round) names its holder here, so its waiters' `owner` matches it |
 | steps | u64? | the basic blocks a `macro expand` ran on the evaluator; null for a compiled run, a run that did not end, and any other span |
 | peak_bytes | u64? | the most stack and heap a `macro expand`'s evaluator held at once; null as `steps` is |
 | outcome | dict? | how a `macro expand` ended: ok, panic, step limit, memory limit or error; null for one that did not end (an unwind) |
 | waits_on | dict? | the kind of thing a `wait` waits on: key, lock, channel, io, child or scope |
+| job | u64? | the pool job a `job` span is of, as `switches.job` names it (or `switches.began_as`, for a job that joined the graph after the span opened); the spans under it are its job's too |
+| module_from | dict? | where a `macro module` got its wasm module's machine code: memo (this process had it), store (the daemon's own store) or compiled; null for a load that did not end (refused or failed) |
+| code_bytes | u64? | the bytes of a `macro module`'s machine code, as the store keeps it; null for one from the memo |
 
-The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`) and `hold` (`what`, `holder`). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
+The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`), `hold` (`what`, `holder`), `job` (`kind`, `job`) and `macro module` (`module` in `function`, and as it ends `module_from`, `code_bytes`). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
 
 A `macro expand` span is one run of a proc macro: `function` is the macro's path (`serde_derive::Serialize`), `crate` the crate the call is in. A unit's phase spans (`unit names`, `unit bodies`, `unit codegen`, `unit link`, `unit store`) carry the unit in `unit` as `serde v1.0.219 (build script)`; their `crate` is the target's name, `build-script-build` for every build script. A `scope` wait names the span its caller opened the scope in: `scope 13 of unit codegen serde v1.0.219 (build script)`.
 
 A query span on a body names it: `infer_query`, `infer_anon_const_query`, `mir_body_query`,
-`body_query`, `body_relative_query` and `body_with_source_map_query` carry the body's crate in
-`crate` and its path in `function`. The path is `crate::module::item`, with `{block}` for a block,
-the trait or `<impl Type>` it is in, `Enum::Variant` for a discriminant, and `::{const}` for an
-anonymous const in a body. `hir_def::body_span!` writes them, and only while a subscriber records
+`mir_body_for_closure_query`, `body_query`, `body_relative_query` and
+`body_with_source_map_query` carry the body's crate in `crate` and its path in `function`. No
+two bodies of a crate share a path, so a repeated `function` is a repeated body. The path is
+`crate::module::item`, and `crates/hir-def/src/span_names.rs` writes it:
+- an impl by its ordinal among its file's impls, `<impl#3>::swap_bytes`, and one a macro wrote also by the call, `<impl#0 in macro call 3fa2.5>::get`. Its self type and trait are not in the name, because only its signature has them;
+- a block after the body it is in, with its ordinal among that item's blocks:
+  `outer::{block#2}::inner`;
+- a `const _` by its ordinal among the module's: `_#1`;
+- a closure, an `async` block and an anonymous const after their body, numbered by their
+  expression in it: `outer::{closure#14}`, `outer::{async#9}`, `outer::{const#3}`; one in a
+  signature `Item::{signature const#N}`, in a struct's fields `Item::{field const#N}`;
+- a node a macro wrote also by the call: `_#0 in derive macro 3fa2.0`;
+- a build script by its package, `build_script[serde]::main` (its `crate` stays
+  `build_script_build`);
+- `Enum::Variant` for a discriminant.
+
+`hir_def::body_span!` and `span_names::of_inner` write them, and only while a subscriber records
 the span. The recorder interns each string, so a row holds a number, and also takes values
 recorded after the span began.
+
+Naming a span never changes the query graph. Otherwise a query's reuse would depend on whether the profiler is on. A name reads interned ids, ast ids, module and block identity, the item tree, an impl's or trait's item list and the crate's inputs, and never a signature. Even those reads are edges in blaze-query, so `span_names` reads them inside `blaze_query::db::for_span_text`, which drops them from the running query's frame. That scope returns nothing and writes only into a `String`, so only tracing text leaves it, and `.clippy.toml` refuses any caller but `span_names`. `span_names::tests::naming_a_span_reads_nothing_into_its_query` checks that a query's recorded reads are equal with and without a recording subscriber.
 
 A file's query spans carry its path in `function`: `parse_query` (one parse per file),
 `file_item_tree_query` (one per file and crate, the crate in `crate`; a macro file reads
@@ -123,17 +145,56 @@ noted only when the span closes on the thread it began on.
 |---|---|---|
 | build_id | u64? | the build, or null |
 | process | u32 | the process id |
-| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, `footprint bytes` (the process's physical footprint, all the OS counts against it; `footprint_per_build` gives each build's peak), and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes), and per query kind at a build's end `query executed`, `query verified`, `query reran` |
+| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, `footprint bytes` (the process's physical footprint, all the OS counts against it; `footprint_per_build` gives each build's peak), `macro modules from memo`, `macro modules from store` and `macro modules compiled` (each a daemon's running total of its wasm module loads), and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes) |
 | t_ns | i64 | when |
 | value | f64 | the value then |
 | fiber | u32? | the fiber a `fiber stack` counter is of, or null |
 | job | u64? | the job that ran on that fiber, or null |
-| query_kind | dict? | the query kind a `query` counter is of, as `spans.query_kind` names it, or null |
 
-At a build's end the daemon notes, per query kind, what the query engine counted
-(`blaze_profile::query_counts`): its runs, the rows it verified without running, and the runs of
-a key that kind had run already in the build. `blaze explain reexecution_per_query_kind` puts them
-beside the spans' own runs, distinct keys and repeats, so repeated work shows directly.
+Schema 2 removed `counters.query_kind`: no writer ever filled it. The query engine's counts
+are the `query_counts` table.
+
+### `query_counts`: one row a query function a build ran, verified or evicted
+
+| column | type | meaning |
+|---|---|---|
+| build_id | u64 | the build that ended when they were taken |
+| query | dict | the query function, as `spans.query_kind` names a query's span where they agree |
+| executed | u64 | its runs |
+| verified | u64 | its rows proved unchanged without running |
+| reran | u64 | of its runs, those in a view the row had already run in |
+| evicted_asked | u64 | of its runs, those for a value evicted earlier and asked for again: what eviction cost |
+| evicted | u64 | its values a sweep let go past its cap |
+| refused | u64 | of those, the ones recency alone would have kept |
+| dropped | u64 | its values an explicit `evict_values` or `evict_values_of` let go |
+
+When a build ends, the daemon takes the counts (`blaze_query::db::take_counts`, in
+`crates/blaze-cargo/src/serve/observe.rs`) and the next flush writes them. The counts belong to
+the process, so when two builds overlap, the first one to end gets both builds' counts. Hits
+are not counted, because a warm hit is four loads with no shared write. `blaze explain
+reexecution_per_query_kind` puts the counts beside the spans' runs and distinct function names.
+Profiles written before span names were made distinct shared one `function` across bodies
+(`<impl NonZero>::swap_bytes` for each integer type, `{block}`, every build script's `main`), so
+there a repeated name is not a repeated key.
+
+### `misses`: one row a thing a build computed again instead of reusing, and why
+
+| column | type | meaning |
+|---|---|---|
+| build_id | u64 | the build that computed it again |
+| step | dict | what was computed: `codegen dev template`, `unit`, `build script run` |
+| item | utf8 | what of, by path: a function, a unit, a package's build script's run |
+| cause | dict | `first`, `parts`, `lost`, `beyond`, `unnamed`, `read`, `unrecorded`, `collected`, `unshaped`, `twice`, `always`, `not_explained` or `failed` |
+| what | utf8? | what changed or why, in words: the read, the parts of its key that changed, the reason |
+| names | utf8? | the item the change is of, when it is another's: what a chain of reasons follows |
+| was | utf8? | the hash of what changed when it was last computed, in hex; null for several parts |
+| now | utf8? | its hash now, in hex; null for several parts |
+| changed | u32? | how many of its reads or key parts changed; for `twice`, how many keys it had |
+| of | u32? | how many reads or key parts it has |
+| since | u64? | the last build that computed it and ended well, which it is compared with |
+
+`blaze why` reads the same rows from the daemon (`Request::Rebuilt`). How each cause is worked
+out is in docs/v2/plan/lanes/why.md.
 
 The fiber driver notes the four `fiber stack` counters when a job ends, as one row in the
 recorder (`blaze_profile::fiber_stack`):
@@ -233,12 +294,18 @@ them, each a block that bypasses `blaze_graph::wait`.
 | thread | u32 | the thread it happened on |
 | thread_name | dict | the thread's name |
 | t_ns | i64 | when |
-| event | dict | `started`, `parked`, `resumed` or `ended` |
-| job | u64 | the job: its slot's generation << 32 \| its slot |
+| event | dict | `started` (joined the graph), `parked`, `ready` (made runnable, on its waker's thread), `resumed`, `ended`, `ran` (a pool job that never joined the graph ended), or a pool worker's `idle` and `woke` |
+| job | u64 | the job: its slot's generation << 32 \| its slot; for `ran`, its number before it joined the graph (slot `0xffffffff`); 0 for `idle` and `woke` |
 | fiber | u32 | the fiber it runs on |
 | core | u32 | the driver's core of the thread |
 | wait_kind | dict? | for `parked`: `job`, `key`, `counter`, `until`, or `moved` (the scheduler moving it to another core) |
-| wait_value | u64? | the job's slot, the key's hash, the counter or the deadline; null for `moved` |
+| wait_value | u64? | the job (as `job` names it), the key's hash, the counter or the deadline; null for `moved` |
+| by_job | u64? | for `started` and `ran`, the job that gave it to the pool; for `ready`, the job that woke it |
+| since_ns | i64? | for `started` and `ran`, when the job began on its fiber |
+| began_as | u64? | for `started`, its number before it joined the graph, which its `job` span and its spawned jobs' `by_job` name until then |
+
+A switch costs one ring row. A job's `ended` row is of the build it last worked for, though its
+code let go of the build before it ended.
 
 The fiber driver (`blaze_graph::sched::fiber::observe`) tells the recorder of each switch, under
 its lock, one ring row each. A job's open spans and build move with it:
@@ -250,6 +317,31 @@ next job inside no span. Three views read it:
   `thread_after`, `waited_ns` and `moved`.
 - `job_spans`: `spans` plus the `job` running on the span's thread when it began.
 - `job_tiles`, below, is built from `job_spans`.
+
+### `events`: one row a `tracing` event the recorder keeps, on the thread it happened on
+
+| column | type | |
+|---|---|---|
+| build_id | u64? | the build the thread worked for then |
+| process | u32 | the process id |
+| thread | u32 | the thread it happened on |
+| thread_name | dict | the thread's name |
+| t_ns | i64 | when |
+| job | u64? | the job running on the thread, as `switches.job` names it (its `began_as` before it joined the graph); null on no job |
+| level | dict | `ERROR`, `WARN` or `INFO` |
+| target | dict | its target: the module path it was written in (`blaze_cargo::serve::daemon`), unless it names one |
+| name | dict | its callsite, as `tracing` names it: `event crates/blaze-cargo/src/serve/daemon.rs:1102` |
+| message | utf8? | its message, then each other field as `name=value`; null when its text was let go before a reader read it |
+| span_id | u64? | the span it happened in, as `spans.span_id`; null outside any |
+
+The recorder keeps an event by the rule it keeps a span by (`blaze_profile::keeps`): INFO or
+above, and a target that starts with `blaze` (a `blaze*` crate's `warn!` needs no target). Every
+other event costs its call and is never seen, so the lint `blaze::unrecorded_span` finds one
+outside a `blaze*` crate and names `target: "blaze"`. An event is one ring row: its message and
+fields are interned as one name, so a message that changes each time (a count, a path) costs a
+name each time. `blaze debug time --trace` shows each event as an instant on its job's fiber
+track (its span's lane when it names no job, its thread's otherwise), and `--html` lists the
+build's first 500.
 
 ### `errors`: one row an error a build said: a diagnostic of level error, or each function a refused-functions error names
 
@@ -298,6 +390,52 @@ lane. Its waits are gaps, drawn from `job_waits`.
 | kind | dict | `normal`, `build` or `dev`: the dependency table it is from |
 
 The daemon gives both to `History::linked` and `History::crate_graph` (`crates/blaze-profile/src/facts.rs`) and the next flush writes them.
+
+### `perf_runs`: one row a profiled run of a program blaze built
+
+| column | type | meaning |
+|---|---|---|
+| run | utf8 | 16 hex digits: a hash of its repetitions' profiles |
+| format | u32 | the perf rows' format: a reader refuses one it does not know |
+| target | utf8 | the program, as its profile names it (its executable's file name) |
+| started_unix_ns | i64 | when its first repetition began, on the wall clock |
+| reps | u32 | how many repetitions |
+| tree | utf8? | the digest of the workspace's source tree, as `builds.tree`; null when not known (`gaps` says why) |
+| blaze | utf8 | the BLAKE3 hash of the blaze that recorded it |
+| binary | utf8? | the BLAKE3 hash of the executable that ran; null when it could not be read |
+| build_id | utf8? | the executable's build id, as its profile's frames name it |
+| host | utf8 | the machine it ran on |
+| arch | utf8 | its architecture |
+| os | utf8 | its operating system |
+| cpu_period_ns | u64? | the CPU time one sample stands for; null when the sampler was off |
+| sampler | utf8 | how the sampler ran, as the profile says |
+| samples | u64 | samples of a thread on a CPU, every repetition |
+| unmapped | u64 | of those, samples whose running function no code map names |
+| wall_ns | i64 | the repetitions' wall time, summed |
+| maps | utf8? | the directory of the code maps its rows were named through |
+| gaps | utf8? | each input the run lacks, in words, `; ` between them |
+
+### `perf_functions`: one row a function and a repetition of a profiled run
+
+| column | type | meaning |
+|---|---|---|
+| run | utf8 | the run, as `perf_runs.run` |
+| rep | u32 | the repetition, from 0 |
+| function | utf8 | the instance's demangled path; the frame's symbol when no code map names it |
+| module | utf8? | the image it is in |
+| identity | utf8? | what it is across builds (item, which instance, type arguments), hex: what runs are joined by |
+| code | utf8? | its own code: its code hash and its type arguments' facts, hex |
+| key | utf8? | its code with the codegen settings, hex |
+| deep | utf8? | its key and those of everything it refers to, transitively, hex |
+| self_samples | u64 | samples with it running |
+| total_samples | u64 | samples with it anywhere on the stack, once a sample |
+| calls | u64? | times it was called, counted; null when not counted |
+| instructions | u64? | instructions it retired, counted; null when not counted |
+| gap | utf8? | for a row with no identity: why |
+
+`blaze perf record` writes both, one pair of files a run (`perf-<run>.<table>.parquet`, which the
+history's cap never deletes), and `blaze perf diff` compares two runs function by function, joined by
+`identity`, with a noise bound and a cause class: docs/v2/plan/lanes/perf-history.md.
 
 ### `open`: a result, not stored
 
@@ -396,8 +534,8 @@ Running a build script has no span yet.
 
 ## The flight recorder
 
-Every blaze process keeps a fixed ring per thread, holding that thread's recent spans and
-counter values as `spans` and `counters` rows. Recording allocates nothing and does no I/O. A
+Every blaze process keeps a fixed ring per thread, holding that thread's recent spans, counter
+values, switches and events as `spans`, `counters`, `switches` and `events` rows. Recording allocates nothing and does no I/O. A
 span's fields (`crate`, `function`, `unit`, `awaits`) are interned the first time each value
 is seen, in generations of 16,384 names a shard: a full one becomes the previous and the one
 before it is let go, so a daemon's thousandth build names its keys as its first did. (Until

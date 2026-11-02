@@ -39,6 +39,7 @@ mod tests;
 use base_db::{Crate, Db, Reads, Written};
 use blaze_dbsp::{Pos, ReadIndex, Weight, Work};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_mem::{Frame, Tag};
 use hir_expand::name::Name;
 
@@ -74,7 +75,9 @@ inventory::submit! {
 }
 
 /// What the last write changed of each maintained crate's resolution, in dependency order:
-/// what the impls maintainer (`200`) reads. Cleared at the start of each write.
+/// what the impls maintainer (`200`) reads. Cleared at the start of each write. A crate whose
+/// def map the frozen image serves is in it too, as [`served_delta`] gives it: the impls
+/// maintainer keeps its tables over the decoded map.
 #[derive(Default)]
 pub struct LastWrite {
     pub crates: Vec<CrateDelta>,
@@ -83,8 +86,9 @@ pub struct LastWrite {
 /// One crate's share of [`LastWrite`]; a crate the write left alone has none.
 pub struct CrateDelta {
     pub krate: Crate,
-    /// The crate was maintained from empty: every impl, derive impl and trait it has is an
-    /// insert, and nothing held of it before stands.
+    /// The crate was maintained from empty, or its def map is served from the frozen image
+    /// after a crate graph change ([`served_delta`]): every impl, derive impl and trait it has
+    /// is an insert, and nothing held of it before stands.
     pub fresh: bool,
     /// Impls gone (`-1`, at the position they were handed over at) or new or moved (`+1`).
     pub impls: Vec<(ImplId, Pos, Weight)>,
@@ -144,7 +148,7 @@ fn apply_step(db: &mut Db, written: &Written<'_>, reads: &Reads) {
                 drop_gone(db, state);
             }
             for run in reads.take::<CrateRun>() {
-                finish_crate(db, state, &mut last.crates, run);
+                finish_crate(db, state, &mut last.crates, written, run);
             }
             for scoped in reads.take::<Scoped>() {
                 last.crates.push(finish_records(db, state, scoped));
@@ -160,7 +164,7 @@ fn layer(db: &Db, layers: &mut Vec<Vec<Crate>>) {
     }
     let crates = base_db::all_crates(db);
     // alloc: each crate's layer, once per write
-    let mut depth: HashMap<Crate, usize> = HashMap::default();
+    let mut depth: HashMap<Crate, usize, Global> = HashMap::new_in(Global);
     depth.reserve(crates.len());
     for &krate in crates.iter() {
         let at = depth_of(db, krate, &mut depth);
@@ -176,7 +180,7 @@ fn layer(db: &Db, layers: &mut Vec<Vec<Crate>>) {
 
 /// `krate`'s layer, by a walk of its dependencies: `all_crates` keeps its order across a graph
 /// change that keeps its crates, so a crate may come there before one it now depends on.
-fn depth_of(db: &Db, krate: Crate, depth: &mut HashMap<Crate, usize>) -> usize {
+fn depth_of(db: &Db, krate: Crate, depth: &mut HashMap<Crate, usize, Global>) -> usize {
     if let Some(&at) = depth.get(&krate) {
         return at;
     }
@@ -191,7 +195,7 @@ fn depth_of(db: &Db, krate: Crate, depth: &mut HashMap<Crate, usize>) -> usize {
 /// Drops the state of every crate no longer in the graph, and its published inputs.
 fn drop_gone(db: &mut Db, state: &mut State) {
     let crates = base_db::all_crates(db);
-    let live: HashSet<Crate> = crates.iter().copied().collect(); // alloc: a crate graph change, once
+    let live: HashSet<Crate, Global> = crates.iter().copied().collect(); // alloc: a crate graph change, once
     let gone: Vec<Crate> = state.crates.keys().copied().filter(|it| !live.contains(it)).collect(); // alloc: as above
     for krate in gone {
         state.crates.remove(&krate);
@@ -222,7 +226,7 @@ struct Ran {
     cold: bool,
     delta: Delta,
     moved: Vec<ModuleId>,
-    region: HashSet<ModuleId>,
+    region: HashSet<ModuleId, Global>,
     cutoff: Option<Cutoff>,
     /// An edit of the root's `#![...]` alone wakes no group, and changes the crate data.
     attrs_changed: bool,
@@ -291,7 +295,7 @@ fn read_crate(db: &Db, written: &Written<'_>, run: &mut CrateRun) {
     // the root's censor. A write that changes one runs every group again.
     if cs.data_of.as_ref().is_some_and(|it| it != data) {
         delta.direct.clear();
-        let seeded: HashSet<ModuleId> = delta.seeds.iter().copied().collect(); // alloc: once per write that changes a crate attribute
+        let seeded: HashSet<ModuleId, Global> = delta.seeds.iter().copied().collect(); // alloc: once per write that changes a crate attribute
         delta.seeds.extend(cs.groups.keys().filter(|it| !seeded.contains(*it)));
         delta.removing.clear();
         delta.removing.extend(cs.groups.keys());
@@ -325,13 +329,24 @@ fn read_crate(db: &Db, written: &Written<'_>, run: &mut CrateRun) {
 }
 
 /// Publishes the scopes of what `run`'s job ran, for its records step; or, for a crate whose
-/// write ran nothing, puts its state back with what the write touched into `last`.
-fn finish_crate(db: &mut Db, state: &mut State, last: &mut Vec<CrateDelta>, run: CrateRun) {
+/// write ran nothing, puts its state back with what the write touched into `last`. A crate the
+/// frozen image serves hands `last` its decoded map's items after a crate graph change
+/// ([`served_delta`]).
+fn finish_crate(
+    db: &mut Db,
+    state: &mut State,
+    last: &mut Vec<CrateDelta>,
+    written: &Written<'_>,
+    run: CrateRun,
+) {
     let CrateRun { krate, served, old, work, ran, scratch, .. } = run;
     state.pass.scratch.push(scratch);
     if served {
         if old.is_some() {
             publish::enter(db, krate, None);
+        }
+        if written.crates {
+            last.push(served_delta(db, krate));
         }
         return;
     }
@@ -443,7 +458,7 @@ fn enum_glob_wakes(db: &Db, cs: &mut CrateState, delta: &Delta, out: &mut Vec<Mo
 fn wake_enum_globs(
     db: &Db,
     index: &ReadIndex<Key, ModuleId>,
-    seen: &mut HashMap<EnumId, u64>,
+    seen: &mut HashMap<EnumId, u64, Global>,
     def: ModuleDefId,
     out: &mut Vec<ModuleId>,
 ) {
@@ -494,8 +509,8 @@ fn initial_region(
     delta: &Delta,
     wakes: Vec<ModuleId>,
     cold: bool,
-) -> HashSet<ModuleId> {
-    let mut region = HashSet::default();
+) -> HashSet<ModuleId, Global> {
+    let mut region = HashSet::new_in(Global);
     if cold {
         region.extend(cs.groups.keys().copied());
         return region;
@@ -517,7 +532,7 @@ fn initial_region(
 }
 
 /// The root runs with every group whose expansions write its scope, and those with it.
-fn close_root(cs: &CrateState, region: &mut HashSet<ModuleId>) {
+fn close_root(cs: &CrateState, region: &mut HashSet<ModuleId, Global>) {
     let writers = || cs.groups.iter().filter(|(_, it)| it.out.writes_root).map(|(&it, _)| it);
     if !region.contains(&cs.root) && !writers().any(|it| region.contains(&it)) {
         return;
@@ -530,7 +545,7 @@ fn close_root(cs: &CrateState, region: &mut HashSet<ModuleId>) {
 struct Cutoff {
     out: RunOut,
     /// The rows before the write of the region's modules and of the groups gone.
-    old: HashMap<ModuleId, ModuleData>,
+    old: HashMap<ModuleId, ModuleData, Global>,
     /// Every other row.
     outside: ModulesMap,
     changed: Vec<Changed>,
@@ -546,7 +561,7 @@ fn cutoff(
     cs: &CrateState,
     scratch: &mut Scratch,
     deleted: &[(ModuleId, Group)],
-    region: &mut HashSet<ModuleId>,
+    region: &mut HashSet<ModuleId, Global>,
     mut rows: ModulesMap,
     work: &mut Work,
 ) -> Cutoff {
@@ -585,7 +600,7 @@ fn cutoff(
         }
         // Each reader once: a group noted under a name and under the module whole, or woken by
         // an addition and a removal, counts once, as a removal's reader.
-        let (mut woken, mut redo) = (HashSet::default(), HashSet::default()); // alloc: the readers outside the region, once per run
+        let (mut woken, mut redo) = (HashSet::new_in(Global), HashSet::new_in(Global)); // alloc: the readers outside the region, once per run
         for &((module, name), present) in &changed {
             let into = if present { &mut redo } else { &mut woken };
             readers_outside(cs, region, (module, name), into);
@@ -607,13 +622,13 @@ fn cutoff(
 }
 
 /// The region in group order.
-fn region_order(cs: &CrateState, region: &HashSet<ModuleId>) -> Vec<ModuleId> {
+fn region_order(cs: &CrateState, region: &HashSet<ModuleId, Global>) -> Vec<ModuleId> {
     let mut order: Vec<ModuleId> = region.iter().copied().collect(); // alloc: the region, once per run
     order.sort_unstable_by_key(|it| cs.groups.get_index_of(it));
     order
 }
 
-fn readers_outside(cs: &CrateState, region: &HashSet<ModuleId>, key: Key, into: &mut HashSet<ModuleId>) {
+fn readers_outside(cs: &CrateState, region: &HashSet<ModuleId, Global>, key: Key, into: &mut HashSet<ModuleId, Global>) {
     into.extend(cs.reads.readers(key).filter(|it| !region.contains(it) && cs.groups.contains_key(it)));
 }
 
@@ -626,8 +641,8 @@ fn split(
     order: &[ModuleId],
     deleted: &[(ModuleId, Group)],
     work: &mut Work,
-) -> (ModulesMap, HashMap<ModuleId, ModuleData>) {
-    let mut old = HashMap::default();
+) -> (ModulesMap, HashMap<ModuleId, ModuleData, Global>) {
+    let mut old = HashMap::new_in(Global);
     let ran = order.iter().flat_map(|group| &cs.groups[group].modules);
     for &module in ran.chain(deleted.iter().flat_map(|(_, group)| &group.modules)) {
         if let Some(row) = rows.swap_remove(&module) {
@@ -638,7 +653,7 @@ fn split(
     (rows, old)
 }
 
-fn join(mut outside: ModulesMap, old: HashMap<ModuleId, ModuleData>, work: &mut Work) -> ModulesMap {
+fn join(mut outside: ModulesMap, old: HashMap<ModuleId, ModuleData, Global>, work: &mut Work) -> ModulesMap {
     work.moved += old.len() as u64;
     outside.extend(old);
     outside
@@ -678,7 +693,7 @@ fn publish_scopes(
     mut cs: CrateState,
     delta: Delta,
     cutoff: Option<Cutoff>,
-    region: &HashSet<ModuleId>,
+    region: &HashSet<ModuleId, Global>,
     moved: &[ModuleId],
     cold: bool,
     mut work: Work,
@@ -741,7 +756,7 @@ fn publish_scopes(
 
         // The groups' modules and outputs.
         for (group, gone) in &delta.deleted {
-            for module in gone.modules.iter().filter(|it| !run.group_of.contains_key(it)) {
+            for module in gone.modules.iter().filter(|it| !run.group_of.contains_key(*it)) {
                 cs.inputs.remove(module);
                 cs.group_of.remove(module);
             }
@@ -972,7 +987,7 @@ fn cold(db: &Db, frame: &Frame, krate: Crate) -> (crate::nameres::DefMap, crate:
     let mut cs = CrateState::new(root);
     let none = Written { set: &[], added: &[], removed: &[], roots: &[], crates: true, included: &[], proc_macros: &[] };
     input::read(db, krate, &mut cs, &none, true, false);
-    let mut region: HashSet<ModuleId> = cs.groups.keys().copied().collect();
+    let mut region: HashSet<ModuleId, Global> = cs.groups.keys().copied().collect();
     let mut work = Work::default();
     let Cutoff { mut out, mut outside, order, .. } =
         cutoff(db, frame, krate, &cs, &mut Scratch::default(), &[], &mut region, ModulesMap::new(), &mut work);
@@ -1021,6 +1036,32 @@ fn cold(db: &Db, frame: &Frame, krate: Crate) -> (crate::nameres::DefMap, crate:
         data,
     };
     (def_map, local)
+}
+
+/// The delta of a crate whose def map the frozen image serves, after a crate graph change:
+/// fresh, with every impl, derive impl and trait of the decoded map an insert. This maintainer
+/// runs no such crate, but the impls maintainer (`200`) keeps tables of every crate whose
+/// impls are not frozen too, and a serve (`deps::serve`, itself a crate graph change) gives the
+/// crate a decoded map whose modules are new ids: the rows it held name modules no map of the
+/// crate has. Positions are by `DefMap::modules` order, then by order in the module's scope,
+/// which is the order the impls tables give a crate's modules (`DefMap::module_rank`).
+fn served_delta(db: &Db, krate: Crate) -> CrateDelta {
+    let def_map = crate::nameres::crate_def_map(db, krate);
+    let mut items = Items::default();
+    for (rank, (_, module)) in (0u32..).zip(def_map.modules(db)) {
+        items.add(module.scope(db), &Pos::root().child(rank));
+    }
+    let Items { impls, derive_impls, traits } = items;
+    let mut out = empty_delta(krate);
+    out.fresh = true;
+    // alloc: the delta handed to the impls maintainer, once per crate graph change
+    out.impls = impls.into_iter().map(|(it, pos)| (it, pos, 1)).collect();
+    // alloc: as above
+    out.derive_impls = derive_impls.into_iter().map(|(it, pos)| (it, pos, 1)).collect();
+    // alloc: as above
+    out.traits = traits.into_iter().map(|it| (it, 1)).collect();
+    out.traits.sort_unstable();
+    out
 }
 
 fn empty_delta(krate: Crate) -> CrateDelta {

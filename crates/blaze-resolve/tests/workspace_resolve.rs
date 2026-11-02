@@ -6,11 +6,13 @@
 // The fixtures are cargo's output for a workspace at `/ws` on Linux: `path+file:///ws` ids,
 // which a Windows path is not, and `/ws` is no absolute path there.
 #![cfg(unix)]
+#![feature(allocator_api)]
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::metadata::{MetadataPackages, resolve_graph};
 use blaze_resolve::resolver::{CliFeatures, CompileKind, HasDevUnits, Members, VersionOrdering};
@@ -66,7 +68,7 @@ fn resolve(
     patch: &[(Url, Vec<Patch>)],
     lock: Option<&str>,
 ) -> Resolve {
-    let path_packages: HashMap<SourceId, Summary> = members
+    let path_packages: HashMap<SourceId, Summary, Global> = members
         .iter()
         .copied()
         .chain(packages)

@@ -3,15 +3,15 @@
 //! recursively"). E0091: a type parameter of a type alias its type never names.
 //!
 //! Follows rustc's `compiler/rustc_hir_analysis/src/check/check.rs`
-//! (`check_type_alias_type_params_are_used`), `wfcheck.rs`
-//! (`check_variances_for_type_defn`, `report_bivariance`, `HasErrorDeep`,
-//! `IsProbablyCyclical`, `CollectUsageSpans`), `constrained_generic_params.rs`
-//! (`identify_constrained_generic_params`, `setup_constraining_predicates`, `parameters_for`)
-//! and `diagnostics.rs` (`UnusedGenericParameter`, `RecursiveGenericParameter`,
-//! `UnusedGenericParameterHelp`) (MIT or Apache-2.0). The variances are hir-ty's
-//! `variances_of`.
+//! (`check_type_alias_type_params_are_used`), `wfcheck.rs` (`report_bivariance`,
+//! `IsProbablyCyclical`, `CollectUsageSpans`) and `diagnostics.rs` (`UnusedGenericParameter`,
+//! `RecursiveGenericParameter`, `UnusedGenericParameterHelp`) (MIT or Apache-2.0). Which
+//! parameters are unused (`check_variances_for_type_defn`: variance, then
+//! `identify_constrained_generic_params` over the lowered predicates, then `HasErrorDeep`) is
+//! hir-ty's `adt_unused_params`, through `hir::Adt::unused_params`.
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir::PathResolution;
 use smallvec::SmallVec;
@@ -29,44 +29,24 @@ use crate::{
     model::{Diag, MultiSpan, Span},
 };
 
-/// A predicate `<inputs as Trait>::Assoc == outputs`: the parameters it reads, and those it
-/// constrains once all of those are.
-struct Projection {
-    inputs: HashSet<hir::GenericParam>,
-    outputs: HashSet<hir::GenericParam>,
-}
-
 pub(super) fn check<'db>(cx: &Cx<'_, 'db>, adt: hir::Adt) -> Vec<Found> {
     let db = cx.db;
+    // The parameters rustc's `check_variances_for_type_defn` reports: bivariant, constrained by
+    // no projection of the lowered predicates (`identify_constrained_generic_params`, which sees
+    // `Fn` sugar's `-> T` and associated type bounds as written syntax does not), and none when
+    // a field's type has an error (`HasErrorDeep`). Almost always empty.
+    let unused = adt.unused_params(db);
+    if unused.is_empty() {
+        // alloc: empty, allocates nothing
+        return Vec::new();
+    }
     // alloc: empty, allocates nothing
     let Some(source) = cx.vsema.source(adt) else { return Vec::new() };
     // alloc: empty, allocates nothing
     let Some(list) = source.value.generic_param_list() else { return Vec::new() };
-    // Almost every parameter is constrained by its variance alone: nothing is collected then.
-    let bivariant = |param: hir::GenericParam| param.variance(db) == Some(hir::Variance::Bivariant);
-    if list.generic_params().all(|it| cx.vsema.to_def(it).is_none_or(|param| !bivariant(param))) {
-        // alloc: empty, allocates nothing
-        return Vec::new();
-    }
-    // alloc: only for an ADT with a bivariant parameter, from here on
     let params: Vec<(hir::GenericParam, ast::GenericParam<'db>)> =
-        // alloc: only for an ADT with a bivariant parameter, mostly the error
+        // alloc: only for an ADT with an unconstrained parameter, mostly the error
         list.generic_params().filter_map(|it| Some((cx.vsema.to_def(it)?, it))).collect();
-    let mut constrained: HashSet<hir::GenericParam> = params
-        .iter()
-        .filter(|(param, _)| !bivariant(*param))
-        .map(|(param, _)| *param)
-        // alloc: as above
-        .collect();
-    if params.iter().all(|(param, _)| constrained.contains(param)) {
-        // alloc: empty, allocates nothing
-        return Vec::new();
-    }
-    identify_constrained(cx, source.value, &mut constrained);
-    if params.iter().all(|(param, _)| constrained.contains(param)) || has_error_deep(cx, adt) {
-        // alloc: empty, allocates nothing
-        return Vec::new();
-    }
 
     let fields = field_types(source.value);
     let invalid = Invalid::of(list);
@@ -84,7 +64,7 @@ pub(super) fn check<'db>(cx: &Cx<'_, 'db>, adt: hir::Adt) -> Vec<Found> {
     // alloc: only for an ADT with a bivariant parameter, mostly the error
     let mut found = Vec::new();
     for (param, node) in &params {
-        if constrained.contains(param) {
+        if !unused.contains(param) {
             continue;
         }
         let (name, kind, range) = match node {
@@ -199,7 +179,7 @@ pub(super) fn check_alias<'db>(cx: &Cx<'_, 'db>, alias: hir::TypeAlias) -> Vec<F
         return Vec::new();
     }
     let mut used: SmallVec<[hir::GenericParam; 8]> = SmallVec::new();
-    params_in(cx, ty.syntax(), true, &mut used);
+    params_in(cx, ty.syntax(), &mut used);
 
     // rustc reads the bounds after `Sized` elaboration: a parameter without `?Sized` has an
     // implicit bound, so none at all means every parameter is `?Sized` and bounded by nothing.
@@ -274,109 +254,11 @@ fn written_bounds<'db>(
     (relaxed, written)
 }
 
-/// rustc's `identify_constrained_generic_params` of an ADT's predicates: a parameter an
-/// associated type binding equates with is constrained once all that the projection reads are.
-fn identify_constrained<'db>(cx: &Cx<'_, 'db>, node: ast::Adt<'db>, constrained: &mut HashSet<hir::GenericParam>) {
-    // alloc: only for an ADT with a bivariant parameter
-    let mut projections = Vec::new();
-    if let Some(list) = node.generic_param_list() {
-        for param in list.type_or_const_params() {
-            let ast::TypeOrConstParam::Type(param) = param else { continue };
-            let (Some(def), Some(bounds)) = (cx.vsema.to_def(param), param.type_bound_list()) else {
-                continue;
-            };
-            let inputs = HashSet::from_iter([hir::GenericParam::TypeParam(def)]);
-            bound_projections(cx, &inputs, bounds, &mut projections);
-        }
-    }
-    if let Some(clause) = node.where_clause() {
-        for pred in clause.predicates() {
-            let (Some(ty), Some(bounds)) = (pred.ty(), pred.type_bound_list()) else { continue };
-            let mut inputs = HashSet::default();
-            params_in(cx, ty.syntax(), true, &mut inputs);
-            bound_projections(cx, &inputs, bounds, &mut projections);
-        }
-    }
-    loop {
-        let mut changed = false;
-        for projection in &projections {
-            if projection.inputs.iter().all(|it| constrained.contains(it)) {
-                for &output in &projection.outputs {
-                    changed |= constrained.insert(output);
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-}
-
-/// The projections the associated type bindings of `bounds` on a type reading `inputs` make,
-/// those of associated type bounds (`Trait<Assoc: Other<B = U>>`) included.
-fn bound_projections<'db>(
-    cx: &Cx<'_, 'db>,
-    inputs: &HashSet<hir::GenericParam>,
-    bounds: ast::TypeBoundList<'db>,
-    out: &mut Vec<Projection>,
-) {
-    for bound in bounds.bounds() {
-        let Some(ast::Type::PathType(ty)) = bound.ty() else { continue };
-        let Some(segment) = ty.path().and_then(|it| it.segment()) else { continue };
-        let Some(args) = segment.generic_arg_list() else { continue };
-        // clone: only for an ADT with a bivariant parameter
-        let mut trait_inputs = inputs.clone();
-        for arg in args.generic_args() {
-            if !matches!(arg, ast::GenericArg::AssocTypeArg(_)) {
-                params_in(cx, arg.syntax(), true, &mut trait_inputs);
-            }
-        }
-        for arg in args.generic_args() {
-            let ast::GenericArg::AssocTypeArg(arg) = arg else { continue };
-            // clone: only for an ADT with a bivariant parameter
-            let mut inputs = trait_inputs.clone();
-            if let Some(own) = arg.generic_arg_list() {
-                params_in(cx, own.syntax(), true, &mut inputs);
-            }
-            if let Some(ty) = arg.ty() {
-                let mut outputs = HashSet::default();
-                params_in(cx, ty.syntax(), false, &mut outputs);
-                // clone: only for an ADT with a bivariant parameter
-                out.push(Projection { inputs: inputs.clone(), outputs });
-            }
-            if let Some(list) = arg.type_bound_list() {
-                bound_projections(cx, &inputs, list, out);
-            }
-        }
-    }
-}
-
-/// rustc's `parameters_for`: the parameters named in `node`, those inside a projection or an
-/// unevaluated constant only with `include_nonconstraining`.
-fn params_in<'db>(
-    cx: &Cx<'_, 'db>,
-    node: ast::Node<'db>,
-    include_nonconstraining: bool,
-    out: &mut impl Extend<hir::GenericParam>,
-) {
-    let mut walk = node.preorder();
-    while let Some(event) = walk.next() {
+/// The parameters named anywhere in `node`, inside projections and constants too (rustc's
+/// `parameters_for` with `include_nonconstraining`, as E0091 walks the alias's type).
+fn params_in<'db>(cx: &Cx<'_, 'db>, node: ast::Node<'db>, out: &mut impl Extend<hir::GenericParam>) {
+    for event in node.preorder() {
         let WalkEvent::Enter(node) = event else { continue };
-        if !include_nonconstraining {
-            let skip = match node.kind() {
-                kind if ast::PathType::can_cast(kind) => {
-                    ast::PathType::cast(node).and_then(|ty| ty.path()).is_some_and(|it| is_projection(cx, it))
-                }
-                kind if ast::ConstArg::can_cast(kind) => {
-                    ast::ConstArg::cast(node).is_some_and(|it| !matches!(it.expr(), Some(ast::Expr::PathExpr(_))))
-                }
-                _ => false,
-            };
-            if skip {
-                walk.skip_subtree();
-                continue;
-            }
-        }
         if ast::Lifetime::can_cast(node.kind()) {
             let lifetime = ast::Lifetime::cast(node).expect("a lifetime");
             if let Some(param) = cx.vsema.resolve_lifetime_param(lifetime) {
@@ -398,25 +280,6 @@ fn params_in<'db>(
             _ => {}
         }
     }
-}
-
-/// Whether the type `path` names is an associated type of another: `<T as Trait>::A`, `T::A`.
-fn is_projection<'db>(cx: &Cx<'_, 'db>, path: ast::Path<'db>) -> bool {
-    let Some(qualifier) = path.qualifier() else { return false };
-    let first = qualifier.first_segment();
-    if first.is_some_and(|it| it.type_anchor().is_some()) {
-        return true;
-    }
-    matches!(
-        cx.vsema.resolve_path(qualifier),
-        Some(
-            PathResolution::TypeParam(_)
-                | PathResolution::SelfType(_)
-                | PathResolution::Def(
-                    hir::ModuleDef::Adt(_) | hir::ModuleDef::BuiltinType(_) | hir::ModuleDef::TypeAlias(_)
-                )
-        )
-    )
 }
 
 /// The written types of the fields of every variant.
@@ -500,8 +363,8 @@ fn is_explicitly_bounded<'db>(
 /// name declared twice, whose every use is then an error, and a lifetime declared again or
 /// named `'static` or `'_`, whose name is `ParamName::Error`.
 struct Invalid {
-    names: HashSet<String>,
-    lifetimes: HashSet<TextRange>,
+    names: HashSet<String, Global>,
+    lifetimes: HashSet<TextRange, Global>,
 }
 
 impl Invalid {
@@ -510,7 +373,7 @@ impl Invalid {
         let mut lifetimes: SmallVec<[ast::Lifetime<'t>; 4]> = SmallVec::new();
         let mut names: SmallVec<[ast::Name<'t>; 4]> = SmallVec::new();
         // alloc: empty unless a parameter is declared twice, an error
-        let mut invalid = Invalid { names: HashSet::default(), lifetimes: HashSet::default() };
+        let mut invalid = Invalid { names: HashSet::new_in(Global), lifetimes: HashSet::new_in(Global) };
         for param in list.generic_params() {
             match param {
                 ast::GenericParam::LifetimeParam(it) => {
@@ -551,17 +414,6 @@ impl Invalid {
     }
 }
 
-/// rustc's `HasErrorDeep`: whether the fields, and those of the types they hold, have a type
-/// that is an error.
-fn has_error_deep(cx: &Cx<'_, '_>, adt: hir::Adt) -> bool {
-    let mut error = false;
-    walk_fields(cx, adt, |ty, _| {
-        error |= ty.is_unknown();
-        error
-    });
-    error
-}
-
 /// rustc's `IsProbablyCyclical`: whether a field, or one of a type it holds, holds `adt`.
 fn is_probably_cyclical(cx: &Cx<'_, '_>, adt: hir::Adt) -> bool {
     let mut cyclical = false;
@@ -574,7 +426,7 @@ fn is_probably_cyclical(cx: &Cx<'_, '_>, adt: hir::Adt) -> bool {
 
 /// Every type in the fields of `adt` and, once each, of the ADTs they hold, until `stop` says.
 fn walk_fields(cx: &Cx<'_, '_>, adt: hir::Adt, mut stop: impl FnMut(&hir::Type<'_>, Option<hir::Adt>) -> bool) {
-    let mut seen = HashSet::from_iter([adt]);
+    let mut seen = HashSet::from_iter_in([adt], Global);
     // alloc: only for an ADT with a bivariant parameter
     let mut queue = vec![adt];
     while let Some(adt) = queue.pop() {

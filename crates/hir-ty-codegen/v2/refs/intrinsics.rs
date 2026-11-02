@@ -16,6 +16,7 @@ use std::{
 };
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use cranelift_codegen::ir::{self, types};
 use hir_def::{
     AdtId, FunctionId, HasModule, VariantId,
@@ -38,7 +39,8 @@ use smallvec::SmallVec;
 
 use super::{Tys, Walk, told};
 use crate::{
-    AbiScalar, Arch, CodegenError, VariableArguments, asm, avx512, f16_f128, neon, sve, x86,
+    AbiScalar, Arch, CodegenError, NarrowInt, VariableArguments, asm, avx512, f16_f128, neon, sve,
+    x86,
 };
 
 /// Whether `wasm_simd_intrinsic` may make wasm's vector instructions of the generic intrinsic
@@ -320,7 +322,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     | TyKind::Str
             )
         {
-            return self.equal_parts(ty, &mut HashSet::default());
+            return self.equal_parts(ty, &mut HashSet::new_in(Global));
         }
         if matches!(ty.kind(), TyKind::RawPtr(..))
             && matches!(self.ty_layout(ty)?.backend_repr, BackendRepr::ScalarPair { .. })
@@ -597,7 +599,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 if intrinsic == I::RawEq {
                     let size = self.ty_layout(generic_args.type_at(0))?.size.bytes();
                     // `copies::equal_bytes` compares as much inline.
-                    if size <= 2 * u64::from(crate::ptr().bytes()) {
+                    if size <= 2 * u64::from(self.fx.cg.target.pointer().bytes()) {
                         return Ok(true);
                     }
                 }
@@ -1036,11 +1038,11 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     "x86.sha256msg1" => "sha256msg1 xmm0, xmm1",
                     _ => "sha256msg2 xmm0, xmm1",
                 };
-                self.assembly(asm::vector_instruction(instruction, "xmm0"))?;
+                self.assembly(asm::vector_instruction(self.fx.cg.target.call_conv, instruction, "xmm0"))?;
             }
             ("x86.sha256rnds2", [_, _, _]) => {
                 let rounds = "movdqa xmm3, xmm0\nmovdqa xmm0, xmm2\nsha256rnds2 xmm3, xmm1";
-                self.assembly(asm::vector_instruction(rounds, "xmm3"))?;
+                self.assembly(asm::vector_instruction(self.fx.cg.target.call_conv, rounds, "xmm3"))?;
             }
             (
                 "aarch64.crypto.sha256su0"
@@ -1061,8 +1063,8 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 | "aarch64.crypto.sha1su0",
                 [_, _, _],
             ) => self.assembly(crate::neon_crypto(name))?,
-            ("x86.sha1rnds4", [_, _, _]) => self.assembly(asm::sha1rnds4())?,
-            ("x86.xgetbv", [_]) => self.assembly(asm::xgetbv())?,
+            ("x86.sha1rnds4", [_, _, _]) => self.assembly(asm::sha1rnds4(self.fx.cg.target.call_conv))?,
+            ("x86.xgetbv", [_]) => self.assembly(asm::xgetbv(self.fx.cg.target.call_conv))?,
             (
                 "aarch64.crc32b" | "aarch64.crc32h" | "aarch64.crc32w" | "aarch64.crc32x"
                 | "aarch64.crc32cb" | "aarch64.crc32ch" | "aarch64.crc32cw" | "aarch64.crc32cx",
@@ -1076,7 +1078,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 [_, _],
             ) => {
                 let data = self.ty_scalar(arg_tys[1])?;
-                self.assembly(asm::x86_crc32(data.ty.bits()))?;
+                self.assembly(asm::x86_crc32(self.fx.cg.target.call_conv, data.ty.bits()))?;
             }
             ("aarch64.dmb" | "aarch64.dsb" | "aarch64.hint", [option]) => {
                 let Some(option) = self.const_immediate(option)? else {
@@ -1107,7 +1109,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             ("aarch64.isb", [_]) => self.assembly(asm::isb())?,
             ("x86.vcvtps2ph.128" | "x86.vcvtps2ph.256", [_, _]) => {
                 let register = if name.ends_with("256") { "ymm0" } else { "xmm0" };
-                self.assembly(asm::vcvtps2ph(register))?;
+                self.assembly(asm::vcvtps2ph(self.fx.cg.target.call_conv, register))?;
             }
             (_, [_, _, _]) if name.starts_with("x86.avx512.vpermi2var.") => {
                 if !matches!(name.split('.').nth(3), Some("qi" | "hi" | "d" | "ps" | "q" | "pd")) {
@@ -1274,7 +1276,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     fn fused_forms(&mut self, bytes: u32, suffix: &str) -> Result<(), String> {
         let loads = [avx512::Load::Vector(bytes); 3];
         for text in fma_texts(bytes, suffix) {
-            self.assembly(asm::avx512_function(&loads, &text, avx512::Out::Vector(bytes)))?;
+            self.assembly(asm::avx512_function(self.fx.cg.target.call_conv, &loads, &text, avx512::Out::Vector(bytes)))?;
         }
         Ok(())
     }
@@ -1336,7 +1338,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     "`{name}` of lanes of f16 on x86-64 without an instruction for it here"
                 )));
             };
-            return self.assembly(asm::avx512_function(&lowered.loads, &lowered.text, lowered.out));
+            return self.assembly(asm::avx512_function(self.fx.cg.target.call_conv, &lowered.loads, &lowered.text, lowered.out));
         }
         let single_and_half = op == SimdOp::Cast && matches!(widths, Some((16, 32) | (32, 16)));
         if self.fx.cg.target.arch != Arch::Aarch64
@@ -1486,7 +1488,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     TyKind::Int(_) => ((value << unused) as i128 >> unused) as u128,
                     _ => value,
                 };
-                Ok(Some(value & mask))
+                Ok(Some(NarrowInt::of(ty).map_or(value & mask, |int| int.normalize_bits(value))))
             }
             _ => Ok(None),
         }
@@ -1573,7 +1575,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             // alloc: the error's message
             return Err(unsupported(format!("`llvm.{name}` returning {dst_ty:?}")));
         }
-        self.assembly(asm::avx512_function(&lowered.loads, &lowered.text, lowered.out))?;
+        self.assembly(asm::avx512_function(self.fx.cg.target.call_conv, &lowered.loads, &lowered.text, lowered.out))?;
         Ok(true)
     }
 
@@ -1655,7 +1657,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             }
         };
         let text =
-            asm::x86_function(&text, &reads, &writes, &lowered.clobbers).map_err(unsupported)?;
+            asm::x86_function(self.fx.cg.target.call_conv, &text, &reads, &writes, &lowered.clobbers).map_err(unsupported)?;
         self.assembly(text)
     }
 
@@ -1798,7 +1800,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
 
     /// `branch_unless_equal` of two values of `ty`: `memcmp` of bytes, a soft float's `==`.
     /// `seen` are the types already looked at, which ask for the same wherever they are.
-    fn equal_parts(&mut self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>>) -> Result<(), String> {
+    fn equal_parts(&mut self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>, Global>) -> Result<(), String> {
         let db = self.db();
         let ty = self.fx.normalize(ty);
         if !seen.insert(ty) {
@@ -1918,7 +1920,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 self.widen_half(types::F32)?;
                 self.scalar_cast(single, to)
             }
-            (types::I128, types::F16) if self.on_x86() => {
+            (types::I128, types::F16) if self.fx.half_by_builtins() => {
                 self.symbol(if from.signed { "__floattihf" } else { "__floatuntihf" })
             }
             (_, types::F16) => {
@@ -2070,19 +2072,23 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
 
     /// `widen_half` of an `f16` to `to`.
     fn widen_half(&mut self, to: ir::Type) -> Result<(), String> {
-        if !self.on_x86() {
+        if !self.fx.half_by_builtins() {
             return self.assembly(asm::fcvt(letter(to), 'h'));
         }
-        self.x86_soft_half()?;
+        if self.on_x86() {
+            self.x86_soft_half()?;
+        }
         self.symbol("__extendhfsf2")
     }
 
     /// `narrow_to_half` of an `f32` or `f64` of `from`.
     fn narrow_to_half(&mut self, from: ir::Type) -> Result<(), String> {
-        if !self.on_x86() {
+        if !self.fx.half_by_builtins() {
             return self.assembly(asm::fcvt('h', letter(from)));
         }
-        self.x86_soft_half()?;
+        if self.on_x86() {
+            self.x86_soft_half()?;
+        }
         self.symbol(if from == types::F32 { "__truncsfhf2" } else { "__truncdfhf2" })
     }
 

@@ -1,0 +1,4 @@
+[package]
+name = "tail_calls"
+version = "0.1.0"
+edition = "2024"

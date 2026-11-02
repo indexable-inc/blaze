@@ -11,6 +11,7 @@ mod literal;
 
 use base_db::Crate;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{
     AdtId, EnumId, HasModule as _,
     hir::{BinaryOp, CmpOp, Expr, ExprId, Literal, Ordering, Pat, PatId, UnaryOp},
@@ -50,7 +51,7 @@ pub(crate) struct TypeLimits {
     option: Option<EnumId>,
     /// Whether an ADT is `NonNull` (its diagnostic item), looked up once per ADT compared as a
     /// pointer: about 16 bytes an entry, one hash probe a lookup.
-    non_null: HashMap<AdtId, bool>,
+    non_null: HashMap<AdtId, bool, Global>,
 }
 
 /// The diagnostic items the pass compares with, interned once: a comparison is a pointer
@@ -87,7 +88,7 @@ impl Default for TypeLimits {
             krate: None,
             pointer_bits: None,
             option: None,
-            non_null: HashMap::default(),
+            non_null: HashMap::new_in(Global),
         }
     }
 }

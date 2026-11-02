@@ -5,9 +5,9 @@
 //! the workspace's included, whose def-map indices move on edits.
 
 use std::{
-    collections::hash_map::Entry,
     mem::{self, offset_of},
 };
+use blaze_hash::hash_map::Entry;
 
 use base_db::Db;
 use blaze_format::{
@@ -15,6 +15,7 @@ use blaze_format::{
     schema_of,
 };
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_query::db::{AsId, FromId};
 use hir_def::{
@@ -247,7 +248,7 @@ pub(super) struct Keyed<'a, 'db> {
     /// Each item's kind, as an `IdKind`'s number, at its index.
     pub(super) kinds: Vec<u8>,
     /// Each key given, with the item it was given for and its index.
-    seen: HashMap<ContentId, (IdKind, u64, u32)>,
+    seen: HashMap<ContentId, (IdKind, u64, u32), Global>,
 }
 
 impl<'a, 'db> Keyed<'a, 'db> {
@@ -258,7 +259,7 @@ impl<'a, 'db> Keyed<'a, 'db> {
         body: DefWithBodyId,
     ) -> Keyed<'a, 'db> {
         // alloc: empty until an item is named; once per body offered
-        Keyed { db, facts, body, keys: Vec::new(), kinds: Vec::new(), seen: HashMap::default() }
+        Keyed { db, facts, body, keys: Vec::new(), kinds: Vec::new(), seen: HashMap::new_in(Global) }
     }
 }
 

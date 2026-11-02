@@ -84,7 +84,7 @@ pub(in crate::method_resolution) fn body_part(db: &Db, module: ModuleId) -> Body
         if holders.is_empty() {
             return BodyPart::default();
         }
-        if tracing_holders() {
+        if tracing_holders(db) {
             trace_holders(db, module, &holders);
         }
         let mut heads: Vec<Head, &Frame> = Vec::new_in(frame);

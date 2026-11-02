@@ -4,10 +4,10 @@
 
 use std::{
     cell::UnsafeCell,
-    collections::hash_map::Entry,
     ptr,
     sync::atomic::{AtomicU8, Ordering},
 };
+use blaze_hash::hash_map::Entry;
 
 use super::{Lock, claim_flight, flight, give_way, hex, task};
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
     sched::{self, CounterId, Wait},
 };
 
-type ByKey<V> = blaze_hash::ByHash<Key, V>;
+type ByKey<V> = blaze_hash::ByHash<Key, V, std::alloc::Global>; // alloc: a shard's table, for the pump's life
 
 const RUNNING: u8 = 0;
 const DONE: u8 = 1;

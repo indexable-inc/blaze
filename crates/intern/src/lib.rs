@@ -11,6 +11,7 @@
 //! record). The symbol table's one view of its bytes as text is `symbol`'s `text` module.
 
 #![deny(unsafe_code)]
+#![feature(allocator_api)]
 
 mod arena;
 mod concat;

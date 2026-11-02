@@ -38,6 +38,11 @@ use crate::guest::{Guest, Stop, put_word, word};
 
 use self::target::{Errno, Sys, Target};
 
+pub(crate) use self::{
+    files::{At, FIRST_FD},
+    random::HASHMAP_KEYS,
+};
+
 /// What a claimed function is: which shim, decided once per function.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Shim {
@@ -55,7 +60,7 @@ pub(crate) enum Answer {
 }
 
 /// What a shim returns: an answer, or why the expansion stops.
-type Done = Result<Answer, Stop>;
+pub(crate) type Done = Result<Answer, Stop>;
 
 /// Each function a shim answers, by what it is under every name it has.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,6 +71,7 @@ enum Call {
     Pread,
     Readv,
     Close,
+    Fcntl,
     Lseek,
     Fstat,
     Stat,
@@ -116,6 +122,7 @@ impl Call {
             "pread" | "pread64" => Call::Pread,
             "readv" => Call::Readv,
             "close" | "close$NOCANCEL" => Call::Close,
+            "fcntl" | "fcntl64" => Call::Fcntl,
             "lseek" | "lseek64" => Call::Lseek,
             "fstat" | "fstat64" | "fstat$INODE64" => Call::Fstat,
             "stat" | "stat64" | "stat$INODE64" => Call::Stat,
@@ -220,6 +227,9 @@ pub(crate) struct Os<'a> {
     streams: Vec<files::Stream>,
     trace: Trace,
     unkeyable: Option<String>,
+    /// Whether a path outside the roots stops the expansion, naming it ([`Os::wasm`]), rather
+    /// than failing with `EACCES`.
+    refusal_stops: bool,
     /// The value `getenv` gave of each variable it was asked of that is set, by its name.
     answers: Vec<(&'a str, u64)>,
     /// What `environ` gives, once made.
@@ -248,6 +258,7 @@ impl<'a> Os<'a> {
             streams: Vec::new(), // alloc: none until the first `opendir`, then reused
             trace: Trace::default(),
             unkeyable: None,
+            refusal_stops: false,
             answers: Vec::new(), // alloc: one entry per variable read, once
             environ: None,
             allocated: Vec::new(), // alloc: none until a `realpath` or `getcwd` allocates
@@ -257,6 +268,13 @@ impl<'a> Os<'a> {
             scratch: Vec::new(), // alloc: none until the first listing, then reused
             bytes: Vec::new(), // alloc: none until the first string given, then reused
         }
+    }
+
+    /// The machine of a wasm macro's WASI (`wasm/wasi.rs`): [`Os::new`]'s, except that a read
+    /// outside the roots stops the expansion with an error naming the path, as the sandbox
+    /// refuses it, where the evaluator's `EACCES` would leave the macro to say it or not.
+    pub(crate) fn wasm(env: &'a Env) -> Os<'a> {
+        Os { refusal_stops: true, ..Os::new(env) }
     }
 
     /// Whether `func` is one of the shims: an extern function of a known name (its
@@ -327,6 +345,7 @@ impl<'a> Os<'a> {
             }
             Call::Readv => self.readv(t, g, ret, (int(args, 0)?, word(args, 1)?, int(args, 2)?)),
             Call::Close => self.close(t, g, ret, int(args, 0)?),
+            Call::Fcntl => self.fcntl(t, g, ret, (int(args, 0)?, int(args, 1)?)),
             Call::Lseek => self.lseek(t, g, ret, (int(args, 0)?, int(args, 1)?, int(args, 2)?)),
             Call::Fstat => self.fstat(t, g, ret, (int(args, 0)?, word(args, 1)?)),
             Call::Stat | Call::Lstat => {

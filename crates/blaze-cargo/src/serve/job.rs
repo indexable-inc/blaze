@@ -47,8 +47,8 @@ use std::{
 };
 
 use blaze_api::{
-    ApiError, Artifact, Diagnostic, Edit, FetchVerb, Level, LinkKind, Mismatch, Response,
-    ServedCrate, ServedPart, Targets, TestOutcome, TestResult, Traced, Ub, UnitStarted, Verb,
+    ApiError, Artifact, ArtifactKind, Diagnostic, Edit, FetchVerb, Level, LinkKind, Mismatch, Response,
+    ServedCrate, ServedPart, Targets, TestOutcome, TestResult, Traced, Ub, UnitOf, UnitStarted, Verb,
     Worked,
     build::{Builder, JobId, Opened, Work},
 };
@@ -59,9 +59,13 @@ use blaze_graph::{
     plane::NodeRef,
 };
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_history::History;
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
-use blaze_profile::history::{self as profile_history, BuildRow};
+use blaze_profile::{
+    facts::{CrateDepRow, DepKind, LinkOutcome, LinkRow},
+    history::{self as profile_history, BuildRow},
+};
 use blaze_protocol::events::NodeKind;
 use blaze_query::{Database, QueryKey};
 use blaze_units::{
@@ -82,10 +86,11 @@ use super::{
     heads::Heads,
     image::{Images, Parts},
     mounts::Mounts,
+    observe::Ended,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
         Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library,
-        Linking, Phase, Readers, Runs, Selection, Source, Steps, Writer,
+        Linking, Phase, Readers, RunPuts, Runs, Selection, Source, Steps, Writer,
     },
 };
 use crate::cli::print::Format;
@@ -125,6 +130,9 @@ pub enum Value<S: Steps> {
     Evaluated(Result<TestResult, ApiError>),
     /// [`Work::Ahead`]: the units to build ahead ([`Front::ahead`]).
     Ahead(Result<Vec<u32>, ApiError>),
+    /// What a kept front end left for the store ([`Steps::store_kept`]), and the front end
+    /// given back: none when its store panicked, as it may be half written.
+    StoredKept(Option<S::KeptFront>, Result<Vec<super::work::KeptPut>, ApiError>),
 }
 
 /// What jobs tell the session, in order.
@@ -142,6 +150,8 @@ pub struct World<'a, S: Steps> {
     pub vfs: &'a mut Vfs,
     pub db: &'a Arc<Database>,
     pub store: &'a mut Store,
+    /// The daemon's proc macros, whose expansions are kept in `store`.
+    pub macros: &'a Arc<blaze_macro_eval::Macros>,
     /// The standard library's store, shared by this build's daemons ([`super::Options::std`]).
     pub std: &'a mut Store,
     pub plane: &'a mut Tasks<S>,
@@ -161,6 +171,8 @@ pub struct Setup {
     /// Where the standard library's builds are placed, every workspace's and every daemon's of
     /// this blaze build: [`super::Options::std`].
     pub std: String,
+    /// Where a workspace's build directory is when nothing names one: [`super::Options::builds`].
+    pub builds: String,
     /// The triple of the machine the daemon runs on.
     pub host: String,
     /// The daemon's `PATH` and `HOME`: an agent's invocation's whole environment.
@@ -206,7 +218,9 @@ pub(super) enum Does<S: Steps> {
     /// Task `at` fetches `fetches[at]`.
     Fetch { steps: Arc<S>, fetches: Arc<[Fetch]> },
     /// The head's last front end, taken by the run that lowers into it.
-    Lower { steps: Arc<S>, input: JobInput, kept: Mutex<Option<S::KeptFront>> },
+    /// Its build dirs leased first ([`lease_build_dirs`]) into `leases`, against `checkout`,
+    /// `builds` the dir of every workspace's build dir.
+    Lower { steps: Arc<S>, input: JobInput, kept: Mutex<Option<S::KeptFront>>, leases: Arc<Mutex<Leases>>, checkout: String, builds: String },
     /// Task `at` compiles unit `at`. A compile that gives way puts the images it was given in
     /// `back` ([`Paths::back`]), so its next try still relinks them.
     Compile { front: Arc<S::Front>, back: Arc<SegQueue<Image<S>>> },
@@ -225,6 +239,9 @@ pub(super) enum Does<S: Steps> {
     Pack { front: Arc<S::Front>, program: String },
     /// As [`Does::Pack`] is: the documentation sets `cfg(doc)` on the crates it documents.
     Doc { front: Arc<S::Front>, no_deps: bool, private: bool },
+    /// A job's front end as it is kept, what its build left for the store written from it
+    /// ([`Steps::store_kept`]); taken by the task and given back in its value.
+    StoreKept { steps: Arc<S>, kept: Mutex<Option<S::KeptFront>>, checkout: String },
 }
 
 impl<S: Steps> Step<S> {
@@ -274,6 +291,7 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Ahead { .. } => tracing::info_span!("ahead"),
             Does::Pack { .. } => tracing::info_span!("pack"),
             Does::Doc { .. } => tracing::info_span!("doc"),
+            Does::StoreKept { checkout, .. } => tracing::info_span!(target: "blaze", "store kept front end", checkout = %checkout),
         }
         .entered();
         match &self.does {
@@ -284,7 +302,45 @@ impl<S: Steps> plane::Work for Step<S> {
                 // clone: a refcount per fetch
                 self.settle(fetched, |it| Value::Fetched(fetches.clone(), arg, it))
             }
-            Does::Lower { steps, input, kept } => {
+            Does::Lower { steps, input, kept, leases, checkout, builds } => {
+                // Its build dirs' leases, before anything is built into them: here, on the pool.
+                // The lock is held only to read and store the field, never across the lease's
+                // file IO and syncs (review M1): one lowering a job, so nothing races between.
+                let (unleased, first_try_ns) = {
+                    let held = leases.lock();
+                    (held.held.is_empty(), held.first_try_ns)
+                };
+                if unleased {
+                    match lease_build_dirs(&input.units, checkout, builds) {
+                        Ok(Ok(taken)) => {
+                            let mut held = leases.lock();
+                            if held.held.is_empty() {
+                                held.held = taken;
+                            }
+                        }
+                        Ok(Err((dir, wait))) => {
+                            // Bounded by time since the first try, not by a count a hot repost
+                            // spends in milliseconds (review N8).
+                            let now = u64::try_from(blaze_profile::clock::mono_ns()).unwrap_or(0);
+                            let first = first_try_ns.unwrap_or(now);
+                            let waited = std::time::Duration::from_nanos(now.saturating_sub(first));
+                            if waited < blaze_gc::lease::GIVE_WAY {
+                                leases.lock().first_try_ns = Some(first);
+                                return self.settle(Err(Failed::Again), Value::Lowered);
+                            }
+                            let why = format!(
+                                "the build dir {dir} was not leased in {waited:?} of trying: {wait}"
+                            );
+                            let error = ApiError::new(why, Some(dir));
+                            return self.settle(Err(Failed::Error(error)), Value::Lowered);
+                        }
+                        Err(why) => {
+                            // clone: the error's own path, once
+                            let error = ApiError::new(why, Some(input.units.target_dir.clone()));
+                            return self.settle(Err(Failed::Error(error)), Value::Lowered);
+                        }
+                    }
+                }
                 let kept = kept.lock().take();
                 self.settle(steps.lower(input, kept), Value::Lowered)
             }
@@ -293,7 +349,8 @@ impl<S: Steps> plane::Work for Step<S> {
                 let Readers { this, mut images, .. } = readers;
                 let reader = this.expect("a task that reads is posted with its reader");
                 let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| front.compile(reader, unit, phase, &mut images)));
-                let mut panicked = None;
+                // Why the unit failed, when its compile panicked or erred, for its node.
+                let mut failed_why = None;
                 let compiled = match caught {
                     Ok(it) => it,
                     Err(payload) if payload.is::<blaze_query::db::Cancelled>() || payload.is::<blaze_graph::Cancelled>() => {
@@ -304,7 +361,7 @@ impl<S: Steps> plane::Work for Step<S> {
                         // The images it was relinking may be half written.
                         images.clear();
                         let refused = front.refused(unit, format!("blaze {panic}, making this unit")); // alloc: a panic, once
-                        panicked = Some(panic.to_string()); // alloc: a panic, once
+                        failed_why = Some(panic.to_string()); // alloc: a panic, once
                         Ok(Some(Compiled {
                             diagnostics: vec![refused], // alloc: a panic, once
                             ok: false,
@@ -314,6 +371,7 @@ impl<S: Steps> plane::Work for Step<S> {
                             artifact: None,
                             macros: None,
                             links: Vec::new(),
+                            misses: Vec::new(),
                         }))
                     }
                 };
@@ -326,12 +384,38 @@ impl<S: Steps> plane::Work for Step<S> {
                 let compiled = match compiled {
                     Ok(None) => return Some(Did { outcome: Outcome::Built, value: Value::Phase(unit, images) }),
                     Ok(Some(compiled)) => Ok(compiled),
+                    // An error of one unit's compile (a codegen error that is no refusal, a
+                    // record that does not read, a toolchain it can't be made for) fails that
+                    // unit, as a panic does, never the job: its siblings build under
+                    // `--keep-going` and every other program of the job is told nothing of it
+                    // (panics-fail-one-job).
+                    Err(Failed::Error(error)) if !self.cancelled.load(Ordering::Acquire) => {
+                        images.clear();
+                        let what = match &error.at {
+                            // alloc: an error, once
+                            Some(at) => format!("blaze could not make this unit: {} (at {at})", error.what),
+                            // alloc: an error, once
+                            None => format!("blaze could not make this unit: {}", error.what),
+                        };
+                        failed_why = Some(what.clone()); // clone: the node's why beside the unit's error, once
+                        Ok(Compiled {
+                            diagnostics: vec![front.refused(unit, what)], // alloc: an error, once
+                            ok: false,
+                            puts: Vec::new(),
+                            share: Vec::new(),
+                            outputs: Vec::new(),
+                            artifact: None,
+                            macros: None,
+                            links: Vec::new(),
+                            misses: Vec::new(),
+                        })
+                    }
                     Err(failed) => Err(failed),
                 };
                 let ok = matches!(&compiled, Ok(it) if it.ok);
                 let mut did = self.settle(compiled, |it| Value::Compiled(unit, it, images))?;
                 if !ok && matches!(did.outcome, Outcome::Built) {
-                    let why = panicked.unwrap_or_else(|| "it did not compile".to_owned()); // alloc: a unit that failed, once
+                    let why = failed_why.unwrap_or_else(|| "it did not compile".to_owned()); // alloc: a unit that failed, once
                     did.outcome = Outcome::Failed { why };
                 }
                 Some(did)
@@ -371,6 +455,26 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Doc { front, no_deps, private } => {
                 let writer = readers.writer.expect("the documentation's task is posted with its job's writer");
                 self.settle(front.doc(writer, *no_deps, *private), Value::Answers)
+            }
+            Does::StoreKept { steps, kept, .. } => {
+                let Some(mut front) = kept.lock().take() else {
+                    let error = ApiError::new("the kept front end to store was taken before its task ran", None);
+                    return self.settle(Err(Failed::Error(error)), |it| Value::StoredKept(None, it));
+                };
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| steps.store_kept(&mut front)));
+                let (front, stored) = match caught {
+                    Ok(stored) => (Some(front), stored),
+                    Err(payload) => {
+                        let panic = plane::panicked(&*payload);
+                        drop(front);
+                        // alloc: a panic, once
+                        let what = format!(
+                            "blaze {panic}, storing what the build left for the store; its front end is dropped, as it may be half written"
+                        );
+                        (None, Err(ApiError::new(what, None)))
+                    }
+                };
+                self.settle(stored.map_err(Failed::Error), |it| Value::StoredKept(front, it))
             }
         }
     }
@@ -607,7 +711,7 @@ struct Prep {
     key: ContentId,
     queries: ViewId,
     /// Every fetch's `at` this view's load asked for: asked again once mounted is a loop.
-    asked: HashSet<String>,
+    asked: HashSet<String, Global>,
     /// The units of the head's last plan when it was of this key, asked nothing again.
     last: Option<(Arc<Units>, Option<LockWrite>)>,
 }
@@ -650,7 +754,7 @@ impl Outputs {
 /// Every path an output is placed at or an image kept at, interned to a `u32` once, the first
 /// time it comes in, for the daemon's life; the rest indexed by it, a column each.
 struct Paths<S: Steps> {
-    ids: HashMap<Box<str>, u32>,
+    ids: HashMap<Box<str>, u32, Global>,
     /// As it came in: `/`-rooted.
     names: Vec<Box<str>>,
     /// The driver's name of it; none for a path that names no file under the driver's root.
@@ -671,7 +775,7 @@ struct Paths<S: Steps> {
 impl<S: Steps> Paths<S> {
     fn new() -> Paths<S> {
         Paths {
-            ids: HashMap::default(),
+            ids: HashMap::new_in(Global),
             names: Vec::new(),  // alloc: none until the first path
             files: Vec::new(),  // alloc: none until the first path
             placed: Vec::new(), // alloc: none until the first path
@@ -749,12 +853,15 @@ impl<S: Steps> Paths<S> {
 
 /// The checkouts later builds are of again ([`lasting`]), interned once by root directory.
 struct Roots<S: Steps> {
-    ids: HashMap<Box<str>, u32>,
+    ids: HashMap<Box<str>, u32, Global>,
     /// The last plan of each.
     plans: Vec<Option<LastPlan>>,
     /// The front end of each one's last build, for its next job to lower into
     /// ([`Steps::lower`]).
     fronts: Vec<Option<S::KeptFront>>,
+    /// How many of each one's front ends are being stored ([`Jobs::store_kept`]): its next
+    /// job's lowering waits in [`Jobs::lowering`] until none is, and one is back in `fronts`.
+    storing: Vec<u32>,
     /// The outputs of its last units, as ids.
     outputs: Vec<Option<Arc<Outputs>>>,
 }
@@ -762,9 +869,10 @@ struct Roots<S: Steps> {
 impl<S: Steps> Roots<S> {
     fn new() -> Roots<S> {
         Roots {
-            ids: HashMap::default(),
+            ids: HashMap::new_in(Global),
             plans: Vec::new(),   // alloc: none until the first checkout
             fronts: Vec::new(),  // alloc: none until the first checkout
+            storing: Vec::new(), // alloc: none until the first checkout
             outputs: Vec::new(), // alloc: none until the first checkout
         }
     }
@@ -777,6 +885,7 @@ impl<S: Steps> Roots<S> {
         self.ids.insert(root_dir.into(), id);
         self.plans.push(None);
         self.fronts.push(None);
+        self.storing.push(0);
         self.outputs.push(None);
         id
     }
@@ -803,7 +912,7 @@ enum Stage<S: Steps> {
     /// The tests or the run, once every unit is built: its run in [`Jobs::runs`].
     Runs(Handle<Run<S>>),
     /// Waits for the VFS's commit of the heads and the store's last put before this.
-    Snapshot { ticket: Option<Ticket>, heads: Vec<(String, ContentId)>, store: Option<blaze_cas::Ticket> },
+    Snapshot { ticket: Option<Ticket>, heads: Vec<(String, ContentId)>, store: blaze_cas::Tickets },
     Over,
 }
 
@@ -837,6 +946,11 @@ struct Build<S: Steps> {
     /// The checkout it is of, whose front end is kept for its next build.
     root: Option<u32>,
     artifacts: Vec<Artifact>,
+    /// The test executables compiled and not yet said ready, each its unit and its place in
+    /// `artifacts`, in the order they compiled: each is said as [`Response::TestReady`] once
+    /// nothing of its unit's outputs is in flight ([`Jobs::release_ready`]). Only for a cargo
+    /// `test` or `bench` build ([`streams_units`]).
+    ready: Vec<(u32, u32)>,
     /// `blaze test --ub`'s tests, run in the evaluator once every unit is checked.
     evaluation: Option<Evaluation>,
     /// The units a write that panicked leaves unbuilt; none until one does.
@@ -914,7 +1028,7 @@ struct Job<S: Steps> {
     /// The value of the node its stage waits on, given before the node settles.
     value: Option<(NodeId, Value<S>)>,
     /// Index files and git repositories reported as `Updating`, once each.
-    updating: HashSet<String>,
+    updating: HashSet<String, Global>,
     /// Opened by the job and closed as it finishes, but `built`.
     queries: Vec<ViewId>,
     /// The one of `queries` its last view was made ready in: handed to the session as it
@@ -923,9 +1037,15 @@ struct Job<S: Steps> {
     /// Views of [`Roots::plans`] it reads, which the jobs close once none reads them.
     borrowed: Vec<ViewId>,
     placing: usize,
+    /// How the bytes of what it placed got there: cloned, written into the store, copied
+    /// ([`blaze_cas::PlacedBytes`]), for its `Work` report and its span.
+    placed: blaze_cas::PlacedBytes,
+    /// Its `Work` report, said as it finishes: once its placements have all ended, so it
+    /// counts every byte they placed.
+    worked: Option<Worked>,
     /// Of `placing`, how many are in flight at each path ([`Paths`] id): a file with one is
     /// not yet all there.
-    busy: HashMap<u32, u32>,
+    busy: HashMap<u32, u32, Global>,
     /// Build scripts' runs the plane started whose programs are not yet all placed: each
     /// starts once its compile's outputs have nothing in flight ([`Jobs::run_script`]).
     held: Vec<NodeId>,
@@ -938,6 +1058,26 @@ struct Job<S: Steps> {
     shared: bool,
     /// Its runs of user code that have not ended.
     runs: u32,
+    /// The tickets of records that a value verified across checkouts depends on where its
+    /// roots are ([`blaze_usercode::roots::verify::retraction`]): the job is not reported done
+    /// until they are durable, or a crash forgets the record and the value is given again.
+    durable: blaze_cas::Tickets,
+    /// The store of its kept front end under way ([`Jobs::store_kept`]): the job is not
+    /// reported done before it ends.
+    storing: Option<Storing<S>>,
+    /// The tickets of what its kept front end left for the store, each a put's own or that of
+    /// the put that kept its value already, and of every put the loop made before it ended
+    /// (what it may have read, [`Jobs::wind_up`]); and the checkout its front end is of. The job
+    /// is not reported done until they are durable, so a stop, a crash or a reboot after the
+    /// answer loses none of it (persisted-state-round-trips).
+    stored: blaze_cas::Tickets,
+    stored_of: Option<String>,
+    /// When, on the injected clock ([`World::now`]), it first waited for `durable` or `stored`
+    /// with nothing else left (or, a snapshot, for the store's puts before it): it fails once
+    /// [`DURABLE_WITHIN`] has gone by from the later of then and the last step of the store's commit
+    /// (bounded-progress, [`gave_up`]), the daemon's loop waking it then
+    /// ([`Jobs::next_deadline`]).
+    durable_since: Option<Duration>,
     over: Option<(bool, Option<ApiError>)>,
     stats: RequestStats,
     /// Units started that were fresh, and that were made again.
@@ -948,6 +1088,13 @@ struct Job<S: Steps> {
     served: Vec<ServedCrate>,
     /// Each image its units linked and how ([`Compiled::links`]), taken by its `Work` report.
     links: Vec<(String, Linking)>,
+    /// Each image its units linked, for the history ([`LinkRow`]): the target it is of as
+    /// cargo names it, its package, and whether it was laid out whole.
+    linked: Vec<(String, Option<String>, bool)>,
+    /// Why each unit, template and run it computed again was not reused, as each unit's
+    /// compile and each run handed them over ([`Compiled::misses`], [`RunPuts::misses`]):
+    /// this build's alone, sorted when it ends, for `blaze why`.
+    misses: Vec<blaze_kernel::Miss>,
     /// Its command line's environment names a profile's directory ([`profile_dir`]): the
     /// daemon's part of the build is written there as it finishes.
     profiled: bool,
@@ -955,6 +1102,276 @@ struct Job<S: Steps> {
     /// and on the wall's, for its row in the history.
     opened_ns: i64,
     opened_unix_ns: Option<i64>,
+    /// The leases of the build dirs it builds into ([`lease_build_dirs`]), taken by its
+    /// lowering and held until the job is dropped: the collector renames no dir while a build
+    /// holds it (docs/gc.md, "Leases").
+    leases: Arc<Mutex<Leases>>,
+}
+
+/// A job's kept front end being stored ([`Jobs::store_kept`]), by one task of a plane request
+/// of its own: the request (promoted with its job), its node, the root the front end is kept
+/// for and its checkout, and the task's value once given.
+struct Storing<S: Steps> {
+    request: RequestId,
+    node: NodeId,
+    root: u32,
+    checkout: String,
+    value: Option<(Option<S::KeptFront>, Result<Vec<super::work::KeptPut>, ApiError>)>,
+}
+
+/// A job's lowering waiting for its root's front end, which is being stored
+/// ([`Jobs::lower`]): posted as the store ends, into the front end it gives back. It has no
+/// plane node while it waits: `span`, open until it is posted or dropped, names the wait
+/// (every-wait-says-what), and a stall names it ([`Jobs::held_lowerings`]).
+struct Lowering {
+    id: JobId,
+    input: JobInput,
+    root: u32,
+    name: String,
+    checkout: String,
+    /// The node of the store it waits on, when one was found.
+    on: Option<NodeId>,
+    span: tracing::Span,
+}
+
+/// A lowering held for its root's kept front end to be stored, as a stall names it.
+#[derive(Debug)]
+pub struct HeldLowering {
+    pub job: JobId,
+    pub root: u32,
+    pub checkout: String,
+    /// The node of the store it waits on.
+    pub on: Option<u32>,
+}
+
+impl std::fmt::Display for HeldLowering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the lowering of job {:?} ({}) is held until root {}'s kept front end is stored", self.job, self.checkout, self.root)?;
+        match self.on {
+            Some(node) => write!(f, ", by node {node}"),
+            None => write!(f, ", by no store the loop knows of (a lowering left held: a bug)"),
+        }
+    }
+}
+
+/// How long a job that is over waits for what it put to be durable with the store answering
+/// nothing before it fails naming it (bounded-progress): no progress, not the whole wait, so a
+/// healthy build behind a large commit waits for it ([`Jobs::commit_moved`], [`gave_up`]).
+pub(super) const DURABLE_WITHIN: Duration = Duration::from_secs(120);
+
+/// Why a wait since `since` for the store to make puts durable is given up, if it is: the
+/// store broke, or no step of its commit answered for [`DURABLE_WITHIN`] since the later of
+/// `since` and the last one that did (`heard`), each on the injected clock.
+///
+/// The time is judged only when `judge` is set, from [`Jobs::expire`], which the loop calls
+/// once a turn after it has dispatched every completion of it: a winding up from inside one
+/// completion's dispatch may run before a commit step that answered in the same turn is
+/// counted, and must not fail a wait that step moved.
+fn gave_up(store: &Store, now: Duration, since: Duration, heard: Duration, judge: bool) -> Option<String> {
+    if let Some(broken) = store.broken() {
+        return Some(broken.to_string()); // alloc: error path
+    }
+    if !judge {
+        return None;
+    }
+    let from = since.max(heard);
+    (now.saturating_sub(from) >= DURABLE_WITHIN).then(|| {
+        // alloc: error path
+        format!(
+            "the store answered nothing of its commit for {} s (since {:.3} s on the daemon's clock): a sync \
+             that does not return, or a disk that stopped",
+            DURABLE_WITHIN.as_secs(),
+            from.as_secs_f64()
+        )
+    })
+}
+
+/// How soon a wait whose puts are counted but not yet drained looks again ([`flush_for_wait`]):
+/// another thread's put is counted ([`Store::last_puts`]) before its record is published to
+/// the store's drain, for as long as the put takes, so the flush that found nothing new to
+/// commit is tried again shortly rather than at the bound.
+pub(super) const RECHECK: Duration = Duration::from_millis(10);
+
+/// A wait for puts still pending, at each winding up: the store is flushed every time, which
+/// drains what is published by now, costs nothing when nothing new is (a commit in flight
+/// takes it at its end), and so drains a put another thread published after an earlier
+/// flush. Says whether this flush started a commit, which the wait counts as the store's
+/// progress, and whether no commit runs though puts are pending: one counted and not yet
+/// published, to look for again in [`RECHECK`].
+fn flush_for_wait(store: &mut Store, effects: &mut Vec<Effect>) -> (bool, bool) {
+    let was = store.committing();
+    store.flush(effects);
+    let now = store.committing();
+    (!was && now, !now)
+}
+
+/// [`flush_for_wait`] at most once a winding up (`flushed`, its idle once it ran), however
+/// many jobs wait: each flush walks every segment's drain. A flush that started a commit
+/// moves `heard` to `now`. Gives whether no commit runs though puts are pending.
+fn flush_once(
+    flushed: &mut Option<bool>,
+    heard: &mut Duration,
+    store: &mut Store,
+    now: Duration,
+    effects: &mut Vec<Effect>,
+) -> bool {
+    *flushed.get_or_insert_with(|| {
+        let (started, idle) = flush_for_wait(store, effects);
+        if started {
+            *heard = (*heard).max(now);
+        }
+        idle
+    })
+}
+
+/// The build dir leases of a job, taken by its lowering step on the pool (never on the loop):
+/// shared with the job, which holds them until it ends, and past a stall until its tasks let go.
+#[derive(Default)]
+pub(super) struct Leases {
+    pub(super) held: Vec<blaze_gc::lease::Lease>,
+    /// When the lowering first found a lease it could not take now ([`blaze_gc::lease::Wait`])
+    /// and gave way to be posted again, on [`blaze_profile::clock::mono_ns`]: it gives way for
+    /// at most [`blaze_gc::lease::GIVE_WAY`] from then (review N8).
+    pub(super) first_try_ns: Option<u64>,
+}
+
+/// Whether `dir` may get blaze's files (a lease, a record, a `CACHEDIR.TAG`): never `/` or a
+/// directory right under it, nor the checkout or one that holds it, nor anything
+/// [`blaze_gc::fs::Protected`] refuses (`$HOME`, `CARGO_HOME` and what is in it, blaze's root
+/// and its state, the machine's shared directory and its std stores). A dir strictly inside the checkout (a project's `./target`) only when blaze
+/// makes it now (`made`) or it is marked a build dir already ([`blaze_gc::record::is_marked`]:
+/// cargo's and blaze's `CACHEDIR.TAG`), so a build writing into it holds a lease that `blaze
+/// clean` and the collector see (review S2); a directory of the user's is never marked. Every
+/// side resolved through [`blaze_gc::fs::resolve`], so `..` or a symlink is seen even before the
+/// dir is there, and a path that cannot be resolved is an error naming it (review C7).
+fn may_mark(dir: &std::path::Path, checkout: &std::path::Path, root: &std::path::Path, made: bool) -> Result<bool, String> {
+    let real = |it: &std::path::Path| {
+        blaze_gc::fs::resolve(it).map_err(|why| format!("the build dir {} is not leased: {why}", dir.display()))
+    };
+    let resolved = real(dir)?;
+    if resolved.parent().is_none_or(|it| it.parent().is_none()) {
+        return Ok(false);
+    }
+    let checkout = real(checkout)?;
+    if checkout.starts_with(&resolved) {
+        return Ok(false);
+    }
+    if resolved.starts_with(&checkout) && !made && !blaze_gc::record::is_marked(&resolved) {
+        return Ok(false);
+    }
+    // `<root>/build` itself, or a dir holding it, as a target dir: its lease would make every
+    // workspace's build dir one build's, and `blaze clean` of it would take them all, leased or
+    // not. A build into it fails, naming it (review round 5, B1).
+    let builds = real(&root.join(blaze_gc::fs::BUILDS))?;
+    if builds.ancestors().any(|it| it == resolved || blaze_gc::fs::same_dir(it, &resolved)) {
+        return Err(format!(
+            "the build dir {} ({}) is or holds {}, blaze's directory of every workspace's build dirs: a target dir is never it or above it. Name a directory of its own (`--target-dir`, `CARGO_TARGET_DIR`, `build.target-dir`)",
+            dir.display(),
+            resolved.display(),
+            builds.display()
+        ));
+    }
+    // The one list `blaze clean` refuses too (review N13): `$HOME`, `CARGO_HOME`, `RUSTUP_HOME`
+    // and what is in them, blaze's root, its build directories and its state, the machine's
+    // shared directory and its std stores. Made once, at the daemon's start (review round 6, C5).
+    let protected = protected(root).map_err(|why| format!("the build dir {} is not leased: {why}", dir.display()))?;
+    Ok(protected.refuses(&resolved)?.is_none())
+}
+
+/// What no build dir may be, hold or be inside ([`blaze_gc::fs::Protected::of_env`]), made once
+/// for blaze's root, with the root it was made for.
+static PROTECTED: std::sync::OnceLock<(std::path::PathBuf, Result<blaze_gc::fs::Protected, String>)> =
+    std::sync::OnceLock::new();
+
+/// [`PROTECTED`] for blaze's root `root`, made on the first call: the daemon's start makes it, and
+/// a list that does not make stops the start, naming why (review round 6, C5), so no lease
+/// rebuilds it. A daemon builds for one root: another is an error naming both.
+pub(super) fn protected(root: &std::path::Path) -> Result<&'static blaze_gc::fs::Protected, String> {
+    let (made_for, made) = PROTECTED.get_or_init(|| {
+        let made = match crate::serve::machine() {
+            Ok(machine) => blaze_gc::fs::Protected::of_env(root, Some(&machine)),
+            Err(error) => Err(format!("{error:#}")),
+        };
+        (root.to_path_buf(), made)
+    });
+    if made_for != root {
+        return Err(format!(
+            "what no build dir may be or hold was made for blaze's root {}, not {}: a daemon builds for one root",
+            made_for.display(),
+            root.display()
+        ));
+    }
+    made.as_ref().map_err(|why| format!("what no build dir may be or hold: {why}"))
+}
+
+/// The leases of `units`' build dirs (`target_dir` and `build_dir`), each dir's record touched
+/// for `checkout`, with each profile's or target's directory the build writes into (docs/gc.md).
+/// Only the dirs under `builds` (`<root>/build/<dir>`) are ever collected; one a `--target-dir`
+/// or `CARGO_TARGET_DIR` names is leased too, so `blaze clean` refuses it while a build uses it.
+/// A dir [`may_mark`] refuses gets no file of blaze's and no lease. `CACHEDIR.TAG` is written
+/// only into a dir blaze made now or one under `builds`, never into a dir of the user's.
+/// `Ok(Err((dir, wait)))` when a lease cannot be taken now (held exclusively by a collector's
+/// rename, or its file without a whole nonce yet): the caller gives way and tries again, for at
+/// most [`blaze_gc::lease::GIVE_WAY`]. Runs on the pool: it may sync a record.
+#[allow(clippy::type_complexity, reason = "a lease taken, a lease to wait for, or an error")]
+fn lease_build_dirs(
+    units: &Units,
+    checkout: &str,
+    builds: &str,
+) -> Result<Result<Vec<blaze_gc::lease::Lease>, (String, blaze_gc::lease::Wait)>, String> {
+    let now = blaze_gc::record::now_ns();
+    let builds = std::path::Path::new(builds);
+    let root = builds.parent().unwrap_or(builds);
+    let checkout_path = std::path::Path::new(checkout);
+    // alloc: once per job, a lease or two
+    let mut leases = Vec::new();
+    for dir in [units.target_dir.as_str(), units.build_dir.as_str()] {
+        let dir = std::path::Path::new(dir);
+        if leases.iter().any(|it: &blaze_gc::lease::Lease| it.dir() == dir) {
+            continue;
+        }
+        // Checked before anything is made: a dir right under `/` (a foreign workspace's
+        // `/@blaze-foreign-target`) or one of the user's own is never made or marked.
+        let made = !dir.exists();
+        if !may_mark(dir, checkout_path, root, made)? {
+            continue;
+        }
+        let _span = tracing::info_span!(target: "blaze", "lease of a build dir", dir = %dir.display()).entered();
+        let lease = match blaze_gc::lease::Lease::try_hold(dir)? {
+            Ok(lease) => lease,
+            Err(wait) => return Ok(Err((dir.display().to_string(), wait))),
+        };
+        leases.push(lease);
+        // Again once made: a symlink or `..` only resolves once the dir is there.
+        if !may_mark(dir, checkout_path, root, made)? {
+            leases.pop();
+            continue;
+        }
+        let under_builds = std::fs::canonicalize(dir)
+            .ok()
+            .zip(std::fs::canonicalize(builds).ok())
+            .is_some_and(|(dir, builds)| dir.parent() == Some(builds.as_path()));
+        if made || under_builds {
+            blaze_gc::record::tag_cache_dir(dir)?;
+        }
+        // Each directory in it the build writes into (a profile's, or a target's) is used now
+        // too, written or not: the first part of each output's path under it.
+        // alloc: once per job, a name a profile
+        let mut profiles: Vec<&str> = units
+            .plans
+            .iter()
+            .flat_map(|plan| plan.outputs.iter())
+            .filter_map(|out| std::path::Path::new(out).strip_prefix(dir).ok())
+            .filter_map(|rest| rest.components().next())
+            .filter_map(|first| first.as_os_str().to_str())
+            .collect();
+        profiles.sort_unstable();
+        profiles.dedup();
+        if let Some(why) = blaze_gc::record::touch(dir, Some(checkout), &profiles, now)? {
+            tracing::warn!(target: "blaze", dir = %dir.display(), "a build dir's record did not read and was written afresh: {why}");
+        }
+    }
+    Ok(Ok(leases))
 }
 
 impl<S: Steps> Job<S> {
@@ -994,10 +1411,83 @@ impl<S: Steps> Job<S> {
         }
     }
 
+    /// The history's rows of its plane request `request` ([`Job::row`]): its own, each image
+    /// its units linked, and its units' crate graph.
+    fn ended(&mut self, request: RequestId, stats: Option<RequestStats>, outcome: profile_history::Outcome) -> Ended {
+        let build_id = u64::from(request.0);
+        let links = self
+            .linked
+            .iter()
+            .map(|(image, krate, placed)| LinkRow {
+                build_id,
+                // clone: the history's copy, once a link
+                image: image.clone(),
+                krate: krate.clone(),
+                outcome: if *placed { LinkOutcome::Placed } else { LinkOutcome::Patched },
+                dur_ns: None,
+            })
+            .collect(); // alloc: one a link, once a build
+        let crate_deps = match &self.stage {
+            Stage::Units(build) => crate_deps(build_id, &build.input.units, &build.units),
+            _ => Vec::new(),
+        };
+        // Sorted, so what `blaze why` keeps of the build is not down to the order its units
+        // and runs ended in (rule 22).
+        let mut misses = std::mem::take(&mut self.misses);
+        misses.sort_unstable();
+        misses.dedup();
+        Ended { row: self.row(request, stats, outcome), links, crate_deps, misses }
+    }
+
     /// The value its stage waited on, if node `node` gave it.
     fn take_value(&mut self, node: NodeId) -> Option<Value<S>> {
         self.value.take_if(|(at, _)| *at == node).map(|(_, value)| value)
     }
+}
+
+/// The name of the package `pkg_id` is of, as the plan has it.
+fn package_named<'a>(units: &'a Units, pkg_id: &str) -> Option<&'a str> {
+    units.packages.iter().find(|it| it.id == pkg_id).map(|it| it.name.as_str())
+}
+
+/// The edges between packages of the units `built`, one row each, sorted: from a build
+/// script's compile a build-dependency, an edge only a dev-dependency makes a dev one, else
+/// a normal one. A package's edges to itself, a build script's run's and the standard
+/// library's are not of its manifest's tables, and are left out.
+fn crate_deps(build_id: u64, units: &Units, built: &[u32]) -> Vec<CrateDepRow> {
+    let graph = &units.graph.units;
+    // alloc: once a build, for the history
+    let names: HashMap<&str, &str, Global> = units.packages.iter().map(|it| (it.id.as_str(), it.name.as_str())).collect();
+    // alloc: once a build, for the history
+    let mut edges: Vec<(&str, &str, DepKind)> = Vec::new();
+    for &at in built {
+        let Some(unit) = graph.get(at as usize) else { continue };
+        if unit.is_std || unit.mode == UnitMode::RunCustomBuild {
+            continue;
+        }
+        let Some(&krate) = names.get(unit.pkg_id.as_str()) else { continue };
+        let script = unit.target.is_custom_build();
+        for dep in &unit.dependencies {
+            let Some(to) = graph.get(dep.index) else { continue };
+            if to.is_std || to.mode == UnitMode::RunCustomBuild || to.pkg_id == unit.pkg_id {
+                continue;
+            }
+            let Some(&name) = names.get(to.pkg_id.as_str()) else { continue };
+            let kind = match (script, dep.dev) {
+                (true, _) => DepKind::Build,
+                (false, true) => DepKind::Dev,
+                (false, false) => DepKind::Normal,
+            };
+            edges.push((krate, name, kind));
+        }
+    }
+    edges.sort_unstable_by_key(|it| (it.0, it.1, it.2.name()));
+    edges.dedup();
+    edges
+        .into_iter()
+        // alloc: the history's copy, once an edge
+        .map(|(krate, dep, kind)| CrateDepRow { build_id, krate: krate.to_owned(), dep: dep.to_owned(), kind })
+        .collect()
 }
 
 /// What the session asked, in the order it asked it.
@@ -1101,19 +1591,23 @@ pub struct Jobs<S: Steps> {
     library_failed: Option<ApiError>,
     /// The errors of fetches that failed, by where they mount: a fetch is one task for every
     /// job asking it, so the jobs that joined it read its error here. Once per source.
-    fetch_failed: HashMap<String, ApiError>,
+    fetch_failed: HashMap<String, ApiError, Global>,
     /// The store's placements by the store's tag: its tags are its own, made among its other
     /// effects, so there is no slot of ours in them to index by.
-    placing: HashMap<Tag, Placing>,
+    placing: HashMap<Tag, Placing, Global>,
     paths: Paths<S>,
     /// The lock writes, modes and looks at files in flight, by the slot their tag carries.
     own: Tagged<Own>,
     /// Every run of user code going, by the number its tags carry: run `n` has the tags
     /// `setup.runs + n * 2^32` on.
     runs: Tagged<Run<S>>,
-    /// The store's last put: its tickets are made in order, so all before it are durable once
-    /// it is.
-    put: Option<blaze_cas::Ticket>,
+    /// Every put the loop has made to the daemon's store (the plane's results, kept front ends,
+    /// user code's runs, the jobs' records), as the last ticket of each segment they are in
+    /// ([`blaze_cas::Tickets`]: a put of a value kept already gets the ticket of the put that
+    /// kept it, from any writer). Two waits read it: a snapshot waits for all of it, and a job
+    /// at its Done gate waits for all of it as of its first wait (`Wait::Everything`), since a
+    /// value it read comes back with no ticket and may be another job's put not yet durable.
+    put: blaze_cas::Tickets,
     roots: Roots<S>,
     /// Views of plans replaced in `roots`, closed once no job reads them.
     retired: Vec<ViewId>,
@@ -1129,7 +1623,25 @@ pub struct Jobs<S: Steps> {
     pub ended: bool,
     /// The plane requests that ended, as the profile history's rows, for the daemon to hand
     /// to its history.
-    pub rows: Vec<BuildRow>,
+    pub rows: Vec<Ended>,
+    /// The build dir leases of jobs dropped while their tasks may still write (a stall): each
+    /// held until the last task lets go of the job's cancel flag ([`Jobs::release_leases`]).
+    held_leases: Vec<(JobId, Arc<AtomicBool>, Arc<Mutex<Leases>>)>,
+    /// Lowerings waiting for their root's front end to be stored ([`Jobs::lower`]).
+    lowering: Vec<Lowering>,
+    /// The plane requests of kept front ends' stores ([`Jobs::store_kept`]), until each
+    /// finishes: a store is part of its job's build, never a build of its own.
+    store_requests: HashSet<RequestId, Global>,
+    /// When, on the injected clock, a step of the store's commit last answered
+    /// ([`Store::commit_steps`] moved): a wait for it to make puts durable gives up only once
+    /// the commit has stood still for [`DURABLE_WITHIN`] ([`gave_up`]), so a large commit that
+    /// is moving never trips it, and a sync that never returns does even while other builds'
+    /// reads and placements keep the store answering.
+    store_heard: Duration,
+    /// [`Store::commit_steps`] as of `store_heard`.
+    commit_steps: u64,
+    /// When a wait whose puts no commit is taking looks again ([`RECHECK`]), if one is.
+    recheck: Option<Duration>,
 }
 
 impl<S: Steps> Builder for Jobs<S> {
@@ -1166,12 +1678,12 @@ impl<S: Steps> Jobs<S> {
             batches: Batches::new(),
             library: None,
             library_failed: None,
-            fetch_failed: HashMap::default(),
-            placing: HashMap::default(),
+            fetch_failed: HashMap::new_in(Global),
+            placing: HashMap::new_in(Global),
             paths: Paths::new(),
             own,
             runs,
-            put: None,
+            put: blaze_cas::Tickets::default(),
             roots: Roots::new(),
             retired: Vec::new(), // alloc: none until a plan is replaced
             out: Vec::new(),     // alloc: none until user code says something, then reused
@@ -1180,7 +1692,27 @@ impl<S: Steps> Jobs<S> {
             cold: false,
             ended: false,
             rows: Vec::new(), // alloc: none until a build ends, then reused
+            held_leases: Vec::new(), // alloc: none until a stall
+            lowering: Vec::new(),    // alloc: none until a job lowers while its root's front end is stored
+            store_requests: HashSet::new_in(Global),
+            store_heard: Duration::ZERO,
+            commit_steps: 0,
+            recheck: None,
         })
+    }
+
+    /// Lets go of the build dir leases of dropped jobs no task of which is left: a task holds a
+    /// clone of its job's cancel flag until it ends.
+    pub fn release_leases(&mut self) {
+        if self.held_leases.is_empty() {
+            return;
+        }
+        // A dropped job's outputs still being placed, or its runs of user code not ended, write
+        // into its build dirs as much as its tasks do (review C5b).
+        // alloc: a stall's leases, rarely
+        let mut busy: Vec<JobId> = self.placing.values().map(|it| it.job).collect();
+        busy.extend(self.runs.iter_mut().map(|(_, it)| it.job));
+        self.held_leases.retain(|(id, cancelled, _)| Arc::strong_count(cancelled) > 1 || busy.contains(id));
     }
 
     /// Whether no job is under way.
@@ -1255,26 +1787,36 @@ impl<S: Steps> Jobs<S> {
             cancelled: Arc::new(AtomicBool::new(false)), // alloc: once per job, shared with its tasks
             stage: Stage::Over,
             value: None,
-            updating: HashSet::default(),
+            updating: HashSet::new_in(Global),
             queries: Vec::new(),  // alloc: once per job
             built: None,
             borrowed: Vec::new(), // alloc: once per job
             placing: 0,
-            busy: HashMap::default(),
+            placed: blaze_cas::PlacedBytes::default(),
+            worked: None,
+            busy: HashMap::new_in(Global),
             held: Vec::new(), // alloc: none until a run waits for its program
             look: 0,
             awaiting: None,
             shared: false,
             runs: 0,
+            durable: blaze_cas::Tickets::default(),
+            storing: None,
+            stored: blaze_cas::Tickets::default(),
+            stored_of: None,
+            durable_since: None,
             over: None,
             stats: RequestStats::default(),
             fresh: 0,
             compiled: 0,
             served: Vec::new(), // alloc: none; a build fills it once
             links: Vec::new(),  // alloc: none until a unit links
+            linked: Vec::new(), // alloc: none until a unit links
+            misses: Vec::new(), // alloc: none until a unit misses
             profiled,
             opened_ns: 0,
             opened_unix_ns: None,
+            leases: Arc::default(), // alloc: once per job, shared with its lowering
         };
         if self.jobs.put(key_of(id), job).is_err() {
             // alloc: an error the session's free list can't give
@@ -1309,6 +1851,13 @@ impl<S: Steps> Jobs<S> {
         if let (Some(request), false) = (job.request, job.finished) {
             w.plane.promote(w.now, request);
         }
+        // Its answer waits for its store: an idle one would wait on every other build.
+        // Finished at the plane, its word not yet read here: nothing is left to promote.
+        if let Some(storing) = &job.storing
+            && w.plane.is_open(storing.request)
+        {
+            w.plane.promote(w.now, storing.request);
+        }
     }
 
     /// Makes the next view of the job ready, the standard library first.
@@ -1328,12 +1877,12 @@ impl<S: Steps> Jobs<S> {
             self.end(w, id, false, Some(ApiError::new("the job has no view to build", None)));
             return;
         };
-        self.open(w, id, opened, HashSet::default());
+        self.open(w, id, opened, HashSet::new_in(Global));
     }
 
     /// The view opened in the database with its build configuration as the mounts are now, or
     /// the head's last plan when it was of this view and configuration; then its plan.
-    fn open(&mut self, w: &mut World<'_, S>, id: JobId, opened: Opened, asked: HashSet<String>) {
+    fn open(&mut self, w: &mut World<'_, S>, id: JobId, opened: Opened, asked: HashSet<String, Global>) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         // clone: the config owns the library's place, once per view
         let Some(library) = self.library.clone() else {
@@ -1361,6 +1910,7 @@ impl<S: Steps> Jobs<S> {
             host: self.setup.host.clone(), // clone: the config owns it, once per view
             library,
             std: self.setup.std.clone(), // clone: the config owns it, once per view
+            builds: self.setup.builds.clone(), // clone: the config owns it, once per view
         };
         let encoded = config.encode();
         let key = Hasher::new("blaze v2 serve last plan").id(&opened.view.root).part(&encoded).finish();
@@ -1539,16 +2089,37 @@ impl<S: Steps> Jobs<S> {
         job.over.get_or_insert((false, Some(error)));
     }
 
-    /// Keeps what a task's expansions put, from the store's one owner: a refused one fails the
-    /// task's job, naming the expansion.
+    /// Keeps what a task's expansions put, and the daemon's durable puts not kept yet
+    /// (`Keeping::publish`), from the store's one owner: a refused one fails the task's job,
+    /// naming the expansion.
     fn kept(&mut self, w: &mut World<'_, S>, node: NodeId, puts: Vec<proc_macro_api::kept::Put>) {
-        let published = proc_macro_api::kept::publish(w.store, puts);
-        if let Some(ticket) = published.tickets.last() {
-            self.put = Some(*ticket);
+        let published = w.macros.keeps().publish(w.store, puts);
+        for ticket in &published.tickets {
+            self.put.add(*ticket);
+        }
+        if !published.durable.is_empty() {
+            w.store.flush(w.effects);
+            self.wait_durable(&published.durable);
         }
         let Some(refused) = published.refused.into_iter().next() else { return };
         if let Some(job) = self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id))) {
             job.over.get_or_insert((false, Some(ApiError::new(refused, None))));
+        }
+    }
+
+    /// A retraction was published (a [`proc_macro_api::kept::Keep::Durable`] put, flushed as it
+    /// was): every job not ended yet waits for it to be durable before it is reported done. A
+    /// durable put goes to its daemon's own queue (`Keeping::put`), which only this owner takes
+    /// (`Keeping::publish`, from `kept` or `plane_finished`), so whichever publish takes
+    /// it calls this in the same step. It was put before the task that made it ended, which is
+    /// before that job's `plane_finished`, whose publish takes the queue; and a job ends only
+    /// after that (`Job::finished`, `wind_up`). So the job that made it is among those
+    /// not ended here. The others wait for it too: one more flush, never a wrong answer.
+    fn wait_durable(&mut self, tickets: &blaze_cas::Tickets) {
+        for id in &self.order {
+            if let Some(job) = self.jobs.get_mut(key_of(*id)) {
+                job.durable.extend(tickets);
+            }
         }
     }
 
@@ -1619,6 +2190,12 @@ impl<S: Steps> Jobs<S> {
                     }
                 }
             }
+            Value::StoredKept(front, stored) => {
+                let job = self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id)));
+                if let Some(storing) = job.and_then(|it| it.storing.as_mut()).filter(|it| it.node == node) {
+                    storing.value = Some((front, stored));
+                }
+            }
             value => {
                 if let Some(job) = self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id))) {
                     job.value = Some((node, value));
@@ -1630,6 +2207,11 @@ impl<S: Steps> Jobs<S> {
     fn settled(&mut self, w: &mut World<'_, S>, node: NodeId, ok: bool, why: Option<String>) {
         let Some(id) = self.batches.job_of(node) else { return };
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        // Its store settles after the job is over: what it left for the store is put still.
+        if job.storing.as_ref().is_some_and(|it| it.node == node) {
+            self.stored_kept(w, id, why);
+            return;
+        }
         if job.over.is_some() {
             job.take_value(node);
             return;
@@ -1688,7 +2270,7 @@ impl<S: Steps> Jobs<S> {
                     for put in puts {
                         let (key, kind) = (put.key, put.kind);
                         match w.store.put(put.key, put.kind, put.bytes) {
-                            Ok(ticket) => self.put = Some(ticket),
+                            Ok(ticket) => self.put.add(ticket),
                             Err(mismatch) => {
                                 // alloc: an error, once
                                 let what = format!(
@@ -1859,6 +2441,8 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         };
+        // Its build dirs are leased by its lowering, on the pool ([`Does::Lower`]).
+        let checkout = prep.config.invocation.root.clone(); // clone: the lowering's own copy, once
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         job.built = job.queries.contains(&prep.queries).then_some(prep.queries);
         let cargo = targets_of(&job.work).and_then(|it| it.cargo.as_ref());
@@ -1871,6 +2455,7 @@ impl<S: Steps> Jobs<S> {
             units,
             store: w.store.reader(),
             std: w.std.reader(),
+            macros: Arc::clone(w.macros), // clone: a refcount, once per view
             color: cargo.map_or(self.setup.color, |it| it.color),
             short,
             width: cargo.and_then(|it| it.width),
@@ -1886,13 +2471,176 @@ impl<S: Steps> Jobs<S> {
             self.next(w, id);
             return;
         }
-        let kept = Mutex::new(prep.root.and_then(|root| self.roots.fronts[root as usize].take()));
-        let (steps, lowering) = (w.steps.clone(), input.clone()); // clone: refcounts, once per view
-        let work = Step::of(&job.cancelled, Does::Lower { steps, input: lowering, kept });
         let name = named("lowering ", &prep.root_dir);
-        let fresh = lone(w.plane, NodeKind::Names, &name, Pool::Work, None, kinds::LOWER);
-        job.stage = Stage::Lower(fresh.first(), input, prep.root);
+        let job_idle = job.idle;
+        match prep.root {
+            // The root's front end is being stored: the lowering waits for it rather than
+            // lowering anew beside it.
+            Some(root) if self.roots.storing[root as usize] > 0 => {
+                let mut on = None;
+                for job in self.jobs.values() {
+                    let Some(storing) = job.storing.as_ref().filter(|it| it.root == root) else { continue };
+                    on = Some(storing.node);
+                    // A build asked now waits on the store: none of it runs as idle work.
+                    if !job_idle && w.plane.is_open(storing.request) {
+                        w.plane.promote(w.now, storing.request);
+                    }
+                }
+                let span = tracing::info_span!(
+                    target: "blaze",
+                    "lowering waits for the kept front end's store",
+                    checkout = %checkout,
+                    root,
+                    store_node = on.map(|it| it.0),
+                );
+                self.lowering.push(Lowering { id, input, root, name, checkout, on, span });
+            }
+            root => self.lower(w, id, input, root, &name, checkout),
+        }
+    }
+
+    /// A job's view lowered by one task, into its root's kept front end if there is one.
+    fn lower(&mut self, w: &mut World<'_, S>, id: JobId, input: JobInput, root: Option<u32>, name: &str, checkout: String) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let kept = Mutex::new(root.and_then(|root| self.roots.fronts[root as usize].take()));
+        let (steps, lowering) = (w.steps.clone(), input.clone()); // clone: refcounts, once per view
+        let (leases, builds) = (Arc::clone(&job.leases), self.setup.builds.clone()); // clone: a refcount and a path, once per view
+        let work = Step::of(&job.cancelled, Does::Lower { steps, input: lowering, kept, leases, checkout, builds });
+        let fresh = lone(w.plane, NodeKind::Names, name, Pool::Work, None, kinds::LOWER);
+        job.stage = Stage::Lower(fresh.first(), input, root);
         self.add(w, id, fresh, Some(work), false);
+    }
+
+    /// What job `id`'s build left for the store, written from its front end as it is kept
+    /// ([`Steps::store_kept`]) by one task of a plane request of its own, as the job's other
+    /// tasks are done with it. The front end is the root's again once the puts are made
+    /// ([`Jobs::stored_kept`]), and the job is reported done only once they are durable
+    /// ([`Jobs::wind_up`]).
+    fn store_kept(&mut self, w: &mut World<'_, S>, id: JobId, root: u32, checkout: String, kept: S::KeptFront) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let request = w.plane.open(w.now, false, job.idle);
+        let name = named("storing the kept front end of ", &checkout);
+        let fresh = lone(w.plane, NodeKind::Store, &name, Pool::Work, None, kinds::STORE_KEPT);
+        let (node, count) = (fresh.first(), fresh.count());
+        // clone: the checkout's path, once per build, for the task's span
+        let does = Does::StoreKept { steps: Arc::clone(w.steps), kept: Mutex::new(Some(kept)), checkout: checkout.clone() };
+        let work = Step::of(&job.cancelled, does);
+        // A store's request is marked before anything can finish it, and its node is the
+        // job's only once the plane took it: a refused add leaves no entry behind.
+        self.store_requests.insert(request);
+        match w.plane.add(w.now, request, fresh, Some(work), false) {
+            Ok(()) => {
+                self.batches.insert(node.0, count, id);
+                job.storing = Some(Storing { request, node, root, checkout, value: None });
+                self.roots.storing[root as usize] += 1;
+            }
+            Err(error) => {
+                // alloc: an error, once
+                let what = format!("the plane refused the task storing what the build of {checkout} left for the store: {error}");
+                fail_over(&mut job.over, ApiError::new(what, Some(checkout)));
+            }
+        }
+        w.plane.close(w.now, request);
+    }
+
+    /// Job `id`'s kept front end stored, its task's node settled: its puts made and the store
+    /// flushed, the front end the root's again, and the lowerings waiting for it posted. A
+    /// store that failed, or panicked, fails the job naming why, its front end dropped: the
+    /// root's next job lowers anew.
+    fn stored_kept(&mut self, w: &mut World<'_, S>, id: JobId, why: Option<String>) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let Some(Storing { root, checkout, value, .. }) = job.storing.take() else { return };
+        self.roots.storing[root as usize] -= 1;
+        let failed = match value {
+            Some((front, Ok(puts))) => {
+                let mut failed = None;
+                let put = !puts.is_empty();
+                for super::work::KeptPut { put, what } in puts {
+                    let (key, kind) = (put.key, put.kind);
+                    match w.store.put(put.key, put.kind, put.bytes) {
+                        // Each ticket is waited on: a value kept already gets the ticket of the
+                        // put that kept it, from any writer's segment, so no one ticket stands
+                        // for the rest ([`blaze_cas::Tickets`]).
+                        Ok(ticket) => {
+                            self.put.add(ticket);
+                            job.stored.add(ticket);
+                        }
+                        Err(mismatch) => {
+                            // alloc: an error, once
+                            let what = format!(
+                                "the store holds other bytes under {key:?} than the build of {checkout} made now \
+                                 for {what}, a {kind:?} value (kept {:?}, made {:?}): its key misses an input or \
+                                 what made it is not deterministic (keys-cover-every-input)",
+                                mismatch.kept, mismatch.given
+                            );
+                            failed = Some(ApiError::new(what, Some(checkout.clone()))); // clone: an error, once
+                            break;
+                        }
+                    }
+                }
+                job.stored_of = Some(checkout.clone()); // clone: the checkout's path, once per build
+                if put {
+                    w.store.flush(w.effects);
+                }
+                if failed.is_none() {
+                    self.roots.fronts[root as usize] = front;
+                }
+                failed
+            }
+            Some((_, Err(error))) => {
+                // alloc: an error, once
+                let what = format!("storing what the build of {checkout} left for the store: {}", error.what);
+                Some(ApiError::new(what, error.at.or_else(|| Some(checkout.clone())))) // clone: an error, once
+            }
+            None => {
+                let why = why.unwrap_or_else(|| "its task ended with no value".to_owned()); // alloc: an error, once
+                // alloc: an error, once
+                let what = format!("storing what the build of {checkout} left for the store: {why}");
+                Some(ApiError::new(what, Some(checkout.clone()))) // clone: an error, once
+            }
+        };
+        if let Some(error) = failed {
+            fail_over(&mut job.over, error);
+        }
+        // Storing a front end can expand macros of its own: a dependency crate's image encodes
+        // the signature of every item (`hir_def::deps::serve`'s `signatures::encode`), and a
+        // type-position macro call the build never needed is expanded there first, which a
+        // kept proc-macro expansion puts. `plane_finished` published before the store ran, so
+        // what those expansions put is published here as it is there: its tickets waited on by
+        // this job (and the snapshot, [`Jobs::put`]), a durable put by every job not ended,
+        // and a verdict the store refuses failing this job.
+        w.macros.flush();
+        let published = w.macros.keeps().publish(w.store, proc_macro_api::kept::take_puts());
+        for ticket in &published.tickets {
+            self.put.add(*ticket);
+        }
+        if !published.durable.is_empty() {
+            w.store.flush(w.effects);
+            self.wait_durable(&published.durable);
+        }
+        if let Some(job) = self.jobs.get_mut(key_of(id)) {
+            for ticket in &published.tickets {
+                job.stored.add(*ticket);
+            }
+            if let Some(refused) = published.refused.into_iter().next() {
+                // alloc: an error, once
+                let what = format!("storing what the build of {checkout} left for the store: {refused}");
+                fail_over(&mut job.over, ApiError::new(what, Some(checkout.clone()))); // clone: an error, once
+            }
+        }
+        // Another store of the root's front end still under way: its lowerings wait for it.
+        if self.roots.storing[root as usize] > 0 {
+            return;
+        }
+        let mut waiting = std::mem::take(&mut self.lowering);
+        let (now, later): (Vec<Lowering>, Vec<Lowering>) = waiting.drain(..).partition(|it| it.root == root); // alloc: the lowerings waiting, a few
+        self.lowering = later;
+        for Lowering { id, input, root, name, checkout, span, .. } in now {
+            drop(span);
+            if self.jobs.get(key_of(id)).is_some_and(|it| it.over.is_none()) {
+                self.lower(w, id, input, Some(root), &name, checkout);
+            }
+        }
     }
 
     /// The shared std store has looked again: each build that waited for the look begins.
@@ -2064,7 +2812,7 @@ impl<S: Steps> Jobs<S> {
         let work = Step::of(&cancelled, Does::Compile { front: front.clone(), back: self.paths.back.clone() });
         let units = &input.units;
         let package_of = {
-            let packages: HashMap<&str, u32> =
+            let packages: HashMap<&str, u32, Global> =
                 // alloc: once per build
                 (0u32..).zip(&units.packages).map(|(at, package)| (package.id.as_str(), at)).collect();
             // alloc: once per build
@@ -2112,6 +2860,7 @@ impl<S: Steps> Jobs<S> {
             outputs,
             root,
             artifacts: Vec::new(), // alloc: once per build
+            ready: Vec::new(),     // alloc: none until a test executable compiles
             evaluation,
             refused: None,
         }));
@@ -2170,6 +2919,11 @@ impl<S: Steps> Jobs<S> {
         match fresh {
             true => job.fresh += 1,
             false => job.compiled += 1,
+        }
+        if streams_units(&job.work)
+            && let Some(began) = unit_of(&build.input.units, at)
+        {
+            w.said.push(Said::Report(id, Response::UnitBegan(began)));
         }
         let unit = &build.input.units.graph.units[at];
         let Some(package) = build.input.units.packages.get(build.package_of[at] as usize) else { return };
@@ -2262,6 +3016,8 @@ impl<S: Steps> Jobs<S> {
         };
         let mut out = std::mem::take(&mut self.out);
         let ended = runs.start(w.store, Some(&mut build.writer), w.effects, &mut out);
+        let puts = runs.take_puts();
+        self.run_put(w, id, puts);
         for response in out.drain(..) {
             w.said.push(Said::Report(id, response));
         }
@@ -2285,6 +3041,7 @@ impl<S: Steps> Jobs<S> {
     fn compiled(&mut self, w: &mut World<'_, S>, node: NodeId, unit: usize, result: Result<Compiled, ApiError>) {
         let Some(id) = self.batches.job_of(node) else { return };
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let streams = streams_units(&job.work);
         let mut compiled = match result {
             Ok(compiled) => compiled,
             Err(error) => {
@@ -2299,12 +3056,29 @@ impl<S: Steps> Jobs<S> {
         {
             job.over.get_or_insert((false, Some(error)));
         }
+        if let Stage::Units(build) = &job.stage
+            && let Some(u) = build.input.units.graph.units.get(unit)
+        {
+            let kind = u.target.kind.first().map_or("", String::as_str);
+            let package = package_named(&build.input.units, &u.pkg_id);
+            for (_, how) in &compiled.links {
+                // alloc: one a link, for the history
+                job.linked.push((format!("{} ({kind})", u.target.name), package.map(str::to_owned), how.placed()));
+            }
+        }
         job.links.append(&mut compiled.links);
+        job.misses.append(&mut compiled.misses);
         // Said once its last diagnostic is, so the client prints cargo's "generated N warnings"
         // or "could not compile" there and not at the build's end. A unit that said nothing has
         // no such line.
         // clone: the report and its diagnostics each own the unit's name, once per unit
         let ended = compiled.diagnostics.iter().find_map(|it| it.unit.clone());
+        // A test build's live view hears of every unit's end, not only those that said
+        // something; a unit with nothing to say prints no line either way.
+        let ended = match (ended, streams, &job.stage) {
+            (None, true, Stage::Units(build)) => unit_of(&build.input.units, unit),
+            (ended, ..) => ended,
+        };
         for diagnostic in compiled.diagnostics {
             w.said.push(Said::Report(id, Response::Diagnostic(diagnostic)));
         }
@@ -2330,7 +3104,7 @@ impl<S: Steps> Jobs<S> {
         for put in compiled.puts {
             let kind = put.kind;
             match w.store.put(put.key, put.kind, put.bytes) {
-                Ok(ticket) => self.put = Some(ticket),
+                Ok(ticket) => self.put.add(ticket),
                 Err(mismatch) => {
                     let error = mismatched("the store", kind, mismatch);
                     job.over.get_or_insert((false, Some(error)));
@@ -2338,6 +3112,12 @@ impl<S: Steps> Jobs<S> {
             }
         }
         job.shared |= !compiled.share.is_empty();
+        // Not waited on before the answer, and flushed only as the job ends: a share is a copy,
+        // for the other daemons, of what `compiled.puts` put into this daemon's own store just
+        // above, whose tickets the job does wait on. Losing it in a crash loses no answer: a
+        // reader of the shared store takes a std record only with every output it names there
+        // (`unit::compile::kept`, and `found`'s `header::check`), and every value is checked
+        // against its hash, so a share torn or lost is a miss, compiled again by whoever asks.
         for put in compiled.share {
             let kind = put.kind;
             if let Err(mismatch) = w.std.put(put.key, put.kind, put.bytes) {
@@ -2347,6 +3127,13 @@ impl<S: Steps> Jobs<S> {
         }
         let outputs = match (compiled.artifact, &mut job.stage) {
             (artifact, Stage::Units(build)) => {
+                if streams
+                    && let Some(it) = &artifact
+                    && runs_as_test(it)
+                    && let (Ok(unit), Ok(at)) = (u32::try_from(unit), u32::try_from(build.artifacts.len()))
+                {
+                    build.ready.push((unit, at));
+                }
                 build.artifacts.extend(artifact);
                 Some(build.outputs.clone()) // clone: a refcount, once per unit
             }
@@ -2387,7 +3174,14 @@ impl<S: Steps> Jobs<S> {
 
     /// The store's value of `key` placed at path `path` for job `id`.
     fn place(&mut self, w: &mut World<'_, S>, id: JobId, path: u32, key: blaze_cas::Key, executable: bool) {
-        self.paths.placed[path as usize] = None;
+        // The whole file the store kept to clone the path's last value from goes once nothing
+        // clones it (unless the new value has the same bytes): a build dir rebuilt again and
+        // again keeps no store file of each version.
+        if let Some(before) = self.paths.placed[path as usize].take()
+            && before.key != key
+        {
+            w.store.unplace(&before.key, &key, w.effects);
+        }
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         // clone: the store's effect owns the file's name, once per placement
         let Some(file) = self.paths.files[path as usize].clone() else {
@@ -2422,7 +3216,7 @@ impl<S: Steps> Jobs<S> {
     fn end_placing(&mut self, id: JobId, path: u32) -> Option<&mut Job<S>> {
         let job = self.jobs.get_mut(key_of(id))?;
         job.placing -= 1;
-        if let std::collections::hash_map::Entry::Occupied(mut busy) = job.busy.entry(path) {
+        if let blaze_hash::hash_map::Entry::Occupied(mut busy) = job.busy.entry(path) {
             *busy.get_mut() -= 1;
             if *busy.get() == 0 {
                 busy.remove();
@@ -2441,6 +3235,30 @@ impl<S: Steps> Jobs<S> {
             {
                 let node = job.held.remove(ready);
                 self.run_script(w, node);
+            }
+        }
+    }
+
+    /// Each test executable [`Jobs::compiled`] held, asked again: one whose unit's outputs
+    /// have nothing in flight is all there, and is said as [`Response::TestReady`] so the
+    /// command runs it while the rest builds; the rest wait on. One the build ends before is
+    /// in its [`Response::Built`] only.
+    fn release_ready(&mut self, w: &mut World<'_, S>) {
+        for &id in &self.order {
+            let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
+            let Job { stage: Stage::Units(build), busy, .. } = job else { continue };
+            let mut at = 0;
+            while at < build.ready.len() {
+                let (unit, artifact) = build.ready[at];
+                if build.outputs.of(unit as usize).iter().any(|path| busy.contains_key(path)) {
+                    at += 1;
+                    continue;
+                }
+                build.ready.remove(at);
+                if let Some(it) = build.artifacts.get(artifact as usize) {
+                    // clone: the report owns it, once per test executable
+                    w.said.push(Said::Report(id, Response::TestReady(it.clone())));
+                }
             }
         }
     }
@@ -2475,11 +3293,10 @@ impl<S: Steps> Jobs<S> {
 
     /// What the store placed.
     pub fn placed(&mut self, w: &mut World<'_, S>, placed: Vec<Placed>) {
-        for Placed { tag, to, result } in placed {
+        for Placed { tag, to, result, bytes } in placed {
             let Some(Placing { job: id, path, key, executable }) = self.placing.remove(&tag) else { continue };
-            if self.jobs.get(key_of(id)).is_none() {
-                continue;
-            }
+            let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
+            job.placed += bytes;
             match result {
                 Ok(()) if executable => match self.own_tag(Own::Mode { job: id, path, key }) {
                     Ok(tag) => w.effects.push(Effect::Mode { file: to, mode: 0o755, tag }),
@@ -2530,6 +3347,8 @@ impl<S: Steps> Jobs<S> {
         };
         let mut out = std::mem::take(&mut self.out);
         let ended = runs.complete(completion, w.store, writer, w.effects, &mut out);
+        let puts = runs.take_puts();
+        self.run_put(w, id, puts);
         for response in out.drain(..) {
             w.said.push(Said::Report(id, response));
         }
@@ -2539,6 +3358,25 @@ impl<S: Steps> Jobs<S> {
             self.run_ended(w, id, node, ok);
         }
         self.wind_up(w);
+    }
+
+    /// What a run of user code put, taken after each of its steps (a start that ends at once
+    /// too): its job answers once all of it is durable, and every other job that may have read
+    /// it waits for it too ([`Jobs::put`], `wind_up`). The store is flushed when the job comes
+    /// to its gate, once, not after every step.
+    fn run_put(&mut self, w: &mut World<'_, S>, id: JobId, mut puts: RunPuts) {
+        self.put.extend(&puts.tickets);
+        if let Some(job) = self.jobs.get_mut(key_of(id)) {
+            job.durable.extend(&puts.tickets);
+            job.misses.append(&mut puts.misses);
+        }
+        if puts.retracted {
+            // A retraction is flushed at once: every other checkout must stop being given
+            // the value. A kept front end is lowered afresh too, which costs one lowering
+            // for a record that is rare, whatever it retracts.
+            w.store.flush(w.effects);
+            w.macros.keeps().retracted();
+        }
     }
 
     /// An effect of the loop's own done.
@@ -2593,6 +3431,12 @@ impl<S: Steps> Jobs<S> {
     }
 
     fn plane_finished(&mut self, w: &mut World<'_, S>, request: RequestId, ok: bool, stats: RequestStats) {
+        // A kept front end's store is part of its job's build, which was marked as it finished.
+        // Its node settled before its request finishes, which clears the job's `storing`: the
+        // set says, not the job.
+        if self.store_requests.remove(&request) {
+            return;
+        }
         blaze_profile::built(blaze_profile::Built {
             serial: u64::from(request.0),
             hits: stats.cached,
@@ -2611,13 +3455,18 @@ impl<S: Steps> Jobs<S> {
             (false, true) => profile_history::Outcome::Ok,
             (false, false) => profile_history::Outcome::Failed,
         };
-        self.rows.push(job.row(request, Some(stats), outcome));
-        blaze_macro_eval::flush();
+        self.rows.push(job.ended(request, Some(stats), outcome));
+        w.macros.flush();
         // The snapshot waits on the last ticket; a verdict the store refuses fails the job.
-        let published = proc_macro_api::kept::publish(w.store, proc_macro_api::kept::take_puts());
-        if let Some(ticket) = published.tickets.last() {
-            self.put = Some(*ticket);
+        let published = w.macros.keeps().publish(w.store, proc_macro_api::kept::take_puts());
+        for ticket in &published.tickets {
+            self.put.add(*ticket);
         }
+        if !published.durable.is_empty() {
+            w.store.flush(w.effects);
+            self.wait_durable(&published.durable);
+        }
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         if let Some(refused) = published.refused.into_iter().next() {
             job.over.get_or_insert((false, Some(ApiError::new(refused, None))));
         }
@@ -2632,10 +3481,17 @@ impl<S: Steps> Jobs<S> {
         let runs = ok && matches!(job.work, Work::Test { ub: None, .. } | Work::Run { .. });
         let pack = ok && matches!(job.work, Work::Pack { .. } | Work::Doc { .. });
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
-        let Build { input, front, mut writer, artifacts, evaluation, root, .. } = *build;
-        if let Err(error) = writer.finished() {
-            self.end(w, id, false, Some(error));
-            return;
+        let Build { input, front, mut writer, artifacts, evaluation, root, units, .. } = *build;
+        match writer.finished(ok, &units) {
+            Ok(warnings) => {
+                for warning in warnings {
+                    w.said.push(Said::Report(id, Response::Diagnostic(warning)));
+                }
+            }
+            Err(error) => {
+                self.end(w, id, false, Some(error));
+                return;
+            }
         }
         let served = match writer.served() {
             Ok(it) => it,
@@ -2656,7 +3512,8 @@ impl<S: Steps> Jobs<S> {
             false => {
                 if let Some(root) = root {
                     match writer.keep() {
-                        Ok(kept) => self.roots.fronts[root as usize] = Some(kept),
+                        // clone: the checkout's path, once per build
+                        Ok(kept) => self.store_kept(w, id, root, input.config.invocation.root.clone(), kept),
                         Err(error) => {
                             self.end(w, id, false, Some(error));
                             return;
@@ -2716,6 +3573,8 @@ impl<S: Steps> Jobs<S> {
         };
         let mut out = std::mem::take(&mut self.out);
         let ended = runs.start(w.store, None, w.effects, &mut out);
+        let puts = runs.take_puts();
+        self.run_put(w, id, puts);
         for response in out.drain(..) {
             w.said.push(Said::Report(id, response));
         }
@@ -2788,8 +3647,9 @@ impl<S: Steps> Jobs<S> {
                 .map(|(kind, ns)| (kind, ns / 1000))
                 // alloc: one a kind that ran, at the request's end
                 .collect(),
+            placed: blaze_api::PlacedBytes::default(),
         };
-        w.said.push(Said::Report(id, Response::Work(worked)));
+        job.worked = Some(worked);
     }
 
     /// The daemon's tasks stalled ([`blaze_profile::Stall`]): every job with a plane request
@@ -2803,6 +3663,24 @@ impl<S: Steps> Jobs<S> {
                 .get(key_of(*id))
                 .is_some_and(|job| matches!(&job.stage, Stage::Units(build) if build.writer.waiting()))
         })
+    }
+
+    /// How many kept front ends are being stored now ([`Jobs::store_kept`]).
+    pub fn storing(&self) -> usize {
+        self.jobs.values().filter(|it| it.storing.is_some()).count()
+    }
+
+    /// The lowerings the loop holds for their root's kept front end to be stored, which have no
+    /// plane node: what a stall names of them, by root and the store's node.
+    pub fn held_lowerings(&self) -> Vec<HeldLowering> {
+        (self.lowering.iter())
+            .map(|it| HeldLowering {
+                job: it.id,
+                root: it.root,
+                checkout: it.checkout.clone(), // clone: a stall, once per lowering held
+                on: it.on.map(|node| node.0),
+            })
+            .collect() // alloc: a stall, once
     }
 
     /// What the loop holds node `node` back for, if it does: what a stall names of it.
@@ -2825,14 +3703,27 @@ impl<S: Steps> Jobs<S> {
             .order
             .iter()
             .copied()
-            .filter(|id| jobs.get(key_of(*id)).is_some_and(|it| it.request.is_some() && !it.finished))
+            .filter(|id| {
+                jobs.get(key_of(*id)).is_some_and(|it| (it.request.is_some() && !it.finished) || it.storing.is_some())
+            })
             .collect(); // alloc: once a stall
         for id in stalled {
             self.kill_runs(w, id);
-            let Some(job) = self.jobs.remove(key_of(id)) else { continue };
+            let Some(mut job) = self.jobs.remove(key_of(id)) else { continue };
+            // Its store's task may still run: what it gives back is dropped with the job.
+            if let Some(storing) = job.storing.take() {
+                self.roots.storing[storing.root as usize] -= 1;
+                if w.plane.is_open(storing.request) {
+                    w.plane.cancel(w.now, storing.request);
+                }
+            }
+            // Its tasks, placings and runs may still write into its build dirs: their leases
+            // outlive the job.
+            // clone: refcounts, once a stalled job
+            self.held_leases.push((id, Arc::clone(&job.cancelled), Arc::clone(&job.leases)));
             if let Some(request) = job.request {
                 let stats = w.plane.stats(request);
-                self.rows.push(job.row(request, stats, profile_history::Outcome::Stalled));
+                self.rows.push(job.ended(request, stats, profile_history::Outcome::Stalled));
                 job.cancelled.store(true, Ordering::Release);
                 if w.plane.is_open(request) {
                     w.plane.cancel(w.now, request);
@@ -2849,6 +3740,33 @@ impl<S: Steps> Jobs<S> {
             // clone: the error, once a job the stall ends
             w.said.push(Said::Finish(id, false, Some(error.clone()), job.built));
         }
+        // The lowerings of jobs the stall ended wait for nothing now.
+        let jobs = &self.jobs;
+        self.lowering.retain(|it| jobs.get(key_of(it.id)).is_some());
+    }
+
+    /// The daemon's store broke: every job still live fails with `error`, which names the store
+    /// and why. Those waiting at their gate fail at once; every other one is ended (its plane
+    /// request let go, its runs of user code killed) with the error as its answer, given as
+    /// soon as nothing of it is left, so no client is told of the break by a hangup alone.
+    pub fn store_broke(&mut self, w: &mut World<'_, S>, error: &ApiError) {
+        self.wind_up_judging(w, true);
+        // clone: the live jobs' ids, each turn the store is broken while jobs are live (at most
+        // a turn or two: each is ended here and finishes once nothing of it is left)
+        let live = self.order.clone();
+        for id in live {
+            let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
+            // Its tasks on the pool stop at their next look, so it finishes sooner.
+            job.cancelled.store(true, Ordering::Release);
+            let (ok, said) = job.over.get_or_insert((false, None));
+            *ok = false;
+            if said.is_none() {
+                *said = Some(error.clone()); // clone: an error, once a job the break ends
+            }
+            self.end(w, id, false, None);
+            self.kill_runs(w, id);
+        }
+        self.wind_up_judging(w, true);
     }
 
     fn cancel_job(&mut self, w: &mut World<'_, S>, id: JobId) {
@@ -2930,32 +3848,144 @@ impl<S: Steps> Jobs<S> {
     /// Finishes every job that is over and has nothing left: its tasks, its placements and its
     /// runs; and a snapshot once all it waits for is durable.
     fn wind_up(&mut self, w: &mut World<'_, S>) {
+        self.wind_up_judging(w, false);
+    }
+
+    /// [`Jobs::wind_up`], judging whether a wait for the store ran out of time only when
+    /// `judge` is set ([`gave_up`]).
+    fn wind_up_judging(&mut self, w: &mut World<'_, S>, judge: bool) {
         self.release_held(w);
+        self.release_ready(w);
         self.apply_writes(w);
         let mut over = std::mem::take(&mut self.over);
+        let mut heard = self.store_heard;
+        let mut recheck = false;
+        // Flushed once a winding up, for every job that waits ([`flush_once`]).
+        let mut flushed = None;
         for &id in &self.order {
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
             if let Stage::Snapshot { ticket: None, heads, store } = &mut job.stage
                 && w.images.done()
-                && store.is_none_or(|it| w.store.durable(it))
             {
-                let heads = std::mem::take(heads);
-                job.stage = Stage::Over;
-                match w.images.failed() {
-                    None => {
-                        w.said.push(Said::Report(id, Response::Snapshotted { heads }));
-                        job.over = Some((true, None));
+                // The store's puts before it, durable; or the wait given up as a build's is
+                // (bounded-progress): a broken store, or one that answers nothing.
+                store.retain_pending(|it| w.store.durable(it));
+                let refused = match store.iter().next() {
+                    None => Some(None),
+                    Some(pending) => {
+                        recheck |= flush_once(&mut flushed, &mut heard, w.store, w.now, w.effects);
+                        let since = *job.durable_since.get_or_insert(w.now);
+                        gave_up(w.store, w.now, since, heard, judge).map(|why| {
+                            // alloc: error path
+                            Some(format!(
+                                "the snapshot waits for the store's {pending}, put before it, to be durable, \
+                                 and it is not: {why}"
+                            ))
+                        })
                     }
-                    Some(why) => job.over = Some((false, Some(ApiError::new(why, None)))),
+                };
+                if let Some(refused) = refused {
+                    let heads = std::mem::take(heads);
+                    job.stage = Stage::Over;
+                    match (refused, w.images.failed()) {
+                        (Some(why), _) => job.over = Some((false, Some(ApiError::new(why, None)))),
+                        (None, None) => {
+                            w.said.push(Said::Report(id, Response::Snapshotted { heads }));
+                            job.over = Some((true, None));
+                        }
+                        (None, Some(why)) => job.over = Some((false, Some(ApiError::new(why, None)))),
+                    }
                 }
             }
             let Some((ok, error)) = &mut job.over else { continue };
-            if job.finished && job.placing == 0 && job.runs == 0 && !matches!(job.stage, Stage::Runs(..)) {
-                over.push((id, *ok, error.take()));
+            if !(job.finished
+                && job.placing == 0
+                && job.runs == 0
+                && job.storing.is_none()
+                && !matches!(job.stage, Stage::Runs(..)))
+            {
+                continue;
             }
+            // What its kept front end left for the store ([`Job::stored`]) and the retractions it
+            // put ([`Job::durable`]) are durable first; the store was flushed as they were put.
+            // A store that broke never makes them durable, nor does one that stopped committing:
+            // the job fails naming why and which, rather than wait with no end (rule 15).
+            // Wait for everything (the store model's `Wait::Everything`): a value a job read is
+            // handed back with no ticket, so it may be another job's put that is not durable
+            // yet, and answering on it before a crash loses it gives what a restart can't. Once,
+            // as it first comes here, it also waits for every put the loop made by then
+            // ([`Jobs::put`]), and for the last put of every segment of the store
+            // ([`Store::last_puts`]), which covers every put made by then, on the loop or through
+            // a writer of another thread, whether or not its caller handed the ticket over (an
+            // error path that put before it failed, a fetch).
+            let first = job.durable_since.is_none();
+            if first {
+                job.stored.extend(&self.put);
+                job.stored.extend(&w.store.last_puts());
+            }
+            job.stored.retain_pending(|it| w.store.durable(it));
+            job.durable.retain_pending(|it| w.store.durable(it));
+            // Flushed while it waits, whatever it waits on ([`flush_for_wait`]): a job with no
+            // kept front end (a run's puts alone, in `durable`) must flush too, or it waits for a
+            // commit no one asked for; and a put counted before its record was published is
+            // drained by a later flush, not by none.
+            if !(job.stored.is_empty() && job.durable.is_empty()) {
+                recheck |= flush_once(&mut flushed, &mut heard, w.store, w.now, w.effects);
+            }
+            let waiting = job.stored.iter().next().map(|it| (it, true)).or_else(|| job.durable.iter().next().map(|it| (it, false)));
+            if let Some((ticket, stored)) = waiting {
+                let since = *job.durable_since.get_or_insert(w.now);
+                let Some(why) = gave_up(w.store, w.now, since, heard, judge) else { continue };
+                let what = match (stored, &job.stored_of) {
+                    // alloc: error path
+                    (true, Some(checkout)) => format!(
+                        "what the build of {checkout} left for the store or read from it (dependency images, \
+                         check outcomes, goals; store ticket {ticket}) was put and is not durable, so a \
+                         restarted daemon would work it out again: {why}"
+                    ),
+                    // alloc: error path
+                    (true, None) => format!(
+                        "what job {id} (`{}`, on the view of root {}) read from the store, or the loop put \
+                         before it (store ticket {ticket}), was put and is not durable, so a restarted daemon \
+                         would work it out again: {why}",
+                        command_line(&job.work),
+                        job.views.first().map_or_else(|| "none".to_owned(), |it| it.view.root.to_string()),
+                    ),
+                    // alloc: error path
+                    (false, _) => format!(
+                        "what job {id} (`{}`) put itself (a build script's or test's results, a retraction, \
+                         the record of where a verified value's roots are; store ticket {ticket}) is not \
+                         durable, so a restarted daemon would work it out, or give it, again: {why}",
+                        command_line(&job.work),
+                    ),
+                };
+                *ok = false;
+                if error.is_none() {
+                    *error = Some(ApiError::new(what, job.stored_of.clone())); // clone: an error, once
+                }
+            }
+            over.push((id, *ok, error.take()));
         }
+        // A commit a wait started is the store moving; a wait whose puts no commit takes looks
+        // again shortly. Neither while the store is broken: its waits have failed above.
+        self.store_heard = heard;
+        self.recheck = (recheck && w.store.broken().is_none()).then(|| w.now + RECHECK);
         for (id, ok, error) in over.drain(..) {
-            let Some(job) = self.jobs.remove(key_of(id)) else { continue };
+            let Some(mut job) = self.jobs.remove(key_of(id)) else { continue };
+            let placed = job.placed;
+            tracing::info_span!(
+                target: "blaze",
+                "build placed",
+                cloned = placed.cloned,
+                written = placed.written,
+                copied = placed.copied
+            )
+            .in_scope(|| {});
+            if let Some(mut worked) = job.worked.take() {
+                worked.placed =
+                    blaze_api::PlacedBytes { cloned: placed.cloned, written: placed.written, copied: placed.copied };
+                w.said.push(Said::Report(id, Response::Work(worked)));
+            }
             // What it shared is committed for the other daemons, which find it at their next look.
             if job.shared {
                 w.std.flush(w.effects);
@@ -2990,6 +4020,31 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
+    /// When, on the injected clock, the first job waiting for what it put to be durable gives
+    /// up ([`DURABLE_WITHIN`] with no step of the store's commit answering, [`gave_up`]): the loop calls
+    /// [`Jobs::expire`] then, if nothing woke it before.
+    pub fn next_deadline(&self) -> Option<Duration> {
+        let since = self.jobs.values().filter_map(|it| it.durable_since).min()?;
+        let bound = since.max(self.store_heard) + DURABLE_WITHIN;
+        Some(self.recheck.map_or(bound, |at| at.min(bound)))
+    }
+
+    /// The store took a completion of its own at `now` on the injected clock, its commit
+    /// having answered `steps` steps ever ([`Store::commit_steps`]): only when that moved is
+    /// the commit making progress, and waits for it start their deadline again.
+    pub fn commit_moved(&mut self, now: Duration, steps: u64) {
+        if steps != self.commit_steps {
+            self.commit_steps = steps;
+            self.store_heard = self.store_heard.max(now);
+        }
+    }
+
+    /// The loop's clock reached [`Jobs::next_deadline`]: each job whose wait for the store is
+    /// past it fails, naming what it waited for.
+    pub fn expire(&mut self, w: &mut World<'_, S>) {
+        self.wind_up_judging(w, true);
+    }
+
     /// The VFS's tickets that are durable: a snapshot waits for its own.
     pub fn durable(&mut self, w: &mut World<'_, S>, tickets: &[Ticket]) {
         for job in self.jobs.values_mut() {
@@ -3007,13 +4062,17 @@ impl<S: Steps> Jobs<S> {
     fn snapshot(&mut self, w: &mut World<'_, S>) -> Stage<S> {
         let front = self.front_db();
         w.images.ask(Parts { db: w.db, front, vfs: &mut *w.vfs, predict: w.plane.predict(), effects: &mut *w.effects });
+        // What it waits for, read before the flush: a put another thread makes between the
+        // flush's drain and the read would be waited on and drained by no commit.
+        let mut store = self.put.clone(); // clone: one ticket per segment, once per snapshot
+        store.extend(&w.store.last_puts());
         w.store.flush(w.effects);
         w.std.flush(w.effects);
         // alloc: once per snapshot
         let heads: Vec<(String, ContentId)> = w.vfs.heads().into_iter().map(|(head, root)| (head.to_owned(), root)).collect();
         let ticket = heads.first().and_then(|(head, root)| w.vfs.set_head(head, *root).ok());
         w.vfs.flush(w.effects);
-        Stage::Snapshot { ticket, heads, store: self.put }
+        Stage::Snapshot { ticket, heads, store }
     }
 }
 
@@ -3076,6 +4135,17 @@ fn at_its_end(open: bool, ok: bool, closed: bool) -> (bool, bool) {
     (false, !closed)
 }
 
+/// A job over, not ok, with `error`: whether or not it was over already, its first error kept.
+fn fail_over(over: &mut Option<(bool, Option<ApiError>)>, error: ApiError) {
+    match over {
+        Some((ok, kept)) => {
+            *ok = false;
+            kept.get_or_insert(error);
+        }
+        None => *over = Some((false, Some(error))),
+    }
+}
+
 /// The reading tasks a job held for a write ended unposted: the job is over or cancelled.
 fn refuse_held<S: Steps>(w: &mut World<'_, S>, stage: &mut Stage<S>) {
     if let Stage::Units(build) = stage {
@@ -3083,6 +4153,35 @@ fn refuse_held<S: Steps>(w: &mut World<'_, S>, stage: &mut Stage<S>) {
             w.plane.refuse(w.now, task, "cancelled".to_owned()); // alloc: a cancel, once per task held
         }
     }
+}
+
+/// Whether a job's work is a cargo `test` or `bench` build, whose command runs each test
+/// executable as it is ready: such a build also says every unit's start and end
+/// ([`Response::UnitBegan`], [`Response::UnitEnded`]) and each test executable once placed
+/// ([`Response::TestReady`]).
+fn streams_units(work: &Work) -> bool {
+    let Work::Build(targets) = work else { return false };
+    targets.cargo.as_ref().is_some_and(|it| it.command == "test" || it.command == "bench")
+}
+
+/// Whether `artifact` is a test executable the command runs: a test-profile target's, or a
+/// doc test's.
+fn runs_as_test(artifact: &Artifact) -> bool {
+    artifact.executable.is_some() && (artifact.profile.test || artifact.kind == ArtifactKind::Doctest)
+}
+
+/// Unit `at` of `units` as a response names it; `None` for one past the graph, or whose package
+/// or target the plan does not have (its diagnostics say so).
+fn unit_of(units: &Units, at: usize) -> Option<UnitOf> {
+    let unit = units.graph.units.get(at)?;
+    let package = super::unit::package_of(units, unit).ok()?;
+    Some(UnitOf {
+        id: u32::try_from(at).ok()?,
+        test: matches!(unit.mode, UnitMode::Test) || (matches!(unit.mode, UnitMode::Check) && unit.checked_as_test),
+        package_id: unit.pkg_id.clone(),               // clone: the report owns it, once per unit
+        manifest_path: package.manifest_path.clone(), // clone: the report owns it, once per unit
+        target: super::unit::unit_target(unit).ok()?,
+    })
 }
 
 /// Whether build script run `node` of `job` waits for its program: an output of the compile of
@@ -3159,7 +4258,7 @@ fn noted(served: &ServedCrate) -> Option<Diagnostic> {
 
 /// Every memo reachable from `from` in `db`, each once, in the order it is reached.
 fn walk(db: &Database, from: QueryKey) -> Vec<blaze_query::Memo> {
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     let mut queue = vec![from]; // alloc: a trace or a verify, once
     let mut memos = Vec::new(); // alloc: a trace or a verify, once
     while let Some(key) = queue.pop() {

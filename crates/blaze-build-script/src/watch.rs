@@ -9,13 +9,14 @@
 
 use std::{
     borrow::{Borrow, Cow},
-    collections::hash_map::Entry,
     ffi::OsStr,
     hash::{BuildHasher, Hash},
     path::{Component, Path, PathBuf},
 };
+use blaze_hash::hash_map::Entry;
 
 use blaze_hash::{FixedState, HashMap};
+use std::alloc::Global;
 
 use crate::{
     Error,
@@ -121,7 +122,7 @@ const SCAN: usize = 16;
 enum Seen {
     Scan,
     /// Each hash met, with the index of the first value kept that has it.
-    Hashed(HashMap<u64, u32>),
+    Hashed(HashMap<u64, u32, Global>),
 }
 
 impl Seen {
@@ -129,7 +130,7 @@ impl Seen {
         if len <= SCAN {
             Seen::Scan
         } else {
-            Seen::Hashed(HashMap::with_capacity_and_hasher(len, FixedState))
+            Seen::Hashed(HashMap::with_capacity_in(len, Global))
         }
     }
 

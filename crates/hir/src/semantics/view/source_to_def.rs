@@ -577,7 +577,7 @@ impl<'db> ViewCtx<'db, '_> {
             let files = def_map.modules(db).filter_map(|(_, data)| data.origin.file_id());
             let mut pending: Vec<hir_expand::EditionedFileId> = files.collect(); // alloc: the files searched, once per file no crate def map has
             // alloc: as above
-            let mut seen: blaze_hash::HashSet<hir_expand::EditionedFileId> = pending.iter().copied().collect();
+            let mut seen: blaze_hash::HashSet<hir_expand::EditionedFileId, std::alloc::Global> = pending.iter().copied().collect();
             while let Some(searched) = pending.pop() {
                 let root = self.sema.parse(searched).syntax();
                 for node in root.descendants() {
@@ -605,7 +605,7 @@ impl<'db> ViewCtx<'db, '_> {
     }
 
     pub(super) fn module_to_def(&mut self, src: InFile<ast::Module<'db>>) -> Option<ModuleId> {
-        let _p = tracing::info_span!("module_to_def").entered();
+        let _p = tracing::info_span!(target: "blaze", "module_to_def").entered();
         let parent_declaration = self
             .parent_ancestors_with_macros(src.map(|it| it.syntax()), |_, ancestor, _| {
                 ancestor.map(Either::<ast::Module<'db>, ast::BlockExpr<'db>>::cast).transpose()
@@ -631,7 +631,7 @@ impl<'db> ViewCtx<'db, '_> {
         &mut self,
         src: InFile<ast::SourceFile<'db>>,
     ) -> Option<ModuleId> {
-        let _p = tracing::info_span!("source_file_to_def").entered();
+        let _p = tracing::info_span!(target: "blaze", "source_file_to_def").entered();
         self.file_module(src.file_id)
     }
 
@@ -924,7 +924,7 @@ impl<'db> ViewCtx<'db, '_> {
     }
 
     pub(super) fn find_container(&mut self, src: InFile<Node<'db>>) -> Option<ChildContainer> {
-        let _p = tracing::info_span!("find_container").entered();
+        let _p = tracing::info_span!(target: "blaze", "find_container").entered();
         if self.call_crate.is_none()
             && let Some(macro_file) = src.file_id.macro_file()
         {

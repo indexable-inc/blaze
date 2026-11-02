@@ -181,8 +181,10 @@ fn masked() -> Masked {
 fn valid() -> Vec<Vec<u8>> {
     let mut windows = full();
     windows.unwind = Some(TemplateUnwind::Windows { info: vec![1, 2], handler: None, lsda: Some(0) });
-    windows.profile = Some(Profiled::Used { mismatched: true });
-    let mut out = vec![encode(&bare()), encode(&full()), encode(&windows)];
+    windows.profile = Some(Profiled::Used { mismatched: true, applied: false });
+    let mut applied = full();
+    applied.profile = Some(Profiled::Used { mismatched: false, applied: true });
+    let mut out = vec![encode(&bare()), encode(&full()), encode(&windows), encode(&applied)];
     out.extend(statics().iter().map(encode_static));
     out.push(encode_masked(Some(&masked())));
     out.push(encode_masked(None));

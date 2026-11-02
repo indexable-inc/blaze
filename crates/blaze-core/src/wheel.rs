@@ -18,6 +18,8 @@
 //! Cost: 32 bytes of links per timer beside its value (and the slab's 8), 11 KiB of slot heads,
 //! and O(1) insert, cancel and step of an advance.
 
+#![blaze::sans_io]
+
 use std::time::Duration;
 
 use blaze_mem::{MemError, Slab, Tag as MemTag};

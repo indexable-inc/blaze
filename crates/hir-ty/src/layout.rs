@@ -1,6 +1,6 @@
 //! Compute the binary representation of a type
 
-use std::{cell::OnceCell, fmt, ops::Deref, sync::LazyLock};
+use std::{fmt, ops::Deref};
 
 use base_db::{Db, Crate};
 use blaze_hashcons::{Consed, HashCons, Interned};
@@ -20,6 +20,7 @@ use rustc_abi::{
     WrappingRange,
 };
 use rustc_index::{IndexSlice, IndexVec, bit_set::BitMatrix};
+use smallvec::SmallVec;
 use rustc_type_ir::{
     FloatTy, IntTy, TypeVisitableExt as _, UintTy,
     inherent::{GenericArgs as _, IntoKind},
@@ -38,9 +39,18 @@ use crate::{
     traits::StoredParamEnvAndCrate,
 };
 
-pub use self::{adt::layout_of_adt_query, target::target_data_layout_query};
+pub use self::{
+    adt::layout_of_adt_query,
+    bits::{
+        BitWidth, BitWidthError, BitsError, BitsField, BitsLayout, bit_width_of, bits_display_target,
+        bits_layout, bits_struct_of, is_bits_struct,
+    },
+    target::target_data_layout_query,
+};
 
 pub(crate) mod adt;
+mod bits;
+pub mod field_order;
 pub(crate) mod target;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,7 +125,8 @@ impl Consed for InternedLayout {
 
 /// Every layout of the process, never freed, as `crates/intern`'s tables are: a handle stays
 /// valid in every revision and every database.
-static LAYOUTS: LazyLock<HashCons<InternedLayout>> = LazyLock::new(HashCons::new);
+#[expect(clippy::disallowed_types, reason = "the process's one layout interner: handles stay valid across databases and revisions")]
+static LAYOUTS: std::sync::LazyLock<HashCons<InternedLayout>> = std::sync::LazyLock::new(HashCons::new);
 
 /// The one handle of `layout`.
 pub fn intern_layout(layout: Layout) -> Interned<'static, InternedLayout> {
@@ -126,6 +137,8 @@ pub fn intern_layout(layout: Layout) -> Interned<'static, InternedLayout> {
 pub enum LayoutError {
     // FIXME: Remove more variants once they get added to LayoutCalculatorError
     BadCalc(LayoutCalculatorError<()>),
+    /// A `#[blaze::bits]` struct that is refused: [`BitsError::message`] says why.
+    Bits(Box<BitsError>),
     /// `variant`'s discriminant did not evaluate; rustc reports it (E0080) and stops.
     DiscriminantFailed { variant: EnumVariantId },
     HasErrorConst,
@@ -149,6 +162,11 @@ impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LayoutError::BadCalc(err) => err.fallback_fmt(f),
+            LayoutError::Bits(err) => write!(
+                f,
+                "the `#[blaze::bits]` struct {:?} is refused ({err:?}); its definition's error says why",
+                err.strukt()
+            ),
             LayoutError::DiscriminantFailed { variant } => {
                 write!(f, "the discriminant of {variant:?} did not evaluate")
             }
@@ -341,12 +359,14 @@ struct Normalizer<'db> {
     krate: Crate,
     param_env: ParamEnv<'db>,
     cause: ObligationCause,
-    infcx: OnceCell<InferCtxt<'db>>,
+    #[expect(clippy::disallowed_types, reason = "the inference context, set once per normalizer: not global")]
+    infcx: std::cell::OnceCell<InferCtxt<'db>>,
 }
 
 impl<'db> Normalizer<'db> {
+    #[expect(clippy::disallowed_types, reason = "the inference context, set once per normalizer: not global")]
     fn new(db: &'db Db, krate: Crate, param_env: ParamEnv<'db>) -> Self {
-        Self { db, krate, param_env, cause: ObligationCause::dummy(), infcx: OnceCell::new() }
+        Self { db, krate, param_env, cause: ObligationCause::dummy(), infcx: std::cell::OnceCell::new() }
     }
 
     fn normalize(&self, ty: Ty<'db>) -> Result<Ty<'db>, LayoutError> {
@@ -356,7 +376,12 @@ impl<'db> Normalizer<'db> {
             return Ok(ty);
         }
         let infcx = self.infcx.get_or_init(|| {
-            DbInterner::new_with(self.db, self.krate).infer_ctxt().build(TypingMode::PostAnalysis)
+            let infcx = DbInterner::new_with(self.db, self.krate)
+                .infer_ctxt()
+                .build(TypingMode::PostAnalysis);
+            // A `for const` binder the environment assumes things of can be named.
+            crate::comptime_env::enter_universes(&infcx, self.param_env);
+            infcx
         });
         // An alias rigid in the typing mode the type comes from may not be in `PostAnalysis`,
         // as rustc's `layout_of` resets them when it switches.
@@ -409,7 +434,10 @@ pub fn layout_of_ty_query(
     if let Some(bare) = bare_env(db, ty, trait_env) {
         return db.layout_of_ty(ty, bare);
     }
-    blaze_mem::frame::current(|frame| layout_of_ty_in(db, ty, trait_env, frame))
+    // A field's layout is a query inside its ADT's, one per level of a type as deep as the
+    // program built it (`Option` 130 deep): an overflow aborts the process, so each level makes
+    // sure of its stack (rule 17).
+    stdx::ensure_sufficient_stack(|| blaze_mem::frame::current(|frame| layout_of_ty_in(db, ty, trait_env, frame)))
 }
 
 /// The crate's empty environment when `ty` has no parameter, inference variable or placeholder
@@ -485,36 +513,34 @@ fn layout_of_ty_in(
         ),
         TyKind::Int(i) => Layout::scalar(
             dl,
-            scalar_unit(
+            int_scalar(
                 dl,
-                Primitive::Int(
-                    match i {
-                        IntTy::Isize => dl.ptr_sized_integer(),
-                        IntTy::I8 => Integer::I8,
-                        IntTy::I16 => Integer::I16,
-                        IntTy::I32 => Integer::I32,
-                        IntTy::I64 => Integer::I64,
-                        IntTy::I128 => Integer::I128,
-                    },
-                    true,
-                ),
+                match i.storage() {
+                    IntTy::Isize => dl.ptr_sized_integer(),
+                    IntTy::I8 => Integer::I8,
+                    IntTy::I16 => Integer::I16,
+                    IntTy::I32 => Integer::I32,
+                    IntTy::I64 => Integer::I64,
+                    IntTy::I128 | IntTy::Bits(_) => Integer::I128,
+                },
+                true,
+                i.arbitrary_width(),
             ),
         ),
         TyKind::Uint(i) => Layout::scalar(
             dl,
-            scalar_unit(
+            int_scalar(
                 dl,
-                Primitive::Int(
-                    match i {
-                        UintTy::Usize => dl.ptr_sized_integer(),
-                        UintTy::U8 => Integer::I8,
-                        UintTy::U16 => Integer::I16,
-                        UintTy::U32 => Integer::I32,
-                        UintTy::U64 => Integer::I64,
-                        UintTy::U128 => Integer::I128,
-                    },
-                    false,
-                ),
+                match i.storage() {
+                    UintTy::Usize => dl.ptr_sized_integer(),
+                    UintTy::U8 => Integer::I8,
+                    UintTy::U16 => Integer::I16,
+                    UintTy::U32 => Integer::I32,
+                    UintTy::U64 => Integer::I64,
+                    UintTy::U128 | UintTy::Bits(_) => Integer::I128,
+                },
+                false,
+                i.arbitrary_width(),
             ),
         ),
         TyKind::Float(f) => Layout::scalar(
@@ -879,6 +905,57 @@ pub fn struct_tail_erasing_lifetimes<'a>(
     }
 }
 
+/// Where the `dyn` at the end of `ty`'s chain of last fields (through structs and tuples, as
+/// [`struct_tail_erasing_lifetimes`] finds it) starts in a value of `ty`, and that value's
+/// alignment, when the `dyn`'s concrete type is aligned to `align`; `None` when the tail is no
+/// `dyn`. Each unsized field starts where the layout puts it (after the fields before it),
+/// rounded up to its own alignment, capped by its struct's `packed`, and a value is aligned to
+/// the larger of its sized fields' alignment and its tail's: rustc's `project_field` and
+/// `size_and_align_of_dst`. Const eval, the code generator and code identity all place a
+/// `dyn` tail's concrete value with this, so they find it at one offset. `normalize` is given
+/// each field type, `layout` each struct or tuple on the way.
+pub fn dyn_tail_place<'a, 'l, E>(
+    db: &'a Db,
+    ty: Ty<'a>,
+    align: usize,
+    mut normalize: impl FnMut(Ty<'a>) -> Result<Ty<'a>, E>,
+    mut layout: impl FnMut(Ty<'a>) -> Result<&'l Layout, E>,
+) -> Result<Option<(usize, usize)>, E> {
+    // Each struct or tuple on the way down, with its last field's index and its `packed`.
+    let mut chain: SmallVec<[(Ty<'a>, usize, Option<usize>); 4]> = SmallVec::new();
+    let mut at = ty;
+    loop {
+        at = match at.kind() {
+            TyKind::Dynamic(..) => break,
+            TyKind::Adt(def, args) => {
+                let AdtId::StructId(id) = def.def_id() else { return Ok(None) };
+                if representability(db, def.def_id()) == Representability::Infinite {
+                    return Ok(None);
+                }
+                let fields = variant_field_ids(db, id.into());
+                let Some(&last) = fields.last() else { return Ok(None) };
+                let pack = AttrFlags::repr(db, id.into()).and_then(|it| it.pack).map(|it| it.bytes_usize());
+                chain.push((at, fields.len() - 1, pack));
+                normalize(field_ty(db, id.into(), last, args))?
+            }
+            TyKind::Tuple(tys) => {
+                let Some(last) = tys.iter().next_back() else { return Ok(None) };
+                chain.push((at, tys.len() - 1, None));
+                normalize(last)?
+            }
+            _ => return Ok(None),
+        };
+    }
+    let (mut offset, mut align) = (0, align);
+    for &(outer, last, pack) in chain.iter().rev() {
+        let layout = layout(outer)?;
+        let field_align = pack.map_or(align, |pack| align.min(pack));
+        offset += layout.fields.offset(last).bytes_usize().next_multiple_of(field_align);
+        align = layout.align.abi.bytes_usize().max(field_align);
+    }
+    Ok(Some((offset, align)))
+}
+
 fn field_ty<'a>(
     db: &'a Db,
     def: hir_def::VariantId,
@@ -890,6 +967,31 @@ fn field_ty<'a>(
 
 fn scalar_unit(dl: &TargetDataLayout, value: Primitive) -> Scalar {
     Scalar::Initialized { value, valid_range: WrappingRange::full(value.size(dl)) }
+}
+
+/// An integer's scalar. A standard width is valid at every bit pattern. One of
+/// `#![blaze::arbitrary_ints]` is its storage integer (`u3` is a `u8`, `i24` an `i32`) holding
+/// the value zero- or sign-extended, so its valid range is the width's values and the high
+/// bits it never sets are a niche, as `bool`'s are: `Option<u7>` is one byte
+/// (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+pub(crate) fn int_scalar(
+    dl: &TargetDataLayout,
+    storage: Integer,
+    signed: bool,
+    width: Option<rustc_ast_ir::IntWidth>,
+) -> Scalar {
+    let value = Primitive::Int(storage, signed);
+    let Some(width) = width else { return scalar_unit(dl, value) };
+    let bits = width.bits();
+    let valid_range = match signed {
+        // `i3` is -4..=3: from -4's sign-extended pattern up through 0 to 3.
+        true => WrappingRange {
+            start: storage.size().truncate((-(1i128 << (bits - 1))) as u128),
+            end: (1u128 << (bits - 1)) - 1,
+        },
+        false => WrappingRange { start: 0, end: (1u128 << bits) - 1 },
+    };
+    Scalar::Initialized { value, valid_range }
 }
 
 /// Where an `async` block keeps what has to survive from one `poll` to the next. The fields of

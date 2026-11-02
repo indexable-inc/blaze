@@ -84,6 +84,47 @@ impl<'db> InferCtxt<'db> {
         (result, var_values)
     }
 
+    /// [`Self::instantiate_canonical`] for a query this context answers itself, in a probe (the
+    /// method probe's steps), where `original_values` are the query's own inputs: a placeholder
+    /// of the input is the caller's placeholder, not one made anew in the current universe.
+    ///
+    /// rustc answers such a query in a fresh context, where the input's root universe is the
+    /// root again and its placeholders come back as themselves. Here the root maps to the
+    /// current universe, so a placeholder made anew (a `for const` binder `!U_b`) would be
+    /// another type: not the one the environment's assumptions name, or the same as a second
+    /// binder that shares its index, and the response would hand back a placeholder the caller
+    /// never had.
+    pub fn instantiate_canonical_as_caller<T>(
+        &self,
+        span: Span,
+        canonical: &Canonical<'db, T>,
+        original_values: &canonicalizer::OriginalQueryValues<'db>,
+    ) -> (T, CanonicalVarValues<'db>)
+    where
+        T: TypeFoldable<DbInterner<'db>>,
+    {
+        assert_eq!(original_values.var_values.len(), canonical.var_kinds.len());
+        let universes: SmallVec<[UniverseIndex; 4]> = std::iter::once(self.universe())
+            .chain((1..=canonical.max_universe.as_u32()).map(|_| self.create_next_universe()))
+            // alloc: inline up to 4 universes; queries rarely carry any but the root.
+            .collect();
+        let var_values = CanonicalVarValues::instantiate(
+            self.interner,
+            canonical.var_kinds,
+            |var_values, info| {
+                if info.is_existential() {
+                    self.instantiate_canonical_var(span, info, var_values, |ui| {
+                        universes[ui.as_usize()]
+                    })
+                } else {
+                    original_values.var_values[var_values.len()]
+                }
+            },
+        );
+        let result = canonical.instantiate(self.interner, &var_values);
+        (result, var_values)
+    }
+
     /// Given the "info" about a canonical variable, creates a fresh
     /// variable for it. If this is an existentially quantified
     /// variable, then you'll get a new inference variable; if it is a

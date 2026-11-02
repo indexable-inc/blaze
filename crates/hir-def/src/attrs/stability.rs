@@ -13,7 +13,7 @@
 //! `compiler/rustc_hir/src/{stability.rs,attrs/data_structures.rs}` (the types) (MIT or
 //! Apache-2.0).
 
-use std::{num::NonZero, ops::ControlFlow, sync::LazyLock};
+use std::{num::NonZero, ops::ControlFlow};
 
 use base_db::{Db, Crate, CrateOrigin, LangCrateOrigin};
 use hir_expand::{AstId, HirFileId, InFile, Lookup, attrs::expand_cfg_attr_view, name::Name};
@@ -208,7 +208,8 @@ pub enum StableSince {
 
 /// The stability `-Zforce-unstable-if-unmarked` gives everything of a crate without
 /// `staged_api` (rustc's `FORCE_UNSTABLE`).
-static FORCE_UNSTABLE: LazyLock<Stability> = LazyLock::new(|| Stability {
+#[expect(clippy::disallowed_types, reason = "the process's one forced unstable marker: callers share the same constant stability value")]
+static FORCE_UNSTABLE: std::sync::LazyLock<Stability> = std::sync::LazyLock::new(|| Stability {
     level: StabilityLevel::Unstable {
         reason: UnstableReason::Default,
         issue: NonZero::new(27812),

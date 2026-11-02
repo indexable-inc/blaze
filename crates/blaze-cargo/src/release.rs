@@ -2,8 +2,6 @@
 //! crates/blaze-engine/build.rs) and handed over by its `main` with [`set`] before any command
 //! runs, so that no release and no commit changes this crate.
 
-use std::sync::OnceLock;
-
 pub struct Release {
     /// A release's `0.YYYYMMDD.N`, or `0.0.0-dev` for a build of the tree (`BLAZE_VERSION`).
     pub version: &'static str,
@@ -12,7 +10,11 @@ pub struct Release {
     pub line: &'static str,
 }
 
-static RELEASE: OnceLock<Release> = OnceLock::new();
+#[expect(
+    clippy::disallowed_types,
+    reason = "which blaze the process is, handed over once by the program's main so that no release changes this crate"
+)]
+static RELEASE: std::sync::OnceLock<Release> = std::sync::OnceLock::new();
 
 pub fn set(release: Release) {
     let _ = RELEASE.set(release);

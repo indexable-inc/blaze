@@ -35,7 +35,8 @@ use crate::{
             SideTable,
         },
         diagnostics::{
-            AssocTypeFailure, AssocTypeQself, ElidedLifetimeSite, GenericArgsProhibitedReason,
+            AssocTypeFailure, AssocTypeQself, CycleQuery, ElidedLifetimeSite,
+            GenericArgsProhibitedReason,
             IncorrectGenericsLenKind, MissingLifetimeKind, PathGenericsSource,
             PathLoweringDiagnostic, PatternTypeUnsupported,
         },
@@ -370,7 +371,8 @@ impl ColdBatch {
 impl Persist for ColdBatch {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ColdBatch"),
-        Part::U64(6),
+        // 7: `TyLoweringDiagnostic::ComptimeBinderNotYetSupported`.
+        Part::U64(7),
         Part::Schema(<BatchRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ColdBatchRef<'a>;
@@ -899,11 +901,27 @@ pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic
             w.push(8);
             put_local(w, *source);
         }
+        TyLoweringDiagnostic::ComptimeBinderNotYetSupported { source } => {
+            w.push(40);
+            put_local(w, *source);
+        }
         TyLoweringDiagnostic::PatternTypeNotLowered { source, reason } => {
             w.push(9);
             put_local(w, *source);
             w.push(match reason {
                 PatternTypeUnsupported::Pattern => 0,
+            });
+        }
+        TyLoweringDiagnostic::QueryCycle { def, query } => {
+            w.push(10);
+            put_generic_def(w, *def);
+            w.push(match query {
+                CycleQuery::Predicates => 0,
+                CycleQuery::SuperClauses => 1,
+                CycleQuery::ImpliedClauses => 2,
+                CycleQuery::Supertraits => 3,
+                CycleQuery::ImplSelfTy => 4,
+                CycleQuery::ImplTrait => 5,
             });
         }
     }
@@ -1204,11 +1222,24 @@ impl Words<'_> {
                 TyLoweringDiagnostic::MissingSelfDefaultParams { source, trait_, params }
             }
             8 => TyLoweringDiagnostic::ObjectWithoutTrait { source: self.local()? },
+            40 => TyLoweringDiagnostic::ComptimeBinderNotYetSupported { source: self.local()? },
             9 => TyLoweringDiagnostic::PatternTypeNotLowered {
                 source: self.local()?,
                 reason: match self.u32()? {
                     0 => PatternTypeUnsupported::Pattern,
                     _ => return Err(self.invalid("a pattern type not lowered for no reason")),
+                },
+            },
+            10 => TyLoweringDiagnostic::QueryCycle {
+                def: self.generic_def()?,
+                query: match self.u32()? {
+                    0 => CycleQuery::Predicates,
+                    1 => CycleQuery::SuperClauses,
+                    2 => CycleQuery::ImpliedClauses,
+                    3 => CycleQuery::Supertraits,
+                    4 => CycleQuery::ImplSelfTy,
+                    5 => CycleQuery::ImplTrait,
+                    _ => return Err(self.invalid("a cycle of no query")),
                 },
             },
             _ => return Err(self.invalid("a lowering diagnostic of no kind")),
@@ -1435,10 +1466,17 @@ mod tests {
                 params: Box::new([TypeParamId::from_unchecked(param)]),
             },
             TyLoweringDiagnostic::ObjectWithoutTrait { source },
+            TyLoweringDiagnostic::ComptimeBinderNotYetSupported { source },
             TyLoweringDiagnostic::PatternTypeNotLowered {
                 source,
                 reason: PatternTypeUnsupported::Pattern,
             },
+            TyLoweringDiagnostic::QueryCycle { def, query: CycleQuery::Predicates },
+            TyLoweringDiagnostic::QueryCycle { def: trait_def, query: CycleQuery::SuperClauses },
+            TyLoweringDiagnostic::QueryCycle { def: trait_def, query: CycleQuery::ImpliedClauses },
+            TyLoweringDiagnostic::QueryCycle { def: trait_def, query: CycleQuery::Supertraits },
+            TyLoweringDiagnostic::QueryCycle { def, query: CycleQuery::ImplSelfTy },
+            TyLoweringDiagnostic::QueryCycle { def, query: CycleQuery::ImplTrait },
             TyLoweringDiagnostic::InferVarsNotAllowed { sources: Box::new([Span::TypeRefId(source)]) },
             TyLoweringDiagnostic::InferVarsNotAllowed {
                 sources: Box::new([Span::ExprId(Idx::from_raw(RawIdx::from_u32(1))), Span::TypeRefId(source)]),

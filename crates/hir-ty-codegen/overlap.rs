@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::bits::BitMatrix;
 use blaze_mem::Frame;
 use cranelift_codegen::{
@@ -30,7 +31,7 @@ pub(super) struct FrameLocals {
     /// By index in `slots`.
     pub(super) conflicts: BitMatrix<usize>,
     /// Where in `slots` a local kept in a register puts the slot it gets when it needs one.
-    pub(super) lazy: HashMap<hir_ty_mir::mir::LocalId, usize>,
+    pub(super) lazy: HashMap<hir_ty_mir::mir::LocalId, usize, Global>,
 }
 
 /// Shares the slots of `frame` between locals that never hold storage at once, and has
@@ -236,6 +237,7 @@ fn slot_mut(inst: &mut InstructionData) -> Option<&mut ir::StackSlot> {
 #[cfg(test)]
 mod tests {
     use blaze_hash::HashSet;
+    use std::alloc::Global;
     use blaze_ids::rng::SplitMix64;
     use cranelift_codegen::ir::{
         InstBuilder, StackSlotData, StackSlotKind,
@@ -246,9 +248,9 @@ mod tests {
     use super::*;
 
     /// [`escaping`] as it was, with hash maps.
-    fn escaping_model(func: &ir::Function) -> HashSet<ir::StackSlot> {
+    fn escaping_model(func: &ir::Function) -> HashSet<ir::StackSlot, Global> {
         let dfg = &func.dfg;
-        let mut of: HashMap<ir::Value, ir::StackSlot> = HashMap::default();
+        let mut of: HashMap<ir::Value, ir::StackSlot, Global> = HashMap::new_in(Global);
         loop {
             let known = of.len();
             for block in func.layout.blocks() {
@@ -269,7 +271,7 @@ mod tests {
                 break;
             }
         }
-        let mut escaping = HashSet::default();
+        let mut escaping = HashSet::new_in(Global);
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
                 let followed = match dfg.insts[inst] {
@@ -300,12 +302,12 @@ mod tests {
         func: &mut ir::Function,
         frame: &FrameLocals,
         named: &mut [ir::StackSlot],
-        only: Option<&HashSet<ir::StackSlot>>,
+        only: Option<&HashSet<ir::StackSlot, Global>>,
     ) {
         if frame.slots.is_empty() {
             return;
         }
-        let mut used = HashSet::default();
+        let mut used = HashSet::new_in(Global);
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
                 used.extend(func.dfg.inst_values(inst).map(|it| func.dfg.resolve_aliases(it)));
@@ -344,7 +346,7 @@ mod tests {
                 None => groups.push(vec![at]),
             }
         }
-        let mut moved: HashMap<ir::StackSlot, ir::StackSlot> = HashMap::default();
+        let mut moved: HashMap<ir::StackSlot, ir::StackSlot, Global> = HashMap::new_in(Global);
         for group in groups.iter().filter(|it| it.len() > 1) {
             let kept = slot(group[0]);
             for &at in &group[1..] {
@@ -418,7 +420,7 @@ mod tests {
         let returned = returned.unwrap_or_else(|| builder.ins().iconst(I64, 0));
         builder.ins().return_(&[returned]);
         builder.seal_all_blocks();
-        builder.finalize(super::super::target().unwrap().frontend_config());
+        builder.finalize(super::super::isa_for(super::super::Target::for_host()).unwrap().frontend_config());
         let registers = random.below(4) as usize;
         let frame_slots: Vec<_> = slots
             .iter()
@@ -436,7 +438,7 @@ mod tests {
             }
         }
         let named = slots.iter().copied().filter(|_| random.below(4) == 0).collect();
-        let lazy = HashMap::default();
+        let lazy = HashMap::new_in(Global);
         (func, FrameLocals { slots: frame_slots, conflicts, lazy }, named)
     }
 

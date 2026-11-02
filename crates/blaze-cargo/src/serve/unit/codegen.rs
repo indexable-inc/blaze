@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use blaze_codegen::{
     Backend, InstanceKey, NativeLib, NativeLibKind, Target,
-    driver::{Build, Built},
+    driver::{Build, Built, ProfileCounts},
     plan::{Mode as BuildMode, OptLevel, Origin, Override, Package, Policy, Profile},
     settings::{DebugInfo, Panic, Pgo, Sanitize, Sanitizers, Toolchain},
 };
@@ -18,13 +18,14 @@ use blaze_build_script::{
     apply::{Compile, Linked as LinkedTo},
     unit as bs,
 };
+use blaze_api::ApiError;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
-use blaze_link::{Change, Image, Native, Output};
+use blaze_link::{Change, Image, Native, NativeKind, Output};
 use blaze_units::schema::{self, Mode, Unit};
 use hir_ty_codegen::v2::{
-    Backends, BodyChecks, BuildTime, Databases, HashSource, HirFrontend, HirInstance, ItemHashes, LinkInputs,
-    RootKind, Roots, Runs,
+    Backends, BodyChecks, BuildTime, Databases, GlobalAsmObject, HashSource, HirFrontend, HirInstance, ItemHashes,
+    LinkInputs, RootKind, Roots, Runs,
 };
 
 use super::{Job, Real, UnitReader, files::Mounted, graph::flag, script};
@@ -71,14 +72,34 @@ pub(crate) fn makes(unit: &Unit) -> Result<Makes, String> {
     Ok(Makes::Library)
 }
 
-fn root_kind(unit: &Unit, makes: &Makes) -> RootKind {
-    match makes {
+/// Whether `unit` is a proc macro built for wasm32-wasip1 to run as a wasm module
+/// ([`blaze_lower::wasm_macro`]): it builds code, linked as a WASI reactor whose exports are the
+/// bridge's glue ([`super::harness`]).
+pub(crate) fn wasm_macro(job: &Job, unit: usize) -> bool {
+    match (job.unit(unit), job.plan(unit)) {
+        (Ok(u), Ok(plan)) => blaze_lower::wasm_macro(u, plan),
+        _ => false,
+    }
+}
+
+/// The roots codegen compiles for `unit`. A proc macro built for wasm (`wasm`) is a program
+/// whose roots are its glue's exports, kept by name as a `cdylib`'s are; any other proc macro
+/// builds no code (its expanders run its MIR, [`super::compile`]'s `macros`), so asking for
+/// its roots is an error naming it.
+fn root_kind(unit: &Unit, makes: &Makes, wasm: bool) -> Result<RootKind, String> {
+    Ok(match makes {
         Makes::Executable if matches!(unit.mode, Mode::Test) => RootKind::Test,
         Makes::Executable => RootKind::Executable,
-        Makes::Shared { proc_macro: true } => RootKind::ProcMacro,
+        Makes::Shared { proc_macro: true } if wasm => RootKind::Shared,
+        Makes::Shared { proc_macro: true } => {
+            return Err(format!(
+                "proc macro `{}` builds no code (its expanders run its MIR), yet its codegen was asked for",
+                unit.target.name
+            ));
+        }
         Makes::Shared { proc_macro: false } => RootKind::Shared,
         Makes::Library => RootKind::Library,
-    }
+    })
 }
 
 /// The triple `unit` is built for.
@@ -145,7 +166,7 @@ fn panic(panic: &str) -> Result<Panic, String> {
 /// generator takes them. Worked out once per job from [`Graph`](super::graph::Graph)'s bitset.
 fn build_time(job: &Job) -> std::sync::Arc<BuildTime> {
     let crates = job.build_time.get_or_init(|| {
-        let mut crates = blaze_hash::HashSet::default();
+        let mut crates = blaze_hash::HashSet::new_in(std::alloc::Global);
         for at in 0..job.graph.len() as u32 {
             if job.graph.build_time(at)
                 && let Some(krate) = job.crates.krate(at as usize)
@@ -277,6 +298,10 @@ pub(crate) struct Profiles(Box<[(String, Result<Profiled, String>)]>);
 pub(crate) struct Profiled {
     id: ContentId,
     unstored: parking_lot::Mutex<Option<Vec<u8>>>,
+    /// How its records are named, sorted once as it is read ([`blaze_lints::profile::names`]),
+    /// or why they don't read: what tells a profile blaze made, which applying to nothing
+    /// refuses, from one rustc or clang made, which only warns ([`judge`]).
+    names: Result<blaze_lints::profile::Names, String>,
     #[cfg(feature = "llvm")]
     _given: hir_ty_codegen::v2::Profile,
 }
@@ -302,25 +327,30 @@ fn profiles(job: &Job) -> &Profiles {
 /// members), read off the machine and given to the code generator; an error naming the path
 /// when it can't be read or given.
 pub(crate) fn read_profile(root: &str, path: &str) -> Result<Profiled, String> {
+    let span = tracing::info_span!(target: "blaze", "profile names", path, records = tracing::field::Empty).entered();
     let at = std::path::Path::new(root).join(path);
     let bytes = std::fs::read(&at).map_err(|error| {
         // alloc: an error
         format!("the flags for rustc have `-C profile-use={path}`, and `{}` can't be read: {error}", at.display())
     })?;
-    profiled(path, bytes)
+    let names = blaze_lints::profile::names(&bytes);
+    if let Ok(names) = &names {
+        span.record("records", names.records);
+    }
+    profiled(path, bytes, names)
 }
 
 #[cfg(feature = "llvm")]
-fn profiled(path: &str, bytes: Vec<u8>) -> Result<Profiled, String> {
+fn profiled(path: &str, bytes: Vec<u8>, names: Result<blaze_lints::profile::Names, String>) -> Result<Profiled, String> {
     let id = hir_ty_codegen::v2::profile_id(&bytes);
     let given = hir_ty_codegen::v2::give_profile(id, &bytes)
         // alloc: an error
         .map_err(|what| format!("the profile of `-C profile-use={path}`: {what}"))?;
-    Ok(Profiled { id, unstored: parking_lot::Mutex::new(Some(bytes)), _given: given })
+    Ok(Profiled { id, unstored: parking_lot::Mutex::new(Some(bytes)), names, _given: given })
 }
 
 #[cfg(not(feature = "llvm"))]
-fn profiled(path: &str, _bytes: Vec<u8>) -> Result<Profiled, String> {
+fn profiled(path: &str, _bytes: Vec<u8>, _names: Result<blaze_lints::profile::Names, String>) -> Result<Profiled, String> {
     // alloc: an error
     Err(format!(
         "the flags for rustc have `-C profile-use={path}`, and this blaze is built without LLVM \
@@ -345,6 +375,202 @@ fn pgo_of(job: &Job, asked: PgoFlag<'_>) -> Result<Pgo, String> {
 /// profile to use, whose path in its flags says nothing of the bytes there.
 pub(crate) fn unit_pgo(job: &Job, unit: usize) -> Result<Pgo, String> {
     pgo_of(job, pgo(&job.plan(unit).map_err(|it| it.what)?.rustflags)?)
+}
+
+/// What `unit`'s codegen did with each profile it used, sorted by profile ID, as this job's
+/// build of it counted ([`Job::counted`]): none when it built no code this job.
+pub(crate) fn counted(job: &Job, unit: usize) -> &[(ContentId, ProfileCounts)] {
+    job.counted.get(unit).and_then(|it| it.get()).map_or(&[], |it| &it[..])
+}
+
+/// The check that each profile the job's units name applied to something, summed over the
+/// whole job ([`judge`]), once its build ended: `ok` whether it succeeded, `built` the units
+/// it built (a build ahead builds some). Its warnings, one a profile, for the job to say.
+pub(crate) fn unapplied(job: &Job, ok: bool, built: &[u32]) -> Result<Vec<String>, ApiError> {
+    let _span = tracing::info_span!(target: "blaze", "profile applied check").entered();
+    if !ok {
+        return Ok(Vec::new());
+    }
+    let units = job.units();
+    // alloc: once per job, a flag a unit
+    let mut was_built = vec![false; units.plans.len()];
+    for at in built {
+        if let Some(it) = was_built.get_mut(*at as usize) {
+            *it = true;
+        }
+    }
+    // alloc: once per job, a unit that names a profile
+    let accounted: Vec<Accounted<'_>> = units
+        .plans
+        .iter()
+        .enumerate()
+        .filter(|(unit, plan)| {
+            was_built[*unit] && !job.graph.has(*unit as u32, flag::RUN) && matches!(pgo(&plan.rustflags), Ok(PgoFlag::Use(_)))
+        })
+        .map(|(unit, _)| Accounted { unit, counted: job.counted.get(unit).and_then(|it| it.get()).map(|it| &it[..]) })
+        .collect();
+    if accounted.is_empty() {
+        return Ok(Vec::new());
+    }
+    // alloc: once per job, a profile read
+    let named: Vec<Named<'_>> = profiles(job)
+        .0
+        .iter()
+        .filter_map(|(path, read)| {
+            let read = read.as_ref().ok()?;
+            Some(Named { id: read.id, path, names: read.names.as_ref().copied().map_err(String::as_str) })
+        })
+        .collect();
+    judge(ok, accounted, |unit| super::compile::recorded_profiles(job, unit), &named)
+}
+
+/// A unit of a job that names a profile, as [`judge`] is given it.
+pub(crate) struct Accounted<'a> {
+    pub(crate) unit: usize,
+    /// What its codegen did with each profile, as this job counted it ([`Job::counted`]): set
+    /// when it built, or when its record was replayed; none when neither was in this job.
+    pub(crate) counted: Option<&'a [(ContentId, ProfileCounts)]>,
+}
+
+/// A unit's record, read when nothing counted it this job.
+pub(crate) enum Recorded {
+    Read(Vec<(ContentId, ProfileCounts)>),
+    /// There is none: the unit and its record key named, for the error.
+    Missing(String),
+}
+
+/// A profile the job read, as [`judge`] names it.
+pub(crate) struct Named<'a> {
+    pub(crate) id: ContentId,
+    /// As the flags have it, `-C profile-use=<path>`.
+    pub(crate) path: &'a str,
+    /// How its records are named ([`blaze_lints::profile::names`]), or why they don't read.
+    pub(crate) names: Result<blaze_lints::profile::Names, &'a str>,
+}
+
+/// Whether each profile the units of a job that ended (`ok` whether it succeeded) used applied
+/// to something, summed over every unit: each unit's counts are this job's ([`Accounted`]),
+/// else its record's (`recorded`), else, as nothing can say what its profile did, an error
+/// naming it. Summed, not per unit, as a target the profiled program never ran (another
+/// binary, an example, a test) applies none of a profile's records and builds under rustc.
+///
+/// A profile used that applied to nothing refuses the job only when blaze made it (blaze named
+/// every record, [`blaze_lints::profile::Names::blaze_made`]) and no function found its record
+/// edited: blaze's own names, made under other item keys, are blaze's failure (rule 3). Any
+/// other (rustc or clang made it, it was edited, it mixes names, its names don't read) is a
+/// warning naming its path, its counts and the cause, and the build goes on as under rustc
+/// (rule 4). A job that failed is not judged: a failed unit's counts say nothing.
+pub(crate) fn judge<'a>(
+    ok: bool,
+    units: impl IntoIterator<Item = Accounted<'a>>,
+    mut recorded: impl FnMut(usize) -> Result<Recorded, ApiError>,
+    profiles: &[Named<'_>],
+) -> Result<Vec<String>, ApiError> {
+    if !ok {
+        return Ok(Vec::new());
+    }
+    // alloc: none when no unit used a profile; one entry per profile used
+    let mut totals: BTreeMap<ContentId, ProfileCounts> = BTreeMap::new();
+    for unit in units {
+        let read;
+        let counts = match unit.counted {
+            Some(counts) => counts,
+            None => match recorded(unit.unit)? {
+                Recorded::Read(it) => {
+                    read = it;
+                    &read[..]
+                }
+                Recorded::Missing(what) => {
+                    // alloc: an error
+                    let what = format!(
+                        "{what}: the job built it with a profile and succeeded, and neither its build this job nor \
+                         a record says what the profile did to it, which the check that a profile applied to \
+                         something reads"
+                    );
+                    return Err(ApiError::new(what, None));
+                }
+            },
+        };
+        for (id, counts) in counts {
+            let at = totals.entry(*id).or_default();
+            *at = at.plus(*counts);
+        }
+    }
+    // alloc: none when every profile applied somewhere
+    let (mut refused, mut warnings) = (Vec::new(), Vec::new());
+    for (id, counts) in totals {
+        if counts.used == 0 || counts.applied > 0 {
+            continue;
+        }
+        let Some(named) = profiles.iter().find(|it| it.id == id) else {
+            // alloc: an error
+            let what = format!("the job's units used the profile of content {id:x}, which is none the job read");
+            return Err(ApiError::new(what, None));
+        };
+        match applied_nothing(named, counts) {
+            Err(line) => refused.push(line),
+            Ok(line) => warnings.push(line),
+        }
+    }
+    if !refused.is_empty() {
+        return Err(ApiError::new(refused.join("\n"), None));
+    }
+    Ok(warnings)
+}
+
+/// What is said of profile `named`, used by `counts.used` functions and applied to none: the
+/// refusal (`Err`) when blaze made it under other keys, else a warning (`Ok`).
+fn applied_nothing(named: &Named<'_>, counts: ProfileCounts) -> Result<String, String> {
+    let Named { id, path, names } = named;
+    let ProfileCounts { used, mismatched, .. } = counts;
+    // alloc: once per profile that applied to nothing
+    let head = format!(
+        "the profile `-C profile-use={path}` (content {id:x}) gave counts to none of the {used} functions the build \
+         compiled with it, summed over every target ({mismatched} found a record of their name with another hash)"
+    );
+    let names = match names {
+        Ok(names) => *names,
+        // alloc: as above
+        Err(why) => return Ok(format!("{head}. Its records' names don't read ({why}), so who made it is not known; the build goes on without its counts")),
+    };
+    let blaze_lints::profile::Names { records, blaze, rustc, foreign } = names;
+    if mismatched > 0 {
+        // alloc: as above
+        return Ok(format!(
+            "{head}: a record under a name this build has, with another hash, means the program was edited since it \
+             was profiled. Profile it again with blaze's `-Cprofile-generate`; the build goes on without its counts"
+        ));
+    }
+    if names.blaze_made() {
+        // alloc: an error, once per profile refused
+        return Err(format!(
+            "{head}: blaze named each of its {records} records (`blaze.pgo.<hash>`), so blaze made it, and none names a \
+             function of this build: it was made by a blaze whose crate or item key version differs, or built for \
+             another target, target features or cfgs than this build, so its names are of other keys (or of a \
+             program that shares no function with this one). Make the profile again with this blaze's \
+             `-Cprofile-generate` and this build's flags, or build without it"
+        ));
+    }
+    if records == 0 {
+        // alloc: as above
+        return Ok(format!(
+            "{head}: it has no records, so the profiled run wrote nothing (it ran no instrumented code, or the \
+             profile was merged from no raw profiles). The build goes on without its counts"
+        ));
+    }
+    if blaze == 0 {
+        // alloc: as above
+        return Ok(format!(
+            "{head}: none of its {records} records is named by blaze ({rustc} are symbols rustc mangled, {foreign} \
+             other names), so rustc or clang made it: blaze can't apply profiles rustc made; make one with blaze's \
+             -Cprofile-generate. The build goes on without its counts"
+        ));
+    }
+    // alloc: as above
+    Ok(format!(
+        "{head}: of its {records} records blaze named {blaze}, rustc {rustc} and neither {foreign}, so it was merged \
+         with another tool's profile or edited. The build goes on without its counts"
+    ))
 }
 
 /// What a build with `pgo` puts in the store beside its code: the profile's bytes under its
@@ -376,13 +602,46 @@ fn unput_profile(job: &Job, put: blaze_codegen::driver::Put) {
     }
 }
 
+/// Whether `rustflags` turn lint `blaze::vecreport` on (`-W`, `-D`, `-F`, `--force-warn`,
+/// itself or its group `blaze::pedantic_perf`; the last flag naming it wins, `-A` turns it
+/// off): its release build is then built for the report, which [`compile`'s link
+/// prints](super::compile). A `#![warn(blaze::vecreport)]` in the source is not read here:
+/// the report changes the build's keys, which are known before its source is read.
+pub(crate) fn vecreport(rustflags: &[String]) -> bool {
+    const NAMES: [&str; 2] = ["blaze::vecreport", "blaze::pedantic_perf"];
+    let mut on = false;
+    let mut flags = rustflags.iter().map(String::as_str);
+    while let Some(flag) = flags.next() {
+        let (level, joined) = match flag {
+            "-W" | "--warn" | "-D" | "--deny" | "-F" | "--forbid" | "--force-warn" => (true, None),
+            "-A" | "--allow" => (false, None),
+            _ => {
+                let joined = [("-W", true), ("--warn=", true), ("-D", true), ("--deny=", true), ("-F", true)]
+                    .into_iter()
+                    .chain([("--forbid=", true), ("--force-warn=", true), ("-A", false), ("--allow=", false)])
+                    .find_map(|(prefix, level)| flag.strip_prefix(prefix).map(|name| (level, name)));
+                match joined {
+                    Some((level, name)) => (level, Some(name)),
+                    None => continue,
+                }
+            }
+        };
+        let Some(name) = joined.or_else(|| flags.next()) else { break };
+        if NAMES.contains(&name) {
+            on = level;
+        }
+    }
+    on
+}
+
 /// How `unit`'s build compiles every function: its own profile, and for each package of its
 /// closure whose unit cargo gives another profile (`[profile.*.package.*]`), that one; the
 /// sanitizers of its rustflags, the same for every function, std's too, as cargo passes
 /// `RUSTFLAGS` to every crate.
 pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Policy, String> {
     let root = job.unit(unit).map_err(|it| it.what)?;
-    let rustflags = &job.plan(unit).map_err(|it| it.what)?.rustflags;
+    let plan = job.plan(unit).map_err(|it| it.what)?;
+    let rustflags = &plan.rustflags;
     let sanitize = sanitize(rustflags, triple(job, root))?;
     let pgo = pgo_of(job, pgo(rustflags)?)?;
     let base = &root.profile;
@@ -419,7 +678,10 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
             overflow_checks: base.overflow_checks,
             debug_assertions: base.debug_assertions,
             debuginfo: info,
-            panic: panic(&base.panic)?,
+            // A wasm macro's module aborts on a panic, after its glue's hook gave the host the
+            // message (`guest/entry.rs`), as its std was planned (`blaze_units`' `std_key`):
+            // wasm32 code unwinds nowhere, and the host fails that expansion alone.
+            panic: if plan.macro_wasm { Panic::Abort } else { panic(&base.panic)? },
             packages,
             build_override: Override::default(),
         },
@@ -427,6 +689,12 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
         fold: true,
         sanitize,
         pgo,
+        // A wasm macro's std reaches the host for what WASI would give (`RandomState`'s keys).
+        proc_macro_bridge: plan.macro_wasm,
+        report: vecreport(rustflags),
+        // What the program's allocator allows is read from its sources, which [`generate`]
+        // has: there it is set for the unit's program.
+        heap_to_stack: false,
     })
 }
 
@@ -444,7 +712,7 @@ impl Parts {
     /// done before its codegen began, so a write applied since changed none of it.
     pub(crate) fn over<'a>(&'a self, job: &Job, reader: &'a UnitReader, mounted: &Arc<Mounted>) -> Generated<'a> {
         let frontend = frontend(job, reader, mounted).with_policy(&self.policy);
-        Generated { built: &self.built, roots: &self.roots, frontend, policy: &self.policy, side: std::cell::OnceCell::new() }
+        Generated { built: &self.built, roots: &self.roots, frontend, policy: &self.policy, side: Default::default() }
     }
 }
 
@@ -456,10 +724,53 @@ pub(crate) struct Generated<'a> {
     pub(crate) policy: &'a Policy,
     /// The span tables and debug names the build's code names: read once, by the first
     /// link or test selection that needs them, and none for a library.
+    #[expect(clippy::disallowed_types, reason = "read once, by the first link or test selection that needs it: per unit's codegen, not global")]
     side: std::cell::OnceCell<LinkInputs>,
 }
 
 impl Generated<'_> {
+    /// What lint `blaze::vecreport` says of the workspace's code the build compiled, read from
+    /// each function's side table: this build's from its puts, the rest from `store`. Empty
+    /// for a build not made for it ([`Policy::report`]). A side table the store lacks, or one
+    /// that does not read, is an error naming the function.
+    pub(crate) fn report(&self, store: &blaze_cas::Reader) -> Result<Vec<hir_ty_codegen::v2::report::Reported>, String> {
+        use blaze_codegen::driver::Owner;
+        if !self.policy.report {
+            return Ok(Vec::new());
+        }
+        let guard = blaze_cas::enter();
+        let workspace: blaze_hash::HashSet<InstanceKey, std::alloc::Global> = self
+            .built
+            .owners
+            .iter()
+            .filter(|it| it.1 == Owner::Workspace)
+            .map(|it| it.0)
+            .collect();
+        // alloc: once per unit reported, a function each
+        let mut reports = Vec::new();
+        for function in self.built.functions.iter().filter(|it| workspace.contains(&it.key)) {
+            let Some(id) = function.side else { continue };
+            let key = blaze_codegen::query::keys::side(&id);
+            let named = || format!("{:?}", function.key); // alloc: an error's name
+            let bytes = match self.built.puts.iter().find(|it| it.key == key) {
+                Some(put) => &put.bytes[..],
+                None => match store.get(&guard, &key) {
+                    Ok(Some(entry)) => entry.bytes,
+                    // alloc: an error
+                    Ok(None) => return Err(format!("the side table of {} is not in the store", named())),
+                    // alloc: an error
+                    Err(corrupt) => return Err(format!("the side table of {}: {corrupt}", named())),
+                },
+            };
+            // alloc: an error
+            let rows = hir_ty_codegen::v2::report::of_side(bytes).map_err(|why| format!("the report of {}: {why}", named()))?;
+            if !rows.is_empty() {
+                reports.push((function.key, rows));
+            }
+        }
+        self.frontend.vecreport(self.built, &reports).map_err(|it| it.what)
+    }
+
     /// What the link takes beside the code ([`HirFrontend::link_inputs`]).
     pub(crate) fn side(&self) -> Result<&LinkInputs, String> {
         if let Some(side) = self.side.get() {
@@ -540,14 +851,23 @@ pub(crate) fn generate<'db>(
     // The process's code generator compiles for one toolchain: the first unit sets it up, and
     // a unit of another is refused here, naming both.
     hir_ty_codegen::v2::select(&toolchain)?;
-    let policy = policy(job, unit, toolchain)?;
+    // An allocation may move to the stack only where no allocation of the program is observed
+    // (`MirOptions::heap_to_stack`): known of a unit that links a program, never of a library
+    // whose program is linked later, which may bring its own `#[global_allocator]`.
+    let heap_to_stack = match makes {
+        Makes::Executable | Makes::Shared { .. } => hir_ty_codegen::v2::allocations_unobserved(reader.db(), krate)
+            // alloc: an error
+            .map_err(|it| format!("unit {unit} (`{}` of {}): {it}", u.target.name, u.pkg_id))?,
+        Makes::Library => false,
+    };
+    let policy = Policy { heap_to_stack, ..policy(job, unit, toolchain)? };
     // A cancelled job's build stops within a function: its caller posts it again.
     let frontend = frontend(job, reader, mounted).with_policy(&policy).with_stop(&job.input.cancelled);
     let frontend = match checks {
         Some(checks) => frontend.with_checks(checks),
         None => frontend,
     };
-    let roots = match frontend.roots(krate, root_kind(u, makes)) {
+    let roots = match frontend.roots(krate, root_kind(u, makes, wasm_macro(job, unit))?) {
         Ok(it) => it,
         Err(error) => return Ok(Err(vec![error.what])),
     };
@@ -555,17 +875,26 @@ pub(crate) fn generate<'db>(
     let asked: Vec<(HirInstance, Origin)> = roots.roots.iter().map(|it| (it.clone(), origin)).collect();
     // The job holds the profile given for as long as it lives, so for the whole build.
     let profile = profile_put(job, policy.pgo)?;
+    // `BLAZE_VERIFY_STORE` in the request's environment: the store hits it samples are
+    // compiled again and checked ([`Build::verify_store`]); a value that is none is the error.
+    let verify = blaze_store_check::Setting::from_env(&job.input.config.invocation.env).map_err(|it| it.to_string())?;
     let backends = Backends::default();
     let built = {
         let guard = blaze_cas::enter();
         let store = Reading { store: &job.input.store, guard: &guard };
         Build::new(&backends, &frontend, &policy, &job.memo)
             .owned_by(&u.target.name)
-            .run_with_statics(&asked, &roots.statics, &store)
+            .verify_store(verify)
+            .explain_misses(true)
+            .run_with_statics(&asked, &roots.statics, &roots.check_roots(origin), &store)
     };
     match built {
         Ok(mut built) => {
             built.puts.extend(profile);
+            if let Some(slot) = job.counted.get(unit) {
+                // alloc: once per unit built, one entry per profile it used (none or one)
+                let _ = slot.set(built.stats.profiles.iter().map(|(id, counts)| (*id, *counts)).collect());
+            }
             Ok(Ok(Parts { built, roots, policy }))
         }
         Err(errors) => {
@@ -587,6 +916,9 @@ pub struct Linked {
     statics: Vec<StaticRow>,
     natives: Vec<ContentId>,
     names: Vec<String>,
+    /// The profile its first link laid it out by ([`super::layout::Weights::id`]): a kept
+    /// image keeps that order, so another profile makes it again.
+    layout: Option<ContentId>,
 }
 
 impl Linked {
@@ -674,16 +1006,19 @@ fn given(job: &Job, unit: u32) -> Result<Compile, String> {
     Ok(Compile::of(&package, &script::target_of(u), job.graph.has(unit, flag::TEST), &linked, &own))
 }
 
-/// The native libraries `unit` links, in rustc's order: each crate linked in, what depends
-/// first ([`Graph::linked_in`]), the `-l`s its rustc is given (its build script's
-/// `rustc-link-lib`s) then its `#[link]`s, then the unit's own `rustc-link-arg`s; and where to
-/// look for them, the unit's `-L`s.
+/// What native inputs `unit` links: the native libraries, in rustc's order: each crate linked
+/// in, what depends first ([`Graph::linked_in`]), the `-l`s its rustc is given (its build
+/// script's `rustc-link-lib`s) then its `#[link]`s, then the unit's own `rustc-link-arg`s;
+/// where to look for them, the unit's `-L`s; and the object each crate's `global_asm!`s
+/// assemble to for `triple`, in the same order, which go on the link line before every
+/// library, as rustc puts a crate's code before the libraries.
 ///
 /// [`Graph::linked_in`]: super::graph::Graph::linked_in
-fn natives(job: &Job, unit: usize, frontend: &HirFrontend<'_>) -> Result<(Vec<NativeLib>, Vec<PathBuf>), String> {
+fn natives(job: &Job, unit: usize, frontend: &HirFrontend<'_>, triple: &str) -> Result<Natives, String> {
     let unit = unit as u32;
     let mine = given(job, unit)?;
     let mut libs = Vec::new();
+    let mut assembled = Vec::new();
     for at in job.graph.linked_in(unit) {
         let theirs;
         let compile = match at == unit {
@@ -699,13 +1034,26 @@ fn natives(job: &Job, unit: usize, frontend: &HirFrontend<'_>) -> Result<(Vec<Na
         }
         if let Some(krate) = job.crates.krate(at as usize) {
             libs.extend(frontend.linked(krate).map_err(|it| it.what)?);
+            assembled.extend(frontend.global_asm(krate, triple).map_err(|it| it.what)?);
         }
     }
     for arg in &mine.link_args {
         libs.push(link_arg(arg)?);
     }
-    Ok((libs, mine.search))
+    Ok(Natives { libs, search: mine.search, assembled })
 }
+
+/// [`natives`]: the libraries, where to look for them, and the crates' `global_asm!` objects.
+struct Natives {
+    libs: Vec<NativeLib>,
+    search: Vec<PathBuf>,
+    assembled: Vec<GlobalAsmObject>,
+}
+
+/// The place on the link line of the first library: the `global_asm!` objects take the places
+/// before it, so a crate that gains or loses one moves no library the image already has (an
+/// image keeps the place a native input was added at).
+const FIRST_LIBRARY: u32 = 1 << 20;
 
 /// A native input a link read off the machine: its path, and the BLAKE3 hash of its contents.
 pub(crate) type Read = (String, ContentId);
@@ -827,7 +1175,10 @@ fn link_at(
         DebugInfo::None => blaze_link::Debug::None,
         _ => blaze_link::Debug::Lines,
     };
+    let wasm = wasm_macro(job, unit);
     let shared = match makes {
+        // A proc macro built for wasm is a WASI reactor ([`blaze_link::target::reactor`]).
+        Makes::Shared { proc_macro: true } if wasm => None,
         Makes::Shared { .. } => {
             let name = path.rsplit('/').next().unwrap_or(path).to_owned();
             let exports = built.symbols.iter().map(|it| it.1.clone()).collect();
@@ -837,40 +1188,73 @@ fn link_at(
     };
     let test = job.graph.has(unit as u32, flag::TEST);
     let linker = |step: LinkStep| move |error: blaze_link::LinkError| LinkCause::Linker { step, error };
-    let mut output =
-        blaze_link::target::output(triple(job, u), shared, debug, true).map_err(linker(LinkStep::Output))?;
+    let output = match wasm {
+        // A wasm module is linked whole and never slid or patched in place, and its debug info
+        // is its name section: each expansion instantiates the module afresh.
+        true => blaze_link::target::reactor(blaze_link::Debug::None, false),
+        false => blaze_link::target::output(triple(job, u), shared, debug, true),
+    };
+    let mut output = output.map_err(linker(LinkStep::Output))?;
     output.exec_log = test && blaze_codegen::exec::records(generated.policy.mode);
     output.sanitize = generated.policy.sanitize;
-    let (libs, search) = natives(job, unit, &generated.frontend)?;
+    let Natives { libs, search, assembled } = natives(job, unit, &generated.frontend, triple(job, u))?;
     let sysroot = crate::toolchain::sysroot().ok_or(LinkCause::NoToolchain)?;
     let located =
         blaze_link::target::locate(&mut output, &libs, &search, &sysroot).map_err(linker(LinkStep::Locate))?;
     let side = generated.side()?;
+    // The profiles the target directory keeps for layout, what they say of this image, and
+    // that as this build's instances.
+    let profiles = super::layout::profiles(job)?;
+    let weights = profiles.and_then(|it| it.weights(path));
+    let heat = weights.map(|it| it.heat(&built.identities));
 
-    let (mut linked, changed) = kept_image(images, path, &output)?;
+    let (mut linked, changed, relaid) = kept_image(images, path, &output, weights.map(super::layout::Weights::id))?;
     // The image goes back whether the link is made or not: one that fails leaves it as it
     // was, and the next link is a change of it.
-    let made = relink(path, generated, test, &located, side, &mut linked);
+    let made = relink(path, generated, test, &assembled, &located, side, heat.as_ref(), &mut linked);
+    // What address holds which function, for a profile of this build to be read through.
+    let mapped = match (&made, profiles) {
+        (Ok(_), Some(profiles)) => {
+            profiles.write_map(path, linked.image.build_id(), &linked.image.functions(), &built.identities)
+        }
+        _ => Ok(()),
+    };
+    // What each address is by code identity and what it refers to, for `blaze perf` to name a
+    // run's functions across builds and say why each changed.
+    let perf_mapped = match &made {
+        Ok(_) => super::perf::write_map(job, path, &linked.image, built),
+        Err(_) => Ok(()),
+    };
     images.push(KeptImage { path: path.to_owned(), kept: linked });
     let (bytes, read, table, full) = made?;
-    Ok(LinkMade { bytes, read, table, how: linking(changed, full, output.incremental) })
+    mapped?;
+    perf_mapped?;
+    let how = match relaid && changed.is_some_and(OutputFields::is_empty) {
+        true => Linking::Full(Full::Layout),
+        false => linking(changed, full, output.incremental),
+    };
+    Ok(LinkMade { bytes, read, table, how })
 }
 
-/// The image to link `output` into at `path`, taken out of `images`, and the fields of
-/// `output` that differ from the kept image's (`None` when none was kept there). A kept image
-/// of another output is let go only once its replacement is made, so an error leaves
+/// The image to link `output` laid out by profile `layout` into at `path`, taken out of
+/// `images`; the fields of `output` that differ from the kept image's (`None` when none was
+/// kept there); and whether the kept image was laid out by another profile. A kept image of
+/// another output or profile is let go only once its replacement is made, so an error leaves
 /// `images` as it was.
 pub(crate) fn kept_image(
     images: &mut Vec<KeptImage>,
     path: &str,
     output: &Output,
-) -> Result<(Linked, Option<OutputFields>), LinkCause> {
+    layout: Option<ContentId>,
+) -> Result<(Linked, Option<OutputFields>, bool), LinkCause> {
     let at = images.iter().position(|it| it.path == path);
     let changed = at.map(|at| OutputFields::between(&images[at].kept.output, output));
+    let relaid = at.is_some_and(|at| images[at].kept.layout != layout);
     if let (Some(at), Some(changed)) = (at, changed)
         && changed.is_empty()
+        && !relaid
     {
-        return Ok((images.swap_remove(at).kept, Some(changed)));
+        return Ok((images.swap_remove(at).kept, Some(changed), false));
     }
     let to = blaze_core::FileName::new(path.trim_start_matches('/')).ok_or(LinkCause::Unnamed)?;
     let fresh = Linked {
@@ -881,11 +1265,12 @@ pub(crate) fn kept_image(
         statics: Vec::new(),
         natives: Vec::new(),
         names: Vec::new(),
+        layout,
     };
     if let Some(at) = at {
         images.swap_remove(at);
     }
-    Ok((fresh, changed))
+    Ok((fresh, changed, relaid))
 }
 
 /// How a link went: `changed` is the fields of the output that differ from the kept image's
@@ -929,15 +1314,20 @@ pub(crate) fn static_rows(
     Ok((rows, gone, new))
 }
 
-/// [`link`]'s change of `linked` to what `generated` built, and whether blaze-link laid the
-/// image out whole ([`blaze_link::Staged::full`]). Its columns are written only once the image
-/// has taken the change, so after an error they still say what the image holds.
+/// [`link`]'s change of `linked` to what `generated` built, with the crates' `global_asm!`
+/// objects `assembled` and the native inputs `located`, laid out by `heat` where the image is
+/// laid out whole, and whether blaze-link laid it out whole ([`blaze_link::Staged::full`]).
+/// Its columns are written only once the image has taken the change, so after an error they
+/// still say what the image holds.
+#[expect(clippy::too_many_arguments, reason = "the link's inputs, each its own")]
 fn relink(
     path: &str,
     generated: &Generated<'_>,
     test: bool,
+    assembled: &[GlobalAsmObject],
     located: &[blaze_link::target::Located],
     side: &LinkInputs,
+    heat: Option<&blaze_link::Heat>,
     linked: &mut Linked,
 ) -> Result<(Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>, bool), LinkCause> {
     let built = generated.built;
@@ -945,7 +1335,17 @@ fn relink(
     // their `stat`: one `stat` for a library the image already has, read only when it is new.
     let mut files = blaze_usercode::inputs::Disk::new(Vec::new());
     let mut read = Vec::with_capacity(located.len());
-    let mut native_ids = Vec::with_capacity(located.len());
+    // The `global_asm!` objects first, which are not read off the machine, then `located`.
+    let mut native_ids = Vec::with_capacity(assembled.len() + located.len());
+    native_ids.extend(assembled.iter().map(|it| it.id));
+    if assembled.len() >= FIRST_LIBRARY as usize {
+        // alloc: error path
+        return Err(LinkCause::Given(format!(
+            "{} crates with `global_asm!` linked into one image, more than the {FIRST_LIBRARY} places \
+             before the first library",
+            assembled.len()
+        )));
+    }
     for it in located {
         let hash = blaze_usercode::trace::Inputs::file(&mut files, &it.path)
             .map_err(LinkCause::Native)?
@@ -961,7 +1361,14 @@ fn relink(
     let mut added_natives = Vec::new();
     diff(&linked.natives, &new_natives, &mut removed_natives, &mut added_natives);
     let mut bytes_of = Vec::with_capacity(added_natives.len());
+    for (at, it) in assembled.iter().enumerate() {
+        if added_natives.binary_search(&it.id).is_ok() {
+            // clone: an `Arc`, the assembler's object shared with the image
+            bytes_of.push((at, it.bytes.clone()));
+        }
+    }
     for (order, it) in located.iter().enumerate() {
+        let order = assembled.len() + order;
         if added_natives.binary_search(&native_ids[order]).is_ok() {
             let bytes = std::fs::read(&it.path).map_err(|error| {
                 // alloc: error path
@@ -1012,16 +1419,20 @@ fn relink(
         debug_names: side.debug_names.clone(),
         natives: bytes_of
             .iter()
-            .map(|(order, bytes)| Native {
-                id: native_ids[*order],
-                name: &located[*order].name,
-                bytes,
-                kind: located[*order].kind,
-                order: *order as u32,
+            .map(|(at, bytes)| match assembled.get(*at) {
+                Some(object) => Native { id: object.id, name: &object.name, bytes, kind: NativeKind::Object, order: *at as u32 },
+                None => {
+                    let index = *at - assembled.len();
+                    let it = &located[index];
+                    Native { id: native_ids[*at], name: &it.name, bytes, kind: it.kind, order: FIRST_LIBRARY + index as u32 }
+                }
             })
             .collect(),
         removed_natives,
         spans: side.spans.iter().map(|(anchor, bytes)| (*anchor, bytes.as_slice())).collect(),
+        heat,
+        // clone: once per image linked, the functions codegen inferred cold
+        cold: built.cold.clone(),
     };
     let made = linked.image.stage(change).map_err(|error| (LinkStep::Stage, error)).and_then(|staged| {
         let full = staged.full();

@@ -12,6 +12,7 @@
 //! a block's value only, no nested body) (MIT or Apache-2.0).
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     ModuleDefId,
@@ -49,9 +50,9 @@ enum Parent {
 #[derive(Default)]
 pub(crate) struct IfLetRescope {
     /// The `if`s of a chain already probed, and the `if` of each `while`.
-    skip: HashSet<ExprId>,
+    skip: HashSet<ExprId, Global>,
     /// Where the body's `if`s are, those that are statements, values or `else`s.
-    parents: HashMap<ExprId, Parent>,
+    parents: HashMap<ExprId, Parent, Global>,
 }
 
 impl LatePass for IfLetRescope {

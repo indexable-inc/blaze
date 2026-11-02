@@ -506,6 +506,7 @@ impl<'db> ExprCollector<'db> {
                     Some(BuiltinInt::I16) => i16::MAX as u128,
                     Some(BuiltinInt::I64 | BuiltinInt::Isize) => i64::MAX as u128,
                     Some(BuiltinInt::I128) => i128::MAX as u128,
+                    Some(BuiltinInt::Bits(w)) => (1u128 << (w.bits() - 1)) - 1,
                 };
                 fits(u128::try_from(*n).ok()?, max)
             }
@@ -516,6 +517,7 @@ impl<'db> ExprCollector<'db> {
                     Some(BuiltinUint::U32) => u32::MAX as u128,
                     Some(BuiltinUint::U64 | BuiltinUint::Usize) => u64::MAX as u128,
                     Some(BuiltinUint::U128) | None => u128::MAX,
+                    Some(BuiltinUint::Bits(w)) => (1u128 << w.bits()) - 1,
                 };
                 fits(*n, max)
             }

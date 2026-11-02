@@ -38,7 +38,7 @@ use crate::{
     batches::{self, Process},
     clock,
     errors::{self, ErrorRow},
-    facts::{self, CrateDepRow, LinkRow},
+    facts::{self, CrateDepRow, LinkRow, MissRow, QueryCountRow},
     flight::{self, Cursor, Read, SpanRow},
     identity,
     sampler::{self, Sample},
@@ -122,9 +122,12 @@ pub struct Flushed {
     pub builds: usize,
     pub samples: usize,
     pub switches: usize,
+    pub events: usize,
     pub errors: usize,
     pub links: usize,
     pub crate_deps: usize,
+    pub query_counts: usize,
+    pub misses: usize,
     pub files: u32,
     pub bytes: u64,
     /// Rows the rings wrote over before this flush read them, CPU samples included.
@@ -140,6 +143,9 @@ pub enum HistoryError {
     Arrow { table: &'static str, error: ArrowError },
     /// What a build was of could not be told: its tree's digest, or blaze's own hash.
     Identity { what: &'static str, path: PathBuf, error: io::Error },
+    /// The history `dir` has no schema file of `tables` (it was written before they existed),
+    /// and writing them there failed: no view over it can be opened.
+    SchemasMissing { dir: PathBuf, tables: Vec<&'static str>, error: Box<HistoryError> },
 }
 
 impl fmt::Display for HistoryError {
@@ -157,6 +163,13 @@ impl fmt::Display for HistoryError {
             HistoryError::Identity { what, path, error } => {
                 write!(f, "the profile history: {what} {}: {error}", path.display())
             }
+            HistoryError::SchemasMissing { dir, tables, error } => write!(
+                f,
+                "the profile history {} was written before the tables {} existed, and their schema files can't be \
+                 written there, so no view over it opens (open it once with a blaze that can write it): {error}",
+                dir.display(),
+                tables.join(", ")
+            ),
         }
     }
 }
@@ -168,6 +181,7 @@ impl std::error::Error for HistoryError {
             HistoryError::Parquet { error, .. } => Some(error),
             HistoryError::Arrow { error, .. } => Some(error),
             HistoryError::Identity { error, .. } => Some(error),
+            HistoryError::SchemasMissing { error, .. } => Some(error.as_ref()),
         }
     }
 }
@@ -259,21 +273,61 @@ impl Writer {
         written.map(|()| bytes)
     }
 
-    /// An empty `schema.<table>.parquet` of each table in `dir`.
+    /// An empty `schema.<table>.parquet` of each table in `dir`, each written over: a writer
+    /// of the history makes them its own blaze's columns.
     pub(crate) fn schemas(&mut self, dir: &Path) -> Result<(), HistoryError> {
         for table in schema::TABLES {
-            // alloc: a file's name, once a table when the history opens
-            self.write(&dir.join(format!("schema.{}.parquet", table.name)), table, &[])?;
+            self.write(&schema_file(dir, table), table, &[])?;
         }
         Ok(())
     }
 }
 
+/// The empty file of `table` in the history `dir`, which every view's glob matches, so a view
+/// of a table no file has rows for reads as empty instead of failing.
+fn schema_file(dir: &Path, table: &Table) -> PathBuf {
+    // alloc: a file's name, once a table
+    dir.join(format!("schema.{}.parquet", table.name))
+}
+
+/// Makes sure the history `dir` has the schema file of every table, as a reader needs before
+/// it opens views over it: a history last written before a table existed has none of that
+/// table's. Writes only those missing, leaving the rest as their writer wrote them. A
+/// directory they can't be written to is [`HistoryError::SchemasMissing`], naming them.
+pub fn ensure_schemas(dir: &Path) -> Result<(), HistoryError> {
+    // alloc: the tables missing, once a reader opens views
+    let mut missing: Vec<&'static Table> = Vec::new();
+    for table in schema::TABLES {
+        let path = schema_file(dir, table);
+        if !path.try_exists().map_err(io_error(&path, "looking for"))? {
+            missing.push(table);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut writer = Writer::new();
+    for (i, table) in missing.iter().enumerate() {
+        if let Err(error) = writer.write(&schema_file(dir, table), table, &[]) {
+            return Err(HistoryError::SchemasMissing {
+                // alloc: an error
+                dir: dir.to_owned(),
+                // alloc: an error
+                tables: missing[i..].iter().map(|it| it.name).collect(),
+                error: Box::new(error),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Writes `bytes` as `path` in one write, under a hidden name first and renamed into place.
+/// The hidden name is this process's: a reader writing a missing schema file
+/// ([`ensure_schemas`]) while a daemon opens the same history must not write into its file.
 fn put(path: &Path, bytes: &[u8]) -> Result<(), HistoryError> {
     let name = path.file_name().and_then(|it| it.to_str()).unwrap_or("history");
     // alloc: a file's name, once a file
-    let hidden = path.with_file_name(format!(".{name}.tmp"));
+    let hidden = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
     fs::write(&hidden, bytes).map_err(io_error(&hidden, "writing"))?;
     fs::rename(&hidden, path).map_err(io_error(path, "renaming into place"))
 }
@@ -341,6 +395,10 @@ pub struct History {
     /// Images builds linked, and the crate graphs they built, since the last flush.
     links: Vec<LinkRow>,
     crate_deps: Vec<CrateDepRow>,
+    /// What the query engine counted by each build's end, since the last flush.
+    query_counts: Vec<QueryCountRow>,
+    /// What builds computed again, and why, since the last flush.
+    misses: Vec<MissRow>,
     /// The files written, oldest first, and their bytes all told.
     kept: VecDeque<Kept>,
     total: u64,
@@ -370,7 +428,8 @@ impl History {
             let path = entry.path();
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if name.starts_with('.') && name.ends_with(".parquet.tmp") {
+            // `.<file>.parquet.<pid>.tmp`, and `.<file>.parquet.tmp` of a blaze before the pid.
+            if name.starts_with('.') && name.ends_with(".tmp") && name.contains(".parquet.") {
                 fs::remove_file(&path).map_err(io_error(&path, "deleting a half-written file"))?;
                 continue;
             }
@@ -408,6 +467,10 @@ impl History {
             links: Vec::new(),
             // alloc: once a history
             crate_deps: Vec::new(),
+            // alloc: once a history
+            query_counts: Vec::new(),
+            // alloc: once a history
+            misses: Vec::new(),
             kept: kept.into(),
             total,
             last_build,
@@ -474,6 +537,18 @@ impl History {
         self.crate_deps.extend(rows);
     }
 
+    /// Notes what the query engine counted by a build's end, one row a query function, for
+    /// the next flush to write.
+    pub fn query_counted(&mut self, rows: impl IntoIterator<Item = QueryCountRow>) {
+        self.query_counts.extend(rows);
+    }
+
+    /// Notes what a build computed again and why, one row a thing, for the next flush to
+    /// write.
+    pub fn missed(&mut self, rows: impl IntoIterator<Item = MissRow>) {
+        self.misses.extend(rows);
+    }
+
     /// Writes what the rings hold that is new since the last flush, and the builds that ended
     /// since, one file a table with rows, named for `build` (`None`: the timer's flush, named
     /// 0). Then deletes the oldest files past the cap. A failed write is an error naming the
@@ -509,8 +584,12 @@ impl History {
         let errors = [errors::batch(&self.errors).map_err(arrow_error(&schema::ERRORS))?];
         let links = [facts::links(&self.links).map_err(arrow_error(&schema::LINKS))?];
         let crate_deps = [facts::crate_deps(&self.crate_deps).map_err(arrow_error(&schema::CRATE_DEPS))?];
+        let query_counts =
+            [facts::query_counts(&self.query_counts).map_err(arrow_error(&schema::QUERY_COUNTS))?];
+        let misses = [facts::misses(&self.misses).map_err(arrow_error(&schema::MISSES))?];
         let switches =
             [batches::switches(&self.read.switches, self.process).map_err(arrow_error(&schema::SWITCHES))?];
+        let events = [batches::events(&self.read.events, self.process).map_err(arrow_error(&schema::EVENTS))?];
         self.samples.clear();
         let samples_skipped = sampler::since(&mut self.sampled, &mut self.samples);
         let samples = [self.samples_batch().map_err(arrow_error(&schema::SAMPLES))?];
@@ -522,23 +601,29 @@ impl History {
             builds: rows(&builds),
             samples: rows(&samples),
             switches: rows(&switches),
+            events: rows(&events),
             errors: rows(&errors),
             links: rows(&links),
             crate_deps: rows(&crate_deps),
+            query_counts: rows(&query_counts),
+            misses: rows(&misses),
             skipped: self.read.skipped + samples_skipped,
             ..Flushed::default()
         };
         let build = build.unwrap_or(0);
         self.last_build = self.last_build.max(build);
-        let tables: [(&'static Table, &[RecordBatch]); 8] = [
+        let tables: [(&'static Table, &[RecordBatch]); 11] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
             (&schema::SAMPLES, &samples),
             (&schema::SWITCHES, &switches),
+            (&schema::EVENTS, &events),
             (&schema::ERRORS, &errors),
             (&schema::LINKS, &links),
             (&schema::CRATE_DEPS, &crate_deps),
+            (&schema::QUERY_COUNTS, &query_counts),
+            (&schema::MISSES, &misses),
         ];
         for (table, parts) in tables {
             if rows(parts) == 0 {
@@ -556,6 +641,8 @@ impl History {
         self.errors.clear();
         self.links.clear();
         self.crate_deps.clear();
+        self.query_counts.clear();
+        self.misses.clear();
         flushed.deleted = self.trim()?;
         match self.unidentified.take() {
             Some(error) => Err(error),
@@ -615,16 +702,22 @@ pub fn write_live(window: Duration, dir: &Path) -> Result<Flushed, HistoryError>
     let spans = batches::spans(&read.spans, process).map_err(arrow_error(&schema::SPANS))?;
     let counters = batches::counters(&read.counters, process).map_err(arrow_error(&schema::COUNTERS))?;
     let switches = batches::switches(&read.switches, process).map_err(arrow_error(&schema::SWITCHES))?;
+    let events = batches::events(&read.events, process).map_err(arrow_error(&schema::EVENTS))?;
     let mut writer = Writer::new();
     writer.schemas(dir)?;
     let mut flushed = Flushed {
         spans: spans.num_rows(),
         counters: counters.num_rows(),
         switches: switches.num_rows(),
+        events: events.num_rows(),
         ..Flushed::default()
     };
-    let tables: [(&'static Table, RecordBatch); 3] =
-        [(&schema::SPANS, spans), (&schema::COUNTERS, counters), (&schema::SWITCHES, switches)];
+    let tables: [(&'static Table, RecordBatch); 4] = [
+        (&schema::SPANS, spans),
+        (&schema::COUNTERS, counters),
+        (&schema::SWITCHES, switches),
+        (&schema::EVENTS, events),
+    ];
     for (table, batch) in tables {
         // alloc: a file's name, once a file
         let path = dir.join(format!("live.{}.parquet", table.name));
@@ -720,7 +813,6 @@ mod tests {
                 t_ns: i as i64,
                 value: i as u64 * 3,
                 fiber: None,
-                query_kind: 0,
             })
             .collect();
         let counters = batches::counters(&counters, process).unwrap();
@@ -803,6 +895,48 @@ mod tests {
 
         let again = history.flush(Some(62)).unwrap();
         assert_eq!((again.links, again.crate_deps), (0, 0), "a flush writes each row once");
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_builds_query_counts_are_written_at_the_next_flush_column_for_column() {
+        use arrow_array::types::{UInt32Type, UInt64Type};
+
+        use crate::facts::QueryCountRow;
+        let dir = scratch("query-counts");
+        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        let mir = QueryCountRow {
+            build_id: 63,
+            query: "mir_body_query",
+            executed: 6384,
+            verified: 10,
+            reran: 2,
+            evicted_asked: 3,
+            evicted: 4,
+            refused: 5,
+            dropped: 6,
+        };
+        history.query_counted([mir, QueryCountRow { query: "infer_body_query", executed: 7566, ..mir }]);
+        let flushed = history.flush(Some(63)).unwrap();
+        assert_eq!(flushed.query_counts, 2);
+        let read = read_back(&dir.join(format!("63-{:08}.query_counts.parquet", flushed.seq)));
+        let batch = &read[0];
+        let count = |name: &str, row: usize| {
+            batch.column(schema::QUERY_COUNTS.column(name).unwrap()).as_primitive::<UInt64Type>().value(row)
+        };
+        let query = batch.column(schema::QUERY_COUNTS.column("query").unwrap()).as_dictionary::<UInt32Type>();
+        let names = query.values().as_string::<i32>();
+        assert_eq!(names.value(query.keys().value(1) as usize), "infer_body_query");
+        assert_eq!(
+            ["build_id", "executed", "verified", "reran", "evicted_asked", "evicted", "refused", "dropped"]
+                .map(|it| count(it, 0)),
+            [63, 6384, 10, 2, 3, 4, 5, 6],
+            "each count in its own column"
+        );
+        assert_eq!(count("executed", 1), 7566);
+
+        let again = history.flush(Some(64)).unwrap();
+        assert_eq!(again.query_counts, 0, "a flush writes each row once");
         _ = fs::remove_dir_all(&dir);
     }
 

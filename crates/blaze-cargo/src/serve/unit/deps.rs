@@ -20,13 +20,14 @@
 //!   global trait goals' answers (`hir_ty::next_solver::goal_store`). Each is served with the
 //!   images and stored where they are.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use base_db::{Crate, Db, Env};
 use blaze_api::{ApiError, Diagnostic, Level, ServedCrate, ServedPart};
 use blaze_cas::{Key, Kind};
 use blaze_diagnostics::{Diag, Options, cache};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_lower::Lowered;
 use hir_def::deps::{Held, ImageBuf, ImageStore, Mode, Served};
@@ -34,7 +35,7 @@ use hir_ty::{body_store, next_solver::goal_store};
 use parking_lot::Mutex;
 
 use super::{Job, compile, graph};
-use crate::serve::work::Put;
+use crate::serve::work::{KeptPut, Put};
 
 pub(crate) const IMAGES: &str = "BLAZE_DEP_IMAGES";
 pub(crate) const ITEMS: &str = "BLAZE_ITEM_STORE";
@@ -101,7 +102,7 @@ pub(crate) fn serve(
     let flags = imaged(db, job, units.iter().map(|&unit| unit as usize))?;
     let options = Options::default();
     let asked: Vec<(Crate, cache::Inputs<'_>)> =
-        flags.iter().map(|(krate, flags)| (*krate, cache::Inputs::of(flags, &options))).collect(); // alloc: once per serve
+        flags.iter().map(|(krate, flags)| (*krate, cache::Inputs::of(db, flags, &options))).collect(); // alloc: once per serve
     cache::serve(lowered.served_db(), &asked, &*session.images, checks).map_err(|why| ApiError::new(why, None))?;
     let db = lowered.db();
     let consts = (0..job.graph.len())
@@ -138,15 +139,22 @@ pub(crate) struct Session {
     checks: Arc<cache::Served>,
     /// Why [`hir_def::deps::store`] wrote no image of each crate it last refused, for the
     /// report of the builds that read the database after ([`served`]).
-    refused: HashMap<Crate, String>,
+    refused: HashMap<Crate, String, Global>,
 }
 
 /// The session of `lowered`'s database over `store`, its goal store and item store installed
 /// before any query of it solves, the item store as the job's `env` asks ([`items_in`]): a
-/// database made freshly, once.
-pub(crate) fn session(lowered: &Lowered, store: &blaze_cas::Reader, env: &[(String, String)]) -> Result<Session, ApiError> {
+/// database made freshly, once. What a kept expansion read is worked out by the daemon's
+/// `macros`.
+pub(crate) fn session(
+    lowered: &Lowered,
+    store: &blaze_cas::Reader,
+    macros: &Arc<blaze_macro_eval::Macros>,
+    env: &[(String, String)],
+) -> Result<Session, ApiError> {
     let items_mode = items_in(env)?;
-    let images = Arc::new(Images::new(store.clone())); // alloc: setup, once per database; clone: an `Arc`
+    // alloc: setup, once per database; clone: an `Arc` each
+    let images = Arc::new(Images::new(store.clone(), Arc::clone(macros)));
     // dyn: the goal store keeps both for the database's life; called once per database
     let adapter: Arc<dyn ImageStore + Send + Sync> = images.clone(); // clone: an `Arc`, once per database
     // dyn: hir-ty's goal store takes its facts as `dyn` (blaze-items depends on hir-ty, which can't name `Goals`); made once per database
@@ -166,7 +174,7 @@ pub(crate) fn session(lowered: &Lowered, store: &blaze_cas::Reader, env: &[(Stri
         }
     };
     let checks = Arc::new(cache::Served::default()); // alloc: setup, once per database
-    Ok(Session { installed, items, images, checks, refused: HashMap::default() })
+    Ok(Session { installed, items, images, checks, refused: HashMap::new_in(Global) })
 }
 
 /// What the job's `BLAZE_ITEM_STORE` asks of the item store: unset serves what it holds,
@@ -253,38 +261,62 @@ pub(crate) fn differences(kept: &Kept) -> Result<(), ApiError> {
 /// [`hir_def::deps::store`] and resolved again in each build); the outcomes and checked bodies
 /// of the dependency crates it checked (`later`, their paths named from `root`), after their
 /// dependencies'; the constants' values they evaluated; the goals and bodies' steps offered,
-/// with what their flushes did ([`noted`]). Called when the head's next build lowers into the
-/// front end, which no task reads then.
+/// with what their flushes did ([`noted`]). Called on a worker as the front end is kept
+/// ([`crate::serve::work::Steps::store_kept`]), which no task reads then, and its puts made
+/// durable before the build that kept it answers.
 pub(crate) fn store(
     lowered: &Lowered,
     kept: Option<Kept>,
     session: &mut Session,
     later: &[Later],
     root: &str,
-) -> Result<(Vec<Put>, Flushes), ApiError> {
+) -> Result<(Vec<KeptPut>, Flushes), ApiError> {
     let images = &*session.images;
     let stored = match &kept {
         Some(kept) => Some(lowered.store_deps(&kept.served, images).map_err(super::lower_error)?),
         None => None,
     };
     let db = lowered.db();
+    // Each stage's puts taken as it ends, so each says what it is in an error ([`KeptPut`]).
+    let mut puts = Vec::new(); // alloc: once per front end stored, one per value put
+    // alloc: once per front end stored, one per image written
+    let mut filed: HashMap<ContentId, Crate, Global> = HashMap::new_in(Global);
+    if let Some(stored) = &stored {
+        filed.extend(stored.filed.iter().map(|(krate, key)| (*key, *krate)));
+    }
+    let filing: Arc<str> = Arc::from("a read-filing record of a dependency crate's def-map image");
+    for put in images.take_puts() {
+        let what = match filed.get(&put.key.0) {
+            // alloc: once per image put
+            Some(krate) => Arc::from(format!("the def-map image of dependency crate {}", hir_def::deps::crate_name(db, *krate))),
+            None => Arc::clone(&filing),
+        };
+        puts.push(KeptPut { put, what });
+    }
+    let mut stage = |what: &'static str| {
+        let what: Arc<str> = Arc::from(what);
+        puts.extend(images.take_puts().into_iter().map(|put| KeptPut { put, what: Arc::clone(&what) }));
+    };
     let options = Options::default();
     let checked: Vec<cache::Checked<'_>> = later
         .iter()
         .filter_map(|it| {
             // None: its image was refused, and its outcome is for the same reason.
             let image = cache::image_key(db, it.krate).or_else(|| stored.as_ref()?.filed.get(&it.krate).copied())?;
-            Some(cache::Checked { krate: it.krate, image, inputs: cache::Inputs::of(&it.flags, &options), diags: &it.diags })
+            Some(cache::Checked { krate: it.krate, image, inputs: cache::Inputs::of(db, &it.flags, &options), diags: &it.diags })
         })
         .collect(); // alloc: once per front end stored, one per crate checked
-    let error = |why: String| ApiError::new(why, None);
+    let error = |why: String| ApiError::new(why, Some(root.to_owned())); // alloc: error path
     let kept_checks = cache::store(db, &checked, &session.checks, root, images).map_err(error)?;
+    stage("a check outcome or checked bodies of a dependency crate checked in this build");
     let mut bases = session.checks.keys.clone(); // clone: once per front end stored
     bases.extend(kept_checks.keys);
     hir_ty::consteval::deps::drain(db, &bases).map_err(error)?;
+    stage("a constant's value a dependency crate evaluated in this build");
     let goals = session.installed.flush().map_err(|why| error(format!("the persistent goal cache: {why}")))?; // alloc: error path
+    stage("a goal of the persistent goal cache");
     let items = session.items.as_ref().map(body_store::Installed::flush).transpose().map_err(error)?;
-    let puts = images.take_puts();
+    stage("a body's steps of the item store");
     if let Some(stored) = &stored {
         for krate in &stored.written {
             session.refused.remove(krate);
@@ -301,10 +333,10 @@ pub(crate) struct Flushes {
     pub(crate) items: Option<body_store::Flushed>,
 }
 
-/// The `-v` note of a build: what [`store`]'s flushes did when it lowered (`flushes`: the goals'
-/// ([`flushed`]), then the bodies' steps the head's last build offered, and why any were kept
-/// out), then what this build's item store lookups found, step by step (`steps`, from
-/// [`Session::item_steps`]). None when there is neither.
+/// The `-v` note of a build: what [`store`]'s flushes did for the head's last front end it
+/// lowered into (`flushes`: the goals' ([`flushed`]), then the bodies' steps the head's last
+/// build offered, and why any were kept out), then what this build's item store lookups
+/// found, step by step (`steps`, from [`Session::item_steps`]). None when there is neither.
 pub(crate) fn noted(flushes: Option<&Flushes>, steps: Option<&[body_store::StepCounts; 3]>) -> Option<Diagnostic> {
     let note = flushes.map(|it| flushed(&it.goals));
     let mut message = String::new();
@@ -419,8 +451,8 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
 pub(crate) fn served(db: &Db, job: &Job, session: &Session) -> Result<Vec<ServedCrate>, ApiError> {
     let later = job.later.lock();
     // alloc: once per build, one entry per dependency crate checked
-    let outcomes: HashMap<Crate, Option<&str>> = later.iter().map(|it| (it.krate, it.refused.as_deref())).collect();
-    let mut seen = HashSet::default();
+    let outcomes: HashMap<Crate, Option<&str>, Global> = later.iter().map(|it| (it.krate, it.refused.as_deref())).collect();
+    let mut seen = HashSet::new_in(Global);
     let mut lines = Vec::new(); // alloc: once per build, one line per dependency library
     for unit in 0..job.graph.len() {
         let Some(krate) = job.crates.krate(unit) else { continue };
@@ -475,7 +507,11 @@ pub(crate) fn served(db: &Db, job: &Job, session: &Session) -> Result<Vec<Served
 /// it compiles against, which decides what a crate resolves to. Never a constant: a fixed
 /// name-resolution bug must not go on serving the def maps the bug made.
 fn build() -> Result<ContentId, ApiError> {
-    static BUILD: OnceLock<Result<ContentId, String>> = OnceLock::new();
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the identity of the running blaze executable, hashed once per process"
+    )]
+    static BUILD: std::sync::OnceLock<Result<ContentId, String>> = std::sync::OnceLock::new();
     let worked_out = BUILD.get_or_init(|| {
         let host = crate::toolchain::host()
             .ok_or("blaze has no target triple for this machine's architecture and system")?;
@@ -487,14 +523,17 @@ fn build() -> Result<ContentId, ApiError> {
 /// The store as [`hir_def::deps`] and the goal store read and write it.
 struct Images {
     store: blaze_cas::Reader,
+    /// The daemon's proc macros, whose kept expansions' reads [`ImageStore::reads_now`] works
+    /// out again.
+    macros: Arc<blaze_macro_eval::Macros>,
     /// What it asked to keep, in the order asked; a write path, once per crate it images and
     /// per goal a flush writes.
     puts: Mutex<Vec<Put>>,
 }
 
 impl Images {
-    fn new(store: blaze_cas::Reader) -> Images {
-        Images { store, puts: Mutex::new(Vec::new()) }
+    fn new(store: blaze_cas::Reader, macros: Arc<blaze_macro_eval::Macros>) -> Images {
+        Images { store, macros, puts: Mutex::new(Vec::new()) }
     }
 
     /// What it was asked to keep since the last take, in the order asked.
@@ -543,7 +582,7 @@ impl ImageStore for Images {
     }
 
     fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String> {
-        proc_macro_api::kept::reads_now(env, shape)
+        self.macros.keeps().reads_now(env, shape)
     }
 
     // dyn: as `ImageStore::for_each`, one call per batch of crates

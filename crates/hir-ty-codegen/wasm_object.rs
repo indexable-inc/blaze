@@ -101,7 +101,7 @@ struct Defined {
 #[derive(Default)]
 struct Writer {
     types: Vec<WasmSignature>,
-    type_of: HashMap<WasmSignature, u32>,
+    type_of: HashMap<WasmSignature, u32, std::alloc::Global>,
     symbols: Vec<u8>,
     symbol_count: u32,
     code: Vec<u8>,
@@ -136,7 +136,7 @@ fn import_of(symbol: &str) -> Option<(&str, &str)> {
 /// joins the ones of every object.
 pub(super) fn from_elf(
     elf: &[u8],
-    signatures: &HashMap<String, WasmSignature>,
+    signatures: &HashMap<String, WasmSignature, std::alloc::Global>,
     custom: &[(String, Vec<u8>)],
 ) -> Result<Vec<u8>, String> {
     // alloc: the error's message
@@ -178,7 +178,7 @@ pub(super) fn from_elf(
     // An undefined symbol of an ELF object has no kind: it is a function when the code
     // generator declared one of its name. The ones nothing refers to are left out, as the
     // linker would ask for them.
-    let referred: blaze_hash::HashSet<SymbolIndex> = file
+    let referred: blaze_hash::HashSet<SymbolIndex, std::alloc::Global> = file
         .sections()
         .flat_map(|section| section.relocations())
         .filter_map(|(_, reloc)| match reloc.target() {
@@ -187,7 +187,7 @@ pub(super) fn from_elf(
         })
         // alloc: once per object, the set of the symbols relocations name
         .collect();
-    let mut symbol_of: HashMap<SymbolIndex, (u32, bool)> = HashMap::default();
+    let mut symbol_of: HashMap<SymbolIndex, (u32, bool), std::alloc::Global> = HashMap::new_in(std::alloc::Global);
     let mut imported = 0u32;
     // alloc: once per object, its functions
     let mut functions = Vec::new();

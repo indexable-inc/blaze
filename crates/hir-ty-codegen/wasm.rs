@@ -280,6 +280,12 @@ impl Class {
             types::I32 => Class::Word(32),
             types::I64 => Class::Long,
             types::I128 => Class::Pair,
+            // `f16` and `f128` have no wasm arithmetic: codegen hands every operation of one
+            // to compiler-builtins (`f16_f128`), and what is left is their bits moved, as
+            // LLVM's wasm32 has them: an `f16` soft-promoted to the low 16 bits of an `i32`,
+            // an `f128` in two `i64`, returned through a pointer as an `i128` is.
+            types::F16 => Class::Word(16),
+            types::F128 => Class::Pair,
             types::F32 => Class::F32,
             types::F64 => Class::F64,
             _ if ty.is_vector() && ty.bits() == 128 => Class::V128,

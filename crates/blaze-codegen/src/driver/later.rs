@@ -24,16 +24,17 @@
 //!
 //! Folding (#1292) is a whole build's: a lazy function is compiled alone, as its own template.
 
-use blaze_cas::Kind;
+use blaze_cas::{Key, Kind};
 use blaze_graph::par;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_mem::{Tag, frame};
 
 use super::{
-    Build, Built, FnNode, FrontInstance, FrontStatic, Lookup, Node, Out, Put, Sorted, StaticId,
-    StaticNode, Whence, callee, error, placed, stopped, stored, stored_function, unfit,
+    Build, Built, By, FnNode, FrontInstance, FrontStatic, Lookup, Node, Out, Put, Sorted, StaticId,
+    StaticNode, Whence, callee, dev_template_key, error, placed, stopped, stored, stored_function, unfit,
     unkept_inline, unkept_message,
 };
 use crate::{
@@ -79,12 +80,12 @@ pub fn runs_at_start(section: &str) -> bool {
 pub struct Later<I, S> {
     pub(super) nodes: Sorted<InstanceKey, FnNode<I, S>>,
     /// The shape of each function whose IR was built for its check.
-    pub(super) shapes: HashMap<InstanceKey, ContentId>,
+    pub(super) shapes: HashMap<InstanceKey, ContentId, Global>,
 }
 
 impl<I, S> Default for Later<I, S> {
     fn default() -> Self {
-        Later { nodes: Sorted::default(), shapes: HashMap::default() }
+        Later { nodes: Sorted::default(), shapes: HashMap::new_in(Global) }
     }
 }
 
@@ -101,7 +102,7 @@ pub(super) struct Lazily {
     pub(super) walked: Vec<Walked>,
     pub(super) entry: Vec<InstanceKey>,
     /// The shape of each function whose IR was built for its check.
-    pub(super) shapes: HashMap<InstanceKey, ContentId>,
+    pub(super) shapes: HashMap<InstanceKey, ContentId, Global>,
 }
 
 /// Where a compile's template came from.
@@ -116,14 +117,6 @@ fn nothing() -> (InstanceKey, ItemKey) {
     (InstanceKey(ContentId::default()), ItemKey(ContentId::default()))
 }
 
-/// Whether a function first compiled at `backend` may be compiled alone on its first call.
-fn is_dev(backend: Backend) -> bool {
-    match backend {
-        Backend::Cranelift { .. } | Backend::Stencil => true,
-        Backend::Llvm { .. } => false,
-    }
-}
-
 /// `key`'s node, if a lazy build may compile it: a function of the walk at a dev backend.
 fn lazy_node<I, S>(nodes: &Sorted<InstanceKey, FnNode<I, S>>, key: InstanceKey) -> Result<&FnNode<I, S>, CodegenError> {
     let Some(node) = nodes.get(&key) else {
@@ -136,7 +129,7 @@ fn lazy_node<I, S>(nodes: &Sorted<InstanceKey, FnNode<I, S>>, key: InstanceKey) 
 /// A lazy function is compiled alone on its first call, which a release unit can't be: its
 /// imports are decided from the whole build's summaries.
 fn dev_only<I, S>(key: InstanceKey, node: &FnNode<I, S>) -> Result<(), CodegenError> {
-    if is_dev(node.spec.backend) {
+    if !node.spec.backend.is_release() {
         return Ok(());
     }
     let backend = node.spec.backend;
@@ -152,14 +145,13 @@ fn dev_only<I, S>(key: InstanceKey, node: &FnNode<I, S>) -> Result<(), CodegenEr
     ))
 }
 
-/// The function for `key` from the store's template under `at`, if it has one.
+/// The function for `key` from the store's template under `at` (a [`dev_template_key`]), if it has one.
 fn stored_one<I, S, L: Lookup + ?Sized>(
     node: &FnNode<I, S>,
-    at: InstanceKey,
+    at: Key,
     key: InstanceKey,
     store: &L,
 ) -> Result<Option<CompiledFunction>, CodegenError> {
-    let at = keys::template(&at);
     match store.read(&at) {
         Ok(None) => Ok(None),
         Ok(Some(bytes)) => match stored_function(bytes, key, &node.refs) {
@@ -173,10 +165,10 @@ fn stored_one<I, S, L: Lookup + ?Sized>(
     }
 }
 
-/// The store's value of `template`, kept under `at`.
-fn put_of(at: &InstanceKey, template: &Template) -> Put {
+/// The store's value of `template`, kept under `at` (a [`dev_template_key`]).
+fn put_of(at: Key, template: &Template) -> Put {
     // alloc: the store's value of a template, once a function
-    Put { key: keys::template(at), kind: Kind::Code, bytes: blob::encode(template) }
+    Put { key: at, kind: Kind::Code, bytes: blob::encode(template) }
 }
 
 /// The function for `key` from the memo's `template` of `shape`, with the template's [`Put`]
@@ -184,7 +176,7 @@ fn put_of(at: &InstanceKey, template: &Template) -> Put {
 fn memoized<I, S>(
     node: &FnNode<I, S>,
     key: InstanceKey,
-    at: &InstanceKey,
+    at: Key,
     shape: ContentId,
     template: &Template,
 ) -> Result<(CompiledFunction, Vec<Put>), CodegenError> {
@@ -207,11 +199,11 @@ fn compiled<B: Prepare>(
     spec: &Spec,
 ) -> Result<(CompiledFunction, Vec<Put>, Made, ContentId), CodegenError> {
     let (key, item) = (unit.instance.key(), unit.item);
-    let at = placed(stored(key, &node.built_in), &node.refs);
-    let (shape, made) = backend.prepare(frontend, unit, spec, &node.instance, &node.refs)?;
-    let shape = shape.key();
+    let at = dev_template_key(&unit.instance, &node.built_in, &node.refs, &spec.toolchain.id);
+    let (compiled, made) = backend.prepare(frontend, unit, spec, &node.instance, &node.refs)?;
+    let shape = compiled.key();
     if let Some(template) = memo.get(&shape) {
-        let (function, puts) = memoized(node, key, &at, shape, template)?;
+        let (function, puts) = memoized(node, key, at, shape, template)?;
         return Ok((function, puts, Made::Memo, shape));
     }
     let emitted = backend.emit(unit, spec, made, &node.refs, None)?;
@@ -220,7 +212,7 @@ fn compiled<B: Prepare>(
         return Err(error(key, item, format!("compiled as {:?}", emitted.function.key)));
     }
     if let Some(it) = unkept_inline(nodes, &emitted.function, node.built_in.iter().copied()) {
-        return Err(error(key, item, unkept_message(nodes, node, it)));
+        return Err(error(key, item, unkept_message(nodes, node, it, &node.built_in, &at)));
     }
     // alloc: the store's values of a compile: its template and its side table
     let mut puts = Vec::with_capacity(2);
@@ -232,8 +224,8 @@ fn compiled<B: Prepare>(
     let template = Template::of_owned(emitted.function, &node.refs, &emitted.extra)
         // alloc: an error
         .map_err(|why| error(key, item, why.to_string()))?;
-    let kept = memo.put(shape, template);
-    puts.push(put_of(&at, kept));
+    let kept = memo.put(compiled, template);
+    puts.push(put_of(at, kept));
     let unfit = |why| unfit(key, item, &node.described.name, Whence::Shape(shape), why);
     let function = kept.instantiate(key, &node.refs).map_err(unfit)?;
     Ok((function, puts, Made::Compiled, shape))
@@ -242,7 +234,9 @@ fn compiled<B: Prepare>(
 /// [`compiled`], by one build of the memo ([`crate::flight`]), keyed by what the function is
 /// stored under: this call's when it claims it first, after `check`; else the template
 /// another build compiled, taken once it landed. No claim is held while waiting. With the
-/// shape its template is kept under in the memo.
+/// shape its template is kept under in the memo. A landed template is taken without a
+/// comparison: this call has prepared nothing to compare it with, and the lander's stored
+/// key is this one's, which is what a store hit is taken by too.
 #[allow(clippy::too_many_arguments)]
 fn claimed<B: Prepare>(
     backend: &B,
@@ -278,7 +272,7 @@ fn claimed<B: Prepare>(
         };
         return match memo.get(&shape) {
             Some(template) => {
-                memoized(node, key, &at, shape, template).map(|(function, puts)| (function, puts, Made::Flown, shape))
+                memoized(node, key, dev_template_key(&unit.instance, &node.built_in, &node.refs, &spec.toolchain.id), shape, template).map(|(function, puts)| (function, puts, Made::Flown, shape))
             }
             // alloc: an error
             None => Err(error(key, unit.item, format!("its compile landed under shape {shape:?}, which the memo has no template of"))),
@@ -331,7 +325,7 @@ impl<I, S> Later<I, S> {
     /// `key`'s node and the memo's template of the shape its check recorded: no allocation,
     /// no lock but the memo's.
     fn recorded<'m>(&self, memo: &'m Memo, key: InstanceKey) -> Option<(&FnNode<I, S>, &'m Template, ContentId)> {
-        let node = self.nodes.get(&key).filter(|it| is_dev(it.spec.backend))?;
+        let node = self.nodes.get(&key).filter(|it| !it.spec.backend.is_release())?;
         let shape = *self.shapes.get(&key)?;
         Some((node, memo.get(&shape)?, shape))
     }
@@ -353,7 +347,7 @@ impl<I, S> Later<I, S> {
     /// where `memo_hit` is.
     pub fn memo_put(&self, memo: &Memo, key: InstanceKey) -> Option<Put> {
         let (node, template, _) = self.recorded(memo, key)?;
-        Some(put_of(&node.stored(), template))
+        Some(put_of(node.template_key(), template))
     }
 
     /// One function of the walk, as a lazy run asks for it on its first call: the store's
@@ -376,12 +370,12 @@ impl<I, S> Later<I, S> {
         L: Lookup + ?Sized,
     {
         let node = lazy_node(&self.nodes, key)?;
-        if let Some(function) = stored_one(node, node.stored(), key, store)? {
+        if let Some(function) = stored_one(node, node.template_key(), key, store)? {
             // alloc: none, empty
             return Ok((function, Vec::new()));
         }
         if let Some((_, template, shape)) = self.recorded(memo, key) {
-            return memoized(node, key, &node.stored(), shape, template);
+            return memoized(node, key, node.template_key(), shape, template);
         }
         let check = || same_code(frontend, node, key);
         claimed(backend, frontend, memo, &self.nodes, node, &node.unit, &node.spec, check).map(|it| (it.0, it.1))
@@ -411,7 +405,8 @@ impl<I, S> Later<I, S> {
         let node = lazy_node(&self.nodes, key)?;
         let (unit, spec) = at_tier(key, node, to, counted)?;
         let tiered = unit.instance.key();
-        if let Some(function) = stored_one(node, placed(stored(tiered, &node.built_in), &node.refs), tiered, store)? {
+        let at = dev_template_key(&unit.instance, &node.built_in, &node.refs, &spec.toolchain.id);
+        if let Some(function) = stored_one(node, at, tiered, store)? {
             // alloc: none, empty
             return Ok((function, Vec::new()));
         }
@@ -427,7 +422,8 @@ impl<B: Prepare> Build<'_, B> {
     /// an initializer or finalizer section names ([`runs_at_start`]). [`Built::walked`] lists
     /// every function in the walk's order, [`Built::entry`] the entry's keys; the rest are
     /// compiled by [`Build::into_later`]'s [`Later`] on their first call. A build whose output
-    /// is a file is compiled whole, so with [`Mode::Output`] it is an error.
+    /// is a file is compiled whole, so with [`Mode::Output`] it is an error. The recursion
+    /// limit's check walks from the roots in their order (no [`super::CheckRoot`]s of their own).
     pub fn run_later(
         &mut self,
         roots: &[(FrontInstance<B>, Origin)],
@@ -440,7 +436,7 @@ impl<B: Prepare> Build<'_, B> {
             let why = "a lazy build (`later`) of a build whose output is a file, which is compiled whole";
             return Err(vec![error(unit, item, why)]); // alloc: an error
         }
-        self.run_as(roots, static_roots, Some(entry), store)
+        self.run_as(roots, static_roots, &[], Some(entry), store)
     }
 
     /// The last run's walk, owned, for a lazy run's first calls.
@@ -508,7 +504,7 @@ impl<B: Prepare> Build<'_, B> {
             .filter(|it| it.described.section.as_deref().is_some_and(runs_at_start))
             .flat_map(|it| it.refs.iter().filter_map(callee));
         // alloc: per build, its entry and start functions
-        let ahead: HashSet<InstanceKey> = entry_keys.iter().copied().chain(started).collect();
+        let ahead: HashSet<InstanceKey, Global> = entry_keys.iter().copied().chain(started).collect();
         // alloc: per build, its entry and start functions
         let mut ahead: Vec<InstanceKey> = ahead.into_iter().collect();
         ahead.sort_unstable();
@@ -519,7 +515,7 @@ impl<B: Prepare> Build<'_, B> {
         let (mut unchecked, mut kept) = (Vec::new(), Vec::new());
         for key in order.iter().filter(|it| ahead.binary_search(*it).is_err()) {
             let node = &nodes[key];
-            let at = keys::template(&node.stored());
+            let at = node.template_key();
             match store.read(&at) {
                 Ok(Some(bytes)) => kept.push((*key, node, at, bytes)),
                 Ok(None) => unchecked.push(*key),
@@ -541,7 +537,7 @@ impl<B: Prepare> Build<'_, B> {
                 // The IR is let go here, on the thread that built it: only its shape is kept.
                 (*key, made.map(|(shape, _)| shape.key()))
             });
-        let mut shapes = HashMap::with_capacity_and_hasher(checked.len(), Default::default());
+        let mut shapes = HashMap::with_capacity_in(checked.len(), Global);
         for (key, shape) in checked {
             match shape {
                 Ok(shape) => {
@@ -556,21 +552,21 @@ impl<B: Prepare> Build<'_, B> {
         // alloc: per build, its entry and start functions
         let mut missing = Vec::new();
         for key in &ahead {
-            let read = lazy_node(nodes, *key).and_then(|node| Ok((node, stored_one(node, node.stored(), *key, store)?)));
+            let read = lazy_node(nodes, *key).and_then(|node| Ok((node, stored_one(node, node.template_key(), *key, store)?)));
             match read {
                 Ok((node, Some(function))) => {
                     out.stats.stored += 1;
-                    out.push(node.unit.instance.code, function);
+                    out.push(node.unit.instance.code, node.unit.item, function);
                 }
-                Ok((node, None)) => missing.push(node),
+                Ok((node, None)) => missing.push((*key, node)),
                 Err(why) => out.errors.push(why),
             }
         }
-        let compiled = self.until_stopped(&missing, &mut out.errors, |node| {
+        let compiled = self.until_stopped(&missing, &mut out.errors, |&(key, node)| {
             let made = claimed(self.backend, self.frontend, self.memo, nodes, node, &node.unit, &node.spec, || Ok(()));
-            (node.unit.instance.code, made)
+            (By::node(key, &node.unit), node.unit.instance.code, made)
         });
-        for (code, made) in compiled {
+        for (by, code, made) in compiled {
             match made {
                 Ok((function, puts, how, shape)) => {
                     out.used(shape);
@@ -579,8 +575,8 @@ impl<B: Prepare> Build<'_, B> {
                         Made::Compiled => out.stats.compiled += 1,
                         Made::Flown => out.stats.flown += 1,
                     }
-                    out.push(code, function);
-                    out.puts.extend(puts);
+                    out.push(code, by.item, function);
+                    out.puts.extend(puts.into_iter().map(|put| (by, put)));
                 }
                 Err(why) => out.errors.push(why),
             }

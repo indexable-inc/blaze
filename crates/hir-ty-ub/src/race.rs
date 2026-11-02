@@ -560,7 +560,7 @@ pub struct Races {
     allocs: Vec<Slot>,
     /// The clock of each synchronization object by address (Miri: the `clock` of `Mutex`,
     /// `Futex`, `Condvar` and `InitOnce` in `sync.rs` and `init_once.rs`).
-    sync: HashMap<u64, VClock>,
+    sync: HashMap<u64, VClock, std::alloc::Global>,
     /// Set by an atomic [`Races::read`], for [`Races::load_value`].
     pending_load: Option<PendingLoad>,
     /// Set by [`Races::rmw`], for [`Races::store_value`].
@@ -577,7 +577,7 @@ impl Races {
             yield_requested: false,
             global: Global::new(),
             allocs: Vec::new(),
-            sync: HashMap::default(),
+            sync: HashMap::new_in(std::alloc::Global),
             pending_load: None,
             pending_rmw: None,
         }

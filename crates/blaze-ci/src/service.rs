@@ -35,6 +35,7 @@ use std::{
 
 use blaze_api::{Diagnostic, Level, Mismatch, Request, Response, TestOutcome, TestResult, ViewRef};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_vfs::View;
 use serde::{Deserialize, Serialize};
@@ -249,17 +250,17 @@ pub struct Service {
     default_ref: String,
     state: State,
     now: u64,
-    jobs: HashMap<JobId, Job>,
-    runs: HashMap<RunId, Run>,
+    jobs: HashMap<JobId, Job, Global>,
+    runs: HashMap<RunId, Run, Global>,
     /// Each branch's and pull request's newest job.
-    latest: HashMap<String, JobId>,
+    latest: HashMap<String, JobId, Global>,
     /// The job whose checkout of a ref is in flight.
-    checking_out: HashMap<String, JobId>,
+    checking_out: HashMap<String, JobId, Global>,
     train: Train,
     release_running: Option<JobId>,
     release_waiting: Option<JobId>,
     snapshotting: bool,
-    removing: HashSet<String>,
+    removing: HashSet<String, Global>,
     next_job: u64,
     next_run: u64,
 }
@@ -275,15 +276,15 @@ impl Service {
             settings,
             state,
             now: 0,
-            jobs: HashMap::default(),
-            runs: HashMap::default(),
-            latest: HashMap::default(),
-            checking_out: HashMap::default(),
+            jobs: HashMap::new_in(Global),
+            runs: HashMap::new_in(Global),
+            latest: HashMap::new_in(Global),
+            checking_out: HashMap::new_in(Global),
             train: Train::default(),
             release_running: None,
             release_waiting: None,
             snapshotting: false,
-            removing: HashSet::default(),
+            removing: HashSet::new_in(Global),
             next_job: 0,
             next_run: 0,
         }
@@ -943,6 +944,8 @@ impl Report {
             Response::Built { artifacts, .. } => self.artifacts += artifacts.len(),
             Response::Unit(_)
             | Response::UnitEnded(_)
+            | Response::UnitBegan(_)
+            | Response::TestReady(_)
             | Response::Fetched { .. }
             | Response::BuildScript(_)
             | Response::Work(_) => {}

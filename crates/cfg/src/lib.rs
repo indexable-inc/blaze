@@ -1,6 +1,7 @@
 //! cfg defines conditional compiling options, `cfg` attribute parser and evaluator
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![feature(allocator_api)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
@@ -13,11 +14,20 @@ mod tests;
 use std::fmt;
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 
 use intern::{Symbol, sym};
 
 pub use cfg_expr::{CfgAtom, CfgExpr};
 pub use dnf::DnfExpr;
+
+/// blaze: the crate cfg atom of a profile whose `contract-checks` is on (dev and test by
+/// default; docs/v2/plan/lanes/contracts.md, part 1). blaze-lower adds it after the target's
+/// cfgs, so `--print cfg` and build scripts never see it, and no source can test it: a cfg
+/// predicate's name is one identifier, never a path. Its one meaning is that MIR building
+/// checks the crate's native `requires`/`ensures` clauses at run time. It is not nightly's
+/// `contract_checks`, which only `-Zcontract-checks` sets.
+pub const CONTRACT_CHECKS: &str = "blaze::contract_checks";
 
 /// Configuration options used for conditional compilation on items with `cfg` attributes.
 /// We have two kind of options in different namespaces: atomic options like `unix`, and
@@ -31,12 +41,12 @@ pub use dnf::DnfExpr;
 /// See: <https://doc.rust-lang.org/reference/conditional-compilation.html#set-configuration-options>
 #[derive(Clone, PartialEq, Eq)]
 pub struct CfgOptions {
-    enabled: HashSet<CfgAtom>,
+    enabled: HashSet<CfgAtom, Global>,
 }
 
 impl Default for CfgOptions {
     fn default() -> Self {
-        Self { enabled: HashSet::from_iter([CfgAtom::Flag(sym::true_)]) }
+        Self { enabled: HashSet::from_iter_in([CfgAtom::Flag(sym::true_)], Global) }
     }
 }
 
@@ -64,6 +74,12 @@ impl CfgOptions {
         self.enabled.contains(cfg)
     }
 
+    /// blaze: whether the crate checks its native contract clauses at run time, the atom
+    /// [`CONTRACT_CHECKS`] its profile's `contract-checks` sets.
+    pub fn contract_checks(&self) -> bool {
+        self.check_atom(&CfgAtom::Flag(Symbol::intern(CONTRACT_CHECKS)))
+    }
+
     pub fn insert_atom(&mut self, key: Symbol) {
         self.insert_any_atom(CfgAtom::Flag(key));
     }
@@ -80,7 +96,7 @@ impl CfgOptions {
         for atom in diff.disable {
             let (CfgAtom::Flag(sym) | CfgAtom::KeyValue { key: sym, .. }) = &atom;
             if *sym == sym::true_ || *sym == sym::false_ {
-                tracing::error!("cannot remove `true` or `false` from cfg");
+                tracing::error!(target: "blaze", "cannot remove `true` or `false` from cfg");
                 continue;
             }
             self.enabled.remove(&atom);
@@ -90,7 +106,7 @@ impl CfgOptions {
     fn insert_any_atom(&mut self, atom: CfgAtom) {
         let (CfgAtom::Flag(sym) | CfgAtom::KeyValue { key: sym, .. }) = &atom;
         if *sym == sym::true_ || *sym == sym::false_ {
-            tracing::error!("cannot insert `true` or `false` to cfg");
+            tracing::error!(target: "blaze", "cannot insert `true` or `false` to cfg");
             return;
         }
         self.enabled.insert(atom);
@@ -136,22 +152,22 @@ impl Extend<CfgAtom> for CfgOptions {
 }
 
 impl IntoIterator for CfgOptions {
-    type Item = <HashSet<CfgAtom> as IntoIterator>::Item;
+    type Item = <HashSet<CfgAtom, Global> as IntoIterator>::Item;
 
-    type IntoIter = <HashSet<CfgAtom> as IntoIterator>::IntoIter;
+    type IntoIter = <HashSet<CfgAtom, Global> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        <HashSet<CfgAtom> as IntoIterator>::into_iter(self.enabled)
+        <HashSet<CfgAtom, Global> as IntoIterator>::into_iter(self.enabled)
     }
 }
 
 impl<'a> IntoIterator for &'a CfgOptions {
-    type Item = <&'a HashSet<CfgAtom> as IntoIterator>::Item;
+    type Item = <&'a HashSet<CfgAtom, Global> as IntoIterator>::Item;
 
-    type IntoIter = <&'a HashSet<CfgAtom> as IntoIterator>::IntoIter;
+    type IntoIter = <&'a HashSet<CfgAtom, Global> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        <&HashSet<CfgAtom> as IntoIterator>::into_iter(&self.enabled)
+        <&HashSet<CfgAtom, Global> as IntoIterator>::into_iter(&self.enabled)
     }
 }
 

@@ -6,11 +6,13 @@
 //! `compiler/rustc_lint/src/lints.rs` (`BuiltinDerefNullptr`) (MIT or Apache-2.0).
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir_def::hir::{
     Expr, ExprId, UnaryOp,
     type_ref::{Rawness, TypeRef},
 };
 use hir_ty::next_solver::TyKind;
+use intern::sym;
 use rustc_type_ir::inherent::IntoKind as _;
 
 use super::{is_zero, layout, span};
@@ -24,7 +26,7 @@ use crate::{
 pub(crate) struct DerefNullPtr {
     /// The places of the body being walked that are borrowed raw (`&raw const <place>`): the
     /// parents rustc's `parent_hir_node` finds, seen before the places in them.
-    raw_borrowed: HashSet<ExprId>,
+    raw_borrowed: HashSet<ExprId, Global>,
 }
 
 impl LatePass for DerefNullPtr {
@@ -67,7 +69,7 @@ fn is_null_ptr(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
             matches!(b.store().type_ref(type_ref), TypeRef::RawPtr(..)) && (is_zero(b, inner) || is_null_ptr(b, inner))
         }
         Expr::Call { callee, .. } => {
-            super::callee_item(b, callee).is_some_and(|it| it == util::items().ptr_null || it == util::items().ptr_null_mut)
+            super::callee_item(b, callee).is_some_and(|it| it == sym::ptr_null || it == sym::ptr_null_mut)
         }
         _ => false,
     }

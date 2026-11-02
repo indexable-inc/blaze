@@ -24,7 +24,12 @@ fn script(crates: &str) -> (Db, FunctionId) {
 #[track_caller]
 fn purity_of(crates: &str) -> Purity {
     let (db, main) = script(crates);
-    hir_ty::attach_db(&db, || script_purity(&db, main).clone())
+    hir_ty::attach_db(&db, || {
+        // Every fixture is a test of the summaries' keys: through its home or in the script,
+        // each instance's summary is the same (crate::home).
+        super::share::keys_agree(&db, crate_named(&db, "build_script"));
+        script_purity(&db, main).clone()
+    })
 }
 
 /// The proof of the script in `crates`, which must be pure with `effects` and read exactly the

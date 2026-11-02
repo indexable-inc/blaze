@@ -5,6 +5,7 @@ use std::{borrow::Cow, iter, mem};
 use arrayvec::ArrayVec;
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId,
@@ -19,6 +20,7 @@ use hir_def::{
     lang_item::LangItems,
     resolver::{HasResolver, ResolveValueResult, Resolver, ValueNs},
     signatures::{EnumSignature, FunctionSignature},
+    span_names::InnerBody,
 };
 use hir_expand::name::Name;
 use itertools::{Either, EitherOrBoth, Itertools};
@@ -246,7 +248,7 @@ struct MirLowerCtx<'a, 'f, 'db> {
     inline_consts: u32,
     /// The `line!()` literals read where the code runs ([`location::slots_lines`]); `None`
     /// where each is its value.
-    line_slots: Option<&'db blaze_hash::HashSet<ExprId>>,
+    line_slots: Option<&'db blaze_hash::HashSet<ExprId, Global>>,
     /// How many shared borrows rustc may promote the expression being lowered is inside of: a
     /// promoted constant is a value, so a `line!()` in one stays a literal.
     promotable_borrows: u32,
@@ -315,7 +317,7 @@ struct MirLowerCtx<'a, 'f, 'db> {
     /// Whether each type asked about is `Copy`. Every statement that may panic asks of every
     /// local in scope, which in a long body is the most of lowering it.
     // alloc: mark_moves (hir-ty) takes this map by type; frame once D2 lands
-    copy: HashMap<Ty<'db>, bool>,
+    copy: HashMap<Ty<'db>, bool, Global>,
     env: ParamEnv<'db>,
     infcx: InferCtxt<'db>,
     /// Buffers reused across statements, each taken out while it is in use and put back.
@@ -332,9 +334,18 @@ struct MirLowerCtx<'a, 'f, 'db> {
     exit_ended_buf: Vec<LocalId, &'f Frame>,
     /// Whether a call of an uninhabited type other than `!` was lowered.
     uninhabited_call: bool,
+    /// Set by `lower_root` for a function body whose clauses are checked at run time
+    /// (`cfg::CONTRACT_CHECKS`, docs/v2/plan/lanes/contracts.md part 1); `None` everywhere
+    /// else, which lowers as before.
+    contracts: Option<contract::Contracts>,
     /// Set only while `unreachable_after_calls`'s probe lowers the body again
     /// (`lower/uninhabited.rs`): lowering goes on past calls of an uninhabited type.
     probe: Option<uninhabited::Probe<'f>>,
+    /// Drops written in no source, each lowered where `drop(x);` after its statement would
+    /// be ([`lower_with_early_drops`]); empty for every body a query builds.
+    early_drops: &'a [EarlyDrop],
+    /// How many of `early_drops` were lowered.
+    early_drops_placed: usize,
 }
 
 /// A token to ensuring that each drop scope is popped at most once, thanks to the compiler that checks moves.
@@ -397,6 +408,10 @@ macro_rules! implementation_error {
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
+// After `not_supported!` and `implementation_error!`, which it uses.
+mod comptime;
+mod contract;
+
 impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     fn new(
         db: &'db Db,
@@ -419,7 +434,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             locals: Arena::new(),
             start_block,
             binding_locals: ArenaMap::new(),
-            upvar_locals: HashMap::default(),
+            upvar_locals: HashMap::new_in(Global),
             param_locals: Vec::with_capacity(0),
             promoted_locals: Vec::with_capacity(0),
             owner,
@@ -449,6 +464,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         let interner = DbInterner::new_with(db, resolver.krate());
         // FIXME(next-solver): Is `non_body_analysis()` correct here? Don't we want to reveal opaque types defined by this body?
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+        // `for const` binders (`#![feature(blaze_comptime)]`): what the body assumes of each,
+        // in the universes inference made them in. `env` itself in a body without one.
+        let env = comptime::lowering_env(&infcx, infer, env);
 
         MirLowerCtx {
             result: mir,
@@ -494,7 +512,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             deref_temps: framed::map_in(frame),
             assigned: Vec::new_in(frame),
             assigned_from: MirSpan::Unknown,
-            copy: HashMap::default(),
+            copy: HashMap::new_in(Global),
             env,
             infcx,
             order_buf: Vec::new_in(frame),
@@ -504,7 +522,10 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             exit_locals_buf: Vec::new_in(frame),
             exit_ended_buf: Vec::new_in(frame),
             uninhabited_call: false,
+            contracts: None,
             probe: None,
+            early_drops: &[],
+            early_drops_placed: 0,
         }
     }
 
@@ -558,7 +579,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     /// The body lowering built, each list of it allocated once at its length, with what
     /// `mark_moves` asks for.
-    fn finish(mut self) -> (MirBody<'db>, InferCtxt<'db>, ParamEnv<'db>, HashMap<Ty<'db>, bool>) {
+    fn finish(mut self) -> (MirBody<'db>, InferCtxt<'db>, ParamEnv<'db>, HashMap<Ty<'db>, bool, Global>) {
         let Building {
             blocks,
             locals,
@@ -1608,6 +1629,10 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 } else {
                     self.push_assign_unit(current, return_slot().into(), expr_id.into());
                 }
+                if self.contracts.is_some() {
+                    let Some(c) = self.lower_ensures_checks(current)? else { return Ok(None) };
+                    current = c;
+                }
                 let returned = match self.returned {
                     Some(it) => it,
                     None => {
@@ -1619,7 +1644,10 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 self.exit_to(0, current, returned, expr_id.into());
                 Ok(None)
             }
-            Expr::Become { expr } => self.lower_become(expr, expr_id, current),
+            Expr::Become { expr } => {
+                self.refuse_become_with_ensures()?;
+                self.lower_become(expr, expr_id, current)
+            }
             Expr::Yield { .. } => not_supported!("yield"),
             Expr::RecordLit { fields, path, spread, .. } => {
                 let variant_id =
@@ -1721,10 +1749,10 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             Expr::Await { expr } => self.lower_await(expr, expr_id, place, current),
             Expr::Yeet { .. } => not_supported!("yeet"),
             Expr::Const(_) if let Some(konst) = self.inline_const(expr_id) => {
-                let subst = GenericArgs::identity_for_item(
-                    self.interner(),
-                    self.owner.generic_def(self.db).into(),
-                );
+                // The item's parameters, then the binders of the `for const` loops the block
+                // is in (outermost first), which its body may name: each copy of an iteration
+                // then evaluates the constant for its own member.
+                let subst = self.inline_const_args(expr_id);
                 self.lower_const(konst.into(), current, place, subst, expr_id.into())?;
                 Ok(Some(current))
             }
@@ -1837,6 +1865,10 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 self.push_assignment(current, place, rvalue, expr_id.into());
                 Ok(Some(current))
             }
+            // `#![feature(blaze_comptime)]` (`docs/v2/plan/design/comptime.md`).
+            Expr::ComptimeFor { pat, iterable, body, label } => {
+                self.lower_comptime_for(current, place, expr_id, pat, iterable, body, label)
+            }
             // An `unsafe<..> T` is laid out as `T`, the binder erased: rustc's
             // `WrapUnsafeBinder` and an `UnwrapUnsafeBinder` read move or copy the operand
             // and change only its type.
@@ -1882,6 +1914,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             }
             Expr::Field { .. }
             | Expr::Index { .. }
+            | Expr::ReflectedField { .. }
             | Expr::UnaryOp { op: hir_def::hir::UnaryOp::Deref, .. } => {
                 let Some((p, current)) =
                     self.lower_expr_as_place_without_adjust(current, expr_id, true)?
@@ -2417,7 +2450,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             .type_of_type_placeholder(offset.container)
             .ok_or(MirLowerError::TypeError("unknown type in offset_of"))?;
         let base = self.temp(Ty::new_ptr(interner, ty, Mutability::Not), current, span)?;
-        let null = Operand::from_bytes(word_bytes(0), self.local(base).ty.as_ref());
+        let null = Operand::from_bytes(word_bytes(0, self.word()?), self.local(base).ty.as_ref());
         self.push_assignment(current, base.into(), null.into(), span);
         let mut place = Place::from(base).project(ProjectionElem::Deref);
         let mut variant = None;
@@ -2540,7 +2573,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         };
         // A reference to `len` bytes, whose address the memory map gives: two words of the
         // target.
-        let fat = |len: usize| -> Box<[u8]> { [word_bytes(0), word_bytes(len)].concat().into() };
+        let word = self.word()?;
+        let fat = |len: usize| -> Box<[u8]> { [word_bytes(0, word), word_bytes(len, word)].concat().into() };
         let bytes: Box<[_]> = match l {
             hir_def::hir::Literal::String(b) => {
                 let b = b.as_str();
@@ -3342,7 +3376,13 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         match literal(rhs) {
             None | Some(0) => false,
             Some(-1) if signed => {
-                let bits = ty.primitive_size(self.interner()).bits();
+                // `i3::MIN` is -4, though an `i3` is stored in 8 bits.
+                let bits = match ty.kind() {
+                    TyKind::Int(int) if let Some(width) = int.arbitrary_width() => {
+                        u64::from(width.bits())
+                    }
+                    _ => ty.primitive_size(self.interner()).bits(),
+                };
                 let min = i128::MIN >> (128 - bits);
                 literal(lhs).is_some_and(|it| it != min)
             }
@@ -3744,6 +3784,31 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             })
     }
 
+    /// The drops of [`Self::early_drops`] after statement `statement` of `block`: each value
+    /// moved into a temporary of a scope of its own, which ends at once and drops it, as the
+    /// statement `drop(x);` there would move it into `drop`'s parameter and drop it. The
+    /// binding's own drop at the end of its scope then drops nothing: the value is moved out.
+    fn lower_early_drops(
+        &mut self,
+        block: ExprId,
+        statement: usize,
+        mut current: BasicBlockId,
+    ) -> Result<'db, BasicBlockId> {
+        let drops = self.early_drops;
+        for drop in drops.iter().filter(|it| it.block == block && it.statement == statement) {
+            let local = self.binding_local(drop.binding)?;
+            let ty = self.local(local).ty.as_ref();
+            let span = MirSpan::ExprId(block);
+            let scope = self.push_drop_scope();
+            let temp = self.temp(ty, current, MirSpan::Unknown)?;
+            let value = Operand { kind: OperandKind::Move(Place::from(local).store()), span: None };
+            self.push_assignment(current, temp.into(), value.into(), span);
+            current = scope.pop_and_drop(self, current, span);
+            self.early_drops_placed += 1;
+        }
+        Ok(current)
+    }
+
     fn lower_block_to_place(
         &mut self,
         statements: hir_def::hir::Statements<'_>,
@@ -3789,7 +3854,12 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         }
         let enclosing = self.drop_scopes.iter().rposition(|it| !it.temporaries);
         let scope = self.push_drop_scope();
-        for statement in statements.iter() {
+        for (index, statement) in statements.iter().enumerate() {
+            // What `drop(x);` after the statement before would do: here, as the simple `let`
+            // below ends its round with `continue`.
+            if let Some(before) = index.checked_sub(1) {
+                current = self.lower_early_drops(block, before, current)?;
+            }
             match statement {
                 hir_def::hir::Statement::Let {
                     pat, initializer, else_branch, is_super, ..
@@ -3901,6 +3971,18 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         }
                     }
                 }
+                // blaze_verify's clause groups are ghost: erased, never run
+                // (docs/v2/plan/lanes/verus.md), but for a `requires` checked at run time
+                // (`contract-checks`, docs/v2/plan/lanes/contracts.md part 1).
+                hir_def::hir::Statement::Expr { expr, has_semi: _ }
+                    if let Some(kind) = self.store.spec_clause(expr) =>
+                {
+                    let Some(c) = self.lower_clause_group(expr, kind, current)? else {
+                        scope.pop_assume_dropped(self);
+                        return Ok(None);
+                    };
+                    current = c;
+                }
                 hir_def::hir::Statement::Expr { expr, has_semi: _ } => {
                     let scope2 = self.push_drop_scope();
                     // A place used as a statement (`*x;`, `S[0];`) is moved out of into a
@@ -3915,6 +3997,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 }
                 hir_def::hir::Statement::Item(_) => (),
             }
+        }
+        if let Some(last) = statements.len().checked_sub(1) {
+            current = self.lower_early_drops(block, last, current)?;
         }
         if let Some(tail) = tail {
             // Before the 2024 edition the temporaries of a block's tail live as long as those
@@ -4330,6 +4415,15 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     fn krate(&self) -> Crate {
         self.owner.krate(self.db)
+    }
+
+    /// How many bytes an address of the body's target takes: its crate's, never the process's.
+    fn word(&self) -> Result<'db, usize> {
+        let layout = self
+            .db
+            .target_data_layout(self.krate())
+            .map_err(|_| crate::layout::LayoutError::TargetLayoutNotAvailable)?;
+        Ok(layout.pointer_size().bytes_usize())
     }
 
     fn drop_until_scope(
@@ -4761,15 +4855,37 @@ pub(crate) fn build_mir_body<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<'
     match owner {
         MirOwner::Body(def) => compute_mir_body(db, def),
         MirOwner::Closure(closure) => {
-            lower_closure_body(db, closure.loc(db), CoroutineCaptures::Own)
+            let loc = closure.loc(db);
+            let _p = inner_body_span(db, loc, InnerBody::Closure).entered();
+            lower_closure_body(db, loc, CoroutineCaptures::Own)
         }
         MirOwner::Coroutine(coroutine) => {
-            lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::Own)
+            let loc = coroutine.loc(db);
+            let _p = inner_body_span(db, loc, InnerBody::Coroutine).entered();
+            lower_closure_body(db, loc, CoroutineCaptures::Own)
         }
         MirOwner::CoroutineByMove(coroutine) => {
-            lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::OfClosure)
+            let loc = coroutine.loc(db);
+            let _p = inner_body_span(db, loc, InnerBody::CoroutineByMove).entered();
+            lower_closure_body(db, loc, CoroutineCaptures::OfClosure)
         }
     }
+}
+
+/// The span of building the MIR of the closure or coroutine at `loc`, named by its expression
+/// under its body ([`hir_def::span_names::of_inner`]): without one, its time is its caller's.
+fn inner_body_span<'db>(db: &'db Db, loc: InternedClosure<'db>, inner: InnerBody) -> tracing::Span {
+    hir_def::span_names::of_inner(
+        db,
+        loc.owner.expression_store_owner(db),
+        loc.expr,
+        inner,
+        tracing::info_span!(
+            "mir_body_for_closure_query",
+            krate = tracing::field::Empty,
+            function = tracing::field::Empty
+        ),
+    )
 }
 
 /// Stops at a body with a macro call that failed to expand, or whose expansion is not what
@@ -4960,6 +5076,13 @@ fn lower_closure_body_in<'db>(
     let store = ExpressionStore::of(db, body_owner.expression_store_owner(db));
     let infer = InferenceResult::of(db, body_owner);
     check_expansions(db, body_owner)?;
+    // rustc's `check_tail_calls` refused a `become` written in this closure's own body.
+    if let InferBodyId::DefWithBodyId(def) = body_owner
+        && hir_ty_tailck::has_become(store)
+        && hir_ty_tailck::tail_call_check(db, def).fails_body(Some(expr))
+    {
+        return Err(MirLowerError::HasErrors);
+    }
     let Expr::Closure { args, body: root, closure_kind, .. } = store.expr(expr) else {
         implementation_error!("closure expression is not closure");
     };
@@ -5276,9 +5399,11 @@ pub(crate) fn compute_mir_body<'db>(
 ) -> Result<'db, MirBody<'db>> {
     let span = match def {
         InferBodyId::DefWithBodyId(it) => hir_def::body_span!(db, it, "mir_body_query"),
-        InferBodyId::AnonConstId(it) => hir_def::span_names::of_anon_const(
+        InferBodyId::AnonConstId(it) => hir_def::span_names::of_inner(
             db,
             it.loc(db).owner,
+            it.loc(db).expr,
+            hir_def::span_names::InnerBody::Const,
             tracing::info_span!(
                 "mir_body_query",
                 krate = tracing::field::Empty,
@@ -5354,6 +5479,54 @@ pub fn lower_body_to_mir<'db>(
     self_param: Option<BindingId>,
     params: &[Param<PatId>],
 ) -> Result<'db, MirBody<'db>> {
+    lower_body_dropping(db, owner, store, infer, root_expr, self_param, params, &[])
+}
+
+/// A drop written in no source: the value of `binding` dropped right after statement
+/// `statement` of the block `block`, where the statement `drop(binding);` written after it
+/// would drop it. [`lower_with_early_drops`] lowers a body with some.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EarlyDrop {
+    pub block: ExprId,
+    pub statement: usize,
+    pub binding: BindingId,
+}
+
+/// The built MIR of `def` (as `mir_body` builds it, not cached) with `drops` lowered into it:
+/// for a check of a suggestion to drop a value earlier than its scope ends, before it is
+/// made (`hir_ty_borrowck::drop_early`). A drop that lowering does not reach (its block is a
+/// `super let` block, its statement never finishes, it is in a closure's or `async` block's
+/// body) is an error naming it, never a body without it.
+pub fn lower_with_early_drops<'db>(
+    db: &'db Db,
+    def: DefWithBodyId,
+    drops: &[EarlyDrop],
+) -> Result<'db, MirBody<'db>> {
+    let body = Body::of(db, def);
+    let owner = InferBodyId::DefWithBodyId(def);
+    let infer = InferenceResult::of(db, owner);
+    let self_param = body.self_param.map(|param| param.formal);
+    lower_body_dropping(db, owner, &**body, infer, body.root_expr(), self_param, &*body.params, drops)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_body_dropping<'db>(
+    db: &'db Db,
+    owner: InferBodyId<'db>,
+    store: &ExpressionStore,
+    infer: &InferenceResult<'db>,
+    root_expr: ExprId,
+    self_param: Option<BindingId>,
+    params: &[Param<PatId>],
+    drops: &[EarlyDrop],
+) -> Result<'db, MirBody<'db>> {
+    // rustc's `check_tail_calls` refused a `become` of the body: it builds the body's error MIR.
+    if let InferBodyId::DefWithBodyId(def) = owner
+        && hir_ty_tailck::has_become(store)
+        && hir_ty_tailck::tail_call_check(db, def).fails_body(None)
+    {
+        return Err(MirLowerError::HasErrors);
+    }
     // Extract params and self_param only when lowering the body's root expression for a function.
     if let Some(fid) = owner.as_function() {
         let callable_sig = {
@@ -5369,7 +5542,7 @@ pub fn lower_body_to_mir<'db>(
         let list = params.last().filter(|_| callable_sig.c_variadic());
         let param_tys = param_tys.chain(list.map(|list| infer.pat_ty(list.formal)));
 
-        lower_to_mir_with_store(
+        lower_to_mir_dropping(
             db,
             owner,
             store,
@@ -5377,9 +5550,10 @@ pub fn lower_body_to_mir<'db>(
             root_expr,
             params.iter().map(|param| param.formal).zip(param_tys),
             self_param,
+            drops,
         )
     } else {
-        lower_to_mir_with_store(db, owner, store, infer, root_expr, iter::empty(), None)
+        lower_to_mir_dropping(db, owner, store, infer, root_expr, iter::empty(), None, drops)
     }
 }
 
@@ -5395,6 +5569,20 @@ pub fn lower_to_mir_with_store<'db>(
     root_expr: ExprId,
     params: impl Iterator<Item = (PatId, Ty<'db>)> + Clone,
     self_param: Option<(BindingId, Ty<'db>)>,
+) -> Result<'db, MirBody<'db>> {
+    lower_to_mir_dropping(db, owner, store, infer, root_expr, params, self_param, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_to_mir_dropping<'db>(
+    db: &'db Db,
+    owner: InferBodyId<'db>,
+    store: &ExpressionStore,
+    infer: &InferenceResult<'db>,
+    root_expr: ExprId,
+    params: impl Iterator<Item = (PatId, Ty<'db>)> + Clone,
+    self_param: Option<(BindingId, Ty<'db>)>,
+    drops: &[EarlyDrop],
 ) -> Result<'db, MirBody<'db>> {
     check_expansions(db, owner)?;
     if infer.has_type_mismatches() || infer.is_erroneous() {
@@ -5422,13 +5610,23 @@ pub fn lower_to_mir_with_store<'db>(
     }
     frame::task(Tag::Mir, |frame| {
         let mut ctx = MirLowerCtx::new(db, owner, store, infer, frame);
+        ctx.early_drops = drops;
         // clone: an iterator over the parameters' slices, kept for the probe
         lower_root(&mut ctx, root_expr, params.clone(), self_param)?;
+        if ctx.early_drops_placed != drops.len() {
+            // alloc: error path
+            return Err(MirLowerError::NotSupported(format!(
+                "{} of the {} drops written in no source were not lowered (in {owner:?}): {drops:?}",
+                drops.len() - ctx.early_drops_placed,
+                drops.len()
+            )));
+        }
         let probe = ctx.needs_probe();
         let (mut body, infcx, env, mut copy) = ctx.finish();
         body.mark_moves(&infcx, env, &mut copy);
         if probe {
             let mut ctx = MirLowerCtx::new(db, owner, store, infer, frame);
+            ctx.early_drops = drops;
             ctx.probe = Some(uninhabited::Probe::new_in(frame));
             lower_root(&mut ctx, root_expr, params, self_param)?;
             body.unreachable_after_calls = ctx.unreachable_after_calls();
@@ -5459,6 +5657,8 @@ fn lower_root<'db>(
     let expected_binding_owner =
         if matches!(owner, InferBodyId::DefWithBodyId(_)) { None } else { Some(root_expr) };
     let binding_picker = |b: BindingId| store.binding_owner(b) == expected_binding_owner;
+    // clone: an iterator over the parameters' slices
+    ctx.start_contract_checks(params.clone().map(|(pat, _)| pat), self_param.map(|(it, _)| it));
     let current = ctx.lower_params_and_bindings(params, self_param, binding_picker)?;
     ctx.ends_temporaries.insert(root_expr);
     // rustc's `region::resolve_body`: the initializer of a body that is not a function's is a
@@ -5470,6 +5670,10 @@ fn lower_root<'db>(
         ctx.lower_expr_to_place_without_adjust(root_expr, return_slot().into(), current)?
     } else {
         ctx.lower_expr_to_place(root_expr, return_slot().into(), current)?
+    };
+    let current = match current {
+        Some(current) if ctx.contracts.is_some() => ctx.lower_ensures_checks(current)?,
+        current => current,
     };
     if let Some(current) = current {
         let current = ctx.pop_drop_scope_assert_finished(current, root_expr.into())?;
@@ -5484,9 +5688,8 @@ fn const_bytes<const N: usize>(bytes: [u8; N]) -> Box<[u8]> {
     Box::new(bytes)
 }
 
-/// `value` as a `usize` of the target.
-fn word_bytes(value: usize) -> Box<[u8]> {
-    let word = crate::mir::target::word();
+/// `value` as a `usize` of a target of `word`-byte addresses.
+fn word_bytes(value: usize, word: usize) -> Box<[u8]> {
     value.to_le_bytes()[..word].into()
 }
 

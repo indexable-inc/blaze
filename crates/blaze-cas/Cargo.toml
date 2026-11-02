@@ -21,10 +21,17 @@ blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-reclaim.workspace = true
+blaze-serde.workspace = true
 lz4_flex.workspace = true
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
+tracing.workspace = true
 zstd.workspace = true
+
+[features]
+# `Writer::hold_put`: a put counted and not yet published, for the tests of the store's users
+# (the daemon's gate). Only dev units turn it on, so no build without dev units has it.
+test-hooks = []
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

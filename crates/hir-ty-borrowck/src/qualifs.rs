@@ -259,13 +259,19 @@ impl<'db> ValueCx<'_, '_, 'db> {
         self.consts.borrow_mut().insert(konst, Qualifs { needs_drop: true, mut_interior: true });
         let def = DefWithBodyId::ConstId(konst);
         let body = Body::of(self.db, def);
+        let infer = InferenceResult::of(self.db, def);
         let cx = ValueCx {
             db: self.db,
             infcx: self.infcx,
-            env: self.db.trait_environment(konst.into()),
+            // With what its `for const` loops assume of their binders, as inference had it.
+            env: hir_ty::comptime_env::body_env(
+                self.infcx,
+                infer,
+                self.db.trait_environment(konst.into()),
+            ),
             owner: InferBodyId::DefWithBodyId(def),
             store: body,
-            infer: InferenceResult::of(self.db, def),
+            infer,
             consts: self.consts,
         };
         let qualifs = cx.value(body.root_expr(), 0);

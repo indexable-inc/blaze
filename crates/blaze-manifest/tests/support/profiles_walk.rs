@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_manifest::config::CompileKind;
 use blaze_manifest::diagnostic::report;
 use blaze_manifest::files::Disk;
@@ -287,7 +288,7 @@ fn profiles_of(
     if let Some(locked) = &locked {
         packages.extend(locked.iter());
     } else {
-        let mut seen = blaze_hash::HashSet::default();
+        let mut seen = blaze_hash::HashSet::new_in(Global);
         for (unit, value) in parsed.iter().zip(units) {
             if seen.insert(value["pkg_id"].as_str()) {
                 packages.push(&unit.pkg);
@@ -300,7 +301,7 @@ fn profiles_of(
         let _ = writeln!(stderr, "warning: {warning}");
     }
     let mut walk =
-        Walk { units: &parsed, profiles, interned: Vec::new(), by_unit: HashMap::default() };
+        Walk { units: &parsed, profiles, interned: Vec::new(), by_unit: HashMap::new_in(Global) };
     let roots = graph["roots"].as_array().ok_or_else(|| anyhow!("no `roots` in the unit graph"))?;
     let is_test_command = matches!(command.name.as_str(), "test" | "bench");
     let requested = match &command.target {
@@ -366,7 +367,7 @@ struct Walk<'a> {
     units: &'a [Unit],
     profiles: &'a Profiles,
     interned: Vec<Interned>,
-    by_unit: HashMap<usize, Vec<usize>>,
+    by_unit: HashMap<usize, Vec<usize>, Global>,
 }
 
 impl Walk<'_> {

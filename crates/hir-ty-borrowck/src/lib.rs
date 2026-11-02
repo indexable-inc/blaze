@@ -12,7 +12,8 @@
 //! subtree is a range of words, and region inference over the SCCs of the outlives graph.
 
 #![forbid(unsafe_code)]
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, register_tool)]
+#![register_tool(blaze)]
 
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 extern crate rustc_type_ir;
@@ -23,6 +24,9 @@ mod check;
 mod constraints;
 mod dataflow;
 mod decode;
+mod dropck;
+pub mod drop_early;
+mod flow;
 mod gate;
 mod inference;
 mod intervals;
@@ -45,6 +49,10 @@ mod budget;
 #[cfg(test)]
 mod differential;
 #[cfg(test)]
+mod dropck_tests;
+#[cfg(test)]
+mod flow_tests;
+#[cfg(test)]
 mod missing_body_tests;
 #[cfg(test)]
 mod served;
@@ -53,7 +61,7 @@ mod served;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
-use std::{cell::RefCell, sync::LazyLock};
+use std::cell::RefCell;
 
 use base_db::{Db, Crate};
 use blaze_ids::radix;
@@ -88,30 +96,21 @@ use crate::{
 
 /// Which of rustc's borrow checkers to match: the one stable Rust has, or the location
 /// sensitive one nightly Rust has by default (`-Zpolonius=next`), which accepts more.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Mode {
-    Nll,
-    Polonius,
-    Off,
-}
+pub use base_db::BorrowckMode as Mode;
 
-/// `BLAZE_BORROWCK`: `polonius` (the default), `nll` or `off`.
-pub fn mode() -> Mode {
-    static MODE: LazyLock<Mode> =
-        LazyLock::new(|| match std::env::var("BLAZE_BORROWCK").as_deref() {
-            Ok("nll") => Mode::Nll,
-            Ok("off" | "0") => Mode::Off,
-            _ => Mode::Polonius,
-        });
-    *MODE
+/// The database's borrow checker ([`base_db::FrontSettings::borrowck`], `BLAZE_BORROWCK`):
+/// `polonius` (the default), `polonius-flow`, `nll` or `off`.
+pub fn mode(db: &Db) -> Mode {
+    base_db::FrontSettings::get(db).borrowck(db)
 }
 
 /// `BLAZE_BORROWCK_DEBUG=1` prints the regions, constraints and loans of every body checked,
-/// `BLAZE_BORROWCK_DEBUG=name` those of the functions called `name` and their closures.
+/// `BLAZE_BORROWCK_DEBUG=name` those of the functions called `name` and their closures
+/// ([`base_db::FrontSettings::borrowck_debug`]).
 pub(crate) fn debugging(db: &Db, owner: InferBodyId<'_>) -> bool {
-    static WANTED: LazyLock<Option<String>> =
-        LazyLock::new(|| std::env::var("BLAZE_BORROWCK_DEBUG").ok()); // alloc: once per process
-    let Some(wanted) = WANTED.as_deref() else { return false };
+    let Some(wanted) = base_db::FrontSettings::get(db).borrowck_debug(db).as_deref() else {
+        return false;
+    };
     match owner {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it)) if wanted != "1" => {
             hir_def::signatures::FunctionSignature::of(db, it).name.as_str() == wanted
@@ -136,6 +135,22 @@ pub struct BorrowckDiagnostic {
     pub children: Vec<Child>,
     /// rustc's suggestions, in the order rustc adds them.
     pub suggestions: Vec<Suggestion>,
+    /// The variable of the item's own body whose drop at the end of its scope is the later use
+    /// that makes this an error ("borrow might be used here, when `x` is dropped"): the error
+    /// [`drop_early::add_notes`] may suggest dropping it sooner for.
+    pub dropped_at_scope_end: Option<BindingId>,
+    /// E0320's types and limit, for a printer that shortens the types as rustc does.
+    pub drop_check: Option<DropCheckOverflow>,
+}
+
+/// What an E0320, "overflow while adding drop-check rules", is about: the type of the local
+/// dropped, the type the drop check went past the recursion limit at, and the limit, the
+/// crate's `#![recursion_limit]`. Regions erased.
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+pub struct DropCheckOverflow {
+    pub ty: hir_ty::next_solver::StoredTy,
+    pub overflow_ty: hir_ty::next_solver::StoredTy,
+    pub limit: u32,
 }
 
 /// Where a part of a [`BorrowckDiagnostic`] points.
@@ -146,6 +161,10 @@ pub enum PartSpan {
     Before(MirSpan),
     /// The empty span where `span`'s source ends.
     After(MirSpan),
+    /// The empty span where the statement `span` is the pattern or expression of ends, past
+    /// its `;`: a suggestion's text there goes on a line of its own below the statement,
+    /// indented as it is.
+    LineAfter(MirSpan),
     /// From where the first expression's source starts to where the second's, an expression
     /// inside it, starts: the `&` or `*` a suggestion removes.
     Head(ExprId, ExprId),
@@ -208,6 +227,8 @@ impl BorrowckDiagnostic {
             labels: Vec::new(), // alloc: the owned diagnostic; `Vec::new` takes no memory
             children: Vec::new(), // alloc: the owned diagnostic; `Vec::new` takes no memory
             suggestions: Vec::new(), // alloc: the owned diagnostic; `Vec::new` takes no memory
+            dropped_at_scope_end: None,
+            drop_check: None,
         }
     }
 
@@ -282,6 +303,9 @@ pub enum NotChecked {
     /// Match checking refused it (E0004, E0005, E0030, a constant pattern that does not
     /// evaluate): rustc's `mir_built` gives such a body its error body, which nothing checks.
     MatchErrors,
+    /// `check_tail_calls` refused a `become` in it: rustc's `mir_built` gives such a body its
+    /// error body.
+    TailCallErrors,
     /// A `static` of a type that is not `Sized`: rustc's E0277.
     UnsizedStatic,
     /// A const context drops a value of a type with drop glue: rustc's E0493.
@@ -301,7 +325,7 @@ impl NotChecked {
 /// The errors rustc's borrow checker reports in `def` and the closures in it.
 #[blaze_query::tracked(returns(ref))]
 pub fn borrowck<'db>(db: &'db Db, def: DefWithBodyId) -> BorrowckResult {
-    let mode = mode();
+    let mode = mode(db);
     let Some(checker) = checker(mode) else { return borrowck_in_mode(db, def, mode) };
     let (result, reads) = hir_ty::body_store::capture(db, || borrowck_in_mode(db, def, mode));
     if gate::verdict(def, &result).is_ok() {
@@ -316,13 +340,27 @@ pub(crate) fn checker(mode: Mode) -> Option<&'static str> {
     match mode {
         Mode::Nll => Some("nll"),
         Mode::Polonius => Some("polonius"),
+        Mode::PoloniusFlow => Some("polonius-flow"),
         Mode::Off => None,
     }
 }
 
 /// [`borrowck`] in `mode`, not cached: for measuring the checker in each mode.
 pub fn borrowck_in_mode(db: &Db, def: DefWithBodyId, mode: Mode) -> BorrowckResult {
-    blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| check_def(db, def, mode, frame))
+    blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| check_def(db, def, mode, None, frame))
+}
+
+/// The borrow check of `def` with its own body's MIR replaced by `body` (the closures,
+/// coroutines and `const` blocks in it from their queries, as [`borrowck`] takes them), in
+/// `mode`. Not cached: for a lint that checks a rewrite of the body before it suggests it
+/// (`blaze::borrow_workaround`).
+pub fn borrowck_rewritten<'db>(
+    db: &'db Db,
+    def: DefWithBodyId,
+    body: &MirBody<'db>,
+    mode: Mode,
+) -> BorrowckResult {
+    blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| check_def(db, def, mode, Some(body), frame))
 }
 
 /// Whether `def`'s source has a body: a fn's block, a const's or static's value, a variant's
@@ -341,7 +379,13 @@ fn written_with_body(db: &Db, def: DefWithBodyId) -> bool {
     }
 }
 
-fn check_def(db: &Db, def: DefWithBodyId, mode: Mode, frame: &Frame) -> BorrowckResult {
+fn check_def<'db>(
+    db: &'db Db,
+    def: DefWithBodyId,
+    mode: Mode,
+    root: Option<&MirBody<'db>>,
+    frame: &Frame,
+) -> BorrowckResult {
     let mut result = BorrowckResult::default();
     if mode == Mode::Off {
         result.not_checked = Some(NotChecked::Off);
@@ -385,6 +429,13 @@ fn check_def(db: &Db, def: DefWithBodyId, mode: Mode, frame: &Frame) -> Borrowck
         result.not_checked = Some(NotChecked::MatchErrors);
         return result;
     }
+    // rustc's `check_tail_calls` refused a `become` of the body or a closure in it, whose
+    // error MIR taints the body's borrow check. One bit of the store first, so a body without
+    // a `become` reads no more.
+    if hir_ty_tailck::has_become(body) && hir_ty_tailck::tail_call_check(db, def).failed() {
+        result.not_checked = Some(NotChecked::TailCallErrors);
+        return result;
+    }
     // A `static` of a type that is not `Sized` is rustc's E0277, which keeps it from being
     // borrow checked; a `const` is checked all the same.
     if let DefWithBodyId::StaticId(it) = def
@@ -401,7 +452,12 @@ fn check_def(db: &Db, def: DefWithBodyId, mode: Mode, frame: &Frame) -> Borrowck
         result.not_checked = Some(NotChecked::UnsizedStatic);
         return result;
     }
-    check_owner(db, owner, Some(def), mode, frame)
+    let mut result = check_owner(db, owner, Some(def), mode, root, frame);
+    // A rewritten body is checked to see whether a suggestion holds: it suggests nothing more.
+    if root.is_none() {
+        drop_early::add_notes(db, def, mode, &mut result);
+    }
+    result
 }
 
 /// The errors rustc's borrow checker reports in a constant of a signature, as an array length
@@ -414,7 +470,7 @@ pub fn borrowck_anon_const<'db>(
     if konst.is_inline_const(db) {
         return BorrowckResult::default();
     }
-    if mode() == Mode::Off {
+    if mode(db) == Mode::Off {
         return BorrowckResult { not_checked: Some(NotChecked::Off), ..Default::default() };
     }
     blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
@@ -432,22 +488,68 @@ pub fn borrowck_anon_const<'db>(
                 ..Default::default()
             };
         }
-        check_owner(db, owner, None, mode(), frame)
+        check_owner(db, owner, None, mode(db), None, frame)
     })
 }
 
 /// The errors in `owner`'s body and the closures, coroutines and `const { .. }` blocks in it;
 /// `def` is the item when it is one, not a constant of a signature.
+///
+/// `polonius-flow` checks with the alpha first and keeps what it says unless it reports an
+/// error other than a `#[blaze::linear]` one (`LINEAR`, which no mode changes): then it checks again with datalog Polonius's loan liveness and universal check
+/// ([`flow`]), whose verdict it takes. So it accepts what the alpha accepts, with the same
+/// diagnostics, and costs nothing more on a body the alpha accepts.
 fn check_owner<'db>(
     db: &'db Db,
     owner: InferBodyId<'db>,
     def: Option<DefWithBodyId>,
     mode: Mode,
+    root: Option<&MirBody<'db>>,
+    frame: &Frame,
+) -> BorrowckResult {
+    if mode != Mode::PoloniusFlow {
+        return check_owner_once(db, owner, def, mode, root, frame);
+    }
+    let alpha = blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
+        check_owner_once(db, owner, def, Mode::Polonius, root, frame)
+    });
+    // A `#[blaze::linear]` error is the same in every mode, so only the borrow checker's own
+    // errors are a reason to check again.
+    if alpha.skipped.is_some()
+        || alpha.not_checked.is_some()
+        || !alpha.diagnostics.iter().any(|it| {
+            it.is_error() && it.code != hir_ty_linear::LinearDiagnostic::CODE
+        })
+    {
+        return alpha;
+    }
+    let name = match owner {
+        InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it)) => {
+            hir_def::signatures::FunctionSignature::of(db, it).name.as_str()
+        }
+        _ => "",
+    };
+    let _span =
+        tracing::info_span!(target: "blaze", "borrowck.flow", name, owner = ?owner).entered();
+    check_owner_once(db, owner, def, Mode::PoloniusFlow, root, frame)
+}
+
+/// [`check_owner`] in one mode.
+fn check_owner_once<'db>(
+    db: &'db Db,
+    owner: InferBodyId<'db>,
+    def: Option<DefWithBodyId>,
+    mode: Mode,
+    root: Option<&MirBody<'db>>,
     frame: &Frame,
 ) -> BorrowckResult {
     let mut result = BorrowckResult::default();
     let infer = InferenceResult::of(db, owner);
-    let body = match timings::phase(timings::Phase::Mir, || db.mir_body(owner)) {
+    let lowered = match root {
+        Some(body) => Ok(body),
+        None => timings::phase(timings::Phase::Mir, || db.mir_body(owner)),
+    };
+    let body = match lowered {
         Ok(body) => body,
         Err(error) => {
             // alloc: the owned result, once, when MIR lowering refuses the body
@@ -593,6 +695,38 @@ fn check_owner<'db>(
     let reported = diagnostics.iter().flatten().flatten().count();
     result.diagnostics =
         mem::owned(ExactLen::new(diagnostics.into_iter().rev().flatten().flatten(), reported));
+    // `#[blaze::linear]`: a linear value a body drops implicitly, or gives to code that may,
+    // refuses the item as a borrow error does. Each body in the order it was lowered: the
+    // owner's, then those written in it.
+    let mut linear = Vec::new(); // alloc: empty unless a linear value is dropped (error path)
+    for &(body, closure, inline_const) in bodies.iter() {
+        let kind = match (def, closure, inline_const) {
+            (Some(def), None, None) => hir_ty_linear::BodyKind::Item(def),
+            _ => hir_ty_linear::BodyKind::Nested,
+        };
+        hir_ty_linear::check_body(db, body, kind, &mut linear);
+    }
+    result.diagnostics.extend(linear.into_iter().map(|it| BorrowckDiagnostic {
+        code: hir_ty_linear::LinearDiagnostic::CODE,
+        span: it.span,
+        message: it.message,
+        at_signature: false,
+        // alloc: error path, a linear error's labels
+        labels: it.labels.into_iter().map(|(span, label)| (PartSpan::At(span), label)).collect(),
+        children: it
+            .notes
+            .into_iter()
+            .map(|message| Child {
+                level: Sublevel::Note,
+                message,
+                spans: Vec::new(),  // alloc: empty
+                labels: Vec::new(), // alloc: empty
+            })
+            .collect(), // alloc: error path, a linear error's notes
+        suggestions: Vec::new(), // alloc: empty
+        dropped_at_scope_end: None,
+        drop_check: None,
+    }));
     if debugging(db, owner) {
         if let Some(skipped) = &result.skipped {
             eprintln!("skipped {skipped}");
@@ -816,6 +950,10 @@ impl<'a, 'db> Ctx<'a, 'db> {
         let interner = DbInterner::new_with(db, krate).with_regions();
         let env = normalized_env(interner, db.trait_environment(owner.generic_def(db)));
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+        // `for const` binders (`#![feature(blaze_comptime)]`): what the body's loops assume of
+        // them, unnormalized as inference had it, so `F: Copy` and `F::Type: Drop` get
+        // inference's answers. `env` itself in a body without a loop.
+        let env = hir_ty::comptime_env::body_env(&infcx, infer, env);
         let mut bindings = mem::map(frame);
         bindings.reserve(body.binding_locals.values().count());
         bindings.extend(body.binding_locals.iter().map(|(binding, &local)| (local, binding)));
@@ -1048,6 +1186,7 @@ fn is_copy_query(
     let env = env.as_ref(db);
     let interner = DbInterner::new_with(db, env.krate).with_regions();
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
     infcx.type_is_copy_modulo_regions(env.param_env, ty.as_ref())
 }
 
@@ -1062,6 +1201,7 @@ fn drop_glue_query(
     let env = env.as_ref(db);
     let interner = DbInterner::new_with(db, env.krate).with_regions();
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
     hir_ty::drop::has_drop_glue(&infcx, ty.as_ref(), env.param_env) as u8
 }
 

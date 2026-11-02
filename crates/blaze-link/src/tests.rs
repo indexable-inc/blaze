@@ -1453,6 +1453,10 @@ mod sanitize;
 
 mod splice;
 
+mod icf;
+
+mod layout;
+
 /// The state's columns, read and written as a stage does.
 mod columns {
     use blaze_codegen::Line;

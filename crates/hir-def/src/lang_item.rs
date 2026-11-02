@@ -11,6 +11,7 @@ use crate::{
     AdtId, AssocItemId, AttrDefId, ConstId, Crate, EnumId, EnumVariantId, FunctionId, ImplId,
     ItemContainerId, MacroId, ModuleDefId, StaticId, StructId, TraitId, TypeAliasId, UnionId,
     attrs::{AttrFlags, CrateAttrFlags},
+    item_scope::ImportOrExternCrate,
     nameres::{DefMap, assoc::TraitItems, crate_def_map, crate_local_def_map},
 };
 
@@ -141,13 +142,37 @@ pub fn lang_items(db: &Db, start_crate: Crate) -> LangItems {
         // Some crates declares themselves as extern crate like `extern crate self as core`.
         // Ignore these to prevent cycles.
         let krate = module.krate(db);
-        if krate != start_crate {
+        if krate != start_crate && !krate.loads_only_macros(db) {
             result.merge_prefer_self(lang_items(db, krate));
+        }
+    }
+
+    // An `extern crate` loads its crate wherever it is, as rustc's crate loader does, but only
+    // one in the crate's root is in the extern prelude. A test harness of a `#![no_std]` crate
+    // reaches `std` (and its `start`) only through the `extern crate test;` in its module.
+    let def_map = crate_def_map(db, start_crate);
+    for (_, module_data) in def_map.modules(db) {
+        let scope = module_data.scope(db);
+        if scope.extern_crate_decls().next().is_none() {
+            continue;
+        }
+        for (_, item) in scope.types() {
+            if let (ModuleDefId::ModuleId(module), Some(ImportOrExternCrate::ExternCrate(_))) =
+                (item.def, item.import)
+            {
+                let krate = module.krate(db);
+                if krate != start_crate && !krate.loads_only_macros(db) {
+                    result.merge_prefer_self(lang_items(db, krate));
+                }
+            }
         }
     }
 
     result
 }
+
+#[cfg(test)]
+mod extern_tests;
 
 impl LangItems {
     fn collect_lang_item<T>(&mut self, flags: &mut CrateAttrFlags<'_>, item: T)
@@ -498,6 +523,17 @@ language_item_table! { LangItems =>
     Clone,                   sym::clone,               TraitId;
     TrivialClone,            sym::trivial_clone,       TraitId;
     TryAsDyn,                sym::try_as_dyn,          TraitId;
+    /// The arbitrary-width integers `u1`..`u128`, `i1`..`i128` other than the standard ones
+    /// (`#[blaze::arbitrary_ints]`): a marker the solver answers, never implemented by an impl.
+    ArbitraryInt,            sym::arbitrary_int,       TraitId;
+    /// The signed arbitrary-width integers.
+    ArbitrarySigned,         sym::arbitrary_signed,    TraitId;
+    /// `Self: IntFrom<S>`: two different integer types, one of them arbitrary-width, where every
+    /// value of `S` is a value of `Self`.
+    IntFrom,                 sym::int_from,            TraitId;
+    /// `Self: IntTryFrom<S>`: as `IntFrom`, where some value of `S` is not one of
+    /// `Self`.
+    IntTryFrom,              sym::int_try_from,        TraitId;
     Sync,                    sym::sync,                TraitId;
     DiscriminantKind,        sym::discriminant_kind,   TraitId;
     /// The associated item of the `DiscriminantKind` trait.
@@ -687,6 +723,11 @@ language_item_table! { LangItems =>
     TryTraitBranch,          sym::branch,              FunctionId;
     TryTraitFromYeet,        sym::from_yeet,           FunctionId;
     ResidualIntoTryType,     sym::into_try_type,       FunctionId;
+    // Nightly's contracts (`core::contracts`, `core::intrinsics`): what a
+    // `#[core::contracts::requires/ensures]` clause is lowered to call.
+    ContractBuildCheckEnsures, sym::contract_build_check_ensures, FunctionId;
+    ContractCheckRequires,   sym::contract_check_requires, FunctionId;
+    ContractCheckEnsures,    sym::contract_check_ensures, FunctionId;
 
     PointerLike,             sym::pointer_like,        TraitId;
 
@@ -751,6 +792,42 @@ language_item_table! { LangItems =>
     Field,                   sym::field,               TraitId;
     FieldBase,               sym::field_base,          TypeAliasId;
     FieldType,               sym::field_type,          TypeAliasId;
+    /// `core::field::FieldRepresentingType`, the type reflection's field ids are of.
+    FieldRepresentingType,   sym::field_representing_type, StructId;
+
+    // blaze's compile-time reflection, `core::reflect` (`#![feature(blaze_comptime)]`,
+    // docs/v2/plan/design/comptime.md). Only blaze's `core` declares them; the solver answers
+    // the traits, the `for const` loop and its expansion read the types.
+    /// `core::reflect::Struct`: a struct or tuple whose fields reflection may read and write.
+    ReflectStruct,           sym::blaze_struct,        TraitId;
+    /// `core::reflect::Enum`.
+    ReflectEnum,             sym::blaze_enum,          TraitId;
+    /// `core::reflect::Field<Base>`, a subtrait of `core::field::Field`: what
+    /// `for<F: Field<T>>` ranges over.
+    ReflectField,            sym::blaze_field,         TraitId;
+    /// `core::reflect::Marked<M>`: a field written `#[blaze::mark(M)]`.
+    ReflectMarked,           sym::blaze_marked,        TraitId;
+    /// `core::reflect::Unmarked<M>`: a field not written `#[blaze::mark(M)]`.
+    ReflectUnmarked,         sym::blaze_unmarked,      TraitId;
+    /// `core::reflect::Variant<Base>`: what `for<V: Variant<T>>` ranges over.
+    ReflectVariant,          sym::blaze_variant,       TraitId;
+    /// `<V as core::reflect::Variant<E>>::View`, which is `VariantOf<E, V's index>`.
+    ReflectVariantView,      sym::blaze_variant_view,  TypeAliasId;
+    /// `core::reflect::VariantRepresentingType<E, VARIANT>`, the types `Variant<E>` holds for.
+    ReflectVariantRepresentingType, sym::blaze_variant_representing_type, StructId;
+    /// `core::reflect::VariantOf<E, VARIANT>`: an `E` known to be that variant,
+    /// `repr(transparent)`; its fields to reflection are the variant's.
+    ReflectVariantOf,        sym::blaze_variant_of,    StructId;
+    /// `core::reflect::Fields<T, P>`, what `for const` iterates over the fields of `T`.
+    ReflectFields,           sym::blaze_fields,        StructId;
+    /// `core::reflect::OnlyMarked<M, Rest>`, a `Fields` filter: `F: Marked<M>`, then `Rest`'s.
+    ReflectOnlyMarked,       sym::blaze_only_marked,   StructId;
+    /// `core::reflect::OnlyUnmarked<M, Rest>`: `F: Unmarked<M>`, then `Rest`'s.
+    ReflectOnlyUnmarked,     sym::blaze_only_unmarked, StructId;
+    /// `core::reflect::Variants<T>`, what `for const` iterates over the variants of `T`.
+    ReflectVariants,         sym::blaze_variants,      StructId;
+    /// `core::reflect::FnItem`: fn item and closure types, never fn pointers.
+    ReflectFnItem,           sym::blaze_fn_item,       TraitId;
 
     RangeMin,                sym::RangeMin,            ConstId;
     /// `SizedTypeProperties::SIZE` and `::ALIGN`.

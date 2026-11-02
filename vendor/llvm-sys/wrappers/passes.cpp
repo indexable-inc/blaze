@@ -17,6 +17,12 @@
  * LLVMBlazeCreatePgoPasses keeps passes whose pipelines instrument for PGO or use a profile, as
  * rustc's LLVMRustOptimize builds its PassBuilder with PGOOptions for -Cprofile-generate and
  * -Cprofile-use. A profile is read from memory, never from a file.
+ *
+ * LLVMBlazeReport* keep what blaze's report (the `blaze::vecreport` lint) reads of a module's
+ * optimized code: the loop vectorizer's remarks of why it left a loop scalar, caught by a
+ * diagnostic handler while the passes run, and the branches out of a loop to code that never
+ * returns (a check whose panic path survived), found once the passes are done. Each finding
+ * is placed by the line of its debug location, which blaze makes the statement of the code.
  */
 #include <llvm-c/Error.h>
 #include <llvm-c/TargetMachine.h>
@@ -24,8 +30,17 @@
 #include <llvm/ADT/IntrusiveRefCntPtr.h>
 #include <llvm/ADT/StringMap.h>
 #include <llvm/ADT/StringRef.h>
+#include <llvm/Analysis/BlockFrequencyInfo.h>
+#include <llvm/Analysis/BranchProbabilityInfo.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/ProfileSummaryInfo.h>
+#include <llvm/IR/CFG.h>
+#include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/IR/DiagnosticHandler.h>
 #include <llvm/IR/DiagnosticInfo.h>
+#include <llvm/IR/Dominators.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
@@ -45,9 +60,13 @@
 #include <llvm/Transforms/Instrumentation/ThreadSanitizer.h>
 #include <llvm/Transforms/Utils/Instrumentation.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
+#include <string>
+#include <vector>
 
 using namespace llvm;
 
@@ -110,7 +129,55 @@ bool reusable(StringRef Text) {
   return !Text.contains("inline") && !Text.contains("default<") && !Text.contains("lto");
 }
 
+/* A finding of the report as the passes keep it until LLVMBlazeReportRows hands it out. */
+struct Held {
+  uint8_t Kind;
+  uint32_t Line;
+  uint32_t LoopLine;
+  std::optional<uint64_t> Count;
+  std::string Name;
+  std::string Message;
+};
+
 } // namespace
+
+/* A finding of the report. Declared field for field in src/transforms/pass_builder.rs. */
+struct LLVMBlazeReportRow {
+  /* LLVMBlazeFoundKept, LLVMBlazeFoundMissed or LLVMBlazeFoundAnalysis. */
+  uint8_t Kind;
+  /* LLVMBlazeHeatUnprofiled, LLVMBlazeHeatUncounted, LLVMBlazeHeatCold or
+   * LLVMBlazeHeatHot. */
+  uint8_t Heat;
+  /* The line of the code's debug location, through any inlining to the function's own; 0 for
+   * code of no line. Kept: of the call that never returns. A remark: of its location. */
+  uint32_t Line;
+  /* The line of the loop's start; 0 where it is not known. */
+  uint32_t LoopLine;
+  /* The loop header's profile count, for Cold and Hot. */
+  uint64_t Count;
+  /* Kept: the name of the function called (empty for a call through a pointer). A remark: its
+   * name (`CantVectorizeCall`). */
+  const char *Name;
+  size_t NameLength;
+  /* A remark's message; empty for Kept. */
+  const char *Message;
+  size_t MessageLength;
+};
+
+enum : uint8_t {
+  LLVMBlazeFoundKept = 1,
+  LLVMBlazeFoundMissed = 2,
+  LLVMBlazeFoundAnalysis = 3,
+};
+
+enum : uint8_t {
+  /* The module has no profile summary: built without a profile. */
+  LLVMBlazeHeatUnprofiled = 0,
+  /* The module has a profile, and no count reaches this loop (it is gone, or uncounted). */
+  LLVMBlazeHeatUncounted = 1,
+  LLVMBlazeHeatCold = 2,
+  LLVMBlazeHeatHot = 3,
+};
 
 struct LLVMBlazeOpaquePasses {
   TargetMachine *Machine;
@@ -124,6 +191,18 @@ struct LLVMBlazeOpaquePasses {
    * profile's record of its name, and how many it gave since LLVMBlazeTakeMismatched. */
   std::string MismatchText = "";
   uint32_t Mismatched = 0;
+  /* How many functions a profile used gave counts to (an entry count they did not have
+   * before the run) since LLVMBlazeTakeApplied. */
+  uint32_t Applied = 0;
+  /* Whether the runs catch the loop vectorizer's remarks into Report (LLVMBlazeReportStart). */
+  bool Reporting = false;
+  /* The findings since LLVMBlazeReportStart, in the order LLVM made them. */
+  std::vector<Held> Report = {};
+  /* The vectorizer's reasons since its last "loop not vectorized": they are of the loop it
+   * names next, whose line they are given then. */
+  std::vector<size_t> Pending = {};
+  /* Report as LLVMBlazeReportRows hands it out, pointing into it. */
+  std::vector<LLVMBlazeReportRow> Rows = {};
 };
 
 /* What LLVMBlazeCreatePgoPasses builds pipelines for: rustc's -Cprofile-generate (Generate)
@@ -275,10 +354,71 @@ struct Mismatches final : DiagnosticHandler {
   uint32_t Count = 0;
 };
 
+/* The pass name of the loop vectorizer's remarks (LoopVectorize.cpp's LV_NAME). */
+constexpr const char *Vectorizer = "loop-vectorize";
+
+/* Catches the loop vectorizer's remarks of a loop it left scalar (missed) and of why
+ * (analysis) into the report, and hands every other diagnostic to the handler it stands in
+ * for. A remark only describes: asking for them changes no code (LLVM's remarks are
+ * observers, as -Rpass-missed is in clang). */
+struct Remarks final : DiagnosticHandler {
+  Remarks(std::unique_ptr<DiagnosticHandler> Outer, LLVMBlazeOpaquePasses &Passes)
+      : Outer(std::move(Outer)), Passes(Passes) {}
+
+  bool handleDiagnostics(const DiagnosticInfo &DI) override {
+    const auto *Remark = dyn_cast<DiagnosticInfoIROptimization>(&DI);
+    if (!Remark || Remark->getPassName() != Vectorizer)
+      return Outer->handleDiagnostics(DI);
+    /* Only the function's own (or its body, before it is built into its wrapper): an import's
+     * body, available_externally until elim-avail-extern, is another function's report. */
+    StringRef Of = Remark->getFunction().getName();
+    if (Of != "blaze.own" && Of != "blaze.inner")
+      return true;
+    uint8_t Kind = 0;
+    switch (Remark->getKind()) {
+    case DK_OptimizationRemarkMissed:
+      Kind = LLVMBlazeFoundMissed;
+      break;
+    case DK_OptimizationRemarkAnalysis:
+    case DK_OptimizationRemarkAnalysisFPCommute:
+    case DK_OptimizationRemarkAnalysisAliasing:
+      Kind = LLVMBlazeFoundAnalysis;
+      break;
+    default:
+      return Outer->handleDiagnostics(DI);
+    }
+    uint32_t Line = Remark->isLocationAvailable() ? Remark->getLocation().getLine() : 0;
+    Held Row{Kind, Line, 0, std::nullopt, Remark->getRemarkName().str(), Remark->getMsg()};
+    if (Kind == LLVMBlazeFoundMissed) {
+      Row.LoopLine = Line;
+      for (size_t At : Passes.Pending)
+        Passes.Report[At].LoopLine = Line;
+      Passes.Pending.clear();
+    } else {
+      Passes.Pending.push_back(Passes.Report.size());
+    }
+    Passes.Report.push_back(std::move(Row));
+    return true;
+  }
+  bool isAnalysisRemarkEnabled(StringRef Pass) const override {
+    return Pass == Vectorizer || Outer->isAnalysisRemarkEnabled(Pass);
+  }
+  bool isMissedOptRemarkEnabled(StringRef Pass) const override {
+    return Pass == Vectorizer || Outer->isMissedOptRemarkEnabled(Pass);
+  }
+  bool isPassedOptRemarkEnabled(StringRef Pass) const override {
+    return Outer->isPassedOptRemarkEnabled(Pass);
+  }
+  bool isAnyRemarkEnabled() const override { return true; }
+
+  std::unique_ptr<DiagnosticHandler> Outer;
+  LLVMBlazeOpaquePasses &Passes;
+};
+
 /* Runs `Manager` over `Mod` with `Kept`'s analyses, counting the mismatches of a profile used
  * into `Passes`, and forgets the analyses after. */
-void runCounted(LLVMBlazeOpaquePasses &Passes, Pipelines &Kept, ModulePassManager &Manager,
-                Module &Mod) {
+void runMeasured(LLVMBlazeOpaquePasses &Passes, Pipelines &Kept, ModulePassManager &Manager,
+                 Module &Mod) {
   bool Using = Passes.Pgo && Passes.Pgo->Action == PGOOptions::IRUse;
   if (!Using) {
     Manager.run(Mod, Kept.Modules);
@@ -289,11 +429,97 @@ void runCounted(LLVMBlazeOpaquePasses &Passes, Pipelines &Kept, ModulePassManage
   auto Counter = std::make_unique<Mismatches>(Context.getDiagnosticHandler(), Passes.MismatchText);
   Mismatches *Counting = Counter.get();
   Context.setDiagnosticHandler(std::move(Counter));
+  /* The functions with no entry count yet, by name (the run may delete one): those that
+   * have one after it were given counts by the profile. A module read back with its counts
+   * is not counted again. */
+  std::vector<std::string> Uncounted;
+  for (Function &F : Mod)
+    if (!F.isDeclaration() && !F.getEntryCount())
+      Uncounted.push_back(F.getName().str());
   Manager.run(Mod, Kept.Modules);
   Kept.forget();
   std::unique_ptr<DiagnosticHandler> Taken = Context.getDiagnosticHandler();
   Passes.Mismatched += Counting->Count;
+  for (const std::string &Name : Uncounted)
+    if (const Function *F = Mod.getFunction(Name); F && !F->isDeclaration() && F->getEntryCount())
+      ++Passes.Applied;
   Context.setDiagnosticHandler(std::move(Counting->Outer));
+}
+
+/* runMeasured, with the vectorizer's remarks caught into the report while `Passes` is
+ * reporting (LLVMBlazeReportStart). */
+void runCounted(LLVMBlazeOpaquePasses &Passes, Pipelines &Kept, ModulePassManager &Manager,
+                Module &Mod) {
+  if (!Passes.Reporting) {
+    runMeasured(Passes, Kept, Manager, Mod);
+    return;
+  }
+  LLVMContext &Context = Mod.getContext();
+  auto Catcher = std::make_unique<Remarks>(Context.getDiagnosticHandler(), Passes);
+  Remarks *Catching = Catcher.get();
+  Context.setDiagnosticHandler(std::move(Catcher));
+  runMeasured(Passes, Kept, Manager, Mod);
+  std::unique_ptr<DiagnosticHandler> Taken = Context.getDiagnosticHandler();
+  Context.setDiagnosticHandler(std::move(Catching->Outer));
+}
+
+/* The line of `Location` in the function's own code: through the calls it was inlined at, to
+ * the outermost. 0 for none. */
+uint32_t lineOf(const DebugLoc &Location) {
+  const DILocation *At = Location.get();
+  if (!At)
+    return 0;
+  /* Bounded by the depth of inlining, which the IR holds finitely; the fuel names the bound. */
+  for (unsigned Fuel = 0; Fuel < 4096 && At->getInlinedAt(); ++Fuel)
+    At = At->getInlinedAt();
+  return At->getLine();
+}
+
+/* The first instruction of `Block` with a debug location's line, 0 for none. */
+uint32_t firstLine(const BasicBlock &Block) {
+  for (const Instruction &I : Block)
+    if (uint32_t Line = lineOf(I.getDebugLoc()))
+      return Line;
+  return 0;
+}
+
+/* Whether `I` is a call that says nothing of the code: a debug or lifetime marker. */
+bool isMarker(const Instruction &I) {
+  if (const auto *Intrinsic = dyn_cast<IntrinsicInst>(&I))
+    return Intrinsic->isAssumeLikeIntrinsic() || Intrinsic->isLifetimeStartOrEnd();
+  return false;
+}
+
+/* The call that starts the panic path at `Exit`, a block a loop branches out to: code that
+ * goes on, block by block with no choice, to `unreachable` (or is an invoke whose normal
+ * destination does). The call is the first of the path (the panic function: `llvm.trap` only
+ * when the path calls nothing else). Null when `Exit` can return. */
+const CallBase *panicPath(const BasicBlock *Exit) {
+  const CallBase *First = nullptr;
+  const BasicBlock *At = Exit;
+  /* A path of more blocks than this is not a panic path blaze's lowering makes. */
+  for (unsigned Fuel = 0; Fuel < 16 && At; ++Fuel) {
+    for (const Instruction &I : *At) {
+      const auto *Call = dyn_cast<CallBase>(&I);
+      if (!Call || isMarker(I))
+        continue;
+      bool Trap = isa<IntrinsicInst>(Call) &&
+                  cast<IntrinsicInst>(Call)->getIntrinsicID() == Intrinsic::trap;
+      if (!First || (isa<IntrinsicInst>(First) && !Trap))
+        First = Call;
+    }
+    const Instruction *End = At->getTerminator();
+    if (!End)
+      return nullptr;
+    if (isa<UnreachableInst>(End))
+      return First;
+    if (const auto *Invoke = dyn_cast<InvokeInst>(End)) {
+      const Instruction *Then = Invoke->getNormalDest()->getTerminator();
+      return Then && isa<UnreachableInst>(Then) ? Invoke : nullptr;
+    }
+    At = At->getSingleSuccessor();
+  }
+  return nullptr;
 }
 
 /* The pipelines of `Passes` for `SLPVectorization`, made for the context of `Mod` the first
@@ -468,6 +694,13 @@ uint32_t LLVMBlazeTakeMismatched(LLVMBlazeOpaquePasses *Passes) {
   return Mismatched;
 }
 
+/* How many functions the profile the passes use gave counts to since this was last asked. */
+uint32_t LLVMBlazeTakeApplied(LLVMBlazeOpaquePasses *Passes) {
+  uint32_t Applied = Passes->Applied;
+  Passes->Applied = 0;
+  return Applied;
+}
+
 /* The indexed profile of IR instrumentation with the `Count` records `Records`, as
  * llvm-profdata merge writes it, into `*Out`, which the caller disposes of. */
 LLVMErrorRef LLVMBlazeWriteProfile(const LLVMBlazeProfileRecord *Records, size_t Count,
@@ -489,6 +722,102 @@ LLVMErrorRef LLVMBlazeWriteProfile(const LLVMBlazeProfileRecord *Records, size_t
     return wrap(std::move(Failed));
   *Out = wrap(Writer.writeBuffer().release());
   return nullptr;
+}
+
+/* Starts a report: what was kept is let go, and the runs from now on catch the loop
+ * vectorizer's remarks until LLVMBlazeReportStop. */
+void LLVMBlazeReportStart(LLVMBlazeOpaquePasses *Passes) {
+  Passes->Report.clear();
+  Passes->Pending.clear();
+  Passes->Rows.clear();
+  Passes->Reporting = true;
+}
+
+/* Ends the report: the runs from now on catch no remarks, and what was kept is let go. */
+void LLVMBlazeReportStop(LLVMBlazeOpaquePasses *Passes) {
+  Passes->Reporting = false;
+  Passes->Report.clear();
+  Passes->Pending.clear();
+  Passes->Rows.clear();
+}
+
+/* Adds to the report what `Fn`'s optimized code still does inside its loops: each branch out
+ * of a loop to a panic path (panicPath), once per loop and path, placed at the path's call,
+ * with the innermost loop it leaves. Then gives every finding its loop's heat: the loop
+ * header's profile count, hot or cold as the module's profile summary says (none for a
+ * module built without a profile). The order is the function's blocks' and their
+ * successors': deterministic for one module. */
+void LLVMBlazeReportKept(LLVMBlazeOpaquePasses *Passes, LLVMValueRef Fn) {
+  Function &F = *unwrap<Function>(Fn);
+  if (F.isDeclaration())
+    return;
+  DominatorTree Dominators(F);
+  LoopInfo Loops(Dominators);
+  BranchProbabilityInfo Probabilities(F, Loops);
+  BlockFrequencyInfo Frequencies(F, Probabilities, Loops);
+  ProfileSummaryInfo Summary(*F.getParent());
+  /* Each loop's header count, by both lines a loop is placed at: its start (Loop::getStartLoc,
+   * as the vectorizer places its remarks) and its header's first. */
+  std::map<uint32_t, std::optional<uint64_t>> Counts;
+  for (const Loop *L : Loops.getLoopsInPreorder()) {
+    std::optional<uint64_t> Count = Frequencies.getBlockProfileCount(L->getHeader());
+    for (uint32_t Line : {lineOf(L->getStartLoc()), firstLine(*L->getHeader())})
+      if (Line)
+        Counts.try_emplace(Line, Count);
+  }
+  std::vector<std::pair<const BasicBlock *, const Loop *>> Seen;
+  for (const BasicBlock &Block : F) {
+    const Loop *L = Loops.getLoopFor(&Block);
+    if (!L)
+      continue;
+    for (const BasicBlock *Exit : successors(&Block)) {
+      if (L->contains(Exit))
+        continue;
+      const CallBase *Call = panicPath(Exit);
+      if (!Call)
+        continue;
+      std::pair<const BasicBlock *, const Loop *> Key{Exit, L};
+      if (std::find(Seen.begin(), Seen.end(), Key) != Seen.end())
+        continue;
+      Seen.push_back(Key);
+      uint32_t Line = lineOf(Call->getDebugLoc());
+      if (!Line)
+        Line = lineOf(Block.getTerminator()->getDebugLoc());
+      uint32_t LoopLine = lineOf(L->getStartLoc());
+      if (!LoopLine)
+        LoopLine = firstLine(*L->getHeader());
+      const Function *Callee = Call->getCalledFunction();
+      std::string Name = Callee ? Callee->getName().str() : "";
+      Passes->Report.push_back(Held{LLVMBlazeFoundKept, Line, LoopLine,
+                                    Frequencies.getBlockProfileCount(L->getHeader()),
+                                    std::move(Name), ""});
+    }
+  }
+  for (Held &Row : Passes->Report) {
+    if (Row.Kind == LLVMBlazeFoundKept)
+      continue;
+    auto Found = Counts.find(Row.LoopLine);
+    Row.Count = Found == Counts.end() ? std::nullopt : Found->second;
+  }
+  bool Profiled = Summary.hasProfileSummary();
+  Passes->Rows.clear();
+  for (const Held &Row : Passes->Report) {
+    uint8_t Heat = LLVMBlazeHeatUnprofiled;
+    if (Profiled)
+      Heat = !Row.Count                       ? LLVMBlazeHeatUncounted
+             : Summary.isHotCount(*Row.Count) ? LLVMBlazeHeatHot
+                                              : LLVMBlazeHeatCold;
+    Passes->Rows.push_back(LLVMBlazeReportRow{
+        Row.Kind, Heat, Row.Line, Row.LoopLine, Row.Count.value_or(0), Row.Name.data(),
+        Row.Name.size(), Row.Message.data(), Row.Message.size()});
+  }
+}
+
+/* The report's findings as LLVMBlazeReportKept last made them, into `*Out`: live until the
+ * next LLVMBlazeReport* call on `Passes`. Returns how many. */
+size_t LLVMBlazeReportRows(LLVMBlazeOpaquePasses *Passes, const LLVMBlazeReportRow **Out) {
+  *Out = Passes->Rows.data();
+  return Passes->Rows.size();
 }
 
 } // extern "C"

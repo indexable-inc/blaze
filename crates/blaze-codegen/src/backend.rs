@@ -78,6 +78,11 @@ pub struct Described<I, S> {
     /// arguments. `Err` names why its item's could not be hashed; only a test binary's table
     /// needs it.
     pub bound: Result<ContentId, String>,
+    /// Whether it runs only when something has gone wrong, so a full link places it after
+    /// every other function ([`Built::cold`](crate::driver::Built::cold)): `#[cold]`, the
+    /// panic machinery, a diverging `#[track_caller]` function, a closure of one of those.
+    /// A profile that saw it run wins (docs/v2/plan/lanes/layout/layout.md).
+    pub cold: bool,
 }
 
 /// What the front end says of a static.
@@ -87,7 +92,13 @@ pub struct DescribedStatic<I, S> {
     /// Which instance of the item: a generic's thread-local or a promoted constant's owner;
     /// [`ContentId::default`] for a plain static.
     pub instance: ContentId,
-    /// The content ID of its evaluated value and its layout: the key of its bytes.
+    /// The content ID of its evaluated value and its layout: the key of its bytes. Its
+    /// definition's store key is made of it ([`crate::driver`]'s static definition), so it must
+    /// cover everything the compiled static is made of but its flags, section and how many
+    /// references of which kind: its alignment, how it is initialized and its data, its
+    /// relocations by place (each one's offset, addend and the place it resolves), and
+    /// what its externs are imported as. A value that leaves one out lets two statics of other
+    /// bytes share one key (rule 18).
     pub value: ContentId,
     /// `static mut`, or a type with interior mutability.
     pub mutable: bool,
@@ -96,7 +107,47 @@ pub struct DescribedStatic<I, S> {
     pub section: Option<String>,
     pub origin: Origin,
     pub symbol: Option<String>,
+    /// Its path, as errors name it (`krate::module::NAME`).
+    pub name: String,
     pub refs: Vec<FrontRef<I, S>>,
+}
+
+/// Which body a function instance is of, as the build's walk counts instances against the
+/// recursion limit ([`Frontend::counted`]): rustc's collector counts per `DefId`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Instantiates {
+    /// The body: equal for two instances of one body (a function and its vtable shim are one,
+    /// as they are one `DefId`; all drop glue is one), and only then.
+    pub body: ContentId,
+    /// Drop glue, which rustc counts at a quarter (its `LangItem::DropGlue` margin): a nested
+    /// type gives it a chain of instances as deep as the type.
+    pub drop_glue: bool,
+}
+
+/// A crate's `#![recursion_limit]`, and which crate's it is.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Limit {
+    /// The crate, by an identity that is equal for one crate and only then (never persisted).
+    pub krate: ContentId,
+    pub value: u32,
+}
+
+/// What the build's walk reads of a function instance for rustc's recursion limit
+/// (`driver/recursion.rs`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Counted {
+    /// What it is an instance of: `None` for one the limit does not count (an `asm!` function,
+    /// one of the allocator shim's, the C `main` that runs the program's `main`), as rustc's
+    /// collector counts no such item.
+    pub body: Option<Instantiates>,
+    /// The limit of the crate it is built for, which holds a path it heads: `None` for one of
+    /// no crate, past which each function heads a path of its own.
+    pub limit: Option<Limit>,
+    /// It is collected in its own crate's build, never in a crate that uses it: a function
+    /// with no type or const arguments that is not `#[inline]` (rustc's
+    /// `should_codegen_locally` is false for it upstream). Reached from another crate's path,
+    /// it heads a path of its own, held to the larger of the two limits.
+    pub heads_own_path: bool,
 }
 
 /// The front end of a build: which instances there are and what they refer to.
@@ -126,6 +177,36 @@ pub trait Frontend: Sync {
     /// its check, or its job's stop flag is set): the build begins no further function and
     /// gives [`stopped`](crate::driver). Asked once per function, so it must be a load or two.
     fn stopped(&self) -> bool;
+
+    /// What the recursion limit reads of each of `functions`, in order ([`Counted`]): one
+    /// entry a function. Another count is the build's error, naming the functions left
+    /// without one.
+    fn counted(&self, functions: &[(Self::Instance, Origin)]) -> Vec<Counted>;
+
+    /// `instance` as an error names it: its path and its arguments, cut short.
+    fn spell(&self, instance: &Self::Instance) -> String;
+
+    /// The error of `instance`, the `depth`th repeat of its body along the walk's path from
+    /// `head`, past `limit`, the `#![recursion_limit]` of the crate `limit_of` is built for:
+    /// naming the function, the instance and that crate.
+    fn past_recursion_limit(
+        &self,
+        instance: &Self::Instance,
+        depth: u32,
+        limit: u32,
+        head: &Self::Instance,
+        limit_of: &Self::Instance,
+    ) -> CodegenError;
+
+    /// Told that the walk has reached everything it was told of ([`Self::reached`]), with
+    /// no error: `true` when what it reached closes facts of the whole program its bodies are
+    /// to be described and built against from now on (a final binary's trait objects, which
+    /// `hir-ty-codegen` devirtualizes calls by), so the walk runs once more and describes
+    /// every instance again; `false` when there are none, or they are those the walk was made
+    /// against. Facts the second walk finds other than the first are the front end's error.
+    fn closed(&self) -> Result<bool, CodegenError> {
+        Ok(false)
+    }
 }
 
 /// What a prepared function compiles to, up to what fills its places: the content ID of its
@@ -192,8 +273,8 @@ impl<E> Copy for Import<'_, E> {}
 /// relocation points. [`laid_out`] keys the compile on it.
 pub fn release_refs(own: &Refs, imported: &[&Refs]) -> (Vec<crate::Target>, Vec<u32>) {
     let total = own.len() + imported.iter().map(|it| it.len()).sum::<usize>();
-    let mut first: blaze_hash::HashMap<ContentId, u32> =
-        blaze_hash::HashMap::with_capacity_and_hasher(total, Default::default());
+    let mut first: blaze_hash::HashMap<ContentId, u32, std::alloc::Global> =
+        blaze_hash::HashMap::with_capacity_in(total, std::alloc::Global);
     // alloc: the release unit's references, kept by its job
     let mut refs = own.to_vec();
     // alloc: the release unit's layout, hashed into its key and dropped

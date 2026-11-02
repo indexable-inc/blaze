@@ -34,6 +34,7 @@
 
 use blaze_codegen::{CompiledFunction, Init, InstanceKey, RelocKind, Static, Target};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::names;
 use blaze_items::{CodeHash, ItemKey};
 
@@ -81,7 +82,7 @@ pub struct Plan {
     ahead: Vec<(InstanceKey, Ahead)>,
     keys: Vec<InstanceKey>,
     items: Vec<ItemKey>,
-    index: HashMap<InstanceKey, LazyId>,
+    index: HashMap<InstanceKey, LazyId, Global>,
     /// Every lazy function's code hash, sorted, with its id.
     by_code: Vec<(CodeHash, LazyId)>,
 }
@@ -90,7 +91,7 @@ impl Plan {
     /// The plan of a build whose walk described `functions` (in the walk's order, which is
     /// deterministic), whose entry is `entry` and whose statics are `statics`.
     pub fn new(functions: &[Function], entry: &[InstanceKey], statics: &[Static]) -> Result<Plan, PlanError> {
-        let mut ahead: HashMap<InstanceKey, Ahead> = HashMap::default();
+        let mut ahead: HashMap<InstanceKey, Ahead, Global> = HashMap::new_in(Global);
         for key in entry {
             if !functions.iter().any(|it| it.key == *key) {
                 return Err(PlanError::Unknown(*key));
@@ -106,7 +107,7 @@ impl Plan {
             ahead: Vec::with_capacity(ahead.len()),
             keys: Vec::with_capacity(functions.len().saturating_sub(ahead.len())),
             items: Vec::with_capacity(functions.len().saturating_sub(ahead.len())),
-            index: HashMap::default(),
+            index: HashMap::new_in(Global),
             by_code: Vec::with_capacity(functions.len().saturating_sub(ahead.len())),
         };
         plan.index.reserve(functions.len());
@@ -118,7 +119,7 @@ impl Plan {
                 continue;
             }
             let next = LazyId(plan.keys.len() as u32);
-            if let std::collections::hash_map::Entry::Vacant(slot) = plan.index.entry(function.key) {
+            if let blaze_hash::hash_map::Entry::Vacant(slot) = plan.index.entry(function.key) {
                 if plan.keys.len() as u64 >= u64::from(MOST_LAZY) {
                     return Err(PlanError::TooMany(functions.len()));
                 }

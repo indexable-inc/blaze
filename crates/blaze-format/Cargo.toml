@@ -15,6 +15,7 @@ doctest = false
 
 [dependencies]
 blaze-ids.workspace = true
+blaze-serde.workspace = true
 serde = { workspace = true, features = ["derive"] }
 zstd.workspace = true
 

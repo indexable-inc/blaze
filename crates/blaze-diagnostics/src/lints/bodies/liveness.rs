@@ -31,6 +31,7 @@ mod flow;
 mod source;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::radix;
 use hir::InFile;
 use hir_def::{
@@ -168,7 +169,7 @@ struct Liveness<'b, 'a, 'db> {
     source: Source,
     infcx: InferCtxt<'db>,
     env: ParamEnv<'db>,
-    analysed: HashMap<Nested<'db>, DeadCaptures>,
+    analysed: HashMap<Nested<'db>, DeadCaptures, Global>,
     constants: Option<Vec<(String, Ty<'db>, String)>>,
     out: Vec<Found>,
     pool: Pool<'db>,
@@ -198,12 +199,15 @@ impl<'db> Liveness<'_, '_, 'db> {
 impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
     fn new(b: &'b BodyCx<'b, 'a, 'db>, pool: Pool<'db>) -> Self {
         let db = b.db();
+        let infcx = DbInterner::new_with(db, b.cx.krate.base()).infer_ctxt().build(TypingMode::non_body_analysis());
+        // With what the body's `for const` loops assume of their binders, as inference had it.
+        let env = hir_ty::comptime_env::body_env(&infcx, b.infer, db.trait_environment(b.owner.generic_def(db)));
         Liveness {
             b,
             source: Source::new(b),
-            infcx: DbInterner::new_with(db, b.cx.krate.base()).infer_ctxt().build(TypingMode::non_body_analysis()),
-            env: db.trait_environment(b.owner.generic_def(db)),
-            analysed: HashMap::default(),
+            infcx,
+            env,
+            analysed: HashMap::new_in(Global),
             constants: None,
             // alloc: empty, pushed to only for a lint found
             out: Vec::new(),
@@ -274,7 +278,7 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
             }
         }
         let closure_local = mir.param_locals.first().copied();
-        let mut capture_locals = HashSet::default();
+        let mut capture_locals = HashSet::new_in(Global);
         for (field, &capture) in captures.iter().enumerate() {
             let field = field as u32;
             let by_ref = capture.is_by_ref();
@@ -311,7 +315,7 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
         let mut lists = std::mem::take(&mut buffers.lists);
         lists.clear();
         lists.resize_with(n, SmallVec::new);
-        let mut slots: HashMap<(Index, Key), usize> = HashMap::default();
+        let mut slots: HashMap<(Index, Key), usize, Global> = HashMap::new_in(Global);
         for sighting in seen.sightings.drain(..) {
             let key = match sighting.kind {
                 Access::Assign => Key::At(sighting.span),
@@ -468,12 +472,12 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
         &self,
         mir: &MirBody<'db>,
         places: &Places<'db>,
-        capture_locals: &HashSet<LocalId>,
+        capture_locals: &HashSet<LocalId, Global>,
         closure_local: Option<LocalId>,
-    ) -> HashMap<(u32, u32), Special> {
+    ) -> HashMap<(u32, u32), Special, Global> {
         let store = self.b.store();
-        let mut specials = HashMap::default();
-        let mut stores: HashMap<MirSpan, SmallVec<[(&StoredPlace, (u32, u32)); 1]>> = HashMap::default();
+        let mut specials = HashMap::new_in(Global);
+        let mut stores: HashMap<MirSpan, SmallVec<[(&StoredPlace, (u32, u32)); 1]>, Global> = HashMap::new_in(Global);
         for (block, data) in mir.basic_blocks.iter() {
             for (index, statement) in data.statements.iter().enumerate() {
                 let key = (raw(block), index as u32);
@@ -834,7 +838,7 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
 struct Report {
     root: ExprId,
     strings: Option<Vec<(Span, String)>>,
-    used: Option<HashSet<BindingId>>,
+    used: Option<HashSet<BindingId, Global>>,
 }
 
 impl Report {
@@ -843,7 +847,7 @@ impl Report {
         self.strings.get_or_insert_with(|| source::string_literals(b, root))
     }
 
-    fn used(&mut self, b: &BodyCx<'_, '_, '_>) -> &HashSet<BindingId> {
+    fn used(&mut self, b: &BodyCx<'_, '_, '_>) -> &HashSet<BindingId, Global> {
         let root = self.root;
         self.used.get_or_insert_with(|| source::used_in_source(b, root))
     }
@@ -887,8 +891,8 @@ fn raw(block: BasicBlockId) -> u32 {
 }
 
 /// The expressions of `root` and those in it.
-fn expr_tree(store: &hir_def::expr_store::ExpressionStore, root: ExprId) -> HashSet<ExprId> {
-    let mut found = HashSet::default();
+fn expr_tree(store: &hir_def::expr_store::ExpressionStore, root: ExprId) -> HashSet<ExprId, Global> {
+    let mut found = HashSet::new_in(Global);
     // alloc: only for a binding no point of the body reads, which is reported
     let mut stack = vec![root];
     while let Some(expr) = stack.pop() {
@@ -900,8 +904,8 @@ fn expr_tree(store: &hir_def::expr_store::ExpressionStore, root: ExprId) -> Hash
 }
 
 /// The patterns of `root` and those in it.
-fn pat_tree(store: &hir_def::expr_store::ExpressionStore, root: PatId) -> HashSet<PatId> {
-    let mut found = HashSet::default();
+fn pat_tree(store: &hir_def::expr_store::ExpressionStore, root: PatId) -> HashSet<PatId, Global> {
+    let mut found = HashSet::new_in(Global);
     // alloc: only for a binding no point of the body reads, which is reported
     let mut stack = vec![root];
     while let Some(pat) = stack.pop() {

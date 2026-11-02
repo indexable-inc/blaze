@@ -15,6 +15,7 @@ use std::{
 use base_db::{Db, EditionedFileId};
 use blaze_diagnostics::model;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use cfg::{CfgAtom, CfgDiff, CfgExpr, CfgOptions};
 use hir::{HasAttrs as _, HirFileId, InFile};
 use hir_def::{
@@ -39,6 +40,7 @@ use crate::{
     famous::{self, Famous},
     level::{CommandLine, Levels, Lint, Set, Source, Spec, Target},
     lints::{self, Implemented, On},
+    profile,
     query::{
         self, BodyAt, Expect, FileNames, Finding, Found as FoundLint, LintSet, Lints, ModuleFile,
         Named, Place, Plan,
@@ -71,7 +73,7 @@ pub type NameOf<'a> = &'a dyn Fn(base_db::FileId) -> Option<String>;
 /// The diagnostics of the lints of `krate`, in the order rustc would emit them. A file of the
 /// crate, or of a span a lint gives, that `name_of` does not name is the error: its lints are
 /// never left out.
-pub fn check(db: &Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -> Result<Vec<Found>, diag::Unnamed> {
+pub fn check(db: &Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -> Result<Vec<Found>, diag::CheckError> {
     hir::attach_db(db, || {
         let levels = Levels::new(&setup.command_line);
         let mut driver = Driver::new(db, krate, setup, name_of, lints::command_line_on(&levels));
@@ -102,6 +104,9 @@ struct Pending {
     /// Where its level is asked for.
     at: TextRange,
     diagnostic: Diag,
+    /// How the profile has the function whose body it was found in, when the profile shows
+    /// that function hot: `blaze::profile_hot` gives the function's perf lints its level.
+    hot: Option<profile::Hit>,
     /// The order rustc emits it in: by pass (pre-expansion over the root file, early, late,
     /// after late), then by where the node it was found at is in the walk over the crate,
     /// outer nodes first.
@@ -127,10 +132,12 @@ struct Driver<'q> {
     name_of: NameOf<'q>,
     command_line: On,
     files: Vec<File<'q>>,
-    by_id: HashMap<EditionedFileId, usize>,
-    sets: HashMap<On, LintSet>,
+    by_id: HashMap<EditionedFileId, usize, Global>,
+    sets: HashMap<On, LintSet, Global>,
     pending: Vec<Pending>,
     expectations: Vec<Expectation>,
+    /// The crate's functions as the configured profile has them ([`crate::profile`]).
+    hits: Option<&'q profile::Hits>,
 }
 
 impl<'q> Driver<'q> {
@@ -149,23 +156,28 @@ impl<'q> Driver<'q> {
             it.apply_diff(CfgDiff::new(Vec::new(), vec![test]));
             it
         });
+        let hits = setup.conf.profile.as_ref().map(|loaded| {
+            // clone: the profile's settings and a refcount, once per crate
+            query::profile_hits(db, krate.base(), query::ProfileKey::new(db, loaded.clone()))
+        });
         Driver {
             db,
             krate,
+            hits,
             conf: &setup.conf,
             cfg,
             without_test,
             name_of,
             command_line,
             files: Vec::new(),
-            by_id: HashMap::default(),
-            sets: HashMap::default(),
+            by_id: HashMap::new_in(Global),
+            sets: HashMap::new_in(Global),
             pending: Vec::new(),
             expectations: Vec::new(),
         }
     }
 
-    fn run(&mut self) -> Result<(), diag::Unnamed> {
+    fn run(&mut self) -> Result<(), diag::CheckError> {
         let db = self.db;
         let base = self.krate.base();
         let plan = query::lint_plan(db, base);
@@ -187,9 +199,9 @@ impl<'q> Driver<'q> {
                             .names
                             .iter()
                             .filter(|it| it.owner.contains_range(range))
-                            .fold(0, |on, it| on | it.lints)
+                            .fold(On::EMPTY, |on, it| on | it.lints)
                 }
-                None => 0,
+                None => On::EMPTY,
             };
             self.by_id.insert(file, self.files.len());
             self.files.push(File { id: file, name, declared: parent_of, place, names, around });
@@ -198,12 +210,12 @@ impl<'q> Driver<'q> {
             let file = &self.files[at];
             let id = file.id;
             let on = self.command_line | file.around | file.names.on;
-            if on == 0 {
+            if on.is_empty() {
                 continue;
             }
             let set = self.set(on);
             let lints = query::item_lints(db, id, base, set);
-            self.take(at, 0, lints)?;
+            self.take(at, 0, lints, None)?;
         }
         for &body in plan.bodies.iter() {
             self.lint_body(body)?;
@@ -211,26 +223,35 @@ impl<'q> Driver<'q> {
         Ok(())
     }
 
-    fn lint_body(&mut self, BodyAt { def, file, offset, item }: BodyAt) -> Result<(), diag::Unnamed> {
+    fn lint_body(&mut self, BodyAt { def, file, offset, item }: BodyAt) -> Result<(), diag::CheckError> {
         let db = self.db;
         let Some(&at) = self.by_id.get(&file) else { return Ok(()) };
         let named = &self.files[at];
         let mut on = self.command_line | named.around;
         // A name can only add lints when it names one not on already.
-        if named.names.on & !on != 0 {
+        if !named.names.on.without(on).is_empty() {
             on |= named
                 .names
                 .names
                 .iter()
                 .filter(|it| it.owner.contains_range(item) || item.contains_range(it.at))
-                .fold(0, |on, it| on | it.lints);
+                .fold(On::EMPTY, |on, it| on | it.lints);
         }
-        if on == 0 {
+        // A function the profile shows hot gets its perf lints run, at `blaze::profile_hot`'s
+        // level where nothing else sets theirs ([`Driver::finish`]).
+        let hot = match (self.hits, def) {
+            (Some(hits), DefWithBodyId::FunctionId(f)) => hits.of(f).filter(|it| it.hot),
+            _ => None,
+        };
+        if hot.is_some() {
+            on |= blaze::PROFILE_RAISES.iter().fold(On::EMPTY, |on, it| on | it.bit());
+        }
+        if on.is_empty() {
             return Ok(());
         }
         let set = self.set(on);
         let lints = query::body_lints(db, def, set);
-        self.take(at, u32::from(offset), lints)
+        self.take(at, u32::from(offset), lints, hot)
     }
 
     /// Where rustc's walks over the crate come to file `at`: at the `mod` item declaring it,
@@ -251,8 +272,12 @@ impl<'q> Driver<'q> {
     }
 
     /// Takes what a query found in the file `at`, moving its ranges by `offset`.
-    fn take(&mut self, at: usize, offset: u32, lints: &Lints) -> Result<(), diag::Unnamed> {
+    fn take(&mut self, at: usize, offset: u32, lints: &Lints, hot: Option<profile::Hit>) -> Result<(), diag::CheckError> {
         let file = &self.files[at];
+        if let Some(path) = &lints.not_known {
+            // clone: an error's names, once
+            return Err(diag::CheckError::NotKnown { file: file.name.clone(), path: path.clone() });
+        }
         let moved = |range: TextRange| range + TextSize::new(offset);
         for Finding { lint, at: found_at, place, diagnostic } in &lints.findings {
             // clone: a finding's diagnostic, out of the query's value, to be given its level
@@ -287,6 +312,7 @@ impl<'q> Driver<'q> {
                 file: at,
                 at: moved(*found_at),
                 diagnostic,
+                hot,
                 order: (phase, key),
             });
         }
@@ -352,9 +378,9 @@ impl<'q> Driver<'q> {
         let mut pending = std::mem::take(&mut self.pending);
         pending.sort_by(|a, b| a.order.cmp(&b.order));
         let mut found = Vec::new();
-        let mut fulfilled: HashSet<Span> = HashSet::default();
-        let mut sets_of: HashMap<(usize, TextRange), (Vec<Set>, bool)> = HashMap::default();
-        for Pending { lint, file, at, mut diagnostic, .. } in pending {
+        let mut fulfilled: HashSet<Span, Global> = HashSet::new_in(Global);
+        let mut sets_of: HashMap<(usize, TextRange), (Vec<Set>, bool), Global> = HashMap::new_in(Global);
+        for Pending { lint, file, at, mut diagnostic, hot, .. } in pending {
             let (sets, test_only) =
                 sets_of.entry((file, at)).or_insert_with(|| self.sets_at(file, at)).clone();
             // blaze's own lints add their link after their own help, as clippy's order is.
@@ -362,7 +388,30 @@ impl<'q> Driver<'q> {
                 FoundLint::Clippy(lint) => (Lint::Clippy(lint.info()), Some(lint.info().docs_url())),
                 FoundLint::Blaze(lint) => (Lint::Blaze(lint), None),
             };
-            let spec = levels.of(asked, &sets);
+            let mut spec = levels.of(asked, &sets);
+            // A perf lint in a function the profile shows hot, at no level set for it: at
+            // `blaze::profile_hot`'s, when its own is `allow`; with a note saying so, when not.
+            let hot = match (hot, lint) {
+                (Some(hit), FoundLint::Blaze(it)) if blaze::PROFILE_NOTES.contains(&it) && spec.source == Source::Default => {
+                    Some(hit)
+                }
+                _ => None,
+            };
+            let mut hot_note = None;
+            if let Some(hit) = hot
+                && let Some(loaded) = self.conf.profile.as_ref()
+            {
+                let file = loaded.file_name();
+                let percent = hit.percent();
+                if spec.level == Level::Allow {
+                    let by = levels.of(Lint::Blaze(blaze::Lint::ProfileHot), &sets);
+                    if !matches!(by.level, Level::Allow | Level::Expect) {
+                        spec = Spec { level: by.level, source: Source::Profile { file, percent } };
+                    }
+                } else {
+                    hot_note = Some(format!("this function is hot per profile `{file}`: {percent} of its counts"));
+                }
+            }
             match spec.level {
                 Level::Allow => continue,
                 Level::Expect => {
@@ -378,6 +427,9 @@ impl<'q> Driver<'q> {
                 diagnostic.help(format!("for further information visit {docs}"));
             }
             crate::level::explain(&mut diagnostic, asked, &spec);
+            if let Some(note) = hot_note {
+                diagnostic.note(note);
+            }
             if diagnostic
                 .span
                 .primary
@@ -407,7 +459,40 @@ impl<'q> Driver<'q> {
             crate::level::explain(&mut diagnostic, unfulfilled, &spec);
             found.push(Found { diagnostic, test_only });
         }
+        found.extend(self.coverage(levels));
         found
+    }
+
+    /// A note of the profile's hot names in the crate's path that no function of the crate
+    /// matched, when there are any and `blaze::profile_hot` is on: what a name the mapping
+    /// misses looks like, so it is seen rather than read as cold.
+    fn coverage(&self, levels: &Levels) -> Option<Found> {
+        let hits = self.hits?;
+        let loaded = self.conf.profile.as_ref()?;
+        if hits.unmatched_hot.is_empty()
+            || matches!(levels.of(Lint::Blaze(blaze::Lint::ProfileHot), &[]).level, Level::Allow | Level::Expect)
+        {
+            return None;
+        }
+        let name = self.krate.display_name(self.db).map_or_else(String::new, |it| it.to_string());
+        let shown: Vec<String> =
+            hits.unmatched_hot.iter().map(|(key, hit)| format!("`{key}` ({})", hit.percent())).collect();
+        let message = format!(
+            "profile `{}` matched {} of the {} functions of `{name}`; its hot names in the crate's path that matched none: {}",
+            loaded.file_name(),
+            hits.matched,
+            hits.functions,
+            shown.join(", ")
+        );
+        let mut diagnostic = Diag::new(model::Level::Note, None, message);
+        if hits.ambiguous > 0 {
+            diagnostic.note(format!(
+                "{} functions of the crate share their profile name with another (impls of one trait or type for different arguments) and are matched to none",
+                hits.ambiguous
+            ));
+        }
+        diagnostic.note(format!("the profile is `{}`, named in {}", loaded.settings.path.display(), loaded.settings.named_in));
+        Some(Found { diagnostic, test_only: false })
     }
 }
 
@@ -417,7 +502,7 @@ pub(crate) fn names_of(db: &Db, file: EditionedFileId) -> FileNames {
     let text = db.file_text(file.file_id(db)).text(db);
     // alloc: the query's value, once per edit of the file
     let mut names = Vec::new();
-    let mut on = 0;
+    let mut on = On::EMPTY;
     let mut root = None;
     lints::names_in(text, |at, lints| {
         let root = *root.get_or_insert_with(|| file.parse(db).root());
@@ -432,7 +517,7 @@ pub(crate) fn names_of(db: &Db, file: EditionedFileId) -> FileNames {
 pub(crate) fn plan_of(db: &Db, krate: base_db::Crate) -> Plan {
     // alloc: the query's value and its worklist, once per crate and edit
     let mut files: Vec<ModuleFile> = Vec::new();
-    let mut seen: HashSet<EditionedFileId> = HashSet::default();
+    let mut seen: HashSet<EditionedFileId, Global> = HashSet::new_in(Global);
     for module in hir::Crate::from(krate).modules(db) {
         let Some(file) = module.definition_source_file_id(db).file_id() else { continue };
         if !seen.insert(file) {
@@ -509,7 +594,7 @@ fn attr_owner(root: ast::Node<'_>, at: TextRange) -> Option<TextRange> {
 
 /// The bodies of the items of `scope`: its functions, consts, statics and enum discriminants,
 /// and those of its traits and impls.
-fn bodies_of(db: &Db, scope: &ItemScope, out: &mut Vec<DefWithBodyId>) {
+pub(crate) fn bodies_of(db: &Db, scope: &ItemScope, out: &mut Vec<DefWithBodyId>) {
     let assoc = |out: &mut Vec<DefWithBodyId>, items: &[(hir::Name, AssocItemId)]| {
         for &(_, item) in items {
             match item {
@@ -667,15 +752,25 @@ struct Walking {
 /// What the items a query walks are, by where they are written.
 #[derive(Default)]
 struct Items {
-    defs: HashMap<Key, ModuleDefId>,
-    impls: HashMap<Key, ImplId>,
+    defs: HashMap<Key, ModuleDefId, Global>,
+    impls: HashMap<Key, ImplId, Global>,
     /// The macro calls of items and statements, and the items an attribute macro is on.
-    calls: HashMap<Key, MacroCallId>,
+    calls: HashMap<Key, MacroCallId, Global>,
     /// The calls of each `#[derive]` of an ADT, in the order of the attributes.
-    derives: HashMap<Key, Vec<Box<[Option<MacroCallId>]>>>,
+    derives: HashMap<Key, Vec<Box<[Option<MacroCallId>]>>, Global>,
 }
 
 type Key = (HirFileId, SyntaxNodePtr);
+
+/// One attribute macro call of those that wrote the item whose body is linted
+/// ([`Cx::attr_calls`]).
+pub(crate) struct AttrCall {
+    /// The builtin attribute macro it calls, if it calls one.
+    pub(crate) builtin: Option<hir_expand::builtin::BuiltinAttrExpander>,
+    /// Its `#[..]` and the `(..)` of its arguments, as written in [`Cx::text`]; `None` when a
+    /// macro wrote it, it is in a `cfg_attr`, or it has no `(..)`.
+    pub(crate) written: Option<(TextRange, TextRange)>,
+}
 
 /// The context a lint is run in: what is linted, the tree walked and where the walk is.
 pub(crate) struct Cx<'q: 't, 't> {
@@ -696,6 +791,8 @@ pub(crate) struct Cx<'q: 't, 't> {
     famous_defs: OnceCell<&'q [Option<hir::ModuleDef>]>,
     /// The crate's [`lints::disallowed::disallowed_defs`], read once per query.
     disallowed: OnceCell<&'q lints::disallowed::Resolved>,
+    /// The first path a lint looked up that [`famous::KNOWN`] does not list.
+    not_known: OnceCell<String>,
     /// The expansions read, with the call of each.
     trees: RefCell<Vec<(&'q FlatTree, MacroCallId)>>,
     walking: Walking,
@@ -728,6 +825,7 @@ impl<'q: 't, 't> Cx<'q, 't> {
             items: OnceCell::new(),
             famous_defs: OnceCell::new(),
             disallowed: OnceCell::new(),
+            not_known: OnceCell::new(),
             trees: RefCell::new(Vec::new()),
             walking: Walking::default(),
             found: Vec::new(),
@@ -736,7 +834,7 @@ impl<'q: 't, 't> Cx<'q, 't> {
     }
 
     fn done(self) -> Lints {
-        Lints { findings: self.found, expects: self.expects }
+        Lints { findings: self.found, expects: self.expects, not_known: self.not_known.into_inner() }
     }
 
     pub(crate) fn db(&self) -> &'q Db {
@@ -759,18 +857,43 @@ impl<'q: 't, 't> Cx<'q, 't> {
     /// that cannot is not run.
     #[inline]
     pub(crate) fn on(&self, lint: Implemented) -> bool {
-        self.on & lint.bit() != 0
+        self.on.intersects(lint.bit())
     }
 
     /// Whether some lint of `lints` is [`Cx::on`].
     #[inline]
     pub(crate) fn on_any(&self, lints: On) -> bool {
-        self.on & lints != 0
+        self.on.intersects(lints)
     }
 
     #[inline]
     pub(crate) fn on_blaze(&self, lint: blaze::Lint) -> bool {
-        self.on & lint.bit() != 0
+        self.on.intersects(lint.bit())
+    }
+
+    /// Whether the crate's root denies or forbids `lint` (`blaze::hot` counts for its lints)
+    /// in its own attributes, `cfg_attr`s expanded: how a lint scoped to hot crates knows one.
+    pub(crate) fn root_denies(&self, lint: blaze::Lint) -> bool {
+        let root = self.krate.root_file_id(self.db).parse(self.db).root();
+        let Some(owner) = ast::AnyHasAttrs::cast(root) else { return false };
+        lint_attrs(self.cfg, owner).iter().any(|it| {
+            matches!(it.level, Level::Deny | Level::Forbid)
+                && matches!(&it.target, Target::Blaze(bits) if bits.intersects(lint.bit()))
+        })
+    }
+
+    /// The lint attribute on `owner` itself that turns `blaze::hot` or one of its lints on
+    /// (any level but `allow` and `expect`), as written: `#[deny(blaze::hot)]`. How code says
+    /// it is hot, for `blaze::stale_hot_marker`.
+    pub(crate) fn marks_hot(&self, owner: ast::AnyHasAttrs<'_>) -> Option<String> {
+        let hot = blaze::HOT.iter().fold(On::EMPTY, |on, it| on | it.bit());
+        lint_attrs(self.cfg, owner)
+            .into_iter()
+            .find(|it| {
+                !matches!(it.level, Level::Allow | Level::Expect)
+                    && matches!(&it.target, Target::Blaze(bits) if bits.intersects(hot))
+            })
+            .map(|it| format!("#[{}({})]", it.level.as_str(), it.name))
     }
 
     /// Where the walk starts: the item of the body linted, or the file.
@@ -819,6 +942,57 @@ impl<'q: 't, 't> Cx<'q, 't> {
         self.walking.call_at
     }
 
+    /// The unstable features the crate's root turns on.
+    pub(crate) fn features(&self) -> &'q hir_def::unstable_features::UnstableFeatures {
+        crate_def_map(self.db, self.krate).features()
+    }
+
+    /// The attribute macro calls that wrote the item whose body is linted, outermost (the first
+    /// written) first, with the item as the file has it: `None` unless every macro between the
+    /// file and the body is an attribute macro (none, or a function-like call or a derive on
+    /// the way, is `None`) and the outermost is written in the file of [`Cx::text`]. Each call is
+    /// the macro name resolution chose for its attribute, through `use`, renames, globs and
+    /// re-exports.
+    pub(crate) fn attr_calls(&self) -> Option<(ast::Node<'t>, Vec<AttrCall>)> {
+        let db = self.db;
+        let mut file = self.def?.erased_ast_id(db).file_id;
+        let mut calls = Vec::new(); // alloc: the few attribute calls on one item, once per body that a macro wrote
+        let mut outermost = None;
+        while let HirFileId::MacroFile(call) = file {
+            let loc = call.loc(db);
+            let MacroCallKind::Attr { ast_id, censored_attr_ids, .. } = &loc.kind else { return None };
+            let builtin = match loc.def.kind {
+                MacroDefKind::BuiltInAttr(_, it) => Some(it),
+                _ => None,
+            };
+            let at = |range: TextRange| match ast_id.file_id {
+                HirFileId::FileId(it) if it == self.base.file && !self.base.relative => Some(range),
+                HirFileId::FileId(_) => None,
+                HirFileId::MacroFile(prev) => self.upmap(prev, range),
+            };
+            let written = self.node_of(*ast_id).and_then(ast::AnyHasAttrs::cast).and_then(|owner| {
+                let (attr, meta) =
+                    censored_attr_ids.invoc_attr().find_attr_range_with_source_view(db, loc.krate, owner);
+                // A `cfg_attr` holds the attribute: its `Attr` is the `cfg_attr`'s.
+                let ast::Meta::TokenTreeMeta(own) = attr.meta()? else { return None };
+                if own.syntax() != meta.syntax() {
+                    return None;
+                }
+                let args = own.token_tree()?;
+                Some((at(attr.syntax().text_range())?, at(args.syntax().text_range())?))
+            });
+            calls.push(AttrCall { builtin, written });
+            outermost = Some(call);
+            file = ast_id.file_id;
+        }
+        if file.file_id() != Some(self.base.file) {
+            return None;
+        }
+        let item = self.call_node(outermost?)?;
+        calls.reverse();
+        Some((item, calls))
+    }
+
     /// Whether the walk is in the arguments of a function-like macro call, as `vec!` is in
     /// `assert!(f(vec![]))`.
     pub(crate) fn in_bang_call(&self) -> bool {
@@ -852,6 +1026,11 @@ impl<'q: 't, 't> Cx<'q, 't> {
             either::Either::Right(id) => self.view_of(id)?.name()?,
         };
         Some(intern::Symbol::intern(name.text()))
+    }
+
+    /// The crate that defines the macro `call` calls.
+    pub(crate) fn macro_crate(&self, call: ast::MacroCall<'t>) -> Option<hir::Crate> {
+        Some(hir::Crate::from(self.call_id(call)?.loc(self.db).def.krate))
     }
 
     /// The root of what `call` expands to.
@@ -954,6 +1133,26 @@ impl<'q: 't, 't> Cx<'q, 't> {
         self.sema().resolve_path(path)
     }
 
+    /// What `path`, of the file's items, names in each namespace, as a `use` imports them; `None`
+    /// in a body, whose analysis resolves a path to one item.
+    pub(crate) fn path_per_ns(&self, path: ast::Path<'t>) -> Option<hir::PathResolutionPerNs<'q>> {
+        if self.def.is_some() {
+            return None;
+        }
+        let path = ast::Path::cast(self.in_sema(path.syntax())?)?;
+        self.sema().resolve_path_per_ns(path)
+    }
+
+    /// The macro each path of the `#[derive(..)]` `attr`, of the file's items, resolves to, in
+    /// the order [`derive_paths`] reads them; empty in a body.
+    pub(crate) fn derive_macros(&self, attr: ast::Attr<'t>) -> Vec<Option<hir::Macro>> {
+        if self.def.is_some() {
+            return Vec::new();
+        }
+        let Some(attr) = self.in_sema(attr.syntax()).and_then(ast::Attr::cast) else { return Vec::new() };
+        attr.meta().and_then(|meta| self.sema().resolve_derive_macro(meta)).unwrap_or_default()
+    }
+
     pub(crate) fn pat_ty(&self, pat: ast::Pat<'t>) -> Option<hir::Type<'q>> {
         Some(self.analysis()?.type_of_pat(self.ptr::<syntax::ast::Pat>(pat))?.original)
     }
@@ -1016,8 +1215,6 @@ impl<'q: 't, 't> Cx<'q, 't> {
         }
     }
 
-    /// The item at `path` in the crate `path[0]` (`core`, `alloc`, `std`): one perfect hash of
-    /// the path into what the crate resolved of [`famous::KNOWN`].
     /// The `disallowed-*` entries of the crate's configuration, resolved.
     pub(crate) fn disallowed(&self) -> &'q lints::disallowed::Resolved {
         self.disallowed.get_or_init(|| {
@@ -1027,14 +1224,19 @@ impl<'q: 't, 't> Cx<'q, 't> {
         })
     }
 
+    /// The item at `path` in the crate `path[0]` (`core`, `alloc`, `std`): one perfect hash of
+    /// the path into what the crate resolved of [`famous::KNOWN`]. A path the table does not
+    /// list is a lint's bug: `None`, and the query's [`Lints::not_known`], which fails the
+    /// crate's check naming the path.
     pub(crate) fn std_def(&self, path: &[&str]) -> Option<hir::ModuleDef> {
         let krate = path.first()?;
         if !matches!(*krate, "core" | "alloc" | "std") {
             return None;
         }
         let Some(at) = famous::known(path) else {
-            // alloc: the message of a bug, a lint looking up a path left out of the table
-            panic!("`{}` is not in `famous::KNOWN`", path.join(":"));
+            // alloc: the path of a bug, a lint looking up a path left out of the table
+            self.not_known.get_or_init(|| path.join("::"));
+            return None;
         };
         let defs = self.famous_defs.get_or_init(|| &**query::famous_defs(self.db, self.krate));
         defs[at]
@@ -1861,7 +2063,7 @@ fn lint_list(tt: ast::TokenTree<'_>) -> (Vec<(String, TextRange)>, Option<String
 }
 
 /// The paths of a `#[derive(...)]`, in order, with where each is.
-fn derive_paths(attr: ast::Attr<'_>) -> Vec<(TextRange, String)> {
+pub(crate) fn derive_paths(attr: ast::Attr<'_>) -> Vec<(TextRange, String)> {
     let Some(tt) = attr.meta().and_then(|it| match it {
         ast::Meta::TokenTreeMeta(it) => it.token_tree(),
         _ => None,

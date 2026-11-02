@@ -8,10 +8,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::LazyLock;
-
 use base_db::{Crate, Db, FileId};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_query::db::FromId as _;
 use hir_def::{CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup};
 use rustc_type_ir::{
@@ -33,7 +32,7 @@ use super::{Instance, InstanceDef};
 /// The crates the name of an instance mentions.
 struct Mentions<'db> {
     db: &'db Db,
-    crates: HashSet<Crate>,
+    crates: HashSet<Crate, Global>,
     /// The bodies it has the code of or mentions a type of.
     bodies: SmallVec<[DefWithBodyId; 4]>,
     /// Of those, the ones it mentions a coroutine of, whose layout is of the whole body.
@@ -50,7 +49,7 @@ struct Mentions<'db> {
     opaque: bool,
     /// The types looked into so far. The type of a future holds those of the futures it
     /// awaits, each of which holds its own, so the same few are reached along very many ways.
-    seen: HashSet<Ty<'db>>,
+    seen: HashSet<Ty<'db>, Global>,
 }
 
 impl<'db> Mentions<'db> {
@@ -61,14 +60,14 @@ impl<'db> Mentions<'db> {
     fn looking(db: &'db Db, instance: &Instance, reveal: bool) -> Mentions<'db> {
         let mut mentions = Mentions {
             db,
-            crates: HashSet::default(),
+            crates: HashSet::new_in(Global),
             bodies: SmallVec::new(),
             coroutines: SmallVec::new(),
             reveal,
             revealing: 0,
             hidden: SmallVec::new(),
             opaque: false,
-            seen: HashSet::default(),
+            seen: HashSet::new_in(Global),
         };
         match instance.def {
             InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => {
@@ -211,10 +210,6 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
     }
 }
 
-/// `BLAZE_NO_HOME`: every instance is compiled in the environment of the function that asks
-/// for it. Read once, as [`Homes::home`] is asked for each instance a function calls.
-static NO_HOME: LazyLock<bool> = LazyLock::new(|| std::env::var_os("BLAZE_NO_HOME").is_some());
-
 /// What `krate` can see: itself and the crates whose impls it knows ([`loaded_crates`]),
 /// sorted to be probed by binary search. One memo for every task that asks.
 #[blaze_query::tracked(returns(deref))]
@@ -240,8 +235,7 @@ impl Homes {
         instance: &Instance,
         asked: &StoredParamEnvAndCrate,
     ) -> StoredParamEnvAndCrate {
-        if *NO_HOME || !asked.param_env(db).clauses().is_empty()
-        {
+        if !asked.param_env(db).clauses().is_empty() {
             // clone: a refcount of the interned clauses; callers own the environment they get
             return asked.clone();
         }

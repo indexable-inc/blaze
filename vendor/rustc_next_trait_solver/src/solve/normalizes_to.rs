@@ -1107,6 +1107,49 @@ where
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
         unreachable!("try_as_dyn helper trait doesn't have assoc types")
     }
+
+    /// blaze: `<VariantRepresentingType<E, v> as Variant<E>>::View` is `VariantOf<E, v>`.
+    /// The reflection traits' other items are constants, filled by const eval through the
+    /// builtin impl, never normalized here; a generic `<V as Variant<E>>::View` is rigid
+    /// (its trait goal holds by the environment).
+    fn consider_builtin_reflect_candidate(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+        item: SolverTraitLangItem,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        let cx = ecx.cx();
+        if item != SolverTraitLangItem::ReflectVariant {
+            return Err(NoSolution.into());
+        }
+        let def_id = goal.predicate.alias.expect_projection_ty_def_id();
+        if !cx.is_projection_lang_item(def_id, SolverProjectionLangItem::ReflectVariantView) {
+            return Err(NoSolution.into());
+        }
+        let self_ty = goal.predicate.self_ty();
+        let Some(view) = cx.reflect_variant_view(self_ty) else {
+            return Err(NoSolution.into());
+        };
+        let ty::Adt(_, view_args) = view.kind() else {
+            unreachable!("a variant view is an ADT: {view:?}")
+        };
+        let base = goal.predicate.alias.args.type_at(1);
+        ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
+            ecx.eq(goal.param_env, base, view_args.type_at(0))?;
+            ecx.instantiate_normalizes_to_term(goal, view.into())?;
+            ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+        })
+    }
+
+    /// blaze: the markers of `#[blaze::arbitrary_ints]` have no associated types. Their
+    /// associated constants (`ArbitraryInt::BITS`, `MIN`, `MAX`) are defaults, read by const
+    /// eval through the builtin impl, never normalized here.
+    fn consider_builtin_int_marker_candidate(
+        _ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+        _marker: structural_traits::IntMarker,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        panic!("the `#[blaze::arbitrary_ints]` markers have no associated types: {:?}", goal)
+    }
 }
 
 impl<D, I> EvalCtxt<'_, D>

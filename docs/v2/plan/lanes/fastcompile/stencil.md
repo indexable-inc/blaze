@@ -273,6 +273,24 @@ IR and flags:
   records the call site with its exception handlers, and stores results to slots (for
   `try_call`, the pseudo slots of `TryCallRet`). At a landing pad it stores the exception
   payload (`rax`/`rdx`, `x0`/`x1`) into the pseudo slots of `TryCallExn`.
+- **Tail calls**: `return_call` and `return_call_indirect` from a `tail` function to one, as
+  Cranelift writes them (the incoming argument area grown, popped and the return address
+  moved), and also, past Cranelift (whose verifier takes them only in `tail`), between two
+  functions of one System V, Apple AArch64 or Windows convention: Rust's `become` as the IR
+  builder lowers it. There the caller's caller reserved the stack arguments and pops them, so
+  the callee's must fit in the caller's own (where its last stack argument ends, unrounded,
+  Windows' shadow space counted), its returns and convention must be the caller's, and a
+  StructReturn pointer must be the caller's own. The glue writes the stack arguments over the
+  caller's own (every source is a slot or a constant, since the prologue copied the incoming
+  stack arguments to slots, so swapped arguments need no ordering), loads the register
+  arguments and the callee (`r11`, `x17`), restores the saved registers and frame as a
+  `return` does, and jumps; a StructArgument (x86-64) is passed only as the caller's own at
+  the same place, left untouched. What it can't do so (more stack arguments, another
+  convention or returns, another StructReturn pointer, a StructArgument that would need a
+  copy, a Windows 16-byte value passed by pointer to a copy) is an error naming the
+  `return_call` (`arch::caller_pops_tail_call`, `x64/frame.rs`'s `native_tail_call`). The
+  jump is an epilogue: the rows say the CFA from `rsp` after the frame is popped and restore
+  the body's state after the jump, as at a `ret`.
 - **Addresses**: `func_addr`, `symbol_value` and `tls_value` (Cranelift 0.136 has no
   `global_value`), written as Cranelift writes them for `is_pic` and `tls_model` (GOT loads for
   what is not colocated, `__tls_get_addr`/TLS descriptors/`tlv` thunks/`_tls_index`).

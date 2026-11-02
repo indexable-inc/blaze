@@ -2,7 +2,7 @@
 //! `*_view` lookups (`AstPtr::of(view)`, no handle made) and then answers as the handle method
 //! does, from the same inference result and resolver.
 
-use std::{cell::OnceCell, iter::once};
+use std::iter::once;
 
 use base_db::Db;
 use either::Either;
@@ -203,7 +203,7 @@ impl<'db> SourceAnalyzer<'db> {
             }
             _ => LifetimeElisionKind::Infer,
         };
-        let generics = OnceCell::new();
+        let generics = hir_ty::generics::generics(db, generic_def);
         let ty = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
             TyLoweringContext::new(
                 db,
@@ -482,6 +482,7 @@ impl<'db> SourceAnalyzer<'db> {
         let env = self.trait_environment(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
 
         let mut container = Either::Right(container.ty.skip_binder());
         for field_name in offset_of_expr.fields() {

@@ -12,11 +12,12 @@ use blaze_codegen::{
 };
 use blaze_format::cursor::Put;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, ItemKey, key::Resolved};
 use hir_def::{
-    AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ItemContainerId, Lookup,
-    ModuleDefId,
+    AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, HasModule as _,
+    ItemContainerId, Lookup, ModuleDefId,
     attrs::{AttrFlags, NativeLibKind as Written},
     expr_store::Body as BodyStore,
     nameres::crate_def_map,
@@ -70,14 +71,9 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
     let mut libs = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
         for block in module.scope(db).extern_blocks() {
-            if let Some(imported) = AttrFlags::wasm_import_module(db, block) {
-                // alloc: an error
-                return Err(format!(
-                    "`#[link(wasm_import_module = \"{imported}\")]` on an `extern` block of {}: \
-                     blaze links no wasm imports",
-                    named()
-                ));
-            }
+            // A block's `#[link(wasm_import_module = "..")]` names no library: on wasm its
+            // functions are the module's imports from that module (`v2::wasm::imports`), and
+            // elsewhere rustc ignores it.
             for lib in AttrFlags::native_libs(db, block).iter() {
                 let name = lib.name.as_str();
                 let kind = match lib.kind {
@@ -188,14 +184,14 @@ fn tables(
     db: &Db,
     hashes: &HashSource,
     items: &[ItemKey],
-    mut named: HashMap<ContentId, NamedBy>,
+    mut named: HashMap<ContentId, NamedBy, Global>,
     debug_names: &[(InstanceKey, String)],
 ) -> Result<Vec<(ContentId, Vec<u8>)>, String> {
-    let mut names: HashMap<base_db::FileId, String> = HashMap::default();
+    let mut names: HashMap<base_db::FileId, String, Global> = HashMap::new_in(Global);
     // alloc: per link, a table the code names each
     let mut spans = Vec::with_capacity(named.len());
-    let mut owners: HashSet<DefWithBodyId> = HashSet::default();
-    let mut declared: HashSet<FunctionId> = HashSet::default();
+    let mut owners: HashSet<DefWithBodyId, Global> = HashSet::new_in(Global);
+    let mut declared: HashSet<FunctionId, Global> = HashSet::new_in(Global);
     // An `asm!` function's and the allocator shim's items are of no crate of the database.
     let mut unresolved: Option<(usize, ItemKey)> = None;
     for &item in items {
@@ -271,14 +267,14 @@ fn tables(
 
 /// Every anchor the code of `built` names, in a position, a line or a static's bytes, with
 /// what names it first, for an error.
-fn named_anchors(built: &Built) -> HashMap<ContentId, NamedBy> {
+fn named_anchors(built: &Built) -> HashMap<ContentId, NamedBy, Global> {
     fn named_in(targets: &[Target]) -> impl Iterator<Item = ContentId> + '_ {
         targets.iter().filter_map(|it| match it {
             Target::Position(span) => Some(span.anchor),
             _ => None,
         })
     }
-    let mut named: HashMap<ContentId, NamedBy> = HashMap::default();
+    let mut named: HashMap<ContentId, NamedBy, Global> = HashMap::new_in(Global);
     for function in &built.functions {
         let by = |what: &'static str| move |anchor: ContentId| (anchor, NamedBy::Function { key: function.key, what });
         let code = named_in(function.relocs.targets()).map(by("a position in"));
@@ -322,21 +318,21 @@ impl std::fmt::Display for NamedBy {
 }
 
 /// A position: the file, its 1-based line and column, as `core::panic::Location` has them.
-type Row = (base_db::FileId, u32, u32);
+pub(super) type Row = (base_db::FileId, u32, u32);
 
 /// The positions of a body's spans, by table in [`hir_ty_share::code::table_of`]'s order:
 /// table `t` is `rows[starts[t]..starts[t + 1]]`, by the span's index.
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct Positions {
-    starts: [u32; TABLES + 1],
-    rows: Box<[Row]>,
+pub(super) struct Positions {
+    pub(super) starts: [u32; TABLES + 1],
+    pub(super) rows: Box<[Row]>,
 }
 
 /// Each span's position, as the program observes it; a span with no syntax of its own (a
 /// binding, [`MirSpan::Unknown`]) is where its owner is. Memoized, so a link after an edit
 /// finds again only the bodies it changed.
 #[blaze_query::tracked(returns(ref))]
-fn positions(db: &Db, owner: DefWithBodyId) -> Result<Positions, String> {
+pub(super) fn positions(db: &Db, owner: DefWithBodyId) -> Result<Positions, String> {
     let store = BodyStore::of(db, owner);
     let at_owner = owner_location(db, owner);
     let row = |span: MirSpan| {
@@ -389,7 +385,7 @@ fn owner_location(db: &Db, owner: DefWithBodyId) -> Option<Row> {
 fn encode(
     db: &Db,
     hashes: &HashSource,
-    names: &mut HashMap<base_db::FileId, String>,
+    names: &mut HashMap<base_db::FileId, String, Global>,
     rows: &[Row],
 ) -> Result<Vec<u8>, String> {
     // alloc: per table, the files it names, a few
@@ -432,8 +428,12 @@ fn encode(
 pub(super) fn debug_name(db: &Db, kind: &Kind) -> String {
     match kind {
         Kind::Code(instance, _) => hir_ty::attach_db(db, || crate::backtrace_name(db, instance)),
-        // alloc: per instance described, its debug name
-        Kind::Start(_) => crate::Target::current().entry().0.to_owned(),
+        Kind::Start(main) => match crate::target_of_crate(db, main.krate(db)) {
+            // alloc: per instance described, its debug name
+            Ok(target) => target.entry().0.to_owned(),
+            // alloc: per instance described, its debug name, which names the trouble
+            Err(error) => format!("{{start: {error}}}"),
+        },
         // alloc: per instance described, its debug name
         Kind::Allocator(forward) => forward.symbol.to_owned(),
         // alloc: per instance described, its debug name

@@ -2,7 +2,8 @@
 //! 1.99.0 (5f94df4789) writes them (`src/ops/cargo_metadata.rs`). cargo's unstable artifact
 //! dependencies (`-Zbindeps`) and the fields they add are not ported.
 
-use blaze_hash::{FixedState, HashMap};
+use blaze_hash::HashMap;
+use std::alloc::Global;
 use cargo_platform::Platform;
 use serde::Serialize;
 
@@ -65,7 +66,7 @@ pub fn resolve_graph(
     packages: &impl MetadataPackages,
     requested_kinds: &[CompileKind],
 ) -> CargoResult<MetadataResolve> {
-    let mut node_map = HashMap::with_capacity_and_hasher(resolve.len(), FixedState);
+    let mut node_map = HashMap::with_capacity_in(resolve.len(), Global);
     for &member in members {
         build_resolve_graph_r(&mut node_map, member, resolve, packages, requested_kinds)?;
     }
@@ -78,7 +79,7 @@ pub fn resolve_graph(
 }
 
 fn build_resolve_graph_r<P: MetadataPackages>(
-    node_map: &mut HashMap<PackageId, MetadataResolveNode>,
+    node_map: &mut HashMap<PackageId, MetadataResolveNode, Global>,
     pkg_id: PackageId,
     resolve: &Resolve,
     packages: &P,

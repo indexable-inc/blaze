@@ -77,10 +77,10 @@ fn tree_is_the_anchor() {
 /// `RA_CHECK_RELATIVE_BODIES` parses every tree again, so there is nothing kept to compare.
 #[test]
 fn tree_is_kept_on_its_thread() {
-    if super::check_relative() {
+    let db = fixture::db(CODE).into_db();
+    if super::check_relative(&db) {
         return;
     }
-    let db = fixture::db(CODE).into_db();
     for def in bodies(&db) {
         let syntax = body_syntax(&db, def).as_ref().expect("a body written in a file");
         let (first, second) = (syntax.tree(&db), syntax.tree(&db));

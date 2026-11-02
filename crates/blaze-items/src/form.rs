@@ -21,6 +21,7 @@ use std::{
 
 use base_db::{Crate, Db};
 use blaze_hash::{FixedState, HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::{
     ContentId,
     bits::{self, Bits},
@@ -54,9 +55,9 @@ use hir_ty::{
     intrinsic::{Intrinsic, intrinsic_of},
     method_resolution::loaded_crates,
     mir::{
-        AggregateKind, AsmOperand, AssertKind, BasicBlockId, LocalId, MirBody, MirSpan, Operand,
-        OperandKind, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
-        is_by_move_coroutine,
+        AggregateKind, AsmOperand, AssertKind, BasicBlockId, LocalId, MirBody, MirLowerError,
+        MirSpan, Operand, OperandKind, ProjectionElem, Rvalue, StatementKind, StoredPlace,
+        TerminatorKind, is_by_move_coroutine,
     },
     next_solver::{
         AliasConstKind, Allocation, Binder, BoundRegion, Clause, Const, ConstKind, DbInterner,
@@ -82,7 +83,7 @@ use crate::{
     key::{self, generic_def_item, item_key},
 };
 
-const DOMAIN: &str = "blaze v2 form 2";
+const DOMAIN: &str = "blaze v2 form 3";
 const SPANS_DOMAIN: &str = "blaze v2 form spans 1";
 
 /// Why a form is not of a program rustc accepts.
@@ -157,7 +158,7 @@ struct Form {
     /// Distinct, in slot order.
     refs: Vec<ItemId>,
     /// The slot of each of `refs`, filled once there are more than [`SCAN`].
-    slots: HashMap<ItemId, u32>,
+    slots: HashMap<ItemId, u32, Global>,
     missed: Option<Missed>,
     /// The first walk of a body, which only finds the locals it uses: nothing is written, and
     /// what names no local (types, constants, allocations, variants) is not spelled.
@@ -172,7 +173,7 @@ struct FormBuffers {
     digest: Vec<u8>,
     spans: Vec<u8>,
     refs: Vec<ItemId>,
-    slots: HashMap<ItemId, u32>,
+    slots: HashMap<ItemId, u32, Global>,
 }
 
 /// What one worker keeps of finished forms and walks to write the next ones into: at most
@@ -429,8 +430,8 @@ impl std::fmt::Write for Text<'_> {
 }
 
 /// A body written inside another: a closure or a coroutine, whose code is part of its owner's.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Nested<'db> {
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Nested<'db> {
     Closure(InternedClosureId<'db>),
     Coroutine(InternedCoroutineId<'db>),
 }
@@ -439,7 +440,7 @@ enum Nested<'db> {
 #[derive(Default)]
 struct Nests<'db> {
     order: Vec<Nested<'db>>,
-    seen: HashSet<Nested<'db>>,
+    seen: HashSet<Nested<'db>, Global>,
 }
 
 impl<'db> Nests<'db> {
@@ -512,7 +513,7 @@ const LEAK: u8 = 0xfe;
 #[cfg(test)]
 #[derive(Default)]
 struct Reference<'db> {
-    tys: RefCell<HashMap<Ty<'db>, Code>>,
+    tys: RefCell<HashMap<Ty<'db>, Code, Global>>,
     spelling: RefCell<Vec<Ty<'db>>>,
 }
 
@@ -752,12 +753,27 @@ impl<'db> Cx<'db> {
     /// build stops with at [`Missed::NoMir`]; `None` when each lowers (the MIR that failed is
     /// elsewhere in the item, an anonymous constant of a type).
     pub(crate) fn mir_error(&self, id: ItemId) -> Option<String> {
+        let (within, error) = self.mir_lowering_error(id)?;
+        Some(match within {
+            // alloc: the error a build stops with, once
+            None => format!("{error:?}"),
+            // alloc: as above
+            Some(Nested::Closure(_)) => format!("a closure in it: {error:?}"),
+            // alloc: as above
+            Some(Nested::Coroutine(_)) => format!("a coroutine in it: {error:?}"),
+        })
+    }
+
+    /// [`Self::mir_error`] as data: the lowering error, and the body in the item it was in
+    /// (`None` for its own body, else the closure or coroutine), so a reader can tell one
+    /// reason from another (an intrinsic missing from the table) without parsing text, and
+    /// name the body that failed.
+    pub(crate) fn mir_lowering_error(&self, id: ItemId) -> Option<(Option<Nested<'db>>, MirLowerError<'db>)> {
         let db = self.db;
         let def = self.body_owner(id)?;
         let body = match db.mir_body(InferBodyId::DefWithBodyId(def)) {
             Ok(body) => body,
-            // alloc: the error a build stops with, once
-            Err(error) => return Some(format!("{error:?}")),
+            Err(error) => return Some((None, error)),
         };
         let mut scratch = Form::quiet();
         let mut nested = Nests::default();
@@ -766,14 +782,13 @@ impl<'db> Cx<'db> {
         while at < nested.order.len() {
             let next = nested.order[at];
             at += 1;
-            let (what, body) = match next {
-                Nested::Closure(it) => ("a closure", db.mir_body_for_closure(it)),
-                Nested::Coroutine(it) => ("a coroutine", db.mir_body_for_coroutine(it)),
+            let body = match next {
+                Nested::Closure(it) => db.mir_body_for_closure(it),
+                Nested::Coroutine(it) => db.mir_body_for_coroutine(it),
             };
             match body {
                 Ok(body) => self.mir(&mut scratch, body, &mut nested),
-                // alloc: as above
-                Err(error) => return Some(format!("{what} in it: {error:?}")),
+                Err(error) => return Some((Some(next), error)),
             }
         }
         None
@@ -959,11 +974,11 @@ impl<'db> Cx<'db> {
             return code;
         }
         let key = FormTy::new(self.db, ty.store());
-        let code = if self.leak_free {
-            signature_ty_form(self.db, key)
-        } else {
-            ty_form(self.db, key)
-        };
+        // A type's form asks for its parts' forms, one query inside another per level of the
+        // type, as deep as the program nests it (rule 17).
+        let code = stdx::ensure_sufficient_stack(|| {
+            if self.leak_free { signature_ty_form(self.db, key) } else { ty_form(self.db, key) }
+        });
         entry.set(Some((ty, code)));
         code
     }
@@ -1070,7 +1085,12 @@ impl<'db> Cx<'db> {
                 f.u64(u64::from(EnumSignature::of(db, it).flags.bits()));
                 let variants = it.enum_variants(db);
                 f.len(variants.variants.len());
-                for (variant, _, explicit) in variants.with_explicit_discriminant() {
+                let names = variants.variants.keys();
+                for (name, (variant, _, explicit)) in
+                    names.zip(variants.with_explicit_discriminant())
+                {
+                    // The name: `for const` over the variants reads it (`Variant::NAME`).
+                    f.str(name.symbol().as_str());
                     self.attrs(f, variant.into());
                     self.fields(f, variant.into());
                     // An explicit discriminant is a body; a variant without one has none.
@@ -1095,7 +1115,10 @@ impl<'db> Cx<'db> {
             FieldsShape::Unit => f.u8(2),
         }
         f.len(fields.len());
-        for (field, _) in fields.fields().iter() {
+        for (field, data) in fields.fields().iter() {
+            // The name: `for const` over the fields reads it (`Field::NAME`), so two types
+            // alike but for a field's name expand apart.
+            f.str(data.name.symbol().as_str());
             self.nest(f, self.field_form(variant, field));
         }
     }
@@ -2115,7 +2138,7 @@ impl<'db> Cx<'db> {
 
     fn spell_names(&self, f: &mut Form, mut found: Vec<Named>) {
         let db = self.db;
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new_in(Global);
         found.retain(|it| seen.insert(*it));
         f.len(found.len());
         for named in found {
@@ -2499,6 +2522,11 @@ impl<'db> Cx<'db> {
                 ProjectionElem::Downcast(variant) => {
                     f.u8(5);
                     self.variant(f, variant);
+                }
+                // The binder's universe, as the placeholder `F` in the body's types spells it.
+                ProjectionElem::ReflectedField(binder) => {
+                    f.u8(6);
+                    f.u32(binder.0);
                 }
             }
         }
@@ -2923,6 +2951,17 @@ impl<'db> Cx<'db> {
                 self.operands(f, c, args);
                 f.span(*fn_span);
             }
+            TerminatorKind::ComptimeFor { binder, domain, body, after } => {
+                f.u8(15);
+                f.u32(binder.0);
+                self.ty_in(f, domain.as_ref());
+                self.block(f, c, Some(*body));
+                self.block(f, c, Some(*after));
+            }
+            TerminatorKind::ComptimeNext { head } => {
+                f.u8(16);
+                self.block(f, c, Some(*head));
+            }
         }
     }
 }
@@ -3287,7 +3326,7 @@ pub(crate) mod check {
         }
         let mut bytes = Form::new("").digest.clone();
         let mut refs = Vec::new();
-        let mut slots = blaze_hash::HashMap::default();
+        let mut slots = blaze_hash::HashMap::new_in(std::alloc::Global);
         for &id in ids {
             let next = refs.len() as u32;
             let slot = *slots.entry(id).or_insert(next);

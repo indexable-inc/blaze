@@ -38,8 +38,8 @@ fn lower(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (TestDB, DefWithBod
 /// which are the source map's.
 fn round_trip(db: &TestDB, def: DefWithBodyId) {
     let (body, source_map) = Body::with_source_map(db, def);
-    let in_store: blaze_hash::HashSet<_> = body.store.macro_calls().iter().copied().collect();
-    let in_map: blaze_hash::HashSet<_> =
+    let in_store: blaze_hash::HashSet<_, std::alloc::Global> = body.store.macro_calls().iter().copied().collect();
+    let in_map: blaze_hash::HashSet<_, std::alloc::Global> =
         source_map.store.macro_calls().map(|(_, call)| call).collect();
     assert_eq!(in_store, in_map, "{def:?}: the store's macro calls are the source map's");
     assert_eq!(Body::of(db, def).store.macro_calls(), body.store.macro_calls());
@@ -99,6 +99,7 @@ fn check_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
 /// A body that lowers to every kind of expression, pattern and statement.
 const EVERY_VARIANT: &str = r#"
 //- minicore: range, fmt
+#![feature(blaze_comptime)]
 struct S { a: i32, b: i32 }
 struct T(i32, i32);
 const C: i32 = 0;
@@ -110,6 +111,7 @@ fn main(x: i32, s: S, v: &[i32], r: &mut i32) {
     let _ = (two!(), -x, !true, *r, &mut x, &raw const x, x as u8, nothing!());
     let _ = (x + 1 * 2, x == 1 && true, v[0], s.a, _, builtin # include_bytes);
     let _ = (builtin # wrap_binder(x), builtin # unwrap_binder(x, u8));
+    for const f in x { let _ = s.[f]; }
     let _ = [1, 2];
     let _ = [0; 4];
     let _ = 0..x;
@@ -333,9 +335,11 @@ fn expr_variant(expr: Expr<'_>) -> usize {
         Expr::InlineAsm(_) => 31,
         Expr::IncludeBytes => 32,
         Expr::UnsafeBinderCast { .. } => 33,
+        Expr::ComptimeFor { .. } => 34,
+        Expr::ReflectedField { .. } => 35,
     }
 }
-const EXPR_VARIANTS: usize = 34;
+const EXPR_VARIANTS: usize = 36;
 
 /// [`expr_variant`] for patterns.
 fn pat_variant(pat: Pat<'_>) -> usize {
@@ -1355,6 +1359,79 @@ fn f() {
     assert_eq!(too_large.len(), 2, "the literal past u128 and the pattern: {too_large:?}");
 }
 
+/// The left side of `=` is a pattern only where it names a constructor of its form, as rustc's
+/// `extract_unit_struct_path` and `extract_tuple_struct_path` decide: a constant, a function or a
+/// constructor of the other form stays an expression, an invalid left-hand side (E0070).
+#[test]
+fn an_assignment_destructures_only_through_a_constructor_of_its_form() {
+    let db = fixture::db(
+        r#"
+const C: i32 = 0;
+struct Unit;
+struct Pair(i32, i32);
+enum E { A, B(i32) }
+fn f(_: i32) -> i32 { 0 }
+impl Pair {
+    fn main(mut a: i32, mut b: i32) {
+        C = 14;
+        Unit = Unit;
+        Pair = Pair;
+        E::A = E::A;
+        E::B = E::B;
+        Pair(a, b) = Pair(1, 2);
+        E::B(a) = E::B(3);
+        Unit(a) = Unit;
+        f(a) = 1;
+        Self(a, b) = Pair(4, 5);
+    }
+}
+"#,
+    )
+    .into_db();
+    let def_map = crate_def_map(&db, db.fetch_test_crate());
+    let module = def_map.modules(&db).next().expect("the crate root").1;
+    let main = module
+        .scope(&db)
+        .impls()
+        .find_map(|it| {
+            crate::nameres::assoc::ImplItems::of(&db, it).0.items.iter().find_map(|(name, item)| {
+                match item {
+                    crate::AssocItemId::FunctionId(it) if name.as_str() == "main" => Some(*it),
+                    _ => None,
+                }
+            })
+        })
+        .expect("`Pair::main`");
+    let body = Body::of(&db, main.into());
+    let kinds: Vec<&str> = body
+        .exprs()
+        .filter_map(|(_, expr)| match expr {
+            Expr::Assignment { target, .. } => Some(match body.pat(target) {
+                Pat::Path(_) => "pattern",
+                Pat::TupleStruct { .. } => "tuple pattern",
+                Pat::Expr(_) => "expression",
+                other => panic!("{other:?}"),
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "expression",
+            "pattern",
+            "expression",
+            "pattern",
+            "expression",
+            "tuple pattern",
+            "tuple pattern",
+            "expression",
+            "expression",
+            "tuple pattern",
+        ]
+    );
+}
+
 #[test]
 fn an_anonymous_parameter_is_a_wildcard() {
     let db = fixture::db(
@@ -1384,4 +1461,114 @@ trait T {
     for param in body.params.iter() {
         assert!(matches!(body.pat(param.formal), Pat::Wild), "{:?}", body.pat(param.formal));
     }
+}
+
+/// `#[core::contracts::requires]` and `#[ensures]` lower to rustc's `lower_contract`: the
+/// precondition through `contract_check_requires(|| ..)`, the postcondition built once and every
+/// return (the tail, `return`, a `?`) through `contract_check_ensures`, but not a closure's, all
+/// behind the literal `cfg(contract_checks)`: off, the clauses are still there to type-check.
+#[test]
+fn contract_clauses_lower_as_nightly_off_and_on() {
+    let body = |cfg: &str| {
+        let fixture = format!(
+            r#"
+//- minicore: option, try, fn
+//- /main.rs {cfg}
+#![feature(contracts)]
+#[rustc_builtin_macro]
+pub macro contracts_requires($item:item) {{}}
+#[rustc_builtin_macro]
+pub macro contracts_ensures($item:item) {{}}
+#[lang = "contract_check_requires"]
+pub fn contract_check_requires<C: Fn() -> bool + Copy>(_: C) {{}}
+#[lang = "contract_build_check_ensures"]
+pub fn build_check_ensures<Ret, C: Fn(&Ret) -> bool + Copy + 'static>(c: C) -> C {{ c }}
+#[lang = "contract_check_ensures"]
+pub fn contract_check_ensures<C: Fn(&Ret) -> bool + Copy, Ret>(_: Option<C>, r: Ret) -> Ret {{ r }}
+
+#[contracts_requires(let lim = 10; x < lim)]
+#[contracts_ensures(|r: &Option<u32>| r.is_some())]
+fn f(x: u32) -> Option<u32> {{
+    let g = || return 1u32;
+    if x == 0 {{ return None; }}
+    let y = Some(x)?;
+    Some(y + g())
+}}
+"#
+        );
+        let db = fixture::db(&fixture).into_db();
+        let def_map = crate_def_map(&db, db.fetch_test_crate());
+        let f = def_map
+            .modules(&db)
+            .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
+            .find_map(|decl| match decl {
+                ModuleDefId::FunctionId(it) if crate::signatures::FunctionSignature::of(&db, it).name.as_str() == "f" => Some(it),
+                _ => None,
+            })
+            .expect("`f`");
+        round_trip(&db, f.into());
+        Body::of(&db, f.into()).pretty_print(&db, f.into(), Edition::CURRENT)
+    };
+    for (cfg, checked) in [("", "false"), ("cfg:contract_checks", "true")] {
+        let printed = body(cfg);
+        let count = |it: &str| printed.matches(it).count();
+        assert_eq!(count("builtin#lang(contract_check_requires)"), 1, "{printed}");
+        assert_eq!(count("builtin#lang(contract_build_check_ensures)"), 1, "{printed}");
+        // The tail, `return None` and the `?`; not the closure's `return 1u32`.
+        assert_eq!(count("builtin#lang(contract_check_ensures)"), 3, "{printed}");
+        assert_eq!(count(&format!("if {checked}")), 4, "{printed}");
+        assert!(printed.contains("let lim = 10"), "the requires' declarations are kept: {printed}");
+        assert!(!printed.contains("rustc_contract"), "no marker is left: {printed}");
+    }
+}
+
+/// `#[blaze::contract_test]` (docs/v2/plan/lanes/contracts.md, part 2): the path resolves to
+/// `core::blaze::contract_test` without a `blaze` crate, and the function is kept beside a test
+/// `f_contract` that assumes the `requires`, calls `f` and checks the `ensures`.
+#[test]
+fn contract_test_expands_to_a_test_of_the_clauses() {
+    let db = fixture::db(
+        r#"
+//- /core.rs crate:core
+pub mod blaze {
+    #[rustc_builtin_macro]
+    pub macro contract_test($item:item) {}
+}
+pub mod prelude {
+    pub mod v1 {
+        #[rustc_builtin_macro]
+        pub macro test($item:item) {}
+    }
+}
+//- /hegel.rs crate:hegel
+//- /main.rs crate:main deps:core,hegel cfg:test
+#![feature(blaze_verify)]
+#[blaze::contract_test]
+fn f(x: u32) -> (r: u32) requires x < 10 ensures r > x { x + 1 }
+"#,
+    )
+    .into_db();
+    // `main`, the last crate of the fixture.
+    let def_map = crate_def_map(&db, db.fetch_test_crate());
+    assert!(def_map.diagnostics(&db).is_empty(), "{:?}", def_map.diagnostics(&db));
+    let function = |name: &str| {
+        def_map
+            .modules(&db)
+            .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
+            .find_map(|decl| match decl {
+                ModuleDefId::FunctionId(it)
+                    if crate::signatures::FunctionSignature::of(&db, it).name.as_str() == name =>
+                {
+                    Some(it)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no function `{name}`"))
+    };
+    function("f");
+    let test = function("f_contract");
+    let printed = Body::of(&db, test.into()).pretty_print(&db, test.into(), Edition::CURRENT);
+    assert!(printed.contains("assume(x < 10)"), "the requires is assumed: {printed}");
+    assert!(printed.contains("r > x"), "the ensures is checked: {printed}");
+    assert!(printed.contains("f("), "`f` is called: {printed}");
 }

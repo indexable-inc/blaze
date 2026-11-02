@@ -10,7 +10,7 @@ mod outputs;
 #[cfg(test)]
 mod tests;
 
-use std::collections::hash_map::Entry;
+use blaze_hash::hash_map::Entry;
 use std::path::Path;
 
 use blaze_manifest::Config;
@@ -21,6 +21,7 @@ use blaze_manifest::profiles::{Profile as BaseProfile, ProfileRoot};
 use blaze_manifest::targets::TargetKind;
 use blaze_resolve::PackageId;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 
 use self::flags::KindInfo;
 use self::hash::{CompileMode, HashedProfile, LtoUnit, Meta, MetaInput, RustcVersion, TrimPaths};
@@ -40,9 +41,9 @@ pub(crate) struct PlanInput<'a, F: Files> {
     /// The standard library's units' plans, made by its own load; `None` for every other unit.
     pub std_plans: &'a [Option<UnitPlan>],
     /// Every package of the units, by the unit's `pkg_id`.
-    pub packages: &'a HashMap<String, (PackageId, Package<'a>)>,
+    pub packages: &'a HashMap<String, (PackageId, Package<'a>), Global>,
     /// Every package's manifest path, by its id.
-    pub manifests: &'a HashMap<PackageId, (&'a Path, &'a Manifest)>,
+    pub manifests: &'a HashMap<PackageId, (&'a Path, &'a Manifest), Global>,
     /// The graph's roots, as indexes of `units`.
     pub roots: &'a [usize],
     pub config: &'a Config<F>,
@@ -63,6 +64,9 @@ pub(crate) struct PlanInput<'a, F: Files> {
     pub build_dir: &'a Path,
     pub host: &'a str,
     pub target: Option<&'a str>,
+    /// `-Z wasm-macros`' platform: its units are planned as a third kind, after the host's
+    /// and the target's, and their plans say [`UnitPlan::macro_wasm`].
+    pub macro_wasm: Option<&'a str>,
     /// The profile asked for, by name (`dev`), and its directory's name (`debug`).
     pub requested_profile: &'a str,
     pub profile_dir: &'a str,
@@ -71,7 +75,7 @@ pub(crate) struct PlanInput<'a, F: Files> {
     pub jobs: Option<u32>,
     /// The packages, by the unit's `pkg_id`, whose build scripts run outside the sandbox
     /// (`UnitPlan::unsandboxed`).
-    pub unsandboxed: &'a HashSet<&'a str>,
+    pub unsandboxed: &'a HashSet<&'a str, Global>,
 }
 
 pub(crate) struct PlanOutput {
@@ -253,6 +257,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     }
     let config = input.config;
     let workspace_lints = flags::workspace_lints(input.ws_metadata, input.ws_manifest)?;
+    let lint_profile = flags::workspace_profile(input.ws_metadata, input.ws_manifest, input.ws_root)?;
 
     let wrapper = match config.env("RUSTC_WORKSPACE_WRAPPER") {
         Some(it) => !it.is_empty(),
@@ -269,6 +274,13 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         kinds.push(flags::kind_info(config, input.host, input.target, Some(target))?);
         kind_hashes.push(hash::kind_fingerprint_hash(Some(target))?);
         layouts.push(Layout::new(input.target_dir, input.build_dir, Some(target), input.profile_dir));
+    }
+    let macro_kind = kinds.len();
+    // Never the target's triple: the load refuses that build before its graph is made.
+    if let Some(triple) = input.macro_wasm {
+        kinds.push(flags::macro_wasm_info(triple)?);
+        kind_hashes.push(hash::kind_fingerprint_hash(Some(triple))?);
+        layouts.push(Layout::new(input.target_dir, input.build_dir, Some(triple), input.profile_dir));
     }
     if let Intent::Doc { open } = input.intent {
         flags::doc_unhonored(config, input.host, input.target, &kinds, open)?;
@@ -335,6 +347,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         let kind = match unit.platform.as_deref() {
             None => 0,
             Some(triple) if Some(triple) == input.target => 1,
+            Some(triple) if Some(triple) == input.macro_wasm => macro_kind,
             Some(triple) => {
                 return Err(error(format!(
                     "the unit graph has a unit of `{}` for `{triple}` in a build for {:?}",
@@ -410,9 +423,9 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     for &at in input.roots {
         roots[at] = true;
     }
-    let primary: HashSet<&str> = input.roots.iter().map(|&at| units[at].pkg_id.as_str()).collect();
-    let mut per_package: HashMap<&str, PackageFlags> =
-        HashMap::with_capacity_and_hasher(input.packages.len(), Default::default());
+    let primary: HashSet<&str, Global> = input.roots.iter().map(|&at| units[at].pkg_id.as_str()).collect();
+    let mut per_package: HashMap<&str, PackageFlags, Global> =
+        HashMap::with_capacity_in(input.packages.len(), Global);
     let artifact_dir = !matches!(input.intent, Intent::Check { .. } | Intent::Doc { .. });
 
     let mut plans = Vec::with_capacity(units.len());
@@ -489,6 +502,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
                 runner: Vec::new(),
                 harness: target.harness,
                 clippy: None,
+                macro_wasm: input.macro_wasm.is_some() && it.kind == macro_kind,
             }));
             continue;
         }
@@ -555,7 +569,8 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         let clippy = match input.lints && it.pkg.is_member && !unit.is_std {
             true => {
                 cfgs.push("clippy".to_owned());
-                Some(Clippy { conf: clippy_conf(input, it.pkg.manifest_path)? })
+                // clone: the workspace's profile keys, once per member unit linted
+                Some(Clippy { conf: clippy_conf(input, it.pkg.manifest_path)?, profile: lint_profile.clone() })
             }
             false => None,
         };
@@ -580,6 +595,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             },
             harness: target.harness,
             clippy,
+            macro_wasm: input.macro_wasm.is_some() && it.kind == macro_kind,
         }));
     }
 

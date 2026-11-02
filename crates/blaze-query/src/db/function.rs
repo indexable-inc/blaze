@@ -26,9 +26,11 @@ use std::{
 };
 
 use blaze_mem::Tag;
+use parking_lot::Mutex;
 
 use super::{
     AsId, Cancelled, Cycle, Database, DatabaseKeyIndex, EventKind, FromIdIn, Id, MemoryUsage,
+    admission::{self, Eviction, Held, Sketch},
     counts,
     id::PAGE_LEN,
     ingredient::{self, Ingredient, Kind, Vtable},
@@ -66,7 +68,8 @@ pub trait Function: 'static {
     type Value: Send + Sync + 'static;
     const NAME: &'static str;
     const FILE: &'static str;
-    /// The value cap: past it, the oldest-verified values are evicted at a new view. 0: none.
+    /// The value cap: past it, values are evicted at a new view as the storage's [`Eviction`]
+    /// picks them. 0: none.
     const LRU: usize;
     /// `lru = N` given (0 too): the values may be evicted, and without `NO_EQ` `hash` is real.
     const EVICTABLE: bool;
@@ -88,12 +91,15 @@ pub trait Function: 'static {
     fn hash(value: &Self::Value) -> u64;
 }
 
-/// A function's table: its rows, how many hold a value, and its `lru` cap (0: none), read
-/// only by the sweep.
+/// A function's table: its rows, how many hold a value, and its `lru` cap (0: none) and
+/// frequency sketch, read only by the sweep.
 pub(crate) struct FnTable<F: Function> {
     pages: Pages,
     values: AtomicUsize,
     cap: AtomicUsize,
+    /// How many views asked for each key, made at the first sweep under a cap. Locked only to
+    /// take it out and put it back: the sweep runs with `&mut` of the storage, so nothing waits.
+    sketch: Mutex<Option<Sketch>>,
     _of: PhantomData<fn() -> F>,
 }
 
@@ -107,6 +113,7 @@ impl<F: Function> Table for FnTable<F> {
             pages: Pages::new(Tag::Query),
             values: AtomicUsize::new(0),
             cap: AtomicUsize::new(F::LRU),
+            sketch: Mutex::new(None),
             _of: PhantomData,
         }
     }
@@ -679,7 +686,9 @@ impl Drop for Running<'_> {
     }
 }
 
-/// Empties the cycle members from `from` on the member list: a cycle's unwinding.
+/// Empties the cycle members from `from` on the member list: a cycle's unwinding. A head that
+/// a later round ran to a final value (it read no provisional row) is left as it is: it is
+/// published, so another task may be reading it.
 fn empty_members(storage: &Storage, from: u32) {
     loop {
         let Some(member) = local::with(|local| {
@@ -687,7 +696,11 @@ fn empty_members(storage: &Storage, from: u32) {
         }) else {
             return;
         };
-        reset_member(storage, member);
+        if member_header(storage, member)
+            .is_some_and(|it| it.verified.load(Ordering::Relaxed) & PROVISIONAL != 0)
+        {
+            reset_member(storage, member);
+        }
     }
 }
 
@@ -1149,7 +1162,13 @@ unsafe fn reset_row<F: Function>(storage: &Storage, index: u32, id: Id) {
     let Some(table) = storage.table::<FnTable<F>>(index) else { return };
     let Some(row) = table.pages.row::<RowOf<F>>(id) else { return };
     let header = &row.header;
-    if header.verified.load(Ordering::Relaxed) & VALUE != 0 {
+    let word = header.verified.load(Ordering::Relaxed);
+    debug_assert!(
+        word & VALUE == 0 || word & PROVISIONAL != 0,
+        "a reset of {}({id:?}), whose value is published (word {word:#x}): another task may read it",
+        F::NAME,
+    );
+    if word & VALUE != 0 {
         // SAFETY: the caller is the thread of the row's cycle, whose frames no longer read it
         // (rule 4), or a run that unwinds holding its flight (rule 1).
         unsafe { row.drop_value() };
@@ -1204,6 +1223,7 @@ pub fn evict_values<F: Function>(db: &mut F::Db) -> usize {
     let Some(table) = storage.table::<FnTable<F>>(F::ingredient().index()) else { return 0 };
     let evicted = rows::<F>(storage, table).filter(|(_, row)| evict::<F>(row)).count();
     table.values.fetch_sub(evicted, Ordering::Relaxed);
+    counts::add(F::ingredient().index(), counts::DROPPED, evicted as u64);
     evicted
 }
 
@@ -1217,15 +1237,85 @@ pub fn evict_values_of<F: Function>(db: &mut F::Db, keys: &[F::Key]) -> usize {
         .filter(|row| evict::<F>(row))
         .count();
     table.values.fetch_sub(evicted, Ordering::Relaxed);
+    counts::add(F::ingredient().index(), counts::DROPPED, evicted as u64);
     evicted
 }
 
-/// [`Vtable::sweep`] of `F`: past its cap, the values verified longest ago go.
+/// [`Vtable::sweep`] of `F`: past its cap, values go as the storage's [`Eviction`] picks.
 fn sweep<F: Function>(storage: &mut Storage, index: u32) {
     let Some(table) = storage.table::<FnTable<F>>(index) else { return };
-    let held = table.values.load(Ordering::Relaxed);
     let cap = table.cap.load(Ordering::Relaxed);
-    if cap == 0 || held <= cap {
+    if cap == 0 {
+        return;
+    }
+    match storage.eviction() {
+        Eviction::Frequency => sweep_by_frequency::<F>(storage, table, index, cap),
+        Eviction::Recency => sweep_by_recency::<F>(storage, table, index, cap),
+    }
+}
+
+/// W-TinyLFU: adds a view to the sketch for each value the view that just ended asked for,
+/// ages it, and past the cap evicts what [`admission::plan`] does not keep. Every view, a walk
+/// of the rows under a cap.
+fn sweep_by_frequency<F: Function>(
+    storage: &Storage,
+    table: &FnTable<F>,
+    index: u32,
+    cap: usize,
+) {
+    let held = table.values.load(Ordering::Relaxed);
+    let over = held > cap;
+    // The sweep runs after `next_view` bumped the view (renumbered first at the limit, which
+    // keeps the order of stamps), so the view whose asks are counted is the one before.
+    let ended = storage.view_bits().saturating_sub(1);
+    let mut sketch = table
+        .sketch
+        .lock()
+        .take()
+        .filter(|it| it.fits(cap))
+        .unwrap_or_else(|| Sketch::new(cap, admission::SEED));
+    sketch.set_cap(cap);
+    let mut values: Vec<Held> = Vec::new(); // alloc: a sweep past the cap, at a view boundary
+    for (id, row) in rows::<F>(storage, table) {
+        let word = row.header.verified.load(Ordering::Relaxed);
+        if word & VALUE == 0 || word & PROVISIONAL != 0 {
+            continue;
+        }
+        let key = id.as_u32();
+        if word & VIEW_MASK == ended {
+            sketch.increment(u64::from(key));
+        }
+        if over {
+            values.push(Held::new(word & VIEW_MASK, key, 0)); // alloc: as above
+        }
+    }
+    sketch.age_if_due();
+    for value in &mut values {
+        value.frequency = sketch.estimate(u64::from(value.key));
+    }
+    *table.sketch.lock() = Some(sketch);
+    let refused = admission::plan(&mut values, cap);
+    let mut evicted = 0;
+    for value in values.iter().skip(cap) {
+        if let Some(row) = table.pages.row::<RowOf<F>>(Id::from_u32(value.key))
+            && evict::<F>(row)
+        {
+            evicted += 1;
+        }
+    }
+    table.values.fetch_sub(evicted, Ordering::Relaxed);
+    if evicted != 0 {
+        counts::add(index, counts::EVICTED, evicted as u64);
+    }
+    if refused != 0 {
+        counts::add(index, counts::REFUSED, refused as u64);
+    }
+}
+
+/// [`Eviction::Recency`]: past the cap, the values verified longest ago go.
+fn sweep_by_recency<F: Function>(storage: &Storage, table: &FnTable<F>, index: u32, cap: usize) {
+    let held = table.values.load(Ordering::Relaxed);
+    if held <= cap {
         return;
     }
     let mut ages: Vec<(u32, Id)> = rows::<F>(storage, table) // alloc: a sweep past the cap, at a view boundary
@@ -1248,6 +1338,9 @@ fn sweep<F: Function>(storage: &mut Storage, index: u32) {
         }
     }
     table.values.fetch_sub(evicted, Ordering::Relaxed);
+    if evicted != 0 {
+        counts::add(index, counts::EVICTED, evicted as u64);
+    }
 }
 
 /// Replaces `F`'s `lru` cap (0: none), applied at the next view's sweep.

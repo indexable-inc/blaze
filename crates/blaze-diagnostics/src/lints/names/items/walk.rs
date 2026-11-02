@@ -11,6 +11,7 @@
 use std::{ops::ControlFlow, rc::Rc};
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_mem::Frame;
 use hir::{HirFileId, InFile, view::ModuleSourceView};
@@ -89,7 +90,7 @@ pub(super) type Order = SmallVec<[u32; 4]>;
 /// per key after that.
 #[derive(Default)]
 pub(super) struct Orders {
-    of: HashMap<hir::Module, Order>,
+    of: HashMap<hir::Module, Order, Global>,
 }
 
 impl Orders {

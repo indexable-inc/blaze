@@ -13,14 +13,15 @@
 //! bookkeeping is `std`'s, invisible to the model: it adds no schedule point.
 
 use std::{
-    collections::hash_map::Entry,
     fmt::{self, Debug},
     hash::{BuildHasher, Hash},
     panic::Location,
     sync::atomic::{AtomicU32, Ordering::Relaxed},
 };
+use blaze_hash::hash_map::Entry;
 
 use blaze_hash::{FixedState, HashMap};
+use std::alloc::Global;
 use parking_lot::Mutex;
 
 use crate::{clock::Clock, rt};
@@ -119,7 +120,7 @@ impl<S: Spec> History<S> {
             // alloc: each operation's happens-before set, once per check
             .collect();
         // alloc: the memo, once per check
-        let mut memo = Memo { seen: Vec::new(), first: HashMap::default() };
+        let mut memo = Memo { seen: Vec::new(), first: HashMap::new_in(Global) };
         let root = memo.insert(0, init).expect("an empty memo holds nothing");
         if !linearizable(&events, &before, 0, root, &mut memo) {
             panic!(
@@ -148,7 +149,7 @@ const NONE: u32 = u32::MAX;
 /// of pairs needs a second clone to keep one while the search goes on with the other.
 struct Memo<S> {
     seen: Vec<(u64, S, u32)>,
-    first: HashMap<u64, u32>,
+    first: HashMap<u64, u32, Global>,
 }
 
 impl<S: Spec> Memo<S> {

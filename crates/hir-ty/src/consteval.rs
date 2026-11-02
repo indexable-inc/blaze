@@ -159,6 +159,9 @@ pub(crate) fn literal_ty<'db>(
                 hir_def::builtin_type::BuiltinInt::I32 => types.types.i32,
                 hir_def::builtin_type::BuiltinInt::I64 => types.types.i64,
                 hir_def::builtin_type::BuiltinInt::I128 => types.types.i128,
+                hir_def::builtin_type::BuiltinInt::Bits(w) => {
+                    Ty::new_int(interner, rustc_type_ir::IntTy::Bits(*w))
+                }
             },
             None => default_int(types),
         },
@@ -170,6 +173,9 @@ pub(crate) fn literal_ty<'db>(
                 hir_def::builtin_type::BuiltinUint::U32 => types.types.u32,
                 hir_def::builtin_type::BuiltinUint::U64 => types.types.u64,
                 hir_def::builtin_type::BuiltinUint::U128 => types.types.u128,
+                hir_def::builtin_type::BuiltinUint::Bits(w) => {
+                    Ty::new_uint(interner, rustc_type_ir::UintTy::Bits(*w))
+                }
             },
             None => default_uint(types),
         },
@@ -239,7 +245,6 @@ fn evaluated<'db>(
         AliasConstKind::Projection { def_id: TraitAssocConstId(id) }
         | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
         | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => {
-            let _request = trace_const(db, id, false);
             const_eval_query(db, id, unevaluated.args.store(), None)
         }
         AliasConstKind::Anon { def_id } => {
@@ -461,28 +466,12 @@ fn const_eval_discriminant_cycle_result<'db>(
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
 }
 
-type TraceConst = fn(&Db, ConstId, bool) -> Option<fn(std::time::Instant)>;
-static TRACE_CONST: std::sync::OnceLock<TraceConst> = std::sync::OnceLock::new();
-
-/// Has `observer` see each request for a named constant (`false`) and each run of its query
-/// (`true`): for one it follows, it gives what to call at the end with when it began.
-pub fn trace_consts_with(observer: TraceConst) {
-    _ = TRACE_CONST.set(observer);
-}
-
-fn trace_const(db: &Db, def: ConstId, executing: bool) -> Option<impl Drop> {
-    let finish = TRACE_CONST.get()?(db, def, executing)?;
-    let start = std::time::Instant::now();
-    Some(stdx::defer(move || finish(start)))
-}
-
 pub(crate) fn const_eval<'db>(
     db: &'db Db,
     def: ConstId,
     subst: GenericArgs<'db>,
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
-    let _request = trace_const(db, def, false);
     match const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
         Ok(konst) => Ok(konst.as_ref()),
         Err(err) => Err(err.clone()), // clone: error path
@@ -496,7 +485,6 @@ pub fn const_eval_query<'db>(
     subst: StoredGenericArgs,
     trait_env: Option<StoredParamEnvAndCrate>,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-    let _execution = trace_const(db, def, true);
     let subst = subst.as_ref();
     if let Some(kept) = deps::cached(db, def, subst)? {
         return Ok(kept.store());

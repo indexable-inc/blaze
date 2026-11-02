@@ -20,10 +20,9 @@
 //! `compiler/rustc_hir_analysis/src/check_unused.rs` (`check_unused_traits`) (MIT or
 //! Apache-2.0).
 
-use std::sync::LazyLock;
-
 use base_db::{CrateOrigin, LangCrateOrigin};
 use blaze_hash::{FixedState, HashMap, HashSet};
+use std::alloc::Global;
 use blaze_mem::Frame;
 use cfg::CfgAtom;
 use hir::InFile;
@@ -55,18 +54,18 @@ pub(super) struct Unused {
     /// What `check_unused_traits` lints after type checking.
     pub(super) bodies: Vec<Found>,
     /// The `use` trees found unused.
-    pub(super) unused: HashSet<Binding>,
+    pub(super) unused: HashSet<Binding, Global>,
     /// The single imports found redundant.
-    pub(super) redundant: HashSet<Binding>,
+    pub(super) redundant: HashSet<Binding, Global>,
 }
 
 impl Unused {
     pub(super) fn of(cx: &Cx<'_, '_>, uses: &Uses<'_, '_>) -> Unused {
         let mut out =
             // alloc: both hold only diagnostics that fire; empty, they allocate nothing
-            Unused { resolve: Vec::new(), bodies: Vec::new(), unused: HashSet::default(), redundant: HashSet::default() };
+            Unused { resolve: Vec::new(), bodies: Vec::new(), unused: HashSet::new_in(Global), redundant: HashSet::new_in(Global) };
         let extern_crates = cx.lint_may_fire(LintId::named("unused_extern_crates"));
-        let mut maybe_unused_crates = HashSet::default();
+        let mut maybe_unused_crates = HashSet::new_in(Global);
         for krate in &uses.crates {
             out.macro_use(cx, uses, krate);
             let binding = Binding::ExternCrate(krate.id);
@@ -224,7 +223,7 @@ impl Unused {
     }
 
     /// `unused_extern_crates` of `krate`: unused, or one a `use` could replace.
-    fn extern_crate(&mut self, cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, krate: &ExternCrate<'_>, maybe_unused: &HashSet<hir_def::ExternCrateId>) {
+    fn extern_crate(&mut self, cx: &Cx<'_, '_>, uses: &Uses<'_, '_>, krate: &ExternCrate<'_>, maybe_unused: &HashSet<hir_def::ExternCrateId, Global>) {
         let node = krate.node;
         let at = node.map(|it| ast::ptr(it.syntax()));
         let name = krate.name.as_str();
@@ -384,8 +383,8 @@ fn is_used(uses: &Uses<'_, '_>, binding: Binding, tree: &Tree<'_>) -> bool {
 }
 
 /// The trees directly in each tree of `item`, by index.
-fn children(item: &UseItem<'_>) -> HashMap<usize, Vec<usize>> {
-    let mut children: HashMap<usize, Vec<usize>> = HashMap::default();
+fn children(item: &UseItem<'_>) -> HashMap<usize, Vec<usize>, Global> {
+    let mut children: HashMap<usize, Vec<usize>, Global> = HashMap::new_in(Global);
     for (j, tree) in item.trees.iter().enumerate() {
         if let Some(parent) = tree.parent {
             children.entry(parent as usize).or_default().push(j);
@@ -405,7 +404,7 @@ enum Calc {
 /// item with an unused tree.
 fn calc_unused_spans(
     item: &UseItem<'_>,
-    children: &HashMap<usize, Vec<usize>>,
+    children: &HashMap<usize, Vec<usize>, Global>,
     unused: &Trees,
     j: usize,
     item_span: TextRange,
@@ -797,9 +796,10 @@ fn may_be_unused(cx: &Cx<'_, '_>, krate: hir::Crate) -> bool {
         CrateOrigin::Lang(_) => return false,
         _ => {}
     }
+    let finders = KEPT.map(memmem::Finder::new);
     for module in krate.modules_iter(db) {
         let Some(file) = module.as_source_file_id(db) else { continue };
-        if mentions_kept(cx.file_text(file.file_id(db)).as_bytes()) {
+        if mentions_kept(&finders, cx.file_text(file.file_id(db)).as_bytes()) {
             return false;
         }
     }
@@ -810,11 +810,10 @@ const KEPT: [&str; 5] = ["compiler_builtins", "panic_runtime", "global_allocator
 
 /// Whether `text` has one of [`KEPT`] as a word, or a word starting `eii_`. One SIMD substring
 /// search per name (memchr's `memmem`, chosen for the machine at run time) over the source as
-/// it is in the database; no copy, no allocation.
-fn mentions_kept(text: &[u8]) -> bool {
-    static FINDERS: LazyLock<[memmem::Finder<'static>; 5]> = LazyLock::new(|| KEPT.map(memmem::Finder::new));
+/// it is in the database; no copy, no allocation. `finders` are [`KEPT`]'s, in order.
+fn mentions_kept(finders: &[memmem::Finder<'static>; 5], text: &[u8]) -> bool {
     let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    FINDERS.iter().zip(KEPT).any(|(finder, name)| {
+    finders.iter().zip(KEPT).any(|(finder, name)| {
         finder.find_iter(text).any(|at| {
             let end = at + name.len();
             let starts = at == 0 || !ident(text[at - 1]);

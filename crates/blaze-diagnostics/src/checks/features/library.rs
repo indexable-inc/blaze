@@ -24,6 +24,7 @@
 //! `compiler/rustc_span/src/source_map.rs` (`span_extend_to_line`) (MIT or Apache-2.0).
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir::InFile;
 use smallvec::SmallVec;
 use stdx::edit_distance::find_best_match_for_name;
@@ -68,7 +69,7 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features) 
         found.push(Found::lint(diag, Phase::Items, lint_at));
     };
 
-    let mut lang = HashSet::default();
+    let mut lang = HashSet::new_in(Global);
     for enabled in &features.lang {
         if let Some(since) = enabled.since {
             lint(&mut found, stable(cx, enabled.at, &enabled.name, since));
@@ -207,9 +208,9 @@ enum Stability {
 #[derive(Default)]
 struct Library {
     /// Each feature with what the first attribute naming it says of it and where that is.
-    features: HashMap<String, (Stability, InFile<TextRange>)>,
+    features: HashMap<String, (Stability, InFile<TextRange>), Global>,
     /// Each `implied_by` of the crate's unstable definitions, with the feature it implies.
-    implications: HashMap<String, String>,
+    implications: HashMap<String, String, Global>,
     removed: Vec<Removed>,
 }
 
@@ -296,7 +297,7 @@ impl<'a, 'c, 'db> Libraries<'a, 'c, 'db> {
     }
 
     /// rustc's `all_implications`: the crate's own, then each crate's in order.
-    fn implications(&mut self, local: &Library) -> HashMap<String, String> {
+    fn implications(&mut self, local: &Library) -> HashMap<String, String, Global> {
         self.load_all();
         // clone: once per check, only when a stable feature is enabled
         let mut all = local.implications.clone();
@@ -327,13 +328,13 @@ fn needs_all(library: &Library, remaining: &Remaining) -> bool {
 struct Check<'a, 'c, 'db> {
     cx: &'a Cx<'c, 'db>,
     remaining: &'a mut Remaining,
-    implications: &'a mut HashMap<String, String>,
+    implications: &'a mut HashMap<String, String, Global>,
     /// Whether `stable_features` may fire anywhere in the crate ([`Cx::lint_may_fire`]): when
     /// it can't, a stable feature is passed over with nothing read or built for it.
     stable_lint: bool,
     /// rustc's `all_implications`, read once a library has a stable feature the crate enables
     /// ([`needs_all`]) and `stable_lint` holds.
-    all: Option<&'a HashMap<String, String>>,
+    all: Option<&'a HashMap<String, String, Global>>,
     found: &'a mut Vec<Found>,
     lint_at: InFile<syntax::SyntaxNodePtr>,
 }
@@ -435,7 +436,7 @@ fn similar<'a>(names: &[&'a str], feature: &str) -> Option<&'a str> {
 /// The crates rustc loads besides the crate (`tcx.crates(())`): its dependencies and theirs, each
 /// once, depth first in the order the crate graph lists them.
 fn crates(cx: &Cx<'_, '_>) -> Vec<hir::Crate> {
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     seen.insert(cx.krate);
     // alloc: setup, once per check that enables a library feature
     let mut order = Vec::new();

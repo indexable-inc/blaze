@@ -1,4 +1,5 @@
 use crate::resolver::{HashMap, HashSet};
+use std::alloc::Global;
 use std::collections::BTreeMap;
 
 use tracing::trace;
@@ -141,15 +142,15 @@ pub(super) struct ConflictCache {
     // as a global cache which we never delete from. Any entry in this map is
     // unconditionally true regardless of our resolution history of how we got
     // here.
-    con_from_dep: HashMap<Dependency, ConflictStoreTrie>,
+    con_from_dep: HashMap<Dependency, ConflictStoreTrie, Global>,
     // `dep_from_pid` is an inverse-index of `con_from_dep`.
     // For every `PackageId` this lists the `Dependency`s that mention it in `dep_from_pid`.
-    dep_from_pid: HashMap<PackageId, HashSet<Dependency>>,
+    dep_from_pid: HashMap<PackageId, HashSet<Dependency, Global>, Global>,
 }
 
 impl ConflictCache {
     pub(super) fn new() -> ConflictCache {
-        ConflictCache { con_from_dep: HashMap::default(), dep_from_pid: HashMap::default() }
+        ConflictCache { con_from_dep: HashMap::new_in(Global), dep_from_pid: HashMap::new_in(Global) }
     }
     pub(super) fn find(
         &self,
@@ -208,7 +209,7 @@ impl ConflictCache {
     pub(super) fn dependencies_conflicting_with(
         &self,
         pid: PackageId,
-    ) -> Option<&HashSet<Dependency>> {
+    ) -> Option<&HashSet<Dependency, Global>> {
         self.dep_from_pid.get(&pid)
     }
 }

@@ -750,12 +750,13 @@ fn big_and_aligned_frames() {
 
 #[test]
 fn refuses_what_cranelift_refuses() {
+    // A tail call from a System V function is to one of its own convention.
     let tail = build(sig(CallConv::SystemV, &[], &[]), |b, _| {
-        let callee = import(b, 0, sig(CallConv::SystemV, &[], &[]), true);
+        let callee = import(b, 0, sig(CallConv::Tail, &[], &[]), true);
         b.ins().return_call(callee, &[]);
     });
     let e = compile(&tail, &LINUX).unwrap_err();
-    assert!(e.inst.is_some() && e.what.contains("tail"), "{e}");
+    assert!(e.inst.is_some() && e.what.contains("convention"), "{e}");
 
     let catching = build(sig(CallConv::WindowsFastcall, &[], &[]), |b, _| {
         let callee = import(b, 0, sig(CallConv::WindowsFastcall, &[], &[]), true);

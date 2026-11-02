@@ -267,6 +267,10 @@ fn cfg_printed(given: &Given<'_>, tuple: &str, host: &str, nightly: bool) -> Opt
         cfgs: given.cfgs.iter().map(|it| (*it).to_owned()).collect(),
         proc_macro: given.crate_types.contains(&"proc-macro"),
         sanitizer: None,
+        // `Given::of` answers no `-Z contract-checks`: it is `Modelled`, not `Ignored`, so its
+        // `-Z` arm returns `None` and rustc's own answer is taken. Every line answered here has
+        // none, which is off.
+        contract_checks: false,
         stable: !nightly,
     };
     let (cfgs, skipped) = target::target_cfg_told(tuple, &args).ok()?;

@@ -1,0 +1,27 @@
+[package]
+name = "blaze-storemodel"
+description = "A model checker of blaze's store and kernel protocol: the real blaze-cas and blaze-kernel state machines driven through every interleaving of a few actors, with a crash injected after every IO decision on a file system that models what a crash may keep"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-cas.workspace = true
+blaze-core.workspace = true
+blaze-ids.workspace = true
+blaze-kernel.workspace = true
+blaze-rng.workspace = true
+blaze-store-check.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

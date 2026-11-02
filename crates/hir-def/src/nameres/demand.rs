@@ -15,6 +15,7 @@ use std::ops::ControlFlow;
 
 use base_db::{Crate, Db};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir_expand::{ErasedAstId, InFile, name::Name};
 use intern::Symbol;
 use syntax::{
@@ -168,8 +169,8 @@ pub fn walk_bodies<'db>(
     mut each: impl FnMut(DefWithBodyId, &BodyBlocks<'db>),
 ) {
     // alloc: once per walk, at the roots' count
-    let mut seen: HashSet<DefWithBodyId> =
-        HashSet::with_capacity_and_hasher(roots.len(), Default::default());
+    let mut seen: HashSet<DefWithBodyId, Global> =
+        HashSet::with_capacity_in(roots.len(), Global);
     seen.extend(roots.iter().copied());
     let mut queue = roots;
     queue.reverse();
@@ -214,7 +215,7 @@ pub(crate) fn walk_bodies_saying<'db>(
     // The macros of the blocks lowered so far: a `macro_rules!` of a block is seen by the
     // bodies declared in it, which are visited after it. Seen by the others too, which only
     // lowers more.
-    let local = std::cell::RefCell::new(HashSet::<SmolStr>::default());
+    let local = std::cell::RefCell::new(HashSet::<SmolStr, Global>::default());
     let roots = crate_body_owners(db, krate);
     walk_bodies(
         db,
@@ -401,7 +402,7 @@ impl Look {
         self,
         db: &Db,
         owner: DefWithBodyId,
-        local: &HashSet<SmolStr>,
+        local: &HashSet<SmolStr, Global>,
     ) -> bool {
         let Some(body) = body_syntax(db, owner) else { return false };
         let declaring = self.macros(db, owner.module(db).krate(db));
@@ -423,7 +424,7 @@ impl Look {
         self,
         db: &Db,
         scope: &ItemScope,
-        declaring: &HashSet<SmolStr>,
+        declaring: &HashSet<SmolStr, Global>,
     ) -> Vec<Symbol> {
         // alloc: the query's result, once per execution (per crate or per body)
         let mut found = Vec::new();
@@ -456,7 +457,7 @@ impl Look {
     /// [`macros_declaring_roots`] and [`macros_writing_diagnostic_items`]: the macros of
     /// `krate` that may write such an item, with those of its dependencies.
     fn crate_macros(self, db: &Db, krate: Crate) -> Box<[Symbol]> {
-        let mut known: HashSet<Symbol> = HashSet::default();
+        let mut known: HashSet<Symbol, Global> = HashSet::new_in(Global);
         for dep in &krate.data(db).dependencies {
             known.extend(self.macros(db, dep.crate_id).iter().copied());
         }
@@ -464,7 +465,7 @@ impl Look {
         let mut found = Vec::new();
         // alloc: the query's result, once per execution (per crate or per body)
         let mut calling = Vec::new();
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new_in(Global);
         for (_, module) in crate_def_map(db, krate).modules(db) {
             for (name, id) in scope_macros(module.scope(db)) {
                 if seen.insert((name, id)) {
@@ -537,7 +538,7 @@ fn body_syntax(db: &Db, owner: DefWithBodyId) -> Option<ast::Node<'_>> {
 /// syntax, and lowers no body. A body of which this is false declares no such item, though it
 /// may declare others; those are reached through it.
 pub fn may_declare_roots(db: &Db, owner: DefWithBodyId) -> bool {
-    Look::Roots.may_say(db, owner, &HashSet::default())
+    Look::Roots.may_say(db, owner, &HashSet::new_in(Global))
 }
 
 /// What a macro is made of, for whether it may write an item a build keeps.
@@ -597,7 +598,7 @@ fn settle(
     known: impl Fn(&Symbol) -> bool,
 ) -> Vec<Symbol> {
     // alloc: the query's result, once per execution (per crate or per body)
-    let mut writing: HashSet<Symbol> = found.iter().copied().collect();
+    let mut writing: HashSet<Symbol, Global> = found.iter().copied().collect();
     loop {
         let before = found.len();
         calling.retain(|(name, words)| {

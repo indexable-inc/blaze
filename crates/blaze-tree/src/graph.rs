@@ -9,10 +9,11 @@
 //! node and edge kind, sorted by rank and deduplicated in the same pass.
 
 use std::cmp::Ordering;
-use std::collections::hash_map::Entry;
+use blaze_hash::hash_map::Entry;
 use std::ops::Range;
 
-use blaze_hash::{FixedState, HashMap};
+use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_resolve::resolver::{CliFeatures, CompileKind, FeaturesFor, ResolvedFeatures};
 use blaze_resolve::{
     DepKind, Dependency, FeatureMap, FeatureValue, InternedString, PackageId, Resolve, Summary,
@@ -203,7 +204,7 @@ pub(crate) struct Graph<'a> {
     slots: Vec<NodeId>,
     stride: usize,
     /// The feature nodes by `(package node, name)`.
-    feature_index: HashMap<(NodeId, usize), NodeId>,
+    feature_index: HashMap<(NodeId, usize), NodeId, Global>,
     /// After [`Graph::restrict`], the nodes still in the graph.
     live: Option<Bits>,
 }
@@ -233,7 +234,7 @@ impl<'a> Graph<'a> {
             dep_names: Vec::with_capacity(names),
             slots,
             stride,
-            feature_index: HashMap::with_capacity_and_hasher(if graph_features { nodes } else { 0 }, FixedState),
+            feature_index: HashMap::with_capacity_in(if graph_features { nodes } else { 0 }, Global),
             live: None,
         }
     }

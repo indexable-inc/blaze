@@ -71,15 +71,16 @@ fn allocate<'db>(
 }
 
 /// A slice's two words: where it starts and its length.
-fn fat(addr: Address, len: usize) -> OwnedBytes {
-    let mut bytes = OwnedBytes::from_slice(&addr.to_bytes());
-    bytes.extend_from_slice(&word_bytes(len));
+fn fat(addr: Address, len: usize, word: usize) -> OwnedBytes {
+    let mut bytes = OwnedBytes::from_slice(&addr.to_bytes(word));
+    bytes.extend_from_slice(&word_bytes(len, word));
     bytes
 }
 
 /// `text` in the heap, as a `&str`.
 fn write_str<'db>(evaluator: &mut Evaluator<'db>, text: &str) -> Result<'db, OwnedBytes> {
-    Ok(fat(allocate(evaluator, text.as_bytes(), 1)?, text.len()))
+    let word = evaluator.ptr_size();
+    Ok(fat(allocate(evaluator, text.as_bytes(), 1)?, text.len(), word))
 }
 
 /// `input` in the heap, as a `&const_ast::Item`: its arrays, the `Tree` of them (`repr(C)`,
@@ -105,26 +106,26 @@ fn write_item<'db>(evaluator: &mut Evaluator<'db>, input: &FlatInput) -> Result<
                 "a const macro's flat tree has a token past its text".into(),
             ));
         }
-        texts.extend_from_slice(&fat(text.offset(from), to - from));
+        texts.extend_from_slice(&fat(text.offset(from), to - from, ptr_size));
         start = end;
     }
     // The arrays' bytes, each built in `scratch` just before it is allocated.
     let mut scratch = Vec::with_capacity(len * 4);
     scratch.extend(input.kinds.iter().flat_map(|it| it.to_le_bytes()));
     let mut tree = Vec::with_capacity(8 * ptr_size);
-    tree.extend_from_slice(&fat(allocate(evaluator, &scratch, 2)?, len));
+    tree.extend_from_slice(&fat(allocate(evaluator, &scratch, 2)?, len, ptr_size));
     scratch.clear();
     scratch.extend(input.ends.iter().flat_map(|it| it.to_le_bytes()));
-    tree.extend_from_slice(&fat(allocate(evaluator, &scratch, 4)?, len));
+    tree.extend_from_slice(&fat(allocate(evaluator, &scratch, 4)?, len, ptr_size));
     scratch.clear();
     scratch.extend(input.spans.iter().flat_map(|it| it.to_le_bytes()));
-    tree.extend_from_slice(&fat(allocate(evaluator, &scratch, 4)?, len));
-    tree.extend_from_slice(&fat(allocate(evaluator, &texts, ptr_size)?, len));
+    tree.extend_from_slice(&fat(allocate(evaluator, &scratch, 4)?, len, ptr_size));
+    tree.extend_from_slice(&fat(allocate(evaluator, &texts, ptr_size)?, len, ptr_size));
     let tree = allocate(evaluator, &tree, ptr_size)?;
-    let mut item = OwnedBytes::from_slice(&tree.to_bytes());
+    let mut item = OwnedBytes::from_slice(&tree.to_bytes(ptr_size));
     item.extend_from_slice(&input.item.to_le_bytes());
     item.resize(2 * ptr_size, 0);
-    Ok(OwnedBytes::from_slice(&allocate(evaluator, &item, ptr_size)?.to_bytes()))
+    Ok(OwnedBytes::from_slice(&allocate(evaluator, &item, ptr_size)?.to_bytes(ptr_size)))
 }
 
 /// The text of a `String` (or anything laid out as one: a pointer to its bytes, its capacity
@@ -141,10 +142,10 @@ fn read_string<'db>(evaluator: &Evaluator<'db>, value: Interval) -> Result<'db, 
     let bytes = value.get(evaluator)?;
     let mut words = Vec::with_capacity(3);
     for word in bytes.chunks(ptr_size) {
-        words.push(from_bytes!(usize, word));
+        words.push(from_bytes!(usize, ptr_size, word));
     }
     let Some(addr) =
-        words.iter().map(|&it| Address::from_usize(it)).find(|it| matches!(it.at(), Heap(_)))
+        words.iter().map(|&it| Address::from_usize(it, ptr_size)).find(|it| matches!(it.at(), Heap(_)))
     else {
         // An empty `String` holds a dangling pointer, not one into the heap.
         return Ok(String::new()); // alloc: empty, allocates nothing
@@ -153,7 +154,7 @@ fn read_string<'db>(evaluator: &Evaluator<'db>, value: Interval) -> Result<'db, 
     let len = words
         .iter()
         .copied()
-        .filter(|&it| !matches!(Address::from_usize(it).at(), Heap(_)))
+        .filter(|&it| !matches!(Address::from_usize(it, ptr_size).at(), Heap(_)))
         .min()
         .unwrap_or(0);
     let text = evaluator.read_memory(addr, len)?;

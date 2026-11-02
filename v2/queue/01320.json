@@ -6,10 +6,10 @@
     "crates/hir-ty-codegen/mod.rs"
   ],
   "what": "hello: 32 of 267 refused in their references walk: \"unsupported: f16, f16b, f128 and ppcf128\" (hir-ty-codegen mod.rs:3312, Primitive::Float), std functions that use f16/f128. full list .coord-1030/b2-build/wt2-refused.txt (hello with blaze --features llvm at d38d64b4ea + 01313, refusal cap raised; 267 functions), counts wt2-causes.txt.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-10-31T16:48:54Z",
-  "updated": "2026-10-31T18:20:09Z",
-  "taken_by": null,
+  "updated": "2026-11-02T03:09:25Z",
+  "taken_by": "speed",
   "why": null,
   "source": null,
   "history": [
@@ -24,6 +24,12 @@
       "by": "coord-1030",
       "action": "reassign",
       "note": "codegen -> speed: codegen has no live window; speed holds hir-ty-codegen (01100, 01307). Blocks hello (goals 1-2)."
+    },
+    {
+      "at": "2026-11-02T03:09:25Z",
+      "by": "speed",
+      "action": "done",
+      "note": "committed in round 12 (3651bc4ebc): f16/f128 on Apple aarch64; hello builds, links and runs (builder-2 wt29, 2026-10-31)"
     }
   ]
 }

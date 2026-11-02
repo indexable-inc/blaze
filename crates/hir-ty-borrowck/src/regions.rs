@@ -994,10 +994,10 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                             output = rustc_type_ir::TypeFoldable::fold_with(output, &mut folder);
                         }
                     }
-                    // Each elided input lifetime is its own region before `&dyn Trait` copies
-                    // it into the object's default, so that the two are the same one. A
-                    // parameter that elides one lifetime has it once however often its type
-                    // does (`S2` of `type S2<'a> = S<'a, 'a>`).
+                    // Each elided input lifetime is one region however often its type has it:
+                    // `&dyn Trait` has it as the reference's and as the object's default, and
+                    // a parameter that elides one lifetime has it once
+                    // (`S2` of `type S2<'a> = S<'a, 'a>`).
                     let resolver = {
                         use hir_def::resolver::HasResolver;
                         function.resolver(self.ctx.db)
@@ -1047,7 +1047,9 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                                     }
                                     _ => return region,
                                 };
-                                errors.push(region);
+                                if !errors.contains(&region) {
+                                    errors.push(region);
+                                }
                                 region
                             });
                     }
@@ -1063,16 +1065,6 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                         output =
                             hir_ty::with_elided_regions(self.ctx.db, output, function, &regions);
                     }
-                    let mut defaults = ObjectDefaults {
-                        db: self.ctx.db,
-                        interner: self.interner(),
-                        keep_static: writes_static_object(&written.store),
-                        erase: false,
-                    };
-                    for input in &mut inputs {
-                        *input = rustc_type_ir::TypeFoldable::fold_with(*input, &mut defaults);
-                    }
-                    output = rustc_type_ir::TypeFoldable::fold_with(output, &mut defaults);
                     // What lifetime elision counts of a parameter that writes `Self`: rustc
                     // looks only at the lifetimes a parameter's type writes or elides, so
                     // the impl's (`self` of `impl Foo<'_>`, `other: Self`) are none of them.
@@ -1089,8 +1081,6 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                                 .instantiate_identity()
                                 .skip_norm_wip(),
                         };
-                        let impl_self =
-                            rustc_type_ir::TypeFoldable::fold_with(impl_self, &mut defaults);
                         let unit = Ty::new_unit(self.interner());
                         let mut folder = Replace::new(self.interner(), (impl_self, unit));
                         self_free = mem::collect(
@@ -2503,12 +2493,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                         }
                     }
                     ClauseKind::TypeOutlives(OutlivesClause(ty, region)) => {
-                        if let Some(region) =
-                            self.signature_region(region, rustc_type_ir::INNERMOST).and_then(rv_of)
-                        {
-                            let ty = self.signature_ty(ty);
-                            self.regions.type_bounds.push((ty, region));
-                        }
+                        self.where_clause_outlives(ty, region, &mut pairs);
                     }
                     _ => (),
                 }
@@ -2521,12 +2506,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             for clause in clauses {
                 match clause.kind().skip_binder() {
                     ClauseKind::TypeOutlives(OutlivesClause(ty, region)) => {
-                        if let Some(region) =
-                            self.signature_region(region, rustc_type_ir::INNERMOST).and_then(rv_of)
-                        {
-                            let ty = self.signature_ty(ty);
-                            self.regions.type_bounds.push((ty, region));
-                        }
+                        self.where_clause_outlives(ty, region, &mut pairs);
                     }
                     ClauseKind::RegionOutlives(OutlivesClause(longer, shorter)) => {
                         if let (Some(longer), Some(shorter)) = (
@@ -2583,6 +2563,36 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             }
         }
         self.regions.known = known;
+    }
+
+    /// A where clause `ty: 'r`, split as rustc's elaboration of the param env splits it into
+    /// its outlives components: each region in `ty` outlives `'r`, and so does each parameter
+    /// and projection in it. `Self: 'b` in `impl<'a, T> Foo<'a, T>` says `'a: 'b` and `T: 'b`.
+    fn where_clause_outlives(
+        &mut self,
+        ty: Ty<'db>,
+        region: Region<'db>,
+        pairs: &mut FVec<'a, (Rv, Rv)>,
+    ) {
+        let Some(shorter) = self.signature_region(region, rustc_type_ir::INNERMOST).and_then(rv_of)
+        else {
+            return;
+        };
+        let ty = self.signature_ty(ty);
+        self.regions.type_bounds.push((ty, shorter));
+        // rustc leaves out a component that names a bound region (`Component::EscapingAlias`).
+        if rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&ty) {
+            return;
+        }
+        let mut components = self.scratch.rvs.take();
+        let mut params = self.scratch.tys.take();
+        self.implied_components(ty, &mut components, &mut params);
+        pairs.extend(components.iter().map(|&longer| (longer, shorter)));
+        self.regions
+            .type_bounds
+            .extend(params.iter().filter(|&&it| it != ty).map(|&it| (it, shorter)));
+        self.scratch.rvs.give(components);
+        self.scratch.tys.give(params);
     }
 
     /// The self type of the impl `function` is in with its anonymous lifetimes universal
@@ -3021,14 +3031,6 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         else {
             return;
         };
-        let written = FunctionSignature::of(self.ctx.db, function);
-        let mut defaults = ObjectDefaults {
-            db: self.ctx.db,
-            interner: self.interner(),
-            keep_static: writes_static_object(&written.store),
-            erase: false,
-        };
-        let typed = rustc_type_ir::TypeFoldable::fold_with(typed, &mut defaults);
         let typed = match self.async_declared_output(function) {
             Some(declared) => self.unnamed_hidden(typed, declared),
             None => typed,
@@ -3634,8 +3636,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             return;
         }
         let opaque = alias.kind.try_to_opaque();
-        if opaque.is_none()
-            && let Some(normalized) = self.normalize(ty)
+        let normalized = if opaque.is_none() { self.normalize(ty) } else { None };
+        if let Some(normalized) = normalized
             && !matches!(normalized.kind(), TyKind::Alias(_, _) | TyKind::Infer(_))
         {
             self.type_outlives_at(normalized, region, at, depth + 1);
@@ -3661,6 +3663,21 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                     _ => None,
                 }),
         );
+        // What it normalizes to when that is another alias, as rustc's type check normalizes
+        // a callee's signature before it proves it well-formed: `<[V] as Index<I>>::Output` is
+        // `<I as SliceIndex<[V]>>::Output`, which `&'r Self::Output` in the signature of
+        // `impl<I: SliceIndex<[V]>> Index<I> for A` implies outlives `'r`.
+        if !in_env
+            && from_trait.is_empty()
+            && depth <= 4
+            && let Some(normalized) = normalized
+            && normalized != ty
+            && let TyKind::Alias(_, _) = normalized.kind()
+        {
+            self.scratch.regions.give(from_trait);
+            self.alias_outlives(normalized, region, at, depth + 1);
+            return;
+        }
         let mut has_regions = false;
         rustc_type_ir::fold_regions(interner, alias.args, |region, _| {
             has_regions |= !matches!(region.kind(), RegionKind::ReBound(..));
@@ -4232,6 +4249,38 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         Some(self.written(args))
     }
 
+    /// For each error region of `sig`, `function`'s signature, in the order `fold_regions`
+    /// meets them, which lifetime the signature leaves out it is, and how many there are: each
+    /// one once however often its type has it (`&dyn Trait` has the reference's twice), by
+    /// [`hir_ty::elided_groups`]; each error one of its own in a type that does not line up.
+    fn elided_slots(
+        &self,
+        function: Option<hir_def::FunctionId>,
+        sig: hir_ty::next_solver::FnSig<'db>,
+    ) -> (FVec<'a, usize>, usize) {
+        let interner = self.interner();
+        let groups = function.map(|it| hir_ty::elided_groups(self.ctx.db, it));
+        let inputs = sig.inputs().len();
+        let (mut slots, mut count) = (Vec::new_in(self.ctx.frame), 0);
+        for (index, ty) in sig.inputs_and_output.iter().enumerate() {
+            let groups = groups.and_then(|groups| match index < inputs {
+                true => groups.of(interner, index, ty),
+                false => groups.of_output(interner, ty),
+            });
+            let (start, mut seen) = (count, 0);
+            rustc_type_ir::fold_regions(interner, ty, |region, _| {
+                if region.is_error() {
+                    let slot = start + groups.map_or(seen, |it| it[seen] as usize);
+                    seen += 1;
+                    slots.push(slot);
+                    count = count.max(slot + 1);
+                }
+                region
+            });
+        }
+        (slots, count)
+    }
+
     /// A type written in the body, lowered as inference lowers it, its lifetimes the
     /// signature's where it names them.
     /// For each error in `ty`, the type of `function`'s parameter written `param`, which of the
@@ -4247,7 +4296,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         let db = self.ctx.db;
         let resolver = function.resolver(db);
         let signature = FunctionSignature::of(db, function);
-        let generics = std::cell::OnceCell::new();
+        let generics = hir_ty::generics::generics(db, function.into());
         let lowered = hir_ty::TyLoweringContext::new(
             db,
             &resolver,
@@ -4623,7 +4672,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             MirSpan::ExprId(expr) => Some(resolver.update_to_inner_scope(db, store_owner, expr)),
             _ => None,
         };
-        let generics = std::cell::OnceCell::new();
+        let generics = hir_ty::generics::generics(db, self.ctx.owner.generic_def(db));
         let mut ctx = hir_ty::TyLoweringContext::new(
             db,
             &resolver,
@@ -4688,17 +4737,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                                 .callable_item_signature(def.0)
                                 .instantiate(self.interner(), args)
                                 .skip_norm_wip();
-                            // An elided `&dyn Trait` of a function's is `&'r (dyn Trait + 'r)`,
-                            // once `'r` is a lifetime of the signature's and not an error.
-                            let mut defaults = match def.0 {
-                                CallableDefId::FunctionId(function) => Some(ObjectDefaults {
-                                    db: self.ctx.db,
-                                    interner: self.interner(),
-                                    keep_static: writes_static_object(
-                                        &FunctionSignature::of(self.ctx.db, function).store,
-                                    ),
-                                    erase: false,
-                                }),
+                            let function = match def.0 {
+                                CallableDefId::FunctionId(function) => Some(function),
                                 _ => None,
                             };
                             // To a `for<'a> fn`, the item's signature keeps its own `for<'a>`,
@@ -4713,16 +4753,19 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                                 // target and would have to outlive `'static`.
                                 let interner = self.interner();
                                 let bound_vars = sig.bound_vars();
-                                let mut elided = 0;
+                                let (slots, elided) =
+                                    self.elided_slots(function, sig.skip_binder());
+                                let mut slots = slots.into_iter();
                                 let inner = rustc_type_ir::fold_regions(
                                     interner,
                                     sig.skip_binder(),
                                     |r, depth| match r.kind() {
                                         RegionKind::ReError(_) => {
+                                            let slot =
+                                                slots.next().expect("a slot for each error");
                                             let var = rustc_type_ir::BoundVar::from_usize(
-                                                bound_vars.len() + elided,
+                                                bound_vars.len() + slot,
                                             );
-                                            elided += 1;
                                             Region::new_bound(
                                                 interner,
                                                 depth,
@@ -4735,12 +4778,6 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                                         _ => r,
                                     },
                                 );
-                                let inner = match &mut defaults {
-                                    Some(defaults) => {
-                                        rustc_type_ir::TypeFoldable::fold_with(inner, defaults)
-                                    }
-                                    None => inner,
-                                };
                                 let bound_vars = hir_ty::next_solver::BoundVarKinds::new_from_slice(
                                     &mem::collect(
                                         self.ctx.frame,
@@ -4765,18 +4802,18 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                                 hir_ty::next_solver::infer::BoundRegionConversionTime::FnCall,
                                 sig,
                             );
+                            let (slots, elided) = self.elided_slots(function, sig);
+                            let mut regions = filled(self.ctx.frame, elided, None);
+                            let mut slots = slots.into_iter();
                             let sig = rustc_type_ir::fold_regions(self.interner(), sig, |r, _| {
                                 match r.kind() {
-                                    RegionKind::ReError(_) => self.fresh_elided(),
+                                    RegionKind::ReError(_) => {
+                                        let slot = slots.next().expect("a slot for each error");
+                                        *regions[slot].get_or_insert_with(|| self.fresh_elided())
+                                    }
                                     _ => r,
                                 }
                             });
-                            let sig = match &mut defaults {
-                                Some(defaults) => {
-                                    rustc_type_ir::TypeFoldable::fold_with(sig, defaults)
-                                }
-                                None => sig,
-                            };
                             let wf = At { category: Category::Boring, span };
                             for ty in sig.inputs_and_output.iter() {
                                 self.well_formed(ty, wf, 0);
@@ -5330,7 +5367,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                             self.path_well_formed(expr, container, fn_args, span);
                         }
                         let mut impl_self = None;
-                        let (self_param, keep_static, returns_self, static_self) = match def {
+                        let (self_param, returns_self) = match def {
                             CallableDefId::FunctionId(it) => {
                                 self.error_region |= signature_lifetime_error(self.ctx.db, it);
                                 let written = FunctionSignature::of(self.ctx.db, it);
@@ -5358,14 +5395,9 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                                         hir_def::hir::type_ref::TypeRef::Path(path)
                                             if path.is_self_type())
                                 });
-                                (
-                                    written.has_self_param(),
-                                    writes_static_object(&written.store),
-                                    returns_self,
-                                    written.has_self_param() && self.impl_of_static_object(it),
-                                )
+                                (written.has_self_param(), returns_self)
                             }
-                            _ => (false, true, false, false),
+                            _ => (false, false),
                         };
                         let function = match def {
                             CallableDefId::FunctionId(it) => Some(it),
@@ -5377,9 +5409,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                             sig.inputs().as_slice(),
                             sig.output(),
                             self_param,
-                            keep_static,
                             returns_self,
-                            static_self,
                             impl_self,
                             &mut inputs,
                         );
@@ -5512,15 +5542,6 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         }
     }
 
-    /// Whether `function` is of an impl for a `dyn Trait + 'static`.
-    fn impl_of_static_object(&self, function: hir_def::FunctionId) -> bool {
-        let ItemContainerId::ImplId(impl_) = function.lookup(self.ctx.db).container else {
-            return false;
-        };
-        let ty = self.ctx.db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
-        matches!(ty.kind(), TyKind::Dynamic(_, region) if matches!(region.kind(), RegionKind::ReStatic))
-    }
-
     /// Whether the closure `id` is of this body and writes no type of a parameter or of its
     /// return: the lifetimes rustc infers for its signature are in its type, the same for every
     /// call, where those a written `&T` elides are the call's own.
@@ -5538,8 +5559,6 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
     /// region variables by the elision rules: each elided input lifetime its own, an elided
     /// output lifetime that of `self` when `self` is a reference, else that of the only
     /// lifetime of the inputs. The default lifetime of a trait object is not one of them.
-    /// `static_self`: `self` is of an impl for `dyn Trait`, whose lifetime the impl's header
-    /// defaults to `'static` (`impl dyn Trait { fn f(&self) }`), not the reference's.
     /// An `impl Trait` `function` returns has, for each lifetime its parameters leave out, that
     /// lifetime's region.
     /// `impl_self`: the self type of the impl `function` is in, which parameters write `Self`
@@ -5553,14 +5572,12 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         inputs: &[Ty<'db>],
         output: Ty<'db>,
         self_param: bool,
-        keep_static: bool,
         returns_self: bool,
-        static_self: bool,
         impl_self: Option<(Ty<'db>, FVec<'_, bool>, bool)>,
         out: &mut FVec<'a, Ty<'db>>,
     ) -> Ty<'db> {
         let interner = self.interner();
-        let mut defaults = ObjectDefaults { db: self.ctx.db, interner, keep_static, erase: false };
+        let groups = function.map(|it| hir_ty::elided_groups(self.ctx.db, it));
         let mut errors = filled(self.ctx.frame, inputs.len(), Vec::new_in(self.ctx.frame));
         let (impl_self, writes_self, ret_self) = match impl_self {
             Some((raw, writes, ret)) => {
@@ -5588,18 +5605,29 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 ),
                 _ => ty,
             };
-            let ty = rustc_type_ir::fold_regions(interner, ty, |region, _| match region.kind() {
+            // One region for each lifetime left out, `&dyn Trait`'s reference and object
+            // sharing it.
+            let groups = match writes_self(index) {
+                true => None,
+                false => groups.and_then(|groups| groups.of(interner, index, ty)),
+            };
+            let errors = &mut errors[index];
+            let mut seen = 0;
+            rustc_type_ir::fold_regions(interner, ty, |region, _| match region.kind() {
                 RegionKind::ReError(_) => {
-                    let region = self.fresh_elided();
-                    errors[index].push(region);
-                    region
+                    let group = groups.map(|it| it[seen] as usize);
+                    seen += 1;
+                    match group.and_then(|it| errors.get(it)) {
+                        Some(&region) => region,
+                        None => {
+                            let region = self.fresh_elided();
+                            errors.push(region);
+                            region
+                        }
+                    }
                 }
                 _ => region,
-            });
-            if static_self && index == 0 {
-                return ty;
-            }
-            rustc_type_ir::TypeFoldable::fold_with(ty, &mut defaults)
+            })
         }));
         let inputs: &[Ty<'db>] = out;
         let self_region = match inputs.first().map(|it| it.kind()) {
@@ -5611,10 +5639,6 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             for (index, ty) in inputs.iter().enumerate() {
                 let ty = match impl_self {
                     Some((_, named)) if writes_self(index) => {
-                        let named = match static_self && index == 0 {
-                            true => named,
-                            false => rustc_type_ir::TypeFoldable::fold_with(named, &mut defaults),
-                        };
                         let unit = Ty::new_unit(interner);
                         rustc_type_ir::TypeFoldable::fold_with(
                             *ty,
@@ -5648,13 +5672,11 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         };
         // A return of `Self` elides nothing: its anonymous lifetimes are the impl's,
         // `impl Foo<'_>`, which rust-analyzer leaves as errors too.
-        let output =
-            rustc_type_ir::fold_regions(interner, output, |region, _| match region.kind() {
-                RegionKind::ReError(_) if returns_self => self.fresh(),
-                RegionKind::ReError(_) => elided.unwrap_or_else(|| self.fresh_elided()),
-                _ => region,
-            });
-        rustc_type_ir::TypeFoldable::fold_with(output, &mut defaults)
+        rustc_type_ir::fold_regions(interner, output, |region, _| match region.kind() {
+            RegionKind::ReError(_) if returns_self => self.fresh(),
+            RegionKind::ReError(_) => elided.unwrap_or_else(|| self.fresh_elided()),
+            _ => region,
+        })
     }
 
     /// The where clauses of what a call calls, which the caller must prove.
@@ -6439,6 +6461,8 @@ fn prove_query(
         let env = env.as_ref(db);
         let interner = DbInterner::new_with(db, env.krate).with_regions();
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+        // Before the region variables, so they can name a `for const` binder of `env`.
+        hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
         for _ in 0..vars {
             infcx.next_region_var(hir_ty::Span::Dummy);
         }
@@ -7352,6 +7376,8 @@ fn normalize_query(
         let env = env.as_ref(db);
         let interner = DbInterner::new_with(db, env.krate).with_regions();
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+        // Before the region variables, so they can name a `for const` binder of `env`.
+        hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
         for _ in 0..vars {
             infcx.next_region_var(hir_ty::Span::Dummy);
         }
@@ -7399,6 +7425,12 @@ fn normalize_query(
 
 #[cfg(test)]
 mod error_region_tests;
+
+#[cfg(test)]
+mod implied_outlives_tests;
+
+#[cfg(test)]
+mod object_default_tests;
 
 #[cfg(test)]
 mod tests {

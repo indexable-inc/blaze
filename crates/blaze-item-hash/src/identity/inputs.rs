@@ -66,7 +66,7 @@ pub(crate) fn build(db: &Db) -> Option<ContentId> {
 ///   `no_core`, `proc-macro`, `rustc_coherence_is_core` and `recursion_limit`, which covers
 ///   `UnstableFeatures::query` and `crate_recursion_limit` (`no_implicit_prelude` changes
 ///   only what names resolve to, which section 3.5 hashes);
-/// - the borrow checker's mode (`hir_ty_borrowck::mode`, one per process).
+/// - the borrow checker's mode (`hir_ty_borrowck::mode`, one per database).
 ///
 /// MIR building reads no option of its own: overflow checks, debug assertions and the panic
 /// strategy reach the front end as cfg, in the crate's key.
@@ -101,10 +101,11 @@ pub fn crate_inputs(db: &Db, krate: Crate) -> ContentId {
         def_map.is_rustc_coherence_is_core() as u8,
     ]);
     h.update(&def_map.recursion_limit().to_le_bytes());
-    h.update(&[match hir_ty_borrowck::mode() {
+    h.update(&[match hir_ty_borrowck::mode(db) {
         hir_ty_borrowck::Mode::Nll => 0,
         hir_ty_borrowck::Mode::Polonius => 1,
         hir_ty_borrowck::Mode::Off => 2,
+        hir_ty_borrowck::Mode::PoloniusFlow => 3,
     }]);
     h.finish()
 }

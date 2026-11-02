@@ -11,6 +11,7 @@
 use std::{collections::VecDeque, rc::Rc};
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::bits::{BitMatrix, BitSet};
 use hir_ty::mir::{
     AggregateKind, AsmOperand, BasicBlockId, LocalId, MirBody, MirSpan, Operand, OperandKind,
@@ -328,7 +329,7 @@ pub(super) struct Seen<'m> {
 pub(super) struct Flow<'m, 'p, 'db> {
     pub(super) mir: &'m MirBody<'db>,
     places: &'p Places<'db>,
-    specials: &'p HashMap<(u32, u32), Special>,
+    specials: &'p HashMap<(u32, u32), Special, Global>,
     cfg: &'p Cfg,
     kind: CaptureKind,
     /// The state where each block starts, a row per block.
@@ -339,7 +340,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
     pub(super) fn new(
         mir: &'m MirBody<'db>,
         places: &'p Places<'db>,
-        specials: &'p HashMap<(u32, u32), Special>,
+        specials: &'p HashMap<(u32, u32), Special, Global>,
         cfg: &'p Cfg,
         kind: CaptureKind,
     ) -> Self {
@@ -475,7 +476,9 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
             | TerminatorKind::Unreachable
             | TerminatorKind::CoroutineDrop
             | TerminatorKind::FalseEdge { .. }
-            | TerminatorKind::FalseUnwind { .. } => {}
+            | TerminatorKind::FalseUnwind { .. }
+            | TerminatorKind::ComptimeFor { .. }
+            | TerminatorKind::ComptimeNext { .. } => {}
         }
     }
 

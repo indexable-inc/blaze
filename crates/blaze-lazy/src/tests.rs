@@ -53,6 +53,9 @@ pub(crate) fn policy(level: OptLevel, mode: Mode) -> Policy {
         fold: false,
         sanitize: Sanitize::default(),
         pgo: Pgo::None,
+        proc_macro_bridge: false,
+        report: false,
+        heap_to_stack: false,
     }
 }
 

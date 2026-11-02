@@ -11,12 +11,12 @@
 use std::fmt;
 
 use blaze_ids::{ContentId, Hasher};
-use blaze_items::ItemKey;
+use blaze_items::{CodeHash, ItemKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     CompiledFunction, Init, InstanceKey, Settings, Static, Target,
-    driver::{Built, reach::Walk},
+    driver::Built,
     plan::Mode,
 };
 
@@ -479,9 +479,89 @@ pub struct ExecTable {
     /// The content ID of the code the binary runs that is in no table: the premapped
     /// dependency image; zero for none.
     pub beside: ContentId,
-    /// Each test in the harness's order, with the functions it reaches as indices into `fns`,
-    /// sorted.
-    pub tests: Vec<(String, Vec<u32>)>,
+    /// Each test in the harness's order, with its root's node in [`ExecTable::graph`]: what
+    /// it reaches is walked when asked ([`ExecTable::reached`], [`ExecTable::reaches`]), never
+    /// at link, as a binary of thousands of tests that each reach most of the program would
+    /// make tests times functions places at every link (2026-11-01: 2m45s for one binary, more
+    /// than 8 minutes for another) when selection reads them only for a run whose record is
+    /// not whole.
+    pub tests: Vec<(String, u32)>,
+    /// What the binary's code refers to, which its tests' reach is walked over.
+    pub graph: TestGraph,
+}
+
+/// The binary's reference graph as the build walked it (`driver::Reach`), kept with its
+/// table so a test's reach is walked only when asked: per node where its edges start (one
+/// more than there are nodes), the edges, its function's place in [`ExecTable::fns`]
+/// ([`ExecTable::EMPTY`] for a static, or a node that is no function), and its two marks
+/// (code hash and arguments, or value and instance).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+pub struct TestGraph {
+    starts: Vec<u32>,
+    edges: Vec<u32>,
+    place: Vec<u32>,
+    marks: Vec<[ContentId; 2]>,
+}
+
+impl TestGraph {
+    /// The graph of a table whose tests are given as lists of places in `fns` rather than by
+    /// a build: node `i < functions` is the function at place `i`, then one node per list
+    /// that refers to each place it names, marked with zeros. Gives the graph and each list's
+    /// node. For tables made by hand, as tests make them.
+    pub fn listing(functions: u32, lists: &[Vec<u32>]) -> (TestGraph, Vec<u32>) {
+        let nodes = functions as usize + lists.len();
+        let mut graph = TestGraph {
+            // alloc: a table made by hand, sized by its nodes
+            starts: vec![0; functions as usize + 1],
+            // alloc: a table made by hand, sized by its lists
+            edges: Vec::new(),
+            // alloc: a table made by hand, sized by its nodes
+            place: (0..functions).chain(lists.iter().map(|_| ExecTable::EMPTY)).collect(),
+            // alloc: a table made by hand, sized by its nodes
+            marks: vec![[ContentId::default(); 2]; nodes],
+        };
+        // alloc: a table made by hand, a node per list
+        let mut roots = Vec::with_capacity(lists.len());
+        for (at, list) in lists.iter().enumerate() {
+            roots.push(functions + at as u32);
+            graph.edges.extend(list.iter().filter(|&&it| it < functions));
+            graph.starts.push(graph.edges.len() as u32);
+        }
+        (graph, roots)
+    }
+
+    /// Walks what `root` reaches, itself included, each node once, until `stop` says to:
+    /// whether it did. A node or edge past the graph (a corrupt record) is not walked.
+    fn walk(&self, root: u32, mut stop: impl FnMut(u32) -> bool) -> bool {
+        let nodes = self.place.len();
+        if root as usize >= nodes {
+            return false;
+        }
+        // alloc: per walk, a bit per node
+        let mut seen = vec![0u64; nodes.div_ceil(64)];
+        // alloc: per walk, sized by what it reaches
+        let mut stack = vec![root];
+        seen[root as usize / 64] |= 1 << (root % 64);
+        while let Some(at) = stack.pop() {
+            if stop(at) {
+                return true;
+            }
+            let (Some(&from), Some(&to)) = (self.starts.get(at as usize), self.starts.get(at as usize + 1)) else {
+                continue;
+            };
+            for &next in self.edges.get(from as usize..to as usize).unwrap_or_default() {
+                if next as usize >= nodes {
+                    continue;
+                }
+                let (word, bit) = (next as usize / 64, 1u64 << (next % 64));
+                if seen[word] & bit == 0 {
+                    seen[word] |= bit;
+                    stack.push(next);
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Why a binary has no table.
@@ -502,6 +582,9 @@ pub enum ExecError {
     NotCompiled { function: InstanceKey },
     /// A function whose code names the span table `anchor`, which the link was not given.
     NoSpans { function: InstanceKey, anchor: ContentId },
+    /// The build's reference graph has `functions` functions where it has `inputs` instances,
+    /// so a node is no place in the table.
+    Unwalked { functions: usize, inputs: usize },
 }
 
 impl fmt::Display for ExecError {
@@ -528,6 +611,9 @@ impl fmt::Display for ExecError {
             ExecError::NoSpans { function, anchor } => {
                 write!(f, "{function:?} names the span table {anchor:?}, which the link was not given")
             }
+            ExecError::Unwalked { functions, inputs } => {
+                write!(f, "the build's reference graph has {functions} functions for {inputs} instances, so its tests' reach can't be walked")
+            }
         }
     }
 }
@@ -538,6 +624,35 @@ impl ExecTable {
     /// The function of a slot that runs none: one an incremental link emptied of a function
     /// gone from the binary, which nothing calls until another is put in it.
     pub const EMPTY: u32 = u32::MAX;
+
+    /// The functions test `test` (its place in [`ExecTable::tests`]) reaches, itself included,
+    /// as indices into [`ExecTable::fns`], sorted and each once: through statics too, whose
+    /// values point at functions. Walked now, in time and space linear in what it reaches;
+    /// empty for a test past the table.
+    pub fn reached(&self, test: usize) -> Vec<u32> {
+        // alloc: per call, the list its caller keeps
+        let mut out = Vec::new();
+        let Some((_, root)) = self.tests.get(test) else { return out };
+        self.graph.walk(*root, |node| {
+            match self.graph.place.get(node as usize) {
+                Some(&place) if place != ExecTable::EMPTY => out.push(place),
+                _ => {}
+            }
+            false
+        });
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Whether test `test` reaches a node one of whose marks (code hash, arguments, static
+    /// value or instance) `hit` holds: walked now, stopping at the first.
+    pub fn reaches(&self, test: usize, hit: impl Fn(&CodeHash) -> bool) -> bool {
+        let Some((_, root)) = self.tests.get(test) else { return false };
+        self.graph.walk(*root, |node| {
+            self.graph.marks.get(node as usize).is_some_and(|marks| marks.iter().any(|it| hit(&CodeHash(*it))))
+        })
+    }
 
     /// The table of the test binary linked from `built`, whose link took the span tables
     /// `spans` (`hir_ty_codegen::v2::LinkInputs::spans`). Each function's `Bound` in
@@ -621,43 +736,31 @@ impl ExecTable {
             *place = rank[at];
         }
 
-        let mut walk = Walk::default();
-        // alloc: once per test binary, a bit per function, cleared by each test that sets it
-        let mut bits = vec![0u64; count.div_ceil(64)];
+        // Each test by its root's node only: what it reaches is walked when asked.
         // alloc: once per test binary, its tests
-        let mut reached = Vec::new();
+        let mut roots = Vec::new();
         for (test, root) in tests {
-            let functions = built.roots.get(root).and_then(|key| built.reach.functions_of(key, &mut walk));
-            let Some(mut functions) = functions else {
+            let Some(node) = built.roots.get(root).and_then(|key| built.reach.node_of(key)) else {
                 return Err(ExecError::NoRoot { test, root });
             };
-            in_table_order(&mut functions, &rank, &mut bits);
-            reached.push((test, functions));
+            roots.push((test, node));
         }
-        Ok(ExecTable { fns, slot_fn, beside, tests: reached })
-    }
-}
-
-/// `functions`, places in key order, as places in the table, sorted: by a sort when they are
-/// few, else by `bits` (all clear, and left so), as the table's order is no function of the
-/// keys'.
-fn in_table_order(functions: &mut Vec<u32>, rank: &[u32], bits: &mut [u64]) {
-    for it in functions.iter_mut() {
-        *it = rank[*it as usize];
-    }
-    if functions.len() * 4 < bits.len() {
-        functions.sort_unstable();
-        return;
-    }
-    for &it in functions.iter() {
-        bits[it as usize / 64] |= 1 << (it % 64);
-    }
-    functions.clear();
-    for (word, bits) in bits.iter_mut().enumerate() {
-        while *bits != 0 {
-            functions.push(word as u32 * 64 + bits.trailing_zeros());
-            *bits &= *bits - 1;
+        let functions = built.reach.function_count();
+        if functions != count {
+            return Err(ExecError::Unwalked { functions, inputs: count });
         }
+        let (starts, edges, marks) = built.reach.arrays();
+        let graph = TestGraph {
+            // alloc: once per test binary, the graph its tests are walked over
+            starts: starts.to_vec(),
+            // alloc: once per test binary, the graph its tests are walked over
+            edges: edges.to_vec(),
+            // alloc: once per test binary, a place per node
+            place: rank.iter().copied().chain((functions..marks.len()).map(|_| ExecTable::EMPTY)).collect(),
+            // alloc: once per test binary, the marks per node
+            marks: marks.to_vec(),
+        };
+        Ok(ExecTable { fns, slot_fn, beside, tests: roots, graph })
     }
 }
 

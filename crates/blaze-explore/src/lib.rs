@@ -19,6 +19,7 @@
 
 #![feature(random)]
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 pub mod cert;
 pub mod frame;

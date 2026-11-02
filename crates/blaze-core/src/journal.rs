@@ -6,6 +6,9 @@
 
 use std::fmt;
 
+#[cfg(any(windows, test))]
+pub(crate) mod barrier;
+
 use crate::FileName;
 
 /// Many names under the driver's root in one buffer, for an effect over thousands of them:

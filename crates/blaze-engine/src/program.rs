@@ -45,6 +45,14 @@ pub fn main() -> ExitCode {
             if let Err(error) = crate::huge::huge_pages_for_mimalloc() {
                 return failed(&format!("{error:#}"));
             }
+            // `IX_PROF=<dir>`: this process (the client, or the daemon it starts) is sampled
+            // until it ends and its profile written to `<dir>`; with `<dir>` a target
+            // directory's `layout`, the next build of blaze there lays its code out by it
+            // (docs/v2/plan/lanes/layout/layout.md). Unset, nothing runs.
+            let _profiled = match ix_prof::start_from_env() {
+                Ok(guard) => guard,
+                Err(error) => return failed(&error.to_string()),
+            };
             return blaze_cargo::cli::main(std::env::args_os());
         }
     };

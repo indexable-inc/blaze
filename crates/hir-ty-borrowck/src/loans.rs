@@ -639,6 +639,12 @@ impl<'a> Loans<'a> {
         self.index.get(OF_LOCAL, raw(local))
     }
 
+    /// The loans the statement or terminator at `point` kills, as [`Self::after`] replays
+    /// them: datalog Polonius's `loan_killed_at`.
+    pub(super) fn killed_at(&self, point: usize) -> &'a [u32] {
+        self.kills.get(KILLED_AT, point)
+    }
+
     /// The two-phase loans first used at `point`.
     pub(super) fn activated_at(&self, point: usize) -> &'a [u32] {
         self.index.get(ACTIVATED_AT, point)
@@ -937,6 +943,15 @@ fn projection_conflict<'db>(
             ProjectionElem::ConstantIndex { .. } | ProjectionElem::Subslice { .. },
             ProjectionElem::Index(..),
         ) => unknown,
+        // One loop's binder names one field in an iteration (a loan kept across iterations
+        // is taken as of the same field: refused, never allowed wrongly). Two loops', or a
+        // binder's and a field's, may name one.
+        (ProjectionElem::ReflectedField(a), ProjectionElem::ReflectedField(b)) if a == b => {
+            Overlap::EqualOrDisjoint
+        }
+        (ProjectionElem::ReflectedField(_), ProjectionElem::ReflectedField(_))
+        | (ProjectionElem::ReflectedField(_), ProjectionElem::Field(_))
+        | (ProjectionElem::Field(_), ProjectionElem::ReflectedField(_)) => unknown,
         (
             ProjectionElem::ConstantIndex { offset: a, min_length: la, from_end: fa },
             ProjectionElem::ConstantIndex { offset: b, min_length: lb, from_end: fb },

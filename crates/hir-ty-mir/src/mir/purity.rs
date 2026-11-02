@@ -10,7 +10,6 @@
 //! is not looked at here: what keeps a result by its arguments refuses those itself.
 
 use base_db::Db;
-use either::Either;
 use hir_def::{
     CallableDefId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
     attrs::AttrFlags,
@@ -29,7 +28,9 @@ use hir_ty::{
 
 use super::{
     CastKind, MirBody, MirSpan, Operand, OperandKind, ProjectionElem, Rvalue, StatementKind,
-    StoredPlace, TerminatorKind, const_check::of_a_trait,
+    StoredPlace, TerminatorKind,
+    const_check::of_a_trait,
+    dispatch::{self, Callee},
 };
 
 /// Why a function is not const-pure.
@@ -265,19 +266,28 @@ fn called(db: &Db, krate: base_db::Crate, callee: &Operand) -> Option<Impure> {
     Some(Impure { what: inner.what.clone(), through, span: MirSpan::Unknown, told: inner.told })
 }
 
-/// The body a call of a trait's method `func` runs, when its arguments tell it.
+/// The body a call of a trait's method `func` runs, when its arguments tell it: the function
+/// the code generator dispatches it to ([`dispatch::callee`]), when that has a body.
 fn resolved<'db>(
     db: &'db Db,
     krate: base_db::Crate,
     func: FunctionId,
     args: GenericArgs<'db>,
 ) -> Option<FunctionId> {
-    if rustc_type_ir::TypeVisitableExt::has_param(&args) {
+    // A `for const` binder (a placeholder) is as unknown here as a parameter: the empty
+    // environment says nothing of it.
+    if rustc_type_ir::TypeVisitableExt::has_param(&args)
+        || rustc_type_ir::TypeVisitableExt::has_placeholders(&args)
+    {
         return None;
     }
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate };
-    match db.lookup_impl_method(env, func, args) {
-        (Either::Left(it), _) if FunctionSignature::of(db, it).has_body() => Some(it),
+    let infcx = DbInterner::new_with(db, krate)
+        .with_regions()
+        .infer_ctxt()
+        .build(TypingMode::non_body_analysis());
+    match dispatch::callee(&infcx, env, func, args) {
+        Ok(Callee::Fn(it, _)) if FunctionSignature::of(db, it).has_body() => Some(it),
         _ => None,
     }
 }

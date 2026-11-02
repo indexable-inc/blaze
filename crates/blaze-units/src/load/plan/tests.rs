@@ -2,6 +2,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_manifest::Config;
 use blaze_manifest::files::Disk;
 use blaze_manifest::manifest::{Context, EitherManifest, Manifest, read_manifest};
@@ -205,7 +206,12 @@ fn the_workspace_sets_blaze_lints_in_its_metadata() {
     assert!(path.what.ends_with("is named without its tool: these are blaze's own lints"), "{}", path.what);
     assert_eq!(
         of("[blaze.lints]\nhot = \"deny\"\nconst_impure = \"allow\"\n").unwrap(),
-        ["--allow=blaze::const_impure", "--deny=blaze::hot"]
+        ["--deny=blaze::hot", "--allow=blaze::const_impure"]
+    );
+    assert_eq!(
+        of("[blaze.lints]\nhot_alloc = \"deny\"\nhot = \"forbid\"\ninternal = \"warn\"\ngeneral = \"allow\"\n").unwrap(),
+        ["--allow=blaze::general", "--warn=blaze::internal", "--forbid=blaze::hot", "--deny=blaze::hot_alloc"],
+        "a group comes before the lints it holds, so each lint's own level wins"
     );
     let unknown = of("[blaze.lints]\nhot_allocs = \"warn\"\n").unwrap_err();
     assert_eq!(
@@ -614,7 +620,7 @@ fn unit(pkg: &str, kind: &[&str], crate_types: &[&str], name: &str, platform: Op
         is_std: false,
         dependencies: deps
             .iter()
-            .map(|&index| UnitDep { index, extern_crate_name: format!("dep{index}"), public: None, noprelude: None, nounused: None })
+            .map(|&index| UnitDep { index, extern_crate_name: format!("dep{index}"), public: None, noprelude: None, nounused: None, dev: false })
             .collect(),
     }
 }
@@ -693,11 +699,11 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
             false,
         ),
     ];
-    let packages: HashMap<String, (PackageId, Package<'_>)> = ids
+    let packages: HashMap<String, (PackageId, Package<'_>), Global> = ids
         .iter()
         .map(|(key, id, manifest, _, is_member)| ((*key).to_owned(), (*id, Package { manifest: *manifest, is_member: *is_member })))
         .collect();
-    let manifests: HashMap<PackageId, (&Path, &Manifest)> =
+    let manifests: HashMap<PackageId, (&Path, &Manifest), Global> =
         ids.iter().map(|(_, id, manifest, path, _)| (*id, (*path, *manifest))).collect();
 
     let units = app_units(target);
@@ -711,7 +717,7 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
         ..BaseProfile::default()
     };
     let target_dir = ws.join("target");
-    let unsandboxed: HashSet<&str> = ["app"].into_iter().collect();
+    let unsandboxed: HashSet<&str, Global> = ["app"].into_iter().collect();
     let ws_metadata = Some(toml::Value::Table(toml::from_str("[blaze.lints]\nhot_alloc = \"warn\"\n").unwrap()));
     let input = PlanInput {
         units: &units,
@@ -731,6 +737,7 @@ fn plan_app_as(target: Option<&str>, lints: bool) -> (PathBuf, Vec<UnitPlan>, St
         build_dir: &target_dir,
         host: HOST,
         target,
+        macro_wasm: None,
         requested_profile: "dev",
         profile_dir: "debug",
         base_profile: &base_profile,

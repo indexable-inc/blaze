@@ -5,10 +5,11 @@
 #[cfg(test)]
 mod tests;
 
-use std::{cell::OnceCell, iter::once, mem, sync::Arc};
+use std::{iter::once, mem, sync::Arc};
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, BuiltinDeriveImplId, CallableDefId, DefWithBodyId, EnumVariantId,
@@ -66,20 +67,25 @@ pub struct BodyAnalysis<'db> {
     syntax: Option<&'db BodySyntax>,
     body: &'db Body,
     source_map: &'db BodySourceMap,
-    infer: OnceCell<&'db InferenceResult<'db>>,
-    anchor: OnceCell<Arc<FlatTree>>,
+    #[expect(clippy::disallowed_types, reason = "body inference, set once per body analysis: not global")]
+    infer: std::cell::OnceCell<&'db InferenceResult<'db>>,
+    #[expect(clippy::disallowed_types, reason = "anchor tree, set once per body analysis: not global")]
+    anchor: std::cell::OnceCell<Arc<FlatTree>>,
     /// Where each macro call of the body's store is, by its call.
-    calls: OnceCell<HashMap<MacroCallId, InFile<SyntaxNodePtr>>>,
-    nested: OnceCell<Nested>,
-    moved: OnceCell<Option<Box<[BindingId]>>>,
+    #[expect(clippy::disallowed_types, reason = "macro call locations, set once per body analysis: not global")]
+    calls: std::cell::OnceCell<HashMap<MacroCallId, InFile<SyntaxNodePtr>, Global>>,
+    #[expect(clippy::disallowed_types, reason = "nested items and calls, set once per body analysis: not global")]
+    nested: std::cell::OnceCell<Nested>,
+    #[expect(clippy::disallowed_types, reason = "moved bindings, set once per body analysis: not global")]
+    moved: std::cell::OnceCell<Option<Box<[BindingId]>>>,
 }
 
 /// The items written in the body's blocks and the body's own item, by where each is, and
 /// where the macro calls among them are.
 #[derive(Default)]
 struct Nested {
-    items: HashMap<InFile<SyntaxNodePtr>, Either<GenericDefId, EnumVariantId>>,
-    calls: HashMap<MacroCallId, InFile<SyntaxNodePtr>>,
+    items: HashMap<InFile<SyntaxNodePtr>, Either<GenericDefId, EnumVariantId>, Global>,
+    calls: HashMap<MacroCallId, InFile<SyntaxNodePtr>, Global>,
 }
 
 /// The store a node is lowered in.
@@ -116,11 +122,11 @@ impl<'db> BodyAnalysis<'db> {
             syntax,
             body,
             source_map,
-            infer: OnceCell::new(),
-            anchor: OnceCell::new(),
-            calls: OnceCell::new(),
-            nested: OnceCell::new(),
-            moved: OnceCell::new(),
+            infer: Default::default(),
+            anchor: Default::default(),
+            calls: Default::default(),
+            nested: Default::default(),
+            moved: Default::default(),
         }
     }
 
@@ -357,6 +363,9 @@ impl<'db> BodyAnalysis<'db> {
     ) -> (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>) {
         let db = self.db;
         let param_env = db.trait_environment(self.def.generic_def(db));
+        // With what the body's `for const` loops assume of their binders, as inference had it.
+        let param_env =
+            hir_ty::comptime_env::owner_param_env(db, self.def.into(), param_env);
         db.lookup_impl_method(ParamEnvAndCrate { param_env, krate: self.def.krate(db) }, func, args)
     }
 

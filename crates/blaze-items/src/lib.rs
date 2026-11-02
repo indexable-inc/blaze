@@ -40,11 +40,13 @@
 
 mod bound;
 mod facts;
+pub mod field_order;
 mod form;
 pub mod goals;
 pub mod hash;
 mod index;
 pub mod key;
+pub mod pgo;
 pub mod table;
 #[cfg(test)]
 mod tests;
@@ -64,7 +66,7 @@ use serde::{Deserialize, Serialize};
 
 pub use bound::{BOUND_DOMAIN, bound_hash};
 pub use facts::*;
-pub use form::observes_names;
+pub use form::{Nested, observes_names};
 pub use hash::{
     Unhashable, closure_code, code_hash, coroutine_code, deep_hash, hashes, interface_hash,
     layout_hash, signature_hash,

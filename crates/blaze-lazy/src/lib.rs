@@ -31,6 +31,7 @@
 //! resolver calls, and [`wire`], the frames it sends.
 
 #![deny(unsafe_code)]
+#![feature(allocator_api)]
 
 #[cfg(feature = "daemon")]
 pub mod compile;

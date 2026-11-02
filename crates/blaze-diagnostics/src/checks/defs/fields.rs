@@ -4,6 +4,7 @@
 //! `lower_variant`) and its `FieldAlreadyDeclared::NotNested` (MIT or Apache-2.0).
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir::{FieldSourceView, InFile, Name};
 use syntax::{TextRange, view::AstNode as _};
@@ -17,7 +18,7 @@ use crate::{
 pub(super) fn check(cx: &Cx<'_, '_>, adts: &[hir::Adt]) -> Vec<Found> {
     // alloc: empty, allocates only when a field is declared twice
     let mut found = Vec::new();
-    let mut seen = HashMap::default();
+    let mut seen = HashMap::new_in(Global);
     for &adt in adts {
         match adt {
             hir::Adt::Struct(it) => check_variant(cx, adt, it.into(), &mut seen, &mut found),
@@ -38,7 +39,7 @@ fn check_variant(
     cx: &Cx<'_, '_>,
     adt: hir::Adt,
     variant: hir::Variant,
-    seen: &mut HashMap<Name, InFile<TextRange>>,
+    seen: &mut HashMap<Name, InFile<TextRange>, Global>,
     found: &mut Vec<Found>,
 ) {
     seen.clear();

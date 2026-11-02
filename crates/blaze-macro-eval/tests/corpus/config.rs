@@ -16,6 +16,18 @@ pub(crate) struct Corpus {
     pub(crate) scratch: Option<String>,
     /// The `CARGO_HOME` the packages were fetched into and the build ran with.
     pub(crate) cargo_home: String,
+    /// Where the daemon that built `workspace` and `scratch` placed their build directories,
+    /// absolute: `build` under its `BLAZE_HOME` (`blaze_manifest::home::builds`). load.rs plans
+    /// with it, so each build script's `OUT_DIR` is the real one that build left its run in.
+    pub(crate) builds: String,
+    /// The standard library's directory that daemon shared, absolute:
+    /// `<machine>/std/<build id>` (blaze-cargo's `serve::machine`, `$XDG_CACHE_HOME/blaze` or
+    /// `~/.cache/blaze`; the build id is BLAKE3's `derive_key("blaze v2 build id 1")` of the
+    /// blaze binary, `serve::build_of`). The std crates' build scripts left their runs there.
+    pub(crate) std: String,
+    /// Each proc-macro crate's `wasm32-wasip1` module as blaze built it, by the crate's name
+    /// (`serde_derive`), for the tests of the wasm host against the evaluator.
+    pub(crate) wasm: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl Corpus {
@@ -30,7 +42,19 @@ impl Corpus {
         serde_json::from_str(&text).map_err(|error| format!("{VAR}: {error}"))
     }
 
+    /// Where the daemon that built the copies placed its outputs.
+    pub(crate) fn homes(&self) -> Homes<'_> {
+        Homes { builds: &self.builds, std: &self.std }
+    }
+
     pub(crate) fn scratch(&self) -> Result<&str, String> {
         self.scratch.as_deref().ok_or_else(|| format!("{VAR} names no `scratch`: a built copy of the workspace to change"))
     }
+}
+
+/// Where a daemon placed what it built: [`Corpus::builds`] and [`Corpus::std`].
+#[derive(Clone, Copy)]
+pub(crate) struct Homes<'a> {
+    pub(crate) builds: &'a str,
+    pub(crate) std: &'a str,
 }

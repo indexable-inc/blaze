@@ -69,6 +69,9 @@ pub(crate) struct Kept {
     /// What its pre-link said: its profile has a record of it with another hash.
     #[cfg(feature = "llvm")]
     mismatched: bool,
+    /// What its pre-link said: its profile gave it counts.
+    #[cfg(feature = "llvm")]
+    applied: bool,
 }
 
 /// A release function as its importers link it, held for one build.
@@ -82,6 +85,9 @@ pub struct Export {
     places: Places,
     /// Its code hash: what a compile that imports it built in.
     code: CodeHash,
+    /// What its own IR built in ([`Function::inlined`] of it, MIR-inlined bodies): a compile
+    /// that imports it builds those in too.
+    inlined: Vec<CodeHash>,
 }
 
 #[cfg(not(feature = "llvm"))]
@@ -119,12 +125,19 @@ pub(crate) fn summarize(
                 external: true,
             };
             // clone: the export is held for the build; the function keeps its own to emit by
-            let export = Export { module: None, places: places.clone(), code: unit.instance.code };
+            let export = Export {
+                module: None,
+                places: places.clone(),
+                code: unit.instance.code,
+                // clone: per release export, the code hashes of what it built in (nearly always none)
+                inlined: function.inlined.clone(),
+            };
             return Ok((summary, export));
         }
     };
-    let Prelinked { own, export, size, facts, mismatched } = prelinked(unit, spec, function, refs, optimization)?;
-    function.release = Kept { own: Some(own), mismatched };
+    let Prelinked { own, export, size, facts, mismatched, applied } =
+        prelinked(unit, spec, function, refs, optimization)?;
+    function.release = Kept { own: Some(own), mismatched, applied };
     let requests = &pending.wants.requests;
     let mut calls: Vec<Call> = Vec::with_capacity(facts.calls.len());
     for mut called in facts.calls {
@@ -162,7 +175,9 @@ pub(crate) fn summarize(
         .map(|it| it.1.as_u32());
     let addressed = keys(unit, places, refs, facts.addressed.iter().copied().chain(in_data))?;
     // An instrumented body counts into counters of its own, which an importer's copy has not.
-    let importable = requests.ordered() && spec.pgo != Pgo::Generate;
+    // A body with allocations moved into its frame keeps them out of every importer's frame,
+    // which may recur (`hir-ty-mir`'s `optimize/escape.rs`): its summary says `Never`.
+    let importable = requests.ordered() && spec.pgo != Pgo::Generate && !pending.moves_to_frame();
     let hint = if importable { function.hint } else { summary::Hint::Never };
     let summary = Summary {
         key: unit.instance.key(),
@@ -190,7 +205,9 @@ pub(crate) fn summarize(
         })
     });
     // clone: the export is held for the build; the function keeps its own to emit by
-    Ok((summary, Export { module, places: places.clone(), code: unit.instance.code }))
+    // clone: per release export, the code hashes of what it built in (nearly always none)
+    let inlined = function.inlined.clone();
+    Ok((summary, Export { module, places: places.clone(), code: unit.instance.code, inlined }))
 }
 
 #[cfg(not(feature = "llvm"))]
@@ -237,17 +254,19 @@ pub(crate) fn emit(
     if let Built::Assembled(code, requests) = function.code {
         let (places, spans) = (&function.places, &function.spans);
         let (variables, scopes) = (&function.variables, &function.scopes);
-        return emitted(unit, places, spans, variables, scopes, code, &requests, refs);
+        // alloc: empty, no allocation; assembly has no report
+        return emitted(unit, function.target, places, spans, variables, scopes, code, &requests, refs, Vec::new());
     }
     // Nothing summarized a unit compiled without imports, or one whose summary the store had.
-    let (own, mismatched) = match function.release.own.take() {
-        Some(own) => (own, function.release.mismatched),
+    let (own, mismatched, applied) = match function.release.own.take() {
+        Some(own) => (own, function.release.mismatched, function.release.applied),
         None => {
             let prelinked = prelinked(unit, spec, &function, refs, optimization)?;
-            (prelinked.own, prelinked.mismatched)
+            (prelinked.own, prelinked.mismatched, prelinked.applied)
         }
     };
     let features = function.features;
+    let asked = crate::llvm::report::Asked::of(spec.report, spec.debuginfo != DebugInfo::None, function.target);
     let Function { code: Built::Ir(pending), places, .. } = &mut function else {
         return Err(failed(unit, "an assembly function has no IR for LLVM"));
     };
@@ -274,6 +293,7 @@ pub(crate) fn emit(
                 .filter(|it| requests_of(&it.export.places, it.refs, import.key).next().is_some())
                 // alloc: an error's, each a caller's name
                 .map(|it| it.key.0.to_string())
+                // alloc: an error's, the callers' names
                 .collect();
             let why = if callers.is_empty() {
                 // alloc: an error's
@@ -293,6 +313,8 @@ pub(crate) fn emit(
         // A body LLVM did not build in can still have told it what the function returns or
         // that it writes nothing: every import is what the code is made of.
         inlined.push(import.export.code);
+        // What the import's own IR built in is in its export, so in this code too.
+        inlined.extend_from_slice(&import.export.inlined);
     }
     places.refs = u32::try_from(refs.len()).map_err(|_| failed(unit, "more than 2^32 references"))?;
     // clone: `Given` owns what LLVM is told; the decision is the build's, borrowed
@@ -306,7 +328,7 @@ pub(crate) fn emit(
     }
     let signature = &pending.func.signature;
     let name = (spec.pgo == Pgo::Generate).then(|| pgo::name(unit.item, unit.instance.args));
-    let (code, covered, counted) = llvm::compile(
+    let (code, covered, counted, found) = llvm::compile(
         &mut pending.wants,
         &own,
         signature,
@@ -316,17 +338,22 @@ pub(crate) fn emit(
         &spec.sanitize,
         name.as_deref(),
         features,
+        asked,
     )
     // alloc: an error
     .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))?;
-    let profile = profiled(unit, spec, counted, mismatched)?;
+    let profile = profiled(unit, spec, counted, mismatched, applied)?;
     placed_since(unit, &pending.wants, places, refs)?;
-    let code = crate::backend::pad(code).map_err(|why| failed(unit, why))?;
+    let code = crate::backend::pad(code, function.target).map_err(|why| failed(unit, why))?;
     let Built::Ir(pending) = &function.code else {
         return Err(failed(unit, "an assembly function has no IR for LLVM"));
     };
     let Function { places, spans, variables, scopes, .. } = &function;
-    let mut emitted = emitted(unit, places, spans, variables, scopes, code, &pending.wants.requests, refs)?;
+    let report = super::report::rows(found, spans, &places.funcs, refs)
+        // alloc: an error
+        .map_err(|why| failed(unit, format!("its report: {why}")))?;
+    let mut emitted =
+        emitted(unit, function.target, places, spans, variables, scopes, code, &pending.wants.requests, refs, report)?;
     // What the IR built in (MIR-inlined, `#[inline(always)]` of no member) is the code's too.
     inlined.extend_from_slice(&function.inlined);
     inlined.sort_unstable();
@@ -347,10 +374,12 @@ fn coverage(spec: &Spec, covered: crate::llvm::sanitize::Covered) -> Option<blaz
 
 /// `code` against `refs`, by the function's `places`, as the Cranelift backend converts its
 /// own (`super::backend::emit_cranelift`): its unwind information and lines come with it, and
-/// its side table of `variables` in `scopes`. `spans` are what its line rows name.
+/// its side table of `variables` in `scopes`, with its `report` after it. `spans` are what
+/// its line rows name.
 #[cfg(feature = "llvm")]
 fn emitted(
     unit: &Unit,
+    target: &'static crate::Target,
     places: &Places,
     spans: &[blaze_format::SpanRef],
     variables: &[super::side::Variable],
@@ -358,11 +387,12 @@ fn emitted(
     code: crate::fragment::Code,
     requests: &Requests,
     refs: &Refs,
+    report: Vec<super::report::Row>,
 ) -> Result<Emitted, CodegenError> {
     // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
-    let isa: &dyn cranelift_codegen::isa::TargetIsa = &**crate::target().map_err(|e| failed(unit, e))?;
+    let isa: &dyn cranelift_codegen::isa::TargetIsa = &**crate::isa_for(target).map_err(|e| failed(unit, e))?;
     let (converted, extra) = super::places::resolve_owning(places, refs, |resolve| {
-        let side = super::side::of(variables, scopes, &code, resolve.frame())?;
+        let side = super::report::with_side(super::side::of(variables, scopes, &code, resolve.frame())?, report)?;
         let converted = super::convert::function(
             resolve.frame(),
             unit.instance.key(),
@@ -440,12 +470,14 @@ fn prelinked(
         &pending.named,
         function.hint,
         debug,
+        spec.report,
         optimization,
         &instances,
         &spec.sanitize,
         function.unsanitized,
         wanted.zip(name.as_deref()),
         function.features,
+        function.frame_pointers,
     )
     // alloc: an error
     .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))
@@ -453,8 +485,9 @@ fn prelinked(
 
 /// What PGO made of the function, as its compiled function has it: its record, instrumented
 /// (`counted`, read from its module), or, built with a profile, whether the profile has a
-/// record under its name with another hash (`mismatched`, from its pre-link), which the
-/// build's `Stats::profile_mismatched` counts. Anything else than `spec.pgo` asked for is an
+/// record under its name with another hash (`mismatched`, from its pre-link), and whether it
+/// gave the function counts (`applied`): the build's `Stats::profiles` counts both, and a job
+/// a profile applied to nothing in is refused. Anything else than `spec.pgo` asked for is an
 /// error naming it.
 #[cfg(feature = "llvm")]
 fn profiled(
@@ -462,10 +495,14 @@ fn profiled(
     spec: &Spec,
     counted: Option<pgo::Counted>,
     mismatched: bool,
+    applied: bool,
 ) -> Result<Option<Profiled>, CodegenError> {
-    match (spec.pgo, counted, mismatched) {
+    if mismatched && applied {
+        return Err(failed(unit, "its pre-link read a profile of it with another hash and also gave it counts"));
+    }
+    match (spec.pgo, counted, mismatched || applied) {
         (Pgo::None, None, false) => Ok(None),
-        (Pgo::Use(_), None, mismatched) => Ok(Some(Profiled::Used { mismatched })),
+        (Pgo::Use(_), None, _) => Ok(Some(Profiled::Used { mismatched, applied })),
         (Pgo::Generate, Some(counted), false) => {
             let pgo::Counted { name_ref, hash, counters, version, .. } = counted;
             let name = pgo::name_bytes(unit.item, unit.instance.args);
@@ -477,7 +514,7 @@ fn profiled(
             format!(
                 "built with PGO {asked:?}, LLVM {} it{}",
                 if counted.is_some() { "instrumented" } else { "did not instrument" },
-                if mismatched { " and its pre-link read a profile of it" } else { "" },
+                if mismatched || applied { " and its pre-link read a profile of it" } else { "" },
             ),
         )),
     }
@@ -733,13 +770,13 @@ mod tests {
     /// bytes, bytes that point at them and at `b`, and a location of nowhere.
     #[test]
     fn an_imports_requests_are_the_compiles_each_once() {
-        let isa = crate::target().unwrap();
-        let mut wants = Wants::new(&**isa);
+        let isa = crate::isa_for(crate::Target::for_host()).unwrap();
+        let mut wants = Wants::new(crate::Target::for_host(), &**isa);
         symbol(&mut wants, "a");
         wants.define_data_as(blob(&[1, 2, 3]), DataIdentity::Shared);
         let mut places = Places { funcs: vec![0], datas: vec![DataPlace::Own], refs: 1 };
 
-        let mut theirs = Wants::new(&**isa);
+        let mut theirs = Wants::new(crate::Target::for_host(), &**isa);
         let b = symbol(&mut theirs, "b");
         symbol(&mut theirs, "a");
         let same = theirs.define_data_as(blob(&[1, 2, 3]), DataIdentity::Shared);
@@ -779,11 +816,11 @@ mod tests {
     /// second made once however many bodies ask for it.
     #[test]
     fn one_request_that_is_two_functions_is_two_requests() {
-        let isa = crate::target().unwrap();
-        let mut wants = Wants::new(&**isa);
+        let isa = crate::isa_for(crate::Target::for_host()).unwrap();
+        let mut wants = Wants::new(crate::Target::for_host(), &**isa);
         symbol(&mut wants, "a");
         let mut places = Places { funcs: vec![0], datas: Vec::new(), refs: 2 };
-        let mut theirs = Wants::new(&**isa);
+        let mut theirs = Wants::new(crate::Target::for_host(), &**isa);
         symbol(&mut theirs, "a");
         let their_places = Places { funcs: vec![0], datas: Vec::new(), refs: 1 };
         let their_refs = [Target::Direct(instance(6))];
@@ -798,10 +835,10 @@ mod tests {
 
     #[test]
     fn an_import_that_refers_to_what_the_compile_lacks_is_refused() {
-        let isa = crate::target().unwrap();
-        let mut wants = Wants::new(&**isa);
+        let isa = crate::isa_for(crate::Target::for_host()).unwrap();
+        let mut wants = Wants::new(crate::Target::for_host(), &**isa);
         let mut places = Places::default();
-        let mut theirs = Wants::new(&**isa);
+        let mut theirs = Wants::new(crate::Target::for_host(), &**isa);
         symbol(&mut theirs, "c");
         let their_places = Places { funcs: vec![0], datas: Vec::new(), refs: 1 };
         let refused = merge(
@@ -830,8 +867,8 @@ mod tests {
 
     #[test]
     fn what_llvm_asks_for_on_its_own_is_placed() {
-        let isa = crate::target().unwrap();
-        let mut wants = Wants::new(&**isa);
+        let isa = crate::isa_for(crate::Target::for_host()).unwrap();
+        let mut wants = Wants::new(crate::Target::for_host(), &**isa);
         symbol(&mut wants, "a");
         let mut places = Places { funcs: vec![0], datas: Vec::new(), refs: 2 };
         symbol(&mut wants, "fmod");
@@ -886,6 +923,10 @@ mod tests {
             mir_inline: false,
             pgo: blaze_codegen::settings::Pgo::None,
             sanitize: blaze_codegen::settings::Sanitize::default(),
+            // A release image links native code: no proc macro's module.
+            proc_macro_bridge: false,
+            report: false,
+            heap_to_stack: false,
         }
     }
 
@@ -911,7 +952,7 @@ mod tests {
         let name = pgo::name(unit.item, unit.instance.args);
         let counted =
             || pgo::Counted { name: name.clone(), name_ref: 5, hash: 7, counters: 3, version: 10 };
-        let Some(Profiled::Counted(record)) = profiled(&unit, &with(Pgo::Generate), Some(counted()), false).unwrap()
+        let Some(Profiled::Counted(record)) = profiled(&unit, &with(Pgo::Generate), Some(counted()), false, false).unwrap()
         else {
             panic!("an instrumented function without its record");
         };
@@ -919,15 +960,18 @@ mod tests {
         assert_eq!((record.name_ref, record.hash, record.counters, record.version), (5, 7, 3, 10));
 
         let used = with(Pgo::Use(ContentId([9; 32])));
-        for mismatched in [false, true] {
-            assert_eq!(profiled(&unit, &used, None, mismatched).unwrap(), Some(Profiled::Used { mismatched }));
+        for (mismatched, applied) in [(false, false), (true, false), (false, true)] {
+            let made = profiled(&unit, &used, None, mismatched, applied).unwrap();
+            assert_eq!(made, Some(Profiled::Used { mismatched, applied }));
         }
-        assert_eq!(profiled(&unit, &with(Pgo::None), None, false).unwrap(), None);
+        assert!(profiled(&unit, &used, None, true, true).is_err());
+        assert_eq!(profiled(&unit, &with(Pgo::None), None, false, false).unwrap(), None);
 
-        assert!(profiled(&unit, &with(Pgo::None), Some(counted()), false).is_err());
-        assert!(profiled(&unit, &with(Pgo::None), None, true).is_err());
-        assert!(profiled(&unit, &with(Pgo::Generate), None, false).is_err());
-        assert!(profiled(&unit, &with(Pgo::Generate), Some(counted()), true).is_err());
-        assert!(profiled(&unit, &used, Some(counted()), false).is_err());
+        assert!(profiled(&unit, &with(Pgo::None), Some(counted()), false, false).is_err());
+        assert!(profiled(&unit, &with(Pgo::None), None, true, false).is_err());
+        assert!(profiled(&unit, &with(Pgo::None), None, false, true).is_err());
+        assert!(profiled(&unit, &with(Pgo::Generate), None, false, false).is_err());
+        assert!(profiled(&unit, &with(Pgo::Generate), Some(counted()), true, false).is_err());
+        assert!(profiled(&unit, &used, Some(counted()), false, false).is_err());
     }
 }

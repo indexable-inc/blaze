@@ -38,6 +38,19 @@ pub(crate) fn solver_ty(cx: &Cx<'_, '_>, ty: Ty<'_>) -> String {
     ty_in(cx, ty, Mode::NORMAL)
 }
 
+/// rustc's `TyCtxt::short_string` at its default diagnostic width (140): the type whole if it
+/// is at most two thirds of the width long, else `string_with_limit` of half the width, a long
+/// nest of types ending in `_`. rustc also writes the whole type to a file; blaze does not.
+pub fn short_ty(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> String {
+    const WIDTH: usize = 140;
+    let ty = ty.to_next_solver();
+    let regular = ty_in(cx, ty, Mode::NORMAL);
+    match regular.len() <= WIDTH * 2 / 3 {
+        true => regular,
+        false => types::string_with_limit(cx, ty, WIDTH / 2, Mode::NORMAL),
+    }
+}
+
 /// A type with no path trimmed: rustc's `with_no_trimmed_paths!`.
 pub fn ty_untrimmed(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> String {
     ty_in(cx, ty.to_next_solver(), Mode::UNTRIMMED)

@@ -63,7 +63,8 @@ fn noop_method_call(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Found> {
         return None;
     }
     let env = ParamEnvAndCrate {
-        param_env: db.trait_environment(b.owner.generic_def(db)),
+        // With what the body's `for const` loops assume of their binders, as inference had it.
+        param_env: b.infer.comptime_param_env(db.trait_environment(b.owner.generic_def(db))),
         krate: b.owner.krate(db),
     };
     let (Either::Left(instance), _) = db.lookup_impl_method(env, method, args) else { return None };

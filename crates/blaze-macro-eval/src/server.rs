@@ -6,17 +6,18 @@
 //! Token streams are owned handles, dense from 1, freed as the client takes them; spans are
 //! interned handles, the same span always the same handle, as the bridge's `InternedStore`
 //! gives them. A question only the database can answer (a span's text, file, line or
-//! parent) is asked through `blaze_lower::answer`, and the expansion is then not kept: its key
-//! does not say what it was told.
+//! parent) is asked through an [`Answer`], and the expansion is then not kept: its key does
+//! not say what it was told.
 
 use std::{fmt::Write as _, ops::Bound};
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_lower::{SubRequest, SubResponse};
 use intern::Symbol;
 use proc_macro_api::bridge::spans::{self, spanned};
-use span::{Edition, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, TextRange, TextSize};
+use span::{Edition, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SyntaxContext, TextRange, TextSize};
 
 use crate::{
     guest::Stop,
@@ -24,7 +25,7 @@ use crate::{
     print::{self, Op},
     protocol::Method,
     stream::{DelimSpan, Delimiter, IdentKind, LitKind, Spacing, Stream, Tree, push_given},
-    wire::{Reader, Width, Writer},
+    wire::{Reader, Writer},
 };
 
 /// A diagnostic the macro emitted (`proc_macro::Diagnostic::emit`), or an error rustc's
@@ -35,12 +36,30 @@ pub(crate) struct Emitted {
     pub(crate) text: String,
 }
 
+/// What only the database can say of a span, asked mid-request: the database itself on the
+/// evaluator, and on a wasm expansion's own thread the job that holds it
+/// ([`crate::wasm`]'s `thread`), which can be gone.
+pub(crate) trait Answer {
+    fn answer(&self, req: SubRequest) -> Result<SubResponse, Stop>;
+    fn edition(&self, ctx: SyntaxContext) -> Result<Edition, Stop>;
+}
+
+impl Answer for Db {
+    fn answer(&self, req: SubRequest) -> Result<SubResponse, Stop> {
+        Ok(blaze_lower::answer(self, req))
+    }
+
+    fn edition(&self, ctx: SyntaxContext) -> Result<Edition, Stop> {
+        Ok(ctx.edition(self))
+    }
+}
+
 /// One expansion's server.
 pub(crate) struct Server {
     /// `streams[h - 1]` is the stream of handle `h`, `None` once the client took it.
     streams: Vec<Option<Stream>>,
     spans: Vec<Span>,
-    span_handles: HashMap<Span, u32>,
+    span_handles: HashMap<Span, u32, Global>,
     /// `Span::save_span`'s, by the index it gave.
     saved: Vec<Span>,
     /// The def, call and mixed sites.
@@ -49,8 +68,6 @@ pub(crate) struct Server {
     edition: Edition,
     /// Whether the calling crate enables `forced_keywords`, which gates each `k#` it lexes.
     forced_keywords: bool,
-    /// The client's `usize`, which its requests and the replies are written in.
-    width: Width,
     /// Whether the expansion learned of a span what its key does not say.
     pub(crate) asked: bool,
     /// Paths given to `proc_macro::tracked_path::path`: inputs as much as files it read.
@@ -60,6 +77,9 @@ pub(crate) struct Server {
     text: String,
     lexed: Vec<String>,
     warned: Vec<String>,
+    /// Why an [`Answer`] could not answer during the request: the request then stops with
+    /// it, and the reply written meanwhile is never sent.
+    lost: Option<Stop>,
 }
 
 fn freed() -> Stop {
@@ -173,24 +193,24 @@ fn bound_word(bound: Bound<u64>) -> u64 {
 
 impl Server {
     /// The server of one expansion at `sites` (def, call, mixed), for a crate of `edition`
-    /// that enables `forced_keywords` or not, speaking to a client whose `usize` is `width`.
-    pub(crate) fn new(sites: [Span; 3], edition: Edition, forced_keywords: bool, width: Width) -> Server {
+    /// that enables `forced_keywords` or not.
+    pub(crate) fn new(sites: [Span; 3], edition: Edition, forced_keywords: bool) -> Server {
         let mut server = Server {
             // alloc: once per expansion, its tables, which grow with what it builds
             streams: Vec::new(),
             spans: Vec::new(), // alloc: once per expansion, as above
-            span_handles: HashMap::default(),
+            span_handles: HashMap::new_in(Global),
             saved: Vec::new(), // alloc: once per expansion, as above
             sites,
             edition,
             forced_keywords,
-            width,
             asked: false,
             tracked: Vec::new(), // alloc: once per expansion, as above
             emitted: Vec::new(), // alloc: once per expansion, as above
             text: String::new(), // alloc: once per expansion, as above
             lexed: Vec::new(), // alloc: once per expansion, as above
             warned: Vec::new(), // alloc: once per expansion, as above
+            lost: None,
         };
         for site in sites {
             server.span_handle(site);
@@ -237,7 +257,7 @@ impl Server {
     /// The bytes the client's `run` is given: the sites, then each input stream's handle.
     pub(crate) fn input(&mut self, inputs: &[Stream], out: &mut Vec<u8>) {
         out.clear();
-        let mut w = Writer { out, width: self.width };
+        let mut w = Writer { out };
         for site in self.sites {
             let handle = self.span_handle(site);
             w.handle(handle);
@@ -251,7 +271,7 @@ impl Server {
 
     /// What `run` gave back: the output stream, or the macro's panic message.
     pub(crate) fn output(&mut self, bytes: &[u8]) -> Result<Result<Stream, String>, Stop> {
-        let mut r = Reader::new(bytes, self.width);
+        let mut r = Reader::new(bytes);
         let ok = r.some()?;
         let some = r.some()?;
         let answer = match (ok, some) {
@@ -267,9 +287,16 @@ impl Server {
         Ok(answer)
     }
 
-    fn ask(&mut self, db: &Db, req: SubRequest) -> SubResponse {
+    fn ask(&mut self, db: &(impl Answer + ?Sized), req: SubRequest) -> SubResponse {
         self.asked = true;
-        blaze_lower::answer(db, req)
+        match db.answer(req) {
+            Ok(it) => it,
+            Err(stop) => {
+                let reason = stop.0.clone(); // alloc: error path
+                self.lost.get_or_insert(stop);
+                SubResponse::Cancel { reason }
+            }
+        }
     }
 
     fn read_tree(&mut self, r: &mut Reader<'_>, out: &mut Vec<Tree>) -> Result<(), Stop> {
@@ -393,7 +420,7 @@ impl Server {
     /// (`Span::to`), split again into characters, each its byte of a span exactly the
     /// operator's length and else the whole span; a `'` glued to an identifier is a lifetime,
     /// both at its span. Streams the lexer made hold glued tokens split this way already.
-    fn put_trees(&mut self, db: &Db, w: &mut Writer<'_>, trees: &[Tree], count: &mut u64) -> Result<(), Stop> {
+    fn put_trees(&mut self, db: &(impl Answer + ?Sized), w: &mut Writer<'_>, trees: &[Tree], count: &mut u64) -> Result<(), Stop> {
         let mut at = 0;
         while at < trees.len() {
             let (end, op) = glued(trees, at);
@@ -428,7 +455,7 @@ impl Server {
     /// rustc's `Span::to`: the span from `first` to `second`. Of spans of two contexts it is
     /// the one not of the root (`prepare_to_combine`); two contexts neither at the root, or
     /// two files, would need what rustc's source map has, so the call stops.
-    fn to(&mut self, db: &Db, first: Span, second: Span) -> Result<Span, Stop> {
+    fn to(&mut self, db: &(impl Answer + ?Sized), first: Span, second: Span) -> Result<Span, Stop> {
         if first.ctx == second.ctx {
             return spans::join(first, second, |req| Some(self.ask(db, req))).ok_or_else(|| {
                 // alloc: error path
@@ -473,16 +500,25 @@ impl Server {
         Ok(error)
     }
 
-    /// Answers the request `request`, writing the reply, `Result<_, PanicMessage>`, to `reply`.
-    pub(crate) fn dispatch(&mut self, db: &Db, request: &[u8], reply: &mut Vec<u8>) -> Result<(), Stop> {
+    /// Answers the request `request`, writing the reply, `Result<_, PanicMessage>`, to `reply`;
+    /// what `db` could not answer stops it.
+    pub(crate) fn dispatch(&mut self, db: &(impl Answer + ?Sized), request: &[u8], reply: &mut Vec<u8>) -> Result<(), Stop> {
+        let answered = self.answer_request(db, request, reply);
+        match self.lost.take() {
+            Some(stop) => Err(stop),
+            None => answered,
+        }
+    }
+
+    fn answer_request(&mut self, db: &(impl Answer + ?Sized), request: &[u8], reply: &mut Vec<u8>) -> Result<(), Stop> {
         reply.clear();
-        let mut r = Reader::new(request, self.width);
+        let mut r = Reader::new(request);
         let tag = r.u8()?;
         let Some(method) = Method::of(tag) else {
             // alloc: error path
             return Err(Stop(format!("sent the server the request {tag}, which the pinned bridge has not")));
         };
-        let mut w = Writer { out: reply, width: self.width };
+        let mut w = Writer { out: reply };
         match method {
             Method::TrackEnvVar => {
                 // The variable was read through `getenv`, which traced it.
@@ -576,11 +612,20 @@ impl Server {
                 text.clear();
                 // A span's edition is its context's, which the key numbers but does not say.
                 let mut asked = false;
+                let mut lost = None;
+                // What is printed once an edition is lost is never sent: the request stops.
+                let calling = self.edition;
                 print::to_string(self.stream(handle)?.trees(), &mut text, |span| {
                     asked = true;
-                    span.ctx.edition(db)
+                    db.edition(span.ctx).unwrap_or_else(|stop| {
+                        lost.get_or_insert(stop);
+                        calling
+                    })
                 });
                 self.asked |= asked;
+                if let Some(stop) = lost {
+                    self.lost.get_or_insert(stop);
+                }
                 w.ok(true);
                 w.str(&text);
                 self.text = text;
@@ -844,8 +889,15 @@ impl Server {
             }
         }
         if !r.is_empty() {
+            let rest = r.rest();
             // alloc: error path
-            return Err(Stop(format!("sent `{}` more than the pinned bridge sends", method.name())));
+            return Err(Stop(format!(
+                "sent `{}` more than the pinned bridge sends: {} bytes past what it reads of the {}-byte request {:02x?}",
+                method.name(),
+                rest.len(),
+                request.len(),
+                &request[..request.len().min(48)]
+            )));
         }
         Ok(())
     }

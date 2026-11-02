@@ -28,6 +28,7 @@
 //! [`Lowered`], and a write takes `&mut Lowered`, which no reader can hold at the same time.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 mod answer;
 mod const_macros;
@@ -38,6 +39,7 @@ mod harness;
 mod tests;
 
 use std::{cell::Cell, collections::HashMap, fmt};
+use std::alloc::Global;
 
 use base_db::FileSetConfig;
 use base_db::{
@@ -61,7 +63,7 @@ pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
 
 pub use self::answer::{SubRequest, SubResponse, answer};
 pub use self::crates::{lint_flags, local};
-pub use self::harness::{Appended, macros_loaded};
+pub use self::harness::{Appended, macros_loaded, wasm_macro};
 
 /// What [`lower`] lowers.
 pub struct Lower<'a, T> {
@@ -131,10 +133,10 @@ pub struct Lowered {
     /// place when no task does.
     paths: std::sync::Arc<HashMap<FileId, String>>,
     /// Each crate's identity worked out since the last write ([`Lowered::identity`]).
-    identities: blaze_hash::HashMap<Crate, ContentId>,
+    identities: blaze_hash::HashMap<Crate, ContentId, Global>,
     /// Each root (an alias) [`Lowered::append_roots`] made since the last [`Lowered::refresh`],
     /// with the unit it was first made for and the content ID of the module it was given.
-    appended: blaze_hash::HashMap<FileId, (usize, ContentId)>,
+    appended: blaze_hash::HashMap<FileId, (usize, ContentId), Global>,
     /// Each directory read into the front end, as [`Lowered::refresh`] reads it again.
     loads: Vec<Load>,
     /// The root of the view its files were read from.
@@ -220,7 +222,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
             units.plans.len()
         )));
     }
-    let packages: blaze_hash::HashMap<&str, &PackagePlan> =
+    let packages: blaze_hash::HashMap<&str, &PackagePlan, Global> =
         units.packages.iter().map(|it| (it.id.as_str(), it)).collect();
     let package_of = |unit: &Unit| {
         packages.get(unit.pkg_id.as_str()).copied().ok_or_else(|| {
@@ -234,20 +236,20 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
     for unit in &units.graph.units {
         whats.push(crates::describe(package_of(unit)?, unit));
     }
-    let package_index: blaze_hash::HashMap<&str, usize> =
+    let package_index: blaze_hash::HashMap<&str, usize, Global> =
         units.packages.iter().enumerate().map(|(index, it)| (it.id.as_str(), index)).collect();
     let mut const_plan = const_macros::plan(units, &package_index, &whats)?;
 
     // One source root per package with a unit, in the order of `units.packages`, but one for
     // every package of the standard library; each directory read is one root's, the innermost
     // when one is in another's.
-    let mut used: blaze_hash::HashMap<&str, bool> = blaze_hash::HashMap::default();
+    let mut used: blaze_hash::HashMap<&str, bool, Global> = blaze_hash::HashMap::new_in(Global);
     for unit in &units.graph.units {
         *used.entry(unit.pkg_id.as_str()).or_default() |= unit.is_std;
     }
     let mut library: Vec<bool> = Vec::new();
-    let mut set_of: blaze_hash::HashMap<&str, usize> = blaze_hash::HashMap::default();
-    let mut loads: blaze_hash::HashMap<String, usize> = blaze_hash::HashMap::default();
+    let mut set_of: blaze_hash::HashMap<&str, usize, Global> = blaze_hash::HashMap::new_in(Global);
+    let mut loads: blaze_hash::HashMap<String, usize, Global> = blaze_hash::HashMap::new_in(Global);
     let mut std_set = None;
     for package in &units.packages {
         let Some(&is_std) = used.get(package.id.as_str()) else { continue };
@@ -274,7 +276,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
         library.push(true);
         library.len() - 1
     });
-    let mut excluded: HashSet<String> = HashSet::default();
+    let mut excluded: HashSet<String, Global> = HashSet::new_in(Global);
     excluded.insert(units.target_dir.clone());
     excluded.insert(units.build_dir.clone());
     for (index, unit) in units.graph.units.iter().enumerate() {
@@ -320,7 +322,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
     }
     let other = SourceRootId(library.len() as u32);
     db.set_source_root_with_durability(other, Arc::new(SourceRoot::new_local(FileSet::default())), Durability::LOW);
-    let roots = |library_too: bool| -> HashSet<SourceRootId> {
+    let roots = |library_too: bool| -> HashSet<SourceRootId, Global> {
         (0..=library.len())
             .filter(|&it| library.get(it).copied().unwrap_or(false) == library_too)
             .map(|it| SourceRootId(it as u32))
@@ -396,7 +398,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
     let order = crates::topological(units, &whats, &const_plan.after)?;
     let mut all = Vec::with_capacity(order.len());
     // alloc: once a lowering, the crates made by their root file, for the units after to share.
-    let mut made: blaze_hash::HashMap<FileId, Vec<Made>> = blaze_hash::HashMap::default();
+    let mut made: blaze_hash::HashMap<FileId, Vec<Made>, Global> = blaze_hash::HashMap::new_in(Global);
     let mut const_listed = Vec::new();
     let mut const_made = Vec::new();
     for index in order {
@@ -497,6 +499,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
             origin: crates::origin(package, unit),
             crate_attrs: Box::new([]),
             target_kind: crates::target_kind(unit, plan, what)?,
+            manifest_kind: crates::manifest_kind(unit, what)?,
             crate_types: crates::crate_types(unit, plan, what)?,
             proc_macro_cwd: Arc::new(abs(&crates::proc_macro_cwd(&workspace_root, package))?),
         };
@@ -513,9 +516,9 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
             .map(|dep| dep.index)
             .collect();
         // A crate whose root blaze appends a module to ([`Lowered::append_roots`]: a test's
-        // harness) has a root of its own, an alias of the file on disk, so no other crate of
-        // that file reads the module.
-        let aliased = crates::is_test(unit, plan) && plan.harness;
+        // harness, a wasm proc macro's list of macros and bridge glue) has a root of its own,
+        // an alias of the file on disk, so no other crate of that file reads the module.
+        let aliased = (crates::is_test(unit, plan) && plan.harness) || wasm_macro(unit, plan);
         // Units cargo keeps apart for what the front end does not read (a profile's opt-level
         // or debuginfo) are one crate: two crates of one key would name each other's items.
         let made_of_root = made.entry(root_file).or_default();
@@ -561,6 +564,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
     ProcMacros::give(&mut db, not_built);
     const_macros::set_macros(&mut db, const_listed);
     base_db::set_process_env(&mut db, config.invocation.env.iter().cloned().collect());
+    name_sources(&mut db, workspace_root.dir.as_deref(), &config.library);
 
     let paths = paths_of(&db, library.len());
     Ok(Lowered {
@@ -568,8 +572,8 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
         applied: (0..unit_count).map(|_| Vec::new()).collect(),
         crates: std::sync::Arc::new(Crates { units: lowerings, sets: library.len() }),
         paths: std::sync::Arc::new(paths),
-        identities: blaze_hash::HashMap::default(),
-        appended: blaze_hash::HashMap::default(),
+        identities: blaze_hash::HashMap::new_in(Global),
+        appended: blaze_hash::HashMap::new_in(Global),
         loads: read,
         view: root,
         workspace_root,
@@ -626,9 +630,16 @@ impl Lowered {
     /// Unit `unit`'s identity in the front end: of its crate (its root file's path, data,
     /// cfgs, env, edition, target), its root's text and appended module (an alias's, which is
     /// not among its source root's files), the files of its source root by path and content (an
-    /// applied run's `OUT_DIR` among them), the process's environment, and each crate it
-    /// depends on by its identity, so the identity of a crate covers everything it is made
-    /// from. None for a unit with no crate. Worked out once per crate between writes.
+    /// applied run's `OUT_DIR` among them), and each crate it depends on by its identity, so the
+    /// identity of a crate covers everything it is made from before it is resolved. None for a
+    /// unit with no crate. Worked out once per crate between writes.
+    ///
+    /// The process's environment is not in it: a crate reads a variable of it only through
+    /// `env!` and `option_env!`, which only resolving finds, and each read is noted in the
+    /// database's `env!` log (`Files::env_read`). Whoever files a value made from the crate
+    /// keys it by those reads and their values, as `blaze-cargo`'s unit records do; hashing the
+    /// whole environment here made every record miss whenever any variable changed, such as
+    /// a per-run `BLAZE_PROFILE`.
     pub fn identity(&mut self, unit: usize) -> Option<ContentId> {
         let krate = self.crates.krate(unit)?;
         Some(identity_of(&self.db, krate, &mut self.identities))
@@ -853,15 +864,14 @@ fn checked<'a>(crates: &'a Crates, run: usize, ran: &Ran) -> Result<(&'a Lowerin
     Ok((lowering, cfgs))
 }
 
-const IDENTITY: &str = "blaze v2 cargo unit identity 3";
+const IDENTITY: &str = "blaze v2 cargo unit identity 4";
 
 /// [`Lowered::identity`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own rather than the thread's.
-fn identity_of(db: &Db, krate: Crate, known: &mut blaze_hash::HashMap<Crate, ContentId>) -> ContentId {
+fn identity_of(db: &Db, krate: Crate, known: &mut blaze_hash::HashMap<Crate, ContentId, Global>) -> ContentId {
     if let Some(identity) = known.get(&krate) {
         return *identity;
     }
-    let process = base_db::ProcessEnv::try_get(db).map(|it| it.content(db)).unwrap_or_default();
     let mut stack = vec![(krate, false)];
     while let Some((at, deps_known)) = stack.pop() {
         if known.contains_key(&at) {
@@ -876,12 +886,6 @@ fn identity_of(db: &Db, krate: Crate, known: &mut blaze_hash::HashMap<Crate, Con
         let root = db.file_source_root(data.root_file_id).source_root_id(db);
         let mut hasher = Hasher::new(IDENTITY);
         hasher.id(&at.content(db)).id(&db.file_text(data.root_file_id).content(db)).id(&db.source_root(root).content(db));
-        // The standard library's crates read no variable of the process (`env!` of one is
-        // their crate's alone, as a std built elsewhere has it), so a workspace's
-        // environment names no std crate apart.
-        if !data.origin.is_lang() {
-            hasher.id(&process);
-        }
         hasher.update(&(data.dependencies.len() as u64).to_le_bytes());
         for dep in &data.dependencies {
             hasher.id(&known[&dep.crate_id]);
@@ -889,6 +893,27 @@ fn identity_of(db: &Db, krate: Crate, known: &mut blaze_hash::HashMap<Crate, Con
         known.insert(at, hasher.finish());
     }
     known[&krate]
+}
+
+/// Tells the evaluator of constants what the build calls each file (`file!()` in a constant's
+/// value, such as tracing's callsite statics), as cargo has rustc call it: a file of the
+/// standard library (under `library`) by its path as it is, one under the workspace's root
+/// `workspace` by its path from there, any other by its absolute path. The key names both
+/// directories, so telling it again for the same workspace evaluates nothing again.
+fn name_sources(db: &mut Db, workspace: Option<&str>, library: &str) {
+    let library = format!("{}/", library.trim_end_matches('/'));
+    let workspace = workspace.map(|it| format!("{}/", it.trim_end_matches('/')));
+    let key = format!("{}\0{library}", workspace.as_deref().unwrap_or(""));
+    hir_ty_mir::mir::location::name_sources(db, &key, move |db, file| {
+        let root = db.file_source_root(file).source_root_id(db);
+        let root = db.source_root(root).source_root(db);
+        let path = root.path_for_file(&file)?.as_path()?.as_str();
+        if path.starts_with(&library) {
+            return Some(path.to_owned());
+        }
+        let relative = workspace.as_deref().and_then(|it| path.strip_prefix(it));
+        Some(relative.unwrap_or(path).to_owned())
+    });
 }
 
 /// The front end's tables, each of the database's structs and memoized queries by its name,

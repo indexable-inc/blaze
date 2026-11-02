@@ -153,15 +153,25 @@ impl Flights {
     }
 
     /// Keeps each of `made`, a summary under the flight key a build claimed it by, for the
-    /// builds that take it once the build lands it.
-    pub fn keep_summaries(&self, made: Vec<(InstanceKey, Summary)>) {
+    /// builds that take it once the build lands it. Only the build that claimed a key keeps
+    /// under it, and [`Flights::retain`] drops a summary with its landing, so a key holds a
+    /// summary already only when a build claims it again; an equal one is one, and the keys
+    /// of other ones are given back, never written over (rule 18), the kept one staying.
+    pub fn keep_summaries(&self, made: Vec<(InstanceKey, Summary)>) -> Vec<InstanceKey> {
+        // alloc: empty, allocates nothing unless a summary is refused
+        let mut refused = Vec::new();
         if made.is_empty() {
-            return;
+            return refused;
         }
         let summaries = self.summaries.pin();
         for (key, summary) in made {
-            summaries.insert(key, summary);
+            if let Err(it) = summaries.try_insert(key, summary)
+                && *it.current != it.not_inserted
+            {
+                refused.push(key);
+            }
         }
+        refused
     }
 
     /// The summary kept under each of `keys`, landed: `None` for one no build kept.
@@ -340,6 +350,17 @@ mod tests {
             body: crate::summary::Attrs::default(),
             external: true,
         }
+    }
+
+    /// A second summary under one flight key is one when equal, and refused when other: the
+    /// kept one stays (rule 18).
+    #[test]
+    fn another_summary_under_a_kept_key_is_refused() {
+        let flights = Flights::new();
+        assert!(flights.keep_summaries(vec![(key(1), summary(1))]).is_empty());
+        assert!(flights.keep_summaries(vec![(key(1), summary(1))]).is_empty(), "an equal summary is one");
+        assert_eq!(flights.keep_summaries(vec![(key(1), summary(2)), (key(2), summary(2))]), [key(1)]);
+        assert_eq!(flights.summaries(&[key(1), key(2)]), [Some(summary(1)), Some(summary(2))]);
     }
 
     /// A summary kept and landed is every later asker's, and goes with its landing.

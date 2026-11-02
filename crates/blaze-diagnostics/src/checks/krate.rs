@@ -14,6 +14,7 @@ use std::ops::ControlFlow;
 
 use base_db::{FileId, TargetKind};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir::{HirFileId, InFile, ModuleDef, Name};
 use hir_def::{Lookup, ModuleDefId, expr_store::Body, item_scope::ImportOrGlob};
 use syntax::{
@@ -264,7 +265,7 @@ fn free_item_def_range(node: ast::Node<'_>) -> TextRange {
 fn free_items<'db>(cx: &Cx<'_, 'db>) -> Vec<FreeItem<'db>> {
     let root = cx.krate.root_module(cx.db);
     // alloc: setup, once per crate; `items` is empty unless there is a `#[rustc_main]` or a `main` below the root
-    let mut walk = Walk { cx, places: None, root, seen: HashSet::default(), items: Vec::new() };
+    let mut walk = Walk { cx, places: None, root, seen: HashSet::new_in(Global), items: Vec::new() };
     walk.module(root);
     let mut items = walk.items;
     items.sort_by(|a, b| a.place.cmp(&b.place));
@@ -276,7 +277,7 @@ struct Walk<'a, 'b, 'db> {
     /// Made for the first item kept.
     places: Option<Places>,
     root: hir::Module,
-    seen: HashSet<(HirFileId, NodeId)>,
+    seen: HashSet<(HirFileId, NodeId), Global>,
     items: Vec<FreeItem<'db>>,
 }
 
@@ -402,12 +403,12 @@ fn has_attr(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>, name: &str) -> bool {
 /// Where each file of the crate is in its source as rustc reads it: a module's file where
 /// its `mod` item is.
 struct Places {
-    files: HashMap<FileId, Vec<u32>>,
+    files: HashMap<FileId, Vec<u32>, Global>,
 }
 
 impl Places {
     fn new(cx: &Cx<'_, '_>) -> Places {
-        let mut places = Places { files: HashMap::default() };
+        let mut places = Places { files: HashMap::new_in(Global) };
         for module in modules(cx) {
             let Some(file) = module.as_source_file_id(cx.db) else { continue };
             let file = file.file_id(cx.db);

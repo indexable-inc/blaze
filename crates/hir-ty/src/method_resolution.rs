@@ -15,6 +15,8 @@ mod pick_cache;
 mod probe;
 #[cfg(test)]
 mod relevant_tests;
+#[cfg(test)]
+mod proc_macro_edge_tests;
 pub mod scope_sets;
 
 use std::{hash::BuildHasher, ops::Range};
@@ -31,6 +33,7 @@ use tracing::{debug, instrument};
 
 use base_db::{Crate, Db};
 use blaze_hash::FixedState;
+use std::alloc::Global;
 use hir_def::{
     AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, DefWithBodyId, FunctionId,
     GenericParamId, HasModule, ImplId, ItemContainerId, MacroId, ModuleDefId, ModuleId, TraitId,
@@ -549,6 +552,7 @@ pub(crate) fn lookup_impl_method_query<'db>(
 > {
     let interner = DbInterner::new_with(db, env.krate);
     let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+    crate::comptime_env::enter_universes(&infcx, env.param_env);
 
     let ItemContainerId::TraitId(trait_id) = func.loc(db).container else {
         return Ok((Either::Left(func), fn_subst));
@@ -882,13 +886,13 @@ pub(crate) fn find_matching_impl<'db>(
 /// does) and less where such a macro in a body alone names the dependency.
 #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
-    let _p = tracing::info_span!("loaded_crates").entered();
+    let _p = tracing::info_span!(target: "blaze", "loaded_crates").entered();
     blaze_mem::frame::current(|frame| {
         let data = krate.data(db);
         let mut unnamed = Vec::new_in(frame);
         unnamed.extend(data.dependencies.iter().filter(|dep| {
             let data = dep.crate_id.data(db);
-            !(dep.is_sysroot() || data.origin.is_lang() || data.target_kind.is_proc_macro())
+            !(dep.is_sysroot() || data.origin.is_lang() || dep.crate_id.loads_only_macros(db))
         }));
         // Few files name a dependency, and a file's text tells which may without its tree. A
         // file `include!` puts among the items is one of the crate's as well: a root that is
@@ -966,7 +970,10 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
         ordered.push(krate);
         loaded.insert(krate);
         for dep in &data.dependencies {
-            if unnamed.iter().any(|it| std::ptr::eq(*it, dep)) {
+            // A proc-macro crate's impls and its dependencies' are never its user's
+            // (`Crate::loads_only_macros`): a derive built for `wasm32-wasip1` brings its own
+            // `alloc` and `std`, whose impls would stand beside the user's.
+            if unnamed.iter().any(|it| std::ptr::eq(*it, dep)) || dep.crate_id.loads_only_macros(db) {
                 continue;
             }
             // The same of the dependency: the crates of its tests and benches are among its own.
@@ -997,6 +1004,12 @@ pub struct CratesThatName {
 }
 
 impl CratesThatName {
+    /// Whether `krate` is one of the loaded crates or what one depends on: with the crate asked
+    /// for among them, its whole dependency closure.
+    pub fn has(&self, krate: Crate) -> bool {
+        self.crates.binary_search(&krate).is_ok()
+    }
+
     fn row(&self, krate: Crate) -> Option<&[u64]> {
         let r = self.crates.binary_search(&krate).ok()?;
         let words = self.row_words as usize;
@@ -1020,7 +1033,7 @@ impl CratesThatName {
 
 #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub fn crates_that_name(db: &Db, krate: Crate) -> CratesThatName {
-    let _p = tracing::info_span!("crates_that_name").entered();
+    let _p = tracing::info_span!(target: "blaze", "crates_that_name").entered();
     blaze_mem::frame::current(|frame| {
         let loaded = loaded_crates(db, krate);
         // Every crate after the ones it depends on, the graph being acyclic: a walk from each
@@ -1227,12 +1240,10 @@ fn macro_is_inert(db: &Db, krate: Crate, name: &Symbol) -> bool {
     matches!(known.binary_search_by(|(it, _)| it.cmp_order(name)), Ok(i) if !known[i].1)
 }
 
-/// Whether `BLAZE_TRACE_HOLDERS=1` asks for [`trace_holders`]; read once per process.
-pub(crate) fn tracing_holders() -> bool {
-    static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("BLAZE_TRACE_HOLDERS").is_some_and(|it| it == "1")
-    });
-    *TRACE
+/// Whether `BLAZE_TRACE_HOLDERS=1` asks for [`trace_holders`]
+/// ([`base_db::FrontSettings::trace_holders`]).
+pub(crate) fn tracing_holders(db: &Db) -> bool {
+    base_db::FrontSettings::get(db).trace_holders(db)
 }
 
 /// Writes to stderr, one line per holder of `module` ([`impl_holders`]), why it makes the
@@ -1319,7 +1330,7 @@ fn macro_resolution(db: &Db, krate: Crate, name: &Symbol) -> String {
         return "unknown".to_owned();
     }
     let mut found = Vec::new();
-    let mut seen = blaze_hash::HashSet::default();
+    let mut seen = blaze_hash::HashSet::new_in(Global);
     // alloc: as above
     let mut stack = vec![krate];
     while let Some(at) = stack.pop() {
@@ -1345,7 +1356,7 @@ fn macro_resolution(db: &Db, krate: Crate, name: &Symbol) -> String {
         if !writes[i].1 {
             continue;
         }
-        let mut files = blaze_hash::HashSet::default();
+        let mut files = blaze_hash::HashSet::new_in(Global);
         for (_, module) in def_map.modules(db) {
             let Some(file) = module.origin.file_id() else { continue };
             // alloc: as above
@@ -1667,12 +1678,14 @@ impl ImplWork {
 #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn crates_containing_incoherent_inherent_impls(db: &Db, krate: Crate) -> Box<[Crate]> {
     blaze_mem::frame::current(|frame| {
-        let _p = tracing::info_span!("crates_containing_incoherent_inherent_impls").entered();
+        let _p = tracing::info_span!(target: "blaze", "crates_containing_incoherent_inherent_impls").entered();
         // We assume that only sysroot crates contain `#[rustc_has_incoherent_inherent_impls]`
-        // impls, since this is an internal feature and only std uses it.
+        // impls, since this is an internal feature and only std uses it. The sysroot of a
+        // proc macro's crate is never its user's (`Crate::loads_only_macros`): a macro built
+        // for `wasm32-wasip1` has its own `alloc`, whose `[T]::sort` is not the user's.
         let mut lang = Vec::new_in(frame);
         lang.extend(
-            krate.transitive_deps(db).iter().copied().filter(|krate| krate.data(db).origin.is_lang()),
+            krate.transitive_loaded_deps(db).iter().copied().filter(|krate| krate.data(db).origin.is_lang()),
         );
         // alloc: the memo's value, once at its length.
         lang.iter().copied().collect()
@@ -1696,7 +1709,7 @@ pub fn with_incoherent_inherent_impls<'db>(
     if !has_incoherent_impls {
         return;
     }
-    let _p = tracing::info_span!("incoherent_inherent_impls").entered();
+    let _p = tracing::info_span!(target: "blaze", "incoherent_inherent_impls").entered();
     let crates = crates_containing_incoherent_inherent_impls(db, krate);
     for &krate in crates {
         callback(InherentImpls::in_crate_for_self_ty(db, krate, SelfTyKey(*self_ty)));

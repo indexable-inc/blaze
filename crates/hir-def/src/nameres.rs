@@ -77,6 +77,7 @@ use std::{
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::Tag;
 use either::Either;
 use hir_expand::{
@@ -243,7 +244,7 @@ pub struct DefMap {
     /// `macro_use` prelude that contains macros from `#[macro_use]`'d external crates. Note that
     /// this contains all kinds of macro, not just `macro_rules!` macro.
     /// ExternCrateId being None implies it being imported from the general prelude import.
-    macro_use_prelude: HashMap<Name, (MacroId, Option<ExternCrateId>)>,
+    macro_use_prelude: HashMap<Name, (MacroId, Option<ExternCrateId>), Global>,
 
     /// Tracks which custom derives are in scope for an item, to allow resolution of derive helper
     /// attributes.
@@ -271,7 +272,7 @@ pub struct DefMap {
 }
 
 type DeriveHelpers =
-    HashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>>;
+    HashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>, Global>;
 
 /// What a collected def map recorded that no resolution reads: how its imports and macro calls
 /// resolved, its diagnostics and the derive helpers in scope of its items.
@@ -349,9 +350,9 @@ impl DiagnosticsByModule {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DefMapCrateData {
     /// Side table for resolving derive helpers.
-    exported_derives: HashMap<MacroId, Box<[Name]>>,
-    fn_proc_macro_mapping: HashMap<FunctionId, ProcMacroId>,
-    fn_proc_macro_mapping_back: HashMap<ProcMacroId, FunctionId>,
+    exported_derives: HashMap<MacroId, Box<[Name]>, Global>,
+    fn_proc_macro_mapping: HashMap<FunctionId, ProcMacroId, Global>,
+    fn_proc_macro_mapping_back: HashMap<ProcMacroId, FunctionId, Global>,
 
     /// Custom tool modules registered with `#![register_tool]`.
     registered_tools: Vec<Symbol>,
@@ -363,6 +364,9 @@ struct DefMapCrateData {
     no_std: bool,
     /// A crate of procedural macros, which gives other crates its macros and nothing else.
     proc_macro: bool,
+    /// blaze: `#![blaze::arbitrary_ints]`, under which `u1`..`u128` and `i1`..`i128` are
+    /// primitive integer types (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+    arbitrary_ints: bool,
 
     edition: Edition,
     recursion_limit: Option<u32>,
@@ -371,9 +375,9 @@ struct DefMapCrateData {
 impl DefMapCrateData {
     fn new(edition: Edition) -> Self {
         Self {
-            exported_derives: HashMap::default(),
-            fn_proc_macro_mapping: HashMap::default(),
-            fn_proc_macro_mapping_back: HashMap::default(),
+            exported_derives: HashMap::new_in(Global),
+            fn_proc_macro_mapping: HashMap::new_in(Global),
+            fn_proc_macro_mapping_back: HashMap::new_in(Global),
             // alloc: once per crate
             registered_tools: PREDEFINED_TOOLS.iter().map(|it| Symbol::intern(it)).collect(),
             unstable_features: UnstableFeatures::default(),
@@ -381,6 +385,7 @@ impl DefMapCrateData {
             no_core: false,
             no_std: false,
             proc_macro: false,
+            arbitrary_ints: false,
             edition,
             recursion_limit: None,
         }
@@ -397,6 +402,7 @@ impl DefMapCrateData {
             no_core: _,
             no_std: _,
             proc_macro: _,
+            arbitrary_ints: _,
             edition: _,
             recursion_limit: _,
         } = self;
@@ -725,7 +731,7 @@ impl Unmaintained {
     /// Unwinds with `self` as the payload. It is logged first: a catcher that reads only a
     /// panic's text finds none in it, and the panic hook prints only where it was thrown.
     pub fn throw(self) -> ! {
-        tracing::error!("{self}");
+        tracing::error!(target: "blaze", "{self}");
         std::panic::panic_any(self)
     }
 
@@ -795,7 +801,7 @@ impl FixpointLimit {
 
     /// Unwinds with `self` as the payload, logged first as [`Unmaintained::throw`] is.
     pub fn throw(self) -> ! {
-        tracing::error!("{self}");
+        tracing::error!(target: "blaze", "{self}");
         std::panic::panic_any(self)
     }
 
@@ -891,8 +897,8 @@ impl DefMap {
             modules: ModulesSlot::Building(modules),
             krate,
             prelude: None,
-            macro_use_prelude: HashMap::default(),
-            derive_helpers_in_scope: HashMap::default(),
+            macro_use_prelude: HashMap::new_in(Global),
+            derive_helpers_in_scope: HashMap::new_in(Global),
             session_macros: false,
             names: uses::NameRecords::default(),
             // alloc: empty; allocates nothing until a diagnostic
@@ -1124,6 +1130,26 @@ impl DefMap {
         self.data.no_std || self.data.no_core
     }
 
+    /// Whether the crate says `#![blaze::arbitrary_ints]`, so that `u3` and `i24` name
+    /// integers of those widths wherever no item of that name shadows them.
+    #[inline]
+    pub fn arbitrary_ints(&self) -> bool {
+        self.data.arbitrary_ints
+    }
+
+    /// The integer of an arbitrary width `name` names in this crate, as the builtin scope's
+    /// `u8` is: only under `#![blaze::arbitrary_ints]`, and shadowed by an item of that name
+    /// exactly as `u8` is, since it is read where the builtin scope is.
+    pub(crate) fn arbitrary_int(&self, name: &Name) -> PerNs {
+        if !self.data.arbitrary_ints {
+            return PerNs::none();
+        }
+        match BuiltinType::arbitrary_by_name(name) {
+            Some(ty) => PerNs::types(ty.into(), Visibility::Public, None),
+            None => PerNs::none(),
+        }
+    }
+
     /// Whether this is a crate of procedural macros (`proc-macro = true`).
     pub fn is_proc_macro(&self) -> bool {
         self.data.proc_macro
@@ -1249,7 +1275,7 @@ impl DefMap {
         self.prelude
     }
 
-    pub(crate) fn macro_use_prelude(&self) -> &HashMap<Name, (MacroId, Option<ExternCrateId>)> {
+    pub(crate) fn macro_use_prelude(&self) -> &HashMap<Name, (MacroId, Option<ExternCrateId>), Global> {
         &self.macro_use_prelude
     }
 

@@ -10,7 +10,7 @@ pub(crate) mod diagnostics;
 pub(crate) mod path;
 pub mod persist;
 
-use std::{alloc::Allocator, cell::OnceCell, iter, mem, sync::OnceLock};
+use std::{alloc::Allocator, iter, mem};
 
 use base_db::Db;
 use blaze_mem::Frame;
@@ -25,8 +25,8 @@ use hir_def::{
     hir::{
         ExprId, PatId,
         generics::{
-            GenericParamDataRef, GenericParams, LocalTypeOrConstParamId, TypeOrConstParamData,
-            TypeParamProvenance, WherePredicate,
+            BinderParams, GenericParamDataRef, GenericParams, LocalTypeOrConstParamId,
+            TypeOrConstParamData, TypeParamProvenance, WherePredicate,
         },
     },
     item_tree::FieldsShape,
@@ -47,9 +47,11 @@ use rustc_ast_ir::Mutability;
 use rustc_type_ir::{
     AliasTyKind, BoundRegion, BoundRegionKind, BoundTyKind, BoundVar, BoundVarIndexKind,
     DebruijnIndex, ExistentialPredicate, ExistentialProjection, ExistentialTraitRef, FnSig,
-    Interner, OutlivesClause, PredicateProxy, TermKind, TyKind, TypeFoldable, TypeFolder,
-    TypeSuperFoldable, TypeVisitableExt, Upcast, UpcastFrom, elaborate,
+    InferConst, InferTy, Interner, OutlivesClause, PredicateProxy, TermKind, TyKind,
+    TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt, TypingMode, Upcast,
+    UpcastFrom, elaborate,
     inherent::{Clause as _, GenericArg as _, GenericArgs as _, IntoKind as _, Ty as _},
+    reflect::{ReflectedDomain, ReflectedVar},
     shift_vars,
 };
 use smallvec::SmallVec;
@@ -61,7 +63,7 @@ pub use hir_def::LoweringMode;
 pub(crate) use hir_def::TrackedStructToken;
 
 use crate::{
-    ElidedLifetimeSite, ImplTraitId, InferenceResult, MissingLifetimeKind,
+    CycleQuery, ElidedLifetimeSite, ImplTraitId, InferenceResult, MissingLifetimeKind,
     PathLoweringDiagnostic, PatternTypeUnsupported, Span, TyLoweringDiagnostic,
     consteval::{CreateConstError, create_anon_const, path_to_const},
     db::{AnonConstId, HirDatabase, InternedOpaqueTyId},
@@ -72,10 +74,14 @@ use crate::{
         BoundTy, BoundVarKinds, BoundVariableKind, Clause, ClauseKind, Clauses, Const, ConstExt,
         ConstKind, DbInterner, DefaultAny, EarlyBinder, EarlyParamRegion, ErrorGuaranteed,
         FnSigKind, GenericArg, GenericArgKind, GenericArgs, IsRigid, ParamConst,
-        ParamEnv, PatList, Pattern, PolyFnSig, Predicate, Region, RegionExt, RegionKind,
+        ParamEnv, PatList, Pattern, PolyFnSig, Predicate, ProjectionClause, Region, RegionExt,
+        RegionKind,
         StoredClauses, StoredConst, StoredEarlyBinder, StoredGenericArg, StoredGenericArgs,
         StoredPolyFnSig, StoredTraitRef, StoredTy, Symbol, TermId, TraitClause, TraitRef, Ty, Tys,
-        Unnormalized, abi::Safety, default_types, infer::InferCtxt, mk_param,
+        Unnormalized, abi::Safety, default_types,
+        infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
+        mk_param,
+        obligation_ctxt::ObligationCtxt,
         util::BottomUpFolder,
     },
 };
@@ -362,7 +368,7 @@ pub struct TyLoweringContext<'db, 'a> {
     store: &'a ExpressionStore,
     def: ExpressionStoreOwnerId,
     generic_def: GenericDefId,
-    generics: &'a OnceCell<Generics<'db>>,
+    generics: &'a Generics<'db>,
     in_binders: DebruijnIndex,
     impl_trait_mode: ImplTraitLoweringState<'a>,
     interning_mode: LoweringMode,
@@ -380,11 +386,6 @@ pub struct TyLoweringContext<'db, 'a> {
     /// Lifetimes left out (`&u8`, `'_`) that no signature binds are region variables, not
     /// errors, as the borrow checker lowers a type written in a body.
     elided_region_vars: bool,
-    /// Lowering an impl's self type or trait, where rustc makes an elided lifetime a fresh
-    /// parameter of the impl: the trait object behind such a reference has its lifetime, an
-    /// error as the reference's is, not `'static`, so `impl Params for &[&dyn ToSql]` holds
-    /// for `&[&name as &dyn ToSql]`.
-    impl_header: bool,
     is_lowering_impl_trait_bounds: bool,
     /// The names the binders in scope bind, outermost first: binder `i`'s are
     /// `bound_names[bound_vars[i].0..]`, up to the next binder's start.
@@ -413,7 +414,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         store: &'a ExpressionStore,
         def: ExpressionStoreOwnerId,
         generic_def: GenericDefId,
-        generics: &'a OnceCell<Generics<'db>>,
+        generics: &'a Generics<'db>,
         lifetime_elision: LifetimeElisionKind<'db>,
         lifetime_lowering_mode: LifetimeLoweringMode,
         frame: &'a Frame,
@@ -447,7 +448,6 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             infer_vars: None,
             type_placeholders: Vec::new_in(frame),
             elided_region_vars: false,
-            impl_header: false,
             is_lowering_impl_trait_bounds: false,
             bound_names: Vec::new_in(frame),
             bound_vars,
@@ -859,11 +859,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     fn bound_vars(
         db: &'db Db,
         def: GenericDefId,
-        generic: &'a OnceCell<Generics<'db>>,
+        generics: &Generics<'db>,
     ) -> BoundVarKinds<'db> {
         let def_id = def.into();
 
-        let generics = generic.get_or_init(|| generics(db, def));
         let args = generics.iter_self_late_bound().map(|(_, data)| match data {
             GenericParamDataRef::TypeParamData(..) => {
                 BoundVariableKind::Ty(BoundTyKind::Param(def_id))
@@ -937,7 +936,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             expr_id,
             self.resolver,
             const_type,
-            &|| self.generics.get_or_init(|| generics(self.db, self.generic_def)),
+            &|| self.generics,
             create_var,
             self.interning_mode,
             self.forbid_params_after,
@@ -973,8 +972,8 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         self.types.consts.error
     }
 
-    fn generics(&self) -> &Generics<'db> {
-        self.generics.get_or_init(|| generics(self.db, self.generic_def))
+    fn generics(&self) -> &'a Generics<'db> {
+        self.generics
     }
 
     fn param_index_is_disallowed(&self, index: u32) -> bool {
@@ -1087,8 +1086,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     None => self.anonymous_lifetime(ElidedLifetimeSite::Reference(type_ref_id)),
                 };
                 let inner_ty = match self.store.type_ref(ref_.ty) {
-                    // `&'a dyn Trait` is `&'a (dyn Trait + 'a)`.
-                    TypeRef::DynTrait(bounds) if !lifetime.is_error() || self.impl_header => {
+                    // `&'a dyn Trait` is `&'a (dyn Trait + 'a)`, and `&dyn Trait` of a
+                    // parameter the error of its elided lifetime twice, which
+                    // [`elided_groups`] makes one lifetime.
+                    TypeRef::DynTrait(bounds) => {
                         let object = self.object_default(lifetime);
                         self.lower_dyn_trait(bounds, object)
                     }
@@ -1325,7 +1326,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     fn_sig_kind: FnSigKind::dummy()
                         .set_abi(fn_.abi)
                         .set_safety(if fn_.is_unsafe { Safety::Unsafe } else { Safety::Safe })
-                        .set_c_variadic(fn_.is_varargs),
+                        .set_c_variadic(fn_.is_varargs)
+                        .set_splatted(fn_.splatted, params.len())
+                        .expect("`FnType::splatted` indexes its inputs, below `u8::MAX`"),
                     inputs_and_output: Tys::new_from_slice(&args),
                 },
                 binder,
@@ -1404,6 +1407,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             let (ty, res) = self.lower_ty_ext(type_ref);
             let mut ctx = self.at_path(path_id);
             return ctx.lower_ty_relative_path(ty, res, false, path_id.type_ref().into());
+        }
+        // `F` or `F::Type` of a field binder in scope (`for<F: Field<T>>`).
+        if let Some(ty) = self.lower_reflected_var_path(path, path_id.type_ref()) {
+            return (ty, None);
         }
 
         let mut ctx = self.at_path(path_id);
@@ -1487,8 +1494,22 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             Either::Left(ctx.lower_type_bound(bound, self_ty, ignore_bindings))
         };
 
-        match where_predicate {
-            WherePredicate::TypeBound { lifetimes, target, bound } => match lifetimes {
+        let lowered = match where_predicate {
+            // A field binder `for<'a, F: Field<C>, ..>` (`#![feature(blaze_comptime)]`,
+            // docs/v2/plan/design/comptime.md): one binder whose variables are the lifetimes,
+            // then a `Reflected` variable per type parameter. What it cannot lower is a typed
+            // error and no clause.
+            WherePredicate::TypeBound { lifetimes, binder, target, bound } if !binder.is_empty() => {
+                if self.push_reflected_binder(*lifetimes, *binder, *target, bound).is_none() {
+                    return None.into_iter().flatten();
+                }
+                let shifted = self.in_binders.shifted_in(1);
+                let lowered =
+                    self.with_debruijn(shifted, |ctx| lower_type_outlives(ctx, target, bound, true));
+                self.pop_bound_vars();
+                lowered
+            }
+            WherePredicate::TypeBound { lifetimes, binder: _, target, bound } => match lifetimes {
                 Some(lifetimes) => {
                     self.with_shifted_in(self.store.names(*lifetimes), |ctx| {
                         lower_type_outlives(ctx, target, bound, true)
@@ -1509,8 +1530,8 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 )),
                 GenericPredicateSource::SelfOnly,
             ))),
-        }
-        .into_iter()
+        };
+        Some(lowered).into_iter().flatten()
     }
 
     /// The trait of `ty`'s implicit sizedness bound, for the bounds lowered on it so far.
@@ -2117,6 +2138,213 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             None
         }
     }
+
+    /// Pushes the binder of the where predicate `for<'a, F: Field<C>, ..> target: bound`
+    /// (`#![feature(blaze_comptime)]`): its lifetimes, then one
+    /// [`BoundVariableKind::Reflected`] variable per type parameter, whose container `C` is
+    /// lowered inside the binder and may name the parameters before it. The caller lowers the
+    /// predicate under it and pops it. `None`, with the binder not pushed, after a typed error
+    /// at what it cannot lower: a parameter whose bounds are not exactly one
+    /// `core::reflect::Field<C>` or `Variant<C>` (filters such as `+ Unmarked<M>` are not built
+    /// yet), and a `const`/`[const]` bound, which would be a const condition no one lowers
+    /// under a field binder.
+    fn push_reflected_binder(
+        &mut self,
+        lifetimes: Option<hir_def::expr_store::path::Names>,
+        binder: BinderParams,
+        target: TypeRefId,
+        bound: &TypeBound,
+    ) -> Option<()> {
+        let refuse = |ctx: &mut Self, source| {
+            ctx.push_diagnostic(TyLoweringDiagnostic::ComptimeBinderNotYetSupported { source });
+            None
+        };
+        if let TypeBound::Path(_, TraitBoundModifier::Const | TraitBoundModifier::MaybeConst) =
+            bound
+        {
+            return refuse(self, target);
+        }
+        let (Some(field), Some(variant)) = (self.lang_items.ReflectField, self.lang_items.ReflectVariant)
+        else {
+            return refuse(self, target);
+        };
+        let Some(params) = self.generics.params_of_store(self.store) else {
+            return refuse(self, target);
+        };
+        let store = self.store;
+        let lifetime_names: &[Name] = lifetimes.map_or(&[], |it| store.names(it));
+        let start = self.bound_names.len() as u32;
+        self.bound_names.extend(lifetime_names.iter().cloned());
+        // clone: a `Name` is an interned `Symbol`
+        self.bound_names.extend(params.binder_params(binder).map(|(_, param)| param.name.clone()));
+        // Each type variable is plain until its bound is lowered, so a container naming its
+        // own variable or a later one does not resolve to it.
+        let kinds = BoundVarKinds::new_from_iter(lifetime_names.iter().map(for_lifetime_kind).chain(
+            iter::repeat_n(BoundVariableKind::Ty(BoundTyKind::Anon), binder.len as usize),
+        ));
+        self.bound_vars.push((start, kinds));
+        for (at, (_, param)) in params.binder_params(binder).enumerate() {
+            let var = lifetime_names.len() + at;
+            let shifted = self.in_binders.shifted_in(1);
+            let reflected = self.with_debruijn(shifted, |ctx| {
+                ctx.lower_reflected_var(&param.bounds, var, field, variant, target)
+            });
+            let Some(reflected) = reflected else {
+                self.pop_bound_vars();
+                return None;
+            };
+            let kinds = self.peek_bound_vars();
+            self.bound_vars.last_mut().unwrap().1 =
+                BoundVarKinds::new_from_iter(kinds.iter().enumerate().map(|(index, kind)| {
+                    if index == var { BoundVariableKind::Reflected(reflected) } else { kind }
+                }));
+        }
+        Some(())
+    }
+
+    /// The variable `var` of the innermost binder, bounded by `bounds`: `Field<C>` ranges over
+    /// the fields of `C`, `Variant<C>` over the variants of `C`.
+    fn lower_reflected_var(
+        &mut self,
+        bounds: &[TypeBound],
+        var: usize,
+        field: TraitId,
+        variant: TraitId,
+        target: TypeRefId,
+    ) -> Option<ReflectedVar<DbInterner<'db>>> {
+        let path = match bounds {
+            [TypeBound::Path(path, TraitBoundModifier::None)] => *path,
+            [TypeBound::Path(path, _) | TypeBound::ForLifetime(_, path), ..] => {
+                self.push_diagnostic(TyLoweringDiagnostic::ComptimeBinderNotYetSupported {
+                    source: path.type_ref(),
+                });
+                return None;
+            }
+            _ => {
+                self.push_diagnostic(TyLoweringDiagnostic::ComptimeBinderNotYetSupported {
+                    source: target,
+                });
+                return None;
+            }
+        };
+        let self_ty = Ty::new_bound(
+            self.interner,
+            DebruijnIndex::ZERO,
+            BoundTy { var: BoundVar::from_usize(var), kind: BoundTyKind::Anon },
+        );
+        let Some((trait_ref, _)) = self.lower_trait_ref_from_path(path, self_ty) else {
+            // Not a trait: the bound names no domain.
+            self.push_diagnostic(TyLoweringDiagnostic::ComptimeBinderNotYetSupported {
+                source: path.type_ref(),
+            });
+            return None;
+        };
+        let domain = match trait_ref.def_id.0 {
+            it if it == field => ReflectedDomain::Fields,
+            it if it == variant => ReflectedDomain::Variants,
+            _ => {
+                self.push_diagnostic(TyLoweringDiagnostic::ComptimeBinderNotYetSupported {
+                    source: path.type_ref(),
+                });
+                return None;
+            }
+        };
+        Some(ReflectedVar { kind: BoundTyKind::Anon, domain, container: trait_ref.args.type_at(1) })
+    }
+
+    /// The reflected variable a binder in scope binds to `name`: how many binders out it is,
+    /// its index, and what it ranges over.
+    fn find_reflected_var(
+        &self,
+        name: &Name,
+    ) -> Option<(DebruijnIndex, BoundVar, ReflectedVar<DbInterner<'db>>)> {
+        let mut end = self.bound_names.len();
+        for (debruijn, &(start, kinds)) in self.bound_vars.iter().rev().enumerate() {
+            let names = &self.bound_names[start as usize..end];
+            if let Some(index) = names.iter().rposition(|it| it == name) {
+                if let Some(BoundVariableKind::Reflected(var)) = kinds.as_slice().get(index) {
+                    return Some((
+                        DebruijnIndex::from_usize(debruijn),
+                        BoundVar::from_usize(index),
+                        *var,
+                    ));
+                }
+                // A lifetime of that name, or a type variable whose bound is being lowered:
+                // not this type.
+                return None;
+            }
+            end = start as usize;
+        }
+        None
+    }
+
+    /// `path` (no type anchor) when its first segment names a field binder's variable: `F` is
+    /// the variable, `F::Name` the associated type `Name` of its reflection trait
+    /// (`reflect::Field<C>`, `Variant<C>`) or of their supertraits (`F::Type` is
+    /// `<F as core::field::Field>::Type`). `None` when it names none.
+    fn lower_reflected_var_path(&mut self, path: Path<'_>, source: TypeRefId) -> Option<Ty<'db>> {
+        if self.bound_names.is_empty()
+            || *path.kind() != hir_expand::mod_path::PathKind::Plain
+        {
+            return None;
+        }
+        let segments = path.segments();
+        let first = segments.first()?;
+        let (debruijn, var, reflected) = self.find_reflected_var(first.name)?;
+        let refuse = |ctx: &mut Self| {
+            ctx.push_diagnostic(TyLoweringDiagnostic::ComptimeBinderNotYetSupported { source });
+            ctx.types.types.error
+        };
+        if first.args_and_bindings.is_some() {
+            return Some(refuse(self));
+        }
+        let interner = self.interner;
+        let bound = Ty::new_bound(interner, debruijn, BoundTy { var, kind: BoundTyKind::Anon });
+        let assoc = match segments.len() {
+            1 => return Some(bound),
+            2 => segments.get(1)?,
+            _ => return Some(refuse(self)),
+        };
+        if assoc.args_and_bindings.is_some() {
+            return Some(refuse(self));
+        }
+        let (Some(field), Some(variant)) = (self.lang_items.ReflectField, self.lang_items.ReflectVariant)
+        else {
+            return Some(refuse(self));
+        };
+        let reflect_trait = match reflected.domain {
+            ReflectedDomain::Fields => field,
+            ReflectedDomain::Variants => variant,
+        };
+        // The container is written inside its binder, which is `debruijn` binders out.
+        let container = shift_vars(interner, reflected.container, debruijn.as_u32());
+        let db = self.db;
+        for &trait_ in crate::utils::all_super_traits(db, reflect_trait) {
+            let Some(alias) = trait_.trait_items(db).associated_type_by_name(assoc.name) else {
+                continue;
+            };
+            // The reflection trait's own (`Variant<C>::View`) takes `[F, C]`; a supertrait's,
+            // only when its one parameter is `Self` (`core::field::Field::Type`), `[F]`.
+            let args: SmallVec<[GenericArg<'db>; 2]> = if trait_ == reflect_trait {
+                SmallVec::from_slice(&[bound.into(), container.into()])
+            } else if generics(db, trait_.into()).len(false) == 1 {
+                SmallVec::from_slice(&[bound.into()])
+            } else {
+                return Some(refuse(self));
+            };
+            // A generic associated type would take arguments the path does not give.
+            if generics(db, alias.into()).len(false) != args.len() {
+                return Some(refuse(self));
+            }
+            return Some(Ty::new_projection_from_args(
+                interner,
+                IsRigid::No,
+                alias.into(),
+                GenericArgs::new_from_slice(&args),
+            ));
+        }
+        Some(refuse(self))
+    }
 }
 
 /// A lowered signature and what lowering it found: its diagnostics and the anonymous constants it
@@ -2369,7 +2597,7 @@ pub(crate) fn lower_impl_trait<'db, 'f>(
 ) -> Option<FrameLowered<'f, 'db, StoredEarlyBinder<StoredTraitRef>>> {
     let impl_data = ImplSignature::of(db, impl_id);
     let resolver = impl_id.resolver(db);
-    let generics = OnceCell::new();
+    let generics = generics(db, impl_id.into());
     let mut ctx = TyLoweringContext::new(
         db,
         &resolver,
@@ -2381,19 +2609,39 @@ pub(crate) fn lower_impl_trait<'db, 'f>(
         LifetimeLoweringMode::Bound,
         frame,
     );
-    ctx.impl_header = true;
     let target_trait = impl_data.target_trait?;
     let trait_ref = ctx.lower_trait_ref(target_trait, self_ty)?;
     let value = StoredEarlyBinder::bind(ctx.interner, StoredTraitRef::new(trait_ref));
     Some(FrameLowered::from_ctx(value, ctx, frame))
 }
 
+/// `impl Tr<Self::A> for S`: the trait's arguments name an associated type of the impl's own
+/// trait, which is being lowered. rustc's E0391 "cycle detected when computing trait
+/// implemented by `impl`". The trait the impl names, with every argument an error, so the impl
+/// stays a trait impl (an inherent one would take its items for inherent ones); `None` only
+/// when the impl names no trait, which is no cycle of its trait but the true answer.
 pub(crate) fn impl_trait_with_diagnostics_cycle_result<'db>(
-    _db: &'db Db,
+    db: &'db Db,
     _: blaze_query::db::Id,
-    _impl_id: ImplId,
+    impl_id: ImplId,
 ) -> Option<TyLoweringResult<'db, StoredEarlyBinder<StoredTraitRef>>> {
-    None
+    let impl_data = ImplSignature::of(db, impl_id);
+    let target_trait = impl_data.target_trait?;
+    let Some(TypeNs::TraitId(trait_)) = impl_id
+        .resolver(db)
+        .resolve_path_in_type_ns_fully(db, impl_data.store.path(target_trait.path))
+    else {
+        // Not a trait: lowering it reports that, and reads no trait to cycle on.
+        return None;
+    };
+    let interner = DbInterner::new_no_crate(db);
+    let args = GenericArgs::error_for_item(interner, trait_.into());
+    let trait_ref = TraitRef::new_from_args(interner, trait_.into(), args);
+    Some(TyLoweringResult::new(
+        StoredEarlyBinder::bind(interner, StoredTraitRef::new(trait_ref)),
+        [TyLoweringDiagnostic::QueryCycle { def: impl_id.into(), query: CycleQuery::ImplTrait }],
+        [],
+    ))
 }
 
 impl ImplTraitId {
@@ -2499,7 +2747,12 @@ pub(crate) fn ty_query<'db>(db: &'db Db, def: TyDefId) -> EarlyBinder<'db, Ty<'d
             it,
             GenericArgs::identity_for_item(interner, it.into()),
         )),
-        TyDefId::TypeAliasId(it) => db.type_for_type_alias_with_diagnostics(it).value.value.get(),
+        // An alias of an alias is a query inside a query, one per level of a chain the
+        // program writes (`type D130 = Option<D129>`), as deep as it likes: an overflow aborts
+        // the process, so each level makes sure of its stack (rule 17).
+        TyDefId::TypeAliasId(it) => {
+            stdx::ensure_sufficient_stack(|| db.type_for_type_alias_with_diagnostics(it).value.value.get())
+        }
     }
 }
 
@@ -2531,7 +2784,7 @@ pub(crate) fn type_for_const_with_diagnostics<'db>(
         let resolver = def.resolver(db);
         let data = ConstSignature::of(db, def);
         let parent = def.loc(db).container;
-        let generics = OnceCell::new();
+        let generics = generics(db, def.into());
         let mut ctx = TyLoweringContext::new(
             db,
             &resolver,
@@ -2566,7 +2819,7 @@ pub(crate) fn type_for_static_with_diagnostics<'db>(
     blaze_mem::frame::current(|frame| {
         let resolver = def.resolver(db);
         let data = StaticSignature::of(db, def);
-        let generics = OnceCell::new();
+        let generics = generics(db, def.into());
         let mut ctx = TyLoweringContext::new(
             db,
             &resolver,
@@ -2660,7 +2913,7 @@ pub(crate) fn type_for_type_alias_with_diagnostics<'db>(
     } else {
         blaze_mem::frame::current(|frame| {
             let resolver = t.resolver(db);
-            let generics = OnceCell::new();
+            let generics = generics(db, t.into());
             let mut ctx = TyLoweringContext::new(
                 db,
                 &resolver,
@@ -2748,7 +3001,7 @@ pub(crate) fn lower_impl_self_ty<'db, 'f>(
     frame: &'f Frame,
 ) -> FrameLowered<'f, 'db, StoredEarlyBinder<StoredTy>> {
     let resolver = impl_id.resolver(db);
-    let generics = OnceCell::new();
+    let generics = generics(db, impl_id.into());
     let impl_data = ImplSignature::of(db, impl_id);
     let mut ctx = TyLoweringContext::new(
         db,
@@ -2761,20 +3014,27 @@ pub(crate) fn lower_impl_self_ty<'db, 'f>(
         LifetimeLoweringMode::Bound,
         frame,
     );
-    ctx.impl_header = true;
     let ty = ctx.lower_ty(impl_data.self_ty);
     assert!(!ty.has_escaping_bound_vars());
     FrameLowered::from_ctx(StoredEarlyBinder::bind(ctx.interner, ty.store()), ctx, frame)
 }
 
+/// `impl Tr for W<Self>`: the self type names `Self`, the type being lowered. rustc's E0391
+/// "cycle detected when computing type of `impl`" (it refuses `Self` there first, with "`Self`
+/// is not valid in the self type of an impl block"). An error type, which the diagnostic
+/// guarantees.
 pub(crate) fn impl_self_ty_with_diagnostics_cycle_result<'db>(
     db: &'db Db,
     _: blaze_query::db::Id,
-    _impl_id: ImplId,
+    impl_id: ImplId,
 ) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
-    TyLoweringResult::empty(StoredEarlyBinder::bind_no_rigid_aliases(
-        Ty::new_error(DbInterner::new_no_crate(db), ErrorGuaranteed).store(),
-    ))
+    TyLoweringResult::new(
+        StoredEarlyBinder::bind_no_rigid_aliases(
+            Ty::new_error(DbInterner::new_no_crate(db), ErrorGuaranteed).store(),
+        ),
+        [TyLoweringDiagnostic::QueryCycle { def: impl_id.into(), query: CycleQuery::ImplSelfTy }],
+        [],
+    )
 }
 
 pub(crate) fn const_param_ty<'db>(db: &'db Db, def: ConstParamId) -> Ty<'db> {
@@ -2826,7 +3086,7 @@ pub(crate) fn const_param_types_with_diagnostics<'db>(
     }
     blaze_mem::frame::current(|frame| {
         let resolver = def.resolver(db);
-        let generics = OnceCell::new();
+        let generics = generics(db, def);
         let mut ctx = TyLoweringContext::new(
             db,
             &resolver,
@@ -3000,7 +3260,7 @@ pub(crate) fn lower_field_types<'db, 'f>(
         VariantId::UnionId(it) => (it.resolver(db), it.into()),
         VariantId::EnumVariantId(it) => (it.resolver(db), it.lookup(db).parent.into()),
     };
-    let generics = OnceCell::new();
+    let generics = generics(db, generic_def);
     let mut res = Vec::with_capacity_in(fields.len(), frame);
     let mut ctx = TyLoweringContext::new(
         db,
@@ -3033,11 +3293,21 @@ pub(crate) struct SupertraitsInfo {
     /// a hash's, so a hash over the list is the same in every run.
     supertraits: Box<[TraitId]>,
     direct_start: u32,
+    /// The supertraits needed the trait itself, as `trait A: B {}` with `trait B: A {}`: an
+    /// E0391, which [`supertraits_cycle`] reports. The lists then hold the trait alone.
+    cycle: bool,
     /// The associated types of the trait and its supertraits, the trait's own first.
     pub(crate) defined_assoc_types: Box<[(Name, TypeAliasId)]>,
 }
 
 const _: () = assert!(size_of::<SupertraitsInfo>() <= 40);
+
+/// Whether `trait_`'s supertraits need `trait_` itself (`trait A: B {}` with `trait B: A {}`):
+/// rustc's E0391 "cycle detected when computing the super clauses of `A`", which hir reports
+/// at each trait in the cycle.
+pub fn supertraits_cycle(db: &Db, trait_: TraitId) -> bool {
+    SupertraitsInfo::query(db, trait_).cycle
+}
 
 /// Appends `it` unless `list` has it: a trait has a few supertraits and associated types, so a
 /// scan beats hashing.
@@ -3069,6 +3339,7 @@ impl SupertraitsInfo {
             // alloc: the memo's own lists, exact size
             supertraits: all.iter().chain(direct).copied().collect(),
             direct_start,
+            cycle: false,
             defined_assoc_types: Box::from(defined_assoc_types),
         }
     }
@@ -3095,7 +3366,14 @@ impl SupertraitsInfo {
                 let resolver = trait_.resolver(db);
                 let signature = TraitSignature::of(db, trait_);
                 for pred in signature.generic_params.where_predicates() {
-                    let WherePredicate::TypeBound { lifetimes: _, target, bound } = pred else {
+                    // A binder predicate's target names its own parameters (`for<F: ..> F::Type: ..`).
+                    let WherePredicate::TypeBound {
+                        lifetimes: _,
+                        binder: BinderParams { len: 0, .. },
+                        target,
+                        bound,
+                    } = pred
+                    else {
                         continue;
                     };
                     let (TypeBound::Path(
@@ -3134,12 +3412,28 @@ impl SupertraitsInfo {
             })
         }
 
+        /// `trait A: B {}` with `trait B: A {}`: rustc's E0391 "cycle detected when computing
+        /// the super clauses of `A`", which [`supertraits_cycle`] reports for each trait in the
+        /// cycle. The trait alone, with its own associated types, so name lookup in it still
+        /// finds them.
         fn supertraits_info_cycle(
-            _db: &Db,
+            db: &Db,
             _: blaze_query::db::Id,
-            _trait_: TraitId,
+            trait_: TraitId,
         ) -> SupertraitsInfo {
-            SupertraitsInfo::default()
+            blaze_mem::frame::current(|frame| {
+                let mut defined_assoc_types = Vec::new_in(frame);
+                defined_assoc_types.extend(trait_.trait_items(db).items.iter().filter_map(
+                    |(name, id)| match *id {
+                        // clone: a 4-byte interned `Name`
+                        AssocItemId::TypeAliasId(id) => Some((name.clone(), id)),
+                        _ => None,
+                    },
+                ));
+                let mut info = SupertraitsInfo::new(&[trait_], &[], &defined_assoc_types);
+                info.cycle = true;
+                info
+            })
         }
     }
 }
@@ -3170,7 +3464,7 @@ enum AssocTypeShorthandResolution {
 /// This is a query mostly to handle cycles somewhat gracefully; e.g. the
 /// following bounds are disallowed: `T: Foo<U::Item>, U: Foo<T::Item>`, but
 /// these are fine: `T: Foo<U::Item>, U: Foo<()>`.
-#[tracing::instrument(skip(db), ret)]
+#[tracing::instrument(target = "blaze", skip(db), ret)]
 #[blaze_query::tracked(
     returns(ref),
     cycle_result = resolve_type_param_assoc_type_shorthand_cycle_result,
@@ -3196,7 +3490,7 @@ fn resolve_type_param_assoc_type_shorthand_in(
 ) -> AssocTypeShorthandResolution {
     let generics = generics(db, def);
     let store = generics.store();
-    let generics = &OnceCell::from(generics);
+    let generics = &generics;
     let resolver = def.resolver(db);
     let mut ctx = TyLoweringContext::new(
         db,
@@ -3210,7 +3504,6 @@ fn resolve_type_param_assoc_type_shorthand_in(
         frame,
     );
     let interner = ctx.interner;
-    let generics = generics.get().unwrap();
     let param_ty = Ty::new_param(interner, param, generics.type_or_const_param_idx(param.into()));
 
     let mut this_trait_resolution = None;
@@ -3231,7 +3524,14 @@ fn resolve_type_param_assoc_type_shorthand_in(
     for maybe_parent_generics in generics.iter_owners().rev() {
         ctx.set_owner(maybe_parent_generics);
         for pred in maybe_parent_generics.where_predicates() {
-            let WherePredicate::TypeBound { lifetimes: _, target, bound } = pred else {
+            // A binder predicate's target names its own parameters (`for<F: ..> F::Type: ..`).
+                    let WherePredicate::TypeBound {
+                        lifetimes: _,
+                        binder: BinderParams { len: 0, .. },
+                        target,
+                        bound,
+                    } = pred
+                    else {
                 continue;
             };
             let (TypeBound::Path(
@@ -3413,7 +3713,7 @@ fn type_alias_bounds_in<'db>(
 ) -> TyLoweringResult<'db, SelfAndAssocBounds> {
     let type_alias_data = TypeAliasSignature::of(db, type_alias);
     let resolver = type_alias.resolver(db);
-    let generics = OnceCell::new();
+    let generics = generics(db, type_alias.into());
     let mut ctx = TyLoweringContext::new(
         db,
         &resolver,
@@ -3511,7 +3811,7 @@ fn remap_gat_vars_and_recurse_into_nested_projections<'db>(
     interner: DbInterner<'db>,
     item_trait_ref: TraitRef<'db>,
     assoc_item_def_id: TypeAliasId,
-    generics: &OnceCell<Generics<'db>>,
+    generics: &Generics<'db>,
     clause: Clause<'db>,
     frame: &Frame,
 ) -> Option<(Clause<'db>, GenericPredicateSource)> {
@@ -3555,9 +3855,7 @@ fn remap_gat_vars_and_recurse_into_nested_projections<'db>(
     // First, check that all of the GAT args are substituted with a unique late-bound arg.
     // If we find a duplicate, then it can't be mapped to the definition's params.
     let mut mapping = frame_map(frame);
-    let generics = generics
-        .get_or_init(|| crate::generics::generics(interner.db, assoc_item_def_id.into()))
-        .owner();
+    let generics = generics.owner();
     for ((param_idx, param, _), var) in std::iter::zip(generics.iter_with_idx(), gat_vars) {
         let existing = match var.kind() {
             GenericArgKind::Lifetime(re) => {
@@ -3779,21 +4077,136 @@ fn generic_predicates_of<'db>(
     blaze_mem::frame::current(|frame| generic_predicates(db, def, frame).owned())
 }
 
-/// A cycle can occur from malformed code.
+/// The where clauses of `def` when lowering them needed them again, which malformed code does
+/// (rustc's E0391 of `predicates_of`): the error, reported with the item, and one clause that
+/// is an error, `WellFormed({type error})`. Every item whose where clauses are in the cycle
+/// gets this, so each reports the cycle naming itself.
+///
+/// Not the empty list: an item with no where clause at all would make its blanket impls hold
+/// for every type and its bodies prove what their bounds do not give, so type check would
+/// accept what rustc refuses, with nothing said. A clause that references an error marks the
+/// item as erroneous, as the error the diagnostic guarantees, and the solver holds goals over
+/// it without cascading errors.
 fn generic_predicates_cycle_result<'db>(
-    _db: &'db Db,
+    db: &'db Db,
     _: blaze_query::db::Id,
-    _def: GenericDefId,
+    def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericPredicates> {
-    TyLoweringResult::empty(GenericPredicates::from_explicit_own_predicates(
-        StoredEarlyBinder::bind_no_rigid_aliases(Clauses::empty().store()),
-    ))
+    cycle_predicates(db, def, CycleQuery::Predicates)
+}
+
+/// The predicates of `def` whose `query` needed itself: one clause that is an error,
+/// `WellFormed({type error})`, and the E0391 that guarantees it, naming `def` and `query`.
+fn cycle_predicates<'db>(
+    db: &'db Db,
+    def: GenericDefId,
+    query: CycleQuery,
+) -> TyLoweringResult<'db, GenericPredicates> {
+    let interner = DbInterner::new_no_crate(db);
+    let error = Clause(Predicate::new(
+        interner,
+        Binder::dummy(rustc_type_ir::PredicateKind::Clause(ClauseKind::WellFormed(
+            Ty::new_error(interner, ErrorGuaranteed).into(),
+        ))),
+    ));
+    let predicates = GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
+        interner,
+        Clauses::new_from_slice(&[error]).store(),
+    ));
+    TyLoweringResult::new(predicates, [TyLoweringDiagnostic::QueryCycle { def, query }], [])
+}
+
+/// A trait's where clauses on `Self` alone, its supertraits: rustc's
+/// `explicit_super_predicates_of`, which the solver's `explicit_super_clauses_of` and the
+/// elaboration of a `dyn Trait`'s principal read. Its own query, so a where clause that is not
+/// about `Self` (`where Box<dyn Tr>: Send`) is never lowered for it: lowering `dyn Tr` there
+/// reads these, which are not in the middle of being computed, so valid code has no cycle.
+///
+/// Only what a cycle finds is reported here: every other diagnostic of these clauses is the
+/// same one [`GenericPredicates::query_with_diagnostics`] reports, as are their anon consts.
+pub(crate) fn explicit_super_clauses(db: &Db, trait_: TraitId) -> &GenericPredicates {
+    &explicit_super_clauses_of(db, trait_).value
+}
+
+/// A trait's where clauses on `Self` and on its associated types (`Self::A: Bound`,
+/// `Self: Tr<A: Bound>`): rustc's `explicit_implied_predicates_of`, which the solver's
+/// `explicit_implied_clauses_of` reads. As [`explicit_super_clauses`], its own query.
+pub(crate) fn explicit_implied_clauses(db: &Db, trait_: TraitId) -> &GenericPredicates {
+    &explicit_implied_clauses_of(db, trait_).value
+}
+
+#[blaze_query::tracked(returns(ref), cycle_result = explicit_super_clauses_cycle_result, mem_tag = Infer)]
+fn explicit_super_clauses_of<'db>(
+    db: &'db Db,
+    trait_: TraitId,
+) -> TyLoweringResult<'db, GenericPredicates> {
+    blaze_mem::frame::current(|frame| {
+        TyLoweringResult::empty(
+            lower_generic_predicates_filtered(db, trait_.into(), frame, PredicateFilter::SelfOnly)
+                .value,
+        )
+    })
+}
+
+/// `trait Tr: Eqv<dyn Tr> {}`: `dyn Tr` is elaborated through `Tr`'s supertraits, which are
+/// being lowered. rustc's E0391 "cycle detected when computing the super clauses of `Tr`".
+fn explicit_super_clauses_cycle_result<'db>(
+    db: &'db Db,
+    _: blaze_query::db::Id,
+    trait_: TraitId,
+) -> TyLoweringResult<'db, GenericPredicates> {
+    cycle_predicates(db, trait_.into(), CycleQuery::SuperClauses)
+}
+
+#[blaze_query::tracked(returns(ref), cycle_result = explicit_implied_clauses_cycle_result, mem_tag = Infer)]
+fn explicit_implied_clauses_of<'db>(
+    db: &'db Db,
+    trait_: TraitId,
+) -> TyLoweringResult<'db, GenericPredicates> {
+    blaze_mem::frame::current(|frame| {
+        TyLoweringResult::empty(
+            lower_generic_predicates_filtered(
+                db,
+                trait_.into(),
+                frame,
+                PredicateFilter::SelfAndAssoc,
+            )
+            .value,
+        )
+    })
+}
+
+/// A bound on `Self` or on an associated type of it that needs the trait's implied clauses:
+/// rustc's E0391 "cycle detected when computing the implied clauses of `Tr`".
+fn explicit_implied_clauses_cycle_result<'db>(
+    db: &'db Db,
+    _: blaze_query::db::Id,
+    trait_: TraitId,
+) -> TyLoweringResult<'db, GenericPredicates> {
+    cycle_predicates(db, trait_.into(), CycleQuery::ImpliedClauses)
+}
+
+/// The diagnostics and anon consts of a trait's super and implied clause queries, which hold
+/// only what a cycle found ([`explicit_super_clauses`]).
+pub(crate) fn trait_clauses_with_diagnostics(
+    db: &Db,
+    trait_: TraitId,
+) -> [Lowered<'_, GenericPredicates>; 2] {
+    [
+        explicit_super_clauses_of(db, trait_).as_lowered(),
+        explicit_implied_clauses_of(db, trait_).as_lowered(),
+    ]
 }
 
 impl GenericPredicates {
     #[inline]
     pub fn empty() -> &'static GenericPredicates {
-        static EMPTY: OnceLock<GenericPredicates> = OnceLock::new();
+        #[expect(
+            clippy::disallowed_types,
+            reason = "a process-wide constant: the interned empty clause list, the same for every \
+                      database"
+        )]
+        static EMPTY: std::sync::OnceLock<GenericPredicates> = std::sync::OnceLock::new();
         EMPTY.get_or_init(|| GenericPredicates {
             predicates: StoredEarlyBinder::bind_no_rigid_aliases(Clauses::default().store()),
             has_trait_implied_predicate: false,
@@ -3908,9 +4321,133 @@ pub(crate) fn param_env_from_predicates<'db>(
         predicates.all_predicates().iter_identity().map(Unnormalized::skip_norm_wip),
     );
     let clauses = Clauses::new_from_iter(clauses);
+    if !clauses.has_aliases() {
+        return ParamEnv { clauses };
+    }
+    // As rustc's `normalize_param_env_or_error`: the clauses but the `TypeOutlives` ones are
+    // normalized in the param env as written, those in the one that gives.
+    let is_outlives =
+        |clause: &Clause<'db>| matches!(clause.kind().skip_binder(), ClauseKind::TypeOutlives(..));
+    let all = clauses.as_slice().iter().copied();
+    let others = normalize_clauses(
+        interner,
+        clauses,
+        Clauses::new_from_iter(all.clone().filter(|it| !is_outlives(it))),
+    );
+    let outlives = Clauses::new_from_iter(all.filter(is_outlives));
+    let outlives_env =
+        Clauses::new_from_iter(others.as_slice().iter().chain(outlives.as_slice()).copied());
+    let outlives = normalize_clauses(interner, outlives_env, outlives);
+    let clauses = others.as_slice().iter().chain(outlives.as_slice()).copied();
+    ParamEnv { clauses: Clauses::new_from_iter(clauses) }
+}
 
-    // FIXME: We should normalize projections here, like rustc does.
-    ParamEnv { clauses }
+/// rustc's `do_normalize_clauses` under the next solver: `clauses` normalized in `env` with its
+/// type aliases taken as rigid, so that a clause on `<T as Trait>::Assoc` is matched with its
+/// self type rigid, not normalized again through itself. Each projection's term and each opaque
+/// type is then left to normalize again where the param env is used. What fails to normalize,
+/// or leaves a variable, is an error, as rustc gives it after reporting it.
+fn normalize_clauses<'db>(
+    interner: DbInterner<'db>,
+    env: Clauses<'db>,
+    clauses: Clauses<'db>,
+) -> Clauses<'db> {
+    if !clauses.has_aliases() {
+        return clauses;
+    }
+    let env = rustc_type_ir::set_type_aliases_to_rigid(interner, env);
+    let env = ParamEnv { clauses: projection_terms_to_non_rigid(interner, env) };
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    let cause = ObligationCause::dummy();
+    // A field binder (`for<F: Field<T>> F::Type: Hash`) is normalized under its binder, with
+    // what its variables are members of assumed (`hir_ty::comptime`), as the solver enters it.
+    let is_field_binder = |clause: &Clause<'db>| {
+        rustc_type_ir::reflect::first_reflected_var::<DbInterner<'db>>(clause.kind().bound_vars())
+            .is_some()
+    };
+    let mut binders_failed = false;
+    let binders: SmallVec<[Clause<'db>; 2]> = clauses
+        .iter()
+        .filter(is_field_binder)
+        .map(|clause| {
+            crate::comptime::normalize_field_binder_clause(&infcx, env, clause).unwrap_or_else(|| {
+                binders_failed = true;
+                clause
+            })
+        })
+        .collect(); // alloc: none up to 2 field binders, inline in the `SmallVec`
+    let others = if binders.is_empty() {
+        clauses
+    } else {
+        Clauses::new_from_iter(clauses.iter().filter(|clause| !is_field_binder(clause)))
+    };
+    let (others, obligations) =
+        crate::next_solver::normalize::normalize(infcx.at(&cause, env), others);
+    let mut ocx = ObligationCtxt::new(&infcx);
+    ocx.register_obligations(obligations);
+    let failed = !ocx.evaluate_obligations_error_on_ambiguity().is_empty() || binders_failed;
+    let clauses = if binders.is_empty() {
+        others
+    } else {
+        // In their order as written.
+        let (mut others, mut binders) = (others.iter(), binders.into_iter());
+        Clauses::new_from_iter(clauses.iter().map(|clause| {
+            if is_field_binder(&clause) { binders.next() } else { others.next() }
+                .expect("each clause normalized once")
+        }))
+    };
+    let clauses = infcx.deeply_resolve_via_unification_table(clauses);
+    let clauses = match (failed, clauses.has_infer()) {
+        (false, false) => clauses,
+        (_, regions) => infer_and_non_rigid_aliases_to_errors(interner, clauses, regions),
+    };
+    let clauses = projection_terms_to_non_rigid(interner, clauses);
+    rustc_type_ir::set_opaques_to_non_rigid(interner, clauses).skip_normalization()
+}
+
+/// rustc's `set_projection_term_to_non_rigid`: the term each projection clause gives.
+fn projection_terms_to_non_rigid<'db>(
+    interner: DbInterner<'db>,
+    clauses: Clauses<'db>,
+) -> Clauses<'db> {
+    Clauses::new_from_iter(clauses.as_slice().iter().map(|&clause| {
+        let Some(projection) = clause.as_projection_clause() else { return clause };
+        projection
+            .map_bound(|it| ProjectionClause {
+                projection_term: it.projection_term,
+                term: rustc_type_ir::set_aliases_to_non_rigid(interner, it.term)
+                    .skip_normalization(),
+            })
+            .upcast(interner)
+    }))
+}
+
+/// rustc's `replace_infer_and_non_rigid_alias_with_error`, the region variables too where
+/// `regions`.
+fn infer_and_non_rigid_aliases_to_errors<'db>(
+    interner: DbInterner<'db>,
+    clauses: Clauses<'db>,
+    regions: bool,
+) -> Clauses<'db> {
+    let errors = interner.default_types();
+    clauses.fold_with(&mut BottomUpFolder {
+        interner,
+        ty_op: |ty: Ty<'db>| match ty.kind() {
+            TyKind::Infer(InferTy::TyVar(_) | InferTy::IntVar(_) | InferTy::FloatVar(_))
+            | TyKind::Alias(IsRigid::No, _) => errors.types.error,
+            _ => ty,
+        },
+        lt_op: |region: Region<'db>| match region.kind() {
+            RegionKind::ReVar(_) if regions => errors.regions.error,
+            _ => region,
+        },
+        ct_op: |ct: Const<'db>| match ct.kind() {
+            ConstKind::Infer(InferConst::Var(_)) | ConstKind::Alias(IsRigid::No, _) => {
+                errors.consts.error
+            }
+            _ => ct,
+        },
+    })
 }
 
 pub(crate) fn trait_environment<'db>(db: &'db Db, def: GenericDefId) -> ParamEnv<'db> {
@@ -3956,7 +4493,7 @@ pub(crate) fn const_conditions<'db>(
                         .push(maybe_const(interner, TraitRef::identity(interner, trait_.into())));
                 }
                 let store = generics.store();
-                let generics = &OnceCell::from(generics);
+                let generics = &generics;
                 let resolver = def.resolver(db);
                 let mut ctx = TyLoweringContext::new(
                     db,
@@ -3969,9 +4506,10 @@ pub(crate) fn const_conditions<'db>(
                     LifetimeLoweringMode::Bound,
                     frame,
                 );
-                for pred in generics.get().unwrap().owner().where_predicates() {
+                for pred in generics.owner().where_predicates() {
                     let WherePredicate::TypeBound {
                         lifetimes: None,
+                        binder: BinderParams { len: 0, .. },
                         target,
                         bound: TypeBound::Path(path, TraitBoundModifier::MaybeConst),
                     } = pred
@@ -4005,13 +4543,67 @@ pub(crate) fn const_conditions<'db>(
 
 /// Resolve the where clause(s) of an item with generics,
 /// with a given filter
-#[tracing::instrument(skip(db, frame), ret)]
+#[tracing::instrument(target = "blaze", skip(db, frame), ret)]
 pub(crate) fn generic_predicates<'db, 'f>(
     db: &'db Db,
     def: GenericDefId,
     frame: &'f Frame,
 ) -> FrameLowered<'f, 'db, GenericPredicates> {
     lower_generic_predicates(db, def, frame, None)
+}
+
+/// Which where clauses of an item [`lower_generic_predicates_filtered`] lowers: rustc's
+/// `PredicateFilter` of `implied_predicates_with_filter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PredicateFilter {
+    /// Every one: `predicates_of`.
+    All,
+    /// Those whose bounded type is `Self`: `explicit_super_predicates_of`.
+    SelfOnly,
+    /// Those whose bounded type is `Self` or a path rooted at it (`Self::A`,
+    /// `<Self as Tr>::A`): `explicit_implied_predicates_of`.
+    SelfAndAssoc,
+}
+
+impl PredicateFilter {
+    fn keeps(self, store: &ExpressionStore, pred: &WherePredicate) -> bool {
+        let target = match *pred {
+            WherePredicate::TypeBound { target, .. } => target,
+            WherePredicate::Lifetime { .. } => return self == PredicateFilter::All,
+        };
+        match self {
+            PredicateFilter::All => true,
+            PredicateFilter::SelfOnly => is_self(store, target),
+            PredicateFilter::SelfAndAssoc => is_rooted_at_self(store, target),
+        }
+    }
+}
+
+/// Whether `ty` is written as the trait's `Self`.
+fn is_self(store: &ExpressionStore, ty: TypeRefId) -> bool {
+    match store.type_ref(ty) {
+        TypeRef::TypeParam(param) => param.local_id() == GenericParams::SELF_PARAM_ID_IN_SELF,
+        TypeRef::Path(path) => path.is_self_type(),
+        _ => false,
+    }
+}
+
+/// Whether `ty` is `Self` or a path rooted at it: `Self::A`, `<Self as Tr>::A`, `Self::A::B`.
+fn is_rooted_at_self(store: &ExpressionStore, ty: TypeRefId) -> bool {
+    if is_self(store, ty) {
+        return true;
+    }
+    let TypeRef::Path(path) = store.type_ref(ty) else {
+        return false;
+    };
+    match path.type_anchor() {
+        Some(anchor) => is_rooted_at_self(store, anchor),
+        None => {
+            *path.kind() == hir_expand::mod_path::PathKind::Plain
+                && path.segments().len() > 1
+                && path.segments().first().is_some_and(|it| *it.name == intern::sym::Self_)
+        }
+    }
 }
 
 /// Where a predicate of [`GenericPredicates::query_all`] comes from, for rustc's "required by
@@ -4046,13 +4638,36 @@ fn lower_generic_predicates<'db, 'f>(
     frame: &'f Frame,
     sources: Option<&mut Vec<PredicateSource>>,
 ) -> FrameLowered<'f, 'db, GenericPredicates> {
+    lower_generic_predicates_with(db, def, frame, sources, PredicateFilter::All)
+}
+
+/// The where clauses of `def` that `filter` keeps, with the implicit `MetaSized` of a trait's
+/// `Self`. The parent's and the other parameters' implicit bounds are only in
+/// [`PredicateFilter::All`]: the filtered ones are a trait's, which has no parent, and their
+/// readers keep only clauses on `Self`.
+fn lower_generic_predicates_filtered<'db, 'f>(
+    db: &'db Db,
+    def: GenericDefId,
+    frame: &'f Frame,
+    filter: PredicateFilter,
+) -> FrameLowered<'f, 'db, GenericPredicates> {
+    lower_generic_predicates_with(db, def, frame, None, filter)
+}
+
+fn lower_generic_predicates_with<'db, 'f>(
+    db: &'db Db,
+    def: GenericDefId,
+    frame: &'f Frame,
+    sources: Option<&mut Vec<PredicateSource>>,
+    filter: PredicateFilter,
+) -> FrameLowered<'f, 'db, GenericPredicates> {
     // alloc: error path, only when `sources` is asked for
     let mut own_sources = sources.is_some().then(Vec::new);
     // alloc: error path, as `own_sources`
     let mut assoc_sources = sources.is_some().then(Vec::new);
     let generics = generics(db, def);
     let store = generics.store();
-    let generics = &OnceCell::from(generics);
+    let generics = &generics;
     let resolver = def.resolver(db);
     let interner = DbInterner::new_no_crate(db);
     let mut ctx = TyLoweringContext::new(
@@ -4066,7 +4681,6 @@ fn lower_generic_predicates<'db, 'f>(
         LifetimeLoweringMode::Bound,
         frame,
     );
-    let generics = generics.get().unwrap();
     let myself = generics.owner();
 
     let mut own_predicates = Vec::new_in(frame);
@@ -4082,6 +4696,9 @@ fn lower_generic_predicates<'db, 'f>(
     let generics = myself;
 
     for (index, pred) in generics.where_predicates().enumerate() {
+        if !filter.keeps(store, pred) {
+            continue;
+        }
         tracing::debug!(?pred);
         let written = PredicateSource::Written { def, index: index as u32 };
         for (pred, source) in ctx.lower_where_predicate(pred, false) {
@@ -4124,6 +4741,9 @@ fn lower_generic_predicates<'db, 'f>(
 
         let of_trait_self = param_data.provenance == TypeParamProvenance::TraitSelf;
         if of_trait_self && !trait_self_gets_implicit {
+            return;
+        }
+        if !of_trait_self && filter != PredicateFilter::All {
             return;
         }
 
@@ -4285,7 +4905,7 @@ pub(crate) fn generic_defaults_with_diagnostics<'db>(
         let resolver = def.resolver(db);
 
         let store_for_self = generics.store();
-        let generics = &OnceCell::from(generics);
+        let generics = &generics;
         let mut ctx = TyLoweringContext::new(
             db,
             &resolver,
@@ -4298,7 +4918,6 @@ pub(crate) fn generic_defaults_with_diagnostics<'db>(
             frame,
         )
         .with_impl_trait_mode(ImplTraitLoweringMode::Disallowed);
-        let generics = generics.get().unwrap();
 
         let parent: &[_] = match generics.parent() {
             Some(parent) => &generic_defaults_with_diagnostics(db, parent.def()).value.0,
@@ -4405,7 +5024,7 @@ fn fn_sig_for_fn_in<'db>(
     let data = FunctionSignature::of(db, def);
     let resolver = def.resolver(db);
     let interner = DbInterner::new_no_crate(db);
-    let generics = OnceCell::new();
+    let generics = generics(db, def.into());
     let mut ctx_params = TyLoweringContext::new(
         db,
         &resolver,
@@ -4537,26 +5156,30 @@ pub(crate) fn bind_elided_lifetimes<'db>(
     vars.extend(sig.bound_vars().iter());
     let mut of_params = Vec::new_in(frame);
     let mut tys = Vec::with_capacity_in(inputs.len() + 1, frame);
-    for (&input, count) in inputs.iter().zip(&elided.params) {
+    let groups = elided_groups(db, function);
+    for (index, (&input, count)) in inputs.iter().zip(&elided.params).enumerate() {
         let Some(count) = *count else { return sig };
+        let groups = groups.of(interner, index, input);
         let (start, mut seen) = (of_params.len(), 0);
         let input = rustc_type_ir::fold_regions(interner, input, |region, depth| {
             if !region.is_error() {
                 return region;
             }
-            seen += 1;
-            let var = match (count, of_params.get(start)) {
-                (1, Some(&var)) => var,
-                _ => {
-                    let var = BoundVar::from_usize(vars.len());
-                    vars.push(BoundVariableKind::Region(BoundRegionKind::Anon));
-                    of_params.push(var);
-                    var
-                }
+            let existing = match groups {
+                Some(groups) => of_params.get(start + groups[seen] as usize).copied(),
+                None if count == 1 => of_params.get(start).copied(),
+                None => None,
             };
+            seen += 1;
+            let var = existing.unwrap_or_else(|| {
+                let var = BoundVar::from_usize(vars.len());
+                vars.push(BoundVariableKind::Region(BoundRegionKind::Anon));
+                of_params.push(var);
+                var
+            });
             Region::new_bound(interner, depth, BoundRegion { var, kind: BoundRegionKind::Anon })
         });
-        if (of_params.len() - start) as u32 != count.min(seen) {
+        if (of_params.len() - start) as u32 != count.min(seen as u32) {
             return sig;
         }
         tys.push(input);
@@ -4686,6 +5309,124 @@ fn elided_lifetimes_in(db: &Db, function: FunctionId, frame: &Frame) -> ElidedLi
         _ => None,
     });
     ElidedLifetimes { params: params.into_boxed_slice(), output }
+}
+
+/// For each parameter of a function and its return type, which of the lifetimes it leaves out
+/// each error region of its type in [`callable_item_signature`] is, numbered by the order they
+/// are first met: `&dyn Trait` has the reference's twice, the object's default being the
+/// reference's lifetime. `None` for a type that does not line up with its lowering.
+#[derive(PartialEq, Eq, Debug, Hash, blaze_query::Value)]
+pub struct ElidedGroups {
+    pub params: Box<[Option<Box<[u32]>>]>,
+    pub output: Option<Box<[u32]>>,
+}
+
+impl ElidedGroups {
+    /// The groups of the errors of `ty`, parameter `index`'s type or that type instantiated, in
+    /// the order `fold_regions` meets them; `None` where `ty` has another number of errors.
+    pub fn of<'db>(&self, interner: DbInterner<'db>, index: usize, ty: Ty<'db>) -> Option<&[u32]> {
+        Self::matching(self.params.get(index)?, interner, ty)
+    }
+
+    /// As [`ElidedGroups::of`], for the return type.
+    pub fn of_output<'db>(&self, interner: DbInterner<'db>, ty: Ty<'db>) -> Option<&[u32]> {
+        Self::matching(&self.output, interner, ty)
+    }
+
+    fn matching<'a, 'db>(
+        groups: &'a Option<Box<[u32]>>,
+        interner: DbInterner<'db>,
+        ty: Ty<'db>,
+    ) -> Option<&'a [u32]> {
+        let groups = groups.as_deref()?;
+        let mut errors = 0;
+        rustc_type_ir::fold_regions(interner, ty, |region, _| {
+            errors += usize::from(region.is_error());
+            region
+        });
+        (errors == groups.len()).then_some(groups)
+    }
+}
+
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+pub fn elided_groups(db: &Db, function: FunctionId) -> ElidedGroups {
+    blaze_mem::frame::current(|frame| elided_groups_in(db, function, frame))
+}
+
+/// Lowers each parameter again with a region variable for each lifetime it leaves out, as the
+/// borrow checker lowers a type written in a body, and reads which errors share one.
+fn elided_groups_in(db: &Db, function: FunctionId, frame: &Frame) -> ElidedGroups {
+    let data = FunctionSignature::of(db, function);
+    let resolver = function.resolver(db);
+    let sig = callable_item_signature(db, function.into()).skip_binder().skip_binder();
+    let inputs = sig.inputs();
+    let interner = DbInterner::new_with(db, resolver.krate());
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    let generics = generics(db, function.into());
+    let mut ctx = TyLoweringContext::new(
+        db,
+        &resolver,
+        &data.store,
+        ExpressionStoreOwnerId::Signature(function.into()),
+        function.into(),
+        &generics,
+        LifetimeElisionKind::Infer,
+        LifetimeLoweringMode::Bound,
+        frame,
+    )
+    .with_infer_ctxt_vars(Some(&infcx))
+    .with_elided_region_vars();
+    // alloc: the memo's column, exact size
+    let mut params = Vec::with_capacity(data.params.len() + 1);
+    let (mut theirs, mut ours, mut distinct) =
+        (Vec::new_in(frame), Vec::new_in(frame), Vec::new_in(frame));
+    let written = data.params.iter().enumerate().map(|(index, &param)| (inputs.get(index), param));
+    let output = sig.output();
+    for (input, param) in written.chain(data.ret_type.map(|it| (Some(&output), it))) {
+        let Some(&input) = input else {
+            params.push(None);
+            continue;
+        };
+        if !input.references_error() {
+            params.push(Some(Box::default())); // alloc: none, an empty slice
+            continue;
+        }
+        let lowered = ctx.lower_ty(param);
+        theirs.clear();
+        ours.clear();
+        distinct.clear();
+        for (ty, found) in [(input, &mut theirs), (lowered, &mut ours)] {
+            rustc_type_ir::fold_regions(interner, ty, |region, _| {
+                found.push(region);
+                region
+            });
+        }
+        if theirs.len() != ours.len() {
+            params.push(None);
+            continue;
+        }
+        let mut groups = Vec::new(); // alloc: the memo's column
+        let lined_up = theirs.iter().zip(&ours).filter(|(theirs, _)| theirs.is_error()).all(
+            |(_, &ours)| {
+                if !matches!(ours.kind(), RegionKind::ReVar(_)) {
+                    return false;
+                }
+                let group = distinct.iter().position(|&it| it == ours).unwrap_or_else(|| {
+                    distinct.push(ours);
+                    distinct.len() - 1
+                });
+                groups.push(group as u32);
+                true
+            },
+        );
+        params.push(lined_up.then(|| groups.into_boxed_slice()));
+    }
+    // A function that writes no return type returns `()`, with no lifetime to leave out.
+    let output = match data.ret_type {
+        Some(_) => params.pop().flatten(),
+        None => Some(Box::default()), // alloc: none, an empty slice
+    };
+    ElidedGroups { params: params.into_boxed_slice(), output }
 }
 
 /// The lifetimes the type `ty` of a parameter writes, `None` for one it leaves out, in the order

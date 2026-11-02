@@ -5,6 +5,7 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::{Tag, frame};
 use hir_expand::{mod_path::ModPath, name::Name};
 use triomphe::Arc;
@@ -204,7 +205,7 @@ pub(crate) const NO_ROUND: u32 = u32::MAX;
 pub(crate) struct RoundModules {
     pub(crate) order: Box<[ModuleId]>,
     pub(crate) rows: Box<[ModuleRow]>,
-    pub(crate) index: HashMap<ModuleId, u32>,
+    pub(crate) index: HashMap<ModuleId, u32, Global>,
     /// Per module: [`RoundModules::STEP`], [`RoundModules::GAINS`], [`RoundModules::PENDING`].
     pub(crate) flags: Box<[u8]>,
     /// The modules with `STEP` or `GAINS`, ascending: those with a directive this round or ops

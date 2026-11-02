@@ -145,6 +145,13 @@ pub(crate) fn cfg(
     if test {
         options.insert_atom(Symbol::intern("test"));
     }
+    // blaze's own atom, after the target's cfgs and rustc's flags, so `--print cfg` and build
+    // scripts' `CARGO_CFG_*` never see it: MIR building reads it to check native contract
+    // clauses (docs/v2/plan/lanes/contracts.md, part 1). The crate's cfg is an input of every
+    // body lowering, so each key over a body covers it (rule 18).
+    if profile.contract_checks {
+        options.insert_atom(Symbol::intern(cfg::CONTRACT_CHECKS));
+    }
     Ok(options)
 }
 
@@ -330,11 +337,20 @@ pub(crate) fn crate_types(unit: &Unit, plan: &UnitPlan, what: &str) -> Result<Cr
 
 /// What the crate is: a `--test` crate is a test (a bench's a bench), whatever its target.
 pub(crate) fn target_kind(unit: &Unit, plan: &UnitPlan, what: &str) -> Result<TargetKind, LowerError> {
+    if is_test(unit, plan) {
+        let bench = unit.target.kind.iter().any(|it| it == "bench");
+        return Ok(if bench { TargetKind::Bench } else { TargetKind::Test });
+    }
+    manifest_kind(unit, what)
+}
+
+/// The kind of the manifest's target the crate is built from, `--test` or not: with the
+/// target's name, which of its package's targets it is (cargo's target identity), so an
+/// example and an integration test of one name, both built with `--test` under
+/// `--all-targets`, are two crates.
+pub(crate) fn manifest_kind(unit: &Unit, what: &str) -> Result<TargetKind, LowerError> {
     let target = &unit.target;
     let has = |kind: &str| target.kind.iter().any(|it| it == kind);
-    if is_test(unit, plan) {
-        return Ok(if has("bench") { TargetKind::Bench } else { TargetKind::Test });
-    }
     Ok(if target.is_custom_build() {
         TargetKind::BuildScript
     } else if target.is_proc_macro() {

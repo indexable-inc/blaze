@@ -207,6 +207,7 @@ impl<'db> Type<'db> {
         let env = self.param_env(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+        hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
         let ty = self.ty.instantiate_identity().skip_norm_wip();
         !is_ty_uninhabited_from(&infcx, ty, module.id, env.param_env)
     }

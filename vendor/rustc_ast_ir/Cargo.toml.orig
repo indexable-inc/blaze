@@ -1,0 +1,12 @@
+[dependencies]
+
+[features]
+nightly = []
+
+[package]
+description = "\nAutomatically published version of the package `rustc_ast_ir`\nin the rust-lang/rust repository from commit dc44e7f2c436b6041742e138b9c2176f093196d5\n\nThe publishing script for this crate lives at:\nhttps://github.com/rust-analyzer/rustc-auto-publish\n"
+edition = "2024"
+license = "MIT / Apache-2.0"
+name = "ra-ap-rustc_ast_ir"
+repository = "https://github.com/rust-lang/rust"
+version = "0.179.0"

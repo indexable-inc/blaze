@@ -5,7 +5,7 @@ use hir_expand::fixture;
 
 use crate::{
     db::HirDatabase,
-    next_solver::{ConstExt as _, DbInterner, RegionKind, TyKind},
+    next_solver::{AliasConstKind, ConstKind, DbInterner, RegionKind, TyKind},
     test_db::TestDBExt as _,
     tests::{check_infer, check_no_mismatches, check_types},
 };
@@ -425,8 +425,10 @@ fn f(_: [u8; 18446744073709551616]) {}
     );
 }
 
+/// As rustc's `try_lower_anon_const_lit`: a literal that doesn't match the length's type is not
+/// lowered as a value but left an anon const, whose own typeck reports the mismatch.
 #[test]
-fn invalid_string_array_len_is_error() {
+fn invalid_string_array_len_is_an_anon_const() {
     let fx = fixture::db(
         r#"
 pub union U {
@@ -459,7 +461,13 @@ pub union U {
             .instantiate_identity()
             .skip_norm_wip();
         let TyKind::Array(_, len) = field_ty.kind() else { unreachable!() };
-        assert!(len.is_error());
+        assert!(
+            matches!(
+                len.kind(),
+                ConstKind::Alias(_, alias) if matches!(alias.kind, AliasConstKind::Anon { .. })
+            ),
+            "{len:?}"
+        );
     });
 }
 

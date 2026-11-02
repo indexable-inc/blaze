@@ -520,7 +520,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
                             );
                         } else {
                             let c = Operand::from_concrete_const(
-                                crate::mir::lower::word_bytes(pattern_len),
+                                crate::mir::lower::word_bytes(pattern_len, self.word()?),
                                 MemoryMap::default(),
                                 Ty::new_usize(self.interner()),
                             );

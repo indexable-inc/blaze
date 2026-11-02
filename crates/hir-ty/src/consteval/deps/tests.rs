@@ -3,6 +3,7 @@ use std::sync::Arc;
 use base_db::{Crate, Db, Env};
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use hir_def::{
     ConstId, ModuleDefId,
@@ -184,7 +185,7 @@ fn the_key_changes_with_each_input() {
 /// A store in memory, which refuses a second put of a key with other bytes.
 #[derive(Default)]
 struct Memory {
-    values: Mutex<HashMap<ContentId, Arc<Aligned>>>,
+    values: Mutex<HashMap<ContentId, Arc<Aligned>, Global>>,
 }
 
 impl ImageStore for Memory {
@@ -253,7 +254,7 @@ fn kept(store: &Arc<Memory>, base: Option<ContentId>, mode: Mode) -> (Db, Crate,
     let mut db = fixture::db(FIXTURE).into_db();
     let lib = crate_named(&db, "lib");
     let seven = const_named(&db, lib, "SEVEN");
-    let crates = HashMap::from_iter([(lib, base)]);
+    let crates = HashMap::from_iter_in([(lib, base)], Global);
     set(&mut db, Arc::clone(store) as Arc<dyn ImageStore + Send + Sync>, crates, mode);
     (db, lib, seven)
 }
@@ -325,14 +326,14 @@ fn a_recorded_value_is_drained_under_its_key() {
         }
         let failed = Err(ConstEvalError::MirEvalError(MirEvalError::Panic("no".to_owned())));
         record(&db, seven, empty, &failed);
-        let bases = HashMap::from_iter([(lib, BASE)]);
+        let bases = HashMap::from_iter_in([(lib, BASE)], Global);
         assert_eq!(drain(&db, &bases), Ok(Drained { written: 1, unkeyed: 0 }));
         let item = hir_def::deps::const_key(&db, seven).unwrap();
         assert_eq!(store.read(key(BASE, item)), Some(u32_value(7)));
         assert_eq!(drain(&db, &bases), Ok(Drained::default()), "drained once");
 
         record(&db, seven, empty, &Ok(u32_value(7).store()));
-        assert_eq!(drain(&db, &HashMap::default()), Ok(Drained { written: 0, unkeyed: 1 }));
+        assert_eq!(drain(&db, &HashMap::new_in(Global)), Ok(Drained { written: 0, unkeyed: 1 }));
 
         record(&db, seven, empty, &Ok(u32_value(7).store()));
         record(&db, seven, empty, &Ok(u32_value(9).store()));
@@ -356,7 +357,7 @@ fn check_mode_records_a_difference_and_verify_serves() {
         record(&db, seven, empty, &Ok(u32_value(7).store()));
         let found = of_constants(frozen::differences());
         assert!(found.len() == 1 && found[0].contains("`SEVEN`"), "{found:?}");
-        assert_eq!(drain(&db, &HashMap::default()), Ok(Drained::default()), "nothing to keep");
+        assert_eq!(drain(&db, &HashMap::new_in(Global)), Ok(Drained::default()), "nothing to keep");
     });
     let (db, _, seven) = kept(&store, Some(BASE), Mode::Verify);
     crate::attach_db(&db, || {
@@ -372,9 +373,9 @@ fn setting_the_same_store_changes_nothing() {
     // clone: a test reading the input before and after
     let before = KeptConsts::get(&db).kept(&db).clone();
     let same = Arc::clone(&store) as Arc<dyn ImageStore + Send + Sync>;
-    set(&mut db, same, HashMap::from_iter([(lib, Some(BASE))]), Mode::Serve);
+    set(&mut db, same, HashMap::from_iter_in([(lib, Some(BASE))], Global), Mode::Serve);
     assert_eq!(*KeptConsts::get(&db).kept(&db), before, "the input is not set again");
     let other = Arc::clone(&store) as Arc<dyn ImageStore + Send + Sync>;
-    set(&mut db, other, HashMap::from_iter([(lib, Some(KEY))]), Mode::Serve);
+    set(&mut db, other, HashMap::from_iter_in([(lib, Some(KEY))], Global), Mode::Serve);
     assert_ne!(*KeptConsts::get(&db).kept(&db), before, "another base is another input");
 }

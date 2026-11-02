@@ -100,7 +100,7 @@ Whether a crate keeps state is learned, as the wasm host learns it, and kept by 
 the store expansions are kept in (`blaze_expand::keeping`): read through its reader, written
 as puts the store's owner publishes, one key per verdict, stateful winning. Unseen, its calls are a session (`requires_session`, so the front end
 expands them in declaration order) and no kept expansion is used, since a hit skips a run that
-may leave state; once a build ran some and none left state (`blaze_macro_eval::flush`, called
+may leave state; once a build ran some and none left state (`blaze_macro_eval::Macros::flush` of the daemon's `Macros`, called
 on the store owner's thread when a job's build is over, which then publishes that thread's
 puts), it is stateless and its expansions are found in the store; once one
 left state, it is stateful for good. A stateless verdict that a later run contradicts is said,

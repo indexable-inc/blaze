@@ -58,6 +58,7 @@ use base_db::{
     target::{Arch, TargetData},
 };
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_query::db::{Durability, Setter};
 use cfg::CfgOptions;
 use intern::{Symbol, sym};
@@ -128,7 +129,7 @@ pub fn db_with_proc_macros(
 /// a dependency: `proc_macros`, or `foo` of `crate:main deps:foo`.
 pub fn test_crate(db: &Db) -> Crate {
     let all = all_crates(db);
-    let depended_on: HashSet<Crate> = all
+    let depended_on: HashSet<Crate, Global> = all
         .iter()
         .flat_map(|krate| krate.data(db).dependencies.iter().map(|dep| dep.crate_id))
         .collect();
@@ -266,9 +267,16 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         target_data_layout,
         target_arch,
     } = FixtureWithProjectMeta::parse(fixture);
+    let arch = parse_target_arch(&target_arch);
+    // The tuple is the arch's: a crate's keys and its code generator's target read the tuple.
+    let tuple = match arch {
+        Arch::Wasm32 => "wasm32-wasip1",
+        Arch::Wasm64 => "wasm64-unknown-unknown",
+        _ => "x86_64-unknown-linux-gnu",
+    };
     let target = Ok(TargetData {
-        tuple: Symbol::intern("x86_64-unknown-linux-gnu"),
-        arch: parse_target_arch(&target_arch),
+        tuple: Symbol::intern(tuple),
+        arch,
         data_layout: target_data_layout.into(),
         has_thumb_interworking: false,
     });
@@ -549,8 +557,8 @@ fn set_files(
 ) -> Vec<FileId> {
     let mut by_id = roots.to_vec();
     by_id.sort_unstable_by_key(|(id, _)| id.0);
-    let mut local = HashSet::default();
-    let mut library = HashSet::default();
+    let mut local = HashSet::new_in(Global);
+    let mut library = HashSet::new_in(Global);
     for (id, kind) in by_id {
         let root = match kind {
             SourceRootKind::Local => {

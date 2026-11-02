@@ -165,6 +165,15 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             | Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Unwrap, expr, ty: _ } => {
                 self.infer_mut_expr(expr, mutability);
             }
+            // `x.[f]`, a field of the place `x`, as `Expr::Field`.
+            Expr::ReflectedField { base, field } => {
+                self.infer_mut_expr(base, mutability);
+                self.infer_mut_expr(field, Mutability::Not);
+            }
+            Expr::ComptimeFor { pat: _, iterable, body, label: _ } => {
+                self.infer_mut_expr(iterable, Mutability::Not);
+                self.infer_mut_expr(body, Mutability::Not);
+            }
             Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Wrap, expr, ty: _ }
             | Expr::UnaryOp { expr, op: _ }
             | Expr::Await { expr }

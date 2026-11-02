@@ -5,13 +5,17 @@
 #[cfg(unix)]
 use std::time::Duration;
 
-/// Whether the process `pid` runs.
+/// Whether the process `pid` runs: one this process may not signal (`EPERM`, another user's)
+/// runs too; only `ESRCH` says it does not (review round 5, L3).
 #[cfg(unix)]
 pub fn alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
     // SAFETY: `kill` takes no pointer, so no memory of this process is at stake whatever `pid`
     // is, and a signal of 0 is delivered to nothing: it only asks whether `pid` may be sent one.
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Waits at most `long` for `fd` to be readable, or closed at its other end: whether it is.
@@ -124,14 +128,17 @@ pub fn reap(pid: u32) -> Option<Reaped> {
 pub fn alive(pid: u32) -> bool {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
     use windows_sys::Win32::{
-        Foundation::WAIT_TIMEOUT,
+        Foundation::{ERROR_ACCESS_DENIED, GetLastError, WAIT_TIMEOUT},
         System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
     };
     // SAFETY: `OpenProcess` takes no pointer; any `pid` is either opened or refused with null.
     // The handle it opens is owned below, so it is closed once.
     let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
     if process.is_null() {
-        return false;
+        // One this process may not open (another user's) runs; any other refusal says it does
+        // not (review round 5, L3).
+        // SAFETY: reads this thread's last error, set by the `OpenProcess` just above.
+        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
     }
     // SAFETY: `process` is an open handle that nothing else owns: `OpenProcess` just made it.
     // Were it owned twice, it would be closed twice, the second time maybe another's handle.

@@ -67,7 +67,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use blaze_hash::FixedState;
+use std::alloc::Global;
 use tracing::{debug, trace};
 
 use crate::interning::InternedString;
@@ -92,8 +92,7 @@ pub use self::version_prefs::VersionOrdering;
 pub use self::version_prefs::VersionPreferences;
 
 pub(crate) type CargoResult<T> = anyhow::Result<T>;
-pub(crate) type HashMap<K, V> = blaze_hash::HashMap<K, V>;
-pub(crate) type HashSet<K> = blaze_hash::HashSet<K>;
+pub(crate) use blaze_hash::{HashMap, HashSet};
 
 mod conflict_cache;
 mod context;
@@ -172,7 +171,7 @@ pub fn resolve(
         }
     };
 
-    let mut cksums = HashMap::default();
+    let mut cksums = HashMap::new_in(Global);
     for (summary, _) in resolver_ctx.activations.values() {
         let cksum = summary.checksum().map(|s| s.to_owned());
         cksums.insert(summary.package_id(), cksum);
@@ -483,7 +482,7 @@ fn activate_deps_loop(
                         && let Some((other_parent, conflict)) = remaining_deps
                             .iter()
                             // for deps related to us
-                            .filter(|(_, other_dep)| known_related_bad_deps.contains(other_dep))
+                            .filter(|(_, other_dep)| known_related_bad_deps.contains(*other_dep))
                             .filter_map(|(other_parent, other_dep)| {
                                 past_conflicting_activations
                                     .find_conflicting(&resolver_ctx, other_dep, Some(pid))
@@ -980,9 +979,9 @@ fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
     // We visit each node at most once and we keep
     // track of the path through the graph as we walk it. If we walk onto the
     // same node twice that's a cycle.
-    let mut checked = HashSet::with_capacity_and_hasher(resolve.len(), FixedState);
+    let mut checked = HashSet::with_capacity_in(resolve.len(), Global);
     let mut path = Vec::with_capacity(4);
-    let mut visited = HashSet::with_capacity_and_hasher(4, FixedState);
+    let mut visited = HashSet::with_capacity_in(4, Global);
     for pkg in resolve.iter() {
         if !checked.contains(&pkg) {
             visit(resolve, pkg, &mut visited, &mut path, &mut checked)?
@@ -993,9 +992,9 @@ fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
     fn visit(
         resolve: &Resolve,
         id: PackageId,
-        visited: &mut HashSet<PackageId>,
+        visited: &mut HashSet<PackageId, Global>,
         path: &mut Vec<PackageId>,
-        checked: &mut HashSet<PackageId>,
+        checked: &mut HashSet<PackageId, Global>,
     ) -> CargoResult<()> {
         if !visited.insert(id) {
             // We found a cycle and need to construct an error. Performance is no longer top priority.
@@ -1038,7 +1037,7 @@ fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
 /// particular, we don't store paths of path dependencies. That means that
 /// *different* packages may collide in the lock file, hence this check.
 fn check_duplicate_pkgs_in_lockfile(resolve: &Resolve) -> CargoResult<()> {
-    let mut unique_pkg_ids = HashMap::default();
+    let mut unique_pkg_ids = HashMap::new_in(Global);
     let state = lockfile::EncodeState::new(resolve);
     for pkg_id in resolve.iter() {
         let encodable_pkd_id = lockfile::encodable_package_id(pkg_id, &state, resolve.version());

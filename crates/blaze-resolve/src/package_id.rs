@@ -4,8 +4,6 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ptr;
-use std::sync::OnceLock;
-
 use anyhow::{Result, anyhow};
 use blaze_ids::{Domain, Interner, Sharded};
 
@@ -49,7 +47,11 @@ impl Hash for PackageIdInner {
 /// Every package id, by the content ID of what [`PackageIdInner`]'s `Eq` compares (its `Hash`
 /// covers exactly that, the source by address): a hit is lock-free probes and no allocation.
 /// The ID is only compared within this process, so an address in it is sound.
-static PACKAGE_IDS: OnceLock<Sharded<PackageIdInner>> = OnceLock::new();
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's interner: a `PackageId` is a `&'static` into it, compared by address, so there is one per process"
+)]
+static PACKAGE_IDS: std::sync::OnceLock<Sharded<PackageIdInner>> = std::sync::OnceLock::new();
 static PACKAGE_ID: Domain = Domain::new("blaze-resolve package id 1");
 
 impl PartialEq for PackageId {

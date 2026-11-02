@@ -14,6 +14,7 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Domain};
 use hir_expand::{HirFileId, MacroCallId, MacroCallKind};
 use smallvec::SmallVec;
@@ -86,7 +87,7 @@ impl Item {
 
 /// The modules of `krate`'s `DefMap` by their index in it.
 #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-pub(super) fn module_indexes(db: &Db, krate: Crate) -> HashMap<ModuleId, u32> {
+pub(super) fn module_indexes(db: &Db, krate: Crate) -> HashMap<ModuleId, u32, Global> {
     let modules = crate_def_map(db, krate).modules(db);
     // alloc: once per crate, the map every key of the crate reads.
     modules.enumerate().map(|(index, (module, _))| (module, index as u32)).collect()
@@ -147,7 +148,7 @@ pub(super) fn of(db: &Db, item: Item) -> Option<(Crate, ContentId)> {
 
 struct Key<'a> {
     db: &'a Db,
-    indexes: &'a HashMap<ModuleId, u32>,
+    indexes: &'a HashMap<ModuleId, u32, Global>,
     bytes: SmallVec<[u8; 64]>,
 }
 

@@ -4,7 +4,8 @@
 //! a stack slot and every address is an `i64`. Blocks become blocks, block parameters become
 //! phis, stack slots become allocas. What is an address is a pointer ([`addresses`],
 //! [`pointerish`]), so that LLVM can tell what each access is based on, and parameters carry
-//! what their Rust types say of the memory they point to ([`Pointee`]).
+//! what their Rust types say of the memory they point to ([`Pointee`]). A `return_call` (Rust's
+//! `become`) is a `musttail` call through the caller's own type ([`Lowering::tail_call`]).
 
 #![forbid(unsafe_code)]
 
@@ -19,6 +20,7 @@ use cranelift_codegen::isa::CallConv;
 use std::num::NonZeroU32;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use inkwell::{
     AddressSpace, AtomicOrdering, AtomicRMWBinOp, FloatPredicate, GlobalVisibility, IntPredicate,
     ThreadLocalMode,
@@ -38,6 +40,7 @@ use inkwell::{
         FunctionValue, InstructionValue, IntValue, PhiValue, PointerValue, VectorValue,
     },
 };
+use inkwell::values::LLVMTailCallKind;
 use smallvec::SmallVec;
 
 use hir_def::hir::AsmOptions;
@@ -91,6 +94,39 @@ enum Side {
     Callee,
 }
 
+/// What a tail call calls.
+#[derive(Clone, Copy)]
+enum Tailed {
+    Direct(ir::FuncRef),
+    Indirect(Value),
+}
+
+/// The parameter attributes LLVM's verifier holds a `musttail` call to give its arguments as
+/// its caller has them on its parameters (`getParameterABIAttributes`, LLVM 23), which change
+/// how the argument is passed; `align` is one of them where the parameter is `byval` or
+/// `byref`.
+const ABI_ATTRIBUTES: [&str; 10] = [
+    "sret",
+    "byval",
+    "inalloca",
+    "inreg",
+    "alignstack",
+    "swiftself",
+    "swiftasync",
+    "swifterror",
+    "preallocated",
+    "byref",
+];
+
+/// Whether `function` makes a `musttail` call.
+pub(super) fn has_musttail(function: FunctionValue<'_>) -> bool {
+    function.get_basic_block_iter().any(|block| {
+        block.get_instructions().any(|it| {
+            it.get_tail_call_kind().is_ok_and(|kind| kind == LLVMTailCallKind::LLVMTailCallKindMustTail)
+        })
+    })
+}
+
 /// What an unwinding call lands on.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Pad {
@@ -101,22 +137,24 @@ struct Pad {
 pub(super) struct Lowering<'ctx, 'f> {
     context: &'ctx Context,
     module: &'f Module<'ctx>,
+    /// The target the module is for, which its lowering asks of its ABI and assembly.
+    target: &'static crate::Target,
     builder: Builder<'ctx>,
     func: &'f ir::Function,
     function: FunctionValue<'ctx>,
-    values: HashMap<Value, Operand<'ctx>>,
+    values: HashMap<Value, Operand<'ctx>, Global>,
     /// The `i1` a comparison gave, for the branch or select that uses it.
-    conditions: HashMap<Value, IntValue<'ctx>>,
-    blocks: HashMap<Block, BasicBlock<'ctx>>,
-    phis: HashMap<Block, Vec<PhiValue<'ctx>>>,
-    slots: HashMap<ir::StackSlot, PointerValue<'ctx>>,
-    callees: HashMap<ir::FuncRef, FunctionValue<'ctx>>,
-    globals: HashMap<ir::GlobalValue, PointerValue<'ctx>>,
+    conditions: HashMap<Value, IntValue<'ctx>, Global>,
+    blocks: HashMap<Block, BasicBlock<'ctx>, Global>,
+    phis: HashMap<Block, Vec<PhiValue<'ctx>>, Global>,
+    slots: HashMap<ir::StackSlot, PointerValue<'ctx>, Global>,
+    callees: HashMap<ir::FuncRef, FunctionValue<'ctx>, Global>,
+    globals: HashMap<ir::GlobalValue, PointerValue<'ctx>, Global>,
     /// The bytes of the data objects that a load from is known to give, by the number in
     /// their names.
-    constants: &'f HashMap<u32, &'f [u8]>,
+    constants: &'f HashMap<u32, &'f [u8], Global>,
     /// The numbers in the names of the data objects that are statics.
-    statics: &'f HashSet<u32>,
+    statics: &'f HashSet<u32, Global>,
     /// The number in the name of `_Unwind_Resume`, whose calls are LLVM's `resume`.
     resume: Option<u32>,
     /// The number in the name of `memcmp`, which is called by its own name: LLVM writes a
@@ -124,8 +162,8 @@ pub(super) struct Lowering<'ctx, 'f> {
     memcmp: Option<u32>,
     /// The `asm!` blocks whose wrappers are called, by the numbers in the wrappers' names, that
     /// go where they are called as LLVM's inline assembly.
-    blocks_asm: &'f HashMap<u32, &'static asm::Inline>,
-    pads: HashMap<Pad, BasicBlock<'ctx>>,
+    blocks_asm: &'f HashMap<u32, &'static asm::Inline, Global>,
+    pads: HashMap<Pad, BasicBlock<'ctx>, Global>,
     /// The block the allocas are in.
     frame: Option<BasicBlock<'ctx>>,
     /// Where a guarded call that unwound leaves its exception (see `unwind::seh`).
@@ -135,25 +173,25 @@ pub(super) struct Lowering<'ctx, 'f> {
     /// How often each branch went each way while code of the function ran.
     weights: Option<&'f crate::tier::Weights>,
     /// The values that are addresses, which are pointers in LLVM: see [`addresses`].
-    addresses: HashSet<Value>,
+    addresses: HashSet<Value, Global>,
     /// The parameters of each callee, by its name, that are pointers: see
     /// [`Lowering::pointer_params`].
-    pointer_params: HashMap<String, Vec<u32>>,
+    pointer_params: HashMap<String, Vec<u32>, Global>,
     /// The values that are or may be addresses: see [`pointerish`]. A block parameter of
     /// one is a phi of pointers.
-    pointerish: HashSet<Value>,
+    pointerish: HashSet<Value, Global>,
     /// The functions called whose bodies LLVM is shown, by their place among the requests.
-    shown: &'f HashMap<u32, FunctionValue<'ctx>>,
+    shown: &'f HashMap<u32, FunctionValue<'ctx>, Global>,
     /// The addresses rounded up in slots aligned beyond what Cranelift aligns: see
     /// [`realigned`].
-    realigned: HashMap<Inst, (ir::StackSlot, u32)>,
+    realigned: HashMap<Inst, (ir::StackSlot, u32), Global>,
 }
 
 /// Each `(address + align - 1) & -align` of a stack slot, with the slot and the alignment:
 /// Cranelift aligns a frame by 16 bytes, so a slot that needs more is larger by as much and
 /// the address rounded up. LLVM aligns an alloca by any power of two, and the rounded address
 /// is then the alloca's, which LLVM can follow where it can't through the arithmetic.
-fn realigned(func: &ir::Function) -> HashMap<Inst, (ir::StackSlot, u32)> {
+fn realigned(func: &ir::Function) -> HashMap<Inst, (ir::StackSlot, u32), Global> {
     let dfg = &func.dfg;
     let made = |value: Value| match dfg.value_def(dfg.resolve_aliases(value)) {
         ir::ValueDef::Result(inst, _) => Some(dfg.insts[inst]),
@@ -163,7 +201,7 @@ fn realigned(func: &ir::Function) -> HashMap<Inst, (ir::StackSlot, u32)> {
         InstructionData::UnaryImm { opcode: Opcode::Iconst, imm, .. } => Some(imm.bits()),
         _ => None,
     };
-    let mut found = HashMap::default();
+    let mut found = HashMap::new_in(Global);
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let InstructionData::Binary { opcode: Opcode::Band, args: [bumped, mask] } =
@@ -216,11 +254,11 @@ pub(super) struct Defined<'f> {
 /// passed, and what is stored at and loaded from each place of a stack slot.
 struct Flow {
     /// What each block parameter is passed; a call's result passed is the parameter itself.
-    incoming: HashMap<Value, Vec<Value>>,
+    incoming: HashMap<Value, Vec<Value>, Global>,
     /// The values of pointer width stored at each place, and the place each load of pointer
     /// width reads.
-    stored: HashMap<(ir::StackSlot, i64), Vec<Value>>,
-    loaded: HashMap<Value, (ir::StackSlot, i64)>,
+    stored: HashMap<(ir::StackSlot, i64), Vec<Value>, Global>,
+    loaded: HashMap<Value, (ir::StackSlot, i64), Global>,
 }
 
 impl Flow {
@@ -259,9 +297,9 @@ impl Flow {
             }
         };
         let mut flow = Flow {
-            incoming: HashMap::default(),
-            stored: HashMap::default(),
-            loaded: HashMap::default(),
+            incoming: HashMap::new_in(Global),
+            stored: HashMap::new_in(Global),
+            loaded: HashMap::new_in(Global),
         };
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
@@ -324,7 +362,7 @@ impl Flow {
 ///
 /// A wrong guess costs nothing but speed: a value that is used as an integer as well is
 /// turned into one there (`ptrtoint`, which LLVM takes for the address escaping).
-fn addresses(func: &ir::Function, flow: &Flow) -> HashSet<Value> {
+fn addresses(func: &ir::Function, flow: &Flow) -> HashSet<Value, Global> {
     let dfg = &func.dfg;
     // alloc: once per function lowered, the analysis's worklist
     let mut work = Vec::new();
@@ -356,7 +394,7 @@ fn addresses(func: &ir::Function, flow: &Flow) -> HashSet<Value> {
         ),
         _ => false,
     };
-    let mut found = HashSet::default();
+    let mut found = HashSet::new_in(Global);
     while let Some(value) = work.pop() {
         let value = dfg.resolve_aliases(value);
         if dfg.value_type(value) != types::I64 || !found.insert(value) {
@@ -385,9 +423,9 @@ fn addresses(func: &ir::Function, flow: &Flow) -> HashSet<Value> {
 fn pointerish(
     func: &ir::Function,
     flow: &Flow,
-    addresses: &HashSet<Value>,
+    addresses: &HashSet<Value, Global>,
     params: &[Value],
-) -> HashSet<Value> {
+) -> HashSet<Value, Global> {
     let dfg = &func.dfg;
     // clone: once per function lowered; `addresses` is kept beside it (`Lowering::addresses`)
     let mut found = addresses.clone();
@@ -448,10 +486,12 @@ pub(super) struct Debug<'ctx> {
 }
 
 impl<'ctx> Debug<'ctx> {
-    pub(super) fn of(module: &Module<'ctx>) -> Lowered<Option<Debug<'ctx>>> {
+    /// `report`: the lines are for the report of what the optimized code keeps
+    /// ([`super::report`]), which reads them from the IR, never from the object, and so on
+    /// every format; the object is stripped of them where it is not read back.
+    pub(super) fn of(module: &Module<'ctx>, target: &crate::Target, report: bool) -> Lowered<Option<Debug<'ctx>>> {
         // Without a flag that asks for CodeView, the table is DWARF in a COFF object too.
-        let target = crate::Target::selected().map_err(Unhandled::Llvm)?;
-        if !matches!(target.object_format, ObjectFormat::Elf | ObjectFormat::Coff) {
+        if !report && !matches!(target.object_format, ObjectFormat::Elf | ObjectFormat::Coff) {
             return Ok(None);
         }
         let context = module.get_context();
@@ -524,7 +564,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     fn pointers(
         func: &ir::Function,
         pointees: &[(u32, Pointee)],
-        addresses: &HashSet<Value>,
+        addresses: &HashSet<Value, Global>,
     ) -> SmallVec<[u32; 8]> {
         let mut pointers = pointees.iter().map(|it| it.0).collect::<SmallVec<[u32; 8]>>();
         if let Some(entry) = func.layout.entry_block() {
@@ -541,16 +581,19 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         pointers
     }
 
-    /// Adds the function `defined` is to `module`, with the attributes of its signature.
+    /// Adds the function `defined` is to `module`, with the attributes of its signature,
+    /// keeping its frame pointer when `frame_pointers` (its unit's `Toolchain::frame_pointers`).
     pub(super) fn add(
         context: &'ctx Context,
         module: &Module<'ctx>,
+        target: &crate::Target,
         defined: &Defined<'_>,
+        frame_pointers: bool,
     ) -> Lowered<FunctionValue<'ctx>> {
         let func = defined.func;
         let addresses = addresses(func, &Flow::of(func));
         let pointers = Self::pointers(func, defined.pointees, &addresses);
-        let ty = Self::function_type(context, &func.signature)?;
+        let ty = Self::function_type(context, target, &func.signature)?;
         let ty = Self::with_pointers(context, ty, &pointers);
         let function = module.add_function(defined.name, ty, Some(Linkage::External));
         Self::mark_pointees(context, defined.pointees, |loc, attribute| {
@@ -562,11 +605,10 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         Self::mark_signature(context, &func.signature, Side::Callee, |loc, attribute| {
             function.add_attribute(loc, attribute)
         });
-        let target = crate::Target::selected().map_err(Unhandled::Llvm)?;
         let probe = target.stack_probe().map(|probe| ("probe-stack", probe));
         // Without, LLVM gives the frame pointer's register to values, and code that walks the
         // frames by it reads one of those.
-        let frame = crate::backend::frame_pointers().then_some(("frame-pointer", "all"));
+        let frame = frame_pointers.then_some(("frame-pointer", "all"));
         for (name, value) in [("target-cpu", target.cpu())].into_iter().chain(probe).chain(frame) {
             let attribute = context.create_string_attribute(name, value);
             function.add_attribute(AttributeLoc::Function, attribute);
@@ -582,14 +624,15 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     pub(super) fn define(
         context: &'ctx Context,
         module: &'f Module<'ctx>,
+        target: &'static crate::Target,
         function: FunctionValue<'ctx>,
         defined: &Defined<'f>,
-        constants: &'f HashMap<u32, &'f [u8]>,
-        statics: &'f HashSet<u32>,
+        constants: &'f HashMap<u32, &'f [u8], Global>,
+        statics: &'f HashSet<u32, Global>,
         resume: Option<u32>,
         memcmp: Option<u32>,
-        blocks_asm: &'f HashMap<u32, &'static asm::Inline>,
-        shown: &'f HashMap<u32, FunctionValue<'ctx>>,
+        blocks_asm: &'f HashMap<u32, &'static asm::Inline, Global>,
+        shown: &'f HashMap<u32, FunctionValue<'ctx>, Global>,
         debug: Option<&'f Debug<'ctx>>,
     ) -> Lowered<()> {
         let func = defined.func;
@@ -607,28 +650,29 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         let mut lowering = Lowering {
             context,
             module,
+            target,
             builder: context.create_builder(),
             func,
             function,
-            values: HashMap::default(),
-            conditions: HashMap::default(),
-            blocks: HashMap::default(),
-            phis: HashMap::default(),
-            slots: HashMap::default(),
-            callees: HashMap::default(),
-            globals: HashMap::default(),
+            values: HashMap::new_in(Global),
+            conditions: HashMap::new_in(Global),
+            blocks: HashMap::new_in(Global),
+            phis: HashMap::new_in(Global),
+            slots: HashMap::new_in(Global),
+            callees: HashMap::new_in(Global),
+            globals: HashMap::new_in(Global),
             constants,
             statics,
             resume,
             memcmp,
             blocks_asm,
-            pads: HashMap::default(),
+            pads: HashMap::new_in(Global),
             frame: None,
             arrival: None,
             marks: debug.filter(|_| defined.marked).map(|debug| Marks::new(debug, function)),
             weights: defined.weights,
             addresses,
-            pointer_params: HashMap::default(),
+            pointer_params: HashMap::new_in(Global),
             pointerish,
             realigned: realigned(func),
             shown,
@@ -770,7 +814,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
 
     fn reverse_post_order(&self, entry: Block) -> Vec<Block> {
         let mut order = Vec::with_capacity(self.func.dfg.num_blocks());
-        let mut seen = blaze_hash::HashSet::default();
+        let mut seen = blaze_hash::HashSet::new_in(Global);
         seen.insert(entry);
         let mut stack: SmallVec<[(Block, SmallVec<[Block; 2]>, usize); 16]> = SmallVec::new();
         stack.push((entry, self.successors(entry), 0));
@@ -839,13 +883,17 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     }
 
     /// A parameter that stands for memory is a pointer to LLVM; the rest are what they are.
-    pub(super) fn function_type(context: &'ctx Context, sig: &Signature) -> Lowered<FunctionType<'ctx>> {
+    pub(super) fn function_type(
+        context: &'ctx Context,
+        target: &crate::Target,
+        sig: &Signature,
+    ) -> Lowered<FunctionType<'ctx>> {
         // LLVM would give the register such an integer leaves to the next parameter, which
         // Cranelift, building the other side of the call, does not. The Rust and C ABIs
         // pass it in memory instead; what is left is a signature with a parameter put in
         // front of them, as a vtable's receiver.
         if sig.call_conv == CallConv::SystemV
-            && crate::Target::current().arch == crate::target::Arch::X86_64
+            && target.arch == crate::target::Arch::X86_64
             && crate::lone_register_i128(&sig.params).is_some()
         {
             return Err(Unhandled::Shape("a 128-bit integer that finds one register left"));
@@ -856,7 +904,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             CallConv::AppleAarch64 => 1,
             _ => 2,
         };
-        if crate::Target::current().arch == crate::target::Arch::Aarch64
+        if target.arch == crate::target::Arch::Aarch64
             && crate::stranded_i128(&sig.params, even).is_some()
         {
             return Err(Unhandled::Shape(
@@ -887,7 +935,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             }
             // AArch64 has eight registers of each kind for what comes back, and LLVM gives
             // the fields of a struct the next of its kind in order, as Cranelift does values.
-            many if crate::Target::current().arch == crate::target::Arch::Aarch64
+            many if target.arch == crate::target::Arch::Aarch64
                 && many.len() <= 8 =>
             {
                 let fields = many
@@ -1239,7 +1287,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     // Cranelift's AArch64 vector fma is `fmla c, a, b`, LLVM's of the same
                     // operands `fmla c, b, a`: which factor comes first decides which of two
                     // NaNs comes out.
-                    let factors = match crate::Target::current().arch {
+                    let factors = match self.target.arch {
                         crate::target::Arch::Aarch64 => [b, a],
                         _ => [a, b],
                     };
@@ -1332,6 +1380,16 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 let callee = self.callee(func_ref)?;
                 self.set(inst, Operand::Pointer(callee.as_global_value().as_pointer_value()));
             }
+            InstructionData::Call { opcode: Opcode::ReturnCall, func_ref, .. } => {
+                let sig = &dfg.signatures[dfg.ext_funcs[func_ref].signature];
+                self.tail_call(inst, Tailed::Direct(func_ref), sig, dfg.inst_args(inst))?;
+            }
+            InstructionData::CallIndirect { opcode: Opcode::ReturnCallIndirect, sig_ref, .. } => {
+                let [callee, args @ ..] = dfg.inst_args(inst) else {
+                    return Err(Unhandled::Shape("an indirect tail call without a callee"));
+                };
+                self.tail_call(inst, Tailed::Indirect(*callee), &dfg.signatures[sig_ref], args)?;
+            }
             InstructionData::Call { func_ref, .. } => {
                 if let Some(libcall) = memory_call(&dfg.ext_funcs[func_ref].name) {
                     let to = self.memory(libcall, dfg.inst_args(inst))?;
@@ -1420,10 +1478,14 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             }
             InstructionData::Brif { arg, blocks: [then, otherwise], .. } => {
                 let condition = self.condition(arg)?;
+                let cold = [then, otherwise].map(|it| self.func.layout.is_cold(it.block(&dfg.value_lists)));
                 let (then, otherwise) = (self.branch_edge(then)?, self.branch_edge(otherwise)?);
                 let branch = self.builder.build_conditional_branch(condition, then, otherwise)?;
                 if let Some(taken) = self.weights.and_then(|it| it.taken.get(&inst)) {
                     self.weigh(branch, *taken)?;
+                } else if let Some(taken) = unlikely(cold) {
+                    // A `-C profile-use` profile's counts replace these where it has the branch.
+                    self.weigh(branch, taken)?;
                 }
             }
             InstructionData::BranchTable { arg, table, .. } => {
@@ -1532,9 +1594,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 Opcode::Nop => {}
                 // Where the exception arrives in a register, the frame pointer is read for
                 // what the caller left above the frame, so it is the one of LLVM's frame.
-                Opcode::GetFramePointer if crate::Target::current().exception_in_register() => {
+                Opcode::GetFramePointer if self.target.exception_in_register() => {
                     use crate::target::{Arch, ObjectFormat};
-                    let target = crate::Target::current();
+                    let target = self.target;
                     let pointer = self.context.ptr_type(AddressSpace::default());
                     let frame = if (target.arch, target.object_format)
                         == (Arch::Aarch64, ObjectFormat::Elf)
@@ -1560,8 +1622,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 // that takes `...`, to find the arguments on the stack: Cranelift's frame
                 // is what says where they are from it.
                 Opcode::GetFramePointer => {
-                    let target = crate::Target::selected().map_err(Unhandled::Llvm)?;
-                    if target.exception_in_register() {
+                    if self.target.exception_in_register() {
                         return Err(Unhandled::Shape("the frame pointer"));
                     }
                     let arrival = self.arrival()?;
@@ -2146,8 +2207,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             more => self.context.struct_type(more, false).fn_type(&params, false),
         };
         let options = block.options;
-        let intel = crate::Target::selected()
-            .is_ok_and(|it| it.arch == crate::target::Arch::X86_64)
+        let intel = self.target.arch == crate::target::Arch::X86_64
             && !options.contains(AsmOptions::ATT_SYNTAX);
         let pure = options.contains(AsmOptions::PURE);
         let code = self.context.create_inline_asm(
@@ -2189,13 +2249,23 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     }
 
     fn callee(&mut self, func_ref: ir::FuncRef) -> Lowered<FunctionValue<'ctx>> {
+        self.callee_declared(func_ref, None)
+    }
+
+    /// The function `func_ref` is, declared with `fresh` where the module has none of its
+    /// name yet, rather than with the type its calls make ([`Lowering::pointer_params`]).
+    fn callee_declared(
+        &mut self,
+        func_ref: ir::FuncRef,
+        fresh: Option<FunctionType<'ctx>>,
+    ) -> Lowered<FunctionValue<'ctx>> {
         if let Some(&callee) = self.callees.get(&func_ref) {
             return Ok(callee);
         }
         let data = &self.func.dfg.ext_funcs[func_ref];
         let mut name = self.external_name(&data.name)?;
         let sig = &self.func.dfg.signatures[data.signature];
-        let ty = Self::function_type(self.context, sig)?;
+        let ty = Self::function_type(self.context, self.target, sig)?;
         let shown = match self.symbol(&data.name) {
             Some(super::Symbol::Func(id)) if Some(id) == self.memcmp => {
                 // alloc: once per callee of the function, which `callees` keeps
@@ -2217,7 +2287,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     "memcmp" => &[0, 1][..],
                     _ => self.pointer_params.get(&name).map_or(&[][..], Vec::as_slice),
                 };
-                let ty = Self::with_pointers(self.context, ty, pointers);
+                let ty = fresh.unwrap_or_else(|| Self::with_pointers(self.context, ty, pointers));
                 let callee = self.module.add_function(&name, ty, Some(Linkage::External));
                 Self::mark_signature(self.context, sig, Side::Caller, |loc, attribute| {
                     callee.add_attribute(loc, attribute)
@@ -2343,7 +2413,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     /// The type of an indirect call of `sig` with `args`: an argument that is an address is
     /// passed as a pointer, which does not have it escape before the call.
     fn indirect_type(&self, sig: &Signature, args: &[Value]) -> Lowered<FunctionType<'ctx>> {
-        let ty = Self::function_type(self.context, sig)?;
+        let ty = Self::function_type(self.context, self.target, sig)?;
         let pointers = std::iter::zip(&sig.params, args)
             .enumerate()
             .filter(|(_, (param, arg))| {
@@ -2357,14 +2427,20 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
 
     /// The parameters of each callee that some call of it passes an address to, by its name:
     /// the callee is declared with pointers there.
-    fn pointer_params(&self, pointerish: &HashSet<Value>) -> HashMap<String, Vec<u32>> {
+    fn pointer_params(&self, pointerish: &HashSet<Value, Global>) -> HashMap<String, Vec<u32>, Global> {
         let dfg = &self.func.dfg;
-        let mut found: HashMap<String, Vec<u32>> = HashMap::default();
+        let mut found: HashMap<String, Vec<u32>, Global> = HashMap::new_in(Global);
+        // A tail call is made through the caller's own type ([`Lowering::tail_call`]): its
+        // callee has pointers where the caller has them.
+        let own = self.function.get_type().get_param_types();
         for block in self.func.layout.blocks() {
             for inst in self.func.layout.block_insts(block) {
-                let func_ref = match dfg.insts[inst] {
+                let (func_ref, tail) = match dfg.insts[inst] {
+                    InstructionData::Call { opcode: Opcode::ReturnCall, func_ref, .. } => {
+                        (func_ref, true)
+                    }
                     InstructionData::Call { func_ref, .. }
-                    | InstructionData::TryCall { func_ref, .. } => func_ref,
+                    | InstructionData::TryCall { func_ref, .. } => (func_ref, false),
                     _ => continue,
                 };
                 let data = &dfg.ext_funcs[func_ref];
@@ -2374,9 +2450,11 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 // name has none.
                 let mut positions: Option<&mut Vec<u32>> = None;
                 for (at, (param, arg)) in args {
-                    if param.purpose == ArgumentPurpose::Normal
-                        && pointerish.contains(&dfg.resolve_aliases(*arg))
-                    {
+                    let pointer = match tail {
+                        true => own.get(at).is_some_and(|it| it.is_pointer_type()),
+                        false => pointerish.contains(&dfg.resolve_aliases(*arg)),
+                    };
+                    if param.purpose == ArgumentPurpose::Normal && pointer {
                         if positions.is_none() {
                             let Ok(name) = self.external_name(&data.name) else { break };
                             positions = Some(found.entry(name).or_default());
@@ -2419,6 +2497,185 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     ) -> Lowered<()> {
         for (&result, value) in std::iter::zip(results, self.returned(call, sig)?) {
             self.values.insert(result, value.into());
+        }
+        Ok(())
+    }
+
+    /// A `return_call` or `return_call_indirect` (Rust's `become`): LLVM's `musttail` call, then
+    /// the `ret` of what it returns, as rustc builds one. LLVM guarantees that the call reuses
+    /// the caller's frame only where it is made through the caller's own function type, calling
+    /// convention and ABI attributes (`sret`, `byval`...), so it is made through the caller's
+    /// type, each argument the pointer or the integer the caller has in its place. What can't be
+    /// made so is refused, never left a call that grows the stack.
+    fn tail_call(
+        &mut self,
+        inst: Inst,
+        callee: Tailed,
+        sig: &Signature,
+        args: &[Value],
+    ) -> Lowered<()> {
+        let refused = |why: String| Err(Unhandled::TailCall(why));
+        let named = match callee {
+            Tailed::Direct(func_ref) => {
+                let name = self.external_name(&self.func.dfg.ext_funcs[func_ref].name)?;
+                // alloc: the callee's name, for the errors below
+                format!("the tail call of `{name}`")
+            }
+            // alloc: as above
+            Tailed::Indirect(_) => "the indirect tail call".to_owned(),
+        };
+        if unwind::seh::is_guarded(self.func.srcloc(inst)) {
+            // alloc: the error's message
+            return refused(format!("{named} is in a guarded region, whose handler it would leave"));
+        }
+        let caller = &self.func.signature;
+        if sig.call_conv != caller.call_conv || sig.returns != caller.returns {
+            // alloc: the error's message
+            return refused(format!(
+                "{named} is of the signature `{sig}` and the caller of `{caller}`: LLVM guarantees \
+                 a tail call only to a callee of the caller's calling convention and return values"
+            ));
+        }
+        if sig.params.len() != caller.params.len() {
+            // alloc: the error's message
+            return refused(format!(
+                "{named} passes {} parameters (`{sig}`) where the caller has {} (`{caller}`), as a \
+                 call through a vtable does, whose receiver is one pointer where the caller's is \
+                 two: LLVM guarantees a tail call only with the caller's parameters",
+                sig.params.len(),
+                caller.params.len(),
+            ));
+        }
+        if args.len() != sig.params.len() {
+            return Err(Unhandled::Shape("a tail call given other arguments than its signature takes"));
+        }
+        let ty = self.function.get_type();
+        let types = ty.get_param_types();
+        let entry = self.func.layout.entry_block().ok_or(Unhandled::Shape("function without blocks"))?;
+        let own = self.func.dfg.block_params(entry);
+        let mut passed: SmallVec<[BasicMetadataValueEnum<'ctx>; 8]> = SmallVec::new();
+        for (at, ((param, &arg), want)) in sig.params.iter().zip(args).zip(&types).enumerate() {
+            let mine = &caller.params[at];
+            if param.purpose != mine.purpose || param.value_type != mine.value_type {
+                // alloc: the error's message
+                return refused(format!(
+                    "parameter {at} of {named} is `{param}` and the caller's `{mine}`"
+                ));
+            }
+            let forwarded = own.get(at) == Some(&self.func.dfg.resolve_aliases(arg));
+            let value: BasicValueEnum<'ctx> = match param.purpose {
+                // The caller reads such a parameter from the arguments on its stack, and LLVM
+                // passes a pointer to a copy, which would be in the frame the call leaves.
+                ArgumentPurpose::StructArgument(_)
+                    if caller.call_conv == CallConv::WindowsFastcall =>
+                {
+                    // alloc: the error's message
+                    return refused(format!(
+                        "parameter {at} of {named} is `{param}`, memory passed by the Windows x64 \
+                         convention, which LLVM copies into the frame the tail call leaves"
+                    ));
+                }
+                ArgumentPurpose::StructReturn | ArgumentPurpose::StructArgument(_) if !forwarded => {
+                    // alloc: the error's message
+                    return refused(format!(
+                        "parameter {at} of {named} is `{param}` and is passed other memory than \
+                         the caller's own parameter {at}, which a tail call must pass on"
+                    ));
+                }
+                ArgumentPurpose::StructReturn | ArgumentPurpose::StructArgument(_) => {
+                    self.function.get_nth_param(at as u32).expect("a parameter")
+                }
+                _ if want.is_pointer_type() => self.pointer(arg)?.into(),
+                _ => self.plain(arg)?,
+            };
+            if BasicMetadataTypeEnum::from(value.get_type()) != *want {
+                // alloc: the error's message
+                return refused(format!(
+                    "parameter {at} of {named} is passed `{}` where the caller has `{want}`",
+                    value.get_type().print_to_string().to_string_lossy(),
+                ));
+            }
+            passed.push(value.into());
+        }
+        let pointer = match callee {
+            Tailed::Direct(func_ref) => {
+                let function = self.callee_declared(func_ref, Some(ty))?;
+                // A function only declared is called through the caller's type, as it is
+                // passed the same either way. A body is not: LLVM takes a call of one through
+                // another type to be undefined (see `agree_calls`), and a `musttail` call
+                // can't be made through the body's.
+                let body = function.count_basic_blocks() > 0
+                    || self.shown.values().any(|it| *it == function);
+                if function.get_type() != ty && body {
+                    // alloc: the error's message
+                    return refused(format!(
+                        "{named} is of a body LLVM is given whose parameters are pointers where \
+                         the caller's are integers or the other way (`{}` where the caller is \
+                         `{}`), which a `musttail` call can't convert",
+                        function.get_type().print_to_string().to_string_lossy(),
+                        ty.print_to_string().to_string_lossy(),
+                    ));
+                }
+                function.as_global_value().as_pointer_value()
+            }
+            Tailed::Indirect(callee) => self.pointer(callee)?,
+        };
+        let call = self.builder.build_indirect_call(ty, pointer, &passed, "")?;
+        Self::mark_signature(self.context, sig, Side::Caller, |loc, attribute| {
+            call.add_attribute(loc, attribute)
+        });
+        Self::same_abi_attributes(self.function, call)
+            // alloc: the error's message
+            .map_err(|why| Unhandled::TailCall(format!("{named}: {why}")))?;
+        call.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindMustTail);
+        match call.try_as_basic_value().basic() {
+            Some(returned) => self.builder.build_return(Some(&returned))?,
+            None => self.builder.build_return(None)?,
+        };
+        Ok(())
+    }
+
+    /// Gives `call`, a call `caller` makes `musttail`, the attributes of `caller`'s parameters
+    /// that decide how an argument is passed ([`ABI_ATTRIBUTES`]) where it lacks them. One it
+    /// has that `caller` lacks or has otherwise is refused, as the argument is passed otherwise
+    /// than the parameter it takes the place of. A call to a callee of other attributes than
+    /// its caller is also refused by LLVM's verifier; this one names the parameter.
+    pub(super) fn same_abi_attributes(
+        caller: FunctionValue<'ctx>,
+        call: CallSiteValue<'ctx>,
+    ) -> Result<(), String> {
+        let align = super::attribute_kind("align");
+        for at in 0..caller.count_params() {
+            let loc = AttributeLoc::Param(at);
+            let memory = ["byval", "byref"].into_iter().any(|name| {
+                let kind = super::attribute_kind(name);
+                caller.get_enum_attribute(loc, kind).is_some()
+                    || call.get_enum_attribute(loc, kind).is_some()
+            });
+            let aligned = memory.then_some("align");
+            for name in ABI_ATTRIBUTES.into_iter().chain(aligned) {
+                let kind = match name {
+                    "align" => align,
+                    _ => super::attribute_kind(name),
+                };
+                match (caller.get_enum_attribute(loc, kind), call.get_enum_attribute(loc, kind)) {
+                    (Some(want), None) => call.add_attribute(loc, want),
+                    (want, have) if want == have => {}
+                    (None, _) => {
+                        // alloc: the error's message
+                        return Err(format!(
+                            "parameter {at} is `{name}` at the call and not in the caller"
+                        ));
+                    }
+                    (Some(_), _) => {
+                        // alloc: the error's message
+                        return Err(format!(
+                            "parameter {at} is `{name}` of another value at the call than in \
+                             the caller"
+                        ));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -2736,5 +2993,17 @@ impl From<BuilderError> for Unhandled {
     fn from(e: BuilderError) -> Self {
         // alloc: the error's message
         Unhandled::Llvm(e.to_string())
+    }
+}
+
+/// The weights of a branch with one cold side (Cranelift's `Layout::is_cold`: a cleanup, a panic or
+/// the `Err` arm of `?`, docs/v2/plan/lanes/layout/layout.md), as `llvm.expect` gives an
+/// unlikely edge (its `UnlikelyBranchWeight` of 1 against `LikelyBranchWeight`'s 2000), so
+/// LLVM moves the cold side out of the hot path; none when neither side or both are cold.
+fn unlikely([then, otherwise]: [bool; 2]) -> Option<[u64; 2]> {
+    match (then, otherwise) {
+        (true, false) => Some([1, 2000]),
+        (false, true) => Some([2000, 1]),
+        _ => None,
     }
 }

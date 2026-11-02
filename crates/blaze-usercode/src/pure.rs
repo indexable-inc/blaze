@@ -18,13 +18,14 @@ use std::{
 };
 
 use blaze_build_script::Error;
-use blaze_cas::{Guard, Reader, Store, Ticket};
+use blaze_cas::{Guard, Key, Reader, Store};
 use blaze_core::Traced;
 use blaze_ids::ContentId;
 
 use crate::{
     Given, RunKey, RunKind,
     index::{self, FindError, Found, KeepError},
+    roots::{NoRoot, Roots, Rooted, verify},
     run::Value,
     trace::Inputs,
 };
@@ -49,27 +50,93 @@ pub struct Proof {
 /// never a sandboxed run's.
 const GIVEN: &[u8] = b"blaze v2 pure build script 1";
 
-/// The run key a pure script's result is kept under: its identity, and nothing given. Its
-/// working directory is its package, whose files are in its shape by absolute path; its
-/// arguments and standard input are empty.
-pub fn run_key(proof: &Proof) -> RunKey {
+/// The run key a pure script's result is kept under: its identity, the roles of its roots
+/// ([`crate::roots`]), and nothing else given. Its working directory is its package, whose
+/// files are in its shape written against the package's root; its arguments and standard
+/// input are empty.
+pub fn run_key(proof: &Proof, roots: &Roots<'_>) -> RunKey {
     let mut given = Given::new(RunKind::BuildScript);
     given.part("pure", GIVEN);
+    given.roots(roots);
     RunKey { code: proof.identity, given: given.finish() }
 }
 
 /// The result of the pure script of `proof` for its inputs as they are now, in `inputs` (the
 /// script's environment as its run would be given it, and the machine's files: a
 /// [`crate::inputs::Disk`]), if the store has one: then it is neither compiled nor run.
-pub fn find<I: Inputs>(store: &Reader, guard: &Guard, proof: &Proof, inputs: &mut I) -> Result<Option<Value>, String>
+///
+/// `roots` are the run's, as [`crate::script::prepare`] makes them: its package, its
+/// `OUT_DIR` and the build's.
+pub fn find<I: Inputs>(
+    store: &Reader,
+    guard: &Guard,
+    proof: &Proof,
+    roots: Roots<'_>,
+    inputs: &mut I,
+) -> Result<Option<Value>, String>
 where
-    I::Error: std::fmt::Debug,
+    I::Error: std::fmt::Debug + From<NoRoot>,
 {
-    match index::find(store, guard, &run_key(proof), inputs) {
-        Ok(Found::Hit { value, .. }) => Value::decode(value).map(Some),
+    find_hit(store, guard, proof, roots, inputs).map(|it| it.map(|hit| hit.value))
+}
+
+/// What [`find_hit`] found under a pure key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hit {
+    /// The kept value, with this run's roots.
+    pub value: Value,
+    /// The key of its unmarked result when it was verified across checkouts
+    /// ([`Found::Hit`]'s `verified`): a run of the script that gives otherwise retracts it
+    /// ([`verify::retraction`] under [`run_key`]).
+    pub verified: Option<Key>,
+}
+
+/// [`find`], with whether what it found was verified across checkouts.
+pub fn find_hit<I: Inputs>(
+    store: &Reader,
+    guard: &Guard,
+    proof: &Proof,
+    roots: Roots<'_>,
+    inputs: &mut I,
+) -> Result<Option<Hit>, String>
+where
+    I::Error: std::fmt::Debug + From<NoRoot>,
+{
+    match index::find(store, guard, &run_key(proof, &roots), &mut Rooted::new(roots, inputs)) {
+        Ok(Found::Hit { value, verified, .. }) => Value::decode(value)
+            .and_then(|value| roots.restored(value).map_err(String::from))
+            .map(|value| Some(Hit { value, verified })),
         Ok(Found::Miss { .. }) => Ok(None),
         // alloc: error path
         Err(error) => Err(find_error(error)),
+    }
+}
+
+/// Under `BLAZE_SCRIPT_CACHE=check` (or any rerun of a script whose pure key hit): `ran`, what
+/// the pure script of `proof` gave run again in the checkout of `roots`, against `hit`, what
+/// its pure key found. When the hit was verified across checkouts and `ran` differs from it
+/// ([`crate::run::differs_with_stderr`], as sharing compares), the
+/// record that the run depends on where its roots are is put ([`verify::retraction`]) and
+/// how it differs is given with the record's tickets: no checkout is given the value again.
+/// None when the hit was this checkout's own or `ran` is the same. A record whose put fails
+/// part way gives the tickets of what landed in [`verify::NotKept`].
+pub fn retract(
+    store: &mut Store,
+    proof: &Proof,
+    roots: Roots<'_>,
+    hit: &Hit,
+    ran: &Value,
+) -> Result<Option<(String, Vec<blaze_cas::Ticket>)>, verify::NotKept> {
+    let Some(unmarked) = hit.verified else { return Ok(None) };
+    let Some(what) = crate::run::differs_with_stderr(&hit.value, ran) else { return Ok(None) };
+    let record = verify::retraction(&run_key(proof, &roots), &unmarked);
+    let mut tickets = Vec::new(); // alloc: the record's tickets, once per retraction
+    match index::keep_into(store, blaze_cas::Unit::SHARED, &record.run, &record.traced, record.value, &mut tickets) {
+        Ok(()) => Ok(Some((what, tickets))),
+        Err(error) => {
+            let retracted = tickets.first().copied();
+            Err(verify::NotKept { error, tickets, retracted })
+        }
     }
 }
 
@@ -81,6 +148,10 @@ fn find_error<E: std::fmt::Debug>(error: FindError<E>) -> String {
         FindError::NotAShape { key, why } => format!("the pure build script's shape slot {key:?}: {why}"),
         // alloc: error path
         FindError::Inputs(error) => format!("hashing what the pure build script reads: {error:?}"),
+        // alloc: error path
+        FindError::TooManyShapes { run } => {
+            format!("the pure build script's run {run:?} has more than {} shapes", crate::index::MOST_SHAPES)
+        }
     }
 }
 
@@ -192,8 +263,18 @@ pub fn checked_value(script: &str, proof: &Proof, value: &Value) -> Result<(), E
 /// Keeps `value`, the result of a run of the pure script of `proof` that [`check`] found read
 /// `read` in its package, under its pure key: the shape is the proof's variables, with their
 /// values as `inputs` (the run's environment: its [`crate::inputs::Disk`]) has them, and those
-/// files.
-pub fn keep<I: Inputs>(store: &mut Store, proof: &Proof, read: Read, inputs: &mut I, value: &Value) -> Result<Vec<Ticket>, KeepError> {
+/// files, all written against `roots`; what it printed is kept ported, kept against where its
+/// roots are and given to another checkout once one verified it ([`crate::roots::verify`]).
+/// `roots` are the run's prepared ones ([`crate::script::prepare`]): their links as they were
+/// read then are what [`Roots::relinked`] compares with now.
+pub fn keep<I: Inputs>(
+    store: &mut Store,
+    proof: &Proof,
+    roots: Roots<'_>,
+    read: Read,
+    inputs: &mut I,
+    value: &Value,
+) -> Result<verify::Kept, verify::NotKept> {
     let env = proof
         .env
         .iter()
@@ -203,7 +284,10 @@ pub fn keep<I: Inputs>(store: &mut Store, proof: &Proof, read: Read, inputs: &mu
         .collect();
     // alloc: none, empty lists
     let traced = Traced { files: read, dirs: Vec::new(), env, untraceable: Vec::new() };
-    index::keep(store, &run_key(proof), &traced, value.encode())
+    let run = run_key(proof, &roots);
+    // alloc: error path, why the scan could not be made
+    let (marked, stored) = roots.kept(&traced, value).map_err(|error| KeepError::Scan { run, why: error.to_string() })?;
+    verify::keep(store, &roots, &run, marked, stored.encode(), crate::run::ported_differs)
 }
 
 #[cfg(test)]

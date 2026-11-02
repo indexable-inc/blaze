@@ -20,6 +20,7 @@ use frame_map::{FrameHashMap, FrameHashSet, FrameMap};
 use std::cell::Cell;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_query::db::{AsId, FromId};
 use cranelift_codegen::{
     ir::{
@@ -65,7 +66,7 @@ use triomphe::Arc;
 
 use hir_def::lang_item::LangItems;
 use hir_ty::{
-    InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, PointerCast,
+    InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate, PointerAt, PointerCast,
     consteval::{ConstEvalError, try_const_usize},
     db::HirDatabase,
     db::{GeneralConstId, InternedClosureId, InternedCoroutineId},
@@ -96,7 +97,7 @@ use hir_ty_mir::mir::{
     AggregateKind, AssertKind, BasicBlockId, BinOp, CallerLocation, CastKind, FrameStorage,
     LocalId, MirBody, MirEvalError, MirOptLevel, MirOptions, MirOwner, MirPhase, MirSpan, MirStage,
     Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace,
-    TerminatorKind, UnOp, caller_location, interpret_mir,
+    TerminatorKind, UnOp, caller_location, dispatch, interpret_mir,
     location::{
         ConcatPart, concat_parts, line_and_column, located_concats, location_macros, location_of,
         macro_location_of, reported_range, source_location_in_file, source_range, track_caller,
@@ -209,6 +210,8 @@ macro_rules! unsupported {
 }
 
 // After `unsupported!`, which they use.
+mod arbitrary_int;
+use arbitrary_int::NarrowInt;
 mod fma;
 mod sve;
 mod wasm_simd;
@@ -767,16 +770,27 @@ enum Callee<'db> {
     Pointer(Value, ExternAbi, Option<usize>),
 }
 
-/// The code generator of the one [`Target`] the process compiles for, with the baseline's
-/// features: what reads the target's conventions, pointer width and registers, which no set
-/// of features changes, and v1's compiles.
-fn target() -> Result<&'static isa::OwnedTargetIsa> {
-    target_of(Features::BASELINE, Isa::Usual, false)
+/// The code generator of a unit's [`Target`] with the baseline's features: what reads the
+/// target's conventions, pointer width and registers, which no set of features changes, and
+/// v1's compiles.
+pub(crate) fn isa_for(target: &'static Target) -> Result<&'static isa::OwnedTargetIsa> {
+    target_of(target, Features::BASELINE, Isa::Usual, false)
 }
 
-/// [`target`] with `features`: what a function of that set is compiled with.
-pub(crate) fn target_with(features: Features) -> Result<&'static isa::OwnedTargetIsa> {
-    target_of(features, Isa::Usual, false)
+/// [`isa_for`] with `features`: what a function of that set is compiled with.
+pub(crate) fn target_with(target: &'static Target, features: Features) -> Result<&'static isa::OwnedTargetIsa> {
+    target_of(target, features, Isa::Usual, false)
+}
+
+/// The target `krate` is built for, from its `TargetData`: what a query lowering one of its
+/// items compiles for. A wasm32 unit's crate and a native one's are two crates, so their
+/// queries never share an answer.
+pub(crate) fn target_of_crate(db: &Db, krate: Crate) -> Result<&'static Target> {
+    match &krate.workspace_data(db).target {
+        Ok(data) => Target::of(data.tuple.as_str()).map_err(CodegenError::Backend),
+        // alloc: error path
+        Err(error) => Err(CodegenError::Backend(format!("the crate's target did not load: {error}"))),
+    }
 }
 
 /// Which of the process's code generators a function is compiled with.
@@ -796,11 +810,19 @@ enum Isa {
 /// The code generator of a kind for the target features `features`, at Cranelift's
 /// `opt_level=speed` for code no edit reaches (`speed`) and at `none` for the rest. Each is
 /// made once, the first time it is asked for: a few per process, one per set a function is
-/// compiled with (the toolchains' and the `#[target_feature]` sets over them).
-fn target_of(features: Features, kind: Isa, speed: bool) -> Result<&'static isa::OwnedTargetIsa> {
+/// compiled with (the toolchains' and the `#[target_feature]` sets over them), for each target
+/// a unit names: a set's number is the process's, and the baseline's is every target's.
+#[expect(clippy::disallowed_types, reason = "the process's ISAs, each made once for a target, feature set, kind and speed and shared by every unit")]
+fn target_of(
+    target: &'static Target,
+    features: Features,
+    kind: Isa,
+    speed: bool,
+) -> Result<&'static isa::OwnedTargetIsa> {
     type Made = std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>>;
-    static TARGETS: [[[Made; 3]; 2]; target::MOST_FEATURE_SETS] =
-        [const { [const { [const { Made::new() }; 3] }; 2] }; target::MOST_FEATURE_SETS];
+    static TARGETS: [[[[Made; 3]; 2]; target::MOST_FEATURE_SETS]; target::MOST_TARGETS] =
+        [const { [const { [const { [const { Made::new() }; 3] }; 2] }; target::MOST_FEATURE_SETS] };
+            target::MOST_TARGETS];
     let (regalloc, frame_pointers) = match kind {
         Isa::Usual => (regalloc(), false),
         Isa::Large => ("single_pass", false),
@@ -811,8 +833,8 @@ fn target_of(features: Features, kind: Isa, speed: bool) -> Result<&'static isa:
     } else {
         cranelift_codegen::settings::OptLevel::None
     };
-    TARGETS[features.index()][usize::from(speed)][kind as usize]
-        .get_or_init(|| Target::selected()?.isa(features, regalloc, frame_pointers, opt))
+    TARGETS[target.index()][features.index()][usize::from(speed)][kind as usize]
+        .get_or_init(|| target.isa(features, regalloc, frame_pointers, opt))
         .as_ref()
         // clone: the error's message
         .map_err(|e| CodegenError::Backend(e.clone()))
@@ -852,10 +874,6 @@ const SINGLE_PASS: usize = 50_000;
 /// of; a larger one, which a function Cranelift compiles after all would test one case at a
 /// time, keeps `Switch`'s tree.
 const CHAINED: usize = 256;
-
-fn selected_target() -> Result<&'static Target> {
-    Target::selected().map_err(CodegenError::Backend)
-}
 
 /// What tells compiled code from any other: equal for the same code however often an edit
 /// went away from it and came back, so that a patch holds what differs from its base alone.
@@ -1002,8 +1020,8 @@ fn root_code(db: &Db, func: FunctionId, tier: bool) -> Result<Produced> {
 fn linked_crates(
     db: &Db,
     crates: impl IntoIterator<Item = Crate>,
-) -> HashSet<Crate> {
-    let mut linked = HashSet::default();
+) -> HashSet<Crate, Global> {
+    let mut linked = HashSet::new_in(Global);
     // alloc: once per program linked, setup
     let mut stack: Vec<Crate> = crates.into_iter().collect();
     while let Some(krate) = stack.pop() {
@@ -1232,7 +1250,7 @@ impl VariadicRegisters {
         sig.params.extend((self.ints..ints).map(|_| AbiParam::new(types::I64)));
         sig.params.extend((self.floats..Self::FLOATS).map(|_| AbiParam::new(types::F64)));
         if self.arch == Arch::X86_64 {
-            sig.params.push(AbiParam::special(ptr(), ArgumentPurpose::StructArgument(8)));
+            sig.params.push(AbiParam::special(types::I64, ArgumentPurpose::StructArgument(8)));
         }
     }
 }
@@ -1274,7 +1292,7 @@ impl HomedRegisters {
     /// variable argument in, and the stack past the room for the four, to `sig`.
     fn rest(self, sig: &mut Signature) {
         sig.params.extend((0..self.left()).map(|_| AbiParam::new(types::I64)));
-        sig.params.push(AbiParam::special(ptr(), ArgumentPurpose::StructArgument(8)));
+        sig.params.push(AbiParam::special(types::I64, ArgumentPurpose::StructArgument(8)));
     }
 }
 
@@ -1309,12 +1327,13 @@ impl Variadic {
         })
     }
 
-    fn rest(self, sig: &mut Signature) {
+    /// `pointer` is the unit target's address, which a buffer of the arguments is passed as.
+    fn rest(self, sig: &mut Signature, pointer: Type) {
         match self {
             Variadic::SystemV(named) => named.rest(sig),
             Variadic::Windows(named) => named.rest(sig),
             Variadic::Apple { .. } => (),
-            Variadic::Buffer => sig.params.push(AbiParam::new(ptr())),
+            Variadic::Buffer => sig.params.push(AbiParam::new(pointer)),
         }
     }
 
@@ -1422,6 +1441,11 @@ fn mir_options_of(db: &Db, krate: Crate) -> Result<MirOptions> {
         ub_checks: debug_assertions(db, krate),
         lifetime_markers: true,
         inline: rustc_inlines(level, krate.data(db).origin.is_lang(), backend::optimizing()),
+        // v1 knows nothing of the program its crates are linked into, so not what allocator
+        // it has: no allocation moves to the stack.
+        heap_to_stack: false,
+        // Nor what trait objects it makes.
+        world: None,
     })
 }
 
@@ -1450,8 +1474,8 @@ fn body_options(
 }
 
 /// The body of an instance that is not a shim, with the instance's types in place of the
-/// generic parameters. The database does not keep it unless `BLAZE_LEAN=0`: nothing but
-/// compiling the instance reads it, and what was compiled is kept.
+/// generic parameters. The database does not keep it: nothing but compiling the instance
+/// reads it, and what was compiled is kept.
 ///
 /// `build` is the v2 unit's settings the body is read under ([`v2::build::building`] in the
 /// IR builder, [`v2::build::Build::WALK`] for the walk), `None` in v1.
@@ -1461,32 +1485,17 @@ fn instance_body<'db>(
     env: StoredParamEnvAndCrate,
     build: Option<v2::build::Build>,
 ) -> Result<Cow<'db, MirBody<'db>>> {
-    static LEAN: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("BLAZE_LEAN").is_none_or(|it| it != "0"));
     let args = instance.args;
     let tally = backend::Tally::global();
     let filled = |body, args: &StoredGenericArgs, env: &StoredParamEnvAndCrate| {
         tally.step(Step::Monomorphize, || monomorphized(db, body, args, env).map(Cow::Owned))
     };
-    // The database keeps a monomorphized body of the runtime body only, which only
-    // `BLAZE_MIR_OPT=0` compiles; of a coroutine, only `BLAZE_LEAN=0`, whatever the level.
     let Some(owner) = instance.def.mir_owner() else { unsupported!("the body of a shim") };
-    let lean = match owner {
-        MirOwner::Body(_) | MirOwner::Closure(_) => {
-            *LEAN || mir_opt_level()? != Some(MirOptLevel::Off)
-        }
-        MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => *LEAN,
-    };
     let written = owner.written_in(db).module(db).krate(db);
     let options = body_options(db, build, written, env.krate)?;
-    // A unit's body, or one with rustc's UB checks, is never the kept runtime one.
-    let body = if lean || build.is_some() || !options.is_runtime() {
-        tally
-            .step(Step::Mir, || db.mir(owner, MirStage::compiled(owner, options)))
-            .and_then(|it| filled(it, &args, &env))
-    } else {
-        db.monomorphized_mir(owner, MirStage::Runtime, args, env).map(Cow::Borrowed)
-    };
+    let body = tally
+        .step(Step::Mir, || db.mir(owner, MirStage::compiled(owner, options)))
+        .and_then(|it| filled(it, &args, &env));
     // alloc: the error's message
     let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
     match instance.def {
@@ -1586,6 +1595,29 @@ fn coroutine_layout_line<'db>(
     Some(format!("{{async fn body of {name}()}} @coroutine {}", variants.join(";")))
 }
 
+/// Whether `func` runs only when something has gone wrong, so its code goes after every other
+/// function and a block calling it after the rest of its function
+/// (docs/v2/plan/lanes/layout/layout.md): it is `#[cold]` (`handle_alloc_error`,
+/// `unwrap_failed`, core's panics), the panic machinery by its lang items (the
+/// `#[panic_handler]`, `begin_panic`, the personality routine unwinding runs), or
+/// `#[track_caller]` and never returns (a panic helper of a crate's own). A profile that saw it
+/// run wins.
+pub(crate) fn cold_fn(db: &Db, lang_items: &LangItems, func: FunctionId) -> bool {
+    let flags = AttrFlags::query(db, func.into());
+    if flags.contains(AttrFlags::COLD) {
+        return true;
+    }
+    if [lang_items.PanicImpl, lang_items.BeginPanic, lang_items.EhPersonality].contains(&Some(func)) {
+        return true;
+    }
+    flags.contains(AttrFlags::TRACK_CALLER) && {
+        let signature = FunctionSignature::of(db, func);
+        signature
+            .ret_type
+            .is_some_and(|ret| matches!(signature.store.type_ref(ret), hir_def::hir::type_ref::TypeRef::Never))
+    }
+}
+
 /// The methods of the `Fn` traits and of the `AsyncFn` traits, each from the one that borrows
 /// the callee to the one that takes it.
 fn fn_trait_methods(lang_items: &LangItems) -> [[Option<FunctionId>; 3]; 2] {
@@ -1623,17 +1655,19 @@ fn declared_method(db: &Db, func: FunctionId) -> FunctionId {
 }
 
 /// The instance that is the `poll` of the future `ty`, when that is one of an `async` block.
-fn coroutine_instance<'db>(
-    db: &'db Db,
-    ty: Ty<'db>,
-) -> Option<(InstanceDef, GenericArgs<'db>)> {
-    let TyKind::Coroutine(id, args) = ty.kind() else { return None };
-    let args = args.as_coroutine();
-    let def = match is_by_move_coroutine(db, id.0, args) {
-        true => InstanceDef::CoroutineByMove(id.0.as_id()),
-        false => InstanceDef::Coroutine(id.0.as_id()),
-    };
-    Some((def, GenericArgs::new_from_slice(args.parent_args())))
+fn coroutine_instance<'db>(db: &'db Db, ty: Ty<'db>) -> Option<(InstanceDef, GenericArgs<'db>)> {
+    let (body, parent_args) = dispatch::coroutine_poll(db, ty)?;
+    Some((instance_def(body), parent_args))
+}
+
+/// The instance of a body the dispatch names.
+fn instance_def(body: dispatch::Body) -> InstanceDef {
+    match body {
+        dispatch::Body::Fn(func) => InstanceDef::Fn(func),
+        dispatch::Body::Closure(id) => InstanceDef::Closure(id),
+        dispatch::Body::Coroutine(id) => InstanceDef::Coroutine(id),
+        dispatch::Body::CoroutineByMove(id) => InstanceDef::CoroutineByMove(id),
+    }
 }
 
 /// The instances the walk for [`TheirStatics`] went through. What it found stays as it is
@@ -1644,7 +1678,8 @@ type Walked = Vec<(Instance, StoredParamEnvAndCrate)>;
 #[blaze_query::tracked(returns(ref))]
 fn compiled_static(db: &Db, id: StaticId) -> Result<CompiledStatic> {
     let checked = crate_checks_overflow(db, id.krate(db)).unwrap_or(false);
-    let mut cg = Recorder::new(db, &**target()?, selected_target()?, checked);
+    let target = target_of_crate(db, id.krate(db))?;
+    let mut cg = Recorder::new(db, &**isa_for(target)?, target, checked);
     let env =
         ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate: id.krate(db) };
     let mut value = None;
@@ -1851,19 +1886,9 @@ pub(crate) fn impl_method<'db>(
     env: ParamEnvAndCrate<'db>,
     func: FunctionId,
     args: GenericArgs<'db>,
-) -> std::result::Result<(ImplMethod, GenericArgs<'db>), String> {
-    match db.lookup_impl_method_or_why(env, func, args) {
-        Ok(found) => Ok(found),
-        Err(why) if why.is_expected() => Ok((either::Either::Left(func), args)),
-        Err(why) => Err(no_impl_method(db, func, args, why)),
-    }
+) -> std::result::Result<(dispatch::ImplMethod, GenericArgs<'db>), String> {
+    dispatch::impl_method(db, env, func, args).map_err(|why| no_impl_method(db, func, args, why))
 }
-
-/// What [`impl_method`] finds: a function, or the method of an impl a builtin derive makes.
-pub(crate) type ImplMethod = either::Either<
-    FunctionId,
-    (hir_def::BuiltinDeriveImplId, hir_def::builtin_derive::BuiltinDeriveImplMethod),
->;
 
 /// `trait P method m for <args>: why`, of a call of the trait method `func` with `args` that
 /// no impl's method was found for.
@@ -1909,8 +1934,17 @@ pub fn exported_static(db: &Db, id: StaticId) -> Option<intern::Symbol> {
     })
 }
 
-/// The symbol an item of an `extern` block links to.
-pub fn link_name(db: &Db, func: FunctionId) -> Option<String> {
+/// The symbol an item of an `extern` block links to, on its crate's target. A target that
+/// does not load is an error: the symbol depends on it.
+pub fn link_name(db: &Db, func: FunctionId) -> Result<Option<String>> {
+    let ItemContainerId::ExternBlockId(_) = func.lookup(db).container else {
+        return Ok(None);
+    };
+    Ok(link_name_for(db, target_of_crate(db, func.krate(db))?, func))
+}
+
+/// [`link_name`] on `target`, the target of the code that names the item.
+pub(crate) fn link_name_for(db: &Db, target: &Target, func: FunctionId) -> Option<String> {
     let ItemContainerId::ExternBlockId(_) = func.lookup(db).container else {
         return None;
     };
@@ -1920,28 +1954,26 @@ pub fn link_name(db: &Db, func: FunctionId) -> Option<String> {
         None => FunctionSignature::of(db, func).name.as_str(),
     };
     // alloc: the symbol written into the object; callers outside this range take a `String`
-    Some(as_declared(name, global_prefix()).to_owned())
+    Some(as_declared(name, global_prefix(target)).to_owned())
 }
 
 /// The module of a wasm module's imports an item of an `extern` block is one of, on a target
 /// whose objects are wasm's.
-fn wasm_import_module(db: &Db, func: FunctionId) -> Option<String> {
+fn wasm_import_module(db: &Db, target: &Target, func: FunctionId) -> Option<String> {
     let ItemContainerId::ExternBlockId(block) = func.lookup(db).container else { return None };
-    if !Target::current().writes_wasm_objects() {
+    if !target.writes_wasm_objects() {
         return None;
     }
     // alloc: the import's module, written into the object; its caller takes a `String`
     AttrFlags::wasm_import_module(db, block).map(|it| it.as_str().to_owned())
 }
 
-/// The prefix the object writer puts in front of every name declared to it for the target:
-/// `_` on Mach-O and on 32-bit Windows, nothing elsewhere.
-fn global_prefix() -> Option<char> {
-    let triple = target().ok()?.triple();
-    let prefixed = triple.binary_format == target_lexicon::BinaryFormat::Macho
-        || triple.binary_format == target_lexicon::BinaryFormat::Coff
-            && matches!(triple.architecture, target_lexicon::Architecture::X86_32(_));
-    prefixed.then_some('_')
+/// The prefix the object writer puts in front of every name declared to it for `target`:
+/// `_` on Mach-O, nothing elsewhere. 32-bit Windows prefixes too, and blaze emits no code for
+/// it. The target's own object format decides, never its ISA's triple: a wasm32 target
+/// borrows a native ISA's settings, whose triple on a Mac is Mach-O.
+fn global_prefix(target: &Target) -> Option<char> {
+    (target.object_format == ObjectFormat::MachO).then_some('_')
 }
 
 /// The name an `extern` item written with `link_name` is declared under. One that starts with
@@ -2031,8 +2063,16 @@ fn global_allocator_export(
     })
 }
 
-/// The symbol a static of an `extern` block links to.
-fn static_link_name(db: &Db, id: StaticId) -> Option<String> {
+/// The symbol a static of an `extern` block links to, on its crate's target.
+fn static_link_name(db: &Db, id: StaticId) -> Result<Option<String>> {
+    if !StaticSignature::of(db, id).flags.contains(StaticFlags::EXTERN) {
+        return Ok(None);
+    }
+    Ok(static_link_name_for(db, target_of_crate(db, id.krate(db))?, id))
+}
+
+/// [`static_link_name`] on `target`, the target of the code that names the static.
+fn static_link_name_for(db: &Db, target: &Target, id: StaticId) -> Option<String> {
     let signature = StaticSignature::of(db, id);
     if !signature.flags.contains(StaticFlags::EXTERN) {
         return None;
@@ -2040,7 +2080,7 @@ fn static_link_name(db: &Db, id: StaticId) -> Option<String> {
     let written = AttrFlags::link_name(db, id.into());
     let name = written.as_ref().map_or_else(|| signature.name.as_str(), |it| it.as_str());
     // alloc: the symbol written into the object; callers outside this range take a `String`
-    Some(as_declared(name, global_prefix()).to_owned())
+    Some(as_declared(name, global_prefix(target)).to_owned())
 }
 
 /// Builds the IR of one function and runs Cranelift on it.
@@ -2066,8 +2106,9 @@ fn compile_as<'db>(
     tier: bool,
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<Produced> {
-    let isa = &**target()?;
-    let mut cg = Recorder::new(db, isa, selected_target()?, checked);
+    let target = target_of_crate(db, env.krate)?;
+    let isa = &**isa_for(target)?;
+    let mut cg = Recorder::new(db, isa, target, checked);
     let tally = backend::Tally::global();
     let mut ctx = tally.step(Step::Translate, || {
         let mut ctx = build(&mut cg, env, body, tracked, fill)?;
@@ -2115,12 +2156,14 @@ fn compile_as<'db>(
             spare::keep_context(ctx);
             return Ok(Produced::Pending(Pending {
                 func,
+                target,
                 wants,
                 named,
                 source,
                 variables,
                 layouts,
                 closure: None,
+                moves_to_frame: body.is_some_and(|it| it.inlined.moved_to_frame != 0),
             }));
         }
         None => Backend::emit(&mut cg, &mut ctx)?,
@@ -2146,14 +2189,9 @@ fn compile_as<'db>(
 /// in put where they are called, the locals a register holds taken out of the frame, and the
 /// copies of a known small size made loads and stores, as LLVM's -O0 makes them.
 fn settle(ctx: &mut cranelift_codegen::Context, cg: &Recorder) -> Result<()> {
-    /// `BLAZE_PROMOTE=0` leaves every local in its slot of the frame.
-    static PROMOTE: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("BLAZE_PROMOTE").is_none_or(|it| it != "0"));
     inline(ctx, &cg.inlined)?;
-    if *PROMOTE {
-        promote::promote(&mut ctx.func, cg.named_slots());
-    }
-    if copies::lower_small(&mut ctx.func) && *PROMOTE {
+    promote::promote(&mut ctx.func, cg.named_slots());
+    if copies::lower_small(&mut ctx.func) {
         promote::promote(&mut ctx.func, cg.named_slots());
     }
     Ok(())
@@ -2180,12 +2218,17 @@ impl Produced {
 /// compiles without it: an edit applied meanwhile waits for nothing.
 pub struct Pending {
     func: ir::Function,
+    /// The unit's target, which LLVM compiles the function for.
+    target: &'static Target,
     wants: fragment::Wants,
     named: Vec<ir::StackSlot>,
     source: Option<fragment::Source>,
     variables: Option<(StoredParamEnvAndCrate, Vec<Variable>)>,
     layouts: Vec<(String, u64, u64)>,
     closure: Option<ExprId>,
+    /// Its body has allocations `HeapToStack` moved into its frame
+    /// (`Inlined::moved_to_frame`): it is built into no other function.
+    moves_to_frame: bool,
 }
 
 impl Pending {
@@ -2193,9 +2236,16 @@ impl Pending {
         &self.func
     }
 
+    /// Whether its body has allocations moved into its own frame, which no importer may build
+    /// into its frame: the importer may recur, and `HeapToStack` keeps a moved slot out of
+    /// every frame that may.
+    pub(crate) fn moves_to_frame(&self) -> bool {
+        self.moves_to_frame
+    }
+
     /// The code LLVM makes of the function, at the level `request` asks for.
     pub(crate) fn produce(mut self, request: &tier::Request) -> Result<CompiledFunction> {
-        let code = tier::emit(&mut self.wants, &self.named, &mut self.func, request)?;
+        let code = tier::emit(&mut self.wants, self.target, &self.named, &mut self.func, request)?;
         Ok(CompiledFunction {
             requests: self.wants.into_requests(),
             code,
@@ -2358,9 +2408,10 @@ fn build<'db>(
     if guarded && let Some(entry) = ctx.func.layout.entry_block() {
         // The slot a guarded call looks for an exception in starts empty.
         use cranelift_codegen::cursor::{Cursor as _, FuncCursor};
+        let pointer = cg.target.pointer();
         let mut cursor = FuncCursor::new(&mut ctx.func).at_first_insertion_point(entry);
-        let frame = cursor.ins().get_frame_pointer(ptr());
-        let none = cursor.ins().iconst(ptr(), 0);
+        let frame = cursor.ins().get_frame_pointer(pointer);
+        let none = cursor.ins().iconst(pointer, 0);
         cursor.ins().store(MEM, none, frame, unwind::seh::ARRIVAL);
     }
     Ok(ctx)
@@ -2415,13 +2466,19 @@ fn built_in_body(
     unit: Option<v2::build::Build>,
 ) -> Option<fragment::Inlinable> {
     let InstanceDef::Fn(func) = instance.def else { return None };
+    // No callee built in is devirtualized, as the MIR inliner devirtualizes none
+    // (`hir-ty-mir` `inline.rs` `callee_options`): its walk without the world lists it.
+    let unit = unit.map(|it| v2::build::Build { world: None, ..it });
     let generic = db.mir_body(func.into()).ok()?;
     if !generic.closures.is_empty() || generic.coroutine.is_some() {
         return None;
     }
     let at = env.as_ref(db);
     let body = instance_body(db, instance, env, unit).ok()?;
-    let mut cg = Recorder::new(db, &**target().ok()?, selected_target().ok()?, instance.checked);
+    // Not built in, never built for a guessed target: the compile asking for the body is of
+    // `at.krate` and loaded its target with `?`, so a target that fails reaches it as that error.
+    let target = target_of_crate(db, at.krate).ok()?;
+    let mut cg = Recorder::new(db, &**isa_for(target).ok()?, target, instance.checked);
     cg.unit = unit;
     cg.unlocated = true;
     let args = instance.args;
@@ -2563,23 +2620,30 @@ fn inline(ctx: &mut cranelift_codegen::Context, inlined: &[ir::Function]) -> Res
 
 /// [`emit_lent`] into lists of its own, at Cranelift's default optimization: v1's compile
 /// (`Backend::emit`, and the shims it defines), and what the tests compile a function with.
-fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
+fn emit(ctx: &mut cranelift_codegen::Context, target: &'static Target) -> Result<Code> {
     // alloc: none until the code's rows are written, then exactly that many: the caller keeps them
-    emit_with(ctx, false, Features::BASELINE, Relocs::default(), Vec::new())
+    emit_with(ctx, target, false, Features::BASELINE, backend::V1_FRAME_POINTERS, Relocs::default(), Vec::new())
 }
 
 /// Runs Cranelift on a finished function: v2's compile (`v2/backend.rs`), at
 /// `opt_level=speed` when `speed` (code no edit reaches, the standard library's and
 /// dependencies', whose unit's key says so: `blaze_codegen::Backend::Cranelift { speed }`),
-/// with the function's target features (its unit's and its `#[target_feature]`'s).
+/// with the function's target features (its unit's and its `#[target_feature]`'s), keeping
+/// every frame pointer when `frame_pointers`, its unit's `Toolchain::frame_pointers`.
 /// v2 keeps what it compiles in the back-end memo by the function's shape, which is its printed
 /// IR with names by place, so Cranelift's incremental cache would be a second key over the same
 /// IR (a serialization and hash of the whole function, and a lookup in v1's store) that the
 /// memo already missed on. It compiles with none. The relocations and line rows are written
 /// into the thread's kept lists ([`spare::relocs`], [`spare::lines`]), which v2's conversion
 /// gives back ([`spare::keep_relocs`], [`spare::keep_lines`]).
-fn emit_lent(ctx: &mut cranelift_codegen::Context, speed: bool, features: Features) -> Result<Code> {
-    emit_with(ctx, speed, features, spare::relocs(), spare::lines())
+fn emit_lent(
+    ctx: &mut cranelift_codegen::Context,
+    target: &'static Target,
+    speed: bool,
+    features: Features,
+    frame_pointers: bool,
+) -> Result<Code> {
+    emit_with(ctx, target, speed, features, frame_pointers, spare::relocs(), spare::lines())
 }
 
 /// Runs Cranelift on a finished function, writing its relocations and line rows into `relocs`
@@ -2587,17 +2651,20 @@ fn emit_lent(ctx: &mut cranelift_codegen::Context, speed: bool, features: Featur
 /// for one); that must cost us one function, not the process.
 fn emit_with(
     ctx: &mut cranelift_codegen::Context,
+    target: &'static Target,
     speed: bool,
     features: Features,
+    frame_pointers: bool,
     relocs: Relocs,
     lines: Vec<LineRow>,
 ) -> Result<Code> {
-    if Target::current().is_wasm() {
-        return emit_wasm(&ctx.func, Target::current().calls());
+    refuse_tail_calls(&ctx.func, target)?;
+    if target.is_wasm() {
+        return emit_wasm(&ctx.func, target.calls());
     }
     let large = ctx.func.dfg.num_insts() > SINGLE_PASS;
     let kind = if large { Isa::Large } else { Isa::Usual };
-    let mut isa = &**target_of(features, kind, speed)?;
+    let mut isa = &**target_of(target, features, kind, speed)?;
     let func = &ctx.func;
     // Cranelift reads the return address from the function's frame record, which only a
     // function compiled to keep its frame pointer has (`core::intrinsics::return_address`).
@@ -2609,7 +2676,7 @@ fn emit_with(
         })
     };
     if !isa.flags().preserve_frame_pointers()
-        && (backend::frame_pointers()
+        && (frame_pointers
             || func.layout.entry_block().is_some_and(|entry| {
                 func.layout
                     .block_insts(entry)
@@ -2617,7 +2684,7 @@ fn emit_with(
             })
             || reads_return_address())
     {
-        isa = &**target_of(features, Isa::FramePointer, speed)?;
+        isa = &**target_of(target, features, Isa::FramePointer, speed)?;
     }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.compile(isa, &mut Default::default())
@@ -2658,6 +2725,71 @@ fn emit_with(
             Err(CodegenError::Backend(format!("backend panic: {message}")))
         }
     }
+}
+
+/// Why a `become` of `func` can't be a tail call, where it can't: the compiler supplies what
+/// it does in the caller, so it is no function to jump to (rustc refuses the intrinsics and
+/// the `Fn` traits' methods before codegen; the rest are the standard library's, whose code
+/// has no `become` of them), or it is C-variadic. The IR builder and the refs walk ask the
+/// same question, so the walk lists nothing the builder would not call.
+fn tail_call_refused(
+    db: &Db,
+    target: &Target,
+    interner: DbInterner<'_>,
+    func: FunctionId,
+) -> Option<String> {
+    let signature = FunctionSignature::of(db, func);
+    let name = signature.name.as_str();
+    let lang_items = interner.lang_items();
+    if FunctionSignature::is_intrinsic(db, func)
+        || fncache::is_code(db, func)
+        || fn_trait_methods(lang_items).iter().any(|it| it.contains(&Some(func)))
+        || [lang_items.DropInPlace, lang_items.DropGlue].contains(&Some(func))
+        || func.krate(db).data(db).origin.is_lang() && is_ub_check(signature.name.symbol())
+        || link_name_for(db, target, func).is_some_and(|it| it.starts_with("llvm."))
+    {
+        // alloc: the error's message
+        return Some(format!(
+            "a tail call (`become`) of `{name}`, whose body the compiler supplies where it is \
+             called: it is no function to jump to"
+        ));
+    }
+    // alloc: the error's message
+    signature.is_varargs().then(|| format!("a tail call (`become`) of the C-variadic `{name}`"))
+}
+
+/// Refuses a function with a tail call (`become`'s `return_call`) where the code is
+/// Cranelift's own or blaze's WebAssembly: Cranelift makes a tail call only under its
+/// `tail` convention, which no Rust function has (a call and a return in its place would
+/// grow the stack `become` promises not to), and the WebAssembly lowering has no
+/// `return_call` yet. The copy-and-patch stencils and LLVM (`musttail`) make it.
+fn refuse_tail_calls(func: &ir::Function, target: &'static Target) -> Result<()> {
+    let convention = func.signature.call_conv;
+    if !target.is_wasm() && convention.supports_tail_calls() {
+        return Ok(());
+    }
+    let tail_calls = func.layout.blocks().any(|block| {
+        func.layout.block_insts(block).any(|inst| {
+            matches!(
+                func.dfg.insts[inst].opcode(),
+                ir::Opcode::ReturnCall | ir::Opcode::ReturnCallIndirect
+            )
+        })
+    });
+    if tail_calls {
+        match target.is_wasm() {
+            true => unsupported!(
+                "a tail call (`become`) in code for WebAssembly, whose lowering has no \
+                 `return_call` yet"
+            ),
+            false => unsupported!(
+                "a tail call (`become`) in code Cranelift's native back end makes: it \
+                 guarantees one only under its `tail` convention, never the target's \
+                 `{convention}`; `become` builds with the copy-and-patch stencils or LLVM"
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Lowers a finished function to WebAssembly. The bytes are a [`wasm::WasmFunction`], which
@@ -2746,17 +2878,136 @@ enum Lowered {
 struct Relocations<'a, 'db> {
     map: &'a MemoryMap<'db>,
     in_static: bool,
-    defined: HashMap<usize, DataId>,
-    /// The allocations [`FunctionCx::relocate_data_pointer`] is in the middle of, by start.
+    /// The data object of each allocation made so far, by start.
+    defined: HashMap<usize, Defined<'db>, Global>,
+    /// The allocations whose data objects are being made, by start: what const eval made of a
+    /// constant points in no circle (a static is named, not walked).
     walking: Vec<usize>,
+    /// The words a walk by type left as they are on purpose, though they have provenance: a
+    /// reference to nothing, made its alignment.
+    handled: Vec<PointerAt>,
+    /// The bytes a type says are a number (an integer, a float, a `bool`, a `char`, a slice's
+    /// length), by the memory they are in (`None` for the constant's value): a word of them
+    /// equal to one of const eval's ids is that number. Only where a type can be trusted, not
+    /// behind a raw pointer.
+    numbers: HashMap<Option<usize>, Vec<(usize, usize)>, Global>,
+    /// The unions walked, by the memory they are in: where they are and their type, for an
+    /// error about a word in one to name it.
+    unions: Vec<(Option<usize>, usize, usize, Ty<'db>)>,
 }
 
-impl Relocations<'_, '_> {
+impl<'db> Relocations<'_, 'db> {
     /// The alignment to give the data object made for the memory at `start`: what const eval
     /// made it with, or where it does not say, the most a value could need.
     fn align_of(&self, start: usize) -> u64 {
         self.map.align_at(start).map_or(16, |align| align as u64)
     }
+
+    /// Whether the word at `at` is a pointer with provenance. A map of a literal's reference
+    /// says nothing of provenance, and its pointers are what its type says.
+    fn provenance(&self, at: PointerAt) -> bool {
+        match self.map {
+            MemoryMap::Complex(_) => self.map.has_provenance(at),
+            MemoryMap::Empty | MemoryMap::Simple(_) => true,
+        }
+    }
+
+    /// Whether the map says which words have provenance, as const eval's always does.
+    fn tracks_provenance(&self) -> bool {
+        matches!(self.map, MemoryMap::Complex(_))
+    }
+
+    /// Notes that the `size` bytes at `start` of the memory at `kept` are a number.
+    fn number(&mut self, kept: Option<usize>, start: usize, size: usize) {
+        if size > 0 {
+            // alloc: the numbers of one allocation, for its walk
+            self.numbers.entry(kept).or_insert_with(Vec::new).push((start, start + size));
+        }
+    }
+
+    /// Whether a type says every byte of the `word` at `at` of the memory at `kept` is a
+    /// number.
+    fn is_number(&self, kept: Option<usize>, at: usize, word: usize) -> bool {
+        let Some(ranges) = self.numbers.get(&kept) else { return false };
+        let mut pos = at;
+        // Each step moves `pos` to the end of a range that holds it, so at most one a range.
+        for _ in 0..=ranges.len() {
+            if pos >= at + word {
+                return true;
+            }
+            match ranges.iter().find(|&&(start, end)| start <= pos && pos < end) {
+                Some(&(_, end)) => pos = end,
+                None => return false,
+            }
+        }
+        pos >= at + word
+    }
+
+    /// The union the byte at `at` of the memory at `kept` is in, if a walk went through one.
+    fn union_at(&self, kept: Option<usize>, at: usize) -> Option<Ty<'db>> {
+        (self.unions.iter())
+            .find(|it| it.0 == kept && it.1 <= at && at < it.2)
+            .map(|it| it.3)
+    }
+}
+
+/// Whether a value of `ty` is a number, with no pointer in it.
+fn is_number(ty: Ty<'_>) -> bool {
+    matches!(
+        ty.kind(),
+        TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char
+    )
+}
+
+/// Where the bytes a walk goes through were in const eval, and whether a type describes them.
+#[derive(Clone, Copy)]
+struct Walk {
+    /// The address of the memory const eval kept they are, or `None` for the constant's value.
+    kept: Option<usize>,
+    /// Reached through a raw pointer, whose pointee type may be a cast's: a word that type
+    /// says is a pointer is one only with provenance.
+    raw: bool,
+}
+
+impl Walk {
+    /// Where const eval's provenance of the word at `offset` is.
+    fn word(self, offset: usize) -> PointerAt {
+        match self.kept {
+            Some(start) => PointerAt::Memory(start + offset),
+            None => PointerAt::Value(offset),
+        }
+    }
+}
+
+/// How a pointer reaches an allocation: the type it walks it as, at an offset.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Reach<'db> {
+    ty: Ty<'db>,
+    /// The pointer's type's pointee: `ty` but for a `dyn`, whose `ty` is its concrete type.
+    pointee: Ty<'db>,
+    at: usize,
+    raw: bool,
+    /// A slice's or `str`'s length.
+    len: Option<usize>,
+    /// The concrete type of the `dyn` tail of a struct.
+    tail: Option<Ty<'db>>,
+}
+
+/// The data object made of an allocation, how it was walked, and what it was made of, which
+/// a later walk of it as another type must make again.
+struct Defined<'db> {
+    data: DataId,
+    by: Option<Reach<'db>>,
+    blob: ConstBlob,
+}
+
+/// The memory const eval kept that holds `addr`, with the address it starts at, or that `addr`
+/// is one past the end of, as a pointer made by offsetting to the end is.
+fn memory_holding<'m>(map: &'m MemoryMap<'_>, addr: usize) -> Option<(usize, &'m [u8])> {
+    map.memory_at(addr).or_else(|| {
+        let (start, memory) = map.memory_at(addr.checked_sub(1)?)?;
+        (addr - start == memory.len()).then_some((start, memory))
+    })
 }
 
 /// Whether a data object can be the same object as another with the same content.
@@ -2800,15 +3051,23 @@ impl ConstBlob {
         &self.bytes
     }
 
+    /// Puts the relocations in the order of their offsets, which one offset has at most one
+    /// of: a blob is compared and content-hashed with them, whatever order a walk found them.
+    fn in_order(&mut self) {
+        self.relocs.sort_unstable_by_key(|it| it.0);
+        self.fn_relocs.sort_unstable_by_key(|it| it.0);
+        self.type_ids.sort_unstable_by_key(|it| it.0);
+    }
+
     /// Makes the pointer at `offset` the address `at` bytes into `target`.
-    fn point_to(&mut self, offset: usize, target: DataId, at: usize) {
-        self.bytes[offset..offset + word()].fill(0);
+    fn point_to(&mut self, offset: usize, target: DataId, at: usize, word: usize) {
+        self.bytes[offset..offset + word].fill(0);
         self.relocs.push((offset as u32, target, at as i64));
     }
 
-    fn usize_at(&self, offset: usize) -> Option<usize> {
-        let bytes = self.bytes.get(offset..offset + word())?;
-        Some(bytes.iter().rev().fold(0, |word, &byte| word << 8 | usize::from(byte)))
+    fn usize_at(&self, offset: usize, word: usize) -> Option<usize> {
+        let bytes = self.bytes.get(offset..offset + word)?;
+        Some(bytes.iter().rev().fold(0, |value, &byte| value << 8 | usize::from(byte)))
     }
 }
 
@@ -3035,7 +3294,9 @@ struct SuspendedState {
 
 /// `args` with every lifetime but a bound one erased: lifetimes change nothing about the
 /// code, and the ones a caller passes on are its own parameters, which mean nothing in the
-/// callee.
+/// callee. The fold is compile identity's ([`hir_ty_identity::instance::erased`]), which folds
+/// each distinct type once: a root like rust#37311's `A70` (`(&'static A69, &'static A69)`) is
+/// 2^70 types as a tree, and a fold with no memo never ends on it (review 7, P1).
 ///
 /// What was erased is kept per thread. The arguments of a closure hold the types of all it
 /// captured, and of the closures those hold: erased again at every call, they are interned
@@ -3048,20 +3309,19 @@ pub(crate) fn erase_regions<'db>(
     /// How many are kept before they are let go, as each keeps its types interned.
     const KEPT: usize = 1 << 16;
     thread_local! {
-        static ERASED: std::cell::RefCell<HashMap<StoredGenericArgs, StoredGenericArgs>> =
+        static ERASED: std::cell::RefCell<HashMap<StoredGenericArgs, StoredGenericArgs, Global>> =
             std::cell::RefCell::default();
     }
-    if !args.has_free_regions() {
+    // Binders are anonymized too (`erased`), so a type with bound variables but no free region
+    // is erased as well: `for<'a> fn(&'a u8)` and `for<'b> fn(&'b u8)` are one instance.
+    if !args.has_type_flags(hir_ty_identity::instance::ERASES) {
         return args;
     }
     let key = args.store();
     if let Some(known) = ERASED.with_borrow(|it| it.get(&key).map(|it| it.as_ref())) {
         return known;
     }
-    let erased = rustc_type_ir::fold_regions(interner, args, |region, _| match region.kind() {
-        rustc_type_ir::RegionKind::ReBound(..) => region,
-        _ => Region::new_erased(interner),
-    });
+    let erased = hir_ty_identity::instance::erased(interner, args);
     ERASED.with_borrow_mut(|it| {
         if it.len() >= KEPT {
             it.clear();
@@ -3069,21 +3329,6 @@ pub(crate) fn erase_regions<'db>(
         it.insert(key, erased.store());
     });
     erased
-}
-
-/// The integer an address is on the target.
-fn ptr() -> Type {
-    Target::current().pointer()
-}
-
-/// How many bytes an address takes on the target.
-fn word() -> usize {
-    Target::current().word()
-}
-
-/// Where the second word of a wide pointer is.
-fn meta_at() -> i32 {
-    word() as i32
 }
 
 /// Where an `async` body left off: before its first statement, after its last, part of the way
@@ -3151,6 +3396,20 @@ pub(crate) fn promoted_constants<'a, 'db>(
     own.chain(inlined)
 }
 
+/// The error of a promoted constant whose MIR does not build, naming it and the body it is of.
+pub(crate) fn no_promoted_mir(db: &Db, promoted: Promoted<'_>, error: impl std::fmt::Debug) -> CodegenError {
+    let owner = match promoted.owner {
+        InferBodyId::DefWithBodyId(def) => {
+            format!("`{}`", blaze_items::key::path(db, blaze_items::ItemId::of_body(db, def))) // alloc: an error's text
+        }
+        InferBodyId::AnonConstId(_) => "an anonymous constant".to_owned(), // alloc: an error's text
+    };
+    // alloc: the error's message
+    CodegenError::Refused(hir_ty::attach_db(db, || {
+        format!("the promoted constant {:?} of {owner} has no MIR: {error:?}", promoted.expr)
+    }))
+}
+
 /// The locals of `body` that hold a promoted constant, its own and its inlined callees'.
 fn promoted_locals<'a>(body: &'a MirBody<'_>) -> impl Iterator<Item = LocalId> + 'a {
     let own = body.promoted_locals.iter().map(|it| it.0);
@@ -3208,8 +3467,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let at = self.layout(boxed)?.fields.offset(0).bytes() as i32;
         let meta = self
             .is_unsized(pointee)
-            .then(|| self.builder.ins().load(ptr(), MEM, addr, at + meta_at()));
-        Ok((self.builder.ins().load(ptr(), MEM, addr, at), meta))
+            .then(|| self.builder.ins().load(self.cg.target.pointer(), MEM, addr, at + self.cg.target.meta_at()));
+        Ok((self.builder.ins().load(self.cg.target.pointer(), MEM, addr, at), meta))
     }
 
     fn is_unsized(&self, ty: Ty<'db>) -> bool {
@@ -3262,21 +3521,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let meta = match meta {
             Some(meta) if self.is_unsized(ty) => meta,
             _ => {
-                let size = self.builder.ins().iconst(ptr(), layout.size.bytes() as i64);
-                return Ok((size, self.builder.ins().iconst(ptr(), align)));
+                let size = self.builder.ins().iconst(self.cg.target.pointer(), layout.size.bytes() as i64);
+                return Ok((size, self.builder.ins().iconst(self.cg.target.pointer(), align)));
             }
         };
         match ty.kind() {
-            TyKind::Str => Ok((meta, self.builder.ins().iconst(ptr(), 1))),
+            TyKind::Str => Ok((meta, self.builder.ins().iconst(self.cg.target.pointer(), 1))),
             TyKind::Slice(elem) => {
                 let elem = self.layout(elem)?;
                 let size = self.builder.ins().imul_imm(meta, elem.size.bytes() as i64);
-                Ok((size, self.builder.ins().iconst(ptr(), elem.align.abi.bytes() as i64)))
+                Ok((size, self.builder.ins().iconst(self.cg.target.pointer(), elem.align.abi.bytes() as i64)))
             }
             // Size and align are the vtable's second and third words.
             TyKind::Dynamic(..) => Ok((
-                self.builder.ins().load(ptr(), MEM, meta, meta_at()),
-                self.builder.ins().load(ptr(), MEM, meta, 2 * meta_at()),
+                self.builder.ins().load(self.cg.target.pointer(), MEM, meta, self.cg.target.meta_at()),
+                self.builder.ins().load(self.cg.target.pointer(), MEM, meta, 2 * self.cg.target.meta_at()),
             )),
             _ => {
                 let (field, field_ty) = self.last_field(ty)?;
@@ -3284,12 +3543,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (tail_size, mut tail_align) =
                     self.size_and_align_of_val(field_ty, Some(meta))?;
                 if let Some(pack) = self.pack(ty) {
-                    let pack = self.builder.ins().iconst(ptr(), pack as i64);
+                    let pack = self.builder.ins().iconst(self.cg.target.pointer(), pack as i64);
                     tail_align = self.builder.ins().umin(tail_align, pack);
                 }
-                let sized_align = self.builder.ins().iconst(ptr(), align);
+                let sized_align = self.builder.ins().iconst(self.cg.target.pointer(), align);
                 let full_align = self.builder.ins().umax(tail_align, sized_align);
-                let offset = self.builder.ins().iconst(ptr(), offset);
+                let offset = self.builder.ins().iconst(self.cg.target.pointer(), offset);
                 let offset = self.emit_align_up(offset, tail_align);
                 let size = self.builder.ins().iadd(offset, tail_size);
                 Ok((self.emit_align_up(size, full_align), full_align))
@@ -3342,10 +3601,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let (_, mut align) = self.size_and_align_of_val(field_ty, Some(meta))?;
         if let Some(pack) = self.pack(container) {
-            let pack = self.builder.ins().iconst(ptr(), pack as i64);
+            let pack = self.builder.ins().iconst(self.cg.target.pointer(), pack as i64);
             align = self.builder.ins().umin(align, pack);
         }
-        let offset = self.builder.ins().iconst(ptr(), offset.bytes() as i64);
+        let offset = self.builder.ins().iconst(self.cg.target.pointer(), offset.bytes() as i64);
         let offset = self.emit_align_up(offset, align);
         Ok(self.builder.ins().iadd(addr, offset))
     }
@@ -3398,7 +3657,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 },
                 signed,
             },
-            Primitive::Pointer(_) => AbiScalar { ty: ptr(), signed: false },
+            Primitive::Pointer(_) => AbiScalar { ty: self.cg.target.pointer(), signed: false },
             Primitive::Float(rustc_abi::Float::F32) => AbiScalar { ty: types::F32, signed: true },
             Primitive::Float(rustc_abi::Float::F64) => AbiScalar { ty: types::F64, signed: true },
             // `f16b` has no arithmetic in Rust, only its bits moved, and LLVM passes it where it
@@ -3442,7 +3701,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(PassMode::Indirect);
         }
         // rustc returns in memory what is more than two registers hold.
-        let wide = is_ret && layout.size.bytes() > 2 * word() as u64;
+        let wide = is_ret && layout.size.bytes() > 2 * self.cg.target.word() as u64;
         Ok(match layout.backend_repr {
             BackendRepr::Scalar(_) if wide => PassMode::Indirect,
             BackendRepr::Scalar(scalar) => PassMode::Direct(self.scalar(scalar)?),
@@ -3459,7 +3718,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
             }
             BackendRepr::Memory { sized: true } => {
-                let max = word() as u64;
+                let max = self.cg.target.word() as u64;
                 match layout.size.bytes() {
                     size if size > max => PassMode::Indirect,
                     1 => PassMode::Cast(types::I8),
@@ -3596,7 +3855,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 .collect::<Result<_>>()?;
             return Ok(FnAbi { ret, args });
         }
-        if Target::current().is_wasm() {
+        if self.cg.target.is_wasm() {
             return self.wasm_c_abi(ret, args);
         }
         let arch = self.cg.target.arch;
@@ -4271,7 +4530,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn push_abi_params(&self, mode: PassMode, params: &mut Vec<AbiParam>) {
-        let copied = |size| AbiParam::special(ptr(), ArgumentPurpose::StructArgument(size));
+        let copied = |size| AbiParam::special(self.cg.target.pointer(), ArgumentPurpose::StructArgument(size));
         match mode {
             PassMode::Ignore => (),
             PassMode::Direct(s) => params.push(s.param()),
@@ -4282,9 +4541,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 params.extend((0..skipped).map(|_| AbiParam::new(PassMode::register(unit))));
                 params.extend((0..count).map(|_| AbiParam::new(unit)));
             }
-            PassMode::Indirect => params.push(AbiParam::new(ptr())),
+            PassMode::Indirect => params.push(AbiParam::new(self.cg.target.pointer())),
             PassMode::IndirectUnsized => {
-                params.extend([AbiParam::new(ptr()), AbiParam::new(ptr())])
+                params.extend([AbiParam::new(self.cg.target.pointer()), AbiParam::new(self.cg.target.pointer())])
             }
             PassMode::Spread { .. } => params.push(AbiParam::new(types::F64)),
             PassMode::OnStack { size, padded } => {
@@ -4315,7 +4574,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mut sig = self.cg.make_signature();
         match ret {
             PassMode::Indirect => {
-                sig.params.push(AbiParam::special(ptr(), ArgumentPurpose::StructReturn))
+                sig.params.push(AbiParam::special(self.cg.target.pointer(), ArgumentPurpose::StructReturn))
             }
             mode => self.push_abi_params(mode, &mut sig.returns),
         }
@@ -4393,8 +4652,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // The callee is handed the value where it is, as rustc does: the operand is a
             // place moved out of, whose memory nothing reads again.
             PassMode::IndirectUnsized => {
-                values.push(self.builder.ins().load(ptr(), MEM, addr, 0));
-                values.push(self.builder.ins().load(ptr(), MEM, addr, meta_at()));
+                values.push(self.builder.ins().load(self.cg.target.pointer(), MEM, addr, 0));
+                values.push(self.builder.ins().load(self.cg.target.pointer(), MEM, addr, self.cg.target.meta_at()));
             }
             PassMode::OnStack { padded, .. } => {
                 if padded {
@@ -4440,7 +4699,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             PassMode::IndirectUnsized => {
                 let (data, meta) = (next(), next());
                 self.builder.ins().store(MEM, data, addr, 0);
-                self.builder.ins().store(MEM, meta, addr, meta_at());
+                self.builder.ins().store(MEM, meta, addr, self.cg.target.meta_at());
             }
             PassMode::Direct(_) => {
                 let value = next();
@@ -4526,7 +4785,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             8,
             3,
         ));
-        self.builder.ins().stack_addr(ptr(), slot, 0)
+        self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0)
     }
 
     /// Storage for an integer of 128 bits.
@@ -4536,7 +4795,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             16,
             4,
         ));
-        self.builder.ins().stack_addr(ptr(), slot, 0)
+        self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0)
     }
 
     /// Storage for a fat pointer.
@@ -4546,7 +4805,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             16,
             3,
         ));
-        self.builder.ins().stack_addr(ptr(), slot, 0)
+        self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0)
     }
 
     /// Storage for a temporary that is borrowed for `'static` and that [`Self::promoted_constant`]
@@ -4556,7 +4815,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn promoted_slot(&mut self, layout: &Layout) -> Result<Value> {
         let align = layout.align.abi.bytes();
         if layout.size.bytes() == 0 {
-            return Ok(self.builder.ins().iconst(ptr(), align as i64));
+            return Ok(self.builder.ins().iconst(self.cg.target.pointer(), align as i64));
         }
         let blob = ConstBlob {
             // alloc: the data object's bytes, which `define_data` takes and the unit keeps
@@ -4568,7 +4827,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let data = self.cg.define_data(blob, true)?;
         let data = self.cg.declare_data_in_func(data, self.builder.func);
-        Ok(self.builder.ins().symbol_value(ptr(), data))
+        Ok(self.builder.ins().symbol_value(self.cg.target.pointer(), data))
     }
 
     /// The read-only data a promoted `&expr` points to, when `expr` can be evaluated now.
@@ -4582,31 +4841,31 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         promoted: Promoted<'db>,
         layout: &Layout,
         plain: bool,
-    ) -> Option<Value> {
+    ) -> Result<Option<Value>> {
         let db = self.cg.db;
         if layout.size.bytes() == 0 {
-            return None;
+            return Ok(None);
         }
         if self.mentions_location(promoted.owner, promoted.expr) {
-            return self.builtin_location(promoted.owner, promoted.expr).ok().flatten();
+            return Ok(self.builtin_location(promoted.owner, promoted.expr).ok().flatten());
         }
-        let constant = monomorphized_promoted_mir_body_query(
-            db,
-            promoted.owner,
-            promoted.expr,
-            promoted.args(body, self.args.as_ref())?,
-            self.env.store(),
-        )
-        .ok()?;
-        let allocation = interpret_mir(db, constant, Some(self.env)).ok()?.0.ok()?;
+        let Some(args) = promoted.args(body, self.args.as_ref()) else { return Ok(None) };
+        // A promoted constant whose MIR does not build is an error, never left unpromoted:
+        // compile identity refuses it too (`hir_ty_identity`'s sites), so the two agree.
+        let constant =
+            monomorphized_promoted_mir_body_query(db, promoted.owner, promoted.expr, args, self.env.store())
+                .map_err(|error| no_promoted_mir(db, promoted, error))?;
+        let Some(allocation) = interpret_mir(db, constant, Some(self.env)).ok().and_then(|it| it.0.ok()) else {
+            return Ok(None);
+        };
         let ty = allocation.ty;
-        let blob = self.allocation_blob(allocation, false).ok()?;
+        let Ok(blob) = self.allocation_blob(allocation, false) else { return Ok(None) };
         if blob.bytes.len() != layout.size.bytes_usize()
             || !plain && !self.is_plain_value(&blob.bytes, 0, ty)
         {
-            return None;
+            return Ok(None);
         }
-        self.blob_addr(blob).ok()
+        Ok(self.blob_addr(blob).ok())
     }
 
     /// Whether a value of `ty` can be read-only data that is never dropped.
@@ -4688,7 +4947,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             )),
         };
         self.argument_slots.push((slot, (size, align_shift)));
-        self.builder.ins().stack_addr(ptr(), slot, 0)
+        self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0)
     }
 
     /// The address `addr` is, taken anew when it is of a slot of the frame. One taken where
@@ -4703,7 +4962,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 offset,
             } = dfg.insts[inst]
         {
-            return self.builder.ins().stack_addr(ptr(), stack_slot, offset);
+            return self.builder.ins().stack_addr(self.cg.target.pointer(), stack_slot, offset);
         }
         addr
     }
@@ -4727,7 +4986,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 size,
                 self.slot_align_shift(layout),
             ));
-            return self.builder.ins().stack_addr(ptr(), slot, 0);
+            return self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0);
         }
         // Cranelift keeps the frame 16-byte aligned and no more, so over-allocate and round up.
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
@@ -4735,7 +4994,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             size + align as u32,
             4,
         ));
-        let base = self.builder.ins().stack_addr(ptr(), slot, 0);
+        let base = self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0);
         let bumped = self.builder.ins().iadd_imm(base, align as i64 - 1);
         self.builder.ins().band_imm(bumped, -(align as i64))
     }
@@ -4781,7 +5040,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             .collect::<Result<Vec<_>>>()?;
         let mut sig = self.signature(&param_modes, ret);
         if self.tracked {
-            sig.params.push(AbiParam::new(ptr()));
+            sig.params.push(AbiParam::new(self.cg.target.pointer()));
         }
         let variadic = match self.variadic {
             true => {
@@ -4802,7 +5061,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(variadic) = Variadic::of(self.cg.target, &sig)?.filter(|_| native) else {
                     unsupported!("a function that takes `...` for this target");
                 };
-                variadic.rest(&mut sig);
+                variadic.rest(&mut sig, self.cg.target.pointer());
                 Some(variadic)
             }
             false => None,
@@ -4890,7 +5149,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 int_count * 8 + floats_bytes,
                 4,
             ));
-            let saved = self.builder.ins().stack_addr(ptr(), saved, 0);
+            let saved = self.builder.ins().stack_addr(self.cg.target.pointer(), saved, 0);
             for offset in (named.ints..int_count).map(|at| at * 8).chain(
                 (named.floats..VariadicRegisters::FLOATS)
                     .map(|at| int_count * 8 + at * VariadicRegisters::FLOAT_BYTES),
@@ -4904,7 +5163,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 // that the next one is. The arguments on the stack are above the frame
                 // pointer and the return address, the named ones first. Asking for the
                 // frame pointer here is what has `emit` keep one.
-                let frame = self.builder.ins().get_frame_pointer(ptr());
+                let frame = self.builder.ins().get_frame_pointer(self.cg.target.pointer());
                 let stack = self.builder.ins().iadd_imm(frame, 16 + i64::from(named.stack));
                 let ints_end = self.builder.ins().iadd_imm(saved, i64::from(int_count * 8));
                 let floats_end =
@@ -4940,7 +5199,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // What the caller left on the stack is right above the frame record, which is
             // the frame pointer and the return address: the named parameters that are
             // there, then the variable ones.
-            let frame = self.builder.ins().get_frame_pointer(ptr());
+            let frame = self.builder.ins().get_frame_pointer(self.cg.target.pointer());
             let stack = self.builder.ins().iadd_imm(frame, 16 + i64::from(named));
             self.builder.ins().store(MEM, stack, addr, 0);
             self.locals.insert(list, LocalSlot { addr, borrowed: false });
@@ -4948,7 +5207,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if let Some(Variadic::Buffer) = variadic {
             let list = *body.param_locals.last().expect("the list of a variadic function");
             let layout = self.layout(body.locals[list].ty.as_ref())?;
-            if layout.size.bytes() != u64::from(ptr().bytes()) {
+            if layout.size.bytes() != u64::from(self.cg.target.pointer().bytes()) {
                 unsupported!("a `VaList` that is not the one of this target");
             }
             let addr = self.stack_slot(&layout);
@@ -4972,7 +5231,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let upvars = args.as_coroutine().tupled_upvars_ty().tuple_fields().len();
                 let held = body.locals_held_across_yields();
                 let frame = CoroutineFrame { upvars };
-                let addr = self.builder.ins().load(ptr(), MEM, self.locals[receiver].addr, 0);
+                let addr = self.builder.ins().load(self.cg.target.pointer(), MEM, self.locals[receiver].addr, 0);
                 Some((frame, self.layout(ty)?, addr, ty, held))
             }
             None => None,
@@ -4988,7 +5247,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         // In an `async` body a temporary may be kept in the future where its binding is not.
         let mut forwarded =
-            if frame.is_none() { forwarded_temps(body) } else { HashMap::default() };
+            if frame.is_none() { forwarded_temps(body) } else { HashMap::new_in(Global) };
         let in_place = match self.ret_mode {
             PassMode::Indirect if frame.is_none() => {
                 returned_in_place(body, &forwarded).filter(|it| !forwarded.contains_key(it))
@@ -5036,7 +5295,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // twice in every call's frame (bug D: two such frames overflowed CoreAudio's
             // 512 KB thread). The address is as a value of no size has it.
             if frame.is_none() && unmentioned.contains(&local) && !layout.is_unsized() {
-                let addr = self.builder.ins().iconst(ptr(), layout.align.abi.bytes() as i64);
+                let addr = self.builder.ins().iconst(self.cg.target.pointer(), layout.align.abi.bytes() as i64);
                 self.locals.insert(local, LocalSlot { addr, borrowed: false });
                 continue;
             }
@@ -5073,7 +5332,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     layout.size.bytes() as u32,
                     layout.align.abi.bytes().trailing_zeros() as u8,
                 ));
-                let addr = self.builder.ins().stack_addr(ptr(), slot, 0);
+                let addr = self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0);
                 self.locals.insert(local, LocalSlot { addr, borrowed: false });
                 shareable.push((local, slot));
                 continue;
@@ -5081,7 +5340,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let addr = if let Some(promoted) = promoted {
                 let ty = data.ty.as_ref();
                 let plain = self.is_plain(ty);
-                match self.promoted_constant(body, promoted, &layout, plain) {
+                match self.promoted_constant(body, promoted, &layout, plain)? {
                     Some(addr) => {
                         self.constant_locals.push(local);
                         addr
@@ -5123,15 +5382,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
         // Only blocks that can run are compiled: `if cfg!(miri) { .. }` calls functions that do
         // not exist.
-        let mut reachable = blaze_hash::HashSet::default();
+        let mut reachable = blaze_hash::HashSet::new_in(Global);
         let off = self.checks_off(body);
         // rustc's RemoveNoopLandingPads: such a pad costs a call LLVM doesn't know resumes.
         let resumes_only = match frame {
-            Some(_) => HashSet::default(),
+            Some(_) => HashSet::new_in(Global),
             None => hir_ty_mir::mir::noop_landing_pads(body),
         };
         // Switches on a value known now, and the one way they go.
-        let mut decided = HashMap::default();
+        let mut decided = HashMap::new_in(Global);
         let mut worklist = Vec::with_capacity(body.basic_blocks.len());
         worklist.push(body.start_block);
         while let Some(id) = worklist.pop() {
@@ -5189,7 +5448,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.switch_to_block(self.blocks[id]);
             self.block = Some(id);
             self.in_cleanup = block.is_cleanup;
-            if block.is_cleanup {
+            if block.is_cleanup || self.calls_cold(block.terminator.as_ref().map(|it| &it.kind)) {
                 self.builder.set_cold_block(self.blocks[id]);
             }
             for statement in &block.statements {
@@ -5262,7 +5521,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         &mut self,
         block: &hir_ty_mir::mir::BasicBlock,
         discr: &Operand,
-        off: &HashSet<LocalId>,
+        off: &HashSet<LocalId, Global>,
     ) -> Option<u128> {
         if let Some(bits) = self.const_bits(discr) {
             return Some(bits);
@@ -5298,11 +5557,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// false, and what they guard is not compiled, nor asks
     /// for the bodies of what it calls (`precondition_check`, the panics), which would else
     /// use up what a compile may build in before the code that runs is reached.
-    fn checks_off(&mut self, body: &MirBody<'db>) -> HashSet<LocalId> {
+    fn checks_off(&mut self, body: &MirBody<'db>) -> HashSet<LocalId, Global> {
         let db = self.cg.db;
-        let mut assigned: HashMap<LocalId, usize> = HashMap::default();
-        let mut borrowed = HashSet::default();
-        let mut off = HashSet::default();
+        let mut assigned: HashMap<LocalId, usize, Global> = HashMap::new_in(Global);
+        let mut borrowed = HashSet::new_in(Global);
+        let mut off = HashSet::new_in(Global);
         for (_, block) in body.basic_blocks.iter() {
             for statement in &block.statements {
                 if let StatementKind::Assign(place, rvalue) = &statement.kind {
@@ -5384,7 +5643,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     layout.align.abi.bytes().trailing_zeros() as u8,
                 ));
                 self.cg.frame_locals.as_mut().expect("the frame's locals").slots[at] = Some(slot);
-                self.builder.ins().stack_addr(ptr(), slot, 0)
+                self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0)
             }
             _ => self.stack_slot(&layout),
         };
@@ -5432,8 +5691,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let mut meta = None;
         if borrowed {
-            meta = Some(self.builder.ins().load(ptr(), MEM, addr, meta_at()));
-            addr = self.builder.ins().load(ptr(), MEM, addr, 0);
+            meta = Some(self.builder.ins().load(self.cg.target.pointer(), MEM, addr, self.cg.target.meta_at()));
+            addr = self.builder.ins().load(self.cg.target.pointer(), MEM, addr, 0);
         }
         let mut ty = PlaceTy::from_ty(self.body.expect("MIR body").locals[place.local].ty.as_ref());
         ty.ty = self.normalize(ty.ty);
@@ -5457,13 +5716,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 ProjectionElem::Deref => match self.layout(prev.ty)?.backend_repr {
                     BackendRepr::Scalar(_) if pointer.take().is_some() => (),
                     BackendRepr::Scalar(_) => {
-                        addr = self.builder.ins().load(ptr(), MEM, addr, 0);
+                        addr = self.builder.ins().load(self.cg.target.pointer(), MEM, addr, 0);
                         meta = None;
                     }
                     BackendRepr::ScalarPair { .. } if !matches!(prev.ty.kind(), TyKind::Adt(def, _) if def.is_box()) =>
                     {
-                        meta = Some(self.builder.ins().load(ptr(), MEM, addr, meta_at()));
-                        addr = self.builder.ins().load(ptr(), MEM, addr, 0);
+                        meta = Some(self.builder.ins().load(self.cg.target.pointer(), MEM, addr, self.cg.target.meta_at()));
+                        addr = self.builder.ins().load(self.cg.target.pointer(), MEM, addr, 0);
                     }
                     BackendRepr::ScalarPair { .. } | BackendRepr::Memory { .. } if matches!(prev.ty.kind(), TyKind::Adt(def, _) if def.is_box()) =>
                     {
@@ -5506,7 +5765,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         Some(register) => self.builder.use_var(register.var),
                         None => {
                             let index = self.slot_addr(self.locals[*local].addr);
-                            self.builder.ins().load(ptr(), MEM, index, 0)
+                            self.builder.ins().load(self.cg.target.pointer(), MEM, index, 0)
                         }
                     };
                     addr = self.element(addr, prev.ty, index)?;
@@ -5517,7 +5776,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         let len = self.len(prev.ty, meta)?;
                         self.builder.ins().iadd_imm(len, -(*offset as i64))
                     } else {
-                        self.builder.ins().iconst(ptr(), *offset as i64)
+                        self.builder.ins().iconst(self.cg.target.pointer(), *offset as i64)
                     };
                     addr = self.element(addr, prev.ty, index)?;
                     meta = None;
@@ -5532,6 +5791,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         }
                         None => None,
                     };
+                }
+                ProjectionElem::ReflectedField(_) => {
+                    unsupported!(
+                        "{} (in {:?})",
+                        hir_ty::mir::ComptimeUnexpanded::new(
+                            hir_ty::mir::MirComptimeForm::ReflectedField,
+                            "the code generator",
+                        ),
+                        self.body.map(|it| it.owner),
+                    )
                 }
             }
         }
@@ -5552,7 +5821,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(len) = try_const_usize(self.cg.db, len) else {
                     unsupported!("array with unevaluated length");
                 };
-                Ok(self.builder.ins().iconst(ptr(), len as i64))
+                Ok(self.builder.ins().iconst(self.cg.target.pointer(), len as i64))
             }
             (TyKind::Slice(_) | TyKind::Str, Some(len)) => Ok(len),
             _ => unsupported!("length of {container:?}"),
@@ -5612,6 +5881,26 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let found = self.core_function(path);
         self.core_panics.push((name, found));
         found
+    }
+
+    /// Whether a block ending in `terminator` runs only when something has gone wrong: it
+    /// calls a [`cold_fn`], or `FromResidual::from_residual` into a `Result`, which is the
+    /// `Err` arm of `?`. `?` on an `Option` or a `ControlFlow` is not: a `None` or a `Break`
+    /// is as often the answer as the error. Cranelift lays a cold block out after the rest of
+    /// its function; LLVM is told so by a branch weight, which a profile's replaces.
+    fn calls_cold(&self, terminator: Option<&TerminatorKind>) -> bool {
+        let Some(TerminatorKind::Call { func, .. }) = terminator else { return false };
+        let OperandKind::Constant { ty, .. } = &func.kind else { return false };
+        let TyKind::FnDef(def, args) = ty.as_ref().kind() else { return false };
+        let CallableDefId::FunctionId(callee) = def.0 else { return false };
+        let db = self.cg.db;
+        let lang_items = self.interner.lang_items();
+        if Some(callee) == lang_items.TryTraitFromResidual {
+            // `<Self as FromResidual<R>>::from_residual`: `Self` is what the `?` returns.
+            let result = lang_items.ResultErr.map(|it| AdtId::EnumId(it.lookup(db).parent));
+            return matches!(args.skip_binder().type_at(0).kind(), TyKind::Adt(adt, _) if Some(adt.def_id()) == result);
+        }
+        cold_fn(db, lang_items, callee)
     }
 
     /// The function core declares at `path`, its modules then its name.
@@ -5710,9 +5999,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let data = self.cg.static_data(*id);
                 let data = self.cg.declare_data_in_func(data, self.builder.func);
                 let value = if is_thread_local(self.cg.db, *id) {
-                    self.builder.ins().tls_value(ptr(), data)
+                    self.builder.ins().tls_value(self.cg.target.pointer(), data)
                 } else {
-                    self.builder.ins().symbol_value(ptr(), data)
+                    self.builder.ins().symbol_value(self.cg.target.pointer(), data)
                 };
                 let ty = self.static_ty(*id);
                 let layout = self.layout(ty)?;
@@ -5882,7 +6171,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn blob_addr(&mut self, blob: ConstBlob) -> Result<Value> {
         let data = self.cg.define_const(blob)?;
         let data = self.cg.declare_data_in_func(data, self.builder.func);
-        Ok(self.builder.ins().symbol_value(ptr(), data))
+        Ok(self.builder.ins().symbol_value(self.cg.target.pointer(), data))
     }
 
     fn valtree_blob(&mut self, ty: Ty<'db>, valtree: ValTree<'db>) -> Result<ConstBlob> {
@@ -5936,8 +6225,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     target.align = target.align.max(item.align);
                     target.bytes.extend(item.bytes);
                 }
-                bytes[word()..2 * word()]
-                    .copy_from_slice(&(items.len() as u64).to_le_bytes()[..word()]);
+                bytes[self.cg.target.word()..2 * self.cg.target.word()]
+                    .copy_from_slice(&(items.len() as u64).to_le_bytes()[..self.cg.target.word()]);
                 target
             }
             TyKind::Dynamic(..) => unsupported!("`dyn` constant"),
@@ -6043,18 +6332,27 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mut map = Relocations {
             map: memory_map,
             in_static,
-            defined: HashMap::default(),
+            defined: HashMap::new_in(Global),
             walking: Vec::new(), // alloc: empty until a pointer is followed
+            handled: Vec::new(), // alloc: empty until a reference to nothing is found
+            numbers: HashMap::new_in(Global),
+            unions: Vec::new(), // alloc: empty until a union is walked
         };
-        self.relocate(&mut blob, 0, *ty, &mut map)?;
+        let walk = Walk { kept: None, raw: false };
+        self.relocate(&mut blob, walk, 0, *ty, &mut map)?;
+        self.relocate_by_provenance(&mut blob, None, Mutability::Not, &mut map)?;
+        self.refuse_ids_left(&blob, None, &map)?;
+        blob.in_order();
         Ok(blob)
     }
 
     /// Const eval gives pointers as keys into `map`. Emits each target as its own data object
-    /// and records a relocation for the pointer, walking `ty` to find them.
+    /// and records a relocation for the pointer, walking `ty` to find them. `walk` says where
+    /// `blob`'s bytes were in const eval and whether a type can be trusted to describe them.
     fn relocate(
         &mut self,
         blob: &mut ConstBlob,
+        walk: Walk,
         offset: usize,
         ty: Ty<'db>,
         map: &mut Relocations<'_, 'db>,
@@ -6063,111 +6361,76 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(());
         }
         let db = self.cg.db;
+        let word = self.cg.target.word();
         match ty.kind() {
-            TyKind::Pat(base, _) => self.relocate(blob, offset, base, map)?,
-            TyKind::Ref(_, pointee, mutability) => {
-                let Some(addr) = blob.usize_at(offset) else {
-                    unsupported!("constant pointer out of bounds");
-                };
-                // Const eval gives a vtable as an id into its table of types.
-                let pointee = match pointee.kind() {
-                    TyKind::Dynamic(..) => {
-                        let erased = blob
-                            .usize_at(offset + word())
-                            .and_then(|id| map.map.vtable_ty(id).ok());
-                        let Some(erased) = erased else {
-                            unsupported!("`dyn` constant without a known type");
-                        };
-                        let trait_ref = self.principal(pointee, erased);
-                        let vtable = self.vtable(erased, trait_ref)?;
-                        blob.point_to(offset + word(), vtable, 0);
-                        erased
-                    }
-                    _ => pointee,
-                };
-                if let Some((id, at)) = map.map.static_at(addr) {
-                    let target = self.cg.static_data(id);
-                    blob.point_to(offset, target, at);
-                    return Ok(());
-                }
-                let Some((start, memory)) = map.map.memory_at(addr) else { return Ok(()) };
-                let elem = match pointee.kind() {
-                    TyKind::Str => None,
-                    TyKind::Slice(elem) => Some(elem),
-                    _ => Some(pointee),
-                };
-                let empty = match pointee.kind() {
-                    TyKind::Slice(_) => blob.usize_at(offset + word()) == Some(0),
-                    _ => false,
-                };
-                // An empty slice can be at the address of an allocation that is not its own.
-                if memory.is_empty() || empty {
-                    // Nothing is behind the pointer, and rustc makes it the alignment.
-                    let align = match elem {
-                        Some(elem) => self.layout(elem)?.align.abi.bytes(),
-                        None => 1,
-                    };
-                    blob.bytes[offset..offset + word()]
-                        .copy_from_slice(&align.to_le_bytes()[..word()]);
-                    return Ok(());
-                }
-                if let Some(&target) = map.defined.get(&start) {
-                    blob.point_to(offset, target, addr - start);
-                    return Ok(());
-                }
-                let mut target = ConstBlob {
-                    // alloc: the pointee's bytes, owned by the blob `define_data` keeps
-                    bytes: memory.to_vec(),
-                    // alloc: empty until a pointer is found in it, then owned by the blob
-                    relocs: Vec::new(),
-                    // alloc: empty until a function pointer is found in it, then owned by the blob
-                    fn_relocs: Vec::new(),
-                    align: map.align_of(start),
-                    // alloc: empty until a `TypeId` is found in it, then owned by the blob
-                    type_ids: Vec::new(),
-                };
-                let at = addr - start;
-                match pointee.kind() {
-                    TyKind::Str => (),
-                    TyKind::Slice(elem) => {
-                        let Some(len) = blob.usize_at(offset + word()) else {
-                            unsupported!("constant slice length out of bounds");
-                        };
-                        let size = self.layout(elem)?.size.bytes_usize();
-                        for i in 0..len {
-                            self.relocate(&mut target, at + i * size, elem, map)?;
-                        }
-                    }
-                    _ => self.relocate(&mut target, at, pointee, map)?,
-                }
-                let writable = map.in_static && mutability == Mutability::Mut;
-                let target = self.cg.define_data(target, writable)?;
-                map.defined.insert(start, target);
-                blob.point_to(offset, target, at);
+            TyKind::Pat(base, _) => self.relocate(blob, walk, offset, base, map)?,
+            // A reference and a raw pointer are relocated alike, as rustc relocates every
+            // pointer by its provenance, metadata included.
+            TyKind::Ref(_, pointee, mutability) | TyKind::RawPtr(pointee, mutability) => {
+                self.relocate_pointer(blob, walk, offset, ty, pointee, mutability, map)?
             }
-            // Const eval gives function pointers as ids into its table of fn item types. A
-            // function cast to a raw pointer keeps that id, so a raw pointer holding one is
-            // taken to be a function. FIXME: const eval should track provenance instead.
-            TyKind::FnPtr(..) | TyKind::RawPtr(..) => {
-                let Some(id) = blob.usize_at(offset) else {
+            // Const eval gives function pointers as ids into its table of fn item types. In
+            // memory reached through a raw pointer the type may be a cast's, and only a word
+            // with provenance is a pointer.
+            TyKind::FnPtr(..) => {
+                let Some(id) = blob.usize_at(offset, word) else {
                     unsupported!("constant pointer out of bounds");
                 };
-                let fn_ty = match map.map.vtable_ty(id) {
-                    Ok(fn_ty)
-                        if matches!(fn_ty.kind(), TyKind::FnDef(..) | TyKind::Closure(..)) =>
-                    {
-                        fn_ty
-                    }
-                    _ if let TyKind::RawPtr(_, mutability) = ty.kind() => {
-                        self.relocate_data_pointer(blob, offset, id, mutability, map)?;
-                        return Ok(());
-                    }
-                    _ if id == 0 => return Ok(()),
-                    _ => unsupported!("fn pointer in a constant"),
+                let fn_ty = map.map.vtable_ty(id).ok();
+                let fn_ty =
+                    fn_ty.filter(|it| matches!(it.kind(), TyKind::FnDef(..) | TyKind::Closure(..)));
+                let fn_ty = match fn_ty {
+                    Some(fn_ty) if !walk.raw || map.provenance(walk.word(offset)) => fn_ty,
+                    _ if walk.raw || id == 0 => return Ok(()),
+                    _ => unsupported!(
+                        "a `{}` in a constant whose value is no function const eval made",
+                        self.spell(ty)
+                    ),
                 };
                 let target = self.fn_item(fn_ty)?;
-                blob.bytes[offset..offset + word()].fill(0);
+                blob.bytes[offset..offset + word].fill(0);
                 blob.fn_relocs.push((offset as u32, target));
+            }
+            // A `DynMetadata` holds a vtable as const eval's id into its table of types, as a
+            // `&dyn` does (`ptr::metadata`, reflection's `trait_info_of`). The id names the
+            // type only, so the trait is the `dyn` the `DynMetadata` is of; one of no `dyn`
+            // (`type_id_vtable`'s `DynMetadata<*const ()>`) cannot say which vtable it is.
+            TyKind::Adt(def, args)
+                if self
+                    .interner
+                    .lang_items()
+                    .DynMetadata
+                    .is_some_and(|it| def.def_id() == AdtId::StructId(it)) =>
+            {
+                // `_vtable_ptr`, its first field.
+                let at = offset + self.layout(ty)?.fields.offset(0).bytes_usize();
+                let Some(id) = blob.usize_at(at, word) else {
+                    unsupported!("constant `{ty:?}` out of bounds");
+                };
+                let dyn_ty = self.normalized(args.type_at(0), ty)?;
+                let Ok(erased) = map.map.vtable_ty(id) else {
+                    if walk.raw {
+                        return Ok(());
+                    }
+                    unsupported!(
+                        "a `{}` in a constant whose vtable const eval did not make",
+                        self.spell(ty)
+                    );
+                };
+                if !matches!(dyn_ty.kind(), TyKind::Dynamic(..)) {
+                    // FIXME(comptime): const eval's vtable ids should carry the trait (rustc's
+                    // `GlobalAlloc::VTable(ty, dyn_ty)`), for this one to be emitted too.
+                    unsupported!(
+                        "a `{}` in a constant, the vtable of `{}` for a trait the constant's \
+                         type does not name: const eval's vtable ids name the type only \
+                         (`type_id_vtable`, `trait_info_of_trait_type_id`)",
+                        self.spell(ty),
+                        self.spell(erased)
+                    );
+                }
+                let trait_ref = self.principal(dyn_ty, erased);
+                let vtable = self.vtable(erased, trait_ref)?;
+                blob.point_to(at, vtable, 0, word);
             }
             // Const eval gives a `TypeId` as an id into its table of types, which the hash rustc
             // gives the type replaces once the object is stitched.
@@ -6180,6 +6443,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             {
                 let id = blob.bytes.get(offset..offset + 16).and_then(|it| it.try_into().ok());
                 let Some(of) = id.and_then(|it| map.map.type_id_ty(u128::from_le_bytes(it))) else {
+                    if walk.raw {
+                        return Ok(());
+                    }
                     unsupported!("a `TypeId` in a constant that const eval did not make");
                 };
                 blob.type_ids.push((offset as u32, of.store()));
@@ -6188,36 +6454,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let layout = self.layout(ty)?;
                 let (variant, variant_layout): (VariantId, Cow<'_, Layout>) = match def.def_id() {
                     AdtId::StructId(id) => (id.into(), Cow::Borrowed(layout)),
-                    // Const eval does not say which bytes of a union are a pointer, so every
-                    // word that is the address of something it kept is taken to be one.
-                    AdtId::UnionId(_) => {
-                        let align = layout.align.abi.bytes_usize();
-                        let mut may_hold_fn = None;
-                        if align.is_multiple_of(word()) {
-                            for index in 0..layout.size.bytes_usize() / word() {
-                                let at = offset + index * word();
-                                let Some(id) = blob.usize_at(at) else { continue };
-                                // And every word that is the id of a function is taken to
-                                // be that function, in a union that may hold one, as the
-                                // one of a `LazyLock` does.
-                                if may_hold_fn.get_or_insert_with(|| self.holds_fn_pointer(ty, 8))
-                                    == &true
-                                    && let Ok(fn_ty) = map.map.vtable_ty(id)
-                                    && matches!(
-                                        fn_ty.kind(),
-                                        TyKind::FnDef(..) | TyKind::Closure(..)
-                                    )
-                                {
-                                    let target = self.fn_item(fn_ty)?;
-                                    blob.bytes[at..at + word()].fill(0);
-                                    blob.fn_relocs.push((at as u32, target));
-                                    continue;
-                                }
-                                self.relocate_data_pointer(blob, at, id, Mutability::Not, map)?;
-                            }
-                        }
-                        return Ok(());
-                    }
+                    AdtId::UnionId(id) => return self.relocate_union(blob, walk, offset, ty, id, map),
                     AdtId::EnumId(id) => {
                         let Some(bytes) =
                             blob.bytes.get(offset..offset + layout.size.bytes_usize())
@@ -6236,14 +6473,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     .map(|i| variant_layout.fields.offset(i).bytes_usize());
                 for ((_, field), field_offset) in db.field_types(variant).iter().zip(offsets) {
                     let field = field.ty().instantiate(self.interner, args).skip_norm_wip();
-                    self.relocate(blob, offset + field_offset, field, map)?;
+                    self.relocate(blob, walk, offset + field_offset, field, map)?;
                 }
             }
             TyKind::Tuple(tys) => {
                 let layout = self.layout(ty)?;
                 for (i, field) in tys.iter().enumerate() {
                     let field_offset = layout.fields.offset(i).bytes_usize();
-                    self.relocate(blob, offset + field_offset, field, map)?;
+                    self.relocate(blob, walk, offset + field_offset, field, map)?;
+                }
+            }
+            // A closure's captures, as a struct's fields.
+            TyKind::Closure(_, args) => {
+                let layout = self.layout(ty)?;
+                let upvars = args.as_closure().tupled_upvars_ty();
+                for (i, field) in upvars.tuple_fields().iter().enumerate() {
+                    let field_offset = layout.fields.offset(i).bytes_usize();
+                    self.relocate(blob, walk, offset + field_offset, field, map)?;
                 }
             }
             TyKind::Array(elem, len) => {
@@ -6251,14 +6497,25 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     unsupported!("array with unevaluated length");
                 };
                 let size = self.layout(elem)?.size.bytes_usize();
+                if is_number(elem) {
+                    if !walk.raw {
+                        map.number(walk.kept, offset, size * len as usize);
+                    }
+                    return Ok(());
+                }
                 for i in 0..len as usize {
-                    self.relocate(blob, offset + i * size, elem, map)?;
+                    self.relocate(blob, walk, offset + i * size, elem, map)?;
                 }
             }
             TyKind::Alias(..) => {
-                let normalized = self.normalize(ty);
-                if !matches!(normalized.kind(), TyKind::Alias(..)) {
-                    self.relocate(blob, offset, normalized, map)?;
+                let normalized = self.normalized(ty, ty)?;
+                self.relocate(blob, walk, offset, normalized, map)?;
+            }
+            // A word a type says is a number is one, whatever its value; behind a raw pointer
+            // the type may be a cast's.
+            _ if is_number(ty) => {
+                if !walk.raw {
+                    map.number(walk.kept, offset, self.layout(ty)?.size.bytes_usize());
                 }
             }
             _ => (),
@@ -6266,90 +6523,535 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
-    /// Whether a value of the type has a function pointer in it, not behind a pointer, looking
-    /// `depth` types deep.
-    fn holds_fn_pointer(&self, ty: Ty<'db>, depth: u32) -> bool {
-        if depth == 0 {
-            return false;
-        }
-        let db = self.cg.db;
-        match ty.kind() {
-            TyKind::FnPtr(..) => true,
-            TyKind::Tuple(tys) => tys.iter().any(|it| self.holds_fn_pointer(it, depth - 1)),
-            TyKind::Array(elem, _) => self.holds_fn_pointer(elem, depth - 1),
-            TyKind::Adt(def, args) => {
-                let holds = |variant: VariantId| {
-                    db.field_types(variant).iter().any(|(_, field)| {
-                        let field = field.ty().instantiate(self.interner, args).skip_norm_wip();
-                        self.holds_fn_pointer(field, depth - 1)
-                    })
-                };
-                match def.def_id() {
-                    AdtId::StructId(id) => holds(id.into()),
-                    AdtId::UnionId(id) => holds(id.into()),
-                    AdtId::EnumId(id) => {
-                        id.enum_variants(db).variants.iter().any(|it| holds(it.1.0.into()))
-                    }
-                }
-            }
-            _ => false,
-        }
-    }
-
-    /// Points the word at `offset`, which const eval left holding address `addr`, at the static
-    /// or the allocation that address is in.
-    fn relocate_data_pointer(
+    /// The union `ty` at `offset` in `blob`. Const eval does not say which of its fields it
+    /// holds: its provenance says which words are pointers, which the walk by provenance after
+    /// this one relocates. One whose fields but one are empty (`MaybeUninit<T>`'s `value`,
+    /// besides `()`) holds that one or nothing, which is walked as memory reached through a
+    /// raw pointer: a word is a pointer only with provenance, a vtable only where it has none.
+    /// A map without provenance (a literal's) holds no union.
+    fn relocate_union(
         &mut self,
         blob: &mut ConstBlob,
+        walk: Walk,
         offset: usize,
-        addr: usize,
+        ty: Ty<'db>,
+        id: hir_def::UnionId,
+        map: &mut Relocations<'_, 'db>,
+    ) -> Result<()> {
+        let TyKind::Adt(_, args) = ty.kind() else { return Ok(()) };
+        let layout = self.layout(ty)?;
+        map.unions.push((walk.kept, offset, offset + layout.size.bytes_usize(), ty));
+        let mut held = None;
+        for (i, (_, field)) in self.cg.db.field_types(id.into()).iter().enumerate() {
+            let field = field.ty().instantiate(self.interner, args).skip_norm_wip();
+            let field = self.normalized(field, ty)?;
+            if self.layout(field)?.size.bytes() == 0 {
+                continue;
+            }
+            if held.is_some() {
+                return Ok(());
+            }
+            held = Some((layout.fields.offset(i).bytes_usize(), field));
+        }
+        if let Some((at, field)) = held {
+            self.relocate(blob, Walk { raw: true, ..walk }, offset + at, field, map)?;
+        }
+        Ok(())
+    }
+
+    /// `ty` as an error spells it: by its path, cut short.
+    fn spell(&self, ty: Ty<'db>) -> String {
+        use hir_ty::display::HirDisplay as _;
+        let target = hir_ty::display::DisplayTarget::from_crate(self.cg.db, self.env.krate);
+        ty.display_truncated(self.cg.db, Some(80), target).to_string() // alloc: an error's text
+    }
+
+    /// `ty` normalized; one that stays an alias is an error naming `of`, the type it is in.
+    fn normalized(&self, ty: Ty<'db>, of: Ty<'db>) -> Result<Ty<'db>> {
+        let normalized = self.normalize(ty);
+        if matches!(normalized.kind(), TyKind::Alias(..) | TyKind::Infer(..)) {
+            unsupported!(
+                "`{}` in a constant's `{}` does not normalize",
+                self.spell(ty),
+                self.spell(of)
+            );
+        }
+        Ok(normalized)
+    }
+    /// The pointer of type `ty` to `pointee` at `offset` in `blob`, a reference or a raw
+    /// pointer: both are relocated as rustc relocates every pointer, by its provenance, the
+    /// metadata's too. A vtable in the metadata is for the `dyn` at the tail of the pointee,
+    /// normalized, as const eval's vtable ids name the type only. The memory pointed to is
+    /// walked as the pointee's type, for a raw pointer only where a value of it fits (one past
+    /// the end, or cast from another type, it need not), and then by its provenance.
+    #[allow(clippy::too_many_arguments, reason = "the walk's state, passed down as `relocate`'s")]
+    fn relocate_pointer(
+        &mut self,
+        blob: &mut ConstBlob,
+        walk: Walk,
+        offset: usize,
+        ty: Ty<'db>,
+        pointee: Ty<'db>,
         mutability: Mutability,
         map: &mut Relocations<'_, 'db>,
     ) -> Result<()> {
-        if let Some((id, at)) = map.map.static_at(addr) {
-            let target = self.cg.static_data(id);
-            blob.point_to(offset, target, at);
+        let word = self.cg.target.word();
+        let raw = matches!(ty.kind(), TyKind::RawPtr(..));
+        let Some(addr) = blob.usize_at(offset, word) else {
+            unsupported!("constant pointer out of bounds");
+        };
+        let provenance = map.provenance(walk.word(offset));
+        // Behind a raw pointer the type may be a cast's: a word without provenance is a
+        // number, its metadata too.
+        if walk.raw && !provenance {
             return Ok(());
         }
-        // Const eval keeps the whole allocation a raw pointer points into.
-        let Some((start, memory)) = map.map.memory_at(addr) else { return Ok(()) };
-        let target = match map.defined.get(&start) {
-            Some(&target) => target,
-            None => {
-                let mut target = ConstBlob {
-                    // alloc: the pointee's bytes, owned by the blob `define_data` keeps
-                    bytes: memory.to_vec(),
-                    // alloc: empty until a pointer is found in it, then owned by the blob
-                    relocs: Vec::new(),
-                    // alloc: empty until a function pointer is found in it, then owned by the blob
-                    fn_relocs: Vec::new(),
-                    align: map.align_of(start),
-                    // alloc: empty until a `TypeId` is found in it, then owned by the blob
-                    type_ids: Vec::new(),
+        let pointee = self.normalized(pointee, ty)?;
+        let tail = hir_ty::layout::struct_tail_erasing_lifetimes(self.cg.db, pointee, |it| {
+            self.normalize(it)
+        });
+        let tail = self.normalized(tail, ty)?;
+        let wide = matches!(tail.kind(), TyKind::Str | TyKind::Slice(_) | TyKind::Dynamic(..));
+        // A slice's length is a number.
+        if !walk.raw && matches!(tail.kind(), TyKind::Str | TyKind::Slice(_)) {
+            map.number(walk.kept, offset + word, word);
+        }
+        // A function cast to a thin raw pointer keeps const eval's id for it.
+        if raw
+            && !wide
+            && provenance
+            && let Ok(fn_ty) = map.map.vtable_ty(addr)
+            && matches!(fn_ty.kind(), TyKind::FnDef(..) | TyKind::Closure(..))
+        {
+            let target = self.fn_item(fn_ty)?;
+            blob.bytes[offset..offset + word].fill(0);
+            blob.fn_relocs.push((offset as u32, target));
+            return Ok(());
+        }
+        // Const eval gives a vtable as an id into its table of types.
+        let mut erased = None;
+        if let TyKind::Dynamic(..) = tail.kind() {
+            // Behind a raw pointer the type may be a cast's: a vtable has no provenance, and a
+            // word with it (a pointer, a function) is no vtable.
+            if walk.raw && map.tracks_provenance() && map.provenance(walk.word(offset + word)) {
+                return Ok(());
+            }
+            let id = blob.usize_at(offset + word, word);
+            let Some(concrete) = id.and_then(|id| map.map.vtable_ty(id).ok()) else {
+                if walk.raw {
+                    return Ok(());
+                }
+                unsupported!(
+                    "a `{}` in a constant whose vtable const eval did not make",
+                    self.spell(ty)
+                );
+            };
+            let trait_ref = self.principal(tail, concrete);
+            let vtable = self.vtable(concrete, trait_ref)?;
+            blob.point_to(offset + word, vtable, 0, word);
+            erased = Some(concrete);
+        }
+        if let Some((id, at)) = map.map.static_at(addr) {
+            let target = self.cg.static_data(id);
+            blob.point_to(offset, target, at, word);
+            return Ok(());
+        }
+        // What is walked by type: the concrete type behind a `dyn`, else the pointee.
+        let walked = match (pointee.kind(), erased) {
+            (TyKind::Dynamic(..), Some(erased)) => erased,
+            _ => pointee,
+        };
+        // A slice's or `str`'s length, or a struct's whose tail is one.
+        let len = match tail.kind() {
+            TyKind::Str | TyKind::Slice(_) => {
+                let Some(len) = blob.usize_at(offset + word, word) else {
+                    unsupported!("constant slice length out of bounds");
                 };
-                // What the allocation is of is not known here, so as in a union, every word
-                // of it that is the address of something const eval kept is taken to be one,
-                // but one of an allocation being walked: what const eval made of a constant
-                // points in no circle (a static is named, not walked), so that word is a
-                // number, and following it would not end.
-                map.walking.push(start);
-                for index in 0..target.bytes.len() / word() {
-                    let at = index * word();
-                    if let Some(inner) = target.usize_at(at)
-                        && inner != 0
-                        && map.map.memory_at(inner).is_some_and(|it| !map.walking.contains(&it.0))
-                    {
-                        self.relocate_data_pointer(&mut target, at, inner, mutability, map)?;
+                Some(len)
+            }
+            _ => None,
+        };
+        // A reference one past its memory's end is to nothing, and taken below to be that.
+        let holding = if raw { memory_holding(map.map, addr) } else { map.map.memory_at(addr) };
+        // A reference to nothing (no bytes, or an empty slice of no memory const eval kept) is
+        // its alignment, as rustc makes a reference to a zero-sized allocation.
+        let empty = match holding {
+            _ if raw => false,
+            Some((_, memory)) if memory.is_empty() => true,
+            _ if matches!(walked.kind(), TyKind::Str | TyKind::Slice(_)) => len == Some(0),
+            Some(_) => false,
+            None => self.layout(walked).is_ok_and(|it| it.is_sized() && it.size.bytes() == 0),
+        };
+        // An empty slice into memory const eval kept points into it, where it is: its address
+        // is the allocation's, as rustc's provenance keeps it (`a[1..1]`, `a[a.len()..]`).
+        if empty
+            && provenance
+            && map.tracks_provenance()
+            && let Some((start, memory)) = memory_holding(map.map, addr)
+            && !memory.is_empty()
+        {
+            let target = self.walk_allocation(start, memory, None, mutability, map)?;
+            blob.point_to(offset, target, addr - start, word);
+            return Ok(());
+        }
+        if empty {
+            let align = match walked.kind() {
+                TyKind::Str => 1,
+                TyKind::Slice(elem) => self.layout(elem)?.align.abi.bytes(),
+                _ => self.layout(walked)?.align.abi.bytes(),
+            };
+            blob.bytes[offset..offset + word].copy_from_slice(&align.to_le_bytes()[..word]);
+            map.handled.push(walk.word(offset));
+            return Ok(());
+        }
+        let Some((start, memory)) = holding else {
+            // A pointer with provenance to memory const eval did not keep would be a dangling
+            // pointer, which rustc refuses in a constant's value; without it, a number.
+            if provenance && map.tracks_provenance() {
+                unsupported!(
+                    "a `{}` in a constant (at {addr:#x}) to memory const eval did not keep: \
+                     rustc refuses a dangling pointer in a constant's value",
+                    self.spell(ty)
+                );
+            }
+            return Ok(());
+        };
+        let at = addr - start;
+        let tail = erased.filter(|_| !matches!(pointee.kind(), TyKind::Dynamic(..)));
+        let by = Reach { ty: walked, pointee, at, raw: walk.raw || raw, len, tail };
+        let target = self.walk_allocation(start, memory, Some(by), mutability, map)?;
+        blob.point_to(offset, target, at, word);
+        Ok(())
+    }
+
+    /// The data object of the allocation const eval kept at `start`, `memory`, its pointers
+    /// relocated: walked as `by` says, a type at an offset, where it is reached by a pointer
+    /// of a type, then by its provenance. One allocation is one data object however many
+    /// pointers reach it; one reached as two types that relocate it differently (a vtable a
+    /// pointer of one type says is there and one of another does not) is an error.
+    fn walk_allocation(
+        &mut self,
+        start: usize,
+        memory: &[u8],
+        by: Option<Reach<'db>>,
+        mutability: Mutability,
+        map: &mut Relocations<'_, 'db>,
+    ) -> Result<DataId> {
+        let first = map.defined.get(&start).map(|it| (it.data, it.by));
+        match first {
+            // A walk by provenance finds no more than one by type, which walks by provenance
+            // after it.
+            Some((data, _)) if by.is_none() => return Ok(data),
+            Some((data, first)) if first.is_some() && first == by => return Ok(data),
+            _ => (),
+        }
+        if map.walking.contains(&start) {
+            unsupported!(
+                "a pointer in a constant that points back into memory it is in (at {start:#x}): \
+                 const eval's memory of a constant points in no circle"
+            );
+        }
+        let mut target = ConstBlob {
+            // alloc: the pointee's bytes, owned by the blob `define_data` keeps
+            bytes: memory.to_vec(),
+            // alloc: empty until a pointer is found in it, then owned by the blob
+            relocs: Vec::new(),
+            // alloc: empty until a function pointer is found in it, then owned by the blob
+            fn_relocs: Vec::new(),
+            align: map.align_of(start),
+            // alloc: empty until a `TypeId` is found in it, then owned by the blob
+            type_ids: Vec::new(),
+        };
+        map.walking.push(start);
+        if let Some(by) = by {
+            let walk = Walk { kept: Some(start), raw: by.raw };
+            let at = by.at;
+            let fits = |size: usize| at.checked_add(size).is_some_and(|end| end <= memory.len());
+            match by.ty.kind() {
+                TyKind::Str => (),
+                TyKind::Slice(elem) => {
+                    let size = self.layout(elem)?.size.bytes_usize();
+                    let len = by.len.unwrap_or(0);
+                    if !by.raw || size.checked_mul(len).is_some_and(fits) {
+                        for i in 0..len {
+                            self.relocate(&mut target, walk, at + i * size, elem, map)?;
+                        }
                     }
                 }
-                map.walking.pop();
-                let writable = map.in_static && mutability == Mutability::Mut;
-                let target = self.cg.define_data(target, writable)?;
-                map.defined.insert(start, target);
-                target
+                _ if !by.raw => self.relocate(&mut target, walk, at, by.ty, map)?,
+                // A raw pointer's pointee need not have a layout (an extern type), and then
+                // only its provenance says what is behind it. One into memory that is an array
+                // of its pointee, as `as_ptr` makes it, reaches every element: each is walked,
+                // at the pointee's stride, as memory a raw pointer reaches.
+                _ => {
+                    let layout = self.layout(by.ty).ok().filter(|it| it.is_sized());
+                    let size = layout.map(|it| it.size.bytes_usize());
+                    match size {
+                        Some(size)
+                            if size > 0
+                                && !is_number(by.ty)
+                                && at % size == 0
+                                && memory.len() % size == 0 =>
+                        {
+                            for pos in (0..memory.len()).step_by(size) {
+                                self.relocate(&mut target, walk, pos, by.ty, map)?;
+                            }
+                        }
+                        Some(size) if fits(size) => {
+                            self.relocate(&mut target, walk, at, by.ty, map)?
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            // A struct or tuple whose tail is a slice: its elements, after the sized fields.
+            if let Some(len) = by.len
+                && !matches!(by.ty.kind(), TyKind::Str | TyKind::Slice(_))
+                && let Some((tail, elem)) = self.slice_tail(by.pointee)?
+            {
+                let size = self.layout(elem)?.size.bytes_usize();
+                let whole = size.checked_mul(len).and_then(|it| it.checked_add(tail));
+                if is_number(elem) {
+                    if !by.raw {
+                        map.number(walk.kept, at + tail, size * len);
+                    }
+                } else if !by.raw || whole.is_some_and(fits) {
+                    for i in 0..len {
+                        self.relocate(&mut target, walk, at + tail + i * size, elem, map)?;
+                    }
+                }
+            }
+            // A struct or tuple with a `dyn` tail: the tail is its concrete type, placed by
+            // the rule const eval and code identity share.
+            if let Some(erased) = by.tail {
+                let align = self.layout(erased)?.align.abi.bytes_usize();
+                let size = self.layout(erased)?.size.bytes_usize();
+                let place = hir_ty::layout::dyn_tail_place(
+                    self.cg.db,
+                    by.pointee,
+                    align,
+                    |it| self.normalized(it, by.pointee),
+                    |it| self.layout(it),
+                )?;
+                if let Some((tail, _)) = place
+                    && (!by.raw || fits(tail + size))
+                {
+                    self.relocate(&mut target, walk, at + tail, erased, map)?;
+                }
+            }
+        }
+        self.relocate_by_provenance(&mut target, Some(start), mutability, map)?;
+        self.refuse_ids_left(&target, Some(start), map)?;
+        map.walking.pop();
+        target.in_order();
+        if let Some(first) = map.defined.get(&start) {
+            if first.blob == target {
+                return Ok(first.data);
+            }
+            let name = |it: Option<Reach<'db>>| match it {
+                // alloc: error path
+                Some(it) => format!("`{}` at {}", self.spell(it.ty), it.at),
+                None => "memory of no type".to_owned(), // alloc: error path
+            };
+            let differs = Self::first_difference(&first.blob, &target);
+            unsupported!(
+                "one allocation of a constant (at {start:#x}) is reached as {} and as {}, which \
+                 relocate it differently ({differs}): one type says a word is a vtable, a \
+                 function or a `TypeId` that the other does not, and const eval's ids name no \
+                 trait to say which is right",
+                name(first.by),
+                name(by)
+            );
+        }
+        let writable = map.in_static && mutability == Mutability::Mut;
+        let kept = target.clone(); // clone: compared with a later walk of the same allocation
+        let data = self.cg.define_data(target, writable)?;
+        map.defined.insert(start, Defined { data, by, blob: kept });
+        Ok(data)
+    }
+
+    /// Where the slice at the end of `ty`'s chain of last fields (through structs and tuples)
+    /// starts in a value of it, and its element type; `None` when the tail is no slice. A
+    /// slice's alignment is its element's, which the layout of `ty` places it at.
+    fn slice_tail(&self, ty: Ty<'db>) -> Result<Option<(usize, Ty<'db>)>> {
+        let (mut at, mut offset) = (ty, 0);
+        // A type's chain of last fields is as deep as the type: fuel for a cycle a bug makes.
+        for _ in 0..256 {
+            let (index, last) = match at.kind() {
+                TyKind::Slice(elem) => return Ok(Some((offset, elem))),
+                TyKind::Adt(def, args) => {
+                    let AdtId::StructId(id) = def.def_id() else { return Ok(None) };
+                    let fields = self.cg.db.field_types(id.into());
+                    let Some((_, last)) = fields.iter().next_back() else { return Ok(None) };
+                    let last = last.ty().instantiate(self.interner, args).skip_norm_wip();
+                    (fields.iter().count() - 1, last)
+                }
+                TyKind::Tuple(tys) => match tys.iter().next_back() {
+                    Some(last) => (tys.len() - 1, last),
+                    None => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+            offset += self.layout(at)?.fields.offset(index).bytes_usize();
+            at = self.normalized(last, ty)?;
+        }
+        unsupported!("the tail of `{}` is more than 256 fields deep", self.spell(ty));
+    }
+
+    /// Where two blobs of one allocation first differ, for an error to say.
+    fn first_difference(a: &ConstBlob, b: &ConstBlob) -> String {
+        let at = |blob: &ConstBlob, offset: u32| {
+            let reloc = blob.relocs.iter().find(|it| it.0 == offset);
+            let func = blob.fn_relocs.iter().find(|it| it.0 == offset);
+            let type_id = blob.type_ids.iter().any(|it| it.0 == offset);
+            match (reloc, func, type_id) {
+                (Some(_), ..) => "a pointer",
+                (_, Some(_), _) => "a function",
+                (_, _, true) => "a `TypeId`",
+                _ => "a number",
             }
         };
-        blob.point_to(offset, target, addr - start);
+        // alloc: error path, the offsets either blob relocates
+        let mut offsets: Vec<u32> = (a.relocs.iter().map(|it| it.0))
+            .chain(b.relocs.iter().map(|it| it.0))
+            .chain(a.fn_relocs.iter().chain(&b.fn_relocs).map(|it| it.0))
+            .chain(a.type_ids.iter().chain(&b.type_ids).map(|it| it.0))
+            .collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        for offset in offsets {
+            let (x, y) = (at(a, offset), at(b, offset));
+            let same = (a.relocs.iter().find(|it| it.0 == offset))
+                == (b.relocs.iter().find(|it| it.0 == offset))
+                && x == y;
+            if !same {
+                // alloc: error path
+                return format!("the word at {offset} is {x} as the first and {y} as the second");
+            }
+        }
+        "their bytes differ".to_owned() // alloc: error path
+    }
+
+    /// Points each word of `target` that is a pointer with provenance and that no walk by
+    /// type relocated at what it points to, as rustc relocates an allocation by its
+    /// provenance whatever type reaches it: memory behind a raw pointer cast from another
+    /// type, the rest of an allocation a reference points into, a union. `kept` is where
+    /// `target` was: the memory const eval kept at that address, or the constant's value.
+    fn relocate_by_provenance(
+        &mut self,
+        target: &mut ConstBlob,
+        kept: Option<usize>,
+        mutability: Mutability,
+        map: &mut Relocations<'_, 'db>,
+    ) -> Result<()> {
+        let word = self.cg.target.word();
+        let pointers = match kept {
+            Some(start) => map.map.pointers_in(start..start + target.bytes.len()),
+            None => map.map.value_pointers(),
+        };
+        if pointers.is_empty() {
+            return Ok(());
+        }
+        // alloc: the pointers' offsets in `target`, copied out of the map while it is walked
+        let pointers: Vec<usize> = pointers.iter().map(|it| it - kept.unwrap_or(0)).collect();
+        let done = Self::relocated(target, word);
+        let walk = Walk { kept, raw: true };
+        for at in pointers {
+            if done.binary_search(&(at as u32)).is_ok() || map.handled.contains(&walk.word(at)) {
+                continue;
+            }
+            let Some(addr) = target.usize_at(at, word) else { continue };
+            if let Ok(of) = map.map.vtable_ty(addr) {
+                if !matches!(of.kind(), TyKind::FnDef(..) | TyKind::Closure(..)) {
+                    unsupported!(
+                        "the vtable of `{}` in a constant's memory (at {at} of {kept:x?}) \
+                         that no type of the constant says is a `dyn` pointer's: const eval's \
+                         vtable ids name the type only, not the trait",
+                        self.spell(of)
+                    );
+                }
+                let func = self.fn_item(of)?;
+                target.bytes[at..at + word].fill(0);
+                target.fn_relocs.push((at as u32, func));
+                continue;
+            }
+            if let Some((id, offset)) = map.map.static_at(addr) {
+                let data = self.cg.static_data(id);
+                target.point_to(at, data, offset, word);
+                continue;
+            }
+            let Some((start, memory)) = memory_holding(map.map, addr) else {
+                unsupported!(
+                    "a pointer in a constant (at {at} of {kept:x?}) to memory const eval did not \
+                     keep ({addr:#x}): rustc refuses a dangling pointer in a constant's value"
+                );
+            };
+            let data = self.walk_allocation(start, memory, None, mutability, map)?;
+            target.point_to(at, data, addr - start, word);
+        }
+        Ok(())
+    }
+
+    /// The offsets in `blob` of the words already relocated, sorted: pointers, functions and
+    /// the words of a `TypeId`, which hold const eval's id for its type.
+    fn relocated(blob: &ConstBlob, word: usize) -> Vec<u32> {
+        // alloc: the offsets already relocated, sorted, for one allocation's walk
+        let mut done: Vec<u32> = (blob.relocs.iter().map(|it| it.0))
+            .chain(blob.fn_relocs.iter().map(|it| it.0))
+            .chain(
+                (blob.type_ids.iter())
+                    .flat_map(|it| (0..16).step_by(word).map(move |at| it.0 + at as u32)),
+            )
+            .collect();
+        done.sort_unstable();
+        done
+    }
+
+    /// Refuses a word of `blob` left equal to one of const eval's ids of a function or a
+    /// vtable: a pointer no type of the constant and no provenance said was there, which would
+    /// be emitted as a number. The ids are far from any number a program plausibly holds
+    /// (`VTableMap::FIRST_ID`).
+    fn refuse_ids_left(
+        &self,
+        blob: &ConstBlob,
+        kept: Option<usize>,
+        map: &Relocations<'_, 'db>,
+    ) -> Result<()> {
+        let MemoryMap::Complex(_) = map.map else { return Ok(()) };
+        let word = self.cg.target.word();
+        let done = Self::relocated(blob, word);
+        for at in (0..blob.bytes.len().saturating_sub(word - 1)).step_by(word) {
+            if done.binary_search(&(at as u32)).is_ok() {
+                continue;
+            }
+            let Some(id) = blob.usize_at(at, word) else { continue };
+            if id < hir_ty::mir::VTableMap::FIRST_ID || map.is_number(kept, at, word) {
+                continue;
+            }
+            if let Ok(of) = map.map.vtable_ty(id) {
+                let place = match kept {
+                    Some(start) => format!("memory (at {start:#x})"), // alloc: error path
+                    None => "value".to_owned(), // alloc: error path
+                };
+                let why = match map.union_at(kept, at) {
+                    // alloc: error path
+                    Some(union) => format!(
+                        "it is in the union `{}`, whose field holding it const eval does not say",
+                        self.spell(union)
+                    ),
+                    None => "a vtable behind a pointer cast to another type (`&&dyn Tr as \
+                             *const _ as *const u8`) needs const eval's vtable ids to name the \
+                             trait"
+                        .to_owned(), // alloc: error path
+                };
+                unsupported!(
+                    "the word at {at} of a constant's {place} is const eval's id of `{}` (a \
+                     function or a vtable), which no type of the constant says is a pointer: \
+                     {why}",
+                    self.spell(of)
+                );
+            }
+        }
         Ok(())
     }
 
@@ -6406,12 +7108,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let ty = this.operand_ty(operand)?;
             let id = this.fn_item(ty)?;
             let id = this.cg.declare_func_address_in_func(id, this.builder.func);
-            Ok(this.builder.ins().func_addr(ptr(), id))
+            Ok(this.builder.ins().func_addr(this.cg.target.pointer(), id))
         };
         let (cleanup, copy) = (function(self, cleanup)?, function(self, copy)?);
         let type_desc = self.cg.static_data(*type_desc);
         let type_desc = self.cg.declare_data_in_func(type_desc, self.builder.func);
-        let type_desc = self.builder.ins().symbol_value(ptr(), type_desc);
+        let type_desc = self.builder.ins().symbol_value(self.cg.target.pointer(), type_desc);
         // 14 words: `_ThrowInfo` (4), `_CatchableTypeArray` (2) and `_CatchableType` (7).
         let info = self.cg.define_data(
             ConstBlob {
@@ -6425,14 +7127,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             true,
         )?;
         let info = self.cg.declare_data_in_func(info, self.builder.func);
-        let info = self.builder.ins().symbol_value(ptr(), info);
+        let info = self.builder.ins().symbol_value(self.cg.target.pointer(), info);
         // The image's base is what `GetModuleHandleW(NULL)` gives.
         let mut sig = self.cg.make_signature();
-        sig.params.push(AbiParam::new(ptr()));
-        sig.returns.push(AbiParam::new(ptr()));
+        sig.params.push(AbiParam::new(self.cg.target.pointer()));
+        sig.returns.push(AbiParam::new(self.cg.target.pointer()));
         let handle = self.cg.import("GetModuleHandleW", &sig)?;
         let handle = self.cg.declare_func_in_func(handle, self.builder.func);
-        let null = self.builder.ins().iconst(ptr(), 0);
+        let null = self.builder.ins().iconst(self.cg.target.pointer(), 0);
         let call = self.builder.ins().call(handle, &[null]);
         let base = self.builder.inst_results(call)[0];
         let b = &mut self.builder;
@@ -6582,7 +7284,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             wrapper.slot_size,
             4,
         ));
-        let slot = self.builder.ins().stack_addr(ptr(), slot, 0);
+        let slot = self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0);
         for (operand, offset) in block.operands.iter().zip(&wrapper.offsets) {
             if let (AsmOperand::Reg { input: Some(input), .. }, Some(offset)) = (operand, offset) {
                 let (addr, ty) = self.operand(input)?;
@@ -6592,7 +7294,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
         }
         let mut sig = self.cg.make_signature();
-        sig.params.push(AbiParam::new(ptr()));
+        sig.params.push(AbiParam::new(self.cg.target.pointer()));
         if block.taken.is_some() {
             sig.returns.push(AbiParam::new(types::I64));
         }
@@ -6652,13 +7354,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
                 let from_ty = self.operand_ty(from)?;
                 let Some(value) = self.immediate(from)? else { return Ok(None) };
-                // An `as` to a wider type extends by the sign of the narrower.
+                // An `as` to a wider type extends by the sign of the narrower; one to an
+                // arbitrary width is normalized to it.
                 let unused = 128 - self.layout(from_ty)?.size.bits() as u32;
                 let value = match from_ty.kind() {
                     TyKind::Int(_) => ((value << unused) as i128 >> unused) as u128,
                     _ => value,
                 };
-                Ok(Some(value & mask))
+                Ok(Some(NarrowInt::of(ty).map_or(value & mask, |int| int.normalize_bits(value))))
             }
             _ => Ok(None),
         }
@@ -6738,7 +7441,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // more IR than fits in memory.
         if size.bytes() > 128 {
             let config = self.cg.target_config();
-            let bytes = self.builder.ins().iconst(ptr(), size.bytes() as i64);
+            let bytes = self.builder.ins().iconst(self.cg.target.pointer(), size.bytes() as i64);
             self.builder.call_memcpy(config, dst, src, bytes);
             return;
         }
@@ -6919,7 +7622,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.operand(operand)?;
             let slot = self.slot_addr(self.locals[place.local].addr);
             self.builder.ins().store(MEM, addr, slot, 0);
-            self.builder.ins().store(MEM, meta, slot, meta_at());
+            self.builder.ins().store(MEM, meta, slot, self.cg.target.meta_at());
             return Ok(());
         }
         let (dst, dst_ty) = match register {
@@ -6959,7 +7662,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let Some(meta) = place.meta else {
                         unsupported!("fat reference to a place without metadata");
                     };
-                    self.builder.ins().store(MEM, meta, dst, meta_at());
+                    self.builder.ins().store(MEM, meta, dst, self.cg.target.meta_at());
                 }
             }
             Rvalue::Len(place) => {
@@ -6991,8 +7694,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let header = self.builder.create_block();
                     let body = self.builder.create_block();
                     let done = self.builder.create_block();
-                    self.builder.append_block_param(header, ptr());
-                    let zero = self.builder.ins().iconst(ptr(), 0);
+                    self.builder.append_block_param(header, self.cg.target.pointer());
+                    let zero = self.builder.ins().iconst(self.cg.target.pointer(), 0);
                     self.builder.ins().jump(header, &[zero.into()]);
                     self.builder.switch_to_block(header);
                     let index = self.builder.block_params(header)[0];
@@ -7027,10 +7730,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             Rvalue::UnaryOp(op, operand) => {
                 let (value, _) = self.load_scalar(operand)?;
-                let is_bool = matches!(self.operand_ty(operand)?.kind(), TyKind::Bool);
+                let ty = self.operand_ty(operand)?;
+                let is_bool = matches!(ty.kind(), TyKind::Bool);
+                let narrow = NarrowInt::of(ty);
                 let value = match op {
                     UnOp::Not if is_bool => self.builder.ins().bxor_imm(value, 1),
-                    UnOp::Not => self.builder.ins().bnot(value),
+                    UnOp::Not => match narrow {
+                        Some(int) => self.narrow_not(value, int),
+                        None => self.builder.ins().bnot(value),
+                    },
                     UnOp::Neg if f16_f128::soft(self.builder.func.dfg.value_type(value)) => {
                         self.soft_neg(value)
                     }
@@ -7045,8 +7753,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             types::I64 => zero,
                             _ => self.builder.ins().ireduce(ty, zero),
                         };
-                        // An `Assert` before it has ruled out `MIN`.
-                        self.builder.ins().isub(zero, value)
+                        // An `Assert` before it has ruled out `MIN`, or it wraps to `MIN` at
+                        // an arbitrary width as at a standard one.
+                        let value = self.builder.ins().isub(zero, value);
+                        self.normalize_if(value, narrow)
                     }
                 };
                 store(self, value);
@@ -7132,7 +7842,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ) => {
                 let callee = self.fn_item(from_ty)?;
                 let callee = self.cg.declare_func_address_in_func(callee, self.builder.func);
-                let pointer = self.builder.ins().func_addr(ptr(), callee);
+                let pointer = self.builder.ins().func_addr(self.cg.target.pointer(), callee);
                 self.builder.ins().store(MEM, pointer, dst, 0);
             }
             CastKind::PointerCoercion(
@@ -7149,6 +7859,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let (from, to) = (self.scalar(from)?, self.scalar(to)?);
                     let value = self.builder.ins().load(from.ty, MEM, src, 0);
                     let value = self.int_cast(value, from, to);
+                    let value = self.narrow_cast(value, from_ty, from, to_ty);
                     self.builder.ins().store(MEM, value, dst, 0);
                 }
                 // Fat to fat keeps the metadata, fat to thin drops it.
@@ -7162,6 +7873,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (from, to) = (self.scalar_of(from_ty)?, self.scalar_of(to_ty)?);
                 let value = self.builder.ins().load(from.ty, MEM, src, 0);
                 let value = self.float_cast(value, from, to)?;
+                // Saturated at the storage's bounds, which an arbitrary width's are inside.
+                let value = match NarrowInt::of(to_ty) {
+                    Some(int) => self.narrow_saturate(value, int),
+                    None => value,
+                };
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             // The bits of the one as the other (rustc's `CastKind::Transmute`), of one size.
@@ -7222,7 +7938,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             && signature.has_body()
             && let Some(variadic) = Variadic::of(self.cg.target, sig)?
         {
-            variadic.rest(sig);
+            variadic.rest(sig, self.cg.target.pointer());
         }
         Ok(())
     }
@@ -7413,12 +8129,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         while let TyKind::Ref(_, inner, _) = ty.kind() {
             ty = inner;
             l_ref = Some(l_addr);
-            l_addr = self.builder.ins().load(ptr(), MEM, l_addr, 0);
+            l_addr = self.builder.ins().load(self.cg.target.pointer(), MEM, l_addr, 0);
         }
         while let TyKind::Ref(_, inner, _) = r_ty.kind() {
             r_ty = inner;
             r_ref = Some(r_addr);
-            r_addr = self.builder.ins().load(ptr(), MEM, r_addr, 0);
+            r_addr = self.builder.ins().load(self.cg.target.pointer(), MEM, r_addr, 0);
         }
         // A constant pattern of a type that has no `==` of its own: rustc matches such a
         // constant field by field, never through `PartialEq`.
@@ -7434,8 +8150,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         {
             let metas = match (l_ref, r_ref) {
                 (Some(l_ref), Some(r_ref)) if self.is_unsized(ty) => Some((
-                    self.builder.ins().load(ptr(), MEM, l_ref, meta_at()),
-                    self.builder.ins().load(ptr(), MEM, r_ref, meta_at()),
+                    self.builder.ins().load(self.cg.target.pointer(), MEM, l_ref, self.cg.target.meta_at()),
+                    self.builder.ins().load(self.cg.target.pointer(), MEM, r_ref, self.cg.target.meta_at()),
                 )),
                 _ => None,
             };
@@ -7464,9 +8180,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 _ => unsupported!("{op:?} on wide pointers"),
             };
             let [l_ptr, r_ptr] =
-                [l_addr, r_addr].map(|it| self.builder.ins().load(ptr(), MEM, it, 0));
+                [l_addr, r_addr].map(|it| self.builder.ins().load(self.cg.target.pointer(), MEM, it, 0));
             let [l_meta, r_meta] =
-                [l_addr, r_addr].map(|it| self.builder.ins().load(ptr(), MEM, it, meta_at()));
+                [l_addr, r_addr].map(|it| self.builder.ins().load(self.cg.target.pointer(), MEM, it, self.cg.target.meta_at()));
             let same_ptr = self.builder.ins().icmp(IntCC::Equal, l_ptr, r_ptr);
             let by_meta = self.builder.ins().icmp(cc, l_meta, r_meta);
             let by_ptr = self.builder.ins().icmp(cc, l_ptr, r_ptr);
@@ -7511,11 +8227,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if let Some(cc) = cc {
             return Ok((self.builder.ins().icmp(cc, l, r), None));
         }
+        // An arbitrary width's result is normalized to it, and overflows when it leaves it.
+        let narrow = NarrowInt::of(ty);
         if let BinOp::Mul = op
             && self.builder.func.dfg.value_type(l) == types::I128
         {
             let (value, overflow) = self.wide_mul_overflow(l, r, signed)?;
+            if let Some(int) = narrow {
+                let flag = overflowing.then_some(overflow);
+                return Ok(self.narrow_overflowing(int, value, flag, true));
+            }
             return Ok((value, overflowing.then_some(overflow)));
+        }
+        if let (Some(int), BinOp::Shl | BinOp::Shr) = (narrow, op) {
+            let value = self.narrow_shift(l, r, r_ty, matches!(op, BinOp::Shl), int);
+            return Ok((value, None));
         }
         let ins = self.builder.ins();
         let value = match op {
@@ -7534,12 +8260,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     (BinOp::Mul, true) => ins.smul_overflow(l, r),
                     (_, _) => ins.umul_overflow(l, r),
                 };
+                if let Some(int) = narrow {
+                    let (flag, mul) = (overflowing.then_some(overflow), matches!(op, BinOp::Mul));
+                    return Ok(self.narrow_overflowing(int, value, flag, mul));
+                }
                 return Ok((value, overflowing.then_some(overflow)));
             }
-            // An `Assert` before it has ruled out a zero divisor and `MIN / -1`.
+            // An `Assert` before it has ruled out a zero divisor and `MIN / -1`, whatever the
+            // overflow checks: what is left of an arbitrary width's is of its width.
             BinOp::Div | BinOp::Rem => self.divide(l, r, matches!(op, BinOp::Div), signed)?,
-            // The amount is taken modulo the width, as rustc's `Shl` and `Shr` do.
+            // The amount is taken modulo the width, as rustc's `Shl` and `Shr` do. One of an
+            // arbitrary width is read at its own width ([`Self::unsigned_amount`]).
             BinOp::Shl | BinOp::Shr => {
+                let r = self.unsigned_amount(r, r_ty);
                 let (r, _) = self.shift_amount_word(r);
                 match (op, signed) {
                     (BinOp::Shl, _) => self.builder.ins().ishl(l, r),
@@ -7736,7 +8469,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
-    fn panic_if(&mut self, cond: Value, op: OverflowOp) -> Result<()> {
+    /// Branches to the panic of a failed check of `op` when `cond` is set: core's
+    /// `panic_const_*`, or for a check of an arbitrary width `checked`, core's `panic` with
+    /// the message naming it.
+    fn panic_if(&mut self, cond: Value, op: OverflowOp, checked: Option<NarrowInt>) -> Result<()> {
         let name = match op {
             OverflowOp::Add => "panic_const_add_overflow",
             OverflowOp::Sub => "panic_const_sub_overflow",
@@ -7755,8 +8491,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.ins().brif(cond, panic_block, &[], ok_block, &[]);
 
         self.builder.switch_to_block(panic_block);
-        let location = self.caller_location()?;
-        self.call_panic(&["panicking", "panic_const", name], &[location])?;
+        if let Some(int) = checked {
+            self.narrow_check_panic(op, int)?;
+        } else {
+            let location = self.caller_location()?;
+            self.call_panic(&["panicking", "panic_const", name], &[location])?;
+        }
         self.builder.ins().trap(TrapCode::user(1).expect("non-zero trap code"));
 
         self.builder.switch_to_block(ok_block);
@@ -7783,15 +8523,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// in the source.
     fn mentions_location(&self, owner: InferBodyId<'db>, expr: ExprId) -> bool {
         let InferBodyId::DefWithBodyId(def) = owner else { return false };
-        if self.location_macro(owner, expr).is_some()
-            || located_concats(self.cg.db, def).contains_key(&expr)
-        {
-            return true;
-        }
-        let mut found = false;
-        Body::of(self.cg.db, def)
-            .walk_child_exprs(expr, |child| found |= self.mentions_location(owner, child));
-        found
+        hir_ty_mir::mir::location::mentions_location(self.cg.db, def, expr)
     }
 
     /// The `&str` of a literal that a `concat!` with `file!()` among its arguments expanded
@@ -7833,7 +8565,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let text = self.cg.text(text);
         let text = self.cg.declare_data_in_func(text, self.builder.func);
-        Ok(Some(self.builder.ins().symbol_value(ptr(), text)))
+        Ok(Some(self.builder.ins().symbol_value(self.cg.target.pointer(), text)))
     }
 
     /// The `&str` of a literal that `file!()`, or a `concat!` with it, expanded to, in the body
@@ -7856,7 +8588,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let path = self.cg.file_path(file);
         let path = self.cg.declare_data_in_func(path, self.builder.func);
-        Ok(Some(self.builder.ins().symbol_value(ptr(), path)))
+        Ok(Some(self.builder.ins().symbol_value(self.cg.target.pointer(), path)))
     }
 
     /// Tells `overlap` which of the slots of `shareable` and of the locals kept in registers
@@ -7866,7 +8598,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         &mut self,
         body: &MirBody<'_>,
         shareable: &[(LocalId, ir::StackSlot)],
-        forwarded: &HashMap<LocalId, LocalId>,
+        forwarded: &HashMap<LocalId, LocalId, Global>,
     ) {
         let frame = self.frame;
         // A local kept in a register gets its slot later, if ever: see `local_slot`. In index
@@ -7885,8 +8617,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             Vec::with_capacity_in(count + forwarded.len(), frame);
         members.extend(shareable.iter().enumerate().map(|(at, &(local, _))| (local, at)));
         // alloc: kept in the recorder's frame locals (`overlap::FrameLocals`) past the build
-        let mut lazy: HashMap<LocalId, usize> =
-            HashMap::with_capacity_and_hasher(registers.len(), Default::default());
+        let mut lazy: HashMap<LocalId, usize, Global> =
+            HashMap::with_capacity_in(registers.len(), Global);
         lazy.extend(registers.iter().enumerate().map(|(at, &local)| (local, shareable.len() + at)));
         members.extend(registers.iter().map(|local| (*local, lazy[local])));
         for (&temp, to) in forwarded {
@@ -7969,10 +8701,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            ptr().bytes(),
+            self.cg.target.pointer().bytes(),
             3,
         ));
-        let kept = self.builder.ins().stack_addr(ptr(), slot, 0);
+        let kept = self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0);
         self.builder.ins().store(MEM, addr, kept, 0);
         let ty = body.locals[local].ty;
         self.cg.named.push(Named { binding, param: true, ty, slot, pointer: Some(0) });
@@ -8014,7 +8746,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let location = self.cg.location(Some((owner, span)));
         let location = self.cg.declare_data_in_func(location, self.builder.func);
-        Ok(self.builder.ins().symbol_value(ptr(), location))
+        Ok(self.builder.ins().symbol_value(self.cg.target.pointer(), location))
     }
 
     fn terminator(&mut self, terminator: &TerminatorKind) -> Result<()> {
@@ -8032,7 +8764,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 let register = self.register_of(discr);
                 let (addr, ty) = match register {
-                    Some(_) => (self.iconst(ptr(), 0), self.operand_ty(discr)?),
+                    Some(_) => (self.iconst(self.cg.target.pointer(), 0), self.operand_ty(discr)?),
                     None => self.operand(discr)?,
                 };
                 let scalar = self.scalar_of(ty)?;
@@ -8131,7 +8863,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.store_state(addr, ty, PANICKED);
                 }
                 let slot = self.exception_slot();
-                let exception = self.builder.ins().stack_load(ptr(), ptr(), slot, 0);
+                let exception = self.builder.ins().stack_load(self.cg.target.pointer(), self.cg.target.pointer(), slot, 0);
                 self.resume_unwinding(exception)?;
             }
             // A suspended future has been dropped: its state already says it returned.
@@ -8187,8 +8919,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         AssertKind::DivisionByZero(_) => Some(OverflowOp::DivByZero),
                         AssertKind::RemainderByZero(_) => Some(OverflowOp::RemByZero),
                     };
+                    // A check of an arbitrary width names it in the panic.
+                    let checked = match msg {
+                        AssertKind::Overflow(_, of, _)
+                        | AssertKind::OverflowNeg(of)
+                        | AssertKind::DivisionByZero(of)
+                        | AssertKind::RemainderByZero(of) => NarrowInt::of(self.operand_ty(of)?),
+                        _ => None,
+                    };
                     if let Some(op) = op {
-                        self.panic_if(failed, op)?;
+                        self.panic_if(failed, op, checked)?;
                     }
                 }
                 self.builder.ins().jump(self.blocks[*target], &[]);
@@ -8196,11 +8936,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TerminatorKind::Call { func, args, destination, target, intrinsic, .. } => {
                 self.call(func, args, destination, *target, *intrinsic)?
             }
-            // A call and a return in its place would grow the stack where `become` promises not
-            // to: refused until Cranelift's `return_call` is emitted.
-            TerminatorKind::TailCall { .. } => {
-                unsupported!("a tail call (`become`), which blaze's back ends do not make yet")
-            }
+            TerminatorKind::TailCall { func, args, .. } => self.tail_call(func, args)?,
             _ => unsupported!("terminator {terminator:?}"),
         }
         Ok(())
@@ -8220,6 +8956,224 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         done
     }
 
+    /// `become callee(args)` (`TerminatorKind::TailCall`): a `return_call` that hands the
+    /// callee this function's own return place and its own incoming argument memory, so
+    /// the callee's frame takes this one's place and a chain of them runs in constant
+    /// stack. The front end has refused every `become` rustc refuses (signatures, ABIs,
+    /// borrows of locals) and dropped the locals before it; what is left here is a
+    /// call the convention can make with nothing of this frame alive across it:
+    ///
+    /// - an indirect result is written where this function's caller asked for its own;
+    /// - an argument passed by reference (`PassMode::Indirect`) is copied first into a
+    ///   temporary and then into the memory this function was handed for the parameter at
+    ///   its place, as rustc does (`tail_call_temporaries`): the two steps let
+    ///   `become f(b, a)` swap two such parameters;
+    /// - the call is never a `try_call`: no landing pad of this frame outlives it.
+    ///
+    /// A back end that can't guarantee the tail call refuses it, naming it (`emit_with`
+    /// for Cranelift's native code and WebAssembly, LLVM where the callee's prototype is not
+    /// the caller's); none makes a plain call in its place.
+    fn tail_call(&mut self, func: &Operand, args: &[Operand]) -> Result<()> {
+        let body = self.body.expect("MIR body");
+        let db = self.cg.db;
+        if self.suspended.is_some() {
+            unsupported!("a tail call (`become`) in the `async` body {:?}", body.owner);
+        }
+        if self.tracked || self.variadic || self.abi == ExternAbi::RustCall {
+            // The front end refuses each (`check_tail_calls`), as rustc does.
+            unsupported!(
+                "a tail call (`become`) in {:?}, which is `#[track_caller]`, C-variadic or \
+                 `extern \"rust-call\"`",
+                body.owner
+            );
+        }
+        let fn_ty = self.operand_ty(func)?;
+        let mut values = self.operands(args)?;
+        let callee = match fn_ty.kind() {
+            TyKind::FnPtr(..) => {
+                let (addr, _) = self.operand(func)?;
+                let pointer = self.builder.ins().load(self.cg.target.pointer(), MEM, addr, 0);
+                let sig = fn_ty.fn_sig(self.interner);
+                if sig.c_variadic() {
+                    unsupported!("a tail call (`become`) through a C-variadic `{fn_ty:?}`");
+                }
+                self.check_abort_unwinding(sig.abi())?;
+                Callee::Pointer(pointer, sig.abi(), None)
+            }
+            TyKind::FnDef(def, generic_args) => {
+                let generic_args = generic_args.skip_binder();
+                let CallableDefId::FunctionId(func) = def.0 else {
+                    unsupported!("a tail call (`become`) of a constructor, {fn_ty:?}");
+                };
+                let signature = FunctionSignature::of(db, func);
+                let name = signature.name.as_str();
+                if let ItemContainerId::ExternBlockId(_) = func.lookup(db).container {
+                    self.check_abort_unwinding(signature.abi)?;
+                }
+                if let Some(why) = tail_call_refused(db, self.cg.target, self.interner, func) {
+                    unsupported!("{why}");
+                }
+                let callee = dispatch::callee(&self.infcx, self.env, func, generic_args)
+                    .map_err(|why| {
+                        CodegenError::Refused(no_impl_method(db, func, generic_args, why))
+                    })?;
+                match callee {
+                    dispatch::Callee::Fn(callee, callee_args) => {
+                        // rustc tail-calls the shim a pointer to it would be, and warns that
+                        // the callee is then told no caller (`tail_call_track_caller`).
+                        if track_caller(db, callee) {
+                            let def = CallableDefId::FunctionId(callee).into();
+                            let item = Ty::new_fn_def(self.interner, def, callee_args);
+                            let args = GenericArgs::new_from_slice(&[item.into()]);
+                            Callee::Instance(InstanceDef::ReifyShim { receiver: false }, args)
+                        } else {
+                            Callee::Instance(InstanceDef::Fn(callee), callee_args)
+                        }
+                    }
+                    dispatch::Callee::Poll(body, parent_args) => {
+                        Callee::Instance(instance_def(body), parent_args)
+                    }
+                    dispatch::Callee::Virtual => {
+                        if track_caller(db, func) {
+                            unsupported!(
+                                "a tail call (`become`) through a vtable of `{name}`, which is \
+                                 `#[track_caller]`"
+                            );
+                        }
+                        let Some(&(receiver, receiver_ty)) = values.first() else {
+                            unsupported!("vtable call without a receiver");
+                        };
+                        let (pointer, thin, thin_ty) =
+                            self.virtual_callee(func, generic_args.type_at(0), receiver, receiver_ty)?;
+                        values[0] = (thin, thin_ty);
+                        Callee::Pointer(pointer, ExternAbi::Rust, None)
+                    }
+                    dispatch::Callee::Derived(impl_, method) => {
+                        let derived = unexpanded_derive(db, (impl_, method), generic_args.type_at(0));
+                        unsupported!("a tail call (`become`) of {derived}");
+                    }
+                    dispatch::Callee::CloneBuiltin(_) | dispatch::Callee::FnPtr(_) => unsupported!(
+                        "a tail call (`become`) of `{name}`, whose body the compiler supplies \
+                         where it is called: it is no function to jump to"
+                    ),
+                }
+            }
+            _ => unsupported!("a tail call (`become`) of {fn_ty:?}"),
+        };
+        let abi = match callee {
+            Callee::Instance(InstanceDef::Fn(func), _) => FunctionSignature::of(db, func).abi,
+            Callee::Instance(..) => ExternAbi::Rust,
+            Callee::Pointer(_, abi, _) => abi,
+        };
+        if abi == ExternAbi::RustCall {
+            unsupported!("a tail call (`become`) of an `extern \"rust-call\"` function");
+        }
+        let returned = body.locals[returned_local(body)].ty.as_ref();
+        let FnAbi { ret: ret_mode, args: arg_modes } =
+            self.fn_abi(abi, returned, values.iter().map(|&(_, ty)| ty))?;
+        let sig = self.signature(&arg_modes, ret_mode);
+        let FnAbi { args: own_modes, .. } = self.body_abi(body, self.abi)?;
+        let indirect = |mode| matches!(mode, PassMode::Indirect);
+        if indirect(ret_mode) != indirect(self.ret_mode)
+            || sig.returns != self.builder.func.signature.returns
+        {
+            unsupported!(
+                "a tail call (`become`) whose callee returns {ret_mode:?} where {:?} returns \
+                 {:?}",
+                body.owner,
+                self.ret_mode
+            );
+        }
+        // Where this function was handed its own: the return place, and the memory of each
+        // parameter passed by reference.
+        let entry = self.builder.func.layout.entry_block().expect("the entry block");
+        let incoming = smallvec::SmallVec::<[Value; 16]>::from_slice(self.builder.block_params(entry));
+        let mut at = usize::from(matches!(self.ret_mode, PassMode::Indirect));
+        let mut own_memory = smallvec::SmallVec::<[Option<Value>; 8]>::new();
+        let mut these = Vec::new(); // alloc: a parameter's few, reused, of a tail call only
+        for &mode in &own_modes {
+            own_memory.push(matches!(mode, PassMode::Indirect).then(|| incoming[at]));
+            these.clear();
+            self.push_abi_params(mode, &mut these);
+            at += these.len();
+        }
+        // The calls before this one have returned.
+        self.free_argument_slots.append(&mut self.argument_slots);
+        let mut call_values = Vec::with_capacity(sig.params.len()); // alloc: the call's arguments
+        if let PassMode::Indirect = ret_mode {
+            call_values.push(incoming[0]);
+        }
+        // Each by-reference argument's temporary, and the place among the values of the
+        // pointer that hands it over: every argument is read before any of this function's
+        // own memory is written, which some of them may be read from.
+        let mut moved = smallvec::SmallVec::<[(usize, usize, Value); 4]>::new();
+        for (index, (&(addr, ty), &mode)) in values.iter().zip(&arg_modes).enumerate() {
+            let layout = self.layout(ty)?;
+            match mode {
+                PassMode::Indirect => {
+                    let temporary = self.argument_slot(&layout);
+                    self.copy_value(temporary, addr, &layout);
+                    moved.push((index, call_values.len(), temporary));
+                    call_values.push(temporary);
+                }
+                PassMode::OnStack { .. }
+                | PassMode::SpilledPair { spilled: [Some(_), _] | [_, Some(_)], .. } => {
+                    unsupported!(
+                        "a tail call (`become`) that passes `{ty:?}` by value on the stack, \
+                         which blaze does not make yet"
+                    );
+                }
+                PassMode::IndirectUnsized => {
+                    unsupported!("a tail call (`become`) with the unsized argument `{ty:?}`");
+                }
+                mode => self.pass(mode, addr, &layout, &mut call_values),
+            }
+        }
+        for (index, value_at, temporary) in moved {
+            let (_, ty) = values[index];
+            let Some(Some(own)) = own_memory.get(index).copied() else {
+                unsupported!(
+                    "a tail call (`become`) that passes argument {index} (`{ty:?}`) by \
+                     reference where {:?} is not handed its own parameter {index} so",
+                    body.owner
+                );
+            };
+            let layout = self.layout(ty)?;
+            let own_ty = body.locals[body.param_locals[index]].ty.as_ref();
+            let own_layout = self.layout(own_ty)?;
+            if own_layout.size < layout.size || own_layout.align.abi < layout.align.abi {
+                unsupported!(
+                    "a tail call (`become`) that passes argument {index} (`{ty:?}`) where \
+                     {:?} was handed `{own_ty:?}`, which is smaller",
+                    body.owner
+                );
+            }
+            self.copy_value(own, temporary, &layout);
+            call_values[value_at] = own;
+        }
+        match callee {
+            Callee::Instance(def, generic_args) => {
+                let own = &self.builder.func.signature;
+                if sig.params != own.params || sig.returns != own.returns {
+                    unsupported!(
+                        "a tail call (`become`) of {def:?} from {:?}, whose signatures differ \
+                         in this target's convention ({sig} and {own}): a guaranteed tail \
+                         call needs the caller's",
+                        body.owner
+                    );
+                }
+                let callee = self.cg.callee(def, generic_args, self.env, &sig)?;
+                let callee = self.cg.declare_func_in_func(callee, self.builder.func);
+                self.builder.ins().return_call(callee, &call_values);
+            }
+            Callee::Pointer(pointer, ..) => {
+                let sig = self.builder.import_signature(sig);
+                self.builder.ins().return_call_indirect(sig, pointer, &call_values);
+            }
+        }
+        Ok(())
+    }
+
     fn call_with(
         &mut self,
         func: &Operand,
@@ -8232,7 +9186,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let fn_ty = self.operand_ty(func)?;
         if let TyKind::FnPtr(..) = fn_ty.kind() {
             let (addr, _) = self.operand(func)?;
-            let pointer = self.builder.ins().load(ptr(), MEM, addr, 0);
+            let pointer = self.builder.ins().load(self.cg.target.pointer(), MEM, addr, 0);
             let values = self.operands(args)?;
             let sig = fn_ty.fn_sig(self.interner);
             self.check_abort_unwinding(sig.abi())?;
@@ -8246,6 +9200,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let generic_args = generic_args.skip_binder();
         let func = match def.0 {
             CallableDefId::FunctionId(func) => func,
+            // A direct call is a literal, which the MIR pass packs; this is the constructor as a
+            // function value, called through `Fn*`.
+            CallableDefId::StructId(id) if hir_ty::layout::is_bits_struct(self.cg.db, id) => {
+                let name = hir_def::signatures::StructSignature::of(self.cg.db, id).name.as_str();
+                refused!(
+                    "the constructor of `#[blaze::bits]` struct `{name}` used as a function \
+                     value: no stencil packs its fields from a call; call it in a closure, \
+                     `|..| {name}(..)`"
+                );
+            }
             CallableDefId::StructId(id) => {
                 if let Some(layout) = self.variant_layout(dst, id.into(), generic_args)? {
                     self.write_fields(dst, &layout, args)?;
@@ -8279,9 +9243,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             };
             let ty = generic_args.type_at(0);
             let (src, _) = self.operand(pointer)?;
-            let addr = self.builder.ins().load(ptr(), MEM, src, 0);
+            let addr = self.builder.ins().load(self.cg.target.pointer(), MEM, src, 0);
             let meta =
-                self.is_unsized(ty).then(|| self.builder.ins().load(ptr(), MEM, src, meta_at()));
+                self.is_unsized(ty).then(|| self.builder.ins().load(self.cg.target.pointer(), MEM, src, self.cg.target.meta_at()));
             self.drop_value(addr, meta, ty)?;
             return self.finish_call(destination, target);
         }
@@ -8346,7 +9310,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
             }
         }
-        if let Some(name) = link_name(self.cg.db, func)
+        if let Some(name) = link_name_for(self.cg.db, self.cg.target, func)
             && let Some(name) = name.strip_prefix("llvm.")
         {
             self.llvm_intrinsic(name, args, dst, dst_ty.ty)?;
@@ -8389,7 +9353,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.operand(operand)?;
         let pair = self.scratch_pair();
         self.builder.ins().store(MEM, addr, pair, 0);
-        self.builder.ins().store(MEM, meta, pair, meta_at());
+        self.builder.ins().store(MEM, meta, pair, self.cg.target.meta_at());
         Ok((pair, ty))
     }
 
@@ -8471,7 +9435,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(slot) = self.vtable_layout(trait_ref).method(method) else {
                     unsupported!("method missing from the vtable of {dyn_ty:?}");
                 };
-                let pointer = self.builder.ins().load(ptr(), MEM, vtable, slot as i32 * meta_at());
+                let pointer = self.builder.ins().load(self.cg.target.pointer(), MEM, vtable, slot as i32 * self.cg.target.meta_at());
                 let thin = self.scratch();
                 self.builder.ins().store(MEM, place.addr, thin, 0);
                 let thin_ty = Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner));
@@ -8514,7 +9478,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
                 return self.call_virtual(method, inner, addr, ty, &values, dst, dst_ty);
             }
-            addr = self.builder.ins().load(ptr(), MEM, addr, 0);
+            addr = self.builder.ins().load(self.cg.target.pointer(), MEM, addr, 0);
             ty = inner;
         }
         match ty.kind() {
@@ -8549,7 +9513,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.call_direct(func, generic_args.skip_binder(), &values, dst, dst_ty)
             }
             TyKind::FnPtr(..) => {
-                let pointer = self.builder.ins().load(ptr(), MEM, addr, 0);
+                let pointer = self.builder.ins().load(self.cg.target.pointer(), MEM, addr, 0);
                 let abi = ty.fn_sig(self.interner).abi();
                 self.emit_call(Callee::Pointer(pointer, abi, None), &values, dst, dst_ty)
             }
@@ -8687,6 +9651,42 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         })
     }
 
+    /// The method `func` of the vtable of the `dyn_ty` the receiver at `receiver` points
+    /// to, and where the data pointer alone is, of type `*const ()`, which it is called with.
+    fn virtual_callee(
+        &mut self,
+        func: FunctionId,
+        dyn_ty: Ty<'db>,
+        receiver: Value,
+        receiver_ty: Ty<'db>,
+    ) -> Result<(Value, Value, Ty<'db>)> {
+        let receiver_layout = self.layout(receiver_ty)?;
+        // A `dyn Trait` taken by value is where the pair of its data pointer and vtable is
+        // (`argument`), as a fat pointer to it would be; rustc hands the method the data
+        // pointer as well.
+        let by_value = matches!(receiver_ty.kind(), TyKind::Dynamic(..));
+        if !by_value
+            && (!matches!(receiver_layout.backend_repr, BackendRepr::ScalarPair { .. })
+                || receiver_layout.size.bytes_usize() != 2 * self.cg.target.word())
+        {
+            unsupported!("vtable call with receiver {receiver_ty:?}");
+        }
+        let Some(trait_ref) = self.principal(dyn_ty, dyn_ty) else {
+            unsupported!("vtable call on {dyn_ty:?}");
+        };
+        let Some(slot) = self.vtable_layout(trait_ref).method(func) else {
+            unsupported!("method missing from the vtable of {dyn_ty:?}");
+        };
+        let data = self.builder.ins().load(self.cg.target.pointer(), MEM, receiver, 0);
+        let vtable = self.builder.ins().load(self.cg.target.pointer(), MEM, receiver, self.cg.target.meta_at());
+        let pointer = self.builder.ins().load(self.cg.target.pointer(), MEM, vtable, slot as i32 * self.cg.target.meta_at());
+        // The method takes the data pointer alone where the caller holds a fat pointer.
+        let thin = self.scratch();
+        self.builder.ins().store(MEM, data, thin, 0);
+        let thin_ty = Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner));
+        Ok((pointer, thin, thin_ty))
+    }
+
     /// Calls trait method `func` on the trait object behind the fat pointer at `receiver`.
     #[allow(clippy::too_many_arguments)]
     fn call_virtual(
@@ -8699,30 +9699,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         dst: Value,
         dst_ty: Ty<'db>,
     ) -> Result<()> {
-        let receiver_layout = self.layout(receiver_ty)?;
-        // A `dyn Trait` taken by value is where the pair of its data pointer and vtable is
-        // (`argument`), as a fat pointer to it would be; rustc hands the method the data
-        // pointer as well.
-        let by_value = matches!(receiver_ty.kind(), TyKind::Dynamic(..));
-        if !by_value
-            && (!matches!(receiver_layout.backend_repr, BackendRepr::ScalarPair { .. })
-                || receiver_layout.size.bytes_usize() != 2 * word())
-        {
-            unsupported!("vtable call with receiver {receiver_ty:?}");
-        }
-        let Some(trait_ref) = self.principal(dyn_ty, dyn_ty) else {
-            unsupported!("vtable call on {dyn_ty:?}");
-        };
-        let Some(slot) = self.vtable_layout(trait_ref).method(func) else {
-            unsupported!("method missing from the vtable of {dyn_ty:?}");
-        };
-        let data = self.builder.ins().load(ptr(), MEM, receiver, 0);
-        let vtable = self.builder.ins().load(ptr(), MEM, receiver, meta_at());
-        let pointer = self.builder.ins().load(ptr(), MEM, vtable, slot as i32 * meta_at());
-        // The method takes the data pointer alone where the caller holds a fat pointer.
-        let thin = self.scratch();
-        self.builder.ins().store(MEM, data, thin, 0);
-        let thin_ty = Ty::new_imm_ptr(self.interner, Ty::new_unit(self.interner));
+        let (pointer, thin, thin_ty) = self.virtual_callee(func, dyn_ty, receiver, receiver_ty)?;
         let mut values = smallvec::SmallVec::<[(Value, Ty<'db>); 8]>::new();
         values.push((thin, thin_ty));
         values.extend_from_slice(rest);
@@ -8787,12 +9764,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 TyKind::RawPtr(from_pointee, _) | TyKind::Ref(_, from_pointee, _),
                 TyKind::RawPtr(to_pointee, _) | TyKind::Ref(_, to_pointee, _),
             ) => {
-                let old = (from.size.bytes() == 2 * word() as u64)
-                    .then(|| self.builder.ins().load(ptr(), MEM, src, meta_at()));
+                let old = (from.size.bytes() == 2 * self.cg.target.word() as u64)
+                    .then(|| self.builder.ins().load(self.cg.target.pointer(), MEM, src, self.cg.target.meta_at()));
                 let meta = self.unsize_metadata(from_pointee, to_pointee, old)?;
-                let ptr = self.builder.ins().load(ptr(), MEM, src, 0);
+                let ptr = self.builder.ins().load(self.cg.target.pointer(), MEM, src, 0);
                 self.builder.ins().store(MEM, ptr, dst, 0);
-                self.builder.ins().store(MEM, meta, dst, meta_at());
+                self.builder.ins().store(MEM, meta, dst, self.cg.target.meta_at());
             }
             // `NonNull` holds its pointer as a pattern type.
             (TyKind::Pat(from_ty, _), TyKind::Pat(to_ty, _)) => {
@@ -8834,7 +9811,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(len) = try_const_usize(self.cg.db, len) else {
                     unsupported!("array with unevaluated length");
                 };
-                Ok(self.builder.ins().iconst(ptr(), len as i64))
+                Ok(self.builder.ins().iconst(self.cg.target.pointer(), len as i64))
             }
             (TyKind::Dynamic(..), TyKind::Dynamic(..)) => {
                 let Some(vtable) = old else {
@@ -8853,7 +9830,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 match self.vtable_layout(trait_ref).upcast(target) {
                     Some(Upcast::Same) => Ok(vtable),
                     Some(Upcast::Load(slot)) => {
-                        Ok(self.builder.ins().load(ptr(), MEM, vtable, slot as i32 * meta_at()))
+                        Ok(self.builder.ins().load(self.cg.target.pointer(), MEM, vtable, slot as i32 * self.cg.target.meta_at()))
                     }
                     None => unsupported!("upcast of {from:?} to {to:?}"),
                 }
@@ -8865,7 +9842,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let trait_ref = self.principal(to, from);
                 let vtable = self.vtable(from, trait_ref)?;
                 let vtable = self.cg.declare_data_in_func(vtable, self.builder.func);
-                Ok(self.builder.ins().symbol_value(ptr(), vtable))
+                Ok(self.builder.ins().symbol_value(self.cg.target.pointer(), vtable))
             }
             (TyKind::Adt(def, args), TyKind::Adt(to_def, to_args))
                 if def.def_id() == to_def.def_id() =>
@@ -8890,8 +9867,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// The vtable of `ty` for `trait_ref`, or with the header alone when the trait object has
-    /// no principal trait.
+    /// no principal trait. Keyed with free regions erased, error regions too (inference's
+    /// writeback makes every region variable one, `hir-ty/src/infer/unify.rs`
+    /// `Resolver::fold_region`), and binders anonymized, as no lifetime changes a vtable:
+    /// `&'{region error} T` and `&'static T` are one vtable, as are `fn(&T)` and
+    /// `for<'a> fn(&'a T)`, and one type in the dyn facts.
     fn vtable(&mut self, ty: Ty<'db>, trait_ref: Option<TraitRef<'db>>) -> Result<DataId> {
+        let ty = hir_ty_identity::instance::erased(self.interner, ty);
+        let trait_ref = trait_ref.map(|it| hir_ty_identity::instance::erased(self.interner, it));
         let key = (ty.store(), trait_ref.map(|it| (it.def_id.0, it.args.store())));
         if let Some(id) = self.cg.vtable(&key) {
             return Ok(id);
@@ -8899,28 +9882,28 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let layout = self.layout(ty)?;
         let slots = trait_ref.map_or_else(Vec::new, |it| self.vtable_layout(it).slots);
         // alloc: once per vtable (the key is looked up above), the vtable's bytes
-        let mut bytes = vec![0u8; (vtable::HEADER + slots.len()) * word()];
-        bytes[word()..2 * word()].copy_from_slice(&layout.size.bytes().to_le_bytes()[..word()]);
-        bytes[2 * word()..3 * word()]
-            .copy_from_slice(&layout.align.abi.bytes().to_le_bytes()[..word()]);
+        let mut bytes = vec![0u8; (vtable::HEADER + slots.len()) * self.cg.target.word()];
+        bytes[self.cg.target.word()..2 * self.cg.target.word()].copy_from_slice(&layout.size.bytes().to_le_bytes()[..self.cg.target.word()]);
+        bytes[2 * self.cg.target.word()..3 * self.cg.target.word()]
+            .copy_from_slice(&layout.align.abi.bytes().to_le_bytes()[..self.cg.target.word()]);
         let mut blob = ConstBlob {
             bytes,
             // alloc: once per vtable, the pointers to its supertraits' vtables
             relocs: Vec::new(),
             // alloc: once per vtable, its drop glue and methods
             fn_relocs: Vec::new(),
-            align: word() as u64,
+            align: self.cg.target.word() as u64,
             type_ids: Vec::new(), // alloc: empty, allocates nothing
         };
         if self.glue_of(ty) != DropGlue::None {
             let mut sig = self.cg.make_signature();
-            sig.params.push(AbiParam::new(ptr()));
+            sig.params.push(AbiParam::new(self.cg.target.pointer()));
             let args = GenericArgs::new_from_slice(&[ty.into()]);
             let glue = self.cg.callee(InstanceDef::DropGlue, args, self.env, &sig)?;
             blob.fn_relocs.push((0, glue));
         }
         for (index, slot) in slots.into_iter().enumerate() {
-            let offset = ((vtable::HEADER + index) * word()) as u32;
+            let offset = ((vtable::HEADER + index) * self.cg.target.word()) as u32;
             match slot {
                 // A slot nothing can call through is left empty, as rustc leaves it.
                 Slot::Method(func, trait_ref) if self.method_bounds_hold(func, trait_ref) => {
@@ -9044,9 +10027,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             if !matches!(mode, PassMode::Indirect) || track_caller(db, callee) {
                 let mut sig = self.body_signature(body)?;
                 if track_caller(db, func) {
-                    sig.params.push(AbiParam::new(ptr()));
+                    sig.params.push(AbiParam::new(self.cg.target.pointer()));
                 }
-                let sig = Self::by_pointer(&sig, mode);
+                let sig = Self::by_pointer(&sig, mode, self.cg.target.pointer());
                 return self.cg.callee(
                     InstanceDef::VtableShim(callee),
                     callee_args,
@@ -9063,7 +10046,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let mut sig = self.body_signature(body)?;
         if track_caller(db, callee) {
-            sig.params.push(AbiParam::new(ptr()));
+            sig.params.push(AbiParam::new(self.cg.target.pointer()));
         }
         self.cg.callee(InstanceDef::Fn(callee), callee_args, self.env, &sig)
     }
@@ -9097,7 +10080,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             if matches!(mode, PassMode::Indirect) {
                 return self.cg.callee(closure, parent_args, self.env, &sig);
             }
-            let sig = Self::by_pointer(&sig, mode);
+            let sig = Self::by_pointer(&sig, mode, self.cg.target.pointer());
             let args = GenericArgs::new_from_slice(&[ty.into()]);
             return self.cg.callee(InstanceDef::CallOnceShim, args, self.env, &sig);
         }
@@ -9200,7 +10183,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     {
                         let location = self.cg.declaration(callee);
                         let location = self.cg.declare_data_in_func(location, self.builder.func);
-                        self.location = Some(self.builder.ins().symbol_value(ptr(), location));
+                        self.location = Some(self.builder.ins().symbol_value(self.cg.target.pointer(), location));
                     }
                     self.call_direct(func, generic_args, &values, dst, dst_ty)?;
                 }
@@ -9226,7 +10209,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             },
             _ => {
                 let receiver = receiver.expect("a fn pointer is only reified for a vtable");
-                let pointer = self.builder.ins().load(ptr(), MEM, receiver, 0);
+                let pointer = self.builder.ins().load(self.cg.target.pointer(), MEM, receiver, 0);
                 self.emit_call(Callee::Pointer(pointer, fn_sig.abi(), None), &values, dst, dst_ty)?;
             }
         }
@@ -9243,7 +10226,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// as rustc writes it.
     fn start_shim(&mut self, main: FunctionId) -> Result<()> {
         let Some(start) = self.interner.lang_items().Start else {
-            unsupported!("no `lang_start`");
+            let krate = crate::fncache::crate_name(self.cg.db, main.krate(self.cg.db));
+            unsupported!(
+                "the C `main` of crate `{krate}`: no `start` lang item (std's `lang_start`) in \
+                 the crates `{krate}` loads, which its `main` is handed to"
+            );
         };
         let fn_ty = |func: FunctionId, args| {
             Ty::new_fn_def(self.interner, CallableDefId::FunctionId(func).into(), args)
@@ -9255,11 +10242,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let returned = self.normalize(sig_of(main_ty).output());
         let start_args = GenericArgs::new_from_slice(&[returned.into()]);
         let start_sig = sig_of(fn_ty(start, start_args));
-        let (_, with_arguments) = Target::current().entry();
+        let (_, with_arguments) = self.cg.target.entry();
         let mut sig = Signature::new(self.cg.isa.default_call_conv());
         if with_arguments {
             // alloc: once per program, the signature of its `main`
-            sig.params = vec![AbiParam::new(types::I32), AbiParam::new(ptr())];
+            sig.params = vec![AbiParam::new(types::I32), AbiParam::new(self.cg.target.pointer())];
         }
         // alloc: once per program, the signature of its `main`
         sig.returns = vec![AbiParam::new(types::I32)];
@@ -9269,14 +10256,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.switch_to_block(entry);
         let (argc, argv) = match *self.builder.block_params(entry) {
             [argc, argv] => (argc, argv),
-            [] => (self.builder.ins().iconst(types::I32, 0), self.builder.ins().iconst(ptr(), 0)),
+            [] => (self.builder.ins().iconst(types::I32, 0), self.builder.ins().iconst(self.cg.target.pointer(), 0)),
             _ => unsupported!("`main` is called with a count and the arguments"),
         };
         // `argc` is an `isize` for `lang_start`.
-        let argc = if ptr() == types::I32 { argc } else { self.builder.ins().sextend(ptr(), argc) };
+        let argc = if self.cg.target.pointer() == types::I32 { argc } else { self.builder.ins().sextend(self.cg.target.pointer(), argc) };
         let callee = self.fn_item(main_ty)?;
         let callee = self.cg.declare_func_address_in_func(callee, self.builder.func);
-        let pointer = self.builder.ins().func_addr(ptr(), callee);
+        let pointer = self.builder.ins().func_addr(self.cg.target.pointer(), callee);
         // What `SIGPIPE` does is left as the runtime has it.
         let sigpipe = self.builder.ins().iconst(types::I8, 0);
         let &[main_param, argc_ty, argv_ty, sigpipe_ty] = start_sig.inputs().as_slice() else {
@@ -9296,9 +10283,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let layout = self.layout(code_ty)?;
         let code = self.stack_slot(&layout);
         self.call_direct(start, start_args, &values, code, code_ty)?;
-        let code = self.builder.ins().load(ptr(), MEM, code, 0);
+        let code = self.builder.ins().load(self.cg.target.pointer(), MEM, code, 0);
         let code =
-            if ptr() == types::I32 { code } else { self.builder.ins().ireduce(types::I32, code) };
+            if self.cg.target.pointer() == types::I32 { code } else { self.builder.ins().ireduce(types::I32, code) };
         self.builder.ins().return_(&[code]);
         Ok(())
     }
@@ -9355,7 +10342,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.switch_to_block(entry);
         // alloc: once per shim, the values it passes on, which `pass` adds to as a `Vec`
         let params = self.builder.block_params(entry).to_vec();
-        let receiver = self.builder.ins().iconst(ptr(), 1);
+        let receiver = self.builder.ins().iconst(self.cg.target.pointer(), 1);
         let values = if forwarded {
             let mut values = params;
             values.insert(sret as usize, receiver);
@@ -9417,7 +10404,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let declared = declared_method(self.cg.db, func);
         let handed = track_caller(self.cg.db, declared);
         if handed {
-            sig.params.push(AbiParam::new(ptr()));
+            sig.params.push(AbiParam::new(self.cg.target.pointer()));
         }
         let placed = (!handed && track_caller(self.cg.db, func)).then_some(declared);
         self.call_by_pointer(func, args, &sig, mode, &layout, placed)
@@ -9499,7 +10486,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // `call` and `call_mut` borrow the object, which is what the data pointer is.
         // `call_once` takes it by value, and the data pointer is where it is.
         let receiver = match Some(method) == self.interner.lang_items().FnOnce_call_once {
-            true => self.builder.ins().load(ptr(), MEM, data, 0),
+            true => self.builder.ins().load(self.cg.target.pointer(), MEM, data, 0),
             false => data,
         };
         let values = [(receiver, receiver_ty), (tuple, tuple_ty)];
@@ -9524,7 +10511,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         layout: &Layout,
         placed: Option<FunctionId>,
     ) -> Result<()> {
-        self.builder.func.signature = Self::by_pointer(sig, mode);
+        self.builder.func.signature = Self::by_pointer(sig, mode, self.cg.target.pointer());
         let entry = self.builder.create_block();
         self.builder.append_block_params_for_function_params(entry);
         self.builder.switch_to_block(entry);
@@ -9539,7 +10526,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             Some(_) => {
                 // clone: a `#[track_caller]` method's shim only, whose callee takes the place too
                 let mut with = sig.clone();
-                with.params.push(AbiParam::new(ptr()));
+                with.params.push(AbiParam::new(self.cg.target.pointer()));
                 with_place = with;
                 &with_place
             }
@@ -9555,7 +10542,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if let Some(declared) = placed {
             let location = self.cg.declaration(declared);
             let location = self.cg.declare_data_in_func(location, self.builder.func);
-            params.push(self.builder.ins().symbol_value(ptr(), location));
+            params.push(self.builder.ins().symbol_value(self.cg.target.pointer(), location));
         }
         let results = self.invoke(callee, &params);
         self.builder.ins().return_(&results);
@@ -9581,7 +10568,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let sret = sig.params.first().is_some_and(|it| it.purpose == ArgumentPurpose::StructReturn);
         let count = sig.params.len();
         let callee_sig = if by_value {
-            self.builder.func.signature = Self::by_pointer(&sig, mode);
+            self.builder.func.signature = Self::by_pointer(&sig, mode, self.cg.target.pointer());
             Some(sig)
         } else {
             self.builder.func.signature = sig;
@@ -9617,7 +10604,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// `sig` with the receiver, which is passed as `mode` says, behind a pointer instead.
-    fn by_pointer(sig: &Signature, mode: PassMode) -> Signature {
+    fn by_pointer(sig: &Signature, mode: PassMode, pointer: Type) -> Signature {
         let sret = sig.params.first().is_some_and(|it| it.purpose == ArgumentPurpose::StructReturn);
         let count = match mode {
             PassMode::Ignore => 0,
@@ -9632,7 +10619,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             _ => 1,
         };
         let mut sig = sig.clone(); // clone: the shim's own signature, built from the body's
-        sig.params.splice(sret as usize..sret as usize + count, [AbiParam::new(ptr())]);
+        sig.params.splice(sret as usize..sret as usize + count, [AbiParam::new(pointer)]);
         sig
     }
 
@@ -9646,46 +10633,42 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         dst_ty: Ty<'db>,
     ) -> Result<()> {
         let db = self.cg.db;
-        if Some(func) == self.interner.lang_items().FuturePoll
-            && let Some(callee) = self.coroutine_callee(self.normalize(generic_args.type_at(0)))
-        {
-            return self.emit_call(callee, args, dst, dst_ty);
-        }
-        if is_dyn_method(self.interner, self.env.param_env, func, generic_args).is_some() {
-            let Some((&(receiver, receiver_ty), rest)) = args.split_first() else {
-                unsupported!("vtable call without a receiver");
-            };
-            let dyn_ty = generic_args.type_at(0);
-            return self.call_virtual(func, dyn_ty, receiver, receiver_ty, rest, dst, dst_ty);
-        }
-        let (callee, callee_args) =
-            impl_method(db, self.env, func, generic_args).map_err(CodegenError::Refused)?;
-        let callee = match callee {
-            either::Either::Left(callee) => callee,
-            either::Either::Right(derived) => {
-                let derived = unexpanded_derive(db, derived, generic_args.type_at(0));
+        let callee = dispatch::callee(&self.infcx, self.env, func, generic_args)
+            .map_err(|why| CodegenError::Refused(no_impl_method(db, func, generic_args, why)))?;
+        let (callee, callee_args) = match callee {
+            dispatch::Callee::Poll(body, parent_args) => {
+                let callee = Callee::Instance(instance_def(body), parent_args);
+                return self.emit_call(callee, args, dst, dst_ty);
+            }
+            dispatch::Callee::Virtual => {
+                let Some((&(receiver, receiver_ty), rest)) = args.split_first() else {
+                    unsupported!("vtable call without a receiver");
+                };
+                let dyn_ty = generic_args.type_at(0);
+                return self.call_virtual(func, dyn_ty, receiver, receiver_ty, rest, dst, dst_ty);
+            }
+            dispatch::Callee::Derived(impl_, method) => {
+                let derived = unexpanded_derive(db, (impl_, method), generic_args.type_at(0));
                 unsupported!("call to {derived}");
             }
+            dispatch::Callee::CloneBuiltin(callee_args) => {
+                if let &[(receiver, _)] = args {
+                    let src = self.builder.ins().load(self.cg.target.pointer(), MEM, receiver, 0);
+                    return self.clone_builtin(func, src, dst, dst_ty);
+                }
+                (func, callee_args)
+            }
+            // `FnPtr::addr` is the compiler's to supply as well: a function pointer is its address.
+            dispatch::Callee::FnPtr(callee_args) => {
+                if let &[(receiver, _)] = args {
+                    let addr = self.builder.ins().load(self.cg.target.pointer(), MEM, receiver, 0);
+                    self.builder.ins().store(MEM, addr, dst, 0);
+                    return Ok(());
+                }
+                (func, callee_args)
+            }
+            dispatch::Callee::Fn(callee, callee_args) => (callee, callee_args),
         };
-        if callee == func
-            && let ItemContainerId::TraitId(trait_) = func.lookup(db).container
-            && Some(trait_) == self.interner.lang_items().Clone
-            && FunctionSignature::of(db, func).name.as_str() == "clone"
-            && let &[(receiver, _)] = args
-        {
-            let src = self.builder.ins().load(ptr(), MEM, receiver, 0);
-            return self.clone_builtin(func, src, dst, dst_ty);
-        }
-        // `FnPtr::addr` is the compiler's to supply as well: a function pointer is its address.
-        if callee == func
-            && let ItemContainerId::TraitId(trait_) = func.lookup(db).container
-            && Some(trait_) == self.interner.lang_items().FnPtrTrait
-            && let &[(receiver, _)] = args
-        {
-            let addr = self.builder.ins().load(ptr(), MEM, receiver, 0);
-            self.builder.ins().store(MEM, addr, dst, 0);
-            return Ok(());
-        }
         self.emit_call(Callee::Instance(InstanceDef::Fn(callee), callee_args), args, dst, dst_ty)
     }
 
@@ -9743,12 +10726,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             TyKind::Array(element, _) => {
                 let size = self.layout(element)?.size.bytes() as i64;
-                let len = self.builder.ins().iconst(ptr(), layout.fields.count() as i64);
+                let len = self.builder.ins().iconst(self.cg.target.pointer(), layout.fields.count() as i64);
                 let header = self.builder.create_block();
                 let body = self.builder.create_block();
                 let done = self.builder.create_block();
-                self.builder.append_block_param(header, ptr());
-                let zero = self.builder.ins().iconst(ptr(), 0);
+                self.builder.append_block_param(header, self.cg.target.pointer());
+                let zero = self.builder.ins().iconst(self.cg.target.pointer(), 0);
                 self.builder.ins().jump(header, &[zero.into()]);
                 self.builder.switch_to_block(header);
                 let index = self.builder.block_params(header)[0];
@@ -9785,22 +10768,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         args: GenericArgs<'db>,
         sig: &Signature,
     ) -> Option<ir::FuncRef> {
-        /// `BLAZE_INLINE=0` calls every function.
-        static ENABLED: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("BLAZE_INLINE").is_none_or(|it| it != "0"));
         let db = self.cg.db;
-        if !*ENABLED {
-            return None;
-        }
         // A v2 unit builds in only the `#[inline(always)]` callees of crates no edit reaches,
         // whose places its walk lists (`v2/refs.rs` `Walk::instance_call`).
         if self.cg.unit.is_some() {
             return self.always_inlined(def, args, sig);
         }
-        if Target::current().writes_wasm_objects() {
+        if self.cg.target.writes_wasm_objects() {
             return self.always_inlined(def, args, sig);
         }
-        if !self.cg.target.exception_in_register() || Target::current().is_wasm() {
+        if !self.cg.target.exception_in_register() || self.cg.target.is_wasm() {
             return None;
         }
         let erased = |args| erase_regions(DbInterner::new_with(db, self.env.krate), args);
@@ -9898,7 +10875,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let args = erase_regions(DbInterner::new_with(db, self.env.krate), args);
         let instance = Instance { def, args: args.store(), checked: self.cg.checked };
-        let body = always_inlinable(db, instance, self.env.store(), self.cg.unit).as_ref()?;
+        // A body built into this one moves no allocation to the stack (`Build::built_in`).
+        let unit = self.cg.unit.map(v2::build::Build::built_in);
+        let body = always_inlinable(db, instance, self.env.store(), unit).as_ref()?;
         Some((instance, body))
     }
 
@@ -10023,7 +11002,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if let Callee::Instance(InstanceDef::Fn(func), _) = callee
             && track_caller(self.cg.db, func)
         {
-            sig.params.push(AbiParam::new(ptr()));
+            sig.params.push(AbiParam::new(self.cg.target.pointer()));
             values.push(self.caller_location()?);
         }
         // How many of the arguments are for named parameters, when the rest are for `...`.
@@ -10038,7 +11017,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(named) = named else {
             return self.call_as(callee, sig, &values, ret_mode, dst, &ret_layout);
         };
-        if Target::current().is_wasm() {
+        if self.cg.target.is_wasm() {
             // The arguments after the named ones are written to memory, each at its
             // own alignment, and the function is given where.
             if arg_modes.iter().any(|mode| !matches!(mode, PassMode::Direct(_))) {
@@ -10046,7 +11025,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             let rest = values.split_off(named);
             sig.params.truncate(named);
-            sig.params.push(AbiParam::new(ptr()));
+            sig.params.push(AbiParam::new(self.cg.target.pointer()));
             let mut offsets = Vec::with_capacity(rest.len());
             let mut size = 0u32;
             for &value in &rest {
@@ -10060,7 +11039,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 size.max(1),
                 4,
             ));
-            let buffer = self.builder.ins().stack_addr(ptr(), slot, 0);
+            let buffer = self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0);
             for (value, offset) in rest.into_iter().zip(offsets) {
                 self.builder.ins().store(MEM, value, buffer, offset as i32);
             }
@@ -10089,7 +11068,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 let callee = self.cg.callee(def, generic_args, self.env, &declared)?;
                 let callee = self.cg.declare_func_address_in_func(callee, self.builder.func);
-                self.builder.ins().func_addr(ptr(), callee)
+                self.builder.ins().func_addr(self.cg.target.pointer(), callee)
             }
             Callee::Pointer(pointer, ..) => pointer,
         };
@@ -10145,11 +11124,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 _ => unsupported!("a float and a wide argument to a variadic function"),
             }
         }
-        sig.params.push(AbiParam::new(ptr()));
+        sig.params.push(AbiParam::new(self.cg.target.pointer()));
         values.push(callee);
         let through = self.cg.assembly(asm::counted_variadic(ints, stack), sig);
         let through = self.cg.declare_func_address_in_func(through, self.builder.func);
-        Ok(self.builder.ins().func_addr(ptr(), through))
+        Ok(self.builder.ins().func_addr(self.cg.target.pointer(), through))
     }
 
     /// Makes a call pass what follows its first `named` parameters the way Apple passes the
@@ -10214,6 +11193,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (l, scalar) = self.load_scalar(lhs)?;
                 let (r, r_scalar) = self.load_scalar(rhs)?;
                 let signed = scalar.signed;
+                if intrinsic != I::ThreeWayCompare
+                    && let Some(int) = NarrowInt::of(self.operand_ty(lhs)?)
+                {
+                    let r_ty = self.operand_ty(rhs)?;
+                    let value = self.narrow_binary_intrinsic(intrinsic, (l, r), r_ty, int)?;
+                    self.builder.ins().store(MEM, value, dst, 0);
+                    return Ok(Lowered::Inline);
+                }
                 let r = match intrinsic {
                     I::UncheckedShl | I::UncheckedShr => self.shift_amount_word(r).0,
                     _ => r,
@@ -10258,6 +11245,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     (_, true) => ins.smul_overflow(l, r),
                     (_, false) => ins.umul_overflow(l, r),
                 };
+                let (value, overflow) = match NarrowInt::of(self.operand_ty(lhs)?) {
+                    Some(int) => {
+                        let mul = intrinsic == I::MulWithOverflow;
+                        let (value, out) = self.narrow_overflowing(int, value, Some(overflow), mul);
+                        (value, out.unwrap_or(overflow))
+                    }
+                    None => (value, overflow),
+                };
                 let layout = self.layout(dst_ty)?;
                 self.builder.ins().store(MEM, value, dst, layout.fields.offset(0).bytes() as i32);
                 self.builder.ins().store(
@@ -10273,13 +11268,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 [arg],
             ) => {
                 let (value, from) = self.load_scalar(arg)?;
-                let value = match intrinsic {
-                    I::Ctpop => self.builder.ins().popcnt(value),
-                    I::Ctlz | I::CtlzNonzero => self.builder.ins().clz(value),
-                    I::Cttz | I::CttzNonzero => self.builder.ins().ctz(value),
-                    I::Bswap if from.ty == types::I8 => value,
-                    I::Bswap => self.builder.ins().bswap(value),
-                    _ => self.builder.ins().bitrev(value),
+                let value = match NarrowInt::of(self.operand_ty(arg)?) {
+                    Some(int) => self.narrow_bits_intrinsic(intrinsic, value, int)?,
+                    None => match intrinsic {
+                        I::Ctpop => self.builder.ins().popcnt(value),
+                        I::Ctlz | I::CtlzNonzero => self.builder.ins().clz(value),
+                        I::Cttz | I::CttzNonzero => self.builder.ins().ctz(value),
+                        I::Bswap if from.ty == types::I8 => value,
+                        I::Bswap => self.builder.ins().bswap(value),
+                        _ => self.builder.ins().bitrev(value),
+                    },
                 };
                 let to = self.scalar_of(dst_ty)?;
                 let value = self.int_cast(value, AbiScalar { signed: false, ..from }, to);
@@ -10299,7 +11297,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     I::SizeOf => layout.size.bytes(),
                     _ => layout.align.abi.bytes(),
                 };
-                let value = self.builder.ins().iconst(ptr(), bytes as i64);
+                let value = self.builder.ins().iconst(self.cg.target.pointer(), bytes as i64);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             (I::TypeName, []) => {
@@ -10307,7 +11305,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(name) = hir_ty_mir::mir::type_name::rustc_type_name(self.cg.db, ty) else {
                     unsupported!("`type_name` of `{ty:?}`");
                 };
-                let len = self.builder.ins().iconst(ptr(), name.len() as i64);
+                let len = self.builder.ins().iconst(self.cg.target.pointer(), name.len() as i64);
                 let data = self.cg.define_const(ConstBlob {
                     bytes: name.into_bytes(),
                     relocs: Vec::new(), // alloc: empty, allocates nothing
@@ -10316,9 +11314,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     type_ids: Vec::new(), // alloc: empty, allocates nothing
                 })?;
                 let data = self.cg.declare_data_in_func(data, self.builder.func);
-                let ptr = self.builder.ins().symbol_value(ptr(), data);
+                let ptr = self.builder.ins().symbol_value(self.cg.target.pointer(), data);
                 self.builder.ins().store(MEM, ptr, dst, 0);
-                self.builder.ins().store(MEM, len, dst, meta_at());
+                self.builder.ins().store(MEM, len, dst, self.cg.target.meta_at());
             }
             (I::NeedsDrop, []) => {
                 let ty = generic_args.type_at(0);
@@ -10332,6 +11330,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             (I::IsValStaticallyKnown, _) => {
                 let value = self.builder.ins().iconst(types::I8, 0);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            // `x as D` between two integers of any width, standard or not (core's items of the
+            // integers of `#![blaze::arbitrary_ints]` are written with it): what `IntToInt`
+            // does, the destination's held form after, and never a panic.
+            (I::BlazeIntCast, [arg]) => {
+                let (from_ty, to_ty) = (generic_args.type_at(0), generic_args.type_at(1));
+                let int = |ty: Ty<'db>| matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_));
+                if !int(from_ty) || !int(to_ty) {
+                    unsupported!("intrinsic `blaze_int_cast` from `{from_ty:?}` to `{to_ty:?}`, which are not both integers");
+                }
+                let (value, from) = self.load_scalar(arg)?;
+                let to = self.scalar_of(to_ty)?;
+                let value = self.int_cast(value, from, to);
+                let value = self.narrow_cast(value, from_ty, from, to_ty);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             // rustc's MIR keeps it for codegen only where the body checks overflow itself or
@@ -10353,7 +11366,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 // as it is wide.
                 let bytes = i64::from(scalar.ty.bytes());
                 let (list, _) = self.load_scalar(list)?;
-                let after = self.builder.ins().load(ptr(), MEM, list, 0);
+                let after = self.builder.ins().load(self.cg.target.pointer(), MEM, list, 0);
                 let slot = self.builder.ins().iadd_imm(after, bytes - 1);
                 let slot = self.builder.ins().band_imm(slot, -bytes);
                 let next = self.builder.ins().iadd_imm(slot, bytes);
@@ -10380,7 +11393,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 // The list is the address of the next argument, each of them in eight bytes,
                 // or in as many as it is wide.
                 let (list, _) = self.load_scalar(list)?;
-                let mut slot = self.builder.ins().load(ptr(), MEM, list, 0);
+                let mut slot = self.builder.ins().load(self.cg.target.pointer(), MEM, list, 0);
                 if aligned {
                     slot = self.builder.ins().iadd_imm(slot, bytes - 1);
                     slot = self.builder.ins().band_imm(slot, -bytes);
@@ -10389,7 +11402,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let next = self.builder.ins().iadd_imm(slot, step);
                 self.builder.ins().store(MEM, next, list, 0);
                 let from = match by_reference {
-                    true => self.builder.ins().load(ptr(), MEM, slot, 0),
+                    true => self.builder.ins().load(self.cg.target.pointer(), MEM, slot, 0),
                     false => slot,
                 };
                 self.copy(dst, from, size);
@@ -10417,7 +11430,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
                 let (list, _) = self.load_scalar(list)?;
                 let [saved, stack, done] = [(); 3].map(|()| self.builder.create_block());
-                self.builder.append_block_param(done, ptr());
+                self.builder.append_block_param(done, self.cg.target.pointer());
                 // An argument is in the registers the function saved while its kind of
                 // register lasts, and on the stack after that.
                 let stack_at = if arch == Arch::Aarch64 {
@@ -10444,8 +11457,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.builder.ins().brif(fits, saved, &[], stack, &[]);
 
                     self.builder.switch_to_block(saved);
-                    let area = self.builder.ins().load(ptr(), MEM, list, end);
-                    let far = self.builder.ins().sextend(ptr(), offset);
+                    let area = self.builder.ins().load(self.cg.target.pointer(), MEM, list, end);
+                    let far = self.builder.ins().sextend(self.cg.target.pointer(), offset);
                     let from = self.builder.ins().iadd(area, far);
                     self.builder.ins().jump(done, &[from.into()]);
                     0
@@ -10466,8 +11479,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     self.builder.ins().brif(fits, saved, &[], stack, &[]);
 
                     self.builder.switch_to_block(saved);
-                    let area = self.builder.ins().load(ptr(), MEM, list, 16);
-                    let wide = self.builder.ins().uextend(ptr(), offset);
+                    let area = self.builder.ins().load(self.cg.target.pointer(), MEM, list, 16);
+                    let wide = self.builder.ins().uextend(self.cg.target.pointer(), offset);
                     let from = self.builder.ins().iadd(area, wide);
                     let next = self.builder.ins().iadd_imm(offset, i64::from(step));
                     self.builder.ins().store(MEM, next, list, at);
@@ -10476,7 +11489,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
 
                 self.builder.switch_to_block(stack);
-                let from = self.builder.ins().load(ptr(), MEM, list, stack_at);
+                let from = self.builder.ins().load(self.cg.target.pointer(), MEM, list, stack_at);
                 let from = match wide {
                     true => {
                         let up = self.builder.ins().iadd_imm(from, 15);
@@ -10616,7 +11629,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (boxed, boxed_ty) = self.operand(boxed)?;
                 let (src, ty) = self.operand(value)?;
                 let size = self.layout(ty)?.size;
-                let ptr = self.builder.ins().load(ptr(), MEM, boxed, 0);
+                let ptr = self.builder.ins().load(self.cg.target.pointer(), MEM, boxed, 0);
                 self.copy(ptr, src, size);
                 let size = self.layout(boxed_ty)?.size;
                 self.copy(dst, boxed, size);
@@ -10648,7 +11661,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (a, _) = self.load_scalar(a)?;
                 let (b, _) = self.load_scalar(b)?;
                 let bytes = self.builder.ins().isub(a, b);
-                let size = self.builder.ins().iconst(ptr(), size);
+                let size = self.builder.ins().iconst(self.cg.target.pointer(), size);
                 let value = self.builder.ins().sdiv(bytes, size);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
@@ -10686,7 +11699,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 if intrinsic == I::RawEq {
                     let size = self.layout(generic_args.type_at(0))?.size.bytes();
                     if let Some(equal) =
-                        copies::equal_bytes(&mut self.builder, ptr(), a, b, size)
+                        copies::equal_bytes(&mut self.builder, self.cg.target.pointer(), a, b, size)
                     {
                         self.builder.ins().store(MEM, equal, dst, 0);
                         return Ok(Lowered::Inline);
@@ -10696,7 +11709,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     [_, _, len] => self.load_scalar(len)?.0,
                     _ => {
                         let size = self.layout(generic_args.type_at(0))?.size.bytes();
-                        self.builder.ins().iconst(ptr(), size as i64)
+                        self.builder.ins().iconst(self.cg.target.pointer(), size as i64)
                     }
                 };
                 let mut value = self.memcmp(a, b, len)?;
@@ -10944,7 +11957,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (vector, ty) = self.operand(vector)?;
                 let (index, _) = self.load_scalar(index)?;
                 let (lane, _) = self.simd_moved_lanes(ty)?;
-                let index = self.builder.ins().uextend(ptr(), index);
+                let index = self.builder.ins().uextend(self.cg.target.pointer(), index);
                 let offset = self.builder.ins().imul_imm(index, lane.ty.bytes() as i64);
                 let addr = self.builder.ins().iadd(vector, offset);
                 let value = self.builder.ins().load(lane.ty, MEM, addr, 0);
@@ -10957,7 +11970,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (lane, _) = self.simd_moved_lanes(ty)?;
                 let size = self.layout(ty)?.size;
                 self.copy(dst, vector, size);
-                let index = self.builder.ins().uextend(ptr(), index);
+                let index = self.builder.ins().uextend(self.cg.target.pointer(), index);
                 let offset = self.builder.ins().imul_imm(index, lane.ty.bytes() as i64);
                 let addr = self.builder.ins().iadd(dst, offset);
                 self.builder.ins().store(MEM, value, addr, 0);
@@ -10976,14 +11989,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     (layout.size.bytes() * 2) as u32,
                     layout.align.abi.bytes().min(16).trailing_zeros() as u8,
                 ));
-                let both = self.builder.ins().stack_addr(ptr(), both, 0);
+                let both = self.builder.ins().stack_addr(self.cg.target.pointer(), both, 0);
                 self.copy(both, first, layout.size);
                 let upper = self.builder.ins().iadd_imm(both, layout.size.bytes() as i64);
                 self.copy(upper, second, layout.size);
                 let mut lanes = LaneValues::new();
                 for i in 0..count {
                     let index = self.builder.ins().load(types::I32, MEM, indices, (i * 4) as i32);
-                    let index = self.builder.ins().uextend(ptr(), index);
+                    let index = self.builder.ins().uextend(self.cg.target.pointer(), index);
                     let offset = self.builder.ins().imul_imm(index, lane_size as i64);
                     let addr = self.builder.ins().iadd(both, offset);
                     lanes.push(self.builder.ins().load(lane.ty, MEM, addr, 0));
@@ -11440,7 +12453,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             (I::DiscriminantValue, [arg]) => {
                 // The reference may be a wide one, of a struct that ends in a slice.
                 let (reference, _) = self.operand(arg)?;
-                let ptr = self.builder.ins().load(ptr(), MEM, reference, 0);
+                let ptr = self.builder.ins().load(self.cg.target.pointer(), MEM, reference, 0);
                 let to = self.scalar_of(dst_ty)?;
                 let value = self.discriminant(ptr, generic_args.type_at(0), to)?;
                 self.builder.ins().store(MEM, value, dst, 0);
@@ -11448,23 +12461,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             (I::PtrMetadata, [arg]) => {
                 let (src, ty) = self.operand(arg)?;
                 if let BackendRepr::ScalarPair { .. } = self.layout(ty)?.backend_repr {
-                    let meta = self.builder.ins().load(ptr(), MEM, src, meta_at());
+                    let meta = self.builder.ins().load(self.cg.target.pointer(), MEM, src, self.cg.target.meta_at());
                     self.builder.ins().store(MEM, meta, dst, 0);
                 }
             }
             (I::AggregateRawPtr, [data, meta]) => {
                 let (data, _) = self.operand(data)?;
-                let data = self.builder.ins().load(ptr(), MEM, data, 0);
+                let data = self.builder.ins().load(self.cg.target.pointer(), MEM, data, 0);
                 self.builder.ins().store(MEM, data, dst, 0);
                 if let BackendRepr::ScalarPair { .. } = self.layout(dst_ty)?.backend_repr {
                     let (meta, _) = self.load_scalar(meta)?;
-                    self.builder.ins().store(MEM, meta, dst, meta_at());
+                    self.builder.ins().store(MEM, meta, dst, self.cg.target.meta_at());
                 }
             }
             (I::SliceGetUnchecked, [slice, index]) => {
                 let size = self.layout(generic_args.type_at(2))?.size.bytes() as i64;
                 let (slice, _) = self.operand(slice)?;
-                let ptr = self.builder.ins().load(ptr(), MEM, slice, 0);
+                let ptr = self.builder.ins().load(self.cg.target.pointer(), MEM, slice, 0);
                 let (index, _) = self.load_scalar(index)?;
                 let offset = self.builder.ins().imul_imm(index, size);
                 let value = self.builder.ins().iadd(ptr, offset);
@@ -11472,8 +12485,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             (I::VtableSize | I::VtableAlign, [vtable]) => {
                 let (vtable, _) = self.load_scalar(vtable)?;
-                let offset = if intrinsic == I::VtableSize { meta_at() } else { 2 * meta_at() };
-                let value = self.builder.ins().load(ptr(), MEM, vtable, offset);
+                let offset = if intrinsic == I::VtableSize { self.cg.target.meta_at() } else { 2 * self.cg.target.meta_at() };
+                let value = self.builder.ins().load(self.cg.target.pointer(), MEM, vtable, offset);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             (I::SizeOfVal | I::AlignOfVal, [arg]) => {
@@ -11481,7 +12494,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let ty = generic_args.type_at(0);
                 let meta = self
                     .is_unsized(ty)
-                    .then(|| self.builder.ins().load(ptr(), MEM, src, meta_at()));
+                    .then(|| self.builder.ins().load(self.cg.target.pointer(), MEM, src, self.cg.target.meta_at()));
                 let (size, align) = self.size_and_align_of_val(ty, meta)?;
                 let value = if intrinsic == I::SizeOfVal { size } else { align };
                 self.builder.ins().store(MEM, value, dst, 0);
@@ -11491,10 +12504,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (data, _) = self.load_scalar(data)?;
                 let (catch_fn, _) = self.load_scalar(catch_fn)?;
                 let mut sig = self.cg.make_signature();
-                sig.params.push(AbiParam::new(ptr()));
+                sig.params.push(AbiParam::new(self.cg.target.pointer()));
                 let try_sig = self.builder.import_signature(sig);
                 let mut sig = self.cg.make_signature();
-                sig.params.extend([AbiParam::new(ptr()); 2]);
+                sig.params.extend([AbiParam::new(self.cg.target.pointer()); 2]);
                 let catch_sig = self.builder.import_signature(sig);
 
                 // Whether it unwound is an `i32` or a `bool`, by the toolchain.
@@ -11513,7 +12526,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let returned = self.builder.create_block();
                 let caught = self.builder.create_block();
                 let done = self.builder.create_block();
-                self.builder.append_block_param(caught, ptr());
+                self.builder.append_block_param(caught, self.cg.target.pointer());
                 self.builder.append_block_param(done, outcome);
                 if self.cg.target.exception_in_register() {
                     let normal = self.builder.func.dfg.block_call(returned, &[]);
@@ -11548,7 +12561,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let object = self.builder.ins().iadd_imm(exception, unwind::seh::OBJECT);
                     self.invoke_indirect(catch_sig, catch_fn, &[data, object]);
                     let mut sig = self.cg.make_signature();
-                    sig.params.push(AbiParam::new(ptr()));
+                    sig.params.push(AbiParam::new(self.cg.target.pointer()));
                     let release = self.cg.import(unwind::seh::RELEASE, &sig)?;
                     let release = self.cg.declare_func_in_func(release, self.builder.func);
                     self.builder.ins().call(release, &[exception]);
@@ -11567,10 +12580,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // LLVM gives it as `llvm.returnaddress(0)`; Cranelift compiles a function that
             // reads it keeping its frame pointer (`emit_with`).
             (I::ReturnAddress, []) => {
-                if Target::current().is_wasm() {
+                if self.cg.target.is_wasm() {
                     unsupported!("`return_address` on WebAssembly, which has no return address");
                 }
-                let value = self.builder.ins().get_return_address(ptr());
+                let value = self.builder.ins().get_return_address(self.cg.target.pointer());
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             _ => return Ok(Lowered::Unknown),
@@ -11753,7 +12766,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let (a, _) = self.operand(a)?;
         let (b, _) = self.operand(b)?;
         let mut sig = self.cg.make_signature();
-        sig.params.extend([AbiParam::new(ptr()); 3]);
+        sig.params.extend([AbiParam::new(self.cg.target.pointer()); 3]);
         let callee = self.cg.assembly(text, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         self.builder.ins().call(callee, &[a, b, dst]);
@@ -11930,7 +12943,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     .map(|lane| {
                         let index = self.builder.ins().load(types::I8, MEM, indices, lane);
                         let slot = self.builder.ins().band_imm(index, 0x0f);
-                        let slot = self.builder.ins().uextend(ptr(), slot);
+                        let slot = self.builder.ins().uextend(self.cg.target.pointer(), slot);
                         let addr = self.builder.ins().iadd(table, slot);
                         let found = self.builder.ins().load(types::I8, MEM, addr, 0);
                         let outside = match kept {
@@ -12133,7 +13146,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let directives = asm::extensions(Arch::Aarch64, lowered.features.iter().copied());
         let text = asm::neon_function(&directives, &lowered.args, &lowered.text, &results);
         let mut sig = self.cg.make_signature();
-        sig.params.extend(values.iter().map(|_| AbiParam::new(ptr())));
+        sig.params.extend(values.iter().map(|_| AbiParam::new(self.cg.target.pointer())));
         let callee = self.cg.assembly(text, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         self.builder.ins().call(callee, &values);
@@ -12214,16 +13227,16 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             8 * (1 + addrs.len() as u32),
             3,
         ));
-        let slot = self.builder.ins().stack_addr(ptr(), slot, 0);
+        let slot = self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0);
         self.builder.ins().store(MEM, dst, slot, 0);
         for (i, addr) in addrs.iter().enumerate() {
             if let Some(addr) = *addr {
                 self.builder.ins().store(MEM, addr, slot, 8 * (i as i32 + 1));
             }
         }
-        let text = asm::avx512_function(&lowered.loads, &lowered.text, lowered.out);
+        let text = asm::avx512_function(self.cg.target.call_conv, &lowered.loads, &lowered.text, lowered.out);
         let mut sig = self.cg.make_signature();
-        sig.params.push(AbiParam::new(ptr()));
+        sig.params.push(AbiParam::new(self.cg.target.pointer()));
         let callee = self.cg.assembly(text, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         self.builder.ins().call(callee, &[slot]);
@@ -12307,15 +13320,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             size.max(1),
             4,
         ));
-        let slot = self.builder.ins().stack_addr(ptr(), slot, 0);
+        let slot = self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0);
         for (from, at, bytes) in copies {
             let to = self.builder.ins().iadd_imm(slot, i64::from(at));
             self.copy(to, from, Size::from_bytes(bytes));
         }
-        let text = asm::x86_function(&text, &reads, &writes, &lowered.clobbers)
+        let text = asm::x86_function(self.cg.target.call_conv, &text, &reads, &writes, &lowered.clobbers)
             .map_err(CodegenError::Unsupported)?;
         let mut sig = self.cg.make_signature();
-        sig.params.extend([AbiParam::new(ptr()); 2]);
+        sig.params.extend([AbiParam::new(self.cg.target.pointer()); 2]);
         let callee = self.cg.assembly(text, &sig);
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         self.builder.ins().call(callee, &[slot, dst]);
@@ -12378,7 +13391,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 for i in 0..size {
                     let index = self.builder.ins().load(types::I8, MEM, indices, i as i32);
                     let slot = self.builder.ins().band_imm(index, 0x0f);
-                    let slot = self.builder.ins().uextend(ptr(), slot);
+                    let slot = self.builder.ins().uextend(self.cg.target.pointer(), slot);
                     let addr = self.builder.ins().iadd(table, slot);
                     let found = self.builder.ins().load(types::I8, MEM, addr, (i & !15) as i32);
                     let zero = self.builder.ins().iconst(types::I8, 0);
@@ -12405,9 +13418,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         let at = (lane * bytes) as i32;
                         let index = self.builder.ins().load(width, MEM, indices, at);
                         let slot = self.builder.ins().band_imm(index, lanes - 1);
-                        let slot = match width == ptr() {
+                        let slot = match width == self.cg.target.pointer() {
                             true => slot,
-                            false => self.builder.ins().uextend(ptr(), slot),
+                            false => self.builder.ins().uextend(self.cg.target.pointer(), slot),
                         };
                         let offset = self.builder.ins().imul_imm(slot, bytes);
                         let addr = self.builder.ins().iadd(table, offset);
@@ -12426,7 +13439,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     .map(|lane| {
                         let index = self.builder.ins().load(types::I32, MEM, indices, lane * 4);
                         let slot = self.builder.ins().band_imm(index, 7);
-                        let slot = self.builder.ins().uextend(ptr(), slot);
+                        let slot = self.builder.ins().uextend(self.cg.target.pointer(), slot);
                         let offset = self.builder.ins().ishl_imm(slot, 2);
                         let addr = self.builder.ins().iadd(table, offset);
                         self.builder.ins().load(types::I32, MEM, addr, 0)
@@ -12609,7 +13622,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ) => {
                 // alloc: the instruction's text, which is the output
                 let instruction = format!("{} xmm0, xmm1", name.trim_start_matches("x86."));
-                self.vector_assembly(asm::vector_instruction(&instruction, "xmm0"), a, b, dst)?;
+                self.vector_assembly(asm::vector_instruction(self.cg.target.call_conv, &instruction, "xmm0"), a, b, dst)?;
             }
             ("x86.sha256rnds2", [a, b, k]) => {
                 let (k, ty) = self.operand(k)?;
@@ -12617,7 +13630,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.copy_value(dst, k, &layout);
                 // The instruction takes its third vector in `xmm0`.
                 let rounds = "movdqa xmm3, xmm0\nmovdqa xmm0, xmm2\nsha256rnds2 xmm3, xmm1";
-                self.vector_assembly(asm::vector_instruction(rounds, "xmm3"), a, b, dst)?;
+                self.vector_assembly(asm::vector_instruction(self.cg.target.call_conv, rounds, "xmm3"), a, b, dst)?;
             }
             (
                 "aarch64.crypto.sha256su0"
@@ -12653,14 +13666,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             ("x86.sha1rnds4", [a, b, function]) => {
                 let (function, _) = self.load_scalar(function)?;
                 self.builder.ins().store(MEM, function, dst, 0);
-                self.vector_assembly(asm::sha1rnds4(), a, b, dst)?;
+                self.vector_assembly(asm::sha1rnds4(self.cg.target.call_conv), a, b, dst)?;
             }
             ("x86.xgetbv", [register]) => {
                 let (register, _) = self.load_scalar(register)?;
                 let mut sig = self.cg.make_signature();
                 sig.params.push(AbiParam::new(types::I32));
                 sig.returns.push(AbiParam::new(types::I64));
-                let callee = self.cg.assembly(asm::xgetbv(), &sig);
+                let call_conv = self.cg.target.call_conv;
+                let callee = self.cg.assembly(asm::xgetbv(call_conv), &sig);
                 let callee = self.cg.declare_func_in_func(callee, self.builder.func);
                 let call = self.builder.ins().call(callee, &[register]);
                 let value = self.builder.inst_results(call)[0];
@@ -12694,7 +13708,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let mut sig = self.cg.make_signature();
                 sig.params.extend([AbiParam::new(sum.ty), AbiParam::new(scalar.ty)]);
                 sig.returns.push(AbiParam::new(sum.ty));
-                let callee = self.cg.assembly(asm::x86_crc32(scalar.ty.bits()), &sig);
+                let call_conv = self.cg.target.call_conv;
+                let callee = self.cg.assembly(asm::x86_crc32(call_conv, scalar.ty.bits()), &sig);
                 let callee = self.cg.declare_func_in_func(callee, self.builder.func);
                 let call = self.builder.ins().call(callee, &[crc, data]);
                 let value = self.builder.inst_results(call)[0];
@@ -12790,7 +13805,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     unsupported!("`llvm.{name}` returning {dst_ty:?}");
                 }
                 let mut sig = self.cg.make_signature();
-                sig.params.push(AbiParam::new(ptr()));
+                sig.params.push(AbiParam::new(self.cg.target.pointer()));
                 let callee = self.cg.assembly(asm::random(name == "aarch64.rndrrs"), &sig);
                 let callee = self.cg.declare_func_in_func(callee, self.builder.func);
                 self.builder.ins().call(callee, &[dst]);
@@ -12806,10 +13821,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (singles, _) = self.operand(singles)?;
                 let (rounding, _) = self.load_scalar(rounding)?;
                 let mut sig = self.cg.make_signature();
-                sig.params.extend([AbiParam::new(ptr()), AbiParam::new(ptr())]);
+                sig.params.extend([AbiParam::new(self.cg.target.pointer()), AbiParam::new(self.cg.target.pointer())]);
                 sig.params.push(AbiParam::new(types::I32));
                 let register = if name.ends_with("256") { "ymm0" } else { "xmm0" };
-                let callee = self.cg.assembly(asm::vcvtps2ph(register), &sig);
+                let call_conv = self.cg.target.call_conv;
+                let callee = self.cg.assembly(asm::vcvtps2ph(call_conv, register), &sig);
                 let callee = self.cg.declare_func_in_func(callee, self.builder.func);
                 self.builder.ins().call(callee, &[singles, dst, rounding]);
             }
@@ -12821,7 +13837,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let half = |fx: &mut Self, bit: i64| {
                     let chosen = fx.builder.ins().ushr_imm(halves, bit);
                     let chosen = fx.builder.ins().band_imm(chosen, 1);
-                    let chosen = fx.builder.ins().uextend(ptr(), chosen);
+                    let chosen = fx.builder.ins().uextend(fx.cg.target.pointer(), chosen);
                     fx.builder.ins().ishl_imm(chosen, 3)
                 };
                 let (of_a, of_b) = (half(self, 0), half(self, 4));
@@ -12870,7 +13886,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             self.builder.ins().load(int, MEM, indices, (lane * width) as i32);
                         let index = self.builder.ins().band_imm(index, 2 * lanes - 1);
                         let index = if width < 8 {
-                            self.builder.ins().uextend(ptr(), index)
+                            self.builder.ins().uextend(self.cg.target.pointer(), index)
                         } else {
                             index
                         };
@@ -13081,7 +14097,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let wide = |ty: Type| windows && ty == types::I128;
         let mut sig = self.cg.make_signature();
         sig.params
-            .extend(params.iter().map(|&ty| AbiParam::new(if wide(ty) { ptr() } else { ty })));
+            .extend(params.iter().map(|&ty| AbiParam::new(if wide(ty) { self.cg.target.pointer() } else { ty })));
         sig.returns.push(AbiParam::new(if wide(ret) { types::I64X2 } else { ret }));
         let callee = self.cg.import(name, &sig)?;
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
@@ -13125,7 +14141,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// What `ptr` held, swapped for `new` when it was `expected`: compiler_builtins'
     /// compare-and-swap of 128 bits ([`Self::wide_atomics`]).
     fn cas16(&mut self, ptr: Value, expected: Value, new: Value) -> Result<Value> {
-        let params = [types::I128, types::I128, self::ptr()];
+        let params = [types::I128, types::I128, self.cg.target.pointer()];
         self.builtin("__aarch64_cas16_acq_rel", &params, types::I128, &[expected, new, ptr])
     }
 
@@ -13198,7 +14214,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn wide_mul_overflow(&mut self, l: Value, r: Value, signed: bool) -> Result<(Value, Value)> {
         let name = if signed { "__rust_i128_mulo" } else { "__rust_u128_mulo" };
         let overflow = self.scratch();
-        let params = [types::I128, types::I128, ptr()];
+        let params = [types::I128, types::I128, self.cg.target.pointer()];
         let value = self.builtin(name, &params, types::I128, &[l, r, overflow])?;
         let overflow = self.builder.ins().load(types::I32, MEM, overflow, 0);
         let overflow = self.builder.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
@@ -13207,7 +14223,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     fn memcmp(&mut self, a: Value, b: Value, len: Value) -> Result<Value> {
         let mut sig = self.cg.make_signature();
-        sig.params.extend([AbiParam::new(ptr()); 3]);
+        sig.params.extend([AbiParam::new(self.cg.target.pointer()); 3]);
         sig.returns.push(AbiParam::new(types::I32));
         let memcmp = self.cg.import("memcmp", &sig)?;
         let memcmp = self.cg.declare_func_in_func(memcmp, self.builder.func);
@@ -13348,7 +14364,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Some(pad);
         }
         let pad = self.builder.create_block();
-        self.builder.append_block_param(pad, ptr());
+        self.builder.append_block_param(pad, self.cg.target.pointer());
         self.builder.set_cold_block(pad);
         self.pads.push((target, pad));
         Some(pad)
@@ -13393,13 +14409,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let call = call(&mut self.builder);
         self.at(self.span);
         let results = self.builder.inst_results(call).to_vec(); // alloc: returned as a `Vec`
-        let frame = self.builder.ins().get_frame_pointer(ptr());
-        let exception = self.builder.ins().load(ptr(), MEM, frame, unwind::seh::ARRIVAL);
+        let frame = self.builder.ins().get_frame_pointer(self.cg.target.pointer());
+        let exception = self.builder.ins().load(self.cg.target.pointer(), MEM, frame, unwind::seh::ARRIVAL);
         let (unwound, returned) = (self.builder.create_block(), self.builder.create_block());
         self.builder.set_cold_block(unwound);
         self.builder.ins().brif(exception, unwound, &[], returned, &[]);
         self.builder.switch_to_block(unwound);
-        let none = self.builder.ins().iconst(ptr(), 0);
+        let none = self.builder.ins().iconst(self.cg.target.pointer(), 0);
         self.builder.ins().store(MEM, none, frame, unwind::seh::ARRIVAL);
         self.builder.ins().jump(pad, &[exception.into()]);
         self.builder.switch_to_block(returned);
@@ -13413,7 +14429,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.builder.switch_to_block(pad);
             let exception = self.builder.block_params(pad)[0];
             let slot = self.exception_slot();
-            self.builder.ins().stack_store(ptr(), exception, slot, 0);
+            self.builder.ins().stack_store(self.cg.target.pointer(), exception, slot, 0);
             self.builder.ins().jump(self.blocks[target], &[]);
         }
     }
@@ -13462,7 +14478,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(hir_ty_mir::mir::CoroutineLocals { context, .. }) = body.coroutine else {
             unsupported!("async body without a context");
         };
-        let context = self.builder.ins().load(ptr(), MEM, self.locals[context].addr, 0);
+        let context = self.builder.ins().load(self.cg.target.pointer(), MEM, self.locals[context].addr, 0);
         let at = self.builder.ins().load(state.ty, MEM, state.addr, 0);
         let at = match state.ty {
             types::I64 => at,
@@ -13526,13 +14542,6 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         returns.unwrap_or(MirSpan::Unknown)
     }
 
-    /// Calls the `poll` of the `async` block of type `ty`, which is what `Future::poll` is for
-    /// it. `args` are the pinned reference and the context.
-    fn coroutine_callee(&mut self, ty: Ty<'db>) -> Option<Callee<'db>> {
-        let (def, parent_args) = coroutine_instance(self.cg.db, ty)?;
-        Some(Callee::Instance(def, parent_args))
-    }
-
     /// Drops the `async` block at `addr`, by polling it with no context.
     fn drop_coroutine(&mut self, addr: Value, ty: Ty<'db>) -> Result<()> {
         let Some((def, parent_args)) = coroutine_instance(self.cg.db, ty) else {
@@ -13545,7 +14554,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mut values = smallvec::SmallVec::<[(Value, Ty<'db>); 2]>::new();
         for (param, value) in body.params.iter().zip([Some(addr), None]) {
             let slot = self.scratch();
-            let value = value.unwrap_or_else(|| self.builder.ins().iconst(ptr(), 0));
+            let value = value.unwrap_or_else(|| self.builder.ins().iconst(self.cg.target.pointer(), 0));
             self.builder.ins().store(MEM, value, slot, 0);
             values.push((slot, param.as_ref()));
         }
@@ -13557,7 +14566,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     fn resume_unwinding(&mut self, exception: Value) -> Result<()> {
         let mut sig = self.cg.make_signature();
-        sig.params.push(AbiParam::new(ptr()));
+        sig.params.push(AbiParam::new(self.cg.target.pointer()));
         let resume = if self.cg.target.exception_in_register() {
             "_Unwind_Resume"
         } else {
@@ -13595,7 +14604,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let outer = self.landing_pad_for_call();
         let pad = self.builder.create_block();
-        self.builder.append_block_param(pad, ptr());
+        self.builder.append_block_param(pad, self.cg.target.pointer());
         self.builder.set_cold_block(pad);
         let enclosing = self.inner_pad.replace(pad);
         let done = body(self);
@@ -13630,14 +14639,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return Ok(());
         }
         let mut sig = self.cg.make_signature();
-        sig.params.push(AbiParam::new(ptr()));
+        sig.params.push(AbiParam::new(self.cg.target.pointer()));
         let mut values = smallvec::SmallVec::<[Value; 2]>::new();
         values.push(addr);
         if self.is_unsized(ty) {
             let Some(meta) = meta else {
                 unsupported!("drop of unsized {ty:?} without metadata");
             };
-            sig.params.push(AbiParam::new(ptr()));
+            sig.params.push(AbiParam::new(self.cg.target.pointer()));
             values.push(meta);
         }
         let args = GenericArgs::new_from_slice(&[ty.into()]);
@@ -13651,9 +14660,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// The body of `drop_in_place::<ty>`.
     fn drop_glue(&mut self, ty: Ty<'db>) -> Result<()> {
         let mut sig = self.cg.make_signature();
-        sig.params.push(AbiParam::new(ptr()));
+        sig.params.push(AbiParam::new(self.cg.target.pointer()));
         if self.is_unsized(ty) {
-            sig.params.push(AbiParam::new(ptr()));
+            sig.params.push(AbiParam::new(self.cg.target.pointer()));
         }
         self.builder.func.signature = sig;
         let entry = self.builder.create_block();
@@ -13684,12 +14693,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TyKind::Ref(_, pointee, _) => {
                 let metas = self.is_unsized(pointee).then(|| {
                     (
-                        self.builder.ins().load(ptr(), MEM, l, meta_at()),
-                        self.builder.ins().load(ptr(), MEM, r, meta_at()),
+                        self.builder.ins().load(self.cg.target.pointer(), MEM, l, self.cg.target.meta_at()),
+                        self.builder.ins().load(self.cg.target.pointer(), MEM, r, self.cg.target.meta_at()),
                     )
                 });
-                let l = self.builder.ins().load(ptr(), MEM, l, 0);
-                let r = self.builder.ins().load(ptr(), MEM, r, 0);
+                let l = self.builder.ins().load(self.cg.target.pointer(), MEM, l, 0);
+                let r = self.builder.ins().load(self.cg.target.pointer(), MEM, r, 0);
                 self.branch_unless_equal(l, r, metas, pointee, differ)
             }
             TyKind::Str | TyKind::Slice(_) | TyKind::Array(..) => {
@@ -13702,7 +14711,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         let Some(len) = try_const_usize(db, len) else {
                             unsupported!("array with unevaluated length");
                         };
-                        self.builder.ins().iconst(ptr(), len as i64)
+                        self.builder.ins().iconst(self.cg.target.pointer(), len as i64)
                     }
                     (_, Some((l_len, r_len))) => {
                         let same = self.builder.ins().icmp(IntCC::Equal, l_len, r_len);
@@ -13727,8 +14736,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let header = self.builder.create_block();
                 let body = self.builder.create_block();
                 let done = self.builder.create_block();
-                self.builder.append_block_param(header, ptr());
-                let zero = self.builder.ins().iconst(ptr(), 0);
+                self.builder.append_block_param(header, self.cg.target.pointer());
+                let zero = self.builder.ins().iconst(self.cg.target.pointer(), 0);
                 self.builder.ins().jump(header, &[zero.into()]);
                 self.builder.switch_to_block(header);
                 let index = self.builder.block_params(header)[0];
@@ -13838,9 +14847,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             TyKind::Pat(base, _) => self.branch_unless_equal(l, r, metas, base, differ),
             // A pointer to something unsized is equal in its address and its metadata.
             TyKind::RawPtr(pointee, _) if self.is_unsized(pointee) => {
-                for offset in [0, meta_at()] {
-                    let l = self.builder.ins().load(ptr(), MEM, l, offset);
-                    let r = self.builder.ins().load(ptr(), MEM, r, offset);
+                for offset in [0, self.cg.target.meta_at()] {
+                    let l = self.builder.ins().load(self.cg.target.pointer(), MEM, l, offset);
+                    let r = self.builder.ins().load(self.cg.target.pointer(), MEM, r, offset);
                     let same = self.builder.ins().icmp(IntCC::Equal, l, r);
                     self.branch_unless(same, differ);
                 }
@@ -14027,7 +15036,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let Some(len) = try_const_usize(db, len) else {
                     unsupported!("array with unevaluated length");
                 };
-                let len = self.builder.ins().iconst(ptr(), len as i64);
+                let len = self.builder.ins().iconst(self.cg.target.pointer(), len as i64);
                 self.drop_elements(addr, len, element)?;
             }
             TyKind::Slice(element) => {
@@ -14041,13 +15050,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     unsupported!("drop of `dyn` without a vtable");
                 };
                 // The first vtable entry is `drop_in_place`, null when there is nothing to drop.
-                let glue = self.builder.ins().load(ptr(), MEM, vtable, 0);
+                let glue = self.builder.ins().load(self.cg.target.pointer(), MEM, vtable, 0);
                 let call = self.builder.create_block();
                 let done = self.builder.create_block();
                 self.builder.ins().brif(glue, call, &[], done, &[]);
                 self.builder.switch_to_block(call);
                 let mut sig = self.cg.make_signature();
-                sig.params.push(AbiParam::new(ptr()));
+                sig.params.push(AbiParam::new(self.cg.target.pointer()));
                 let sig = self.builder.import_signature(sig);
                 self.invoke_indirect(sig, glue, &[addr]);
                 self.builder.ins().jump(done, &[]);
@@ -14128,7 +15137,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mut pads: Vec<ir::Block, &Frame> = Vec::with_capacity_in(count - 1, self.frame);
         pads.extend((1..count).map(|_| {
             let pad = self.builder.create_block();
-            self.builder.append_block_param(pad, ptr());
+            self.builder.append_block_param(pad, self.cg.target.pointer());
             self.builder.set_cold_block(pad);
             pad
         }));
@@ -14175,14 +15184,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn drop_elements(&mut self, addr: Value, len: Value, element: Ty<'db>) -> Result<()> {
         let size = self.layout(element)?.size.bytes() as i64;
         let done = self.builder.create_block();
-        let zero = self.builder.ins().iconst(ptr(), 0);
+        let zero = self.builder.ins().iconst(self.cg.target.pointer(), 0);
         if self.in_cleanup || self.aborts {
             self.drop_elements_from(addr, len, element, size, zero, None, done)?;
         } else {
             // If an element's drop unwinds, the ones after it are still dropped on the way out.
             let outer = self.landing_pad_for_call();
             let pad = self.builder.create_block();
-            self.builder.append_block_param(pad, ptr());
+            self.builder.append_block_param(pad, self.cg.target.pointer());
             self.builder.set_cold_block(pad);
             let index = self.drop_elements_from(addr, len, element, size, zero, Some(pad), done)?;
             self.builder.switch_to_block(pad);
@@ -14221,7 +15230,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     ) -> Result<Value> {
         let header = self.builder.create_block();
         let body = self.builder.create_block();
-        self.builder.append_block_param(header, ptr());
+        self.builder.append_block_param(header, self.cg.target.pointer());
         self.builder.ins().jump(header, &[start.into()]);
         self.builder.switch_to_block(header);
         let index = self.builder.block_params(header)[0];
@@ -14253,7 +15262,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let slot = self.scratch_pair();
         self.builder.ins().store(MEM, addr, slot, 0);
         if let Some(meta) = meta {
-            self.builder.ins().store(MEM, meta, slot, meta_at());
+            self.builder.ins().store(MEM, meta, slot, self.cg.target.meta_at());
         }
         let args = GenericArgs::new_from_slice(&[ty.into()]);
         let unit = Ty::new_unit(self.interner);
@@ -14308,10 +15317,10 @@ fn dump_mir(body: &MirBody<'_>) {
 
 /// The locals that can be kept in a register as far as the body goes: temporaries written
 /// whole by assignments only, that nothing takes the address of.
-fn register_locals(body: &MirBody<'_>, forwarded: &HashMap<LocalId, LocalId>) -> Vec<LocalId> {
+fn register_locals(body: &MirBody<'_>, forwarded: &HashMap<LocalId, LocalId, Global>) -> Vec<LocalId> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
     // Every mention of the whole local, and the ones that are a value read or an assignment.
-    let mut mentions: HashMap<LocalId, (usize, usize)> = HashMap::default();
+    let mut mentions: HashMap<LocalId, (usize, usize), Global> = HashMap::new_in(Global);
     body.visit_places(|place| {
         if let Some(local) = whole(place) {
             mentions.entry(local).or_default().0 += 1;
@@ -14347,7 +15356,7 @@ fn register_locals(body: &MirBody<'_>, forwarded: &HashMap<LocalId, LocalId>) ->
             _ => (),
         }
     }
-    let bound: blaze_hash::HashSet<LocalId> = body
+    let bound: blaze_hash::HashSet<LocalId, Global> = body
         .binding_locals
         .values()
         .chain(&body.param_locals)
@@ -14369,8 +15378,8 @@ fn register_locals(body: &MirBody<'_>, forwarded: &HashMap<LocalId, LocalId>) ->
 /// storage markers are all there is of them. The parameters, the return slot and the promoted
 /// locals are not among them, whatever mentions them: they are written from outside the body,
 /// or read by it.
-fn unmentioned_locals(body: &MirBody<'_>) -> HashSet<LocalId> {
-    let mut mentioned = HashSet::default();
+fn unmentioned_locals(body: &MirBody<'_>) -> HashSet<LocalId, Global> {
+    let mut mentioned = HashSet::new_in(Global);
     body.visit_places(|place| {
         mentioned.insert(place.local);
     });
@@ -14393,7 +15402,7 @@ fn unmentioned_locals(body: &MirBody<'_>) -> HashSet<LocalId> {
 /// or a fresh binding, so the callee reaches that memory through nothing else.
 fn returned_in_place(
     body: &MirBody<'_>,
-    forwarded: &HashMap<LocalId, LocalId>,
+    forwarded: &HashMap<LocalId, LocalId, Global>,
 ) -> Option<LocalId> {
     if body.coroutine.is_some() {
         return None;
@@ -14467,8 +15476,8 @@ fn returned_in_place(
 
 /// How many times each local is dropped by a terminator or read by a `FakeRead`, counted in one
 /// pass: a body of many blocks has many temporaries, and neither is a use of what one holds.
-fn drops_and_fake_reads(body: &MirBody<'_>) -> HashMap<LocalId, usize> {
-    let mut counted: HashMap<LocalId, usize> = HashMap::default();
+fn drops_and_fake_reads(body: &MirBody<'_>) -> HashMap<LocalId, usize, Global> {
+    let mut counted: HashMap<LocalId, usize, Global> = HashMap::new_in(Global);
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::FakeRead(place) = &statement.kind {
@@ -14490,7 +15499,7 @@ fn drops_and_fake_reads(body: &MirBody<'_>) -> HashMap<LocalId, usize> {
 /// `value`'s memory, as rustc passes a moved local.
 fn moved_arguments(
     body: &MirBody<'_>,
-    forwarded: &HashMap<LocalId, LocalId>,
+    forwarded: &HashMap<LocalId, LocalId, Global>,
 ) -> Vec<(LocalId, LocalId)> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
     let slot = return_slot();
@@ -14550,11 +15559,11 @@ fn moved_arguments(
     if found.is_empty() {
         return found;
     }
-    let mut mentions: HashMap<LocalId, usize> = HashMap::default();
+    let mut mentions: HashMap<LocalId, usize, Global> = HashMap::new_in(Global);
     body.visit_places(|place| *mentions.entry(place.local).or_default() += 1);
     let not_uses = drops_and_fake_reads(body);
     let dropped_or_read = |local: LocalId| not_uses.get(&local).copied().unwrap_or(0);
-    let bound: blaze_hash::HashSet<LocalId> = body
+    let bound: blaze_hash::HashSet<LocalId, Global> = body
         .binding_locals
         .values()
         .chain(&body.param_locals)
@@ -14574,7 +15583,7 @@ fn moved_arguments(
             && body.locals[temp].ty == body.locals[from].ty
     });
     // alloc: once per body with a moved argument, which this has no frame for
-    let temps: blaze_hash::HashSet<LocalId> = found.iter().map(|it| it.0).collect();
+    let temps: blaze_hash::HashSet<LocalId, Global> = found.iter().map(|it| it.0).collect();
     found.retain(|(_, from)| !temps.contains(from));
     blaze_ids::radix::sort_copy_by_key(&mut found, |&(temp, from)| {
         blaze_ids::radix::pack_32(temp.into_raw().into_u32(), from.into_raw().into_u32())
@@ -14587,9 +15596,9 @@ fn moved_arguments(
 /// after it is written: `let buffer = [0u8; N]` builds the array in a temporary and copies it.
 /// The two can be one slot, the binding holding nothing yet when the temporary is written, and
 /// a frame is not twice the size of what it declares.
-fn forwarded_temps(body: &MirBody<'_>) -> HashMap<LocalId, LocalId> {
+fn forwarded_temps(body: &MirBody<'_>) -> HashMap<LocalId, LocalId, Global> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
-    let mut forwarded = HashMap::default();
+    let mut forwarded = HashMap::new_in(Global);
     if body.coroutine.is_some() {
         return forwarded;
     }
@@ -14640,13 +15649,13 @@ fn forwarded_temps(body: &MirBody<'_>) -> HashMap<LocalId, LocalId> {
         return forwarded;
     }
     // Written once and read once, and by nothing else: the binding is not what it is made of.
-    let mut mentions: HashMap<LocalId, usize> = HashMap::default();
+    let mut mentions: HashMap<LocalId, usize, Global> = HashMap::new_in(Global);
     body.visit_places(|place| *mentions.entry(place.local).or_default() += 1);
     // A drop of the temporary is not a use: it holds a value only between the two statements,
     // which unwind to nowhere, and a drop of it then finds the slot holding its value.
     let not_uses = drops_and_fake_reads(body);
     let dropped_or_read = |local: LocalId| not_uses.get(&local).copied().unwrap_or(0);
-    let bound: blaze_hash::HashSet<LocalId> = body
+    let bound: blaze_hash::HashSet<LocalId, Global> = body
         .binding_locals
         .values()
         .chain(&body.param_locals)
@@ -14742,7 +15751,7 @@ mod tests {
             "panic_const_div_by_zero",
             "panic_const_rem_by_zero",
         ];
-        let distinct: blaze_hash::HashSet<_> = names.iter().collect();
+        let distinct: blaze_hash::HashSet<_, std::alloc::Global> = names.iter().collect();
         assert_eq!(distinct.len(), names.len());
     }
 
@@ -14750,7 +15759,7 @@ mod tests {
     /// dominator tree another function grew, gives the bytes a fresh context gives.
     #[test]
     fn a_kept_context_compiles_what_a_fresh_one_does() {
-        let isa = super::target().unwrap();
+        let isa = super::isa_for(super::Target::for_host()).unwrap();
         let build = |blocks: usize, by: i64| {
             let mut sig = ir::Signature::new(isa.default_call_conv());
             sig.params.push(AbiParam::new(types::I64));
@@ -14777,10 +15786,10 @@ mod tests {
         };
         let fresh = {
             let mut context = cranelift_codegen::Context::for_function(build(2, 41));
-            super::emit(&mut context).unwrap()
+            super::emit(&mut context, super::Target::for_host()).unwrap()
         };
-        super::with_context(build(64, 3), |context| super::emit(context).unwrap());
-        let kept = super::with_context(build(2, 41), |context| super::emit(context).unwrap());
+        super::with_context(build(64, 3), |context| super::emit(context, super::Target::for_host()).unwrap());
+        let kept = super::with_context(build(2, 41), |context| super::emit(context, super::Target::for_host()).unwrap());
         assert_eq!(kept.bytes, fresh.bytes);
         assert_eq!(kept.relocs.len(), fresh.relocs.len());
         assert_eq!(kept.align, fresh.align);
@@ -14803,7 +15812,7 @@ mod tests {
     /// `cargo test`: a placeholder of `u32::MAX` refused every function as a backend panic.
     #[test]
     fn emit_compiles_a_function_with_debug_assertions_on() {
-        let isa = super::target().unwrap();
+        let isa = super::isa_for(super::Target::for_host()).unwrap();
         let mut sig = ir::Signature::new(isa.default_call_conv());
         sig.returns.push(AbiParam::new(types::I32));
         let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
@@ -14816,7 +15825,7 @@ mod tests {
         builder.ins().return_(&[zero]);
         builder.finalize(isa.frontend_config());
         let mut ctx = cranelift_codegen::Context::for_function(func);
-        let code = super::emit(&mut ctx).unwrap();
+        let code = super::emit(&mut ctx, super::Target::for_host()).unwrap();
         assert!(!code.bytes.is_empty());
     }
 
@@ -15026,7 +16035,7 @@ mod tests {
             ("x86_64-unknown-linux-gnu", Reloc::X86CallPCRel4),
         ] {
             let isa = isa_of(triple);
-            let mut wants = super::fragment::Wants::new(isa);
+            let mut wants = super::fragment::Wants::new(crate::Target::for_host(), isa);
             let sig = ir::Signature::new(isa.default_call_conv());
             let callee = wants.import("callee", &sig).unwrap();
             let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
@@ -15048,7 +16057,7 @@ mod tests {
     /// with `memcpy`, or `memmove` where `overlap`, as `copy_nonoverlapping::<[u64; 3]>(.., 1)`
     /// is built: the count times the size of the type.
     fn copying(size: (i64, i64), overlap: bool) -> ir::Function {
-        let isa = super::target().unwrap();
+        let isa = super::isa_for(super::Target::for_host()).unwrap();
         let pointer = isa.pointer_type();
         let mut sig = ir::Signature::new(isa.default_call_conv());
         sig.params.extend([AbiParam::new(pointer), AbiParam::new(pointer)]);
@@ -15107,7 +16116,7 @@ mod tests {
         let stores = loads.map(|(_, ty)| (Store, ty));
         assert_eq!(accesses(&func), [&loads[..], &stores[..]].concat());
         let mut ctx = cranelift_codegen::Context::for_function(func);
-        assert!(!super::emit(&mut ctx).unwrap().bytes.is_empty());
+        assert!(!super::emit(&mut ctx, super::Target::for_host()).unwrap().bytes.is_empty());
     }
 
     /// One of more than 128 bytes stays a call, of `memcpy` named in place.
@@ -15123,7 +16132,7 @@ mod tests {
     /// `memcmp`; of more, it has no such comparison.
     #[test]
     fn raw_eq_of_two_words_compares_integers() {
-        let isa = super::target().unwrap();
+        let isa = super::isa_for(super::Target::for_host()).unwrap();
         let pointer = isa.pointer_type();
         let mut sig = ir::Signature::new(isa.default_call_conv());
         sig.params.extend([AbiParam::new(pointer), AbiParam::new(pointer)]);
@@ -15145,17 +16154,17 @@ mod tests {
         let (i64, i32) = (Some(types::I64), Some(types::I32));
         assert_eq!(loads, [i64, i64, i32, i32]);
         let mut ctx = cranelift_codegen::Context::for_function(func);
-        assert!(super::emit(&mut ctx).unwrap().relocs.is_empty());
+        assert!(super::emit(&mut ctx, super::Target::for_host()).unwrap().relocs.is_empty());
     }
 
     /// A function that reads its return address, as the fuzz engine's comparison callbacks do,
     /// compiles in a unit that keeps no frame pointers: it alone keeps one.
     #[test]
     fn a_function_reading_its_return_address_keeps_its_frame_pointer() {
-        if super::Target::current().is_wasm() {
+        if super::Target::for_host().is_wasm() {
             return;
         }
-        let isa = super::target().unwrap();
+        let isa = super::isa_for(super::Target::for_host()).unwrap();
         let pointer = isa.pointer_type();
         let mut sig = ir::Signature::new(isa.default_call_conv());
         sig.returns.push(AbiParam::new(pointer));
@@ -15169,7 +16178,7 @@ mod tests {
         builder.ins().return_(&[address]);
         builder.finalize(isa.frontend_config());
         let mut ctx = cranelift_codegen::Context::for_function(func);
-        assert!(!super::emit(&mut ctx).unwrap().bytes.is_empty());
+        assert!(!super::emit(&mut ctx, super::Target::for_host()).unwrap().bytes.is_empty());
     }
 
     /// `ub_checks()` is what rustc makes it: in core, alloc and std the compiling crate's

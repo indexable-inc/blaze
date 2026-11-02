@@ -1,12 +1,10 @@
-//! What blaze emits code for. The target is an input of the process, named by its triple
-//! (`blaze --target <triple>`), and the host when nothing names one. Everything in the
-//! backend that differs between platforms asks the [`Target`] for the property it depends
+//! What blaze emits code for. The target is an input of each unit, named by its triple
+//! (its toolchain's, the same as its crate's `TargetData`), and one process lowers units of
+//! several side by side: the host's and wasm32 for proc macros. Everything in the backend that differs between platforms asks the [`Target`] for the property it depends
 //! on (architecture, object format, calling convention, unwind tables) and never asks what
 //! the daemon itself was built for.
 
 #![forbid(unsafe_code)]
-
-use std::sync::OnceLock;
 
 use blaze_stencil::TlsModel;
 use cranelift_codegen::{
@@ -16,7 +14,13 @@ use cranelift_codegen::{
 };
 use parking_lot::Mutex;
 
-static SELECTED: OnceLock<Target> = OnceLock::new();
+/// Each target a unit has named ([`Target::of`]), parsed once and kept for the process. A
+/// process builds for a handful (the host, wasm32 for proc macros), so a scan finds one.
+static NAMED: Mutex<Vec<&'static Target>> = Mutex::new(Vec::new());
+
+/// The most targets one process lowers units for. A code generator is kept per target and
+/// set of features (`crate::target_of`), by the target's place in [`NAMED`].
+pub(crate) const MOST_TARGETS: usize = 8;
 
 /// The most sets of target features one process compiles with: each toolchain's
 /// (`Toolchain::features`: a dev job's host features, a release job's baseline) and each
@@ -29,8 +33,9 @@ const _: () = assert!(MOST_FEATURE_SETS <= u8::MAX as usize + 1);
 /// The sets [`Features`] number, past the baseline's (0, never set), in the order they were
 /// first named, each once. Only added to, under [`ADDING`], in order, so a slot that is not
 /// set yet ends the sets; read with no lock.
-static FEATURE_SETS: [OnceLock<Box<[String]>>; MOST_FEATURE_SETS] =
-    [const { OnceLock::new() }; MOST_FEATURE_SETS];
+#[expect(clippy::disallowed_types, reason = "the process's one numbering of feature sets: a `Features` is its number, read with no lock")]
+static FEATURE_SETS: [std::sync::OnceLock<Box<[String]>>; MOST_FEATURE_SETS] =
+    [const { std::sync::OnceLock::new() }; MOST_FEATURE_SETS];
 
 /// Held while a set is added to [`FEATURE_SETS`].
 static ADDING: Mutex<()> = Mutex::new(());
@@ -138,6 +143,8 @@ const AARCH64_FEATURES: [(&str, &str); 5] = [
 #[derive(Debug)]
 pub struct Target {
     triple: String,
+    /// Its place among the targets the process has named ([`Target::of`]).
+    index: u8,
     pub arch: Arch,
     pub object_format: ObjectFormat,
     /// The convention of `extern "C"`, which the Rust conventions are laid over.
@@ -203,6 +210,18 @@ impl ObjectFormat {
             ObjectFormat::Elf | ObjectFormat::Coff | ObjectFormat::Wasm => ".L",
         }
     }
+
+    /// Whether a global may be put in a COMDAT. rustc's `TargetOptions::supports_comdat`
+    /// (`rustc_target/src/spec/mod.rs`) says no for Darwin and AIX, as LLVM's
+    /// `Triple::supportsCOMDAT` does for Mach-O and XCOFF: LLVM ends the process when a module
+    /// for Mach-O has one ("MachO doesn't support COMDATs"). Mach-O instead keeps each symbol's
+    /// code apart by `.subsections_via_symbols`, which every object LLVM writes for it has.
+    pub fn supports_comdat(self) -> bool {
+        match self {
+            ObjectFormat::Elf | ObjectFormat::Coff | ObjectFormat::Wasm => true,
+            ObjectFormat::MachO => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,19 +245,27 @@ pub enum Calls {
 }
 
 impl Target {
-    /// Names the target of this process. It is said once, before anything is compiled.
-    pub fn select(triple: &str) -> Result<&'static Target, String> {
-        let target = Target::parse(triple)?;
-        let selected = SELECTED.get_or_init(|| {
-            hir_ty_mir::mir::target::select_word(target.word());
-            target
-        });
-        if selected.triple == triple {
-            Ok(selected)
-        } else {
-            // alloc: an error
-            Err(format!("the target is {} already, not {triple}", selected.triple))
+    /// The target `triple` names, for one unit: each unit's codegen and layout ask its own,
+    /// so units of two targets lower side by side in one process with nothing shared.
+    pub fn of(triple: &str) -> Result<&'static Target, String> {
+        let mut named = NAMED.lock();
+        if let Some(target) = named.iter().find(|it| it.triple == triple) {
+            return Ok(target);
         }
+        if named.len() >= MOST_TARGETS {
+            // alloc: an error
+            return Err(format!("{triple} is past the {MOST_TARGETS} targets one process lowers for"));
+        }
+        let index = named.len() as u8;
+        // alloc: leaked once per target named, for the process (setup)
+        let target: &'static Target = Box::leak(Box::new(Target::parse(triple, index)?));
+        named.push(target);
+        Ok(target)
+    }
+
+    /// Its place among the targets the process has named, below [`MOST_TARGETS`].
+    pub(crate) fn index(&self) -> usize {
+        usize::from(self.index)
     }
 
     /// The set of target features past the baseline of [`Target::cpu`] that `features` names:
@@ -327,14 +354,6 @@ impl Target {
         Ok(table.iter().find(|(it, _)| *it == name).map(|&(_, setting)| (setting, on)))
     }
 
-    /// The target that was named, or the host.
-    pub fn selected() -> Result<&'static Target, String> {
-        match SELECTED.get() {
-            Some(target) => Ok(target),
-            None => Target::select(Target::host()),
-        }
-    }
-
     /// The triple of what the daemon itself runs on.
     pub fn host() -> &'static str {
         // The wasm backend writes its own code from Cranelift's IR and only borrows the
@@ -355,7 +374,30 @@ impl Target {
         }
     }
 
-    pub(crate) fn parse(triple: &str) -> Result<Target, String> {
+    /// The target of the machine a test runs on, which its compiled code runs on too.
+    #[cfg(test)]
+    pub(crate) fn for_host() -> &'static Target {
+        Target::of(Target::host()).expect("blaze emits code for the host it is tested on")
+    }
+
+    /// The target of a fixture's crates (`hir_expand::fixture` gives every crate that is not
+    /// wasm x86-64 Linux's tuple and layout), whatever the host: a unit of a fixture's function
+    /// names it, as codegen refuses a unit whose target is not its crate's. A test that runs
+    /// what it compiles uses [`Self::for_host`] and a fixture of the host's layout instead.
+    #[cfg(test)]
+    pub(crate) fn for_fixtures() -> &'static Target {
+        Target::x86_64_linux()
+    }
+
+    /// x86-64 Linux, whatever the host: the target of a test that inspects or links code it
+    /// never runs, written against System V calls and ELF sections (the LLVM backend's IR
+    /// tests).
+    #[cfg(test)]
+    pub(crate) fn x86_64_linux() -> &'static Target {
+        Target::of("x86_64-unknown-linux-gnu").expect("x86-64 Linux's target")
+    }
+
+    fn parse(triple: &str, index: u8) -> Result<Target, String> {
         let mut parts = triple.split('-');
         let arch = match parts.next() {
             Some("x86_64") => Arch::X86_64,
@@ -383,13 +425,7 @@ impl Target {
             _ => return Err(format!("blaze emits no code for the system of {triple}")),
         };
         // alloc: once per target parsed, at setup
-        Ok(Target { triple: triple.to_owned(), arch, object_format, call_conv, unwind })
-    }
-
-    /// The target of the process, once it is known that there is one: nothing is compiled
-    /// before [`Target::selected`] has said so.
-    pub fn current() -> &'static Target {
-        Target::selected().unwrap_or_else(|error| panic!("{error}"))
+        Ok(Target { triple: triple.to_owned(), index, arch, object_format, call_conv, unwind })
     }
 
     pub fn is_wasm(&self) -> bool {
@@ -418,6 +454,11 @@ impl Target {
     /// How many bytes an address takes.
     pub(crate) fn word(&self) -> usize {
         self.pointer().bytes() as usize
+    }
+
+    /// Where the second word of a wide pointer is.
+    pub(crate) fn meta_at(&self) -> i32 {
+        self.word() as i32
     }
 
     pub fn triple(&self) -> &str {
@@ -678,7 +719,7 @@ mod tests {
 
     #[test]
     fn a_set_is_one_number_and_two_sets_two() {
-        let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
         assert_eq!(x86.features_of(&[]), Ok(Features::BASELINE));
         let avx2 = x86.features_of(&names(&["+avx", "+avx2"])).expect("a set");
         let again = x86.features_of(&names(&["+avx", "+avx2"])).expect("a set");
@@ -692,7 +733,7 @@ mod tests {
 
     #[test]
     fn a_set_out_of_order_twice_or_on_and_off_is_refused() {
-        let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
         assert!(x86.features_of(&names(&["+avx2", "+avx"])).is_err());
         assert!(x86.features_of(&names(&["+avx", "+avx"])).is_err());
         assert!(x86.features_of(&names(&["+popcnt", "-popcnt"])).is_err());
@@ -703,7 +744,7 @@ mod tests {
     /// Sets are numbered from many threads at once: each set gets one number.
     #[test]
     fn sets_named_at_once_get_one_number_each() {
-        let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
         let sets = [["+bmi1"], ["+bmi2"], ["+lzcnt"], ["+fma"]].map(|it| names(&it));
         let numbered: Vec<Vec<Features>> = std::thread::scope(|scope| {
             let threads: Vec<_> = (0..8)
@@ -725,7 +766,7 @@ mod tests {
     /// One ISA per set: each has its set's settings and the baseline's has none of them.
     #[test]
     fn each_set_has_its_own_isa() {
-        let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
         let avx2 = x86.features_of(&names(&["+avx", "+avx2", "+sse3", "+sse4.1", "+sse4.2", "+ssse3"])).expect("a set");
         let ssse3 = x86.features_of(&names(&["+sse3", "+ssse3"])).expect("a set");
         assert_eq!(setting_with(&x86, avx2, "has_avx2"), Some(true));
@@ -733,7 +774,7 @@ mod tests {
         assert_eq!(setting_with(&x86, ssse3, "has_ssse3"), Some(true));
         assert_eq!(setting_with(&x86, ssse3, "has_avx2"), Some(false));
         assert_eq!(setting(&x86, "has_ssse3"), Some(false));
-        let arm = Target::parse("aarch64-apple-darwin").expect("a target");
+        let arm = Target::of("aarch64-apple-darwin").expect("a target");
         let off = arm.features_of(&names(&["-lse"])).expect("a set");
         assert_eq!(setting_with(&arm, off, "has_lse"), Some(false));
         assert_eq!(setting(&arm, "has_lse"), Some(true));
@@ -742,7 +783,7 @@ mod tests {
     /// rustc's `to_llvm_features` for LLVM 23, and Windows' `+cx16` first.
     #[test]
     fn llvm_is_told_the_features_in_its_names() {
-        let linux = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let linux = Target::of("x86_64-unknown-linux-gnu").expect("a target");
         assert_eq!(linux.llvm_features(Features::BASELINE), "");
         let set = linux
             .features_of(&names(&["+avx2", "+bmi1", "+lahfsahf", "+pclmulqdq", "+sse4.2", "-cmpxchg16b"]))
@@ -750,11 +791,11 @@ mod tests {
         assert_eq!(linux.llvm_features(set), "+avx2,+bmi,+sahf,+pclmul,+sse4.2,+crc32,-cx16");
         let off = linux.features_of(&names(&["-sse4.2"])).expect("a set");
         assert_eq!(linux.llvm_features(off), "-sse4.2");
-        let windows = Target::parse("x86_64-pc-windows-msvc").expect("a target");
+        let windows = Target::of("x86_64-pc-windows-msvc").expect("a target");
         assert_eq!(windows.llvm_features(Features::BASELINE), "+cx16");
         let avx = windows.features_of(&names(&["+avx"])).expect("a set");
         assert_eq!(windows.llvm_features(avx), "+cx16,+avx");
-        let arm = Target::parse("aarch64-unknown-linux-gnu").expect("a target");
+        let arm = Target::of("aarch64-unknown-linux-gnu").expect("a target");
         let set = arm.features_of(&names(&["+fp16", "+paca", "+pacg", "+rcpc2", "+tme"])).expect("a set");
         assert_eq!(arm.llvm_features(set), "+fullfp16,+pauth,+rcpc-immo");
         let neon = arm.features_of(&names(&["+fhm", "+neon"])).expect("a set");
@@ -763,8 +804,8 @@ mod tests {
 
     #[test]
     fn only_a_cpu_that_has_lse_is_given_it() {
-        let apple = Target::parse("aarch64-apple-darwin").expect("a target");
-        let linux = Target::parse("aarch64-unknown-linux-gnu").expect("a target");
+        let apple = Target::of("aarch64-apple-darwin").expect("a target");
+        let linux = Target::of("aarch64-unknown-linux-gnu").expect("a target");
         assert_eq!(setting(&apple, "has_lse"), Some(true));
         assert_eq!(setting(&linux, "has_lse"), Some(false));
     }
@@ -772,7 +813,7 @@ mod tests {
     #[test]
     fn the_baseline_of_x86_64_is_what_rustc_compiles_for() {
         for triple in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
-            let target = Target::parse(triple).expect("a target");
+            let target = Target::of(triple).expect("a target");
             let later = ["has_sse3", "has_sse41", "has_popcnt", "has_avx", "has_bmi1", "has_lzcnt"];
             for name in later {
                 assert_eq!(setting(&target, name), Some(false), "{triple}: {name}");
@@ -791,7 +832,7 @@ mod tests {
             "x86_64-pc-windows-msvc",
         ];
         for triple in triples {
-            let target = Target::parse(triple).expect("a target");
+            let target = Target::of(triple).expect("a target");
             let stencil = target.stencil().expect("a stencil target");
             let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
             let flags = isa.flags();
@@ -808,16 +849,16 @@ mod tests {
             let lse = setting(&target, "has_lse") == Some(true);
             assert_eq!(stencil.cpu == blaze_stencil::Cpu::AppleM1, lse, "{triple}");
         }
-        let apple = Target::parse("aarch64-apple-darwin").expect("a target").stencil().expect("a stencil target");
+        let apple = Target::of("aarch64-apple-darwin").expect("a target").stencil().expect("a stencil target");
         assert_eq!((apple.arch, apple.os), (blaze_codegen::Arch::Aarch64, blaze_stencil::Os::MacOs));
-        let windows = Target::parse("x86_64-pc-windows-msvc").expect("a target").stencil().expect("a stencil target");
+        let windows = Target::of("x86_64-pc-windows-msvc").expect("a target").stencil().expect("a stencil target");
         assert_eq!((windows.arch, windows.os), (blaze_codegen::Arch::X86_64, blaze_stencil::Os::Windows));
-        assert_eq!(Target::parse("wasm32-wasip1").expect("a target").stencil(), None);
+        assert_eq!(Target::of("wasm32-wasip1").expect("a target").stencil(), None);
     }
 
     #[test]
     fn tests_verify_what_cranelift_is_given() {
-        let target = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let target = Target::of("x86_64-unknown-linux-gnu").expect("a target");
         let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
         assert!(isa.flags().enable_verifier());
         assert_eq!(isa.flags().opt_level(), OptLevel::None);
@@ -828,8 +869,8 @@ mod tests {
     /// Every setting a feature names is one Cranelift's ISA of the architecture has.
     #[test]
     fn every_mapped_feature_is_a_setting_of_its_isa() {
-        let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
-        let arm = Target::parse("aarch64-unknown-linux-gnu").expect("a target");
+        let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
+        let arm = Target::of("aarch64-unknown-linux-gnu").expect("a target");
         for (target, table) in [(&x86, &X86_FEATURES[..]), (&arm, &AARCH64_FEATURES[..])] {
             for &(feature, name) in table {
                 assert_eq!(setting(target, name).map(|_| ()), Some(()), "{feature}: {name}");
@@ -847,11 +888,11 @@ mod tests {
     fn apple_aarch64_passes_f16_and_f128() {
         use cranelift_codegen::ir::{self, AbiParam, InstBuilder as _, types};
         use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-        let apple = Target::parse("aarch64-apple-darwin").expect("a target");
+        let apple = Target::of("aarch64-apple-darwin").expect("a target");
         assert_eq!(apple.call_conv, cranelift_codegen::isa::CallConv::AppleAarch64);
         assert!(crate::f16_f128::soft_floats(&apple));
-        assert!(crate::f16_f128::soft_floats(&Target::parse("aarch64-unknown-linux-gnu").expect("a target")));
-        assert!(!crate::f16_f128::soft_floats(&Target::parse("x86_64-pc-windows-msvc").expect("a target")));
+        assert!(crate::f16_f128::soft_floats(&Target::of("aarch64-unknown-linux-gnu").expect("a target")));
+        assert!(!crate::f16_f128::soft_floats(&Target::of("x86_64-pc-windows-msvc").expect("a target")));
         let isa = apple.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
         let mut signature = ir::Signature::new(apple.call_conv);
         signature.params.extend([AbiParam::new(types::F16), AbiParam::new(types::F128)]);
@@ -875,16 +916,43 @@ mod tests {
 
     #[test]
     fn features_cranelift_always_uses_cannot_be_turned_off() {
-        let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
         assert_eq!(x86.cranelift_setting("+sse2"), Ok(None));
         assert!(x86.cranelift_setting("-sse2").is_err());
         assert_eq!(x86.cranelift_setting("-cmpxchg16b"), Ok(None));
         assert_eq!(x86.cranelift_setting("+aes"), Ok(None));
-        let arm = Target::parse("aarch64-apple-darwin").expect("a target");
+        let arm = Target::of("aarch64-apple-darwin").expect("a target");
         assert_eq!(arm.arch, Arch::Aarch64);
         assert!(arm.cranelift_setting("-neon").is_err());
         for malformed in ["", "+", "-", "avx2", "*avx2"] {
             assert!(x86.cranelift_setting(malformed).is_err(), "{malformed:?}");
+        }
+    }
+
+    /// A target is what its triple says whichever targets the process named before: its word,
+    /// its pointer type and its ISA are its own, and naming it again gives the same one.
+    #[hegel::test]
+    fn a_target_is_its_triple_whatever_was_named_before(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let triples = vec![Target::host(), "wasm32-wasip1"];
+        let order: Vec<&str> = tc.draw(gs::vecs(gs::sampled_from(triples)).min_size(1).max_size(8));
+        for triple in order {
+            let target = Target::of(triple).expect("a target");
+            assert_eq!(target.triple(), triple);
+            assert!(std::ptr::eq(target, Target::of(triple).expect("a target")));
+            let word = match target.arch {
+                Arch::Wasm32 => 4,
+                Arch::X86_64 | Arch::Aarch64 => 8,
+            };
+            assert_eq!(target.word(), word);
+            assert_eq!(target.pointer().bytes() as usize, word);
+            // A wasm32 target borrows a native ISA's settings, so only a native one's
+            // pointer is the ISA's.
+            let isa = crate::isa_for(target).expect("the target's ISA");
+            assert!(std::ptr::eq(&**isa, &**crate::isa_for(target).expect("the target's ISA")));
+            if !target.is_wasm() {
+                assert_eq!(isa.pointer_type(), target.pointer());
+            }
         }
     }
 }

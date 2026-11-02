@@ -8,6 +8,7 @@ mod transcriber;
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use span::Span;
 use syntax_bridge::to_matcher_input;
 use tt::{DelimSpan, iter::TtIter};
@@ -77,7 +78,7 @@ pub(crate) fn expand_rules(
 /// repetition the metavariable is in.
 #[derive(Debug, Default, Clone)] // clone: the `#[cfg(test)]` model of the old matcher, which copies bindings per fork
 struct Bindings<'a> {
-    inner: HashMap<MetaVar, Binding<'a>>,
+    inner: HashMap<MetaVar, Binding<'a>, Global>,
 }
 
 #[derive(Debug, Clone)] // clone: as `Bindings`, test-only

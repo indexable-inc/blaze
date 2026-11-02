@@ -27,6 +27,7 @@
 //! - [`units`]: the launchd agent and systemd units that socket-activate it.
 
 #![deny(unsafe_code)]
+#![feature(allocator_api)]
 
 pub mod activation;
 pub mod borrowed;
@@ -70,8 +71,11 @@ use serde::{Deserialize, Serialize};
 /// [`Response::DocPage`] and [`Response::Documented`]. 19: [`Cargo::refused`]. 20:
 /// [`Request::Explore`], [`Request::Profile`], [`Request::Live`], [`Request::Sql`], their
 /// answers, and [`Status::history`]. 21: [`Edit::Replace`]. 22: [`Status::build`]. 23:
-/// [`Request::Hot`] and [`Response::Hot`].
-pub const SCHEMA: u32 = 23;
+/// [`Request::Hot`] and [`Response::Hot`]. 24: [`Request::Gc`] and [`Response::Collected`]. 25:
+/// [`Response::UnitBegan`] and [`Response::TestReady`], which let `blaze test` run a test
+/// executable while the rest of the build goes on. 26: [`Request::Rebuilt`] and
+/// [`Response::Rebuilt`] (`blaze why`), grouped on the daemon. 27: [`Worked::placed`].
+pub const SCHEMA: u32 = 27;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -307,6 +311,137 @@ pub enum Request {
     /// each kind of wait's quantiles, from the daemon's live sketches (blaze-profile's `hot`),
     /// no history read; answered with [`Response::Hot`].
     Hot { top: u32, since: HotSince },
+    /// `blaze cache gc` while the daemon holds the collector's areas: one run of the daemon's
+    /// collector to its end (`dry_run` plans and removes nothing), answered with
+    /// [`Response::Collected`] as it records. Answered by the daemon's loop, which holds the
+    /// collector.
+    Gc { dry_run: bool },
+    /// `blaze why [ITEM]`: what the last build that ended in this daemon's life computed again
+    /// instead of reusing, grouped by step and reason, each group with its first items (every
+    /// one with `all`); with `item`, that item's reasons and, after them, those of each item a
+    /// reason names, in order (its chain). Of the last build of the workspace holding `cwd`
+    /// (an absolute path), or with none the newest build's. Answered with
+    /// [`Response::Rebuilt`] by the daemon's loop, which keeps each workspace's last reasons.
+    Rebuilt { all: bool, cwd: Option<String>, item: Option<String> },
+}
+
+/// [`Request::Rebuilt`]'s answer.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Rebuilt {
+    /// Why what the build is compared against is short, when it is: blaze why's ledger did
+    /// not restore whole at the daemon's start, so an item it lost reads as computed first.
+    pub torn: Option<String>,
+    /// The build they are of: the workspace's last (or the newest) that ended since the daemon
+    /// started; none when none has (an earlier daemon's builds are in the history's `misses`
+    /// table).
+    pub build: Option<u64>,
+    /// Whether an item was asked and found, so that `rebuilt` is its chain: its own reasons
+    /// first, then each item one of them names, in the order they are reached.
+    pub chain: bool,
+    /// How many things the build computed again, of those asked of (every one, or those whose
+    /// item starts with the one asked).
+    pub count: u32,
+    /// Without a chain: what was computed again by step and reason, the most items first.
+    pub groups: Vec<RebuildGroup>,
+    /// The build's command line, when there is a build.
+    pub command: Option<String>,
+    /// Subjects last computed in this build or before were dropped from blaze why's ledger to
+    /// keep it under its cap: an item read as computed first may be one of them.
+    pub dropped: Option<u64>,
+    /// With a chain: its reasons in order.
+    pub rebuilt: Vec<Rebuild>,
+    /// Whether the daemon is still restoring blaze why's ledger (off its start path), so what
+    /// `torn` says is not known yet.
+    pub restoring: bool,
+    /// The build's workspace, when there is a build.
+    pub workspace: Option<String>,
+}
+
+/// Things one build computed again for one reason.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct RebuildGroup {
+    /// What was computed again: `codegen dev template`, `unit`, `build script run`.
+    pub step: String,
+    /// The reason, as its first item has it: what each item of the group shares is its kind
+    /// and what it names (the parts, the read), not the build it is compared with.
+    pub cause: RebuildCause,
+    /// How many items the group has.
+    pub count: u32,
+    /// Its items by path, sorted: the first 8, or every one when asked for all.
+    pub items: Vec<String>,
+}
+
+/// One thing a build computed again, and why.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Rebuild {
+    /// What it is of, by path: a function, a unit (`app v0.1.0 (lib)`), a package's build
+    /// script's run. Only for a person: two of one name (one function built for a test and
+    /// for a program) are told apart by blaze, not by it.
+    pub item: String,
+    /// What was computed again: `codegen dev template`, `unit`, `build script run`.
+    pub step: String,
+    pub cause: RebuildCause,
+}
+
+/// Why something was computed again rather than reused.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum RebuildCause {
+    /// Nothing was kept under its key, and blaze has no record of computing it before.
+    First,
+    /// Parts of its key changed since it was last computed, in build `since` (the last build
+    /// that computed it and ended well; builds between may have reused it under another key):
+    /// each one that changed, of the key's `parts`.
+    Parts { parts: u32, since: u64, changed: Vec<PartChanged> },
+    /// Its key is the one it had when last computed, in build `since`, yet nothing is kept
+    /// under it: that compute did not keep it.
+    Lost { since: u64 },
+    /// Its key is the one it had when last computed, in build `since`, so what its value is
+    /// filed under past the key differs, or that compute did not keep it: `what` is filed
+    /// beyond the key, which blaze does not explain yet.
+    Beyond { what: String, since: u64 },
+    /// Its key differs from build `since`'s, yet every part it names is the same: the key has
+    /// a part it does not name.
+    Unnamed { since: u64 },
+    /// A read the entry kept last recorded hashes differently now: the first such, named by
+    /// path, the hashes it saw then and sees now (none: it names nothing), and `changed` of
+    /// the entry's `reads` that changed; `since` is the build that kept that entry.
+    Read {
+        now: Option<ContentId>,
+        was: Option<ContentId>,
+        read: String,
+        names: Option<String>,
+        reads: u32,
+        since: Option<u64>,
+        changed: u32,
+    },
+    /// Shapes of its reads are kept, but blaze has no record of the entry it kept last: kept
+    /// by another daemon, or before its ledger began.
+    Unrecorded,
+    /// The entry blaze recorded as kept last is not in the store: that compute did not keep
+    /// it.
+    Collected,
+    /// Every read of the entry kept last hashes as it did, yet no shape of reads names it: a
+    /// keep that did not finish.
+    Unshaped,
+    /// The build computed it `count` times under different keys, so none is compared with its
+    /// last compute: blaze told the instances apart by less than their keys (a bug in blaze).
+    Twice { count: u32 },
+    /// It is computed every time: why.
+    Always { why: String },
+    /// Its key does not expose its parts yet: the kind of key.
+    NotExplained { what: String },
+    /// The reason could not be worked out: what failed.
+    Failed { why: String },
+}
+
+/// A part of a key that changed: its hash then and now (none: absent), its name, and the item
+/// it is of, when another's (what a chain follows).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct PartChanged {
+    pub now: Option<ContentId>,
+    pub was: Option<ContentId>,
+    pub part: String,
+    pub names: Option<String>,
 }
 
 /// Which stretch of the daemon's life a [`Request::Hot`] sums.
@@ -493,6 +628,20 @@ pub enum Response {
     },
     /// [`Request::Hot`]'s answer.
     Hot(Hot),
+    /// [`Request::Gc`]'s answer: the run's report as `blaze cache gc` prints it (its line, each
+    /// volume, each object's fate).
+    Collected { report: String },
+    /// A unit's compile began: one for every unit, where [`Response::Unit`] is one for its
+    /// package. Sent only for a cargo `test` or `bench` build, with a
+    /// [`Response::UnitEnded`] for every unit too (not only those with diagnostics), so the
+    /// command's live view shows each unit under way and done.
+    UnitBegan(UnitOf),
+    /// A test executable (or a doc test's) is linked and placed, ready to run before the build
+    /// ends: sent only for a cargo `test` or `bench` build, and before its
+    /// [`Response::Built`], which still lists it.
+    TestReady(Artifact),
+    /// [`Request::Rebuilt`]'s answer.
+    Rebuilt(Rebuilt),
 }
 
 /// What a [`Request::Doc`] documented.
@@ -738,6 +887,20 @@ pub struct Worked {
     pub steps_us: Vec<(NodeKind, u64)>,
     /// The plane's critical path of the request.
     pub critical_path_us: u64,
+    /// How the files of the outputs it placed in the build dir got there.
+    pub placed: PlacedBytes,
+}
+
+/// How a build put its outputs' files into its build dir, in bytes (docs/cargo.md, "Where a
+/// build writes"): a copy where a clone was meant shows here.
+#[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct PlacedBytes {
+    /// Cloned from the store, sharing its blocks: no new bytes on disk.
+    pub cloned: u64,
+    /// Written into the store once, as the whole files later builds clone.
+    pub written: u64,
+    /// Copied out of the store by writing: outputs too short to clone.
+    pub copied: u64,
 }
 
 /// A dependency crate of [`Worked::served`].

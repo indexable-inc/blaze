@@ -110,7 +110,10 @@ it once it runs.
   - a crate served before under the same key and mode is kept and not fetched again;
   - one whose key changed is fetched again, and loses its image when none is found.
 - **Store.** `deps::store(db, served, store)` writes the image of each eligible crate not
-  served, after the refusals; a store that keeps other bytes under the key is an error.
+  served, after the refusals; a store that keeps other bytes under the key is an error. Since
+  2026-11-02 it runs as the head's front end is kept, and its puts are durable before that
+  build answers ([restore.md](../../design/restore.md)). Before, it ran when the head's next
+  build lowered into the front end, so a restart after a build lost it.
 - **In place.** `ImageStore::get` returns an `ImageBuf` (`Arc<dyn Held>`, where `Held` lends
   the bytes). The driver gives `blaze_cas::Reader::pinned`, a verified range of the store's
   mapping at a 16-byte boundary, so an image is never copied. Its parts (`PartBytes::In`)

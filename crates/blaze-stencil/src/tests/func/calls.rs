@@ -1,7 +1,9 @@
 //! Calls between the two backends, both ways: direct calls of a `u0:i` name (through the
 //! GOT and, `colocated`, PC-relative), `func_addr` with `call_indirect`, a function pointer
 //! passed in as an argument and called back, and `return_call` (Cranelift takes it only in
-//! the `tail` convention, so those families are `tail` functions called from the host's).
+//! the `tail` convention, so those families are `tail` functions called from the host's; tail
+//! calls in the host's own convention, which only the stencil backend makes, are
+//! [`super::tail`]'s).
 
 use cranelift_codegen::{
     ir::{self, InstBuilder, types},

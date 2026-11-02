@@ -25,6 +25,7 @@ pub(crate) mod missing_self_default_params;
 pub(crate) mod not_a_struct_path;
 pub(crate) mod object_without_trait;
 pub(crate) mod pattern_type_not_lowered;
+pub(crate) mod query_cycle;
 pub(crate) mod self_ctor_not_tuple_or_unit;
 pub(crate) mod tyvar_behind_raw_pointer;
 pub(crate) mod const_param_ty_not_allowed;
@@ -111,11 +112,15 @@ pub(crate) mod unresolved_path;
 pub(crate) mod unsafe_binder_cast_of_non_binder;
 
 pub(crate) mod async_coroutines_not_supported;
+pub(crate) mod comptime;
+pub(crate) mod reflected_member_unmet;
 pub(crate) mod await_outside_of_async;
 pub(crate) mod int_literal_too_large;
+pub(crate) mod verify_refused;
 pub(crate) mod borrowck_error;
 pub(crate) mod borrowck_skipped;
 pub(crate) mod break_outside_of_loop;
+pub(crate) mod drop_check_overflow;
 pub(crate) mod const_check_error;
 pub(crate) mod const_eval_failed;
 pub(crate) mod const_impure;
@@ -127,6 +132,7 @@ pub(crate) mod mixed_deref_patterns;
 pub(crate) mod non_exhaustive_let;
 pub(crate) mod pattern_complexity_limit;
 pub(crate) mod return_outside_function;
+pub(crate) mod tail_call;
 pub(crate) mod undeclared_label;
 pub(crate) mod unlabeled_jump_in_labeled_block;
 pub(crate) mod unplaced_diagnostic;
@@ -219,6 +225,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::MissingSelfDefaultParams(d) => missing_self_default_params::lower(cx, &d),
         AnyDiagnostic::ObjectWithoutTrait(d) => object_without_trait::lower(cx, &d),
         AnyDiagnostic::PatternTypeNotLowered(d) => pattern_type_not_lowered::lower(cx, &d),
+        AnyDiagnostic::QueryCycle(d) => query_cycle::lower(cx, &d),
         AnyDiagnostic::NotAStructPath(d) => not_a_struct_path::lower(cx, &d),
         AnyDiagnostic::AutoderefRecursionLimit(d) => autoderef_recursion_limit::lower(cx, &d),
         AnyDiagnostic::FnTraitArgsNotTuple(d) => fn_trait_args_not_tuple::lower(cx, &d),
@@ -319,10 +326,14 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::UnresolvedPath(d) => unresolved_path::lower(cx, &d),
 
         AnyDiagnostic::AsyncCoroutinesNotSupported(d) => async_coroutines_not_supported::lower(cx, &d),
+        AnyDiagnostic::ComptimeUnsupported(d) => comptime::lower(cx, &d),
+        AnyDiagnostic::ReflectedMemberUnmet(d) => reflected_member_unmet::lower(cx, *d),
         AnyDiagnostic::AwaitOutsideOfAsync(d) => await_outside_of_async::lower(cx, &d),
         AnyDiagnostic::IntLiteralTooLarge(d) => int_literal_too_large::lower(cx, &d),
+        AnyDiagnostic::VerifyRefused(d) => verify_refused::lower(cx, &d),
         AnyDiagnostic::BorrowckError(d) => borrowck_error::lower(cx, &d),
         AnyDiagnostic::BorrowckSkipped(d) => borrowck_skipped::lower(cx, &d),
+        AnyDiagnostic::DropCheckOverflow(d) => drop_check_overflow::lower(cx, &d),
         AnyDiagnostic::BreakOutsideOfLoop(d) => break_outside_of_loop::lower(cx, &d),
         AnyDiagnostic::ConstCheckError(d) => const_check_error::lower(cx, &d),
         AnyDiagnostic::ConstEvalFailed(d) => const_eval_failed::lower(cx, &d),
@@ -335,6 +346,8 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::NonExhaustiveLet(d) => non_exhaustive_let::lower(cx, &d),
         AnyDiagnostic::PatternComplexityLimit(d) => pattern_complexity_limit::lower(cx, &d),
         AnyDiagnostic::ReturnOutsideFunction(d) => return_outside_function::lower(cx, &d),
+        AnyDiagnostic::TailCallRefused(d) => tail_call::lower(cx, &d),
+        AnyDiagnostic::TailCallTrackCaller(d) => tail_call::lower_track_caller(cx, &d),
         AnyDiagnostic::UnsafeBinderCastOfNonBinder(d) => unsafe_binder_cast_of_non_binder::lower(cx, &d),
         AnyDiagnostic::UndeclaredLabel(d) => undeclared_label::lower(cx, &d),
         AnyDiagnostic::UnlabeledJumpInLabeledBlock(d) => unlabeled_jump_in_labeled_block::lower(cx, &d),

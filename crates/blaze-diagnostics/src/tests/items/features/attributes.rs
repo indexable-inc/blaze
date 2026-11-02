@@ -645,3 +645,29 @@ For more information about this error, try `rustc --explain E0658`.
 "#;
     assert_eq!(ui("macro-call-attribute.rs", "2015", source), stderr);
 }
+
+/// `#[sanitize(address = "off")]` under `#![feature(sanitize)]` is a builtin attribute, on a
+/// function written out and on one a `macro_rules!` writes (blaze's fuzz/src/raw.rs): never
+/// "unresolved macro `sanitize`".
+#[test]
+fn sanitize_under_its_feature_is_a_builtin_attribute() {
+    let source = r#"#![feature(sanitize)]
+
+#[sanitize(address = "off")]
+fn off() {}
+
+macro_rules! compares {
+    ($name:ident) => {
+        #[sanitize(address = "off")]
+        fn $name() {}
+    };
+}
+compares!(made);
+
+fn main() {
+    off();
+    made();
+}
+"#;
+    assert_eq!(ui("sanitize-off.rs", "2021", source), "");
+}

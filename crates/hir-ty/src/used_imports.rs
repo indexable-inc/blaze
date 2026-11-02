@@ -3,6 +3,7 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{
     expr_store::{ExpressionStore, StoreVisitor, scope::ExprScopes},
     hir::{ExprId, ExprOrPatId, PatId},
@@ -51,11 +52,11 @@ pub fn used_imports_with_traits(db: &Db, krate: Crate) -> UsedImports {
 /// The expression each pattern of `store` is written in (a `let`'s block, a `match`, a closure,
 /// a `let` expression), whose scope holds the items the pattern sees. A parameter's pattern has
 /// none: it sees the body's own scope. Built only for a body with a pattern that picked a trait.
-fn owners_of_patterns(store: &ExpressionStore) -> HashMap<PatId, ExprId> {
+fn owners_of_patterns(store: &ExpressionStore) -> HashMap<PatId, ExprId, Global> {
     struct Patterns<'a> {
         store: &'a ExpressionStore,
         owner: ExprId,
-        owners: &'a mut HashMap<PatId, ExprId>,
+        owners: &'a mut HashMap<PatId, ExprId, Global>,
     }
 
     impl StoreVisitor for Patterns<'_> {
@@ -68,7 +69,7 @@ fn owners_of_patterns(store: &ExpressionStore) -> HashMap<PatId, ExprId> {
     }
 
     // alloc: once per body with a pattern path resolved through a trait in scope, which is rare.
-    let mut owners = HashMap::default();
+    let mut owners = HashMap::new_in(Global);
     for (expr, _) in store.exprs() {
         store.visit_expr_children(expr, Patterns { store, owner: expr, owners: &mut owners });
     }

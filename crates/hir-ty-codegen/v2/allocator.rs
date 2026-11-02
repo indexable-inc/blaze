@@ -9,12 +9,13 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
 use cranelift_codegen::ir::{AbiParam, InstBuilder as _, Signature};
 use hir_def::HasModule as _;
-use hir_ty::{ParamEnvAndCrate, next_solver::{DbInterner, ParamEnv}};
+use hir_ty::{ParamEnvAndCrate, db::HirDatabase as _, next_solver::{DbInterner, ParamEnv}};
+use smallvec::SmallVec;
 
 use super::{HirInstance, Kind, places::Ref};
 use crate::{
     ALLOCATOR_ENTRIES, Produced, compile_as, declares_global_allocator, linked_crates,
-    fragment::FuncTarget, global_allocator_export, ptr,
+    fragment::FuncTarget, global_allocator_export,
 };
 
 /// One function of the shim: `symbol`, of `params` pointer-sized arguments and a pointer
@@ -48,13 +49,8 @@ pub(super) fn shim(
     }
     let mut declared = program.iter().copied().filter(|&it| declares_global_allocator(db, it));
     let allocator = declared.next();
-    if let Some(other) = declared.next() {
-        // alloc: the error's message
-        return Err(format!(
-            "two `#[global_allocator]`s in one program, in crates `{}` and `{}`",
-            crate::fncache::crate_name(db, allocator.expect("the first")),
-            crate::fncache::crate_name(db, other),
-        ));
+    if let (Some(first), Some(other)) = (allocator, declared.next()) {
+        return Err(two_allocators(db, first, other));
     }
     let mut shim = Vec::with_capacity(2 * ALLOCATOR_ENTRIES.len() + 2);
     for (symbol, ours, params, returns) in ALLOCATOR_ENTRIES {
@@ -83,6 +79,89 @@ pub(super) fn shim(
 
 fn forward(forward: Forward) -> HirInstance {
     HirInstance(Kind::Allocator(forward))
+}
+
+/// The error of a program with two `#[global_allocator]`s, `a`'s and `b`'s, which names their
+/// crates in order of name: the same message whichever order the crate graph lists them in.
+fn two_allocators(db: &Db, a: Crate, b: Crate) -> String {
+    let mut names = [crate::fncache::crate_name(db, a), crate::fncache::crate_name(db, b)];
+    names.sort_unstable();
+    let [first, second] = names;
+    // alloc: the error's message
+    format!("two `#[global_allocator]`s in one program, in crates `{first}` and `{second}`")
+}
+
+/// Whether the program of `krate` observes none of its allocations: its global allocator is
+/// std's, as with no `#[global_allocator]` or one whose static is a `std::alloc::System`, which
+/// does nothing but allocate. Then whether an allocation happens is not something the program
+/// can read, and `hir-ty-mir`'s `HeapToStack` may move one that never leaves its function to
+/// the stack (`MirOptions::heap_to_stack`).
+///
+/// Any other `#[global_allocator]` may count, log or otherwise act on each call where the
+/// program reads it, which `core::alloc::GlobalAlloc` allows the optimizer to change but a
+/// program can still tell: its allocations stay where its MIR puts them. So does one whose
+/// static this can't tell (an expansion that names no static or more than one, or whose MIR
+/// does not build, which compiling the export then reports): `false`, logged under target
+/// `blaze` with why. Two allocators are the error the shim gives too ([`shim`]).
+pub fn allocations_unobserved(db: &Db, krate: Crate) -> Result<bool, String> {
+    let program = linked_crates(db, [krate]);
+    let mut declared = program.iter().copied().filter(|&it| declares_global_allocator(db, it));
+    let Some(allocator) = declared.next() else { return Ok(true) };
+    if let Some(other) = declared.next() {
+        return Err(two_allocators(db, allocator, other));
+    }
+    let kept = |what: &str| {
+        let name = crate::fncache::crate_name(db, allocator);
+        tracing::info!(
+            target: "blaze",
+            "heap_to_stack: every allocation is kept: the `#[global_allocator]` of crate `{name}` {what}"
+        );
+        Ok(false)
+    };
+    let Some(alloc) = global_allocator_export(db, allocator, "__blaze_global_alloc") else {
+        return kept("exports no `__blaze_global_alloc`");
+    };
+    // The expansion's `__blaze_global_alloc` calls `GlobalAlloc::alloc(&NAME, ..)`: the one
+    // static its body names is the allocator's.
+    let body = match db.mir_body(hir_ty::InferBodyId::DefWithBodyId(alloc.into())) {
+        Ok(body) => body,
+        // alloc: the log's message
+        Err(e) => return kept(&format!("has a `__blaze_global_alloc` whose MIR does not build: {e:?}")),
+    };
+    let mut statics = SmallVec::<[hir_def::StaticId; 1]>::new();
+    let mut named = |operand: &hir_ty_mir::mir::Operand| {
+        if let hir_ty_mir::mir::OperandKind::Static(id) = operand.kind
+            && !statics.contains(&id)
+        {
+            statics.push(id);
+        }
+    };
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            if let hir_ty_mir::mir::StatementKind::Assign(_, rvalue) = &statement.kind {
+                rvalue.for_each_operand(&mut named);
+            }
+        }
+        if let Some(terminator) = &block.terminator {
+            terminator.kind.for_each_operand(&mut named);
+        }
+    }
+    let [id] = statics[..] else {
+        // alloc: the log's message
+        return kept(&format!("has a `__blaze_global_alloc` that names {} statics, not one", statics.len()));
+    };
+    let ty = hir_ty::InferenceResult::of(db, hir_def::DefWithBodyId::from(id))
+        .expr_ty(hir_def::expr_store::Body::of(db, id.into()).root_expr());
+    Ok(is_std_system(db, ty))
+}
+
+/// `ty` is `std::alloc::System`.
+fn is_std_system(db: &Db, ty: hir_ty::next_solver::Ty<'_>) -> bool {
+    use rustc_type_ir::inherent::IntoKind as _;
+    let hir_ty::next_solver::TyKind::Adt(adt, _) = ty.kind() else { return false };
+    let hir_def::AdtId::StructId(id) = adt.def_id() else { return false };
+    matches!(id.krate(db).data(db).origin, base_db::CrateOrigin::Lang(base_db::LangCrateOrigin::Std))
+        && hir_def::signatures::StructSignature::of(db, id).name.as_str() == "System"
 }
 
 /// std's default of an entry: `__rdl_alloc` for `__rust_alloc`.
@@ -123,8 +202,9 @@ pub(super) fn built(db: &Db, forward: &Forward, checked: bool) -> crate::Result<
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: forward.krate };
     compile_as(db, env, None, false, checked, true, |fx| {
         let mut sig = Signature::new(fx.cg.isa.default_call_conv());
-        sig.params.extend((0..forward.params).map(|_| AbiParam::new(ptr())));
-        sig.returns.extend(forward.returns.then(|| AbiParam::new(ptr())));
+        let pointer = fx.cg.target.pointer();
+        sig.params.extend((0..forward.params).map(|_| AbiParam::new(pointer)));
+        sig.returns.extend(forward.returns.then(|| AbiParam::new(pointer)));
         // clone: one of the shim's few entries, once per program
         fx.builder.func.signature = sig.clone();
         let entry = fx.builder.create_block();

@@ -136,6 +136,7 @@ fn could_unify_impl<'db>(
 ) -> bool {
     let interner = DbInterner::new_with(db, env.krate);
     let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+    crate::comptime_env::enter_universes(&infcx, env.param_env);
     let cause = ObligationCause::dummy();
     let at = infcx.at(&cause, env.param_env);
     let ((ty1_with_vars, ty2_with_vars), _) = infcx.instantiate_canonical(Span::Dummy, tys);
@@ -657,8 +658,8 @@ impl fmt::Debug for InferenceTable<'_> {
 pub(super) mod resolve_completely {
     use blaze_mem::Frame;
     use rustc_type_ir::{
-        DebruijnIndex, Flags, InferConst, InferTy, PredicateProxy, TypeFlags, TypeFoldable,
-        TypeFolder, TypeSuperFoldable, TypeVisitableExt, inherent::IntoKind,
+        DebruijnIndex, Flags, InferConst, InferTy, PredicateProxy, RegionKind, TypeFlags,
+        TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt, inherent::IntoKind,
     };
     use thin_vec::ThinVec;
 
@@ -669,8 +670,8 @@ pub(super) mod resolve_completely {
             unify::InferenceTable,
         },
         next_solver::{
-            Const, ConstKind, DbInterner, DefaultAny, GenericArg, Region, Term, TermKind, Ty,
-            TyKind,
+            Const, ConstKind, DbInterner, DefaultAny, GenericArg, Region, SolverDefId, Term,
+            TermKind, Ty, TyKind,
             infer::{resolve::ReplaceInferWithError, traits::ObligationCause},
             normalize::deeply_normalize_with_skipped_universes_and_ambiguous_coroutine_goals,
         },
@@ -687,6 +688,8 @@ pub(super) mod resolve_completely {
         spans_emitted_type_must_be_known_for: FrameSet<'f, Span>,
         types: &'db DefaultAny<'db>,
         frame: &'f Frame,
+        /// The body has closures, whose late-bound lifetimes are erased.
+        has_closures: bool,
     }
 
     impl<'db, 'f> WriteBackCtxt<'db, 'f> {
@@ -695,6 +698,7 @@ pub(super) mod resolve_completely {
             diagnostics: ThinVec<InferenceDiagnostic>,
             vars_emitted_type_must_be_known_for: FrameSet<'f, Term<'db>>,
             frame: &'f Frame,
+            has_closures: bool,
         ) -> Self {
             let mut spans_emitted_type_must_be_known_for = frame_set(frame);
             spans_emitted_type_must_be_known_for.extend(
@@ -722,6 +726,7 @@ pub(super) mod resolve_completely {
                 has_errors: false,
                 spans_emitted_type_must_be_known_for,
                 frame,
+                has_closures,
             }
         }
 
@@ -959,7 +964,7 @@ pub(super) mod resolve_completely {
             if !renormalize
                 && !value.has_type_flags(Self::NORMALIZE_FLAGS.union(TypeFlags::HAS_RE_INFER))
             {
-                return value;
+                return self.erase_closure_late_params(value);
             }
             let value = if self.should_normalize
                 && (renormalize || value.has_type_flags(Self::NORMALIZE_FLAGS))
@@ -983,7 +988,34 @@ pub(super) mod resolve_completely {
                 value
             };
 
-            value.fold_with(&mut DiagnoseInferVars { ctx: self.ctx, top_term: value.into() })
+            let value =
+                value.fold_with(&mut DiagnoseInferVars { ctx: self.ctx, top_term: value.into() });
+            self.erase_closure_late_params(value)
+        }
+
+        /// `value` with the late-bound lifetimes of a closure's signature, liberated in its
+        /// body, erased, as rustc's writeback erases every region but a bound one. Those of
+        /// the function itself stay: the borrow checker reads them from the body's types.
+        fn erase_closure_late_params<T: TypeFoldable<DbInterner<'db>>>(&self, value: T) -> T {
+            if !self.ctx.has_closures || !value.has_type_flags(TypeFlags::HAS_FREE_LOCAL_REGIONS) {
+                return value;
+            }
+            let error = self.ctx.types.regions.error;
+            rustc_type_ir::fold_regions(self.ctx.table.interner(), value, |region, _| {
+                match region.kind() {
+                    RegionKind::ReLateParam(late)
+                        if matches!(
+                            late.scope,
+                            SolverDefId::InternedClosureId(_)
+                                | SolverDefId::InternedCoroutineId(_)
+                                | SolverDefId::InternedCoroutineClosureId(_)
+                        ) =>
+                    {
+                        error
+                    }
+                    _ => region,
+                }
+            })
         }
     }
 

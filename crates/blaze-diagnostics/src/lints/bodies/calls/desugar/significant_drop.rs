@@ -16,6 +16,7 @@ use std::ops::ControlFlow;
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir::{InFile, db::HirDatabase};
 use hir_def::{
     AdtId, HasModule as _, Lookup, VariantId, nameres::crate_def_map, src::HasSource as _,
@@ -54,7 +55,7 @@ pub(super) struct SignificantDrops<'s, 'db> {
     solver: &'s Solver<'db>,
     /// The crate's `#![recursion_limit]` (rustc's `tcx.recursion_limit()`).
     limit: usize,
-    dtors: HashMap<AdtId, Dtor>,
+    dtors: HashMap<AdtId, Dtor, Global>,
     /// The types whose parts went deeper than the limit: rustc's `NeedsDropOverflow`, an
     /// error ("overflow while checking whether `{ty}` requires drop").
     pub(super) overflowed: Vec<Ty<'db>>,
@@ -65,21 +66,21 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
         let db = b.db();
         let limit = crate_def_map(db, b.cx.krate.into()).recursion_limit() as usize;
         // alloc: empty, pushed to only on the overflow error
-        SignificantDrops { db, solver, limit, dtors: HashMap::default(), overflowed: Vec::new() }
+        SignificantDrops { db, solver, limit, dtors: HashMap::new_in(Global), overflowed: Vec::new() }
     }
 
     /// rustc's `extract_component_with_significant_dtor`: the parts of a value of `ty` with a
     /// significant destructor, each once, in rustc's order.
     pub(super) fn components(&mut self, ty: Ty<'db>) -> SmallVec<[Ty<'db>; 4]> {
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new_in(Global);
         let mut tys = self.components_raw(ty, &mut seen);
-        let mut unique = HashSet::default();
+        let mut unique = HashSet::new_in(Global);
         tys.retain(|it| unique.insert(*it));
         tys
     }
 
     /// rustc's `extract_component_raw`.
-    fn components_raw(&mut self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>>) -> SmallVec<[Ty<'db>; 4]> {
+    fn components_raw(&mut self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>, Global>) -> SmallVec<[Ty<'db>; 4]> {
         let ty = self.normalize(ty);
         let mut out = SmallVec::new();
         for ty in self.list(ty) {
@@ -107,7 +108,7 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
     /// array of unknown length or a parameter that is all there is to it.
     fn list(&mut self, query: Ty<'db>) -> SmallVec<[Ty<'db>; 4]> {
         let mut out = SmallVec::new();
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new_in(Global);
         seen.insert(query);
         let mut unchecked: SmallVec<[(Ty<'db>, usize); 8]> = SmallVec::new();
         unchecked.push((query, 0));

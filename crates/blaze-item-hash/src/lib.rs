@@ -18,6 +18,7 @@
 //! [`Bodies`] is what the driver gives `hir_ty::body_store::install`.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 pub mod identity;
 pub mod impls;

@@ -7,6 +7,7 @@
 use std::{fmt, hash::Hash};
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 /// A node's index in its tree.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,13 +31,13 @@ impl fmt::Debug for UniIndex {
 /// together are `0..mapping.len() + deassigned.len()`.
 #[derive(Debug, Clone)]
 pub(super) struct UniKeyMap<K> {
-    mapping: HashMap<K, u32>,
+    mapping: HashMap<K, u32, Global>,
     deassigned: Vec<u32>,
 }
 
 impl<K> Default for UniKeyMap<K> {
     fn default() -> Self {
-        UniKeyMap { mapping: HashMap::default(), deassigned: Vec::new() }
+        UniKeyMap { mapping: HashMap::new_in(Global), deassigned: Vec::new() }
     }
 }
 

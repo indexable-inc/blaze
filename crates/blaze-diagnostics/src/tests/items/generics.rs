@@ -520,3 +520,31 @@ For more information about this error, try `rustc --explain E0741`.
         stderr
     );
 }
+
+/// A type alias's body that gives another crate's alias fewer arguments than it takes is E0107
+/// at check, written over several lines with comments between the arguments (blaze-resolve's
+/// `LockedMap` once `blaze_hash::HashMap` took an allocator), never a silent error type that
+/// only codegen's layout of a struct with a field of the alias reports.
+#[test]
+fn too_few_arguments_in_a_type_alias_body_are_e0107() {
+    let fixture = r#"//- /hash.rs crate:hash edition:2021 library
+pub struct Map<K, V, S, A>(pub K, pub V, pub S, pub A);
+pub type HashMap<K, V, A> = Map<K, V, u8, A>;
+//- /main.rs crate:other:main edition:2021 deps:hash
+use hash::HashMap;
+
+type LockedMap = HashMap<
+    // The key.
+    (u32, u64),
+    // The value.
+    (u8, u16),
+>;
+
+pub struct Registry {
+    pub locked: LockedMap,
+}
+
+fn main() {}
+"#;
+    assert_reports(&super::ui_fixture(fixture), &[error(3, &["E0107", "type alias takes 3 generic arguments but 2"])]);
+}

@@ -26,6 +26,7 @@ use std::fmt;
 
 use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::{Tag, tag};
 use blaze_radix as radix;
 use serde::{Deserialize, Serialize};
@@ -74,6 +75,9 @@ pub mod kinds {
     pub const UNIT_STORE: TaskKind = TaskKind(0x1_000d);
     /// A program's link, admitted as [`PROGRAM`] is.
     pub const PROGRAM_LINK: TaskKind = TaskKind(0x1_000e);
+    /// What a build left for the store (dependency images, check outcomes, goals) written from
+    /// its front end as it is kept, before the build answers.
+    pub const STORE_KEPT: TaskKind = TaskKind(0x1_000f);
 }
 
 /// The subsystem whose memory a task of `kind` holds: whose budget holds it back.
@@ -85,7 +89,7 @@ pub mod kinds {
 /// none of them names is [`Tag::Other`]'s.
 pub const fn tag_of(kind: TaskKind) -> Tag {
     match kind {
-        kinds::FETCH | kinds::UNIT_STORE => Tag::Store,
+        kinds::FETCH | kinds::UNIT_STORE | kinds::STORE_KEPT => Tag::Store,
         kinds::LIBRARY | kinds::COMPILE | kinds::REACH | kinds::PROGRAM => Tag::Codegen,
         kinds::UNIT_NAMES => Tag::Nameres,
         kinds::UNIT_BODIES => Tag::Infer,
@@ -187,7 +191,7 @@ impl Estimate {
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 pub struct Estimates {
     #[serde(with = "in_order")]
-    pub by_kind: HashMap<TaskKind, Estimate>,
+    pub by_kind: HashMap<TaskKind, Estimate, Global>, // alloc: the estimates, kept across builds and persisted
     /// What a task of a kind never measured is predicted to hold.
     pub unseen: u64,
 }
@@ -196,12 +200,13 @@ pub struct Estimates {
 /// bytes whatever order their kinds were first seen in.
 mod in_order {
     use blaze_hash::HashMap;
+    use std::alloc::Global;
     use serde::{Deserialize, Deserializer, Serializer};
 
     use super::{Estimate, TaskKind};
 
     pub(super) fn serialize<S: Serializer>(
-        by_kind: &HashMap<TaskKind, Estimate>,
+        by_kind: &HashMap<TaskKind, Estimate, Global>, // alloc: the estimates, kept across builds and persisted
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.collect_map(super::sorted(by_kind))
@@ -209,13 +214,13 @@ mod in_order {
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<HashMap<TaskKind, Estimate>, D::Error> {
+    ) -> Result<HashMap<TaskKind, Estimate, Global>, D::Error> { // alloc: the estimates, kept across builds and persisted
         HashMap::deserialize(deserializer)
     }
 }
 
 /// The kinds of `by_kind` and their estimates, in order of the kinds' numbers.
-fn sorted(by_kind: &HashMap<TaskKind, Estimate>) -> Vec<(TaskKind, Estimate)> {
+fn sorted(by_kind: &HashMap<TaskKind, Estimate, Global>) -> Vec<(TaskKind, Estimate)> { // alloc: the estimates, kept across builds and persisted
     // alloc: once per encoding of the estimates, as the daemon's image is written
     let mut kinds: Vec<(TaskKind, Estimate)> = by_kind.iter().map(|(&k, &e)| (k, e)).collect();
     radix::sort_copy_by_key(&mut kinds, |it| it.0.0);
@@ -230,7 +235,7 @@ const KIND_BYTES: usize = 4 + 4 + 8 * 4;
 impl Estimates {
     /// No kind measured yet, each predicted to hold `unseen`.
     pub fn new(unseen: u64) -> Estimates {
-        Estimates { by_kind: HashMap::default(), unseen }
+        Estimates { by_kind: HashMap::new_in(Global), unseen } // alloc: the estimates, kept across builds and persisted
     }
 
     /// The peak a task of `kind` is predicted to hold, in bytes.
@@ -277,7 +282,7 @@ impl Estimates {
         if count.checked_mul(KIND_BYTES as u64) != Some(read.left() as u64) {
             return Err(DecodeError::Length { count, bytes: bytes.len() });
         }
-        let mut by_kind = HashMap::default();
+        let mut by_kind = HashMap::new_in(Global); // alloc: the estimates, kept across builds and persisted
         by_kind.reserve(count as usize);
         let mut last: Option<u32> = None;
         for _ in 0..count {

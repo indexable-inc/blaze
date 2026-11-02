@@ -37,6 +37,10 @@ pub(super) fn soft_floats(target: &Target) -> bool {
     match (target.arch, target.call_conv) {
         (Arch::Aarch64, isa::CallConv::SystemV | isa::CallConv::AppleAarch64) => true,
         (Arch::X86_64, isa::CallConv::SystemV) => true,
+        // wasm32's LLVM passes an `f16` as the bits of an `i32` and an `f128` as an `i128`
+        // (`wasm::Class`), and works on both through compiler-builtins, as on x86-64 without
+        // F16C; its C `long double` is the `f128`, so C's functions of it are the `l` ones.
+        (Arch::Wasm32, _) => true,
         _ => false,
     }
 }
@@ -116,6 +120,13 @@ impl<'db> FunctionCx<'_, 'db> {
         self.cg.target.arch == Arch::X86_64
     }
 
+    /// Whether an `f16` is converted by compiler-builtins (`__extendhfsf2`, `__truncsfhf2`,
+    /// `__truncdfhf2`), as LLVM does on x86-64 and wasm32, not by AArch64's `fcvt`.
+    /// `v2::refs` lists the same.
+    pub(super) fn half_by_builtins(&self) -> bool {
+        matches!(self.cg.target.arch, Arch::X86_64 | Arch::Wasm32)
+    }
+
     /// Whether the function being compiled is x86-64's with AVX512-FP16, whose instructions
     /// LLVM works on an `f16` with there.
     fn x86_half_precision(&self) -> bool {
@@ -137,10 +148,12 @@ impl<'db> FunctionCx<'_, 'db> {
     /// An `f16` as the `f32` or `f64` of the same value, which is exact. x86-64's LLVM goes
     /// to `f64` through `f32`.
     fn widen_half(&mut self, value: Value, to: Type) -> Result<Value> {
-        if !self.x86() {
+        if !self.half_by_builtins() {
             return Ok(self.fcvt(value, types::F16, to));
         }
-        self.x86_soft_half()?;
+        if self.x86() {
+            self.x86_soft_half()?;
+        }
         let single = self.builtin("__extendhfsf2", &[types::F16], types::F32, &[value])?;
         Ok(match to {
             types::F32 => single,
@@ -151,10 +164,12 @@ impl<'db> FunctionCx<'_, 'db> {
     /// An `f32` or `f64` rounded to the nearest `f16`, ties to even.
     fn narrow_to_half(&mut self, value: Value) -> Result<Value> {
         let from = self.builder.func.dfg.value_type(value);
-        if !self.x86() {
+        if !self.half_by_builtins() {
             return Ok(self.fcvt(value, from, types::F16));
         }
-        self.x86_soft_half()?;
+        if self.x86() {
+            self.x86_soft_half()?;
+        }
         let name = if from == types::F32 { "__truncsfhf2" } else { "__truncdfhf2" };
         self.builtin(name, &[from], types::F16, &[value])
     }
@@ -329,8 +344,9 @@ impl<'db> FunctionCx<'_, 'db> {
                 let wide = self.widen_half(value, types::F32)?;
                 self.float_cast(wide, single, to)?
             }
-            // x86-64's LLVM rounds a 128-bit integer to `f16` once, by compiler-builtins.
-            (types::I128, types::F16) if self.x86() => {
+            // x86-64's and wasm32's LLVM, which soft-promote an `f16`, round a 128-bit
+            // integer to it once, by compiler-builtins.
+            (types::I128, types::F16) if self.half_by_builtins() => {
                 let name = if from.signed { "__floattihf" } else { "__floatuntihf" };
                 self.builtin(name, &[types::I128], types::F16, &[value])?
             }
@@ -515,7 +531,7 @@ impl<'db> FunctionCx<'_, 'db> {
         let bfloat = |scalar: &rustc_abi::Scalar| {
             matches!(scalar.primitive(), Primitive::Float(rustc_abi::Float::F16B))
         };
-        let mut held = HashSet::default();
+        let mut held = HashSet::new_in(std::alloc::Global);
         for (local, data) in body.locals.iter() {
             // A local without a layout is refused where it is compiled, for that.
             let Ok(layout) = self.layout(data.ty.as_ref()) else {
@@ -541,7 +557,7 @@ impl<'db> FunctionCx<'_, 'db> {
         if held.is_empty() {
             return Ok(());
         }
-        let mut predecessors: HashMap<BasicBlockId, usize> = HashMap::default();
+        let mut predecessors: HashMap<BasicBlockId, usize, std::alloc::Global> = HashMap::new_in(std::alloc::Global);
         for (_, block) in body.basic_blocks.iter() {
             if let Some(terminator) = &block.terminator {
                 for to in terminator.kind.successors().into_iter().chain(terminator.kind.unwind()) {
@@ -549,7 +565,7 @@ impl<'db> FunctionCx<'_, 'db> {
                 }
             }
         }
-        let mut follows: HashMap<BasicBlockId, BasicBlockId> = HashMap::default();
+        let mut follows: HashMap<BasicBlockId, BasicBlockId, std::alloc::Global> = HashMap::new_in(std::alloc::Global);
         for (id, block) in body.basic_blocks.iter() {
             let next = match block.terminator.as_ref().map(|it| &it.kind) {
                 Some(TerminatorKind::Goto { target })
@@ -569,7 +585,7 @@ impl<'db> FunctionCx<'_, 'db> {
             }
             id
         };
-        let mut made_in: HashMap<LocalId, BasicBlockId> = HashMap::default();
+        let mut made_in: HashMap<LocalId, BasicBlockId, std::alloc::Global> = HashMap::new_in(std::alloc::Global);
         // alloc: only an x86-64 body with an `f16b` local; one list reused across its blocks
         let mut mentioned = Vec::new();
         for (id, block) in body.basic_blocks.iter() {

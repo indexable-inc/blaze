@@ -124,7 +124,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
     }
 
-    #[tracing::instrument(skip(self), ret)]
+    #[tracing::instrument(target = "blaze", skip(self), ret)]
     fn consider_opaque_type_use(
         &self,
         opaque_type_key: OpaqueTypeKey<'db>,

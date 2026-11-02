@@ -21,7 +21,7 @@ use crate::{
 };
 
 pub(crate) fn validate(root: Node<'_>, errors: &mut Vec<SyntaxError>) {
-    let _p = tracing::info_span!("parser::validate").entered();
+    let _p = tracing::info_span!(target: "blaze", "parser::validate").entered();
     // FIXME:
     // * Add unescape validation of raw string literals and raw byte string literals
     // * Add validation of doc comments are being attached to nodes
@@ -40,7 +40,7 @@ pub(crate) fn validate_outline(
     mut body: impl FnMut(u32, &mut Vec<SyntaxError>) -> bool,
     errors: &mut Vec<SyntaxError>,
 ) {
-    let _p = tracing::info_span!("parser::validate_outline").entered();
+    let _p = tracing::info_span!(target: "blaze", "parser::validate_outline").entered();
     let mut lazies = lazies.iter().peekable();
     let mut preorder = root.preorder();
     while let Some(event) = preorder.next() {

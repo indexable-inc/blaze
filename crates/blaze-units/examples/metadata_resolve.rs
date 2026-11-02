@@ -11,12 +11,15 @@
 //! The `[patch]` tables are read by blaze-units' `read` module, the load's own copy. Packages are
 //! read here from `cargo metadata`'s JSON, since `read::read` takes the typed form the load makes.
 
+#![feature(allocator_api)]
+
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::metadata::{MetadataPackages, resolve_graph};
 use blaze_resolve::resolver::{CliFeatures, CompileKind, HasDevUnits, Members, VersionOrdering};
@@ -190,7 +193,7 @@ fn main() -> Result<()> {
     }
 
     let workspace_root = Path::new(str_of(&metadata, "workspace_root")?);
-    let path_packages: HashMap<SourceId, Summary> = by_spec
+    let path_packages: HashMap<SourceId, Summary, Global> = by_spec
         .values()
         .filter(|s| s.source_id().is_path())
         .map(|s| (s.source_id(), s.clone()))

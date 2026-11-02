@@ -23,11 +23,12 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, LazyLock, OnceLock, atomic::Ordering},
+    sync::{Arc, atomic::Ordering},
 };
 
 use base_db::Db;
 use blaze_hash::{HashSet, SharedMap};
+use std::alloc::Global;
 use cranelift_codegen::ir;
 use hir_def::{attrs::AttrFlags, signatures::FunctionSignature};
 use hir_ty::{db::HirDatabase, next_solver::StoredGenericArgs, traits::StoredParamEnvAndCrate};
@@ -88,18 +89,15 @@ pub(super) struct Import {
 }
 
 /// Whether the compiles of the build under way import what they call: LLVM at `-O2` or above
-/// in a build of a whole program ([`super::tier`]'s `across`), unless `BLAZE_IMPORT=0`,
-/// which has them build their callees in as compiles at a level above 1 do.
+/// in a build of a whole program ([`super::tier`]'s `across`).
 pub(super) fn enabled() -> bool {
-    static ASKED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("BLAZE_IMPORT").is_none_or(|it| it != "0"));
-    *ASKED && super::tier::across() && backend::whole_program()
+    super::tier::across() && backend::whole_program()
 }
 
 /// The exports of what `recorder` calls that its compile imports, and of what those call in
 /// turn, the first first: what a call asks for is in the compile's names from then on.
 pub(super) fn chosen(recorder: &mut Recorder<'_>) -> Vec<Import> {
-    tallied(chosen_for(recorder, &HashSet::default(), BUDGET))
+    tallied(chosen_for(recorder, &HashSet::new_in(Global), BUDGET))
 }
 
 /// `chosen`, counted as imported.
@@ -115,13 +113,13 @@ pub(super) fn tallied(chosen: Vec<Import>) -> Vec<Import> {
 /// room of all of them and imports none of them: `defined` says which instances it has.
 pub(super) fn chosen_for(
     recorder: &mut Recorder<'_>,
-    defined: &HashSet<Instance>,
+    defined: &HashSet<Instance, Global>,
     budget: usize,
 ) -> Vec<Import> {
     let db = recorder.db;
     // alloc: the result, owned by the caller; empty until an import is chosen
     let mut chosen = Vec::new();
-    let mut taken: HashSet<u32> = HashSet::default();
+    let mut taken: HashSet<u32, Global> = HashSet::new_in(Global);
     let mut spent = 0;
     // The calls to look at, by the number of the callee among the compile's requests, with
     // the share of a body's room left to it.
@@ -172,8 +170,9 @@ type Key = (InstanceDef, StoredGenericArgs, bool);
 
 /// The exports of the process, each built once: a compile that asks for one another is
 /// building waits for it, and no export asks for another while it is built.
-static EXPORTS: LazyLock<SharedMap<Key, Arc<OnceLock<Option<Arc<Export>>>>>> =
-    LazyLock::new(Default::default);
+#[expect(clippy::disallowed_types, reason = "the process's one table of exports, each built once by the first compile that asks")]
+static EXPORTS: std::sync::LazyLock<SharedMap<Key, Arc<std::sync::OnceLock<Option<Arc<Export>>>>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// The export of `instance`, built if no compile asked for it before. `None` for one that is
 /// not imported: too large, a coroutine, or a body LLVM has no lowering for.
@@ -249,12 +248,11 @@ fn build(
             // clone: once per export in the process; the query takes its key
             _ => Some(super::instance_body(db, instance, env.clone(), None).ok()?),
         };
-        let mut cg = Recorder::new(
-            db,
-            &**super::target().ok()?,
-            super::selected_target().ok()?,
-            instance.checked,
-        );
+        // No export, never one for a guessed target: the compile that imports it is of a crate
+        // of this target graph and loaded the target with `?`, so a target that fails reaches
+        // it as that error.
+        let target = super::target_of_crate(db, env.as_ref(db).krate).ok()?;
+        let mut cg = Recorder::new(db, &**super::isa_for(target).ok()?, target, instance.checked);
         cg.unlocated = true;
         // clone: once per export in the process, moved into the closure that builds it
         let args = instance.args.clone();

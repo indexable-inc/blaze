@@ -9,6 +9,7 @@
 //! people, never the wire.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 mod keyed;
 

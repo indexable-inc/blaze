@@ -28,6 +28,7 @@ use std::{
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::{RegionVec, Tag as MemTag};
 
 use crate::{Done, FileName, utf8::push_lossy};
@@ -467,7 +468,7 @@ struct Inotify {
 pub(crate) struct Room {
     /// Each directory watched, by its watch, relative to the root ("" for the root), in
     /// `names`.
-    dirs: HashMap<i32, Span>,
+    dirs: HashMap<i32, Span, Global>,
     names: Strings,
     root: Vec<u8>,
     /// The watched directory. inotify watches an inode, not a name: once it is deleted or
@@ -482,7 +483,7 @@ pub(crate) struct Room {
 impl Room {
     fn new() -> io::Result<Room> {
         Ok(Room {
-            dirs: HashMap::default(),
+            dirs: HashMap::new_in(Global),
             names: Strings::new()?,
             root: Vec::new(), // alloc: none, an empty vector, filled once and reused.
             top: String::new(), // alloc: none, filled once and reused.
@@ -648,8 +649,8 @@ mod tests {
         for seed in 0..32 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut strings = Strings::new().unwrap();
-            let mut ours: HashMap<u32, Span> = HashMap::default();
-            let mut theirs: HashMap<u32, String> = HashMap::default();
+            let mut ours: HashMap<u32, Span, Global> = HashMap::new_in(Global);
+            let mut theirs: HashMap<u32, String, Global> = HashMap::new_in(Global);
             for step in 0..4_000u32 {
                 let key = rng.below(64) as u32;
                 if rng.below(3) == 0 {

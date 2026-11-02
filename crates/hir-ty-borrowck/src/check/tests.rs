@@ -110,6 +110,7 @@ fn part(db: &Db, source_map: &BodySourceMap, span: PartSpan) -> String {
     match span {
         PartSpan::At(span) => source(db, source_map, span),
         PartSpan::Before(span) => format!("before {}", source(db, source_map, span)),
+        PartSpan::LineAfter(span) => format!("line after {}", source(db, source_map, span)),
         PartSpan::Def(AdtId::StructId(it)) => {
             format!("def {}", StructSignature::of(db, it).name.as_str())
         }
@@ -141,7 +142,20 @@ fn error_of(
     want: &[(&str, &str)],
     rest: impl FnOnce(&Db, &BodySourceMap, &BorrowckDiagnostic),
 ) {
-    let fx = fixture::db(FIXTURE);
+    error_in(FIXTURE, name, |db, source_map, error| {
+        assert_eq!(error.code, code, "`{name}`: {error:?}");
+        assert_eq!(labels(db, source_map, &error.labels), owned(want), "`{name}`");
+        rest(db, source_map, error);
+    });
+}
+
+/// What `rest` asks of the one error the function `name` of `fixture` gives.
+fn error_in(
+    fixture: &str,
+    name: &str,
+    rest: impl FnOnce(&Db, &BodySourceMap, &BorrowckDiagnostic),
+) {
+    let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
     hir_ty::attach_db(&db, || {
@@ -151,9 +165,77 @@ fn error_of(
         let errors: Vec<&BorrowckDiagnostic> =
             result.diagnostics.iter().filter(|it| it.code.starts_with('E')).collect();
         let &[error] = &errors[..] else { panic!("`{name}`: {errors:?}") };
-        assert_eq!(error.code, code, "`{name}`: {error:?}");
-        assert_eq!(labels(&db, &source_map, &error.labels), owned(want), "`{name}`");
         rest(&db, &source_map, error);
+    });
+}
+
+/// A `RefCell`'s `RefMut`, cut down: it borrows the cell and its drop does something, so it
+/// is used again where its scope ends.
+const DROP_EARLY: &str = r#"
+//- minicore: sized, copy, drop
+struct Cell { v: u32 }
+struct RefMut<'a> { cell: &'a Cell }
+impl Drop for RefMut<'_> { fn drop(&mut self) {} }
+impl Cell { fn borrow_mut(&self) -> RefMut<'_> { RefMut { cell: self } } }
+impl RefMut<'_> { fn touch(&mut self) {} }
+
+fn blocks_a_later_borrow() {
+    let mut c = Cell { v: 0 };
+    let mut r = c.borrow_mut();
+    r.touch();
+    let m = &mut c;
+    m.v = 1;
+}
+
+fn used_with_the_later_borrow() {
+    let mut c = Cell { v: 0 };
+    let mut r = c.borrow_mut();
+    let m = { r.touch(); &mut c };
+    m.v = 1;
+}
+"#;
+
+/// The error of a `RefMut` that keeps its cell borrowed only because it is dropped where its
+/// scope ends gets the note naming it and `drop(r);` after its last use: checked, the body
+/// with that drop passes.
+#[test]
+fn a_refmut_dropped_at_scope_end_gets_the_drop_early_note() {
+    error_in(DROP_EARLY, "blocks_a_later_borrow", |db, source_map, error| {
+        assert_eq!(error.code, "E0502", "{error:?}");
+        let notes: Vec<&crate::Child> = error
+            .children
+            .iter()
+            .filter(|it| it.message.contains("is dropped only where its scope ends"))
+            .collect();
+        let [note] = &notes[..] else { panic!("{error:?}") };
+        assert_eq!(note.level, Sublevel::Note, "{error:?}");
+        assert!(note.message.starts_with("`r`, a `RefMut"), "{}", note.message);
+        let last: Vec<String> = note.labels.iter().map(|(at, _)| part(db, source_map, *at)).collect();
+        // The use written last in the statement: the call, or its receiver.
+        assert!(matches!(&last[..], [it] if it == "r.touch()" || it == "r"), "{last:?}");
+        let suggestion = error
+            .suggestions
+            .iter()
+            .find(|it| it.message == "drop `r` after its last use")
+            .unwrap_or_else(|| panic!("{error:?}"));
+        assert_eq!(suggestion.applicability, Applicability::MachineApplicable);
+        let parts: Labels =
+            suggestion.parts.iter().map(|(at, text)| (part(db, source_map, *at), text.clone())).collect();
+        assert_eq!(parts, owned(&[("line after r.touch()", "drop(r);")]));
+    });
+}
+
+/// Where `drop(r);` could go only after the statement that borrows again, the body with it
+/// fails the same way: no note, no fix.
+#[test]
+fn a_drop_the_rewrite_would_not_fix_gets_no_note() {
+    error_in(DROP_EARLY, "used_with_the_later_borrow", |_, _, error| {
+        assert!(error.dropped_at_scope_end.is_some(), "the later use is `r`'s drop: {error:?}");
+        assert!(
+            !error.children.iter().any(|it| it.message.contains("is dropped only where its scope ends")),
+            "{error:?}"
+        );
+        assert!(!error.suggestions.iter().any(|it| it.message.starts_with("drop `r`")), "{error:?}");
     });
 }
 
@@ -367,7 +449,7 @@ fn a_body_with_no_error_takes_nothing_from_the_global_allocator() {
             for (_, module) in def_map.modules(&db) {
                 for def in module.scope(&db).declarations() {
                     let ModuleDefId::FunctionId(it) = def else { continue };
-                    for mode in [Mode::Nll, Mode::Polonius] {
+                    for mode in [Mode::Nll, Mode::Polonius, Mode::PoloniusFlow] {
                         // The first run warms what outlives a check: the queries it asks and
                         // the types it interns.
                         let first = borrowck_in_mode(&db, it.into(), mode);

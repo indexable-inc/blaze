@@ -663,6 +663,7 @@ fn intrinsic_effects<'db>(
         | I::CttzNonzero
         | I::Bswap
         | I::Bitreverse
+        | I::BlazeIntCast
         | I::IntegerMax
         | I::IntegerMin
         | I::CopySign(_)

@@ -17,6 +17,7 @@ use std::{
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::Frame;
 use cfg::CfgAtom;
 use either::Either;
@@ -93,6 +94,7 @@ pub(crate) fn resolve_round<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
     sink.take_macros(pending);
     let macros = std::mem::replace(pending, Vec::new_in(frame));
     let span = tracing::info_span!(
+        target: "blaze",
         "nameres resolve_round",
         pending = macros.len(),
         eager_with_errors,
@@ -1000,8 +1002,8 @@ impl<'db, 'f> StepSink<'db, 'f> {
             root: queries::crate_root(db, krate),
             modules: ModulesSlot::Unit { own, rows: blaze_query::db::AsId::as_id(&rows) },
             prelude: None,
-            macro_use_prelude: HashMap::default(),
-            derive_helpers_in_scope: HashMap::default(),
+            macro_use_prelude: HashMap::new_in(Global),
+            derive_helpers_in_scope: HashMap::new_in(Global),
             session_macros: false,
             names: NameRecords::default(),
             diagnostics: Vec::new(), // alloc: empty, a view keeps no diagnostics

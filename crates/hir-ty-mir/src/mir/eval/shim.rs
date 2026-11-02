@@ -22,7 +22,7 @@ use crate::{
     mir::eval::{
         Address, AdtId, Evaluator, FunctionId, GenericArgs, Interned, InternedLayout,
         Interval, IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
-        MirEvalError, MirSpan, Mutability, Origin, OwnedBytes, Result, Then, Ty, TyKind, TypeIdOf,
+        MirEvalError, MirSpan, Mutability, Origin, OwnedBytes, Result, Then, Ty, TyKind,
         VTableOfBytes,
         VariantId, from_bytes, not_supported, pad16, try_const_usize,
         machine::{Access, AtomicOrd, Machine, RetagMode, Shadow},
@@ -192,7 +192,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let [arg] = args else {
                     not_supported!("wrong arg count for clone");
                 };
-                let addr = Address::from_bytes(arg.get(self)?)?;
+                let addr = Address::from_bytes(arg.get(self)?, self.cached_ptr_size)?;
                 return destination
                     .write_from_interval(self, Interval { addr, size: destination.size });
             }
@@ -208,7 +208,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let [arg] = args else {
                     not_supported!("wrong arg count for clone");
                 };
-                let addr = Address::from_bytes(arg.get(self)?)?;
+                let addr = Address::from_bytes(arg.get(self)?, self.cached_ptr_size)?;
                 let layout = self.layout(self_ty)?;
                 self.exec_clone_for_fields(
                     subst.iter(),
@@ -258,7 +258,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 ),
             };
             let offset = layout.fields.offset(i).bytes_usize();
-            self.write_memory(tmp, &addr.offset(offset).to_bytes())?;
+            self.write_memory(tmp, &addr.offset(offset).to_bytes(self.cached_ptr_size))?;
             self.exec_clone(
                 def,
                 &[arg],
@@ -286,8 +286,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "rustc_allocator args are not provided".into(),
                     ));
                 };
-                let size = from_bytes!(usize, self.read_scalar(size.interval)?);
-                let align = from_bytes!(usize, self.read_scalar(align.interval)?);
+                let size = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
+                let align = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(align.interval)?);
                 let zeroed = alloc_fn.contains(AttrFlags::RUSTC_ALLOCATOR_ZEROED);
                 let result = self.allocate(size, align, Origin::Allocator, zeroed)?;
                 self.write_pointer(destination.addr, result)?;
@@ -307,7 +307,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "rustc_allocator args are not provided".into(),
                     ));
                 };
-                let new_size = from_bytes!(usize, self.read_scalar(new_size.interval)?);
+                let new_size = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(new_size.interval)?);
                 let ptr = self.read_pointer(ptr.interval.addr)?;
                 let result = self.reallocate(ptr, new_size, Origin::Allocator, "__rust_realloc")?;
                 self.write_pointer(destination.addr, result)?;
@@ -366,7 +366,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     if ty.is_str() {
                         let pointee = self.read_pointer(arg.interval.addr)?;
                         let metadata = &arg.interval.get(self)?[self.ptr_size()..];
-                        let len = from_bytes!(usize, metadata);
+                        let len = from_bytes!(usize, self.cached_ptr_size, metadata);
 
                         return {
                             Err(MirEvalError::Panic(
@@ -423,8 +423,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     "SYS_getrandom args are not provided".into(),
                 ));
             };
-            let addr = Address::from_bytes(buf.get(self)?)?;
-            let size = from_bytes!(usize, len.get(self)?);
+            let addr = Address::from_bytes(buf.get(self)?, self.cached_ptr_size)?;
+            let size = from_bytes!(usize, self.cached_ptr_size, len.get(self)?);
             self.fill_random(addr, size)?;
             return destination.write_from_interval(self, len.interval);
         }
@@ -483,7 +483,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 let addr1 = self.read_pointer(ptr1.interval.addr)?;
                 let addr2 = self.read_pointer(ptr2.interval.addr)?;
-                let size = from_bytes!(usize, self.read_scalar(size.interval)?);
+                let size = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
                 let slice1 = self.read_scalar(Interval::new(addr1, size))?;
                 let slice2 = self.read_scalar(Interval::new(addr2, size))?;
                 let r: i128 = match slice1.cmp(slice2) {
@@ -502,7 +502,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 let dst = self.read_pointer(dst.interval.addr)?;
                 let src = self.read_pointer(src.interval.addr)?;
-                let size = from_bytes!(usize, self.read_scalar(size.interval)?);
+                let size = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
                 self.copy_memory(dst, src, size, 1, as_str == "memmove")?;
                 self.write_pointer(destination.addr, dst)
             }
@@ -515,7 +515,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let Some(&byte) = self.read_scalar(byte.interval)?.first() else {
                     return Err(MirEvalError::InternalError("memset byte is of no size".into()));
                 };
-                let size = from_bytes!(usize, self.read_scalar(size.interval)?);
+                let size = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
                 self.write_memory_using_ref(dst, size)?.fill(byte);
                 self.write_pointer(destination.addr, dst)
             }
@@ -528,7 +528,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 while self.read_scalar(Interval::new(s.offset(len), 1))? != [0] {
                     len += 1;
                 }
-                destination.write_from_bytes(self, &super::word_bytes(len))
+                destination.write_from_bytes(self, &super::word_bytes(len, self.cached_ptr_size))
             }
             "write" => {
                 let [fd, ptr, len] = args else {
@@ -539,7 +539,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let fd = u128::from_le_bytes(pad16(fd.get(self)?, IsSigned::No));
                 let interval = Interval {
                     addr: self.read_pointer(ptr.interval.addr)?,
-                    size: from_bytes!(usize, len.get(self)?),
+                    size: from_bytes!(usize, self.cached_ptr_size, len.get(self)?),
                 };
                 match fd {
                     1 => {
@@ -561,8 +561,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "CCRandomGenerateBytes args are not provided".into(),
                     ));
                 };
-                let addr = Address::from_bytes(buf.get(self)?)?;
-                let size = from_bytes!(usize, len.get(self)?);
+                let addr = Address::from_bytes(buf.get(self)?, self.cached_ptr_size)?;
+                let size = from_bytes!(usize, self.cached_ptr_size, len.get(self)?);
                 self.fill_random(addr, size)?;
                 destination.write_from_bytes(self, &0i32.to_le_bytes()[0..destination.size])
             }
@@ -579,7 +579,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 let mut name_buf = Vec::new(); // alloc: `getenv`'s name, a shim of the edge
                 let name = {
-                    let mut index = Address::from_bytes(name.get(self)?)?;
+                    let mut index = Address::from_bytes(name.get(self)?, self.cached_ptr_size)?;
                     loop {
                         let byte = self.read_memory(index, 1)?[0];
                         index = index.offset(1);
@@ -600,7 +600,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         value.push('\0');
                         let addr = self.heap_allocate(value.len(), 1)?;
                         self.write_memory(addr, value.as_bytes())?;
-                        self.write_memory(destination.addr, &addr.to_bytes())?;
+                        self.write_memory(destination.addr, &addr.to_bytes(self.cached_ptr_size))?;
                     }
                 }
                 Ok(())
@@ -609,7 +609,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let [size] = args else {
                     return Err(MirEvalError::InternalError("malloc args are not provided".into()));
                 };
-                let size = from_bytes!(usize, size.get(self)?);
+                let size = from_bytes!(usize, self.cached_ptr_size, size.get(self)?);
                 let addr = self.c_allocate(size, false)?;
                 self.write_pointer(destination.addr, addr)
             }
@@ -617,12 +617,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let [count, size] = args else {
                     return Err(MirEvalError::InternalError("calloc args are not provided".into()));
                 };
-                let count = from_bytes!(usize, count.get(self)?);
-                let size = from_bytes!(usize, size.get(self)?);
+                let count = from_bytes!(usize, self.cached_ptr_size, count.get(self)?);
+                let size = from_bytes!(usize, self.cached_ptr_size, size.get(self)?);
                 // An overflowing size is C's failure: a null pointer.
                 let addr = match count.checked_mul(size) {
                     Some(size) => self.c_allocate(size, true)?,
-                    None => Address::from_usize(0),
+                    None => Address::from_usize(0, self.cached_ptr_size),
                 };
                 self.write_pointer(destination.addr, addr)
             }
@@ -631,15 +631,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     return Err(MirEvalError::InternalError("realloc args are not provided".into()));
                 };
                 let ptr = self.read_pointer(ptr.interval.addr)?;
-                let size = from_bytes!(usize, size.get(self)?);
-                let addr = if ptr.to_usize() == 0 {
+                let size = from_bytes!(usize, self.cached_ptr_size, size.get(self)?);
+                let addr = if ptr.to_usize(self.cached_ptr_size) == 0 {
                     self.c_allocate(size, false)?
                 } else if size == 0 {
                     match self.target()?.os {
                         // glibc's: the block is freed and the result is null.
                         thread::Os::Linux => {
                             self.deallocate(ptr, Origin::C, "realloc")?;
-                            Address::from_usize(0)
+                            Address::from_usize(0, self.cached_ptr_size)
                         }
                         // macOS': a block of the least size in its place.
                         thread::Os::Apple => self.reallocate(ptr, 1, Origin::C, "realloc")?,
@@ -656,8 +656,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     ));
                 };
                 let out = self.read_pointer(out.interval.addr)?;
-                let align = from_bytes!(usize, align.get(self)?);
-                let size = from_bytes!(usize, size.get(self)?);
+                let align = from_bytes!(usize, self.cached_ptr_size, align.get(self)?);
+                let size = from_bytes!(usize, self.cached_ptr_size, size.get(self)?);
                 // `EINVAL` (22 on every target the evaluator runs): not a power of two, or not
                 // a multiple of a pointer's size.
                 let code: i32 = if !align.is_power_of_two() || align % self.ptr_size() != 0 {
@@ -675,7 +675,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     return Err(MirEvalError::InternalError("free args are not provided".into()));
                 };
                 let ptr = self.read_pointer(ptr.interval.addr)?;
-                if ptr.to_usize() != 0 {
+                if ptr.to_usize(self.cached_ptr_size) != 0 {
                     self.deallocate(ptr, Origin::C, "free")?;
                 }
                 Ok(())
@@ -727,6 +727,25 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         span: MirSpan,
     ) -> Result<'db, bool> {
         match intrinsic {
+            // `x as D` between integers of any width (`narrow.rs`).
+            Intrinsic::BlazeIntCast => {
+                self.int_cast(args, generic_args, destination)?;
+                return Ok(true);
+            }
+            // Whether the body that asks checks overflow: what its own overflow asserts do
+            // here, so core's bodies that ask (those of the integers of any width) and the
+            // asserts of a builtin operation in the same body agree.
+            Intrinsic::OverflowChecks => {
+                destination.write_from_bytes(self, &[u8::from(self.checks_overflow(locals))])?;
+                return Ok(true);
+            }
+            _ => {}
+        }
+        // An integer intrinsic on `u3` computes at its width (`narrow.rs`).
+        if self.narrow_intrinsic(intrinsic, args, destination)? {
+            return Ok(true);
+        }
+        match intrinsic {
             Intrinsic::Atomic(op, orders) => {
                 return self
                     .exec_atomic_intrinsic(
@@ -743,6 +762,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Intrinsic::Simd(op) => {
                 return self
                     .exec_simd_intrinsic(op, args, generic_args, destination, locals, span)
+                    .map(|()| true);
+            }
+            Intrinsic::BlazeAdtName
+            | Intrinsic::BlazeFieldAttrs
+            | Intrinsic::BlazeFieldIndex
+            | Intrinsic::BlazeVariantDiscriminant
+            | Intrinsic::BlazeVariantIndex => {
+                return self
+                    .exec_blaze_reflection_intrinsic(intrinsic, generic_args, destination)
                     .map(|()| true);
             }
             Intrinsic::TypeIdTypeOf
@@ -788,6 +816,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Intrinsic::CopySign(width @ (FloatWidth::F32 | FloatWidth::F64)) => {
                 self.exec_float_intrinsic(intrinsic, width, args, destination)
             }
+            Intrinsic::FieldOffset => {
+                let Some(frt) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
+                    return Err(MirEvalError::InternalError(
+                        "field_offset generic arg is not provided".into(),
+                    ));
+                };
+                let offset = self.field_offset(frt, locals)?;
+                destination.write_from_bytes(self, &super::word_bytes(offset, self.cached_ptr_size))
+            }
             Intrinsic::SizeOf => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
@@ -818,11 +855,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     ));
                 };
                 if let Some((size, _)) = self.size_align_of(ty, locals)? {
-                    destination.write_from_bytes(self, &super::word_bytes(size))
+                    destination.write_from_bytes(self, &super::word_bytes(size, self.cached_ptr_size))
                 } else {
                     let metadata = arg.interval.slice(self.ptr_size()..self.ptr_size() * 2);
                     let (size, _) = self.size_align_of_unsized(ty, metadata, locals)?;
-                    destination.write_from_bytes(self, &super::word_bytes(size))
+                    destination.write_from_bytes(self, &super::word_bytes(size, self.cached_ptr_size))
                 }
             }
             Intrinsic::AlignOfVal => {
@@ -837,11 +874,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     ));
                 };
                 if let Some((_, align)) = self.size_align_of(ty, locals)? {
-                    destination.write_from_bytes(self, &super::word_bytes(align))
+                    destination.write_from_bytes(self, &super::word_bytes(align, self.cached_ptr_size))
                 } else {
                     let metadata = arg.interval.slice(self.ptr_size()..self.ptr_size() * 2);
                     let (_, align) = self.size_align_of_unsized(ty, metadata, locals)?;
-                    destination.write_from_bytes(self, &super::word_bytes(align))
+                    destination.write_from_bytes(self, &super::word_bytes(align, self.cached_ptr_size))
                 }
             }
             Intrinsic::TypeId => {
@@ -851,7 +888,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     ));
                 };
                 let ty = self.type_id_ty(ty)?;
-                let id = self.type_id(TypeIdOf::Ty(ty));
+                let id = self.type_id(ty);
                 destination.write_from_bytes(self, &id)
             }
             Intrinsic::TypeName => {
@@ -869,10 +906,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let len = ty_name.len();
                 let addr = self.heap_allocate(len, 1)?;
                 self.write_memory(addr, ty_name.as_bytes())?;
-                destination.slice(0..self.ptr_size()).write_from_bytes(self, &addr.to_bytes())?;
+                destination.slice(0..self.ptr_size()).write_from_bytes(self, &addr.to_bytes(self.cached_ptr_size))?;
                 destination
                     .slice(self.ptr_size()..2 * self.ptr_size())
-                    .write_from_bytes(self, &super::word_bytes(len))
+                    .write_from_bytes(self, &super::word_bytes(len, self.cached_ptr_size))
             }
             Intrinsic::NeedsDrop => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
@@ -949,8 +986,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let unsigned = matches!(intrinsic, Intrinsic::PtrOffsetFromUnsigned);
                     self.machine.offset_from(self.ptr(lhs), self.ptr(rhs), unsigned)?;
                 }
-                let lhs = lhs.to_usize() as i128;
-                let rhs = rhs.to_usize() as i128;
+                let lhs = lhs.to_usize(self.cached_ptr_size) as i128;
+                let rhs = rhs.to_usize(self.cached_ptr_size) as i128;
                 let ans = lhs.wrapping_sub(rhs);
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
@@ -1094,9 +1131,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "slice_get_unchecked slice metadata is missing".into(),
                     ));
                 };
-                let slice_ptr = Address::from_bytes(data)?;
-                let len = from_bytes!(usize, len);
-                let index = from_bytes!(usize, index.get(self)?);
+                let slice_ptr = Address::from_bytes(data, self.cached_ptr_size)?;
+                let len = from_bytes!(usize, self.cached_ptr_size, len);
+                let index = from_bytes!(usize, self.cached_ptr_size, index.get(self)?);
                 if index >= len {
                     // alloc: error path
                     return Err(MirEvalError::UndefinedBehavior(format!(
@@ -1105,9 +1142,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
                 let size = self.size_of_sized(ty, locals, "slice_get_unchecked item type")?;
                 let offset = index* size;
-                let addr = slice_ptr.to_usize() + offset;
-                let addr = Address::from_usize(addr);
-                destination.write_from_bytes(self, &addr.to_bytes()[..destination.size])
+                let addr = slice_ptr.to_usize(self.cached_ptr_size) + offset;
+                let addr = Address::from_usize(addr, self.cached_ptr_size);
+                destination.write_from_bytes(self, &addr.to_bytes(self.cached_ptr_size)[..destination.size])
             }
             Intrinsic::Offset | Intrinsic::ArithOffset => {
                 let [ptr, offset] = args else {
@@ -1156,8 +1193,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     };
                     self.machine.offset(self.ptr(base), by)?;
                 }
-                let ans = (base.to_usize() as u128).wrapping_add(by as u128);
-                let to = Address::from_bytes(&ans.to_le_bytes()[..self.ptr_size()])?;
+                let ans = (base.to_usize(self.cached_ptr_size) as u128).wrapping_add(by as u128);
+                let to = Address::from_bytes(&ans.to_le_bytes()[..self.ptr_size()], self.cached_ptr_size)?;
                 self.write_pointer(destination.addr, Address { prov: base.prov, ..to })
             }
             Intrinsic::AssertInhabited
@@ -1328,7 +1365,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "discriminant_value generic arg is not provided".into(),
                     ));
                 };
-                let addr = Address::from_bytes(arg.get(self)?)?;
+                let addr = Address::from_bytes(arg.get(self)?, self.cached_ptr_size)?;
                 let size = self.size_of_sized(ty, locals, "discriminant_value ptr type")?;
                 let interval = Interval { addr, size };
                 let r = self.compute_discriminant(ty, interval.get(self)?)?;
@@ -1408,7 +1445,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     ));
                 };
                 let ty = type_arg(generic_args, intrinsic)?;
-                let count = from_bytes!(usize, self.read_scalar(count.interval)?);
+                let count = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(count.interval)?);
                 let val = from_bytes!(u8, self.read_scalar(val.interval)?);
                 let (size, align) =
                     self.size_align_of_sized(ty, locals, "the type `write_bytes` writes")?;
@@ -1432,7 +1469,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let size = self.size_of_sized(ty, locals, "the type `typed_swap_nonoverlapping`")?;
                 let x = self.aligned_to(self.read_pointer(x.interval.addr)?, ty)?;
                 let y = self.aligned_to(self.read_pointer(y.interval.addr)?, ty)?;
-                let (a, b) = (x.to_usize(), y.to_usize());
+                let (a, b) = (x.to_usize(self.cached_ptr_size), y.to_usize(self.cached_ptr_size));
                 if size != 0 && a < b + size && b < a + size {
                     return Err(MirEvalError::UndefinedBehavior(
                         // alloc: error path.
@@ -1472,8 +1509,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     ));
                 };
                 let base = self.read_pointer(ptr.interval.addr)?;
-                let mask = from_bytes!(usize, self.read_scalar(mask.interval)?);
-                let to = Address::from_usize(base.to_usize() & mask);
+                let mask = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(mask.interval)?);
+                let to = Address::from_usize(base.to_usize(self.cached_ptr_size) & mask, self.cached_ptr_size);
                 self.write_pointer(destination.addr, Address { prov: base.prov, ..to })
             }
             Intrinsic::PtrMetadata => {
@@ -1574,7 +1611,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 let left = self.read_pointer(left.interval.addr)?;
                 let right = self.read_pointer(right.interval.addr)?;
-                let bytes = from_bytes!(usize, self.read_scalar(bytes.interval)?);
+                let bytes = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(bytes.interval)?);
                 let left = self.read_scalar(Interval::new(left, bytes))?;
                 let order = left.cmp(self.read_scalar(Interval::new(right, bytes))?);
                 destination.write_from_bytes(self, &(order as i32).to_le_bytes())
@@ -1585,8 +1622,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "const_allocate args are not provided".into(),
                     ));
                 };
-                let size = from_bytes!(usize, self.read_scalar(size.interval)?);
-                let align = from_bytes!(usize, self.read_scalar(align.interval)?);
+                let size = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(size.interval)?);
+                let align = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(align.interval)?);
                 let origin = Origin::ConstHeap { global: false };
                 let result = self.allocate(size, align, origin, false)?;
                 self.write_pointer(destination.addr, result)
@@ -1607,13 +1644,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "const_make_global args are not provided".into(),
                     ));
                 };
-                self.make_global(Address::from_bytes(ptr.get(self)?)?)?;
+                self.make_global(Address::from_bytes(ptr.get(self)?, self.cached_ptr_size)?)?;
                 destination.write_from_interval(self, ptr.interval)
             }
             Intrinsic::CallerLocation => {
                 let site = self.caller_site(locals, span)?;
                 let location = self.location_of(site, locals)?;
-                destination.write_from_bytes(self, &location.to_bytes())
+                destination.write_from_bytes(self, &location.to_bytes(self.cached_ptr_size))
             }
             Intrinsic::BoxNew => {
                 let ty = generic_args.type_at(0);
@@ -1641,7 +1678,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "write_box_via_move box is smaller than a pointer".into(),
                     ));
                 };
-                let addr = Address::from_bytes(ptr)?;
+                let addr = Address::from_bytes(ptr, self.cached_ptr_size)?;
                 Interval { addr, size }.write_from_interval(self, value.interval)?;
                 destination.write_from_interval(self, boxed.interval)
             }
@@ -1735,9 +1772,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         locals: &Locals<'db>,
     ) -> Result<'db, (usize, usize)> {
         Ok(match ty.kind() {
-            TyKind::Str => (from_bytes!(usize, metadata.get(self)?), 1),
+            TyKind::Str => (from_bytes!(usize, self.cached_ptr_size, metadata.get(self)?), 1),
             TyKind::Slice(inner) => {
-                let len = from_bytes!(usize, metadata.get(self)?);
+                let len = from_bytes!(usize, self.cached_ptr_size, metadata.get(self)?);
                 let (size, align) = self.size_align_of_sized(inner, locals, "slice inner type")?;
                 (size * len, align)
             }
@@ -2098,7 +2135,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let (size, align) = self.size_align_of_sized(ty, locals, "the type of a copy")?;
         let src = self.read_pointer(src.interval.addr)?;
         let dst = self.read_pointer(dst.interval.addr)?;
-        let count = from_bytes!(usize, self.read_scalar(count.interval)?);
+        let count = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(count.interval)?);
         let Some(size) = count.checked_mul(size) else {
             return Err(MirEvalError::UndefinedBehavior(
                 // alloc: error path.
@@ -2130,26 +2167,21 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.move_memory(dst, Interval::new(src, size))
     }
 
-    /// The bytes of the `TypeId` of `of`, made when it is the first one asked for.
-    fn type_id(&mut self, of: TypeIdOf<'db>) -> [u8; 16] {
-        let id = self.type_ids.iter().position(|&it| it == of).unwrap_or_else(|| {
-            self.type_ids.push(of);
+    /// The bytes of the `TypeId` of `ty` (already as [`Self::type_id_ty`] makes it), made when
+    /// it is the first one asked for.
+    fn type_id(&mut self, ty: Ty<'db>) -> [u8; 16] {
+        let id = self.type_ids.iter().position(|&it| it == ty).unwrap_or_else(|| {
+            self.type_ids.push(ty);
             self.type_ids.len() - 1
         });
         (id as u128 + 1).to_le_bytes()
     }
 
-    /// What the `TypeId` in `arg` stands for.
-    fn type_id_entry(&self, arg: &IntervalAndTy<'db>) -> Result<'db, Option<&TypeIdOf<'db>>> {
-        let id = from_bytes!(u128, self.read_scalar(arg.interval)?);
-        Ok(id.checked_sub(1).and_then(|it| self.type_ids.get(it as usize)))
-    }
-
-    /// The type a `TypeId` in `arg` is of; a field's stands for no type of the program.
+    /// The type the `TypeId` in `arg` is of.
     fn type_id_of(&self, arg: &IntervalAndTy<'db>) -> Result<'db, Ty<'db>> {
-        match self.type_id_entry(arg)? {
-            Some(&TypeIdOf::Ty(ty)) => Ok(ty),
-            Some(TypeIdOf::Field { .. }) => not_supported!("reflection of a field's `TypeId`"),
+        let id = from_bytes!(u128, self.read_scalar(arg.interval)?);
+        match id.checked_sub(1).and_then(|it| self.type_ids.get(usize::try_from(it).ok()?)) {
+            Some(&ty) => Ok(ty),
             None => not_supported!("a `TypeId` this evaluation did not make"),
         }
     }
@@ -2225,8 +2257,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Ok(IntervalOrOwned::Owned(match field.name.as_str() {
                 "filename" | "file" => {
                     file_field = Some(i);
-                    let mut it = OwnedBytes::from_slice(&addr.to_bytes());
-                    it.extend_from_slice(&super::word_bytes(name.len()));
+                    let mut it = OwnedBytes::from_slice(&addr.to_bytes(self.cached_ptr_size));
+                    it.extend_from_slice(&super::word_bytes(name.len(), self.cached_ptr_size));
                     it
                 }
                 "line" => OwnedBytes::from_slice(&line.to_le_bytes()),
@@ -2254,7 +2286,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.write_pointer(destination.addr, addr)?;
         destination
             .slice(self.ptr_size()..2 * self.ptr_size())
-            .write_from_bytes(self, &super::word_bytes(text.len()))
+            .write_from_bytes(self, &super::word_bytes(text.len(), self.cached_ptr_size))
     }
 
     /// An `Option<inner>` in `destination`: `Some` of the bytes of a value, or `None`.

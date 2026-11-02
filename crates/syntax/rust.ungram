@@ -240,7 +240,14 @@ Fn =
  AnyAttr* Visibility?
  'default'? 'const'? 'async'? 'gen'? 'unsafe'? 'safe'? Abi?
  'fn' Name GenericParamList? ParamList RetType? WhereClause?
+ SpecClause*
  (body:BlockExpr | ';')
+
+// blaze_verify (docs/v2/plan/lanes/verus.md): a function's `requires`, `recommends`, `ensures`
+// and `decreases`, in that order, and a loop's `invariant`, `ensures` and `decreases`.
+SpecClause =
+  ('requires' | 'recommends' | 'ensures' | 'decreases' | 'invariant')
+  (Expr (',' Expr)* ','?)?
 
 Abi =
   'extern' '@string'?
@@ -267,6 +274,7 @@ Param =
 
 RetType =
   '->' Type
+| '->' '(' Pat ':' Type ')'  // blaze_verify's named return, `-> (r: T)`
 
 TypeAlias =
   AnyAttr* Visibility?
@@ -570,7 +578,7 @@ ArrayExpr =
   ) ']'
 
 IndexExpr =
-  AnyAttr* base:Expr '[' index:Expr ']'
+  AnyAttr* base:Expr '.'? '[' index:Expr ']'
 
 TupleExpr =
   AnyAttr* '(' AnyAttr* fields:(Expr (',' Expr)* ','?)? ')'
@@ -612,15 +620,15 @@ IfExpr =
   ('else' else_branch:(IfExpr | BlockExpr))?
 
 LoopExpr =
-  AnyAttr* Label? 'loop'
+  AnyAttr* Label? 'loop' SpecClause*
   loop_body:BlockExpr
 
 ForExpr =
-  AnyAttr* Label? 'for' Pat 'in' iterable:Expr
+  AnyAttr* Label? 'for' 'const'? Pat 'in' iterable:Expr
   loop_body:BlockExpr
 
 WhileExpr =
-  AnyAttr* Label? 'while' condition:Expr
+  AnyAttr* Label? 'while' condition:Expr SpecClause*
   loop_body:BlockExpr
 
 Label =

@@ -3,6 +3,8 @@
 mod adjusted_ty;
 mod budget;
 mod coercion_lub;
+mod comptime_infer;
+mod comptime_solver;
 mod const_args;
 mod const_bounds;
 mod const_param_ty;

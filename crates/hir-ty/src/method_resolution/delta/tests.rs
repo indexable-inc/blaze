@@ -16,6 +16,7 @@ use std::fmt::Write as _;
 use base_db::{Crate, Db, Maintained, all_crates};
 use blaze_dbsp::Work;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::Tag;
 use hir_def::{
     BuiltinDeriveImplId, ImplId, ModuleDefId, ModuleId, TraitId,
@@ -163,8 +164,8 @@ fn check_slices(db: &Db, krate: Crate, what: &str, failures: &mut String) {
         Vec<ModuleId>,
     );
     let lang = lang_items(db, krate);
-    let mut by_trait: HashMap<TraitId, TraitExpected> = HashMap::default();
-    let mut by_head: HashMap<Head, (Vec<(ModuleId, ImplId)>, Vec<ModuleId>)> = HashMap::default();
+    let mut by_trait: HashMap<TraitId, TraitExpected, Global> = HashMap::new_in(Global);
+    let mut by_head: HashMap<Head, (Vec<(ModuleId, ImplId)>, Vec<ModuleId>), Global> = HashMap::new_in(Global);
     let mut body_modules = Vec::new();
     for (module, _) in crate_def_map(db, krate).modules(db) {
         for &trait_ in trait_bodies(db, module).traits.iter() {
@@ -243,7 +244,7 @@ fn check_slices(db: &Db, krate: Crate, what: &str, failures: &mut String) {
 
 /// Every candidate slice against the traits declared in the crate's modules by item name.
 fn check_candidates(db: &Db, krate: Crate, what: &str, failures: &mut String) {
-    let mut by_name: HashMap<Name, Vec<TraitId>> = HashMap::default();
+    let mut by_name: HashMap<Name, Vec<TraitId>, Global> = HashMap::new_in(Global);
     let mut names = SmallVec::new();
     for trait_ in declared_traits(db, krate) {
         assoc_names(db, trait_, &mut names);
@@ -271,8 +272,8 @@ fn check_candidates(db: &Db, krate: Crate, what: &str, failures: &mut String) {
 }
 
 /// Every impl of `krate`'s modules with its key, as made from scratch.
-pub(super) fn impl_keys(db: &Db, krate: Crate) -> HashMap<ImplId, ImplKey> {
-    let mut out = HashMap::default();
+pub(super) fn impl_keys(db: &Db, krate: Crate) -> HashMap<ImplId, ImplKey, Global> {
+    let mut out = HashMap::new_in(Global);
     for (module, _) in crate_def_map(db, krate).modules(db) {
         let impls = module_impls(db, module);
         out.extend(impls.trait_impls.iter().map(|&imp| (imp, impl_key(db, imp, true))));
@@ -282,12 +283,51 @@ pub(super) fn impl_keys(db: &Db, krate: Crate) -> HashMap<ImplId, ImplKey> {
 }
 
 /// Every trait declared in `krate`'s modules with its item names.
-pub(super) fn trait_names(db: &Db, krate: Crate) -> HashMap<TraitId, SmallVec<[Name; 8]>> {
-    let mut out = HashMap::default();
+pub(super) fn trait_names(db: &Db, krate: Crate) -> HashMap<TraitId, SmallVec<[Name; 8]>, Global> {
+    let mut out = HashMap::new_in(Global);
     for trait_ in declared_traits(db, krate) {
         let mut names = SmallVec::new();
         assoc_names(db, trait_, &mut names);
         out.insert(trait_, names);
     }
     out
+}
+
+/// A dependency whose def map comes to be served from its image (`deps::serve` freezes the def
+/// map and lang items, never the impls) keeps impl tables equal to the pull over the decoded
+/// map. The decoded map's modules are new ids, and the maintainer held rows naming the ones
+/// it maintained before: name resolution hands it the served crate as fresh (an `e0311`
+/// build after another workspace's in one daemon stopped in `module_impls` on such a row).
+#[test]
+fn a_dependency_served_from_its_image_keeps_impl_tables_over_the_decoded_map() {
+    use hir_def::nameres::frozen::{self, Frozen, Mode};
+
+    let mut loaded = Loaded::new(
+        r#"
+//- /main.rs crate:main deps:dep
+pub struct M;
+impl dep::Tr for M {}
+//- /dep.rs crate:dep
+pub trait Tr { fn f(&self) {} }
+pub struct S;
+impl Tr for S {}
+impl S { pub fn g(&self) {} }
+pub mod inner { pub struct T; impl super::Tr for T {} }
+"#,
+    );
+    let main = loaded.krate();
+    let dep = *all_crates(&loaded.db).iter().find(|it| **it != main).expect("the crate `dep`");
+    let mut failures = String::new();
+    check(&loaded.db, dep, "maintained", &mut failures);
+    let maintained = crate_def_map(&loaded.db, dep).root_module_id();
+    let bytes = frozen::encode(&loaded.db, dep).expect("`dep`'s def map encodes");
+    let served = Frozen { bytes: bytes.into(), mode: Mode::Serve };
+    frozen::set(&mut loaded.db, [(dep, served)].into_iter().collect());
+    loaded.db.note_crates_changed();
+    let decoded = crate_def_map(&loaded.db, dep).root_module_id();
+    assert_ne!(maintained, decoded, "the decoded map's modules are not the maintained ones");
+    for (krate, what) in [(dep, "`dep` served"), (main, "`main` over a served `dep`")] {
+        check(&loaded.db, krate, what, &mut failures);
+    }
+    assert!(failures.is_empty(), "{failures}");
 }

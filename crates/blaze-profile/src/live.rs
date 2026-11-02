@@ -18,6 +18,7 @@ use arrow_ipc::{
 };
 use arrow_schema::ArrowError;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use crate::{
     batches::{self, Process},
@@ -195,7 +196,7 @@ struct Thread {
 /// The client's view of the feed, folded from each frame.
 #[derive(Default, Debug)]
 pub struct Top {
-    threads: HashMap<u32, Thread>,
+    threads: HashMap<u32, Thread, Global>,
     at_ns: i64,
     /// Spans closed a second, over the last frame.
     rate: f64,
@@ -433,8 +434,8 @@ mod tests {
         let s = 1_000_000_000i64;
         let counters = batches::counters(
             &[
-                CounterRow { build: 1, plot: Plot::MemoHits, t_ns: s, value: 90, fiber: None, query_kind: 0 },
-                CounterRow { build: 1, plot: Plot::MemoMisses, t_ns: s, value: 10, fiber: None, query_kind: 0 },
+                CounterRow { build: 1, plot: Plot::MemoHits, t_ns: s, value: 90, fiber: None },
+                CounterRow { build: 1, plot: Plot::MemoMisses, t_ns: s, value: 10, fiber: None },
             ],
             process,
         )

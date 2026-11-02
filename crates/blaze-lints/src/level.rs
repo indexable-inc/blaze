@@ -17,6 +17,7 @@ use crate::{
     registry::{self, Group, Info, LintIndex, Named},
 };
 
+pub use crate::lints::On;
 pub use blaze_diagnostics::lints::{CommandLine, Level, LintOptions};
 
 /// What a level set applies to.
@@ -31,28 +32,71 @@ pub enum Target {
     Warnings,
     /// A lint of rustc's, by name.
     Rustc(String),
-    /// Lints of blaze's own (`blaze::`): bit `i` for [`blaze::Lint::ALL`]`[i]`, one for a
-    /// lint, several for the group `blaze::hot`.
-    Blaze(u32),
+    /// Lints of blaze's own (`blaze::`), as their bits ([`blaze::Lint::bit`]) in a set that
+    /// grows with the lint tables: one for a lint, several for the group `blaze::hot`.
+    Blaze(On),
 }
 
-/// The lints of the group `blaze::hot` ([`blaze::HOT`]: the four hot lints, not the parallel ones), as a
+/// The lints of the group `blaze::hot` ([`blaze::HOT`]: the hot lints, not the parallel ones), as a
 /// [`Target::Blaze`] has them.
-const BLAZE_HOT: u32 = {
-    let mut bits = 0;
+const BLAZE_HOT: On = {
+    let mut bits = On::EMPTY;
     let mut at = 0;
     while at < blaze::HOT.len() {
-        bits |= blaze_bit(blaze::HOT[at]);
+        bits = bits.or(blaze::HOT[at].bit());
         at += 1;
     }
     bits
 };
 
-pub(crate) const fn blaze_bit(lint: blaze::Lint) -> u32 {
-    1 << lint as u32
+/// The lints of `kind` ([`blaze::Kind`]), as a [`Target::Blaze`] has them: the group
+/// `blaze::general` or `blaze::internal`.
+const fn blaze_kind(kind: blaze::Kind) -> On {
+    let mut bits = On::EMPTY;
+    let mut at = 0;
+    while at < blaze::Lint::ALL.len() {
+        let lint = blaze::Lint::ALL[at];
+        if lint.kind() as u8 == kind as u8 {
+            bits = bits.or(lint.bit());
+        }
+        at += 1;
+    }
+    bits
 }
 
-const _: () = assert!(blaze::Lint::ALL.len() <= u32::BITS as usize);
+/// The group `blaze::general`: the lints any workspace benefits from, on at `warn` everywhere.
+pub(crate) const BLAZE_GENERAL: On = blaze_kind(blaze::Kind::General);
+
+/// The group `blaze::internal`: the lints of blaze's own types and conventions, allowed until
+/// a workspace turns them on.
+pub(crate) const BLAZE_INTERNAL: On = blaze_kind(blaze::Kind::Internal);
+
+/// The group `blaze::pedantic_perf`: speed advice that trades something else away or can't
+/// see whether the code is hot, allowed until a workspace or crate turns it on.
+pub(crate) const BLAZE_PEDANTIC_PERF: On = blaze_kind(blaze::Kind::PedanticPerf);
+
+/// The lints `deny` by default ([`blaze::DENY_BY_DEFAULT`]), as a [`Target::Blaze`] has them.
+const BLAZE_DENY: On = {
+    let mut bits = On::EMPTY;
+    let mut at = 0;
+    while at < blaze::DENY_BY_DEFAULT.len() {
+        bits = bits.or(blaze::DENY_BY_DEFAULT[at].bit());
+        at += 1;
+    }
+    bits
+};
+
+/// The general lints that a workspace turning `blaze::internal` on has allowed by default
+/// ([`blaze::YIELDS_TO_INTERNAL`]), as a [`Target::Blaze`] has them.
+const BLAZE_YIELDS: On = {
+    let mut bits = On::EMPTY;
+    let mut at = 0;
+    while at < blaze::YIELDS_TO_INTERNAL.len() {
+        bits = bits.or(blaze::YIELDS_TO_INTERNAL[at].bit());
+        at += 1;
+    }
+    bits
+};
 
 impl Target {
     /// What `name`, as an attribute or flag writes it, sets the level of, if it is a lint this
@@ -78,11 +122,15 @@ impl Target {
     }
 
     /// The lints of blaze's own `blaze::<name>` stands for, as a [`Target::Blaze`] has them.
-    pub(crate) fn blaze(name: &str) -> Option<u32> {
-        if name == "hot" {
-            return Some(BLAZE_HOT);
+    pub(crate) fn blaze(name: &str) -> Option<On> {
+        match name {
+            "hot" => return Some(BLAZE_HOT),
+            "general" => return Some(BLAZE_GENERAL),
+            "internal" => return Some(BLAZE_INTERNAL),
+            "pedantic_perf" => return Some(BLAZE_PEDANTIC_PERF),
+            _ => {}
         }
-        blaze::Lint::ALL.iter().find(|it| it.name() == name).map(|it| blaze_bit(*it))
+        blaze::Lint::named(name).map(blaze::Lint::bit)
     }
 
     /// Whether it sets the level of `lint`, whose index is `index` when it is clippy's.
@@ -93,7 +141,7 @@ impl Target {
             (Target::All, Lint::Clippy(info)) => info.group.in_all(),
             (Target::Warnings, Lint::Warnings) => true,
             (Target::Rustc(name), Lint::Rustc(lint)) => name == lint,
-            (Target::Blaze(lints), Lint::Blaze(lint)) => lints & blaze_bit(lint) != 0,
+            (Target::Blaze(lints), Lint::Blaze(lint)) => lints.intersects(lint.bit()),
             _ => false,
         }
     }
@@ -103,7 +151,9 @@ impl Target {
 #[derive(Clone, Copy, Debug)]
 pub enum Lint<'a> {
     Clippy(&'a Info),
-    /// A lint of blaze's own, `allow` unless a crate turns it on.
+    /// A lint of blaze's own: `warn` when it is general ([`blaze::Kind::General`]), `allow`
+    /// when it is blaze's internal one until a workspace turns it on (`deny` where `blaze::hot`
+    /// is).
     Blaze(blaze::Lint),
     /// The `warnings` group, which rustc asks for as a lint.
     Warnings,
@@ -125,7 +175,11 @@ impl Lint<'_> {
     fn default_level(&self) -> Level {
         match self {
             Lint::Clippy(info) => info.default_level(),
-            Lint::Blaze(_) => Level::Allow,
+            Lint::Blaze(lint) if BLAZE_DENY.intersects(lint.bit()) => Level::Deny,
+            Lint::Blaze(lint) => match lint.kind() {
+                blaze::Kind::General => Level::Warn,
+                blaze::Kind::Internal | blaze::Kind::PedanticPerf => Level::Allow,
+            },
             Lint::Warnings | Lint::Rustc(_) => Level::Warn,
         }
     }
@@ -141,6 +195,9 @@ pub enum Source {
     /// An attribute: the name in it (`clippy::pedantic`), the span of that name and the
     /// attribute's `reason`.
     Node { name: String, span: Span, reason: Option<String> },
+    /// `blaze::profile_hot`, for a perf lint no level is set for in a function the profile
+    /// `file` (its file name) shows hot, at `percent` of its counts ([`crate::profile`]).
+    Profile { file: String, percent: String },
 }
 
 /// A level and where it came from.
@@ -209,9 +266,7 @@ impl Levels {
     /// The level of `lint` where the attributes `sets` are, outermost first and each node's in
     /// their order: rustc's `reveal_actual_level_spec`.
     pub fn of(&self, lint: Lint<'_>, sets: &[Set]) -> Spec {
-        let mut spec = self
-            .probe(lint, sets)
-            .unwrap_or_else(|| Spec { level: lint.default_level(), source: Source::Default });
+        let mut spec = self.probe(lint, sets).unwrap_or_else(|| self.default_spec(lint, sets));
         if spec.level == Level::Warn
             && let Some(warnings) = self.probe(Lint::Warnings, sets)
             && matches!(warnings.level, Level::Deny | Level::Forbid | Level::Allow | Level::Expect)
@@ -223,6 +278,35 @@ impl Levels {
             spec.level = spec.level.min(cap);
         }
         spec
+    }
+
+    /// The level of `lint` when nothing names it or a group of it: its default, except that a
+    /// general lint in [`blaze::YIELDS_TO_INTERNAL`] is allowed where `blaze::internal` is on
+    /// (the workspace has its own conventions for what the lint asks for), the source being the
+    /// set that turned `blaze::internal` on.
+    fn default_spec(&self, lint: Lint<'_>, sets: &[Set]) -> Spec {
+        if let Lint::Blaze(it) = lint
+            && BLAZE_YIELDS.intersects(it.bit())
+            && let Some(internal) = self.internal_on(sets)
+        {
+            return Spec { level: Level::Allow, source: internal.source };
+        }
+        Spec { level: lint.default_level(), source: Source::Default }
+    }
+
+    /// The last set of the group `blaze::internal` itself, the command line's then the
+    /// attributes', when it turns the group on (any level but `allow`).
+    fn internal_on(&self, sets: &[Set]) -> Option<Spec> {
+        let attrs = sets.iter().map(|it| (&it.target, &it.spec));
+        let internal = Target::Blaze(BLAZE_INTERNAL);
+        let last = self
+            .sets
+            .iter()
+            .map(|(target, spec)| (target, spec))
+            .chain(attrs)
+            .filter(|(target, _)| **target == internal)
+            .last();
+        last.map(|(_, spec)| spec.clone()).filter(|spec| spec.level != Level::Allow)
     }
 
     /// The level set for `lint`, if one is: each set in order, the command line's first, a
@@ -280,6 +364,13 @@ pub fn explain(diagnostic: &mut Diag, lint: Lint<'_>, spec: &Spec) {
                     diagnostic.sub(Sublevel::Help, help, MultiSpan::default(), true);
                 }
             }
+        }
+        Source::Profile { file, percent } => {
+            let note = format!(
+                "`#[{}({name})]` implied by `blaze::profile_hot`: this function is hot per profile `{file}`, {percent} of its counts",
+                level.as_str()
+            );
+            diagnostic.sub(Sublevel::Note, note, MultiSpan::default(), true);
         }
         Source::Node { name: attr_name, span, reason } => {
             if let Some(reason) = reason {
@@ -347,7 +438,9 @@ mod tests {
             spec.source,
             Source::CommandLine { flag: "warnings".to_owned(), level: Level::Deny }
         );
-        assert_eq!(levels.of(Lint::Clippy(info("map_unwrap_or")), &[]).level, Level::Allow);
+        // Pedantic warns by default now, so `-D warnings` denies it; restriction stays off.
+        assert_eq!(levels.of(Lint::Clippy(info("map_unwrap_or")), &[]).level, Level::Deny);
+        assert_eq!(levels.of(Lint::Clippy(info("indexing_slicing")), &[]).level, Level::Allow);
     }
 
     #[test]
@@ -365,14 +458,21 @@ mod tests {
     }
 
     #[test]
-    fn blazes_lints_are_allowed_until_turned_on() {
+    fn general_lints_warn_and_internal_ones_wait_to_be_turned_on() {
         let hot_alloc = Lint::Blaze(blaze::Lint::HotAlloc);
         let none = Levels::new(&CommandLine::default());
         assert_eq!(none.of(hot_alloc, &[]).level, Level::Allow);
-        assert_eq!(none.of(Lint::Blaze(blaze::Lint::StdHashmap), &[]).level, Level::Allow);
+        assert_eq!(none.of(Lint::Blaze(blaze::Lint::DefaultHasher), &[]).level, Level::Allow);
+        assert_eq!(none.of(Lint::Blaze(blaze::Lint::HashTwice), &[]).level, Level::Warn, "general");
+        let internal = Levels::new(&CommandLine::parse(&args("--warn=blaze::internal")).unwrap());
+        assert_eq!(internal.of(hot_alloc, &[]).level, Level::Warn, "`blaze::internal` turns it on");
+        let general = Levels::new(&CommandLine::parse(&args("--allow=blaze::general")).unwrap());
+        assert_eq!(general.of(Lint::Blaze(blaze::Lint::SmallMap), &[]).level, Level::Allow);
         let hot = Levels::new(&CommandLine::parse(&args("--deny=blaze::hot")).unwrap());
         assert_eq!(hot.of(hot_alloc, &[]).level, Level::Deny);
-        assert_eq!(hot.of(Lint::Blaze(blaze::Lint::StdHashmap), &[]).level, Level::Deny, "`blaze::hot` is all four");
+        assert_eq!(hot.of(Lint::Blaze(blaze::Lint::DefaultHasher), &[]).level, Level::Deny, "`blaze::hot` has it");
+        let renamed = Levels::new(&CommandLine::parse(&args("--deny=blaze::std_hashmap")).unwrap());
+        assert_eq!(renamed.of(Lint::Blaze(blaze::Lint::DefaultHasher), &[]).level, Level::Deny, "the old name stands for the new");
         assert_eq!(hot.of(Lint::Clippy(info("needless_bool")), &[]).level, Level::Warn);
         let span = Span { file: "src/lib.rs".to_owned(), lo: 0, hi: 1, expansion: None };
         let cold = Set {

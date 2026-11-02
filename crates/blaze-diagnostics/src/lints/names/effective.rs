@@ -34,6 +34,7 @@ use std::cmp::Ordering;
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir::{
     AsAssocItem as _, AssocItem, AssocItemContainer, GenericDef, HasVisibility as _, ModuleDef,
     db::HirDatabase as _,
@@ -111,7 +112,7 @@ impl Ev {
 /// The effective visibilities of the crate's definitions.
 #[derive(Default)]
 pub(crate) struct Effective {
-    ids: HashMap<Def, u32>,
+    ids: HashMap<Def, u32, Global>,
     defs: Vec<Def>,
     /// rustc's table: `None` where it has no entry.
     ev: Vec<Option<Ev>>,
@@ -138,7 +139,7 @@ impl Effective {
             t: Effective::default(),
             queue: Vec::new(),  // alloc: setup, a definition is queued once at a time
             queued: Vec::new(), // alloc: setup, a column over the numbering
-            impls_of: HashMap::default(),
+            impls_of: HashMap::new_in(Global),
             names: Names::new(db, false),
         };
         build.resolve(&modules);
@@ -324,7 +325,7 @@ struct Build<'c, 'a, 'db> {
     queue: Vec<u32>,
     queued: Vec<bool>,
     /// rustc's `def_ids_to_impls`: the impls whose outermost self type or trait a type or trait is.
-    impls_of: HashMap<u32, Vec<u32>>,
+    impls_of: HashMap<u32, Vec<u32>, Global>,
     /// The definitions a walk names, reused from walk to walk.
     names: Names<'db>,
 }
@@ -845,7 +846,7 @@ struct Names<'db> {
     db: &'db Db,
     found: Vec<Def>,
     /// The aliases and opaque types walked, each once.
-    seen: HashSet<Ty<'db>>,
+    seen: HashSet<Ty<'db>, Global>,
     /// `skip_assoc_tys`: projections not looked into.
     skip_assoc: bool,
 }
@@ -853,7 +854,7 @@ struct Names<'db> {
 impl<'db> Names<'db> {
     fn new(db: &'db Db, skip_assoc: bool) -> Names<'db> {
         // alloc: setup, the buffers are reused for every walk
-        Names { db, found: Vec::new(), seen: HashSet::default(), skip_assoc }
+        Names { db, found: Vec::new(), seen: HashSet::new_in(Global), skip_assoc }
     }
 
     fn push(&mut self, def: Def) {

@@ -6,8 +6,8 @@
 //! messages a build streams are read where they lie in the daemon's frame
 //! ([`blaze_api::borrowed`]): each string is copied once, into the buffer, from the frame.
 
-use std::collections::hash_map::Entry;
-use std::hash::{BuildHasher as _, BuildHasherDefault};
+use blaze_hash::hash_map::Entry;
+use std::hash::BuildHasher as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +16,7 @@ use blaze_api::{
     UnitTargetRef,
 };
 use blaze_hash::FixedState;
+use std::alloc::Global;
 
 use super::print::ByHash;
 
@@ -537,7 +538,7 @@ struct Source {
 /// grown a lookup or a read allocates nothing.
 pub struct Sources {
     /// Each (manifest directory, name)'s file, by hash; `None` for a name that is no file.
-    named: ByHash<Option<u32>>,
+    named: ByHash<Option<u32>, Global>,
     texts: Texts,
 }
 
@@ -545,7 +546,7 @@ pub struct Sources {
 struct Texts {
     root: PathBuf,
     /// Each file read, by the hash of its path, so that two names of one file read it once.
-    at: ByHash<u32>,
+    at: ByHash<u32, Global>,
     files: Vec<Source>,
     text: String,
     starts: Vec<u32>,
@@ -561,11 +562,11 @@ impl Sources {
     /// `root` is the checkout's: a relative file name is looked for no higher.
     pub fn new(root: &Path) -> Sources {
         Sources {
-            named: ByHash::with_capacity_and_hasher(FILES, BuildHasherDefault::default()),
+            named: ByHash::with_capacity_in(FILES, Global),
             texts: Texts {
                 // alloc: once a request.
                 root: root.to_owned(),
-                at: ByHash::with_capacity_and_hasher(FILES, BuildHasherDefault::default()),
+                at: ByHash::with_capacity_in(FILES, Global),
                 files: Vec::with_capacity(FILES),
                 text: String::new(), // alloc: none until the first file is read.
                 starts: Vec::new(),  // alloc: none until the first file is read.

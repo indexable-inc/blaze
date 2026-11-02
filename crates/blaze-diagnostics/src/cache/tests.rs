@@ -1,4 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
+use std::alloc::Global;
 
 use base_db::{Crate, Db, Env};
 use blaze_format::Aligned;
@@ -228,7 +229,6 @@ fn an_empty_outcome_reads_without_allocating() {
     assert_eq!(empty.len(), HEADER + 2);
     let flags = flags(&["--cap-lints", "allow"]);
     let inputs = inputs(&flags);
-    let _ = *PRODUCER;
     let read = blaze_alloc_count::assert_at_most(0, "an empty outcome read and its key made", || {
         let _ = key(ContentId([1; 32]), &inputs);
         decode(&empty, || unreachable!("an empty outcome asks for no paths"), "/w")
@@ -300,7 +300,7 @@ fn a_served_outcome_renders_byte_identical() {
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
 #[derive(Default)]
 struct Memory {
-    values: Mutex<blaze_hash::HashMap<ContentId, Arc<Aligned>>>,
+    values: Mutex<blaze_hash::HashMap<ContentId, Arc<Aligned>, Global>>,
 }
 
 impl ImageStore for Memory {

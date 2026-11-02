@@ -50,6 +50,9 @@ const COLLECTION_CRATES: &[(&str, &str, bool, Shape)] = &[
     ("indexmap", "IndexSet", false, Shape::Set),
     ("blaze_hash", "HashMap", true, Shape::Map),
     ("blaze_hash", "HashSet", true, Shape::Set),
+    // What `blaze_hash::HashMap<K, V, A>` and the rest are: hashbrown's in a named allocator.
+    ("blaze_hash", "Map", true, Shape::Map),
+    ("blaze_hash", "Set", true, Shape::Set),
 ];
 
 /// std's collections, by diagnostic item.

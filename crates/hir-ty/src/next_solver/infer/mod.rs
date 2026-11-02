@@ -1443,6 +1443,13 @@ impl<'db> InferCtxt<'db> {
                 BoundVariableKind::Ty(_) => self.next_ty_var(span).into(),
                 BoundVariableKind::Region(_) => self.next_region_var(span).into(),
                 BoundVariableKind::Const => self.next_const_var(span).into(),
+                // blaze: a field binder's variable (`for<F: Field<T>>`) as a plain type
+                // variable, its container dropped. The solver never instantiates an assumption
+                // of one this way (`assemble_param_env_candidates` skips them; they reach the
+                // environment through their members, `reflect::instantiate_reflected_var`), so
+                // this is only ever a goal's binder seen by a caller that would equally lose a
+                // region's bound: it can make a goal harder to prove, never an unsound assumption.
+                BoundVariableKind::Reflected(_) => self.next_ty_var(span).into(),
             };
             args.push(arg);
         }

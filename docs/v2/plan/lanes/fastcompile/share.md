@@ -5,6 +5,13 @@ date: 2026-10-29
 ---
 # fastcompile-ident-share: shared code across generic instances
 
+Since 2026-11-02 (lane identity-port) this walk is compile identity,
+`hir_ty_identity::instance_identity` (`crates/hir-ty-identity/src/instance.rs`,
+[code-identity.md](../../design/code-identity.md)): `share_key`, `ShareKey`, `ShareInstance`,
+`ShareDef`, `BodyOptions` and `OptionsSet` are now `instance_identity`, `CompileIdentity`,
+`Instance`, `Subject`, `Compiled` and `hir_ty_identity::OptionsSet`, and `walk.rs` is gone.
+`hir-ty-share` keeps the building blocks. What follows is the plan as written.
+
 Idea 2 of [compile-time.md](../../design/compile-time.md). `Vec<&A>::push` and `Vec<&B>::push`
 are one machine function: nothing in them tells `&A` from `&B`. blaze decides this before
 codegen, as a key: two instances of one body with one **share key** are compiled once. The
@@ -42,16 +49,17 @@ line up one for one. A record is a tag byte and a 32-byte id.
 
 A type's **fact** is what code that does not tell types apart reads of it (`fact.rs`):
 
-- An ADT is its definition's identity (key, interface, layout hash, the `Drop` impls its glue
-  reaches), its layout, its discriminants and its fields' facts. So `Vec<&A>` and `Vec<&B>`
-  have one fact, and `A` and `B` do not, even when both are one `u32`. `repr`,
-  `transparent`, lang-item ADTs and `Drop` are all in the definition.
+- An ADT is its shape: its kind, `repr`, layout, discriminants and fields' facts. So
+  `struct A(u32)` and `struct B(u32)` have one fact, and `Vec<A>` and `Vec<B>` too. Lang items,
+  ABI-attribute ADTs and SIMD types keep their definition's identity. What tells two shapes
+  apart (a method, a drop, `TypeId`) is keyed where it is read. Changed by lane polymorph:
+  [../polymorph.md](../polymorph.md).
 - A tuple, an array or a closure is its layout and its parts' facts.
 - A pointer is its mutability and a summary of its pointee: kind, size, alignment, and
   whether it is `Freeze`, `Unpin` and plain data. These are the facts codegen reads to say
   what a reference argument is the only way to. A fact never holds the pointee's fact, so it
   never cycles: a type reaches itself only through a pointer.
-- A scalar is its identity. A function item is a value of no size, keyed where it is called or
+- A number is its class (signed, unsigned, float) and layout; `bool`, `char`, `str`, `!` are their identity. A function item is a value of no size, keyed where it is called or
   cast. A function pointer, a trait object or a coroutine is its full identity.
 - Each fact ends with whether the type needs drop and whether it is `Freeze`.
 

@@ -1,7 +1,7 @@
 //! AST -> `ItemTree` lowering code.
 
 use std::{
-    cell::{Cell, OnceCell},
+    cell::Cell,
     hash::Hash,
     mem,
 };
@@ -384,21 +384,24 @@ pub(super) struct Ctx<'db> {
     tree: TreeBuilder,
     ids: &'db AstIdMap,
     /// The file's span map, read when first wanted.
-    span_map: OnceCell<SpanMap<'db>>,
+    #[expect(clippy::disallowed_types, reason = "the file span map, set once per lowering context: not global")]
+    span_map: std::cell::OnceCell<SpanMap<'db>>,
     file: HirFileId,
-    cfg_options: OnceCell<&'db CfgOptions>,
+    #[expect(clippy::disallowed_types, reason = "crate cfg options, set once per lowering context: not global")]
+    cfg_options: std::cell::OnceCell<&'db CfgOptions>,
     krate: Crate,
 }
 
 impl<'db> Ctx<'db> {
+    #[expect(clippy::disallowed_types, reason = "span map and cfg options, set once per lowering context: not global")]
     pub(super) fn new(db: &'db Db, file: HirFileId, krate: Crate) -> Self {
         Self {
             db,
             tree: SCRATCH.take(),
             ids: file.ast_id_map(db),
             file,
-            cfg_options: OnceCell::new(),
-            span_map: OnceCell::new(),
+            cfg_options: std::cell::OnceCell::new(),
+            span_map: std::cell::OnceCell::new(),
             krate,
         }
     }
@@ -406,6 +409,7 @@ impl<'db> Ctx<'db> {
     /// [`Ctx::new`] with the maps of a part of `file` parsed alone (a body's
     /// [`crate::expr_store::BodySyntax`]), whose ids and spans are the file's: what is lowered
     /// reads that part and not the whole file.
+    #[expect(clippy::disallowed_types, reason = "span map and cfg options, set once per lowering context: not global")]
     pub(super) fn with_maps(
         db: &'db Db,
         file: HirFileId,
@@ -418,8 +422,8 @@ impl<'db> Ctx<'db> {
             tree: SCRATCH.take(),
             ids,
             file,
-            cfg_options: OnceCell::new(),
-            span_map: OnceCell::from(SpanMap::RealSpanMap(span_map)),
+            cfg_options: std::cell::OnceCell::new(),
+            span_map: std::cell::OnceCell::from(SpanMap::RealSpanMap(span_map)),
             krate,
         }
     }
@@ -634,7 +638,8 @@ impl<'db> Ctx<'db> {
             ast::Item::MacroRules(ast) => self.lower_macro_rules(ast)?,
             ast::Item::MacroDef(ast) => self.lower_macro_def(ast)?,
             ast::Item::ExternBlock(ast) => self.lower_extern_block(ast),
-            // FIXME: Handle `global_asm!()`.
+            // A `global_asm!` is no item: the code generator reads it from the macro call
+            // that expands to it (`expr_store::lower::global_asm`).
             ast::Item::AsmExpr(_) => return None,
         };
         self.lower_attrs(mod_item, item);

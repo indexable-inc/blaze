@@ -16,8 +16,6 @@
 //! first segment of a path with more segments is only looked for in the types namespace, the
 //! only one the rest of the path reads.
 
-use std::sync::LazyLock;
-
 use base_db::Db;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
@@ -134,7 +132,29 @@ struct PathQuery<'a> {
 }
 
 /// The name of blaze's test harness module (`blaze-engine`'s `test_harness::MODULE`).
-static TEST_HARNESS: LazyLock<Symbol> = LazyLock::new(|| Symbol::intern("__blaze_test_harness"));
+#[expect(clippy::disallowed_types, reason = "the process's one test harness name symbol: the constant is interned once")]
+static TEST_HARNESS: std::sync::LazyLock<Symbol> = std::sync::LazyLock::new(|| Symbol::intern("__blaze_test_harness"));
+
+/// `::core::blaze::contract_test`, what the attribute path `blaze::contract_test` names.
+#[expect(clippy::disallowed_types, reason = "the process's one alias path: its names are interned once")]
+static CONTRACT_TEST: std::sync::LazyLock<[Name; 3]> = std::sync::LazyLock::new(|| {
+    [intern::sym::core, Symbol::intern("blaze"), intern::sym::contract_test].map(Name::new_symbol_root)
+});
+
+/// The path an attribute macro's `path` resolves as: `blaze::contract_test` is blaze's builtin
+/// `::core::blaze::contract_test` (docs/v2/plan/lanes/contracts.md, part 2) in every crate,
+/// whatever else `blaze` names there, as `blaze::pure` and the other inert `blaze::` attributes
+/// are (`DefMap::is_builtin_or_registered_attr`). Every other path is itself.
+fn attr_path_alias(path: &ModPath, expected: Option<MacroSubNs>) -> (PathKind, &[Name]) {
+    match (expected, path.kind, path.segments()) {
+        (Some(MacroSubNs::Attr), PathKind::Plain, [first, second])
+            if first.symbol().as_str() == "blaze" && *second.symbol() == intern::sym::contract_test =>
+        {
+            (PathKind::Abs, &CONTRACT_TEST[..])
+        }
+        (_, kind, segments) => (kind, segments),
+    }
+}
 
 impl PerNs {
     pub(super) fn filter_macro(
@@ -224,7 +244,8 @@ impl DefMap {
         expected_macro_subns: Option<MacroSubNs>,
     ) -> ResolvePathResult {
         let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
-        self.resolve_fp(q, original_module, path.kind, path.segments(), &mut |_| {})
+        let (kind, segments) = attr_path_alias(path, expected_macro_subns);
+        self.resolve_fp(q, original_module, kind, segments, &mut |_| {})
     }
 
     /// [`Self::resolve_path_fp_with_macro`], calling `reads` with everything the lookup read,
@@ -241,7 +262,8 @@ impl DefMap {
         reads: &mut impl FnMut(PathRead),
     ) -> ResolvePathResult {
         let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
-        self.resolve_fp(q, original_module, path.kind, path.segments(), reads)
+        let (kind, segments) = attr_path_alias(path, expected_macro_subns);
+        self.resolve_fp(q, original_module, kind, segments, reads)
     }
 
     pub(super) fn resolve_path_fp_with_macro_single(
@@ -778,7 +800,10 @@ impl DefMap {
                 // Only resolve to builtins in the root `DefMap`.
                 PerNs::none()
             }
-            None => BUILTIN_SCOPE.get(name).copied().unwrap_or_else(PerNs::none),
+            None => match BUILTIN_SCOPE.get(name) {
+                Some(builtin) => *builtin,
+                None => self.arbitrary_int(name),
+            },
         };
         let from_scope_or_builtin = match shadow {
             BuiltinShadowMode::Module => from_scope.or(from_builtin),

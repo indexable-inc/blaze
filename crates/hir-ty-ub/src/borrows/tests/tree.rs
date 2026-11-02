@@ -5,6 +5,7 @@
 use std::fmt;
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 
 use crate::{
     borrows::{
@@ -37,7 +38,7 @@ fn compatible_with_protector(state: LocationState) -> bool {
 #[test]
 fn packed_state_roundtrip() {
     let sifas = [IdempotentForeignAccess::None, IdempotentForeignAccess::Read, IdempotentForeignAccess::Write];
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     for inner in PermissionPriv::ALL {
         for accessed in bool::exhaustive() {
             for sifa in sifas {
@@ -405,7 +406,7 @@ mod spurious_read {
         {
             let mut handle: Vec<(Self, OpaqueCode<_, _>)> = vec![(self, OpaqueCode { events: Vec::new() })];
             let mut paths: Vec<(Self, OpaqueCode<_, _>)> = Vec::new();
-            let mut seen: HashSet<Self> = HashSet::default();
+            let mut seen: HashSet<Self, Global> = HashSet::new_in(Global);
             while let Some((state, path)) = handle.pop() {
                 for evt in <TestEvent<RetX, RetY>>::exhaustive() {
                     if let Ok(next) = state.clone().perform_test_event(&evt)
@@ -432,7 +433,7 @@ mod spurious_read {
                 return false;
             }
             let mut states = vec![(self.clone(), other.clone())];
-            let mut seen = HashSet::default();
+            let mut seen = HashSet::new_in(Global);
             while let Some(state) = states.pop() {
                 if !seen.insert(state.clone()) {
                     continue;

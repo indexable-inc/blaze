@@ -76,6 +76,7 @@ pub fn autoderef<'db>(
 ) -> impl Iterator<Item = Ty<'db>> + use<'db> {
     let interner = DbInterner::new_with(db, env.krate);
     let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+    crate::comptime_env::enter_universes(&infcx, env.param_env);
     let (ty, _) = infcx.instantiate_canonical(Span::Dummy, &ty);
     let autoderef = Autoderef::new(&infcx, env.param_env, ty, Span::Dummy);
     // alloc: none up to `INLINE_STEPS`, past them a walk as deep as the crate's limit allows

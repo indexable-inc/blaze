@@ -23,9 +23,11 @@ mod inefficient_to_string;
 mod infinite_loop;
 mod io_other_error;
 pub(crate) mod iter_over_hash_type;
+mod iter_overeager_cloned;
 mod large_enum_variant;
-mod large_stack_arrays;
-mod large_stack_frames;
+mod large_futures;
+pub(crate) mod large_stack_arrays;
+pub(crate) mod large_stack_frames;
 mod large_types_passed_by_value;
 mod let_underscore_future;
 mod let_underscore_must_use;
@@ -77,6 +79,8 @@ mod more_rules_tests;
 #[cfg(test)]
 mod more_types_tests;
 
+use blaze_ids::bits::BitArray;
+use serde::{Deserialize, Serialize};
 use syntax::{TextRange, TextSize, view as ast, view::AstNode as _};
 
 use crate::{
@@ -155,7 +159,9 @@ implemented! {
     InfiniteLoop = "infinite_loop", Late;
     IoOtherError = "io_other_error", Late;
     IterOverHashType = "iter_over_hash_type", Late;
+    IterOvereagerCloned = "iter_overeager_cloned", Late;
     LargeEnumVariant = "large_enum_variant", Late;
+    LargeFutures = "large_futures", Late;
     LargeStackArrays = "large_stack_arrays", Late;
     LargeStackFrames = "large_stack_frames", Late;
     LargeTypesPassedByValue = "large_types_passed_by_value", Late;
@@ -199,19 +205,91 @@ implemented! {
     VecBox = "vec_box", Late;
 }
 
+/// The first bit of [`blaze::Lint`]s in an [`On`]: they follow clippy's implemented lints.
+pub(crate) const BLAZE_BITS: usize = Implemented::ALL.len();
+
+/// Every bit an [`On`] has a lint for.
+const ON_BITS: usize = BLAZE_BITS + blaze::Lint::ALL.len();
+
+/// The words of an [`On`]: as many as the two lint tables need, so adding a lint grows it.
+const ON_WORDS: usize = ON_BITS.div_ceil(64);
+
+const _: () = assert!(ON_WORDS * 64 >= ON_BITS, "an `On` holds a bit for every lint");
+const _: () = assert!(size_of::<On>() == 8 * ON_WORDS);
+
 /// A set of lints: bit `i` for the [`Implemented`] lint of index `i`, and bits
-/// [`BLAZE_BITS`]`..` for [`blaze::Lint`]s.
-pub(crate) type On = u128;
+/// [`BLAZE_BITS`]`..` for [`blaze::Lint`]s. Inline words sized by the lint tables, so copying,
+/// comparing and hashing it is a few word operations; it has no bit past [`ON_BITS`]. Its
+/// serialized form is its words, in order.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct On(BitArray<ON_WORDS>);
 
-/// The first bit of [`blaze::Lint`]s in an [`On`].
-pub(crate) const BLAZE_BITS: u32 = 96;
+impl On {
+    pub(crate) const EMPTY: On = On(BitArray::<ON_WORDS>::EMPTY);
 
-const _: () = assert!(Implemented::ALL.len() <= BLAZE_BITS as usize);
-const _: () = assert!(BLAZE_BITS as usize + blaze::Lint::ALL.len() <= On::BITS as usize);
+    /// Every lint, clippy's implemented ones and blaze's.
+    pub(crate) const ALL: On = On(BitArray::<ON_WORDS>::all_below(ON_BITS));
 
-/// Every bit of a [`blaze::Lint`].
-#[cfg(test)]
-const BLAZE: On = !0 << BLAZE_BITS;
+    /// Every [`blaze::Lint`].
+    pub(crate) const BLAZE: On = On::ALL.without(On(BitArray::<ON_WORDS>::all_below(BLAZE_BITS)));
+
+    /// The set of the one lint of bit `at`.
+    pub(crate) const fn bit(at: usize) -> On {
+        assert!(at < ON_BITS, "a bit of no lint");
+        On(BitArray::<ON_WORDS>::EMPTY.with_bit(at))
+    }
+
+    /// The lints of either.
+    pub(crate) const fn or(self, other: On) -> On {
+        On(self.0.or(&other.0))
+    }
+
+    /// These lints but `other`'s.
+    pub(crate) const fn without(self, other: On) -> On {
+        On(self.0.and_not(&other.0))
+    }
+
+    /// Whether some lint is in both: one AND per word.
+    #[inline]
+    pub(crate) fn intersects(self, other: On) -> bool {
+        !self.0.is_disjoint(&other.0)
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::ops::BitOr for On {
+    type Output = On;
+
+    #[inline]
+    fn bitor(self, other: On) -> On {
+        self.or(other)
+    }
+}
+
+impl std::ops::BitOrAssign for On {
+    #[inline]
+    fn bitor_assign(&mut self, other: On) {
+        *self = self.or(other);
+    }
+}
+
+/// The lints by name, clippy's then `blaze::`'s.
+impl std::fmt::Debug for On {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut set = f.debug_set();
+        for at in self.0.iter() {
+            match at.checked_sub(BLAZE_BITS) {
+                None => set.entry(&format_args!("{}", Implemented::ALL[at].name())),
+                Some(at) => set.entry(&format_args!("blaze::{}", blaze::Lint::ALL[at].name())),
+            };
+        }
+        set.finish()
+    }
+}
 
 /// Each implemented lint's index in clippy's table, found when blaze compiles: a lint not of
 /// clippy's is a compile error here.
@@ -258,7 +336,7 @@ impl Implemented {
 
     #[inline]
     pub(crate) const fn bit(self) -> On {
-        1 << self as u32
+        On::bit(self as usize)
     }
 }
 
@@ -280,7 +358,7 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 
 /// The lints the command line, or their default, leaves at a level other than `allow`.
 pub(crate) fn command_line_on(levels: &Levels) -> On {
-    let mut on = 0;
+    let mut on = On::EMPTY;
     for &lint in Implemented::ALL {
         if levels.of(Lint::Clippy(lint.info()), &[]).level != Level::Allow {
             on |= lint.bit();
@@ -318,7 +396,7 @@ pub(crate) fn names_in(text: &str, mut found: impl FnMut(TextRange, On)) {
                 "clippy" => clippy_lints(name),
                 _ => blaze_lints(name),
             };
-            if lints != 0 {
+            if !lints.is_empty() {
                 found(TextRange::new(offset(at), offset(end)), lints);
             }
         }
@@ -343,27 +421,21 @@ fn skip_whitespace(bytes: &[u8], mut at: usize) -> usize {
 /// The lints `clippy::<name>` stands for.
 fn clippy_lints(name: &str) -> On {
     match registry::named(name) {
-        Some(Named::Lint(info)) => Implemented::of(info.index()).map_or(0, Implemented::bit),
+        Some(Named::Lint(info)) => Implemented::of(info.index()).map_or(On::EMPTY, Implemented::bit),
         Some(Named::Group(group)) => clippy_where(|info| info.group == group),
         Some(Named::All) => clippy_where(|info| info.group.in_all()),
-        Some(Named::Renamed(to)) => to.strip_prefix("clippy::").map_or(0, clippy_lints),
-        Some(Named::Removed(_)) | None => 0,
+        Some(Named::Renamed(to)) => to.strip_prefix("clippy::").map_or(On::EMPTY, clippy_lints),
+        Some(Named::Removed(_)) | None => On::EMPTY,
     }
 }
 
 fn clippy_where(covers: impl Fn(&Info) -> bool) -> On {
-    Implemented::ALL.iter().filter(|it| covers(it.info())).fold(0, |on, it| on | it.bit())
+    Implemented::ALL.iter().filter(|it| covers(it.info())).fold(On::EMPTY, |on, it| on | it.bit())
 }
 
 /// The lints `blaze::<name>` stands for.
 fn blaze_lints(name: &str) -> On {
-    match Target::blaze(name) {
-        Some(lints) => blaze::Lint::ALL
-            .iter()
-            .filter(|it| lints & crate::level::blaze_bit(**it) != 0)
-            .fold(0, |on, it| on | it.bit()),
-        None => 0,
-    }
+    Target::blaze(name).unwrap_or(On::EMPTY)
 }
 
 /// Whether the walk goes into what derives expand to: only lints that run there need it.
@@ -374,11 +446,11 @@ pub(crate) fn in_derives(cx: &Cx<'_, '_>) -> bool {
 /// Whether the walk goes into what macro calls expand to, for the code handed to them: only
 /// lints that run on code a macro can be handed need it.
 pub(crate) fn in_calls(cx: &Cx<'_, '_>) -> bool {
-    cx.on_any(!Implemented::EmptyEnums.bit())
+    cx.on_any(On::ALL.without(Implemented::EmptyEnums.bit()))
 }
 
 /// The method names some lint of a method call looks at; any other call is linted by none.
-const METHODS: [&str; 19] = [
+const METHODS: [&str; 28] = [
     "map",
     "unwrap_or",
     "unwrap_or_default",
@@ -398,6 +470,15 @@ const METHODS: [&str; 19] = [
     "ok",
     "unwrap",
     "expect",
+    "next",
+    "last",
+    "nth",
+    "skip",
+    "take",
+    "flatten",
+    "filter",
+    "find",
+    "count",
 ];
 
 blaze_phf::phf_table!(static METHOD = &METHODS;);
@@ -417,7 +498,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         }
         return;
     }
-    if matches!(node.kind(), K::PATH | K::METHOD_CALL_EXPR) || node == cx.root() {
+    if matches!(node.kind(), K::PATH | K::METHOD_CALL_EXPR | K::ATTR) || node == cx.root() {
         disallowed::check(cx, node);
     }
     match node.kind() {
@@ -551,6 +632,10 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
             multiple_unsafe_ops_per_block::check(cx, node);
         }
         K::METHOD_CALL_EXPR => check_method_call(cx, node),
+        K::AWAIT_EXPR => {
+            let Some(it) = ast::Expr::cast(node) else { return };
+            large_futures::check(cx, it);
+        }
         _ => {}
     }
 }
@@ -593,6 +678,7 @@ fn check_method_call<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         15 => map_err_ignore::check(cx, expr),
         16 => unused_result_ok::check(cx, expr),
         17 | 18 => unwrap_in_result::check(cx, expr),
+        19..=27 => iter_overeager_cloned::check(cx, expr),
         _ => {}
     }
 }
@@ -614,7 +700,11 @@ pub(crate) fn check_node_by_casts<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) 
         }
         return;
     }
-    if ast::Path::cast(node).is_some() || ast::MethodCallExpr::cast(node).is_some() || node == cx.root() {
+    if ast::Path::cast(node).is_some()
+        || ast::MethodCallExpr::cast(node).is_some()
+        || ast::Attr::cast(node).is_some()
+        || node == cx.root()
+    {
         disallowed::check(cx, node);
     }
     if let Some(it) = ast::Item::cast(node) {
@@ -682,6 +772,8 @@ pub(crate) fn check_node_by_casts<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) 
         unused_result_ok::check(cx, it);
         unwrap_in_result::check(cx, it);
         arc_with_non_send_sync::check(cx, it);
+        iter_overeager_cloned::check(cx, it);
+        large_futures::check(cx, it);
         if let ast::Expr::ClosureExpr(it) = it {
             needless_return::check_closure(cx, it);
         }
@@ -720,13 +812,14 @@ mod tests {
 
     #[test]
     fn implemented_lints_are_clippys() {
-        assert_eq!(Implemented::ALL.len(), 66);
+        assert_eq!(Implemented::ALL.len(), 68);
         for (at, &lint) in Implemented::ALL.iter().enumerate() {
             assert_eq!(lint as usize, at);
             let info = registry::lint(lint.name()).expect("a lint of clippy's");
             assert!(std::ptr::eq(lint.info(), info));
             assert_eq!(Implemented::of(info.index()), Some(lint));
-            assert_eq!(lint.bit(), 1 << at);
+            assert_eq!(lint.bit(), On::bit(at));
+            assert!(!lint.bit().intersects(On::BLAZE));
         }
         let others = registry::lints().iter().filter(|it| Implemented::ALL.iter().all(|l| l.name() != it.name));
         for info in others {
@@ -764,12 +857,14 @@ mod tests {
     #[test]
     fn blazes_lints_take_the_bits_after_clippys() {
         for (at, &lint) in blaze::Lint::ALL.iter().enumerate() {
-            assert_eq!(lint.bit(), 1 << (BLAZE_BITS as usize + at));
-            assert_ne!(lint.bit() & BLAZE, 0);
+            assert_eq!(lint.bit(), On::bit(BLAZE_BITS + at));
+            assert!(lint.bit().intersects(On::BLAZE));
         }
         for &lint in Implemented::ALL {
-            assert_eq!(lint.bit() & BLAZE, 0);
+            assert!(!lint.bit().intersects(On::BLAZE));
         }
+        let every = Implemented::ALL.iter().map(|it| it.bit()).chain(blaze::Lint::ALL.iter().map(|it| it.bit()));
+        assert_eq!(every.fold(On::EMPTY, |on, it| on | it), On::ALL, "one bit per lint, none past them");
     }
 
     #[test]
@@ -784,10 +879,10 @@ mod tests {
 
     /// The names of the lints of `on`, clippy's then blaze's.
     fn named(on: On) -> Vec<String> {
-        let clippy = Implemented::ALL.iter().filter(|it| on & it.bit() != 0).map(|it| it.name().to_owned());
+        let clippy = Implemented::ALL.iter().filter(|it| on.intersects(it.bit())).map(|it| it.name().to_owned());
         let mut blaze: Vec<String> = blaze::Lint::ALL
             .iter()
-            .filter(|it| on & it.bit() != 0)
+            .filter(|it| on.intersects(it.bit()))
             .map(|it| format!("blaze::{}", it.name()))
             .collect();
         blaze.sort();
@@ -795,7 +890,7 @@ mod tests {
     }
 
     fn named_in(text: &str) -> (On, Vec<TextRange>) {
-        let (mut on, mut at) = (0, Vec::new());
+        let (mut on, mut at) = (On::EMPTY, Vec::new());
         names_in(text, |range, lints| {
             on |= lints;
             at.push(range);
@@ -810,17 +905,35 @@ mod tests {
         assert_eq!(at, [TextRange::new(8.into(), 31.into())]);
         let (on, _) = named_in("#[deny(clippy::pedantic)] mod m {}");
         assert_eq!(on, clippy_where(|it| it.group == registry::Group::Pedantic));
-        assert_ne!(on, 0);
+        assert!(!on.is_empty());
         let (on, _) = named_in("#[allow(clippy::all)]");
         assert_eq!(on, clippy_where(|it| it.group.in_all()));
-        assert_eq!(on & Implemented::DbgMacro.bit(), 0, "a restriction lint is not in `all`");
+        assert!(!on.intersects(Implemented::DbgMacro.bit()), "a restriction lint is not in `all`");
+        // `std_hashmap` is `default_hasher`'s old name.
         let (on, _) = named_in("#[expect(blaze::hot)] #[warn(blaze::std_hashmap)]");
         assert_eq!(
             named(on),
-            ["blaze::hot_alloc", "blaze::hot_alloc_call", "blaze::hot_clone", "blaze::hot_dyn", "blaze::std_hashmap"]
+            [
+                "blaze::cold_error",
+                "blaze::default_hasher",
+                "blaze::hot_alloc",
+                "blaze::hot_alloc_call",
+                "blaze::hot_clone",
+                "blaze::hot_dyn",
+                "blaze::implicit_allocator",
+                "blaze::large_move",
+            ]
         );
+        let (general, _) = named_in("#[allow(blaze::general)]");
+        let (internal, _) = named_in("#[allow(blaze::internal)]");
+        assert!(general.intersects(blaze::Lint::HashTwice.bit()) && !general.intersects(blaze::Lint::HotAlloc.bit()));
+        assert!(internal.intersects(blaze::Lint::HotAlloc.bit()) && !internal.intersects(blaze::Lint::HashTwice.bit()));
+        let (pedantic, _) = named_in("#[allow(blaze::pedantic_perf)]");
+        assert!(pedantic.intersects(blaze::Lint::DeepDropAtExit.bit()) && !pedantic.intersects(blaze::Lint::HashTwice.bit()));
+        assert!(!(general.intersects(pedantic) || internal.intersects(pedantic)), "the kinds are disjoint");
+        assert_eq!(general | internal | pedantic, On::BLAZE, "every blaze lint is of one kind");
         for text in ["notclippy::needless_bool", "clippy::not_a_lint", "clippy needless_bool", "blaze::"] {
-            assert_eq!(named_in(text).0, 0, "{text:?}");
+            assert_eq!(named_in(text).0, On::EMPTY, "{text:?}");
         }
     }
 
@@ -831,11 +944,15 @@ mod tests {
             Levels::new(&crate::level::CommandLine::parse(&args).unwrap())
         };
         let default = command_line_on(&flags(""));
-        assert_ne!(default & Implemented::NeedlessBool.bit(), 0);
-        assert_eq!(default & Implemented::DbgMacro.bit(), 0);
-        assert_eq!(default & BLAZE, 0, "blaze's lints are allowed until turned on");
-        assert_eq!(command_line_on(&flags("-A clippy::all")) & clippy_where(|it| it.group.in_all()), 0);
-        let on = command_line_on(&flags("-A clippy::all -W clippy::dbg_macro -D blaze::hot_alloc"));
+        assert!(default.intersects(Implemented::NeedlessBool.bit()));
+        assert!(!default.intersects(Implemented::DbgMacro.bit()));
+        assert!(default.intersects(blaze::Lint::HashTwice.bit()), "a general lint warns everywhere");
+        assert!(
+            !default.intersects(crate::level::BLAZE_INTERNAL),
+            "blaze's internal lints are allowed until turned on"
+        );
+        assert!(!command_line_on(&flags("-A clippy::all")).intersects(clippy_where(|it| it.group.in_all())));
+        let on = command_line_on(&flags("-A clippy::all -A blaze::general -W clippy::dbg_macro -D blaze::hot_alloc"));
         assert_eq!(named(on), ["dbg_macro", "blaze::hot_alloc"]);
     }
 }

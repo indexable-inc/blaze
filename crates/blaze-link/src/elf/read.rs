@@ -14,7 +14,7 @@ mod strings;
 #[cfg(test)]
 mod tests;
 
-use std::collections::hash_map::Entry;
+use blaze_hash::hash_map::Entry;
 use std::fmt;
 
 use blaze_codegen::Arch;
@@ -756,12 +756,12 @@ struct Added {
     module: Option<u32>,
     got: Option<u32>,
     /// By the ELF symbol whose size each holds.
-    sizes: HashMap<u32, u32>,
+    sizes: HashMap<u32, u32, std::alloc::Global>,
 }
 
 impl Added {
     fn new(empty: Name) -> Added {
-        Added { empty, module: None, got: None, sizes: HashMap::default() }
+        Added { empty, module: None, got: None, sizes: HashMap::new_in(std::alloc::Global) }
     }
 
     fn push(symbols: &mut Vec<Symbol>, symbol: Symbol) -> u32 {

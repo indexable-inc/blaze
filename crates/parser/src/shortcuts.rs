@@ -36,7 +36,7 @@ pub enum OutlineStrStep<'a> {
 
 impl LexedStr<'_> {
     pub fn to_input(&self, edition: Edition) -> crate::Input {
-        let _p = tracing::info_span!("LexedStr::to_input").entered();
+        let _p = tracing::info_span!(target: "blaze", "LexedStr::to_input").entered();
         let mut res = crate::Input::with_capacity(self.len());
         self.push_input(&mut res, &mut false, edition);
         res

@@ -60,7 +60,8 @@ pub(crate) enum Name {
 
 /// The constants of a prepared Cranelift function, prepared against `refs`, masked for
 /// [`blaze_codegen::fold::groups`]. `None` for one that can't take parameters: an assembly
-/// function, one without a body or with a dynamic stack slot, one whose global value has
+/// function, one without a body or with a dynamic stack slot, one with a tail call
+/// (`return_call`, which a thunk's plain call would put a frame under), one whose global value has
 /// a named symbol for its base, one naming a patchable callee, and one with data whose
 /// content isn't final (a `TypeId` still to be written) or that is not shared by content. A
 /// C-variadic function, and one whose address is significant
@@ -290,6 +291,12 @@ fn canon(func: &ir::Function, names: Names<'_>, words: &mut Words) -> Option<u32
         }
         canon.u8(u8::from(func.layout.is_cold(block)));
         for inst in func.layout.block_insts(block) {
+            // A `become`'s `return_call` would go out from the merged body, which its thunk
+            // called with a plain call: the thunk's frame would stay under every hop of the
+            // chain, and `become` promises a constant stack. Such a function is not folded.
+            if matches!(func.dfg.insts[inst].opcode(), Opcode::ReturnCall | Opcode::ReturnCallIndirect) {
+                return None;
+            }
             size += 1;
             canon.inst(inst)?;
         }
@@ -1057,7 +1064,7 @@ mod tests {
     }
 
     fn signature() -> ir::Signature {
-        let mut sig = ir::Signature::new(crate::target().unwrap().default_call_conv());
+        let mut sig = ir::Signature::new(crate::isa_for(crate::Target::for_host()).unwrap().default_call_conv());
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I64));
         sig
@@ -1492,7 +1499,7 @@ mod tests {
     fn random(seed: u64, mutate: Option<u32>, noise: Option<u64>) -> ir::Function {
         let mut d = Draws::new(seed, mutate);
         let mut z = Noise(noise.map(|it| Draws::new(it, None)));
-        let call_conv = crate::target().unwrap().default_call_conv();
+        let call_conv = crate::isa_for(crate::Target::for_host()).unwrap().default_call_conv();
         let sig_of = |params: u32| {
             let mut sig = ir::Signature::new(call_conv);
             sig.params.extend((0..params).map(|_| AbiParam::new(types::I64)));
@@ -1818,12 +1825,12 @@ mod tests {
             panic!("{shown}");
         }
         let mut ctx = cranelift_codegen::Context::for_function(func.clone());
-        assert!(!crate::emit(&mut ctx).unwrap().bytes.is_empty());
+        assert!(!crate::emit(&mut ctx, crate::Target::for_host()).unwrap().bytes.is_empty());
     }
 
     #[test]
     fn two_members_merge_into_a_body_and_thunks() {
-        let pointer = crate::target().unwrap().pointer_type();
+        let pointer = crate::isa_for(crate::Target::for_host()).unwrap().pointer_type();
         // Two sizes, two callees, one static (place 1 of both).
         let (a, b) = (grow(8, 0, 1, false), grow(24, 0, 1, true));
         let refs_a = vec![Target::Function(key(10)), Target::Extern("STATIC".to_owned())];
@@ -1834,7 +1841,7 @@ mod tests {
         let forms = Forms::new();
         let (ma, mb) = (Masking::of(&forms, &ma), Masking::of(&forms, &mb));
         let found = groups(
-            &[(key(1), settings, ma, &refs_a[..]), (key(2), settings, mb, &refs_b[..])],
+            &[(key(1), key(1), settings, ma, &refs_a[..]), (key(2), key(2), settings, mb, &refs_b[..])],
             &limits,
         );
         let group = &found[0];
@@ -1893,7 +1900,7 @@ mod tests {
 
     #[test]
     fn differing_data_is_made_by_the_thunks() {
-        let pointer = crate::target().unwrap().pointer_type();
+        let pointer = crate::isa_for(crate::Target::for_host()).unwrap().pointer_type();
         // One body for two vtables: data objects 7 and 9.
         let (a, b) = (grow_with(8, 0, 1, 7, false), grow_with(8, 0, 1, 9, true));
         let refs = vec![Target::Function(key(10)), Target::Extern("STATIC".to_owned())];
@@ -1903,7 +1910,7 @@ mod tests {
         let forms = Forms::new();
         let (ma, mb) = (Masking::of(&forms, &ma), Masking::of(&forms, &mb));
         let found = groups(
-            &[(key(1), settings, ma, &refs[..]), (key(2), settings, mb, &refs[..])],
+            &[(key(1), key(1), settings, ma, &refs[..]), (key(2), key(2), settings, mb, &refs[..])],
             &limits,
         );
         let group = &found[0];
@@ -1950,7 +1957,7 @@ mod tests {
         let forms = Forms::new();
         let (ma, mb) = (Masking::of(&forms, &ma), Masking::of(&forms, &mb));
         let found = groups(
-            &[(key(1), settings, ma, &refs[..]), (key(2), settings, mb, &refs[..])],
+            &[(key(1), key(1), settings, ma, &refs[..]), (key(2), key(2), settings, mb, &refs[..])],
             &limits,
         );
         let group = &found[0];

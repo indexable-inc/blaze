@@ -65,14 +65,26 @@ impl Group {
     pub fn default_level(self) -> Level {
         match self {
             Group::Correctness => Level::Deny,
-            Group::Complexity | Group::Perf | Group::Style | Group::Suspicious => Level::Warn,
-            Group::Cargo | Group::Nursery | Group::Pedantic | Group::Restriction => Level::Allow,
+            // Every check is on unless a crate turns it off: pedantic, nursery and cargo warn
+            // too, unlike clippy's defaults.
+            Group::Complexity
+            | Group::Perf
+            | Group::Style
+            | Group::Suspicious
+            | Group::Cargo
+            | Group::Nursery
+            | Group::Pedantic => Level::Warn,
+            // Restriction lints contradict each other (`implicit_return` and `needless_return`,
+            // `else_if_without_else` and `redundant_else`) and some forbid ordinary Rust
+            // (`arithmetic_side_effects`, `indexing_slicing`), so each is turned on by name.
+            Group::Restriction => Level::Allow,
         }
     }
 
-    /// Whether `clippy::all` (`clippy::default`) has its lints.
+    /// Whether `clippy::all` (`clippy::default`) has its lints: the groups clippy itself turns
+    /// on, which is what a crate's `clippy::all` means.
     pub fn in_all(self) -> bool {
-        self.default_level() != Level::Allow
+        matches!(self, Group::Correctness | Group::Complexity | Group::Perf | Group::Style | Group::Suspicious)
     }
 }
 

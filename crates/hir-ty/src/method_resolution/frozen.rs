@@ -10,6 +10,7 @@ use std::sync::Arc as StdArc;
 use base_db::{Crate, Db};
 use blaze_format::cursor::{Put, Reader};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::Frame;
 use hir_def::{
     ModuleDefId,
@@ -29,11 +30,11 @@ type R<T = ()> = Result<T, String>;
 #[blaze_query::input(singleton, debug)]
 pub struct FrozenImpls {
     #[returns(ref)]
-    pub maps: StdArc<HashMap<Crate, Frozen>>,
+    pub maps: StdArc<HashMap<Crate, Frozen, Global>>,
 }
 
 /// Has finding the impls of a crate use `maps`.
-pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen>) {
+pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
     use blaze_query::db::{Durability, Setter};
     let maps = StdArc::new(maps);
     match FrozenImpls::try_get(db) {
@@ -234,13 +235,22 @@ fn write_simplified(enc: &mut Enc<'_>, it: &SimplifiedType<'_>) -> R {
     match *it {
         S::Bool => enc.u8(0),
         S::Char => enc.u8(1),
+        // blaze: an arbitrary width (`#![blaze::arbitrary_ints]`, `impl u24 { .. }` in core) is
+        // written as its `code()`, 128 plus its width, past the standard types' indices, so their
+        // bytes are unchanged.
         S::Int(it) => {
             enc.u8(2);
-            enc.u32(index(&INTS, it));
+            enc.u32(match it.arbitrary_width() {
+                Some(_) => u32::from(it.code()),
+                None => index(&INTS, it),
+            });
         }
         S::Uint(it) => {
             enc.u8(3);
-            enc.u32(index(&UINTS, it));
+            enc.u32(match it.arbitrary_width() {
+                Some(_) => u32::from(it.code()),
+                None => index(&UINTS, it),
+            });
         }
         S::Float(it) => {
             enc.u8(4);
@@ -290,12 +300,32 @@ fn write_simplified(enc: &mut Enc<'_>, it: &SimplifiedType<'_>) -> R {
     Ok(())
 }
 
+/// An integer type [`write_simplified`] wrote: an index into `standard`, or the `code()` of an
+/// arbitrary width.
+fn read_int<T: Copy, W>(
+    dec: &mut Dec<'_>,
+    standard: &[T],
+    from_code: fn(u8) -> Option<T>,
+    arbitrary_width: fn(T) -> Option<W>,
+) -> R<T> {
+    let at = dec.u32()?;
+    if let Some(&it) = standard.get(at as usize) {
+        return Ok(it);
+    }
+    u8::try_from(at)
+        .ok()
+        .and_then(from_code)
+        .filter(|&it| arbitrary_width(it).is_some())
+        // alloc: the error on corrupt bytes.
+        .ok_or_else(|| format!("integer type {at}"))
+}
+
 fn read_simplified<'db>(dec: &mut Dec<'_>) -> R<SimplifiedType<'db>> {
     Ok(match dec.u8()? {
         0 => S::Bool,
         1 => S::Char,
-        2 => S::Int(dec.index(&INTS)?),
-        3 => S::Uint(dec.index(&UINTS)?),
+        2 => S::Int(read_int(dec, &INTS, IntTy::from_code, IntTy::arbitrary_width)?),
+        3 => S::Uint(read_int(dec, &UINTS, UintTy::from_code, UintTy::arbitrary_width)?),
         4 => S::Float(dec.index(&FLOATS)?),
         5 => S::Adt(read_def(dec)?),
         6 => S::Foreign(read_def(dec)?),

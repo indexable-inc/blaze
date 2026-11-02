@@ -12,6 +12,7 @@ use std::{
 };
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 
 use crate::{
     output::{LibraryPath, LinkArgTarget, Output},
@@ -159,7 +160,7 @@ pub struct GraphUnit<U, R> {
 pub fn to_link<U, R, G>(
     unit: U,
     graph: &G,
-    memo: &mut HashMap<U, BuildScripts<R>>,
+    memo: &mut HashMap<U, BuildScripts<R>, Global>,
 ) -> BuildScripts<R>
 where
     U: Copy + Eq + Hash,
@@ -176,7 +177,7 @@ where
 pub fn to_link_in<'m, U, R, G>(
     unit: U,
     graph: &G,
-    memo: &'m mut HashMap<U, BuildScripts<R>>,
+    memo: &'m mut HashMap<U, BuildScripts<R>, Global>,
 ) -> &'m BuildScripts<R>
 where
     U: Copy + Eq + Hash,
@@ -190,13 +191,13 @@ where
     &memo[&unit]
 }
 
-fn fill<U, R, G>(unit: U, node: GraphUnit<U, R>, graph: &G, memo: &mut HashMap<U, BuildScripts<R>>)
+fn fill<U, R, G>(unit: U, node: GraphUnit<U, R>, graph: &G, memo: &mut HashMap<U, BuildScripts<R>, Global>)
 where
     U: Copy + Eq + Hash,
     R: Copy + Eq + Hash + Ord,
     G: Fn(&U) -> GraphUnit<U, R> + ?Sized,
 {
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     let mut scripts =
         BuildScripts { to_link: Vec::with_capacity(node.own_runs.len()), plugins: BTreeSet::new() };
     for &run in &node.own_runs {
@@ -362,7 +363,7 @@ fn newest(path: &Path) -> Option<SystemTime> {
     if !meta.is_dir() {
         return Some(newest);
     }
-    let mut visited = HashSet::default();
+    let mut visited = HashSet::new_in(Global);
     visited.extend(DirId::of(path, &meta));
     // alloc: setup: one stack per walk, one path per directory below.
     let mut pending = vec![path.to_owned()];

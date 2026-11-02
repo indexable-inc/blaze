@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use ast_merge_langs::Lang;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use snafu::ResultExt as _;
 use tree_sitter::StreamingIterator as _;
 
@@ -24,7 +25,7 @@ use crate::error::{
 use crate::program::{AppAtom, BodyAtom, MatchAtom, Program, Term, builtin_arity};
 
 pub type Row = Vec<Value>;
-type Env = HashMap<String, Value>;
+type Env = HashMap<String, Value, Global>;
 type Binding = Vec<(String, Value)>;
 
 /// A derived relation: named columns plus deduplicated rows in derivation
@@ -33,12 +34,12 @@ type Binding = Vec<(String, Value)>;
 pub struct Relation {
     pub columns: Vec<String>,
     rows: Vec<Row>,
-    seen: HashSet<Row>,
+    seen: HashSet<Row, Global>,
 }
 
 impl Relation {
     fn new(columns: Vec<String>) -> Self {
-        Self { columns, rows: Vec::new(), seen: HashSet::default() }
+        Self { columns, rows: Vec::new(), seen: HashSet::new_in(Global) }
     }
 
     #[must_use]
@@ -71,9 +72,9 @@ struct MatchKey {
 pub(crate) struct Evaluator<'a> {
     program: &'a Program,
     corpus: &'a Corpus,
-    matches: HashMap<MatchKey, Vec<Binding>>,
+    matches: HashMap<MatchKey, Vec<Binding>, Global>,
     /// `text-match` patterns compiled once at setup, keyed by pattern source.
-    regexes: HashMap<String, regex::Regex>,
+    regexes: HashMap<String, regex::Regex, Global>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -86,15 +87,15 @@ impl<'a> Evaluator<'a> {
     /// a capture index the compiled query does not know, or an invalid
     /// `text-match` regex.
     pub(crate) fn new(program: &'a Program, corpus: &'a Corpus) -> Result<Self, Error> {
-        let mut matches = HashMap::default();
-        let mut regexes = HashMap::default();
+        let mut matches = HashMap::new_in(Global);
+        let mut regexes = HashMap::new_in(Global);
         let rule_atoms = program.rules.iter().flat_map(|rule| &rule.body);
         let rewrite_atoms = program.rewrites.iter().flat_map(|rewrite| &rewrite.body);
         for atom in rule_atoms.chain(rewrite_atoms) {
             match atom {
                 BodyAtom::Match(m) => {
                     let key = MatchKey { lang: m.lang, query: m.query.clone() };
-                    if let std::collections::hash_map::Entry::Vacant(entry) = matches.entry(key) {
+                    if let blaze_hash::hash_map::Entry::Vacant(entry) = matches.entry(key) {
                         entry.insert(materialize(corpus, m)?);
                     }
                 }

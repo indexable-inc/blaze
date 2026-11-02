@@ -9,13 +9,14 @@ use std::{
 };
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 
 use crate::env::{HostOs, Version, below, cfg_of};
 use crate::{Error, unit::Unit};
 
 #[derive(Default)]
 struct Explicit {
-    vars: HashMap<OsString, Option<OsString>>,
+    vars: HashMap<OsString, Option<OsString>, Global>,
 }
 
 impl Explicit {
@@ -44,7 +45,7 @@ fn envify(name: &str) -> String {
 pub fn env(
     unit: &Unit,
     inherited: &[(OsString, OsString)],
-) -> Result<(BTreeMap<OsString, OsString>, HashSet<OsString>), Error> {
+) -> Result<(BTreeMap<OsString, OsString>, HashSet<OsString, Global>), Error> {
     unit.check()?;
     let host = HostOs::of(&unit.host);
     let inherited_var = |name: &str| {
@@ -177,7 +178,7 @@ pub fn env(
     }
 
     let mut vars: BTreeMap<OsString, OsString> = inherited.iter().cloned().collect();
-    let mut from_unit = HashSet::default();
+    let mut from_unit = HashSet::new_in(Global);
     for (name, value) in cmd.vars {
         match value {
             Some(value) => {

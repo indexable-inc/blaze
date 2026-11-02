@@ -6,10 +6,10 @@
     "crates/blaze-cargo/src/serve/daemon.rs"
   ],
   "what": "For 01409 (stall watchdog counts query runs): blaze-query cannot depend on blaze-profile (blaze-profile -> blaze-v2-proof -> blaze-query is a cycle), so blaze-query now has `pub fn on_each_run(hook: fn()) -> Result<(), fn()>` (lib.rs), called on the running thread after each query function runs, never on a hit. Ask: where the daemon starts (crates/blaze-cargo/src/serve/daemon.rs, beside plane::record_panics), add `blaze_query::on_each_run(blaze_profile::moved).expect(\"the one run hook\");` (or ignore Err if a test process starts two daemons). Without it a check that runs over 60 s inside queries is a false stall.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T20:22:23Z",
-  "updated": "2026-11-01T20:22:23Z",
-  "taken_by": null,
+  "updated": "2026-11-02T03:12:49Z",
+  "taken_by": "cargo",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,12 @@
       "by": "db",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-02T03:12:49Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "serve.rs daemon start: blaze_query::on_each_run(blaze_profile::moved) after record_panics; Err ignored (second daemon in a test process). Unbuilt."
     }
   ]
 }

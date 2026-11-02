@@ -7,10 +7,11 @@
 use std::{
     cell::RefCell,
     fmt::Write,
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_query::db::FromId;
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, ModuleDefId,
@@ -126,8 +127,8 @@ fn declared(
 /// The statics and the functions without type parameters that one build of a crate declares.
 #[derive(Default)]
 struct Listed {
-    statics: HashMap<String, StaticId>,
-    functions: HashMap<String, Vec<FunctionId>>,
+    statics: HashMap<String, StaticId, Global>,
+    functions: HashMap<String, Vec<FunctionId>, Global>,
 }
 
 /// A file by its path as `named` has it, or for what a macro wrote by the call that wrote it.

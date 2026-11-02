@@ -36,7 +36,7 @@ use std::{
     ops::ControlFlow,
     ptr::{self, NonNull},
     sync::{
-        Arc, LazyLock, OnceLock,
+        Arc,
         atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
 };
@@ -421,7 +421,8 @@ static INSTALLED: AtomicUsize = AtomicUsize::new(0);
 /// The installed stores, each a `Box` of [`install`], freed through [`LIMBO`] once unlinked.
 static REGISTRY: [AtomicPtr<Store>; STORES] = [const { AtomicPtr::new(ptr::null_mut()) }; STORES];
 
-static LIMBO: LazyLock<Mutex<Limbo>> = LazyLock::new(|| Mutex::new(Limbo::new()));
+#[expect(clippy::disallowed_types, reason = "the process's one body store reclamation pool: all unlinked stores are retired together")]
+static LIMBO: std::sync::LazyLock<Mutex<Limbo>> = std::sync::LazyLock::new(|| Mutex::new(Limbo::new()));
 
 /// Runs `f` on the item store of `db`, if one is installed.
 #[inline]
@@ -640,7 +641,8 @@ impl Installed {
         // alloc: flush, once per build: one entry per step offered
         let entries: Vec<pending::Entry<'_>> = taken.iter().flat_map(pending::entries).collect();
         // alloc: flush, as above
-        let results: Vec<OnceLock<Result<Wrote, String>>> = entries.iter().map(|_| OnceLock::new()).collect();
+        #[expect(clippy::disallowed_types, reason = "body write results, set once per entry in this flush: not global")]
+        let results: Vec<std::sync::OnceLock<Result<Wrote, String>>> = entries.iter().map(|_| std::sync::OnceLock::new()).collect();
         store.images.for_each(entries.len(), &|at| {
             _ = results[at].set(store.write(&entries[at]));
         });

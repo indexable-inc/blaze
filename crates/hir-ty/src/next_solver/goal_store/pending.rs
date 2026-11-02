@@ -6,12 +6,13 @@
 //! stored) and its facts' values, each 32 bytes, in the shape's order.
 
 use std::{
-    collections::hash_map::Entry as Slot,
     mem,
     sync::atomic::{AtomicUsize, Ordering},
 };
+use blaze_hash::hash_map::Entry as Slot;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use parking_lot::Mutex;
 
@@ -38,7 +39,7 @@ struct Padded(Mutex<Shard>);
 #[derive(Default)]
 struct Shard {
     bytes: Vec<u8>,
-    inexpressible: HashMap<&'static str, u64>,
+    inexpressible: HashMap<&'static str, u64, Global>,
     unhashable: u64,
     too_long: u64,
     dropped: u64,
@@ -122,7 +123,7 @@ impl Pending {
     pub(super) fn take(&self) -> (Vec<Vec<u8>>, Tallies) {
         let mut tallies = Tallies::default();
         // alloc: flush, once per build
-        let mut inexpressible = HashMap::<&'static str, u64>::default();
+        let mut inexpressible = HashMap::<&'static str, u64, Global>::default();
         // alloc: flush, once per build
         let mut buffers = Vec::with_capacity(SHARDS);
         for shard in &self.shards {

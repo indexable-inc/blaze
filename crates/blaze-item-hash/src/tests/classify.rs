@@ -11,6 +11,7 @@ use base_db::{Crate, Db, all_crates};
 use blaze_alloc_count::assert_at_most;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{Fact, ItemId, auto_traits, const_value, implements, key, method};
 use hir_def::{
@@ -516,7 +517,7 @@ impl BodyFacts for Probe {
 /// A store in memory.
 #[derive(Default)]
 struct Memory {
-    images: Mutex<HashMap<ContentId, Arc<Aligned>>>,
+    images: Mutex<HashMap<ContentId, Arc<Aligned>, Global>>,
 }
 
 impl ImageStore for Memory {

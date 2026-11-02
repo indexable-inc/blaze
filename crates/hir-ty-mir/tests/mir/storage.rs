@@ -14,6 +14,8 @@ fn kept_for_a_code_generator_that_emits_lifetime_markers() {
         ub_checks: false,
         lifetime_markers: true,
         inline: false,
+        heap_to_stack: false,
+        world: None,
     };
     let mir = mir(BORROWED, "borrowed", options);
     assert!(mir.contains("StorageLive(") && mir.contains("StorageDead("), "{mir}");

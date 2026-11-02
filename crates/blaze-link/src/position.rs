@@ -182,6 +182,20 @@ pub fn location(name_len: usize, position: Position) -> [u8; LOCATION_SIZE as us
     record
 }
 
+/// `core::panic::Location<'static>` on wasm32, where a pointer is four bytes: the file name's
+/// pointer and length, then `line` and `col`, each four bytes (as `blaze-wasm` lays it out).
+pub const WASM32_LOCATION_SIZE: u64 = 16;
+pub const WASM32_LOCATION_ALIGN: u64 = 4;
+
+/// A wasm32 `Location` record's bytes, its pointer left for a relocation to the file name.
+pub fn wasm32_location(name_len: usize, position: Position) -> [u8; WASM32_LOCATION_SIZE as usize] {
+    let mut record = [0; WASM32_LOCATION_SIZE as usize];
+    record[4..8].copy_from_slice(&(name_len as u32).to_le_bytes());
+    record[8..12].copy_from_slice(&position.line.to_le_bytes());
+    record[12..16].copy_from_slice(&position.column.to_le_bytes());
+    record
+}
+
 /// The bytes of a file name a `Location` points at: NUL-terminated, as
 /// `Location::file_as_c_str` reads one byte past the length.
 pub fn file_name(name: &str) -> Vec<u8> {

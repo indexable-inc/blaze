@@ -1505,6 +1505,18 @@ impl<'db> Interner for DbInterner<'db> {
                     [] => false,
                 }
             }
+            // A `const { .. }` block inside `for const` loops (`#![feature(blaze_comptime)]`)
+            // also takes each enclosing loop's binder, outermost first, after its item's
+            // parameters (`crate::mir::comptime_binders_around`).
+            // Asked only when there are more: inference makes the block's constant with its
+            // item's parameters alone, and asking it about the loops there would be a cycle.
+            AliasTermKind::AnonConst { def_id } if args.len() > generics.iter().count() => {
+                let konst = def_id.0;
+                let binders = crate::mir::comptime_binders_of_anon_const(self.db, konst).len();
+                let Some(own) = args.len().checked_sub(binders) else { return false };
+                args_fit_params(generics.iter().map(|(param, _)| param), &args.as_slice()[..own])
+                    && args.as_slice()[own..].iter().all(|it| it.ty().is_some())
+            }
             _ => args_fit_params(generics.iter().map(|(param, _)| param), args.as_slice()),
         }
     }
@@ -1635,7 +1647,8 @@ impl<'db> Interner for DbInterner<'db> {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    // debug: once per solver step; at INFO the flight recorder would keep it and its thread CPU reads.
+    #[tracing::instrument(level = "debug", skip(self))]
     fn item_bounds(
         self,
         def_id: Self::DefId,
@@ -1643,7 +1656,8 @@ impl<'db> Interner for DbInterner<'db> {
         ItemBounds::of_solver_def(self.db, def_id).all_bounds()
     }
 
-    #[tracing::instrument(skip(self))]
+    // debug: as `item_bounds`.
+    #[tracing::instrument(level = "debug", skip(self))]
     fn item_self_bounds(
         self,
         def_id: Self::DefId,
@@ -1676,7 +1690,9 @@ impl<'db> Interner for DbInterner<'db> {
         self,
         def_id: Self::TraitId,
     ) -> EarlyBinder<Self, impl IntoIterator<Item = (Self::Clause, Self::Span)>> {
-        GenericPredicates::query(self.db, def_id.0.into())
+        // The trait's `Self:` clauses alone, rustc's `explicit_super_predicates_of`: a where
+        // clause about another type may name `dyn Trait`, whose elaboration reads these.
+        crate::lower::explicit_super_clauses(self.db, def_id.0)
             .explicit_non_assoc_types_predicates()
             .map_bound(move |predicates| {
                 predicates.filter(|p| is_clause_at_ty(p, is_ty_self)).map(|p| (p, Span::dummy()))
@@ -1698,7 +1714,12 @@ impl<'db> Interner for DbInterner<'db> {
             }
         }
 
-        let predicates = generic_predicates_of(self.db, def_id);
+        // A trait's from its own query, rustc's `explicit_implied_predicates_of`, which lowers
+        // only its clauses on `Self` and on paths rooted at it.
+        let predicates = match def_id {
+            SolverDefId::TraitId(trait_) => crate::lower::explicit_implied_clauses(self.db, trait_),
+            _ => generic_predicates_of(self.db, def_id),
+        };
         let non_assoc_types = predicates
             .explicit_non_assoc_types_predicates()
             .skip_binder()
@@ -1784,6 +1805,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverProjectionLangItem::Metadata => lang_items.Metadata,
             SolverProjectionLangItem::FieldBase => lang_items.FieldBase,
             SolverProjectionLangItem::FieldType => lang_items.FieldType,
+            SolverProjectionLangItem::ReflectVariantView => lang_items.ReflectVariantView,
         };
         lang_item.expect("Lang item required but not found.").into()
     }
@@ -1822,6 +1844,15 @@ impl<'db> Interner for DbInterner<'db> {
             SolverTraitLangItem::Field => lang_items.Field,
             SolverTraitLangItem::Freeze => lang_items.Freeze,
             SolverTraitLangItem::TryAsDyn => lang_items.TryAsDyn,
+            SolverTraitLangItem::ArbitraryInt => lang_items.ArbitraryInt,
+            SolverTraitLangItem::ArbitrarySigned => lang_items.ArbitrarySigned,
+            SolverTraitLangItem::IntFrom => lang_items.IntFrom,
+            SolverTraitLangItem::IntTryFrom => lang_items.IntTryFrom,
+            SolverTraitLangItem::ReflectEnum => lang_items.ReflectEnum,
+            SolverTraitLangItem::ReflectField => lang_items.ReflectField,
+            SolverTraitLangItem::ReflectFnItem => lang_items.ReflectFnItem,
+            SolverTraitLangItem::ReflectStruct => lang_items.ReflectStruct,
+            SolverTraitLangItem::ReflectVariant => lang_items.ReflectVariant,
         };
         lang_item.expect("Lang item required but not found.").into()
     }
@@ -1881,6 +1912,15 @@ impl<'db> Interner for DbInterner<'db> {
             Field,
             Freeze,
             TryAsDyn,
+            ArbitraryInt,
+            ArbitrarySigned,
+            IntFrom,
+            IntTryFrom,
+            ReflectEnum,
+            ReflectField,
+            ReflectFnItem,
+            ReflectStruct,
+            ReflectVariant,
         )
     }
 
@@ -1901,6 +1941,7 @@ impl<'db> Interner for DbInterner<'db> {
             AsyncFnKindUpvars,
             FieldBase,
             FieldType,
+            ReflectVariantView,
         )
     }
 
@@ -1939,7 +1980,52 @@ impl<'db> Interner for DbInterner<'db> {
             Field,
             Freeze,
             TryAsDyn,
+            ArbitraryInt,
+            ArbitrarySigned,
+            IntFrom,
+            IntTryFrom,
+            ReflectEnum,
+            ReflectField,
+            ReflectFnItem,
+            ReflectStruct,
+            ReflectVariant,
         )
+    }
+
+    fn reflect_members(
+        self,
+        container: Ty<'db>,
+        domain: rustc_type_ir::reflect::ReflectedDomain,
+    ) -> Tys<'db> {
+        crate::comptime::reflect_members(self, container, domain)
+    }
+
+    fn reflect_container_of(
+        self,
+        member: Ty<'db>,
+        domain: rustc_type_ir::reflect::ReflectedDomain,
+    ) -> rustc_type_ir::reflect::ReflectContainer<Self> {
+        crate::comptime::reflect_container_of(self, member, domain)
+    }
+
+    fn reflect_is_struct(self, ty: Ty<'db>) -> Option<bool> {
+        crate::comptime::reflect_is_struct(self, ty)
+    }
+
+    fn reflect_variant_view(self, member: Ty<'db>) -> Option<Ty<'db>> {
+        crate::comptime::reflect_variant_view(self, member)
+    }
+
+    fn reflect_is_enum(self, ty: Ty<'db>) -> bool {
+        matches!(ty.kind(), TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::EnumId(_)))
+    }
+
+    fn param_env_with_clauses(
+        self,
+        env: ParamEnv<'db>,
+        clauses: impl IntoIterator<Item = Clause<'db>>,
+    ) -> ParamEnv<'db> {
+        ParamEnv::new(Clauses::new_from_iter(env.clauses().iter().chain(clauses)))
     }
 
     fn as_adt_lang_item(self, def_id: Self::AdtId) -> Option<SolverAdtLangItem> {
@@ -1963,8 +2049,19 @@ impl<'db> Interner for DbInterner<'db> {
     fn for_each_relevant_impl<R: VisitorResult>(
         self,
         trait_ref: TraitRef<Self>,
-        mut f: impl FnMut(Self::ImplId) -> R,
+        f: impl FnMut(Self::ImplId) -> R,
     ) -> R {
+        // blaze: an impl over the markers of `#![blaze::arbitrary_ints]` (`impl<T: ArbitraryInt>
+        // Add for T`) is skipped where the goal has no argument it could make an arbitrary
+        // width, so no other type's goals list it (`crate::arbitrary_ints`).
+        let goal_args = crate::arbitrary_ints::GoalArgs::of(trait_ref);
+        let mut f = {
+            let mut f = f;
+            move |impl_: Self::ImplId| match impl_ {
+                AnyImplId::ImplId(id) if !goal_args.admits(self.db, id) => R::output(),
+                _ => f(impl_),
+            }
+        };
         let trait_def_id = trait_ref.def_id;
         let self_ty = trait_ref.self_ty();
         let krate = self.krate.expect("trait solving requires setting `DbInterner::krate`");
@@ -2065,9 +2162,12 @@ impl<'db> Interner for DbInterner<'db> {
             TyKind::Infer(InferTy::IntVar(_)) => {
                 use IntTy::*;
                 use UintTy::*;
-                // This causes a compiler error if any new integer kinds are added.
-                let (I8 | I16 | I32 | I64 | I128 | Isize): IntTy;
-                let (U8 | U16 | U32 | U64 | U128 | Usize): UintTy;
+                // This causes a compiler error if any new integer kinds are added. blaze: an
+                // integer variable never becomes an arbitrary width (`#![blaze::arbitrary_ints]`)
+                // through an impl, only by unifying with one, so their impls are not listed
+                // here (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+                let (I8 | I16 | I32 | I64 | I128 | Isize | IntTy::Bits(_)): IntTy;
+                let (U8 | U16 | U32 | U64 | U128 | Usize | UintTy::Bits(_)): UintTy;
                 let possible_integers = [
                     // signed integers
                     SimplifiedType::Int(I8),
@@ -2201,7 +2301,8 @@ impl<'db> Interner for DbInterner<'db> {
         }
     }
 
-    #[tracing::instrument(skip(self), ret)]
+    // debug: as `item_bounds`.
+    #[tracing::instrument(level = "debug", skip(self), ret)]
     fn impl_trait_ref(
         self,
         impl_id: Self::ImplId,
@@ -2352,6 +2453,12 @@ impl<'db> Interner for DbInterner<'db> {
         self,
         value: rustc_type_ir::Binder<Self, T>,
     ) -> rustc_type_ir::Binder<Self, T> {
+        // blaze: a field binder keeps its variables: anonymizing renumbers them in order of use
+        // and makes every type variable a plain one, which would drop a reflected variable's
+        // container and turn `for<F: Field<T>>` into `for<F>`.
+        if rustc_type_ir::reflect::has_reflected_vars::<Self>(value.bound_vars()) {
+            return value;
+        }
         struct Anonymize<'a, 'db> {
             interner: DbInterner<'db>,
             map: &'a mut FxIndexMap<BoundVar, BoundVariableKind<'db>>,

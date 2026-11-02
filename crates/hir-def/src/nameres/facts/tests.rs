@@ -19,6 +19,7 @@ use std::{fmt, fmt::Write as _, sync};
 
 use base_db::{Crate, Db, all_crates};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_mem::Tag;
 use either::Either;
 use hir_expand::{
@@ -323,6 +324,7 @@ pub(super) struct CCrateData<'a> {
     pub(super) no_core: bool,
     pub(super) no_std: bool,
     pub(super) proc_macro: bool,
+    pub(super) arbitrary_ints: bool,
     pub(super) edition: Edition,
     pub(super) recursion_limit: Option<u32>,
 }
@@ -377,13 +379,13 @@ fn sorted<T: fmt::Debug>(mut items: Vec<T>) -> Vec<T> {
 
 struct Projector<'a> {
     db: &'a Db,
-    local: HashMap<ModuleId, ModKey>,
+    local: HashMap<ModuleId, ModKey, Global>,
 }
 
 impl<'a> Projector<'a> {
     fn new(db: &'a Db, def_map: &DefMap) -> Self {
         let table = def_map.table(db);
-        let mut local = HashMap::default();
+        let mut local = HashMap::new_in(Global);
         for (id, _) in table.iter() {
             let mut path = Vec::new();
             let mut at = id;
@@ -625,8 +627,8 @@ impl<'a> Projector<'a> {
         } = scope;
 
         // Imports an exempt name's entry resolved through: their chains are left out too.
-        let mut exempt_imports: HashSet<CImport> = HashSet::default();
-        let column = |exempt_imports: &mut HashSet<CImport>,
+        let mut exempt_imports: HashSet<CImport, Global> = HashSet::new_in(Global);
+        let column = |exempt_imports: &mut HashSet<CImport, Global>,
                           name: &Name,
                           import: Option<CImport>| {
             if exempt.name(name) {
@@ -640,7 +642,7 @@ impl<'a> Projector<'a> {
         // which of them it is bound to follows the order the globs were resolved in, which the
         // collectors don't share. Its glob binding is listed with the other items it is
         // ambiguous with, so both compare as the same set.
-        let ambiguous: HashSet<(Name, u8)> = glob_ambiguities
+        let ambiguous: HashSet<(Name, u8), Global> = glob_ambiguities
             .iter()
             .map(|it| {
                 let ns = match it.other {
@@ -856,6 +858,7 @@ impl<'a> Projector<'a> {
             no_core,
             no_std,
             proc_macro,
+            arbitrary_ints,
             edition,
             recursion_limit,
         } = data;
@@ -885,6 +888,7 @@ impl<'a> Projector<'a> {
             no_core: *no_core,
             no_std: *no_std,
             proc_macro: *proc_macro,
+            arbitrary_ints: *arbitrary_ints,
             edition: *edition,
             recursion_limit: *recursion_limit,
         }
@@ -919,7 +923,7 @@ pub(in crate::nameres) fn project<'a>(
         def_map.records(db);
     let p = Projector::new(db, def_map);
 
-    let mut by_module: HashMap<ModuleId, Vec<&DefDiagnosticKind>> = HashMap::default();
+    let mut by_module: HashMap<ModuleId, Vec<&DefDiagnosticKind>, Global> = HashMap::new_in(Global);
     let mut stray = Vec::new();
     for DefDiagnostic { in_module, kind } in diagnostics {
         if !Projector::diagnostic_kind(kind, exempt) {

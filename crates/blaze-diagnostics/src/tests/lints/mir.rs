@@ -6,4 +6,5 @@ mod borrowck;
 mod consts;
 mod matches;
 mod scopes;
+mod tail_calls;
 mod unsafety;

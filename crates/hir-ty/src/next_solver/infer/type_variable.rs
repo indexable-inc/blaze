@@ -126,6 +126,18 @@ impl<'db> TypeVariableStorage<'db> {
         self.eq_relations.try_probe_value(vid)
     }
 
+    /// The root of `vid`'s set in the equality table, read without changing the table.
+    #[inline]
+    pub(crate) fn root_var_shared(&self, vid: TyVid) -> TyVid {
+        self.eq_relations.find_shared(vid)
+    }
+
+    /// The root of `vid`'s set in the sub-unification table, read without changing the table.
+    #[inline]
+    pub(crate) fn sub_root_var_shared(&self, vid: TyVid) -> TyVid {
+        self.sub_unification_table.find_shared(vid)
+    }
+
     /// Whether `vid` is the root of its set in the sub-unification table, read without changing
     /// the table.
     #[inline]

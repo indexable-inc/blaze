@@ -31,6 +31,7 @@ use std::{alloc::Allocator, fmt, fmt::Write as _};
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::AdtId;
@@ -76,6 +77,29 @@ impl Unhashable {
             _ = write!(said, " ({error})");
         }
         said
+    }
+
+    /// Whether the miss is MIR that failed to lower.
+    pub fn missed_mir(&self) -> bool {
+        self.what == form::Missed::NoMir.what()
+    }
+
+    /// For an item missed at MIR that failed to lower, the error lowering gave, as data, and the
+    /// body it was in: `None` for the item's own body, else the first closure or coroutine in it
+    /// that failed. `None` for any other miss. What reads an item's hash can so give a typed
+    /// reason where lowering had one (a call of an intrinsic missing from the table is the
+    /// caller's `UnknownIntrinsic`) and name the body that failed, not its owner. A closure's or
+    /// coroutine's code names its owner item ([`closure_code`], [`coroutine_code`]), so for one
+    /// of those this is the owner's first failure, which may be another body's: read its own
+    /// `mir_body_for_closure` / `mir_body_for_coroutine` instead.
+    pub fn mir_lowering_error<'db>(
+        &self,
+        db: &'db Db,
+    ) -> Option<(Option<form::Nested<'db>>, hir_ty::mir::MirLowerError<'db>)> {
+        if !self.missed_mir() {
+            return None;
+        }
+        form::Cx::new(db).mir_lowering_error(self.item)
     }
 }
 
@@ -169,6 +193,13 @@ impl Graph {
                     .id(&interface.digest)
                     .part(target.data_layout.as_bytes())
                     .part(arch_name(target.arch).as_bytes());
+                // A profile's field order (`hir_ty::layout::field_order`) is an input of the
+                // type's layout. Without a plan ranking it this adds nothing, so no hash moves.
+                if let ItemId::Adt(adt) = id
+                    && let Some(order) = hir_ty::layout::field_order::order_id(db, adt)
+                {
+                    h.update(b"field order").id(&order);
+                }
                 Ok(h.finish())
             }
             Graph::Deep => {
@@ -604,7 +635,7 @@ pub(crate) fn searched(
 #[derive(PartialEq, Eq, Debug, Default)]
 pub(crate) struct Components {
     /// Each item searched and its component, [`ALONE`] for an item by itself.
-    of: HashMap<ItemId, u32>,
+    of: HashMap<ItemId, u32, Global>,
     /// Component `c`'s members are `members[starts[c]..starts[c + 1]]`.
     members: Box<[ItemId]>,
     starts: Box<[u32]>,
@@ -675,7 +706,7 @@ pub(crate) fn find_components(db: &Db, graph: Graph, krate: base_db::Crate) -> C
             }
         }
         cycles.sort_unstable_by_key(|&(start, _)| found[start]);
-        let mut of = HashMap::default();
+        let mut of = HashMap::new_in(Global);
         // alloc: the memo's map, one entry per item searched.
         of.reserve(tarjan.index.len());
         for &id in tarjan.index.keys() {
@@ -716,7 +747,7 @@ struct Tarjan<'a, 'f> {
     krate: base_db::Crate,
     known: Option<&'a Components>,
     // alloc: std's map takes no allocator; one per search.
-    index: HashMap<ItemId, usize>,
+    index: HashMap<ItemId, usize, Global>,
     low: Vec<usize, &'f Frame>,
     on_stack: Vec<bool, &'f Frame>,
     stack: Vec<ItemId, &'f Frame>,
@@ -737,7 +768,7 @@ impl<'a, 'f> Tarjan<'a, 'f> {
             graph,
             krate,
             known,
-            index: HashMap::default(),
+            index: HashMap::new_in(Global),
             low: Vec::new_in(frame),
             on_stack: Vec::new_in(frame),
             stack: Vec::new_in(frame),

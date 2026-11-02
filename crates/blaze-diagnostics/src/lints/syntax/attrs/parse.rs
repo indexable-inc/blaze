@@ -25,6 +25,7 @@
 //! `session_diagnostics.rs` (MIT or Apache-2.0).
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir::InFile;
 use smallvec::SmallVec;
 use stdx::edit_distance::find_best_match_for_name_with_substrings;
@@ -95,7 +96,7 @@ impl Krate {
 #[derive(Default)]
 struct Seen {
     /// The attribute each single parser uses, by its path.
-    single: HashMap<&'static [&'static str], InFile<TextRange>>,
+    single: HashMap<&'static [&'static str], InFile<TextRange>, Global>,
     /// `#[used(compiler)]`, `#[used(linker)]` and `#[used]`.
     used: [Option<InFile<TextRange>>; 3],
     macro_use: MacroUse,

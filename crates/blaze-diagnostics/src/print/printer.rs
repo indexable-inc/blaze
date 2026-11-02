@@ -4,10 +4,11 @@
 //! `compiler/rustc_middle/src/ty/print/pretty.rs`, `compiler/rustc_middle/src/ty/print/mod.rs`
 //! and `own_args_no_defaults` of `compiler/rustc_middle/src/ty/generics.rs` (MIT or Apache-2.0).
 
-use std::{fmt::Write as _, sync::LazyLock};
+use std::fmt::Write as _;
 
 use base_db::Db;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir::db::HirDatabase;
 use hir_def::{AdtId, GenericDefId, ItemContainerId, Lookup, hir::generics::GenericParams};
 use hir_expand::name::Name;
@@ -66,9 +67,10 @@ struct Frame {
 }
 
 /// rustc's names for anonymous regions, `'a` to `'z`.
-static LETTERS: LazyLock<[Symbol; 26]> =
-    // alloc: setup, once per process
-    LazyLock::new(|| std::array::from_fn(|i| Symbol::intern(&format!("'{}", (b'a' + i as u8) as char))));
+const LETTERS: [&str; 26] = [
+    "'a", "'b", "'c", "'d", "'e", "'f", "'g", "'h", "'i", "'j", "'k", "'l", "'m", "'n", "'o", "'p", "'q", "'r",
+    "'s", "'t", "'u", "'v", "'w", "'x", "'y", "'z",
+];
 
 pub(crate) struct Printer<'p, 'a, 'db, 't> {
     pub(crate) cx: &'p Cx<'a, 'db>,
@@ -82,7 +84,7 @@ pub(crate) struct Printer<'p, 'a, 'db, 't> {
     no_visible: bool,
     printed_type_count: usize,
     frames: Vec<Frame>,
-    used_names: HashSet<Symbol>,
+    used_names: HashSet<Symbol, Global>,
     region_index: usize,
 }
 
@@ -111,7 +113,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
             no_visible: false,
             printed_type_count: 0,
             frames: Vec::new(), // alloc: empty, allocates nothing
-            used_names: HashSet::default(),
+            used_names: HashSet::new_in(Global),
             region_index: 0,
         }
     }
@@ -217,7 +219,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
     {
         let value = binder.as_ref().skip_binder();
         if self.frames.is_empty() {
-            let mut used = HashSet::default();
+            let mut used = HashSet::new_in(Global);
             if !self.mode.erase {
                 value.visit_with(&mut UsedNames {
                     db: self.db,
@@ -232,9 +234,11 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
         let mut bound = BoundAt { depth: INNERMOST, found: SmallVec::new() };
         value.visit_with(&mut bound);
 
-        let letters: SmallVec<[&Symbol; 26]> =
+        let letters: SmallVec<[Symbol; 26]> = match bound.found.is_empty() {
+            true => SmallVec::new(),
             // alloc: none, at most 26 inline in the `SmallVec`
-            LETTERS.iter().filter(|it| !self.used_names.contains(*it)).collect();
+            false => LETTERS.iter().map(|it| Symbol::intern(it)).filter(|it| !self.used_names.contains(it)).collect(),
+        };
         let mut taken = 0;
         let mut region_index = self.region_index;
         let mut names: SmallVec<[(u32, Symbol); 4]> = SmallVec::new();
@@ -250,7 +254,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 let name = match letters.get(taken) {
                     Some(it) => {
                         taken += 1;
-                        **it
+                        *it
                     }
                     // alloc: a region past `'z` named, printing a type, the edge
                     None => Symbol::intern(&format!("'z{}", region_index - letters.len())),
@@ -794,7 +798,7 @@ struct UsedNames<'t, 'x> {
     db: &'t Db,
     depth: DebruijnIndex,
     signature: bool,
-    out: &'x mut HashSet<Symbol>,
+    out: &'x mut HashSet<Symbol, Global>,
 }
 
 impl<'t> TypeVisitor<DbInterner<'t>> for UsedNames<'t, '_> {

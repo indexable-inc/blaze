@@ -2,8 +2,6 @@
 //! `.eh_frame` entry, apart from where the function is, and its landing pads as read-only
 //! data of its own. The linker writes the entries.
 
-use std::sync::OnceLock;
-
 use blaze_codegen::{Data, Relocs, Target, Unwind};
 use blaze_format::cursor::Reader;
 use cranelift_codegen::{
@@ -77,20 +75,23 @@ impl Common {
     }
 }
 
-/// [`Common`] of `isa`, which is the process's: the only ISA a v2 unit compiles with
-/// (`backend::check_spec`).
+/// [`Common`] of `isa`'s architecture: Cranelift's CIE reads the architecture and none of the
+/// ISA's flags, so every ISA of one architecture (each target's, each feature set's) has one.
 // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
+#[expect(clippy::disallowed_types, reason = "the CIE of each architecture, made once a process: it reads nothing but the architecture")]
 fn common(isa: &dyn TargetIsa) -> Result<&'static Common, String> {
-    static COMMON: OnceLock<Result<Common, String>> = OnceLock::new();
-    let process = crate::target().map_err(|e| e.to_string())?; // alloc: the error's message
-    if !std::ptr::addr_eq(isa, &**process) {
+    static COMMON: [std::sync::OnceLock<Result<Common, String>>; 2] =
+        [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    let slot = match isa.triple().architecture {
+        target_lexicon::Architecture::X86_64 => &COMMON[0],
+        target_lexicon::Architecture::Aarch64(_) => &COMMON[1],
         // alloc: the error's message
-        return Err(format!("unwind information for {}, which is not the process's ISA", isa.triple()));
-    }
-    let common = COMMON.get_or_init(|| {
-        let Some(made) = process.create_systemv_cie() else {
-            // alloc: the error's message, once per process
-            return Err(format!("{} has no DWARF call frame information", process.triple()));
+        other => return Err(format!("unwind information for {other}, which has no DWARF CIE")),
+    };
+    let common = slot.get_or_init(|| {
+        let Some(made) = isa.create_systemv_cie() else {
+            // alloc: the error's message, once per architecture
+            return Err(format!("{} has no DWARF call frame information", isa.triple()));
         };
         let entry = Entry::of(made, FrameDescriptionEntry::new(ANYWHERE, 0))?;
         Ok(Common { entry })

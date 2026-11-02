@@ -17,6 +17,7 @@ pub mod target;
 mod tests;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
 
@@ -194,7 +195,7 @@ fn checked(ask: &ForeignAsk, graph: &StdGraph) -> Result<(), String> {
     if graph.plans.len() != graph.units.len() {
         return Err(format!("the load planned {} of the standard library's {} units", graph.plans.len(), graph.units.len()));
     }
-    let mut names: HashMap<&str, &str> = HashMap::with_capacity_and_hasher(graph.packages.len(), Default::default());
+    let mut names: HashMap<&str, &str, Global> = HashMap::with_capacity_in(graph.packages.len(), Global);
     names.extend(graph.packages.iter().map(|it| (it.id.as_str(), it.name.as_str())));
     let name_of = |pkg_id: &str| names.get(pkg_id).copied();
     for unit in &graph.units {
@@ -228,7 +229,7 @@ thread_local! {
 impl Query for StdUnits {
     const KIND: QueryKind = kinds::STD_UNITS;
     const NAME: &'static str = "std units";
-    const PRODUCER: ContentId = producer("blaze v2 cargo std units 5");
+    const PRODUCER: ContentId = producer("blaze v2 cargo std units 6");
     type Key = StdKey;
     /// `Foreign`'s bytes as it wrote them once checked: read as a `CborRef<StdPlanned>`, as a
     /// `Cbor<StdPlanned>` would be, with no second encoding.

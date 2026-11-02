@@ -309,9 +309,12 @@ impl<'db> Owner<'db> {
     fn new(b: &BodyCx<'_, '_, 'db>) -> Self {
         let db = b.db();
         let krate = b.cx.krate.base();
+        let infcx = DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::non_body_analysis());
+        // With what the body's `for const` loops assume of their binders, as inference had it.
+        let env = hir_ty::comptime_env::body_env(&infcx, b.infer, db.trait_environment(b.owner.generic_def(db)));
         Owner {
-            infcx: DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::non_body_analysis()),
-            env: db.trait_environment(b.owner.generic_def(db)),
+            infcx,
+            env,
             krate,
             pointer_size: db.target_data_layout(krate).ok().map(|it| it.pointer_size().bytes() as u8),
         }

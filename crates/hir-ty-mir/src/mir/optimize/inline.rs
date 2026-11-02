@@ -23,7 +23,7 @@ use std::ops::Range;
 
 use base_db::{Crate, Db};
 use blaze_hash::{HashMap, HashSet};
-use either::Either;
+use std::alloc::Global;
 use hir_def::{
     CallableDefId, FunctionId, HasModule, ItemContainerId, Lookup, attrs::AttrFlags,
     signatures::FunctionSignature,
@@ -38,11 +38,12 @@ use smallvec::SmallVec;
 
 use crate::{
     db::HirDatabase,
-    method_resolution::is_dyn_method,
     mir::{
         BasicBlockId, InlinedBody, InlinedCallee, MirBody, MirOptLevel, MirOptions, MirSpan,
-        Operand, OperandKind, StatementKind, Terminator, TerminatorKind, monomorphized, overflow,
-        return_slot, transform::Ctx,
+        Operand, OperandKind, StatementKind, Terminator, TerminatorKind,
+        dispatch::{self, Callee},
+        monomorphized, overflow, return_slot,
+        transform::Ctx,
     },
     next_solver::{
         Const, ConstKind, DbInterner, GenericArgs, Region, RegionExt, RegionKind, Ty, TyKind,
@@ -134,14 +135,14 @@ impl Attrs {
 fn target_features<'db>(
     db: &'db Db,
     body: InlinedBody<'db>,
-) -> &'db HashSet<Symbol> {
+) -> &'db HashSet<Symbol, Global> {
     let func = match body {
         InlinedBody::Fn(func) => Some(func),
         InlinedBody::Closure(_) => owner_of(db, body).as_function(),
     };
     match func {
         Some(func) => AttrFlags::target_features(db, func),
-        None => const { &HashSet::with_hasher(blaze_hash::FixedState) },
+        None => const { &HashSet::with_hasher_in(blaze_hash::FixedState, Global) },
     }
 }
 
@@ -196,7 +197,7 @@ pub(super) fn inline<'db>(
         changed: false,
         caller_is_inline_forwarder: caller_attrs.hinted() && body_is_forwarder(body),
         callgraph: None,
-        listed: HashMap::default(),
+        listed: HashMap::new_in(Global),
     };
     inliner.run(body);
     inliner.changed
@@ -208,7 +209,7 @@ struct Inliner<'a, 'f, 'db> {
     db: &'db Db,
     caller: InlinedBody<'db>,
     caller_attrs: Attrs,
-    caller_features: &'db HashSet<Symbol>,
+    caller_features: &'db HashSet<Symbol, Global>,
     options: MirOptions,
     session: cost::Session,
     env: ParamEnvAndCrate<'db>,
@@ -223,7 +224,7 @@ struct Inliner<'a, 'f, 'db> {
     /// [`cycle::callgraph_cyclic`] of the caller, once a callee of its crate asks.
     callgraph: Option<Option<&'db cycle::Callgraph<'db>>>,
     /// Where each instance is in the caller's [`Inlined::callees`](crate::mir::Inlined::callees).
-    listed: HashMap<(InlinedBody<'db>, GenericArgs<'db>), u32>,
+    listed: HashMap<(InlinedBody<'db>, GenericArgs<'db>), u32, Global>,
 }
 
 /// A call that resolves to a body.
@@ -532,7 +533,7 @@ fn is_inline_valid_on_body(
     runtime.then_some(())
 }
 
-fn has_asm(body: &MirBody<'_>) -> bool {
+pub(super) fn has_asm(body: &MirBody<'_>) -> bool {
     body.basic_blocks.iter().any(|(_, block)| {
         block.statements.iter().any(|it| matches!(it.kind, StatementKind::InlineAsm(_)))
     })
@@ -590,13 +591,19 @@ fn optimized<'db>(
 /// compiles one of the crate `caller` with `options`, as `Build::options` gives them
 /// (`hir-ty-codegen/v2/build.rs`): the standard library's are its own, at level 2 without UB
 /// checks; a crate of the build has the caller's, its `debug_assertions` deciding its UB
-/// checks.
+/// checks. No callee is devirtualized ([`MirOptions::world`]): the caller's `Devirtualize`
+/// runs again after `Inline` over what the callees brought, and records what it read in the
+/// caller's own body, which is what the code generator keys. No callee moves an allocation
+/// to the stack ([`MirOptions::heap_to_stack`]): built into a caller, its stack slots would be
+/// the caller's, and a caller may recurse, which `HeapToStack` never moves an allocation
+/// across (`escape.rs`).
 fn callee_options(
     db: &Db,
     caller: Crate,
     callee: Crate,
     options: MirOptions,
 ) -> MirOptions {
+    let options = MirOptions { world: None, heap_to_stack: false, ..options };
     if callee == caller {
         return options;
     }
@@ -727,8 +734,8 @@ pub(super) fn fn_def<'db>(
 
 /// The body a call of `func` with `args` runs, with its generic arguments, where the caller's
 /// typing environment `env` decides it: rustc's `Instance::try_resolve` for what it resolves
-/// to an item with MIR. A virtual call, an intrinsic, a shim and a call whose impl is not
-/// known resolve to nothing.
+/// to an item with MIR, past the code generator's dispatch ([`dispatch::callee`]). A virtual
+/// call, an intrinsic, a shim and a call whose impl is not known resolve to nothing.
 pub(super) fn resolve<'db>(
     ctx: &Ctx<'_, 'db>,
     env: ParamEnvAndCrate<'db>,
@@ -770,10 +777,8 @@ pub(super) fn resolve<'db>(
         let parent = GenericArgs::new_from_slice(closure_args.parent_args());
         return Some((InlinedBody::Closure(closure.0), parent));
     }
-    if is_dyn_method(interner, env.param_env, func, args).is_some() {
-        return None;
-    }
-    let (Either::Left(implemented), impl_args) = db.lookup_impl_method(env, func, args) else {
+    let Ok(Callee::Fn(implemented, impl_args)) = dispatch::callee(&ctx.infcx, env, func, args)
+    else {
         return None;
     };
     let unsettled = TypeFlags::HAS_PARAM | TypeFlags::HAS_TY_INFER | TypeFlags::HAS_CT_INFER;
@@ -821,7 +826,7 @@ fn normalize_ty<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Ty<'db> {
     ty.fold_with(&mut Instantiate { ctx, args: None, missing: false })
 }
 
-fn fold<'db, T: TypeFoldable<DbInterner<'db>>>(
+pub(super) fn fold<'db, T: TypeFoldable<DbInterner<'db>>>(
     ctx: &Ctx<'_, 'db>,
     value: T,
     args: Option<GenericArgs<'db>>,

@@ -21,6 +21,7 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_profile::{batches::schema_of, schema};
 
 /// The most buckets one request may ask for: eight 8K screens across.
@@ -242,7 +243,7 @@ fn names<'a>(batch: &'a RecordBatch) -> Result<Names<'a>, TilesError> {
 /// The names of the output, each once: their number is their key in the output's dictionary.
 #[derive(Default)]
 struct NameTable<'a> {
-    ids: HashMap<&'a str, u32>,
+    ids: HashMap<&'a str, u32, Global>,
     names: Vec<&'a str>,
 }
 

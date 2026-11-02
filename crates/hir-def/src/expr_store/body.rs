@@ -4,6 +4,7 @@ use std::ops;
 
 use base_db::{Db, EditionedFileId};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_expand::{HirFileId, InFile, Lookup, span_map::SpanMap};
 use span::{AstIdMap, Edition, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
@@ -129,7 +130,7 @@ impl Body {
             self_param: source_map.self_param.map(|it| mv.ptr(it)),
             store: source_map.store.moved(&mv),
         };
-        if check_relative() {
+        if check_relative(db) {
             let lowering = Self::of(db, def).lowering_with_source_map();
             let (whole, in_file) = lower_in_file(db, def, lowering);
             assert_eq!(in_file, source_map, "{def:?}: the source map lowered alone, moved");
@@ -238,9 +239,11 @@ fn lower_relative(
     let tree = syntax.tree(db);
     let node = view::to_node(syntax.item, view::Node::root(&tree));
     let (mut params, mut is_async_fn, mut is_gen_fn) = (None, false, false);
+    let mut function = None;
     let body = match def {
         DefWithBodyId::FunctionId(_) => {
             let it = view::Fn::cast(node)?;
+            function = Some(it);
             params = it.param_list();
             is_async_fn = it.async_token().is_some();
             is_gen_fn = it.gen_token().is_some();
@@ -259,6 +262,7 @@ fn lower_relative(
         def.module(db),
         params,
         body,
+        function,
         is_async_fn,
         is_gen_fn,
         maps,
@@ -274,11 +278,13 @@ fn lower_in_file(
     lowering: BodyLowering<'_>,
 ) -> (Body, BodySourceMap) {
     let mut params = None;
+    let mut function = None;
     let mut is_async_fn = false;
     let mut is_gen_fn = false;
     let (InFile { file_id, value: body }, syntax_node) = match def {
         DefWithBodyId::FunctionId(f) => {
             let src = f.lookup(db).source_view(db);
+            function = Some(src.value);
             params = src.value.param_list();
             is_async_fn = src.value.async_token().is_some();
             is_gen_fn = src.value.gen_token().is_some();
@@ -310,6 +316,7 @@ fn lower_in_file(
         module,
         params,
         body,
+        function,
         is_async_fn,
         is_gen_fn,
         None,
@@ -319,10 +326,10 @@ fn lower_in_file(
 
 /// Whether [`Body::with_source_map`] checks the source map of each body lowered alone, moved,
 /// against that of the same body lowered in its file, and [`BodySyntax::tree`] parses every
-/// anchor again and prints the ones that parse differently alone (`RA_CHECK_RELATIVE_BODIES`).
-pub(crate) fn check_relative() -> bool {
-    static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CHECK.get_or_init(|| std::env::var_os("RA_CHECK_RELATIVE_BODIES").is_some())
+/// anchor again and prints the ones that parse differently alone (`RA_CHECK_RELATIVE_BODIES`,
+/// [`base_db::FrontSettings::check_relative_bodies`]).
+pub(crate) fn check_relative(db: &Db) -> bool {
+    base_db::FrontSettings::get(db).check_relative_bodies(db)
 }
 
 /// What lowering a body reads of the file it is written in, as a tree of its own: the anchor
@@ -389,7 +396,7 @@ impl BodySyntax {
     /// The anchor as a tree of its own: the one kept on this thread, else parsed again. Its
     /// root is [`view::Node::root`] of it.
     pub fn tree(&self, db: &Db) -> std::sync::Arc<FlatTree> {
-        let kept = trees::get(self.tree).filter(|_| !check_relative());
+        let kept = trees::get(self.tree).filter(|_| !check_relative(db));
         kept.unwrap_or_else(|| {
             let root = self.reparse().unwrap_or_else(|| self.from_file(db));
             // clone: a count of the tree for this thread's tree cache
@@ -435,7 +442,7 @@ impl BodySyntax {
 
     /// The anchor from the tree of its file, for one that parses differently alone.
     fn from_file(&self, db: &Db) -> std::sync::Arc<FlatTree> {
-        if check_relative() {
+        if check_relative(db) {
             eprintln!(
                 "{:?}: the anchor at {:?} parses differently alone",
                 self.file_id, self.range
@@ -619,14 +626,14 @@ struct ItemBodySyntax<'db> {
 /// The [`ItemBodySyntax`] of each fn, const, static and variant of `file` outside fn bodies, by
 /// its ast id: changed only when such an item comes or goes, not by where an item is.
 #[blaze_query::tracked(returns(ref))]
-fn file_body_syntax(db: &Db, file: EditionedFileId) -> HashMap<ErasedFileAstId, blaze_query::db::Id> {
+fn file_body_syntax(db: &Db, file: EditionedFileId) -> HashMap<ErasedFileAstId, blaze_query::db::Id, Global> {
     let file_id = HirFileId::from(file);
     let SpanMap::RealSpanMap(span_map) = file_id.span_map(db) else {
         unreachable!("{file:?} is a real file")
     };
     let ast_id_map = file_id.ast_id_map(db);
     let root = file_id.root(db);
-    let mut items = HashMap::default();
+    let mut items = HashMap::new_in(Global);
     for &[start, end, kind, id] in ast_id_map.entries() {
         let kind = SyntaxKind::from(kind as u16);
         if !matches!(kind, SyntaxKind::FN | SyntaxKind::CONST | SyntaxKind::STATIC | SyntaxKind::VARIANT) {

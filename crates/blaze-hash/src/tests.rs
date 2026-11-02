@@ -1,4 +1,7 @@
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::{
+    alloc::Global,
+    hash::{BuildHasher, Hash, Hasher},
+};
 
 use hegel::TestCase;
 use hegel::generators as gs;
@@ -72,7 +75,7 @@ fn the_seed_is_the_same_in_every_run() {
 
 #[test]
 fn a_map_finds_what_it_holds() {
-    let mut map: HashMap<(u32, &str), u32> = HashMap::default();
+    let mut map: HashMap<(u32, &str), u32, Global> = HashMap::new_in(Global); // alloc: a test's map
     for it in 0..1_000u32 {
         map.insert((it, "key"), it);
     }
@@ -127,8 +130,8 @@ fn a_content_id_hashes_as_its_first_word() {
 
 #[test]
 fn a_map_on_hashes_finds_what_it_holds() {
-    let mut map: ByHash<Id, u32> = ByHash::default();
-    let mut set: ByHashSet<u64> = ByHashSet::default();
+    let mut map: ByHash<Id, u32, Global> = ByHash::new_in(Global); // alloc: a test's map
+    let mut set: ByHashSet<u64, Global> = ByHashSet::new_in(Global); // alloc: a test's set
     for i in 0..64u32 {
         let mut bytes = [0u8; 32];
         bytes[..4].copy_from_slice(&i.to_le_bytes());
@@ -145,7 +148,7 @@ fn a_map_on_hashes_finds_what_it_holds() {
 
 #[test]
 fn a_lookup_on_a_hash_allocates_nothing() {
-    let mut map: ByHash<Id, u32> = ByHash::default();
+    let mut map: ByHash<Id, u32, Global> = ByHash::new_in(Global); // alloc: a test's map
     map.insert(Id([7; 32]), 7);
     blaze_alloc_count::assert_at_most(0, "a prehashed lookup", || {
         for _ in 0..100 {

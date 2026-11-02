@@ -45,8 +45,21 @@ store's records (`body_store`, kinds 0x3800 to 0x3840). Their keys are made in p
 crate. Lane db was asked for the key functions and each fact's crate (fastcompile-queue 3).
 Until they are given, the builders don't publish these two kinds.
 
-**Dev functions** (`Rule::dev_function`). Cranelift's and copy-and-patch's code is kept under
-`keys::template(stored(instance, built_in))`, with no import decisions. It is public on the
+**Dev functions** (`Rule::dev_function`). Code compiled alone, with no import decisions, is
+kept under `driver::dev_template_key(instance, built_in, refs, toolchain)`, the kernel's entry
+(`kernel::template`) of `placed(stored(instance, built_in), refs)`, whatever its backend: a
+whole build's Cranelift and copy-and-patch code, a lazy build's first compiles, and a lazy
+build's tier-up (`Later::tier_up`), LLVM's too. A whole build's LLVM code (`Backend::is_release`),
+a whole live build's tier-up (`Build::tier_up`) included, is compiled with its imports and kept
+under the release key, which `Rule::function` alone shows public. `Rule::function` is given
+each import twice: the instance the walk names it by (`imported_names`, whose key is the name
+in the import decision; in a tier-up the import's first tier) and the unit its export is
+built as (`imported`, of the same code and type arguments, at the settings it is exported at),
+and the key holds the built unit's. `Rule::dev_function` refuses
+LLVM code: no builder publishes the lone kind yet, and it gets a publisher and a test first. The
+backend is in the instance's settings, so code of two backends never shares a key. The driver
+and the rule both call that one function, and the rule refuses `built_in` that is not strictly
+ascending, the only order the driver keys. It is public on the
 same terms as release code (pinned toolchain, public code and type arguments), and only when
 compiled for the target's baseline (`Toolchain::features` empty: a `Runs::Elsewhere` build
 with no `-C target-cpu` or `-C target-feature`). Code tuned to the builder's CPU has a key of

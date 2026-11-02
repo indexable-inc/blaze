@@ -34,6 +34,7 @@ use inkwell::{
 use std::sync::Arc;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use smallvec::SmallVec;
 
 use super::{
@@ -41,7 +42,9 @@ use super::{
     lower::{Debug, Defined, Lowering},
     mark_features, mark_hint,
     pgo::{self, Counted},
-    rebase, retold_bytes,
+    rebase,
+    report::{self, Asked},
+    retold_bytes,
     sanitize::{self, Covered},
     told_constants, wrap,
 };
@@ -66,6 +69,9 @@ pub(crate) struct Prelinked {
     /// Built with a profile: whether the profile has a record of its name with another hash
     /// ([`pgo`]), so that it is built with no counts.
     pub(crate) mismatched: bool,
+    /// Built with a profile: whether the profile gave it counts (a record of its name with
+    /// its hash).
+    pub(crate) applied: bool,
 }
 
 /// What the pre-linked function says of itself for its summary, its callees by the
@@ -146,52 +152,60 @@ fn run(module: &Module<'_>, passes: &str, machine: &Machinery, vectorize: bool) 
 /// that `unsanitized` leaves on ([`sanitize::mark`]). With `pgo`, what it is built with for PGO
 /// and the name its counts are kept under ([`pgo::name`]), it is instrumented or given its
 /// profile's counts here, as LLVM's pre-link pipeline does. It is compiled with the target
-/// features `features`, its unit's and its `#[target_feature]`'s ([`mark_features`]).
+/// features `features`, its unit's and its `#[target_feature]`'s ([`mark_features`]), and
+/// keeps its frame pointer when `frame_pointers`, its unit's `Toolchain::frame_pointers`.
+/// `report` gives it its lines on every format, for its compile's [`report`](super::report).
 pub(crate) fn prelink(
     wants: &Wants,
     func: &ir::Function,
     named: &[ir::StackSlot],
     hint: Hint,
     debug: bool,
+    report: bool,
     optimization: Optimization,
     instances: &impl Fn(u32) -> bool,
     sanitize: &Sanitize,
     unsanitized: Sanitizers,
     pgo: Option<(pgo::Wanted, &str)>,
     features: Features,
+    frame_pointers: bool,
 ) -> Result<Prelinked, Unhandled> {
     let tally = Tally::global();
-    Machine::with_pgo(optimization, pgo.map(|it| it.0), features, |context, machine| {
+    Machine::with_pgo(wants.target, optimization, pgo.map(|it| it.0), features, |context, machine| {
+        // The counts are the thread's machinery's, which an earlier compile that returned
+        // between its run and its take may have left set: this function's start from none.
+        let _ = (machine.take_mismatched(), machine.take_applied());
         let module = context.create_module("blaze");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
         // alloc: once per module; `Wants` (fragment.rs) lists these, and the lowering looks them up
-        let constants: HashMap<u32, &[u8]> = wants.constants().collect();
+        let constants: HashMap<u32, &[u8], Global> = wants.constants().collect();
         // alloc: once per module, as `constants`
-        let statics: HashSet<u32> = wants.statics().collect();
+        let statics: HashSet<u32, Global> = wants.statics().collect();
         // alloc: once per module, as `constants`
-        let readonly: HashMap<u32, &crate::ConstBlob> = wants.readonly().collect();
+        let readonly: HashMap<u32, &crate::ConstBlob, Global> = wants.readonly().collect();
         let pointer = machine.get_target_data().get_pointer_byte_size(None) as usize;
         told_constants(context, &module, &readonly, pointer);
-        let lines = if debug { Debug::of(&module)? } else { None };
+        let lines = if debug || report { Debug::of(&module, wants.target, report)? } else { None };
         let own = Defined {
             name: OWN,
             func,
             pointees: &wants.pointees,
             named: if debug { named } else { &[] },
             weights: None,
-            marked: debug,
+            marked: debug || report,
         };
         let blocks_asm = wants.asm_blocks();
-        let shown = HashMap::default();
+        let shown = HashMap::new_in(Global);
         let function = tally.time(Phase::Lower, || {
-            let function = Lowering::add(context, &module, &own)?;
+            let function = Lowering::add(context, &module, wants.target, &own, frame_pointers)?;
             mark_hint(context, function, hint);
-            mark_features(context, function, features)?;
+            mark_features(context, function, wants.target, features)?;
             sanitize::mark(context, function, sanitize, unsanitized);
             Lowering::define(
                 context,
                 &module,
+                wants.target,
                 function,
                 &own,
                 &constants,
@@ -216,6 +230,7 @@ pub(crate) fn prelink(
             tally.time(Phase::Optimize, || machine.run_pgo(&module))?;
         }
         let mismatched = machine.take_mismatched() > 0;
+        let applied = machine.take_applied() > 0;
         if let Some(renamed) = renamed {
             renamed.restore();
         }
@@ -232,7 +247,7 @@ pub(crate) fn prelink(
         };
         let body = optimistic(context, module, function, instances, machine)?;
         facts.body = Attrs { noreturn: facts.attrs.noreturn, ..body };
-        Ok(Prelinked { own, export, size, facts, mismatched })
+        Ok(Prelinked { own, export, size, facts, mismatched, applied })
     })
 }
 
@@ -323,7 +338,7 @@ fn told_functions<'ctx>(
                                 .funcs
                                 .get(target as usize)
                                 .ok_or(Unhandled::Shape("an object naming a function nobody asked for"))?;
-                            let ty = Lowering::function_type(context, &request.sig)?;
+                            let ty = Lowering::function_type(context, wants.target, &request.sig)?;
                             module.add_function(&name, ty, Some(Linkage::External))
                         }
                     };
@@ -360,17 +375,8 @@ fn told_functions<'ctx>(
 }
 
 /// `memory(read)` as the linked LLVM encodes it, which depends on how many kinds of location
-/// it has: the same for every context of the process.
+/// it has: read from a one-line module, once a compile that needs it.
 fn read_only(context: &Context) -> Result<u64, Unhandled> {
-    static READ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    if let Some(&read) = READ.get() {
-        return Ok(read);
-    }
-    let read = parse_read_only(context)?;
-    Ok(*READ.get_or_init(|| read))
-}
-
-fn parse_read_only(context: &Context) -> Result<u64, Unhandled> {
     let text = "declare void @read() memory(read)\n\0";
     let source = MemoryBuffer::create_from_memory_range_copy(text.as_bytes(), "memory");
     let parsed = context.create_module_from_ir(source).map_err(llvm)?;
@@ -611,19 +617,20 @@ pub(crate) fn compile(
     sanitize: &Sanitize,
     profiled: Option<&str>,
     features: Features,
-) -> Result<(Code, Covered, Option<Counted>), Unhandled> {
+    report: Asked,
+) -> Result<(Code, Covered, Option<Counted>, Vec<report::Raw>), Unhandled> {
     let _span = tracing::info_span!(target: "blaze", "llvm compile").entered();
     let tally = Tally::global();
     // Where a parameter is the only way to its memory, as `compiled` wraps it.
     let wrapped = optimization.pipeline().is_some()
         && wants.pointees.iter().any(|(_, it)| it.unique)
-        && crate::Target::selected().is_ok_and(|it| it.object_format == crate::ObjectFormat::MachO);
-    Machine::with_pgo(optimization, None, features, |context, machine| {
+        && wants.target.object_format == crate::ObjectFormat::MachO;
+    Machine::with_pgo(wants.target, optimization, None, features, |context, machine| {
         let module = context.create_module("blaze");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
         // alloc: once per module; `Wants` (fragment.rs) lists these, and the lowering looks them up
-        let readonly: HashMap<u32, &crate::ConstBlob> = wants.readonly().collect();
+        let readonly: HashMap<u32, &crate::ConstBlob, Global> = wants.readonly().collect();
         let pointer = machine.get_target_data().get_pointer_byte_size(None) as usize;
         told_constants(context, &module, &readonly, pointer);
         tally.time(Phase::Lower, || {
@@ -644,15 +651,39 @@ pub(crate) fn compile(
             wrap(context, &module, function, None)?;
         }
         tally.time(Phase::Verify, || module.verify()).map_err(llvm)?;
-        if let Some(passes) = postlink(optimization) {
-            run(&module, passes, machine, true)?;
-            if rebase::rebase(&module) {
-                run(&module, REBASED, machine, false)?;
+        let passes = || {
+            if let Some(passes) = postlink(optimization) {
+                run(&module, passes, machine, true)?;
+                if rebase::rebase(&module) {
+                    run(&module, REBASED, machine, false)?;
+                }
             }
-        }
-        if !imports.is_empty() {
-            run(&module, "elim-avail-extern", machine, false)?;
-        }
+            if !imports.is_empty() {
+                run(&module, "elim-avail-extern", machine, false)?;
+            }
+            Ok::<_, Unhandled>(())
+        };
+        // Read before the sanitizers, whose checks branch to reports that never return too.
+        let found = match report {
+            Asked::No => {
+                passes()?;
+                // alloc: empty, no allocation
+                Vec::new()
+            }
+            Asked::Lined | Asked::Unlined => {
+                let ((), found) = machine.reported(|| {
+                    passes()?;
+                    // The function by name: one built into its wrapper is gone (`INNER`).
+                    let function =
+                        module.get_function(OWN).ok_or(Unhandled::Shape("a module without its function"))?;
+                    Ok(((), function))
+                })?;
+                if report == Asked::Unlined {
+                    module.strip_debug_info();
+                }
+                found
+            }
+        };
         sanitize::instrument(&module, machine, sanitize)?;
         retold_bytes(context, &module, &readonly);
         if module.get_function(INNER).is_some() {
@@ -670,16 +701,16 @@ pub(crate) fn compile(
             if u64::from(bytes) != u64::from(counted.counters) * 8 {
                 return Err(Unhandled::Shape("PGO counters of another size than the record says"));
             }
-            return Ok((code, coverage, Some(counted)));
+            return Ok((code, coverage, Some(counted), found));
         }
         if sanitize.coverage.is_on() {
             let (code, coverage) =
                 tally.time(Phase::Read, || emitted::read_covered(object.as_slice(), own, wants))?;
-            return Ok((code, coverage, None));
+            return Ok((code, coverage, None, found));
         }
         let mut codes = tally.time(Phase::Read, || emitted::read(object.as_slice(), &[own], wants))?;
         let code = codes.pop().ok_or(Unhandled::Shape("an object without the function"))??;
-        Ok((code, Covered::default(), None))
+        Ok((code, Covered::default(), None, found))
     })
 }
 
@@ -805,7 +836,7 @@ mod tests {
             passes: Passes::Aggressive,
             selection: crate::backend::Selection::Optimized,
         };
-        Machinery::new(Machine::create(optimization).unwrap())
+        Machinery::new(Machine::create(crate::Target::x86_64_linux(), optimization).unwrap())
     }
 
     /// Calls its request 1 twice with one constant and its request 2 with two, takes the
@@ -850,7 +881,7 @@ define i32 @"blaze.own"() {
 }
 "#,
         );
-        let mut wants = Wants::new(&**crate::target().unwrap());
+        let mut wants = Wants::new(crate::Target::x86_64_linux(), &**crate::isa_for(crate::Target::x86_64_linux()).unwrap());
         let mut signature = Signature::new(cranelift_codegen::isa::CallConv::SystemV);
         signature.returns.push(AbiParam::new(types::I32));
         let method = wants.func(crate::fragment::FuncTarget::Symbol("method".to_owned()), &signature);
@@ -865,7 +896,8 @@ define i32 @"blaze.own"() {
         module.verify().unwrap();
         run(&module, "function(instcombine)", &machine(), false).unwrap();
         let text = module.print_to_string().to_string();
-        assert!(text.contains(r#"call i32 @"blaze.f.0"()"#), "{text}");
+        // LLVM quotes no name of letters, digits and dots.
+        assert!(text.contains("call i32 @blaze.f.0()"), "{text}");
         let told = module.get_global("blaze.d.0").unwrap();
         assert_eq!(told.get_linkage(), Linkage::AvailableExternally);
         assert!(told.is_constant());

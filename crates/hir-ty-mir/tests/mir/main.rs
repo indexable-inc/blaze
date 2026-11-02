@@ -7,6 +7,8 @@ mod alloc_budget;
 mod const_check;
 mod const_check_drops;
 mod db;
+#[path = "../../src/mir/optimize/devirt/fixtures.rs"]
+mod devirt;
 mod erase_regions;
 mod foreign;
 mod held_across_calls;
@@ -18,6 +20,8 @@ mod operands;
 mod references;
 mod scalar_names;
 mod source_maps;
+#[path = "../../src/mir/optimize/specialize/fixtures.rs"]
+mod specialize;
 mod source_names;
 mod stages;
 mod storage;

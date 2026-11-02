@@ -260,7 +260,7 @@ fn named(db: &TestDB, view: &View) -> Vec<(String, String)> {
                 else {
                     continue;
                 };
-                let [ty, value] = names_in(&sema, path_node);
+                let [ty, value, _] = names_in(&sema, path_node);
                 let krate = ty
                     .or(value)
                     .and_then(|it| it.module(db))

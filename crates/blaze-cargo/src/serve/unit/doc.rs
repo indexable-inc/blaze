@@ -6,6 +6,7 @@
 use blaze_api::{ApiError, Diagnostic, Documented, DocumentedCrate, Level, Response};
 use blaze_doc::{Asked, TestOnly, html::Pages, model::Warning};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_lower::Lowered;
 use blaze_units::{
     query::{PackagePlan, Units},
@@ -86,9 +87,9 @@ fn asked(units: &Units, lowered: &Lowered, private: bool) -> Result<Vec<Asked>, 
 }
 
 /// Each lowered crate's package.
-fn packages<'a>(units: &'a Units, lowered: &Lowered) -> HashMap<base_db::Crate, &'a PackagePlan> {
-    let by_id: HashMap<&str, &PackagePlan> = units.packages.iter().map(|it| (it.id.as_str(), it)).collect();
-    let mut out = HashMap::default();
+fn packages<'a>(units: &'a Units, lowered: &Lowered) -> HashMap<base_db::Crate, &'a PackagePlan, Global> {
+    let by_id: HashMap<&str, &PackagePlan, Global> = units.packages.iter().map(|it| (it.id.as_str(), it)).collect();
+    let mut out = HashMap::new_in(Global);
     for (at, unit) in units.graph.units.iter().enumerate() {
         if let (Some(krate), Some(plan)) = (lowered.krate(at), by_id.get(unit.pkg_id.as_str())) {
             out.entry(krate).or_insert(*plan);

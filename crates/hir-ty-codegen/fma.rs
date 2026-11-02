@@ -85,12 +85,12 @@ enum Def {
 struct Facts<'db> {
     body: &'db MirBody<'db>,
     func: Option<FunctionId>,
-    preds: HashMap<BasicBlockId, u32>,
+    preds: HashMap<BasicBlockId, u32, std::alloc::Global>,
     /// The first MIR block of the block of rustc's each is part of.
-    head: HashMap<BasicBlockId, BasicBlockId>,
-    defs: HashMap<LocalId, Vec<Def>>,
+    head: HashMap<BasicBlockId, BasicBlockId, std::alloc::Global>,
+    defs: HashMap<LocalId, Vec<Def>, std::alloc::Global>,
     /// Locals used through a projection or borrowed.
-    tangled: HashSet<LocalId>,
+    tangled: HashSet<LocalId, std::alloc::Global>,
 }
 
 fn mark_projected(facts: &mut Facts<'_>, op: &Operand) {
@@ -184,10 +184,10 @@ impl<'db> Facts<'db> {
         let mut facts = Facts {
             body,
             func: body.owner.as_function(),
-            preds: HashMap::default(),
-            head: HashMap::default(),
-            defs: HashMap::default(),
-            tangled: HashSet::default(),
+            preds: HashMap::new_in(std::alloc::Global),
+            head: HashMap::new_in(std::alloc::Global),
+            defs: HashMap::new_in(std::alloc::Global),
+            tangled: HashSet::new_in(std::alloc::Global),
         };
         for &param in &body.param_locals {
             facts.defs.entry(param).or_default().push(Def::Param);
@@ -195,7 +195,7 @@ impl<'db> Facts<'db> {
         let operand = mark_projected;
         // The block each goes on in, where it goes there alone: a call of an intrinsic never
         // unwinds, whatever the MIR says.
-        let mut goes_on: HashMap<BasicBlockId, BasicBlockId> = HashMap::default();
+        let mut goes_on: HashMap<BasicBlockId, BasicBlockId, std::alloc::Global> = HashMap::new_in(std::alloc::Global);
         for (id, block) in body.basic_blocks.iter() {
             for (at, statement) in block.statements.iter().enumerate() {
                 let StatementKind::Assign(place, rvalue) = &statement.kind else { continue };
@@ -574,7 +574,7 @@ impl<'db> FunctionCx<'_, 'db> {
             bytes * count as u32,
             6,
         ));
-        let copy = self.builder.ins().stack_addr(ptr(), slot, 0);
+        let copy = self.builder.ins().stack_addr(self.cg.target.pointer(), slot, 0);
         let int = Type::int(lane.bits() as u16).expect("a float's width");
         for i in 0..count as i32 {
             let offset = i * bytes as i32;
@@ -1404,7 +1404,7 @@ impl<'db> FunctionCx<'_, 'db> {
     fn wrapper(&mut self, func: FunctionId) -> Result<Option<Wrapper>> {
         let db = self.cg.db;
         let Ok((body, _)) = root_body(db, func) else { return Ok(None) };
-        let mut of: HashMap<LocalId, (usize, bool)> = HashMap::default();
+        let mut of: HashMap<LocalId, (usize, bool), std::alloc::Global> = HashMap::new_in(std::alloc::Global);
         for (i, &param) in body.param_locals.iter().enumerate() {
             of.insert(param, (i, false));
         }
@@ -1569,7 +1569,7 @@ fn inline_cost<'db>(
         }
         _ => false,
     };
-    let mut reached = HashSet::default();
+    let mut reached = HashSet::new_in(std::alloc::Global);
     let mut work: SmallVec<[BasicBlockId; 16]> = SmallVec::from_slice(&[body.start_block]);
     while let Some(id) = work.pop() {
         if !reached.insert(id) {

@@ -19,6 +19,7 @@
 use std::ops::ControlFlow;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::radix;
 use cfg::{CfgExpr, CfgOptions};
 use hir::{HirFileId, InFile, MacroCallId};
@@ -60,9 +61,9 @@ const TARGET_NAMES: &[&str] = &[
 /// given, then the well-known ones, each with its values (`None`: any).
 struct Expected<'c> {
     names: Vec<&'c str>,
-    index: HashMap<&'c str, usize>,
+    index: HashMap<&'c str, usize, Global>,
     values: Vec<Option<Set<'c>>>,
-    well_known: HashSet<&'static str>,
+    well_known: HashSet<&'static str, Global>,
     exhaustive_names: bool,
 }
 
@@ -70,7 +71,7 @@ struct Expected<'c> {
 #[derive(Default)]
 struct Set<'c> {
     order: Vec<Option<&'c str>>,
-    has: HashSet<Option<&'c str>>,
+    has: HashSet<Option<&'c str>, Global>,
 }
 
 impl<'c> Set<'c> {
@@ -90,7 +91,7 @@ impl<'c> Expected<'c> {
         let mut expected = Expected {
             // alloc: setup, once per check, the expected names
             names: Vec::new(),
-            index: HashMap::default(),
+            index: HashMap::new_in(Global),
             // alloc: setup, as above
             values: Vec::new(),
             // alloc: setup, as above

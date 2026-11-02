@@ -18,6 +18,7 @@
 //! A wrong prediction costs an order or an admission, never a result.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 pub mod codec;
 pub mod kinds;

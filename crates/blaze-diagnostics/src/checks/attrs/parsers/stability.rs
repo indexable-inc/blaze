@@ -23,12 +23,14 @@
 //! `compiler/rustc_passes/src/diagnostics.rs`; and `compiler/rustc_ast/src/util/literal.rs`
 //! (`escape_string_symbol`, `LitKind`'s `Display`) (MIT or Apache-2.0).
 
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
 use std::{
     cell::{OnceCell, RefCell},
     num::{IntErrorKind, NonZeroU32},
 };
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::radix;
 use cfg::CfgAtom;
 use either::Either;
@@ -885,20 +887,22 @@ fn is_def_kind(kind: SyntaxKind) -> bool {
 /// What `check_missing_stability` and `check_missing_const_stability` read besides the
 /// stability attributes: whether the crate is a test crate, its effective visibilities, and
 /// each of its modules' `use` items by where it starts.
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
 struct Missing<'a> {
     test: bool,
     effective: &'a Effective,
-    uses: HashMap<(HirFileId, TextSize), UseId>,
+    uses: HashMap<(HirFileId, TextSize), UseId, Global>,
     /// The node of each of the crate's reachable definitions but its `use`s and its root, made
     /// the first time [`Missing::reachable`] asks: one probe per question, where mapping each
     /// node to its definition costs a `to_def`.
-    nodes: OnceCell<HashSet<InFile<SyntaxNodePtr>>>,
+    nodes: OnceCell<HashSet<InFile<SyntaxNodePtr>, Global>>,
 }
 
 impl<'a> Missing<'a> {
+    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
     fn new(cx: &'a Cx<'_, '_>) -> Missing<'a> {
         let db = cx.db;
-        let mut uses = HashMap::default();
+        let mut uses = HashMap::new_in(Global);
         for module in crate::checks::modules(cx) {
             let id = hir_def::ModuleId::from(module);
             for use_ in id.def_map(db).module(db, id).scope(db).use_decls() {
@@ -1028,13 +1032,13 @@ impl<'a> Missing<'a> {
 /// `mod` item, a macro's `macro_rules!` or `macro` (a procedural macro's `fn` is its
 /// function's), a field's declaration. A `use` and the crate's root are asked of [`Effective`]
 /// directly; a derive's impl has no node.
-fn reachable_nodes(cx: &Cx<'_, '_>, effective: &Effective) -> HashSet<InFile<SyntaxNodePtr>> {
+fn reachable_nodes(cx: &Cx<'_, '_>, effective: &Effective) -> HashSet<InFile<SyntaxNodePtr>, Global> {
     fn ptr<'db, N: ast::AstNode<'db>>(it: Option<InFile<N>>) -> Option<InFile<SyntaxNodePtr>> {
         it.map(|it| it.map(|it| ast::ptr(it.syntax())))
     }
     let db = cx.db;
     // alloc: once per `staged_api` crate (the standard library), the reachable definitions
-    let mut nodes = HashSet::default();
+    let mut nodes = HashSet::new_in(Global);
     for def in effective.reachable_local() {
         let node = match def {
             EffectiveDef::Item(item) => match item {
@@ -1196,36 +1200,36 @@ struct Defs<'a, 'c, 'db> {
     parsed: &'a Lowered<'a>,
     crate_root: HirFileId,
     /// Each owner by its node.
-    index: HashMap<InFile<SyntaxNodePtr>, usize>,
+    index: HashMap<InFile<SyntaxNodePtr>, usize, Global>,
     /// The owner of a module file's root, when it has its own (its declaration has none).
-    file_roots: HashMap<HirFileId, usize>,
+    file_roots: HashMap<HirFileId, usize, Global>,
     /// The declaration of each module file, in a tree `cx.vsema` handed out.
-    declared: HashMap<HirFileId, InFile<ast::Node<'db>>>,
+    declared: HashMap<HirFileId, InFile<ast::Node<'db>>, Global>,
     /// The file each declaration of a module file declares.
-    declares: HashMap<InFile<SyntaxNodePtr>, HirFileId>,
+    declares: HashMap<InFile<SyntaxNodePtr>, HirFileId, Global>,
     /// `lookup_stability`: the owner whose `Stability` it is.
-    stability: HashMap<InFile<SyntaxNodePtr>, Option<usize>>,
+    stability: HashMap<InFile<SyntaxNodePtr>, Option<usize>, Global>,
     /// `lookup_deprecation_entry`: the owner whose `Deprecated` it is.
-    deprecation: HashMap<InFile<SyntaxNodePtr>, Option<usize>>,
+    deprecation: HashMap<InFile<SyntaxNodePtr>, Option<usize>, Global>,
     /// Each module, in the order its first definition comes.
-    modules: HashMap<InFile<SyntaxNodePtr>, usize>,
+    modules: HashMap<InFile<SyntaxNodePtr>, usize, Global>,
     /// [`Defs::parent`] of each definition asked about: `order_key`, the lookups and the
     /// annotation kind each ask it, so each definition's ancestors are walked once.
-    parents: RefCell<HashMap<InFile<SyntaxNodePtr>, Option<Def<'db>>>>,
+    parents: RefCell<HashMap<InFile<SyntaxNodePtr>, Option<Def<'db>>, Global>>,
 }
 
 impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
     fn new(cx: &'a Cx<'c, 'db>, owners: &'a [Owner<'db>], parsed: &'a Lowered<'a>, crate_root: HirFileId) -> Self {
-        let mut index = HashMap::default();
-        let mut file_roots = HashMap::default();
+        let mut index = HashMap::new_in(Global);
+        let mut file_roots = HashMap::new_in(Global);
         for (at, owner) in owners.iter().enumerate() {
             index.insert(owner.at(), at);
             if owner.node.value.kind() == SyntaxKind::SOURCE_FILE {
                 file_roots.insert(owner.node.file_id, at);
             }
         }
-        let mut declared = HashMap::default();
-        let mut declares = HashMap::default();
+        let mut declared = HashMap::new_in(Global);
+        let mut declares = HashMap::new_in(Global);
         for module in crate::checks::modules(cx) {
             if let Some(file) = module.as_source_file_id(cx.db)
                 && let Some(declaration) = module.declaration_source_view(cx.db)
@@ -1238,7 +1242,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
                 declared.insert(HirFileId::from(file), node);
             }
         }
-        let mut modules = HashMap::default();
+        let mut modules = HashMap::new_in(Global);
         if let Some(krate) = owners.iter().find(|it| it.target == Target::Crate) {
             modules.insert(krate.at(), 0);
         }
@@ -1251,10 +1255,10 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
             file_roots,
             declared,
             declares,
-            stability: HashMap::default(),
-            deprecation: HashMap::default(),
+            stability: HashMap::new_in(Global),
+            deprecation: HashMap::new_in(Global),
             modules,
-            parents: RefCell::new(HashMap::default()),
+            parents: RefCell::new(HashMap::new_in(Global)),
         }
     }
 

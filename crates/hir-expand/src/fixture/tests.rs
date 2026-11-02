@@ -264,6 +264,7 @@ fn toolchain_target_data_layout_and_arch() {
     let target = workspace.target.as_ref().expect("the fixture's target");
     assert_eq!(&*target.data_layout, "e-m:e-p:32:32-i64:64-n32:64-S128");
     assert_eq!(target.arch, Arch::Wasm32);
+    assert_eq!(target.tuple.as_str(), "wasm32-wasip1");
     assert_eq!(workspace.const_eval.steps, 10_000_000);
 
     let stable = super::db("//- /main.rs\n");

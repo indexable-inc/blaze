@@ -72,7 +72,7 @@ pub fn lowered(
         }
         let inlined = frontend.inlines(db, instance).map_err(|e| failed(unit, e))?;
         blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
-            let walked = (instance, inlined);
+            let walked = (instance, super::refs::Walking::plain(inlined));
             let function =
                 backend::built_function(db, homes, &frontend.hashes, unit, spec, walked, refs, frame)?;
             let Built::Ir(pending) = function.code else {

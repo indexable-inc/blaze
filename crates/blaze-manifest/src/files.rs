@@ -472,12 +472,13 @@ pub(crate) mod tests {
         let env = [
             ("CARGO_HOME".to_owned(), format!("{root}/home")),
             ("__CARGO_TEST_ROOT".to_owned(), root.to_owned()),
+            ("BLAZE_HOME".to_owned(), format!("{root}/blaze")),
         ];
         let config = crate::Config::load_with(Path::new(root), env, files).unwrap();
         let ctx = crate::Context::new(config);
         let manifest = crate::metadata::root_manifest(None, &ctx).unwrap();
         let ws = crate::Workspace::new(&manifest, &ctx).unwrap();
-        serde_json::to_string_pretty(&crate::metadata::export_no_deps(&ws)).unwrap()
+        serde_json::to_string_pretty(&crate::metadata::export_no_deps(&ws).unwrap()).unwrap()
     }
 
     /// The same workspace read through files in memory and through the machine's disk gives the

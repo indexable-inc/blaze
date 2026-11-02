@@ -1,12 +1,20 @@
 //! `blaze_lints::fix` over `clippy.toml`'s `disallowed-*` entries with a replacement: for each import
-//! form of std's locks and channels and of `rustc_hash`'s maps, the fixed file is the text the
-//! test writes, front-end clean, each name that named a disallowed item names its replacement,
+//! form of std's locks and channels and of `rustc_hash`'s maps, and for serde's derives, the fixed
+//! file is the text the test writes, front-end clean, each name that named a disallowed item names its replacement,
 //! and linting it again finds nothing.
 
-use base_db::FileId;
+use std::any::TypeId;
+
+use base_db::{Db, FileId, all_crates};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir::{attach_db, view::Semantics};
-use hir_expand::fixture;
+use hir_expand::{
+    fixture::{self, Fixture},
+    proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind},
+    tt::{DelimSpan, TopSubtree},
+};
+use intern::Symbol;
 use syntax::view::{self as ast, AstNode as _};
 
 use crate::{
@@ -147,15 +155,36 @@ const MOVED: [(&str, &str); 9] = [
 ];
 
 fn setup() -> Setup {
+    setup_of(CLIPPY_TOML)
+}
+
+fn setup_of(clippy_toml: &str) -> Setup {
     let flags: Vec<String> = FLAGS.split_whitespace().map(str::to_owned).collect();
-    let table = CLIPPY_TOML.parse().expect("the configuration reads");
+    let table = clippy_toml.parse().expect("the configuration reads");
     Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf: Conf { table, ..Conf::default() } }
 }
+
+/// The crates of a fixture, the moves its `clippy.toml` makes and the crates the moved names
+/// must resolve to after, and what it gives the fixture's proc-macro crates.
+struct Ports<'a> {
+    crates: &'a str,
+    main: &'a str,
+    clippy_toml: &'a str,
+    moved: &'a [(&'a str, &'a str)],
+    give: fn(&mut Fixture),
+}
+
+const LOCKS: Ports<'static> = Ports { crates: CRATES, main: MAIN, clippy_toml: CLIPPY_TOML, moved: &MOVED, give: |_| {} };
 
 /// `src/lib.rs` of `main` as the fix leaves it, after checking it is front-end clean, names
 /// what it moved by the counterparts, and lints clean again.
 fn fixed(main: &str) -> Result<String, FixError> {
-    let fx = fixture::db(&format!("{CRATES}{MAIN}{}", main.trim_start_matches('\n')));
+    fixed_in(&LOCKS, main)
+}
+
+fn fixed_in(ports: &Ports<'_>, main: &str) -> Result<String, FixError> {
+    let mut fx = fixture::db(&format!("{}{}{}", ports.crates, ports.main, main.trim_start_matches('\n')));
+    (ports.give)(&mut fx);
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
     let krate = attach_db(&db, || {
@@ -165,10 +194,10 @@ fn fixed(main: &str) -> Result<String, FixError> {
             .expect("the fixture has `main`")
     });
     let file = file.file_id(&db);
-    let mut names: HashMap<FileId, String> = HashMap::default();
+    let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
     names.insert(file, "src/lib.rs".to_owned());
     let name_of = |file: FileId| names.get(&file).cloned();
-    let setup = setup();
+    let setup = setup_of(ports.clippy_toml);
     let made = fix(&mut db, krate, &setup, &name_of)?;
     let text = db.file_text(file).text(&db).to_string();
     assert!(made.files.iter().all(|(it, new)| *it == file && *new == text), "the fix names the file it changed");
@@ -190,9 +219,9 @@ fn fixed(main: &str) -> Result<String, FixError> {
         let root = sema.parse(editioned).syntax();
         for path in root.descendants().filter_map(ast::Path::cast) {
             let Some(name) = path.segment().and_then(|it| it.name_ref()) else { continue };
-            let Some(&(_, want)) = MOVED.iter().find(|(it, _)| *it == name.text()) else { continue };
-            let [ty, value] = blaze_intent::retarget::names_in(&sema, path);
-            let krate = ty.or(value).and_then(|it| it.module(&db)).and_then(|it| it.krate(&db).display_name(&db));
+            let Some(&(_, want)) = ports.moved.iter().find(|(it, _)| *it == name.text()) else { continue };
+            let [ty, value, mac] = blaze_intent::retarget::names_in(&sema, path);
+            let krate = mac.or(ty).or(value).and_then(|it| it.module(&db)).and_then(|it| it.krate(&db).display_name(&db));
             assert_eq!(krate.map(|it| it.to_string()).as_deref(), Some(want), "`{}` in:\n{text}", path.syntax().text());
         }
     });
@@ -200,9 +229,13 @@ fn fixed(main: &str) -> Result<String, FixError> {
 }
 
 fn ports(main: &str, want: &str) {
-    let after = fixed(main).unwrap_or_else(|error| panic!("{error}"));
+    ports_in(&LOCKS, main, want);
+}
+
+fn ports_in(ports: &Ports<'_>, main: &str, want: &str) {
+    let after = fixed_in(ports, main).unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(after, want.trim_start_matches('\n'));
-    assert_eq!(fixed(&after).unwrap(), after, "a fixed file has nothing left to fix");
+    assert_eq!(fixed_in(ports, &after).unwrap(), after, "a fixed file has nothing left to fix");
 }
 
 #[test]
@@ -404,11 +437,130 @@ pub fn f(m: &Mutex<u8>) -> bool {
             .expect("the fixture has `main`")
     });
     let file = file.file_id(&db);
-    let names: HashMap<FileId, String> = [(file, "src/lib.rs".to_owned())].into_iter().collect();
+    let names: HashMap<FileId, String, Global> = [(file, "src/lib.rs".to_owned())].into_iter().collect();
     let name_of = |file: FileId| names.get(&file).cloned();
     let error = fix(&mut db, krate, &setup(), &name_of).unwrap_err();
     let FixError::Broke { at, by, .. } = &error else { panic!("{error}") };
     assert_eq!(at, "src/lib.rs:3", "{error}");
     assert!(!by.is_empty(), "{error}");
     assert_eq!(db.file_text(file).text(&db).as_str(), main.trim_start_matches('\n'), "the text is as it was");
+}
+
+/// serde's derives moved to blaze's (`.clippy.toml`'s `disallowed-macros`).
+const SERDE_TOML: &str = r#"
+disallowed-macros = [
+    { path = "serde::Serialize", replacement = "blaze_serde::Serialize", allow-invalid = true },
+    { path = "serde::Deserialize", replacement = "blaze_serde::Deserialize", allow-invalid = true },
+]
+"#;
+
+/// A `serde` whose `Serialize` and `Deserialize` each name a trait and a derive, and a
+/// `blaze_serde` that names the same traits beside its own derives, as the real ones do.
+const SERDE_CRATES: &str = r#"
+//- /serde_derive/lib.rs crate:proc-macro:serde_derive
+#[proc_macro_derive(Serialize)]
+pub fn serialize(item: TokenStream) -> TokenStream {
+    item
+}
+#[proc_macro_derive(Deserialize)]
+pub fn deserialize(item: TokenStream) -> TokenStream {
+    item
+}
+//- /serde/lib.rs crate:serde deps:serde_derive
+pub mod ser {
+    pub trait Serialize {}
+}
+pub mod de {
+    pub trait Deserialize<'de> {}
+}
+pub use de::Deserialize;
+pub use ser::Serialize;
+pub use serde_derive::{Deserialize, Serialize};
+//- /blaze_serde_derive/lib.rs crate:proc-macro:blaze_serde_derive
+#[proc_macro_derive(Serialize)]
+pub fn serialize(item: TokenStream) -> TokenStream {
+    item
+}
+#[proc_macro_derive(Deserialize)]
+pub fn deserialize(item: TokenStream) -> TokenStream {
+    item
+}
+//- /blaze_serde/lib.rs crate:blaze_serde deps:serde,blaze_serde_derive
+pub use blaze_serde_derive::{Deserialize, Serialize};
+pub use serde;
+pub use serde::{de::Deserialize, ser::Serialize};
+"#;
+
+const SERDE: Ports<'static> = Ports {
+    crates: SERDE_CRATES,
+    main: "//- /src/lib.rs crate:main deps:serde,blaze_serde\n",
+    clippy_toml: SERDE_TOML,
+    moved: &[("Serialize", "blaze_serde_derive"), ("Deserialize", "blaze_serde_derive")],
+    give: give_derives,
+};
+
+/// A derive that makes nothing, so the derived item is defined once.
+#[derive(Debug)]
+struct Nothing;
+impl ProcMacroExpander for Nothing {
+    fn expand(&self, _: &Db, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
+        Ok(TopSubtree::empty(DelimSpan { open: call.call_site, close: call.call_site }))
+    }
+
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
+        other.type_id() == TypeId::of::<Self>()
+    }
+}
+
+/// Gives each derive crate its `Serialize` and `Deserialize`, both [`Nothing`].
+fn give_derives(built: &mut Fixture) {
+    for name in ["serde_derive", "blaze_serde_derive"] {
+        let db = built.db();
+        let krate = *all_crates(db)
+            .iter()
+            .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == name))
+            .expect("the fixture has the derive crate");
+        let macros = ["Serialize", "Deserialize"]
+            .map(|it| ProcMacro {
+                name: Symbol::intern(it),
+                kind: ProcMacroKind::CustomDerive,
+                expander: std::sync::Arc::new(Nothing), // alloc: a test's macro, two per crate
+                disabled: false,
+            })
+            .to_vec();
+        built.set_proc_macros(krate, macros);
+    }
+}
+
+/// `use serde::{..}` naming the traits and the derives moves to `blaze_serde`, which names
+/// both, so the bare derives and the trait bound follow it; a derive written by its path moves
+/// in place.
+#[test]
+fn serde_derives_port_to_blaze_serde() {
+    ports_in(
+        &SERDE,
+        r#"
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+pub struct Point;
+
+#[derive(serde::Serialize)]
+pub struct Label;
+
+pub fn written<T: Serialize>(_: &T) {}
+"#,
+        r#"
+use blaze_serde::Deserialize;
+use blaze_serde::Serialize;
+
+#[derive(Serialize, Deserialize)]
+pub struct Point;
+
+#[derive(blaze_serde::Serialize)]
+pub struct Label;
+
+pub fn written<T: Serialize>(_: &T) {}
+"#,
+    );
 }

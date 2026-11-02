@@ -9,6 +9,7 @@
 //! Apache-2.0).
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use smallvec::SmallVec;
 use syntax::TextRange;
 
@@ -92,7 +93,7 @@ struct Follow<'m> {
     m: &'m Matchers,
     tokens: &'m Tokens<'m>,
     /// The FIRST set of each repetition's contents, by the repetition.
-    first: HashMap<u32, TokenSet>,
+    first: HashMap<u32, TokenSet, Global>,
     out: &'m mut Vec<OrPattern>,
 }
 
@@ -100,7 +101,7 @@ struct Follow<'m> {
 /// arguments) gives. One that is not in delimiters is an error rustc gives elsewhere.
 pub(super) fn check_lhs(m: &Matchers, tokens: &Tokens<'_>, lhs: u32, out: &mut Vec<OrPattern>) {
     let Mtt::Delimited { tts, .. } = *m.at(lhs) else { return };
-    let mut follow = Follow { m, tokens, first: HashMap::default(), out };
+    let mut follow = Follow { m, tokens, first: HashMap::new_in(Global), out };
     follow.build(tts);
     let _ = follow.core(tts, &TokenSet::empty());
 }

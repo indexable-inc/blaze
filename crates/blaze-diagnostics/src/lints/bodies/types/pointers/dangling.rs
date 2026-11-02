@@ -11,6 +11,7 @@
 //! (`DanglingPointersFromTemporaries`, `DanglingPointersFromLocals`) (MIT or Apache-2.0).
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir::InFile;
 use hir_def::{
     AdtId, AttrDefId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
@@ -21,6 +22,7 @@ use hir_def::{
 };
 use hir_ty::db::HirDatabase;
 use hir_ty::next_solver::{DbInterner, Ty, TyKind};
+use intern::sym;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use syntax::view::{self as ast, AstNode};
 
@@ -224,7 +226,9 @@ fn is_temporary_rvalue(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
         | Expr::OffsetOf(_)
         | Expr::InlineAsm(_)
         | Expr::IncludeBytes
-        | Expr::UnsafeBinderCast { .. } => false,
+        | Expr::UnsafeBinderCast { .. }
+        | Expr::ComptimeFor { .. }
+        | Expr::ReflectedField { .. } => false,
     }
 }
 
@@ -245,8 +249,7 @@ fn owns_allocation<'db>(b: &BodyCx<'_, '_, 'db>, ty: Ty<'db>) -> bool {
         return true;
     }
     let name = util::diagnostic_item(b.db(), AttrDefId::AdtId(adt));
-    let items = util::items();
-    name.is_some_and(|it| [items.cstring_type, items.Vec, items.Cell, items.SyncUnsafeCell].contains(&it))
+    name.is_some_and(|it| [sym::cstring_type, sym::Vec, sym::Cell, sym::SyncUnsafeCell].contains(&it))
 }
 
 /// What a function or closure returning a raw pointer is linted with: rustc's
@@ -310,7 +313,7 @@ fn pointee_not_1zst<'db>(b: &BodyCx<'_, '_, 'db>, ty: Ty<'db>) -> Option<()> {
 /// value, then the tail of its body's innermost block.
 struct Locals<'s, 'a, 'db> {
     b: &'s BodyCx<'s, 'a, 'db>,
-    inits: &'s HashMap<BindingId, ExprId>,
+    inits: &'s HashMap<BindingId, ExprId, Global>,
     fn_ret: &'s FnRet,
     /// The closure whose body it is, or `None` for the function's.
     owner: Option<ExprId>,

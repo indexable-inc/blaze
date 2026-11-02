@@ -1,38 +1,47 @@
-//! `significant_drop_tightening`: a lock guard kept past its last use, through a call that
-//! could run without the lock.
+//! `significant_drop_tightening`: a value whose drop matters (a lock guard, a `RefCell`
+//! borrow, a type marked as such) kept past its last use, through a call that could run
+//! without it.
 //!
 //! Follows clippy's `clippy_lints/src/significant_drop_tightening.rs` (MIT or Apache-2.0),
 //! read from indexable-inc's fork at c2308e38 (nightly-2026-05-27), the nearest checkout to the
-//! pinned nightly's (rust-lang/rust 12433c30). As in clippy: a guard bound by `let` in a
+//! pinned nightly's (rust-lang/rust 12433c30). As in clippy: a value bound by `let` in a
 //! function written in the file, used, and then held while the function goes on to other
-//! calls, until its scope ends. Unlike clippy, which walks the statements of the guard's block,
-//! this reads the body's runtime MIR:
+//! calls, until its scope ends. Unlike clippy, which walks the statements of the value's
+//! block, this reads the body's runtime MIR:
 //!
-//! - a use is any mention of the guard or of a value borrowed from it (a reference into it, a
+//! - a use is any mention of the value or of one borrowed from it (a reference into it, a
 //!   call's result whose type may hold a borrow of an argument that is one), not its drop at
 //!   the end of its scope; so `let n = guard.len();` ends the guard's uses, and
 //!   `let first = &guard[0];` keeps them going while `first` is used;
 //! - the calls held through are the calls written in the source (`from_hir_call`) on a path
-//!   where the guard may hold a value and is used again on no path after; across branches and
-//!   loops, a guard given a new value in the next round of a loop is a new value;
-//! - a guard never used is left alone: holding a lock for a section is what it is for;
-//! - only std's and `lock_api`'s lock guards ([`guards`](super::guards)), not every type
-//!   marked `#[has_significant_drop]`, which the front end does not read;
+//!   where the value may be held and is used again on no path after; across branches and
+//!   loops, a value given anew in the next round of a loop is a new value;
+//! - a value never used is left alone: holding a lock for a section is what it is for;
+//! - what counts: std's and `lock_api`'s lock guards and `RefCell`'s `Ref` and `RefMut`
+//!   ([`guards`](super::guards)), and any type marked `#[clippy::has_significant_drop]` or
+//!   `#[must_not_suspend]` (the front end reads both into `AttrFlags`); a drop that only frees
+//!   memory (`Vec`, `String`, a `Box` of them) never counts;
 //! - closures and `async` blocks in the function are bodies of their own, each linted.
 //!
-//! No fix is offered: where the guard's scope should end is the author's to say.
+//! The fix, MachineApplicable, writes `drop(x);` on a line of its own after the statement of
+//! the value's last use, where [`hir_ty_borrowck::drop_early::drop_point`] finds that point (a
+//! `let` of a plain name in the function's own body, every later use in that block's
+//! statements, none after) and the body with that drop lowered in passes the borrow check in
+//! the database's mode; Rust's drop order is never changed, only suggested. Anywhere else the
+//! finding has no fix: where the value's scope should end is the author's to say.
 
-use hir_def::DefWithBodyId;
+use hir_def::{AdtId, DefWithBodyId, attrs::AttrFlags, hir::BindingId};
 use hir_ty::{
-    mir::{
-        BasicBlockId, LocalId, MirBody, MirSpan, Operand, OperandKind, Rvalue, StatementKind,
-        StoredPlace, TerminatorKind,
-    },
-    next_solver::{Ty, TyKind},
+    InferBodyId,
+    db::HirDatabase as _,
+    mir::{BasicBlockId, LocalId, MirBody, MirSpan, StatementKind, StoredPlace, TerminatorKind},
 };
-use rustc_type_ir::{TypeVisitableExt as _, inherent::IntoKind as _};
+use hir_ty_borrowck::{
+    BorrowckResult, Mode,
+    drop_early::{derived, drop_point, statement_places, terminator_places},
+};
 use syntax::{
-    TextRange,
+    NodeOrToken, SyntaxKind, TextRange,
     view::{self as ast, AstNode as _},
 };
 
@@ -40,18 +49,85 @@ use super::{
     Implemented,
     guards::{self, Guards, Kind},
 };
-use crate::check::Cx;
+use crate::{check::Cx, diag::Applicability};
 
 const LINT: Implemented = Implemented::SignificantDropTightening;
 
-/// One guard held past its last use, before it is reported.
+/// What makes a value's drop matter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Significant {
+    /// A lock guard or a `RefCell` borrow ([`guards`](super::guards)).
+    Guard(Kind),
+    /// A type marked so; the attribute, as written.
+    Marked(&'static str),
+}
+
+impl Significant {
+    /// What a value of `adt` is, if its drop matters. A type that only owns memory never is.
+    fn of(cx: &Cx<'_, '_>, guards: &Guards, adt: hir::Adt) -> Option<Significant> {
+        let db = cx.db();
+        if let Some(kind) = guards.kind(db, adt) {
+            return Some(Significant::Guard(kind));
+        }
+        let flags = AttrFlags::query(db, hir_def::AttrDefId::AdtId(AdtId::from(adt)));
+        if flags.contains(AttrFlags::HAS_SIGNIFICANT_DROP) {
+            Some(Significant::Marked("#[clippy::has_significant_drop]"))
+        } else if flags.contains(AttrFlags::MUST_NOT_SUSPEND) {
+            Some(Significant::Marked("#[must_not_suspend]"))
+        } else {
+            None
+        }
+    }
+
+    /// What the value keeps, as the message says it: "holds the lock".
+    fn holds(self) -> &'static str {
+        match self {
+            Significant::Guard(Kind::Lock) => "holds the lock",
+            Significant::Guard(Kind::Cell) => "holds the `RefCell` borrow",
+            Significant::Marked(_) => "is kept alive",
+        }
+    }
+
+    /// What its drop does, so why holding it matters.
+    fn why(self) -> String {
+        match self {
+            Significant::Guard(Kind::Lock) => "other threads wait for the lock until it is dropped".to_owned(), // alloc: message
+            Significant::Guard(Kind::Cell) => {
+                "a conflicting borrow of the `RefCell` panics until it is dropped".to_owned() // alloc: message
+            }
+            Significant::Marked(attr) => format!("its type is marked `{attr}`, so its drop does work that matters"),
+        }
+    }
+
+    /// What the value still keeps through the call, as its note says it.
+    fn held(self, name: &str) -> String {
+        match self {
+            Significant::Guard(kind) => format!("{} still held", kind.held()),
+            Significant::Marked(_) => format!("`{name}` still alive"),
+        }
+    }
+
+    /// What dropping it sooner gives.
+    fn sooner(self) -> &'static str {
+        match self {
+            Significant::Guard(Kind::Lock) => "so other threads can take the lock sooner",
+            Significant::Guard(Kind::Cell) => "so the `RefCell` can be borrowed again sooner",
+            Significant::Marked(_) => "so its drop runs sooner",
+        }
+    }
+}
+
+/// One value held past its last use, before it is reported.
 struct Held {
-    /// Where the guard is given its value.
+    /// Where the value is given.
     at: TextRange,
     /// The first call it is held through.
     call: TextRange,
     message: String,
-    guard: String,
+    name: String,
+    significant: Significant,
+    /// Where `drop(name);` goes and its text, when it is checked to hold.
+    fix: Option<(TextRange, String)>,
 }
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
@@ -67,18 +143,28 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     for it in held {
         let span = cx.span(it.at);
         let call = cx.span(it.call);
+        let fix = it.fix.map(|(at, text)| (cx.span(at), text));
         let diagnostic = cx.lint(LINT, node, span, it.message);
-        diagnostic.span_note(call, format!("this call runs with {} still held", Kind::Lock.held()));
+        diagnostic.span_note(call, format!("this call runs with {}", it.significant.held(&it.name)));
         diagnostic.help(format!(
-            "drop `{0}` after its last use (`drop({0});`), or end its scope with a block, so other threads \
-             can take the lock sooner",
-            it.guard
+            "drop `{0}` after its last use (`drop({0});`), or end its scope with a block, {1}",
+            it.name,
+            it.significant.sooner()
         ));
+        if let Some(part) = fix {
+            // alloc: the fix's one part
+            let parts = vec![part];
+            diagnostic.multipart_suggestion(
+                format!("drop `{}` here, after its last use", it.name),
+                parts,
+                Applicability::MachineApplicable,
+            );
+        }
     }
 }
 
 fn find<'t>(cx: &Cx<'_, 't>, function: ast::Fn<'t>) -> Vec<Held> {
-    // alloc: the guards found in one function, reported at the edge
+    // alloc: the values found in one function, reported at the edge
     let mut out = Vec::new();
     let Some(f) = cx.fn_def(function) else { return out };
     let Some(analysis) = cx.analysis() else { return out };
@@ -90,6 +176,8 @@ fn find<'t>(cx: &Cx<'_, 't>, function: ast::Fn<'t>) -> Vec<Held> {
     let db = cx.db();
     let guards = Guards::new(cx);
     let function_name = guards::function_name(cx, analysis);
+    // Whether the function's body as written passes the borrow check, asked once.
+    let mut checked = None;
     for body in guards::bodies(db, analysis, def) {
         let mir = body.mir;
         let owner = match body.expr {
@@ -103,23 +191,95 @@ fn find<'t>(cx: &Cx<'_, 't>, function: ast::Fn<'t>) -> Vec<Held> {
                 continue;
             }
             let ty = analysis.ty(mir.locals[local].ty.as_ref());
-            if ty.as_adt().and_then(|adt| guards.kind(db, adt)) != Some(Kind::Lock) {
+            let Some(significant) = ty.as_adt().and_then(|adt| Significant::of(cx, &guards, adt)) else {
                 continue;
-            }
+            };
             let Some(call) = held_through(mir, local) else { continue };
             let Some(at) = guards::first_assigned(mir, local).and_then(|it| guards::range_of(analysis, it)) else {
                 continue;
             };
             let Some(call) = guards::range_of(analysis, call) else { continue };
             let message = format!(
-                "{} holds {} in {owner} after its last use",
+                "{} {} in {owner} after its last use: {}",
                 guards::say_local(cx, analysis, mir, local),
-                Kind::Lock.held()
+                significant.holds(),
+                significant.why()
             );
-            out.push(Held { at, call, message, guard: name.to_owned() }); // alloc: reported at the edge
+            // A closure's or `async` block's body is lowered on its own: the fix is the
+            // function's own body's.
+            let fix = match body.expr {
+                None if *checked.get_or_insert_with(|| passes(hir_ty_borrowck::borrowck(db, def))) => {
+                    fix(cx, analysis, def, binding, name, call)
+                }
+                _ => None,
+            };
+            // alloc: reported at the edge
+            out.push(Held { at, call, message, name: name.to_owned(), significant, fix });
         }
     }
     out
+}
+
+/// Where `drop(name);` goes for `binding` of `def`'s own body, and its text: after the
+/// statement of its last use, before `call`, written in the file, and only when the body with
+/// that drop lowered in passes the borrow check.
+fn fix(
+    cx: &Cx<'_, '_>,
+    analysis: &hir::BodyAnalysis<'_>,
+    def: DefWithBodyId,
+    binding: BindingId,
+    name: &str,
+    call: TextRange,
+) -> Option<(TextRange, String)> {
+    let db = cx.db();
+    let mode = hir_ty_borrowck::mode(db);
+    if mode == Mode::Off {
+        return None;
+    }
+    let mir = db.mir_body(InferBodyId::DefWithBodyId(def)).ok()?;
+    let point = drop_point(db, def, mir, binding).ok()?;
+    // Both written in the file the function is, not by a macro: a macro's statements are not
+    // the file's.
+    let (_, file) = analysis.tree();
+    let written = |span: MirSpan| -> Option<TextRange> {
+        let map = &analysis.source_map().store;
+        let source = match span {
+            MirSpan::ExprId(it) => map.expr_syntax(it).ok()?,
+            MirSpan::PatId(it) => map.pat_syntax(it).ok()?,
+            _ => return None,
+        };
+        (source.file_id == file).then(|| source.value.syntax_node_ptr().text_range())
+    };
+    let (after, block) = (written(point.after)?, written(MirSpan::ExprId(point.block))?);
+    let root = cx.root();
+    if !root.text_range().contains_range(after) {
+        return None;
+    }
+    let node = match root.covering_element(after) {
+        NodeOrToken::Node(node) => node,
+        NodeOrToken::Token(token) => token.parent()?,
+    };
+    let statement = node.ancestors().find(|it| matches!(it.kind(), SyntaxKind::LET_STMT | SyntaxKind::EXPR_STMT))?;
+    // One of the block's own statements, and the call held through after it.
+    let list = statement.parent().filter(|it| it.kind() == SyntaxKind::STMT_LIST)?;
+    if list.parent()?.text_range() != block || call.start() < statement.text_range().end() {
+        return None;
+    }
+    if !passes(&hir_ty_borrowck::drop_early::check(db, def, &point, mode).ok()?) {
+        return None;
+    }
+    let indent = statement
+        .prev_sibling_or_token()
+        .and_then(|it| it.into_token())
+        .filter(|it| it.kind() == SyntaxKind::WHITESPACE)
+        .and_then(|it| it.text().rsplit_once('\n'))
+        .map_or("", |(_, indent)| indent);
+    Some((TextRange::empty(statement.text_range().end()), format!("\n{indent}drop({name});")))
+}
+
+/// Whether a borrow check found no error and checked the whole body.
+fn passes(result: &BorrowckResult) -> bool {
+    result.skipped.is_none() && result.not_checked.is_none() && !result.diagnostics.iter().any(|it| it.is_error())
 }
 
 /// The first call, by its span, that `guard` is held through: one written in the source,
@@ -199,100 +359,6 @@ fn held_through(mir: &MirBody<'_>, guard: LocalId) -> Option<MirSpan> {
     found
 }
 
-/// The locals that hold `guard` or a borrow of it: references into it, and values made from
-/// one whose type may hold a borrow, the guard itself first.
-fn derived(mir: &MirBody<'_>, guard: LocalId) -> Vec<bool> {
-    // alloc: a flag per local of one body
-    let mut set = vec![false; mir.locals.len()];
-    set[index(guard)] = true;
-    let may_borrow = |local: LocalId| borrows(mir.locals[local].ty.as_ref());
-    let from = |set: &[bool], it: &Operand| match &it.kind {
-        OperandKind::Copy(place) | OperandKind::Move(place) => set[index(place.local)],
-        _ => false,
-    };
-    // Every pass that changes nothing ends it; each change adds a local that stays.
-    for _ in 0..=mir.locals.len() {
-        let mut changed = false;
-        for (_, block) in mir.basic_blocks.iter() {
-            for statement in &block.statements {
-                let StatementKind::Assign(place, rvalue) = &statement.kind else { continue };
-                if set[index(place.local)] {
-                    continue;
-                }
-                let made = match rvalue {
-                    Rvalue::Ref(_, it) => set[index(it.local)],
-                    Rvalue::CopyForDeref(it) => set[index(it.local)] && may_borrow(place.local),
-                    Rvalue::Len(_) | Rvalue::Discriminant(_) => false,
-                    _ => {
-                        let mut any = false;
-                        rvalue.for_each_operand(&mut |it| any |= from(set.as_slice(), it));
-                        any && may_borrow(place.local)
-                    }
-                };
-                if made {
-                    set[index(place.local)] = true;
-                    changed = true;
-                }
-            }
-            if let Some(terminator) = &block.terminator
-                && let TerminatorKind::Call { args, destination, .. } = &terminator.kind
-                && !set[index(destination.local)]
-                && args.iter().any(|it| from(set.as_slice(), it))
-                && may_borrow(destination.local)
-            {
-                set[index(destination.local)] = true;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    set
-}
-
-/// Whether a value of `ty` may hold a borrow: a reference, a raw pointer, or a type with a
-/// lifetime in it.
-fn borrows(ty: Ty<'_>) -> bool {
-    ty.has_regions() || matches!(ty.kind(), TyKind::RawPtr(..))
-}
-
-/// Calls `f` with each place a statement reads, borrows or writes into, but not the whole
-/// local an assignment gives a value to.
-fn statement_places(kind: &StatementKind, f: &mut dyn FnMut(&StoredPlace)) {
-    match kind {
-        StatementKind::Assign(place, rvalue) => {
-            if !place.projection.is_empty() {
-                f(place);
-            }
-            match rvalue {
-                Rvalue::Ref(_, it) | Rvalue::Len(it) | Rvalue::Discriminant(it) | Rvalue::CopyForDeref(it) => f(it),
-                _ => rvalue.for_each_operand(&mut |it| operand_place(it, &mut *f)),
-            }
-        }
-        StatementKind::InlineAsm(_) => kind.for_each_operand(&mut |it| operand_place(it, &mut *f)),
-        _ => {}
-    }
-}
-
-/// Calls `f` with each place a terminator reads, borrows or writes into, but not the whole
-/// local a call returns into, nor `guard` dropped at the end of its scope.
-fn terminator_places(kind: &TerminatorKind, guard: LocalId, f: &mut dyn FnMut(&StoredPlace)) {
-    match kind {
-        TerminatorKind::Drop { place, .. } if whole(place, guard) => {}
-        TerminatorKind::Drop { place, .. } | TerminatorKind::DropAndReplace { place, .. } => f(place),
-        TerminatorKind::Call { destination, .. } if !destination.projection.is_empty() => f(destination),
-        _ => {}
-    }
-    kind.for_each_operand(&mut |it| operand_place(it, &mut *f));
-}
-
-fn operand_place(it: &Operand, f: &mut dyn FnMut(&StoredPlace)) {
-    if let OperandKind::Copy(place) | OperandKind::Move(place) = &it.kind {
-        f(place);
-    }
-}
-
 fn whole(place: &StoredPlace, local: LocalId) -> bool {
     place.local == local && place.projection.is_empty()
 }
@@ -307,11 +373,14 @@ fn block_index(block: BasicBlockId) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::super::drops_tests::lint_only;
+    use super::super::drops_tests::{fixed, lint_only};
 
     const LINT: &[&str] = &["significant_drop_tightening"];
-    /// The end of a finding's message line; the help says "after its last use" too.
-    const FOUND: &str = "after its last use\n";
+    /// A finding's message, before why the value matters; the help and the fix say "after its
+    /// last use" too.
+    const FOUND: &str = "after its last use: ";
+    /// The fix's message, which a finding with no fix never writes.
+    const FIX: &str = "drop `guard` here";
 
     #[test]
     fn a_guard_held_through_a_call_after_its_last_use_is_found() {
@@ -333,17 +402,126 @@ pub fn count(m: &Mutex<Vec<u32>>) -> usize {
         assert!(found.contains("holds the lock in `count` after its last use"), "{found}");
         assert!(found.contains("this call runs with the lock still held"), "{found}");
         assert!(found.contains("`drop(guard);`"), "{found}");
+        assert!(found.contains("other threads wait for the lock until it is dropped"), "{found}");
+        assert!(found.contains(FIX), "{found}");
+    }
+
+    /// The fix writes `drop(guard);` on its own line after the statement of the last use, and
+    /// the crate it leaves passes the borrow check and lints clean.
+    #[test]
+    fn the_fix_drops_the_guard_after_its_last_use_and_the_result_borrow_checks() {
+        let after = fixed(
+            "significant_drop_tightening",
+            r#"
+use std::sync::Mutex;
+pub fn work() {}
+pub fn count(m: &Mutex<Vec<u32>>) -> usize {
+    let guard = m.lock().unwrap();
+    let n = guard.len();
+    work();
+    n
+}
+"#,
+        );
+        assert!(after.contains("    let n = guard.len();\n    drop(guard);\n    work();\n"), "{after}");
+    }
+
+    /// Used again on one branch and held through a call on the other: the drop could go only
+    /// after the whole `if`, past the call, so the finding has no fix.
+    #[test]
+    fn a_guard_used_again_on_one_branch_gets_no_fix() {
+        let found = lint_only(
+            LINT,
+            r#"
+use std::sync::Mutex;
+pub fn work() {}
+pub fn branch(m: &Mutex<Vec<u32>>, b: bool) -> usize {
+    let guard = m.lock().unwrap();
+    let n = guard.len();
+    if b {
+        work();
+    } else {
+        work();
+        return n + guard.len();
+    }
+    n
+}
+"#,
+        );
+        assert_eq!(found.matches(FOUND).count(), 1, "{found}");
+        assert!(!found.contains(FIX), "{found}");
+    }
+
+    /// A `RefCell` borrow and a type marked `#[clippy::has_significant_drop]` or
+    /// `#[must_not_suspend]` count, each saying why; a `Vec`, or a type whose `Drop` only frees
+    /// memory and is marked nothing, never does.
+    #[test]
+    fn a_refcell_borrow_and_marked_types_are_found_and_a_vec_never_is() {
+        let found = lint_only(
+            LINT,
+            r#"
+use std::{cell::RefCell, vec::Vec};
+pub fn work() {}
+#[clippy::has_significant_drop]
+pub struct Token;
+impl Token { pub fn id(&self) -> usize { 0 } }
+impl Drop for Token { fn drop(&mut self) {} }
+#[must_not_suspend]
+pub struct Span;
+impl Span { pub fn id(&self) -> usize { 0 } }
+impl Drop for Span { fn drop(&mut self) {} }
+pub struct Buf(Vec<u32>);
+impl Drop for Buf { fn drop(&mut self) {} }
+pub fn cell(c: &RefCell<Vec<u32>>) -> usize {
+    let b = c.borrow_mut();
+    let n = b.len();
+    work();
+    n
+}
+pub fn marked(make: fn() -> Token) -> usize {
+    let t = make();
+    let n = t.id();
+    work();
+    n
+}
+pub fn suspends(make: fn() -> Span) -> usize {
+    let s = make();
+    let n = s.id();
+    work();
+    n
+}
+pub fn plain(v: Vec<u32>) -> usize {
+    let v = v;
+    let n = v.len();
+    work();
+    n
+}
+pub fn owned(b: Buf) -> usize {
+    let b = b;
+    let n = b.0.len();
+    work();
+    n
+}
+"#,
+        );
+        assert_eq!(found.matches(FOUND).count(), 3, "{found}");
+        assert!(found.contains("holds the `RefCell` borrow in `cell` after its last use: a conflicting borrow"), "{found}");
+        assert!(
+            found.contains("is kept alive in `marked` after its last use: its type is marked `#[clippy::has_significant_drop]`"),
+            "{found}"
+        );
+        assert!(found.contains("in `suspends` after its last use: its type is marked `#[must_not_suspend]`"), "{found}");
+        assert!(!found.contains("in `plain`") && !found.contains("in `owned`"), "{found}");
     }
 
     /// Used after the call, dropped before it, never used (a critical section), named `_`,
-    /// or a borrow of it still used after the call: none is held past its last use. A
-    /// `RefCell` borrow is no lock.
+    /// or a borrow of it still used after the call: none is held past its last use.
     #[test]
     fn a_guard_used_later_dropped_unused_or_still_borrowed_is_left_alone() {
         let found = lint_only(
             LINT,
             r#"
-use std::{cell::RefCell, sync::Mutex};
+use std::sync::Mutex;
 pub fn work() {}
 pub fn used_after(m: &Mutex<Vec<u32>>) -> usize {
     let guard = m.lock().unwrap();
@@ -373,12 +551,6 @@ pub fn borrowed(m: &Mutex<Vec<u32>>) -> u32 {
     let first = guard.first();
     work();
     match first { Some(x) => *x, None => 0 }
-}
-pub fn cell(c: &RefCell<Vec<u32>>) -> usize {
-    let b = c.borrow();
-    let n = b.len();
-    work();
-    n
 }
 "#,
         );

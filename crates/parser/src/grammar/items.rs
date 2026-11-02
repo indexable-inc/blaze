@@ -484,7 +484,7 @@ fn fn_(p: &mut Parser<'_>, m: Marker, is_in_trait: bool) {
     // test function_ret_type
     // fn foo() {}
     // fn bar() -> () {}
-    if !opt_ret_type(p) {
+    if !verify::fn_ret_type(p) {
         // test_err function_ret_type_missing_arrow
         // fn foo() usize {}
         // fn bar() super::Foo {}
@@ -502,6 +502,8 @@ fn fn_(p: &mut Parser<'_>, m: Marker, is_in_trait: bool) {
     // test function_where_clause
     // fn foo<T>() where T: Copy {}
     generic_params::opt_where_clause(p);
+    // blaze_verify: `requires`, `recommends`, `ensures`, `decreases` (grammar/verify.rs).
+    verify::fn_clauses(p);
 
     // test fn_decl
     // trait T { fn foo(); }

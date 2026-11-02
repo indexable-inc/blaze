@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrayvec::ArrayVec;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use intern::{Symbol, sym};
 use span::{Edition, Span, SyntaxContext};
 use tt::{
@@ -544,12 +545,12 @@ fn try_eat_dollar(src: &mut TtIter<'_>) -> bool {
 /// one `lhs` declares no binding for). Returns how many numbers there are. Runs once per rule,
 /// when the macro is defined.
 pub(crate) fn resolve_binders(lhs: &mut MetaTemplate, rhs: &mut MetaTemplate) -> u32 {
-    let mut binders = HashMap::default();
+    let mut binders = HashMap::new_in(Global);
     declare(lhs, &mut binders);
     resolve(rhs, &binders);
     return binders.len() as u32;
 
-    fn declare(template: &mut MetaTemplate, binders: &mut HashMap<MetaVar, Binder>) {
+    fn declare(template: &mut MetaTemplate, binders: &mut HashMap<MetaVar, Binder, Global>) {
         for op in template.0.iter_mut() {
             match op {
                 Op::Var { name, binder, .. } => {
@@ -562,7 +563,7 @@ pub(crate) fn resolve_binders(lhs: &mut MetaTemplate, rhs: &mut MetaTemplate) ->
         }
     }
 
-    fn resolve(template: &mut MetaTemplate, binders: &HashMap<MetaVar, Binder>) {
+    fn resolve(template: &mut MetaTemplate, binders: &HashMap<MetaVar, Binder, Global>) {
         let lookup = |name: &MetaVar| binders.get(name).copied().unwrap_or(NO_BINDER);
         for op in template.0.iter_mut() {
             match op {

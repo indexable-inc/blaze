@@ -866,7 +866,8 @@ impl ExpressionStoreSourceMap {
 impl Persist for ExpressionStoreSourceMap {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ExpressionStoreSourceMap"),
-        Part::U64(4),
+        // 6: `ExpressionStoreDiagnostics::VerifyRefused`.
+        Part::U64(6),
         Part::Schema(<SourceMapRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreSourceMapRef<'a>;
@@ -919,7 +920,8 @@ impl BodySourceMap {
 impl Persist for BodySourceMap {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("BodySourceMap"),
-        Part::U64(4),
+        // 6: `ExpressionStoreDiagnostics::VerifyRefused`.
+        Part::U64(6),
         Part::Schema(<BodySourceMapRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodySourceMapRef<'a>;
@@ -1027,12 +1029,22 @@ impl Code for ExpressionStoreDiagnostics {
                 w.u32(8);
                 node.put(w);
             }
+            ComptimeWithoutFeature { node, form } => {
+                w.u32(9);
+                node.put(w);
+                form.put(w);
+            }
+            VerifyRefused { node, why } => {
+                w.u32(10);
+                node.put(w);
+                why.put(w);
+            }
         }
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
         use ExpressionStoreDiagnostics::*;
-        Ok(match r.tag(9, "a diagnostic kind out of range")? {
+        Ok(match r.tag(11, "a diagnostic kind out of range")? {
             0 => InactiveCode { node: r.get()?, cfg: r.get()? },
             1 => UnresolvedMacroCall { node: r.get()?, path: r.get()? },
             2 => UnreachableLabel { node: r.get()?, name: r.get()? },
@@ -1041,7 +1053,9 @@ impl Code for ExpressionStoreDiagnostics {
             5 => PatternArgInExternFn { node: r.get()? },
             6 => FruInDestructuringAssignment { node: r.get()? },
             7 => MissingBody { node: r.get()?, kind: r.get()? },
-            _ => IntLiteralTooLarge { node: r.get()? },
+            8 => IntLiteralTooLarge { node: r.get()? },
+            9 => ComptimeWithoutFeature { node: r.get()?, form: r.get()? },
+            _ => VerifyRefused { node: r.get()?, why: r.get()? },
         })
     }
 }

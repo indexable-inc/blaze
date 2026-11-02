@@ -15,6 +15,10 @@
 //! | per-call scratch | [`scratch`]: buffers per worker, grown once to their high-water mark, lent for a closure or until dropped |
 //! | tables made and dropped whole, grown by a new one twice the last | [`blocks`]: power-of-two blocks from a region per size class, recycled through lock-free stacks; [`blocks::Slice`] is `Box<[T]>` in one |
 //!
+//! Owned text takes its allocator too ([`text`]): [`String<A>`](String), and on unix
+//! [`OsString<A>`](OsString) and [`PathBuf<A>`](PathBuf), each over a `Vec<u8, A>`, with
+//! [`format_in!`] for `format!`; `String<&Frame>` is a task's text.
+//!
 //! Every allocator is tagged with its subsystem ([`Tag`]); [`tag`] keeps live bytes, the
 //! high-water mark and the bytes handed out per tag, which memory admission and the agent API
 //! read ([`tag::snapshot`]), against a budget per tag ([`tag::set_budget`]).
@@ -56,6 +60,7 @@ mod stack;
 pub mod swiss;
 mod sync;
 pub mod tag;
+pub mod text;
 
 pub use append::AppendVec;
 pub use arena::{Arena, ArenaLocal};
@@ -68,6 +73,9 @@ pub use region::Region;
 pub use region_vec::RegionVec;
 pub use revision::{Built, Revisions};
 pub use tag::Tag;
+#[cfg(unix)]
+pub use text::{OsString, PathBuf};
+pub use text::{FromUtf8Error, String};
 
 /// The size of a huge page on the machines blaze targets (x86-64's and arm64's 2 MB pages
 /// with 4 KB base pages). Every Unix reservation is aligned to it, and a region of huge pages

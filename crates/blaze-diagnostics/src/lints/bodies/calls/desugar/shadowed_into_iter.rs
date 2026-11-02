@@ -9,6 +9,7 @@
 //! `compiler/rustc_span/src/lib.rs` (`Span::find_ancestor_in_same_ctxt`) (MIT or Apache-2.0).
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     FunctionId, HasModule as _, ModuleDefId,
@@ -33,7 +34,7 @@ pub(crate) struct ShadowedIntoIter {
     /// The iterated expressions of the body's `for` loops visited so far: the argument of the
     /// `IntoIterator::into_iter` call each is desugared to (rustc's parent of the parent of a
     /// method call that is one).
-    for_heads: HashSet<ExprId>,
+    for_heads: HashSet<ExprId, Global>,
 }
 
 impl LatePass for ShadowedIntoIter {

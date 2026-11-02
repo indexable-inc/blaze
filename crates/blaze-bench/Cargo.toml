@@ -14,6 +14,7 @@ blaze-rng.workspace = true
 
 [dev-dependencies]
 blaze-cas.workspace = true
+blaze-codegen.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-query.workspace = true
@@ -24,6 +25,10 @@ harness = false
 
 [[bench]]
 name = "query_hit"
+harness = false
+
+[[bench]]
+name = "dedupe"
 harness = false
 
 [lints]

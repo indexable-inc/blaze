@@ -7,6 +7,7 @@
 //! blocks in the same order and ask whether a local is `Copy` in the same order.
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_mem::{Frame, Tag, frame};
 use la_arena::{Idx, RawIdx};
 
@@ -27,12 +28,12 @@ enum Made {
 /// A drop tree that numbers its blocks in the order `unwind_node` and `resume_block` allocate
 /// them, logs each, and logs the first time each local's `Copy` is asked.
 struct Model<'f> {
-    nodes: HashMap<(BasicBlockId, LocalId, bool), BasicBlockId>,
+    nodes: HashMap<(BasicBlockId, LocalId, bool), BasicBlockId, Global>,
     resume: Option<BasicBlockId>,
     made: Vec<Made>,
     copy: Vec<bool>,
     asked: Vec<LocalId>,
-    asked_set: HashSet<LocalId>,
+    asked_set: HashSet<LocalId, Global>,
     unscheduled: LocalSet<'f>,
     /// Every `node` call, made or found.
     probes: usize,
@@ -41,12 +42,12 @@ struct Model<'f> {
 impl<'f> Model<'f> {
     fn new(frame: &'f Frame) -> Self {
         Model {
-            nodes: HashMap::default(),
+            nodes: HashMap::new_in(Global),
             resume: None,
             made: Vec::new(),
             copy: Vec::new(),
             asked: Vec::new(),
-            asked_set: HashSet::default(),
+            asked_set: HashSet::new_in(Global),
             unscheduled: LocalSet::new_in(frame),
             probes: 0,
         }
@@ -98,7 +99,7 @@ struct OldScope {
     tail: Option<usize>,
 }
 
-fn old_in_order(scope: &OldScope, operands: &HashSet<LocalId>) -> Vec<LocalId> {
+fn old_in_order(scope: &OldScope, operands: &HashSet<LocalId, Global>) -> Vec<LocalId> {
     match scope.tail {
         Some(declared) if declared < scope.locals.len() => {
             let (operands, temporaries): (Vec<LocalId>, Vec<LocalId>) =
@@ -109,14 +110,14 @@ fn old_in_order(scope: &OldScope, operands: &HashSet<LocalId>) -> Vec<LocalId> {
     }
 }
 
-fn old_leaving_order(scope: &OldScope, operands: &HashSet<LocalId>) -> Vec<LocalId> {
+fn old_leaving_order(scope: &OldScope, operands: &HashSet<LocalId, Global>) -> Vec<LocalId> {
     let (pending, mut rest): (Vec<LocalId>, Vec<LocalId>) =
         old_in_order(scope, operands).iter().partition(|it| operands.contains(*it));
     rest.extend(pending);
     rest
 }
 
-fn old_in_scope(scopes: &[OldScope], operands: &HashSet<LocalId>) -> Vec<LocalId> {
+fn old_in_scope(scopes: &[OldScope], operands: &HashSet<LocalId, Global>) -> Vec<LocalId> {
     scopes.iter().flat_map(|it| old_in_order(it, operands)).collect()
 }
 
@@ -144,7 +145,7 @@ fn old_unwind_through(
 /// The old world: lists, a hash set of operands, and the fold over everything at every ask.
 struct Old<'f> {
     scopes: Vec<OldScope>,
-    operands: HashSet<LocalId>,
+    operands: HashSet<LocalId, Global>,
     tree: Model<'f>,
     storage: bool,
 }
@@ -252,7 +253,7 @@ impl<'f> Both<'f> {
         let mut both = Both {
             old: Old {
                 scopes: Vec::new(),
-                operands: HashSet::default(),
+                operands: HashSet::new_in(Global),
                 tree: Model::new(frame),
                 storage,
             },
@@ -559,7 +560,7 @@ fn a_long_block_probed_quadratically_before() {
                 OldScope { locals: Vec::new(), tail: None },
                 OldScope { locals: Vec::new(), tail: None },
             ],
-            operands: HashSet::default(),
+            operands: HashSet::new_in(Global),
             tree: Model::new(frame),
             storage: false,
         };

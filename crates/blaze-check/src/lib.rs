@@ -10,6 +10,7 @@
 //! the seed and the schedule, which `CHECK_REPLAY` runs again.
 
 #![deny(unsafe_code)]
+#![feature(allocator_api)]
 
 pub mod cell;
 mod clock;

@@ -475,9 +475,9 @@ struct Foo {
                 x: x_self, y: y_self, z: z_self,
             }
             => {
-                $crate::hash::Hash::hash(&x_self, ra_expand_state);
-                $crate::hash::Hash::hash(&y_self, ra_expand_state);
-                $crate::hash::Hash::hash(&z_self, ra_expand_state);
+                $crate::hash::Hash::hash(x_self, ra_expand_state);
+                $crate::hash::Hash::hash(y_self, ra_expand_state);
+                $crate::hash::Hash::hash(z_self, ra_expand_state);
             }
             ,
         }
@@ -514,11 +514,11 @@ enum Command {
                 x: x_self, y: y_self,
             }
             => {
-                $crate::hash::Hash::hash(&x_self, ra_expand_state);
-                $crate::hash::Hash::hash(&y_self, ra_expand_state);
+                $crate::hash::Hash::hash(x_self, ra_expand_state);
+                $crate::hash::Hash::hash(y_self, ra_expand_state);
             }
             , Command::Do(f0_self, )=> {
-                $crate::hash::Hash::hash(&f0_self, ra_expand_state);
+                $crate::hash::Hash::hash(f0_self, ra_expand_state);
             }
             , Command::Jump=> {}
             ,

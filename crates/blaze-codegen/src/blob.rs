@@ -22,7 +22,7 @@ use crate::{
     wasm,
 };
 
-const TEMPLATE_MAGIC: [u8; 4] = *b"BZT6";
+const TEMPLATE_MAGIC: [u8; 4] = *b"BZT7";
 const STATIC_MAGIC: [u8; 4] = *b"BZS4";
 
 /// Why bytes are not a template.
@@ -174,9 +174,9 @@ fn put_profile(out: &mut Vec<u8>, profiled: Option<&Profiled>) {
             out.put_u32(*counters);
             out.put_u64(*version);
         }
-        Some(Profiled::Used { mismatched }) => {
+        Some(Profiled::Used { mismatched, applied }) => {
             out.put_u8(2);
-            out.put_u8(u8::from(*mismatched));
+            out.put_u8(u8::from(*mismatched) | u8::from(*applied) << 1);
         }
     }
 }
@@ -400,7 +400,10 @@ impl<'a> In<'a> {
                 counters: self.0.u32()?,
                 version: self.0.u64()?,
             })),
-            2 => Some(Profiled::Used { mismatched: self.bool()? }),
+            2 => match self.0.u8()? {
+                read @ 0..=2 => Some(Profiled::Used { mismatched: read & 1 != 0, applied: read & 2 != 0 }),
+                _ => return self.fail("a profile used both mismatched and applied, or of unknown bits"),
+            },
             _ => return self.fail("no such profile"),
         })
     }
@@ -895,7 +898,12 @@ mod tests {
     #[test]
     fn encode_writes_into_one_allocation_of_its_length() {
         let windows = TemplateUnwind::Windows { info: vec![1, 2], handler: Some(1), lsda: None };
-        let profiles = [template().profile, Some(Profiled::Used { mismatched: true }), None];
+        let profiles = [
+            template().profile,
+            Some(Profiled::Used { mismatched: true, applied: false }),
+            Some(Profiled::Used { mismatched: false, applied: true }),
+            None,
+        ];
         for unwind in [template().unwind, Some(windows), None] {
             for coverage in [template().coverage, None] {
                 for profile in profiles {

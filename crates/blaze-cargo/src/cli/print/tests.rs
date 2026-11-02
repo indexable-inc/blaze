@@ -205,6 +205,7 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
         compiled: 1,
         critical_path_us: 1500,
         steps_us: vec![(blaze_api::NodeKind::Link, 40)],
+        placed: blaze_api::PlacedBytes::default(),
     };
     let json = Shown { format: Format::Json { short: false, ansi: false, render_diagnostics: false }, ..Shown::default() };
     let (out, err) = printed(json, &[Response::Work(worked.clone()), Response::Done { ok: true }], true);
@@ -212,7 +213,8 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
         out,
         "{\"reason\": \"blaze-work\", \"reran\": 2, \"green\": 40, \"compiled\": 1, \"found\": 3, \"link\": \
          \"patched\", \"critical_path_us\": 1500, \"links\": [{\"path\": \"target/debug/foo\", \"how\": \
-         \"spliced\", \"why\": []}], \"steps_us\": {\"link\": 40}}\n{\"reason\":\"build-finished\",\"success\":true}\n"
+         \"spliced\", \"why\": []}], \"steps_us\": {\"link\": 40}, \"placed\": {\"cloned\": 0, \"written\": 0, \
+         \"copied\": 0}}\n{\"reason\":\"build-finished\",\"success\":true}\n"
     );
     assert!(err.starts_with("link: target/debug/foo (spliced)\n"), "{err}");
     let (out, err) = printed(Shown::default(), &[Response::Work(worked.clone()), Response::Done { ok: true }], true);
@@ -245,6 +247,7 @@ fn each_dependency_crate_is_one_served_line_after_the_work() {
         compiled: 0,
         critical_path_us: 7,
         steps_us: Vec::new(),
+        placed: blaze_api::PlacedBytes::default(),
     };
     let json = Shown { format: Format::Json { short: false, ansi: false, render_diagnostics: false }, ..Shown::default() };
     let (out, _) = printed(json, &[Response::Work(worked.clone()), Response::Done { ok: true }], true);
@@ -252,7 +255,8 @@ fn each_dependency_crate_is_one_served_line_after_the_work() {
         out,
         concat!(
             "{\"reason\": \"blaze-work\", \"reran\": 1, \"green\": 0, \"compiled\": 0, \"found\": 0, \"link\": \
-             \"placed\", \"critical_path_us\": 7, \"links\": [], \"steps_us\": {}}\n",
+             \"placed\", \"critical_path_us\": 7, \"links\": [], \"steps_us\": {}, \"placed\": {\"cloned\": 0, \
+             \"written\": 0, \"copied\": 0}}\n",
             "{\"reason\": \"blaze-served\", \"package\": \"itoa\", \"outcome\": \"served\", \"bodies\": \"served\", \
              \"why\": null}\n",
             "{\"reason\": \"blaze-served\", \"package\": \"serde\", \"outcome\": \"checked\", \"bodies\": \"refused\", \
@@ -487,6 +491,21 @@ fn json_on_stdout_and_status_on_stderr() {
     assert!(!out.contains("compiler-message"));
     assert!(err.contains(UNUSED));
     assert!(err.contains("warning: `foo` (lib) generated 1 warning\n"));
+}
+
+#[test]
+fn a_warning_of_no_unit_reaches_stderr_once_in_every_format() {
+    // A warning of the whole job (a profile that applied to nothing, goals noted) has no
+    // `compiler-message` to carry it under JSON, so its text goes to stderr there too.
+    let text = "warning: the profile applied to nothing\n";
+    let warning = diagnostic(Level::Warning, "the profile applied to nothing", text, None);
+    let responses = [Response::Diagnostic(warning.clone()), Response::Diagnostic(warning), Response::Done { ok: true }];
+    let json = |render_diagnostics| Format::Json { short: false, ansi: false, render_diagnostics };
+    for format in [json(false), json(true), Format::Human, Format::Short] {
+        let (out, err) = printed(Shown { format, ..Shown::default() }, &responses, true);
+        assert_eq!(err.matches(text).count(), 1, "{format:?}: {err}");
+        assert!(!out.contains("the profile applied to nothing"), "{format:?}: {out}");
+    }
 }
 
 #[test]

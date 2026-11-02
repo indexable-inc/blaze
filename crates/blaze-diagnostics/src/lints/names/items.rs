@@ -37,6 +37,7 @@ mod variants;
 mod visibility;
 mod walk;
 
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
 use std::cell::OnceCell;
 
 use blaze_items::ItemId;
@@ -216,6 +217,7 @@ pub(super) fn after_abort<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>, effective: &E
 }
 
 /// What the late passes read of the crate itself, read once for all of its items.
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
 pub(super) struct Krate {
     pub(super) anonymous_lifetime_in_impl_trait: bool,
     pub(super) async_fn_track_caller: bool,
@@ -232,6 +234,7 @@ pub(super) struct Krate {
 }
 
 impl Krate {
+    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
     fn of(cx: &Cx<'_, '_>) -> Krate {
         let features = UnstableFeatures::query(cx.db, cx.krate.base());
         let enabled = |name: &str| features.is_enabled(&Symbol::intern(name));

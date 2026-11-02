@@ -2,18 +2,32 @@
 //! where that code does not tell types apart. Two types with one fact are handled by the same
 //! machine code wherever only their facts are read.
 //!
-//! - A scalar (`bool`, `char`, an integer, a float), `str` and `!` are their identity.
-//! - An ADT is its definition's identity ([`identity::adt`]: its key, interface, layout hash
-//!   and drop impls, so `repr`, `#[repr(transparent)]`, lang-item ADTs and `Drop` are in it),
-//!   its layout, its discriminants and its fields' facts, with the arguments put in. Two
-//!   instances of one ADT whose fields have one fact (`Vec<&A>`, `Vec<&B>`) have one fact.
+//! - An integer or a float is whether it is signed, unsigned or a float, and its layout:
+//!   `u64` and `usize` have one fact on a 64-bit target, `u32` and `i32` do not (the layout's
+//!   scalar has its signedness). `bool`, `char`, `str` and `!` are their identity.
+//! - An ADT is its **shape** (`docs/v2/plan/lanes/polymorph.md`): whether it is a struct, an
+//!   enum or a union, its `repr` (flags, integer, `align`, `packed`, scalable; not the field
+//!   shuffle seed, whose effect is in the layout's offsets), its layout, its number of variants,
+//!   each variant's discriminant and number of fields, and its fields' facts, with the
+//!   arguments put in. So two ADTs that code handles alike (`struct A(u32)` and
+//!   `struct B(u32)`) have one fact, and `Vec<&A>`, `Vec<&B>`, `Vec<A>` and `Vec<B>` too. What
+//!   tells them apart is read where it is used, never through the fact: a call of one of their
+//!   methods by the callee's key, a drop by the drop glue's identity ([`crate::drop`]), a
+//!   vtable, `TypeId` or `type_name` by full identity ([`identity`]).
+//! - An ADT that the code generator or the layout may treat by what it is rather than by its
+//!   shape keeps its definition's identity ([`identity::adt`]: its key, interface, layout hash
+//!   and drop impls) in place of the shape's kind and `repr`: a lang item (`Box`,
+//!   `UnsafeCell`, `ManuallyDrop`, `MaybeUninit`, `PhantomData`, `Option`, ...), an ADT marked
+//!   `#[rustc_pass_indirectly_in_non_rustic_abis]` or `#[rustc_layout_scalar_valid_range_*]`,
+//!   and a SIMD or scalable vector. Its arguments are still read by their facts, so
+//!   `Option<A>` and `Option<B>` have one fact.
 //! - A tuple, an array and a closure are their layouts and their parts' facts.
 //! - A pointer is its mutability and a summary of what it points to: its kind, size and
 //!   alignment, whether it is `Freeze`, `Unpin` and plain data, which the code generator reads
 //!   to say what memory a reference argument is the only way to. Never the pointee's fact: a
 //!   type reaches itself only through a pointer, so a fact never cycles.
 //! - A function item is a value of no size: what calls it, casts it to a pointer or makes a
-//!   vtable of it keys it there ([`crate::walk`]).
+//!   vtable of it keys it there (compile identity's walk, `hir_ty_identity::instance_identity`).
 //! - Everything else (a function pointer, a trait object, a coroutine) is its identity: the
 //!   code that handles it tells it apart.
 //!
@@ -21,7 +35,7 @@
 
 use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
-use hir_def::VariantId;
+use hir_def::{AdtId, VariantId, attrs::AttrFlags};
 use hir_ty::{
     ParamEnvAndCrate,
     db::HirDatabase,
@@ -29,14 +43,12 @@ use hir_ty::{
     layout::Layout,
         next_solver::{
         DbInterner, ParamEnv, StoredTy, Ty, TyKind, TypingMode,
-        infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
+        infer::{DbInternerInferExt, InferCtxt},
     },
     traits::{StoredParamEnvAndCrate, implements_trait_unique, structurally_normalize_ty},
 };
-use rustc_type_ir::{
-    TypeVisitableExt as _,
-    inherent::{AdtDef as _, GenericArgs as _, IntoKind},
-};
+use rustc_abi::{IntegerType, ReprFlags, ReprOptions, ScalableElt};
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 use crate::{FACT_DOMAIN, Unshared, identity, layout};
 
 /// What a fact or a pointee summary is of: its first byte.
@@ -51,6 +63,8 @@ mod tag {
     pub(super) const CLOSURE: u8 = 8;
     pub(super) const IDENTITY: u8 = 9;
     pub(super) const FN_ITEM: u8 = 10;
+    pub(super) const NUMBER: u8 = 11;
+    pub(super) const ADT_SHAPE: u8 = 12;
     pub(super) const POINTEE_SIZED: u8 = 16;
     pub(super) const POINTEE_STR: u8 = 17;
     pub(super) const POINTEE_SLICE: u8 = 18;
@@ -121,16 +135,16 @@ fn plain_data<'db>(
 
 /// What the queries of one environment share: the database, an inference context in it and
 /// the environment, borrowed and stored.
-pub(crate) struct Cx<'db> {
-    pub(crate) db: &'db Db,
-    pub(crate) interner: DbInterner<'db>,
-    pub(crate) infcx: InferCtxt<'db>,
-    pub(crate) env: ParamEnvAndCrate<'db>,
-    pub(crate) stored: StoredParamEnvAndCrate,
+pub struct Cx<'db> {
+    pub db: &'db Db,
+    pub interner: DbInterner<'db>,
+    pub infcx: InferCtxt<'db>,
+    pub env: ParamEnvAndCrate<'db>,
+    pub stored: StoredParamEnvAndCrate,
 }
 
 impl<'db> Cx<'db> {
-    pub(crate) fn new(
+    pub fn new(
         db: &'db Db,
         stored: StoredParamEnvAndCrate,
     ) -> Cx<'db> {
@@ -141,41 +155,37 @@ impl<'db> Cx<'db> {
     }
 
     /// `ty` with a top-level alias normalized, as the code generator's `normalize` does.
-    pub(crate) fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
+    pub fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
         structurally_normalize_ty(&self.infcx, ty, self.env.param_env)
     }
 
-    pub(crate) fn layout(&self, ty: Ty<'db>) -> Result<&'static Layout, Unshared> {
+    pub fn layout(&self, ty: Ty<'db>) -> Result<&'static Layout, Unshared> {
         self.db
             .layout_of_ty(ty.store(), self.stored.clone()) // clone: the query's key, a reference count
             .map(|layout| &layout.get().0)
             .map_err(|error| Unshared::NoLayout(format!("`{ty:?}`: {error:?}"))) // alloc: error path
     }
 
-    pub(crate) fn needs_drop(&self, ty: Ty<'db>) -> bool {
+    pub fn needs_drop(&self, ty: Ty<'db>) -> bool {
         has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None
     }
 
-    /// `ty` with every alias in it normalized, as rustc's `normalize_erasing_regions` has a type
-    /// before layout and codegen: a field instantiated with the ADT's arguments, or a closure's
-    /// signature, can hold a projection deep inside that only resolves with them.
-    fn deeply_normalize(&self, ty: Ty<'db>) -> Result<Ty<'db>, Unshared> {
-        if !ty.has_aliases() {
-            return Ok(ty);
-        }
-        self.infcx
-            .at(&ObligationCause::dummy(), self.env.param_env)
-            .deeply_normalize(ty)
-            .map_err(|errors| Unshared::NoContent(format!("`{ty:?}` does not normalize: {errors:?}"))) // alloc: error path
+    /// `ty` with every alias in it normalized ([`crate::deeply_normalize`]).
+    pub fn deeply_normalize(&self, ty: Ty<'db>) -> Result<Ty<'db>, Unshared> {
+        crate::deeply_normalize(&self.infcx, self.env.param_env, ty)
     }
 
-    /// The fact of `ty`: one query per (type, environment), so a hit is one lookup.
-    pub(crate) fn fact(&self, ty: Ty<'db>) -> Result<ContentId, Unshared> {
-        let ty = self.deeply_normalize(ty)?;
-        match fact(self.db, ty.store(), self.stored.clone()) { // clone: the query's key, a reference count
-            Ok(id) => Ok(*id),
-            Err(why) => Err(why.clone()), // clone: error path
-        }
+    /// The fact of `ty`: one query per (type, environment), so a hit is one lookup. A field's
+    /// fact is a query inside its ADT's or tuple's, so a miss nests one query per level of
+    /// `ty`, as deep as the program built it: each level runs with stack to spare (rule 17).
+    pub fn fact(&self, ty: Ty<'db>) -> Result<ContentId, Unshared> {
+        stdx::ensure_sufficient_stack(|| {
+            let ty = self.deeply_normalize(ty)?;
+            match fact(self.db, ty.store(), self.stored.clone()) { // clone: the query's key, a reference count
+                Ok(id) => Ok(*id),
+                Err(why) => Err(why.clone()), // clone: error path
+            }
+        })
     }
 
     fn is_unpin(&self, ty: Ty<'db>) -> bool {
@@ -235,33 +245,54 @@ impl<'db> Cx<'db> {
     fn write(&self, ty: Ty<'db>, out: &mut Hasher) -> Result<(), Unshared> {
         let db = self.db;
         match ty.kind() {
-            TyKind::Bool
-            | TyKind::Char
-            | TyKind::Int(_)
-            | TyKind::Uint(_)
-            | TyKind::Float(_)
-            | TyKind::Str
-            | TyKind::Never => {
+            TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Never => {
                 out.update(&[tag::LEAF]);
                 out.update(&identity::ty(db, ty)?.0);
             }
+            // What the code generator reads of a number is its class and its layout's scalar
+            // (size, alignment, signedness, valid range): `usize` is `u64` on a 64-bit target.
+            TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) => {
+                let class = match ty.kind() {
+                    TyKind::Int(_) => 0u8,
+                    TyKind::Uint(_) => 1,
+                    _ => 2,
+                };
+                out.update(&[tag::NUMBER, class]);
+                layout::write(self.layout(ty)?, out);
+            }
             TyKind::Adt(def, args) => {
                 let adt = def.def_id();
-                out.update(&[tag::ADT]);
-                out.id(identity::adt(db, adt).as_ref().map_err(Clone::clone)?);
+                match keeps_identity(db, adt) {
+                    true => {
+                        out.update(&[tag::ADT]);
+                        out.id(identity::adt(db, adt).as_ref().map_err(Clone::clone)?);
+                    }
+                    false => {
+                        out.update(&[tag::ADT_SHAPE]);
+                        write_shape(db, adt, out);
+                    }
+                }
                 layout::write(self.layout(ty)?, out);
+                // Each variant's discriminant and fields, then how many variants there are
+                // (`variant_count`, and an enum of one inhabited variant whose layout is a
+                // struct's).
+                let mut variants = 0u64;
                 for variant in adt.variants(db) {
+                    variants += 1;
                     if let VariantId::EnumVariantId(variant) = variant {
                         let discriminant = db.const_eval_discriminant(variant).map_err(|error| {
                             Unshared::ConstEval(format!("a discriminant of `{ty:?}`: {error:?}")) // alloc: error path
                         })?;
                         out.update(&discriminant.to_le_bytes());
                     }
-                    for (_, field) in db.field_types(variant).iter() {
+                    let fields = db.field_types(variant);
+                    out.update(&(fields.len() as u64).to_le_bytes());
+                    for (_, field) in fields.iter() {
                         let field = field.ty().instantiate(self.interner, args).skip_norm_wip();
                         out.update(&self.fact(field)?.0);
                     }
                 }
+                out.update(&variants.to_le_bytes());
             }
             TyKind::Tuple(fields) => {
                 out.update(&[tag::TUPLE]);
@@ -311,6 +342,61 @@ impl<'db> Cx<'db> {
         out.update(&[u8::from(self.needs_drop(ty)) | u8::from(freeze) << 1]);
         Ok(())
     }
+}
+
+/// The attributes that make the code generator or the layout treat an ADT by what it is: a
+/// lang item (`Box`'s deref and `noalias`, `UnsafeCell`'s `Freeze`, `ManuallyDrop`'s drop,
+/// `MaybeUninit`'s validity), C's indirect passing, a scalar's valid range.
+const IDENTIFYING: AttrFlags = AttrFlags::LANG_ITEM
+    .union(AttrFlags::RUSTC_PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS)
+    .union(AttrFlags::RUSTC_LAYOUT_SCALAR_VALID_RANGE);
+
+/// Whether an ADT's fact holds its definition's identity rather than its shape: one the code
+/// generator may read by what it is (`IDENTIFYING`), or a SIMD or scalable vector, whose
+/// element the code generator reads off the definition.
+fn keeps_identity(db: &Db, adt: AdtId) -> bool {
+    AttrFlags::query(db, adt.into()).intersects(IDENTIFYING)
+        || AttrFlags::repr(db, adt).is_some_and(|repr| {
+            repr.flags.intersects(ReprFlags::IS_SIMD | ReprFlags::IS_SCALABLE)
+                || repr.scalable.is_some()
+        })
+}
+
+/// An ADT's shape before its layout and fields: its kind and its `repr`, which the code
+/// generator reads for a C call (`repr(C)`, `transparent`, `packed`) and the layout already
+/// holds the rest of. The field shuffle seed is left out: it names the definition, and what
+/// it did is in the layout's field offsets.
+fn write_shape(db: &Db, adt: AdtId, out: &mut Hasher) {
+    let kind = match adt {
+        AdtId::StructId(_) => 0u8,
+        AdtId::EnumId(_) => 1,
+        AdtId::UnionId(_) => 2,
+    };
+    out.update(&[kind]);
+    let Some(repr) = AttrFlags::repr(db, adt) else {
+        out.update(&[0]);
+        return;
+    };
+    let ReprOptions { int, align, pack, flags, scalable, field_shuffle_seed: _ } = repr;
+    out.update(&[1, flags.bits()]);
+    match int {
+        None => out.update(&[0]),
+        Some(IntegerType::Pointer(signed)) => out.update(&[1, u8::from(signed)]),
+        Some(IntegerType::Fixed(integer, signed)) => {
+            out.update(&[2, integer.size().bytes() as u8, u8::from(signed)])
+        }
+    };
+    for it in [align, pack] {
+        match it {
+            None => out.update(&[0]),
+            Some(align) => out.update(&[1]).update(&align.bytes().to_le_bytes()),
+        };
+    }
+    match scalable {
+        None => out.update(&[0]),
+        Some(ScalableElt::ElementCount(count)) => out.update(&[1]).update(&count.to_le_bytes()),
+        Some(ScalableElt::Container) => out.update(&[2]),
+    };
 }
 
 #[blaze_query::tracked(returns(ref), cycle_result = fact_cycle)]

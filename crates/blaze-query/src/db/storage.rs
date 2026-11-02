@@ -5,10 +5,7 @@ use std::{
     any::TypeId,
     fmt,
     ptr::{self, NonNull},
-    sync::{
-        OnceLock,
-        atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 
 use blaze_graph::{Key, pump::Flights};
@@ -16,7 +13,9 @@ use blaze_mem::Tag;
 use parking_lot::Mutex;
 
 use super::{
-    Event, EventKind, counts,
+    Event, EventKind,
+    admission::Eviction,
+    counts,
     dense::{Dense, Heap},
     id::{Id, MAX_PAGES, PAGE_BITS, PAGE_LEN},
     ingredient::{self, Ingredient, MAX_INGREDIENTS},
@@ -171,7 +170,10 @@ pub struct Storage {
     lru: Mutex<Vec<u32>>,
     /// [`Storage::keep_every_value`].
     keep: bool,
-    db_type: OnceLock<TypeId>,
+    /// [`Storage::set_eviction`].
+    eviction: Eviction,
+    /// The database type of its first function table ([`Storage::check_db`]).
+    db_type: Mutex<Option<TypeId>>,
 }
 
 // The tables behind the raw pointers are `Send + Sync` (each typed table's fields are atomics,
@@ -224,7 +226,8 @@ impl Storage {
             // alloc: none, empty: one entry per `lru` function, pushed once
             lru: Mutex::new(Vec::new()),
             keep: false,
-            db_type: OnceLock::new(),
+            eviction: Eviction::default(),
+            db_type: Mutex::new(None),
         }
     }
 
@@ -319,6 +322,16 @@ impl Storage {
     /// While `keep`, no `lru` cap evicts at a new view.
     pub fn keep_every_value(&mut self, keep: bool) {
         self.keep = keep;
+    }
+
+    /// How every `lru` cap picks the values it evicts from the next view on
+    /// ([`Eviction::Frequency`] unless set).
+    pub fn set_eviction(&mut self, eviction: Eviction) {
+        self.eviction = eviction;
+    }
+
+    pub(crate) fn eviction(&self) -> Eviction {
+        self.eviction
     }
 
     /// `file!()` where ingredient `ingredient` is defined.
@@ -558,25 +571,24 @@ impl Storage {
 
     /// Records that memo `node` runs in this view because of `cause`: its flight holder's one
     /// store before the run, read back by [`Storage::provenance`]. A run in the view it last
-    /// ran in counts as [`counts::RERAN`].
+    /// ran in counts as [`counts::RERAN`], and a run for an evicted value as
+    /// [`counts::EVICTED_ASKED`].
     #[inline]
     pub(crate) fn record_run(&self, node: u32, cause: Cause) {
         let run = self.runs.get(node as usize);
         let was = run.load(Ordering::Relaxed);
         run.store(cause.word(self.view), Ordering::Relaxed);
-        if ((was >> 32) as u32) & VIEW_MASK == self.view {
+        let reran = ((was >> 32) as u32) & VIEW_MASK == self.view;
+        let evicted = matches!(cause, Cause::Evicted);
+        if reran || evicted {
             let (index, _, _) = key_parts(self.key_of(node));
-            counts::count(index, counts::RERAN);
+            if reran {
+                counts::count(index, counts::RERAN);
+            }
+            if evicted {
+                counts::count(index, counts::EVICTED_ASKED);
+            }
         }
-    }
-
-    /// What each ingredient's rows did since the last call, in every database of this process
-    /// (ingredients are numbered process-wide), summed over threads: `each(name, executed,
-    /// verified, reran)` per ingredient that did anything, named as its query is. Executed is a
-    /// run, verified a row proved unchanged in a view without running, reran a run in a view
-    /// the row had already run in.
-    pub fn take_counts(&self, each: impl FnMut(&str, u64, u64, u64)) {
-        counts::take(each);
     }
 
     /// Copies `edges` into the edge array: a span for a row or a capture.
@@ -706,7 +718,7 @@ impl Storage {
 
     /// Every function of this storage shares one database type (its vtables cast to it).
     pub(crate) fn check_db<D: 'static>(&self, name: &str) {
-        let first = *self.db_type.get_or_init(TypeId::of::<D>);
+        let first = *self.db_type.lock().get_or_insert(TypeId::of::<D>());
         assert!(
             first == TypeId::of::<D>(),
             "{name} is used with a second database type on one storage ({})",

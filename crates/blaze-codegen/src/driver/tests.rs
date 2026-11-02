@@ -48,9 +48,50 @@ struct Program {
     /// The functions of each level the walk reached, in the order it told them.
     reached: Mutex<Vec<Vec<u32>>>,
     stop: AtomicBool,
+    /// Each counted function's body and whether it is drop glue: none is counted unless named.
+    bodies: HashMap<u32, (u32, bool)>,
+    /// The recursion limit of crate 0, every function's unless [`Self::crates`] says: `None`,
+    /// none is held to one.
+    recursion_limit: Option<u32>,
+    /// Each function's crate, when not 0, and whether it is collected in its own crate's build
+    /// (not generic, not `#[inline]`).
+    crates: HashMap<u32, (u32, bool)>,
+    /// The recursion limit of each crate other than 0.
+    limits: HashMap<u32, u32>,
 }
 
 impl Program {
+    /// The code hash of `id`. The code takes callees by their interface, here their number:
+    /// not their bodies.
+    fn code(&self, id: u32) -> CodeHash {
+        let function = &self.functions[&id];
+        let mut code = Hasher::new("blaze v2 test code 1");
+        code.update(&function.code_of.unwrap_or(id).to_le_bytes()).update(&[function.body]);
+        if function.code_of.is_none() {
+            for callee in &function.calls {
+                code.update(&callee.to_le_bytes());
+            }
+        }
+        CodeHash(code.finish())
+    }
+
+    /// The code hashes of the bodies `id` builds in, through what they build in, as the
+    /// driver closes them: its MIR inliner's copies.
+    fn built_in(&self, id: u32) -> Vec<CodeHash> {
+        let (mut seen, mut queue) = (Vec::new(), vec![id]);
+        while let Some(at) = queue.pop() {
+            let function = &self.functions[&at];
+            for place in &function.built_in {
+                let Some(&callee) = function.calls.get(*place as usize) else { continue };
+                if callee != id && !seen.contains(&callee) {
+                    seen.push(callee);
+                    queue.push(callee);
+                }
+            }
+        }
+        seen.into_iter().map(|it| self.code(it)).collect()
+    }
+
     fn function(&mut self, id: u32, body: u8, calls: &[u32]) -> &mut Function {
         let function = Function {
             body,
@@ -89,15 +130,7 @@ impl Frontend for Program {
             .chain(function.statics.iter().map(|it| FrontRef::Static(*it)))
             .chain([FrontRef::Extern(function.outside.to_owned())])
             .collect();
-        // The code takes callees by their interface, here their number: not their bodies.
-        let mut code = Hasher::new("blaze v2 test code 1");
-        code.update(&function.code_of.unwrap_or(*id).to_le_bytes()).update(&[function.body]);
-        if function.code_of.is_none() {
-            for callee in &function.calls {
-                code.update(&callee.to_le_bytes());
-            }
-        }
-        let code = CodeHash(code.finish());
+        let code = self.code(*id);
         Ok(Described {
             owner: function.owner.unwrap_or(Owner::of(&function.origin)),
             identity: ContentId::of("blaze v2 test identity 1", &id.to_le_bytes()),
@@ -115,6 +148,7 @@ impl Frontend for Program {
             refs,
             built_in: function.built_in.clone(),
             name: format!("f{id}"),
+            cold: false,
         })
     }
 
@@ -129,6 +163,7 @@ impl Frontend for Program {
             section: section.clone(),
             origin: Origin::Member(Package::new("app")),
             symbol: None,
+            name: format!("app::S{id}"),
             refs: self.static_calls.get(id).into_iter().flatten().map(|it| FrontRef::Function(*it)).collect(),
         })
     }
@@ -140,6 +175,35 @@ impl Frontend for Program {
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
+
+    fn counted(&self, functions: &[(u32, Origin)]) -> Vec<crate::backend::Counted> {
+        (functions.iter())
+            .map(|(id, _)| {
+                let body = self.bodies.get(id).map(|&(body, drop_glue)| crate::backend::Instantiates {
+                    body: ContentId::of("blaze v2 test body 1", &body.to_le_bytes()),
+                    drop_glue,
+                });
+                let (krate, heads_own_path) = self.crates.get(id).copied().unwrap_or((0, false));
+                let value = if krate == 0 { self.recursion_limit } else { self.limits.get(&krate).copied() };
+                let limit = value.map(|value| crate::backend::Limit {
+                    krate: ContentId::of("blaze v2 test crate 1", &krate.to_le_bytes()),
+                    value,
+                });
+                crate::backend::Counted { body, limit, heads_own_path }
+            })
+            .collect()
+    }
+
+    fn spell(&self, id: &u32) -> String {
+        format!("f{id}")
+    }
+
+    fn past_recursion_limit(&self, id: &u32, depth: u32, limit: u32, head: &u32, limit_of: &u32) -> CodegenError {
+        let what = format!(
+            "f{id} repeats its body {depth} times on its path from f{head}, past {limit} of f{limit_of}'s crate"
+        );
+        error(InstanceKey(ContentId::default()), item(*id), what)
+    }
 }
 
 #[derive(Default)]
@@ -148,6 +212,20 @@ struct Machine {
     emitted: AtomicUsize,
     summarized: AtomicUsize,
     statics: AtomicUsize,
+    /// The body byte of each function emitted, in the order emitted.
+    emitted_bodies: Mutex<Vec<u8>>,
+    /// Added to each prepared function's shape when not 0: IR that differs from another
+    /// machine's under the same key, as a key missing an input would let through.
+    salt: u8,
+    /// A code the release compile of each function of this body byte says it built in, which
+    /// nothing of the build is: as a backend that built in a body its key misses would.
+    unkept: Option<(u8, CodeHash)>,
+}
+
+/// Whether a function of body byte `body` is one nothing may import ([`Hint::Never`]): the
+/// bodies `0x6_`.
+fn never_imported(body: u8) -> bool {
+    body & 0xf0 == 0x60
 }
 
 /// The body byte of a function whose IR can't be built, as a layout error stops it.
@@ -157,6 +235,16 @@ const FAILS_ITS_CHECK: u8 = 0xee;
 struct Prepared {
     body: u8,
     refs: usize,
+    /// The code hashes of the bodies it builds in ([`Program::built_in`]).
+    built_in: Vec<CodeHash>,
+}
+
+/// A release function as its importers build it in: its body byte, which shows in their
+/// code, and the code it is and builds in, which their [`CompiledFunction::inlined`] names.
+struct Exported {
+    body: u8,
+    code: CodeHash,
+    built_in: Vec<CodeHash>,
 }
 
 fn bcmp() -> Target {
@@ -172,7 +260,7 @@ fn code(prepared: &Prepared) -> Vec<u8> {
 impl Prepare for Machine {
     type Frontend = Program;
     type Prepared = Prepared;
-    type Export = u8;
+    type Export = Exported;
 
     fn prepare(
         &self,
@@ -183,11 +271,15 @@ impl Prepare for Machine {
         refs: &crate::template::Refs,
     ) -> Result<(Shape, Prepared), CodegenError> {
         self.prepared.fetch_add(1, Ordering::Relaxed);
-        let prepared = Prepared { body: program.functions[id].body, refs: refs.len() };
+        let prepared = Prepared { body: program.functions[id].body, refs: refs.len(), built_in: program.built_in(*id) };
         if prepared.body == FAILS_ITS_CHECK {
             return Err(error(unit.instance.key(), unit.item, "a layout too big for the target"));
         }
-        Ok((Shape::of(unit, &code(&prepared)), prepared))
+        let mut shaped = code(&prepared);
+        if self.salt != 0 {
+            shaped.push(self.salt);
+        }
+        Ok((Shape::of(unit, &shaped), prepared))
     }
 
     fn summarize(
@@ -196,7 +288,7 @@ impl Prepare for Machine {
         _: &Spec,
         prepared: &mut Prepared,
         refs: &crate::template::Refs,
-    ) -> Result<(Summary, u8), CodegenError> {
+    ) -> Result<(Summary, Exported), CodegenError> {
         self.summarized.fetch_add(1, Ordering::Relaxed);
         let calls = refs
             .iter()
@@ -210,7 +302,7 @@ impl Prepare for Machine {
         let summary = Summary {
             key: unit.instance.key(),
             size: 4,
-            hint: Hint::None,
+            hint: if never_imported(prepared.body) { Hint::Never } else { Hint::None },
             calls,
             addressed: Vec::new(),
             params: 0,
@@ -219,7 +311,8 @@ impl Prepare for Machine {
             body: Attrs::default(),
             external: true,
         };
-        Ok((summary, prepared.body))
+        let exported = Exported { body: prepared.body, code: unit.instance.code, built_in: prepared.built_in.clone() };
+        Ok((summary, exported))
     }
 
     fn emit(
@@ -228,9 +321,10 @@ impl Prepare for Machine {
         _: &Spec,
         prepared: Prepared,
         refs: &crate::template::Refs,
-        imports: Option<(&Imports, &[Import<'_, u8>])>,
+        imports: Option<(&Imports, &[Import<'_, Exported>])>,
     ) -> Result<Emitted, CodegenError> {
         self.emitted.fetch_add(1, Ordering::Relaxed);
+        self.emitted_bodies.lock().push(prepared.body);
         let mut relocs: Vec<crate::Relocation> = (0..prepared.refs)
             .map(|at| crate::Relocation {
                 at: 2 + 5 * at as u32,
@@ -246,10 +340,22 @@ impl Prepare for Machine {
             extra.push("bcmp".to_owned());
         }
         let mut code = code(&prepared);
-        // What it built in shows in its code, as an import's body would.
+        // What it built in shows in its code, as an import's body would, and its code hash is
+        // named, with what the import builds in, as LLVM's release backend names them.
+        let mut inlined = Vec::new();
         for import in imports.map_or(&[][..], |it| it.1) {
-            code.push(*import.export);
+            code.push(import.export.body);
+            inlined.push(import.export.code);
+            inlined.extend_from_slice(&import.export.built_in);
         }
+        if let Some((body, unkept)) = self.unkept
+            && imports.is_some()
+            && body == prepared.body
+        {
+            inlined.push(unkept);
+        }
+        inlined.sort_unstable();
+        inlined.dedup();
         let function = CompiledFunction {
             key: unit.instance.key(),
             arch: unit.arch,
@@ -257,7 +363,7 @@ impl Prepare for Machine {
             code,
             relocs: relocs.into(),
             data: Vec::new(),
-            inlined: Vec::new(),
+            inlined,
             side: None,
             unwind: None,
             lines: Vec::new(),
@@ -346,6 +452,9 @@ fn policy(level: OptLevel, mode: Mode) -> Policy {
         fold: false,
         sanitize: Sanitize::default(),
         pgo: Pgo::None,
+        proc_macro_bridge: false,
+        report: false,
+        heap_to_stack: false,
     }
 }
 
@@ -481,7 +590,7 @@ fn a_static_root_is_built_though_no_code_names_it() {
     let (machine, memo, store) = (Machine::default(), Memo::new(), Store::default());
     let without = build(&program, &machine, &policy, &memo, &store).unwrap();
     assert!(without.statics.is_empty());
-    let with = Build::new(&machine, &program, &policy, &memo).run_with_statics(&[(1, member())], &[7], &store).unwrap();
+    let with = Build::new(&machine, &program, &policy, &memo).run_with_statics(&[(1, member())], &[7], &[], &store).unwrap();
     assert_eq!(with.statics.len(), 1);
     assert_eq!(with.statics[0].item, static_item(7));
     assert_eq!(with.functions.len(), without.functions.len());
@@ -681,7 +790,8 @@ fn a_store_entry_that_does_not_read_is_an_error_not_a_compile() {
 /// the decoder does not.
 #[test]
 fn a_store_hit_is_read_in_place() {
-    let key = keys::template(&InstanceKey(ContentId([1; 32])));
+    let at = |n: u8| kernel::template(&InstanceKey(ContentId([n; 32])), &crate::Settings(ContentId::default()), &ContentId::default());
+    let key = at(1);
     let mut store = Store::default();
     store.0.insert(key, vec![7; 4096]);
     let unit = Unit {
@@ -699,9 +809,227 @@ fn a_store_hit_is_read_in_place() {
     assert!(matches!(out.read(&store, &key, &unit, sum), Read::Hit(28672)));
     let read = blaze_alloc_count::assert_at_most(0, "a warm store hit", || out.read(&store, &key, &unit, sum));
     assert!(matches!(read, Read::Hit(28672)));
-    let missing = keys::template(&InstanceKey(ContentId([2; 32])));
+    let missing = at(2);
     assert!(matches!(out.read(&store, &missing, &unit, sum), Read::Miss));
     assert!(out.errors.is_empty());
+}
+
+/// Rule 18 within one build: two puts under one key are one when their kind and bytes are
+/// equal, and of another kind or other bytes the build is refused as the store refuses the
+/// second, the error naming both putters, the key and both content IDs. Which put is first is
+/// the same in whatever order they were pushed (rule 22).
+#[test]
+fn a_second_put_of_other_bytes_under_one_key_is_refused() {
+    let unit = |n: u8| Unit {
+        instance: Instance {
+            code: CodeHash(ContentId([n; 32])),
+            args: ContentId::default(),
+            settings: crate::Settings(ContentId::default()),
+        },
+        backend: Backend::Cranelift { speed: false },
+        arch: Arch::X86_64,
+        item: item(u32::from(n)),
+    };
+    let (first, then) = (unit(1), unit(2));
+    let (a, b) = (InstanceKey(ContentId([11; 32])), InstanceKey(ContentId([12; 32])));
+    let (by_a, by_b) = (By::node(a, &first), By::node(b, &then));
+    let key = blaze_cas::Key(ContentId([9; 32]));
+    let side = keys::side(&ContentId([8; 32]));
+    let names = |of: Of| match of {
+        Of::Function(it) if it == a => Some("first_fn"),
+        Of::Function(it) if it == b => Some("then_fn"),
+        _ => None,
+    };
+    let finished = |puts: &[(By, Key, Kind, &[u8])]| {
+        let mut out = Out::default();
+        for &(by, key, kind, bytes) in puts {
+            out.put(by, key, kind, bytes.to_vec());
+        }
+        out.finish(names)
+    };
+
+    let equal = finished(&[(by_a, key, Kind::Code, &[1, 2, 3]), (by_b, side, Kind::Debug, &[4]), (by_b, key, Kind::Code, &[1, 2, 3])]);
+    assert!(equal.errors.is_empty(), "{:?}", equal.errors);
+    let mut keys = vec![key, side];
+    keys.sort();
+    assert_eq!(equal.puts.iter().map(|it| it.key).collect::<Vec<_>>(), keys);
+
+    let other = [(by_a, key, Kind::Code, &[1, 2, 3][..]), (by_b, key, Kind::Code, &[1, 2, 4][..])];
+    let (forward, backward) = (finished(&other), finished(&[other[1], other[0]]));
+    assert_eq!(forward.puts, backward.puts, "the push order decides nothing");
+    assert_eq!(forward.errors, backward.errors, "the push order decides nothing");
+    assert_eq!(forward.puts.len(), 1);
+    assert_eq!(forward.errors.len(), 1, "{:?}", forward.errors);
+    let refused = &forward.errors[0];
+    let (kept, given) = (blaze_cas::content_of(&[1, 2, 3]), blaze_cas::content_of(&[1, 2, 4]));
+    let (kept, given) = if by_a < by_b { (kept, given) } else { (given, kept) };
+    let parts = ["`first_fn`".to_owned(), "`then_fn`".to_owned(), format!("{key:?}"), format!("{kept:?}"), format!("{given:?}")];
+    for part in &parts {
+        assert!(refused.what.contains(part.as_str()), "{} does not name {part}", refused.what);
+    }
+    assert!(refused.what.contains("refused"), "{}", refused.what);
+
+    let kinds = finished(&[(by_a, key, Kind::Code, &[1, 2, 3]), (by_b, key, Kind::Debug, &[1, 2, 3])]);
+    assert_eq!(kinds.errors.len(), 1, "another kind under one key is refused too: {:?}", kinds.errors);
+    assert!(kinds.errors[0].what.contains("Debug") && kinds.errors[0].what.contains("Code"), "{}", kinds.errors[0].what);
+}
+
+fn test_static(id: u32) -> DescribedStatic<u32, u32> {
+    DescribedStatic {
+        item: static_item(id),
+        instance: ContentId::default(),
+        value: ContentId::of("blaze v2 test value 1", &[id as u8]),
+        mutable: false,
+        thread_local: false,
+        section: None,
+        origin: Origin::Member(Package::new("app")),
+        symbol: None,
+        name: format!("app::S{id}"),
+        refs: Vec::new(),
+    }
+}
+
+/// A static's definition is kept under a key of how many references it has and the kind of
+/// each, as a function's is ([`placed`]): a template laid out for other places is another.
+#[test]
+fn a_static_definition_key_covers_its_reference_count_and_kinds() {
+    let described = test_static(1);
+    let callee = Target::Function(InstanceKey(ContentId([2; 32])));
+    let one = definition(&described, std::slice::from_ref(&callee));
+    assert_ne!(definition(&described, &[]), one, "the count of references");
+    assert_ne!(definition(&described, &[callee.clone(), callee]), one, "the count of references");
+    assert_ne!(definition(&described, &[Target::Data(ContentId([3; 32]))]), one, "a reference's kind");
+    assert_ne!(definition(&described, &[Target::Direct(InstanceKey(ContentId([2; 32])))]), one, "a reference's kind");
+    assert_eq!(
+        definition(&described, &[Target::Function(InstanceKey(ContentId([7; 32])))]),
+        one,
+        "which target is at a place is not covered, as a template takes any"
+    );
+}
+
+/// Two statics that put other bytes under one key are each named by their path, through the
+/// walk's names ([`names_of`]).
+#[test]
+fn a_statics_refused_put_names_it_by_its_path() {
+    let spec = policy(OptLevel::O0, Mode::Output).choose(&Origin::Member(Package::new("app")), None).unwrap().first;
+    let (a, b): (StaticId, StaticId) = ((static_item(1), ContentId::default()), (static_item(2), ContentId::default()));
+    let mut map = blaze_hash::HashMap::new_in(Global);
+    for (id, at) in [(1, a), (2, b)] {
+        map.insert(at, StaticNode::<Machine> { value: id, described: test_static(id), spec: spec.clone(), refs: Vec::new() });
+    }
+    let statics = Sorted::of(map);
+    let nodes = Sorted::<InstanceKey, Node<Machine>>::default();
+    let unit = Unit {
+        instance: Instance { code: CodeHash(ContentId([1; 32])), args: ContentId::default(), settings: spec.settings() },
+        backend: spec.backend,
+        arch: Arch::X86_64,
+        item: static_item(1),
+    };
+    let key = blaze_cas::Key(ContentId([9; 32]));
+    let mut out = Out::default();
+    out.put(By::static_(a, &unit), key, Kind::Code, vec![1]);
+    out.put(By::static_(b, &unit), key, Kind::Code, vec![2]);
+    let finished = out.finish(names_of(&nodes, Some(&statics)));
+    assert_eq!(finished.errors.len(), 1, "{:?}", finished.errors);
+    let what = &finished.errors[0].what;
+    assert!(what.contains("the static `app::S1`") && what.contains("the static `app::S2`"), "{what}");
+}
+
+/// A store-keyed template the memo already keeps another of is refused, never instantiated,
+/// and the build's error names the memo's and the compile's.
+#[test]
+fn a_store_keyed_memo_put_of_another_template_is_refused() {
+    let (program, policy) = (program(), policy(OptLevel::O0, Mode::Output));
+    let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    // alloc: a test's templates
+    let templates: Vec<Template> = cold.puts.iter().filter_map(|it| blob::decode(&it.bytes).ok()).collect();
+    let first = templates[0].clone();
+    let second = templates.iter().find(|it| **it != first).expect("a build of two templates").clone();
+    let memo = Memo::new();
+    let key = blaze_cas::Key(ContentId([9; 32]));
+    let unit = Unit {
+        instance: Instance { code: CodeHash(ContentId([1; 32])), args: ContentId::default(), settings: crate::Settings(ContentId::default()) },
+        backend: Backend::Cranelift { speed: false },
+        arch: Arch::X86_64,
+        item: item(1),
+    };
+    let by = By::node(InstanceKey(ContentId([11; 32])), &unit);
+    // An earlier build of the memo, which kept `first` under `key`.
+    let mut earlier = Out::default();
+    assert!(earlier.keyed(&memo, by, &unit, key, first.clone()).is_some());
+    assert!(earlier.keyed(&memo, by, &unit, key, first).is_some(), "an equal template is the kept one");
+    assert!(earlier.finish(|_| Some("f")).errors.is_empty());
+    let mut out = Out::default();
+    assert!(out.keyed(&memo, by, &unit, key, second).is_none(), "another template is never instantiated");
+    let finished = out.finish(|_| Some("f"));
+    assert_eq!(finished.errors.len(), 1, "{:?}", finished.errors);
+    let what = &finished.errors[0].what;
+    assert!(what.contains("the memo already kept") && what.contains("`f`"), "{what}");
+}
+
+/// A release compile whose template is another than the one the memo already keeps under
+/// its blob key (an earlier build's, of other bytes) fails the build, which puts nothing.
+#[test]
+fn a_release_compile_of_other_bytes_than_the_memos_under_its_key_fails_the_build() {
+    let (program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
+    let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    // alloc: a test's templates
+    let templates: Vec<(Key, Template)> =
+        cold.puts.iter().filter_map(|it| Some((it.key, blob::decode(&it.bytes).ok()?))).collect();
+    assert!(templates.len() > 1, "{templates:?}");
+    // The earlier build's: each key with another key's template.
+    let memo = Memo::new();
+    for (key, template) in &templates {
+        let other = templates.iter().map(|it| &it.1).find(|it| *it != template).expect("two templates");
+        assert!(memo.put_keyed(*key, other.clone()).is_ok());
+    }
+    let errors = build(&program, &Machine::default(), &policy, &memo, &Store::default()).unwrap_err();
+    assert!(errors.iter().any(|it| it.what.contains("the memo already kept")), "{errors:?}");
+    assert!(errors.iter().all(|it| it.what.contains("rule 18")), "{errors:?}");
+}
+
+/// A release compile's key covers the bodies each import builds in: an edit of one moves no
+/// import's instance key, but its export, which the importer's code holds, is another.
+#[test]
+fn a_release_key_covers_the_bodies_its_imports_build_in() {
+    let instance = Instance {
+        code: CodeHash(ContentId([1; 32])),
+        args: ContentId::default(),
+        settings: crate::Settings(ContentId::default()),
+    };
+    let g = InstanceKey(ContentId([2; 32]));
+    let imports = Imports { imported: vec![g], ..Imports::default() };
+    let refs = [Target::Function(g)];
+    let g_refs: [&[Target]; 1] = [&[]];
+    let (h, edited) = ([InstanceKey(ContentId([3; 32]))], [InstanceKey(ContentId([4; 32]))]);
+    let key = |built_in: &[InstanceKey]| release_template_key(&instance, &[], &refs, &imports, &[g], &g_refs, &[built_in]).1;
+    assert_ne!(key(&h), key(&edited), "an edit of `h`, which `g` builds in");
+    assert_ne!(key(&h), key(&[]), "`g` building `h` in or not");
+    assert_eq!(key(&h), key(&h));
+}
+
+/// A release compile's key covers each import's unit as its export is built: in a live
+/// build's tier-up the import is named by its first tier's key, while its export is built at
+/// the next tier's settings (another opt level), so a key of the name alone would keep `f`'s
+/// code made against the other export (rule 18).
+#[test]
+fn a_release_key_covers_its_imports_settings() {
+    let instance = Instance {
+        code: CodeHash(ContentId([1; 32])),
+        args: ContentId::default(),
+        settings: crate::Settings(ContentId::default()),
+    };
+    let g = InstanceKey(ContentId([2; 32]));
+    let imports = Imports { imported: vec![g], ..Imports::default() };
+    let refs = [Target::Function(g)];
+    let g_refs: [&[Target]; 1] = [&[]];
+    let g_at = |settings: u8| {
+        Instance { code: CodeHash(ContentId([2; 32])), args: ContentId::default(), settings: crate::Settings(ContentId([settings; 32])) }
+            .key()
+    };
+    let key = |unit: InstanceKey| release_template_key(&instance, &[], &refs, &imports, &[unit], &g_refs, &[&[]]).1;
+    assert_ne!(key(g_at(2)), key(g_at(3)), "`g`'s export at opt level 2 and 3, under one walk name");
+    assert_eq!(key(g_at(3)), key(g_at(3)));
 }
 
 /// A stored template's function, read in place, is the one decoding it and instantiating
@@ -747,16 +1075,28 @@ fn a_mismatched_profile_is_counted_compiled_or_stored() {
         coverage: None,
         profile,
     };
-    let mismatched = function(Some(crate::Profiled::Used { mismatched: true }));
+    let mismatched = function(Some(crate::Profiled::Used { mismatched: true, applied: false }));
     let template = crate::template::Template::of(&mismatched, &[], &[]).unwrap();
     let stored = stored_function(&crate::blob::encode(&template), key, &[]).unwrap().unwrap();
     assert_eq!(stored, mismatched);
     let mut out = Out::default();
-    for it in [mismatched, stored, function(Some(crate::Profiled::Used { mismatched: false })), function(None)] {
-        out.push(CodeHash(ContentId::default()), it);
+    for it in [mismatched, stored, function(Some(crate::Profiled::Used { mismatched: false, applied: true })), function(None)] {
+        out.push(CodeHash(ContentId::default()), ItemKey(ContentId::default()), it);
     }
-    assert_eq!(out.stats.profile_mismatched, 2);
     assert_eq!(out.functions.len(), 4);
+    let profile = ContentId([5; 32]);
+    out.profiled(crate::settings::Pgo::Use(profile));
+    let counts = super::ProfileCounts { used: 3, mismatched: 2, applied: 1 };
+    assert_eq!(out.stats.profiles.into_iter().collect::<Vec<_>>(), [(profile, counts)]);
+    // Built with a profile in a build of none is an error, not counts filed under no profile.
+    let mut out = Out::default();
+    let named = ItemKey(ContentId([2; 32]));
+    out.push(CodeHash(ContentId::default()), named, function(Some(crate::Profiled::Used { mismatched: false, applied: true })));
+    out.profiled(crate::settings::Pgo::None);
+    assert!(out.stats.profiles.is_empty());
+    assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+    // It names the first function built with the profile, by key and item (rule 16).
+    assert_eq!((out.errors[0].unit, out.errors[0].item), (key, named), "{:?}", out.errors);
 }
 
 #[test]
@@ -769,6 +1109,7 @@ fn a_level_without_its_backend_names_the_function() {
 }
 
 mod flight;
+mod folded;
 mod later;
 mod masks;
 mod pieces;
@@ -798,4 +1139,370 @@ fn a_key_the_image_s_describer_shares_is_the_image_s_with_its_references() {
     assert_eq!((owner(shared), owner(callee)), (Some(Owner::Dependency), Some(Owner::Dependency)));
     let made = built.functions.iter().find(|it| it.key == shared).unwrap();
     assert!(made.relocs.targets().contains(&Target::Direct(callee)), "{:?}", made.relocs);
+}
+
+/// D2: `f2` imports `f4` at O3, and `f4` builds `f6` in (MIR inlining; `f6` itself is never
+/// imported). An edit of `f6` moves no key `f2` names, but `f4`'s export, which `f2`'s code
+/// holds, is another: `f2` is compiled again, never taken from the store as before the edit.
+#[test]
+fn an_edit_of_a_body_an_import_builds_in_compiles_its_importer_again() {
+    let (mut program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
+    program.function(4, 0x44, &[6]).built_in = vec![0];
+    program.function(6, 0x66, &[]);
+    let mut store = Store::default();
+    let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &store).unwrap();
+    assert!(cold.stats.imported > 0, "an O3 build imports");
+    store.keep(&cold.puts);
+
+    program.functions.get_mut(&6).unwrap().body = 0x67;
+    let machine = Machine::default();
+    build(&program, &machine, &policy, &Memo::new(), &store).unwrap();
+    let bodies = machine.emitted_bodies.lock();
+    assert!(bodies.contains(&0x22), "`f2`, which imports `f4`, which builds `f6` in: {bodies:?}");
+    assert!(!bodies.contains(&0x55), "`f5`, which imports nothing edited: {bodies:?}");
+}
+
+/// Another build's summary kept under the flight key this build claims a summary by, and
+/// not equal to this build's, fails the build naming the function: the key misses an input
+/// of the summary (rule 18), and neither is taken.
+#[test]
+fn another_summary_under_a_summarys_flight_key_fails_the_build() {
+    let (program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
+    let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    let other: Vec<(InstanceKey, Summary)> = (cold.puts.iter())
+        .filter(|it| it.kind == Kind::Query)
+        .filter_map(|it| Some((InstanceKey(it.key.0), serde_json::from_slice::<Summary>(&it.bytes).ok()?)))
+        .map(|(flight, summary)| (flight, Summary { size: summary.size + 1, ..summary }))
+        .collect();
+    assert!(!other.is_empty(), "an O3 build keeps its summaries");
+    let memo = Memo::new();
+    assert!(memo.flights().keep_summaries(other).is_empty());
+    let errors = build(&program, &Machine::default(), &policy, &memo, &Store::default()).unwrap_err();
+    let refused = |it: &CodegenError| it.what.contains("the function `f") && it.what.contains("its summary and another build's");
+    assert!(errors.iter().any(refused), "{errors:?}");
+}
+
+/// A fold candidate is prepared before its stored key is claimed; when another build of the
+/// memo landed another shape under that key, the function is refused naming both shapes
+/// (rule 18), never given the landed template.
+#[test]
+fn a_fold_candidate_prepared_as_another_shape_than_the_landed_fails_the_build() {
+    let (program, mut policy) = (program(), policy(OptLevel::O0, Mode::Output));
+    policy.fold = true;
+    let memo = Memo::new();
+    build(&program, &Machine::default(), &policy, &memo, &Store::default()).unwrap();
+    let salted = Machine { salt: 1, ..Machine::default() };
+    let errors = build(&program, &salted, &policy, &memo, &Store::default()).unwrap_err();
+    assert!(errors.iter().any(|it| it.what.contains("this build prepared it as shape")), "{errors:?}");
+    assert_eq!(salted.emitted.load(Ordering::Relaxed), 0, "nothing landed is compiled again");
+}
+
+/// A chain of `count` functions from 1, each calling the next, all of `body` and `drop_glue`.
+fn chain(count: u32, drop_glue: bool, limit: u32) -> Program {
+    let mut program = Program { recursion_limit: Some(limit), ..Program::default() };
+    for id in 1..=count {
+        let calls: &[u32] = if id < count { &[id + 1] } else { &[] };
+        program.function(id, 0x77, calls).code_of = Some(1);
+        program.bodies.insert(id, (7, drop_glue));
+    }
+    program.functions.get_mut(&1).unwrap().symbol = Some("main".to_owned());
+    program
+}
+
+/// rustc's recursion limit: one body repeated past the limit along one path stops the build
+/// with an error naming that instance and its path's head, and what it reaches is never walked;
+/// drop glue counts a quarter; one body reached by many paths, once each, is no repeat.
+#[test]
+fn a_body_repeated_past_the_limit_along_its_path_stops_the_build() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let run = |program: &Program| {
+        Build::new(&Machine::default(), program, &policy, &Memo::new()).run(&[(1, member())], &Store::default())
+    };
+    // f1 is the body's first; f6 is its sixth along the path, a repeat of 5, past 4.
+    let errors = run(&chain(30, false, 4)).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].item, item(6));
+    assert_eq!(errors[0].what, "f6 repeats its body 5 times on its path from f1, past 4 of f1's crate");
+    let deep = chain(30, false, 4);
+    run(&deep).unwrap_err();
+    assert!(deep.reached.lock().iter().flatten().all(|it| *it <= 6), "nothing past f6 is walked");
+
+    // Drop glue: a repeat of 20 counts 5, past 4; 30 functions of it within 128 build.
+    let errors = run(&chain(30, true, 4)).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].item, item(21));
+    assert!(run(&chain(30, true, 128)).is_ok());
+    assert!(run(&chain(30, false, 128)).is_ok());
+
+    // One body called by f1 thirty times over, each a repeat of one.
+    let mut wide = Program { recursion_limit: Some(1), ..Program::default() };
+    let callees: Vec<u32> = (2..=31).collect();
+    wide.function(1, 0x11, &callees).symbol = Some("main".to_owned());
+    wide.bodies.insert(1, (7, false));
+    for id in callees {
+        wide.function(id, 0x22, &[]);
+        wide.bodies.insert(id, (7, false));
+    }
+    assert!(run(&wide).is_ok());
+}
+
+/// Which crate's limit: a path is held to its head's crate's, and a function of another crate
+/// that is not generic and not `#[inline]` heads a path of its own, held to the larger limit, as
+/// rustc collects it in that crate's own build.
+#[test]
+fn a_dependency_is_held_to_its_own_limit_where_rustc_collects_it_in_its_own_build() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let run = |program: &Program| {
+        Build::new(&Machine::default(), program, &policy, &Memo::new()).run(&[(1, member())], &Store::default())
+    };
+    // `main` (crate 0, the default 128) calls `d::run` (crate 1, 256, not generic), which runs a
+    // chain of 200 repeats of one generic body of crate 1: d's build collects it, within 256.
+    let mut program = chain(202, false, 128);
+    program.bodies.remove(&1);
+    program.bodies.remove(&2);
+    program.crates.insert(2, (1, true));
+    program.limits.insert(1, 256);
+    for id in 3..=202 {
+        program.crates.insert(id, (1, false));
+    }
+    assert!(run(&program).is_ok(), "d's chain of 200 under d's limit of 256");
+    // The same `d::run` were it generic or `#[inline]`: the bin collects it, under 128.
+    program.crates.insert(2, (1, false));
+    let errors = run(&program).unwrap_err();
+    assert_eq!(errors[0].what, "f132 repeats its body 129 times on its path from f1, past 128 of f1's crate");
+
+    // A generic chain of a dependency with a limit of 8, reached from the root's code (limit
+    // 128): the root's build collects it, held to the root's limit.
+    let mut generic = chain(30, false, 128);
+    generic.limits.insert(1, 8);
+    for id in 2..=30 {
+        generic.crates.insert(id, (1, false));
+    }
+    assert!(run(&generic).is_ok(), "held to the root's 128, not the dependency's 8");
+    generic.recursion_limit = Some(8);
+    assert!(run(&generic).is_err(), "the root's own limit of 8 holds it");
+}
+
+/// rustc's path, not the shortest: the walk checks the limit depth first in root and reference
+/// order, claiming each instance's references as it lists them, never on the path it described
+/// an instance by first. The reviewer's typenum shape:
+/// `trait Nat { fn go(); } impl<N: Nat> Nat for S<N> { fn go() { N::go() } }`,
+/// `impl Pad for Z { fn pad() { <S60 as Nat>::go() } } impl<N: Pad> Pad for S<N> { fn pad() { N::pad() } }`,
+/// `fn main() { <S75 as Pad>::pad(); <S130 as Nat>::go(); }`. rustc claims `S60..S1::go` on the
+/// `pad` path (depth 0 to 59), and the `go` chain from `S130` stops at `S60` at depth 69: it
+/// builds. Level by level, `S60::go` is reached first by the `go` chain, and `S1::go` is 129 deep.
+#[test]
+fn the_limit_counts_on_rustcs_depth_first_path_not_the_shortest() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let (pad, go) = (|k: u32| 1000 + k, |k: u32| 2000 + k);
+    let mut program = Program { recursion_limit: Some(128), ..Program::default() };
+    program.function(1, 0x11, &[pad(75), go(130)]).symbol = Some("main".to_owned());
+    for k in 0..=75 {
+        let calls = if k == 0 { [go(60)] } else { [pad(k - 1)] };
+        program.function(pad(k), 0x22, &calls).code_of = Some(1);
+        program.bodies.insert(pad(k), (if k == 0 { 3 } else { 2 }, false));
+    }
+    for k in 0..=130 {
+        let calls: &[u32] = if k == 0 { &[] } else { &[go(k - 1)] };
+        program.function(go(k), 0x33, calls).code_of = Some(1);
+        program.bodies.insert(go(k), (if k == 0 { 5 } else { 4 }, false));
+    }
+    let built = Build::new(&Machine::default(), &program, &policy, &Memo::new()).run(&[(1, member())], &Store::default());
+    assert!(built.is_ok(), "rustc builds it: {:?}", built.err());
+
+    // Past the limit on rustc's path too (`S200::go` from `main` first): refused.
+    for k in 131..=200 {
+        program.function(go(k), 0x33, &[go(k - 1)]).code_of = Some(1);
+        program.bodies.insert(go(k), (4, false));
+    }
+    program.function(1, 0x11, &[go(200), pad(75)]);
+    let errors = Build::new(&Machine::default(), &program, &policy, &Memo::new())
+        .run(&[(1, member())], &Store::default())
+        .unwrap_err();
+    assert_eq!(errors[0].item, item(go(71)), "{errors:?}");
+}
+
+/// rustc's root order for the check (`collect_roots`): free items in definition order, every
+/// static among them, `lang_start` last. The reviewer's program, with limit 128:
+/// `#[used] static WARM: fn() = <S60 as Nat>::go; fn main() { <S130 as Nat>::go(); }`. rustc
+/// visits `WARM` first and claims `S60..S1::go` at depths 0 to 59; `S130::go` then stops at
+/// `S60` at depth 69: it builds. From the C `main` first, `S1::go` is 129 deep. A static no
+/// code names and no linker keeps is a root of rustc's all the same: described for what it
+/// refers to, never built, nor what only it reaches.
+#[test]
+fn a_static_defined_before_main_is_walked_first_as_rustc_does() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let go = |k: u32| 2000 + k;
+    let (start, main, warm) = (1, 2, 3);
+    let mut program = Program { recursion_limit: Some(128), ..Program::default() };
+    program.function(start, 0x11, &[main]).symbol = Some("main".to_owned());
+    program.function(main, 0x12, &[go(130)]);
+    program.function(warm, 0x13, &[go(60)]);
+    for k in 0..=130 {
+        let calls: &[u32] = if k == 0 { &[] } else { &[go(k - 1)] };
+        program.function(go(k), 0x33, calls);
+        program.bodies.insert(go(k), (if k == 0 { 5 } else { 4 }, false));
+    }
+    let warm_static = 1;
+    program.statics.insert(warm_static, (0x01, None));
+    program.static_calls.insert(warm_static, vec![go(60)]);
+    let rustcs = [
+        CheckRoot::Static(warm_static),
+        CheckRoot::Function(main, member()),
+        CheckRoot::Function(start, member()),
+    ];
+    let run = |statics: &[u32], check: &[CheckRoot<u32, u32>]| {
+        Build::new(&Machine::default(), &program, &policy, &Memo::new()).run_with_statics(
+            &[(start, member())],
+            statics,
+            check,
+            &Store::default(),
+        )
+    };
+    // `#[used]`: a root of the build too.
+    let built = run(&[warm_static], &rustcs);
+    assert!(built.is_ok(), "rustc builds it: {:?}", built.err());
+    // The build's order, the C `main` first: refused at `S1::go`, 129 deep.
+    let errors = run(&[warm_static], &[]).unwrap_err();
+    assert_eq!(errors[0].item, item(go(1)), "{errors:?}");
+
+    // A plain static: walked by the check, never built.
+    let built = run(&[], &rustcs).expect("rustc builds it");
+    assert_eq!(built.stats.statics, 0, "nothing names `WARM`: it is not built");
+    assert_eq!(built.stats.instances, 133, "the C `main`, `main` and `S130..S0::go`");
+
+    // A static of a function nothing else reaches: the check walks it, the build leaves both out.
+    program.static_calls.insert(warm_static, vec![warm]);
+    let built = Build::new(&Machine::default(), &program, &policy, &Memo::new())
+        .run_with_statics(&[(start, member())], &[], &rustcs, &Store::default())
+        .expect("rustc builds it");
+    assert_eq!(built.stats.statics, 0);
+    assert_eq!(built.stats.instances, 133, "`warm`, reached only from `WARM`, is not built");
+}
+
+/// Only the check's last pass errs: an instance the first pass places past the limit, because
+/// the instance whose path claims it first in rustc's order was deferred by the levels and not
+/// yet described, is claimed within the limit once that one is, and the build succeeds.
+/// Limit 2; `main` calls `a1` then `x0`; `a1 → a2 → a3 → a4 → d` (none counted); `x0 → x1 →
+/// x2 → [d, y]`, `d → y`, the `x`s, `d` and `y` one body. The levels reach `d` and `y` through
+/// `x2` first, 3 deep, and defer both. The first check stops at `d` on the `a` path and places
+/// `y` 3 deep on the `x` path, past 2; once `d` is described, the `a` path claims `y` 1 deep.
+#[test]
+fn a_refusal_of_an_early_pass_is_gone_once_the_deferred_are_described() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let (main, a, x, d, y) = (1, |k: u32| 10 + k, |k: u32| 20 + k, 30, 31);
+    let mut program = Program { recursion_limit: Some(2), ..Program::default() };
+    program.function(main, 0x11, &[a(1), x(0)]).symbol = Some("main".to_owned());
+    for k in 1..=4 {
+        let next = if k == 4 { d } else { a(k + 1) };
+        program.function(a(k), 0x20 + k as u8, &[next]);
+    }
+    program.function(x(0), 0x30, &[x(1)]);
+    program.function(x(1), 0x31, &[x(2)]);
+    program.function(x(2), 0x32, &[d, y]);
+    program.function(d, 0x33, &[y]);
+    program.function(y, 0x34, &[]);
+    for id in [x(0), x(1), x(2), d, y] {
+        program.bodies.insert(id, (7, false));
+    }
+    let run = |program: &Program| {
+        Build::new(&Machine::default(), program, &policy, &Memo::new()).run(&[(main, member())], &Store::default())
+    };
+    let built = run(&program).expect("the last pass refuses nothing");
+    assert_eq!(built.stats.instances, 10);
+    // Without the `a` path, `d` and `y` are 3 deep on rustc's path too: refused.
+    program.function(main, 0x11, &[x(0)]);
+    let errors = run(&program).unwrap_err();
+    let mut refused: Vec<ItemKey> = errors.iter().map(|it| it.item).collect();
+    refused.sort_unstable();
+    let mut want = vec![item(d), item(y)];
+    want.sort_unstable();
+    assert_eq!(refused, want, "{errors:?}");
+}
+
+/// A release compile that says it built in a code none of its own bodies, its imports or
+/// theirs is fails the build naming the function, the code and its template's key, never
+/// keeps the template under a key that misses that body (rule 18).
+#[test]
+fn a_release_compile_that_built_in_unkept_code_fails_the_build() {
+    let (mut program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
+    program.function(4, 0x44, &[6]).built_in = vec![0];
+    program.function(6, 0x66, &[]);
+    // Only `f2` is of the body the knob strays.
+    program.functions.get_mut(&3).unwrap().body = 0x33;
+    // As D2 builds it, each import's code and what it builds in is kept: `f2` imports `f4`,
+    // whose export builds `f6` in.
+    let plain = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    assert!(plain.stats.imported > 0, "`f2` imports `f4`");
+    let stray = CodeHash(ContentId([0x77; 32]));
+    let machine = Machine { unkept: Some((0x22, stray)), ..Machine::default() };
+    let errors = build(&program, &machine, &policy, &Memo::new(), &Store::default()).unwrap_err();
+    let named = |it: &CodegenError| {
+        it.what.contains("`f2` built in the code") && it.what.contains(&format!("{stray:?}")) && it.what.contains("template's key")
+    };
+    assert!(errors.iter().any(named), "{errors:?}");
+    assert!(errors.iter().all(|it| !it.what.contains("`f3`")), "{errors:?}");
+}
+
+/// The store check compiles a release template the store gave again, with its imports'
+/// exports: one that built in code its key does not hold is refused there too, named as the
+/// store check's, never compared with the stored bytes as if it were the same compile.
+#[test]
+fn the_release_store_check_refuses_code_its_key_does_not_hold() {
+    let (mut program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
+    program.functions.get_mut(&3).unwrap().body = 0x33;
+    let mut store = Store::default();
+    let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &store).unwrap();
+    store.keep(&cold.puts);
+    let stray = CodeHash(ContentId([0x77; 32]));
+    let machine = Machine { unkept: Some((0x22, stray)), ..Machine::default() };
+    let memo = Memo::new();
+    let mut checked = Build::new(&machine, &program, &policy, &memo).verify_store(blaze_store_check::Setting::ALL);
+    let errors = checked.run(&[(1, member())], &store).unwrap_err();
+    let named = |it: &CodegenError| {
+        it.what.starts_with(blaze_store_check::VAR) && it.what.contains("`f2` built in the code") && it.what.contains(&format!("{stray:?}"))
+    };
+    assert!(errors.iter().any(named), "{errors:?}");
+}
+
+/// In a whole live build's tier-up an import is named by its first tier, which an edit of
+/// its own opt level leaves as it was; its export is built at the new level. `f2`, which
+/// imports `f4`, is compiled again, never taken from the store as made against `f4`'s other
+/// export (rule 18).
+#[test]
+fn a_tier_up_recompiles_its_importer_when_an_imports_tier_changes() {
+    let live = |memchr: Option<OptLevel>| {
+        let mut policy = policy(OptLevel::O0, Mode::Live);
+        let at = |level| Override { opt_level: Some(level), ..Override::default() };
+        policy.profile.packages.insert("*".to_owned(), at(OptLevel::O3));
+        if let Some(level) = memchr {
+            policy.profile.packages.insert("memchr".to_owned(), at(level));
+        }
+        policy
+    };
+    let mut program = program();
+    program.functions.get_mut(&2).unwrap().origin = Origin::Dependency(Package::new("dep"));
+    program.functions.get_mut(&4).unwrap().origin = Origin::Dependency(Package::new("memchr"));
+    let mut store = Store::default();
+    let (machine, memo, policy) = (Machine::default(), Memo::new(), live(None));
+    let mut first = Build::new(&machine, &program, &policy, &memo);
+    store.keep(&first.run(&[(1, member())], &store).unwrap().puts);
+    machine.emitted_bodies.lock().clear();
+    let up = first.tier_up(&store).unwrap();
+    assert_eq!(up.replaced.len(), 2, "`f2` and `f4` tier up");
+    let mut tiered = machine.emitted_bodies.lock().clone();
+    tiered.sort_unstable();
+    assert_eq!(tiered, [0x22, 0x44], "the tier-up compiles `f2` and `f4`, nothing else");
+    assert!(up.stats.imported > 0, "`f2` imports `f4`");
+    store.keep(&up.puts);
+
+    let (machine, memo, policy) = (Machine::default(), Memo::new(), live(Some(OptLevel::O2)));
+    let mut next = Build::new(&machine, &program, &policy, &memo);
+    next.run(&[(1, member())], &store).unwrap();
+    assert!(machine.emitted_bodies.lock().is_empty(), "the first tier is as it was");
+    let again = next.tier_up(&store).unwrap();
+    assert!(again.stats.imported > 0, "`f2` still imports `f4`: its decision is as it was");
+    let bodies = machine.emitted_bodies.lock();
+    assert!(bodies.contains(&0x44), "`f4`, at O2 now: {bodies:?}");
+    assert!(bodies.contains(&0x22), "`f2`, whose import `f4` is built at O2 now: {bodies:?}");
 }

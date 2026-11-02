@@ -1,6 +1,8 @@
 //! A registry served from memory: the index read and cached as cargo reads and caches it, and
 //! packages fetched, checked and unpacked where cargo unpacks them.
 
+#![feature(allocator_api)]
+
 use std::{
     cell::Cell,
     io::Write,
@@ -9,6 +11,7 @@ use std::{
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_registry::{
     Context, Locked, Package, Registry, SourceConfig, SourceDef, Sources,
     download::{From, checksum, crate_key, crate_url, parse_checksum, unpack_package_in},
@@ -24,7 +27,7 @@ const BASE: &str = "https://index.example.com/";
 /// Files by URL, each with an ETag, and every request asked of it.
 #[derive(Default)]
 struct Server {
-    files: Mutex<HashMap<String, (Vec<u8>, String)>>,
+    files: Mutex<HashMap<String, (Vec<u8>, String), Global>>,
     asked: Mutex<Vec<(String, Vec<(String, String)>)>>,
 }
 

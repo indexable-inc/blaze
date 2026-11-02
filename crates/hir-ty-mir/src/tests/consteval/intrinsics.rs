@@ -193,7 +193,7 @@ fn type_name() {
 }
 
 const TYPE_INFO: &str = r#"
-    //- minicore: option, send, slice, matches
+    //- minicore: option, send, slice, matches, phantom_data
     #![feature(lang_items)]
     #[lang = "type_id"]
     pub struct TypeId { t: (u64, u64) }
@@ -212,6 +212,8 @@ const TYPE_INFO: &str = r#"
     pub const fn field_representing_type_name(id: TypeId) -> &'static str;
     #[rustc_intrinsic]
     pub const fn field_representing_type_offset(id: TypeId) -> usize;
+    #[rustc_intrinsic]
+    pub const fn field_offset<F>() -> usize;
     #[rustc_intrinsic]
     pub const fn type_id_size_of(id: TypeId) -> Option<usize>;
     #[rustc_intrinsic]
@@ -251,6 +253,11 @@ const TYPE_INFO: &str = r#"
         is_splatted: bool, splatted_index: u8,
     }
     pub enum Abi { Named(&'static str), ExternRust, ExternC }
+    #[lang = "field_representing_type"]
+    /// Zero-sized, as core's (`library/core/src/field.rs`).
+    pub struct FieldRepresentingType<T: ?Sized, const VARIANT: u32, const FIELD: u32> {
+        _phantom: core::marker::PhantomData<fn(T) -> T>,
+    }
 
     const fn same(a: TypeId, b: TypeId) -> bool {
         a.t.0 == b.t.0 && a.t.1 == b.t.1
@@ -409,6 +416,76 @@ fn type_info_generics_and_fn_ptrs() {
             }};"
         ),
         1503,
+    );
+}
+
+/// A field's id is the id of its field representing type, as rustc makes it: equal to
+/// `TypeId::of::<field_of!(..)>()`, so it is a real type's id at run time too.
+#[test]
+fn type_info_field_ids_are_field_representing_types() {
+    check_number(
+        &format!(
+            "{TYPE_INFO}
+            type Y = FieldRepresentingType<Point<'static>, 0, 1>;
+            const GOAL: usize = {{
+                let point = type_id::<Point<'static>>();
+                same(type_id_field_representing_type(point, 0, 1), type_id::<Y>()) as usize
+                    + !same(type_id_field_representing_type(point, 0, 0), type_id::<Y>()) as usize
+                        * 10
+                    + same(
+                        field_representing_type_actual_type_id(
+                            type_id::<FieldRepresentingType<Shape, 1, 1>>(),
+                        ),
+                        type_id::<u64>(),
+                    ) as usize
+                        * 100
+                    + same(field_representing_type_actual_type_id(type_id::<Y>()), type_id::<u8>())
+                        as usize
+                        * 1000
+            }};"
+        ),
+        1111,
+    );
+}
+
+/// `field_offset::<F>()`, which `Field::OFFSET` is, answers as the field's id does.
+#[test]
+fn type_info_field_offset() {
+    check_number(
+        &format!(
+            "{TYPE_INFO}
+            const GOAL: usize = field_offset::<FieldRepresentingType<Packed, 0, 1>>()
+                + field_offset::<FieldRepresentingType<Packed, 0, 0>>() * 10
+                + (field_offset::<FieldRepresentingType<Point<'static>, 0, 1>>()
+                    == field_representing_type_offset(
+                        type_id_field_representing_type(type_id::<Point<'static>>(), 0, 1),
+                    )) as usize
+                    * 100;"
+        ),
+        104,
+    );
+}
+
+/// A fn pointer type's `#[rustc_splat]` input is reflected (`FnPtr::is_splatted`,
+/// `FnPtr::splatted_index`), and a `#[cfg]`d-out input is not one of its inputs.
+#[test]
+fn type_info_fn_ptr_splat() {
+    check_number(
+        &format!(
+            "{TYPE_INFO}
+            const fn splat(id: TypeId) -> usize {{
+                match type_id_function_ptr(id) {{
+                    Some(f) => 1 + f.is_splatted as usize * 10
+                        + f.splatted_index as usize * 100
+                        + f.inputs.len() * 100000,
+                    None => 0,
+                }}
+            }}
+            const GOAL: usize = splat(type_id::<fn(u8, #[rustc_splat] (u16, u32))>())
+                + splat(type_id::<fn(#[cfg(any())] u8, #[rustc_splat] (u16,))>()) * 1000;"
+        ),
+        // `fn(u8, (u16, u32))`: 2 inputs, the second splatted; the other: 1 input, splatted.
+        200111 + 100011 * 1000,
     );
 }
 
@@ -753,6 +830,81 @@ fn a_constant_read_again_is_not_copied_again() {
         };
         "#,
         3 * 8192,
+    );
+}
+
+#[test]
+fn a_loop_of_calls_reading_a_constant_table_uses_constant_memory() {
+    // The shape of blaze-diagnostics' `MODULES` (checks/attrs/parsers.rs): a table of structs
+    // holding slices of `&str`, read by a `const fn` called in a nested loop, its paths
+    // compared byte by byte. 16384 calls of `path`, each of which would copy `TABLE` (256 KiB
+    // and what it points to) to the heap if a constant read in a callee were copied at every
+    // read: 4 GiB, past the default 1 GiB.
+    check_number(
+        r#"
+        //- minicore: coerce_unsized, index, slice, str
+        struct Entry {
+            path: &'static [&'static str],
+            pad: [u8; 1 << 16],
+        }
+        const PAD: [u8; 1 << 16] = [0; 1 << 16];
+        const TABLE: &[Entry] = &[
+            Entry { path: &["a", "b"], pad: PAD },
+            Entry { path: &["c"], pad: PAD },
+            Entry { path: &["d", "e"], pad: PAD },
+            Entry { path: &["f"], pad: PAD },
+        ];
+        const PATHS: &[&[&str]] = &[&["x"], &["d", "e"]];
+        const fn path(at: usize) -> &'static [&'static str] {
+            TABLE[at].path
+        }
+        const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut i = 0;
+            while i < a.len() {
+                if a[i] != b[i] {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        const fn same_path(a: &[&str], b: &[&str]) -> bool {
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut at = 0;
+            while at < a.len() {
+                if !bytes_eq(a[at].as_bytes(), b[at].as_bytes()) {
+                    return false;
+                }
+                at += 1;
+            }
+            true
+        }
+        const GOAL: u32 = {
+            let mut hits = 0u32;
+            let mut round = 0;
+            while round < 2048 {
+                let mut at = 0;
+                while at < 4 {
+                    let mut i = 0;
+                    while i < PATHS.len() {
+                        if same_path(PATHS[i], path(at)) {
+                            hits += 1;
+                        }
+                        i += 1;
+                    }
+                    at += 1;
+                }
+                round += 1;
+            }
+            hits
+        };
+        "#,
+        2048,
     );
 }
 

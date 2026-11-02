@@ -26,6 +26,9 @@ pub enum Phase {
     Loans,
     /// Where each loan is in scope: NLL's from region values, Polonius's loan liveness.
     Scopes,
+    /// `polonius-flow`'s datalog loan liveness and universal check, inside [`Phase::Scopes`]:
+    /// run only on a body the alpha rejects.
+    Flow,
     /// The loans in scope at each block's entry.
     EntrySets,
     /// The walk over the body: conflicting accesses, moves and uninitialized uses.
@@ -35,7 +38,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    pub const ALL: [Phase; 11] = [
+    pub const ALL: [Phase; 12] = [
         Phase::Setup,
         Phase::Mir,
         Phase::Moves,
@@ -44,6 +47,7 @@ impl Phase {
         Phase::Infer,
         Phase::Loans,
         Phase::Scopes,
+        Phase::Flow,
         Phase::EntrySets,
         Phase::Walk,
         Phase::Errors,
@@ -59,6 +63,7 @@ impl Phase {
             Phase::Infer => "infer",
             Phase::Loans => "loans",
             Phase::Scopes => "scopes",
+            Phase::Flow => "flow",
             Phase::EntrySets => "entry_sets",
             Phase::Walk => "walk",
             Phase::Errors => "errors",

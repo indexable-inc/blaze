@@ -57,7 +57,8 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
    `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer
    lifetimes use the request, revision or image allocator. A global allocation (`Vec::new`,
    `vec![]`, `collect` into a heap `Vec`, `Box::new`, `to_owned`) needs `// alloc: <why>` on its
-   line. `blaze::hot_alloc` enforces this wherever `blaze::hot` is denied. See
+   line. `blaze::implicit_allocator` enforces this, warning everywhere and denied wherever
+   `blaze::hot` is, with `blaze::hot_alloc` for what a call reaches. See
    [docs/v2/plan/design/memory.md](docs/v2/plan/design/memory.md).
 10. **standard-structures**: One choice per need, never a hand-rolled or std stand-in: locks are
     `parking_lot::{Mutex, RwLock}`, held only for a field update and never across a query call; a

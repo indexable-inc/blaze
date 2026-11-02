@@ -11,6 +11,7 @@
 //! `IntegerToPtrTransmutesSuggestion`) (MIT or Apache-2.0).
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     CallableDefId, DefWithBodyId, ItemContainerId, Lookup as _,
@@ -83,7 +84,7 @@ enum Inner {
 /// walk of the body the first time a transmute in it is found, which most bodies never have.
 #[derive(Default)]
 pub(crate) struct CheckTransmutes {
-    inner: HashMap<ExprId, Inner>,
+    inner: HashMap<ExprId, Inner, Global>,
     stack: Vec<(ExprId, Option<Inner>)>,
     /// Whether `inner` is of the body being walked.
     built: bool,

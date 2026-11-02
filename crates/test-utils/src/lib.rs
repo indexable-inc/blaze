@@ -7,6 +7,7 @@
 //! * marks (see the eponymous module).
 
 #![allow(clippy::print_stderr)]
+#![feature(allocator_api)]
 
 mod assert_linear;
 pub mod bench_fixture;

@@ -7,6 +7,7 @@
 
 use blaze_format::cursor::Put;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use cranelift_module::FuncId;
 use cranelift_object::{
     ObjectProduct,
@@ -68,7 +69,7 @@ struct Function {
 pub(super) struct CodeView {
     directory: String,
     files: Vec<String>,
-    file_ids: HashMap<String, u32>,
+    file_ids: HashMap<String, u32, Global>,
     functions: Vec<Function>,
     /// The names of the functions, one after another.
     names: String,

@@ -204,6 +204,7 @@ impl<'db> Ty<'db> {
             IntTy::I32 => types.types.i32,
             IntTy::I64 => types.types.i64,
             IntTy::I128 => types.types.i128,
+            IntTy::Bits(_) => Ty::new(interner, TyKind::Int(i)),
         }
     }
 
@@ -216,6 +217,7 @@ impl<'db> Ty<'db> {
             UintTy::U32 => types.types.u32,
             UintTy::U64 => types.types.u64,
             UintTy::U128 => types.types.u128,
+            UintTy::Bits(_) => Ty::new(interner, TyKind::Uint(ui)),
         }
     }
 
@@ -796,6 +798,7 @@ impl<'db> Ty<'db> {
                 hir_def::builtin_type::BuiltinInt::I32 => types.types.i32,
                 hir_def::builtin_type::BuiltinInt::I64 => types.types.i64,
                 hir_def::builtin_type::BuiltinInt::I128 => types.types.i128,
+                hir_def::builtin_type::BuiltinInt::Bits(w) => Ty::new_int(interner, IntTy::Bits(w)),
             },
             hir_def::builtin_type::BuiltinType::Uint(uint) => match uint {
                 hir_def::builtin_type::BuiltinUint::Usize => types.types.usize,
@@ -804,6 +807,9 @@ impl<'db> Ty<'db> {
                 hir_def::builtin_type::BuiltinUint::U32 => types.types.u32,
                 hir_def::builtin_type::BuiltinUint::U64 => types.types.u64,
                 hir_def::builtin_type::BuiltinUint::U128 => types.types.u128,
+                hir_def::builtin_type::BuiltinUint::Bits(w) => {
+                    Ty::new_uint(interner, UintTy::Bits(w))
+                }
             },
             hir_def::builtin_type::BuiltinType::Float(float) => match float {
                 hir_def::builtin_type::BuiltinFloat::F16 => types.types.f16,
@@ -826,6 +832,7 @@ impl<'db> Ty<'db> {
                 rustc_type_ir::IntTy::I32 => hir_def::builtin_type::BuiltinInt::I32,
                 rustc_type_ir::IntTy::I64 => hir_def::builtin_type::BuiltinInt::I64,
                 rustc_type_ir::IntTy::I128 => hir_def::builtin_type::BuiltinInt::I128,
+                rustc_type_ir::IntTy::Bits(w) => hir_def::builtin_type::BuiltinInt::Bits(w),
             }),
             TyKind::Uint(uint) => hir_def::builtin_type::BuiltinType::Uint(match uint {
                 rustc_type_ir::UintTy::Usize => hir_def::builtin_type::BuiltinUint::Usize,
@@ -834,6 +841,7 @@ impl<'db> Ty<'db> {
                 rustc_type_ir::UintTy::U32 => hir_def::builtin_type::BuiltinUint::U32,
                 rustc_type_ir::UintTy::U64 => hir_def::builtin_type::BuiltinUint::U64,
                 rustc_type_ir::UintTy::U128 => hir_def::builtin_type::BuiltinUint::U128,
+                rustc_type_ir::UintTy::Bits(w) => hir_def::builtin_type::BuiltinUint::Bits(w),
             }),
             TyKind::Float(float) => hir_def::builtin_type::BuiltinType::Float(match float {
                 rustc_type_ir::FloatTy::F16 => hir_def::builtin_type::BuiltinFloat::F16,

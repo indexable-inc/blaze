@@ -12,7 +12,15 @@
 //! same way ([`written`]). What else it read (files, variables of the shell, a listing) the
 //! host that ran it traced, and the result is found and kept by exactly those through
 //! [`blaze_usercode::index`]. `blaze-macro-eval`, which runs macro code, keys, finds and puts
-//! its expansions with what is here ([`keeping`]).
+//! its expansions with what is here, through the [`Keeps`] its daemon made and lent it.
+//!
+//! The key, what the expansion read and its shape are written against the calling crate's
+//! roots ([`roots`]: its package, `CARGO_MANIFEST_DIR`, and its `OUT_DIR`), so the same call of
+//! the same macro on the same crate in another checkout is found (docs/v2/plan/lanes/store.md,
+//! "Portable keys"). Every expansion is kept against where those roots are, and is given to
+//! another checkout only once a second one expanded it the same (`blaze_usercode::roots::verify`);
+//! one whose output, read variables or given strings still hold a root once ported ([`left`],
+//! a literal the macro made of `CARGO_MANIFEST_DIR`) is kept here alone.
 //!
 //! Not kept: an expansion that asked the database about a span (its text, file or line),
 //! since the key does not say what it was told; one whose output has an anchor or a context
@@ -32,7 +40,10 @@ pub mod verdict;
 
 use std::{
     cell::Cell,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use base_db::Env;
@@ -42,18 +53,23 @@ use blaze_usercode::{
     Given, RunKind,
     index::{self, FindError},
     inputs,
+    roots::{Role, RoleSet, Roots, Rooted},
     trace::Inputs,
 };
 use hir_expand::proc_macro::ProcMacroKind;
 use span::{Span, SpanAnchor, SyntaxContext};
 
 pub use self::env::{Environment, SET};
-pub use self::puts::{Published, Put, publish, put, take_puts};
+pub use self::puts::{Keep, Published, Put, put, take_puts};
+// Only `Keeping::publish` and `Keeps::publish` publish from outside: a durable put published
+// any other way would neither be the daemon's nor move its epoch. The tests' own publish:
+#[cfg(test)]
+use self::puts::publish;
 use crate::bridge::wire::{self, Parts};
 
 /// The version of what a macro is given and gives back that expansions are kept under: a
 /// change to either bumps it, so nothing kept before is found.
-const ABI: u32 = 8;
+const ABI: u32 = 9;
 
 /// What the content ID of a macro's library is made with.
 pub const LIBRARY: &str = "blaze v2 proc-macro library 1";
@@ -94,12 +110,90 @@ pub struct Expansions {
     pub environment: Arc<Environment>,
 }
 
-struct Installed {
-    expansions: Expansions,
-    mode: Mode,
+/// Where a daemon keeps its expansions, and how: made once by the daemon ([`Keeping::new`]) and
+/// lent to every reader, so each of two daemons in one process reads its own store.
+pub struct Keeping {
+    pub expansions: Expansions,
+    pub mode: Mode,
+    /// How many records that retract a value verified across checkouts this daemon published
+    /// ([`Keeping::retractions_now`]).
+    pub retractions: Retractions,
+    /// The [`Keep::Durable`] puts of its expansions not published yet ([`Keeping::put`]): this
+    /// daemon's own, so another daemon in the process never publishes them into its store,
+    /// and taken only by the store's owner ([`Keeping::publish`]).
+    durable: crossbeam_queue::SegQueue<Put>,
 }
 
-static INSTALLED: OnceLock<Installed> = OnceLock::new();
+/// What a warm front end is kept by, besides its units and config: whether a value verified
+/// across checkouts that it may have been given has been retracted since (rule 18). Such a
+/// value is a tracked expansion and, through `hir_def::deps`, a crate's image; neither is asked
+/// again while its database is kept, so a record put later would not reach it. The store of
+/// expansions has one writer, its daemon (`blaze-cargo`'s `daemon.rs` opens it once), so every
+/// record is one this daemon publishes ([`Keeping::publish`]), and each publish of one moves
+/// the epoch once the record is in the store; a kept front end is lowered into only while
+/// the epoch is the one it was made at.
+///
+/// The invariant: a front end stamped `e` (the epoch its lowering read before it expanded
+/// anything) has seen every record whose bump is at most `e`. A bump comes after its record
+/// is readable, and the lowering reads the epoch before it reads the store, so a record
+/// counted in `e` was there for every lookup it made; a record whose bump is past `e` makes
+/// the epoch another, and the front end is not reused. Bumping before the record is in the
+/// store would break it: a lowering that read the new epoch in between would be given the
+/// retracted value and kept under the stamp that counts its record.
+///
+/// Values that arrive from elsewhere never bump it. That is safe because no retraction record
+/// arrives: the daemon opens the store of expansions with no layers (`daemon.rs`, `layers:
+/// Vec::new()`), and the global cache's fetches (`blaze-cargo`'s `serve/unit/script/global.rs`)
+/// bring a build script's shape slots and results, each proven public by
+/// `blaze_global::Rule::run`, never a record (a value verified across checkouts is refused
+/// before any store keeps it, `blaze_global::public::fetchable`). So every record in this store
+/// went through [`Keeping::publish`]. A remote layer, or a fetch of records into this store, is
+/// a change that must bump the epoch for each record it brings, after the record is readable;
+/// without that, a kept front end would keep a value another machine's record retracted.
+///
+/// Whether the front end was given the value the record retracts is not asked (a record is
+/// rare: another checkout's copy differed), so this is one atomic load per lowering, with
+/// nothing that grows.
+#[derive(Default)]
+pub struct Retractions {
+    /// How many records were published: a front end kept at another epoch may have been given
+    /// a value retracted since.
+    epoch: AtomicU64,
+}
+
+impl Retractions {
+    /// Counts a record, once it is in the store ([`Retractions`]'s invariant).
+    pub fn retracted(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The epoch now.
+    pub fn now(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+}
+
+/// Whether a reader's expansions are kept: in a daemon's store, or nowhere, for a named reason.
+pub enum Keeps {
+    In(Keeping),
+    /// Nothing is kept or found (a bench, a test of the evaluator alone): why, as each expansion
+    /// that ran says it of its reads.
+    Nothing(&'static str),
+}
+
+/// What a reader that needs a daemon's store was told by a [`Keeps::Nothing`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NotKept {
+    pub why: &'static str,
+}
+
+impl std::fmt::Display for NotKept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "proc-macro expansions are not kept here: {}", self.why)
+    }
+}
+
+impl std::error::Error for NotKept {}
 
 /// The inputs of an expansion as they are now: the machine's files, and the environment it is
 /// sent ([`Environment::seen`]). A variable a shape names is looked up where it is, so a hit
@@ -165,45 +259,178 @@ pub fn checked(bytes: &[u8]) -> ContentId {
     ContentId::of("blaze v2 proc-macro checked expansion 1", bytes)
 }
 
-/// Keeps every proc-macro expansion from here on in `expansions`. Says why not when [`CACHE`]
-/// has a value that is not a mode, or it was installed before.
-pub fn install(expansions: Expansions) -> Result<(), String> {
-    let var = |name: &str| match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not UTF-8")), // alloc: error path
+impl Keeping {
+    /// Keeps every proc-macro expansion of its daemon in `expansions`, in the mode [`CACHE`]
+    /// says. Says why not when [`CACHE`] has a value that is not a mode.
+    pub fn new(expansions: Expansions) -> Result<Keeping, String> {
+        let var = |name: &str| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not UTF-8")), // alloc: error path
+        };
+        let mode = Mode::of(var(CACHE)?.as_deref())?;
+        Ok(Keeping { expansions, mode, retractions: Retractions::default(), durable: crossbeam_queue::SegQueue::new() })
+    }
+
+    /// [`Retractions::now`]: what a warm front end is lowered into only while it is the epoch
+    /// the front end was made at.
+    pub fn retractions_now(&self) -> u64 {
+        self.retractions.now()
+    }
+
+    /// Leaves `put` for the store's owner: a [`Keep::Durable`] one in this daemon's own queue,
+    /// which the owner's next [`Keeping::publish`] takes, never in a thread's buffer
+    /// ([`puts::put`]). So it waits on no thread (a task that gave way, a pool thread no task
+    /// ran on, a fiber that moved), and no task's take of its puts carries it off: only the
+    /// owner takes it, and gives its ticket to the jobs not ended in the same call. The put
+    /// happens before the task that made it ends, which is before its job's end publishes
+    /// (`plane_finished`), so the job that made it is among them.
+    pub fn put(&self, put: Put) {
+        match put.keep {
+            Keep::Durable { .. } => self.durable.push(put),
+            _ => puts::put(put),
+        }
+    }
+
+    /// [`puts::publish`] of `puts` and every durable put of this daemon's not published yet
+    /// ([`Keeping::put`]), from the store's one owner. When the batch held a durable put, the
+    /// epoch moves after the publish ([`Retractions::retracted`], whose invariant this keeps):
+    /// a lowering that reads the new epoch finds the record, and one that read the old epoch is
+    /// stamped with it and not reused. It moves whatever the put's outcome: a record's result
+    /// key is readable before its shape slots are kept (`blaze_usercode::index::keep_in`), so a
+    /// put refused as corrupt or past `MOST_SHAPES` may still have made its record visible, and
+    /// a front end stamped before it must not be kept. An extra bump costs only a rebuilt front
+    /// end; a missing one would keep a retracted value.
+    pub fn publish(&self, store: &mut blaze_cas::Store, puts: Vec<Put>) -> Published {
+        self.publish_then(store, puts, |_, _| {})
+    }
+
+    /// [`Keeping::publish`], calling `before_bump` with the store and the epoch once the puts
+    /// are in it and before the epoch moves: what a test checks the order by.
+    fn publish_then(
+        &self,
+        store: &mut blaze_cas::Store,
+        mut puts: Vec<Put>,
+        before_bump: impl FnOnce(&blaze_cas::Store, u64),
+    ) -> Published {
+        puts.extend(std::iter::from_fn(|| self.durable.pop()));
+        let durable = puts.iter().any(|put| matches!(put.keep, Keep::Durable { .. }));
+        let published = puts::publish(store, puts);
+        if durable {
+            before_bump(store, self.retractions.now());
+            self.retractions.retracted();
+        }
+        published
+    }
+
+    /// The hash of the values the names of `shape` (an `ExpansionReads::Traced` shape) have
+    /// now, for an expansion given the variables `env`: what `hir_def::deps` files a crate's
+    /// image by. The same hash the expansion reported when its values were these.
+    pub fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String> {
+        reads_with(self.expansions.environment.passed(), Some(&self.expansions.store), env, shape)
+    }
+}
+
+/// What the shape of the reads of an expansion verified across checkouts starts with
+/// ([`verified_reads`]): then the store's key of the record that would retract it
+/// ([`blaze_usercode::index::depends_key`]), then the shape.
+const VERIFIED_SHAPE: &[u8] = b"blaze v2 verified expansion reads 1\0";
+
+/// The reads an expansion found verified across checkouts reports ([`index::Found::Hit`]'s
+/// `verified`): its `shape` and `values`, and whether the store has `depends`, the record that
+/// retracts it. Its values change once the record is put, so what `hir_def::deps` filed by
+/// them is made again, and the expansion is looked up again (and not given the retracted
+/// value).
+pub fn verified_reads(depends: &blaze_cas::Key, shape: &[u8], values: ContentId) -> (Vec<u8>, ContentId) {
+    // alloc: once per verified hit, the shape the query reporting it owns
+    let shape = [VERIFIED_SHAPE, &depends.0.0[..], shape].concat();
+    (shape, retracted_or_not(values, false))
+}
+
+fn retracted_or_not(values: ContentId, retracted: bool) -> ContentId {
+    blaze_ids::Hasher::new("blaze v2 verified expansion values 1").id(&values).update(&[u8::from(retracted)]).finish()
+}
+
+/// [`reads_in`], with the store that says whether a verified expansion's reads
+/// ([`verified_reads`]) were retracted since: none (a test that keeps nothing) refuses such a
+/// shape, naming why.
+fn reads_with(
+    passed: &[(String, String)],
+    store: Option<&Reader>,
+    env: &Env,
+    shape: &[u8],
+) -> Result<ContentId, String> {
+    let Some(rest) = shape.strip_prefix(VERIFIED_SHAPE) else {
+        return plain_reads(passed, env, shape);
     };
-    let mode = Mode::of(var(CACHE)?.as_deref())?;
-    // alloc: error path
-    INSTALLED.set(Installed { expansions, mode }).map_err(|_| "proc-macro expansions were installed twice".to_owned())
-}
-
-/// Where blaze-macro-eval keeps the expansions it keys, and how.
-#[derive(Clone, Copy)]
-pub struct Keeping {
-    pub expansions: &'static Expansions,
-    pub mode: Mode,
-}
-
-/// Where expansions are kept: `None` before [`install`], as in a bench, which keeps nothing.
-pub fn keeping() -> Option<Keeping> {
-    INSTALLED.get().map(|it| Keeping { expansions: &it.expansions, mode: it.mode })
-}
-
-/// The hash of the values the names of `shape` (an `ExpansionReads::Traced` shape) have now,
-/// for an expansion given the variables `env`: what `hir_def::deps` files a crate's image by.
-/// The same hash the expansion reported when its values were these. Says why not before
-/// [`install`]: no expansion was kept, so no shape is of one.
-pub fn reads_now(env: &Env, shape: &[u8]) -> Result<ContentId, String> {
-    let Some(installed) = INSTALLED.get() else {
-        return Err("a proc-macro expansion's reads were asked before expansions were installed".to_owned()); // alloc: error path
+    let Some((depends, inner)) = rest.split_first_chunk::<32>() else {
+        return Err("a verified expansion's reads with no record key".to_owned()); // alloc: error path
     };
-    reads_in(installed.expansions.environment.passed(), env, shape)
+    let Some(store) = store else {
+        // alloc: error path
+        return Err("a verified expansion's reads are worked out with the store, to see whether it was retracted; none is here".to_owned());
+    };
+    let values = plain_reads(passed, env, inner)?;
+    let guard = blaze_cas::enter();
+    let depends = blaze_cas::Key(ContentId(*depends));
+    let retracted = store.get(&guard, &depends).map_err(|corrupt| corrupt.to_string())?.is_some();
+    Ok(retracted_or_not(values, retracted))
 }
 
-/// [`reads_now`] for expansions passed `passed`.
-fn reads_in(passed: &[(String, String)], env: &Env, shape: &[u8]) -> Result<ContentId, String> {
-    let mut now = Seen { passed, call: env, made: None, none: inputs::Env::default() };
+impl Keeps {
+    /// Where its expansions are kept, or the [`NotKept`] a reader that needs a store fails
+    /// with.
+    pub fn keeping(&self) -> Result<&Keeping, NotKept> {
+        match self {
+            Keeps::In(keeping) => Ok(keeping),
+            Keeps::Nothing(why) => Err(NotKept { why }),
+        }
+    }
+
+    /// [`Keeping::reads_now`] of its daemon's expansions. A [`Keeps::Nothing`] kept no
+    /// expansion, so no shape is of one: that is its [`NotKept`], said.
+    pub fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String> {
+        // alloc: error path
+        self.keeping().map_err(|not| not.to_string())?.reads_now(env, shape)
+    }
+
+    /// [`Keeping::retractions_now`] of its daemon's expansions; a [`Keeps::Nothing`] gave no
+    /// verified value, so its epoch never moves.
+    pub fn retractions_now(&self) -> u64 {
+        match self {
+            Keeps::In(keeping) => keeping.retractions_now(),
+            Keeps::Nothing(_) => 0,
+        }
+    }
+
+    /// [`Keeping::publish`]; a [`Keeps::Nothing`] has no durable puts of its own, so `puts`
+    /// as they are ([`puts::publish`]).
+    pub fn publish(&self, store: &mut blaze_cas::Store, puts: Vec<Put>) -> Published {
+        match self {
+            Keeps::In(keeping) => keeping.publish(store, puts),
+            Keeps::Nothing(_) => puts::publish(store, puts),
+        }
+    }
+
+    /// Counts a record published some other way than [`Keeps::publish`] (a build script's,
+    /// `blaze-cargo`'s runs): [`Retractions::retracted`].
+    pub fn retracted(&self) {
+        if let Keeps::In(keeping) = self {
+            keeping.retractions.retracted();
+        }
+    }
+}
+
+/// [`Keeping::reads_now`] for expansions passed `passed`: what a test that keeps no expansions
+/// works a shape's values out with. The shape is written against the roots of the call's
+/// crate ([`roots`]), as the expansion's was.
+pub fn reads_in(passed: &[(String, String)], env: &Env, shape: &[u8]) -> Result<ContentId, String> {
+    reads_with(passed, None, env, shape)
+}
+
+fn plain_reads(passed: &[(String, String)], env: &Env, shape: &[u8]) -> Result<ContentId, String> {
+    let mut seen = Seen { passed, call: env, made: None, none: inputs::Env::default() };
+    let mut now = Rooted::new(roots(env), &mut seen);
     match index::values(shape, &mut now) {
         Ok(Some(values)) => Ok(values),
         // A directory that is no longer one: no value it had is this.
@@ -211,6 +438,8 @@ fn reads_in(passed: &[(String, String)], env: &Env, shape: &[u8]) -> Result<Cont
         Err(FindError::NotAShape { why, .. }) => Err(format!("a shape that does not read: {why}")), // alloc: error path
         Err(FindError::Inputs(unreadable)) => Err(format!("{unreadable}")), // alloc: error path
         Err(FindError::Corrupt(corrupt)) => Err(format!("{corrupt}")), // alloc: error path
+        // Never from `values`, which reads one shape: named all the same.
+        Err(FindError::TooManyShapes { run }) => Err(format!("run {run:?} has more than {} shapes", index::MOST_SHAPES)), // alloc: error path
     }
 }
 
@@ -278,6 +507,26 @@ pub fn number<T: PartialEq>(all: &mut Vec<T>, it: T) -> u32 {
     at as u32
 }
 
+/// The roots an expansion for a crate given the variables `env` is written against
+/// ([`blaze_usercode::roots`]): the crate's package (`CARGO_MANIFEST_DIR`) and its `OUT_DIR`,
+/// as cargo gives them. A crate with neither has none: its paths stay absolute.
+pub fn roots(env: &Env) -> Roots<'_> {
+    let get = |name: &str| env.iter().find(|it| it.0 == name).map(|it| it.1);
+    let named = [(Role::Package, get("CARGO_MANIFEST_DIR")), (Role::OutDir, get("OUT_DIR"))];
+    Roots::new(named.into_iter().filter_map(|(role, path)| Some((role, path?))))
+}
+
+/// The roots `roots` (the calling crate's, [`roots`], with their spellings) still in a string
+/// `call`'s key is given once ported: its directory and its crate's variables
+/// ([`blaze_usercode::roots::Roots::left`]). Such a key is this checkout's string, so the
+/// expansion is kept here alone. Asked as an expansion is kept, not as one is found.
+pub fn left(call: &Call<'_>, roots: &Roots<'_>) -> RoleSet {
+    call.env
+        .iter()
+        .map(|(_, value)| roots.left(value.as_bytes()))
+        .fold(roots.left(call.current_dir.as_bytes()), RoleSet::union)
+}
+
 /// One call of a macro, as its key is made of it.
 pub struct Call<'a> {
     pub name: &'a str,
@@ -309,15 +558,21 @@ fn kind_byte(kind: ProcMacroKind) -> u8 {
 /// each tree's columns, into buffers kept per thread: a key allocates nothing.
 ///
 /// [`RunKey::given`]: blaze_usercode::RunKey::given
+///
+/// The directory it runs in and the crate's variables are written against the crate's
+/// [`roots`], which the key is given the roles of, so the call in another checkout has the
+/// same key.
 pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
     let mut spans = Spans::shelved();
     let mut given = Given::new(RunKind::ProcMacro);
+    let roots = roots(call.env);
     given
         .part("name", call.name.as_bytes())
         .part("kind", &[kind_byte(call.kind)])
         .part("abi", &ABI.to_le_bytes())
         .id("toolchain", toolchain)
-        .part("dir", call.current_dir.as_bytes());
+        .roots(&roots)
+        .ported("dir", call.current_dir.as_bytes(), &roots);
     with_scratch(|scratch| {
         let Scratch { parts, input, attrs, shapes, .. } = scratch;
         parts.clear();
@@ -346,7 +601,7 @@ pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
             .part("attrs columns", attrs)
             .part("span parts", shapes.as_slice());
     });
-    given.env_keyed(call.env.iter().map(|(name, value)| (name.as_bytes(), value.as_bytes())));
+    given.env_keyed_ported(call.env.iter().map(|(name, value)| (name.as_bytes(), value.as_bytes())), roots);
     (given, spans)
 }
 

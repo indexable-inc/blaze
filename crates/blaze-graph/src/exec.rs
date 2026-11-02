@@ -19,13 +19,14 @@ use std::{
     ptr::NonNull,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::Instant,
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::{Cache, MemError, Pooled, Slab, Tag as MemTag, frame};
 use blaze_protocol::events::{Event, Record};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -370,6 +371,9 @@ struct Run<R: Runner> {
     /// Its handle in the owner's [`Table`], as bits: what its `Done` names.
     at: u64,
     live: UnsafeCell<Option<Live<R::Work>>>,
+    /// The job that posted it last, as a profiler numbers it ([`crate::sched::fiber::observe_spawner`]):
+    /// written by [`post`] before the pool's queue hands it over, which orders it before the read.
+    spawner: AtomicU64,
 }
 
 // SAFETY: `live` has one reader or writer at a time: the owner while it fills the slot, then
@@ -453,7 +457,7 @@ impl<R: Runner> Table<R> {
     ) -> Result<u64, MemError> {
         let header = Header::new(run_pooled::<R>);
         let live = UnsafeCell::new(Some(live));
-        let run = self.cache.try_alloc(Run { header, ctx, at: u64::MAX, live })?;
+        let run = self.cache.try_alloc(Run { header, ctx, at: u64::MAX, live, spawner: AtomicU64::new(0) })?;
         let handle = self.live.try_insert(Slot { run, tag, pool, near })?;
         let slot = self.live.get_mut(handle).expect("a run just placed is in the table");
         slot.run.at = handle.to_bits();
@@ -827,8 +831,8 @@ impl<W: Send + 'static> Scheduler<W> {
         let owner = Owner {
             plane,
             predict,
-            heard: HashMap::default(),
-            works: HashMap::default(),
+            heard: HashMap::new_in(Global), // alloc: the executor's state, for its life
+            works: HashMap::new_in(Global), // alloc: the executor's state, for its life
             ctx,
             table,
             throttle,
@@ -901,9 +905,9 @@ struct Entry<W> {
 struct Owner<R: Runner, P, M> {
     plane: Plane<M>,
     predict: P,
-    heard: HashMap<RequestId, Sender<Heard>>,
+    heard: HashMap<RequestId, Sender<Heard>, Global>, // alloc: the executor's state, for its life
     /// The work of each node added and not settled.
-    works: HashMap<NodeId, Entry<R::Work>>,
+    works: HashMap<NodeId, Entry<R::Work>, Global>, // alloc: the executor's state, for its life
     ctx: &'static Ctx<R>,
     table: Table<R>,
     throttle: Throttle,
@@ -998,7 +1002,7 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                 for Task { mut spec, kind, work } in tasks {
                     self.predict.predict(kind, spec.key).apply(&mut spec);
                     // A node added twice is refused by the plane: the first keeps its work.
-                    if let std::collections::hash_map::Entry::Vacant(it) = self.works.entry(spec.id) {
+                    if let blaze_hash::hash_map::Entry::Vacant(it) = self.works.entry(spec.id) {
                         it.insert(Entry { request, kind, key: spec.key, work: Some(work) });
                         new.push(spec.id);
                     }
@@ -1205,6 +1209,7 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
 /// Runs `run` on the scheduler's pool near `near` (on a fast group when it is critical).
 #[allow(clippy::needless_pass_by_value, reason = "posting transfers the run's sole ownership to the pool job")]
 fn post<R: Runner>(ctx: &Ctx<R>, near: Option<u32>, critical: bool, run: Ran<R>) {
+    run.run().spawner.store(crate::sched::spawner(), Ordering::Relaxed);
     // SAFETY: the slot's header is its first field (`Run` is `repr(C)`) and runs `run_pooled`;
     // the slot stays in the scheduler's pool, unmoved, until its `Done` is taken, and `run`,
     // moved here, was its one name.
@@ -1221,6 +1226,7 @@ fn post<R: Runner>(ctx: &Ctx<R>, near: Option<u32>, critical: bool, run: Ran<R>)
 unsafe fn run_pooled<R: Runner>(header: NonNull<Header>) {
     let run = Ran(header.cast::<Run<R>>());
     let (ctx, critical) = (run.run().ctx, run.live().critical);
+    crate::sched::job_begins(run.run().spawner.load(Ordering::Relaxed));
     let span = pool::JobSpan::begin(std::any::type_name::<R>());
     let result = catch_unwind(AssertUnwindSafe(|| measured(&ctx.runner, run.live())));
     drop(span);
@@ -1281,6 +1287,7 @@ mod tests {
     };
 
     use blaze_hash::{HashMap, HashSet};
+    use std::alloc::Global;
     use blaze_ids::rng::SplitMix64;
     use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
     use crossbeam_channel::bounded;
@@ -1337,7 +1344,7 @@ mod tests {
 
     /// The database a test's work puts each key's value in before its `Done`, as real work
     /// does; the scheduler's memo reads it.
-    type Db = Arc<Mutex<HashMap<Key, Outcome>>>;
+    type Db = Arc<Mutex<HashMap<Key, Outcome, Global>>>; // alloc: a test's model
 
     fn scheduler(workers: usize) -> (Scheduler<Work>, Db) {
         scheduler_on(&Topology::flat(workers)).0
@@ -1565,7 +1572,7 @@ mod tests {
             };
             assert!(drive(&mut machine, nodes, &work, &mut |_| {}, None).unwrap());
             let ran = ran.into_inner();
-            let on = |nodes: &[u32]| -> HashSet<ThreadId> {
+            let on = |nodes: &[u32]| -> HashSet<ThreadId, Global> { // alloc: a test's model
                 ran.iter().filter(|(id, _)| nodes.contains(id)).map(|&(_, at)| at).collect()
             };
             assert_eq!(ran.len(), 4);
@@ -1585,7 +1592,7 @@ mod tests {
     #[test]
     fn shared_keys_run_once_for_two_requests() {
         let (scheduler, db) = scheduler(4);
-        let runs: Arc<Mutex<HashMap<u8, u32>>> = Arc::default();
+        let runs: Arc<Mutex<HashMap<u8, u32, Global>>> = Arc::default(); // alloc: a test's model
         let keyed = |id: u32, key: u8| {
             let (runs, db) = (Arc::clone(&runs), Arc::clone(&db));
             let work: Work = Arc::new(move || {

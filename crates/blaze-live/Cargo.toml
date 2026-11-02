@@ -90,3 +90,7 @@ todo = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
 str_to_string = "warn"
+
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+let_underscore_must_use = "warn"

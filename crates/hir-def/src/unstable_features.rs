@@ -9,6 +9,7 @@ use std::fmt;
 
 use base_db::{Crate, Db};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use intern::{Symbol, sym};
 
 impl fmt::Debug for UnstableFeatures {
@@ -59,7 +60,7 @@ macro_rules! define_unstable_features {
     ( $( $feature:ident, )* ) => {
         #[derive(Clone, Default)]
         pub struct UnstableFeatures {
-            all: HashSet<Symbol>,
+            all: HashSet<Symbol, Global>,
 
             $( pub $feature: bool, )*
         }
@@ -101,4 +102,8 @@ define_unstable_features! {
     generic_const_exprs,
     sized_hierarchy,
     forced_keywords,
+    // blaze's compile-time reflection (`docs/v2/plan/design/comptime.md`).
+    blaze_comptime,
+    // blaze's native verification clauses (`docs/v2/plan/lanes/verus.md`).
+    blaze_verify,
 }

@@ -4,6 +4,7 @@
 use std::fmt;
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_query::db::{Durability, Setter as _};
 use triomphe::Arc;
 use crate::FileId;
@@ -49,10 +50,10 @@ impl FileChange {
         self.crate_graph = Some(graph);
     }
     pub fn apply(self, db: &mut Db) -> Option<CratesIdMap> {
-        let _p = tracing::info_span!("FileChange::apply").entered();
+        let _p = tracing::info_span!(target: "blaze", "FileChange::apply").entered();
         if let Some(roots) = self.roots {
-            let mut local_roots = HashSet::default();
-            let mut library_roots = HashSet::default();
+            let mut local_roots = HashSet::new_in(Global);
+            let mut library_roots = HashSet::new_in(Global);
             for (idx, root) in roots.into_iter().enumerate() {
                 let root_id = SourceRootId(idx as u32);
                 if root.is_library {

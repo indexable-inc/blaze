@@ -17,6 +17,7 @@ use std::sync::Arc;
 use base_db::{Crate, Db};
 use blaze_dbsp::{Pos, SliceHasher};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::db::Setter;
 use hir_def::{BuiltinDeriveImplId, ImplId, ModuleId, TraitId, nameres::crate_def_map};
@@ -97,11 +98,11 @@ pub struct SliceDirectory {
     #[returns(copy)]
     pub krate: Crate,
     #[returns(ref)]
-    pub traits: Arc<HashMap<TraitId, TraitImplsSlice>>,
+    pub traits: Arc<HashMap<TraitId, TraitImplsSlice, Global>>,
     #[returns(ref)]
-    pub heads: Arc<HashMap<Head, InherentSlice>>,
+    pub heads: Arc<HashMap<Head, InherentSlice, Global>>,
     #[returns(ref)]
-    pub names: Arc<HashMap<Name, CandidateSlice>>,
+    pub names: Arc<HashMap<Name, CandidateSlice, Global>>,
     #[returns(ref)]
     pub body_modules: Arc<[ModuleId]>,
 }
@@ -110,7 +111,7 @@ pub struct SliceDirectory {
 #[blaze_query::input(singleton, debug)]
 pub struct ImplSlices {
     #[returns(ref)]
-    pub crates: Arc<HashMap<Crate, SliceDirectory>>,
+    pub crates: Arc<HashMap<Crate, SliceDirectory, Global>>,
 }
 
 /// The directory of `krate`. A crate the impls maintainer never went over, and which no
@@ -322,11 +323,11 @@ pub(super) fn head_identity(db: &Db, hasher: &mut Hasher, head: Head) {
         S::Bool => 0,
         S::Char => 1,
         S::Int(it) => {
-            hasher.update(&[it as u8]);
+            hasher.update(&[it.code()]);
             2
         }
         S::Uint(it) => {
-            hasher.update(&[it as u8]);
+            hasher.update(&[it.code()]);
             3
         }
         S::Float(it) => {
@@ -445,9 +446,9 @@ pub(crate) fn candidate_rows_hash(db: &Db, name: Name, rows: &CandidateRows) -> 
 #[derive(Default)]
 pub(crate) struct Published {
     directory: Option<SliceDirectory>,
-    traits: HashMap<TraitId, TraitImplsSlice>,
-    heads: HashMap<Head, InherentSlice>,
-    names: HashMap<Name, CandidateSlice>,
+    traits: HashMap<TraitId, TraitImplsSlice, Global>,
+    heads: HashMap<Head, InherentSlice, Global>,
+    names: HashMap<Name, CandidateSlice, Global>,
     body_modules: Arc<[ModuleId]>,
     /// Keys first seen in this write, which the directory gains at [`Published::finish`].
     new_traits: bool,
@@ -606,7 +607,7 @@ fn register(db: &mut Db, krate: Crate, directory: SliceDirectory) {
             all.set_crates(db).to(Arc::new(crates));
         }
         None => {
-            let mut crates = HashMap::default();
+            let mut crates = HashMap::new_in(Global);
             crates.insert(krate, directory);
             // alloc: the singleton's map, once per database
             _ = ImplSlices::new(db, Arc::new(crates));

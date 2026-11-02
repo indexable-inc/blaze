@@ -70,10 +70,15 @@ use crate::{
     struct_tail_raw,
 };
 
-pub use hir_def::{VariantId, expr_store::MissingBodyItemKind, hir::UnsafeBinderCastKind};
+pub use hir_def::{
+    VariantId,
+    expr_store::{ComptimeForm, MissingBodyItemKind},
+    hir::UnsafeBinderCastKind,
+};
 pub use hir_expand::BuiltinChild;
 pub use hir_ty::{
-    AssocTypeFailure, GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind,
+    AssocTypeFailure, CycleQuery, GenericArgsProhibitedReason, IncorrectGenericsLenKind,
+    MissingLifetimeKind,
     PatternTypeUnsupported, ReturnKind, StructPathDef, StructPathFound,
     const_param_ty::ConstParamTyReason,
     consteval::CreateConstError,
@@ -151,11 +156,15 @@ diagnostics![AnyDiagnostic<'db> ->
     ArrayPatternWithoutFixedLength,
     AwaitOutsideOfAsync,
     IntLiteralTooLarge,
+    VerifyRefused,
     BorrowckError,
     BorrowckSkipped,
+    DropCheckOverflow<'db>,
     BreakOutsideOfLoop,
     UnlabeledJumpInLabeledBlock,
     AsyncCoroutinesNotSupported,
+    ComptimeUnsupported,
+    ReflectedMemberUnmet<'db>,
     ConstCheckError,
     ConstEvalFailed,
     ConstImpure,
@@ -182,6 +191,7 @@ diagnostics![AnyDiagnostic<'db> ->
     MissingSelfDefaultParams,
     ObjectWithoutTrait,
     PatternTypeNotLowered,
+    QueryCycle,
     InactiveCode,
     IncoherentImpl,
     IncorrectCase,
@@ -260,6 +270,8 @@ diagnostics![AnyDiagnostic<'db> ->
     TraitSolverError<'db>,
     YieldOutsideCoroutine,
     ReturnOutsideFunction,
+    TailCallRefused,
+    TailCallTrackCaller,
     UnsafeBinderCastOfNonBinder<'db>,
     InvalidConstArg,
     NotAStructPath<'db>,
@@ -292,6 +304,16 @@ pub struct UnlabeledJumpInLabeledBlock {
 #[derive(Debug)]
 pub struct AsyncCoroutinesNotSupported {
     pub expr: InFile<ExprOrPatPtr>,
+}
+
+/// `#![feature(blaze_comptime)]` syntax (`docs/v2/plan/design/comptime.md`) at `node`: without
+/// the feature (`feature_enabled` false), or with it where blaze's type checker does not check
+/// `form` yet.
+#[derive(Debug)]
+pub struct ComptimeUnsupported {
+    pub node: InFile<SyntaxNodePtr>,
+    pub form: ComptimeForm,
+    pub feature_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -362,6 +384,14 @@ pub struct AwaitOutsideOfAsync {
 #[derive(Debug)]
 pub struct IntLiteralTooLarge {
     pub node: InFile<AstPtr<ast::Literal>>,
+}
+
+/// A `blaze_verify` specification clause or named return type lowering refused
+/// (docs/v2/plan/lanes/verus.md): `node` is the clause (`requires ..`) or the return type.
+#[derive(Debug)]
+pub struct VerifyRefused {
+    pub node: InFile<SyntaxNodePtr>,
+    pub why: hir_def::expr_store::VerifyRefusal,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -571,6 +601,18 @@ pub struct BorrowckError {
 
 pub use hir_ty_borrowck::{Applicability as BorrowckApplicability, Sublevel as BorrowckSublevel};
 
+/// E0320 "overflow while adding drop-check rules for `{ty}`" of a local of a body, noting
+/// "overflowed on `{overflow_ty}`": the drop check (`hir_ty::dropck`) of `ty` went deeper than
+/// the crate's recursion limit `limit`. rustc's `DropCheckOverflow`, reported by its borrow
+/// checker's liveness.
+#[derive(Debug)]
+pub struct DropCheckOverflow<'db> {
+    pub node: InFile<SyntaxNodePtr>,
+    pub ty: Type<'db>,
+    pub overflow_ty: Type<'db>,
+    pub limit: u32,
+}
+
 /// A note or help of a [`BorrowckError`].
 #[derive(Debug)]
 pub struct BorrowckChild {
@@ -609,6 +651,21 @@ fn borrowck_parts(
         node.map(|it| view::to_node(it, root))
     };
     let expr = |expr| node_of(MirSpan::ExprId(expr));
+    // The statement `span` is written in, with the indentation of its line: a
+    // `PartSpan::LineAfter` goes on a line of its own after it.
+    let statement_of = |span: MirSpan| -> Option<(InFile<TextRange>, &str)> {
+        let node = syntax(node_of(span)?);
+        let statement = node.value.ancestors().find(|it| {
+            matches!(it.kind(), syntax::SyntaxKind::LET_STMT | syntax::SyntaxKind::EXPR_STMT)
+        })?;
+        let indent = statement
+            .prev_sibling_or_token()
+            .and_then(|it| it.into_token())
+            .filter(|it| it.kind() == syntax::SyntaxKind::WHITESPACE)
+            .and_then(|it| it.text().rsplit_once('\n'))
+            .map_or("", |(_, indent)| indent);
+        Some((node.with_value(TextRange::empty(statement.text_range().end())), indent))
+    };
     let range = |part: PartSpan| -> Option<InFile<TextRange>> {
         Some(match part {
             PartSpan::At(span @ MirSpan::ExprEnd(_)) => {
@@ -624,6 +681,7 @@ fn borrowck_parts(
             PartSpan::After(span) => {
                 node_of(span)?.map(|it| TextRange::empty(it.text_range().end()))
             }
+            PartSpan::LineAfter(span) => statement_of(span)?.0,
             PartSpan::Head(outer, inner) => {
                 let (outer, inner) = (expr(outer)?, expr(inner)?);
                 if outer.file_id != inner.file_id {
@@ -719,8 +777,15 @@ fn borrowck_parts(
             let parts = suggestion
                 .parts
                 .iter()
-                // clone: error path, a reported borrowck error's suggestion
-                .map(|(at, text)| Some((range(*at)?, text.clone())))
+                .map(|(at, text)| match *at {
+                    PartSpan::LineAfter(span) => {
+                        let (at, indent) = statement_of(span)?;
+                        // alloc: error path, a reported borrowck error's suggestion
+                        Some((at, format!("\n{indent}{text}")))
+                    }
+                    // clone: error path, a reported borrowck error's suggestion
+                    _ => Some((range(*at)?, text.clone())),
+                })
                 .collect::<Option<Vec<_>>>()?;
             Some(BorrowckSuggestion {
                 // clone: error path, a reported borrowck error's suggestion
@@ -806,6 +871,11 @@ pub enum Unplaced {
     Borrowck { code: &'static str, message: String },
     /// Const checking's.
     ConstCheck { code: &'static str, message: String },
+    /// `check_tail_calls`'s, its message.
+    TailCall(&'static str),
+    /// Type lowering's (a signature's, a field's, a type alias's), which its node in the store's
+    /// source map could not place: the lowering diagnostic as hir-ty has it.
+    Lowering(String),
 }
 
 #[derive(Debug)]
@@ -1401,6 +1471,29 @@ pub enum SolverGoal<'db> {
     Ambiguous,
 }
 
+/// blaze: a field binder `for<F: Field<C>> P(F)` or `for<V: Variant<C>> P(V)`
+/// (`#![feature(blaze_comptime)]`) that does not hold: `P` fails of `member` of `container`, the
+/// first such member in declaration order, for the reason `inner` gives.
+#[derive(Debug)]
+pub struct ReflectedMemberUnmet<'db> {
+    pub span: SpanSyntax,
+    pub container: Type<'db>,
+    pub member: ReflectedMember,
+    /// The field's type; `None` for a variant.
+    pub member_ty: Option<Type<'db>>,
+    pub inner: AnyDiagnostic<'db>,
+}
+
+/// What a field binder's member names.
+#[derive(Debug, Clone, Copy)]
+pub enum ReflectedMember {
+    /// A field of a struct or of an enum's variant.
+    Field(Field),
+    /// The field `.i` of a tuple.
+    TupleField(u32),
+    Variant(EnumVariant),
+}
+
 /// A trait solver error other than an unmet trait bound or a closure of the wrong kind: rustc's
 /// `report_fulfillment_error` for the other codes.
 #[derive(Debug)]
@@ -1521,6 +1614,27 @@ pub struct MissingSelfDefaultParams {
 #[derive(Debug)]
 pub struct ObjectWithoutTrait {
     pub bound: InFile<AstPtr<ast::Type>>,
+}
+
+/// Computing `query` of `item` needed itself: E0391. Each item in the cycle reports one.
+#[derive(Debug)]
+pub struct QueryCycle {
+    /// The item.
+    pub node: InFile<SyntaxNodePtr>,
+    /// The item's name, `impl` for an impl.
+    pub item: String,
+    /// The query that needed itself.
+    pub query: CycleQuery,
+}
+
+impl QueryCycle {
+    pub(crate) fn new(db: &Db, def: GenericDefId, query: CycleQuery) -> QueryCycle {
+        let item = GenericDef::from(def).name(db).map_or_else(
+            || "impl".to_owned(), // alloc: error path, a reported diagnostic's text
+            |it| it.as_str().to_owned(), // alloc: as above
+        );
+        QueryCycle { node: signature_owner(db, def), item, query }
+    }
 }
 
 /// The pattern of the pattern type `ty`, which is not lowered for `reason`.
@@ -1840,6 +1954,23 @@ pub struct YieldOutsideCoroutine {
 pub struct ReturnOutsideFunction {
     pub expr: InFile<ExprOrPatPtr>,
     pub kind: ReturnKind,
+}
+
+pub use hir_ty_tailck::{CallSite as TailCallSite, TailCallErrorKind};
+
+/// A `become` rustc's `check_tail_calls` refuses: `hir_ty_tailck::TailCallError` at its syntax.
+#[derive(Debug)]
+pub struct TailCallRefused {
+    /// The `become` expression.
+    pub become_expr: InFile<ExprOrPatPtr>,
+    pub kind: TailCallErrorKind<InFile<ExprOrPatPtr>>,
+}
+
+/// A tail call of a `#[track_caller]` function: the lint `tail_call_track_caller`.
+#[derive(Debug)]
+pub struct TailCallTrackCaller {
+    pub become_expr: InFile<ExprOrPatPtr>,
+    pub site: TailCallSite<InFile<ExprOrPatPtr>>,
 }
 
 /// A const argument in a body that is not a constant, for `reason`: at its expression, or at
@@ -2289,6 +2420,42 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
 
         let ast_id_map = file_id.ast_id_map(self.db);
 
+        // rustc's `check_min_specialization`, and blaze's sound subset under
+        // `#![blaze::specialization]` (hir-ty-specialization).
+        for error in hir_ty_specialization::check_impl(self.db, def) {
+            // E0520 is at the overriding item's name, the rest at the impl.
+            let node = error.item.and_then(|it| assoc_item_name(self.db, it)).unwrap_or_else(|| {
+                InFile::new(file_id, ast_id_map.get(loc.id.value).syntax_node_ptr())
+            });
+            let children = error
+                .note
+                .into_iter()
+                .map(|message| BorrowckChild {
+                    level: BorrowckSublevel::Note,
+                    message,
+                    // alloc: empty
+                    spans: Vec::new(),
+                    // alloc: empty
+                    labels: Vec::new(),
+                })
+                // alloc: error path, at most one note per reported error
+                .collect();
+            self.acc.push(
+                BorrowckError {
+                    node,
+                    at_end: false,
+                    code: error.rule.code(),
+                    message: error.message,
+                    // alloc: empty
+                    labels: Vec::new(),
+                    children,
+                    // alloc: empty
+                    suggestions: Vec::new(),
+                }
+                .into(),
+            );
+        }
+
         let trait_impl = impl_signature.target_trait.is_some();
         if !trait_impl && !is_inherent_impl_coherent(self.db, def_map, def) {
             self.acc.push(IncoherentImpl { impl_: ast_id_map.get(loc.id.value), file_id }.into())
@@ -2462,8 +2629,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             // specialize that blanket impl, but determining the exact specialization
             // relationship here would be significantly more expensive.
             if !missing.is_empty() {
-                let features = UnstableFeatures::query(self.db, self.krate);
-                if features.specialization || features.min_specialization {
+                if hir_ty::specialization_mode(self.db, self.krate).may_specialize() {
                     missing.retain(|(assoc_name, assoc_item)| {
                         let AssocItem::Function(_) = assoc_item else {
                             return true;
@@ -2510,7 +2676,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     }
 
     fn collect_module(&mut self, def: ModuleId) {
-        let _p = tracing::info_span!("diagnostics", name = ?def.name(self.db)).entered();
+        let _p = tracing::info_span!(target: "blaze", "diagnostics", name = ?def.name(self.db)).entered();
 
         let def_map = def.def_map(self.db);
         let scope = def_map.module(self.db, def).scope(self.db);
@@ -2732,6 +2898,19 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 );
                 continue;
             };
+            if let Some(overflow) = &diagnostic.drop_check {
+                let owner = def.loc(self.db).owner.generic_def(self.db);
+                self.acc.push(
+                    DropCheckOverflow {
+                        node,
+                        ty: Type::new(self.db, owner, overflow.ty.as_ref()),
+                        overflow_ty: Type::new(self.db, owner, overflow.overflow_ty.as_ref()),
+                        limit: overflow.limit,
+                    }
+                    .into(),
+                );
+                continue;
+            }
             let (labels, children, suggestions) = borrowck_parts(self.db, diagnostic, &node_of);
             self.acc.push(
                 BorrowckError {
@@ -2780,18 +2959,30 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         self.collect_variant(def.into());
     }
 
+    /// What lowering the types of `owner` found, placed in `source_map`. A diagnostic its node
+    /// can't place is blaze's error at `owner` naming it ([`Unplaced::Lowering`]), never dropped:
+    /// a type that lowered to an error with nothing said makes `blaze check` pass what rustc
+    /// refuses (an E0107 in a type alias's body met first by codegen's layout).
     fn collect_anon_consts_and_ty_diagnostics(
         &mut self,
         source_map: &ExpressionStoreSourceMap,
         anon_consts: &[AnonConstId<'db>],
         diagnostics: &[TyLoweringDiagnostic],
+        owner: impl Fn() -> InFile<SyntaxNodePtr>,
     ) {
         anon_consts.iter().for_each(|&anon_const| self.collect_anon_const(source_map, anon_const));
 
-        diagnostics
-            .iter()
-            .filter_map(|diag| AnyDiagnostic::ty_diagnostic(diag, source_map, self.db))
-            .for_each(|diag| self.acc.push(diag));
+        for diag in diagnostics {
+            let placed = AnyDiagnostic::ty_diagnostic(diag, source_map, self.db).unwrap_or_else(|| {
+                UnplacedDiagnostic {
+                    owner: owner(),
+                    // alloc: error path, a lowering diagnostic no node places
+                    what: Unplaced::Lowering(format!("{diag:?}")),
+                }
+                .into()
+            });
+            self.acc.push(placed);
+        }
     }
 
     /// The checks of `def`'s signature. Like [`Self::check_body`], they read the signature and
@@ -2812,8 +3003,17 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             let (_, source_map) = ExpressionStore::with_source_map(db, def.into());
             self.collect_store_diagnostics(source_map);
             for (anon_consts, diagnostics) in lowered {
-                self.collect_anon_consts_and_ty_diagnostics(source_map, anon_consts, diagnostics);
+                self.collect_anon_consts_and_ty_diagnostics(source_map, anon_consts, diagnostics, || {
+                    signature_owner(db, def)
+                });
             }
+        }
+        // A trait whose supertraits have it as their own: its supertrait list is no lowering
+        // result with diagnostics of its own, so the cycle is reported here.
+        if let GenericDefId::TraitId(trait_) = def
+            && hir_ty::supertraits_cycle(db, trait_)
+        {
+            self.acc.push(QueryCycle::new(db, def, CycleQuery::Supertraits).into());
         }
         self.collect_const_param_tys(def);
     }
@@ -2907,6 +3107,10 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             }
         }
 
+        if hir_ty_tailck::has_become(body) {
+            self.collect_tail_calls(def, placing.get());
+        }
+
         for diagnostic in BodyValidationDiagnostic::collect(self.db, def, self.style_lints) {
             self.acc.extend(AnyDiagnostic::body_validation_diagnostic(
                 self.db,
@@ -2936,6 +3140,39 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             }
         }
         self.collect_const_eval(def, body, infer, &placing);
+    }
+
+    /// What `check_tail_calls` refuses of the body's `become`s, and the tail calls of
+    /// `#[track_caller]` functions in it.
+    fn collect_tail_calls(&mut self, def: DefWithBodyId, source_map: &ExpressionStoreSourceMap) {
+        let check = hir_ty_tailck::tail_call_check(self.db, def);
+        let unplaced = |what| UnplacedDiagnostic {
+            owner: unplaced_owner(self.db, def.into(), source_map),
+            what: Unplaced::TailCall(what),
+        };
+        for error in check.errors() {
+            // clone: the refusal's types, once per refused tail call
+            let kind = error.kind.clone();
+            let placed = source_map.expr_syntax(error.become_expr).and_then(|become_expr| {
+                let kind = kind.try_map(|expr| source_map.expr_syntax(expr))?;
+                Ok(TailCallRefused { become_expr, kind })
+            });
+            match placed {
+                Ok(it) => self.acc.push(it.into()),
+                Err(SyntheticSyntax) => self.acc.push(unplaced(error.kind.message()).into()),
+            }
+        }
+        for call in check.track_caller_calls() {
+            let placed = source_map.expr_syntax(call.become_expr).and_then(|become_expr| {
+                let site = call.site.map(|expr| source_map.expr_syntax(expr));
+                let site = TailCallSite { call: site.call?, method: site.method };
+                Ok(TailCallTrackCaller { become_expr, site })
+            });
+            // A lint at code with no syntax is not given: rustc's is at the call it writes.
+            if let Ok(it) = placed {
+                self.acc.push(it.into());
+            }
+        }
     }
 
     /// [`ConstEvalFailed`] of `def` when it is a free `const` or a `static` whose body has no
@@ -3132,6 +3369,19 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                     continue;
                 }
             }
+            if let Some(overflow) = &diagnostic.drop_check {
+                let owner = hir_def::ExpressionStoreOwnerId::from(def).generic_def(self.db);
+                self.acc.push(
+                    DropCheckOverflow {
+                        node,
+                        ty: Type::new(self.db, owner, overflow.ty.as_ref()),
+                        overflow_ty: Type::new(self.db, owner, overflow.overflow_ty.as_ref()),
+                        limit: overflow.limit,
+                    }
+                    .into(),
+                );
+                continue;
+            }
             let (labels, children, suggestions) = borrowck_parts(self.db, diagnostic, &node_of);
             self.acc.push(
                 BorrowckError {
@@ -3263,6 +3513,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 source_map,
                 lowering.defined_anon_consts(),
                 lowering.diagnostics(),
+                || variant_owner(db, def),
             );
         }
     }
@@ -3451,6 +3702,12 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 }
                 ExpressionStoreDiagnostics::IntLiteralTooLarge { node } => {
                     IntLiteralTooLarge { node: *node }.into()
+                }
+                ExpressionStoreDiagnostics::VerifyRefused { node, why } => {
+                    VerifyRefused { node: *node, why: *why }.into()
+                }
+                ExpressionStoreDiagnostics::ComptimeWithoutFeature { node, form } => {
+                    ComptimeUnsupported { node: *node, form: *form, feature_enabled: false }.into()
                 }
             });
         }
@@ -3718,6 +3975,12 @@ impl<'db> AnyDiagnostic<'db> {
             &InferenceDiagnostic::AsyncCoroutinesNotSupported { expr } => {
                 AsyncCoroutinesNotSupported { expr: expr_syntax(expr)? }.into()
             }
+            &InferenceDiagnostic::ComptimeNotYetSupported { expr, form } => ComptimeUnsupported {
+                node: expr_syntax(expr)?.map(|it| it.syntax_node_ptr()),
+                form,
+                feature_enabled: true,
+            }
+            .into(),
             &InferenceDiagnostic::NonExhaustiveRecordExpr { expr } => {
                 NonExhaustiveRecordExpr { expr: expr_syntax(expr)? }.into()
             }
@@ -4263,6 +4526,28 @@ impl<'db> AnyDiagnostic<'db> {
             &SolverDiagnosticKind::Unreported { code } => {
                 error(TraitSolverErrorKind::Unreported(code))
             }
+            SolverDiagnosticKind::ReflectedMemberUnmet { container, member, member_ty, inner } => {
+                let inner = Self::solver_diagnostic(db, inner, span, cause, type_owner, target)?;
+                let member = match *member {
+                    hir_ty::comptime::ReflectedMember::Field(field) => {
+                        ReflectedMember::Field(Field { parent: field.parent.into(), id: field.local_id })
+                    }
+                    hir_ty::comptime::ReflectedMember::TupleField(index) => {
+                        ReflectedMember::TupleField(index)
+                    }
+                    hir_ty::comptime::ReflectedMember::Variant(variant) => {
+                        ReflectedMember::Variant(variant.into())
+                    }
+                };
+                ReflectedMemberUnmet {
+                    span,
+                    container: ty(container),
+                    member,
+                    member_ty: member_ty.as_ref().map(ty),
+                    inner,
+                }
+                .into()
+            }
             SolverDiagnosticKind::TraitUnimplemented {
                 trait_predicate,
                 parent_trait_predicates,
@@ -4679,9 +4964,18 @@ impl<'db> AnyDiagnostic<'db> {
             TyLoweringDiagnostic::ObjectWithoutTrait { source } => {
                 ObjectWithoutTrait { bound: Self::type_syntax(*source, source_map)? }.into()
             }
+            TyLoweringDiagnostic::ComptimeBinderNotYetSupported { source } => ComptimeUnsupported {
+                node: Self::type_syntax(*source, source_map)?.map(|it| it.syntax_node_ptr()),
+                form: ComptimeForm::BinderBound,
+                feature_enabled: true,
+            }
+            .into(),
             TyLoweringDiagnostic::PatternTypeNotLowered { source, reason } => {
                 PatternTypeNotLowered { ty: Self::type_syntax(*source, source_map)?, reason: *reason }
                     .into()
+            }
+            TyLoweringDiagnostic::QueryCycle { def, query } => {
+                QueryCycle::new(db, *def, *query).into()
             }
         })
     }
@@ -4722,12 +5016,13 @@ impl<'db> AnyDiagnostic<'db> {
 struct Placing<'db> {
     db: &'db Db,
     def: DefWithBodyId,
+    #[expect(clippy::disallowed_types, reason = "body source map, set once per diagnostic placement: not global")]
     map: std::cell::OnceCell<&'db hir_def::expr_store::BodySourceMap>,
 }
 
 impl<'db> Placing<'db> {
     fn new(db: &'db Db, def: DefWithBodyId) -> Placing<'db> {
-        Placing { db, def, map: std::cell::OnceCell::new() }
+        Placing { db, def, map: Default::default() }
     }
 
     fn get(&self) -> &'db hir_def::expr_store::BodySourceMap {
@@ -4917,7 +5212,8 @@ fn const_eval_failure<'db>(
         | MirEvalError::MachineStop
         | MirEvalError::InvalidVTableId(_)
         | MirEvalError::CoerceUnsizedError(_)
-        | MirEvalError::InternalError(_) => unsupported(),
+        | MirEvalError::InternalError(_)
+        | MirEvalError::ComptimeUnexpanded(_) => unsupported(),
     };
     Some((failure, span))
 }
@@ -4978,6 +5274,9 @@ fn unplaced_inference_text<'db>(
         }
         InferenceDiagnostic::AsyncCoroutinesNotSupported { .. } => {
             "E0727: `async` coroutines are not yet supported".to_owned()
+        }
+        InferenceDiagnostic::ComptimeNotYetSupported { form, .. } => {
+            format!("{} (`#![feature(blaze_comptime)]`) is not yet supported by blaze's type checker", form.syntax())
         }
         InferenceDiagnostic::NonExhaustiveRecordExpr { .. } => {
             "E0639: cannot create non-exhaustive struct using struct expression".to_owned()
@@ -5204,6 +5503,23 @@ fn solver_text<'db>(
             };
             format!("the trait solver found {what}, which only rustc's old solver reports")
         }
+        SolverDiagnosticKind::ReflectedMemberUnmet { container, member, inner, .. } => {
+            let member = match *member {
+                hir_ty::comptime::ReflectedMember::Field(field) => {
+                    let field = Field { parent: field.parent.into(), id: field.local_id };
+                    format!("field `{}`", field.name(db).as_str())
+                }
+                hir_ty::comptime::ReflectedMember::TupleField(index) => format!("field `{index}`"),
+                hir_ty::comptime::ReflectedMember::Variant(variant) => {
+                    format!("variant `{}`", EnumVariant::from(variant).name(db).as_str())
+                }
+            };
+            format!(
+                "{member} of `{}` does not meet the field binder's bound: {}",
+                ty(container),
+                solver_text(db, target, def, inner)
+            )
+        }
     }
 }
 
@@ -5299,32 +5615,8 @@ pub(crate) fn unplaced_owner(
             }
             match loc.owner {
                 ExpressionStoreOwnerId::Body(def) => def,
-                ExpressionStoreOwnerId::Signature(def) => {
-                    return match def {
-                        GenericDefId::AdtId(AdtId::StructId(it)) => {
-                            it.lookup(db).ast_ptr(db).map(Into::into)
-                        }
-                        GenericDefId::AdtId(AdtId::EnumId(it)) => {
-                            it.lookup(db).ast_ptr(db).map(Into::into)
-                        }
-                        GenericDefId::AdtId(AdtId::UnionId(it)) => {
-                            it.lookup(db).ast_ptr(db).map(Into::into)
-                        }
-                        GenericDefId::ConstId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
-                        GenericDefId::FunctionId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
-                        GenericDefId::ImplId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
-                        GenericDefId::StaticId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
-                        GenericDefId::TraitId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
-                        GenericDefId::TypeAliasId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
-                    };
-                }
-                ExpressionStoreOwnerId::VariantFields(def) => {
-                    return match def {
-                        VariantId::EnumVariantId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
-                        VariantId::StructId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
-                        VariantId::UnionId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
-                    };
-                }
+                ExpressionStoreOwnerId::Signature(def) => return signature_owner(db, def),
+                ExpressionStoreOwnerId::VariantFields(def) => return variant_owner(db, def),
             }
         }
     };
@@ -5333,6 +5625,33 @@ pub(crate) fn unplaced_owner(
         DefWithBodyId::StaticId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
         DefWithBodyId::ConstId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
         DefWithBodyId::VariantId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+    }
+}
+
+/// The item whose signature is `def`'s, where an [`UnplacedDiagnostic`] of it is.
+fn signature_owner(db: &Db, def: GenericDefId) -> InFile<SyntaxNodePtr> {
+    use hir_def::src::HasSource as _;
+    match def {
+        GenericDefId::AdtId(AdtId::StructId(it)) => it.lookup(db).ast_ptr(db).map(Into::into),
+        GenericDefId::AdtId(AdtId::EnumId(it)) => it.lookup(db).ast_ptr(db).map(Into::into),
+        GenericDefId::AdtId(AdtId::UnionId(it)) => it.lookup(db).ast_ptr(db).map(Into::into),
+        GenericDefId::ConstId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+        GenericDefId::FunctionId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+        GenericDefId::ImplId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+        GenericDefId::StaticId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+        GenericDefId::TraitId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+        GenericDefId::TypeAliasId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+    }
+}
+
+/// The struct, union or variant whose fields are `def`'s, where an [`UnplacedDiagnostic`] of
+/// them is.
+fn variant_owner(db: &Db, def: VariantId) -> InFile<SyntaxNodePtr> {
+    use hir_def::src::HasSource as _;
+    match def {
+        VariantId::EnumVariantId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+        VariantId::StructId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+        VariantId::UnionId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
     }
 }
 

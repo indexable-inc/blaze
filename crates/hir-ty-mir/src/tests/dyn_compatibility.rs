@@ -1,6 +1,7 @@
 use std::ops::ControlFlow;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir_def::signatures::TraitSignature;
 use hir_expand::fixture;
 use syntax::ToSmolStr;
@@ -30,8 +31,8 @@ fn check_dyn_compatibility<'a>(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
     expected: impl IntoIterator<Item = (&'a str, Vec<DynCompatibilityViolationKind>)>,
 ) {
-    let mut expected: HashMap<_, _> =
-        expected.into_iter().map(|(id, osvs)| (id, HashSet::from_iter(osvs))).collect();
+    let mut expected: HashMap<_, _, Global> =
+        expected.into_iter().map(|(id, osvs)| (id, HashSet::from_iter_in(osvs, Global))).collect();
     let fx = fixture::db(ra_fixture);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
@@ -57,7 +58,7 @@ fn check_dyn_compatibility<'a>(
         let Some(expected) = expected.remove(name.as_str()) else {
             continue;
         };
-        let mut osvs = HashSet::default();
+        let mut osvs = HashSet::new_in(Global);
         let db = &db;
         crate::attach_db(db, || {
             _ = dyn_compatibility_with_callback(db, trait_id, &mut |osv| {

@@ -22,6 +22,7 @@ use blaze_resolve::{
     ResolveVersion, RustVersion, SourceId, Summary,
 };
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use super::files::Snap;
 use super::source::{Index, Located, Sources};
@@ -50,9 +51,9 @@ pub(crate) struct Resolved<'a> {
     pub new_cli_feature_behavior: bool,
     pub behavior: ResolveBehavior,
     pub has_dev_units: HasDevUnits,
-    pub reads: HashMap<PackageId, Read>,
+    pub reads: HashMap<PackageId, Read, Global>,
     /// The manifest of every package of the resolve, and where it is.
-    pub manifests: HashMap<PackageId, (&'a Path, &'a Manifest)>,
+    pub manifests: HashMap<PackageId, (&'a Path, &'a Manifest), Global>,
     pub lock: Option<LockWrite>,
     /// What cargo warns of while selecting the packages.
     pub warnings: Vec<String>,
@@ -117,7 +118,7 @@ pub(crate) fn resolved<'r, 'db, R>(
     }
     let members: Vec<(&Path, &Manifest)> = ws.members().collect();
     let known = members.len() + owned.len();
-    let mut reads: HashMap<PackageId, Read> = HashMap::with_capacity_and_hasher(known, Default::default());
+    let mut reads: HashMap<PackageId, Read, Global> = HashMap::with_capacity_in(known, Global);
     // Of each of `members` then `owned`, in order, its id.
     let mut ids: Vec<PackageId> = Vec::with_capacity(known);
     let all = members.iter().map(|(path, m)| (*path, *m, None)).chain(
@@ -138,7 +139,7 @@ pub(crate) fn resolved<'r, 'db, R>(
     for read in reads.values() {
         pinned.add(IndexSummary::Candidate(read.summary.clone()));
     }
-    let by_path: HashMap<SourceId, Summary> = reads
+    let by_path: HashMap<SourceId, Summary, Global> = reads
         .values()
         .filter(|it| it.summary.source_id().is_path())
         .map(|it| (it.summary.source_id(), it.summary.clone()))
@@ -252,7 +253,7 @@ pub(crate) fn resolved<'r, 'db, R>(
         Err(error) => return Ok(fail(error)),
     };
     let all = members.iter().map(|(path, m)| (*path, *m)).chain(owned.iter().map(|it| (it.manifest_path.as_path(), &*it.manifest)));
-    let manifests: HashMap<PackageId, (&Path, &Manifest)> = ids.iter().copied().zip(all).collect();
+    let manifests: HashMap<PackageId, (&Path, &Manifest), Global> = ids.iter().copied().zip(all).collect();
     if let Some(missing) = targeted.iter().find(|id| !manifests.contains_key(id)) {
         return Ok(fail(anyhow::anyhow!("no manifest of `{missing}` was read")));
     }
@@ -349,7 +350,7 @@ fn locate_all(
     ctx: &Context<Snap<'_, '_>>,
     sources: &Sources,
     ids: &[PackageId],
-    checksums: &HashMap<PackageId, Option<String>>,
+    checksums: &HashMap<PackageId, Option<String>, Global>,
 ) -> Result<Staged<Vec<Package>>, Cancelled> {
     let files = *ctx.files();
     let mut here = Vec::new();

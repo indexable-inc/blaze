@@ -190,6 +190,27 @@ mod load {
             Planned::Needs(fetches) => panic!("the load needs {fetches:?}"),
             Planned::Failed(error) => panic!("the load failed: {}", error.what),
         });
+        workspace_graph(built)
+    }
+
+    /// The workspace's graph under `-Z wasm-macros`, as its unit graph made it.
+    fn wasm_macro_graph(files: &[(&str, &str)]) -> UnitGraph {
+        graph(files, &["-Z", "wasm-macros"]).1
+    }
+
+    /// The units the load plans under `-Z wasm-macros`: its graph with the standard libraries
+    /// merged in, and each unit's plan.
+    fn wasm_macro_units(files: &[(&str, &str)]) -> crate::query::Units {
+        let fixture = Fixture::new();
+        let view = fixture.open(&Ask { args: &["-Z", "wasm-macros"], ..ask(files) });
+        match fixture.plan(view) {
+            Planned::Ready(units) => units,
+            Planned::Needs(fetches) => panic!("the load needs {fetches:?}"),
+            Planned::Failed(error) => panic!("the load failed: {}", error.what),
+        }
+    }
+
+    fn workspace_graph(built: Vec<(Budget, UnitGraph)>) -> (Budget, UnitGraph) {
         let ws = format!("path+file://{WS}");
         built
             .into_iter()
@@ -323,6 +344,89 @@ mod load {
         let (a_run, l_run) = (script(&graph, "a", Mode::RunCustomBuild), script(&graph, "l", Mode::RunCustomBuild));
         let waits = graph.units[a_run].dependencies.iter().find(|it| it.index == l_run).expect("a's run waits for l's");
         assert_eq!(waits.extern_crate_name, "build_script_build");
+    }
+
+    /// `a` depends on `b` and on the proc macro `m`, which has a build script and depends on
+    /// `b` too.
+    fn with_a_proc_macro() -> Vec<(&'static str, &'static str)> {
+        let a = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [dependencies]\nb = { path = \"b\" }\nm = { path = \"m\" }\n";
+        let m = "[package]\nname = \"m\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [lib]\nproc-macro = true\n\n[dependencies]\nb = { path = \"../b\" }\n";
+        vec![
+            ("ws/Cargo.toml", a),
+            ("ws/src/lib.rs", ""),
+            ("ws/b/Cargo.toml", B),
+            ("ws/b/src/lib.rs", ""),
+            ("ws/m/Cargo.toml", m),
+            ("ws/m/build.rs", "fn main() {}\n"),
+            ("ws/m/src/lib.rs", ""),
+        ]
+    }
+
+    #[test]
+    fn without_wasm_macros_a_proc_macro_and_its_dependencies_are_built_for_the_host() {
+        let (_, graph) = graph(&with_a_proc_macro(), &[]);
+        assert_eq!(lib(&graph, "m").1.platform, None);
+        let (b_at, _) = lib(&graph, "b");
+        assert!(lib(&graph, "m").1.dependencies.iter().any(|it| it.index == b_at), "a and m share b's unit");
+    }
+
+    #[test]
+    fn wasm_macros_build_a_proc_macro_and_its_dependencies_for_wasm32_wasip1() {
+        let graph = wasm_macro_graph(&with_a_proc_macro());
+        let wasm = Some(crate::load::MACRO_WASM);
+        let (_, m) = lib(&graph, "m");
+        assert_eq!(m.platform.as_deref(), wasm);
+        let mut b: Vec<Option<&str>> = libs(&graph, "b").iter().map(|(_, it)| it.platform.as_deref()).collect();
+        b.sort();
+        assert_eq!(b, [None, wasm], "a's b for the host, m's b for wasm");
+        let m_b = libs(&graph, "b").into_iter().find(|(_, it)| it.platform.as_deref() == wasm).map(|(at, _)| at);
+        assert!(m.dependencies.iter().any(|it| Some(it.index) == m_b), "m uses the wasm b");
+        let built = &graph.units[script(&graph, "m", Mode::Build)];
+        assert_eq!(built.platform, None, "a build script still runs on the host");
+        let run = &graph.units[script(&graph, "m", Mode::RunCustomBuild)];
+        assert_eq!(run.platform.as_deref(), wasm, "its run is for the unit it feeds");
+    }
+
+    #[test]
+    fn a_wasm_macro_is_planned_with_a_wasm_std_that_takes_the_bridge() {
+        let units = wasm_macro_units(&with_a_proc_macro());
+        let graph = &units.graph;
+        let wasm = Some(crate::load::MACRO_WASM);
+        let (m_at, m) = lib(graph, "m");
+        assert!(units.plans[m_at].macro_wasm, "m is built to run as a wasm module");
+        assert_eq!(m.profile.panic, "abort", "wasm32-wasip1 does not unwind");
+        let (a_at, _) = lib(graph, "a");
+        assert!(!units.plans[a_at].macro_wasm, "a is the build's own");
+        let std_of = |at: usize| -> Vec<(&str, Option<&str>, bool)> {
+            graph.units[at]
+                .dependencies
+                .iter()
+                .filter(|dep| graph.units[dep.index].is_std)
+                .map(|dep| {
+                    let unit = &graph.units[dep.index];
+                    (dep.extern_crate_name.as_str(), unit.platform.as_deref(), units.plans[dep.index].macro_wasm)
+                })
+                .collect()
+        };
+        let m_std = std_of(m_at);
+        assert!(m_std.iter().any(|(name, _, _)| *name == "proc_macro"), "{m_std:?}");
+        assert!(m_std.iter().all(|&(_, platform, bridged)| platform == wasm && bridged), "{m_std:?}");
+        let a_std = std_of(a_at);
+        assert!(!a_std.is_empty() && a_std.iter().all(|&(_, platform, bridged)| platform.is_none() && !bridged), "{a_std:?}");
+    }
+
+    #[test]
+    fn wasm_macros_refuse_a_build_whose_target_is_their_platform() {
+        let fixture = Fixture::new();
+        let args = ["-Z", "wasm-macros", "--target", crate::load::MACRO_WASM];
+        let view = fixture.open(&Ask { args: &args, ..ask(&with_a_proc_macro()) });
+        match fixture.plan(view) {
+            Planned::Failed(error) => assert!(error.what.contains("-Z wasm-macros"), "{}", error.what),
+            Planned::Ready(_) => panic!("a unit of the target could not be told from a wasm macro's"),
+            Planned::Needs(fetches) => panic!("the load needs {fetches:?}"),
+        }
     }
 
     #[test]

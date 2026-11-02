@@ -101,7 +101,7 @@ const _: () = {
 /// each signature, the store's buffer, the item tree's codes (visibilities, shapes), the key and
 /// the frozen encoding of the table.
 pub(crate) const SCHEMA: SchemaHash = blaze_format::schema_of(&[
-    SchemaPart::Str("blaze v2 dependency signatures 4"),
+    SchemaPart::Str("blaze v2 dependency signatures 5"),
     SchemaPart::Schema(<PartRoot as Record>::SCHEMA),
     SchemaPart::Schema(<RecordRoot as Record>::SCHEMA),
     SchemaPart::Schema(<ExpressionStore as Persist>::SCHEMA),
@@ -112,7 +112,7 @@ pub(crate) const SCHEMA: SchemaHash = blaze_format::schema_of(&[
 
 /// The schema of one record's buffer.
 const RECORD_SCHEMA: SchemaHash = blaze_format::schema_of(&[
-    SchemaPart::Str("blaze v2 dependency signature record 1"),
+    SchemaPart::Str("blaze v2 dependency signature record 2"),
     SchemaPart::Schema(<RecordRoot as Record>::SCHEMA),
 ]);
 

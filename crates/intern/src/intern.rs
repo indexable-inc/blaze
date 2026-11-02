@@ -21,6 +21,7 @@ use std::{
 };
 
 use blaze_hash::FixedState;
+use std::alloc::Global;
 
 use crate::{
     sync::OnceLock,
@@ -378,7 +379,7 @@ mod tests {
     #[test]
     fn interning_agrees_with_a_map_model() {
         let mut rng = blaze_ids::rng::SplitMix64::new(0x1a7e);
-        let mut model: blaze_hash::HashMap<Vec<u8>, *const Keyed> = blaze_hash::HashMap::default();
+        let mut model: blaze_hash::HashMap<Vec<u8>, *const Keyed, Global> = blaze_hash::HashMap::new_in(Global); // alloc: a test's model
         for _ in 0..20_000 {
             let len = rng.index(24);
             let bytes: Vec<u8> = (0..len).map(|_| b"ab\0"[rng.index(3)]).collect();

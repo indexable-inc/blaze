@@ -2,18 +2,21 @@
 //! representation.
 
 mod asm;
+mod contract;
 mod format_args;
 mod generics;
 mod path;
+mod spec;
 
 use std::{
-    cell::{OnceCell, RefCell},
+    cell::RefCell,
     mem,
     sync::Arc,
 };
 
 use base_db::{Db, FxIndexSet};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use cfg::CfgOptions;
 use either::Either;
 use hir_expand::{
@@ -41,12 +44,12 @@ use tt::TextRange;
 
 use crate::{
     AdtId, BlockId, BlockIdLt, ConstId, DefWithBodyId, FunctionId, GenericDefId, HasModule, ImplId,
-    ItemContainerId, LoweringMode, MacroId, ModuleDefId, ModuleId, TraitId, TypeAliasId,
+    ItemContainerId, Lookup, LoweringMode, MacroId, ModuleDefId, ModuleId, TraitId, TypeAliasId,
     UnresolvedMacro,
     attrs::AttrFlags,
     expr_store::{
         Body, BodySourceMap, ExprPtr, ExprRoot, ExpressionStore, ExpressionStoreBuilder,
-        ExpressionStoreDiagnostics, ExpressionStoreSourceMap, HygieneId, LabelPtr, LifetimePtr,
+        ComptimeForm, ExpressionStoreDiagnostics, ExpressionStoreSourceMap, HygieneId, LabelPtr, LifetimePtr,
         ListMark, Lists, MacroCallPtr, MissingBodyItemKind, PatPtr, SelfParamPtr, StoreVisitor,
         TypePtr,
         body::Param,
@@ -63,10 +66,11 @@ use crate::{
         generics::{GenericParams, LifetimeParamData},
     },
     item_scope::BuiltinShadowMode,
+    item_tree::FieldsShape,
     lang_item::{LangItemTarget, LangItems},
     nameres::{DefMap, LocalDefMap, MacroSubNs, block_def_map},
     resolver::{HasResolver, macro_def_site},
-    signatures::TypeAliasSignature,
+    signatures::{StructSignature, TypeAliasSignature},
     type_ref::{
         ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId, Rawness,
         RefType, TraitBoundModifier, TraitRef, TypeBound, TypeRef, TypeRefId,
@@ -74,6 +78,7 @@ use crate::{
     unstable_features::UnstableFeatures,
 };
 
+pub use self::asm::{GlobalAsm, global_asm};
 pub use self::generics::ImplTraitLowering;
 pub use self::path::hir_segment_to_ast_segment_view;
 
@@ -102,6 +107,8 @@ pub(super) fn lower_body(
     module: ModuleId,
     parameters: Option<ast::ParamList<'_>>,
     body: Option<ast::Expr<'_>>,
+    // The function whose body this is: its `blaze_verify` clauses.
+    function: Option<ast::Fn<'_>>,
     is_async_fn: bool,
     is_gen_fn: bool,
     maps: Option<(&RealSpanMap, &AstIdMap)>,
@@ -167,6 +174,12 @@ pub(super) fn lower_body(
         return collector.finish_body(params, self_param, source_map_self_param);
     }
     validate_required_body(db, owner, current_file_id, syntax_node, body.is_some(), &mut collector);
+    // With a body, its clauses are lowered at its head (`collect_spec_head`).
+    if let Some(function) = function
+        && body.is_none()
+    {
+        collector.refuse_bodyless_spec(function);
+    }
     collector.with_expr_root(|collector| {
         if let DefWithBodyId::FunctionId(func) = owner
             && let Some(param_list) = parameters
@@ -232,6 +245,7 @@ pub(super) fn lower_body(
             },
             is_async_fn,
             is_gen_fn,
+            matches!(owner, DefWithBodyId::FunctionId(_)),
         )
     });
 
@@ -615,7 +629,8 @@ pub struct ExprCollector<'db> {
     local_def_map: &'db LocalDefMap,
     module: ModuleId,
     lowering_mode: LoweringMode,
-    lang_items: OnceCell<&'db LangItems>,
+    #[expect(clippy::disallowed_types, reason = "crate language items, set once per expression collector: not global")]
+    lang_items: std::cell::OnceCell<&'db LangItems>,
     pub store: ExpressionStoreBuilder,
     pub named_lifetime_store: NamedLifetimeStore,
 
@@ -636,7 +651,7 @@ pub struct ExprCollector<'db> {
 
     /// Legacy (`macro_rules!`) macros can have multiple definitions and shadow each other,
     /// and we need to find the current definition. So we track the number of definitions we saw.
-    current_block_legacy_macro_defs_count: HashMap<Name, usize>,
+    current_block_legacy_macro_defs_count: HashMap<Name, usize, Global>,
 
     current_try_block: Option<TryBlock>,
 
@@ -644,6 +659,12 @@ pub struct ExprCollector<'db> {
     krate: base_db::Crate,
 
     name_generator_index: usize,
+
+    /// While a function's own body is lowered and it has an `ensures`: the check its returns
+    /// go through. Reset in a closure, an async or gen block and a const ([`Self::with_label_rib`]).
+    contract_ensures: Option<contract::Ensures>,
+    /// How many leading statements of the next block lowered are contract markers, left out.
+    contract_markers: usize,
 
     stacks: Stacks,
     /// The blocks of the body's first lowering not yet taken ([`BodyLowering::SourceMap`]).
@@ -706,16 +727,16 @@ enum PatBoundCtx {
 #[derive(Debug)]
 struct BindingList {
     /// Inline for a pattern with at most one or-pattern level open.
-    ctxs: SmallVec<[(PatBoundCtx, HashMap<(Name, HygieneId), BindingId>); 2]>,
-    is_used: HashMap<BindingId, bool>,
+    ctxs: SmallVec<[(PatBoundCtx, HashMap<(Name, HygieneId), BindingId, Global>); 2]>,
+    is_used: HashMap<BindingId, bool, Global>,
     reject_new: bool,
 }
 
 impl Default for BindingList {
     fn default() -> Self {
         BindingList {
-            ctxs: SmallVec::from_iter([(PatBoundCtx::Product, HashMap::default())]),
-            is_used: HashMap::default(),
+            ctxs: SmallVec::from_iter([(PatBoundCtx::Product, HashMap::new_in(Global))]),
+            is_used: HashMap::new_in(Global),
             reject_new: false,
         }
     }
@@ -753,7 +774,7 @@ impl BindingList {
     }
 
     fn push(&mut self, ctx: PatBoundCtx) {
-        self.ctxs.push((ctx, HashMap::default()));
+        self.ctxs.push((ctx, HashMap::new_in(Global)));
     }
 
     /// Ends the innermost context, moving its bindings to the one around it.
@@ -921,6 +942,7 @@ impl<'db> ExprCollector<'db> {
 
     /// With `maps`, what is collected is a part of `current_file_id` lowered as a tree of its
     /// own, and these are the maps of that part ([`Expander::within`]).
+    #[expect(clippy::disallowed_types, reason = "crate language items, set once per expression collector: not global")]
     pub fn with_maps(
         db: &'db Db,
         module: ModuleId,
@@ -943,16 +965,18 @@ impl<'db> ExprCollector<'db> {
             lowering_mode,
             def_map,
             local_def_map,
-            lang_items: OnceCell::new(),
+            lang_items: std::cell::OnceCell::new(),
             store: ExpressionStoreBuilder::new(),
             expander,
             current_try_block: None,
             is_lowering_coroutine: false,
             awaitable_context: None,
-            current_block_legacy_macro_defs_count: HashMap::default(),
+            current_block_legacy_macro_defs_count: HashMap::new_in(Global),
             outer_impl_trait: false,
             krate,
             name_generator_index: 0,
+            contract_ensures: None,
+            contract_markers: 0,
             named_lifetime_store: NamedLifetimeStore::default(),
             for_type_binder: None,
             impl_header_lifetimes: None,
@@ -1127,13 +1151,28 @@ impl<'db> ExprCollector<'db> {
                     .map(|it| self.lower_type_ref(it, impl_trait_lower_fn))
                     .unwrap_or_else(|| self.alloc_type_ref_desugared(TypeRef::UNIT));
                 let mut is_varargs = false;
+                // rustc's `FnDecl::splatted`: the first input written with `#[rustc_splat]`.
+                let mut splatted: Option<usize> = None;
                 let params_base = self.stacks.fn_params.len();
                 if let Some(pl) = inner.param_list() {
-                    if let Some(param) = pl.params().last() {
-                        is_varargs = param.dotdotdot_token().is_some();
-                    }
-
-                    for it in pl.params().filter(|it| it.dotdotdot_token().is_none()) {
+                    // A `#[cfg]` on an input is honored as on a function's (RFC 2565); the
+                    // `...` is the last input left.
+                    let mut inputs = 0usize;
+                    for it in pl.params() {
+                        if !self.check_cfg(it) {
+                            continue;
+                        }
+                        is_varargs = it.dotdotdot_token().is_some();
+                        if is_varargs {
+                            continue;
+                        }
+                        if splatted.is_none()
+                            && ast::HasAttrs::attrs(&it)
+                                .any(|attr| attr.simple_name().is_some_and(|it| it == "rustc_splat"))
+                        {
+                            splatted = Some(inputs);
+                        }
+                        inputs += 1;
                         let type_ref = self.lower_type_ref_opt(it.ty(), impl_trait_lower_fn);
                         let name = match it.pat() {
                             Some(ast::Pat::IdentPat(it)) => Some(
@@ -1157,6 +1196,11 @@ impl<'db> ExprCollector<'db> {
                     is_varargs,
                     is_unsafe: inner.unsafe_token().is_some(),
                     abi,
+                    // As rustc's lowering: none on a C-variadic pointer, none past `u8::MAX`.
+                    splatted: splatted
+                        .filter(|_| !is_varargs)
+                        .and_then(|index| u8::try_from(index).ok())
+                        .filter(|&index| index < u8::MAX),
                     // alloc: the fn type's own stored list, one exact allocation per `fn` type.
                     params: self.stacks.fn_params.drain(params_base..).collect(),
                     binder,
@@ -1531,10 +1575,11 @@ impl<'db> ExprCollector<'db> {
         awaitable: Awaitable,
         is_async_fn: bool,
         is_gen_fn: bool,
+        is_fn: bool,
     ) -> ExprId {
         self.awaitable_context.replace(awaitable);
         self.with_label_rib(RibKind::Closure, |this| {
-            let body = this.collect_expr_opt(expr);
+            let body = if is_fn { this.collect_fn_body(expr) } else { this.collect_expr_opt(expr) };
             if is_async_fn || is_gen_fn {
                 let kind = match (is_async_fn, is_gen_fn) {
                     (true, true) => CoroutineKind::AsyncGen,
@@ -1775,6 +1820,21 @@ impl<'db> ExprCollector<'db> {
                 self.alloc_expr(Expr::Loop { body, label: label.map(|it| it.1), source: LoopSource::Loop }, syntax_ptr)
             }
             ast::Expr::WhileExpr(e) => self.collect_while_loop(syntax_ptr, e),
+            ast::Expr::ForExpr(e) if e.const_token().is_some() => {
+                if !self.comptime_enabled(syntax_ptr.into(), ComptimeForm::ForConst) {
+                    return Some(self.alloc_expr(Expr::Missing, syntax_ptr));
+                }
+                let iterable = self.collect_expr_opt(e.iterable());
+                let pat = self.collect_pat_top(e.pat());
+                let label = e.label().map(|label| {
+                    (self.hygiene_id_for(label.syntax().text_range()), self.collect_label(label))
+                });
+                let body = self.collect_labelled_block_opt(label, e.loop_body());
+                self.alloc_expr(
+                    Expr::ComptimeFor { pat, iterable, body, label: label.map(|it| it.1) },
+                    syntax_ptr,
+                )
+            }
             ast::Expr::ForExpr(e) => self.collect_for_loop(syntax_ptr, e),
             ast::Expr::CallExpr(e) => {
                 let callee = self.collect_expr_opt(e.expr());
@@ -1870,6 +1930,7 @@ impl<'db> ExprCollector<'db> {
             }
             ast::Expr::ReturnExpr(e) => {
                 let expr = e.expr().map(|e| self.collect_expr(e));
+                let expr = self.contract_return_value(expr, syntax_ptr);
                 self.alloc_expr(Expr::Return { expr }, syntax_ptr)
             }
             ast::Expr::BecomeExpr(e) => {
@@ -2169,6 +2230,14 @@ impl<'db> ExprCollector<'db> {
                 let id = self.store.alloc_literal_expr(literal);
                 self.map_expr(id, syntax_ptr)
             }
+            ast::Expr::IndexExpr(e) if e.dot_token().is_some() => {
+                if !self.comptime_enabled(syntax_ptr.into(), ComptimeForm::ReflectedField) {
+                    return Some(self.alloc_expr(Expr::Missing, syntax_ptr));
+                }
+                let base = self.collect_expr_opt(e.base());
+                let field = self.collect_expr_opt(e.index());
+                self.alloc_expr(Expr::ReflectedField { base, field }, syntax_ptr)
+            }
             ast::Expr::IndexExpr(e) => {
                 let base = self.collect_expr_opt(e.base());
                 let index = self.collect_expr_opt(e.index());
@@ -2345,13 +2414,20 @@ impl<'db> ExprCollector<'db> {
     }
 
     /// Whether this path should be lowered as destructuring assignment, or as a normal assignment.
-    fn path_is_destructuring_assignment(&self, path: &ModPath) -> bool {
+    /// `shape` is the constructor a pattern needs it to name: `Unit` for a bare path, `Tuple`
+    /// for a call (rustc's `expected_in_unit_struct_pat` and `expected_in_tuple_struct_pat`).
+    fn path_is_destructuring_assignment(&self, path: &ModPath, shape: FieldsShape) -> bool {
         // rustc has access to a full resolver here, including local variables and generic params, and it checks the following
         // criteria: a path not lowered as destructuring assignment if it can *fully resolve* to something that is *not*
-        // a const, a unit struct or a variant.
+        // a constructor of the shape: a const, a function or a tuple struct as a bare path stays an expression, an
+        // invalid left-hand side (E0070).
         // We don't have access to a full resolver here. So we should do the same as rustc, but assuming that local variables
         // could be resolved to nothing (fortunately, there cannot be a local variable shadowing a unit struct/variant/const,
         // as that is an error). We don't need to consider const params as it's an error to refer to these in patterns.
+        // `Self` in an impl is rustc's `SelfCtor`, a constructor of either shape, which no local resolution names.
+        if path.is_Self() {
+            return true;
+        }
         let (resolution, unresolved_idx, _) = self.def_map.resolve_path_locally(
             self.local_def_map,
             self.db,
@@ -2366,10 +2442,14 @@ impl<'db> ExprCollector<'db> {
                 resolution.take_types().is_some()
             }
             None => match resolution.take_values() {
-                // We don't need to consider non-unit structs/variants, as those are not value types.
-                Some(ModuleDefId::EnumVariantId(_))
-                | Some(ModuleDefId::AdtId(_))
-                | Some(ModuleDefId::ConstId(_)) => true,
+                Some(ModuleDefId::AdtId(AdtId::StructId(it))) => {
+                    StructSignature::of(self.db, it).shape == shape
+                }
+                Some(ModuleDefId::EnumVariantId(it)) => {
+                    let loc = it.lookup(self.db);
+                    let variants = &loc.parent.enum_variants(self.db).variants;
+                    variants.get(&loc.name).is_some_and(|&(_, found)| found == shape)
+                }
                 _ => false,
             },
         }
@@ -2460,6 +2540,10 @@ impl<'db> ExprCollector<'db> {
                 let Some(path) = path else {
                     return Some(self.missing_pat());
                 };
+                let mod_path = self.store.path_at(path).mod_path();
+                if mod_path.is_some_and(|it| !self.path_is_destructuring_assignment(it, FieldsShape::Tuple)) {
+                    return None;
+                }
                 let arg_list = e.arg_list()?;
                 let (ellipsis, mark) = collect_tuple(self, arg_list.args());
                 let id = self.with_lists(mark, |this, lists| {
@@ -2471,7 +2555,7 @@ impl<'db> ExprCollector<'db> {
                 let (path, hygiene) = self.collect_expr_path(e)?;
                 let mod_path =
                     self.store.path_at(path).mod_path().expect("should not lower to lang path");
-                if self.path_is_destructuring_assignment(mod_path) {
+                if self.path_is_destructuring_assignment(mod_path, FieldsShape::Unit) {
                     let pat_id = self.store.alloc_path_pat(path);
                     let pat_id = self.map_pat_from_expr(pat_id, syntax_ptr);
                     if !hygiene.is_root() {
@@ -2937,15 +3021,15 @@ impl<'db> ExprCollector<'db> {
                 let callee = self.alloc_opt_path_expr(convert_fn);
                 let callee = self.map_expr(callee, syntax_ptr);
                 let result = self.alloc_expr(Expr::Call { callee, args: &[it] }, syntax_ptr);
-                self.alloc_expr(
-                    match self.current_try_block {
-                        Some(
-                            TryBlock::Heterogeneous { label } | TryBlock::Homogeneous { label },
-                        ) => Expr::Break { expr: Some(result), label: Some(label) },
-                        None => Expr::Return { expr: Some(result) },
-                    },
-                    syntax_ptr,
-                )
+                let exit = match self.current_try_block {
+                    Some(TryBlock::Heterogeneous { label } | TryBlock::Homogeneous { label }) => {
+                        Expr::Break { expr: Some(result), label: Some(label) }
+                    }
+                    None => {
+                        Expr::Return { expr: self.contract_return_value(Some(result), syntax_ptr) }
+                    }
+                };
+                self.alloc_expr(exit, syntax_ptr)
             },
         };
         let arms = [continue_arm, break_arm];
@@ -3270,6 +3354,33 @@ impl<'db> ExprCollector<'db> {
             Option<ExprId>,
         ) -> Expr<'s>,
     ) -> ExprId {
+        self.with_block_scope(block, |this, block_id| {
+            let statements = this.store.list_mark();
+            // A function body's contract markers are lowered by `collect_fn_body`.
+            let markers = mem::take(&mut this.contract_markers);
+            // blaze_verify's clause groups of the function or loop the block is the body of.
+            this.collect_spec_head(block, markers > 0);
+            block.statements().skip(markers).for_each(|s| this.collect_stmt(s));
+            let tail = block.tail_expr().and_then(|e| match e {
+                ast::Expr::MacroExpr(mac) => this.collect_macro_as_stmt(mac, true),
+                expr => this.maybe_collect_expr(expr),
+            });
+            let tail = tail.or_else(|| this.store.pop_list_tail_expr(statements));
+            let syntax_node_ptr = ExprPtr::of(ast::Expr::BlockExpr(block));
+            this.with_lists(statements, |this, lists| {
+                let expr = mk_block(this, block_id, lists.statements_since(statements), tail);
+                this.alloc_expr(expr, syntax_node_ptr)
+            })
+        })
+    }
+
+    /// Runs `f` in the scope of `block`: its own items' def map, when it has items, and its id;
+    /// `f` makes the block's expression.
+    fn with_block_scope(
+        &mut self,
+        block: ast::BlockExpr<'_>,
+        f: impl FnOnce(&mut Self, Option<BlockId>) -> ExprId,
+    ) -> ExprId {
         let block_id = (|| {
             let token = self.lowering_mode.allow_tracked_structs()?;
             let file_local_id = self.expander.ast_id_map().ast_id_for_block_view(block)?;
@@ -3306,24 +3417,12 @@ impl<'db> ExprCollector<'db> {
             None => self.current_block_legacy_macro_defs_count.clone(),
         };
 
-        let statements = self.store.list_mark();
-        block.statements().for_each(|s| self.collect_stmt(s));
-        let tail = block.tail_expr().and_then(|e| match e {
-            ast::Expr::MacroExpr(mac) => self.collect_macro_as_stmt(mac, true),
-            expr => self.maybe_collect_expr(expr),
-        });
-        let tail = tail.or_else(|| self.store.pop_list_tail_expr(statements));
-
         let written_in = block
             .stmt_list()
             .and_then(|it| it.l_curly_token())
             .map(|it| self.expander.ctx_for_range(it.text_range()))
             .filter(|it| !it.is_root());
-        let syntax_node_ptr = ExprPtr::of(ast::Expr::BlockExpr(block));
-        let expr_id = self.with_lists(statements, |this, lists| {
-            let expr = mk_block(this, block_id, lists.statements_since(statements), tail);
-            this.alloc_expr(expr, syntax_node_ptr)
-        });
+        let expr_id = f(self, block_id);
         if let Some(written_in) = written_in {
             self.store.block_editions.insert(expr_id, written_in.edition(self.db));
         }
@@ -3983,9 +4082,18 @@ impl<'db> ExprCollector<'db> {
     }
 
     fn with_label_rib<T>(&mut self, kind: RibKind, f: impl FnOnce(&mut Self) -> T) -> T {
+        // A closure, coroutine or const is a new scope for `return`: rustc's `with_new_scopes`
+        // takes the contract's ensures check away in it.
+        let contract_ensures = match kind {
+            RibKind::Closure | RibKind::Constant => self.contract_ensures.take(),
+            RibKind::Normal(..) | RibKind::MacroDef(_) => None,
+        };
         self.stacks.label_ribs.push(LabelRib::new(kind));
         let res = f(self);
         self.pop_label_rib();
+        if contract_ensures.is_some() {
+            self.contract_ensures = contract_ensures;
+        }
         res
     }
 
@@ -4090,11 +4198,41 @@ impl<'db> ExprCollector<'db> {
                 node: self.expander.in_file(AstPtr::<tag::Literal>::of(lit)),
             });
         }
+        // blaze: `5u3` under `#![blaze::arbitrary_ints]`; every other crate reads the suffix
+        // as rustc does (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+        if self.def_map.arbitrary_ints()
+            && let ast::LiteralKind::IntNumber(int) = kind
+            && let Some(suffix) = int.suffix()
+        {
+            use crate::builtin_type::BuiltinType;
+            match BuiltinType::arbitrary_by_text(suffix) {
+                Some(BuiltinType::Uint(it)) => return Literal::Uint(int.value().unwrap_or(0), Some(it)),
+                Some(BuiltinType::Int(it)) => {
+                    return Literal::Int(int.value().unwrap_or(0) as i128, Some(it));
+                }
+                _ => {}
+            }
+        }
         kind.into()
     }
 }
 
 impl<'db> ExprCollector<'db> {
+    /// Whether the crate has `#![feature(blaze_comptime)]`; without it `form` at `node` is the
+    /// `ComptimeWithoutFeature` error.
+    pub(in crate::expr_store) fn comptime_enabled(
+        &mut self,
+        node: SyntaxNodePtr,
+        form: ComptimeForm,
+    ) -> bool {
+        if self.features().blaze_comptime {
+            return true;
+        }
+        let node = self.expander.in_file(node);
+        self.store.diagnostics.push(ExpressionStoreDiagnostics::ComptimeWithoutFeature { node, form });
+        false
+    }
+
     fn features(&self) -> &'db UnstableFeatures {
         self.def_map.features()
     }

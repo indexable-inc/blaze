@@ -9,12 +9,13 @@
 //! `InvalidNullArgumentsDiag`) (MIT or Apache-2.0).
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{
     hir::{BinaryOp, BindingId, CmpOp, Expr, ExprId, type_ref::TypeRef},
     signatures::FunctionSignature,
 };
 use hir_ty::next_solver::TyKind;
-use intern::Symbol;
+use intern::{Symbol, sym};
 use rustc_type_ir::inherent::IntoKind as _;
 
 use super::{
@@ -55,8 +56,7 @@ impl LatePass for PtrNullChecks {
                     return;
                 }
                 let Some(name) = callee_item(b, callee) else { return };
-                let items = util::items();
-                if (name == items.ptr_const_is_null || name == items.ptr_is_null)
+                if (name == sym::ptr_const_is_null || name == sym::ptr_is_null)
                     && let [arg] = args
                     && let Some(useless) = useless_check(b, *arg)
                 {
@@ -64,17 +64,17 @@ impl LatePass for PtrNullChecks {
                     return;
                 }
                 let first: [Symbol; 6] = [
-                    items.ptr_read,
-                    items.ptr_read_unaligned,
-                    items.ptr_replace,
-                    items.ptr_write,
-                    items.ptr_write_bytes,
-                    items.ptr_write_unaligned,
+                    sym::ptr_read,
+                    sym::ptr_read_unaligned,
+                    sym::ptr_replace,
+                    sym::ptr_write,
+                    sym::ptr_write_bytes,
+                    sym::ptr_write_unaligned,
                 ];
-                let both = [items.ptr_copy, items.ptr_copy_nonoverlapping, items.ptr_swap, items.ptr_swap_nonoverlapping];
+                let both = [sym::ptr_copy, sym::ptr_copy_nonoverlapping, sym::ptr_swap, sym::ptr_swap_nonoverlapping];
                 let (arg_indices, are_zsts_allowed): (&[usize], bool) = if first.contains(&name) {
                     (&[0], true)
-                } else if name == items.slice_from_raw_parts || name == items.slice_from_raw_parts_mut {
+                } else if name == sym::slice_from_raw_parts || name == sym::slice_from_raw_parts_mut {
                     (&[0], false)
                 } else if both.contains(&name) {
                     (&[0, 1], true)
@@ -111,7 +111,7 @@ impl LatePass for PtrNullChecks {
             }
             Expr::MethodCall { receiver, args: &[], .. } => {
                 if matches!(util::ty_adjusted(b, receiver).kind(), TyKind::RawPtr(..))
-                    && method_item(b, expr).is_some_and(|it| it == util::items().ptr_const_is_null || it == util::items().ptr_is_null)
+                    && method_item(b, expr).is_some_and(|it| it == sym::ptr_const_is_null || it == sym::ptr_is_null)
                     && let Some(useless) = useless_check(b, receiver)
                 {
                     emit_useless(b, expr, useless, out);
@@ -128,7 +128,7 @@ impl LatePass for PtrNullChecks {
                 let is_null = match store.expr(to_check) {
                     Expr::Cast { expr: inner, .. } => is_zero(b, inner),
                     Expr::Call { callee, args } => {
-                        args.is_empty() && callee_item(b, callee).is_some_and(|it| it == util::items().ptr_null || it == util::items().ptr_null_mut)
+                        args.is_empty() && callee_item(b, callee).is_some_and(|it| it == sym::ptr_null || it == sym::ptr_null_mut)
                     }
                     _ => false,
                 };
@@ -201,7 +201,7 @@ fn useless_check(b: &BodyCx<'_, '_, '_>, mut e: ExprId) -> Option<Useless> {
                 expr
             }
             Expr::MethodCall { receiver, args, .. }
-                if args.is_empty() && method_item(b, e).is_some_and(|it| it == util::items().ptr_cast || it == util::items().ptr_cast_mut) =>
+                if args.is_empty() && method_item(b, e).is_some_and(|it| it == sym::ptr_cast || it == sym::ptr_cast_mut) =>
             {
                 had_at_least_one_cast = true;
                 receiver
@@ -223,11 +223,11 @@ fn useless_check(b: &BodyCx<'_, '_, '_>, mut e: ExprId) -> Option<Useless> {
 
 /// rustc's `is_null_ptr` of this pass: through `peel_casts`, a call of `ptr::null()` or
 /// `ptr::null_mut()`, or the literal `0`, with where it is.
-fn is_null_ptr(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, ExprId>, expr: ExprId) -> Option<Span> {
+fn is_null_ptr(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, ExprId, Global>, expr: ExprId) -> Option<Span> {
     let expr = peel_casts(b, inits, expr);
     let is_null = match b.store().expr(expr) {
         Expr::Call { callee, args } if args.is_empty() => {
-            callee_item(b, callee).is_some_and(|it| it == util::items().ptr_null || it == util::items().ptr_null_mut)
+            callee_item(b, callee).is_some_and(|it| it == sym::ptr_null || it == sym::ptr_null_mut)
         }
         Expr::Call { .. } => false,
         _ => is_zero(b, expr),

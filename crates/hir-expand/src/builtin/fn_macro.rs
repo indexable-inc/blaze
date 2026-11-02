@@ -2,7 +2,7 @@
 
 mod args;
 
-use std::{borrow::Cow, sync::OnceLock};
+use std::borrow::Cow;
 
 use base_db::{AnchoredPath, Db};
 use blaze_mem::Frame;
@@ -166,7 +166,8 @@ fn mk_pound(span: Span) -> tt::Leaf {
 
 /// The string literal of `text`, a constant: escaped and interned on the first call, then one
 /// acquire load.
-fn constant_str_literal(cell: &'static OnceLock<Symbol>, text: &str, span: Span) -> tt::Literal {
+#[expect(clippy::disallowed_types, reason = "the process's one cached literal per caller: each constant is interned once")]
+fn constant_str_literal(cell: &'static std::sync::OnceLock<Symbol>, text: &str, span: Span) -> tt::Literal {
     tt::Literal {
         text_and_suffix: *cell.get_or_init(|| str_literal(text, span).text_and_suffix),
         span,
@@ -194,7 +195,8 @@ fn module_path_expand<'f>(
     _tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-    static PLACEHOLDER: OnceLock<Symbol> = OnceLock::new();
+    #[expect(clippy::disallowed_types, reason = "the process's one module path placeholder symbol: the constant is interned once")]
+    static PLACEHOLDER: std::sync::OnceLock<Symbol> = std::sync::OnceLock::new();
     let placeholder = constant_str_literal(&PLACEHOLDER, MODULE_PATH_PLACEHOLDER, span);
     ExpandResult::ok(quote_in! {frame, span =>
          #placeholder
@@ -344,7 +346,7 @@ fn trace_macros_expand<'f>(
 
 /// Whether the source has another token right after the token `text` at `span`. `None` if the
 /// source does not have that token there, which is the case for a token made by a macro.
-fn source_joined(db: &Db, span: Span, text: &str) -> Option<bool> {
+pub(crate) fn source_joined(db: &Db, span: Span, text: &str) -> Option<bool> {
     let crate::FileRange { file_id, range } = crate::resolve_span(db, span);
     let source = db.file_text(file_id.file_id(db)).text(db);
     if source.get(std::ops::Range::<usize>::from(range))? != text {
@@ -360,7 +362,7 @@ fn source_joined(db: &Db, span: Span, text: &str) -> Option<bool> {
 
 /// Whether the tokens of the source a call of `id` is given came out of a proc macro on their
 /// way there: some expansion it is in is a proc macro's.
-fn through_proc_macro(db: &Db, id: MacroCallId) -> bool {
+pub(crate) fn through_proc_macro(db: &Db, id: MacroCallId) -> bool {
     let mut file = id.parent(db);
     while let HirFileId::MacroFile(call) = file {
         if call.loc(db).def.is_proc_macro() {
@@ -393,7 +395,7 @@ fn stringify_expand<'f>(
 
 /// Formats the binary operators and paths in the expression reported by a failed assertion.
 /// `stringify!` instead preserves the token spacing supplied by the caller. Appended to `out`.
-fn write_assert_condition(out: &mut String, tokens: &str, edition: Edition) {
+pub(crate) fn write_assert_condition(out: &mut String, tokens: &str, edition: Edition) {
     use syntax::{SyntaxKind, T};
 
     let parse = syntax::ast::Expr::parse(tokens, edition);
@@ -495,7 +497,8 @@ fn file_expand<'f>(
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     // FIXME: RA purposefully lacks knowledge of absolute file names
     // so just return "".
-    static FILE: OnceLock<Symbol> = OnceLock::new();
+    #[expect(clippy::disallowed_types, reason = "the process's one file placeholder symbol: the constant is interned once")]
+    static FILE: std::sync::OnceLock<Symbol> = std::sync::OnceLock::new();
     let file_name = constant_str_literal(&FILE, "file", span);
 
     let expanded = quote_in! {frame, span =>

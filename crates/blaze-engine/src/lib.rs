@@ -2,7 +2,11 @@
 //! what runs before it ([`main`]): the sandbox launcher, the stand-ins a build script runs, and
 //! the release of blaze a workspace pins (`pin.rs`, `versions.rs`).
 
-#![allow(clippy::print_stderr, reason = "a command line program: stderr is where it speaks")]
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the program `blaze`: stdout is its output, stderr is where it speaks"
+)]
 #![deny(unsafe_code)]
 
 mod as_rustc;

@@ -7,8 +7,6 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::OnceLock;
-
 use anyhow::{Result, anyhow, bail};
 use blaze_ids::{ContentId, Domain, Interner, Sharded};
 use url::Url;
@@ -251,14 +249,22 @@ impl PartialEq for SourceIdInner {
 
 /// Every source id, by the content ID of what [`SourceIdInner`]'s `Eq` compares (its `Hash`
 /// covers exactly that): a hit is lock-free probes and no allocation.
-static SOURCE_IDS: OnceLock<Sharded<SourceIdInner>> = OnceLock::new();
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's interner: a `SourceId` is a `&'static` into it, compared by address, so there is one per process"
+)]
+static SOURCE_IDS: std::sync::OnceLock<Sharded<SourceIdInner>> = std::sync::OnceLock::new();
 static SOURCE_ID: Domain = Domain::new("blaze-source source id 1");
 
 /// The first name each registry was given, by the content ID of its kind and canonical URL,
 /// written once and read with no lock. An id interned before its named twin (a lock file's
 /// registry read before the manifest's) has no name of its own; cargo always makes the named
 /// one first, and its messages name the registry.
-static REGISTRY_NAMES: OnceLock<Sharded<KeyOf>> = OnceLock::new();
+#[expect(
+    clippy::disallowed_types,
+    reason = "kept beside the source ids' interner, whose ids it names: one per process as they are"
+)]
+static REGISTRY_NAMES: std::sync::OnceLock<Sharded<KeyOf>> = std::sync::OnceLock::new();
 static REGISTRY_NAME: Domain = Domain::new("blaze-source registry name 1");
 
 fn registry_names() -> &'static Sharded<KeyOf> {
@@ -437,7 +443,11 @@ impl SourceId {
     /// crates.io as cargo names it when no `[registry] index` or `[source]` changes it: its
     /// git index URL, named `crates-io`. The sparse protocol is a replacement of this source.
     pub fn crates_io() -> SourceId {
-        static ID: OnceLock<SourceId> = OnceLock::new();
+        #[expect(
+            clippy::disallowed_types,
+            reason = "an id of the process's interner, parsed and interned once rather than at each ask"
+        )]
+        static ID: std::sync::OnceLock<SourceId> = std::sync::OnceLock::new();
         *ID.get_or_init(|| {
             let url = Url::parse(CRATES_IO_INDEX).unwrap();
             SourceId::for_alt_registry(&url, CRATES_IO_REGISTRY).unwrap()
@@ -446,7 +456,11 @@ impl SourceId {
 
     /// crates.io's sparse index, named `crates-io`.
     pub fn crates_io_sparse() -> SourceId {
-        static ID: OnceLock<SourceId> = OnceLock::new();
+        #[expect(
+            clippy::disallowed_types,
+            reason = "an id of the process's interner, parsed and interned once rather than at each ask"
+        )]
+        static ID: std::sync::OnceLock<SourceId> = std::sync::OnceLock::new();
         *ID.get_or_init(|| {
             let url = Url::parse(CRATES_IO_HTTP_INDEX).unwrap();
             SourceId::for_alt_registry(&url, CRATES_IO_REGISTRY).unwrap()

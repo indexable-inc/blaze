@@ -18,12 +18,13 @@ use std::{
     },
 };
 
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use blaze_format::cursor::Put;
 use blaze_ids::ContentId;
 use blaze_mem::{Frame, Tag, frame, scratch};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_query::db::{Durability, Setter};
 use smallvec::SmallVec;
 use triomphe::Arc;
@@ -100,6 +101,9 @@ pub struct Files {
     env_read: Table<(Crate, Box<str>)>,
     /// The variables `env!` has found unset, by the crate asking.
     env_unset: Table<(Crate, Box<str>)>,
+    /// What each proc-macro expansion read besides its call, by the crate the call is in and
+    /// where the reads come from: a later note from the same place replaces them.
+    expansions_read: RwLock<HashMap<(Crate, ReadBy), Box<[ExpansionRead]>, Global>>,
     /// Every list of directories whose files are read from another directory that
     /// [`Files::set_view`] made, kept for readers that may hold one; `view` names the one in use.
     views: Log<Box<[View]>>,
@@ -125,13 +129,13 @@ struct View {
 pub(crate) struct Writer {
     /// The inputs of files that had text and lost it (bytes that are not UTF-8), kept so that
     /// what read them reruns if they get text again.
-    pub(crate) parked: HashMap<FileId, FileText>,
+    pub(crate) parked: HashMap<FileId, FileText, Global>,
     /// The content IDs of each source root's files, from which its own is kept.
-    pub(crate) root_contents: HashMap<SourceRootId, RootContent>,
+    pub(crate) root_contents: HashMap<SourceRootId, RootContent, Global>,
     /// The source roots whose [`RootContent`] has each file.
     pub(crate) in_roots: ByFile<SmallVec<[SourceRootId; 1]>>,
     /// Every path a source root has named, with its file: a path keeps its file for good.
-    pub(crate) by_path: HashMap<VfsPath, FileId>,
+    pub(crate) by_path: HashMap<VfsPath, FileId, Global>,
     /// The blaze-vfs content ID each file was last set from by [`Files::set_view_root`].
     pub(crate) view_ids: ByFile<ContentId>,
     /// Where [`Files::unused_file_id`] starts looking for an unused file ID.
@@ -142,7 +146,7 @@ pub(crate) struct Writer {
     /// these.
     pub(crate) free_crate_attrs: Vec<FileId>,
     /// The index of each view base's paths that [`Files::set_view_root`] keeps.
-    pub(crate) views: HashMap<AbsPathBuf, ViewIndex>,
+    pub(crate) views: HashMap<AbsPathBuf, ViewIndex, Global>,
     /// `by_path` as queries read it, across source roots ([`crate::named`]).
     pub(crate) named: Named,
     /// An empty source root, which a root's input holds while its own is edited out of it.
@@ -260,6 +264,7 @@ impl Default for Files {
             sources_included_by: Table::new(1 << 22),
             env_read: Table::new(1 << 22),
             env_unset: Table::new(1 << 22),
+            expansions_read: RwLock::default(),
             views: Log::new(1 << 16),
             view: AtomicU32::new(0),
         }
@@ -846,6 +851,47 @@ impl Files {
         env_list(&self.env_unset)
     }
 
+    /// Notes what `by` in `krate` read, in place of what it read before: the latest expansion
+    /// of a call (one read, or none for an expansion that read nothing), or each read of a
+    /// value served in place of resolving (`hir_def::deps::filed::search`), none when it was
+    /// not served. So the log says what each call's expansion reads now: a call whose
+    /// expansion was unknown and traces now has only the trace.
+    pub fn expansions_are_read(&self, krate: Crate, by: ReadBy, reads: Vec<ExpansionRead>) {
+        let at = (krate, by);
+        if reads.is_empty() {
+            // Most expansions read nothing and were never noted: no write lock for them.
+            if self.expansions_read.read().contains_key(&at) {
+                self.expansions_read.write().remove(&at);
+            }
+            return;
+        }
+        self.expansions_read.write().insert(at, reads.into_boxed_slice());
+    }
+
+    /// Sorted, each once. A call no longer in its crate keeps what it last read: whoever
+    /// refuses a value for an unknown read asks the crate's calls as they are now
+    /// (`hir_def::deps::closure_expansion_reads`).
+    pub fn expansions_read(&self) -> Vec<(Crate, ExpansionRead)> {
+        let log = self.expansions_read.read();
+        let mut list: Vec<_> = (log.iter())
+            // clone: the edge: a sorted list for whoever keys a value by what was read.
+            .flat_map(|(&(krate, _), reads)| reads.iter().map(move |it| (krate, it.clone())))
+            .collect(); // alloc: as above.
+        drop(log);
+        list.sort();
+        list.dedup();
+        list
+    }
+
+    /// What `by` in `krate` read, as [`Files::expansions_are_read`] last noted it: a crate's
+    /// image filed by its reads keeps what its dependencies' were served by
+    /// (`hir_def::deps::reads`).
+    pub fn expansions_read_by(&self, krate: Crate, by: ReadBy) -> Vec<ExpansionRead> {
+        // clone: the edge: a few names and hashes, once per dependency of a crate imaged.
+        let reads = self.expansions_read.read().get(&(krate, by)).map(|it| it.to_vec());
+        reads.unwrap_or_default() // alloc: as above.
+    }
+
     /// Sorted.
     pub fn included_files(&self) -> Vec<AbsPathBuf> {
         // alloc: the edge, as above.
@@ -1039,6 +1085,25 @@ fn keep_aliases(writer: &Writer, root: &mut Arc<SourceRoot>) {
     }
 }
 
+/// Where reads in [`Files::expansions_read`] come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReadBy {
+    /// The latest expansion of a proc-macro call.
+    Call(span::MacroCallId),
+    /// A value served by its reads in place of resolving its crate, by the key it is filed
+    /// under: a crate's image, or a check of its bodies.
+    Served(ContentId),
+}
+
+/// What a proc-macro expansion read besides its call, as [`Files::expansions_read`] has it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExpansionRead {
+    /// The names it read, as its server encodes them, and the hash of the values they had.
+    Traced { shape: Box<[u8]>, values: ContentId },
+    /// Not known, and why: no key covers what it read.
+    Unknown(&'static str),
+}
+
 fn note_env(table: &Table<(Crate, Box<str>)>, krate: Crate, key: &str) {
     table.insert(hash_of((krate, key)), |(by, known)| *by == krate && **known == *key, || {
         (krate, key.into())
@@ -1084,7 +1149,7 @@ pub(crate) struct RootContent {
     /// it in place ([`Files::set_view_root`]).
     pub(crate) one_to_one: bool,
     /// Each file's entry in `entries`.
-    files: HashMap<FileId, u32>,
+    files: HashMap<FileId, u32, Global>,
     entries: Vec<Entry>,
     /// Entries no file has, for the next file to take.
     free_entries: Vec<u32>,
@@ -1159,7 +1224,7 @@ impl RootContent {
         RootContent {
             is_library,
             one_to_one: false,
-            files: HashMap::default(),
+            files: HashMap::new_in(Global),
             entries: Vec::new(), // alloc: none until a file is put in; grows with the root (setup).
             free_entries: Vec::new(), // alloc: as above, with the files taken out.
             // alloc: once per source root set (setup).
@@ -1526,7 +1591,7 @@ impl RootContent {
     /// hashed in one batch, then the inner nodes a batch a depth, deepest first, then the
     /// roots in one.
     pub(crate) fn refresh(
-        contents: &mut HashMap<SourceRootId, RootContent>,
+        contents: &mut HashMap<SourceRootId, RootContent, Global>,
         roots: &[SourceRootId],
         frame: &Frame,
     ) {
@@ -1548,7 +1613,7 @@ impl RootContent {
         if refreshed.is_empty() {
             return;
         }
-        fn of(contents: &HashMap<SourceRootId, RootContent>, root: SourceRootId) -> &RootContent {
+        fn of(contents: &HashMap<SourceRootId, RootContent, Global>, root: SourceRootId) -> &RootContent {
             contents.get(&root).expect("a root out of date has its content")
         }
         let mut bytes = scratch::lend_bytes();

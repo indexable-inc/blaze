@@ -13,8 +13,13 @@
 //! [`Response::Explored`] and nowhere else, never to a log.
 
 use std::{
+    collections::VecDeque,
     fs,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::JoinHandle,
     time::Duration,
 };
@@ -22,11 +27,14 @@ use std::{
 use blaze_api::{ApiError, LiveFrame, Reply, RequestRef, Response};
 use blaze_core::Conn;
 use blaze_profile::{
+    facts::{CrateDepRow, LinkRow, QueryCountRow},
     history::{self, BuildRow, History},
     live::{self, Feed, Frame},
     sql,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+
+use super::why::{Answer, Answers, Ledger, file::File};
 
 /// The variable naming the DuckDB `blaze debug sql` and the explorer run: an absolute path,
 /// which blaze's Nix wrapper sets to `nix run .#duckdb`'s. Never looked up on `PATH`.
@@ -116,8 +124,105 @@ pub struct Profiling {
     /// The number of the daemon's first build: past every build the history names, so a build
     /// stays one id across the daemon's restarts ([`History::next_build`]). Never 0.
     pub first_build: u32,
-    ended: Sender<BuildRow>,
+    ended: Sender<Finished>,
     failed: Receiver<String>,
+    /// What the history's thread tells the loop of `blaze why`'s ledger: its restore, and each
+    /// build's answer.
+    told: Receiver<Told>,
+    /// What the history's thread is doing, for a `blaze why` that waited too long to name.
+    doing: Arc<Doing>,
+}
+
+/// How long a `blaze why` waits for the builds that ended before it was asked to be explained,
+/// on the loop's clock, before it fails naming the build and what the history's thread is
+/// doing (rule 15).
+pub const WHY_WAIT: Duration = Duration::from_secs(30);
+
+/// What the history's thread is doing, as the loop reads it: a step in the top byte and the
+/// build it is for below, one atomic so the two are read together.
+#[derive(Default)]
+struct Doing(AtomicU64);
+
+/// A step of the history's thread ([`Doing`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum Step {
+    Opening = 0,
+    Restoring = 1,
+    Waiting = 2,
+    Explaining = 3,
+    Appending = 4,
+    Flushing = 5,
+    Closing = 6,
+}
+
+impl Doing {
+    const BUILD: u64 = (1 << 56) - 1;
+
+    fn set(&self, step: Step, build: u64) {
+        self.0.store((step as u64) << 56 | (build & Self::BUILD), Ordering::Relaxed);
+    }
+
+    /// What the thread is doing, in words.
+    fn said(&self) -> String {
+        let it = self.0.load(Ordering::Relaxed);
+        let build = it & Self::BUILD;
+        // alloc: error path, a `blaze why` past its deadline
+        let step = [Step::Opening, Step::Restoring, Step::Waiting, Step::Explaining, Step::Appending, Step::Flushing, Step::Closing]
+            .into_iter()
+            .find(|step| *step as u64 == it >> 56);
+        match step {
+            Some(Step::Opening) => "opening the profile history".to_owned(),
+            Some(Step::Restoring) => "restoring blaze why's ledger".to_owned(),
+            Some(Step::Waiting) => "waiting for a build to end".to_owned(),
+            Some(Step::Explaining) => format!("explaining build {build}'s misses"),
+            Some(Step::Appending) => format!("appending build {build}'s record to blaze why's ledger"),
+            Some(Step::Flushing) if build == 0 => "flushing the profile history on its timer".to_owned(),
+            Some(Step::Flushing) => format!("flushing the profile history for build {build}"),
+            Some(Step::Closing) => "writing blaze why's ledger whole as the daemon stops".to_owned(),
+            None => format!("in step {}, which this blaze does not know", it >> 56),
+        }
+    }
+}
+
+/// What the history's thread tells the loop of `blaze why`'s ledger.
+enum Told {
+    /// The restore ended, short for `torn` when it was.
+    Restored { torn: Option<String>, dropped: Option<u64> },
+    /// A build's misses explained.
+    Explained { answer: Answer, dropped: Option<u64> },
+}
+
+/// A build that ended, as the history's rows: its own, each image it linked, and an edge of
+/// its crate graph each.
+pub struct Ended {
+    pub row: BuildRow,
+    pub links: Vec<LinkRow>,
+    pub crate_deps: Vec<CrateDepRow>,
+    /// Why each thing it computed again was not reused, its own alone, sorted and each once
+    /// ([`blaze_kernel::Miss`]): what `blaze why` explains.
+    pub misses: Vec<blaze_kernel::Miss>,
+}
+
+/// What the `blaze-history` thread writes of a build that ended: its rows (with its misses,
+/// which it explains against `blaze why`'s ledger) and what the query engine counted by its end.
+struct Finished {
+    ended: Ended,
+    query_counts: Vec<QueryCountRow>,
+}
+
+/// What the query engine counted since the last take, as `build`'s `query_counts` rows. Taken
+/// on the loop as the build ends, so the next build's runs are its own.
+fn query_counts(build: u64) -> Vec<QueryCountRow> {
+    // alloc: once a build, a row a query function that did anything
+    let mut rows = Vec::new();
+    blaze_query::db::take_counts(|query, counts| rows.push(query_count_row(build, query, counts)));
+    rows
+}
+
+fn query_count_row(build_id: u64, query: &'static str, counts: blaze_query::db::Counts) -> QueryCountRow {
+    let blaze_query::db::Counts { executed, verified, reran, evicted_asked, refused, evicted, dropped } = counts;
+    QueryCountRow { build_id, query, executed, verified, reran, evicted_asked, evicted, refused, dropped }
 }
 
 /// The `blaze-history` thread: it ends with a last flush once the daemon (its [`Profiling`])
@@ -134,19 +239,35 @@ impl Keeper {
 /// a history that does not open is the error, which fails `blaze serve`.
 pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling, Keeper), String> {
     let dir = history::dir_in(state);
+    let owner = claim(&dir).map_err(|it| it.to_string())?;
     let (ended, rows) = crossbeam_channel::unbounded();
     let (failed_to, failed) = crossbeam_channel::unbounded();
     let (opened_to, opened) = crossbeam_channel::bounded(1);
-    // clone: a path, once a daemon
-    let at = dir.clone();
+    let (told_to, told) = crossbeam_channel::unbounded();
+    let doing = Arc::new(Doing::default()); // alloc: once a daemon
+    // clone: a path and a handle, once a daemon
+    let (at, now) = (dir.clone(), Arc::clone(&doing));
     let thread = std::thread::Builder::new()
         .name("blaze-history".to_owned())  // alloc: once a daemon
-        .spawn(move || match History::open(&at, history::CAP_BYTES) {
-            Ok(history) => {
-                _ = opened_to.send(Ok(history.next_build()));
-                keep(history, &rows, &failed_to);
+        .spawn(move || {
+            // Held until the last flush is written: a daemon after this one numbers its builds
+            // from what this one wrote.
+            let _owner = owner;
+            match History::open(&at, history::CAP_BYTES) {
+                Ok(history) => {
+                    _ = opened_to.send(Ok(history.next_build()));
+                    // Off the daemon's start path: builds that end meanwhile wait in `rows`.
+                    now.set(Step::Restoring, 0);
+                    let (mut why, said) = File::restore(&at);
+                    if let Some(said) = said.said {
+                        tracing::warn!("{said}");
+                        _ = failed_to.send(said);
+                    }
+                    _ = told_to.send(Told::Restored { torn: said.torn, dropped: why.dropped() });
+                    keep(history, &mut why, &rows, &failed_to, &told_to, &now);
+                }
+                Err(error) => _ = opened_to.send(Err(error.to_string())),  // alloc: error path, once a daemon
             }
-            Err(error) => _ = opened_to.send(Err(error.to_string())),  // alloc: error path, once a daemon
         })
         .map_err(|error| format!("starting the profile history's thread (`blaze-history`): {error}"))?;  // alloc: error path
     let first_build = match opened.recv() {
@@ -154,25 +275,114 @@ pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling,
         Ok(Err(why)) => return Err(why),
         Err(_) => return Err("the profile history's thread (`blaze-history`) ended before it opened the history".to_owned()),  // alloc: error path
     };
-    Ok((Profiling { dir, duckdb, first_build, ended, failed }, Keeper(thread)))
+    Ok((Profiling { dir, duckdb, first_build, ended, failed, told, doing }, Keeper(thread)))
+}
+
+/// The file in a history's directory whose lock says which daemon writes it, and whose text
+/// is that daemon's pid.
+const OWNER: &str = "owner.lock";
+
+/// A history another process writes: build ids are numbered from what a history holds, so a
+/// second writer would give its builds the first one's ids.
+#[derive(Debug)]
+pub enum Claim {
+    Owned { dir: PathBuf, holder: Option<u32> },
+    Io { path: PathBuf, doing: &'static str, error: std::io::Error },
+}
+
+impl std::fmt::Display for Claim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Claim::Owned { dir, holder } => {
+                write!(f, "the profile history {} is written by another blaze serve (", dir.display())?;
+                match holder {
+                    Some(pid) => write!(f, "pid {pid}")?,
+                    None => f.write_str("its pid unread")?,
+                }
+                write!(f, ", holding {OWNER}): two daemons over one history would give builds the same id")
+            }
+            Claim::Io { path, doing, error } => write!(f, "{doing} {}: {error}", path.display()),
+        }
+    }
+}
+
+/// This process's claim on the history in `dir`, for as long as the file lives: an exclusive
+/// lock on its [`OWNER`] file, with the pid written in it for the next claimant to name.
+fn claim(dir: &Path) -> Result<fs::File, Claim> {
+    let io = |path: &Path, doing| {
+        let path = path.to_path_buf(); // alloc: error path
+        move |error| Claim::Io { path, doing, error }
+    };
+    fs::create_dir_all(dir).map_err(io(dir, "making the profile history"))?;
+    let path = dir.join(OWNER);
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(io(&path, "opening the profile history's owner file"))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            let holder = fs::read_to_string(&path).ok().and_then(|it| it.trim().parse().ok());
+            return Err(Claim::Owned { dir: dir.to_path_buf(), holder });
+        }
+        Err(fs::TryLockError::Error(error)) => {
+            return Err(io(&path, "locking the profile history's owner file")(error));
+        }
+    }
+    use std::io::Write as _;
+    file.set_len(0).map_err(io(&path, "writing the profile history's owner file"))?;
+    write!(file, "{}", std::process::id()).map_err(io(&path, "writing the profile history's owner file"))?;
+    Ok(file)
 }
 
 /// The history's loop: a flush every [`history::EVERY`], and one for each build as it ends,
 /// which writes its row and gives its spans its commit. A flush that fails is logged and told
 /// to the daemon, for `blaze daemon status`; the next one goes on.
-fn keep(mut history: History, rows: &Receiver<BuildRow>, failed: &Sender<String>) {
+fn keep(mut history: History, why: &mut File, rows: &Receiver<Finished>, failed: &Sender<String>, told: &Sender<Told>, doing: &Doing) {
     loop {
+        doing.set(Step::Waiting, 0);
         let (flushed, last) = match rows.recv_timeout(history::EVERY) {
-            Ok(mut row) => {
+            Ok(Finished { ended: Ended { mut row, links, crate_deps, misses }, query_counts }) => {
                 let build = row.build_id;
+                let ended_well = matches!(row.outcome, history::Outcome::Ok);
+                doing.set(Step::Explaining, build);
+                let (rebuilt, misses, record) = why.explain(build, ended_well, misses);
+                // clone: the answer's copy of whose build it is, once a build
+                let answer = Answer { build, workspace: row.workspace.clone(), command: row.command.clone(), rebuilt };
+                // Sent before the record is durable: an answer may name a build whose record a
+                // crash then loses (docs/v2/plan/lanes/why.md, "Answered before durable").
+                _ = told.send(Told::Explained { answer, dropped: why.dropped() });
+                doing.set(Step::Appending, build);
+                if let Err(error) = why.write(build, &record) {
+                    tracing::error!("{error}");
+                    _ = failed.send(error);
+                }
                 if row.commit.is_none() {
                     row.commit = commit_of(Path::new(&row.workspace));
                 }
+                history.linked(links);
+                history.crate_graph(crate_deps);
+                history.query_counted(query_counts);
+                history.missed(misses);
                 history.build_ended(row);
+                doing.set(Step::Flushing, build);
                 (history.flush(Some(build)), false)
             }
-            Err(RecvTimeoutError::Timeout) => (history.flush(None), false),
-            Err(RecvTimeoutError::Disconnected) => (history.flush(None), true),
+            Err(RecvTimeoutError::Timeout) => {
+                doing.set(Step::Flushing, 0);
+                (history.flush(None), false)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                doing.set(Step::Closing, 0);
+                if let Err(error) = why.close() {
+                    tracing::error!("{error}");
+                    _ = failed.send(error);
+                }
+                (history.flush(None), true)
+            }
         };
         if let Err(error) = flushed {
             tracing::error!("{error}");
@@ -245,11 +455,38 @@ pub struct Observe {
     answered: Receiver<Answered>,
     /// The history's last error, for [`blaze_api::Status::history`].
     history_error: Option<String>,
+    /// What `blaze why` is answered from: each workspace's last build's reasons.
+    answers: Answers,
+    /// How many builds were given to the history's thread, and how many of their reasons came
+    /// back (in the order given): a `blaze why` waits in `asked` for those given before it was
+    /// asked, never for builds that end after, so it is never answered from the build before.
+    sent: u64,
+    explained: u64,
+    /// The builds given whose reasons have not come back, oldest first: what a `blaze why` past
+    /// its deadline names.
+    unexplained: VecDeque<u64>,
+    asked: Vec<Asked>,
+    /// The history's thread is gone: nothing more comes back, so nothing waits for it.
+    history_gone: bool,
+    /// A daemon with no history explains its builds on the loop (a simulation's).
+    local: Option<Ledger>,
+}
+
+/// A `blaze why` waiting for the reasons of builds that ended before it was asked: answered
+/// once `after` builds' have come back, failed at `until` on the loop's clock.
+struct Asked {
+    to: RequestRef,
+    cwd: Option<String>,
+    item: Option<String>,
+    all: bool,
+    after: u64,
+    until: Duration,
 }
 
 impl Observe {
     pub fn new(profiling: Option<Profiling>) -> Observe {
         let (answered_to, answered) = crossbeam_channel::unbounded();
+        let answers = Answers::new(profiling.is_some());
         Observe {
             profiling,
             explorer: None,
@@ -259,6 +496,13 @@ impl Observe {
             answered_to,
             answered,
             history_error: None,
+            answers,
+            sent: 0,
+            explained: 0,
+            unexplained: VecDeque::new(), // alloc: none until a build ends
+            asked: Vec::new(), // alloc: none until a `blaze why` waits
+            history_gone: false,
+            local: None,
         }
     }
 
@@ -273,11 +517,46 @@ impl Observe {
         self.history_error.as_deref()
     }
 
-    /// A build that ended, for the history to write; dropped by a daemon that keeps none.
-    pub fn ended(&mut self, row: BuildRow) {
-        let Some(profiling) = &self.profiling else { return };
-        if profiling.ended.send(row).is_err() {
-            self.history_error = Some("the profile history's thread (`blaze-history`) is gone: no build is written".to_owned());  // alloc: error path
+    /// A build that ended, for the history to write with what the query engine counted by
+    /// now; dropped by a daemon that keeps none, which takes no counts.
+    pub fn ended(&mut self, mut ended: Ended) {
+        let build = ended.row.build_id;
+        let Some(profiling) = &self.profiling else {
+            let _span = tracing::info_span!(target: "blaze", "explain a build's misses", build).entered();
+            let ended_well = matches!(ended.row.outcome, history::Outcome::Ok);
+            let ledger = self.local.get_or_insert_default();
+            let rebuilt = ledger.explain(build, ended_well, std::mem::take(&mut ended.misses)).rebuilt;
+            let dropped = ledger.dropped();
+            // clone: whose build it is, once a build of a daemon with no history
+            let answer = Answer { build, workspace: ended.row.workspace.clone(), command: ended.row.command.clone(), rebuilt };
+            self.answers.add(answer, dropped);
+            return;
+        };
+        let query_counts = query_counts(build);
+        let sent = profiling.ended.send(Finished { ended, query_counts });
+        // Counted whether or not it reached the history's thread: one that never did is never
+        // explained, and `blaze why` says so rather than answer with an older build's reasons
+        // (rule 3).
+        self.sent += 1;
+        self.unexplained.push_back(build);
+        if sent.is_err() {
+            self.history_error = Some("the profile history's thread (`blaze-history`) is gone: no build is written".to_owned()); // alloc: error path
+        }
+    }
+
+    /// `blaze why`: what the last build computed again and why, in groups (each listing
+    /// every item with `all`), or `item`'s chain of reasons.
+    /// Asked of the last build of the workspace holding `cwd`; while builds that ended before
+    /// it was asked (at `now` on the loop's clock) are still being explained on the history's
+    /// thread, it waits for them, up to [`WHY_WAIT`] ([`Observe::tick`]).
+    pub fn rebuilt(&mut self, to: RequestRef, cwd: Option<String>, item: Option<String>, all: bool, now: Duration, out: &mut Vec<Reply>) {
+        if self.explained >= self.sent {
+            return answer(out, to, Response::Rebuilt(self.answers.rebuilt(cwd.as_deref(), item.as_deref(), all)));
+        }
+        // Never answered from a build older than one that ended before it was asked (rule 3).
+        match self.history_gone {
+            true => fail(out, to, never_explained(self.unexplained.front().copied())),
+            false => self.asked.push(Asked { to, cwd, item, all, after: self.sent, until: now + WHY_WAIT }),
         }
     }
 
@@ -348,18 +627,22 @@ impl Observe {
         }
     }
 
-    /// `conn` is gone: its subscriptions end and its queries' DuckDBs are killed.
+    /// `conn` is gone: its subscriptions and waiting `blaze why`s end and its queries' DuckDBs are killed.
     pub fn gone(&mut self, conn: Conn) {
         self.live.retain(|it| it.to.conn != conn);
+        self.asked.retain(|it| it.to.conn != conn);
         for querying in self.querying.iter().filter(|it| it.to.conn == conn) {
             _ = querying.stop.try_send(());
         }
     }
 
     /// How long the loop may wait before its next [`Observe::tick`] is due: until the next
-    /// frame while anyone subscribes.
+    /// frame while anyone subscribes, and no later than the first deadline of a waiting
+    /// `blaze why`.
     pub fn wait(&self, now: Duration) -> Option<Duration> {
-        (!self.live.is_empty()).then(|| self.next_frame.saturating_sub(now))
+        let frame = (!self.live.is_empty()).then_some(self.next_frame);
+        let asked = self.asked.iter().map(|it| it.until).min();
+        frame.into_iter().chain(asked).min().map(|at| at.saturating_sub(now))
     }
 
     /// One turn: the history's errors taken, the queries' answers sent, and once a tick is due
@@ -371,6 +654,46 @@ impl Observe {
             while let Ok(why) = profiling.failed.try_recv() {
                 self.history_error = Some(why);
             }
+            loop {
+                match profiling.told.try_recv() {
+                    Ok(Told::Restored { torn, dropped }) => self.answers.restored(torn, dropped),
+                    Ok(Told::Explained { answer, dropped }) => {
+                        self.answers.add(answer, dropped);
+                        self.explained += 1;
+                        self.unexplained.pop_front();
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        // Gone, so nothing more comes back: what is held is answered now, and
+                        // the status names the history's end. What its restore said stays.
+                        if !self.history_gone && (self.explained < self.sent || self.answers.restoring()) {
+                            self.history_error = Some("the profile history's thread (`blaze-history`) ended: no more builds are explained".to_owned()); // alloc: error path
+                        }
+                        self.history_gone = true;
+                        self.answers.gone();
+                        break;
+                    }
+                }
+            }
+        }
+        if !self.asked.is_empty() {
+            let (answers, explained, gone) = (&self.answers, self.explained, self.history_gone);
+            let (unexplained, doing) = (&self.unexplained, self.profiling.as_ref().map(|it| &*it.doing));
+            self.asked.retain(|it| {
+                if explained >= it.after {
+                    answer(out, it.to, Response::Rebuilt(answers.rebuilt(it.cwd.as_deref(), it.item.as_deref(), it.all)));
+                    return false;
+                }
+                if gone {
+                    fail(out, it.to, never_explained(unexplained.front().copied()));
+                    return false;
+                }
+                if now < it.until {
+                    return true;
+                }
+                fail(out, it.to, late(it, explained, unexplained.front().copied(), doing));
+                false
+            });
         }
         while let Ok(Answered { to, answer }) = self.answered.try_recv() {
             self.querying.retain(|it| it.to != to);
@@ -421,6 +744,31 @@ impl Observe {
 
 const NO_PROFILING: &str = "this daemon keeps no profile history (only `blaze serve`'s does)";
 
+/// The error of a `blaze why` past its deadline: the build it still waits for (the oldest
+/// given whose reasons have not come back) and what the history's thread is doing.
+fn late(asked: &Asked, explained: u64, oldest: Option<u64>, doing: Option<&Doing>) -> ApiError {
+    let build = oldest.map_or_else(|| "a build".to_owned(), |it| format!("build {it}")); // alloc: error path
+    let doing = doing.map_or_else(|| "gone".to_owned(), Doing::said); // alloc: error path
+    let waits = asked.after - explained;
+    // alloc: error path
+    let what = format!(
+        "blaze why waited {}s for {build} to be explained ({waits} of the builds that ended before it was asked still are), and the profile history's thread (`blaze-history`) is {doing}",
+        WHY_WAIT.as_secs()
+    );
+    ApiError::new(what, Some("blaze why".to_owned())) // alloc: error path
+}
+
+/// The error of a `blaze why` asked after a build that the history's thread, now ended, never
+/// explained: answering it would give an older build's reasons as the last build's (rule 3).
+fn never_explained(oldest: Option<u64>) -> ApiError {
+    let build = oldest.map_or_else(|| "a build".to_owned(), |it| format!("build {it}")); // alloc: error path
+    // alloc: error path
+    let what = format!(
+        "blaze why can't answer: {build} ended before it was asked and was never explained, because the profile history's thread (`blaze-history`) ended; the reasons it holds are an older build's"
+    );
+    ApiError::new(what, Some("blaze why".to_owned())) // alloc: error path
+}
+
 fn answer(out: &mut Vec<Reply>, to: RequestRef, response: Response) {
     out.push(Reply { to, response });
     out.push(Reply { to, response: Response::Done { ok: true } });
@@ -451,6 +799,24 @@ fn ipc(batches: &[arrow_array::RecordBatch]) -> Result<(Vec<u8>, u64), ApiError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_history_has_one_writer_and_a_second_claimant_is_told_who() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join("profile");
+        let first = claim(&history).unwrap();
+        match claim(&history) {
+            Err(Claim::Owned { dir, holder }) => {
+                assert_eq!(dir, history);
+                assert_eq!(holder, Some(std::process::id()));
+            }
+            other => panic!("a second claim on a held history: {other:?}"),
+        }
+        let said = claim(&history).unwrap_err().to_string();
+        assert!(said.contains(&history.display().to_string()) && said.contains(&format!("pid {}", std::process::id())), "{said}");
+        drop(first);
+        claim(&history).expect("a history its writer let go of is claimed again");
+    }
 
     #[test]
     fn duckdb_unset_is_none_and_set_wrong_is_an_error_naming_it() {
@@ -494,8 +860,223 @@ mod tests {
         assert_eq!(commit_of(&worktree).as_deref(), Some("aaaa"), "a worktree's branch is the common directory's");
     }
 
+    /// The engine's counts, mapped field for field, go with the build's row through the
+    /// history thread into that build's `query_counts` file; the last flush, for no build,
+    /// writes none.
+    #[test]
+    fn a_builds_query_counts_reach_its_query_counts_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = History::open(dir.path(), history::CAP_BYTES).unwrap();
+        let counts = blaze_query::db::Counts {
+            executed: 6384,
+            verified: 1,
+            reran: 2,
+            evicted_asked: 3,
+            refused: 4,
+            evicted: 5,
+            dropped: 6,
+        };
+        let row = query_count_row(71, "mir_body_query", counts);
+        assert_eq!(
+            [row.executed, row.verified, row.reran, row.evicted_asked, row.refused, row.evicted, row.dropped],
+            [6384, 1, 2, 3, 4, 5, 6]
+        );
+        let ended = Ended {
+            row: BuildRow {
+                build_id: 71,
+                commit: Some("abc".to_owned()),
+                workspace: dir.path().join("no-workspace").display().to_string(),
+                command: "build".to_owned(),
+                started_ns: 0,
+                dur_ns: Some(1),
+                started_unix_ns: None,
+                outcome: history::Outcome::Ok,
+                hits: None,
+                misses: None,
+                joined: None,
+                tree: None,
+                blaze: None,
+            },
+            links: Vec::new(),
+            crate_deps: Vec::new(),
+            misses: Vec::new(),
+        };
+        let (to, rows) = crossbeam_channel::unbounded();
+        let (failed_to, failed) = crossbeam_channel::unbounded();
+        to.send(Finished { ended, query_counts: vec![row] }).unwrap();
+        drop(to);
+        let (mut why, _) = File::restore(dir.path());
+        let (told_to, told) = crossbeam_channel::unbounded();
+        keep(history, &mut why, &rows, &failed_to, &told_to, &Doing::default());
+        assert_eq!(failed.try_recv().ok(), None);
+        assert!(matches!(told.try_recv(), Ok(Told::Explained { answer: Answer { build: 71, .. }, .. })));
+        let written: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|it| it.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|it| it.ends_with(".query_counts.parquet") && !it.starts_with("schema."))
+            .collect();
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert!(written[0].starts_with("71-"), "{written:?}");
+    }
+
     fn to(conn: u64, id: u64) -> RequestRef {
         RequestRef { conn: Conn(conn), id }
+    }
+
+    /// Build `build` of the workspace `/w` ending well, with nothing computed again.
+    fn ended_row(build: u64) -> Ended {
+        let row = BuildRow {
+            build_id: build,
+            commit: None,
+            workspace: "/w".to_owned(),
+            command: "build".to_owned(),
+            started_ns: 0,
+            dur_ns: Some(1),
+            started_unix_ns: None,
+            outcome: history::Outcome::Ok,
+            hits: None,
+            misses: None,
+            joined: None,
+            tree: None,
+            blaze: None,
+        };
+        Ended { row, links: Vec::new(), crate_deps: Vec::new(), misses: Vec::new() }
+    }
+
+    fn explained(build: u64) -> Told {
+        let answer = Answer { build, workspace: "/w".to_owned(), command: "build".to_owned(), rebuilt: Vec::new() };
+        Told::Explained { answer, dropped: None }
+    }
+
+    /// A held `blaze why` waits for the builds that ended before it was asked and no others;
+    /// past its deadline on the loop's clock it fails naming the build it waits for and what
+    /// the history's thread is doing; and once that thread is gone, a held one and one asked
+    /// after both fail naming the build it never explained.
+    #[test]
+    fn a_held_why_waits_for_the_builds_before_it_and_fails_past_its_deadline_naming_them() {
+        let (ended, rows) = crossbeam_channel::unbounded();
+        let (_failed_to, failed) = crossbeam_channel::unbounded();
+        let (told_to, told) = crossbeam_channel::unbounded();
+        let doing = Arc::new(Doing::default());
+        let dir = tempfile::tempdir().unwrap();
+        let profiling =
+            Profiling { dir: dir.path().to_path_buf(), duckdb: None, first_build: 1, ended, failed, told, doing: Arc::clone(&doing) };
+        let mut observe = Observe::new(Some(profiling));
+        let mut out = Vec::new();
+        let at = Duration::from_secs(5);
+        told_to.send(Told::Restored { torn: Some("record 2 does not decode".to_owned()), dropped: None }).unwrap();
+        observe.ended(ended_row(1));
+        observe.rebuilt(to(1, 1), Some("/w".to_owned()), None, false, at, &mut out);
+        assert!(out.is_empty(), "build 1 is not explained yet: {out:?}");
+        assert_eq!(observe.wait(at), Some(WHY_WAIT), "the loop wakes by the deadline");
+        // A build that ends after it was asked is not waited for.
+        observe.ended(ended_row(2));
+        told_to.send(explained(1)).unwrap();
+        observe.tick(at, |_| false, &mut out);
+        match &out[..] {
+            [Reply { response: Response::Rebuilt(it), .. }, Reply { response: Response::Done { ok: true }, .. }] => {
+                assert_eq!((it.build, it.torn.as_deref(), it.restoring), (Some(1), Some("record 2 does not decode"), false));
+            }
+            other => panic!("{other:?}"),
+        }
+        out.clear();
+
+        // Build 2 is never explained: past the deadline it fails, naming it and the history's
+        // step.
+        observe.rebuilt(to(1, 2), None, None, false, at, &mut out);
+        // A held one whose connection goes is dropped, never answered.
+        observe.rebuilt(to(2, 1), None, None, false, at, &mut out);
+        observe.gone(Conn(2));
+        doing.set(Step::Flushing, 1);
+        observe.tick(at + WHY_WAIT - Duration::from_millis(1), |_| false, &mut out);
+        assert!(out.is_empty(), "not due yet: {out:?}");
+        observe.tick(at + WHY_WAIT, |_| false, &mut out);
+        match &out[..] {
+            [Reply { response: Response::Error(error), .. }, Reply { response: Response::Done { ok: false }, .. }] => {
+                assert!(error.what.contains("build 2") && error.what.contains("flushing the profile history for build 1"), "{}", error.what);
+                assert_eq!(error.at.as_deref(), Some("blaze why"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(out.iter().all(|it| it.to.conn == Conn(1)), "nothing to the connection that went: {out:?}");
+        out.clear();
+
+        // The history's thread gone with build 2 unexplained: a held one, and one asked after,
+        // fail naming build 2 and the thread's end, never answered with build 1's reasons.
+        observe.rebuilt(to(1, 3), None, None, false, at, &mut out);
+        assert!(out.is_empty());
+        drop(told_to);
+        observe.tick(at, |_| false, &mut out);
+        observe.rebuilt(to(1, 4), None, None, false, at, &mut out);
+        match &out[..] {
+            [
+                Reply { to: a, response: Response::Error(held) },
+                Reply { response: Response::Done { ok: false }, .. },
+                Reply { to: b, response: Response::Error(after) },
+                Reply { response: Response::Done { ok: false }, .. },
+            ] => {
+                assert_eq!((*a, *b), (to(1, 3), to(1, 4)));
+                for error in [held, after] {
+                    assert!(error.what.contains("build 2") && error.what.contains("blaze-history") && error.what.contains("ended"), "{}", error.what);
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(observe.history_error().is_some_and(|it| it.contains("ended")));
+        drop(rows);
+    }
+
+    /// A build that ends once the history's thread is gone never reaches it, yet `blaze why`
+    /// still waits for it: asked before or after the loop sees the thread's end, it fails
+    /// naming that build, never answers with the last explained build's reasons.
+    #[test]
+    fn a_build_that_ends_after_the_history_thread_is_gone_is_named_never_explained() {
+        let (ended, rows) = crossbeam_channel::unbounded();
+        let (_failed_to, failed) = crossbeam_channel::unbounded();
+        let (told_to, told) = crossbeam_channel::unbounded();
+        let dir = tempfile::tempdir().unwrap();
+        let profiling = Profiling {
+            dir: dir.path().to_path_buf(),
+            duckdb: None,
+            first_build: 1,
+            ended,
+            failed,
+            told,
+            doing: Arc::new(Doing::default()),
+        };
+        let mut observe = Observe::new(Some(profiling));
+        let mut out = Vec::new();
+        let at = Duration::from_secs(5);
+        observe.ended(ended_row(1));
+        told_to.send(explained(1)).unwrap();
+        observe.tick(at, |_| false, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+
+        // The thread ends; the loop has not seen it yet. Build 2's send fails.
+        drop(rows);
+        observe.ended(ended_row(2));
+        assert!(observe.history_error().is_some_and(|it| it.contains("no build is written")));
+        observe.rebuilt(to(1, 1), None, None, false, at, &mut out);
+        assert!(out.is_empty(), "held for build 2, not answered with build 1: {out:?}");
+        drop(told_to);
+        observe.tick(at, |_| false, &mut out);
+        // Seen gone: build 3 ends after, and one asked then fails at once.
+        observe.ended(ended_row(3));
+        observe.rebuilt(to(1, 2), None, None, false, at, &mut out);
+        match &out[..] {
+            [
+                Reply { to: a, response: Response::Error(held) },
+                Reply { response: Response::Done { ok: false }, .. },
+                Reply { to: b, response: Response::Error(after) },
+                Reply { response: Response::Done { ok: false }, .. },
+            ] => {
+                assert_eq!((*a, *b), (to(1, 1), to(1, 2)));
+                for error in [held, after] {
+                    assert!(error.what.contains("build 2") && error.what.contains("blaze-history") && error.what.contains("ended"), "{}", error.what);
+                }
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

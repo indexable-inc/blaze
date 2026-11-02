@@ -5,6 +5,7 @@
 
 use blaze_codegen::Arch;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 
 use super::{PLATFORMS, arch_name, arch_rank, platform_name, v3_platforms};
 use crate::model::{Shared, SymbolKind};
@@ -60,7 +61,7 @@ fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Library, Stri
         docs.push(Doc::new(tag.as_deref(), lines)?);
     }
     let mut out = Exports::default();
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     seen.insert(docs[0].install_name.clone());
     fold(&docs, 0, arch, platform, &mut seen, &mut out)?;
     Ok(Library { name: docs[0].install_name.clone(), symbols: out.symbols, inputs: out.inputs })
@@ -71,7 +72,7 @@ fn fold(
     at: usize,
     arch: Arch,
     platform: u32,
-    seen: &mut HashSet<String>,
+    seen: &mut HashSet<String, Global>,
     out: &mut Exports,
 ) -> Result<(), String> {
     let doc = &docs[at];
@@ -92,7 +93,7 @@ fn fold(
 #[derive(Default)]
 struct Exports {
     symbols: Vec<Owned>,
-    names: HashSet<String>,
+    names: HashSet<String, Global>,
     inputs: Vec<String>,
 }
 

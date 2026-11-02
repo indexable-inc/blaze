@@ -18,6 +18,7 @@
 //! - [`config`]: the service's one JSON input.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 #[cfg(test)]
 #[global_allocator]

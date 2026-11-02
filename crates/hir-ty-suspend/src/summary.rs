@@ -3,6 +3,7 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_query::db::FromId;
 use hir_def::{DefWithBodyId, FunctionId, signatures::FunctionSignature};
 use hir_ty::{
@@ -10,8 +11,9 @@ use hir_ty::{
     db::{InternedClosureId, InternedCoroutineId},
     traits::StoredParamEnvAndCrate,
 };
+use hir_ty_mir::mir::dispatch::{Body, LONGEST, body_of};
 
-use crate::dispatch::{Cx, Def, Instance, LONGEST, Marked, Target, Unseen, body_of, sites};
+use crate::dispatch::{Cx, Instance, Marked, Target, Unseen, sites};
 
 /// One step toward the root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -45,14 +47,14 @@ pub(crate) struct Summary {
 #[blaze_query::tracked(returns(ref), cycle_initial = |_, _, _, _| Summary::default())]
 pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Summary {
     let cx = Cx::new(db, env);
-    let body = match body_of(db, &cx.stored, &instance) {
+    let body = match body_of(db, cx.stored, instance.def, instance.args) {
         Ok(body) => body,
         Err(_) => return Summary { unseen: Some(Unseen::NoMir), ..Summary::default() },
     };
     let sites = sites(&cx, body);
     let mut best: Option<Hop> = None;
     let mut driver = false;
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     let mut callees = Vec::new(); // alloc: the summary's edges, once per instance
     let mut edge = |instance: &Instance, callees: &mut Vec<Instance>| {
         if seen.insert(*instance) {
@@ -132,16 +134,16 @@ fn step_name(db: &Db, step: &Step) -> String {
 }
 
 /// An instance as an error names it.
-pub(crate) fn instance_name(db: &Db, def: Def) -> String {
+pub(crate) fn instance_name(db: &Db, def: Body) -> String {
     let parent = |owner: InferBodyId<'_>| match owner {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => fn_name(db, func),
         InferBodyId::DefWithBodyId(_) | InferBodyId::AnonConstId(_) => "a constant".to_owned(), // alloc: an error's path
     };
     match def {
-        Def::Fn(func) => fn_name(db, func),
+        Body::Fn(func) => fn_name(db, func),
         // alloc: an error's path
-        Def::Closure(id) => format!("a closure in {}", parent(InternedClosureId::from_id(id).loc(db).owner)),
-        Def::Coroutine(id) | Def::CoroutineByMove(id) => {
+        Body::Closure(id) => format!("a closure in {}", parent(InternedClosureId::from_id(id).loc(db).owner)),
+        Body::Coroutine(id) | Body::CoroutineByMove(id) => {
             // alloc: an error's path
             format!("an `async` block in {}", parent(InternedCoroutineId::from_id(id).loc(db).owner))
         }
@@ -153,14 +155,14 @@ fn fn_name(db: &Db, func: FunctionId) -> String {
 }
 
 /// The item whose body `def` is written in.
-pub(crate) fn owner_of(db: &Db, def: Def) -> Option<DefWithBodyId> {
+pub(crate) fn owner_of(db: &Db, def: Body) -> Option<DefWithBodyId> {
     let of = |owner: InferBodyId<'_>| match owner {
         InferBodyId::DefWithBodyId(it) => Some(it),
         InferBodyId::AnonConstId(_) => None,
     };
     match def {
-        Def::Fn(func) => Some(func.into()),
-        Def::Closure(id) => of(InternedClosureId::from_id(id).loc(db).owner),
-        Def::Coroutine(id) | Def::CoroutineByMove(id) => of(InternedCoroutineId::from_id(id).loc(db).owner),
+        Body::Fn(func) => Some(func.into()),
+        Body::Closure(id) => of(InternedClosureId::from_id(id).loc(db).owner),
+        Body::Coroutine(id) | Body::CoroutineByMove(id) => of(InternedCoroutineId::from_id(id).loc(db).owner),
     }
 }

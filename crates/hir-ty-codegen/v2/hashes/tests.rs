@@ -159,7 +159,7 @@ pub type Held = m::A;
 "#;
 
 /// An instance's arguments are spelled by [`Hashes::ty`], so an instance of `type_name` or
-/// `type_id`, and every generic calling one with its parameters (whose share key takes their
+/// `type_id`, and every generic calling one with its parameters (whose compile identity takes their
 /// identity), is another instance once a type it is called with is renamed or moved: the
 /// identity holds the type's key, of which the path `type_name` prints is a function.
 #[test]

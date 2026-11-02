@@ -1,7 +1,8 @@
 //! `disallowed_types`, `disallowed_methods`, `disallowed_macros`: a use of an item a
 //! `disallowed-*` entry of the package's `clippy.toml` names, found by resolution: a written
-//! path to it (in a `use`, a type, an expression, a pattern, a macro call's path), and for a
-//! method, a method call resolved to it. An entry with a `replacement` path has a
+//! path to it (in a `use`, a type, an expression, a pattern, a macro call's path, a
+//! `#[derive(..)]`), and for a method, a method call resolved to it. A `use` leaf is read in
+//! every namespace, so `use serde::Serialize` is a use of serde's derive as well as its trait. An entry with a `replacement` path has a
 //! machine-applicable fix, which `blaze check --fix` makes: a `use` is retargeted whole, a qualified
 //! path is rewritten, and a bare name follows the `use` that brings it. Where the replacement's
 //! API differs and the fix knows how (std's locks to parking_lot's), the calls are rewritten
@@ -16,6 +17,7 @@
 
 use blaze_diagnostics::model::Applicability;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_intent::retarget::{Names, Retarget};
 use hir::{ModuleDef, PathResolution};
 use syntax::{
@@ -53,7 +55,7 @@ pub(crate) struct Entry {
 pub(crate) struct Resolved {
     pub(crate) entries: Box<[Entry]>,
     /// Each item an entry names, with the entry's index.
-    pub(crate) by_def: HashMap<ModuleDef, u32>,
+    pub(crate) by_def: HashMap<ModuleDef, u32, Global>,
     /// What of the configuration is wrong for the crate, in the order of its entries: a path
     /// that resolves to nothing, or to an item of another kind than its list's.
     pub(crate) errors: Box<[String]>,
@@ -246,7 +248,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if !cx.on(Implemented::DisallowedTypes)
         && !cx.on(Implemented::DisallowedMethods)
         && !cx.on(Implemented::DisallowedMacros)
-        && !cx.on_any(!0 << super::BLAZE_BITS)
+        && !cx.on_any(super::On::BLAZE)
     {
         return;
     }
@@ -270,6 +272,37 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         check_path(cx, resolved, path);
     } else if let Some(call) = ast::MethodCallExpr::cast(node) {
         check_method_call(cx, resolved, call);
+    } else if let Some(attr) = ast::Attr::cast(node) {
+        check_derive(cx, resolved, attr);
+    }
+}
+
+/// The paths of a `#[derive(..)]` of the file's items naming a disallowed macro. A derive's
+/// paths are tokens of its attribute, no path node, so their findings are made here from what
+/// the derives resolve to. A qualified one (`serde::Serialize`) is rewritten where it is
+/// written; a bare one names the macro through a `use`, whose finding and fix are the `use`'s.
+fn check_derive<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, attr: ast::Attr<'t>) {
+    if attr.simple_name() != Some("derive") || !cx.in_file() || cx.analysis().is_some() {
+        return;
+    }
+    let macros = cx.derive_macros(attr);
+    for ((range, path), found) in crate::check::derive_paths(attr).into_iter().zip(macros) {
+        let Some(found) = found else { continue };
+        let Some(entry) = resolved.of(ModuleDef::Macro(found)) else { continue };
+        if !path.contains("::") || !on(cx, entry) || allowed(cx, entry, attr.syntax()) {
+            continue;
+        }
+        let fix = match (&entry.entry.replacement, unfixable(cx, entry)) {
+            (None, _) => None,
+            (Some(_), Some(why)) => Some(Err(why)),
+            (Some(replacement), None) => Some(
+                written(cx, attr.syntax(), range)
+                    .map(|it| vec![(it, replacement.clone())])
+                    .ok_or_else(|| "the derive is made by a macro: write it outside the macro".to_owned()),
+            ),
+        };
+        let Some(at) = written(cx, attr.syntax(), range) else { continue };
+        report_at(cx, entry, attr.syntax(), at, message(entry), fix);
     }
 }
 
@@ -310,12 +343,25 @@ fn allowed<'t>(cx: &Cx<'_, 't>, entry: &Entry, node: ast::Node<'t>) -> bool {
     entry.entry.allow_in.iter().any(|it| within.contains(it))
 }
 
-/// What `path` names in the type namespace, for [`Retarget`].
+/// What `path` names, for [`Retarget`]: in a use tree of the file's items, each namespace's
+/// item, since the `use` imports them all (`serde::Serialize` is a trait and a derive); else the
+/// one item the path means.
 fn names(cx: &Cx<'_, '_>, path: ast::Path<'_>) -> Names {
-    match cx.path(path) {
-        Some(PathResolution::Def(it)) => [Some(it), None],
-        _ => [None, None],
+    let def = |it: Option<PathResolution<'_>>| match it {
+        Some(PathResolution::Def(it)) => Some(it),
+        _ => None,
+    };
+    if path.syntax().ancestors().any(|it| it.kind() == SyntaxKind::USE_TREE)
+        && let Some(per_ns) = cx.path_per_ns(path)
+    {
+        return [def(per_ns.type_ns), def(per_ns.value_ns), def(per_ns.macro_ns)];
     }
+    [def(cx.path(path)), None, None]
+}
+
+/// Whether `to`, a replacement path, names `def` too, for [`Retarget::carries`].
+fn carries(cx: &Cx<'_, '_>, to: &str, def: ModuleDef) -> bool {
+    resolve(cx.db(), cx.krate(), to).contains(&def)
 }
 
 /// Why `entry`'s fix can't be made in `cx`'s crate, if it can't.
@@ -337,6 +383,18 @@ fn unfixable(cx: &Cx<'_, '_>, entry: &Entry) -> Option<String> {
 /// The finding of `entry` at `at`, with its fix or the reason there is none.
 fn report<'t>(cx: &mut Cx<'_, 't>, entry: &Entry, at: ast::Node<'t>, message: String, fix: Option<Result<Vec<(TextRange, String)>, String>>) {
     let Some(range) = cx.range(at) else { return };
+    report_at(cx, entry, at, range, message, fix);
+}
+
+/// [`report`] at `range` of the file, a part of `at`.
+fn report_at<'t>(
+    cx: &mut Cx<'_, 't>,
+    entry: &Entry,
+    at: ast::Node<'t>,
+    range: TextRange,
+    message: String,
+    fix: Option<Result<Vec<(TextRange, String)>, String>>,
+) {
     let span = cx.span(range);
     let fix = fix.map(|it| it.map(|parts| parts.into_iter().map(|(range, text)| (cx.span(range), text)).collect::<Vec<_>>()));
     let reason = entry.entry.reason.clone();
@@ -372,12 +430,11 @@ fn message(entry: &Entry) -> String {
 }
 
 fn check_path<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, path: ast::Path<'t>) {
-    let Some(PathResolution::Def(def)) = cx.path(path) else { return };
-    if let ModuleDef::Module(module) = def {
+    let names = names(cx, path);
+    if let [Some(ModuleDef::Module(module)), ..] = names {
         check_glob(cx, resolved, path, module);
-        return;
     }
-    let Some(entry) = resolved.of(def) else { return };
+    let Some(entry) = names.into_iter().flatten().find_map(|def| resolved.of(def)) else { return };
     if !on(cx, entry) || allowed(cx, entry, path.syntax()) {
         return;
     }
@@ -401,7 +458,8 @@ fn check_glob<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, path: ast::Path<'t>,
     let scope = item.syntax().parent().unwrap_or(cx.root());
     let resolve = |path: ast::Path<'t>| names(cx, path);
     let to = |_: ModuleDef| None;
-    let retarget = Retarget { db: cx.db(), resolve: &resolve, to: &to };
+    let carries = |_: &str, _: ModuleDef| false;
+    let retarget = Retarget { db: cx.db(), resolve: &resolve, to: &to, carries: &carries };
     let named = module.scope(cx.db(), None).into_iter().find_map(|(name, def)| {
         let hir::ScopeDef::ModuleDef(def) = def else { return None };
         let entry = resolved.of(def)?;
@@ -488,7 +546,8 @@ fn use_fix<'t>(cx: &Cx<'_, 't>, resolved: &Resolved, item: ast::Use<'t>) -> Resu
         }
         entry.entry.replacement.clone()
     };
-    let retarget = Retarget { db: cx.db(), resolve: &resolve, to: &to };
+    let carried = |to: &str, def: ModuleDef| carries(cx, to, def);
+    let retarget = Retarget { db: cx.db(), resolve: &resolve, to: &to, carries: &carried };
     Ok(retarget.use_item(item, cx.root())?.map(|it| vec![(it.range, it.text)]))
 }
 

@@ -13,6 +13,7 @@ use base_db::{Db, all_crates};
 use blaze_alloc_count::measure;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_query::db::Setter;
 use hir_def::{
     AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ModuleDefId, StructId, VariantId,
@@ -230,7 +231,7 @@ fn mir_of<'db>(db: &'db Db, owner: MirOwner<'db>) -> MirBody<'db> {
         start_block: start,
         owner: InferBodyId::DefWithBodyId(def),
         binding_locals,
-        upvar_locals: HashMap::default(),
+        upvar_locals: HashMap::new_in(Global),
         param_locals: vec![n],
         promoted_locals: Vec::new(),
         closures: if closure { Vec::new() } else { vec![closure_of(db, def)] },
@@ -512,7 +513,7 @@ fn located_mir<'db>(db: &'db Db, def: DefWithBodyId, fixture: &str) -> MirBody<'
         start_block: start,
         owner: InferBodyId::DefWithBodyId(def),
         binding_locals,
-        upvar_locals: HashMap::default(),
+        upvar_locals: HashMap::new_in(Global),
         param_locals: Vec::new(),
         promoted_locals: Vec::new(),
         closures: Vec::new(),

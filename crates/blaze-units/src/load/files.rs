@@ -21,6 +21,7 @@ use std::path::{Component, Path};
 
 use blaze_format::{FormatError, Persist, SchemaHash, Slice, Writer};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_manifest::files::{FileKind, Files};
 use blaze_query::{Cancelled, Cx, Query, QueryKind};
@@ -531,7 +532,7 @@ fn dir_through<'a>(cx: &mut Cx<'_>, table: impl Table<'a>, path: &'a str, view: 
         None if known_dir(table, path) => {
             let prefix: Cow<'_, str> = if path == "/" { Cow::Borrowed("/") } else { Cow::Owned(format!("{path}/")) };
             let prefix = prefix.as_bytes();
-            let mut names: HashMap<&str, bool> = HashMap::default();
+            let mut names: HashMap<&str, bool, Global> = HashMap::new_in(Global);
             let first = partition(table.mounts(), |at| table.mount_at(at) < prefix);
             for at in (first..table.mounts()).take_while(|&at| table.mount_at(at).starts_with(prefix)) {
                 let (mount_at, origin, mount_under) = table.mount(at);
@@ -895,7 +896,7 @@ pub(crate) struct Reader<'r, 'db> {
     /// The key of a [`TomlFile`] or a manifest.
     keyed: RefCell<PathKey>,
     /// Each listing read so far, decoded once.
-    dirs: RefCell<HashMap<String, Found<Vec<(&'db str, bool)>>>>,
+    dirs: RefCell<HashMap<String, Found<Vec<(&'db str, bool)>>, Global>>,
     /// A read was cancelled: every read after it is too, without asking.
     cancelled: Cell<bool>,
     /// The least path read that is under no mount.
@@ -918,7 +919,7 @@ impl<'r, 'db> Reader<'r, 'db> {
             fixed,
             // clone: the configuration, once a step, into the key its reads reuse.
             keyed: RefCell::new(PathKey { path: String::new(), config: config.clone() }),
-            dirs: RefCell::new(HashMap::default()),
+            dirs: RefCell::new(HashMap::new_in(Global)),
             cancelled: Cell::new(false),
             unmounted: RefCell::new(None),
         }

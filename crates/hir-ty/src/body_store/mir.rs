@@ -31,7 +31,7 @@ use super::{BodyFacts, INSTALLED, Lookup, Step, infer::{Keyed, items_of}};
 use crate::{
     InferBodyId,
     check_cache::ids::{self, Table},
-    db::InternedClosure,
+    db::{HirDatabase, InternedClosure},
     mir::{
         MirBody, MirLowerError, MirOwner,
         persist::{self, Locations},
@@ -84,9 +84,15 @@ pub fn location_literals(db: &Db, def: DefWithBodyId) -> Box<[ExprId]> {
         .collect()
 }
 
-/// The location literals of `def`, for its records.
-fn locations(db: &Db, def: DefWithBodyId) -> Locations<'_> {
-    Locations { store: Body::of(db, def), exprs: location_literals(db, def) }
+/// The location literals of `def`, for its records, with the address width of its crate's
+/// target, which their constants are made at.
+fn locations(db: &Db, def: DefWithBodyId) -> R<Locations<'_>> {
+    let layout = db.target_data_layout(def.krate(db)).map_err(|error| error.to_string())?;
+    Ok(Locations {
+        store: Body::of(db, def),
+        exprs: location_literals(db, def),
+        word: layout.pointer_size().bytes_usize(),
+    })
 }
 
 blaze_format::record! {
@@ -268,7 +274,7 @@ pub(super) fn encode<'db>(
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = Table::default();
     // alloc: the reason a body is not stored
-    let locations = locations(db, def);
+    let locations = locations(db, def)?;
     let record = ids::relocating(&mut table, || persist::write(db, body, Some(locations)))
         .map_err(str::to_owned)?;
     let mut locs = TyTableWriter::new(interner);
@@ -321,6 +327,6 @@ pub(super) fn decode<'db>(
     let items = items_of(db, facts, def, keys, kinds)?;
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = ids::read(db, interner, &items, words, bytes, root.locs)?;
-    let locations = locations(db, def);
+    let locations = locations(db, def)?;
     ids::relocating(&mut table, || persist::read(db, record, Some(locations))).map_err(format_error)
 }

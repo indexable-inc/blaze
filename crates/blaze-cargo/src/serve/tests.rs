@@ -8,6 +8,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     sync::Arc,
+    time::Duration,
 };
 
 use blaze_api::{
@@ -17,7 +18,7 @@ use blaze_api::{
 };
 use blaze_cas::Store;
 use blaze_core::{
-    Address, Completion, Conn, Effect, FileName, Tag,
+    Address, Completion, Conn, Driver, Effect, FileName, Tag,
     sim::{Faults, Rng, Sim},
 };
 use blaze_ids::{ContentId, Hasher};
@@ -34,10 +35,11 @@ use parking_lot::Mutex;
 
 use super::{
     Daemon, Options,
+    job::{DURABLE_WITHIN, RECHECK},
     plane::{Inline, Runner},
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library, Output, Phase, Put,
-        Runs, Selection, Source, SourceFile, Steps, Writer, applying,
+        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, KeptPut, Library, Output, Phase, Put,
+        RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer, applying,
     },
 };
 
@@ -71,6 +73,9 @@ thread_local! {
     static PANICS_RUN: Cell<Option<usize>> = const { Cell::new(None) };
     /// The unit whose compile panics, as a bug of blaze's would.
     static PANICS_COMPILE: Cell<Option<usize>> = const { Cell::new(None) };
+    /// The unit whose compile ends in an error that is no refusal, as an `Unsupported` codegen
+    /// error of the 2026-10-31 `blaze test --workspace` did.
+    static ERRS_COMPILE: Cell<Option<usize>> = const { Cell::new(None) };
     /// Each compile's unit, and the runs applied in the front end it read.
     static SEEN: RefCell<Vec<(usize, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
     /// Each phase of a unit's compile as it ran, in order.
@@ -84,6 +89,23 @@ thread_local! {
     /// How many lowerings were given the head's last front end, and how many lowered anew.
     static INTO_KEPT: Cell<usize> = const { Cell::new(0) };
     static ANEW: Cell<usize> = const { Cell::new(0) };
+    /// How many kept front ends were stored ([`Steps::store_kept`]).
+    static STORES: Cell<usize> = const { Cell::new(0) };
+    /// The checkout whose kept front end leaves nothing for the store: a job that puts
+    /// nothing new, and may still have read what another job put.
+    static PUTS_NOTHING: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The tests' run keeps how it ran in the store ([`Keeps`]).
+    static TESTS_KEEP: Cell<bool> = const { Cell::new(false) };
+    /// ... and hands the put's ticket to no one: a put no caller told the loop of.
+    static TESTS_KEEP_UNTOLD: Cell<bool> = const { Cell::new(false) };
+    /// ... through this writer of the store's, a segment other than the loop's, when one is
+    /// set: an off-loop put no one told the loop of.
+    static UNTOLD_WRITER: RefCell<Option<blaze_cas::Writer>> = const { RefCell::new(None) };
+    /// ... and runs this long before it keeps anything: a run of user code still going.
+    static KEEPS_FOR: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    /// How many lowerings anew found in the store all a build of their checkout left for it
+    /// ([`kept_key`]): what a restarted daemon's first build reads instead of working it out.
+    static KEPT_READS: Cell<usize> = const { Cell::new(0) };
     /// How many times the standard library's files were read.
     static LIBRARY_READS: Cell<usize> = const { Cell::new(0) };
     /// Whether the program's compile gives [`APP`] as its output at [`APP_AT`].
@@ -99,6 +121,31 @@ const SHARED: &[u8] = b"a std unit's record\n";
 
 fn shared_key() -> blaze_cas::Key {
     blaze_cas::Key(ContentId::of("blaze serve tests shared", SHARED))
+}
+
+/// One of the values a kept front end of the fakes on `checkout` leaves for the store, as a
+/// real one's dependency images and check outcomes are: `at` 0 and 1, its own.
+fn kept_key(checkout: &str, at: u8) -> blaze_cas::Key {
+    blaze_cas::Key(ContentId::of("blaze serve tests kept", format!("{checkout} {at}").as_bytes()))
+}
+
+fn kept_value(checkout: &str, at: u8) -> Vec<u8> {
+    format!("what the build of {checkout} left for the store, part {at}\n").into_bytes()
+}
+
+/// What every checkout's kept front end leaves under one key, as the image of a dependency two
+/// checkouts lock at one version is: the second checkout's put of it is handed the ticket of
+/// the first's, from wherever that was put.
+const SHARED_KEPT: &[u8] = b"what every checkout's build left for the store\n";
+
+fn shared_kept_key() -> blaze_cas::Key {
+    blaze_cas::Key(ContentId::of("blaze serve tests kept shared", SHARED_KEPT))
+}
+
+/// Whether `store` holds all a build of `checkout` left for it.
+fn holds_kept(store: &Store, checkout: &str) -> bool {
+    let shared = store.get(&shared_kept_key()).unwrap().is_some_and(|it| it.bytes == SHARED_KEPT);
+    shared && (0..2).all(|at| store.get(&kept_key(checkout, at)).unwrap().is_some_and(|it| it.bytes == kept_value(checkout, at)))
 }
 
 const APP: &[u8] = b"\x7fELF the program\n";
@@ -189,7 +236,7 @@ fn profile() -> Profile {
     Profile { strip: Strip::Resolved(Stripped::None), ..Profile::dev() }
 }
 
-fn unit(pkg_id: &str, kind: &str, mode: Mode, deps: &[usize]) -> Unit {
+pub(super) fn unit(pkg_id: &str, kind: &str, mode: Mode, deps: &[usize]) -> Unit {
     Unit {
         pkg_id: pkg_id.into(),
         target: Target {
@@ -217,6 +264,7 @@ fn unit(pkg_id: &str, kind: &str, mode: Mode, deps: &[usize]) -> Unit {
                 public: Some(false),
                 noprelude: Some(false),
                 nounused: Some(false),
+                dev: false,
             })
             .collect(),
     }
@@ -250,7 +298,7 @@ fn wave_units(root: &str, manifest: String, scripts: usize) -> Units {
     of_graph(root, manifest, UnitGraph { version: 1, units, roots: vec![scripts + 1] })
 }
 
-fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units {
+pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units {
     let app = format!("path+file://{root}#app@0.1.0");
     let dep = "registry+https://github.com/rust-lang/crates.io-index#dep@1.0.0".to_owned();
     let plan = UnitPlan {
@@ -270,6 +318,7 @@ fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units {
         runner: Vec::new(),
         harness: true,
         clippy: None,
+        macro_wasm: false,
     };
     let package = |id: &str, name: &str, version: &str, source: Option<String>, is_member| PackagePlan {
         id: id.into(),
@@ -343,7 +392,30 @@ impl Steps for Fake {
         Ok(Library { at: LIBRARY.into(), fingerprint, source: Some(Source { files: vec![file], under: String::new() }) })
     }
 
+    fn store_kept(&self, kept: &mut FakeInputs) -> Result<Vec<KeptPut>, ApiError> {
+        if kept.stored {
+            return Ok(Vec::new());
+        }
+        kept.stored = true;
+        STORES.set(STORES.get() + 1);
+        if PUTS_NOTHING.with_borrow(|it| *it == kept.checkout) {
+            return Ok(Vec::new());
+        }
+        let put = |key, bytes, what: &str| KeptPut { put: Put { key, kind: blaze_cas::Kind::Query, bytes }, what: Arc::from(what) };
+        let checkout = &kept.checkout;
+        // The shared value last: a job that waited on its last put's ticket alone answers before
+        // its own two are durable once another checkout put the shared one first (review C1).
+        Ok(vec![
+            put(kept_key(checkout, 0), kept_value(checkout, 0), "the fakes' first value of a checkout"),
+            put(kept_key(checkout, 1), kept_value(checkout, 1), "the fakes' second value of a checkout"),
+            put(shared_kept_key(), SHARED_KEPT.to_vec(), "the fakes' value of every checkout"),
+        ])
+    }
+
     fn lower(&self, job: &JobInput, kept: Option<FakeInputs>) -> Result<FrontEnd<Fake>, Failed> {
+        if kept.as_ref().is_some_and(|it| !it.stored) {
+            return Err(Failed::Error(ApiError::new("the fakes' kept front end is lowered into unstored", None)));
+        }
         let inputs = match kept {
             Some(inputs) => {
                 INTO_KEPT.set(INTO_KEPT.get() + 1);
@@ -351,7 +423,15 @@ impl Steps for Fake {
             }
             None => {
                 ANEW.set(ANEW.get() + 1);
-                FakeInputs::default()
+                let checkout = job.config.invocation.root.clone();
+                // A real lowering anew serves its dependencies from what the last build left
+                // in the store: the fakes count whether it is all there.
+                let guard = blaze_cas::enter();
+                let read = |at| job.store.get(&guard, &kept_key(&checkout, at)).ok().flatten().is_some_and(|it| it.bytes == kept_value(&checkout, at));
+                if read(0) && read(1) {
+                    KEPT_READS.set(KEPT_READS.get() + 1);
+                }
+                FakeInputs { checkout, ..FakeInputs::default() }
             }
         };
         let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new(), broke: Vec::new() };
@@ -380,10 +460,13 @@ struct FakeFront {
     goal: Goal,
 }
 
-/// A front end's inputs: the build scripts' runs applied to it, in the order applied.
+/// A front end's inputs: the build scripts' runs applied to it, in the order applied, whether
+/// it was stored since it was last kept, and the checkout it was lowered for.
 #[derive(Default)]
 struct FakeInputs {
     runs: Vec<usize>,
+    stored: bool,
+    checkout: String,
 }
 
 /// The fakes' front end has no database: their images store no library trees.
@@ -473,15 +556,21 @@ impl Writer<Fake> for FakeWriter {
         if !self.apply()? {
             return Err(ApiError::new("the fakes' runs are kept while a task still reads them", None));
         }
-        Arc::into_inner(self.inputs).ok_or_else(|| ApiError::new("the fakes' inputs are kept while a task still holds them", None))
+        let mut inputs = Arc::into_inner(self.inputs)
+            .ok_or_else(|| ApiError::new("the fakes' inputs are kept while a task still holds them", None))?;
+        // Kept again: what this build left is not stored yet, as a real front end's is not.
+        inputs.stored = false;
+        Ok(inputs)
     }
 }
 
-/// The fakes' user code: a build script's run, or what is over as it starts.
+/// The fakes' user code: a build script's run, or what is over as it starts, or a run that
+/// keeps what it did in the store.
 enum FakeRuns {
     Script(Script),
     Over(Over),
     Lost(Lost),
+    Keeps(Keeps),
 }
 
 impl Runs<Fake> for FakeRuns {
@@ -496,6 +585,7 @@ impl Runs<Fake> for FakeRuns {
             FakeRuns::Script(it) => it.start(store, writer, effects, out),
             FakeRuns::Over(it) => it.start(store, writer, effects, out),
             FakeRuns::Lost(it) => it.start(store, writer, effects, out),
+            FakeRuns::Keeps(it) => it.start(store, writer, effects, out),
         }
     }
 
@@ -504,6 +594,7 @@ impl Runs<Fake> for FakeRuns {
             FakeRuns::Script(it) => it.owns(tag),
             FakeRuns::Over(it) => it.owns(tag),
             FakeRuns::Lost(it) => it.owns(tag),
+            FakeRuns::Keeps(it) => it.owns(tag),
         }
     }
 
@@ -519,6 +610,7 @@ impl Runs<Fake> for FakeRuns {
             FakeRuns::Script(it) => it.complete(completion, store, writer, effects, out),
             FakeRuns::Over(it) => it.complete(completion, store, writer, effects, out),
             FakeRuns::Lost(it) => it.complete(completion, store, writer, effects, out),
+            FakeRuns::Keeps(it) => it.complete(completion, store, writer, effects, out),
         }
     }
 
@@ -527,6 +619,16 @@ impl Runs<Fake> for FakeRuns {
             FakeRuns::Script(it) => it.cancel(effects),
             FakeRuns::Over(it) => it.cancel(effects),
             FakeRuns::Lost(it) => it.cancel(effects),
+            FakeRuns::Keeps(it) => it.cancel(effects),
+        }
+    }
+
+    fn take_puts(&mut self) -> RunPuts {
+        match self {
+            FakeRuns::Script(it) => it.take_puts(),
+            FakeRuns::Over(it) => it.take_puts(),
+            FakeRuns::Lost(it) => it.take_puts(),
+            FakeRuns::Keeps(it) => it.take_puts(),
         }
     }
 }
@@ -558,6 +660,10 @@ impl Runs<Fake> for Script {
     fn cancel(&mut self, _: &mut Vec<Effect>) -> Option<bool> {
         Some(false)
     }
+
+    fn take_puts(&mut self) -> RunPuts {
+        RunPuts::default()
+    }
 }
 
 /// A build script's run whose end never comes: it says it waits on its effects and asked
@@ -586,6 +692,70 @@ impl Runs<Fake> for Lost {
 
     fn cancel(&mut self, _: &mut Vec<Effect>) -> Option<bool> {
         Some(false)
+    }
+
+    fn take_puts(&mut self) -> RunPuts {
+        RunPuts::default()
+    }
+}
+
+/// The key and bytes of how the fakes' tests ran, as [`Keeps`] keeps them.
+fn test_record_key() -> blaze_cas::Key {
+    blaze_cas::Key(ContentId::of("blaze serve tests test record", b"the tests of /w"))
+}
+
+const TEST_RECORD: &[u8] = b"how the tests of /w ran\n";
+
+/// The tests' run as a real one is to its job (`UnitRuns`): it ends on a completion of its
+/// own, and on it keeps how its tests ran in the store, handing the put's ticket over
+/// ([`Runs::take_puts`]) for its job to wait on before it answers.
+struct Keeps {
+    tag: Tag,
+    puts: RunPuts,
+    /// Whether it hands its put's ticket over; not, under [`TESTS_KEEP_UNTOLD`].
+    tells: bool,
+}
+
+impl Runs<Fake> for Keeps {
+    fn start(&mut self, _: &Store, _: Option<&mut FakeWriter>, effects: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
+        effects.push(Effect::Timer { after: KEEPS_FOR.get(), tag: self.tag });
+        None
+    }
+
+    fn owns(&self, tag: Tag) -> bool {
+        tag == self.tag
+    }
+
+    fn complete(
+        &mut self,
+        _: Completion,
+        store: &mut Store,
+        _: Option<&mut FakeWriter>,
+        _: &mut Vec<Effect>,
+        _: &mut Vec<Response>,
+    ) -> Option<bool> {
+        let off_loop = UNTOLD_WRITER.with_borrow_mut(|writer| {
+            writer.as_mut().map(|writer| {
+                let guard = blaze_cas::enter();
+                writer.put(&guard, test_record_key(), blaze_cas::Kind::Query, TEST_RECORD.to_vec()).expect("one value under its key")
+            })
+        });
+        let ticket = match off_loop {
+            Some(ticket) => ticket,
+            None => store.put(test_record_key(), blaze_cas::Kind::Query, TEST_RECORD.to_vec()).expect("one value under its key"),
+        };
+        if self.tells {
+            self.puts.kept([ticket]);
+        }
+        Some(true)
+    }
+
+    fn cancel(&mut self, _: &mut Vec<Effect>) -> Option<bool> {
+        Some(false)
+    }
+
+    fn take_puts(&mut self) -> RunPuts {
+        std::mem::take(&mut self.puts)
     }
 }
 
@@ -616,6 +786,10 @@ impl Runs<Fake> for Over {
     fn cancel(&mut self, _: &mut Vec<Effect>) -> Option<bool> {
         Some(false)
     }
+
+    fn take_puts(&mut self) -> RunPuts {
+        RunPuts::default()
+    }
 }
 
 impl Front<Fake> for FakeFront {
@@ -627,6 +801,9 @@ impl Front<Fake> for FakeFront {
         assert_ne!(self.goal, Goal::Reach, "a reach compiles nothing");
         PHASES.with(|it| it.borrow_mut().push((unit, phase)));
         assert_ne!(PANICS_COMPILE.get(), Some(unit), "serve-test: the unit's compile panics");
+        if ERRS_COMPILE.get() == Some(unit) {
+            return Err(Failed::Error(ApiError::new("serve-test: unsupported: no `lang_start`", Some(format!("unit {unit}")))));
+        }
         if phase == Phase::Names {
             SEEN.with(|it| it.borrow_mut().push((unit, reader.0.runs.clone())));
             if unit == 0 && KEEP.get() {
@@ -650,7 +827,7 @@ impl Front<Fake> for FakeFront {
             true => vec![Put { key: shared_key(), kind: blaze_cas::Kind::Query, bytes: SHARED.to_vec() }],
             false => Vec::new(),
         };
-        Ok(Some(Compiled { diagnostics, ok: true, puts, share, outputs, artifact: None, macros: None, links: Vec::new() }))
+        Ok(Some(Compiled { diagnostics, ok: true, puts, share, outputs, artifact: None, macros: None, links: Vec::new(), misses: Vec::new() }))
     }
 
     fn refused(&self, _: usize, what: String) -> Diagnostic {
@@ -664,8 +841,11 @@ impl Front<Fake> for FakeFront {
         })
     }
 
-    fn tests(&self, _: &[Artifact], selection: Selection<'_>, _: u64) -> Result<FakeRuns, ApiError> {
+    fn tests(&self, _: &[Artifact], selection: Selection<'_>, tags: u64) -> Result<FakeRuns, ApiError> {
         assert!(selection.ub.is_none(), "tests under the evaluator are evaluated, not run");
+        if TESTS_KEEP.get() {
+            return Ok(FakeRuns::Keeps(Keeps { tag: Tag(tags), puts: RunPuts::default(), tells: !TESTS_KEEP_UNTOLD.get() }));
+        }
         Ok(FakeRuns::Over(Over(Vec::new())))
     }
 
@@ -749,6 +929,7 @@ fn options() -> Options {
     Options {
         state: name(STATE),
         std: name(STD),
+        builds: name("cache/blaze/build"),
         writer: Hasher::new("blaze v2 test writer").part(STATE.as_bytes()).finish(),
         socket: name(SOCKET),
         http: None,
@@ -757,6 +938,7 @@ fn options() -> Options {
         io: 2,
         env: vec![("PATH".into(), "/bin".into()), ("HOME".into(), "/home/u".into())],
         host: "x86_64-unknown-linux-gnu".into(),
+        toolchain: Hasher::new("blaze v2 test toolchain").finish(),
         color: false,
         build: blaze_api::Build::default(),
         // A table of its own: each daemon drives one, and tests run at once.
@@ -1219,6 +1401,687 @@ fn a_daemon_stopped_as_its_first_build_answers_writes_the_image_the_next_start_r
     assert!(!matches!(started.cold, Some(super::daemon::Cold::NoImage)), "{started}");
 }
 
+/// What a build leaves for the store as its front end is kept ([`Steps::store_kept`]) is
+/// durable by the time it answers, a failed build's too: a power loss right after the answer
+/// (no stop, no image) loses none of it, and the next start finds it in the store. Before, it
+/// was written only when the head's next build lowered into the front end, so a build followed
+/// by a stop or a crash left the store none of its dependency images or check outcomes
+/// (persisted-state-round-trips).
+///
+/// A crash keeps a random prefix of what was not synced (`Sim::crash`), so the put could
+/// survive one seed by chance: across these seeds, only a sync before the answer keeps it in
+/// every one.
+#[test]
+fn what_a_build_left_for_the_store_is_durable_once_it_answers_and_survives_a_crash() {
+    let runs = (73..81).flat_map(|seed| [(seed, None), (seed + 100, Some(1))]);
+    for (seed, errs) in runs {
+        ERRS_COMPILE.set(errs);
+        STORES.set(0);
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut client = dial(&mut daemon);
+        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let got = client.wait(&mut daemon, id);
+        ERRS_COMPILE.set(None);
+        assert_eq!(got.last(), Some(&Response::Done { ok: errs.is_none() }), "{got:#?}");
+        assert_eq!(STORES.get(), 1, "the kept front end is stored once, as its build ends");
+        assert!(holds_kept(daemon.store(), "/w"), "it is in the store as the build answers");
+        let mut sim = daemon.into_driver();
+        sim.crash();
+        let daemon = start(sim, &steps, seed + 1000);
+        assert!(holds_kept(daemon.store(), "/w"), "a crash after the answer keeps it (failing build: {errs:?})");
+    }
+}
+
+fn second_checkout(sim: &mut Sim) {
+    sim.change(&name("v/Cargo.toml"), b"[package]\nname = \"app\"\n");
+    sim.change(&name("v/src/main.rs"), b"fn main() {}\n");
+}
+
+/// The store's directory under the daemon's state.
+fn store_dir() -> FileName {
+    name(&format!("{STATE}/store"))
+}
+
+/// `turns` turns of the daemon, `client` taking what it is sent.
+fn turns(daemon: &mut SimDaemon, client: &mut Client, turns: usize) {
+    for _ in 0..turns {
+        daemon.turn();
+        client.take(daemon);
+    }
+}
+
+/// Review C1, with two segments: a put of a value the store keeps already is handed the
+/// ticket of the put that kept it, from any writer's segment. Here a writer of its own (a
+/// segment above the loop's) puts the value every checkout leaves first, and `/v`'s build
+/// makes it durable. `/w`'s build then puts its own two on the loop's segment and that value
+/// last, handed the writer's ticket, durable already: one `max` of its tickets is that one, so
+/// a job that waited on it answered before its own were durable and a crash lost them. Across
+/// seeds, as a crash keeps a random prefix of what was not synced.
+#[test]
+fn a_checkout_whose_last_put_another_put_first_answers_once_its_own_are_durable() {
+    for seed in 120..136 {
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        second_checkout(&mut sim);
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut writer = daemon.store_mut().writer();
+        let guard = blaze_cas::enter();
+        let first = writer.put(&guard, shared_kept_key(), blaze_cas::Kind::Query, SHARED_KEPT.to_vec()).unwrap();
+        drop(guard);
+        let mut client = dial(&mut daemon);
+        for head in ["/v", "/w"] {
+            let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head(head.into()), targets: agent() });
+            assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }), "{head}");
+            // `/v` answered on the writer's put, so it waited for it.
+            assert!(daemon.store().durable(first), "seed {seed}: {head} answered before the value it put was durable");
+        }
+        let mut sim = daemon.into_driver();
+        sim.crash();
+        let daemon = start(sim, &steps, seed + 1000);
+        assert!(holds_kept(daemon.store(), "/w") && holds_kept(daemon.store(), "/v"), "seed {seed}");
+        drop(writer);
+    }
+}
+
+/// Wait::Everything (the store model's finding): a value read from the store comes with no
+/// ticket, so a job that put nothing new may have read another job's value that is not durable
+/// yet, and answering on it before a crash loses it gives what a restart can't. With the
+/// store's syncs held, `/w`'s build puts what it leaves and can make none of it durable; a
+/// build of `/v` that puts nothing then must not answer, though it waits on no put of its own.
+/// Let go at the bound, it fails naming the store's ticket, as `/w` does.
+#[test]
+fn a_build_that_puts_nothing_waits_for_what_the_loop_put_before_it_ended() {
+    let mut sim = Sim::new(180, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    second_checkout(&mut sim);
+    PUTS_NOTHING.with_borrow_mut(|it| *it = "/v".to_owned());
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 180);
+    let mut client = dial(&mut daemon);
+    daemon.driver().hold_syncs(store_dir());
+    let start = daemon.driver().now();
+    let w = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    for _ in 0..TURNS {
+        if holds_kept(daemon.store(), "/w") {
+            break;
+        }
+        daemon.turn();
+        client.take(&mut daemon);
+    }
+    assert!(holds_kept(daemon.store(), "/w"), "the build of /w never put what it left");
+    let v = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/v".into()), targets: agent() });
+    turns(&mut daemon, &mut client, 3000);
+    assert!(client.of(v).iter().any(|it| matches!(it, Response::Built { .. })), "/v was built: {:#?}", client.of(v));
+    assert!(!client.done(v), "/v answered on a loop whose puts are not durable: {:#?}", client.of(v));
+    assert!(!client.done(w), "/w answered with what it left not durable: {:#?}", client.of(w));
+    // The waits above ran on the clock's own pace, far short of the bound: they did not
+    // answer because they wait, not because time ran out first.
+    let ran = daemon.driver().now() - start;
+    assert!(ran < Duration::from_secs(1), "the turns took {ran:?} of the clock before the advance");
+    for _ in 0..10 {
+        if client.done(v) && client.done(w) {
+            break;
+        }
+        daemon.driver().advance(DURABLE_WITHIN);
+        turns(&mut daemon, &mut client, 50);
+    }
+    for (head, id) in [("/v", v), ("/w", w)] {
+        let got = client.of(id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{head}: {got:#?}");
+        let named = |it: &Response| matches!(it, Response::Error(error) if error.what.contains("store ticket") && error.what.contains("answered nothing"));
+        assert!(got.iter().any(named), "{head}: {got:#?}");
+    }
+    PUTS_NOTHING.with_borrow_mut(String::clear);
+}
+
+/// Bounded progress: a store whose commit hangs (a sync that never returns) holds a build's
+/// answer, and the build fails naming the checkout and the store once the store has answered
+/// nothing for [`DURABLE_WITHIN`] on the injected clock, not before; the daemon keeps serving.
+#[test]
+fn a_build_whose_store_commit_hangs_fails_naming_it_once_the_store_answers_nothing_for_the_bound() {
+    let mut sim = Sim::new(190, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 190);
+    let mut client = dial(&mut daemon);
+    daemon.driver().hold_syncs(store_dir());
+    let start = daemon.driver().now();
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    turns(&mut daemon, &mut client, 3000);
+    assert!(!client.done(id), "answered with what it left not durable: {:#?}", client.of(id));
+    assert!(daemon.driver().held_syncs() > 0, "the store's commit is held");
+    // So that "short of the bound" below is short of it: the build itself took next to none
+    // of the clock.
+    let ran = daemon.driver().now() - start;
+    assert!(ran < Duration::from_secs(1), "the build took {ran:?} of the clock before the advance");
+    // Short of the bound since the store was last heard from: it still waits.
+    daemon.driver().advance(DURABLE_WITHIN - Duration::from_secs(1));
+    turns(&mut daemon, &mut client, 50);
+    assert!(!client.done(id), "gave up before the bound: {:#?}", client.of(id));
+    for _ in 0..10 {
+        if client.done(id) {
+            break;
+        }
+        daemon.driver().advance(Duration::from_secs(1).max(DURABLE_WITHIN / 10));
+        turns(&mut daemon, &mut client, 50);
+    }
+    let got = client.of(id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let named = |it: &Response| {
+        matches!(it, Response::Error(error) if error.what.contains("the build of /w")
+            && error.what.contains("answered nothing") && error.what.contains("store ticket"))
+    };
+    assert!(got.iter().any(named), "{got:#?}");
+    let status = client.send(&mut daemon, Request::Status);
+    let said = client.wait(&mut daemon, status);
+    assert!(!said.is_empty(), "the daemon serves after the build failed");
+}
+
+/// Bounded progress is no progress, not total time: a store whose commit is slow but moving
+/// (each write and sync of it taking well under [`DURABLE_WITHIN`], the commit's steps one
+/// after another taking well over it in all) is waited for, and the build succeeds. A bound
+/// on the whole wait, or one that counted from the wait's start alone, fails it.
+#[test]
+fn a_build_whose_store_commit_is_slow_but_moving_waits_past_the_bound_and_succeeds() {
+    let mut sim = Sim::new(197, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 197);
+    let mut client = dial(&mut daemon);
+    // Under the profile's watchdogs' bound (60 s) too, should a pool task run meanwhile; the
+    // commit's four steps one after another (truncate, write, sync, head) still take well past
+    // the bound.
+    let step = DURABLE_WITHIN * 4 / 10;
+    daemon.driver().slow_writes(store_dir(), step);
+    let start = daemon.driver().now();
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    let took = daemon.driver().now() - start;
+    assert!(took > DURABLE_WITHIN, "the commit took {took:?}, not past the bound: the test tests nothing");
+    assert!(holds_kept(daemon.store(), "/w"), "answered, and what it left is not in the store");
+}
+
+/// The backstop of Wait::Everything ([`blaze_cas::Store::last_puts`]): a put that no caller
+/// hands its ticket over for (the tests' run here keeps how they ran and tells no one, as an
+/// error path that put before it failed does) is still durable before the job answers, so a
+/// crash after the answer keeps it. Across seeds, as a crash keeps a random prefix of what was
+/// not synced. Without the backstop the job waits only on what it was told of, which its
+/// earlier puts made durable already, and a crash loses the record.
+#[test]
+fn a_put_no_one_hands_over_is_durable_once_its_job_answers() {
+    TESTS_KEEP.set(true);
+    TESTS_KEEP_UNTOLD.set(true);
+    for seed in 220..236 {
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut client = dial(&mut daemon);
+        let request =
+            Request::Test { view: ViewRef::Head("/w".into()), targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
+        let id = client.send(&mut daemon, request);
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+        assert!(daemon.store().get(&test_record_key()).unwrap().is_some(), "seed {seed}: the run kept nothing");
+        let mut sim = daemon.into_driver();
+        sim.crash();
+        let daemon = start(sim, &steps, seed + 1000);
+        let kept = daemon.store().get(&test_record_key()).unwrap().is_some_and(|it| it.bytes == TEST_RECORD);
+        assert!(kept, "seed {seed}: the job answered and a crash lost a put no one handed over");
+    }
+    TESTS_KEEP_UNTOLD.set(false);
+    TESTS_KEEP.set(false);
+}
+
+/// [`a_put_no_one_hands_over_is_durable_once_its_job_answers`], with the untold put made
+/// through a writer of the store's own ([`blaze_cas::Store::writer`], as a worker's or a
+/// [`blaze_cas::Handle`]'s is): a segment other than the loop's. The backstop covers every
+/// segment; one that covered the loop's alone answered before this put was durable, and a
+/// crash lost it.
+#[test]
+fn a_put_no_one_hands_over_through_another_segment_is_durable_once_its_job_answers() {
+    TESTS_KEEP.set(true);
+    TESTS_KEEP_UNTOLD.set(true);
+    for seed in 250..266 {
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let writer = daemon.store_mut().writer();
+        UNTOLD_WRITER.with_borrow_mut(|it| *it = Some(writer));
+        let mut client = dial(&mut daemon);
+        let request =
+            Request::Test { view: ViewRef::Head("/w".into()), targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
+        let id = client.send(&mut daemon, request);
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+        let written = UNTOLD_WRITER.with_borrow_mut(Option::take).expect("the writer is still set");
+        let put = daemon.store().get(&test_record_key()).unwrap().is_some();
+        assert!(put, "seed {seed}: the run kept nothing");
+        let mut sim = daemon.into_driver();
+        sim.crash();
+        drop(written);
+        let daemon = start(sim, &steps, seed + 1000);
+        let kept = daemon.store().get(&test_record_key()).unwrap().is_some_and(|it| it.bytes == TEST_RECORD);
+        assert!(kept, "seed {seed}: the job answered and a crash lost a put no one handed over, made on another segment");
+    }
+    TESTS_KEEP_UNTOLD.set(false);
+    TESTS_KEEP.set(false);
+}
+
+/// Review 6 T3, the daemon's half of D2: a put counted and not yet published (another
+/// thread's, mid-way, held here with [`blaze_cas::Writer::hold_put`]) is waited for at the
+/// gate though no commit takes it, and once it ends, with nothing else in flight, the job
+/// answers within a few [`RECHECK`]s. The gate's flush on every visit drains it, and the
+/// recheck deadline is what wakes the loop: without either, the job sits until the bound
+/// ([`DURABLE_WITHIN`]) and fails.
+#[test]
+fn a_put_counted_and_not_yet_published_is_waited_for_and_answered_soon_after_it_ends() {
+    let mut sim = Sim::new(267, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 267);
+    let mut writer = daemon.store_mut().writer();
+    let held = writer.hold_put();
+    let mut client = dial(&mut daemon);
+    let start = daemon.driver().now();
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    turns(&mut daemon, &mut client, 3000);
+    assert!(daemon.store_deadline().is_some(), "the job waits at its gate: {:#?}", client.of(id));
+    for _ in 0..20 {
+        daemon.driver().advance(RECHECK);
+        turns(&mut daemon, &mut client, 5);
+    }
+    assert!(!client.done(id), "answered while a put it could have read is not published: {:#?}", client.of(id));
+    let ran = daemon.driver().now() - start;
+    assert!(ran < DURABLE_WITHIN / 2, "the wait ran {ran:?} of the clock while held");
+    // The put ends with nothing else of the store's in flight: only the gate's recheck wakes
+    // the loop, and only its flush takes the put.
+    let ended = daemon.driver().now();
+    drop(held);
+    for _ in 0..10 {
+        if client.done(id) {
+            break;
+        }
+        daemon.driver().advance(RECHECK);
+        turns(&mut daemon, &mut client, 5);
+    }
+    let got = client.of(id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "not answered soon after the put ended: {got:#?}");
+    let took = daemon.driver().now() - ended;
+    assert!(took <= RECHECK * 10, "answered {took:?} after the put ended");
+    drop(writer);
+}
+
+/// Review 6 T4: the store breaking while a job is still running (its tests' run going, so not
+/// at its gate) answers that job naming the daemon's store, as soon as its run is killed;
+/// not a hangup, nor an answer only once the run ends of itself.
+#[test]
+fn a_job_still_running_when_the_store_breaks_is_answered_naming_the_store() {
+    TESTS_KEEP.set(true);
+    KEEPS_FOR.set(Duration::from_secs(3600));
+    let mut sim = Sim::new(268, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 268);
+    let mut client = dial(&mut daemon);
+    let request =
+        Request::Test { view: ViewRef::Head("/w".into()), targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
+    let id = client.send(&mut daemon, request);
+    turns(&mut daemon, &mut client, 3000);
+    assert!(!client.done(id), "the tests' run is still going: {:#?}", client.of(id));
+    assert!(daemon.store_deadline().is_none(), "the job is not at its gate");
+    assert!(daemon.store().broken().is_none(), "the store has not broken yet");
+    daemon.driver().fail_syncs(store_dir());
+    let key = blaze_cas::Key(ContentId::of("blaze serve tests store breaks", b"a put"));
+    daemon.store_mut().put(key, blaze_cas::Kind::Query, b"a put whose commit fails\n".to_vec()).unwrap();
+    daemon.flush_store_for_test();
+    for _ in 0..200 {
+        if client.done(id) {
+            break;
+        }
+        daemon.turn();
+        client.take(&mut daemon);
+    }
+    KEEPS_FOR.set(Duration::ZERO);
+    TESTS_KEEP.set(false);
+    assert!(daemon.store().broken().is_some(), "the store broke");
+    let got = client.of(id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let named = |it: &Response| {
+        matches!(it, Response::Error(error) if error.what.contains("the daemon's store")
+            && error.what.contains("Input/output error"))
+    };
+    assert!(got.iter().any(named), "{got:#?}");
+}
+
+/// Review W1: only the commit's own steps are its progress. With its syncs held, the store
+/// still answers other things (placements, here, every quarter of the bound, across it), and
+/// the build fails once the commit has stood still for [`DURABLE_WITHIN`] all the same. A rule
+/// that counted any completion of the store kept it waiting for ever.
+#[test]
+fn a_hung_commit_fails_at_the_bound_though_the_store_answers_placements_meanwhile() {
+    let mut sim = Sim::new(198, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 198);
+    let mut client = dial(&mut daemon);
+    daemon.driver().hold_syncs(store_dir());
+    let start = daemon.driver().now();
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    turns(&mut daemon, &mut client, 3000);
+    assert!(!client.done(id), "answered with what it left not durable: {:#?}", client.of(id));
+    assert!(daemon.driver().held_syncs() > 0, "the store's commit is held");
+    let ran = daemon.driver().now() - start;
+    assert!(ran < Duration::from_secs(1), "the build took {ran:?} of the clock before the advance");
+    let mut placed = 0;
+    for quarter in 0..12 {
+        if client.done(id) {
+            break;
+        }
+        daemon.driver().advance(DURABLE_WITHIN / 4);
+        assert!(daemon.place_for_test(&kept_key("/w", 0), name(&format!("placed/{quarter}"))).is_some(), "a placement asked");
+        turns(&mut daemon, &mut client, 50);
+        placed += 1;
+    }
+    assert!(placed > 4, "the store answered placements across the bound ({placed} quarters)");
+    let got = client.of(id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let named = |it: &Response| matches!(it, Response::Error(error) if error.what.contains("answered nothing") && error.what.contains("store ticket"));
+    assert!(got.iter().any(named), "{got:#?}");
+    let took = daemon.driver().now() - start;
+    assert!(took < DURABLE_WITHIN * 2, "failed at {took:?}, not at the bound");
+}
+
+/// Review C1 and W3, at the boundary (`slow_writes` and `release_held` set to the deadline,
+/// [`DURABLE_WITHIN`] from the wait's start): the commit's held syncs are let go to answer
+/// exactly at the bound, in the same tick as placements, other store traffic, that wind the jobs up
+/// as they are dispatched. Only [`Jobs::expire`](super::job::Jobs::expire), after every
+/// completion of the turn, judges the time, so the step that answered counts and the build
+/// succeeds. Judged inside a placement's dispatch (when it comes first; the seed shuffles
+/// them) or before the turn's completions, it failed.
+#[test]
+fn a_commit_step_that_answers_at_the_bound_counts_whatever_else_answers_then() {
+    // Seeds on which a placement was told before the commit's sync in the tick of the
+    // deadline: the order a judge inside a placement's dispatch gets wrong.
+    let mut placement_first = 0;
+    for seed in 240..248 {
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut client = dial(&mut daemon);
+        daemon.driver().hold_syncs(store_dir());
+        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        turns(&mut daemon, &mut client, 3000);
+        assert!(!client.done(id), "seed {seed}: answered with what it left not durable: {:#?}", client.of(id));
+        assert!(daemon.driver().held_syncs() > 0, "seed {seed}: the store's commit is held");
+        // The syncs and the placements all answer at the deadline itself: the bound from the
+        // tick the wait began, less what the clock has run since.
+        let deadline = daemon.store_deadline().expect("a job waits for the store");
+        let after = deadline - daemon.driver().now();
+        assert!(after > DURABLE_WITHIN / 2 && after <= DURABLE_WITHIN, "seed {seed}: the wait's deadline is {after:?} away");
+        daemon.driver().record(vec![store_dir(), name("placed")]);
+        daemon.driver().slow_writes(name("placed"), after);
+        daemon.driver().release_held(after);
+        for at in 0..4 {
+            assert!(daemon.place_for_test(&kept_key("/w", 0), name(&format!("placed/{at}"))).is_some(), "a placement asked");
+        }
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+        let recorded = daemon.driver().recorded();
+        let placed = name("placed");
+        let sync_at = recorded.iter().position(|(_, file, sync)| *sync && file.is_under(&store_dir()));
+        let sync_at = sync_at.unwrap_or_else(|| panic!("seed {seed}: no sync of the store was told: {recorded:?}"));
+        let tick = recorded[sync_at].0;
+        assert_eq!(tick, deadline, "seed {seed}: the released sync was told at {tick:?}, not at the deadline");
+        let before = recorded[..sync_at].iter().any(|(at, file, sync)| *at == tick && !*sync && file.is_under(&placed));
+        placement_first += usize::from(before);
+    }
+    assert!(placement_first > 0, "no seed told a placement before the commit's sync in the deadline's tick: the test tests nothing");
+}
+
+/// Bounded progress: a store that breaks (its syncs fail until it gives up) never makes a
+/// build's puts durable, and the build fails at once naming why, not at the bound; the
+/// daemon then stops, failed naming its store.
+#[test]
+fn a_build_whose_store_breaks_fails_naming_why() {
+    let mut sim = Sim::new(195, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 195);
+    let mut client = dial(&mut daemon);
+    daemon.driver().fail_syncs(store_dir());
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert!(daemon.store().broken().is_some(), "the store broke");
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let named = |it: &Response| {
+        matches!(it, Response::Error(error) if error.what.contains("the build of /w")
+            && error.what.contains("Input/output error"))
+    };
+    assert!(got.iter().any(named), "{got:#?}");
+    // And the daemon stops, naming its store, as it does for the shared one: the next
+    // request starts a fresh daemon rather than build on a store that can't commit.
+    let failed = daemon.failed().map(ToString::to_string);
+    assert!(failed.as_deref().is_some_and(|it| it.contains("the daemon's store") && it.contains("Input/output error")), "{failed:?}");
+}
+
+/// Review round 2, C1 and C2: what user code run by the job put (here the tests' run keeping
+/// how they ran, through `Runs::take_puts` as `UnitRuns` forwards it) is durable before the
+/// job answers, so a crash after the answer keeps it. Across seeds, as a crash keeps a random
+/// prefix of what was not synced.
+#[test]
+fn what_a_run_put_is_durable_once_its_job_answers() {
+    TESTS_KEEP.set(true);
+    for seed in 200..216 {
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut client = dial(&mut daemon);
+        let request =
+            Request::Test { view: ViewRef::Head("/w".into()), targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
+        let id = client.send(&mut daemon, request);
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+        assert!(daemon.store().get(&test_record_key()).unwrap().is_some(), "seed {seed}: the run kept nothing");
+        let mut sim = daemon.into_driver();
+        sim.crash();
+        let daemon = start(sim, &steps, seed + 1000);
+        let kept = daemon.store().get(&test_record_key()).unwrap().is_some_and(|it| it.bytes == TEST_RECORD);
+        assert!(kept, "seed {seed}: the job answered and a crash lost what its run put");
+    }
+    TESTS_KEEP.set(false);
+}
+
+/// What a build of `/w` gives that a restart must not change: whether it is done, and the
+/// bytes of its program and of each value it left for the store.
+fn outcome(daemon: &mut SimDaemon, got: &[Response]) -> (Option<Response>, Vec<u8>, Vec<Option<Vec<u8>>>) {
+    let app = daemon.driver().contents(&name(&APP_AT[1..]));
+    let keys = [kept_key("/w", 0), kept_key("/w", 1), shared_kept_key()];
+    let kept = keys.iter().map(|key| daemon.store().get(key).unwrap().map(|it| it.bytes.to_vec())).collect();
+    (got.last().cloned(), app, kept)
+}
+
+/// Rule 23, at every point: two checkouts build at once, so one's answer may rest on what the
+/// other put and has not made durable (a value read from the store carries no ticket); the
+/// daemon crashes after turn `k`, for every `k` up to both answering. After each crash, every
+/// checkout whose `Done` the client saw still has all it left in the store (durable before it
+/// answered), and a build of `/w` on the restored disk gives byte for byte what a fresh
+/// daemon's gives: no torn or half-kept value is refused as a mismatch, and what was lost is
+/// made again. `Sim::crash` keeps a seeded prefix of each file's unsynced writes; it does not
+/// model directory entries (lane storemodel's `CrashFs` does).
+#[test]
+fn a_crash_after_any_turn_keeps_what_was_answered_and_restores_to_a_fresh_build() {
+    OUTPUT.set(true);
+    let fresh = {
+        let mut sim = Sim::new(140, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, 140);
+        let mut client = dial(&mut daemon);
+        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let got = client.wait(&mut daemon, id);
+        outcome(&mut daemon, &got)
+    };
+    assert_eq!(fresh.0, Some(Response::Done { ok: true }));
+    let seed = 141;
+    let begin = |steps: &Arc<Fake>| {
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        second_checkout(&mut sim);
+        let mut daemon = start(sim, steps, seed);
+        let mut client = dial(&mut daemon);
+        let builds = ["/w", "/v"].map(|head| Request::Build { view: ViewRef::Head(head.into()), targets: agent() });
+        let ids = client.send_together(&mut daemon, builds.into());
+        (daemon, client, ids)
+    };
+    // The turns an uncrashed run takes until both answer: the crash points.
+    let turns = {
+        let steps = Arc::new(Fake::default());
+        let (mut daemon, mut client, ids) = begin(&steps);
+        let mut turns = 0;
+        while !ids.iter().all(|id| client.done(*id)) {
+            assert!(turns < TURNS, "the builds never ended");
+            daemon.turn();
+            client.take(&mut daemon);
+            turns += 1;
+        }
+        turns
+    };
+    // Crash points where a checkout had answered, so the check that it kept what it left
+    // bites; and of those, ones where the other had not, so one's answer may rest on the
+    // other's puts not yet durable.
+    let (mut answered_any, mut answered_one) = (0, 0);
+    for k in 0..=turns {
+        let steps = Arc::new(Fake::default());
+        let (mut daemon, mut client, ids) = begin(&steps);
+        for _ in 0..k {
+            daemon.turn();
+            client.take(&mut daemon);
+        }
+        let answered: Vec<&str> = ["/w", "/v"]
+            .into_iter()
+            .zip(&ids)
+            .filter(|(_, id)| client.of(**id).last() == Some(&Response::Done { ok: true }))
+            .map(|(head, _)| head)
+            .collect();
+        answered_any += usize::from(!answered.is_empty());
+        answered_one += usize::from(answered.len() == 1);
+        let mut sim = daemon.into_driver();
+        sim.crash();
+        let mut daemon = start(sim, &steps, seed + 1000 + k as u64);
+        for head in &answered {
+            assert!(holds_kept(daemon.store(), head), "crash after turn {k}: {head} answered, and lost what it left");
+        }
+        let mut client = dial(&mut daemon);
+        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(outcome(&mut daemon, &got), fresh, "crash after turn {k}");
+    }
+    assert!(answered_any > 0, "no crash point came after an answer, of {turns} turns: the test checks nothing kept");
+    assert!(
+        answered_one > 0,
+        "no crash point came after one checkout answered and before the other did, of {turns} turns: the race it is for \
+         was never crashed in"
+    );
+    eprintln!("crash points: {} in all, {answered_any} after an answer, {answered_one} after one alone", turns + 1);
+    OUTPUT.set(false);
+}
+
+/// A build of a checkout asked while the checkout's last front end is being stored waits for
+/// the store (its lowering held, named in a stall) and lowers into the front end it stored,
+/// rather than lowering anew beside it. The seeded runner leaves the store's task queued on
+/// some turns: across seeds, at least one asks the second build then.
+#[test]
+fn a_build_asked_while_its_front_end_is_stored_waits_and_lowers_into_it() {
+    let mut held = 0;
+    for seed in 150..170 {
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut client = dial(&mut daemon);
+        let first = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        turn_until(&mut daemon, |daemon| {
+            client.take(daemon);
+            daemon.storing() > 0 || client.done(first)
+        });
+        if client.done(first) {
+            continue;
+        }
+        let (anew, into_kept) = (ANEW.get(), INTO_KEPT.get());
+        let second = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let mut saw_held = false;
+        turn_until(&mut daemon, |daemon| {
+            client.take(daemon);
+            saw_held |= daemon.held_lowerings().iter().any(|it| it.checkout == "/w" && it.on.is_some());
+            client.done(first) && client.done(second)
+        });
+        assert_eq!(client.of(first).last(), Some(&Response::Done { ok: true }), "seed {seed}");
+        assert_eq!(client.of(second).last(), Some(&Response::Done { ok: true }), "seed {seed}");
+        assert_eq!((ANEW.get(), INTO_KEPT.get()), (anew, into_kept + 1), "seed {seed}: the second lowers into the stored front end");
+        held += usize::from(saw_held);
+    }
+    assert!(held > 0, "no seed asked the second build while the first's front end was stored");
+}
+
+/// After a restart the front end the last build kept is gone from memory: the first build
+/// lowers anew, and reads from the store all the last build left for it, rather than working
+/// it out again (the fakes' lowering counts the reads).
+#[test]
+fn after_a_restart_the_first_lowering_reads_what_the_last_build_stored() {
+    for (seed, crash) in [(171, false), (172, true), (173, true)] {
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut client = dial(&mut daemon);
+        let reads = KEPT_READS.get();
+        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
+        assert_eq!(KEPT_READS.get(), reads, "the first build of a fresh daemon finds nothing stored");
+        let mut daemon = match crash {
+            false => restart(daemon, &steps, seed + 1000),
+            true => {
+                let mut sim = daemon.into_driver();
+                sim.crash();
+                start(sim, &steps, seed + 1000)
+            }
+        };
+        let mut client = dial(&mut daemon);
+        let anew = ANEW.get();
+        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
+        assert_eq!(ANEW.get(), anew + 1, "a restarted daemon lowers anew");
+        assert_eq!(KEPT_READS.get(), reads + 1, "and reads what the last build stored (crash: {crash})");
+    }
+}
+
+/// The head's next build lowers into the front end its last one kept and stored, and each
+/// build stores what it left: lowering never writes the last build's results.
+#[test]
+fn a_build_lowers_into_the_front_end_its_last_build_stored() {
+    let mut sim = Sim::new(75, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 75);
+    let mut client = dial(&mut daemon);
+    let (anew, into_kept, stores) = (ANEW.get(), INTO_KEPT.get(), STORES.get());
+    for _ in 0..2 {
+        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
+    }
+    assert_eq!((ANEW.get(), INTO_KEPT.get()), (anew + 1, into_kept + 1), "the second build lowers into the first's");
+    assert_eq!(STORES.get(), stores + 2, "each build stores what it left");
+}
+
 #[test]
 fn a_run_reports_what_ran_after_built() {
     let mut sim = Sim::new(8, Faults::default());
@@ -1444,6 +2307,56 @@ fn a_unit_whose_compile_panics_fails_with_the_panic_while_its_sibling_builds() {
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
 }
 
+/// A unit whose compile ends in an error (no panic, no refusal) fails that unit with the error
+/// naming it, not the job: in the released engine such an error (`unsupported: no
+/// `lang_start``, one `#![no_std]` crate's test) ended the worker, and all 211 programs of
+/// `blaze test --workspace` failed with its text. Here the build script's compile (unit 1)
+/// errs, its run (2) and the program (3) are never compiled, dep's library (0) is, under
+/// `--keep-going`, and the daemon answers the next request.
+#[test]
+fn a_unit_whose_compile_errs_fails_alone_while_its_sibling_builds() {
+    PHASES.with(|it| it.borrow_mut().clear());
+    ERRS_COMPILE.set(Some(1));
+    let mut sim = Sim::new(47, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 47);
+    let mut client = dial(&mut daemon);
+    let cargo = blaze_api::Cargo {
+        cwd: "/w".into(),
+        env: Vec::new(),
+        args: vec!["--keep-going".into()],
+        root: "/w".into(),
+        color: false,
+        files: Vec::new(),
+        width: None,
+        command: "build".into(),
+        refused: None,
+        verbose: 0,
+    };
+    let targets = Targets { cargo: Some(cargo), ..agent() };
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets });
+    let got = client.wait(&mut daemon, id);
+    ERRS_COMPILE.set(None);
+
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let said = got.iter().any(|it| {
+        matches!(it, Response::Diagnostic(diagnostic) if diagnostic.level == Level::Error
+            && diagnostic.message.contains("no `lang_start`")
+            && diagnostic.message.contains("unit 1"))
+    });
+    assert!(said, "the unit's error says what and where: {got:#?}");
+    let job_failed = got.iter().any(|it| matches!(it, Response::Error(error) if error.what.contains("lang_start")));
+    assert!(!job_failed, "the error fails its unit, not the job: {got:#?}");
+    let ran = PHASES.with(|it| it.take());
+    assert!(ran.contains(&(0, Phase::Store)), "dep's library, the sibling, is built: {ran:?}");
+    assert!(!ran.iter().any(|it| it.0 == 3), "the program, after the build script, is never compiled: {ran:?}");
+
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+}
+
 /// A stop (what SIGTERM asks) right after a build failed on a unit's panicking compile writes
 /// the image, and the next start opens it: a caught panic leaves nothing that skips the write.
 #[test]
@@ -1511,7 +2424,7 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
 
     let cancelled = Arc::new(AtomicBool::new(false));
     let front = Arc::new(FakeFront { goal: Goal::Check });
-    let inputs = Arc::new(FakeInputs { runs: vec![4, 7] });
+    let inputs = Arc::new(FakeInputs { runs: vec![4, 7], ..FakeInputs::default() });
     let reading = || Readers::<Fake> { this: Some(FakeReader(inputs.clone())), ..Readers::default() };
     let run = |does: Does<Fake>, readers: Readers<Fake>| match Step::of(&cancelled, does).run(0, readers) {
         Some(Did { outcome: blaze_graph::Outcome::Built, value }) => value,
@@ -1530,12 +2443,12 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
     let codegen = answered(run(Does::CodegenInputs { front: front.clone() }, reading()));
     assert_eq!(codegen, Response::CodegenInputs(Vec::new()));
 
-    let writer = FakeWriter { inputs: Arc::new(FakeInputs { runs: vec![1, 2, 3] }), asked: Vec::new(), broke: Vec::new() };
+    let writer = FakeWriter { inputs: Arc::new(FakeInputs { runs: vec![1, 2, 3], ..FakeInputs::default() }), asked: Vec::new(), broke: Vec::new() };
     let tables = Does::Tables { front: front.clone(), images: Vec::new() };
     let tables = answered(run(tables, Readers { writer: Some(writer), ..Readers::default() }));
     assert_eq!(tables, Response::Tables(vec![Table { name: "run".into(), elements: 3, bytes: 0 }]));
 
-    let writer = FakeWriter { inputs: Arc::new(FakeInputs { runs: vec![1] }), asked: vec![2], broke: Vec::new() };
+    let writer = FakeWriter { inputs: Arc::new(FakeInputs { runs: vec![1], ..FakeInputs::default() }), asked: vec![2], broke: Vec::new() };
     let pack = Does::Pack { front: front.clone(), program: "app".into() };
     let packed = answered(run(pack, Readers { writer: Some(writer), ..Readers::default() }));
     assert_eq!(packed, Response::Packed { pack: b"app [1, 2]".to_vec() }, "a write asked for is applied first");

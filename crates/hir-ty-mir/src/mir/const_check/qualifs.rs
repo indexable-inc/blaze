@@ -18,7 +18,7 @@ use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
     AdtId, DefWithBodyId, HasModule, StaticId,
     attrs::AttrFlags,
-    expr_store::{Body, ExpressionStore},
+    expr_store::ExpressionStore,
     hir::{Expr, type_ref::Rawness},
     signatures::{StaticFlags, StaticSignature},
     unstable_features::UnstableFeatures,
@@ -255,12 +255,14 @@ impl<'a, 'f, 'db> Cx<'a, 'f, 'db> {
         let env = const_param_env(db, owner.generic_def(db));
         let infcx =
             DbInterner::new_with(db, env.krate).infer_ctxt().build(TypingMode::non_body_analysis());
+        // With what the body's `for const` loops assume of their binders, as inference had it.
+        let param_env = hir_ty::comptime_env::owner_env(db, owner, &infcx, env.param_env);
         Cx {
             db,
             body,
             context,
             infcx,
-            env: env.param_env,
+            env: param_env,
             frame,
             types: map_in(frame),
             store: None,
@@ -909,7 +911,7 @@ impl<'a, 'f, 'db> Checker<'a, 'f, 'db> {
         }
         let (span, needs_non_const_drop) = match local {
             Some(local) => (
-                local_span(self.cx.db, owner, self.cx.body, local, dropped_at),
+                crate::mir::local_span(self.cx.db, owner, self.cx.body, local, dropped_at),
                 self.in_local(Qualif::NeedsNonConstDrop, local, block, index),
             ),
             None => (dropped_at, self.cx.in_any_value_of_ty(Qualif::NeedsNonConstDrop, ty)),
@@ -939,39 +941,3 @@ fn local_qualif<'f>(
     flow.state.contains(local_index(local))
 }
 
-/// Where rustc points at a local, its `LocalDecl`'s span: the pattern of a parameter or a
-/// binding, `self`, or the expression a temporary holds; `otherwise` for one with none.
-fn local_span(
-    db: &Db,
-    owner: InferBodyId<'_>,
-    body: &MirBody<'_>,
-    local: LocalId,
-    otherwise: MirSpan,
-) -> MirSpan {
-    // An anonymous constant has no parameters.
-    if let InferBodyId::DefWithBodyId(def) = owner
-        && let Some(at) = body.param_locals.iter().position(|&it| it == local)
-    {
-        let store = Body::of(db, def);
-        // The `self` parameter's local comes first.
-        let has_self = store.self_param.is_some();
-        if has_self && at == 0 {
-            return MirSpan::SelfParam;
-        }
-        if let Some(param) = store.params.get(at - usize::from(has_self)) {
-            return MirSpan::PatId(param.user_written);
-        }
-    }
-    if let Some((binding, _)) = body.binding_locals.iter().find(|&(_, &it)| it == local) {
-        let (_, map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
-        return match map.patterns_for_binding(binding).first() {
-            Some(&pat) => MirSpan::PatId(pat),
-            None => MirSpan::BindingId(binding),
-        };
-    }
-    body.basic_blocks
-        .iter()
-        .flat_map(|(_, block)| &block.statements)
-        .find(|it| matches!(it.kind, StatementKind::StorageLive(it) if it == local))
-        .map_or(otherwise, |it| it.span)
-}

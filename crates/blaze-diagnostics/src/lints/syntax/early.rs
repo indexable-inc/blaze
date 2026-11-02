@@ -27,6 +27,7 @@ mod macros;
 pub(crate) mod validation;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir::{HirFileId, InFile};
 use span::SyntaxContext;
 use syntax::{SyntaxKind, SyntaxNodePtr, TextRange, view as ast};
@@ -95,12 +96,12 @@ pub(crate) fn allows_unsafe(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) 
 /// derive) they are the expansion of: one hash probe per lookup, built once per crate with
 /// its size known.
 pub(crate) struct Expansions<'w, 'db> {
-    by_call: HashMap<InFile<SyntaxNodePtr>, &'w Tree<'db>>,
+    by_call: HashMap<InFile<SyntaxNodePtr>, &'w Tree<'db>, Global>,
 }
 
 impl<'w, 'db> Expansions<'w, 'db> {
     pub(crate) fn of(cx: &Cx<'_, '_>, walk: &'w Walk<'db>) -> Expansions<'w, 'db> {
-        let mut by_call = HashMap::with_capacity_and_hasher(walk.trees.len(), Default::default());
+        let mut by_call = HashMap::with_capacity_in(walk.trees.len(), Global);
         for tree in &walk.trees {
             let Some(call) = tree.call else { continue };
             let node = call.loc(cx.db).to_node_view(cx.db);

@@ -23,6 +23,7 @@ use std::{alloc::Allocator, fmt::Write as _};
 
 use base_db::Db;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, Tag, frame, scratch};
 use either::Either;
@@ -95,8 +96,8 @@ fn reached<'db, 'f>(
 ) -> Result<Reached<'f>, Unhashable> {
     let no_mir = |_| Unhashable { item: id, what: "its MIR failed to lower" };
     // alloc: std's set takes no allocator; one per bound hash.
-    let mut seen: HashSet<Either<InternedClosureId<'db>, InternedCoroutineId<'db>>> =
-        HashSet::default();
+    let mut seen: HashSet<Either<InternedClosureId<'db>, InternedCoroutineId<'db>>, Global> =
+        HashSet::new_in(Global);
     let mut work: Vec<&'db MirBody<'db>, &Frame> = Vec::new_in(frame);
     work.push(db.mir_body(body).map_err(no_mir)?);
     let mut methods = Vec::new_in(frame);

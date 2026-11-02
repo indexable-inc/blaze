@@ -8,12 +8,13 @@
 //! shard's `defs`, for the errors that name it.
 
 use std::{
-    collections::hash_map::Entry as Slot,
     mem,
     sync::atomic::{AtomicUsize, Ordering},
 };
+use blaze_hash::hash_map::Entry as Slot;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use hir_def::DefWithBodyId;
 use parking_lot::{Mutex, MutexGuard};
@@ -43,7 +44,7 @@ struct Shard {
     bytes: Vec<u8>,
     defs: Vec<DefWithBodyId>,
     tallies: Counts,
-    refused: HashMap<&'static str, u64>,
+    refused: HashMap<&'static str, u64, Global>,
 }
 
 /// Why offered steps were not kept, by every reason but a read, and what each step's lookups
@@ -186,7 +187,7 @@ impl Pending {
     pub(super) fn take(&self) -> (Vec<Taken>, Tallies) {
         let mut tallies = Tallies::default();
         // alloc: flush, once per build
-        let mut refused = HashMap::<&'static str, u64>::default();
+        let mut refused = HashMap::<&'static str, u64, Global>::default();
         // alloc: flush, once per build
         let mut taken = Vec::with_capacity(SHARDS);
         for shard in &self.shards {

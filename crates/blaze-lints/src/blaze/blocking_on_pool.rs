@@ -12,6 +12,7 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir::AsAssocItem as _;
 use hir_def::{
     DefWithBodyId, FunctionId, HasModule as _,
@@ -26,7 +27,7 @@ use crate::check::Cx;
 
 /// The functions of a crate's walk that run on a fiber or a pool thread, as a set.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct OnFiber(HashSet<FunctionId>);
+pub(crate) struct OnFiber(HashSet<FunctionId, Global>);
 
 impl OnFiber {
     pub(crate) fn contains(&self, f: FunctionId) -> bool {

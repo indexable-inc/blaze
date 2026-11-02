@@ -683,6 +683,67 @@ fn two_crates_of_one_key_stop_the_build_naming_both() {
     assert!(message.contains("one key"), "{message}");
 }
 
+/// One package's targets of one name (`tests/fetch.rs`, `examples/fetch.rs`, ...) alike in
+/// all else are as many crates as cargo has units: under `--all-targets` an example is built
+/// with `--test`, so the crate is a `Test` of an `Example` target, and its key must not be the
+/// integration test's. Giving the example the test's manifest kind brings the clash back.
+#[test]
+fn an_example_and_a_test_with_one_name_are_two_crates() {
+    use base_db::TargetKind::{Bench, Bin, Example, Lib, Test};
+    use blaze_query::db::Durability;
+    // (what the crate is built as, the manifest target's kind)
+    let graph = |kinds: &[(base_db::TargetKind, base_db::TargetKind)]| {
+        let fixture: String = (0..kinds.len()).map(|at| format!("//- /{at}.rs crate:c{at}\npub struct S;\n")).collect();
+        let mut db = fixture::db(&fixture).into_db();
+        let made: Vec<_> = base_db::all_crates(&db).iter().copied().collect();
+        let (data, workspace) = (made[0].data(&db).clone(), made[0].workspace_data(&db).clone());
+        let mut krates = Vec::new();
+        for (&(target_kind, manifest_kind), it) in kinds.iter().zip(&made) {
+            let data = base_db::BuiltCrateData {
+                root_file_id: it.data(&db).root_file_id,
+                dependencies: Vec::new(),
+                origin: base_db::CrateOrigin::Local { repo: None, name: Some(intern::Symbol::intern("blaze-registry")) },
+                target_kind,
+                manifest_kind,
+                ..data.clone()
+            };
+            let extra = base_db::ExtraCrateData {
+                version: Some("0.0.0".to_owned()),
+                display_name: Some(base_db::CrateDisplayName::from_canonical_name("fetch")),
+                potential_cfg_options: None,
+            };
+            let cfg = cfg::CfgOptions::default();
+            let env = base_db::Env::default();
+            krates.push(base_db::Crate::create(&mut db, data, extra, workspace.clone(), cfg, env, Durability::LOW));
+        }
+        base_db::set_all_crates_with_durability(&mut db, krates.iter().copied(), Durability::LOW);
+        (db, krates)
+    };
+    let kinds = [
+        (Test, Test),
+        (Test, Example),
+        (Example, Example),
+        (Bin, Bin),
+        (Test, Bin),
+        (Bench, Bench),
+        (Test, Bench),
+        (Test, Lib { is_proc_macro: false }),
+    ];
+    let (db, krates) = graph(&kinds);
+    key::check_crate_keys(&db).unwrap_or_else(|clash| panic!("{clash}"));
+    let keys: Vec<_> = krates.iter().map(|&krate| key::crate_key(&db, krate)).collect();
+    for (at, a) in keys.iter().enumerate() {
+        assert!(!keys[at + 1..].contains(a), "{:?} shares its key", kinds[at]);
+    }
+
+    let (db, _) = graph(&[(Test, Test), (Test, Test)]);
+    let clash = key::check_crate_keys(&db).expect_err("a test and a test of one name are one crate");
+    assert!(clash.same_key, "{clash}");
+    let (db, _) = graph(&[(Test, Example), (Test, Example)]);
+    let message = key::check_crate_keys(&db).expect_err("two examples of one name").to_string();
+    assert!(message.contains("test of the example target"), "the error names the target's kind: {message}");
+}
+
 #[test]
 fn a_batch_of_keys_is_each_key_alone() {
     let (db, _) = single(

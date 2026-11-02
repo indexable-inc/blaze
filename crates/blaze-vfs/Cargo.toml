@@ -23,6 +23,7 @@ blaze-image.workspace = true
 blaze-mem.workspace = true
 blaze-protocol.workspace = true
 blaze-reclaim.workspace = true
+blaze-serde.workspace = true
 hashbrown.workspace = true
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }

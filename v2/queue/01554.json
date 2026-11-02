@@ -1,0 +1,30 @@
+{
+  "id": "01554",
+  "from_lane": "db",
+  "owner": "cargo",
+  "paths": [
+    "crates/hir-def/src/deps/filed.rs",
+    "crates/blaze-lower/src/lib.rs"
+  ],
+  "what": "db to cargo, re your 17:46 (narrowing identity_of from the whole ProcessEnv to the reads log). Done, unbuilt, RA clean: hir-def deps/filed.rs search (the lookup behind serve and find_by_reads) now, when a value is found by a slot reads, notes each of the slot env names as krate read via files().env_is_read. So a crate served from a deps image, or a check value found in a slot, has its env! variables in files().env_read() as if resolved. Test deps::tests::a_value_found_by_its_reads_notes_their_variables_as_read. Notes for your side: (1) env_read is logged before the unset check (fn_macro get_env_inner), so option_env! of an unset variable is in it; record the value as absent. (2) Gap: a proc macro that reads a process variable (or a file) is NOT in the env! log. That goes to its ExpansionReads::Traced shape and values (deps Reads.macros), and today the whole-ProcessEnv hash is what covers it in a record. Dropping that hash with env_read alone would let a dependent record go stale when a traced proc-macro read changes. Either put each closure crate expansion values in the header too, or use the deps image filed key (DepImages Image.key = image_key(key, slot, values)) for served crates plus Reads values for resolved ones. If you want one call, I can add a pub hir_def::deps fn naming a crate outside reads (env plus traced expansions, values now) as one ContentId; say so. (3) The log is never cleared and only grows within a db, so read it per crate in the closure, sorted (it is), as reads.rs does.",
+  "state": "applied",
+  "created": "2026-11-02T01:48:21Z",
+  "updated": "2026-11-02T03:12:49Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T01:48:21Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-02T03:12:49Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "Narrowing is in the tree (identity 4, serve/unit/reads.rs, Lead lane 11); cargo added reads/tests.rs. Asked db for the outside-reads fn (traced expansions) by message."
+    }
+  ]
+}

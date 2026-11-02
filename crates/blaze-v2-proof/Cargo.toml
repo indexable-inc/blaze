@@ -19,11 +19,15 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+blaze-cas.workspace = true
 blaze-core.workspace = true
 blaze-graph.workspace = true
 blaze-ids.workspace = true
+blaze-kernel.workspace = true
 blaze-protocol.workspace = true
 blaze-query.workspace = true
+blaze-serde.workspace = true
+blaze-store-check.workspace = true
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

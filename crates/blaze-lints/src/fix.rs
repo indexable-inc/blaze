@@ -32,7 +32,7 @@ pub struct Fixed {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FixError {
-    Unnamed(diag::Unnamed),
+    Check(diag::CheckError),
     /// The fixes left the crate with an error it did not have; the texts are as they were.
     Broke { at: String, error: String, by: Vec<String> },
     /// Fixes still rewriting the same text after the last pass.
@@ -46,7 +46,7 @@ pub enum FixError {
 impl std::fmt::Display for FixError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FixError::Unnamed(it) => it.fmt(f),
+            FixError::Check(it) => it.fmt(f),
             FixError::Broke { at, error, by } => {
                 write!(f, "{at}: the fixes of {} leave the error `{error}`, so none is made", by.join(", "))
             }
@@ -63,9 +63,9 @@ impl std::fmt::Display for FixError {
 
 impl std::error::Error for FixError {}
 
-impl From<diag::Unnamed> for FixError {
-    fn from(it: diag::Unnamed) -> FixError {
-        FixError::Unnamed(it)
+impl From<diag::CheckError> for FixError {
+    fn from(it: diag::CheckError) -> FixError {
+        FixError::Check(it)
     }
 }
 

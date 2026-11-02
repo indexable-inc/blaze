@@ -30,7 +30,7 @@ fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), 
     unoptimized
 }
 
-fn eval_main_at(
+pub(super) fn eval_main_at(
     db: &TestDB,
     file_id: EditionedFileId,
     level: MirOptLevel,
@@ -83,10 +83,32 @@ pub(super) fn check_pass_and_stdio(
     expected_stdout: &str,
     expected_stderr: &str,
 ) {
+    check_pass_and_stdio_in(ra_fixture, expected_stdout, expected_stderr, false);
+}
+
+/// [`check_pass_and_stdio`] with builtin derives expanded, as a build has them: the database
+/// otherwise only records them, and a derived method has no body to run.
+pub(super) fn check_pass_and_stdio_derived(
+    #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    expected_stdout: &str,
+    expected_stderr: &str,
+) {
+    check_pass_and_stdio_in(ra_fixture, expected_stdout, expected_stderr, true);
+}
+
+fn check_pass_and_stdio_in(
+    ra_fixture: &str,
+    expected_stdout: &str,
+    expected_stderr: &str,
+    expand_derives: bool,
+) {
     let _tracing = setup_tracing();
     let fx = fixture::db(ra_fixture);
     let file_ids = fx.files().to_vec();
     let mut db = fx.into_db();
+    if expand_derives {
+        hir_def::nameres::set_expand_builtin_derives(&mut db, true);
+    }
     // As a build does, for `Location::caller` and `file!()`.
     crate::mir::location::name_sources(&mut db, "fixture", |_, _| Some("main.rs".to_owned()));
     crate::attach_db(&db, || {
@@ -147,7 +169,7 @@ fn check_panic(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected_panic: 
     })
 }
 
-fn check_error_with(
+pub(super) fn check_error_with(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
     expect_err: impl FnOnce(MirEvalError<'_>) -> bool,
 ) {
@@ -1055,6 +1077,46 @@ struct X(i32);
 fn main() {
     let ar = [X(1), X(2)];
     ar.clone();
+}
+        "#,
+    );
+}
+
+/// `#![blaze::specialization]` with a `#[blaze::specialization_trait]` bound, no feature: the
+/// call goes to the specialized impl, as `min_specialization`'s does.
+#[test]
+fn blaze_specialization_calls_the_specialized_impl() {
+    check_pass(
+        r#"
+//- minicore: sized, panic
+#![blaze::specialization]
+
+#[blaze::specialization_trait]
+trait Fast {}
+
+trait Pick {
+    fn pick(&self) -> i32;
+}
+
+impl<T> Pick for T {
+    default fn pick(&self) -> i32 {
+        panic!("should go to the specialized impl")
+    }
+}
+
+impl<T: Fast> Pick for T {
+    fn pick(&self) -> i32 {
+        2
+    }
+}
+
+struct X;
+impl Fast for X {}
+
+fn main() {
+    if X.pick() != 2 {
+        panic!("wrong impl");
+    }
 }
         "#,
     );
@@ -3330,6 +3392,81 @@ fn main() {
         free(c as *mut u8);
         free(aligned);
         free(0 as *mut u8);
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn a_bits_struct_round_trips_through_literals_writes_and_patterns() {
+    // `#[blaze::bits]`: fields at bit offsets in declaration order. `Flags` takes valid @0
+    // (1 bit), mode @1 (2: three variants), level @3 (8), inner @11 (3) and delta @14 (8):
+    // 22 bits, so a `u32`. `AT_COMPILE_TIME` is const eval of the same function main runs, so
+    // the two agree only if const eval and run time pack alike.
+    check_pass(
+        r#"
+//- minicore: copy, clone, derive, transmute, add, eq, unary_ops
+#[derive(Clone, Copy)]
+enum Mode { Off, Read, Write }
+
+#[blaze::bits]
+#[derive(Clone, Copy)]
+struct Inner { lo: bool, mode: Mode }
+
+#[blaze::bits]
+#[derive(Clone, Copy)]
+struct Flags { valid: bool, mode: Mode, level: u8, inner: Inner, delta: i8 }
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+const fn build() -> Flags {
+    let mut f = Flags {
+        valid: true,
+        mode: Mode::Write,
+        level: 7,
+        inner: Inner { lo: false, mode: Mode::Read },
+        delta: -3,
+    };
+    f.level += 1;
+    f.inner.lo = true;
+    Flags { mode: Mode::Read, ..f }
+}
+
+// valid | Read << 1 | 8 << 3 | (lo | Read << 1) << 11 | (-3i8 as u8) << 14
+const EXPECTED: u32 = 1 | 1 << 1 | 8 << 3 | 3 << 11 | 253 << 14;
+const AT_COMPILE_TIME: u32 = unsafe { core::mem::transmute::<Flags, u32>(build()) };
+
+fn main() {
+    let g = build();
+    let bits: u32 = unsafe { core::mem::transmute(g) };
+    if bits != EXPECTED || AT_COMPILE_TIME != bits {
+        should_not_reach();
+    }
+    if !g.valid || g.level != 8 || g.delta != -3 || !g.inner.lo {
+        should_not_reach();
+    }
+    match g.mode {
+        Mode::Read => {}
+        _ => should_not_reach(),
+    }
+    let Flags { level, inner: Inner { mode, .. }, .. } = g;
+    if level != 8 {
+        should_not_reach();
+    }
+    match mode {
+        Mode::Read => {}
+        _ => should_not_reach(),
+    }
+    match g {
+        Flags { valid: true, level: 8, delta: -3, inner: Inner { lo: true, .. }, .. } => {}
+        _ => should_not_reach(),
+    }
+    let back: Flags = unsafe { core::mem::transmute(EXPECTED) };
+    if back.level != 8 || back.delta != -3 || !back.inner.lo {
+        should_not_reach();
     }
 }
 "#,

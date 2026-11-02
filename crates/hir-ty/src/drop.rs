@@ -48,8 +48,14 @@ pub enum DropGlue {
 }
 
 /// Whether no part of a value of `ty` can change behind a shared reference: no `UnsafeCell`,
-/// no union, no type parameter. rustc promotes `&expr` only of such a type.
+/// no union, no type parameter. rustc promotes `&expr` only of such a type. One level per level
+/// of `ty`, as deep as the program built it, each with stack to spare (rule 17).
 pub fn is_freeze<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -> bool {
+    stdx::ensure_sufficient_stack(|| is_freeze_level(infcx, ty, env))
+}
+
+/// One level of [`is_freeze`]: its parts go back through it.
+fn is_freeze_level<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -> bool {
     let mut ocx = ObligationCtxt::new(infcx);
     // A field of an associated type, `Cow<str>`'s `<str as ToOwned>::Owned`, is what it
     // normalizes to; one the solver can't decide stays the alias, which is not `Freeze`.
@@ -112,7 +118,19 @@ pub fn has_drop_glue_in<'db>(
     has_drop_glue_impl(infcx, ty, env, &mut frame_set(frame))
 }
 
+/// One level per level of `ty`, as deep as the program built it, each with stack to spare
+/// (rule 17).
 fn has_drop_glue_impl<'db>(
+    infcx: &InferCtxt<'db>,
+    ty: Ty<'db>,
+    env: ParamEnv<'db>,
+    visited: &mut FrameSet<'_, Ty<'db>>,
+) -> DropGlue {
+    stdx::ensure_sufficient_stack(|| has_drop_glue_level(infcx, ty, env, visited))
+}
+
+/// One level of [`has_drop_glue_impl`]: its parts go back through it.
+fn has_drop_glue_level<'db>(
     infcx: &InferCtxt<'db>,
     ty: Ty<'db>,
     env: ParamEnv<'db>,

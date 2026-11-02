@@ -4,6 +4,7 @@ use std::ops::ControlFlow;
 
 use base_db::Db;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir_def::{GenericDefId, HasModule, ImplId, TraitId, TypeAliasId};
 use rustc_abi::{Float, HasDataLayout, Integer, IntegerType, Primitive, ReprOptions};
 use rustc_type_ir::{
@@ -156,6 +157,8 @@ impl IntegerExt for Integer {
             IntTy::I64 => I64,
             IntTy::I128 => I128,
             IntTy::Isize => cx.data_layout().ptr_sized_integer(),
+            // blaze: an arbitrary width is its storage integer (`i3` is an `i8`).
+            IntTy::Bits(_) => Self::from_int_ty(cx, ity.storage()),
         }
     }
     fn from_uint_ty<C: HasDataLayout>(cx: &C, ity: UintTy) -> Integer {
@@ -167,6 +170,7 @@ impl IntegerExt for Integer {
             UintTy::U64 => I64,
             UintTy::U128 => I128,
             UintTy::Usize => cx.data_layout().ptr_sized_integer(),
+            UintTy::Bits(_) => Self::from_uint_ty(cx, ity.storage()),
         }
     }
 
@@ -532,7 +536,7 @@ impl ItemBounds {
             elaborate(interner, explicit_bounds.self_bounds().skip_binder().iter().copied())
                 .filter_only_self();
 
-        let self_bounds = HashSet::from_iter(self_bounds);
+        let self_bounds = HashSet::from_iter_in(self_bounds, Global);
         let non_self_bounds = all_bounds.filter(|bound| !self_bounds.contains(bound));
 
         let non_self_bounds_start = self_bounds.len() as u32;

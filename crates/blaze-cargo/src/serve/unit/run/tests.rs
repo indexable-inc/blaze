@@ -38,6 +38,9 @@ fn policy(level: OptLevel) -> Policy {
         fold: true,
         sanitize: Sanitize::default(),
         pgo: Pgo::None,
+        proc_macro_bridge: false,
+        report: false,
+        heap_to_stack: false,
     }
 }
 

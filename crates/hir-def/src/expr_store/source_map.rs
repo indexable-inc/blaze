@@ -967,6 +967,10 @@ impl ExpressionStoreDiagnostics {
             }
             MissingBody { node, kind } => MissingBody { node: mv.raw(*node), kind: *kind },
             IntLiteralTooLarge { node } => IntLiteralTooLarge { node: mv.ptr(*node) },
+            ComptimeWithoutFeature { node, form } => {
+                ComptimeWithoutFeature { node: mv.raw(*node), form: *form }
+            }
+            VerifyRefused { node, why } => VerifyRefused { node: mv.raw(*node), why: *why },
         }
     }
 }
@@ -1201,6 +1205,7 @@ mod view_tests;
 pub(in crate::expr_store) mod tests {
     use blaze_ids::rng::SplitMix64;
     use blaze_hash::HashMap;
+    use std::alloc::Global;
     use blaze_query::db::FromId;
     use smallvec::SmallVec;
     use syntax::{SyntaxKind, TextSize};
@@ -1251,7 +1256,7 @@ pub(in crate::expr_store) mod tests {
         for seed in 0..64 {
             let mut rng = SplitMix64::new(seed);
             let mut pushed = Vec::new();
-            let mut model = HashMap::default();
+            let mut model = HashMap::new_in(Global);
             for value in 0..rng.below(300) as u32 {
                 let key = seeded_src(&mut rng);
                 pushed.push((key, value));

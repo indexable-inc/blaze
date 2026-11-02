@@ -39,7 +39,6 @@ use hir_def::{
     hir::{ClosureKind, ExprId},
     item_scope::ItemScope,
     lang_item::lang_items,
-    unstable_features::UnstableFeatures,
 };
 use hir_expand::{
     AstId, HirFileId, MacroCallId,
@@ -80,7 +79,7 @@ const NAME: &str = "blaze v2 fact name 1";
 const CAPTURES: &str = "blaze v2 fact captures 1";
 const AUTO_TRAITS: &str = "blaze v2 fact auto traits 2";
 const COHERENCE: &str = "blaze v2 fact coherence 2";
-const SPECIALIZES: &str = "blaze v2 fact specializes 2";
+const SPECIALIZES: &str = "blaze v2 fact specializes 3";
 const DROP_CHECK: &str = "blaze v2 fact drop check 2";
 const VTABLE: &str = "blaze v2 fact vtable 2";
 const DERIVE: &str = "blaze v2 fact derive 2";
@@ -234,8 +233,10 @@ fn value_in(db: &Db, fact: &Fact) -> Result<ContentId, Unhashable> {
             let Some(imp) = impl_of(db, key, fact) else { return absent() };
             h.id(&hash::signature_hash(db, ItemId::Impl(imp))?.0);
             write_coherence(db, &mut h, imp)?;
-            let features = UnstableFeatures::query(db, imp.krate(db));
-            h.update(&[features.specialization as u8, features.min_specialization as u8]);
+            // `may_specialize` reads the crate's mode: its features and its root's
+            // `#![blaze::specialization]`, which `specialization_mode` folds into one.
+            let mode = hir_ty::specialization_mode(db, imp.krate(db));
+            h.update(&[mode as u8]);
         }
         Fact::DropCheck(key) => {
             let Some(adt) = adt(db, key, fact) else { return absent() };

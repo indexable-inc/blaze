@@ -17,6 +17,7 @@
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir::{AsAssocItem as _, HirDisplay as _, HirFileId};
 use hir_def::{
     DefWithBodyId, FunctionId,
@@ -87,7 +88,7 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
 
 /// What makes a callee a query, as a finding says it.
 #[derive(Clone)]
-enum Query {
+pub(super) enum Query {
     /// Made by this attribute macro of `blaze_query_macros`.
     Macro(&'static str),
     /// A method of this trait, implemented for `base_db::Db`.
@@ -95,7 +96,7 @@ enum Query {
 }
 
 impl Query {
-    fn say(&self) -> String {
+    pub(super) fn say(&self) -> String {
         match self {
             Query::Macro(name) => format!("made by `#[blaze_query::{name}]`"),
             Query::Database(name) => format!("a method of `{name}` on the database"),
@@ -114,7 +115,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     // alloc: the query calls of one body, a few; each callee asked once
     let mut queries: Vec<(ExprId, FunctionId, Query)> = Vec::new();
     // alloc: as above
-    let mut known: HashMap<FunctionId, Option<Query>> = HashMap::default();
+    let mut known: HashMap<FunctionId, Option<Query>, Global> = HashMap::new_in(Global);
     for (id, expr) in body.exprs() {
         if !matches!(expr, Expr::Call { .. } | Expr::MethodCall { .. }) {
             continue;
@@ -206,7 +207,7 @@ fn is_guard(db: &Db, adt: hir::Adt) -> bool {
 }
 
 /// Whether a call of `f` with `args` is a query, and what makes it one.
-fn query_of<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, f: FunctionId, args: GenericArgs<'db>) -> Option<Query> {
+pub(super) fn query_of<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, f: FunctionId, args: GenericArgs<'db>) -> Option<Query> {
     if let Some(name) = query_macro(db, f) {
         return Some(Query::Macro(name));
     }
@@ -221,7 +222,7 @@ fn query_of<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, f: FunctionId, 
 
 /// The attribute macro of `blaze_query_macros` that made `f`, if one of [`QUERY_MACROS`] did:
 /// the macro of the call whose expansion `f` is defined in.
-fn query_macro(db: &Db, f: FunctionId) -> Option<&'static str> {
+pub(super) fn query_macro(db: &Db, f: FunctionId) -> Option<&'static str> {
     let HirFileId::MacroFile(call) = DefWithBodyId::from(f).erased_ast_id(db).file_id else { return None };
     let loc = call.loc(db);
     let &MacroDefKind::ProcMacro(id, _, ProcMacroKind::Attr) = &loc.def.kind else { return None };

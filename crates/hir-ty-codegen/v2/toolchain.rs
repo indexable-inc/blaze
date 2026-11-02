@@ -10,7 +10,7 @@
 #[cfg(test)]
 mod tests;
 
-use std::{collections::BTreeSet, path::Path, sync::OnceLock};
+use std::{collections::BTreeSet, path::Path};
 
 use blaze_codegen::{
     Arch,
@@ -128,7 +128,7 @@ pub enum Runs {
 /// gives them to rustc), for a program that `runs` there. A `-C target-cpu` or
 /// `-C target-feature` in the flags wins over where it runs.
 pub fn toolchain(target: &str, rustflags: &[String], runs: Runs) -> Result<Toolchain, String> {
-    let emitted = Target::parse(target)?;
+    let emitted = Target::of(target)?;
     let flags = Flags::read(rustflags)?;
     let arch = match emitted.arch {
         crate::Arch::X86_64 => Arch::X86_64,
@@ -204,7 +204,7 @@ pub fn toolchain(target: &str, rustflags: &[String], runs: Runs) -> Result<Toolc
         }
     };
     Ok(Toolchain {
-        id: id_of(&build()?),
+        id: temporary_executable_id(&build()?),
         // alloc: per toolchain made, a few names
         target: target.to_owned(),
         arch,
@@ -226,19 +226,28 @@ pub fn toolchain(target: &str, rustflags: &[String], runs: Runs) -> Result<Toolc
     })
 }
 
-/// Sets up the process's code generator for `toolchain`: its target and frame pointers, and
-/// its target features as one more set the process compiles with. Said before the first unit
-/// of each toolchain; each unit's spec is checked against it.
+/// Sets up the process's code generator for `toolchain`: its target as one more the process
+/// compiles for (each unit names its own, `backend::unit_target`), and its target features as
+/// one more set the process compiles with. Said before the first unit of each toolchain; each
+/// unit's spec is checked against it. Nothing of it is process-wide: frame pointers are each
+/// unit's own, read where its code is made (`v2::Function::frame_pointers`).
 pub fn select(toolchain: &Toolchain) -> Result<(), String> {
-    let target = Target::select(&toolchain.target)?;
+    let target = Target::of(&toolchain.target)?;
     target.features_of(&toolchain.features)?;
-    crate::backend::keep_frame_pointers(toolchain.frame_pointers);
     Ok(())
 }
 
 /// The pinned nightly blaze compiles against and the blaze build that makes the code (#1439):
 /// the backends' versions are fields of their own.
-fn id_of(build: &ContentId) -> ContentId {
+///
+/// TEMPORARY: this keys code by the executable's bytes, so every rebuild of blaze misses every
+/// stored template, whatever it changed. It is replaced, not kept beside, by the code
+/// generator's own behaviour identity, `core::reflect::fn_info(<codegen entry>).code_id`
+/// (docs/v2/plan/design/code-identity.md, "Toolchain::id"), once const eval answers `fn_info`
+/// (lane comptime), codegen's entry traits are trusted doors (lane pure) and blaze builds itself
+/// with `blaze_comptime`. Until then this is the key, named as what it is; nothing falls back to
+/// it once the CodeId exists, and a CodeId that can't be had is an error, never this.
+fn temporary_executable_id(build: &ContentId) -> ContentId {
     let mut hasher = Hasher::new(ID_DOMAIN);
     hasher.update(NIGHTLY.as_bytes()).update(b"\n").id(build);
     hasher.finish()
@@ -248,8 +257,9 @@ fn id_of(build: &ContentId) -> ContentId {
 /// made for one code hash is what this blaze's front end and code generator make of it, and the
 /// code hash reads neither (it is of the item's source, its callees by their interfaces), so a
 /// store kept across blaze builds would hold another build's code under every key.
+#[expect(clippy::disallowed_types, reason = "the hash of the running blaze executable, which does not change while the process runs")]
 pub fn build() -> Result<ContentId, String> {
-    static BUILD: OnceLock<Result<ContentId, String>> = OnceLock::new();
+    static BUILD: std::sync::OnceLock<Result<ContentId, String>> = std::sync::OnceLock::new();
     BUILD
         .get_or_init(|| {
             // alloc: an error, once a process

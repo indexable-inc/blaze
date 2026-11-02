@@ -169,6 +169,40 @@ fn a_put_is_read_at_once_durable_after_a_flush_and_there_after_reopening() {
     assert_eq!(store.verify(None), Vec::new());
 }
 
+/// A waiter on puts of two segments (the store's own and a worker writer's) is durable only
+/// once each is: tickets of different segments don't compare, and one `max` of them names the
+/// writer's (the higher segment) alone, which a commit made durable while the store's own
+/// later put is not yet. `Tickets` keeps each segment's last and lets go of each as it is
+/// durable.
+#[test]
+fn tickets_wait_on_each_segment_where_one_max_of_them_would_not() {
+    let mut sim = Sim::new(31, quiet());
+    let mut store = open(&mut sim, "store");
+    let mut writer = store.writer();
+    let guard = enter();
+    let early = writer.put(&guard, key(1), Kind::Query, b"a writer's put".to_vec()).unwrap();
+    let earlier = writer.put(&guard, key(2), Kind::Query, b"a writer's first".to_vec()).unwrap();
+    drop(guard);
+    flush(&mut sim, &mut store);
+    assert!(store.durable(early) && store.durable(earlier));
+    let late = store.put(key(3), Kind::Query, b"the store's own, after".to_vec()).unwrap();
+    assert!(!store.durable(late));
+    // One max is no bound: it stands for the writer's put, durable, and not the store's.
+    assert!(store.durable(early.max(late)), "the writer's segment is above the store's own");
+    let mut tickets = Tickets::default();
+    for ticket in [earlier, late, Ticket::DURABLE, early] {
+        tickets.add(ticket);
+    }
+    assert_eq!(tickets.iter().collect::<Vec<_>>(), [earlier.max(early), late], "one per segment, none for DURABLE");
+    assert_eq!(tickets.pending(|it| store.durable(it)), Some(late));
+    tickets.retain_pending(|it| store.durable(it));
+    assert_eq!(tickets.iter().collect::<Vec<_>>(), [late]);
+    flush(&mut sim, &mut store);
+    assert_eq!(tickets.pending(|it| store.durable(it)), None);
+    tickets.retain_pending(|it| store.durable(it));
+    assert!(tickets.is_empty());
+}
+
 #[test]
 fn a_second_put_keeps_the_first_and_other_bytes_are_a_mismatch() {
     let mut sim = Sim::new(2, quiet());
@@ -198,6 +232,1373 @@ fn a_put_of_a_value_in_flight_is_durable_with_its_commit() {
     let durable = drive(&mut sim, &mut store, &mut effects);
     assert!(durable.contains(&ticket));
     assert!(store.durable(again));
+}
+
+/// A pause hook ([`Own::pause`]) that holds a put at `stage` until the test lets it go: the
+/// first `wait` of the returned barrier is the put arriving there, the second lets it on.
+/// How long a test's thread waits at a [`Gate`] for the other before the test fails.
+const GATE_WAIT: Duration = Duration::from_secs(30);
+
+/// Two threads' meeting point, met by each in turn (a put's hook and the test driving it): a
+/// wait returns once the other thread has come to its matching wait, and fails the test,
+/// naming the gate's count, if it has not within [`GATE_WAIT`]. A hook a change skips fails
+/// the test rather than hang it (rule 15).
+#[derive(Default)]
+struct Gate {
+    arrived: std::sync::atomic::AtomicU64,
+}
+
+impl Gate {
+    fn wait(&self) {
+        use std::sync::atomic::Ordering;
+        let mine = self.arrived.fetch_add(1, Ordering::AcqRel) + 1;
+        let met = mine.div_ceil(2) * 2;
+        let deadline = std::time::Instant::now() + GATE_WAIT;
+        let mut spins = 0u32;
+        while self.arrived.load(Ordering::Acquire) < met {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a gate's other thread never came to wait {met} within {GATE_WAIT:?} (this thread's is {mine})"
+            );
+            spins += 1;
+            match spins < 64 {
+                true => std::thread::yield_now(),
+                false => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    }
+}
+
+fn hold_at(stage: crate::segment::PutAt) -> (std::sync::Arc<Gate>, std::sync::Arc<dyn Fn(crate::segment::PutAt) + Send + Sync>) {
+    let gate = std::sync::Arc::new(Gate::default());
+    let at = gate.clone();
+    let hook = move |it| {
+        if it == stage {
+            at.wait();
+            at.wait();
+        }
+    };
+    (gate, std::sync::Arc::new(hook))
+}
+
+/// Review 6 C1: two writers put one key at once and both pass the look. The winner's record
+/// is drained and committed while the loser is still in its put; the loser then loses the
+/// claim, writes nothing and ends. Its count (which `last_puts` hands a waiter) is durable
+/// after the next flush with nothing else to write, not only after some unrelated commit.
+#[test]
+fn a_put_that_lost_its_key_to_another_writers_is_durable_after_a_flush_with_nothing_to_write() {
+    use crate::segment::PutAt;
+    let mut sim = Sim::new(41, quiet());
+    let mut store = open(&mut sim, "store");
+    let mut winner = store.writer();
+    let mut loser = store.writer();
+    let (gate, hook) = hold_at(PutAt::Counted);
+    loser.own.pause = Some(hook);
+    let racing = std::thread::spawn(move || {
+        let guard = enter();
+        let ticket = loser.put(&guard, key(1), Kind::Query, b"one value".to_vec()).unwrap();
+        drop(guard);
+        ticket
+    });
+    // The loser is counted and past its look, and has claimed nothing.
+    gate.wait();
+    let waits = store.last_puts();
+    let lost = waits.iter().collect::<Vec<_>>();
+    assert_eq!(lost.len(), 1, "the loser's put is counted: {lost:?}");
+    let lost = lost[0];
+    let guard = enter();
+    let won = winner.put(&guard, key(1), Kind::Query, b"one value".to_vec()).unwrap();
+    drop(guard);
+    flush(&mut sim, &mut store);
+    assert!(store.durable(won), "the winner's put is committed");
+    assert!(!store.durable(lost), "the loser has not ended: its count is ahead of its drain");
+    gate.wait();
+    let given = racing.join().unwrap();
+    assert_eq!(given, won, "the loser is handed the winner's ticket");
+    flush(&mut sim, &mut store);
+    assert!(store.durable(lost), "a flush with nothing to write leaves the loser's count pending for ever");
+    assert!(store.last_puts().is_empty());
+}
+
+/// Review 6 C2: a put that panics after it was counted (here past its claim, as an assert of
+/// the writer's would) still ends: its count is published, so a wait on everything put
+/// (`last_puts`, a job's gate) ends with the next flush, and the writer goes on. Without the
+/// end, the count stays ahead of what the writer publishes and every later wait on the
+/// segment hangs until the writer's next put.
+#[test]
+fn a_put_that_panics_after_it_is_counted_still_ends_and_its_wait_ends() {
+    use crate::segment::PutAt;
+    let mut sim = Sim::new(42, quiet());
+    let mut store = open(&mut sim, "store");
+    let mut writer = store.writer();
+    writer.own.pause = Some(std::sync::Arc::new(|it| assert_ne!(it, PutAt::Written, "a bug of the put's, past its claim")));
+    let guard = enter();
+    let put = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        writer.put(&guard, key(1), Kind::Query, b"a put that panicked".to_vec())
+    }));
+    drop(guard);
+    assert!(put.is_err(), "the put panicked");
+    writer.own.pause = None;
+    let waits = store.last_puts();
+    assert!(!waits.is_empty(), "the panicked put was counted");
+    flush(&mut sim, &mut store);
+    assert_eq!(waits.pending(|it| store.durable(it)), None, "the wait on everything put ends after a flush");
+    assert!(store.last_puts().is_empty());
+    let guard = enter();
+    let next = writer.put(&guard, key(2), Kind::Query, b"after it".to_vec()).unwrap();
+    drop(guard);
+    flush(&mut sim, &mut store);
+    assert!(store.durable(next), "the writer goes on after a panic of its put");
+}
+
+/// Review 6 T3, the cross-thread half of D2: a put held between its claim and its end on
+/// another thread has its key readable, and is counted (`last_puts`) by then, so a reader's
+/// wait covers it. A flush and a whole commit meanwhile (of another put) leave it pending: its
+/// record is not published to the drain. Once it ends, the next flush makes it durable. Without
+/// the count before the claim, `last_puts` misses a put whose key was read.
+#[test]
+fn a_put_read_on_another_thread_before_it_ends_is_waited_on_until_a_later_commit() {
+    use crate::segment::PutAt;
+    let mut sim = Sim::new(43, quiet());
+    let mut store = open(&mut sim, "store");
+    let mut writer = store.writer();
+    let (gate, hook) = hold_at(PutAt::Written);
+    writer.own.pause = Some(hook);
+    let putting = std::thread::spawn(move || {
+        let guard = enter();
+        let ticket = writer.put(&guard, key(1), Kind::Query, b"put on another thread".to_vec()).unwrap();
+        drop(guard);
+        ticket
+    });
+    gate.wait();
+    let reader = store.reader();
+    let guard = enter();
+    let read = reader.get(&guard, &key(1)).unwrap().is_some_and(|it| it.bytes == b"put on another thread");
+    drop(guard);
+    assert!(read, "its key is readable once claimed");
+    let waits = store.last_puts();
+    let counted = waits.iter().collect::<Vec<_>>();
+    assert_eq!(counted.len(), 1, "a put whose key was read is counted: {counted:?}");
+    let counted = counted[0];
+    let other = store.put(key(2), Kind::Query, b"the loop's own".to_vec()).unwrap();
+    flush(&mut sim, &mut store);
+    assert!(store.durable(other), "a commit ran");
+    assert!(!store.durable(counted), "a put not ended is not drained, so no commit made it durable");
+    flush(&mut sim, &mut store);
+    assert!(!store.durable(counted), "still not ended");
+    gate.wait();
+    let ticket = putting.join().unwrap();
+    assert_eq!(ticket, counted, "the put's ticket is the one counted");
+    flush(&mut sim, &mut store);
+    assert!(store.durable(counted), "the flush after it ended drains and commits it");
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"put on another thread");
+}
+
+/// An output a little past [`CHUNK_FROM`] whose last chunk is 100 bytes: so short that a
+/// writer's record of it shares a segment chunk (8 KiB in tests) with its payload, and stays
+/// unpublished until the put ends. Every other chunk record is longer than a segment chunk and
+/// rolls to a chunk of its own, which publishes it, so only the last chunk can be a record in
+/// another writer's memory alone.
+fn output_with_a_short_last_chunk() -> Vec<u8> {
+    output_ending_in(|rest| rest[..100].to_vec())
+}
+
+/// An output of noise whose last chunk, as [`output_with_a_short_last_chunk`]'s, shares a
+/// segment chunk with its payload, but is 5 KiB of text: at least [`DEMOTE_FROM`], and it
+/// compresses, so a settle moves it cold once it is unread for two periods, which points its
+/// key at a record of the store's own segment (`Store::rehome`).
+fn output_with_a_last_chunk_a_settle_moves() -> Vec<u8> {
+    output_ending_in(|_| text(7, 5 << 10))
+}
+
+/// Text up to its first chunk cut past [`CHUNK_FROM`], then 100 bytes of it as its last
+/// chunk: every chunk but the last compresses and is at least [`DEMOTE_FROM`], so a settle
+/// moves them cold once unread for two periods; the last is under [`DEMOTE_FROM`] and stays.
+fn text_output_with_a_short_last_chunk() -> Vec<u8> {
+    output_of(text(441, 2 * CHUNK_FROM), |rest| rest[..100].to_vec())
+}
+
+/// Noise up to its first chunk cut past [`CHUNK_FROM`], then `tail(the noise after the cut)`
+/// as its last chunk, shorter than a chunk's least.
+fn output_ending_in(tail: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
+    output_of(noise(2 * CHUNK_FROM, 440), tail)
+}
+
+/// `long` up to its first chunk cut past [`CHUNK_FROM`], then `tail(the rest)` as its last
+/// chunk, shorter than a chunk's least.
+fn output_of(long: Vec<u8>, tail: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
+    let cut = chunk::cuts(&long).map(|it| it.end).find(|&end| end >= CHUNK_FROM).unwrap();
+    let tail = tail(&long[cut..]);
+    let mut out = long[..cut].to_vec();
+    out.extend_from_slice(&tail);
+    assert_eq!(chunk::cuts(&out).last(), Some(cut..cut + tail.len()), "the last chunk is the tail");
+    out
+}
+
+/// [`drive`], with the completions of the maps `hold` picks kept back in `held`, in the order
+/// they came: what a driver does whose maps answer out of order (the sim's poll shuffles what
+/// is due, a thread pool answers as each map ends), for as long as a test wants.
+fn drive_holding(
+    sim: &mut Sim,
+    store: &mut Store,
+    effects: &mut Vec<Effect>,
+    held: &mut Vec<Completion>,
+    hold: impl Fn(&Mapped) -> bool,
+) {
+    run_until_idle(sim, effects, |completion, effects| {
+        if !store.owns(completion.tag) {
+            return;
+        }
+        if let Some(Op::Map { what, .. }) = store.tags.ops.get(&completion.tag)
+            && hold(what)
+        {
+            held.push(completion);
+            return;
+        }
+        store.complete(completion, effects);
+    });
+}
+
+/// Every map a commit asks for before its batch's moves are made.
+fn batch_map(what: &Mapped) -> bool {
+    matches!(what, Mapped::Pack { batch: Some(_), .. } | Mapped::External { batch: Some(_), .. })
+}
+
+/// A flush whose maps `hold` picks are kept back in `held`: its commit is durable, and its
+/// batch waits for them.
+fn flush_holding(sim: &mut Sim, store: &mut Store, held: &mut Vec<Completion>, hold: impl Fn(&Mapped) -> bool) {
+    let mut effects = Vec::new();
+    store.flush(&mut effects);
+    drive_holding(sim, store, &mut effects, held, hold);
+}
+
+/// Hands the store the completions held back, then runs what they ask for.
+fn release(sim: &mut Sim, store: &mut Store, held: Vec<Completion>) {
+    let mut effects = Vec::new();
+    for completion in held {
+        store.complete(completion, &mut effects);
+    }
+    drive(sim, store, &mut effects);
+}
+
+/// Two writers race to put `out` (an output whose last chunk is short, as
+/// [`output_with_a_short_last_chunk`]'s) under keys 1 (B) and 2 (A), after `before` small puts
+/// of the store's own that no flush took. B claims every chunk but the last, looks the last up
+/// and misses it, and holds. A then finds B's chunks kept and not durable, so it copies them,
+/// claims the last chunk and holds at [`PutAt::Written`]: its record of the last chunk and its
+/// payload are only in its unpublished memory. B's claim of the last chunk loses to A, B keeps
+/// a copy of it (a [`segment::COPY`] record), ends, and a flush makes B's ticket durable. Gives
+/// the store, its sim, the output and A, still held: release A with `a_gate.wait()` and join
+/// `a_put`.
+#[allow(clippy::type_complexity)]
+fn a_chunk_claim_race(
+    seed: u64,
+    before: u64,
+    out: Vec<u8>,
+) -> (Sim, Store, Vec<u8>, std::sync::Arc<Gate>, std::thread::JoinHandle<Ticket>) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use crate::segment::PutAt;
+    let mut sim = Sim::new(seed, quiet());
+    let mut store = open(&mut sim, "store");
+    for n in 0..before {
+        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+    }
+    let chunks = chunk::cuts(&out).count();
+    let mut b = store.writer();
+    let mut a = store.writer();
+    // B holds at its miss of the last chunk only: nothing was kept, so it misses every one.
+    let b_gate = Arc::new(Gate::default());
+    let (at, misses) = (b_gate.clone(), AtomicUsize::new(0));
+    b.own.pause = Some(Arc::new(move |it| {
+        if it == PutAt::ChunkMissed && misses.fetch_add(1, Ordering::Relaxed) + 1 == chunks {
+            at.wait();
+            at.wait();
+        }
+    }));
+    let (a_gate, hook) = hold_at(PutAt::Written);
+    a.own.pause = Some(hook);
+    let b_out = out.clone();
+    let b_put = std::thread::spawn(move || {
+        let guard = enter();
+        let ticket = b.put(&guard, key(1), Kind::Output, b_out).unwrap();
+        drop(guard);
+        ticket
+    });
+    b_gate.wait();
+    let a_out = out.clone();
+    let a_put = std::thread::spawn(move || {
+        let guard = enter();
+        let ticket = a.put(&guard, key(2), Kind::Output, a_out).unwrap();
+        drop(guard);
+        ticket
+    });
+    // A has claimed the last chunk and holds before it ends.
+    a_gate.wait();
+    b_gate.wait();
+    let b_ticket = b_put.join().unwrap();
+    let last = *chunk_keys(&out).last().unwrap();
+    assert!(
+        matches!(store.found_of(&last).place, Place::Segment(seg) if seg.segment != b_ticket.segment()),
+        "the last chunk's key names A's unpublished record"
+    );
+    flush(&mut sim, &mut store);
+    assert!(store.durable(b_ticket), "B ended and was committed");
+    assert!(
+        store.last_puts().iter().any(|it| it.segment() != b_ticket.segment() && !store.durable(it)),
+        "A has not ended"
+    );
+    (sim, store, out, a_gate, a_put)
+}
+
+/// The keys of the chunks of `out`, a chunked output.
+fn chunk_keys(out: &[u8]) -> Vec<Key> {
+    chunk::cuts(out).map(|range| Key(ContentId::of(disk::CHUNK_DOMAIN, &out[range]))).collect()
+}
+
+/// Review 7: B's claim of a chunk loses to A's put, not durable, between B's look and its
+/// claim; B must keep a copy of the chunk (as it does for one it finds kept, not durable, at
+/// the look). After a crash while A still holds, the store reopens with B's value whole.
+/// Without the copy, B's payload names a chunk no pack holds.
+#[test]
+fn a_chunk_claimed_by_another_writer_after_the_look_is_copied_before_the_put_turns_durable() {
+    let (mut sim, store, out, a_gate, a_put) = a_chunk_claim_race(44, 0, output_with_a_short_last_chunk());
+    sim.crash();
+    a_gate.wait();
+    a_put.join().unwrap();
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(1)).as_ref(), Some(&out), "B's durable value lost a chunk in the crash");
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Review 8 C1: a copy record that is a chunk's only durable home is found on reopen only by
+/// the scan past the index, so when the commit that drains it also writes the index (the
+/// delta holds `INDEX_AFTER` keys), the index must hold the chunk at the copy: B's copy is the
+/// chunk's home while its key points at A's unpublished segment. Without that, the index
+/// leaves the chunk out, its head marks every pack indexed past the copy, and after a crash
+/// before A ends, B's durable value names a chunk the store does not have.
+#[test]
+fn a_copy_that_is_a_chunks_only_durable_record_survives_an_index_write_and_a_crash() {
+    let (mut sim, store, out, a_gate, a_put) = a_chunk_claim_race(45, INDEX_AFTER as u64, output_with_a_short_last_chunk());
+    assert!(store.tiers[0].head.index.is_some(), "B's flush wrote an index");
+    sim.crash();
+    a_gate.wait();
+    a_put.join().unwrap();
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(1)).as_ref(), Some(&out), "B's durable value lost a chunk to the index write");
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Review 8 C1, the settle half: a settle retires the pack that holds B's copy of the last
+/// chunk while A still holds, and rewrites the records a key finds. B's other chunks are text
+/// a settle moves cold, which leaves their pack mostly dead; the last chunk is too short to
+/// move and stays at B's copy. Were B's copy not the chunk's home, the retire would not rewrite
+/// it, and the pack's removal would lose the chunk while A still holds. As the home, it is
+/// rewritten, and B's value reads whole after a crash.
+#[test]
+fn a_copy_that_is_a_chunks_only_durable_record_survives_a_settle_and_a_crash() {
+    let (mut sim, mut store, out, a_gate, a_put) = a_chunk_claim_race(46, 0, text_output_with_a_short_last_chunk());
+    let last = *chunk_keys(&out).last().unwrap();
+    let home = store.loc_of(&last);
+    // A later pack of the unit, so B's copy's pack may be retired.
+    store.put(key(3), Kind::Output, noise(CHUNK_FROM - 1, 3)).unwrap();
+    flush(&mut sim, &mut store);
+    let unit = store.tiers[0].packs[home.pack as usize].unit;
+    assert!(
+        store.tiers[0].packs.iter().rposition(|it| it.unit == unit) != Some(home.pack as usize),
+        "a later pack of the unit than B's copy's"
+    );
+    let mut retired = 0;
+    for _ in 0..4 {
+        retired += settle(&mut sim, &mut store).retired;
+        if store.tiers[0].packs[home.pack as usize].removed {
+            break;
+        }
+    }
+    assert!(retired >= 1, "a settle retired a pack");
+    assert!(store.tiers[0].packs[home.pack as usize].removed, "the pack of B's copy was retired and removed");
+    assert_ne!(store.found_of(&last).place, Place::Pack(home), "the retire rewrote B's copy");
+    sim.crash();
+    a_gate.wait();
+    a_put.join().unwrap();
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(1)).as_ref(), Some(&out), "B's durable value lost a chunk to a retire");
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Review 8 C1 and review 9 C3, the accounting: B's copy of the last chunk is the chunk's home,
+/// and every other record of a chunk drained after its home (A's copies of B's chunks, A's own
+/// record of the last chunk once A ends) is a duplicate, never written to a pack. So no pack
+/// holds a record no key finds: dead bytes stay exact and zero, and the reopen and a later
+/// replace have no second record of a chunk to land on or count again.
+#[test]
+fn a_chunk_record_drained_after_its_chunks_home_is_never_written() {
+    let (mut sim, mut store, out, a_gate, a_put) = a_chunk_claim_race(47, 0, output_with_a_short_last_chunk());
+    let keys = chunk_keys(&out);
+    let dead = |store: &Store| store.tiers[0].packs.iter().map(|it| it.dead).sum::<u64>();
+    let last = keys.last().unwrap();
+    assert_dead_is_exact(&store);
+    assert_eq!(dead(&store), 0, "no pack holds a record no key finds while A holds");
+    let home = store.loc_of(last);
+    a_gate.wait();
+    let a_ticket = a_put.join().unwrap();
+    flush(&mut sim, &mut store);
+    flush(&mut sim, &mut store);
+    assert!(store.durable(a_ticket), "A ended and was committed");
+    assert_eq!(store.loc_of(last), home, "the last chunk stays at B's copy");
+    assert_dead_is_exact(&store);
+    assert_eq!(dead(&store), 0, "A's records of B's chunks were not written");
+    assert_eq!(bytes_of(&store, &key(2)).as_ref(), Some(&out));
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(store.loc_of(last), home, "the reopen lands on the chunk's one record");
+    assert_dead_is_exact(&store);
+    assert_eq!(bytes_of(&store, &key(1)).as_ref(), Some(&out));
+    assert_eq!(bytes_of(&store, &key(2)).as_ref(), Some(&out));
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Dead bytes are exact: in every pack not removed, they are the spans of the records no key
+/// finds (`Pack::dead`). Run once every batch's moves are made, or a record drained and not
+/// yet moved to counts as one no key finds.
+fn assert_dead_is_exact(store: &Store) {
+    assert!(store.pending.is_empty(), "a batch's moves are not made yet");
+    let look = store.look();
+    for (at, pack) in store.tiers[0].packs.iter().enumerate().filter(|(_, it)| !it.removed) {
+        let mut unfound = 0;
+        let mut offset = PACK_HEADER;
+        while offset < pack.end {
+            if pack.bytes(offset, 4).unwrap() == [0; 4] {
+                offset = (offset + 1).next_multiple_of(disk::BLOCK);
+                continue;
+            }
+            let header = RecordHeader::decode(pack.bytes(offset, RECORD_HEADER).unwrap()).unwrap();
+            let found = matches!(
+                look.find(&header.key),
+                Some(Ok(found)) if matches!(found.place, Place::Pack(loc) if loc.pack as usize == at && loc.offset == offset)
+            );
+            if header.form != Form::Dictionary && !found {
+                unfound += header.span();
+            }
+            offset += header.span();
+        }
+        assert_eq!(pack.dead, unfound, "{}: its dead bytes are not the records no key finds", pack.file);
+    }
+}
+
+/// Three settles, the last on a commit that writes the index: 48 ([`INDEX_AFTER`]) small puts
+/// of the store's own fill the delta for it. By then `chunk` (an output's last chunk,
+/// [`output_with_a_last_chunk_a_settle_moves`]), unread for two periods, was moved cold, or
+/// rewritten with its pack, either way to a record of the store's own segment that waits for
+/// the batches before it.
+fn settle_writing_the_index(sim: &mut Sim, store: &mut Store, chunk: &Key) {
+    settle(sim, store);
+    settle(sim, store);
+    for n in 0..INDEX_AFTER as u64 {
+        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+    }
+    assert!(store.tiers[0].head.index.is_none(), "no index was written before");
+    let settled = settle(sim, store);
+    assert!(!settled.more, "{settled:?}");
+    assert!(
+        matches!(store.found_of(chunk).place, Place::Segment(seg) if seg.segment == 0),
+        "a settle moved the chunk to a record of its own segment"
+    );
+    assert!(store.tiers[0].head.index.is_some(), "the last settle's commit wrote the index");
+}
+
+/// Review 9 C1: A puts output V (key 2) and holds before it ends, its last chunk X only in its
+/// memory. B puts V (key 1), finds X kept and not durable, keeps a copy, and holds. A ends, and
+/// a flush drains A's record of X (batch k), its maps held back; B ends, and a flush drains
+/// B's copy (batch k+1), maps held too, while X still points at A's segment. A's record was
+/// drained first, so B's copy is a duplicate and not written (review 10): X's one waiting move
+/// is A's. Batch k's maps come, and X points at A's record. Settles then move X (cold, or with
+/// its pack) while batch k+1 waits, the last on a commit that writes the index: the index must
+/// hold X where the settle put it. Had B's copy been written, its move (from where X no longer
+/// is) would be X's first, and must not keep X out. After a crash both values read back.
+#[test]
+fn a_key_a_settle_moves_while_a_later_batch_waits_on_its_maps_is_in_the_index_the_settle_writes() {
+    use crate::segment::PutAt;
+    let out = output_with_a_last_chunk_a_settle_moves();
+    let last = *chunk_keys(&out).last().unwrap();
+    let mut sim = Sim::new(48, quiet());
+    let mut store = open(&mut sim, "store");
+    let mut a = store.writer();
+    let mut b = store.writer();
+    let (a_gate, hook) = hold_at(PutAt::Written);
+    a.own.pause = Some(hook);
+    let (b_gate, hook) = hold_at(PutAt::Written);
+    b.own.pause = Some(hook);
+    let put = |mut writer: Writer, n: u64, out: Vec<u8>| {
+        std::thread::spawn(move || {
+            let guard = enter();
+            let ticket = writer.put(&guard, key(n), Kind::Output, out).unwrap();
+            drop(guard);
+            ticket
+        })
+    };
+    let a_put = put(a, 2, out.clone());
+    a_gate.wait();
+    let b_put = put(b, 1, out.clone());
+    b_gate.wait();
+    let a_segment = match store.found_of(&last).place {
+        Place::Segment(seg) => seg.segment,
+        Place::Pack(_) => panic!("X is in A's segment"),
+    };
+    a_gate.wait();
+    let a_ticket = a_put.join().unwrap();
+    let mut first = Vec::new();
+    flush_holding(&mut sim, &mut store, &mut first, batch_map);
+    assert!(store.durable(a_ticket), "A's batch is committed");
+    b_gate.wait();
+    let b_ticket = b_put.join().unwrap();
+    let mut second = Vec::new();
+    flush_holding(&mut sim, &mut store, &mut second, batch_map);
+    assert!(store.durable(b_ticket), "B's batch is committed");
+    assert!(
+        matches!(store.found_of(&last).place, Place::Segment(seg) if seg.segment == a_segment),
+        "X points at A's segment while both batches wait"
+    );
+    let waiting: Vec<u32> =
+        store.pending.iter().flat_map(|it| &it.moves).filter(|it| it.key == last).map(|it| it.from.segment).collect();
+    assert_eq!(waiting, vec![a_segment], "X's one waiting move is A's record's: B's copy of X was not written");
+    release(&mut sim, &mut store, first);
+    assert_eq!(store.pending.len(), 1, "B's batch waits on its maps");
+    let home = store.loc_of(&last);
+    settle_writing_the_index(&mut sim, &mut store, &last);
+    sim.crash();
+    drop(second);
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(1)).as_ref(), Some(&out), "B's value lost X to the index");
+    assert_eq!(bytes_of(&store, &key(2)).as_ref(), Some(&out), "A's value lost X to the index");
+    assert_ne!(store.loc_of(&last), home, "X is the settle's record");
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Review 9 C1, the other order: B's copy of X is X's home (the claim race,
+/// [`a_chunk_claim_race`]), then A ends and a flush drains A's record of X, whose batch waits on
+/// its maps. Settles move X out of B's copy, the last on a commit that writes the index: A's
+/// record (X's first move, from where X no longer is) must not keep X out of it.
+#[test]
+fn a_key_a_settle_moves_while_a_later_record_of_it_waits_on_its_maps_is_in_the_index_the_settle_writes() {
+    let (mut sim, mut store, out, a_gate, a_put) = a_chunk_claim_race(49, 0, output_with_a_last_chunk_a_settle_moves());
+    let last = *chunk_keys(&out).last().unwrap();
+    let home = store.loc_of(&last);
+    a_gate.wait();
+    let a_ticket = a_put.join().unwrap();
+    let mut held = Vec::new();
+    flush_holding(&mut sim, &mut store, &mut held, batch_map);
+    assert!(store.durable(a_ticket), "A's batch is committed");
+    assert_eq!(store.pending.len(), 1, "A's batch waits on its maps");
+    assert_eq!(store.loc_of(&last), home, "X stays at B's copy");
+    settle_writing_the_index(&mut sim, &mut store, &last);
+    sim.crash();
+    drop(held);
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(1)).as_ref(), Some(&out), "B's value lost X to the index");
+    assert_eq!(bytes_of(&store, &key(2)).as_ref(), Some(&out), "A's value lost X to the index");
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Review 10 C1: B's copy of X is X's home (the claim race), its move made. While A holds, a
+/// settle moves X cold, to a record of the store's own segment, and its batch waits on its
+/// maps. A ends, and a flush that writes the index drains A's record of X while X points at
+/// the settle's record, drained and waiting: A's record is a duplicate and is never written.
+/// Written, its move would take no spot and its bytes would be counted nowhere, and a reopen
+/// (which takes a key's last record past the index) or an index that named a key's last move
+/// would land on it. X stays at the settle's record through the maps, a crash and the reopen,
+/// dead bytes stay the records no key finds, and both values read back.
+#[test]
+fn a_record_drained_while_its_key_is_at_a_settles_waiting_record_is_never_written() {
+    let (mut sim, mut store, out, a_gate, a_put) = a_chunk_claim_race(53, 0, output_with_a_last_chunk_a_settle_moves());
+    let last = *chunk_keys(&out).last().unwrap();
+    settle(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    let (mut held, mut effects) = (Vec::new(), Vec::new());
+    let settled = store.settle(&mut effects);
+    drive_holding(&mut sim, &mut store, &mut effects, &mut held, batch_map);
+    assert!(settled.demoted >= 1, "{settled:?}");
+    assert!(
+        matches!(store.found_of(&last).place, Place::Segment(seg) if seg.segment == 0),
+        "the settle moved X to a record of its own segment"
+    );
+    assert_eq!(store.pending.len(), 1, "the settle's batch waits on its maps");
+    let settled_at = store.pending[0].moves.iter().find(|it| it.key == last).unwrap().to;
+    a_gate.wait();
+    let a_ticket = a_put.join().unwrap();
+    for n in 0..INDEX_AFTER as u64 {
+        store.put(key(2000 + n), Kind::Query, noise(64, 2000 + n)).unwrap();
+    }
+    flush_holding(&mut sim, &mut store, &mut held, batch_map);
+    assert!(store.durable(a_ticket), "A's batch is committed");
+    assert!(store.tiers[0].head.index.is_some(), "the flush wrote the index");
+    release(&mut sim, &mut store, held);
+    assert_eq!(store.loc_of(&last), settled_at, "X is at the settle's record");
+    assert_dead_is_exact(&store);
+    sim.crash();
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(store.loc_of(&last), settled_at, "the reopen finds X at the settle's record");
+    assert_dead_is_exact(&store);
+    assert_eq!(bytes_of(&store, &key(1)).as_ref(), Some(&out), "B's value lost X");
+    assert_eq!(bytes_of(&store, &key(2)).as_ref(), Some(&out), "A's value lost X");
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Calls `tidy` until the index swap's grace has passed and `end_migration` folded `prev`
+/// into the delta. Other tests of this process hold guards, so the grace can take a moment.
+fn end_the_migration(store: &mut Store) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while store.migrating.is_some() {
+        store.tidy();
+        assert!(std::time::Instant::now() < deadline, "the index swap's grace never passed");
+        std::thread::yield_now();
+    }
+    assert!(store.tiers[0].prev.is_none(), "the swap ended: {:?}", store.broken().map(ToString::to_string));
+}
+
+/// Where each table of the store's own tier holds `key`, checked against the record there: a
+/// spot never names a record of another value than its own (review 11 M1).
+fn assert_spots_hold_their_value(store: &Store, key: &Key) {
+    let own = &store.tiers[0];
+    let held = Held::writer(&*store.shared);
+    for (name, table) in std::iter::once(("the delta", &own.delta)).chain(own.prev.iter().map(|it| ("prev", it))) {
+        let Some((_, spot)) = table.get(held, key) else { continue };
+        let header = match spot.place {
+            Place::Pack(loc) => own.packs[loc.pack as usize].bytes(loc.offset, RECORD_HEADER),
+            // SAFETY: a chunk a table's spot names is freed only after a move takes the spot and
+            // a grace passes, and this thread, the store's, makes the moves.
+            Place::Segment(seg) => unsafe { seg.chunk.get().bytes(seg.offset, RECORD_HEADER) },
+        }
+        .map(RecordHeader::decode);
+        let Some(Ok(header)) = header else { panic!("{name}'s spot of {key:?} at {} names no whole record", spot.place) };
+        assert_eq!(
+            (header.key, header.content),
+            (*key, spot.content),
+            "{name}'s spot of {key:?} at {} names a record of another value",
+            spot.place
+        );
+    }
+}
+
+/// Review 11 S1 and S2. W loads the view and holds before it claims X. A flush writes the index
+/// and swaps it in, leaving the delta W loaded as `prev`. D, a task begun after the swap,
+/// looks X up, misses it, and holds before it claims. W claims X in `prev` and ends.
+/// `during`: a flush drains W's record while the swap lasts (a task begun before it keeps it
+/// open), and its move points `prev`'s spot at W's record in a pack; otherwise that flush
+/// comes after `end_migration`. D then claims X as `d_value` and holds before it ends, its
+/// record only in its memory. The swap ends, a flush writes the index again, and the store
+/// crashes: W's put of X was durable, so X must read back as W's value.
+///
+/// Round 11 claimed in the delta alone, where D met no spot and kept its record beside W's.
+/// `end_migration` then kept the delta's spot (D's, not durable) over `prev`'s (S1); or, for
+/// another value, W's record, drained after it, was a duplicate of no key's value and was not
+/// written (S2). The index left X out, and the crash lost W's put. A claim goes into `prev`
+/// first, so D meets W's spot there: it takes W's ticket (the same value) or is refused
+/// (another), and X stays at W's record.
+fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: Vec<u8>) {
+    use std::sync::Arc;
+
+    use crate::segment::PutAt;
+    let mut sim = Sim::new(seed, quiet());
+    let mut store = open(&mut sim, "store");
+    let mut w = store.writer();
+    let mut d = store.writer();
+    for n in 0..INDEX_AFTER as u64 {
+        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+    }
+    let x = key(9);
+    let w_value = noise(64, 9);
+    let (w_gate, hook) = hold_at(PutAt::Claiming);
+    w.own.pause = Some(hook);
+    // D holds at its count (its look missed X, its claim not made) and before it ends.
+    let d_gate = Arc::new(Gate::default());
+    let at = d_gate.clone();
+    d.own.pause = Some(Arc::new(move |it| {
+        if matches!(it, PutAt::Counted | PutAt::Written) {
+            at.wait();
+            at.wait();
+        }
+    }));
+    let put = |mut writer: Writer, value: Vec<u8>| {
+        std::thread::spawn(move || {
+            let guard = enter();
+            let result = writer.put(&guard, x, Kind::Query, value);
+            drop(guard);
+            result
+        })
+    };
+    let w_put = put(w, w_value.clone());
+    w_gate.wait();
+    // A task open since before the swap: its grace can't pass until this drops.
+    let pin = during.then(enter);
+    flush(&mut sim, &mut store);
+    let first_index = store.tiers[0].head.index.expect("the flush wrote the index");
+    assert!(store.tiers[0].prev.is_some() && store.migrating.is_some(), "the index was swapped in, W still in its put");
+    let d_put = put(d, d_value.clone());
+    d_gate.wait();
+    w_gate.wait();
+    let w_ticket = w_put.join().unwrap().expect("W's put is X's first");
+    if during {
+        flush(&mut sim, &mut store);
+        assert!(store.durable(w_ticket), "W's batch is committed");
+        let place = store.tiers[0].prev.as_ref().unwrap().get(Held::writer(&*store.shared), &x).map(|(_, spot)| spot.place);
+        assert!(matches!(place, Some(Place::Pack(_))), "prev's spot moved with W's record: {place:?}");
+    }
+    d_gate.wait();
+    d_gate.wait();
+    assert_spots_hold_their_value(&store, &x);
+    drop(pin);
+    end_the_migration(&mut store);
+    if !during {
+        flush(&mut sim, &mut store);
+        assert!(store.durable(w_ticket), "W's batch is committed");
+    }
+    assert_spots_hold_their_value(&store, &x);
+    for n in 0..INDEX_AFTER as u64 {
+        store.put(key(2000 + n), Kind::Query, noise(64, 2000 + n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    assert_ne!(store.tiers[0].head.index, Some(first_index), "the flush wrote the index again, D still in its put");
+    assert_spots_hold_their_value(&store, &x);
+    sim.crash();
+    drop(store);
+    d_gate.wait();
+    let d_result = d_put.join().unwrap();
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &x), Some(w_value.clone()), "W's durable put of X was lost");
+    assert_spots_hold_their_value(&store, &x);
+    match d_value == w_value {
+        true => assert_eq!(d_result, Ok(w_ticket), "D's claim met W's spot in prev and took its ticket"),
+        false => assert!(matches!(d_result, Err(Mismatch { .. })), "D's put of another value is refused: {d_result:?}"),
+    }
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn a_key_claimed_after_its_record_in_prev_was_made_durable_keeps_that_record_through_the_end_of_the_swap() {
+    a_key_put_twice_across_an_index_swap(55, true, noise(64, 9));
+}
+
+#[test]
+fn a_record_drained_after_the_swap_ended_is_the_home_of_the_key_another_writer_claimed_in_it() {
+    a_key_put_twice_across_an_index_swap(54, false, noise(64, 9));
+}
+
+#[test]
+fn a_second_value_put_across_an_index_swap_while_the_first_is_durable_is_refused() {
+    a_key_put_twice_across_an_index_swap(58, true, noise(64, 10));
+}
+
+#[test]
+fn a_second_value_put_across_an_index_swap_before_the_first_drains_is_refused() {
+    a_key_put_twice_across_an_index_swap(59, false, noise(64, 10));
+}
+
+/// Review 11 M1: C loads the view while an index swap lasts and holds before it claims X;
+/// `end_migration` folds `prev` and E, after it, claims X with another value and holds before
+/// it ends. C's claim wins in the `prev` its view still holds, which is no store's table now,
+/// and meets E's spot in the delta: its put is refused. C's record, kept for a stale reader,
+/// drains while E's is not drained yet, and is no key's home: X stays at E's record, and reads
+/// back as E's value. Were the value not checked (`record_home`), C's record would stand in
+/// for E's spot, and X would name a record of another value than its own.
+#[test]
+fn a_record_kept_in_a_folded_prev_never_stands_in_for_a_record_of_another_value() {
+    use crate::segment::PutAt;
+    let mut sim = Sim::new(56, quiet());
+    let mut store = open(&mut sim, "store");
+    let mut c = store.writer();
+    let mut e = store.writer();
+    for n in 0..INDEX_AFTER as u64 {
+        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    assert!(store.tiers[0].prev.is_some() && store.migrating.is_some(), "the index was swapped in");
+    let x = key(9);
+    let (c_value, e_value) = (noise(64, 9), noise(64, 10));
+    let (c_gate, hook) = hold_at(PutAt::Claiming);
+    c.own.pause = Some(hook);
+    let (e_gate, hook) = hold_at(PutAt::Written);
+    e.own.pause = Some(hook);
+    let put = |mut writer: Writer, value: Vec<u8>| {
+        std::thread::spawn(move || {
+            let guard = enter();
+            let result = writer.put(&guard, x, Kind::Query, value);
+            drop(guard);
+            result
+        })
+    };
+    let c_put = put(c, c_value);
+    c_gate.wait();
+    // C began after the swap: its task does not hold the swap's grace.
+    end_the_migration(&mut store);
+    let e_put = put(e, e_value.clone());
+    e_gate.wait();
+    c_gate.wait();
+    let c_result = c_put.join().unwrap();
+    assert!(matches!(c_result, Err(Mismatch { .. })), "C's put of another value is refused: {c_result:?}");
+    flush(&mut sim, &mut store);
+    assert_spots_hold_their_value(&store, &x);
+    e_gate.wait();
+    let e_ticket = e_put.join().unwrap().expect("E's put is X's first in the store's delta");
+    flush(&mut sim, &mut store);
+    assert!(store.durable(e_ticket), "E's batch is committed");
+    assert_spots_hold_their_value(&store, &x);
+    assert_eq!(bytes_of(&store, &x), Some(e_value.clone()), "X is E's value");
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &x), Some(e_value), "X is E's value after a reopen");
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Review 12 L1: C and D load the view while an index swap lasts and hold before they claim X;
+/// `end_migration` folds `prev`, and E, after it, claims X with another value in the delta and
+/// holds. D wins the folded `prev` (no store's table now), meets E's spot in the delta and is
+/// refused. C, putting D's value, then loses `prev`'s slot to D's spot: taking D's ticket would
+/// end C's put `Ok` on a record X never reads. The delta decides, so C is refused too, and X
+/// reads back as E's value.
+#[test]
+fn a_claim_that_loses_a_folded_prev_to_a_refused_put_is_answered_by_the_delta() {
+    use crate::segment::PutAt;
+    let mut sim = Sim::new(60, quiet());
+    let mut store = open(&mut sim, "store");
+    let (mut c, mut d, mut e) = (store.writer(), store.writer(), store.writer());
+    for n in 0..INDEX_AFTER as u64 {
+        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    assert!(store.tiers[0].prev.is_some() && store.migrating.is_some(), "the index was swapped in");
+    let x = key(9);
+    let (d_value, e_value) = (noise(64, 9), noise(64, 10));
+    let (c_gate, hook) = hold_at(PutAt::Claiming);
+    c.own.pause = Some(hook);
+    let (d_gate, hook) = hold_at(PutAt::Claiming);
+    d.own.pause = Some(hook);
+    let (e_gate, hook) = hold_at(PutAt::Written);
+    e.own.pause = Some(hook);
+    let put = |mut writer: Writer, value: Vec<u8>| {
+        std::thread::spawn(move || {
+            let guard = enter();
+            let result = writer.put(&guard, x, Kind::Query, value);
+            drop(guard);
+            result
+        })
+    };
+    let c_put = put(c, d_value.clone());
+    c_gate.wait();
+    let d_put = put(d, d_value);
+    d_gate.wait();
+    // C and D began after the swap: their tasks do not hold its grace.
+    end_the_migration(&mut store);
+    let e_put = put(e, e_value.clone());
+    e_gate.wait();
+    d_gate.wait();
+    let d_result = d_put.join().unwrap();
+    assert!(matches!(d_result, Err(Mismatch { .. })), "D won the folded prev and met E's value in the delta: {d_result:?}");
+    c_gate.wait();
+    let c_result = c_put.join().unwrap();
+    assert!(
+        matches!(c_result, Err(Mismatch { kept, .. }) if kept == content_of(&e_value)),
+        "C lost the folded prev to D's refused put: the delta's value decides: {c_result:?}"
+    );
+    e_gate.wait();
+    let e_ticket = e_put.join().unwrap().expect("E's put is X's first in the store's delta");
+    flush(&mut sim, &mut store);
+    assert!(store.durable(e_ticket), "E's batch is committed");
+    assert_spots_hold_their_value(&store, &x);
+    sim.crash();
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &x), Some(e_value), "X is E's value after a reopen");
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Review 12 L1, its narrower window: D, its view loaded while an index swap lasted, wins the
+/// folded `prev` and holds before its claim reaches the delta. C, from the same view, loses
+/// `prev`'s slot to D's spot while the delta lacks the key. Were C to take D's ticket and end,
+/// E, after it, could win the delta with another value and D be refused: C's put would be
+/// `Ok` on a record X never reads. C puts D's spot into the delta before it ends, so E is
+/// refused, D is kept, and X reads back as D's value, C's ticket D's.
+#[test]
+fn a_claim_that_meets_a_put_between_prev_and_the_delta_fixes_the_deltas_value_before_it_ends() {
+    use std::sync::Arc;
+
+    use crate::segment::PutAt;
+    let mut sim = Sim::new(61, quiet());
+    let mut store = open(&mut sim, "store");
+    let (mut c, mut d, e) = (store.writer(), store.writer(), store.writer());
+    for n in 0..INDEX_AFTER as u64 {
+        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    assert!(store.tiers[0].prev.is_some() && store.migrating.is_some(), "the index was swapped in");
+    let x = key(9);
+    let (value, e_value) = (noise(64, 9), noise(64, 10));
+    let (c_gate, hook) = hold_at(PutAt::Claiming);
+    c.own.pause = Some(hook);
+    // D holds before it claims, and again once it won `prev`.
+    let d_gate = Arc::new(Gate::default());
+    let at = d_gate.clone();
+    d.own.pause = Some(Arc::new(move |it| {
+        if matches!(it, PutAt::Claiming | PutAt::InPrev) {
+            at.wait();
+            at.wait();
+        }
+    }));
+    let put = |mut writer: Writer, value: Vec<u8>| {
+        std::thread::spawn(move || {
+            let guard = enter();
+            let result = writer.put(&guard, x, Kind::Query, value);
+            drop(guard);
+            result
+        })
+    };
+    let c_put = put(c, value.clone());
+    c_gate.wait();
+    let d_put = put(d, value.clone());
+    d_gate.wait();
+    end_the_migration(&mut store);
+    d_gate.wait();
+    d_gate.wait();
+    c_gate.wait();
+    let c_ticket = c_put.join().unwrap().expect("C met D's spot of its value");
+    let e_result = put(e, e_value).join().unwrap();
+    assert!(matches!(e_result, Err(Mismatch { .. })), "E met D's spot, put into the delta by C: {e_result:?}");
+    d_gate.wait();
+    let d_ticket = d_put.join().unwrap().expect("D met its own spot in the delta");
+    assert_eq!(c_ticket, d_ticket, "C took D's ticket");
+    flush(&mut sim, &mut store);
+    assert!(store.durable(c_ticket), "D's batch is committed");
+    assert_spots_hold_their_value(&store, &x);
+    sim.crash();
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &x), Some(value), "X is D's value after a reopen");
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Where the store's `prev` and its delta hold `key`.
+fn places_of(store: &Store, key: &Key) -> (Option<Place>, Option<Place>) {
+    let held = Held::writer(&*store.shared);
+    let own = &store.tiers[0];
+    let place = |table: &Table<Spot>| table.get(held, key).map(|(_, spot)| spot.place);
+    (own.prev.as_deref().and_then(place), place(&own.delta))
+}
+
+/// When, in [`a_move_of_prevs_spot_meets_a_claim_that_lost_to_it`], C's copy of `prev`'s spot
+/// lands against the move of W's record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopyLands {
+    /// Before the move: the move finds W's segment spot in the delta and replaces it.
+    First,
+    /// Between the move's probe of the delta (a miss) and its insert, which then meets the
+    /// copy and replaces it.
+    Between,
+    /// After the move: C meets the pack spot in the delta and copies nothing.
+    After,
+}
+
+/// Review 12b H1: W loads the view before an index swap and claims X after the swap's copy, in
+/// `prev` alone, so the delta lacks X. C, a task begun after the swap, misses X, loses `prev`'s
+/// slot to W's segment spot and holds before it reads the delta. A flush drains W's record and
+/// its move points `prev`'s spot at the pack; C's copy of W's segment spot lands in the delta
+/// as `lands` says. Had the move left the delta alone, a copy that lands after the move's
+/// probe would keep W's segment spot there, into a chunk the batch frees, and the end of the
+/// swap would find the two tables apart. The move puts its pack spot into the delta as well,
+/// so it and the copy meet at the delta's one slot: the two tables hold X at one place, and
+/// the swap ends whole.
+fn a_move_of_prevs_spot_meets_a_claim_that_lost_to_it(seed: u64, lands: CopyLands) {
+    use std::sync::Arc;
+
+    use crate::segment::PutAt;
+    let mut sim = Sim::new(seed, quiet());
+    let mut store = open(&mut sim, "store");
+    let (mut w, mut c) = (store.writer(), store.writer());
+    for n in 0..INDEX_AFTER as u64 {
+        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+    }
+    let x = key(9);
+    let value = noise(64, 9);
+    let (w_gate, hook) = hold_at(PutAt::Claiming);
+    w.own.pause = Some(hook);
+    // C holds at its count (its look missed X) and once it lost `prev`'s slot, and meets
+    // `c_done` once its put returned.
+    let (c_gate, c_done) = (Arc::new(Gate::default()), Arc::new(Gate::default()));
+    let at = c_gate.clone();
+    c.own.pause = Some(Arc::new(move |it| {
+        if matches!(it, PutAt::Counted | PutAt::LostInPrev) {
+            at.wait();
+            at.wait();
+        }
+    }));
+    let w_put = std::thread::spawn({
+        let value = value.clone();
+        move || {
+            let guard = enter();
+            let result = w.put(&guard, x, Kind::Query, value);
+            drop(guard);
+            result
+        }
+    });
+    w_gate.wait();
+    // A task open since before the swap: its grace can't pass until this drops.
+    let pin = enter();
+    flush(&mut sim, &mut store);
+    assert!(store.tiers[0].prev.is_some() && store.migrating.is_some(), "the index was swapped in, W still in its put");
+    let c_put = std::thread::spawn({
+        let (value, done) = (value.clone(), c_done.clone());
+        move || {
+            let guard = enter();
+            let result = c.put(&guard, x, Kind::Query, value);
+            drop(guard);
+            done.wait();
+            result
+        }
+    });
+    c_gate.wait();
+    w_gate.wait();
+    let w_ticket = w_put.join().unwrap().expect("W's put is X's first");
+    assert!(matches!(places_of(&store, &x), (Some(Place::Segment(_)), None)), "W claimed X in prev alone: {:?}", places_of(&store, &x));
+    c_gate.wait();
+    c_gate.wait();
+    match lands {
+        CopyLands::First => {
+            c_gate.wait();
+            c_done.wait();
+            assert!(matches!(places_of(&store, &x), (Some(Place::Segment(a)), Some(Place::Segment(b))) if a == b), "C copied W's spot");
+            flush(&mut sim, &mut store);
+        }
+        CopyLands::Between => {
+            let (gate, done, mut once) = (c_gate.clone(), c_done.clone(), true);
+            store.move_probed = Some(Box::new(move |moved| {
+                if moved == x && std::mem::take(&mut once) {
+                    gate.wait();
+                    done.wait();
+                }
+            }));
+            flush(&mut sim, &mut store);
+            assert!(store.move_probed.take().is_some());
+        }
+        CopyLands::After => {
+            flush(&mut sim, &mut store);
+            c_gate.wait();
+            c_done.wait();
+        }
+    }
+    assert!(store.durable(w_ticket), "W's batch is committed");
+    assert_eq!(c_put.join().unwrap(), Ok(w_ticket), "C met W's spot and took its ticket");
+    let (in_prev, in_delta) = places_of(&store, &x);
+    drop(pin);
+    end_the_migration(&mut store);
+    assert!(matches!(in_prev, Some(Place::Pack(_))), "the move pointed prev's spot at the pack: {in_prev:?}");
+    assert_eq!(in_delta, in_prev, "the delta holds X where prev does");
+    assert_spots_hold_their_value(&store, &x);
+    sim.crash();
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &x), Some(value), "X is W's value after a reopen");
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn a_move_of_prevs_spot_and_a_claim_that_lost_to_it_meet_at_the_deltas_slot() {
+    a_move_of_prevs_spot_meets_a_claim_that_lost_to_it(62, CopyLands::After);
+}
+
+#[test]
+fn a_move_of_prevs_spot_replaces_the_copy_a_claim_that_lost_to_it_put_in_the_delta_first() {
+    a_move_of_prevs_spot_meets_a_claim_that_lost_to_it(64, CopyLands::First);
+}
+
+#[test]
+fn a_move_of_prevs_spot_replaces_a_copy_that_lands_between_its_probe_and_its_insert() {
+    a_move_of_prevs_spot_meets_a_claim_that_lost_to_it(65, CopyLands::Between);
+}
+
+/// Review 12c M2: D, a task begun after an index swap, wins chunk X of an output in `prev` and
+/// holds before its claim reaches the delta. P puts an output sharing X: it finds D's record,
+/// not durable, and keeps a copy of X, and a flush drains it, its move standing in for D's
+/// record (`Store::copy_home`) and taking `prev`'s spot while D is between its inserts. The
+/// move puts its pack spot into the delta too; D then meets it there, of the same value, and
+/// is kept, its record drained later as a duplicate. Had the move left the delta alone, D
+/// would win the delta with its segment spot, and the end of the swap would find the two
+/// tables apart.
+#[test]
+fn a_chunks_copy_moved_while_its_first_claim_is_between_prev_and_the_delta_leaves_both_at_the_pack() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use crate::segment::PutAt;
+    let mut sim = Sim::new(63, quiet());
+    let mut store = open(&mut sim, "store");
+    let (mut d, p) = (store.writer(), store.writer());
+    for n in 0..INDEX_AFTER as u64 {
+        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+    }
+    let out = output_with_a_short_last_chunk();
+    let x = chunk_keys(&out)[0];
+    // D holds once it won its first claim, X's, in `prev`.
+    let d_gate = Arc::new(Gate::default());
+    let (at, held) = (d_gate.clone(), AtomicBool::new(false));
+    d.own.pause = Some(Arc::new(move |it| {
+        if it == PutAt::InPrev && !held.swap(true, Ordering::Relaxed) {
+            at.wait();
+            at.wait();
+        }
+    }));
+    // A task open since before the swap: its grace can't pass until this drops.
+    let pin = enter();
+    flush(&mut sim, &mut store);
+    assert!(store.tiers[0].prev.is_some() && store.migrating.is_some(), "the index was swapped in");
+    let put = |mut writer: Writer, at: Key, out: Vec<u8>| {
+        std::thread::spawn(move || {
+            let guard = enter();
+            let result = writer.put(&guard, at, Kind::Output, out);
+            drop(guard);
+            result
+        })
+    };
+    let d_put = put(d, key(1), out.clone());
+    d_gate.wait();
+    assert!(matches!(places_of(&store, &x), (Some(Place::Segment(_)), None)), "D won X in prev alone: {:?}", places_of(&store, &x));
+    let p_ticket = put(p, key(2), out.clone()).join().unwrap().expect("P's output is key 2's first");
+    flush(&mut sim, &mut store);
+    assert!(store.durable(p_ticket), "P's batch is committed");
+    let (in_prev, in_delta) = places_of(&store, &x);
+    d_gate.wait();
+    let d_ticket = d_put.join().unwrap().expect("D's output is key 1's first");
+    drop(pin);
+    end_the_migration(&mut store);
+    assert!(matches!(in_prev, Some(Place::Pack(_))), "the copy's move pointed prev's spot at the pack: {in_prev:?}");
+    assert_eq!(in_delta, in_prev, "the delta holds X where prev does");
+    flush(&mut sim, &mut store);
+    assert!(store.durable(d_ticket), "D's batch is committed");
+    assert_spots_hold_their_value(&store, &x);
+    sim.crash();
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(1)).as_ref(), Some(&out), "D's output lost X");
+    assert_eq!(bytes_of(&store, &key(2)).as_ref(), Some(&out), "P's output lost X");
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Review 12c M1: a move of `prev`'s spot during an index swap that finds the delta holding
+/// the key at another place (planted here by hand, as no claim, copy or move puts one) breaks
+/// the store at once, naming the batch, the key, the move and both places, before readers,
+/// which find the delta first, are left on it until the swap ends. The spot is planted after
+/// the drain, which checks the two tables agree (`Store::record_home`), and before the move.
+#[test]
+fn a_move_of_prevs_spot_that_finds_the_delta_apart_breaks_the_store() {
+    let mut sim = Sim::new(66, quiet());
+    let mut store = open(&mut sim, "store");
+    let _other = store.writer();
+    for n in 0..INDEX_AFTER as u64 {
+        store.put(key(1000 + n), Kind::Query, noise(64, 1000 + n)).unwrap();
+    }
+    // A task open since before the swap: its grace can't pass until this drops.
+    let pin = enter();
+    flush(&mut sim, &mut store);
+    let x = key(9);
+    store.put(x, Kind::Query, noise(64, 9)).unwrap();
+    assert!(store.tiers[0].prev.is_some(), "the index was swapped in");
+    let (Some(Place::Segment(_)), Some(Place::Segment(_))) = places_of(&store, &x) else { panic!("X is claimed in both tables") };
+    // X's record drained, its move waiting on its maps: the drain checked the tables agree.
+    let mut held = Vec::new();
+    flush_holding(&mut sim, &mut store, &mut held, batch_map);
+    assert!(store.pending.iter().any(|it| it.moves.iter().any(|it| it.key == x)), "X's move waits");
+    let elsewhere = store.loc_of(&key(1000));
+    {
+        let held = Held::writer(&*store.shared);
+        let delta = &store.tiers[0].delta;
+        let (_, spot) = delta.get(held, &x).unwrap();
+        let planted = Spot::new(x, content_of(&noise(64, 1000)), Place::Pack(elsewhere), spot.ticket);
+        assert!(delta.replace(held, planted).is_ok());
+    }
+    release(&mut sim, &mut store, held);
+    let broken = store.broken().expect("the move broke the store").to_string();
+    assert!(broken.contains(&format!("moved {:x} from segment", x.0)), "{broken}");
+    assert!(broken.contains(&format!("during an index swap, and the delta holds it as {:x} at {}", content_of(&noise(64, 1000)), Place::Pack(elsewhere))), "{broken}");
+    let mut effects = Vec::new();
+    store.flush(&mut effects);
+    assert!(effects.is_empty(), "a broken store commits nothing");
+    drop(pin);
+}
+
+/// Review 11 C1: a lost move (a batch's move into a pack a settle retired, which `retirable`
+/// rules out, broken here by hand) breaks the store, naming the batch. A map of a later batch
+/// that comes after the break makes no move and frees no chunk (the lost batch's chunks are
+/// still first in the segment, and freeing past them panicked), and nothing more is
+/// committed: no drain, no head. A commit in flight at the break finishes its pack writes and
+/// writes no head (review 12): a crash and a reopen read the head from before the break.
+#[test]
+fn a_map_that_comes_after_a_lost_move_broke_the_store_changes_nothing() {
+    let mut sim = Sim::new(57, quiet());
+    let mut store = open(&mut sim, "store");
+    let other = store.unit(writer(1));
+    // Each record is longer than a segment chunk: each put rolls the store's segment, so each
+    // batch frees a chunk of it.
+    store.put(key(1), Kind::Query, noise(12 << 10, 1)).unwrap();
+    let (mut first, mut second) = (Vec::new(), Vec::new());
+    flush_holding(&mut sim, &mut store, &mut first, batch_map);
+    store.put_in(other, key(2), Kind::Query, noise(12 << 10, 2)).unwrap();
+    flush_holding(&mut sim, &mut store, &mut second, batch_map);
+    assert_eq!(store.pending.len(), 2, "both batches wait on their maps");
+    let (id, lost) = (store.pending[0].id, store.pending[0].moves[0].to.pack);
+    assert!(store.pending.iter().all(|it| !it.chunks.is_empty()), "each batch frees a chunk");
+    assert!(store.pending[1].moves.iter().all(|it| it.to.pack != lost), "the second batch moves into another pack");
+    store.tiers[0].packs[lost as usize].retiring = true;
+    // A third commit in flight at the break: its steps are asked for and held.
+    let head = store.tiers[0].head.clone();
+    store.put(key(3), Kind::Query, noise(64, 3)).unwrap();
+    let mut third = Vec::new();
+    store.flush(&mut third);
+    assert!(!third.is_empty(), "the third commit started");
+    release(&mut sim, &mut store, first);
+    let broken = store.broken().expect("the lost move broke the store").to_string();
+    // Its steps finish after the break: it writes no head.
+    let mut head_asked = false;
+    run_until_idle(&mut sim, &mut third, |completion, effects| {
+        if store.owns(completion.tag) {
+            store.complete(completion, effects);
+            head_asked |= store.tags.ops.values().any(|op| matches!(op, Op::WriteHead));
+        }
+    });
+    assert!(!head_asked, "a commit in flight at the break writes no head");
+    assert!(store.committing(), "the withheld commit stays in flight: no later commit starts behind it");
+    assert_eq!(store.tiers[0].head, head, "the store's head is the one from before the break");
+    let steps = store.commit_steps();
+    release(&mut sim, &mut store, second);
+    assert!(broken.contains(&format!("batch {id} moved {:x} into", key(1).0)), "{broken}");
+    assert_eq!(store.broken().map(ToString::to_string), Some(broken), "the first break is kept");
+    assert_eq!(store.pending.len(), 1, "the later batch's moves are not made");
+    let mut effects = Vec::new();
+    store.flush(&mut effects);
+    assert!(effects.is_empty(), "a broken store commits nothing");
+    assert_eq!(store.commit_steps(), steps, "no step of a commit ran after the break");
+    assert!(store.committing(), "the withheld commit is still in flight");
+    sim.crash();
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(store.tiers[0].head, head, "the reopen reads the head from before the break");
+    assert_eq!(bytes_of(&store, &key(3)), None, "the third commit's put was never committed");
+    assert_eq!(bytes_of(&store, &key(1)), Some(noise(12 << 10, 1)));
+    assert_eq!(bytes_of(&store, &key(2)), Some(noise(12 << 10, 2)));
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Rule 20 for review 9 C1: of a key's moves, `finish_batches` makes the first from where the
+/// key is, and an index written while they wait names that move's record: not the key's first
+/// move (one from a place it left, as a stale copy's), nor its last (one more from where it is).
+#[test]
+fn the_index_names_the_record_of_the_first_move_from_where_its_key_is() {
+    let mut sim = Sim::new(50, quiet());
+    let mut store = open(&mut sim, "store");
+    store.put(key(1), Kind::Query, noise(64, 1)).unwrap();
+    let Place::Segment(at) = store.found_of(&key(1)).place else { panic!("key 1 is in the segment") };
+    let mut held = Vec::new();
+    flush_holding(&mut sim, &mut store, &mut held, batch_map);
+    let batch = store.pending.back_mut().unwrap();
+    let made = *batch.moves.iter().find(|it| it.key == key(1)).unwrap();
+    assert_eq!(made.from, at);
+    let to = |by: u64| Loc { offset: made.to.offset + by, ..made.to };
+    batch.moves.insert(0, Move { key: key(1), from: Seg { offset: at.offset + 4096, ..at }, to: to(4096) });
+    batch.moves.push(Move { key: key(1), from: at, to: to(8192) });
+    let indexed = store.index_entries(&mut Vec::new()).into_iter().find(|(it, _)| *it == key(1));
+    assert_eq!(indexed, Some((key(1), made.to)), "the index names the first move from where the key is");
+    release(&mut sim, &mut store, held);
+    assert_eq!(store.loc_of(&key(1)), made.to, "the first move from where the key is is made");
+}
+
+/// Review 9 C3: a record is counted dead once. B's copy of the last chunk is its home (the
+/// claim race), and A's record of it, drained later, a duplicate. A reopen with no index since
+/// reads every record past what its head indexes and takes the last of each key: had A's
+/// record been written to a pack and counted dead there, the reopen would point the chunk at
+/// it, and a settle moving it cold would count it dead again, until a pack's dead bytes pass
+/// its length and its head no longer opens. A put between the two flushes rolls the pack, so
+/// B's copy and A's record would be in packs of their own. Dead bytes here stay exactly the
+/// records no key finds, through the reopen and the settle, and the store opens after.
+#[test]
+fn a_record_is_counted_dead_once_across_a_reopen_and_a_settle_that_moves_it() {
+    let (mut sim, mut store, out, a_gate, a_put) = a_chunk_claim_race(51, 0, output_with_a_last_chunk_a_settle_moves());
+    let last = *chunk_keys(&out).last().unwrap();
+    let home = store.loc_of(&last);
+    store.put(key(3), Kind::Output, noise(CHUNK_FROM - 1, 3)).unwrap();
+    a_gate.wait();
+    a_put.join().unwrap();
+    flush(&mut sim, &mut store);
+    assert!(store.tiers[0].packs.len() > home.pack as usize + 1, "the pack rolled past B's copy");
+    assert_dead_is_exact(&store);
+    drop(store);
+    let mut store = open(&mut sim, "store");
+    assert_eq!(store.loc_of(&last), home, "the reopen finds the chunk at B's copy");
+    assert_dead_is_exact(&store);
+    settle(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    let settled = settle(&mut sim, &mut store);
+    assert!(settled.demoted >= 1, "{settled:?}");
+    assert_eq!(form_of(&store, &last), Form::Zstd, "the settle moved the chunk cold");
+    assert_dead_is_exact(&store);
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(1)).as_ref(), Some(&out));
+    assert_eq!(bytes_of(&store, &key(2)).as_ref(), Some(&out));
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Review 9 (notes): maps answer in any order, so a pack a batch moves records into can be
+/// mapped while the batch still waits on another file's map. A settle then must not retire the
+/// pack: the batch's records are not yet what their keys find, so the rewrite would leave
+/// them out, and the batch would then point their keys into a removed pack. Once the batch's
+/// moves are made, the pack is retired as any other.
+#[test]
+fn a_pack_a_batch_waiting_on_its_maps_moves_records_into_is_not_retired() {
+    let mut sim = Sim::new(52, quiet());
+    let mut store = open(&mut sim, "store");
+    let value = |n: u64| if n < 100 { text(n, 12 << 10) } else { noise(16 << 10, n) };
+    let keys: Vec<u64> = (0..12).chain(100..116).collect();
+    for &n in &keys[..12] {
+        store.put(key(n), Kind::Code, value(n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    let settled = settle(&mut sim, &mut store);
+    assert_eq!(settled.demoted, 12, "{settled:?}");
+    for &n in &keys[12..] {
+        store.put(key(n), Kind::Code, value(n)).unwrap();
+    }
+    let mut held = Vec::new();
+    flush_holding(&mut sim, &mut store, &mut held, |what| matches!(what, Mapped::Pack { pack: 1, batch: Some(_), .. }));
+    assert_eq!(store.pending.len(), 1, "the batch waits on its map of pack 1");
+    let pack = &store.tiers[0].packs[0];
+    assert!(store.tiers[0].packs.len() == 2 && store.tiers[0].dictionaries.is_empty());
+    assert!(pack.usable == pack.committed, "pack 0 is mapped");
+    assert!(pack.dead * 2 >= pack.committed - PACK_HEADER, "pack 0 is half dead");
+    assert!(store.pending[0].moves.iter().any(|it| it.to.pack == 0), "the batch moves records into pack 0");
+    let settled = settle(&mut sim, &mut store);
+    release(&mut sim, &mut store, held);
+    for &n in &keys {
+        assert_eq!(bytes_of(&store, &key(n)), Some(value(n)), "{n}");
+    }
+    assert_eq!(settled.retired, 0, "{settled:?}");
+    let settled = settle(&mut sim, &mut store);
+    assert!(settled.retired >= 1 && store.tiers[0].packs[0].removed, "{settled:?}");
+    drop(store);
+    let store = open(&mut sim, "store");
+    for &n in &keys {
+        assert_eq!(bytes_of(&store, &key(n)), Some(value(n)), "{n}");
+    }
+    assert_eq!(store.verify(None), Vec::new());
 }
 
 /// The crash test: at any point of any number of commits, under injected IO failures, a crash
@@ -411,7 +1812,8 @@ fn a_large_value_is_a_file_of_its_own_placed_by_sharing_blocks() {
     // Placing again over what is there replaces it.
     let again = store.place(&key(1), name("target/image"), &mut effects).unwrap();
     drive(&mut sim, &mut store, &mut effects);
-    assert_eq!(store.placed()[0], Placed { tag: again, to: name("target/image"), result: Ok(()) });
+    let cloned = PlacedBytes { cloned: big.len() as u64, ..PlacedBytes::default() };
+    assert_eq!(store.placed()[0], Placed { tag: again, to: name("target/image"), result: Ok(()), bytes: cloned });
     drop(store);
     let store = open(&mut sim, "store");
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), big);
@@ -429,6 +1831,366 @@ fn where_blocks_cannot_be_shared_a_place_fails_and_copies_nothing() {
     let placed = store.placed();
     assert!(matches!(&placed[0].result, Err(why) if why.contains("does not copy")), "{placed:?}");
     assert!(!sim.exists(&name("out/q")));
+}
+
+#[test]
+fn an_output_is_written_once_and_cloned_to_every_place() {
+    let mut sim = Sim::new(11, quiet());
+    let mut store = open(&mut sim, "store");
+    let out = noise(CHUNK_FROM as usize + 10, 110);
+    let len = out.len() as u64;
+    store.put(key(1), Kind::Output, out.clone()).unwrap();
+    flush(&mut sim, &mut store);
+    let file = name(&format!("store/placed/{:x}", content_of(&out)));
+    let mut effects = Vec::new();
+    let a = store.place(&key(1), name("one/build/a"), &mut effects).unwrap();
+    let b = store.place(&key(1), name("two/build/a"), &mut effects).unwrap();
+    drive(&mut sim, &mut store, &mut effects);
+    let placed: BTreeMap<Tag, Placed> = store.placed().into_iter().map(|it| (it.tag, it)).collect();
+    assert_eq!(placed[&a].result, Ok(()));
+    assert_eq!(placed[&b].result, Ok(()));
+    let mut bytes = placed[&a].bytes;
+    bytes += placed[&b].bytes;
+    assert_eq!(bytes, PlacedBytes { cloned: 2 * len, written: len, copied: 0 }, "written once, cloned twice");
+    assert_eq!(sim.contents(&name("one/build/a")), out);
+    assert_eq!(sim.contents(&name("two/build/a")), out);
+    assert_eq!(sim.mode(&file), Some(PLACED_MODE), "the store's copy is read-only");
+    assert_eq!(sim.mode(&name("one/build/a")), Some(0o644), "a clone is a written file's mode");
+    // Let go of, the whole file goes; the value and every clone stay, and placing again
+    // writes it again.
+    store.unplace(&key(1), &key(9), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert!(!sim.exists(&file));
+    assert_eq!(sim.contents(&name("two/build/a")), out);
+    let again = store.place(&key(1), name("one/build/a"), &mut effects).unwrap();
+    drive(&mut sim, &mut store, &mut effects);
+    let placed = store.placed();
+    assert_eq!(placed[0].tag, again);
+    assert_eq!(placed[0].bytes, PlacedBytes { cloned: len, written: len, copied: 0 });
+    assert_eq!(store.problems(), &[] as &[String]);
+}
+
+/// One output of `len` bytes put as key 1 and placed at `one/build/a`: the store, its bytes and
+/// the name of the whole file it is cloned from.
+fn placed_once(sim: &mut Sim, seed: u64) -> (Store, Vec<u8>, FileName) {
+    let mut store = open(sim, "store");
+    let out = noise(CHUNK_FROM as usize + 10, seed);
+    store.put(key(1), Kind::Output, out.clone()).unwrap();
+    flush(sim, &mut store);
+    let mut effects = Vec::new();
+    store.place(&key(1), name("one/build/a"), &mut effects).unwrap();
+    drive(sim, &mut store, &mut effects);
+    assert_eq!(store.placed()[0].result, Ok(()));
+    let file = name(&format!("store/placed/{:x}", content_of(&out)));
+    (store, out, file)
+}
+
+/// The one place of key 1 at `to`, driven to its end.
+fn place_one(sim: &mut Sim, store: &mut Store, to: &str) -> Placed {
+    let mut effects = Vec::new();
+    let tag = store.place(&key(1), name(to), &mut effects).unwrap();
+    drive(sim, store, &mut effects);
+    let placed = store.placed();
+    assert_eq!(placed.len(), 1, "{placed:?}");
+    assert_eq!(placed[0].tag, tag);
+    placed.into_iter().next().unwrap()
+}
+
+#[test]
+fn a_placed_file_is_kept_across_an_open_and_cloned_from_again_unwritten() {
+    let mut sim = Sim::new(13, quiet());
+    let (store, out, file) = placed_once(&mut sim, 130);
+    drop(store);
+    let temporary = name("store/placed/.cut-short.123-4.tmp");
+    sim.change(&temporary, b"half a write");
+    let mut store = open(&mut sim, "store");
+    let len = out.len() as u64;
+    assert_eq!(store.placed_on_open(), PlacedOnOpen { kept: 1, kept_bytes: len, swept: 1 });
+    assert!(!sim.exists(&temporary), "a temporary file of an earlier run goes");
+    let placed = place_one(&mut sim, &mut store, "two/build/a");
+    assert_eq!(placed.result, Ok(()));
+    assert_eq!(placed.bytes, PlacedBytes { cloned: len, written: 0, copied: 0 }, "checked, not written again");
+    assert_eq!(sim.contents(&name("two/build/a")), out);
+    assert_eq!(sim.mode(&file), Some(PLACED_MODE));
+    assert_eq!(store.problems(), &[] as &[String]);
+}
+
+/// Pins C3 and C1 of review 4: the first place of a kept whole file after an open looks at the
+/// name without following a link (`Lstat`), hashes it, seals it on the name itself (`Seal`) and
+/// then clones it: never a `Stat` or a `Mode` of it, either of which follows a link put there.
+#[test]
+fn the_first_place_after_an_open_looks_at_and_seals_the_placed_file_without_following_a_link() {
+    let mut sim = Sim::new(25, quiet());
+    let (store, _, file) = placed_once(&mut sim, 250);
+    drop(store);
+    let mut store = open(&mut sim, "store");
+    let mut effects = Vec::new();
+    store.place(&key(1), name("two/build/a"), &mut effects).unwrap();
+    // Every effect asked, in order, of the whole file: the kind of each.
+    let of_file = |effects: &[Effect], seen: &mut Vec<&'static str>| {
+        for effect in effects {
+            seen.extend(match effect {
+                Effect::Lstat { file: it, .. } if *it == file => Some("Lstat"),
+                Effect::Stat { file: it, .. } if *it == file => Some("Stat"),
+                Effect::Map { file: it, .. } if *it == file => Some("Map"),
+                Effect::Seal { file: it, .. } if *it == file => Some("Seal"),
+                Effect::Mode { file: it, .. } if *it == file => Some("Mode"),
+                Effect::Write { file: it, .. } if *it == file => Some("Write"),
+                Effect::Remove { file: it, .. } if *it == file => Some("Remove"),
+                Effect::Clone { from, .. } if *from == file => Some("Clone"),
+                _ => None,
+            });
+        }
+    };
+    let mut seen = Vec::new();
+    of_file(&effects, &mut seen);
+    run_until_idle(&mut sim, &mut effects, |completion, effects| {
+        if store.owns(completion.tag) {
+            let before = effects.len();
+            _ = store.complete(completion, effects);
+            of_file(&effects[before..], &mut seen);
+        }
+    });
+    assert_eq!(store.placed()[0].result, Ok(()));
+    assert_eq!(seen, ["Lstat", "Map", "Seal", "Clone"], "the kept file's effects, in order");
+}
+
+#[test]
+fn a_placed_file_with_other_bytes_is_written_again_before_it_is_cloned() {
+    for (seed, shorter) in [(14, false), (15, true)] {
+        let mut sim = Sim::new(seed, quiet());
+        let (store, out, file) = placed_once(&mut sim, seed * 10);
+        drop(store);
+        let mut other = out.clone();
+        match shorter {
+            true => other.truncate(out.len() - 1),
+            false => other[out.len() / 2] ^= 1,
+        }
+        sim.change(&file, &other);
+        let mut store = open(&mut sim, "store");
+        let placed = place_one(&mut sim, &mut store, "two/build/a");
+        assert_eq!(placed.result, Ok(()));
+        assert_eq!(placed.bytes.written, out.len() as u64, "written again");
+        assert_eq!(sim.contents(&file), out);
+        assert_eq!(sim.contents(&name("two/build/a")), out);
+        let why = if shorter { "bytes, not the" } else { "not of its name" };
+        assert!(store.problems().iter().any(|it| it.contains(why)), "{:?}", store.problems());
+    }
+}
+
+#[test]
+fn a_placed_file_removed_outside_the_daemon_is_written_again() {
+    let mut sim = Sim::new(16, quiet());
+    let (mut store, out, file) = placed_once(&mut sim, 160);
+    sim.delete(&file);
+    let placed = place_one(&mut sim, &mut store, "two/build/a");
+    assert_eq!(placed.result, Ok(()));
+    assert_eq!(placed.bytes.written, out.len() as u64);
+    assert_eq!(sim.contents(&name("two/build/a")), out);
+    assert!(store.problems().iter().any(|it| it.contains("could not be cloned from")), "{:?}", store.problems());
+}
+
+#[test]
+fn a_placed_file_swapped_for_a_symbolic_link_is_written_again_and_never_cloned_through() {
+    let mut sim = Sim::new(18, quiet());
+    let (mut store, out, file) = placed_once(&mut sim, 180);
+    sim.change(&name("elsewhere/a"), &out);
+    sim.symlink(&file, "../../elsewhere/a");
+    let placed = place_one(&mut sim, &mut store, "two/build/a");
+    assert_eq!(placed.result, Ok(()));
+    assert_eq!(placed.bytes.written, out.len() as u64, "written again, not cloned through the link");
+    assert_eq!(sim.contents(&name("two/build/a")), out);
+    assert_eq!(sim.mode(&file), Some(PLACED_MODE), "a file again, read-only");
+    let why = blaze_core::CLONE_THROUGH_A_LINK;
+    assert!(store.problems().iter().any(|it| it.contains(why)), "{:?}", store.problems());
+}
+
+#[test]
+fn a_placed_file_let_go_of_while_a_clone_of_it_is_in_flight_goes_after_it() {
+    let mut sim = Sim::new(17, quiet());
+    let (mut store, out, file) = placed_once(&mut sim, 170);
+    let mut effects = Vec::new();
+    let tag = store.place(&key(1), name("two/build/a"), &mut effects).unwrap();
+    store.unplace(&key(1), &key(9), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    let placed = store.placed();
+    assert_eq!((placed[0].tag, &placed[0].result), (tag, &Ok(())));
+    assert_eq!(sim.contents(&name("two/build/a")), out);
+    assert!(!sim.exists(&file), "it goes once the clone ends");
+    // Let go of for a value of the same bytes, it stays.
+    store.put(key(2), Kind::Output, out.clone()).unwrap();
+    flush(&mut sim, &mut store);
+    place_one(&mut sim, &mut store, "three/build/a");
+    store.unplace(&key(1), &key(2), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert!(sim.exists(&file), "the same bytes under another key keep it");
+}
+
+#[test]
+fn a_place_while_the_open_looks_through_placed_waits_for_the_look_and_is_not_swept() {
+    let mut sim = Sim::new(19, quiet());
+    let (store, _, kept) = placed_once(&mut sim, 190);
+    drop(store);
+    let temporary = name("store/placed/.cut-short.123-4.tmp");
+    sim.change(&temporary, b"half a write");
+    sim.hold_lists(name("store/placed"));
+    let mut effects = Vec::new();
+    let mut store = Store::open(config("store"), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert!(store.ready(), "{:?}", store.broken());
+    assert_eq!(sim.lists_held(), 1, "the open's look through placed/ is still going");
+    // A new output, whose whole file is to be written while the look goes on.
+    let out = noise(CHUNK_FROM as usize + 20, 191);
+    store.put(key(2), Kind::Output, out.clone()).unwrap();
+    flush(&mut sim, &mut store);
+    let file = name(&format!("store/placed/{:x}", content_of(&out)));
+    let tag = store.place(&key(2), name("two/build/b"), &mut effects).unwrap();
+    assert!(!format!("{effects:?}").contains("store/placed"), "nothing in placed/ is touched yet: {effects:?}");
+    drive(&mut sim, &mut store, &mut effects);
+    assert_eq!(store.placed(), Vec::new(), "the place waits for the look");
+    assert!(!sim.exists(&file), "no write into placed/ began");
+    sim.release_lists();
+    drive(&mut sim, &mut store, &mut effects);
+    let placed = store.placed();
+    assert_eq!((placed.len(), placed[0].tag, &placed[0].result), (1, tag, &Ok(())));
+    assert_eq!(placed[0].bytes.written, out.len() as u64);
+    assert_eq!(sim.contents(&file), out, "the place's own file stays");
+    assert_eq!(sim.contents(&name("two/build/b")), out);
+    assert!(sim.exists(&kept) && !sim.exists(&temporary), "the look kept the earlier file and swept the leftover");
+    assert_eq!(store.placed_on_open().swept, 1);
+}
+
+#[test]
+fn a_placed_directory_that_cannot_be_looked_through_breaks_the_store() {
+    let mut sim = Sim::new(20, quiet());
+    let (store, _, file) = placed_once(&mut sim, 200);
+    drop(store);
+    sim.delete(&file);
+    sim.change(&name("store/placed"), b"not a directory");
+    let mut effects = Vec::new();
+    let mut store = Store::open(config("store"), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    let broken = store.broken().expect("broken").to_string();
+    assert!(broken.contains("store/placed") && broken.contains("not a directory"), "{broken}");
+    // A place is refused, naming the directory (or, where the broken store no longer reads its
+    // index, not taken at all).
+    if store.place(&key(1), name("two/build/a"), &mut effects).is_some() {
+        drive(&mut sim, &mut store, &mut effects);
+        let placed = store.placed();
+        assert!(matches!(&placed[0].result, Err(why) if why.contains("store/placed")), "{placed:?}");
+    }
+    assert!(!sim.exists(&name("two/build/a")));
+}
+
+#[test]
+fn a_look_through_placed_that_fails_is_asked_again_and_its_places_go_on() {
+    let mut sim = Sim::new(21, quiet());
+    let (store, out, _) = placed_once(&mut sim, 210);
+    drop(store);
+    let temporary = name("store/placed/.cut-short.123-4.tmp");
+    sim.change(&temporary, b"half a write");
+    // One short of the bound: the look is asked again each time, and the last one sweeps.
+    sim.fail_lists(name("store/placed"), FAILURES_MOST - 1);
+    let mut store = open(&mut sim, "store");
+    assert!(store.broken().is_none(), "{:?}", store.broken());
+    let len = out.len() as u64;
+    assert_eq!(store.placed_on_open(), PlacedOnOpen { kept: 1, kept_bytes: len, swept: 1 });
+    assert!(!sim.exists(&temporary));
+    let placed = place_one(&mut sim, &mut store, "two/build/a");
+    assert_eq!(placed.result, Ok(()));
+    assert_eq!(placed.bytes, PlacedBytes { cloned: len, written: 0, copied: 0 });
+}
+
+#[test]
+fn a_look_through_placed_that_keeps_failing_breaks_the_store_naming_it() {
+    let mut sim = Sim::new(22, quiet());
+    let (store, _, _) = placed_once(&mut sim, 220);
+    drop(store);
+    sim.fail_lists(name("store/placed"), FAILURES_MOST);
+    let mut effects = Vec::new();
+    let mut store = Store::open(config("store"), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    let broken = store.broken().expect("broken").to_string();
+    let times = format!("failed {FAILURES_MOST} times");
+    for part in ["store/placed", "looking through it as the store opened", "Permission denied", &times] {
+        assert!(broken.contains(part), "{part:?} not in {broken}");
+    }
+    if store.place(&key(1), name("two/build/a"), &mut effects).is_some() {
+        drive(&mut sim, &mut store, &mut effects);
+        let placed = store.placed();
+        assert!(matches!(&placed[0].result, Err(why) if why.contains("store/placed")), "{placed:?}");
+    }
+    assert!(!sim.exists(&name("two/build/a")));
+}
+
+/// Pins L1 of round 4: an unplace asked while the open's look through `placed/` runs is
+/// held, so no Remove there races the listing; it goes once the look ends.
+#[test]
+fn an_unplace_while_the_open_looks_through_placed_removes_nothing_until_the_look_ends() {
+    let mut sim = Sim::new(24, quiet());
+    let (store, _, kept) = placed_once(&mut sim, 240);
+    drop(store);
+    sim.hold_lists(name("store/placed"));
+    let mut effects = Vec::new();
+    let mut store = Store::open(config("store"), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert!(store.ready(), "{:?}", store.broken());
+    assert_eq!(sim.lists_held(), 1, "the open's look through placed/ is still going");
+    store.unplace(&key(1), &key(9), &mut effects);
+    let placed_dir = name("store/placed");
+    let removes = effects.iter().any(|it| matches!(it, Effect::Remove { file, .. } if file.is_under(&placed_dir)));
+    assert!(!removes, "no remove in placed/ while the look goes on: {effects:?}");
+    drive(&mut sim, &mut store, &mut effects);
+    assert!(sim.exists(&kept), "the whole file stays while the look goes on");
+    sim.release_lists();
+    drive(&mut sim, &mut store, &mut effects);
+    assert!(store.broken().is_none(), "{:?}", store.broken());
+    assert!(!sim.exists(&kept), "the unplace held for the look goes once it ends");
+}
+
+/// Pins L3 of round 4 (and C2 of review 4): a place held for the open's look is refused, naming
+/// why, when the store breaks before the look ends, here by its commits failing until the bound.
+#[test]
+fn a_place_held_for_the_look_is_refused_when_the_store_breaks_meanwhile() {
+    let mut sim = Sim::new(23, quiet());
+    let (store, _, _) = placed_once(&mut sim, 230);
+    drop(store);
+    sim.hold_lists(name("store/placed"));
+    let mut effects = Vec::new();
+    let mut store = Store::open(config("store"), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert!(store.ready(), "{:?}", store.broken());
+    let tag = store.place(&key(1), name("two/build/a"), &mut effects).unwrap();
+    drive(&mut sim, &mut store, &mut effects);
+    assert_eq!(store.placed(), Vec::new(), "the place waits for the look");
+    // Every commit fails at its sync, until the store breaks.
+    sim.fail_syncs(name("store"));
+    store.put(key(2), Kind::Output, noise(100, 231)).unwrap();
+    flush(&mut sim, &mut store);
+    let broken = store.broken().expect("broken").to_string();
+    assert!(broken.contains("Input/output error"), "{broken}");
+    let placed = store.placed();
+    assert_eq!((placed.len(), placed.first().map(|it| it.tag)), (1, Some(tag)), "refused, not left waiting: {placed:?}");
+    assert!(matches!(&placed[0].result, Err(why) if why.contains("Input/output error")), "{placed:?}");
+    sim.release_lists();
+    drive(&mut sim, &mut store, &mut effects);
+    assert_eq!(store.placed(), Vec::new(), "nothing is placed after the refusal");
+    assert!(!sim.exists(&name("two/build/a")));
+}
+
+#[test]
+fn where_an_output_cannot_be_cloned_its_place_fails_and_copies_nothing() {
+    let mut sim = Sim::new(12, Faults { no_clone: true, ..Faults::default() });
+    let mut store = open(&mut sim, "store");
+    store.put(key(1), Kind::Output, noise(CHUNK_FROM as usize, 120)).unwrap();
+    flush(&mut sim, &mut store);
+    let mut effects = Vec::new();
+    store.place(&key(1), name("out/a"), &mut effects).unwrap();
+    drive(&mut sim, &mut store, &mut effects);
+    let placed = store.placed();
+    assert!(matches!(&placed[0].result, Err(why) if why.contains("does not copy")), "{placed:?}");
+    assert_eq!(placed[0].bytes, PlacedBytes::default());
+    assert!(!sim.exists(&name("out/a")));
 }
 
 #[test]
@@ -857,10 +2619,10 @@ fn a_fetch_the_remote_knows_is_missing_is_answered_at_once() {
     let mut store = open(&mut sim, "store");
     let mut remote = Recorded(Vec::new(), vec![key(5)]);
     let mut effects = Vec::new();
-    assert_eq!(store.fetch(&key(5), &mut remote, &mut effects), None);
+    assert_eq!(store.fetch(&key(5), &mut remote, any, &mut effects), None);
     assert!(remote.0.is_empty() && effects.is_empty());
     assert_eq!(store.fetched(), [(key(5), Fetched::Missing)]);
-    assert!(store.fetch(&key(5), &mut Recorded(Vec::new(), Vec::new()), &mut effects).is_some(), "not left fetching");
+    assert!(store.fetch(&key(5), &mut Recorded(Vec::new(), Vec::new()), any, &mut effects).is_some(), "not left fetching");
 }
 
 #[test]
@@ -901,12 +2663,12 @@ fn a_fetched_value_is_verified_before_it_is_kept() {
     store.put(key(9), Kind::Code, b"here".to_vec()).unwrap();
     let mut remote = Recorded(Vec::new(), Vec::new());
     let mut effects = Vec::new();
-    assert_eq!(store.fetch(&key(9), &mut remote, &mut effects), None, "it has it");
-    let good = store.fetch(&key(1), &mut remote, &mut effects).unwrap();
-    assert_eq!(store.fetch(&key(1), &mut remote, &mut effects), None, "in flight");
-    let bad = store.fetch(&key(2), &mut remote, &mut effects).unwrap();
-    let missing = store.fetch(&key(3), &mut remote, &mut effects).unwrap();
-    let failed = store.fetch(&key(4), &mut remote, &mut effects).unwrap();
+    assert_eq!(store.fetch(&key(9), &mut remote, any, &mut effects), None, "it has it");
+    let good = store.fetch(&key(1), &mut remote, any, &mut effects).unwrap();
+    assert_eq!(store.fetch(&key(1), &mut remote, any, &mut effects), None, "in flight");
+    let bad = store.fetch(&key(2), &mut remote, any, &mut effects).unwrap();
+    let missing = store.fetch(&key(3), &mut remote, any, &mut effects).unwrap();
+    let failed = store.fetch(&key(4), &mut remote, any, &mut effects).unwrap();
     assert_eq!(remote.0.len(), 4);
     let answer = |answer: remote::Answer| {
         let body = answer.encode();
@@ -943,6 +2705,39 @@ fn a_fetched_value_is_verified_before_it_is_kept() {
     assert!(!store.has(&key(2)));
     let durable = flush(&mut sim, &mut store);
     assert_eq!(durable.len(), 2);
+}
+
+/// What lets a reader of machine code prove it is its own: a fetch never keeps a
+/// `Kind::Machine`, and `get_from` says which directory a value is in.
+#[test]
+fn machine_code_is_never_kept_from_a_fetch_and_a_value_says_its_directory() {
+    let mut sim = Sim::new(18, quiet());
+    let mut base = open(&mut sim, "base");
+    base.put(key(7), Kind::Machine, b"a layer's code".to_vec()).unwrap();
+    flush(&mut sim, &mut base);
+    drop(base);
+    let mut store = open_with(&mut sim, Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40 });
+    store.put(key(8), Kind::Machine, b"my code".to_vec()).unwrap();
+    let mut remote = Recorded(Vec::new(), Vec::new());
+    let mut effects = Vec::new();
+    let machine = store.fetch(&key(1), &mut remote, any, &mut effects).unwrap();
+    let run = store.fetch(&key(2), &mut remote, any, &mut effects).unwrap();
+    let value = |key, kind, bytes: &[u8]| {
+        Done::Read(remote::Answer::Value { key, kind, content: content_of(bytes), bytes: bytes.to_vec() }.encode_framed())
+    };
+    store.complete(Completion { tag: machine, done: value(key(1), Kind::Machine, b"far code") }, &mut effects);
+    store.complete(Completion { tag: run, done: value(key(2), Kind::Run, b"far run") }, &mut effects);
+    let fetched: BTreeMap<Key, Fetched> = store.fetched().into_iter().collect();
+    assert!(matches!(&fetched[&key(1)], Fetched::Refused(why) if why.contains("machine code")), "{fetched:?}");
+    assert!(matches!(fetched[&key(2)], Fetched::Kept(_)));
+    assert!(!store.has(&key(1)), "refused machine code is not kept");
+
+    let (reader, guard) = (store.reader(), enter());
+    let from = |key| reader.get_from(&guard, &key).unwrap().map(|(origin, entry)| (origin, entry.kind));
+    assert_eq!(from(key(8)), Some((Origin::Own, Kind::Machine)));
+    assert_eq!(from(key(2)), Some((Origin::Own, Kind::Run)), "a fetched value is the store's own, of the kind it was sent as");
+    assert_eq!(from(key(7)), Some((Origin::Behind(name("base")), Kind::Machine)));
+    assert_eq!(from(key(1)), None);
 }
 
 #[test]
@@ -2073,4 +3868,9 @@ fn a_process_installs_one_handle() {
     assert!(std::ptr::eq(first, Handle::installed().unwrap()));
     let refused = Handle::install(Handle::new(&mut store, "/second".into())).err().unwrap();
     assert!(refused.contains("/first"), "{refused}");
+}
+
+/// What a test's fetches let in: everything that hashes as sent.
+fn any(_: Kind, _: &[u8]) -> Result<(), String> {
+    Ok(())
 }

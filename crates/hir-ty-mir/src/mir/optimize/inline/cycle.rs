@@ -8,6 +8,7 @@ use std::hash::Hash;
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_query::db::AsId;
 use hir_def::{FunctionId, HasModule, nameres::crate_def_map, signatures::FunctionSignature};
 use rustc_type_ir::inherent::GenericArgs as _;
@@ -27,7 +28,7 @@ use super::{Attrs, fn_def, instantiate, is_generic, resolve, spans::owner_of};
 /// first calls them: rustc's `mir_inliner_callees`, of the runtime body. Of
 /// `const_eval_select` it is the function called at runtime.
 fn callees_of(body: &MirBody<'_>) -> Vec<(FunctionId, StoredGenericArgs)> {
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     let mut callees = Vec::new(); // alloc: the memoized query's stored result, once per body
     for (_, block) in body.basic_blocks.iter() {
         let Some(TerminatorKind::Call { func, args, intrinsic, .. }) =
@@ -84,9 +85,9 @@ fn inliner_callees<'db>(
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Walked<B: Eq + Hash> {
     /// rustc's `mir_callgraph_cyclic`: the bodies a path back to the root goes through.
-    pub(super) cyclic: HashSet<B>,
+    pub(super) cyclic: HashSet<B, Global>,
     /// The bodies the walk followed.
-    pub(super) reached: HashSet<B>,
+    pub(super) reached: HashSet<B, Global>,
 }
 
 /// [`Walked`] of the bodies of the root's crate, each list sorted by [`key`].
@@ -105,7 +106,7 @@ fn key(body: &InlinedBody<'_>) -> (bool, blaze_query::db::Id) {
 
 impl<'db> Callgraph<'db> {
     fn new(walked: Walked<InlinedBody<'db>>) -> Self {
-        let sorted = |set: HashSet<InlinedBody<'db>>| {
+        let sorted = |set: HashSet<InlinedBody<'db>, Global>| {
             // alloc: the memoized query's stored result, once per root
             let mut list: Vec<_> = set.into_iter().collect();
             list.sort_unstable_by_key(key);
@@ -227,9 +228,9 @@ where
     B: Copy + Eq + Hash,
     C: Into<SmallVec<[(N, bool); 8]>>,
 {
-    let mut seen: HashMap<N, bool> = HashMap::default();
-    let mut recursion: HashMap<B, usize> = HashMap::default();
-    let mut graph = Walked { cyclic: HashSet::default(), reached: HashSet::default() };
+    let mut seen: HashMap<N, bool, Global> = HashMap::new_in(Global);
+    let mut recursion: HashMap<B, usize, Global> = HashMap::new_in(Global);
+    let mut graph = Walked { cyclic: HashSet::new_in(Global), reached: HashSet::new_in(Global) };
     let mut stack =
         // alloc: one stack per memoized walk of a root, not per node
         vec![Frame { node: start, callees: callees(start).into(), next: 0, reaches: false }];

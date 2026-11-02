@@ -738,6 +738,8 @@ define_symbols! {
     const_precise_live_drops,
     sized_hierarchy,
     forced_keywords,
+    blaze_comptime,
+    blaze_verify,
     mut_ref,
     type_changing_struct_update,
     RangeMin,
@@ -859,7 +861,8 @@ define_symbols! {
     // Builtin attributes and lang items named nowhere above.
     inline, cold, unsafe_unpin, global_alloc_ty, maybe_dangling,
     panic_null_reference_constructed, panic_invalid_enum_construction, mem_size_const,
-    mem_align_const, rustc_diagnostic_item, try_as_dyn,
+    mem_align_const, rustc_diagnostic_item, try_as_dyn, arbitrary_int, arbitrary_signed, int_from,
+    int_try_from, blaze_int_cast,
     // The most frequent identifiers of `library/` and `harness/` (comments and literals left
     // out, keywords and the names above skipped), most frequent first, so that each is a
     // fixed ID found by `COMPILED` with no probe of the table. Not here, though common: the
@@ -898,4 +901,26 @@ define_symbols! {
     u32x4, f1, first, written, reader, error, windows, Section, IMM_INDEX, tests, options,
     vector_unsigned_int, _mm_set_pd, Sync, macho, HvxVectorPred, tx, Op, fold, ix, assert_eq_m128,
     f64x2,
+    assume_init, const_ptr_cast, cstring_type, maybe_uninit_uninit, maybe_uninit_zeroed,
+    mem_discriminant, mem_uninitialized, mem_variant_count, mem_zeroed, ptr_cast, ptr_cast_const,
+    ptr_cast_mut, ptr_const_is_null, ptr_copy, ptr_copy_nonoverlapping, ptr_from_ref, ptr_is_null,
+    ptr_null, ptr_null_mut, ptr_read, ptr_read_unaligned, ptr_replace, ptr_swap,
+    ptr_swap_nonoverlapping, ptr_write, ptr_write_bytes, ptr_write_unaligned, ptr_write_volatile,
+    slice_from_raw_parts, slice_from_raw_parts_mut, unsafe_cell_raw_get, Cell,
+    SyncUnsafeCell, ControlFlow, MutexGuard, RwLockReadGuard, RwLockWriteGuard,
+    // Nightly's contracts (`core::contracts`, `-Zcontract-checks`): the builtin attributes, the
+    // markers their expansion leaves in a body, the lang item and cfg, and the names rustc's
+    // lowering binds.
+    contracts_requires, contracts_ensures, rustc_contract_requires, rustc_contract_ensures,
+    contract_build_check_ensures, contract_checks, __ensures_checker, __ret,
+    // blaze's compile-time reflection (`core::reflect`, `#![feature(blaze_comptime)]`): its lang
+    // items and the intrinsics blaze's const evaluator answers for it.
+    blaze_struct, blaze_enum, blaze_field, blaze_marked, blaze_unmarked, blaze_variant,
+    blaze_variant_view, blaze_variant_representing_type, blaze_variant_of, blaze_fields,
+    blaze_only_marked, blaze_only_unmarked, blaze_variants, blaze_fn_item, blaze_adt_name,
+    blaze_field_index, blaze_field_attrs, blaze_variant_index, blaze_variant_discriminant,
+    blaze_fn_info,
+    // `#[blaze::contract_test]`, the builtin attribute `core::blaze::contract_test`
+    // (docs/v2/plan/lanes/contracts.md, part 2).
+    contract_test,
 }

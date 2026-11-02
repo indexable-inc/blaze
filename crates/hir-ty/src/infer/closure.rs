@@ -24,7 +24,7 @@ use crate::{
     infer::{BreakableKind, ClosureData, Diverges, coerce::CoerceMany},
     next_solver::{
         AliasTy, Binder, ClauseKind, DbInterner, ErrorGuaranteed, FnSig, GenericArg, PolyFnSig,
-        PolyProjectionClause, Predicate, PredicateKind, StoredFnSig, TermId, Ty,
+        PolyProjectionClause, Predicate, PredicateKind, SolverDefId, StoredFnSig, TermId, Ty,
         TyKind, Unnormalized,
         abi::Safety,
         infer::{
@@ -273,7 +273,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 // the coroutine type, filling in the tupled_upvars_ty and kind_ty with infer
                 // vars which will get constrained during upvar analysis.
                 let coroutine_output_ty = interner.liberate_late_bound_regions(
-                    self.owner.into(),
+                    coroutine_closure_id.into(),
                     closure_args.coroutine_closure_sig().map_bound(|sig| {
                         sig.to_coroutine(
                             interner,
@@ -757,7 +757,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             self.supplied_sig_of_closure(closure_expr, decl_inputs, decl_output, closure_kind);
         self.result.closures_without_expectation.insert(closure_expr);
 
-        self.closure_sigs(bound_sig)
+        self.closure_sigs(closure_expr, closure_kind, bound_sig)
     }
 
     /// Invoked to compute the signature of a closure expression. This
@@ -828,6 +828,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             );
         } else if expected_sig.skip_binder().inputs_and_output.len() != decl_input_tys.len() + 1 {
             return self.sig_of_closure_with_mismatched_number_of_arguments(
+                closure_expr,
+                closure_kind,
                 decl_input_tys,
                 decl_output_ty,
             );
@@ -852,7 +854,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         // anonymize away, so as not to confuse the user.
         let bound_sig = self.interner().anonymize_bound_vars(bound_sig);
 
-        let closure_sigs = self.closure_sigs(bound_sig);
+        let closure_sigs = self.closure_sigs(closure_expr, closure_kind, bound_sig);
 
         // Up till this point, we have ignored the annotations that the user
         // gave. This function will check that they unify successfully.
@@ -879,12 +881,14 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
     fn sig_of_closure_with_mismatched_number_of_arguments(
         &mut self,
+        closure_expr: ExprId,
+        closure_kind: ClosureKind,
         decl_inputs: &[Option<TypeRefId>],
         decl_output: Option<TypeRefId>,
     ) -> ClosureSignatures<'db> {
         let error_sig = self.error_sig_of_closure(decl_inputs, decl_output);
 
-        self.closure_sigs(error_sig)
+        self.closure_sigs(closure_expr, closure_kind, error_sig)
     }
 
     /// Enforce the user's types against the expectation. See
@@ -1185,10 +1189,34 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         result
     }
 
-    fn closure_sigs(&self, bound_sig: PolyFnSig<'db>) -> ClosureSignatures<'db> {
-        // TODO: def id needs to be changed?
-        let liberated_sig =
-            self.interner().liberate_late_bound_regions(self.owner.into(), bound_sig);
+    /// The closure, coroutine or coroutine closure `closure_expr` makes, the scope of the
+    /// late-bound lifetimes of its signature inside its body, as rustc liberates them to the
+    /// closure's def id: they are not the enclosing function's.
+    pub(super) fn closure_scope(
+        &self,
+        closure_expr: ExprId,
+        closure_kind: ClosureKind,
+    ) -> SolverDefId<'db> {
+        let loc = InternedClosure { owner: self.owner, expr: closure_expr, kind: closure_kind };
+        match closure_kind {
+            ClosureKind::Closure => InternedClosureId::new(self.db, loc).into(),
+            ClosureKind::OldCoroutine(_) | ClosureKind::Coroutine { .. } => {
+                InternedCoroutineId::new(self.db, loc).into()
+            }
+            ClosureKind::CoroutineClosure(_) => {
+                InternedCoroutineClosureId::new(self.db, loc).into()
+            }
+        }
+    }
+
+    fn closure_sigs(
+        &self,
+        closure_expr: ExprId,
+        closure_kind: ClosureKind,
+        bound_sig: PolyFnSig<'db>,
+    ) -> ClosureSignatures<'db> {
+        let scope = self.closure_scope(closure_expr, closure_kind);
+        let liberated_sig = self.interner().liberate_late_bound_regions(scope, bound_sig);
         ClosureSignatures { bound_sig, liberated_sig }
     }
 }

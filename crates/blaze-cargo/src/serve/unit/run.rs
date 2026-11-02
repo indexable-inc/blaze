@@ -12,6 +12,7 @@ use blaze_cas::Store;
 use blaze_codegen::plan::{Mode as BuildMode, Policy};
 use blaze_core::{Command, Completion, Done, Effect, Sandbox, Tag};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_lazy::{Purpose, Refused};
 use blaze_units::schema::Mode;
 
@@ -20,7 +21,7 @@ use super::{
     error::{UnitError, manifest_dir},
     package_of,
 };
-use crate::serve::work::Runs;
+use crate::serve::work::{RunPuts, Runs};
 
 pub(crate) mod inproc;
 #[cfg(test)]
@@ -76,7 +77,7 @@ pub(crate) fn process_env(job: &[(String, String)], artifact: &Artifact, os: &st
         "windows" => ";",
         _ => ":",
     };
-    let mut env: HashMap<String, String> = job.iter().cloned().collect();
+    let mut env: HashMap<String, String, Global> = job.iter().cloned().collect();
     for (name, value) in &artifact.env {
         let joined = match env.get(name).filter(|_| name == var) {
             Some(theirs) if theirs.starts_with(value.as_str()) => theirs.clone(),
@@ -275,5 +276,10 @@ impl Runs<Real> for Program {
                 Some(false)
             }
         }
+    }
+
+    /// A program run puts nothing into the store.
+    fn take_puts(&mut self) -> RunPuts {
+        RunPuts::default()
     }
 }

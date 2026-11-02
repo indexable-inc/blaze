@@ -206,20 +206,11 @@ fn not_patchable(func: &ir::Function, inst: ir::Inst, func_ref: ir::FuncRef) -> 
 
 /// The stack argument bytes of a `return_call` or `return_call_indirect`, after checking the
 /// glue can make it: from a `tail` function to one (Cranelift's verifier and
-/// `gen_call_args`), with no StructArgument, whose copy would go into the area it replaces.
+/// `gen_call_args`), with no StructArgument, whose copy would go into the area it replaces;
+/// or between two functions of the System V or Windows convention, whose caller pops
+/// ([`native_tail_call`]).
 fn return_call_stack(func: &ir::Function, inst: ir::Inst) -> Result<u32, Error> {
     let opcode = func.dfg.insts[inst].opcode();
-    if func.signature.call_conv != CallConv::Tail {
-        return Err(Error::at(
-            inst,
-            // alloc: the error's message.
-            format!(
-                "`{opcode}` in a {} function: Cranelift's x64 backend tail-calls only from \
-                 `tail` functions",
-                func.signature.call_conv
-            ),
-        ));
-    }
     let sig = match func.dfg.insts[inst] {
         InstructionData::Call { func_ref, .. } => {
             not_patchable(func, inst, func_ref)?;
@@ -229,6 +220,12 @@ fn return_call_stack(func: &ir::Function, inst: ir::Inst) -> Result<u32, Error> 
         _ => return Err(Error::at(inst, "a return call of another format")),
     };
     let sig = &func.dfg.signatures[sig];
+    if func.signature.call_conv != CallConv::Tail {
+        native_tail_call(func, inst, sig)?;
+        let stack = abi::stack_args(sig).map_err(blame(inst))?;
+        abi::rets(sig, |_, _, _| Ok(())).map_err(blame(inst))?;
+        return Ok(stack);
+    }
     if sig.call_conv != CallConv::Tail {
         return Err(Error::at(
             inst,
@@ -245,6 +242,55 @@ fn return_call_stack(func: &ir::Function, inst: ir::Inst) -> Result<u32, Error> 
     .map_err(blame(inst))?;
     abi::rets(sig, |_, _, _| Ok(())).map_err(blame(inst))?;
     Ok(stack)
+}
+
+/// Checks a tail call from a System V or Windows function `func` to `sig`
+/// ([`crate::arch::caller_pops_tail_call`]), and that each argument the glue can't move into
+/// the caller's incoming argument area is already there: a StructArgument must be the
+/// caller's own, at the same place in the area (its bytes stay where the caller's caller
+/// copied them, and no other argument of the callee's lies over them), and a Windows 16-byte
+/// value passed by pointer to a copy has no area of the caller's to put the copy in.
+fn native_tail_call(func: &ir::Function, inst: ir::Inst, sig: &ir::Signature) -> Result<(), Error> {
+    let args = crate::arch::caller_pops_tail_call(func, inst, sig, abi::arg_bytes)?;
+    let opcode = func.dfg.insts[inst].opcode();
+    let params = match func.layout.entry_block() {
+        Some(entry) => func.dfg.block_params(entry),
+        None => &[],
+    };
+    abi::args(sig, |i, _, place| match place {
+        Place::Struct { at, size } => {
+            let value = func.dfg.resolve_aliases(args[i]);
+            let mut own = false;
+            if let Some(j) = params.iter().position(|&param| param == value) {
+                abi::args(&func.signature, |k, _, mine| {
+                    own |= k == j && mine == place;
+                    Ok(())
+                })?;
+            }
+            if own {
+                return Ok(());
+            }
+            Err(Error::new(
+                // alloc: the error's message.
+                format!(
+                    "argument {i} of `{opcode}`, a StructArgument of {size} bytes at {at} in the \
+                     argument area, is {value}, not the caller's own StructArgument at the same \
+                     place: a tail call copies none, since the copy would go into the area it \
+                     replaces"
+                ),
+            ))
+        }
+        Place::Implicit { .. } => Err(Error::new(
+            // alloc: the error's message.
+            format!(
+                "argument {i} of `{opcode}`, a Windows 16-byte value passed by pointer to a \
+                 copy: a tail call has no area of the caller's to put the copy in"
+            ),
+        )),
+        _ => Ok(()),
+    })
+    .map_err(blame(inst))?;
+    Ok(())
 }
 
 fn walk(func: &ir::Function, target: &Target) -> Result<Walk, Error> {

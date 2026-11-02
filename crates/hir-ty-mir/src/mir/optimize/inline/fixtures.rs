@@ -20,6 +20,8 @@ fn options(level: MirOptLevel) -> MirOptions {
         ub_checks: false,
         lifetime_markers: false,
         inline: level == MirOptLevel::Release,
+        heap_to_stack: false,
+        world: None,
     }
 }
 

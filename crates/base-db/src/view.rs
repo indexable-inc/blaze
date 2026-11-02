@@ -23,6 +23,7 @@ use std::{borrow::Cow, cell::RefCell, fmt};
 use blaze_ids::{ContentId, radix};
 use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
 use blaze_hash::{FixedState, HashMap};
+use std::alloc::Global;
 use blaze_query::db::{Durability, Setter};
 use triomphe::Arc;
 use crate::{AbsPath, AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};
@@ -124,7 +125,7 @@ pub(crate) struct ViewIndex {
 }
 
 impl ViewIndex {
-    pub(crate) fn new(base: &AbsPath, by_path: &HashMap<VfsPath, FileId>) -> ViewIndex {
+    pub(crate) fn new(base: &AbsPath, by_path: &HashMap<VfsPath, FileId, Global>) -> ViewIndex {
         let mut index = ViewIndex::default();
         for (path, &file) in by_path {
             index.note(base, path, file);

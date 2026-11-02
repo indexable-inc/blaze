@@ -11,6 +11,7 @@
 //! `unsafe` of them in every edition, and only lints a call outside a block before 2024.
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir::{DefWithBody, InFile};
 use hir_def::{
     CallableDefId, DefWithBodyId,
@@ -88,7 +89,7 @@ enum Context {
 
 struct Visitor<'s, 'a, 'db> {
     b: &'s BodyCx<'s, 'a, 'db>,
-    ops: HashSet<ExprOrPatSource>,
+    ops: HashSet<ExprOrPatSource, Global>,
     context: Context,
     /// Each block found unused, with the used block it is nested in when that is why.
     warnings: Vec<(ExprId, Option<ExprId>)>,
@@ -216,7 +217,7 @@ impl Visitor<'_, '_, '_> {
 }
 
 /// The unsafe operations of the body, by where they are written.
-fn operations(b: &BodyCx<'_, '_, '_>) -> HashSet<ExprOrPatSource> {
+fn operations(b: &BodyCx<'_, '_, '_>) -> HashSet<ExprOrPatSource, Global> {
     let def = DefWithBody::from(b.owner);
     b.cx.vsema.get_unsafe_ops(def.into())
 }

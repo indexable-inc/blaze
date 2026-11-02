@@ -707,6 +707,70 @@ fn main() {
     assert!(notes.contains(&"required by a bound in `assert_failed`"), "{notes:?}");
 }
 
+/// A method's own where clause that fails once its argument decides the method's parameter is
+/// rustc's E0277: hashbrown's `contains<Q: ?Sized + Equivalent<T>>(&self, value: &Q)` given a
+/// `&&u64` makes `Q = &u64`, and the blanket `impl<Q: Eq, K: Borrow<Q>> Equivalent<K> for Q`
+/// then needs `u64: Borrow<&u64>`. rustc: "the trait bound `u64: Borrow<&u64>` is not
+/// satisfied", once at a direct call and once inside a closure (the shape of
+/// `.filter(|it| !set.contains(it))`), with the impl in the same crate and in a dependency, as
+/// hashbrown's is.
+#[test]
+fn a_method_where_clause_that_fails_is_e0277() {
+    let items = "pub trait Borrow<B: ?Sized> { fn borrow(&self) -> &B; }
+impl<T: ?Sized> Borrow<T> for T { fn borrow(&self) -> &T { self } }
+impl<T: ?Sized> Borrow<T> for &T { fn borrow(&self) -> &T { &**self } }
+pub trait Same { fn same(&self, other: &Self) -> bool; }
+impl Same for u64 { fn same(&self, _other: &u64) -> bool { true } }
+impl<T: ?Sized + Same> Same for &T { fn same(&self, other: &Self) -> bool { (**self).same(*other) } }
+pub trait Equivalent<K: ?Sized> { fn equivalent(&self, key: &K) -> bool; }
+impl<Q: ?Sized + Same, K: ?Sized + Borrow<Q>> Equivalent<K> for Q {
+    fn equivalent(&self, key: &K) -> bool { self.same(key.borrow()) }
+}
+pub struct Set<T>(pub T);
+impl<T> Set<T> {
+    pub fn contains<Q: ?Sized + Equivalent<T>>(&self, value: &Q) -> bool { value.equivalent(&self.0) }
+}
+";
+    let calls = "fn call<F: FnMut(&&u64) -> bool>(mut f: F, it: &&u64) -> bool { f(it) }
+fn direct(s: &Set<u64>, it: &&u64) -> bool { s.contains(it) }
+fn in_closure(s: &Set<u64>, it: &&u64) -> bool { call(|it| !s.contains(it), it) }
+";
+    let expected = [
+        "E0277: the trait bound `u64: Borrow<&u64>` is not satisfied",
+        "E0277: the trait bound `u64: Borrow<&u64>` is not satisfied",
+    ];
+    // Only the E0277s: the fixture's functions are otherwise unused.
+    let e0277 = |fixture: &str| -> Vec<String> {
+        checked(fixture).messages().into_iter().filter(|it| it.starts_with("E0277: ")).collect()
+    };
+    let same_crate =
+        format!("//- minicore: sized, fn\n//- /main.rs crate:other:main\n{items}{calls}fn main() {{}}\n");
+    assert_eq!(e0277(&same_crate), expected, "the impl in the same crate");
+    let dependency = format!(
+        "//- minicore: sized, fn\n//- /dep.rs crate:dep\n{items}//- /main.rs crate:other:main deps:dep\nuse dep::Set;\n{calls}fn main() {{}}\n"
+    );
+    assert_eq!(e0277(&dependency), expected, "the impl in a dependency");
+}
+
+/// rustc's rule for `==`: a reference on one side and a value on the other is no builtin
+/// comparison and no impl (`&u32: PartialEq<{integer}>` does not hold; core only has
+/// `&A: PartialEq<&B>`), so it is E0277, never a method call to `<&u32 as PartialEq<u32>>::eq`
+/// that codegen later finds no impl for. `blaze_lints::blaze::hashmap::check_type` had
+/// `bits == 0` with `bits: &u32` (a tracked query's default `returns(ref)`) and blaze accepted it.
+#[test]
+fn a_reference_compared_with_an_integer_is_e0277() {
+    let e0277 = |body: &str| -> Vec<String> {
+        let fixture =
+            format!("//- minicore: sized, eq, ord, builtin_impls\nfn f(bits: &u32) -> bool {{ {body} }}\nfn main() {{}}\n");
+        checked(&fixture).messages().into_iter().filter(|it| it.contains("E0277")).collect()
+    };
+    let refused = e0277("bits == 0");
+    assert_eq!(refused.len(), 1, "`&u32 == {{integer}}` is one E0277: {refused:?}");
+    assert!(refused[0].contains("&u32"), "the error names the reference type: {refused:?}");
+    assert_eq!(e0277("*bits == 0"), Vec::<String>::new(), "a deref compares two `u32`s");
+    assert_eq!(e0277("bits == &0"), Vec::<String>::new(), "`&A: PartialEq<&B>` holds");
+}
+
 /// An error blaze cannot place (a `self` parameter has no pattern for the solver's span to
 /// map to) is still rustc's error in words, naming the type, trait, parameter and item, with a
 /// note that blaze could not place it, never type checking's diagnostic printed raw.

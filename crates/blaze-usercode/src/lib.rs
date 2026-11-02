@@ -25,6 +25,7 @@ pub mod index;
 pub mod inputs;
 pub mod pool;
 pub mod pure;
+pub mod roots;
 pub mod rule;
 pub mod run;
 pub mod script;
@@ -142,6 +143,46 @@ impl Given {
     /// lent, with no copy. Named twice, the last value is kept. [`Given::sets`] and
     /// [`Given::vars`] don't name them.
     pub fn env_keyed<'a>(&mut self, vars: impl IntoIterator<Item = (&'a [u8], &'a [u8])>) -> &mut Given {
+        self.env_keyed_ported(vars, roots::Roots::none())
+    }
+
+    /// The layout of the roots the run's key is written against ([`roots::Roots::layout`]):
+    /// a part of every key whose paths or values are ported, so two checkouts share it only
+    /// when their roots sit the same way to each other, and a placeholder in what is kept
+    /// under it always names a root the run has. Hashed as it is made, with no copy.
+    pub fn roots(&mut self, roots: &roots::Roots<'_>) -> &mut Given {
+        let mut hasher = Hasher::new(Given::PART);
+        roots.layout(|piece| {
+            hasher.update(piece);
+        });
+        let hash = hasher.finish().0;
+        self.hashed("roots", hash)
+    }
+
+    /// [`Given::part`] of `bytes` written against `roots` ([`roots::Roots::port`]), hashed as it
+    /// is ported, with no copy: the same in every checkout whose roots are where its paths are.
+    pub fn ported(&mut self, name: &'static str, bytes: &[u8], roots: &roots::Roots<'_>) -> &mut Given {
+        let mut hasher = Hasher::new(Given::PART);
+        if roots.is_empty() && !bytes.contains(&0) {
+            hasher.update(bytes);
+        } else {
+            roots.port(bytes, |piece| {
+                hasher.update(piece);
+            });
+        }
+        let hash = hasher.finish().0;
+        self.hashed(name, hash)
+    }
+
+    /// [`Given::env_keyed`] with each value written against `roots` ([`roots::Roots::port`]):
+    /// a value that is a path under a root (`CARGO_MANIFEST_DIR`, `OUT_DIR`) is the same in
+    /// every checkout. With no roots, and no `\0` in a value (no environment has one), it hashes
+    /// as `env_keyed` always has.
+    pub fn env_keyed_ported<'a>(
+        &mut self,
+        vars: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+        roots: roots::Roots<'_>,
+    ) -> &mut Given {
         let hash = blaze_mem::frame::task(blaze_mem::Tag::Usercode, |frame| {
             // A name's first sixteen bytes, big-endian and padded with zeros, order as its bytes
             // do, and most comparisons end there at one compare of two words; a tie goes to
@@ -167,7 +208,13 @@ impl Given {
             let mut batched = Batched { hasher: &mut hasher, batch: [0; Batched::LEN], len: 0 };
             for (_, name, value) in &sorted {
                 batched.part(name);
-                batched.part(value);
+                if roots.touches(value) {
+                    // The bytes `Hasher::part` would hash of the ported value, ported in place.
+                    batched.put(&(roots.ported_len(value) as u64).to_le_bytes());
+                    roots.port(value, |piece| batched.put(piece));
+                } else {
+                    batched.part(value);
+                }
             }
             batched.flush();
             hasher.finish().0
@@ -210,6 +257,33 @@ impl Given {
             hasher.part(name.as_bytes()).update(hash);
         }
         hasher.finish()
+    }
+
+    /// Each part of [`Self::finish`] by name with its own hash, for `blaze why`: its kind, its
+    /// arguments, each variable by name (`env CC`), its standard input and each named part.
+    /// Made on a miss only.
+    pub fn parts(&self) -> Vec<(String, ContentId)> {
+        let one = |bytes: &[u8]| {
+            let mut hasher = Hasher::new(Given::PART);
+            hasher.part(bytes);
+            hasher.finish()
+        };
+        // alloc: once a miss, a part each part of the key
+        let mut parts = Vec::with_capacity(3 + self.env.len() + self.len);
+        parts.push(("kind".to_owned(), one(&[self.kind.byte()])));
+        let mut args = Hasher::new(Given::PART);
+        for arg in &self.args {
+            args.part(&trace::os_bytes(arg));
+        }
+        parts.push(("arguments".to_owned(), args.finish()));
+        for (name, value) in &self.env {
+            parts.push((format!("env {}", name.to_string_lossy()), one(&trace::os_bytes(value))));
+        }
+        parts.push(("standard input".to_owned(), ContentId(self.stdin)));
+        for (name, hash) in &self.parts[..self.len] {
+            parts.push(((*name).to_owned(), ContentId(*hash)));
+        }
+        parts
     }
 
     /// Whether `name` is one blaze sets, so not one to trace.

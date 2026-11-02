@@ -11,6 +11,7 @@ pub fn int_ty_to_string(ty: IntTy) -> &'static str {
         IntTy::I32 => "i32",
         IntTy::I64 => "i64",
         IntTy::I128 => "i128",
+        IntTy::Bits(_) => ty.name_str(),
     }
 }
 
@@ -22,6 +23,7 @@ pub fn uint_ty_to_string(ty: UintTy) -> &'static str {
         UintTy::U32 => "u32",
         UintTy::U64 => "u64",
         UintTy::U128 => "u128",
+        UintTy::Bits(_) => ty.name_str(),
     }
 }
 

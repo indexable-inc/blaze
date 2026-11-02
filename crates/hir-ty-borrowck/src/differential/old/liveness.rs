@@ -4,6 +4,7 @@
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::radix;
 use hir_def::{AdtId, attrs::AttrFlags};
 use rustc_type_ir::{
@@ -516,10 +517,10 @@ impl InitAtExit {
 struct DropComponents<'c, 'a, 'r, 'db> {
     ctx: &'c Ctx<'a, 'db>,
     regions: &'c Regions<'r, 'db>,
-    done: HashMap<Ty<'db>, (u32, u32)>,
+    done: HashMap<Ty<'db>, (u32, u32), Global>,
     pool: Vec<Rv>,
     /// Tarjan's: each type on the stack and its number in the walk.
-    open: HashMap<Ty<'db>, usize>,
+    open: HashMap<Ty<'db>, usize, Global>,
     stack: Vec<Ty<'db>>,
     found: Vec<Rv>,
     children: Vec<Ty<'db>>,
@@ -535,9 +536,9 @@ impl<'c, 'a, 'r, 'db> DropComponents<'c, 'a, 'r, 'db> {
         DropComponents {
             ctx,
             regions,
-            done: HashMap::default(),
+            done: HashMap::new_in(Global),
             pool: Vec::new(),
-            open: HashMap::default(),
+            open: HashMap::new_in(Global),
             stack: Vec::new(),
             found: Vec::new(),
             children: Vec::new(),
@@ -720,7 +721,7 @@ fn drop_constraint(db: &Db, adt: AdtId) -> DropConstraint {
             take_apart(db, interner, field, &mut regions, &mut whole, &mut tys);
         }
     }
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     tys.retain(|it| seen.insert(*it));
     DropConstraint {
         regions: regions.into_iter().map(|it| it.store()).collect(),

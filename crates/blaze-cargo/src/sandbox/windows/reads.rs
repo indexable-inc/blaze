@@ -35,7 +35,6 @@ use std::{
     os::windows::ffi::OsStrExt as _,
     path::Path,
     ptr::{null, null_mut},
-    sync::OnceLock,
 };
 
 use parking_lot::Mutex;
@@ -86,7 +85,11 @@ const BACKSLASH: u16 = b'\\' as u16;
 /// `\\?\`, which a final path starts with.
 const VERBATIM: [u16; 4] = [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
 
-static KEPT: OnceLock<Reads> = OnceLock::new();
+#[expect(
+    clippy::disallowed_types,
+    reason = "the checks the warm launcher process keeps for every run it launches, made once"
+)]
+static KEPT: std::sync::OnceLock<Reads> = std::sync::OnceLock::new();
 
 /// The checks the warm launcher keeps, once [`keep`] made them; none in a launcher of one run.
 pub(super) fn kept() -> Option<&'static Reads> {

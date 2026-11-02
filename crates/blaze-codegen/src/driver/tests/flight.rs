@@ -20,7 +20,7 @@ struct Slow {
 impl Prepare for Slow {
     type Frontend = Program;
     type Prepared = Prepared;
-    type Export = u8;
+    type Export = Exported;
 
     fn prepare(
         &self,
@@ -40,7 +40,7 @@ impl Prepare for Slow {
         spec: &Spec,
         prepared: &mut Prepared,
         refs: &crate::template::Refs,
-    ) -> Result<(Summary, u8), CodegenError> {
+    ) -> Result<(Summary, Exported), CodegenError> {
         self.machine.summarize(unit, spec, prepared, refs)
     }
 
@@ -50,7 +50,7 @@ impl Prepare for Slow {
         spec: &Spec,
         prepared: Prepared,
         refs: &crate::template::Refs,
-        imports: Option<(&Imports, &[Import<'_, u8>])>,
+        imports: Option<(&Imports, &[Import<'_, Exported>])>,
     ) -> Result<Emitted, CodegenError> {
         blaze_graph::spin::busy(Duration::from_millis(10));
         self.emitted.lock().push(unit.instance.key());

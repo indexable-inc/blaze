@@ -1,5 +1,5 @@
 //! Pre-type IR item generics
-use std::{ops, sync::LazyLock};
+use std::ops;
 
 use base_db::Db;
 use hir_expand::name::Name;
@@ -18,6 +18,40 @@ use crate::{
 
 pub type LocalTypeOrConstParamId = Idx<TypeOrConstParamData>;
 pub type LocalLifetimeParamId = Idx<LifetimeParamData>;
+pub type LocalBinderParamId = Idx<BinderParamData>;
+
+/// A type parameter of a where predicate's `for<..>` binder (`for<F: Field<T>>`,
+/// `#![feature(blaze_comptime)]`), not a generic parameter of the item: it takes no generic
+/// argument and counts in none of the item's lengths. Its bounds are in the generics' store.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct BinderParamData {
+    pub name: Name,
+    pub bounds: Box<[TypeBound]>,
+}
+
+/// A binder parameter of `parent`'s generics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub struct BinderParamId {
+    pub parent: GenericDefId,
+    pub local_id: LocalBinderParamId,
+}
+
+/// The binder parameters of one where predicate: a run of [`GenericParams::binder_params`].
+/// The predicates one `for<..>` binder splits into share it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct BinderParams {
+    pub start: u32,
+    pub len: u32,
+}
+
+impl BinderParams {
+    pub const EMPTY: BinderParams = BinderParams { start: 0, len: 0 };
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
 
 /// Data about a generic type parameter (to a function, struct, impl, ...).
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
@@ -184,6 +218,9 @@ pub struct GenericParams {
     pub(crate) lifetimes: Arena<LifetimeParamData>,
     pub(crate) where_predicates: Box<[WherePredicate]>,
     pub(crate) early_bound_lifetimes_len: usize,
+    /// The type parameters of the where predicates' `for<..>` binders, each predicate's a run
+    /// ([`WherePredicate::TypeBound`]'s `binder`).
+    pub(crate) binder_params: Arena<BinderParamData>,
 }
 
 impl ops::Index<LocalTypeOrConstParamId> for GenericParams {
@@ -204,18 +241,27 @@ impl ops::Index<LocalLifetimeParamId> for GenericParams {
 /// where clauses like `where T: Foo + Bar` are turned into multiple of these.
 /// It might still result in multiple actual predicates though, because of
 /// associated type bindings like `Iterator<Item = u32>`. `lifetimes` is the predicate's
-/// `for<..>` binder, a run in the store of the generics ([`ExpressionStore::names`]).
+/// `for<..>` binder, a run in the store of the generics ([`ExpressionStore::names`]); `binder` is
+/// its type parameters (`#![feature(blaze_comptime)]`), a run of
+/// [`GenericParams::binder_params`], empty without the feature.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum WherePredicate {
-    TypeBound { lifetimes: Option<Names>, target: TypeRefId, bound: TypeBound },
+    TypeBound {
+        lifetimes: Option<Names>,
+        binder: BinderParams,
+        target: TypeRefId,
+        bound: TypeBound,
+    },
     Lifetime { target: LifetimeRefId, bound: LifetimeRefId },
 }
 
-static EMPTY: LazyLock<GenericParams> = LazyLock::new(|| GenericParams {
+#[expect(clippy::disallowed_types, reason = "the process's one empty generic parameter set: callers share a static empty value")]
+static EMPTY: std::sync::LazyLock<GenericParams> = std::sync::LazyLock::new(|| GenericParams {
     type_or_consts: Arena::default(),
     lifetimes: Arena::default(),
     where_predicates: Box::default(),
     early_bound_lifetimes_len: 0,
+    binder_params: Arena::default(),
 });
 
 impl GenericParams {
@@ -224,8 +270,9 @@ impl GenericParams {
         LocalTypeOrConstParamId::from_raw(RawIdx::from_u32(0));
 
     #[inline]
+    #[expect(clippy::disallowed_types, reason = "the process's one empty generic parameter set: callers share a static empty value")]
     pub fn empty() -> &'static GenericParams {
-        LazyLock::force(&EMPTY)
+        std::sync::LazyLock::force(&EMPTY)
     }
 
     pub fn of(db: &Db, def: GenericDefId) -> &GenericParams {
@@ -364,6 +411,22 @@ impl GenericParams {
     #[inline]
     pub fn where_predicates(&self) -> &[WherePredicate] {
         &self.where_predicates
+    }
+
+    /// The binder parameters of `run` (a where predicate's `binder`), in the order written.
+    pub fn binder_params(
+        &self,
+        run: BinderParams,
+    ) -> impl ExactSizeIterator<Item = (LocalBinderParamId, &BinderParamData)> {
+        (run.start..run.start + run.len).map(|raw| {
+            let id = LocalBinderParamId::from_raw(RawIdx::from_u32(raw));
+            (id, &self.binder_params[id])
+        })
+    }
+
+    /// Every binder parameter of every where predicate.
+    pub fn iter_binder_params(&self) -> impl Iterator<Item = (LocalBinderParamId, &BinderParamData)> {
+        self.binder_params.iter()
     }
 
     /// Iterator of type_or_consts field

@@ -7,6 +7,7 @@ use base_db::{Crate, Db, all_crates};
 use blaze_alloc_count::assert_at_most;
 use blaze_format::{Aligned, HEADER_LEN, Persist};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_query::db::AsId;
 use hir_def::{
     DefWithBodyId, FunctionId, LoweringMode, deps::ImageBuf, nameres::demand::crate_body_owners,
@@ -127,7 +128,7 @@ fn a_part_reads_back_in_another_database() {
 
     open(&bytes).unwrap();
     // alloc: test setup
-    let mut parts = HashMap::default();
+    let mut parts = HashMap::new_in(Global);
     parts.insert(dep, buf(&bytes));
     set_served(&mut db, parts);
 
@@ -264,7 +265,7 @@ fn a_body_neither_recorded_nor_left_out_is_an_error() {
     let mut db = db_of(&fixture);
     let dep = crate_named(&db, "dep");
     // alloc: test setup
-    let mut parts = HashMap::default();
+    let mut parts = HashMap::new_in(Global);
     parts.insert(dep, buf(&bytes));
     set_served(&mut db, parts);
     let unwritten = DefWithBodyId::FunctionId(function(&db, dep, "unwritten"));
@@ -299,7 +300,7 @@ fn a_left_out_body_is_listed_with_why_and_not_served() {
     assert_eq!(part.left_out(&key), Some("left out by the test"));
     assert!(part.find(&key).is_none());
     // alloc: test setup
-    let mut parts = HashMap::default();
+    let mut parts = HashMap::new_in(Global);
     parts.insert(dep, buf(&bytes));
     set_served(&mut db, parts);
     assert!(served_inference(&db, area).is_none() && !served_passed(&db, area));

@@ -7,6 +7,7 @@
 // JSON text as they are, which a Windows path's `\` is not.
 #![cfg(unix)]
 #![allow(dead_code, reason = "the walk module, of which the test uses `main`")]
+#![feature(allocator_api)]
 
 #[path = "support/profiles_walk.rs"]
 mod walk;

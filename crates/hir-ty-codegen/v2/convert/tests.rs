@@ -64,7 +64,7 @@ fn requests() -> Requests {
 }
 
 fn convert(code: Code, requests: &Requests) -> Result<blaze_codegen::CompiledFunction, String> {
-    let isa = &**crate::target().expect("the host's isa");
+    let isa = &**crate::isa_for(crate::Target::for_host()).expect("the host's isa");
     let func = |_: u32, _: &FuncRequest| Ok(callee());
     let data = |index: u32, _: &DataRequest| {
         Ok(match index {

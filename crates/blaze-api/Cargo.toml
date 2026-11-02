@@ -20,6 +20,7 @@ blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-protocol.workspace = true
 blaze-query.workspace = true
+blaze-serde.workspace = true
 blaze-vfs.workspace = true
 memchr.workspace = true
 serde = { workspace = true, features = ["derive"] }

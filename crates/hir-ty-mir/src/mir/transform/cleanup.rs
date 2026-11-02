@@ -4,6 +4,7 @@
 //! storage states of its scopes are never seen by the coroutine transform there.
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_mem::{Frame, Tag, frame};
 
 use crate::mir::{
@@ -13,11 +14,11 @@ use crate::mir::{
 
 /// The cleanup blocks of `body` that do nothing but go on unwinding: only storage markers,
 /// fake reads and nops, ending in resuming the unwind or going to such a block.
-pub fn noop_landing_pads(body: &MirBody<'_>) -> HashSet<BasicBlockId> {
+pub fn noop_landing_pads(body: &MirBody<'_>) -> HashSet<BasicBlockId, Global> {
     frame::task(Tag::Mir, |frame| {
         let noop = noop_in(body, frame);
         // alloc: codegen's set, kept for the function it builds
-        let mut set = HashSet::with_capacity_and_hasher(noop.count(), Default::default());
+        let mut set = HashSet::with_capacity_in(noop.count(), Global);
         set.extend(noop.iter().map(block_id));
         set
     })

@@ -24,6 +24,8 @@ pub(crate) struct Asked {
     pub library: String,
     /// [`crate::query::BuildConfig::std`].
     pub std: String,
+    /// [`crate::query::BuildConfig::builds`].
+    pub builds: String,
     pub packages: Vec<String>,
     pub workspace: bool,
     pub exclude: Vec<String>,
@@ -101,11 +103,11 @@ pub(crate) struct Configured {
 }
 
 impl Versioned for Configured {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 5");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 6");
 }
 
 impl Versioned for Asked {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked 3");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked 4");
 }
 
 /// Reads `Cx::config`: the [`BuildConfig`] narrowed.
@@ -148,7 +150,7 @@ impl Query for Asking {
 }
 
 impl Versioned for Result<Asked, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked or not 2");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked or not 3");
 }
 
 fn configure(bytes: &[u8]) -> Configured {
@@ -190,6 +192,7 @@ fn configure(bytes: &[u8]) -> Configured {
         host: config.host,
         library: config.library,
         std: config.std,
+        builds: config.builds,
         ..Asked::default()
     };
     asked.command = Some(invocation.command);
@@ -497,6 +500,7 @@ mod tests {
             host: "x86_64-unknown-linux-gnu".to_owned(),
             library: "/rustc/0/library".to_owned(),
             std: "/s/std".to_owned(),
+            builds: "/s/build".to_owned(),
         };
         let configured = configure(&config.encode());
         let asked = configured.asked.unwrap();

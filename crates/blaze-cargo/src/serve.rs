@@ -18,16 +18,18 @@
 
 mod daemon;
 mod fetch;
+mod gc;
 mod heads;
 mod image;
 mod job;
 mod mounts;
 pub mod observe;
 mod plane;
-mod signals;
+pub(crate) mod signals;
 #[cfg(test)]
 mod tests;
 mod unit;
+pub mod why;
 mod work;
 
 use std::{
@@ -69,30 +71,42 @@ pub fn home() -> anyhow::Result<PathBuf> {
     blaze_api::client::home().map_err(anyhow::Error::msg)
 }
 
-/// Where the daemon keeps what outlives it: `$BLAZE_HOME/v2`, else `blaze/v2` in the user's
-/// cache directory (`XDG_CACHE_HOME`, or `~/.cache`). Unlike the socket it is never in
-/// `XDG_RUNTIME_DIR`, which does not outlive the session.
+/// Where the daemon keeps what outlives it: `v2` under blaze's root
+/// ([`blaze_manifest::home::root`]: `$BLAZE_HOME`, else `blaze` in the user's cache directory,
+/// `XDG_CACHE_HOME` or `~/.cache`). Unlike the socket it is never in `XDG_RUNTIME_DIR`, which
+/// does not outlive the session.
 pub fn state() -> anyhow::Result<PathBuf> {
-    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Ok(PathBuf::from(home).join("v2"));
-    }
-    if let Some(caches) = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()) {
-        return Ok(PathBuf::from(caches).join("blaze/v2"));
-    }
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    Ok(PathBuf::from(home.context("no BLAZE_HOME, XDG_CACHE_HOME or HOME says where the daemon keeps its state")?)
-        .join(".cache/blaze/v2"))
+    Ok(blaze_manifest::home::state(&root()?))
+}
+
+/// Where every workspace's default build directory is: `build` under blaze's root, beside
+/// [`state`] and not in it ([`blaze_manifest::home::builds`]).
+pub fn builds() -> anyhow::Result<PathBuf> {
+    Ok(blaze_manifest::home::builds(&root()?))
+}
+
+/// blaze's root of this process ([`blaze_manifest::home::root`]), which [`state`] and
+/// [`builds`] are under.
+fn root() -> anyhow::Result<PathBuf> {
+    blaze_manifest::home::process_root()
+        .map_err(anyhow::Error::msg)?
+        .context("no BLAZE_HOME, XDG_CACHE_HOME or HOME says where blaze keeps its state and build directories")
 }
 
 /// Where every daemon of this machine, whatever its `BLAZE_HOME`, keeps what they share:
 /// `blaze` in the user's cache directory (`XDG_CACHE_HOME`, or `~/.cache`).
 pub fn machine() -> anyhow::Result<PathBuf> {
-    if let Some(caches) = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()) {
-        return Ok(PathBuf::from(caches).join("blaze"));
-    }
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    Ok(PathBuf::from(home.context("no XDG_CACHE_HOME or HOME says where this machine's daemons share the standard library")?)
-        .join(".cache/blaze"))
+    let dir = match std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()) {
+        Some(caches) => PathBuf::from(caches).join("blaze"),
+        None => {
+            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+            PathBuf::from(home.context("no XDG_CACHE_HOME or HOME says where this machine's daemons share the standard library")?)
+                .join(".cache/blaze")
+        }
+    };
+    // A relative one is taken against the current directory, as cargo takes its homes (review
+    // round 6, C4).
+    std::path::absolute(&dir).with_context(|| format!("the machine's shared directory {} against the current directory", dir.display()))
 }
 
 /// Which blaze `exe` is: the hash of its bytes, so two builds of one commit, a dirty tree's,
@@ -450,9 +464,23 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     let build = build_of(&paths.launcher)?;
     let std = machine()?.join("std").join(format!("{:x}", build.id));
     std::fs::create_dir_all(&std).with_context(|| format!("making the standard library's shared directory {}", std.display()))?;
+    // Its lease, held for the daemon's life: no collector, this daemon's or another
+    // process's, renames the shared store away while this daemon may read or write it
+    // (docs/gc.md, "Leases"). Its record says when a daemon last started on it.
+    let _std_lease = blaze_gc::lease::Lease::hold(&std).map_err(|why| anyhow::anyhow!("the standard library's shared directory: {why}"))?;
+    if let Some(why) = blaze_gc::record::touch(&std, None, &[], blaze_gc::record::now_ns()).map_err(|why| anyhow::anyhow!(why))? {
+        tracing::warn!(target: "blaze", dir = %std.display(), "the shared store's record did not read and was written afresh: {why}");
+    }
+    let host = crate::toolchain::host()
+        .context("blaze has no target triple for this machine's architecture and system")?
+        .to_owned();
+    let toolchain = hir_ty_codegen::v2::toolchain(&host, &[], hir_ty_codegen::v2::Runs::Elsewhere)
+        .map_err(|why| anyhow::anyhow!("the toolchain proc macros are built with, for {host}: {why}"))?
+        .id;
     let options = Options {
         state: file_name(&paths.state)?,
         std: file_name(&std)?,
+        builds: file_name(&builds()?)?,
         writer: writer_of(&paths.state)?,
         socket: file_name(&paths.socket)?,
         http: args.http.zip(token),
@@ -467,9 +495,8 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
                 Err(error) => Some(Err(anyhow::anyhow!("the daemon's ${name}: {error}"))),
             })
             .collect::<anyhow::Result<_>>()?,
-        host: crate::toolchain::host()
-            .context("blaze has no target triple for this machine's architecture and system")?
-            .to_owned(),
+        host,
+        toolchain,
         color: false,
         build,
         outside: blaze_vfs::outside::dirs(),
@@ -485,6 +512,20 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     signals::catch();
     signals::record_ends();
     plane::record_panics();
+    // Each query run is progress to the stall watchdog: a check inside queries for minutes is
+    // no stall. Set once per process, so a second daemon in one (tests) finds it set by the
+    // first; a hook something else set first would leave the watchdog counting nothing.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "blaze_query's run hook is set once per process; this keeps whether this process's set took"
+    )]
+    static WATCHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*WATCHED.get_or_init(|| blaze_query::on_each_run(blaze_profile::moved).is_ok()) {
+        anyhow::bail!(
+            "blaze_query::on_each_run already has a hook other than the daemon's, so the stall \
+             watchdog would not see query runs as progress"
+        );
+    }
     let steps = Arc::new(unit::Real::new(&paths).map_err(|why| anyhow::anyhow!(why))?);
     let scratch = paths.state.join("spawn");
     let runner = plane::Runner::Threads(plane::Threads::new(options.io, options.threads));
@@ -512,7 +553,6 @@ fn run(
     runner: plane::Runner<job::Step<unit::Real>>,
     mut ready: Option<std::fs::File>,
 ) -> anyhow::Result<()> {
-    let host = options.host.clone();
     say(ready.as_mut(), Phase::State);
     let mut daemon = Daemon::start(driver, options, steps, runner)?;
     say(ready.as_mut(), Phase::Setup);
@@ -527,16 +567,23 @@ fn run(
         eprintln!("blaze serve: started: {started}");
     }
     daemon.install_store().map_err(|why| anyhow::anyhow!("the daemon's store: {why}"))?;
-    // Once a process: every expansion from here on reads the daemon's store with no lock.
-    let toolchain = hir_ty_codegen::v2::toolchain(&host, &[], hir_ty_codegen::v2::Runs::Elsewhere)
-        .map_err(|why| anyhow::anyhow!("the toolchain proc macros are built with, for {host}: {why}"))?
-        .id;
-    proc_macro_api::kept::install(proc_macro_api::kept::Expansions {
-        store: daemon.store().reader(),
-        toolchain,
-        environment: proc_macro_api::kept::Environment::new(),
-    })
-    .map_err(|why| anyhow::anyhow!("keeping proc-macro expansions: {why}"))?;
+    // What blaze keeps on disk, collected in the background (docs/gc.md): the build dirs
+    // under blaze's root and the shared stores of the machine's directory.
+    let root = builds()?.parent().map(std::path::Path::to_path_buf).context("blaze's build directories have no root")?;
+    // What no build dir may be or hold, made once here: one that does not make stops the start,
+    // named (review round 6, C5).
+    job::protected(&root).map_err(|why| anyhow::anyhow!("blaze serve: {why}"))?;
+    // `<root>/gc.json` sets the levels of free space and whether the daemon collects on its
+    // own; one that does not read stops the start.
+    let settings = blaze_gc::settings::GcSettings::read(&root, blaze_gc::pace::Levels::default()).map_err(|why| anyhow::anyhow!(why))?;
+    if settings.auto {
+        daemon.collect(gc::Gc::new(gc::areas(&root, &machine()?), &state()?, settings.levels));
+    } else {
+        eprintln!(
+            "blaze serve: {} sets \"auto\": false: the daemon collects nothing on its own (`blaze cache gc` still does when run)",
+            root.join(blaze_gc::settings::SETTINGS).display()
+        );
+    }
     // `start` bound the socket; a turn hears how the bind went, so a refused one stops here,
     // named, before the CLI is told it listens and connects at once.
     let turning = daemon.turn();

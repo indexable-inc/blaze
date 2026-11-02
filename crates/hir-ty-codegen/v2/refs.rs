@@ -16,27 +16,27 @@ use std::{borrow::Cow, hash::BuildHasher};
 use base_db::Db;
 use blaze_codegen::backend::FrontRef;
 use blaze_hash::{FixedState, HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::bits::BitSet;
 use blaze_query::db::AsId;
 use cranelift_codegen::ir::{self, ArgumentPurpose};
 use hashbrown::{HashTable, hash_table::Entry};
 use hir_def::{
-    AdtId, CallableDefId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
-    attrs::AttrFlags, signatures::FunctionSignature,
+    AdtId, CallableDefId, FunctionId, HasModule, StaticId, attrs::AttrFlags,
+    signatures::FunctionSignature,
 };
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate, PointerCast,
     db::HirDatabase,
     drop::DropGlue,
     intrinsic::{Intrinsic, intrinsic_of},
-    method_resolution::is_dyn_method,
     next_solver::{ConstKind, GenericArgs, ParamEnv, Region, RegionExt, Ty, TyKind},
     traits::StoredParamEnvAndCrate,
 };
 use hir_ty_mir::mir::{
-    AssertKind, BasicBlockId, BinOp, CastKind, InlineAsm, InlinedBody, MirBody, MirPhase, Operand,
-    OperandKind, PlaceTy, Rvalue, StatementKind, StoredPlace, TerminatorKind, interpret_mir,
-    is_by_move_coroutine,
+    AssertKind, BasicBlockId, devirt::DevirtWorld, BinOp, CastKind, InlineAsm, InlinedBody, MirBody, MirPhase, Operand,
+    OperandKind, PlaceTy, Rvalue, StatementKind, StoredPlace, TerminatorKind, dispatch,
+    interpret_mir, is_by_move_coroutine,
     location::{located_concats, track_caller},
     monomorphized_promoted_mir_body_query,
 };
@@ -48,10 +48,11 @@ use smallvec::{SmallVec, smallvec};
 use super::{
     HirInstance, Kind,
     build::Build,
+    devirt::Facts,
     places::{self, Ref},
 };
 use crate::{
-    Arch, CodegenError, FnAbi, FunctionCx, Instance, InstanceDef, Target, asm, coroutine_instance,
+    Arch, CodegenError, FnAbi, FunctionCx, Instance, InstanceDef, NarrowInt, asm,
     fn_trait_methods, fncache,
     fragment::{DataRequest, FuncTarget, Recorder},
     home::Homes,
@@ -66,16 +67,32 @@ mod tests;
 /// The types of a call's operands: inline up to eight, as nearly every call has.
 pub(super) type Tys<'db> = SmallVec<[Ty<'db>; 8]>;
 
+/// What the references of an instance are walked for: whether a unit of it MIR-inlines bodies
+/// of crates other than the library's (`Spec::mir_inline`), whose code then asks for what they
+/// call, and the program's dyn facts its body is devirtualized against
+/// ([`super::devirt::walking`]), whose direct calls it then asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct Walking {
+    pub(crate) inlined: bool,
+    pub(crate) world: Option<DevirtWorld>,
+}
+
+impl Walking {
+    /// The walk without the program's world, as every walk was before one is made.
+    pub(crate) fn plain(inlined: bool) -> Self {
+        Walking { inlined, world: None }
+    }
+}
+
 /// Everything the IR of `instance` can request, each once, in the order of its MIR: [`walked`],
-/// owned. `inlined` is whether a unit of it MIR-inlines bodies of crates other than the
-/// library's (`Spec::mir_inline`), whose code then asks for what they call.
+/// owned.
 pub(crate) fn walk(
     db: &Db,
     instance: &HirInstance,
-    inlined: bool,
+    walking: Walking,
     _: &mut Homes,
 ) -> Result<Vec<Ref>, String> {
-    listed(db, instance, inlined).map(Cow::into_owned)
+    listed(db, instance, walking).map(Cow::into_owned)
 }
 
 /// [`walk`], borrowed from the database's memo where it has one: what `prepare` places the
@@ -83,25 +100,24 @@ pub(crate) fn walk(
 pub(crate) fn listed<'db>(
     db: &'db Db,
     instance: &HirInstance,
-    inlined: bool,
+    walking: Walking,
 ) -> Result<Cow<'db, [Ref]>, String> {
     match &instance.0 {
         Kind::Allocator(forward) => Ok(Cow::Owned(super::allocator::walk(forward))),
-        _ => walked(db, instance, inlined).map(Cow::Borrowed),
+        _ => walked(db, instance, walking).map(Cow::Borrowed),
     }
 }
 
 /// Everything the IR of `instance` can request, each once, in the order of its MIR, walked once
 /// a revision ([`code_walk`], [`start_walk`]) as rustc's collector has `items_of_instance`: a
 /// second asker (`describe`, then `prepare`) gets the list of the first and allocates nothing.
-/// The list for `inlined` starts with the one without, and is the same walk where the
-/// instance's body has nothing inlined.
+/// The list for `inlined` starts with the one without.
 pub(crate) fn walked<'db>(
     db: &'db Db,
     instance: &HirInstance,
-    inlined: bool,
+    walking: Walking,
 ) -> Result<&'db [Ref], String> {
-    memo(db, instance, inlined).map(|it| it.map_or(&[][..], |it| &it.refs))
+    memo(db, instance, walking).map(|it| it.map_or(&[][..], |it| &it.refs))
 }
 
 /// The places among [`walked`] of the callees whose bodies the IR of `instance` builds in, in
@@ -110,11 +126,38 @@ pub(crate) fn walked<'db>(
 pub(crate) fn built_in<'db>(
     db: &'db Db,
     instance: &HirInstance,
-    inlined: bool,
+    walking: Walking,
 ) -> Result<&'db [u32], String> {
     match &instance.0 {
         Kind::Allocator(_) => Ok(&[]),
-        _ => memo(db, instance, inlined).map(|it| it.map_or(&[][..], |it| &it.built_in)),
+        _ => memo(db, instance, walking).map(|it| it.map_or(&[][..], |it| &it.built_in)),
+    }
+}
+
+/// What the IR of `instance` does with trait objects ([`super::devirt`]); `None` for one that
+/// names nothing.
+pub(crate) fn facts<'db>(
+    db: &'db Db,
+    instance: &HirInstance,
+    walking: Walking,
+) -> Result<Option<&'db Facts>, String> {
+    match &instance.0 {
+        Kind::Allocator(_) => Ok(None),
+        _ => memo(db, instance, walking).map(|it| it.map(|it| &it.facts)),
+    }
+}
+
+/// The digests of the dyn facts the body of `instance` read when it was devirtualized
+/// (`MirBody::inlined.devirtualized`), sorted, each once: what its code is keyed by beside its
+/// body ([`super::devirt::code`]). Empty for a walk without the program's world.
+pub(crate) fn read<'db>(
+    db: &'db Db,
+    instance: &HirInstance,
+    walking: Walking,
+) -> Result<&'db [[u8; 32]], String> {
+    match &instance.0 {
+        Kind::Allocator(_) => Ok(&[]),
+        _ => memo(db, instance, walking).map(|it| it.map_or(&[][..], |it| &it.read)),
     }
 }
 
@@ -123,13 +166,15 @@ pub(crate) fn built_in<'db>(
 pub(crate) struct Walked {
     refs: Vec<Ref>,
     built_in: Vec<u32>,
+    facts: Facts,
+    read: Vec<[u8; 32]>,
 }
 
 /// The walk of `instance`; `None` for one that names nothing.
 fn memo<'db>(
     db: &'db Db,
     instance: &HirInstance,
-    inlined: bool,
+    Walking { inlined, world }: Walking,
 ) -> Result<Option<&'db Walked>, String> {
     let walked = match &instance.0 {
         // Its assembly names nothing: `asm::wrapper` refuses a `sym`, and the backend an
@@ -148,8 +193,10 @@ fn memo<'db>(
                 && matches!(code.def, InstanceDef::Fn(_) | InstanceDef::Closure(_))
                 && super::frontend::crate_of(db, &instance.0)
                     .is_some_and(|it| !it.data(db).origin.is_lang());
+            // Only a body built with the inliner is built against the world.
+            let world = world.filter(|_| inlined);
             // clone: the query's keys by value, each a few `Copy` ids in a `Clone`-only type
-            code_walk(db, code.clone(), env.clone(), inlined)
+            code_walk(db, code.clone(), env.clone(), inlined, world)
         }
     };
     match walked {
@@ -167,8 +214,9 @@ fn code_walk<'db>(
     instance: Instance,
     env: StoredParamEnvAndCrate,
     inlined: bool,
+    world: Option<DevirtWorld>,
 ) -> Result<Walked, String> {
-    code_refs(db, &instance, &env, inlined)
+    code_refs(db, &instance, &env, inlined, world)
 }
 
 #[blaze_query::tracked(returns(ref))]
@@ -177,12 +225,14 @@ fn start_walk(db: &Db, main: FunctionId) -> Result<Walked, String> {
     scratch(db, env, None, false, |walk| walk.start_shim(main))
 }
 
-/// The walk of a function, closure, `async` body or shim, as `instance_code` builds each.
+/// The walk of a function, closure, `async` body or shim, as `instance_code` builds each;
+/// `world` is what the body with the inliner on is devirtualized against.
 fn code_refs(
     db: &Db,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
     inlined: bool,
+    world: Option<DevirtWorld>,
 ) -> Result<Walked, String> {
     let ty = || instance.args.as_ref().type_at(0);
     let shim_env = env.as_ref(db);
@@ -219,18 +269,20 @@ fn code_refs(
         _ => (false, ExternAbi::Rust, false),
     };
     // A body of the library's is inlined under `WALK` already, as in every unit; a coroutine
-    // has nothing inlined into it (`hir-ty-mir` `inline.rs`).
+    // has nothing inlined into it (`hir-ty-mir` `inline.rs`). A body with nothing inlined is
+    // walked again too: the callees it builds in are built under the unit's settings, where
+    // their own bodies are inlined.
     let written = body.owner.module(db).krate(db);
     let inlined = match inlined && !written.data(db).origin.is_lang() && body.coroutine.is_none()
     {
         true => Some(
             // clone: as above, two `Copy` ids in a `Clone`-only type
-            crate::instance_body(db, instance, env.clone(), Some(Build::WALK_INLINED))
+            crate::instance_body(db, instance, env.clone(), Some(Build { world, ..Build::WALK_INLINED }))
                 .map_err(told)?,
         ),
         false => None,
     };
-    let inlined = inlined.as_deref().filter(|it| !it.inlined.callees.is_empty());
+    let inlined = inlined.as_deref();
     // clone: `Found` owns the env the requests hold; two `Copy` ids in a `Clone`-only type
     let mut found = Found::new(env.clone(), Some(body));
     let env = env.as_ref(db);
@@ -239,10 +291,14 @@ fn code_refs(
         walk.fx.variadic = variadic;
         walk.fx.args = Some(instance.args);
         walk.outside()?;
+        walk.edge(body, abi)?;
         walk.body(body)
     })?;
     if let Some(inlined) = inlined {
-        pass(db, env, Some(inlined), tracked, (Build::WALK_INLINED, &mut found), |walk| {
+        found.read.extend_from_slice(&inlined.inlined.devirtualized);
+        found.read.sort_unstable();
+        found.read.dedup();
+        pass(db, env, Some(inlined), tracked, (Build { world, ..Build::WALK_INLINED }, &mut found), |walk| {
             walk.fx.abi = abi;
             walk.fx.variadic = variadic;
             walk.fx.args = Some(instance.args);
@@ -279,8 +335,8 @@ fn pass<'db>(
     (build, found): (Build, &mut Found<'db>),
     work: impl for<'w, 'cx> FnOnce(&mut Walk<'w, 'cx, 'db>) -> Result<(), String>,
 ) -> Result<(), String> {
-    let isa = &**crate::target().map_err(told)?;
-    let target = crate::selected_target().map_err(told)?;
+    let target = crate::target_of_crate(db, env.krate).map_err(told)?;
+    let isa = &**crate::isa_for(target).map_err(told)?;
     let mut cg = Recorder::new(db, isa, target, true);
     // The settings a walk reads are its own, never the thread's unit's: the walk is a query.
     cg.unit = Some(build);
@@ -290,7 +346,8 @@ fn pass<'db>(
         fx.aborts = false;
         fx.debug_assertions = true;
         fx.ub_checks = true;
-        let mut walk = Walk { fx, found: &mut *found, drained: (0, 0) };
+        // alloc: one pass's few built-in places, freed with the pass
+        let mut walk = Walk { fx, found: &mut *found, drained: (0, 0), built_here: Vec::new() };
         done = Some(work(&mut walk).and_then(|()| walk.drain()));
         Ok(())
     })
@@ -309,6 +366,11 @@ pub(super) struct Walk<'w, 'cx, 'db> {
     found: &'w mut Found<'db>,
     /// How many of the function and data requests of `fx.cg` are in `found.listed`.
     drained: (usize, usize),
+    /// The places of the callees this pass has built in. Each pass builds its body under its
+    /// own settings, so a callee the `WALK` pass built in is built in again by the
+    /// `WALK_INLINED` pass, whose copy of the callee's body is MIR-inlined and may call what
+    /// the first did not: `found.built_in`, shared by both, cannot say whether this pass has.
+    built_here: Vec<u32>,
 }
 
 /// What the walks of an instance's bodies found.
@@ -319,10 +381,12 @@ struct Found<'db> {
     listed: Listed,
     /// The calls listed already, by their interned definition and arguments, and the place of
     /// each: a call made again costs a hash of two ids and no homing (`places::call_ref`).
-    called: HashMap<(InstanceDef, GenericArgs<'db>), u32>,
+    called: HashMap<(InstanceDef, GenericArgs<'db>), u32, Global>,
     /// The places in `listed` of the callees whose bodies are built in ([`Walked::built_in`]),
     /// each once.
     built_in: Vec<u32>,
+    facts: Facts,
+    read: Vec<[u8; 32]>,
 }
 
 impl<'db> Found<'db> {
@@ -333,16 +397,19 @@ impl<'db> Found<'db> {
             homes: Homes::default(),
             env,
             listed: Listed::with_capacity(capacity),
-            called: HashMap::with_capacity_and_hasher(capacity, Default::default()),
+            called: HashMap::with_capacity_in(capacity, Global),
             // alloc: the memoized output, empty until a callee is built in
             built_in: Vec::new(),
+            facts: Facts::default(),
+            // alloc: the memoized output, empty but for a devirtualized body
+            read: Vec::new(),
         }
     }
 
     fn walked(self) -> Walked {
         let mut refs = self.listed.refs;
         refs.shrink_to_fit();
-        Walked { refs, built_in: self.built_in }
+        Walked { refs, built_in: self.built_in, facts: self.facts, read: self.read }
     }
 }
 
@@ -452,8 +519,8 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// builder's requests are placed: a function by its target, a static as itself or its
     /// symbol, with what Cranelift calls to reach a thread-local one.
     fn drain(&mut self) -> Result<(), String> {
-        let Walk { fx, found, drained } = self;
-        let Found { homes, listed, .. } = &mut **found;
+        let Walk { fx, found, drained, .. } = self;
+        let Found { homes, listed, facts, .. } = &mut **found;
         let db = fx.cg.db;
         let requests = &fx.cg.wants.requests;
         for request in &requests.funcs[drained.0..] {
@@ -463,6 +530,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             };
         }
         for request in &requests.datas[drained.1..] {
+            if let DataRequest::Vtable { ty, trait_ref: Some((trait_, args)), .. } = request {
+                facts.vtable(ty, *trait_, args);
+            }
             if let DataRequest::Static(id) = request {
                 listed.add(places::static_ref(db, *id)?);
                 if is_thread_local(db, *id) {
@@ -491,6 +561,35 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         Ok(())
     }
 
+    /// The object types a signature at the program's edge carries ([`Facts::foreign`]): the
+    /// function's own where its ABI is not Rust's, and each foreign function's it calls. Code
+    /// outside the program may make or take objects of them.
+    fn edge(&mut self, body: &'db MirBody<'db>, abi: ExternAbi) -> Result<(), String> {
+        let db = self.fx.cg.db;
+        let (infcx, env) = (&self.fx.infcx, self.fx.env.param_env);
+        let facts = &mut self.found.facts;
+        if !matches!(abi, ExternAbi::Rust | ExternAbi::RustCall) {
+            for &local in body.param_locals.iter().chain([&crate::returned_local(body)]) {
+                facts.foreign(infcx, env, body.locals[local].ty.as_ref());
+            }
+        }
+        for (_, block) in body.basic_blocks.iter() {
+            let Some(TerminatorKind::Call { func, .. }) = block.terminator.as_ref().map(|it| &it.kind)
+            else {
+                continue;
+            };
+            let Some((CallableDefId::FunctionId(callee), _)) = func.fn_def() else { continue };
+            if !matches!(callee.loc(db).container, hir_def::ItemContainerId::ExternBlockId(_)) {
+                continue;
+            }
+            let sig = db.callable_item_signature(callee.into()).skip_binder().skip_binder();
+            for &ty in sig.inputs_and_output.as_slice() {
+                facts.foreign(infcx, env, ty);
+            }
+        }
+        Ok(())
+    }
+
     /// A call of `def` with `args`, as `Recorder::callee` asks for it.
     pub(super) fn call(&mut self, def: InstanceDef, args: GenericArgs<'db>) -> Result<(), String> {
         self.listed_call(def, args).map(drop)
@@ -512,9 +611,19 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// The place of the callee `def` with `args`, listed where it is not yet.
     fn call_place(&mut self, def: InstanceDef, args: GenericArgs<'db>) -> Result<u32, String> {
         let db = self.fx.cg.db;
+        let wasm = self.fx.cg.target.is_wasm();
         let Found { homes, env, listed, called, .. } = &mut *self.found;
         if let Some(&at) = called.get(&(def, args)) {
             return Ok(at);
+        }
+        // A unit of a proc macro's wasm module calls the bridge's import in place of what
+        // `wasm::bridged` names (`Recorder::callee`), any other unit the function: the walk
+        // lists both.
+        if let InstanceDef::Fn(func) = def
+            && wasm
+            && let Some(import) = super::wasm::bridged(db, func)
+        {
+            listed.symbol(Cow::Borrowed(import));
         }
         let at = listed.add(places::call_ref(db, homes, def, args, env)?);
         called.insert((def, args), at);
@@ -523,6 +632,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
 
     /// Lists the callee at `at` as one whose body is built in, once.
     fn build_in(&mut self, at: u32) {
+        if !self.built_here.contains(&at) {
+            self.built_here.push(at);
+        }
         if !self.found.built_in.contains(&at) {
             self.found.built_in.push(at);
         }
@@ -554,8 +666,14 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// `always_inlinable_callee` gives one, as LLVM's always-inliner does at -O0. Its body's
     /// requests are then the caller's, listed as `declare_inlined` makes them; the callee
     /// stays listed, as a unit whose IR calls it after all (their signatures differ) needs.
+    /// Whether it is built in is asked at every call, not only where the callee is first
+    /// listed: a `become` of it lists it first and builds none in ([`Self::tail_call`]).
     fn instance_call(&mut self, def: InstanceDef, args: GenericArgs<'db>) -> Result<(), String> {
-        let Some(at) = self.listed_call(def, args)? else { return Ok(()) };
+        self.drain()?;
+        let at = self.call_place(def, args)?;
+        if self.built_here.contains(&at) {
+            return Ok(());
+        }
         let Some((instance, body)) = self.fx.always_inlinable_callee(def, args) else {
             return Ok(());
         };
@@ -732,39 +850,29 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         dst_ty: Ty<'db>,
     ) -> Result<(), String> {
         let db = self.db();
-        let lang_items = self.fx.interner.lang_items();
-        if Some(func) == lang_items.FuturePoll
-            && let Some((def, parent_args)) =
-                coroutine_instance(db, self.fx.normalize(generic_args.type_at(0)))
-        {
-            return self.emit_call(def, parent_args, arg_tys, dst_ty);
-        }
-        // Through the object's vtable, which the coercion to it listed.
-        if is_dyn_method(self.fx.interner, self.fx.env.param_env, func, generic_args).is_some() {
-            return Ok(());
-        }
-        let (callee, callee_args) = crate::impl_method(db, self.fx.env, func, generic_args)?;
-        let callee = match callee {
-            either::Either::Left(callee) => callee,
-            either::Either::Right(derived) => {
-                let derived = crate::unexpanded_derive(db, derived, generic_args.type_at(0));
+        let callee = dispatch::callee(&self.fx.infcx, self.fx.env, func, generic_args)
+            .map_err(|why| crate::no_impl_method(db, func, generic_args, why))?;
+        let (callee, callee_args) = match callee {
+            dispatch::Callee::Poll(body, parent_args) => {
+                return self.emit_call(crate::instance_def(body), parent_args, arg_tys, dst_ty);
+            }
+            // Through the object's vtable, which the coercion to it listed.
+            dispatch::Callee::Virtual => return Ok(()),
+            dispatch::Callee::Derived(impl_, method) => {
+                let derived =
+                    crate::unexpanded_derive(db, (impl_, method), generic_args.type_at(0));
                 // alloc: the error's message
                 return Err(format!("call to {derived}"));
             }
-        };
-        if callee == func
-            && let ItemContainerId::TraitId(trait_) = func.lookup(db).container
-            && let [_] = arg_tys
-        {
-            if Some(trait_) == lang_items.Clone
-                && FunctionSignature::of(db, func).name.as_str() == "clone"
-            {
+            dispatch::Callee::CloneBuiltin(_) if arg_tys.len() == 1 => {
                 return self.clone_builtin(func, dst_ty);
             }
-            if Some(trait_) == lang_items.FnPtrTrait {
-                return Ok(());
+            dispatch::Callee::FnPtr(_) if arg_tys.len() == 1 => return Ok(()),
+            dispatch::Callee::CloneBuiltin(callee_args) | dispatch::Callee::FnPtr(callee_args) => {
+                (func, callee_args)
             }
-        }
+            dispatch::Callee::Fn(callee, callee_args) => (callee, callee_args),
+        };
         self.emit_call(InstanceDef::Fn(callee), callee_args, arg_tys, dst_ty)
     }
 
@@ -854,7 +962,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         tracked: bool,
     ) -> Result<(), String> {
         let target = self.fx.cg.target;
-        if Target::current().is_wasm()
+        if target.is_wasm()
             || target.call_conv != cranelift_codegen::isa::CallConv::SystemV
             || target.arch != Arch::X86_64
         {
@@ -864,7 +972,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             self.fx.fn_abi(abi, dst_ty, arg_tys.iter().copied()).map_err(told)?;
         let mut sig = self.fx.signature(&modes, ret);
         if tracked {
-            sig.params.push(ir::AbiParam::new(crate::ptr()));
+            sig.params.push(ir::AbiParam::new(target.pointer()));
         }
         if !sig.params.iter().any(|param| param.value_type.is_float()) {
             return Ok(());
@@ -937,7 +1045,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     fn reachable(&mut self, body: &'db MirBody<'db>) -> (Blocks, Blocks) {
         let off = self.fx.checks_off(body);
         let resumes_only = match body.coroutine {
-            Some(_) => HashSet::default(),
+            Some(_) => HashSet::new_in(Global),
             None => hir_ty_mir::mir::noop_landing_pads(body),
         };
         let count = body.basic_blocks.len();
@@ -1012,17 +1120,13 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 continue;
             }
             let env = self.fx.env;
-            let allocation = (|| {
-                let constant = monomorphized_promoted_mir_body_query(
-                    db,
-                    promoted.owner,
-                    promoted.expr,
-                    promoted.args(body, self.fx.args.as_ref())?,
-                    env.store(),
-                )
-                .ok()?;
-                interpret_mir(db, constant, Some(env)).ok()?.0.ok()
-            })();
+            let Some(args) = promoted.args(body, self.fx.args.as_ref()) else { continue };
+            // A promoted constant whose MIR does not build is the IR builder's error too
+            // (`promoted_constant`), never left out of the walk.
+            let constant =
+                monomorphized_promoted_mir_body_query(db, promoted.owner, promoted.expr, args, env.store())
+                    .map_err(|error| crate::no_promoted_mir(db, promoted, error).to_string())?;
+            let allocation = interpret_mir(db, constant, Some(env)).ok().and_then(|it| it.0.ok());
             if let Some(allocation) = allocation {
                 // A constant whose data can't be made is not promoted, and leaves what it
                 // asked for before then.
@@ -1139,8 +1243,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     fn unsize_metadata(&mut self, from: Ty<'db>, to: Ty<'db>) -> Result<(), String> {
         match (from.kind(), to.kind()) {
             (TyKind::Array(..), TyKind::Slice(_)) => Ok(()),
-            // The vtable it is upcast to is in the one it has.
-            (TyKind::Dynamic(..), TyKind::Dynamic(..)) => Ok(()),
+            // The vtable it is upcast to is in the one it has; the object it becomes holds
+            // the types of the one it was ([`super::devirt`]).
+            (TyKind::Dynamic(..), TyKind::Dynamic(..)) => {
+                self.found.facts.upcast(&self.fx.infcx, self.fx.env.param_env, (from, to));
+                Ok(())
+            }
             (_, TyKind::Dynamic(..)) => {
                 if self.fx.is_unsized(from) {
                     // alloc: the error's message
@@ -1193,7 +1301,19 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 }
                 Ok(())
             }
-            TerminatorKind::Drop { place, .. } => self.drop_value(self.place_ty(place).ty),
+            TerminatorKind::Drop { place, .. } => {
+                let ty = self.place_ty(place).ty;
+                self.drop_value(ty)?;
+                // The walk reads bodies that keep every allocation (`Build::WALK`); a body of
+                // a unit that moves one to the stack drops the value the box or `Rc` held
+                // itself (`hir-ty-mir`'s `HeapToStack`), so the walk lists that drop too.
+                match hir_ty_mir::mir::heap_held(self.fx.cg.db, ty) {
+                    Some(held) if self.fx.infcx.type_is_sized_modulo_regions(self.fx.env.param_env, held) => {
+                        self.drop_value(held)
+                    }
+                    _ => Ok(()),
+                }
+            }
             TerminatorKind::Assert { msg, .. } => self.assert(msg),
             TerminatorKind::Call { func, args, destination, target, intrinsic, .. } => {
                 // A promoted call already holds its value.
@@ -1206,10 +1326,18 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 // alloc: the error's message
                 Err(format!("terminator {kind:?}"))
             }
-            // Refused as the back end refuses it: a unit with one is never compiled.
-            TerminatorKind::TailCall { .. } => {
+            TerminatorKind::TailCall { func, args, .. } => self.tail_call(func, args),
+            TerminatorKind::ComptimeFor { .. } | TerminatorKind::ComptimeNext { .. } => {
                 // alloc: the error's message
-                Err("a tail call (`become`), which blaze's back ends do not make yet".to_owned())
+                Err(format!(
+                    "{} (in {:?})",
+                    hir_ty::mir::ComptimeUnexpanded::new(
+                        hir_ty::mir::MirComptimeForm::of_terminator(kind)
+                            .expect("a comptime terminator"),
+                        "the code generator's walk",
+                    ),
+                    self.fx.body.map(|it| it.owner),
+                ))
             }
         }
     }
@@ -1217,6 +1345,20 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// The panic an `Assert` makes when it fails, which a unit makes where it checks: an
     /// overflow check is made by a unit with overflow checks only, and listed all the same.
     fn assert(&mut self, msg: &AssertKind) -> Result<(), String> {
+        // A check of an arbitrary width panics through core's `panic`, naming it
+        // (`FunctionCx::panic_if`).
+        if let AssertKind::Overflow(
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr,
+            of,
+            _,
+        )
+        | AssertKind::OverflowNeg(of)
+        | AssertKind::DivisionByZero(of)
+        | AssertKind::RemainderByZero(of) = msg
+            && NarrowInt::of(self.operand_ty(of)).is_some()
+        {
+            return self.panic(&["panicking", "panic"]);
+        }
         let name = match msg {
             AssertKind::BoundsCheck { .. } => {
                 return self.panic(&["panicking", "panic_bounds_check"]);
@@ -1250,6 +1392,66 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             AssertKind::RemainderByZero(_) => "panic_const_rem_by_zero",
         };
         self.panic(&["panicking", "panic_const", name])
+    }
+
+    /// `tail_call`: the one function a `become` jumps to, never built in. What the IR
+    /// builder refuses of the callee (`tail_call_refused`), this refuses too: a unit with it
+    /// is never compiled.
+    fn tail_call(&mut self, func: &Operand, args: &[Operand]) -> Result<(), String> {
+        let fn_ty = self.operand_ty(func);
+        self.operands(args)?;
+        if let TyKind::FnPtr(..) = fn_ty.kind() {
+            if fn_ty.fn_sig(self.fx.interner).c_variadic() {
+                // alloc: the error's message
+                return Err(format!("a tail call (`become`) through a C-variadic `{fn_ty:?}`"));
+            }
+            return self.operand(func).map(drop);
+        }
+        let TyKind::FnDef(def, generic_args) = fn_ty.kind() else {
+            // alloc: the error's message
+            return Err(format!("a tail call (`become`) of {fn_ty:?}"));
+        };
+        let generic_args = generic_args.skip_binder();
+        let CallableDefId::FunctionId(func) = def.0 else {
+            // alloc: the error's message
+            return Err(format!("a tail call (`become`) of a constructor, {fn_ty:?}"));
+        };
+        let db = self.db();
+        if let Some(why) = crate::tail_call_refused(db, self.fx.cg.target, self.fx.interner, func) {
+            return Err(why);
+        }
+        let callee = dispatch::callee(&self.fx.infcx, self.fx.env, func, generic_args)
+            .map_err(|why| crate::no_impl_method(db, func, generic_args, why))?;
+        match callee {
+            dispatch::Callee::Fn(callee, callee_args) if track_caller(db, callee) => {
+                let def = CallableDefId::FunctionId(callee).into();
+                let item = Ty::new_fn_def(self.fx.interner, def, callee_args);
+                let args = GenericArgs::new_from_slice(&[item.into()]);
+                self.call(InstanceDef::ReifyShim { receiver: false }, args)
+            }
+            dispatch::Callee::Fn(callee, callee_args) => {
+                self.call(InstanceDef::Fn(callee), callee_args)
+            }
+            dispatch::Callee::Poll(body, parent_args) => {
+                self.call(crate::instance_def(body), parent_args)
+            }
+            dispatch::Callee::Virtual if track_caller(db, func) => {
+                let name = FunctionSignature::of(db, func).name.as_str().to_owned();
+                // alloc: the error's message
+                Err(format!(
+                    "a tail call (`become`) through a vtable of `{name}`, which is `#[track_caller]`"
+                ))
+            }
+            // Through the object's vtable, which the coercion to it listed.
+            dispatch::Callee::Virtual => Ok(()),
+            dispatch::Callee::Derived(..)
+            | dispatch::Callee::CloneBuiltin(_)
+            | dispatch::Callee::FnPtr(_) => {
+                let name = FunctionSignature::of(db, func).name.as_str().to_owned();
+                // alloc: the error's message
+                Err(format!("a tail call (`become`) of `{name}`, which is no function to jump to"))
+            }
+        }
     }
 
     /// `call_with`: what a call terminator calls, as the IR builder sorts it out.
@@ -1347,7 +1549,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 return Err(format!("intrinsic `{intrinsic}`, which has no body to run"));
             }
         }
-        if let Some(name) = crate::link_name(db, func)
+        if let Some(name) = crate::link_name_for(db, self.fx.cg.target, func)
             && let Some(name) = name.strip_prefix("llvm.")
         {
             return self.llvm_intrinsic(name, args, dst_ty);
@@ -1592,8 +1794,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     fn start_shim(&mut self, main: FunctionId) -> Result<(), String> {
         let interner = self.fx.interner;
         let Some(start) = interner.lang_items().Start else {
+            let krate = crate::fncache::crate_name(self.db(), main.krate(self.db()));
             // alloc: the error's message
-            return Err("no `lang_start`".to_owned());
+            return Err(format!(
+                "the C `main` of crate `{krate}`: no `start` lang item (std's `lang_start`) in \
+                 the crates `{krate}` loads, which its `main` is handed to"
+            ));
         };
         let fn_ty = |func: FunctionId, args| {
             Ty::new_fn_def(interner, CallableDefId::FunctionId(func).into(), args)

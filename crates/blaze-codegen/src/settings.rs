@@ -24,6 +24,19 @@ pub enum DebugInfo {
     Full,
 }
 
+impl DebugInfo {
+    /// Whether a function built at this level tells a debugger of its named locals, each with
+    /// its type. The one predicate both the code generator (which builds the told variables
+    /// into the shape and side table) and the front end (which keys a generic by its exact
+    /// arguments when they are told) read, so the key and the shape can't disagree (rule 18).
+    pub fn tells_locals(self) -> bool {
+        match self {
+            DebugInfo::None | DebugInfo::LineTablesOnly => false,
+            DebugInfo::Limited | DebugInfo::Full => true,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Relocation {
     /// Position-independent: what every executable blaze links is.
@@ -37,6 +50,9 @@ pub enum Relocation {
 pub struct Toolchain {
     /// The pinned nightly's and blaze's own code identity (`harness/toolchain` and the hash of
     /// the blaze executable, `hir_ty_codegen::v2::build`): another blaze is other code.
+    /// TEMPORARY: the executable's hash stands in for the code generator's CodeId
+    /// (`fn_info(..).code_id`) until that exists; see `temporary_executable_id` in
+    /// `hir_ty_codegen::v2::toolchain` and docs/v2/plan/design/code-identity.md.
     pub id: ContentId,
     /// The target triple.
     pub target: String,
@@ -178,6 +194,20 @@ pub struct Spec {
     /// code is never a plain one's.
     pub sanitize: Sanitize,
     pub pgo: Pgo,
+    /// The code is a proc macro's wasm module's, which `blaze-macro-eval`'s host runs: what
+    /// std asks the platform for and the host answers (`RandomState`'s keys) is the
+    /// `blaze_proc_macro` bridge's import, in place of std's body.
+    pub proc_macro_bridge: bool,
+    /// The program the function is linked into observes no allocation: its global allocator
+    /// is std's (no `#[global_allocator]`, or one of `std::alloc::System`). An allocation of
+    /// the function's MIR that never leaves it may then live on its stack instead
+    /// (`hir-ty-mir`'s `HeapToStack`), which changes the function's code. Never set for std's
+    /// functions, which move nothing ([`crate::plan::Policy::heap_to_stack`]).
+    pub heap_to_stack: bool,
+    /// The function is built for the report of what its optimized code still does in its
+    /// loops (lint `blaze::vecreport`, `hir_ty_codegen::v2::report`): LLVM is given its lines
+    /// on every format and its remarks are caught. Only LLVM's units have it.
+    pub report: bool,
 }
 
 impl Spec {
@@ -194,6 +224,9 @@ impl Spec {
             mir_inline,
             sanitize,
             pgo,
+            proc_macro_bridge,
+            heap_to_stack,
+            report,
         } = self;
         let Toolchain {
             id,
@@ -237,6 +270,8 @@ impl Spec {
             *fold as u8,
             *counted as u8,
             *mir_inline as u8,
+            *proc_macro_bridge as u8,
+            *heap_to_stack as u8,
         ]);
         let Sanitize { sanitizers, recover, track_origins, coverage } = sanitize;
         hasher.update(&[sanitizers.0, recover.0, *track_origins, coverage.level]);
@@ -246,6 +281,10 @@ impl Spec {
             Pgo::Generate => hasher.update(&[1]),
             Pgo::Use(profile) => hasher.update(&[2]).id(profile),
         };
+        // Last and only when on: every function built without the report keeps its key.
+        if *report {
+            hasher.update(b"vecreport");
+        }
         Settings(hasher.finish())
     }
 
@@ -285,6 +324,9 @@ mod tests {
             mir_inline: false,
             sanitize: Sanitize::default(),
             pgo: Pgo::None,
+            proc_macro_bridge: false,
+            report: false,
+            heap_to_stack: false,
         }
     }
 
@@ -321,6 +363,8 @@ mod tests {
             |it| it.sanitize.coverage.flags = Coverage::PC_TABLE,
             |it| it.pgo = Pgo::Generate,
             |it| it.pgo = Pgo::Use(ContentId([5; 32])),
+            |it| it.proc_macro_bridge = true,
+            |it| it.heap_to_stack = true,
         ];
         let mut seen = std::collections::BTreeSet::from([base.settings()]);
         for change in changes {

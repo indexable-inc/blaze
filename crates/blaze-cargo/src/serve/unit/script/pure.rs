@@ -25,11 +25,15 @@ use blaze_units::schema::Mode;
 use blaze_usercode::{
     inputs::Disk,
     pure::{self, Places, Proof, Read},
+    roots::RootMap,
     run::Value,
 };
 
-use super::{Of, compile_of, inherited, named_program, script_unit};
-use crate::serve::unit::{Job, UnitReader, error::UnitError};
+use super::{Of, compile_of, inherited, named_program, run_roots, script_unit};
+use crate::serve::{
+    unit::{Job, UnitReader, error::UnitError},
+    work::RunPuts,
+};
 
 /// The job's variable that asks a script whose pure key hit built and run as well, and checked
 /// against the kept value: `verify`, or unset.
@@ -64,13 +68,18 @@ pub(crate) enum Purity {
 #[derive(Debug)]
 pub(crate) struct Pure {
     pub(crate) proof: Proof,
-    /// Each run of the script, by its unit, with the kept value its pure key found, if any.
-    pub(crate) runs: Vec<(usize, Option<Value>)>,
+    /// Each run of the script, by its unit, with what its pure key found, if anything: the
+    /// kept value, and whether it was verified across checkouts.
+    pub(crate) runs: Vec<(usize, Option<pure::Hit>)>,
 }
 
 impl Pure {
-    fn hit(&self, run: usize) -> Option<&Value> {
+    fn found(&self, run: usize) -> Option<&pure::Hit> {
         self.runs.iter().find(|it| it.0 == run).and_then(|it| it.1.as_ref())
+    }
+
+    fn hit(&self, run: usize) -> Option<&Value> {
+        self.found(run).map(|it| &it.value)
     }
 
     fn all_hit(&self) -> bool {
@@ -102,9 +111,17 @@ pub(crate) fn unbuilt(job: &Job, reader: &UnitReader, unit: usize) -> Result<boo
     if !u.target.is_custom_build() || matches!(u.mode, Mode::RunCustomBuild) || job.sandbox_off() {
         return Ok(false);
     }
-    let verify = verifies(job)?;
+    // `BLAZE_SCRIPT_CACHE=check` reruns what the store kept, a pure key's hit among it.
+    let verify = verifies(job)? || super::rechecks(job)?;
     let Some(slot) = job.pure.get(unit) else { return Ok(false) };
     if slot.get().is_none() {
+        // Named for the script it proves (`serde v1.0.219 (build script)`): every build
+        // script's target is `build-script-build`, so the crate alone can't tell two apart.
+        // alloc: once per build script, the name its span carries
+        let name = crate::serve::unit::compile::span_unit(u);
+        let krate = u.target.name.as_str();
+        let _span =
+            tracing::info_span!(target: "blaze", "build script purity", krate, unit = name.as_str()).entered();
         let worked = work_out(job, reader, unit)?;
         let _ = slot.set(worked);
     }
@@ -114,7 +131,7 @@ pub(crate) fn unbuilt(job: &Job, reader: &UnitReader, unit: usize) -> Result<boo
 /// Whether compile `unit` built nothing because its runs hit ([`unbuilt`], already asked): then
 /// it keeps no record.
 pub(crate) fn built_nothing(job: &Job, unit: usize) -> bool {
-    !verifies(job).unwrap_or(true) && of(job, unit).is_some_and(Pure::all_hit)
+    !verifies(job).unwrap_or(true) && !super::rechecks(job).unwrap_or(true) && of(job, unit).is_some_and(Pure::all_hit)
 }
 
 fn work_out(job: &Job, reader: &UnitReader, compile: usize) -> Result<Purity, ApiError> {
@@ -123,7 +140,12 @@ fn work_out(job: &Job, reader: &UnitReader, compile: usize) -> Result<Purity, Ap
     // Not proved, so built and run in the sandbox as any script: the proof is asked of a free
     // `main` only.
     let Some(main) = hir_ty_pure::main_of(db, krate) else { return Ok(Purity::Unproved) };
-    let purity = hir_ty::attach_db(db, || hir_ty_pure::script_purity(db, main));
+    let purity = {
+        // The walk from `main` over every instance it reaches: the part of the span above
+        // that is not the store's lookups below.
+        let _span = tracing::info_span!(target: "blaze", "build script proof").entered();
+        hir_ty::attach_db(db, || hir_ty_pure::script_purity(db, main))
+    };
     let proved = match purity {
         hir_ty_pure::Purity::Pure(proved) => proved,
         // alloc: once per impure script: what the build's report says of it
@@ -137,6 +159,7 @@ fn work_out(job: &Job, reader: &UnitReader, compile: usize) -> Result<Purity, Ap
         writes: proved.effects.has(hir_ty_pure::Effects::WRITE),
         prints: proved.effects.has(hir_ty_pure::Effects::PRINT),
     };
+    let _span = tracing::info_span!(target: "blaze", "build script pure lookup").entered();
     let units = job.units();
     let mut runs = Vec::new(); // alloc: once per pure script, one entry per run of it
     for run in 0..units.graph.units.len() {
@@ -147,7 +170,8 @@ fn work_out(job: &Job, reader: &UnitReader, compile: usize) -> Result<Purity, Ap
         let (unit, env) = run_of(job, run)?;
         let mut disk = Disk::new(script_env(&unit, &env)?);
         let guard = blaze_cas::enter();
-        let found = pure::find(&job.input.store, &guard, &proof, &mut disk)
+        let roots = run_roots(job, &unit);
+        let found = pure::find_hit(&job.input.store, &guard, &proof, roots.view(), &mut disk)
             .map_err(|what| ApiError::new(what, Some(unit.package.descr())))?;
         runs.push((run, found));
     }
@@ -213,10 +237,46 @@ pub(crate) fn check(job: &Job, run: usize, unit: &bs::Unit, traced: &Traced) -> 
     Some(pure::check(&unit.package.descr(), &pure.proof, &places, traced).map_err(|it| it.0))
 }
 
+/// Run `run` of a pure script whose pure key found a value verified across checkouts, run
+/// again (`BLAZE_SCRIPT_CACHE=check`, `BLAZE_PURE=verify`), against that value
+/// ([`pure::retract`]): when it gave otherwise, the record that the value depends on where its
+/// roots are is put, and how it differs is given with the record's ticket, durable before the
+/// run is reported done. None when its script is not pure, its pure key missed, the hit was
+/// this checkout's own, or the run gave the same. An error carries what landed before it.
+pub(crate) fn retract(
+    job: &Job,
+    run: usize,
+    unit: &bs::Unit,
+    store: &mut Store,
+    roots: &RootMap,
+    value: &Value,
+) -> Result<Option<(String, RunPuts)>, (String, RunPuts)> {
+    let Some(pure) = compile_of(job.units(), run).and_then(|compile| of(job, compile)) else { return Ok(None) };
+    let Some(hit) = pure.found(run) else { return Ok(None) };
+    match pure::retract(store, &pure.proof, roots.view(), hit, value) {
+        Ok(None) => Ok(None),
+        Ok(Some((what, tickets))) => {
+            // Every put of the record, each segment's last: one ticket alone bounds only its own.
+            let mut puts = RunPuts { retracted: true, ..RunPuts::default() };
+            puts.kept(tickets);
+            Ok(Some((what, puts)))
+        }
+        Err(not) => {
+            // alloc: the edge: the error the build stops with
+            let what = format!("the build script of `{}`: retracting its pure key's verified result: {:?}", unit.package.descr(), not.error);
+            Err((what, landed(not)))
+        }
+    }
+}
+
 /// Keeps `value`, the result of run `run` of `unit`'s pure script, under its pure key, after
 /// checking what it printed and wrote against its proof; `checked` is what [`check`] said of
 /// its trace. A run that failed is not kept, as no failed run is; a trace that showed an effect
-/// the proof said absent is an error whether it failed or not.
+/// the proof said absent is an error whether it failed or not. `roots` are the run's prepared
+/// ones (its spec's), never made again here: a root's links are compared with how they were
+/// as it was prepared ([`blaze_usercode::roots::Roots::relinked`]). The ticket of a record that
+/// the run depends on where its roots are, when one was put: durable before the run is
+/// reported done. An error carries what landed before it.
 pub(crate) fn keep(
     job: &Job,
     run: usize,
@@ -224,18 +284,35 @@ pub(crate) fn keep(
     checked: Option<Result<Read, String>>,
     store: &mut Store,
     disk: &mut Disk,
+    roots: &RootMap,
     value: &Value,
-) -> Result<(), String> {
-    let Some(checked) = checked else { return Ok(()) };
-    let read = checked?;
+) -> Result<RunPuts, (String, RunPuts)> {
+    let Some(checked) = checked else { return Ok(RunPuts::default()) };
+    let read = checked.map_err(|what| (what, RunPuts::default()))?;
     if !value.succeeded() {
-        return Ok(());
+        return Ok(RunPuts::default());
     }
-    let Some(pure) = compile_of(job.units(), run).and_then(|compile| of(job, compile)) else { return Ok(()) };
+    let Some(pure) = compile_of(job.units(), run).and_then(|compile| of(job, compile)) else { return Ok(RunPuts::default()) };
     let script = unit.package.descr();
-    pure::checked_value(&script, &pure.proof, value).map_err(|it| it.0)?;
-    pure::keep(store, &pure.proof, read, disk, value)
-        .map(|_| ())
-        // alloc: the edge: the error the build stops with
-        .map_err(|error| format!("the build script of `{script}`: keeping its result under its pure key: {error:?}"))
+    pure::checked_value(&script, &pure.proof, value).map_err(|it| (it.0, RunPuts::default()))?;
+    pure::keep(store, &pure.proof, roots.view(), read, disk, value)
+        .map(|kept| {
+            let mut puts = RunPuts::default();
+            puts.kept(kept.tickets);
+            puts.retraction(kept.retracted);
+            puts
+        })
+        .map_err(|not| {
+            // alloc: the edge: the error the build stops with
+            let what = format!("the build script of `{script}`: keeping its result under its pure key: {:?}", not.error);
+            (what, landed(not))
+        })
+}
+
+/// What a keep that failed part way put before it did: its tickets, waited for as any put's.
+fn landed(not: blaze_usercode::roots::verify::NotKept) -> RunPuts {
+    let mut puts = RunPuts::default();
+    puts.kept(not.tickets);
+    puts.retraction(not.retracted);
+    puts
 }

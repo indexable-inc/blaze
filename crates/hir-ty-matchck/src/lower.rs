@@ -675,6 +675,38 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
 
     /// `const_to_pat`'s valtree construction and `valtree_to_pat` over a value's bytes, in one
     /// walk: what either refuses goes to `refusals`, and the part refused becomes opaque.
+    /// A constant of the `#[blaze::bits]` struct `id`, whose bytes are its backing integer:
+    /// each field's bits, read out and widened back into the bytes a value of the field's type
+    /// has (sign-extended where the field is signed), so the fields take part in exhaustiveness
+    /// as a plain struct's do.
+    #[expect(clippy::too_many_arguments, reason = "`value_pat`'s, and the struct")]
+    fn bits_value_pat(
+        &self,
+        pat: PatId,
+        ty: Ty<'db>,
+        id: hir_def::StructId,
+        args: GenericArgs<'db>,
+        bytes: &[u8],
+        map: &MemoryMap<'db>,
+        depth: u32,
+        refusals: &mut Refusals,
+        refused: bool,
+    ) -> Result<Pat<'a, 'db>, LowerError> {
+        let bits = hir_ty::layout::bits_layout(self.cx.db, id).map_err(|_| LowerError::Failed)?;
+        let backing = read_uint(bytes).ok_or(LowerError::Failed)?;
+        // alloc: the fields `DeconstructedPat::new` takes, for a const's value only.
+        let mut lowered = Vec::new();
+        for (fid, field_ty) in self.cx.variant_fields(args, id.into()) {
+            let field = bits.field(fid).ok_or(LowerError::Failed)?;
+            let size = self.layout_size(field_ty)?;
+            let le = field.read(backing).to_le_bytes();
+            let field_bytes = le.get(..size).ok_or(LowerError::Failed)?;
+            lowered.push(self.value_pat(pat, field_ty, field_bytes, map, depth + 1, refusals, refused)?);
+        }
+        let arity = lowered.len();
+        Ok(Self::new_pat(Constructor::Struct, fields_of(lowered), arity, ty, pat))
+    }
+
     fn value_pat(
         &self,
         pat: PatId,
@@ -738,6 +770,9 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                 Self::new_pat(Constructor::Struct, fields_of(lowered), arity, ty, pat)
             }
             TyKind::Adt(def, args) => match def.def_id() {
+                AdtId::StructId(id) if hir_ty::layout::is_bits_struct(db, id) => {
+                    self.bits_value_pat(pat, ty, id, args, bytes, map, depth, refusals, refused)?
+                }
                 AdtId::StructId(id) => {
                     let layout = db
                         .layout_of_adt(id.into(), args.store(), env)

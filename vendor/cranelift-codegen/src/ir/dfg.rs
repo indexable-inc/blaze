@@ -208,6 +208,9 @@ impl DataFlowGraph {
         self.constants.clear();
         self.immediates.clear();
         self.jump_tables.clear();
+        // blaze: upstream leaves the last function's exception tables here, which a reused
+        // `Context` then hands the next function built in it (vendor/cranelift-codegen/SOURCE.md).
+        self.exception_tables.clear();
         self.mem_flags.clear();
         self.alias_regions.clear();
     }

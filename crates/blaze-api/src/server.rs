@@ -30,6 +30,7 @@ use std::{fmt, net::SocketAddr};
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, FileName, Tag};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_protocol::cbor;
 
@@ -93,8 +94,8 @@ pub struct Server {
     token: Option<String>,
     most_connections: usize,
     listeners: Vec<Listener>,
-    pending: HashMap<Tag, Pending>,
-    conns: HashMap<Conn, Connection>,
+    pending: HashMap<Tag, Pending, Global>,
+    conns: HashMap<Conn, Connection, Global>,
     failed: Option<String>,
     stopped: bool,
     /// What arrived, handed over at the end of the next [`Server::complete`].
@@ -183,8 +184,8 @@ impl Server {
             token: None,
             most_connections: config.most_connections,
             listeners,
-            pending: HashMap::default(),
-            conns: HashMap::default(),
+            pending: HashMap::new_in(Global),
+            conns: HashMap::new_in(Global),
             failed: None,
             stopped: false,
             told,

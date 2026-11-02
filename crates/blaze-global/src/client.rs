@@ -27,6 +27,7 @@ use crate::{
     tls::{Channel, Channels, TlsClient},
     wire::{self, BATCH_MOST, BODY_MOST, Fields as _, RecvWindow, SendWindow},
 };
+use std::alloc::Global;
 
 /// The most connections to the cache at once: enough that their receive windows (about
 /// 6 MiB each) cover a 10 Gbit/s link at 50 ms. As many are opened as what is queued takes.
@@ -86,7 +87,7 @@ pub struct Client<C: Channels = TlsClient> {
     /// In [`Client::fetch_many`]: what the store asks waits to be asked together.
     batching: bool,
     /// The records of verified manifests.
-    listed: ByHash<Key, Record>,
+    listed: ByHash<Key, Record, Global>,
     published: Vec<Published>,
     got: Vec<GotBundle>,
     /// The store's completions that came of a call with no completions to return (a fetch
@@ -179,7 +180,7 @@ impl<C: Channels> Client<C> {
             bundles: VecDeque::new(),
             allowed: None,
             batching: false,
-            listed: ByHash::default(),
+            listed: ByHash::new_in(Global),
             // alloc: setup: once a client.
             published: Vec::new(),
             // alloc: setup: once a client.
@@ -196,7 +197,9 @@ impl<C: Channels> Client<C> {
     }
 
     /// Asks `store` to fetch `public` through the cache: `None` when it has the value or is
-    /// fetching it. The store's completion is among what [`Client::complete`] returns.
+    /// fetching it. The store's completion is among what [`Client::complete`] returns. A value
+    /// no machine may publish ([`crate::public::fetchable`]) is refused before the store keeps
+    /// it, so no build reads it.
     pub fn fetch(&mut self, store: &mut Store, public: &Public, effects: &mut Vec<Effect>) -> Option<Tag> {
         self.fetch_many(store, std::iter::once(public), effects).pop().map(|(_, tag)| tag)
     }
@@ -215,7 +218,7 @@ impl<C: Channels> Client<C> {
         for public in publics {
             let key = public.key();
             self.allowed = Some(key);
-            tags.extend(store.fetch(&key, self, effects).map(|tag| (key, tag)));
+            tags.extend(store.fetch(&key, self, crate::public::fetchable, effects).map(|tag| (key, tag)));
         }
         self.allowed = None;
         self.batching = false;
@@ -224,7 +227,9 @@ impl<C: Channels> Client<C> {
     }
 
     /// Publishes `value` as the value of `public`, signed by `publisher`, unless it holds one
-    /// of `secrets`; how it went comes through [`Client::published`] with the tag returned.
+    /// of `secrets` or is a value no machine may fetch ([`crate::public::fetchable`]: one
+    /// verified across checkouts, whose retraction would be this machine's alone); how it went
+    /// comes through [`Client::published`] with the tag returned.
     pub fn publish(
         &mut self,
         public: &Public,
@@ -234,6 +239,7 @@ impl<C: Channels> Client<C> {
         effects: &mut Vec<Effect>,
     ) -> Result<Tag, Private> {
         secrets.check(public.key(), &value)?;
+        crate::public::fetchable(public.kind(), &value).map_err(|why| Private { key: public.key(), why })?;
         let signed = publisher.sign(Record::of(public.key(), public.kind(), &value));
         let tag = self.tags.next();
         self.publishes.push_back((tag, signed, value));
@@ -650,7 +656,7 @@ fn answer(
     asked: Asked,
     body: &[u8],
     trust: &Trust,
-    listed: &mut ByHash<Key, Record>,
+    listed: &mut ByHash<Key, Record, Global>,
     window: &mut RecvWindow,
     fetches: &mut VecDeque<(Tag, Key)>,
     outcomes: &mut Outcomes<'_>,
@@ -757,7 +763,7 @@ fn fetched(
     answered: &mut usize,
     reader: &mut Reader<'_>,
     trust: &Trust,
-    listed: &ByHash<Key, Record>,
+    listed: &ByHash<Key, Record, Global>,
     window: &mut RecvWindow,
     fetches: &mut VecDeque<(Tag, Key)>,
     outcomes: &mut Outcomes<'_>,

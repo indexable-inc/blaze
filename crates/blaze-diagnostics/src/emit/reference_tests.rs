@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use annotate_snippets::{AnnotationKind, Group, Patch, Renderer, Snippet};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::radix;
 use hegel::TestCase;
 use hegel::generators as gs;
@@ -22,7 +23,7 @@ use crate::model::{
 const MAX_SUGGESTIONS: usize = 4;
 
 pub(super) struct Sources {
-    files: HashMap<String, Option<Arc<File>>>,
+    files: HashMap<String, Option<Arc<File>>, Global>,
 }
 
 pub(super) struct File {

@@ -10,6 +10,7 @@
 
 use blaze_format::cursor::Reader;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use cranelift_codegen::gimli::{
     self, DW_AT_GNU_addr_base, DW_AT_GNU_dwo_id, DW_AT_GNU_dwo_name, DW_AT_GNU_ranges_base,
     DW_AT_comp_dir, DW_AT_low_pc, DW_AT_ranges, DW_AT_stmt_list, DW_CHILDREN_no,
@@ -109,9 +110,9 @@ pub(super) struct Split {
     /// Of the unit being added, as [`Split::locations`] finds them: the place among the
     /// relocations of its location lists of the one at each offset, the place in
     /// `.debug_addr` of each address they name, and where each list is now by where it was.
-    loc_relocs: HashMap<u64, usize>,
-    indices: HashMap<(u32, i64), u64>,
-    lists: HashMap<i64, usize>,
+    loc_relocs: HashMap<u64, usize, Global>,
+    indices: HashMap<(u32, i64), u64, Global>,
+    lists: HashMap<i64, usize, Global>,
     files: Vec<Sidecar>,
 }
 
@@ -133,9 +134,9 @@ impl Split {
             ranges: SectionWriter::default(),
             addr: SectionWriter::default(),
             loc_apart: SectionWriter::default(),
-            loc_relocs: HashMap::default(),
-            indices: HashMap::default(),
-            lists: HashMap::default(),
+            loc_relocs: HashMap::new_in(Global),
+            indices: HashMap::new_in(Global),
+            lists: HashMap::new_in(Global),
             // alloc: once per object, one file pushed for each unit of up to 256 functions
             files: Vec::new(),
         }

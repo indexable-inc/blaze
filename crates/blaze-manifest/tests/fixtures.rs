@@ -69,14 +69,20 @@ fn read(fixture: &Path, scratch: &Path) -> String {
         }
         Err(_) => root.clone(),
     };
-    let env = [("CARGO_HOME".to_owned(), home.display().to_string())];
+    // blaze's root, where the workspace's build directory is: `$BLAZE_HOME/build/<name>-<id>`
+    // in what is printed.
+    let blaze_home = scratch.join("blaze-home");
+    let env = [
+        ("CARGO_HOME".to_owned(), home.display().to_string()),
+        ("BLAZE_HOME".to_owned(), blaze_home.display().to_string()),
+    ];
     let result = (|| {
         let ctx = Context::new(Config::load(&cwd, env, &[])?);
         let manifest = root_manifest(None, &ctx)?;
         let ws = Workspace::new(&manifest, &ctx)?;
         let mut out = Vec::new();
         let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
-        export_no_deps(&ws)
+        export_no_deps(&ws)?
             .serialize(&mut serde_json::Serializer::with_formatter(&mut out, formatter))?;
         anyhow::Ok(String::from_utf8(out)?)
     })();
@@ -94,7 +100,35 @@ fn read(fixture: &Path, scratch: &Path) -> String {
             String::from_utf8(out).unwrap()
         }
     };
+    let builds = blaze_manifest::home::builds(&blaze_home).display().to_string();
+    let text = text.replace(&builds, "$BLAZE_HOME/build");
+    // The build directory's id is a digest of where the scratch copy is: `<name>-ID` in what
+    // is kept.
+    let text = workspace_ids(&text);
     text.replace(&root, "$ROOT").replace(&home, "$CARGO_HOME") + "\n"
+}
+
+/// `text` with each `$BLAZE_HOME/build/<name>-<32 hex digits>` as `$BLAZE_HOME/build/<name>-ID`.
+fn workspace_ids(text: &str) -> String {
+    const AT: &str = "$BLAZE_HOME/build/";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(AT) {
+        let (before, after) = rest.split_at(at + AT.len());
+        out.push_str(before);
+        let end = after.find(|it: char| it == '"' || it == '/').unwrap_or(after.len());
+        let name = &after[..end];
+        match name.rsplit_once('-') {
+            Some((prefix, id)) if id.len() == 32 && id.bytes().all(|it| it.is_ascii_hexdigit()) => {
+                out.push_str(prefix);
+                out.push_str("-ID");
+            }
+            _ => out.push_str(name),
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[test]

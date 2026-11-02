@@ -21,6 +21,7 @@ use hir_def::{
     GenericParamId, ImplId, LifetimeParamId, StructId, TraitId, TupleFieldId, TupleId, TypeAliasId,
     TypeOrConstParamId, TypeParamId, UnionId, VariantId,
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinType, BuiltinUint},
+    expr_store::ComptimeForm,
     hir::{
         ArithOp, BinaryOp, BindingId, ExprId, ExprOrPatId, ExprOrPatIdPacked, PatId, UnaryOp,
         UnsafeBinderCastKind,
@@ -32,7 +33,7 @@ use intern::Symbol;
 use la_arena::{Idx, RawIdx};
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
-use rustc_type_ir::{ClausePolarity, ClosureKind};
+use rustc_type_ir::{ClausePolarity, ClosureKind, inherent::IntoKind, reflect::ReflectedDomain};
 
 use crate::{
     Span,
@@ -40,7 +41,8 @@ use crate::{
     db::{AnonConstId, InternedOpaqueTyId},
     infer::{
         Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, CallArguments,
-        CaptureInfo, CaptureSourceStack, CapturedPlace, ClosureData, ExplicitDropMethodUseKind,
+        CaptureInfo, CaptureSourceStack, CapturedPlace, ClosureData, ComptimeLoop,
+        ExplicitDropMethodUseKind,
         InferenceDiagnostic, InferenceResult, MinCaptures, OverloadedDeref, PatAdjust,
         PatAdjustment, PointerCast, ReturnKind, StructPathDef, StructPathFound, Unreachable,
         UnreachableAt, UpvarCapture,
@@ -61,9 +63,9 @@ use crate::{
     },
     method_resolution::CandidateId,
     next_solver::{
-        AnyImplId, DbInterner, FnSig, FnSigKind, GenericArgs, Predicate, StoredFnSig,
+        AnyImplId, Clauses, DbInterner, FnSig, FnSigKind, GenericArgs, Predicate, StoredFnSig,
         StoredGenericArg, StoredGenericArgs, StoredPredicate, StoredTraitRef, StoredTy, StoredTys,
-        TraitRef, Ty, Tys,
+        TraitRef, Ty, TyKind, Tys,
         abi::Safety,
         infer::traits::ObligationCauseCode,
         persist::{TyTableReader, TyTableWriter, table_words},
@@ -72,6 +74,7 @@ use crate::{
         Ambiguity, AmbiguityCandidate, AmbiguityNote, NamedTerm, StoredGoal, TypeAnnotationNeeded,
         UnreportedSolverError,
     },
+    comptime::ReflectedMember,
     solver_errors::{SolverDiagnostic, SolverDiagnosticKind, StoredTraitPredicate},
 };
 
@@ -835,6 +838,7 @@ impl InferenceRecord {
             coercion_casts,
             closures_without_expectation,
             asm_sym_tys,
+            comptime_loops,
             closures_data,
             defined_anon_consts,
         } = result;
@@ -956,6 +960,22 @@ impl InferenceRecord {
             words.word(local(*pat));
             words.named_term(tys, named);
         });
+        words.len(comptime_loops.len());
+        comptime_loops.iter().for_each(|(&expr, it)| {
+            let ComptimeLoop { binder, domain, kind, container, assumptions } = it;
+            words.word(local(expr));
+            words.word(match kind {
+                ReflectedDomain::Fields => 0,
+                ReflectedDomain::Variants => 1,
+            });
+            for ty in [binder, domain, container] {
+                words.word(tys.ty(ty.as_ref()));
+            }
+            words.len(assumptions.as_ref().len());
+            for clause in assumptions.as_ref().iter() {
+                words.word(tys.predicate(clause.as_predicate()));
+            }
+        });
         record.put32(C32::Words, words.words.iter().copied());
         record.put8(C8::Text, words.text.iter().copied());
 
@@ -985,7 +1005,10 @@ impl InferenceRecord {
 impl Persist for InferenceRecord {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("InferenceRecord"),
-        Part::U64(23),
+        // 24: `InferenceDiagnostic::ComptimeNotYetSupported`.
+        // 25: `comptime_loops`, after the named pattern types in the side table words.
+        // 26: `SolverDiagnosticKind::ReflectedMemberUnmet` (solver kind 9).
+        Part::U64(26),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -1388,7 +1411,41 @@ impl<'a> InferenceRecordRef<'a> {
             self.ensure(entries.is_sorted_by(|a, b| a.0 < b.0), "named pattern types out of order")?;
             entries.into_boxed_slice()
         };
-        self.ensure(words.is_done(), "words after the last named pattern type")?;
+        let comptime_loops = {
+            let len = words.len()?;
+            let entries = exact(
+                len,
+                (0..len).map(|_| -> Result<(ExprId, ComptimeLoop), FormatError> {
+                    let expr = local_of(words.word()?);
+                    let kind = match words.word()? {
+                        0 => ReflectedDomain::Fields,
+                        1 => ReflectedDomain::Variants,
+                        _ => return Err(self.invalid("a `for const` loop over no domain")),
+                    };
+                    let binder = words.ty(tys)?;
+                    self.ensure(
+                        matches!(binder.as_ref().kind(), TyKind::Placeholder(_)),
+                        "a `for const` binder that is no placeholder",
+                    )?;
+                    let (domain, container) = (words.ty(tys)?, words.ty(tys)?);
+                    let count = words.len()?;
+                    let clauses = exact(
+                        count,
+                        (0..count).map(|_| {
+                            let predicate = tys.predicate(words.word()?)?;
+                            predicate
+                                .as_ref()
+                                .as_clause()
+                                .ok_or(self.invalid("a `for const` assumption that is no clause"))
+                        }),
+                    )?;
+                    let assumptions = Clauses::new_from_slice(&clauses).store();
+                    Ok((expr, ComptimeLoop { binder, domain, kind, container, assumptions }))
+                }),
+            )?;
+            SortedMap::from_sorted(entries).map_err(|what| self.invalid(what))?
+        };
+        self.ensure(words.is_done(), "words after the last `for const` loop")?;
 
         let anon_consts = self.u64s(C64::AnonConsts);
         let defined_anon_consts =
@@ -1440,6 +1497,7 @@ impl<'a> InferenceRecordRef<'a> {
             coercion_casts: self.idx_set(C64::CoercionCasts)?,
             closures_without_expectation: self.idx_set(C64::ClosuresWithoutExpectation)?,
             asm_sym_tys,
+            comptime_loops,
             closures_data,
             defined_anon_consts,
         })
@@ -1750,6 +1808,98 @@ impl Sink {
         self.word(at);
     }
 
+    fn solver_kind<'db>(&mut self, tys: &mut impl TyEncode<'db>, kind: &SolverDiagnosticKind) {
+        match kind {
+            SolverDiagnosticKind::TraitUnimplemented {
+                trait_predicate,
+                parent_trait_predicates,
+                parent_impls,
+            } => {
+                self.word(0);
+                self.trait_predicate(tys, trait_predicate);
+                self.len(parent_trait_predicates.len());
+                parent_trait_predicates.iter().for_each(|it| self.trait_predicate(tys, it));
+                debug_assert_eq!(parent_impls.len(), parent_trait_predicates.len());
+                for &it in parent_impls {
+                    self.optional_impl(it.map(|(impl_, _)| impl_));
+                    if let Some((_, bound_index)) = it {
+                        self.word(bound_index);
+                    }
+                }
+            }
+            SolverDiagnosticKind::ClosureKindMismatch { expected, found, is_async, closure } => {
+                self.word(1);
+                self.closure_kind(*expected);
+                self.closure_kind(*found);
+                self.bool(*is_async);
+                self.ty(tys, closure);
+            }
+            SolverDiagnosticKind::GoalUnmet { goal, non_const_impl } => {
+                self.word(2);
+                self.goal(tys, goal);
+                self.optional_impl(*non_const_impl);
+            }
+            SolverDiagnosticKind::Overflow { goal, suggest_increasing_limit } => {
+                self.word(3);
+                self.goal(tys, goal);
+                self.bool(*suggest_increasing_limit);
+            }
+            SolverDiagnosticKind::ProjectionMismatch { goal, normalized, impl_ } => {
+                self.word(4);
+                self.goal(tys, goal);
+                self.bool(normalized.is_some());
+                if let Some(normalized) = normalized {
+                    self.generic_arg(tys, normalized);
+                }
+                self.optional_impl(*impl_);
+            }
+            SolverDiagnosticKind::TypesDiffer { expected, found } => {
+                self.word(5);
+                self.ty(tys, expected);
+                self.ty(tys, found);
+            }
+            SolverDiagnosticKind::ConstArgHasWrongType { ct, ct_ty, expected_ty } => {
+                self.word(6);
+                self.generic_arg(tys, ct);
+                self.ty(tys, ct_ty);
+                self.ty(tys, expected_ty);
+            }
+            SolverDiagnosticKind::HigherRankedOutlives => self.word(7),
+            SolverDiagnosticKind::Unreported { code } => self.words.extend([
+                8,
+                match code {
+                    UnreportedSolverError::Cycle => 0,
+                    UnreportedSolverError::SignatureMismatch => 1,
+                    UnreportedSolverError::TraitDynIncompatible => 2,
+                    UnreportedSolverError::NotConstEvaluatable => 3,
+                    UnreportedSolverError::SelectionOverflow => 4,
+                    UnreportedSolverError::ConstEquate => 5,
+                },
+            ]),
+            SolverDiagnosticKind::ReflectedMemberUnmet { container, member, member_ty, inner } => {
+                self.word(9);
+                self.ty(tys, container);
+                match *member {
+                    ReflectedMember::Field(field) => {
+                        self.word(0);
+                        self.variant(field.parent);
+                        self.local(field.local_id);
+                    }
+                    ReflectedMember::TupleField(index) => self.words.extend([1, index]),
+                    ReflectedMember::Variant(variant) => {
+                        self.word(2);
+                        self.id(variant);
+                    }
+                }
+                self.bool(member_ty.is_some());
+                if let Some(member_ty) = member_ty {
+                    self.ty(tys, member_ty);
+                }
+                self.solver_kind(tys, inner);
+            }
+        }
+    }
+
     fn goal<'db>(&mut self, tys: &mut impl TyEncode<'db>, goal: &StoredGoal) {
         match goal {
             StoredGoal::Trait { trait_, args, polarity } => {
@@ -1968,6 +2118,14 @@ impl Sink {
                 self.bool(*is_break);
             }
             D::AsyncCoroutinesNotSupported { expr } => self.words.extend([51, local(*expr)]),
+            D::ComptimeNotYetSupported { expr, form } => {
+                let form = match form {
+                    ComptimeForm::ForConst => 0,
+                    ComptimeForm::ReflectedField => 1,
+                    ComptimeForm::BinderBound => 2,
+                };
+                self.words.extend([80, local(*expr), form]);
+            }
             D::NonExhaustiveRecordExpr { expr } => self.words.extend([13, local(*expr)]),
             D::NonExhaustiveRecordPat { pat, variant } => {
                 self.words.extend([14, local(*pat)]);
@@ -2198,74 +2356,7 @@ impl Sink {
                 self.word(39);
                 self.span(*span);
                 self.cause_code(*cause);
-                match kind {
-                    SolverDiagnosticKind::TraitUnimplemented {
-                        trait_predicate,
-                        parent_trait_predicates,
-                        parent_impls,
-                    } => {
-                        self.word(0);
-                        self.trait_predicate(tys, trait_predicate);
-                        self.len(parent_trait_predicates.len());
-                        parent_trait_predicates.iter().for_each(|it| self.trait_predicate(tys, it));
-                        debug_assert_eq!(parent_impls.len(), parent_trait_predicates.len());
-                        for &it in parent_impls {
-                            self.optional_impl(it.map(|(impl_, _)| impl_));
-                            if let Some((_, bound_index)) = it {
-                                self.word(bound_index);
-                            }
-                        }
-                    }
-                    SolverDiagnosticKind::ClosureKindMismatch { expected, found, is_async, closure } => {
-                        self.word(1);
-                        self.closure_kind(*expected);
-                        self.closure_kind(*found);
-                        self.bool(*is_async);
-                        self.ty(tys, closure);
-                    }
-                    SolverDiagnosticKind::GoalUnmet { goal, non_const_impl } => {
-                        self.word(2);
-                        self.goal(tys, goal);
-                        self.optional_impl(*non_const_impl);
-                    }
-                    SolverDiagnosticKind::Overflow { goal, suggest_increasing_limit } => {
-                        self.word(3);
-                        self.goal(tys, goal);
-                        self.bool(*suggest_increasing_limit);
-                    }
-                    SolverDiagnosticKind::ProjectionMismatch { goal, normalized, impl_ } => {
-                        self.word(4);
-                        self.goal(tys, goal);
-                        self.bool(normalized.is_some());
-                        if let Some(normalized) = normalized {
-                            self.generic_arg(tys, normalized);
-                        }
-                        self.optional_impl(*impl_);
-                    }
-                    SolverDiagnosticKind::TypesDiffer { expected, found } => {
-                        self.word(5);
-                        self.ty(tys, expected);
-                        self.ty(tys, found);
-                    }
-                    SolverDiagnosticKind::ConstArgHasWrongType { ct, ct_ty, expected_ty } => {
-                        self.word(6);
-                        self.generic_arg(tys, ct);
-                        self.ty(tys, ct_ty);
-                        self.ty(tys, expected_ty);
-                    }
-                    SolverDiagnosticKind::HigherRankedOutlives => self.word(7),
-                    SolverDiagnosticKind::Unreported { code } => self.words.extend([
-                        8,
-                        match code {
-                            UnreportedSolverError::Cycle => 0,
-                            UnreportedSolverError::SignatureMismatch => 1,
-                            UnreportedSolverError::TraitDynIncompatible => 2,
-                            UnreportedSolverError::NotConstEvaluatable => 3,
-                            UnreportedSolverError::SelectionOverflow => 4,
-                            UnreportedSolverError::ConstEquate => 5,
-                        },
-                    ]),
-                }
+                self.solver_kind(tys, kind);
             }
             D::ExplicitDropMethodUse { kind } => {
                 self.word(40);
@@ -2821,6 +2912,78 @@ impl Source<'_> {
         }))
     }
 
+    fn solver_kind(&mut self, tys: &impl TyDecode) -> Result<SolverDiagnosticKind, FormatError> {
+        Ok(match self.word()? {
+            0 => {
+                let trait_predicate = self.trait_predicate(tys)?;
+                let len = self.len()?;
+                let parent_trait_predicates = exact(len, (0..len).map(|_| self.trait_predicate(tys)))?;
+                let parent_impls = exact(
+                    len,
+                    (0..len).map(|_| match self.optional_impl()? {
+                        Some(impl_) => Ok(Some((impl_, self.word()?))),
+                        None => Ok(None),
+                    }),
+                )?;
+                SolverDiagnosticKind::TraitUnimplemented {
+                    trait_predicate,
+                    parent_trait_predicates,
+                    parent_impls,
+                }
+            }
+            1 => SolverDiagnosticKind::ClosureKindMismatch {
+                expected: self.closure_kind()?,
+                found: self.closure_kind()?,
+                is_async: self.bool()?,
+                closure: self.ty(tys)?,
+            },
+            2 => SolverDiagnosticKind::GoalUnmet {
+                goal: self.goal(tys)?,
+                non_const_impl: self.optional_impl()?,
+            },
+            3 => SolverDiagnosticKind::Overflow {
+                goal: self.goal(tys)?,
+                suggest_increasing_limit: self.bool()?,
+            },
+            4 => SolverDiagnosticKind::ProjectionMismatch {
+                goal: self.goal(tys)?,
+                normalized: if self.bool()? { Some(self.generic_arg(tys)?) } else { None },
+                impl_: self.optional_impl()?,
+            },
+            5 => SolverDiagnosticKind::TypesDiffer { expected: self.ty(tys)?, found: self.ty(tys)? },
+            6 => SolverDiagnosticKind::ConstArgHasWrongType {
+                ct: self.generic_arg(tys)?,
+                ct_ty: self.ty(tys)?,
+                expected_ty: self.ty(tys)?,
+            },
+            7 => SolverDiagnosticKind::HigherRankedOutlives,
+            8 => SolverDiagnosticKind::Unreported {
+                code: match self.word()? {
+                    0 => UnreportedSolverError::Cycle,
+                    1 => UnreportedSolverError::SignatureMismatch,
+                    2 => UnreportedSolverError::TraitDynIncompatible,
+                    3 => UnreportedSolverError::NotConstEvaluatable,
+                    4 => UnreportedSolverError::SelectionOverflow,
+                    5 => UnreportedSolverError::ConstEquate,
+                    _ => return Err(self.invalid("an unreported solver error of no kind")),
+                },
+            },
+            9 => SolverDiagnosticKind::ReflectedMemberUnmet {
+                container: self.ty(tys)?,
+                member: match self.word()? {
+                    0 => ReflectedMember::Field(FieldId { parent: self.variant()?, local_id: self.local()? }),
+                    1 => ReflectedMember::TupleField(self.word()?),
+                    2 => ReflectedMember::Variant(self.id()?),
+                    _ => return Err(self.invalid("a reflected member of no kind")),
+                },
+                member_ty: if self.bool()? { Some(self.ty(tys)?) } else { None },
+                // alloc: a restored diagnostic's own reason
+                inner: Box::new(self.solver_kind(tys)?),
+            },
+            _ => return Err(self.invalid("a solver diagnostic of no kind")),
+        })
+    }
+
     fn goal(&mut self, tys: &impl TyDecode) -> Result<StoredGoal, FormatError> {
         Ok(match self.word()? {
             0 => StoredGoal::Trait { trait_: self.id()?, args: self.args(tys)?, polarity: self.polarity()? },
@@ -2965,6 +3128,15 @@ impl Source<'_> {
             },
             50 => D::UnlabeledJumpInLabeledBlock { expr: self.local()?, is_break: self.bool()? },
             51 => D::AsyncCoroutinesNotSupported { expr: self.local()? },
+            80 => D::ComptimeNotYetSupported {
+                expr: self.local()?,
+                form: match self.word()? {
+                    0 => ComptimeForm::ForConst,
+                    1 => ComptimeForm::ReflectedField,
+                    2 => ComptimeForm::BinderBound,
+                    _ => return Err(self.invalid("a comptime form of no kind")),
+                },
+            },
             13 => D::NonExhaustiveRecordExpr { expr: self.local()? },
             14 => D::NonExhaustiveRecordPat { pat: self.local()?, variant: self.variant()? },
             15 => D::UnionPatMustHaveExactlyOneField { pat: self.local()? },
@@ -3181,63 +3353,7 @@ impl Source<'_> {
             39 => {
                 let span = self.span()?;
                 let cause = self.cause_code()?;
-                let kind = match self.word()? {
-                    0 => {
-                        let trait_predicate = self.trait_predicate(tys)?;
-                        let len = self.len()?;
-                        let parent_trait_predicates = exact(len, (0..len).map(|_| self.trait_predicate(tys)))?;
-                        let parent_impls = exact(
-                            len,
-                            (0..len).map(|_| match self.optional_impl()? {
-                                Some(impl_) => Ok(Some((impl_, self.word()?))),
-                                None => Ok(None),
-                            }),
-                        )?;
-                        SolverDiagnosticKind::TraitUnimplemented {
-                            trait_predicate,
-                            parent_trait_predicates,
-                            parent_impls,
-                        }
-                    }
-                    1 => SolverDiagnosticKind::ClosureKindMismatch {
-                        expected: self.closure_kind()?,
-                        found: self.closure_kind()?,
-                        is_async: self.bool()?,
-                        closure: self.ty(tys)?,
-                    },
-                    2 => SolverDiagnosticKind::GoalUnmet {
-                        goal: self.goal(tys)?,
-                        non_const_impl: self.optional_impl()?,
-                    },
-                    3 => SolverDiagnosticKind::Overflow {
-                        goal: self.goal(tys)?,
-                        suggest_increasing_limit: self.bool()?,
-                    },
-                    4 => SolverDiagnosticKind::ProjectionMismatch {
-                        goal: self.goal(tys)?,
-                        normalized: if self.bool()? { Some(self.generic_arg(tys)?) } else { None },
-                        impl_: self.optional_impl()?,
-                    },
-                    5 => SolverDiagnosticKind::TypesDiffer { expected: self.ty(tys)?, found: self.ty(tys)? },
-                    6 => SolverDiagnosticKind::ConstArgHasWrongType {
-                        ct: self.generic_arg(tys)?,
-                        ct_ty: self.ty(tys)?,
-                        expected_ty: self.ty(tys)?,
-                    },
-                    7 => SolverDiagnosticKind::HigherRankedOutlives,
-                    8 => SolverDiagnosticKind::Unreported {
-                        code: match self.word()? {
-                            0 => UnreportedSolverError::Cycle,
-                            1 => UnreportedSolverError::SignatureMismatch,
-                            2 => UnreportedSolverError::TraitDynIncompatible,
-                            3 => UnreportedSolverError::NotConstEvaluatable,
-                            4 => UnreportedSolverError::SelectionOverflow,
-                            5 => UnreportedSolverError::ConstEquate,
-                            _ => return Err(self.invalid("an unreported solver error of no kind")),
-                        },
-                    },
-                    _ => return Err(self.invalid("a solver diagnostic of no kind")),
-                };
+                let kind = self.solver_kind(tys)?;
                 D::SolverDiagnostic(SolverDiagnostic { span, cause, kind })
             }
             40 => D::ExplicitDropMethodUse {
@@ -3502,10 +3618,11 @@ mod tests {
             TyLoweringDiagnostic,
         },
         next_solver::{
-            Const, ConstExt, ConstKind, GenericArg, StoredGenericArg, TyKind, default_types,
+            Const, ConstExt, ConstKind, GenericArg, PlaceholderType, StoredGenericArg,
+            default_types,
         },
     };
-    use rustc_type_ir::{InferConst, InferTy};
+    use rustc_type_ir::{BoundVar, InferConst, InferTy, UniverseIndex};
 
     /// Types and arguments as a list, without a database: what the round trip of everything but
     /// the type table is tested with. A trait reference needs an interner, so the tests hold none.
@@ -3703,6 +3820,7 @@ mod tests {
             D::UnlabeledJumpInLabeledBlock { expr: expr(8), is_break: true },
             D::UnlabeledJumpInLabeledBlock { expr: expr(9), is_break: false },
             D::AsyncCoroutinesNotSupported { expr: expr(10) },
+            D::ComptimeNotYetSupported { expr: expr(9), form: ComptimeForm::ReflectedField },
             D::NonExhaustiveRecordExpr { expr: expr(9) },
             D::NonExhaustiveRecordPat { pat: pat(7), variant },
             D::UnionPatMustHaveExactlyOneField { pat: pat(8) },
@@ -4300,6 +4418,17 @@ mod tests {
             coercion_casts: [expr(1), expr(64)].into_iter().collect(),
             closures_without_expectation: [expr(3)].into_iter().collect(),
             asm_sym_tys: SortedMap::from_entries([((expr(9), 2), types.i32.store()), ((expr(9), 0), types.u8.store())]),
+            comptime_loops: SortedMap::from_entries([(expr(18), ComptimeLoop {
+                binder: Ty::new_without_interner(TyKind::Placeholder(PlaceholderType::new_anon(
+                    UniverseIndex::from_u32(3),
+                    BoundVar::ZERO,
+                )))
+                .store(),
+                domain: types.u8.store(),
+                kind: ReflectedDomain::Variants,
+                container: types.i32.store(),
+                assumptions: Clauses::empty().store(),
+            })]),
             closures_data: SortedMap::from_entries([(expr(3), closure()), (expr(11), ClosureData {
                 min_captures: Default::default(),
                 fake_reads: Box::new([]),

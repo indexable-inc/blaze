@@ -33,6 +33,7 @@ use blaze_format::{
     FormatError, Part, Placed, Record, Rel, SchemaHash, Slice, Writer, open_as, schema_of,
 };
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{
     DefWithBodyId, FieldId, LocalFieldId, VariantId,
     expr_store::ExpressionStore,
@@ -47,7 +48,7 @@ use smallvec::SmallVec;
 
 use super::{
     AggregateKind, AsmOperand, AssertKind, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind,
-    CoroutineLocals, FieldIndex, InlineAsm, Inlined, InlinedBinding, InlinedBody, InlinedCallee,
+    ComptimeBinder, CoroutineLocals, FieldIndex, InlineAsm, Inlined, InlinedBinding, InlinedBody, InlinedCallee,
     InlinedPromoted, InlinedScope, InlinedSpan, Local, LocalId, MirBody, MirPhase, MirSpan,
     MutBorrowKind, Operand, OperandKind, Place, PlaceElem, Projection, ProjectionElem, Rvalue,
     Statement, StatementKind, StoredPlace, SwitchTargets, Terminator, TerminatorKind, UnOp,
@@ -69,7 +70,7 @@ use crate::{
 };
 
 /// The version of the words [`write`] writes: changes with any change to what a word means.
-const WORDS_VERSION: u64 = 2;
+const WORDS_VERSION: u64 = 4;
 
 /// The literals of a body that a location macro expanded to, sorted, with the store they are
 /// expressions of: the constants a body's MIR makes of them are written as slots and filled
@@ -78,6 +79,8 @@ const WORDS_VERSION: u64 = 2;
 pub(crate) struct Locations<'a> {
     pub(crate) store: &'a ExpressionStore,
     pub(crate) exprs: &'a [ExprId],
+    /// How many bytes an address of the body's target takes.
+    pub(crate) word: usize,
 }
 
 impl Locations<'_> {
@@ -113,7 +116,7 @@ impl Locations<'_> {
     /// expand to; `None` for another.
     fn constant<'db>(&self, expr: ExprId, ty: Ty<'db>) -> Option<StoredAllocation> {
         let Expr::Literal(literal) = self.store.expr(expr) else { return None };
-        let word = super::target::word();
+        let word = self.word;
         let (memory, memory_map): (Box<[u8]>, MemoryMap<'db>) = match *literal {
             Literal::String(ref text) => {
                 let text = text.as_str();
@@ -167,6 +170,8 @@ pub(crate) const SCHEMA: SchemaHash = schema_of(&[
     Part::Schema(<MirRoot as Record>::SCHEMA),
     Part::Schema(TABLE_SCHEMA),
     Part::Schema(<AllocationRec as Record>::SCHEMA),
+    // A call's intrinsic is stored by its index.
+    Part::Schema(Intrinsic::SCHEMA),
 ]);
 
 /// `body` as a buffer of its own, the constants of `locations` as slots. Refused, with why,
@@ -190,7 +195,7 @@ pub(crate) fn write<'db>(
         text: Vec::new(),
         // alloc: as above
         allocs: Vec::new(),
-        alloc_places: HashMap::default(),
+        alloc_places: HashMap::new_in(Global),
         refused: None,
         locations,
     };
@@ -270,7 +275,7 @@ struct Encode<'w, 'db> {
     text: Vec<u8>,
     /// Where each allocation's record is, by the index the words name it with.
     allocs: Vec<u64>,
-    alloc_places: HashMap<Allocation<'db>, u32>,
+    alloc_places: HashMap<Allocation<'db>, u32, Global>,
     /// Why the body has no stored form, found where a word could not say so.
     refused: Option<&'static str>,
     locations: Option<Locations<'w>>,
@@ -495,7 +500,7 @@ impl<'db> Encode<'_, 'db> {
     /// Sorted by binding, so equal maps write equal words whatever order they iterate in.
     fn upvar_locals(
         &mut self,
-        upvars: &HashMap<BindingId, Vec<(LocalId, closure_analysis::Place)>>,
+        upvars: &HashMap<BindingId, Vec<(LocalId, closure_analysis::Place)>, Global>,
     ) {
         self.count(upvars.len());
         blaze_mem::scratch::with_u32s(|keys| {
@@ -548,7 +553,19 @@ impl<'db> Encode<'_, 'db> {
     }
 
     fn inlined(&mut self, inlined: &Inlined<'db>) {
-        let Inlined { callees, scopes, spans, bindings, promoted } = inlined;
+        let Inlined { callees, scopes, spans, bindings, promoted, devirtualized, specialized, moved_to_frame } =
+            inlined;
+        // Only an optimized body calls specialized copies, and only built bodies are kept.
+        if !specialized.is_empty() {
+            self.refused
+                .get_or_insert("a body with specialized calls, which only optimized MIR has");
+        }
+        // Likewise only an optimized body has allocations moved into its frame.
+        if *moved_to_frame != 0 {
+            self.refused.get_or_insert(
+                "a body with allocations moved into its frame, which only optimized MIR has",
+            );
+        }
         self.count(callees.len());
         for InlinedCallee { body, args, written_checked } in callees {
             match *body {
@@ -585,6 +602,12 @@ impl<'db> Encode<'_, 'db> {
             self.local(local);
             self.word(callee);
             self.word(expr.into_raw().into_u32());
+        }
+        self.count(devirtualized.len());
+        for digest in devirtualized {
+            for word in digest.chunks_exact(4) {
+                self.word(u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
+            }
         }
     }
 
@@ -681,6 +704,10 @@ impl<'db> Encode<'_, 'db> {
                 ProjectionElem::Downcast(variant) => {
                     self.word(5);
                     self.variant(variant);
+                }
+                ProjectionElem::ReflectedField(ComptimeBinder(universe)) => {
+                    self.word(6);
+                    self.word(universe);
                 }
             }
         }
@@ -1109,6 +1136,17 @@ impl<'db> Encode<'_, 'db> {
                 self.block(*real_target);
                 self.opt_block(*unwind);
             }
+            TerminatorKind::ComptimeFor { binder: ComptimeBinder(universe), domain, body, after } => {
+                self.word(15);
+                self.word(*universe);
+                self.ty(domain);
+                self.block(*body);
+                self.block(*after);
+            }
+            TerminatorKind::ComptimeNext { head } => {
+                self.word(16);
+                self.block(*head);
+            }
         }
     }
 }
@@ -1371,10 +1409,10 @@ impl<'a, 'db> Decode<'a, 'db> {
 
     fn upvar_locals(
         &mut self,
-    ) -> R<HashMap<BindingId, Vec<(LocalId, closure_analysis::Place)>>> {
+    ) -> R<HashMap<BindingId, Vec<(LocalId, closure_analysis::Place)>, Global>> {
         let len = self.count()?;
         // alloc: the body's own map, at its length
-        let mut upvars = HashMap::with_capacity_and_hasher(len, Default::default());
+        let mut upvars = HashMap::with_capacity_in(len, Global);
         let mut last = None;
         for _ in 0..len {
             let binding = self.word()?;
@@ -1430,7 +1468,17 @@ impl<'a, 'db> Decode<'a, 'db> {
         let promoted = self.list(|it| {
             Ok(InlinedPromoted { local: it.local()?, callee: it.word()?, expr: idx(it.word()?) })
         })?;
-        Ok(Inlined { callees, scopes, spans, bindings, promoted })
+        let devirtualized = self.list(|it| {
+            let mut digest = [0; 32];
+            for word in digest.chunks_exact_mut(4) {
+                word.copy_from_slice(&it.word()?.to_le_bytes());
+            }
+            Ok(digest)
+        })?;
+        // alloc: empty, so never allocated: only optimized bodies have specialized calls
+        let specialized = Vec::new();
+        // Only optimized bodies have allocations moved into their frame.
+        Ok(Inlined { callees, scopes, spans, bindings, promoted, devirtualized, specialized, moved_to_frame: 0 })
     }
 
     fn basic_block(&mut self) -> R<BasicBlock> {
@@ -1488,6 +1536,7 @@ impl<'a, 'db> Decode<'a, 'db> {
                 },
                 4 => ProjectionElem::Subslice { from: self.u64()?, to: self.u64()? },
                 5 => ProjectionElem::Downcast(self.variant()?),
+                6 => ProjectionElem::ReflectedField(ComptimeBinder(self.word()?)),
                 _ => return Err(self.invalid("a projection of no kind")),
             });
         }
@@ -1809,6 +1858,13 @@ impl<'a, 'db> Decode<'a, 'db> {
                 real_target: self.block()?,
                 unwind: self.opt_block()?,
             },
+            15 => TerminatorKind::ComptimeFor {
+                binder: ComptimeBinder(self.word()?),
+                domain: self.ty()?,
+                body: self.block()?,
+                after: self.block()?,
+            },
+            16 => TerminatorKind::ComptimeNext { head: self.block()? },
             _ => return Err(self.invalid("a terminator of no kind")),
         })
     }

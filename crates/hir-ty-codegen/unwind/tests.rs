@@ -148,7 +148,7 @@ fn fde_instructions_by_index(written: &[u8]) -> Option<std::ops::Range<usize>> {
 /// every prefix of it, with bytes after it, and in entries too short or 64-bit.
 #[test]
 fn fde_instructions_are_where_indexing_found_them() {
-    let isa = crate::target().unwrap();
+    let isa = crate::isa_for(crate::Target::for_host()).unwrap();
     let cie = isa.create_systemv_cie().expect("a DWARF ISA");
     let mut inputs = Vec::new();
     for len in [0, 16, 4096] {
@@ -184,7 +184,7 @@ fn fde_instructions_are_where_indexing_found_them() {
 /// depends on the CIE's two factors alone. Rows of every rule, at every distance apart.
 #[test]
 fn an_fde_written_alone_is_the_one_written_after_the_isas_cie() {
-    let isa = crate::target().unwrap();
+    let isa = crate::isa_for(crate::Target::for_host()).unwrap();
     let cie = isa.create_systemv_cie().expect("a DWARF ISA");
     let reference = fde_after(&cie, FrameDescriptionEntry::new(Address::Constant(0), 0));
     assert!(reference.iter().all(|&it| it == gimli::DW_CFA_nop.0));
@@ -319,12 +319,78 @@ fn saving(isa: &dyn TargetIsa, ints: usize, floats: usize, stack: u32) -> ir::Fu
     func
 }
 
-/// The rows [`SystemV::rows`] makes of a function's unwind instructions are, as an FDE,
-/// Cranelift's own: on x86-64 and AArch64, of functions that save no, some and every
-/// callee-saved register of either kind, with frames of no to a megabyte of slots, and with
-/// AArch64's return addresses signed.
+/// What an unwinder computes over the function `fde` covers, written after `cie` and read
+/// back: each stretch of code, from the function's start, with the CFA's rule and every
+/// register's in register order. An unsigned return address (register 34, `RA_SIGN_STATE`,
+/// at `DW_OP_lit0`) is left out: it is every frame's initial state (Arm's DWARF for AArch64),
+/// so a table that restates it and one that doesn't unwind alike. Stretches with one state are
+/// merged. Also says whether the table restates an unsigned return address anywhere.
+fn unwind_rules(
+    cie: &CommonInformationEntry,
+    fde: FrameDescriptionEntry,
+) -> (Vec<(std::ops::Range<u64>, String)>, bool) {
+    use gimli::{BaseAddresses, CieOrFde, UnwindContext, UnwindSection, read};
+    let mut table = FrameTable::default();
+    let id = table.add_cie(cie.clone());
+    table.add_fde(id, fde);
+    let mut written = EhFrame(EndianVec::new(RunTimeEndian::Little));
+    table.write_eh_frame(&mut written).unwrap();
+    let eh_frame = read::EhFrame::new(written.0.slice(), RunTimeEndian::Little);
+    let bases = BaseAddresses::default().set_eh_frame(0);
+    let mut entries = eh_frame.entries(&bases);
+    let fde = loop {
+        match entries.next().unwrap().expect("an FDE after the CIE") {
+            CieOrFde::Cie(_) => {}
+            CieOrFde::Fde(partial) => break partial.parse(read::EhFrame::cie_from_offset).unwrap(),
+        }
+    };
+    let bytes = |expression: &read::UnwindExpression<usize>| expression.get(&eh_frame).unwrap().0.slice().to_vec();
+    let unsigned = |register: gimli::Register, rule: &read::RegisterRule<usize>| {
+        matches!(rule, read::RegisterRule::ValExpression(it) if register.0 == 34 && bytes(it) == [gimli::DW_OP_lit0.0])
+    };
+    let mut context = UnwindContext::new();
+    let mut rows = fde.rows(&eh_frame, &bases, &mut context).unwrap();
+    let mut stretches: Vec<(std::ops::Range<u64>, String)> = Vec::new();
+    let mut restates_unsigned = false;
+    while let Some(row) = rows.next_row().unwrap() {
+        let mut state = match row.cfa() {
+            read::CfaRule::RegisterAndOffset { register, offset } => format!("cfa=r{}{offset:+}", register.0),
+            read::CfaRule::Expression(it) => format!("cfa={:?}", bytes(it)),
+        };
+        let mut registers: Vec<_> = row.registers().collect();
+        registers.sort_by_key(|(register, _)| register.0);
+        for (register, rule) in registers {
+            if unsigned(*register, rule) {
+                restates_unsigned = true;
+                continue;
+            }
+            let rule = match rule {
+                read::RegisterRule::Expression(it) => format!("[{:?}]", bytes(it)),
+                read::RegisterRule::ValExpression(it) => format!("{:?}", bytes(it)),
+                other => format!("{other:?}"),
+            };
+            state.push_str(&format!(" r{}={rule}", register.0));
+        }
+        let start = row.start_address() - fde.initial_address();
+        let end = row.end_address() - fde.initial_address();
+        match stretches.last_mut() {
+            Some((range, last)) if *last == state && range.end == start => range.end = end,
+            _ => stretches.push((start..end, state)),
+        }
+    }
+    (stretches, restates_unsigned)
+}
+
+/// The rows [`SystemV::rows`] makes of a function's unwind instructions unwind as Cranelift's
+/// own FDE does, at every address: on x86-64 and AArch64, of functions that save no, some and
+/// every callee-saved register of either kind, with frames of no to a megabyte of slots, and
+/// with AArch64's return addresses signed. Where Cranelift restates unsigned return addresses
+/// at entry (it does for Apple's AArch64, "the macOS unwinder seems to require this"), the
+/// rows don't: every frame starts unsigned, LLVM writes no such row for aarch64-apple-darwin,
+/// and the macOS unwinder unwinds through frames without it (handoff v2-unwind-mac); each one
+/// is a "non standard register 34" warning per FDE in ld64. Signing rows are kept.
 #[test]
-fn system_v_rows_are_cranelifts() {
+fn system_v_rows_unwind_as_cranelifts() {
     let triples = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"];
     let mut isas: Vec<_> = triples.iter().map(|it| isa_of(it)).collect();
     isas.push({
@@ -346,7 +412,20 @@ fn system_v_rows_are_cranelifts() {
             let made = FunctionUnwind::of(isa, &context).unwrap().unwrap();
             assert!(matches!(made.frame, Frame::Rows(_)), "{}", isa.triple());
             let address = Address::Constant(0);
-            assert_eq!(made.fde(address), Some(info.to_fde(address)), "{} {ints} {floats} {stack}", isa.triple());
+            let cie = isa.create_systemv_cie().expect("a DWARF ISA");
+            let (rules, restates_unsigned) = unwind_rules(&cie, made.fde(address).expect("an FDE"));
+            let (cranelifts, cranelift_restates_unsigned) = unwind_rules(&cie, info.to_fde(address));
+            let case = format!("{} {ints} {floats} {stack}", isa.triple());
+            assert_eq!(rules, cranelifts, "{case}");
+            assert!(!restates_unsigned, "{case}: a row restates that return addresses are unsigned");
+            let apple = isa.triple().to_string() == "aarch64-apple-darwin";
+            // Cranelift restates it for Apple only; if that changes, this no longer tests dropping it.
+            assert_eq!(cranelift_restates_unsigned, apple, "{case}: Cranelift's own entry row changed");
+            let signed = format!(" r34={:?}", [gimli::DW_OP_lit1.0]);
+            let signs = rules.iter().any(|(_, state)| state.contains(&signed));
+            let flags = isa.isa_flags();
+            let signing = flags.iter().any(|it| it.name == "sign_return_address" && it.as_bool() == Some(true));
+            assert_eq!(signs, signing, "{case}");
         }
     }
 }

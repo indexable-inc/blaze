@@ -6,7 +6,19 @@
 //! alias, std's sleeps, spins, clock and lazy cells, `blaze_graph::par`, `papaya`, `hashbrown`,
 //! `indexmap`, `once_cell`, and a run of some lints alone.
 
-use crate::tests::lint;
+use base_db::FileId;
+use blaze_hash::HashMap;
+use hir::attach_db;
+use hir_expand::fixture;
+use std::alloc::Global;
+
+use crate::{
+    check::{Setup, check},
+    conf::Conf,
+    fix::fix,
+    level::CommandLine,
+    tests::lint,
+};
 
 const MINICORE: &str = "//- minicore: sized, copy, clone, option, result, fn, future, send, sync, drop, iterators, deref, deref_mut, builtin_impls, unary_ops, eq, ord, add, panic\n";
 
@@ -234,6 +246,40 @@ pub(crate) fn fixture(main: &str) -> String {
 pub(crate) fn lint_only(lints: &[&str], main: &str) -> String {
     let flags: String = lints.iter().map(|it| format!(" -W clippy::{it}")).collect();
     lint(&fixture(main), &format!("-A clippy::all{flags}"))
+}
+
+/// `src/lib.rs` of `main` as the fix of `clippy::<lint>` alone leaves it, after checking that
+/// the fix changed it, that the fixed crate is front-end clean (its borrow check included) and
+/// that no lint is left.
+pub(crate) fn fixed(lint_name: &str, main: &str) -> String {
+    let fx = fixture::db(&fixture(main));
+    let file = *fx.files().last().expect("src/lib.rs");
+    let mut db = fx.into_db();
+    let krate = attach_db(&db, || crate::tests::main_crate(&db));
+    let file = file.file_id(&db);
+    let before = db.file_text(file).text(&db).to_string();
+    let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
+    names.insert(file, "src/lib.rs".to_owned());
+    let name_of = |file: FileId| names.get(&file).cloned();
+    let flags = ["-A".to_owned(), "clippy::all".to_owned(), "-W".to_owned(), format!("clippy::{lint_name}")];
+    let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf: Conf::default() };
+    let made = fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    let after = db.file_text(file).text(&db).to_string();
+    assert_ne!(after, before, "the fix of `{lint_name}` changed the file");
+    assert!(made.applied > 0, "the fix of `{lint_name}` made a suggestion");
+    attach_db(&db, || {
+        let mut acc = Vec::new();
+        for module in krate.modules(&db) {
+            module.diagnostics(&db, &mut acc, false);
+        }
+        let errors: Vec<String> =
+            acc.iter().map(|it| format!("{it:?}")).filter(|it| !it.starts_with("InactiveCode")).collect();
+        assert!(errors.is_empty(), "the fixed file is front-end clean:\n{after}\n{errors:#?}");
+        let found = check(&db, krate, &setup, &name_of).expect("the file is named");
+        let left: Vec<&str> = found.iter().map(|it| it.diagnostic.message.as_str()).collect();
+        assert!(left.is_empty(), "the fixed file lints clean:\n{after}\n{left:#?}");
+    });
+    after
 }
 
 /// What `blaze::<lint>` alone says of `main`.

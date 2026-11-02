@@ -50,6 +50,9 @@ mimalloc.workspace = true
 # mimalloc on the huge pages `blaze-mem` chose (`huge.rs`).
 libmimalloc-sys = { workspace = true, features = ["extended"] }
 blaze-mem.workspace = true
+# `IX_PROF=<dir>` samples blaze itself (`program.rs`): the profile a build of blaze is laid out by
+# (docs/v2/plan/lanes/layout/layout.md).
+ix-prof = { workspace = true, features = ["sampler"] }
 # A pin: the root manifest read (`pin.rs`) and written with its layout and comments kept
 # (`versions.rs`).
 parking_lot.workspace = true

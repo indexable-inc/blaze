@@ -18,6 +18,7 @@ use std::{hash::BuildHasher, num::NonZeroU32, ops::Range};
 
 use base_db::{Crate, Db};
 use blaze_hash::{FixedState, HashMap};
+use std::alloc::Global;
 use blaze_lint_defs::{Checked, Feature, Level, Lint, LintId, LintOptions, LintSet, Store};
 use cfg::CfgOptions;
 use hashbrown::HashTable;
@@ -97,7 +98,7 @@ pub struct LevelCx<'a, 'db> {
     /// command line, not one per lint or per node.
     sources: Vec<Source>,
     /// Each `#[expect]`'s name by where it is, hashed once as both builders come to it.
-    expects: HashMap<(HirFileId, TextRange), ExpectId>,
+    expects: HashMap<(HirFileId, TextRange), ExpectId, Global>,
 }
 
 impl<'a, 'db> LevelCx<'a, 'db> {
@@ -126,7 +127,7 @@ impl<'a, 'db> LevelCx<'a, 'db> {
             features: UnstableFeatures::query(db, krate),
             cmd_warnings: opts.opts.iter().find(|(it, _)| &**it == "warnings").map(|&(_, it)| it),
             sources: vec![Source::Default], // alloc: once per crate's levels
-            expects: HashMap::default(),
+            expects: HashMap::new_in(Global),
         }
     }
 

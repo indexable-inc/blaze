@@ -3,25 +3,48 @@
 //! under ([`Header`]), and the kinds of its relocations. The rest of the header (its type, the
 //! types of its indirect calls, the places of the stack pointer) is `wasm::lower`'s.
 
-use base_db::Db;
+use base_db::{CrateOrigin, Db, LangCrateOrigin};
 use blaze_codegen::{
     RelocKind,
     wasm::{Code, Import},
 };
 use cranelift_codegen::binemit::Reloc;
-use hir_def::{ItemContainerId, Lookup, attrs::AttrFlags};
+use hir_def::{FunctionId, HasModule, ItemContainerId, Lookup, attrs::AttrFlags, signatures::FunctionSignature};
 
 use super::{HirInstance, Kind, fold::BODY};
 use crate::{
     Instance, InstanceDef, exported_symbol,
     fragment::{FuncTarget, RelocName, Requests},
-    link_name,
+    link_name_for,
     wasm::{CALL, WasmSignature},
 };
 
 /// The module a function of an `extern` block is imported from when the block names none
 /// (`#[link(wasm_import_module)]`), as rustc's wasm targets import it.
 pub(crate) const ENV: &str = "env";
+
+/// The module of the `proc_macro` bridge's imports, which `blaze-macro-eval`'s host gives a
+/// proc macro's wasm module (its `src/wasm/abi.rs` `BRIDGE`).
+pub(crate) const BRIDGE: &str = "blaze_proc_macro";
+
+/// What the host gives for std's `hashmap_random_keys`: the evaluator's fixed keys
+/// (`blaze-macro-eval` `os/random.rs`), so a macro's `RandomState` reads no WASI randomness and
+/// its expansion stays one blaze keeps.
+const RANDOM_KEYS: &str = "hashmap_random_keys";
+
+/// The bridge's import that a call of `func` is in a proc macro's wasm module, in place of
+/// std's body: std's `sys::random::hashmap_random_keys`, named as the evaluator names it
+/// (`blaze-macro-eval` `os.rs` `Call::of_std`). Its `() -> (u64, u64)` lowers on wasm32 to
+/// `(i32) -> ()`, the pair returned through the pointer, which is the host's
+/// `hashmap_random_keys(into)`; [`imports`] checks it.
+pub(crate) fn bridged(db: &Db, func: FunctionId) -> Option<&'static str> {
+    let ItemContainerId::ModuleId(module) = func.lookup(db).container else { return None };
+    if !matches!(func.krate(db).data(db).origin, CrateOrigin::Lang(LangCrateOrigin::Std)) {
+        return None;
+    }
+    let named = FunctionSignature::of(db, func).name.as_str() == RANDOM_KEYS;
+    (named && module.name(db)?.as_str() == "random").then_some(RANDOM_KEYS)
+}
 
 /// The part of a function's [`Code`] that the front end says: empty for nearly every function,
 /// and on every target but wasm32.
@@ -41,8 +64,13 @@ impl Header {
 }
 
 /// The header of `instance`'s code, whose (placed) requests are `requests`.
-pub(crate) fn header(db: &Db, instance: &HirInstance, requests: &Requests) -> Result<Header, String> {
-    let imports = imports(db, requests, || format!("{instance:?}"))?; // alloc: an error's name of the function
+pub(crate) fn header(
+    db: &Db,
+    target: &crate::Target,
+    instance: &HirInstance,
+    requests: &Requests,
+) -> Result<Header, String> {
+    let imports = imports(db, target, requests, || format!("{instance:?}"))?; // alloc: an error's name of the function
     let export = match &instance.0 {
         Kind::Code(Instance { def: InstanceDef::Fn(func), args, .. }, _)
             if args.as_ref().iter().all(|it| it.region().is_some()) =>
@@ -57,26 +85,44 @@ pub(crate) fn header(db: &Db, instance: &HirInstance, requests: &Requests) -> Re
 /// What each outside function `requests` name is imported as, by its symbol: a function of an
 /// `extern` block from its block's `#[link(wasm_import_module)]` or [`ENV`], a symbol of no
 /// item from [`ENV`]; the field is the symbol, and the type the one a call of it is lowered to
-/// ([`WasmSignature::of`]). Empty but on a wasm target. `owner` names what asks, in an error:
+/// ([`WasmSignature::of`]). Empty but when `target` is wasm. `owner` names what asks, in an error:
 /// a function whose `Code::imports` these are, or a static (`Static::imports`).
 pub(crate) fn imports(
     db: &Db,
+    target: &crate::Target,
     requests: &Requests,
     owner: impl Fn() -> String,
 ) -> Result<Vec<(String, Import)>, String> {
     // alloc: empty, allocates only for what names an outside function
     let mut imports: Vec<(String, Import)> = Vec::new();
-    if !crate::Target::selected()?.is_wasm() {
+    if !target.is_wasm() {
         return Ok(imports);
     }
     for request in &requests.funcs {
         let (name, module) = match &request.target {
+            // A bridged call is recorded only in a proc macro's module (`Recorder::callee`).
+            FuncTarget::Symbol(symbol) if symbol == RANDOM_KEYS => {
+                let ty = WasmSignature::of(&request.sig).map_err(|what| {
+                    // alloc: an error
+                    format!("{} calls std's `{RANDOM_KEYS}`, whose signature has no wasm type: {what}", owner())
+                })?;
+                if ty.params != [crate::wasm::WasmType::I32] || !ty.results.is_empty() {
+                    // alloc: an error
+                    return Err(format!(
+                        "{} calls std's `{RANDOM_KEYS}` as {ty:?}, and the bridge's import takes the \
+                         pointer its keys are written to, (i32) -> ()",
+                        owner()
+                    ));
+                }
+                // alloc: the import's to keep, keyed by it
+                (RANDOM_KEYS.to_owned(), BRIDGE.to_owned())
+            }
             // clone: the import's to keep, keyed by it
             FuncTarget::Symbol(symbol) => (symbol.clone(), ENV.to_owned()),
             FuncTarget::Instance(instance, _) => {
                 let InstanceDef::Fn(func) = instance.def else { continue };
                 let ItemContainerId::ExternBlockId(block) = func.lookup(db).container else { continue };
-                let Some(name) = link_name(db, func) else {
+                let Some(name) = link_name_for(db, target, func) else {
                     // alloc: an error
                     return Err(format!("{} names a function of an `extern` block with no link name", owner()));
                 };
@@ -149,5 +195,50 @@ pub(crate) fn reloc_kind(kind: Reloc, name: RelocName) -> Result<RelocKind, Stri
         RelocName::Data(_) if kind == Reloc::Abs4 => Ok(RelocKind::WasmMemory),
         // alloc: an error
         _ => Err(format!("a {kind:?} relocation at {name:?} in wasm code, which `wasm::lower` makes none of")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base_db::{CrateOrigin, LangCrateOrigin, all_crates};
+    use hir_def::test_items::function;
+    use hir_expand::fixture;
+
+    use super::{RANDOM_KEYS, bridged};
+
+    fn std_crate(db: &base_db::Db) -> base_db::Crate {
+        all_crates(db)
+            .iter()
+            .copied()
+            .find(|it| matches!(it.data(db).origin, CrateOrigin::Lang(LangCrateOrigin::Std)))
+            .expect("the fixture's std")
+    }
+
+    #[test]
+    fn stds_random_keys_are_the_bridges_import() {
+        let db = fixture::db(
+            r#"
+//- /main.rs crate:main deps:std
+pub mod random { pub fn hashmap_random_keys() -> (u64, u64) { (0, 0) } }
+//- /std.rs crate:std
+pub mod random { pub fn hashmap_random_keys() -> (u64, u64) { (1, 2) } }
+"#,
+        )
+        .into_db();
+        assert_eq!(bridged(&db, function(&db, std_crate(&db), RANDOM_KEYS)), Some(RANDOM_KEYS));
+        assert_eq!(bridged(&db, function(&db, fixture::test_crate(&db), RANDOM_KEYS)), None, "a crate of its own");
+    }
+
+    #[test]
+    fn a_std_function_of_that_name_elsewhere_keeps_its_body() {
+        let db = fixture::db(
+            r#"
+//- /main.rs crate:main deps:std
+//- /std.rs crate:std
+pub mod hash { pub fn hashmap_random_keys() -> (u64, u64) { (1, 2) } }
+"#,
+        )
+        .into_db();
+        assert_eq!(bridged(&db, function(&db, std_crate(&db), RANDOM_KEYS)), None);
     }
 }

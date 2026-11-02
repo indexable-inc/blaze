@@ -4,12 +4,15 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::ptr;
-use std::sync::OnceLock;
 
 use blaze_ids::{ContentId, Domain, Interner, Sharded};
 
 /// Every string interned, by its content ID: a hit is lock-free probes and no allocation.
-static STRINGS: OnceLock<Sharded<Box<str>>> = OnceLock::new();
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's interner: an `InternedString` is a `&'static str` into it, compared by address, so there is one per process"
+)]
+static STRINGS: std::sync::OnceLock<Sharded<Box<str>>> = std::sync::OnceLock::new();
 static STRING: Domain = Domain::new("blaze-source interned string 1");
 
 /// A string kept once for the life of the process, so that names compare by pointer and copy
@@ -132,6 +135,7 @@ impl fmt::Display for InternedString {
 mod tests {
     use super::InternedString;
     use blaze_hash::HashMap;
+    use std::alloc::Global;
 
     #[test]
     fn same_string_same_pointer() {
@@ -145,7 +149,7 @@ mod tests {
     #[test]
     fn ordered_and_looked_up_as_str() {
         assert!(InternedString::new("a") < InternedString::new("b"));
-        let mut map = HashMap::default();
+        let mut map = HashMap::new_in(Global);
         map.insert(InternedString::new("default"), 1);
         assert_eq!(map.get("default"), Some(&1));
     }

@@ -7,7 +7,7 @@
 use std::{
     path::PathBuf,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -59,7 +59,8 @@ pub struct SparseIndex {
     config: Mutex<Option<RegistryConfig>>,
     auth: Option<Arc<Auth>>,
     /// The registry's name in the configuration, found once a token is first asked for.
-    name: OnceLock<Option<String>>,
+    #[expect(clippy::disallowed_types, reason = "found once a token is first asked for: per registry, not global")]
+    name: std::sync::OnceLock<Option<String>>,
     /// Whether requests carry the token.
     auth_required: AtomicBool,
     /// The `login_url` of the last 401's `www-authenticate: Cargo` challenge.
@@ -94,7 +95,7 @@ impl SparseIndex {
             fresh: SharedSet::default(),
             config: Mutex::default(),
             auth,
-            name: OnceLock::new(),
+            name: Default::default(),
             auth_required: AtomicBool::new(false),
             login_url: Mutex::default(),
             auth_error_headers: Mutex::default(),

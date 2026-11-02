@@ -11,6 +11,7 @@ use blaze_api::{
     client::{Client, ClientError},
 };
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_vfs::View;
 
@@ -30,12 +31,12 @@ struct Pins {
     socket: PathBuf,
     client: Option<Client>,
     /// Sorted by root where it is walked, so roots are held again in that order.
-    held: HashMap<ContentId, u32>,
+    held: HashMap<ContentId, u32, Global>,
     service: crossbeam_channel::Sender<Input>,
 }
 
 pub(crate) fn run(socket: PathBuf, commands: crossbeam_channel::Receiver<Command>, service: crossbeam_channel::Sender<Input>) {
-    let mut pins = Pins { socket, client: None, held: HashMap::default(), service };
+    let mut pins = Pins { socket, client: None, held: HashMap::new_in(Global), service };
     for command in commands {
         match command {
             Command::Open { view, reply } => {

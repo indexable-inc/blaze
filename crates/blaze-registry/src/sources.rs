@@ -6,6 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, bail};
 use blaze_hash::{HashMap, SharedMap};
+use std::alloc::Global;
 
 use blaze_source::{CRATES_IO_REGISTRY, GitReference, SourceId, SourceKind};
 
@@ -33,7 +34,7 @@ pub struct SourceConfig {
     /// The `[source]` tables.
     pub sources: Vec<(String, SourceDef)>,
     /// `registries.<name>.index` of each `[registries.<name>]`.
-    pub registries: HashMap<String, String>,
+    pub registries: HashMap<String, String, Global>,
     /// `registries.crates-io.protocol = "git"`: crates.io read from its git index.
     pub crates_io_git: bool,
 }
@@ -169,7 +170,7 @@ impl Sources {
     /// `$CARGO_HOME/registry/src`, or the directory a vendored copy is in once its files are
     /// checked.
     pub fn fetch(&self, locked: &[Locked]) -> anyhow::Result<Vec<(PathBuf, From)>> {
-        let mut by_source: HashMap<SourceId, Vec<usize>> = HashMap::default();
+        let mut by_source: HashMap<SourceId, Vec<usize>, Global> = HashMap::new_in(Global);
         for (at, it) in locked.iter().enumerate() {
             let from = self.map.replacement(it.source)?;
             by_source.entry(from).or_default().push(at);
@@ -193,8 +194,8 @@ impl Sources {
                 }
                 SourceKind::Git(_) => {
                     let _lock = crate::PackageCacheLock::acquire(&self.context.cargo_home)?;
-                    let mut checkouts: HashMap<Option<&str>, crate::git::Checkout> =
-                        HashMap::default();
+                    let mut checkouts: HashMap<Option<&str>, crate::git::Checkout, Global> =
+                        HashMap::new_in(Global);
                     for &at in &at {
                         let precise = locked[at].source.precise_git_fragment();
                         let checkout = match checkouts.get(&precise) {

@@ -1639,6 +1639,27 @@ pub fn collect<'f, T>(frame: &'f Frame, items: impl IntoIterator<Item = T>) -> V
     out
 }
 
+/// A copy of `text` in `frame`, to grow: `bumpalo`'s `String::from_str_in`. For finished text
+/// that won't grow, [`Frame::alloc_str`]; for formatting, [`format_in!`](crate::format_in).
+#[inline]
+pub fn string<'f>(frame: &'f Frame, text: &str) -> crate::text::String<&'f Frame> {
+    crate::text::String::from_str_in(text, frame)
+}
+
+/// A copy of `path` in `frame`, to push onto or pop (unix only, [`crate::text`]).
+#[cfg(unix)]
+#[inline]
+pub fn path<'f>(frame: &'f Frame, path: impl AsRef<std::path::Path>) -> crate::text::PathBuf<&'f Frame> {
+    crate::text::PathBuf::from_path_in(path, frame)
+}
+
+/// A copy of `text` in `frame`, to grow (unix only, [`crate::text`]).
+#[cfg(unix)]
+#[inline]
+pub fn os_string<'f>(frame: &'f Frame, text: impl AsRef<std::ffi::OsStr>) -> crate::text::OsString<&'f Frame> {
+    crate::text::OsString::from_os_str_in(text, frame)
+}
+
 const _: () = assert!(mem::size_of::<Marker>() == 16);
 
 #[cfg(test)]

@@ -2,6 +2,7 @@ use parking_lot::Mutex;
 
 use blaze_format::Aligned;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir_expand::fixture;
 
 use super::*;
@@ -136,7 +137,7 @@ fn all(db: &TestDB) -> Vec<Crate> {
 /// A store in memory.
 #[derive(Default)]
 struct Memory {
-    images: Mutex<HashMap<ContentId, std::sync::Arc<Aligned>>>,
+    images: Mutex<HashMap<ContentId, std::sync::Arc<Aligned>, Global>>,
 }
 
 impl ImageStore for Memory {
@@ -254,7 +255,7 @@ fn every_served_signature_is_the_lowered_one() {
         let krate = crate_named(&db, name);
         let items = items(&db, krate);
         if name == "lib" {
-            let kinds: HashSet<u8> = items.iter().map(|it| it.what()).collect();
+            let kinds: HashSet<u8, Global> = items.iter().map(|it| it.what()).collect();
             assert_eq!(kinds.len(), 11, "the fixture asks every query: {kinds:?}");
         }
         for item in items {
@@ -618,9 +619,9 @@ fn a_record_of_another_query_is_refused() {
 
 #[test]
 fn a_key_names_one_item_and_is_the_same_in_every_database() {
-    let keys_of = |db: &TestDB| -> (HashSet<ContentId>, usize) {
+    let keys_of = |db: &TestDB| -> (HashSet<ContentId, Global>, usize) {
         let items = items(db, crate_named(db, "lib"));
-        let distinct: HashSet<Item> = items.iter().copied().collect();
+        let distinct: HashSet<Item, Global> = items.iter().copied().collect();
         let keys = items.iter().map(|&item| key::of(db, item).unwrap().1).collect();
         (keys, distinct.len())
     };

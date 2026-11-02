@@ -81,7 +81,7 @@ impl eval::Shadow<Prov> for Shadow {
 #[derive(Debug, Default)]
 pub struct Sites<'db> {
     sites: Vec<Site<'db>>,
-    bodies: HashMap<InferBodyId<'db>, u32>,
+    bodies: HashMap<InferBodyId<'db>, u32, std::alloc::Global>,
     /// By the index in `bodies`: per span kind, the `SiteId` of each arena index
     /// (`SiteId::START` where not yet interned).
     spans: Vec<[Vec<SiteId>; 7]>,

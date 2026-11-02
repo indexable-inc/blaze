@@ -105,12 +105,42 @@ impl DefMap {
                 return true;
             }
 
-            // `#[blaze::reassociate]`, blaze's own inert attribute (`blaze::parallelizable` reads
-            // it from the item's syntax). `blaze` is no tool namespace: `#[blaze::cache]` stays
-            // the `blaze` crate's attribute macro.
+            // `#[blaze::reassociate]`, `#![blaze::sans_io]`, `#[blaze::checkfree]`,
+            // `#[blaze::pure]` and `#[blaze::bits]`, blaze's own inert attributes
+            // (`blaze::parallelizable` reads the first from the item's syntax,
+            // `blaze::sans_io_core` the second from `AttrFlags::SANS_IO`, `blaze::checkfree`
+            // the third from `AttrFlags::CHECKFREE`, `hir-ty-pure` the fourth from
+            // `AttrFlags::PURE`, the layout and MIR the fifth from `AttrFlags::BLAZE_BITS`),
+            // and `#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]`
+            // (`hir-ty-effects`, from `AttrFlags::effect_attr`), and `#![blaze::specialization]`
+            // and `#[blaze::specialization_trait]` (`hir-ty-specialization`, from
+            // `AttrFlags::BLAZE_SPECIALIZATION` and `TraitFlags::BLAZE_SPECIALIZATION_TRAIT`).
+            // `blaze` is no tool namespace: `#[blaze::cache]` stays the `blaze` crate's
+            // attribute macro.
             if let [_, attr] = segments
                 && name.as_str() == "blaze"
-                && attr.symbol().as_str() == "reassociate"
+                && matches!(
+                    attr.symbol().as_str(),
+                    "reassociate"
+                        | "sans_io"
+                        | "checkfree"
+                        | "pure"
+                        | "bits"
+                        | "nopanic"
+                        | "noalloc"
+                        | "nonblocking"
+                        | "specialization"
+                        | "specialization_trait"
+                        // `hir-ty-linear`, from `AttrFlags::LINEAR` and `AttrFlags::CONSUMES`.
+                        | "linear"
+                        | "consumes"
+                        // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
+                        // (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+                        | "arbitrary_ints"
+                        // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
+                        // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
+                        | "reflect"
+                )
             {
                 return true;
             }

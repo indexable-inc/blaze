@@ -5,7 +5,7 @@
 //! Nothing here does IO: files come in as blaze-vfs views ([`crate::Db::set_view_root`]) and
 //! the crate graph from `blaze-lower`.
 
-use std::collections::hash_map::Entry;
+use blaze_hash::hash_map::Entry;
 use std::error::Error;
 use std::str::FromStr;
 use std::{fmt, mem, ops};
@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 
 use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, VfsPath};
 use blaze_hash::{FixedState, HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_lint_defs::LintOptions;
 use blaze_mem::Frame;
@@ -32,7 +33,7 @@ use crate::{
 };
 
 pub type ProcMacroPaths =
-    HashMap<CrateBuilderId, Result<(String, AbsPathBuf), ProcMacroLoadingError>>;
+    HashMap<CrateBuilderId, Result<(String, AbsPathBuf), ProcMacroLoadingError>, Global>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: an error, cold
 pub enum ProcMacroLoadingError {
@@ -570,7 +571,15 @@ pub struct CrateData<Id> {
     /// The crate attributes given on the command line (rustc's `-Z crate-attr`), each with
     /// `#![` and `]` around it: each is a file of its own, see [`crate::crate_attrs`].
     pub crate_attrs: Box<[Box<str>]>,
+    /// What the crate is: a `--test` crate is a [`TargetKind::Test`] (a bench's a
+    /// [`TargetKind::Bench`]), whatever target it is built from.
     pub target_kind: TargetKind,
+    /// The kind of the manifest's target the crate is built from: an example, a binary or a
+    /// library built with `--test` is a [`TargetKind::Test`] crate of an `Example`, `Bin` or
+    /// `Lib` target. With its name it says which of its package's targets the crate is, as
+    /// cargo's units tell targets apart (`tests/fetch.rs` and `examples/fetch.rs` are two).
+    /// [`TargetKind::Other`] for no cargo target; equal to `target_kind` when not `--test`.
+    pub manifest_kind: TargetKind,
     /// The crate types it is built as (rustc's `--crate-type`s): cargo's target's
     /// `crate_types`. Empty when none is given, as for rustc with no `--crate-type`.
     pub crate_types: CrateTypes,
@@ -601,7 +610,7 @@ pub struct ExtraCrateData {
 
 #[derive(Default, Clone, PartialEq, Eq)] // clone: setup: the crate graph, once per load
 pub struct Env {
-    entries: HashMap<String, String>,
+    entries: HashMap<String, String, Global>,
 }
 
 impl fmt::Debug for Env {
@@ -688,7 +697,7 @@ impl<Id> Dependency<Id> {
     }
 }
 
-pub type CratesIdMap = HashMap<CrateBuilderId, Crate>;
+pub type CratesIdMap = HashMap<CrateBuilderId, Crate, Global>;
 
 /// A crate. Its fields are set only through base-db ([`Crate::create`], [`Crate::set_env`] and
 /// the other setters, [`CrateGraphBuilder::set_in_db`]), which keep [`Crate::content`] the
@@ -749,7 +758,7 @@ impl Crate {
     /// path, and its disambiguator is the crate's own data and cfg. A dependency is its
     /// crate's ID, its name and a byte each of prelude, sysroot and private. Its
     /// [`LintOptions`] follow, each flag's lint and level and then the cap.
-    pub const DOMAIN: &'static str = "blaze v2 crate 4";
+    pub const DOMAIN: &'static str = "blaze v2 crate 5";
 
     pub fn data<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db BuiltCrateData {
         self.data_field(db)
@@ -878,7 +887,7 @@ impl Crate {
             hasher.part(attr.as_bytes());
         }
         hasher
-            .update(&[data.target_kind.tag(), data.crate_types.bits()])
+            .update(&[data.target_kind.tag(), data.manifest_kind.tag(), data.crate_types.bits()])
             .part(data.proc_macro_cwd.as_str().as_bytes())
             .opt_part(extra.version.as_deref());
         match &extra.display_name {
@@ -924,7 +933,7 @@ fn refresh_contents(db: &mut Db, krate: Crate) {
     if !refresh_content(db, krate) {
         return;
     }
-    let mut changed = HashSet::default();
+    let mut changed = HashSet::new_in(Global);
     changed.insert(krate);
     // In topological order: a crate's dependencies are refreshed before it.
     for dependent in all_crates(&*db).iter().copied() {
@@ -986,6 +995,24 @@ impl Crate {
         transitive_deps(db, self)
     }
 
+    /// Whether a crate that depends on this one loads its macros alone: a proc-macro crate.
+    /// rustc loads such a crate for the host and resolves none of its dependencies into the
+    /// dependent's crate graph (rustc_metadata's `resolve_crate_deps` returns an empty map
+    /// for a proc-macro crate), and its metadata holds nothing but the macros; so its impls,
+    /// its lang items and every crate it depends on (its own `std`, built for the host or for
+    /// `wasm32-wasip1`) are never the dependent's. Every walk from a crate to the crates whose
+    /// items it sees stops at one ([`Self::transitive_loaded_deps`]).
+    pub fn loads_only_macros(self, db: &Db) -> bool {
+        self.data(db).target_kind.is_proc_macro()
+    }
+
+    /// The crate and every crate whose items it sees, directly or not, in the order a walk
+    /// from it first reaches them: [`Self::transitive_deps`], but never into a crate whose
+    /// dependents load only its macros ([`Self::loads_only_macros`]) nor through one.
+    pub fn transitive_loaded_deps(self, db: &Db) -> &[Crate] {
+        transitive_loaded_deps(db, self)
+    }
+
     /// The crate and every crate that depends on it, directly or not, in the order a walk from
     /// it first reaches them.
     ///
@@ -1009,6 +1036,27 @@ fn transitive_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
             }
             deps.push(krate);
             worklist.extend(krate.data(db).dependencies.iter().map(|dep| dep.crate_id));
+        }
+        Box::from(&deps[..]) // alloc: the memo's value at its size.
+    })
+}
+
+#[blaze_query::tracked(returns(deref))]
+fn transitive_loaded_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
+    blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+        let mut worklist = Vec::new_in(frame);
+        worklist.push(krate);
+        let mut seen: hashbrown::HashSet<Crate, FixedState, &Frame> =
+            hashbrown::HashSet::with_hasher_in(FixedState, frame);
+        let mut deps = Vec::new_in(frame);
+        while let Some(krate) = worklist.pop() {
+            if !seen.insert(krate) {
+                continue;
+            }
+            deps.push(krate);
+            worklist.extend(
+                krate.data(db).dependencies.iter().map(|dep| dep.crate_id).filter(|dep| !dep.loads_only_macros(db)),
+            );
         }
         Box::from(&deps[..]) // alloc: the memo's value at its size.
     })
@@ -1075,11 +1123,11 @@ impl CratesMap {
 
 #[derive(Debug, Default)]
 struct Crates {
-    by_data: HashMap<UniqueCrateData, Crate>,
+    by_data: HashMap<UniqueCrateData, Crate, Global>,
     /// For each crate whose content ID base-db made, when and from which root path: what lets
     /// [`CrateGraphBuilder::set_in_db`] keep the ID of a crate whose fields are what they were
     /// without hashing it.
-    stamps: HashMap<Crate, Stamp>,
+    stamps: HashMap<Crate, Stamp, Global>,
     /// Ticks once per content ID made.
     clock: u64,
 }
@@ -1137,7 +1185,7 @@ struct Walk<'a, 'f> {
     crates: &'a mut Crates,
     all: FxIndexSet<Crate>,
     visited: CratesIdMap,
-    root_files: HashSet<FileId>,
+    root_files: HashSet<FileId, Global>,
     /// Each builder crate walked, by its index: its crate, and when that crate's content ID
     /// last changed ([`Stamp::changed`]).
     done: &'f mut [Option<(Crate, u64)>],
@@ -1303,6 +1351,7 @@ fn built_data(krate: &CrateBuilder, deps: &[Crate]) -> BuiltCrateData {
         // clone: as above.
         crate_attrs: basic.crate_attrs.clone(),
         target_kind: basic.target_kind,
+        manifest_kind: basic.manifest_kind,
         crate_types: basic.crate_types,
         // clone: as above.
         proc_macro_cwd: basic.proc_macro_cwd.clone(),
@@ -1318,12 +1367,14 @@ fn same_data(new: &CrateDataBuilder, deps: &[Crate], old: &BuiltCrateData) -> bo
         origin,
         crate_attrs,
         target_kind,
+        manifest_kind,
         crate_types,
         proc_macro_cwd,
     } = new;
     *root_file_id == old.root_file_id
         && *edition == old.edition
         && *target_kind == old.target_kind
+        && *manifest_kind == old.manifest_kind
         && *crate_types == old.crate_types
         && *origin == old.origin
         && *crate_attrs == old.crate_attrs
@@ -1374,6 +1425,7 @@ impl CrateGraphBuilder {
                 origin,
                 crate_attrs: crate_attrs.into_boxed_slice(),
                 target_kind,
+                manifest_kind: target_kind,
                 crate_types: target_kind.default_crate_types(),
                 proc_macro_cwd,
             },
@@ -1389,12 +1441,12 @@ impl CrateGraphBuilder {
         from: CrateBuilderId,
         dep: DependencyBuilder,
     ) -> Result<(), CyclicDependenciesError> {
-        let _p = tracing::info_span!("add_dep").entered();
+        let _p = tracing::info_span!(target: "blaze", "add_dep").entered();
 
         // Check if adding a dep from `from` to `to` creates a cycle. To figure
         // that out, look for a  path in the *opposite* direction, from `to` to
         // `from`.
-        if let Some(path) = self.find_path(&mut HashSet::default(), dep.crate_id, from) {
+        if let Some(path) = self.find_path(&mut HashSet::new_in(Global), dep.crate_id, from) {
             let path =
                 // clone: the cycle's error (an error path).
                 path.into_iter().map(|it| (it, self[it].extra.display_name.clone())).collect();
@@ -1426,8 +1478,8 @@ impl CrateGraphBuilder {
                 // For some reason in some repositories we have duplicate crates, so we use a set and not `Vec`.
                 // We use an `IndexSet` because the list needs to be topologically sorted.
                 all: FxIndexSet::with_capacity_and_hasher(len, FixedState),
-                visited: HashMap::with_capacity_and_hasher(len, FixedState),
-                root_files: HashSet::with_capacity_and_hasher(len, FixedState),
+                visited: HashMap::with_capacity_in(len, Global),
+                root_files: HashSet::with_capacity_in(len, Global),
                 done: frame.alloc_slice_fill_with(len, |_| None),
                 frame,
             };
@@ -1461,7 +1513,7 @@ impl CrateGraphBuilder {
     pub fn transitive_deps(&self, of: CrateBuilderId) -> impl Iterator<Item = CrateBuilderId> {
         // alloc: a walk of the builder's graph (setup).
         let mut worklist = vec![of];
-        let mut deps = HashSet::default();
+        let mut deps = HashSet::new_in(Global);
 
         while let Some(krate) = worklist.pop() {
             if !deps.insert(krate) {
@@ -1479,7 +1531,7 @@ impl CrateGraphBuilder {
     fn crates_in_topological_order(&self) -> Vec<CrateBuilderId> {
         // alloc: a walk of the builder's graph (setup).
         let mut res = Vec::new();
-        let mut visited = HashSet::default();
+        let mut visited = HashSet::new_in(Global);
 
         for krate in self.iter() {
             go(self, &mut visited, &mut res, krate);
@@ -1489,7 +1541,7 @@ impl CrateGraphBuilder {
 
         fn go(
             graph: &CrateGraphBuilder,
-            visited: &mut HashSet<CrateBuilderId>,
+            visited: &mut HashSet<CrateBuilderId, Global>,
             res: &mut Vec<CrateBuilderId>,
             source: CrateBuilderId,
         ) {
@@ -1514,7 +1566,7 @@ impl CrateGraphBuilder {
         &mut self,
         mut other: CrateGraphBuilder,
         proc_macros: &mut ProcMacroPaths,
-    ) -> HashMap<CrateBuilderId, CrateBuilderId> {
+    ) -> HashMap<CrateBuilderId, CrateBuilderId, Global> {
         // Sorting here is a bit pointless because the input is likely already sorted.
         // However, the overhead is small and it makes the `extend` method harder to misuse.
         self.arena
@@ -1525,7 +1577,7 @@ impl CrateGraphBuilder {
 
         let m = self.arena.len();
         let topo = other.crates_in_topological_order();
-        let mut id_map: HashMap<CrateBuilderId, CrateBuilderId> = HashMap::default();
+        let mut id_map: HashMap<CrateBuilderId, CrateBuilderId, Global> = HashMap::new_in(Global);
         for topo in topo {
             let crate_data = &mut other.arena[topo];
 
@@ -1550,7 +1602,7 @@ impl CrateGraphBuilder {
 
     fn find_path(
         &self,
-        visited: &mut HashSet<CrateBuilderId>,
+        visited: &mut HashSet<CrateBuilderId, Global>,
         from: CrateBuilderId,
         to: CrateBuilderId,
     ) -> Option<Vec<CrateBuilderId>> {
@@ -1702,7 +1754,7 @@ impl From<Env> for Vec<(String, String)> {
 
 impl<'a> IntoIterator for &'a Env {
     type Item = (&'a String, &'a String);
-    type IntoIter = std::collections::hash_map::Iter<'a, String, String>;
+    type IntoIter = blaze_hash::hash_map::Iter<'a, String, String>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.entries.iter()

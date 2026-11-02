@@ -43,6 +43,8 @@
 //! | `OffsetOf` | `offset_ofs` t | |
 //! | `InlineAsm` | `asms` t | |
 //! | `UnsafeBinderCast` | e | `[expr, ty+1 <<1 \| kind]` |
+//! | `ComptimeFor` | e | `[pat, iterable, body, label+1]` |
+//! | `ReflectedField` | e | `[base, field]` |
 //!
 //! | pattern | data | `extra` |
 //! |---|---|---|
@@ -238,6 +240,8 @@ pub enum ExprKind {
     InlineAsm,
     IncludeBytes,
     UnsafeBinderCast,
+    ComptimeFor,
+    ReflectedField,
 }
 
 /// Which variant of [`Pat`] a node is, in variant order: the byte of the `pat_kind` column, and
@@ -291,13 +295,13 @@ impl StatementKind {
 
 impl ExprKind {
     /// Every kind, at the index of its value.
-    pub const ALL: [ExprKind; 34] = {
+    pub const ALL: [ExprKind; 36] = {
         use ExprKind::*;
         [
             Missing, Path, If, Let, Block, Const, Loop, Call, MethodCall, Match, Continue, Break,
             Return, Become, Yield, Yeet, RecordLit, Field, Await, Cast, Ref, UnaryOp, BinaryOp,
             Assignment, Index, Closure, Tuple, Array, Literal, Underscore, OffsetOf, InlineAsm,
-            IncludeBytes, UnsafeBinderCast,
+            IncludeBytes, UnsafeBinderCast, ComptimeFor, ReflectedField,
         ]
     };
 
@@ -339,6 +343,8 @@ impl ExprKind {
             Expr::InlineAsm(_) => ExprKind::InlineAsm,
             Expr::IncludeBytes => ExprKind::IncludeBytes,
             Expr::UnsafeBinderCast { .. } => ExprKind::UnsafeBinderCast,
+            Expr::ComptimeFor { .. } => ExprKind::ComptimeFor,
+            Expr::ReflectedField { .. } => ExprKind::ReflectedField,
         }
     }
 }
@@ -380,7 +386,7 @@ impl PatKind {
 /// The `extra` words of each expression kind, by kind.
 pub(crate) const EXPR_WORDS: [u8; ExprKind::ALL.len()] = [
     0, 0, 3, 2, 6, 0, 2, 3, 5, 3, 0, 2, 0, 0, 0, 0, 4, 2, 0, 2, 2, 2, 3, 2, 2, 7, 2, 3, 0, 0, 0, 0,
-    0, 2,
+    0, 2, 4, 2,
 ];
 
 /// The `extra` words of each pattern kind, by kind.
@@ -923,6 +929,19 @@ impl<V: ColumnVec> HirColumns<V> {
                     expr: idx(expr),
                     ty: unopt(word >> 1),
                 }
+            }
+            ExprKind::ComptimeFor => {
+                let [pat, iterable, body, label] = self.node::<4>(d)?;
+                Expr::ComptimeFor {
+                    pat: idx(pat),
+                    iterable: idx(iterable),
+                    body: idx(body),
+                    label: unopt(label),
+                }
+            }
+            ExprKind::ReflectedField => {
+                let [base, field] = self.node::<2>(d)?;
+                Expr::ReflectedField { base: idx(base), field: idx(field) }
             }
         })
     }
@@ -1528,6 +1547,10 @@ impl HirColumns<Growing> {
             Expr::UnsafeBinderCast { kind, expr, ty } => {
                 self.words(old, [raw(expr), shl(opt(ty), 1) | kind as u32])
             }
+            Expr::ComptimeFor { pat, iterable, body, label } => {
+                self.words(old, [raw(pat), raw(iterable), raw(body), opt(label)])
+            }
+            Expr::ReflectedField { base, field } => self.words(old, [raw(base), raw(field)]),
         }
     }
 
@@ -1710,9 +1733,15 @@ impl Bounds {
                 self.pat(target)?;
                 self.expr(value)
             }
-            Expr::Index { base, index } => {
+            Expr::Index { base, index } | Expr::ReflectedField { base, field: index } => {
                 self.expr(base)?;
                 self.expr(index)
+            }
+            Expr::ComptimeFor { pat, iterable, body, label } => {
+                self.pat(pat)?;
+                self.expr(iterable)?;
+                self.expr(body)?;
+                self.label_opt(label)
             }
             Expr::Closure {
                 args,
@@ -2143,6 +2172,9 @@ mod tests {
             Expr::IncludeBytes,
             Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Wrap, expr: E0, ty: None },
             Expr::UnsafeBinderCast { kind: UnsafeBinderCastKind::Unwrap, expr: E0, ty: Some(T0) },
+            Expr::ComptimeFor { pat: P0, iterable: E0, body: E0, label: some_label },
+            Expr::ComptimeFor { pat: P0, iterable: E0, body: E0, label: None },
+            Expr::ReflectedField { base: E0, field: E0 },
         ];
         exprs.extend(ops.map(|op| Expr::BinaryOp { lhs: E0, rhs: E0, op }));
         exprs.extend(closure_kinds.into_iter().map(|closure_kind| Expr::Closure {

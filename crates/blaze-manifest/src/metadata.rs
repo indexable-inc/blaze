@@ -129,18 +129,21 @@ pub fn export_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> Serialize
 }
 
 /// What `cargo metadata --no-deps` prints for the workspace.
-pub fn export_no_deps<'a, F: Files>(ws: &'a Workspace<'_, F>) -> ExportInfo<'a> {
+pub fn export_no_deps<'a, F: Files>(ws: &'a Workspace<'_, F>) -> anyhow::Result<ExportInfo<'a>> {
     let packages = ws.members().map(|(path, m)| export_package(path, m)).collect();
     export(ws, packages, None)
 }
 
-/// What `cargo metadata` prints for the workspace with `packages` and `resolve`.
+/// What `cargo metadata` prints for the workspace with `packages` and `resolve`. Its
+/// `target_directory` and `build_directory` are where blaze builds, under blaze's root unless
+/// the configuration names one ([`Workspace::target_dir`]), so editors and rust-analyzer look
+/// there and not in the checkout.
 pub fn export<'a, R, F: Files>(
     ws: &'a Workspace<'_, F>,
     packages: Vec<SerializedPackage<'a>>,
     resolve: Option<R>,
-) -> ExportInfo<'a, R> {
-    ExportInfo {
+) -> anyhow::Result<ExportInfo<'a, R>> {
+    Ok(ExportInfo {
         packages,
         workspace_members: ws.members().map(|(_, m)| m.package_id.to_spec()).collect(),
         workspace_default_members: ws
@@ -148,12 +151,12 @@ pub fn export<'a, R, F: Files>(
             .map(|(_, m)| m.package_id.to_spec())
             .collect(),
         resolve,
-        target_directory: ws.target_dir(),
-        build_directory: ws.build_dir(),
+        target_directory: ws.target_dir()?,
+        build_directory: ws.build_dir()?,
         version: VERSION,
         workspace_root: ws.root(),
         metadata: ws.custom_metadata(),
-    }
+    })
 }
 
 /// The manifest `--manifest-path` names, or the nearest `Cargo.toml` from the working

@@ -16,14 +16,15 @@
 use std::{
     alloc::{self, Layout},
     cell::UnsafeCell,
+    marker::PhantomData,
     mem::ManuallyDrop,
     ptr::{self, NonNull},
 };
 
 use crate::{
     sync::{
-        OnceLock,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        Mutex,
+        atomic::{AtomicBool, AtomicI64, AtomicPtr, Ordering},
         freed_bytes, read_bytes, thread_local, wrote_bytes,
     },
     table::ShortLock,
@@ -82,23 +83,83 @@ fn lane_place(lane: u32) -> (usize, usize) {
 
 /// A `T` a lane, made when a lane first asks; chunks never move.
 pub(crate) struct Lanes<T> {
-    chunks: [OnceLock<Box<[T]>>; LANE_CHUNKS],
+    /// Chunk `k`'s first `T` of its `LANE_FIRST << k`, a leaked `Box<[T]>`; null until a lane
+    /// of it asks.
+    chunks: [AtomicPtr<T>; LANE_CHUNKS],
+    /// Held while a chunk is made, so each is made once.
+    making: Mutex<()>,
+    _owns: PhantomData<*mut T>,
 }
+
+// SAFETY: as `OnceLock<Box<[T]>>`: a `T` is made by whichever thread first asks for its lane
+// and read through `&` from any (`T: Sync`), and dropped by the owner (`T: Send`).
+unsafe impl<T: Send + Sync> Sync for Lanes<T> {}
+// SAFETY: the `T`s are owned, as in a `Box<[T]>`.
+unsafe impl<T: Send> Send for Lanes<T> {}
 
 impl<T: Default> Lanes<T> {
     pub(crate) fn new() -> Lanes<T> {
-        Lanes { chunks: std::array::from_fn(|_| OnceLock::new()) }
+        Lanes {
+            chunks: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+            making: Mutex::new(()),
+            _owns: PhantomData,
+        }
     }
 
     pub(crate) fn get(&self, lane: u32) -> &T {
         let (chunk, at) = lane_place(lane);
+        // Acquire: the chunk's `T`s, made before it was stored with release.
+        let mut first = self.chunks[chunk].load(Ordering::Acquire);
+        if first.is_null() {
+            first = self.make(chunk);
+        }
+        // SAFETY: chunk `chunk` is `LANE_FIRST << chunk` made `T`s from `first`, `at` is below
+        // that (`lane_place`), and they live until `self` drops.
+        unsafe { &*first.add(at) }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn make(&self, chunk: usize) -> *mut T {
+        let _one = self.making.lock();
+        let first = self.chunks[chunk].load(Ordering::Acquire);
+        if !first.is_null() {
+            return first;
+        }
         // alloc: once a chunk of lanes, made when its first lane asks.
-        &self.chunks[chunk].get_or_init(|| (0..LANE_FIRST << chunk).map(|_| T::default()).collect())[at]
+        let made: Box<[T]> = (0..LANE_FIRST << chunk).map(|_| T::default()).collect();
+        let first = Box::into_raw(made).cast::<T>();
+        // Release: a lane that loads it sees its `T`s made.
+        self.chunks[chunk].store(first, Ordering::Release);
+        first
+    }
+}
+
+impl<T> Lanes<T> {
+    /// Chunk `k`'s `T`s, if made.
+    fn chunk(&self, k: usize) -> Option<*mut [T]> {
+        let first = self.chunks[k].load(Ordering::Acquire);
+        (!first.is_null()).then(|| ptr::slice_from_raw_parts_mut(first, LANE_FIRST << k))
     }
 
     /// Every lane's `T` made so far.
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.chunks.iter_mut().filter_map(OnceLock::get_mut).flat_map(|chunk| chunk.iter_mut())
+        (0..LANE_CHUNKS).filter_map(|k| self.chunk(k)).flat_map(|chunk| {
+            // SAFETY: a made chunk, whole and alive until `self` drops; `&mut self` lends it
+            // to nobody else.
+            unsafe { &mut *chunk }.iter_mut()
+        })
+    }
+}
+
+impl<T> Drop for Lanes<T> {
+    fn drop(&mut self) {
+        for k in 0..LANE_CHUNKS {
+            if let Some(chunk) = self.chunk(k) {
+                // SAFETY: the `Box<[T]>` `make` leaked, of this length, freed once here.
+                drop(unsafe { Box::from_raw(chunk) });
+            }
+        }
     }
 }
 

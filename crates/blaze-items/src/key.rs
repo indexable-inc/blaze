@@ -13,8 +13,9 @@
 //! an opaque type). [`resolve`] reads both and looks in one index of one crate.
 //!
 //! A crate is named by its content, never by its `Crate` id: its name, version, origin, kind
-//! of target, edition, crate attributes, dependencies (by name and key) and the cfg it is
-//! built with. Features are in the cfg: one package is built
+//! of target (what it is built as and the manifest target's kind, so an example and an
+//! integration test of one name are two crates), edition, crate attributes, dependencies (by
+//! name and key) and the cfg it is built with. Features are in the cfg: one package is built
 //! twice in one build, for the host and for the target, with different features and, when not
 //! cross compiling, the same target cfg. Turning on a feature names its crate's items anew;
 //! their hashes stay what they were, so it costs queries, not code. Two crates of one build
@@ -32,7 +33,7 @@
 
 use std::{fmt, mem};
 
-use base_db::{Db, Crate, TargetKind};
+use base_db::{Db, Crate};
 use blaze_format::cursor::Put;
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_mem::{Frame, MemError, RegionVec, Tag, frame, scratch};
@@ -65,7 +66,7 @@ use syntax::view::HasName;
 use crate::{ItemId, ItemKey, NAME_DOMAIN, NameHash, SimplifiedType};
 
 pub const KEY_DOMAIN: &str = "blaze v2 item key 2";
-pub const CRATE_DOMAIN: &str = "blaze v2 crate key 2";
+pub const CRATE_DOMAIN: &str = "blaze v2 crate key 3";
 pub const SIMPLIFIED_DOMAIN: &str = "blaze v2 simplified type 1";
 
 /// What a key names, in the current database.
@@ -97,15 +98,11 @@ pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
     h.opt_part(extra.display_name.as_ref().map(|name| name.canonical_name().as_str()))
         .opt_part(extra.version.as_deref());
     data.origin.hash_into(&mut h);
-    match data.target_kind {
-        TargetKind::Bin => h.update(&[0]),
-        TargetKind::Lib { is_proc_macro } => h.update(&[1, is_proc_macro as u8]),
-        TargetKind::Example => h.update(&[2]),
-        TargetKind::Test => h.update(&[3]),
-        TargetKind::Bench => h.update(&[4]),
-        TargetKind::BuildScript => h.update(&[5]),
-        TargetKind::Other => h.update(&[6]),
-    };
+    // Which of its package's targets it is, as cargo's units tell them apart: the kind of
+    // the manifest's target with its name above, and what it is built as (`--test` makes any
+    // target a test). An example and an integration test of one name are two crates, both
+    // `Test` under `--all-targets`.
+    h.update(&[data.target_kind.tag(), data.manifest_kind.tag()]);
     // What a path in it resolves to: its edition, its `-Z crate-attr`s and each dependency by
     // its name, its flags and its own key. One package of one cfg built twice in one graph (a
     // build dependency reached from the host side and the target side) has two `Crate`s only
@@ -1129,9 +1126,19 @@ impl ClashingCrate {
             name: name.to_owned(), // alloc: an error's, once
             version: extra.version.clone(), // clone: an error's, once
             origin: format!("{:?}", data.origin), // alloc: an error's, once
-            kind: format!("{:?}", data.target_kind), // alloc: an error's, once
+            kind: if data.target_kind == data.manifest_kind {
+                cargo_kind(data.target_kind).to_owned() // alloc: an error's, once
+            } else {
+                // alloc: as above
+                format!("{} of the {} target", cargo_kind(data.target_kind), cargo_kind(data.manifest_kind))
+            },
         }
     }
+}
+
+/// A kind of target as cargo names it (`example`, `test`, `proc-macro`, ...).
+fn cargo_kind(kind: base_db::TargetKind) -> &'static str {
+    kind.as_cargo_target().unwrap_or("no cargo target")
 }
 
 impl fmt::Display for ClashingCrate {

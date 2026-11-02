@@ -1,8 +1,7 @@
 //! The bytes of the pinned bridge's protocol (`library/proc_macro/src/bridge/rpc.rs`), read
 //! and written by blaze's server as the client writes and reads them. Little-endian; a
-//! `usize` is the client's pointer width ([`Width`]: `rpc_encode_decode!(le usize)` writes
-//! `to_le_bytes`, so four bytes from a wasm32 module and eight from the evaluator's 64-bit
-//! targets); a handle is a nonzero `u32`; a string is its length then its bytes; `Option`'s
+//! `usize` is eight bytes on every target (a 64-bit client's `to_le_bytes`, a wasm32 module's
+//! padded to `MAX_USIZE_SIZE`, of which it reads the first four); a handle is a nonzero `u32`; a string is its length then its bytes; `Option`'s
 //! tag is `Some` 0 and `None` 1, `Result`'s `Ok` 0 and `Err` 1, `Bound`'s `Included` 0,
 //! `Excluded` 1 and `Unbounded` 2, each a byte. [`protocol`](crate::protocol) checks that the
 //! bridge in the database is the one this is.
@@ -13,29 +12,9 @@ use blaze_format::cursor::{self, Put as _};
 
 use crate::guest::Stop;
 
-/// The width of the client's `usize`, which every length, count and `usize` argument of the
-/// protocol is written in.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Width {
-    /// A wasm32 module's client.
-    W32,
-    /// The evaluator's client, on a 64-bit target.
-    W64,
-}
-
-impl Width {
-    pub(crate) const fn bytes(self) -> usize {
-        match self {
-            Width::W32 => 4,
-            Width::W64 => 8,
-        }
-    }
-}
-
 /// A request, read from its start.
 pub(crate) struct Reader<'a> {
     bytes: cursor::Reader<'a>,
-    width: Width,
 }
 
 fn short(what: &str) -> Stop {
@@ -49,12 +28,17 @@ fn bad(what: &str, value: u8) -> Stop {
 }
 
 impl<'a> Reader<'a> {
-    pub(crate) fn new(bytes: &'a [u8], width: Width) -> Reader<'a> {
-        Reader { bytes: cursor::Reader::new(bytes), width }
+    pub(crate) fn new(bytes: &'a [u8]) -> Reader<'a> {
+        Reader { bytes: cursor::Reader::new(bytes) }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.bytes.is_done()
+    }
+
+    /// The bytes not read yet.
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        self.bytes.remaining()
     }
 
     pub(crate) fn u8(&mut self) -> Result<u8, Stop> {
@@ -74,11 +58,7 @@ impl<'a> Reader<'a> {
     }
 
     pub(crate) fn usize(&mut self) -> Result<u64, Stop> {
-        match self.width {
-            Width::W32 => self.bytes.u32().map(u64::from),
-            Width::W64 => self.bytes.u64(),
-        }
-        .map_err(|_| short("a usize"))
+        self.bytes.u64().map_err(|_| short("a usize"))
     }
 
     pub(crate) fn handle(&mut self) -> Result<u32, Stop> {
@@ -128,15 +108,13 @@ impl<'a> Reader<'a> {
 /// A reply, written into a buffer the server reuses.
 pub(crate) struct Writer<'a> {
     pub(crate) out: &'a mut Vec<u8>,
-    pub(crate) width: Width,
 }
 
 impl Writer<'_> {
     /// Writes `value` over the `usize` written at `at`: a count known only once what it
     /// counts is written.
     pub(crate) fn set_usize(&mut self, at: usize, value: u64) {
-        let len = self.width.bytes();
-        self.out[at..at + len].copy_from_slice(&value.to_le_bytes()[..len]);
+        self.out[at..at + 8].copy_from_slice(&value.to_le_bytes());
     }
 
     pub(crate) fn u8(&mut self, value: u8) {
@@ -151,14 +129,10 @@ impl Writer<'_> {
         self.out.put_u32(value);
     }
 
-    /// `value` in the client's width; one that does not fit a wasm32 `usize` is a length no
-    /// wasm32 client can hold, which the server never writes for it (each is of what the
-    /// client sent or a stream in its memory).
+    /// `value` in eight bytes; a wasm32 client reads the low four, and the server never writes
+    /// it a length past them (each is of what the client sent or a stream in its memory).
     pub(crate) fn usize(&mut self, value: u64) {
-        match self.width {
-            Width::W32 => self.out.put_u32(value as u32),
-            Width::W64 => self.out.put_u64(value),
-        }
+        self.out.put_u64(value);
     }
 
     pub(crate) fn handle(&mut self, handle: u32) {
@@ -186,7 +160,7 @@ mod tests {
     #[test]
     fn what_is_written_is_read_back_in_the_bridges_encoding() {
         let mut out = Vec::new();
-        let mut w = Writer { out: &mut out, width: Width::W64 };
+        let mut w = Writer { out: &mut out };
         w.u8(7);
         w.bool(true);
         w.handle(3);
@@ -197,7 +171,7 @@ mod tests {
         w.ok(false);
         // `Option::Some` is tag 0, as `compound_traits!(enum Option<T> { Some(t), None })` makes it.
         assert_eq!(&out[out.len() - 3..], &[1, 0, 1]);
-        let mut r = Reader::new(&out, Width::W64);
+        let mut r = Reader::new(&out);
         assert_eq!(r.u8().unwrap(), 7);
         assert!(r.bool().unwrap());
         assert_eq!(r.handle().unwrap(), 3);
@@ -211,14 +185,14 @@ mod tests {
 
     #[test]
     fn a_request_cut_short_or_out_of_range_is_refused() {
-        assert!(Reader::new(&[1, 2], Width::W64).u32().is_err());
-        assert!(Reader::new(&[0, 0, 0, 0], Width::W64).handle().is_err());
-        assert!(Reader::new(&[2], Width::W64).bool().is_err());
-        assert!(Reader::new(&[3], Width::W64).bound().is_err());
+        assert!(Reader::new(&[1, 2]).u32().is_err());
+        assert!(Reader::new(&[0, 0, 0, 0]).handle().is_err());
+        assert!(Reader::new(&[2]).bool().is_err());
+        assert!(Reader::new(&[3]).bound().is_err());
         let mut long = 100u64.to_le_bytes().to_vec();
         long.push(0);
-        assert!(Reader::new(&long, Width::W64).count().is_err());
-        assert!(Reader::new(&long, Width::W64).str().is_err());
+        assert!(Reader::new(&long).count().is_err());
+        assert!(Reader::new(&long).str().is_err());
     }
 
     #[test]
@@ -228,24 +202,25 @@ mod tests {
         out.push(1);
         out.extend_from_slice(&9u64.to_le_bytes());
         out.push(2);
-        let mut r = Reader::new(&out, Width::W64);
+        let mut r = Reader::new(&out);
         assert_eq!(r.bound().unwrap(), Bound::Included(5));
         assert_eq!(r.bound().unwrap(), Bound::Excluded(9));
         assert_eq!(r.bound().unwrap(), Bound::Unbounded);
     }
 
-    /// A wasm32 client writes a `usize`, and so a string's length, in four bytes.
+    /// Every client writes a `usize`, and so a string's length, in eight bytes: the pinned
+    /// bridge pads a wasm32 one (`MAX_USIZE_SIZE`), as the request a wasm32 module sent for
+    /// `TokenStream::from_str("42")` shows.
     #[test]
-    fn a_wasm32_clients_usize_is_four_bytes_and_a_count_is_patched_in_its_width() {
+    fn a_usize_is_eight_bytes_from_every_client_and_a_count_is_patched_in_place() {
         let mut out = Vec::new();
-        let mut w = Writer { out: &mut out, width: Width::W32 };
+        let mut w = Writer { out: &mut out };
         w.usize(0);
-        w.str("ab");
+        w.str("42");
         w.set_usize(0, 9);
-        assert_eq!(out, [9, 0, 0, 0, 2, 0, 0, 0, b'a', b'b']);
-        let mut r = Reader::new(&out, Width::W32);
-        assert_eq!(r.usize().unwrap(), 9);
-        assert_eq!(r.str().unwrap(), "ab");
+        assert_eq!(out, [9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, b'4', b'2']);
+        let mut r = Reader::new(&[2, 0, 0, 0, 0, 0, 0, 0, 0x34, 0x32]);
+        assert_eq!(r.str().unwrap(), "42");
         assert!(r.is_empty());
     }
 }

@@ -30,3 +30,6 @@ pub use core::num::{FpCategory, ParseFloatError, ParseIntError, TryFromIntError}
 pub use core::num::{NonZeroI8, NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI128, NonZeroIsize};
 #[stable(feature = "nonzero", since = "1.28.0")]
 pub use core::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize};
+// blaze: the integers of any width of `#![blaze::arbitrary_ints]`.
+#[stable(feature = "blaze_arbitrary_ints", since = "CURRENT_RUSTC_VERSION")]
+pub use core::num::arbitrary;

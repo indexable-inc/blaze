@@ -2,6 +2,7 @@
 
 use base_db::Db;
 use blaze_hash::{FixedState, HashMap};
+use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_mem::frame::Frame;
 use hir_expand::mod_path::{ModPath, PathKind};
@@ -71,7 +72,7 @@ impl UpvarsRef<'_> {
 pub fn upvars_mentioned(
     db: &Db,
     owner: ExpressionStoreOwnerId,
-) -> Option<&HashMap<ExprId, Upvars>> {
+) -> Option<&HashMap<ExprId, Upvars, Global>> {
     return match owner {
         ExpressionStoreOwnerId::Signature(owner) => signature_upvars_mentioned(db, owner),
         ExpressionStoreOwnerId::Body(owner) => body_upvars_mentioned(db, owner),
@@ -82,7 +83,7 @@ pub fn upvars_mentioned(
     pub fn signature_upvars_mentioned(
         db: &Db,
         owner: GenericDefId,
-    ) -> Option<Box<HashMap<ExprId, Upvars>>> {
+    ) -> Option<Box<HashMap<ExprId, Upvars, Global>>> {
         upvars_mentioned_impl(db, owner.into())
     }
 
@@ -90,7 +91,7 @@ pub fn upvars_mentioned(
     pub fn body_upvars_mentioned(
         db: &Db,
         owner: DefWithBodyId,
-    ) -> Option<Box<HashMap<ExprId, Upvars>>> {
+    ) -> Option<Box<HashMap<ExprId, Upvars, Global>>> {
         upvars_mentioned_impl(db, owner.into())
     }
 
@@ -98,7 +99,7 @@ pub fn upvars_mentioned(
     pub fn variant_fields_upvars_mentioned(
         db: &Db,
         owner: VariantId,
-    ) -> Option<Box<HashMap<ExprId, Upvars>>> {
+    ) -> Option<Box<HashMap<ExprId, Upvars, Global>>> {
         upvars_mentioned_impl(db, owner.into())
     }
 }
@@ -106,7 +107,7 @@ pub fn upvars_mentioned(
 fn upvars_mentioned_impl(
     db: &Db,
     owner: ExpressionStoreOwnerId,
-) -> Option<Box<HashMap<ExprId, Upvars>>> {
+) -> Option<Box<HashMap<ExprId, Upvars, Global>>> {
     let store = ExpressionStore::of(db, owner);
     store.expr_roots().next()?;
     // Most bodies have no closure: they need no resolver and no walk.
@@ -132,7 +133,7 @@ fn upvars_mentioned_impl(
         }
         // alloc: the memo's map, exact
         let mut result =
-            HashMap::with_capacity_and_hasher(visitor.closures.len(), FixedState);
+            HashMap::with_capacity_in(visitor.closures.len(), Global);
         result.extend(visitor.closures.drain(..));
         // alloc: the memo's box, once per body with a capture
         Some(Box::new(result))

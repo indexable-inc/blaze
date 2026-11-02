@@ -32,9 +32,30 @@ pub fn spins() { unsafe { core::arch::asm!("nop") } }
 pub extern "C" fn bare() { core::arch::naked_asm!("ret") }
 "#;
 
+/// `become`s: one with its result and arguments passed by reference, one that also returns,
+/// and one through a pointer.
+const TAIL_CALLS: &str = r#"
+//- minicore: sized, fn, add, eq, copy
+#![feature(explicit_tail_calls)]
+pub struct Big(pub [u64; 4]);
+pub fn pair(a: Big, b: Big) -> (Big, Big) { (a, b) }
+pub fn swap(a: Big, b: Big) -> (Big, Big) { become pair(b, a) }
+pub fn count(n: u64, acc: u64) -> u64 {
+    if n == 0 {
+        return acc;
+    }
+    become count(n - 1, acc + n)
+}
+pub fn through(n: u64, acc: u64) -> u64 {
+    // A `become`'s callee has the caller's signature, a pointer's too, as rustc requires.
+    let f: fn(u64, u64) -> u64 = count;
+    become f(n, acc)
+}
+"#;
+
 /// The tier's spec: copy-and-patch's IR of static code that counts nothing and folds nothing.
 fn spec() -> Spec {
-    let target = crate::Target::selected().expect("a target");
+    let target = crate::Target::for_fixtures();
     let arch = match target.arch {
         crate::Arch::X86_64 => blaze_codegen::Arch::X86_64,
         crate::Arch::Aarch64 => blaze_codegen::Arch::Aarch64,
@@ -52,7 +73,7 @@ fn spec() -> Spec {
             cranelift: "0.136".to_owned(),
             llvm: None,
             stencils: Some(blaze_format::hex::encode(&library)),
-            frame_pointers: crate::backend::frame_pointers(),
+            frame_pointers: false,
             relocation: Relocation::Static,
         },
         backend: Backend::Stencil,
@@ -65,12 +86,15 @@ fn spec() -> Spec {
         mir_inline: false,
         pgo: Pgo::None,
         sanitize: Sanitize::default(),
+        proc_macro_bridge: false,
+        report: false,
+        heap_to_stack: false,
     }
 }
 
-/// What the process compiles to: its code position-independent or static as its ISA is.
+/// What the fixtures' target compiles to: its code position-independent or static as its ISA is.
 fn relocation() -> Relocation {
-    match crate::target().expect("a code generator").flags().is_pic() {
+    match crate::isa_for(crate::Target::for_fixtures()).expect("a code generator").flags().is_pic() {
         true => Relocation::Pic,
         false => Relocation::Static,
     }
@@ -97,7 +121,7 @@ fn unit(spec: &Spec) -> Unit {
     }
 }
 
-/// A build at -O0 of the process's toolchain, which Cranelift compiles.
+/// A build at -O0 of the fixtures' toolchain, which Cranelift compiles.
 fn policy() -> Policy {
     let mut toolchain = spec().toolchain;
     toolchain.relocation = relocation();
@@ -116,12 +140,19 @@ fn policy() -> Policy {
         fold: false,
         sanitize: Sanitize::default(),
         pgo: Pgo::None,
+        proc_macro_bridge: false,
+        report: false,
+        heap_to_stack: false,
     }
 }
 
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend() -> (&'static TestDB, HirFrontend<'static>) {
-    let db: &'static TestDB = Box::leak(Box::new(fixture::db(PROGRAM).into_db()));
+    frontend_of(PROGRAM)
+}
+
+fn frontend_of(program: &str) -> (&'static TestDB, HirFrontend<'static>) {
+    let db: &'static TestDB = Box::leak(Box::new(fixture::db(program).into_db()));
     let build_time = std::sync::Arc::new(BuildTime(Default::default()));
     let frontend = HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time);
     (db, frontend.with_policy(&policy()))
@@ -136,7 +167,7 @@ fn function(db: &TestDB, name: &str) -> FunctionId {
 fn refs_of(frontend: &HirFrontend<'_>, instance: &HirInstance) -> Vec<Target> {
     frontend.with(|db, homes| {
         let inlined = frontend.inlines(db, instance).expect("the policy");
-        let walked = refs::walk(db, instance, inlined, homes).expect("the walk");
+        let walked = refs::walk(db, instance, refs::Walking::plain(inlined), homes).expect("the walk");
         (0..walked.len()).map(|at| Target::Extern(format!("ref{at}"))).collect()
     })
 }
@@ -274,6 +305,45 @@ fn the_reach_of_a_root_is_the_drivers() {
             Ok(Lowering::Ir { names, .. }) => assert!(names.iter().all(|it| !matches!(it, Target::Counter(_)))),
             Ok(_) => {}
             Err(e) => panic!("{instance:?}: {e:?}"),
+        }
+    }
+}
+
+/// A `become` is one `return_call` with the caller's own signature, handed the caller's own
+/// memory and nothing else of its frame: its result where the caller was asked for its own,
+/// and each argument passed by reference in the memory the caller was handed for the
+/// parameter at its place (`swap` hands `pair` its `b` where its `a` was). That the values
+/// end up swapped, through the temporaries, is `harness/wholeprogram.py tail_calls`'s to run.
+#[test]
+fn become_is_a_return_call_in_the_callers_own_memory() {
+    let (db, frontend) = frontend_of(TAIL_CALLS);
+    let tier = spec();
+    for name in ["swap", "count", "through"] {
+        let root = frontend.root(function(db, name));
+        let refs = refs_of(&frontend, &root);
+        let lowering = lowered(&frontend, &unit(&tier), &tier, &root, &refs).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let Lowering::Ir { func, .. } = lowering else { panic!("{name}: IR") };
+        let shown = func.display();
+        let tail: Vec<ir::Inst> = func
+            .layout
+            .blocks()
+            .flat_map(|block| func.layout.block_insts(block))
+            .filter(|&inst| matches!(func.dfg.insts[inst].opcode(), ir::Opcode::ReturnCall | ir::Opcode::ReturnCallIndirect))
+            .collect();
+        let [tail] = tail[..] else { panic!("{name}: one tail call, not {}:\n{shown}", tail.len()) };
+        let sig = match func.dfg.insts[tail] {
+            ir::InstructionData::Call { func_ref, .. } => func.dfg.ext_funcs[func_ref].signature,
+            ir::InstructionData::CallIndirect { sig_ref, .. } => sig_ref,
+            other => panic!("{name}: {other:?}"),
+        };
+        let sig = &func.dfg.signatures[sig];
+        assert_eq!((&sig.params, &sig.returns), (&func.signature.params, &func.signature.returns), "{name}:\n{shown}");
+        if name == "swap" {
+            let entry = func.layout.entry_block().expect("an entry block");
+            let incoming = func.dfg.block_params(entry);
+            let args = func.dfg.inst_args(tail);
+            // The result's memory, then `a`'s and `b`'s.
+            assert_eq!(args, incoming, "{name}:\n{shown}");
         }
     }
 }

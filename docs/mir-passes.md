@@ -108,6 +108,13 @@ after lowering.
      - flags are set at entry from the parameters.
 5. **`packed_drops::add_moves_for_packed_drops`**: a drop of a field that a `#[repr(packed)]`
    struct leaves misaligned is turned into a move to an aligned temporary and a drop of that.
+6. **`bits::lower_bits_structs`**: blaze's own, for `#[blaze::bits]` structs
+   ([const.md](const.md#bit-packed-structs-blazebits)). Last, so borrow checking and drop
+   elaboration saw each field as a place. Every read of a field becomes a `Transmute` of the
+   struct to its backing `uN`, a shift and a mask; every write a read-modify-write of the whole
+   struct; a literal ORs its fields' bits; `==` of two values (a constant pattern) compares the
+   used bits. Nothing after it sees a field of a bits struct, so the interpreter and the code
+   generator need no new projection. A body that names no bits struct is left as it was.
 
 There are no optimization passes: no inlining, GVN, SROA, const propagation or simplification.
 
@@ -235,6 +242,40 @@ the level from `set_interpreter_mir_opt_level`.
   `CopyProp`, `CriticalCallEdges`.
 - Level 2 adds `Inline` (`optimize/inline.rs`, where the unit inlines), `UnreachablePropagation`
   and both `DeadStoreElimination`s.
+- blaze's own, at levels 1 and 2, before the UB checks, where the program's allocator is
+  std's (`MirOptions::heap_to_stack`): `HeapToStack` (`optimize/escape.rs`), which rustc has
+  none of. A `Box::new`, an `Rc::new` that is never cloned and a `vec![..]` of elements with
+  nothing to drop, whose allocation never leaves the function (only read through, borrowed
+  for calls that cannot grow or hand it out, and dropped), live in the function's frame: at
+  most 512 bytes a value and 2 KiB a body, and only in a body that can't call itself again
+  (it calls only constructors, the calls it rewrites, and std's functions with std's types).
+  The drops drop the value as before; the frees go. Zero-sized boxes and `vec!`s stay. Library
+  units and std's own bodies never get it, nor do bodies built into another. A body that
+  keeps a move (`Inlined::moved_to_frame`) is one LLVM never imports. What it relies on and leaves out:
+  `docs/v2/plan/lanes/heap-to-stack.md`.
+- blaze's own, at levels 1 and 2, after `HeapToStack` and before `LowerSliceLenCalls`:
+  `BoxInPlace` (`optimize/box_in_place.rs`), which rustc has none of. `Box::new(value)` of a
+  value of at least 4 KiB (`BOX_IN_PLACE_MIN`) with nothing to drop, built by an assignment
+  in the call's block or by a call returning into it, allocates first, with the
+  `box_new_uninit` call and layout read from std's own `Box::new` body (a body of another
+  shape is an error naming it), then builds the value in the box, struct and tuple fields
+  built in the same block included, and makes the `Box` of the pointer. A call that unwinds
+  while building it frees the box (a drop of it as a `Box<MaybeUninit<T>>`) and unwinds where
+  it did. The only difference a program can see is that a failed allocation comes before the
+  argument's code runs. `Arc::new`, `Rc::new` and `Vec::push` are not rewritten.
+- blaze's own, at level 2 where the unit inlines, last: `Specialize` (`optimize/specialize.rs`),
+  which rustc has none of. A call that passes a constant (a literal, a variant, a `const`) its
+  callee branches on is listed in `body.inlined.specialized` with a copy of the callee knowing
+  it (`specialized_mir_body`): the callee's runtime body with the value folded in and the
+  branches it decides made gotos, then optimized as the callee is. The call itself does not
+  change, so the interpreter and every other reader call the callee. A copy must remove at
+  least `MIN_SAVES` of work (a branch in a loop does, a one-shot `if` does not). A function has
+  at most `MAX_COPIES` (8) copies and a body calls at most `MAX_COPIES_PER_BODY` (8). No callee
+  over 2048 statements, `#[track_caller]`, `#[cold]`, `#[naked]`, `#[optimize(none)]`,
+  `#[rustc_no_mir_inline]`, `#[rustc_inherit_overflow_checks]`, with inline assembly, or named
+  by a symbol gets one; `#[inline(never)]` callees do. The
+  code generator's half, which calls the copies, has not landed: until it does, every listed
+  call still calls the callee. The plan: docs/v2/plan/lanes/codegen/constspec.md.
 - Storage markers are kept at every level: the code generator gives its backend lifetimes, and
   rustc runs `RemoveStorageMarkers` only where it gives none.
 - Not ported: `passes_not_ported(level)` lists them. At level 1 `ForceInline`, `RemoveZsts`

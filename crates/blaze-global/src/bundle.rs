@@ -26,6 +26,7 @@ use crate::{
     tls::Channels,
     wire::{Fields as _, truncated},
 };
+use std::alloc::Global;
 
 /// The most values one manifest lists.
 pub const ENTRIES_MOST: usize = 1 << 20;
@@ -249,7 +250,7 @@ pub struct Download {
 enum State {
     Asking,
     /// `waiting`: each key fetched and not yet answered, with its length.
-    Fetching { listed: usize, waiting: ByHash<Key, u64>, fetched: usize, bytes: u64, tickets: Vec<Ticket>, failed: Vec<String> },
+    Fetching { listed: usize, waiting: ByHash<Key, u64, Global>, fetched: usize, bytes: u64, tickets: Vec<Ticket>, failed: Vec<String> },
     Done(Result<Downloaded, String>),
 }
 
@@ -290,7 +291,7 @@ impl Download {
                         // alloc: setup: once a bundle or its lock file, not a value.
                         manifest.entries.iter().map(|entry| Public::listed(entry.key, entry.kind)).collect();
                     // alloc: setup: once a bundle or its lock file, not a value.
-                    let lens: ByHash<Key, u64> = manifest.entries.iter().map(|it| (it.key, it.len)).collect();
+                    let lens: ByHash<Key, u64, Global> = manifest.entries.iter().map(|it| (it.key, it.len)).collect();
                     let waiting = client
                         .fetch_many(store, &publics, effects)
                         .into_iter()

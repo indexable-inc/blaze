@@ -4,6 +4,7 @@
 //! through handles.
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use itertools::izip;
 use span::Span;
 use stdx::never;
@@ -364,7 +365,7 @@ pub(super) fn parse_adt_from_syntax(
         .flat_map(|param_list| param_list.lifetime_params())
         .filter_map(|param| Some((to_tt(param.syntax()), to_tt(param.lifetime()?.syntax()))))
         .collect();
-    let mut param_type_set: HashSet<Name> = HashSet::default();
+    let mut param_type_set: HashSet<Name, Global> = HashSet::new_in(Global);
     let param_types = generic_param_list
         .into_iter()
         .flat_map(|param_list| param_list.type_or_const_params())
@@ -468,12 +469,15 @@ pub(super) fn parse_adt_from_syntax(
         })
         .collect();
     let name_token = name_to_token(call_site, tm, name)?;
+    // A `#[blaze::bits]` struct's fields have no address either: copied out as a packed one's.
     let packed = adt.attrs().any(|attr| {
         let text = attr.syntax().text().to_string();
         let mut words = text
             .split(|c: char| !c.is_alphanumeric() && c != '_')
             .filter(|word| !word.is_empty() && *word != "r");
-        words.next() == Some("repr") && words.any(|word| word == "packed")
+        let repr_packed = words.next() == Some("repr") && words.any(|word| word == "packed");
+        let blaze_bits = super::editor::is_blaze_bits(&attr);
+        repr_packed || blaze_bits
     });
     Ok(BasicAdtInfo {
         name: name_token,
@@ -932,7 +936,11 @@ pub(super) fn hash_expand(
                     let expr = {
                         let it = names.iter().map(|it| {
                             let bound = bound_of_self(it);
-                            quote! {span => #krate::hash::Hash::hash(&#bound, ra_expand_state); }
+                            if adt.packed {
+                                quote! {span => #krate::hash::Hash::hash(&#bound, ra_expand_state); }
+                            } else {
+                                quote! {span => #krate::hash::Hash::hash(#bound, ra_expand_state); }
+                            }
                         });
                         quote! {span => {
                             # #it

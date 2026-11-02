@@ -10,11 +10,12 @@
 
 use std::{
     ops::Range,
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
 use base_db::{Crate, Db, Env};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use hir_expand::{MacroCallId, MacroCallKind, MacroDefKind, builtin::include_input_to_file_id};
 
@@ -47,7 +48,7 @@ pub trait ImageStore: Sync {
 
     /// The hash of the values that the names `shape` an expansion server encoded (an
     /// `ExpansionReads::Traced` shape) have now, as the server hashed them when the expansion
-    /// ran: `proc_macro_api::kept::reads_now`. A variable is the calling crate's (`env`, what the
+    /// ran: the daemon's `proc_macro_api::kept::Keeping::reads_now`. A variable is the calling crate's (`env`, what the
     /// expansion was given) before the process's. `Err` when one of them can't be read.
     fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String>;
 
@@ -104,7 +105,7 @@ pub struct Served {
     /// those asked, and their dependencies.
     ///
     /// [`eligible`]: super::eligible
-    pub keys: HashMap<Crate, ContentId>,
+    pub keys: HashMap<Crate, ContentId, Global>,
     /// The crates read from an image, in the order of their keys.
     pub hits: Vec<Crate>,
     /// The crates with reads kept under their key but no image for the values those reads
@@ -162,7 +163,7 @@ pub struct Stored {
     /// The key each crate of `written` has its image filed under ([`Image::key`]): what a
     /// value made from the crate as this database resolved it is filed by
     /// (`blaze_diagnostics::cache`).
-    pub filed: HashMap<Crate, ContentId>,
+    pub filed: HashMap<Crate, ContentId, Global>,
 }
 
 /// The name of `krate` in an error.
@@ -210,7 +211,8 @@ pub fn serve(
         .collect();
     order.sort_unstable_by_key(|&(_, key)| key);
     // alloc: setup: one slot per crate, once per serve
-    let found: Vec<OnceLock<Fetched>> = order.iter().map(|_| OnceLock::new()).collect();
+    #[expect(clippy::disallowed_types, reason = "fetched image results, set once per crate in a serve: not global")]
+    let found: Vec<std::sync::OnceLock<Fetched>> = order.iter().map(|_| std::sync::OnceLock::new()).collect();
     {
         let db = &*db;
         images.for_each(order.len(), &|at| {
@@ -264,7 +266,7 @@ pub fn serve(
 }
 
 /// The frozen bytes a database was given, to add to.
-fn copied(maps: Option<&Arc<HashMap<Crate, Frozen>>>) -> HashMap<Crate, Frozen> {
+fn copied(maps: Option<&Arc<HashMap<Crate, Frozen, Global>>>) -> HashMap<Crate, Frozen, Global> {
     // clone: what was served before, once per serve that fetches a crate, to add to
     maps.map(|it| (**it).clone()).unwrap_or_default()
 }
@@ -314,7 +316,7 @@ fn open(db: &Db, krate: Crate, filed: ContentId, bytes: ImageBuf) -> Fetched {
     Ok(Found::Hit { bytes, parts, filed })
 }
 
-fn set_images(db: &mut Db, images: HashMap<Crate, Image>) {
+fn set_images(db: &mut Db, images: HashMap<Crate, Image, Global>) {
     use blaze_query::db::{Durability, Setter};
     // alloc: setup: the one input value, once per session
     let images = Arc::new(images);
@@ -334,17 +336,18 @@ fn set_images(db: &mut Db, images: HashMap<Crate, Image>) {
 // dyn: the driver's store, one call per crate per session
 pub fn store(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<Stored, String> {
     // alloc: setup: once per session
-    let hits: HashSet<Crate> = served.hits.iter().copied().collect();
+    let hits: HashSet<Crate, Global> = served.hits.iter().copied().collect();
     // alloc: setup: once per session
     let mut order: Vec<(Crate, ContentId)> = (served.keys.iter())
-        .filter(|(krate, _)| !hits.contains(krate))
+        .filter(|(krate, _)| !hits.contains(*krate))
         .map(|(&krate, &key)| (krate, key))
         // alloc: setup: once per session
         .collect();
     order.sort_unstable_by_key(|&(_, key)| key);
-    let made: Vec<OnceLock<Result<Result<ContentId, Refused>, String>>> =
+    #[expect(clippy::disallowed_types, reason = "image creation results, set once per crate in a session: not global")]
+    let made: Vec<std::sync::OnceLock<Result<Result<ContentId, Refused>, String>>> =
         // alloc: setup: one slot per crate, once per session
-        order.iter().map(|_| OnceLock::new()).collect();
+        order.iter().map(|_| std::sync::OnceLock::new()).collect();
     images.for_each(order.len(), &|at| {
         let (krate, key) = order[at];
         _ = made[at].set(make(db, krate, key, images));

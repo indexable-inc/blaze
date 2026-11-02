@@ -338,6 +338,10 @@ impl<R: Read> Read for LimitErrorReader<R> {
 /// The process's umask, read once (cargo's `get_umask`).
 #[cfg(unix)]
 fn umask() -> u32 {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the process's umask, which reading sets: read once, before any thread unpacks"
+    )]
     static UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *UMASK.get_or_init(|| {
         // SAFETY: `umask` cannot fail; it is set straight back to what it was, once, before

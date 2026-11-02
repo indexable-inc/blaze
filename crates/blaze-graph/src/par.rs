@@ -867,22 +867,22 @@ mod tests {
         pool.submit(
             None,
             move || {
-                let asking = AtomicBool::new(false);
+                let answered = AtomicBool::new(false);
                 let mut asked = None;
                 crate::pool::scope_here(|scope| {
                     let ran = flights.get_or_run(key, || {
                         scope.submit(
                             None,
                             || {
-                                asking.store(true, Ordering::Release);
-                                flights.get_or_run(key, || Ok(1))
+                                let got = flights.get_or_run(key, || Ok(1));
+                                answered.store(true, Ordering::Release);
+                                got
                             },
                             |it| asked = Some(it.unwrap()),
                         );
-                        crate::spin::SpinWait::within("the other worker to ask for the key", LONG, || {
-                            asking.load(Ordering::Acquire)
+                        crate::spin::SpinWait::within("the other worker's ask to link to the key's run or be answered", LONG, || {
+                            flights.waiters(key) >= 1 || answered.load(Ordering::Acquire)
                         });
-                        crate::spin::busy(Duration::from_millis(50));
                         Ok(5)
                     });
                     assert_eq!(ran, Ok(5));

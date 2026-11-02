@@ -16,6 +16,7 @@ use blaze_format::{
     ALIGN, FormatError, Part, Record, SchemaHash, Slice, Writer, record_at, schema_of,
 };
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{
     AdtId, ConstParamId, GenericDefId, LifetimeParamId, TypeOrConstParamId, TypeParamId,
 };
@@ -25,7 +26,9 @@ use rustc_ast_ir::{FloatTy, IntTy, Mutability, UintTy};
 use rustc_type_ir::{
     Alias, AliasConstKind, BoundConstness, BoundVar, BoundVarIndexKind, ClausePolarity, ConstVid,
     DebruijnIndex, FloatVid, InferConst, InferTy, IntVid, IsRigid, RegionVid, TyVid, TypeVisitable,
-    UniverseIndex, inherent::IntoKind,
+    UniverseIndex,
+    inherent::IntoKind,
+    reflect::{ReflectedDomain, ReflectedVar},
 };
 use smallvec::SmallVec;
 
@@ -348,22 +351,28 @@ macro_rules! enum_code {
 }
 
 enum_code!(Mutability { 0 => Mutability::Not, 1 => Mutability::Mut });
-enum_code!(IntTy {
-    0 => IntTy::Isize,
-    1 => IntTy::I8,
-    2 => IntTy::I16,
-    3 => IntTy::I32,
-    4 => IntTy::I64,
-    5 => IntTy::I128,
-});
-enum_code!(UintTy {
-    0 => UintTy::Usize,
-    1 => UintTy::U8,
-    2 => UintTy::U16,
-    3 => UintTy::U32,
-    4 => UintTy::U64,
-    5 => UintTy::U128,
-});
+/// The integer types: their [`IntTy::code`], the standard ones' variant numbers as before
+/// and an arbitrary width of `#![blaze::arbitrary_ints]` 128 plus its width.
+macro_rules! int_code {
+    ($($ty:ident)*) => {$(
+        impl<'db> Code<'db> for $ty {
+            #[inline]
+            fn put(&self, sink: &mut impl Sink<'db>) {
+                sink.word(u32::from(self.code()));
+            }
+            #[inline]
+            fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
+                let word = source.word()?;
+                match u8::try_from(word).ok().and_then($ty::from_code) {
+                    Some(it) => Ok(it),
+                    None => Err(source.invalid(stringify!($ty))),
+                }
+            }
+        }
+    )*};
+}
+
+int_code!(IntTy UintTy);
 enum_code!(FloatTy { 0 => FloatTy::F16, 1 => FloatTy::F32, 2 => FloatTy::F64, 3 => FloatTy::F128 });
 enum_code!(ClausePolarity { 0 => ClausePolarity::Positive, 1 => ClausePolarity::Negative });
 enum_code!(BoundConstness { 0 => BoundConstness::Const, 1 => BoundConstness::Maybe });
@@ -878,6 +887,16 @@ impl<'db> Code<'db> for BoundVariableKind<'db> {
                 kind.put(sink);
             }
             BoundVariableKind::Const => sink.word(2),
+            // blaze: a field binder's variable (`rustc_type_ir::reflect`).
+            BoundVariableKind::Reflected(var) => {
+                sink.word(3);
+                var.kind.put(sink);
+                sink.word(match var.domain {
+                    ReflectedDomain::Fields => 0,
+                    ReflectedDomain::Variants => 1,
+                });
+                sink.node(var.container);
+            }
         }
     }
     fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
@@ -885,6 +904,16 @@ impl<'db> Code<'db> for BoundVariableKind<'db> {
             0 => BoundVariableKind::Ty(Code::get(source)?),
             1 => BoundVariableKind::Region(Code::get(source)?),
             2 => BoundVariableKind::Const,
+            3 => {
+                let kind = Code::get(source)?;
+                let domain = match source.word()? {
+                    0 => ReflectedDomain::Fields,
+                    1 => ReflectedDomain::Variants,
+                    _ => return Err(source.invalid("a reflected variable's domain")),
+                };
+                let container = source.node::<Ty<'db>>()?;
+                BoundVariableKind::Reflected(ReflectedVar { kind, domain, container })
+            }
             _ => return Err(source.invalid("a bound variable kind")),
         })
     }
@@ -1751,7 +1780,8 @@ blaze_format::record! {
 
 /// The version of the words a table holds: of the codec, which follows the variant order of the
 /// kinds of the pinned `rustc_type_ir`. Changes with any change to a `Code` impl.
-pub const FORMAT_VERSION: u64 = 2;
+/// 3: `BoundVariableKind::Reflected` (tag 3), blaze's field binders.
+pub const FORMAT_VERSION: u64 = 3;
 
 /// The schema of a persisted type table, for the schema of a buffer that holds one: a table
 /// written by another codec reads as a schema mismatch, never as other values.
@@ -1772,7 +1802,7 @@ pub const TABLE_SCHEMA: SchemaHash = schema_of(&[
 /// grows.
 pub struct TyTableWriter<'db> {
     /// The place of each value written, by kind and row.
-    places: HashMap<(Kind, NonZeroU32), u32>,
+    places: HashMap<(Kind, NonZeroU32), u32, Global>,
     nodes: Vec<NodeRec>,
     words: Vec<u32>,
     /// The words of the values being written, innermost last.
@@ -1789,7 +1819,7 @@ impl<'db> TyTableWriter<'db> {
     fn empty() -> Self {
         // alloc: none until the first value; one writer's buffers per table written.
         TyTableWriter {
-            places: HashMap::default(),
+            places: HashMap::new_in(Global),
             // alloc: as above.
             nodes: Vec::new(),
             // alloc: as above.

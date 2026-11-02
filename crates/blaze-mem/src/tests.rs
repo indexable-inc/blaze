@@ -19,7 +19,7 @@ use crate::{
     huge::{self, Pages},
     pool,
     revision::PublishError,
-    scratch, tag,
+    scratch, tag, text,
 };
 
 /// xorshift64*: the tests' operations, the same on every run. Not `blaze_ids::rng`, since
@@ -2491,4 +2491,116 @@ fn scratch_allocates_nothing_once_warm() {
     work();
     let (_, used) = measure(work);
     assert_eq!(used.allocations, 0, "a warm scratch buffer is reused, not reallocated");
+}
+
+// Text
+
+/// What `value` feeds a hasher, to check a text type hashes as its borrowed form does.
+fn hashed(value: &(impl std::hash::Hash + ?Sized)) -> Vec<u8> { // alloc: a test's record of hashed bytes
+    struct Bytes(Vec<u8>); // alloc: a test's record of hashed bytes
+    impl std::hash::Hasher for Bytes {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
+    }
+    let mut state = Bytes(Vec::new()); // alloc: a test's record of hashed bytes
+    value.hash(&mut state);
+    state.0
+}
+
+#[test]
+fn a_frame_string_stays_utf8_across_pushes_pops_and_truncation() {
+    frame::task(Tag::Other, |frame| {
+        let mut text = text::String::new_in(frame);
+        for ch in ['a', 'é', '日', '🦀'] {
+            text.push(ch);
+            assert!(std::str::from_utf8(text.as_bytes()).is_ok(), "after pushing {ch:?}: {:?}", text.as_bytes());
+        }
+        text.push_str("本");
+        assert_eq!(text, "aé日🦀本");
+        assert_eq!(text.len(), "aé日🦀本".len());
+        assert_eq!(text.pop(), Some('本'));
+        assert_eq!(text.pop(), Some('🦀'));
+        assert_eq!(text, "aé日");
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| text.truncate(2))).is_err(), "byte 2 is inside 'é'");
+        assert_eq!(text, "aé日", "a refused truncate leaves the text whole");
+        text.truncate(3);
+        assert_eq!(text, "aé");
+        let bytes = text.clone().into_bytes();
+        assert!(text::String::from_utf8(bytes).is_ok());
+        let mut bad: Vec<u8, &Frame> = Vec::new_in(frame);
+        bad.extend_from_slice(b"a\xff");
+        let refused = text::String::from_utf8(bad).expect_err("0xff is not UTF-8");
+        assert_eq!(refused.utf8_error().valid_up_to(), 1);
+        let boxed = text.into_boxed_str();
+        assert_eq!(&*boxed, "aé");
+        assert!(frame.contains(boxed.as_ptr()), "the boxed text stays in the frame");
+    });
+}
+
+#[test]
+fn a_frame_string_is_a_map_key_found_by_str() {
+    frame::task(Tag::Other, |frame| {
+        let mut units = std::collections::BTreeMap::new(); // alloc: a test's map, keys in the frame
+        for (at, name) in ["serde", "syn", "quote"].into_iter().enumerate() {
+            units.insert(frame::string(frame, name), at);
+        }
+        assert_eq!(units.get("syn"), Some(&1), "looked up by &str through Borrow<str>");
+        assert_eq!(units.get("proc-macro2"), None);
+        let key = frame::string(frame, "serde");
+        assert_eq!(hashed(&key), hashed("serde"), "it hashes as str does, so a hash map finds it by &str too");
+        assert_eq!(key, *units.keys().nth(1).expect("three keys"), "ordered as str is: quote, serde, syn");
+    });
+}
+
+#[test]
+fn format_in_writes_into_the_allocator_it_is_given_and_allocates_nothing_global_once_warm() {
+    let work = || {
+        frame::task(Tag::Other, |frame| {
+            let before = frame.used();
+            let unit = crate::format_in!(frame, "{}-{:03}", "unit", 7);
+            assert_eq!(unit, "unit-007");
+            assert!(frame.contains(unit.as_ptr()) && frame.used() > before, "the text is the frame's");
+            let plain = crate::format_in!(frame, "no arguments");
+            assert_eq!(plain, "no arguments");
+            let name = "syn";
+            assert_eq!(crate::format_in!(frame, "{name}@{}", 2), "syn@2");
+            unit.len()
+        })
+    };
+    work();
+    let (len, used) = measure(work);
+    assert_eq!(len, 8);
+    assert_eq!(used.allocations, 0, "format_in! into a warm task's frame calls no global allocator");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_frame_path_joins_and_pops_as_std_does() {
+    use std::path::Path;
+    frame::task(Tag::Other, |frame| {
+        let src = frame::path(frame, "/work/src");
+        let lib = src.join("lib.rs");
+        assert_eq!(lib, Path::new("/work/src/lib.rs"));
+        assert!(frame.contains(lib.as_os_str().as_encoded_bytes().as_ptr()));
+        for (base, more) in [("a", "b"), ("a/", "b"), ("", "b"), ("a", "/b"), ("/", "b"), ("a", ""), ("a/b", "../c")] {
+            let mut ours = frame::path(frame, base);
+            ours.push(more);
+            let reference = Path::new(base).join(more); // alloc: std's join, to compare with
+            assert_eq!(ours.as_os_str(), reference.as_os_str(), "{base:?} joined with {more:?}");
+        }
+        let mut walk = frame::path(frame, "/a/b/c");
+        assert!(walk.pop());
+        assert_eq!(walk, Path::new("/a/b"));
+        assert!(walk.pop() && walk.pop());
+        assert_eq!(walk, Path::new("/"));
+        assert!(!walk.pop(), "the root has no parent");
+        let mut os = frame::os_string(frame, "lib");
+        os.push(".rs");
+        assert_eq!(os, "lib.rs");
+        assert_eq!(hashed(&lib), hashed(Path::new("/work/src/lib.rs")), "it hashes as Path does");
+    });
 }

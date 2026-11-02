@@ -42,10 +42,12 @@ mod types;
 mod unsafety;
 mod unstable_names;
 
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one body's lint, dropped with it, not global state")]
 use std::cell::{Cell, OnceCell};
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use hir::{DefWithBody, InFile, db::HirDatabase};
@@ -211,6 +213,7 @@ pub(crate) struct Scratch {
 }
 
 /// One body being linted, with what it was lowered to and inferred as.
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one body's lint, dropped with it, not global state")]
 pub(crate) struct BodyCx<'a, 'c, 'db> {
     pub(crate) cx: &'a Cx<'c, 'db>,
     pub(crate) owner: DefWithBodyId,
@@ -237,6 +240,7 @@ pub(crate) struct BodyCx<'a, 'c, 'db> {
 impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
     /// The body of `owner`, if it has one written (a variant has one only when its
     /// discriminant is).
+    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one body's lint, dropped with it, not global state")]
     pub(crate) fn new(cx: &'a Cx<'c, 'db>, owner: DefWithBodyId) -> Option<BodyCx<'a, 'c, 'db>> {
         let db = cx.db;
         let (body, source_map) = Body::with_source_map(db, owner);
@@ -521,6 +525,8 @@ fn lowering_failed(db: &Db, source_map: &BodySourceMap) -> bool {
                 | ExpressionStoreDiagnostics::UnreachableLabel { .. }
                 | ExpressionStoreDiagnostics::UnresolvedMacroCall { .. }
                 | ExpressionStoreDiagnostics::IntLiteralTooLarge { .. }
+                // `for const` or `x.[f]` without the feature, lowered to `Missing`.
+                | ExpressionStoreDiagnostics::ComptimeWithoutFeature { .. }
         )
     });
     errors
@@ -584,7 +590,7 @@ fn child_exprs(store: &ExpressionStore, expr: ExprId, out: &mut Vec<ExprId>) {
 /// hold.
 fn body_owners(cx: &Cx<'_, '_>) -> Vec<DefWithBodyId> {
     let db = cx.db;
-    let mut rank: HashMap<FileId, usize> = HashMap::default();
+    let mut rank: HashMap<FileId, usize, Global> = HashMap::new_in(Global);
     for module in crate::checks::modules(cx) {
         let file = module.definition_source_file_id(db).original_file(db).file_id(db);
         let next = rank.len();
@@ -862,8 +868,13 @@ impl Passes {
             pat: [Ids::EMPTY; PAT_TAGS],
             any: false,
         };
+        // blaze: in a crate of `#![blaze::arbitrary_ints]`, `TypeLimits` also refuses a literal
+        // out of the range of a `u3`, which is an error at every lint level, so it runs even
+        // where none of its lints may fire (docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+        let arbitrary_ints = hir_def::nameres::crate_def_map(cx.db, cx.krate.base()).arbitrary_ints();
         for index in 0..PASSES {
-            if !may_fire(cx, &PASS_LINTS[index]) {
+            let refuses = arbitrary_ints && matches!(passes.all[index], Pass::TypeLimits(_));
+            if !refuses && !may_fire(cx, &PASS_LINTS[index]) {
                 continue;
             }
             passes.any = true;

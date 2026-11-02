@@ -12,9 +12,10 @@ use windows_sys::Win32::{
     Foundation::{FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE},
     Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_END_OF_FILE_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FileEndOfFileInfo, GetFileAttributesW,
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_END_OF_FILE_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN,
+        FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+        FileAttributeTagInfo, FileBasicInfo, FileEndOfFileInfo, GetFileAttributesW, GetFileInformationByHandleEx,
         GetFileSizeEx, GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES,
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS,
         OPEN_EXISTING, ReadFile, SetFileAttributesW, SetFileInformationByHandle, SetFileTime,
@@ -167,6 +168,35 @@ pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
 /// may (0o755, 0o644, 0o555, 0o444) is what the directory's access list already grants them.
 /// Any other mode asks for what Windows cannot keep, and is refused.
 pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    let read_only = read_only_of(path, mode)?;
+    let wide = sys::path(path)?;
+    // SAFETY: a NUL-terminated path.
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        let error = io::Error::last_os_error();
+        // alloc: an error path.
+        return Err(io::Error::new(error.kind(), format!("{}: {error}", path.display())));
+    }
+    let wanted = match read_only {
+        true => attributes | FILE_ATTRIBUTE_READONLY,
+        false => attributes & !FILE_ATTRIBUTE_READONLY,
+    };
+    if wanted == attributes {
+        return Ok(());
+    }
+    let wanted = match wanted & !FILE_ATTRIBUTE_DIRECTORY {
+        0 if wanted & FILE_ATTRIBUTE_DIRECTORY == 0 => FILE_ATTRIBUTE_NORMAL,
+        _ => wanted,
+    };
+    // SAFETY: a NUL-terminated path.
+    sys::check(unsafe { SetFileAttributesW(wide.as_ptr(), wanted) })
+        // alloc: an error path.
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+}
+
+/// Whether `mode` asks for the read-only attribute (the owner's write bit off), refused where
+/// it asks for what Windows does not keep (see [`set_mode`]).
+fn read_only_of(path: &Path, mode: u32) -> io::Result<bool> {
     let owner = (mode >> 6) & 0o7;
     let shared = owner & 0o5;
     let keepable =
@@ -183,29 +213,7 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
             ),
         ));
     }
-    let wide = sys::path(path)?;
-    // SAFETY: a NUL-terminated path.
-    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
-    if attributes == INVALID_FILE_ATTRIBUTES {
-        let error = io::Error::last_os_error();
-        // alloc: an error path.
-        return Err(io::Error::new(error.kind(), format!("{}: {error}", path.display())));
-    }
-    let wanted = match owner & 0o2 {
-        0 => attributes | FILE_ATTRIBUTE_READONLY,
-        _ => attributes & !FILE_ATTRIBUTE_READONLY,
-    };
-    if wanted == attributes {
-        return Ok(());
-    }
-    let wanted = match wanted & !FILE_ATTRIBUTE_DIRECTORY {
-        0 if wanted & FILE_ATTRIBUTE_DIRECTORY == 0 => FILE_ATTRIBUTE_NORMAL,
-        _ => wanted,
-    };
-    // SAFETY: a NUL-terminated path.
-    sys::check(unsafe { SetFileAttributesW(wide.as_ptr(), wanted) })
-        // alloc: an error path.
-        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+    Ok(owner & 0o2 == 0)
 }
 
 /// 100 ns intervals from 1601, where a `FILETIME` counts from, to the Unix epoch.
@@ -273,6 +281,144 @@ fn plain(path: &Path, rights: u32, disposition: u32) -> io::Result<OwnedHandle> 
     sys::owned(handle).map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }
 
+/// The source of a clone opened as itself (`FILE_FLAG_OPEN_REPARSE_POINT`), never through a
+/// link: a reparse point there that names another file (a name surrogate: a symbolic link, a
+/// junction) is refused with [`crate::CLONE_THROUGH_A_LINK`], as `O_NOFOLLOW` refuses one on
+/// Unix; any other reparse point (data deduplication, a cloud placeholder) with
+/// [`crate::CLONE_OF_NO_FILE`], naming its tag.
+fn clone_source(from: &Path) -> io::Result<OwnedHandle> {
+    let wide = sys::path(from)?;
+    // SAFETY: a NUL-terminated path; no security attributes or template.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    // alloc: an error path.
+    let source = sys::owned(handle).map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", from.display())))?;
+    let info = attribute_tag(&source)
+        // alloc: an error path.
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", from.display())))?;
+    if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        return Ok(source);
+    }
+    let tag = info.ReparseTag;
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        // alloc: an error path.
+        match name_surrogate(tag) {
+            true => format!("{} {}", from.display(), crate::CLONE_THROUGH_A_LINK),
+            false => format!("{} (a reparse point of tag {tag:#x}, no link) {}", from.display(), crate::CLONE_OF_NO_FILE),
+        },
+    ))
+}
+
+/// The attributes and reparse tag of the open `handle` (`FileAttributeTagInfo`).
+fn attribute_tag(handle: &OwnedHandle) -> io::Result<FILE_ATTRIBUTE_TAG_INFO> {
+    // SAFETY: all zeros is a valid buffer of plain integers.
+    let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: an open handle and a buffer of the type and size the class fills.
+    sys::check(unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle(),
+            FileAttributeTagInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    })?;
+    Ok(info)
+}
+
+/// Whether a reparse point of `tag` names another file (`IsReparseTagNameSurrogate`: a
+/// symbolic link, a junction), so opening through it would follow it.
+fn name_surrogate(tag: u32) -> bool {
+    tag & 0x2000_0000 != 0
+}
+
+/// The attributes `FileBasicInfo` may set (`FILE_ATTRIBUTE_VALID_SET_FLAGS`): a reparse point's,
+/// a directory's or a sparse file's bit is the file system's to keep, never set this way.
+const SETTABLE_ATTRIBUTES: u32 = 0x31a7;
+
+/// [`crate::Effect::Seal`]: `path` opened as itself (`FILE_FLAG_OPEN_REPARSE_POINT`), refused
+/// when it names another file (a name surrogate: a symbolic link, a junction; a link is never
+/// followed) or is a directory, then its read-only attribute set as [`set_mode`] sets it, on
+/// that same handle (`FileBasicInfo`), so what is sealed is what was looked at, as `fchmod` on
+/// Unix. Any other reparse point (data deduplication, a cloud placeholder) holds a regular
+/// file's data and is sealed.
+pub(crate) fn seal(path: &Path, mode: u32) -> io::Result<()> {
+    let read_only = read_only_of(path, mode)?;
+    let wide = sys::path(path)?;
+    // SAFETY: a NUL-terminated path; no security attributes or template.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+            SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    // alloc: an error path.
+    let named = |error: io::Error| io::Error::new(error.kind(), format!("{}: sealing it: {error}", path.display()));
+    let handle = sys::owned(handle).map_err(named)?;
+    let info = attribute_tag(&handle).map_err(named)?;
+    let attributes = info.FileAttributes;
+    let refused = match () {
+        // alloc: an error path.
+        () if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && name_surrogate(info.ReparseTag) => Some(format!(
+            "{} (a symbolic link or junction, tag {:#x}) {}",
+            path.display(),
+            info.ReparseTag,
+            crate::SEAL_THROUGH_A_LINK
+        )),
+        // alloc: an error path.
+        () if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 => Some(format!("{} (a directory) {}", path.display(), crate::SEAL_OF_NO_FILE)),
+        () => None,
+    };
+    if let Some(refused) = refused {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, refused));
+    }
+    let wanted = match read_only {
+        true => attributes | FILE_ATTRIBUTE_READONLY,
+        false => attributes & !FILE_ATTRIBUTE_READONLY,
+    };
+    if wanted == attributes {
+        return Ok(());
+    }
+    // 0 leaves the attributes as they are; none to keep is `FILE_ATTRIBUTE_NORMAL`.
+    let settable = match wanted & SETTABLE_ATTRIBUTES {
+        0 => FILE_ATTRIBUTE_NORMAL,
+        it => it,
+    };
+    // Times of 0 are left as they are.
+    let basic = FILE_BASIC_INFO {
+        CreationTime: 0,
+        LastAccessTime: 0,
+        LastWriteTime: 0,
+        ChangeTime: 0,
+        FileAttributes: settable,
+    };
+    // SAFETY: an open handle with `FILE_WRITE_ATTRIBUTES` and a buffer of the type and size
+    // the class reads.
+    sys::check(unsafe {
+        SetFileInformationByHandle(
+            handle.as_raw_handle(),
+            FileBasicInfo,
+            (&raw const basic).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    })
+    .map_err(named)
+}
+
 /// The name of the file system `handle` is on, and whether it shares blocks between files.
 fn file_system(handle: &OwnedHandle) -> io::Result<(String, bool)> {
     let mut name = [0u16; 64];
@@ -324,7 +470,7 @@ fn control<T, U>(handle: &OwnedHandle, code: u32, input: Option<&T>, output: Opt
 /// system that cannot: nothing copies instead.
 pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
     crate::fs::make_parent(to)?;
-    let source = plain(from, GENERIC_READ, OPEN_EXISTING)?;
+    let source = clone_source(from)?;
     let (system, shares) = file_system(&source)?;
     if !shares {
         return Err(io::Error::new(

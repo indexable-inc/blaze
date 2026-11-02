@@ -1,6 +1,6 @@
 //! `hot_alloc`: a call that reaches the global allocator.
 //!
-//! [`reaches_alloc`] answers for one instance of a function, its generic arguments given: a
+//! [`reaches_root`] with [`Roots::Alloc`] answers for one instance of a function, its generic arguments given: a
 //! root is a function with `#[rustc_allocator]`, `#[rustc_allocator_zeroed]` or
 //! `#[rustc_reallocator]` (the `__rust_alloc` family), the `exchange_malloc` lang item or the
 //! `box_new` intrinsic; any other function reaches when a call in its body does, the callee's
@@ -15,6 +15,12 @@
 //! The walk goes into a function of a workspace member only for `hot_alloc_call`, the
 //! item-level contract that nothing a hot function calls allocates; for `hot_alloc` such a
 //! function's allocations are found in its own body, and a call of it is none.
+//!
+//! The walk is [`reaches_root`], parameterized by a [`Roots`]: the allocator's functions are
+//! one set, the ambient effects a sans-IO core may not reach (`sans_io_core`) another, the stats
+//! and opens of a path (`syscall_in_loop`) a third. Each set
+//! says which functions end the walk reaching ([`Roots::is_root`]) and which end it not
+//! reaching ([`Roots::stops`]); everything else is walked into the same way.
 
 use base_db::Db;
 use hir_def::{
@@ -42,28 +48,79 @@ use rustc_type_ir::inherent::IntoKind as _;
 /// `type_length_limit`; such an instance is not followed.
 const LONGEST: usize = 256;
 
-/// Whether the instance `f` with `args`, in the environment `env`, reaches the global
-/// allocator: through functions of workspace members too when `through_workspace`.
-#[blaze_query::tracked(returns(copy), cycle_initial = |_, _, _, _, _, _| false)]
-pub(crate) fn reaches_alloc(
+/// The set of functions a walk looks for: part of [`reaches_root`]'s key, so the two walks
+/// never share a memo (rule 18).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Roots {
+    /// The global allocator: `hot_alloc`, `hot_alloc_call`, `hot_clone`.
+    Alloc,
+    /// Ambient effects (the wall clock, threads, files, sockets, processes, the environment,
+    /// stdio, OS randomness, async runtimes, channel timeouts, libc): `sans_io_core`.
+    Ambient,
+    /// A stat or an open of a path (std's `fs::metadata`, `File::open`, libc's `stat`):
+    /// `syscall_in_loop`.
+    Syscall,
+}
+
+impl Roots {
+    /// Whether the walk ends at `f`, reaching.
+    pub(super) fn is_root(self, db: &Db, f: FunctionId) -> bool {
+        match self {
+            Roots::Alloc => is_alloc_root(db, f),
+            Roots::Ambient => super::sans_io_core::ambient(db, f).is_root(),
+            Roots::Syscall => super::syscall_in_loop::syscall(db, f) == super::syscall_in_loop::Syscall::Root,
+        }
+    }
+
+    /// Whether the walk ends at `f`, not reaching: what is followed no further although it has
+    /// a body (std's locks and panic machinery, for the ambient set).
+    fn stops(self, db: &Db, f: FunctionId) -> bool {
+        match self {
+            Roots::Alloc => false,
+            Roots::Ambient => super::sans_io_core::ambient(db, f).stops(),
+            Roots::Syscall => super::syscall_in_loop::syscall(db, f) == super::syscall_in_loop::Syscall::Stop,
+        }
+    }
+}
+
+/// Whether the instance `f` with `args`, in the environment `env`, reaches a function of
+/// `roots`: through functions of workspace members too when `through_workspace`.
+#[blaze_query::tracked(returns(copy), cycle_initial = |_, _, _, _, _, _, _| false)]
+pub(crate) fn reaches_root(
     db: &Db,
     env: StoredParamEnvAndCrate,
     f: FunctionId,
     args: StoredGenericArgs,
     through_workspace: bool,
+    roots: Roots,
 ) -> bool {
-    if is_root(db, f) {
+    if roots.is_root(db, f) {
         return true;
     }
-    if !FunctionSignature::of(db, f).has_body() {
+    if roots.stops(db, f) {
         return false;
+    }
+    first_reaching_call(db, env.as_ref(db), f, args.as_ref(), through_workspace, roots).is_some()
+}
+
+/// What the first call of `f`'s body (instantiated with `args`) that reaches a function of
+/// `roots` runs: the next step of a chain to a root. `None` when no call does, or `f` has no
+/// body.
+pub(super) fn first_reaching_call<'db>(
+    db: &'db Db,
+    env: ParamEnvAndCrate<'db>,
+    f: FunctionId,
+    args: GenericArgs<'db>,
+    through_workspace: bool,
+    roots: Roots,
+) -> Option<Resolved<'db>> {
+    if !FunctionSignature::of(db, f).has_body() {
+        return None;
     }
     let def = DefWithBodyId::FunctionId(f);
     let body = Body::of(db, def);
     let infer = InferenceResult::of(db, def);
     let interner = DbInterner::new_no_crate(db);
-    let env = env.as_ref(db);
-    let args = args.as_ref();
     for (id, expr) in body.exprs() {
         if !matches!(expr, Expr::Call { .. } | Expr::MethodCall { .. }) {
             continue;
@@ -71,15 +128,34 @@ pub(crate) fn reaches_alloc(
         let Some((callee, callee_args)) = written_callee(infer, body, id) else { continue };
         let callee_args =
             EarlyBinder::bind(interner, callee_args).instantiate(interner, args).skip_norm_wip();
-        if instance_reaches(db, env, resolve(db, env, callee, callee_args), through_workspace) {
-            return true;
+        let resolved = resolve(db, env, callee, callee_args);
+        if instance_reaches_root(db, env, resolved, through_workspace, roots) {
+            return Some(resolved);
         }
     }
-    false
+    None
+}
+
+/// The step after `resolved` on a chain to a function of `roots`: `None` once `resolved` is
+/// a root itself (or reaches none).
+pub(super) fn next_step<'db>(
+    db: &'db Db,
+    env: ParamEnvAndCrate<'db>,
+    resolved: Resolved<'db>,
+    through_workspace: bool,
+    roots: Roots,
+) -> Option<Resolved<'db>> {
+    match resolved {
+        Resolved::Function(f, _) if roots.is_root(db, f) || roots.stops(db, f) => None,
+        Resolved::Function(f, args) => first_reaching_call(db, env, f, args, through_workspace, roots),
+        Resolved::Derived(impl_, method, args) => {
+            derived_first(db, env, impl_, method, args, through_workspace, roots)
+        }
+    }
 }
 
 /// A function of the allocator itself.
-fn is_root(db: &Db, f: FunctionId) -> bool {
+fn is_alloc_root(db: &Db, f: FunctionId) -> bool {
     let flags = AttrFlags::query(db, f.into());
     if flags.intersects(
         AttrFlags::RUSTC_ALLOCATOR | AttrFlags::RUSTC_ALLOCATOR_ZEROED | AttrFlags::RUSTC_REALLOCATOR,
@@ -142,14 +218,26 @@ pub(super) fn instance_reaches<'db>(
     resolved: Resolved<'db>,
     through_workspace: bool,
 ) -> bool {
+    instance_reaches_root(db, env, resolved, through_workspace, Roots::Alloc)
+}
+
+/// Whether what `resolved` runs reaches a function of `roots`: through functions of workspace
+/// members too when `through_workspace`.
+pub(super) fn instance_reaches_root<'db>(
+    db: &'db Db,
+    env: ParamEnvAndCrate<'db>,
+    resolved: Resolved<'db>,
+    through_workspace: bool,
+    roots: Roots,
+) -> bool {
     match resolved {
         Resolved::Function(f, args) => {
             (through_workspace || !f.krate(db).data(db).origin.is_local())
                 && fits(args.types().map(|it| it.walk()), LONGEST)
-                && reaches_alloc(db, env.store(), f, args.store(), through_workspace)
+                && reaches_root(db, env.store(), f, args.store(), through_workspace, roots)
         }
         Resolved::Derived(impl_, method, args) => {
-            derived_reaches(db, env, impl_, method, args, through_workspace)
+            derived_first(db, env, impl_, method, args, through_workspace, roots).is_some()
         }
     }
 }
@@ -167,30 +255,39 @@ fn fits<I: Iterator>(types: impl Iterator<Item = I>, longest: usize) -> bool {
     true
 }
 
-/// Whether a built-in derive's `clone` or `default` reaches the allocator: it calls the
-/// trait's method on every field. The other derived methods reach nothing through their
-/// fields that a hot function would call them for (`fmt` formats through `&dyn Debug`).
-fn derived_reaches<'db>(
+/// What the first field's call of a built-in derive's `clone` or `default` that reaches a
+/// function of `roots` runs: it calls the trait's method on every field. The other derived
+/// methods reach nothing through their fields that a hot function or a core would call them
+/// for (`fmt` formats through `&dyn Debug`, `hash` feeds the `H: Hasher` it is given).
+fn derived_first<'db>(
     db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     impl_: BuiltinDeriveImplId,
     method: BuiltinDeriveImplMethod,
     args: GenericArgs<'db>,
     through_workspace: bool,
-) -> bool {
+    roots: Roots,
+) -> Option<Resolved<'db>> {
     if !matches!(method, BuiltinDeriveImplMethod::clone | BuiltinDeriveImplMethod::default) {
-        return false;
+        return None;
     }
-    let Some(trait_method) = method.trait_method(db, impl_) else { return false };
+    let trait_method = method.trait_method(db, impl_)?;
     let interner = DbInterner::new_no_crate(db);
     let adt = impl_.loc(db).adt;
+    let mut found = None;
     any_variant(db, adt, |variant| {
         db.field_types(variant).iter().any(|(_, field)| {
             let ty = field.ty().instantiate(interner, args).skip_norm_wip();
             let field_args = GenericArgs::new_from_slice(&[GenericArg::from(ty)]);
-            instance_reaches(db, env, resolve(db, env, trait_method, field_args), through_workspace)
+            let resolved = resolve(db, env, trait_method, field_args);
+            let reaches = instance_reaches_root(db, env, resolved, through_workspace, roots);
+            if reaches {
+                found = Some(resolved);
+            }
+            reaches
         })
-    })
+    });
+    found
 }
 
 /// Whether `f` holds for some variant of `adt`: its one for a struct or union.
@@ -229,7 +326,7 @@ impl Std {
 /// global allocator's that has not allocated yet and will when it grows: one with `Global` as a
 /// type argument (`Vec::new()`, `vec![]`, `VecDeque::default()`), `String::new()`, or std's
 /// `HashMap` or `HashSet`, which take no allocator (one hashing with `RandomState` is
-/// `std_hashmap`'s). A collection that names its allocator (`Vec::new_in(frame)`) is not one.
+/// `default_hasher`'s). A collection that names its allocator (`Vec::new_in(frame)`) is not one.
 pub(super) fn makes_global(k: &super::Known<'_>, callee: FunctionId, ty: Ty<'_>) -> Option<AdtId> {
     let (adt, args) = ty.as_adt()?;
     let global = Some(adt) == k.alloc.string

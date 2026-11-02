@@ -12,8 +12,6 @@
 //! each keeps its own memo under its own key, and every one computes through `compute` or
 //! `compute_monomorphized`, which take the stage before from its memo ([`mir_at`]).
 
-use std::sync::OnceLock;
-
 use base_db::Db;
 use rustc_type_ir::{
     Interner as _, RegionKind, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable,
@@ -77,7 +75,8 @@ inventory::collect!(Mir);
 
 /// The linked MIR table.
 pub fn mir() -> &'static Mir {
-    static ONE: OnceLock<&'static Mir> = OnceLock::new();
+    #[expect(clippy::disallowed_types, reason = "the process's one MIR provider table: selected from the linked providers")]
+    static ONE: std::sync::OnceLock<&'static Mir> = std::sync::OnceLock::new();
     ONE.get_or_init(|| {
         let mut tested = inventory::iter::<Mir>().filter(|it| it.own_tests);
         let Some(first) = tested.next() else { return one::<Mir>("hir-ty-mir") };

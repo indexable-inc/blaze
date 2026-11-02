@@ -4,6 +4,7 @@ use std::{cmp::Ordering, fmt};
 
 use base_db::{Crate, Db};
 use blaze_hash::{FixedState, HashSet};
+use std::alloc::Global;
 use blaze_ids::bits::BitSet;
 use blaze_mem::Frame;
 use hir_expand::name::Name;
@@ -294,7 +295,7 @@ impl<'f> Collector<'f> {
     }
 
     fn collect(db: &Db, krate: Crate, frame: &'f Frame) -> Collector<'f> {
-        let _p = tracing::info_span!("collect_import_map").entered();
+        let _p = tracing::info_span!(target: "blaze", "collect_import_map").entered();
 
         let def_map = crate_def_map(db, krate);
         let mut found = Collector {
@@ -655,9 +656,9 @@ pub fn search_dependencies(
     db: &Db,
     krate: Crate,
     query: &Query,
-) -> HashSet<(ItemInNs, Complete)> {
+) -> HashSet<(ItemInNs, Complete), Global> {
     // alloc: the caller's result, at the edge
-    let mut found = HashSet::default();
+    let mut found = HashSet::new_in(Global);
     search_dependencies_into(db, krate, query, &mut found);
     found
 }
@@ -668,7 +669,7 @@ pub fn search_dependencies_into(
     db: &Db,
     krate: Crate,
     query: &Query,
-    found: &mut HashSet<(ItemInNs, Complete)>,
+    found: &mut HashSet<(ItemInNs, Complete), Global>,
 ) {
     search_dependencies_each(db, krate, query, |item, complete| {
         found.insert((item, complete));
@@ -684,7 +685,7 @@ pub fn search_dependencies_each(
     query: &Query,
     mut f: impl FnMut(ItemInNs, Complete),
 ) {
-    let _p = tracing::info_span!("search_dependencies", ?query).entered();
+    let _p = tracing::info_span!(target: "blaze", "search_dependencies", ?query).entered();
     let lowercased = query.lowercased.as_bytes();
     for dep in krate.data(db).dependencies.iter() {
         let map = ImportMap::of(db, dep.crate_id);
@@ -1308,6 +1309,7 @@ pub mod fmt {
     mod reference {
         use base_db::{Crate, Db};
         use blaze_hash::HashSet;
+        use std::alloc::Global;
         use fst::{Automaton, IntoStreamer, Streamer, raw::IndexedValue};
         use itertools::Itertools;
         use smallvec::SmallVec;
@@ -1375,7 +1377,7 @@ pub mod fmt {
             let mut map = FxIndexMap::default();
             let root = def_map.root_module_id();
             let mut worklist = vec![root];
-            let mut visited = HashSet::default();
+            let mut visited = HashSet::new_in(Global);
             while let Some(module) = worklist.pop() {
                 if !visited.insert(module) {
                     continue;
@@ -1568,7 +1570,7 @@ pub mod fmt {
             db: &Db,
             krate: Crate,
             query: &Query,
-        ) -> HashSet<(ItemInNs, Complete)> {
+        ) -> HashSet<(ItemInNs, Complete), Global> {
             let maps: Vec<_> =
                 krate.data(db).dependencies.iter().map(|dep| build(db, dep.crate_id)).collect();
             let mut op = fst::map::OpBuilder::new();
@@ -1657,8 +1659,8 @@ pub mod fmt {
             maps: &[OldImportMap],
             mut stream: fst::map::Union<'_>,
             query: &Query,
-        ) -> HashSet<(ItemInNs, Complete)> {
-            let mut res = HashSet::default();
+        ) -> HashSet<(ItemInNs, Complete), Global> {
+            let mut res = HashSet::new_in(Global);
             while let Some((_, indexed_values)) = stream.next() {
                 for &IndexedValue { index, value } in indexed_values {
                     let end = (value & 0xFFFF_FFFF) as usize;
@@ -1897,7 +1899,7 @@ pub mod fmt {
             Query::new("fmt".to_owned()).fuzzy(),
             Query::new("FMT".to_owned()).fuzzy().case_sensitive(),
         ];
-        let mut found = HashSet::default();
+        let mut found = HashSet::new_in(Global);
         for query in &queries {
             search_dependencies_into(&db, main, query, &mut found);
         }
@@ -1950,7 +1952,7 @@ pub fn fmt() {}
             })
         });
         assert_eq!(first, again);
-        let visited: HashSet<_> = first.iter().copied().collect();
+        let visited: HashSet<_, Global> = first.iter().copied().collect();
         assert_eq!(visited, search_dependencies(&db, main, &query));
     }
 

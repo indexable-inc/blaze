@@ -28,6 +28,7 @@ use std::{
 };
 
 use blaze_hash::{FixedHasher, HashMap, HashSet};
+use std::alloc::Global;
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::{
@@ -167,7 +168,7 @@ const fn sym(shard: usize, epoch: u32, index: usize) -> Sym {
 #[derive(Default)]
 struct Generation {
     epoch: u32,
-    ids: HashMap<std::sync::Arc<str>, Sym>,
+    ids: HashMap<std::sync::Arc<str>, Sym, Global>,
     names: Vec<std::sync::Arc<str>>,
 }
 
@@ -296,15 +297,15 @@ pub enum Plot {
     FiberStackTouched,
     /// Bytes of segments the job grew past its fiber's stack ([`FiberStack::grown`]).
     FiberStackGrown,
-    /// Runs of one kind of query in a build ([`query_counts`]).
-    QueryExecuted,
-    /// Rows of one kind of query a build verified without running them.
-    QueryVerified,
-    /// Runs of one kind of query in a build for a key that kind ran already in that build.
-    QueryReran,
     /// Bytes of the process's physical footprint, what the OS counts against it (compressed
     /// pages too): all it holds, not only what `blaze_mem` tags.
     Footprint,
+    /// Proc-macro wasm modules the daemon had in its memo when loaded, so far.
+    MacroModuleMemo,
+    /// Proc-macro wasm modules whose machine code the daemon loaded from its own store, so far.
+    MacroModuleStore,
+    /// Proc-macro wasm modules the daemon compiled, so far.
+    MacroModuleCompiled,
 }
 
 impl Plot {
@@ -320,10 +321,10 @@ impl Plot {
         Plot::FiberStackDeepest,
         Plot::FiberStackTouched,
         Plot::FiberStackGrown,
-        Plot::QueryExecuted,
-        Plot::QueryVerified,
-        Plot::QueryReran,
         Plot::Footprint,
+        Plot::MacroModuleMemo,
+        Plot::MacroModuleStore,
+        Plot::MacroModuleCompiled,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -339,10 +340,10 @@ impl Plot {
             Plot::FiberStackDeepest => "fiber stack deepest",
             Plot::FiberStackTouched => "fiber stack touched",
             Plot::FiberStackGrown => "fiber stack grown",
-            Plot::QueryExecuted => "query executed",
-            Plot::QueryVerified => "query verified",
-            Plot::QueryReran => "query reran",
             Plot::Footprint => "footprint bytes",
+            Plot::MacroModuleMemo => "macro modules from memo",
+            Plot::MacroModuleStore => "macro modules from store",
+            Plot::MacroModuleCompiled => "macro modules compiled",
         }
     }
 
@@ -393,33 +394,6 @@ pub fn fiber_stack(stack: FiberStack) {
     }
 }
 
-/// How one kind of query went in a build, as the query engine counts it: read as the counters
-/// [`Plot::QueryExecuted`], [`Plot::QueryVerified`] and [`Plot::QueryReran`] of the kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct QueryCounts<'a> {
-    /// The build they are of.
-    pub build: u32,
-    /// The query's kind, as its span is named (`file_item_tree_query`), so the counters join
-    /// the spans' `query_kind`.
-    pub kind: &'a str,
-    pub executed: u64,
-    pub verified: u64,
-    /// Of `executed`, the runs for a key the kind ran already in the build: repeated work.
-    pub reran: u64,
-}
-
-/// The plot byte of a [`query_counts`] row: one row a kind, read as three counters.
-const QUERY_COUNTS_ROW: u64 = 0xfb;
-
-/// Notes `counts` now, in this thread's ring: one row, at a build's end, once a kind.
-pub fn query_counts(counts: QueryCounts<'_>) {
-    if let Some(ring) = ring() {
-        let build = u64::from(counts.build);
-        let what = KIND_PLOT << 62 | u64::from(intern(counts.kind)) << 8 | QUERY_COUNTS_ROW;
-        ring.put([clock::ticks(), counts.executed, counts.verified, counts.reran, what, 0, build, 0]);
-    }
-}
-
 /// Notes the end of the build `serial`: a mark on the timeline.
 pub(crate) fn mark(serial: u64) {
     if let Some(ring) = ring() {
@@ -438,6 +412,9 @@ thread_local! {
 /// around each task it runs for a request.
 #[must_use]
 pub fn building(build: u32) -> Building {
+    if build != 0 {
+        RUNNING.with(|it| it.set(OnThread { build, ..it.get() }));
+    }
     Building(BUILD.with(|it| it.replace(build)))
 }
 
@@ -465,6 +442,8 @@ struct Carried {
     cpu_at: u64,
     /// The job's span, closed as it parked, to open again as it resumes.
     job: Option<JobSegment>,
+    /// The job itself, as its switches name it, and its build ([`running_job`]).
+    running: OnThread,
 }
 
 /// A job's span as its job parked ([`job_began`]): its kind's site and columns, and where it
@@ -528,15 +507,16 @@ pub fn take_open() -> usize {
     let ring = MINE.with(Cell::get);
     // Before the job's clock is taken: the segment's CPU is read on it.
     let job = ring.and_then(park_job);
+    let running = RUNNING.with(|it| it.replace(OnThread::default()));
     let depth = ring.map_or(0, |it| it.depth.load(Ordering::Relaxed));
-    let nothing = depth == 0 && build == 0 && job.is_none();
+    let nothing = depth == 0 && build == 0 && job.is_none() && running == OnThread::default();
     let (cpu_clock, cpu_at) = if nothing { (0, 0) } else { job_cpu().unwrap_or((0, 0)) };
     // The next job on this thread counts on a clock of its own.
     JOB_CPU.with(|it| it.set((0, 0)));
     if nothing {
         return 0;
     }
-    let mut carried = Carried { depth, build, entered: [0; OPEN_MAX], cpu_clock, cpu_at, job };
+    let mut carried = Carried { depth, build, entered: [0; OPEN_MAX], cpu_clock, cpu_at, job, running };
     if let Some(ring) = ring {
         for (to, from) in carried.entered.iter_mut().zip(&ring.entered[..(depth as usize).min(OPEN_MAX)]) {
             *to = from.load(Ordering::Relaxed);
@@ -572,6 +552,7 @@ pub fn put_open(taken: usize) {
         carried
     };
     BUILD.with(|it| it.set(carried.build));
+    RUNNING.with(|it| it.set(carried.running));
     // The job's clock goes on from where it parked; unread, its open spans' CPU is not counted.
     let now = (carried.cpu_clock != 0).then(|| THREAD_CPU.get().and_then(|read| read())).flatten();
     let resumed = now.map_or((0, 0), |now| (carried.cpu_clock, now.wrapping_sub(carried.cpu_at)));
@@ -613,9 +594,24 @@ pub enum Switched {
     Idle,
     /// The worker woke from its idle stretch.
     Woke,
+    /// A parked job became runnable, on its waker's thread: `by` is the job running there.
+    Ready,
+    /// A pool job that never joined the graph ended: its whole life, from `since`.
+    Ran,
 }
 
 impl Switched {
+    pub const ALL: [Switched; 8] = [
+        Switched::Started,
+        Switched::Parked,
+        Switched::Resumed,
+        Switched::Ended,
+        Switched::Idle,
+        Switched::Woke,
+        Switched::Ready,
+        Switched::Ran,
+    ];
+
     pub const fn name(self) -> &'static str {
         match self {
             Switched::Started => "started",
@@ -624,13 +620,13 @@ impl Switched {
             Switched::Ended => "ended",
             Switched::Idle => "idle",
             Switched::Woke => "woke",
+            Switched::Ready => "ready",
+            Switched::Ran => "ran",
         }
     }
 
     fn of(byte: u64) -> Option<Switched> {
-        [Switched::Started, Switched::Parked, Switched::Resumed, Switched::Ended, Switched::Idle, Switched::Woke]
-            .into_iter()
-            .find(|it| *it as u64 == byte)
+        Switched::ALL.into_iter().find(|it| *it as u64 == byte)
     }
 }
 
@@ -638,7 +634,7 @@ impl Switched {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WaitedOn {
-    /// A job's end: the value is the job's number (its slot; the job it holds then).
+    /// A job's end: the value is the job's number, as `job` names a job.
     Job = 1,
     /// A key's flight: the value is the key's hash, its first eight bytes.
     Key,
@@ -686,15 +682,152 @@ pub struct Switch {
 /// The plot byte of a [`switched`] row.
 const SWITCH_ROW: u64 = 0xfd;
 
-/// Notes `switch` now, in this thread's ring: one row, the `switches` table's.
+/// The job running on a thread, as its switch rows name it (0: none), and the build it last
+/// worked for: what its `ended` row is of, written after its code let go of the build. Moved
+/// with the job when its fiber parks ([`Carried`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OnThread {
+    job: u64,
+    build: u32,
+}
+
+/// A pool job that began on this thread and has not joined the graph yet ([`job_begins`]):
+/// what its `started` or `ran` row says of its start.
+#[derive(Clone, Copy, Debug)]
+struct Begun {
+    ticks: u64,
+    /// Its number until it joins the graph ([`UNJOINED_SLOT`]).
+    unjoined: u64,
+    spawner: u64,
+}
+
+thread_local! {
+    static RUNNING: Cell<OnThread> = const { Cell::new(OnThread { job: 0, build: 0 }) };
+    static BEGUN: Cell<Option<Begun>> = const { Cell::new(None) };
+}
+
+/// The slot of a job's number before it joins the graph: `blaze_graph`'s unregistered slot,
+/// which no job in the graph has, under a count of this process's own as its generation.
+pub const UNJOINED_SLOT: u64 = 0xffff_ffff;
+static UNJOINED: AtomicU64 = AtomicU64::new(1);
+
+/// The job running on this thread as its switch rows name it, 0 for none: the spawner a pool
+/// job given to the pool now is told of (`blaze_graph::sched::fiber::observe_spawner`).
+pub fn running_job() -> u64 {
+    RUNNING.with(Cell::get).job
+}
+
+/// A pool job given to the pool by `spawner` begins on this thread. No row: its `started` or
+/// `ran` row says when (`since`), so a job's life costs no row more than its switches.
+pub fn job_begins(spawner: u64) {
+    let unjoined = UNJOINED.fetch_add(1, Ordering::Relaxed) << 32 | UNJOINED_SLOT;
+    BEGUN.with(|it| it.set(Some(Begun { ticks: clock::ticks(), unjoined, spawner })));
+    RUNNING.with(|it| it.set(OnThread { job: unjoined, build: BUILD.with(Cell::get) }));
+}
+
+/// Notes `switch` now, in this thread's ring: one row, the `switches` table's. Its words past
+/// the switch's own: `by` (word 5), the spawner of a `started` or `ran` job and the waker of
+/// a `ready` one; `since` (word 7), when a `started` or `ran` job began; and for `started`,
+/// in the value word, the number it had before it joined the graph.
 #[inline]
 pub fn switched(switch: Switch) {
-    if let Some(ring) = ring() {
-        let build = u64::from(BUILD.with(Cell::get));
-        let (waited, value) = switch.waited.map_or((0, 0), |(on, value)| (on as u64, value));
-        let what = KIND_PLOT << 62 | waited << 16 | (switch.event as u64) << 8 | SWITCH_ROW;
-        let where_ = u64::from(switch.core) << 32 | u64::from(switch.fiber);
-        ring.put([clock::ticks(), switch.job, value, where_, what, 0, build, 0]);
+    let running = RUNNING.with(Cell::get);
+    let build = match BUILD.with(Cell::get) {
+        0 => running.build,
+        build => build,
+    };
+    let (waited, mut value) = switch.waited.map_or((0, 0), |(on, value)| (on as u64, value));
+    let (mut job, mut by, mut since) = (switch.job, 0, 0);
+    match switch.event {
+        Switched::Started => {
+            if let Some(begun) = BEGUN.with(Cell::take) {
+                (value, by, since) = (begun.unjoined, begun.spawner, begun.ticks);
+            }
+            RUNNING.with(|it| it.set(OnThread { job: switch.job, build }));
+        }
+        Switched::Ran => {
+            // A job that began before the observer was installed: its life is not in the record.
+            let Some(begun) = BEGUN.with(Cell::take) else { return };
+            (job, by, since) = (begun.unjoined, begun.spawner, begun.ticks);
+            RUNNING.with(|it| it.set(OnThread::default()));
+        }
+        Switched::Ended => {
+            BEGUN.with(Cell::take);
+            RUNNING.with(|it| it.set(OnThread::default()));
+        }
+        Switched::Ready => by = running.job,
+        Switched::Parked | Switched::Resumed | Switched::Idle | Switched::Woke => {}
+    }
+    // The thread's running job moves above whether or not the row is kept.
+    let Some(ring) = ring() else { return };
+    let what = KIND_PLOT << 62 | waited << 16 | (switch.event as u64) << 8 | SWITCH_ROW;
+    let where_ = u64::from(switch.core) << 32 | u64::from(switch.fiber);
+    ring.put([clock::ticks(), job, value, where_, what, by, u64::from(build), since]);
+}
+
+// --- Events -------------------------------------------------------------------------------
+
+/// The low byte of word 4 of an event's row ([`evented`]).
+const EVENT_ROW: u64 = 0xfc;
+
+/// Notes the `tracing` event `event` of `site` now, in this thread's ring: one row, the `events`
+/// table's. Words: when, the job running here ([`running_job`]), the span it happened in, its
+/// site (level, target and name), its message and fields as one interned text, and its build.
+pub(crate) fn evented(event: &tracing::Event<'_>, site: u16) {
+    let Some(ring) = ring() else {
+        RINGLESS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let span = if event.is_root() {
+        0
+    } else if let Some(parent) = event.parent() {
+        parent.into_u64()
+    } else {
+        let depth = (ring.depth.load(Ordering::Relaxed) as usize).min(OPEN_MAX);
+        ring.entered[..depth].last().map_or(0, |it| it.load(Ordering::Relaxed))
+    };
+    let span = if span == UNRECORDED { 0 } else { span };
+    let message = TEXT
+        .try_with(|text| {
+            // A field's `Debug` that itself logs finds the text taken: that event has none.
+            let Ok(mut text) = text.try_borrow_mut() else { return 0 };
+            text.clear();
+            event.record(&mut Message(&mut *text));
+            intern(&text)
+        })
+        .unwrap_or(0);
+    let running = RUNNING.with(Cell::get);
+    let build = match BUILD.with(Cell::get) {
+        0 => running.build,
+        build => build,
+    };
+    let what = KIND_PLOT << 62 | u64::from(site) << 8 | EVENT_ROW;
+    ring.put([clock::ticks(), running.job, span, 0, what, u64::from(message), u64::from(build), 0]);
+}
+
+/// An event's fields as one text: its message, then each other field as `name=value`.
+struct Message<'a>(&'a mut String);
+
+impl Message<'_> {
+    fn put(&mut self, name: &str, value: std::fmt::Arguments<'_>) {
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        // Writing to a `String` does not fail.
+        if name != "message" {
+            _ = write!(self.0, "{name}=");
+        }
+        _ = self.0.write_fmt(value);
+    }
+}
+
+impl tracing::field::Visit for Message<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.put(field.name(), format_args!("{value}"));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.put(field.name(), format_args!("{value:?}"));
     }
 }
 
@@ -804,7 +937,7 @@ const _: () = assert!(TYPED < CPU_COL as usize, "a typed column's index is a byt
 const UNCOUNTED: u64 = 1;
 
 const _: () = {
-    let bytes = [FIBER_STACK_ROW, SPAN_COPIED_ROW, SWITCH_ROW, QUERY_COUNTS_ROW, SPAN_COLS_ROW];
+    let bytes = [FIBER_STACK_ROW, SPAN_COPIED_ROW, SWITCH_ROW, SPAN_COLS_ROW];
     let mut i = 0;
     while i < bytes.len() {
         assert!(bytes[i] as usize >= Plot::ALL.len(), "a row's plot byte is no plot's");
@@ -1565,8 +1698,6 @@ pub struct CounterRow {
     pub value: u64,
     /// The fiber and job a [`fiber_stack`] counter is of; `None` for every other plot.
     pub fiber: Option<(u32, u64)>,
-    /// The query kind a [`query_counts`] counter is of; 0 for every other plot.
-    pub query_kind: Sym,
 }
 
 /// A row of the schema's `switches` table: a [`switched`] row, on the thread it happened on.
@@ -1581,6 +1712,31 @@ pub struct SwitchRow {
     pub fiber: u32,
     pub core: u32,
     pub waited: Option<(WaitedOn, u64)>,
+    /// For `started` and `ran`, the job that gave it to the pool; for `ready`, the job that
+    /// woke it. `None`: no job (a thread on no fiber), or another event.
+    pub by: Option<u64>,
+    /// For `started` and `ran`, when the job began on its fiber.
+    pub since_ns: Option<i64>,
+    /// For `started` after a `Began`, the number the job had before it joined the graph, which
+    /// what it did before then (its spans, the jobs it gave the pool) names.
+    pub began_as: Option<u64>,
+}
+
+/// A row of the schema's `events` table: an [`evented`] `tracing` event, on the thread it
+/// happened on; its level, target and name are its site's ([`meta`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventRow {
+    pub build: u32,
+    pub thread: u32,
+    pub thread_name: Sym,
+    pub t_ns: i64,
+    /// The job running on the thread, as `switches` names it: 0 for none.
+    pub job: u64,
+    /// The span it happened in: 0 for none.
+    pub span: u64,
+    pub site: u16,
+    /// Its message and fields ([`name`]).
+    pub message: Sym,
 }
 
 /// A build's end, as [`crate::built`] noted it.
@@ -1597,6 +1753,7 @@ pub struct Read {
     pub spans: Vec<SpanRow>,
     pub counters: Vec<CounterRow>,
     pub switches: Vec<SwitchRow>,
+    pub events: Vec<EventRow>,
     pub ends: Vec<BuildEnd>,
     /// Rows written over before this reader read them: it fell behind by that many.
     pub skipped: u64,
@@ -1616,6 +1773,7 @@ impl Read {
         self.spans.clear();
         self.counters.clear();
         self.switches.clear();
+        self.events.clear();
         self.ends.clear();
         self.skipped = 0;
     }
@@ -1654,6 +1812,7 @@ pub fn window(window: Duration, into: &mut Read) {
     into.spans.retain(|it| it.start_ns + it.dur_ns >= since);
     into.counters.retain(|it| it.t_ns >= since);
     into.switches.retain(|it| it.t_ns >= since);
+    into.events.retain(|it| it.t_ns >= since);
     into.ends.retain(|it| it.t_ns >= since);
 }
 
@@ -1714,8 +1873,21 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                         fiber: row[3] as u32,
                         core: (row[3] >> 32) as u32,
                         waited: WaitedOn::of(row[4] >> 16 & 0xff).map(|on| (on, row[2])),
+                        by: (row[5] != 0).then_some(row[5]),
+                        since_ns: (row[7] != 0).then(|| scale.mono(row[7])),
+                        began_as: (event == Switched::Started && row[2] != 0).then_some(row[2]),
                     });
                 }
+                KIND_PLOT if row[4] & 0xff == EVENT_ROW => into.events.push(EventRow {
+                    build: row[6] as u32,
+                    thread: by.tid,
+                    thread_name: by.name,
+                    t_ns: scale.mono(row[0]),
+                    job: row[1],
+                    span: row[2],
+                    site: (row[4] >> 8 & ((1 << SITE_BITS) - 1)) as u16,
+                    message: row[5] as Sym,
+                }),
                 KIND_PLOT if row[4] & 0xff == SPAN_COPIED_ROW => {
                     // Written right after its span's row, by the same thread: the span read
                     // last, unless the ring wrote over that row first.
@@ -1752,15 +1924,7 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                             (Plot::FiberStackTouched, row[3]),
                             (Plot::FiberStackGrown, row[5]),
                         ]
-                        .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber, query_kind: 0 }),
-                    );
-                }
-                KIND_PLOT if row[4] & 0xff == QUERY_COUNTS_ROW => {
-                    let query_kind = (row[4] >> 8) as Sym;
-                    let (build, t_ns) = (row[6] as u32, scale.mono(row[0]));
-                    into.counters.extend(
-                        [(Plot::QueryExecuted, row[1]), (Plot::QueryVerified, row[2]), (Plot::QueryReran, row[3])]
-                            .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber: None, query_kind }),
+                        .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber }),
                     );
                 }
                 KIND_PLOT => {
@@ -1771,7 +1935,6 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                         t_ns: scale.mono(row[0]),
                         value: row[1],
                         fiber: None,
-                        query_kind: 0,
                     });
                 }
                 KIND_MARK => into.ends.push(BuildEnd { build: row[1], t_ns: scale.mono(row[0]), thread: by.tid }),
@@ -1913,7 +2076,7 @@ pub(crate) fn part(window: Duration) -> Part {
     let mut read = Read::default();
     self::window(window, &mut read);
     let mut part = Part { pid: std::process::id(), command: crate::command(), ..Part::default() };
-    let mut named: HashSet<u32> = HashSet::default();
+    let mut named: HashSet<u32, Global> = HashSet::new_in(Global);
     for span in &read.spans {
         if named.insert(span.thread) {
             // alloc: a dump, on demand
@@ -1955,6 +2118,7 @@ pub(crate) fn part(window: Duration) -> Part {
     let (samples, sampler) = crate::sampler::taken(since, &epoch);
     part.samples = samples;
     part.sampler = sampler;
+    part.fibers = crate::time::trace::of_read(&read, part.pid, |ns| epoch.us_of_mono(ns) as f64);
     part
 }
 
@@ -2530,6 +2694,155 @@ mod tests {
         }
     }
 
+    /// A job tree a pool runs: job 0 is given to the pool from the test's thread, each other
+    /// job by its parent from inside the parent's run. A job asks one of two keys or none, so
+    /// one job parks on another's run of a key.
+    #[derive(Debug)]
+    struct Tree {
+        parent: Vec<usize>,
+        key: Vec<Option<u8>>,
+        spin_us: Vec<u64>,
+    }
+
+    fn tree(tc: &hegel::TestCase) -> Tree {
+        use hegel::generators as gs;
+        let jobs = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+        let mut it = Tree { parent: vec![0], key: Vec::new(), spin_us: Vec::new() };
+        for i in 1..jobs {
+            it.parent.push(tc.draw(gs::integers::<usize>().max_value(i - 1)));
+        }
+        for _ in 0..jobs {
+            let key = tc.draw(gs::integers::<u8>().max_value(2));
+            it.key.push((key < 2).then_some(key));
+            it.spin_us.push(tc.draw(gs::integers::<u64>().max_value(300)));
+        }
+        it
+    }
+
+    /// A case's run. Its jobs hold the pool weakly: the test's thread holds the one strong
+    /// handle, so the pool is dropped (and its workers joined) there and never on a worker.
+    struct Case {
+        tree: Tree,
+        build: u32,
+        flights: blaze_graph::pump::Flights<u32>,
+        pool: std::sync::Weak<blaze_graph::pool::Pool>,
+        done: crossbeam_channel::Sender<(usize, bool)>,
+    }
+
+    /// Gives `job` to `pool`: called with the test's handle for the root, and with a parent
+    /// job's upgrade, which lives only for the parent's run, for the rest.
+    fn give(pool: &blaze_graph::pool::Pool, case: std::sync::Arc<Case>, job: usize) {
+        let done = case.done.clone();
+        pool.submit(None, move || run_job(&case, job), move |it| done.send((job, it.is_ok())).unwrap());
+    }
+
+    fn run_job(case: &std::sync::Arc<Case>, job: usize) {
+        let _build = building(case.build);
+        let spin = Duration::from_micros(case.tree.spin_us[job]);
+        match case.tree.key[job] {
+            Some(key) => {
+                let mut bytes = [key; 32];
+                bytes[..4].copy_from_slice(&case.build.to_le_bytes());
+                let got = case.flights.get_or_run_named(blaze_graph::Key(bytes), |it| it.push_str("pool run key"), || {
+                    blaze_graph::spin::busy(spin);
+                    Ok(0)
+                });
+                assert!(got.is_ok(), "nothing cancels a key's run here");
+            }
+            None => blaze_graph::spin::busy(spin),
+        }
+        let children: Vec<usize> = (1..case.tree.parent.len()).filter(|&it| case.tree.parent[it] == job).collect();
+        if children.is_empty() {
+            return;
+        }
+        // The test's thread drops its handle only once every job's `done` came, and this job's
+        // comes after this run returns.
+        let pool = case.pool.upgrade().expect("the test holds the pool until every job is done");
+        for child in children {
+            give(&pool, std::sync::Arc::clone(case), child);
+        }
+    }
+
+    /// The rows of `build`'s jobs: their switches, by the jobs whose `started` or `ran` row is
+    /// of it, and the spans under a `job` span naming one of them.
+    fn of_build(read: &Read, build: u32) -> Read {
+        let mut jobs: std::collections::HashSet<u64> = read
+            .switches
+            .iter()
+            .filter(|it| it.build == build && matches!(it.event, Switched::Started | Switched::Ran))
+            .map(|it| it.job)
+            .collect();
+        let began: Vec<u64> = read.switches.iter().filter(|it| jobs.contains(&it.job)).filter_map(|it| it.began_as).collect();
+        jobs.extend(began);
+        let spans: std::collections::HashMap<u64, &SpanRow> = read.spans.iter().map(|it| (it.span_id, it)).collect();
+        // A fn, not a closure: an annotated closure argument is higher-ranked, and walking up to a
+        // parent from the map needs the argument and the map's rows to share one lifetime.
+        fn root<'a>(spans: &std::collections::HashMap<u64, &'a SpanRow>, mut it: &'a SpanRow) -> &'a SpanRow {
+            while let Some(parent) = spans.get(&it.parent).copied().filter(|_| it.parent != 0 && it.depth > 0) {
+                it = parent;
+            }
+            it
+        }
+        let root_job = |it| root(&spans, it).get::<span::col::OfJob>();
+        Read {
+            switches: read.switches.iter().filter(|it| jobs.contains(&it.job)).copied().collect(),
+            spans: read.spans.iter().filter(|it| root_job(it).is_some_and(|job| jobs.contains(&job))).copied().collect(),
+            ..Read::default()
+        }
+    }
+
+    /// On a recorded pool run, the rows the pool writes account for each job's whole life:
+    /// every job lane runs from its `started` (or `ran`) row's `since` to its `ended` (or `ran`)
+    /// row with no unrecorded time, and the critical path crosses from each job's start to its
+    /// spawner and from each wait to its waker without a gap, from the build's first row to its
+    /// last.
+    #[hegel::test(test_cases = 40)]
+    fn a_recorded_pool_run_accounts_for_every_jobs_wall_time_and_its_critical_path_spans_the_build(tc: hegel::TestCase) {
+        use blaze_graph::{pool::Pool, pump::Flights, topology::Topology};
+
+        use crate::time::{Begin, End, Input, Model, path};
+        // The rings outlive each case's pool, so each case's rows are told apart by build.
+        static BUILDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(7000);
+        crate::install();
+        let pool = std::sync::Arc::new(Pool::new(&Topology::flat(2), false).expect("the pool starts"));
+        let tree = tree(&tc);
+        let jobs = tree.parent.len();
+        let build = BUILDS.fetch_add(1, Ordering::Relaxed);
+        let (done, finished) = crossbeam_channel::unbounded();
+        let case = Case { tree, build, flights: Flights::new(), pool: std::sync::Arc::downgrade(&pool), done };
+        give(&pool, std::sync::Arc::new(case), 0);
+        for _ in 0..jobs {
+            let (job, ok) = finished.recv_timeout(Duration::from_secs(60)).expect("every job finishes within a minute");
+            assert!(ok, "job {job} of build {build} panicked");
+        }
+        // A worker writes a job's `ended` (or `ran`) row after its `done`; joining the workers
+        // is what makes every one of them written before the read.
+        let pool = std::sync::Arc::into_inner(pool).expect("no job holds the pool once every job is done");
+        drop(pool);
+        let mut all = Read::default();
+        window(Duration::from_secs(600), &mut all);
+        let read = of_build(&all, build);
+        let ended = read.switches.iter().filter(|it| matches!(it.event, Switched::Ended | Switched::Ran)).count();
+        assert_eq!(ended, jobs, "build {build}: one end row a job, all written once the pool's workers are joined");
+        let input = Input { build: u64::from(build), ..Input::of_read(&read, 1).expect("the recorder's rows read") };
+        let m = Model::build(input).expect("the build has rows");
+
+        let lanes: Vec<_> = m.lanes.iter().filter(|it| it.id.job().is_some()).collect();
+        assert_eq!(lanes.len(), jobs, "one lane a job: {:?}", read.switches);
+        for lane in lanes {
+            assert_eq!((lane.begin, lane.end), (Begin::Started, End::Ended), "{}: {:?}", lane.id, lane.intervals);
+            let totals = lane.totals();
+            assert_eq!(totals.unrecorded_ns, 0, "{}: {:?}", lane.id, lane.intervals);
+            assert_eq!(totals.total(), lane.end_ns() - lane.begin_ns(), "{}", lane.id);
+        }
+        let path = path::critical(&m);
+        assert_eq!(path.reached, path::Reached::BuildStart, "{:?}", path.links);
+        for pair in path.links.windows(2) {
+            assert_eq!(pair[0].to_ns, pair[1].from_ns, "links meet: {:?}", path.links);
+        }
+        assert_eq!((path.start_ns(), path.end_ns()), (Some(m.bounds.start_ns), Some(m.bounds.end_ns)), "{:?}", path.links);
+    }
+
     #[test]
     fn a_fiber_stack_row_reads_as_four_counters_of_its_fiber_and_job() {
         crate::install();
@@ -2570,36 +2883,6 @@ mod tests {
             read.counters.iter().filter(|it| it.plot == Plot::Queued && it.build == 9).all(|it| it.fiber.is_none()),
             "a plot is of no fiber"
         );
-    }
-
-    #[test]
-    fn a_query_counts_row_reads_as_three_counters_of_its_kind_and_build() {
-        crate::install();
-        std::thread::spawn(|| {
-            query_counts(QueryCounts {
-                build: 47,
-                kind: "flight_counted_query",
-                executed: 78_000,
-                verified: 120,
-                reran: 62_000,
-            });
-        })
-        .join()
-        .unwrap();
-        let mut read = Read::default();
-        window(Duration::from_secs(60), &mut read);
-        let ours: Vec<(Plot, u64)> = read
-            .counters
-            .iter()
-            .filter(|it| it.query_kind != 0 && name(it.query_kind).as_deref() == Some("flight_counted_query"))
-            .inspect(|it| assert_eq!((it.build, it.fiber), (47, None)))
-            .map(|it| (it.plot, it.value))
-            .collect();
-        assert_eq!(ours, [(Plot::QueryExecuted, 78_000), (Plot::QueryVerified, 120), (Plot::QueryReran, 62_000)]);
-        assert!(read.counters.iter().filter(|it| it.query_kind == 0).all(|it| !matches!(
-            it.plot,
-            Plot::QueryExecuted | Plot::QueryVerified | Plot::QueryReran
-        )));
     }
 
     thread_local! {

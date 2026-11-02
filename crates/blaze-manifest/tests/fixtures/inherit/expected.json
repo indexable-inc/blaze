@@ -306,8 +306,8 @@
   "path+file://$ROOT/b#0.1.0"
  ],
  "resolve": null,
- "target_directory": "$ROOT/target",
- "build_directory": "$ROOT/target",
+ "target_directory": "$BLAZE_HOME/build/inherit-ID",
+ "build_directory": "$BLAZE_HOME/build/inherit-ID",
  "version": 1,
  "workspace_root": "$ROOT",
  "metadata": {

@@ -15,9 +15,10 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, SchemaRef};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use crate::{
-    flight::{self, CounterRow, Read, SpanRow, SwitchRow, ThreadNow, WaitedOn},
+    flight::{self, CounterRow, EventRow, Read, SpanRow, SwitchRow, ThreadNow, WaitedOn},
     sampler::Sample,
     schema::{self, Table},
     span,
@@ -64,14 +65,14 @@ fn column(array: impl Array + 'static) -> ArrayRef {
 /// A dictionary column being built: each distinct number given a key the first time, its
 /// string looked up then.
 struct Dict {
-    keys_of: HashMap<u64, u32>,
+    keys_of: HashMap<u64, u32, Global>,
     values: Vec<std::sync::Arc<str>>,
 }
 
 impl Dict {
     fn new() -> Dict {
         // alloc: a dictionary's values, once a column a batch
-        Dict { keys_of: HashMap::default(), values: Vec::new() }
+        Dict { keys_of: HashMap::new_in(Global), values: Vec::new() }
     }
 
     fn key<T: Into<std::sync::Arc<str>>>(&mut self, number: u64, text: impl FnOnce() -> T) -> u32 {
@@ -197,12 +198,6 @@ pub fn counters(counters: &[CounterRow], process: Process<'_>) -> Result<RecordB
     let mut names = Dict::new();
     let name_keys =
         UInt32Array::from_iter_values(counters.iter().map(|it| names.key(it.plot as u64, || it.plot.name())));
-    let mut kinds = Dict::new();
-    let kind_keys = UInt32Array::from_iter(counters.iter().map(|it| {
-        (it.query_kind != 0).then(|| {
-            kinds.key(u64::from(it.query_kind), || flight::name(it.query_kind).unwrap_or_else(|| "?".into()))
-        })
-    }));
     // alloc: a batch's list of columns, once a read
     let columns: Vec<ArrayRef> = vec![
         column(UInt64Array::from_iter(counters.iter().map(|it| build_id(it.build)))),
@@ -212,7 +207,6 @@ pub fn counters(counters: &[CounterRow], process: Process<'_>) -> Result<RecordB
         column(Float64Array::from_iter_values(counters.iter().map(|it| it.value as f64))),
         column(UInt32Array::from_iter(counters.iter().map(|it| it.fiber.map(|(fiber, _)| fiber)))),
         column(UInt64Array::from_iter(counters.iter().map(|it| it.fiber.map(|(_, job)| job)))),
-        kinds.finish(kind_keys)?,
     ];
     RecordBatch::try_new(schema_of(&schema::COUNTERS), columns)
 }
@@ -244,7 +238,7 @@ pub fn open(threads: &[ThreadNow], at_ns: i64, process: Process<'_>) -> Result<R
 /// nanoseconds then ([`crate::clock::mono_ns`]).
 pub(crate) fn samples(
     samples: &[Sample],
-    names: &HashMap<u64, String>,
+    names: &HashMap<u64, String, Global>,
     at: (Instant, i64),
     process: Process<'_>,
 ) -> Result<RecordBatch, ArrowError> {
@@ -303,8 +297,44 @@ pub fn switches(switches: &[SwitchRow], process: Process<'_>) -> Result<RecordBa
         column(UInt32Array::from_iter_values(switches.iter().map(|it| it.core))),
         kinds.finish(UInt32Array::from(kind_keys))?,
         column(UInt64Array::from_iter(switches.iter().map(value))),
+        column(UInt64Array::from_iter(switches.iter().map(|it| it.by))),
+        column(Int64Array::from_iter(switches.iter().map(|it| it.since_ns))),
+        column(UInt64Array::from_iter(switches.iter().map(|it| it.began_as))),
     ];
     RecordBatch::try_new(schema_of(&schema::SWITCHES), columns)
+}
+
+/// The `events` rows of `events`, all from `process`.
+pub fn events(events: &[EventRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
+    let rows = events.len();
+    let (mut threads, mut levels, mut targets, mut names) = (Dict::new(), Dict::new(), Dict::new(), Dict::new());
+    // alloc: a batch's keys, once a read
+    let (mut thread_keys, mut level_keys, mut target_keys, mut name_keys) =
+        (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
+    for row in events {
+        let meta = flight::meta(row.site);
+        thread_keys.push(threads.key(u64::from(row.thread_name), || flight::name(row.thread_name).unwrap_or_else(|| "?".into())));
+        level_keys.push(levels.key(u64::from(row.site), || meta.map_or("?", |it| it.level().as_str())));
+        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target())));
+        name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name())));
+    }
+    // alloc: a batch's messages, once a read
+    let messages: Vec<Option<std::sync::Arc<str>>> = events.iter().map(|it| flight::name(it.message)).collect();
+    // alloc: a batch's list of columns, once a read
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt64Array::from_iter(events.iter().map(|it| build_id(it.build)))),
+        column(UInt32Array::from_value(process.pid, rows)),
+        column(UInt32Array::from_iter_values(events.iter().map(|it| it.thread))),
+        threads.finish(UInt32Array::from(thread_keys))?,
+        column(Int64Array::from_iter_values(events.iter().map(|it| it.t_ns))),
+        column(UInt64Array::from_iter(events.iter().map(|it| (it.job != 0).then_some(it.job)))),
+        levels.finish(UInt32Array::from(level_keys))?,
+        targets.finish(UInt32Array::from(target_keys))?,
+        names.finish(UInt32Array::from(name_keys))?,
+        column(StringArray::from_iter(messages.iter().map(|it| it.as_deref()))),
+        column(UInt64Array::from_iter(events.iter().map(|it| (it.span != 0).then_some(it.span)))),
+    ];
+    RecordBatch::try_new(schema_of(&schema::EVENTS), columns)
 }
 
 /// Both tables of a read: `spans` then `counters`.
@@ -363,7 +393,7 @@ mod tests {
         let mut pcs = [0; crate::sampler::DEPTH];
         pcs[..3].copy_from_slice(&[0x30, 0x20, 0x10]);
         let sample = Sample { at: now, tid: 12, depth: 3, pcs, span: 0, build: 0, on_cpu: true };
-        let names: HashMap<u64, String> = [(0x10, "main"), (0x20, "build"), (0x30, "typeck")]
+        let names: HashMap<u64, String, Global> = [(0x10, "main"), (0x20, "build"), (0x30, "typeck")]
             .into_iter()
             .map(|(pc, it)| (pc, it.to_owned()))
             .collect();

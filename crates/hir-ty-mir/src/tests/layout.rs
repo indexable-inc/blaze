@@ -21,6 +21,7 @@ use crate::{
 };
 
 mod closure;
+mod field_order;
 
 /// The data layout of the machine the tests run on, from the pinned nightly's recorded target
 /// spec: the layouts are checked against the real `size_of`/`align_of` of this binary's types.
@@ -650,6 +651,27 @@ fn niche_optimization() {
         minicore: option;
         struct Goal(Option<Option<bool>>);
     }
+}
+
+/// An integer of any width (`#![blaze::arbitrary_ints]`) is stored in the smallest standard
+/// integer that holds it, aligned as that is, and its bits above the width are a niche.
+#[test]
+fn arbitrary_ints_layout() {
+    let opted = |goal: &str| format!("#![blaze::arbitrary_ints]\n{goal}");
+    let u128_align = std::mem::align_of::<u128>() as u64;
+    check_size_and_align(&opted("struct Goal(u3);"), "", 1, 1);
+    check_size_and_align(&opted("struct Goal(i7);"), "", 1, 1);
+    check_size_and_align(&opted("struct Goal(u24);"), "", 4, 4);
+    check_size_and_align(&opted("struct Goal(i40);"), "", 8, 8);
+    check_size_and_align(&opted("struct Goal(u65);"), "", 16, u128_align);
+    check_size_and_align(&opted("struct Goal(Option<u7>);"), "//- minicore: option\n", 1, 1);
+    check_size_and_align(&opted("struct Goal(Option<i1>);"), "//- minicore: option\n", 1, 1);
+    check_size_and_align(
+        &opted("struct Goal(Option<Option<u7>>);"),
+        "//- minicore: option\n",
+        1,
+        1,
+    );
 }
 
 #[test]

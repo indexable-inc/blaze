@@ -724,6 +724,7 @@ fn loop_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
     assert!(p.at(T![loop]));
     let m = m.unwrap_or_else(|| p.start());
     p.bump(T![loop]);
+    verify::loop_clauses(p);
     block_expr(p);
     m.complete(p, LOOP_EXPR)
 }
@@ -739,6 +740,7 @@ fn while_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
     let m = m.unwrap_or_else(|| p.start());
     p.bump(T![while]);
     expr_no_struct(p);
+    verify::loop_clauses(p);
     block_expr(p);
     m.complete(p, WHILE_EXPR)
 }
@@ -751,6 +753,10 @@ fn for_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
     assert!(p.at(T![for]));
     let m = m.unwrap_or_else(|| p.start());
     p.bump(T![for]);
+    // `for const f in fields_of::<T>() { .. }` (blaze's `#![feature(blaze_comptime)]`): no Rust
+    // program has `const` here, so taking it changes none; lowering refuses it without the
+    // feature.
+    p.eat(T![const]);
     patterns::pattern(p);
     p.expect(T![in]);
     expr_no_struct(p);

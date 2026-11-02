@@ -124,7 +124,14 @@ fn prefix_suffix(triple: &str, crate_type: &CrateType) -> Result<Option<(String,
 /// cargo's `TargetInfo::file_types`.
 fn file_types(crate_type: &CrateType, flavor: Flavor, triple: &str) -> Result<Option<Vec<FileType>>, LoadError> {
     let crate_type = if *crate_type == CrateType::Lib { CrateType::Rlib } else { crate_type.clone() };
-    let Some((prefix, suffix)) = prefix_suffix(triple, &crate_type)? else { return Ok(None) };
+    // A proc macro built for `-Z wasm-macros`' platform ([`crate::load::MACRO_WASM`]) is a WASI
+    // reactor, a module named as a `cdylib` of that target is: rustc makes no proc macro for
+    // a wasm target.
+    let named = match crate_type {
+        CrateType::ProcMacro if triple == crate::load::MACRO_WASM => CrateType::Cdylib,
+        _ => crate_type.clone(),
+    };
+    let Some((prefix, suffix)) = prefix_suffix(triple, &named)? else { return Ok(None) };
     let file = |suffix: &str, prefix: &str, flavor: Flavor, replace_hyphens: bool| FileType {
         flavor,
         crate_type: Some(crate_type.clone()),

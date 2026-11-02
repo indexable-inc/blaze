@@ -11,10 +11,11 @@ mod source_map;
 #[cfg(test)]
 mod tests;
 
-use std::{borrow::Borrow, cell::RefCell, mem, ops::Index, sync::LazyLock};
+use std::{borrow::Borrow, cell::RefCell, mem, ops::Index};
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::radix;
 use cfg::CfgExpr;
 use either::Either;
@@ -162,6 +163,10 @@ struct ExpressionOnlyStore {
     /// The closures written with `#[rustc_inherit_overflow_checks]`, in increasing order.
     overflow_inheriting: Col<ExprId>,
 
+    /// blaze_verify's clause groups ([`ExpressionStore::spec_clause`]), by group in increasing
+    /// order.
+    spec_clauses: Col<(ExprId, SpecClauseKind)>,
+
     /// Maps expression roots to their origin.
     ///
     /// Note: while every root expr is an inference root (aka. an `AnonConst`), there could be other roots that do not appear here.
@@ -226,14 +231,16 @@ pub struct ExpressionStoreBuilder {
     pub bindings: Arena<Binding>,
     pub labels: Arena<Label>,
     pub lifetimes: Arena<LifetimeRef>,
-    pub binding_owners: HashMap<BindingId, ExprId>,
+    pub binding_owners: HashMap<BindingId, ExprId, Global>,
     block_scopes: Vec<BlockId>,
-    ident_hygiene: HashMap<ExprOrPatIdPacked, HygieneId>,
+    ident_hygiene: HashMap<ExprOrPatIdPacked, HygieneId, Global>,
     pub(crate) type_hygiene: Vec<(TypeRefId, HygieneId)>,
-    block_editions: HashMap<ExprId, Edition>,
+    block_editions: HashMap<ExprId, Edition, Global>,
 
     /// The closures written with `#[rustc_inherit_overflow_checks]`.
-    overflow_inheriting: HashSet<ExprId>,
+    overflow_inheriting: HashSet<ExprId, Global>,
+    /// blaze_verify's clause groups, in lowering order.
+    pub(crate) spec_clauses: Vec<(ExprId, SpecClauseKind)>,
     inference_roots: Option<SmallVec<[ExprRoot; 1]>>,
 
     // AST expressions can create patterns in destructuring assignments. Therefore, `ExprSource` can also map
@@ -313,6 +320,112 @@ pub enum ExpressionStoreDiagnostics {
     /// `LitError::IntTooLarge`, reported by `rustc_ast_lowering`'s `lower_lit` (so only for
     /// code cfg keeps), whose `LitKind::Err` taints the body.
     IntLiteralTooLarge { node: InFile<AstPtr<ast::Literal>> },
+    /// `for const`, `x.[f]` or a bounded type parameter of a where predicate's `for<..>` binder
+    /// in a crate without `#![feature(blaze_comptime)]`: an expression lowers to `Missing`, a
+    /// binder parameter is not recorded.
+    ComptimeWithoutFeature { node: InFile<SyntaxNodePtr>, form: ComptimeForm },
+    /// A specification clause (`requires`, `ensures`, `invariant`, ..) or a named return type
+    /// (docs/v2/plan/lanes/verus.md) lowering refuses, for `why`: the clause is not lowered.
+    VerifyRefused { node: InFile<SyntaxNodePtr>, why: VerifyRefusal },
+}
+
+/// Why lowering refused a `blaze_verify` clause or named return type.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum VerifyRefusal {
+    /// The crate has no `#![feature(blaze_verify)]`.
+    WithoutFeature,
+    /// The function has no body to put its clauses in (a trait method's declaration, a
+    /// foreign function): not lowered yet.
+    WithoutBody,
+    /// The function also has nightly's `#[core::contracts::*]` clauses: one function takes one
+    /// form (lane contracts' `blaze check --fix` rewrites them to the native one).
+    WithNightlyContracts,
+}
+
+impl VerifyRefusal {
+    /// The refusal, for a message.
+    pub fn message(self) -> &'static str {
+        match self {
+            VerifyRefusal::WithoutFeature => {
+                "specification clauses need `#![feature(blaze_verify)]` in the crate"
+            }
+            VerifyRefusal::WithoutBody => {
+                "specification clauses on a function without a body are not supported yet"
+            }
+            VerifyRefusal::WithNightlyContracts => {
+                "a function takes native specification clauses or `#[core::contracts::*]`, not both"
+            }
+        }
+    }
+}
+
+/// blaze_verify: which clauses a clause group holds (docs/v2/plan/lanes/verus.md). A group is
+/// one expression statement lowering puts at the head of the block it is about: a function's
+/// body for `Requires`, `Recommends`, `Ensures` and `Decreases`, a loop's body for the others.
+/// Its expression is a tuple of the clause's expressions, or, for an `Ensures` of a function
+/// with a named return `-> (r: T)`, a closure `|r: T| (..)` of that tuple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum SpecClauseKind {
+    Requires = 0,
+    Recommends = 1,
+    Ensures = 2,
+    Decreases = 3,
+    Invariant = 4,
+    LoopEnsures = 5,
+    LoopDecreases = 6,
+}
+
+impl SpecClauseKind {
+    /// The kind of the byte [`SpecClauseKind`] `as u8` gives.
+    pub fn of_u8(byte: u8) -> Option<SpecClauseKind> {
+        use SpecClauseKind::*;
+        Some(match byte {
+            0 => Requires,
+            1 => Recommends,
+            2 => Ensures,
+            3 => Decreases,
+            4 => Invariant,
+            5 => LoopEnsures,
+            6 => LoopDecreases,
+            _ => return None,
+        })
+    }
+
+    /// The keyword the clause is written with.
+    pub fn keyword(self) -> &'static str {
+        use SpecClauseKind::*;
+        match self {
+            Requires => "requires",
+            Recommends => "recommends",
+            Ensures | LoopEnsures => "ensures",
+            Decreases | LoopDecreases => "decreases",
+            Invariant => "invariant",
+        }
+    }
+}
+
+/// Which form of `#![feature(blaze_comptime)]` (`docs/v2/plan/design/comptime.md`) a diagnostic
+/// is about.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum ComptimeForm {
+    /// `for const pat in iterable { .. }`.
+    ForConst,
+    /// `base.[field]`.
+    ReflectedField,
+    /// `for<F: Bound> ..` in a where predicate.
+    BinderBound,
+}
+
+impl ComptimeForm {
+    /// The form as it is written, for a message.
+    pub fn syntax(self) -> &'static str {
+        match self {
+            ComptimeForm::ForConst => "`for const`",
+            ComptimeForm::ReflectedField => "a reflected field access `base.[field]`",
+            ComptimeForm::BinderBound => "a bounded type parameter in a `for<..>` binder",
+        }
+    }
 }
 
 /// The stacks lowering collects a node's children on before it allocates the node, one per
@@ -526,12 +639,13 @@ struct Scratch {
     bindings: Arena<Binding>,
     labels: Arena<Label>,
     lifetimes: Arena<LifetimeRef>,
-    binding_owners: HashMap<BindingId, ExprId>,
+    binding_owners: HashMap<BindingId, ExprId, Global>,
     block_scopes: Vec<BlockId>,
-    ident_hygiene: HashMap<ExprOrPatIdPacked, HygieneId>,
+    ident_hygiene: HashMap<ExprOrPatIdPacked, HygieneId, Global>,
     type_hygiene: Vec<(TypeRefId, HygieneId)>,
-    block_editions: HashMap<ExprId, Edition>,
-    overflow_inheriting: HashSet<ExprId>,
+    block_editions: HashMap<ExprId, Edition, Global>,
+    overflow_inheriting: HashSet<ExprId, Global>,
+    spec_clauses: Vec<(ExprId, SpecClauseKind)>,
     expr_map: Vec<(ExprSource, ExprOrPatIdPacked)>,
     pat_map: Vec<(PatSource, ExprOrPatIdPacked)>,
     label_map: Vec<(LabelSource, LabelId)>,
@@ -644,6 +758,7 @@ impl Scratch {
             type_hygiene,
             block_editions,
             overflow_inheriting,
+            spec_clauses,
             expr_map,
             pat_map,
             label_map,
@@ -674,6 +789,7 @@ impl Scratch {
         type_hygiene.clear();
         block_editions.clear();
         overflow_inheriting.clear();
+        spec_clauses.clear();
         expr_map.clear();
         pat_map.clear();
         label_map.clear();
@@ -706,6 +822,7 @@ impl Scratch {
             + self.type_hygiene.capacity()
             + self.block_editions.capacity()
             + self.overflow_inheriting.capacity()
+            + self.spec_clauses.capacity()
             + self.expr_map.capacity()
             + self.pat_map.capacity()
             + self.label_map.capacity()
@@ -742,6 +859,7 @@ impl ExpressionStoreBuilder {
             type_hygiene,
             block_editions,
             overflow_inheriting,
+            spec_clauses,
             expr_map,
             pat_map,
             label_map,
@@ -773,6 +891,7 @@ impl ExpressionStoreBuilder {
             type_hygiene,
             block_editions,
             overflow_inheriting,
+            spec_clauses,
             inference_roots: None,
             expr_map,
             expr_map_back,
@@ -814,6 +933,7 @@ impl ExpressionStoreBuilder {
             type_hygiene: mem::take(&mut self.type_hygiene),
             block_editions: mem::take(&mut self.block_editions),
             overflow_inheriting: mem::take(&mut self.overflow_inheriting),
+            spec_clauses: mem::take(&mut self.spec_clauses),
             expr_map: mem::take(&mut self.expr_map),
             pat_map: mem::take(&mut self.pat_map),
             label_map: mem::take(&mut self.label_map),
@@ -1193,6 +1313,7 @@ impl ExpressionStoreBuilder {
                     ident_hygiene,
                     block_editions,
                     overflow_inheriting,
+                    spec_clauses,
                     packing,
                     ..
                 } = &mut scratch;
@@ -1224,12 +1345,16 @@ impl ExpressionStoreBuilder {
                 layout.add::<(ExprId, Edition)>(packing.editions.len());
                 layout.add::<u32>(packing.owners.len());
                 layout.add::<ExprId>(packing.inheriting.len());
+                // Lowered in order, so already sorted but for a group lowered inside another's.
+                spec_clauses.sort_unstable_by_key(|&(group, _)| group.into_raw().into_u32());
+                layout.add::<(ExprId, SpecClauseKind)>(spec_clauses.len());
                 let mut slab = SlabWriter::new(layout);
                 let block_scopes = slab.copy(&block_scopes[..]);
                 let ident_hygiene = slab.copy(&packing.hygiene[..]);
                 let block_editions = slab.copy(&packing.editions[..]);
                 let binding_owners = slab.copy(&packing.owners[..]);
                 let overflow_inheriting = slab.copy(&packing.inheriting[..]);
+                let spec_clauses = slab.copy(&spec_clauses[..]);
                 // alloc: once per store, keeps signature-only stores small.
                 Some(Box::new(ExpressionOnlyStore {
                     kinds: kinds_of(&columns.expr_kind),
@@ -1241,6 +1366,7 @@ impl ExpressionStoreBuilder {
                     ident_hygiene,
                     block_editions,
                     overflow_inheriting,
+                    spec_clauses,
                     expr_roots: expr_roots
                         .expect("should always finish with a `Some(_)` expr_roots"),
                 }))
@@ -1274,7 +1400,8 @@ impl ExpressionStore {
     /// made in a `const`. Empty columns allocate nothing.
     #[inline]
     pub fn empty() -> &'static ExpressionStore {
-        static EMPTY: LazyLock<ExpressionStore> = LazyLock::new(ExpressionStore::empty_owned);
+        #[expect(clippy::disallowed_types, reason = "the process's one empty expression store: callers share a static empty value")]
+        static EMPTY: std::sync::LazyLock<ExpressionStore> = std::sync::LazyLock::new(ExpressionStore::empty_owned);
         &EMPTY
     }
 
@@ -1598,9 +1725,14 @@ impl ExpressionStore {
                 visitor.on_expr(lhs);
                 visitor.on_expr(rhs);
             }
-            Expr::Index { base, index } => {
+            Expr::Index { base, index } | Expr::ReflectedField { base, field: index } => {
                 visitor.on_expr(base);
                 visitor.on_expr(index);
+            }
+            Expr::ComptimeFor { pat, iterable, body, label: _ } => {
+                visitor.on_expr(iterable);
+                visitor.on_pat(pat);
+                visitor.on_expr(body);
             }
             Expr::Cast { expr, type_ref } => {
                 visitor.on_expr(expr);
@@ -1705,7 +1837,14 @@ impl ExpressionStore {
                 visitor.on_type(*ty);
                 visitor.on_anon_const_expr(*len);
             }
-            TypeRef::Fn(FnType { params, is_varargs: _, is_unsafe: _, abi: _, binder: _ }) => {
+            TypeRef::Fn(FnType {
+                params,
+                is_varargs: _,
+                is_unsafe: _,
+                abi: _,
+                binder: _,
+                splatted: _,
+            }) => {
                 params.iter().for_each(|(_, param_ty)| visitor.on_type(*param_ty));
             }
             TypeRef::ImplTrait(bounds) | TypeRef::DynTrait(bounds) => {
@@ -1728,6 +1867,20 @@ impl ExpressionStore {
     /// with `#[rustc_inherit_overflow_checks]` does.
     pub fn inherits_overflow_checks(&self, closure: ExprId) -> bool {
         self.assert_expr_only().overflow_inheriting.binary_search(&closure).is_ok()
+    }
+
+    /// blaze_verify: the clause `group` is, when it is one: an expression statement that
+    /// [`lower`](crate::expr_store::lower) made of a function's or a loop's clauses
+    /// (docs/v2/plan/lanes/verus.md). The program erases it: MIR lowering skips it.
+    pub fn spec_clause(&self, group: ExprId) -> Option<SpecClauseKind> {
+        let clauses = &self.expr_only.as_deref()?.spec_clauses;
+        let at = clauses.binary_search_by_key(&group, |&(it, _)| it).ok()?;
+        Some(clauses[at].1)
+    }
+
+    /// blaze_verify: every clause group of the store, by group in increasing order.
+    pub fn spec_clauses(&self) -> &[(ExprId, SpecClauseKind)] {
+        self.expr_only.as_deref().map_or(&[], |it| &it.spec_clauses[..])
     }
 
     /// The edition a block was written in, when a macro wrote it.

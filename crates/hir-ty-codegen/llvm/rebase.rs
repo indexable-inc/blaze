@@ -18,6 +18,7 @@
 //! check the rewrite against the IR it must give and leave what is not an address alone.
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use inkwell::{
     llvm_sys::{
         LLVMOpcode,
@@ -108,7 +109,7 @@ enum Node {
 
 /// The integers an address is made of, each with what it is made of in turn.
 struct Web {
-    nodes: HashMap<LLVMValueRef, Node>,
+    nodes: HashMap<LLVMValueRef, Node, Global>,
     /// In an order that has an operand before what is made of it, `phi`s aside.
     order: SmallVec<[LLVMValueRef; 16]>,
     /// The `phi`s, in the order [`Web::add`] met them: what is built for them is built in this
@@ -138,7 +139,7 @@ impl Web {
         // SAFETY: `root` is a live value of the module being rewritten; this only reads it.
         let int = unsafe { LLVMTypeOf(root) };
         let mut web = Web {
-            nodes: HashMap::default(),
+            nodes: HashMap::new_in(Global),
             order: SmallVec::new(),
             phis: SmallVec::new(),
             addresses: 0,
@@ -231,8 +232,8 @@ impl Web {
     ///
     /// Every value of the web is still a live value of its module.
     unsafe fn ordered(&self) -> bool {
-        let mut built: HashSet<LLVMValueRef> =
-            HashSet::with_capacity_and_hasher(self.nodes.len(), Default::default());
+        let mut built: HashSet<LLVMValueRef, Global> =
+            HashSet::with_capacity_in(self.nodes.len(), Global);
         built.extend(self.phis.iter().copied());
         for &value in &self.order {
             let ready = match self.nodes[&value] {
@@ -424,7 +425,7 @@ impl Web {
         root: LLVMValueRef,
         inttoptr: LLVMValueRef,
     ) {
-        let mut pointers: HashMap<LLVMValueRef, LLVMValueRef> = HashMap::default();
+        let mut pointers: HashMap<LLVMValueRef, LLVMValueRef, Global> = HashMap::new_in(Global);
         let phis = &self.phis;
         for &phi in phis {
             // SAFETY: `builder` was made in the module's context and is disposed of only at

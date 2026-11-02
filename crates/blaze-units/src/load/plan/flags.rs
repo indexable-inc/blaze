@@ -15,7 +15,7 @@ use blaze_resolve::Cfg;
 use cargo_util_schemas::manifest::{TomlLintLevel, TomlManifest};
 
 use crate::load::load_error;
-use crate::query::LoadError;
+use crate::query::{LintProfile, LoadError};
 use crate::stdlib::target::{self as platform, CfgArgs};
 
 fn error(what: String) -> LoadError {
@@ -72,6 +72,18 @@ pub(super) fn kind_info<F: Files>(config: &Config<F>, host: &str, target: Option
         }
         return Ok(KindInfo { triple: triple.to_owned(), rustflags, cfg_lines, cfgs });
     }
+}
+
+/// The kind of `-Z wasm-macros`' units, built for `triple` with no rustflags: the build's
+/// flags are for its own platforms (a host's `-C target-cpu=native` is no wasm cpu), and no
+/// `[target.<triple>]` of the user's names blaze's macro platform.
+pub(super) fn macro_wasm_info(triple: &str) -> Result<KindInfo, LoadError> {
+    let cfg_lines = platform::target_cfg(triple, &CfgArgs { proc_macro: true, ..CfgArgs::default() }).map_err(error)?;
+    let cfgs = cfg_lines
+        .iter()
+        .map(|line| line.parse::<Cfg>().map_err(|e| error(format!("the cfg `{line}` of `{triple}`: {e}"))))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(KindInfo { triple: triple.to_owned(), rustflags: Vec::new(), cfg_lines, cfgs })
 }
 
 /// What `cargo doc` would read that `blaze doc` does not honor yet, refused naming it: rustdoc's
@@ -223,6 +235,10 @@ pub(super) fn workspace_lints(metadata: Option<&toml::Value>, manifest: &Path) -
     let table = table.as_table().ok_or_else(|| wrong("is a table of lint names to levels".to_owned()))?;
     let mut flags = Vec::with_capacity(table.len());
     for (lint, level) in table {
+        // The profile the profile lints read is configuration, not a level ([`workspace_profile`]).
+        if PROFILE_KEYS.contains(&lint.as_str()) {
+            continue;
+        }
         if lint.contains(':') {
             return Err(wrong(format!("`{lint}` is named without its tool: these are blaze's own lints")));
         }
@@ -238,8 +254,58 @@ pub(super) fn workspace_lints(metadata: Option<&toml::Value>, manifest: &Path) -
         };
         flags.push(format!("{flag}=blaze::{lint}"));
     }
-    flags.sort_by(|a, b| a.split_once('=').map(|it| it.1).cmp(&b.split_once('=').map(|it| it.1)));
+    // The wide groups first, then `hot` (part of `internal`), then single lints, each by name:
+    // the later flag wins, so `internal = "warn"` with `hot_alloc = "deny"` denies `hot_alloc`.
+    let rank = |flag: &String| {
+        let name = flag.split_once('=').map_or("", |it| it.1);
+        let order = match name {
+            "blaze::general" | "blaze::internal" | "blaze::pedantic_perf" => 0,
+            "blaze::hot" => 1,
+            _ => 2,
+        };
+        (order, name.to_owned()) // alloc: a sort key of a few flags, once per load
+    };
+    flags.sort_by_cached_key(rank);
     Ok(flags)
+}
+
+/// The keys of [`WORKSPACE_LINTS`] that name the profile blaze's profile lints read
+/// (`blaze_lints::profile::KEYS`), beside the levels.
+pub(crate) const PROFILE_KEYS: [&str; 3] = ["profile", "profile-hot-percent", "profile-cold-percent"];
+
+/// The profile [`WORKSPACE_LINTS`] in `metadata` names for the profile lints, its path made
+/// absolute against the workspace's root `ws_root`, and its percents; `None` when it sets none. A key of the
+/// wrong type is an error naming it and the manifest; the percents are read by the lints.
+pub(super) fn workspace_profile(
+    metadata: Option<&toml::Value>,
+    manifest: &Path,
+    ws_root: &Path,
+) -> Result<Option<LintProfile>, LoadError> {
+    let Some(table) = metadata.and_then(|it| it.get("blaze")).and_then(|it| it.get("lints")).and_then(|it| it.as_table())
+    else {
+        return Ok(None);
+    };
+    let wrong = |what: String| LoadError {
+        what: format!("{WORKSPACE_LINTS} in {}: {what}", manifest.display()),
+        at: Some(manifest.display().to_string()),
+    };
+    let percent = |key: &str| match table.get(key) {
+        None => Ok(None),
+        Some(it @ (toml::Value::Integer(_) | toml::Value::Float(_))) => Ok(Some(it.to_string())),
+        Some(other) => Err(wrong(format!("`{key}` is a {}, not a percent", other.type_str()))),
+    };
+    let path = match table.get("profile") {
+        None => None,
+        Some(toml::Value::String(path)) => Some(ws_root.join(path).display().to_string()),
+        Some(other) => return Err(wrong(format!("`profile` is a {}, not a path", other.type_str()))),
+    };
+    let hot_percent = percent("profile-hot-percent")?;
+    let cold_percent = percent("profile-cold-percent")?;
+    // The percents alone are kept too: a package's `clippy.toml` may name the profile.
+    if path.is_none() && hot_percent.is_none() && cold_percent.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(LintProfile { path, hot_percent, cold_percent, manifest: manifest.display().to_string() }))
 }
 
 /// cargo's `lints_to_rustflags` of the package's `[lints]` (inherited already): the level

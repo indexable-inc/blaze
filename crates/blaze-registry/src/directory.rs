@@ -5,7 +5,6 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::OnceLock,
 };
 
 use anyhow::{Context as _, bail};
@@ -49,12 +48,13 @@ struct ManifestPackage {
 pub struct Directory {
     source: SourceId,
     root: PathBuf,
-    packages: OnceLock<Result<Vec<Vendored>, String>>,
+    #[expect(clippy::disallowed_types, reason = "the vendored packages, read the first time one is asked for: per directory source, not global")]
+    packages: std::sync::OnceLock<Result<Vec<Vendored>, String>>,
 }
 
 impl Directory {
     pub fn new(source: SourceId, root: PathBuf) -> Directory {
-        Directory { source, root, packages: OnceLock::new() }
+        Directory { source, root, packages: Default::default() }
     }
 
     pub fn source(&self) -> &SourceId {

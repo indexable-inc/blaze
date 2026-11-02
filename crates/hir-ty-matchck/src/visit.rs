@@ -88,11 +88,13 @@ pub(crate) fn check_body<'db>(
     };
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::typeck_for_body(interner, def.into()));
+    // With what the body's `for const` loops assume of their binders, as inference had it.
+    let env = hir_ty::comptime_env::body_env(&infcx, infer, db.trait_environment(def.generic_def(db)));
     let features = UnstableFeatures::query(db, krate);
     let cx = Cx {
         db,
         infcx: &infcx,
-        env: db.trait_environment(def.generic_def(db)),
+        env,
         module: def.module(db),
         krate,
         pointer_bits: target.pointer_size().bits(),
@@ -881,28 +883,7 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
     /// `is_known_valid_scrutinee`: whether the place may hold invalid data, read through a
     /// pointer, a union field or a static.
     fn is_known_valid_scrutinee(&self, expr: ExprId) -> bool {
-        if self.infer.expr_adjustment(expr).is_some_and(|adjustments| {
-            adjustments.iter().any(|adjustment| matches!(adjustment.kind, Adjust::Deref(..)))
-        }) {
-            return false;
-        }
-        match self.body.expr(expr) {
-            Expr::UnaryOp { op: UnaryOp::Deref, .. } => false,
-            Expr::Path(path) => {
-                let Some(lower) = &self.lower else { return true };
-                lower.scope.set(expr);
-                let hygiene = self.body.expr_path_hygiene(expr);
-                !matches!(lower.resolve_value(path, hygiene), Some(ValueNs::StaticId(_)))
-            }
-            Expr::Field { expr: base, .. } => match self.infer.expr_ty(base).kind() {
-                TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::UnionId(_)) => false,
-                _ => self.is_known_valid_scrutinee(base),
-            },
-            Expr::Index { base, .. } => self.is_known_valid_scrutinee(base),
-            Expr::Cast { expr: inner, .. } => self.is_known_valid_scrutinee(inner),
-            Expr::Missing => false,
-            _ => true,
-        }
+        known_valid_scrutinee(self.body, self.infer, self.lower.as_ref(), expr)
     }
 
     /// `check_for_bindings_named_same_as_variants` over `pat.walk_always`.
@@ -930,6 +911,38 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
                 }));
             }
         });
+    }
+}
+
+/// `is_known_valid_scrutinee`: whether the place `expr` reads may hold invalid data, read through
+/// a pointer, a union field or a static. With no lowerer every path is taken as valid.
+pub(crate) fn known_valid_scrutinee(
+    body: &Body,
+    infer: &InferenceResult<'_>,
+    lower: Option<&Lowerer<'_, '_, '_>>,
+    expr: ExprId,
+) -> bool {
+    if infer.expr_adjustment(expr).is_some_and(|adjustments| {
+        adjustments.iter().any(|adjustment| matches!(adjustment.kind, Adjust::Deref(..)))
+    }) {
+        return false;
+    }
+    match body.expr(expr) {
+        Expr::UnaryOp { op: UnaryOp::Deref, .. } => false,
+        Expr::Path(path) => {
+            let Some(lower) = lower else { return true };
+            lower.scope.set(expr);
+            let hygiene = body.expr_path_hygiene(expr);
+            !matches!(lower.resolve_value(path, hygiene), Some(ValueNs::StaticId(_)))
+        }
+        Expr::Field { expr: base, .. } => match infer.expr_ty(base).kind() {
+            TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::UnionId(_)) => false,
+            _ => known_valid_scrutinee(body, infer, lower, base),
+        },
+        Expr::Index { base, .. } => known_valid_scrutinee(body, infer, lower, base),
+        Expr::Cast { expr: inner, .. } => known_valid_scrutinee(body, infer, lower, inner),
+        Expr::Missing => false,
+        _ => true,
     }
 }
 

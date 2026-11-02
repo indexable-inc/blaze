@@ -4,9 +4,10 @@
 //! them. It is in the text and appended module of the crate's own root, an alias of the file
 //! on disk ([`Lowered::append_roots`]), so the unit's identity and record key cover it, a
 //! harness of another mode is another text (the unit is stale), and the lib beside its test,
-//! which has the file itself, is the same unit under `build` and `test`. A proc macro's lib
-//! has nothing appended: it builds no code ([`super::compile`]), and its macros are found from
-//! its def map ([`blaze_macro_eval::load`]).
+//! which has the file itself, is the same unit under `build` and `test`. A proc macro built
+//! for wasm32-wasip1 ([`codegen::wasm_macro`]) has the list of its macros and the bridge's glue
+//! appended ([`blaze_macro_eval::wasm_glue`]), which its module exports to the host; its
+//! macros are found from its def map either way.
 
 #![forbid(unsafe_code)]
 
@@ -20,8 +21,9 @@ use blaze_lower::{Appended, LowerError, Lowered};
 
 use super::{Job, codegen, graph::Waits, lower_error};
 
-/// The harness of each of `units` built with `cfg(test)` (a test, a check of tests), written
-/// into its crate's root: the root's text on disk, then the module. A test with
+/// The harness of each of `units` built with `cfg(test)` (a test, a check of tests), or the
+/// glue of each that is a proc macro built for wasm, written into its crate's root: the
+/// root's text on disk, then the module. A test with
 /// `harness = false` has none and its root is left as it is.
 /// Called on the loop's writer as these units become ready, before they are identified, so
 /// what they are identified by has the module.
@@ -38,7 +40,7 @@ use super::{Job, codegen, graph::Waits, lower_error};
 /// that can't be made, naming its crate.
 pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<Item = u32>) -> Result<(), ApiError> {
     let paths = Arc::clone(lowered.paths());
-    let appended = units.into_iter().filter(|&unit| tested(job, unit as usize));
+    let appended = units.into_iter().filter(|&unit| tested(job, unit as usize) || codegen::wasm_macro(job, unit as usize));
     let made = lowered.append_roots(appended, |db, unit, krate| {
         if !blaze_lower::macros_loaded(db, krate) {
             return Ok(None);
@@ -49,6 +51,10 @@ pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<I
             Err(error) => error.what,
         };
         let refused = |what: String| LowerError { what, at: Some(at()) };
+        if codegen::wasm_macro(job, unit) {
+            let glue = blaze_macro_eval::wasm_glue(db, krate).map_err(refused)?;
+            return Ok(Some(Appended { after: glue, module: blaze_macro_eval::GLUE_MODULE }));
+        }
         let toolchain = codegen::toolchain(job, unit).map_err(refused)?;
         let policy = codegen::policy(job, unit, toolchain).map_err(refused)?;
         let frontend = codegen::frontend_over(job, db, &paths, &job.mounted);

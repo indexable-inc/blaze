@@ -282,3 +282,27 @@ fn main() {}
         &[unstable(4), unstable(4), unstable(7), unstable(27), unstable(27), unstable(64)],
     );
 }
+
+/// A call through another crate's module to a function the module lacks, where only an
+/// associated function of that name exists (`gc::lease::try_hold` for `Lease::try_hold`), is
+/// E0425 at check, never an error type MIR building meets first (`MissingFunctionDefinition`).
+#[test]
+fn a_call_to_a_missing_function_of_another_crates_module_is_e0425() {
+    let fixture = r#"//- /gc.rs crate:gc edition:2021 library
+pub mod lease {
+    pub struct Lease;
+    impl Lease {
+        pub fn try_hold(_dir: &str) -> Lease { Lease }
+    }
+}
+//- /main.rs crate:other:main edition:2021 deps:gc
+fn hold(dir: &str) {
+    let _lease = gc::lease::try_hold(dir);
+}
+
+fn main() {
+    hold("d");
+}
+"#;
+    assert_reports(&super::ui_fixture(fixture), &[error(2, &["E0425", "`try_hold`", "`gc::lease`"])]);
+}

@@ -12,6 +12,7 @@ use std::{any::Any, sync::Arc};
 
 use base_db::{Crate, Db, all_crates};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{AdtId, FunctionId, MacroId, ModuleDefId, StructId, nameres::crate_def_map};
 use hir_expand::{
     name::Name,
@@ -195,7 +196,7 @@ fn flat_input(
     }
     let root = parse.syntax_node().to_flat();
     let (tree, _) = root.flat().ok_or("the input has no flat tree")?;
-    let mut table: HashMap<Span, u32> = HashMap::default();
+    let mut table: HashMap<Span, u32, Global> = HashMap::new_in(Global);
     for (index, site) in (0..).zip(sites) {
         table.entry(site).or_insert(index);
     }

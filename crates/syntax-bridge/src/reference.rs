@@ -65,7 +65,7 @@ fn convert<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     let mut fragment_at = None;
 
     let mut current = buffer.cursor();
-    let mut syntax_context_to_edition_cache = HashMap::default();
+    let mut syntax_context_to_edition_cache = HashMap::new_in(Global);
     let mut last: Option<(SyntaxContext, Edition)> = None;
     let mut ctx_edition = |ctx: SyntaxContext| {
         if let Some((last_ctx, edition)) = last

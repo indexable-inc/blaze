@@ -1,5 +1,5 @@
 //! Processes out `#[cfg]` and `#[cfg_attr]` attributes from the input for the derive macro
-use std::{cell::OnceCell, ops::ControlFlow};
+use std::ops::ControlFlow;
 
 use ::tt::TextRange;
 use base_db::{Db, Crate};
@@ -67,7 +67,8 @@ macro_rules! macro_input_callback_impl {
             default_span: Span,
             span_map: SpanMap<'_>,
         ) -> impl FnMut(&mut $Preorder, &WalkEvent<$Element>) -> (bool, Inserted) {
-            let cfg_options = OnceCell::new();
+            #[expect(clippy::disallowed_types, reason = "crate cfg options, set once per cfg processing closure: not global")]
+            let cfg_options = std::cell::OnceCell::new();
             let cfg_options = move || *cfg_options.get_or_init(|| krate.cfg_options(db));
 
             let mut should_strip_attr = {

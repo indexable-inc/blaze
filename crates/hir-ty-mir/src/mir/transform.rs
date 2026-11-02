@@ -8,18 +8,23 @@
 //! 4. [`elaborate_drops::elaborate_drops`]: every drop drops; drop flags are locals.
 //! 5. [`packed_drops::add_moves_for_packed_drops`]: what a packed struct leaves misaligned is
 //!    moved out before it is dropped.
+//! 6. [`bits::lower_bits_structs`]: a `#[blaze::bits]` struct's fields, literals and constant
+//!    patterns become operations on its backing integer; a body without one is unchanged.
 //!
 //! None of them optimizes. The IDE never asks for these queries, so it never pays for them;
 //! the code generator and the interpreter do. `docs/mir-passes.md` has the design.
 
 mod asserts;
+mod bits;
 mod cleanup;
+mod drop_states;
 mod elaborate_drops;
 mod move_paths;
 mod packed_drops;
 mod upvars;
 
 pub use cleanup::noop_landing_pads;
+pub use drop_states::{DropState, HeldPath, drop_states};
 pub(super) use cleanup::remove_noop_landing_pads;
 
 use std::cell::RefCell;
@@ -70,6 +75,9 @@ impl<'f, 'db> Ctx<'f, 'db> {
         let env = db.trait_environment(owner.generic_def(db));
         let interner = DbInterner::new_with(db, krate);
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+        // `for const` binders (`#![feature(blaze_comptime)]`): the passes solve what inference
+        // solved, in its environment. `env` itself in a body without a loop.
+        let env = hir_ty::comptime_env::owner_env(db, owner, &infcx, env);
         Ctx { db, infcx, env, krate, frame, needs_drop: RefCell::new(framed::map_in(frame)) }
     }
 
@@ -200,6 +208,8 @@ pub(super) fn run_passes<'db>(db: &'db Db, built: &MirBody<'db>) -> Result<'db, 
         frame::task(Tag::Mir, |frame| {
             packed_drops::add_moves_for_packed_drops(&ctx, &mut body, frame)
         });
+        // Last: borrow checking and drop elaboration saw a bits struct's fields as places.
+        frame::task(Tag::Mir, |frame| bits::lower_bits_structs(&ctx, &mut body, frame))?;
         Ok(())
     })?;
     body.phase = MirPhase::Runtime;

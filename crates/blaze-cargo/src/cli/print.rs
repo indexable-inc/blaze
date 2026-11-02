@@ -19,7 +19,7 @@
 
 use std::{
     fmt::Write as _,
-    hash::{BuildHasher as _, BuildHasherDefault},
+    hash::BuildHasher as _,
     io::{self, Write},
     path::Path,
     time::Duration,
@@ -27,6 +27,7 @@ use std::{
 
 use blaze_api::{Applicability, Artifact, DiagnosticRef, FetchVerb, Level, ResponseRef, TargetKind, UnitOfRef, Verb};
 use blaze_hash::FixedState;
+use std::alloc::Global;
 
 use super::{json, say};
 
@@ -132,8 +133,8 @@ const _: () = assert!(size_of::<Unit>() == 20);
 #[derive(Clone, Copy)]
 struct Name(u32, u32);
 
-pub(super) type ByHash<V> = blaze_hash::ByHash<u64, V>;
-type HashedSet = blaze_hash::ByHashSet<u64>;
+pub(super) type ByHash<V, A> = blaze_hash::ByHash<u64, V, A>;
+type HashedSet<A> = blaze_hash::ByHashSet<u64, A>;
 
 /// What the build placed, once it said ([`ResponseRef::Built`]).
 struct Built {
@@ -180,7 +181,7 @@ pub struct Printer<'a, O: Write, E: Write> {
     /// The units' names, one after another.
     names: String,
     /// The hash of every diagnostic printed, as cargo's `DiagDedupe` keeps them.
-    printed: HashedSet,
+    printed: HashedSet<Global>,
     built: Option<Built>,
     /// The daemon numbered a unit or package past [`IDS`]: said, and the build fails.
     refused: bool,
@@ -201,7 +202,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             counted: Vec::with_capacity(PACKAGES),
             units: Vec::with_capacity(PACKAGES),
             names: String::with_capacity(NAMES),
-            printed: HashedSet::with_capacity_and_hasher(DIAGNOSTICS, BuildHasherDefault::default()),
+            printed: HashedSet::with_capacity_in(DIAGNOSTICS, Global),
             built: None,
             refused: false,
         }
@@ -414,13 +415,17 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             json::compiler_message(&mut self.line, unit, diagnostic, ansi, &mut self.sources);
             self.line.push('\n');
         }
+        // A diagnostic of no unit (a warning of the whole job) has no `compiler-message` to
+        // carry it, so its text goes to stderr in every format, as cargo writes its own warnings
+        // under `--message-format=json`; where the format renders, it is written there once.
+        let writes = renders || diagnostic.unit.is_none();
         // cargo takes one newline off the end, then writes the text and a newline.
         let rendered = diagnostic.rendered.strip_suffix('\n').unwrap_or(diagnostic.rendered);
-        let printed = match renders {
+        let printed = match writes {
             true => self.printed.insert(FixedState.hash_one(rendered)),
             false => true,
         };
-        if renders && printed {
+        if writes && printed {
             self.to(false)?;
             self.line.push_str(rendered);
             self.line.push('\n');

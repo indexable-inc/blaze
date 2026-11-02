@@ -14,8 +14,8 @@ use hir_def::{
     },
     hir::{
         generics::{
-            GenericParams, LocalTypeOrConstParamId, TypeOrConstParamData, TypeParamProvenance,
-            WherePredicate,
+            BinderParams, GenericParams, LocalTypeOrConstParamId, TypeOrConstParamData,
+            TypeParamProvenance, WherePredicate,
         },
         type_ref::{
             ConstRef, LifetimeRef, LifetimeRefId, Mutability, TraitBoundModifier, TypeBound,
@@ -623,8 +623,12 @@ impl<'a> Sig<'a> {
             .where_predicates()
             .iter()
             .filter_map(|pred| match pred {
-                WherePredicate::TypeBound { lifetimes: None, target, bound }
-                    if self.is_param(*target, id) =>
+                WherePredicate::TypeBound {
+                    lifetimes: None,
+                    binder: BinderParams { len: 0, .. },
+                    target,
+                    bound,
+                } if self.is_param(*target, id) =>
                 {
                     Some(bound)
                 }
@@ -644,8 +648,10 @@ impl<'a> Sig<'a> {
         let mut last_target: Option<TypeRefId> = None;
         for pred in params.where_predicates() {
             match pred {
-                WherePredicate::TypeBound { lifetimes, target, bound } => {
-                    let inline = lifetimes.is_none()
+                WherePredicate::TypeBound { lifetimes, binder, target, bound } => {
+                    // Under a `for<..>` binder: its own line, the binder written out.
+                    let bound_free = lifetimes.is_none() && binder.is_empty();
+                    let inline = bound_free
                         && match self.store.type_ref(*target) {
                             TypeRef::TypeParam(p) => {
                                 let data = &GenericParams::of(db, p.parent())[p.local_id()];
@@ -662,7 +668,7 @@ impl<'a> Sig<'a> {
                     if inline {
                         continue;
                     }
-                    if lifetimes.is_none()
+                    if bound_free
                         && last_target == Some(*target)
                         && let Some(line) = lines.last_mut()
                     {
@@ -671,20 +677,32 @@ impl<'a> Sig<'a> {
                         continue;
                     }
                     let mut line = Code::default();
-                    if let Some(lifetimes) = lifetimes {
+                    if !bound_free {
                         line.kw("for").text("<");
-                        for (at, name) in self.store.names(*lifetimes).iter().enumerate() {
+                        let names = lifetimes.map_or(&[][..], |it| self.store.names(it));
+                        for (at, name) in names.iter().enumerate() {
                             if at > 0 {
                                 line.text(", ");
                             }
                             line.push(Piece::Lifetime(lifetime_text(name.as_str())));
+                        }
+                        // `for<F: Field<T>>` (`#![feature(blaze_comptime)]`).
+                        for (at, (_, param)) in params.binder_params(*binder).enumerate() {
+                            if at > 0 || !names.is_empty() {
+                                line.text(", ");
+                            }
+                            line.text(param.name.as_str());
+                            for (at, bound) in param.bounds.iter().enumerate() {
+                                line.text(if at == 0 { ": " } else { " + " });
+                                self.bound(&mut line, bound);
+                            }
                         }
                         line.text("> ");
                     }
                     self.ty(&mut line, *target);
                     line.text(": ");
                     self.bound(&mut line, bound);
-                    last_target = if lifetimes.is_none() { Some(*target) } else { None };
+                    last_target = if bound_free { Some(*target) } else { None };
                     lines.push(line);
                 }
                 WherePredicate::Lifetime { target, .. } => {
@@ -1205,8 +1223,12 @@ pub(crate) fn trait_header(db: &Db, places: Linking<'_>, it: hir::Trait, out: &m
         .where_predicates()
         .iter()
         .filter_map(|pred| match pred {
-            WherePredicate::TypeBound { lifetimes: None, target, bound }
-                if matches!(data.store.type_ref(*target), TypeRef::TypeParam(p)
+            WherePredicate::TypeBound {
+                lifetimes: None,
+                binder: BinderParams { len: 0, .. },
+                target,
+                bound,
+            } if matches!(data.store.type_ref(*target), TypeRef::TypeParam(p)
                     if data.generic_params[p.local_id()].is_trait_self()) =>
             {
                 Some(bound)

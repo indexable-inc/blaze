@@ -236,6 +236,20 @@ fn old_match_attr_flags(
                         "define_opaque" => attr_flags.insert(AttrFlags::HAS_DEFINE_OPAQUE),
                         _ => {}
                     },
+                    "blaze" if &*second_segment == "pure" => {
+                        attr_flags.insert(AttrFlags::PURE);
+                        if tt.syntax().text().to_string().contains("trusted") {
+                            attr_flags.insert(AttrFlags::PURE_TRUSTED);
+                        }
+                    }
+                    "blaze" if &*second_segment == "bits" => {
+                        attr_flags.insert(AttrFlags::BLAZE_BITS)
+                    }
+                    "blaze" if &*second_segment == "nopanic" => attr_flags.insert(AttrFlags::NOPANIC),
+                    "blaze" if &*second_segment == "noalloc" => attr_flags.insert(AttrFlags::NOALLOC),
+                    "blaze" if &*second_segment == "nonblocking" => {
+                        attr_flags.insert(AttrFlags::NONBLOCKING)
+                    }
                     _ => {}
                 },
             }
@@ -329,6 +343,12 @@ fn old_match_attr_flags(
                         }
                         _ => {}
                     },
+                    "clippy" => match &*second_segment {
+                        "has_significant_drop" => {
+                            attr_flags.insert(AttrFlags::HAS_SIGNIFICANT_DROP)
+                        }
+                        _ => {}
+                    },
                     "diagnostic" => match &*second_segment {
                         "do_not_recommend" => {
                             attr_flags.insert(AttrFlags::DIAGNOSTIC_DO_NOT_RECOMMEND)
@@ -337,6 +357,17 @@ fn old_match_attr_flags(
                     },
                     "blaze" => match &*second_segment {
                         "may_suspend" => attr_flags.insert(AttrFlags::MAY_SUSPEND),
+                        "sans_io" => attr_flags.insert(AttrFlags::SANS_IO),
+                        "checkfree" => attr_flags.insert(AttrFlags::CHECKFREE),
+                        "pure" => attr_flags.insert(AttrFlags::PURE),
+                        "bits" => attr_flags.insert(AttrFlags::BLAZE_BITS),
+                        "nopanic" => attr_flags.insert(AttrFlags::NOPANIC),
+                        "noalloc" => attr_flags.insert(AttrFlags::NOALLOC),
+                        "nonblocking" => attr_flags.insert(AttrFlags::NONBLOCKING),
+                        "specialization" => attr_flags.insert(AttrFlags::BLAZE_SPECIALIZATION),
+                        "specialization_trait" => {
+                            attr_flags.insert(AttrFlags::BLAZE_SPECIALIZATION_TRAIT)
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -370,6 +401,8 @@ fn gating_flags(root: view::Node<'_>, meta: &ast::Meta) -> AttrFlags {
         ("rustc_never_returns_null_ptr", AttrFlags::RUSTC_NEVER_RETURNS_NULL_PTR),
         ("rustc_canonical_symbol", AttrFlags::RUSTC_CANONICAL_SYMBOL),
         ("marker", AttrFlags::MARKER),
+        ("rustc_specialization_trait", AttrFlags::RUSTC_SPECIALIZATION_TRAIT),
+        ("rustc_unsafe_specialization_marker", AttrFlags::RUSTC_UNSAFE_SPECIALIZATION_MARKER),
         ("automatically_derived", AttrFlags::AUTOMATICALLY_DERIVED),
         ("rustc_main", AttrFlags::RUSTC_MAIN),
         ("default", AttrFlags::DEFAULT),
@@ -949,6 +982,7 @@ fn old_parse_repr_tt(tt: &ast::TokenTree) -> Option<rustc_abi::ReprOptions> {
                             BuiltinInt::I32 => IntegerType::Fixed(Integer::I32, true),
                             BuiltinInt::I64 => IntegerType::Fixed(Integer::I64, true),
                             BuiltinInt::I128 => IntegerType::Fixed(Integer::I128, true),
+                            BuiltinInt::Bits(_) => unreachable!("a suffix reads no arbitrary width"),
                         },
                         Either::Right(bu) => match bu {
                             BuiltinUint::Usize => IntegerType::Pointer(false),
@@ -957,6 +991,7 @@ fn old_parse_repr_tt(tt: &ast::TokenTree) -> Option<rustc_abi::ReprOptions> {
                             BuiltinUint::U32 => IntegerType::Fixed(Integer::I32, false),
                             BuiltinUint::U64 => IntegerType::Fixed(Integer::I64, false),
                             BuiltinUint::U128 => IntegerType::Fixed(Integer::I128, false),
+                            BuiltinUint::Bits(_) => unreachable!("a suffix reads no arbitrary width"),
                         },
                     });
                 ReprOptions { int, ..Default::default() }
@@ -2134,5 +2169,59 @@ pub mod m {
         ] {
             assert_eq!(off(name), expected, "{name}");
         }
+    }
+}
+
+const EFFECTS: &str = r#"
+mod marked {
+    #[blaze::nopanic]
+    #[blaze::noalloc(trusted = "the caller's frame")]
+    #[blaze::nonblocking(because)]
+    pub fn f(x: u32) -> u32 { x }
+}
+mod plain {
+    pub fn f(x: u32) -> u32 { x }
+}
+"#;
+
+/// `#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]` set their bit and say
+/// what they say, and nothing else: the signature and every other flag of a marked function are
+/// those of the same function unmarked, so no code an unmarked crate builds can differ.
+#[test]
+fn an_effect_attribute_changes_no_signature() {
+    use super::{EffectWord, PureAttr};
+    use crate::signatures::FunctionSignature;
+
+    let db = fixture::db(EFFECTS).into_db();
+    let def_map = crate_def_map(&db, fixture::test_crate(&db));
+    let root = def_map.module(&db, def_map.root);
+    let in_module = |module: &str| {
+        let (_, &id) = (root.children(&db).iter())
+            .find(|(name, _)| name.as_str() == module)
+            .unwrap_or_else(|| panic!("no module {module}"));
+        def_map
+            .module(&db, id)
+            .scope(&db)
+            .declarations()
+            .find_map(|decl| match decl {
+                ModuleDefId::FunctionId(func) => Some(func),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no fn in {module}"))
+    };
+    let (marked, plain) = (in_module("marked"), in_module("plain"));
+    let effects = AttrFlags::NOPANIC | AttrFlags::NOALLOC | AttrFlags::NONBLOCKING;
+
+    let marked_flags = AttrFlags::query(&db, marked.into());
+    assert!(marked_flags.contains(effects));
+    assert_eq!(marked_flags - effects, AttrFlags::query(&db, plain.into()));
+    assert_eq!(FunctionSignature::of(&db, marked), FunctionSignature::of(&db, plain));
+
+    let said = |func: FunctionId, word| AttrFlags::effect_attr(&db, func.into(), word);
+    assert_eq!(said(marked, EffectWord::Nopanic), Some(PureAttr::Checked));
+    assert_eq!(said(marked, EffectWord::Noalloc), Some(PureAttr::Trusted(Symbol::intern("the caller's frame"))));
+    assert!(matches!(said(marked, EffectWord::Nonblocking), Some(PureAttr::Malformed(_))));
+    for word in [EffectWord::Nopanic, EffectWord::Noalloc, EffectWord::Nonblocking] {
+        assert_eq!(said(plain, word), None);
     }
 }

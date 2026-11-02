@@ -41,7 +41,14 @@ pub(super) enum LaterUse {
 pub(super) enum Explanation {
     UsedLater { kind: LaterUse, at: PartSpan, path: Option<PartSpan> },
     UsedLaterInLoop { kind: LaterUse, at: PartSpan, path: Option<PartSpan> },
-    UsedLaterWhenDropped { at: MirSpan, dropped: LocalId, note_order: bool },
+    /// `binding` is the variable dropped, when the drop is the end of its scope in the
+    /// item's own body ([`super::Draft::dropped_at_scope_end`]).
+    UsedLaterWhenDropped {
+        at: MirSpan,
+        dropped: LocalId,
+        note_order: bool,
+        binding: Option<hir_def::hir::BindingId>,
+    },
     /// The loan must be valid for a lifetime of the signature. rustc's label of it names the
     /// region, which is not given.
     MustBeValidFor,
@@ -116,6 +123,7 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
                 dropped: local,
                 note_order: self.ctx.local_name(local).is_some()
                     && dropped.is_some_and(|it| it != local && self.ctx.local_name(it).is_some()),
+                binding: self.scope_end_drop(local, at),
             },
             Some((_, _, DefUse::Def)) | None => {
                 let universal = self.values.universals_of(region).any(|it| {
@@ -184,7 +192,8 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
                     }
                 }
             }
-            Explanation::UsedLaterWhenDropped { at, dropped, note_order } => {
+            Explanation::UsedLaterWhenDropped { at, dropped, note_order, binding } => {
+                diagnostic.dropped_at_scope_end = binding;
                 let ty = self.body.locals[dropped].ty.as_ref();
                 let (dtor, what) = match ty.kind() {
                     TyKind::Adt(def, _)
@@ -232,6 +241,26 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
                 }
             }
             Explanation::MustBeValidFor | Explanation::Unexplained => (),
+        }
+    }
+
+    /// The variable `local` is, when `at` is the drop of the whole of it in the item's own body
+    /// (not a closure's, an `async` block's or a `const` block's), which is its scope's end or
+    /// a way out of the scope: what `drop(x);` earlier could move.
+    fn scope_end_drop(&self, local: LocalId, at: Location) -> Option<hir_def::hir::BindingId> {
+        if self.ctx.closure_expr.is_some() || self.ctx.inline_const {
+            return None;
+        }
+        let binding = *self.ctx.bindings.get(&local)?;
+        let data = &self.body.basic_blocks[at.block];
+        if at.statement != data.statements.len() {
+            return None;
+        }
+        match &data.terminator.as_ref()?.kind {
+            TerminatorKind::Drop { place, .. } if place.local == local && place.projection.is_empty() => {
+                Some(binding)
+            }
+            _ => None,
         }
     }
 

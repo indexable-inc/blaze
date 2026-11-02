@@ -32,6 +32,7 @@ mod generics;
 mod items;
 mod types;
 
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
 use std::{cell::OnceCell, ops::ControlFlow};
 
 use hir::{HirFileId, InFile};
@@ -50,6 +51,7 @@ use crate::{
 
 /// One pass over the nodes [`Walk`] holds: each node costs a `kind` read and a `match` on it;
 /// only the kinds a check looks at are cast, and nothing is allocated unless an error fires.
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
 pub(crate) fn check<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Found> {
     let features = OnceCell::new();
     let mut out = Out::default();
@@ -82,6 +84,7 @@ impl Out {
 }
 
 /// The validator at one tree of the walk.
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
 struct V<'v, 'a, 'db> {
     cx: &'v Cx<'a, 'db>,
     walk: &'v Walk<'db>,

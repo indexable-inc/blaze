@@ -17,9 +17,11 @@
 //! (`Visibility::to_string`) and `compiler/rustc_privacy/src/diagnostics.rs`
 //! (`PrivateInterfacesOrBoundsLint`, `InPublicInterface`) (MIT or Apache-2.0).
 
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
 use std::cell::OnceCell;
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_items::Fact;
 use hir::{AsAssocItem as _, AssocItemContainer, InFile, ModuleDef, PathResolution};
 use syntax::{
@@ -61,7 +63,7 @@ fn vis_str(cx: &Cx<'_, '_>, vis: Vis, def: Def) -> String {
 
 pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>], effective: &Effective) -> Vec<Found> {
     // alloc: the pass's output, once per crate
-    let mut checker = Checker { cx, effective, found: Vec::new(), seen: HashSet::default() };
+    let mut checker = Checker { cx, effective, found: Vec::new(), seen: HashSet::new_in(Global) };
     let mut at = 0;
     while at < items.len() {
         let module = items[at].module;
@@ -82,6 +84,7 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>], effective: &Effe
 }
 
 /// One `SearchInterfaceForPrivateItemsVisitor`: the item it checks and what it requires.
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
 struct Check<'i, 'db> {
     item: Def,
     node: InFile<ast::Node<'db>>,
@@ -107,11 +110,12 @@ struct Checker<'c, 'a, 'db> {
     effective: &'c Effective,
     found: Vec<Found>,
     /// rustc emits a diagnostic it already emitted once.
-    seen: HashSet<String>,
+    seen: HashSet<String, Global>,
 }
 
 impl<'db> Checker<'_, '_, 'db> {
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
     fn check<'i>(
         &self,
         owner: &'i Item<'db>,
@@ -179,7 +183,7 @@ impl<'db> Checker<'_, '_, 'db> {
                 }
                 check.skip_assoc = true;
                 check.primary = true;
-                let mut aliases = HashSet::default();
+                let mut aliases = HashSet::new_in(Global);
                 if let Some(ty) = imp.self_ty() {
                     self.visit(&check, InFile::new(file, ty.syntax()), false, &mut aliases);
                 }
@@ -228,7 +232,7 @@ impl<'db> Checker<'_, '_, 'db> {
         let mut check = self.check(owner, def, field, "field", vis, ev);
         check.primary = true;
         if let Some(ty) = ty {
-            self.visit(&check, InFile::new(file, ty.syntax()), false, &mut HashSet::default());
+            self.visit(&check, InFile::new(file, ty.syntax()), false, &mut HashSet::new_in(Global));
         }
     }
 
@@ -253,7 +257,7 @@ impl<'db> Checker<'_, '_, 'db> {
             check.hard_error = false;
             check.primary = false;
             if let ast::Item::TypeAlias(it) = item.node.value {
-                let mut aliases = HashSet::default();
+                let mut aliases = HashSet::new_in(Global);
                 for bound in it.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
                     self.visit(&check, item.node.with_value(bound.syntax()), false, &mut aliases);
                 }
@@ -266,7 +270,7 @@ impl<'db> Checker<'_, '_, 'db> {
         check.primary = true;
         let Some(params) = node.syntax().children().find_map(ast::GenericParamList::cast) else { return };
         let file = check.node.file_id;
-        let mut aliases = HashSet::default();
+        let mut aliases = HashSet::new_in(Global);
         for param in params.generic_params() {
             let ty = match &param {
                 ast::GenericParam::ConstParam(it) => it.ty(),
@@ -284,7 +288,7 @@ impl<'db> Checker<'_, '_, 'db> {
     fn clauses(&mut self, check: &mut Check<'_, 'db>, node: ast::Item<'db>) {
         check.primary = false;
         let file = check.node.file_id;
-        let mut aliases = HashSet::default();
+        let mut aliases = HashSet::new_in(Global);
         if let ast::Item::Trait(it) = node {
             for bound in it.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
                 self.visit(check, InFile::new(file, bound.syntax()), false, &mut aliases);
@@ -323,7 +327,7 @@ impl<'db> Checker<'_, '_, 'db> {
     fn ty(&mut self, check: &mut Check<'_, 'db>, node: ast::Item<'db>, impl_self: Option<InFile<ast::Node<'db>>>) {
         check.primary = true;
         let file = check.node.file_id;
-        let mut aliases = HashSet::default();
+        let mut aliases = HashSet::new_in(Global);
         match node {
             ast::Item::Fn(f) => {
                 if let Some(list) = f.param_list() {
@@ -361,7 +365,7 @@ impl<'db> Checker<'_, '_, 'db> {
     }
 
     /// The defs a type (or a bound) names, in the order rustc's skeleton visits them.
-    fn visit(&mut self, check: &Check<'_, 'db>, node: InFile<ast::Node<'db>>, skip_impl_trait: bool, aliases: &mut HashSet<hir::TypeAlias>) {
+    fn visit(&mut self, check: &Check<'_, 'db>, node: InFile<ast::Node<'db>>, skip_impl_trait: bool, aliases: &mut HashSet<hir::TypeAlias, Global>) {
         let cx = self.cx;
         let mut walk = node.value.preorder();
         while let Some(event) = walk.next() {
@@ -413,7 +417,7 @@ impl<'db> Checker<'_, '_, 'db> {
 
     /// `<T as Trait>::Assoc` (or `T::Assoc`): the associated type, its trait, then `T` and the
     /// trait's arguments.
-    fn projection(&mut self, check: &Check<'_, 'db>, path: InFile<ast::Path<'db>>, alias: hir::TypeAlias, aliases: &mut HashSet<hir::TypeAlias>) {
+    fn projection(&mut self, check: &Check<'_, 'db>, path: InFile<ast::Path<'db>>, alias: hir::TypeAlias, aliases: &mut HashSet<hir::TypeAlias, Global>) {
         let cx = self.cx;
         let def = ModuleDef::TypeAlias(alias);
         self.def_id(check, Def::Item(def), "associated type", || cx.def_path(def));

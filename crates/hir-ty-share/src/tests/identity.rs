@@ -7,6 +7,7 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, coroutine_code, interface_hash, item_key, key, layout_hash};
 use hegel::TestCase;
@@ -148,7 +149,7 @@ fn old_adt(db: &Db, old: Old, adt: AdtId) -> Result<ContentId, String> {
     h.id(&item_key(db, item).0)
         .id(&interface_hash(db, item).map_err(describe)?.0)
         .id(&layout_hash(db, adt).map_err(describe)?.0);
-    let mut seen: HashSet<AdtId> = HashSet::default();
+    let mut seen: HashSet<AdtId, Global> = HashSet::new_in(Global);
     seen.insert(adt);
     let mut next = vec![adt];
     let mut dropping: Vec<(ItemKey, ContentId)> = Vec::new();

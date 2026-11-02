@@ -26,6 +26,7 @@
 mod body;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use either::Either;
 use hir::{HirFileId, InFile, ModuleDef, PathResolution};
 use hir_def::{
@@ -53,10 +54,10 @@ use crate::{
 pub(super) struct Live {
     live: DefSet,
     /// The closures and anonymous constants walked, which items in them have as their parent.
-    anon: HashSet<InFile<SyntaxNodePtr>>,
+    anon: HashSet<InFile<SyntaxNodePtr>, Global>,
     /// rustc's `ignored_derived_traits`: of each ADT, the traits of the derives whose impls
     /// were not walked, in the order they were met.
-    pub(super) ignored: HashMap<DefIdx, SmallVec<[&'static str; 2]>>,
+    pub(super) ignored: HashMap<DefIdx, SmallVec<[&'static str; 2]>, Global>,
 }
 
 impl Live {
@@ -102,7 +103,7 @@ pub(super) fn live(k: &Crate<'_, '_, '_>, seeds: Seeds) -> (Liveness, Vec<Found>
         ignore_variants: Vec::new(), // alloc: setup, one stack for the whole walk
         repr_all_live: false,
         repr_simd: false,
-        self_assigns: HashSet::default(),
+        self_assigns: HashSet::new_in(Global),
         found: Vec::new(), // alloc: the pass's output, once per crate
     };
     let mut unsolved = seeds.unsolved;
@@ -124,7 +125,7 @@ struct Mark<'k, 'c, 'a, 'db> {
     ignore_variants: Vec<DefIdx>,
     repr_all_live: bool,
     repr_simd: bool,
-    self_assigns: HashSet<InFile<SyntaxNodePtr>>,
+    self_assigns: HashSet<InFile<SyntaxNodePtr>, Global>,
     found: Vec<Found>,
 }
 

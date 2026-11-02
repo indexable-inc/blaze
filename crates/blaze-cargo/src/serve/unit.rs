@@ -37,9 +37,12 @@ mod files;
 mod graph;
 mod harness;
 mod intent;
+mod layout;
 mod memo;
 mod pack;
+mod perf;
 mod reach;
+mod reads;
 mod run;
 mod say;
 mod script;
@@ -52,9 +55,12 @@ mod tests;
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, OnceLock, atomic::Ordering},
+    sync::{Arc, atomic::Ordering},
     time::Instant,
 };
+
+#[expect(clippy::disallowed_types, reason = "a job's slots, one per unit, each set once by the unit's task: per job, not global")]
+use std::sync::OnceLock;
 
 use base_db::FileId;
 use blaze_api::{ApiError, Artifact, CrateType, Reach, Response, Table, TargetKind, TestResult, Ub, UnitOf, UnitTarget};
@@ -72,8 +78,8 @@ use crate::serve::{
     Paths,
     fetch::Fetcher,
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library, Phase, Put, Runs,
-        Selection, Source, SourceFile, Steps, Writer, applying,
+        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, KeptPut, Library, Phase, Put, RunPuts,
+        Runs, Selection, Source, SourceFile, Steps, Writer, applying,
     },
 };
 
@@ -173,6 +179,35 @@ impl Steps for Real {
         Ok(Library { at: named, fingerprint, source: Some(Source { files, under: String::new() }) })
     }
 
+    fn store_kept(&self, kept: &mut KeptLowered) -> Result<Vec<KeptPut>, ApiError> {
+        if kept.stored {
+            return Ok(Vec::new()); // alloc: none
+        }
+        let later = std::mem::take(&mut kept.later);
+        let deps = kept.deps.take();
+        let stored = cancellable(|| deps::store(&kept.lowered, deps, &mut kept.session, &later, &kept.root));
+        let (puts, flushes) = match stored {
+            Ok(stored) => stored?,
+            // A cancel of the front end's database or of the build graph, caught as the
+            // lowering's are: what it stored so far is not all of it, so the front end is
+            // dropped ([`super::job`]'s `stored_kept`) and the next build lowers it anew.
+            Err(Failed::Again) => {
+                // alloc: an error, once
+                let what = format!(
+                    "storing what the build of {} left for the store was cancelled partway (a cancel of its \
+                     front end's database or of the build graph), so its front end is dropped and the \
+                     checkout's next build lowers it anew",
+                    kept.root
+                );
+                return Err(ApiError::new(what, Some(kept.root.clone()))); // clone: an error, once
+            }
+            Err(Failed::Error(error)) => return Err(error),
+        };
+        kept.flushed = Some(flushes);
+        kept.stored = true;
+        Ok(puts)
+    }
+
     fn lower(&self, input: &JobInput, kept: Option<KeptLowered>) -> Result<FrontEnd<Real>, Failed> {
         if input.cancelled.load(Ordering::Relaxed) {
             return Err(Failed::Again);
@@ -182,16 +217,30 @@ impl Steps for Real {
             // Held until this job's front end is kept with its own: what the head's last build
             // used stays in the memo for this one.
             let held = kept.as_mut().and_then(|it| it.memo.take());
-            let mut puts = Vec::new();
+            let puts = Vec::new(); // alloc: none
+            // What the head's last build left for the store was written as it was kept
+            // ([`Steps::store_kept`]), before that build answered; a front end that was not is
+            // never lowered into, as its images and outcomes would be lost (rule 3).
             let mut flushed = None;
             if let Some(it) = &mut kept {
-                let later = std::mem::take(&mut it.later);
-                let (stored, goals) = deps::store(&it.lowered, it.deps.take(), &mut it.session, &later, &it.root)?;
-                puts = stored;
-                flushed = Some(goals);
+                if !it.stored {
+                    let what = "the head's last front end is lowered into, and what its build left for the store was never written (`Steps::store_kept`)";
+                    return Err(Failed::Error(ApiError::new(what, Some(it.root.clone())))); // clone: an error, once
+                }
+                flushed = it.flushed.take();
             }
+            // Whether a record retracting a value verified across checkouts was published since
+            // the kept front end was lowered (rule 18): its database's tracked expansions and
+            // served images would keep such a value, so it is not lowered into, and the build
+            // lowers afresh, where `deps::serve` works every verified image's reads out again
+            // and an expansion is looked up again. Read before this job expands anything, so a
+            // record published while it runs moves the epoch past the one its front end is kept
+            // at. One atomic load (`Keeping::retractions_now`).
+            let retractions = input.macros.keeps().retractions_now();
             let kept = kept.filter(|it| {
-                (Arc::ptr_eq(&it.units, &input.units) || it.units == input.units) && it.config == input.config
+                (Arc::ptr_eq(&it.units, &input.units) || it.units == input.units)
+                    && it.config == input.config
+                    && it.retractions == retractions
             });
             let lower = || Lower {
                 units: &input.units,
@@ -225,7 +274,7 @@ impl Steps for Real {
             }
             let mut session = match session {
                 Some(session) => session,
-                None => deps::session(&lowered, &input.store, &input.config.invocation.env)?,
+                None => deps::session(&lowered, &input.store, &input.macros, &input.config.invocation.env)?,
             };
             let mut job = Job::new(input.clone(), lowered.crates().clone(), self.shared.clone(), held)?;
             job._seeded = seeded;
@@ -258,6 +307,7 @@ impl Steps for Real {
                 flushed,
                 broke: Vec::new(),
                 broken: false,
+                retractions,
             };
             Ok((writer, puts))
         })??;
@@ -300,19 +350,27 @@ impl KeptDb for KeptLowered {
 /// A job's front end as the loop keeps it ([`Writer::keep`]), with what it was lowered from:
 /// the next build of the head lowers into it only when it lowers the same.
 pub struct KeptLowered {
-    /// What its database keeps of the store ([`deps::session`]), its goals flushed when the
-    /// next build lowers into it. Declared first: its goal store is uninstalled before the
+    /// What its database keeps of the store ([`deps::session`]), its goals flushed as it is
+    /// stored ([`Steps::store_kept`]). Declared first: its goal store is uninstalled before the
     /// database it is keyed to drops.
     session: deps::Session,
     lowered: Held<Lowered>,
     units: Arc<Units>,
     config: Arc<BuildConfig>,
-    /// What it was served with, until the next build lowering into it stores the images.
+    /// What it was served with, until it is stored ([`Steps::store_kept`]).
     deps: Option<deps::Kept>,
+    /// The epoch of retractions ([`proc_macro_api::kept::Keeping::retractions_now`]) its job
+    /// was lowered at: the next build lowers into it only at the same one.
+    retractions: u64,
     /// The dependency crates its build checked, and the workspace root their outcomes'
-    /// paths are named from, until the next build lowering into it stores them.
+    /// paths are named from, until it is stored ([`Steps::store_kept`]).
     later: Vec<deps::Later>,
     root: String,
+    /// Whether what its build left for the store was written ([`Steps::store_kept`]): the
+    /// next build lowers into it only then.
+    stored: bool,
+    /// What its store's flushes did, for the `-v` note of the next build lowering into it.
+    flushed: Option<deps::Flushes>,
     /// The trees its job's last edit reparsed in place, for the next build to seed its parses
     /// with when it moves to the edit's commit.
     seeds: Vec<blaze_intent::Seed>,
@@ -371,6 +429,8 @@ pub struct UnitWriter {
     broke: Vec<Broke>,
     /// Whether a write ever panicked: the front end may be half written, and is not kept.
     broken: bool,
+    /// The epoch of retractions its job was lowered at, kept with it ([`KeptLowered`]).
+    retractions: u64,
 }
 
 /// `broke`, a panic of a step of an apply for each of the units `ready`, kept once for each.
@@ -470,9 +530,10 @@ impl Writer<Real> for UnitWriter {
         cancellable(|| lowered.tables())
     }
 
-    fn finished(&mut self) -> Result<(), ApiError> {
+    fn finished(&mut self, ok: bool, built: &[u32]) -> Result<Vec<blaze_api::Diagnostic>, ApiError> {
         self.deps.as_ref().map_or(Ok(()), deps::differences)?;
-        deps::item_errors(&self.session)
+        deps::item_errors(&self.session)?;
+        Ok(codegen::unapplied(&self.job, ok, built)?.into_iter().map(warning).collect())
     }
 
     fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError> {
@@ -492,7 +553,7 @@ impl Writer<Real> for UnitWriter {
             let what = "the front end is not kept for the head's next build: a write to it panicked, and it may be half written";
             return Err(self.refused(what));
         }
-        let UnitWriter { session, front, job, deps, .. } = self;
+        let UnitWriter { session, front, job, deps, retractions, .. } = self;
         let Some(lowered) = Arc::into_inner(front.into_inner()) else {
             let what = "the front end is kept for the head's next build, and another holder of it is still alive";
             return Err(ApiError::new(what, None));
@@ -500,7 +561,7 @@ impl Writer<Real> for UnitWriter {
         let later = std::mem::take(&mut *job.later.lock());
         let seeds = std::mem::take(&mut *job.seeds.lock());
         // alloc: once per front end kept, every entry its units' builds used
-        let used: Vec<ContentId> = job.memo_used.iter().filter_map(OnceLock::get).flatten().copied().collect();
+        let used: Vec<ContentId> = job.memo_used.iter().filter_map(|it| it.get()).flatten().copied().collect();
         let memo = Some(job.shared.memos.hold(used));
         Ok(KeptLowered {
             session,
@@ -508,8 +569,11 @@ impl Writer<Real> for UnitWriter {
             units: job.input.units.clone(),
             config: job.input.config.clone(),
             deps,
+            retractions,
             later,
             root: job.mounted.root().to_owned(), // alloc: once per front end kept
+            stored: false,
+            flushed: None,
             seeds,
             memo,
         })
@@ -682,6 +746,7 @@ pub(crate) fn cancellable<T>(work: impl FnOnce() -> T) -> Result<T, Failed> {
 
 /// One job's front: its units lowered, and what its build scripts and compiles found that
 /// later units read.
+#[expect(clippy::disallowed_types, reason = "a job's slots, one per unit, each set once by the unit's task: per job, not global")]
 pub(crate) struct Job {
     pub(crate) input: JobInput,
     /// Each unit's crate in the front end.
@@ -721,6 +786,18 @@ pub(crate) struct Job {
     /// The profiles its units' `-C profile-use`s name, read and given to the code generator
     /// once, and held while the job lives.
     pub(crate) profiles: OnceLock<codegen::Profiles>,
+    /// What each unit's codegen did with each profile it used, by unit, set once when its
+    /// build ends ([`codegen::counted`]); summed over the job, each profile is judged
+    /// ([`codegen::judge`]): one that applied to nothing fails the job only when blaze made
+    /// it, and is a warning otherwise.
+    pub(crate) counted: Box<[OnceLock<Box<[(ContentId, blaze_codegen::driver::ProfileCounts)]>>]>,
+    /// The profiles its units' profile lints read (`profile` in `clippy.toml` or
+    /// `[workspace.metadata.blaze.lints]`), read once and held while the job lives.
+    pub(crate) lint_profiles: OnceLock<compile::LintProfiles>,
+    /// The profiles in the target directory's `layout` its images are laid out by, and where
+    /// their links write address maps ([`layout`]); read the first time a unit that links
+    /// asks, none when there is no such directory.
+    pub(crate) layout: OnceLock<Result<Option<layout::Profiles>, String>>,
     /// `blaze test --ub`'s tests, selected once on a worker, read by every evaluation.
     pub(crate) ub: OnceLock<test::UbTests>,
     /// When the job's front was made: the clock the test queue is given.
@@ -756,25 +833,28 @@ impl Job {
             crates,
             shared,
             graph,
-            identities: (0..slots).map(|_| OnceLock::new()).collect(),
-            scripts: (0..slots).map(|_| OnceLock::new()).collect(),
-            made: (0..slots).map(|_| OnceLock::new()).collect(),
+            identities: (0..slots).map(|_| Default::default()).collect(),
+            scripts: (0..slots).map(|_| Default::default()).collect(),
+            made: (0..slots).map(|_| Default::default()).collect(),
             phases: (0..slots).map(|_| Mutex::default()).collect(),
-            keys: (0..slots).map(|_| OnceLock::new()).collect(),
-            runs: (0..slots).map(|_| OnceLock::new()).collect(),
+            keys: (0..slots).map(|_| Default::default()).collect(),
+            runs: (0..slots).map(|_| Default::default()).collect(),
             mounted,
-            inert: (0..slots).map(|_| OnceLock::new()).collect(),
-            pure: (0..slots).map(|_| OnceLock::new()).collect(),
+            inert: (0..slots).map(|_| Default::default()).collect(),
+            pure: (0..slots).map(|_| Default::default()).collect(),
             starts: (0..slots).map(|_| Mutex::new(None)).collect(),
-            build_time: OnceLock::new(),
-            profiles: OnceLock::new(),
-            ub: OnceLock::new(),
+            build_time: Default::default(),
+            profiles: Default::default(),
+            counted: (0..slots).map(|_| Default::default()).collect(),
+            lint_profiles: Default::default(),
+            layout: Default::default(),
+            ub: Default::default(),
             began: Instant::now(),
             later: Mutex::new(Vec::new()), // alloc: setup, once per job; grows once per dependency crate checked
             seeds: Mutex::new(Vec::new()),
             _seeded: Vec::new(),
             memo,
-            memo_used: (0..slots).map(|_| OnceLock::new()).collect(),
+            memo_used: (0..slots).map(|_| Default::default()).collect(),
             _held: held,
         })
     }
@@ -1112,6 +1192,14 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Program(it) => it.cancel(effects),
         }
     }
+
+    fn take_puts(&mut self) -> RunPuts {
+        match self {
+            UnitRuns::Script(it) => it.take_puts(),
+            UnitRuns::Tests(it) => it.take_puts(),
+            UnitRuns::Program(it) => it.take_puts(),
+        }
+    }
 }
 
 /// The front end's tables (tokens, syntax nodes, HIR expressions, MIR statements, memos and
@@ -1130,4 +1218,19 @@ fn summed(mut counted: Vec<(&'static str, u64, u64)>) -> Vec<Table> {
         }
     }
     tables
+}
+
+/// A warning of the whole job, of no unit or span: `message` as the job says it.
+fn warning(message: String) -> blaze_api::Diagnostic {
+    blaze_api::Diagnostic {
+        level: blaze_api::Level::Warning,
+        code: None,
+        rendered: format!("warning: {message}\n"), // alloc: once per warning
+        message,
+        spans: Vec::new(),    // alloc: none
+        children: Vec::new(), // alloc: none
+        facts: Vec::new(),    // alloc: none
+        unit: None,
+        explanation: None,
+    }
 }

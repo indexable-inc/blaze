@@ -62,6 +62,12 @@ impl<'a> Os<'a> {
         ok(ret, 0)
     }
 
+    /// Nanoseconds since the Unix epoch, now, noted read: WASI's realtime clock for a wasm macro.
+    pub(crate) fn realtime_ns(&mut self) -> u64 {
+        self.note_clock();
+        now_ns()
+    }
+
     pub(super) fn time(&mut self, g: &mut impl Guest, ret: &mut [u8], out: u64) -> Done {
         self.note_clock();
         let s = now_ns() / 1_000_000_000;

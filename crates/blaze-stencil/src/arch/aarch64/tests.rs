@@ -409,9 +409,14 @@ fn kinds(relocs: &[code::Reloc]) -> Vec<(Reloc, Name, i64)> {
 
 /// `(log2 of the size, offset)` of each integer store at `[sp, #off]`, either form.
 fn sp_stores(words: &[u32]) -> Vec<(u32, u32)> {
+    stores_at(words, 31)
+}
+
+/// `(log2 of the size, offset)` of each integer store at `[base, #off]`, either form.
+fn stores_at(words: &[u32], base: u32) -> Vec<(u32, u32)> {
     words
         .iter()
-        .filter(|w| (*w >> 5) & 31 == 31)
+        .filter(|w| (*w >> 5) & 31 == base)
         .filter_map(|&w| {
             let size = w >> 30;
             if w & 0x3fe0_0c00 == 0x3800_0000 {
@@ -438,21 +443,30 @@ fn frame_record_epilogue_and_rows_are_cranelifts() {
         let ret = ours.span(ir::Opcode::Return, &func);
         assert_eq!(ret[ret.len() - 2..], [0xa8c1_7bfd, 0xd65f_03c0]);
         assert_eq!(ret[ret.len() - 2..], clif.words[clif.words.len() - 2..]);
-        // Apple's unsigned return addresses, the record's rows and the CFA moved to `x29`,
-        // as Cranelift's (its leaf saves nothing, so these are all of its rows).
-        let apple = usize::from(target.os == Os::MacOs);
-        let rows: Vec<String> = ours.rows[..4 + apple]
-            .iter()
-            .map(|row| match row {
-                (at, Rule::RaSignState(signed)) => {
-                    format!("({at}, Aarch64SetPointerAuth {{ return_addresses: {signed} }})")
-                }
-                row => format!("{row:?}"),
-            })
-            .collect();
-        assert_eq!(rows[3 + apple], "(8, CfaRegister(29))");
-        let theirs = format!("{:?}", clif.unwind);
+        // The record's rows and the CFA moved to `x29`, as Cranelift's (its leaf saves
+        // nothing, so these are all of its rows), without the unsigned return addresses it
+        // says first on Apple's: they are what a frame starts with.
+        let rows: Vec<String> = ours.rows[..4].iter().map(|row| format!("{row:?}")).collect();
+        assert_eq!(rows[3], "(8, CfaRegister(29))");
+        let unsigned = "(0, Aarch64SetPointerAuth { return_addresses: false }), ";
+        let theirs = format!("{:?}", clif.unwind).replace(unsigned, "");
         assert!(theirs.contains(&format!("[{}]", rows.join(", "))), "{theirs} is not {rows:?}");
+    }
+}
+
+/// A stencil function signs no return address, so its rows say nothing of signing on any
+/// target: DWARF's `RA_SIGN_STATE` starts at 0. Apple's ld64 takes a row of it for a save of
+/// register 34 that no compact unwind entry has, and warns once a function, scanning the
+/// symbol table each time (1,170,131 warnings and 20 minutes linking blaze, 2026-11-02).
+#[test]
+fn rows_say_nothing_of_signing_when_nothing_is_signed() {
+    for target in [LINUX, MACOS] {
+        for func in [leaf(conv(&target)), leaf_with_slot(conv(&target), 64)] {
+            let ours = whole(&func, &target);
+            let signing: Vec<_> =
+                ours.rows.iter().filter(|(_, rule)| matches!(rule, Rule::RaSignState(_))).collect();
+            assert!(signing.is_empty(), "{:?}: {signing:?}", target.os);
+        }
     }
 }
 
@@ -860,7 +874,7 @@ fn tail_calls_outside_tail_and_other_conventions_are_errors() {
     let inst =
         func.layout.first_inst(func.layout.entry_block().expect("a block")).expect("an inst");
     let error = Aarch64::frame(&func, &LINUX, AREA).map(drop).map_err(|e| e.inst);
-    assert_eq!(error, Err(Some(inst)), "a `system_v` function's return call is refused");
+    assert_eq!(error, Err(Some(inst)), "a `system_v` function's return call to a `tail` one is refused");
     assert!(Aarch64::frame(&leaf(CallConv::Tail), &LINUX, AREA).is_ok());
     assert!(Aarch64::frame(&leaf(CallConv::Winch), &LINUX, AREA).is_err());
 }
@@ -885,6 +899,30 @@ fn a_return_call_of_more_stack_arguments_grows_the_frame_as_cranelift_does() {
     assert_eq!(call[call.len() - 1], 0x1400_0000);
     let reloc = out.relocs.last().expect("the callee's relocation");
     assert_eq!((reloc.kind, reloc.at / 4), (Reloc::Arm64Call, (out.words.len() - 8 - 1) as u32));
+}
+
+#[test]
+fn a_native_return_call_writes_over_the_callers_own_stack_arguments() {
+    // Ten `i32`s, two on the stack: the callee's go where the caller's caller put the
+    // caller's (8 bytes each in AAPCS64, packed in Apple's), and `sp` stays at them.
+    for (target, expect) in [
+        (LINUX, [(2, 16), (2, 24)]),
+        (WINDOWS, [(2, 16), (2, 24)]),
+        (MACOS, [(2, 16), (2, 20)]),
+    ] {
+        let ten = sig(conv(&target), &[I32; 10], &[I32]);
+        let func = build(ten.clone(), |b, p| {
+            let f = import(b, 1, ten.clone(), true);
+            let args: Vec<_> = p.iter().rev().copied().collect();
+            b.ins().return_call(f, &args);
+        });
+        let out = whole(&func, &target);
+        assert_eq!((out.frame.pop, out.frame.grow), (0, 0), "{:?}", target.os);
+        let call = out.span(ir::Opcode::ReturnCall, &func);
+        assert_eq!(stores_at(call, u32::from(inst::FP)), expect, "{:?}", target.os);
+        // `ldp x29, x30, [sp], #16`, then the colocated `b`: no `add sp` between.
+        assert_eq!(call[call.len() - 2..], [0xa8c1_7bfd, 0x1400_0000], "{:?}", target.os);
+    }
 }
 
 #[test]

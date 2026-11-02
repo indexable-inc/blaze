@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir_def::{AssocItemId, FunctionId, TraitId};
 use rustc_type_ir::{
     Binder, Interner, RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable,
@@ -42,7 +43,7 @@ impl<'db> VtableLayout<'db> {
         let mut walk = Walk {
             interner,
             plain,
-            visited: HashSet::from_iter([trait_ref]),
+            visited: HashSet::from_iter_in([trait_ref], Global),
             // alloc: the layout's own lists, returned in it
             slots: Vec::new(),
             // alloc: the layout's own lists, returned in it
@@ -86,7 +87,7 @@ pub(super) enum Upcast {
 struct Walk<'a, 'db, P> {
     interner: DbInterner<'db>,
     plain: &'a P,
-    visited: HashSet<TraitRef<'db>>,
+    visited: HashSet<TraitRef<'db>, Global>,
     slots: Vec<Slot<'db>>,
     prefixes: Vec<TraitRef<'db>>,
     /// Set once a trait with methods has been laid out: every later supertrait is no longer

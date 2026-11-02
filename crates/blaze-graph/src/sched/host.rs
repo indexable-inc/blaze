@@ -20,11 +20,9 @@ use std::{
     cell::Cell,
     panic::{self, AssertUnwindSafe},
     ptr::{self, NonNull},
-    sync::{
-        OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     thread::{self, Thread},
+    time::{Duration, Instant},
 };
 
 use corosensei::{
@@ -35,9 +33,9 @@ use corosensei::{
 use super::{
     CounterId, Cycle, JobId, Suspend, Wait,
     fiber::{
-        Answer, Global, HERE, Here, MAX_CARRIED, OwnIo, Panic, Stackful, SwitchEvent, Taken, UNREGISTERED,
-        carry_stack_limit, check_no_wait, clear, come_on, dispatch_global, global, go_off, go_off_ended,
-        observing, switched,
+        Answer, Global, HERE, Here, IdleReason, MAX_CARRIED, OwnIo, Panic, Stackful, SwitchEvent, Taken, UNREGISTERED,
+        carry_stack_limit, check_no_wait, clear, come_on, dispatch_global, global, go_off, go_off_ended, idled,
+        observing, switched, switched_known, switched_unregistered,
     },
 };
 use crate::{
@@ -83,6 +81,25 @@ struct Parked {
     /// The first panic of a carried take as it parked, raised in it when it resumes.
     failed: Option<Panic>,
     job: JobId,
+    /// `job`'s generation as it parked, for the observer's [`SwitchEvent::Ready`], which is
+    /// told without the world.
+    generation: u32,
+}
+
+/// Tells the observer that the parked job whose record is at `token` (its header's exposed
+/// address, as the pool's wake is given it) is runnable: on the waker's thread, under the
+/// scheduler's lock, before the pool queues it.
+#[allow(unsafe_code)]
+pub(crate) fn ready(token: usize) {
+    if !observing() {
+        return;
+    }
+    // SAFETY: a parked job's token is the address of its `Parked` (`drive` leaked it with
+    // `Box::into_raw`), which lives until a worker resumes it; its wake, which calls this,
+    // comes first and once.
+    let record = unsafe { &*ptr::with_exposed_provenance::<Parked>(token) };
+    let fiber = record.fiber.as_ref().map_or(0, |it| it.1);
+    switched_known(SwitchEvent::Ready, record.job, record.generation, fiber, core());
 }
 
 /// The run of a [`Parked`]'s header: never called, only recognized by [`Host::run`]. Not
@@ -154,6 +171,39 @@ fn set_own(g: &mut Global, member: u32, io: OwnIo) {
     g.own[at] = Some(io);
 }
 
+/// When a pool job's timed wait is next due, on [`now`]'s clock (`u64::MAX` for none): set under
+/// the scheduler's lock, read by workers without it.
+static DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[expect(clippy::disallowed_types, reason = "the process's one origin of the pool jobs' clock, which every pool's timed waits share")]
+static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// The clock a pool job's [`Wait::Until`] counts in: nanoseconds since the process first read
+/// it. (A [`super::fiber`] driver's jobs count in the driver's own clock.)
+pub fn now() -> u64 {
+    u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Wakes the pool jobs whose timed waits are due: a worker calls it as it looks for work, and
+/// after it parked for [`until_due`]. Reads no clock while no wait is timed.
+pub(crate) fn fire_due() {
+    let at = DEADLINE.load(Ordering::Acquire);
+    if at == u64::MAX || now() < at {
+        return;
+    }
+    let mut g = global();
+    g.world.advance_own_clock(now());
+    DEADLINE.store(g.world.next_own_deadline().unwrap_or(u64::MAX), Ordering::Release);
+    dispatch_global(&mut g, None);
+}
+
+/// How long until a pool job's timed wait is due, if one is: the longest a worker that has
+/// nothing to run may park.
+pub(crate) fn until_due() -> Option<Duration> {
+    let at = DEADLINE.load(Ordering::Acquire);
+    (at != u64::MAX).then(|| Duration::from_nanos(at.saturating_sub(now())))
+}
+
 thread_local! {
     /// The pool worker this thread is (its index), for the switches an observer is told of.
     static CORE: Cell<u32> = const { Cell::new(u32::MAX) };
@@ -162,6 +212,32 @@ thread_local! {
 #[inline(never)]
 fn core() -> u32 {
     CORE.get()
+}
+
+/// A pool job begins on this thread's fiber, given to the pool while `spawner` ran
+/// ([`super::fiber::spawner`]): its lifetime starts here, not at the claim or wait that joins
+/// it to the graph later, if ever. Nothing on a thread that is no pool worker's fiber, or for a
+/// job already in the graph.
+#[inline]
+pub(crate) fn job_begins(spawner: u64) {
+    if observing() && HERE.get().is_some_and(|here| here.job == UNREGISTERED) {
+        switched_unregistered(SwitchEvent::Began { spawner }, 0, core());
+    }
+}
+
+/// This pool worker goes idle (`began`) or wakes, told to the idle observer: idle until the
+/// next timed wait of a pool job is due, or with nothing to run.
+pub(crate) fn idle(began: bool) {
+    let due = DEADLINE.load(Ordering::Acquire);
+    let reason = if due == u64::MAX { IdleReason::Nothing } else { IdleReason::Until(due) };
+    idled(core(), reason, began);
+}
+
+/// `job` as the observer numbers it: its generation << 32 | its slot, one job of the process's
+/// life, as its switches name it. Takes the scheduler's lock: for a profiler naming a job it
+/// does not run (a wait's owner), not for every switch.
+pub fn observed(job: JobId) -> u64 {
+    u64::from(global().world.generation(job)) << 32 | u64::from(job.0)
 }
 
 /// A pool worker's fibers: the jobs it takes run on them.
@@ -242,7 +318,17 @@ impl<'a> Host<'a> {
                 }
                 Out::Wait(job, on) => {
                     let mut g = global();
-                    input = match g.world.suspended(self.member, job, on) {
+                    if matches!(on, Wait::Until(_)) {
+                        g.world.advance_own_clock(now());
+                    }
+                    let suspended = g.world.suspended(self.member, job, on);
+                    if matches!(on, Wait::Until(_)) {
+                        DEADLINE.store(g.world.next_own_deadline().unwrap_or(u64::MAX), Ordering::Release);
+                        if !matches!(suspended, Ok(Suspend::Waiting)) {
+                            dispatch_global(&mut g, None);
+                        }
+                    }
+                    input = match suspended {
                         Ok(Suspend::Ready) => In::Go(Answer::Ready),
                         Err(cycle) => In::Go(Answer::Cycle(cycle)),
                         Ok(Suspend::Waiting) => {
@@ -255,10 +341,12 @@ impl<'a> Host<'a> {
                                     taken: [None; MAX_CARRIED],
                                     failed: None,
                                     job,
+                                    generation: 0,
                                 })
                             });
                             record.failed = go_off(&mut record.taken, worker);
                             record.job = job;
+                            record.generation = g.world.generation(job);
                             record.fiber = Some(fiber);
                             self.parked.fetch_add(1, crate::sync::atomic::Ordering::AcqRel);
                             let token = Box::into_raw(record).expose_provenance();
@@ -329,6 +417,8 @@ fn body(member: u32, fiber: u32, limit: usize, yielder: &Yielder<In, Out>, first
             }
             g.world.done(member, joined);
             dispatch_global(&mut g, None);
+        } else {
+            switched_unregistered(SwitchEvent::Ran, fiber, core());
         }
         next = yielder.suspend(Out::Done(ran.err()));
     }
@@ -465,15 +555,15 @@ thread_local! {
     static CLIENT: Client = Client { job: Cell::new(UNREGISTERED), woken: AtomicBool::new(false), thread: thread::current() };
 }
 
-static CLIENTS: OnceLock<u32> = OnceLock::new();
-
 /// The clients' member, joined at the first client's claim or wait.
 fn clients(g: &mut Global) -> u32 {
-    *CLIENTS.get_or_init(|| {
-        let member = g.world.join_own();
-        set_own(g, member, OwnIo { wake: wake_client, ctx: 0, idle: None });
-        member
-    })
+    if let Some(member) = g.clients {
+        return member;
+    }
+    let member = g.world.join_own();
+    set_own(g, member, OwnIo { wake: wake_client, ctx: 0, idle: None });
+    g.clients = Some(member);
+    member
 }
 
 /// A client's wait ended: `token` is its [`Client`]'s address, which lives until its thread

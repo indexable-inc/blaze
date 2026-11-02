@@ -37,6 +37,7 @@ mod params;
 mod paths;
 mod patterns;
 mod types;
+mod verify;
 
 use crate::{
     SyntaxKind::{self, *},

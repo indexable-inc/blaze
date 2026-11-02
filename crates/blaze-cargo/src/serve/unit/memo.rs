@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use blaze_codegen::memo::Memo;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use parking_lot::{Mutex, MutexGuard};
 
@@ -26,7 +27,7 @@ pub(crate) struct Memos {
 #[derive(Default)]
 struct KeptSets {
     next: u64,
-    sets: HashMap<u64, Box<[ContentId]>>,
+    sets: HashMap<u64, Box<[ContentId]>, Global>,
     /// The sum of the sets' lengths, at least their union's.
     total: usize,
 }
@@ -104,12 +105,24 @@ fn lock<T>(it: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use blaze_codegen::{Arch, Relocs, template::Template};
+    use blaze_codegen::{Arch, Backend, Instance, Relocs, Settings, Unit, backend::Shape, template::Template};
+    use blaze_items::{CodeHash, ItemKey};
 
     use super::*;
 
+    /// The shape of a prepared function whose canonical bytes are `n`.
+    fn shaped(n: u32) -> Shape {
+        let unit = Unit {
+            instance: Instance { code: CodeHash(ContentId::default()), args: ContentId::default(), settings: Settings(ContentId::default()) },
+            backend: Backend::Stencil,
+            arch: Arch::X86_64,
+            item: ItemKey(ContentId::default()),
+        };
+        Shape::of(&unit, &n.to_le_bytes())
+    }
+
     fn shape(n: u32) -> ContentId {
-        ContentId::of("blaze-cargo memo test", &n.to_le_bytes())
+        shaped(n).key()
     }
 
     fn template(n: u32) -> Template {
@@ -132,7 +145,7 @@ mod tests {
 
     fn fill(memo: &Memo, from: u32, count: u32) {
         for n in from..from + count {
-            memo.put(shape(n), template(n));
+            memo.put(shaped(n), template(n));
         }
     }
 

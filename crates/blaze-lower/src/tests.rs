@@ -97,6 +97,7 @@ fn dep(index: usize, name: &str, noprelude: bool) -> UnitDep {
         public: None,
         noprelude: noprelude.then_some(true),
         nounused: None,
+        dev: false,
     }
 }
 
@@ -132,6 +133,7 @@ fn plan(cfgs: &[&str], env: &[(&str, &str)], out_dir: Option<&str>) -> UnitPlan 
         runner: Vec::new(),
         harness: true,
         clippy: None,
+        macro_wasm: false,
     }
 }
 
@@ -223,6 +225,7 @@ fn config(view: ContentId, library: ContentId) -> BuildConfig {
         host: HOST.to_owned(),
         library: LIBRARY.to_owned(),
         std: "/s/std".to_owned(),
+        builds: "/s/build".to_owned(),
     }
 }
 
@@ -416,6 +419,19 @@ fn files_are_at_cargos_paths_in_their_roots() {
     assert_ne!(root_id_of(db, krate(&built, CORE)), root_id_of(db, krate(&built, LIB)));
 }
 
+/// `file!()` in a constant (tracing's callsite statics) names a file as cargo has rustc name
+/// it: a member's by its path from the workspace's root, the standard library's as it is. The
+/// evaluator stops on `file!()` it was not told the names of.
+#[test]
+fn a_constants_file_names_a_members_file_from_the_workspaces_root() {
+    let built = lowered(&units()).unwrap();
+    let db = built.lowered.db();
+    let name = |unit: usize| hir_ty_mir::mir::location::source_path(db, krate(&built, unit).data(db).root_file_id);
+    assert_eq!(name(LIB), Some("a/src/lib.rs"));
+    assert_eq!(name(BIN), Some("b/src/main.rs"));
+    assert_eq!(name(CORE), Some("/rustc/abc/library/core/src/lib.rs"));
+}
+
 #[test]
 fn a_path_under_no_mount_is_refused_naming_it() {
     let mut units = units();
@@ -476,6 +492,61 @@ fn a_run_is_refused_for_what_is_no_run() {
     assert!(built.lowered.ran(RUN, &elsewhere).is_err());
     assert!(built.lowered.macros(LIB, Ok(Vec::new())).is_err());
     assert!(built.lowered.macros(MACRO, Ok(Vec::new())).is_ok());
+}
+
+/// [`units`] with a wasm proc macro beside the native one: `core` and the macro again, for
+/// wasm32-wasip1, as `-Z wasm-macros` plans them. Returns the units and the two new indexes.
+fn with_a_wasm_macro() -> (Units, usize, usize) {
+    const WASM: &str = "wasm32-wasip1";
+    let mut units = units();
+    let wasm_core = units.graph.units.len();
+    let mut core = units.graph.units[CORE].clone();
+    core.platform = Some(WASM.to_owned());
+    units.graph.units.push(core);
+    // clone: a test's fixture.
+    units.plans.push(UnitPlan { macro_wasm: true, ..units.plans[CORE].clone() });
+    let wasm_macro = units.graph.units.len();
+    let mut proc_macro = units.graph.units[MACRO].clone();
+    proc_macro.platform = Some(WASM.to_owned());
+    proc_macro.dependencies = vec![dep(wasm_core, "core", true)];
+    units.graph.units.push(proc_macro);
+    units.plans.push(UnitPlan { macro_wasm: true, ..units.plans[MACRO].clone() });
+    (units, wasm_core, wasm_macro)
+}
+
+#[test]
+fn a_wasm_unit_is_a_crate_of_its_own_target() {
+    let (units, wasm_core, wasm_macro) = with_a_wasm_macro();
+    let mut built = lowered(&units).unwrap();
+    let db = built.lowered.db();
+    assert_ne!(krate(&built, wasm_core), krate(&built, CORE));
+    assert_ne!(krate(&built, wasm_macro), krate(&built, MACRO));
+    assert_eq!(krate(&built, wasm_macro).data(db).dependencies[0].crate_id, krate(&built, wasm_core));
+    let target = |unit| {
+        let data = krate(&built, unit).workspace_data(db);
+        let Ok(target) = &data.target else { panic!("unit {unit} has no target") };
+        (target.tuple.as_str().to_owned(), matches!(target.arch, base_db::target::Arch::Wasm32))
+    };
+    assert_eq!(target(wasm_macro), ("wasm32-wasip1".to_owned(), true));
+    assert_eq!(target(MACRO), (HOST.to_owned(), false));
+    let cfg = krate(&built, wasm_macro).cfg_options(db).clone();
+    assert!(cfg.check_atom(&key_value("target_arch", "wasm32")) && cfg.check_atom(&key_value("target_os", "wasi")));
+    assert!(!cfg.check_atom(&key_value("target_os", "linux")));
+    let (native, wasm) = (built.lowered.identity(MACRO), built.lowered.identity(wasm_macro));
+    assert!(native.is_some() && wasm.is_some());
+    assert_ne!(native, wasm, "a unit's identity names its target");
+}
+
+#[test]
+fn a_native_unit_lowers_the_same_beside_a_wasm_one() {
+    let (with_wasm, _, _) = with_a_wasm_macro();
+    let mut beside = lowered(&with_wasm).unwrap();
+    let mut alone = lowered(&units()).unwrap();
+    for unit in [CORE, BUILD_SCRIPT, LIB, MACRO, BIN, LIB_TEST] {
+        let (one, two) = (beside.lowered.db(), alone.lowered.db());
+        assert_eq!(krate(&beside, unit).content(one), krate(&alone, unit).content(two), "unit {unit}");
+        assert_eq!(beside.lowered.identity(unit), alone.lowered.identity(unit), "unit {unit}");
+    }
 }
 
 #[test]
@@ -607,6 +678,27 @@ fn a_units_identity_covers_what_it_is_made_from_deeply() {
     assert_ne!(first.lowered.identity(LIB), after[2]);
     first.lowered.ran(RUN, &ran("pub fn gen() {}\n")).unwrap();
     assert_eq!(first.lowered.identity(LIB), after[2], "the same inputs, the same identity");
+}
+
+/// The process's environment is no input of an identity: a crate reads it only through
+/// `env!`, and whoever files a value made from the crate keys it by what was read
+/// (`blaze-cargo`'s unit records). Two runs that differ only in variables, a per-run
+/// `BLAZE_PROFILE` among them, give every unit the identity it had.
+#[test]
+fn a_units_identity_leaves_out_the_process_environment() {
+    let units = units();
+    let identities = |env: &[(&str, &str)]| {
+        let tree = MemTree::default();
+        let root = view(&tree);
+        let mut config = config(root, library(&tree));
+        config.invocation.env = env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect();
+        let mut lowered = lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap();
+        [CORE, BUILD_SCRIPT, LIB, MACRO, BIN, LIB_TEST].map(|unit| lowered.identity(unit))
+    };
+    let first = identities(&[("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101"), ("SHLVL", "1")]);
+    let second = identities(&[("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0242"), ("OLDPWD", "/elsewhere"), ("SHLVL", "3")]);
+    assert!(first.iter().all(Option::is_some));
+    assert_eq!(first, second);
 }
 
 #[test]
@@ -1193,4 +1285,36 @@ fn a_proc_macros_proc_macro_is_in_its_extern_prelude_alone() {
     };
     assert_eq!(in_prelude(MACRO), Some(true));
     assert_eq!(in_prelude(BIN), Some(false), "only a proc macro is passed `--extern proc_macro`");
+}
+
+/// `cargo test --all-targets` builds every example with `--test` (cargo's `new_units`: only an
+/// unspecific filter builds an untested example as a plain binary), so `examples/fetch.rs` and
+/// `tests/fetch.rs` are two `Test` units of one package and one name. They are two targets, so
+/// two crates with two keys: the manifest's kind tells them apart.
+#[test]
+fn an_all_targets_example_and_test_of_one_name_lower_to_two_crates() {
+    let mut units = units();
+    let a = "path+file:///w/a#0.1.0";
+    let deps = || vec![dep(CORE, "core", true), dep(LIB, "a", false)];
+    let example = units.graph.units.len();
+    units.graph.units.push(unit(a, target("example", "fetch", "/w/a/examples/fetch.rs", "2021"), Mode::Test, false, deps()));
+    let test = units.graph.units.len();
+    units.graph.units.push(unit(a, target("test", "fetch", "/w/a/tests/fetch.rs", "2021"), Mode::Test, false, deps()));
+    for _ in [example, test] {
+        units.plans.push(plan(&[], &[("CARGO_PKG_NAME", "a")], None));
+    }
+    units.graph.roots.extend([example, test]);
+    let tree = MemTree::default();
+    let files: &[(&'static str, Option<&'static [u8]>)] =
+        &[("a/examples/fetch.rs", Some(b"fn main() {}\n")), ("a/tests/fetch.rs", Some(b"#[test]\nfn fetch() {}\n"))];
+    let built = lowered_with(&units, &tree, files).unwrap();
+    let db = built.lowered.db();
+    let kinds = |unit| {
+        let data = krate(&built, unit).data(db);
+        (data.target_kind, data.manifest_kind)
+    };
+    assert_eq!(kinds(example), (TargetKind::Test, TargetKind::Example));
+    assert_eq!(kinds(test), (TargetKind::Test, TargetKind::Test));
+    assert_ne!(krate(&built, example), krate(&built, test));
+    blaze_items::key::check_crate_keys(db).unwrap_or_else(|clash| panic!("{clash}"));
 }

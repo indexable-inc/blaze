@@ -4,6 +4,7 @@
 
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir_def::{
     AssocItemId, FunctionId, ModuleDefId, ModuleId, TraitId,
     nameres::{ModuleData, crate_def_map},
@@ -23,7 +24,7 @@ const FIBERS: &str = "corosensei";
 #[blaze_query::tracked(returns(deref))]
 pub(crate) fn roots(db: &Db, krate: Crate) -> Box<[FunctionId]> {
     let mut found = Vec::new(); // alloc: the roots, once per crate graph, one per corosensei
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     let mut stack = vec![krate]; // alloc: the walk of the crate graph, once per crate
     while let Some(at) = stack.pop() {
         if !seen.insert(at) {

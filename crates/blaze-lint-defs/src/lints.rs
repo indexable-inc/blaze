@@ -910,7 +910,7 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::hot_dyn", Allow, "detects a call in hot code that goes through a vtable")
         .externally_loaded(),
-    l("blaze::std_hashmap", Allow, "detects std's `HashMap` or `HashSet` hashing with `RandomState`")
+    l("blaze::default_hasher", Allow, "detects a hash map or set whose hasher is left to its default or seeded at random")
         .externally_loaded(),
     l("blaze::parallelizable", Allow, "detects a loop whose iterations are independent and could run in parallel")
         .externally_loaded(),
@@ -942,6 +942,131 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::open_wait_loop", Allow, "detects a loop that waits for progress with no bound")
         .externally_loaded(),
+    l("blaze::unrecorded_span", Allow, "detects a `tracing` span whose target the flight recorder drops")
+        .externally_loaded(),
+    l(
+        "blaze::implicit_allocator",
+        Allow,
+        "detects a type that leaves its allocator to the default `Global`, or a global-heap type that takes none",
+    )
+    .externally_loaded(),
+    l("blaze::fixed_key_lookup", Allow, "detects a lookup of keys known at compile time made at run time instead of by a perfect hash")
+        .externally_loaded(),
+    l("blaze::struct_update", Allow, "detects a struct literal of the workspace that takes fields from a base instead of writing each one")
+        .externally_loaded(),
+    l("blaze::bool_param", Allow, "detects a `bool` parameter of a workspace function where a two-variant enum would name the choice")
+        .externally_loaded(),
+    l("blaze::sans_io_core", Allow, "detects a function of a `#![blaze::sans_io]` core that reaches the wall clock or IO")
+        .externally_loaded(),
+    l("blaze::key_ignores_field", Allow, "detects a hand-written key (`Hash`, `PartialEq`, `Ord` or a key builder) that leaves a field out unnamed")
+        .externally_loaded(),
+    l("blaze::wildcard_arm", Allow, "detects a catch-all `match` arm over an enum of the workspace, where listing the variants makes a new one a compile error")
+        .externally_loaded(),
+    l("blaze::false_sharing", Warn, "detects a struct shared between threads whose atomics or locks, written by different methods, can share one cache line")
+        .externally_loaded(),
+    l("blaze::seqcst_unexplained", Warn, "detects `Ordering::SeqCst` with no `// seqcst: <why>` saying why the operation needs one total order")
+        .externally_loaded(),
+    l("blaze::large_move", Allow, "detects a value over 512 bytes moved by value in hot code, and an enum whose largest variant is over 512 bytes and 4x its second")
+        .externally_loaded(),
+    l("blaze::collect_then_consume", Warn, "detects a `collect` into a collection that is only iterated, asked its length or emptiness, or passed on as an iterator")
+        .externally_loaded(),
+    l("blaze::hash_twice", Warn, "detects a key looked up in a hash map or set and then inserted, removed or entered on the same map, hashing it twice")
+        .externally_loaded(),
+    l("blaze::syscall_in_loop", Allow, "detects a stat or open of a path once per element of a loop in a crate whose file system work is batched")
+        .externally_loaded(),
+    l("blaze::query_in_loop", Allow, "detects a query called once per element of a loop when a query beside it takes the whole batch")
+        .externally_loaded(),
+    l("blaze::string_key", Allow, "detects a hash map or set keyed by a string whose keys are all a `Name`'s or `Symbol`'s text, where `intern::Symbol` would do")
+        .externally_loaded(),
+    l("blaze::outline_generic_body", Warn, "detects a generic function whose type parameters only feed a conversion at entry, so every instantiation copies a large non-generic body")
+        .externally_loaded(),
+    l("blaze::cold_error", Warn, "detects a `Result` whose error is over 128 bytes (`large-error-threshold`), and in hot code an error built inline with a `String` or a large struct outside a `#[cold]` function")
+        .externally_loaded(),
+    l("blaze::frozen_collection", Warn, "detects a non-public `Vec` or `String` field nothing in the crate changes after the struct is built, where a boxed slice or `Box<str>` would do")
+        .externally_loaded(),
+    l("blaze::intern_candidate", Warn, "detects a recursive or deep `Hash + Eq + Clone` type used as a map key and compared or cloned often, where an interned `Copy` id would make `==` and hashing one integer")
+        .externally_loaded(),
+    l("blaze::small_map", Warn, "detects a hash map or set, or a `BTreeMap`, that provably holds a few entries, where a sorted array or a `match` would do")
+        .externally_loaded(),
+    l("blaze::arc_clone_only_borrowed", Warn, "detects an `Arc` cloned (or an `ArcSwap` loaded in full) where the clone is only borrowed, paying two atomic updates of a shared count for nothing")
+        .externally_loaded(),
+    l("blaze::blocking_in_async", Warn, "detects a blocking call (file system, sleep, socket, channel receive, child process, thread join) inside an async fn, block or closure, which stalls every task on the executor thread")
+        .externally_loaded(),
+    l("blaze::relaxed_publish", Warn, "detects an atomic flag or pointer stored with `Ordering::Relaxed` in one function and loaded in another to guard other data, which `Relaxed` doesn't order")
+        .externally_loaded(),
+    l("blaze::unwind_across_ffi", Warn, "detects a panic (an `unwrap`, `expect`, `panic!`, index or division) in a function with a foreign ABI that can't unwind, where a panic aborts the process")
+        .externally_loaded(),
+    l("blaze::unbounded_from_input", Warn, "detects a loop that reads input and grows a collection or an unbounded channel every round with no cap on its size in the loop")
+        .externally_loaded(),
+    l("blaze::dos_hasher_on_input", Warn, "detects a hash map or set with a fixed-seed hasher keyed by text a caller of a public library function hands in, open to collision attacks (HashDoS)")
+        .externally_loaded(),
+    l("blaze::panic_in_drop", Warn, "detects a `Drop::drop` that can panic, which aborts the process when it runs during unwinding")
+        .externally_loaded(),
+    l("blaze::bounds_check_in_loop", Warn, "detects a slice or `Vec` indexed by a range loop's variable where nothing before the loop proves the range's end is within its length, so the bounds check runs every iteration")
+        .externally_loaded(),
+    l("blaze::unbuffered_io", Warn, "detects a `File`, socket or pipe written several times, or inside a loop, or read in small pieces, with no `BufWriter` or `BufReader`, so each call is a system call")
+        .externally_loaded(),
+    l("blaze::stdout_lock_in_loop", Warn, "detects `println!`, `print!` or a write to `stdout()` or `stderr()` inside a loop, which locks the stream once per call")
+        .externally_loaded(),
+    l("blaze::front_vec_ops", Warn, "detects `Vec::remove(0)`, `Vec::insert(0, ..)` or `drain(..1)` inside a loop, which shifts every element each time")
+        .externally_loaded(),
+    l("blaze::missing_size_hint", Warn, "detects an `Iterator` impl that steps a counter over what it holds with no `size_hint`, or an exact `size_hint` with no `ExactSizeIterator`")
+        .externally_loaded(),
+    l("blaze::fmt_allocates", Warn, "detects a `String` built inside a `fmt` method only to be written to the formatter")
+        .externally_loaded(),
+    l("blaze::jagged_vec", Warn, "detects a `Vec<Vec<T>>`, `Vec<String>` or `Vec<Box<[T]>>` field nothing changes after the struct is built, one heap allocation per row")
+        .externally_loaded(),
+    l("blaze::stable_sort_needless", Warn, "detects a stable sort of elements whose equal values can't be told apart, where `sort_unstable` gives the same order without the buffer")
+        .externally_loaded(),
+    l("blaze::dyn_in_hot_field", Warn, "detects a `Box<dyn Trait>` or `&dyn Trait` field the struct's methods call inside a loop, an indirect call that can't be inlined")
+        .externally_loaded(),
+    l("blaze::profile_hot", Warn, "gives the perf lints of a function the configured profile shows hot (`profile` in `clippy.toml`) this level where nothing else sets theirs")
+        .externally_loaded(),
+    l("blaze::stale_hot_marker", Warn, "detects a function marked hot (`#[deny(blaze::hot)]`) that the configured profile counts as cold or never run")
+        .externally_loaded(),
+    l("blaze::hot_marked_cold", Warn, "detects a `#[cold]` function that the configured profile shows hot")
+        .externally_loaded(),    l("blaze::push_without_reserve", Warn, "detects an empty `Vec` or `String` pushed to once per iteration of a loop whose count is known before it starts, which `with_capacity` would allocate once")
+        .externally_loaded(),
+    l("blaze::scratch_in_loop", Warn, "detects a `Vec`, `String` or hash map made, grown and dropped in every iteration of a loop, which made once and cleared would keep its capacity")
+        .externally_loaded(),
+    l("blaze::boxed_recursive_node", Warn, "detects a crate-private type that links to itself through `Box` or `Rc<RefCell<..>>`, one allocation per node where an arena holds them in one")
+        .externally_loaded(),
+    l("blaze::wide_index", Warn, "detects a `usize` or `u64` field only ever used to index one container, which a `u32` would hold in half the room")
+        .externally_loaded(),
+    l("blaze::bounded_heap_field", Warn, "detects a `String` or `Vec` field every construction fills with a small, known bound and nothing grows, which could be held inline")
+        .externally_loaded(),
+    l("blaze::enum_vec_padded", Warn, "detects a `Vec` of an enum whose largest variant is several times its smallest, only pushed and walked, where every element pays the largest variant's room")
+        .externally_loaded(),
+    l("blaze::deep_drop_at_exit", Allow, "detects a collection of heap-owning elements alive when `main` returns, freed one element at a time just before the process exits")
+        .externally_loaded(),
+    l("blaze::dyn_fn_param", Warn, "detects a `&dyn Fn`, `&mut dyn FnMut` or `Box<dyn FnOnce>` parameter called inside a loop, an indirect call that can't be inlined")
+        .externally_loaded(),
+    l("blaze::box_large_new", Warn, "detects `Box::new` of a value over `large-box-threshold` bytes, built on the stack and then copied into the heap")
+        .externally_loaded(),
+    l("blaze::pod_serialized_by_field", Allow, "detects a `#[repr(C)]` struct of plain numbers with no padding that goes through serde field by field")
+        .externally_loaded(),
+    l("blaze::checkfree", Deny, "detects a bounds check, overflow check or panic left in the optimized code of a `#[blaze::checkfree]` function")
+        .externally_loaded(),
+    l("blaze::nopanic", Deny, "detects a `#[blaze::nopanic]` function that may panic or abort, through any call")
+        .externally_loaded(),
+    l("blaze::noalloc", Deny, "detects a `#[blaze::noalloc]` function that may call the global allocator, through any call")
+        .externally_loaded(),
+    l("blaze::nonblocking", Deny, "detects a `#[blaze::nonblocking]` function that may block the thread, through any call")
+        .externally_loaded(),
+    l("blaze::pure", Deny, "detects a `#[blaze::pure]` function that may read or change the world outside its arguments (the environment, the clock, files, threads, state that changes, an address, randomness, foreign code), through any call")
+        .externally_loaded(),
+    l("blaze::packable", Allow, "detects a struct held in a collection whose `bool` and fieldless enum fields need far fewer bits than they take, which `#[blaze::bits]` would pack")
+        .externally_loaded(),
+    l("blaze::soa_candidate", Allow, "detects a struct held in a `Vec`, slice or array whose loops read or write only a small part of each element, which a struct of arrays would store as columns")
+        .externally_loaded(),
+    l("blaze::borrow_workaround", Warn, "detects a value looked up twice, first only to test that it is there, where one lookup kept in an `if let` passes every borrow checker")
+        .externally_loaded(),
+    l("blaze::nll_workaround", Allow, "detects a value looked up twice so a borrow ends where the branch is not taken, which blaze's borrow checker accepts as one lookup in an `if let` and stable Rust's rejects")
+        .externally_loaded(),
+    l("blaze::native_contracts", Warn, "detects nightly's `#[core::contracts::requires]` and `#[core::contracts::ensures]` on a function of a crate with `#![feature(blaze_verify)]`, whose native `requires` and `ensures` clauses say the contract in the signature")
+        .externally_loaded(),
+    // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
+    l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
 ];
 
 /// Lints rustc declares and never registers: an attribute can't name them, but

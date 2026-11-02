@@ -1,22 +1,78 @@
 //! Lowering of inline assembly.
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir_expand::name::Name;
 use intern::Symbol;
 use syntax::{
     T,
-    view::{self as ast, AstNode, AstToken, HasName, IsString},
+    view::{self as ast, AstNode, AstToken, HasModuleItem, HasName, IsString},
 };
 use tt::TextRange;
 
+use base_db::Db;
+use hir_expand::{HirFileId, MacroCallId};
+
 use crate::{
+    LoweringMode, ModuleId,
     expr_store::{
         ExprPtr,
         lower::{ExprCollector, FxIndexSet, ImplTraitLowering},
     },
     hir::{
-        AsmOperand, AsmOptions, AsmPiece, ExprId, InlineAsm, InlineAsmKind, InlineAsmRegOrRegClass,
+        AsmOperand, AsmOptions, AsmPiece, Expr, ExprId, InlineAsm, InlineAsmKind,
+        InlineAsmRegOrRegClass,
     },
 };
+
+/// A `global_asm!` as the code generator takes it: its template and options, and what each
+/// operand is. The operands' expressions are not kept: blaze assembles a `global_asm!` that
+/// has none, and the code generator refuses one that has any by what it is.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GlobalAsm {
+    /// The template strings joined by newlines, as [`InlineAsm::template`] has them. `None`
+    /// when a string could not be read or names an operand that is not there.
+    pub template: Option<Box<[AsmPiece]>>,
+    pub options: AsmOptions,
+    /// Each operand, in order, by how it is written: `const` or `sym`, what `global_asm!`
+    /// takes, or `in`, `out` and the rest, which it does not.
+    pub operands: Box<[&'static str]>,
+}
+
+/// The `global_asm!` the item-level macro call `call` of `module` expands to, lowered as an
+/// `asm!` block is (a template that `concat!` or another macro makes, its `{}`s, its options),
+/// or `None` when `call` expands to something else. The item tree keeps no item for one
+/// (`item_tree::lower`): the code generator finds a crate's in its modules' macro calls
+/// ([`crate::item_scope::ItemScope::iter_macro_invoc`]) and asks this of each.
+#[blaze_query::tracked(returns(ref))]
+pub fn global_asm(db: &Db, module: ModuleId, call: MacroCallId) -> Option<GlobalAsm> {
+    let file = HirFileId::MacroFile(call);
+    let items = ast::MacroItems::cast(file.root(db))?;
+    let asm = items.items().find_map(|item| match item {
+        ast::Item::AsmExpr(asm) => Some(asm),
+        _ => None,
+    })?;
+    let mut collector = ExprCollector::new(db, module, file, LoweringMode::Analysis);
+    let id = collector.lower_inline_asm(asm, ExprPtr::of(ast::Expr::AsmExpr(asm)));
+    let (store, _) = collector.finish_store();
+    let Expr::InlineAsm(lowered) = store.expr(id) else {
+        return None;
+    };
+    let operands = lowered.operands.iter().map(|(_, operand)| match operand {
+        AsmOperand::Const(_) => "const",
+        AsmOperand::Sym(_) => "sym",
+        AsmOperand::In { .. } => "in",
+        AsmOperand::Out { .. } => "out",
+        AsmOperand::InOut { .. } | AsmOperand::SplitInOut { .. } => "inout",
+        AsmOperand::Label(_) => "label",
+    });
+    Some(GlobalAsm {
+        // clone: once per `global_asm!`, into the query's value; the store is let go
+        template: lowered.template.clone(),
+        options: lowered.options,
+        // alloc: once per `global_asm!`, the query's value
+        operands: operands.collect(),
+    })
+}
 
 impl ExprCollector<'_> {
     pub(super) fn lower_inline_asm(
@@ -29,9 +85,9 @@ impl ExprCollector<'_> {
         let mut operands = vec![];
         let mut options = AsmOptions::empty();
 
-        let mut named_pos: HashMap<usize, Symbol> = Default::default();
-        let mut named_args: HashMap<Symbol, usize> = Default::default();
-        let mut reg_args: HashSet<usize> = Default::default();
+        let mut named_pos: HashMap<usize, Symbol, Global> = Default::default();
+        let mut named_args: HashMap<Symbol, usize, Global> = Default::default();
+        let mut reg_args: HashSet<usize, Global> = Default::default();
         for piece in asm.asm_pieces() {
             if !self.check_cfg(piece) {
                 continue;

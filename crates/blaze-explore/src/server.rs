@@ -340,12 +340,27 @@ fn hello_bytes(shared: &Shared) -> Vec<u8> {
         ("certhash", current.hash.as_str().into()),
         ("cert_not_after_unix_s", current.not_after_s.into()),
         ("live_every_ms", (live::EVERY.as_millis() as u64).into()),
+        ("source", source_descriptor()),
     ];
     // alloc: once a session
     let header: Map<String, Value> = header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect();
     let mut out = Vec::new();
     encode_head(&mut out, &header);
     out
+}
+
+/// What kind of profile source this server is, for the page's generic views
+/// (docs/v2/plan/lanes/observe/explore.md, "One explorer, many sources"): the blaze daemon,
+/// whose builds the generic views read through `spans` and `sql`, and which alone has the
+/// `blaze` extension (builds, SQL, views, the build world). A page that reads the field shows the
+/// extension's views only when it is listed.
+fn source_descriptor() -> Value {
+    let mut source = Map::new();
+    // alloc: once a session
+    source.insert("kind".to_owned(), "blaze".into());
+    // alloc: once a session
+    source.insert("extensions".to_owned(), Value::Array(vec![Value::from("blaze")]));
+    Value::Object(source)
 }
 
 /// A request's stream: read, answered on the blocking pool unless the page stops it, written.
@@ -671,6 +686,7 @@ mod tests {
             assert_eq!(header["schema"], schema::VERSION);
             assert_eq!(header["certhash"], explorer.certhash().as_str());
             assert_eq!(header["live_every_ms"], 250);
+            assert_eq!(header["source"]["extensions"][0], "blaze", "{header}");
 
             let (header, ipc) = ask(&connection, r#"{"op":"views"}"#).await;
             assert_eq!(header["op"], "views", "{header}");

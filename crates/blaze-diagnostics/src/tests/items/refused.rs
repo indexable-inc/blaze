@@ -2,7 +2,10 @@
 //! fresh variable, `pub`, `extern "C"`, no prelude) is each rustc's error, by its code and
 //! message.
 
-use crate::tests::{assert_reports, checked, error, items::ui_core};
+use crate::{
+    model::Level,
+    tests::{assert_reports, checked, error, items::ui_core},
+};
 
 /// The crate `source`, of edition `edition` over minicore's `sized`, gives an error whose
 /// `code: message` starts with `wanted`.
@@ -76,6 +79,63 @@ fn type_lowering_errors_are_rustcs() {
         "2021",
         "trait T<Rhs = Self> {}\nfn f(_: &dyn T) {}\nfn main() {}\n",
         "E0393: the type parameter `Rhs` must be explicitly specified",
+    );
+}
+
+/// A trait whose supertrait names an object type of itself needs its own supertraits to lower
+/// them (`dyn Tr` is elaborated through `Tr`'s supertraits): rustc's E0391 of
+/// `explicit_super_predicates_of`, naming the trait, never an empty list of where clauses that
+/// lets the rest type check.
+#[test]
+fn a_supertrait_naming_the_traits_own_object_type_is_e0391_naming_the_trait() {
+    refused(
+        "2021",
+        "trait Eqv<R: ?Sized> {}\ntrait Tr: Eqv<dyn Tr> {}\nfn main() {}\n",
+        "E0391: cycle detected when computing the super clauses of `Tr`",
+    );
+}
+
+/// A where clause about another type than `Self` is no supertrait: lowering the `dyn Tr` in it
+/// reads `Tr`'s supertraits, which are their own query, so valid code has no cycle (rustc
+/// accepts it).
+#[test]
+fn the_traits_object_type_in_a_where_clause_not_on_self_is_no_cycle() {
+    let source = "trait Snd {}\nstruct W<T: ?Sized>(T);\ntrait Tr where W<dyn Tr>: Snd {}\n\
+                  impl Snd for W<dyn Tr> {}\nfn main() {}\n";
+    let checked =
+        checked(&format!("//- minicore: sized\n//- /main.rs crate:other:main edition:2021\n{source}"));
+    let errors = checked.diags.iter().filter(|it| it.level == Level::Error).count();
+    assert_eq!(errors, 0, "no error in {:?}", checked.messages());
+}
+
+/// Two traits each the other's supertrait: rustc's E0391, at each trait, naming it, never a
+/// trait with no supertraits.
+#[test]
+fn traits_that_are_each_others_supertrait_are_e0391_naming_each() {
+    let source = "trait A: B {}\ntrait B: A {}\nfn main() {}\n";
+    refused("2021", source, "E0391: cycle detected when computing the super clauses of `A`");
+    refused("2021", source, "E0391: cycle detected when computing the super clauses of `B`");
+}
+
+/// An impl whose self type names `Self` needs its own self type to lower it: an E0391 (rustc
+/// refuses `Self` there first), never an error type with nothing said.
+#[test]
+fn an_impls_self_type_naming_self_is_e0391() {
+    refused(
+        "2021",
+        "struct W<T>(T);\ntrait Tr {}\nimpl Tr for W<Self> {}\nfn main() {}\n",
+        "E0391: cycle detected when computing type of `impl`",
+    );
+}
+
+/// An impl whose trait's arguments name an associated type of `Self` needs its own trait to
+/// resolve it: rustc's E0391 of `impl_trait_header`, never an impl that implements nothing.
+#[test]
+fn an_impls_trait_naming_its_own_associated_type_is_e0391() {
+    refused(
+        "2021",
+        "trait Tr<X> { type A; }\nstruct S;\nimpl Tr<Self::A> for S { type A = u8; }\nfn main() {}\n",
+        "E0391: cycle detected when computing trait implemented by `impl`",
     );
 }
 

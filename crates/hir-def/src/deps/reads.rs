@@ -12,6 +12,9 @@
 //! image is never used once a value it was made from is another. A crate that reads nothing of
 //! the kind has its image under its key alone and no slot.
 //!
+//! A crate's reads hold its dependencies' expansions' too ([`Reads::deps`]): its image holds
+//! what they made, and no key covers what they read.
+//!
 //! An expansion whose reads are not known (one its server could not trace, one that read the
 //! clock, one that asked the database about a span, one of a macro that keeps a session) makes
 //! the crate's image leave out an input, so the crate is refused an image ([`Refused`]).
@@ -21,6 +24,7 @@ use std::sync::Arc;
 use base_db::{Crate, Db};
 use blaze_format::cursor::{Put, Reader};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use hir_expand::{HirFileId, MacroCallId, MacroDefKind, proc_macro::ExpansionReads};
 
@@ -31,14 +35,15 @@ use crate::{
 };
 
 /// The domain of the slots, the images filed by reads, and the reads' encoding.
-pub const READS_DOMAIN: &str = "blaze v2 dependency image reads 1";
+/// 2: a crate's reads hold its dependencies' ([`Reads::deps`]).
+pub const READS_DOMAIN: &str = "blaze v2 dependency image reads 2";
 
 /// How many sets of names one key keeps: a crate's expansions read other names only as what
 /// they read decides it, so one or two in practice.
 pub const SLOTS: u32 = 16;
 
 /// The first byte of a slot's bytes: the version of [`Reads::encode`].
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 /// What a crate read besides the inputs of its key: each sorted, with no repeats.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -48,31 +53,78 @@ pub struct Reads {
     /// Each expansion's names, as its server encodes them, with the hash of their values when
     /// it ran: known for reads made in this database, not for reads decoded from a slot.
     macros: Vec<(Arc<[u8]>, Option<ContentId>)>,
+    /// What the crates it depends on read that their keys do not cover, as [`Reads::macros`]:
+    /// each by its index in the crate's closure ([`Crate::transitive_deps`], which the
+    /// crate's key fixes, since it covers every dependency's key in order), its expansions'
+    /// names worked out with that crate's variables. A crate's image holds what their
+    /// expansions made (a name it imports from a derive's or an attribute's output, the
+    /// location of an item in one), and their keys cover only what they were given, never
+    /// what their expansions read, nor whether a value verified across checkouts was
+    /// retracted since; so without these an image would be served once a dependency's
+    /// expansion makes something else (rule 18). Only [`Reads::of`] (an image) has them: a
+    /// check's reads ([`super::checked_reads`]) are its own.
+    deps: Vec<(u32, Vec<(Arc<[u8]>, Option<ContentId>)>)>,
 }
 
 impl Reads {
     pub fn is_empty(&self) -> bool {
-        self.env.is_empty() && self.macros.is_empty()
+        self.env.is_empty() && self.macros.is_empty() && self.deps.is_empty()
     }
 
     /// The names read: the process variables `env!` and `option_env!` read, and each
     /// expansion's names as its server encodes them (an `ExpansionReads::Traced` shape), each
-    /// sorted.
+    /// sorted; then its dependencies' expansions' ([`Reads::deps`]), what a rule for public
+    /// keys looks at too.
     pub fn names(&self) -> (&[Box<str>], impl Iterator<Item = &[u8]>) {
-        (&self.env, self.macros.iter().map(|(shape, _)| &**shape))
+        let deps = self.deps.iter().flat_map(|(_, shapes)| shapes.iter().map(|(shape, _)| &**shape));
+        (&self.env, self.macros.iter().map(|(shape, _)| &**shape).chain(deps))
     }
 
     /// The reads of `krate` as it is resolved in `db`: the proc-macro expansions of every macro
     /// call of its modules, of `calls` (those its signatures name,
     /// [`super::signatures::encode`]) and of each call any of them is in the expansion of; and
-    /// every process variable the database noted the crate's `env!`s read.
+    /// every process variable the database noted the crate's `env!`s read. Then what each
+    /// crate it depends on read, the same way ([`Reads::deps`]).
     pub(crate) fn of(db: &Db, krate: Crate, calls: &[MacroCallId]) -> Result<Reads, Refused> {
+        let mut reads = Reads::own(db, krate, calls)?;
+        reads.dependencies(db, krate)?;
+        Ok(reads)
+    }
+
+    /// [`Reads::of`] but for what its dependencies read.
+    fn own(db: &Db, krate: Crate, calls: &[MacroCallId]) -> Result<Reads, Refused> {
         // alloc: setup: the calls of one crate, walked once as its image is written
         let mut todo: Vec<MacroCallId> = calls.to_vec();
         for (_, module) in crate_def_map(db, krate).modules(db) {
             todo.extend(module.scope(db).all_macro_calls());
         }
         Reads::of_calls(db, krate, todo)
+    }
+
+    /// Adds what each crate `krate` depends on, directly or not, read ([`Reads::deps`]): a
+    /// crate served from its image what serving it noted (the reads its image was filed by,
+    /// `filed::search`); one resolved here its own reads as [`Reads::of`] works them out, its
+    /// modules' expansions, which its def map ran. An expansion of a dependency's whose reads
+    /// are not known is a refusal naming it, as one of the crate's own is: what it made is in
+    /// the crate's image, and no key covers it.
+    fn dependencies(&mut self, db: &Db, krate: Crate) -> Result<(), Refused> {
+        for (at, &dep) in krate.transitive_deps(db).iter().enumerate() {
+            if dep == krate {
+                continue;
+            }
+            let read = match super::image_of(db, dep) {
+                Some(image) => served(db, dep, image.base)?,
+                None => Reads::own(db, dep, &[])?,
+            };
+            self.env.extend(read.env);
+            if !read.macros.is_empty() {
+                let at = u32::try_from(at).expect("fewer than 2^32 crates");
+                self.deps.push((at, read.macros));
+            }
+        }
+        self.env.sort_unstable();
+        self.env.dedup();
+        Ok(())
     }
 
     /// The reads of `krate` from the proc-macro expansions of `todo` and of each call any of
@@ -84,7 +136,7 @@ impl Reads {
         mut todo: Vec<MacroCallId>,
     ) -> Result<Reads, Refused> {
         let own = krate.env(db);
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new_in(Global);
         let mut reads = Reads::default();
         while let Some(call) = todo.pop() {
             if !seen.insert(call) {
@@ -150,6 +202,14 @@ impl Reads {
         for (shape, _) in &self.macros {
             out.put_bytes_u32(shape);
         }
+        out.put_u32(count(self.deps.len()));
+        for (at, shapes) in &self.deps {
+            out.put_u32(*at);
+            out.put_u32(count(shapes.len()));
+            for (shape, _) in shapes {
+                out.put_bytes_u32(shape);
+            }
+        }
         out
     }
 
@@ -170,7 +230,23 @@ impl Reads {
         for _ in 0..read.count_u32(4).map_err(short)? {
             reads.macros.push((read.bytes_u32().map_err(short)?.into(), None)); // alloc: setup, as above
         }
+        for _ in 0..read.count_u32(8).map_err(short)? {
+            let at = read.u32().map_err(short)?;
+            let count = read.count_u32(4).map_err(short)?;
+            // alloc: setup, as above
+            let mut shapes: Vec<(Arc<[u8]>, Option<ContentId>)> = Vec::with_capacity(count);
+            for _ in 0..count {
+                shapes.push((read.bytes_u32().map_err(short)?.into(), None));
+            }
+            if shapes.is_empty() || !shapes.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+                return Err("a dependency's expansions empty, out of order or repeated");
+            }
+            reads.deps.push((at, shapes));
+        }
         read.finish().map_err(|_| "bytes after the reads")?;
+        if !reads.deps.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            return Err("dependencies out of order");
+        }
         if !reads.env.windows(2).all(|pair| pair[0] < pair[1]) {
             return Err("variables out of order");
         }
@@ -180,30 +256,45 @@ impl Reads {
         Ok(reads)
     }
 
-    /// The values the reads had as `db` resolved the crate: what the image is filed by.
-    pub(crate) fn values_then(&self, db: &Db) -> ContentId {
-        self.values(db, |_, then| Ok(then.expect("reads made in this database know their values")))
+    /// The values the reads had as `db` resolved `krate`, whose they are: what the image is
+    /// filed by.
+    pub(crate) fn values_then(&self, db: &Db, krate: Crate) -> ContentId {
+        self.values(db, krate, |_, _, then| Ok(then.expect("reads made in this database know their values")))
             .expect("values made in this database do not fail")
     }
 
     /// The values the reads of `krate` have now: the process variables in `db`, each
     /// expansion's names worked out again by the driver ([`ImageStore::reads_now`]) with the
-    /// crate's variables, which its expansions were given.
+    /// crate's variables, which its expansions were given, and a dependency's
+    /// ([`Reads::deps`]) with that dependency's. `each` is given every one of the crate's own
+    /// expansions' names with their values' hash as it is worked out: a dependency's are its
+    /// own crate's, noted as that crate is served or resolved.
     pub(crate) fn values_now(
         &self,
         db: &Db,
         krate: Crate,
         // dyn: the driver's store, once per slot read
         store: &dyn ImageStore,
+        mut each: impl FnMut(&[u8], ContentId),
     ) -> Result<ContentId, String> {
         let env = krate.env(db);
-        self.values(db, |shape, _| store.reads_now(&env, shape))
+        self.values(db, krate, |by, shape, _| {
+            if by != krate {
+                return store.reads_now(&by.env(db), shape);
+            }
+            let values = store.reads_now(&env, shape)?;
+            each(shape, values);
+            Ok(values)
+        })
     }
 
+    /// The hash of the values of the reads of `krate`, each expansion's as `expansion` gives
+    /// it for the crate it is of, the names and the hash it ran with.
     fn values(
         &self,
         db: &Db,
-        mut expansion: impl FnMut(&[u8], Option<ContentId>) -> Result<ContentId, String>,
+        krate: Crate,
+        mut expansion: impl FnMut(Crate, &[u8], Option<ContentId>) -> Result<ContentId, String>,
     ) -> Result<ContentId, String> {
         let mut hasher = Hasher::new(READS_DOMAIN);
         hasher.part(b"values");
@@ -211,10 +302,61 @@ impl Reads {
             hasher.opt_part(base_db::process_env_var(db, name));
         }
         for (shape, then) in &self.macros {
-            hasher.id(&expansion(shape, *then)?);
+            hasher.id(&expansion(krate, shape, *then)?);
+        }
+        if self.deps.is_empty() {
+            return Ok(hasher.finish());
+        }
+        let closure = krate.transitive_deps(db);
+        hasher.part(b"dependencies");
+        for (at, shapes) in &self.deps {
+            let Some(&dep) = closure.get(*at as usize) else {
+                // alloc: error path
+                return Err(format!(
+                    "reads of dependency {at} of crate {}, whose closure has {} crates: the key leaves out an input",
+                    crate_name(db, krate),
+                    closure.len()
+                ));
+            };
+            hasher.update(&at.to_le_bytes());
+            for (shape, then) in shapes {
+                hasher.id(&expansion(dep, shape, *then)?);
+            }
         }
         Ok(hasher.finish())
     }
+}
+
+/// What `krate`, served from its image under the key `base`, was filed by, as serving it
+/// noted ([`super::filed::search`]): the process variables its `env!`s read and its
+/// expansions' names, with the values they had.
+fn served(db: &Db, krate: Crate, base: ContentId) -> Result<Reads, Refused> {
+    let own = krate.env(db);
+    let mut reads = Reads::default();
+    for (read, name) in db.files().env_read() {
+        if read == krate && own.get(&name).is_none() {
+            reads.env.push(name.into_boxed_str());
+        }
+    }
+    for read in db.files().expansions_read_by(krate, base_db::ReadBy::Served(base)) {
+        match read {
+            base_db::ExpansionRead::Traced { shape, values } => reads.macros.push((shape.into(), Some(values))),
+            // Never noted for a value served: it was filed by its reads, all traced.
+            base_db::ExpansionRead::Unknown(why) => {
+                // alloc: why a crate is refused, once per refused crate
+                let call = format!("an expansion of crate {}, served from its image", crate_name(db, krate));
+                return Err(Refused::ProcMacro { call, why });
+            }
+        }
+    }
+    reads.env.sort_unstable();
+    reads.env.dedup();
+    reads.macros.sort_unstable();
+    reads.macros.dedup();
+    if reads.macros.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(Refused::Reads { why: "a dependency was served by two values of the same names" });
+    }
+    Ok(reads)
 }
 
 /// Slot `n` of the crate whose key is `key`: where the `n`th set of names it read is kept.
@@ -238,6 +380,7 @@ impl Reads {
         let mut reads = Reads {
             env: env.iter().map(|&it| it.into()).collect(),
             macros: macros.iter().map(|&(shape, values)| (shape.into(), Some(values))).collect(),
+            deps: Vec::new(),
         };
         reads.env.sort_unstable();
         reads.macros.sort_unstable();

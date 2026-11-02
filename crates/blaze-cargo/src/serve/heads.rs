@@ -3,11 +3,20 @@
 //!
 //! - The first request on a checkout imports it: a [`Watcher`] of its directory scans it into
 //!   the head named by its path and keeps the head current. What a build writes and what is no
-//!   source is not taken in: the root's `target/` and every `.git`.
-//! - A request on a checkout waits until the watcher has seen every change made before it, as
-//!   watchman's cookies do: the daemon writes a cookie file under the checkout's `target/`
-//!   (outside the view) and holds the request until the watcher reports the cookie and has
-//!   committed everything it was told before it. Only then does the session see it.
+//!   source is not taken in: a `target/` at the root (cargo's, or a `--target-dir` named
+//!   there; blaze's own build directories are under blaze's root, never in the checkout) and
+//!   every `.git`.
+//! - A request on a checkout waits until the watcher has seen every change made before it:
+//!   the daemon asks the driver to flush the checkout's watch ([`Effect::Flush`]) and holds the
+//!   request until the flush is told and the watcher has committed everything it was told
+//!   before it. Only then does the session see it. Nothing is written into the checkout for
+//!   it: FSEvents' flush writes its cookie in a directory of its own outside the checkout,
+//!   io_uring's drains the watch's queue, and IOCP's marks where the volume's USN journal ends
+//!   as the flush is asked and is told once the watch's reads of the journal have told every
+//!   record before it (blaze-core's `journal::barrier`). Where the driver can't flush (a
+//!   checkout on a network share or a volume with no USN journal, whose watch can't start at
+//!   all), the flush fails and so does every request on the checkout, naming the checkout and
+//!   why.
 //! - A checkout whose directory or a changed file of it can't be read, or whose watch ended,
 //!   fails the requests waiting on it, naming it, and its watch stops: the head never keeps a
 //!   file's old bytes as current. The next request watches it again.
@@ -18,14 +27,14 @@
 //!
 //! A checkout is a slot, its watcher's tags `watchers + slot * 2^32`, so a completion finds its
 //! checkout by one shift; a head's name is looked up once, as a request arrives. A batch of
-//! changes costs one pass over its files: each is matched against the checkout's cookie prefix
-//! and filtered in place, nothing allocated per file.
+//! changes costs one pass over its files, filtered in place, nothing allocated per file.
 
 #![forbid(unsafe_code)]
 
 use blaze_api::{ApiError, Arrived, Reply, Request, RequestRef, Response, ViewRef};
-use blaze_core::{Completion, Conn, Done, Effect, FileName, Tag, decimal::decimal};
+use blaze_core::{Completion, Conn, Done, Effect, FileName, Tag};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_vfs::{Outside, Vfs, Watched, Watcher};
 
@@ -48,7 +57,7 @@ pub enum Out {
 struct Held {
     from: RequestRef,
     request: Request,
-    /// Each checkout it names, by slot, and the cookie it waits for there.
+    /// Each checkout it names, by slot, and the flush it waits for there.
     waits: Vec<(u32, u64)>,
     /// It runs user code: it waits for the round of the watches outside views.
     outside: bool,
@@ -59,35 +68,27 @@ struct Checkout {
     watcher: Watcher,
     /// Its directory under the driver's root, then `/`: what its files' paths start with.
     below: String,
-    /// `<dir>/target`, where its cookies are.
-    cookie_dir: String,
-    /// `<dir>/target/.blaze-cookie-<pid>-`: a cookie's path is this and its number.
-    cookie_prefix: String,
-    /// Cookies written or being written and not seen yet, by number. Walked in number order
-    /// only where the walk makes effects ([`Heads::sweep`]).
-    cookies: HashMap<u64, Cookie>,
-}
-
-struct Cookie {
-    file: FileName,
-    written: bool,
-    seen: bool,
+    /// The tag of its watcher's watch, which a flush names.
+    watch: Tag,
+    /// Flushes asked of its watch, by number: whether each has been told. Dropped once told
+    /// and no held request waits for it ([`Heads::sweep`]).
+    flushes: HashMap<u64, bool, Global>,
 }
 
 pub struct Heads {
-    /// The cookies' writes and removes: `tags..tags + 2^32`.
+    /// The flushes of checkouts' watches: `tags..tags + 2^32`.
     tags: u64,
     /// The first tag of slot 0's watcher.
     watchers: u64,
     /// The last tag of every watcher's range.
     watcher_end: u64,
-    next_cookie: u64,
+    next_flush: u64,
     /// By slot; a slot whose watch ended stays empty, its tags never used again.
     checkouts: Vec<Option<Box<Checkout>>>,
     /// The slot of each checkout watched, by its head.
-    slots: HashMap<String, u32>,
-    /// By cookie tag: the checkout's slot and the cookie.
-    writing: HashMap<Tag, (u32, u64)>,
+    slots: HashMap<String, u32, Global>,
+    /// By flush tag: the checkout's slot and the flush's number.
+    flushing: HashMap<Tag, (u32, u64), Global>,
     held: Vec<Held>,
     /// Kept for the daemon's life: dropping it leaves every directory unconfirmed.
     outside: Outside<'static>,
@@ -156,16 +157,12 @@ pub fn runs_user_code(request: &Request) -> bool {
     )
 }
 
-/// Whether the file at `rel` of a checkout is out of its view: the build's `target/` at the
-/// root and every `.git`.
+/// Whether the file at `rel` of a checkout is out of its view: a `target/` at the root, which
+/// cargo or a `--target-dir` there writes (blaze's default build directory is never in the
+/// checkout), and every `.git`.
 pub fn excluded(rel: &str) -> bool {
     rel.strip_prefix("target").is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
         || (rel.contains(".git") && rel.split('/').any(|part| part == ".git"))
-}
-
-/// Whether `dir` is `at` or under it.
-fn within(dir: &str, at: &str) -> bool {
-    dir.strip_prefix(at).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 impl Checkout {
@@ -176,17 +173,17 @@ impl Checkout {
 }
 
 impl Heads {
-    /// Cookies take the tags `tags..tags + 2^32`; watchers take ranges of `2^32` from
+    /// Flushes take the tags `tags..tags + 2^32`; watchers take ranges of `2^32` from
     /// `watchers` on, up to `watchers_end`; `outside` its own ([`Outside::owns`]).
     pub fn new(tags: u64, watchers: u64, watchers_end: u64, outside: Outside<'static>) -> Heads {
         Heads {
             tags,
             watchers,
             watcher_end: watchers_end,
-            next_cookie: 0,
+            next_flush: 0,
             checkouts: Vec::new(),
-            slots: HashMap::default(),
-            writing: HashMap::default(),
+            slots: HashMap::new_in(Global),
+            flushing: HashMap::new_in(Global),
             held: Vec::new(),
             outside,
         }
@@ -211,6 +208,12 @@ impl Heads {
     /// The checkout whose head is at `root`, if one is: where an agent's build of it is placed.
     pub fn path_of(&self, vfs: &Vfs, root: ContentId) -> Option<String> {
         self.slots.keys().find(|head| vfs.head(head) == Some(root)).cloned()
+    }
+
+    /// The checkouts watched now, by absolute path: the collector's live heads, whose build
+    /// dirs it keeps (docs/gc.md).
+    pub fn checkouts(&self) -> impl Iterator<Item = &str> + Clone {
+        self.slots.keys().map(String::as_str).filter(|head| is_checkout(head))
     }
 
     /// How many requests wait for a watcher.
@@ -253,7 +256,7 @@ impl Heads {
         }
         let mut waits = Vec::with_capacity(heads.len());
         for head in heads {
-            match self.cookie(vfs, head, effects) {
+            match self.flush(vfs, head, effects) {
                 Ok(wait) => waits.push(wait),
                 Err(error) => {
                     answer(out, from, Some(error), false);
@@ -268,27 +271,20 @@ impl Heads {
         self.release(out);
     }
 
-    /// A cookie written into `head`'s checkout, its watcher started first if it has none: the
-    /// checkout's slot and the cookie's number.
-    fn cookie(&mut self, vfs: &Vfs, head: &str, effects: &mut Vec<Effect>) -> Result<(u32, u64), ApiError> {
+    /// A flush of `head`'s checkout's watch, its watcher started first if it has none: the
+    /// checkout's slot and the flush's number. Nothing is written into the checkout.
+    fn flush(&mut self, vfs: &Vfs, head: &str, effects: &mut Vec<Effect>) -> Result<(u32, u64), ApiError> {
         let slot = match self.slots.get(head) {
             Some(&slot) => slot,
             None => self.watch(vfs, head, effects)?,
         };
         let checkout = self.checkouts[slot as usize].as_deref_mut().expect("a slot named is watched");
-        let number = self.next_cookie;
-        self.next_cookie += 1;
-        let mut path = String::with_capacity(checkout.cookie_prefix.len() + 20);
-        path.push_str(&checkout.cookie_prefix);
-        path.push_str(decimal(number, &mut [0; 20]));
-        let file = FileName::new(&path).expect("a cookie's name is a name");
-        let tag = Tag(self.tags + (number % (1 << 31)) * 2);
-        self.writing.insert(tag, (slot, number));
-        path.clear();
-        path.push_str(decimal(number, &mut [0; 20]));
-        path.push('\n');
-        effects.push(Effect::Write { file: file.clone(), bytes: path.into_bytes(), tag });
-        checkout.cookies.insert(number, Cookie { file, written: false, seen: false });
+        let number = self.next_flush;
+        self.next_flush += 1;
+        let tag = Tag(self.tags + number % (1 << 32));
+        self.flushing.insert(tag, (slot, number));
+        effects.push(Effect::Flush { watch: checkout.watch, tag });
+        checkout.flushes.insert(number, false);
         Ok((slot, number))
     }
 
@@ -305,16 +301,16 @@ impl Heads {
         let tags = self.watchers + u64::from(slot) * WATCHER_TAGS;
         assert!(tags < self.watcher_end, "the daemon has watched every checkout its tags allow");
         let mut watcher = Watcher::new(head, dir.clone(), tags);
+        // The journal is asked before any flush of it, in the same effects: a flush names a
+        // watch in flight.
         watcher.start(vfs, effects);
-        let cookie_dir = format!("{dir}/target");
-        let cookie_prefix = format!("{cookie_dir}/.blaze-cookie-{}-", std::process::id());
         let checkout = Checkout {
             head: head.to_owned(),
             watcher,
             below: format!("{dir}/"),
-            cookie_dir,
-            cookie_prefix,
-            cookies: HashMap::default(),
+            // The tag of the watcher's journal: its first ([`Watcher::new`]).
+            watch: Tag(tags),
+            flushes: HashMap::new_in(Global),
         };
         self.checkouts.push(Some(Box::new(checkout)));
         self.slots.insert(head.to_owned(), slot);
@@ -324,7 +320,7 @@ impl Heads {
     /// Takes a completion of its own; what was held and is now caught up goes on.
     pub fn complete(&mut self, vfs: &mut Vfs, completion: Completion, effects: &mut Vec<Effect>, out: &mut Vec<Out>) {
         if completion.tag.0.wrapping_sub(self.tags) < 1 << 32 {
-            self.cookie_done(completion, out);
+            self.flushed(completion, out);
         } else if self.outside.owns(completion.tag) {
             self.outside.complete(completion, effects);
         } else {
@@ -333,25 +329,23 @@ impl Heads {
         self.release(out);
     }
 
-    fn cookie_done(&mut self, completion: Completion, out: &mut Vec<Out>) {
-        // Odd tags are the removes of cookies seen: nothing waits for them.
-        let Some((slot, number)) = self.writing.remove(&completion.tag) else { return };
+    fn flushed(&mut self, completion: Completion, out: &mut Vec<Out>) {
+        let Some((slot, number)) = self.flushing.remove(&completion.tag) else { return };
         let Some(checkout) = self.checkouts.get_mut(slot as usize).and_then(Option::as_deref_mut) else { return };
         match completion.done {
-            Done::Written => {
-                if let Some(cookie) = checkout.cookies.get_mut(&number) {
-                    cookie.written = true;
+            Done::Flushed => {
+                if let Some(told) = checkout.flushes.get_mut(&number) {
+                    *told = true;
                 }
             }
             done => {
-                let file = checkout.cookies.remove(&number).map(|it| it.file);
+                checkout.flushes.remove(&number);
                 let why = match done {
                     Done::Failed(error) => error.to_string(),
                     other => format!("the driver answered {other:?}"),
                 };
                 let what = format!(
-                    "writing the cookie {} that shows the watcher of {} has caught up: {why}",
-                    file.map_or_else(String::new, |it| format!("/{it}")),
+                    "flushing the watch of the checkout {} so that a request sees every change made before it: {why}",
                     checkout.head,
                 );
                 let head = checkout.head.clone();
@@ -365,26 +359,6 @@ impl Heads {
         let Some(checkout) = self.checkouts.get_mut(slot as usize).and_then(Option::as_deref_mut) else { return };
         let done = match completion.done {
             Done::Journaled(mut batch) => {
-                // A directory reported for what changed in it, or a subtree whose changes the
-                // journal lost, tells every cookie in it.
-                let mut told = false;
-                for file in &batch.files {
-                    let file = file.as_str();
-                    match file.strip_prefix(checkout.cookie_prefix.as_str()).and_then(|it| it.parse::<u64>().ok()) {
-                        Some(number) => {
-                            if let Some(cookie) = checkout.cookies.get_mut(&number) {
-                                cookie.seen = true;
-                            }
-                        }
-                        None => told |= within(&checkout.cookie_dir, file),
-                    }
-                }
-                let lost = batch.lost.iter().any(|(under, _)| within(&checkout.cookie_dir, under.as_str()));
-                if told || lost {
-                    for cookie in checkout.cookies.values_mut() {
-                        cookie.seen |= told || cookie.written;
-                    }
-                }
                 // A lost subtree under `target/` or `.git` is not rescanned, nor is an excluded
                 // directory listed into.
                 batch.files.retain(|it| checkout.keeps(it));
@@ -426,7 +400,7 @@ impl Heads {
         {
             gone.watcher.stop(effects);
             self.slots.remove(&gone.head);
-            self.writing.retain(|_, it| it.0 != slot);
+            self.flushing.retain(|_, it| it.0 != slot);
             self.fail_waiting(|it| it.0 == slot, &what, &gone.head, out);
         }
     }
@@ -438,14 +412,14 @@ impl Heads {
         }
     }
 
-    /// Hands on every held request whose every checkout has seen its cookie and committed what
+    /// Hands on every held request whose every checkout's flush is told and committed what
     /// it was told before, and, if it runs user code, whose round outside views is in, oldest
     /// first. A request held for an older round waits for the newer one too.
     fn release(&mut self, out: &mut Vec<Out>) {
         let (checkouts, flushed) = (&self.checkouts, self.outside.flushed());
         let caught_up = |(slot, number): &(u32, u64)| {
             checkouts.get(*slot as usize).and_then(Option::as_deref).is_some_and(|it| {
-                it.watcher.idle() && it.cookies.get(number).is_some_and(|cookie| cookie.seen)
+                it.watcher.idle() && it.flushes.get(number).is_some_and(|told| *told)
             })
         };
         for held in self.held.extract_if(.., |it| (flushed || !it.outside) && it.waits.iter().all(&caught_up)) {
@@ -453,25 +427,12 @@ impl Heads {
         }
     }
 
-    /// Removes the cookies seen that no held request waits for.
-    pub fn sweep(&mut self, effects: &mut Vec<Effect>) {
-        let (held, tags) = (&self.held, self.tags);
-        let mut swept = Vec::new();
+    /// Drops the flushes told that no held request waits for.
+    pub fn sweep(&mut self) {
+        let held = &self.held;
         for (slot, checkout) in (0u32..).zip(&mut self.checkouts) {
             let Some(checkout) = checkout.as_deref_mut() else { continue };
-            swept.extend(
-                checkout
-                    .cookies
-                    .iter()
-                    .filter(|(number, cookie)| cookie.seen && !held.iter().any(|it| it.waits.contains(&(slot, **number))))
-                    .map(|(number, _)| *number),
-            );
-            blaze_ids::radix::sort(&mut swept);
-            for number in swept.drain(..) {
-                let cookie = checkout.cookies.remove(&number).expect("a cookie just found");
-                let tag = Tag(tags + (number % (1 << 31)) * 2 + 1);
-                effects.push(Effect::Remove { file: cookie.file, tag });
-            }
+            checkout.flushes.retain(|number, told| !*told || held.iter().any(|it| it.waits.contains(&(slot, *number))));
         }
     }
 
@@ -512,14 +473,6 @@ mod tests {
         assert!(!excluded("crates/target/src/lib.rs"));
         assert!(!excluded(".cargo/config.toml"));
         assert!(!excluded("src/.gitignore.rs"));
-    }
-
-    #[test]
-    fn a_cookie_dir_is_within_what_contains_it() {
-        assert!(within("w/target", "w/target"));
-        assert!(within("w/target", "w"));
-        assert!(!within("w/target", "w/tar"));
-        assert!(!within("w/target", "w/target/x"));
     }
 
     #[test]
@@ -658,27 +611,27 @@ mod tests {
         assert!(named(&edit).is_empty());
     }
 
+    /// A request on a checkout waits on a flush of its watch, and nothing is written into the
+    /// checkout for it: no file of a cookie, no build directory.
     #[test]
-    fn cookies_seen_are_removed_in_number_order() {
+    fn a_checkout_is_caught_up_with_by_a_flush_that_writes_nothing() {
         let mut heads = Heads::new(0, 1 << 32, 1 << 40, outside(1 << 40).1);
         let mut effects = Vec::new();
         let vfs = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]).0;
-        let numbers: Vec<u64> = (0..40).map(|_| heads.cookie(&vfs, "/w", &mut effects).unwrap().1).collect();
+        let numbers: Vec<u64> = (0..40).map(|_| heads.flush(&vfs, "/w", &mut effects).unwrap().1).collect();
+        assert_eq!(numbers, (0..40).collect::<Vec<_>>());
+        let watch = heads.checkouts[0].as_deref().unwrap().watch;
+        let flushes = effects.iter().filter(|it| matches!(it, Effect::Flush { watch: at, .. } if *at == watch)).count();
+        assert_eq!(flushes, 40);
+        assert!(
+            !effects.iter().any(|it| matches!(it, Effect::Write { .. } | Effect::Remove { .. })),
+            "a flush writes nothing into the checkout: {effects:?}"
+        );
         let checkout = heads.checkouts[0].as_deref_mut().unwrap();
-        for (number, cookie) in &mut checkout.cookies {
-            cookie.seen = number % 3 != 1;
+        for (number, told) in &mut checkout.flushes {
+            *told = number % 3 != 1;
         }
-        effects.clear();
-        heads.sweep(&mut effects);
-        let removed: Vec<u64> = effects
-            .iter()
-            .filter_map(|it| match it {
-                Effect::Remove { tag, .. } => Some((tag.0 - 1) / 2),
-                _ => None,
-            })
-            .collect();
-        let want: Vec<u64> = numbers.into_iter().filter(|it| it % 3 != 1).collect();
-        assert_eq!(removed, want);
-        assert_eq!(heads.checkouts[0].as_deref().unwrap().cookies.len(), 13);
+        heads.sweep();
+        assert_eq!(heads.checkouts[0].as_deref().unwrap().flushes.len(), 13);
     }
 }

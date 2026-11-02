@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use cargo_util_schemas::manifest::{
     PathValue, StringOrVec, TomlManifest, TomlPackageBuild, TomlTarget,
 };
@@ -1056,8 +1057,8 @@ fn toml_targets_and_inferred(
             let target_path =
                 |target: &TomlTarget| target.path.clone().map(|p| package_root.join(p.0));
 
-            let mut seen_names = HashSet::default();
-            let mut seen_paths = HashSet::default();
+            let mut seen_names = HashSet::new_in(Global);
+            let mut seen_paths = HashSet::new_in(Global);
             for target in targets.iter() {
                 seen_names.insert(target.name.clone());
                 seen_paths.insert(target_path(target));
@@ -1129,7 +1130,7 @@ fn inferred_to_toml_targets(inferred: &[(String, PathBuf)]) -> Vec<TomlTarget> {
 }
 
 fn validate_unique_names(targets: &[TomlTarget], target_kind: &str) -> anyhow::Result<()> {
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     for name in targets.iter().map(name_or_panic) {
         if !seen.insert(name) {
             bail!(
@@ -1142,7 +1143,7 @@ fn validate_unique_names(targets: &[TomlTarget], target_kind: &str) -> anyhow::R
 }
 
 fn validate_unique_build_scripts(scripts: &[String]) -> anyhow::Result<()> {
-    let mut seen: HashMap<&str, Vec<&str>> = HashMap::default();
+    let mut seen: HashMap<&str, Vec<&str>, Global> = HashMap::new_in(Global);
     for script in scripts {
         let stem =
             Path::new(script).file_stem().and_then(|s| s.to_str()).expect("previously normalized");

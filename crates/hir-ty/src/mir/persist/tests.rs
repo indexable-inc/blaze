@@ -14,6 +14,7 @@ use base_db::{Db, all_crates};
 use blaze_alloc_count::measure;
 use blaze_format::{Aligned, FormatError, open_as};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, FieldId, FunctionId,
     ModuleDefId, StaticId, StructId, UnionId, VariantId,
@@ -35,7 +36,7 @@ use crate::{
     intrinsic::Intrinsic,
     mir::{
         AggregateKind, AsmOperand, AssertKind, BasicBlock, BasicBlockId, BinOp, BorrowKind,
-        CastKind, CoroutineLocals, FieldIndex, InlineAsm, Inlined, InlinedBinding, InlinedBody,
+        CastKind, ComptimeBinder, CoroutineLocals, FieldIndex, InlineAsm, Inlined, InlinedBinding, InlinedBody,
         InlinedCallee, InlinedPromoted, InlinedScope, InlinedSpan, Local, LocalId, MirBody,
         MirPhase, MirSpan, MutBorrowKind, Operand, OperandKind, Place, PlaceElem, Projection,
         ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace, SwitchTargets, Terminator,
@@ -190,13 +191,14 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
         MirSpan::Unknown,
         MirSpan::Inlined(0),
     ];
-    let projections: [PlaceElem; 6] = [
+    let projections: [PlaceElem; 7] = [
         ProjectionElem::Deref,
         ProjectionElem::Field(FieldIndex(1)),
         ProjectionElem::Index(index),
         ProjectionElem::ConstantIndex { offset: 1 << 40, min_length: 3, from_end: true },
         ProjectionElem::Subslice { from: 1, to: u64::MAX },
         ProjectionElem::Downcast(VariantId::EnumVariantId(it.variant)),
+        ProjectionElem::ReflectedField(ComptimeBinder(3)),
     ];
 
     let mut statements = Vec::new();
@@ -359,6 +361,13 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
         TerminatorKind::FalseEdge { real_target: block(1), imaginary_target: block(2) },
         TerminatorKind::FalseUnwind { real_target: block(1), unwind: Some(block(3)) },
         TerminatorKind::FalseUnwind { real_target: block(1), unwind: None },
+        TerminatorKind::ComptimeFor {
+            binder: ComptimeBinder(3),
+            domain: tuple.store(),
+            body: block(1),
+            after: block(2),
+        },
+        TerminatorKind::ComptimeNext { head: block(0) },
     ];
     let asserts = [
         AssertKind::BoundsCheck { len: copy(index), index: copy(index) },
@@ -413,7 +422,7 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
             },
         ]),
     };
-    let mut upvar_locals = HashMap::default();
+    let mut upvar_locals = HashMap::new_in(Global);
     upvar_locals.insert(
         idx(5),
         vec![
@@ -467,6 +476,10 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
             spans: vec![InlinedSpan { scope: 0, span: MirSpan::PatId(idx(0)) }],
             bindings: vec![InlinedBinding { scope: 0, binding: idx(1), local: ret }],
             promoted: vec![InlinedPromoted { local: bytes, callee: 0, expr: idx(3) }],
+            devirtualized: vec![[7; 32], [0; 32]],
+            // Never persisted: only optimized bodies have them (`write` refuses one that does).
+            specialized: Vec::new(),
+            moved_to_frame: 0,
         },
     }
 }
@@ -537,7 +550,7 @@ fn an_empty_body_reads_back_equal() {
         start_block: idx(0),
         owner: InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it.callee)),
         binding_locals: ArenaMap::default(),
-        upvar_locals: HashMap::default(),
+        upvar_locals: HashMap::new_in(Global),
         param_locals: Vec::new(),
         promoted_locals: Vec::new(),
         closures: Vec::new(),
@@ -571,7 +584,7 @@ fn equal_bodies_write_equal_bytes() {
     let mut reordered = body.clone(); // clone: a test's copy
     let mut entries: Vec<_> = reordered.upvar_locals.drain().collect();
     entries.reverse();
-    let mut map = HashMap::with_capacity_and_hasher(64, Default::default());
+    let mut map = HashMap::with_capacity_in(64, Global);
     map.extend(entries);
     reordered.upvar_locals = map;
     assert_eq!(reordered, body);
@@ -585,6 +598,18 @@ fn a_description_lowering_does_not_make_is_refused() {
     let mut body = sample(&db, &it);
     body.unreachable_after_calls[0].descr = "statement";
     assert!(write(&db, &body, None).is_err());
+}
+
+/// A body `HeapToStack` moved an allocation of is optimized MIR, which is never kept: its
+/// write is refused, never a body read back with its locals retyped and nothing to say so.
+#[test]
+fn a_body_with_allocations_moved_into_its_frame_is_refused() {
+    let db = db();
+    let it = items(&db);
+    let mut body = sample(&db, &it);
+    body.inlined.moved_to_frame = 1;
+    let why = write(&db, &body, None).expect_err("a body with an allocation moved into its frame");
+    assert!(why.contains("moved into its frame"), "{why}");
 }
 
 #[test]
@@ -689,7 +714,8 @@ fn owned_blocks(body: &MirBody<'_>) -> u64 {
     for places in body.upvar_locals.values() {
         blocks += vec(places) + places.iter().map(|(_, it)| vec(&it.projections)).sum::<u64>();
     }
-    let Inlined { callees, scopes, spans, bindings, promoted } = &body.inlined;
+    let Inlined { callees, scopes, spans, bindings, promoted, devirtualized, specialized, moved_to_frame: _ } =
+        &body.inlined;
     blocks += vec(&body.param_locals)
         + vec(&body.promoted_locals)
         + vec(&body.closures)
@@ -705,7 +731,9 @@ fn owned_blocks(body: &MirBody<'_>) -> u64 {
         + vec(scopes)
         + vec(spans)
         + vec(bindings)
-        + vec(promoted);
+        + vec(promoted)
+        + vec(devirtualized)
+        + vec(specialized);
     blocks
 }
 

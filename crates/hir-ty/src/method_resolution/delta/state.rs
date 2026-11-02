@@ -14,6 +14,7 @@
 use base_db::{Crate, Db, Written};
 use blaze_dbsp::{Arrangement, Pos, ReadIndex, Work};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir_def::{
     BuiltinDeriveImplId, HasModule, ImplId, ModuleDefId, ModuleId, TraitId,
     builtin_derive::BuiltinDeriveImplTrait,
@@ -63,20 +64,20 @@ struct DeriveRow {
 /// One crate's impls and traits, and its published inputs.
 #[derive(Default)]
 pub(crate) struct CrateState {
-    impls: HashMap<ImplId, ImplRow>,
-    derives: HashMap<BuiltinDeriveImplId, DeriveRow>,
+    impls: HashMap<ImplId, ImplRow, Global>,
+    derives: HashMap<BuiltinDeriveImplId, DeriveRow, Global>,
     pub(crate) traits: Arrangement<TraitId, Pos, TraitEntry>,
     pub(crate) heads: Arrangement<Head, Pos, (ModuleId, ImplId)>,
     /// Each trait declared in the crate's modules with its item names (`AssocFn`).
-    assoc: HashMap<TraitId, SmallVec<[Name; 8]>>,
+    assoc: HashMap<TraitId, SmallVec<[Name; 8]>, Global>,
     /// Traits whose items a macro call writes: their names may change with no edit of theirs.
-    wild_traits: HashSet<TraitId>,
+    wild_traits: HashSet<TraitId, Global>,
     pub(crate) candidates: Arrangement<Name, TraitId, TraitId>,
     /// The traits the crate's lang items give each built-in derive, by
     /// `BuiltinDeriveImplTrait::ALL` index, once a derive impl asked.
     lang: Option<SmallVec<[Option<TraitId>; 16]>>,
     /// The body part of each module whose bodies may hold an impl.
-    bodies: HashMap<ModuleId, BodyPart>,
+    bodies: HashMap<ModuleId, BodyPart, Global>,
     /// The modules whose bodies hold impls of each trait, of each head, and (under `()`) any
     /// inherent impl.
     body_traits: Arrangement<TraitId, ModuleId, ModuleId>,
@@ -92,11 +93,11 @@ pub(crate) struct CrateState {
 /// the impls of its dependents that read it.
 #[derive(Default)]
 pub struct State {
-    crates: HashMap<Crate, CrateState>,
-    owner: HashMap<ImplId, Crate>,
+    crates: HashMap<Crate, CrateState, Global>,
+    owner: HashMap<ImplId, Crate, Global>,
     by_name: ReadIndex<Name, ImplId>,
     by_def: ReadIndex<ModuleDefId, ImplId>,
-    wild: HashSet<ImplId>,
+    wild: HashSet<ImplId, Global>,
     scratch: Scratch,
 }
 
@@ -104,13 +105,13 @@ pub struct State {
 #[derive(Default)]
 struct Scratch {
     reads: Reads,
-    deltas: HashMap<Crate, usize>,
-    names: HashSet<Name>,
-    defs: HashSet<ModuleDefId>,
-    woken: HashSet<ImplId>,
-    done: HashSet<ImplId>,
-    kinds: HashMap<ImplId, bool>,
-    kinds_of: HashSet<ModuleId>,
+    deltas: HashMap<Crate, usize, Global>,
+    names: HashSet<Name, Global>,
+    defs: HashSet<ModuleDefId, Global>,
+    woken: HashSet<ImplId, Global>,
+    done: HashSet<ImplId, Global>,
+    kinds: HashMap<ImplId, bool, Global>,
+    kinds_of: HashSet<ModuleId, Global>,
     trait_keys: Vec<TraitId>,
     head_keys: Vec<Head>,
     name_keys: Vec<Name>,
@@ -179,7 +180,7 @@ pub(crate) fn run(
 /// Drops the state of every crate no longer in the graph, with its impls' read sets.
 fn drop_gone(state: &mut State, crates: &[Crate]) {
     // alloc: a crate graph change, once
-    let live: HashSet<Crate> = crates.iter().copied().collect();
+    let live: HashSet<Crate, Global> = crates.iter().copied().collect();
     let gone: Vec<Crate> =
         state.crates.keys().copied().filter(|it| !live.contains(it)).collect(); // alloc: as above
     for krate in gone {
@@ -817,7 +818,7 @@ pub(crate) fn warm_one(db: &Db, _: &Written<'_>, warm: &mut Warm) {
 }
 
 /// Each maintained crate's delta of `last`, by crate.
-fn deltas(last: &LastWrite) -> HashMap<Crate, &CrateDelta> {
+fn deltas(last: &LastWrite) -> HashMap<Crate, &CrateDelta, Global> {
     last.crates.iter().map(|it| (it.krate, it)).collect() // alloc: a crate's delta each, once per write
 }
 
@@ -832,7 +833,7 @@ fn changed(last: &LastWrite) -> bool {
 pub(crate) fn warm(db: &Db, state: &State, last: &LastWrite, written: &Written<'_>) -> Vec<Warm> {
     let deltas = deltas(last);
     let changed = changed(last);
-    let mut impls: HashSet<ImplId> = HashSet::default(); // alloc: the impls the write reads, once per write
+    let mut impls: HashSet<ImplId, Global> = HashSet::new_in(Global); // alloc: the impls the write reads, once per write
     for delta in &last.crates {
         impls.extend(delta.touched_impls.iter().copied());
         for &(_, name) in &delta.bindings {

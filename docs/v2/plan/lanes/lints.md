@@ -46,8 +46,8 @@ the same passes. v2 does that per body, as queries:
 
 ## Blaze's own lints (`blaze::`)
 
-`hot_clone`, `hot_alloc`, `hot_alloc_call`, `hot_dyn` and `std_hashmap` (all five the group
-`blaze::hot`, as hot_lint.py checks SipHash maps in hot crates too), typed, in
+`hot_clone`, `hot_alloc`, `hot_alloc_call`, `hot_dyn`, `default_hasher` (was `std_hashmap`) and `implicit_allocator`
+(all six the group `blaze::hot`, as hot_lint.py checks SipHash maps in hot crates too), typed, in
 `crates/blaze-lints/src/blaze/` ([lints/blaze.md](lints/blaze.md)). They are `allow` by
 default, so a crate that doesn't opt in sees nothing (superset-of-rust). A workspace turns one
 on for every member in its root manifest's `[workspace.metadata.blaze.lints]` (`hot_alloc =
@@ -183,11 +183,25 @@ is right. In blaze's own workspace each is at `warn`, not `deny`, until the tree
   every arm. A guard moved on or matched on itself is not one; closures and blocks in the
   scrutinee are not looked in. For a `match` or `if let` statement of a scalar value the fix is
   `let value = ..;` first (maybe incorrect: the arms then run without the lock).
-- `significant_drop_tightening` (rule 9): a named lock guard, used, then held through a call
-  written in the source on a path where it is used on no path after, until its scope ends. Uses
-  are read from the runtime MIR (the guard, references into it, call results that may borrow
-  from it), with liveness across branches and loops, not clippy's statement walk; a guard never
-  used (a critical section) is left alone. No fix.
+- `significant_drop_tightening` (rule 9): a named value whose drop matters, used, then held
+  through a call written in the source on a path where it is used on no path after, until its
+  scope ends. What counts: std's and `lock_api`'s lock guards, `RefCell`'s `Ref`/`RefMut`, and
+  any type marked `#[clippy::has_significant_drop]` or `#[must_not_suspend]` (both read into
+  `AttrFlags`); a drop that only frees memory (`Vec`, `String`, a `Box` of them) never does. The
+  message names the value's type and why its drop matters. Uses are read from the runtime MIR
+  (the value, references into it, call results that may borrow from it), with liveness across
+  branches and loops, not clippy's statement walk; a value never used (a critical section) is
+  left alone. The fix, MachineApplicable, writes `drop(x);` on its own line after the statement
+  of the last use: only for a `let` of a plain name in the function's own body whose every use
+  is in that block's statements up to that one, with the call held through after it, and only
+  when `hir_ty_borrowck::drop_early::check` (the body lowered again with that drop,
+  `hir_ty_mir::mir::lower_with_early_drops`, then `borrowck_rewritten`) passes. Anywhere else,
+  the finding has no fix. Rust's drop order is never changed (rule 4); this only suggests.
+- The borrow check's drop-early note: an error whose later use is the implicit drop of a local
+  at the end of its scope ("later used here, when `x` is dropped") gets a note naming the local,
+  its type and its last real use, and the same MachineApplicable `drop(x);` fix
+  (`PartSpan::LineAfter`), only when the body with that drop passes with no new error
+  (`hir_ty_borrowck::drop_early::add_notes`; checked, never guessed).
 - `await_holding_lock`, `await_holding_refcell_ref` (rule 9): a local an `async` body keeps
   across an `.await` (`MirBody::held_locals_in`, the front end's coroutine layout) holding a
   lock guard, or a `RefCell`'s `Ref`/`RefMut`, itself or in its arguments or fields. A guard

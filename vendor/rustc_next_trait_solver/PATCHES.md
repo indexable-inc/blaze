@@ -158,6 +158,44 @@ for as many runs as goals nest: warm re-solves of one body still allocated a nes
 per run (`docs/v2/plan/lanes/mem/db-solver.md`, item 8). Kept, a pool holds a buffer per level
 after one run. Answers are unchanged.
 
+### 0011-int-marker-builtins
+
+What: the four markers of `#[blaze::arbitrary_ints]` (`ArbitraryInt`, `ArbitrarySigned`,
+`IntFrom<S>`, `IntTryFrom<S>`, lang items of `core::num::arbitrary`; `rustc_type_ir`'s patch
+`0011-arbitrary-int-lang-items` names them) are builtin candidates:
+`GoalKind::consider_builtin_int_marker_candidate`, dispatched from
+`assemble_builtin_impl_candidates`, decided by `structural_traits::int_marker_holds`.
+`ArbitraryInt` holds of `Int(Bits)` and `Uint(Bits)`, `ArbitrarySigned` of `Int(Bits)`, and both
+are refused for every other type, an integer variable included, before any probe. `IntFrom<S>`
+and `IntTryFrom<S>` hold when `Self` and `S` (structurally normalized) are two different integer
+types, at least one of them of an arbitrary width: `IntFrom` when every value of `S` is one of
+`Self` on every target (a pointer-sized `S` never is, a pointer-sized `Self` counts as 16 bits,
+rustc's rule for `usize`'s and `isize`'s `From` impls), `IntTryFrom` otherwise. A type variable
+as `S` is ambiguous. The host-effect form answers `ArbitraryInt` and `ArbitrarySigned` as the
+trait form does (`ArbitraryInt` is a `const trait`); `NormalizesTo` panics, as for the other
+builtin traits without associated types. `consider_builtin_copy_clone_candidate` makes
+`Int(Bits)` and `Uint(Bits)` `Copy` with no constituents; their `Clone` and `TrivialClone` are
+impls in core, as the standard widths' are.
+
+Why: blaze's integers of any width (`docs/v2/plan/lanes/frontend/arbitrary-ints.md`) get their
+trait impls once in core, as blanket impls over these markers, not once per width. The answer
+comes from the type alone, so it is a builtin; no impl may name the traits
+(`#[rustc_deny_explicit_impl]`). An integer variable never becomes an arbitrary width through
+selection, so programs that don't name one infer exactly as before. `Copy` is a builtin because
+core cannot write `impl<T: ArbitraryInt> Copy for T` (E0206).
+
+### 0012-deep-folds-guarded
+
+What: `NormalizationFolder::try_fold_ty` and `try_fold_const` fold their arguments inside
+`stdx::ensure_sufficient_stack`, and so does `Canonicalizer::inner_fold_ty` for a type it
+descends into, so the crate depends on `stdx`.
+
+Why: deep normalization and canonicalization recursed once per level of the type on the
+caller's stack, so a type a few thousand levels deep overflowed a release build's default stack.
+Blaze's other deep recursions grow the stack the same way (fiber-aware). Tests: `hir-ty-identity`'s
+`a_type_with_an_alias_at_the_bottom_normalizes_at_any_depth` (the normalizer) and
+`a_body_naming_a_deep_type_has_an_identity` (the canonicalizer) overflow without them.
+
 ## Dropped since the previous base (ra-ap-rustc_next_trait_solver 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#161380 (a constant sends a goal back to the caller's typing

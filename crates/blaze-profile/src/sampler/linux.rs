@@ -8,6 +8,7 @@ use std::{
 };
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 
 use super::{DEPTH, Sample, Unsampled, keep};
 
@@ -276,8 +277,8 @@ fn threads(own: libc::pid_t, into: &mut Vec<libc::pid_t>) {
 pub(super) fn run(hz: u32) {
     // SAFETY: `gettid` has no precondition.
     let own = unsafe { libc::gettid() };
-    let mut events: HashMap<libc::pid_t, Event> = HashMap::default();
-    let mut refused: HashSet<libc::pid_t> = HashSet::default();
+    let mut events: HashMap<libc::pid_t, Event, Global> = HashMap::new_in(Global);
+    let mut refused: HashSet<libc::pid_t, Global> = HashSet::new_in(Global);
     // alloc: the sampler's thread, at the edge, every 100 ms
     let mut now: Vec<libc::pid_t> = Vec::new();
     let mut batch: Vec<Sample> = Vec::with_capacity(4096);

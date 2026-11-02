@@ -1,4 +1,5 @@
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hegel::{TestCase, generators as gs};
 
 use super::*;
@@ -11,8 +12,8 @@ fn stream(tc: &TestCase) -> Vec<(u64, u64)> {
     tc.draw(gs::vecs(gs::tuples!(keys, ticks)).max_size(400))
 }
 
-fn exact(stream: &[(u64, u64)]) -> HashMap<u64, u64> {
-    let mut exact = HashMap::default();
+fn exact(stream: &[(u64, u64)]) -> HashMap<u64, u64, Global> {
+    let mut exact = HashMap::new_in(Global);
     for &(key, ticks) in stream {
         *exact.entry(key).or_default() += ticks;
     }
@@ -60,7 +61,7 @@ fn a_key_over_the_floor_is_listed_and_its_exact_ticks_are_never_over(tc: TestCas
         top.offer(key, estimate, ticks);
     }
     let exact = exact(&stream);
-    let listed: HashMap<u64, (u64, u64)> = top.entries().map(|(key, estimate, ticks)| (key, (estimate, ticks))).collect();
+    let listed: HashMap<u64, (u64, u64), Global> = top.entries().map(|(key, estimate, ticks)| (key, (estimate, ticks))).collect();
     for (key, ticks) in &exact {
         if *ticks > top.floor() {
             assert!(listed.contains_key(key), "key {key} has {ticks} ticks, over the floor {}, and is not listed", top.floor());

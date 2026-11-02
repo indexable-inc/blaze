@@ -10,6 +10,7 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::Frame;
 use hir_expand::name::Name;
 
@@ -40,9 +41,9 @@ pub(super) struct RunOut {
     /// order the run made them.
     pub(super) rows: ModulesMap,
     /// Each group's share, and its modules in order, the round-0 one first.
-    pub(super) outs: HashMap<ModuleId, (GroupOut, Vec<ModuleId>)>,
+    pub(super) outs: HashMap<ModuleId, (GroupOut, Vec<ModuleId>), Global>,
     /// The group of each module of `rows`.
-    pub(super) group_of: HashMap<ModuleId, ModuleId>,
+    pub(super) group_of: HashMap<ModuleId, ModuleId, Global>,
     /// What the run read, with whose read it was.
     pub(super) reads: Vec<Read>,
     /// The crate env after the run.
@@ -106,8 +107,8 @@ fn run_in<'db>(
         root,
         modules: ModulesSlot::Maintained { own: ModulesMap::new(), outside },
         prelude: None,
-        macro_use_prelude: HashMap::default(),
-        derive_helpers_in_scope: HashMap::default(),
+        macro_use_prelude: HashMap::new_in(Global),
+        derive_helpers_in_scope: HashMap::new_in(Global),
         session_macros: false,
         names: uses::NameRecords::default(),
         // alloc: empty, a run's view keeps no diagnostics
@@ -123,7 +124,7 @@ fn run_in<'db>(
     {
         unit.def_map_mut().prelude = state.prelude;
     }
-    let mut outs: HashMap<ModuleId, GroupOut> = HashMap::default();
+    let mut outs: HashMap<ModuleId, GroupOut, Global> = HashMap::new_in(Global);
     outs.reserve(region.len());
     let mut sink = RegionSink { unit, env, root, group: root, outs, missed_root: false };
 
@@ -216,9 +217,9 @@ fn run_in<'db>(
     let RegionSink { unit, env, outs: mut group_outs, missed_root, .. } = sink;
 
     // Which group each module the run made is in: its own, or its parent's.
-    let mut modules: HashMap<ModuleId, (GroupOut, Vec<ModuleId>)> = HashMap::default();
+    let mut modules: HashMap<ModuleId, (GroupOut, Vec<ModuleId>), Global> = HashMap::new_in(Global);
     modules.reserve(region.len());
-    let mut group_of: HashMap<ModuleId, ModuleId> = HashMap::default();
+    let mut group_of: HashMap<ModuleId, ModuleId, Global> = HashMap::new_in(Global);
     let def_map = unit.def_map();
     let ModulesSlot::Maintained { own, .. } = &def_map.modules else {
         unreachable!("nameres delta: a run's view is `ModulesSlot::Maintained`")
@@ -306,7 +307,7 @@ struct RegionSink<'db, 'f> {
     root: ModuleId,
     /// The group whose macro round is running.
     group: ModuleId,
-    outs: HashMap<ModuleId, GroupOut>,
+    outs: HashMap<ModuleId, GroupOut, Global>,
     missed_root: bool,
 }
 

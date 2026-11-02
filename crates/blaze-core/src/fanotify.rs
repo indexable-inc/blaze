@@ -32,6 +32,7 @@ use std::{
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::{RegionVec, Tag as MemTag};
 
 use crate::{
@@ -122,7 +123,7 @@ const SEEN: usize = 1 << 16;
 /// each lookup hashes the key once and compares the bytes of the entries of its hash.
 struct Dirs<V> {
     /// The first entry of each hash.
-    heads: HashMap<u64, u32>,
+    heads: HashMap<u64, u32, Global>,
     entries: RegionVec<Entry<V>>,
     /// The first entry let go, the rest through their `next`.
     free: u32,
@@ -152,7 +153,7 @@ impl<V: Copy> Dirs<V> {
     fn new(heads: usize) -> io::Result<Dirs<V>> {
         Ok(Dirs {
             // alloc: setup, once per room, reused by every watch after.
-            heads: HashMap::with_capacity_and_hasher(heads, Default::default()),
+            heads: HashMap::with_capacity_in(heads, Global),
             entries: RegionVec::new(DIRS, MemTag::Io).map_err(io::Error::other)?,
             free: NONE,
             len: 0,
@@ -889,7 +890,7 @@ mod tests {
         for seed in 0..32 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut ours: Dirs<u64> = Dirs::new(64).unwrap();
-            let mut theirs: HashMap<Vec<u8>, (u64, String)> = HashMap::default();
+            let mut theirs: HashMap<Vec<u8>, (u64, String), Global> = HashMap::new_in(Global);
             for step in 0..4_000u64 {
                 let handle = [rng.below(8) as u8, rng.below(8) as u8];
                 let key = Key::of(&[seed as u8; 8], 1, &handle[..1 + rng.below(2) as usize]);

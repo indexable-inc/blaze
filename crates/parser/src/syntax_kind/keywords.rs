@@ -112,6 +112,12 @@ const CONTEXTUAL: &[(&str, SyntaxKind, Option<Edition>)] = &[
     ("unwrap_binder", UNWRAP_BINDER_KW, None),
     ("wrap_binder", WRAP_BINDER_KW, None),
     ("yeet", YEET_KW, None),
+    // blaze_verify's specification clauses (docs/v2/plan/lanes/verus.md).
+    ("decreases", DECREASES_KW, None),
+    ("ensures", ENSURES_KW, None),
+    ("invariant", INVARIANT_KW, None),
+    ("recommends", RECOMMENDS_KW, None),
+    ("requires", REQUIRES_KW, None),
 ];
 
 const fn names<const N: usize, T: Copy, U: Copy>(table: &[(&'static str, T, U)]) -> [&'static str; N] {
@@ -438,6 +444,11 @@ mod tests {
             "union" => UNION_KW,
             "unwrap_binder" => UNWRAP_BINDER_KW,
             "wrap_binder" => WRAP_BINDER_KW,
+            "decreases" => DECREASES_KW,
+            "ensures" => ENSURES_KW,
+            "invariant" => INVARIANT_KW,
+            "recommends" => RECOMMENDS_KW,
+            "requires" => REQUIRES_KW,
             "yeet" => YEET_KW,
             _ => return None,
         };

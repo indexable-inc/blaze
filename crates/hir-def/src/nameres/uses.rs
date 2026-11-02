@@ -18,6 +18,7 @@ use std::alloc::Allocator;
 
 use base_db::{Crate, Db};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir_expand::{
     HirFileId, InFile, MacroCallId, MacroCallKind, MacroDefId,
     attrs::AttrId,
@@ -595,7 +596,7 @@ impl<'db> Walk<'db> {
         let scopes = ExprScopes::of(db, owner);
         let within = Within::of(store, scopes);
         // alloc: one resolver per scope a path of the store is in, built once.
-        let mut resolvers: HashMap<Option<ScopeId>, Resolver<'db>> = HashMap::default();
+        let mut resolvers: HashMap<Option<ScopeId>, Resolver<'db>, Global> = HashMap::new_in(Global);
         let out = &mut self.uses;
         for (expr, it) in store.exprs() {
             let (path, ns) = match it {
@@ -672,13 +673,13 @@ impl<'db> Walk<'db> {
 fn finish(db: &Db, krate: Crate, walked: &CrateUses, more: &[Use]) -> UsedImports {
     let not_introducing = &*crate_def_map(db, krate).name_records(db).not_introducing;
     // alloc: once per `finish`, which runs once per crate.
-    let glob_targets: HashMap<GlobId, ModuleId> = walked.glob_targets.iter().copied().collect();
+    let glob_targets: HashMap<GlobId, ModuleId, Global> = walked.glob_targets.iter().copied().collect();
     let mut imports: FxIndexMap<ImportOrExternCrate, Used> = FxIndexMap::default();
     let mut macro_use: FxIndexMap<ExternCrateId, Used> = FxIndexMap::default();
     let mut globs: FxIndexMap<GlobId, Vec<Name>> = FxIndexMap::default();
     // alloc: part of the result.
     let mut ambiguous = Vec::new();
-    let mut seen: HashSet<Use> = HashSet::default();
+    let mut seen: HashSet<Use, Global> = HashSet::new_in(Global);
     // alloc: the worklist, the walk's uses and the globs they read through.
     let mut queue: Vec<Use> = Vec::with_capacity(walked.uses.len() + more.len());
     queue.extend_from_slice(&walked.uses);
@@ -743,7 +744,7 @@ fn finish(db: &Db, krate: Crate, walked: &CrateUses, more: &[Use]) -> UsedImport
 }
 
 fn resolver_at<'a, 'db>(
-    resolvers: &'a mut HashMap<Option<ScopeId>, Resolver<'db>>,
+    resolvers: &'a mut HashMap<Option<ScopeId>, Resolver<'db>, Global>,
     db: &'db Db,
     owner: ExpressionStoreOwnerId,
     scope: Option<ScopeId>,
@@ -754,13 +755,13 @@ fn resolver_at<'a, 'db>(
 /// The scope each pattern and type of a store is in: that of the expression it is part of,
 /// or the store's own where none is.
 struct Within {
-    pats: HashMap<PatId, Option<ScopeId>>,
-    types: HashMap<TypeRefId, Option<ScopeId>>,
+    pats: HashMap<PatId, Option<ScopeId>, Global>,
+    types: HashMap<TypeRefId, Option<ScopeId>, Global>,
 }
 
 impl Within {
     fn of(store: &ExpressionStore, scopes: &ExprScopes) -> Within {
-        let mut within = Within { pats: HashMap::default(), types: HashMap::default() };
+        let mut within = Within { pats: HashMap::new_in(Global), types: HashMap::new_in(Global) };
         // alloc: the worklist, once per store.
         let mut todo = Vec::new();
         for expr in store.expr_ids() {
@@ -808,14 +809,14 @@ struct Assign<'a> {
 
 impl StoreVisitor for Assign<'_> {
     fn on_pat(&mut self, pat: PatId) {
-        if let std::collections::hash_map::Entry::Vacant(it) = self.within.pats.entry(pat) {
+        if let blaze_hash::hash_map::Entry::Vacant(it) = self.within.pats.entry(pat) {
             it.insert(self.scope);
             self.todo.push(Child::Pat(pat));
         }
     }
 
     fn on_type(&mut self, ty: TypeRefId) {
-        if let std::collections::hash_map::Entry::Vacant(it) = self.within.types.entry(ty) {
+        if let blaze_hash::hash_map::Entry::Vacant(it) = self.within.types.entry(ty) {
             it.insert(self.scope);
             self.todo.push(Child::Type(ty));
         }

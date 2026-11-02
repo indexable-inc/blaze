@@ -17,6 +17,7 @@ use blaze_core::{
     Address, Command, Completion, Conn, Done, Effect, Exit, FileName, IoError, Sandbox, Tag,
 };
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher, radix};
 
 use crate::confine::LIVE;
@@ -128,9 +129,9 @@ struct Process {
 pub struct Pool {
     config: Config,
     next: u64,
-    servers: HashMap<Server, Process>,
-    asked: HashMap<Tag, Asked>,
-    idle: HashMap<WarmKey, Vec<Server>>,
+    servers: HashMap<Server, Process, Global>,
+    asked: HashMap<Tag, Asked, Global>,
+    idle: HashMap<WarmKey, Vec<Server>, Global>,
     count: u32,
 }
 
@@ -139,9 +140,9 @@ impl Pool {
         Pool {
             config,
             next: 0,
-            servers: HashMap::default(),
-            asked: HashMap::default(),
-            idle: HashMap::default(),
+            servers: HashMap::new_in(Global),
+            asked: HashMap::new_in(Global),
+            idle: HashMap::new_in(Global),
             count: 0,
         }
     }

@@ -1,0 +1,17 @@
+# The test writes this manifest again with hegeltest's absolute path, the case being copied out
+# of the tree; this one builds the crate in place.
+[package]
+name = "repro"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+hegeltest = { path = "../../../../../vendor/hegeltest", default-features = false, features = ["static-engine"] }
+
+# Part 1's contract checks abort on a broken clause inside the callee (`panic_nounwind`), which
+# Hegel can't catch or shrink: the generated tests need them off until part 3's unchecked entry
+# (docs/v2/plan/lanes/contracts.md, part 2).
+[profile.test]
+contract-checks = false
+
+[workspace]

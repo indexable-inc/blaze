@@ -1,4 +1,7 @@
 #![feature(allocator_api, allocator_ext)]
+// `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core`; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 //! blaze v2's query database (docs/v2/plan/lanes/db.md section 7, docs/v2/plan/lanes/items.md
 //! section 6.2).
 //!
@@ -193,6 +196,12 @@ pub mod kinds {
     pub const USER: std::ops::Range<u16> = 0x5000..0x6000;
     /// The workspace load and the unit graph (lane cargo): `0x6000..0x6800`.
     pub const CARGO: std::ops::Range<u16> = 0x6000..0x6800;
+    /// The kernel's entries (`blaze-kernel`), as the invalidation oracle's trace names them
+    /// (`blaze_v2_proof::kernel`): the entry of step `n` at `0x6800 + n`. No database query
+    /// has these kinds; the kernel keeps its entries in the store.
+    pub const KERNEL_ENTRIES: std::ops::Range<u16> = 0x6800..0x6c00;
+    /// The kernel's reads in the same trace: a read of kind `k` at `0x6c00 + k`.
+    pub const KERNEL_READS: std::ops::Range<u16> = 0x6c00..0x7000;
 }
 
 fn is_input(kind: QueryKind) -> bool {

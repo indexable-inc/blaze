@@ -1,0 +1,12 @@
+[package]
+name = "escape"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "HeapToStack bench: an allocation-heavy loop (vec!, Box::new, Rc::new per step); alloc_loop_counted reads a counting #[global_allocator], so blaze keeps every allocation there"
+
+# Its own workspace and lock, like harness/live-alloc.
+[workspace]
+
+[profile.release]
+debug = 1

@@ -221,6 +221,77 @@ pub fn replay_reads<D: Database>(db: &D, reads: Reads) {
     });
 }
 
+/// Appends to `out` the tracing text `write` writes: a span's name (`hir_def::span_names`).
+///
+/// Reads here are not tracked; the result must never reach a query's value. The running query
+/// records none of `write`'s reads, so its edges are the same whether or not a profiler records
+/// its span; text that reached its value would go stale with nothing to invalidate it. So only
+/// text leaves: `write` returns nothing and writes only into `out`. `.clippy.toml` refuses every
+/// caller but `span_names`. A query `write` asks for still runs, and records its reads into its
+/// own row.
+///
+/// `write` must not ask for a query that may be on this thread's stack: the cycle through it
+/// would make the running query a member of a cycle whose read this forgets.
+pub fn for_span_text<D: Database>(
+    db: &D,
+    out: &mut String,
+    write: impl FnOnce(&D, &mut String),
+) {
+    let _restore = untracked(db);
+    write(db, out);
+}
+
+/// Stops recording reads into `db`'s running query until the guard drops.
+fn untracked<D: Database>(db: &D) -> Option<Unrecorded> {
+    let storage = db.storage();
+    local::with(|local| {
+        let edges = local.edges.len() as u32;
+        let at = local.frames.len().checked_sub(1)? as u32;
+        let frame = local.recording(storage)?;
+        Some(Unrecorded {
+            at,
+            edges,
+            dedup_floor: frame.dedup_floor,
+            durability: frame.durability,
+            changed: frame.changed,
+            summary: frame.summary,
+            head: frame.head,
+            unshareable: frame.unshareable,
+            untracked: frame.untracked,
+        })
+    })
+}
+
+/// The running query's frame as [`for_span_text`] found it, put back when it ends (an unwind
+/// out of its `write` too): its edges above `edges` dropped, and what those reads folded into it.
+struct Unrecorded {
+    at: u32,
+    edges: u32,
+    dedup_floor: u32,
+    durability: u8,
+    changed: u32,
+    summary: Summary,
+    head: u32,
+    unshareable: bool,
+    untracked: bool,
+}
+
+impl Drop for Unrecorded {
+    fn drop(&mut self) {
+        local::with(|local| {
+            local.edges.truncate(self.edges as usize);
+            let Some(frame) = local.frames.get_mut(self.at as usize) else { return };
+            frame.dedup_floor = self.dedup_floor;
+            frame.durability = self.durability;
+            frame.changed = self.changed;
+            frame.summary = self.summary;
+            frame.head = self.head;
+            frame.unshareable = self.unshareable;
+            frame.untracked = self.untracked;
+        });
+    }
+}
+
 /// Makes every capture frame open in the running query give `None`: the caller used something
 /// the query computed earlier, outside those frames, whose reads they did not make.
 pub fn unshareable_reads<D: Database>(db: &D) {

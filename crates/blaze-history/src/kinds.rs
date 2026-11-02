@@ -4,6 +4,7 @@
 
 use blaze_graph::admission::TaskKind;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::radix;
 
 /// A new run's weight against the mean, as a shift: an eighth.
@@ -37,7 +38,7 @@ impl Time {
 /// probe; an observe of a kind seen before allocates nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Times {
-    by_kind: HashMap<TaskKind, Time>,
+    by_kind: HashMap<TaskKind, Time, Global>, // alloc: the history's times, for the daemon's life
 }
 
 impl Times {
@@ -63,7 +64,7 @@ impl Times {
 
     /// Times read back, in order of their kinds, each one some observations make.
     pub(crate) fn from_sorted(kinds: Vec<(TaskKind, Time)>) -> Times {
-        let mut by_kind = HashMap::default();
+        let mut by_kind = HashMap::new_in(Global); // alloc: the history's times, for the daemon's life
         by_kind.reserve(kinds.len());
         by_kind.extend(kinds);
         Times { by_kind }

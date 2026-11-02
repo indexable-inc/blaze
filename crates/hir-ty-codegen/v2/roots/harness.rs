@@ -49,10 +49,9 @@ pub(super) fn tested(db: &Db, krate: Crate) -> bool {
     krate.cfg_options(db).check_atom(&CfgAtom::Flag(sym::test))
 }
 
-/// Where what blaze appends to a root file starts in `text`: this module or a proc-macro
-/// crate's list ([`super::proc_macros`]).
+/// Where what blaze appends to a root file starts in `text`: this module.
 pub(super) fn appended_at(text: &str) -> Option<usize> {
-    [MARK, super::proc_macros::MARK].iter().filter_map(|it| text.find(it)).min()
+    text.find(MARK)
 }
 
 /// One test as libtest describes it.

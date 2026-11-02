@@ -9,6 +9,7 @@ use std::{cell::RefCell, mem, ops};
 
 use base_db::{Db, all_crates};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use either::Either;
 use hir_def::{
     DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, TraitId, VariantId,
@@ -125,8 +126,8 @@ impl<'db> TypeInfo<'db> {
 }
 
 type DefWithoutBodyWithAnonConsts = Either<GenericDefId, VariantId>;
-type ExprToAnonConst<'db> = HashMap<ExprId, AnonConstId<'db>>;
-type DefAnonConstsMap<'db> = HashMap<DefWithoutBodyWithAnonConsts, ExprToAnonConst<'db>>;
+type ExprToAnonConst<'db> = HashMap<ExprId, AnonConstId<'db>, Global>;
+type DefAnonConstsMap<'db> = HashMap<DefWithoutBodyWithAnonConsts, ExprToAnonConst<'db>, Global>;
 
 pub struct SemanticsImpl<'db> {
     pub db: &'db Db,
@@ -187,10 +188,10 @@ impl<'db> SemanticsImpl<'db> {
         }
     }
 
-    pub fn get_unsafe_ops(&self, def: ExpressionStoreOwner) -> HashSet<ExprOrPatSource> {
+    pub fn get_unsafe_ops(&self, def: ExpressionStoreOwner) -> HashSet<ExprOrPatSource, Global> {
         let Ok(def) = ExpressionStoreOwnerId::try_from(def) else { return Default::default() };
         let (body, source_map) = ExpressionStore::with_source_map(self.db, def);
-        let mut res = HashSet::default();
+        let mut res = HashSet::new_in(Global);
         self.with_all_infers_for_store(def, &mut |infer| {
             for root in body.expr_roots() {
                 unsafe_operations(self.db, infer, def, body, root, &mut |node, _| {
@@ -448,10 +449,10 @@ impl<'db> SemanticsScope<'db> {
 }
 
 #[derive(Debug)]
-pub struct VisibleTraits(pub HashSet<TraitId>);
+pub struct VisibleTraits(pub HashSet<TraitId, Global>);
 
 impl ops::Deref for VisibleTraits {
-    type Target = HashSet<TraitId>;
+    type Target = HashSet<TraitId, Global>;
 
     fn deref(&self) -> &Self::Target {
         &self.0

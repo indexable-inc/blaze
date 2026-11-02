@@ -18,6 +18,7 @@ use std::{cell::RefCell, fmt, ptr, sync::Arc};
 
 use base_db::{Db, toolchain_channel};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir_def::{
     expr_store::ExprOrPatSource,
         nameres::ModuleOrigin,
@@ -42,7 +43,7 @@ pub struct Semantics<'db> {
     pub db: &'db Db,
     pub(super) imp: SemanticsImpl<'db>,
     /// The file of each tree this handed out, by the address of the file's tree.
-    roots: RefCell<HashMap<usize, HirFileId>>,
+    roots: RefCell<HashMap<usize, HirFileId, Global>>,
 }
 
 impl fmt::Debug for Semantics<'_> {
@@ -62,7 +63,7 @@ fn tree_key(node: Node<'_>) -> usize {
 thread_local! {
     /// The `roots` of the last `Semantics` dropped on this thread, emptied: the next one takes
     /// its allocation, as the source-to-def tables are carried (`SourceToDefCache::take`).
-    static ROOTS: RefCell<HashMap<usize, HirFileId>> = RefCell::default();
+    static ROOTS: RefCell<HashMap<usize, HirFileId, Global>> = RefCell::default();
 }
 
 impl Drop for Semantics<'_> {
@@ -80,7 +81,7 @@ impl<'db> Semantics<'db> {
 
     /// Like `new`, with a file taken as a module of only those of `crates` it is in, when it
     /// is in any.
-    pub fn new_within(db: &'db Db, crates: Arc<HashSet<base_db::Crate>>) -> Semantics<'db> {
+    pub fn new_within(db: &'db Db, crates: Arc<HashSet<base_db::Crate, Global>>) -> Semantics<'db> {
         let mut imp = SemanticsImpl::new(db);
         imp.s2d_cache.get_mut().within = Some(crates);
         Semantics { db, imp, roots: RefCell::new(ROOTS.take()) }
@@ -248,7 +249,7 @@ impl<'db> Semantics<'db> {
         self.imp.adjust_edition(file_id)
     }
 
-    pub fn get_unsafe_ops(&self, def: ExpressionStoreOwner) -> HashSet<ExprOrPatSource> {
+    pub fn get_unsafe_ops(&self, def: ExpressionStoreOwner) -> HashSet<ExprOrPatSource, Global> {
         self.imp.get_unsafe_ops(def)
     }
 

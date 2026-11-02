@@ -19,8 +19,9 @@ use hegel::{TestCase, generators as gs};
 use parking_lot::Mutex;
 
 use super::{
-    AsId, Cancelled, Cause, Cycle, Database, DatabaseKeyIndex, Durability, Event, FromIdIn, Hook,
-    Id, Outcome, Provenance, ReadKind, Reads, Setter, Storage, attach, capture_reads,
+    AsId, Cancelled, Cause, Counts, Cycle, Database, DatabaseKeyIndex, Durability, Event,
+    Eviction, FromIdIn, Hook, Id, Outcome, Provenance, ReadKind, Reads, Setter, Storage, attach,
+    capture_reads,
     input::field_node,
     owner_is,
     plumbing::{
@@ -589,6 +590,52 @@ fn message(payload: &(dyn std::any::Any + Send)) -> String {
         .cloned()
         .or_else(|| payload.downcast_ref::<&str>().map(|it| (*it).to_owned()))
         .unwrap_or_default()
+}
+
+/// Rounds of [`Outer`] run so far; [`Settles`] reads its own and [`Outer`]'s provisional
+/// values in round 1 only (an inner head), and nothing from round 2 on.
+static OUTER_ROUNDS: AtomicU64 = AtomicU64::new(0);
+
+query!(
+    Outer,
+    u64,
+    |db, key| {
+        let round = OUTER_ROUNDS.fetch_add(1, Ordering::SeqCst) + 1;
+        let settled = *get::<Settles>(db, key);
+        assert!(round != 2, "the outer head fails in round 2");
+        settled + 1
+    };
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+query!(
+    Settles,
+    u64,
+    |db, key| {
+        if OUTER_ROUNDS.load(Ordering::SeqCst) >= 2 {
+            7
+        } else {
+            (*get::<Settles>(db, key)).max(*get::<Outer>(db, key))
+        }
+    };
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+
+#[test]
+fn a_head_a_later_round_made_final_outlives_its_cycle_unwinding() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 0, 0);
+    let payload = catch_unwind(AssertUnwindSafe(|| *get::<Outer>(&db, cell)))
+        .expect_err("the outer head fails in its second round");
+    assert!(message(&*payload).contains("round 2"), "{}", message(&*payload));
+    assert_eq!(db.runs("Settles"), 2, "an inner head of round 1, then final in round 2");
+    assert_eq!(*get::<Settles>(&db, cell), 7);
+    assert_eq!(db.runs("Settles"), 2, "its published value was kept, not emptied by the unwind");
 }
 
 #[test]
@@ -1192,50 +1239,126 @@ query!(
     const EVICT: bool = true;
 );
 query!(CountedReader, u64, |db, key| get::<CountedTens>(db, key) + 1);
+query!(
+    CountedCapped,
+    u64,
+    |db, key| key.a(db);
+    const CAP: usize = 2;
+    const EVICT: bool = true;
+);
 
-/// `(executed, verified, reran)` of the two counted queries since the last take; other tests
-/// count other queries, and only this one takes.
-fn counted(db: &TestDb) -> [(u64, u64, u64); 2] {
-    let mut found = [(0, 0, 0); 2];
-    db.storage().take_counts(|name, executed, verified, reran| {
+/// What the three counted queries did since the last take; other tests count other queries,
+/// and only this one takes.
+fn counted() -> [Counts; 3] {
+    let mut found = [Counts::default(); 3];
+    crate::db::take_counts(|name, counts| {
         let at = match name {
             "CountedTens" => 0,
             "CountedReader" => 1,
+            "CountedCapped" => 2,
             _ => return,
         };
-        found[at] = (executed, verified, reran);
+        found[at] = counts;
     });
     found
 }
 
-/// What observe's `reexecution_per_query_kind` reads: a run counts as executed, a row proved
-/// unchanged as verified, and only a second run of a row in one view (its value evicted and
-/// asked for again) as reran; a run in a later view is not one, nor is a hit anything.
+/// `(executed, verified, reran, evicted_asked)` of `counts`.
+fn did_runs(counts: Counts) -> (u64, u64, u64, u64) {
+    (counts.executed, counts.verified, counts.reran, counts.evicted_asked)
+}
+
+/// What the profile's `query_counts` table holds: a run counts as executed, a row proved
+/// unchanged as verified, only a second run of a row in one view (its value evicted and asked
+/// for again) as reran, and every run for an evicted value, in any view, as evicted-asked; a
+/// hit is nothing. A value an explicit `evict_values_of` let go counts as dropped, one a cap's
+/// sweep let go as evicted, and of those, one recency would have kept as refused.
 #[test]
-fn each_run_verify_and_rerun_in_one_view_is_counted_per_query() {
+fn each_run_verify_rerun_eviction_and_refused_admission_is_counted_per_query() {
     let mut db = TestDb::new();
     let cell = Cell::new(&db, 11, 0);
-    counted(&db);
+    counted();
     assert_eq!(*get::<CountedReader>(&db, cell), 2);
     assert_eq!(*get::<CountedReader>(&db, cell), 2);
-    assert_eq!(counted(&db), [(1, 0, 0), (1, 0, 0)], "a first run each, and a hit is nothing");
+    let [tens, reader, _] = counted().map(did_runs);
+    assert_eq!([tens, reader], [(1, 0, 0, 0), (1, 0, 0, 0)], "a first run each, a hit nothing");
 
     cell.set_a(&mut db, 12);
     assert_eq!(*get::<CountedReader>(&db, cell), 2);
-    assert_eq!(counted(&db), [(1, 0, 0), (0, 1, 0)], "tens ran equal: its reader is verified");
+    let [tens, reader, _] = counted().map(did_runs);
+    assert_eq!([tens, reader], [(1, 0, 0, 0), (0, 1, 0, 0)], "tens ran equal: reader verified");
 
     assert_eq!(evict_values_of::<CountedTens>(&mut db, &[cell]), 1);
     assert_eq!(*get::<CountedTens>(&db, cell), 1);
-    assert_eq!(counted(&db), [(1, 0, 1), (0, 0, 0)], "run again in the view it ran in");
+    let [tens, reader, _] = counted();
+    assert_eq!([did_runs(tens), did_runs(reader)], [(1, 0, 1, 1), (0, 0, 0, 0)], "run again in the view it ran in");
+    assert_eq!((tens.dropped, tens.evicted), (1, 0), "an explicit drop, not a sweep");
 
     cell.set_b(&mut db, 1);
     assert_eq!(evict_values_of::<CountedTens>(&mut db, &[cell]), 1);
     assert_eq!(*get::<CountedReader>(&db, cell), 2);
     assert_eq!(*get::<CountedTens>(&db, cell), 1);
-    let [(executed, verified, reran), reader] = counted(&db);
+    let [tens, reader, _] = counted().map(did_runs);
+    let (executed, verified, reran, evicted_asked) = tens;
     assert_eq!((executed, reran), (1, 0), "evicted in an earlier view: a run, not a rerun");
+    assert_eq!(evicted_asked, 1, "but a run for an evicted value all the same");
     assert_eq!(verified, 1, "proved unchanged before it ran for its value");
-    assert_eq!(reader, (0, 1, 0));
+    assert_eq!(reader, (0, 1, 0, 0));
+
+    scan::<CountedCapped>(&mut db);
+    let [_, _, capped] = counted();
+    assert_eq!(capped.evicted, 1, "three values under a cap of two: the sweep let one go");
+    assert_eq!(capped.refused, 1, "the scan's second value lost to the value asked for twice");
+    assert_eq!((capped.evicted_asked, capped.dropped), (0, 0));
+}
+
+/// Asks for one key of `F` (cap 2) in two views, then for two other keys in a third, and opens
+/// a fourth: its sweep is past the cap. The key asked for in two views is returned.
+fn scan<F: Function<Db = TestDb, Key = Cell, Value = u64>>(db: &mut TestDb) -> Cell {
+    let cells: Vec<Cell> = (0..3).map(|i| Cell::new(db, 40 + i, 0)).collect();
+    let hot = cells[0];
+    get::<F>(db, hot);
+    db.storage_mut().synthetic_write(Durability::LOW);
+    get::<F>(db, hot);
+    db.storage_mut().synthetic_write(Durability::LOW);
+    get::<F>(db, cells[1]);
+    get::<F>(db, cells[2]);
+    db.storage_mut().synthetic_write(Durability::LOW);
+    hot
+}
+
+query!(
+    ScanFrequency,
+    u64,
+    |db, key| key.a(db);
+    const CAP: usize = 2;
+    const EVICT: bool = true;
+);
+query!(
+    ScanRecency,
+    u64,
+    |db, key| key.a(db);
+    const CAP: usize = 2;
+    const EVICT: bool = true;
+);
+
+/// The win W-TinyLFU is for, tested by switching it off: a pass over more new keys than the
+/// cap keeps the value asked for in more views under [`Eviction::Frequency`], and under
+/// [`Eviction::Recency`] lets it go, so asking for it again runs it again.
+#[test]
+fn a_scan_past_the_cap_keeps_the_value_asked_for_in_more_views() {
+    let mut db = TestDb::new();
+    let hot = scan::<ScanFrequency>(&mut db);
+    assert_eq!(values_held(&db, "ScanFrequency"), 2);
+    assert_eq!(*get::<ScanFrequency>(&db, hot), 40);
+    assert_eq!(db.runs("ScanFrequency"), 3, "the hot value stayed: asking for it runs nothing");
+
+    let mut db = TestDb::new();
+    db.storage_mut().set_eviction(Eviction::Recency);
+    let hot = scan::<ScanRecency>(&mut db);
+    assert_eq!(values_held(&db, "ScanRecency"), 2);
+    assert_eq!(*get::<ScanRecency>(&db, hot), 40);
+    assert_eq!(db.runs("ScanRecency"), 4, "recency let the hot value go for the scan");
 }
 
 static HASHES: AtomicUsize = AtomicUsize::new(0);

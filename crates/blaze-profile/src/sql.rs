@@ -41,6 +41,9 @@ pub enum SqlError {
     NoDuckdb { path: PathBuf, why: String },
     Views(ViewError),
     Live(HistoryError),
+    /// A directory the views read lacks a table's schema file that could not be written
+    /// ([`history::ensure_schemas`]).
+    History(HistoryError),
     Io { path: PathBuf, doing: &'static str, error: io::Error },
     /// DuckDB refused the query: its own message, the query, and the script it ran (kept for
     /// reading).
@@ -72,6 +75,7 @@ impl fmt::Display for SqlError {
             ),
             SqlError::Views(error) => write!(f, "{error}"),
             SqlError::Live(error) => write!(f, "writing the recorder's last seconds for --live: {error}"),
+            SqlError::History(error) => write!(f, "{error}"),
             SqlError::Io { path, doing, error } => write!(f, "blaze debug sql: {doing} {}: {error}", path.display()),
             SqlError::Duckdb { message, sql, script } => write!(
                 f,
@@ -90,7 +94,7 @@ impl std::error::Error for SqlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             SqlError::Views(error) => Some(error),
-            SqlError::Live(error) => Some(error),
+            SqlError::Live(error) | SqlError::History(error) => Some(error),
             SqlError::Io { error, .. } => Some(error),
             _ => None,
         }
@@ -285,6 +289,11 @@ fn run_in(
         // alloc: an error
         Err(error) => return Err(no_duckdb(&format!("can't be read: {error}"))),
     }
+    // A view's glob that matches no file fails every query, so each directory gets the schema
+    // file of every table before a view opens over it.
+    for dir in dirs {
+        history::ensure_schemas(dir).map_err(SqlError::History)?;
+    }
     let answer = scratch.join("answer.parquet");
     let script_path = scratch.join("query.sql");
     let init = scratch.join("init.sql");
@@ -353,7 +362,7 @@ mod tests {
     use super::*;
     use crate::{
         flight,
-        history::{BuildRow, CAP_BYTES, History, Outcome},
+        history::{BuildRow, CAP_BYTES, History, HistoryError, Outcome},
         schema,
     };
 
@@ -406,6 +415,81 @@ mod tests {
         drop(stopper);
         assert!(ended_or_stopped(&mut child, &stop).unwrap().is_none());
         assert!(started.elapsed() < Duration::from_secs(5), "stopped after {:?}", started.elapsed());
+    }
+
+    /// A history as a blaze from before `events` and `query_counts` left it: every schema file
+    /// but theirs.
+    fn old_history(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("blaze-sql-{name}-{}", std::process::id()));
+        _ = fs::remove_dir_all(&dir);
+        drop(History::open(&dir, CAP_BYTES).unwrap());
+        for table in ["events", "query_counts"] {
+            fs::remove_file(dir.join(format!("schema.{table}.parquet"))).unwrap();
+        }
+        dir
+    }
+
+    /// A stand-in for DuckDB that runs nothing and answers nothing: a query that reaches it got
+    /// past the views' files.
+    #[cfg(unix)]
+    fn silent_duckdb(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = dir.join("duckdb");
+        fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        fake
+    }
+
+    /// The `blaze debug sql` path over a history written before a table existed writes that
+    /// table's schema file before a view opens, so the query reaches DuckDB instead of failing
+    /// on a glob that matches nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_query_over_a_history_older_than_a_table_writes_its_schema_file_first() {
+        let dir = old_history("old");
+        let fake = silent_duckdb(&dir);
+        let error = run(&Query { duckdb: &fake, history: &dir, sql: "SELECT count(*) FROM events" }).unwrap_err();
+        assert!(matches!(error, SqlError::Duckdb { .. }), "the query reached DuckDB: {error}");
+        for table in schema::TABLES {
+            assert!(dir.join(format!("schema.{}.parquet", table.name)).exists(), "{}", table.name);
+        }
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Where the missing schema files can't be written, the query is refused naming them and
+    /// the directory. A directory where the file's hidden name goes blocks the write as any
+    /// user, root too.
+    #[cfg(unix)]
+    #[test]
+    fn a_history_whose_missing_schema_files_cant_be_written_is_refused_naming_them() {
+        let dir = old_history("blocked");
+        fs::create_dir(dir.join(format!(".schema.events.parquet.{}.tmp", std::process::id()))).unwrap();
+        let fake = silent_duckdb(&dir);
+        let error = run(&Query { duckdb: &fake, history: &dir, sql: "SELECT 1" }).unwrap_err();
+        match &error {
+            SqlError::History(HistoryError::SchemasMissing { dir: named, tables, .. }) => {
+                assert_eq!(named, &dir);
+                assert_eq!(tables, &["events", "query_counts"]);
+            }
+            _ => panic!("{error}"),
+        }
+        let said = error.to_string();
+        assert!(said.contains("events, query_counts") && said.contains(&dir.display().to_string()), "{said}");
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Over a history older than `events` and `query_counts`, both views read as empty.
+    #[test]
+    #[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
+    fn duckdb_reads_a_table_newer_than_the_history_as_empty() {
+        let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+        let dir = old_history("newer");
+        for table in ["events", "query_counts"] {
+            let sql = format!("SELECT count(*) AS n FROM {table}");
+            let batches = run(&Query { duckdb: &duckdb, history: &dir, sql: &sql }).unwrap_or_else(|error| panic!("{table}: {error}"));
+            assert_eq!(batches[0].column(0).as_primitive::<arrow_array::types::Int64Type>().value(0), 0, "{table}");
+        }
+        _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

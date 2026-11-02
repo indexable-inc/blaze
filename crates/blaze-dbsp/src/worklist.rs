@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, hash::Hash};
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 
 /// A worklist with set semantics: `push` of a queued item is a no-op; `pop` is FIFO. An item
 /// popped may be pushed again. The ring and the set keep their buffers, so a warm worklist
@@ -8,7 +9,7 @@ use blaze_hash::HashSet;
 #[derive(Debug)]
 pub struct Worklist<T> {
     queue: VecDeque<T>,
-    queued: HashSet<T>,
+    queued: HashSet<T, Global>,
 }
 
 impl<T: Copy + Eq + Hash> Default for Worklist<T> {
@@ -19,7 +20,7 @@ impl<T: Copy + Eq + Hash> Default for Worklist<T> {
 
 impl<T: Copy + Eq + Hash> Worklist<T> {
     pub fn new() -> Self {
-        Worklist { queue: VecDeque::new(), queued: HashSet::default() }
+        Worklist { queue: VecDeque::new(), queued: HashSet::new_in(Global) }
     }
 
     /// Queues `t` unless it is queued; whether it was not.

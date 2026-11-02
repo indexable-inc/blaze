@@ -25,6 +25,7 @@ use std::ops::{Deref, DerefMut};
 
 use blaze_format::{FormatError, Slice, Str, Writer};
 use blaze_hash::{FixedState, HashMap};
+use std::alloc::Global;
 use cfg::{CfgAtom, CfgExpr};
 use hir_expand::{
     HirFileId, InFile, MacroCallId,
@@ -171,7 +172,7 @@ relocate! {
 #[derive(Default, Debug)]
 pub(crate) struct Relocation {
     entries: Vec<(Kind, u64)>,
-    indexes: HashMap<(Kind, u64), u32>,
+    indexes: HashMap<(Kind, u64), u32, Global>,
 }
 
 impl Relocation {
@@ -181,7 +182,7 @@ impl Relocation {
 
     /// The table of a buffer being read: entry `i` is the id index `i` names.
     pub(crate) fn of(entries: Vec<(Kind, u64)>) -> Relocation {
-        Relocation { entries, indexes: HashMap::default() }
+        Relocation { entries, indexes: HashMap::new_in(Global) }
     }
 
     /// The index of the id of `kind` whose bits are `bits`, added when it is new.
@@ -362,10 +363,10 @@ pub(crate) struct WordsBuffers {
     names: Vec<(u32, u32)>,
     /// The last name of each text's hash; earlier names of the same hash are chained in
     /// `same_hash`.
-    by_hash: HashMap<u64, u32>,
+    by_hash: HashMap<u64, u32, Global>,
     /// For each name, the name before it with the same hash, [`NO_NAME`] for none.
     same_hash: Vec<u32>,
-    by_symbol: HashMap<Symbol, u32>,
+    by_symbol: HashMap<Symbol, u32, Global>,
     /// What [`Words::place`] builds the name column in.
     placed: Vec<Str>,
 }

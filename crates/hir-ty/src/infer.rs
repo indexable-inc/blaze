@@ -25,6 +25,7 @@ pub mod cast;
 pub mod closure;
 mod coerce;
 pub mod columns;
+mod comptime;
 pub(crate) mod diagnostics;
 mod expr;
 mod fallback;
@@ -40,7 +41,7 @@ mod sized_bound;
 pub(crate) mod unify;
 
 use std::{
-    cell::{OnceCell, RefCell},
+    cell::RefCell,
     cmp,
     convert::identity,
     fmt,
@@ -56,7 +57,7 @@ use hir_def::{
     GenericDefId, GenericParamId, HasModule, ItemContainerId, LocalFieldId, Lookup, TraitId,
     TupleFieldId, TupleId, VariantId,
     attrs::AttrFlags,
-    expr_store::{Body, ExpressionStore, HygieneId, body::Param, path::Path},
+    expr_store::{Body, ComptimeForm, ExpressionStore, HygieneId, body::Param, path::Path},
     hir::{
         BinaryOp, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked, LabelId, PatId, UnaryOp,
     },
@@ -73,8 +74,9 @@ use macros::{TypeFoldable, TypeVisitable};
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::{
-    AliasTyKind, TypeFoldable, TypeVisitableExt,
+    AliasTyKind, TypeFoldable, TypeVisitableExt, UniverseIndex,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
+    reflect::ReflectedDomain,
 };
 use span::Edition;
 use thin_vec::ThinVec;
@@ -114,7 +116,7 @@ use crate::{
     next_solver::{
         AliasConstKind, AliasTy, AnonConstIdWrapper, Const, ConstKind, DbInterner, ErrorGuaranteed,
         GenericArgs, IsRigid, Region, RegionExt, StoredFnSig, StoredGenericArg, StoredGenericArgs,
-        StoredPredicate, StoredTy, StoredTys, Term, Ty, TyKind, Tys,
+        StoredClauses, StoredPredicate, StoredTy, StoredTys, Term, Ty, TyKind, Tys,
         abi::Safety,
         infer::{
             InferCtxt, ObligationInspector,
@@ -233,9 +235,11 @@ fn infer_anon_const_query<'db>(
 ) -> InferenceResult<'db> {
     blaze_mem::frame::current(|frame| {
         let loc = def.loc(db);
-        let _p = hir_def::span_names::of_anon_const(
+        let _p = hir_def::span_names::of_inner(
             db,
             loc.owner,
+            loc.expr,
+            hir_def::span_names::InnerBody::Const,
             tracing::info_span!(
                 "infer_anon_const_query",
                 krate = tracing::field::Empty,
@@ -449,6 +453,14 @@ pub enum InferenceDiagnostic {
     AsyncCoroutinesNotSupported {
         #[type_visitable(ignore)]
         expr: ExprId,
+    },
+    /// `for const` or `x.[f]` (`#![feature(blaze_comptime)]`), which the type checker does not
+    /// check yet: of the error type, its subexpressions inferred.
+    ComptimeNotYetSupported {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+        #[type_visitable(ignore)]
+        form: ComptimeForm,
     },
     NonExhaustiveRecordExpr {
         #[type_visitable(ignore)]
@@ -1331,6 +1343,11 @@ pub struct InferenceResult<'db> {
     /// generic arguments (`sym dep::<'a, T>`) are those it spells out.
     pub asm_sym_tys: SortedMap<(ExprId, u32), StoredTy>,
 
+    /// Each `for const` loop the body checks (`#![feature(blaze_comptime)]`): its binder and
+    /// what the body assumes of it. A loop that was not checked (a filtered domain, an error
+    /// in the iterable) has none.
+    pub(crate) comptime_loops: SortedMap<ExprId, ComptimeLoop>,
+
     /// The capture analysis of each closure, a side table.
     pub closures_data: SortedMap<ExprId, ClosureData>,
 
@@ -1373,6 +1390,7 @@ pub(crate) struct InferenceTables<'db, 'f> {
     coercion_casts: FrameIdxSet<'f, ExprId>,
     closures_without_expectation: FrameIdxSet<'f, ExprId>,
     asm_sym_tys: FrameMap<'f, (ExprId, u32), StoredTy>,
+    comptime_loops: FrameMap<'f, ExprId, ComptimeLoop>,
     closures_data: FrameMap<'f, ExprId, ClosureData>,
 }
 
@@ -1402,6 +1420,7 @@ impl<'db, 'f> InferenceTables<'db, 'f> {
             coercion_casts: FrameIdxSet::new_in(frame),
             closures_without_expectation: FrameIdxSet::new_in(frame),
             asm_sym_tys: frame_map(frame),
+            comptime_loops: frame_map(frame),
             closures_data: frame_map(frame),
         };
         // Every expression gets a type and most an adjustment list's slot, every pattern a
@@ -1526,6 +1545,7 @@ impl<'db, 'f> InferenceTables<'db, 'f> {
             coercion_casts,
             closures_without_expectation,
             asm_sym_tys,
+            comptime_loops,
             closures_data,
         } = self;
         InferenceResult {
@@ -1561,6 +1581,7 @@ impl<'db, 'f> InferenceTables<'db, 'f> {
             coercion_casts: coercion_casts.freeze(),
             closures_without_expectation: closures_without_expectation.freeze(),
             asm_sym_tys: SortedMap::from_entries_in(frame, asm_sym_tys),
+            comptime_loops: SortedMap::from_entries_in(frame, comptime_loops),
             closures_data: SortedMap::from_entries_in(frame, closures_data),
             defined_anon_consts,
         }
@@ -1585,6 +1606,36 @@ fn adjusted_ty<'a>(adjustments: Option<&[Adjustment]>, unadjusted: impl FnOnce()
     match adjustments.and_then(<[Adjustment]>::last) {
         Some(it) => it.target.as_ref(),
         None => unadjusted(),
+    }
+}
+
+/// A `for const` loop as inference checked it (`#![feature(blaze_comptime)]`,
+/// docs/v2/plan/design/comptime.md, "Type checking once"): its body once, with the binder a
+/// placeholder.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct ComptimeLoop {
+    /// `F`: the placeholder `!U_0`, in a universe `U` the body's inference created for this loop
+    /// alone, so no other loop of the body has it.
+    pub binder: StoredTy,
+    /// The iterable's type: `core::reflect::Fields<B, ()>` or `Variants<B>`.
+    pub domain: StoredTy,
+    /// `Fields` (`F: core::reflect::Field<B>`) or `Variants` (`F: Variant<B>`).
+    pub kind: ReflectedDomain,
+    /// `B`, the container the binder ranges over.
+    pub container: StoredTy,
+    /// What the body assumes of `F`, elaborated: `F: Field<B>` (`Variant<B>`), its host effect
+    /// `F: const Field<B>`, each field binder of the environment over `B` instantiated with `F`,
+    /// and their supertraits (`Copy`, `Sized`, `core::field::Field`).
+    pub assumptions: StoredClauses,
+}
+
+impl ComptimeLoop {
+    /// The universe of [`Self::binder`].
+    pub fn universe(&self) -> UniverseIndex {
+        match self.binder.as_ref().kind() {
+            TyKind::Placeholder(placeholder) => placeholder.universe,
+            _ => unreachable!("a `for const` binder that is no placeholder: {:?}", self.binder),
+        }
     }
 }
 
@@ -2020,9 +2071,43 @@ impl<'db> InferenceResult<'db> {
             coercion_casts: Default::default(),
             closures_without_expectation: Default::default(),
             asm_sym_tys: Default::default(),
+            comptime_loops: Default::default(),
             closures_data: Default::default(),
             defined_anon_consts: Default::default(),
         }
+    }
+
+    /// The `for const` loop `expr` as inference checked it, if it did.
+    pub fn comptime_loop(&self, expr: ExprId) -> Option<&ComptimeLoop> {
+        self.comptime_loops.get(&expr)
+    }
+
+    /// Every `for const` loop inference checked, by expression.
+    pub fn comptime_loops(&self) -> impl ExactSizeIterator<Item = (ExprId, &ComptimeLoop)> + '_ {
+        self.comptime_loops.iter().map(|(&expr, it)| (expr, it))
+    }
+
+    /// The largest universe of a `for const` binder of the body, `ROOT` when it has none: an
+    /// inference context that solves goals naming a binder first creates universes up to it.
+    pub fn comptime_max_universe(&self) -> UniverseIndex {
+        self.comptime_loops.values().map(ComptimeLoop::universe).max().unwrap_or(UniverseIndex::ROOT)
+    }
+
+    /// `env` with what every `for const` loop of the body assumes of its binder: the
+    /// environment its goals hold in. One serves the whole body, as each binder is a
+    /// placeholder of its own loop that no type outside the loop names. `env` itself when the
+    /// body has no loop.
+    pub fn comptime_param_env(
+        &self,
+        env: crate::next_solver::ParamEnv<'db>,
+    ) -> crate::next_solver::ParamEnv<'db> {
+        if self.comptime_loops.is_empty() {
+            return env;
+        }
+        let added = self.comptime_loops.values().flat_map(|it| it.assumptions.as_ref().iter());
+        crate::next_solver::ParamEnv::new(crate::next_solver::Clauses::new_from_iter(
+            env.clauses().iter().chain(added),
+        ))
     }
 
     pub fn method_resolution(&self, expr: ExprId) -> Option<(FunctionId, GenericArgs<'db>)> {
@@ -2284,11 +2369,11 @@ pub(crate) struct InferenceContext<'db, 'f> {
     /// Generally you should not resolve things via this resolver. Instead create a TyLoweringContext
     /// and resolve the path via its methods. This will ensure proper error reporting.
     pub(crate) resolver: Resolver<'db>,
-    target_features: OnceCell<(TargetFeatures<'db>, TargetFeatureIsSafeInTarget)>,
+    target_features: (TargetFeatures<'db>, TargetFeatureIsSafeInTarget),
     pub(crate) edition: Edition,
     allow_using_generic_params: bool,
-    generics: OnceCell<Generics<'db>>,
-    identity_args: OnceCell<GenericArgs<'db>>,
+    generics: Generics<'db>,
+    identity_args: GenericArgs<'db>,
     pub(crate) table: unify::InferenceTable<'db>,
     pub(crate) lang_items: &'db LangItems,
     pub(crate) features: &'db UnstableFeatures,
@@ -2420,11 +2505,23 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let trait_env = db.trait_environment(generic_def);
         let table = unify::InferenceTable::new(db, trait_env, resolver.krate(), owner);
         let types = crate::next_solver::default_types();
+        let target_features = match store_owner {
+            ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(id)) => {
+                TargetFeatures::from_fn(db, id)
+            }
+            _ => TargetFeatures::default(),
+        };
+        let target_feature_is_safe = match &resolver.krate().workspace_data(db).target {
+            Ok(target) => crate::utils::target_feature_is_safe_in_target(target),
+            Err(_) => TargetFeatureIsSafeInTarget::No,
+        };
+        let generics = crate::generics::generics(db, generic_def);
+        let identity_args = GenericArgs::identity_for_item(table.interner(), generic_def.into());
         InferenceContext {
             result: InferenceTables::new(types.types.error, store, frame),
             return_ty: types.types.error, // set in collect_* calls
             types,
-            target_features: OnceCell::new(),
+            target_features: (target_features, target_feature_is_safe),
             lang_items: table.interner().lang_items(),
             features: resolver.top_level_def_map().features(),
             edition: resolver.krate().data(db).edition,
@@ -2438,8 +2535,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             store_owner,
             generic_def,
             allow_using_generic_params,
-            generics: OnceCell::new(),
-            identity_args: OnceCell::new(),
+            generics,
+            identity_args,
             store,
             resolver,
             diverges: Diverges::Maybe,
@@ -2485,6 +2582,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             coercion_casts,
             closures_without_expectation,
             asm_sym_tys,
+            comptime_loops,
             closures_data,
         } = &mut self.result;
         merge_index(method_resolutions, other.method_resolutions.iter());
@@ -2530,6 +2628,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         coercion_casts.extend(other.coercion_casts.iter());
         closures_without_expectation.extend(other.closures_without_expectation.iter());
         merge_map(asm_sym_tys, other.asm_sym_tys.iter());
+        merge_map(comptime_loops, other.comptime_loops.iter());
         merge_map(closures_data, other.closures_data.iter());
         for node in other.nodes_with_type_mismatches.iter() {
             nodes_with_type_mismatches.insert(node);
@@ -2588,19 +2687,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     }
 
     fn target_features(&self) -> (&TargetFeatures<'db>, TargetFeatureIsSafeInTarget) {
-        let (target_features, target_feature_is_safe) = self.target_features.get_or_init(|| {
-            let target_features = match self.store_owner {
-                ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(id)) => {
-                    TargetFeatures::from_fn(self.db, id)
-                }
-                _ => TargetFeatures::default(),
-            };
-            let target_feature_is_safe = match &self.krate().workspace_data(self.db).target {
-                Ok(target) => crate::utils::target_feature_is_safe_in_target(target),
-                Err(_) => TargetFeatureIsSafeInTarget::No,
-            };
-            (target_features, target_feature_is_safe)
-        });
+        let (target_features, target_feature_is_safe) = &self.target_features;
         (target_features, *target_feature_is_safe)
     }
 
@@ -2692,13 +2779,19 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             coercion_casts: _,
             closures_without_expectation: _,
             asm_sym_tys,
+            comptime_loops,
             nodes_with_type_mismatches,
         } = &mut result;
 
         let mut defined_anon_consts = defined_anon_consts.into_inner();
 
-        let mut resolver =
-            WriteBackCtxt::new(table, diagnostics, vars_emitted_type_must_be_known_for, frame);
+        let mut resolver = WriteBackCtxt::new(
+            table,
+            diagnostics,
+            vars_emitted_type_must_be_known_for,
+            frame,
+            !closures_data.is_empty(),
+        );
 
         for ty in type_of_expr.values_mut() {
             resolver.resolve_completely(ty);
@@ -2723,6 +2816,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
         for ty in asm_sym_tys.values_mut() {
             resolver.resolve_completely(ty);
+        }
+        for comptime_loop in comptime_loops.values_mut() {
+            let ComptimeLoop { binder: _, domain, kind: _, container, assumptions } = comptime_loop;
+            resolver.resolve_completely(domain);
+            resolver.resolve_completely(container);
+            resolver.resolve_completely_without_normalizing(assumptions);
         }
 
         if !nodes_with_type_mismatches.is_empty() {
@@ -3064,13 +3163,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     }
 
     fn generics(&self) -> &Generics<'db> {
-        self.generics.get_or_init(|| crate::generics::generics(self.db, self.generic_def))
+        &self.generics
     }
 
     fn identity_args(&self) -> GenericArgs<'db> {
-        *self.identity_args.get_or_init(|| {
-            GenericArgs::identity_for_item(self.interner(), self.generic_def.into())
-        })
+        self.identity_args
     }
 
     pub(crate) fn create_anon_const(&mut self, expr: ExprId, expected_ty: Ty<'db>) -> Const<'db> {

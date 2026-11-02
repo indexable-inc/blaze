@@ -488,6 +488,46 @@ pub trait Interner:
 
     fn as_adt_lang_item(self, def_id: Self::AdtId) -> Option<SolverAdtLangItem>;
 
+    /// blaze: compile-time reflection (`#![feature(blaze_comptime)]`, [`crate::reflect`]).
+    /// The members `domain` ranges over in the rigid ADT or tuple `container`, in declaration
+    /// order: field representing types (`Fields`) or variant representing types (`Variants`).
+    /// Empty when `container` has none to reflection: not a `core::reflect::Struct` for
+    /// `Fields`, not an enum for `Variants`.
+    fn reflect_members(
+        self,
+        container: Self::Ty,
+        domain: crate::reflect::ReflectedDomain,
+    ) -> Self::Tys;
+
+    /// blaze: the container `member` is a member of in `domain` ([`Self::reflect_members`]),
+    /// as `F: Field<C>` and `V: Variant<C>` ask.
+    fn reflect_container_of(
+        self,
+        member: Self::Ty,
+        domain: crate::reflect::ReflectedDomain,
+    ) -> crate::reflect::ReflectContainer<Self>;
+
+    /// blaze: whether the ADT type `ty` is `core::reflect::Struct` (a struct whose every field
+    /// is `pub` or one written `#[blaze::reflect]`, not `repr(packed)`; a variant view of an
+    /// existing variant); `None` while an inference variable decides it. Tuples are the
+    /// solver's.
+    fn reflect_is_struct(self, ty: Self::Ty) -> Option<bool>;
+
+    /// blaze: `<V as core::reflect::Variant<E>>::View` of the variant representing type `V` of
+    /// an existing variant `v`: `VariantOf<E, v>`. `None` for any other type.
+    fn reflect_variant_view(self, member: Self::Ty) -> Option<Self::Ty>;
+
+    /// blaze: whether `ty` is an enum (`core::reflect::Enum`).
+    fn reflect_is_enum(self, ty: Self::Ty) -> bool;
+
+    /// blaze: `env` with `clauses` added, for a member of a field binder entering the
+    /// environment (`rustc_next_trait_solver`'s `env_with_reflected_member`).
+    fn param_env_with_clauses(
+        self,
+        env: Self::ParamEnv,
+        clauses: impl IntoIterator<Item = Self::Clause>,
+    ) -> Self::ParamEnv;
+
     fn associated_type_def_ids(
         self,
         def_id: Self::TraitId,

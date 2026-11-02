@@ -22,6 +22,7 @@ use base_db::{Crate, Db};
 use base_db::{FileId, VfsPath};
 use blaze_format::cursor::{Put, Reader};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use cfg::{CfgAtom, CfgExpr};
 use either::Either;
 use hir_expand::{
@@ -77,7 +78,7 @@ type R<T = ()> = Result<T, String>;
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 15";
+pub const ENCODING: &str = "blaze frozen def map 16";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,11 +102,11 @@ pub struct Frozen {
 #[blaze_query::input(singleton, debug)]
 pub struct FrozenDefMaps {
     #[returns(ref)]
-    pub maps: Arc<HashMap<Crate, Frozen>>,
+    pub maps: Arc<HashMap<Crate, Frozen, Global>>,
 }
 
 /// Has name resolution use `maps`.
-pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen>) {
+pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
     use blaze_query::db::{Durability, Setter};
     // alloc: Check/Verify only, which record differences; never when serving
     let maps = Arc::new(maps);
@@ -273,11 +274,11 @@ pub fn unreadable(db: &Db, krate: Crate, bytes: &[u8]) -> Option<String> {
 #[blaze_query::input(singleton, debug)]
 pub struct FrozenLangItems {
     #[returns(ref)]
-    pub maps: Arc<HashMap<Crate, Frozen>>,
+    pub maps: Arc<HashMap<Crate, Frozen, Global>>,
 }
 
 /// Has finding the lang items of a crate use `maps`.
-pub fn set_lang_items(db: &mut Db, maps: HashMap<Crate, Frozen>) {
+pub fn set_lang_items(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
     use blaze_query::db::{Durability, Setter};
     // alloc: once per load of the frozen bytes
     let maps = Arc::new(maps);
@@ -365,7 +366,7 @@ fn closure(db: &Db, krate: Crate) -> Vec<Crate> {
     // alloc: encoding, once per crate per image write (not on a build's path)
     let mut order = vec![krate];
     // alloc: encoding, once per crate per image write (not on a build's path)
-    let mut seen: HashSet<Crate> = order.iter().copied().collect();
+    let mut seen: HashSet<Crate, Global> = order.iter().copied().collect();
     let mut at = 0;
     while let Some(&next) = order.get(at) {
         at += 1;
@@ -480,24 +481,24 @@ pub struct Enc<'a> {
     /// Writing a fingerprint: macro calls and syntax contexts are written as hashes of what
     /// they are, and nothing is named by an index.
     fingerprinting: bool,
-    crates: HashMap<Crate, u32>,
+    crates: HashMap<Crate, u32, Global>,
     closure: Vec<Crate>,
-    dirs: HashMap<u32, String>,
+    dirs: HashMap<u32, String, Global>,
     /// The crates of the closure whose root is in each source root, in the closure's order.
-    owners: HashMap<base_db::SourceRootId, Vec<u32>>,
+    owners: HashMap<base_db::SourceRootId, Vec<u32>, Global>,
     /// Each file: the crate it is named from and its path from that crate's root.
-    file_names: HashMap<FileId, (u32, String)>,
-    files: HashMap<FileId, u32>,
+    file_names: HashMap<FileId, (u32, String), Global>,
+    files: HashMap<FileId, u32, Global>,
     /// The files named, in the order of their index.
     file_order: Vec<FileId>,
-    calls: HashMap<MacroCallId, u32>,
-    contexts: HashMap<SyntaxContext, u32>,
-    call_hashes: HashMap<MacroCallId, u128>,
-    context_hashes: HashMap<SyntaxContext, u128>,
-    modules: HashMap<ModuleId, (u32, u32)>,
-    indexed: HashSet<Crate>,
+    calls: HashMap<MacroCallId, u32, Global>,
+    contexts: HashMap<SyntaxContext, u32, Global>,
+    call_hashes: HashMap<MacroCallId, u128, Global>,
+    context_hashes: HashMap<SyntaxContext, u128, Global>,
+    modules: HashMap<ModuleId, (u32, u32), Global>,
+    indexed: HashSet<Crate, Global>,
     /// The body each block that was looked for is in.
-    block_owners: HashMap<BlockId, DefWithBodyId>,
+    block_owners: HashMap<BlockId, DefWithBodyId, Global>,
     out_dirs: Vec<(u32, String)>,
 }
 
@@ -548,19 +549,19 @@ impl<'a> Enc<'a> {
             fingerprinting: false,
             crates,
             closure,
-            dirs: HashMap::default(),
-            owners: HashMap::default(),
-            file_names: HashMap::default(),
-            files: HashMap::default(),
+            dirs: HashMap::new_in(Global),
+            owners: HashMap::new_in(Global),
+            file_names: HashMap::new_in(Global),
+            files: HashMap::new_in(Global),
             // alloc: encoding, once per crate per image write (not on a build's path)
             file_order: Vec::new(),
-            calls: HashMap::default(),
-            contexts: HashMap::default(),
-            call_hashes: HashMap::default(),
-            context_hashes: HashMap::default(),
-            modules: HashMap::default(),
-            indexed: HashSet::default(),
-            block_owners: HashMap::default(),
+            calls: HashMap::new_in(Global),
+            contexts: HashMap::new_in(Global),
+            call_hashes: HashMap::new_in(Global),
+            context_hashes: HashMap::new_in(Global),
+            modules: HashMap::new_in(Global),
+            indexed: HashSet::new_in(Global),
+            block_owners: HashMap::new_in(Global),
             out_dirs,
         }
     }
@@ -1366,8 +1367,7 @@ impl Enc<'_> {
             }
             ModuleDefId::BuiltinType(it) => {
                 self.u8(8);
-                let all = BuiltinType::all_builtin_types();
-                self.u32(all.iter().position(|(_, x)| *x == it).unwrap() as u32);
+                self.u32(it.code());
                 Ok(())
             }
             ModuleDefId::MacroId(it) => {
@@ -1951,6 +1951,7 @@ impl Enc<'_> {
             no_core,
             no_std,
             proc_macro,
+            arbitrary_ints,
             edition,
             recursion_limit,
         } = &**data;
@@ -1963,6 +1964,7 @@ impl Enc<'_> {
         self.bool(*rustc_coherence_is_core);
         self.bool(*no_core);
         self.bool(*no_std);
+        self.bool(*arbitrary_ints);
         self.option(*recursion_limit, |enc, it| {
             enc.u32(it);
             Ok(())
@@ -1986,7 +1988,7 @@ impl Enc<'_> {
             return Err("a def map whose root is not its first module".to_owned());
         }
         self.usize(table.len())?;
-        let index: HashMap<ModuleId, u32> =
+        let index: HashMap<ModuleId, u32, Global> =
             // alloc: encoding, once per crate per image write (not on a build's path)
             table.keys().enumerate().map(|(i, &it)| (it, i as u32)).collect();
         for (id, data) in table.iter() {
@@ -2162,7 +2164,7 @@ pub struct Dec<'a> {
     closure: Vec<Crate>,
     /// The files of each crate of the closure by their path from its root, read when first
     /// needed.
-    paths: HashMap<u32, (String, bool, base_db::SourceRootId)>,
+    paths: HashMap<u32, (String, bool, base_db::SourceRootId), Global>,
     files: Vec<FileId>,
     calls: Vec<MacroCallId>,
     contexts: Vec<SyntaxContext>,
@@ -2170,7 +2172,7 @@ pub struct Dec<'a> {
     own: Vec<ModuleId>,
     /// Reading the crate's own `DefMap`, whose modules are `own`.
     in_def_map: bool,
-    modules: HashMap<u32, Vec<ModuleId>>,
+    modules: HashMap<u32, Vec<ModuleId>, Global>,
 }
 
 impl<'a> Dec<'a> {
@@ -2180,7 +2182,7 @@ impl<'a> Dec<'a> {
             r: Reader::new(bytes),
             krate,
             closure: closure(db, krate),
-            paths: HashMap::default(),
+            paths: HashMap::new_in(Global),
             // alloc: the decoded map's own storage, once per crate served
             files: Vec::new(),
             // alloc: the decoded map's own storage, once per crate served
@@ -2190,7 +2192,7 @@ impl<'a> Dec<'a> {
             // alloc: the decoded map's own storage, once per crate served
             own: Vec::new(),
             in_def_map: false,
-            modules: HashMap::default(),
+            modules: HashMap::new_in(Global),
         }
     }
 
@@ -2807,9 +2809,9 @@ impl Dec<'_> {
                 TypeAliasLoc { container: self.container()?, id: self.ast_id()? }.intern(db),
             ),
             8 => {
-                let index = self.len()?;
-                let all = BuiltinType::all_builtin_types();
-                ModuleDefId::BuiltinType(all.get(index).ok_or("a builtin type")?.1)
+                let code = self.len()?;
+                let code = u32::try_from(code).map_err(|_| "a builtin type's code")?;
+                ModuleDefId::BuiltinType(BuiltinType::from_code(code).ok_or("a builtin type")?)
             }
             9 => ModuleDefId::MacroId(self.macro_id()?),
             // alloc: error path
@@ -3309,6 +3311,7 @@ impl Dec<'_> {
         data.rustc_coherence_is_core = self.bool()?;
         data.no_core = self.bool()?;
         data.no_std = self.bool()?;
+        data.arbitrary_ints = self.bool()?;
         data.recursion_limit = self.option(Self::u32)?;
         data.registered_tools = self.many(Self::symbol)?;
         let mut features = UnstableFeatures::default();
@@ -3627,7 +3630,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
         let krate = crate_named(db, name);
         let def_map = super::super::crate_def_map(db, krate);
         let table = def_map.table(db);
-        let modules: HashMap<ModuleId, (u32, u32)> =
+        let modules: HashMap<ModuleId, (u32, u32), Global> =
             table.keys().enumerate().map(|(index, &it)| (it, (0, index as u32))).collect();
         (table.iter())
             .map(|(_, module)| {

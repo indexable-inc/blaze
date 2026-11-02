@@ -19,6 +19,7 @@ doctest = false
 reference = []
 
 [dependencies]
+blaze-serde.workspace = true
 serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]

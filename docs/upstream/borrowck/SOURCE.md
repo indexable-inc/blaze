@@ -76,15 +76,17 @@ Source: `https://raw.githubusercontent.com/rust-lang/polonius/main/<path>`, `mai
 | `pinned-polonius-flag.md` | `https://raw.githubusercontent.com/rust-lang/rust/a30aa9064df6a504b6a323c6884a2f4cfbfff666/<path>` for `compiler/rustc_session/src/config.rs`, `compiler/rustc_session/src/options.rs`, `src/bootstrap/src/core/build_steps/compile.rs`, `src/tools/compiletest/src/common.rs`, `src/tools/compiletest/src/runtest.rs`, `src/ci/docker/scripts/x86_64-gnu-next-trait-solver-polonius.sh`; plus `rustc +nightly-2026-10-09 -Z help` run locally | **excerpts** with line numbers |
 | `github-items.md` | GitHub REST API `https://api.github.com/repos/<repo>/issues/<n>` and `/pulls/<n>` for rust-lang/rust #159343, #160456, #160588, #153215, #161038, #161471, #164337, #164420, #164421, #161909, #143093, #150551; rust-lang/compiler-team #1015; rust-lang/rust-analyzer #23043 | item metadata (state, dates, labels) plus bodies, some truncated where marked; comments not included |
 | `ui-polonius-revisions-table.md` | derived by a script from `tests/ui` of the sparse checkout of rust-lang/rust at the pinned commit (`/tmp/rust-bck`) | **derived**, not fetched: per-revision verdicts of the 46 tests with a polonius revision; method in the file header |
-| `tests-ui/*.rs`, `tests-ui/*.stderr` | `tests/ui/<path>` at the pinned commit (same sparse checkout; identical to `https://raw.githubusercontent.com/rust-lang/rust/a30aa9064df6a504b6a323c6884a2f4cfbfff666/tests/ui/<path>`) | verbatim; `<path>` is the file name with `_` read back as `/` (first component `nll` or `borrowck`) |
+| `tests-ui/*.rs`, `tests-ui/*.stderr` | `tests/ui/<path>` at the pinned commit (same sparse checkout; identical to `https://raw.githubusercontent.com/rust-lang/rust/a30aa9064df6a504b6a323c6884a2f4cfbfff666/tests/ui/<path>`) | verbatim; `<path>` is the table's path for the file name (below) |
 
-The `tests-ui/` files: `nll/polonius/nll-problem-case-3-issue-21906.rs` (+ its `.nll.stderr`),
-`nll/polonius/nll-problem-case-2-issue-92038.rs`, `nll/polonius/filtering-lending-iterator-issue-92985.rs`,
-`nll/polonius/iterating-updating-mutref.rs`, `nll/polonius/location-insensitive-constraints-issue-70044.rs`,
-`nll/polonius/nll-legacy-unnecessary-error.rs`, `nll/polonius/iterating-updating-cursor-issue-57165.rs`
-(+ its `.polonius.stderr`), `nll/polonius/flow-sensitive-invariance.rs`, `nll/issue-46589.rs`,
-`nll/polonius/lending-iterator-sanity-checks.rs`, `nll/polonius/opaque-multiple-defining-uses-160669.rs`,
-`borrowck/alias-liveness/rpit-hide-lifetime-for-swap.rs`.
+The `tests-ui/` `.rs` files are all 46 tests `ui-polonius-revisions-table.md` lists, named by
+the table's path with `tests/ui/` dropped and `/` turned into `_` (read a name back through the
+table, since upstream names have `_` of their own). The first 14 came from the sparse checkout on
+2026-10-20; the other 32 were fetched on **2026-11-02** from
+`https://raw.githubusercontent.com/rust-lang/rust/a30aa9064df6a504b6a323c6884a2f4cfbfff666/tests/ui/<path>`
+for the borrowck-cursor lane (`harness/v2/frontend/borrowck_flow.py` runs them); the 14 already
+here were fetched again then and are byte for byte the same. The two `.stderr` files are
+`nll/polonius/nll-problem-case-3-issue-21906.nll.stderr` and
+`nll/polonius/iterating-updating-cursor-issue-57165.polonius.stderr`.
 
 ## rust-analyzer/ (the borrowck rust-analyzer removed)
 

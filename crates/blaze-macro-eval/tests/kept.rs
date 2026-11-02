@@ -1,12 +1,14 @@
-//! blaze-macro-eval's expansions kept and found again: with keeping installed, a build of the
+//! blaze-macro-eval's expansions kept and found again: with a store to keep in, a build of the
 //! fixture workspace keeps what each stateless macro made; a second build finds every one of
 //! them without running it and gives the same output; a call whose variable or file changed
-//! finds nothing of the first and runs again.
+//! finds nothing of the first and runs again. A value verified across checkouts is given to
+//! the warm database until the record that retracts it is published, which moves the epoch a
+//! kept front end is lowered into at, and the call then expands again.
 //!
 //! It runs on `scratch` of `BLAZE_MACRO_CORPUS` (`corpus/config.rs`), a copy of the workspace
-//! built as the first, whose `calls/data.txt` it changes and puts back. Keeping is installed
-//! once per process and the store's verdicts are global, so it is one test in a process of
-//! its own.
+//! built as the first, whose `calls/data.txt` it changes and puts back. Its builds share one
+//! `Macros`, as a daemon's do; it changes a file of the scratch workspace, so it is one test in
+//! a process of its own.
 
 #[allow(dead_code, reason = "shared with tests/corpus.rs, which uses other parts of it")]
 #[path = "corpus/config.rs"]
@@ -27,7 +29,8 @@ use std::{
 };
 
 use blaze_core::sim::{Faults, Sim};
-use proc_macro_api::kept::{self, Environment, Expansions, Put};
+use blaze_usercode::{index, roots::verify};
+use proc_macro_api::kept::{self, Environment, Expansions, Keep, Put};
 use hir_def::nameres::crate_def_map;
 use hir_expand::proc_macro::{ProcMacroCall, ProcMacroExpander};
 
@@ -55,8 +58,14 @@ type Loaded = Vec<(String, String, Arc<dyn ProcMacroExpander>)>;
 
 /// The workspace at `dir` lowered, every macro blaze-macro-eval's recording into `records`,
 /// and `corpus-calls`' def map made.
-fn build(config: &Corpus, dir: &str, records: &Records, loaded: &mut Loaded) -> load::Workspace {
-    let workspace = load::lower(dir, &config.cargo_home, |krate, macros| {
+fn build(
+    config: &Corpus,
+    dir: &str,
+    keeping: &Arc<blaze_macro_eval::Macros>,
+    records: &Records,
+    loaded: &mut Loaded,
+) -> load::Workspace {
+    let workspace = load::lower(dir, &config.cargo_home, config.homes(), keeping, |krate, macros| {
         Ok(macros
             .into_iter()
             .map(|eval| {
@@ -96,11 +105,36 @@ fn the_call<'a>(records: &'a [Record], name: &str, subject: &str) -> &'a Record 
 }
 
 fn expander<'a>(loaded: &'a Loaded, name: &str) -> &'a Arc<dyn ProcMacroExpander> {
-    let found: Vec<_> = loaded.iter().filter(|(krate, it, _)| krate == "corpus_macros" && it == name).collect();
+    expander_of(loaded, "corpus_macros", name)
+}
+
+/// The expander of macro `name` of crate `of`, as loaded.
+fn expander_of<'a>(loaded: &'a Loaded, of: &str, name: &str) -> &'a Arc<dyn ProcMacroExpander> {
+    let found: Vec<_> = loaded.iter().filter(|(krate, it, _)| krate == of && it == name).collect();
     match found.as_slice() {
         [(_, _, expander)] => expander,
-        _ => panic!("`corpus_macros` has {} macros named `{name}`", found.len()),
+        _ => panic!("`{of}` has {} macros named `{name}`", found.len()),
     }
+}
+
+/// What a checkout's copy of a value is kept as starting with (`verify::copy_of`): not an
+/// expansion, so never made a verified value here.
+const COPY: &[u8] = b"blaze v2 a checkout's copy 2\0";
+
+/// `puts`, each expansion of `Serialize` kept as a value verified across checkouts, as one is
+/// once a second checkout expanded it the same (`verify::keeps`): the runs and the keys of
+/// their unmarked results, which a record would retract them by.
+fn verified(puts: &mut [Put]) -> Vec<(blaze_usercode::RunKey, blaze_cas::Key)> {
+    let named = "the proc macro `Serialize` of ";
+    let mut verified = Vec::new();
+    for put in puts.iter_mut().filter(|it| it.what.starts_with(named) && !it.value.starts_with(COPY)) {
+        let Keep::Run { run, traced } = &put.keep else { continue };
+        // Any key stands for the unmarked result: it is what the record is found by.
+        let unmarked = index::result_key(run, traced);
+        put.value = index::verified_value(&unmarked, &put.value);
+        verified.push((*run, unmarked));
+    }
+    verified
 }
 
 /// The file `path` with `text` written over it, put back as it was when dropped.
@@ -136,13 +170,14 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     let toolchain = load::toolchain().unwrap_or_else(|why| panic!("{why}"));
     let mut sim = Sim::new(5, Faults::default());
     let mut store = kept_in(&mut sim);
-    kept::install(Expansions { store: store.reader(), toolchain, environment: Arc::new(Environment::default()) })
+    let keeping = kept::Keeping::new(Expansions { store: store.reader(), toolchain, environment: Arc::new(Environment::default()) })
         .unwrap_or_else(|why| panic!("{why}"));
+    let macros = blaze_macro_eval::Macros::new(kept::Keeps::In(keeping));
 
     // A first build runs every macro and keeps what each stateless one made.
     let records = Records::default();
     let mut loaded = Loaded::new();
-    let first = build(&config, &dir, &records, &mut loaded);
+    let first = build(&config, &dir, &macros, &records, &mut loaded);
     let firstly = taken(&records);
     let mut puts = kept::take_puts();
     for name in [
@@ -170,16 +205,18 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     assert_eq!(verdict(&puts, "corpus_state"), [b"stateful".to_vec()], "`counter` was seen to keep state: {:?}", whats(&puts));
     // The verdicts of the crates that kept no state are left with the puts of the thread that
     // calls `flush`, as the daemon's loop does, and published with the build's.
-    blaze_macro_eval::flush();
+    macros.flush();
     puts.extend(kept::take_puts());
     assert_eq!(verdict(&puts, "corpus_macros"), [b"stateless".to_vec()], "{:?}", whats(&puts));
-    let published = kept::publish(&mut store, puts);
+    let verified = verified(&mut puts);
+    assert!(!verified.is_empty(), "the first build keeps `Serialize`: {:?}", whats(&puts));
+    let published = macros.keeps().publish(&mut store, puts);
     assert!(published.refused.is_empty(), "{:?}", published.refused);
     drop(first);
     loaded.clear();
 
     // A second build finds each, runs none of them, and gives what the first did.
-    let second = build(&config, &dir, &records, &mut loaded);
+    let second = build(&config, &dir, &macros, &records, &mut loaded);
     let secondly = taken(&records);
     let puts = kept::take_puts();
     assert!(puts.is_empty(), "the second build ran what the first kept: {:?}", whats(&puts));
@@ -222,4 +259,31 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     assert!(said.iter().any(|it| it.contains("changed after the first build")), "`include_data!` read the old file: {said:?}");
     assert_eq!(puts_of(&puts, "include_data").len(), 1, "with its file changed it ran: {:?}", whats(&puts));
     drop(changed);
+
+    // M1 (round 8): the warm database was given `Serialize` verified across checkouts. Once
+    // the record that retracts it is published, the epoch a kept front end is lowered into at
+    // moves (what `blaze-cargo`'s `unit.rs` compares before it reuses a front end), and the
+    // call looks it up again, finds it retracted, and expands.
+    let serialize = (secondly.iter())
+        .find(|it| &*it.call.name == "Serialize" && it.call.calling == Some(calls))
+        .unwrap_or_else(|| panic!("`corpus-calls` calls no `Serialize`"));
+    let again = |call: ProcMacroCall<'_>| {
+        let output = expander_of(&loaded, &serialize.call.krate, "Serialize").expand_in(db, calls, call);
+        output.unwrap_or_else(|error| panic!("`Serialize` again: {error:?}"));
+        kept::take_puts()
+    };
+    let puts = again(serialize.call.call());
+    assert!(puts.is_empty(), "verified and not retracted, it is found: {:?}", whats(&puts));
+    let at = macros.keeps().retractions_now();
+    let keeping = macros.keeps().keeping().unwrap_or_else(|not| panic!("{not}"));
+    for (run, unmarked) in &verified {
+        keeping.put(Put::of(verify::retraction(run, unmarked), "the record of `Serialize`".to_owned()));
+    }
+    assert_eq!(macros.keeps().retractions_now(), at, "put, not published: nothing is retracted yet");
+    let published = macros.keeps().publish(&mut store, Vec::new());
+    assert!(published.refused.is_empty(), "{:?}", published.refused);
+    assert!(!published.durable.is_empty(), "a record is durable before its job is done");
+    assert_ne!(macros.keeps().retractions_now(), at, "retracted: a front end kept at the old epoch is lowered afresh");
+    let puts = again(serialize.call.call());
+    assert!(!puts_of(&puts, "Serialize").is_empty(), "retracted, it expanded again: {:?}", whats(&puts));
 }

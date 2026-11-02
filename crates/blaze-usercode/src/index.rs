@@ -172,6 +172,51 @@ pub fn result_key(run: &RunKey, traced: &Traced) -> Key {
     Key(run.traced(traced))
 }
 
+/// The run that the record that `result`, a value under `run`'s key, depends on where the
+/// run's roots are is kept under ([`crate::roots::verify`]): with nothing read, so it is found
+/// by [`depends_key`] alone.
+pub fn depends(run: &RunKey, result: &Key) -> RunKey {
+    RunKey { code: run.code, given: Hasher::new("blaze v2 run depends on its roots 1").id(&run.given).id(&result.0).finish() }
+}
+
+/// The store's key of [`depends`]'s record, which [`find`] asks of every verified value it
+/// finds ([`verified_value`]).
+pub fn depends_key(run: &RunKey, result: &Key) -> Key {
+    result_key(&depends(run, result), &Traced::default())
+}
+
+/// What a value verified across checkouts ([`crate::roots::verify`]) is kept as starting with:
+/// then the key of its unmarked result (what [`depends`] is of), then the value. No value a run
+/// gives starts with it: a run's value starts with its own magic, an expansion's with its tree.
+const VERIFIED: &[u8] = b"blaze v2 verified across checkouts 1\0";
+
+/// `value` as it is kept verified across checkouts, `unmarked` being the key of its result
+/// under its unmarked trace: [`find`] asks [`depends_key`] of it before giving it, and gives
+/// `value` alone.
+pub fn verified_value(unmarked: &Key, value: &[u8]) -> Vec<u8> {
+    // alloc: once per value verified, the bytes the store keeps
+    let mut out = Vec::with_capacity(VERIFIED.len() + 32 + value.len());
+    out.extend_from_slice(VERIFIED);
+    out.extend_from_slice(&unmarked.0.0);
+    out.extend_from_slice(value);
+    out
+}
+
+/// The unmarked result's key and the value, when `bytes` are a value kept verified
+/// ([`verified_value`]).
+pub fn split_verified(bytes: &[u8]) -> Option<(Key, &[u8])> {
+    let rest = bytes.strip_prefix(VERIFIED)?;
+    let (key, value) = rest.split_first_chunk::<32>()?;
+    Some((Key(ContentId(*key)), value))
+}
+
+/// The most shapes a run's chain is read to, finding or keeping: a run reads the same paths
+/// every run (one shape), and portable keys add one for the marks and one for each set of
+/// roots a value was verified against ([`crate::roots::verify`]), at most 2^6. A chain longer
+/// than this is a run whose paths change every run, or a store's bytes gone wrong: a typed
+/// error naming the run, never an open walk (rule 15).
+pub const MOST_SHAPES: u32 = 4096;
+
 /// The run key [`values`] hashes under: no library and no call, which the image of the
 /// calling crate keys itself (`hir_def::deps`).
 pub const VALUES: RunKey = RunKey { code: ContentId([0; 32]), given: ContentId([0; 32]) };
@@ -192,8 +237,10 @@ pub fn values<I: Inputs>(bytes: &[u8], inputs: &mut I) -> Result<Option<ContentI
 pub enum Found<'s> {
     /// A result whose every input is as it is now: its key, the value kept and the shape it
     /// was found by, in place; with [`find_reads`], also the [`values`] of that shape, hashed
-    /// in the same pass as the key.
-    Hit { key: Key, value: &'s [u8], shape: &'s [u8], values: Option<ContentId> },
+    /// in the same pass as the key. `verified` is the key of the unmarked result when the
+    /// value was verified across checkouts ([`verified_value`]): `value` is then without its
+    /// prefix, and a rerun that gives otherwise retracts it ([`depends`]).
+    Hit { key: Key, value: &'s [u8], shape: &'s [u8], values: Option<ContentId>, verified: Option<Key> },
     /// No result of a shape the run has had is for the inputs as they are now; `shapes` is
     /// how many it has had.
     Miss { shapes: u32 },
@@ -206,6 +253,8 @@ pub enum FindError<E> {
     /// another schema is in this slot.
     NotAShape { key: Key, why: String },
     Inputs(E),
+    /// The run's chain has [`MOST_SHAPES`] shapes and goes on: the walk stops there.
+    TooManyShapes { run: RunKey },
 }
 
 /// The result of `run` for `inputs` as they are now, if the store has one: read in place on
@@ -254,8 +303,7 @@ fn search_in<'s, I: Inputs>(
     with_values: bool,
     inputs: &mut I,
 ) -> Result<Found<'s>, FindError<I::Error>> {
-    let mut n = 0;
-    loop {
+    for n in 0..MOST_SHAPES {
         let at = slot(run, n);
         let Some(bytes) = get(&at).map_err(FindError::Corrupt)? else {
             return Ok(Found::Miss { shapes: n });
@@ -264,12 +312,23 @@ fn search_in<'s, I: Inputs>(
             Keyed::NotAShape(why) => FindError::NotAShape { key: at, why },
             Keyed::Inputs(error) => FindError::Inputs(error),
         })?;
-        if let Some((key, values)) = keyed
-            && let Some(value) = get(&Key(key)).map_err(FindError::Corrupt)?
-        {
-            return Ok(Found::Hit { key: Key(key), value, shape: bytes, values });
+        let Some((key, values)) = keyed else { continue };
+        let Some(stored) = get(&Key(key)).map_err(FindError::Corrupt)? else { continue };
+        // Only a value verified across checkouts is asked after: one kept here (marked) or
+        // with no roots costs no second read.
+        let Some((unmarked, value)) = split_verified(stored) else {
+            return Ok(Found::Hit { key: Key(key), value: stored, shape: bytes, values, verified: None });
+        };
+        // A value verified by checkouts that another found to depend on where its roots are is
+        // never given again ([`crate::roots::verify`]): the next shape may still have this
+        // checkout's own.
+        if get(&depends_key(run, &unmarked)).map_err(FindError::Corrupt)?.is_none() {
+            return Ok(Found::Hit { key: Key(key), value, shape: bytes, values, verified: Some(unmarked) });
         }
-        n += 1;
+    }
+    match get(&slot(run, MOST_SHAPES)).map_err(FindError::Corrupt)? {
+        None => Ok(Found::Miss { shapes: MOST_SHAPES }),
+        Some(_) => Err(FindError::TooManyShapes { run: *run }),
     }
 }
 
@@ -426,6 +485,17 @@ pub enum KeepError {
     /// The store has a value of the result's key with other bytes: the key misses an input
     /// the value depends on, or the run is not deterministic. Never kept over.
     Mismatch(Mismatch),
+    /// The store's bytes under the key of another checkout's copy of the run
+    /// ([`crate::roots::verify`]) are not a copy, or not the run's value: what a copy is made
+    /// of changed with no bump of its domains.
+    NotACopy { key: Key, why: String },
+    /// The run's chain has [`MOST_SHAPES`] shapes, none this result's: its shape is not
+    /// kept (the result is, under its key), and the walk stops there (rule 15).
+    TooManyShapes { run: RunKey },
+    /// The automaton that scans what the run wrote for its roots
+    /// ([`crate::roots::Roots::stored`]) could not be built, `why`: nothing of the run is kept,
+    /// as whether a root is in its files is not known.
+    Scan { run: RunKey, why: String },
 }
 
 /// Keeps `value`, the result of `run`, which read `traced`: the result under its key and its
@@ -451,27 +521,42 @@ pub fn keep_in(
     value: Vec<u8>,
 ) -> Result<Vec<Ticket>, KeepError> {
     let mut tickets = Vec::with_capacity(2);
+    keep_into(store, unit, run, traced, value, &mut tickets)?;
+    Ok(tickets)
+}
+
+/// [`keep_in`], each put's ticket pushed onto `tickets` as it lands, so one that fails past
+/// its value (every slot holding another shape) still hands back the value's ticket: the value
+/// is readable, so whoever must wait for what it put waits for it too.
+pub fn keep_into(
+    store: &mut Store,
+    unit: Unit,
+    run: &RunKey,
+    traced: &Traced,
+    value: Vec<u8>,
+    tickets: &mut Vec<Ticket>,
+) -> Result<(), KeepError> {
     let key = result_key(run, traced);
     tickets.push(store.put_in(unit, key, Kind::Run, value).map_err(KeepError::Mismatch)?);
     let shape = Shape::of(traced).encode();
-    let mut n = 0;
-    loop {
+    for n in 0..MOST_SHAPES {
         let at = slot(run, n);
         let same = store.get(&at).map_err(KeepError::Corrupt)?.map(|it| it.bytes == shape.as_slice());
         match same {
-            Some(true) => return Ok(tickets),
-            Some(false) => n += 1,
+            Some(true) => return Ok(()),
+            Some(false) => {}
             // clone: the store owns what it keeps, and a slot another took first needs the shape again
             None => match store.put_in(unit, at, Kind::Run, shape.clone()) {
                 Ok(ticket) => {
                     tickets.push(ticket);
-                    return Ok(tickets);
+                    return Ok(());
                 }
                 // Another kept another shape here first.
-                Err(_) => n += 1,
+                Err(_) => {}
             },
         }
     }
+    Err(KeepError::TooManyShapes { run: *run })
 }
 
 /// Where a run read something it can't see again: what [`crate::rule`] keys such a run by.

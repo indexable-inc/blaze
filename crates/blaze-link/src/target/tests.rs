@@ -8,8 +8,8 @@ use object::write::Object as Builder;
 use object::{Architecture, BinaryFormat, Endianness, SectionKind};
 
 use super::{
-    Ask, Cache, Located, Target, caseless, fhs, listing, loader, locate_with, output_with, parse_version, rpaths,
-    top_level_string,
+    Ask, Cache, Located, Target, caseless, fhs, listing, loader, locate_with, output_with, parse_version, reactor_with,
+    rpaths, top_level_string,
 };
 use crate::{Debug, Format, LinkError, NativeKind, Output, OutputKind, Platform, Searched};
 
@@ -761,8 +761,36 @@ fn a_wasi_line_is_wasi_libcs_from_blazes_toolchain() {
     let error = locate_with(&cache, &answers, &output, &[], &[], &empty).unwrap_err();
     assert!(error.what.contains("no wasi-libc") && error.what.contains(empty.to_str().unwrap()), "{}", error.what);
 
+    let no_libc = temp("no-wasi-libc-archive");
+    touch(&no_libc.join("lib/rustlib/wasm32-wasip1/lib/self-contained/crt1-command.o"), b"\0asm\x01\0\0\0");
+    let error = locate_with(&Cache::new(), &answers, &output, &[], &[], &no_libc).unwrap_err();
+    assert!(error.what.contains("libc.a") && error.what.contains("no wasi-libc"), "{}", error.what);
+
     let output = shared(&cache, &answers, "wasm32-unknown-unknown").unwrap();
     assert!(locate_plain(&cache, &answers, &output, &[], &[]).unwrap().is_empty());
+}
+
+#[test]
+fn a_wasm_proc_macro_links_as_a_wasi_reactor() {
+    let sysroot = temp("reactor-sysroot");
+    let dir = sysroot.join("lib/rustlib/wasm32-wasip1/lib/self-contained");
+    touch(&dir.join("crt1-command.o"), b"\0asm\x01\0\0\0");
+    touch(&dir.join("libc.a"), ARCHIVE);
+    let answers = Answers::new();
+    let output = reactor_with(&Cache::new(), &answers, Debug::None, false).unwrap();
+    assert_eq!(output.kind, OutputKind::Executable { entry: "_initialize".to_owned() });
+    assert_eq!((output.format, output.arch, output.triple.as_str()), (Format::Wasm, Arch::Wasm32, "wasm32-wasip1"));
+    let error = locate_with(&Cache::new(), &answers, &output, &[], &[], &sysroot).unwrap_err();
+    assert!(error.what.contains("crt1-reactor.o"), "a toolchain with no reactor start: {}", error.what);
+
+    touch(&dir.join("crt1-reactor.o"), b"\0asm\x01\0\0\0");
+    let located = locate_with(&Cache::new(), &answers, &output, &[static_lib("c", false)], &[], &sysroot).unwrap();
+    assert_eq!(line(&located), [(dir.join("crt1-reactor.o"), NativeKind::Object), (dir.join("libc.a"), ARCHIVED)]);
+
+    let mut odd = output;
+    odd.kind = OutputKind::Executable { entry: "main".to_owned() };
+    let error = locate_with(&Cache::new(), &answers, &odd, &[], &[], &sysroot).unwrap_err();
+    assert!(error.what.contains("`main`") && error.what.contains("_initialize"), "{}", error.what);
 }
 
 #[test]

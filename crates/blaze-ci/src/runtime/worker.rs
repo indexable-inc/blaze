@@ -19,6 +19,7 @@ use blaze_api::{
     frames::{self, Frames},
 };
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, radix};
 use blaze_protocol::cbor;
 use blaze_vfs::{Op, View};
@@ -59,7 +60,7 @@ struct Worker {
     /// taken for a new request's.
     next_id: u64,
     /// Sorted by id where it is walked, so cancels and failures go out in request order.
-    running: HashMap<u64, RunId>,
+    running: HashMap<u64, RunId, Global>,
     /// Each request is encoded here, then written: one buffer for the job's every request.
     out: Outgoing,
     /// The ids being cancelled or failed, sorted: kept from one cancel to the next.
@@ -68,7 +69,7 @@ struct Worker {
 
 impl Worker {
     fn new(job: JobId, shared: Arc<Shared>, me: crossbeam_channel::Sender<Command>) -> Worker {
-        let running = HashMap::default();
+        let running = HashMap::new_in(Global);
         // alloc: once per job
         Worker { job, shared, me, stream: None, next_id: 1, running, out: Outgoing::default(), ids: Vec::new() }
     }

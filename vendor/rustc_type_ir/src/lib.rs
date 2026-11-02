@@ -64,6 +64,7 @@ pub mod ir_print;
 pub mod lang_items;
 pub mod lift;
 pub mod outlives;
+pub mod reflect;
 pub mod region_constraint;
 pub mod relate;
 pub mod search_graph;

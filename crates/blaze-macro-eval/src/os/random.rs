@@ -11,8 +11,8 @@ use super::{
 };
 use crate::guest::Guest;
 
-/// The keys every `RandomState` of a macro starts from.
-const HASHMAP_KEYS: (u64, u64) = (0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+/// The keys every `RandomState` of a macro starts from, on the evaluator and in a wasm module.
+pub(crate) const HASHMAP_KEYS: (u64, u64) = (0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
 
 /// The most `getentropy` gives at once.
 const ENTROPY_MAX: u64 = 256;
@@ -31,7 +31,7 @@ pub(super) fn hashmap_random_keys(ret: &mut [u8]) -> Answer {
 impl<'a> Os<'a> {
     /// Writes `len` random bytes at `buf`, and returns `returns`, or `len` for `None` and
     /// nothing for a `void` function.
-    pub(super) fn fill_random(
+    pub(crate) fn fill_random(
         &mut self,
         g: &mut impl Guest,
         ret: &mut [u8],

@@ -18,10 +18,12 @@
 //! (`ImproperCTypes`, `UsesPowerAlignment`, `BuiltinClashingExtern`) (MIT or Apache-2.0).
 
 use hir_ty::db::HirDatabase;
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
 use std::{cell::OnceCell, str::FromStr};
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use blaze_mem::Frame;
 use either::Either;
@@ -151,6 +153,7 @@ impl State {
 }
 
 /// The types of one item, in its param env.
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
 struct Types<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
     interner: DbInterner<'db>,
@@ -164,6 +167,7 @@ struct Types<'c, 'a, 'db> {
 }
 
 impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
+    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
     fn new(cx: &'c Cx<'a, 'db>, owner: GenericDefId) -> Self {
         let db = cx.db;
         let krate = cx.krate.base();
@@ -360,7 +364,7 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
 /// rustc's `ImproperCTypesVisitor`: whether a type is FFI-safe.
 struct Visitor<'t, 'c, 'a, 'db> {
     types: &'t mut Types<'c, 'a, 'db>,
-    cache: HashSet<Ty<'db>>,
+    cache: HashSet<Ty<'db>, Global>,
     base_ty: Ty<'db>,
     base_mode: CItemKind,
 }
@@ -368,7 +372,7 @@ struct Visitor<'t, 'c, 'a, 'db> {
 impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
     fn new(types: &'t mut Types<'c, 'a, 'db>, base_ty: Ty<'db>, base_mode: CItemKind) -> Self {
         let base_ty = if opaque(base_ty).is_some() { base_ty } else { types.normalize(base_ty) };
-        Visitor { types, cache: HashSet::default(), base_ty, base_mode }
+        Visitor { types, cache: HashSet::new_in(Global), base_ty, base_mode }
     }
 
     fn check_type(&mut self, state: State, ty: Ty<'db>) -> FfiResult<'db> {
@@ -895,7 +899,7 @@ impl<'db> Pass<'_, '_, 'db> {
         if let Some((id, name)) = super::item_id(cx, site.item) {
             diag.fact(Fact::Signature(cx.key(id)), format!("the signature of `{name}`")); // alloc: the firing lint's fact
         }
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new_in(Global);
         for &adt in &types.adts {
             if seen.insert(adt) {
                 let name = cx.def_path(ModuleDef::Adt(adt.into()));
@@ -1028,7 +1032,7 @@ fn link_name(cx: &Cx<'_, '_>, id: FunctionId, f: ast::Fn<'_>) -> Option<TextRang
 /// rustc's `structurally_same_type`.
 struct Same<'t, 'c, 'a, 'db> {
     types: &'t Types<'c, 'a, 'db>,
-    seen: HashSet<(Ty<'db>, Ty<'db>)>,
+    seen: HashSet<(Ty<'db>, Ty<'db>), Global>,
 }
 
 impl<'db> Same<'_, '_, '_, 'db> {
@@ -1137,12 +1141,12 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Vec<Found> {
     }
     decls.sort_by(|a, b| a.0.cmp(&b.0));
     let mut found = Vec::new(); // alloc: empty until a lint fires; holds only what fires
-    let mut seen: HashMap<Symbol, usize> = HashMap::with_capacity_and_hasher(decls.len(), Default::default());
+    let mut seen: HashMap<Symbol, usize, Global> = HashMap::with_capacity_in(decls.len(), Global);
     for index in 0..decls.len() {
         let (_, item, f, def, id) = &decls[index];
         let first = match seen.entry(symbol(cx, *id)) {
-            std::collections::hash_map::Entry::Occupied(it) => *it.get(),
-            std::collections::hash_map::Entry::Vacant(it) => {
+            blaze_hash::hash_map::Entry::Occupied(it) => *it.get(),
+            blaze_hash::hash_map::Entry::Vacant(it) => {
                 it.insert(index);
                 continue;
             }
@@ -1152,7 +1156,7 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Vec<Found> {
         let interner = types.interner;
         let sig_of = |id: FunctionId| db.callable_item_signature(CallableDefId::FunctionId(id)).skip_binder();
         let (expected, this_sig) = (sig_of(*first_id), sig_of(*id));
-        let mut same = Same { types: &types, seen: HashSet::default() };
+        let mut same = Same { types: &types, seen: HashSet::new_in(Global) };
         let erased = (
             interner.instantiate_bound_regions_with_erased(expected),
             interner.instantiate_bound_regions_with_erased(this_sig),

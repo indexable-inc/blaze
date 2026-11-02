@@ -21,6 +21,8 @@ extern crate rustc_type_ir;
 extern crate self as hir_ty;
 
 pub mod builtin_derive;
+pub mod comptime;
+pub mod comptime_env;
 pub mod generics;
 pub mod infer;
 pub mod inhabitedness;
@@ -34,6 +36,7 @@ mod target_feature;
 pub mod utils;
 mod variance;
 
+pub mod arbitrary_ints;
 pub mod autoderef;
 pub mod body_store;
 pub mod check_cache;
@@ -45,6 +48,7 @@ pub mod db;
 pub mod diagnostics;
 pub mod display;
 pub mod drop;
+pub mod dropck;
 pub mod dyn_compatibility;
 pub mod effects;
 pub mod evict;
@@ -70,6 +74,7 @@ use std::{hash::Hash, ops::ControlFlow};
 
 use base_db::Db;
 use blaze_hash::{FixedState, HashMap, HashSet};
+use std::alloc::Global;
 use blaze_mem::Frame;
 use hir_def::{
     CallableDefId, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, FunctionId,
@@ -118,21 +123,23 @@ pub use infer::{
     prelude_lints::{EditionLint, ReceiverAdjustment},
 };
 pub use lower::{
-    ElidedLifetimes, ElidedOutput, FieldType, FieldTypes, GenericDefaults, GenericDefaultsRef,
-    GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, Lowered, LoweringMode,
+    ElidedGroups, ElidedLifetimes, ElidedOutput, FieldType, FieldTypes, GenericDefaults,
+    GenericDefaultsRef, GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, Lowered, LoweringMode,
     PredicateSource, SelfAndAssocBounds, TyDefId, TyLoweringContext, TyLoweringResult,
     ValueTyDefId,
     batch::{
         Batch, CrateFieldTypes, CrateImplPredicates, CrateImplSelfTys, CrateImplTraits, SideTable,
     },
     diagnostics::*,
-    elided_lifetimes, hir_mutability, lower_mutability,
+    elided_groups, elided_lifetimes, hir_mutability, lower_mutability,
     persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
-    predicate_sources, with_elided_regions,
+    predicate_sources, supertraits_cycle, with_elided_regions,
 };
 pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
 pub use opaques::{rpit_hidden_types, tait_hidden_types};
-pub use specialization::impl_unconstrained_params;
+pub use specialization::{
+    SpecializationMode, impl_unconstrained_params, specialization_mode, specialized_ancestor,
+};
 pub use target_feature::{TargetFeature, TargetFeatureSet, TargetFeatures, crate_target_features};
 pub use traits::{ParamEnvAndCrate, check_orphan_rules};
 pub use used_imports::used_imports_with_traits;
@@ -188,7 +195,9 @@ pub struct ComplexMemoryMap<'db> {
     aligns: Vec<(usize, usize)>,
     /// The types of the `TypeId`s the constant may hold, by the ids the evaluation gave them:
     /// those are not rustc's hashes, which whoever emits the constant puts in their place.
-    /// `None` for the id of a field reflection made.
+    /// A field's id is its field representing type's, as in rustc, so the evaluator makes no
+    /// `None`; it stays for maps decoded from stores written before (FIXME(comptime): narrow
+    /// to `Vec<Ty>` in one port with its encoders).
     pub type_ids: Vec<Option<Ty<'db>>>,
     /// The offsets into the evaluated value's bytes of each word that is a pointer with
     /// provenance, sorted. A word not listed is an integer, even when it is typed as a pointer.
@@ -439,13 +448,23 @@ impl ComplexMemoryMap<'_> {
 }
 
 impl<'db> MemoryMap<'db> {
-    /// The static whose memory holds `addr`, and the offset of `addr` in it.
+    /// The static whose memory holds `addr`, or that `addr` is one past the end of, and the
+    /// offset of `addr` in it. Const eval leaves a gap after each allocation, so one past the
+    /// end of one is never the start of another.
     pub fn static_at(&self, addr: usize) -> Option<(hir_def::StaticId, usize)> {
         let MemoryMap::Complex(map) = self else { return None };
         map.statics.iter().find_map(|it| {
             let offset = addr.checked_sub(it.start)?;
-            (offset < it.size.max(1)).then_some((it.id, offset))
+            (offset <= it.size).then_some((it.id, offset))
         })
+    }
+
+    /// The offsets of the words of the value that are pointers with provenance, in order.
+    pub fn value_pointers(&self) -> &[usize] {
+        match self {
+            MemoryMap::Complex(map) => &map.value_pointers,
+            MemoryMap::Empty | MemoryMap::Simple(_) => &[],
+        }
     }
 
     /// The memory that holds `addr`, with the address it starts at.
@@ -479,6 +498,15 @@ impl<'db> MemoryMap<'db> {
         }
     }
 
+    /// The addresses of the words in `range` of memory that are pointers with provenance,
+    /// in order. An `Empty` or `Simple` map holds none.
+    pub fn pointers_in(&self, range: std::ops::Range<usize>) -> &[usize] {
+        let MemoryMap::Complex(map) = self else { return &[] };
+        let from = map.memory_pointers.partition_point(|&it| it < range.start);
+        let to = map.memory_pointers.partition_point(|&it| it < range.end);
+        &map.memory_pointers[from..to.max(from)]
+    }
+
     pub fn vtable_ty(&self, id: usize) -> Result<Ty<'db>, MirEvalError<'db>> {
         match self {
             MemoryMap::Empty | MemoryMap::Simple(_) => Err(MirEvalError::InvalidVTableId(id)),
@@ -507,7 +535,7 @@ impl<'db> MemoryMap<'db> {
     pub fn transform_addresses(
         &self,
         mut f: impl FnMut(&[u8], usize) -> Result<usize, MirEvalError<'db>>,
-    ) -> Result<HashMap<usize, usize>, MirEvalError<'db>> {
+    ) -> Result<HashMap<usize, usize, Global>, MirEvalError<'db>> {
         let mut transform = |(addr, val): (&usize, &[u8])| {
             let addr = *addr;
             let align = match self.align_at(addr) {
@@ -520,13 +548,13 @@ impl<'db> MemoryMap<'db> {
         match self {
             MemoryMap::Empty => Ok(Default::default()),
             MemoryMap::Simple(m) => transform((&0, m)).map(|(addr, val)| {
-                let mut map = HashMap::with_capacity_and_hasher(1, blaze_hash::FixedState);
+                let mut map = HashMap::with_capacity_in(1, Global);
                 map.insert(addr, val);
                 map
             }),
             MemoryMap::Complex(cm) => {
                 let mut map =
-                    HashMap::with_capacity_and_hasher(cm.memory.len(), blaze_hash::FixedState);
+                    HashMap::with_capacity_in(cm.memory.len(), Global);
                 for (addr, val) in cm.memory.iter() {
                     let (addr, new) = transform((addr, val))?;
                     map.insert(addr, new);
@@ -645,7 +673,7 @@ mod memory_map_tests {
         assert_eq!(map.align_at(16), None);
         assert_eq!(map, other);
         assert_eq!(hash(&map), hash(&other));
-        let addresses: HashMap<usize, usize> = map
+        let addresses: HashMap<usize, usize, Global> = map
             .transform_addresses(|bytes, align| Ok(bytes.len() * 1000 + align))
             .unwrap();
         assert_eq!(addresses.get(&64), Some(&8008));
@@ -870,7 +898,7 @@ pub fn associated_type_shorthand_candidates(
         _ => return None,
     };
 
-    let mut dedup_map = HashSet::default();
+    let mut dedup_map = HashSet::new_in(Global);
     let param_ty = Ty::new_param(interner, param, type_or_const_param_idx(db, param.into()));
     // We use the ParamEnv and not the predicates because the ParamEnv elaborates bounds.
     let param_env = db.trait_environment(def);
@@ -961,7 +989,7 @@ pub fn callable_sig_from_fn_trait<'db>(
 }
 
 struct ParamCollector {
-    params: HashSet<TypeOrConstParamId>,
+    params: HashSet<TypeOrConstParamId, Global>,
 }
 
 impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for ParamCollector {
@@ -989,7 +1017,7 @@ pub fn collect_params<'db, T>(value: &T) -> Vec<TypeOrConstParamId>
 where
     T: ?Sized + rustc_type_ir::TypeVisitable<DbInterner<'db>>,
 {
-    let mut collector = ParamCollector { params: HashSet::default() };
+    let mut collector = ParamCollector { params: HashSet::new_in(Global) };
     value.visit_with(&mut collector);
     Vec::from_iter(collector.params)
 }

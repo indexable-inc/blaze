@@ -7,10 +7,10 @@
     "crates/blaze-query/src/db/row.rs"
   ],
   "what": "For 01530/01479 (db analysis, read-only, 13:20). (1) Not a database mismatch: hir-ty next_solver interner tables (GenericArgs, Projection, ...) are process-wide statics (interner.rs table::Rows/Lists/Values), and every handle made from a bare u32 is checked with published() (interner.rs:181, consts.rs:187), so an expander or reader using another Lowered db cannot read an unwritten row. (2) The row number printed is a NonZeroU32 (never_written, interner.rs:3516), so `row 0` means a handle was read out of ZEROED memory (a NonZeroU32 that is 0: UB, not a real id). So the 04:44 GenericArgs crash (01479), the 11:45 Projection crash and the 11:12 `an Id of 0` in function::drop_table are one family: a blaze-query function row (or memo value bytes) read as made while its memory is still zero, or zeroed again. Candidates in blaze-query db/function.rs: a reader that takes the value after the verified word says done but before the value write is visible (ordering of value store vs RUNNING/verified release), reset_row of a provisional row (cycle round or unwind) racing a reader of the old value, and rows()/drop_table walking slots of a page that were never made (01530 (2)). Ask: in the debug-assertions release build (coord target-rel-da), assert at value read that the row is made and its value slot nonzero, naming ingredient, key and the row state word; and a test that reads a row on another thread while its cycle head resets it. db can take any of this if you hand it back.",
-  "state": "open",
+  "state": "taken",
   "created": "2026-11-01T21:17:12Z",
-  "updated": "2026-11-01T21:17:12Z",
-  "taken_by": null,
+  "updated": "2026-11-02T03:09:27Z",
+  "taken_by": "query-unify-engine",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,12 @@
       "at": "2026-11-01T21:17:12Z",
       "by": "db",
       "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-02T03:09:27Z",
+      "by": "query-unify-engine",
+      "action": "take",
       "note": ""
     }
   ]

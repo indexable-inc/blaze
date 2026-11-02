@@ -2910,7 +2910,7 @@ impl B for Astruct {}
         expect![[r#"
             733..737 'self': Box<[T], A>
             766..798 '{     ...     }': Vec<T, A>
-            776..792 'unimpl...ted!()': Vec<T, A>
+            776..792 'unimpl...ted!()': {unknown}
             812..940 '{     ...])); }': ()
             822..825 'vec': Vec<i32, Global>
             828..843 '<[_]>::into_vec': fn into_vec<i32, Global>(Box<[i32], Global>) -> Vec<i32, Global>
@@ -4473,5 +4473,49 @@ struct Foo<const N: usize> {
                   // ^ usize
 }
     "#,
+    );
+}
+
+/// `u3` is a type only in a crate that says `#![blaze::arbitrary_ints]`. Without it, a
+/// `struct u3` is the crate's own, as under rustc, and `u3` names nothing else; with it, an
+/// item named `u3` shadows the builtin, as one named `u8` does.
+#[test]
+fn arbitrary_ints_need_the_opt_in() {
+    check_types(
+        r#"
+struct u3 { wide: bool }
+fn f(x: u3) {
+    x.wide;
+  //^^^^^^ bool
+}
+"#,
+    );
+    check_types(
+        r#"
+fn f(x: u3, y: i7) {
+    (x, y);
+  //^^^^^^ ({unknown}, {unknown})
+}
+"#,
+    );
+    check_types(
+        r#"
+#![blaze::arbitrary_ints]
+struct u3 { wide: bool }
+fn f(x: u3) {
+    x.wide;
+  //^^^^^^ bool
+}
+"#,
+    );
+    check_types(
+        r#"
+#![blaze::arbitrary_ints]
+fn f(y: i7) {
+    let x = 5u3;
+    (x, y, x + 1, y < 3);
+  //^^^^^^^^^^^^^^^^^^^^ (u3, i7, u3, bool)
+}
+"#,
     );
 }

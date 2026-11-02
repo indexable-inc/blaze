@@ -9,6 +9,7 @@
 use std::fmt::{self, Write};
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 
 use crate::{CfgAtom, CfgDiff, CfgExpr, CfgOptions, InactiveReason};
 
@@ -81,8 +82,8 @@ impl DnfExpr {
         // A cfg is enabled if any of `self.conjunctions` evaluate to `true`.
 
         self.conjunctions.iter().filter_map(move |conj| {
-            let mut enable = HashSet::default();
-            let mut disable = HashSet::default();
+            let mut enable = HashSet::new_in(Global);
+            let mut disable = HashSet::new_in(Global);
             for lit in &conj.literals {
                 let atom = lit.var.as_ref()?;
                 let enabled = opts.enabled.contains(atom);

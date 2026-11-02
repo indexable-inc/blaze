@@ -1485,7 +1485,7 @@ trait Tr {
     };
 }
 
-fn f(it: core::option::Option<u8>) {
+fn f(it: [u8; 1]) {
     it.vec();
   //^^^^^^^^ u16
     S.inherent();
@@ -1920,6 +1920,8 @@ fn test() {
 
 #[test]
 fn deref_into_inference_var() {
+    // As rustc's `method_autoderef_steps`: autoderef reaches the error type of the missing
+    // `Target`, so the probe reports an error instead of picking `A<i32>::foo`.
     check_types(
         r#"
 //- minicore:deref
@@ -1928,7 +1930,7 @@ impl core::ops::Deref for A<u32> {}
 impl A<i32> { fn foo(&self) {} }
 fn main() {
     A(0).foo();
-  //^^^^^^^^^^ ()
+  //^^^^^^^^^^ {unknown}
 }
 "#,
     );
@@ -1946,7 +1948,7 @@ fn test() {
     Foo.foo();
   //^^^ adjustments: Borrow(Ref(Not))
     (&Foo).foo();
-  // ^^^^ adjustments: Deref(None), Borrow(Ref(Not))
+  //^^^^^^ adjustments: Deref(None), Borrow(Ref(Not))
 }
 "#,
     );

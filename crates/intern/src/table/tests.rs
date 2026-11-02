@@ -1,4 +1,5 @@
 use std::{collections::HashMap, panic::AssertUnwindSafe};
+use std::alloc::Global;
 
 use blaze_format::SchemaHash;
 use blaze_ids::{ContentId, rng::SplitMix64};
@@ -331,7 +332,7 @@ fn interning_agrees_with_a_map_model() {
     for seed in 0..3 {
         let mut rng = SplitMix64::new(0x5eed + seed);
         let table = Table::new(shape());
-        let mut model: blaze_hash::HashMap<Vec<u8>, u32> = blaze_hash::HashMap::default();
+        let mut model: blaze_hash::HashMap<Vec<u8>, u32, Global> = blaze_hash::HashMap::new_in(Global); // alloc: a test's model
         let mut next = table.end();
         // Text, as the shape's restore checks: short names, numbered ones, long runs, digits.
         let value = |rng: &mut SplitMix64| -> Vec<u8> {
@@ -345,7 +346,7 @@ fn interning_agrees_with_a_map_model() {
                 }
             }
         };
-        let check = |table: &Table, model: &mut blaze_hash::HashMap<Vec<u8>, u32>, next: &mut u32, bytes: Vec<u8>| {
+        let check = |table: &Table, model: &mut blaze_hash::HashMap<Vec<u8>, u32, Global>, next: &mut u32, bytes: Vec<u8>| { // alloc: a test's model
             let id = table.intern(&bytes);
             let expect = match model.get(&bytes) {
                 Some(&id) => id,

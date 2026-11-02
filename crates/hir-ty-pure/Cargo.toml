@@ -32,6 +32,7 @@ hir-ty.workspace = true
 hir-ty-mir.workspace = true
 hir-ty-share.workspace = true
 intern.workspace = true
+span.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

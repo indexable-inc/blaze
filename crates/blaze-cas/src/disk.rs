@@ -460,14 +460,18 @@ impl Head {
             let content = ContentId(*read.array()?);
             head.externals.push(ExternalRef { content, len: read.u64()? });
         }
-        let mut seen = blaze_hash::HashSet::default();
-        for _ in 0..units {
-            let unit = ContentId(*read.array()?);
-            if unit == ContentId::default() || !seen.insert(unit) {
-                return Err("it lists a unit twice, or one of no crate".into());
+        // The units seen live only while the head is read: a frame's.
+        blaze_mem::frame::task(blaze_mem::Tag::Store, |frame| {
+            let mut seen = blaze_hash::HashSet::new_in(frame);
+            for _ in 0..units {
+                let unit = ContentId(*read.array()?);
+                if unit == ContentId::default() || !seen.insert(unit) {
+                    return Err("it lists a unit twice, or one of no crate".into());
+                }
+                head.units.push(unit);
             }
-            head.units.push(unit);
-        }
+            Ok::<(), String>(())
+        })?;
         for (number, pack) in head.packs.iter().enumerate() {
             if pack.indexed > pack.committed
                 || pack.dead > pack.committed

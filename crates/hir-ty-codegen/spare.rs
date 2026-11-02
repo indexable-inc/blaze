@@ -181,7 +181,7 @@ mod tests {
         let value = builder.ins().iadd_imm(value, add);
         builder.ins().return_(&[value]);
         builder.seal_all_blocks();
-        builder.finalize(crate::target().unwrap().frontend_config());
+        builder.finalize(crate::isa_for(crate::Target::for_host()).unwrap().frontend_config());
     }
 
     fn signature() -> ir::Signature {
@@ -213,6 +213,42 @@ mod tests {
         let mut builder_ctx = builder();
         build(&mut builder_ctx, &mut context.func, 7);
         assert_eq!(context.func.display().to_string(), fresh);
+    }
+
+    /// A kept context's function is a new one's, byte for byte as its stencil hashes, which is
+    /// the shape of the function built in it next (`v2/shape.rs`): nothing of the function
+    /// compiled in it before is left, not even what no instruction names and the IR's text
+    /// leaves out. Cranelift's `DataFlowGraph::clear` kept the exception tables, so a function
+    /// got another shape by what its thread compiled before (rule 18).
+    #[test]
+    fn a_kept_context_hashes_as_a_new_one() {
+        struct Bytes(Vec<u8>); // alloc: a test's
+        impl std::hash::Hasher for Bytes {
+            fn finish(&self) -> u64 {
+                0
+            }
+
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.extend_from_slice(bytes);
+            }
+        }
+        let bytes = |func: &ir::Function| {
+            let mut out = Bytes(Vec::new()); // alloc: a test's
+            std::hash::Hash::hash(&func.stencil, &mut out);
+            out.0
+        };
+        CONTEXTS.with_borrow_mut(Vec::clear);
+        let mut used = context();
+        used.func.signature = signature();
+        build(&mut FunctionBuilderContext::new(), &mut used.func, 7);
+        let dfg = &mut used.func.dfg;
+        let sig = dfg.signatures.push(signature());
+        let block = dfg.make_block();
+        let to = dfg.block_call(block, &[]);
+        dfg.exception_tables.push(ir::ExceptionTableData::new(sig, to, [ir::ExceptionTableItem::Default(to)]));
+        keep_context(used);
+        let kept = context();
+        assert_eq!(bytes(&kept.func), bytes(&ir::Function::new()));
     }
 
     #[test]

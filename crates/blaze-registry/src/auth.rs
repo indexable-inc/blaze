@@ -15,6 +15,7 @@ use std::{
 
 use anyhow::bail;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_manifest::config::{Config, OptValue, PathAndArgs, Value, env_key};
 use blaze_manifest::files::Disk;
 use blaze_source::SourceId;
@@ -296,15 +297,15 @@ pub struct Auth {
 struct State {
     config: Config<Disk>,
     /// By the registry's canonical URL.
-    tokens: HashMap<String, Cached>,
+    tokens: HashMap<String, Cached, Global>,
     /// By the registry's canonical URL, cargo's `registry_config` cache.
-    registries: HashMap<String, Option<Credentials>>,
+    registries: HashMap<String, Option<Credentials>, Global>,
 }
 
 impl Auth {
     // dyn: the CLI's output, as on `Auth::shell`.
     pub fn new(config: Config<Disk>, shell: Box<dyn Shell>) -> Auth {
-        let state = State { config, tokens: HashMap::default(), registries: HashMap::default() };
+        let state = State { config, tokens: HashMap::new_in(Global), registries: HashMap::new_in(Global) };
         Auth { state: Mutex::new(state), shell }
     }
 

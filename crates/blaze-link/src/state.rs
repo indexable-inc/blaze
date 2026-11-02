@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use blaze_codegen::{InstanceKey, Line};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, radix};
 use smallvec::SmallVec;
 
@@ -445,7 +446,7 @@ pub(crate) struct State {
     /// wasm: what codegen's live functions and statics say each name is imported as, the one
     /// import every live piece declaring it agrees on ([`State::declare_wasm`]); a name no
     /// live piece declares has none.
-    pub wasm_imports: Arc<HashMap<NameId, blaze_codegen::wasm::Import>>,
+    pub wasm_imports: Arc<HashMap<NameId, blaze_codegen::wasm::Import, Global>>,
     pub inputs: Arc<Vec<Input>>,
     pub resolved: Arc<Resolved>,
     /// The jump table: slots given out, and how many there are room for.
@@ -1031,6 +1032,17 @@ impl State {
     ) -> FuncId {
         let lines = self.lines.push(lines);
         self.functions.push(FunctionInfo { key, id, fde, windows, lines }) as FuncId
+    }
+
+    /// The image's id, its build id in the file: of its lineage and generation.
+    pub fn image_id(&self) -> [u8; 16] {
+        let full = blaze_ids::Hasher::new("blaze v2 link image 1")
+            .update(&self.lineage[..])
+            .update(&self.generation.to_le_bytes())
+            .finish();
+        let mut id = [0; 16];
+        id.copy_from_slice(&full.0[..16]);
+        id
     }
 
     pub fn function(&self, id: FuncId) -> &FunctionInfo {

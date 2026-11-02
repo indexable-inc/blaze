@@ -15,6 +15,7 @@
 use std::ops::ControlFlow;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir::{HirFileId, InFile};
 use syntax::{
     NodeOrToken, SyntaxKind, SyntaxNodePtr, T, TextRange, WalkEvent,
@@ -234,8 +235,14 @@ impl Visitor<'_, '_, '_, '_> {
         }
         if token(node, T![default]).is_some() {
             let is_fn = node.kind() == SyntaxKind::FN;
+            // `#![blaze::specialization]` specializes `default fn` without either feature;
+            // hir-ty-specialization refuses every other `default` under it.
+            let blaze = || {
+                hir_ty::specialization_mode(self.cx.db, self.cx.krate.base())
+                    == hir_ty::SpecializationMode::Blaze
+            };
             let enabled = self.features.enabled("specialization")
-                || (is_fn && self.features.enabled("min_specialization"));
+                || (is_fn && (self.features.enabled("min_specialization") || blaze()));
             if !enabled && !allows_unstable(self.cx, file, at, "specialization") {
                 let span = self.cx.span(InFile::new(file, at));
                 let diag = feature_err(self.features, "specialization", span, "specialization is experimental");
@@ -442,12 +449,12 @@ fn doc_gate(name: &str) -> Option<(&'static str, &'static str)> {
 /// item is, an expansion where its macro is called (what a derive makes, after the item it
 /// is on), then where in its own tree the node is, outer nodes before those in them.
 struct Places {
-    files: HashMap<HirFileId, Vec<(u32, u32)>>,
+    files: HashMap<HirFileId, Vec<(u32, u32)>, Global>,
 }
 
 impl Places {
     fn new(cx: &Cx<'_, '_>) -> Places {
-        let mut files: HashMap<HirFileId, Vec<(u32, u32)>> = HashMap::default();
+        let mut files: HashMap<HirFileId, Vec<(u32, u32)>, Global> = HashMap::new_in(Global);
         for module in crate::checks::modules(cx) {
             let Some(file) = module.as_source_file_id(cx.db) else { continue };
             // alloc: on the error path (`Places` is made only when a gate is hit)

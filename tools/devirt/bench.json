@@ -1,0 +1,10 @@
+{
+  "old_builder": "/w/blaze-base/target/release/blaze",
+  "new_builder": "/w/blaze-v2/target/release/blaze",
+  "tree": "/w/blaze-v2",
+  "program": "/w/blaze-v2/tools/devirt/dyn_loop",
+  "scratch": "/w/bench/devirt/scratch",
+  "out": "/w/bench/devirt/result.json",
+  "rounds": 10,
+  "iterations": 300000000
+}

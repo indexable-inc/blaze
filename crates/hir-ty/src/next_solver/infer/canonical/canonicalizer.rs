@@ -8,6 +8,7 @@
 use std::marker::PhantomData;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use rustc_index::Idx;
 use rustc_type_ir::InferTy::{self, FloatVar, IntVar, TyVar};
 use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
@@ -81,6 +82,35 @@ impl<'db> InferCtxt<'db> {
             self.interner,
             query_state,
         )
+    }
+
+    /// [`Self::canonicalize_query`] of `value`, whose input also has a variable for each of
+    /// `placeholders` (the caller's own, from its environment), named in `value` or not, at the
+    /// end of `query_state`'s values.
+    ///
+    /// For a query the caller answers itself
+    /// ([`InferCtxt::instantiate_canonical_as_caller`]): the new solver puts the param env in
+    /// the input, so every placeholder its response names is an input and maps back to the
+    /// caller's by index. Here the env is not in the input, and a response may name an env
+    /// placeholder through what the env says (`Wrap<?x>: Deref` solved by an assumption
+    /// `Wrap<!F>: Deref` constrains `?x := !F`); as an input of its own it maps back the same
+    /// way. With no placeholders this is [`Self::canonicalize_query`].
+    pub fn canonicalize_query_naming<V>(
+        &self,
+        value: V,
+        placeholders: &[GenericArg<'db>],
+        query_state: &mut OriginalQueryValues<'db>,
+    ) -> Canonical<'db, V>
+    where
+        V: TypeFoldable<DbInterner<'db>>,
+    {
+        if placeholders.is_empty() {
+            return self.canonicalize_query(value, query_state);
+        }
+        let placeholders = crate::next_solver::GenericArgs::new_from_slice(placeholders);
+        let Canonical { value: (value, _), max_universe, var_kinds } =
+            self.canonicalize_query((value, placeholders), query_state);
+        Canonical { value, max_universe, var_kinds }
     }
 
     /// Canonicalizes a query *response* `V`. When we canonicalize a
@@ -260,14 +290,14 @@ struct Canonicalizer<'cx, 'db, M> {
     query_state: &'cx mut OriginalQueryValues<'db>,
     // Note that indices is only used once `var_values` is big enough to be
     // heap-allocated.
-    indices: HashMap<GenericArg<'db>, BoundVar>,
+    indices: HashMap<GenericArg<'db>, BoundVar, Global>,
     /// Maps each `sub_unification_table_root_var` to the index of the first
     /// variable which used it.
     ///
     /// This means in case two type variables have the same sub relations root,
     /// we set the `sub_root` of the second variable to the position of the first.
     /// Otherwise the `sub_root` of each type variable is just its own position.
-    sub_root_lookup_table: HashMap<TyVid, usize>,
+    sub_root_lookup_table: HashMap<TyVid, usize, Global>,
     needs_canonical_flags: TypeFlags,
 
     binder_index: DebruijnIndex,
@@ -520,7 +550,7 @@ impl<'cx, 'db, M: CanonicalizeMode> Canonicalizer<'cx, 'db, M> {
             needs_canonical_flags,
             variables: SmallVec::from_slice(base.var_kinds.as_slice()),
             query_state,
-            indices: HashMap::default(),
+            indices: HashMap::new_in(Global),
             sub_root_lookup_table: Default::default(),
             binder_index: DebruijnIndex::ZERO,
             mode: PhantomData,

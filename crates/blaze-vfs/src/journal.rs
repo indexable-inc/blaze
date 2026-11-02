@@ -46,6 +46,7 @@ use std::sync::Arc;
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
 use blaze_format::cursor::{Put as _, Reader};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
 
 use crate::{
@@ -145,7 +146,7 @@ pub(crate) struct Journal {
     written: Written,
     sequence: u64,
     /// The sequence of each head, as last written.
-    heads: HashMap<Box<str>, u64>,
+    heads: HashMap<Box<str>, u64, Global>,
     /// Records made and not yet handed to an append.
     open: Batch,
     flight: Flight,
@@ -182,7 +183,7 @@ pub(crate) struct Journal {
 /// What [`Journal::recover`] rebuilt.
 pub(crate) struct Loaded {
     pub(crate) tree: Tree,
-    pub(crate) heads: HashMap<Box<str>, NodeId>,
+    pub(crate) heads: HashMap<Box<str>, NodeId, Global>,
     pub(crate) journal: Journal,
     pub(crate) found: Recovered,
 }
@@ -203,7 +204,7 @@ impl Journal {
 
     fn load(file: FileName, tags: u64, bytes: &[u8], image: Option<FromImage>) -> Loaded {
         let mut found = Recovered::default();
-        let mut moves: HashMap<Box<str>, Vec<(u64, Option<ContentId>)>> = HashMap::default();
+        let mut moves: HashMap<Box<str>, Vec<(u64, Option<ContentId>)>, Global> = HashMap::new_in(Global);
         let mut sequence = 0;
         let (mut tree, from) = match image {
             Some(FromImage { tree, name, nodes, resumed }) => {
@@ -232,7 +233,7 @@ impl Journal {
             tags,
             written: Written::filled(tree.len()),
             sequence,
-            heads: HashMap::default(),
+            heads: HashMap::new_in(Global),
             open: Batch::default(),
             flight: Flight::Idle,
             cut: (valid < bytes.len()).then_some(valid as u64),
@@ -261,7 +262,7 @@ impl Journal {
             Some((image, false)) => journal.base = Some(image),
             None => {}
         }
-        let mut heads = HashMap::default();
+        let mut heads = HashMap::new_in(Global);
         // alloc: once per recovery, the heads by name.
         let mut names: Vec<Box<str>> = moves.keys().cloned().collect();
         names.sort_unstable();
@@ -364,7 +365,7 @@ impl Journal {
     pub(crate) fn flush(
         &mut self,
         tree: &Tree,
-        heads: &HashMap<Box<str>, NodeId>,
+        heads: &HashMap<Box<str>, NodeId, Global>,
         effects: &mut Vec<Effect>,
     ) {
         if !matches!(self.flight, Flight::Idle) {
@@ -442,7 +443,7 @@ impl Journal {
     pub(crate) fn complete(
         &mut self,
         tree: &Tree,
-        heads: &HashMap<Box<str>, NodeId>,
+        heads: &HashMap<Box<str>, NodeId, Global>,
         completion: Completion,
         effects: &mut Vec<Effect>,
     ) -> Vec<Ticket> {
@@ -674,7 +675,7 @@ fn record(bytes: &[u8]) -> Option<Record<'_>> {
 fn load(
     tree: &mut Tree,
     record: &Record<'_>,
-    moves: &mut HashMap<Box<str>, Vec<(u64, Option<ContentId>)>>,
+    moves: &mut HashMap<Box<str>, Vec<(u64, Option<ContentId>)>, Global>,
     sequence: &mut u64,
 ) -> Option<()> {
     let payload = record.payload;

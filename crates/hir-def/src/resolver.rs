@@ -3,6 +3,7 @@ use std::{cell::RefCell, fmt, iter, mem, ops::ControlFlow};
 
 use base_db::{Crate, Db};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_mem::scratch::Scratch;
 use hir_expand::{
     MacroDefId,
@@ -319,9 +320,12 @@ impl<'db> Resolver<'db> {
                     if let Some(res) = m.resolve_path_in_type_ns(db, path) {
                         let res = match res.0 {
                             TypeNs::ModuleId(_) if res.1.is_none() => {
-                                if let Some(ModuleDefId::BuiltinType(builtin)) = BUILTIN_SCOPE
-                                    .get(first_name)
-                                    .and_then(|builtin| builtin.take_types())
+                                let builtin = match BUILTIN_SCOPE.get(first_name) {
+                                    Some(builtin) => *builtin,
+                                    None => def_map.arbitrary_int(first_name),
+                                };
+                                if let Some(ModuleDefId::BuiltinType(builtin)) =
+                                    builtin.take_types()
                                 {
                                     (
                                         TypeNs::BuiltinType(builtin),
@@ -582,7 +586,13 @@ impl<'db> Resolver<'db> {
         // `use core::u16;`.
         if path.kind == PathKind::Plain
             && n_segments > 1
-            && let Some(builtin) = BuiltinType::by_name(first_name)
+            && let Some(builtin) = BuiltinType::by_name(first_name).or_else(|| {
+                let arbitrary = self.module_scope.def_map.arbitrary_int(first_name);
+                match arbitrary.take_types() {
+                    Some(ModuleDefId::BuiltinType(it)) => Some(it),
+                    _ => None,
+                }
+            })
         {
             return Some((
                 ResolveValueResult::Partial(TypeNs::BuiltinType(builtin), 1),
@@ -894,8 +904,8 @@ impl<'db> Resolver<'db> {
             .map(|(name, module_id)| (*name, module_id.0))
     }
 
-    pub fn traits_in_scope(&self, db: &Db) -> HashSet<TraitId> {
-        let mut traits = HashSet::default();
+    pub fn traits_in_scope(&self, db: &Db) -> HashSet<TraitId, Global> {
+        let mut traits = HashSet::new_in(Global);
         self.traits_in_scope_into(db, &mut traits);
         traits
     }

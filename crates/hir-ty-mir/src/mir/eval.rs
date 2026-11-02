@@ -69,22 +69,28 @@ use super::{Budget, IsSigned, MirEvalError, VTableMap, pad16};
 pub mod foreign;
 mod hooks;
 pub mod machine;
+mod narrow;
 mod provenance;
 mod shim;
 mod threads;
 mod unwind;
 
 use hooks::Hooks;
+use narrow::Narrow;
 use machine::{Access, EvalThread, Machine, MemKind, Plain, Ptr, RetagMode, Shadow, Site, TypedCx};
 use provenance::Provenance;
 
 macro_rules! from_bytes {
-    // A `usize` of the target, which is as wide as what holds it.
-    (usize, $value:expr) => {
-        match $crate::mir::eval::usize_of(AsRef::<[u8]>::as_ref(&$value)) {
+    // A `usize` of a target of `$word`-byte addresses: the evaluator's `cached_ptr_size`.
+    (usize, $word:expr, $value:expr) => {
+        match $crate::mir::eval::usize_of(AsRef::<[u8]>::as_ref(&$value), $word) {
             Some(it) => it,
             None => return Err(MirEvalError::InternalError("mismatched size in constructing usize".into())),
         }
+    };
+    // Without the width the `$ty` arm below would read it at the host's: refused instead.
+    (usize, $value:expr) => {
+        compile_error!("`from_bytes!(usize, ..)` takes the evaluator's address width: `from_bytes!(usize, self.cached_ptr_size, ..)`")
     };
     ($ty:tt, $value:expr) => {
         ($ty::from_le_bytes(match ($value).try_into() {
@@ -143,7 +149,8 @@ trait VTableOfBytes<'db> {
 
 impl<'db> VTableOfBytes<'db> for VTableMap<'db> {
     fn ty_of_bytes(&self, bytes: &[u8]) -> Result<'db, Ty<'db>> {
-        let id = from_bytes!(usize, bytes);
+        // Every caller hands the one address-wide slot the id was written in.
+        let id = from_bytes!(usize, bytes.len(), bytes);
         self.ty(id)
     }
 }
@@ -334,12 +341,12 @@ impl std::ops::Deref for VariantLayout {
 /// The provenances the machine gave the evaluation's pointers, each once, by [`ProvId`].
 struct Provs<P> {
     list: Vec<P>,
-    index: HashMap<P, u32>,
+    index: HashMap<P, u32, std::alloc::Global>,
 }
 
 impl<P> Default for Provs<P> {
     fn default() -> Self {
-        Provs { list: Vec::new(), index: HashMap::default() } // alloc: empty, allocates nothing
+        Provs { list: Vec::new(), index: HashMap::new_in(std::alloc::Global) } // alloc: empty, allocates nothing
     }
 }
 
@@ -360,15 +367,15 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     heap_blocks: BTreeMap<usize, HeapBlock>,
     /// The offsets of freed heap blocks, by size class and alignment, for the next block of
     /// that class and alignment.
-    free_blocks: HashMap<(usize, usize), Vec<usize>>,
+    free_blocks: HashMap<(usize, usize), Vec<usize>, std::alloc::Global>,
     /// Where a promoted temporary of a body (`&[1, 2]`) is: in the heap, as its borrow
     /// outlives the call, once for every call of the body.
-    promoted: HashMap<(usize, LocalId), Address>,
+    promoted: HashMap<(usize, LocalId), Address, std::alloc::Global>,
     /// Whether dropping a value of a type does anything ([`Self::has_drop_glue`]).
-    drop_glue: HashMap<Ty<'db>, bool>,
+    drop_glue: HashMap<Ty<'db>, bool, std::alloc::Global>,
     /// Where the value of a constant operand is, once read: the program never writes it, so
     /// every use of the constant reads the same copy.
-    constants: HashMap<Either<Const<'db>, Allocation<'db>>, Interval>,
+    constants: HashMap<Either<Const<'db>, Allocation<'db>>, Interval, std::alloc::Global>,
     code_stack: Vec<StackFrame<'db>>,
     /// Emptied `code_stack`s, for the nested runs of [`Self::interpret_mir`].
     spare_code_stacks: Vec<Vec<StackFrame<'db>>>,
@@ -394,7 +401,7 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// The running thread's destructors to call when its start function returns.
     at_exit: Vec<(usize, Address)>,
     /// The running thread's `#[thread_local]` statics, as [`Self::static_locations`].
-    thread_statics: HashMap<StaticId, Address>,
+    thread_statics: HashMap<StaticId, Address, std::alloc::Global>,
     /// What the thread shims keep for the whole process: pthread keys, signal actions.
     process: shim::Process,
     /// The virtual clock, in nanoseconds since the run started.
@@ -412,17 +419,15 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     moved_args: Vec<Interval>,
     /// A panic left the run of [`Self::interpret_mir`] being ended, with its frames on it.
     escaped: bool,
-    /// The `#[panic_handler]` of the crate graph, once looked for.
-    panic_handler: std::cell::OnceCell<Option<FunctionId>>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
-    static_locations: HashMap<StaticId, Address>,
+    static_locations: HashMap<StaticId, Address, std::alloc::Global>,
     /// The memory of each evaluated static, as start and size.
     static_memory: Vec<(usize, usize, StaticId)>,
     /// The statics whose value is read, when the others are left unevaluated: a static that
     /// is only pointed to needs no value, and may itself point back at the one being
     /// evaluated. `None` evaluates every static that is named.
-    read_statics: Option<HashSet<StaticId>>,
+    read_statics: Option<HashSet<StaticId, std::alloc::Global>>,
     /// Heap memory standing in for the statics left unevaluated, as start and size.
     unevaluated_statics: Vec<(usize, usize, StaticId)>,
     /// The unevaluated static whose memory was read, which fails the evaluation.
@@ -444,24 +449,26 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     random_state: blaze_rng::SplitMix64,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    layout_cache: RefCell<HashMap<Ty<'db>, Interned<'static, InternedLayout>>>,
-    projected_ty_cache: RefCell<HashMap<(PlaceTy<'db>, PlaceElem), PlaceTy<'db>>>,
-    not_special_fn_cache: RefCell<HashSet<FunctionId>>,
-    mir_or_dyn_index_cache: RefCell<HashMap<(FunctionId, GenericArgs<'db>), MirOrDynIndex<'db>>>,
+    layout_cache: RefCell<HashMap<Ty<'db>, Interned<'static, InternedLayout>, std::alloc::Global>>,
+    projected_ty_cache: RefCell<HashMap<(PlaceTy<'db>, PlaceElem), PlaceTy<'db>, std::alloc::Global>>,
+    not_special_fn_cache: RefCell<HashSet<FunctionId, std::alloc::Global>>,
+    mir_or_dyn_index_cache: RefCell<HashMap<(FunctionId, GenericArgs<'db>), MirOrDynIndex<'db>, std::alloc::Global>>,
     /// Constantly dropping and creating `Locals` is very costly. We store
     /// old locals that we normally want to drop here, to reuse their allocations
     /// later.
-    unused_locals_store: RefCell<HashMap<InferBodyId<'db>, Vec<Locals<'db>>>>,
+    unused_locals_store: RefCell<HashMap<InferBodyId<'db>, Vec<Locals<'db>>, std::alloc::Global>>,
     /// [`Self::storage_marked`] of each body run under a machine, by the body's address.
-    storage_marked: RefCell<HashMap<usize, Arc<HashSet<LocalId>>>>,
+    storage_marked: RefCell<HashMap<usize, Arc<HashSet<LocalId, std::alloc::Global>>, std::alloc::Global>>,
     cached_ptr_size: usize,
     cached_fn_trait_func: Option<FunctionId>,
     cached_fn_mut_trait_func: Option<FunctionId>,
     cached_fn_once_trait_func: Option<FunctionId>,
     crate_id: Crate,
-    /// What the `TypeId`s made so far stand for. An id here is its place in this list, which
-    /// says whether two are of one type and is not the hash compiled code has.
-    type_ids: Vec<TypeIdOf<'db>>,
+    /// The types of the `TypeId`s made so far. An id here is its place in this list, which
+    /// says whether two are of one type and is not the hash compiled code has. A field's id is
+    /// its field representing type's (`FieldRepresentingType<Base, VARIANT, FIELD>`), as rustc
+    /// makes it.
+    type_ids: Vec<Ty<'db>>,
     /// What the evaluation may spend, of the workspace of the crate it is for.
     budget: ConstEvalBudget,
     /// The steps of [`Self::budget`] not spent yet.
@@ -484,14 +491,6 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     infcx: InferCtxt<'db>,
     /// What an embedder set ([`foreign`]).
     embedder: foreign::Embedder<'db, M>,
-}
-
-/// What a `TypeId` of the evaluation stands for: a type, or the type that stands for a field
-/// of one in reflection (`type_id_field_representing_type`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TypeIdOf<'db> {
-    Ty(Ty<'db>),
-    Field { base: Ty<'db>, variant: usize, field: usize },
 }
 
 /// Which memory of the evaluation an address is in.
@@ -617,31 +616,28 @@ impl<S> IntervalOrOwned<S> {
     }
 }
 
-/// Where the addresses of the stack and of the heap start, which have to fit an address
-/// of the target.
-fn stack_offset() -> usize {
-    1 << (target_word() * 8 - 4)
+/// Where the addresses of the stack and of the heap start on a target of `word`-byte
+/// addresses, which they have to fit. `word` is the evaluator's (`cached_ptr_size`, from the
+/// crate's data layout), never the process's: one process evaluates for wasm32 and the host.
+fn stack_offset(word: usize) -> usize {
+    1 << (word * 8 - 4)
 }
 
-fn heap_offset() -> usize {
-    1 << (target_word() * 8 - 5)
+fn heap_offset(word: usize) -> usize {
+    1 << (word * 8 - 5)
 }
 
-/// How many bytes an address of the target takes.
-fn target_word() -> usize {
-    crate::mir::target::word()
+/// The `usize` of a target of `word`-byte addresses that `bytes` are.
+fn usize_of(bytes: &[u8], word: usize) -> Option<usize> {
+    let mut value = [0; size_of::<usize>()];
+    (bytes.len() == word).then_some(())?;
+    value.get_mut(..word)?.copy_from_slice(bytes);
+    Some(usize::from_le_bytes(value))
 }
 
-/// The `usize` of the target that `bytes` are.
-fn usize_of(bytes: &[u8]) -> Option<usize> {
-    let mut word = [0; size_of::<usize>()];
-    (bytes.len() == target_word()).then(|| word[..bytes.len()].copy_from_slice(bytes))?;
-    Some(usize::from_le_bytes(word))
-}
-
-/// `value` as a `usize` of the target.
-fn word_bytes(value: usize) -> smallvec::SmallVec<[u8; 8]> {
-    smallvec::SmallVec::from_slice(&value.to_le_bytes()[..target_word()])
+/// `value` as a `usize` of a target of `word`-byte addresses.
+fn word_bytes(value: usize, word: usize) -> smallvec::SmallVec<[u8; 8]> {
+    smallvec::SmallVec::from_slice(&value.to_le_bytes()[..word])
 }
 
 impl Address {
@@ -669,15 +665,15 @@ impl Address {
         }
     }
 
-    fn from_bytes<'db>(it: &[u8]) -> Result<'db, Self> {
-        Ok(Address::from_usize(from_bytes!(usize, it)))
+    fn from_bytes<'db>(it: &[u8], word: usize) -> Result<'db, Self> {
+        Ok(Address::from_usize(from_bytes!(usize, word, it), word))
     }
 
-    fn from_usize(it: usize) -> Self {
-        if it > stack_offset() {
-            Address::stack(it - stack_offset())
-        } else if it > heap_offset() {
-            Address::heap(it - heap_offset())
+    fn from_usize(it: usize, word: usize) -> Self {
+        if it > stack_offset(word) {
+            Address::stack(it - stack_offset(word))
+        } else if it > heap_offset(word) {
+            Address::heap(it - heap_offset(word))
         } else {
             Address::invalid(it)
         }
@@ -689,14 +685,14 @@ impl Address {
         size == 0 && self.space == Space::Invalid
     }
 
-    fn to_bytes(&self) -> smallvec::SmallVec<[u8; 8]> {
-        word_bytes(self.to_usize())
+    fn to_bytes(&self, word: usize) -> smallvec::SmallVec<[u8; 8]> {
+        word_bytes(self.to_usize(word), word)
     }
 
-    fn to_usize(&self) -> usize {
+    fn to_usize(&self, word: usize) -> usize {
         match self.space {
-            Space::Stack => self.offset + stack_offset(),
-            Space::Heap => self.offset + heap_offset(),
+            Space::Stack => self.offset + stack_offset(word),
+            Space::Heap => self.offset + heap_offset(word),
             Space::Invalid => self.offset,
         }
     }
@@ -764,7 +760,7 @@ pub fn interpret_mir<'db>(
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<'db, (Result<'db, Allocation<'db>>, MirOutput)> {
     let ty = body.locals[return_slot()].ty.as_ref();
-    let mut read_statics = HashSet::default();
+    let mut read_statics = HashSet::new_in(std::alloc::Global);
     loop {
         let mut evaluator = Evaluator::with_machine(
             db,
@@ -846,13 +842,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         // const eval, which cannot read them as integers, so no other value is computed from
         // an id's bytes: comparing two (`IS_UNIT` in core) and reflection's counts, sizes and
         // names are answered.
-        if !self.type_ids.is_empty() && !self.holds_no_type_id(ty, &mut HashSet::default()) {
-            let of = |it: &TypeIdOf<'db>| match *it {
-                TypeIdOf::Ty(ty) => Some(ty),
-                TypeIdOf::Field { .. } => None,
-            };
+        if !self.type_ids.is_empty() && !self.holds_no_type_id(ty, &mut HashSet::new_in(std::alloc::Global)) {
             // alloc: the constant's map, kept with it
-            memory_map.type_ids = self.type_ids.iter().map(of).collect();
+            memory_map.type_ids = self.type_ids.iter().map(|&ty| Some(ty)).collect();
         }
         let pointers = self.note_pointers(interval, &mut memory_map)?;
         let bytes = Box::from(bytes);
@@ -895,7 +887,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             // alloc: the kept pieces' places, once per constant, as `note_pointer` takes the map
             map.memory.iter().map(|(&addr, bytes)| (addr, bytes.len())).collect();
         for (addr, len) in pieces {
-            let (_, shadow) = self.read_shadowed(Address::from_usize(addr), len)?;
+            let (_, shadow) = self.read_shadowed(Address::from_usize(addr, self.cached_ptr_size), len)?;
             shadow.pointers(len, size, |at| {
                 map.note_pointer(PointerAt::Memory(addr + at));
                 noted = true;
@@ -935,6 +927,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         // arguments select can be in crates the body's own doesn't depend on.
         let interner = DbInterner::new_with(db, trait_env.map_or(crate_id, |env| env.krate));
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        // A caller's environment (a pass over a `for const` body) can assume things of a
+        // binder; the owner's own names none, and a body the evaluator runs is expanded.
+        if let Some(env) = trait_env {
+            hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
+        }
         let lang_items = interner.lang_items();
         let budget = crate_id.workspace_data(db).const_eval;
         let limits_frames =
@@ -954,10 +951,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             heap: vec![0],
             stack_allocations: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             heap_blocks: BTreeMap::new(),
-            free_blocks: HashMap::default(),
-            promoted: HashMap::default(),
-            drop_glue: HashMap::default(),
-            constants: HashMap::default(),
+            free_blocks: HashMap::new_in(std::alloc::Global),
+            promoted: HashMap::new_in(std::alloc::Global),
+            drop_glue: HashMap::new_in(std::alloc::Global),
+            constants: HashMap::new_in(std::alloc::Global),
             code_stack: vec![], // alloc: empty, allocates nothing; one per evaluation
             spare_code_stacks: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             spare_args: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
@@ -970,7 +967,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             waiting: None,
             yielded: false,
             at_exit: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
-            thread_statics: HashMap::default(),
+            thread_statics: HashMap::new_in(std::alloc::Global),
             process: shim::Process::default(),
             clock: 0,
             wait_counter: 0,
@@ -979,7 +976,6 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             pending: None,
             moved_args: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             escaped: false,
-            panic_handler: std::cell::OnceCell::new(),
             vtable_map: VTableMap::default(),
             thread_local_storage: shim::TlsData::default(),
             static_locations: Default::default(),
@@ -1087,7 +1083,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     behind_deref = true;
                 }
                 ProjectionElem::Index(op) => {
-                    let offset = from_bytes!(usize, self.read_scalar(locals.ptr[*op])?);
+                    let offset = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(locals.ptr[*op])?);
                     metadata = None; // Result of index is always sized
                     let ty_size = self.size_of_sized(ty.ty, locals, "array inner type")?;
                     addr = self.project(addr, ty_size * offset, behind_deref)?;
@@ -1102,7 +1098,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 }
                             },
                             TyKind::Slice(_) => match &metadata {
-                                Some(it) => from_bytes!(usize, self.scalar(it)?) as u64,
+                                Some(it) => from_bytes!(usize, self.cached_ptr_size, self.scalar(it)?) as u64,
                                 None => not_supported!("slice place without metadata"),
                             },
                             _ => not_supported!("bad type for const index"),
@@ -1122,9 +1118,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     };
                     metadata = match metadata {
                         Some(it) => {
-                            let prev_len = from_bytes!(usize, self.scalar(&it)?) as u64;
+                            let prev_len = from_bytes!(usize, self.cached_ptr_size, self.scalar(&it)?) as u64;
                             Some(IntervalOrOwned::Owned(OwnedBytes::from_slice(&word_bytes(
                                 (prev_len - from - to) as usize,
+                                self.cached_ptr_size,
                             ))))
                         }
                         None => None,
@@ -1162,6 +1159,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
                 ProjectionElem::Downcast(_) => {
                     // no runtime effect
+                }
+                ProjectionElem::ReflectedField(_) => {
+                    return Err(MirEvalError::ComptimeUnexpanded(hir_ty::mir::ComptimeUnexpanded::new(
+                        hir_ty::mir::MirComptimeForm::ReflectedField,
+                        "the MIR evaluator",
+                    )));
                 }
             }
         }
@@ -1911,7 +1914,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     fn truncate_stack(&mut self, len: usize) -> Result<'db, ()> {
-        let end = Address::stack(self.stack_base() + len).to_usize();
+        let end = Address::stack(self.stack_base() + len).to_usize(self.cached_ptr_size);
         let kept = self.stack_allocations.partition_point(|it| it.start < end);
         if M::CHECKS {
             for allocated in self.stack_allocations[kept..].iter().filter(|it| it.tracked) {
@@ -1933,7 +1936,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if !M::CHECKS || interval.size == 0 || interval.addr.space != Space::Stack {
             return Ok(());
         }
-        let start = interval.addr.to_usize();
+        let start = interval.addr.to_usize(self.cached_ptr_size);
         let i = self.stack_allocations.partition_point(|it| it.start < start);
         let Some(allocated) = self.stack_allocations.get(i).filter(|it| it.start == start).copied()
         else {
@@ -1954,13 +1957,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     /// The locals of `body` with storage statements, which are live only from a `StorageLive`.
-    fn storage_marked(&self, body: &'db MirBody<'db>) -> Arc<HashSet<LocalId>> {
+    fn storage_marked(&self, body: &'db MirBody<'db>) -> Arc<HashSet<LocalId, std::alloc::Global>> {
         let key = std::ptr::from_ref(body) as usize;
         if let Some(it) = self.storage_marked.borrow().get(&key) {
             // clone: an `Arc`
             return it.clone();
         }
-        let marked: HashSet<LocalId> = body
+        let marked: HashSet<LocalId, std::alloc::Global> = body
             .basic_blocks
             .iter()
             .flat_map(|(_, block)| &block.statements)
@@ -2111,7 +2114,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let addr = Address::stack(self.stack_base() + my_ptr).aligned(align);
                 locals.ptr.insert(id, Interval { addr, size });
                 self.stack_allocations.push(Allocated {
-                    start: addr.to_usize(),
+                    start: addr.to_usize(self.cached_ptr_size),
                     size,
                     align,
                     tracked: false,
@@ -2130,7 +2133,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             // In index order, as `locals.ptr` is, without borrowing it across `set_storage`.
             for (id, _) in body.locals.iter() {
                 let Some(at) = locals.ptr.get(id) else { continue };
-                let in_frame = at.addr.to_usize() >= frame_start.to_usize();
+                let in_frame = at.addr.to_usize(self.cached_ptr_size) >= frame_start.to_usize(self.cached_ptr_size);
                 if !marked.contains(&id) && in_frame {
                     self.set_storage(id, &mut locals, true)?;
                 }
@@ -2196,6 +2199,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             Owned(OwnedBytes::from_slice(&c.to_bits().to_le_bytes()))
                         }
                     }
+                } else if let Some(n) = Narrow::of(ty) {
+                    // `-iN::MIN` wraps here; a check before it is an `Assert` (`OverflowNeg`).
+                    let value = n.read(c)?;
+                    let value = match op {
+                        UnOp::Not => n.not(value),
+                        UnOp::Neg => n.neg(value).0,
+                    };
+                    Owned(Narrow::bytes(value, c.len()))
                 } else {
                     let mut c = OwnedBytes::from_slice(c);
                     if matches!(ty.kind(), TyKind::Bool) {
@@ -2248,8 +2259,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             ));
                         }
                         let ps = self.ptr_size();
-                        let ls = from_bytes!(usize, self.read_scalar(lv.slice(ps..ps * 2))?);
-                        let rs = from_bytes!(usize, self.read_scalar(rv.slice(ps..ps * 2))?);
+                        let ls = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(lv.slice(ps..ps * 2))?);
+                        let rs = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(rv.slice(ps..ps * 2))?);
                         if ls != rs {
                             break 'binary_op Owned(smallvec![0]); // alloc: inline `OwnedBytes`, no heap
                         }
@@ -2394,6 +2405,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             }
                         }
                     }
+                } else if let Some(n) = Narrow::of(ty)
+                    && !matches!(
+                        op,
+                        BinOp::Ge | BinOp::Gt | BinOp::Le | BinOp::Lt | BinOp::Eq | BinOp::Ne
+                    )
+                {
+                    let mut rhs_ty = self.operand_ty(rhs, locals)?;
+                    while let TyKind::Ref(_, inner, _) = rhs_ty.kind() {
+                        rhs_ty = inner;
+                    }
+                    Owned(self.narrow_binary_op(n, op, checked, (lc, ty), (rc, rhs_ty), locals)?)
                 } else {
                     let is_signed = matches!(ty.kind(), TyKind::Int(_));
                     let l128 = IntValue::from_bytes(lc, is_signed)?;
@@ -2446,11 +2468,22 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         BinOp::Shl | BinOp::Shr => {
                             let r = 'b: {
                                 let bits = lc.len() as u32 * 8;
+                                // An arbitrary-width amount is read at its own width
+                                // (`narrow::shift_amount`): `-1i3` is 7.
+                                let rhs_ty = self.operand_ty(rhs, locals)?;
+                                let narrow_amount =
+                                    Narrow::of(rhs_ty).map(|_| narrow::shift_amount(rc, rhs_ty));
                                 let amount = if checked && self.checks_overflow(locals) {
-                                    r128.as_u32()
+                                    match narrow_amount {
+                                        Some(amount) => u32::try_from(amount).ok(),
+                                        None => r128.as_u32(),
+                                    }
                                 } else {
                                     // An unchecked shift takes the low bits of its amount.
-                                    Some(u32::from(r128.to_bytes()[0]) % bits)
+                                    Some(match narrow_amount {
+                                        Some(amount) => (amount % u128::from(bits)) as u32,
+                                        None => u32::from(r128.to_bytes()[0]) % bits,
+                                    })
                                 };
                                 if let Some(shift_amount) = amount {
                                     let r = match op {
@@ -2627,7 +2660,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             self.machine.expose(Ptr { addr, prov })?;
                         }
                     }
-                    let bytes = OwnedBytes::from_slice(&pad16(bytes, is_signed)[0..dest_size]);
+                    let mut bytes = OwnedBytes::from_slice(&pad16(bytes, is_signed)[0..dest_size]);
+                    // `as uN` truncates to N bits and extends from them.
+                    if let Some(n) = Narrow::of(target_ty.as_ref()) {
+                        let value = i128::from_le_bytes(pad16(&bytes, IsSigned::Yes));
+                        bytes = Narrow::bytes(n.normalize(value), dest_size);
+                    }
                     if M::CHECKS && *kind == CastKind::PointerFromExposedAddress {
                         let addr = u128::from_le_bytes(pad16(&bytes, IsSigned::No)) as u64;
                         let prov = self.machine.from_exposed(addr);
@@ -2648,15 +2686,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         locals,
                         "destination of float to int cast",
                     )?;
+                    // `as uN` saturates at N bits.
+                    let narrow = Narrow::of(target_ty.as_ref());
+                    let width = narrow.map_or(dest_size * 8, |it| it.bits() as usize);
                     let soft = match ty {
                         rustc_type_ir::FloatTy::F16 => Some(apfloat_to_int(
                             from_bytes!(f16, u16, value),
-                            dest_size * 8,
+                            width,
                             is_signed,
                         )),
                         rustc_type_ir::FloatTy::F128 => Some(apfloat_to_int(
                             from_bytes!(f128, u128, value),
-                            dest_size * 8,
+                            width,
                             is_signed,
                         )),
                         _ => None,
@@ -2677,6 +2718,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             unreachable!("converted above")
                         }
                     };
+                    if let Some(n) = narrow {
+                        return Ok(Owned(Narrow::bytes(n.saturate(value), dest_size)));
+                    }
                     let dest_bits = dest_size * 8;
                     let (max, min) = if dest_bits == 128 {
                         (i128::MAX, i128::MIN)
@@ -2796,32 +2840,49 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             AssertKind::BoundsCheck { len, index } => {
                 let len = {
                     let len = self.eval_operand(len, locals)?;
-                    from_bytes!(usize, self.read_scalar(len)?)
+                    from_bytes!(usize, self.cached_ptr_size, self.read_scalar(len)?)
                 };
                 let index = {
                     let index = self.eval_operand(index, locals)?;
-                    from_bytes!(usize, self.read_scalar(index)?)
+                    from_bytes!(usize, self.cached_ptr_size, self.read_scalar(index)?)
                 };
                 // alloc: the panic's message, only when an assert fails
                 format!("index out of bounds: the len is {len} but the index is {index}")
             }
-            // alloc: the panic's message, only when an assert fails
-            AssertKind::Overflow(op, ..) => format!("Overflow in {op:?}"),
-            // alloc: the panic's message, only when an assert fails
-            AssertKind::OverflowNeg(_) => "Overflow in Neg".to_owned(),
-            // alloc: the panic's message, only when an assert fails
-            AssertKind::DivisionByZero(_) => "Overflow in Div".to_owned(),
-            // alloc: the panic's message, only when an assert fails
-            AssertKind::RemainderByZero(_) => "Overflow in Rem".to_owned(),
+            // An arbitrary-width integer's panic names the operation and its type.
+            AssertKind::Overflow(op, lhs, _) => match Narrow::of(self.operand_ty(lhs, locals)?) {
+                Some(n) => n.overflow(op),
+                // alloc: the panic's message, only when an assert fails
+                None => format!("Overflow in {op:?}"),
+            },
+            AssertKind::OverflowNeg(operand) => match Narrow::of(self.operand_ty(operand, locals)?) {
+                Some(n) => n.neg_overflow(),
+                // alloc: the panic's message, only when an assert fails
+                None => "Overflow in Neg".to_owned(),
+            },
+            AssertKind::DivisionByZero(operand) => {
+                match Narrow::of(self.operand_ty(operand, locals)?) {
+                    Some(n) => n.by_zero(&BinOp::Div),
+                    // alloc: the panic's message, only when an assert fails
+                    None => "Overflow in Div".to_owned(),
+                }
+            }
+            AssertKind::RemainderByZero(operand) => {
+                match Narrow::of(self.operand_ty(operand, locals)?) {
+                    Some(n) => n.by_zero(&BinOp::Rem),
+                    // alloc: the panic's message, only when an assert fails
+                    None => "Overflow in Rem".to_owned(),
+                }
+            }
             // core's words for the panics of the UB checks (`core::panicking`).
             AssertKind::MisalignedPointerDereference { required, found } => {
                 let required = {
                     let required = self.eval_operand(required, locals)?;
-                    from_bytes!(usize, self.read_scalar(required)?)
+                    from_bytes!(usize, self.cached_ptr_size, self.read_scalar(required)?)
                 };
                 let found = {
                     let found = self.eval_operand(found, locals)?;
-                    from_bytes!(usize, self.read_scalar(found)?)
+                    from_bytes!(usize, self.cached_ptr_size, self.read_scalar(found)?)
                 };
                 // alloc: the panic's message, only when an assert fails
                 format!(
@@ -2971,7 +3032,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         }
                         Some(it) => it as usize,
                     };
-                    self.with_metadata(addr, &word_bytes(len))?
+                    self.with_metadata(addr, &word_bytes(len, self.cached_ptr_size))?
                 }
                 t => {
                     not_supported!("slice unsizing from non array type {t:?}")
@@ -2985,7 +3046,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             TyKind::Dynamic(..) => {
                 let vtable = self.vtable_map.id(current_ty);
-                self.with_metadata(addr, &word_bytes(vtable))?
+                self.with_metadata(addr, &word_bytes(vtable, self.cached_ptr_size))?
             }
             TyKind::Adt(adt_def, target_subst) => match &current_ty.kind() {
                 TyKind::Adt(current_adt_def, current_subst) => {
@@ -3266,7 +3327,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let size = self.ptr_size();
                 let addr = self.heap_allocate(2 * size, size)?;
                 self.write_pointer(addr, at)?;
-                self.write_memory(addr.offset(size), &word_bytes(text.len()))?;
+                self.write_memory(addr.offset(size), &word_bytes(text.len(), self.cached_ptr_size))?;
                 self.freeze(Interval::new(addr, 2 * size));
                 Some(Interval::new(addr, 2 * size))
             }
@@ -3609,7 +3670,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             if freezes {
                 frozen.push(Interval::new(addr, b.len()));
             }
-            Ok(addr.to_usize())
+            Ok(addr.to_usize(self.cached_ptr_size))
         })?;
         let padded;
         let v: &[u8] = if size != v.len() {
@@ -3626,12 +3687,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             v
         };
         self.write_memory(addr, v)?;
+        let ptr_size = self.cached_ptr_size;
         self.patch_addresses(
             &patch_map,
             memory_map,
             |bytes| match memory_map {
                 MemoryMap::Empty | MemoryMap::Simple(_) => {
-                    Err(MirEvalError::InvalidVTableId(from_bytes!(usize, bytes)))
+                    Err(MirEvalError::InvalidVTableId(from_bytes!(usize, ptr_size, bytes)))
                 }
                 MemoryMap::Complex(cm) => cm.vtable.ty_of_bytes(bytes),
             },
@@ -3660,7 +3722,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             (false, _) | (_, 0) => None,
             (true, id) => self.provs.borrow().list.get(id as usize - 1).copied(),
         };
-        Ptr { addr: addr.to_usize() as u64, prov }
+        Ptr { addr: addr.to_usize(self.cached_ptr_size) as u64, prov }
     }
 
     /// `addr` with the provenance `prov`.
@@ -3712,11 +3774,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let size = self.ptr_size();
         let addr = addr.aligned(size);
         if !M::CHECKS {
-            return Address::from_bytes(self.peek_memory(addr, size)?);
+            return Address::from_bytes(self.peek_memory(addr, size)?, self.cached_ptr_size);
         }
         let (bytes, shadow) = self.read_shadowed(addr, size)?;
         self.machine.require_init(&shadow, 0..size)?;
-        let pointer = Address::from_bytes(bytes)?;
+        let pointer = Address::from_bytes(bytes, self.cached_ptr_size)?;
         Ok(self.with_prov(pointer, shadow.prov_at(0, size)))
     }
 
@@ -3728,7 +3790,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         let (mem, pos): (&[u8], usize) = match addr.at() {
             Stack(it) => {
-                let (t, pos) = threads::stack_position(it);
+                let (t, pos) = threads::stack_position(it, self.cached_ptr_size);
                 let Some(region) = threads::region(&self.stack, &self.threads, self.thread, t)
                 else {
                     // alloc: error path
@@ -3818,7 +3880,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         let (mem, pos) = match addr.at() {
             Stack(it) => {
-                let (t, pos) = threads::stack_position(it);
+                let (t, pos) = threads::stack_position(it, self.cached_ptr_size);
                 let running = self.thread;
                 let Some(region) =
                     threads::region_mut(&mut self.stack, &mut self.threads, running, t)
@@ -3866,7 +3928,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// Writes at `at` a pointer to `to`, which carries `to`'s provenance.
     fn write_pointer(&mut self, at: Address, to: Address) -> Result<'db, ()> {
-        let bytes = to.to_bytes();
+        let bytes = to.to_bytes(self.cached_ptr_size);
         if !M::CHECKS {
             return self.write_memory(at, &bytes);
         }
@@ -3877,18 +3939,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// Writes at `at` a pointer to `to`, an address in memory the evaluator laid out itself (a
     /// constant's), which carries the root provenance of the allocation `to` is in.
     fn write_root_pointer(&mut self, at: Address, to: usize) -> Result<'db, ()> {
-        let to = Address::from_usize(to);
+        let to = Address::from_usize(to, self.cached_ptr_size);
         if !M::CHECKS {
-            return self.write_memory(at, &to.to_bytes());
+            return self.write_memory(at, &to.to_bytes(self.cached_ptr_size));
         }
-        let to = self.with_prov(to, self.machine.root(to.to_usize() as u64));
+        let to = self.with_prov(to, self.machine.root(to.to_usize(self.cached_ptr_size) as u64));
         self.write_pointer(at, to)
     }
 
     /// Writes at `at` a pointer to the function `id` (a [`VTableMap`] id), which carries the
     /// provenance the machine gives functions.
     fn write_function_pointer(&mut self, at: Address, id: usize) -> Result<'db, ()> {
-        let bytes = word_bytes(id);
+        let bytes = word_bytes(id, self.cached_ptr_size);
         if !M::CHECKS {
             self.poke_memory(at, bytes.len())?.copy_from_slice(&bytes);
             return Ok(());
@@ -3903,7 +3965,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         to: Address,
         metadata: Option<&IntervalOrOwned<M::Shadow>>,
     ) -> Result<'db, IntervalOrOwned<M::Shadow>> {
-        let mut bytes = OwnedBytes::from_slice(&to.to_bytes());
+        let mut bytes = OwnedBytes::from_slice(&to.to_bytes(self.cached_ptr_size));
         let Some(metadata) = metadata else {
             return Ok(match M::CHECKS {
                 true => {
@@ -3980,7 +4042,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         match (addr.at(), r.addr.at()) {
             (Stack(dst), Stack(src)) => {
                 let ((dst_thread, dst), (src_thread, src)) =
-                    (threads::stack_position(dst), threads::stack_position(src));
+                    (threads::stack_position(dst, self.cached_ptr_size), threads::stack_position(src, self.cached_ptr_size));
                 if dst_thread == src_thread {
                     let stack =
                         threads::region_mut(&mut self.stack, &mut self.threads, running, dst_thread)
@@ -4007,14 +4069,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 self.heap.copy_within(src..src + r.size, dst)
             }
             (Stack(dst), Heap(src)) => {
-                let (dst_thread, dst) = threads::stack_position(dst);
+                let (dst_thread, dst) = threads::stack_position(dst, self.cached_ptr_size);
                 threads::region_mut(&mut self.stack, &mut self.threads, running, dst_thread)
                     .and_then(|it| it.get_mut(dst..dst + r.size))
                     .ok_or_else(oob)?
                     .copy_from_slice(self.heap.get(src..src + r.size).ok_or_else(oob)?);
             }
             (Heap(dst), Stack(src)) => {
-                let (src_thread, src) = threads::stack_position(src);
+                let (src_thread, src) = threads::stack_position(src, self.cached_ptr_size);
                 let bytes = threads::region(&self.stack, &self.threads, running, src_thread)
                     .and_then(|it| it.get(src..src + r.size))
                     .ok_or_else(oob)?;
@@ -4024,7 +4086,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 // alloc: error path
                 return Err(MirEvalError::UndefinedBehavior(format!(
                     "invalid memory write at address {:#x}",
-                    addr.to_usize()
+                    addr.to_usize(self.cached_ptr_size)
                 )));
             }
         }
@@ -4046,28 +4108,116 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         Ok(layout.is_sized().then(|| (layout.size.bytes_usize(), layout.align.bytes() as usize)))
     }
 
-    /// The size of a value of a struct whose last field is a `str` or a slice, or of one of
-    /// those, given the pointer metadata. `None` for a `dyn` tail.
+    /// The size of a value of a struct whose last field is a `str`, a slice or a `dyn`, or of
+    /// one of those, given the pointer metadata.
     fn size_of_unsized_struct(&self, ty: Ty<'db>, metadata: &[u8]) -> Result<'db, Option<usize>> {
-        let len = from_bytes!(usize, metadata);
+        Ok(self.size_align_of_tail(ty, metadata)?.map(|(size, _)| size))
+    }
+
+    /// The size and alignment of a value of the unsized `ty` whose pointer's metadata is
+    /// `metadata`: a struct's or tuple's tail starts where its sized fields end, at the tail's
+    /// alignment (a `dyn`'s is its concrete type's) capped by the struct's `packed`, as rustc
+    /// lays it out ([`Evaluator::tail_offset`], `hir_ty::layout::dyn_tail_place`).
+    fn size_align_of_tail(
+        &self,
+        ty: Ty<'db>,
+        metadata: &[u8],
+    ) -> Result<'db, Option<(usize, usize)>> {
+        let len = from_bytes!(usize, self.cached_ptr_size, metadata);
         Ok(match ty.kind() {
-            TyKind::Str => Some(len),
-            TyKind::Slice(inner) => Some(self.layout(inner)?.size.bytes_usize() * len),
-            TyKind::Adt(adt, subst) => {
-                let AdtId::StructId(id) = adt.def_id() else { return Ok(None) };
-                let layout = self.layout(ty)?;
-                let field_types = self.db.field_types(id.into());
-                let Some((_, last)) = field_types.iter().next_back() else { return Ok(None) };
-                let last = last.ty().instantiate(self.interner(), subst).skip_norm_wip();
-                let Some(tail) = self.size_of_unsized_struct(last, metadata)? else {
+            TyKind::Str => Some((len, 1)),
+            TyKind::Slice(inner) => {
+                let layout = self.layout(inner)?;
+                Some((layout.size.bytes_usize() * len, layout.align.bytes() as usize))
+            }
+            TyKind::Dynamic(..) => {
+                let layout = self.layout(self.vtable_map.ty_of_bytes(metadata)?)?;
+                Some((layout.size.bytes_usize(), layout.align.bytes() as usize))
+            }
+            TyKind::Adt(..) | TyKind::Tuple(..) => {
+                let Some(last) = self.last_field(ty)? else { return Ok(None) };
+                let Some((tail, tail_align)) = self.size_align_of_tail(last.ty, metadata)? else {
                     return Ok(None);
                 };
-                let start = layout.fields.offset(field_types.iter().count() - 1).bytes_usize();
-                let align = layout.align.bytes() as usize;
-                Some((start + tail).next_multiple_of(align))
+                let (start, align) = self.tail_offset(ty, &last, tail_align)?;
+                Some(((start + tail).next_multiple_of(align), align))
             }
             _ => None,
         })
+    }
+
+    /// The last field of the struct or tuple `ty`, normalized, with its index and its
+    /// struct's `packed`; `None` for another type, a struct with no fields or an enum.
+    fn last_field(&self, ty: Ty<'db>) -> Result<'db, Option<LastField<'db>>> {
+        Ok(match ty.kind() {
+            TyKind::Adt(adt, subst) => {
+                let AdtId::StructId(id) = adt.def_id() else { return Ok(None) };
+                let field_types = self.db.field_types(id.into());
+                let Some((_, last)) = field_types.iter().next_back() else { return Ok(None) };
+                let last = last.ty().instantiate(self.interner(), subst).skip_norm_wip();
+                let pack = hir_def::attrs::AttrFlags::repr(self.db, id.into())
+                    .and_then(|it| it.pack)
+                    .map(|it| it.bytes_usize());
+                Some(LastField {
+                    ty: self.normalized(last, "the tail of a struct")?,
+                    index: field_types.iter().count() - 1,
+                    pack,
+                })
+            }
+            TyKind::Tuple(tys) => {
+                let Some(last) = tys.iter().next_back() else { return Ok(None) };
+                let ty = self.normalized(last, "the tail of a tuple")?;
+                Some(LastField { ty, index: tys.len() - 1, pack: None })
+            }
+            _ => None,
+        })
+    }
+
+    /// Where the unsized `last` field of `ty` starts when the tail is aligned to `tail_align`,
+    /// and the alignment of a value of `ty`: after the sized fields, at the tail's alignment
+    /// capped by `packed`, as rustc's `project_field` and `size_and_align_of_dst` place it and
+    /// as `hir_ty::layout::dyn_tail_place` does for a `dyn`.
+    fn tail_offset(
+        &self,
+        ty: Ty<'db>,
+        last: &LastField<'db>,
+        tail_align: usize,
+    ) -> Result<'db, (usize, usize)> {
+        let layout = self.layout(ty)?;
+        let field_align = last.pack.map_or(tail_align, |pack| tail_align.min(pack));
+        let start = layout.fields.offset(last.index).bytes_usize().next_multiple_of(field_align);
+        Ok((start, (layout.align.bytes() as usize).max(field_align)))
+    }
+
+    /// `ty` normalized when it is an alias (a field's `<T as Tr>::Obj`), as its size, layout or
+    /// kind is read; one that does not normalize is an error naming `what` it is.
+    fn normalized(&self, ty: Ty<'db>, what: &str) -> Result<'db, Ty<'db>> {
+        if !matches!(ty.kind(), TyKind::Alias(..)) {
+            return Ok(ty);
+        }
+        let normalized = ObligationCtxt::new(&self.infcx)
+            .structurally_normalize_ty(&ObligationCause::dummy(), self.param_env.param_env, ty)
+            .ok();
+        match normalized {
+            Some(it) if !matches!(it.kind(), TyKind::Alias(..) | TyKind::Infer(..)) => Ok(it),
+            _ => not_supported!("{what}, `{ty:?}`, does not normalize"),
+        }
+    }
+
+    /// The type at the end of `ty`'s chain of last fields, normalized, which says what a pointer
+    /// to `ty` has for metadata; one that does not normalize is an error.
+    fn struct_tail(&self, ty: Ty<'db>) -> Result<'db, Ty<'db>> {
+        let mut failed = None;
+        let tail = crate::layout::struct_tail_erasing_lifetimes(self.db, ty, |it| {
+            self.normalized(it, "a struct's tail").unwrap_or_else(|e| {
+                failed = Some(e);
+                it
+            })
+        });
+        match failed {
+            Some(e) => Err(e),
+            None => self.normalized(tail, "a pointee's tail"),
+        }
     }
 
     /// A version of `self.size_of` which returns error if the type is unsized. `what` argument should
@@ -4100,9 +4250,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// The allocation `addr` is in.
     fn allocation_at(&self, addr: usize) -> Option<Allocated> {
-        match Address::from_usize(addr).at() {
+        match Address::from_usize(addr, self.cached_ptr_size).at() {
             Stack(offset) => {
-                let (t, _) = threads::stack_position(offset);
+                let (t, _) = threads::stack_position(offset, self.cached_ptr_size);
                 let allocations = threads::region_allocations(
                     &self.stack_allocations,
                     &self.threads,
@@ -4115,7 +4265,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             Heap(offset) => {
                 let (start, block) = self.heap_block_at(offset)?;
-                let start = Address::heap(start).to_usize();
+                let start = Address::heap(start).to_usize(self.cached_ptr_size);
                 Some(Allocated { start, size: block.size, align: block.align, tracked: false })
             }
             Invalid(_) => None,
@@ -4162,7 +4312,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     #[inline(always)]
     fn freeze(&self, block: Interval) {
         if M::CHECKS && block.size != 0 {
-            self.machine.freeze(block.addr.to_usize() as u64);
+            self.machine.freeze(block.addr.to_usize(self.cached_ptr_size) as u64);
         }
     }
 
@@ -4171,7 +4321,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     #[inline(always)]
     fn initialized(&self, block: Interval) {
         if M::CHECKS && block.size != 0 {
-            self.machine.initialized(block.addr.to_usize() as u64);
+            self.machine.initialized(block.addr.to_usize(self.cached_ptr_size) as u64);
         }
     }
 
@@ -4199,8 +4349,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 self.heap[pos..pos + class].fill(0);
                 pos
             }
+            // A byte at least between each block and the next, so a pointer one past a block's
+            // end is not also the start of another: which allocation it is of stays known.
             None => {
-                let pos = self.heap.len().next_multiple_of(align);
+                let pos = (self.heap.len() + 1).next_multiple_of(align);
                 self.check_memory((pos - self.heap.len()).saturating_add(class))?;
                 self.heap.resize(pos + class, 0);
                 pos
@@ -4211,7 +4363,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if !M::CHECKS {
             return Ok(addr);
         }
-        let start = addr.to_usize() as u64;
+        let start = addr.to_usize(self.cached_ptr_size) as u64;
         let prov = self.machine.alloc(start, size as u64, align as u64, origin.kind(), zeroed)?;
         Ok(self.with_prov(addr, Some(prov)))
     }
@@ -4306,7 +4458,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// latter alike ("encountered `const_allocate` pointer in final value that was not made
     /// global"), and has no `Box` or `Vec` that allocates in a constant.
     fn may_be_in_value(&self, addr: usize) -> Result<'db, ()> {
-        let Heap(offset) = Address::from_usize(addr).at() else { return Ok(()) };
+        let Heap(offset) = Address::from_usize(addr, self.cached_ptr_size).at() else { return Ok(()) };
         match self.heap_block_at(offset) {
             Some((_, HeapBlock { origin: Origin::Allocator, .. })) => {
                 Err(MirEvalError::HeapInValue { of_const_allocate: false })
@@ -4362,7 +4514,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// Whether no value of the type has a `TypeId` in it or behind its references. A type
     /// this cannot see through, as a raw pointer or a `dyn`, is taken to have one; one met
     /// again in `seen`, through a reference to itself, adds nothing.
-    fn holds_no_type_id(&self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>>) -> bool {
+    fn holds_no_type_id(&self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>, std::alloc::Global>) -> bool {
         if !seen.insert(ty) {
             return true;
         }
@@ -4421,9 +4573,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind()
                 && let Some(addr) = bytes.get(..this.ptr_size())
             {
-                let addr = from_bytes!(usize, addr);
+                let addr = from_bytes!(usize, this.cached_ptr_size, addr);
+                // One past a static's end is in it too, as rustc's provenance says.
                 let pointee = this.static_memory.iter().find(|&&(start, size, _)| {
-                    addr.checked_sub(start).is_some_and(|offset| offset < size.max(1))
+                    addr.checked_sub(start).is_some_and(|offset| offset <= size)
                 });
                 if let Some(&(start, size, id)) = pointee {
                     let pointee = crate::StaticMemory { start, size, id };
@@ -4454,15 +4607,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 TyKind::Pat(base, _) => rec(this, bytes, base, locals, mm, stack_depth_limit - 1)?,
                 TyKind::RawPtr(..) => {
                     let Some(addr) = bytes.get(..this.ptr_size()) else { return Ok(()) };
-                    let addr = from_bytes!(usize, addr);
+                    let addr = from_bytes!(usize, this.cached_ptr_size, addr);
                     behind_raw(this, addr, mm, stack_depth_limit - 1)?;
                 }
                 TyKind::Ref(_, t, _) => {
+                    // A field's pointee can be an alias (`&'static <T as Tr>::Obj`), whose size
+                    // and metadata are of the type it normalizes to.
+                    let t = this.normalized(t, "the pointee of a reference in a constant")?;
                     let size = this.size_align_of(t, locals)?;
                     match size {
                         Some((size, _)) => {
-                            let addr_usize = from_bytes!(usize, bytes);
-                            let addr = Address::from_usize(addr_usize);
+                            let addr_usize = from_bytes!(usize, this.cached_ptr_size, bytes);
+                            let addr = Address::from_usize(addr_usize, this.cached_ptr_size);
                             if addr.is_of_nothing(size) {
                                 return Ok(());
                             }
@@ -4474,14 +4630,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         None => {
                             let mut check_inner = None;
                             let (addr, meta) = bytes.split_at(bytes.len() / 2);
-                            if let TyKind::Adt(..) = t.kind() {
-                                // A struct with an unsized tail. FIXME: pointers in the
-                                // struct itself are not followed.
+                            if let TyKind::Adt(..) | TyKind::Tuple(..) = t.kind() {
+                                // A struct or tuple with an unsized tail, whose fields are
+                                // followed as a sized one's are, the tail's by its metadata.
                                 if let Some(size) = this.size_of_unsized_struct(t, meta)? {
-                                    let addr = Address::from_bytes(addr)?;
+                                    let addr = Address::from_bytes(addr, this.cached_ptr_size)?;
                                     let b = this.read_memory(addr, size)?;
-                                    mm.memory.insert(addr.to_usize(), b);
-                                    this.note_align(mm, addr.to_usize());
+                                    mm.memory.insert(addr.to_usize(this.cached_ptr_size), b);
+                                    this.note_align(mm, addr.to_usize(this.cached_ptr_size));
+                                    let depth = stack_depth_limit - 1;
+                                    unsized_fields(this, b, t, meta, locals, mm, depth)?;
+                                    dyn_tail(this, b, t, meta, locals, mm, depth)?;
                                 }
                                 return Ok(());
                             }
@@ -4500,16 +4659,16 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             };
                             let count = match t.kind() {
                                 TyKind::Dynamic(..) => 1,
-                                _ => from_bytes!(usize, meta),
+                                _ => from_bytes!(usize, this.cached_ptr_size, meta),
                             };
                             let size = element_size * count;
-                            let addr = Address::from_bytes(addr)?;
+                            let addr = Address::from_bytes(addr, this.cached_ptr_size)?;
                             if addr.is_of_nothing(size) {
                                 return Ok(());
                             }
                             let b = this.read_memory(addr, size)?;
-                            mm.memory.insert(addr.to_usize(), b);
-                            this.note_align(mm, addr.to_usize());
+                            mm.memory.insert(addr.to_usize(this.cached_ptr_size), b);
+                            this.note_align(mm, addr.to_usize(this.cached_ptr_size));
                             // Elements that take no room may be `usize::MAX` in number.
                             let plain = element_size == 0
                                 || check_inner.is_some_and(|ty| this.holds_no_pointer(ty));
@@ -4568,6 +4727,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     }
                 }
                 TyKind::Adt(adt, subst) => match adt.def_id() {
+                    // A `#[blaze::bits]` struct is an integer: no field holds an address.
+                    AdtId::StructId(s) if crate::layout::is_bits_struct(this.db, s) => {}
                     AdtId::StructId(s) => {
                         let data = s.fields(this.db);
                         let layout = this.layout(ty)?;
@@ -4648,9 +4809,115 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
                     rec(this, bytes, ty, locals, mm, stack_depth_limit - 1)?;
                 }
+                // A closure's captures, as a struct's fields.
+                TyKind::Closure(_, args) => {
+                    let layout = this.layout(ty)?;
+                    let upvars = args.as_closure().tupled_upvars_ty();
+                    for (i, ty) in upvars.tuple_fields().iter().enumerate() {
+                        let offset = layout.fields.offset(i).bytes_usize();
+                        let size = this.layout(ty)?.size.bytes_usize();
+                        rec(
+                            this,
+                            &bytes[offset..offset + size],
+                            ty,
+                            locals,
+                            mm,
+                            stack_depth_limit - 1,
+                        )?;
+                    }
+                }
                 _ => (),
             }
             Ok(())
+        }
+        /// Follows the fields of `ty`, a struct or tuple with an unsized tail at `bytes` whose
+        /// pointer's metadata is `meta`: the tail starts where the sized fields end, at its own
+        /// alignment capped by `packed`, as [`Evaluator::tail_offset`] places it.
+        fn unsized_fields<'db, M: Machine<'db>>(
+            this: &Evaluator<'db, M>,
+            bytes: &[u8],
+            ty: Ty<'db>,
+            meta: &[u8],
+            locals: &Locals<'db>,
+            mm: &mut ComplexMemoryMap<'db>,
+            stack_depth_limit: usize,
+        ) -> Result<'db, ()> {
+            if stack_depth_limit.checked_sub(1).is_none() {
+                return Err(MirEvalError::StackOverflow);
+            }
+            let depth = stack_depth_limit - 1;
+            let Some(last) = this.last_field(ty)? else { return Ok(()) };
+            let layout = this.layout(ty)?;
+            // The sized fields, where the layout puts them.
+            let sized: SmallVec<[Ty<'db>; 4]> = match ty.kind() {
+                TyKind::Adt(adt, subst) => {
+                    let AdtId::StructId(id) = adt.def_id() else { return Ok(()) };
+                    let field_types = this.db.field_types(id.into());
+                    (field_types.iter().take(last.index))
+                        .map(|(_, it)| it.ty().instantiate(this.interner(), subst).skip_norm_wip())
+                        .collect()
+                }
+                TyKind::Tuple(tys) => tys.iter().take(last.index).collect(),
+                _ => return Ok(()),
+            };
+            for (i, field) in sized.into_iter().enumerate() {
+                let field = this.normalized(field, "a field of a constant's struct")?;
+                let offset = layout.fields.offset(i).bytes_usize();
+                let size = this.layout(field)?.size.bytes_usize();
+                let Some(bytes) = bytes.get(offset..offset + size) else { continue };
+                rec(this, bytes, field, locals, mm, depth)?;
+            }
+            let Some((size, align)) = this.size_align_of_tail(last.ty, meta)? else {
+                return Ok(());
+            };
+            let (offset, _) = this.tail_offset(ty, &last, align)?;
+            let Some(tail) = bytes.get(offset..offset + size) else { return Ok(()) };
+            match last.ty.kind() {
+                // `dyn_tail` walks a `dyn`'s concrete value, where code identity and the code
+                // generator find it.
+                TyKind::Slice(elem) if !this.holds_no_pointer(elem) => {
+                    let size = this.size_of_sized(elem, locals, "slice inner type")?;
+                    if size > 0 {
+                        for element in tail.chunks_exact(size) {
+                            rec(this, element, elem, locals, mm, depth)?;
+                        }
+                    }
+                }
+                TyKind::Adt(..) | TyKind::Tuple(..) => {
+                    unsized_fields(this, tail, last.ty, meta, locals, mm, depth)?
+                }
+                _ => (),
+            }
+            Ok(())
+        }
+        /// Follows the pointers in the concrete value of the `dyn` at the end of `ty`'s chain
+        /// of last fields, in `bytes`, a value of `ty` whose metadata is `meta`: placed by
+        /// `hir_ty::layout::dyn_tail_place`, the one rule codegen and code identity use too.
+        fn dyn_tail<'db, M: Machine<'db>>(
+            this: &Evaluator<'db, M>,
+            bytes: &[u8],
+            ty: Ty<'db>,
+            meta: &[u8],
+            locals: &Locals<'db>,
+            mm: &mut ComplexMemoryMap<'db>,
+            depth: usize,
+        ) -> Result<'db, ()> {
+            if !matches!(this.struct_tail(ty)?.kind(), TyKind::Dynamic(..)) {
+                return Ok(());
+            }
+            let concrete = this.vtable_map.ty_of_bytes(meta)?;
+            let layout = this.layout(concrete)?;
+            let (size, align) = (layout.size.bytes_usize(), layout.align.abi.bytes_usize());
+            let place = crate::layout::dyn_tail_place(
+                this.db,
+                ty,
+                align,
+                |it| this.normalized(it, "a field of a constant's struct"),
+                |it| this.layout(it).map(|it| &it.get().0),
+            )?;
+            let Some((offset, _)) = place else { return Ok(()) };
+            let Some(tail) = bytes.get(offset..offset + size) else { return Ok(()) };
+            rec(this, tail, concrete, locals, mm, depth)
         }
         /// Keeps the whole allocation `addr` is in, the type of which a raw pointer does not
         /// say, and what every word of it that is in another allocation or a static points
@@ -4666,7 +4933,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 return Err(MirEvalError::StackOverflow);
             }
             let pointee = this.static_memory.iter().find(|&&(start, size, _)| {
-                addr.checked_sub(start).is_some_and(|offset| offset < size.max(1))
+                addr.checked_sub(start).is_some_and(|offset| offset <= size)
             });
             if let Some(&(start, size, id)) = pointee {
                 let pointee = crate::StaticMemory { start, size, id };
@@ -4676,19 +4943,25 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 return Ok(());
             }
             this.may_be_in_value(addr)?;
-            let Some(Allocated { start, size, align, .. }) = this.allocation_at(addr) else {
+            // A pointer one past an allocation's end is to that allocation: the heap leaves a
+            // gap after each block, so it is never also the start of the next.
+            let allocation = this.allocation_at(addr).or_else(|| {
+                let it = this.allocation_at(addr.checked_sub(1)?)?;
+                (addr - it.start == it.size).then_some(it)
+            });
+            let Some(Allocated { start, size, align, .. }) = allocation else {
                 return Ok(());
             };
             if mm.memory.get(&start).is_some_and(|it| it.len() >= size) {
                 return Ok(());
             }
-            let Ok(memory) = this.read_memory(Address::from_usize(start), size) else {
+            let Ok(memory) = this.read_memory(Address::from_usize(start, this.cached_ptr_size), size) else {
                 return Ok(());
             };
             mm.memory.insert(start, memory);
             mm.note_align(start, align);
             for word in memory.chunks_exact(this.ptr_size()) {
-                let inner = from_bytes!(usize, word);
+                let inner = from_bytes!(usize, this.cached_ptr_size, word);
                 if inner != 0 {
                     behind_raw(this, inner, mm, stack_depth_limit - 1)?;
                 }
@@ -4702,7 +4975,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     fn patch_addresses(
         &mut self,
-        patch_map: &HashMap<usize, usize>,
+        patch_map: &HashMap<usize, usize, std::alloc::Global>,
         source: &MemoryMap<'db>,
         ty_of_bytes: impl Fn(&[u8]) -> Result<'db, Ty<'db>> + Copy,
         addr: Address,
@@ -4717,30 +4990,33 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         use rustc_type_ir::TyKind;
         // The vtable of a `dyn` pointer is the id the value's own evaluation gave the type it
-        // points at, and this one has another for it.
+        // points at, and this one has another for it: of a pointee that normalizes to a `dyn`
+        // (`&<T as Tr>::Obj`) or ends in one (`&Wrap<dyn Tr>`) too.
         if let TyKind::RawPtr(t, _) | TyKind::Ref(_, t, _) = ty.kind()
-            && let TyKind::Dynamic(..) = t.kind()
+            && let TyKind::Dynamic(..) = self.struct_tail(t)?.kind()
         {
             let at = addr.offset(self.ptr_size());
             let concrete = ty_of_bytes(self.peek_memory(at, self.ptr_size())?)?;
             let new_id = self.vtable_map.id(concrete);
-            self.poke_memory(at, self.ptr_size())?.copy_from_slice(&word_bytes(new_id));
+            let ptr_size = self.cached_ptr_size;
+            self.poke_memory(at, ptr_size)?.copy_from_slice(&word_bytes(new_id, ptr_size));
         }
         // A pointer into a static points into this evaluator's copy of it.
         if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind() {
-            let current = from_bytes!(usize, self.peek_memory(addr, self.ptr_size())?);
+            let current = from_bytes!(usize, self.cached_ptr_size, self.peek_memory(addr, self.ptr_size())?);
             if let Some((id, offset)) = source.static_at(current) {
                 let location = self.eval_static(id, locals)?;
-                let start = from_bytes!(usize, self.peek_memory(location, self.ptr_size())?);
+                let start = from_bytes!(usize, self.cached_ptr_size, self.peek_memory(location, self.ptr_size())?);
                 return self.write_root_pointer(addr, start + offset);
             }
         }
         match ty.kind() {
             TyKind::Ref(_, t, _) => {
+                let t = self.normalized(t, "the pointee of a reference in a constant")?;
                 let size = self.size_align_of(t, locals)?;
                 match size {
                     Some(_) => {
-                        let current = from_bytes!(usize, self.peek_memory(addr, my_size)?);
+                        let current = from_bytes!(usize, self.cached_ptr_size, self.peek_memory(addr, my_size)?);
                         let patched = match patch_map.get(&current) {
                             Some(it) => {
                                 self.write_root_pointer(addr, *it)?;
@@ -4757,7 +5033,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             patch_map,
                             source,
                             ty_of_bytes,
-                            Address::from_usize(patched),
+                            Address::from_usize(patched, self.cached_ptr_size),
                             t,
                             locals,
                         )?;
@@ -4766,7 +5042,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         let bytes = self.peek_memory(addr, my_size)?;
                         let (current, metadata) = bytes.split_at(my_size / 2);
                         let metadata = OwnedBytes::from_slice(metadata);
-                        let current = from_bytes!(usize, current);
+                        let current = from_bytes!(usize, self.cached_ptr_size, current);
                         let patched = match patch_map.get(&current) {
                             Some(it) => {
                                 self.write_root_pointer(addr, *it)?;
@@ -4779,7 +5055,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 current
                             }
                         };
-                        let patched = Address::from_usize(patched);
+                        let patched = Address::from_usize(patched, self.cached_ptr_size);
                         if let TyKind::Dynamic(..) = t.kind() {
                             let concrete = self.vtable_map.ty_of_bytes(&metadata)?;
                             self.patch_addresses(
@@ -4791,7 +5067,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 locals,
                             )?;
                         } else if let TyKind::Slice(inner) = t.kind() {
-                            let len = from_bytes!(usize, metadata);
+                            let len = from_bytes!(usize, self.cached_ptr_size, metadata);
                             let size = self.size_of_sized(inner, locals, "slice item to patch")?;
                             let len = if size == 0 { 0 } else { len };
                             for i in 0..len {
@@ -4813,12 +5089,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             // A raw pointer can point anywhere into the allocation that was kept for it.
             TyKind::RawPtr(..) => {
-                let current = from_bytes!(usize, self.peek_memory(addr, self.ptr_size())?);
+                let current = from_bytes!(usize, self.cached_ptr_size, self.peek_memory(addr, self.ptr_size())?);
                 if let Some((start, _)) = source.memory_at(current)
                     && let Some(new_start) = patch_map.get(&start)
                 {
                     self.write_root_pointer(addr, new_start + (current - start))?;
-                } else if let Ok(fn_ty) = ty_of_bytes(&word_bytes(current))
+                } else if let Ok(fn_ty) = ty_of_bytes(&word_bytes(current, self.cached_ptr_size))
                     && matches!(fn_ty.kind(), TyKind::FnDef(..) | TyKind::Closure(..))
                 {
                     // A function cast to a raw pointer is still the id the value's own
@@ -4833,6 +5109,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 self.write_function_pointer(addr, new_id)?;
             }
             TyKind::Adt(id, args) => match id.def_id() {
+                // A `#[blaze::bits]` struct is an integer: no field holds an address.
+                AdtId::StructId(s) if crate::layout::is_bits_struct(self.db, s) => {}
                 AdtId::StructId(s) => {
                     for (i, (_, field)) in self.db.field_types(s.into()).iter().enumerate() {
                         let offset = layout.fields.offset(i).bytes_usize();
@@ -4959,7 +5237,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         then: Then,
         span: MirSpan,
     ) -> Result<'db, Option<StackFrame<'db>>> {
-        let id = from_bytes!(usize, bytes.get(self)?);
+        let id = from_bytes!(usize, self.cached_ptr_size, bytes.get(self)?);
         let next_ty = self.vtable_map.ty(id)?;
         use rustc_type_ir::TyKind;
         match next_ty.kind() {
@@ -5076,6 +5354,30 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     then,
                     span,
                 )
+            }
+            // A `#[blaze::bits]` tuple struct's constructor as a function value: each
+            // argument's bits at its field's bit offset in the backing integer, as the MIR pass
+            // packs a literal.
+            CallableDefId::StructId(id) if crate::layout::is_bits_struct(self.db, id) => {
+                let ty = Ty::new_adt(self.interner(), id.into(), generic_args);
+                let size = self.layout(ty)?.size.bytes_usize();
+                let bits = crate::layout::bits_layout(self.db, id).map_err(|err| {
+                    let err = crate::layout::LayoutError::Bits(Box::new(err.clone())); // alloc: error path
+                    MirEvalError::LayoutError(err, ty.store())
+                })?;
+                let mut backing = 0u128;
+                for (field, arg) in bits.fields.iter().zip(args.iter()) {
+                    let bytes = arg.interval.get(self)?;
+                    let mut le = [0u8; 16];
+                    let len = bytes.len().min(16);
+                    le[..len].copy_from_slice(&bytes[..len]);
+                    let value = u128::from_le_bytes(le);
+                    let width = field.width.bits;
+                    let value = if width >= 128 { value } else { value & ((1u128 << width) - 1) };
+                    backing |= value.checked_shl(field.offset).unwrap_or(0);
+                }
+                destination.write_from_bytes(self, &backing.to_le_bytes()[..size])?;
+                Ok(None)
             }
             CallableDefId::StructId(id) => {
                 let (size, variant_layout, tag) =
@@ -5336,12 +5638,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             func_ty = z;
             if matches!(func_ty.kind(), TyKind::Dynamic(..)) {
                 let id =
-                    from_bytes!(usize, &func_data.get(self)?[self.ptr_size()..self.ptr_size() * 2]);
+                    from_bytes!(usize, self.cached_ptr_size, &func_data.get(self)?[self.ptr_size()..self.ptr_size() * 2]);
                 func_data = func_data.slice(0..self.ptr_size());
                 func_ty = self.vtable_map.ty(id)?;
             }
             let size = self.size_of_sized(func_ty, locals, "self type of fn trait")?;
-            func_data = Interval { addr: Address::from_bytes(func_data.get(self)?)?, size };
+            func_data = Interval { addr: Address::from_bytes(func_data.get(self)?, self.cached_ptr_size)?, size };
         }
         match func_ty.kind() {
             TyKind::FnDef(def, subst) => {
@@ -5669,7 +5971,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let offset = layout.fields.offset(0).bytes_usize();
                     let bytes = self.read_memory(addr.offset(offset), size)?;
                     let (data, contents_metadata) = bytes.split_at(self.ptr_size());
-                    let contents = Address::from_bytes(data)?;
+                    let contents = Address::from_bytes(data, self.cached_ptr_size)?;
                     let contents_metadata = OwnedBytes::from_slice(contents_metadata);
                     steps.push(DropStep::Glue(subst.type_at(0), contents, contents_metadata));
                     steps.push(DropStep::DropImpl(ty, addr));
@@ -5724,7 +6026,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 self.element_steps(inner, len as usize, locals, addr, steps)?;
             }
             TyKind::Slice(inner) => {
-                let len = from_bytes!(usize, metadata);
+                let len = from_bytes!(usize, self.cached_ptr_size, metadata);
                 self.element_steps(inner, len, locals, addr, steps)?;
             }
             TyKind::Dynamic(..) => {
@@ -5866,13 +6168,13 @@ pub fn render_const_using_debug_impl<'db>(
     // i.e. two words: a pointer to the value, and the type-erased `<T as Debug>::fmt` function.
     // A non-null `value` is what distinguishes the `Placeholder` variant from `Count`.
     let argument = evaluator.heap_allocate(ptr_size * 2, ptr_size)?;
-    evaluator.write_memory(argument, &data.addr.to_bytes())?;
+    evaluator.write_memory(argument, &data.addr.to_bytes(ptr_size))?;
     let debug_fmt_fn_ptr = evaluator.vtable_map.id(Ty::new_fn_def(
         evaluator.interner(),
         CallableDefId::FunctionId(debug_fmt_fn).into(),
         GenericArgs::new_from_slice(&[ty.into()]),
     ));
-    evaluator.write_memory(argument.offset(ptr_size), &word_bytes(debug_fmt_fn_ptr))?;
+    evaluator.write_memory(argument.offset(ptr_size), &word_bytes(debug_fmt_fn_ptr, ptr_size))?;
     // Since Rust 1.93 `core::fmt::Arguments` is two words wide:
     //   struct Arguments<'a> { template: NonNull<u8>, args: NonNull<Argument<'a>> }
     // `template` points at a byte-encoded format string; `format_args!("{:?}", x)` encodes to a
@@ -5883,8 +6185,8 @@ pub fn render_const_using_debug_impl<'db>(
     let template = evaluator.heap_allocate(2, 1)?;
     evaluator.write_memory(template, &[0xC0, 0x00])?;
     let arguments = evaluator.heap_allocate(ptr_size * 2, ptr_size)?;
-    evaluator.write_memory(arguments, &template.to_bytes())?;
-    evaluator.write_memory(arguments.offset(ptr_size), &argument.to_bytes())?;
+    evaluator.write_memory(arguments, &template.to_bytes(ptr_size))?;
+    evaluator.write_memory(arguments.offset(ptr_size), &argument.to_bytes(ptr_size))?;
     let Some(ValueNs::FunctionId(format_fn)) = resolver.resolve_path_in_value_ns_fully(
         db,
         hir_def::expr_store::path::Path::from_known_path_with_no_generic(&path![std::fmt::format]),
@@ -5900,11 +6202,11 @@ pub fn render_const_using_debug_impl<'db>(
     )?;
     let message_string = interval.get(&evaluator)?;
     let words = [
-        from_bytes!(usize, message_string[0..ptr_size]),
-        from_bytes!(usize, message_string[ptr_size..2 * ptr_size]),
-        from_bytes!(usize, message_string[2 * ptr_size..3 * ptr_size]),
+        from_bytes!(usize, ptr_size, message_string[0..ptr_size]),
+        from_bytes!(usize, ptr_size, message_string[ptr_size..2 * ptr_size]),
+        from_bytes!(usize, ptr_size, message_string[2 * ptr_size..3 * ptr_size]),
     ];
-    let Some(addr) = words.into_iter().map(Address::from_usize).find(|it| matches!(it.at(), Heap(_)))
+    let Some(addr) = words.into_iter().map(|it| Address::from_usize(it, ptr_size)).find(|it| matches!(it.at(), Heap(_)))
     else {
         // No heap buffer means the formatted string is empty.
         // alloc: the formatted text is the result, and an empty `String` holds nothing
@@ -5912,7 +6214,7 @@ pub fn render_const_using_debug_impl<'db>(
     };
     let size = words
         .into_iter()
-        .filter(|&it| !matches!(Address::from_usize(it).at(), Heap(_)))
+        .filter(|&it| !matches!(Address::from_usize(it, ptr_size).at(), Heap(_)))
         .min()
         .unwrap_or(0);
     // alloc: the formatted text is the result
@@ -6061,4 +6363,12 @@ impl std::ops::BitOr for IntValue {
 impl std::ops::BitXor for IntValue {
     type Output = Self;
     for_each_int_type!(unchecked_int_op, [bitxor, ^]);
+}
+
+/// The last field of a struct or tuple, which may be unsized ([`Evaluator::last_field`]).
+struct LastField<'db> {
+    ty: Ty<'db>,
+    index: usize,
+    /// Its struct's `repr(packed(n))`, which caps the field's alignment.
+    pack: Option<usize>,
 }

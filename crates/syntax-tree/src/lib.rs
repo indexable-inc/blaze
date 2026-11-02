@@ -6,6 +6,7 @@
     // missing_docs,
 )]
 #![deny(unsafe_code)]
+#![feature(allocator_api)]
 
 #[cfg(test)]
 #[global_allocator]

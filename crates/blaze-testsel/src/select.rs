@@ -50,8 +50,26 @@ pub struct Subject<'a> {
     /// It reaches the outside world, as codegen marks it: it always runs and is never kept.
     pub outside: bool,
     /// What codegen's walk says it reaches, by the binary's table index: the set a run whose
-    /// record is not whole is kept under.
-    pub reached: &'a [u32],
+    /// record is not whole is kept under, and only read for such a run.
+    pub reached: Reached<'a>,
+}
+
+/// What a test reaches by its binary's table index, sorted: given, or walked only when a run
+/// is kept under it ([`kept_set`]), as walking every test of a large binary at link costs
+/// tests times functions.
+#[derive(Clone, Copy)]
+pub enum Reached<'a> {
+    Known(&'a [u32]),
+    Lazy(&'a (dyn Fn() -> Vec<u32> + 'a)),
+}
+
+impl fmt::Debug for Reached<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Reached::Known(it) => f.debug_tuple("Known").field(it).finish(),
+            Reached::Lazy(_) => f.write_str("Lazy"),
+        }
+    }
 }
 
 /// What set a pass is kept under: the functions the run executed, from its whole record, or
@@ -350,7 +368,11 @@ pub(crate) fn kept_set(image: &Image, subject: &Subject<'_>, ran: &Ran<'_>) -> R
         None => {
             // alloc: the reason a basis carries, for a run whose record is not whole
             let why = ran.record.why().unwrap_or_default().to_owned();
-            (image.reached(subject.reached).map_err(RecordError::Table)?, Basis::Reached { why })
+            let set = match subject.reached {
+                Reached::Known(it) => image.reached(it),
+                Reached::Lazy(walk) => image.reached(&walk()),
+            };
+            (set.map_err(RecordError::Table)?, Basis::Reached { why })
         }
     })
 }

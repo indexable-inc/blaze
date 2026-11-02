@@ -3,8 +3,6 @@
 //! is not hashed again. A function's masked IR itself is made from its IR in each build that
 //! folds it: no key known before preparing holds every input of its data objects' content.
 
-use std::sync::LazyLock;
-
 use crate::fold::Forms;
 
 pub struct Masks {
@@ -24,7 +22,8 @@ impl Masks {
 
     /// The masks every build of this process keeps.
     pub fn shared() -> &'static Masks {
-        static SHARED: LazyLock<Masks> = LazyLock::new(Masks::new);
+        #[expect(clippy::disallowed_types, reason = "the daemon's one set of folded forms, kept across its builds so a form is hashed once")]
+        static SHARED: std::sync::LazyLock<Masks> = std::sync::LazyLock::new(Masks::new);
         &SHARED
     }
 

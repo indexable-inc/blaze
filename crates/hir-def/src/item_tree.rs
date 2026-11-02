@@ -306,7 +306,7 @@ pub(crate) fn block_item_tree_query(
     let view = view::BlockExpr::cast(node).expect("a block's ast id names a block");
     let ctx = lower::Ctx::with_maps(db, ast_id.file_id, krate, &syntax.ast_id_map, &syntax.span_map);
     let lowered = ctx.lower_block(view);
-    if crate::expr_store::body::check_relative() {
+    if crate::expr_store::body::check_relative(db) {
         let whole = lower::Ctx::new(db, ast_id.file_id, krate).lower_block(ast_id.to_view(db));
         assert!(lowered == whole, "{block:?}: the block's item tree lowered from its body alone");
     }
@@ -489,6 +489,40 @@ impl ItemTree {
         }
     }
 
+    /// What a span's name says of the item of this tree whose id is `ast_id`
+    /// ([`crate::span_names`]): its name, or an impl's ordinal among the tree's impls; `None`
+    /// when no item here has the id. A walk of the tree's items, made only while a span records.
+    pub(crate) fn span_item(&self, ast_id: span::ErasedFileAstId) -> Option<SpanItem<'_>> {
+        let mut impls = 0;
+        for (at, id) in self.ast_ids().iter().enumerate() {
+            if id.erase() == ast_id {
+                let named = |name| self.get_name(name).map_or(SpanItem::Unnamed, SpanItem::Named);
+                return Some(match self.index(ModItemId::new(at as u32)) {
+                    ModItemKind::Impl(..) => SpanItem::Impl(impls),
+                    ModItemKind::Function(_, it) => named(it.name),
+                    ModItemKind::Const(_, it) => named(it.name),
+                    ModItemKind::Static(_, it) => named(it.name),
+                    ModItemKind::Struct(_, it) => named(it.name),
+                    ModItemKind::Union(_, it) => named(it.name),
+                    ModItemKind::Enum(_, it) => named(it.name),
+                    ModItemKind::Trait(_, it) => named(it.name),
+                    ModItemKind::TypeAlias(_, it) => named(it.name),
+                    ModItemKind::Mod(_, it) => named(it.name),
+                    ModItemKind::ExternBlock(..)
+                    | ModItemKind::ExternCrate(..)
+                    | ModItemKind::Macro2(..)
+                    | ModItemKind::MacroCall(..)
+                    | ModItemKind::MacroRules(..)
+                    | ModItemKind::Use(..) => SpanItem::Unnamed,
+                });
+            }
+            if self.kinds()[at] == ItemKind::Impl {
+                impls += 1;
+            }
+        }
+        None
+    }
+
     #[inline]
     pub fn import_alias(&self, alias: AliasId) -> Option<ImportAlias> {
         match alias {
@@ -557,6 +591,16 @@ pub struct ItemTreeDataStats {
 /// Trait implemented by all nodes in the item tree.
 pub(crate) trait ItemTreeNode: Clone {
     type Source: AstIdNode;
+}
+
+/// An item as a span's name writes it ([`ItemTree::span_item`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SpanItem<'a> {
+    Named(&'a Name),
+    /// `const _`, or an item that has no name.
+    Unnamed,
+    /// An impl, by its ordinal among its tree's impls.
+    Impl(u32),
 }
 
 #[allow(type_alias_bounds)]

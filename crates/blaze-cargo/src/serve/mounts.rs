@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_units::query::{Mount, Origin};
 use blaze_vfs::{CommitError, Op, OpError, Ticket, Vfs};
@@ -32,13 +33,13 @@ fn parse(head: &str) -> Option<(String, String)> {
 /// Every source mounted, by `at`.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct Mounts {
-    by_at: HashMap<String, Mount>,
+    by_at: HashMap<String, Mount, Global>,
 }
 
 impl Mounts {
     /// The mounts a VFS recovered from its journal kept.
     pub fn recover(vfs: &Vfs) -> Mounts {
-        let mut by_at = HashMap::default();
+        let mut by_at = HashMap::new_in(Global);
         for (head, root) in vfs.heads() {
             if let Some((at, under)) = parse(head) {
                 by_at.insert(at.clone(), Mount { at, origin: Origin::Root(root), under });

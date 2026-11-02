@@ -7,6 +7,7 @@ use std::{panic::RefUnwindSafe, sync};
 use base_db::{Crate, CrateBuilderId, CratesIdMap, Db, Env, ProcMacroLoadingError};
 use intern::Symbol;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_query::db::{Durability, Setter};
 use span::Span;
 use triomphe::Arc;
@@ -136,7 +137,7 @@ pub type ProcMacroLoadResult = Result<Vec<ProcMacro>, ProcMacroLoadingError>;
 type StoredProcMacroLoadResult = Result<Box<[ProcMacro]>, ProcMacroLoadingError>;
 
 #[derive(Default, Debug)]
-pub struct ProcMacrosBuilder(HashMap<CrateBuilderId, Arc<CrateProcMacros>>);
+pub struct ProcMacrosBuilder(HashMap<CrateBuilderId, Arc<CrateProcMacros>, Global>);
 
 impl ProcMacrosBuilder {
     pub fn insert(
@@ -169,7 +170,7 @@ impl ProcMacrosBuilder {
             .0
             .into_iter()
             .map(|(krate, proc_macro)| (crates_id_map[&krate], proc_macro))
-            .collect::<HashMap<_, _>>();
+            .collect::<HashMap<_, _, Global>>();
         map.shrink_to_fit();
         ProcMacros::try_get(db)
             .unwrap_or_else(|| ProcMacros::new(db, Default::default()))
@@ -197,7 +198,7 @@ pub struct CrateProcMacros(StoredProcMacroLoadResult);
 #[blaze_query::input(singleton, debug)]
 pub struct ProcMacros {
     #[returns(ref)]
-    pub by_crate: HashMap<Crate, Arc<CrateProcMacros>>,
+    pub by_crate: HashMap<Crate, Arc<CrateProcMacros>, Global>,
 }
 
 impl ProcMacros {

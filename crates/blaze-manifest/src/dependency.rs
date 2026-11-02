@@ -246,7 +246,7 @@ mod tests {
     }
 
     fn config(files: Mem, flags: &[&str]) -> anyhow::Result<crate::Config<Mem>> {
-        let env = [("CARGO_HOME".to_owned(), format!("{ROOT}/home"))];
+        let env = [("CARGO_HOME".to_owned(), format!("{ROOT}/home")), ("BLAZE_HOME".to_owned(), format!("{ROOT}/blaze"))];
         let mut config = crate::Config::load_with(Path::new(ROOT), env, files)?;
         config.cli_unstable(&kinds(flags))?;
         Ok(config)
@@ -256,7 +256,7 @@ mod tests {
         let ctx = crate::Context::new(config(files, flags)?);
         let manifest = crate::metadata::root_manifest(None, &ctx)?;
         let ws = crate::Workspace::new(&manifest, &ctx)?;
-        Ok(serde_json::to_string(&crate::metadata::export_no_deps(&ws))?)
+        Ok(serde_json::to_string(&crate::metadata::export_no_deps(&ws)?)?)
     }
 
     #[test]

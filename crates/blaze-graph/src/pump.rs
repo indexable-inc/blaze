@@ -26,7 +26,7 @@ use crate::{
     Cancelled, Key,
     sched::{self, CounterId, JobId, Wait},
     sync::{
-        MutexGuard, OnceLock,
+        MutexGuard,
         atomic::{AtomicU64, Ordering},
         thread_local,
     },
@@ -171,7 +171,7 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
                 Asked::Wait { flight, runner } => (flight, runner),
             };
             let left = Left { runs: &self.runs, key, waiter: &waiter };
-            let waiting = Waiting::begin(crate::wait::WaitKind::Key, &mut named, Some(runner));
+            let waiting = Waiting::begin(crate::wait::WaitKind::Key, &mut named, || Some(observed(runner)));
             let got = wait(&waiter, flight(number));
             drop(waiting);
             drop(left);
@@ -330,18 +330,27 @@ fn job(task: u64) -> JobId {
 #[derive(Clone, Copy)]
 pub struct WaitSpans {
     /// Opens the wait's span on this thread, `kind` the [`crate::wait::WaitOn`] variant it is,
-    /// `awaited` naming what it waits for and `owner` the task running it, when known: a
-    /// number for `end`.
+    /// `awaited` naming what it waits for and `owner` the job running it, when known (for a
+    /// key, its generation << 32 | its slot, as [`sched::observed`] and the switches name it):
+    /// a number for `end`.
     pub begin: fn(kind: crate::wait::WaitKind, awaited: &str, owner: Option<u64>) -> u64,
     /// Closes the span `begin` gave, on whatever thread the wait ended on (a job on a fiber
     /// may resume on another).
     pub end: fn(u64),
     /// Opens the span of a hold on this thread ([`Flights::hold_named`]), `what` naming what is
-    /// held and `holder` the task holding it: what a waiter's `owner` names. Closed by `end`.
+    /// held and `holder` the job holding it, numbered as `begin`'s `owner`: what a waiter's
+    /// `owner` names. Closed by `end`.
     pub held: fn(what: &str, holder: u64) -> u64,
 }
 
-static WAIT_SPANS: OnceLock<WaitSpans> = OnceLock::new();
+#[cfg_attr(
+    not(blaze_check),
+    expect(
+        clippy::disallowed_types,
+        reason = "the profiler's hooks for every wait of the process, set once where it starts, as the profile ring is"
+    )
+)]
+static WAIT_SPANS: crate::sync::OnceLock<WaitSpans> = crate::sync::OnceLock::new();
 
 /// Spans every wait for a key from now on with `spans`; `Err` with them when spans were
 /// given before.
@@ -354,28 +363,37 @@ pub fn span_waits(spans: WaitSpans) -> Result<(), WaitSpans> {
 pub(crate) struct Waiting(Option<(fn(u64), u64)>);
 
 impl Waiting {
+    /// `owner` is read only while a profiler spans waits: naming a task's job takes the
+    /// scheduler's lock ([`observed`]).
     pub(crate) fn begin(
         kind: crate::wait::WaitKind,
         named: &mut impl FnMut(&mut String),
-        owner: Option<u64>,
+        owner: impl FnOnce() -> Option<u64>,
     ) -> Waiting {
         Waiting(WAIT_SPANS.get().map(|spans| {
             // alloc: only while a profiler spans waits, once a wait, which suspends
             let mut awaited = String::new();
             named(&mut awaited);
-            (spans.end, (spans.begin)(kind, &awaited, owner))
+            (spans.end, (spans.begin)(kind, &awaited, owner()))
         }))
     }
 
-    /// The span of a hold by `holder` of what `named` writes, open while this lives.
+    /// The span of a hold by `holder` (a task id) of what `named` writes, open while this lives.
     fn holding(named: &mut impl FnMut(&mut String), holder: u64) -> Waiting {
         Waiting(WAIT_SPANS.get().map(|spans| {
             // alloc: only while a profiler spans waits, once a hold, which lasts a round
             let mut what = String::new();
             named(&mut what);
-            (spans.end, (spans.held)(&what, holder))
+            (spans.end, (spans.held)(&what, observed(holder)))
         }))
     }
+}
+
+/// The job of task `task`, as the profiler's switches number it (generation << 32 | slot), so
+/// a wait's owner names one job of the process's life, not a slot another job reuses. Read as
+/// the span opens, while that task runs the key: the slot is its until it ends.
+fn observed(task: u64) -> u64 {
+    sched::observed(job(task))
 }
 
 impl Drop for Waiting {
