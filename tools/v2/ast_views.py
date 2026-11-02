@@ -117,7 +117,7 @@ def read_nodes(text: str) -> Model:
     for name, body in ENUM.findall(text):
         if len(VARIANT.findall(body)) != len([it for it in body.splitlines() if it.strip()]):
             raise Refused(f"enum `{name}` has a variant that is not `Name(Type)`")
-    any_kinds = {}
+    any_kinds: dict[str, list[str]] = {}
     for name, body in CAN_CAST.findall(text):
         if name in anys:
             any_kinds[name] = [it.strip() for it in body.split("|")]
@@ -341,7 +341,7 @@ def main() -> None:
     except Refused as e:
         print(f"{SCRIPT}: refused: {e}", file=sys.stderr)
         sys.exit(2)
-    stale = []
+    stale: list[str] = []
     outputs = (
         (views / "nodes.rs", nodes),
         (views / "tokens.rs", tokens),

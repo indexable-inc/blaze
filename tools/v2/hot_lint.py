@@ -73,7 +73,8 @@ def code_lines(text: str) -> list[str]:
 
 def cfg_args(expr: str) -> list[str]:
     """The top-level comma-separated arguments of a `cfg` predicate list."""
-    args, depth, cur = [], 0, ""
+    args: list[str] = []
+    depth, cur = 0, ""
     for ch in expr:
         if ch == "(":
             depth += 1

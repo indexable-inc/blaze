@@ -45,7 +45,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Literal, cast, get_args
 
 from typed_input import fail, parse
 
@@ -254,10 +254,13 @@ def messages(said: str, reason: str) -> list[dict[str, object]]:
     for line in said.splitlines():
         if line.startswith("{") and reason in line:
             try:
-                message = json.loads(line)
+                parsed: object = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(message, dict) and message.get("reason") == reason:
+            if not isinstance(parsed, dict):
+                continue
+            message = cast(dict[str, object], parsed)
+            if message.get("reason") == reason:
                 out.append(message)
     return out
 
@@ -286,7 +289,8 @@ async def build(env: Env, ws: Path, seed: Path | None, label: str, exe: str) -> 
     try:
         said = await run(f"{label}: the build", [blaze, "build", "--message-format=json"], ws, variables, BUILD_SECS)
         programs = [m["executable"] for m in messages(said, "compiler-artifact")
-                    if m.get("executable") and isinstance(m.get("target"), dict) and m["target"].get("name") == exe]
+                    if m.get("executable") and isinstance(target := m.get("target"), dict)
+                    and cast(dict[str, object], target).get("name") == exe]
         if not programs:
             raise Failed(f"{label}: the build names no executable of {exe}:\n{said[-3000:]}")
         program = str(programs[-1])

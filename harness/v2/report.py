@@ -54,7 +54,9 @@ def commit() -> str | None:
 
 def host() -> dict[str, Number]:
     """What the run was on."""
-    cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    # Linux only: elsewhere `os` has no `sched_getaffinity`.
+    affinity: Callable[[int], set[int]] | None = getattr(os, "sched_getaffinity", None)
+    cores = len(affinity(0)) if affinity is not None else os.cpu_count()
     memory_gib: float | None = None
     try:
         with open("/proc/meminfo") as f:
@@ -100,7 +102,9 @@ class Report:
         return None
 
     def failing(self) -> list[Outcome]:
-        bad: set[Verdict] = {"fail", "error"} | ({"unmeasured"} if self.engine.kind == "v2" else set())
+        bad: set[Verdict] = {"fail", "error"}
+        if self.engine.kind == "v2":
+            bad.add("unmeasured")
         return [o for o in self.outcomes if o.verdict in bad]
 
     def finish(self) -> NoReturn:

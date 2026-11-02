@@ -294,7 +294,8 @@ def fixture_tests(rep: report.Report, eng: engine.Engine, ws: Path, env: dict[st
         rep.add(label, "pass", seconds=round(ran.seconds, 2))
     import blaze_cli
 
-    kept: list[str] = blaze_cli.kept_passes(str(kept_at)) if kept_at.is_file() else []
+    kept_passes: Callable[[str], list[str]] = getattr(blaze_cli, "kept_passes")
+    kept = kept_passes(str(kept_at)) if kept_at.is_file() else []
     expected = [*expected_tests({"tests": FIXTURE_TESTS.read_text()}, "tests::"), *FIXTURE_OWN]
     for judged in judge_tests(expected, ran.stdout + "\n" + ran.stderr, kept):
         rep.add(f"{LABEL}/fixture/{judged.name}", judged.verdict, judged.detail)
@@ -328,7 +329,8 @@ def run_tests(rep: report.Report, eng: engine.Engine, work: Path, target: Path, 
         rep.add(label, "pass", seconds=round(ran.seconds, 2))
     import blaze_cli
 
-    kept: list[str] = blaze_cli.kept_passes(str(kept_at))
+    kept_passes: Callable[[str], list[str]] = getattr(blaze_cli, "kept_passes")
+    kept = kept_passes(str(kept_at))
     sources = {t: (TESTS / f"{t}.rs").read_text() for t in TEST_FILES}
     for judged in judge_tests(expected_tests(sources), ran.stdout + "\n" + ran.stderr, kept):
         rep.add(f"{LABEL}/{judged.name}", judged.verdict, judged.detail)
@@ -438,7 +440,7 @@ def test_lock() -> None:
 
 def test_fixture() -> None:
     """The fixture's own proc-macro crates, and the tests this runs of this repository."""
-    own = []
+    own: list[str] = []
     for manifest in sorted(FIXTURE.glob("*/Cargo.toml")):
         parsed = tomllib.loads(manifest.read_text())
         if parsed.get("lib", {}).get("proc-macro"):

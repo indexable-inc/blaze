@@ -68,7 +68,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -213,7 +213,7 @@ def script_run(step: str, line: dict[str, object]) -> ScriptRun:
     if hit and kind != "pure":
         raise engine.Failed(f"{wrong} hit a pure key and is not pure")
     name, version = package_of(step, package_id)
-    purity = Purity(cast(Kind, kind), cast(str | None, said if kind == "impure" else None),
+    purity = Purity(kind, cast(str | None, said if kind == "impure" else None),
                     cast(str | None, identity if kind == "pure" else None), hit)
     return ScriptRun(package_id, name, version, out_dir, purity)
 
@@ -357,7 +357,9 @@ def resolved_build_deps(label: str, ws: Path, env: dict[str, str]) -> dict[tuple
     meta = json.loads(ran.checked(f"{label}: cargo metadata").stdout)
     names = {p["id"]: (p["name"], p["version"]) for p in meta["packages"]}
     out: dict[tuple[str, str], tuple[str, ...]] = {}
-    for node in (meta.get("resolve") or {}).get("nodes", []):
+    resolve: dict[str, Any] = meta.get("resolve") or {}
+    nodes: list[dict[str, Any]] = resolve.get("nodes", [])
+    for node in nodes:
         deps = {names[dep["pkg"]][0] for dep in node["deps"] if any(k["kind"] == "build" for k in dep["dep_kinds"])}
         out[names[node["id"]]] = tuple(sorted(deps))
     return out
@@ -651,7 +653,7 @@ def test_lines() -> None:
     expect(package_of("t", "libc 0.2.191 (registry+https://github.com/rust-lang/crates.io-index)") == ("libc", "0.2.191"),
            "an old package id")
     reg = "registry+https://github.com/rust-lang/crates.io-index"
-    lines = [
+    lines: list[dict[str, object]] = [
         {"reason": EXECUTED, "package_id": f"{reg}#serde_json@1.0.154", "out_dir": "/t/a/out"},
         {"reason": SCRIPT_LINE, "package_id": f"{reg}#serde_json@1.0.154", "out_dir": "/t/a/out", "purity": "pure",
          "said": None, "identity": "ab12", "hit": True},

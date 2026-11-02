@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Protocol
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -177,6 +178,25 @@ Nothing answered it.
 """
 
 
+class ImportedRequest(Protocol):
+    """The fields of queue.py's `Request` these tests read (the module is loaded by path, so untyped)."""
+
+    @property
+    def id(self) -> str: ...
+    @property
+    def from_lane(self) -> str: ...
+    @property
+    def owner(self) -> str: ...
+    @property
+    def paths(self) -> tuple[str, ...]: ...
+    @property
+    def what(self) -> str: ...
+    @property
+    def created(self) -> str: ...
+    @property
+    def source(self) -> str | None: ...
+
+
 class Import(unittest.TestCase):
     def setUp(self) -> None:
         self.scratch = tempfile.TemporaryDirectory()
@@ -191,7 +211,7 @@ class Import(unittest.TestCase):
         lanes.mkdir()
         for name in ("v2-frontend", "v2-link", "v2-requests"):
             (lanes / f"{name}.md").write_text("")
-        self.input = {"command": "import", "root": str(self.root), "lanes_from": [str(lanes)]}
+        self.input: dict[str, object] = {"command": "import", "root": str(self.root), "lanes_from": [str(lanes)]}
         self.patches = [
             mock.patch.object(q, "now", lambda: T0),
             mock.patch.object(q, "windows", lambda: [(3, "link-next1")]),
@@ -204,7 +224,7 @@ class Import(unittest.TestCase):
             p.stop()
         self.scratch.cleanup()
 
-    def run_import(self) -> list[object]:
+    def run_import(self) -> list[ImportedRequest]:
         return q.import_requests(q.parse(q.Import, json.dumps(self.input), "test"))
 
     def test_imports_only_open_items_with_their_owner(self) -> None:

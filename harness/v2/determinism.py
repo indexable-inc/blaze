@@ -234,6 +234,8 @@ def main(args: Input) -> None:
         subjects.append(("fixture", lambda top: fixture_subject(top, args.fixture_seed)))
 
     def each(subject: Subject, top: Path) -> None:
+        # Declared: the lambdas below capture it, and a captured loop variable's inferred type is `str`.
+        profile: Profile
         for profile in dict.fromkeys(args.profiles):
             name = f"{subject.label} {profile}"
             rep.guarded(name, lambda: budgets.failing(name, lambda: compare(eng, rep, subject, top, profile, cores_a,
