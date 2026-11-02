@@ -163,14 +163,15 @@
    {
     "dependencies": [
      "blaze-core",
+     "blaze-hash",
      "blaze-ids",
      "blaze-mem",
      "blaze-protocol",
      "blaze-query",
+     "blaze-serde",
      "blaze-vfs",
      "libc",
      "memchr",
-     "rustc-hash 2.1.3",
      "serde",
      "sonic-rs"
     ],
@@ -183,9 +184,10 @@
    },
    {
     "dependencies": [
+     "blaze-hash",
      "blaze-rng",
      "libc",
-     "rustc-hash 2.1.3",
+     "parking_lot",
      "windows-sys 0.61.2"
     ],
     "name": "blaze-check",
@@ -194,12 +196,14 @@
    {
     "dependencies": [
      "blaze-check",
+     "blaze-hash",
      "blaze-mem",
      "blaze-radix",
      "blaze-rng",
      "crossbeam-channel",
+     "crossbeam-queue",
      "libc",
-     "rustc-hash 2.1.3",
+     "parking_lot",
      "windows-sys 0.61.2"
     ],
     "name": "blaze-core",
@@ -208,6 +212,7 @@
    {
     "dependencies": [
      "blaze-ids",
+     "blaze-serde",
      "serde",
      "zstd"
     ],
@@ -219,16 +224,20 @@
      "blaze-check",
      "blaze-core",
      "blaze-format",
+     "blaze-hash",
      "blaze-image",
      "blaze-mem",
      "blaze-protocol",
      "blaze-radix",
      "blaze-reclaim",
+     "blaze-serde",
+     "blaze-spin",
      "corosensei",
      "crossbeam-channel",
      "crossbeam-deque",
+     "crossbeam-queue",
      "libc",
-     "rustc-hash 2.1.3",
+     "parking_lot",
      "serde",
      "serde_json",
      "stdx"
@@ -238,12 +247,25 @@
    },
    {
     "dependencies": [
+     "foldhash 0.2.0",
+     "hashbrown 0.17.1",
+     "papaya",
+     "serde"
+    ],
+    "name": "blaze-hash",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
      "blake3",
      "blake3-servil",
      "blaze-check",
+     "blaze-hash",
      "blaze-mem",
      "blaze-radix",
      "blaze-rng",
+     "blaze-serde",
+     "parking_lot",
      "serde",
      "smallvec",
      "thin-vec"
@@ -265,7 +287,10 @@
     "dependencies": [
      "blaze-bytes",
      "blaze-mem",
+     "blaze-spin",
+     "crossbeam-channel",
      "libc",
+     "parking_lot",
      "windows-sys 0.61.2"
     ],
     "name": "blaze-inproc",
@@ -283,7 +308,10 @@
     "dependencies": [
      "blaze-check",
      "blaze-reclaim",
+     "blaze-spin",
+     "crossbeam-channel",
      "libc",
+     "parking_lot",
      "windows-sys 0.61.2"
     ],
     "name": "blaze-mem",
@@ -295,6 +323,7 @@
    },
    {
     "dependencies": [
+     "blaze-serde",
      "serde"
     ],
     "name": "blaze-protocol",
@@ -307,18 +336,20 @@
      "blaze-core",
      "blaze-format",
      "blaze-graph",
+     "blaze-hash",
      "blaze-ids",
      "blaze-image",
      "blaze-mem",
      "blaze-protocol",
      "blaze-query-macros",
      "blaze-reclaim",
+     "blaze-serde",
      "blaze-vfs",
      "either",
      "hashbrown 0.17.1",
      "indexmap",
      "intern",
-     "rustc-hash 2.1.3",
+     "parking_lot",
      "serde",
      "smallvec",
      "thin-vec",
@@ -329,6 +360,7 @@
    },
    {
     "dependencies": [
+     "blaze-hash",
      "proc-macro2",
      "quote",
      "syn 2.0.119"
@@ -352,7 +384,26 @@
     "version": "0.0.0"
    },
    {
+    "dependencies": [
+     "blaze-serde-derive",
+     "serde"
+    ],
+    "name": "blaze-serde",
+    "version": "0.0.0"
+   },
+   {
+    "name": "blaze-serde-derive",
+    "version": "0.0.0"
+   },
+   {
     "name": "blaze-sha256",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "blaze-check"
+    ],
+    "name": "blaze-spin",
     "version": "0.0.0"
    },
    {
@@ -361,13 +412,15 @@
      "blaze-check",
      "blaze-core",
      "blaze-format",
+     "blaze-hash",
      "blaze-ids",
      "blaze-image",
      "blaze-mem",
      "blaze-protocol",
      "blaze-reclaim",
+     "blaze-serde",
      "hashbrown 0.17.1",
-     "rustc-hash 2.1.3",
+     "parking_lot",
      "serde",
      "smallvec"
     ],
@@ -639,6 +692,15 @@
     "name": "crossbeam-epoch",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.9.21"
+   },
+   {
+    "checksum": "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae",
+    "dependencies": [
+     "crossbeam-utils"
+    ],
+    "name": "crossbeam-queue",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.3.14"
    },
    {
     "checksum": "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6",
@@ -1214,7 +1276,9 @@
    {
     "checksum": "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a",
     "dependencies": [
-     "foldhash 0.2.0"
+     "foldhash 0.2.0",
+     "serde",
+     "serde_core"
     ],
     "name": "hashbrown",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -1256,11 +1320,12 @@
     "dependencies": [
      "blaze-check",
      "blaze-format",
+     "blaze-hash",
      "blaze-ids",
      "blaze-image",
      "blaze-mem",
      "blaze-phf",
-     "rustc-hash 2.1.3"
+     "parking_lot"
     ],
     "name": "intern",
     "version": "0.0.0"
@@ -1959,6 +2024,16 @@
     "version": "1.2.3"
    },
    {
+    "checksum": "da2442474a9404698c42509b8967f437249dbc7b50493e83020333d3943ec0ae",
+    "dependencies": [
+     "equivalent",
+     "seize"
+    ],
+    "name": "papaya",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.2.5"
+   },
+   {
     "checksum": "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a",
     "dependencies": [
      "lock_api",
@@ -2383,6 +2458,16 @@
     "name": "scopeguard",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "1.2.0"
+   },
+   {
+    "checksum": "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521",
+    "dependencies": [
+     "libc",
+     "windows-sys 0.61.2"
+    ],
+    "name": "seize",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "version": "0.5.1"
    },
    {
     "checksum": "2ab42ca02749e120097e328d91d415325bdf43b1c72c4c8badf37375fe40a813",
@@ -3932,6 +4017,23 @@
    },
    "version": "0.0.0"
   },
+  "blaze-hash@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze v2's in-memory hashing: maps and sets on foldhash with a fixed seed, and the identity hasher for keys that are hashes already",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-hash",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-hash",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
   "blaze-ids@0.0.0": {
    "authors": "blaze contributors",
    "description": "blaze v2's two kinds of IDs: content IDs (BLAKE3) for identity, dense u32 indices per arena for speed, and the interners that map one to the other",
@@ -4136,6 +4238,40 @@
    },
    "version": "0.0.0"
   },
+  "blaze-serde-derive@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "derive(Serialize) and derive(Deserialize) for serde's traits, read from proc_macro's tokens with no syn, quote or proc-macro2, so blaze's macro engine runs it cheaply",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-serde-derive",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-serde-derive",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-serde@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "serde with blaze's own derive: the traits, the derives under the same names, and the helpers the derived impls share",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-serde",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-serde",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
   "blaze-sha256@0.0.0": {
    "authors": "blaze contributors",
    "description": "blaze's one SHA-256 (FIPS 180-4), in the processor's SHA-256 instructions where it has them; no dependencies, so build scripts take it as a build-dependency",
@@ -4149,6 +4285,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-sha256",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-spin@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's one bounded spin (AGENTS.md rules 9 and 13): a wait for a step another running thread is in the middle of spins, yields, then says to park or panics naming what it waited for",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-spin",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-spin",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -4662,6 +4815,23 @@
     "kind": "registry"
    },
    "version": "0.9.21"
+  },
+  "crossbeam-queue@0.3.14": {
+   "authors": "",
+   "description": "Concurrent queues",
+   "homepage": "https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-queue",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "crossbeam-queue",
+   "readme": "README.md",
+   "repository": "https://github.com/crossbeam-rs/crossbeam",
+   "rust_version": "1.60",
+   "source": {
+    "checksum": "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae",
+    "kind": "registry"
+   },
+   "version": "0.3.14"
   },
   "crossbeam-utils@0.8.23": {
    "authors": "",
@@ -6805,6 +6975,23 @@
    },
    "version": "1.2.3"
   },
+  "papaya@0.2.5": {
+   "authors": "Ibraheem Ahmed <ibraheem@ibraheem.ca>",
+   "description": "A fast and ergonomic concurrent hash-table for read-heavy workloads.",
+   "homepage": "",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "papaya",
+   "readme": "README.md",
+   "repository": "https://github.com/ibraheemdev/papaya",
+   "rust_version": "1.72.0",
+   "source": {
+    "checksum": "da2442474a9404698c42509b8967f437249dbc7b50493e83020333d3943ec0ae",
+    "kind": "registry"
+   },
+   "version": "0.2.5"
+  },
   "parking_lot@0.12.5": {
    "authors": "Amanieu d'Antras <amanieu@gmail.com>",
    "description": "More compact and efficient implementations of the standard synchronization primitives.",
@@ -7620,6 +7807,23 @@
     "kind": "registry"
    },
    "version": "1.2.0"
+  },
+  "seize@0.5.1": {
+   "authors": "Ibraheem Ahmed <ibraheem@ibraheem.ca>",
+   "description": "Fast, efficient, and predictable memory reclamation for concurrent data structures.",
+   "homepage": "",
+   "license": "MIT",
+   "license_file": "",
+   "links": null,
+   "name": "seize",
+   "readme": "README.md",
+   "repository": "https://github.com/ibraheemdev/seize",
+   "rust_version": "1.72.0",
+   "source": {
+    "checksum": "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521",
+    "kind": "registry"
+   },
+   "version": "0.5.1"
   },
   "self_cell@1.3.0": {
    "authors": "Lukas Bergdoll <lukas.bergdoll@gmail.com>",
@@ -9945,6 +10149,10 @@
        "unit": "blaze-core@0.0.0 lib blaze_core build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
@@ -9961,6 +10169,10 @@
        "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "blaze_vfs",
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
@@ -9971,10 +10183,6 @@
       {
        "name": "memchr",
        "unit": "memchr@2.8.3 lib memchr build"
-      },
-      {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
       },
       {
        "name": "serde",
@@ -10026,6 +10234,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
@@ -10042,12 +10254,16 @@
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -10073,6 +10289,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
       {
        "name": "serde",
@@ -10112,6 +10332,10 @@
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_image",
        "unit": "blaze-image@0.0.0 lib blaze_image build"
       },
@@ -10132,6 +10356,14 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
        "name": "corosensei",
        "unit": "corosensei@0.3.4 lib corosensei build"
       },
@@ -10144,12 +10376,16 @@
        "unit": "crossbeam-deque@0.8.8 lib crossbeam_deque build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -10181,6 +10417,80 @@
      "src": "src/lib.rs",
      "target": "blaze_graph"
     },
+    "blaze-hash@0.0.0 lib blaze_hash build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "foldhash",
+       "unit": "foldhash@0.2.0 lib foldhash build"
+      },
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build"
+      },
+      {
+       "name": "papaya",
+       "unit": "papaya@0.2.5 lib papaya build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-hash@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_hash"
+    },
+    "blaze-hash@0.0.0 lib blaze_hash build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "foldhash",
+       "unit": "foldhash@0.2.0 lib foldhash build host"
+      },
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build host"
+      },
+      {
+       "name": "papaya",
+       "unit": "papaya@0.2.5 lib papaya build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-hash@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_hash"
+    },
     "blaze-ids@0.0.0 lib blaze_ids build": {
      "crate_type": "lib",
      "deps": [
@@ -10193,6 +10503,10 @@
        "unit": "blake3@1.8.7 lib blake3 build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
@@ -10203,6 +10517,14 @@
       {
        "name": "blaze_rng",
        "unit": "blaze-rng@0.0.0 lib blaze_rng build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -10283,8 +10605,20 @@
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -10341,8 +10675,20 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -10386,6 +10732,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "serde",
        "unit": "serde@1.0.229 lib serde build"
       }
@@ -10410,6 +10760,10 @@
     "blaze-query-macros@0.0.0 proc-macro blaze_query_macros build host": {
      "crate_type": "proc-macro",
      "deps": [
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build host"
+      },
       {
        "name": "proc_macro2",
        "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
@@ -10460,6 +10814,10 @@
        "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
@@ -10484,6 +10842,10 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "blaze_vfs",
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
@@ -10504,8 +10866,8 @@
        "unit": "intern@0.0.0 lib intern build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -10601,6 +10963,55 @@
      "src": "src/lib.rs",
      "target": "blaze_rng"
     },
+    "blaze-serde-derive@0.0.0 proc-macro blaze_serde_derive build host": {
+     "crate_type": "proc-macro",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "proc-macro",
+     "mode": "build",
+     "pkg": "blaze-serde-derive@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_serde_derive"
+    },
+    "blaze-serde@0.0.0 lib blaze_serde build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_serde_derive",
+       "unit": "blaze-serde-derive@0.0.0 proc-macro blaze_serde_derive build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-serde@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_serde"
+    },
     "blaze-sha256@0.0.0 lib blaze_sha256 build": {
      "crate_type": "lib",
      "deps": [],
@@ -10621,6 +11032,26 @@
      "src": "src/lib.rs",
      "target": "blaze_sha256"
     },
+    "blaze-spin@0.0.0 lib blaze_spin build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-spin@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_spin"
+    },
     "blaze-vfs@0.0.0 lib blaze_vfs build": {
      "crate_type": "lib",
      "deps": [
@@ -10635,6 +11066,10 @@
       {
        "name": "blaze_format",
        "unit": "blaze-format@0.0.0 lib blaze_format build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
       {
        "name": "blaze_ids",
@@ -10657,12 +11092,16 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "hashbrown",
        "unit": "hashbrown@0.17.1 lib hashbrown build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -11552,6 +11991,35 @@
      "src": "src/lib.rs",
      "target": "crossbeam_epoch"
     },
+    "crossbeam-queue@0.3.14 lib crossbeam_queue build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "crossbeam_utils",
+       "unit": "crossbeam-utils@0.8.23 lib crossbeam_utils build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "alloc",
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "crossbeam-queue@0.3.14",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "crossbeam_queue"
+    },
     "crossbeam-utils@0.8.23 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
@@ -12255,6 +12723,26 @@
      "src": "src/lib.rs",
      "target": "equivalent"
     },
+    "equivalent@1.0.3 lib equivalent build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2015",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "equivalent@1.0.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "equivalent"
+    },
     "euclid@0.22.14 lib euclid build": {
      "crate_type": "lib",
      "deps": [
@@ -12424,7 +12912,9 @@
      "deps": [],
      "edition": "2021",
      "features": [
-      "nightly"
+      "default",
+      "nightly",
+      "std"
      ],
      "kind": "lib",
      "mode": "build",
@@ -12435,6 +12925,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "foldhash"
+    },
+    "foldhash@0.2.0 lib foldhash build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "foldhash@0.2.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -12984,13 +13497,18 @@
       {
        "name": "foldhash",
        "unit": "foldhash@0.2.0 lib foldhash build"
+      },
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
       }
      ],
      "edition": "2024",
      "features": [
       "default-hasher",
       "inline-more",
-      "nightly"
+      "nightly",
+      "serde"
      ],
      "kind": "lib",
      "mode": "build",
@@ -13001,6 +13519,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hashbrown"
+    },
+    "hashbrown@0.17.1 lib hashbrown build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "inline-more",
+      "nightly",
+      "serde"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hashbrown@0.17.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -13095,6 +13642,10 @@
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
@@ -13111,8 +13662,8 @@
        "unit": "blaze-phf@0.0.0 lib blaze_phf build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -14471,6 +15022,70 @@
      "src": "src/lib.rs",
      "target": "once_cell"
     },
+    "papaya@0.2.5 lib papaya build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "equivalent",
+       "unit": "equivalent@1.0.3 lib equivalent build"
+      },
+      {
+       "name": "seize",
+       "unit": "seize@0.5.1 lib seize build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "fast-barrier"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "papaya@0.2.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "papaya"
+    },
+    "papaya@0.2.5 lib papaya build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "equivalent",
+       "unit": "equivalent@1.0.3 lib equivalent build host"
+      },
+      {
+       "name": "seize",
+       "unit": "seize@0.5.1 lib seize build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "fast-barrier"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "papaya@0.2.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "papaya"
+    },
     "parking_lot@0.12.5 lib parking_lot build": {
      "crate_type": "lib",
      "deps": [
@@ -15187,29 +15802,6 @@
      "src": "src/lib.rs",
      "target": "ref_cast"
     },
-    "rustc-hash@2.1.3 lib rustc_hash build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2021",
-     "features": [
-      "default",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "rustc-hash@2.1.3",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "rustc_hash"
-    },
     "scopeguard@1.2.0 lib scopeguard build": {
      "crate_type": "lib",
      "deps": [],
@@ -15229,6 +15821,64 @@
      },
      "src": "src/lib.rs",
      "target": "scopeguard"
+    },
+    "seize@0.5.1 lib seize build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "fast-barrier",
+      "libc",
+      "windows-sys"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "seize@0.5.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "seize"
+    },
+    "seize@0.5.1 lib seize build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "fast-barrier",
+      "libc",
+      "windows-sys"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "seize@0.5.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "seize"
     },
     "self_cell@1.3.0 lib self_cell build": {
      "crate_type": "lib",
@@ -15250,7 +15900,7 @@
      "src": "src/lib.rs",
      "target": "self_cell"
     },
-    "serde@1.0.229 custom-build build-script-build build host": {
+    "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -15277,12 +15927,35 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "serde@1.0.229 custom-build build-script-build build host features=default,std": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "serde@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "serde@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde@1.0.229 custom-build build-script-build build host"
+       "unit": "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std"
       }
      ],
      "edition": "2021",
@@ -15303,6 +15976,34 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "serde@1.0.229 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde@1.0.229 custom-build build-script-build build host features=default,std"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "serde@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -15349,7 +16050,39 @@
      "src": "src/lib.rs",
      "target": "serde"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host": {
+    "serde@1.0.229 lib serde build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde@1.0.229 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde"
+    },
+    "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -15374,12 +16107,35 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "serde_core@1.0.229 custom-build build-script-build build host features=result,std": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "result",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "serde_core@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "serde_core@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std"
       }
      ],
      "edition": "2021",
@@ -15398,6 +16154,34 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "serde_core@1.0.229 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=result,std"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "result",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "serde_core@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -15428,6 +16212,34 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_core"
+    },
+    "serde_core@1.0.229 lib serde_core build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde_core@1.0.229 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "result",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_core@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -17562,6 +18374,10 @@
        "unit": "blaze-core@0.0.0 lib blaze_core build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
@@ -17578,6 +18394,10 @@
        "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "blaze_vfs",
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
@@ -17588,10 +18408,6 @@
       {
        "name": "memchr",
        "unit": "memchr@2.8.3 lib memchr build"
-      },
-      {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
       },
       {
        "name": "serde",
@@ -17643,6 +18459,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
@@ -17659,12 +18479,16 @@
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -17690,6 +18514,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
       {
        "name": "serde",
@@ -17729,6 +18557,10 @@
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_image",
        "unit": "blaze-image@0.0.0 lib blaze_image build"
       },
@@ -17749,6 +18581,14 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
        "name": "corosensei",
        "unit": "corosensei@0.3.4 lib corosensei build"
       },
@@ -17761,12 +18601,16 @@
        "unit": "crossbeam-deque@0.8.8 lib crossbeam_deque build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -17798,6 +18642,80 @@
      "src": "src/lib.rs",
      "target": "blaze_graph"
     },
+    "blaze-hash@0.0.0 lib blaze_hash build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "foldhash",
+       "unit": "foldhash@0.2.0 lib foldhash build"
+      },
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build"
+      },
+      {
+       "name": "papaya",
+       "unit": "papaya@0.2.5 lib papaya build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-hash@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_hash"
+    },
+    "blaze-hash@0.0.0 lib blaze_hash build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "foldhash",
+       "unit": "foldhash@0.2.0 lib foldhash build host"
+      },
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build host"
+      },
+      {
+       "name": "papaya",
+       "unit": "papaya@0.2.5 lib papaya build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-hash@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_hash"
+    },
     "blaze-ids@0.0.0 lib blaze_ids build": {
      "crate_type": "lib",
      "deps": [
@@ -17810,6 +18728,10 @@
        "unit": "blake3@1.8.7 lib blake3 build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
@@ -17820,6 +18742,14 @@
       {
        "name": "blaze_rng",
        "unit": "blaze-rng@0.0.0 lib blaze_rng build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -17900,8 +18830,20 @@
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -17958,8 +18900,20 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -18003,6 +18957,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "serde",
        "unit": "serde@1.0.229 lib serde build"
       }
@@ -18027,6 +18985,10 @@
     "blaze-query-macros@0.0.0 proc-macro blaze_query_macros build host": {
      "crate_type": "proc-macro",
      "deps": [
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build host"
+      },
       {
        "name": "proc_macro2",
        "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
@@ -18077,6 +19039,10 @@
        "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
@@ -18101,6 +19067,10 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "blaze_vfs",
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
@@ -18121,8 +19091,8 @@
        "unit": "intern@0.0.0 lib intern build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -18218,6 +19188,55 @@
      "src": "src/lib.rs",
      "target": "blaze_rng"
     },
+    "blaze-serde-derive@0.0.0 proc-macro blaze_serde_derive build host": {
+     "crate_type": "proc-macro",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "proc-macro",
+     "mode": "build",
+     "pkg": "blaze-serde-derive@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_serde_derive"
+    },
+    "blaze-serde@0.0.0 lib blaze_serde build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_serde_derive",
+       "unit": "blaze-serde-derive@0.0.0 proc-macro blaze_serde_derive build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-serde@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_serde"
+    },
     "blaze-sha256@0.0.0 lib blaze_sha256 build": {
      "crate_type": "lib",
      "deps": [],
@@ -18238,6 +19257,26 @@
      "src": "src/lib.rs",
      "target": "blaze_sha256"
     },
+    "blaze-spin@0.0.0 lib blaze_spin build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-spin@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_spin"
+    },
     "blaze-vfs@0.0.0 lib blaze_vfs build": {
      "crate_type": "lib",
      "deps": [
@@ -18252,6 +19291,10 @@
       {
        "name": "blaze_format",
        "unit": "blaze-format@0.0.0 lib blaze_format build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
       {
        "name": "blaze_ids",
@@ -18274,12 +19317,16 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "hashbrown",
        "unit": "hashbrown@0.17.1 lib hashbrown build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -19035,6 +20082,35 @@
      "src": "src/lib.rs",
      "target": "crossbeam_epoch"
     },
+    "crossbeam-queue@0.3.14 lib crossbeam_queue build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "crossbeam_utils",
+       "unit": "crossbeam-utils@0.8.23 lib crossbeam_utils build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "alloc",
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "crossbeam-queue@0.3.14",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "crossbeam_queue"
+    },
     "crossbeam-utils@0.8.23 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
@@ -19709,6 +20785,26 @@
      "src": "src/lib.rs",
      "target": "equivalent"
     },
+    "equivalent@1.0.3 lib equivalent build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2015",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "equivalent@1.0.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "equivalent"
+    },
     "euclid@0.22.14 lib euclid build": {
      "crate_type": "lib",
      "deps": [
@@ -19878,7 +20974,9 @@
      "deps": [],
      "edition": "2021",
      "features": [
-      "nightly"
+      "default",
+      "nightly",
+      "std"
      ],
      "kind": "lib",
      "mode": "build",
@@ -19889,6 +20987,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "foldhash"
+    },
+    "foldhash@0.2.0 lib foldhash build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "foldhash@0.2.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -20555,13 +21676,18 @@
       {
        "name": "foldhash",
        "unit": "foldhash@0.2.0 lib foldhash build"
+      },
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
       }
      ],
      "edition": "2024",
      "features": [
       "default-hasher",
       "inline-more",
-      "nightly"
+      "nightly",
+      "serde"
      ],
      "kind": "lib",
      "mode": "build",
@@ -20572,6 +21698,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hashbrown"
+    },
+    "hashbrown@0.17.1 lib hashbrown build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "inline-more",
+      "nightly",
+      "serde"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hashbrown@0.17.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -20666,6 +21821,10 @@
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
@@ -20682,8 +21841,8 @@
        "unit": "blaze-phf@0.0.0 lib blaze_phf build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -21670,6 +22829,70 @@
      "src": "src/lib.rs",
      "target": "once_cell"
     },
+    "papaya@0.2.5 lib papaya build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "equivalent",
+       "unit": "equivalent@1.0.3 lib equivalent build"
+      },
+      {
+       "name": "seize",
+       "unit": "seize@0.5.1 lib seize build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "fast-barrier"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "papaya@0.2.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "papaya"
+    },
+    "papaya@0.2.5 lib papaya build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "equivalent",
+       "unit": "equivalent@1.0.3 lib equivalent build host"
+      },
+      {
+       "name": "seize",
+       "unit": "seize@0.5.1 lib seize build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "fast-barrier"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "papaya@0.2.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "papaya"
+    },
     "parking_lot@0.12.5 lib parking_lot build": {
      "crate_type": "lib",
      "deps": [
@@ -22466,29 +23689,6 @@
      "src": "src/lib.rs",
      "target": "ref_cast"
     },
-    "rustc-hash@2.1.3 lib rustc_hash build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2021",
-     "features": [
-      "default",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "rustc-hash@2.1.3",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "rustc_hash"
-    },
     "rustix@0.38.44 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
@@ -22760,6 +23960,64 @@
      "src": "src/lib.rs",
      "target": "scopeguard"
     },
+    "seize@0.5.1 lib seize build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "fast-barrier",
+      "libc",
+      "windows-sys"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "seize@0.5.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "seize"
+    },
+    "seize@0.5.1 lib seize build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "fast-barrier",
+      "libc",
+      "windows-sys"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "seize@0.5.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "seize"
+    },
     "self_cell@1.3.0 lib self_cell build": {
      "crate_type": "lib",
      "deps": [],
@@ -22780,7 +24038,7 @@
      "src": "src/lib.rs",
      "target": "self_cell"
     },
-    "serde@1.0.229 custom-build build-script-build build host": {
+    "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -22807,12 +24065,35 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "serde@1.0.229 custom-build build-script-build build host features=default,std": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "serde@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "serde@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde@1.0.229 custom-build build-script-build build host"
+       "unit": "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std"
       }
      ],
      "edition": "2021",
@@ -22833,6 +24114,34 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "serde@1.0.229 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde@1.0.229 custom-build build-script-build build host features=default,std"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "serde@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -22879,7 +24188,39 @@
      "src": "src/lib.rs",
      "target": "serde"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host": {
+    "serde@1.0.229 lib serde build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde@1.0.229 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde"
+    },
+    "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -22904,12 +24245,35 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "serde_core@1.0.229 custom-build build-script-build build host features=result,std": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "result",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "serde_core@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "serde_core@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std"
       }
      ],
      "edition": "2021",
@@ -22928,6 +24292,34 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "serde_core@1.0.229 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=result,std"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "result",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "serde_core@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -22958,6 +24350,34 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_core"
+    },
+    "serde_core@1.0.229 lib serde_core build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde_core@1.0.229 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "result",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_core@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -26106,6 +27526,10 @@
        "unit": "blaze-core@0.0.0 lib blaze_core build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
@@ -26122,6 +27546,10 @@
        "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "blaze_vfs",
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
@@ -26132,10 +27560,6 @@
       {
        "name": "memchr",
        "unit": "memchr@2.8.3 lib memchr build"
-      },
-      {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
       },
       {
        "name": "serde",
@@ -26187,6 +27611,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
@@ -26203,12 +27631,16 @@
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -26234,6 +27666,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
       {
        "name": "serde",
@@ -26273,6 +27709,10 @@
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_image",
        "unit": "blaze-image@0.0.0 lib blaze_image build"
       },
@@ -26293,6 +27733,14 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
        "name": "corosensei",
        "unit": "corosensei@0.3.4 lib corosensei build"
       },
@@ -26305,12 +27753,16 @@
        "unit": "crossbeam-deque@0.8.8 lib crossbeam_deque build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -26342,12 +27794,90 @@
      "src": "src/lib.rs",
      "target": "blaze_graph"
     },
+    "blaze-hash@0.0.0 lib blaze_hash build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "foldhash",
+       "unit": "foldhash@0.2.0 lib foldhash build"
+      },
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build"
+      },
+      {
+       "name": "papaya",
+       "unit": "papaya@0.2.5 lib papaya build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-hash@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_hash"
+    },
+    "blaze-hash@0.0.0 lib blaze_hash build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "foldhash",
+       "unit": "foldhash@0.2.0 lib foldhash build host"
+      },
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build host"
+      },
+      {
+       "name": "papaya",
+       "unit": "papaya@0.2.5 lib papaya build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-hash@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_hash"
+    },
     "blaze-ids@0.0.0 lib blaze_ids build": {
      "crate_type": "lib",
      "deps": [
       {
        "name": "blake3",
        "unit": "blake3@1.8.7 lib blake3 build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
       {
        "name": "blaze_mem",
@@ -26360,6 +27890,14 @@
       {
        "name": "blaze_rng",
        "unit": "blaze-rng@0.0.0 lib blaze_rng build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -26440,8 +27978,20 @@
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -26498,8 +28048,20 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -26543,6 +28105,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "serde",
        "unit": "serde@1.0.229 lib serde build"
       }
@@ -26567,6 +28133,10 @@
     "blaze-query-macros@0.0.0 proc-macro blaze_query_macros build host": {
      "crate_type": "proc-macro",
      "deps": [
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build host"
+      },
       {
        "name": "proc_macro2",
        "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
@@ -26617,6 +28187,10 @@
        "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
@@ -26641,6 +28215,10 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "blaze_vfs",
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
@@ -26661,8 +28239,8 @@
        "unit": "intern@0.0.0 lib intern build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -26758,6 +28336,55 @@
      "src": "src/lib.rs",
      "target": "blaze_rng"
     },
+    "blaze-serde-derive@0.0.0 proc-macro blaze_serde_derive build host": {
+     "crate_type": "proc-macro",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "proc-macro",
+     "mode": "build",
+     "pkg": "blaze-serde-derive@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_serde_derive"
+    },
+    "blaze-serde@0.0.0 lib blaze_serde build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_serde_derive",
+       "unit": "blaze-serde-derive@0.0.0 proc-macro blaze_serde_derive build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-serde@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_serde"
+    },
     "blaze-sha256@0.0.0 lib blaze_sha256 build": {
      "crate_type": "lib",
      "deps": [],
@@ -26778,6 +28405,26 @@
      "src": "src/lib.rs",
      "target": "blaze_sha256"
     },
+    "blaze-spin@0.0.0 lib blaze_spin build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-spin@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_spin"
+    },
     "blaze-vfs@0.0.0 lib blaze_vfs build": {
      "crate_type": "lib",
      "deps": [
@@ -26792,6 +28439,10 @@
       {
        "name": "blaze_format",
        "unit": "blaze-format@0.0.0 lib blaze_format build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
       {
        "name": "blaze_ids",
@@ -26814,12 +28465,16 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "hashbrown",
        "unit": "hashbrown@0.17.1 lib hashbrown build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -27729,6 +29384,35 @@
      "src": "src/lib.rs",
      "target": "crossbeam_epoch"
     },
+    "crossbeam-queue@0.3.14 lib crossbeam_queue build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "crossbeam_utils",
+       "unit": "crossbeam-utils@0.8.23 lib crossbeam_utils build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "alloc",
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "crossbeam-queue@0.3.14",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "crossbeam_queue"
+    },
     "crossbeam-utils@0.8.23 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
@@ -28432,6 +30116,26 @@
      "src": "src/lib.rs",
      "target": "equivalent"
     },
+    "equivalent@1.0.3 lib equivalent build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2015",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "equivalent@1.0.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "equivalent"
+    },
     "euclid@0.22.14 lib euclid build": {
      "crate_type": "lib",
      "deps": [
@@ -28601,7 +30305,9 @@
      "deps": [],
      "edition": "2021",
      "features": [
-      "nightly"
+      "default",
+      "nightly",
+      "std"
      ],
      "kind": "lib",
      "mode": "build",
@@ -28612,6 +30318,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "foldhash"
+    },
+    "foldhash@0.2.0 lib foldhash build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "foldhash@0.2.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -29161,13 +30890,18 @@
       {
        "name": "foldhash",
        "unit": "foldhash@0.2.0 lib foldhash build"
+      },
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
       }
      ],
      "edition": "2024",
      "features": [
       "default-hasher",
       "inline-more",
-      "nightly"
+      "nightly",
+      "serde"
      ],
      "kind": "lib",
      "mode": "build",
@@ -29178,6 +30912,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hashbrown"
+    },
+    "hashbrown@0.17.1 lib hashbrown build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "inline-more",
+      "nightly",
+      "serde"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hashbrown@0.17.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -29272,6 +31035,10 @@
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
@@ -29288,8 +31055,8 @@
        "unit": "blaze-phf@0.0.0 lib blaze_phf build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -30648,6 +32415,70 @@
      "src": "src/lib.rs",
      "target": "once_cell"
     },
+    "papaya@0.2.5 lib papaya build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "equivalent",
+       "unit": "equivalent@1.0.3 lib equivalent build"
+      },
+      {
+       "name": "seize",
+       "unit": "seize@0.5.1 lib seize build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "fast-barrier"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "papaya@0.2.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "papaya"
+    },
+    "papaya@0.2.5 lib papaya build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "equivalent",
+       "unit": "equivalent@1.0.3 lib equivalent build host"
+      },
+      {
+       "name": "seize",
+       "unit": "seize@0.5.1 lib seize build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "fast-barrier"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "papaya@0.2.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "papaya"
+    },
     "parking_lot@0.12.5 lib parking_lot build": {
      "crate_type": "lib",
      "deps": [
@@ -31364,29 +33195,6 @@
      "src": "src/lib.rs",
      "target": "ref_cast"
     },
-    "rustc-hash@2.1.3 lib rustc_hash build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2021",
-     "features": [
-      "default",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "rustc-hash@2.1.3",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "rustc_hash"
-    },
     "scopeguard@1.2.0 lib scopeguard build": {
      "crate_type": "lib",
      "deps": [],
@@ -31406,6 +33214,64 @@
      },
      "src": "src/lib.rs",
      "target": "scopeguard"
+    },
+    "seize@0.5.1 lib seize build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "fast-barrier",
+      "libc",
+      "windows-sys"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "seize@0.5.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "seize"
+    },
+    "seize@0.5.1 lib seize build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "fast-barrier",
+      "libc",
+      "windows-sys"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "seize@0.5.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "seize"
     },
     "self_cell@1.3.0 lib self_cell build": {
      "crate_type": "lib",
@@ -31427,7 +33293,7 @@
      "src": "src/lib.rs",
      "target": "self_cell"
     },
-    "serde@1.0.229 custom-build build-script-build build host": {
+    "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -31454,12 +33320,35 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "serde@1.0.229 custom-build build-script-build build host features=default,std": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "serde@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "serde@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde@1.0.229 custom-build build-script-build build host"
+       "unit": "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std"
       }
      ],
      "edition": "2021",
@@ -31480,6 +33369,34 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "serde@1.0.229 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde@1.0.229 custom-build build-script-build build host features=default,std"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "serde@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -31526,7 +33443,39 @@
      "src": "src/lib.rs",
      "target": "serde"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host": {
+    "serde@1.0.229 lib serde build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde@1.0.229 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde"
+    },
+    "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -31551,12 +33500,35 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "serde_core@1.0.229 custom-build build-script-build build host features=result,std": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "result",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "serde_core@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "serde_core@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std"
       }
      ],
      "edition": "2021",
@@ -31575,6 +33547,34 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "serde_core@1.0.229 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=result,std"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "result",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "serde_core@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -31605,6 +33605,34 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_core"
+    },
+    "serde_core@1.0.229 lib serde_core build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde_core@1.0.229 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "result",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_core@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -33739,6 +35767,10 @@
        "unit": "blaze-core@0.0.0 lib blaze_core build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
@@ -33755,6 +35787,10 @@
        "unit": "blaze-query@0.0.0 lib blaze_query build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "blaze_vfs",
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
@@ -33765,10 +35801,6 @@
       {
        "name": "memchr",
        "unit": "memchr@2.8.3 lib memchr build"
-      },
-      {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
       },
       {
        "name": "serde",
@@ -33820,6 +35852,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
@@ -33836,12 +35872,16 @@
        "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -33867,6 +35907,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
       },
       {
        "name": "serde",
@@ -33906,6 +35950,10 @@
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_image",
        "unit": "blaze-image@0.0.0 lib blaze_image build"
       },
@@ -33926,6 +35974,14 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
        "name": "corosensei",
        "unit": "corosensei@0.3.4 lib corosensei build"
       },
@@ -33938,12 +35994,16 @@
        "unit": "crossbeam-deque@0.8.8 lib crossbeam_deque build"
       },
       {
+       "name": "crossbeam_queue",
+       "unit": "crossbeam-queue@0.3.14 lib crossbeam_queue build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -33975,6 +36035,80 @@
      "src": "src/lib.rs",
      "target": "blaze_graph"
     },
+    "blaze-hash@0.0.0 lib blaze_hash build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "foldhash",
+       "unit": "foldhash@0.2.0 lib foldhash build"
+      },
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build"
+      },
+      {
+       "name": "papaya",
+       "unit": "papaya@0.2.5 lib papaya build"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-hash@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_hash"
+    },
+    "blaze-hash@0.0.0 lib blaze_hash build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "foldhash",
+       "unit": "foldhash@0.2.0 lib foldhash build host"
+      },
+      {
+       "name": "hashbrown",
+       "unit": "hashbrown@0.17.1 lib hashbrown build host"
+      },
+      {
+       "name": "papaya",
+       "unit": "papaya@0.2.5 lib papaya build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-hash@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_hash"
+    },
     "blaze-ids@0.0.0 lib blaze_ids build": {
      "crate_type": "lib",
      "deps": [
@@ -33987,6 +36121,10 @@
        "unit": "blake3@1.8.7 lib blake3 build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_mem",
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
@@ -33997,6 +36135,14 @@
       {
        "name": "blaze_rng",
        "unit": "blaze-rng@0.0.0 lib blaze_rng build"
+      },
+      {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -34077,8 +36223,20 @@
        "unit": "blaze-mem@0.0.0 lib blaze_mem build"
       },
       {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -34135,8 +36293,20 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_spin",
+       "unit": "blaze-spin@0.0.0 lib blaze_spin build"
+      },
+      {
+       "name": "crossbeam_channel",
+       "unit": "crossbeam-channel@0.5.17 lib crossbeam_channel build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
+      },
+      {
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -34180,6 +36350,10 @@
      "crate_type": "lib",
      "deps": [
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "serde",
        "unit": "serde@1.0.229 lib serde build"
       }
@@ -34204,6 +36378,10 @@
     "blaze-query-macros@0.0.0 proc-macro blaze_query_macros build host": {
      "crate_type": "proc-macro",
      "deps": [
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build host"
+      },
       {
        "name": "proc_macro2",
        "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
@@ -34254,6 +36432,10 @@
        "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
@@ -34278,6 +36460,10 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "blaze_vfs",
        "unit": "blaze-vfs@0.0.0 lib blaze_vfs build"
       },
@@ -34298,8 +36484,8 @@
        "unit": "intern@0.0.0 lib intern build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -34395,6 +36581,55 @@
      "src": "src/lib.rs",
      "target": "blaze_rng"
     },
+    "blaze-serde-derive@0.0.0 proc-macro blaze_serde_derive build host": {
+     "crate_type": "proc-macro",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "proc-macro",
+     "mode": "build",
+     "pkg": "blaze-serde-derive@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_serde_derive"
+    },
+    "blaze-serde@0.0.0 lib blaze_serde build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_serde_derive",
+       "unit": "blaze-serde-derive@0.0.0 proc-macro blaze_serde_derive build host"
+      },
+      {
+       "name": "serde",
+       "unit": "serde@1.0.229 lib serde build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-serde@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_serde"
+    },
     "blaze-sha256@0.0.0 lib blaze_sha256 build": {
      "crate_type": "lib",
      "deps": [],
@@ -34415,6 +36650,26 @@
      "src": "src/lib.rs",
      "target": "blaze_sha256"
     },
+    "blaze-spin@0.0.0 lib blaze_spin build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-spin@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_spin"
+    },
     "blaze-vfs@0.0.0 lib blaze_vfs build": {
      "crate_type": "lib",
      "deps": [
@@ -34429,6 +36684,10 @@
       {
        "name": "blaze_format",
        "unit": "blaze-format@0.0.0 lib blaze_format build"
+      },
+      {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
       },
       {
        "name": "blaze_ids",
@@ -34451,12 +36710,16 @@
        "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
       },
       {
+       "name": "blaze_serde",
+       "unit": "blaze-serde@0.0.0 lib blaze_serde build"
+      },
+      {
        "name": "hashbrown",
        "unit": "hashbrown@0.17.1 lib hashbrown build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       },
       {
        "name": "serde",
@@ -35232,6 +37495,35 @@
      "src": "src/lib.rs",
      "target": "crossbeam_epoch"
     },
+    "crossbeam-queue@0.3.14 lib crossbeam_queue build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "crossbeam_utils",
+       "unit": "crossbeam-utils@0.8.23 lib crossbeam_utils build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "alloc",
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "crossbeam-queue@0.3.14",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "crossbeam_queue"
+    },
     "crossbeam-utils@0.8.23 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
@@ -35906,6 +38198,26 @@
      "src": "src/lib.rs",
      "target": "equivalent"
     },
+    "equivalent@1.0.3 lib equivalent build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2015",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "equivalent@1.0.3",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "equivalent"
+    },
     "euclid@0.22.14 lib euclid build": {
      "crate_type": "lib",
      "deps": [
@@ -36075,7 +38387,9 @@
      "deps": [],
      "edition": "2021",
      "features": [
-      "nightly"
+      "default",
+      "nightly",
+      "std"
      ],
      "kind": "lib",
      "mode": "build",
@@ -36086,6 +38400,29 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "foldhash"
+    },
+    "foldhash@0.2.0 lib foldhash build host": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "foldhash@0.2.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -36752,13 +39089,18 @@
       {
        "name": "foldhash",
        "unit": "foldhash@0.2.0 lib foldhash build"
+      },
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build"
       }
      ],
      "edition": "2024",
      "features": [
       "default-hasher",
       "inline-more",
-      "nightly"
+      "nightly",
+      "serde"
      ],
      "kind": "lib",
      "mode": "build",
@@ -36769,6 +39111,35 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hashbrown"
+    },
+    "hashbrown@0.17.1 lib hashbrown build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2024",
+     "features": [
+      "inline-more",
+      "nightly",
+      "serde"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hashbrown@0.17.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -36863,6 +39234,10 @@
        "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
+       "name": "blaze_hash",
+       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+      },
+      {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
@@ -36879,8 +39254,8 @@
        "unit": "blaze-phf@0.0.0 lib blaze_phf build"
       },
       {
-       "name": "rustc_hash",
-       "unit": "rustc-hash@2.1.3 lib rustc_hash build"
+       "name": "parking_lot",
+       "unit": "parking_lot@0.12.5 lib parking_lot build"
       }
      ],
      "edition": "2024",
@@ -37867,6 +40242,70 @@
      "src": "src/lib.rs",
      "target": "once_cell"
     },
+    "papaya@0.2.5 lib papaya build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "equivalent",
+       "unit": "equivalent@1.0.3 lib equivalent build"
+      },
+      {
+       "name": "seize",
+       "unit": "seize@0.5.1 lib seize build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "fast-barrier"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "papaya@0.2.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "papaya"
+    },
+    "papaya@0.2.5 lib papaya build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "equivalent",
+       "unit": "equivalent@1.0.3 lib equivalent build host"
+      },
+      {
+       "name": "seize",
+       "unit": "seize@0.5.1 lib seize build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "fast-barrier"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "papaya@0.2.5",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "papaya"
+    },
     "parking_lot@0.12.5 lib parking_lot build": {
      "crate_type": "lib",
      "deps": [
@@ -38663,29 +41102,6 @@
      "src": "src/lib.rs",
      "target": "ref_cast"
     },
-    "rustc-hash@2.1.3 lib rustc_hash build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2021",
-     "features": [
-      "default",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "rustc-hash@2.1.3",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "rustc_hash"
-    },
     "rustix@0.38.44 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [],
@@ -38957,6 +41373,64 @@
      "src": "src/lib.rs",
      "target": "scopeguard"
     },
+    "seize@0.5.1 lib seize build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "fast-barrier",
+      "libc",
+      "windows-sys"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "seize@0.5.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "seize"
+    },
+    "seize@0.5.1 lib seize build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "fast-barrier",
+      "libc",
+      "windows-sys"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "seize@0.5.1",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "seize"
+    },
     "self_cell@1.3.0 lib self_cell build": {
      "crate_type": "lib",
      "deps": [],
@@ -38977,7 +41451,7 @@
      "src": "src/lib.rs",
      "target": "self_cell"
     },
-    "serde@1.0.229 custom-build build-script-build build host": {
+    "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -39004,12 +41478,35 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "serde@1.0.229 custom-build build-script-build build host features=default,std": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "serde@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "serde@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde@1.0.229 custom-build build-script-build build host"
+       "unit": "serde@1.0.229 custom-build build-script-build build host features=alloc,default,derive,rc,serde_derive,std"
       }
      ],
      "edition": "2021",
@@ -39030,6 +41527,34 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "serde@1.0.229 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde@1.0.229 custom-build build-script-build build host features=default,std"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "serde@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -39076,7 +41601,39 @@
      "src": "src/lib.rs",
      "target": "serde"
     },
-    "serde_core@1.0.229 custom-build build-script-build build host": {
+    "serde@1.0.229 lib serde build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde@1.0.229 custom-build build-script-build run-custom-build host"
+      },
+      {
+       "name": "serde_core",
+       "unit": "serde_core@1.0.229 lib serde_core build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "default",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde"
+    },
+    "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std": {
      "crate_type": "bin",
      "deps": [],
      "edition": "2021",
@@ -39101,12 +41658,35 @@
      "src": "build.rs",
      "target": "build-script-build"
     },
+    "serde_core@1.0.229 custom-build build-script-build build host features=result,std": {
+     "crate_type": "bin",
+     "deps": [],
+     "edition": "2021",
+     "features": [
+      "result",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "build",
+     "pkg": "serde_core@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
     "serde_core@1.0.229 custom-build build-script-build run-custom-build": {
      "crate_type": "bin",
      "deps": [
       {
        "name": "build_script_build",
-       "unit": "serde_core@1.0.229 custom-build build-script-build build host"
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=alloc,rc,result,std"
       }
      ],
      "edition": "2021",
@@ -39125,6 +41705,34 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "build.rs",
+     "target": "build-script-build"
+    },
+    "serde_core@1.0.229 custom-build build-script-build run-custom-build host": {
+     "crate_type": "bin",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde_core@1.0.229 custom-build build-script-build build host features=result,std"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "result",
+      "std"
+     ],
+     "kind": "custom-build",
+     "mode": "run-custom-build",
+     "pkg": "serde_core@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
@@ -39155,6 +41763,34 @@
       "debuginfo": 0,
       "name": "release",
       "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "serde_core"
+    },
+    "serde_core@1.0.229 lib serde_core build host": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "build_script_build",
+       "unit": "serde_core@1.0.229 custom-build build-script-build run-custom-build host"
+      }
+     ],
+     "edition": "2021",
+     "features": [
+      "result",
+      "std"
+     ],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "serde_core@1.0.229",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "0",
       "overflow_checks": false,
       "panic": "unwind"
      },
