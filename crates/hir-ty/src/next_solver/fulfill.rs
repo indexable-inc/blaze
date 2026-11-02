@@ -232,6 +232,19 @@ impl<'db> FulfillmentCtxt<'db> {
         self.collect_remaining_errors(infcx)
     }
 
+    /// [`Self::evaluate_obligations_error_on_ambiguity`] handing each error to `on_error`.
+    pub(crate) fn evaluate_obligations_error_on_ambiguity_with(
+        &mut self,
+        infcx: &InferCtxt<'db>,
+        on_error: &mut impl FnMut(NextSolverError<'db>),
+    ) {
+        if self.try_evaluate_obligations_with(infcx, on_error) {
+            return;
+        }
+        self.pending.obligations().map(NextSolverError::Ambiguity).for_each(&mut *on_error);
+        self.pending.clear();
+    }
+
     pub(crate) fn pending_obligations(&self) -> PredicateObligations<'db> {
         self.pending.obligations().collect() // alloc: the caller takes the pending set, once
     }

@@ -30,7 +30,10 @@ use std::{
 use blaze_hash::{FixedHasher, HashMap, HashSet};
 use parking_lot::{Mutex, MutexGuard};
 
-use crate::{Counter, Event, Part, clock};
+use crate::{
+    Counter, Event, Part, clock,
+    span::{self, Said, TYPED},
+};
 
 /// Rows a thread keeps: [`WORDS`] words, 64 bytes, each, so 1 MiB a thread, committed as rows
 /// reach it.
@@ -79,29 +82,18 @@ const SITES_MAX: usize = SLOTS / 2;
 
 type Meta = tracing::Metadata<'static>;
 
-/// A callsite recorded, and which of the schema's fields its spans carry.
+/// A callsite recorded, and which of the generic span columns its fields fill: bit `i` for
+/// the column at [`span::Said::get`]'s `i` ([`span::generic_of`]). The typed columns only a
+/// span kind fills ([`crate::span`]).
 struct Site {
     meta: &'static Meta,
     fields: u8,
 }
 
-const FIELD_CRATE: u8 = 1;
-const FIELD_FUNCTION: u8 = 2;
-const FIELD_UNIT: u8 = 4;
-/// What a wait waits for: a key, a lock, a channel.
-const FIELD_AWAITS: u8 = 8;
-/// Who runs what a wait waits for: a job or thread, as a number.
-const FIELD_OWNER: u8 = 16;
+const _: () = assert!(span::GENERIC <= 8, "a callsite's generic fields are bits of a u8");
 
 fn field_of(name: &str) -> u8 {
-    match name {
-        "crate" | "krate" => FIELD_CRATE,
-        "function" | "subject" => FIELD_FUNCTION,
-        "unit" | "cgu" => FIELD_UNIT,
-        "awaits" => FIELD_AWAITS,
-        "owner" => FIELD_OWNER,
-        _ => 0,
-    }
+    span::generic_of(name).map_or(0, |at| 1 << at)
 }
 
 /// The callsites recorded, open-addressed by the address of their metadata: written under
@@ -248,7 +240,7 @@ impl Names {
 
 /// The number of `name` for as long as the process lives: a thread's name, which its ring's
 /// rows hold for the thread's life. Only for names of which there are few.
-fn intern_kept(name: &str) -> Sym {
+pub(crate) fn intern_kept(name: &str) -> Sym {
     let mut kept = lock(&KEPT);
     let kept = kept.get_or_insert_with(Generation::default);
     if let Some(&id) = kept.ids.get(name) {
@@ -468,6 +460,53 @@ struct Carried {
     depth: u32,
     build: u32,
     entered: [u64; OPEN_MAX],
+    /// The job's CPU clock and its reading as it parked ([`job_cpu`]); clock 0 for none.
+    cpu_clock: u64,
+    cpu_at: u64,
+    /// The job's span, closed as it parked, to open again as it resumes.
+    job: Option<JobSegment>,
+}
+
+/// A job's span as its job parked ([`job_began`]): its kind's site and columns, and where it
+/// was in the enter stack.
+#[derive(Clone, Copy)]
+struct JobSegment {
+    site: u16,
+    said: Said,
+    at: u32,
+}
+
+thread_local! {
+    /// The span of the job running on this thread, 0 for none: the span a park closes and a
+    /// resume opens again, so a parked job's span never covers the time other jobs ran.
+    static JOB: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Notes the span `id`, a job's ([`crate::span::Job`]), just opened and entered, as the job
+/// running on this thread: the span of the job it runs inside, for [`job_ended`].
+pub(crate) fn job_began(id: u64) -> u64 {
+    JOB.with(|it| it.replace(id))
+}
+
+/// The job running on this thread ended: the span to close, its last segment, and `outer`'s
+/// job runs on.
+pub(crate) fn job_ended(outer: u64) -> u64 {
+    JOB.with(|it| it.replace(outer))
+}
+
+/// Closes the span of the job parking on this thread, taking it out of the enter stack: what
+/// to open again as it resumes. `None` for a job with no span named on the stack.
+fn park_job(ring: &'static Ring) -> Option<JobSegment> {
+    let id = JOB.with(|it| it.replace(0));
+    if id == 0 || id == UNRECORDED {
+        return None;
+    }
+    let depth = (ring.depth.load(Ordering::Relaxed) as usize).min(OPEN_MAX);
+    let at = ring.entered[..depth].iter().rposition(|it| it.load(Ordering::Relaxed) == id)?;
+    let opened = by_number(ring_of(id))?.opened(id)?;
+    exited(id);
+    crate::closed(id);
+    Some(JobSegment { site: opened.site, said: opened.said(), at: at as u32 })
 }
 
 /// The carried state of each parked job, by the number [`take_open`] gave it, less one; and the
@@ -487,11 +526,17 @@ static PARKED: Mutex<Parked> = Mutex::new(Parked { jobs: Vec::new(), free: Vec::
 pub fn take_open() -> usize {
     let build = BUILD.with(|it| it.replace(0));
     let ring = MINE.with(Cell::get);
+    // Before the job's clock is taken: the segment's CPU is read on it.
+    let job = ring.and_then(park_job);
     let depth = ring.map_or(0, |it| it.depth.load(Ordering::Relaxed));
-    if depth == 0 && build == 0 {
+    let nothing = depth == 0 && build == 0 && job.is_none();
+    let (cpu_clock, cpu_at) = if nothing { (0, 0) } else { job_cpu().unwrap_or((0, 0)) };
+    // The next job on this thread counts on a clock of its own.
+    JOB_CPU.with(|it| it.set((0, 0)));
+    if nothing {
         return 0;
     }
-    let mut carried = Carried { depth, build, entered: [0; OPEN_MAX] };
+    let mut carried = Carried { depth, build, entered: [0; OPEN_MAX], cpu_clock, cpu_at, job };
     if let Some(ring) = ring {
         for (to, from) in carried.entered.iter_mut().zip(&ring.entered[..(depth as usize).min(OPEN_MAX)]) {
             *to = from.load(Ordering::Relaxed);
@@ -527,12 +572,31 @@ pub fn put_open(taken: usize) {
         carried
     };
     BUILD.with(|it| it.set(carried.build));
+    // The job's clock goes on from where it parked; unread, its open spans' CPU is not counted.
+    let now = (carried.cpu_clock != 0).then(|| THREAD_CPU.get().and_then(|read| read())).flatten();
+    let resumed = now.map_or((0, 0), |now| (carried.cpu_clock, now.wrapping_sub(carried.cpu_at)));
+    JOB_CPU.with(|it| it.set(resumed));
     if let Some(ring) = ring() {
-        let named = (carried.depth as usize).min(OPEN_MAX);
-        for (to, from) in ring.entered[..named].iter().zip(&carried.entered) {
+        let (mut entered, mut depth) = (carried.entered, carried.depth);
+        if let Some(job) = carried.job {
+            // The segment begins where the job's span was, under what it was under; the spans
+            // the job is inside of it keep the parent they began under.
+            let at = job.at as usize;
+            ring.depth.store(job.at, Ordering::Relaxed);
+            let parent = at.checked_sub(1).map_or(0, |below| entered[below]);
+            let id = began(job.site, Some(parent), &job.said);
+            if id != UNRECORDED {
+                entered.copy_within(at..OPEN_MAX - 1, at + 1);
+                entered[at] = id;
+                depth += 1;
+                JOB.with(|it| it.set(id));
+            }
+        }
+        let named = (depth as usize).min(OPEN_MAX);
+        for (to, from) in ring.entered[..named].iter().zip(&entered) {
             to.store(*from, Ordering::Relaxed);
         }
-        ring.depth.store(carried.depth, Ordering::Release);
+        ring.depth.store(depth, Ordering::Release);
     }
 }
 
@@ -683,17 +747,64 @@ fn frame_copied() -> FrameCopied {
     FRAME_COPIED.get().map_or_else(FrameCopied::default, |read| read())
 }
 
+/// The reader of the calling thread's CPU time in nanoseconds, given by the binary, once.
+static THREAD_CPU: OnceLock<fn() -> Option<u64>> = OnceLock::new();
+
+/// Has every span note the CPU time of its job while it was open, less that of the spans
+/// under it, read by `read` (the calling thread's CPU time, `None` when it can't be read).
+/// Without it `self_cpu_ns` is null. Each read is a system call (`clock_gettime` of
+/// `CLOCK_THREAD_CPUTIME_ID`), two a span. Once a process; a second call is refused.
+pub fn count_cpu(read: fn() -> Option<u64>) -> Result<(), fn() -> Option<u64>> {
+    THREAD_CPU.set(read)
+}
+
+thread_local! {
+    /// The CPU clock of the job running on this thread: its number (0 until one is needed)
+    /// and what to take from the thread's CPU time to read it.
+    static JOB_CPU: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
+
+/// Job CPU clocks given out, so no two jobs' share a number.
+static CPU_CLOCKS: AtomicU64 = AtomicU64::new(0);
+
+/// The running job's CPU clock and its reading now: the CPU time its threads gave it. A job
+/// that parks takes its clock with it ([`take_open`], [`put_open`]), so what a span counts is
+/// its own job's CPU, never that of a job that ran on the thread while it waited. A span
+/// closed under another clock than it began on (its handle sent to another job) is not counted.
+#[inline]
+fn job_cpu() -> Option<(u64, u64)> {
+    let read = THREAD_CPU.get()?;
+    let now = read()?;
+    JOB_CPU
+        .try_with(|it| {
+            let (mut clock, offset) = it.get();
+            if clock == 0 {
+                clock = CPU_CLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
+                it.set((clock, offset));
+            }
+            (clock, now.wrapping_sub(offset))
+        })
+        .ok()
+}
+
 /// The plot byte of the row that follows a span's row when the span's frames copied: the
 /// copies and bytes, and the span's id. A span closed on another thread than it began on has
 /// one with `UNCOUNTED` set: the two threads' counts don't subtract.
 const SPAN_COPIED_ROW: u64 = 0xfe;
-/// The plot byte of the row that follows a span's row when it said what it waits for: its
-/// `awaits` and `owner` (plus one), and the span's id.
-const SPAN_WAITS_ROW: u64 = 0xfc;
+/// The plot byte of the rows that follow a span's row when its CPU was counted or a span kind
+/// said its typed columns ([`span::TYPED_COLUMNS`]): up to [`COL_WORDS`] values a row, each
+/// plus one, at the words `COL_WORDS` names, and the span's id at word 3. Word 4's bytes 1..6
+/// say whose value each word holds: a typed column's index, [`CPU_COL`] for the span's self
+/// CPU, [`NO_COL`] for none.
+const SPAN_COLS_ROW: u64 = 0xfa;
+const COL_WORDS: [usize; 5] = [1, 2, 5, 6, 7];
+const CPU_COL: u64 = 0xfe;
+const NO_COL: u64 = 0xff;
+const _: () = assert!(TYPED < CPU_COL as usize, "a typed column's index is a byte of its own");
 const UNCOUNTED: u64 = 1;
 
 const _: () = {
-    let bytes = [FIBER_STACK_ROW, SPAN_COPIED_ROW, SWITCH_ROW, SPAN_WAITS_ROW, QUERY_COUNTS_ROW];
+    let bytes = [FIBER_STACK_ROW, SPAN_COPIED_ROW, SWITCH_ROW, QUERY_COUNTS_ROW, SPAN_COLS_ROW];
     let mut i = 0;
     while i < bytes.len() {
         assert!(bytes[i] as usize >= Plot::ALL.len(), "a row's plot byte is no plot's");
@@ -734,9 +845,13 @@ struct Slot {
     frame_bytes: AtomicU64,
     /// The ring's [`Ring::lease`] when the span began: which thread's counts it began with.
     lease: AtomicU64,
-    /// What it waits for (a `Sym`) and who runs that, plus one (0: not said).
-    awaits: AtomicU64,
-    owner: AtomicU64,
+    /// The words of its typed columns, as a span kind said them (0: not said).
+    typed: [AtomicU64; TYPED],
+    /// Its job's CPU clock when it began ([`job_cpu`]): the clock, and the reading plus one
+    /// (0: not counted); and the CPU of the spans under it that closed on that clock.
+    cpu_clock: AtomicU64,
+    cpu: AtomicU64,
+    cpu_under: AtomicU64,
 }
 
 impl Slot {
@@ -753,8 +868,10 @@ impl Slot {
         frame_copies: AtomicU64::new(0),
         frame_bytes: AtomicU64::new(0),
         lease: AtomicU64::new(0),
-        awaits: AtomicU64::new(0),
-        owner: AtomicU64::new(0),
+        typed: [const { AtomicU64::new(0) }; TYPED],
+        cpu_clock: AtomicU64::new(0),
+        cpu: AtomicU64::new(0),
+        cpu_under: AtomicU64::new(0),
     };
 }
 
@@ -771,8 +888,17 @@ struct Opened {
     alloc: Allocated,
     copied: FrameCopied,
     lease: u64,
-    awaits: Sym,
-    owner: u64,
+    typed: [u64; TYPED],
+    cpu_clock: u64,
+    cpu: u64,
+    cpu_under: u64,
+}
+
+impl Opened {
+    /// Its columns, as a span kind reads them.
+    fn said(&self) -> Said {
+        Said { krate: (self.of >> 32) as Sym, function: self.of as Sym, unit: self.unit as Sym, typed: self.typed }
+    }
 }
 
 pub(crate) struct Ring {
@@ -801,6 +927,9 @@ pub(crate) struct Ring {
     current: AtomicU64,
     /// [`WORDS`] words a row.
     words: Box<[AtomicU64]>,
+    /// What takes longest on this ring's threads: its sketches ([`crate::hot`]), written as
+    /// each span closes here.
+    hot: Box<[AtomicU64]>,
     owners: Mutex<Vec<Owner>>,
     /// What the sampler needs of the thread, under the lock the thread takes to leave.
     pub(crate) sampled: Mutex<crate::sampler::Thread>,
@@ -827,6 +956,7 @@ impl Ring {
             lease: AtomicU64::new(0),
             current: AtomicU64::new(0),
             words,
+            hot: crate::hot::record::cells(),
             // alloc: once per thread, as it first records
             owners: Mutex::new(Vec::new()),
             sampled: Mutex::new(crate::sampler::Thread::default()),
@@ -904,8 +1034,10 @@ impl Ring {
                 bytes: slot.frame_bytes.load(Ordering::Relaxed),
             },
             lease: slot.lease.load(Ordering::Relaxed),
-            awaits: slot.awaits.load(Ordering::Relaxed) as Sym,
-            owner: slot.owner.load(Ordering::Relaxed),
+            typed: std::array::from_fn(|it| slot.typed[it].load(Ordering::Relaxed)),
+            cpu_clock: slot.cpu_clock.load(Ordering::Relaxed),
+            cpu: slot.cpu.load(Ordering::Relaxed),
+            cpu_under: slot.cpu_under.load(Ordering::Relaxed),
         };
         fence(Ordering::Acquire);
         (slot.id.load(Ordering::Relaxed) == id).then_some(opened)
@@ -1048,40 +1180,21 @@ fn claim() -> Option<&'static Ring> {
 
 // --- What spans do ----------------------------------------------------------------------
 
-/// The schema's fields of a span, as it is made.
+/// The generic columns of an ad hoc span, from its fields, as it is made: those of
+/// [`Site::fields`].
 struct Fields {
     wanted: u8,
-    krate: Sym,
-    function: Sym,
-    unit: Sym,
-    awaits: Sym,
-    /// Plus one, so 0 is "not said".
-    owner: u64,
+    said: Said,
 }
 
 impl Fields {
+    /// `field` is one bit of [`Site::fields`].
     fn set(&mut self, field: u8, value: &str) {
-        let sym = intern(value);
-        match field {
-            FIELD_CRATE => self.krate = sym,
-            FIELD_FUNCTION => self.function = sym,
-            FIELD_UNIT => self.unit = sym,
-            FIELD_AWAITS => self.awaits = sym,
-            _ => {}
-        }
+        self.said.set(field.trailing_zeros() as usize, u64::from(intern(value)));
     }
 }
 
 impl tracing::field::Visit for Fields {
-    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        let field = field_of(field.name()) & self.wanted;
-        if field == FIELD_OWNER {
-            self.owner = value.saturating_add(1);
-        } else if field != 0 {
-            self.record_debug_of(field, &value);
-        }
-    }
-
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         let field = field_of(field.name()) & self.wanted;
         if field != 0 {
@@ -1091,17 +1204,7 @@ impl tracing::field::Visit for Fields {
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let field = field_of(field.name()) & self.wanted;
-        if field != 0 {
-            self.record_debug_of(field, value);
-        }
-    }
-}
-
-impl Fields {
-    /// A field's value written with `Debug`: a number given as a text field, or any value
-    /// `record_debug` takes. An owner is only ever a number.
-    fn record_debug_of(&mut self, field: u8, value: &dyn std::fmt::Debug) {
-        if field == FIELD_OWNER {
+        if field == 0 {
             return;
         }
         _ = TEXT.try_with(|text| {
@@ -1113,9 +1216,32 @@ impl Fields {
     }
 }
 
-/// Makes the span `span` of `site` beginning now on this thread: its id, or [`UNRECORDED`].
+/// Makes the ad hoc span `span` of `site` beginning now on this thread: its id, or
+/// [`UNRECORDED`]. Its fields fill the generic columns its site names.
 #[inline]
 pub(crate) fn opened(span: &tracing::span::Attributes<'_>, site: u16) -> u64 {
+    let wanted = SITES[usize::from(site) - 1].get().map_or(0, |it| it.fields);
+    let mut fields = Fields { wanted, said: Said::EMPTY };
+    if wanted != 0 {
+        span.record(&mut fields);
+    }
+    let parent = if span.is_root() { Some(0) } else { span.parent().map(tracing::span::Id::into_u64) };
+    began(site, parent, &fields.said)
+}
+
+/// Makes a span of a kind ([`crate::span`]) of `site` beginning now on this thread, its columns
+/// `said`, and enters it: its id, or [`UNRECORDED`].
+#[inline]
+pub(crate) fn open_said(site: u16, said: &Said) -> u64 {
+    let id = began(site, None, said);
+    entered(id);
+    id
+}
+
+/// Makes a span of `site` beginning now on this thread, its columns `said`, under `parent`
+/// (`Some(0)`: a root), or under the innermost span the thread is inside when `None`.
+#[inline]
+fn began(site: u16, parent: Option<u64>, said: &Said) -> u64 {
     let Some(ring) = ring() else {
         RINGLESS.fetch_add(1, Ordering::Relaxed);
         return UNRECORDED;
@@ -1125,21 +1251,13 @@ pub(crate) fn opened(span: &tracing::span::Attributes<'_>, site: u16) -> u64 {
         ring.lost.store(ring.lost.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
         return UNRECORDED;
     };
-    let parent = if span.is_root() {
-        0
-    } else if let Some(parent) = span.parent() {
-        parent.into_u64()
-    } else {
+    let parent = parent.unwrap_or_else(|| {
         depth
             .checked_sub(1)
             .and_then(|top| ring.entered.get(top as usize))
             .map_or(0, |it| it.load(Ordering::Relaxed))
-    };
-    let wanted = SITES[usize::from(site) - 1].get().map_or(0, |it| it.fields);
-    let mut fields = Fields { wanted, krate: 0, function: 0, unit: 0, awaits: 0, owner: 0 };
-    if wanted != 0 {
-        span.record(&mut fields);
-    }
+    });
+    let (cpu_clock, cpu) = job_cpu().map_or((0, 0), |(clock, at)| (clock, at.saturating_add(1)));
     let made = ring.made.load(Ordering::Relaxed) + 1;
     ring.made.store(made, Ordering::Relaxed);
     let id = u64::from(ring.number) << (SLOT_BITS + SEQ_BITS) | (at as u64) << SEQ_BITS | made & SEQ_MASK;
@@ -1150,10 +1268,10 @@ pub(crate) fn opened(span: &tracing::span::Attributes<'_>, site: u16) -> u64 {
     slot.start.store(clock::ticks(), Ordering::Relaxed);
     slot.parent.store(parent, Ordering::Relaxed);
     slot.what.store(u64::from(build) << 32 | u64::from(depth.min(0xffff)) << 16 | u64::from(site), Ordering::Relaxed);
-    slot.of.store(u64::from(fields.krate) << 32 | u64::from(fields.function), Ordering::Relaxed);
-    slot.unit.store(u64::from(fields.unit), Ordering::Relaxed);
-    slot.awaits.store(u64::from(fields.awaits), Ordering::Relaxed);
-    slot.owner.store(fields.owner, Ordering::Relaxed);
+    store_said(slot, said);
+    slot.cpu_clock.store(cpu_clock, Ordering::Relaxed);
+    slot.cpu.store(cpu, Ordering::Relaxed);
+    slot.cpu_under.store(0, Ordering::Relaxed);
     slot.alloc_bytes.store(alloc.bytes, Ordering::Relaxed);
     slot.allocs.store(alloc.count, Ordering::Relaxed);
     slot.frame_copies.store(copied.copies, Ordering::Relaxed);
@@ -1162,6 +1280,15 @@ pub(crate) fn opened(span: &tracing::span::Attributes<'_>, site: u16) -> u64 {
     slot.refs.store(1, Ordering::Relaxed);
     slot.id.store(id, Ordering::Release);
     id
+}
+
+#[inline]
+fn store_said(slot: &Slot, said: &Said) {
+    slot.of.store(u64::from(said.krate) << 32 | u64::from(said.function), Ordering::Relaxed);
+    slot.unit.store(u64::from(said.unit), Ordering::Relaxed);
+    for (word, value) in slot.typed.iter().zip(said.typed) {
+        word.store(value, Ordering::Relaxed);
+    }
 }
 
 /// Another handle of the open span `id` was made.
@@ -1177,8 +1304,9 @@ pub(crate) fn cloned(id: u64) {
     }
 }
 
-/// The span `id`, still open, was given values after it was made: those of the schema's
-/// fields replace the ones it began with. A value given after the span closed is not kept.
+/// The ad hoc span `id`, still open, was given values after it was made: those of its
+/// generic columns replace the ones it began with. A value given after the span closed is not
+/// kept.
 pub(crate) fn recorded(id: u64, values: &tracing::span::Record<'_>) {
     if id == UNRECORDED {
         return;
@@ -1189,20 +1317,22 @@ pub(crate) fn recorded(id: u64, values: &tracing::span::Record<'_>) {
     if wanted == 0 {
         return;
     }
-    let mut fields = Fields {
-        wanted,
-        krate: (opened.of >> 32) as Sym,
-        function: opened.of as Sym,
-        unit: opened.unit as Sym,
-        awaits: opened.awaits,
-        owner: opened.owner,
-    };
+    let mut fields = Fields { wanted, said: opened.said() };
     values.record(&mut fields);
-    let slot = &ring.open[slot_of(id)];
-    slot.of.store(u64::from(fields.krate) << 32 | u64::from(fields.function), Ordering::Relaxed);
-    slot.unit.store(u64::from(fields.unit), Ordering::Relaxed);
-    slot.awaits.store(u64::from(fields.awaits), Ordering::Relaxed);
-    slot.owner.store(fields.owner, Ordering::Relaxed);
+    store_said(&ring.open[slot_of(id)], &fields.said);
+}
+
+/// The span `id` of a kind, still open, says more as it ends ([`span::Ending::ended`]):
+/// `say` changes its columns.
+pub(crate) fn said_after(id: u64, say: impl FnOnce(&mut Said)) {
+    if id == UNRECORDED {
+        return;
+    }
+    let Some(ring) = by_number(ring_of(id)) else { return };
+    let Some(opened) = ring.opened(id) else { return };
+    let mut said = opened.said();
+    say(&mut said);
+    store_said(&ring.open[slot_of(id)], &said);
 }
 
 /// The build of the open span `id`, 0 for none or a span closed already: atomics only, so the
@@ -1287,9 +1417,10 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
     let build_unit = u64::from(opened.build) << 32 | opened.unit;
     let ring = ring()?;
     ring.put([now, opened.start, id, opened.parent, what, opened.of, build_unit, bytes]);
-    if opened.awaits != 0 || opened.owner != 0 {
-        ring.put([now, u64::from(opened.awaits), opened.owner, id, KIND_PLOT << 62 | SPAN_WAITS_ROW, 0, 0, 0]);
-    }
+    let key = crate::hot::record::key(opened.site, opened.of as u32);
+    let waits_on = opened.typed[<span::col::WaitsOn as span::Column>::AT - span::GENERIC];
+    crate::hot::record::closed(&ring.hot, key, now.wrapping_sub(opened.start), waits_on);
+    put_cols(ring, now, id, self_cpu(&opened), &opened.typed);
     if FRAME_COPIED.get().is_some() {
         let copied = frame_copied();
         let row = if ring.number != made_by.number || ring.lease.load(Ordering::Relaxed) != opened.lease {
@@ -1307,6 +1438,51 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
     Some(now.wrapping_sub(opened.start))
 }
 
+/// Writes the [`SPAN_COLS_ROW`]s of the span `id`, closing now: its self CPU (`cpu`, plus one;
+/// 0: not counted) and each typed column said, [`COL_WORDS`] a row.
+#[inline]
+fn put_cols(ring: &Ring, now: u64, id: u64, cpu: u64, typed: &[u64; TYPED]) {
+    let said = (cpu != 0).then_some((CPU_COL, cpu));
+    let mut values = said.into_iter().chain((0..TYPED).filter(|&it| typed[it] != 0).map(|it| (it as u64, typed[it])));
+    loop {
+        let mut row = [now, 0, 0, id, 0, 0, 0, 0];
+        let mut whose = 0;
+        let mut any = false;
+        for (place, &word) in COL_WORDS.iter().enumerate() {
+            let (col, value) = match values.next() {
+                Some(it) => {
+                    any = true;
+                    it
+                }
+                None => (NO_COL, 0),
+            };
+            row[word] = value;
+            whose |= col << (8 * (place + 1));
+        }
+        if !any {
+            return;
+        }
+        row[4] = KIND_PLOT << 62 | whose | SPAN_COLS_ROW;
+        ring.put(row);
+    }
+}
+
+/// The CPU of the span `opened`, closing now, less that of the spans under it, plus one (0:
+/// not counted): counted only when its job's clock is the one it began on. What it took in
+/// all is added to its parent's spans-under when the parent counts on the same clock.
+fn self_cpu(opened: &Opened) -> u64 {
+    let Some(began) = opened.cpu.checked_sub(1) else { return 0 };
+    let Some((clock, now)) = job_cpu().filter(|(clock, _)| *clock == opened.cpu_clock) else { return 0 };
+    let whole = now.saturating_sub(began);
+    if let Some(parent) = by_number(ring_of(opened.parent)).filter(|_| opened.parent != 0) {
+        let slot = &parent.open[slot_of(opened.parent)];
+        if slot.id.load(Ordering::Acquire) == opened.parent && slot.cpu_clock.load(Ordering::Relaxed) == clock {
+            slot.cpu_under.fetch_add(whole, Ordering::Relaxed);
+        }
+    }
+    whole.saturating_sub(opened.cpu_under).saturating_add(1)
+}
+
 /// Notes that work moved on this thread with no span closing: what a long piece of work
 /// with no span of its own (a query's run) says to the stall watchdog. One store.
 #[inline]
@@ -1321,6 +1497,15 @@ pub fn moved() {
 pub(crate) fn rings(into: &mut Vec<&'static Ring>) {
     into.clear();
     into.extend(lock(&RINGS).iter().copied());
+}
+
+/// Each ring's number and its sketches' counters ([`crate::hot`]), read as they are now.
+pub(crate) fn each_hot(mut each: impl FnMut(u16, &[AtomicU64])) {
+    // alloc: a read of the sketches, once a read
+    let rings: Vec<&'static Ring> = lock(&RINGS).clone();
+    for ring in rings {
+        each(ring.number, &ring.hot);
+    }
 }
 
 /// Spans closed in this process so far, on every thread: it grows while any work moves.
@@ -1351,9 +1536,24 @@ pub struct SpanRow {
     pub krate: Sym,
     pub function: Sym,
     pub unit: Sym,
-    /// What a wait waits for (its `awaits` field), and who runs that (its `owner`).
-    pub awaits: Sym,
-    pub owner: Option<u64>,
+    /// Its job's CPU in nanoseconds less that of the spans under it: `None` when not counted
+    /// ([`count_cpu`]) or closed under another job's clock.
+    pub self_cpu_ns: Option<u64>,
+    /// The words of its typed columns, as its span kind said them (0: not said): read with
+    /// [`SpanRow::get`] or as its kind ([`span::read`]).
+    pub typed: [u64; TYPED],
+}
+
+impl SpanRow {
+    /// Its columns, as a span kind reads them.
+    pub fn said(&self) -> Said {
+        Said { krate: self.krate, function: self.function, unit: self.unit, typed: self.typed }
+    }
+
+    /// Its column `C`: `None` when not said.
+    pub fn get<C: span::Column>(&self) -> Option<C::Value> {
+        self.said().value::<C>()
+    }
 }
 
 /// A row of the schema's `counters` table.
@@ -1498,8 +1698,8 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                         krate: (row[5] >> 32) as u32,
                         function: row[5] as u32,
                         unit: row[6] as u32,
-                        awaits: 0,
-                        owner: None,
+                        self_cpu_ns: None,
+                        typed: [0; TYPED],
                     });
                 }
                 KIND_PLOT if row[4] & 0xff == SWITCH_ROW => {
@@ -1525,13 +1725,21 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                         span.copied = (row[5] & UNCOUNTED == 0).then_some(FrameCopied { copies: row[1], bytes: row[2] });
                     }
                 }
-                KIND_PLOT if row[4] & 0xff == SPAN_WAITS_ROW => {
-                    // As a copied row: right after its span's, or after that one's copied row.
+                KIND_PLOT if row[4] & 0xff == SPAN_COLS_ROW => {
+                    // As a copied row: right after its span's, or after that one's other rows.
                     if let Some(span) = into.spans.last_mut()
                         && span.span_id == row[3]
                     {
-                        span.awaits = row[1] as Sym;
-                        span.owner = row[2].checked_sub(1);
+                        for (place, &word) in COL_WORDS.iter().enumerate() {
+                            match row[4] >> (8 * (place + 1)) & 0xff {
+                                CPU_COL => span.self_cpu_ns = row[word].checked_sub(1),
+                                col => {
+                                    if let Some(typed) = usize::try_from(col).ok().and_then(|it| span.typed.get_mut(it)) {
+                                        *typed = row[word];
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 KIND_PLOT if row[4] & 0xff == FIBER_STACK_ROW => {
@@ -1577,6 +1785,34 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
 }
 
 // --- Threads now ------------------------------------------------------------------------
+
+/// Writes into `out` what this thread is working on: the innermost span it is inside that
+/// names a `function`, `unit` or `crate` (the first it has), as `<span name> <that>`, else the
+/// innermost span's name. False, writing nothing, when it is inside no span. A scope's caller
+/// waits in the span it opened the scope in, so before its wait this names the scope's creator.
+pub(crate) fn write_working_on(out: &mut String) -> bool {
+    let Some(ring) = ring() else { return false };
+    let depth = (ring.depth.load(Ordering::Relaxed) as usize).min(OPEN_MAX);
+    let mut innermost = None;
+    for entered in ring.entered[..depth].iter().rev() {
+        let id = entered.load(Ordering::Relaxed);
+        let Some(opened) = by_number(ring_of(id)).and_then(|it| it.opened(id)) else { continue };
+        let Some(meta) = meta(opened.site) else { continue };
+        let of = [opened.of as Sym, opened.unit as Sym, (opened.of >> 32) as Sym].into_iter().find(|it| *it != 0);
+        match of.and_then(name) {
+            Some(of) => {
+                // Writing to a `String` does not fail.
+                _ = write!(out, "{} {of}", meta.name());
+                return true;
+            }
+            None if innermost.is_none() => innermost = Some(meta.name()),
+            None => {}
+        }
+    }
+    let Some(innermost) = innermost else { return false };
+    out.push_str(innermost);
+    true
+}
 
 /// A span a thread is inside now, what it is of, and for how long it has been.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -1632,8 +1868,8 @@ pub fn threads_now() -> Vec<ThreadNow> {
                     krate: self::name((opened.of >> 32) as Sym),
                     function: self::name(opened.of as Sym),
                     unit: self::name(opened.unit as Sym),
-                    awaits: self::name(opened.awaits),
-                    owner: (opened.owner != 0).then_some(opened.owner),
+                    awaits: opened.said().value::<span::col::Awaits>().and_then(span::Name::text),
+                    owner: opened.said().value::<span::col::Owner>(),
                 })
             })
             // alloc: a dump, on demand
@@ -1965,9 +2201,11 @@ mod tests {
         let [asking] = named_on(asker, "flight asking")[..] else { panic!("the asking span is a row") };
         assert_eq!(asking.span_id, asking_id);
         assert_eq!(self::name(wait.function).as_deref(), Some("slow_query(of_square)"));
-        assert_eq!(self::name(wait.awaits).as_deref(), Some("slow_query(of_square)"), "a wait says what it awaits");
-        assert!(wait.owner.is_some(), "a wait for a run says whose run it is");
-        assert_eq!(asking.awaits, 0, "a span that waits on nothing awaits nothing");
+        let typed = span::read::<span::Wait>(wait).unwrap().expect("the wait is a `wait`").fields;
+        assert_eq!(typed.awaits.text().as_deref(), Some("slow_query(of_square)"), "a wait says what it awaits");
+        assert_eq!(typed.on, blaze_graph::wait::WaitKind::Key);
+        assert!(typed.owner.is_some(), "a wait for a run says whose run it is");
+        assert_eq!(asking.get::<span::col::Awaits>(), None, "a span that waits on nothing awaits nothing");
         assert_eq!((wait.parent, wait.depth), (asking_id, 1));
         assert!(wait.dur_ns >= 100_000_000, "the wait lasted while the run slept: {} ns", wait.dur_ns);
         let asking_self = asking.dur_ns - wait.dur_ns;
@@ -2011,8 +2249,8 @@ mod tests {
         let [hold] = named_on(holder, "hold")[..] else { panic!("the holder's hold is one span") };
         let [wait] = named_on(waiter, "wait")[..] else { panic!("the waiter waited once") };
         assert_eq!(self::name(hold.function).as_deref(), Some("codegen round 3 of app"));
-        assert!(hold.owner.is_some(), "a hold names its holder");
-        assert_eq!(wait.owner, hold.owner, "the wait names the hold's holder as whose it waits on");
+        let holder_of = span::read::<span::Hold>(hold).unwrap().expect("the hold is a `hold`").fields.holder;
+        assert_eq!(wait.get::<span::col::Owner>(), Some(holder_of), "the wait names the hold's holder as whose it waits on");
         assert!(hold.dur_ns >= 150_000_000, "the hold lasted until it ended: {} ns", hold.dur_ns);
         assert!(hold.start_ns <= wait.start_ns && wait.start_ns + wait.dur_ns <= hold.start_ns + hold.dur_ns + 50_000_000);
     }
@@ -2217,6 +2455,81 @@ mod tests {
         );
     }
 
+    /// Every stretch a pool's worker runs a job (from the job's start or resume to its next
+    /// switch) is inside a `job` span of that job's kind on that worker: a job that parks on a
+    /// key closes its span as it parks and opens another where it resumes.
+    #[test]
+    fn a_pool_job_is_inside_its_job_span_on_every_worker_it_runs_on() {
+        use blaze_graph::{Key, pool::Pool, pump::Flights, topology::Topology};
+
+        crate::install();
+        let pool = Pool::new(&Topology::flat(2), false).expect("the pool starts");
+        let flights: &'static Flights<u32> = Box::leak(Box::new(Flights::new()));
+        let key = Key([0x7c; 32]);
+        let named = |it: &mut String| it.push_str("job span test key");
+        let since = clock::mono_ns();
+        let (started, has_started) = crossbeam_channel::unbounded();
+        let (first, first_done) = crossbeam_channel::unbounded();
+        let (second, second_done) = crossbeam_channel::unbounded();
+        pool.submit(
+            None,
+            move || {
+                let on = tid();
+                let got = flights.get_or_run_named(key, named, || {
+                    started.send(()).unwrap();
+                    blaze_graph::spin::busy(Duration::from_millis(200));
+                    Ok(5)
+                });
+                (got, on)
+            },
+            move |got| first.send(got.unwrap()).unwrap(),
+        );
+        has_started.recv().unwrap();
+        pool.submit(
+            None,
+            move || {
+                let before = tid();
+                let got = flights.get_or_run_named(key, named, || Ok(0));
+                (got, before, tid())
+            },
+            move |got| second.send(got.unwrap()).unwrap(),
+        );
+        let (got, ran_on) = first_done.recv().unwrap();
+        let (asked, asked_on, resumed_on) = second_done.recv().unwrap();
+        assert_eq!((got, asked), (Ok(5), Ok(5)), "the second job waited for the first's run");
+        drop(pool);
+
+        let workers = [ran_on, asked_on, resumed_on];
+        let mut read = Read::default();
+        window(Duration::from_secs(60), &mut read);
+        let jobs: Vec<&SpanRow> = read
+            .spans
+            .iter()
+            .filter(|it| workers.contains(&it.thread) && it.start_ns >= since)
+            .filter(|it| span::read::<span::Job>(it).ok().flatten().is_some())
+            .collect();
+        assert!(jobs.iter().all(|it| it.depth == 0 && it.parent == 0), "a job's span is a root: {jobs:?}");
+        assert!(jobs.len() >= 3, "the first job's, and the second's before its park and after its resume: {jobs:?}");
+        let mut switches: Vec<&SwitchRow> =
+            read.switches.iter().filter(|it| workers.contains(&it.thread) && it.t_ns >= since).collect();
+        switches.sort_by_key(|it| (it.thread, it.t_ns));
+        let parked = switches.iter().any(|it| it.event == Switched::Parked && matches!(it.waited, Some((WaitedOn::Key, _))));
+        assert!(parked, "the second job parked on the key: {switches:?}");
+        for pair in switches.windows(2) {
+            let [from, to] = [pair[0], pair[1]];
+            if from.thread != to.thread || !matches!(from.event, Switched::Started | Switched::Resumed) {
+                continue;
+            }
+            let covers = |it: &&SpanRow| it.thread == from.thread && it.start_ns < to.t_ns && it.start_ns + it.dur_ns > from.t_ns;
+            assert!(jobs.iter().any(covers), "the run from {from:?} to {to:?} is inside a job span: {jobs:?}");
+            let crossing = |it: &&SpanRow| it.thread == from.thread && it.start_ns < from.t_ns && it.start_ns + it.dur_ns > to.t_ns;
+            assert!(
+                !(from.event == Switched::Resumed && jobs.iter().any(crossing)),
+                "no job span stays open across a park: {jobs:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_fiber_stack_row_reads_as_four_counters_of_its_fiber_and_job() {
         crate::install();
@@ -2287,5 +2600,69 @@ mod tests {
             it.plot,
             Plot::QueryExecuted | Plot::QueryVerified | Plot::QueryReran
         )));
+    }
+
+    thread_local! {
+        static TEST_CPU: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn test_cpu() -> Option<u64> {
+        Some(TEST_CPU.with(Cell::get))
+    }
+
+    fn spend(ns: u64) {
+        TEST_CPU.with(|it| it.set(it.get() + ns));
+    }
+
+    fn row_named<'a>(read: &'a Read, name: &str) -> &'a SpanRow {
+        read.spans
+            .iter()
+            .find(|it| meta(it.site).map(|it| it.name()) == Some(name))
+            .unwrap_or_else(|| panic!("`{name}` is a row"))
+    }
+
+    #[test]
+    fn a_spans_self_cpu_is_its_jobs_alone_less_the_spans_under_it_and_what_ran_while_it_parked() {
+        crate::install();
+        // The one test that counts CPU: a process takes one reader.
+        count_cpu(test_cpu).expect("no other test gives a CPU reader");
+        let (parked, taken) = std::thread::spawn(|| {
+            {
+                let _outer = tracing::info_span!(target: "blaze", "cpu outer").entered();
+                spend(10);
+                let _inner = tracing::info_span!(target: "blaze", "cpu inner").entered();
+                spend(20);
+            }
+            let _build = building(3);
+            let parked = tracing::info_span!(target: "blaze", "cpu parked");
+            spend(5);
+            let taken = take_open();
+            // Another job runs on the thread while the first is parked.
+            {
+                let _other = tracing::info_span!(target: "blaze", "cpu other job").entered();
+                spend(100);
+            }
+            (parked, taken)
+        })
+        .join()
+        .unwrap();
+        std::thread::spawn(move || {
+            spend(1_000);
+            put_open(taken);
+            spend(3);
+            drop(parked);
+        })
+        .join()
+        .unwrap();
+        let mut read = Read::default();
+        window(Duration::from_secs(60), &mut read);
+        assert_eq!(row_named(&read, "cpu inner").self_cpu_ns, Some(20));
+        assert_eq!(row_named(&read, "cpu outer").self_cpu_ns, Some(10), "less the 20 of the span under it");
+        assert_eq!(row_named(&read, "cpu other job").self_cpu_ns, Some(100));
+        assert_eq!(
+            row_named(&read, "cpu parked").self_cpu_ns,
+            Some(8),
+            "5 before it parked and 3 after it resumed on another thread, never the other job's 100"
+        );
     }
 }

@@ -108,6 +108,20 @@ pub(crate) fn parsed<'f, 'db>(
     lowered
 }
 
+/// The errors expansion gives of the attributes that invoke attribute macros, `invoking`
+/// ([`attrs::invoking_attrs`](crate::lints::syntax::attrs::invoking_attrs)): read once each,
+/// as the macro is called.
+pub(crate) fn invoked<'db>(cx: &Cx<'_, 'db>, invoking: &[Owner<'db>], found: &mut Vec<Found>) {
+    // alloc: setup, one buffer reused for every attribute macro call, once per check
+    let mut errors = Vec::new();
+    for owner in invoking {
+        for attr in &owner.attrs {
+            parsers::misc::validate(cx, attr, &mut errors);
+        }
+        push(cx, owner, Phase::Expand, &mut errors, found);
+    }
+}
+
 /// The errors `check_mod_attrs` gives of `owners`' attributes, parsed by [`parsed`] to
 /// `lowered`, then those of the stability pass, which reads what each definition inherits
 /// from its parents.

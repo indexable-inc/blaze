@@ -263,6 +263,51 @@ fn partial_eq_writes_structural_partial_eq_first() {
     }
 }
 
+/// rustc's `PartialEq`, `PartialOrd` and `Ord` derives: the discriminants are compared only
+/// for an enum of several variants (`discriminant_value` needs `Self: Sized`, which a struct
+/// like `struct AbsPath(Utf8Path)` is not), and the match of `self` and `other` has a fallback
+/// arm only where its arms leave pairs out (none for one variant: rustc's unreachable pattern).
+#[test]
+fn discriminants_and_a_fallback_arm_only_for_an_enum_of_several_variants() {
+    type Derive = for<'f> fn(
+        &'f Frame,
+        Span,
+        Result<super::BasicAdtInfo, crate::ExpandError>,
+    ) -> ExpandResult<tt::TopSubtree<&'f Frame>>;
+    let derives: [(&str, Derive); 3] = [
+        ("PartialEq", super::partial_eq_derive),
+        ("PartialOrd", super::partial_ord_derive),
+        ("Ord", super::ord_derive),
+    ];
+    let span = call_site();
+    // (item, compares discriminants, has a fallback arm)
+    for (text, discriminants, fallback) in [
+        ("struct Wrap(u8);", false, false),
+        ("struct Record { a: u8, b: u16 }", false, false),
+        ("struct Unit;", false, false),
+        ("enum One { A(u8) }", false, false),
+        ("enum OneFieldless { A }", false, false),
+        ("enum Many { A(u8), B }", true, true),
+        ("enum Never {}", false, true),
+    ] {
+        let (_, map) = item(text);
+        let parse = parsed(text);
+        for (name, derive) in derives {
+            let info = super::parse_adt_from_syntax(adt_view(&parse), &map, span);
+            let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+            let ExpandResult { value, err } = derive(frame, span, info);
+            assert!(err.is_none(), "{name} of `{text}`: {err:?}");
+            let written = value.to_string();
+            assert_eq!(
+                written.contains("discriminant_value"),
+                discriminants,
+                "{name} of `{text}`: {written}"
+            );
+            assert_eq!(written.contains("_unused"), fallback, "{name} of `{text}`: {written}");
+        }
+    }
+}
+
 /// rustc's `From` derive as the old code wrote it, for a struct with one field. Another item is
 /// refused, as the new code refuses it.
 fn reference_from(

@@ -62,6 +62,13 @@ pub(super) const GROUPS: &[(&str, &[&str])] = &[
 /// `register_group_alias`: the alias and the group, a silent one.
 pub(super) const ALIASES: &[(&str, &str)] = &[("bad_style", "nonstandard_style")];
 
+/// The groups of blaze's own lints, after rustc's: `blaze::hot`, the lints of hot code
+/// (blaze-lints' `blaze::HOT`, which its tests hold to this).
+pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[(
+    "blaze::hot",
+    &["blaze::hot_clone", "blaze::hot_alloc", "blaze::hot_alloc_call", "blaze::hot_dyn", "blaze::std_hashmap"],
+)];
+
 /// `register_renamed`: the old name and the new.
 pub(super) const RENAMED: &[(&str, &str)] = &[
     ("single_use_lifetime", "single_use_lifetimes"),

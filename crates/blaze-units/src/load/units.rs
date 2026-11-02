@@ -48,7 +48,7 @@ pub(crate) struct Built {
     pub finished: String,
     /// A foreign workspace's roots by name, with their units' indexes.
     pub roots: Vec<(String, usize)>,
-    /// The workspace's `build-script-link-dirs`, absolute.
+    /// The workspace's `build-script-link-dirs`, absolute or `${NAME}/rest` for a run to expand.
     pub link_dirs: Vec<String>,
     /// The workspace's `sandboxed-tests` experiment ([`crate::query::Units::sandboxed_tests`]).
     pub sandboxed_tests: bool,
@@ -280,6 +280,7 @@ pub(crate) fn units(
         roots: &graph.roots,
         config,
         intent: spec.intent,
+        lints: spec.lints,
         build_std: spec.build_std.is_some(),
         ws_root: ws.root(),
         ws_manifest: ws.root_manifest(),

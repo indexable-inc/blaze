@@ -142,6 +142,8 @@ struct World<'d> {
     heard: Vec<Receiver<Heard>>,
     /// What each actor was last told.
     told: Cell<[Option<Do>; ACTORS]>,
+    /// Each actor's last ask, which a holder told to let go may still be parked in.
+    asked: Cell<[Option<Do>; ACTORS]>,
 }
 
 /// Says on `left` that an actor's thread ended, however it ended.
@@ -194,18 +196,30 @@ impl<'d> World<'d> {
             to_all.push(to);
             heard.push(said);
         }
-        World { name, design, to: to_all, heard, told: Cell::new([None; ACTORS]) }
+        World { name, design, to: to_all, heard, told: Cell::new([None; ACTORS]), asked: Cell::new([None; ACTORS]) }
     }
 
     fn tell(&self, actor: usize, todo: Do) {
         let mut told = self.told.get();
         told[actor] = Some(todo);
         self.told.set(told);
+        if let Do::Ask(..) = todo {
+            let mut asked = self.asked.get();
+            asked[actor] = Some(todo);
+            self.asked.set(asked);
+        }
         self.to[actor].send(todo).unwrap();
     }
 
     fn hear(&self, actor: usize) -> Heard {
-        self.heard[actor].recv_timeout(LONG).unwrap_or_else(|_| panic!("actor {actor} said nothing"))
+        self.heard[actor].recv_timeout(LONG).unwrap_or_else(|_| {
+            hung(format!(
+                "{} actor {actor} said nothing in {LONG:?}; last told {:?}, its last ask {:?}",
+                self.name,
+                self.told.get()[actor],
+                self.asked.get()[actor]
+            ))
+        })
     }
 
     /// Waits until `count` waiters are linked to `at`'s run, or `actor` said something.
@@ -218,7 +232,9 @@ impl<'d> World<'d> {
             if self.design.waiters(key(at)) == count {
                 return None;
             }
-            assert!(Instant::now() < until, "actor {actor}'s ask neither linked nor ended");
+            if Instant::now() >= until {
+                hung(format!("{} actor {actor}'s ask of key {at} neither linked nor ended in {LONG:?}", self.name));
+            }
             std::thread::yield_now();
         }
     }
@@ -260,9 +276,11 @@ fn the_table_answers_as_the_sharded_design_did(tc: TestCase) {
     let table = Flights::<u32>::new();
     let sharded = Sharded::<u32>::new();
     let (left, gone) = unbounded();
+    let watch = Watch::start();
     std::thread::scope(|scope| {
         let worlds = [World::new(scope, "table", &table, &left), World::new(scope, "sharded", &sharded, &left)];
-        let checked = std::panic::catch_unwind(AssertUnwindSafe(|| check(&tc, &worlds)));
+        let checked = std::panic::catch_unwind(AssertUnwindSafe(|| check(&tc, &worlds, &watch)));
+        watch.at(format_args!("joining the actors after the case ({})", if checked.is_ok() { "passed" } else { "failed" }));
         let Err(failed) = checked else { return };
         let told = worlds.each_ref().map(|world| (world.name, world.told.get()));
         drop(worlds);
@@ -297,9 +315,97 @@ fn the_table_answers_as_the_sharded_design_did(tc: TestCase) {
         }
         std::panic::resume_unwind(failed);
     });
+    watch.end();
 }
 
-fn check(tc: &TestCase, worlds: &[World<'_>; 2]) {
+/// Longer than any case's own bounds add up to (a hear's [`LONG`], then the drain's [`LONG`]
+/// before it aborts): a case still running past it is blocked where no bound reaches.
+const CASE: Duration = Duration::from_secs(90);
+
+/// The whole run's bound once a case hung: hegel replays a hung case while it shrinks, each
+/// replay a [`LONG`] of its own, so no one case passes [`CASE`]. Under hegel's own 300 s shrink
+/// budget, and far over a passing run's second.
+const RUN: Duration = Duration::from_secs(200);
+
+/// Where the running case is, as [`Watch::at`] last named it.
+static PLACE: parking_lot::Mutex<String> = parking_lot::const_mutex(String::new());
+
+/// The first wait of the run that timed out ([`hung`]).
+static HUNG: parking_lot::Mutex<Option<String>> = parking_lot::const_mutex(None);
+
+/// A bounded wait of the case timed out: said on stderr at once (hegel keeps a case's panic
+/// until it ends shrinking) and kept as the run's first hang, then the case fails with it.
+fn hung(why: String) -> ! {
+    let mut first = HUNG.lock();
+    if first.is_none() {
+        _ = writeln!(std::io::stderr(), "the oracle hung: {why}");
+        *first = Some(why.clone());
+    }
+    drop(first);
+    panic!("{why}")
+}
+
+/// Says `why` on stderr itself (an abort ends nothing the harness keeps), with a sample of the
+/// process where `sample` exists, and aborts.
+fn sample_and_abort(why: &str) -> ! {
+    let pid = std::process::id();
+    let sampled = std::env::temp_dir().join(format!("blaze-oracle-hang-{pid}.txt"));
+    let took = std::process::Command::new("/usr/bin/sample")
+        .args([pid.to_string().as_str(), "3", "-file"])
+        .arg(&sampled)
+        .status()
+        .map_or_else(|why| format!("no sample ({why})"), |_| format!("sampled to {}", sampled.display()));
+    _ = writeln!(std::io::stderr(), "{why}; {took}");
+    std::process::abort()
+}
+
+/// A case's deadline, watched from a thread of its own: past [`CASE`] it says where the case
+/// was (the step and the call [`Watch::at`] last named), samples the process, and aborts, so a
+/// hang fails naming itself rather than holding the run. The first case also starts the run's
+/// watch: past [`RUN`], if a wait has timed out ([`hung`]), it aborts naming that wait.
+struct Watch {
+    ended: Option<Sender<()>>,
+}
+
+impl Watch {
+    fn start() -> Watch {
+        static RUN_WATCH: std::sync::Once = std::sync::Once::new();
+        RUN_WATCH.call_once(|| {
+            std::thread::spawn(|| {
+                let (_never, quiet) = unbounded::<()>();
+                _ = quiet.recv_timeout(RUN);
+                let Some(first) = HUNG.lock().clone() else { return };
+                let at = PLACE.lock().clone();
+                sample_and_abort(&format!(
+                    "the oracle ran past {RUN:?} while hegel replayed a hung case: first {first}; now at {at}"
+                ));
+            });
+        });
+        *PLACE.lock() = String::from("starting the actors");
+        let (ended, watched) = unbounded::<()>();
+        std::thread::spawn(move || {
+            if watched.recv_timeout(CASE) != Err(crossbeam_channel::RecvTimeoutError::Timeout) {
+                return;
+            }
+            let at = PLACE.lock().clone();
+            sample_and_abort(&format!("the oracle's case ran past {CASE:?}, blocked where no bound of its own reaches: at {at}"));
+        });
+        Watch { ended: Some(ended) }
+    }
+
+    /// Where the case is now, for the message if it hangs here.
+    fn at(&self, now: std::fmt::Arguments<'_>) {
+        let mut at = PLACE.lock();
+        at.clear();
+        _ = std::fmt::Write::write_fmt(&mut *at, now);
+    }
+
+    fn end(mut self) {
+        self.ended.take();
+    }
+}
+
+fn check(tc: &TestCase, worlds: &[World<'_>; 2], watch: &Watch) {
     let mut expect = Expect::default();
     let steps = 1 + below(tc, 40);
     for step in 0..steps {
@@ -315,6 +421,7 @@ fn check(tc: &TestCase, worlds: &[World<'_>; 2]) {
         };
         let mut heard = Vec::new();
         for world in worlds {
+            watch.at(format_args!("step {step} of {steps}, {}: told actor {actor} {todo:?}, hearing it or counting its ask's link", world.name));
             world.tell(actor, todo);
             let said = match todo {
                 Do::Ask(at, _) if expect.holder[at].is_some() && !expect.closes_cycle(actor, at) => {
@@ -325,6 +432,7 @@ fn check(tc: &TestCase, worlds: &[World<'_>; 2]) {
             let mut woken = Vec::new();
             if let Do::Release(at, value) = todo {
                 for other in (0..ACTORS).filter(|it| expect.waits[*it] == Some(at)) {
+                    watch.at(format_args!("step {step} of {steps}, {}: {todo:?} by actor {actor}, hearing woken actor {other}", world.name));
                     let said = match world.hear(other) {
                         Heard::Asked(Ok(_)) if value.is_none() => Heard::AskedAfterCancel,
                         it => it,
@@ -332,6 +440,7 @@ fn check(tc: &TestCase, worlds: &[World<'_>; 2]) {
                     woken.push((other, said));
                 }
             }
+            watch.at(format_args!("step {step} of {steps}, {}: after {todo:?} by actor {actor}, counting the runs", world.name));
             heard.push((said, woken, world.design.running()));
         }
         assert_eq!(heard[0], heard[1], "step {step}: {todo:?}");
@@ -348,23 +457,27 @@ fn check(tc: &TestCase, worlds: &[World<'_>; 2]) {
             _ => {}
         }
     }
-    for at in 0..KEYS {
-        if let Some(holder) = expect.holder[at] {
-            for world in worlds {
-                world.tell(holder, Do::Release(at, None));
-                assert_eq!(world.hear(holder), Heard::Released);
-                for other in (0..ACTORS).filter(|it| expect.waits[*it] == Some(at)) {
-                    world.hear(other);
-                }
+    // A holder whose own ask waits hears nothing until that ask ends, so each key let go is
+    // one held by an actor that waits for none; with no cycle among the waits, one always is.
+    while let Some(at) = (0..KEYS).find(|&at| expect.holder[at].is_some_and(|holder| expect.waits[holder].is_none())) {
+        let holder = expect.holder[at].take().expect("a held key");
+        for world in worlds {
+            watch.at(format_args!("the case's end, {}: actor {holder} lets go of key {at}", world.name));
+            world.tell(holder, Do::Release(at, None));
+            assert_eq!(world.hear(holder), Heard::Released);
+            for other in (0..ACTORS).filter(|it| expect.waits[*it] == Some(at)) {
+                world.hear(other);
             }
-            for waits in &mut expect.waits {
-                if *waits == Some(at) {
-                    *waits = None;
-                }
+        }
+        for waits in &mut expect.waits {
+            if *waits == Some(at) {
+                *waits = None;
             }
         }
     }
+    assert_eq!(expect.holder, [None; KEYS], "the case's end: every key held is let go");
     for world in worlds {
+        watch.at(format_args!("the case's end, {}: counting the runs left", world.name));
         assert_eq!(world.design.running(), 0);
     }
 }

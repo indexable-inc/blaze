@@ -6,10 +6,10 @@
     "crates/hir-ty/src/diagnostics/expr.rs"
   ],
   "what": "hir-ty diagnostics/expr.rs ExprValidator::validate_block (line ~176) returns early when `!self.validate_lints`, so check_unused_must_use never runs under blaze: blaze-diagnostics check.rs:87 runs the plan with style_lints=false (the flag is for rust-analyzer's own style lints, RemoveTrailingReturn / RemoveUnnecessaryElse / ReplaceFilterMapNextWithFindMap, which blaze drops in lower/mod.rs:343-346). unused_must_use is rustc's lint (warn by default), so `#[must_use]` types and functions are never reported: no `unused ... that must be used` in any blaze-diagnostics output of round 15. Fix: in validate_block, call check_unused_must_use for each `Statement::Expr { has_semi: true }` whatever validate_lints is; keep the gate on the three style lints only. Test: blaze-diagnostics tests::lints::bodies::calls::statements::a_result_of_an_ordinary_type_is_unused (rustc's tests/ui/lint/unused/unused-result.rs, 4 missing errors at lines 25, 26, 39, 40).",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T00:17:14Z",
-  "updated": "2026-11-01T00:17:14Z",
-  "taken_by": null,
+  "updated": "2026-11-01T20:23:13Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,18 @@
       "by": "tests-diag",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T20:23:13Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:23:13Z",
+      "by": "db",
+      "action": "done",
+      "note": "applied, not yet run: hir-ty diagnostics/expr.rs validate_block runs check_unused_must_use whatever validate_lints says (the gate stays on the three rust-analyzer style lints), and pushes into the validator diagnostics with no Vec per statement. Check: blaze-diagnostics a_result_of_an_ordinary_type_is_unused."
     }
   ]
 }

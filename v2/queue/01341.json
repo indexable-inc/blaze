@@ -7,10 +7,10 @@
     "crates/blaze-query/src/db/interned.rs"
   ],
   "what": "A public check that an id names a made row: `Storage::made(&self, id: Id) -> bool` (or `interned_made(storage, id, ingredient_name) -> bool`), true when `id`'s page has an owner and that owner's row for `id` is made (`fields_of`'s `made` load, Acquire). Where: crates/blaze-query/src/db/{storage,interned}.rs. Why: crates/blaze-lower/src/answer.rs `context` checks a proc-macro server's raw syntax context (user code in a sandbox) before using it: it checks the page's owner is `SyntaxContextImpl` (`Storage::owner` + `ingredient_name`), but an id on an owned page whose slot was never interned still panics in `interned_fields` (\"was never interned\"), so a hostile server can still crash a lookup instead of getting `SubResponse::Cancel`. Once it exists, answer.rs adds `&& storage.made(id)` to `owned`. No caller changes otherwise.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-10-31T20:32:43Z",
-  "updated": "2026-10-31T20:32:43Z",
-  "taken_by": null,
+  "updated": "2026-11-01T20:21:06Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -19,6 +19,18 @@
       "by": "cargo",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T20:21:06Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:21:06Z",
+      "by": "db",
+      "action": "done",
+      "note": "applied, not yet run: blaze-query `Storage::made(&self, id: Id) -> bool` (db/storage.rs): true only when the page owner is an interned ingredient and the slot was interned (Acquire load of made, through a new Vtable.made entry set by Vtable::interned, None for inputs, functions, tracked). Test db/tests.rs only_an_interned_slot_is_made. For cargo: blaze-lower answer.rs context() can add `&& storage.made(Id::from_u32(raw + 1))` to `owned`."
     }
   ]
 }

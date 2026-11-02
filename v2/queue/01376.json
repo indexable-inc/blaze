@@ -6,10 +6,10 @@
     "crates/hir-expand/src/builtin/fn_macro.rs"
   ],
   "what": "hir-expand builtin/fn_macro.rs assert_expand line 471: before edition 2021, `assert!(cond, msg..)` expands to `#dollar_crate::panic!(msg..)`, i.e. core's panic!, whose panic_2015 arm calls `panicking::panic_str_2015(expr: &str)`. rustc (rustc_builtin_macros assert.rs panic_path) writes an unqualified `panic` with the call-site span, so it resolves at the call site: std's panic! (`rt::begin_panic<M: Any + Send>`) in a std crate, core's only under no_std. So blaze gives E0308 `expected &str, found integer` for `assert!(false, 123)` / `assert!(false, v)` in a 2015/2018 std crate, which rustc builds (superset-of-rust). Fix: in the `None =>` arm, quote `panic!(# #panic_args)` with call_site_span and no `$crate::` path. Seen in blaze-diagnostics tests::lints::bodies::calls::methods::non_fmt_panic::{non_fmt_panic, non_fmt_panic_2018} (6 E0308 at non-fmt-panic.rs:28,30,80,85,90,95, round 15), which then hide all 35 non_fmt_panics warnings.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T00:12:08Z",
-  "updated": "2026-11-01T00:12:08Z",
-  "taken_by": null,
+  "updated": "2026-11-01T20:22:49Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,18 @@
       "by": "tests-diag",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T20:22:49Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:22:49Z",
+      "by": "db",
+      "action": "done",
+      "note": "applied, not yet run: hir-expand builtin/fn_macro.rs assert_expand, before 2021 with a message the panic is an unqualified `panic!` at the call-site span (rustc assert.rs panic_path), so std crates reach std::panic! and no_std crates core::panic!. hir-def macro_expansion_tests builtin_fn_macro.rs test_assert_expand_2015 expectation updated. Check: blaze-diagnostics non_fmt_panic, non_fmt_panic_2018."
     }
   ]
 }

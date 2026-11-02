@@ -38,7 +38,7 @@ pub(crate) fn declaration(item: &ItemStruct, lifetime: Option<&Lifetime>) -> Tok
 }
 
 /// `Self(id)` for the struct.
-pub(crate) fn construct(lifetime: Option<&Lifetime>, id: TokenStream) -> TokenStream {
+pub(crate) fn construct(lifetime: Option<&Lifetime>, id: &TokenStream) -> TokenStream {
     match lifetime {
         Some(_) => quote!(Self(#id, ::core::marker::PhantomData)),
         None => quote!(Self(#id)),
@@ -58,7 +58,7 @@ pub(crate) fn id_impls(
         Some(lifetime) => (quote!(<#lifetime>), quote!(#ident<#lifetime>)),
         None => (TokenStream::new(), quote!(#ident)),
     };
-    let make = construct(lifetime, quote!(id));
+    let make = construct(lifetime, &quote!(id));
     quote! {
         impl #generics #db::AsId for #ty {
             #[inline]

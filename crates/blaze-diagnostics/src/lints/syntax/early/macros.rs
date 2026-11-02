@@ -23,10 +23,13 @@
 mod asm;
 mod matchers;
 
-use hir::{InFile, MacroCallId};
+use cfg::CfgAtom;
+use hir::{InFile, MacroCallId, ModuleDef, PathResolution};
+use hir_def::MacroId;
 use hir_expand::{ExpandTo, MacroCallKind, MacroCallLoc, MacroDefKind, builtin::BuiltinAttrExpander};
+use intern::sym;
 use syntax::{
-    NodeOrToken, SyntaxKind, SyntaxNodePtr, T, TextSize,
+    NodeOrToken, SyntaxKind, SyntaxNodePtr, T, TextRange, TextSize,
     view::{self as ast, AstNode as _, HasName as _},
 };
 
@@ -59,6 +62,13 @@ pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Emitted> {
             _ => None,
         };
         emitted.extend(found);
+    }
+    if walk.cfg.check_atom(&CfgAtom::Flag(sym::test)) {
+        for tree in &walk.trees {
+            for node in tree.with_attrs(ast::Item::can_cast) {
+                emitted.extend(unexpanded_test(cx, walk, tree, node));
+            }
+        }
     }
     emitted
 }
@@ -225,13 +235,52 @@ fn duplicate_attribute(cx: &Cx<'_, '_>, walk: &Walk<'_>, loc: &MacroCallLoc) -> 
     };
     let MacroCallKind::Attr { ast_id, censored_attr_ids, .. } = &loc.kind else { return None };
     let node = loc.to_node_view(db);
+    let (_, invoked) = censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id);
+    duplicated(cx, walk, node, name, invoked.syntax().text_range())
+}
+
+/// [`duplicate_attribute`] of a `#[test]`, `#[bench]` or `#[test_case]` in a `cfg(test)` crate,
+/// which nameres resolves but makes no call of (`collect_attr_macros`): the item `node` stays in
+/// `tree`, and the attribute rustc expands is the first of its own that resolves to the macro.
+fn unexpanded_test<'db>(
+    cx: &Cx<'_, 'db>,
+    walk: &Walk<'db>,
+    tree: &Tree<'db>,
+    node: ast::Node<'db>,
+) -> Option<Emitted> {
+    let owner = ast::AnyHasAttrs::cast(node)?;
+    let (name, invoked) = walk.attrs(owner).find_map(|(meta, _)| {
+        let path = meta.path()?;
+        if !matches!(path.segment()?.name_ref()?.text(), "test" | "bench" | "test_case") {
+            return None;
+        }
+        let Some(PathResolution::Def(ModuleDef::Macro(mac))) = cx.vsema.resolve_path(path) else { return None };
+        let MacroDefKind::BuiltInAttr(_, expander) = MacroId::from(mac).definition(cx.db).kind else { return None };
+        let name = match expander {
+            BuiltinAttrExpander::Test => "test",
+            BuiltinAttrExpander::Bench => "bench",
+            BuiltinAttrExpander::TestCase => "test_case",
+            _ => return None,
+        };
+        Some((name, meta.syntax().text_range()))
+    })?;
+    duplicated(cx, walk, InFile::new(tree.file, node), name, invoked)
+}
+
+/// `duplicate_macro_attributes` of the attribute `invoked` of the builtin attribute macro
+/// `name` on the item `node`: at the first other attribute of that name.
+fn duplicated(
+    cx: &Cx<'_, '_>,
+    walk: &Walk<'_>,
+    node: InFile<ast::Node<'_>>,
+    name: &str,
+    invoked: TextRange,
+) -> Option<Emitted> {
     // rustc does not look for it on an item that is a statement.
     if node.value.parent().is_some_and(|it| matches!(it.kind(), SyntaxKind::STMT_LIST | SyntaxKind::MACRO_STMTS)) {
         return None;
     }
     let owner = ast::AnyHasAttrs::cast(node.value)?;
-    let (_, invoked) = censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id);
-    let invoked = invoked.syntax().text_range();
     let (meta, attr) = walk
         .attrs(owner)
         .find(|(meta, _)| meta.syntax().text_range() != invoked && meta.simple_name() == Some(name))?;

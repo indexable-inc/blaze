@@ -11,7 +11,7 @@ use super::state::{CrateState, Key};
 use crate::{
     BuiltinDeriveImplId, ImplId, ModuleDefId, ModuleId, TraitId,
     item_scope::ItemScope,
-    nameres::{ModuleData, ModulesMap},
+    nameres::{ModuleData, ModulesMap, facts::queries::DeclKey},
 };
 
 /// A key whose value changed, and whether it had one before (a change or a removal, which may
@@ -132,17 +132,31 @@ fn weighted<T: Copy + Eq + std::hash::Hash>(
 /// change visited every group, which this follows at the same cost.
 pub(super) fn update_positions(state: &mut CrateState) -> Vec<ModuleId> {
     let mut moved = Vec::new(); // alloc: the groups that moved, once per change of the tree
+    // Each round-0 child's parent group and index, from the lists the walk just read: the walk
+    // reached every group but the root from one of them. `group_of` is as of the last run, and
+    // a write that moves a module into or out of round 0 (an attribute that may be a macro)
+    // leaves it naming a group that no longer declares the child.
+    let mut declared: HashMap<DeclKey, (ModuleId, u32)> = HashMap::default(); // alloc: the tree's children, once per change of the tree
+    declared.reserve(state.groups.len());
+    for (&group, g) in &state.groups {
+        for (at, &key) in (0u32..).zip(&g.children) {
+            declared.insert(key, (group, at));
+        }
+    }
     let mut now: HashMap<ModuleId, Pos> = HashMap::default();
     now.reserve(state.groups.len());
     // Group order is DFS preorder: a parent's position is known before its children's.
     for (&group, g) in &state.groups {
         let pos = match g.parent {
             None => Pos::root(),
-            Some(parent) => {
-                let parent = state.group_of.get(&parent).copied().unwrap_or(parent);
-                let at = state.groups[&parent].children.iter().position(|&it| it == g.key);
-                let at = at.expect("nameres delta: a round-0 module its parent does not declare");
-                now[&parent].child(1 + at as u32)
+            Some(_) => {
+                let Some(&(parent, at)) = declared.get(&g.key) else {
+                    panic!(
+                        "nameres delta: the walk reached group {group:?} (key {:?}) from no group's round-0 children",
+                        g.key
+                    )
+                };
+                now[&parent].child(1 + at)
             }
         };
         if state.group_pos.get(&group) != Some(&pos) {

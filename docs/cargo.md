@@ -72,7 +72,9 @@ a build first needs it.
 ## Commands
 
     blaze build [cargo's flags]                                       (b)
-    blaze check [cargo's flags]                                       (c)
+    blaze check [cargo's flags] [--fix [--lint NAME]...]               (c)
+    blaze check [cargo's flags] --replace FROM=TO [--replace FROM=TO ...]
+    blaze check [cargo's flags] --baselines DIR [--bless-baselines] [--new-baseline LINT[,LINT...]]
     blaze run   [cargo's flags] [-- program arguments]                (r)
     blaze test  [cargo's flags] [TESTNAME] [-- test arguments]        (t)
     blaze bench [cargo's flags] [BENCHNAME] [-- bench arguments]
@@ -85,7 +87,6 @@ a build first needs it.
     blaze trace --out PATH
     blaze tables --format=json
     blaze pack -p PACKAGE --out PATH [cargo's flags]
-    blaze fix --replace FROM=TO [--replace FROM=TO ...]
     blaze pin
     blaze --version
 
@@ -103,7 +104,7 @@ the package for `wasm32-unknown-unknown` with debug assertions off (as `--releas
 scripts run and proc macros loaded in the sandbox as any check's, and writes the program's crate
 and every crate it is made of, with each macro expansion its names and bodies needed, to `PATH`
 as one JSON file for the in-browser compiler (`crates/blaze-wasm-pack`, the agent API's
-`Request::Pack`); `fix --replace std::sync::Mutex=parking_lot::Mutex` retargets every
+`Request::Pack`); `check --replace std::sync::Mutex=parking_lot::Mutex` retargets every
 reference that resolves to the item `FROM` names to the item `TO` names, each a def path from a
 crate's name: the daemon's front end finds them by name resolution (imports, renames, globs,
 re-exports, the prelude, a macro's input), never by text, rewrites a `use` of it or a path that
@@ -112,7 +113,8 @@ and commits the edits to the checkout's head, and the client writes them to its 
 (`crates/blaze-intent/src/replace.rs`, the agent API's `Edit::Replace`). A crate that would have
 to name `TO` without depending on its crate, or a name the front end can't place (a
 `macro_rules!` body, cfg'd out code), stops it with an error naming the file and line, before
-anything is written; `pin` is [below](#pinning-a-release-of-blaze). Any other command (v1's `fmt`, `clippy`, `tree`,
+anything is written, and nothing is checked; `pin` is [below](#pinning-a-release-of-blaze). `check`'s lints, `--fix`
+and `--baselines` are [below](#lints). There is no `clippy` and no `fix` command: `check` is both. Any other command (v1's `fmt`, `tree`,
 `metadata`, `toolchain`, ...) fails with `error: no such command` and status 101; none is
 passed to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
 
@@ -413,12 +415,18 @@ registry can be named in:
 ```toml
 [workspace.metadata.blaze.sandbox]
 unsandboxed-build-scripts = ["hegeltest", "flecs_ecs_sys"]   # by package name
-build-script-link-dirs = ["/opt/vendor/lib"]                 # rustc-link-search may name
+build-script-link-dirs = ["/opt/vendor/lib", "${OPENSSL_DIR}/lib"]   # rustc-link-search may name
+build-script-env = ["OPENSSL_DIR"]                                   # a ${NAME} above must be listed here
 ```
+
+An entry that starts `${NAME}` is under the variable's value in the environment the script runs
+in, for a library whose place differs by machine; `build-script-env` must list `NAME`, and a
+script run where it is unset, or is no absolute path, fails naming it.
 
 The table may also have `unsandboxed-proc-macros`, `build-script-env` and `wasi-build-scripts`,
 each a list of names, which v1 read: v2 checks that each is a list of strings and does nothing
-else with it (`crates/blaze-units/src/load/sandbox.rs`). Proc macros run in blaze's own
+else with it beyond naming the variables `build-script-link-dirs` may use
+(`crates/blaze-units/src/load/sandbox.rs`). Proc macros run in blaze's own
 process, confined by blaze's evaluator, which is their sandbox and has no way out
 ([below](#proc-macros-run-on-blazes-evaluator)), and a script is given the command's whole
 environment already.
@@ -829,7 +837,7 @@ any other fails with status 101 and does nothing:
 
     error: no such command: `fmt`
 
-    help: blaze's commands are build, check, run, test, bench, doc, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, explain and fix
+    help: blaze's commands are build, check, run, test, bench, doc, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug and explain
 
 The table below is a record of what v1 had (as of 2026-10-30): the crates it names
 (blaze-metadata, blaze-fmt, blaze-lints, ...) are still in the tree, and a command comes back
@@ -843,7 +851,7 @@ once the client asks the daemon for it. None of it runs in v2.
 | `verify-project` | yes | `{"success":"true"}`, or `{"invalid":...}` and status 1 |
 | `version`, `help` | yes | blaze's version and help |
 | `fmt` | yes | `crates/blaze-fmt`: rustfmt and cargo-fmt at rust-lang/rust 12433c307 ported onto a syntax tree of blaze's own, filled by rust-analyzer's parser with rustc's spans, run in process. `blaze fmt [--check] [-p NAME]... [--all] [--manifest-path PATH] [-v\|-q] [-- RUSTFMT_ARGS]` formats the targets blaze-manifest reads; `blaze fmt a.rs b.rs` formats files, with rustfmt's options. Measured against stock rustfmt (the pinned nightly's) before the comparison harnesses were deleted (2026-10-30): ripgrep, nushell, fd, helix and biome with their own rustfmt.toml, 6068 of 6068 files byte-equal (100%), and `--check` exit codes and diffs equal; the same with `max_width = 60`, 6068 of 6068 (100%); rustfmt's `tests/source`, 773 of 793 (97.5%; 18 more use line ranges, which it does not run). At blaze-fmt f43e4a20af on dev-aws-14. A file is refused with the reason, and left as it is, when it has nightly syntax rust-analyzer does not parse (postfix `.yield`, `.use` and `.match`, `const` block items, `use` closures, `&pin`, unsafe binders, `unsafe mod`, `mut ref`, `default` on an associated `const fn`), a parenthesized trait object with `+` (`(Foo) + 'static`), a `macro` with a parameter list, an `impl` or `mut` restriction, or a typed `try` block; a non-empty `ignore` option is an error |
-| `clippy` | yes | `crates/blaze-lints`: 24 of clippy's lints ported onto rust-analyzer's analysis, run by the daemon, written as `cargo clippy` writes them; [below](#clippy-v1-not-in-v2) |
+| `clippy` | yes | `crates/blaze-lints`: 24 of clippy's lints ported onto rust-analyzer's analysis, run by the daemon, written as `cargo clippy` writes them; [below](#lints) |
 | `doc` (`d`) | yes | `crates/blaze-doc`: every page from rust-analyzer's HIR, no rustdoc; cargo's flags, `target/doc/<crate>/index.html`, search, source pages, themes. Measured against the pinned nightly's `cargo doc` before the comparison harnesses were deleted (2026-10-30), with their dependencies: fd 100.0% of rustdoc's pages, 99.9% of their members and impls, 99.4% of the resolved links; ripgrep 99.9%, 99.6%, 99.1%; nushell 99.5%, 99.2%, 98.4%; helix 98.9%, 99.0%, 98.7%; biome 99.0%, 99.2%, 98.1%. biome in 92.5 s against `cargo doc`'s 1028.0 s, nushell in 28.4 s against 497.1 s, its build scripts already run ([doc.md](doc.md)). The load still runs cargo for build scripts and proc macros, as every load does; doctests are `blaze test --doc`'s |
 | `tree` | yes | `crates/blaze-tree`, cargo 1.101's `cargo tree` ported onto blaze-resolve: every flag (`-p`, `--workspace`, `--exclude`, `-e`, `-i`, `--prune`, `--depth`, `--prefix`, `--no-dedupe`, `-d`, `-f`, `--target`, `--charset`, `--color`, the feature flags). Measured equal to cargo's before the comparison harnesses were deleted (2026-10-30): 26 forms over ripgrep, fd, helix, nushell and biome, 130 of 130 byte-equal. Package patterns with globs (`-p 'serde*'`) and `-i` with no value are refused |
 | `pkgid` | yes | the package's full spec from `Cargo.lock`, with cargo's errors for none or several matches |
@@ -862,9 +870,21 @@ once the client asks the daemon for it. None of it runs in v2.
 | `config` | yes | `config get`, by blaze-manifest's port of cargo 1.99's `cargo_config.rs`: `--format toml`, `json` and `json-value`, `--show-origin`, `--merged no`. Unstable in cargo, and refused as cargo refuses it unless `-Z unstable-options`, `unstable.unstable-options` or `CARGO_UNSTABLE_UNSTABLE_OPTIONS` allows it. Measured equal to cargo's before the comparison harnesses were deleted (2026-10-30): 41 of 41 cases |
 | any other | no | `error: no such command`; blaze runs no cargo plugin |
 
-### `clippy` (v1, not in v2)
+### Lints
 
-A record of v1 (as of 2026-10-27); v2 has no `blaze clippy`. v1's `blaze clippy` linted with
+v2's `blaze check` runs every lint, rustc's, clippy's and blaze's (`blaze::`), at the levels
+the manifests set: `crates/blaze-lints` runs over each crate of the workspace's packages beside
+its check, with `--cfg clippy` and the `clippy.toml` clippy's search finds; a registry crate is
+checked, not linted. `--fix` makes every machine-applicable suggestion of the check (with
+`--lint NAME`, given any number of times, only those of the lints named), checks the result
+again up to four times, and writes the files only when no check of it has an error the first
+did not; `--fix` checks every target when none is named. `--baselines DIR` holds the run's lint
+counts to the baselines checked in under `DIR`, `--bless-baselines` lowers them to the run's,
+and `--new-baseline LINT[,LINT...]` starts a lint's at the run's
+([lints.md](v2/plan/lanes/lints.md#blaze-check-lints)). A baseline holds a lint at `warn`: a
+`deny` lint's finding fails the check, baselined or not.
+
+A record of v1 (as of 2026-10-27). v1's `blaze clippy` linted with
 blaze's own lints, `crates/blaze-lints`:
 each a port of one of clippy's, with its file naming the clippy source it follows, keeping its
 messages, spans, suggestions and conditions. The daemon runs them over the crates it loads as

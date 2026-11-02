@@ -53,7 +53,7 @@ use blaze_units::{
     stdlib::target::HostCpu,
 };
 use cfg::{CfgAtom, CfgOptions};
-use hir_expand::proc_macro::{CrateProcMacros, ProcMacros};
+use hir_expand::proc_macro::ProcMacros;
 use triomphe::Arc;
 
 pub use base_db::{Db, ProcMacroLoadingError};
@@ -553,16 +553,12 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
     }
     base_db::set_all_crates_with_durability(&mut db, all, Durability::MEDIUM);
 
-    let not_built: blaze_hash::HashMap<Crate, Arc<CrateProcMacros>> = lowerings
+    let not_built = lowerings
         .iter()
         .filter(|it| it.proc_macro)
         .filter_map(|it| it.krate)
-        .map(|krate| {
-            let macros = CrateProcMacros::new(Err(base_db::ProcMacroLoadingError::NotYetBuilt));
-            (krate, Arc::new(macros))
-        })
-        .collect();
-    ProcMacros::get(&db).set_by_crate(&mut db).with_durability(Durability::HIGH).to(not_built);
+        .map(|krate| (krate, Err(base_db::ProcMacroLoadingError::NotYetBuilt)));
+    ProcMacros::give(&mut db, not_built);
     const_macros::set_macros(&mut db, const_listed);
     base_db::set_process_env(&mut db, config.invocation.env.iter().cloned().collect());
 
@@ -791,11 +787,7 @@ impl Lowered {
             macros
         });
         self.identities.clear();
-        let db = &mut self.db;
-        let all = ProcMacros::get(&*db);
-        let mut by_crate = all.by_crate(&*db).clone();
-        by_crate.insert(krate, Arc::new(CrateProcMacros::new(macros)));
-        all.set_by_crate(db).with_durability(Durability::HIGH).to(by_crate);
+        ProcMacros::give(&mut self.db, [(krate, macros)]);
         Ok(())
     }
 

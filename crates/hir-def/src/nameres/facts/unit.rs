@@ -34,7 +34,7 @@ use triomphe::Arc;
 use crate::{
     AdtId, FxIndexMap, Lookup, MacroId, ModuleDefId, ModuleId, UseId,
     item_scope::{
-        GlobAmbiguity, GlobId, ImportId, ImportOrExternCrate, ImportOrGlob, ItemInNs,
+        GlobAmbiguity, GlobId, ImportId, ImportOrExternCrate, ImportOrGlob, ItemInNs, ItemScope,
         PerNsGlobImports, UnderscoreImport,
     },
     item_tree::{ImportAlias, ImportKind},
@@ -216,6 +216,10 @@ pub(crate) struct Unit<'db, 'f, A: Allocator + Clone = Global> {
     /// Whether a macro directive of the crate (a block's, a region's) is still unexpanded, as
     /// the driver last said ([`Unit::set_unexpanded`]).
     unexpanded: bool,
+    /// What glob propagation (`update_recursive`) did since the unit started: the names it
+    /// pushed into a scope and the importer edges it walked, for the `nameres update` span.
+    names_pushed: u64,
+    edges_walked: u64,
 }
 
 /// The rows of a unit's view.
@@ -270,6 +274,30 @@ pub(in crate::nameres) fn glob_takes_over(
         return vis.max(db, prev_vis, def_map) == Some(vis);
     }
     prev.is_some_and(|prev| prev != glob && glob_position(db, glob) < glob_position(db, prev))
+}
+
+/// The visibility of `scope`'s record of `glob` giving `name` the item `other`, if it has one.
+pub(in crate::nameres) fn recorded_ambiguity(
+    scope: &ItemScope,
+    name: &Name,
+    other: ItemInNs,
+    glob: GlobId,
+) -> Option<Visibility> {
+    let same = |it: &&GlobAmbiguity| it.name == *name && it.glob == glob && it.other == other;
+    scope.glob_ambiguities().iter().find(same).map(|it| it.vis)
+}
+
+/// The visibility to record a glob giving a name an item at `vis` where an earlier record of
+/// the same glob and item has `earlier` ([`recorded_ambiguity`]): the wider, as rustc keeps the
+/// more visible of a glob's two bindings of one item, so the record is the same whichever of
+/// the glob's deliveries arrives last. Both collectors ask it.
+pub(in crate::nameres) fn widest_ambiguity(
+    db: &Db,
+    def_map: &DefMap,
+    earlier: Option<Visibility>,
+    vis: Visibility,
+) -> Visibility {
+    earlier.and_then(|it| it.max(db, vis, def_map)).unwrap_or(vis)
 }
 
 /// Whether the type or value binding of `def`, an import's resolution, is a glob's of a
@@ -351,6 +379,8 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             records: Vec::new_in(frame),
             diagnostics: Vec::new_in(frame),
             unexpanded: false,
+            names_pushed: 0,
+            edges_walked: 0,
         }
     }
 }
@@ -1094,7 +1124,17 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
         import: Option<ImportOrExternCrate>,
     ) {
         let end = self.held.len();
+        let span = tracing::info_span!(
+            "nameres update",
+            resolutions = end - start,
+            names_pushed = tracing::field::Empty,
+            edges_walked = tracing::field::Empty,
+        )
+        .entered();
+        let (names, edges) = (self.names_pushed, self.edges_walked);
         self.update_recursive(module_id, start..end, vis, import, 0);
+        span.record("names_pushed", self.names_pushed - names);
+        span.record("edges_walked", self.edges_walked - edges);
         self.held.truncate(start);
     }
 
@@ -1112,10 +1152,11 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     ) {
         if depth > GLOB_RECURSION_LIMIT {
             // prevent stack overflows (but this shouldn't be possible)
-            panic!("infinite recursion in glob imports!");
+            panic!("nameres: glob imports into {module_id:?} recurse past {GLOB_RECURSION_LIMIT} levels");
         }
         let mut changed = false;
 
+        self.names_pushed += resolutions.len() as u64;
         // clone: a `Range` of two indices.
         for at in resolutions.clone() {
             let (name, res) = self.held[at];
@@ -1202,6 +1243,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             let ImporterEdge { importer, data: (glob_import_vis, glob), next } =
                 self.state.globs.edge(edge);
             edge = next;
+            self.edges_walked += 1;
             if !vis.is_visible_from_def_map(self.db, &self.def_map, importer) {
                 continue;
             }
@@ -1234,6 +1276,9 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
         glob: GlobId,
         vis: Visibility,
     ) {
+        let scope = self.def_map.module(self.db, module_id).scope(self.db);
+        let earlier = recorded_ambiguity(scope, name, other, glob);
+        let vis = widest_ambiguity(self.db, &self.def_map, earlier, vis);
         let it = GlobAmbiguity { name: *name, other, glob, vis };
         self.scope_mut(module_id).push_glob_ambiguity(it);
     }

@@ -71,6 +71,12 @@ fn each_command_its_request() {
     assert_eq!((filter, all), (vec!["parse".to_owned()], false));
     // `--reached` is blaze's: cargo's command line does not have it.
     assert_eq!(targets.cargo.unwrap().args, ["parse"]);
+
+    let check = request_of(&invocation(words(os(&["blaze", "check", "--baselines", "b", "--fix"]))));
+    let Request::Check { targets, .. } = check else { panic!("{check:?}") };
+    let cargo = targets.cargo.unwrap();
+    assert_eq!(cargo.command, "check");
+    assert_eq!(cargo.args, ["--all-targets"], "`--fix` checks every target; blaze's flags stay with the client");
 }
 
 #[test]

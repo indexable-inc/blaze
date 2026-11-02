@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::{
     ApiError, Applicability, Artifact, Basis, BuildScriptRan, Cached, CrateType, Diagnostic,
-    Documented, Edited, FactRead, FetchVerb, Level, LiveFrame, Memory, Mismatch, Ranked, Reach, Response, Span, Status,
+    Documented, Edited, FactRead, FetchVerb, Hot, Level, LiveFrame, Memory, Mismatch, Ranked, Reach, Response, Span, Status,
     Table, TargetKind, TestOutcome, TestResult, Traced, UnitOf, UnitStarted, UnitTarget, Verb,
     Worked,
 };
@@ -83,6 +83,7 @@ pub enum ResponseRef<'a> {
         ipc: &'a [u8],
         rows: u64,
     },
+    Hot(Hot),
 }
 
 /// [`LiveFrame`], read where it lies: a frame every 250 ms decodes with no copy of its tables.
@@ -319,6 +320,7 @@ impl ResponseRef<'_> {
             ResponseRef::Profiled { trace } => Response::Profiled { trace: bytes(trace) },
             ResponseRef::Live(it) => Response::Live(it.into_owned()),
             ResponseRef::Queried { ipc, rows } => Response::Queried { ipc: bytes(ipc), rows },
+            ResponseRef::Hot(it) => Response::Hot(it),
         }
     }
 }

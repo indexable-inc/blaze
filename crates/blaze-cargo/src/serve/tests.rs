@@ -269,6 +269,7 @@ fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units {
         unsandboxed: false,
         runner: Vec::new(),
         harness: true,
+        clippy: None,
     };
     let package = |id: &str, name: &str, version: &str, source: Option<String>, is_member| PackagePlan {
         id: id.into(),

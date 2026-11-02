@@ -1,0 +1,41 @@
+{
+  "id": "01529",
+  "from_lane": "one-pool",
+  "owner": "one-pool",
+  "paths": [
+    "crates/blaze-mem/src/frame.rs"
+  ],
+  "what": "Supersedes 01528 (refuse that one): its premise is disproven on the binary that crashed (/Volumes/Projects/.coord-1030/target-rel-v2/release/blaze, 10:41). In frame::task<StoredEarlyBinder<StoredClauses>, run<next_solver::util Configuration_>> the drop of Back is an out-of-line call that looks up STACK again, and task uses the thread-local only before f (disassembly /tmp/blaze-lanes/one-pool-task-disasm.txt). So a task's end does not write to a stale thread. What A1 needs instead: catch the bad frame where it is carried, not at the next task. In frame.rs, check the frame at take_current and put_current: a pub fn check_carried(taken: usize, at: &'static str) that runs check_outer's seal test on a non-null taken frame and panics naming the switch (take or put), the job's task id from the seal and this thread. Call it from blaze-graph's carry at go_off and come_on; the call sites are sched-next2's or mine. Also record in the panic whether outer lies on this fiber's stack (stdx::fiber_stack_limit() up to limit + FIBER_STACK) or elsewhere (a stacker segment from stdx::ensure_sufficient_stack; frames #16 and #32 of the 10:50 trace grew one), which tells a frame left in a freed segment from one carried across threads.",
+  "state": "applied",
+  "created": "2026-11-01T18:47:02Z",
+  "updated": "2026-11-01T21:46:37Z",
+  "taken_by": "one-pool",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T18:47:02Z",
+      "by": "one-pool",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:04:50Z",
+      "by": "coord-1030",
+      "action": "reassign",
+      "note": "owner mem -> one-pool: mem has no live window; one-pool takes crates/blaze-mem/src/frame.rs"
+    },
+    {
+      "at": "2026-11-01T21:46:37Z",
+      "by": "one-pool",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T21:46:37Z",
+      "by": "one-pool",
+      "action": "done",
+      "note": "blaze-mem frame.rs: take_current and put_current check the carried frame seal (check_carried) and fail at the switch, naming it; refuse_outer and check_carried say where the frame lies against the thread stack pointer (whereabouts); STACK accesses after a wait are inline(never) calls. Tests: frame.rs a_dropped_frame_carried_across_a_switch_fails_at_the_switch, a_live_frame_carried_across_a_switch_is_current_again (the 1701 compile fix is in: the closure captures a usize); blaze-graph tests/frame_carry.rs a_task_that_resumes_on_another_thread_ends_on_that_thread."
+    }
+  ]
+}

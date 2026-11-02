@@ -6,10 +6,10 @@
     "crates/hir-ty/src/next_solver/interner.rs"
   ],
   "what": "crates/hir-ty/src/next_solver/interner.rs `attach_db`: on blaze`s pool a worker waiting on a query runs other pool jobs above the waiting one (pump), and since rayon is gone (lane one-pool) parallel loops of codegen, doc and lints run there too. A pumped job of another database (two databases in one test process; tests run concurrently) calling `attach_db` panics `Cannot change attached database`, and its guard sets the slot to None on drop instead of restoring the frame below. Make `attach` restore the previous pointer on drop and accept a different database pushed above (as `attach_db_allow_change` does), or one stack per pump frame. Seen as blaze-doc tests members_and_impls, signature_names_link_to_their_pages, signatures_come_from_the_hir failing with no message in round 16; blaze-doc now uses attach_db_allow_change at its two par sites, but hir-ty-codegen, blaze-lints, blaze-diagnostics, hir-ty-mir attach inside work that now runs on the pool.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T01:27:43Z",
-  "updated": "2026-11-01T01:27:43Z",
-  "taken_by": null,
+  "updated": "2026-11-01T20:19:23Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,18 @@
       "by": "one-pool",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T20:19:23Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:19:23Z",
+      "by": "db",
+      "action": "done",
+      "note": "settled by the scheduler, no edit: a wait no longer runs other jobs above the waiting one (blaze-graph pump.rs: a wait suspends the job, fiber switch or park), and hir-ty interner.rs tls_db carries the attached database with each fiber job (carry_attached: take_attached/put_attached), so a job of another database starts on a thread with none attached; attach restores None, which is what was there when it set. Pinned by tls_db::tests::jobs_with_databases_of_their_own_park_and_resume_on_each_others_workers. Each par item attaches its own database: a worker never inherits the spawners."
     }
   ]
 }

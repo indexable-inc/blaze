@@ -24,7 +24,7 @@ use crate::{
     print::{self, Op},
     protocol::Method,
     stream::{DelimSpan, Delimiter, IdentKind, LitKind, Spacing, Stream, Tree, push_given},
-    wire::{Reader, Writer},
+    wire::{Reader, Width, Writer},
 };
 
 /// A diagnostic the macro emitted (`proc_macro::Diagnostic::emit`), or an error rustc's
@@ -49,6 +49,8 @@ pub(crate) struct Server {
     edition: Edition,
     /// Whether the calling crate enables `forced_keywords`, which gates each `k#` it lexes.
     forced_keywords: bool,
+    /// The client's `usize`, which its requests and the replies are written in.
+    width: Width,
     /// Whether the expansion learned of a span what its key does not say.
     pub(crate) asked: bool,
     /// Paths given to `proc_macro::tracked_path::path`: inputs as much as files it read.
@@ -171,8 +173,8 @@ fn bound_word(bound: Bound<u64>) -> u64 {
 
 impl Server {
     /// The server of one expansion at `sites` (def, call, mixed), for a crate of `edition`
-    /// that enables `forced_keywords` or not.
-    pub(crate) fn new(sites: [Span; 3], edition: Edition, forced_keywords: bool) -> Server {
+    /// that enables `forced_keywords` or not, speaking to a client whose `usize` is `width`.
+    pub(crate) fn new(sites: [Span; 3], edition: Edition, forced_keywords: bool, width: Width) -> Server {
         let mut server = Server {
             // alloc: once per expansion, its tables, which grow with what it builds
             streams: Vec::new(),
@@ -182,6 +184,7 @@ impl Server {
             sites,
             edition,
             forced_keywords,
+            width,
             asked: false,
             tracked: Vec::new(), // alloc: once per expansion, as above
             emitted: Vec::new(), // alloc: once per expansion, as above
@@ -234,7 +237,7 @@ impl Server {
     /// The bytes the client's `run` is given: the sites, then each input stream's handle.
     pub(crate) fn input(&mut self, inputs: &[Stream], out: &mut Vec<u8>) {
         out.clear();
-        let mut w = Writer { out };
+        let mut w = Writer { out, width: self.width };
         for site in self.sites {
             let handle = self.span_handle(site);
             w.handle(handle);
@@ -248,7 +251,7 @@ impl Server {
 
     /// What `run` gave back: the output stream, or the macro's panic message.
     pub(crate) fn output(&mut self, bytes: &[u8]) -> Result<Result<Stream, String>, Stop> {
-        let mut r = Reader::new(bytes);
+        let mut r = Reader::new(bytes, self.width);
         let ok = r.some()?;
         let some = r.some()?;
         let answer = match (ok, some) {
@@ -473,13 +476,13 @@ impl Server {
     /// Answers the request `request`, writing the reply, `Result<_, PanicMessage>`, to `reply`.
     pub(crate) fn dispatch(&mut self, db: &Db, request: &[u8], reply: &mut Vec<u8>) -> Result<(), Stop> {
         reply.clear();
-        let mut r = Reader::new(request);
+        let mut r = Reader::new(request, self.width);
         let tag = r.u8()?;
         let Some(method) = Method::of(tag) else {
             // alloc: error path
             return Err(Stop(format!("sent the server the request {tag}, which the pinned bridge has not")));
         };
-        let mut w = Writer { out: reply };
+        let mut w = Writer { out: reply, width: self.width };
         match method {
             Method::TrackEnvVar => {
                 // The variable was read through `getenv`, which traced it.
@@ -642,7 +645,7 @@ impl Server {
                 w.usize(0);
                 let mut count = 0;
                 self.put_trees(db, &mut w, stream.trees(), &mut count)?;
-                w.out[at..at + 8].copy_from_slice(&count.to_le_bytes());
+                w.set_usize(at, count);
             }
             Method::SpanDebug => {
                 let span = self.read_span(&mut r)?;

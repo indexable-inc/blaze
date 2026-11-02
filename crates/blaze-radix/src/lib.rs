@@ -553,9 +553,12 @@ impl<T: Copy> Parts<T> {
     #[allow(clippy::mut_from_ref)]
     unsafe fn part(&self, range: Range<usize>) -> &mut [T] {
         assert!(range.start <= range.end && range.end <= self.len);
+        // SAFETY: `range.start <= self.len` (just checked), so the pointer stays in the buffer
+        // or one past it.
+        let start = unsafe { self.at.add(range.start) };
         // SAFETY: in bounds (just checked); live, initialized and not aliased, as the caller
         // promises.
-        unsafe { slice::from_raw_parts_mut(self.at.add(range.start), range.end - range.start) }
+        unsafe { slice::from_raw_parts_mut(start, range.end - range.start) }
     }
 
     /// # Safety
@@ -564,8 +567,10 @@ impl<T: Copy> Parts<T> {
     /// `at` meanwhile.
     unsafe fn write(&self, at: usize, value: T) {
         debug_assert!(at < self.len);
+        // SAFETY: `at < self.len`, as the caller promises, so the pointer is in the buffer.
+        let slot = unsafe { self.at.add(at) };
         // SAFETY: in bounds and unshared, as the caller promises; `T: Copy` has no drop to skip.
-        unsafe { self.at.add(at).write(value) }
+        unsafe { slot.write(value) }
     }
 }
 

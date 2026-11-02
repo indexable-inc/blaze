@@ -54,6 +54,7 @@ pub(crate) mod trait_impl_incorrect_safety;
 pub(crate) mod trait_impl_missing_assoc_items;
 pub(crate) mod trait_impl_orphan;
 pub(crate) mod trait_impl_redundant_assoc_items;
+pub(crate) mod trait_impl_unstable_default_body;
 pub(crate) mod unimplemented_builtin_macro;
 pub(crate) mod unresolved_extern_crate;
 pub(crate) mod unresolved_import;
@@ -116,6 +117,7 @@ pub(crate) mod borrowck_error;
 pub(crate) mod borrowck_skipped;
 pub(crate) mod break_outside_of_loop;
 pub(crate) mod const_check_error;
+pub(crate) mod const_eval_failed;
 pub(crate) mod const_impure;
 pub(crate) mod const_pattern_refused;
 pub(crate) mod empty_range_pattern;
@@ -242,6 +244,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::TraitImplRedundantAssocItems(d) => {
             trait_impl_redundant_assoc_items::lower(cx, &d)
         }
+        AnyDiagnostic::TraitImplUnstableDefaultBody(d) => trait_impl_unstable_default_body::lower(cx, &d),
         AnyDiagnostic::UnimplementedBuiltinMacro(d) => unimplemented_builtin_macro::lower(cx, &d),
         AnyDiagnostic::UnresolvedExternCrate(d) => unresolved_extern_crate::lower(cx, &d),
         AnyDiagnostic::UnresolvedImport(d) => unresolved_import::lower(cx, &d),
@@ -322,6 +325,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::BorrowckSkipped(d) => borrowck_skipped::lower(cx, &d),
         AnyDiagnostic::BreakOutsideOfLoop(d) => break_outside_of_loop::lower(cx, &d),
         AnyDiagnostic::ConstCheckError(d) => const_check_error::lower(cx, &d),
+        AnyDiagnostic::ConstEvalFailed(d) => const_eval_failed::lower(cx, &d),
         AnyDiagnostic::ConstImpure(d) => const_impure::lower(cx, &d),
         AnyDiagnostic::ConstPatternRefused(d) => const_pattern_refused::lower(cx, &d),
         AnyDiagnostic::EmptyRangePattern(d) => empty_range_pattern::lower(cx, &d),

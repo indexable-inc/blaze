@@ -117,6 +117,8 @@ impl<'db> ConstVariableValue<'db> {
 
 impl<'db> UnifyValue for ConstVariableValue<'db> {
     type Error = NoError;
+    /// rustc's `order_roots` of `ConstVidKey`.
+    const OLDER_ROOT: bool = true;
 
     fn unify_values(value1: &Self, value2: &Self) -> Result<Self, Self::Error> {
         match (value1, value2) {

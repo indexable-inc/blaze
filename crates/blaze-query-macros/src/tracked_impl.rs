@@ -17,7 +17,7 @@ use crate::tracked_fn::{cfgs, db_param, output_type, refuse_modifiers, split_att
 
 pub(crate) fn expand(
     args: TokenStream,
-    item: ItemImpl,
+    item: &ItemImpl,
 ) -> Result<TokenStream, (syn::Error, TokenStream)> {
     let stripped = |item: &ItemImpl| {
         // clone: expansion time, the item given back with the attributes it can't keep
@@ -29,9 +29,9 @@ pub(crate) fn expand(
         }
         item.into_token_stream()
     };
-    match expand_in(args, &item) {
+    match expand_in(args, item) {
         Ok(tokens) => Ok(tokens),
-        Err(error) => Err((error, stripped(&item))),
+        Err(error) => Err((error, stripped(item))),
     }
 }
 

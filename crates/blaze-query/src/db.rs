@@ -14,6 +14,7 @@
 use std::{fmt, panic::UnwindSafe};
 
 mod capture;
+mod counts;
 mod dense;
 mod function;
 mod id;
@@ -257,8 +258,8 @@ pub fn par_map<R: Send>(count: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
 }
 
 /// The thread's query stack, carried with a job on a fiber across its waits.
-pub(crate) fn carried() -> blaze_graph::sched::fiber::Carried {
-    blaze_graph::sched::fiber::Carried { take: local::take, put: local::put }
+pub(crate) fn carried() -> blaze_graph::sched::Carried {
+    blaze_graph::sched::Carried { take: local::take, put: local::put }
 }
 
 /// Puts `db`'s storage where [`with_attached`] finds it (a `Debug` impl's database) while `f`

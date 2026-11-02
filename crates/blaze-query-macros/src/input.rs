@@ -12,9 +12,9 @@ use crate::{db, plumbing, structs};
 
 pub(crate) fn expand(
     args: TokenStream,
-    item: ItemStruct,
+    item: &ItemStruct,
 ) -> Result<TokenStream, (syn::Error, TokenStream)> {
-    expand_in(args, &item).map_err(|error| (error, structs::stripped(&item)))
+    expand_in(args, item).map_err(|error| (error, structs::stripped(item)))
 }
 
 fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {

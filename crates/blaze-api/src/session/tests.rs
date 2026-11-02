@@ -78,6 +78,7 @@ impl World {
             budget_bytes: 20,
             memory: counters,
             profile: dumped,
+            hot: hotted,
             history: None,
         };
         f(&mut self.session, &mut cx, &mut out);
@@ -488,6 +489,7 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             budget_bytes: 20,
             memory: counters,
             profile: dumped,
+            hot: hotted,
             history: None,
         };
         let from = to(2, id);
@@ -511,6 +513,43 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
 /// The flight recorder's dump as a test's daemon has it: the window's seconds, as text.
 fn dumped(window: std::time::Duration) -> Vec<u8> {
     window.as_secs().to_string().into_bytes()
+}
+
+/// The live sketches as a test's daemon has them: one key whose time is `top` ms since the
+/// start, and no last build.
+fn hotted(top: u32, since: crate::HotSince) -> Result<crate::Hot, ApiError> {
+    use crate::{Hot, HotFunction, HotKey, HotSince, HotWait, HotWaitKind};
+    if since == HotSince::LastBuild {
+        return Err(ApiError::new("no build has ended in this daemon", Some("blaze debug hot --last-build".to_owned())));
+    }
+    let ns = u64::from(top) * 1_000_000;
+    Ok(Hot {
+        keys: vec![HotKey {
+            span: "infer_query".to_owned(),
+            function: HotFunction::Named("app::main".to_owned()),
+            lower_ns: ns / 2,
+            upper_ns: ns,
+        }],
+        torn: 0,
+        since,
+        spans: 1,
+        waits: vec![HotWait { kind: HotWaitKind::Key, count: 1, max_ns: 9, p50_ns: 9, p90_ns: 9, p99_ns: 9 }],
+        error_ns: 0,
+        total_ns: ns,
+    })
+}
+
+/// A hot request is answered with the daemon's reading of its sketches, and its refusal (no
+/// last build yet) is the request's error.
+#[test]
+fn hot_is_the_daemons_sketches_and_their_refusal_is_its_error() {
+    let mut world = World::new();
+    let hot = world.request(1, 1, Request::Hot { top: 20, since: crate::HotSince::Start });
+    let Some(Reply { response: Response::Hot(hot), .. }) = hot.first() else { panic!("{hot:?}") };
+    assert_eq!((hot.keys.len(), hot.keys[0].upper_ns, hot.since), (1, 20_000_000, crate::HotSince::Start));
+    let refused = world.request(1, 2, Request::Hot { top: 20, since: crate::HotSince::LastBuild });
+    assert_eq!(error_at(&refused).as_deref(), Some("blaze debug hot --last-build"), "{refused:?}");
+    assert_eq!(refused.last(), Some(&done(1, 2, false)));
 }
 
 /// How many times [`counters`] was read: the parse tag hands out 3 MB between reads.
@@ -837,6 +876,7 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             budget_bytes: 20,
             memory: counters,
             profile: dumped,
+            hot: hotted,
             history: None,
         };
         let arrived = Arrived::Request { from: to(1, id), request: Request::Snapshot };
@@ -854,6 +894,7 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             budget_bytes: 20,
             memory: counters,
             profile: dumped,
+            hot: hotted,
             history: None,
         };
         blaze_alloc_count::assert_at_most(0, "a warm finish of a job", || {

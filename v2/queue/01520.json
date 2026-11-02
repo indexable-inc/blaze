@@ -1,0 +1,36 @@
+{
+  "id": "01520",
+  "from_lane": "fastcompile-macros",
+  "owner": "nameres-hello",
+  "paths": [
+    "crates/blaze-lower/src/lib.rs",
+    "crates/blaze-lower/src/const_macros.rs"
+  ],
+  "what": "## fastcompile-macros 12: a proc-macro crate's def map is never re-resolved once its macros are set: every serde derive is `MISSING_EXPANDER`\n\nRound 32 self-build (07:11 live tree, log /tmp/blaze-lanes/self-run-1101-072457PST.log): blaze-protocol's 26 `blaze can't expand derive macro Deserialize/Serialize: the proc-macro crate serde_derive (Crate(Id(54382))) loaded and exports no macro of this name`. The map has serde_derive's `Ok` list (hir-expand `proc_macro.rs` `missing`), yet its def map gave each derive `CustomProcMacroExpander::missing_expander()`.\n\nWhy, by reading: `crate_local_def_map` returns what the name-resolution maintainer published (`delta::published`), and the maintainer re-resolves published crates only on a crates note (`Db::note_crates_changed`, as `set_expand_builtin_derives` and `ProcMacrosBuilder::set_in_db` do). blaze-macro-eval's `load` reads serde_derive's def map (`run::functions`) before its list exists, so the maintainer publishes it with no list: every `export_proc_macro` gets `MISSING_EXPANDER`. Then `Lowered::macros` (blaze-lower `lib.rs` ~798) and `const_macros::set_macros` (~366) set `ProcMacros::by_crate` with no note, so that map is never redone. The fixture's `Fixture::set_proc_macros` does call `note_crates_changed`, which is why fixture tests don't see it.\n\nAsk: after each `set_by_crate` in blaze-lower, `db.note_crates_changed()` (or a narrower note naming the proc-macro crate, if the maintainer has one), and a test that fails without it: lower a proc-macro crate and a crate deriving from it, read the proc-macro crate's `crate_def_map` before `Lowered::macros` (as `load` does), then set its macros and check the dependent's derive expands (or the proc-macro crate's `ProcMacroLoc` expander is listed). Not run: lanes don't build.",
+  "state": "applied",
+  "created": "2026-11-01T15:32:58Z",
+  "updated": "2026-11-01T15:39:59Z",
+  "taken_by": "nameres-hello",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T15:32:58Z",
+      "by": "fastcompile-macros",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T15:33:12Z",
+      "by": "nameres-hello",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T15:39:59Z",
+      "by": "nameres-hello-next2",
+      "action": "done",
+      "note": "applied, not yet run: Note::ProcMacros(Crate) -> Written.proc_macros (base-db maintain.rs); hir_expand ProcMacros::give sets HIGH and notes, every set_by_crate caller ported (blaze-lower lib.rs, const_macros.rs, blaze-wasm-pack record.rs, hir-expand fixture.rs); nameres input::read re-checks a noted crate root group; test hir-def nameres::delta::tests::a_proc_macro_crate_given_its_macros_after_its_map_was_read_resolves_them_again"
+    }
+  ]
+}

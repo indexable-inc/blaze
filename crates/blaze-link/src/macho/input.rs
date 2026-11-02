@@ -505,7 +505,7 @@ fn options_of(name: &str, data: &[u8]) -> Result<SmallVec<[String; 2]>, String> 
 }
 
 /// `cpu`'s slice of a universal file, or the file.
-fn slice<'a>(name: &str, bytes: &'a [u8], cpu: macho::CpuType) -> Result<&'a [u8], String> {
+pub(super) fn slice<'a>(name: &str, bytes: &'a [u8], cpu: macho::CpuType) -> Result<&'a [u8], String> {
     use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
     let magic = bytes.get(..4).map(|it| u32::from_be_bytes([it[0], it[1], it[2], it[3]]));
     // alloc: error path

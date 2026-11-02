@@ -1,0 +1,24 @@
+{
+  "id": "01539",
+  "from_lane": "db",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/tests/lints/names/dead.rs",
+    "crates/blaze-diagnostics/src/tests/lints/names/items.rs"
+  ],
+  "what": "Two blaze-diagnostics test fixtures lack a lang item real core always has, and hir-ty (as rustc) then rejects the program; fix the fixtures, not hir-ty (from db, 01483 items 2 and 4). (1) tests::lints::names::dead::lint_dead_code_3 uses core: \"coerce_unsized\" only. `&self` is a dispatchable receiver only through `DispatchFromDyn` (hir-ty dyn_compatibility.rs:600, rustc receiver_is_dispatchable returns false without the lang item), so `inner::Trait` is not dyn compatible and `&1_isize` to `&dyn inner::Trait` is E0308. Use core: \"coerce_unsized, dispatch_from_dyn\". (2) tests::lints::names::items::runtime_symbols: FFI_STD (items.rs:49) has no `#[lang = \"va_list\"] pub struct VaList<'a>` in core::ffi, so the C-variadic `_: ...` of `bcmp` has no VaList type (hir-ty infer.rs resolve_va_list) and gets E0282. Add the lang item struct to FFI_STD.",
+  "state": "open",
+  "created": "2026-11-01T22:09:56Z",
+  "updated": "2026-11-01T22:09:56Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T22:09:56Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -23,7 +23,6 @@ mod env;
 mod files;
 mod random;
 pub(crate) mod target;
-mod thread;
 
 #[cfg(test)]
 mod tests;
@@ -286,13 +285,6 @@ impl<'a> Os<'a> {
         Some(Shim { call, target: Os::target_of(db, func.krate(db)) })
     }
 
-    /// The shim of the external function `symbol` called by code of `krate`, when one is
-    /// claimed: [`Os::claims`] of an `extern` block's function, for code compiled with its
-    /// externals named by symbol (the compiled tier's).
-    pub(crate) fn claims_extern(db: &Db, krate: base_db::Crate, symbol: &str) -> Option<Shim> {
-        Some(Shim { call: Call::of_extern(symbol)?, target: Os::target_of(db, krate) })
-    }
-
     fn target_of(db: &Db, krate: base_db::Crate) -> Option<Target> {
         match &krate.workspace_data(db).target {
             Ok(data) => Target::of_tuple(data.tuple.as_str()),
@@ -417,7 +409,7 @@ impl<'a> Os<'a> {
                 self.fstatat(t, g, ret, at, word(rest, 4)?, int(rest, 2)?, files::Form::Statx)
             }
             Sys::Getrandom => self.getrandom(g, ret, (word(rest, 0)?, word(rest, 1)?)),
-            Sys::Evaluator(_) => Ok(Answer::Evaluator),
+            Sys::Evaluator => Ok(Answer::Evaluator),
             Sys::Other(name) => {
                 let name = name.unwrap_or("one blaze has no name for");
                 // alloc: error path

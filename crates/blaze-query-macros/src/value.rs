@@ -94,7 +94,7 @@ enum Proof {
     Unconditional,
 }
 
-pub(crate) fn expand(input: syn::DeriveInput) -> syn::Result<TokenStream> {
+pub(crate) fn expand(input: &syn::DeriveInput) -> syn::Result<TokenStream> {
     let fields: Vec<&syn::Field> = match &input.data {
         // alloc: expansion time, once per annotated item; no query runs this
         syn::Data::Struct(data) => data.fields.iter().collect(),

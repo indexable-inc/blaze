@@ -49,7 +49,7 @@ impl<'db> IrPrint<ty::AliasTy<Self>> for DbInterner<'db> {
     }
 
     fn print_debug(t: &ty::AliasTy<Self>, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        crate::with_attached_db(|db| {
+        crate::next_solver::interner::fmt_with_attached_db(fmt, "AliasTy", |db, fmt| {
             print_alias(db, "AliasTy", alias_def_id(t.kind.into()), t.args, fmt)
         })
     }
@@ -61,7 +61,7 @@ impl<'db> IrPrint<ty::AliasTerm<Self>> for DbInterner<'db> {
     }
 
     fn print_debug(t: &ty::AliasTerm<Self>, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        crate::with_attached_db(|db| {
+        crate::next_solver::interner::fmt_with_attached_db(fmt, "AliasTerm", |db, fmt| {
             print_alias(db, "AliasTerm", alias_def_id(t.kind), t.args, fmt)
         })
     }
@@ -72,7 +72,7 @@ impl<'db> IrPrint<ty::TraitRef<Self>> for DbInterner<'db> {
     }
 
     fn print_debug(t: &ty::TraitRef<Self>, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        crate::with_attached_db(|db| {
+        crate::next_solver::interner::fmt_with_attached_db(fmt, "TraitRef", |db, fmt| {
             let trait_ = t.def_id.0;
             let self_ty = &t.args.as_slice()[0];
             let trait_args = &t.args.as_slice()[1..];
@@ -133,7 +133,7 @@ impl<'db> IrPrint<ty::ExistentialTraitRef<Self>> for DbInterner<'db> {
         t: &ty::ExistentialTraitRef<Self>,
         fmt: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
-        crate::with_attached_db(|db| {
+        crate::next_solver::interner::fmt_with_attached_db(fmt, "ExistentialTraitRef", |db, fmt| {
             let trait_ = t.def_id.0;
             write!(
                 fmt,
@@ -156,7 +156,7 @@ impl<'db> IrPrint<ty::ExistentialProjection<Self>> for DbInterner<'db> {
         t: &ty::ExistentialProjection<Self>,
         fmt: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
-        crate::with_attached_db(|db| {
+        crate::next_solver::interner::fmt_with_attached_db(fmt, "ExistentialProjection", |db, fmt| {
             fmt.write_str("ExistentialProjection(")?;
             print_alias(db, "", t.def_id.into(), t.args, fmt)?;
             write!(fmt, " -> {:?})", t.term)
@@ -175,7 +175,7 @@ impl<'db> IrPrint<ty::ProjectionClause<Self>> for DbInterner<'db> {
         t: &ty::ProjectionClause<Self>,
         fmt: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
-        crate::with_attached_db(|db| {
+        crate::next_solver::interner::fmt_with_attached_db(fmt, "ProjectionClause", |db, fmt| {
             fmt.write_str("ProjectionClause(")?;
             let def_id = alias_def_id(t.projection_term.kind);
             print_alias(db, "", def_id, t.projection_term.args, fmt)?;

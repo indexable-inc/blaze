@@ -66,21 +66,24 @@ too_many_arguments = "allow"
 type_complexity = "allow"
 wrong_self_convention = "allow"
 
-redundant_clone = "deny"
-clone_on_ref_ptr = "deny"
-implicit_clone = "deny"
-unnecessary_to_owned = "deny"
-inefficient_to_string = "deny"
-format_collect = "deny"
+redundant_clone = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+clone_on_ref_ptr = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+implicit_clone = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+unnecessary_to_owned = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+inefficient_to_string = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+format_collect = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
 needless_pass_by_value = "deny"
-large_types_passed_by_value = "deny"
-box_collection = "deny"
-vec_box = "deny"
-rc_buffer = "deny"
-large_enum_variant = "deny"
+large_types_passed_by_value = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+box_collection = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+vec_box = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+rc_buffer = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+large_enum_variant = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+# in `perf` (deny above): warn until their baselines are empty
+useless_vec = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+useless_borrows_in_formatting = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
 
 undocumented_unsafe_blocks = "deny"
-multiple_unsafe_ops_per_block = "deny"
+multiple_unsafe_ops_per_block = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
 
 dbg_macro = "warn"
 todo = "warn"

@@ -50,5 +50,11 @@ hegeltest.workspace = true
 name = "flights"
 harness = false
 
+# The pool's `Victims` (topology walk, two choices) at the ends of fan-out waves: wave time
+# against a perfect split, in us.
+[[bench]]
+name = "steal"
+harness = false
+
 [lints]
 workspace = true

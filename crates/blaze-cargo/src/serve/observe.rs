@@ -50,6 +50,62 @@ pub fn duckdb(value: Option<std::ffi::OsString>) -> Result<Option<PathBuf>, Stri
     }
 }
 
+/// `blaze debug hot`'s answer: the daemon's live sketches ([`blaze_profile::hot::read`]) in the
+/// API's terms.
+pub fn hot(top: u32, since: blaze_api::HotSince) -> Result<blaze_api::Hot, ApiError> {
+    use blaze_api::{HotFunction, HotKey, HotSince, HotWait, HotWaitKind};
+    use blaze_graph::wait::WaitKind;
+    use blaze_profile::hot;
+    let read = hot::read(top as usize, match since {
+        HotSince::Start => hot::Since::Start,
+        HotSince::LastBuild => hot::Since::LastBuild,
+    })
+    // alloc: error path
+    .map_err(|error| ApiError::new(error.to_string(), Some("blaze debug hot --last-build".to_owned())))?;
+    let keys = read
+        .keys
+        .into_iter()
+        .map(|it| HotKey {
+            span: it.span.to_owned(),  // alloc: the answer's copy, once a request
+            function: match it.function {
+                hot::Function::None => HotFunction::None,
+                hot::Function::Named(name) => HotFunction::Named(name.as_ref().to_owned()),  // alloc: as above
+                hot::Function::Forgotten(sym) => HotFunction::Forgotten(sym),
+            },
+            lower_ns: it.lower_ns,
+            upper_ns: it.upper_ns,
+        })
+        .collect();  // alloc: the answer's rows, once a request
+    let waits = read
+        .waits
+        .iter()
+        .map(|it| HotWait {
+            kind: match it.kind {
+                WaitKind::Key => HotWaitKind::Key,
+                WaitKind::Lock => HotWaitKind::Lock,
+                WaitKind::Channel => HotWaitKind::Channel,
+                WaitKind::Io => HotWaitKind::Io,
+                WaitKind::Child => HotWaitKind::Child,
+                WaitKind::Scope => HotWaitKind::Scope,
+            },
+            count: it.count,
+            max_ns: it.max_ns,
+            p50_ns: it.p50_ns,
+            p90_ns: it.p90_ns,
+            p99_ns: it.p99_ns,
+        })
+        .collect();  // alloc: the answer's rows, once a request
+    Ok(blaze_api::Hot {
+        keys,
+        torn: read.torn,
+        since,
+        spans: read.spans,
+        waits,
+        error_ns: read.error_ns,
+        total_ns: read.total_ns,
+    })
+}
+
 /// The profile history and the DuckDB that queries it, as `blaze serve` gives them to its
 /// daemon.
 pub struct Profiling {

@@ -1,0 +1,42 @@
+{
+  "id": "01524",
+  "from_lane": "no-fallback-link-native",
+  "owner": "no-fallback-link-native",
+  "paths": [
+    "crates/blaze-usercode",
+    "crates/blaze-cargo/src/sandbox"
+  ],
+  "what": "A build script that hangs (round 33: ring, zstd-sys spinning in cc's block_on sleep, see the codegen item from no-fallback-link-native) has no bound and no named wait: the daemon sits idle until coord's 300 s watchdog. Per rules every-wait-says-what and bounded-progress, a sandboxed run needs a bound (or progress check) that fails the one job with an error naming the script, its pid and how long it has run, and the daemon's wait on it should be named in its status. Stacks: /tmp/blaze-lanes/sandbox-hang/*.sample.",
+  "state": "applied",
+  "created": "2026-11-01T16:36:01Z",
+  "updated": "2026-11-01T17:32:54Z",
+  "taken_by": "no-fallback-link-native",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T16:36:01Z",
+      "by": "no-fallback-link-native",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T17:32:00Z",
+      "by": "coordinator",
+      "action": "reassign",
+      "note": "usercode has no live window; link-native diagnosed the round 33 hang and has the context"
+    },
+    {
+      "at": "2026-11-01T17:26:58Z",
+      "by": "no-fallback-link-native",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T17:32:54Z",
+      "by": "no-fallback-link-native",
+      "action": "done",
+      "note": "blaze-cargo serve/unit/script.rs: a sandboxed build-script run names its live record (confine::LIVE) at blaze-live beside OUT_DIR; Quiet looks at it every 15 s of driver timer (Effect::Timer then Effect::Stamp); 600 s with the stamp unchanged (no file, listing or variable read by the script or any program it started) kills the run (Effect::Kill) and fails it naming the package, the script path, the quiet and total seconds and the bound. A failed look is an error too. Late looks after the run ends are dropped. Tests: serve/unit/script/tests.rs a_run_whose_live_record_stays_as_it_is_is_stuck_and_one_that_reads_is_not, a_look_that_fails_or_ends_otherwise_is_an_error. Not bounded: runs outside the sandbox (BLAZE_SANDBOX=off, unsandboxed-build-scripts), which have no live record. ra 0 errors; uncompiled."
+    }
+  ]
+}

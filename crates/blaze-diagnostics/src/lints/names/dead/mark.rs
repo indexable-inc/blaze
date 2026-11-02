@@ -235,6 +235,14 @@ impl<'db> Mark<'_, '_, '_, 'db> {
             Id::Variant(_) | Id::Field(_) => return,
             _ => {}
         }
+        if let Parent::Def(impl_) = d.parent
+            && let Some(&name) = defs.trivial_derives.get(&impl_)
+        {
+            if let Some(adt) = defs.impl_of(impl_).and_then(|it| it.self_adt) {
+                self.ignore(adt, name);
+            }
+            return;
+        }
         let Some(ptr) = d.node else { return };
         let saved = (self.repr_all_live, self.repr_simd);
         self.repr_all_live = false;
@@ -358,10 +366,7 @@ impl<'db> Mark<'_, '_, '_, 'db> {
                     BuiltinDeriveImplTrait::Clone => "Clone",
                     _ => "Debug",
                 };
-                let ignored = self.live.ignored.entry(adt).or_default();
-                if !ignored.contains(&name) {
-                    ignored.push(name);
-                }
+                self.ignore(adt, name);
             }
             BuiltinDeriveImplTrait::PartialEq
             | BuiltinDeriveImplTrait::PartialOrd
@@ -396,6 +401,15 @@ impl<'db> Mark<'_, '_, '_, 'db> {
             | BuiltinDeriveImplTrait::CoerceUnsized
             | BuiltinDeriveImplTrait::DispatchFromDyn
             | BuiltinDeriveImplTrait::Reborrow => {}
+        }
+    }
+
+    /// `should_ignore_item` of a method of a derive of a `rustc_trivial_field_reads` trait: not
+    /// walked, the trait kept for `adt`'s note.
+    fn ignore(&mut self, adt: DefIdx, name: &'static str) {
+        let ignored = self.live.ignored.entry(adt).or_default();
+        if !ignored.contains(&name) {
+            ignored.push(name);
         }
     }
 

@@ -953,7 +953,7 @@ fn loops() {
     //- minicore: add, builtin_impls
     const GOAL: u8 = {
         'a: loop {
-            let x = 'b: loop {
+            let x: u8 = 'b: loop {
                 let x = 'c: loop {
                     let x = 'd: loop {
                         let x: u8 = 'e: loop {
@@ -2622,17 +2622,38 @@ fn static_written_by_a_static() {
 }
 
 #[test]
-fn extern_weak_statics() {
-    check_number(
+fn an_extern_static_is_not_read_at_compile_time() {
+    // rustc's `ExternStatic`: only the linked program has its value, weak or not.
+    check_fail(
         r#"
     //- minicore: sized
     extern "C" {
         #[linkage = "extern_weak"]
         static __dso_handle: *mut u8;
     }
-    const GOAL: usize = __dso_handle as usize;
+    const GOAL: usize = unsafe { __dso_handle } as usize;
     "#,
-        0,
+        |e| {
+            matches!(&e, ConstEvalError::MirEvalError(MirEvalError::NotSupported(it))
+                if it.contains("extern static `__dso_handle`"))
+        },
+    );
+}
+
+#[test]
+fn the_address_of_an_extern_static_is_known_at_compile_time() {
+    check_number(
+        r#"
+    //- minicore: sized
+    extern "C" {
+        static __dso_handle: *mut u8;
+    }
+    const GOAL: usize = {
+        let _at = &raw const __dso_handle;
+        1
+    };
+    "#,
+        1,
     );
 }
 
@@ -3623,7 +3644,7 @@ fn unsized_field() {
 }
 
 #[test]
-fn unsized_local() {
+fn an_unknown_type_in_a_constant_stops_its_lowering() {
     check_fail(
         r#"
     //- minicore: coerce_unsized, index, slice
@@ -3637,8 +3658,8 @@ fn unsized_local() {
         z[1]
     };
     "#,
-        // The temporary of the slice is lowered, as rustc's is; evaluating it fails.
-        |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::TypeIsUnsized(..))),
+        // rustc stops on the unknown type (E0412); nothing of `GOAL` is evaluated past it.
+        |e| matches!(e, ConstEvalError::MirLowerError(MirLowerError::HasErrors)),
     );
 }
 

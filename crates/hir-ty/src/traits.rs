@@ -19,7 +19,7 @@ use hir_def::{
 use hir_expand::name::Name;
 use intern::sym;
 use rustc_type_ir::{
-    TypeVisitableExt, TypingMode,
+    AliasTy, AliasTyKind, TypeVisitableExt, TypingMode,
     inherent::{BoundExistentialPredicates, IntoKind, Ty as _},
 };
 
@@ -440,11 +440,17 @@ fn inherent_impl_coherent(
     krate: Crate,
     rustc_coherence_is_core: bool,
 ) -> bool {
-    let self_ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
+    let mut self_ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
+    // rustc's `InherentCollect::check_item`: a pattern type is taken as its base.
+    while let TyKind::Pat(base, _) = self_ty.kind() {
+        self_ty = base;
+    }
     let self_ty = self_ty.kind();
     let impl_allowed = match self_ty {
         TyKind::Tuple(_)
         | TyKind::FnDef(_, _)
+        | TyKind::FnPtr(..)
+        | TyKind::UnsafeBinder(_)
         | TyKind::Array(_, _)
         | TyKind::Never
         | TyKind::RawPtr(_, _)
@@ -461,6 +467,18 @@ fn inherent_impl_coherent(
         TyKind::Dynamic(it, _) => {
             it.principal_def_id().is_some_and(|trait_id| trait_id.0.module(db).krate(db) == krate)
         }
+        // rustc's `InherentNominal` (E0118): no type to hang the impl on, in any crate.
+        TyKind::Param(_)
+        | TyKind::Alias(
+            _,
+            AliasTy {
+                kind:
+                    AliasTyKind::Projection { .. }
+                    | AliasTyKind::Inherent { .. }
+                    | AliasTyKind::Opaque { .. },
+                ..
+            },
+        ) => false,
 
         _ => true,
     };
@@ -468,6 +486,8 @@ fn inherent_impl_coherent(
         let rustc_has_incoherent_inherent_impls = match self_ty {
             TyKind::Tuple(_)
             | TyKind::FnDef(_, _)
+            | TyKind::FnPtr(..)
+            | TyKind::UnsafeBinder(_)
             | TyKind::Array(_, _)
             | TyKind::Never
             | TyKind::RawPtr(_, _)

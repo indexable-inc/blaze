@@ -57,6 +57,9 @@ pub struct Daemon<'a> {
     /// The flight recorder's Chrome trace of the last given time, for [`Response::Profiled`]:
     /// `blaze_profile::flight::dump` in the daemon.
     pub profile: fn(std::time::Duration) -> Vec<u8>,
+    /// The live sketches' top keys and wait quantiles, for [`Response::Hot`]: the daemon's
+    /// reading of `blaze_profile::hot::read`.
+    pub hot: fn(u32, crate::HotSince) -> Result<crate::Hot, ApiError>,
     /// The profile history's last error, for [`Status::history`].
     pub history: Option<&'a str>,
 }
@@ -735,6 +738,10 @@ impl Session {
             Request::Profile { seconds } => {
                 let trace = (cx.profile)(std::time::Duration::from_secs(u64::from(seconds)));
                 answer(out, req, Response::Profiled { trace });
+            }
+            Request::Hot { top, since } => {
+                let hot = (cx.hot)(top, since)?;
+                answer(out, req, Response::Hot(hot));
             }
             Request::Explore { .. } | Request::Live | Request::Sql { .. } => {
                 return Err(ApiError::new(

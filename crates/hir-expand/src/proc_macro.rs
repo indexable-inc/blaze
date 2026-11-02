@@ -204,6 +204,23 @@ impl ProcMacros {
     pub fn init_default(db: &mut Db, durability: Durability) {
         _ = Self::builder(Default::default()).durability(durability).new(db);
     }
+
+    /// Gives each crate of `given` its proc macros (or why it has none) in place of those it
+    /// had, as loading its dylib does, and notes it ([`Db::note_proc_macros`]): the one way to
+    /// change a crate's list once the crate graph is set. A crate's def map lists its proc
+    /// macros' expanders, so one resolved before its list was given must resolve again, and a
+    /// set that is not noted leaves it naming none.
+    pub fn give(db: &mut Db, given: impl IntoIterator<Item = (Crate, ProcMacroLoadResult)>) {
+        db.batch(|db| {
+            let all = ProcMacros::try_get(db).unwrap_or_else(|| ProcMacros::new(db, Default::default()));
+            let mut by_crate = all.by_crate(db).clone();
+            for (krate, macros) in given {
+                by_crate.insert(krate, Arc::new(CrateProcMacros::new(macros))); // alloc: once per crate, when its proc macros are loaded
+                db.note_proc_macros(krate);
+            }
+            all.set_by_crate(db).with_durability(Durability::HIGH).to(by_crate);
+        });
+    }
 }
 
 #[blaze_query::tracked]
@@ -517,13 +534,7 @@ mod tests {
     }
 
     fn set(db: &mut Db, krate: Crate, macros: ProcMacroLoadResult) {
-        let mut map = HashMap::default();
-        map.insert(krate, Arc::new(CrateProcMacros::new(macros)));
-        ProcMacros::try_get(db)
-            .unwrap_or_else(|| ProcMacros::new(db, Default::default()))
-            .set_by_crate(db)
-            .with_durability(Durability::HIGH)
-            .to(map);
+        ProcMacros::give(db, [(krate, macros)]);
     }
 
     #[test]

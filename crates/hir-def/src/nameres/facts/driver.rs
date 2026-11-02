@@ -39,7 +39,7 @@ use super::{
     env::{ChildMode, ChildRequest, CrateEnv, SideTables, SideTablesIn, Sink},
     graph::{ImportShape, ShapeImport, ShapeModule},
     macros, map_in,
-    ops::{DeclOp, DeriveHelper, ImportOp, ImportSource, MacroOp, OpLog},
+    ops::{DeclOp, DeriveHelper, ImportOp, ImportSource, MacroOp, MacroOpKind, OpLog},
     queries::{
         self, CrateEnvKey, FactKey, ModuleRound, ModuleRow, NO_ROUND, RoundKey, RoundKind,
         RoundModules, RoundOutcome, SccKey, SccState, Scope,
@@ -50,6 +50,55 @@ use super::{
 
 /// The old loop's bound on expansion rounds (`collector::FIXED_POINT_LIMIT`).
 pub(crate) const FIXED_POINT_LIMIT: u32 = 8192;
+
+/// The error of a resolution of `krate` (a block's when `block`) that passed
+/// [`FIXED_POINT_LIMIT`] after `rounds`, naming what was still pending: `macros`, and the
+/// `imports` that had not resolved.
+pub(crate) fn fixpoint_limit<'a>(
+    db: &Db,
+    krate: Crate,
+    block: bool,
+    rounds: u32,
+    macros: impl Iterator<Item = &'a MacroOp>,
+    imports: impl Iterator<Item = &'a ImportOp>,
+) -> crate::nameres::FixpointLimit {
+    use crate::nameres::FixpointLimit;
+    let edition = span::Edition::LATEST;
+    let module = |it: ModuleId| match it.name(db) {
+        Some(name) => format!("module `{}`", name.display(db, edition)), // alloc: an error's text, once
+        None => "the crate root".to_owned(),                             // alloc: as above
+    };
+    let mut first = Vec::new(); // alloc: an error's list, once
+    let mut pending_macros = 0;
+    for op in macros {
+        pending_macros += 1;
+        if first.len() < FixpointLimit::LISTED {
+            let path = match &op.kind {
+                MacroOpKind::FnLike { ast_id, .. } => &ast_id.path,
+                MacroOpKind::Derive { ast_id, .. } => &ast_id.path,
+                MacroOpKind::Attr { attr, .. } => &attr.path,
+            };
+            first.push(format!("macro `{}` in {}", path.display(db, edition), module(op.module))); // alloc: as above
+        }
+    }
+    let mut pending_imports = 0;
+    for op in imports {
+        pending_imports += 1;
+        if first.len() < 2 * FixpointLimit::LISTED {
+            first.push(format!("import `{}` in {}", op.path.display(db, edition), module(op.module))); // alloc: as above
+        }
+    }
+    FixpointLimit {
+        krate,
+        // alloc: an error's crate name, once
+        name: krate.extra_data(db).display_name.as_ref().map(|it| it.crate_name().to_string()),
+        block,
+        rounds,
+        pending_macros,
+        pending_imports,
+        first,
+    }
+}
 
 // The round queries.
 
@@ -574,7 +623,12 @@ pub(crate) fn round_kind(db: &Db, round: RoundKey) -> RoundKind {
     let outcome = queries::round_progress(db, previous);
     if outcome.progress {
         if r > FIXED_POINT_LIMIT {
-            panic!("name resolution of {krate:?} still made progress after {FIXED_POINT_LIMIT} rounds");
+            let modules = queries::round_modules(db, previous);
+            let pending = modules.stepping().flat_map(|at| {
+                let key = FactKey::new(db, modules.order[at as usize], krate, r - 1);
+                queries::macro_step(db, key).pending.iter()
+            });
+            fixpoint_limit(db, krate, false, r, pending, std::iter::empty()).throw();
         }
         return RoundKind::Normal;
     }
@@ -1107,9 +1161,8 @@ pub(crate) fn collect_block<'db>(
             eager_with_errors = false;
             rounds += 1;
             if rounds > FIXED_POINT_LIMIT {
-                panic!(
-                    "name resolution of a block of {krate:?} still made progress after {FIXED_POINT_LIMIT} rounds"
-                );
+                let imports = sink.unit.import_outcomes().filter(|(_, it)| it.is_none()).map(|(it, _)| it);
+                fixpoint_limit(db, krate, true, rounds, pending.iter(), imports).throw();
             }
         }
         let Some(index) = macros::first_attr(&pending) else { break 'resolve_attr };
@@ -1331,6 +1384,34 @@ crate::make!();
             [RoundKind::Normal, RoundKind::Normal, RoundKind::Final]
         );
         assert_same_as_old("round_kinds_progress", fixture);
+    }
+
+    /// The round count of a macro chain behind a glob: the call the expansion makes resolves
+    /// there and expands within the same round, so one round resolves the whole chain and the
+    /// next finds nothing, never a round rescheduled with nothing pending.
+    #[test]
+    fn round_kinds_of_a_macro_chain_through_a_glob() {
+        let fixture = r#"
+//- /lib.rs
+mod a {
+    #[macro_export]
+    macro_rules! outer { () => { $crate::inner!(); } }
+    #[macro_export]
+    macro_rules! inner { () => { pub struct Made; } }
+}
+mod b {
+    pub use crate::*;
+}
+use b::Made;
+outer!();
+"#;
+        let db = fixture_db(fixture);
+        let krate = db.fetch_test_crate();
+        assert_eq!(round_kinds(&db, krate), [RoundKind::Normal, RoundKind::Normal, RoundKind::Final]);
+        let def_map = crate_local_def_map(&db, krate).def_map(&db);
+        let scope = def_map.module(&db, def_map.root).scope(&db);
+        assert_ne!(scope.get(&Name::new_root("Made")), PerNs::none(), "`Made` through the glob");
+        assert_same_as_old("round_kinds_of_a_macro_chain_through_a_glob", fixture);
     }
 
     #[test]

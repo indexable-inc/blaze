@@ -1,6 +1,6 @@
 //! Wrappers over [`make`] constructors
 
-#![allow(clippy::needless_pass_by_value, reason = "rust-analyzer's builder API takes owned nodes; it goes with the handles")]
+#![expect(clippy::needless_pass_by_value, reason = "rust-analyzer's owned-node builder API; goes with the handles as format moves to views")]
 
 use either::Either;
 

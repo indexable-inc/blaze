@@ -14,15 +14,20 @@
 //! [`os`]: crate::os
 //! [`protocol`]: crate::protocol
 
-use std::cell::RefCell;
+use std::{
+    cell::RefCell,
+    time::{Duration, Instant},
+};
 
 use base_db::{ConstEvalBudget, Crate, CrateOrigin, Db, Env};
 use blaze_hash::HashMap;
+use blaze_profile::span::{Ending, MacroExpand, MacroExpanded, Name as SpanName, Outcome};
 use hir_def::{AssocItemId, FunctionId, HasModule, ModuleDefId, StaticId, nameres::crate_def_map};
 use hir_expand::name::Name;
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
     db::HirDatabase,
+    mir::Budget,
     next_solver::{DbInterner, GenericArg, GenericArgs, Region, RegionExt, SolverDefId, Ty},
 };
 use hir_ty_mir::mir::{
@@ -37,12 +42,24 @@ use crate::{
     os::{Answer, Os, Shim},
     server::{Emitted, Server},
     stream::Stream,
-    tier::{self, Tier},
+    wire::Width,
 };
 
-/// What a macro's expansion may use of the evaluator's memory, stack and heap together: what
-/// a wasm32 engine gives a module.
-pub(crate) const MEMORY: u64 = 1 << 32;
+/// What a macro's expansion may use of the evaluator's memory, stack and heap together. A
+/// derive of serde's size uses tens of megabytes natively; the evaluator's buffers may hold
+/// twice what they use, so one expansion holds at most 2 GiB of the daemon's.
+pub(crate) const MEMORY: u64 = 1 << 30;
+
+/// The steps (basic blocks run) one expansion may take on the evaluator before it stops,
+/// naming the macro and where it was: a macro that loops ends in an error, not a stalled
+/// build. Each expansion of a run, the session's earlier calls run again included, has its own.
+/// A derive of serde's size runs a few million basic blocks natively: this is ten to a hundred
+/// times that, and minutes of the evaluator at most.
+pub(crate) const STEPS: u64 = 1 << 27;
+
+/// The `usize` of the evaluated client: the shims model only 64-bit targets (`os/target.rs`),
+/// and [`State::word`] is the same eight bytes.
+const WIDTH: Width = Width::W64;
 
 /// The functions of the `proc_macro` crate a run calls or claims.
 #[derive(Clone, Copy, Debug)]
@@ -122,6 +139,69 @@ pub(crate) struct Ran {
     pub(crate) statics: Vec<(StaticId, Vec<u8>, bool)>,
 }
 
+/// What a run spent on the evaluator, read from it whether the run ended or stopped: what the
+/// run's `macro expand` span says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Spent {
+    /// Whether it ran on the evaluator: a compiled run counts no steps.
+    pub(crate) evaluated: bool,
+    /// Basic blocks run, over every expansion of the run (the session's earlier calls too).
+    pub(crate) steps: u64,
+    /// The most bytes of stack and heap the evaluator held at once.
+    pub(crate) peak_bytes: u64,
+    /// The budget that stopped it, when one did.
+    pub(crate) over: Option<Over>,
+}
+
+/// A budget of [`STEPS`] or [`MEMORY`] that stopped a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Over {
+    Steps,
+    Memory,
+}
+
+/// How a run ended, as its span's `outcome` says it.
+pub(crate) fn outcome_of(ran: &Result<Ran, Stop>, spent: &Spent) -> Outcome {
+    match (ran, spent.over) {
+        (Ok(ran), _) if ran.output.is_err() => Outcome::Panic,
+        (Ok(_), _) => Outcome::Ok,
+        (Err(_), Some(Over::Steps)) => Outcome::StepLimit,
+        (Err(_), Some(Over::Memory)) => Outcome::MemoryLimit,
+        (Err(_), None) => Outcome::Error,
+    }
+}
+
+/// Opens and enters the span of one run of a macro, `macro expand`: its `function` the
+/// macro's path (`serde_derive::Serialize`), its `crate` the crate the call is in. [`ran_on`]
+/// says what the run spent and how it ended, and closes it.
+pub(crate) fn expand_span(path: &str, calling: &str) -> Ending<MacroExpanded> {
+    MacroExpand { path: SpanName::of(path), krate: SpanName::of(calling) }.open()
+}
+
+/// Closes `span`, an [`expand_span`], with what its run spent and how it ended: steps and peak
+/// bytes only for a run on the evaluator.
+pub(crate) fn ran_on(span: Ending<MacroExpanded>, spent: &Spent, ran: &Result<Ran, Stop>) {
+    let evaluated = |it: u64| spent.evaluated.then_some(it);
+    span.ended(MacroExpanded {
+        steps: evaluated(spent.steps),
+        peak_bytes: evaluated(spent.peak_bytes),
+        outcome: outcome_of(ran, spent),
+    });
+}
+
+/// The budget that stopped the evaluation `error` ended it in, under the frames it unwound.
+pub(crate) fn over_budget(error: &MirEvalError<'_>) -> Option<Over> {
+    let mut leaf = error;
+    while let MirEvalError::InFunction(inner, _) = leaf {
+        leaf = inner;
+    }
+    match leaf {
+        MirEvalError::OverBudget { spent: Budget::Steps(_), .. } => Some(Over::Steps),
+        MirEvalError::OverBudget { spent: Budget::Memory(_), .. } => Some(Over::Memory),
+        _ => None,
+    }
+}
+
 /// The state the claimed calls share with the run that set them: outside the evaluator, so
 /// the run reads it back once the evaluator is done.
 struct State<'e> {
@@ -135,11 +215,19 @@ struct State<'e> {
     word: usize,
 }
 
+/// How often a run on the evaluator says it is still running.
+const PROGRESS: Duration = Duration::from_secs(10);
+
 /// The evaluator's embedder for one run.
 struct Host<'r, 'e> {
     db: &'r Db,
     closure_call: FunctionId,
     state: &'r RefCell<State<'e>>,
+    /// The macro and the crate calling it, as the run's progress lines name them.
+    what: &'r str,
+    started: Instant,
+    /// When the run next says it is still running.
+    next: Instant,
 }
 
 /// The evaluator's memory as a shim reaches it.
@@ -259,6 +347,15 @@ impl<'db, 'r: 'db, 'e: 'db> Foreign<'db> for Host<'r, 'e> {
         args: &[&[u8]],
         ret: &mut [u8],
     ) -> Result<Claimed, MirEvalError<'db>> {
+        // The evaluator gives the run back only at its claimed calls (the bridge's dispatch,
+        // the shims), which a macro makes for each token it reads or writes.
+        let now = Instant::now();
+        if now >= self.next {
+            self.next = now + PROGRESS;
+            let secs = now.duration_since(self.started).as_secs();
+            let steps = eval.steps_spent();
+            eprintln!("blaze serve: {} has run {secs} s on the evaluator, {steps} steps into its expansion", self.what);
+        }
         let result = if func == self.closure_call {
             self.dispatch(eval, args, ret).map(|()| Claimed::Answered)
         } else {
@@ -288,34 +385,34 @@ pub(crate) fn of_sysroot(db: &Db, st: StaticId) -> bool {
 /// Runs `expansions` in order on one evaluator, each with its own server as rustc gives each
 /// expansion its own handles, starting from the statics `preset`: what the last gave, and
 /// what all of them did. The ones before the last are the session's earlier calls, run again
-/// for the state they leave.
+/// for the state they leave. What the evaluator spent goes in `spent`, however the run ends.
 pub(crate) fn run(
     db: &Db,
+    what: &str,
     bridge: &Bridge,
-    code: blaze_ids::ContentId,
-    runs: u64,
     env: &Env,
     preset: &[(StaticId, Vec<u8>)],
     expansions: &[Expansion<'_>],
+    spent: &mut Spent,
 ) -> Result<Ran, Stop> {
-    match tier::choose(code, runs) {
-        Tier::Evaluator => evaluate(db, bridge, env, preset, expansions),
-        Tier::Compiled => tier::run(db, bridge, code, env, preset, expansions),
-    }
+    evaluate(db, what, bridge, env, preset, expansions, spent)
 }
 
 fn evaluate(
     db: &Db,
+    what: &str,
     bridge: &Bridge,
     env: &Env,
     preset: &[(StaticId, Vec<u8>)],
     expansions: &[Expansion<'_>],
+    spent: &mut Spent,
 ) -> Result<Ran, Stop> {
+    spent.evaluated = true;
     let Some(last) = expansions.last() else {
         return Err(Stop("was given nothing to expand".to_owned())); // alloc: error path
     };
     let state = RefCell::new(State {
-        server: Server::new(last.sites, last.edition, last.forced_keywords),
+        server: Server::new(last.sites, last.edition, last.forced_keywords, WIDTH),
         os: Os::new(env),
         shims: HashMap::default(),
         stop: None,
@@ -324,7 +421,10 @@ fn evaluate(
         word: 8,
     });
     // The evaluator's error borrows the state; made a `Stop` before the state is taken back.
-    let output = on_evaluator(db, bridge, &state, preset, expansions).map_err(|e| stop_of(db, e));
+    let output = on_evaluator(db, what, bridge, &state, preset, expansions, spent).map_err(|e| {
+        spent.over = over_budget(&e);
+        stop_of(db, e)
+    });
     let state = state.into_inner();
     let (output, statics) = match (output, state.stop) {
         (Ok(it), _) => it,
@@ -345,21 +445,28 @@ fn evaluate(
     })
 }
 
+/// What a run gave on the evaluator: the last expansion's output, and the statics it changed.
+type Evaluated = (Result<Stream, String>, Vec<(StaticId, Vec<u8>, bool)>);
+
 /// The evaluator's part of [`evaluate`], borrowing the state for as long as the evaluator
-/// lives.
+/// lives. What the evaluator spent goes in `spent` once its expansions end or stop.
+#[allow(clippy::too_many_arguments)]
 fn on_evaluator<'db>(
     db: &'db Db,
+    what: &'db str,
     bridge: &Bridge,
     state: &'db RefCell<State<'_>>,
     preset: &[(StaticId, Vec<u8>)],
     expansions: &[Expansion<'_>],
-) -> Result<(Result<Stream, String>, Vec<(StaticId, Vec<u8>, bool)>), MirEvalError<'db>> {
+    spent: &mut Spent,
+) -> Result<Evaluated, MirEvalError<'db>> {
     let first = expansions[0].function;
     let krate = first.module(db).krate(db);
     let env = ParamEnvAndCrate { param_env: db.trait_environment(first.into()), krate };
     let owner: InferBodyId<'db> = first.into();
     let mut eval = Evaluator::new(db, owner, Some(env))?;
-    eval.set_budget(ConstEvalBudget { steps: u64::MAX, memory: MEMORY });
+    let budget = ConstEvalBudget { steps: STEPS, memory: MEMORY };
+    eval.set_budget(budget);
     if let Some(checks) = hir_ty_mir::mir::overflow::crate_checks_overflow(db, krate) {
         eval.set_inherited_overflow_checks(checks);
     }
@@ -367,19 +474,43 @@ fn on_evaluator<'db>(
     for (id, bytes) in preset {
         eval.preset_static(*id, bytes);
     }
-    eval.set_foreign(Some(Box::new(Host { db, closure_call: bridge.closure_call, state }))); // alloc: once per run, the evaluator's embedder
+    let started = Instant::now();
+    let host = Host { db, closure_call: bridge.closure_call, state, what, started, next: started + PROGRESS };
+    eval.set_foreign(Some(Box::new(host))); // alloc: once per run, the evaluator's embedder
     let interner = DbInterner::new_with(db, krate);
     let call_args = GenericArgs::for_item(interner, SolverDefId::FunctionId(bridge.closure_call), |_, _, _, _| {
         GenericArg::from(Region::new_erased(interner))
     });
     let dispatch = eval.fn_pointer(bridge.closure_call, call_args)?;
+    let ran = expand_all(db, bridge, state, &mut eval, interner, &dispatch, budget, expansions, spent);
+    spent.steps += eval.steps_spent();
+    spent.peak_bytes = eval.memory_peak();
+    ran
+}
+
+/// [`on_evaluator`]'s expansions, in order, on `eval`; the steps of each but the last go in
+/// `spent` as the next one's budget replaces them.
+#[allow(clippy::too_many_arguments)]
+fn expand_all<'db>(
+    db: &'db Db,
+    bridge: &Bridge,
+    state: &'db RefCell<State<'_>>,
+    eval: &mut Evaluator<'db>,
+    interner: DbInterner<'db>,
+    dispatch: &[u8],
+    budget: ConstEvalBudget,
+    expansions: &[Expansion<'_>],
+    spent: &mut Spent,
+) -> Result<Evaluated, MirEvalError<'db>> {
     let mut output = Ok(Stream::default());
     // alloc: once per run, the input's and the config's bytes
     let mut input = Vec::new();
     let mut config = Vec::new(); // alloc: once per run, as above
     for (at, expansion) in expansions.iter().enumerate() {
         if at > 0 {
-            state.borrow_mut().server = Server::new(expansion.sites, expansion.edition, expansion.forced_keywords);
+            state.borrow_mut().server = Server::new(expansion.sites, expansion.edition, expansion.forced_keywords, WIDTH);
+            spent.steps += eval.steps_spent();
+            eval.set_budget(budget);
         }
         let expand = if expansion.attr { bridge.expand2 } else { bridge.expand1 };
         let macro_fn = Ty::new_fn_def(
@@ -405,13 +536,13 @@ fn on_evaluator<'db>(
             state.word = word;
             state.server.input(expansion.inputs, &mut input);
         }
-        if let Err(stop) = fill(db, &mut eval, &mut buffer, word, &input) {
+        if let Err(stop) = fill(db, eval, &mut buffer, word, &input) {
             state.borrow_mut().stop.get_or_insert(stop);
             return Err(MirEvalError::MachineStop);
         }
         config.clear();
         config.extend_from_slice(&buffer);
-        config.extend_from_slice(&dispatch);
+        config.extend_from_slice(dispatch);
         config.extend_from_slice(&[0; 8][..word]);
         // `force_show_panics: false`, then the padding to the config's alignment.
         config.resize(config.len() + word, 0);

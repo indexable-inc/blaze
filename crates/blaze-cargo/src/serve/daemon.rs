@@ -181,6 +181,7 @@ macro_rules! cx {
             budget_bytes: $daemon.plane.budget().map_or(0, |it| it.bytes),
             memory: blaze_mem::tag::snapshot,
             profile: blaze_profile::flight::dump,
+            hot: crate::serve::observe::hot,
             history: $daemon.observe.history_error(),
         }
     };

@@ -39,8 +39,6 @@ pub(crate) enum Errno {
     Range,
     Nametoolong,
     Loop,
-    /// A `futex` wait whose word no longer holds the value.
-    Again,
 }
 
 /// What a file is, as a `stat` and a `dirent` say it.
@@ -223,16 +221,10 @@ pub(crate) struct AtFlags {
 pub(crate) enum Sys {
     Statx,
     Getrandom,
-    /// One the evaluator's thread shims answer, and the compiled tier's.
-    Evaluator(Thread),
+    /// One the evaluator's thread shims answer (`futex`, `gettid`).
+    Evaluator,
     /// Any other, by its name when it has a known one.
     Other(Option<&'static str>),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Thread {
-    Futex,
-    Gettid,
 }
 
 impl Target {
@@ -287,8 +279,6 @@ impl Target {
             Errno::Nametoolong => 36,
             Errno::Loop if apple => 62,
             Errno::Loop => 40,
-            Errno::Again if apple => 35,
-            Errno::Again => 11,
         }
     }
 
@@ -401,8 +391,7 @@ impl Target {
         match number {
             _ if number == numbers.statx => Sys::Statx,
             _ if number == numbers.getrandom => Sys::Getrandom,
-            _ if number == numbers.futex => Sys::Evaluator(Thread::Futex),
-            _ if number == numbers.gettid => Sys::Evaluator(Thread::Gettid),
+            _ if number == numbers.futex || number == numbers.gettid => Sys::Evaluator,
             _ => Sys::Other(numbers.names.iter().find(|it| it.0 == number).map(|it| it.1)),
         }
     }

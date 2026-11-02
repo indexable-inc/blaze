@@ -31,6 +31,7 @@ use crate::{
         },
         inspect::{InspectConfig, InspectGoal, ProofTreeVisitor},
         obligation_ctxt::ObligationCtxt,
+        recycle,
     },
     solver_errors::SolverDiagnostic,
     traits::ParamEnvAndCrate,
@@ -482,8 +483,9 @@ impl<'db> InferenceTable<'db> {
     }
 
     pub(crate) fn register_infer_ok<T>(&mut self, infer_ok: InferOk<'db, T>) -> T {
-        let InferOk { value, obligations } = infer_ok;
-        self.register_predicates(obligations);
+        let InferOk { value, mut obligations } = infer_ok;
+        self.register_predicates(obligations.drain(..));
+        recycle::give_obligations(obligations);
         value
     }
 

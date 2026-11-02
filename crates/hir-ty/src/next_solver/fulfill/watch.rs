@@ -336,18 +336,33 @@ impl<'db> FulfillmentCtxt<'db> {
         &mut self,
         infcx: &InferCtxt<'db>,
     ) -> Vec<NextSolverError<'db>> {
+        let mut errors = Vec::new(); // alloc: empty unless a goal fails
+        self.try_evaluate_obligations_with(infcx, &mut |error| errors.push(error));
+        errors
+    }
+
+    /// [`Self::try_evaluate_obligations`] handing each error to `on_error` as it is found, for
+    /// a caller that needs only a verdict or keeps the errors elsewhere; whether there was one.
+    pub(crate) fn try_evaluate_obligations_with(
+        &mut self,
+        infcx: &InferCtxt<'db>,
+        on_error: &mut impl FnMut(NextSolverError<'db>),
+    ) -> bool {
         assert_eq!(self.usable_in_snapshot, infcx.num_open_snapshots());
         if self.fixpoint == Some(infcx.state_changes()) {
-            return Vec::new(); // alloc: empty
+            return false;
         }
         self.fixpoint = None;
         #[cfg(test)]
         if tests::old_rounds() {
-            return self.try_evaluate_obligations_old(infcx);
+            let errors = self.try_evaluate_obligations_old(infcx);
+            let any = !errors.is_empty();
+            errors.into_iter().for_each(&mut *on_error);
+            return any;
         }
         let delegate = <&SolverContext<'db>>::from(infcx);
         let recursion_limit = infcx.interner.recursion_limit();
-        let mut errors = Vec::new(); // alloc: empty unless a goal fails
+        let mut any = false;
         let mut overflowed = false;
         let pending = &mut self.pending;
         pending.watches.admit(pending.len());
@@ -386,7 +401,8 @@ impl<'db> FulfillmentCtxt<'db> {
                 let GoalEvaluation { goal, certainty, has_changed, stalled_on } = match result {
                     Ok(result) => result,
                     Err(NoSolution) => {
-                        errors.push(NextSolverError::TrueError(obligation));
+                        any = true;
+                        on_error(NextSolverError::TrueError(obligation));
                         pending.watches.finish(at);
                         continue;
                     }
@@ -401,7 +417,8 @@ impl<'db> FulfillmentCtxt<'db> {
                     if obligation.recursion_depth as usize > recursion_limit {
                         // We limit the total count of inference progress to avoid hangs, and
                         // don't try to recover from this, as rustc doesn't.
-                        errors.push(NextSolverError::Overflow(obligation));
+                        any = true;
+                        on_error(NextSolverError::Overflow(obligation));
                         pending.watches.finish(at);
                         overflowed = true;
                         break;
@@ -436,7 +453,7 @@ impl<'db> FulfillmentCtxt<'db> {
         } else if watches.linked > 2 * watches.keys + 64 {
             pending.rewatch();
         }
-        errors
+        any
     }
 }
 

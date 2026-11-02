@@ -31,8 +31,25 @@ resolver = "2"
 [workspace.metadata.blaze]
 experimental = ["sandboxed-tests"]
 
+# blaze-lints' own lints (AGENTS.md rules 3, 9, 11, 13-15, 20, 22). Each is `warn` until its
+# count in crates/blaze-lints/baselines/ reaches zero, then `deny`. The other `hot_*` lints are
+# set by the hot crates that opt in. Here, not in `[workspace.lints]`: cargo hands that to rustc, which
+# refuses the tool `blaze` (E0602).
 [workspace.metadata.blaze.lints]
 hot_alloc = "warn"
+fiber_boundary = "warn"
+held_across_wait = "warn"
+lock_across_query = "warn"
+error_debug = "warn"
+blocking_on_pool = "warn"
+shared_collection_lock = "warn"
+open_wait_loop = "warn"
+unnamed_wait = "warn"
+wall_clock = "warn"
+std_hashmap = "warn"
+dropped_error = "warn"
+untyped_error = "warn"
+hash_order_output = "warn"
 
 # llvm-sys's build script (vendor/llvm-sys/pin.rs) checks the pinned LLVM `nix develop` names.
 [workspace.metadata.blaze.sandbox]
@@ -160,6 +177,7 @@ blaze-hashcons = { path = "crates/blaze-hashcons" }
 blaze-history = { path = "crates/blaze-history" }
 blaze-inproc = { path = "crates/blaze-inproc" }
 blaze-intent = { path = "crates/blaze-intent" }
+blaze-lints = { path = "crates/blaze-lints" }
 blaze-lazy = { path = "crates/blaze-lazy" }
 blaze-stencil = { path = "crates/blaze-stencil" }
 blaze-testsel = { path = "crates/blaze-testsel" }
@@ -226,6 +244,13 @@ cranelift-frontend = "=0.137.1"
 # The reference interpreter and CLIF reader blaze-stencil's tests check each stencil with.
 cranelift-interpreter = "=0.137.1"
 cranelift-reader = "=0.137.1"
+# The runtime a proc macro's wasm32-wasip1 module runs on, in process (rule `proc-macros-on-wasm`,
+# crates/blaze-macro-eval/src/wasm.rs). `=`: the release whose Cranelift is 0.137.1, the one above,
+# so the patched `vendor/cranelift-codegen` is the only Cranelift in the tree. No component
+# model, async, GC, WASI crates or pooling allocator: blaze answers the module's imports itself.
+# No `parallel-compilation`: it compiles on rayon's pool, and a second pool beside blaze's
+# deadlocked the self-build (blaze_graph::par is the one pool).
+wasmtime = { version = "=50.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
 # `vendor/llvm-sys` by the patch above.
 llvm-sys = "231"
 # The stackful fibers blaze-graph's scheduler parks a waiting job on (docs/v2/plan/lanes/sched.md, Phase 2).
@@ -476,23 +501,26 @@ wrong_self_convention = "allow"
 
 ## deny: allocation, dyn and clones are controlled mechanically
 ## (docs/v2/plan/goals/principles.md)
-redundant_clone = "deny"
-clone_on_ref_ptr = "deny"
-implicit_clone = "deny"
-unnecessary_to_owned = "deny"
-inefficient_to_string = "deny"
-format_collect = "deny"
+redundant_clone = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+clone_on_ref_ptr = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+implicit_clone = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+unnecessary_to_owned = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+inefficient_to_string = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+format_collect = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
 needless_pass_by_value = "deny"
-large_types_passed_by_value = "deny"
-box_collection = "deny"
-vec_box = "deny"
-rc_buffer = "deny"
-large_enum_variant = "deny"
+large_types_passed_by_value = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+box_collection = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+vec_box = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+rc_buffer = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+large_enum_variant = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+# in `perf` (deny above): warn until their baselines are empty
+useless_vec = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
+useless_borrows_in_formatting = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
 
 ## deny: every unsafe block says why it is sound, one operation each
 ## (docs/v2/plan/design/unsafe.md)
 undocumented_unsafe_blocks = "deny"
-multiple_unsafe_ops_per_block = "deny"
+multiple_unsafe_ops_per_block = "warn" # baseline ratchet (crates/blaze-lints/baselines/); back to deny at zero findings
 
 ## warn at following lints
 # CI raises these to deny

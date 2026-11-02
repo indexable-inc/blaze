@@ -744,12 +744,15 @@ impl<'db> InferCtxt<'db> {
             let mut ocx = ObligationCtxt::new(self);
             ocx.register_obligation(*obligation);
             let mut result = EvaluationResult::EvaluatedToOk;
-            for error in ocx.evaluate_obligations_error_on_ambiguity() {
-                if error.is_true_error() {
-                    return EvaluationResult::EvaluatedToErr;
+            ocx.evaluate_obligations_error_on_ambiguity_with(&mut |error| {
+                result = result.max(if error.is_true_error() {
+                    EvaluationResult::EvaluatedToErr
                 } else {
-                    result = result.max(EvaluationResult::EvaluatedToAmbig);
-                }
+                    EvaluationResult::EvaluatedToAmbig
+                });
+            });
+            if result == EvaluationResult::EvaluatedToErr {
+                return result;
             }
             if self.opaque_types_added_in_snapshot(snapshot) {
                 result = result.max(EvaluationResult::EvaluatedToOkModuloOpaqueTypes);

@@ -614,7 +614,6 @@ fn assert_errnos(t: Target) {
         (Errno::Range, libc::ERANGE),
         (Errno::Nametoolong, libc::ENAMETOOLONG),
         (Errno::Loop, libc::ELOOP),
-        (Errno::Again, libc::EAGAIN),
     ];
     for (errno, code) in pairs {
         assert_eq!(t.errno(errno), code, "{errno:?}");

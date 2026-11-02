@@ -31,9 +31,10 @@ thread_local! {
 // that waits between two may resume on another thread, and an inlined access may reuse the
 // address of the first thread's slot (docs/v2/plan/lanes/may-suspend.md).
 
-/// The name a glob of an enum is noted reading in the enum's module, `(module, Some(it))`:
-/// no binding has it, so a glob of the module (`(module, None)`) is not woken with the
-/// enum's globs, and only a write touching an enum there wakes them (`delta::enum_glob_wakes`).
+/// The name a glob of an enum, or a path through it to a variant (`use E::V`), is noted reading
+/// in the enum's module, `(module, Some(it))`: no binding has it, so a glob of the module
+/// (`(module, None)`) is not woken with the enum's readers, and only a write touching an enum
+/// there wakes them (`delta::enum_glob_wakes`).
 pub(crate) fn enum_glob() -> Name {
     Name::new_symbol_root(intern::Symbol::intern("{enum glob}"))
 }

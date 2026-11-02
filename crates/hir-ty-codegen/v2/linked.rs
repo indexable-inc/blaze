@@ -437,6 +437,6 @@ pub(super) fn debug_name(db: &Db, kind: &Kind) -> String {
         // alloc: per instance described, its debug name
         Kind::Allocator(forward) => forward.symbol.to_owned(),
         // alloc: per instance described, its debug name
-        Kind::Asm(_) => "{global_asm}".to_owned(),
+        Kind::Asm(..) => "{global_asm}".to_owned(),
     }
 }

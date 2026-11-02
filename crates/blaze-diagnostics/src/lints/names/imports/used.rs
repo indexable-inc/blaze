@@ -788,23 +788,23 @@ impl<'f, 'db> Uses<'f, 'db> {
             && let Some(owner) = ast::AnyHasAttrs::cast(node)
             && owner.attrs().next().is_some()
         {
-            for (meta, attr) in walk.attrs(owner) {
+            for (meta, _) in walk.attrs(owner) {
                 let ast::Meta::TokenTreeMeta(it) = &meta else { continue };
                 if it.path().and_then(|it| it.as_single_name_ref()).is_none_or(|it| it.text() != "derive") {
                     continue;
                 }
-                self.derive(cx, node, meta, attr);
+                self.derive(cx, node, meta);
             }
         }
     }
 
     /// Marks what each path of a `#[derive(..)]` goes through.
-    fn derive(&mut self, cx: &Cx<'_, 'db>, owner: Node<'db>, meta: ast::Meta<'db>, attr: ast::Attr<'_>) {
+    fn derive(&mut self, cx: &Cx<'_, 'db>, owner: Node<'db>, meta: ast::Meta<'db>) {
         let Some(scope) = cx.vsema.scope(owner) else { return };
         let module = ModuleId::from(scope.module());
         let resolved = cx.vsema.resolve_derive_macro(meta).unwrap_or_default();
         let mut next = 0usize;
-        crate::cx::derive_path_tokens_view(attr, |_, tokens| {
+        crate::cx::derive_path_tokens_view(meta, |_, tokens| {
             let k = next;
             next += 1;
             let (kind, names) = Self::derive_path(tokens);

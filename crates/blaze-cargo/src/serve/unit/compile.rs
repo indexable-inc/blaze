@@ -22,7 +22,8 @@ use blaze_diagnostics::{Diag, Options, lints::CommandLine};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
 use blaze_lower::{ProcMacroLoadResult, ProcMacroLoadingError};
-use blaze_units::schema::Unit;
+use blaze_profile::span::{self, Name};
+use blaze_units::schema::{Mode, Unit};
 use hir_ty_codegen::v2::BodyChecks;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
@@ -181,13 +182,7 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
     let u = job.unit(unit)?;
     let plan = job.plan(unit)?;
     let toolchain = codegen::toolchain(job, unit).map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?;
-    let goal: u8 = match job.input.goal {
-        Goal::Check => 0,
-        Goal::Build => 1,
-        Goal::Test => 2,
-        Goal::Run => 3,
-        Goal::Reach => 4,
-    };
+    let goal = keyed_goal(job.input.goal, u);
     let runs = runs(job, unit);
     // An inert script's compile makes nothing, unless `BLAZE_ELIDE=verify` builds it to run it.
     let verified = u.target.is_custom_build()
@@ -220,6 +215,22 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
     // How many refused functions its error names: every one apart from each count.
     hasher.update(&job.input.refused.map_or(0, |it| u64::from(it) + 1).to_le_bytes());
     Ok(Key(hasher.finish()))
+}
+
+/// The goal as `unit`'s record key holds it. A build script's compile is the same program
+/// whatever the job's goal ([`super::checks_only`] is false for it under every goal), so a
+/// `blaze check` and a `blaze build` share its record; any other unit keys the goal.
+pub(crate) fn keyed_goal(goal: Goal, unit: &Unit) -> u8 {
+    if unit.mode == Mode::Build && unit.target.is_custom_build() {
+        return 1;
+    }
+    match goal {
+        Goal::Check => 0,
+        Goal::Build => 1,
+        Goal::Test => 2,
+        Goal::Run => 3,
+        Goal::Reach => 4,
+    }
 }
 
 /// Whether `unit` is a build script elision found inert, or one of std's own that blaze has a
@@ -540,15 +551,17 @@ pub(crate) fn compile(
         // alloc: error path
         return Err(ApiError::new(format!("unit {unit} has no phases in the job"), None).into());
     };
-    let krate = job.units().graph.units.get(unit).map_or("", |it| it.target.name.as_str());
+    let of = job.units().graph.units.get(unit);
+    let krate = Name::of(of.map_or("", |it| it.target.name.as_str()));
+    // alloc: once per phase of a unit, the name its span carries
+    let unit_name = Name::of(&of.map(span_unit).unwrap_or_default());
     let _span = match phase {
-        Phase::Names => tracing::info_span!("unit names", krate),
-        Phase::Bodies => tracing::info_span!("unit bodies", krate),
-        Phase::Codegen => tracing::info_span!("unit codegen", krate),
-        Phase::Link => tracing::info_span!("unit link", krate),
-        Phase::Store => tracing::info_span!("unit store", krate),
-    }
-    .entered();
+        Phase::Names => span::UnitNames { krate, unit: unit_name }.open(),
+        Phase::Bodies => span::UnitBodies { krate, unit: unit_name }.open(),
+        Phase::Codegen => span::UnitCodegen { krate, unit: unit_name }.open(),
+        Phase::Link => span::UnitLink { krate, unit: unit_name }.open(),
+        Phase::Store => span::UnitStore { krate, unit: unit_name }.open(),
+    };
     match phase {
         Phase::Names => names(job, reader, unit, slot)?,
         Phase::Bodies => bodies(job, reader, unit, slot)?,
@@ -557,6 +570,26 @@ pub(crate) fn compile(
         Phase::Store => return store(job, reader, unit, &mut lock(slot)).map(Some),
     }
     Ok(None)
+}
+
+/// A unit as its phase spans name it in `unit`: its package, the package's version and its
+/// target, `serde v1.0.219 (build script)`, `blaze-api v0.1.0 (lib test)`. Every build script's
+/// target is `build-script-build`, so the target's name alone (the spans' `crate`) can't tell
+/// two apart.
+pub(super) fn span_unit(unit: &Unit) -> String {
+    let package = crate::cli::say::package_name(&unit.pkg_id);
+    let version = crate::cli::say::package_version(&unit.pkg_id);
+    let target = &unit.target;
+    let kind = target.kind.first().map_or("", String::as_str);
+    let named: std::borrow::Cow<'_, str> = match kind {
+        _ if target.is_custom_build() && unit.mode == Mode::RunCustomBuild => "build script run".into(),
+        _ if target.is_custom_build() => "build script".into(),
+        _ if target.is_lib() => "lib".into(),
+        kind => format!("{kind} \"{}\"", target.name).into(), // alloc: once per phase of a unit
+    };
+    // As cargo names a unit: a test or bench target's test is just the target.
+    let test = (unit.mode == Mode::Test || unit.checked_as_test) && !matches!(kind, "test" | "bench");
+    format!("{package} v{version} ({named}{})", if test { " test" } else { "" }) // alloc: once per phase of a unit
 }
 
 /// A unit's phases, each holding the lock while it changes them. Only [`Phase::Bodies`] and
@@ -623,14 +656,17 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> R
 
 /// The text of each file `diags` point into that no mount of the build holds (a build script's
 /// output under `OUT_DIR`, read by an `include!`), as the database has it: the text their spans
-/// were made against, which [`assemble`], with no database, can't read through `mounted`. A
-/// file the database has no text of is left out, and [`assemble`] names it as unread.
+/// were made against, which [`assemble`], with no database, can't read through `mounted`. Held
+/// is a mount's file there, not a path under a mount's directory: `target/` is under the
+/// workspace's, and the view has none of its outputs. A file the database has no text of is
+/// left out, and [`assemble`] names it as unread.
 fn unmounted(reader: &UnitReader, mounted: &Mounted, diags: &[Diag]) -> Vec<(String, String)> {
     let (db, paths) = (reader.db(), reader.paths());
     let names: Vec<&str> = blaze_diagnostics::emit::Sources::default()
         .unread(diags)
         .into_iter()
-        .filter(|name| mounted.locate(&mounted.absolute(name)).is_none())
+        // A mount's bytes that fail their check are left to `add_sources`, which adds them unread.
+        .filter(|name| matches!(mounted.read(&mounted.absolute(name)), Ok(None)))
         .collect(); // alloc: the few names of a unit's diagnostics no mount holds
     if names.is_empty() {
         return Vec::new(); // alloc: empty, allocates nothing
@@ -669,10 +705,57 @@ fn bodies(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> 
         // clone: once per dependency crate checked this build
         job.check_later(krate, flags, diags.clone(), refused);
     }
+    let plan = job.plan(unit)?;
+    let diags = match &plan.clippy {
+        Some(clippy) => linted(db, krate, reader, job.mounted.root(), u, plan, clippy, options.lints, diags)?,
+        None => diags,
+    };
     let unmounted = unmounted(reader, &job.mounted, &diags);
     let mut phases = lock(slot);
     (phases.diags, phases.unmounted) = (Some(diags), unmounted);
     Ok(())
+}
+
+/// `diags`, the check's, with what clippy's lints and blaze's find in the unit's crate under
+/// `cargo clippy`, at the levels of its lint flags and attributes, before rustc's closing lines,
+/// which are made again to count them.
+#[expect(clippy::too_many_arguments, reason = "the crate, where its files are named from, its plan and the check's")]
+fn linted(
+    db: &base_db::Db,
+    krate: base_db::Crate,
+    reader: &UnitReader,
+    root: &str,
+    u: &Unit,
+    plan: &blaze_units::query::UnitPlan,
+    clippy: &blaze_units::query::Clippy,
+    command_line: CommandLine,
+    mut diags: Vec<Diag>,
+) -> Result<Vec<Diag>, ApiError> {
+    let at = || Some(format!("clippy's lints of `{}`", u.target.name));
+    let rust_version = plan.env.iter().find(|(name, _)| name == "CARGO_PKG_RUST_VERSION").map(|(_, it)| it.as_str());
+    let file = clippy.conf.clone().map(|(path, text)| (std::path::PathBuf::from(path), text)); // clone: the file's text, once per unit linted
+    let conf = blaze_lints::conf::Conf::of_text(file, rust_version.filter(|it| !it.is_empty()))
+        .map_err(|why| ApiError::new(why, at()))?;
+    let paths = reader.paths();
+    // alloc: a file's name, once per file of the crate and per span that leaves its file
+    let name_of = |file: base_db::FileId| paths.get(&file).map(|path| blaze_diagnostics::Files::relative(path, root).to_owned());
+    let setup = blaze_lints::Setup { command_line, conf };
+    let found = blaze_lints::check(db, hir::Crate::from(krate), &setup, &name_of)
+        .map_err(|why| ApiError::new(why.to_string(), at()))?;
+    let end = diags.iter().rposition(|it| !closing(it)).map_or(0, |at| at + 1);
+    diags.truncate(end);
+    diags.extend(found.into_iter().map(|it| it.diagnostic));
+    let closing = blaze_diagnostics::emit::summary(diags.iter());
+    diags.extend(closing);
+    Ok(diags)
+}
+
+/// Whether `diag` is one of rustc's closing lines after a crate's diagnostics
+/// ([`blaze_diagnostics::emit::summary`]'s).
+fn closing(diag: &Diag) -> bool {
+    diag.code.is_none()
+        && diag.span.primary.is_empty()
+        && (diag.level == blaze_diagnostics::model::Level::FailureNote || cargo_hides(&diag.message))
 }
 
 /// [`Phase::Codegen`]: the unit's functions compiled from its roots, when it compiles code,

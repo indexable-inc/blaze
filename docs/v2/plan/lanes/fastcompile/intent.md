@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2 lane fastcompile, ideas 9 and 10 (semantic edits, declared intent): crates/blaze-intent's edits by meaning applied to the flat tree in place, the byte-equality argument against the text edit, rename and path replacement (`blaze fix --replace`) through the front end's resolution, what each edit reports changed, the agent API's Edit, WillTest and WillSave, the session's take-over and cancel rules, the plane's idle class requested from core, the hooks requested from ci, core, db and cargo, the tests, and the state of the art.
+summary: blaze v2 lane fastcompile, ideas 9 and 10 (semantic edits, declared intent): crates/blaze-intent's edits by meaning applied to the flat tree in place, the byte-equality argument against the text edit, rename and path replacement (`blaze check --replace`) through the front end's resolution, what each edit reports changed, the agent API's Edit, WillTest and WillSave, the session's take-over and cancel rules, the plane's idle class requested from core, the hooks requested from ci, core, db and cargo, the tests, and the state of the art.
 date: 2026-10-29
 ---
 # fastcompile: semantic edits and declared intent (`crates/blaze-intent`)
@@ -72,7 +72,7 @@ from a text diff.
   else, and renaming an item that implements a trait method ("rename it in the trait").
   Renaming the trait method renames every impl of it and every call.
 
-**Replace retargets by resolution, never by text** (`blaze_intent::replace`, `blaze fix
+**Replace retargets by resolution, never by text** (`blaze_intent::replace`, `blaze check
 --replace std::sync::Mutex=parking_lot::Mutex`). It is the tool for moving a type or path
 (the locks and hasher ports); astlog stays the syntax tool.
 
@@ -111,7 +111,7 @@ from a text diff.
   unresolved or cfg'd-out occurrence, a `use` a macro expands, a path a macro builds from
   pieces of its input, a token a macro uses both for `from` and for something else, and a glob
   cycle each stop it with `path:line`. Nothing is written.
-- `blaze fix` (`crates/blaze-cargo/src/cli/fix.rs`) opens the checkout's head, sends
+- `blaze check --replace` (`crates/blaze-cargo/src/cli/replace.rs`) opens the checkout's head, sends
   `Request::Edit` with one `Replace` a `--replace`, and writes the committed ops to the
   checkout's files (each read once, edited in memory, written whole through a file renamed
   over it); a path leaving the checkout or an edit past a file's end is refused before
@@ -443,7 +443,7 @@ reuses it.
   structural search and replace (`ide-ssr`) matches a path pattern by resolution but edits
   only the matched paths, leaving `use` items, globs and the prelude to the user, and IntelliJ's
   "migrate" (Java's package and class migration maps) rewrites imports and qualified names
-  together but by fully qualified name text. `blaze fix --replace` resolves both ends, moves
+  together but by fully qualified name text. `blaze check --replace` resolves both ends, moves
   imports instead of paths through them, adds the import a glob or the prelude needed, and
   refuses what it can't place.
 - **Speculation.** Watch modes and flycheck (rust-analyzer, dune, cargo-watch) build after a

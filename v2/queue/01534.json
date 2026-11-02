@@ -1,0 +1,36 @@
+{
+  "id": "01534",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/diagnostics.rs",
+    "crates/blaze-diagnostics/src/lower/mod.rs"
+  ],
+  "what": "E0080 is never reported: a free `const` (or `static`) whose evaluation fails builds silently. rustc evaluates every free const and static of the crate it checks (`check_crate`, then `const_eval_poly` in `check_mod_item_types`/`check_item_type`) and reports E0080 \"evaluation of constant value failed\" with the interpreter's reason (here: \"reached the configured maximum number of stack frames\" for `const fn f<T>(x: T) { f(x); } const X: () = f(1);`, tests/ui/consts/recursive.rs). No code in crates/hir/src or crates/blaze-diagnostics/src produces E0080 (only codes.rs lists its text). Wanted: hir's module walk evaluates each free const and static item (a non-generic one; rustc skips those with generics) and pushes a diagnostic naming the item and the evaluator's error, which blaze-diagnostics lowers to E0080. Test: blaze-diagnostics tests::lints::bodies::recursion::a_const_fn_that_calls_itself (its error at line 7; its unconditional_recursion warning at line 3 is tests-diag's to find).",
+  "state": "applied",
+  "created": "2026-11-01T20:26:05Z",
+  "updated": "2026-11-01T21:58:59Z",
+  "taken_by": "db",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T20:26:05Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T21:58:59Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T21:58:59Z",
+      "by": "db",
+      "action": "done",
+      "note": "hir diagnostics.rs: check_body ends with collect_const_eval: each free const (container a module, incl. in a fn body; no generics; has a body) and each static with a body is evaluated (db.const_eval / const_eval_static) unless its body is tainted (inference errors, borrowck skipped/not checked/errors, const check findings). New AnyDiagnostic::ConstEvalFailed { node, item, is_static, failure: Failed(reason) | Cycle | Unsupported(text) }, placed at the frame in the item own body (the call), else its value. Reasons: StackOverflow = reached the configured maximum number of stack frames, Panic = evaluation panicked: msg, UB, OverBudget, LongRunning, HeapInValue, nested const = evaluation of constant `N` failed: reason; errors of code that does not type/resolve give none; blaze evaluator limits are Unsupported (blaze error, no-fallback, like BorrowckSkipped). blaze-diagnostics: new lower/const_eval_failed.rs: E0080 with the reason as message + note naming the item, E0391 for a cycle, code-less blaze cannot evaluate X: .. for Unsupported, Phase via const_check_error::phase. Tests: crates/hir/src/tests/const_eval.rs (5). RA clean. Coordinator: watch the self-check for new Unsupported errors on statics/consts blaze cannot evaluate; each is a real evaluator gap."
+    }
+  ]
+}

@@ -3,7 +3,9 @@
 //!
 //! The root a union keeps is `ena` 0.14's, which rustc uses, so `resolve` and diagnostics see
 //! the same variable: the root of higher rank, and on equal ranks the second one, whose rank
-//! grows by one. Path halving and `ena`'s full compression never change a root.
+//! grows by one; where the value asks for [`UnifyValue::OLDER_ROOT`] (rustc's `order_roots` of
+//! `TyVidEqKey` and `ConstVidKey`), the older of the two whatever the ranks. Path halving and
+//! `ena`'s full compression never change a root.
 //!
 //! A snapshot is a length mark plus a position in an undo log of `(index, old parent, old rank,
 //! old value)` rows. Rollback replays the rows in reverse, then truncates the columns to the
@@ -23,6 +25,11 @@ pub(crate) trait UnifyKey: Copy + Eq + fmt::Debug {
 
 pub(crate) trait UnifyValue: Copy + fmt::Debug {
     type Error;
+
+    /// Whether a union keeps the older root, the lower index, whatever the ranks (rustc's
+    /// `order_roots`): the variable inference made first, for a generic parameter, stays the
+    /// one a diagnostic names, not one a solver response made later and equated with it.
+    const OLDER_ROOT: bool = false;
 
     fn unify_values(a: &Self, b: &Self) -> Result<Self, Self::Error>;
 }
@@ -52,7 +59,8 @@ pub(crate) struct UnionFindMark {
 /// `O(log n)` worst case and near `O(1)` amortized; a union writes two undo rows in a snapshot.
 pub(crate) struct UnionFind<K, V> {
     parent: Vec<u32>,
-    /// At most `log2` of the number of variables, so below 32.
+    /// At most `log2` of the number of variables, so below 32, unless `V::OLDER_ROOT`, where it
+    /// saturates and decides nothing.
     rank: Vec<u8>,
     value: Vec<V>,
     undo: Vec<UndoRow<V>>,
@@ -295,7 +303,8 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
 
     /// Path halving only on variables at or above the floor, which a rollback truncates, so
     /// `find` never writes an undo row. Below the floor a path stays as it is: union by rank
-    /// keeps it at most `log2(len)` long, and halving never changes a root.
+    /// keeps it at most `log2(len)` long (an `OLDER_ROOT` table at most `len`, halved outside
+    /// snapshots), and halving never changes a root.
     #[inline(always)]
     fn root(&mut self, index: u32) -> u32 {
         let mut at = index;
@@ -315,7 +324,16 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
     fn unify_roots(&mut self, root_a: u32, root_b: u32, combined: V) {
         let rank_a = self.rank[root_a as usize];
         let rank_b = self.rank[root_b as usize];
-        let (new_rank, old_root, new_root) = if rank_a > rank_b {
+        let (new_rank, old_root, new_root) = if V::OLDER_ROOT {
+            // `ena`'s rank for a root `order_roots` chose; it decides nothing in such a table.
+            let (new_root, old_root, rank_new, rank_old) = if root_a < root_b {
+                (root_a, root_b, rank_a, rank_b)
+            } else {
+                (root_b, root_a, rank_b, rank_a)
+            };
+            let rank = if rank_new > rank_old { rank_new } else { rank_old.saturating_add(1) };
+            (rank, old_root, new_root)
+        } else if rank_a > rank_b {
             (rank_a, root_b, root_a)
         } else if rank_a < rank_b {
             (rank_b, root_a, root_b)
@@ -513,6 +531,35 @@ mod tests {
         table.union(b, d);
         assert_eq!(table.find(d), b);
         assert_eq!(table.probe_value(c), Universe(0));
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Older(u32);
+
+    impl UnifyValue for Older {
+        type Error = NoError;
+        const OLDER_ROOT: bool = true;
+
+        fn unify_values(a: &Self, b: &Self) -> Result<Self, NoError> {
+            Ok(Older(a.0.min(b.0)))
+        }
+    }
+
+    /// rustc's `order_roots` of `TyVidEqKey`: the older root stays, whichever side and rank.
+    #[test]
+    fn an_older_root_table_keeps_the_older_variable() {
+        let mut table = UnionFind::<Key, Older>::default();
+        let keys: Vec<_> = (0..4).map(|u| table.new_key(Older(u + 10))).collect();
+        table.union(keys[0], keys[1]);
+        assert_eq!(table.find(keys[1]), keys[0], "equal ranks keep the first, not the second");
+        table.union(keys[3], keys[2]);
+        assert_eq!(table.find(keys[3]), keys[2], "the older on either side");
+        let fresh = table.new_key(Older(0));
+        table.union(fresh, keys[0]);
+        assert_eq!(table.find(fresh), keys[0], "a singleton made later never becomes the root");
+        table.union(keys[3], keys[1]);
+        assert!(keys.iter().chain([&fresh]).all(|&key| table.find(key) == keys[0]));
+        assert_eq!(table.probe_value(keys[2]), Older(0));
     }
 
     #[test]

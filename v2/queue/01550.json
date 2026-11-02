@@ -1,0 +1,31 @@
+{
+  "id": "01550",
+  "from_lane": "coord-1030",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir-ty/src/infer/expr.rs",
+    "crates/hir-ty/src/infer/coerce.rs",
+    "crates/hir-ty/src/method_resolution.rs"
+  ],
+  "what": "hir-ty-mir tests failing since before 07:11, {unknown} where a type was inferred or an argument coercion failed: method_resolution::{deref_into_inference_var,trait_impl_in_a_default_method_of_its_trait,receiver_adjustment_autoref}, simple::box_into_vec, traits::{inline_assoc_type_bounds_2,integer_range_iterate}, never_type::diverging_let_with_else, regression::{regression_21885,new_solver::invalid_string_array_len_is_error}, coercion::call_argument_expectations_from_expected_output. For the last one rustc 16d1ffac accepts the code (check_argument_types, only_keep_structural_changes keeps &[u8] as the expected input), but ours fails to coerce &[u8;3] to &[u8] even with minicore coerce_unsized. Also port only_keep_structural_changes, which check_call_arguments lacks.",
+  "state": "taken",
+  "created": "2026-11-02T01:41:50Z",
+  "updated": "2026-11-02T01:45:11Z",
+  "taken_by": "no-fallback-front-ty-next1",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T01:41:50Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-02T01:45:11Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

@@ -37,6 +37,8 @@ pub struct Vtable {
     pub(crate) row_size: usize,
     /// An interned row's fields' IDs ([`Storage::ids_of`]).
     pub(crate) ids_of: Option<fn(storage: &Storage, ingredient: u32, id: Id, out: &mut Vec<Id>)>,
+    /// Whether an interned row's value was interned ([`Storage::made`]).
+    pub(crate) made: Option<fn(storage: &Storage, ingredient: u32, id: Id) -> bool>,
     /// What its table holds ([`Storage::memory_usage`]).
     pub(crate) memory: fn(storage: &Storage, ingredient: u32) -> super::MemoryUsage,
     /// Brings `id`'s row up to the storage's view (verifying it, running it if it changed),

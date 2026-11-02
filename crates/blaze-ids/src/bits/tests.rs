@@ -353,6 +353,13 @@ fn a_bitset_ranks_each_row() {
 }
 
 #[test]
+fn ranks_are_one_allocation() {
+    let words = [u64::MAX, 0, 1 << 3, 5];
+    let ranks = blaze_alloc_count::assert_at_most(1, "a ranked set's counts", || ranks_of(&words));
+    assert_eq!(&*ranks.unwrap(), &[0, 64, 64, 65]);
+}
+
+#[test]
 #[should_panic(expected = "with a bit past its end")]
 fn a_ranked_set_has_no_bit_past_its_end() {
     let _ = Ranked::from_words(vec![1 << 10], 10);

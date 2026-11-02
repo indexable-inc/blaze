@@ -700,8 +700,15 @@ mod tests {
             krate: 0,
             function: 0,
             unit: 0,
-            awaits: 0,
-            owner: (i % 4 == 0).then_some(i),
+            self_cpu_ns: (i % 2 == 1).then_some(10 * i),
+            typed: {
+                use crate::span::{Column as _, Said, Value as _, col};
+                let mut said = Said::EMPTY;
+                said.set(col::Owner::AT, (i % 4 == 0).then_some(i).word());
+                said.set(col::Steps::AT, (i % 5 == 0).then_some(1000 + i).word());
+                said.set(col::PeakBytes::AT, (i % 5 == 0).then_some(4096 * i).word());
+                said.typed
+            },
         };
         let spans: Vec<SpanRow> = (0..40).map(span).collect();
         let process = Process { pid: 9, name: "blaze test", commit: Some("abc") };
@@ -894,8 +901,8 @@ mod tests {
                 krate: 0,
                 function: functions[(i % 1000) as usize],
                 unit: 0,
-                awaits: 0,
-                owner: None,
+                self_cpu_ns: Some(i % 50_000),
+                typed: crate::span::Said::EMPTY.typed,
             })
             .collect();
         let dir = scratch("cost");

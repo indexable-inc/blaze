@@ -137,15 +137,15 @@ pub(in crate::mir::eval) enum Errors {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Os {
+pub(super) enum Os {
     Linux,
     Apple,
 }
 
 /// What the shims depend on of the target, read once from the crate's cfg.
 #[derive(Debug, Clone, Copy)]
-struct Target {
-    os: Os,
+pub(super) struct Target {
+    pub(super) os: Os,
     /// `SYS_futex` and `SYS_gettid` of the architecture.
     sys_futex: i64,
     sys_gettid: i64,
@@ -1001,7 +1001,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
     }
 
-    fn target(&mut self) -> Result<'db, Target> {
+    pub(super) fn target(&mut self) -> Result<'db, Target> {
         if let Some(target) = self.process.target {
             return Ok(target);
         }

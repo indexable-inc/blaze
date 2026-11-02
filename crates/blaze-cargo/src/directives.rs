@@ -321,6 +321,34 @@ pub fn refused_error(package: &str, refused: &[(String, String)]) -> String {
     )
 }
 
+/// The workspace's `build-script-link-dirs` as a script started in `env` may name them: an
+/// entry `${NAME}/rest` is the variable `NAME`'s value then `/rest` (a machine's install of
+/// what the script links, which the manifest can't spell: `${LLVM_SYS_231_PREFIX}/lib`), any
+/// other entry as it is. An error names a variable the script was not given, or one that is
+/// no absolute path.
+pub fn link_dirs(dirs: &[String], env: &[(std::ffi::OsString, std::ffi::OsString)]) -> Result<Vec<PathBuf>, String> {
+    dirs.iter()
+        .map(|dir| {
+            let Some((name, rest)) = dir.strip_prefix("${").and_then(|it| it.split_once('}')) else {
+                return Ok(PathBuf::from(dir));
+            };
+            let Some((_, value)) = env.iter().find(|(it, _)| it == name) else {
+                return Err(format!(
+                    "`{dir}` of `build-script-link-dirs` names `{name}`, which the build script's environment does not set"
+                ));
+            };
+            let value = Path::new(value);
+            if !value.is_absolute() {
+                return Err(format!(
+                    "`{dir}` of `build-script-link-dirs`: `{name}` is `{}`, which is no absolute path",
+                    value.display()
+                ));
+            }
+            Ok(blaze_manifest::paths::normalize_path(&value.join(rest.trim_start_matches('/'))))
+        })
+        .collect()
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -450,5 +478,25 @@ mod tests {
             error.contains("`evil-sys`") && error.contains("`cargo:rustc-link-search=/root/x`")
         );
         assert!(error.contains("build-script-link-dirs"), "{error}");
+    }
+
+    /// A link dir under a variable is where the script's environment puts it, and the search it
+    /// prints there is allowed; an unset or relative variable is an error naming it, never a
+    /// dir left out.
+    #[test]
+    fn a_link_dir_under_a_variable_is_where_the_scripts_environment_puts_it() {
+        use std::ffi::OsString;
+        let env = |value: &str| -> Vec<(OsString, OsString)> { vec![("LLVM_SYS_231_PREFIX".into(), value.into())] };
+        let dirs = ["${LLVM_SYS_231_PREFIX}/lib".to_owned(), "/opt/vendor/lib".to_owned()];
+        let found = link_dirs(&dirs, &env("/m/llvm-23.1.4")).unwrap();
+        assert_eq!(found, [PathBuf::from("/m/llvm-23.1.4/lib"), PathBuf::from("/opt/vendor/lib")]);
+        let ran = Ran { link_dirs: &found, ..ran() };
+        assert!(refused(b"cargo:rustc-link-search=native=/m/llvm-23.1.4/lib\n", &ran).is_empty());
+        assert!(!refused(b"cargo:rustc-link-search=native=/m/other/lib\n", &ran).is_empty());
+
+        let unset = link_dirs(&dirs, &[]).unwrap_err();
+        assert!(unset.contains("`LLVM_SYS_231_PREFIX`") && unset.contains("does not set"), "{unset}");
+        let relative = link_dirs(&dirs, &env("llvm")).unwrap_err();
+        assert!(relative.contains("no absolute path"), "{relative}");
     }
 }

@@ -14,9 +14,9 @@ use crate::{db, plumbing, structs, value};
 
 pub(crate) fn expand(
     args: TokenStream,
-    item: ItemStruct,
+    item: &ItemStruct,
 ) -> Result<TokenStream, (syn::Error, TokenStream)> {
-    expand_in(args, &item).map_err(|error| (error, structs::stripped(&item)))
+    expand_in(args, item).map_err(|error| (error, structs::stripped(item)))
 }
 
 fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
@@ -145,7 +145,7 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
         Some(it) => it.clone(), // clone: expansion time, an identifier
         None => syn::Ident::new("new", ident.span()),
     };
-    let make = structs::construct(Some(db_lt), quote!(id));
+    let make = structs::construct(Some(db_lt), &quote!(id));
 
     let debug = options.debug.as_ref().map(|_| {
         quote! {

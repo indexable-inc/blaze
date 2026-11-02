@@ -537,7 +537,6 @@ impl<V> Runs<V> {
     }
 
     /// How many waiters `key`'s run has linked now.
-    #[cfg(test)]
     pub(super) fn waiters(&self, key: &Key) -> usize {
         let latched = self.latch(key);
         let Some((bucket, at)) = latched.find(key) else { return 0 };

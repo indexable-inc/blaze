@@ -224,8 +224,9 @@ impl<'db> Types<'db> {
     fn operand_ty(&self, mir: &MirBody<'db>, operand: &Operand) -> Option<Ty<'db>> {
         match &operand.kind {
             OperandKind::Constant { ty, .. } => Some(ty.as_ref()),
+            OperandKind::Allocation { allocation } => Some(allocation.as_ref().ty),
             OperandKind::Copy(place) | OperandKind::Move(place) => Some(self.place_ty(mir, place)),
-            OperandKind::Allocation { .. } | OperandKind::Static(_) => None,
+            OperandKind::Static(_) => None,
         }
     }
 

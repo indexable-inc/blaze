@@ -22,12 +22,20 @@
 //!   2, a byte saying whether it replaces the filters before it (1) or adds to them (0), the
 //!   [`Store::epoch`] it covers as a `u64`, and a [`Fuse8`] of the first word of each key the
 //!   server's store holds. The server sends a full filter first on each connection, ahead of
-//!   any answer, then a delta of the keys each batch of its store puts ([`Server::refresh`]),
-//!   and a full one again once the deltas pass a quarter of the full one's keys. A client asks
-//!   only for a key one of its filters may hold, and answers any other `Missing` itself: a miss
-//!   costs no round trip. A filter has no false negatives for the keys it covers; a key put
-//!   after the epoch it covers reads `Missing` until the next delta, so a stale filter costs a
-//!   recompute, never a wrong value. A client with no filter yet asks for every key.
+//!   any answer, then a delta of the keys put since ([`Server::refresh`]), and a full one again
+//!   once the deltas pass a quarter of the full one's keys. A client asks only for a key one of
+//!   its filters may hold, and answers any other `Missing` itself: a miss costs no round trip.
+//!   A client with no filter yet asks for every key.
+//! - **The invariant** that rules out a false negative: every key [`Store::get`] gives when
+//!   [`Server::refresh`] (or the full filter of a first peer) reads the store is in a filter
+//!   frame queued to every peer, ahead of any answer served after it. A delta takes the keys
+//!   readable and not yet packed ([`Store::unpacked_keys`]) as well as those packed since
+//!   ([`Store::new_keys`]), since a put is readable at once and packed only at a later flush.
+//!   One connection keeps its order, so a client that answers `Missing` itself does so only
+//!   for a key the server's store could not give when it last refreshed before the last frame
+//!   the client took: a key put after that is asked once the next delta comes. The daemon
+//!   calls `refresh` before it hands the server a batch of asks to serve. [`FilterCounts`]
+//!   says what the filters saved and what they let through.
 //! - Bounds: a value is at most [`LONGEST_VALUE`] bytes, and a client refuses a frame longer
 //!   than that and its header before reading it. A server hangs up a connection whose stream is
 //!   not whole asks, and stops answering and reading a connection while its unsent answers pass
@@ -47,7 +55,7 @@ use std::collections::{VecDeque, hash_map};
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, IoError, RECV_MOST, Tag, Tags};
 use blaze_format::cursor::{self, Put as _, Reader};
-use blaze_hash::HashMap;
+use blaze_hash::{ByHashSet, HashMap};
 use blaze_ids::{ContentId, fuse::Fuse8, radix};
 
 use crate::{Asked, ByHash, Corrupt, Entry, Key, Kind, Remote, Store};
@@ -351,6 +359,19 @@ fn owed(buffer: &[u8]) -> usize {
     (8 + len as usize).saturating_sub(buffer.len())
 }
 
+/// What a client's filters did with its fetches since it was made.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct FilterCounts {
+    /// Fetches answered `Missing` without asking: the round trips the filters saved.
+    pub skipped: u64,
+    /// Fetches asked because a filter may hold the key, answered `Missing`: its false positives.
+    pub false_positives: u64,
+    /// Fetches asked because a filter may hold the key, answered with a value.
+    pub found: u64,
+    /// Fetches asked before any filter came.
+    pub unfiltered: u64,
+}
+
 /// The laptop's side: one connection to `at`, asks pipelined on it, answers matched by key.
 pub struct Client {
     at: Address,
@@ -358,9 +379,9 @@ pub struct Client {
     link: Link,
     /// Asks not yet handed to a send.
     out: Vec<u8>,
-    /// The fetch of each key asked on this connection and not yet answered: answers come in
-    /// any order.
-    waiting: ByHash<Key, Tag>,
+    /// The fetch of each key asked on this connection and not yet answered (answers come in
+    /// any order), and whether a filter said the server may hold it.
+    waiting: ByHash<Key, (Tag, bool)>,
     /// Fetches of a key already waiting, not asked again: each gets a copy of its answer.
     again: Vec<(Key, Tag)>,
     /// Connects given up while in flight: a connection one of them makes is hung up.
@@ -370,6 +391,7 @@ pub struct Client {
     filters: Vec<Fuse8>,
     /// The [`Store::epoch`] the filters cover; `None` until the first comes.
     epoch: Option<u64>,
+    counts: FilterCounts,
 }
 
 enum Link {
@@ -414,7 +436,13 @@ impl Client {
             // alloc: empty, allocates nothing; once per client, setup.
             filters: Vec::new(),
             epoch: None,
+            counts: FilterCounts::default(),
         }
+    }
+
+    /// What its filters did with its fetches so far.
+    pub fn counts(&self) -> FilterCounts {
+        self.counts
     }
 
     /// Whether `tag` is one it asks with, so its completion goes to [`Client::complete`].
@@ -608,15 +636,20 @@ impl Client {
                     Err(why) => break Err(format!("a malformed filter: {why}")),
                 }
             }
-            let key = match parse(&rest[8..end]) {
-                Ok(parsed) => parsed.key(),
+            let (key, missing) = match parse(&rest[8..end]) {
+                Ok(parsed) => (parsed.key(), matches!(parsed, Parsed::Missing { .. })),
                 // alloc: an error path.
                 Err(why) => break Err(format!("a malformed answer: {why}")),
             };
-            let Some(tag) = self.waiting.remove(&key) else {
+            let Some((tag, filtered)) = self.waiting.remove(&key) else {
                 // alloc: an error path.
                 break Err(format!("an answer for {:x}, which was not asked", key.0));
             };
+            match (filtered, missing) {
+                (true, true) => self.counts.false_positives += 1,
+                (true, false) => self.counts.found += 1,
+                (false, _) => {}
+            }
             let frame = if start == 0 && end >= CLIENT_RECV {
                 if end == up.buffer.len() {
                     std::mem::take(&mut up.buffer)
@@ -661,7 +694,7 @@ impl Client {
                 key.0
             ))),
         };
-        answers.extend(self.waiting.drain().map(|(key, tag)| failed(key, tag)));
+        answers.extend(self.waiting.drain().map(|(key, (tag, _))| failed(key, tag)));
         answers.extend(self.again.drain(..).map(|(key, tag)| failed(key, tag)));
         match std::mem::replace(&mut self.link, Link::Down) {
             Link::Down => {}
@@ -678,16 +711,21 @@ impl Remote for Client {
     /// there is one, so a turn of fetches is one send. A key already waiting is not asked again.
     fn fetch(&mut self, key: &Key, tag: Tag, effects: &mut Vec<Effect>) -> Asked {
         if !self.may_hold(key) {
+            self.counts.skipped += 1;
             return Asked::Missing;
         }
+        let filtered = self.epoch.is_some();
         match self.waiting.entry(*key) {
             hash_map::Entry::Occupied(_) => {
                 self.again.push((*key, tag));
                 return Asked::Sent;
             }
             hash_map::Entry::Vacant(slot) => {
-                slot.insert(tag);
+                slot.insert((tag, filtered));
             }
+        }
+        if !filtered {
+            self.counts.unfiltered += 1;
         }
         if let Link::Down = self.link {
             let connect = self.tags.next();
@@ -735,6 +773,9 @@ pub struct Server {
     full_keys: usize,
     /// Keys the deltas since were built of.
     delta_keys: usize,
+    /// Keys a filter sent holds while they were readable and not yet packed: their packing,
+    /// which [`Store::new_keys`] lists, sends them no second time.
+    announced: ByHashSet<Key>,
 }
 
 #[derive(Default)]
@@ -782,18 +823,25 @@ impl Server {
             filters: Vec::new(),
             full_keys: 0,
             delta_keys: 0,
+            announced: ByHashSet::default(),
         })
     }
 
-    /// Sends every peer a filter of the keys `store`'s batches put since the last call: a
-    /// delta, or a full filter again once the deltas pass a quarter of the full one's keys or
+    /// Sends every peer a filter of the keys `store` can give that no filter sent holds: those
+    /// put and not yet packed, and those packed since the last call that were not. A delta, or
+    /// a full filter again once the deltas pass a quarter of the full one's keys or
     /// [`FILTER_DELTAS`] of them. The daemon calls it once before serving, which has the store
-    /// watch its keys (a peer of a store that does not is refused), then after each batch.
+    /// watch its keys (a peer of a store that does not is refused), then before each batch of
+    /// asks it serves, so no answer goes ahead of a filter of what the store held then.
     pub fn refresh(&mut self, store: &mut Store, effects: &mut Vec<Effect>) {
         store.watch_keys();
-        let (epoch, keys) = store.new_keys();
+        let (epoch, packed) = store.new_keys();
         // Before the first peer, the full filter it is sent will hold these.
-        if self.filters.is_empty() || keys.is_empty() {
+        if self.filters.is_empty() {
+            return;
+        }
+        let keys = self.unannounced(packed, store.unpacked_keys());
+        if keys.is_empty() {
             return;
         }
         self.delta_keys += keys.len();
@@ -819,11 +867,37 @@ impl Server {
         }
     }
 
+    /// Of the keys `packed` since the last refresh and those `unpacked` now, sorted, the ones
+    /// no filter sent holds; an unpacked one is remembered, so its packing sends nothing.
+    fn unannounced(&mut self, packed: Vec<Key>, unpacked: Vec<Key>) -> Vec<Key> {
+        // alloc: once per refresh, the keys of its delta
+        let mut fresh = Vec::new();
+        for key in packed {
+            if !self.announced.remove(&key) {
+                fresh.push(key);
+            }
+        }
+        for key in unpacked {
+            if self.announced.insert(key) {
+                fresh.push(key);
+            }
+        }
+        fresh.sort_unstable();
+        fresh.dedup();
+        fresh
+    }
+
     /// Builds the full filter of `store` again, in place of the one and the deltas before.
     fn rebuild(&mut self, store: &Store) {
+        // Read before the keys, which a writer may put to meanwhile: every key remembered is
+        // then in the filter. Read after, a key put between the two would be remembered and
+        // missing from it, and no delta would ever send it.
+        let unpacked = store.unpacked_keys();
         let keys = store.keys();
         self.full_keys = keys.len();
         self.delta_keys = 0;
+        self.announced.clear();
+        self.announced.extend(unpacked);
         self.filters.clear();
         self.filters.push(filter_of(true, store.epoch(), &keys));
     }
@@ -2126,5 +2200,133 @@ mod tests {
         effects.clear();
         assert_eq!(client.fetch(&absent, Tag(7), &mut effects), Asked::Missing);
         assert!(effects.is_empty() && client.out.is_empty(), "nothing is asked");
+        assert_eq!(client.counts().skipped, 1);
+    }
+
+    /// A put is readable at once and packed only at a later flush: the delta of the refresh
+    /// between the two holds it, and its packing sends it no second time.
+    #[test]
+    fn a_put_not_yet_packed_is_in_the_next_delta() {
+        let (mut sim, mut store) = opened(Sim::new(11, Faults::default()), &[]);
+        let mut net = Net::new(usize::MAX);
+        net.server.refresh(&mut store, &mut net.effects[S]);
+        net.fetch("a probe", 0);
+        net.run(&store);
+        assert_eq!(net.client.filters.len(), 1, "the full filter of the first peer");
+
+        store.put(key("fresh"), Kind::Code, b"fresh".to_vec()).unwrap();
+        assert!(store.get(&key("fresh")).unwrap().is_some(), "readable before it is packed");
+        assert!(store.unpacked_keys().contains(&key("fresh")));
+        net.server.refresh(&mut store, &mut net.effects[S]);
+        net.run(&store);
+        assert_eq!(net.client.filters.len(), 2, "a delta of the put not yet packed");
+        assert!(net.client.may_hold(&key("fresh")));
+
+        commit(&mut sim, &mut store);
+        assert!(!store.unpacked_keys().contains(&key("fresh")), "packed by the commit");
+        net.server.refresh(&mut store, &mut net.effects[S]);
+        net.run(&store);
+        assert_eq!(net.client.filters.len(), 2, "its packing sends it no second time");
+        net.fetch("fresh", 1);
+        net.run(&store);
+        let last = net.answers.last().unwrap();
+        assert_eq!(last.tag, Tag(1));
+        assert_eq!(answer(last), Answer::of(&store, &key("fresh")).unwrap());
+        assert!(net.filtered.is_empty());
+    }
+
+    /// The model of the invariant in the module's docs: however puts, commits, refreshes and
+    /// fetches interleave, a key the server's store could give when it last refreshed is never
+    /// ruled out, packed or not, and a fetch of it is answered with its value. A key never put
+    /// is answered `Missing`, by the filter or the server.
+    #[hegel::test]
+    fn no_key_the_server_could_give_at_its_last_refresh_is_ruled_out(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let ops: Vec<u16> = tc.draw(gs::vecs(gs::integers()).max_size(160));
+        let name = |n: u16| format!("interleaved {n}");
+        let (mut sim, mut store) = opened(Sim::new(12, Faults::default()), &[]);
+        let mut net = Net::new(usize::MAX);
+        net.server.refresh(&mut store, &mut net.effects[S]);
+        net.fetch("a probe", 0);
+        net.run(&store);
+        let mut put: Vec<u16> = Vec::new();
+        // What was put when the server last refreshed.
+        let mut covered: Vec<u16> = Vec::new();
+        for (at, op) in ops.into_iter().enumerate() {
+            let n = (op / 4) % 300;
+            match op % 4 {
+                0 => {
+                    store.put(key(&name(n)), Kind::Code, n.to_le_bytes().to_vec()).unwrap();
+                    put.push(n);
+                }
+                1 => commit(&mut sim, &mut store),
+                2 => {
+                    net.server.refresh(&mut store, &mut net.effects[S]);
+                    net.run(&store);
+                    covered.clone_from(&put);
+                    for &it in &covered {
+                        assert!(net.client.may_hold(&key(&name(it))), "{it}, put before a refresh, hidden");
+                    }
+                }
+                _ => {
+                    let tag = Tag(1 + at as u64);
+                    net.fetch(&name(n), tag.0);
+                    net.run(&store);
+                    let last = net.answers.last().unwrap();
+                    assert_eq!(last.tag, tag);
+                    let got = answer(last);
+                    if covered.contains(&n) {
+                        assert_eq!(got, Answer::of(&store, &key(&name(n))).unwrap(), "{n} covered");
+                        assert!(matches!(got, Answer::Value { .. }), "{n} covered and answered {got:?}");
+                    } else if !put.contains(&n) {
+                        assert_eq!(got, Answer::Missing { key: key(&name(n)) });
+                    }
+                }
+            }
+        }
+        let counts = net.client.counts();
+        assert_eq!(counts.skipped, net.filtered.len() as u64);
+    }
+
+    #[test]
+    fn filter_counts_say_what_was_skipped_and_what_got_through() {
+        let store = stored(&[("a", Kind::Code, b"the code of a".as_slice())]);
+        let mut net = Net::new(usize::MAX);
+        net.fetch("a", 0);
+        net.run(&store);
+        assert_eq!(net.client.counts(), FilterCounts { unfiltered: 1, ..FilterCounts::default() });
+
+        net.fetch("a", 1);
+        const ABSENT: u64 = 2000;
+        for n in 0..ABSENT {
+            net.fetch(&format!("absent {n}"), 2 + n);
+        }
+        net.run(&store);
+        assert_eq!(net.answers.len() as u64, 2 + ABSENT);
+        let counts = net.client.counts();
+        assert_eq!(counts.unfiltered, 1);
+        assert_eq!(counts.found, 1);
+        assert_eq!(counts.skipped, net.filtered.len() as u64);
+        assert_eq!(counts.skipped + counts.false_positives, ABSENT);
+        // About 1 in 256: 8 expected.
+        assert!(counts.false_positives <= 40, "{counts:?}");
+        assert_eq!(net.links.len(), 1);
+    }
+
+    /// A filter frame rules in about one key in 256 it was not built of, at any size, and
+    /// every key it was.
+    #[hegel::test]
+    fn a_filter_frame_rules_in_about_one_absent_key_in_256(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let built: usize = tc.draw(gs::integers().max_value(3000));
+        let salt: u64 = tc.draw(gs::integers());
+        let keys: Vec<Key> = (0..built).map(|n| key(&format!("in {salt} {n}"))).collect();
+        let frame = filter_of(true, 0, &keys);
+        let (_, _, filter) = parse_filter(&frame[8..]).unwrap();
+        assert!(keys.iter().all(|it| filter.contains(word(it))));
+        const PROBES: usize = 4096;
+        let wrong = (0..PROBES).filter(|n| filter.contains(word(&key(&format!("out {salt} {n}"))))).count();
+        // 16 expected; 64 is past any run of these probes but a broken filter's.
+        assert!(wrong <= 64, "{wrong} of {PROBES} absent keys ruled in by a filter of {built}");
     }
 }

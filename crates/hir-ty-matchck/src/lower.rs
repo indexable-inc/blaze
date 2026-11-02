@@ -10,7 +10,7 @@ use std::{cell::Cell, ops::ControlFlow};
 use base_db::Db;
 
 use hir_def::{
-    AdtId, ConstId, DefWithBodyId, HasModule, TraitId, VariantId,
+    AdtId, BuiltinDeriveImplId, ConstId, DefWithBodyId, HasModule, TraitId, VariantId,
     attrs::AttrFlags,
     builtin_derive::BuiltinDeriveImplTrait,
     expr_store::{Body, HygieneId, path::Path, scope::ExprScopes},
@@ -40,8 +40,8 @@ use hir_ty::{
     method_resolution::CandidateId,
     mir::{IsSigned, pad16},
     next_solver::{
-        Allocation, AnyImplId, DbInterner, GenericArgs, StoredTy, Ty, TyKind,
-        infer::traits::ObligationCause,
+        Allocation, AnyImplId, DbInterner, GenericArgs, StoredTy, Ty, TyKind, Unnormalized,
+        infer::traits::{Obligation, ObligationCause},
     },
     traits::{implements_trait_unique, implements_trait_unique_with_args},
     utils::detect_variant_from_bytes,
@@ -521,22 +521,45 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         }
     }
 
-    /// `type_marked_structural`: the ADT implements `StructuralPartialEq`, which
-    /// `#[derive(PartialEq)]` implements for every argument.
+    /// `type_marked_structural`: `ty`, an instance of `adt`, implements `StructuralPartialEq`.
+    /// `#[derive(PartialEq)]`'s impl of it has the bounds of its `PartialEq` impl (rustc's
+    /// `additional_bounds`, rust-lang/rust#147714), so it holds of `ty` when those do, whatever
+    /// manual `PartialEq` impl `ty` has.
     fn is_structural(&self, ty: Ty<'db>, adt: AdtId) -> bool {
-        self.builtin_derives_partial_eq(adt)
+        self.builtin_partial_eq_derive(adt).is_some_and(|derive| self.derive_holds(derive, ty))
             || self.cx.infcx.interner.lang_items().StructuralPeq.is_some_and(|structural| {
                 let env = ParamEnvAndCrate { param_env: self.cx.env, krate: self.cx.krate };
                 implements_trait_unique(ty, self.cx.db, env, structural)
             })
     }
 
+    /// Whether the bounds of the builtin derive `derive` hold of `ty`, an instance of its ADT.
+    fn derive_holds(&self, derive: BuiltinDeriveImplId, ty: Ty<'db>) -> bool {
+        let TyKind::Adt(_, args) = ty.kind() else { return false };
+        let infcx = self.cx.infcx;
+        hir_ty::builtin_derive::predicates(self.cx.db, derive)
+            .all_predicates()
+            .iter_instantiated(infcx.interner, args.as_slice())
+            .map(Unnormalized::skip_norm_wip)
+            .all(|clause| {
+                let cause = ObligationCause::dummy();
+                let obligation =
+                    Obligation::new(infcx.interner, cause, self.cx.env, clause.as_predicate());
+                infcx.predicate_must_hold_modulo_regions(&obligation)
+            })
+    }
+
     /// The front end records a builtin derive as the derive, not as the impls it expands to,
     /// so its `StructuralPartialEq` impl is the recorded derive.
     fn builtin_derives_partial_eq(&self, adt: AdtId) -> bool {
+        self.builtin_partial_eq_derive(adt).is_some()
+    }
+
+    /// The builtin `#[derive(PartialEq)]` of `adt`, if it has one.
+    fn builtin_partial_eq_derive(&self, adt: AdtId) -> Option<BuiltinDeriveImplId> {
         let db = self.cx.db;
         let module = adt.module(db);
-        module.def_map(db).module(db, module).scope(db).builtin_derive_impls().any(|derive| {
+        module.def_map(db).module(db, module).scope(db).builtin_derive_impls().find(|derive| {
             let loc = derive.loc(db);
             loc.adt == adt && loc.trait_ == BuiltinDeriveImplTrait::PartialEq
         })

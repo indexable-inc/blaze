@@ -594,9 +594,10 @@ impl<'a, 'db> Walk<'a, 'db> {
         }
     }
 
+    /// A reason names types, whose `Debug` reads the attached database.
     fn refuse_with(&mut self, what: impl FnOnce() -> String) {
         if self.own.is_none() {
-            self.own = Some(what());
+            self.own = Some(hir_ty::attach_db(self.cx.db, what));
         }
     }
 

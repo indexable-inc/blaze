@@ -351,12 +351,13 @@ fn check_def(db: &Db, def: DefWithBodyId, mode: Mode, frame: &Frame) -> Borrowck
     // builds no MIR for it, so there is nothing to check and nothing to refuse (where Rust
     // requires a body, AST validation reports its absence). A body that is written but lowered
     // to nothing (`#[rust_analyzer::skip]`, a `#[cfg]`d-out body expression) is refused:
-    // rustc checks what is written.
+    // rustc checks what is written. Asked before the lowered root is looked at: a bodiless
+    // `async fn` lowers to an `async` block around nothing, which is no body either.
+    if !written_with_body(db, def) {
+        return result;
+    }
     let body = hir_def::expr_store::Body::of(db, def);
     if matches!(body.expr(body.root_expr()), hir_def::hir::Expr::Missing) {
-        if !written_with_body(db, def) {
-            return result;
-        }
         // alloc: the owned result, once, when the body is refused
         result.skipped =
             Some("a body that is written but lowered to no expression: nothing to check".into());

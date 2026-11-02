@@ -970,7 +970,7 @@ fn cold(db: &Db, frame: &Frame, krate: Crate) -> (crate::nameres::DefMap, crate:
 
     let root = queries::crate_root(db, krate);
     let mut cs = CrateState::new(root);
-    let none = Written { set: &[], added: &[], removed: &[], roots: &[], crates: true, included: &[] };
+    let none = Written { set: &[], added: &[], removed: &[], roots: &[], crates: true, included: &[], proc_macros: &[] };
     input::read(db, krate, &mut cs, &none, true, false);
     let mut region: HashSet<ModuleId> = cs.groups.keys().copied().collect();
     let mut work = Work::default();

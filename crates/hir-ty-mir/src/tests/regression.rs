@@ -944,8 +944,8 @@ fn flush(&self) {
             295..345 '{     ...()); }': ()
             305..306 'w': &'? Mutex<BufWriter>
             331..342 '*(w.lock())': BufWriter
+            332..342 '(w.lock())': MutexGuard<'?, BufWriter>
             333..334 'w': &'? Mutex<BufWriter>
-            333..341 'w.lock()': MutexGuard<'?, BufWriter>
         "#]],
     );
 }

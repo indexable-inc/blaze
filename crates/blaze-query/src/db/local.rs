@@ -210,7 +210,7 @@ unsafe impl Send for Spare {}
 static SPARES: ShortLock<Vec<Spare>> = ShortLock::new(Vec::new());
 
 /// Moves the stack of the job switching out off this thread, leaving an empty one
-/// ([`blaze_graph::sched::fiber::Carried`]): the job's frames, reads and cycle state are its
+/// ([`blaze_graph::sched::Carried`]): the job's frames, reads and cycle state are its
 /// own wherever it resumes, and a job that runs here meanwhile starts a stack of its own.
 #[inline(never)]
 pub(crate) fn take() -> usize {

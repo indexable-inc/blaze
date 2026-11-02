@@ -131,6 +131,7 @@ fn plan(cfgs: &[&str], env: &[(&str, &str)], out_dir: Option<&str>) -> UnitPlan 
         unsandboxed: false,
         runner: Vec::new(),
         harness: true,
+        clippy: None,
     }
 }
 

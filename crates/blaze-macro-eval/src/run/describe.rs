@@ -15,7 +15,7 @@ use hir_expand::InFile;
 use hir_ty::{
     InferBodyId, InferenceDiagnostic, InferenceResult,
     display::{DisplayTarget, HirDisplay},
-    mir::{MirEvalError, MirLowerError, MirSpan},
+    mir::{Budget, MirEvalError, MirLowerError, MirSpan},
 };
 use hir_ty_mir::mir_pretty::MirLowerErrorPretty;
 use span::{FileId, TextRange};
@@ -47,6 +47,24 @@ pub(crate) fn describe(db: &Db, error: &MirEvalError<'_>) -> String {
                 owner_path(db, loc.owner),
             );
             lowering(db, lower, loc.owner.expression_store_owner(db).krate(db), &mut out);
+        }
+        MirEvalError::OverBudget { spent, at } => {
+            match spent {
+                Budget::Steps(steps) => _ = write!(
+                    out,
+                    "the expansion ran {steps} steps (basic blocks), all one expansion may, without finishing"
+                ),
+                Budget::Memory(bytes) => _ = write!(
+                    out,
+                    "the expansion would use more than {bytes} bytes of memory, all one expansion may"
+                ),
+            }
+            if let Some((owner, span)) = *at {
+                _ = write!(out, "; it was in `{}`", owner_path(db, owner));
+                if !matches!(span, MirSpan::Unknown) {
+                    _ = write!(out, " at {}", place(db, owner, span));
+                }
+            }
         }
         other => _ = write!(out, "{other:?}"),
     }

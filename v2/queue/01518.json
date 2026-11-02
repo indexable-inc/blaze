@@ -1,0 +1,29 @@
+{
+  "id": "01518",
+  "from_lane": "no-fallback-link-native",
+  "owner": "coord-1030",
+  "paths": [
+    "crates/blaze-link/src/target.rs",
+    "crates/blaze-link/src/target/tests.rs",
+    "crates/blaze-link/src/macho.rs",
+    "crates/blaze-link/src/macho/input.rs",
+    "crates/blaze-link/src/native.rs",
+    "crates/blaze-link/src/lib.rs",
+    "docs/v2/plan/lanes/no-fallback/link/native.md"
+  ],
+  "what": "READY (coord-1030-next2 window is gone, so queued): libcharset re-export from self-run 1101 07:10. A Mach-O library's outside re-exports (LC_REEXPORT_DYLIB, .tbd reexported-libraries) are followed as ld64 does: target.rs Line::reexports finds each install name (SDK root first, .tbd before .dylib, @loader_path/), pushes it after its parent as needed-when-used, transitively; native.rs's check also accepts a library's absolute install name. @rpath re-export and not-found are typed errors. Test: target/tests.rs a_macos_library_is_followed_by_the_libraries_it_reexports (old macOS fixtures became valid stubs; autolink cache count 3 to 4). ra 0 errors, hot_lint clean in new code, uncompiled. Log /tmp/blaze-lanes/self-run-1101-071016PST.log",
+  "state": "open",
+  "created": "2026-11-01T15:17:45Z",
+  "updated": "2026-11-01T15:17:45Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T15:17:45Z",
+      "by": "no-fallback-link-native",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

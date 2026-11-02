@@ -69,6 +69,7 @@ use crate::{
         },
         inspect::{InspectGoal, ProofTreeVisitor},
         obligation_ctxt::ObligationCtxt,
+        recycle,
     },
     utils::TargetFeatureIsSafeInTarget,
 };
@@ -248,7 +249,8 @@ where
             let target_ty =
                 if self.use_lub { self.infcx().next_ty_var(self.cause.span()) } else { b };
 
-            let mut obligations = PredicateObligations::with_capacity(2);
+            // The caller registers them (`register_infer_ok`), which gives the list back.
+            let mut obligations = recycle::obligations(2);
             for &source_ty in &[a, b] {
                 if source_ty != target_ty {
                     obligations.push(Obligation::new(

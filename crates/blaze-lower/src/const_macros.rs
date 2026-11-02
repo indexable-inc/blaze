@@ -18,14 +18,14 @@ use base_db::{
 };
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
-use blaze_query::db::{Durability, Setter};
+use blaze_query::db::Durability;
 use blaze_units::{
     query::{PackagePlan, Units},
     schema::{Mode, Unit},
     stdlib::target::{self, CfgArgs},
 };
 use cfg::{CfgAtom, CfgDiff, CfgOptions};
-use hir_expand::proc_macro::{CrateProcMacros, ProcMacro, ProcMacros};
+use hir_expand::proc_macro::{ProcMacro, ProcMacros};
 use hir_ty_mir::const_macro::{CONST_AST, CONST_AST_NAME};
 use intern::Symbol;
 use span::Edition;
@@ -358,12 +358,7 @@ pub(crate) fn set_macros(db: &mut Db, made: Vec<(Crate, Vec<ProcMacro>)>) {
     if made.is_empty() {
         return;
     }
-    let all = ProcMacros::get(&*db);
-    let mut by_crate = all.by_crate(&*db).clone();
-    for (krate, macros) in made {
-        by_crate.insert(krate, Arc::new(CrateProcMacros::new(Ok(macros))));
-    }
-    all.set_by_crate(db).with_durability(Durability::HIGH).to(by_crate);
+    ProcMacros::give(db, made.into_iter().map(|(krate, macros)| (krate, Ok(macros))));
 }
 
 impl Loaded {

@@ -31,6 +31,8 @@ disallowed-types = [
     { path = "once_cell::sync::Lazy", replacement = "std::sync::LazyLock", reason = "std has it", allow-invalid = true },
     { path = "once_cell::sync::OnceCell", replacement = "std::sync::OnceLock", reason = "std has it", allow-invalid = true },
     { path = "std::sync::Barrier", reason = "a pool thread waits through the scheduler (AGENTS.md rule 9): join on a counter or a job" },
+    { path = "std::hash::DefaultHasher", replacement = "blaze_hash::FixedHasher", reason = "SipHash: slow, and not `blaze_hash`'s one hasher" },
+    { path = "std::collections::hash_map::DefaultHasher", replacement = "blaze_hash::FixedHasher", reason = "SipHash: slow, and not `blaze_hash`'s one hasher" },
 ]
 
 disallowed-methods = [
@@ -41,8 +43,17 @@ disallowed-methods = [
     { path = "std::thread::sleep", reason = "on a pool thread a wait goes through the scheduler, elsewhere through a driver's timer (AGENTS.md rule 9)" },
     { path = "std::hint::spin_loop", reason = "the one bounded spin-then-park helper of `blaze_graph` spins (AGENTS.md rules 9 and 13)" },
     { path = "std::thread::spawn", reason = "name the thread, `std::thread::Builder::new().name(..)`: an unnamed thread is unreadable in samples and the profile" },
+    { path = "std::thread::scope", reason = "parallel work runs on blaze's one pool (`blaze_graph::par`), which the scheduler prioritises and the profile sees: a scoped thread is a second, unscheduled pool" },
+    { path = "std::thread::available_parallelism", reason = "the pool owns the worker count (`blaze_graph`'s workers); a second count sizes work for cores another pool is using" },
+    { path = "std::thread::yield_now", reason = "a yield is a spin with no bound: wait through the scheduler, or the bounded spin-then-park helper (AGENTS.md rules 9 and 13)" },
+    { path = "std::thread::park", reason = "on a pool thread a wait goes through the scheduler (AGENTS.md rule 9); a driver parks through its own wait" },
+    { path = "std::thread::park_timeout", reason = "on a pool thread a wait goes through the scheduler (AGENTS.md rule 9); a driver parks through its own wait" },
     { path = "std::env::var", reason = "configuration is typed and read once at the entry point, with no default for a missing value (AGENTS.md rule 3)" },
     { path = "std::env::var_os", reason = "configuration is typed and read once at the entry point, with no default for a missing value (AGENTS.md rule 3)" },
     { path = "std::process::exit", reason = "return a typed error from `main`, so destructors and the profile's flush run" },
     { path = "std::mem::forget", replacement = "std::mem::ManuallyDrop::new", reason = "says what it keeps from being dropped" },
+]
+
+disallowed-macros = [
+    { path = "lazy_static::lazy_static", replacement = "std::sync::LazyLock", reason = "std has it", allow-invalid = true },
 ]

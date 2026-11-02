@@ -41,8 +41,8 @@ impl Clap for Command {
                 KEEP_GOING, TARGET, ARTIFACT, REPORTS, COMPILE_TIME_DEPS, MANIFEST, REFUSED,
             ],
             Command::Check => &[
-                GLOBAL, FUTURE, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, KEEP_GOING, RELEASE,
-                PROFILE, TARGET, REPORTS, COMPILE_TIME_DEPS, MANIFEST, REFUSED,
+                GLOBAL, CHECK_ONLY, BASELINES, FUTURE, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS,
+                KEEP_GOING, RELEASE, PROFILE, TARGET, REPORTS, COMPILE_TIME_DEPS, MANIFEST, REFUSED,
             ],
             Command::Run => &[
                 GLOBAL, MESSAGE, SILENT, PACKAGE, RUN_TARGETS, FEATURES, JOBS, KEEP_GOING, RELEASE, PROFILE,
@@ -267,9 +267,44 @@ const TEST_ONLY: &[Flag] = &[
 /// error names, the first `N` or every one ([`blaze_api::Cargo::refused`]).
 const REFUSED: &[Flag] = &[Flag::new("refused", None, Takes::Value, "N|all")];
 
-/// blaze's own flags: read here, never on cargo's command line.
+/// `check`'s edits, blaze's: `--fix` makes every machine-applicable suggestion of the check
+/// ([`super::fix`]), only those of each `--lint NAME` when any is given; `--replace FROM=TO`
+/// retargets every reference to the item `FROM` to `TO` by name resolution
+/// ([`super::replace`]), and checks nothing.
+const CHECK_ONLY: &[Flag] = &[
+    Flag::switch("fix"),
+    Flag::new("lint", None, Takes::Value, "NAME").many(),
+    Flag::new("replace", None, Takes::Value, "FROM=TO").many(),
+];
+
+/// `check`'s baselines, blaze's (`blaze_lints::baseline`): `--baselines DIR` checks the run's
+/// counts against the baselines in `DIR`, `--bless-baselines` lowers them to the run's, and
+/// `--new-baseline LINT[,LINT...]`, given any number of times, starts each `LINT`'s at the run's.
+const BASELINES: &[Flag] = &[
+    Flag::new("baselines", None, Takes::Value, "DIR"),
+    Flag::switch("bless-baselines"),
+    Flag::new("new-baseline", None, Takes::Value, "LINT").many(),
+];
+
+/// The flags read here and never handed to the daemon's load: blaze's own, which the client
+/// does.
 fn blaze_only(flag: &Flag) -> bool {
-    matches!(flag.long, Some("reached" | "ub" | "ub-seed" | "ub-schedules" | "refused"))
+    matches!(
+        flag.long,
+        Some(
+            "reached"
+                | "ub"
+                | "ub-seed"
+                | "ub-schedules"
+                | "refused"
+                | "baselines"
+                | "bless-baselines"
+                | "new-baseline"
+                | "fix"
+                | "lint"
+                | "replace"
+        )
+    )
 }
 const RUNNING: &[Flag] = &[Flag::switch("no-run"), Flag::switch("no-fail-fast")];
 
@@ -300,8 +335,6 @@ pub enum Asked {
     Debug(Vec<OsString>),
     /// `blaze explain VIEW ...`, with the words after it ([`super::observe::explain`]).
     Explain(Vec<OsString>),
-    /// `blaze fix --replace FROM=TO ...`, with the words after it ([`super::fix::main`]).
-    Fix(Vec<OsString>),
     Help(Option<Command>),
     Version,
     /// A command that is none of blaze's.
@@ -388,6 +421,18 @@ pub fn refused(asked: &Invocation) -> Option<String> {
                 format!("`blaze doc` writes no JSON messages for the pages yet (`--message-format {it}`)")
             })
         }
+        Command::Check if !flags.replace.is_empty() && (flags.fix || flags.baselines.is_some()) => {
+            Some("`--replace` makes its edits and checks nothing: run `--fix` and `--baselines` apart".to_owned())
+        }
+        Command::Check if flags.fix && flags.baselines.is_some() => {
+            Some("`--fix` changes the findings `--baselines` counts: run them apart".to_owned())
+        }
+        Command::Check if !flags.fix && !flags.lints.is_empty() => {
+            Some("`--lint` narrows the suggestions `--fix` makes: give `--fix` too".to_owned())
+        }
+        Command::Check if flags.baselines.is_none() && (flags.bless_baselines || !flags.new_baselines.is_empty()) => {
+            Some("`--bless-baselines` and `--new-baseline` write the baselines `--baselines DIR` names".to_owned())
+        }
         _ => None,
     }
 }
@@ -432,6 +477,15 @@ pub struct Flags {
     pub refused: Option<Option<u32>>,
     /// `--unit-graph` and `--timings`, by name, as given.
     pub reports: Vec<&'static str>,
+    /// `check`'s `--fix`, and each `--lint` it is narrowed to.
+    pub fix: bool,
+    pub lints: Vec<String>,
+    /// `check`'s `--replace`, each `FROM=TO` as given.
+    pub replace: Vec<String>,
+    /// `check`'s `--baselines`, `--bless-baselines` and each `--new-baseline`.
+    pub baselines: Option<String>,
+    pub bless_baselines: bool,
+    pub new_baselines: Vec<String>,
 }
 
 impl Flags {
@@ -484,6 +538,15 @@ impl Flags {
                 self.ub_schedules = value.and_then(|it| it.parse().ok());
             }
             "refused" => self.refused = value.map(|it| it.parse().ok()),
+            "fix" => self.fix = true,
+            "lint" => self.lints.extend(owned()),
+            "replace" => self.replace.extend(owned()),
+            "baselines" => self.baselines = owned(),
+            "bless-baselines" => self.bless_baselines = true,
+            "new-baseline" => {
+                let lints = value.unwrap_or_default().split(',');
+                self.new_baselines.extend(lints.filter(|it| !it.is_empty()).map(str::to_owned));
+            }
             _ => {}
         }
     }
@@ -547,7 +610,6 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("explore") => return Ok(Asked::Explore(words.collect())),
             Some("debug") => return Ok(Asked::Debug(words.collect())),
             Some("explain") => return Ok(Asked::Explain(words.collect())),
-            Some("fix") => return Ok(Asked::Fix(words.collect())),
             Some("daemon") => {
                 return Ok(match words.next().as_deref().and_then(std::ffi::OsStr::to_str) {
                     Some("install") => Asked::Daemon(DaemonVerb::Install),

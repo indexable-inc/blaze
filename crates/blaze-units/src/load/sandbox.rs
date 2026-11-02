@@ -36,7 +36,7 @@ pub(crate) struct WorkspaceOptOut {
     /// `unsandboxed-build-scripts`: packages by name, sorted.
     pub build_scripts: Vec<String>,
     /// `build-script-link-dirs`: absolute (a relative one is under the workspace's root),
-    /// normal, sorted.
+    /// normal, sorted; or `${NAME}/rest` as written, `NAME` one `build-script-env` lists.
     pub link_dirs: Vec<String>,
     /// [`EXPERIMENTAL`] lists [`SANDBOXED_TESTS`].
     pub sandboxed_tests: bool,
@@ -78,6 +78,8 @@ pub(crate) fn workspace(metadata: Option<&toml::Value>, manifest: &Path) -> Resu
     let Some(table) = sandbox_table(metadata) else { return Ok(out) };
     let wrong = |what: &str| wrong(WORKSPACE_TABLE, manifest, what);
     let root = manifest.parent().unwrap_or(Path::new("/"));
+    let mut env: Vec<&str> = Vec::new(); // alloc: a manifest's few names, once a load
+    let mut under_vars: Vec<(&str, &str)> = Vec::new(); // alloc: as above
     for (key, value) in table {
         let names = || -> Result<Vec<&str>, LoadError> {
             let list = value.as_array().ok_or_else(|| wrong(&format!("`{key}` is a list")))?;
@@ -87,15 +89,23 @@ pub(crate) fn workspace(metadata: Option<&toml::Value>, manifest: &Path) -> Resu
             "unsandboxed-build-scripts" => out.build_scripts = names()?.into_iter().map(str::to_owned).collect(),
             "build-script-link-dirs" => {
                 for dir in names()? {
+                    // Expanded from the script's environment when it runs (`blaze_cargo::directives::link_dirs`).
+                    if let Some(rest) = dir.strip_prefix("${") {
+                        let name = rest.split_once('}').map(|(name, _)| name).filter(|it| !it.is_empty());
+                        let name = name.ok_or_else(|| {
+                            wrong(&format!("`{dir}` of `build-script-link-dirs` starts `${{` with no `NAME}}` after it"))
+                        })?;
+                        under_vars.push((dir, name));
+                        out.link_dirs.push(dir.to_owned());
+                        continue;
+                    }
                     let absolute = super::files::normal(&root.join(dir))
                         .ok_or_else(|| wrong(&format!("`{dir}` of `build-script-link-dirs` is not a UTF-8 path")))?;
                     out.link_dirs.push(absolute);
                 }
             }
             // Every build script is given the command's whole environment, these variables too.
-            "build-script-env" => {
-                names()?;
-            }
+            "build-script-env" => env = names()?,
             "unsandboxed-proc-macros" => {
                 return Err(wrong(&format!(
                     "`unsandboxed-proc-macros` lists {:?}, but no proc macro can run outside: blaze runs \
@@ -118,6 +128,13 @@ pub(crate) fn workspace(metadata: Option<&toml::Value>, manifest: &Path) -> Resu
                 )));
             }
         }
+    }
+    // A dir under a variable the workspace does not declare its scripts read would hang on
+    // whatever the shell happens to set.
+    if let Some((dir, name)) = under_vars.iter().find(|(_, name)| !env.contains(name)) {
+        return Err(wrong(&format!(
+            "`{dir}` of `build-script-link-dirs` is under `{name}`, which `build-script-env` does not list"
+        )));
     }
     out.build_scripts.sort_unstable();
     out.build_scripts.dedup();
@@ -256,6 +273,26 @@ mod tests {
         assert!(!out.sandboxed_tests);
         assert_eq!(workspace(None, manifest).unwrap(), WorkspaceOptOut::default());
         assert_eq!(workspace(Some(&metadata("[other]\nx = 1\n")), manifest).unwrap(), WorkspaceOptOut::default());
+    }
+
+    /// A link dir under a variable is kept as written, for the run to expand; its variable must
+    /// be one `build-script-env` lists, whichever key comes first.
+    #[test]
+    fn a_link_dir_under_a_variable_is_kept_for_the_run_and_its_variable_is_declared() {
+        let manifest = Path::new("/w/Cargo.toml");
+        let declared = metadata(
+            "[blaze.sandbox]\nbuild-script-link-dirs = [\"${LLVM_SYS_231_PREFIX}/lib\", \"/opt/lib\"]\n\
+             build-script-env = [\"LLVM_SYS_231_PREFIX\"]\n",
+        );
+        let out = workspace(Some(&declared), manifest).unwrap();
+        assert_eq!(out.link_dirs, ["${LLVM_SYS_231_PREFIX}/lib", "/opt/lib"]);
+
+        let undeclared = metadata("[blaze.sandbox]\nbuild-script-link-dirs = [\"${LLVM_SYS_231_PREFIX}/lib\"]\n");
+        let error = workspace(Some(&undeclared), manifest).unwrap_err();
+        assert!(error.what.ends_with("is under `LLVM_SYS_231_PREFIX`, which `build-script-env` does not list"), "{}", error.what);
+        let unclosed = metadata("[blaze.sandbox]\nbuild-script-link-dirs = [\"${LLVM/lib\"]\n");
+        let error = workspace(Some(&unclosed), manifest).unwrap_err();
+        assert!(error.what.contains("with no `NAME}` after it"), "{}", error.what);
     }
 
     #[test]

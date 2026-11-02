@@ -102,6 +102,7 @@ impl Vtable {
             fields: &[],
             row_size: size_of::<InternRow<I::Fields>>(),
             ids_of: Some(ids_of::<I> as fn(&Storage, u32, Id, &mut Vec<Id>)),
+            made: Some(made::<I> as fn(&Storage, u32, Id) -> bool),
             memory: memory::<I>,
             verify: None,
             reset: None,
@@ -267,6 +268,10 @@ pub(crate) fn fields_of<F: Send + Sync + 'static>(
 /// The name of the function whose hidden key `id` is, if it is one.
 pub fn interned_arguments(storage: &Storage, id: Id) -> Option<&'static str> {
     storage.ingredient_name(storage.owner(id)?).strip_suffix(ARGUMENTS)
+}
+
+fn made<I: Interned>(storage: &Storage, index: u32, id: Id) -> bool {
+    fields_of::<I::Fields>(storage, index, id).is_some()
 }
 
 fn ids_of<I: Interned>(storage: &Storage, index: u32, id: Id, out: &mut Vec<Id>) {

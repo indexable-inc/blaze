@@ -13,9 +13,9 @@ use crate::{db, plumbing, structs, value};
 
 pub(crate) fn expand(
     args: TokenStream,
-    item: ItemStruct,
+    item: &ItemStruct,
 ) -> Result<TokenStream, (syn::Error, TokenStream)> {
-    expand_in(args, &item).map_err(|error| (error, structs::stripped(&item)))
+    expand_in(args, item).map_err(|error| (error, structs::stripped(item)))
 }
 
 fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
@@ -99,7 +99,7 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
         .iter()
         .zip(&indices)
         .map(|(it, index)| it.store(&quote!(#plumbing::Lookup::into_owned(key.#index))));
-    let make = structs::construct(struct_lt, quote!(id));
+    let make = structs::construct(struct_lt, &quote!(id));
 
     let mut getters = TokenStream::new();
     for ((field, it), index) in fields.iter().zip(&both).zip(&indices) {

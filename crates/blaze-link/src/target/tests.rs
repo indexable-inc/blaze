@@ -94,6 +94,21 @@ fn temp(name: &str) -> PathBuf {
     dir
 }
 
+/// A `.tbd` for AArch64 and x86-64 macOS whose install name is `install`, re-exporting the
+/// libraries `reexports`.
+fn stub(install: &str, reexports: &[&str]) -> Vec<u8> {
+    let mut text = format!("--- !tapi-tbd\ntbd-version: 4\ntargets: [ x86_64-macos, arm64-macos ]\ninstall-name: '{install}'\n");
+    if !reexports.is_empty() {
+        let libraries: Vec<String> = reexports.iter().map(|it| format!("'{it}'")).collect();
+        text.push_str(&format!(
+            "reexported-libraries:\n  - targets: [ x86_64-macos, arm64-macos ]\n    libraries: [ {} ]\n",
+            libraries.join(", ")
+        ));
+    }
+    text.push_str("...\n");
+    text.into_bytes()
+}
+
 fn touch(path: &Path, bytes: &[u8]) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, bytes).unwrap();
@@ -477,10 +492,10 @@ fn no_c_toolchain_is_an_error_naming_what_was_tried() {
 fn a_macos_line_takes_tbds_before_dylibs_and_frameworks_from_the_sdk() {
     let sdk = temp("sdk-line");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
-    let tbd = b"--- !tapi-tbd\ntbd-version: 4\n...\n";
+    let tbd = &stub("/usr/lib/libstub.dylib", &[]);
     touch(&sdk.join("usr/lib/libSystem.tbd"), tbd);
     touch(&sdk.join("usr/lib/libiconv.tbd"), tbd);
-    touch(&sdk.join("usr/lib/libiconv.dylib"), b"");
+    touch(&sdk.join("usr/lib/libiconv.dylib"), tbd);
     touch(&sdk.join("System/Library/Frameworks/CoreFoundation.framework/CoreFoundation.tbd"), tbd);
     let answers = Answers::new().var("SDKROOT", sdk.display().to_string()).answer(DRIVER, jobs(&[]));
     let cache = Cache::new();
@@ -504,10 +519,10 @@ fn a_macos_line_takes_tbds_before_dylibs_and_frameworks_from_the_sdk() {
 fn a_library_only_on_a_path_the_c_driver_passes_its_linker_is_found() {
     let sdk = temp("sdk-driver");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
-    touch(&sdk.join("usr/lib/libSystem.tbd"), b"--- !tapi-tbd\ntbd-version: 4\n...\n");
+    touch(&sdk.join("usr/lib/libSystem.tbd"), &stub("/usr/lib/libSystem.B.dylib", &[]));
     let (nix, profile, mine) = (temp("nix-libiconv"), temp("nix-profile"), temp("mine"));
-    touch(&nix.join("libiconv.dylib"), b"");
-    touch(&profile.join("libiconv.dylib"), b"");
+    touch(&nix.join("libiconv.dylib"), &stub("/nix/libiconv.dylib", &[]));
+    touch(&profile.join("libiconv.dylib"), &stub("/profile/libiconv.dylib", &[]));
     let missing = nix.join("missing");
     let answers =
         Answers::new().var("SDKROOT", sdk.display().to_string()).answer(DRIVER, jobs(&[&nix, &missing, &profile]));
@@ -543,6 +558,58 @@ fn a_library_only_on_a_path_the_c_driver_passes_its_linker_is_found() {
     let error = executable(&Cache::new(), &Answers::new().var("SDKROOT", sdk.display().to_string()), "aarch64-apple-darwin")
         .unwrap_err();
     assert!(error.what.contains(DRIVER) && error.what.contains("neither CC_aarch64_apple_darwin nor CC"), "{}", error.what);
+}
+
+/// nix's libiconv re-exports libcharset by its absolute install name, which no `-L` names:
+/// ld64 loads it with libiconv, so the line has it after libiconv, needed when imported from.
+#[test]
+fn a_macos_library_is_followed_by_the_libraries_it_reexports() {
+    let sdk = temp("sdk-reexport");
+    touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
+    touch(&sdk.join("usr/lib/libSystem.tbd"), &stub("/usr/lib/libSystem.B.dylib", &[]));
+    touch(&sdk.join("usr/lib/libfake.1.tbd"), &stub("/usr/lib/libfake.1.dylib", &[]));
+    let (iconv, charset) = (temp("nix-iconv"), temp("nix-charset"));
+    let installed = charset.join("libcharset.1.dylib");
+    let installed = installed.to_str().unwrap();
+    let reexports = [installed, "/usr/lib/libfake.1.dylib"];
+    touch(&iconv.join("libiconv.dylib"), &stub(iconv.join("libiconv.2.dylib").to_str().unwrap(), &reexports));
+    touch(&charset.join("libcharset.1.dylib"), &stub(installed, &["@loader_path/deep/libdeep.dylib"]));
+    touch(&charset.join("deep/libdeep.dylib"), &stub("/nowhere/libdeep.dylib", &[installed]));
+    let answers = Answers::new().var("SDKROOT", sdk.display().to_string()).answer(DRIVER, jobs(&[&iconv]));
+    let cache = Cache::new();
+    let output = executable(&cache, &answers, "aarch64-apple-darwin").unwrap();
+    let located = locate_plain(&cache, &answers, &output, &[dylib("iconv")], &[]).unwrap();
+    let asked = NativeKind::Shared { as_needed: false };
+    assert_eq!(
+        line(&located),
+        [
+            (iconv.join("libiconv.dylib"), asked),
+            (charset.join("libcharset.1.dylib"), SHARED),
+            (charset.join("deep/libdeep.dylib"), SHARED),
+            (sdk.join("usr/lib/libfake.1.tbd"), SHARED),
+            (sdk.join("usr/lib/libSystem.tbd"), asked),
+        ],
+        "each re-export once, after its library, transitively; a `/usr/lib` one is the SDK's `.tbd`"
+    );
+    let search = std::slice::from_ref(&charset);
+    let located = locate_plain(&cache, &answers, &output, &[dylib("iconv"), dylib("charset.1")], search).unwrap();
+    assert_eq!(line(&located)[1], (charset.join("libcharset.1.dylib"), asked), "asked for too, it is loaded used or not");
+
+    touch(&iconv.join("libiconv.dylib"), &stub("/nix/libiconv.2.dylib", &["/gone/libcharset.1.dylib"]));
+    let error = locate_plain(&cache, &answers, &output, &[dylib("iconv")], &[]).unwrap_err();
+    assert!(error.what.contains("re-exports /gone/libcharset.1.dylib (LC_REEXPORT_DYLIB)"), "{}", error.what);
+    let found = error.not_found().expect("a typed not-found");
+    assert_eq!(found.library, "/gone/libcharset.1.dylib");
+    assert_eq!(found.files, ["libcharset.1.tbd", "libcharset.1.dylib"]);
+    assert_eq!(
+        found.searched,
+        [(sdk.join("gone"), Searched::Toolchain), (PathBuf::from("/gone"), Searched::InstallName)],
+        "under the SDK, then the install name's own directory"
+    );
+
+    touch(&iconv.join("libiconv.dylib"), &stub("/nix/libiconv.2.dylib", &["@rpath/libcharset.1.dylib"]));
+    let error = locate_plain(&cache, &answers, &output, &[dylib("iconv")], &[]).unwrap_err();
+    assert!(error.what.contains("@rpath/libcharset.1.dylib names the image's run"), "{}", error.what);
 }
 
 #[test]
@@ -720,7 +787,7 @@ fn autolinking(options: &[&[&'static str]]) -> Vec<u8> {
 fn a_macos_line_is_followed_by_what_its_objects_and_members_ask_for() {
     let (sdk, mine) = (temp("sdk-autolink"), temp("mine-autolink"));
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
-    let tbd = b"--- !tapi-tbd\ntbd-version: 4\n...\n";
+    let tbd = &stub("/usr/lib/libstub.dylib", &[]);
     touch(&sdk.join("usr/lib/libSystem.tbd"), tbd);
     touch(&sdk.join("usr/lib/libz.tbd"), tbd);
     let frameworks = sdk.join("System/Library/Frameworks");
@@ -746,7 +813,7 @@ fn a_macos_line_is_followed_by_what_its_objects_and_members_ask_for() {
     let located = locate_plain(&cache, &answers, &output, &libs, search).unwrap();
     assert_eq!(line(&located), expected, "an object's -lz, a member's -framework, transitively, each once after its asker");
     let read = cache.asked.lock().len();
-    assert_eq!(read, 3, "glue.o, libsec.a and libhelper.a");
+    assert_eq!(read, 4, "glue.o, libsec.a and libhelper.a, and the stubs' re-exports");
     assert_eq!(line(&locate_plain(&cache, &answers, &output, &libs, search).unwrap()), expected);
     assert_eq!(cache.asked.lock().len(), read, "a file's content is read for its options once");
 
@@ -821,13 +888,13 @@ fn a_linux_sanitizers_runtime_is_its_whole_archive_after_the_start_objects() {
 fn a_macos_sanitizers_runtime_is_its_dylib_found_by_an_absolute_rpath() {
     let sdk = temp("sanitize-sdk");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
-    touch(&sdk.join("usr/lib/libSystem.tbd"), b"--- !tapi-tbd\ntbd-version: 4\n...\n");
+    touch(&sdk.join("usr/lib/libSystem.tbd"), &stub("/usr/lib/libSystem.B.dylib", &[]));
     let answers = Answers::new().var("SDKROOT", sdk.display().to_string()).answer(DRIVER, jobs(&[]));
     let cache = Cache::new();
     let sysroot = temp("sanitize-macos");
     let dir = sysroot.join("lib/rustlib/aarch64-apple-darwin/lib");
     for name in ["asan", "tsan"] {
-        touch(&dir.join(format!("librustc-nightly_rt.{name}.dylib")), b"");
+        touch(&dir.join(format!("librustc-nightly_rt.{name}.dylib")), &stub("@rpath/librt.dylib", &[]));
     }
     let plain = executable(&cache, &answers, "aarch64-apple-darwin").unwrap();
     assert!(rpaths(Target::MacOs, &plain, &sysroot).unwrap().is_empty(), "no sanitizer, no rpath");

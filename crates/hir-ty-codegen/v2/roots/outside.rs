@@ -155,7 +155,7 @@ impl<'db> Graph<'_, '_, 'db> {
     ) -> Result<(bool, Cow<'db, [Ref]>), String> {
         let names = match node {
             Ref::Function(instance) => match &instance.0 {
-                Kind::Asm(_) => return Ok((true, Cow::Borrowed(&[]))),
+                Kind::Asm(..) => return Ok((true, Cow::Borrowed(&[]))),
                 // The walk without MIR inlining reaches what the one with does, through the
                 // callees it inlines.
                 _ => refs::listed(db, instance, false)?,

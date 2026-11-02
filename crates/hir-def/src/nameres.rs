@@ -768,6 +768,66 @@ impl std::fmt::Display for Unmaintained {
 
 impl std::error::Error for Unmaintained {}
 
+/// Name resolution of a crate, or of a block of it, that still made progress after
+/// `FIXED_POINT_LIMIT` macro rounds: every round resolved a macro call or reseeded an
+/// attribute, so it would never reach its fixed point. A bug in blaze, or a program whose
+/// macros expand without end below the recursion limit. It unwinds like [`Unmaintained`], and
+/// the driver that catches it stops the build with it as the error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixpointLimit {
+    pub krate: Crate,
+    /// Its display name, if it has one.
+    pub name: Option<String>,
+    /// Whether it was a block's resolution, not the crate's.
+    pub block: bool,
+    /// The rounds run.
+    pub rounds: u32,
+    /// How many macro calls were still waiting to resolve, and how many imports.
+    pub pending_macros: usize,
+    pub pending_imports: usize,
+    /// The first of them, each as "macro `path` in module `name`" or "import `path` in ...".
+    pub first: Vec<String>,
+}
+
+impl FixpointLimit {
+    /// How many of the pending macro calls and imports [`FixpointLimit::first`] lists.
+    pub(crate) const LISTED: usize = 8;
+
+    /// Unwinds with `self` as the payload, logged first as [`Unmaintained::throw`] is.
+    pub fn throw(self) -> ! {
+        tracing::error!("{self}");
+        std::panic::panic_any(self)
+    }
+
+    /// The `FixpointLimit` a caught panic's payload is, if it is one.
+    // dyn: a caught panic's payload, read once
+    pub fn of_payload(payload: &(dyn std::any::Any + Send)) -> Option<&FixpointLimit> {
+        payload.downcast_ref::<FixpointLimit>()
+    }
+}
+
+impl std::fmt::Display for FixpointLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("name resolution: ")?;
+        if self.block {
+            f.write_str("a block of ")?;
+        }
+        f.write_str("crate ")?;
+        write_crate(f, self.krate, self.name.as_deref())?;
+        write!(
+            f,
+            " still made progress after {} macro rounds, with {} macro calls and {} imports pending",
+            self.rounds, self.pending_macros, self.pending_imports
+        )?;
+        for it in &self.first {
+            write!(f, "\n  {it}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for FixpointLimit {}
+
 #[blaze_query::tracked(returns(ref))]
 pub fn block_def_map<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {
     // The `'static` ids go only into the `DefMap` this query returns, invalidated with its key.

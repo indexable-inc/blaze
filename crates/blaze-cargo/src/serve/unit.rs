@@ -208,7 +208,7 @@ impl Steps for Real {
                     .refresh(lower(), |db| seed(db, &seeds))
                     .map_err(failed)?
                 {
-                    true => (lowered, Some(session), seeds),
+                    true => (lowered.into_inner(), Some(session), seeds),
                     false => {
                         drop((session, lowered, seeds));
                         (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new())
@@ -248,7 +248,7 @@ impl Steps for Real {
             }
             let writer = UnitWriter {
                 session,
-                front: Arc::new(lowered),
+                front: Held::new(Arc::new(lowered), "a job's front end"),
                 job,
                 waits,
                 ready: Vec::new(),
@@ -304,7 +304,7 @@ pub struct KeptLowered {
     /// next build lowers into it. Declared first: its goal store is uninstalled before the
     /// database it is keyed to drops.
     session: deps::Session,
-    lowered: Lowered,
+    lowered: Held<Lowered>,
     units: Arc<Units>,
     config: Arc<BuildConfig>,
     /// What it was served with, until the next build lowering into it stores the images.
@@ -353,7 +353,7 @@ pub struct UnitWriter {
     /// What the front end's database keeps of the store ([`deps::session`]), declared first
     /// as in [`KeptLowered`].
     session: deps::Session,
-    front: Arc<Lowered>,
+    front: Held<Arc<Lowered>>,
     job: Arc<Job>,
     waits: graph::Waits,
     /// The units the runs of one apply made ready, reused from apply to apply.
@@ -486,14 +486,14 @@ impl Writer<Real> for UnitWriter {
     fn keep(mut self) -> Result<KeptLowered, ApiError> {
         if !self.apply()? {
             let what = "the front end is kept for the head's next build with no task reading it, and one still does";
-            return Err(ApiError::new(what, None));
+            return Err(self.refused(what));
         }
         if self.broken || !self.broke.is_empty() {
             let what = "the front end is not kept for the head's next build: a write to it panicked, and it may be half written";
-            return Err(ApiError::new(what, None));
+            return Err(self.refused(what));
         }
         let UnitWriter { session, front, job, deps, .. } = self;
-        let Some(lowered) = Arc::into_inner(front) else {
+        let Some(lowered) = Arc::into_inner(front.into_inner()) else {
             let what = "the front end is kept for the head's next build, and another holder of it is still alive";
             return Err(ApiError::new(what, None));
         };
@@ -504,7 +504,7 @@ impl Writer<Real> for UnitWriter {
         let memo = Some(job.shared.memos.hold(used));
         Ok(KeptLowered {
             session,
-            lowered,
+            lowered: Held::new(lowered, "a kept front end"),
             units: job.input.units.clone(),
             config: job.input.config.clone(),
             deps,
@@ -513,6 +513,77 @@ impl Writer<Real> for UnitWriter {
             seeds,
             memo,
         })
+    }
+}
+
+impl UnitWriter {
+    /// The error of a front end [`Writer::keep`] refuses, which it lets go of here: the panic
+    /// of that drop, if it panics, is said with the refusal and fails the job with it.
+    fn refused(self, what: &str) -> ApiError {
+        let UnitWriter { session, front, .. } = self;
+        drop(session);
+        match front.let_go() {
+            Ok(()) => ApiError::new(what, None),
+            // alloc: an error, once
+            Err(panic) => ApiError::new(format!("{what}; letting go of it then {panic}"), None),
+        }
+    }
+}
+
+/// A front end's database as the loop holds it ([`UnitWriter`], [`KeptLowered`]). The last
+/// drop of one drops a whole query storage, which may panic (a table it can't walk), and a
+/// panic on the loop would end every request the daemon serves (rule 15). Its drop runs inside
+/// a catch: a panic there is said in the daemon's log, naming what was let go, and where a job
+/// can still fail with it, [`Held::let_go`] gives it to that job.
+pub(crate) struct Held<T> {
+    it: Option<T>,
+    what: &'static str,
+}
+
+impl<T> Held<T> {
+    fn new(it: T, what: &'static str) -> Held<T> {
+        Held { it: Some(it), what }
+    }
+
+    fn into_inner(mut self) -> T {
+        self.it.take().expect("a front end held is there until it is let go")
+    }
+
+    /// Drops it now, inside a catch: the panic, if the drop panics.
+    fn let_go(mut self) -> Result<(), super::plane::Panic> {
+        self.it.take().map_or(Ok(()), dropped)
+    }
+}
+
+/// Drops `it` inside a catch: the panic, if the drop panics.
+fn dropped<T>(it: T) -> Result<(), super::plane::Panic> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(it))).map_err(|payload| super::plane::panicked(&*payload))
+}
+
+impl<T> std::ops::Deref for Held<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.it.as_ref().expect("a front end held is there until it is let go")
+    }
+}
+
+impl<T> std::ops::DerefMut for Held<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.it.as_mut().expect("a front end held is there until it is let go")
+    }
+}
+
+impl<T> Drop for Held<T> {
+    fn drop(&mut self) {
+        if let Some(it) = self.it.take()
+            && let Err(panic) = dropped(it)
+        {
+            eprintln!(
+                "blaze serve: letting go of {} {panic}; the daemon goes on, the memory it held may be lost",
+                self.what
+            );
+        }
     }
 }
 
@@ -588,7 +659,9 @@ fn library_fingerprint(dir: &std::path::Path, prefix: &str, into: &mut blaze_ids
 }
 
 /// `work` on a worker, the front end's or the build graph's cancel as [`Failed::Again`]: the
-/// loop posts it again whole, and nothing of it is kept. Any other panic is not caught.
+/// loop posts it again whole, and nothing of it is kept. Name resolution's typed stops
+/// ([`hir_def::nameres::Unmaintained`], [`hir_def::nameres::FixpointLimit`]) become the unit's
+/// error. Any other panic is not caught.
 pub(crate) fn cancellable<T>(work: impl FnOnce() -> T) -> Result<T, Failed> {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
     match caught {
@@ -597,6 +670,8 @@ pub(crate) fn cancellable<T>(work: impl FnOnce() -> T) -> Result<T, Failed> {
             if payload.is::<blaze_query::db::Cancelled>() || payload.is::<blaze_graph::Cancelled>() {
                 Err(Failed::Again)
             } else if let Some(it) = hir_def::nameres::Unmaintained::of_payload(&*payload) {
+                Err(Failed::Error(ApiError::new(it.to_string(), None))) // alloc: an error, once
+            } else if let Some(it) = hir_def::nameres::FixpointLimit::of_payload(&*payload) {
                 Err(Failed::Error(ApiError::new(it.to_string(), None))) // alloc: an error, once
             } else {
                 std::panic::resume_unwind(payload)
@@ -815,9 +890,14 @@ pub(crate) fn unit_target(unit: &Unit) -> Result<UnitTarget, ApiError> {
     })
 }
 
-/// Whether the job stops `unit` after the front end: a check, or every unit of `cargo check`.
+/// Whether the job stops `unit` after the front end: a check, or every unit of `cargo check`
+/// but a build script's compile, which is linked as cargo links it there, for its run.
 pub(crate) fn checks_only(goal: Goal, unit: &Unit) -> bool {
-    goal == Goal::Check || matches!(unit.mode, Mode::Check)
+    match unit.mode {
+        Mode::Check => true,
+        Mode::Build if unit.target.is_custom_build() => false,
+        _ => goal == Goal::Check,
+    }
 }
 
 /// The phases of `unit`'s compile, each a node of the plane ([`Phase`]): no codegen and no

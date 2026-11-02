@@ -144,6 +144,20 @@ empty and allocated one; a warm re-solve of an unchanged body allocated once per
 (`docs/v2/plan/lanes/mem/db-solver.md`, item 8). Answers are unchanged: nothing reads the list
 after a bail.
 
+### 0010-never-grown-scratch-buffers-kept
+
+What: `solve::scratch` (patches `0004-solver-temporaries-recycled` and
+`0008-scratch-buffers-raised`) keeps a buffer given back that never grew, raised to the largest
+its pool holds, once the pool holds any room; before, only buffers that had grown were kept.
+
+Why: `evaluate_added_goals_step` swaps the list it evaluates for a spare from the pool, so a
+grown list goes back to the pool at a shallower level than the one that took it, and the spare
+that took its place, never grown, was dropped. Taken last in, first out, the one grown list went
+to an outer goal on the next run and the probe that grows a list found the pool empty again,
+for as many runs as goals nest: warm re-solves of one body still allocated a nested-goals list
+per run (`docs/v2/plan/lanes/mem/db-solver.md`, item 8). Kept, a pool holds a buffer per level
+after one run. Answers are unchanged.
+
 ## Dropped since the previous base (ra-ap-rustc_next_trait_solver 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#161380 (a constant sends a goal back to the caller's typing

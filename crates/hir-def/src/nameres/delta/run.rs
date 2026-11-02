@@ -23,7 +23,7 @@ use crate::{
         DefMap, DiagnosticsByModule, LocalDefMap, ModulesMap, ModulesSlot,
         facts::{
             FrameVec, collect,
-            driver::{FIXED_POINT_LIMIT, copy_diagnostic},
+            driver::{FIXED_POINT_LIMIT, copy_diagnostic, fixpoint_limit},
             env::{ChildMode, ChildRequest, CrateEnv, SideTables, Sink},
             macros,
             ops::{DeclOp, MacroOp},
@@ -192,8 +192,8 @@ fn run_in<'db>(
             eager_with_errors = false;
             rounds += 1;
             if rounds > FIXED_POINT_LIMIT {
-                tracing::error!("name resolution is stuck");
-                break 'resolve_attr;
+                let imports = sink.unit.import_outcomes().filter(|(_, it)| it.is_none()).map(|(it, _)| it);
+                fixpoint_limit(db, krate, false, rounds, pending.iter().flatten(), imports).throw();
             }
         }
         let first = (0..region.len()).find_map(|at| Some((at, macros::first_attr(&pending[at])?)));

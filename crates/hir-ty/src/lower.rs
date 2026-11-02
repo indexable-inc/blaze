@@ -302,21 +302,24 @@ pub(crate) enum InferVars<'a, 'db> {
 }
 
 impl<'db> InferVars<'_, 'db> {
+    /// A variable for `span`, made for `param` where it stands for a parameter's argument left
+    /// out (rustc's `var_for_def`, whose origin names it in "cannot infer type").
     fn next_ty_var(
         &mut self,
         span: Span,
+        param: Option<TypeParamId>,
         types: &DefaultAny<'db>,
         type_placeholders: &mut Vec<(TypeRefId, Ty<'db>), &Frame>,
     ) -> Ty<'db> {
         match self {
             InferVars::Inference { table } => {
-                let ty = table.infer_ctxt.next_ty_var(span);
+                let ty = table.infer_ctxt.next_ty_var_for_param(span, param);
                 if let Span::TypeRefId(type_ref) = span {
                     type_placeholders.push((type_ref, ty));
                 }
                 ty
             }
-            InferVars::Context(infcx) => infcx.next_ty_var(span),
+            InferVars::Context(infcx) => infcx.next_ty_var_for_param(span, param),
             InferVars::Answered(infer) => match span {
                 Span::TypeRefId(type_ref) => infer
                     .and_then(|infer| infer.type_of_type_placeholder(type_ref))
@@ -326,10 +329,17 @@ impl<'db> InferVars<'_, 'db> {
         }
     }
 
-    fn next_const_var(&mut self, span: Span, types: &DefaultAny<'db>) -> Const<'db> {
+    fn next_const_var(
+        &mut self,
+        span: Span,
+        param: Option<ConstParamId>,
+        types: &DefaultAny<'db>,
+    ) -> Const<'db> {
         match self {
-            InferVars::Inference { table, .. } => table.infer_ctxt.next_const_var(span),
-            InferVars::Context(infcx) => infcx.next_const_var(span),
+            InferVars::Inference { table, .. } => {
+                table.infer_ctxt.next_const_var_for_param(span, param)
+            }
+            InferVars::Context(infcx) => infcx.next_const_var_for_param(span, param),
             InferVars::Answered(_) => types.consts.error,
         }
     }
@@ -661,9 +671,13 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     }
 
     fn next_ty_var(&mut self, span: Span) -> Ty<'db> {
+        self.next_ty_var_for_param(span, None)
+    }
+
+    fn next_ty_var_for_param(&mut self, span: Span, param: Option<TypeParamId>) -> Ty<'db> {
         match &mut self.infer_vars {
             Some(infer_vars) => {
-                infer_vars.next_ty_var(span, self.types, &mut self.type_placeholders)
+                infer_vars.next_ty_var(span, param, self.types, &mut self.type_placeholders)
             }
             None => {
                 self.push_infer_vars_not_allowed(span);
@@ -673,8 +687,12 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     }
 
     fn next_const_var(&mut self, span: Span) -> Const<'db> {
+        self.next_const_var_for_param(span, None)
+    }
+
+    fn next_const_var_for_param(&mut self, span: Span, param: Option<ConstParamId>) -> Const<'db> {
         match &mut self.infer_vars {
-            Some(infer_vars) => infer_vars.next_const_var(span, self.types),
+            Some(infer_vars) => infer_vars.next_const_var(span, param, self.types),
             None => {
                 self.push_infer_vars_not_allowed(span);
                 self.types.consts.error
@@ -909,7 +927,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         let types = self.types;
         #[expect(clippy::manual_map, reason = "a `map()` here generates a borrowck error")]
         let create_var = match &mut self.infer_vars {
-            Some(infer_vars) => Some(&mut |span| infer_vars.next_const_var(span, types)),
+            Some(infer_vars) => Some(&mut |span| infer_vars.next_const_var(span, None, types)),
             None => None,
         };
         let konst = create_anon_const(

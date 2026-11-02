@@ -6,10 +6,10 @@
     "crates/hir-ty/src/infer.rs"
   ],
   "what": "hir-ty infer.rs collect_fn (~2828-2854) requires Sized of self, the parameters and the return type for a trait method with no body (`fn into_iter(self) -> FooIter;`, `fn unused_method(&self) -> Self;`). rustc runs check_fn only for a body, so these are false SolverDiagnostics (SizedArgumentType / SizedReturnType, TraitUnimplemented Sized) with no syntax of their own, and blaze-diagnostics prints them as `blaze: type checking's SolverDiagnostic(..) ... which blaze cannot place`. Tests: tests::lints::bodies::calls::desugar::array_into_iter_ambiguous, tests::lints::bodies::calls::items::atomic_ordering_false_positive, tests::lints::names::dead::unused_adt_impls_pub_trait. Skip the Sized requirements (or the inference) when the function has no body.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T00:14:54Z",
-  "updated": "2026-11-01T00:14:54Z",
-  "taken_by": null,
+  "updated": "2026-11-01T22:04:41Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,18 @@
       "by": "tests-diag",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T22:04:41Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T22:04:41Z",
+      "by": "db",
+      "action": "done",
+      "note": "Already in the tree: hir-ty infer.rs collect_fn asks Sized of the self param, the params and the return type only when FunctionSignature::has_body (params_sized / has_body). No edit."
     }
   ]
 }

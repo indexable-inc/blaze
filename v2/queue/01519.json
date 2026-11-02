@@ -1,0 +1,25 @@
+{
+  "id": "01519",
+  "from_lane": "one-pool",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-graph/src/pool.rs",
+    "crates/blaze-graph/src/sched/mod.rs",
+    "crates/blaze-graph/src/sched/graph.rs"
+  ],
+  "what": "blaze-graph stall tests hang the whole test binary (test-step2.log 07:13; sample /tmp/blaze-lanes/sample-step2-graph.txt). (1) World::stall needs every live job in the process waiting and every pool idle (graph.rs stuck: any Target::None job means no stall). Any concurrently running test with an idle client job (pump::oracle has 6 actor threads, each a client job for its life, idle on a channel between steps) or a live fiber::Driver member blocks it, so pool::tests::a_stall_inside_a_scope_fails_its_job_before_its_caller and a_job_waiting_on_a_key_nobody_will_finish_fails_naming_the_key time out at 60 s whenever the oracle runs long. Fix: run the stall tests in a binary of their own (tests/stall.rs, nothing else in the process), or scope the stall check to the jobs a test owns. (2) After the timeout the test unwinds into Pool::drop, whose stop drain (pool.rs work, stop branch: parked != 0 -> park_timeout(1ms); continue) waits for parked jobs forever, an open loop (rule 13). The binary never ends, so no failure output is printed for the crate, including the oracle failure. Bound it: on stop with only parked jobs left, run check_stall (counting a stopping pool whose only work is parked as idle), or after a deadline fail naming the parked jobs.",
+  "state": "open",
+  "created": "2026-11-01T15:22:50Z",
+  "updated": "2026-11-01T15:22:50Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T15:22:50Z",
+      "by": "one-pool",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

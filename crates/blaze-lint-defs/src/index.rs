@@ -146,8 +146,9 @@ pub(super) fn fcw_groups() -> impl Iterator<Item = (&'static str, usize)> {
     FCW_ORDERED[..FCW_ORDER.1].iter().map(|&it| (FCW_GROUPS[usize::from(it)], usize::from(it)))
 }
 
-/// The groups: the future-incompatible ones, `add_lint_group!`'s, then the aliases.
-pub(super) const GROUP_COUNT: usize = FCW_ORDER.1 + names::GROUPS.len() + names::ALIASES.len();
+/// The groups: the future-incompatible ones, `add_lint_group!`'s, the aliases, then blaze's.
+pub(super) const GROUP_COUNT: usize =
+    FCW_ORDER.1 + names::GROUPS.len() + names::ALIASES.len() + names::BLAZE_GROUPS.len();
 
 const _: () = assert!(GROUP_COUNT < u16::MAX as usize);
 
@@ -179,6 +180,13 @@ const OTHERS: ([&str; OTHER_COUNT], [Entry; OTHER_COUNT]) = {
     i = 0;
     while i < names::ALIASES.len() {
         keys[at] = names::ALIASES[i].0;
+        entries[at] = Entry::Group(at as u16);
+        at += 1;
+        i += 1;
+    }
+    i = 0;
+    while i < names::BLAZE_GROUPS.len() {
+        keys[at] = names::BLAZE_GROUPS[i].0;
         entries[at] = Entry::Group(at as u16);
         at += 1;
         i += 1;

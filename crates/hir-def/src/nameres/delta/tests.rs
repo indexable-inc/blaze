@@ -1054,3 +1054,53 @@ fn removing_an_item_of_a_trait_or_enum_unresolves_its_import_in_the_same_module(
     }
     assert!(failures.is_empty(), "{failures}");
 }
+
+/// A proc macro's crate resolved before its macros were built names no expander for them; given
+/// them later, as `Lowered::macros` gives a built dylib's, it resolves again, and so does the
+/// derive of a crate depending on it.
+#[test]
+fn a_proc_macro_crate_given_its_macros_after_its_map_was_read_resolves_them_again() {
+    use either::Either;
+    use hir_expand::{MacroDefKind, proc_macro::ProcMacros};
+
+    use crate::MacroId;
+
+    let mut loaded = Loaded::new(
+        "//- proc_macros: derive_identity\n//- minicore: derive\n//- /main.rs\n#[derive(proc_macros::DeriveIdentity)]\npub struct S;\n",
+    );
+    let main = loaded.file("/main.rs");
+    let db = &loaded.db;
+    let main = *all_crates(db).iter().find(|it| it.data(db).root_file_id == main).expect("`main`");
+    let macros = *all_crates(db).iter().find(|it| it.data(db).target_kind.is_proc_macro()).expect("`proc_macros`");
+    let built = ProcMacros::get_for_crate(db, macros).and_then(|it| it.macros().map(<[_]>::to_vec)).expect("listed");
+    // The expander of `DeriveIdentity` in `proc_macros`' map, and of the call of it in `main`'s.
+    let expanders = |db: &Db| {
+        let map = crate_local_def_map(db, macros).def_map(db);
+        let defined = match map.module(db, map.root).scope(db).get(&name("DeriveIdentity")).take_macros() {
+            Some(MacroId::ProcMacroId(it)) => !it.loc(db).expander.is_missing(),
+            other => panic!("`DeriveIdentity` is not a proc macro of `proc_macros`: {other:?}"),
+        };
+        let map = crate_local_def_map(db, main).def_map(db);
+        let calls: Vec<bool> = map
+            .module(db, map.root)
+            .scope(db)
+            .derive_macro_invocs()
+            .flat_map(|(_, invocs)| invocs.flat_map(|(_, _, calls)| calls.iter().filter_map(|it| it.and_then(Either::left))))
+            .map(|call| match call.loc(db).def.kind {
+                MacroDefKind::ProcMacro(_, expander, _) => !expander.is_missing(),
+                other => panic!("the derive of `S` calls no proc macro: {other:?}"),
+            })
+            .collect();
+        (defined, calls)
+    };
+    assert_eq!(expanders(&loaded.db), (true, vec![true]), "loaded with its macros built");
+
+    ProcMacros::give(&mut loaded.db, [(macros, Err(base_db::ProcMacroLoadingError::NotYetBuilt))]);
+    assert_eq!(expanders(&loaded.db), (false, vec![false]), "its macros not yet built");
+
+    ProcMacros::give(&mut loaded.db, [(macros, Ok(built))]);
+    assert_eq!(expanders(&loaded.db), (true, vec![true]), "given its built macros after its map was read");
+    let mut failures = String::new();
+    check_db(&loaded.db, "given built macros", &Exempt::NONE, true, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}

@@ -52,7 +52,7 @@ const GOAL: u8 = {
 //- minicore: add, builtin_impls
 const GOAL: u8 = {
     'a: loop {
-        let x = 'b: loop {
+        let x: u8 = 'b: loop {
             let x = 'c: loop {
                 let x = 'd: loop {
                     let x: u8 = 'e: loop {

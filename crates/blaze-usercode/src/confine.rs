@@ -176,7 +176,7 @@ impl Confine for Launcher {
         let file = scratch.join(SPEC_FILE);
         blaze_mem::scratch::with_bytes(|text| {
             serde_json::to_writer(&mut *text, &spec).map_err(|error| format!("the spec: {error}"))?; // alloc: error path
-            std::fs::write(&file, &*text).map_err(|error| format!("{}: {error}", file.display())) // alloc: error path
+            write_private(&file, text).map_err(|error| format!("{}: {error}", file.display())) // alloc: error path
         })?;
         let mut args = Vec::with_capacity(LAUNCH.len() + 1);
         args.extend(LAUNCH.map(OsString::from));
@@ -250,6 +250,18 @@ impl Confine for Launcher {
             },
         }
     }
+}
+
+/// Writes `bytes` to the new file `file`, readable by its owner alone: a spec holds the
+/// program's whole environment, its secrets too, so it is made so and lives only until the
+/// launcher has read it, which removes it before anything runs (`blaze sandbox --v2`).
+fn write_private(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(file)?.write_all(bytes)
 }
 
 /// The next run on `input`, a frame [`Confine::hand`] made, read into `buffer` (kept for the
@@ -344,6 +356,12 @@ mod tests {
         let text = std::fs::read(scratch.join(SPEC_FILE)).unwrap();
         let spec: Spec = serde_json::from_slice(&text).unwrap();
         assert_eq!(spec, read_back(&command(true), &scratch));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(scratch.join(SPEC_FILE)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the spec holds the environment: its owner's alone");
+        }
         assert!(launcher.traced(&command(true), &scratch).is_err());
         std::fs::write(scratch.join(REPORT_FILE), trace::encode(&Report::NotMade("no".into()))).unwrap();
         assert!(launcher.traced(&command(true), &scratch).unwrap_err().contains("no sandbox"));

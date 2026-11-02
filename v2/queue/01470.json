@@ -7,10 +7,10 @@
     "crates/hir-def/src/hir/generics.rs"
   ],
   "what": "TOP proc-macro blocker (self-build 00:03, 8 proc-macro libs, 122 refusals: proc_macro::bridge::client methods and run_client, MissingFunctionDefinition in a closure). The calls are Result::<_, PanicMessage>::decode and <(ExpnGlobals<Span>, A)>::decode; each needs X: for<'s> Decode<'a, 's, S> from an impl written `impl<S> Decode<'_, '_, S> for X` (PanicMessage, Span). crates/hir-ty/src/lower.rs anonymous_lifetime (592-593): under LifetimeElisionKind::AnonymousCreateParameter, the impl header elision lower_impl_trait (2362) and lower_impl_self_ty use, an elided `'_` is self.types.regions.error, a fallback. rustc (rustc_resolve late.rs, LifetimeRibKind::AnonymousCreateParameter -> create_fresh_lifetime; the impl gets a LifetimeParamKind::Elided early-bound param per elided lifetime) makes each a fresh parameter of the impl. Fix: give the impl one generic lifetime parameter per elided lifetime of its header (hir-def generics of the impl, in source order) and have anonymous_lifetime return the next one under AnonymousCreateParameter in an impl header. Tests (hir-ty-mir src/tests/mir/lower.rs): a_type_relative_call_with_a_placeholder_lowers_in_a_closure, a_type_anchored_call_on_a_bound_parameter_lowers_in_a_closure must pass; a_type_relative_call_lowers_in_a_closure_with_named_impl_lifetimes is the same with the lifetimes named and should pass before the fix (if it fails too, the cause is elsewhere: tell no-fallback-front-mir).",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T07:13:11Z",
-  "updated": "2026-11-01T07:13:11Z",
-  "taken_by": null,
+  "updated": "2026-11-01T23:42:31Z",
+  "taken_by": "no-fallback-front-ty-next1",
   "why": null,
   "source": null,
   "history": [
@@ -19,6 +19,18 @@
       "by": "no-fallback-front-mir",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T22:58:15Z",
+      "by": "no-fallback-front-ty-next1",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T23:42:31Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "verified 15:42 snapshot: hir-ty-mir tests::mir::lower 8/0 (the three in-a-closure type-relative call tests), hir-ty tests::impl_header_elided_lifetimes 2/0; cause fixed by 01358/01225 lower_impl fresh impl lifetime params"
     }
   ]
 }

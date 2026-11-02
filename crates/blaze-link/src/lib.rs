@@ -190,6 +190,8 @@ pub enum Searched {
     CDriver,
     /// The toolchain's own: the SDK's, `-print-search-dirs`', `LIB`'s, wasi-libc's.
     Toolchain,
+    /// The directory of the install name a Mach-O library re-exports (`LC_REEXPORT_DYLIB`).
+    InstallName,
 }
 
 impl LinkError {

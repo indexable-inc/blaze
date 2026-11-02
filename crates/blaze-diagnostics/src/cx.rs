@@ -114,8 +114,11 @@ impl<'a, 'db> Cx<'a, 'db> {
         files: Files<'a>,
         frame: &'a Frame,
     ) -> Cx<'a, 'db> {
+        // A file of two crates (a crate built for the host and the target) is a module of each:
+        // its syntax must map to this crate's items, not the first crate's.
+        let within = std::sync::Arc::new(blaze_hash::HashSet::from_iter([krate.base()])); // alloc: once a check, one crate
         Cx {
-            vsema: hir::view::Semantics::new(db),
+            vsema: hir::view::Semantics::new_within(db, within),
             db,
             krate,
             edition: krate.edition(db),
@@ -183,10 +186,10 @@ impl<'a, 'db> Cx<'a, 'db> {
     }
 
     /// Whether the `cfg`s of `node`, an attribute owner, keep it in the crate, its `cfg_attr`s
-    /// expanded. A node's attributes are its first children, so one without an attribute first
-    /// has none and costs one step.
+    /// expanded. A node's attributes and doc comments are its first children, so one without
+    /// either first has no attribute and costs one step; a doc comment is a node of its own.
     pub(crate) fn cfg_enabled(&self, node: view::Node<'_>) -> bool {
-        if node.first_child().is_none_or(|it| it.kind() != SyntaxKind::ATTR) {
+        if node.first_child().is_none_or(|it| !view::AnyAttr::can_cast(it.kind())) {
             return true;
         }
         let Some(owner) = view::AnyHasAttrs::cast(node) else { return true };
@@ -289,6 +292,7 @@ impl<'a, 'db> Cx<'a, 'db> {
         let mapped = range.original_node_file_range_opt(self.db);
         if let Some((at, ctxt)) = mapped
             && ctxt.is_root()
+            && !self.written_by_derive(call, at)
         {
             return self.span_in_file(at.file_id.file_id(self.db), at.range);
         }
@@ -320,7 +324,10 @@ impl<'a, 'db> Cx<'a, 'db> {
         let mapped = range.original_node_file_range_opt(self.db);
         let loc = call.loc(self.db);
         match mapped {
-            Some((at, ctxt)) if ctxt.is_root() || hir::Crate::from(loc.def.krate) == self.krate => {
+            Some((at, ctxt))
+                if (ctxt.is_root() && !self.written_by_derive(call, at))
+                    || hir::Crate::from(loc.def.krate) == self.krate =>
+            {
                 (at.file_id.file_id(self.db), at.range)
             }
             _ => match self.call_of(call, false) {
@@ -331,6 +338,21 @@ impl<'a, 'db> Cx<'a, 'db> {
                 }
             },
         }
+    }
+
+    /// Whether `at`, where a range of `call`'s expansion is written with the root context, is
+    /// the text of a derive's own `derive(..)`: what the derive wrote, not the item it was
+    /// handed. blaze's derives give what they write that span with no context of their own;
+    /// rustc gives it the call site in the expansion's context (`Span::in_external_macro`).
+    fn written_by_derive(&self, call: MacroCallId, at: hir_expand::FileRange) -> bool {
+        let loc = call.loc(self.db);
+        if !matches!(loc.kind, MacroCallKind::Derive { .. })
+            || loc.kind.file_id().file_id().is_none()
+        {
+            return false;
+        }
+        let written = loc.kind.original_call_range(self.db, loc.krate);
+        written.file_id == at.file_id && written.range.contains_range(at.range)
     }
 
     /// [`Cx::span`] of a node.
@@ -407,14 +429,15 @@ impl<'a, 'db> Cx<'a, 'db> {
                 (MacroKind::Bang, name, range)
             }
             MacroCallKind::Derive { derive_index, .. } => {
-                let attr = view::Attr::cast(node.value)?;
+                // A derive's node is its `derive(..)` meta (`MacroCallLoc::to_node_view`).
+                let meta = view::Meta::cast(node.value)?;
                 if named {
-                    let (range, path) = derive_paths_view(attr).into_iter().nth(*derive_index as usize)?;
+                    let (range, path) = derive_paths_view(meta).into_iter().nth(*derive_index as usize)?;
                     (MacroKind::Derive, owned(path.rsplit("::").next()?), range)
                 } else {
                     let mut at = None;
                     let mut k = 0u32;
-                    derive_path_tokens_view(attr, |range, _| {
+                    derive_path_tokens_view(meta, |range, _| {
                         if k == *derive_index {
                             at = Some(range);
                         }
@@ -506,20 +529,20 @@ fn fast_print_path(path: view::Path<'_>) -> Option<String> {
 
 /// The paths of a `#[derive(...)]`, in order, with where each is, as text: for a diagnostic
 /// naming a derive. A scan takes [`derive_path_tokens_view`].
-pub fn derive_paths_view(attr: view::Attr<'_>) -> Vec<(TextRange, String)> {
+pub fn derive_paths_view(meta: view::Meta<'_>) -> Vec<(TextRange, String)> {
     // alloc: the paths as text, for a diagnostic's name of a derive
     let mut paths = Vec::new();
-    derive_path_tokens_view(attr, |range, tokens| {
+    derive_path_tokens_view(meta, |range, tokens| {
         // alloc: as above
         paths.push((range, tokens.iter().map(|it| it.text()).collect()));
     });
     paths
 }
 
-/// Each path of a `#[derive(...)]`, in order: where it is and its tokens (names, `::`). No
-/// allocation for a path of up to eight tokens.
-pub fn derive_path_tokens_view<'t>(attr: view::Attr<'t>, mut each: impl FnMut(TextRange, &[view::Token<'t>])) {
-    let Some((_, tt)) = attr.as_simple_call() else { return };
+/// Each path of a `derive(...)` meta, the attribute's own or one in a `cfg_attr`, in order:
+/// where it is and its tokens (names, `::`). No allocation for a path of up to eight tokens.
+pub fn derive_path_tokens_view<'t>(meta: view::Meta<'t>, mut each: impl FnMut(TextRange, &[view::Token<'t>])) {
+    let Some((_, tt)) = meta.as_simple_call() else { return };
     let mut current: SmallVec<[view::Token<'t>; 8]> = SmallVec::new();
     let mut flush = |current: &mut SmallVec<[view::Token<'t>; 8]>| {
         if let (Some(first), Some(last)) = (current.first(), current.last()) {
@@ -668,7 +691,10 @@ mod tests {
             .root()
             .descendants()
             .filter_map(view::Attr::cast)
-            .map(|attr| derive_paths_view(attr).into_iter().map(|(range, it)| (&text[range], it)).collect())
+            .map(|attr| {
+                let paths = attr.meta().map(derive_paths_view).unwrap_or_default();
+                paths.into_iter().map(|(range, it)| (&text[range], it)).collect()
+            })
             .collect();
         assert_eq!(
             derives,
@@ -686,8 +712,8 @@ mod tests {
     fn derive_paths_are_each_named() {
         let text = "#[derive(Debug, serde::Serialize)]\nstruct S;";
         let parse = parse(text);
-        let attr = first_view::<view::Attr<'_>>(&parse);
-        let paths: Vec<_> = derive_paths_view(attr).into_iter().map(|(range, it)| (&text[range], it)).collect();
+        let meta = first_view::<view::Attr<'_>>(&parse).meta().unwrap();
+        let paths: Vec<_> = derive_paths_view(meta).into_iter().map(|(range, it)| (&text[range], it)).collect();
         assert_eq!(paths, [("Debug", "Debug".to_owned()), ("serde::Serialize", "serde::Serialize".to_owned())]);
     }
 

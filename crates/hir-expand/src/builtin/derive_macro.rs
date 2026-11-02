@@ -640,7 +640,9 @@ impl BasicAdtInfo {
 
     /// A `match` of `self` and `other` against each of `arms`' two patterns, with the arm
     /// `body` writes for it, and `fallback` if none matches. A packed struct's fields are copied
-    /// out of both, as by [`Self::write_match_self`].
+    /// out of both, as by [`Self::write_match_self`]. Of one variant whose arm is written (a
+    /// struct, an enum of one variant) the match has no `fallback` arm, which nothing could
+    /// reach: rustc's derives write none there.
     fn write_match_both<'a>(
         &'a self,
         b: &mut Builder,
@@ -661,7 +663,9 @@ impl BasicAdtInfo {
         in_group(b, span, |b| {
             quote_into!(b, span => match (self, other));
             delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                let mut written = 0;
                 for v in arms {
+                    written += 1;
                     in_group(b, span, |b| {
                         delimited(b, tt::DelimiterKind::Parenthesis, span, |b| {
                             self.write_pattern(b, span, v, selfs);
@@ -673,9 +677,11 @@ impl BasicAdtInfo {
                         quote_into!(b, span => ,);
                     });
                 }
-                quote_into!(b, span => _unused);
-                fat_arrow(b, span);
-                fallback(b);
+                if !(self.shape.variants.len() == 1 && written == 1) {
+                    quote_into!(b, span => _unused);
+                    fat_arrow(b, span);
+                    fallback(b);
+                }
             });
         });
     }
@@ -1786,15 +1792,16 @@ fn write_ordering_equal(b: &mut Builder, span: Span, krate: &tt::Ident, partial:
     if grouped { in_group(b, span, write) } else { write(b) }
 }
 
-/// The comparison of `self` and `other` of `Ord` (`PartialOrd` for `partial`): the
-/// discriminants first (always for `PartialOrd`, for an enum for `Ord`), then the fields of
-/// the variants that have any, each in turn.
+/// The comparison of `self` and `other` of `Ord` (`PartialOrd` for `partial`): for an enum of
+/// several variants the discriminants first, then the fields of the variants that have any,
+/// each in turn. As rustc's: a struct or an enum of one variant compares its fields alone, so
+/// a struct's `Self` need not be `Sized` as `discriminant_value` requires.
 fn write_ordering(b: &mut Builder, span: Span, krate: &tt::Ident, adt: &BasicAdtInfo, partial: bool) {
     let selfs = adt.bindings("_self");
     let others = adt.bindings("_other");
-    let enumeration = adt.is_enum();
-    // The discriminants are compared first: a variant without fields is then equal.
-    let arms = adt.shape.variants.iter().filter(|v| !enumeration || !v.is_empty());
+    let discriminants = adt.is_enum() && adt.shape.variants.len() > 1;
+    // With the discriminants compared first, a variant without fields is then equal.
+    let arms = adt.shape.variants.iter().filter(|v| !discriminants || !v.is_empty());
     let arm = |b: &mut Builder, v: &Variant| {
         for i in v.fields() {
             let (t1, t2) = (&selfs[i], &others[i]);
@@ -1812,7 +1819,6 @@ fn write_ordering(b: &mut Builder, span: Span, krate: &tt::Ident, adt: &BasicAdt
             write_compare_close(b, span);
         }
     };
-    let discriminants = partial || enumeration;
     let discriminant = |b: &mut Builder, of_self: bool| {
         in_group(b, span, |b| {
             if of_self {

@@ -347,9 +347,9 @@ mod tests {
                         unit = "sonic_rs.3"
                     )
                     .entered();
-                    let _wait =
-                        tracing::info_span!(target: "blaze", "wait", awaits = "trait_solve `T: Sized`", owner = 7u64)
-                            .entered();
+                    let awaits = crate::span::Name::of("trait_solve `T: Sized`");
+                    let on = blaze_graph::wait::WaitKind::Key;
+                    let _wait = crate::span::Wait { awaits, function: awaits, owner: Some(7), on }.open();
                     ready.wait();
                     let (released, cv) = &gate;
                     let mut released = released.lock();
@@ -367,7 +367,7 @@ mod tests {
             for said in [
                 "unit bodies of sonic-rs (",
                 "infer_query `sonic_rs::serde::de::Deserializer::parse`, unit sonic_rs.3 (",
-                "wait, awaiting trait_solve `T: Sized`, run by task 7 (",
+                "wait `trait_solve `T: Sized``, awaiting trait_solve `T: Sized`, run by task 7 (",
             ] {
                 assert!(line.contains(said), "the line says `{said}`: {line}");
             }

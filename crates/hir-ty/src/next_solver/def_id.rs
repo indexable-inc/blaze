@@ -50,7 +50,7 @@ pub enum SolverDefId<'db> {
 
 impl std::fmt::Debug for SolverDefId<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        crate::with_attached_db(|db| self.fmt_with_names(db, f))
+        crate::next_solver::interner::fmt_with_attached_db(f, "SolverDefId", |db, f| self.fmt_with_names(db, f))
     }
 }
 

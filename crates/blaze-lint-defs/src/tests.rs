@@ -48,11 +48,23 @@ fn named_ids_are_the_lints_of_their_names() {
 }
 
 #[test]
-fn blaze_is_a_tool_with_one_lint() {
+fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 1);
+    assert_eq!(blaze_lints().len(), 20);
+    assert!(!lint.is_externally_loaded);
+    assert!(blaze_lints()[1..].iter().all(|it| it.default_level == Level::Allow && it.is_externally_loaded));
+    let hot = group("blaze::hot").expect("blaze's group");
+    let members: Vec<&str> = hot.lints.iter().map(|it| it.name).collect();
+    assert_eq!(
+        members,
+        ["blaze::hot_clone", "blaze::hot_alloc", "blaze::hot_alloc_call", "blaze::hot_dyn", "blaze::std_hashmap"]
+    );
+    assert_eq!(store.check("hot", Some(BLAZE_TOOL)), Checked::Tool(&hot.lints, None));
+    let hot_dyn = super::lint("blaze::hot_dyn").expect("blaze-lints' lint");
+    assert_eq!(store.check("hot_dyn", Some(BLAZE_TOOL)), Checked::Tool(hot_dyn.id().alone(), None));
+    assert_eq!(store.group_of(hot_dyn), None);
     assert_eq!(store.check("const_impure", Some(BLAZE_TOOL)), Checked::Tool(lint.id().alone(), None));
     assert_eq!(store.find_lints("blaze::const_impure"), Some(lint.id().alone()));
     assert!(matches!(store.check("const_purity", Some(BLAZE_TOOL)), Checked::NoLint { .. }));
@@ -93,6 +105,7 @@ fn counts_are_rustcs() {
             "deprecated_safe",
             "unknown_or_malformed_diagnostic_attributes",
             "bad_style",
+            "blaze::hot",
         ]
     );
     assert_eq!(group("unused").unwrap().lints.len(), 24);
@@ -246,6 +259,10 @@ mod by_scan {
         for &(alias, of) in names::ALIASES {
             let lints = groups.iter().find(|it| it.0 == of).unwrap().1.clone();
             groups.push((alias, lints, Some(of)));
+        }
+        for &(name, members) in names::BLAZE_GROUPS {
+            let lints = members.iter().map(|member| blaze_lints().iter().find(|it| it.name == *member).unwrap()).collect();
+            groups.push((name, lints, None));
         }
         groups
     }

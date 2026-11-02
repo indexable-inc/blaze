@@ -337,3 +337,45 @@ fn main() {
 ";
     assert_eq!(messages(fixture, &[], "unused_imports"), ["unused_imports: unused import: `a::Unused`"]);
 }
+
+/// A crate built for the host and for the target is two crates with one root file: each sees
+/// its own uses, so neither reports the other's items and imports unused.
+#[test]
+fn the_second_crate_of_a_shared_root_file_sees_its_own_uses() {
+    use blaze_query::db::Durability;
+    let fixture = "//- /lib.rs crate:twice
+mod a {
+    pub struct S;
+    fn helper() {}
+    pub fn f() {
+        helper()
+    }
+}
+use a::S;
+pub fn g(_: S) {
+    a::f()
+}
+";
+    let mut fx = hir_expand::fixture::db(fixture);
+    let file = fx.file(0).file_id(fx.db());
+    let db = fx.db_mut();
+    let all = base_db::all_crates(db);
+    let first =
+        *all.iter().find(|it| it.data(db).root_file_id == file).expect("the fixture's crate");
+    let mut cfg = first.cfg_options(db).clone();
+    cfg.insert_atom(intern::Symbol::intern("twin"));
+    let (data, extra) = (first.data(db).clone(), first.extra_data(db).clone());
+    let (workspace, env) = (first.workspace_data(db).clone(), first.env(db).clone());
+    let second = base_db::Crate::create(db, data, extra, workspace, cfg, env, Durability::LOW);
+    let both = all.iter().copied().chain([second]);
+    base_db::set_all_crates_with_durability(db, both, Durability::LOW);
+    let db = fx.into_db();
+    let names = std::collections::HashMap::from([(file, "lib.rs".to_owned())]);
+    let options = Options::default();
+    for krate in [first, second] {
+        let files = crate::Files::new(&names, "");
+        let diags = crate::check::check_crate(&db, hir::Crate::from(krate), files, &options);
+        let lints: Vec<_> = diags.iter().filter_map(|it| it.lint_name()).collect();
+        assert!(lints.is_empty(), "{krate:?}: {lints:?}");
+    }
+}

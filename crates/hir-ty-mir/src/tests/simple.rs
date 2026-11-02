@@ -1082,8 +1082,8 @@ fn infer_inherent_method() {
             159..160 'a': A
             159..167 'a.foo(1)': i32
             165..166 '1': u32
+            173..177 '(&a)': &'? A
             173..184 '(&a).bar(1)': i64
-            174..176 '&a': &'? A
             175..176 'a': A
             182..183 '1': u64
             190..191 'a': A
@@ -1443,8 +1443,8 @@ fn infer_impl_generics_with_autoderef() {
             97..99 '{}': Option<&'? T>
             110..111 'o': Option<u32>
             126..164 '{     ...f(); }': ()
+            132..136 '(&o)': &'? Option<u32>
             132..145 '(&o).as_ref()': Option<&'? u32>
-            133..135 '&o': &'? Option<u32>
             134..135 'o': Option<u32>
             151..152 'o': Option<u32>
             151..161 'o.as_ref()': Option<&'? u32>
@@ -2508,7 +2508,7 @@ fn infer_labelled_break_with_val() {
             97..113 'Defaul...efault': {unknown}
             97..115 'Defaul...ault()': bool
             129..269 'if (br...     }': ()
-            133..147 'break 'outer i': !
+            132..148 '(break...ter i)': !
             146..147 'i': bool
             149..208 '{     ...     }': !
             167..193 'loop {...5i8; }': !
@@ -2564,7 +2564,7 @@ fn foo() {
             117..124 'default': fn default<bool>() -> bool
             117..126 'default()': bool
             140..270 'if (br...     }': ()
-            144..158 'break 'outer i': !
+            143..159 '(break...ter i)': !
             157..158 'i': bool
             160..209 '{     ...     }': !
             178..194 'break ...er 5i8': !

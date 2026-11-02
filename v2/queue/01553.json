@@ -1,0 +1,23 @@
+{
+  "id": "01553",
+  "from_lane": "cargo",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-engine/tests/repro.rs"
+  ],
+  "what": "cargo: two end-to-end tests that a build script's compile is taken from the store. They go in crates/blaze-engine/tests/repro.rs, on the existing crate tests/repro/a_build_script_prints_a_debug_list (it has a build.rs). Use the Case helpers already there (ok, stop). With `-v`, blaze prints `Fresh <pkg>` for each unit replayed from its record, and `Compiling <pkg>` for one made again.\n\n1. a_build_script_compiled_once_is_fresh_after_a_restart:\n   - `blaze build`, then case.stop(), then `blaze build -v`.\n   - The second build's stderr has no `Compiling` line at all, and a `Fresh` line for the package.\n   - This guards against any key input that changes per run (a temp dir, the daemon's pid, a sandbox path).\n\n2. a_check_stores_the_build_script_a_build_takes:\n   - `blaze check`, then case.stop(), then `blaze build -v`.\n   - The second run's stderr has a `Fresh` line for the package's build script.\n   - A `Compiling` line only for the bin, which a check doesn't build. If the verbs name units alike, assert that one package has both a Fresh and a Compiling line.\n\nThe cargo half is in the tree, unbuilt: compile::keyed_goal no longer keys a build script's compile on the goal, with the unit test a_build_scripts_record_is_keyed_alike_under_every_goal in serve/unit/tests.rs. Test 2 fails without it. Test 1 should pass already; if it fails, it has found the per-run input the lead suspects, so tell cargo.",
+  "state": "open",
+  "created": "2026-11-02T01:46:05Z",
+  "updated": "2026-11-02T01:46:05Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T01:46:05Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

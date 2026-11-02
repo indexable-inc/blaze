@@ -62,7 +62,7 @@ pub(crate) fn func_ref(
         }
         FuncTarget::Instance(instance, env) => instance_ref(db, homes, instance, env),
         // clone: only a call of an `asm!` block's function, whose `Kind::Asm` owns its text
-        FuncTarget::Asm(text) => Ok(FrontRef::Function(HirInstance(Kind::Asm(text.clone())))),
+        FuncTarget::Asm(text) => Ok(FrontRef::Function(HirInstance(Kind::Asm(text.clone(), false)))),
     }
 }
 
@@ -244,10 +244,20 @@ impl<'a, A: Allocator> Placer<'a, A> {
     }
 
     pub(crate) fn place(&mut self, it: Ref) -> Result<u32, String> {
+        // alloc: the error's message
+        self.place_named(it, |it, _| format!("{it:?}"))
+    }
+
+    /// [`Self::place`], an error naming the reference by `name`.
+    fn place_named(&mut self, it: Ref, name: impl FnOnce(&Ref, &[Ref]) -> String) -> Result<u32, String> {
         let hashed = hash(&it);
         let refs = &self.refs;
         if let Some(&place) = self.index.find(hashed, |&at| refs[at as usize] == it) {
             return Ok(place);
+        }
+        if !self.open {
+            // alloc: the error's message
+            return Err(format!("the IR asks for {}, which its references do not list", name(&it, refs)));
         }
         self.add(hashed, it)
     }
@@ -285,6 +295,34 @@ impl<'a, A: Allocator> Placer<'a, A> {
     }
 }
 
+/// A reference as an error names it: a function by its path and the crate it is compiled in.
+fn ref_name(db: &Db, it: &Ref) -> String {
+    match it {
+        FrontRef::Function(instance) => super::Named(db, instance).to_string(), // alloc: the error's message
+        // alloc: the error's message
+        FrontRef::Static(HirStatic(id)) => format!("the static `{}`", StaticSignature::of(db, *id).name.as_str()),
+        FrontRef::Extern(name) => format!("the symbol `{name}`"), // alloc: the error's message
+        FrontRef::Weak(name) => format!("the weak symbol `{name}`"), // alloc: the error's message
+    }
+}
+
+/// A reference the IR asks for that `refs` lacks, named, with the crates `refs` compiles the
+/// same instance in when it has it elsewhere: the walk and the IR builder disagree on its home.
+fn unlisted(db: &Db, it: &Ref, refs: &[Ref]) -> String {
+    let mut said = ref_name(db, it);
+    if let FrontRef::Function(HirInstance(Kind::Code(instance, _))) = it {
+        for other in refs {
+            if let FrontRef::Function(other @ HirInstance(Kind::Code(same, _))) = other
+                && same == instance
+            {
+                // alloc: the error's message
+                said.push_str(&format!("; it lists {}", super::Named(db, other)));
+            }
+        }
+    }
+    said
+}
+
 /// The place of each of `requests`, whose `TypeId`s it fills in. `krate` is the crate whose
 /// code makes them, `None` for assembly.
 pub(crate) fn place_requests<A: Allocator>(
@@ -299,7 +337,7 @@ pub(crate) fn place_requests<A: Allocator>(
     for request in &requests.funcs {
         let place = match &request.target {
             FuncTarget::Symbol(symbol) => placer.symbol(symbol)?,
-            target => placer.place(func_ref(db, homes, target)?)?,
+            target => placer.place_named(func_ref(db, homes, target)?, |it, refs| unlisted(db, it, refs))?,
         };
         funcs.push(place);
     }
@@ -310,7 +348,9 @@ pub(crate) fn place_requests<A: Allocator>(
                 fill_type_ids(db, hashes, krate, blob)?;
                 DataPlace::Own
             }
-            DataRequest::Static(id) => DataPlace::Place(placer.place(static_ref(db, *id)?)?),
+            DataRequest::Static(id) => {
+                DataPlace::Place(placer.place_named(static_ref(db, *id)?, |it, refs| unlisted(db, it, refs))?)
+            }
             DataRequest::Location(Some((owner, span))) => {
                 DataPlace::Position(hashes.span(db, *owner, *span)?)
             }

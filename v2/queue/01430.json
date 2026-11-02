@@ -6,10 +6,10 @@
     "crates/blaze-query/src/segment.rs"
   ],
   "what": "segment.rs copy(): when a lane's open segment is full it makes the next one with cap = open.next_cap.max(self.first) and puts the copy at 0 without checking len <= cap, so any copy with cap < len <= max/4 trips debug_assert at segment.rs:367 (`at + bytes.len() <= segment.cap`) and in release writes past the segment. Seen from memo.rs:354 copy_value of a LoadFile (read_file) on a FRESH daemon building a crate that depends on object 0.39.1, and on every rebuild after an edit or a daemon restart. Fix: cap = open.next_cap.max(self.first).max(len.next_multiple_of(SEGMENT_ALIGN)) (and a unit test: an open lane segment, then a copy bigger than next_cap). Repro tests (crates/blaze-engine/tests/repro.rs): a_crate_rebuilds_after_its_daemon_restarts (deterministic, ~2 min), an_edited_crate_rebuilds_on_one_daemon. Quick check without the test binary: tools/v2/repro/repro.py check (see /tmp/blaze-lanes/v2-repro.md). This also blocks every reduction: the reducer keeps one daemon warm across candidates, and each candidate is an edit.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T02:21:49Z",
-  "updated": "2026-11-01T02:21:49Z",
-  "taken_by": null,
+  "updated": "2026-11-01T20:18:32Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,18 @@
       "by": "repro",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T20:18:32Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:18:32Z",
+      "by": "db",
+      "action": "done",
+      "note": "already in the tree: blaze-query segment.rs copy() grows cap until len fits, put() asserts the bounds in release too; test segment.rs a_copy_bigger_than_the_lanes_next_segment_still_fits_in_it. Added: Segments::new asserts first > 0 so the grow loop is bounded."
     }
   ]
 }

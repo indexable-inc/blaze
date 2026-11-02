@@ -157,6 +157,7 @@ diagnostics![AnyDiagnostic<'db> ->
     UnlabeledJumpInLabeledBlock,
     AsyncCoroutinesNotSupported,
     ConstCheckError,
+    ConstEvalFailed,
     ConstImpure,
     CannotBeDereferenced<'db>,
     UnaryOperatorCannotBeApplied<'db>,
@@ -228,6 +229,7 @@ diagnostics![AnyDiagnostic<'db> ->
     TraitImplMissingAssocItems,
     TraitImplOrphan,
     TraitImplRedundantAssocItems,
+    TraitImplUnstableDefaultBody,
     TraitItemImport,
     TypedHole<'db>,
     TypeMismatch<'db>,
@@ -269,7 +271,7 @@ diagnostics![AnyDiagnostic<'db> ->
     SelfCtorNotTupleOrUnit<'db>,
     ConstParamTyNotAllowed<'db>,
     ValTreeError<'db>,
-    UnplacedDiagnostic<'db>,
+    UnplacedDiagnostic,
 ];
 
 #[derive(Debug)]
@@ -759,21 +761,45 @@ pub struct BorrowckSkipped {
     pub reason: String,
 }
 
+/// The evaluation of a free `const` or a `static` failed. rustc evaluates each `static` and
+/// each free `const` without generics of the crate it checks (`rustc_interface::passes::analysis`:
+/// `eval_static_initializer`, `const_eval_poly`), whether or not anything uses it.
+#[derive(Debug)]
+pub struct ConstEvalFailed {
+    /// Where in the item's value the evaluation failed (the call it was in), or the value.
+    pub node: InFile<SyntaxNodePtr>,
+    /// The item's name, `_` for an unnamed `const`.
+    pub item: String,
+    pub is_static: bool,
+    pub failure: ConstEvalFailure,
+}
+
+#[derive(Debug)]
+pub enum ConstEvalFailure {
+    /// What the evaluated code did that a constant may not, in rustc's words: E0080.
+    Failed(String),
+    /// The value needs itself: E0391.
+    Cycle,
+    /// What blaze's evaluator cannot do: an error, as blaze has not checked what rustc would.
+    Unsupported(String),
+}
+
 /// A diagnostic the front end found in code with no syntax of its own (what lowering
 /// desugared), which blaze can't place where rustc does: blaze's error at the item the code is
 /// in, naming the diagnostic, where it would otherwise be dropped.
 #[derive(Debug)]
-pub struct UnplacedDiagnostic<'db> {
+pub struct UnplacedDiagnostic {
     /// The anonymous constant's expression, or the item whose body the code is in.
     pub owner: InFile<SyntaxNodePtr>,
-    pub what: Unplaced<'db>,
+    pub what: Unplaced,
 }
 
 /// The diagnostic an [`UnplacedDiagnostic`] could not place.
 #[derive(Debug)]
-pub enum Unplaced<'db> {
-    /// Type checking's.
-    Inference(&'db InferenceDiagnostic),
+pub enum Unplaced {
+    /// Type checking's, as text: its code and message, naming the item it is in and the
+    /// types, trait and binding it is of.
+    Inference(String),
     /// E0133, or a lint's, for an operation that needs `unsafe`.
     MissingUnsafe { reason: UnsafetyReason, lint: UnsafeLint },
     /// The borrow checker's, with its code (a lint's name for a lint).
@@ -1116,6 +1142,19 @@ pub struct TraitImplMissingAssocItems {
     pub file_id: HirFileId,
     pub impl_: AstPtr<ast::Impl>,
     pub missing: Vec<(Name, AssocItem)>,
+}
+
+/// rustc's `default_body_is_unstable` (E0658): a trait impl that leaves `item` to the trait's
+/// default body, which `#[rustc_default_body_unstable]` gates behind a feature its crate does
+/// not enable.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TraitImplUnstableDefaultBody {
+    pub file_id: HirFileId,
+    pub impl_: AstPtr<ast::Impl>,
+    pub item: Name,
+    pub feature: intern::Symbol,
+    pub reason: hir_def::attrs::stability::UnstableReason,
+    pub issue: Option<std::num::NonZero<u32>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2276,30 +2315,23 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             trait_is_unsafe = impl_is_unsafe;
         }
 
-        let drop_maybe_dangle = (|| {
-            let trait_ = trait_?;
-            let drop_trait = infcx.interner.lang_items().Drop?;
-            if drop_trait != trait_ {
-                return None;
-            }
-            let parent = def.into();
+        // rustc's `unsafe_attr`: a `#[may_dangle]` parameter of the impl, whatever its trait.
+        let maybe_dangle = trait_.is_some() && {
             let (lifetimes_attrs, type_and_consts_attrs) =
-                AttrFlags::query_generic_params(self.db, parent);
-            let res = lifetimes_attrs.values().any(|it| it.contains(AttrFlags::MAY_DANGLE))
-                || type_and_consts_attrs.values().any(|it| it.contains(AttrFlags::MAY_DANGLE));
-            Some(res)
-        })()
-        .unwrap_or(false);
+                AttrFlags::query_generic_params(self.db, def.into());
+            lifetimes_attrs.values().any(|it| it.contains(AttrFlags::MAY_DANGLE))
+                || type_and_consts_attrs.values().any(|it| it.contains(AttrFlags::MAY_DANGLE))
+        };
 
-        match (impl_is_unsafe, trait_is_unsafe, impl_is_negative, drop_maybe_dangle) {
+        match (impl_is_unsafe, trait_is_unsafe, impl_is_negative, maybe_dangle) {
                 // unsafe negative impl
                 (true, _, true, _) |
                 // unsafe impl for safe trait
                 (true, false, _, false) => self.acc.push(TraitImplIncorrectSafety { impl_: ast_id_map.get(loc.id.value), file_id, should_be_safe: true }.into()),
                 // safe impl for unsafe trait
                 (false, true, false, _) |
-                // safe impl of dangling drop
-                (false, false, _, true) => self.acc.push(TraitImplIncorrectSafety { impl_: ast_id_map.get(loc.id.value), file_id, should_be_safe: false }.into()),
+                // safe positive impl with a `#[may_dangle]` parameter
+                (false, false, false, true) => self.acc.push(TraitImplIncorrectSafety { impl_: ast_id_map.get(loc.id.value), file_id, should_be_safe: false }.into()),
                 _ => (),
             };
 
@@ -2333,15 +2365,65 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 )
             }
 
-            let mut missing: Vec<_> = required_items
-                .filter(|(name, id)| {
-                    !impl_assoc_items_scratch.iter().any(|(impl_name, impl_item)| {
-                        discriminant(impl_item) == discriminant(id) && impl_name == name
-                    })
+            let implemented_here = |name: &Name, id: &AssocItemId| {
+                impl_assoc_items_scratch.iter().any(|(impl_name, impl_item)| {
+                    discriminant(impl_item) == discriminant(id) && impl_name == name
                 })
+            };
+            let mut missing: Vec<_> = required_items
+                .filter(|(name, id)| !implemented_here(name, id))
                 .map(|(name, item)| (*name, AssocItem::from(*item)))
                 // alloc: empty, so no allocation, unless items are missing: then reported
                 .collect();
+
+            // rustc's `eval_default_body_stability` of each item the impl leaves to the trait: a
+            // default body `#[rustc_default_body_unstable]` gates is refused to another crate
+            // without its feature; `Drop::drop`'s, without `pin_ergonomics`, as a missing item.
+            if hir_def::HasModule::krate(&trait_, self.db) != self.krate {
+                use hir_def::attrs::stability::{StabilityLevel, default_body_stability};
+                let features = UnstableFeatures::query(self.db, self.krate);
+                let is_drop =
+                    hir_def::lang_item::lang_items(self.db, self.krate).Drop == Some(trait_);
+                for &(name, id) in trait_items.iter() {
+                    if implemented_here(&name, &id) {
+                        continue;
+                    }
+                    let def = match id {
+                        AssocItemId::FunctionId(it) => hir_def::AttrDefId::from(it),
+                        AssocItemId::ConstId(it) => it.into(),
+                        AssocItemId::TypeAliasId(it) => it.into(),
+                    };
+                    let Some(stability) = default_body_stability(self.db, def) else {
+                        continue;
+                    };
+                    let StabilityLevel::Unstable { reason, issue, .. } = &stability.level else {
+                        continue;
+                    };
+                    if features.is_enabled(&stability.feature) {
+                        continue;
+                    }
+                    if is_drop
+                        && name == intern::sym::drop
+                        && !features.is_enabled(&intern::Symbol::intern("pin_ergonomics"))
+                    {
+                        if !missing.iter().any(|(it, _)| *it == name) {
+                            missing.push((name, AssocItem::from(id)));
+                        }
+                        continue;
+                    }
+                    self.acc.push(
+                        TraitImplUnstableDefaultBody {
+                            file_id,
+                            impl_: ast_id_map.get(loc.id.value),
+                            item: name,
+                            feature: stability.feature.clone(),
+                            reason: reason.clone(),
+                            issue: *issue,
+                        }
+                        .into(),
+                    );
+                }
+            }
 
             if !missing.is_empty() {
                 let env = ParamEnvAndCrate {
@@ -2547,13 +2629,55 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     }
 
     fn collect_anon_const(&mut self, source_map: &ExpressionStoreSourceMap, def: AnonConstId<'db>) {
-        self.emit_inference_errors(
-            def.into(),
-            source_map,
-            TypeOwnerId::from_anon_const(def, self.db),
-        );
+        // An inline `const { .. }` was inferred with its body, whose errors are reported there.
+        if !def.is_inline_const(self.db) {
+            self.emit_inference_errors(
+                def.into(),
+                source_map,
+                TypeOwnerId::from_anon_const(def, self.db),
+            );
+        }
         self.collect_anon_const_borrowck(source_map, def);
+        self.collect_anon_const_const_check(source_map, def);
         self.collect_anon_const_valtree(source_map, def);
+    }
+
+    /// rustc's const checks of `def` as a `const` of its own (an array length, a repeat count,
+    /// a const argument or default, a `const { .. }` block), whatever body it is written in.
+    fn collect_anon_const_const_check(
+        &mut self,
+        source_map: &ExpressionStoreSourceMap,
+        def: AnonConstId<'db>,
+    ) {
+        let db = self.db;
+        for diagnostic in &hir_ty_mir::mir::const_check::anon_const_check(db, def).diagnostics {
+            let Some(node) = anon_const_node(db, source_map, def, diagnostic.span) else {
+                self.acc.push(
+                    UnplacedDiagnostic {
+                        owner: unplaced_owner(db, def.into(), source_map),
+                        what: Unplaced::ConstCheck {
+                            code: diagnostic.code,
+                            // clone: error path, a reported const check error
+                            message: diagnostic.message.clone(),
+                        },
+                    }
+                    .into(),
+                );
+                continue;
+            };
+            self.acc.push(
+                ConstCheckError {
+                    node,
+                    code: diagnostic.code,
+                    // clone: error path, a reported const check error
+                    message: diagnostic.message.clone(),
+                    // clone: error path, a reported const check error
+                    kind: diagnostic.kind.clone(),
+                    context: diagnostic.context,
+                }
+                .into(),
+            );
+        }
     }
 
     fn collect_anon_const_valtree(
@@ -2590,18 +2714,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         def: AnonConstId<'db>,
     ) {
         use hir_ty_mir::mir::MirSpan;
-        let result = hir_ty_borrowck::borrowck_anon_const(self.db, def);
-        let node_of = |span: MirSpan| -> Option<InFile<SyntaxNodePtr>> {
-            let source = match span {
-                MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => source_map.expr_syntax(expr),
-                MirSpan::PatId(pat) => source_map.pat_syntax(pat),
-                MirSpan::BindingId(binding) => {
-                    source_map.pat_syntax(*source_map.patterns_for_binding(binding).first()?)
-                }
-                _ => source_map.expr_syntax(def.loc(self.db).expr),
-            };
-            Some(source.ok()?.map(|it| it.syntax_node_ptr()))
-        };
+        let db = self.db;
+        let result = hir_ty_borrowck::borrowck_anon_const(db, def);
+        let node_of = |span: MirSpan| anon_const_node(db, source_map, def, span);
         for diagnostic in &result.diagnostics {
             let Some(node) = node_of(diagnostic.span) else {
                 self.acc.push(
@@ -2684,9 +2799,11 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     /// before the item in its file makes again, only when there is a diagnostic to place.
     fn collect_generic_def(&mut self, def: GenericDefId) {
         let db = self.db;
-        self.collect_blocks(ExpressionStore::of(db, def.into()));
+        let store = ExpressionStore::of(db, def.into());
+        self.collect_blocks(store);
         let lowered = signature_anon_consts_and_diagnostics(db, def);
         let reports = signature_store_has_diagnostics(db, def)
+            || store_macro_failed(db, store)
             || lowered.iter().any(|&(anon_consts, diagnostics)| {
                 !diagnostics.is_empty()
                     || anon_consts.iter().any(|&it| self.anon_const_reports(it))
@@ -2707,6 +2824,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         !InferenceResult::of(db, def).diagnostics().is_empty()
             || !hir_ty::coroutine_obligations::coroutine_obligation_errors(db, def.into()).is_empty()
             || !hir_ty_borrowck::borrowck_anon_const(db, def).diagnostics.is_empty()
+            || !hir_ty_mir::mir::const_check::anon_const_check(db, def).diagnostics.is_empty()
             || hir_ty::const_valtree::anon_const_valtree_error(db, def).is_some()
     }
 
@@ -2754,7 +2872,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         let placing = Placing::new(db, def);
 
         self.collect_blocks(body);
-        if !Body::unmoved_source_map(db, def).diagnostics().is_empty() {
+        if !Body::unmoved_source_map(db, def).diagnostics().is_empty()
+            || store_macro_failed(db, body)
+        {
             self.collect_store_diagnostics(placing.get());
         }
         let infer = InferenceResult::of(db, def);
@@ -2802,6 +2922,99 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             self.acc,
         );
         self.collect_borrowck(def, body, &placing);
+        // A repeat count or const argument in the body is a constant of its own, inferred and
+        // checked apart from it, as rustc does. The list can name one twice (merging a nested
+        // body's appends its own), and each is reported once.
+        // Their inference errors are the body's, reported with it above.
+        let defined = infer.defined_anon_consts();
+        for (at, &konst) in defined.iter().enumerate() {
+            if !defined[..at].contains(&konst) && self.anon_const_reports(konst) {
+                let source_map = placing.get();
+                self.collect_anon_const_borrowck(source_map, konst);
+                self.collect_anon_const_const_check(source_map, konst);
+                self.collect_anon_const_valtree(source_map, konst);
+            }
+        }
+        self.collect_const_eval(def, body, infer, &placing);
+    }
+
+    /// [`ConstEvalFailed`] of `def` when it is a free `const` or a `static` whose body has no
+    /// error of its own: rustc evaluates no body an earlier error taints.
+    fn collect_const_eval(
+        &mut self,
+        def: DefWithBodyId,
+        body: &Body,
+        infer: &InferenceResult<'db>,
+        placing: &Placing<'db>,
+    ) {
+        use hir_def::{
+            hir::generics::GenericParams,
+            signatures::{StaticFlags, StaticSignature},
+        };
+        use hir_ty::next_solver::GenericArgs;
+        let db = self.db;
+        let (name, is_static) = match def {
+            DefWithBodyId::ConstId(id) => {
+                let signature = ConstSignature::of(db, id);
+                if !signature.has_body()
+                    || !matches!(id.lookup(db).container, ItemContainerId::ModuleId(_))
+                    || !GenericParams::of(db, id.into()).is_empty()
+                {
+                    return;
+                }
+                (signature.name.as_ref(), false)
+            }
+            DefWithBodyId::StaticId(id) => {
+                let signature = StaticSignature::of(db, id);
+                if !signature.flags.contains(StaticFlags::HAS_BODY) {
+                    return;
+                }
+                (Some(&signature.name), true)
+            }
+            DefWithBodyId::FunctionId(_) | DefWithBodyId::VariantId(_) => return,
+        };
+        if infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty() {
+            return;
+        }
+        let borrowck = hir_ty_borrowck::borrowck(db, def);
+        if borrowck.skipped.is_some()
+            || borrowck.not_checked.is_some_and(|it| it.refuses())
+            || borrowck.diagnostics.iter().any(|it| it.is_error())
+            || !hir_ty_mir::mir::const_check::const_check(db, def).diagnostics.is_empty()
+        {
+            return;
+        }
+        let evaluated = match def {
+            DefWithBodyId::ConstId(id) => db.const_eval(id, GenericArgs::empty(), None).map(drop),
+            DefWithBodyId::StaticId(id) => db.const_eval_static(id).map(drop),
+            DefWithBodyId::FunctionId(_) | DefWithBodyId::VariantId(_) => return,
+        };
+        let Err(error) = evaluated else { return };
+        let display_target = DisplayTarget::from_crate_and_edition(db, self.krate, self.edition);
+        let own = InferBodyId::DefWithBodyId(def);
+        let Some((failure, span)) = const_eval_failure(db, own, &error, display_target) else {
+            return;
+        };
+        let source_map = placing.get();
+        let at = |span: hir_ty_mir::mir::MirSpan| {
+            use hir_ty_mir::mir::MirSpan;
+            match span {
+                MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => source_map.expr_syntax(expr).ok(),
+                MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok(),
+                _ => None,
+            }
+        };
+        let node = span
+            .and_then(at)
+            .or_else(|| source_map.expr_syntax(body.root_expr()).ok())
+            .map(|it| it.map(|it| it.syntax_node_ptr()));
+        let Some(node) = node else {
+            never!("{def:?}: a `const` or `static` whose value has no syntax");
+            return;
+        };
+        // alloc: error path, the item's name in a reported diagnostic
+        let item = name.map_or_else(|| "_".to_owned(), |it| it.as_str().to_owned());
+        self.acc.push(ConstEvalFailed { node, item, is_static, failure }.into());
     }
 
     fn collect_borrowck(&mut self, def: DefWithBodyId, body: &Body, placing: &Placing<'db>) {
@@ -3014,11 +3227,14 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             );
             let found = match placed {
                 Some(it) => it,
-                None => UnplacedDiagnostic {
-                    owner: unplaced_owner(self.db, def, source_map),
-                    what: Unplaced::Inference(diag),
+                None => {
+                    let target = DisplayTarget::from_crate_and_edition(self.db, self.krate, self.edition);
+                    UnplacedDiagnostic {
+                        owner: unplaced_owner(self.db, def, source_map),
+                        what: Unplaced::Inference(unplaced_inference_text(self.db, target, def, diag)),
+                    }
+                    .into()
                 }
-                .into(),
             };
             self.acc.push(found);
         }
@@ -3029,13 +3245,15 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     fn collect_variant(&mut self, def: VariantId) {
         use hir_def::signatures::VariantFields;
         let db = self.db;
-        self.collect_blocks(&VariantFields::of(db, def).store);
+        let store = &VariantFields::of(db, def).store;
+        self.collect_blocks(store);
         let lowering = db.field_types_with_diagnostics(def);
         let store_reports = match VariantFields::relative(db, def) {
             Some((_, map)) => !map.diagnostics().is_empty(),
             None => !VariantFields::with_source_map(db, def).1.diagnostics().is_empty(),
         };
         let reports = store_reports
+            || store_macro_failed(db, store)
             || !lowering.diagnostics().is_empty()
             || lowering.defined_anon_consts().iter().any(|&it| self.anon_const_reports(it));
         if reports {
@@ -4520,6 +4738,12 @@ impl<'db> Placing<'db> {
 /// Whether lowering `def`'s signature store found anything: read from the map counted from the
 /// signature's own syntax (`relative`), which an edit elsewhere in its file leaves as it was. A
 /// signature a macro writes has no such syntax, and its one map is in the macro's file.
+/// Whether a macro call lowered into `store` failed to expand (`compile_error!` in a body or a
+/// type): its error is placed with the store's diagnostics, so the store's map is read.
+fn store_macro_failed(db: &Db, store: &ExpressionStore) -> bool {
+    store.macro_calls().iter().any(|call| call.parse_macro_expansion_error(db).is_some())
+}
+
 fn signature_store_has_diagnostics(db: &Db, def: GenericDefId) -> bool {
     use hir_def::signatures::{EnumSignature, StaticSignature, StructSignature, UnionSignature};
     macro_rules! of {
@@ -4540,6 +4764,521 @@ fn signature_store_has_diagnostics(db: &Db, def: GenericDefId) -> bool {
         GenericDefId::StaticId(id) => of!(StaticSignature, id),
         GenericDefId::TraitId(id) => of!(TraitSignature, id),
         GenericDefId::TypeAliasId(id) => of!(TypeAliasSignature, id),
+    }
+}
+
+/// The syntax of `span` in the anonymous constant `def`'s MIR, read from the store it is
+/// written in; a span of no expression, pattern or binding is the constant's own expression.
+fn anon_const_node(
+    db: &Db,
+    source_map: &ExpressionStoreSourceMap,
+    def: AnonConstId<'_>,
+    span: hir_ty_mir::mir::MirSpan,
+) -> Option<InFile<SyntaxNodePtr>> {
+    use hir_ty_mir::mir::MirSpan;
+    let source = match span {
+        MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => source_map.expr_syntax(expr),
+        MirSpan::PatId(pat) => source_map.pat_syntax(pat),
+        MirSpan::BindingId(binding) => {
+            source_map.pat_syntax(*source_map.patterns_for_binding(binding).first()?)
+        }
+        _ => source_map.expr_syntax(def.loc(db).expr),
+    };
+    Some(source.ok()?.map(|it| it.syntax_node_ptr()))
+}
+
+/// What [`ConstEvalFailed`] reports of `error`, the failed evaluation of the value `own`, and
+/// where in that value it failed when known. `None` when the error is one reported at its own
+/// place: code that does not type or resolve, in the value or in a function it calls.
+fn const_eval_failure<'db>(
+    db: &'db Db,
+    own: InferBodyId<'db>,
+    error: &hir_ty::consteval::ConstEvalError<'db>,
+    display_target: DisplayTarget,
+) -> Option<(ConstEvalFailure, Option<hir_ty_mir::mir::MirSpan>)> {
+    use hir_ty::{
+        consteval::ConstEvalError,
+        mir::{MirEvalError, MirLowerError},
+    };
+    use hir_ty_mir::mir_pretty::ConstEvalErrorPretty as _;
+    let reported = |error: &MirLowerError<'_>| {
+        matches!(
+            error,
+            MirLowerError::HasErrors
+                | MirLowerError::IncompleteExpr
+                | MirLowerError::IncompletePattern
+                | MirLowerError::UnresolvedName { .. }
+                | MirLowerError::RecordLiteralWithoutPath
+                | MirLowerError::UnresolvedMethod(_)
+                | MirLowerError::UnresolvedField
+                | MirLowerError::TypeError(_)
+                | MirLowerError::ContinueWithoutLoop
+                | MirLowerError::BreakWithoutLoop
+                | MirLowerError::UnresolvedLabel
+        )
+    };
+    let unsupported = || {
+        // alloc: error path, the evaluator's account of what it cannot do
+        let mut printed = String::new();
+        _ = error.pretty_print(&mut printed, db, |_, _| String::new(), display_target); // alloc: error path, no place text
+        // alloc: error path, the same on one line
+        let mut text = String::new();
+        for line in printed.lines().map(str::trim) {
+            if line.is_empty() || line == "Mir eval error:" {
+                continue;
+            }
+            if !text.is_empty() {
+                text.push_str("; ");
+            }
+            text.push_str(line);
+        }
+        ConstEvalFailure::Unsupported(text)
+    };
+    let mut err = match error {
+        ConstEvalError::MirLowerError(MirLowerError::Loop) => {
+            return Some((ConstEvalFailure::Cycle, None));
+        }
+        ConstEvalError::MirLowerError(error) if reported(error) => return None,
+        ConstEvalError::MirLowerError(_) => return Some((unsupported(), None)),
+        ConstEvalError::MirEvalError(error) => error,
+    };
+    let mut span = None;
+    while let MirEvalError::InFunction(inner, stack) = err {
+        if span.is_none() {
+            span = stack.iter().find(|&&(_, _, body)| body == own).map(|&(_, at, _)| at);
+        }
+        err = inner;
+    }
+    let at_own = |at: &Option<(InferBodyId<'db>, hir_ty_mir::mir::MirSpan)>| {
+        at.and_then(|(body, at)| (body == own).then_some(at))
+    };
+    let failure = match err {
+        MirEvalError::StackOverflow => ConstEvalFailure::Failed(
+            // alloc: error path, a reported diagnostic's message
+            "reached the configured maximum number of stack frames".to_owned(),
+        ),
+        // alloc: error path, a reported diagnostic's message
+        MirEvalError::Panic(message) => ConstEvalFailure::Failed(format!("evaluation panicked: {message}")),
+        MirEvalError::Aborted(message) => ConstEvalFailure::Failed(
+            // alloc: error path, a reported diagnostic's message
+            format!("the evaluated program aborted execution: {message}"),
+        ),
+        // clone: error path, a reported diagnostic's message
+        MirEvalError::UndefinedBehavior(message) => ConstEvalFailure::Failed(message.clone()),
+        MirEvalError::OverBudget { spent, at } => {
+            span = span.or_else(|| at_own(at));
+            // alloc: error path, a reported diagnostic's message
+            ConstEvalFailure::Failed(format!(
+                "constant evaluation {spent} (raise {} under `[workspace.metadata.blaze]`)",
+                spent.setting()
+            ))
+        }
+        MirEvalError::LongRunning { at } => {
+            span = span.or_else(|| at_own(at));
+            // alloc: error path, a reported diagnostic's message
+            ConstEvalFailure::Failed("constant evaluation is taking a long time".to_owned())
+        }
+        MirEvalError::HeapInValue { of_const_allocate: true } => ConstEvalFailure::Failed(
+            // alloc: error path, a reported diagnostic's message
+            "encountered `const_allocate` pointer in final value that was not made global".to_owned(),
+        ),
+        MirEvalError::HeapInValue { of_const_allocate: false } => ConstEvalFailure::Failed(
+            // alloc: error path, a reported diagnostic's message
+            "encountered dangling pointer in final value of constant".to_owned(),
+        ),
+        MirEvalError::ConstEvalError(name, inner) => {
+            let (failure, inner_span) = const_eval_failure(db, own, inner, display_target)?;
+            span = span.or(inner_span);
+            match failure {
+                ConstEvalFailure::Failed(reason) => {
+                    // alloc: error path, a reported diagnostic's message
+                    ConstEvalFailure::Failed(format!("evaluation of constant `{name}` failed: {reason}"))
+                }
+                ConstEvalFailure::Cycle => ConstEvalFailure::Cycle,
+                ConstEvalFailure::Unsupported(reason) => {
+                    // alloc: error path, a reported diagnostic's message
+                    ConstEvalFailure::Unsupported(format!("constant `{name}`: {reason}"))
+                }
+            }
+        }
+        MirEvalError::MirLowerError(_, error) | MirEvalError::MirLowerErrorForClosure(_, error)
+            if reported(error) =>
+        {
+            return None;
+        }
+        MirEvalError::InFunction(..) => unreachable!("every `InFunction` was taken off above"),
+        MirEvalError::LayoutError(..)
+        | MirEvalError::TargetDataLayoutNotAvailable(_)
+        | MirEvalError::MirLowerError(..)
+        | MirEvalError::MirLowerErrorForClosure(..)
+        | MirEvalError::TypeIsUnsized(..)
+        | MirEvalError::NotSupported(_)
+        | MirEvalError::InvalidConst
+        | MirEvalError::MachineStop
+        | MirEvalError::InvalidVTableId(_)
+        | MirEvalError::CoerceUnsizedError(_)
+        | MirEvalError::InternalError(_) => unsupported(),
+    };
+    Some((failure, span))
+}
+
+/// The text of the type checking diagnostic `d` of `def` that
+/// [`AnyDiagnostic::inference_diagnostic`] could not place: rustc's code and message, the
+/// binding it is of where it has one, and the item it is in.
+fn unplaced_inference_text<'db>(
+    db: &'db Db,
+    target: DisplayTarget,
+    def: InferBodyId<'db>,
+    d: &'db InferenceDiagnostic,
+) -> String {
+    let ty = |ty: &'db StoredTy| ty.as_ref().display(db, target).to_string();
+    let seen = |found: &'db StoredTy, at_error: &'db Option<StoredTy>| ty(at_error.as_ref().unwrap_or(found));
+    let fn_name = |f: FunctionId| FunctionSignature::of(db, f).name.as_str().to_owned();
+    // alloc: each arm, error path, the error's text
+    let what = match d {
+        InferenceDiagnostic::NoSuchField { field, .. } => match field.unpack() {
+            ExprOrPatId::ExprId(_) => "E0560: the struct literal names a field the struct does not have".to_owned(),
+            ExprOrPatId::PatId(_) => "E0026: the pattern names a field the struct does not have".to_owned(),
+        },
+        &InferenceDiagnostic::MismatchedArrayPatLen { expected, found, has_rest, .. } => match has_rest {
+            true => format!("E0528: pattern requires at least {found} elements but array has {expected}"),
+            false => format!("E0527: pattern requires {found} elements but array has {expected}"),
+        },
+        InferenceDiagnostic::ArrayPatternWithoutFixedLength { .. } => {
+            "E0730: cannot pattern-match on an array without a fixed length".to_owned()
+        }
+        InferenceDiagnostic::ExpectedArrayOrSlicePat { found, .. } => {
+            format!("E0529: expected an array or slice, found `{}`", ty(found))
+        }
+        InferenceDiagnostic::InvalidRangePatType { .. } => {
+            "E0029: only `char` and numeric types are allowed in range patterns".to_owned()
+        }
+        InferenceDiagnostic::DuplicateField { field, .. } => match field.unpack() {
+            ExprOrPatId::ExprId(_) => "E0062: field specified more than once".to_owned(),
+            ExprOrPatId::PatId(_) => "E0025: field bound multiple times in the pattern".to_owned(),
+        },
+        InferenceDiagnostic::PrivateField { .. } => "E0616: the field read is private".to_owned(),
+        InferenceDiagnostic::PrivateAssocItem { .. } => "E0624: the associated item used is private".to_owned(),
+        InferenceDiagnostic::UnresolvedField { receiver, name, .. } => {
+            format!("E0609: no field `{}` on type `{}`", name.as_str(), ty(receiver))
+        }
+        InferenceDiagnostic::UnresolvedMethodCall { receiver, name, .. } => {
+            format!("E0599: no method named `{}` found for `{}`", name.as_str(), ty(receiver))
+        }
+        InferenceDiagnostic::UnresolvedAssocItem { ty: on, name, .. } => {
+            format!("E0599: no associated item named `{}` found for `{}`", name.as_str(), ty(on))
+        }
+        InferenceDiagnostic::UnresolvedIdent { .. } => "E0425: cannot find a value of this name in this scope".to_owned(),
+        InferenceDiagnostic::UnresolvedPath { .. } => "E0433: failed to resolve a path".to_owned(),
+        &InferenceDiagnostic::BreakOutsideOfLoop { is_break, .. } => {
+            format!("E0268: `{}` outside of a loop", if is_break { "break" } else { "continue" })
+        }
+        &InferenceDiagnostic::UnlabeledJumpInLabeledBlock { is_break, .. } => {
+            format!("E0695: unlabeled `{}` inside of a labeled block", if is_break { "break" } else { "continue" })
+        }
+        InferenceDiagnostic::AsyncCoroutinesNotSupported { .. } => {
+            "E0727: `async` coroutines are not yet supported".to_owned()
+        }
+        InferenceDiagnostic::NonExhaustiveRecordExpr { .. } => {
+            "E0639: cannot create non-exhaustive struct using struct expression".to_owned()
+        }
+        InferenceDiagnostic::NonExhaustiveRecordPat { .. } => {
+            "E0638: a pattern of a `#[non_exhaustive]` struct needs `..`".to_owned()
+        }
+        InferenceDiagnostic::UnionPatMustHaveExactlyOneField { .. } => {
+            "union patterns should have exactly one field".to_owned()
+        }
+        InferenceDiagnostic::UnionPatHasRest { .. } => "`..` cannot be used in union patterns".to_owned(),
+        InferenceDiagnostic::FunctionalRecordUpdateOnNonStruct { .. } => {
+            "E0436: functional record update syntax requires a struct".to_owned()
+        }
+        &InferenceDiagnostic::MismatchedArgCount { expected, found, is_fn_trait_call, .. } => format!(
+            "{}: this function takes {expected} arguments but {found} were supplied",
+            if is_fn_trait_call { "E0057" } else { "E0061" }
+        ),
+        InferenceDiagnostic::IncorrectArguments { .. } => "E0308: arguments to this function are incorrect".to_owned(),
+        &InferenceDiagnostic::MismatchedTupleStructPatArgCount { expected, found, .. } => format!(
+            "E0023: this pattern has {found} fields, but the corresponding tuple variant has {expected} fields"
+        ),
+        InferenceDiagnostic::ExpectedFunction { found, .. } => format!("E0618: expected function, found `{}`", ty(found)),
+        InferenceDiagnostic::CannotBeDereferenced { found, at_error, .. } => {
+            format!("E0614: type `{}` cannot be dereferenced", seen(found, at_error))
+        }
+        InferenceDiagnostic::UnaryOperatorCannotBeApplied { op, found, at_error, .. } => {
+            let op = match op {
+                hir_def::hir::UnaryOp::Deref => "*",
+                hir_def::hir::UnaryOp::Not => "!",
+                hir_def::hir::UnaryOp::Neg => "-",
+            };
+            format!("E0600: cannot apply unary operator `{op}` to type `{}`", seen(found, at_error))
+        }
+        InferenceDiagnostic::BinaryOperatorCannotBeApplied { op, lhs, rhs, at_error, .. } => {
+            let (lhs, rhs) = match at_error.as_deref() {
+                Some((lhs, rhs)) => (ty(lhs), ty(rhs)),
+                None => (ty(lhs), ty(rhs)),
+            };
+            format!("E0369: binary operation `{op}` cannot be applied to `{lhs}` and `{rhs}`")
+        }
+        InferenceDiagnostic::MutRefInImmRefPat { .. } => {
+            "E0308: mismatched types: a `&mut` pattern matches a shared reference".to_owned()
+        }
+        InferenceDiagnostic::CannotImplicitlyDerefTraitObject { found, .. } => {
+            format!("E0033: type `{}` cannot be dereferenced", ty(found))
+        }
+        InferenceDiagnostic::CannotIndexInto { found, at_error, .. } => {
+            format!("E0608: cannot index into a value of type `{}`", seen(found, at_error))
+        }
+        InferenceDiagnostic::TypedHole { .. } => {
+            "in expressions, `_` can only be used on the left-hand side of an assignment".to_owned()
+        }
+        InferenceDiagnostic::CastToUnsized { cast_ty, .. } => format!("E0620: cast to unsized type: `{}`", ty(cast_ty)),
+        InferenceDiagnostic::InvalidCast { expr_ty, cast_ty, .. } => {
+            format!("casting `{}` as `{}` is invalid", ty(expr_ty), ty(cast_ty))
+        }
+        InferenceDiagnostic::TyDiagnostic { .. } => "a type written in the body is invalid".to_owned(),
+        InferenceDiagnostic::PathDiagnostic { .. } => "a path written in the body is invalid".to_owned(),
+        &InferenceDiagnostic::MethodCallIncorrectGenericsLen { provided_count, expected_count, .. } => format!(
+            "E0107: a method call is given {provided_count} generic arguments, but the method takes {expected_count}"
+        ),
+        &InferenceDiagnostic::MethodCallIllegalSizedBound { method, .. } => {
+            format!("the `{}` method cannot be invoked on a trait object", fn_name(method))
+        }
+        &InferenceDiagnostic::EditionDependentMethodCall { method, .. } => {
+            format!("the call of `{}` resolves to another method in a later edition", fn_name(method))
+        }
+        InferenceDiagnostic::FullyQualifiedCallFrom2018 { self_ty, .. } => {
+            format!("the call on `{}` resolves to another trait's item with the 2021 prelude", ty(self_ty))
+        }
+        InferenceDiagnostic::MethodCallIncorrectGenericsOrder { .. } => {
+            "E0747: the method call's generic arguments are in the wrong order".to_owned()
+        }
+        InferenceDiagnostic::MethodCallLateBoundLifetimeArgs { .. } => {
+            "cannot specify lifetime arguments explicitly if late bound lifetime parameters are present".to_owned()
+        }
+        InferenceDiagnostic::InvalidLhsOfAssignment { op, .. } => {
+            format!("{}: invalid left-hand side of assignment", if op.is_some() { "E0067" } else { "E0070" })
+        }
+        InferenceDiagnostic::TypeMustBeKnown { kind, top_term, .. } => {
+            let code = match kind {
+                TypeAnnotationNeeded::E0282 => "E0282",
+                TypeAnnotationNeeded::E0283 => "E0283",
+                TypeAnnotationNeeded::E0284 => "E0284",
+            };
+            match top_term {
+                Some(term) => format!("{code}: type annotations needed for `{}`", term.as_ref().display(db, target)),
+                None => format!("{code}: type annotations needed"),
+            }
+        }
+        InferenceDiagnostic::UnionExprMustHaveExactlyOneField { .. } => {
+            "E0784: union expressions should have exactly one field".to_owned()
+        }
+        InferenceDiagnostic::TypeMismatch { expected, found, at_error, .. } => {
+            let (expected, found) = match at_error.as_deref() {
+                Some((expected, found)) => (ty(expected), ty(found)),
+                None => (ty(expected), ty(found)),
+            };
+            format!("E0308: mismatched types: expected `{expected}`, found `{found}`")
+        }
+        InferenceDiagnostic::SolverDiagnostic(it) => solver_text(db, target, def, &it.kind),
+        InferenceDiagnostic::ExplicitDropMethodUse { .. } => "E0040: explicit use of destructor method".to_owned(),
+        InferenceDiagnostic::MutableRefBinding { .. } => "binding cannot be both mutable and by-reference".to_owned(),
+        InferenceDiagnostic::YieldOutsideCoroutine { .. } => {
+            "E0627: yield expression outside of coroutine literal".to_owned()
+        }
+        InferenceDiagnostic::ReturnOutsideFunction { kind, .. } => match kind {
+            ReturnKind::ReturnExpr => "E0572: return statement outside of function body".to_owned(),
+            ReturnKind::BecomeExpr => "E0572: become statement outside of function body".to_owned(),
+        },
+        InferenceDiagnostic::UnsafeBinderCastOfNonBinder { found, .. } => {
+            format!("`{}` is not an unsafe binder type (`unsafe<..> T`)", ty(found))
+        }
+        InferenceDiagnostic::RecordMissingFields { record, missed_fields, .. } => match record {
+            ExprOrPatId::ExprId(_) => format!("E0063: {} fields missing in the struct literal", missed_fields.len()),
+            ExprOrPatId::PatId(_) => format!("E0027: the pattern does not mention {} fields", missed_fields.len()),
+        },
+        InferenceDiagnostic::InvalidConstArg { .. } => "a const argument that is not a constant".to_owned(),
+        InferenceDiagnostic::NotAStructPath { .. } => {
+            "E0574: the path does not name a struct, variant or union of the kind needed here".to_owned()
+        }
+        InferenceDiagnostic::AutoderefRecursionLimit { ty: at, suggested_limit, .. } => format!(
+            "E0055: reached the recursion limit while auto-dereferencing `{}` (consider `#![recursion_limit = \"{suggested_limit}\"]`)",
+            ty(at)
+        ),
+        InferenceDiagnostic::MethodOnUnknownRawPointee { .. } => {
+            "E0282: type annotations needed: cannot call a method on a raw pointer with an unknown pointee type"
+                .to_owned()
+        }
+        InferenceDiagnostic::TyvarBehindRawPointer { .. } => {
+            "type annotations needed: a method call on a raw pointer with an unknown pointee type".to_owned()
+        }
+        InferenceDiagnostic::InheritedRefMutabilityMismatch { .. } => {
+            "E0308: mismatched types: cannot match inherited `&` with `&mut` pattern".to_owned()
+        }
+        InferenceDiagnostic::FnTraitArgsNotTuple { .. } => {
+            "E0059: the arguments of a call through a function trait are not a tuple".to_owned()
+        }
+        InferenceDiagnostic::SelfCtorNotTupleOrUnit { self_ty, .. } => format!(
+            "the `Self` constructor can only be used with tuple or unit structs, and `Self` is `{}`",
+            ty(self_ty)
+        ),
+    };
+    let place = match d {
+        InferenceDiagnostic::SolverDiagnostic(it) => {
+            let binding = match (it.span, def) {
+                (hir_ty::Span::BindingId(binding), InferBodyId::DefWithBodyId(def)) => {
+                    Some(Body::of(db, def)[binding].name.as_str())
+                }
+                _ => None,
+            };
+            match (binding, ObligationCauseCode::from(it.cause)) {
+                (Some(name), ObligationCauseCode::SizedArgumentType) => format!(", for the parameter `{name}`"),
+                (_, ObligationCauseCode::SizedReturnType) => ", for the return type".to_owned(),
+                (Some(name), _) => format!(", for the binding `{name}`"),
+                (None, _) => String::new(),
+            }
+        }
+        _ => String::new(),
+    };
+    // alloc: error path, the error's text
+    format!("{what}{place}, in {}", body_item_text(db, target, def))
+}
+
+/// rustc's code and message of the trait solver error `kind` in `def`.
+fn solver_text<'db>(
+    db: &'db Db,
+    target: DisplayTarget,
+    def: InferBodyId<'db>,
+    kind: &'db SolverDiagnosticKind,
+) -> String {
+    let interner = DbInterner::new_no_crate(db);
+    let ty = |ty: &'db StoredTy| ty.as_ref().display(db, target).to_string();
+    let goal = |goal| goal_text(db, target, goal);
+    // alloc: each arm, error path, the error's text
+    match kind {
+        SolverDiagnosticKind::TraitUnimplemented { trait_predicate, .. } => {
+            let pred = trait_predicate.get(interner);
+            let krate = hir_def::HasModule::krate(&def, db);
+            let sized = hir_def::lang_item::lang_items(db, krate).Sized;
+            if sized == Some(pred.def_id().0) && pred.polarity == rustc_type_ir::ClausePolarity::Positive {
+                // `Sized`'s `#[rustc_on_unimplemented]` message.
+                format!(
+                    "E0277: the size for values of type `{}` cannot be known at compilation time (`{}`)",
+                    pred.self_ty().display(db, target),
+                    pred.display(db, target)
+                )
+            } else {
+                format!("E0277: the trait bound `{}` is not satisfied", pred.display(db, target))
+            }
+        }
+        SolverDiagnosticKind::ClosureKindMismatch { expected, found, .. } => format!(
+            "E0525: expected a closure that implements the `{}` trait, but this closure only implements `{}`",
+            expected.as_str(),
+            found.as_str()
+        ),
+        SolverDiagnosticKind::GoalUnmet { goal: unmet, .. } => {
+            format!("the requirement `{}` is not satisfied", goal(unmet))
+        }
+        SolverDiagnosticKind::Overflow { goal: overflowed, .. } => {
+            format!("E0275: overflow evaluating the requirement `{}`", goal(overflowed))
+        }
+        SolverDiagnosticKind::ProjectionMismatch { goal: projection, .. } => {
+            format!("E0271: type mismatch resolving `{}`", goal(projection))
+        }
+        SolverDiagnosticKind::TypesDiffer { expected, found } => {
+            format!("E0308: mismatched types: expected `{}`, found `{}`", ty(expected), ty(found))
+        }
+        SolverDiagnosticKind::ConstArgHasWrongType { ct, expected_ty, .. } => {
+            format!("the constant `{}` is not of type `{}`", ct.as_ref().display(db, target), ty(expected_ty))
+        }
+        SolverDiagnosticKind::HigherRankedOutlives => {
+            "higher-ranked lifetime bound could not be satisfied".to_owned()
+        }
+        SolverDiagnosticKind::Unreported { code } => {
+            let what = match code {
+                solver_errors::UnreportedSolverError::Cycle => "a cycle",
+                solver_errors::UnreportedSolverError::SignatureMismatch => "a signature mismatch",
+                solver_errors::UnreportedSolverError::TraitDynIncompatible => "a trait that is not dyn compatible",
+                solver_errors::UnreportedSolverError::NotConstEvaluatable => "a constant that cannot be evaluated",
+                solver_errors::UnreportedSolverError::SelectionOverflow => "an overflow in selection",
+                solver_errors::UnreportedSolverError::ConstEquate => "constants that differ",
+            };
+            format!("the trait solver found {what}, which only rustc's old solver reports")
+        }
+    }
+}
+
+/// `goal` as rustc prints a predicate.
+fn goal_text<'db>(db: &'db Db, target: DisplayTarget, goal: &'db StoredGoal) -> String {
+    let interner = DbInterner::new_no_crate(db);
+    let arg = |arg: &'db hir_ty::next_solver::StoredGenericArg| arg.as_ref().display(db, target).to_string();
+    let ty = |ty: &'db StoredTy| ty.as_ref().display(db, target).to_string();
+    let trait_ref = |trait_: TraitId, args: &'db hir_ty::next_solver::StoredGenericArgs| {
+        hir_ty::next_solver::TraitRef::new_from_args(interner, trait_.into(), args.as_ref())
+    };
+    let trait_name = |trait_: TraitId| TraitSignature::of(db, trait_).name.as_str().to_owned();
+    // alloc: each arm, error path, the error's text
+    match goal {
+        &StoredGoal::Trait { trait_, ref args, polarity } => {
+            let tr = trait_ref(trait_, args);
+            let not = if polarity == rustc_type_ir::ClausePolarity::Negative { "!" } else { "" };
+            format!("{}: {not}{}", tr.self_ty().display(db, target), tr.display(db, target))
+        }
+        &StoredGoal::HostEffect { trait_, ref args, maybe_const } => {
+            let tr = trait_ref(trait_, args);
+            let constness = if maybe_const { "[const]" } else { "const" };
+            format!("{}: {constness} {}", tr.self_ty().display(db, target), tr.display(db, target))
+        }
+        StoredGoal::Projection { alias, term } | StoredGoal::NormalizesTo { alias, term } => {
+            format!("{} == {}", arg(alias), arg(term))
+        }
+        StoredGoal::WellFormed { term } => format!("{} well-formed", arg(term)),
+        StoredGoal::Subtype { a, b } => format!("{} <: {}", ty(a), ty(b)),
+        StoredGoal::Coerce { a, b } => format!("{} coerces to {}", ty(a), ty(b)),
+        StoredGoal::ConstEvaluatable { ct } => format!("the constant `{}` can be evaluated", arg(ct)),
+        StoredGoal::ConstArgHasType { ct, ty: of } => format!("the constant `{}` has type `{}`", arg(ct), ty(of)),
+        StoredGoal::ConstEquate { a, b } => format!("{} == {}", arg(a), arg(b)),
+        &StoredGoal::DynCompatible { trait_ } => format!("the trait `{}` is dyn compatible", trait_name(trait_)),
+        StoredGoal::UnstableFeature { feature } => format!("the feature `{}` is enabled", feature.as_str()),
+        StoredGoal::Outlives { a, b } => format!("{}: {}", arg(a), arg(b)),
+        StoredGoal::Ambiguous => "an ambiguous goal".to_owned(),
+    }
+}
+
+/// The item `def` is the body of, as an error names it: `` `Trait::method` ``, a constant in
+/// one, or a constant in an item's signature.
+fn body_item_text(db: &Db, target: DisplayTarget, def: InferBodyId<'_>) -> String {
+    use hir_def::ExpressionStoreOwnerId;
+    let def = match def {
+        InferBodyId::DefWithBodyId(def) => def,
+        InferBodyId::AnonConstId(konst) => {
+            return match konst.loc(db).owner {
+                ExpressionStoreOwnerId::Body(def) => {
+                    // alloc: error path, the error's text
+                    format!("a constant in {}", body_item_text(db, target, InferBodyId::DefWithBodyId(def)))
+                }
+                ExpressionStoreOwnerId::Signature(_) | ExpressionStoreOwnerId::VariantFields(_) => {
+                    "a constant in the signature or fields of the item it is placed at".to_owned()
+                }
+            };
+        }
+    };
+    // alloc: error path, the error's text
+    match def {
+        DefWithBodyId::FunctionId(f) => {
+            let name = FunctionSignature::of(db, f).name.as_str().to_owned();
+            match f.lookup(db).container {
+                ItemContainerId::TraitId(t) => format!("`{}::{name}`", TraitSignature::of(db, t).name.as_str()),
+                ItemContainerId::ImplId(i) => format!(
+                    "`<{}>::{name}`",
+                    db.impl_self_ty(i).instantiate_identity().skip_norm_wip().display(db, target)
+                ),
+                ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => format!("`{name}`"),
+            }
+        }
+        _ => match crate::DefWithBody::from(def).name(db) {
+            Some(name) => format!("`{}`", name.as_str()),
+            None => "an unnamed constant".to_owned(),
+        },
     }
 }
 

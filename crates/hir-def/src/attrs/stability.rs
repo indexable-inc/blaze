@@ -182,6 +182,21 @@ pub enum UnstableReason {
     Some(Symbol),
 }
 
+impl UnstableReason {
+    /// `to_opt_reason`: the reason written, or for `Default` rustc's
+    /// `sym::unstable_location_reason_default`.
+    pub fn to_opt_reason(&self) -> Option<&str> {
+        match self {
+            UnstableReason::None => None,
+            UnstableReason::Default => Some(
+                "this crate is being loaded from the sysroot, an unstable location; did you mean to \
+                 load this crate from crates.io via `Cargo.toml` instead?",
+            ),
+            UnstableReason::Some(reason) => Some(reason.as_str()),
+        }
+    }
+}
+
 /// `StableSince`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StableSince {
@@ -223,6 +238,34 @@ pub fn stability(db: &Db, def: StabilityDef) -> Option<&Stability> {
     match stability_from(db, def)? {
         StabilityFrom::Own(origin) => own(db, origin)?.stability.as_ref(),
         StabilityFrom::ForceUnstable => Some(&FORCE_UNSTABLE),
+    }
+}
+
+/// `lookup_default_body_stability(def)`: what `def`'s own `#[rustc_default_body_unstable]` says
+/// of its default body, in a crate with `staged_api` (`BodyStabilityParser`), nothing inherited.
+pub fn default_body_stability(db: &Db, def: AttrDefId) -> Option<&Stability> {
+    if !UnstableFeatures::query(db, def.krate(db)).staged_api {
+        return None;
+    }
+    return default_body_of(db, def).as_ref();
+
+    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+    fn default_body_of(db: &Db, def: AttrDefId) -> Option<Stability> {
+        let (source, outer_mod_decl, crate_attrs, krate) = attrs_source(db, def, Tree::Live);
+        collect_attrs_in(db, source, outer_mod_decl, crate_attrs, krate, |meta, _| {
+            match meta.path() {
+                Some(path) if is_one(path, "rustc_default_body_unstable") => {
+                    let ast::Meta::TokenTreeMeta(list) = meta else {
+                        return ControlFlow::Break(None);
+                    };
+                    ControlFlow::Break(
+                        list.token_tree().and_then(items).and_then(|it| parse_unstable(&it)),
+                    )
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        })
+        .flatten()
     }
 }
 

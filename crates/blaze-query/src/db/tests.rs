@@ -592,6 +592,21 @@ fn message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 #[test]
+fn a_key_the_database_never_gave_is_refused_naming_the_query_and_the_database_still_drops() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    assert_eq!(*get::<Double>(&db, cell), 6);
+    for forged in [Id::from_u32(5), Id::from_u32(Id::MAX_U32), Id::from_u32(u32::MAX)] {
+        let payload = catch_unwind(AssertUnwindSafe(|| *get::<Double>(&db, Cell(forged))))
+            .expect_err("a key of no owned page");
+        let message = message(&*payload);
+        assert!(message.contains("`Double`") && message.contains("never gave"), "{message}");
+    }
+    assert_eq!(*get::<Double>(&db, cell), 6);
+    drop(db);
+}
+
+#[test]
 fn a_fixpoint_that_never_converges_panics_naming_its_head_and_leaves_no_value() {
     let db = TestDb::new();
     let cell = Cell::new(&db, 0, 0);
@@ -847,6 +862,30 @@ fn making_a_singleton_reruns_what_read_its_absence() {
     assert_eq!((db.runs("ConfigOrZero"), db.runs("Double")), (2, 1));
 }
 
+thread_local! {
+    static RAN_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn count_run() {
+    RAN_HERE.with(|it| it.set(it.get() + 1));
+}
+
+/// The stall watchdog is told of each run and of no hit ([`crate::on_each_run`]).
+#[test]
+fn each_run_is_told_and_no_hit_is() {
+    assert!(crate::on_each_run(count_run).is_ok(), "only this test sets the hook");
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 1, 2);
+    let ran = || RAN_HERE.with(std::cell::Cell::get);
+    let before = ran();
+    assert_eq!(*get::<Double>(&db, cell), 2);
+    let told = ran() - before;
+    assert_eq!(told, db.runs("Double") as u64, "one per run, on the thread it ran on");
+    assert_eq!(*get::<Double>(&db, cell), 2);
+    assert_eq!(ran() - before, told, "a hit is not told");
+    assert!(crate::on_each_run(count_run).is_err(), "once per process");
+}
+
 /// Interned strings.
 struct Names;
 
@@ -911,6 +950,26 @@ impl Interned for Pairs {
     fn ids_of(fields: &(Id, u32), out: &mut Vec<Id>) {
         out.push(fields.0);
     }
+}
+
+/// An id from outside is checked before its fields are read: only a slot interned on an
+/// interned ingredient's page is made; the next slot of that page, an input's row and a page
+/// nobody owns are not.
+#[test]
+fn only_an_interned_slot_is_made() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 0, 0);
+    let id = name(&db, "made");
+    let storage = db.storage();
+    assert!(storage.made(id));
+    let next = Id::at(id.page(), id.slot() + 1);
+    assert_eq!(storage.owner(next), storage.owner(id), "the same page");
+    assert!(!storage.made(next), "a slot of the page never interned");
+    let payload = catch_unwind(AssertUnwindSafe(|| interned_fields::<Names>(storage, next)))
+        .expect_err("what `made` keeps a caller from");
+    assert!(message(&*payload).contains("was never interned"));
+    assert!(!storage.made(cell.0), "an input's row");
+    assert!(!storage.made(Id::from_u32(Id::MAX_U32)), "a page nobody owns");
 }
 
 #[test]
@@ -1124,6 +1183,59 @@ fn an_evicted_value_recomputed_equal_does_not_rerun_its_readers() {
     assert_eq!(*get::<Tens>(&db, cell), 1, "evicted in this view: run again, stamp kept");
     cell.set_a(&mut db, 25);
     assert_eq!(*get::<TensReader>(&db, cell), 3);
+}
+
+query!(
+    CountedTens,
+    u64,
+    |db, key| key.a(db) / 10;
+    const EVICT: bool = true;
+);
+query!(CountedReader, u64, |db, key| get::<CountedTens>(db, key) + 1);
+
+/// `(executed, verified, reran)` of the two counted queries since the last take; other tests
+/// count other queries, and only this one takes.
+fn counted(db: &TestDb) -> [(u64, u64, u64); 2] {
+    let mut found = [(0, 0, 0); 2];
+    db.storage().take_counts(|name, executed, verified, reran| {
+        let at = match name {
+            "CountedTens" => 0,
+            "CountedReader" => 1,
+            _ => return,
+        };
+        found[at] = (executed, verified, reran);
+    });
+    found
+}
+
+/// What observe's `reexecution_per_query_kind` reads: a run counts as executed, a row proved
+/// unchanged as verified, and only a second run of a row in one view (its value evicted and
+/// asked for again) as reran; a run in a later view is not one, nor is a hit anything.
+#[test]
+fn each_run_verify_and_rerun_in_one_view_is_counted_per_query() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 11, 0);
+    counted(&db);
+    assert_eq!(*get::<CountedReader>(&db, cell), 2);
+    assert_eq!(*get::<CountedReader>(&db, cell), 2);
+    assert_eq!(counted(&db), [(1, 0, 0), (1, 0, 0)], "a first run each, and a hit is nothing");
+
+    cell.set_a(&mut db, 12);
+    assert_eq!(*get::<CountedReader>(&db, cell), 2);
+    assert_eq!(counted(&db), [(1, 0, 0), (0, 1, 0)], "tens ran equal: its reader is verified");
+
+    assert_eq!(evict_values_of::<CountedTens>(&mut db, &[cell]), 1);
+    assert_eq!(*get::<CountedTens>(&db, cell), 1);
+    assert_eq!(counted(&db), [(1, 0, 1), (0, 0, 0)], "run again in the view it ran in");
+
+    cell.set_b(&mut db, 1);
+    assert_eq!(evict_values_of::<CountedTens>(&mut db, &[cell]), 1);
+    assert_eq!(*get::<CountedReader>(&db, cell), 2);
+    assert_eq!(*get::<CountedTens>(&db, cell), 1);
+    let [(executed, verified, reran), reader] = counted(&db);
+    assert_eq!((executed, reran), (1, 0), "evicted in an earlier view: a run, not a rerun");
+    assert_eq!(verified, 1, "proved unchanged before it ran for its value");
+    assert_eq!(reader, (0, 1, 0));
 }
 
 static HASHES: AtomicUsize = AtomicUsize::new(0);

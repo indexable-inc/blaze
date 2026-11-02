@@ -28,8 +28,7 @@
 //! Rounding to power-of-two alignments is [`align`]'s, one copy for the whole tree; the
 //! SwissTable group probe every interner shares is [`swiss`]'s.
 //!
-//! Unsafe code is confined to [`os`] (the kernel's virtual memory), [`vm`] (that memory for a
-//! caller that lays out its own reservation, over `os`), the few lines in each
+//! Unsafe code is confined to [`os`] (the kernel's virtual memory), the few lines in each
 //! allocator that turn a committed address into a typed place, and [`lock`]'s guard (a lock
 //! that never allocates, which `std`'s does on macOS); every block says which
 //! invariant holds and where it is upheld (docs/v2/plan/design/unsafe.md).
@@ -57,7 +56,6 @@ mod stack;
 pub mod swiss;
 mod sync;
 pub mod tag;
-pub mod vm;
 
 pub use append::AppendVec;
 pub use arena::{Arena, ArenaLocal};

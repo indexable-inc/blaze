@@ -8,10 +8,10 @@
     "crates/hir-def/src/expr_store.rs"
   ],
   "what": "## A macro error inside a function body is never reported: `fn main() { compile_error!(\"msg\"); }` builds silently\n\nblaze-diagnostics tests::items::macros::compile_error_is_an_error_at_the_call has printed nothing since round 12 (BUILTINS_CORE fixture: `compile_error` is the `#[rustc_builtin_macro]` of core's prelude, resolved). rustc: error \"msg\" at the call (line 2). The parse error of an expansion in a body is lost the same way (tests::items::macros::an_expansion_that_ends_inside_an_expression_says_so_at_its_last_token: only 01380's borrowck leak is printed, not \"macro expansion ends with an incomplete expression\"). The route: hir reports body macro errors from `BodySourceMap::macro_calls()` (hir/src/diagnostics.rs:3240, then `collect_macro_call` at 2160), which reads `expansions` (hir-def/src/expr_store/source_map.rs:1014). Those are pushed only under `self.store.record` (expr_store/lower.rs:3034, 3005), and `record` is cleared at expr_store.rs:839. Please check that the source map hir walks there is built with `record` on for statement-position calls (`collect_macro_as_stmt`, lower.rs:3068). Otherwise, report from `ExpressionStore::macro_calls()`, which is always kept. Item-level `compile_error!` goes through `DefDiagnosticKind::MacroError` and works. Program impact: `compile_error!` under a `cfg`-selected branch in a fn body (common in real crates) is ignored.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T00:22:51Z",
-  "updated": "2026-11-01T00:22:51Z",
-  "taken_by": null,
+  "updated": "2026-11-01T20:24:28Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -20,6 +20,18 @@
       "by": "fix-diag-lints",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T20:24:28Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:24:28Z",
+      "by": "db",
+      "action": "done",
+      "note": "done by tests-diag (edit 84/85, unbuilt): hir diagnostics.rs check_body, collect_generic_def, collect_variant collect the store when an expansion failed (store_macro_failed). db agrees."
     }
   ]
 }

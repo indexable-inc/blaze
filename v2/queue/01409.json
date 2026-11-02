@@ -6,10 +6,10 @@
     "crates/blaze-query"
   ],
   "what": "observe: tell the stall watchdog a query ran (Andrew, 2026-10-31: the stall watchdog). The daemon's watchdog fails a request when nothing has moved for 60 s while its tasks run: no info span closed, no task ended. A long front-end check can run for minutes inside one task with no info span closing. So once per query execution (a real run, not a memo hit), call blaze_profile::moved(): a thread-local read and one relaxed add on the thread's own cache line, no allocation, no lock. Put it where a query's function is about to run or has just run. It needs `blaze-profile.workspace = true` in blaze-query's Cargo.toml (deps: rustc-hash, serde, serde_json, tracing, object, rustc-demangle; no salsa or hir). Without it, a check that runs over 60 s with every thread inside queries is a false stall.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-11-01T01:19:26Z",
-  "updated": "2026-11-01T01:19:26Z",
-  "taken_by": null,
+  "updated": "2026-11-01T20:22:23Z",
+  "taken_by": "db",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,18 @@
       "by": "observe",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-11-01T20:22:23Z",
+      "by": "db",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T20:22:23Z",
+      "by": "db",
+      "action": "done",
+      "note": "applied, not yet run: blaze-query cannot depend on blaze-profile (cycle through blaze-v2-proof), so blaze-query lib.rs has `on_each_run(hook: fn())` (a OnceLock<fn()>, one Acquire load per run, nothing on a hit), called in db/function.rs right after F::execute. Test db/tests.rs each_run_is_told_and_no_hit_is. Registration `blaze_query::on_each_run(blaze_profile::moved)` queued to cargo for the daemon start."
     }
   ]
 }

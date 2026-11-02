@@ -92,6 +92,15 @@ pub(crate) fn resolve_round<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
     // Directives the sink took before the round are the round's too.
     sink.take_macros(pending);
     let macros = std::mem::replace(pending, Vec::new_in(frame));
+    let span = tracing::info_span!(
+        "nameres resolve_round",
+        pending = macros.len(),
+        eager_with_errors,
+        resolved = tracing::field::Empty,
+        kept = tracing::field::Empty,
+        progress = tracing::field::Empty,
+    )
+    .entered();
     let mut kept = Vec::with_capacity_in(macros.len(), frame);
     // The directives the round's own resolutions add (an attribute's item collected again, a
     // derive left unresolved), in the order they come: after the retained ones.
@@ -124,6 +133,9 @@ pub(crate) fn resolve_round<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
     }
     kept.append(&mut added);
     *pending = kept;
+    span.record("resolved", resolved.len());
+    span.record("kept", pending.len());
+    span.record("progress", progress);
 
     for (module, call, id) in eager {
         sink.apply(DeclOp::AddMacroInvoc { module, call, id });

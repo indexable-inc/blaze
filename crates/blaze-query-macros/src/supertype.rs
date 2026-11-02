@@ -6,7 +6,7 @@ use quote::quote;
 
 use crate::db;
 
-pub(crate) fn expand(input: syn::DeriveInput) -> syn::Result<TokenStream> {
+pub(crate) fn expand(input: &syn::DeriveInput) -> syn::Result<TokenStream> {
     let syn::Data::Enum(data) = &input.data else {
         return Err(syn::Error::new_spanned(
             &input.ident,

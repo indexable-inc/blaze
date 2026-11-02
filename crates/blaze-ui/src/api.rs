@@ -9,8 +9,8 @@
 use std::fmt;
 
 use blaze_api::{
-    Diagnostic, FetchVerb, How, Level, LinkHow, LinkKind, Linked, NodeKind, Ranked, Response, ServedCrate,
-    TestOutcome, TestResult, Traced, Verb, Worked,
+    Diagnostic, FetchVerb, Hot, HotFunction, HotSince, HotWaitKind, How, Level, LinkHow, LinkKind, Linked, NodeKind,
+    Ranked, Response, ServedCrate, TestOutcome, TestResult, Traced, Verb, Worked,
 };
 use blaze_ids::ContentId;
 use blaze_query::QueryKey;
@@ -263,6 +263,58 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             out.push('\n');
         }
         Response::Queried { rows, ipc } => put!(out, "{} {rows} rows, {} bytes of Arrow IPC\n", status("Queried"), ipc.len()),
+        Response::Hot(hot) => hot_lines(out, hot),
+    }
+}
+
+/// `blaze debug hot`'s table: the keys that took most, each with the bracket the sketches
+/// put its time in, then each kind of wait's quantiles.
+pub fn hot_lines(out: &mut String, hot: &Hot) {
+    use std::fmt::Write as _;
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let since = match hot.since {
+        HotSince::Start => "since the daemon began",
+        HotSince::LastBuild => "over the last build",
+    };
+    _ = writeln!(
+        out,
+        "blaze hot, {since}: {} spans, {:.1} ms in spans (nested ones again); a key's time is at most \
+         its first column, over the truth by at most {:.1} ms but for a 1.8% chance, and at least its second",
+        hot.spans,
+        ms(hot.total_ns),
+        ms(hot.error_ns),
+    );
+    _ = writeln!(out, "{:>12} {:>12}  span  of", "at most ms", "at least ms");
+    for key in &hot.keys {
+        _ = write!(out, "{:>12.1} {:>12.1}  {}", ms(key.upper_ns), ms(key.lower_ns), key.span);
+        _ = match &key.function {
+            HotFunction::None => writeln!(out),
+            HotFunction::Named(name) => writeln!(out, "  {name}"),
+            HotFunction::Forgotten(sym) => writeln!(out, "  (a name the daemon let go, #{sym})"),
+        };
+    }
+    if hot.torn > 0 {
+        _ = writeln!(out, "{} entries were read as a thread replaced them: left out of `at least`", hot.torn);
+    }
+    _ = writeln!(out, "{:<8} {:>9} {:>12} {:>12} {:>12} {:>12}", "wait", "count", "p50 ms", "p90 ms", "p99 ms", "max ms");
+    for wait in &hot.waits {
+        let kind = match wait.kind {
+            HotWaitKind::Key => "key",
+            HotWaitKind::Lock => "lock",
+            HotWaitKind::Channel => "channel",
+            HotWaitKind::Io => "io",
+            HotWaitKind::Child => "child",
+            HotWaitKind::Scope => "scope",
+        };
+        _ = writeln!(
+            out,
+            "{kind:<8} {:>9} {:>12.3} {:>12.3} {:>12.3} {:>12.3}",
+            wait.count,
+            ms(wait.p50_ns),
+            ms(wait.p90_ns),
+            ms(wait.p99_ns),
+            ms(wait.max_ns),
+        );
     }
 }
 

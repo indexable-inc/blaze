@@ -739,11 +739,16 @@ pub(super) fn resolve<'db>(
     if FunctionSignature::is_intrinsic(db, func) {
         return None;
     }
+    let interner = ctx.infcx.interner;
+    let lang = interner.lang_items();
+    // `drop_glue`'s body is a placeholder the compiler replaces with the type's drop glue, a
+    // shim: inlined, it would drop nothing.
+    if [lang.DropInPlace, lang.DropGlue].contains(&Some(func)) {
+        return None;
+    }
     let ItemContainerId::TraitId(_) = func.loc(db).container else {
         return FunctionSignature::of(db, func).has_body().then_some((InlinedBody::Fn(func), args));
     };
-    let interner = ctx.infcx.interner;
-    let lang = interner.lang_items();
     let called_as = if Some(func) == lang.Fn_call {
         Some(ClosureKind::Fn)
     } else if Some(func) == lang.FnMut_call_mut {

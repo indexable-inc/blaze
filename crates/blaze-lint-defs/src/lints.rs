@@ -894,13 +894,55 @@ pub(super) const BUILTIN: &[Lint] = &[
     l("warnings", Warn, "mass-change the level for lints which produce warnings"),
 ];
 
-/// The lints of the tool `blaze`, blaze's own (docs/fn-cache.md), always registered: rustc
-/// has none of them.
-pub(super) const BLAZE: &[Lint] = &[l(
-    "blaze::const_impure",
-    Warn,
-    "detects a `#[blaze::cache]` function whose result depends on more than its arguments",
-)];
+/// The lints of the tool `blaze`, blaze's own, always registered: rustc has none of them. The
+/// front end's (docs/fn-cache.md), then blaze-lints' in the order of its `blaze::Lint::ALL`,
+/// which its tests hold to this table; those run under `blaze check` and are allowed unless a
+/// level is set (`[workspace.metadata.blaze.lints]`).
+pub(super) const BLAZE: &[Lint] = &[
+    l(
+        "blaze::const_impure",
+        Warn,
+        "detects a `#[blaze::cache]` function whose result depends on more than its arguments",
+    ),
+    l("blaze::hot_clone", Allow, "detects a clone in hot code that costs more than a copy")
+        .externally_loaded(),
+    l("blaze::hot_alloc", Allow, "detects a call in hot code that reaches the global allocator")
+        .externally_loaded(),
+    l("blaze::hot_dyn", Allow, "detects a call in hot code that goes through a vtable")
+        .externally_loaded(),
+    l("blaze::std_hashmap", Allow, "detects std's `HashMap` or `HashSet` hashing with `RandomState`")
+        .externally_loaded(),
+    l("blaze::parallelizable", Allow, "detects a loop whose iterations are independent and could run in parallel")
+        .externally_loaded(),
+    l("blaze::serial_dependence", Allow, "detects a loop kept serial by exactly one dependence")
+        .externally_loaded(),
+    l("blaze::fiber_boundary", Allow, "detects code that reaches past `blaze_graph::sched` into fibers")
+        .externally_loaded(),
+    l("blaze::hot_alloc_call", Allow, "detects a call in hot code that allocates through the workspace's code")
+        .externally_loaded(),
+    l("blaze::error_debug", Allow, "detects an error's message that can panic or names no item")
+        .externally_loaded(),
+    l("blaze::wall_clock", Allow, "detects a read of the wall clock outside the injected clock")
+        .externally_loaded(),
+    l("blaze::untyped_error", Allow, "detects a function returning an error that is not an enum of what fails")
+        .externally_loaded(),
+    l("blaze::dropped_error", Allow, "detects an error thrown away for a value")
+        .externally_loaded(),
+    l("blaze::hash_order_output", Allow, "detects output that depends on hash-map iteration order")
+        .externally_loaded(),
+    l("blaze::held_across_wait", Allow, "detects a thread-tied value held across a wait")
+        .externally_loaded(),
+    l("blaze::lock_across_query", Allow, "detects a lock guard held across a query call")
+        .externally_loaded(),
+    l("blaze::blocking_on_pool", Allow, "detects a blocking call on a pool thread or fiber")
+        .externally_loaded(),
+    l("blaze::unnamed_wait", Allow, "detects a wait with no span naming what it waits for")
+        .externally_loaded(),
+    l("blaze::shared_collection_lock", Allow, "detects a locked map or `Vec` shared between parallel items")
+        .externally_loaded(),
+    l("blaze::open_wait_loop", Allow, "detects a loop that waits for progress with no bound")
+        .externally_loaded(),
+];
 
 /// Lints rustc declares and never registers: an attribute can't name them, but
 /// `private_macro_use` is still emitted by name resolution at its default level.

@@ -641,6 +641,12 @@ impl DefMap {
                     let named = i.checked_sub(1).map(|prev| &segments[prev]);
                     let vis =
                         self.declared_enum_visibility(db, e, curr, named, reads).unwrap_or(curr.vis);
+                    // A variant is no binding of the enum's module: a write touching the enum
+                    // wakes this read (`enum_glob_wakes`), as it wakes a glob of the enum.
+                    crate::nameres::delta::reads::note(
+                        crate::Lookup::lookup(&e, db).container,
+                        Some(crate::nameres::delta::reads::enum_glob()),
+                    );
                     let res = e.enum_variants(db).variants.get(segment).map(|&(variant, shape)| {
                         if shape.has_value_ns_ctor() {
                             PerNs::both(variant.into(), variant.into(), vis, None)

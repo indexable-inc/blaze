@@ -1,0 +1,23 @@
+{
+  "id": "01540",
+  "from_lane": "one-pool",
+  "owner": "sched-attach-db",
+  "paths": [
+    "crates/hir-ty/src/next_solver/interner.rs"
+  ],
+  "what": "hir-ty next_solver/interner.rs tls_db test jobs_with_databases_of_their_own_park_and_resume_on_each_others_workers failed once under load ('the test holds the key', interner.rs:3288, coord round 14:50, /tmp/blaze-lanes/round-1450/hir-ty.log). The cause is a timing bet in the test, not the scheduler: each job bumps `waiting` before it calls flights.get_or_run(key, ..), and the holder ends the run 2 ms (spin::busy) after it sees both bumps. A job descheduled past 2 ms between the bump and its ask finds the key idle and runs the panicking closure. Fix: in the holder, replace the SpinWait on `waiting.load() >= 2` and the busy(2 ms) with `blaze_graph::spin::SpinWait::within(\"both jobs to link to the key's run\", Duration::from_secs(60), || flights.waiters(key) >= 2)`. `Flights::waiters(key)` is now public (blaze-graph pump.rs, one-pool), and the `waiting` counter can go. A linked waiter is told the run's end, so the ask can no longer find the key idle.",
+  "state": "open",
+  "created": "2026-11-01T22:53:01Z",
+  "updated": "2026-11-01T22:53:01Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T22:53:01Z",
+      "by": "one-pool",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

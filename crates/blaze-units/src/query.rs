@@ -274,7 +274,7 @@ pub enum Planned {
 }
 
 impl Versioned for Planned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 5");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 6");
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -325,7 +325,8 @@ pub struct Units {
     pub build_dir: String,
     /// The profile as cargo's `Finished` line names it: "`dev` profile [unoptimized + debuginfo]".
     pub finished: String,
-    /// The workspace's `build-script-link-dirs`, absolute.
+    /// The workspace's `build-script-link-dirs`, absolute or `${NAME}/rest` for a run to expand
+    /// (`blaze_cargo::directives::link_dirs`).
     pub link_dirs: Vec<String>,
     /// The workspace's root manifest lists `sandboxed-tests` in `experimental` under
     /// `[workspace.metadata.blaze]`: every member's tests run sandboxed but those
@@ -334,7 +335,7 @@ pub struct Units {
 }
 
 impl Versioned for Units {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 6");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 8");
 }
 
 /// What cargo passes and writes for one unit.
@@ -375,6 +376,19 @@ pub struct UnitPlan {
     pub runner: Vec<String>,
     /// The target's `harness`.
     pub harness: bool,
+    /// What `check` lints the unit's crate with; `None` for a crate it does not lint (any
+    /// other command, a package outside the workspace, the standard library, a build script's
+    /// run).
+    pub clippy: Option<Clippy>,
+}
+
+/// What `check` lints a crate with beyond its compile, as cargo-clippy gives clippy's driver;
+/// `--cfg clippy` is among [`UnitPlan::cfgs`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Clippy {
+    /// The configuration file clippy's search finds (`.clippy.toml` or `clippy.toml`, from
+    /// `CLIPPY_CONF_DIR` or the package's directory up), absolute, with its text.
+    pub conf: Option<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

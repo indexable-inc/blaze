@@ -309,7 +309,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 let new_size = from_bytes!(usize, self.read_scalar(new_size.interval)?);
                 let ptr = self.read_pointer(ptr.interval.addr)?;
-                let result = self.reallocate(ptr, new_size)?;
+                let result = self.reallocate(ptr, new_size, Origin::Allocator, "__rust_realloc")?;
                 self.write_pointer(destination.addr, result)?;
             }
             _ => not_supported!("unknown alloc function"),
@@ -335,6 +335,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             (lang_items.BeginPanic.filter(|_| const_panics), BeginPanic),
             (lang_items.SliceLen, SliceLen),
             (lang_items.DropInPlace, DropInPlace),
+            // `drop_in_place`'s callee, whose body is a placeholder for the type's drop glue.
+            (lang_items.DropGlue, DropInPlace),
         ]
         .iter()
         .find(|&(candidate, _)| candidate == Some(def))
@@ -603,8 +605,90 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
                 Ok(())
             }
+            "malloc" => {
+                let [size] = args else {
+                    return Err(MirEvalError::InternalError("malloc args are not provided".into()));
+                };
+                let size = from_bytes!(usize, size.get(self)?);
+                let addr = self.c_allocate(size, false)?;
+                self.write_pointer(destination.addr, addr)
+            }
+            "calloc" => {
+                let [count, size] = args else {
+                    return Err(MirEvalError::InternalError("calloc args are not provided".into()));
+                };
+                let count = from_bytes!(usize, count.get(self)?);
+                let size = from_bytes!(usize, size.get(self)?);
+                // An overflowing size is C's failure: a null pointer.
+                let addr = match count.checked_mul(size) {
+                    Some(size) => self.c_allocate(size, true)?,
+                    None => Address::from_usize(0),
+                };
+                self.write_pointer(destination.addr, addr)
+            }
+            "realloc" => {
+                let [ptr, size] = args else {
+                    return Err(MirEvalError::InternalError("realloc args are not provided".into()));
+                };
+                let ptr = self.read_pointer(ptr.interval.addr)?;
+                let size = from_bytes!(usize, size.get(self)?);
+                let addr = if ptr.to_usize() == 0 {
+                    self.c_allocate(size, false)?
+                } else if size == 0 {
+                    match self.target()?.os {
+                        // glibc's: the block is freed and the result is null.
+                        thread::Os::Linux => {
+                            self.deallocate(ptr, Origin::C, "realloc")?;
+                            Address::from_usize(0)
+                        }
+                        // macOS': a block of the least size in its place.
+                        thread::Os::Apple => self.reallocate(ptr, 1, Origin::C, "realloc")?,
+                    }
+                } else {
+                    self.reallocate(ptr, size, Origin::C, "realloc")?
+                };
+                self.write_pointer(destination.addr, addr)
+            }
+            "posix_memalign" => {
+                let [out, align, size] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "posix_memalign args are not provided".into(),
+                    ));
+                };
+                let out = self.read_pointer(out.interval.addr)?;
+                let align = from_bytes!(usize, align.get(self)?);
+                let size = from_bytes!(usize, size.get(self)?);
+                // `EINVAL` (22 on every target the evaluator runs): not a power of two, or not
+                // a multiple of a pointer's size.
+                let code: i32 = if !align.is_power_of_two() || align % self.ptr_size() != 0 {
+                    22
+                } else {
+                    // Of no size, as glibc's and macOS': a block of its own, not null.
+                    let addr = self.allocate(size.max(1), align, Origin::C, false)?;
+                    self.write_pointer(out, addr)?;
+                    0
+                };
+                destination.write_from_bytes(self, &code.to_le_bytes()[0..destination.size])
+            }
+            "free" => {
+                let [ptr] = args else {
+                    return Err(MirEvalError::InternalError("free args are not provided".into()));
+                };
+                let ptr = self.read_pointer(ptr.interval.addr)?;
+                if ptr.to_usize() != 0 {
+                    self.deallocate(ptr, Origin::C, "free")?;
+                }
+                Ok(())
+            }
             _ => not_supported!("unknown external function {as_str}"),
         }
+    }
+
+    /// `malloc`'s block of `size` bytes (`calloc`'s, initialized to zero, when `zeroed`),
+    /// aligned as C's `max_align_t` (two pointers' size). Of no size, as glibc's and macOS'
+    /// `malloc(0)`: a block of its own, not null, which `free` takes back.
+    fn c_allocate(&mut self, size: usize, zeroed: bool) -> Result<'db, Address> {
+        self.allocate(size.max(1), 2 * self.ptr_size(), Origin::C, zeroed)
     }
 
     /// A call of the intrinsic `intrinsic`, the function `def`: `Ok(false)` when the evaluator

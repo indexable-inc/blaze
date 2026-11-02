@@ -6,6 +6,7 @@
 use std::cmp::Reverse;
 use std::path::Path;
 
+use blaze_lint_defs::Named;
 use blaze_manifest::Config;
 use blaze_manifest::config::{CompileKind, Flags, PathAndArgs};
 use blaze_manifest::files::Files;
@@ -19,6 +20,12 @@ use crate::stdlib::target::{self as platform, CfgArgs};
 
 fn error(what: String) -> LoadError {
     LoadError { what, at: None }
+}
+
+/// Whether `blaze::{lint}` is a lint or group of the compile's registry, which has blaze-lints'
+/// as well as the front end's: a level set for any other name would set nothing.
+fn is_blazes(lint: &str) -> bool {
+    matches!(blaze_lint_defs::named(&format!("blaze::{lint}")), Named::Lint(_) | Named::Group(_))
 }
 
 /// What cargo's `TargetInfo` has of one kind of unit.
@@ -203,8 +210,8 @@ pub(crate) const WORKSPACE_LINTS: &str = "[workspace.metadata.blaze.lints]";
 
 /// The level flags of [`WORKSPACE_LINTS`] in `metadata`, the root manifest's
 /// `[workspace.metadata]` (at `manifest`): `hot_alloc = "warn"` is `--warn=blaze::hot_alloc`,
-/// by name. A level that is not `allow`, `warn`, `deny` or `forbid`, or a name with a path, is an
-/// error.
+/// by name. A level that is not `allow`, `warn`, `deny` or `forbid`, a name with a path, or one
+/// that is no lint or group of blaze's, is an error.
 pub(super) fn workspace_lints(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<String>, LoadError> {
     let Some(table) = metadata.and_then(|it| it.get("blaze")).and_then(|it| it.get("lints")) else {
         return Ok(Vec::new());
@@ -218,6 +225,9 @@ pub(super) fn workspace_lints(metadata: Option<&toml::Value>, manifest: &Path) -
     for (lint, level) in table {
         if lint.contains(':') {
             return Err(wrong(format!("`{lint}` is named without its tool: these are blaze's own lints")));
+        }
+        if !is_blazes(lint) {
+            return Err(wrong(format!("`{lint}` is no lint or group of blaze's (`blaze::{lint}`)")));
         }
         let flag = match level.as_str() {
             Some("forbid") => "--forbid",
@@ -250,6 +260,11 @@ pub(super) fn lints_of(name: &str, toml: &TomlManifest) -> Result<(Vec<String>, 
             continue;
         }
         for (lint, config) in tool_lints {
+            if tool == blaze_lint_defs::BLAZE_TOOL && !is_blazes(lint) {
+                return Err(error(format!(
+                    "the `[lints.blaze]` of `{name}` set `{lint}`, which is no lint or group of blaze's (`blaze::{lint}`)"
+                )));
+            }
             let flag = match config.level() {
                 TomlLintLevel::Forbid => "--forbid",
                 TomlLintLevel::Deny => "--deny",

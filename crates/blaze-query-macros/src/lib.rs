@@ -65,11 +65,11 @@ pub(crate) fn tracked_tokens(args: TokenStream2, item: TokenStream2) -> TokenStr
     // clone: expansion time, once per annotated item; no query runs this
     match syn::parse2::<syn::Item>(item.clone()) {
         Ok(syn::Item::Fn(it)) => {
-            tracked_fn::expand(args, it).unwrap_or_else(|error| with_error(item, error))
+            tracked_fn::expand(args, &it).unwrap_or_else(|error| with_error(item, error))
         }
-        Ok(syn::Item::Impl(it)) => tracked_impl::expand(args, it)
+        Ok(syn::Item::Impl(it)) => tracked_impl::expand(args, &it)
             .unwrap_or_else(|(error, stripped)| with_error(stripped, error)),
-        Ok(syn::Item::Struct(it)) => tracked_struct::expand(args, it)
+        Ok(syn::Item::Struct(it)) => tracked_struct::expand(args, &it)
             .unwrap_or_else(|(error, stripped)| with_error(stripped, error)),
         Ok(other) => syn::Error::new_spanned(
             other,
@@ -83,7 +83,7 @@ pub(crate) fn tracked_tokens(args: TokenStream2, item: TokenStream2) -> TokenStr
 pub(crate) fn input_tokens(args: TokenStream2, item: TokenStream2) -> TokenStream2 {
     match syn::parse2::<syn::ItemStruct>(item) {
         Ok(it) => {
-            input::expand(args, it).unwrap_or_else(|(error, stripped)| with_error(stripped, error))
+            input::expand(args, &it).unwrap_or_else(|(error, stripped)| with_error(stripped, error))
         }
         Err(error) => error.into_compile_error(),
     }
@@ -91,7 +91,7 @@ pub(crate) fn input_tokens(args: TokenStream2, item: TokenStream2) -> TokenStrea
 
 pub(crate) fn interned_tokens(args: TokenStream2, item: TokenStream2) -> TokenStream2 {
     match syn::parse2::<syn::ItemStruct>(item) {
-        Ok(it) => interned::expand(args, it)
+        Ok(it) => interned::expand(args, &it)
             .unwrap_or_else(|(error, stripped)| with_error(stripped, error)),
         Err(error) => error.into_compile_error(),
     }
@@ -99,10 +99,10 @@ pub(crate) fn interned_tokens(args: TokenStream2, item: TokenStream2) -> TokenSt
 
 fn derive_tokens(
     item: TokenStream2,
-    expand: fn(syn::DeriveInput) -> syn::Result<TokenStream2>,
+    expand: fn(&syn::DeriveInput) -> syn::Result<TokenStream2>,
 ) -> TokenStream2 {
     syn::parse2::<syn::DeriveInput>(item)
-        .and_then(expand)
+        .and_then(|input| expand(&input))
         .unwrap_or_else(syn::Error::into_compile_error)
 }
 

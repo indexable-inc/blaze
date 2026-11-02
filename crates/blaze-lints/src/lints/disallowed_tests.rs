@@ -1,4 +1,4 @@
-//! `blaze fix` over `clippy.toml`'s `disallowed-*` entries with a replacement: for each import
+//! `blaze_lints::fix` over `clippy.toml`'s `disallowed-*` entries with a replacement: for each import
 //! form of std's locks and channels and of `rustc_hash`'s maps, the fixed file is the text the
 //! test writes, front-end clean, each name that named a disallowed item names its replacement,
 //! and linting it again finds nothing.
@@ -152,7 +152,7 @@ fn setup() -> Setup {
     Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf: Conf { table, ..Conf::default() } }
 }
 
-/// `src/lib.rs` of `main` as `blaze fix` leaves it, after checking it is front-end clean, names
+/// `src/lib.rs` of `main` as the fix leaves it, after checking it is front-end clean, names
 /// what it moved by the counterparts, and lints clean again.
 fn fixed(main: &str) -> Result<String, FixError> {
     let fx = fixture::db(&format!("{CRATES}{MAIN}{}", main.trim_start_matches('\n')));

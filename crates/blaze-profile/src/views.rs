@@ -409,6 +409,7 @@ pub fn prelude(dirs: &[&Path]) -> Result<String, ViewError> {
         // line of its own.
         _ = write!(out, "\nCREATE OR REPLACE VIEW {} AS\n{}\n;\n", view.name, render(view, &Map::new())?);
     }
+    crate::span::views(&mut out);
     Ok(out)
 }
 

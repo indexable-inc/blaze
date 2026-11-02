@@ -171,7 +171,7 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
                 Asked::Wait { flight, runner } => (flight, runner),
             };
             let left = Left { runs: &self.runs, key, waiter: &waiter };
-            let waiting = Waiting::begin(&mut named, Some(runner));
+            let waiting = Waiting::begin(crate::wait::WaitKind::Key, &mut named, Some(runner));
             let got = wait(&waiter, flight(number));
             drop(waiting);
             drop(left);
@@ -229,6 +229,12 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
     /// How many keys are running now.
     pub fn running(&self) -> usize {
         self.runs.running()
+    }
+
+    /// How many waiters `key`'s run has linked now: what a test holding a run waits for before
+    /// it ends the run, so each asker is known to wait for it rather than find the key idle.
+    pub fn waiters(&self, key: Key) -> usize {
+        self.runs.waiters(&key)
     }
 }
 
@@ -323,9 +329,10 @@ fn job(task: u64) -> JobId {
 /// query shows as many waits on it.
 #[derive(Clone, Copy)]
 pub struct WaitSpans {
-    /// Opens the wait's span on this thread, `awaited` naming what it waits for and `owner`
-    /// the task running it, when known: a number for `end`.
-    pub begin: fn(awaited: &str, owner: Option<u64>) -> u64,
+    /// Opens the wait's span on this thread, `kind` the [`crate::wait::WaitOn`] variant it is,
+    /// `awaited` naming what it waits for and `owner` the task running it, when known: a
+    /// number for `end`.
+    pub begin: fn(kind: crate::wait::WaitKind, awaited: &str, owner: Option<u64>) -> u64,
     /// Closes the span `begin` gave, on whatever thread the wait ended on (a job on a fiber
     /// may resume on another).
     pub end: fn(u64),
@@ -347,12 +354,16 @@ pub fn span_waits(spans: WaitSpans) -> Result<(), WaitSpans> {
 pub(crate) struct Waiting(Option<(fn(u64), u64)>);
 
 impl Waiting {
-    pub(crate) fn begin(named: &mut impl FnMut(&mut String), owner: Option<u64>) -> Waiting {
+    pub(crate) fn begin(
+        kind: crate::wait::WaitKind,
+        named: &mut impl FnMut(&mut String),
+        owner: Option<u64>,
+    ) -> Waiting {
         Waiting(WAIT_SPANS.get().map(|spans| {
             // alloc: only while a profiler spans waits, once a wait, which suspends
             let mut awaited = String::new();
             named(&mut awaited);
-            (spans.end, (spans.begin)(&awaited, owner))
+            (spans.end, (spans.begin)(kind, &awaited, owner))
         }))
     }
 

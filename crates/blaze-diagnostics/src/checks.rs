@@ -23,7 +23,7 @@ use syntax::view::{self, HasAttrs as _};
 
 use crate::{
     cx::Cx,
-    lints::syntax::attrs::{Owner, owners},
+    lints::syntax::attrs::{Owner, invoking_attrs, owners},
     lower::{Found, Phase},
 };
 
@@ -56,6 +56,7 @@ pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
     found.extend(defs::check(cx, &scopes));
     found.extend(names::check(cx, &scopes));
     found.extend(features::early(cx, walk, &owners, features, &flags));
+    attrs::invoked(cx, &invoking_attrs(cx, walk), &mut found);
     let lowered = attrs::parsed(cx, &session, &owners, &mut found);
     found.extend(krate::check(cx));
     attrs::checked(cx, &session, &owners, &lowered, &mut found);

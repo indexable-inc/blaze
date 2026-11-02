@@ -389,3 +389,24 @@ fn lint_dead_code_3() {
         ],
     );
 }
+
+/// Our own: with derives expanded, as a build has them, a field the derived `PartialEq` reads is
+/// live, and one only `Clone`'s and `Debug`'s read is not, with rustc's note
+/// (`rustc_trivial_field_reads`). A check records the builtin derives instead, as the tests
+/// above have them.
+#[test]
+fn what_expanded_derives_read() {
+    let fixture = r#"//- minicore: clone, copy, eq, ord, fmt, derive, dispatch_from_dyn
+//- /lib.rs crate:other edition:2024
+#[derive(Clone, Debug, PartialEq)]
+pub struct Compared(u64);
+#[derive(Clone, Debug)]
+pub struct Shown(u64);
+"#;
+    let checked = crate::tests::checked_expanding_derives(fixture, &crate::Options::default());
+    let stderr = checked.stderr();
+    let dead: Vec<_> = checked.diags.iter().filter(|it| it.lint_name() == Some("dead_code")).collect();
+    assert_eq!(dead.len(), 1, "only `Shown`'s field: {stderr}");
+    assert!(stderr.contains("`Shown` has derived impls for the traits"), "{stderr}");
+    assert!(!checked.diags.iter().any(|it| it.is_error()), "{stderr}");
+}

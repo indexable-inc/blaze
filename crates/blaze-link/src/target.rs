@@ -99,6 +99,11 @@ const ASKED: &str = "blaze v2 link target default libraries";
 const AUTOLINKED_AARCH64: &str = "blaze v2 link target autolinked libraries aarch64";
 const AUTOLINKED_X86_64: &str = "blaze v2 link target autolinked libraries x86_64";
 
+/// The domains a Mach-O library's bytes are named in for the install names it re-exports from
+/// outside itself, one per architecture; the cache keys them by platform too.
+const REEXPORTED_AARCH64: &str = "blaze v2 link target re-exported libraries aarch64";
+const REEXPORTED_X86_64: &str = "blaze v2 link target re-exported libraries x86_64";
+
 const LINKED: &str = "x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, aarch64-apple-darwin, \
                       x86_64-pc-windows-msvc, wasm32-wasip1 and wasm32-unknown-unknown";
 
@@ -668,7 +673,7 @@ type Asked = Arc<Vec<(String, String)>>;
 /// default libraries ask for, by their bytes: a few of each per process, searched in order.
 pub(crate) struct Cache {
     found: Mutex<Vec<(Key, Arc<Found>)>>,
-    asked: Mutex<Vec<(ContentId, Asked)>>,
+    asked: Mutex<Vec<(ContentId, u32, Asked)>>,
 }
 
 impl Cache {
@@ -680,24 +685,50 @@ impl Cache {
     /// What the PE archive, or the Mach-O object or archive for `arch`, at `path` (`name` on
     /// the line) asks for: read once for each content the file has had.
     fn asked(&self, path: &Path, name: &str, format: Format, arch: Arch) -> Result<Asked, LinkError> {
-        // alloc: error path
-        let bytes = std::fs::read(path).map_err(|error| fail(format!("{name}: {error}")))?;
         let domain = match (format, arch) {
             (Format::MachO, Arch::X86_64) => AUTOLINKED_X86_64,
             (Format::MachO, _) => AUTOLINKED_AARCH64,
             _ => ASKED,
         };
+        self.read(path, name, (domain, 0), |bytes| match format {
+            Format::MachO => crate::macho::asked_libraries(name, bytes, arch),
+            _ => crate::pe::asked_libraries(name, bytes),
+        })
+    }
+
+    /// The install names the Mach-O library for `arch` and `platform` at `path` (`name` on the
+    /// line) re-exports from outside itself, as `("", install)`
+    /// ([`crate::macho::reexported`]): read once for each content the file has had.
+    fn reexported(&self, path: &Path, name: &str, arch: Arch, platform: u32) -> Result<Asked, LinkError> {
+        let domain = match arch {
+            Arch::X86_64 => REEXPORTED_X86_64,
+            _ => REEXPORTED_AARCH64,
+        };
+        self.read(path, name, (domain, platform), |bytes| {
+            let installs = crate::macho::reexported(name, bytes, arch, platform)?;
+            // alloc: once per process and library content, its re-exports
+            Ok(installs.into_iter().map(|it| (String::new(), it)).collect())
+        })
+    }
+
+    /// What `read` makes of the bytes at `path`, named in `domain` and read for `platform`:
+    /// once for each content.
+    fn read(
+        &self,
+        path: &Path,
+        name: &str,
+        (domain, platform): (&'static str, u32),
+        read: impl FnOnce(&[u8]) -> Result<Vec<(String, String)>, String>,
+    ) -> Result<Asked, LinkError> {
+        // alloc: error path
+        let bytes = std::fs::read(path).map_err(|error| fail(format!("{name}: {error}")))?;
         let id = ContentId::of(domain, &bytes);
-        if let Some((_, asked)) = self.asked.lock().iter().find(|it| it.0 == id) {
+        if let Some((.., asked)) = self.asked.lock().iter().find(|it| it.0 == id && it.1 == platform) {
             return Ok(Arc::clone(asked));
         }
-        let asked = match format {
-            Format::MachO => crate::macho::asked_libraries(name, &bytes, arch),
-            _ => crate::pe::asked_libraries(name, &bytes),
-        };
         // alloc: once per process and file content, what it asks for
-        let asked = Arc::new(asked.map_err(fail)?);
-        self.asked.lock().push((id, Arc::clone(&asked)));
+        let asked = Arc::new(read(&bytes).map_err(fail)?);
+        self.asked.lock().push((id, platform, Arc::clone(&asked)));
         Ok(asked)
     }
 
@@ -736,6 +767,8 @@ struct Found {
     interpreter: Option<String>,
     /// Mach-O: the SDK's version, as `xxxx.yy.zz` nibbles.
     sdk: u32,
+    /// Mach-O: the SDK, which ld64's `-syslibroot` reroots an install name under.
+    root: Option<PathBuf>,
 }
 
 impl Found {
@@ -1002,6 +1035,7 @@ fn apple<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
         // alloc: once per toolchain asked, its directories
         frameworks: vec![sdk.join("Library/Frameworks"), sdk.join("System/Library/Frameworks")],
         sdk: version,
+        root: Some(sdk),
         ..Found::default()
     })
 }
@@ -1234,7 +1268,14 @@ impl Line<'_> {
     /// `LC_LINKER_OPTION`s ask for when it is a Mach-O object or archive.
     fn push(&mut self, path: PathBuf, kind: NativeKind) -> Result<(), LinkError> {
         let pe = self.output.format == Format::Pe;
-        if self.out.iter().any(|it| it.path == path || (pe && it.path.as_os_str().eq_ignore_ascii_case(path.as_os_str()))) {
+        if let Some(it) =
+            self.out.iter_mut().find(|it| it.path == path || (pe && it.path.as_os_str().eq_ignore_ascii_case(path.as_os_str())))
+        {
+            // A Mach-O library on the line as a re-export that the link also asks for is loaded
+            // as ld64 loads one asked for, used or not.
+            if self.output.format == Format::MachO && kind == (NativeKind::Shared { as_needed: false }) {
+                it.kind = kind;
+            }
             return Ok(());
         }
         let script =
@@ -1242,6 +1283,7 @@ impl Line<'_> {
         let archive = pe && matches!(kind, NativeKind::Archive { .. });
         let autolinks =
             self.output.format == Format::MachO && matches!(kind, NativeKind::Archive { .. } | NativeKind::Object);
+        let reexports = self.output.format == Format::MachO && matches!(kind, NativeKind::Shared { .. });
         // alloc: once per file of the line, the name the engine knows it by
         let name = path.to_string_lossy().into_owned();
         self.out.push(Located { path, name, kind });
@@ -1255,7 +1297,84 @@ impl Line<'_> {
         if autolinks {
             self.autolinks(at)?;
         }
+        if reexports {
+            self.reexports(at)?;
+        }
         Ok(())
+    }
+
+    /// The libraries the Mach-O library at `at` re-exports from outside itself, each after it
+    /// on the line and followed in turn, as ld64 loads them with it ([`Line::reexported`]).
+    /// Each is needed only when the image imports from it: ld64 binds such an import to the
+    /// re-exporting library, blaze to the one that defines it, which the loader finds alike.
+    fn reexports(&mut self, at: usize) -> Result<(), LinkError> {
+        let platform = self.output.platform.as_ref().map_or(0, |it| it.platform);
+        let asked = self.cache.reexported(&self.out[at].path, &self.out[at].name, self.output.arch, platform)?;
+        for (_, install) in asked.iter() {
+            let path = self.reexported(at, install).map_err(|it| LinkError {
+                // alloc: error path
+                what: format!("{} re-exports {install} (LC_REEXPORT_DYLIB), and {}", self.out[at].name, it.what),
+                ..it
+            })?;
+            self.push(path, NativeKind::Shared { as_needed: true })?;
+        }
+        Ok(())
+    }
+
+    /// The file of the install name `install` that the Mach-O library at `at` re-exports, as
+    /// ld64 finds it: under the SDK (`-syslibroot`) first, then as it is, a `.tbd` before its
+    /// `.dylib` in each; `@loader_path/` from the library's own directory. `@rpath/` and
+    /// `@executable_path/` name the image's run, which a re-export is not found by: an error.
+    fn reexported(&self, at: usize, install: &str) -> Result<PathBuf, LinkError> {
+        let (dir, file) = match install.strip_prefix("@loader_path/") {
+            Some(rest) => {
+                let Some(parent) = self.out[at].path.parent() else {
+                    // alloc: error path
+                    return Err(fail(format!("{} is in no directory", self.out[at].name)));
+                };
+                let path = parent.join(rest);
+                // alloc: error path
+                let file = path.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
+                (path.parent().map(Path::to_path_buf), file)
+            }
+            None if install.starts_with('@') => {
+                // alloc: error path
+                return Err(fail(format!("{install} names the image's run, which ld64 does not find a re-export by")));
+            }
+            None => {
+                let path = Path::new(install);
+                // alloc: error path
+                let file = path.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
+                (path.parent().filter(|_| path.is_absolute()).map(Path::to_path_buf), file)
+            }
+        };
+        let Some(dir) = dir.filter(|_| !file.is_empty()) else {
+            // alloc: error path
+            return Err(fail(format!("{install} is not an absolute path to a library")));
+        };
+        let mut searched: SmallVec<[(PathBuf, Searched); 2]> = SmallVec::new();
+        if let Some(root) = &self.found.root
+            && !install.starts_with('@')
+        {
+            // alloc: error path
+            searched.push((root.join(dir.strip_prefix("/").unwrap_or(&dir)), Searched::Toolchain));
+        }
+        searched.push((dir, Searched::InstallName));
+        let stub = Path::new(&file).with_extension("tbd").to_string_lossy().into_owned();
+        let mut files: SmallVec<[(String, NativeKind); 2]> = SmallVec::new();
+        if stub != file {
+            files.push((stub, NativeKind::Shared { as_needed: true }));
+        }
+        files.push((file, NativeKind::Shared { as_needed: true }));
+        for (dir, _) in &searched {
+            for (file, _) in &files {
+                let path = dir.join(file);
+                if path.is_file() {
+                    return Ok(path);
+                }
+            }
+        }
+        Err(not_found(install, &files, searched.iter().map(|(dir, by)| (dir.as_path(), *by))))
     }
 
     /// The libraries the members of the PE archive at `at` ask for, each after it on the line
@@ -1470,6 +1589,7 @@ fn not_found<'a>(
             Searched::Link => "the link's -L",
             Searched::CDriver => "the C driver's linker -L",
             Searched::Toolchain => "the toolchain's",
+            Searched::InstallName => "the re-exported install name's",
         };
         let _ = write!(what, "{} ({by})", dir.display());
     }

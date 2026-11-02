@@ -169,7 +169,7 @@ fn reach(frontend: &HirFrontend, root: HirInstance) -> Reached {
                             queue.push(next.clone());
                         }
                     }
-                    Kind::Asm(_) => assert_eq!(walk(db, next, false, homes), Ok(Vec::new())),
+                    Kind::Asm(..) => assert_eq!(walk(db, next, false, homes), Ok(Vec::new())),
                     Kind::Start(_) | Kind::Allocator(_) => (),
                 }
             }
@@ -595,7 +595,7 @@ fn extern_and_variadic_calls_list_their_symbols() {
     let assembly: Vec<&HirInstance> = walked
         .iter()
         .filter_map(|it| match it {
-            FrontRef::Function(instance @ HirInstance(Kind::Asm(_))) => Some(instance),
+            FrontRef::Function(instance @ HirInstance(Kind::Asm(..))) => Some(instance),
             _ => None,
         })
         .collect();
@@ -710,7 +710,7 @@ fn a_constant_lists_the_functions_it_points_at() {
 #[test]
 fn assembly_walks_empty() {
     let (_, frontend) = frontend(PLAIN);
-    let assembly = HirInstance(Kind::Asm("nop".to_owned()));
+    let assembly = HirInstance(Kind::Asm("nop".to_owned(), false));
     frontend.with(|db, homes| assert_eq!(walk(db, &assembly, false, homes), Ok(Vec::new())));
 }
 

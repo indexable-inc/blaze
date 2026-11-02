@@ -66,7 +66,7 @@ A comment containing `astlog-ignore` suppresses findings on its own line or the 
 
 - `rust-locks.astlog` (from ix): the same lock taken twice in one statement while the first temporary guard still lives, which deadlocks.
 
-Lints that need types (the locks, channels and hashers ports: `blaze::std_lock`, `blaze::std_mpsc`, `blaze::fx_hash`) are blaze-lints', with machine-applicable fixes that `blaze fix` applies, not astlog rules: syntax alone cannot tell a parking_lot lock from another.
+Lints that need types (the locks, channels and hashers ports: `blaze::std_lock`, `blaze::std_mpsc`, `blaze::fx_hash`) are blaze-lints', with machine-applicable fixes that `blaze check --fix` applies, not astlog rules: syntax alone cannot tell a parking_lot lock from another.
 
 `scan.py` is the gate: every rules file over every file git has under the paths it is given, one file per `astlog scan`, since a join over one file stays small where one over the whole tree would not:
 

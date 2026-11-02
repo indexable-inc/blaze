@@ -1,0 +1,24 @@
+{
+  "id": "01547",
+  "from_lane": "coord-1030",
+  "owner": "no-fallback-front-ty",
+  "paths": [
+    "crates/hir/src/diagnostics.rs",
+    "crates/blaze-diagnostics/src/tests/bodies/types.rs"
+  ],
+  "what": "Place errors on a by-value self parameter: hir span_syntax maps Span::BindingId(self) through patterns_for_binding, which is empty for self, so e.g. E0277 Self: Sized on `fn head(self)` in a trait is unplaced (reported at the item). rustc places it at `self`. Add a SelfParam case to hir SpanAst (source map self_param syntax) so these are placed; then move the test an_unplaced_type_error_names_its_type_trait_and_item to another unplaced case and add a placed self test.",
+  "state": "open",
+  "created": "2026-11-02T01:22:05Z",
+  "updated": "2026-11-02T01:22:05Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T01:22:05Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

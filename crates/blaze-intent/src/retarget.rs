@@ -1,7 +1,7 @@
 //! Retargeting: every reference of one file to some items, moved to other paths, each found by
 //! the front end's name resolution, never by text search. It is one edit with two callers: a
 //! lint's machine-applicable fix (a `disallowed-types` entry moves `std::sync::Mutex` to
-//! `parking_lot::Mutex`) and a request's replace (`blaze fix --replace A=B`).
+//! `parking_lot::Mutex`) and a request's replace (`blaze check --replace A=B`).
 //!
 //! A `use` item that imports a moved item is rewritten whole: its other leaves stay as they are
 //! written, and each moved leaf becomes an import of its own of the new path, with the item's

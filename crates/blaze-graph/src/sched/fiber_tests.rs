@@ -573,10 +573,14 @@ fn a_key_asked_on_fibers_runs_once_and_its_waiters_suspend() {
     assert_eq!(work.flights.running(), 0);
 }
 
-/// Two runs on fibers, each asking for the other's key: the scheduler refuses the wait that
-/// closes the cycle, that run gives way (`Cancelled`), and the other ends with a value.
+/// Two runs on fibers, each asking for the other's key once both run: the scheduler refuses
+/// the wait that closes the cycle, that run gives way (`Cancelled`), and the other ends with a
+/// value.
 struct Crossed {
     flights: crate::pump::Flights<u32>,
+    /// Runs under way: each asks for the other's key only once both are, so neither can end
+    /// before the other claimed its key, however late the driver starts the second.
+    running: AtomicU32,
     ended: Mutex<Vec<Result<u32, crate::Cancelled>>>,
 }
 
@@ -591,8 +595,12 @@ impl Work for &'static Crossed {
         }
         let theirs = 3 - mine;
         let got = self.flights.get_or_run(key(mine), || {
-            let at = cx.now() + 1_000_000;
-            cx.wait(Wait::Until(at)).expect("a timed wait closes no cycle");
+            self.running.fetch_add(1, Ordering::AcqRel);
+            let until = cx.now() + 10_000_000_000;
+            while self.running.load(Ordering::Acquire) < 2 {
+                assert!(cx.now() < until, "run {mine} waited 10 s for the other run to start");
+                cx.wait(Wait::Until(cx.now() + 100_000)).expect("a timed wait closes no cycle");
+            }
             self.flights.get_or_run(key(theirs), || Ok(0)).map(|it| it + 10)
         });
         self.ended.lock().push(got);
@@ -602,7 +610,7 @@ impl Work for &'static Crossed {
 #[test]
 fn crossed_runs_on_fibers_give_way_once() {
     static WORK: OnceLock<Crossed> = OnceLock::new();
-    let work = WORK.get_or_init(|| Crossed { flights: crate::pump::Flights::new(), ended: Mutex::new(Vec::new()) });
+    let work = WORK.get_or_init(|| Crossed { flights: crate::pump::Flights::new(), running: AtomicU32::new(0), ended: Mutex::new(Vec::new()) });
     let driver = start(Cores::flat(1).unwrap(), work);
     driver.spawn(0, Spawn::root());
     driver.join().unwrap();

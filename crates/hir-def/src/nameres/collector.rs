@@ -54,7 +54,7 @@ use crate::{
         attr_resolution::{attr_macro_as_call_id, derive_macro_as_call_id},
         crate_def_map,
         diagnostics::{DefDiagnostic, PreludeError, TraitItemImport, is_glob_of_non_module},
-        facts::unit::glob_takes_over,
+        facts::unit::{glob_takes_over, recorded_ambiguity, widest_ambiguity},
         mod_resolution::ModDir,
         path_resolution::{PathRead, ReachedFixedPoint, ResolvePathResult},
         proc_macro::{ProcMacroDef, ProcMacroKind, parse_macro_name_and_helper_attrs},
@@ -1970,6 +1970,8 @@ impl<'db> DefCollector<'db> {
         glob: GlobId,
         vis: Visibility,
     ) {
+        let earlier = recorded_ambiguity(self.def_map.modules.building()[module_id].scope(self.db), name, other, glob);
+        let vis = widest_ambiguity(self.db, &self.def_map, earlier, vis);
         let it = GlobAmbiguity { name: *name, other, glob, vis };
         self.def_map.modules.building()[module_id].scope_mut().push_glob_ambiguity(it);
     }

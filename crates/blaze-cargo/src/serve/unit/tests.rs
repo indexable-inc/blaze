@@ -74,6 +74,7 @@ fn plan(extra: &str, outputs: &[&str]) -> UnitPlan {
         unsandboxed: false,
         runner: Vec::new(),
         harness: true,
+        clippy: None,
     }
 }
 
@@ -781,6 +782,20 @@ fn a_units_key_is_the_same_wherever_the_graph_puts_its_dependencies() {
     assert_ne!(bytes(&first, &first[1]), bytes(&second, &other), "a dependency on another unit is another key");
 }
 
+/// A build script's compile is one program under every goal, so `blaze check` and `blaze
+/// build` key its record alike and the second finds what the first stored; a library checked
+/// is not the library built, and keys the goal.
+#[test]
+fn a_build_scripts_record_is_keyed_alike_under_every_goal() {
+    use crate::serve::work::Goal;
+    let goals = [Goal::Check, Goal::Build, Goal::Test, Goal::Run, Goal::Reach];
+    let script = unit("p", target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]);
+    let keyed: Vec<u8> = goals.iter().map(|goal| compile::keyed_goal(*goal, &script)).collect();
+    assert!(keyed.iter().all(|it| *it == keyed[0]), "{keyed:?}");
+    let lib = unit("p", target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
+    assert_ne!(compile::keyed_goal(Goal::Check, &lib), compile::keyed_goal(Goal::Build, &lib));
+}
+
 const MACROS: &[u8] = b"extern crate proc_macro;\nuse proc_macro::TokenStream;\n\n\
 #[proc_macro]\npub fn shout(input: TokenStream) -> TokenStream { input }\n\n\
 #[proc_macro_attribute]\npub fn tag(_: TokenStream, item: TokenStream) -> TokenStream { item }\n";
@@ -891,4 +906,57 @@ fn a_proc_macros_root_is_its_file_on_disk_and_its_def_map_has_its_macros() {
         .filter(|def| matches!(def, hir_def::ModuleDefId::FunctionId(it) if def_map.fn_as_proc_macro(*it).is_some()))
         .count();
     assert_eq!(macros, 2, "`shout` and `tag`");
+}
+
+/// `cargo check` and `cargo clippy` stop every unit after the front end but a build script's
+/// compile, which is linked as under `cargo build` so that it can run.
+#[test]
+fn a_check_links_its_build_scripts_and_checks_the_rest() {
+    use crate::serve::work::Goal;
+    let script = unit(P, target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]);
+    let lib = unit(P, target("p", "lib", "/w/p/src/lib.rs"), Mode::Check, &[]);
+    let bin = unit(P, target("p", "bin", "/w/p/src/main.rs"), Mode::Build, &[]);
+    assert!(!super::checks_only(Goal::Check, &script));
+    assert!(super::checks_only(Goal::Check, &lib));
+    assert!(super::checks_only(Goal::Check, &bin));
+    assert!(super::checks_only(Goal::Build, &lib));
+    assert!(!super::checks_only(Goal::Build, &script));
+    assert!(!super::checks_only(Goal::Build, &bin));
+}
+
+/// A front end held on the loop whose drop panics (a storage with a table it can't walk) lets
+/// go of nothing past the catch: dropped, its holder goes on; let go of by a refusal, the job
+/// is given the panic.
+#[test]
+fn a_front_end_whose_drop_panics_fails_its_holder_not_the_loop() {
+    struct Breaks;
+    impl Drop for Breaks {
+        fn drop(&mut self) {
+            panic!("a table with an Id of 0");
+        }
+    }
+    let dropped = std::panic::catch_unwind(|| drop(super::Held::new(Breaks, "a test's front end")));
+    assert!(dropped.is_ok(), "the drop of a held front end unwound its holder");
+    let panic = super::Held::new(Breaks, "a test's front end").let_go().unwrap_err();
+    assert!(panic.to_string().contains("a table with an Id of 0"), "{panic}");
+    assert!(super::Held::new(3_u8, "a test's front end").let_go().is_ok());
+}
+
+/// Every build script's target is `build-script-build`: the phase spans' `unit` names the
+/// package, its version and the target, so the profile tells each script apart.
+#[test]
+fn a_units_phase_spans_name_its_package_version_and_target() {
+    let script = |pkg: &str| unit(pkg, target("build-script-build", "custom-build", "build.rs"), Mode::Build, &[]);
+    let serde = script("registry+https://github.com/rust-lang/crates.io-index#serde@1.0.219");
+    let libc = script("registry+https://github.com/rust-lang/crates.io-index#libc@0.2.170");
+    assert_eq!(compile::span_unit(&serde), "serde v1.0.219 (build script)");
+    assert_eq!(compile::span_unit(&libc), "libc v0.2.170 (build script)");
+    let lib = target("blaze_api", "lib", "src/lib.rs");
+    let api = "path+file:///w/crates/blaze-api#0.1.0";
+    assert_eq!(compile::span_unit(&unit(api, lib.clone(), Mode::Build, &[])), "blaze-api v0.1.0 (lib)");
+    assert_eq!(compile::span_unit(&unit(api, lib, Mode::Test, &[])), "blaze-api v0.1.0 (lib test)");
+    let bin = target("blaze", "bin", "src/main.rs");
+    assert_eq!(compile::span_unit(&unit(api, bin, Mode::Build, &[])), "blaze-api v0.1.0 (bin \"blaze\")");
+    let tests = target("e2e", "test", "tests/e2e.rs");
+    assert_eq!(compile::span_unit(&unit(api, tests, Mode::Test, &[])), "blaze-api v0.1.0 (test \"e2e\")");
 }

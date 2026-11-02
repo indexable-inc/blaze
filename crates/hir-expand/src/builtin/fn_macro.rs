@@ -468,7 +468,9 @@ fn assert_expand<'f>(
             None if panic_2021 => {
                 quote_into!(b, call_site_span => #dollar_crate::panic::panic_2021!(# #panic_args))
             }
-            None => quote_into!(b, call_site_span => #dollar_crate::panic!(# #panic_args)),
+            // Unqualified at the call site, as rustc's `panic_path`: std's `panic!` in a std
+            // crate, whose 2015 arm takes any payload, and core's only under `no_std`.
+            None => quote_into!(b, call_site_span => panic!(# #panic_args)),
         }
     });
     let value = cond.value;

@@ -46,6 +46,7 @@ pub fn call_const_macro<'db>(
     let body =
         db.runtime_mir_body(func.into()).map_err(|e| MirEvalError::MirLowerError(func, e))?;
     let mut evaluator = Evaluator::new(db, func.into(), None)?;
+    evaluator.compile_time = true;
     let mut values = Vec::with_capacity(args.len());
     for arg in args {
         let value = match arg {

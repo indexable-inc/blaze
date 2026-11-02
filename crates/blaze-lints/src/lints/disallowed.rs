@@ -2,7 +2,7 @@
 //! `disallowed-*` entry of the package's `clippy.toml` names, found by resolution: a written
 //! path to it (in a `use`, a type, an expression, a pattern, a macro call's path), and for a
 //! method, a method call resolved to it. An entry with a `replacement` path has a
-//! machine-applicable fix, which `blaze fix` makes: a `use` is retargeted whole, a qualified
+//! machine-applicable fix, which `blaze check --fix` makes: a `use` is retargeted whole, a qualified
 //! path is rewritten, and a bare name follows the `use` that brings it. Where the replacement's
 //! API differs and the fix knows how (std's locks to parking_lot's), the calls are rewritten
 //! too.
@@ -328,7 +328,7 @@ fn unfixable(cx: &Cx<'_, '_>, entry: &Entry) -> Option<String> {
         let first = replacement.split("::").next().unwrap_or(replacement);
         let krate = crate_name(cx.db(), cx.krate());
         return Some(format!(
-            "`{replacement}` does not refer to an item `{krate}` can name: add `{first}` to its `[dependencies]`, and `blaze fix` makes this"
+            "`{replacement}` does not refer to an item `{krate}` can name: add `{first}` to its `[dependencies]`, and `blaze check --fix` makes this"
         ));
     }
     None

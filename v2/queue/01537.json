@@ -1,0 +1,36 @@
+{
+  "id": "01537",
+  "from_lane": "db",
+  "owner": "fastcompile-macros",
+  "paths": [
+    "crates/blaze-macro-eval/src/tier/build.rs",
+    "crates/blaze-macro-eval/src/tier/enter.rs"
+  ],
+  "what": "Cause of the daemon row-0 / Id-0 crashes (coord-1030 target-rel-da, 13:45, serve.log b2-home-rel from 36270: `Id(1261) is a row of AllCrates, read as StaticId` at blaze-query interned.rs:247, then eval.rs:1402 index 1261 of 13, garbage tys rows), db diagnosis by reading: blaze-macro-eval tier/build.rs `compiled()` caches each macro crate's Compiled in the process-wide `IMAGES` keyed by the code ContentId alone, but Compiled holds database ids: `clients: Vec<(FunctionId, u32)>` and `statics: Vec<(StaticId, u32, u32)>` (and whatever compile() resolved through `db`). blaze-query ids are per database (page owners are per Storage), so a second database with the same serde_derive code (another job's Lowered, a fresh Lowered after a refused refresh, the clippy baseline's) is handed the first one's ids: enter.rs:339-340 `run::of_sysroot(db, id)` reads a foreign StaticId (the owner check fires), and `ran.statics` carries them into the session preset the MIR evaluator reads (expander.rs:346), giving the out-of-bounds index and garbage type rows. Rule 16: the key misses an input. Fix: keep the image (machine code, layout) shared by code hash if it is id-free, and key the id tables (clients, statics, anything else holding a hir id) by the database as well (Storage identity / db.nonce_and_revision().0), rebuilt per database; or key the whole cell by (code, database nonce). A test that fails today: two fixture databases with the same proc-macro crate, expand in the first, then in the second, and the second must read only its own StaticIds (or: the same Compiled is never used against a database whose nonce differs).",
+  "state": "applied",
+  "created": "2026-11-01T21:47:25Z",
+  "updated": "2026-11-01T21:48:35Z",
+  "taken_by": "fastcompile-macros",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T21:47:25Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T21:48:35Z",
+      "by": "fastcompile-macros",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-01T21:48:35Z",
+      "by": "fastcompile-macros",
+      "action": "done",
+      "note": "applied: tier/build.rs IMAGES (process-wide, by code) is gone. `tier::build::Images` is a field of expander.rs `Library` (one per load, so per database), passed through run::run and tier::run. It records the database (nonce) of its first use, and `Images::of(db)` refuses any other with a Stop naming it, so a Compiled is never used against another database's ids. Test: tier/build/tests.rs images_of_one_database_are_refused_to_another (two fixture databases). ra clean, not run. Caveat: this is not what crashed the 13:45 run. The compiled tier is off (Policy::DEFAULT.compiled = false, the one policy tier::choose reads), and every stack is in the MIR evaluator (run::run -> Evaluator::call -> eval_operand -> eval_static), at the bridge's first calls, before serde code. The foreign StaticId is an OperandKind::Static in a MIR body, so the MIR most likely came from a store (item store body_store::mir::decode, or a dependency image) with an unrelocated id. check_cache::ids id_bits/id_of silently write or read raw ids outside a relocating scope (thread-local TABLE). Rerun with BLAZE_ITEM_STORE=verify or off to confirm. Report: /tmp/blaze-lanes/v2-fastcompile-macros.md."
+    }
+  ]
+}

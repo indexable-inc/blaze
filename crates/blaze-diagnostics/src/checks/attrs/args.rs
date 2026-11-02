@@ -62,6 +62,8 @@ pub(crate) struct MetaItem {
 #[derive(Clone, Debug)]
 pub(crate) struct Path {
     pub(crate) segments: SmallVec<[Ident; 1]>,
+    /// Written with a leading `::`: rustc's `kw::PathRoot` first segment, so never a word.
+    pub(crate) rooted: bool,
     pub(crate) range: TextRange,
 }
 
@@ -215,7 +217,7 @@ impl Path {
     /// Its one segment, when it has one: rustc's `word`.
     pub(crate) fn word(&self) -> Option<&Ident> {
         match self.segments.as_slice() {
-            [ident] => Some(ident),
+            [ident] if !self.rooted => Some(ident),
             _ => None,
         }
     }
@@ -229,15 +231,17 @@ impl Path {
     }
 
     pub(crate) fn segments_is(&self, names: &[&str]) -> bool {
-        self.segments.len() == names.len() && self.segments.iter().zip(names).all(|(a, b)| a.name == *b)
+        !self.rooted
+            && self.segments.len() == names.len()
+            && self.segments.iter().zip(names).all(|(a, b)| a.name == *b)
     }
 
-    /// As rustc prints it: `a::b`.
+    /// As rustc prints it: `a::b`, `::a::b`.
     pub(crate) fn text(&self) -> String {
         // alloc: the path as an error prints it
         let mut text = String::new();
         for (i, segment) in self.segments.iter().enumerate() {
-            if i > 0 {
+            if i > 0 || self.rooted {
                 text.push_str("::");
             }
             text.push_str(&segment.name);
@@ -615,8 +619,8 @@ impl Reader<'_, '_, '_> {
         }
         let first = cursor.elements[start].text_range().start();
         let last = segments.last().map(|it| it.range.end()).unwrap_or(first);
-        let path = Path { segments, range: TextRange::new(first, last) };
-        let one = path.segments.len() == 1 && !rooted;
+        let path = Path { segments, rooted, range: TextRange::new(first, last) };
+        let one = path.word().is_some();
         let (args, after) = match cursor.peek() {
             Some(NodeOrToken::Node(node)) if node.kind() == SyntaxKind::TOKEN_TREE => {
                 let tt = ast::TokenTree::cast(node).ok_or(Fail::Said)?;

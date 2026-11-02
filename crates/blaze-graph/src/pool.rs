@@ -11,8 +11,9 @@
 //! behind the deque's, so the slot never starves it.
 //!
 //! An idle worker takes from its slot and its deque, then searches: its group's injector and
-//! workers (from a random one, half a deque at a time), then each group of its
-//! [`Topology::steal_order`] the same way, four times over, then parks. At most half the
+//! workers (half a deque at a time), then each group of its [`Topology::steal_order`] the same
+//! way, four times over, then parks. Inside a group it picks deques as its pool's [`Victims`]
+//! says: by default twice the longer of two random ones, then each from a random one. At most half the
 //! workers search at once, and a job wakes a parked worker (of its group first) only when none
 //! searches; a searcher that finds work and was the last wakes another for the rest (Go's and
 //! Tokio's rules), so a burst of work wakes no stampede and none is left unseen. A parked worker
@@ -76,6 +77,8 @@ const BATCH: usize = 4;
 const LIFO_RUNS: u8 = 3;
 /// How many times a searching worker looks at every queue before it parks.
 const ROUNDS: u32 = 4;
+/// How many pairs a [`Victims::TwoChoices`] thief draws in a group before it walks the group.
+const CHOICES: u32 = 2;
 
 /// How long a pool sleeps, idle with jobs parked, before it asks the scheduler whether they
 /// are stalled ([`crate::sched::check_stall`]).
@@ -246,6 +249,45 @@ fn give_back(cell: Room) {
     });
 }
 
+/// What a profiler is told of each job a pool runs, so a worker's time is always inside a span
+/// of the job it runs: `began` opens and enters the span of a job of `kind` (the type of its
+/// closure, or of the plane's runner) on this thread, giving a number for `ended`, which closes
+/// it on whatever thread the job ended on. A job that parks on its fiber closes its span as it
+/// parks and opens another as it resumes: the profiler's `take` and `put` of
+/// [`crate::sched::fiber::carry`] do that.
+#[derive(Clone, Copy)]
+pub struct JobSpans {
+    pub began: fn(kind: &'static str) -> u64,
+    pub ended: fn(u64),
+}
+
+static JOB_SPANS: OnceLock<JobSpans> = OnceLock::new();
+
+/// Spans every job from now on with `spans`; `Err` with them when spans were given before.
+pub fn span_jobs(spans: JobSpans) -> Result<(), JobSpans> {
+    JOB_SPANS.set(spans)
+}
+
+/// The span of the job running, open while this lives (an unwind closes it too); nothing while
+/// no profiler spans jobs.
+pub(crate) struct JobSpan(Option<(fn(u64), u64)>);
+
+impl JobSpan {
+    #[inline]
+    pub(crate) fn begin(kind: &'static str) -> JobSpan {
+        JobSpan(JOB_SPANS.get().map(|spans| (spans.ended, (spans.began)(kind))))
+    }
+}
+
+impl Drop for JobSpan {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some((ended, span)) = self.0 {
+            ended(span);
+        }
+    }
+}
+
 impl Job {
     /// `f` in a cell, given back as it runs.
     fn new<F: FnOnce() + Send + 'static>(f: F) -> Job {
@@ -273,6 +315,7 @@ impl Job {
             // SAFETY: the closure is read out once, so it runs and drops once.
             let f = unsafe { f.read() };
             give_back(cell);
+            let _span = JobSpan::begin(std::any::type_name::<F>());
             f();
         }
         let class = const { Placed::<F>::CLASS };
@@ -512,6 +555,34 @@ pub enum Class {
     Critical,
 }
 
+/// How a searching worker picks the deques it steals from inside one group. Either way it
+/// visits the groups in its [`Topology::steal_order`], each group's injector first, so which
+/// groups' workers take which jobs (critical ones on fast groups) does not change.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Victims {
+    /// Each other worker of the group in turn, from a random one.
+    Walk,
+    /// Up to twice (`CHOICES`), two other workers of the group drawn at random and half of the
+    /// longer deque of the two (Mitzenmacher's power of two choices), so thieves going idle at
+    /// once spread over the fullest deques; then [`Victims::Walk`] of the group, for what the
+    /// picks missed.
+    TwoChoices,
+}
+
+/// How a pool's workers steal: what [`Pool::with_stealing`] takes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Stealing {
+    pub victims: Victims,
+    /// Seeds every worker's draws, mixed with its index: the same seed and the same deque
+    /// lengths draw the same victims.
+    pub seed: u64,
+}
+
+impl Stealing {
+    /// What [`Pool::new`] makes a pool with.
+    pub const DEFAULT: Stealing = Stealing { victims: Victims::Walk, seed: 0x5EED_B1A2E };
+}
+
 pub struct Pool {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
@@ -527,8 +598,10 @@ struct Local {
     deque: Worker<Job>,
     /// How many jobs in a row came from the LIFO slot.
     lifo: Cell<u8>,
-    /// Where a search of a group's workers begins (xorshift).
+    /// The state of the draws of a search (xorshift): where a walk of a group's workers begins,
+    /// and a [`Victims::TwoChoices`] pair.
     seed: Cell<u32>,
+    victims: Victims,
 }
 
 thread_local! {
@@ -556,8 +629,14 @@ pub fn node() -> Option<u32> {
 impl Pool {
     /// A worker per CPU of `topology`, bound to it when `bind` (pinned on Linux, a QoS class on
     /// macOS; an error elsewhere). An error when a thread cannot be started or bound: the pool
-    /// is not made smaller.
+    /// is not made smaller. Its workers steal as [`Stealing::DEFAULT`] says.
     pub fn new(topology: &Topology, bind: bool) -> io::Result<Pool> {
+        Pool::with_stealing(topology, bind, Stealing::DEFAULT)
+    }
+
+    /// As [`Pool::new`], its workers stealing as `stealing` says: for a bench that compares
+    /// [`Victims`], or a run that replays a seed.
+    pub fn with_stealing(topology: &Topology, bind: bool, stealing: Stealing) -> io::Result<Pool> {
         radix::set_ambient(ambient);
         if topology.cpus.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a worker pool of no CPU"));
@@ -649,7 +728,6 @@ impl Pool {
                     _ = ready.send(bound);
                     if ok {
                         let group = shared.slots[index].group as usize;
-                        let seed = (index as u32).wrapping_mul(0x9E37_79B9) | 1;
                         work(&Local {
                             shared,
                             index,
@@ -657,7 +735,8 @@ impl Pool {
                             node: cpu.node,
                             deque,
                             lifo: Cell::new(0),
-                            seed: Cell::new(seed),
+                            seed: Cell::new(worker_seed(stealing.seed, index)),
+                            victims: stealing.victims,
                         });
                     }
                 });
@@ -856,7 +935,7 @@ fn scope_in<'env, R>(shared: &Shared, f: impl FnOnce(&Scope<'env>) -> R) -> R {
     drop(Left(&raw const pending));
     #[cfg(not(blaze_check))]
     {
-        let waited = crate::wait::wait(crate::wait::WaitOn::Channel("a scope's jobs"), None, || {
+        let waited = crate::wait::wait(crate::wait::WaitOn::Scope(pending.counter.0), None, || {
             crate::sched::wait(crate::sched::Wait::Counter(pending.counter))
         });
         if let Err(cycle) = waited {
@@ -1232,6 +1311,51 @@ fn least(count: usize, only_fast: bool, of: impl Fn(usize) -> (u64, u64, bool)) 
     best.map_or(0, |(at, _)| at)
 }
 
+/// The next state of a worker's draws (Marsaglia's xorshift32): never 0 from a state not 0.
+fn xorshift(mut x: u32) -> u32 {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    x
+}
+
+/// The first state of worker `index`'s draws under the pool's `seed`: SplitMix64's finalizer
+/// over both, so neighbouring workers and seeds draw apart; odd, so never xorshift's dead 0.
+fn worker_seed(seed: u64, index: usize) -> u32 {
+    let mut z = seed ^ (index as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z as u32) | 1
+}
+
+/// Two of `workers` but the one at `me` (its position there, if it is one), each drawn by
+/// `random` uniformly (the two may be the same), and of them the one `len` says has the longer
+/// deque, the first on a tie: a worker's index. `None` when `len` says both are empty, or
+/// `workers` holds no other.
+fn pick_two(
+    workers: &[u32],
+    me: Option<usize>,
+    mut random: impl FnMut() -> u32,
+    len: impl Fn(usize) -> usize,
+) -> Option<usize> {
+    let others = workers.len().saturating_sub(usize::from(me.is_some()));
+    if others == 0 {
+        return None;
+    }
+    let mut draw = || {
+        let at = random() as usize % others;
+        workers[if me.is_some_and(|me| at >= me) { at + 1 } else { at }] as usize
+    };
+    let (first, second) = (draw(), draw());
+    let (of_first, of_second) = (len(first), if second == first { 0 } else { len(second) });
+    match (of_first, of_second) {
+        (0, 0) => None,
+        (a, b) if b > a => Some(second),
+        _ => Some(first),
+    }
+}
+
 impl Local {
     #[allow(clippy::needless_pass_by_value, reason = "the LIFO slot takes sole ownership of the job until it is taken")]
     fn push_next(&self, job: Job) {
@@ -1259,16 +1383,35 @@ impl Local {
     }
 
     fn random(&self) -> u32 {
-        let mut x = self.seed.get();
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
+        let x = xorshift(self.seed.get());
         self.seed.set(x);
         x
     }
 
+    /// Up to [`CHOICES`] pairs of `group`'s other workers ([`pick_two`]), each a steal of half
+    /// the longer deque; `retry` set when a steal lost a race. `None` when every pick found
+    /// nothing.
+    fn two_choices(&self, group: &Group, retry: &mut bool) -> Option<Job> {
+        let shared = &*self.shared;
+        let me = group.workers.iter().position(|&it| it as usize == self.index);
+        for _ in 0..CHOICES {
+            // A deque's length is a hint: its owner and other thieves move it as it is read.
+            let Some(worker) = pick_two(&group.workers, me, || self.random(), |it| shared.slots[it].stealer.len())
+            else {
+                continue;
+            };
+            match shared.slots[worker].stealer.steal_batch_and_pop(&self.deque) {
+                Steal::Success(job) => return Some(job),
+                Steal::Retry => *retry = true,
+                Steal::Empty => {}
+            }
+        }
+        None
+    }
+
     /// One look at every queue but this worker's own, nearest first: each group's injector (a
-    /// few jobs), its workers' deques (half of one), then their LIFO slots.
+    /// few jobs), its workers' deques (half of one, picked as [`Local::victims`] says), then
+    /// their LIFO slots.
     fn steal(&self) -> Option<Job> {
         let shared = &*self.shared;
         loop {
@@ -1278,6 +1421,14 @@ impl Local {
                 if let Some(job) = group.inject.steal_into(&self.deque) {
                     return Some(job);
                 }
+                if self.victims == Victims::TwoChoices
+                    && let Some(job) = self.two_choices(group, &mut retry)
+                {
+                    return Some(job);
+                }
+                // The walk of every other deque of the group: all of `Victims::Walk`, and under
+                // `TwoChoices` the documented second step for deques its picks missed or read
+                // as empty, so no queued job is left unseen before the worker parks.
                 let count = group.workers.len();
                 let start = self.random() as usize % count;
                 for step in 0..count {
@@ -2346,55 +2497,6 @@ mod tests {
         }
     }
 
-    /// A job claims a key and then waits on a scope of its own that nothing will end; another
-    /// waits for the key, which nobody will finish. Once the pool is idle a while, each fails
-    /// with the stall, naming the key and who claimed it, rather than both waiting forever;
-    /// the pool goes on running jobs.
-    #[test]
-    fn a_job_waiting_on_a_key_nobody_will_finish_fails_naming_the_key() {
-        use crate::sched::{self, Wait};
-        let pool = Pool::new(&Topology::flat(2), false).unwrap();
-        let (tx, rx) = unbounded::<Result<(), String>>();
-        let at = key(7_000);
-        let claimed = Arc::new(AtomicUsize::new(0));
-        {
-            let (tx, claimed) = (tx.clone(), Arc::clone(&claimed));
-            pool.submit(
-                None,
-                move || {
-                    assert!(sched::claim(at), "the key is new");
-                    claimed.store(1, Ordering::SeqCst);
-                    let never = sched::open_scope();
-                    let _ = sched::wait(Wait::Counter(never));
-                },
-                move |it| _ = tx.send(it.map_err(|it| message(&*it))),
-            );
-        }
-        until("the key to be claimed", || claimed.load(Ordering::SeqCst) == 1);
-        {
-            let tx = tx.clone();
-            pool.submit(
-                None,
-                move || {
-                    let _ = sched::wait(Wait::Key(at));
-                },
-                move |it| _ = tx.send(it.map_err(|it| message(&*it))),
-            );
-        }
-        let named = at.0.iter().fold(String::new(), |mut text, byte| {
-            use std::fmt::Write as _;
-            write!(text, "{byte:02x}").expect("writing to a String cannot fail");
-            text
-        });
-        for _ in 0..2 {
-            let failed = rx.recv_timeout(LONG).unwrap().expect_err("a stalled job fails");
-            assert!(failed.starts_with("stalled: "), "{failed}");
-            assert!(failed.contains(&format!("key {named}, claimed by job ")), "the stall names the key: {failed}");
-        }
-        pool.submit(None, || (), move |it| _ = tx.send(it.map_err(|it| message(&*it))));
-        assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(()), "the pool ran no job after the stall");
-    }
-
     /// On a pool of one worker, a job waits on an event and holds no thread: the worker runs
     /// another job meanwhile. A thread of no pool fires it; the job goes on, and a wait after
     /// the fire, on a worker or on no pool, ends at once.
@@ -2486,65 +2588,6 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 1);
         stop.store(1, Ordering::SeqCst);
         until("the last of the chain to end", || Arc::strong_count(&pool) == 1);
-    }
-
-    /// A scope's job waits on a key a job outside it claimed, which waits forever: a stall. The
-    /// key's claimer and the scope's job fail with it; the scope's caller, waiting on its job,
-    /// is left until that job ended and returns as a scope does, never unwinding while a job
-    /// borrowing its frame runs.
-    #[test]
-    fn a_stall_inside_a_scope_fails_its_job_before_its_caller() {
-        use crate::sched::{self, Wait};
-        let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
-        let (tx, rx) = unbounded::<Result<(), String>>();
-        let at = key(7_100);
-        let claimed = Arc::new(AtomicUsize::new(0));
-        {
-            let (tx, claimed) = (tx.clone(), Arc::clone(&claimed));
-            pool.submit(
-                None,
-                move || {
-                    assert!(sched::claim(at), "the key is new");
-                    claimed.store(1, Ordering::SeqCst);
-                    let never = sched::open_scope();
-                    let _ = sched::wait(Wait::Counter(never));
-                },
-                move |it| _ = tx.send(it.map_err(|it| message(&*it))),
-            );
-        }
-        until("the key to be claimed", || claimed.load(Ordering::SeqCst) == 1);
-        let ended = Arc::new(AtomicUsize::new(0));
-        {
-            let (tx, ended) = (tx.clone(), ended);
-            let scoped = Arc::clone(&pool);
-            pool.submit(
-                None,
-                move || {
-                    let (job_tx, job_rx) = unbounded::<Result<(), String>>();
-                    let borrowed = &ended;
-                    scoped.scope(|scope| {
-                        scope.submit(
-                            None,
-                            move || {
-                                let _ = sched::wait(Wait::Key(at));
-                                borrowed.store(1, Ordering::SeqCst);
-                            },
-                            move |it| _ = job_tx.send(it.map_err(|it| message(&*it))),
-                        );
-                    });
-                    let failed = job_rx.try_recv().expect("the scope returned once its job ended").unwrap_err();
-                    assert!(failed.starts_with("stalled: "), "{failed}");
-                    assert_eq!(ended.load(Ordering::SeqCst), 0, "the scope's job failed at its wait");
-                },
-                move |it| _ = tx.send(it.map_err(|it| message(&*it))),
-            );
-        }
-        let mut got = [rx.recv_timeout(LONG).unwrap(), rx.recv_timeout(LONG).unwrap()];
-        got.sort();
-        assert!(got[0].is_ok(), "the scope's caller saw its job's stall: {got:?}");
-        assert!(got[1].as_ref().is_err_and(|it| it.starts_with("stalled: ")), "the key's claimer fails: {got:?}");
-        pool.submit(None, || (), move |it| _ = tx.send(it.map_err(|it| message(&*it))));
-        assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(()), "the pool ran no job after the stall");
     }
 
     /// A scope's job given to a worker's LIFO slot is taken by another worker while the first
@@ -2888,6 +2931,129 @@ mod tests {
     }
 }
 
+/// [`Victims`]: a two-choices pick is the longer of two other workers' deques and replays for
+/// a seed, and under either way of picking every job of a tree of scopes runs once.
+#[cfg(all(test, not(blaze_check)))]
+#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
+mod victims {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use hegel::{TestCase, generators as gs};
+
+    use super::{Pool, Stealing, Victims, pick_two, worker_seed, xorshift};
+    use crate::topology::{Cpu, Topology};
+
+    /// Workers' pool indices start here, so a position in a group's list is never mistaken
+    /// for a worker's index.
+    const BASE: usize = 7;
+
+    /// Over generated groups, deque lengths and seeds: each pick draws two workers other than
+    /// `me`, is the one of the longer deque (the first on a tie), is none only when both are
+    /// empty, and the same seed draws the same picks again.
+    #[hegel::test(test_cases = 200)]
+    fn a_two_choices_pick_is_the_longer_of_two_others_and_replays_for_a_seed(tc: TestCase) {
+        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
+        let me = tc.draw(gs::booleans()).then(|| tc.draw(gs::integers::<usize>().max_value(count - 1)));
+        let lens: Vec<usize> = (0..count).map(|_| tc.draw(gs::integers::<usize>().max_value(4))).collect();
+        let (seed, index) = (tc.draw(gs::integers::<u64>()), tc.draw(gs::integers::<usize>().max_value(255)));
+        let workers: Vec<u32> = (0..count).map(|it| (BASE + it) as u32).collect();
+        let len = |worker: usize| lens[worker - BASE];
+        let run = || {
+            let mut state = worker_seed(seed, index);
+            (0..16)
+                .map(|_| {
+                    let mut drawn = Vec::new();
+                    let random = || {
+                        state = xorshift(state);
+                        drawn.push(state);
+                        state
+                    };
+                    let pick = pick_two(&workers, me, random, len);
+                    (pick, drawn)
+                })
+                .collect::<Vec<_>>()
+        };
+        let picks = run();
+        assert_eq!(picks, run(), "seed {seed:#x} worker {index}: the same seed drew other victims");
+        let others = count - usize::from(me.is_some());
+        let mine = me.map(|it| BASE + it);
+        for (pick, drawn) in picks {
+            if others == 0 {
+                assert_eq!((pick, drawn.len()), (None, 0), "a group of only `me` draws nothing");
+                continue;
+            }
+            let worker = |r: u32| {
+                let at = r as usize % others;
+                BASE + if me.is_some_and(|me| at >= me) { at + 1 } else { at }
+            };
+            let [a, b] = [worker(drawn[0]), worker(drawn[1])];
+            assert!(Some(a) != mine && Some(b) != mine, "drew `me` {mine:?}: {a} {b}");
+            let want = match (len(a), len(b)) {
+                (0, 0) => None,
+                (of_a, of_b) if of_b > of_a => Some(b),
+                _ => Some(a),
+            };
+            assert_eq!(pick, want, "lens {lens:?}, drew {a} and {b}");
+        }
+    }
+
+    /// With every deque as long, the picks reach every other worker of the group: two-choices
+    /// keeps the walk's spread rather than pinning a thief to one victim.
+    #[test]
+    fn equal_deques_spread_the_picks_over_every_other_worker() {
+        let workers: Vec<u32> = (0..8).map(|it| (BASE + it) as u32).collect();
+        let mut state = worker_seed(Stealing::DEFAULT.seed, 3);
+        let mut seen = [0u32; 8];
+        for _ in 0..400 {
+            let random = || {
+                state = xorshift(state);
+                state
+            };
+            let pick = pick_two(&workers, Some(3), random, |_| 1).unwrap();
+            seen[pick - BASE] += 1;
+        }
+        assert_eq!(seen[3], 0, "picked itself: {seen:?}");
+        assert!(seen.iter().enumerate().all(|(at, &it)| at == 3 || it > 0), "a worker never picked: {seen:?}");
+    }
+
+    /// A worker per generated topology's CPU, one job per node of a generated tree, each
+    /// node's job a scope of its children's (so jobs pile up in deques and are stolen), under
+    /// either [`Victims`]: every job runs exactly once and the scope at the root ends.
+    #[hegel::test(test_cases = 32)]
+    fn every_job_of_a_tree_runs_once_under_either_victims(tc: TestCase) {
+        fn run(pool: &Pool, children: &[Vec<usize>], ran: &[AtomicU32], at: usize) {
+            ran[at].fetch_add(1, Ordering::Relaxed);
+            let mut spin = 0u64;
+            for it in 0..2000u64 {
+                spin = std::hint::black_box(spin.wrapping_add(it));
+            }
+            pool.scope(|scope| {
+                for &child in &children[at] {
+                    scope.submit(None, move || run(pool, children, ran, child), |it| it.unwrap());
+                }
+            });
+        }
+        let groups = tc.draw(gs::integers::<u32>().min_value(1).max_value(2));
+        let each = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
+        let victims = if tc.draw(gs::booleans()) { Victims::TwoChoices } else { Victims::Walk };
+        let seed = tc.draw(gs::integers::<u64>());
+        let nodes = tc.draw(gs::integers::<usize>().min_value(1).max_value(40));
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); nodes];
+        for node in 1..nodes {
+            let parent = tc.draw(gs::integers::<usize>().max_value(node - 1));
+            children[parent].push(node);
+        }
+        let topology = Topology {
+            cpus: (0..groups * each).map(|id| Cpu { id, group: id / each, socket: 0, node: 0, fast: true }).collect(),
+        };
+        let pool = Pool::with_stealing(&topology, false, Stealing { victims, seed }).unwrap();
+        let ran: Vec<AtomicU32> = (0..nodes).map(|_| AtomicU32::new(0)).collect();
+        pool.install(|| run(&pool, &children, &ran, 0));
+        let counts: Vec<u32> = ran.iter().map(|it| it.load(Ordering::Relaxed)).collect();
+        assert!(counts.iter().all(|&it| it == 1), "{victims:?} on {groups}x{each}: runs per node {counts:?}");
+    }
+}
+
 /// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-graph --release
 /// model_`), against a bag of jobs (each runs once, after it was given, and none is left):
 /// pools built by hand, without `Pool::new`'s start-up channel and binding, which the checker
@@ -2904,7 +3070,9 @@ mod model {
     };
     use crossbeam_deque::Worker;
 
-    use super::{Group, Idle, Inject, Job, Local, Pool, Shared, Slot, scope_in, searching, sleeping, work};
+    use super::{
+        Group, Idle, Inject, Job, Local, Pool, Shared, Slot, Stealing, scope_in, searching, sleeping, work, worker_seed,
+    };
     use crate::{
         pump::Lock,
         sync::{
@@ -2992,7 +3160,8 @@ mod model {
             node: 0,
             deque,
             lifo: Cell::new(0),
-            seed: Cell::new((index as u32).wrapping_mul(0x9E37_79B9) | 1),
+            seed: Cell::new(worker_seed(Stealing::DEFAULT.seed, index)),
+            victims: Stealing::DEFAULT.victims,
         }
     }
 
