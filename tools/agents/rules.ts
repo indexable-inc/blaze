@@ -79,7 +79,7 @@ export const rules = [
 	},
 	{
 		id: "fix-through-blaze-lints",
-		info: "A change that moves a type, path, API or idiom across the code is a blaze lint with a MachineApplicable fix (`blaze::std_lock`, `blaze::std_mpsc`, `blaze::fx_hash` and the next one), applied with `blaze fix`; a one-off move of a path is `blaze fix --replace A=B`. Both find code by name resolution (imports, renames, globs, re-exports, macro output), never by text, and leave it compiling and lint-clean, so the rule keeps holding after the port. `sed`, `rg` replace and syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a build afterward.",
+		info: "A change that moves a type, path, API or idiom across the code is a ban with a `replacement` in `.clippy.toml` (mirrored in the hot crates' `clippy.toml`), which blaze-lints' `disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce with a MachineApplicable fix, or a `blaze::` lint where the rule needs types or MIR; either is applied with `blaze check --fix`, and its count lives in `crates/blaze-lints/baselines/`, which may only shrink; a one-off move of a path is `blaze check --replace A=B`. Both find code by name resolution (imports, renames, globs, re-exports, macro output), never by text, and leave it compiling and lint-clean, so the rule keeps holding after the port. `sed`, `rg` replace and syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a build afterward.",
 		reason: "Andrew, 2026-11-01: \"make our own version of clippy that is incremental and has suggestions for replace\" and \"recommend doing find replace with blaze lints\". A text or tree-sitter rewrite of `std::sync::Mutex` misses `use std::sync::{Arc, Mutex}`, renames and globs, and can hit an unrelated `Mutex`; blaze-lints already runs per body as front-end queries.",
 	},
 	{
@@ -91,6 +91,11 @@ export const rules = [
 		id: "every-wait-says-what",
 		info: "A thread or fiber that blocks says what it waits for: the wait opens a span naming the awaited key, lock, channel, IO or child, and its owner when known. A wait with no name, and time on a worker covered by no span, are bugs; the profile test fails on them.",
 		reason: "2026-11-01: 18 codegen workers sat 77 s each in build 24 with no span saying why; only a bisect found part D's apply phase. 19,342 wait spans in that build carried no target because the table dropped the field.",
+	},
+	{
+		id: "slow-is-p0-traced",
+		info: "Anything slow is a P0 until a span names it, and the trace comes before the speed fix. Every stretch of worker time sits under a `tracing::info_span!(target: \"blaze\", ...)` that names the work: the macro path for a proc-macro expansion, the package, version and target kind for a unit, the query and key, the creator of a scope being waited on. Its own CPU time (`self_cpu_ns`) is filled, so a DuckDB query over `<BLAZE_HOME>/v2/profile/*.spans.parquet` says which item took the time and whether it was busy or waiting. A sampler stack or a guess from a log is a lead. The PR that makes something faster quotes the before and after from those spans.",
+		reason: "Andrew, 2026-11-01: \"whenever something is slow p0 make sure it is traced properly\". Build 53 ran 917 s on about 2 of 18 cores and its spans could not say why: no span for proc-macro expansion, `self_cpu_ns` NULL in every row, every build script recorded as `build-script-build`, and waits named `scope 13`. A claim that one derive took minutes came from the sampler, and the spans did not back it.",
 	},
 	{
 		id: "bounded-progress",
@@ -124,7 +129,7 @@ export const rules = [
 	},
 	{
 		id: "whole-ports",
-		info: "A change to a shared signature or type (a struct's fields, a trait, a lock type) updates every caller in the same batch, so the shared tree compiles at every save point. Do it through `blaze fix` or a scoped rewrite, then build, then hand the batch over. A half-ported tree blocks every lane's run.",
+		info: "A change to a shared signature or type (a struct's fields, a trait, a lock type) updates every caller in the same batch, so the shared tree compiles at every save point. Do it through `blaze check --fix`, `blaze check --replace` or a scoped rewrite, then build, then hand the batch over. A half-ported tree blocks every lane's run.",
 		reason: "2026-11-01: the self-build loop sat blocked on `Maintainer { run }` after its fields changed, on `LifetimeParamData::is_fresh` callers, and on `into_inner().ok()` after the parking_lot port, each a signature changed without its callers.",
 	},
 	{
