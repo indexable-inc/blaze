@@ -29,7 +29,7 @@ the PGO a release adds ([reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)); 0
 profile and fails with it. From a checkout, the release's own recipe builds all of it, with the profile
 [tools/pgo/profiles.json](../tools/pgo/profiles.json) pins:
 
-    python3 .github/scripts/build_release.py --target $(rustc +"$(cat harness/toolchain)" -vV | sed -n 's/^host: //p') --out shipped
+    python3 .github/scripts/build_release.py "{\"target\": \"$(rustc +"$(cat harness/toolchain)" -vV | sed -n 's/^host: //p')\", \"out\": \"shipped\"}"
     cp shipped/* ~/.cargo/bin/
 
 That build has the LLVM backend (the release profile's, [below](#backends)) and the LLVM tiers, as the

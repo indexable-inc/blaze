@@ -20,9 +20,10 @@ changed. What to do next: [usage.md](usage.md).
 
 ## What you need
 
-- **macOS on Apple silicon, or Linux on x86-64 or ARM64.** Windows has no release build and
-  the installer refuses it; v2 has not been run there (v1's port:
-  [platforms.md](platforms.md#windows-x86-64-msvc)). Intel Macs are not supported.
+- **macOS on Apple silicon, or Linux on x86-64 or ARM64.** Windows has a release archive, which
+  promotion unpacks and tries, but the installer (`install.sh`) refuses it, and v2 has not been
+  run there (v1's port: [platforms.md](platforms.md#windows-x86-64-msvc)). Intel Macs are not
+  supported.
 - **On Linux, glibc 2.34 or newer**: RHEL 9, Debian 12, Ubuntu 22.04 and anything newer. Each
   is checked by installing there in a container with no Rust. Alpine and other musl systems are
   not supported; the installer says so.

@@ -91,10 +91,12 @@ GitHub release, not in a section of CHANGELOG.md.
 main's HEAD the same way (`train_release.py`): a tag through the API and release.yaml on it,
 no commit. Both count every tag, so they never take the same number.
 
-Either way `release.yaml` builds the archives on the tag for macOS (Apple silicon) and Linux
-(x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS` (what install.sh checks) and `B3SUMS` (what a
-pinned release's fetch checks). PGO is off for now (#870):
-the release is built with `--no-pgo`.
+Either way `release.yaml` builds the archives on the tag for macOS (Apple silicon), Linux
+(x86-64, ARM64) and Windows (x86-64, MSVC; the C runtime linked in, built on `windows-2025`) and
+publishes them as a prerelease with `SHA256SUMS` (what install.sh checks) and `B3SUMS` (what a
+pinned release's fetch checks). PGO is off for now (#870): the release is built with `no_pgo`.
+`install.sh` does not install the Windows archive; promotion (below) unpacks it and builds a
+project with it.
 
 ## Promotion to stable
 
@@ -103,7 +105,9 @@ the workflow's own token publishes starts no `release:` workflow). One gate runs
 newer canary's run replaces one still waiting, so the gate always takes the newest canary when it
 is free, and a canary it never took stays a canary. It runs, against the
 published archives, installed with `install.sh --version <v>` as a user installs them, on macOS
-(Apple silicon) and Linux (x86-64 and ARM64):
+(Apple silicon) and Linux (x86-64 and ARM64); the Windows archive is unpacked by hand, since
+`install.sh` refuses Windows, and has to report its version and build and run `blaze new`
+(`windows-archive`):
 
 - the install checks: `blaze --version` is the release's, `blaze new` + `blaze run` prints
   `Hello, world!` (v2's blaze has no `new` command, so a v2 release fails this check until it

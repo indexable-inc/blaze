@@ -3,11 +3,17 @@
 work (PGO). The release workflow, the flake's `daemon` and `cargo install` from a checkout all
 build it with this.
 
-  build_release.py --target T [--profdata FILE] [--features F] [--out DIR]
+One JSON value, inline, a file's path, or `-` for stdin (AGENTS.md, scripts-take-typed-input);
+an unknown field is refused. The fields, and what a value of them does:
+
+  {"target": T, "profdata": FILE, "features": F, "out": DIR}
                                                   # the build, into target/T/dist; DIR gets every binary of blaze
-  build_release.py --target T --train DIR         # a new profile for T, into DIR (the pgo workflow)
-  build_release.py --pin DIR                      # tools/pgo/profiles.json names the profiles in DIR
-  build_release.py --target T --show              # the command the build runs, for any other driver
+  {"target": T, "train": DIR}                     # a new profile for T, into DIR (the pgo workflow)
+  {"pin": [DIR, ...]}                             # tools/pgo/profiles.json names the profiles in DIR
+  {"target": T, "show": true}                     # the command the build runs, for any other driver
+
+Besides these: `strict` fails when the profile is of other crates (a release), `no_pgo` builds
+without a profile (releases, while PGO is off) and `nix` is the flake's build (below).
 
 The build is `cargo build -p blaze-engine --profile dist --locked --target T --features llvm` with
 `RUSTFLAGS=-Cprofile-use=<profile>`. The `llvm` feature is part of every build of it, the
@@ -41,18 +47,23 @@ training session by ending the daemon, after which each worker sees its input cl
 by itself. The `cc` crate passes `-Cprofile-generate`/`-Cprofile-use` on to the C compiler;
 on macOS Apple clang's profile format is not rustc's LLVM's and the instrumented blaze
 crashes at start (rust-lang/rust#163640), so the C code (mimalloc, ring) is built without
-them. macOS and Linux; stdlib only.
+them. macOS, Linux and Windows (x86-64 MSVC); stdlib only.
+
+On Windows the build links the C runtime statically (`+crt-static`), as the pinned LLVM is built
+(/MT), and names the Windows SDK's libraries, which the linker is not otherwise shown, as CI's
+build of blaze does (blaze-platform.yaml). Its flags go in `CARGO_ENCODED_RUSTFLAGS`, since the
+SDK's path has spaces. A shipped `.exe` is refused when it imports LLVM or the Visual C++ runtime,
+which a machine that downloads it may not have.
 
 On Linux every binary in DIR is refused when it asks for a glibc newer
 than `GLIBC` (RHEL 9's; Debian 12 and Ubuntu 22.04 have newer): the release builds on the
 oldest hosted Ubuntu, and a binary linked on a newer system asks for that system's glibc
-(GitHub issue #351). install.sh says the same floor to a system below it. With `--nix` (the
+(GitHub issue #351). install.sh says the same floor to a system below it. With `nix` (the
 flake's `dist`) every binary has to load nixpkgs' glibc through a loader under /nix/store
 instead, as a binary built by Nix does: it never meets the system's glibc, so the floor is not
 its own, and a binary of the build that would meet it is refused.
 """
 
-import argparse
 import collections
 import hashlib
 import json
@@ -66,9 +77,14 @@ import sys
 import tempfile
 import time
 import urllib.request
+import types
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+# Run by a bare python (and with -I), not by uv: the one stdlib-only module it needs is found from the tree.
+sys.path.insert(0, str(ROOT / "python" / "typed-input" / "src"))
+from typed_input import fail, parse  # noqa: E402
 HARNESS = ROOT / "harness"
 TOOLCHAIN = (HARNESS / "toolchain").read_text().strip()
 PINS = ROOT / "tools" / "pgo" / "profiles.json"
@@ -93,7 +109,10 @@ GLIBC_VERSION = re.compile(rb"GLIBC_(\d+)\.(\d+)(?:\.\d+)?\x00")
 # The LLVM the `llvm` feature links (crates/hir-ty-codegen/build.rs), and the libraries no
 # shipped binary may load: LLVM is linked in, and on Linux libstdc++ with it.
 LLVM_PREFIX = "LLVM_SYS_231_PREFIX"
-NOT_LOADED = {"linux": re.compile(r"libLLVM|libstdc\+\+|libc\+\+"), "darwin": re.compile(r"libLLVM")}
+NOT_LOADED = {"linux": re.compile(r"libLLVM|libstdc\+\+|libc\+\+"), "darwin": re.compile(r"libLLVM"),
+              "windows": re.compile(r"(?i)^(llvm|vcruntime|msvcp|concrt)")}
+# Where the Windows SDK keeps the libraries of each of its versions.
+WINDOWS_SDK = Path("C:/Program Files (x86)/Windows Kits/10/Lib")
 
 
 def run(argv, **kwargs):
@@ -122,10 +141,23 @@ def recipe(target, rustflags, cflags, features=None, llvm="<LLVM_SYS_231_PREFIX>
     triple = target.replace("-", "_")
     env = {"RUSTUP_TOOLCHAIN": TOOLCHAIN, "RUSTFLAGS": rustflags, "RUSTC_WRAPPER": "", "RUSTC_WORKSPACE_WRAPPER": "",
            "CARGO_INCREMENTAL": "0", LLVM_PREFIX: str(llvm)}
+    if target.endswith("-windows-msvc"):
+        flags = ["-C", "target-feature=+crt-static", "-L", f"native={windows_sdk()}", *filter(None, [rustflags])]
+        del env["RUSTFLAGS"]
+        env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
     for name in ("CFLAGS", "CXXFLAGS"):
         env[f"{name}_{triple}"] = " ".join(filter(None, [os.environ.get(f"{name}_{triple}"), cflags]))
     return env, ["cargo", "build", "-p", "blaze-engine", "--profile", "dist", "--locked", "--target", target,
                  "--features", ",".join(["llvm", *filter(None, [features])])]
+
+
+def windows_sdk():
+    """The x64 libraries of the newest Windows SDK installed."""
+    found = sorted(WINDOWS_SDK.glob("*/um/x64"), key=lambda p: [int(n) for n in re.findall(r"\d+", p.parts[-3])])
+    if not found:
+        sys.exit(f"error: build_release: no Windows SDK in {WINDOWS_SDK}: blaze links against its libraries. "
+                 "Visual Studio's installer adds it (the Windows 10 or 11 SDK)")
+    return found[-1]
 
 
 def llvm_prefix(target):
@@ -305,22 +337,71 @@ def check_glibc(out):
     print(f"build_release: the binaries in {out} ask for glibc {shown} or older", flush=True)
 
 
+def pe_imports(binary):
+    """The DLLs a PE32+ executable imports, the delay-loaded ones included, or None for a file that
+    is not one."""
+    data = binary.read_bytes()
+    if data[:2] != b"MZ":
+        return None
+    (pe,) = struct.unpack_from("<I", data, 0x3c)
+    if data[pe:pe + 4] != b"PE\0\0" or struct.unpack_from("<H", data, pe + 24)[0] != 0x20b:
+        return None
+    (count,) = struct.unpack_from("<H", data, pe + 6)
+    (optional_size,) = struct.unpack_from("<H", data, pe + 20)
+    optional = pe + 24
+    # Each section's address, size in memory and offset in the file.
+    sections = []
+    for index in range(count):
+        size, address, _, raw = struct.unpack_from("<IIII", data, optional + optional_size + 40 * index + 8)
+        sections.append((address, size, raw))
+
+    def offset(rva):
+        for address, size, raw in sections:
+            if address <= rva < address + size:
+                return rva - address + raw
+        sys.exit(f"error: build_release: {binary} has an address {rva:#x} in no section")
+
+    dlls = []
+    # The import directory (entry 1: 20-byte descriptors, the name's address at 12) and the
+    # delay-load one (entry 13: 32-byte descriptors, the name's at 4), each ended by zeros.
+    for entry, size, at in ((1, 20, 12), (13, 32, 4)):
+        (rva,) = struct.unpack_from("<I", data, optional + 112 + 8 * entry)
+        if not rva:
+            continue
+        descriptor = offset(rva)
+        while any(data[descriptor:descriptor + size]):
+            start = offset(struct.unpack_from("<I", data, descriptor + at)[0])
+            dlls.append(data[start:data.index(b"\0", start)].decode())
+            descriptor += size
+    return dlls
+
+
 def check_loads(out):
     """Refuses the build when a binary in `out` loads a library `NOT_LOADED` names."""
-    system = "darwin" if sys.platform == "darwin" else "linux"
+    system = {"darwin": "darwin", "win32": "windows"}.get(sys.platform, "linux")
     wrong = []
     for binary in sorted(out.iterdir()):
-        if not binary.is_file() or binary.read_bytes()[:4] not in (b"\x7fELF", b"\xcf\xfa\xed\xfe"):
+        if not binary.is_file():
             continue
-        argv = ["otool", "-L", binary] if system == "darwin" else ["readelf", "-d", binary]
-        shown = subprocess.run(argv, capture_output=True, text=True, check=True).stdout
-        lines = shown.splitlines()[1:] if system == "darwin" else [l for l in shown.splitlines() if "(NEEDED)" in l]
-        wrong += [f"{binary.name}: {line.strip()}" for line in lines if NOT_LOADED[system].search(line)]
+        if system == "windows":
+            if binary.suffix != ".exe":
+                continue
+            lines = pe_imports(binary)
+            if lines is None:
+                sys.exit(f"error: build_release: {binary} is not a 64-bit Windows executable")
+        elif binary.read_bytes()[:4] not in (b"\x7fELF", b"\xcf\xfa\xed\xfe"):
+            continue
+        else:
+            argv = ["otool", "-L", binary] if system == "darwin" else ["readelf", "-d", binary]
+            shown = subprocess.run(argv, capture_output=True, text=True, check=True).stdout
+            lines = shown.splitlines()[1:] if system == "darwin" else [l for l in shown.splitlines() if "(NEEDED)" in l]
+        wrong += [f"{binary.name}: {line.strip()}" for line in lines if NOT_LOADED[system].search(line.strip())]
     if wrong:
         sys.exit(f"error: build_release: a shipped binary loads what a user's machine lacks: {'; '.join(wrong)}. "
-                 "LLVM and, on Linux, libstdc++ are linked in statically (crates/hir-ty-codegen/build.rs)")
-    print(f"build_release: the binaries in {out} load no libLLVM" + ("" if system == "darwin" else " or C++ runtime"),
-          flush=True)
+                 "LLVM and, on Linux, libstdc++ are linked in statically (crates/hir-ty-codegen/build.rs), and on "
+                 "Windows the C runtime (+crt-static)")
+    shown = {"darwin": "", "linux": " or C++ runtime", "windows": " or Visual C++ runtime"}[system]
+    print(f"build_release: the binaries in {out} load no libLLVM{shown}", flush=True)
 
 
 def interpreter(binary):
@@ -364,24 +445,34 @@ def ship(args, binaries):
         check_nix(args.out) if args.nix else check_glibc(args.out)
 
 
+@dataclass(frozen=True)
+class Input:
+    target: str = ""
+    profdata: str = ""  # the pinned profile, already fetched
+    train: str = ""  # train a new profile into this directory
+    pin: tuple[str, ...] = ()  # pin the profiles trained into these directories
+    out: str = ""  # copy the binaries into this directory
+    features: str = ""  # cargo features of blaze besides `llvm`, which every build has
+    strict: bool = False
+    no_pgo: bool = False
+    show: bool = False
+    nix: bool = False
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--target")
-    parser.add_argument("--profdata", help="the pinned profile, already fetched")
-    parser.add_argument("--train", type=Path, metavar="DIR", help="train a new profile into DIR")
-    parser.add_argument("--pin", nargs="+", metavar="DIR", help="pin the profiles trained into DIR")
-    parser.add_argument("--out", type=Path, metavar="DIR", help="copy the binaries into DIR")
-    parser.add_argument("--features", help="cargo features of blaze besides `llvm`, which every build has")
-    parser.add_argument("--strict", action="store_true", help="fail when the profile is of other crates (a release)")
-    parser.add_argument("--no-pgo", action="store_true", help="build without a profile (releases, while PGO is off)")
-    parser.add_argument("--show", action="store_true", help="print the build's environment and command")
-    parser.add_argument("--nix", action="store_true",
-                        help="the flake's build: its Linux binaries load nixpkgs' glibc, not the system's (no RHEL 9 floor)")
-    args = parser.parse_args()
+    match sys.argv[1:]:
+        case [text]:
+            given = parse(Input, text, "build_release.py")
+        case _:
+            fail("build_release.py", "usage: build_release.py JSON (see the top of the file)")
+    args = types.SimpleNamespace(
+        target=given.target, profdata=given.profdata or None, train=Path(given.train) if given.train else None,
+        pin=list(given.pin), out=Path(given.out) if given.out else None, features=given.features or None,
+        strict=given.strict, no_pgo=given.no_pgo, show=given.show, nix=given.nix)
     if args.pin:
         return pin(args.pin)
     if not args.target:
-        parser.error("--target is required")
+        fail("build_release.py", "target is required")
     args.out = args.out and args.out.resolve()
     if args.train:
         return train(args.target, args.train)

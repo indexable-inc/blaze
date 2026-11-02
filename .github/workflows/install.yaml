@@ -128,10 +128,15 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+      # typed_input (the scripts take JSON) needs Python 3.12; the oldest hosted Ubuntu has 3.10.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
       # cargo and rustc, with no cache: this is the release's own recipe (build_release.py, the
       # dist profile), and the recipe is what it checks.
-      - run: python3 .github/scripts/build_release.py --target x86_64-unknown-linux-gnu --out shipped --no-pgo
+      - run: |
+          python3 .github/scripts/build_release.py '{"target": "x86_64-unknown-linux-gnu", "out": "shipped", "no_pgo": true}'
         timeout-minutes: 40
       - name: archive
         run: |

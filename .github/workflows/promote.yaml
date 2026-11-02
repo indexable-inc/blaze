@@ -150,6 +150,57 @@ jobs:
           path: ${{ runner.temp }}/${{ matrix.os }}.json
           if-no-files-found: ignore
 
+  # The Windows archive, as the release published it: install.sh refuses Windows, so the archive
+  # is unpacked by hand, and it has to start, report its version, and build and run a project.
+  # Without this the archive would reach stable never having been used.
+  windows-archive:
+    name: smoke (the Windows archive)
+    needs: release
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.release.outputs.tag }}
+      # No sandbox on Windows yet (#1390).
+      BLAZE_SANDBOX: "off"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ilammy/msvc-dev-cmd@v1
+      - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
+      # The releases cut before release.yaml had a Windows row (v0.20261029.7 is the newest of
+      # them) have no such archive, and a run of the gate against one (a pull request changing
+      # it takes the newest release) has nothing to try: that is said, not passed over. Every
+      # later release has it, and its absence fails the job.
+      - name: has a Windows archive
+        run: |
+          before=v0.20261029.7
+          if [ "$(printf '%s\n%s\n' "$TAG" "$before" | sort -V | head -n 1)" = "$TAG" ]; then
+            echo "::notice::$TAG is not newer than $before, the last release with no Windows archive: nothing to try"
+            echo "NO_ARCHIVE=1" >> "$GITHUB_ENV"
+          fi
+      - name: download and check ${{ env.TAG }}
+        if: env.NO_ARCHIVE != '1'
+        run: |
+          mkdir -p "$RUNNER_TEMP/dl"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*-x86_64-pc-windows-msvc.tar.gz*' --dir "$RUNNER_TEMP/dl"
+          cd "$RUNNER_TEMP/dl"
+          sha256sum -c ./*.tar.gz.sha256
+          tar xzf ./*.tar.gz
+          echo "BLAZE_DIR=$(pwd)/$(ls -d blaze-*-x86_64-pc-windows-msvc)" >> "$GITHUB_ENV"
+      - name: what it unpacked runs
+        if: env.NO_ARCHIVE != '1'
+        run: |
+          export PATH="$BLAZE_DIR:$PATH"
+          blaze --version | tee /dev/stderr | grep -F "blaze ${TAG#v} "
+          cd "$RUNNER_TEMP"
+          blaze new --quiet hello
+          cd hello
+          blaze run | grep -Fx "Hello, world!"
+          blaze stop
+
   # The applications, each check of each on each platform a job: a build of one is hours on a
   # hosted runner. Not on a pull request, which runs the rest of the gate.
   apps:
@@ -320,7 +371,7 @@ jobs:
 
   verdict:
     name: promote or file
-    needs: [release, smoke, apps, train, main-tests]
+    needs: [release, smoke, windows-archive, apps, train, main-tests]
     if: always() && github.event_name == 'workflow_dispatch' && needs.release.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -338,15 +389,15 @@ jobs:
         with:
           path: results
       - name: promote ${{ env.TAG }}
-        if: needs.smoke.result == 'success' && needs.apps.result == 'success' && needs.train.result == 'success' && needs.main-tests.result == 'success' && inputs.promote
+        if: needs.smoke.result == 'success' && needs.windows-archive.result == 'success' && needs.apps.result == 'success' && needs.train.result == 'success' && needs.main-tests.result == 'success' && inputs.promote
         run: |
           jq -n --arg tag "$TAG" --arg run "$RUN" '{tag: $tag, run: $run, bench: "results"}' > "$RUNNER_TEMP/promote.json"
           python3 -I .github/scripts/promote.py promote "$RUNNER_TEMP/promote.json" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: passed, not promoted
-        if: needs.smoke.result == 'success' && needs.apps.result == 'success' && needs.main-tests.result == 'success' && !(inputs.promote && inputs.train)
+        if: needs.smoke.result == 'success' && needs.windows-archive.result == 'success' && needs.apps.result == 'success' && needs.main-tests.result == 'success' && !(inputs.promote && inputs.train)
         run: echo "$TAG passed what this run tested; a run with promote and the train marks it stable" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: an issue for what failed
-        if: needs.smoke.result != 'success' || needs.apps.result != 'success' || needs.main-tests.result != 'success' || (inputs.train && needs.train.result != 'success')
+        if: needs.smoke.result != 'success' || needs.windows-archive.result != 'success' || needs.apps.result != 'success' || needs.main-tests.result != 'success' || (inputs.train && needs.train.result != 'success')
         env:
           FILE: ${{ inputs.promote }}
         run: |

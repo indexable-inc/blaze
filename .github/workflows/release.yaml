@@ -1,7 +1,7 @@
 name: release
 
 # A tag `v0.YYYYMMDD.N` (a dated version, .github/scripts/train_release.py) builds blaze for
-# Linux (x86_64, aarch64) and macOS (aarch64) and makes a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS, B3SUMS (what a pin's fetch checks, crates/blaze-engine/src/versions.rs),
+# Linux (x86_64, aarch64), macOS (aarch64) and Windows (x86_64, MSVC) and makes a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS, B3SUMS (what a pin's fetch checks, crates/blaze-engine/src/versions.rs),
 # the standard library's source `library-<digest>.tar.xz` (docs/toolchain.md), and the
 # notes (what CHANGELOG.md's [Unreleased] gained and what was merged since the release before). The release is a prerelease, the canary channel's,
 # until promote.yaml makes it stable (docs/release.md). Every tag (canary.yaml's, train_release.py's)
@@ -75,12 +75,34 @@ jobs:
           # The oldest hosted Ubuntu, so that the binaries ask for an old glibc.
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+    defaults:
+      run:
+        shell: bash
     env:
       # `cargo binstall` and install.sh find the archive and its binaries by this name
       # ([package.metadata.binstall] in crates/blaze-engine/Cargo.toml).
       NAME: blaze-v${{ needs.notes.outputs.version }}-${{ matrix.target }}
+      # Git Bash on Windows has `python` and no `python3`.
+      PYTHON: ${{ startsWith(matrix.os, 'windows') && 'python' || 'python3' }}
+      # Build scripts run in a sandbox, which Windows does not have yet (#1390): as CI's Windows
+      # build (blaze-platform.yaml), they run outside one there.
+      BLAZE_SANDBOX: ${{ startsWith(matrix.os, 'windows') && 'off' || '' }}
     steps:
+      # As CI's build of blaze on Windows (blaze-platform.yaml): the sources as committed, and
+      # cargo's stable build-dir layout, whose rustc command lines fit in Windows' 32K.
+      - if: runner.os == 'Windows'
+        run: |
+          git config --global core.autocrlf false
+          echo CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT=false >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
+      # typed_input (the scripts take JSON) needs Python 3.12; the oldest hosted Ubuntu has 3.10.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      # link.exe and the Windows SDK, for blaze's build and for the programs blaze links.
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
       - run: tc=$(cat harness/toolchain) && rustup toolchain install "$tc" --profile minimal && rustup default "$tc"
       # `blaze --version` names the commit and its date (UTC), as rustc does:
       # `blaze 0.20261028.9 (fb82b09 2026-10-28)` (crates/blaze-engine/build.rs).
@@ -99,7 +121,8 @@ jobs:
       # since the pgo workflow last ran).
       # PGO is off for now (pgo.yaml runs by hand only): releases ship the plain `dist` build, so a
       # fix reaches users minutes after release-cut. To turn it back on, `--strict` instead of `--no-pgo`.
-      - run: python3 .github/scripts/build_release.py --target ${{ matrix.target }} --out shipped --no-pgo
+      - run: |
+          $PYTHON .github/scripts/build_release.py '{"target": "${{ matrix.target }}", "out": "shipped", "no_pgo": true}'
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
       - name: Archive
@@ -111,7 +134,8 @@ jobs:
           # `blaze` runs the one beside it.
           "$NAME/blaze" --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
           tar czf "$NAME.tar.gz" "$NAME"
-          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          # Git Bash has sha256sum and no shasum; macOS the other way round.
+          if command -v sha256sum >/dev/null; then sha256sum "$NAME.tar.gz"; else shasum -a 256 "$NAME.tar.gz"; fi > "$NAME.tar.gz.sha256"
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.NAME }}
