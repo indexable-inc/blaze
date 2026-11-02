@@ -184,6 +184,7 @@ pub fn foreign_ask(key: &StdKey) -> Result<ForeignAsk, LoadError> {
         },
         panic_abort: ALWAYS_ABORT.map(str::to_owned).to_vec(),
         is_std: true,
+        macro_wasm: key.macro_wasm,
         out: STD_OUT.to_owned(),
     })
 }
@@ -207,6 +208,10 @@ fn checked(ask: &ForeignAsk, graph: &StdGraph) -> Result<(), String> {
         if ALWAYS_ABORT.contains(&name) && !script && unit.profile.panic != "abort" {
             return Err(format!("`{name}` is built with `panic = \"{}\"`, not `\"abort\"`", unit.profile.panic));
         }
+        let asked = crate::schema::BuiltFor { platform: Some(&ask.triple), macro_wasm: ask.macro_wasm };
+        if unit.platform.is_some() && unit.built_for() != asked {
+            return Err(format!("the load gave a unit of `{name}` built for {}, in a standard library for {asked}", unit.built_for()));
+        }
     }
     if !graph.roots.iter().map(|(name, _)| name).eq(&ask.roots) {
         let named: Vec<&str> = graph.roots.iter().map(|(name, _)| name.as_str()).collect();
@@ -229,7 +234,7 @@ thread_local! {
 impl Query for StdUnits {
     const KIND: QueryKind = kinds::STD_UNITS;
     const NAME: &'static str = "std units";
-    const PRODUCER: ContentId = producer("blaze v2 cargo std units 6");
+    const PRODUCER: ContentId = producer("blaze v2 cargo std units 7");
     type Key = StdKey;
     /// `Foreign`'s bytes as it wrote them once checked: read as a `CborRef<StdPlanned>`, as a
     /// `Cbor<StdPlanned>` would be, with no second encoding.

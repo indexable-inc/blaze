@@ -43,8 +43,10 @@ CODE = (
     ".clippy.toml",
     # The pinned nightly: compiled into blaze-cargo.
     "harness/toolchain",
-    # The tests job runs it.
+    # The tests job runs it, and holds its failures to the known ones.
     "harness/unittests.py",
+    "harness/failures.py",
+    "harness/known-failures.toml",
     # What fetches and checks the pinned LLVM for the build (.github/actions/blaze). No Nix:
     # neither job reads the flake.
     ".github/scripts/llvm.py",

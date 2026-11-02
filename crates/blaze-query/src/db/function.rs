@@ -1295,14 +1295,7 @@ fn sweep_by_frequency<F: Function>(
     }
     *table.sketch.lock() = Some(sketch);
     let refused = admission::plan(&mut values, cap);
-    let mut evicted = 0;
-    for value in values.iter().skip(cap) {
-        if let Some(row) = table.pages.row::<RowOf<F>>(Id::from_u32(value.key))
-            && evict::<F>(row)
-        {
-            evicted += 1;
-        }
-    }
+    let evicted = evict_held::<F>(storage, index, values.get(cap..).unwrap_or_default());
     table.values.fetch_sub(evicted, Ordering::Relaxed);
     if evicted != 0 {
         counts::add(index, counts::EVICTED, evicted as u64);
@@ -1310,6 +1303,40 @@ fn sweep_by_frequency<F: Function>(
     if refused != 0 {
         counts::add(index, counts::REFUSED, refused as u64);
     }
+}
+
+/// Evictions a sweep spreads over the pool: below it, one thread evicts them.
+const PAR_EVICT: usize = 256;
+
+/// Evicts the values of `gone` (keys of `F`, each once); returns how many held one. An
+/// eviction hashes its value ([`evict`]), which for a big one (a macro expansion's parse and
+/// span map) is most of a sweep, so many go on the pool at once: the rows are distinct, and the
+/// caller's `&mut` of the storage keeps every reader out while the loop runs. A span names the
+/// function and the count, so a write that evicts much says so.
+fn evict_held<F: Function>(storage: &Storage, index: u32, gone: &[Held]) -> usize {
+    if gone.is_empty() {
+        return 0;
+    }
+    let _span =
+        tracing::info_span!(target: "blaze", "lru evict", function = F::NAME, count = gone.len())
+            .entered();
+    let Some(table) = storage.table::<FnTable<F>>(index) else { return 0 };
+    let one = |table: &FnTable<F>, value: &Held| {
+        table.pages.row::<RowOf<F>>(Id::from_u32(value.key)).is_some_and(|row| evict::<F>(row))
+    };
+    if gone.len() < PAR_EVICT {
+        return gone.iter().filter(|value| one(table, value)).count();
+    }
+    let evicted = AtomicUsize::new(0);
+    super::pump_barrier(|| {
+        blaze_graph::par::for_each(gone, |value| {
+            let table = storage.table::<FnTable<F>>(index).expect("the table this sweep walks");
+            if one(table, value) {
+                evicted.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    });
+    evicted.into_inner()
 }
 
 /// [`Eviction::Recency`]: past the cap, the values verified longest ago go.

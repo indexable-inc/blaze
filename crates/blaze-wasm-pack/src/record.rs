@@ -32,6 +32,19 @@ impl ProcMacroExpander for Recorder {
         self.inner.requires_session()
     }
 
+    fn ordered(&self) -> bool {
+        self.inner.ordered()
+    }
+
+    fn speculates(&self, db: &Db, calling_crate: Crate) -> bool {
+        self.inner.speculates(db, calling_crate)
+    }
+
+    // A run ahead records nothing: its call's turn records what it gave.
+    fn speculate(&self, db: &Db, calling_crate: Crate, call: ProcMacroCall<'_>) {
+        self.inner.speculate(db, calling_crate, call);
+    }
+
     fn code(&self) -> Option<base_db::ContentId> {
         self.inner.code()
     }

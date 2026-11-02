@@ -66,6 +66,7 @@ fn policy(level: OptLevel) -> Policy {
         pgo: blaze_codegen::settings::Pgo::None,
         proc_macro_bridge: false,
         report: false,
+        fuel: false,
         heap_to_stack: false,
     }
 }
@@ -113,6 +114,7 @@ fn spec() -> Spec {
         sanitize: Sanitize::default(),
         proc_macro_bridge: false,
         report: false,
+        fuel: false,
         heap_to_stack: false,
     }
 }
@@ -490,6 +492,68 @@ fn a_cached_function_is_new_code_when_what_its_closure_reaches_is() {
     assert_eq!(code("x ^ 1"), code("x ^ 1"));
     assert_eq!(code("x ^ 1"), code("/* a comment */ x  ^\n 1"));
     assert_ne!(code("x ^ 1"), code("x ^ 2"));
+}
+
+/// A cached function whose closure reads `S`, `held`: a raw pointer to the first of a
+/// `[&A, &B]` of `&dyn Tr`, or a `static mut`.
+fn cached_reading(held: &str, read: &str) -> String {
+    format!(
+        r#"
+//- minicore: sized, fn, sync, unsize, coerce_unsized, dispatch_from_dyn, slice
+pub struct Code {{ hash: [u64; 2], name: &'static str }}
+pub fn __blaze_cache_code<F>(_: &F) -> Code {{ loop {{}} }}
+pub trait Tr {{ fn f(&self) -> u32; }}
+pub struct A(pub u32);
+impl Tr for A {{ fn f(&self) -> u32 {{ self.0 }} }}
+pub struct B(pub u32, pub u32);
+impl Tr for B {{ fn f(&self) -> u32 {{ self.1 }} }}
+pub struct P(pub *const &'static (dyn Tr + Sync));
+unsafe impl Sync for P {{}}
+{held}
+fn keep<T>(_: T) {{}}
+pub fn cached(x: u32) -> u32 {{
+    let body = move || {{ keep({read}); x }};
+    let _code = __blaze_cache_code(&body);
+    body()
+}}
+"#
+    )
+}
+
+/// A cached function whose body code identity refuses is a build error naming the function
+/// and the refusal (PR #1603 review, rule 3), from the code generator and from the frontend
+/// both: the closure reads `S`, whose `B` vtable identity finds at no place whose type names
+/// its trait (a raw pointer to the array's first element). Writing a zero hash and running the
+/// function uncached took the slow path in its place. A body that is impure, reading a
+/// `static mut`, still compiles and runs uncached: that is the program's doing.
+#[test]
+fn a_cached_function_whose_body_has_no_code_identity_is_an_error() {
+    use blaze_codegen::backend::Frontend as _;
+    let refused = cached_reading(
+        "const ARR: &[&(dyn Tr + Sync)] = &[&A(1), &B(2, 3)];\n\
+         static S: P = P(ARR as *const [&(dyn Tr + Sync)] as *const &'static (dyn Tr + Sync));",
+        "S.0",
+    );
+    let (db, front) = frontend(&refused);
+    hir_ty::attach_db(db, || {
+        let cached = function(db, "cached");
+        let compiled = crate::compiled_root(db, cached).as_ref().map(|_| ()).map_err(ToString::to_string);
+        let what = compiled.expect_err("the code generator refuses `cached`");
+        assert!(what.contains("cached") && what.contains("no code identity"), "{what}");
+        assert!(what.contains("at no place whose type names its trait"), "{what}");
+        let root = front.root(cached);
+        let origin = front.with(|hir, _| front.origin(hir, fixture::test_crate(&db)));
+        let what = front.describe(&root, &origin).map(|_| ()).expect_err("the frontend refuses `cached`").what;
+        assert!(what.contains("no code identity") && what.contains("at no place whose type names its trait"), "{what}");
+    });
+    let impure = cached_reading("static mut S: u32 = 0;", "unsafe { S }");
+    let (db, _) = frontend(&impure);
+    hir_ty::attach_db(db, || {
+        let compiled = crate::compiled_root(db, function(db, "cached"));
+        if let Err(e) = compiled {
+            panic!("an impure cached function compiles, uncached: {e}");
+        }
+    });
 }
 
 #[test]
@@ -955,6 +1019,60 @@ fn two_allocators_are_named_in_order_of_name() {
             "{first} listed first"
         );
     }
+}
+
+/// A `std` (a lang crate) that depends on both panic runtimes and names neither, as the
+/// toolchain's does.
+const PANIC_RUNTIMES: &str = r#"
+//- minicore: sized
+//- /unwind.rs crate:panic_unwind
+#![feature(panic_runtime)]
+#![panic_runtime]
+//- /abort.rs crate:panic_abort
+#![feature(panic_runtime)]
+#![panic_runtime]
+//- /std.rs crate:std deps:panic_unwind,panic_abort
+#![feature(needs_panic_runtime)]
+#![needs_panic_runtime]
+"#;
+
+/// The panic runtimes the program of `main` links, by name, `main` having `deps` and `-C
+/// panic=<strategy>`.
+fn linked_runtimes(strategy: &str, deps: &str, main: &str) -> Result<Vec<String>, String> {
+    let text = format!("{PANIC_RUNTIMES}//- /main.rs crate:main deps:std{deps} cfg:panic={strategy}\n{main}\nfn main() {{}}\n");
+    let db = fixture::db(&text).into_db();
+    let krate = fixture::test_crate(&db);
+    let mut names: Vec<String> = crate::linked_crates(&db, krate)?
+        .into_iter()
+        .map(|it| crate::fncache::crate_name(&db, it))
+        .filter(|it| it.starts_with("panic_"))
+        .collect();
+    names.sort_unstable();
+    Ok(names)
+}
+
+/// A program links one panic runtime: the one its strategy names, though std depends on
+/// both, or the one it names itself, as rustc's `inject_panic_runtime` and
+/// `activate_injected_dep` choose. Both linked defined `__rust_panic_cleanup` twice, and a
+/// `catch_unwind` cleaned up `panic_unwind`'s exception with `panic_abort`'s (#1611).
+#[test]
+fn a_program_links_the_one_panic_runtime_its_strategy_names() {
+    assert_eq!(linked_runtimes("unwind", "", ""), Ok(vec!["panic_unwind".to_owned()]));
+    assert_eq!(linked_runtimes("abort", "", ""), Ok(vec!["panic_abort".to_owned()]));
+    assert_eq!(
+        linked_runtimes("unwind", ",panic_abort", "extern crate panic_abort;"),
+        Ok(vec!["panic_abort".to_owned()]),
+        "a runtime the program names replaces the injected one"
+    );
+    let text = format!("{PANIC_RUNTIMES}//- /main.rs crate:main deps:std\nfn main() {{}}\n");
+    let db = fixture::db(&text).into_db();
+    assert_eq!(
+        crate::linked_crates(&db, fixture::test_crate(&db)).map(drop),
+        Err("the program of crate `main` has a panic strategy that names no panic runtime: its cfg \
+             has neither `panic = \"unwind\"` nor `panic = \"abort\"`"
+            .to_owned()),
+        "no strategy is an error, never a runtime guessed"
+    );
 }
 
 const SANITIZED: &str = r#"
@@ -1529,7 +1647,7 @@ pub fn roots(x: u32) {
     });
 }
 
-const POINTERS_TO_DYN: &str = r#"
+pub(super) const POINTERS_TO_DYN: &str = r#"
 //- minicore: sized, coerce_unsized, dispatch_from_dyn
 pub trait Tr { fn f(&self) -> u32; }
 pub struct A(pub u32);
@@ -1634,7 +1752,7 @@ fn every_pointer_to_dyn_in_a_constant_points_at_its_vtable() {
     });
 }
 
-const CONSTANT_MEMORY: &str = r#"
+pub(super) const CONSTANT_MEMORY: &str = r#"
 //- minicore: sized, coerce_unsized, dispatch_from_dyn, fn, sync, transmute, copy, manually_drop, phantom_data, pointee, index, slice
 pub trait Tr { fn f(&self) -> u32; }
 pub struct A(pub u32);
@@ -1707,6 +1825,13 @@ pub const ORDER: (&[&u32], OrderP) = {
     (a, OrderP(&arr[1] as *const &'static u32))
 };
 pub fn order() -> (&'static [&'static u32], OrderP) { ORDER }
+pub struct Reordered { pub x: Option<&'static dyn Tr>, pub y: &'static dyn Tr }
+pub struct OrderD(pub *const &'static dyn Tr);
+pub const ORDER_DYN: (&Reordered, OrderD) = {
+    let s: &'static Reordered = &Reordered { x: Some(&F(1)), y: &G(2) };
+    (s, OrderD(&s.y as *const &'static dyn Tr))
+};
+pub fn order_dyn() -> (&'static Reordered, OrderD) { ORDER_DYN }
 fn seven() -> u32 { 7 }
 pub const NUM: ([u64; 4], fn() -> u32) = ([0x0600_0000, 0x0600_0001, 0x0600_0002, 0x0600_0003], seven);
 pub fn num() -> ([u64; 4], fn() -> u32) { NUM }
@@ -1729,6 +1854,12 @@ pub struct Pk<X: ?Sized>(pub u16, pub core::mem::ManuallyDrop<Prefix<X>>);
 pub const PKPRE: &Pk<dyn Tr> =
     &Pk(1, core::mem::ManuallyDrop::new(Prefix(&77, Holder(&K(9) as &dyn Tr))));
 pub fn pkpre() -> &'static Pk<dyn Tr> { PKPRE }
+pub struct In2<X: ?Sized>(pub u8, pub X);
+#[repr(C, packed(2))]
+pub struct PkTail<X: ?Sized>(pub u16, pub core::mem::ManuallyDrop<X>);
+pub const PK_SLICE: &PkTail<In2<[&dyn Tr]>> =
+    &PkTail(1, core::mem::ManuallyDrop::new(In2(2, [&F(3) as &dyn Tr, &G(4)])));
+pub fn pk_slice() -> &'static PkTail<In2<[&'static dyn Tr]>> { PK_SLICE }
 pub const TWO_VIEWS: (&(usize, usize), &&dyn Tr) = {
     let t: &&dyn Tr = &(&A(1) as &dyn Tr);
     (unsafe { core::mem::transmute::<&&dyn Tr, &(usize, usize)>(t) }, t)
@@ -1762,6 +1893,11 @@ pub const TUP: &(u8, dyn Tr) = unsafe {
     core::mem::transmute::<(*const (u8, Holder), *const ()), &(u8, dyn Tr)>((tuple, parts.1))
 };
 pub fn tup() -> &'static (u8, dyn Tr) { TUP }
+pub const NOTHING: (&(), &[u32], &[u8; 0]) = {
+    let e: &'static E3 = &E3([1, 2, 3], []);
+    (&(), &[], &e.1)
+};
+pub fn nothing() -> (&'static (), &'static [u32], &'static [u8; 0]) { NOTHING }
 "#;
 
 /// What the IR of `name`, a function of [`CONSTANT_MEMORY`], asks for as data, each with a
@@ -2091,6 +2227,78 @@ fn interleaved_units_keep_their_own_frame_pointers() {
     assert_eq!(emit(&keeps, second), alone_keeps, "the unit keeping frame pointers");
 }
 
+const SPIN: &str = r#"
+pub fn spin(n: u32) -> u32 {
+    let mut i = 0;
+    loop {
+        if i == n {
+            return i;
+        }
+        i = i + 1;
+    }
+}
+"#;
+
+/// Fuel (#1605) at `backend`: a unit metered for fuel is keyed apart, its function calls
+/// the fuel runtime by its symbols (kept as the template's own outside symbols) and is the
+/// same code every time; with fuel off it names no fuel symbol and is the same code every
+/// time too. That off leaves every key as it was is `Spec::settings`' construction (fuel is
+/// hashed only when on, `blaze_codegen::settings`).
+fn fuel_meters_a_loop_at(spec: Spec) {
+    use blaze_codegen::backend::Prepare;
+    let (db, frontend) = frontend(SPIN);
+    let root = frontend.root(function(&db, "spin"));
+    let refs: Vec<blaze_codegen::Target> = frontend.with(|db, homes| refs_of(db, homes, (&root, false)));
+    let backends = Backends::default();
+    let emit = |spec: &Spec| {
+        super::toolchain::select(&spec.toolchain).expect("the toolchain");
+        let (shape, prepared) =
+            backends.prepare(&frontend, &unit(spec), spec, &root, &refs).unwrap_or_else(|e| panic!("prepared: {e:?}"));
+        let emitted = backends.emit(&unit(spec), spec, prepared, &refs, None);
+        (shape, emitted.unwrap_or_else(|e| panic!("emitted: {e:?}")))
+    };
+    let fuel = |emitted: &blaze_codegen::backend::Emitted| {
+        let mut names: Vec<String> = emitted
+            .function
+            .relocs
+            .targets()
+            .iter()
+            .filter_map(|it| match it {
+                blaze_codegen::Target::Extern(name) if name.starts_with("__blaze_fuel_") => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let on = Spec { fuel: true, ..spec.clone() };
+    assert_ne!(unit(&spec).instance.key(), unit(&on).instance.key(), "fuel is in the unit's key");
+    let ((off_shape, off), (_, again)) = (emit(&spec), emit(&spec));
+    assert_eq!(off.function.code, again.function.code, "unmetered code is the same every time");
+    assert!(fuel(&off).is_empty() && off.extra.is_empty(), "unmetered code calls no fuel runtime");
+    let ((on_shape, metered), (_, again)) = (emit(&on), emit(&on));
+    assert_eq!(metered.function.code, again.function.code, "metered code is the same every time");
+    assert_eq!(fuel(&metered), ["__blaze_fuel_cell", "__blaze_fuel_out"]);
+    let mut extra = metered.extra.clone();
+    extra.sort();
+    assert_eq!(extra, ["__blaze_fuel_cell", "__blaze_fuel_out"], "the template keeps them");
+    assert_ne!(on_shape, off_shape, "the shape covers the metered IR");
+    assert_ne!(metered.function.code, off.function.code);
+}
+
+#[test]
+fn fuel_meters_a_loop() {
+    fuel_meters_a_loop_at(spec());
+}
+
+#[cfg(feature = "llvm")]
+#[test]
+fn fuel_meters_a_loop_in_llvm() {
+    let base = spec();
+    let toolchain = Toolchain { llvm: Some("test".to_owned()), ..base.toolchain.clone() };
+    fuel_meters_a_loop_at(Spec { toolchain, backend: Backend::Llvm { opt: 0 }, ..base });
+}
+
 /// What `name` builds or the error it stops with, and a failure message's description.
 fn datas_or(name: &str) -> Result<Vec<(crate::fragment::DataRequest, String)>, String> {
     constant_datas(name)
@@ -2120,6 +2328,21 @@ fn an_allocation_reached_from_its_middle_is_one_object() {
         words.iter().any(|it| matches!(it[..], [(0, a, 0), (at, b, add)]
             if at == 2 * word && a == b && add == i64::from(word))),
         "`ORDER`'s pointers are not into one object: {}",
+        all_described(&datas)
+    );
+}
+
+/// An allocation whose fields are laid out out of their declared order (`y` first) and that
+/// is reached by its type and by a raw pointer to a field is one object: the two walks find
+/// its vtables in different orders, which are the same relocations.
+#[test]
+fn an_allocation_two_walks_find_in_different_orders_is_one_object() {
+    let datas = datas_or("order_dyn").unwrap_or_else(|e| panic!("`ORDER_DYN` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        points_at_vtable(&datas, &words, word, "G") && points_at_vtable(&datas, &words, 3 * word, "F"),
+        "`Reordered`'s vtables are not relocated: {}",
         all_described(&datas)
     );
 }
@@ -2211,6 +2434,24 @@ fn a_packed_structs_unsized_field_is_at_its_capped_offset() {
     );
 }
 
+/// A slice at the end of a packed struct's nested tail (`PkTail<In2<[&dyn Tr]>>`, packed to
+/// 2) starts where the layout puts it, 2 + 8 = 10 bytes in as rustc has it: a slice's
+/// alignment is its element's, so the layout's offsets already hold the cap `packed` puts on
+/// it, and its `dyn` pointers' vtables are at 10 + a word and 10 + 3 words.
+#[test]
+fn a_slice_in_a_packed_structs_nested_tail_is_at_the_layouts_offset() {
+    let datas = datas_or("pk_slice").unwrap_or_else(|e| panic!("`PK_SLICE` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    let tail = 2 + word;
+    assert!(
+        points_at_vtable(&datas, &words, tail + word, "F")
+            && points_at_vtable(&datas, &words, tail + 3 * word, "G"),
+        "`PK_SLICE`'s vtables are not at the slice's offset: {}",
+        all_described(&datas)
+    );
+}
+
 /// One allocation reached as two types that relocate it differently (`&(usize, usize)` and
 /// `&&dyn Tr`) is refused: the first walk would decide what the second sees.
 #[test]
@@ -2275,4 +2516,14 @@ fn a_tuple_with_a_dyn_tail_is_relocated() {
         "the tuple tail's `&dyn` is not relocated: {}",
         all_described(&datas)
     );
+}
+
+/// A reference to nothing (`&()`, `&[]`, or one past the end of memory const eval did not
+/// keep, `&e.1`, whose provenance says it is a pointer) is its alignment, which the walk by
+/// provenance leaves as it is: there is no memory to point it into.
+#[test]
+fn a_reference_to_nothing_is_its_alignment() {
+    let datas = datas_or("nothing").unwrap_or_else(|e| panic!("`NOTHING` is refused: {e}"));
+    let words = relocated_words(&datas);
+    assert!(words.iter().all(|it| it.is_empty()), "`NOTHING` is relocated: {words:?}");
 }

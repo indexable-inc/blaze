@@ -27,6 +27,19 @@ needs more than the sandbox allows is the only exception, and is made to work ra
 refused where possible: the root manifest's `unsandboxed-build-scripts` and
 `unsandboxed-proc-macros` name it.
 
+The other allowed difference is soundness. Where rustc accepts a program only because of an
+objective bug in rustc, a soundness hole that lets safe code cause undefined behavior or another
+clear safety defect, blaze refuses it with a hard error that names the hole. The first is
+[rust-lang/rust#25860](https://github.com/rust-lang/rust/issues/25860): implied bounds dropped
+when a function is coerced to a higher-ranked function pointer, which the cve-rs crate turns into
+use-after-free with no `unsafe`. A program like that has no defined behavior to keep the same, so
+refusing it narrows nothing a correct program relies on. A disagreement with rustc's design is not
+such a bug; this exception covers only holes the Rust project itself treats as unsound
+(`I-unsound`) or that plainly break memory safety.
+
+Andrew, 2026-11-02: "hard error ... revise superset UNLESS there is a safety issue / objective
+issue w rustc."
+
 Andrew, 2026-10-24: "we want to be a superset of Rust (i.e., any existing Rust program should
 work, minus a proc macro that isn't sandboxed, which it should be tbh)."
 

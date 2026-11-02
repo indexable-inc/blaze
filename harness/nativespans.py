@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Native proc macros answer source queries across edits and restarts as from nothing (#823).
+"""Proc macros answer source queries across edits and restarts as from nothing (#823).
 
-The same derive asks for line/column, source text, byte range and file. Under one daemon, both
-the native opt-out and the default wasm path must print what `blaze run` of the same source
-prints from nothing (a home, store and target directory of its own). Moving and renaming the
-item, then restarting with the expansion store intact, must not reuse an old answer.
+The same derive asks for line/column, source text, byte range and file. Under one daemon, the
+macro, run as a wasm module as every build runs it, must print what `blaze run` of the same
+source prints from nothing (a home, store and target directory of its own). Moving and renaming
+the item, then restarting with the expansion store intact, must not reuse an old answer. Its
+native arm is gone: it set `BLAZE_PROC_MACRO_WASM`, which v2 never read, so it ran the wasm
+path twice, and no build runs a macro natively any more.
 """
 import os, shutil, subprocess, tempfile
 
@@ -52,30 +54,29 @@ def main():
         return ran.stdout
 
     try:
-        for mode in ("0", "1"):
-            base = base_env(os.path.join(work, "home-" + mode))
-            base["BLAZE_PROC_MACRO_WASM"] = mode
-            # No opt-in to the bidirectional protocol is supplied by the user.
-            base.pop("RUST_ANALYZER_USE_POSTCARD", None)
-            for lines, name in ((5, "Here"), (93, "Here"), (17, "Renamed")):
-                source = "\n" * lines + f"#[derive(asker::Where)]\nstruct {name};\nfn main() {{ {name}::place(); }}\n"
-                write(at, "src/main.rs", source)
-                expected = from_scratch()
-                ours = run(["blaze", "run", "-q"])
-                assert ours == expected, f"mode {mode}, line {lines}, {name}: {ours!r} != {expected!r}"
-                print(f"  wasm={mode}, {name} after {lines} lines: {ours.strip()}", flush=True)
-            run(["blaze", "stop"])
+        base = base_env(os.path.join(work, "home"))
+        # No opt-in to the bidirectional protocol is supplied by the user.
+        base.pop("RUST_ANALYZER_USE_POSTCARD", None)
+        expected = None
+        for lines, name in ((5, "Here"), (93, "Here"), (17, "Renamed")):
+            source = "\n" * lines + f"#[derive(asker::Where)]\nstruct {name};\nfn main() {{ {name}::place(); }}\n"
+            write(at, "src/main.rs", source)
+            expected = from_scratch()
             ours = run(["blaze", "run", "-q"])
-            assert ours == expected, f"mode {mode}, kept store: {ours!r} != {expected!r}"
-            print(f"  wasm={mode}, restart with store: as from nothing", flush=True)
-            run(["blaze", "stop"])
+            assert ours == expected, f"line {lines}, {name}: {ours!r} != {expected!r}"
+            print(f"  {name} after {lines} lines: {ours.strip()}", flush=True)
+        run(["blaze", "stop"])
+        ours = run(["blaze", "run", "-q"])
+        assert ours == expected, f"kept store: {ours!r} != {expected!r}"
+        print("  restart with store: as from nothing", flush=True)
+        run(["blaze", "stop"])
         passed = True
     finally:
         if base:
             subprocess.run(["blaze", "stop"], cwd=at, env=base, capture_output=True)
         if passed:
             shutil.rmtree(work)
-    print("PASS: native and wasm source queries, edits and kept store", flush=True)
+    print("PASS: wasm source queries, edits and kept store", flush=True)
 
 
 if __name__ == "__main__":

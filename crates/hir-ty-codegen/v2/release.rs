@@ -409,6 +409,8 @@ fn emitted(
         Ok::<_, String>((converted, side))
     });
     let (converted, side) = converted.map_err(|e| failed(unit, e))?;
+    let mut extra = extra;
+    super::backend::fuel_externs(&converted, &mut extra);
     Ok(Emitted { function: converted, side: side.map(|it| it.0), extra })
 }
 
@@ -926,6 +928,7 @@ mod tests {
             // A release image links native code: no proc macro's module.
             proc_macro_bridge: false,
             report: false,
+            fuel: false,
             heap_to_stack: false,
         }
     }

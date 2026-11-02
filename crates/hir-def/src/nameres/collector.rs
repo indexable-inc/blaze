@@ -146,17 +146,6 @@ pub(super) fn collect_defs(
     (def_map, local_def_map)
 }
 
-/// Computes the item tree of each of `calls`' expansions as one batch of the database's tasks
-/// ([`Db::run_all`]). The results are left in the database, where the collection
-/// reads them in the round's order.
-fn expand_all(db: &Db, krate: Crate, calls: &[MacroCallId]) {
-    if calls.len() > 1 {
-        db.run_all(Tag::Expand, calls.len(), |db, at| {
-            file_item_tree(db, calls[at].into(), krate);
-        });
-    }
-}
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum PartialResolvedImport {
     /// None of any namespaces is resolved
@@ -2715,32 +2704,16 @@ impl<'db> DefCollector<'db> {
         res
     }
 
-    /// Expands the macros a round resolved as one batch of plane tasks, before
-    /// `collect_macro_expansion` collects them one at a time in the round's order. An expansion
-    /// is a query of its call alone, so which task runs it when changes no result, and
-    /// collecting in the round's order keeps the def map the same whatever the scheduling.
-    ///
-    /// A proc macro that keeps a session sees its calls in the order rustc makes them, so its
-    /// calls are left to the collection, in order.
+    /// Expands the macros a round resolved as batches of plane tasks
+    /// ([`super::batch::expand_round`]), before `collect_macro_expansion` collects them one at
+    /// a time in the round's order.
     fn expand_round(&mut self, resolved: &[ResolvedCall]) {
-        let db = self.db;
         let limit = self.def_map.recursion_limit();
-        let in_session = |call: MacroCallId| {
-            let def = call.loc(db).def;
-            matches!(
-                def.kind,
-                MacroDefKind::ProcMacro(_, exp, _) if exp.requires_session(db, def.krate)
-            )
-        };
         let mut calls = mem::take(&mut self.round_calls);
         calls.extend(
-            resolved
-                .iter()
-                .filter(|&&(_, depth, ..)| depth <= limit)
-                .map(|&(_, _, _, call, _)| call)
-                .filter(|&call| !in_session(call)),
+            resolved.iter().filter(|&&(_, depth, ..)| depth <= limit).map(|&(_, _, _, call, _)| call),
         );
-        expand_all(db, self.def_map.krate, &calls);
+        super::batch::expand_round(self.db, self.def_map.krate, &calls);
         calls.clear();
         self.round_calls = calls;
     }

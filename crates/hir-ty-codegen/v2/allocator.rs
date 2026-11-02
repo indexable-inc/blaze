@@ -43,7 +43,7 @@ pub(super) fn shim(
     let Some(boxed) = DbInterner::new_with(db, krate).lang_items().OwnedBox else {
         return Ok(Vec::new()); // alloc: empty, allocates nothing
     };
-    let program = linked_crates(db, [krate]);
+    let program = linked_crates(db, krate)?;
     if !program.contains(&boxed.krate(db)) {
         return Ok(Vec::new()); // alloc: empty, allocates nothing
     }
@@ -104,7 +104,7 @@ fn two_allocators(db: &Db, a: Crate, b: Crate) -> String {
 /// does not build, which compiling the export then reports): `false`, logged under target
 /// `blaze` with why. Two allocators are the error the shim gives too ([`shim`]).
 pub fn allocations_unobserved(db: &Db, krate: Crate) -> Result<bool, String> {
-    let program = linked_crates(db, [krate]);
+    let program = linked_crates(db, krate)?;
     let mut declared = program.iter().copied().filter(|&it| declares_global_allocator(db, it));
     let Some(allocator) = declared.next() else { return Ok(true) };
     if let Some(other) = declared.next() {

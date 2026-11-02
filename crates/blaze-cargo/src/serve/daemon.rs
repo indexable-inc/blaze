@@ -16,10 +16,10 @@
 //! - A stop writes the image, waits for it to be mapped, then stops listening and hangs up.
 //! - The explorer, the live feed and live SQL are answered by the loop itself ([`Observe`]);
 //!   each build that ends goes to the profile history's thread. A build whose tasks run while
-//!   no span closes for [`Watchdog::BOUND`], no query completes for [`Watchdog::QUERY_BOUND`],
-//!   or no unit's step ends for [`Watchdog::STEP_BOUND`] fails with the stall, whose trace is
-//!   written to the state's `stalls/`, and the daemon stops: its workers may be deadlocked or
-//!   going around without end, and cannot be got back.
+//!   no span closes, no query completes and no task or unit's step ends for the stall bound
+//!   ([`Options::stall`], [`Watchdog::BOUND`] unless `blaze serve --stall-bound` names another)
+//!   fails with the stall, whose trace is written to the state's `stalls/`, and the daemon
+//!   stops: its workers may be deadlocked, and cannot be got back.
 
 #![forbid(unsafe_code)]
 
@@ -32,10 +32,10 @@ use std::{
 
 use blaze_api::{
     ApiError, Arrived, Reply, Request,
-    server::{Config as ServerConfig, Http, Server, Unix},
+    server::{Abandoned, Config as ServerConfig, Http, Server, Unix},
     session::{self, Session},
 };
-use blaze_profile::{Plot, Watchdog, watchdog::still};
+use blaze_profile::{Plot, Watchdog, watchdog::Progress};
 use blaze_cas::Store;
 use blaze_core::{Address, Completion, Done, Driver, Effect, FileName, Mapping, Tag};
 use blaze_graph::{Budget, PlaneConfig, arena};
@@ -91,8 +91,9 @@ const STALL: Tag = Tag(OWN + 9);
 /// The image's write and its map ([`Images`]).
 const IMAGE: u64 = OWN + 10;
 
-/// How long a stop waits for the driver's last effects once it hung up.
-const LAST_EFFECTS: Duration = Duration::from_secs(2);
+/// How long a stop waits for the driver's last effects once it hung up: past it, the
+/// connections still sending are hung up on ([`Server::abandon`]) and named in a warning.
+pub(super) const LAST_EFFECTS: Duration = Duration::from_secs(2);
 /// How often the plane's and the memory's plots are written to the flight recorder, at most.
 const PLOT_EVERY: Duration = Duration::from_millis(10);
 /// How often the memory by tag goes to the log while the daemon works, at most.
@@ -100,6 +101,9 @@ const MEMORY_LOG_EVERY: Duration = Duration::from_secs(30);
 /// How long a build may have nothing that can move it before it fails with [`Still`]: past
 /// the loop's longest turn and a worker's wake, short of anyone waiting on it.
 const STILL_FOR: Duration = Duration::from_secs(2);
+/// How long one unit's step runs, while no other ends, before what every thread is inside is
+/// written to the log ([`Daemon::watch`]): a warning, never a failure.
+const LONG_STEP: Duration = Duration::from_secs(300);
 /// The most nodes a [`Still`] names one by one.
 const STILL_NAMED: usize = 64;
 
@@ -253,6 +257,10 @@ pub struct Options {
     /// The table of directories outside views that user code's checks read
     /// ([`blaze_vfs::outside::dirs`]); the daemon drives its watches for its whole life.
     pub outside: &'static blaze_vfs::outside::Dirs,
+    /// How long no span may close, no query complete and no task or unit's step end while the
+    /// plane's tasks run before the build fails with the stall ([`Daemon::watch`]):
+    /// [`Watchdog::BOUND`] unless `blaze serve --stall-bound SECS` says.
+    pub stall: Duration,
     /// The socket systemd or launchd passed (`blaze serve --activated`), listened on in place
     /// of one made at `socket`, where it must be bound. Its file is the manager's.
     #[cfg(unix)]
@@ -305,6 +313,8 @@ pub struct Daemon<D: Driver, S: Steps> {
     stopping: Option<Stopping>,
     /// A `blaze stop` arrived: the daemon stops once its answer is sent.
     stop_asked: bool,
+    /// What the stop hung up on when [`LAST_EFFECTS`] passed with replies still being sent.
+    abandoned: Option<Abandoned>,
     settling: bool,
     failed: Option<Failed>,
     pid: u32,
@@ -314,14 +324,15 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// Its state directory, in whose `stalls/` a stall's trace is written.
     state: FileName,
     observe: Observe,
-    /// The stall watchdogs ([`Daemon::watch`]): of spans closed, of queries completed, of
-    /// unit's steps ended.
+    /// The stall watchdog ([`Daemon::watch`]): of spans closed, queries completed and tasks
+    /// and unit's steps ended, all at once, at [`Options::stall`].
     watchdog: Watchdog,
-    query_watch: Watchdog,
-    step_watch: Watchdog,
-    /// Of unit's steps ended, at half [`Watchdog::STEP_BOUND`]: what every thread is inside is
-    /// written to the log once a quiet stretch, and nothing fails.
+    /// Of the same, at half that bound: what every thread is inside is written to the log once
+    /// a quiet stretch, and nothing fails.
     dump_watch: Watchdog,
+    /// Of unit's steps ended alone, at [`LONG_STEP`]: what every thread is inside is written to
+    /// the log once a long step, and nothing fails, as other work moves meanwhile.
+    step_watch: Watchdog,
     /// Since when nothing could move a build ([`Daemon::still`]), on the driver's clock.
     still_since: Option<u64>,
     /// The effects in flight that end on their own, by tag ([`ends_alone`]): what can still
@@ -934,6 +945,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             spare: Spare::default(),
             stopping: None,
             stop_asked: false,
+            abandoned: None,
             settling: false,
             failed: None,
             pid: std::process::id(),
@@ -941,10 +953,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             started,
             state,
             observe,
-            watchdog: Watchdog::new(Watchdog::BOUND),
-            query_watch: Watchdog::new(Watchdog::QUERY_BOUND),
-            step_watch: Watchdog::new(Watchdog::STEP_BOUND),
-            dump_watch: Watchdog::new(Watchdog::STEP_BOUND / 2),
+            watchdog: Watchdog::new(options.stall),
+            dump_watch: Watchdog::new(options.stall / 2),
+            step_watch: Watchdog::new(LONG_STEP),
             still_since: None,
             ending: blaze_hash::HashMap::new_in(std::alloc::Global),
             settled: 0,
@@ -996,6 +1007,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
 
     pub fn driver(&mut self) -> &mut D {
         &mut self.driver
+    }
+
+    /// What the stop hung up on once [`LAST_EFFECTS`] passed with replies still being sent:
+    /// the clients that never got the end of their answers. `None` when every send ended.
+    pub fn abandoned(&self) -> Option<&Abandoned> {
+        self.abandoned.as_ref()
     }
 
     /// The driver, the daemon let go: what a restart starts on.
@@ -1057,6 +1074,18 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     #[cfg(test)]
     pub(super) fn flush_store_for_test(&mut self) {
         self.store.flush(&mut self.effects);
+    }
+
+    /// Holds every thread task of `kind` on the simulation's runner, still running, while
+    /// `held`, and lets them run from the next turn once not ([`super::plane::Inline::hold`]): a
+    /// task that runs long, as a large front end's store does on a worker.
+    #[cfg(test)]
+    pub(super) fn hold_tasks_for_test(&mut self, kind: blaze_graph::admission::TaskKind, held: bool) {
+        match self.plane.runner_mut() {
+            Runner::Inline(runner) if held => runner.hold(kind),
+            Runner::Inline(runner) => runner.release(kind),
+            Runner::Threads(_) => panic!("holding the tasks of {kind:?} needs the simulation's inline runner, not threads"),
+        }
     }
 
     /// The standard library's store, shared with this build's other daemons.
@@ -1217,12 +1246,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
     }
 
-    /// The stall watchdogs' turn: once the plane's tasks run and what one counts has not moved
-    /// for its bound (spans closed, queries completed, unit's steps ended), every job with a
-    /// plane request under way fails with the stall, its trace is written to the state
-    /// directory, and the daemon stops. At half the steps' bound, what every thread is inside
-    /// is written to the log first, so a client's own watchdog that stops the daemon sooner
-    /// still finds it.
+    /// The stall watchdog's turn: once the plane's tasks run and none of its counts (spans
+    /// closed, every pool job's among them; queries completed; tasks and unit's steps ended)
+    /// has moved for the stall bound, every job with a plane request under way fails with the
+    /// stall, its trace is written to the state directory, and the daemon stops. A step or a
+    /// span that runs long while anything else moves is no stall. At half the bound, what
+    /// every thread is inside is written to the log first, so a client's own watchdog that
+    /// stops the daemon sooner still finds it; so it is too once a step runs [`LONG_STEP`].
     fn watch(&mut self) {
         self.still();
         if self.failed.is_some() {
@@ -1231,20 +1261,27 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let running = self.plane.running();
         let busy = running > 0;
         let now = ns(self.driver.now());
-        let spans = blaze_profile::flight::progress() + self.settled;
-        let queries = blaze_query::db::completed() + self.settled;
-        if let Some(quiet) = self.dump_watch.tick(now, self.settled, busy) {
+        let progress = Progress {
+            spans: blaze_profile::flight::progress(),
+            queries: blaze_query::db::completed(),
+            steps: self.settled,
+        };
+        let steps = Progress { steps: self.settled, ..Progress::default() };
+        if let Some(quiet) = self.step_watch.tick(now, steps, busy) {
             let secs = quiet.for_ns / 1_000_000_000;
-            tracing::warn!("no unit's step ended for {secs} s: {}", blaze_profile::watchdog::running());
+            tracing::warn!("no unit's step ended for {secs} s, {progress}: {}", blaze_profile::watchdog::running());
         }
-        let found = [
-            (self.watchdog.tick(now, spans, busy), still::SPANS),
-            (self.query_watch.tick(now, queries, busy), still::QUERIES),
-            (self.step_watch.tick(now, self.settled, busy), still::STEPS),
-        ];
-        let found = found.into_iter().find_map(|(quiet, what)| Some((quiet?, what)));
-        let Some((quiet, what)) = found else { return };
-        let stall = blaze_profile::watchdog::stall(quiet, running, what);
+        if let Some(quiet) = self.dump_watch.tick(now, progress, busy) {
+            let secs = quiet.for_ns / 1_000_000_000;
+            let bound = self.watchdog.bound().as_secs();
+            tracing::warn!(
+                "{} for {secs} s of the stall bound's {bound} s, {progress}: {}",
+                blaze_profile::watchdog::STILL,
+                blaze_profile::watchdog::running()
+            );
+        }
+        let Some(quiet) = self.watchdog.tick(now, progress, busy) else { return };
+        let stall = blaze_profile::watchdog::stall(quiet, running);
         let said = stall.to_string();
         tracing::error!("{said}");
         let file = under(&self.state, &format!("stalls/{now}.json"));
@@ -1727,7 +1764,30 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 self.server.stop(&mut self.effects);
                 self.stopping = Some(Stopping::Hangup { at: now });
             }
-            Some(Stopping::Hangup { at }) if self.driver.in_flight() == 0 || now.saturating_sub(at) > LAST_EFFECTS => {
+            Some(Stopping::Hangup { .. }) if self.driver.in_flight() == 0 => {
+                self.stopping = Some(Stopping::Over);
+            }
+            Some(Stopping::Hangup { at }) if now.saturating_sub(at) > LAST_EFFECTS => {
+                // The bound, not the last effect, ended the wait: a client that stopped reading
+                // still has its answer's send in flight. Hang up on it, and say who lost what.
+                let in_flight = self.driver.in_flight();
+                let mut arrived = self.spare.arrived.pop().unwrap_or_default();
+                let abandoned = self.server.abandon(&mut self.effects, &mut arrived);
+                match abandoned.conns.is_empty() {
+                    true => tracing::info!(target: "blaze", in_flight, "the stop's last effects outlasted {LAST_EFFECTS:?}; no connection was still being answered"),
+                    false => tracing::warn!(
+                        target: "blaze",
+                        in_flight,
+                        conns = abandoned.conns.len(),
+                        unsent_bytes = abandoned.unsent_bytes,
+                        "the stop waited {LAST_EFFECTS:?} for its last replies to be sent and gave up: {abandoned}"
+                    ),
+                }
+                for it in arrived.drain(..) {
+                    self.arrive(it);
+                }
+                self.spare.arrived.push(arrived);
+                self.abandoned = (!abandoned.conns.is_empty()).then_some(abandoned);
                 self.stopping = Some(Stopping::Over);
             }
             _ => {}

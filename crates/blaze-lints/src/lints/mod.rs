@@ -951,8 +951,16 @@ mod tests {
             !default.intersects(crate::level::BLAZE_INTERNAL),
             "blaze's internal lints are allowed until turned on"
         );
-        assert!(!command_line_on(&flags("-A clippy::all")).intersects(clippy_where(|it| it.group.in_all())));
-        let on = command_line_on(&flags("-A clippy::all -A blaze::general -W clippy::dbg_macro -D blaze::hot_alloc"));
+        // Every check is on by default but restriction's: pedantic and nursery warn too.
+        assert!(default.intersects(Implemented::NeedlessPassByValue.bit()), "pedantic warns by default");
+        assert!(default.intersects(Implemented::RedundantClone.bit()), "nursery warns by default");
+        let without_all = command_line_on(&flags("-A clippy::all"));
+        assert!(!without_all.intersects(clippy_where(|it| it.group.in_all())));
+        assert!(without_all.intersects(Implemented::RedundantClone.bit()), "`clippy::all` is clippy's five groups only");
+        let on = command_line_on(&flags(&format!(
+            "{} -A blaze::general -W clippy::dbg_macro -D blaze::hot_alloc",
+            crate::tests::CLIPPY_OFF
+        )));
         assert_eq!(named(on), ["dbg_macro", "blaze::hot_alloc"]);
     }
 }

@@ -80,6 +80,32 @@ pub(super) enum Category {
     /// A region of a returned `impl Trait`'s hidden type outliving the lifetime chosen for
     /// it, rustc's `OpaqueType`.
     Opaque,
+    /// A bound the signature under a `for<'a>` implies, proven where the binder is
+    /// instantiated to relate it with a more general one: one of `Regions::dropped_bounds`.
+    /// rustc proves none of them there (rust-lang/rust#25860).
+    ImpliedBound,
+}
+
+/// A bound a fn signature's `for<'a>` implies, `'b: 'a` of `&'a &'b ()`, that relating it with a
+/// more general signature (a function coerced to a higher-ranked fn pointer, or one fn pointer
+/// a subtype of another) must prove: rustc drops it, rust-lang/rust#25860, the hole cve-rs
+/// builds use-after-free on in safe code. Its regions are the instantiated signature's.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DroppedBound<'db> {
+    /// The region that must outlive `sub`, or `None` where `subject` must.
+    pub(super) sup: Option<Rv>,
+    pub(super) subject: Option<Ty<'db>>,
+    pub(super) sub: Rv,
+    /// The two regions as the source signature names them: a region of its `for<'a>` as
+    /// bound there, `'static`, or `None` for one of the body's.
+    pub(super) longer: Option<Region<'db>>,
+    pub(super) shorter: Option<Region<'db>>,
+    /// The function coerced, when it is a function item.
+    pub(super) function: Option<CallableDefId>,
+    /// The signature that loses the bound, and the one it is related with.
+    pub(super) source: Ty<'db>,
+    pub(super) target: Ty<'db>,
+    pub(super) span: MirSpan,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -201,9 +227,30 @@ pub(super) struct Regions<'f, 'db> {
     /// A variable a function item or constructor is called through, read at the call: rust-
     /// analyzer lowers `f(x)` with `let f = Foo::<&'a u32>` as a call of the item itself.
     pub(super) callee_reads: FVec<'f, (LocalId, Location)>,
+    /// What relating a signature's `for<'a>` with a more general one needs of it, each an
+    /// `ImpliedBound` constraint or a type test (rust-lang/rust#25860).
+    pub(super) dropped_bounds: FVec<'f, DroppedBound<'db>>,
 }
 
 impl<'f, 'db> Regions<'f, 'db> {
+    /// The bound an `ImpliedBound` constraint `sup: sub` proves.
+    pub(super) fn dropped_bound(&self, sup: Rv, sub: Rv) -> Option<&DroppedBound<'db>> {
+        self.dropped_bounds.iter().find(|it| it.sup == Some(sup) && it.sub == sub)
+    }
+
+    /// The bound the type test `ty: lower` at `span` proves, if it is one of a signature's
+    /// `for<'a>`.
+    pub(super) fn dropped_type_bound(
+        &self,
+        ty: Ty<'db>,
+        lower: Rv,
+        span: MirSpan,
+    ) -> Option<&DroppedBound<'db>> {
+        self.dropped_bounds
+            .iter()
+            .find(|it| it.subject == Some(ty) && it.sub == lower && it.span == span)
+    }
+
     pub(super) fn universal(&self, rv: Rv) -> Option<usize> {
         match self.universal_index.get(rv) {
             Some(&at) if at != u32::MAX => Some(at as usize),
@@ -247,6 +294,41 @@ pub(super) fn rv_of(region: Region<'_>) -> Option<Rv> {
         RegionKind::ReVar(vid) => Some(vid.as_usize()),
         _ => None,
     }
+}
+
+/// `ty` with every alias in it marked not rigid. Whether the solver has found an alias rigid
+/// (it could not normalize it further) says nothing of which type it is, and the bounds a type
+/// test is checked against come from both sides: `&Self::Output` of
+/// `impl<I: SliceIndex<[Value]>> Index<I> for Array` normalizes, for its implied bound, to a
+/// rigid `<I as SliceIndex<[Value]>>::Output`, while the callee's signature it is tested
+/// against names the same projection as lowered, not rigid (sonic-rs's `Array::index`, E0311).
+/// Type bounds and type tests hold their types in this form so that equality is the type's.
+pub(super) fn unrigid<'db>(interner: hir_ty::next_solver::DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
+    struct Unrigid<'db>(hir_ty::next_solver::DbInterner<'db>);
+    impl<'db> rustc_type_ir::TypeFolder<hir_ty::next_solver::DbInterner<'db>> for Unrigid<'db> {
+        fn cx(&self) -> hir_ty::next_solver::DbInterner<'db> {
+            self.0
+        }
+
+        fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+            use rustc_type_ir::{TypeSuperFoldable as _, TypeVisitableExt as _, inherent::Ty as _};
+            if !ty.has_aliases() {
+                return ty;
+            }
+            let ty = ty.super_fold_with(self);
+            match ty.kind() {
+                TyKind::Alias(rustc_type_ir::IsRigid::Yes, alias) => {
+                    Ty::new_alias(self.0, rustc_type_ir::IsRigid::No, alias)
+                }
+                _ => ty,
+            }
+        }
+    }
+    use rustc_type_ir::TypeVisitableExt as _;
+    if !ty.has_aliases() {
+        return ty;
+    }
+    rustc_type_ir::TypeFoldable::fold_with(ty, &mut Unrigid(interner))
 }
 
 /// Each region in `ty`, in order, those under a binder aside.
@@ -542,6 +624,7 @@ pub(super) fn build<'a, 'db>(
             returns_static_opaque: false,
             callee_reads: Vec::new_in(frame),
             choices: Vec::new_in(frame),
+            dropped_bounds: Vec::new_in(frame),
         },
         requirements,
         early: mem::map(frame),
@@ -562,6 +645,8 @@ pub(super) fn build<'a, 'db>(
         synthesized: synthesized(ctx),
         placeholders: mem::map(frame),
         relate_universes: mem::set(frame),
+        assumed: Vec::new_in(frame),
+        coercing: None,
         elided: std::cell::RefCell::new(mem::set(frame)),
         scratch: Scratch::new(frame),
     };
@@ -660,6 +745,13 @@ struct Builder<'c, 'a, 'db> {
     placeholders: FMap<'a, Region<'db>, Region<'db>>,
     /// The universes made to relate two types' `for<'a>`.
     relate_universes: FSet<'a, rustc_type_ir::UniverseIndex>,
+    /// What the more general side of relating two signatures' `for<'a>` implies of its
+    /// placeholders, `'b: 'a` of `for<'a, 'b> fn(&'a &'b ())`, known as a where clause is: its
+    /// callers prove it, as every call proves its signature well-formed.
+    assumed: FVec<'a, (Rv, Rv)>,
+    /// The function item a `ReifyFnPointer` cast relates, with the type it is cast to as
+    /// written and the item's signature as the fn pointer related, while it does.
+    coercing: Option<(CallableDefId, Ty<'db>, Ty<'db>)>,
     /// The region variables given the error regions rust-analyzer leaves for elided lifetimes,
     /// each a late-bound lifetime of its own in rustc: the fn pointer two fn items or closures
     /// coerce to, `if r { up } else { down }`, is `for<'a> fn(&'a T)` there.
@@ -2535,6 +2627,13 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         for ty in signature {
             self.implied_bounds(ty, &mut pairs, &mut seen, 0, false);
         }
+        // Every type bound is in, from the where clauses and what the signature implies.
+        let interner = self.interner();
+        for bound in self.regions.type_bounds.iter_mut() {
+            bound.0 = unrigid(interner, bound.0);
+        }
+        // And what the more general side of each `for<'a>` related implies of its placeholders.
+        pairs.extend(self.assumed.iter().copied());
         let count = self.regions.universals.len();
         let mut known = matrix(self.ctx.frame, count, count);
         let static_index = self.regions.universal(self.regions.static_rv).unwrap();
@@ -3251,7 +3350,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             };
             if let Some(ty) = requirement.subject {
                 self.regions.type_tests.push(TypeTest {
-                    ty,
+                    ty: unrigid(self.interner(), ty),
                     lower: sub,
                     span: requirement.span,
                     forall: false,
@@ -3349,6 +3448,155 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         )
     }
 
+    /// What the `for<'a>` of the less general side of relating two signatures implies, proven
+    /// for the variables it was instantiated with, where the more general side's placeholders
+    /// are known to have what its own signature implies of them: the types team's where clauses
+    /// on binders (rust-lang/rust#25860). rustc drops these, so a function whose signature
+    /// implies `'b: 'a` (`&'a &'b ()`) coerces to `for<'x> fn(_, &'x T) -> &'b T` and turns any
+    /// lifetime into any other in safe code (cve-rs). Each bound is an `ImpliedBound`
+    /// constraint, or a type test, recorded in `Regions::dropped_bounds` for its error.
+    fn binder_implied_bounds(
+        &mut self,
+        (source, sig, specific): (
+            Ty<'db>,
+            rustc_type_ir::Binder<
+                hir_ty::next_solver::DbInterner<'db>,
+                rustc_type_ir::FnSigTys<hir_ty::next_solver::DbInterner<'db>>,
+            >,
+            hir_ty::next_solver::Tys<'db>,
+        ),
+        (target, general): (Ty<'db>, hir_ty::next_solver::Tys<'db>),
+        at: At,
+    ) {
+        let interner = self.interner();
+        if sig.bound_vars().is_empty() {
+            return;
+        }
+        // Each variable the less general side's `for<'a>` was instantiated with, by the bound
+        // region it stands for: the two signatures walked in step, region by region.
+        let mut bound: FVec<'_, Option<Region<'db>>> = Vec::new_in(self.ctx.frame);
+        rustc_type_ir::fold_regions(interner, sig.skip_binder().inputs_and_output, |r, depth| {
+            bound.push(match r.kind() {
+                RegionKind::ReBound(rustc_type_ir::BoundVarIndexKind::Bound(binder), _)
+                    if binder == depth =>
+                {
+                    Some(r)
+                }
+                _ => None,
+            });
+            r
+        });
+        let mut existentials: FVec<'_, (Rv, Region<'db>)> = Vec::new_in(self.ctx.frame);
+        let mut position = 0;
+        rustc_type_ir::fold_regions(interner, specific, |r, _| {
+            if let Some(Some(bound)) = bound.get(position)
+                && let Some(rv) = rv_of(r)
+                && !existentials.iter().any(|it| it.0 == rv)
+            {
+                existentials.push((rv, *bound));
+            }
+            position += 1;
+            r
+        });
+        if existentials.is_empty() {
+            return;
+        }
+        // The more general side's placeholders as their universal regions, and what its
+        // signature implies of them assumed.
+        let mut placeholders: FVec<'_, Rv> = Vec::new_in(self.ctx.frame);
+        let general = rustc_type_ir::fold_regions(interner, general, |r, _| match r.kind() {
+            RegionKind::RePlaceholder(_) => {
+                let universal = self.placeholder(r);
+                placeholders.extend(rv_of(universal));
+                universal
+            }
+            _ => r,
+        });
+        let start = self.regions.type_bounds.len();
+        let mut pairs = Vec::new_in(self.ctx.frame);
+        let mut seen = mem::set(self.ctx.frame);
+        for ty in general.iter() {
+            self.implied_bounds(ty, &mut pairs, &mut seen, 0, false);
+        }
+        let mut kept = start;
+        for index in start..self.regions.type_bounds.len() {
+            let it = self.regions.type_bounds[index];
+            if placeholders.contains(&it.1) {
+                self.regions.type_bounds[kept] = it;
+                kept += 1;
+            }
+        }
+        self.regions.type_bounds.truncate(kept);
+        self.assumed.extend(
+            pairs.drain(..).filter(|(a, b)| placeholders.contains(a) || placeholders.contains(b)),
+        );
+        // What the less general side implies of its variables, proven.
+        let start = self.regions.type_bounds.len();
+        seen.clear();
+        for ty in specific.iter() {
+            self.implied_bounds(ty, &mut pairs, &mut seen, 0, false);
+        }
+        let mut subjects: FVec<'_, (Ty<'db>, Rv)> = Vec::new_in(self.ctx.frame);
+        subjects.extend(self.regions.type_bounds.drain(start..));
+        let static_rv = self.regions.static_rv;
+        let named = |rv: Rv| match existentials.iter().find(|it| it.0 == rv) {
+            Some(&(_, bound)) => Some(bound),
+            None if rv == static_rv => Some(Region::new_static(interner)),
+            None => None,
+        };
+        let of_binder = |rv: Rv| existentials.iter().any(|it| it.0 == rv);
+        // Named as the function and the type written, for the item's own signature.
+        let coercing = self.coercing.filter(|it| it.2 == source);
+        let function = coercing.map(|it| it.0);
+        let target = coercing.map_or(target, |it| it.1);
+        let at = At { category: Category::ImpliedBound, span: at.span };
+        for (longer, shorter) in pairs.drain(..) {
+            if longer == shorter || !(of_binder(longer) || of_binder(shorter)) {
+                continue;
+            }
+            if !self.regions.dropped_bounds.iter().any(|it| {
+                it.sup == Some(longer) && it.sub == shorter && it.span == at.span
+            }) {
+                self.regions.dropped_bounds.push(DroppedBound {
+                    sup: Some(longer),
+                    subject: None,
+                    sub: shorter,
+                    longer: named(longer),
+                    shorter: named(shorter),
+                    function,
+                    source,
+                    target,
+                    span: at.span,
+                });
+            }
+            self.outlives(longer, shorter, at);
+        }
+        for &(ty, shorter) in subjects.iter() {
+            if !of_binder(shorter) {
+                continue;
+            }
+            let ty = unrigid(interner, ty);
+            self.regions.dropped_bounds.push(DroppedBound {
+                sup: None,
+                subject: Some(ty),
+                sub: shorter,
+                longer: None,
+                shorter: named(shorter),
+                function,
+                source,
+                target,
+                span: at.span,
+            });
+            self.regions.type_tests.push(TypeTest {
+                ty,
+                lower: shorter,
+                span: at.span,
+                forall: false,
+                signature: false,
+            });
+        }
+    }
+
     /// Two signatures' inputs and output, related as the types of `fn` pointers are.
     fn relate_sig_tys(
         &mut self,
@@ -3419,6 +3667,11 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                     let xs = this.instantiate_sig(sa, universe, !general_is_b);
                     let ys = this.instantiate_sig(sb, universe, general_is_b);
                     this.relate_sig_tys(xs, ys, variance, at);
+                    let (specific, general) = match general_is_b {
+                        true => ((a, sa, xs), (b, ys)),
+                        false => ((b, sb, ys), (a, xs)),
+                    };
+                    let _ = (specific, general);
                 };
                 match variance {
                     Variance::Covariant => pass(self, true),
@@ -3604,7 +3857,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         }
         for &param in params.iter() {
             self.regions.type_tests.push(TypeTest {
-                ty: param,
+                ty: unrigid(self.interner(), param),
                 lower: rv,
                 span: at.span,
                 forall: false,
@@ -3671,7 +3924,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             && from_trait.is_empty()
             && depth <= 4
             && let Some(normalized) = normalized
-            && normalized != ty
+            && unrigid(interner, normalized) != unrigid(interner, ty)
             && let TyKind::Alias(_, _) = normalized.kind()
         {
             self.scratch.regions.give(from_trait);
@@ -3718,7 +3971,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             return;
         }
         self.regions.type_tests.push(TypeTest {
-            ty,
+            ty: unrigid(self.interner(), ty),
             lower: rv,
             span: at.span,
             forall: false,
@@ -4714,7 +4967,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 Some(Ty::new_ref(self.interner(), region, ty, mutability))
             }
             Rvalue::Cast(kind, operand, target) => {
-                let target = self.renumber(target.as_ref());
+                let written = target.as_ref();
+                let target = self.renumber(written);
                 let source = match kind {
                     CastKind::PointerCoercion(hir_ty::PointerCast::ReifyFnPointer) => {
                         self.fn_item(operand, span).or_else(|| self.operand_ty(operand))?
@@ -4791,7 +5045,11 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                                 );
                                 let sig = rustc_type_ir::Binder::bind_with_vars(inner, bound_vars);
                                 let source = Ty::new_fn_ptr(interner, sig);
+                                // What its signature implies is proven for the target's
+                                // lifetimes (`binder_implied_bounds`), naming the function.
+                                self.coercing = Some((def.0, written, source));
                                 self.relate(source, target, Variance::Covariant, at);
+                                self.coercing = None;
                                 return Some(target);
                             }
                             // rustc instantiates the item's late-bound lifetimes and proves
@@ -5440,6 +5698,14 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                             hir_ty::next_solver::infer::BoundRegionConversionTime::FnCall,
                             sig,
                         );
+                        // As rustc's type check of a call, its signature well-formed for the
+                        // lifetimes it is called with: what a higher-ranked fn pointer's
+                        // signature implies is known where it is made (`binder_implied_bounds`)
+                        // because every call proves it.
+                        let wf = At { category: Category::Boring, span };
+                        for ty in sig.inputs_and_output.iter() {
+                            self.well_formed(ty, wf, 0);
+                        }
                         let mut inputs = self.scratch.tys.take();
                         inputs.extend(sig.inputs().iter().copied());
                         (inputs, sig.output())
@@ -7116,6 +7382,7 @@ pub(super) fn blame_with(path: &[Outlives], opaque: bool) -> Option<Outlives> {
         Category::GenericArg => 3,
         Category::Predicate => 4,
         Category::Boring | Category::Signature | Category::Opaque => 5,
+        Category::ImpliedBound => 2,
         Category::Internal => 7,
     };
     let best = path.iter().map(interest).min()?;
@@ -7427,10 +7694,16 @@ fn normalize_query(
 mod error_region_tests;
 
 #[cfg(test)]
+mod projection_bound_tests;
+
+#[cfg(test)]
 mod implied_outlives_tests;
 
 #[cfg(test)]
 mod object_default_tests;
+
+#[cfg(test)]
+mod dropped_bound_tests;
 
 #[cfg(test)]
 mod tests {

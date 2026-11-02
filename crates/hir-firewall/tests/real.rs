@@ -9,7 +9,8 @@
 //!                "packages": ["ecs"], "stride": 1}]}
 //! ```
 //!
-//! Each project is built once with `blaze build` first, so its build scripts have run, and its
+//! Each project is built once with `blaze build` first, so its build scripts have run and its
+//! proc macros' `wasm32-wasip1` modules are linked (the test runs each, as a build does), and its
 //! registry packages are fetched into `cargo_home` (`cargo fetch --locked`). The test is
 //! `#[ignore]`d, as it reads the machine's checkouts: the harness runs it with `--ignored`.
 
@@ -269,7 +270,8 @@ fn ran(units: &Units, unit: usize) -> Result<Ran, String> {
 }
 
 /// The workspace at `dir` lowered into a logged database ([`Db::logged`]) as a build lowers
-/// it, each build script's run and each proc-macro crate's macros applied.
+/// it, each build script's run and each proc-macro crate's macros applied: each its
+/// `wasm32-wasip1` module as that build linked it, run under Wasmtime as a build runs it.
 fn lower(dir: &str, cargo_home: &str) -> Result<(Lowered, Units), String> {
     let tree = tree();
     let files = read_tree(Path::new(dir), &|_: &str| true, &["target"])?;
@@ -287,14 +289,30 @@ fn lower(dir: &str, cargo_home: &str) -> Result<(Lowered, Units), String> {
     }
     let toolchain = ContentId::of("blaze v2 firewall toolchain 1", library()?.commit.as_bytes());
     let keeping = blaze_macro_eval::Macros::nothing("the firewall test runs every expansion");
+    let modules = blaze_macro_eval::Modules::new().map_err(|why| format!("no Wasmtime engine for the proc macros: {why}"))?;
     for unit in 0..units.graph.units.len() {
         if !lowered.crates().is_proc_macro(unit) {
             continue;
         }
         let name = &units.graph.units[unit].target.name;
         let krate = lowered.krate(unit).ok_or_else(|| format!("proc macro `{name}` has no crate"))?;
-        let macros = blaze_macro_eval::load(lowered.db(), krate, toolchain, &keeping);
+        let bytes = module(&units, unit, name)?;
+        let macros = blaze_macro_eval::load_wasm(lowered.db(), krate, toolchain, &keeping, &modules, &bytes);
         lowered.macros(unit, macros).map_err(|error| format!("the macros of `{name}`: {error}"))?;
     }
     Ok((lowered, units))
+}
+
+/// The wasm module `blaze build` linked for proc-macro unit `unit`: the `.wasm` among its
+/// planned outputs, read from where that build wrote it.
+fn module(units: &Units, unit: usize, name: &str) -> Result<Vec<u8>, String> {
+    let plan = &units.plans[unit];
+    let path = plan
+        .outputs
+        .iter()
+        .find(|it| it.ends_with(".wasm"))
+        .ok_or_else(|| format!("proc macro `{name}` (unit {unit}) plans no `.wasm` module: every build plans its proc macros as wasm modules"))?;
+    std::fs::read(path).map_err(|error| {
+        format!("the wasm module of proc macro `{name}` at {path}: {error}; build the project with `blaze build` first")
+    })
 }

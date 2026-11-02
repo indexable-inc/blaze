@@ -1,0 +1,1322 @@
+//! What made a build slow, and what to fix: `blaze slow` (docs/profiling.md, "What made a build
+//! slow"). It reads one build's profile and gives findings ranked by the wall time each would
+//! save if fixed, each with its evidence (numbers and the span, query or key it is about), the
+//! kind of fix, how the saving was estimated and, when the span says, the module that owns it;
+//! then what the profile could not see (time the record lost, waits with no name, CPU the spans
+//! did not count), which is said, never skipped.
+//!
+//! Sans-IO: [`analyse`] is a pure function of the time model ([`crate::time::Model`]), its
+//! critical path and the [`Facts`] (the tables that belong to no lane: the build's row, the
+//! misses, the query engine's counts, the memory counters). [`load`] is the driver that reads
+//! them through DuckDB; [`text`] renders a report for a person, and the report is
+//! `serde::Serialize` for an agent (`blaze slow --json`). The output depends on nothing but the
+//! rows: every map is sorted before it is read out (rule 22).
+//!
+//! What it borrows (/tmp/blaze-lanes/v2-slowreport.md):
+//! - EngFlow's bazel_invocation_analyzer: independent suggestion providers over one profile, each
+//!   with a potential improvement; its bottleneck estimate (a stretch's time times the share of
+//!   cores left idle) is [`Estimate::IdleCores`].
+//! - Bazel's and Buck2's critical path, and Perfetto's thread-state wake-up chains: the path
+//!   crosses from a wait to the job that woke it ([`crate::time::path`]), so a wait is charged
+//!   only for the time it held the build up.
+//! - Holistic Trace Analysis's idle-time breakdown: idle workers are split into "nothing was
+//!   runnable" (the critical path's serial work) and "work was runnable but not run" (queued).
+
+pub mod load;
+mod render;
+#[cfg(test)]
+mod tests;
+
+use std::alloc::Global;
+
+use blaze_hash::{HashMap, HashSet};
+use serde_derive::Serialize;
+
+use crate::time::{
+    Model, State, WAIT_SPAN,
+    path::{Link, LinkKind, Path, Reached},
+    report,
+};
+
+pub use render::text;
+
+/// The version of the report's JSON: bumped when a field changes meaning or goes away.
+pub const VERSION: u32 = 1;
+
+/// The build the report is of, as its `builds` row says.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct BuildFacts {
+    pub id: u64,
+    pub workspace: Option<String>,
+    pub command: Option<String>,
+    pub outcome: Option<String>,
+    /// The digest of the tree it built, and the BLAKE3 of the blaze that built it (rule 19).
+    pub tree: Option<String>,
+    pub blaze: Option<String>,
+    pub hits: Option<u64>,
+    /// Nodes that ran their task, as the build counted them.
+    pub misses: Option<u64>,
+}
+
+/// What the report reads beside the time model.
+#[derive(Clone, Debug, Default)]
+pub struct Facts {
+    pub build: BuildFacts,
+    /// The threads' names.
+    pub threads: Vec<ThreadName>,
+    /// The spans in the build's window by name and query kind.
+    pub span_kinds: Vec<SpanKind>,
+    /// The build's misses rows, by step and cause.
+    pub misses: Vec<MissGroup>,
+    pub query_counts: Vec<QueryCount>,
+    pub memory: Memory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadName {
+    pub process: u32,
+    pub thread: u32,
+    pub name: String,
+}
+
+/// The spans of one name (and query kind) in the build's window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpanKind {
+    pub name: String,
+    pub query_kind: Option<String>,
+    /// The module its spans were made in (`spans.target`), the least of them.
+    pub target: Option<String>,
+    pub runs: u64,
+    pub dur_ns: i64,
+    pub self_cpu_ns: i64,
+}
+
+/// The misses rows of one step and cause.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MissGroup {
+    pub step: String,
+    pub cause: String,
+    pub count: u64,
+    /// The least item, for an example.
+    pub example: String,
+    /// The commonest `what`.
+    pub what: Option<String>,
+}
+
+/// One query function's counts for the build (`query_counts`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueryCount {
+    pub query: String,
+    pub executed: u64,
+    pub verified: u64,
+    pub reran: u64,
+    pub evicted_asked: u64,
+    pub evicted: u64,
+    pub refused: u64,
+    pub dropped: u64,
+}
+
+/// The daemon's heap (`live bytes`) and footprint around the build, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Memory {
+    /// The last `live bytes` before the build began: what the daemon held after the build before.
+    pub live_before: Option<i64>,
+    /// The first `live bytes` in the build's window.
+    pub live_first: Option<i64>,
+    pub live_peak: Option<i64>,
+    pub footprint_peak: Option<i64>,
+}
+
+/// One report.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Report {
+    pub version: u32,
+    pub build: BuildFacts,
+    pub summary: Summary,
+    /// Ranked: most wall time saved first; those whose saving can't be estimated last.
+    pub findings: Vec<Finding>,
+    /// What the profile could not see, most time hidden first.
+    pub blind_spots: Vec<BlindSpot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Summary {
+    pub wall_ns: i64,
+    /// The pool's worker threads seen in the build.
+    pub workers: u32,
+    /// Their time running a job (or inside a span, for a thread no switch names), all told.
+    pub busy_ns: i64,
+    /// `busy_ns` over workers x wall.
+    pub busy_ratio: f64,
+    /// Every span's `self_cpu_ns` in the build's window, added.
+    pub span_cpu_ns: i64,
+    pub path_ns: i64,
+    /// Where the critical path's walk stopped: the build's start, a lane's start, its bound.
+    pub path_reached: String,
+    /// The path's time by kind of link: ran, waited, wake, queued, spawned, unrecorded.
+    pub path_by_link: Vec<Named>,
+    /// The path's running time by the outermost span it ran in.
+    pub path_by_phase: Vec<Named>,
+    /// Findings left out for saving less than [`Summary::cut_ns`].
+    pub smaller: u32,
+    pub cut_ns: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Named {
+    pub name: String,
+    pub ns: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Finding {
+    pub kind: Kind,
+    pub fix: Fix,
+    /// The wall time it would save, by [`Finding::estimate`]; 0 with [`Estimate::Unknown`].
+    pub saves_ns: i64,
+    pub estimate: Estimate,
+    /// What it is about: a span's name, a wait's class, a query.
+    pub subject: String,
+    /// The module or file that owns it, when the profile says.
+    pub owner: Option<String>,
+    pub title: String,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// Work on the critical path that ran serially while workers were idle.
+    Serial,
+    /// Work on the critical path that was on a core but got little CPU.
+    Starved,
+    /// Workers the OS gave much less CPU per second running than the others.
+    StarvedWorkers,
+    /// A kind of wait that held the build up.
+    Wait,
+    /// Runnable jobs that waited for a core.
+    Queued,
+    /// The same query key run more than once in the build.
+    Redone,
+    /// Runs in a view the row had already run in (`query_counts.reran`).
+    Reran,
+    /// Runs for a value evicted earlier and asked for again.
+    Evicted,
+    /// The daemon let go of most of its heap between the build before and this one.
+    Shed,
+    /// Things the build computed again (the misses table), by cause.
+    Missed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Fix {
+    Parallelise,
+    GiveCpu,
+    ShortenWait,
+    WakeWorkers,
+    KeyForReuse,
+    KeepInMemory,
+    KeepAcrossBuilds,
+    ExplainMiss,
+}
+
+impl Fix {
+    /// The fix in words.
+    pub fn says(self) -> &'static str {
+        match self {
+            Fix::Parallelise => "parallelise it: it ran serially on the critical path while workers sat idle",
+            Fix::GiveCpu => {
+                "give it CPU: it was on a core, or blocked outside any `wait` span, yet got little CPU; check its worker's QoS class, the host's load, and blocking calls no `wait` span names"
+            }
+            Fix::ShortenWait => "shorten what it waits on, or start that sooner: the owner's work is what held the build up",
+            Fix::WakeWorkers => "run runnable work at once: jobs sat queued for a core while workers were idle",
+            Fix::KeyForReuse => "key it so its first run is reused: the same key ran more than once in one build",
+            Fix::KeepInMemory => "keep it in memory: values were evicted, then asked for and computed again",
+            Fix::KeepAcrossBuilds => "keep the lowered database across requests: the daemon let it go between builds",
+            Fix::ExplainMiss => "find why each was computed again (`blaze why`) and key it so it is reused",
+        }
+    }
+}
+
+/// How a finding's saving was worked out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Estimate {
+    /// Its time on the critical path (times the share it could lose: idle workers, missing CPU).
+    CriticalPath,
+    /// Its wall time times the share of workers idle meanwhile: an upper bound, used where the
+    /// critical path can't be trusted.
+    IdleCores,
+    /// Its thread time over the build's mean parallelism.
+    ThreadTime,
+    /// The profile does not say what it cost.
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BlindSpot {
+    pub kind: BlindKind,
+    /// The time it hides; 0 when it hides a count, not time.
+    pub hidden_ns: i64,
+    pub subject: String,
+    pub title: String,
+    pub evidence: Vec<String>,
+    pub fix: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlindKind {
+    /// Critical path time the record lost.
+    Unrecorded,
+    /// Workers running a job inside no span.
+    Uncovered,
+    /// Waits that say nothing of what they wait for (rule 13).
+    UnnamedWait,
+    /// Waits that name what they wait for but never who runs it.
+    OwnerlessWait,
+    /// Workers' running time the spans counted no CPU for.
+    CpuGap,
+    /// No `ready` rows: parked and queued time can't be told apart.
+    NoReadyRows,
+    /// Misses the build counted that no misses row explains.
+    MissesUnexplained,
+    /// Rows that did not line up (spans with no parent row, runs cut short).
+    Misaligned,
+    /// The critical path's walk stopped short of the build's start.
+    PathCut,
+}
+
+/// The least saving a finding needs to be listed: 1% of the wall time, and at least this.
+const MIN_SAVES_NS: i64 = 200_000_000;
+/// A span whose CPU over its own running time is below this was starved.
+const STARVED_RATIO: f64 = 0.25;
+/// A worker whose CPU per running second is below the others' by this factor is starved.
+const STARVED_WORKER_FACTOR: f64 = 3.0;
+/// The least running time a span group or worker needs before its CPU rate is judged.
+const JUDGED_NS: i64 = 1_000_000_000;
+/// The least time a blind spot needs to be listed.
+const MIN_HIDDEN_NS: i64 = 100_000_000;
+/// The most examples a finding lists.
+const EXAMPLES: usize = 3;
+
+/// The report of `model`, its critical `path` and `facts`.
+pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
+    let ctx = Ctx::new(model, path, facts);
+    // alloc: a report's findings, once a report
+    let mut findings = Vec::new();
+    ctx.path_work(&mut findings);
+    ctx.starved_workers(&mut findings);
+    let mut blind = ctx.waits(&mut findings);
+    ctx.queued(&mut findings);
+    ctx.redone(&mut findings);
+    ctx.query_counts(&mut findings);
+    ctx.missed(&mut findings);
+    ctx.shed(&mut findings);
+    ctx.blind_spots(&mut blind);
+
+    let cut_ns = (model.bounds.wall_ns() / 100).max(MIN_SAVES_NS);
+    let before = findings.len();
+    findings.retain(|it| it.estimate == Estimate::Unknown || it.saves_ns >= cut_ns);
+    let smaller = (before - findings.len()) as u32;
+    findings.sort_by(|a, b| {
+        (a.estimate == Estimate::Unknown)
+            .cmp(&(b.estimate == Estimate::Unknown))
+            .then(b.saves_ns.cmp(&a.saves_ns))
+            .then(a.kind.cmp(&b.kind))
+            .then_with(|| a.subject.cmp(&b.subject))
+    });
+    blind.retain(|it| it.hidden_ns >= MIN_HIDDEN_NS || it.hidden_ns == 0);
+    blind.sort_by(|a, b| b.hidden_ns.cmp(&a.hidden_ns).then(a.kind.cmp(&b.kind)).then_with(|| a.subject.cmp(&b.subject)));
+    Report { version: VERSION, build: facts.build.clone(), summary: ctx.summary(smaller, cut_ns), findings, blind_spots: blind }
+}
+
+/// Integer seconds to a tenth, for evidence.
+fn s(ns: i64) -> String {
+    // alloc: a cell
+    format!("{:.1} s", ns as f64 / 1e9)
+}
+
+fn pct(part: i64, whole: i64) -> f64 {
+    if whole > 0 { 100.0 * part as f64 / whole as f64 } else { 0.0 }
+}
+
+/// What the analysis precomputes once.
+struct Ctx<'a> {
+    model: &'a Model,
+    path: &'a Path,
+    facts: &'a Facts,
+    /// The pool's worker threads, sorted.
+    workers: Vec<(u32, u32)>,
+    /// Each worker's running stretches, merged and clipped to the build: `workers`' order.
+    running: Vec<Vec<(i64, i64)>>,
+    busy: Steps,
+    /// The path's running time cut by the innermost span open: (from, to, span or none, lane).
+    path_ran: Vec<(i64, i64, Option<usize>, usize)>,
+    /// The critical path is complete enough to charge waits by it.
+    path_trusted: bool,
+}
+
+impl<'a> Ctx<'a> {
+    fn new(model: &'a Model, path: &'a Path, facts: &'a Facts) -> Ctx<'a> {
+        let (start, end) = (model.bounds.start_ns, model.bounds.end_ns);
+        let named: HashSet<(u32, u32), Global> = {
+            let mut it = HashSet::new_in(Global);
+            it.extend(facts.threads.iter().filter(|it| it.name.starts_with("blaze-work")).map(|it| (it.process, it.thread)));
+            it
+        };
+        // A worker: a thread a pool job ran on, or one named as the pool names its threads.
+        let mut stretches: HashMap<(u32, u32), Vec<(i64, i64)>, Global> = HashMap::new_in(Global);
+        for lane in &model.lanes {
+            for it in &lane.intervals {
+                let State::Running { thread, core, .. } = it.state else { continue };
+                let key = (lane.id.process(), thread);
+                if core.is_none() && !named.contains(&key) && !named.is_empty() {
+                    continue;
+                }
+                let (from, to) = (it.from_ns.max(start), it.to_ns.min(end));
+                if to > from {
+                    // alloc: a worker's stretches, once a worker a report
+                    stretches.entry(key).or_default().push((from, to));
+                }
+            }
+        }
+        for &key in &named {
+            stretches.entry(key).or_default();
+        }
+        // alloc: once a report
+        let mut workers: Vec<((u32, u32), Vec<(i64, i64)>)> = stretches.into_iter().collect();
+        workers.sort_unstable_by_key(|it| it.0);
+        for (_, it) in &mut workers {
+            merge(it);
+        }
+        let busy = Steps::of(workers.iter().map(|it| it.1.as_slice()));
+        let (workers, running): (Vec<_>, Vec<_>) = workers.into_iter().unzip();
+
+        let path_ran = path_segments(model, path);
+        let lost: i64 = path.links.iter().filter(|it| it.kind == LinkKind::Unrecorded).map(Link::dur_ns).sum();
+        let path_trusted = matches!(path.reached, Reached::BuildStart) && lost * 5 < path.len_ns().max(1);
+        Ctx { model, path, facts, workers, running, busy, path_ran, path_trusted }
+    }
+
+    fn wall(&self) -> i64 {
+        self.model.bounds.wall_ns()
+    }
+
+    fn n_workers(&self) -> i64 {
+        (self.workers.len() as i64).max(1)
+    }
+
+    /// The build's mean parallelism: busy workers on average, at least 1.
+    fn parallelism(&self) -> f64 {
+        let (start, end) = (self.model.bounds.start_ns, self.model.bounds.end_ns);
+        (self.busy.integral(start, end) as f64 / self.wall().max(1) as f64).max(1.0)
+    }
+
+    fn thread_name(&self, process: u32, thread: u32) -> String {
+        match self.facts.threads.iter().find(|it| it.process == process && it.thread == thread) {
+            // clone: a label
+            Some(it) => it.name.clone(),
+            // alloc: a label
+            None => format!("thread {thread}"),
+        }
+    }
+
+    /// The module that made spans named `name`, or a file named in `subject`.
+    fn owner(&self, name: &str, subject: &str) -> Option<String> {
+        if let Some(file) = file_in(subject) {
+            return Some(file);
+        }
+        self.facts
+            .span_kinds
+            .iter()
+            .filter(|it| it.name == name)
+            .filter_map(|it| it.target.as_deref())
+            .filter(|it| *it != "blaze")
+            .min()
+            .map(str::to_owned)
+    }
+
+    /// Serial and starved work on the critical path, by the innermost span it ran in.
+    fn path_work(&self, out: &mut Vec<Finding>) {
+        let model = self.model;
+        #[derive(Default)]
+        struct Group {
+            ns: i64,
+            busy_ns: i128,
+            subjects: Vec<(String, i64)>,
+            spans: Vec<usize>,
+            roots: Vec<(String, i64)>,
+        }
+        let mut groups: HashMap<&str, Group, Global> = HashMap::new_in(Global);
+        for &(from, to, span, _) in &self.path_ran {
+            let ns = to - from;
+            let name = span.map_or("inside no span", |it| model.spans[it].name.as_str());
+            let group = groups.entry(name).or_default();
+            group.ns += ns;
+            group.busy_ns += i128::from(self.busy.integral(from, to));
+            if let Some(span) = span {
+                // alloc: an example, once a span a report
+                let subject = model.spans[span].subject().unwrap_or("").to_owned();
+                group.subjects.push((subject, ns));
+                group.spans.push(span);
+                let root = model.root_of(span);
+                if root != span {
+                    // clone: a label, once a span a report
+                    group.roots.push((model.spans[root].name.clone(), ns));
+                }
+            }
+        }
+        let workers = self.n_workers();
+        for (name, mut group) in groups {
+            group.spans.sort_unstable();
+            group.spans.dedup();
+            let own_running: i64 = group.spans.iter().map(|&i| model.span_time[i].own.running_ns).sum();
+            let own_cpu: i64 = group.spans.iter().map(|&i| model.spans[i].self_cpu_ns.unwrap_or(0).max(0)).sum();
+            let counted = group.spans.iter().any(|&i| model.spans[i].self_cpu_ns.is_some());
+            let busy = (group.busy_ns as f64 / group.ns.max(1) as f64).max(1.0);
+            let ratio = if own_running > 0 { own_cpu as f64 / own_running as f64 } else { 1.0 };
+            let subjects = top(&mut group.subjects);
+            let roots = top(&mut group.roots);
+            // alloc: a finding's evidence
+            let mut evidence = Vec::new();
+            let count = group.spans.len();
+            if !subjects.is_empty() {
+                evidence.push(format!("of {count} spans on the path: {}", list(&subjects)));
+            }
+            if !roots.is_empty() {
+                evidence.push(format!("inside {}", list(&roots)));
+            }
+            evidence.push(format!(
+                "{:.1} of {workers} workers busy on average meanwhile ({:.0}% idle)",
+                busy,
+                100.0 * (1.0 - busy / workers as f64).max(0.0)
+            ));
+            if counted {
+                evidence.push(format!("its spans ran {} on a core and counted {} of CPU ({:.0}%)", s(own_running), s(own_cpu), 100.0 * ratio));
+            }
+            let owner = self.owner(name, subjects.first().map_or("", |it| it.0.as_str()));
+            // alloc: a finding's subject
+            let subject = name.to_owned();
+            if counted && own_running >= JUDGED_NS && ratio < STARVED_RATIO {
+                out.push(Finding {
+                    kind: Kind::Starved,
+                    fix: Fix::GiveCpu,
+                    saves_ns: (group.ns as f64 * (1.0 - ratio)) as i64,
+                    estimate: Estimate::CriticalPath,
+                    title: format!(
+                        "starved: `{name}` held the critical path {} and its spans got {:.0}% of a CPU",
+                        s(group.ns),
+                        100.0 * ratio
+                    ),
+                    subject,
+                    owner,
+                    evidence,
+                });
+            } else if busy < 0.5 * workers as f64 {
+                out.push(Finding {
+                    kind: Kind::Serial,
+                    fix: Fix::Parallelise,
+                    saves_ns: (group.ns as f64 * (1.0 - busy / workers as f64)) as i64,
+                    estimate: Estimate::CriticalPath,
+                    title: format!("serial: `{name}` ran {} on the critical path while most workers were idle", s(group.ns)),
+                    subject,
+                    owner,
+                    evidence,
+                });
+            }
+        }
+    }
+
+    /// Workers the OS gave much less CPU per running second than the others.
+    fn starved_workers(&self, out: &mut Vec<Finding>) {
+        let model = self.model;
+        let mut cpu: HashMap<(u32, u32), i64, Global> = HashMap::new_in(Global);
+        let mut counted = false;
+        for it in &model.spans {
+            if let Some(ns) = it.self_cpu_ns {
+                counted = true;
+                *cpu.entry((it.process, it.thread)).or_default() += ns.max(0);
+            }
+        }
+        if !counted {
+            return;
+        }
+        // alloc: once a report
+        let mut rates: Vec<(usize, i64, i64, f64)> = Vec::new();
+        for (w, key) in self.workers.iter().enumerate() {
+            let running: i64 = self.running[w].iter().map(|it| it.1 - it.0).sum();
+            if running < JUDGED_NS {
+                continue;
+            }
+            let used = cpu.get(key).copied().unwrap_or(0);
+            rates.push((w, running, used, used as f64 / running as f64));
+        }
+        if rates.len() < 2 {
+            return;
+        }
+        // alloc: once a report
+        let mut sorted: Vec<f64> = rates.iter().map(|it| it.3).collect();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let upper = &sorted[..sorted.len().div_ceil(2)];
+        let reference = upper[upper.len() / 2];
+        if reference <= 0.0 {
+            return;
+        }
+        let starved: Vec<&(usize, i64, i64, f64)> =
+            rates.iter().filter(|it| it.3 * STARVED_WORKER_FACTOR < reference).collect();
+        if starved.is_empty() {
+            return;
+        }
+        // The path's running time on each starved worker.
+        let mut saves = 0.0;
+        for &(from, to, _, lane) in &self.path_ran {
+            let Some(interval) = self.model.lanes[lane].at_or_before(to) else { continue };
+            let State::Running { thread, .. } = self.model.lanes[lane].intervals[interval].state else { continue };
+            let key = (self.model.lanes[lane].id.process(), thread);
+            if let Some(it) = starved.iter().find(|it| self.workers[it.0] == key) {
+                saves += (to - from) as f64 * (1.0 - it.3 / reference);
+            }
+        }
+        let carried: i64 = starved.iter().map(|it| it.1).sum();
+        let all: i64 = rates.iter().map(|it| it.1).sum();
+        let names: Vec<String> = starved
+            .iter()
+            .take(6)
+            .map(|it| {
+                let (process, thread) = self.workers[it.0];
+                format!("{} {:.3}", self.thread_name(process, thread), it.3)
+            })
+            .collect();
+        let more = starved.len().saturating_sub(6);
+        let mut evidence = vec![
+            format!(
+                "{} of {} workers got under 1/{STARVED_WORKER_FACTOR:.0} of the CPU per running second the others got ({reference:.3}): {}{}",
+                starved.len(),
+                rates.len(),
+                names.join(", "),
+                if more > 0 { format!(" and {more} more") } else { String::new() }
+            ),
+            format!("they carried {:.0}% of the workers' running time ({} of {})", pct(carried, all), s(carried), s(all)),
+        ];
+        if saves < 1.0 {
+            evidence.push("none of the critical path ran on them".to_owned());
+        }
+        out.push(Finding {
+            kind: Kind::StarvedWorkers,
+            fix: Fix::GiveCpu,
+            saves_ns: saves as i64,
+            estimate: Estimate::CriticalPath,
+            subject: "workers".to_owned(),
+            owner: Some("blaze_graph::pool".to_owned()),
+            title: format!("starved workers: {} workers ran at a fraction of the others' CPU rate", starved.len()),
+            evidence,
+        });
+    }
+
+    /// Waits by what they wait for, charged by the critical path; and the blind spots of waits
+    /// that name nothing or no owner.
+    fn waits(&self, out: &mut Vec<Finding>) -> Vec<BlindSpot> {
+        let model = self.model;
+        #[derive(Default)]
+        struct Class {
+            count: u64,
+            ns: i64,
+            on_path: Vec<(i64, i64)>,
+            stretches: Vec<(i64, i64)>,
+            owners: Vec<(String, i64)>,
+            known: u64,
+            named: bool,
+            moved: bool,
+        }
+        // alloc: once a report
+        let mut of_wait = vec![0i64; model.waits.len()];
+        // alloc: once a report
+        let mut stretches: Vec<Vec<(i64, i64)>> = vec![Vec::new(); model.waits.len()];
+        for lane in &model.lanes {
+            for it in &lane.intervals {
+                if let Some(w) = it.state.wait() {
+                    of_wait[w] += it.dur_ns();
+                    stretches[w].push((it.from_ns, it.to_ns));
+                }
+            }
+        }
+        // The path's time while each wait held it up: a wait it crossed to its waker stood on
+        // the path the whole time it waited (the waker's run stands in its place); a wait it
+        // could not cross, and a wake's latency, are links of their own.
+        // alloc: once a report
+        let mut path_of_wait: Vec<Vec<(i64, i64)>> = vec![Vec::new(); model.waits.len()];
+        let (path_from, path_to) = (self.path.start_ns().unwrap_or(0), self.path.end_ns().unwrap_or(0));
+        for link in &self.path.links {
+            if let Some(w) = link.wakes {
+                let clipped = stretches[w].iter().map(|&(from, to)| (from.max(path_from), to.min(path_to))).filter(|it| it.1 > it.0);
+                path_of_wait[w].extend(clipped);
+            }
+            if matches!(link.kind, LinkKind::Waited | LinkKind::Wake)
+                && let Some(w) = model.lanes[link.lane].intervals[link.interval].state.wait()
+            {
+                path_of_wait[w].push((link.from_ns, link.to_ns));
+            }
+        }
+        let mut classes: HashMap<String, Class, Global> = HashMap::new_in(Global);
+        for (w, wait) in model.waits.iter().enumerate() {
+            if of_wait[w] == 0 {
+                continue;
+            }
+            let class = classes.entry(report::wait_class(model, wait)).or_default();
+            class.count += 1;
+            class.ns += of_wait[w];
+            class.on_path.append(&mut path_of_wait[w]);
+            class.stretches.append(&mut stretches[w]);
+            class.named |= wait.span.and_then(|it| model.spans[it].awaits.as_deref()).is_some();
+            class.moved |= wait.on == Some(crate::flight::WaitedOn::Moved);
+            if let Some(lane) = wait.waker.lane() {
+                class.known += 1;
+                let at = wait.ready_ns.or(wait.resumed_ns).unwrap_or(wait.parked_ns);
+                class.owners.push((doing_at(model, lane, at), of_wait[w]));
+            }
+        }
+        // alloc: once a report
+        let mut classes: Vec<(String, Class)> = classes.into_iter().collect();
+        classes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let workers = self.n_workers();
+        // alloc: once a report
+        let mut blind = Vec::new();
+        for (name, mut class) in classes {
+            if class.moved {
+                continue;
+            }
+            merge(&mut class.stretches);
+            merge(&mut class.on_path);
+            let on_path: i64 = class.on_path.iter().map(|it| it.1 - it.0).sum();
+            let wall: i64 = class.stretches.iter().map(|it| it.1 - it.0).sum();
+            let busy: i64 = class.stretches.iter().map(|it| self.busy.integral(it.0, it.1)).sum();
+            let idle = (1.0 - busy as f64 / (workers as f64 * wall.max(1) as f64)).clamp(0.0, 1.0);
+            let owners = top(&mut class.owners);
+            let mut evidence = vec![format!(
+                "{} waits, {} of thread time, {} of wall with one or more waiting, {:.0}% of workers idle meanwhile",
+                class.count,
+                s(class.ns),
+                s(wall),
+                100.0 * idle
+            )];
+            if on_path > 0 {
+                evidence.push(format!("{} of it on the critical path", s(on_path)));
+            }
+            match owners.is_empty() {
+                false => evidence.push(format!("woken by: {}", list(&owners))),
+                true => evidence.push("no wait of it names who woke it".to_owned()),
+            }
+            if !class.named {
+                blind.push(BlindSpot {
+                    kind: BlindKind::UnnamedWait,
+                    hidden_ns: class.ns,
+                    title: format!("waits on `{name}` say nothing of what they wait for: {} of thread time", s(class.ns)),
+                    subject: name,
+                    evidence,
+                    fix: "open a `wait` span naming the awaited key, lock, channel or child, and its owner (rule 13)".to_owned(),
+                });
+                continue;
+            }
+            if class.known == 0 && class.ns >= JUDGED_NS {
+                blind.push(BlindSpot {
+                    kind: BlindKind::OwnerlessWait,
+                    hidden_ns: class.ns,
+                    title: format!("waits on `{name}` never name who runs what they wait for: {} of thread time", s(class.ns)),
+                    // clone: a blind spot's subject
+                    subject: name.clone(),
+                    // clone: its evidence, also the finding's
+                    evidence: evidence.clone(),
+                    fix: "set the wait's `owner` (the job running the key, the lock's holder) so the critical path can cross it".to_owned(),
+                });
+            }
+            let (saves, estimate) = match (on_path > 0, self.path_trusted) {
+                (true, _) => (on_path, Estimate::CriticalPath),
+                (false, true) => (0, Estimate::CriticalPath),
+                (false, false) => ((wall as f64 * idle) as i64, Estimate::IdleCores),
+            };
+            let owner = self.owner(WAIT_SPAN, &name).or_else(|| owners.first().and_then(|it| file_in(&it.0)));
+            out.push(Finding {
+                kind: Kind::Wait,
+                fix: Fix::ShortenWait,
+                saves_ns: saves,
+                estimate,
+                title: format!("waits on `{name}`: {} held up", s(if on_path > 0 { on_path } else { wall })),
+                subject: name,
+                owner,
+                evidence,
+            });
+        }
+        blind
+    }
+
+    /// Runnable jobs that waited for a core on the critical path.
+    fn queued(&self, out: &mut Vec<Finding>) {
+        let on_path: i64 = self
+            .path
+            .links
+            .iter()
+            .filter(|it| matches!(it.kind, LinkKind::Queued | LinkKind::Spawned))
+            .map(Link::dur_ns)
+            .sum();
+        let all = report::job_totals(self.model).queued_ns;
+        if on_path == 0 {
+            return;
+        }
+        out.push(Finding {
+            kind: Kind::Queued,
+            fix: Fix::WakeWorkers,
+            saves_ns: on_path,
+            estimate: Estimate::CriticalPath,
+            subject: "queued for a core".to_owned(),
+            owner: Some("blaze_graph::pool".to_owned()),
+            title: format!("queued: the critical path waited {} for a core while its work was runnable", s(on_path)),
+            evidence: vec![format!("{} of queued time over all jobs", s(all))],
+        });
+    }
+
+    /// The same query key run more than once in the build.
+    fn redone(&self, out: &mut Vec<Finding>) {
+        let model = self.model;
+        let queries: HashSet<&str, Global> = {
+            let mut it = HashSet::new_in(Global);
+            it.extend(self.facts.span_kinds.iter().filter(|it| it.query_kind.is_some()).map(|it| it.name.as_str()));
+            it
+        };
+        let mut keys: HashMap<(&str, Option<&str>, &str), (u64, i64, i64), Global> = HashMap::new_in(Global);
+        for (i, it) in model.spans.iter().enumerate() {
+            let Some(function) = it.function.as_deref() else { continue };
+            if !(it.name.ends_with("_query") || queries.contains(it.name.as_str())) {
+                continue;
+            }
+            let entry = keys.entry((it.name.as_str(), it.krate.as_deref(), function)).or_insert((0, 0, 0));
+            let running = model.span_time[i].totals.running_ns;
+            if entry.0 == 0 {
+                entry.2 = running;
+            }
+            entry.0 += 1;
+            entry.1 += running;
+        }
+        let mut by_query: HashMap<&str, (u64, u64, i64, Vec<(String, i64)>), Global> = HashMap::new_in(Global);
+        for ((name, krate, function), (runs, running, first)) in keys {
+            if runs < 2 {
+                continue;
+            }
+            let it = by_query.entry(name).or_default();
+            it.0 += 1;
+            it.1 += runs - 1;
+            it.2 += running - first;
+            // alloc: an example, once a key a report
+            it.3.push((format!("{}{function} x{runs}", krate.map_or(String::new(), |it| format!("{it}: "))), running - first));
+        }
+        let parallelism = self.parallelism();
+        for (name, (keys, extra, ns, mut examples)) in by_query {
+            let examples = top(&mut examples);
+            out.push(Finding {
+                kind: Kind::Redone,
+                fix: Fix::KeyForReuse,
+                saves_ns: (ns as f64 / parallelism) as i64,
+                estimate: Estimate::ThreadTime,
+                title: format!("redone: `{name}` ran {extra} extra times over {keys} keys, {} of running", s(ns)),
+                // alloc: a finding's subject
+                subject: name.to_owned(),
+                owner: self.owner(name, ""),
+                evidence: vec![
+                    format!("most redone: {}", list(&examples)),
+                    format!("the build's mean parallelism is {parallelism:.1} workers"),
+                ],
+            });
+        }
+    }
+
+    /// The query engine's own counts: runs in a view already run in, and runs for an evicted
+    /// value.
+    fn query_counts(&self, out: &mut Vec<Finding>) {
+        let parallelism = self.parallelism();
+        for it in &self.facts.query_counts {
+            let kind = self.facts.span_kinds.iter().find(|kind| {
+                kind.query_kind.as_deref() == Some(it.query.as_str())
+                    || kind.name == it.query
+                    || it.query.strip_suffix(kind.name.as_str()).is_some_and(|rest| rest.ends_with("::"))
+            });
+            let per_run = kind.filter(|it| it.runs > 0).map(|it| it.self_cpu_ns as f64 / it.runs as f64);
+            let cost = |runs: u64| per_run.map_or(0, |per| (per * runs as f64 / parallelism) as i64);
+            let estimate = if per_run.is_some() { Estimate::ThreadTime } else { Estimate::Unknown };
+            let per = per_run.map_or_else(
+                || "its spans count no CPU, so its cost is not known".to_owned(),
+                |per| format!("{:.1} µs of CPU a run, by its spans", per / 1e3),
+            );
+            if it.evicted_asked > 0 {
+                out.push(Finding {
+                    kind: Kind::Evicted,
+                    fix: Fix::KeepInMemory,
+                    saves_ns: cost(it.evicted_asked),
+                    estimate,
+                    title: format!("evicted: `{}` ran {} times for values evicted earlier in the build", it.query, it.evicted_asked),
+                    // clone: a finding's subject
+                    subject: it.query.clone(),
+                    owner: Some("blaze_query".to_owned()),
+                    evidence: vec![
+                        format!(
+                            "{} runs, {} verified; {} values swept past the cap, {} of them admissions the frequency rule refused, {} dropped",
+                            it.executed, it.verified, it.evicted, it.refused, it.dropped
+                        ),
+                        // clone: a line of evidence, also the next finding's
+                        per.clone(),
+                    ],
+                });
+            }
+            if it.reran > 0 {
+                out.push(Finding {
+                    kind: Kind::Reran,
+                    fix: Fix::KeyForReuse,
+                    saves_ns: cost(it.reran),
+                    estimate,
+                    title: format!("reran: `{}` ran {} times in a view its row had already run in", it.query, it.reran),
+                    // clone: a finding's subject
+                    subject: it.query.clone(),
+                    owner: Some("blaze_query".to_owned()),
+                    evidence: vec![format!("{} runs, {} verified", it.executed, it.verified), per],
+                });
+            }
+        }
+    }
+
+    /// The misses table, by step and cause; a first build's misses have nothing to reuse.
+    fn missed(&self, out: &mut Vec<Finding>) {
+        for it in self.facts.misses.iter().filter(|it| it.cause != "first") {
+            // alloc: a finding's evidence
+            let mut evidence = vec![format!("for example {}", it.example)];
+            if let Some(what) = &it.what {
+                evidence.push(format!("the commonest reason: {what}"));
+            }
+            out.push(Finding {
+                kind: Kind::Missed,
+                fix: Fix::ExplainMiss,
+                saves_ns: 0,
+                estimate: Estimate::Unknown,
+                title: format!("computed again: {} `{}` ({})", it.count, it.step, it.cause),
+                subject: format!("{} {}", it.step, it.cause),
+                owner: None,
+                evidence,
+            });
+        }
+    }
+
+    /// The daemon's heap fell by most of itself between the build before and this one.
+    fn shed(&self, out: &mut Vec<Finding>) {
+        let memory = self.facts.memory;
+        let (Some(before), Some(first)) = (memory.live_before, memory.live_first) else { return };
+        const MIB: f64 = 1024.0 * 1024.0;
+        if before - first < 256 * 1024 * 1024 || first * 2 > before {
+            return;
+        }
+        out.push(Finding {
+            kind: Kind::Shed,
+            fix: Fix::KeepAcrossBuilds,
+            saves_ns: 0,
+            estimate: Estimate::Unknown,
+            subject: "live bytes".to_owned(),
+            owner: Some("blaze_cargo::serve".to_owned()),
+            title: format!(
+                "shed: the daemon held {:.0} MiB after the build before and {:.0} MiB as this one began",
+                before as f64 / MIB,
+                first as f64 / MIB
+            ),
+            evidence: vec![format!(
+                "what it let go was computed again in this build; its peak was {:.0} MiB live, {:.0} MiB footprint",
+                memory.live_peak.unwrap_or(0) as f64 / MIB,
+                memory.footprint_peak.unwrap_or(0) as f64 / MIB
+            )],
+        });
+    }
+
+    fn blind_spots(&self, out: &mut Vec<BlindSpot>) {
+        let model = self.model;
+        // The path's lost time.
+        let mut lost: HashMap<String, i64, Global> = HashMap::new_in(Global);
+        for link in self.path.links.iter().filter(|it| it.kind == LinkKind::Unrecorded) {
+            let lane = &model.lanes[link.lane];
+            let why = match lane.intervals[link.interval].state {
+                State::Unrecorded { why } => why.name(),
+                _ => "unrecorded",
+            };
+            *lost.entry(format!("{} on {}", why, lane.id)).or_default() += link.dur_ns();
+        }
+        let lost_ns: i64 = lost.values().sum();
+        if lost_ns > 0 {
+            // alloc: once a report
+            let mut lost: Vec<(String, i64)> = lost.into_iter().collect();
+            out.push(BlindSpot {
+                kind: BlindKind::Unrecorded,
+                hidden_ns: lost_ns,
+                subject: "critical path".to_owned(),
+                title: format!("the record lost {} of the critical path ({:.0}%)", s(lost_ns), pct(lost_ns, self.path.len_ns())),
+                evidence: vec![format!("by reason and lane: {}", list(&top(&mut lost)))],
+                fix: "between_spans: put a span over the thread's work there; cut or no_end: the recorder's ring lost switches, so keep more or flush sooner".to_owned(),
+            });
+        }
+        // Workers running a job inside no span.
+        let mut uncovered = 0i64;
+        // alloc: once a report
+        let mut lanes: Vec<(String, i64)> = Vec::new();
+        for (l, lane) in model.lanes.iter().enumerate() {
+            if lane.id.job().is_none() {
+                continue;
+            }
+            let roots: i64 = lane
+                .spans
+                .iter()
+                .filter(|&&i| model.parent[i].is_none_or(|p| model.span_time[p].lane != Some(l)))
+                .map(|&i| model.span_time[i].totals.running_ns)
+                .sum();
+            let it = (lane.totals().running_ns - roots).max(0);
+            if it > 0 {
+                uncovered += it;
+                lanes.push((lane.id.to_string(), it));
+            }
+        }
+        let capacity = self.n_workers() * self.wall();
+        if pct(uncovered, capacity) >= crate::gate::UNCOVERED_MAX_PCT {
+            out.push(BlindSpot {
+                kind: BlindKind::Uncovered,
+                hidden_ns: uncovered,
+                subject: "workers".to_owned(),
+                title: format!(
+                    "workers ran jobs inside no span for {} ({:.1}% of workers x wall; the gate allows {:.0}%)",
+                    s(uncovered),
+                    pct(uncovered, capacity),
+                    crate::gate::UNCOVERED_MAX_PCT
+                ),
+                evidence: vec![format!("most: {}", list(&top(&mut lanes)))],
+                fix: "every job opens its own `job` span (blaze_graph::pool::span_jobs); find the job kind and span its work".to_owned(),
+            });
+        }
+        // CPU the spans did not count.
+        let running: i64 = self.running.iter().flatten().map(|it| it.1 - it.0).sum();
+        let cpu: i64 = self.facts.span_kinds.iter().map(|it| it.self_cpu_ns).sum();
+        let uncounted = model.spans.iter().filter(|it| it.self_cpu_ns.is_none()).count();
+        if running > 0 && (cpu * 2 < running || uncounted > 0) {
+            let mut evidence = vec![format!(
+                "the pool's switches say workers ran {}; spans counted {} of CPU ({:.0}%)",
+                s(running),
+                s(cpu),
+                pct(cpu, running)
+            )];
+            if uncounted > 0 {
+                evidence.push(format!("{uncounted} spans have no CPU (closed under another job's clock, or not counted)"));
+            }
+            evidence.push("the profile records no OS CPU for the process, so the spans' total can't be checked against it".to_owned());
+            out.push(BlindSpot {
+                kind: BlindKind::CpuGap,
+                hidden_ns: (running - cpu).max(0),
+                subject: "self_cpu_ns".to_owned(),
+                title: format!("workers ran {} that no span counted CPU for", s((running - cpu).max(0))),
+                evidence,
+                fix: "record the process's OS CPU (getrusage) per build beside the spans' sum; the rest is starvation (see starved workers) or CPU outside spans".to_owned(),
+            });
+        }
+        let jobs = report::job_totals(model);
+        if jobs.parked_ns == 0 && jobs.queued_ns == 0 && jobs.parked_or_queued_ns > 0 {
+            out.push(BlindSpot {
+                kind: BlindKind::NoReadyRows,
+                hidden_ns: jobs.parked_or_queued_ns,
+                subject: "switches.ready".to_owned(),
+                title: format!("{} of waiting can't be told parked from queued: the record has no `ready` rows", s(jobs.parked_or_queued_ns)),
+                evidence: Vec::new(),
+                fix: "a binary that writes `ready` switches (schema 2) says which, and who woke each wait".to_owned(),
+            });
+        }
+        let explained: u64 = self.facts.misses.iter().map(|it| it.count).sum();
+        if let Some(counted) = self.facts.build.misses
+            && counted > explained
+        {
+            out.push(BlindSpot {
+                kind: BlindKind::MissesUnexplained,
+                hidden_ns: 0,
+                subject: "misses".to_owned(),
+                title: format!("the build counted {counted} misses and the misses table explains {explained}"),
+                evidence: Vec::new(),
+                fix: "give every node that ran its task a misses row with its cause, or define builds.misses as what the table counts".to_owned(),
+            });
+        }
+        let a = model.anomalies;
+        if a.orphans + a.runs_cut + a.spans_of_no_lane + a.misnested > 0 {
+            out.push(BlindSpot {
+                kind: BlindKind::Misaligned,
+                hidden_ns: 0,
+                subject: "rows".to_owned(),
+                title: format!(
+                    "rows that did not line up: {} spans with no parent row, {} past their parent, {} runs cut, {} job spans of no job",
+                    a.orphans, a.misnested, a.runs_cut, a.spans_of_no_lane
+                ),
+                evidence: Vec::new(),
+                fix: "the recorder's rings wrote over rows before they were flushed: flush sooner or keep more".to_owned(),
+            });
+        }
+        let start_gap = self.path.start_ns().map_or(0, |it| it - model.bounds.start_ns);
+        match self.path.reached {
+            Reached::Fuel { steps } => out.push(BlindSpot {
+                kind: BlindKind::PathCut,
+                hidden_ns: start_gap,
+                subject: "critical path".to_owned(),
+                title: format!("the critical path stopped at its bound of {steps} steps"),
+                evidence: Vec::new(),
+                fix: "the walk's bound is the model's intervals: report it as a bug in time::path".to_owned(),
+            }),
+            Reached::LaneStart { lane } if start_gap * 20 > self.wall() => out.push(BlindSpot {
+                kind: BlindKind::PathCut,
+                hidden_ns: start_gap,
+                subject: "critical path".to_owned(),
+                title: format!("the critical path stops {} after the build's start, at the start of {}", s(start_gap), model.lanes[lane].id),
+                evidence: vec!["the record names no job that gave it to the pool".to_owned()],
+                fix: "write `by_job` on the `started` or `ran` row of every job given to the pool".to_owned(),
+            }),
+            _ => {}
+        }
+    }
+
+    fn summary(&self, smaller: u32, cut_ns: i64) -> Summary {
+        let model = self.model;
+        let busy_ns: i64 = self.running.iter().flatten().map(|it| it.1 - it.0).sum();
+        let path_by_link = LinkKind::ALL
+            .iter()
+            .map(|kind| Named {
+                // alloc: a name
+                name: kind.name().to_owned(),
+                ns: self.path.links.iter().filter(|it| it.kind == *kind).map(Link::dur_ns).sum(),
+            })
+            .filter(|it| it.ns > 0)
+            .collect();
+        let mut phases: HashMap<&str, i64, Global> = HashMap::new_in(Global);
+        for &(from, to, span, _) in &self.path_ran {
+            let name = span.map_or("inside no span", |it| model.spans[model.root_of(it)].name.as_str());
+            *phases.entry(name).or_default() += to - from;
+        }
+        // alloc: once a report
+        let mut path_by_phase: Vec<Named> = phases.into_iter().map(|(name, ns)| Named { name: name.to_owned(), ns }).collect();
+        path_by_phase.sort_by(|a, b| b.ns.cmp(&a.ns).then_with(|| a.name.cmp(&b.name)));
+        path_by_phase.truncate(6);
+        let reached = match self.path.reached {
+            Reached::BuildStart => "the build's start".to_owned(),
+            Reached::LaneStart { lane } => format!("the start of {}", model.lanes[lane].id),
+            Reached::Fuel { steps } => format!("its bound of {steps} steps"),
+            Reached::NoRun => "nothing: no job ran".to_owned(),
+        };
+        Summary {
+            wall_ns: self.wall(),
+            workers: self.workers.len() as u32,
+            busy_ns,
+            busy_ratio: busy_ns as f64 / (self.n_workers() * self.wall()).max(1) as f64,
+            span_cpu_ns: self.facts.span_kinds.iter().map(|it| it.self_cpu_ns).sum(),
+            path_ns: self.path.len_ns(),
+            path_reached: reached,
+            path_by_link,
+            path_by_phase,
+            smaller,
+            cut_ns,
+        }
+    }
+}
+
+/// `stretches` sorted and their overlaps merged.
+fn merge(stretches: &mut Vec<(i64, i64)>) {
+    stretches.sort_unstable();
+    let mut out: Vec<(i64, i64)> = Vec::with_capacity(stretches.len());
+    for &(from, to) in stretches.iter() {
+        match out.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    *stretches = out;
+}
+
+/// How many workers were busy over time: a step function, integrated.
+#[derive(Debug, Default)]
+struct Steps {
+    /// Each instant the level changes, sorted.
+    at: Vec<i64>,
+    /// The level from `at[i]` to `at[i + 1]`.
+    level: Vec<i64>,
+    /// The integral from `at[0]` to `at[i]`.
+    before: Vec<i128>,
+}
+
+impl Steps {
+    fn of<'s>(stretches: impl Iterator<Item = &'s [(i64, i64)]>) -> Steps {
+        // alloc: once a report
+        let mut edges: Vec<(i64, i64)> = Vec::new();
+        for it in stretches {
+            for &(from, to) in it {
+                edges.push((from, 1));
+                edges.push((to, -1));
+            }
+        }
+        edges.sort_unstable();
+        let mut steps = Steps::default();
+        let mut level = 0;
+        for (t, delta) in edges {
+            level += delta;
+            match steps.at.last() {
+                Some(&last) if last == t => *steps.level.last_mut().unwrap_or(&mut 0) = level,
+                _ => {
+                    let before = match (steps.at.last(), steps.level.last(), steps.before.last()) {
+                        (Some(&last), Some(&was), Some(&acc)) => acc + i128::from(was) * i128::from(t - last),
+                        _ => 0,
+                    };
+                    steps.at.push(t);
+                    steps.level.push(level);
+                    steps.before.push(before);
+                }
+            }
+        }
+        steps
+    }
+
+    /// The integral up to `t`.
+    fn upto(&self, t: i64) -> i128 {
+        let i = self.at.partition_point(|&it| it <= t);
+        match i.checked_sub(1) {
+            None => 0,
+            Some(i) => self.before[i] + i128::from(self.level[i]) * i128::from(t - self.at[i]),
+        }
+    }
+
+    /// Busy worker-nanoseconds from `from` to `to`.
+    fn integral(&self, from: i64, to: i64) -> i64 {
+        if to <= from {
+            return 0;
+        }
+        i64::try_from(self.upto(to) - self.upto(from)).unwrap_or(i64::MAX)
+    }
+}
+
+/// The critical path's running links cut by the innermost span open on their lane: (from, to,
+/// span, lane), in path order.
+fn path_segments(model: &Model, path: &Path) -> Vec<(i64, i64, Option<usize>, usize)> {
+    let mut cuts: HashMap<usize, Vec<(i64, i64, usize)>, Global> = HashMap::new_in(Global);
+    // alloc: once a report
+    let mut out = Vec::new();
+    for link in path.links.iter().filter(|it| it.kind == LinkKind::Ran) {
+        // alloc: a lane's cut, once a lane on the path
+        let cut = cuts.entry(link.lane).or_insert_with(|| innermost(model, link.lane));
+        let mut t = link.from_ns;
+        let at = cut.partition_point(|it| it.1 <= link.from_ns);
+        for &(from, to, span) in &cut[at..] {
+            if from >= link.to_ns {
+                break;
+            }
+            let (from, to) = (from.max(link.from_ns), to.min(link.to_ns));
+            if from > t {
+                out.push((t, from, None, link.lane));
+            }
+            if to > from {
+                out.push((from, to, Some(span), link.lane));
+            }
+            t = t.max(to);
+        }
+        if t < link.to_ns {
+            out.push((t, link.to_ns, None, link.lane));
+        }
+    }
+    out
+}
+
+/// A lane's time cut by the innermost of its spans open, end to end where spans are: (from, to,
+/// span), sorted, none overlapping.
+fn innermost(model: &Model, lane: usize) -> Vec<(i64, i64, usize)> {
+    let spans = &model.spans;
+    // alloc: a lane's cut, once a lane on the path
+    let mut out: Vec<(i64, i64, usize)> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    let mut t = i64::MIN;
+    let emit = |out: &mut Vec<(i64, i64, usize)>, from: i64, to: i64, span: usize| {
+        if to > from {
+            out.push((from, to, span));
+        }
+    };
+    for &i in &model.lanes[lane].spans {
+        let start = spans[i].start_ns;
+        while let Some(&top) = open.last()
+            && spans[top].end_ns() <= start
+        {
+            emit(&mut out, t, spans[top].end_ns(), top);
+            t = t.max(spans[top].end_ns());
+            open.pop();
+        }
+        if let Some(&top) = open.last() {
+            emit(&mut out, t, start, top);
+        }
+        t = t.max(start);
+        open.push(i);
+    }
+    while let Some(top) = open.pop() {
+        emit(&mut out, t, spans[top].end_ns(), top);
+        t = t.max(spans[top].end_ns());
+    }
+    out
+}
+
+/// What `lane` was doing at `t`: the innermost span of the interval there, in its outermost.
+fn doing_at(model: &Model, lane: usize, t: i64) -> String {
+    let lane_ = &model.lanes[lane];
+    let span = lane_
+        .at_or_before(t)
+        .and_then(|i| lane_.intervals[i].inside)
+        .or_else(|| lane_.spans.iter().copied().find(|&i| model.parent[i].is_none()));
+    match span {
+        Some(span) => {
+            let root = model.root_of(span);
+            match root == span {
+                true => model.spans[span].item(),
+                // alloc: a label
+                false => format!("{} in {}", model.spans[span].item(), model.spans[root].name),
+            }
+        }
+        // alloc: a label
+        None => lane_.id.to_string(),
+    }
+}
+
+/// `items` summed by name, the [`EXAMPLES`] largest, largest first (ties by name).
+fn top(items: &mut Vec<(String, i64)>) -> Vec<(String, i64)> {
+    items.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    // alloc: once a finding
+    let mut summed: Vec<(String, i64)> = Vec::new();
+    for (name, ns) in items.drain(..) {
+        match summed.last_mut() {
+            Some(last) if last.0 == name => last.1 += ns,
+            _ => summed.push((name, ns)),
+        }
+    }
+    summed.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let more = summed.len().saturating_sub(EXAMPLES);
+    summed.truncate(EXAMPLES);
+    if more > 0 {
+        summed.push((format!("{more} more"), -1));
+    }
+    summed
+}
+
+/// `items` as `name 1.2 s, name 0.4 s, 3 more`.
+fn list(items: &[(String, i64)]) -> String {
+    items
+        .iter()
+        .map(|(name, ns)| match *ns {
+            -1 => name.clone(), // clone: a cell
+            ns => format!("{} {}", if name.is_empty() { "(unnamed)" } else { name }, s(ns)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A source file and line named in `text`: `crates/base-db/src/maintain.rs:161`.
+fn file_in(text: &str) -> Option<String> {
+    let start = text.find("crates/").or_else(|| text.find("library/"))?;
+    let rest = &text[start..];
+    let end = rest.find(|c: char| c.is_whitespace() || c == ')' || c == ',').unwrap_or(rest.len());
+    let it = &rest[..end];
+    it.contains(".rs").then(|| it.to_owned())
+}

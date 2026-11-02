@@ -171,9 +171,9 @@ pub(super) fn run(hz: u32, sink: &Sink, stop: &AtomicBool) {
             new_names.clear();
             kept = Instant::now();
         }
-        #[allow(clippy::disallowed_methods, reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here")]
-        std::thread::sleep(every.saturating_sub(started.elapsed()));
+        super::pause(every.saturating_sub(started.elapsed()));
     }
+    // The tail: what was taken since the last batch, before `Sampler`'s drop returns.
     sink(&batch, &new_names);
 }
 

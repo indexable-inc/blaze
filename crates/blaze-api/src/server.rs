@@ -152,11 +152,51 @@ struct Connection {
     reader: Reader,
     receiving: Option<Tag>,
     sending: Option<Tag>,
+    /// How many bytes the send in flight carries, for [`Server::abandon`] to name.
+    sending_bytes: usize,
     /// Bytes waiting for the send in flight; empty while none is in flight, so a reply is
     /// encoded where it is sent from.
     queue: Vec<u8>,
     /// Hang up once everything queued is sent; nothing more is read.
     closing: bool,
+    /// The request the last reply queued on it answers, for [`Server::abandon`] to name.
+    last_request: Option<u64>,
+}
+
+/// What [`Server::abandon`] hung up on: each connection left, by its number, and what it was
+/// still owed.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct Abandoned {
+    pub conns: Vec<Unsent>,
+    /// Their [`Unsent::bytes`] together.
+    pub unsent_bytes: usize,
+}
+
+/// A connection [`Server::abandon`] hung up on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Unsent {
+    pub conn: Conn,
+    /// Replies queued for it, and the send in flight (some of which may have gone out).
+    pub bytes: usize,
+    /// The request the last reply queued for it answers: its end is among what went unsent
+    /// when `bytes` is not 0.
+    pub last_request: Option<u64>,
+}
+
+impl fmt::Display for Abandoned {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Abandoned { conns, unsent_bytes } = self;
+        write!(f, "hung up on {} connection(s) with {unsent_bytes} bytes of replies unsent", conns.len())?;
+        for (at, Unsent { conn, bytes, last_request }) in conns.iter().enumerate() {
+            let sep = if at == 0 { ": " } else { ", " };
+            write!(f, "{sep}connection {} ({bytes} bytes", conn.0)?;
+            match last_request {
+                Some(id) => write!(f, ", last reply to request {id})")?,
+                None => write!(f, ", nothing replied)")?,
+            }
+        }
+        Ok(())
+    }
 }
 
 enum Reader {
@@ -258,7 +298,7 @@ impl Server {
     pub fn reply(&mut self, reply: Reply, effects: &mut Vec<Effect>) {
         let RequestRef { conn, id } = reply.to;
         let Some(connection) = self.conns.get_mut(&conn) else { return };
-        let Connection { reader, queue, closing, .. } = connection;
+        let Connection { reader, queue, closing, last_request, .. } = connection;
         if *closing {
             return;
         }
@@ -278,6 +318,7 @@ impl Server {
                 }
             }
         }
+        *last_request = Some(id);
         self.flush(conn, effects);
     }
 
@@ -293,7 +334,14 @@ impl Server {
         }
     }
 
-    /// Unlistens, if it still listens, and hangs up every connection.
+    /// Unlistens, if it still listens, and hangs up every connection: at once when nothing is
+    /// left to send it, else once what was replied to it is sent ([`Server::close`]). A stop
+    /// right after the last replies (a daemon that fails as it answers its jobs) still tells
+    /// each client how its request ended, not just the start of it.
+    ///
+    /// The caller owns the bound: a peer that never reads keeps its connection's send in flight
+    /// for ever, and the server reads no clock. So the caller waits for those sends only up to
+    /// a deadline of its own, then calls [`Server::abandon`] and says what it names.
     pub fn stop(&mut self, effects: &mut Vec<Effect>) {
         self.stopped = true;
         self.unlisten(effects);
@@ -301,8 +349,35 @@ impl Server {
         let mut conns: Vec<Conn> = self.conns.keys().copied().collect();
         radix::sort_copy_by_key(&mut conns, |it| it.0);
         for conn in conns {
+            match self.conns.get(&conn).is_some_and(|it| it.sending.is_some()) {
+                true => self.close(conn),
+                false => self.gone(conn, effects),
+            }
+        }
+    }
+
+    /// Hangs up on every connection left, what is queued or in flight on it unsent: the end
+    /// of a stop whose caller's bound for [`Server::stop`]'s last sends passed. Each is gone
+    /// to the session, in `arrived`; the returned [`Abandoned`] names what each was still owed,
+    /// for the caller to say. A send that ends after is ignored, its connection gone.
+    pub fn abandon(&mut self, effects: &mut Vec<Effect>, arrived: &mut Vec<Arrived>) -> Abandoned {
+        self.stopped = true;
+        self.unlisten(effects);
+        // alloc: once, as a stop gives up on its last sends.
+        let mut conns: Vec<Conn> = self.conns.keys().copied().collect();
+        radix::sort_copy_by_key(&mut conns, |it| it.0);
+        let mut abandoned = Abandoned::default();
+        for conn in conns {
+            let Some(it) = self.conns.get(&conn) else { continue };
+            let in_flight = if it.sending.is_some() { it.sending_bytes } else { 0 };
+            let bytes = in_flight + it.queue.len();
+            abandoned.unsent_bytes += bytes;
+            // alloc: once per connection a stop gives up on.
+            abandoned.conns.push(Unsent { conn, bytes, last_request: it.last_request });
             self.gone(conn, effects);
         }
+        arrived.append(&mut self.told);
+        abandoned
     }
 
     fn tag(&mut self) -> Tag {
@@ -367,7 +442,15 @@ impl Server {
         };
         // alloc: none until a reply is queued; once per connection.
         let queue = Vec::new();
-        let connection = Connection { reader, receiving: None, sending: None, queue, closing: false };
+        let connection = Connection {
+            reader,
+            receiving: None,
+            sending: None,
+            sending_bytes: 0,
+            queue,
+            closing: false,
+            last_request: None,
+        };
         self.conns.insert(conn, connection);
         self.receive(conn, effects);
     }
@@ -625,6 +708,7 @@ impl Server {
         let tag = self.tag();
         let Some(connection) = self.conns.get_mut(&conn) else { return };
         connection.sending = Some(tag);
+        connection.sending_bytes = bytes.len();
         self.pending.insert(tag, Pending::Send(conn));
         effects.push(Effect::Send { conn, bytes, tag });
     }

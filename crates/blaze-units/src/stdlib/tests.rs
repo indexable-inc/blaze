@@ -407,6 +407,8 @@ fn key(root: ContentId) -> StdKey {
         host: "x86_64-unknown-linux-gnu".to_owned(),
         profile: "dev".to_owned(),
         profile_root: "dev".to_owned(),
+        macro_wasm: false,
+        runs_here: true,
         panic: "unwind".to_owned(),
         opt_level: "0".to_owned(),
         debug_assertions: true,

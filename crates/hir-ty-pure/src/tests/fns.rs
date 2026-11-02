@@ -90,7 +90,8 @@ pub fn compute(x: u32) -> u32 {
     for (name, want) in names.iter().zip(["compute", "middle", "helper", "deeper"]) {
         assert!(name.ends_with(want), "step `{name}` should be `{want}`: {}", refusal.said());
     }
-    assert!(refusal.what.contains("`var`"), "the last step calls `var`: {}", refusal.said());
+    // Named by its whole path (AGENTS.md rule 16), not its bare name.
+    assert!(refusal.what.contains("calls `std::env::var`"), "the last step calls `std::env::var`: {}", refusal.said());
     assert!(refusal.chain.iter().all(|it| it.at.is_some()), "each step says where: {:?}", refusal.chain);
     let said = refusal.said();
     assert!(said.contains("is `#[blaze::pure]`, but reads the environment"), "{said}");
@@ -154,7 +155,8 @@ pub fn compute(n: u32) -> u32 {
     );
     let trusted: Vec<(&str, &str)> = proof.trusted.iter().map(|it| (&*it.path, it.reason.as_str())).collect();
     assert_eq!(trusted.len(), 1, "par::map alone is trusted: {trusted:?}");
-    assert!(trusted[0].0.ends_with("map"), "{trusted:?}");
+    // The item, not the instance `par::map::<kernel::compute::{closure#0}>`: trust is the item's.
+    assert_eq!(trusted[0].0, "par::map", "{trusted:?}");
     assert_eq!(trusted[0].1, "results come back in item order");
     assert!(!proof.open);
 }

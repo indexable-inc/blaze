@@ -23,15 +23,22 @@ use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
 use blaze_query::db::{AsId, FromId};
 use hir_def::{
-    CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, ModuleDefId, StaticId,
+    AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup as _, ModuleDefId,
+    ModuleIdLt, StaticId,
     attrs::AttrFlags,
+    find_path::{FindPathConfig, PrefixKind, find_path},
+    item_scope::ItemInNs,
     lang_item::{LangItems, lang_items},
     nameres::crate_def_map,
-    signatures::{FunctionSignature, StaticFlags, StaticSignature},
+    signatures::{
+        EnumSignature, FunctionSignature, StaticFlags, StaticSignature, StructSignature, TraitSignature,
+        UnionSignature,
+    },
 };
-use hir_expand::name::Name;
+use hir_expand::{mod_path::PathKind, name::Name};
 use hir_ty::{
-    InferBodyId, MemoryMap, ParamEnvAndCrate, PointerCast,
+    InferBodyId,
+    display::{DisplayTarget, HirDisplay as _}, MemoryMap, ParamEnvAndCrate, PointerCast,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     drop::is_freeze,
     intrinsic::{Intrinsic, SimdOp},
@@ -476,6 +483,34 @@ impl<'db> Cx<'db> {
     pub(crate) fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
         normalize_or_keep(&self.infcx, self.env.param_env, ty)
     }
+
+    /// `ty` as a refusal shows it: see [`Shown`].
+    pub(crate) fn shown(&self, ty: Ty<'db>) -> Shown<'db> {
+        Shown::new(self.db, self.env.krate, ty)
+    }
+}
+
+/// A type as a refusal shows it to a person: the front end's display, as an editor's hover
+/// writes it (`Vec<u32>`, `dyn Fn(u8) -> bool`), never its debug form. Made before a refusal's
+/// text and written only if the text is.
+#[derive(Clone, Copy)]
+pub(crate) struct Shown<'db> {
+    db: &'db Db,
+    target: DisplayTarget,
+    ty: Ty<'db>,
+}
+
+impl<'db> Shown<'db> {
+    /// `ty`, displayed as the crate `krate` (its edition) writes types.
+    pub(crate) fn new(db: &'db Db, krate: Crate, ty: Ty<'db>) -> Shown<'db> {
+        Shown { db, target: DisplayTarget::from_crate(db, krate), ty }
+    }
+}
+
+impl std::fmt::Display for Shown<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.ty.display(self.db, self.target))
+    }
 }
 
 /// What a site reaches, and how its parameters take the site's operands.
@@ -864,8 +899,80 @@ pub(crate) fn name_of(db: &Db, instance: &Instance) -> String {
     }
 }
 
+/// `func` as a refusal names it, in backticks: by the path a user writes for it, the crate's
+/// name first (`std::sync::Mutex::lock`, not the module std defines it in), through its impl's
+/// type or its trait for a method; rustc's symbol spelling (`<T as Trait>::f`) for a trait impl's
+/// method or an impl on a type that is not an ADT.
 pub(crate) fn fn_name(db: &Db, func: FunctionId) -> String {
-    format!("`{}`", FunctionSignature::of(db, func).name.as_str()) // alloc: an impure script's reason
+    format!("`{}`", fn_item_path(db, func)) // alloc: an impure script's reason
+}
+
+/// `func` as an item, the way [`fn_name`] names it but without backticks: the function a person
+/// marks, never an instance of it, so every instance gives the same text (a proof's trusted
+/// function).
+pub(crate) fn fn_item_path(db: &Db, func: FunctionId) -> String {
+    let name = FunctionSignature::of(db, func).name.as_str();
+    let path = match func.lookup(db).container {
+        ItemContainerId::ImplId(imp) if db.impl_trait(imp).is_none() => match db.impl_self_ty(imp).skip_binder().kind() {
+            TyKind::Adt(adt, _) => Some(format!("{}::{name}", item_path(db, ModuleDefId::AdtId(adt.def_id())))), // alloc: an impure script's reason
+            _ => None,
+        },
+        ItemContainerId::ImplId(_) => None,
+        ItemContainerId::TraitId(trait_) => Some(format!("{}::{name}", item_path(db, ModuleDefId::TraitId(trait_)))), // alloc: an impure script's reason
+        ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => Some(item_path(db, ModuleDefId::FunctionId(func))),
+    };
+    let path = path.or_else(|| {
+        let args = GenericArgs::identity_for_item(DbInterner::new_no_crate(db), func.into());
+        hir_ty::attach_db(db, || hir_ty_mir::mir::type_name::rustc_function_name(db, func, args.as_slice()))
+    });
+    path.unwrap_or_else(|| name.to_owned()) // alloc: an impure script's reason
+}
+
+/// The path to `item` a user writes: the shortest from its crate's root that reaches it, the
+/// crate's name first; the modules it is written in when no path from the root reaches it (a
+/// private item).
+fn item_path(db: &Db, item: ModuleDefId) -> String {
+    let Some(module) = item.module(db) else { return String::new() }; // alloc: empty
+    let krate = module.krate(db);
+    let crate_name = krate.extra_data(db).display_name.as_ref().map(|it| it.crate_name().as_str());
+    let root = crate_def_map(db, krate).root_module_id();
+    let namespace = match item {
+        ModuleDefId::FunctionId(_) | ModuleDefId::ConstId(_) | ModuleDefId::StaticId(_) => ItemInNs::Values(item),
+        _ => ItemInNs::Types(item),
+    };
+    let config = FindPathConfig { prefer_no_std: false, prefer_prelude: false, prefer_absolute: false, allow_unstable: true };
+    let mut segments: Vec<&str> = Vec::new(); // alloc: an impure script's reason
+    segments.extend(crate_name);
+    let found = find_path(db, namespace, root, PrefixKind::ByCrate, true, config);
+    match &found {
+        Some(path) if path.kind == PathKind::Crate => segments.extend(path.segments().iter().map(|it| it.as_str())),
+        _ => {
+            // Not reachable from the root: the modules it is in, outermost first.
+            let mut modules = Vec::new(); // alloc: an impure script's reason
+            let mut at = Some(module);
+            while let Some(it) = at {
+                modules.extend(it.name(db));
+                at = it.containing_module(db).map(ModuleIdLt::to_static);
+            }
+            let names: Vec<String> = modules.iter().rev().map(|it| it.as_str().to_owned()).collect(); // alloc: an impure script's reason
+            let own = item_name(db, item);
+            return segments.iter().map(|it| (*it).to_owned()).chain(names).chain(own).collect::<Vec<_>>().join("::"); // alloc: an impure script's reason
+        }
+    }
+    segments.join("::") // alloc: an impure script's reason
+}
+
+/// The name `item` is declared with.
+fn item_name(db: &Db, item: ModuleDefId) -> Option<String> {
+    let name = match item {
+        ModuleDefId::FunctionId(it) => FunctionSignature::of(db, it).name.clone(), // clone: an interned name
+        ModuleDefId::AdtId(AdtId::StructId(it)) => StructSignature::of(db, it).name.clone(), // clone: an interned name
+        ModuleDefId::AdtId(AdtId::EnumId(it)) => EnumSignature::of(db, it).name.clone(), // clone: an interned name
+        ModuleDefId::AdtId(AdtId::UnionId(it)) => UnionSignature::of(db, it).name.clone(), // clone: an interned name
+        ModuleDefId::TraitId(it) => TraitSignature::of(db, it).name.clone(), // clone: an interned name
+        _ => return None,
+    };
+    Some(name.as_str().to_owned()) // alloc: an impure script's reason
 }
 
 /// What a leaf whose argument is not known is said to do.
@@ -1110,8 +1217,9 @@ impl<'a, 'db> Walk<'a, 'db> {
                 Flow::Unknown
             }
             Call::Method(Err(why)) => {
+                let receiver = self.cx.shown(args.type_at(0));
                 self.refuse_with(open_or_unchecked(args), || {
-                    format!("calls {} for `{:?}`, which no impl's method is found for: {}", fn_name(db, f), args.type_at(0), why.describe()) // alloc: an impure script's reason
+                    format!("calls {} for `{receiver}`, which no impl's method is found for: {}", fn_name(db, f), why.describe()) // alloc: an impure script's reason
                 });
                 Flow::Unknown
             }
@@ -1156,8 +1264,9 @@ impl<'a, 'db> Walk<'a, 'db> {
                     && matches!(f.loc(db).container, ItemContainerId::TraitId(_))
                     && !FunctionSignature::of(db, f).has_body() =>
             {
+                let receiver = self.cx.shown(args.type_at(0));
                 self.refuse_with(open_or_unchecked(args), || {
-                    format!("calls {} for `{:?}`, which no impl gives a body", fn_name(db, f), args.type_at(0)) // alloc: an impure script's reason
+                    format!("calls {} for `{receiver}`, which no impl gives a body", fn_name(db, f)) // alloc: an impure script's reason
                 });
                 Flow::Unknown
             }
@@ -1305,7 +1414,8 @@ impl<'a, 'db> Walk<'a, 'db> {
                 DropStep::NoDropTrait => self.refuse(Rule::Unchecked, "drops a value, but the toolchain has no `Drop::drop`"),
                 DropStep::Unknown(ty) => {
                     let rule = if ty.has_param() { Rule::Open } else { Rule::Unchecked };
-                    self.refuse_with(rule, || format!("drops `{ty:?}`, whose drop glue the walk does not know")) // alloc: an impure script's reason
+                    let ty = self.cx.shown(ty);
+                    self.refuse_with(rule, || format!("drops `{ty}`, whose drop glue the walk does not know")) // alloc: an impure script's reason
                 }
             }
         }
@@ -1399,8 +1509,9 @@ impl<'a, 'db> Walk<'a, 'db> {
             self.observe(EffectSet::one(Rule::Address), "transmutes a pointer to a number, which observes its address");
         }
         if self.code(to, false) && !self.code(from, false) {
+            let (from, to) = (self.cx.shown(from), self.cx.shown(to));
             self.refuse_with(Rule::Unchecked, || {
-                format!("transmutes `{from:?}` to `{to:?}`, a function pointer or vtable made of bytes") // alloc: an impure script's reason
+                format!("transmutes `{from}` to `{to}`, a function pointer or vtable made of bytes") // alloc: an impure script's reason
             });
         }
     }
@@ -1413,13 +1524,16 @@ impl<'a, 'db> Walk<'a, 'db> {
             match step {
                 UnsizeStep::Vtable(concrete, dyn_ty) => self.vtable(concrete, dyn_ty),
                 UnsizeStep::NotStruct(from) => {
-                    self.refuse_with(Rule::Unchecked, || format!("unsizes `{from:?}`, which is not a struct")) // alloc: an impure script's reason
+                    let from = self.cx.shown(from);
+                    self.refuse_with(Rule::Unchecked, || format!("unsizes `{from}`, which is not a struct")) // alloc: an impure script's reason
                 }
                 UnsizeStep::NoFields(from) => {
-                    self.refuse_with(Rule::Unchecked, || format!("unsizes `{from:?}`, a struct without fields")) // alloc: an impure script's reason
+                    let from = self.cx.shown(from);
+                    self.refuse_with(Rule::Unchecked, || format!("unsizes `{from}`, a struct without fields")) // alloc: an impure script's reason
                 }
                 UnsizeStep::Unfollowed(from, to) => {
-                    self.refuse_with(Rule::Unchecked, || format!("unsizes `{from:?}` to `{to:?}`, which the walk does not follow")) // alloc: an impure script's reason
+                    let (from, to) = (self.cx.shown(from), self.cx.shown(to));
+                    self.refuse_with(Rule::Unchecked, || format!("unsizes `{from}` to `{to}`, which the walk does not follow")) // alloc: an impure script's reason
                 }
             }
         }
@@ -1520,9 +1634,12 @@ impl<'a, 'db> Walk<'a, 'db> {
                 }
                 _ => match dyns.as_slice() {
                     &[dyn_ty] => self.vtable(pointee, dyn_ty),
-                    _ => self.refuse_with(Rule::Unchecked, || {
-                        format!("uses a value of `{ty:?}` holding a vtable of `{pointee:?}` for a trait the walk cannot name") // alloc: an impure script's reason
-                    }),
+                    _ => {
+                        let (ty, pointee) = (self.cx.shown(ty), self.cx.shown(pointee));
+                        self.refuse_with(Rule::Unchecked, || {
+                            format!("uses a value of `{ty}` holding a vtable of `{pointee}` for a trait the walk cannot name") // alloc: an impure script's reason
+                        });
+                    }
                 },
             }
         }

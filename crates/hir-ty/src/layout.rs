@@ -137,6 +137,9 @@ pub fn intern_layout(layout: Layout) -> Interned<'static, InternedLayout> {
 pub enum LayoutError {
     // FIXME: Remove more variants once they get added to LayoutCalculatorError
     BadCalc(LayoutCalculatorError<()>),
+    /// A coroutine's (an `async` body's) runtime MIR did not build, so what it keeps across
+    /// its suspension points is not known: the MIR error, as text.
+    CoroutineBody(Box<str>),
     /// A `#[blaze::bits]` struct that is refused: [`BitsError::message`] says why.
     Bits(Box<BitsError>),
     /// `variant`'s discriminant did not evaluate; rustc reports it (E0080) and stops.
@@ -162,6 +165,9 @@ impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LayoutError::BadCalc(err) => err.fallback_fmt(f),
+            LayoutError::CoroutineBody(error) => {
+                write!(f, "the coroutine's body did not build to MIR: {error}")
+            }
             LayoutError::Bits(err) => write!(
                 f,
                 "the `#[blaze::bits]` struct {:?} is refused ({err:?}); its definition's error says why",
@@ -642,7 +648,8 @@ fn layout_of_ty_in(
             let runtime = crate::mir::MirStage::Runtime;
             let body = db
                 .monomorphized_mir(owner, runtime, parent_args.store(), trait_env.clone()) // clone: two `u32` handles
-                .map_err(|_| LayoutError::Unknown)?;
+                // alloc: an error's text, kept in the layout query's memo
+                .map_err(|error| LayoutError::CoroutineBody(format!("{error:?}").into_boxed_str()))?;
             let held = body.held_locals_in(frame);
             let upvar_tys = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty());
             let mut upvars = Vec::with_capacity_in(upvar_tys.len(), frame);

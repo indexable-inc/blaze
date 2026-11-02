@@ -13,7 +13,7 @@ use std::{ffi::OsString, fmt::Write as _, io::Write as _, path::PathBuf, time::D
 use arrow_array::{Array, RecordBatch, cast::AsArray, types};
 use blaze_api::{Request, ResponseRef};
 use blaze_profile::{
-    history, live, sql,
+    history, live, slow, sql,
     time::{load, report::By},
     views,
 };
@@ -33,6 +33,7 @@ const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live 
                            [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE]";
 const EXPLAIN_USAGE: &str = "blaze explain VIEW [NAME=VALUE ...] [--json]";
 const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--json]";
+const SLOW_USAGE: &str = "blaze slow [--build N] [--top N] [--json]";
 
 /// `blaze explore`: the daemon's explorer started if it is not, its link printed (it carries
 /// the session's token: on this terminal only) and opened.
@@ -210,6 +211,38 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
     blaze_ui::why::lines(&mut text, &rebuilt);
     print!("{text}");
     Ok(())
+}
+
+/// `blaze slow [--build N] [--top N] [--json]`: what made a build slow, ranked by the wall time
+/// each fix would save, and what its profile could not see (blaze_profile::slow), of the last
+/// build that ended unless `--build` says.
+pub fn slow(words: Vec<OsString>, color: bool) -> i32 {
+    said(slowed(words), color)
+}
+
+fn slowed(words: Vec<OsString>) -> Result<(), Refusal> {
+    let (mut build, mut top, mut json) = (None, 10usize, false);
+    let mut words = texts(words)?.into_iter();
+    while let Some(word) = words.next() {
+        let mut number = |what: &str| -> Result<u64, Refusal> {
+            words.next().and_then(|it| it.parse().ok()).ok_or_else(|| Refusal::Usage(format!("{SLOW_USAGE}: `{word}` takes {what}")))
+        };
+        match word.as_str() {
+            "--build" => build = Some(number("a build id")?),
+            "--top" => top = usize::try_from(number("a number of findings")?).unwrap_or(usize::MAX),
+            "--json" => json = true,
+            _ => return Err(Refusal::Usage(format!("{SLOW_USAGE}, not `{word}`"))),
+        }
+    }
+    let (duckdb, dir) = history_source()?;
+    let source = load::Source { duckdb: &duckdb, history: &dir };
+    let report = slow::load::run(&source, build).map_err(|error| format!("`blaze slow`: {error}"))?;
+    let text = match json {
+        true => serde_json::to_string(&report).map_err(|error| format!("`blaze slow`'s report as JSON: {error}"))? + "\n",
+        false => slow::text(&report, top),
+    };
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes()).and_then(|()| out.flush()).map_err(|error| Refusal::Failed(format!("stdout: {error}")))
 }
 
 enum Refusal {

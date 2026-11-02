@@ -103,6 +103,8 @@ thread_local! {
     static UNTOLD_WRITER: RefCell<Option<blaze_cas::Writer>> = const { RefCell::new(None) };
     /// ... and runs this long before it keeps anything: a run of user code still going.
     static KEEPS_FOR: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    /// How many of its runs started.
+    static KEEPS_STARTED: Cell<usize> = const { Cell::new(0) };
     /// How many lowerings anew found in the store all a build of their checkout left for it
     /// ([`kept_key`]): what a restarted daemon's first build reads instead of working it out.
     static KEPT_READS: Cell<usize> = const { Cell::new(0) };
@@ -252,6 +254,7 @@ pub(super) fn unit(pkg_id: &str, kind: &str, mode: Mode, deps: &[usize]) -> Unit
         },
         profile: profile(),
         platform: None,
+        macro_wasm: false,
         mode,
         checked_as_test: false,
         features: Vec::new(),
@@ -390,6 +393,11 @@ impl Steps for Fake {
         LIBRARY_READS.set(LIBRARY_READS.get() + 1);
         let file = SourceFile { path: "core/src/lib.rs".into(), bytes: b"#![no_core]\n".to_vec(), mode: blaze_vfs::Mode::Regular };
         Ok(Library { at: LIBRARY.into(), fingerprint, source: Some(Source { files: vec![file], under: String::new() }) })
+    }
+
+    /// The fakes' build dirs are paths in the simulation (`/w/target`), never on disk: no lease.
+    fn lease(&self, _: &Units, _: &str, _: &str) -> super::work::Leased {
+        Ok(Ok(Vec::new())) // alloc: none, an empty vec
     }
 
     fn store_kept(&self, kept: &mut FakeInputs) -> Result<Vec<KeptPut>, ApiError> {
@@ -719,6 +727,7 @@ struct Keeps {
 impl Runs<Fake> for Keeps {
     fn start(&mut self, _: &Store, _: Option<&mut FakeWriter>, effects: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
         effects.push(Effect::Timer { after: KEEPS_FOR.get(), tag: self.tag });
+        KEEPS_STARTED.set(KEEPS_STARTED.get() + 1);
         None
     }
 
@@ -943,6 +952,7 @@ fn options() -> Options {
         build: blaze_api::Build::default(),
         // A table of its own: each daemon drives one, and tests run at once.
         outside: Box::leak(Box::new(blaze_vfs::outside::Dirs::new())),
+        stall: blaze_profile::Watchdog::BOUND,
         #[cfg(unix)]
         activated: None,
         profiling: None,
@@ -1721,6 +1731,10 @@ fn a_put_counted_and_not_yet_published_is_waited_for_and_answered_soon_after_it_
 /// Review 6 T4: the store breaking while a job is still running (its tests' run going, so not
 /// at its gate) answers that job naming the daemon's store, as soon as its run is killed;
 /// not a hangup, nor an answer only once the run ends of itself.
+///
+/// The store is broken in the turn after the run starts: the simulation's clock jumps to the
+/// next thing in flight once nothing is ready, so as soon as the loop goes idle with only the
+/// run's timer left, the run ends, however long its timer.
 #[test]
 fn a_job_still_running_when_the_store_breaks_is_answered_naming_the_store() {
     TESTS_KEEP.set(true);
@@ -1732,8 +1746,13 @@ fn a_job_still_running_when_the_store_breaks_is_answered_naming_the_store() {
     let mut client = dial(&mut daemon);
     let request =
         Request::Test { view: ViewRef::Head("/w".into()), targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
+    let started = KEEPS_STARTED.get();
     let id = client.send(&mut daemon, request);
-    turns(&mut daemon, &mut client, 3000);
+    turn_until(&mut daemon, |daemon| {
+        client.take(daemon);
+        KEEPS_STARTED.get() > started || client.done(id)
+    });
+    let start = daemon.driver().now();
     assert!(!client.done(id), "the tests' run is still going: {:#?}", client.of(id));
     assert!(daemon.store_deadline().is_none(), "the job is not at its gate");
     assert!(daemon.store().broken().is_none(), "the store has not broken yet");
@@ -1751,7 +1770,9 @@ fn a_job_still_running_when_the_store_breaks_is_answered_naming_the_store() {
     KEEPS_FOR.set(Duration::ZERO);
     TESTS_KEEP.set(false);
     assert!(daemon.store().broken().is_some(), "the store broke");
+    let took = daemon.driver().now() - start;
     let got = client.of(id);
+    assert!(took < Duration::from_secs(3600), "not answered while its run was still going ({took:?} on the clock): {got:#?}");
     assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
     let named = |it: &Response| {
         matches!(it, Response::Error(error) if error.what.contains("the daemon's store")
@@ -1760,10 +1781,50 @@ fn a_job_still_running_when_the_store_breaks_is_answered_naming_the_store() {
     assert!(got.iter().any(named), "{got:#?}");
 }
 
+/// Review C1/T1: a client that stopped reading while its answer is being sent holds a stop
+/// open only for [`LAST_EFFECTS`](super::daemon::LAST_EFFECTS). Then the daemon hangs up on it,
+/// names the connection, the bytes it never got and the request they answer, and stops.
+/// Before, the stop ended at the bound with the connection left open and nothing said.
+#[test]
+fn a_stop_hangs_up_on_a_client_that_stopped_reading_once_its_last_sends_outlast_the_bound() {
+    let sim = Sim::new(73, Faults::default());
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 73);
+    let mut client = dial(&mut daemon);
+    let first = client.send(&mut daemon, Request::Status);
+    client.wait(&mut daemon, first);
+    daemon.driver().hold_sends(client.conn);
+    let id = client.send(&mut daemon, Request::Status);
+    turn_until(&mut daemon, |daemon| daemon.driver().held_sends() > 0);
+    let asked = daemon.driver().now();
+    daemon.stop();
+    // The simulation's clock jumps only to what will end; a send held for ever will not, so
+    // the test lets time pass as it would for a real daemon.
+    let mut turns = 0;
+    while daemon.turn() {
+        daemon.driver().advance(Duration::from_millis(1));
+        turns += 1;
+        assert!(turns < TURNS, "the daemon never stopped");
+    }
+    let took = daemon.driver().now() - asked;
+    let bound = super::daemon::LAST_EFFECTS;
+    assert!(took > bound && took < bound + Duration::from_secs(1), "stopped {took:?} after it was asked; its bound for last sends is {bound:?}");
+    assert!(daemon.driver().peer_hung_up_on(client.conn), "the stop left the client that stopped reading connected");
+    assert_eq!(daemon.driver().held_sends(), 0, "the hang-up ends the held send");
+    client.take(&mut daemon);
+    assert!(!client.done(id), "a held send reached the client: {:?}", client.of(id));
+    let abandoned = daemon.abandoned().expect("the stop names the client it gave up on");
+    assert_eq!(abandoned.conns.len(), 1, "{abandoned}");
+    let lost = abandoned.conns[0];
+    assert_eq!((lost.conn, lost.last_request), (client.conn, Some(id)), "{abandoned}");
+    assert!(lost.bytes > 0 && abandoned.unsent_bytes == lost.bytes, "{abandoned}");
+}
+
 /// Review W1: only the commit's own steps are its progress. With its syncs held, the store
-/// still answers other things (placements, here, every quarter of the bound, across it), and
-/// the build fails once the commit has stood still for [`DURABLE_WITHIN`] all the same. A rule
-/// that counted any completion of the store kept it waiting for ever.
+/// still answers other things (placements, here, every quarter of the bound, up to and in the
+/// tick of the bound itself), and the build fails once the commit has stood still for
+/// [`DURABLE_WITHIN`] all the same, and not before. A rule that counted any completion of the
+/// store kept it waiting for ever.
 #[test]
 fn a_hung_commit_fails_at_the_bound_though_the_store_answers_placements_meanwhile() {
     let mut sim = Sim::new(198, Faults::default());
@@ -1779,6 +1840,8 @@ fn a_hung_commit_fails_at_the_bound_though_the_store_answers_placements_meanwhil
     assert!(daemon.driver().held_syncs() > 0, "the store's commit is held");
     let ran = daemon.driver().now() - start;
     assert!(ran < Duration::from_secs(1), "the build took {ran:?} of the clock before the advance");
+    let deadline = daemon.store_deadline().expect("the job waits at its gate");
+    assert!(deadline >= start + DURABLE_WITHIN, "the job's next deadline {deadline:?} is no bound from {start:?}");
     let mut placed = 0;
     for quarter in 0..12 {
         if client.done(id) {
@@ -1789,12 +1852,17 @@ fn a_hung_commit_fails_at_the_bound_though_the_store_answers_placements_meanwhil
         turns(&mut daemon, &mut client, 50);
         placed += 1;
     }
-    assert!(placed > 4, "the store answered placements across the bound ({placed} quarters)");
+    // The wait began within the opening turns, under a second in, so the bound falls on the
+    // fourth quarter: the placement asked then answers in the bound's own tick, dispatched
+    // before the turn's expiry judges the wait (`>=` in `gave_up`), and the build fails there.
+    assert!(placed >= 4, "the store answered placements every quarter up to the bound ({placed} quarters)");
     let got = client.of(id);
     assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
     let named = |it: &Response| matches!(it, Response::Error(error) if error.what.contains("answered nothing") && error.what.contains("store ticket"));
     assert!(got.iter().any(named), "{got:#?}");
-    let took = daemon.driver().now() - start;
+    let now = daemon.driver().now();
+    assert!(now >= deadline, "failed at {now:?}, before the bound at {deadline:?}");
+    let took = now - start;
     assert!(took < DURABLE_WITHIN * 2, "failed at {took:?}, not at the bound");
 }
 
@@ -1997,39 +2065,46 @@ fn a_crash_after_any_turn_keeps_what_was_answered_and_restores_to_a_fresh_build(
 
 /// A build of a checkout asked while the checkout's last front end is being stored waits for
 /// the store (its lowering held, named in a stall) and lowers into the front end it stored,
-/// rather than lowering anew beside it. The seeded runner leaves the store's task queued on
-/// some turns: across seeds, at least one asks the second build then.
+/// rather than lowering anew beside it. An inline run is over as it is taken, the next turn
+/// after the store is posted, long before a second build's view is ready, so the store's task
+/// is held on the runner ([`Daemon::hold_tasks_for_test`]), as a large front end's store runs
+/// on a worker, and let go once the second build's lowering is seen waiting on it. Across
+/// seeds, for the order of everything else.
 #[test]
 fn a_build_asked_while_its_front_end_is_stored_waits_and_lowers_into_it() {
-    let mut held = 0;
     for seed in 150..170 {
         let mut sim = Sim::new(seed, Faults::default());
         checkout(&mut sim, "[package]\nname = \"app\"\n");
         let steps = Arc::new(Fake::default());
         let mut daemon = start(sim, &steps, seed);
+        daemon.hold_tasks_for_test(blaze_graph::admission::kinds::STORE_KEPT, true);
         let mut client = dial(&mut daemon);
         let first = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
         turn_until(&mut daemon, |daemon| {
             client.take(daemon);
             daemon.storing() > 0 || client.done(first)
         });
-        if client.done(first) {
-            continue;
-        }
+        assert!(!client.done(first), "seed {seed}: answered before its front end was stored: {:#?}", client.of(first));
         let (anew, into_kept) = (ANEW.get(), INTO_KEPT.get());
         let second = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
-        let mut saw_held = false;
+        // Let go in the turn it is seen: with the store and the lowering both waiting, nothing
+        // else is in flight, and the simulation's clock would jump to the stall's timer.
         turn_until(&mut daemon, |daemon| {
             client.take(daemon);
-            saw_held |= daemon.held_lowerings().iter().any(|it| it.checkout == "/w" && it.on.is_some());
+            let held = daemon.held_lowerings().iter().any(|it| it.checkout == "/w" && it.on.is_some());
+            held || client.done(second)
+        });
+        assert!(!client.done(second), "seed {seed}: the second build never waited for the store: {:#?}", client.of(second));
+        assert!(daemon.storing() > 0, "seed {seed}: the store ended while held");
+        daemon.hold_tasks_for_test(blaze_graph::admission::kinds::STORE_KEPT, false);
+        turn_until(&mut daemon, |daemon| {
+            client.take(daemon);
             client.done(first) && client.done(second)
         });
         assert_eq!(client.of(first).last(), Some(&Response::Done { ok: true }), "seed {seed}");
         assert_eq!(client.of(second).last(), Some(&Response::Done { ok: true }), "seed {seed}");
         assert_eq!((ANEW.get(), INTO_KEPT.get()), (anew, into_kept + 1), "seed {seed}: the second lowers into the stored front end");
-        held += usize::from(saw_held);
     }
-    assert!(held > 0, "no seed asked the second build while the first's front end was stored");
 }
 
 /// After a restart the front end the last build kept is gone from memory: the first build

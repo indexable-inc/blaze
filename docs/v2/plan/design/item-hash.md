@@ -61,7 +61,7 @@ of inference, MIR building and the borrow check it covers: those reads are *cove
 
 | input | why | covers |
 |---|---|---|
-| `blaze_items::key::crate_key` (name, version, origin, kind of target, every cfg, features) | cfg decides what was lowered; features change std's and the crate's code | crate graph input fields |
+| `blaze_items::key::crate_key` (name, version, origin, what it is built for (host, target triple or wasm proc macros), kind of target, every cfg, features) | cfg decides what was lowered; features change std's and the crate's code | crate graph input fields |
 | edition | method resolution (`IntoIterator` for arrays), prelude, closure captures, `if let` rescope, never-type fallback | `Crate::data` edition reads |
 | the target: tuple, data layout, arch, pointer width, endian | `size_of` in constants, layout of types in casts, `cfg` | `target_data_layout_query` |
 | the toolchain: `goal_store::solver_version(build)` (pinned nightly, the solver's patch series, the front end's own code) | everything | the code itself |

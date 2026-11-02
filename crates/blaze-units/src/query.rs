@@ -340,7 +340,7 @@ pub struct Units {
 }
 
 impl Versioned for Units {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 11");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 12");
 }
 
 /// What cargo passes and writes for one unit.
@@ -385,9 +385,10 @@ pub struct UnitPlan {
     /// other command, a package outside the workspace, the standard library, a build script's
     /// run).
     pub clippy: Option<Clippy>,
-    /// The unit is built for `-Z wasm-macros`' platform, its own or the standard library's
-    /// for it: its code calls the macro host's bridge (`proc_macro_bridge`), and a proc macro's
-    /// links as a WASI reactor the host loads.
+    /// The unit is built to run in the macro host ([`crate::schema::Unit::macro_wasm`], which
+    /// this follows), a proc macro's or the standard library's for it: its code calls the macro
+    /// host's bridge (`proc_macro_bridge`), and a proc macro's links as a WASI reactor the host
+    /// loads.
     pub macro_wasm: bool,
 }
 
@@ -511,10 +512,20 @@ pub struct StdKey {
     /// `dev` or `release`: what the build's profile inherits from at the root, whose
     /// `[profile.<root>.package.*]` tables of library/Cargo.toml apply to std.
     pub profile_root: String,
+    /// The std of the wasm proc macros ([`crate::schema::Unit::macro_wasm`]), whose code calls
+    /// the macro host's bridge: never the same std as a `--target wasm32-wasip1` build's, even
+    /// where every other field is equal, so the two are never placed in one directory.
+    pub macro_wasm: bool,
+    /// Whether its code runs on the machine that builds it ([`crate::schema::runs_here`] of
+    /// the platform and profile, as each of its units' codegen reads it): a dev build's host
+    /// std is compiled for this machine's own CPU, the std of a `--target` of the host's own
+    /// triple for the target's baseline. Two stds, never one directory; a release build's
+    /// two are one.
+    pub runs_here: bool,
 }
 
 impl StdKey {
-    pub const DOMAIN: &'static str = "blaze v2 cargo std key 3";
+    pub const DOMAIN: &'static str = "blaze v2 cargo std key 5";
 
     pub fn id(&self) -> ContentId {
         crate::load::key_id(StdKey::DOMAIN, self)
@@ -649,9 +660,15 @@ mod tests {
             host: "x86_64-unknown-linux-gnu".to_owned(),
             rustflags: vec![],
             profile_root: "dev".to_owned(),
+            macro_wasm: false,
+            runs_here: true,
         };
         let abort = StdKey { panic: "abort".to_owned(), ..key.clone() };
         assert_ne!(key.id(), abort.id());
+        let macros = StdKey { macro_wasm: true, ..key.clone() };
+        assert_ne!(key.id(), macros.id(), "the wasm macros' std is never the target's");
+        let shipped = StdKey { runs_here: false, ..key.clone() };
+        assert_ne!(key.id(), shipped.id(), "a std for this machine's CPU is never the baseline's");
         let avx = StdKey { rustflags: vec!["-Ctarget-feature=+avx2".to_owned()], ..key.clone() };
         assert_ne!(key.id(), avx.id());
         assert_eq!(key.id(), key.clone().id());

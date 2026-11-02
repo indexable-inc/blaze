@@ -184,19 +184,54 @@ pub(crate) fn names(
     func: &cranelift_codegen::ir::Function,
     requests: &Requests,
     resolve: &impl Resolver,
-) -> Result<(Vec<Target>, Vec<Data>), String> {
+) -> Result<(Vec<Option<Target>>, Vec<Data>), String> {
     // alloc: none until it has data of its own, which the caller keeps
     let mut own = OwnData { data: Vec::new(), word: word(arch), owner: None };
     let declared = func.params.user_named_funcs();
     let named = declared.values().filter(|it| it.namespace == 1).map(|it| it.index as usize);
     let datas = own.requests(frame, requests, resolve, named)?;
+    let called = called_names(func);
     // alloc: per function handed out, its names, kept by the caller
     let mut names = Vec::with_capacity(declared.len());
-    for name in declared.values() {
+    for (at, name) in declared.iter() {
+        // A body built in keeps its declaration once it is put in its place (`inline`),
+        // which no instruction calls then: no target of the build. A call of one left in
+        // place is refused by `reloc_target`, naming it.
+        if name.namespace == fragment::INLINED && !called[at.as_u32() as usize] {
+            names.push(None);
+            continue;
+        }
         let name = RelocName::user(name.namespace, name.index);
-        names.push(reloc_target(key, name, requests, &datas, resolve)?);
+        names.push(Some(reloc_target(key, name, requests, &datas, resolve)?));
     }
     Ok((names, own.data))
+}
+
+/// For each user name `func` declares, by its index, whether an instruction refers to it
+/// through a function reference: a call, a tail call, a `try_call` or a `func_addr`.
+fn called_names(func: &cranelift_codegen::ir::Function) -> Vec<bool> {
+    use cranelift_codegen::entity::EntityRef as _;
+    use cranelift_codegen::ir::{ExternalName, InstructionData, instructions::CallInfo};
+    // alloc: one flag a declared name, per function handed out
+    let mut called = vec![false; func.params.user_named_funcs().len()];
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            let data = &func.dfg.insts[inst];
+            let func_ref = match data.analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables) {
+                CallInfo::Direct(func_ref, _) | CallInfo::DirectWithSig(func_ref, ..) => Some(func_ref),
+                _ => match *data {
+                    InstructionData::FuncAddr { func_ref, .. } => Some(func_ref),
+                    _ => None,
+                },
+            };
+            if let Some(func_ref) = func_ref
+                && let ExternalName::User(name) = func.dfg.ext_funcs[func_ref].name
+            {
+                called[name.index()] = true;
+            }
+        }
+    }
+    called
 }
 
 /// A static's value: its own data, the target of each of its requests, and its blob's
@@ -457,6 +492,14 @@ fn reloc_target(
             // alloc: an error
             Err(format!("a relocation at tier counter cells {index}, where a function has only its own (0)"))
         }
+        // A metered function's calls of the fuel runtime (`blaze_stencil::fuel`), outside
+        // symbols of the program's std.
+        RelocName::User { namespace: blaze_stencil::fuel::NAMESPACE, index } => match blaze_stencil::fuel::symbol(index) {
+            // alloc: the target's name
+            Some(name) => Ok(Target::Extern(name.to_owned())),
+            // alloc: an error
+            None => Err(format!("a relocation at fuel runtime function {index}, of 2")),
+        },
         RelocName::User { namespace, .. } => {
             // alloc: an error
             Err(format!("a relocation in the unknown namespace {namespace}"))

@@ -814,7 +814,7 @@ impl Lint {
                 "store every row's items in one flat `Vec<T>` (`String` for text) with a `Vec<u32>` of where each row starts; or say why with `#[expect(blaze::jagged_vec, reason = \"..\")]`"
             }
             Lint::StableSortNeedless => {
-                "use `sort_unstable`, `sort_unstable_by` or `sort_unstable_by_key`: equal elements here can't be told apart, so the order is the same"
+                "use `sort_unstable`, `sort_unstable_by` or `sort_unstable_by_key`; or say why the old order of equal elements matters with `#[expect(blaze::stable_sort_needless, reason = \"..\")]`"
             }
             Lint::ProfileHot => {
                 "fix what the lint names in this function, which the profile shows running hot; or allow the lint here if the profile's workload is not the one that matters"

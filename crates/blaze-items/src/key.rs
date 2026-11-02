@@ -12,8 +12,9 @@
 //! and the top bit of byte 8 says whether it is inside a body (an item of a block, a closure,
 //! an opaque type). [`resolve`] reads both and looks in one index of one crate.
 //!
-//! A crate is named by its content, never by its `Crate` id: its name, version, origin, kind
-//! of target (what it is built as and the manifest target's kind, so an example and an
+//! A crate is named by its content, never by its `Crate` id: its name, version, origin, what
+//! it is built for (the host, a target triple or the wasm proc macros, as cargo's units tell
+//! two builds of one package apart), kind of target (what it is built as and the manifest target's kind, so an example and an
 //! integration test of one name are two crates), edition, crate attributes, dependencies (by
 //! name and key) and the cfg it is built with. Features are in the cfg: one package is built
 //! twice in one build, for the host and for the target, with different features and, when not
@@ -66,7 +67,7 @@ use syntax::view::HasName;
 use crate::{ItemId, ItemKey, NAME_DOMAIN, NameHash, SimplifiedType};
 
 pub const KEY_DOMAIN: &str = "blaze v2 item key 2";
-pub const CRATE_DOMAIN: &str = "blaze v2 crate key 3";
+pub const CRATE_DOMAIN: &str = "blaze v2 crate key 4";
 pub const SIMPLIFIED_DOMAIN: &str = "blaze v2 simplified type 1";
 
 /// What a key names, in the current database.
@@ -98,6 +99,11 @@ pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
     h.opt_part(extra.display_name.as_ref().map(|name| name.canonical_name().as_str()))
         .opt_part(extra.version.as_deref());
     data.origin.hash_into(&mut h);
+    // What it is built for: the host, a target or the wasm proc macros. Two builds of one
+    // package and cfg for two of these (std for the host and for `--target` of the host's own
+    // triple, or for `wasm32-wasip1` and its proc macros) differ in what the key leaves out,
+    // their `OUT_DIR` and build script runs, so they are two crates.
+    extra.built_for.hash_into(&mut h);
     // Which of its package's targets it is, as cargo's units tell them apart: the kind of
     // the manifest's target with its name above, and what it is built as (`--test` makes any
     // target a test). An example and an integration test of one name are two crates, both
@@ -1115,6 +1121,8 @@ pub struct ClashingCrate {
     pub version: Option<String>,
     pub origin: String,
     pub kind: String,
+    /// What it is built for: `the host`, a triple, or a triple and `(proc macros)`.
+    pub built_for: String,
 }
 
 impl ClashingCrate {
@@ -1132,6 +1140,7 @@ impl ClashingCrate {
                 // alloc: as above
                 format!("{} of the {} target", cargo_kind(data.target_kind), cargo_kind(data.manifest_kind))
             },
+            built_for: extra.built_for.to_string(), // alloc: an error's, once
         }
     }
 }
@@ -1143,7 +1152,15 @@ fn cargo_kind(kind: base_db::TargetKind) -> &'static str {
 
 impl fmt::Display for ClashingCrate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}@{} ({}, {})", self.name, self.version.as_deref().unwrap_or("?"), self.origin, self.kind)
+        write!(
+            f,
+            "{}@{} ({}, {}, for {})",
+            self.name,
+            self.version.as_deref().unwrap_or("?"),
+            self.origin,
+            self.kind,
+            self.built_for
+        )
     }
 }
 
@@ -1153,8 +1170,8 @@ impl fmt::Display for CrateKeyClash {
         match self.same_key {
             true => write!(
                 f,
-                "crates {a} and {b} have one key: the same name, version, origin, kind of target, \
-                 edition, crate attributes, dependencies and cfg, so the crate graph holds one crate twice"
+                "crates {a} and {b} have one key: the same name, version, origin, platform, kind of \
+                 target, edition, crate attributes, dependencies and cfg, so the crate graph holds one crate twice"
             ),
             false => write!(f, "crates {a} and {b} have keys with equal first 8 bytes (a 64-bit collision)"),
         }

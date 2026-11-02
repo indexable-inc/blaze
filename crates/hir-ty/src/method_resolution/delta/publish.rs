@@ -547,10 +547,13 @@ impl Published {
         )
     }
 
-    /// Gives the directory the keys first seen in this write, making it (and registering it in
-    /// [`ImplSlices`]) the first time. A directory field is set only when its keys grew.
-    pub(crate) fn finish(&mut self, db: &mut Db, krate: Crate) -> u64 {
+    /// Gives the directory the keys first seen in this write, making it the first time: how
+    /// many inputs it set or made, and the directory when it made it, which the run registers
+    /// in [`ImplSlices`] with every other crate's ([`register`]). A directory field is set only
+    /// when its keys grew.
+    pub(crate) fn finish(&mut self, db: &mut Db, krate: Crate) -> (u64, Option<SliceDirectory>) {
         let mut set = 0;
+        let mut made = None;
         match self.directory {
             Some(directory) => {
                 if std::mem::take(&mut self.new_traits) {
@@ -588,27 +591,32 @@ impl Published {
                     self.body_modules.clone(),    // clone: a count
                 );
                 self.directory = Some(directory);
-                register(db, krate, directory);
+                made = Some(directory);
                 set += 1;
             }
         }
-        set
+        (set, made)
     }
 }
 
-/// Adds `krate`'s directory to the singleton.
-fn register(db: &mut Db, krate: Crate, directory: SliceDirectory) {
+/// Adds the directories of the crates a run first maintained to the singleton, with one write:
+/// a write opens a view, which sweeps every `lru` table, so one per crate was a sweep per crate.
+/// Nothing when there are none.
+pub(crate) fn register(db: &mut Db, directories: &[(Crate, SliceDirectory)]) {
+    if directories.is_empty() {
+        return;
+    }
     match ImplSlices::try_get(&*db) {
         Some(all) => {
-            // alloc: clone: the crate map, once per crate first maintained
+            // alloc: clone: the crate map, once per write that first maintains a crate
             let mut crates = (**all.crates(&*db)).clone();
-            crates.insert(krate, directory);
-            // alloc: the singleton's map, once per crate first maintained
+            crates.extend(directories.iter().copied());
+            // alloc: the singleton's map, once per write that first maintains a crate
             all.set_crates(db).to(Arc::new(crates));
         }
         None => {
             let mut crates = HashMap::new_in(Global);
-            crates.insert(krate, directory);
+            crates.extend(directories.iter().copied());
             // alloc: the singleton's map, once per database
             _ = ImplSlices::new(db, Arc::new(crates));
         }

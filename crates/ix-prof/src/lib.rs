@@ -15,7 +15,7 @@
 //! On, it records CPU samples of every thread (no registration), the span tree of `tracing`
 //! spans with each span's own CPU time and allocations, waits (spans with a `wait` field),
 //! sampled allocations by stack with live and total bytes, and heap counters; when the guard
-//! drops it writes `<dir>/<program>-<pid>.ixprof`. Off (no `IX_PROF`, no `IX_PROF_HTTP`),
+//! drops it writes `<dir>/<program>-<pid>-<session>.ixprof`. Off (no `IX_PROF`, no `IX_PROF_HTTP`),
 //! nothing runs and each span callback and allocation costs one relaxed load.
 //!
 //! The format and every interface: docs/ix-prof.md and docs/ix-prof-format.md.
@@ -37,7 +37,8 @@ pub mod alloc;
 pub mod chrome;
 pub mod clock;
 pub mod core;
-#[cfg(feature = "http")]
+pub mod endpoint;
+#[cfg(all(feature = "http", unix))]
 pub mod http;
 pub mod ixprof;
 pub mod json;
@@ -52,6 +53,7 @@ pub mod sampler;
 pub mod symbols;
 #[cfg(test)]
 mod tests;
+pub mod token;
 pub mod view;
 
 #[cfg(feature = "layer")]
@@ -183,13 +185,25 @@ impl Config {
 
 pub(crate) struct Session {
     pub(crate) config: Config,
-    pub(crate) recorder: Mutex<core::Recorder>,
+    /// Shared with the sampler's sink, which feeds it directly (not through [`SESSION`]), so
+    /// the sampler's last batch lands while [`Guard::stop`] joins it.
+    pub(crate) recorder: Arc<Mutex<core::Recorder>>,
     pub(crate) log: Mutex<live::Log>,
     pub(crate) live_wanted: AtomicBool,
-    stop: Arc<AtomicBool>,
+    /// The live stream's session id, also in the profile's file name.
+    id: String,
+    stop: AtomicBool,
     #[cfg(feature = "sampler")]
     sampler: Mutex<Option<sampler::Sampler>>,
+    ticker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    #[cfg(all(feature = "http", unix))]
+    http: Mutex<Option<http::Server>>,
 }
+
+/// Held by every test that starts the profiler or turns the allocator on: they share
+/// [`SESSION`], [`RECORDING`] and the allocator's globals.
+#[cfg(test)]
+pub(crate) static TEST_GLOBALS: Mutex<()> = Mutex::new(());
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
 static SESSION: Mutex<Option<Arc<Session>>> = Mutex::new(None);
@@ -212,10 +226,37 @@ pub(crate) fn with_recorder(f: impl FnOnce(&mut core::Recorder)) {
 }
 
 /// Starts the profiler; it stops, and writes its profile, when the guard drops.
+///
+/// Every step that can fail (binding the endpoint, the sampler, the ticker and server
+/// threads, writing `http.addr`) runs before the session is published and recording turned
+/// on, and a failure stops whatever had started: an `Err` leaves no thread running, nothing
+/// recording and no session, so a later `start` begins clean.
 pub fn start(config: Config) -> Result<Guard, Error> {
     let mut slot = SESSION.lock();
     if slot.is_some() {
         return Err(Error::AlreadyStarted);
+    }
+    // Checked now, not at exit: a directory that is not this user's own is refused before the
+    // run, not after it, when the profile would be lost.
+    if let Some(dir) = &config.dir {
+        private_dir(dir).map_err(|why| Error::Write { path: dir.clone(), why })?;
+    }
+    #[cfg(all(feature = "http", unix))]
+    let bound = config.http.as_deref().map(http::bind).transpose().map_err(Error::Http)?;
+    #[cfg(all(feature = "http", not(unix)))]
+    if config.http.is_some() {
+        return Err(Error::Http(format!(
+            "{VAR_HTTP} is set but the endpoint needs a Unix platform (its stop and token file), not {}",
+            std::env::consts::OS
+        )));
+    }
+    #[cfg(not(feature = "http"))]
+    if config.http.is_some() {
+        return Err(Error::Http(format!("{VAR_HTTP} is set but ix-prof was built without its `http` feature")));
+    }
+    #[cfg(not(feature = "sampler"))]
+    if config.cpu_hz.is_some() {
+        return Err(Error::Sampler("ix-prof was built without its `sampler` feature".to_owned()));
     }
     let pid = std::process::id();
     let program = config.program.clone().unwrap_or_else(|| {
@@ -226,7 +267,8 @@ pub fn start(config: Config) -> Result<Guard, Error> {
     });
     let start_ns = clock::now_ns();
     let start_unix_ns = clock::unix_ns();
-    let alloc_on = alloc::turn_on(config.alloc_sample_bytes);
+    // Turned on when the session is published; whether it is installed is known now.
+    let alloc_on = alloc::installed();
     let meta = profile::Meta {
         program: program.clone(),
         producer: concat!("ix-prof ", env!("CARGO_PKG_VERSION")).to_owned(),
@@ -247,89 +289,187 @@ pub fn start(config: Config) -> Result<Guard, Error> {
         symbolized: true,
         labels: config.labels.iter().cloned().collect(),
     };
-    let mut recorder = core::Recorder::new(pid, &program, meta, config.limits.clone());
-    let session_id = live::session_id(pid, start_ns, start_unix_ns);
-    let log = live::Log::new(session_id, config.retain_bytes);
-    let stop = Arc::new(AtomicBool::new(false));
+    let recorder = Arc::new(Mutex::new(core::Recorder::new(pid, &program, meta, config.limits.clone())));
+    let id = live::session_id(pid, start_ns, start_unix_ns, nonce());
+    let log = live::Log::new(id.clone(), config.retain_bytes);
     #[cfg(feature = "sampler")]
     let sampler = match config.cpu_hz {
         Some(hz) => {
-            let sink: sampler::Sink = Arc::new(|samples: &[sampler::Sample], names: &[(u64, String)]| {
+            let into = Arc::clone(&recorder);
+            let sink: sampler::Sink = Arc::new(move |samples: &[sampler::Sample], names: &[(u64, String)]| {
                 alloc::quiet(|| {
-                    with_recorder(|r| {
-                        for (tid, name) in names {
-                            r.thread(*tid, Some(name));
-                        }
-                        for s in samples {
-                            let span_id = r.innermost(s.tid);
-                            r.cpu_sample(core::RawSample {
-                                thread: s.tid,
-                                t_ns: s.t_ns,
-                                pcs: s.pcs().to_vec(),
-                                span_id,
-                                on_cpu: s.on_cpu,
-                                weight_ns: s.weight_ns,
-                            });
-                        }
-                    });
+                    let mut r = into.lock();
+                    for (tid, name) in names {
+                        r.thread(*tid, Some(name));
+                    }
+                    for s in samples {
+                        let span_id = r.innermost(s.tid);
+                        r.cpu_sample(core::RawSample {
+                            thread: s.tid,
+                            t_ns: s.t_ns,
+                            pcs: s.pcs().to_vec(),
+                            span_id,
+                            on_cpu: s.on_cpu,
+                            weight_ns: s.weight_ns,
+                        });
+                    }
                 });
             });
-            match sampler::start(hz, sink) {
-                Ok(it) => {
-                    recorder.meta_mut().cpu_sampler = format!("on: {hz} Hz, {}", it.how);
-                    Some(it)
-                }
-                Err(why) => {
-                    alloc::turn_off();
-                    return Err(Error::Sampler(why.0));
-                }
-            }
+            let it = sampler::start(hz, sink).map_err(|why| Error::Sampler(why.0))?;
+            recorder.lock().meta_mut().cpu_sampler = format!("on: {hz} Hz, {}", it.how);
+            Some(it)
         }
         None => None,
     };
-    #[cfg(not(feature = "sampler"))]
-    if config.cpu_hz.is_some() {
-        alloc::turn_off();
-        return Err(Error::Sampler("ix-prof was built without its `sampler` feature".to_owned()));
-    }
     let serving = config.http.is_some();
     let session = Arc::new(Session {
         config,
-        recorder: Mutex::new(recorder),
+        recorder,
         log: Mutex::new(log),
         // With an endpoint, batches are kept from the start so a client can resume and backfill.
         live_wanted: AtomicBool::new(serving),
-        stop: Arc::clone(&stop),
+        id,
+        stop: AtomicBool::new(false),
         #[cfg(feature = "sampler")]
         sampler: Mutex::new(sampler),
+        ticker: Mutex::new(None),
+        #[cfg(all(feature = "http", unix))]
+        http: Mutex::new(None),
     });
-    *slot = Some(Arc::clone(&session));
+    let started = (|| -> Result<(), Error> {
+        let ticking = std::thread::Builder::new()
+            .name("ix-prof-ticker".to_owned())
+            .spawn({
+                let session = Arc::clone(&session);
+                move || ticker(&session)
+            })
+            .map_err(|why| Error::Format(format!("the ticker thread did not start: {why}")))?;
+        *session.ticker.lock() = Some(ticking);
+        #[cfg(all(feature = "http", unix))]
+        if let Some(bound) = bound {
+            let server = bound.serve().map_err(Error::Http)?;
+            let (addr, token) = (server.addr, server.token.clone());
+            *session.http.lock() = Some(server);
+            announce(&session, addr, &token)?;
+        }
+        Ok(())
+    })();
+    if let Err(why) = started {
+        halt(&session);
+        return Err(why);
+    }
+    alloc::turn_on(session.config.alloc_sample_bytes);
+    *slot = Some(session);
     drop(slot);
     RECORDING.store(true, Ordering::Release);
-    std::thread::Builder::new()
-        .name("ix-prof-ticker".to_owned())
-        .spawn({
-            let session = Arc::clone(&session);
-            move || ticker(&session)
-        })
-        .map_err(|why| Error::Format(format!("the ticker thread did not start: {why}")))?;
-    #[cfg(feature = "http")]
-    if let Some(addr) = session.config.http.clone() {
-        let bound = http::serve(&addr).map_err(Error::Http)?;
-        let url = format!("http://{bound}/debug/pprof/live");
-        eprintln!("ix-prof: live at {url}");
-        if let Some(dir) = &session.config.dir {
-            let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(dir.join("http.addr"), bound.to_string());
+    Ok(Guard { on: true })
+}
+
+/// A random number for the session id, from the OS's randomness (std's `RandomState` keys).
+fn nonce() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(clock::now_ns() as u64);
+    h.finish()
+}
+
+/// What `announce` prints to stderr. With a directory, where the token is, never the token: a
+/// program's stderr often lands where other users can read it (a CI log, journald, a shared
+/// `2>run.log`). Without one, stderr is the only place to give it.
+#[cfg(all(feature = "http", unix))]
+fn announcement(addr: std::net::SocketAddr, token: &str, dir: Option<&std::path::Path>) -> String {
+    match dir {
+        Some(dir) => format!(
+            "ix-prof: live at http://{addr}/debug/pprof/live (its token is in {}; `blaze pprof --dir {}` reads it)",
+            dir.join(endpoint::FILE).display(),
+            dir.display()
+        ),
+        None => format!("ix-prof: live at http://{addr}/debug/pprof/live?token={token}"),
+    }
+}
+
+/// Says where the endpoint is: with a directory, `<dir>/http.endpoint` (the address and the
+/// token in one 0600 file, renamed into place whole, so a reader never pairs a new token with
+/// an old address); and a line on stderr ([`announcement`]).
+#[cfg(all(feature = "http", unix))]
+fn announce(session: &Session, addr: std::net::SocketAddr, token: &str) -> Result<(), Error> {
+    if let Some(dir) = &session.config.dir {
+        let bytes = endpoint::Endpoint { addr, token: token.to_owned() }.encode();
+        let part = format!("{}.{}.part", endpoint::FILE, session.id);
+        private_dir(dir)
+            .and_then(|d| d.write_whole(endpoint::FILE, &part, bytes.as_bytes()))
+            .map_err(|why| Error::Write { path: dir.join(endpoint::FILE), why })?;
+    }
+    eprintln!("{}", announcement(addr, token, session.config.dir.as_deref()));
+    Ok(())
+}
+
+/// Removes `http.endpoint` when it is this session's (the token in it is its own): a client
+/// that reads it after the stop finds nothing, rather than a port another user may have bound
+/// since. The file is read through [`endpoint::PrivateDir`]: never through a link, never a FIFO
+/// or device, at most 64 bytes, so what is planted there cannot hang or bloat the stop.
+#[cfg(all(feature = "http", unix))]
+fn retract(session: &Session, token: &str) {
+    let Some(dir) = &session.config.dir else { return };
+    if std::fs::symlink_metadata(dir).is_err_and(|why| why.kind() == std::io::ErrorKind::NotFound) {
+        return;
+    }
+    let path = dir.join(endpoint::FILE);
+    let ours = endpoint::PrivateDir::open(dir).and_then(|d| {
+        let Some(bytes) = d.read_small(endpoint::FILE)? else { return Ok(()) };
+        if endpoint::Endpoint::parse(&bytes, &path)?.token == token {
+            d.remove(endpoint::FILE)?;
+        }
+        Ok(())
+    });
+    if let Err(why) = ours {
+        eprintln!("ix-prof: left {} as it is at stop: {why}", path.display());
+    }
+}
+
+/// Makes `dir` and its missing parents, mode 0700, and opens it checked
+/// ([`endpoint::PrivateDir::open`]): a profile, and the endpoint's token, are for this user
+/// only, so a directory that is a link, someone else's, or open to group or other is refused,
+/// never used and never changed.
+fn private_dir(dir: &std::path::Path) -> Result<endpoint::PrivateDir, String> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(dir).map_err(|why| format!("making {}: {why}", dir.display()))?;
+    endpoint::PrivateDir::open(dir)
+}
+
+/// Stops and joins every thread of the session: the sampler (its last batch lands in the
+/// recorder first), the ticker and the HTTP server.
+fn halt(session: &Session) {
+    session.stop.store(true, Ordering::Relaxed);
+    #[cfg(feature = "sampler")]
+    {
+        let sampler = session.sampler.lock().take();
+        drop(sampler);
+    }
+    let ticking = session.ticker.lock().take();
+    if let Some(ticking) = ticking {
+        ticking.thread().unpark();
+        let _wait = tracing::info_span!(target: "ix_prof", "join", wait = "thread", on = "ix-prof-ticker").entered();
+        let _ = ticking.join();
+    }
+    #[cfg(all(feature = "http", unix))]
+    {
+        let server = session.http.lock().take();
+        if let Some(server) = server {
+            let token = server.token.clone();
+            server.stop();
+            retract(session, &token);
         }
     }
-    #[cfg(not(feature = "http"))]
-    if session.config.http.is_some() {
-        return Err(Error::Http(format!(
-            "{VAR_HTTP} is set but ix-prof was built without its `http` feature"
-        )));
-    }
-    Ok(Guard { on: true })
+}
+
+/// The profile's file name: the session id makes it unique to this run, so a later run with
+/// the same pid (pid reuse, containers) never replaces it.
+pub(crate) fn profile_name(program: &str, pid: u32, session: &str) -> String {
+    format!("{program}-{pid}-{session}.ixprof")
 }
 
 /// [`start`] with [`Config::from_env`]; an inert guard when the variables are unset.
@@ -357,10 +497,9 @@ impl Guard {
             return Ok(None);
         }
         let Some(session) = SESSION.lock().take() else { return Ok(None) };
-        session.stop.store(true, Ordering::Relaxed);
-        #[cfg(feature = "sampler")]
-        drop(session.sampler.lock().take());
         RECORDING.store(false, Ordering::Release);
+        // Joined before the snapshot, so the sampler's tail is in it.
+        halt(&session);
         alloc::turn_off();
         drain_allocs(&session);
         session.log.lock().ended = Some("process exiting".to_owned());
@@ -372,15 +511,14 @@ impl Guard {
             (recorder.snapshot(None, None, &mut symbols).to_ixprof(), recorder.meta_mut().program.clone())
         });
         let bytes = bytes.map_err(|it| Error::Format(it.to_string()))?;
-        let name = format!("{program}-{}.ixprof", std::process::id());
+        let name = profile_name(&program, std::process::id(), &session.id);
         let path = dir.join(&name);
         // Whole or not at all: a reader of the directory (a build laying code out by it,
-        // docs/v2/plan/lanes/layout/layout.md) never sees a profile half written.
-        let part = dir.join(format!("{name}.part"));
-        std::fs::create_dir_all(&dir)
-            .and_then(|()| std::fs::write(&part, bytes))
-            .and_then(|()| std::fs::rename(&part, &path))
-            .map_err(|why| Error::Write { path: path.clone(), why: why.to_string() })?;
+        // docs/v2/plan/lanes/layout/layout.md) never sees a profile half written. The part
+        // file is made new, so two writers never share one.
+        private_dir(&dir)
+            .and_then(|d| d.write_whole(&name, &format!("{name}.part"), &bytes))
+            .map_err(|why| Error::Write { path: path.clone(), why })?;
         eprintln!("ix-prof: wrote {}", path.display());
         Ok(Some(path))
     }
@@ -437,8 +575,8 @@ fn ticker(session: &Session) {
         live::Encoder::new(log.session.clone(), std::process::id())
     };
     while !session.stop.load(Ordering::Relaxed) {
-        #[allow(clippy::disallowed_methods, reason = "the ticker thread's own timer, a driver's: no pool thread or job waits here")]
-        std::thread::sleep(session.config.tick);
+        #[allow(clippy::disallowed_methods, reason = "the ticker thread's own timer, a driver's: no pool thread or job waits here, and `halt` unparks it")]
+        std::thread::park_timeout(session.config.tick);
         alloc::quiet(|| {
             drain_allocs(session);
             let now = clock::now_ns();

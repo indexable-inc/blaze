@@ -614,6 +614,7 @@ fn unit(pkg: &str, kind: &[&str], crate_types: &[&str], name: &str, platform: Op
             ..schema::Profile::dev()
         },
         platform: platform.map(str::to_owned),
+        macro_wasm: false,
         mode,
         checked_as_test: false,
         features: strings(features),

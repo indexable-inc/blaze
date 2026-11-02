@@ -99,6 +99,7 @@ Commands:
     debug sql [--live] QUERY       SQL over the profile history (with `--live`, the flight recorder too)
     explain VIEW [NAME=VALUE ...]  One of the history's named views
     why [ITEM] [--all] [--json]    What the last build computed again instead of reusing, and why
+    slow [--build N] [--top N] [--json]   What made the last build slow, ranked by the time each fix saves
     pprof FILE|URL [top|peek|tree|list|flame|diff|export|--http]   Any program's profile (.ixprof or pprof), like `go tool pprof`
     perf record|runs|diff          The performance history of programs blaze built: what changed between runs, and why
 
@@ -178,7 +179,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
                  doc, clean, cache, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, \
-                 explain and why"
+                 explain, why and slow"
             );
             eprint!("{}", say::error(&what, auto_color()));
             FAILED
@@ -201,6 +202,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Debug(words) => observe::debug(words, auto_color()),
         Asked::Explain(words) => observe::explain(words, auto_color()),
         Asked::Why(words) => observe::why(words, auto_color()),
+        Asked::Slow(words) => observe::slow(words, auto_color()),
         Asked::Pprof(words) => pprof::main(words, auto_color()),
         Asked::Perf(words) => perf::main(words, auto_color()),
         Asked::Clean(words) => clean::main(words, auto_color()),

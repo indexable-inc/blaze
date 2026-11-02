@@ -43,6 +43,8 @@ mod lowered;
 pub(crate) mod places;
 pub(crate) mod refs;
 pub(crate) mod release;
+#[cfg(test)]
+mod relocs_hashed;
 pub mod report;
 mod roots;
 pub(crate) mod shape;

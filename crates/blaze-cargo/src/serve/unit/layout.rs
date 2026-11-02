@@ -8,7 +8,7 @@
 //! function whose identity no build since has is dropped from the heat.
 //!
 //! Both live in `<target-dir>/layout`. `IX_PROF=<target-dir>/layout <program>` writes
-//! `<program>-<pid>.ixprof` there when the program ends: blaze starts ix-prof from `IX_PROF`
+//! `<program>-<pid>-<session>.ixprof` there when the program ends: blaze starts ix-prof from `IX_PROF`
 //! itself, and another program links ix-prof and calls `ix_prof::start_from_env`. While the
 //! directory is there, each link writes its image's map to `maps/<image>/<build id>`, so the
 //! addresses a run of that build sampled name its functions. With no directory no map is
@@ -58,8 +58,16 @@ pub(crate) type BuildId = [u8; 16];
 type Row = (u64, u64, ContentId);
 /// One physical frame of a sample: its build, if blaze's, and its address there.
 type At = (Option<BuildId>, u64);
-/// On-CPU samples by their leaf, and its caller in the same build.
-type Sampled = HashMap<(BuildId, u64, Option<u64>), u64, Global>;
+/// On-CPU samples by their leaf, and its caller in the same build: how many, and the CPU time
+/// they stand for (each its `weight_ns`, the sampler's period when it was taken).
+type Sampled = HashMap<(BuildId, u64, Option<u64>), Taken, Global>;
+
+/// Samples counted, and the CPU time in nanoseconds they stand for.
+#[derive(Clone, Copy, Default)]
+struct Taken {
+    samples: u64,
+    weight_ns: u64,
+}
 
 /// What a target directory's `layout` holds, read once a job: each image's weights, and the
 /// build ids its profiles name.
@@ -85,9 +93,10 @@ pub(crate) struct Counts {
     pub(crate) outside: u64,
 }
 
-/// What the profiles say of one image, by function identity: each function's own samples (it
-/// was running) and each caller-to-callee pair's (the callee was running, called from the
-/// caller), summed. Its id covers every weight: a unit's record key and the kept image's
+/// What the profiles say of one image, by function identity: each function's own CPU time in
+/// nanoseconds (it was running) and each caller-to-callee pair's (the callee was running,
+/// called from the caller), summed from the samples' `weight_ns`, so profiles taken at
+/// different rates weigh by the time they stand for, not by how many samples they took. Its id covers every weight: a unit's record key and the kept image's
 /// layout name the profile by it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Weights {
@@ -217,7 +226,7 @@ impl Profiles {
         let maps = maps(&dir, &named)?;
         // alloc: once per job, an image a profile ran
         let mut images: Vec<(String, Vec<(ContentId, u64)>, Vec<(ContentId, ContentId, u64)>)> = Vec::new();
-        for (&(build, leaf, caller), &n) in &sampled {
+        for (&(build, leaf, caller), &Taken { samples, weight_ns }) in &sampled {
             let of = maps.iter().filter(|it| it.0 == build).map(|it| (&it.1, &it.2));
             let mut found = false;
             for (path, rows) in of {
@@ -231,15 +240,15 @@ impl Profiles {
                         images.len() - 1
                     }
                 };
-                images[at].1.push((callee, n));
+                images[at].1.push((callee, weight_ns));
                 if let Some(caller) = caller.and_then(|it| function(rows, it)) {
-                    images[at].2.push((caller, callee, n));
+                    images[at].2.push((caller, callee, weight_ns));
                 }
             }
             if !found {
                 match maps.iter().any(|it| it.0 == build) {
-                    true => counts.outside += n,
-                    false => counts.unmapped += n,
+                    true => counts.outside += samples,
+                    false => counts.unmapped += samples,
                 }
             }
         }
@@ -358,7 +367,8 @@ impl Profiles {
 }
 
 /// Counts each on-CPU sample of `profile` into `sampled` by its leaf, and its caller when in
-/// the same build: each by its physical frame, the inlined frames at one address one frame.
+/// the same build: each by its physical frame, the inlined frames at one address one frame,
+/// weighed by its `weight_ns`.
 fn samples(profile: &Profile, sampled: &mut Sampled, counts: &mut Counts) -> Result<(), String> {
     for sample in profile.cpu_samples.iter().filter(|it| it.on_cpu) {
         counts.samples += 1;
@@ -368,7 +378,9 @@ fn samples(profile: &Profile, sampled: &mut Sampled, counts: &mut Counts) -> Res
             continue;
         };
         let caller = caller.and_then(|(of, at)| (of == Some(build)).then_some(at));
-        *sampled.entry((build, leaf, caller)).or_default() += 1;
+        let taken = sampled.entry((build, leaf, caller)).or_default();
+        taken.samples += 1;
+        taken.weight_ns = taken.weight_ns.saturating_add(sample.weight_ns);
     }
     Ok(())
 }

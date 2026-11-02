@@ -711,6 +711,7 @@ fn an_example_and_a_test_with_one_name_are_two_crates() {
                 version: Some("0.0.0".to_owned()),
                 display_name: Some(base_db::CrateDisplayName::from_canonical_name("fetch")),
                 potential_cfg_options: None,
+                built_for: base_db::BuiltFor::default(),
             };
             let cfg = cfg::CfgOptions::default();
             let env = base_db::Env::default();
@@ -742,6 +743,60 @@ fn an_example_and_a_test_with_one_name_are_two_crates() {
     let (db, _) = graph(&[(Test, Example), (Test, Example)]);
     let message = key::check_crate_keys(&db).expect_err("two examples of one name").to_string();
     assert!(message.contains("test of the example target"), "the error names the target's kind: {message}");
+}
+
+/// One package built for the host, for `--target` of the host's own triple, for
+/// `--target wasm32-wasip1` and for that triple's wasm proc macros, alike in all else a key
+/// hashes (std's crates are: the same cfg and dependencies, only their `OUT_DIR` and build
+/// script runs differ), is four crates of four keys, as cargo keeps four units. Before the
+/// key covered what a crate is built for, a `--target` build stopped on `proc_macro@0.0.0`.
+#[test]
+fn one_package_built_for_the_host_a_target_and_wasm_proc_macros_has_a_key_for_each() {
+    use blaze_query::db::Durability;
+    let host = "aarch64-apple-darwin";
+    let wasm = "wasm32-wasip1";
+    let built_for = |platform: Option<&str>, macro_wasm: bool| base_db::BuiltFor {
+        platform: platform.map(intern::Symbol::intern),
+        macro_wasm,
+    };
+    let graph = |kinds: &[base_db::BuiltFor]| {
+        let fixture: String = (0..kinds.len()).map(|at| format!("//- /{at}.rs crate:c{at}\npub struct S;\n")).collect();
+        let mut db = fixture::db(&fixture).into_db();
+        let made: Vec<_> = base_db::all_crates(&db).iter().copied().collect();
+        let (data, workspace) = (made[0].data(&db).clone(), made[0].workspace_data(&db).clone());
+        let mut krates = Vec::new();
+        for (built_for, it) in kinds.iter().zip(&made) {
+            let data = base_db::BuiltCrateData {
+                root_file_id: it.data(&db).root_file_id,
+                dependencies: Vec::new(),
+                origin: base_db::CrateOrigin::Lang(base_db::LangCrateOrigin::ProcMacro),
+                ..data.clone()
+            };
+            let extra = base_db::ExtraCrateData {
+                version: Some("0.0.0".to_owned()),
+                display_name: Some(base_db::CrateDisplayName::from_canonical_name("proc_macro")),
+                potential_cfg_options: None,
+                built_for: built_for.clone(),
+            };
+            let (cfg, env) = (cfg::CfgOptions::default(), base_db::Env::default());
+            krates.push(base_db::Crate::create(&mut db, data, extra, workspace.clone(), cfg, env, Durability::LOW));
+        }
+        base_db::set_all_crates_with_durability(&mut db, krates.iter().copied(), Durability::LOW);
+        (db, krates)
+    };
+    let kinds = [built_for(None, false), built_for(Some(host), false), built_for(Some(wasm), false), built_for(Some(wasm), true)];
+    let (db, krates) = graph(&kinds);
+    key::check_crate_keys(&db).unwrap_or_else(|clash| panic!("{clash}"));
+    let keys: Vec<_> = krates.iter().map(|&krate| key::crate_key(&db, krate)).collect();
+    for (at, a) in keys.iter().enumerate() {
+        assert!(!keys[at + 1..].contains(a), "{} shares its key", kinds[at]);
+    }
+
+    // Two of one platform are still one crate twice, and the error says what they are built for.
+    let (db, _) = graph(&[built_for(Some(wasm), true), built_for(Some(wasm), true)]);
+    let clash = key::check_crate_keys(&db).expect_err("two builds for one platform are one crate");
+    assert!(clash.same_key, "{clash}");
+    assert!(clash.to_string().contains("for wasm32-wasip1 (proc macros)"), "{clash}");
 }
 
 #[test]

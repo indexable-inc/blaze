@@ -135,7 +135,8 @@ pub(super) fn keys_agree_from(db: &Db, asker: Crate, root: Instance) {
     }
 }
 
-/// The instance named `name` (as an impure script's reason names it) among `instances`, the
+/// The instance named `name` (as an impure script's reason names it, by its whole path:
+/// `` `shared::helper` ``) among `instances`, the
 /// one whose arguments name `ty` when given.
 #[track_caller]
 fn named<'a>(db: &Db, instances: &'a [Instance], name: &str, ty: Option<&str>) -> &'a Instance {
@@ -178,7 +179,7 @@ fn two_scripts_share_the_summaries_of_what_both_reach() {
         // `main` is each script's own; `helper`, `each::<u8>`, `<u8 as Show>::show` and the
         // toolchain's printing under them are both scripts'.
         assert!(shared >= 4, "only {shared} instances are reached by both scripts");
-        let helper = named(&db, &in_a, "`helper`", None);
+        let helper = named(&db, &in_a, "`shared::helper`", None);
         assert_eq!(home::home(&db, a, helper.clone()), Some(crate_named(&db, "shared")));
         let toolchain = in_a.iter().filter(|it| {
             home::home(&db, a, (*it).clone())
@@ -204,8 +205,8 @@ fn a_downstream_impl_keys_the_instance_by_the_crate_of_its_type() {
     let shared = crate_named(&db, "shared");
     hir_ty::attach_db(&db, || {
         let in_b = reached(&db, b);
-        let byte = named(&db, &in_b, "`each`", Some("u8"));
-        let local = named(&db, &in_b, "`each`", Some("Local"));
+        let byte = named(&db, &in_b, "`shared::each`", Some("u8"));
+        let local = named(&db, &in_b, "`shared::each`", Some("Local"));
         // `script_b`'s impl of `Show` for `Local` is what `each::<Local>` runs: it is keyed by
         // `script_b`, the crate that sees the impl, and reads `HOME` there.
         assert_eq!(home::home(&db, b, local.clone()), Some(b));
@@ -224,7 +225,7 @@ fn a_script_that_solves_differently_keeps_its_own_summaries() {
     let c = crate_named(&db, "script_c");
     hir_ty::attach_db(&db, || {
         let in_c = reached(&db, c);
-        let helper = named(&db, &in_c, "`helper`", None);
+        let helper = named(&db, &in_c, "`shared::helper`", None);
         // A recursion limit of its own can change what the solver answers: no sharing, with
         // `shared` or with `std`, the second candidate, which `stands_for` checks the same.
         assert_eq!(home::home(&db, c, helper.clone()), None);
@@ -246,14 +247,14 @@ fn a_specializing_dependency_of_the_script_alone_leaves_sharing() {
     let std = lang_crate(&db, LangCrateOrigin::Std);
     hir_ty::attach_db(&db, || {
         let in_s = reached(&db, s);
-        let helper = named(&db, &in_s, "`helper`", None);
+        let helper = named(&db, &in_s, "`shared::helper`", None);
         // `spec` may specialize, but `shared` and `std` do not depend on it, so by the orphan
         // rule it holds no impl their walks could match: both still stand for `script_s`.
         assert!(home::stands_for(&db, shared, s));
         assert!(home::stands_for(&db, std, s));
         assert_eq!(home::home(&db, s, helper.clone()), Some(shared));
         let in_a = reached(&db, a);
-        let helper_a = named(&db, &in_a, "`helper`", None);
+        let helper_a = named(&db, &in_a, "`shared::helper`", None);
         assert!(std::ptr::eq(summary(&db, env(s), helper.clone()), summary(&db, env(a), helper_a.clone())));
         keys_agree(&db, s);
     });
@@ -321,7 +322,7 @@ fn a_missed_dependency_of_the_home(crates: &str) -> (Purity, bool) {
         // The cause: `dep` is a dependency of `k` the script loads and `k` does not.
         assert!(!home::stands_for(&db, k, script));
         let in_script = reached(&db, script);
-        let run = named(&db, &in_script, "`run`", None);
+        let run = named(&db, &in_script, "`k::run`", None);
         assert_eq!(home::home(&db, script, run.clone()), None);
         let reads_env = summary(&db, env(script), main_instance(&db, script)).kinds.has(Rule::Env);
         (script_purity(&db, main_of(&db, script).unwrap()).clone(), reads_env) // clone: a test's answer
@@ -479,7 +480,7 @@ fn main() {
         // The cause: `h`'s lang items are not the script's, so `h` is no home.
         assert!(!home::stands_for(&db, h, script), "their lang items differ");
         let in_script = reached(&db, script);
-        let consume = named(&db, &in_script, "`consume`", None);
+        let consume = named(&db, &in_script, "`h::consume`", None);
         assert_ne!(home::home(&db, script, consume.clone()), Some(h));
         // A `core` home has no `owned_box` either: what names only `core` is worked out in
         // `std`, which loads it and sees the script's lang items.
@@ -550,7 +551,7 @@ fn main() {
             let mut out = Vec::new();
             for script in [first, second] {
                 let script = crate_named(&db, script);
-                for it in reached(&db, script).iter().filter(|it| ["`ping`", "`pong`"].contains(&&*name_of(&db, it))) {
+                for it in reached(&db, script).iter().filter(|it| ["`lib::ping`", "`lib::pong`"].contains(&&*name_of(&db, it))) {
                     assert_eq!(home::home(&db, script, it.clone()), Some(lib), "the cycle is shared");
                 }
                 let purity = script_purity(&db, main_of(&db, script).unwrap()).clone();
@@ -567,7 +568,7 @@ fn main() {
     let (xy, mut yx) = (walk("script_x", "script_y"), walk("script_y", "script_x"));
     yx.reverse();
     let names: Vec<&str> = xy[0].1.iter().map(|(name, _)| name.as_str()).collect();
-    assert!(names.contains(&"`ping`") && names.contains(&"`pong`"), "both scripts reach the cycle: {names:?}");
-    assert!(xy[1].0.contains(r#""`pong`", "`ping`""#), "`script_y`'s impurity goes `pong` → `ping`: {}", xy[1].0);
+    assert!(names.contains(&"`lib::ping`") && names.contains(&"`lib::pong`"), "both scripts reach the cycle: {names:?}");
+    assert!(xy[1].0.contains(r#""`lib::pong`", "`lib::ping`""#), "`script_y`'s impurity goes `pong` → `ping`: {}", xy[1].0);
     assert_eq!(xy, yx);
 }

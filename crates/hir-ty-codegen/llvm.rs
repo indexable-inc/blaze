@@ -2173,6 +2173,14 @@ define void @"blaze.own"(ptr %to, i64 %from) {
         ];
         let unit = emit_unit(&mut wants, &members, Optimization::NONE, &[]).unwrap();
         let mut codes: Vec<Code> = unit.members.into_iter().map(Result::unwrap).collect();
+        // Of a Mach-O unit each function is its piece of `__text`, and its unwind entry is
+        // its own: as long as that piece.
+        if target.object_format == crate::ObjectFormat::MachO {
+            for code in &codes {
+                let unwind = format!("{:?}", code.unwind.as_ref().expect("an unwind entry"));
+                assert!(unwind.contains(&format!("len: {},", code.bytes.len())), "{unwind}");
+            }
+        }
         // The distinct targets of one namespace: AArch64 loads a constant with `adrp` and
         // `ldr`, two relocations of one symbol.
         let named = |code: &Code, wanted| -> Vec<u32> {

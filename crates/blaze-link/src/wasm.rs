@@ -33,6 +33,25 @@ use crate::model::{
 };
 use crate::output::{Format, NativeKind, Output, OutputKind};
 
+/// The custom section listing what a module's running code can write of the statics blaze's
+/// codegen gave the link, one entry per static with any (`Stage::list_wasm_static`), in the
+/// order of the statics' keys. A proc macro's host reads it to see, and carry between calls,
+/// the state a macro keeps (`blaze-macro-eval`'s `wasm/statics.rs`, which parses this layout).
+/// An entry, every word a little-endian `u32`:
+///
+/// - `__heap_base`: what an address in the module's memory at or past it is of the heap;
+/// - the static's item key, 32 bytes;
+/// - how many records follow, at least one;
+/// - each record: where the bytes are in the module's memory, and how many. The static's own
+///   bytes first when it is mutable or thread-local, then each writable allocation its value
+///   points to.
+///
+/// Another layout is another section's name.
+pub(crate) const STATICS: &str = "blaze.statics";
+/// The bytes of a [`STATICS`] entry before its records, and of each record.
+pub(crate) const STATICS_HEADER: usize = 40;
+pub(crate) const STATICS_RECORD: usize = 8;
+
 /// The synthetic region of the functions the linker defines: `__wasm_call_ctors`.
 const FUNCTIONS: &str = "wasm.functions";
 /// The 0-byte region after all data, which `__heap_base` and `__data_end` are found by.
@@ -130,7 +149,7 @@ fn is_custom(class: &Class) -> bool {
 }
 
 /// Whether a region of this class is part of the module's memory.
-fn in_memory(class: &Class) -> bool {
+pub(crate) fn in_memory(class: &Class) -> bool {
     !is_code(class) && !is_custom(class) && *class != Class::InitArray
 }
 

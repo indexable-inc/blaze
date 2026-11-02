@@ -48,6 +48,7 @@ impl Codegen {
             pgo: Pgo::None,
             proc_macro_bridge: false,
             report: false,
+            fuel: false,
             heap_to_stack: false,
         };
         Ok(Codegen { policy, origin: Origin::Member(Package::new(package)), names })

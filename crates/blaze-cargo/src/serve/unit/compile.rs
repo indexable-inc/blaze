@@ -290,14 +290,26 @@ fn with_record_inputs<T>(
 const FILED_BEYOND: &str = "the values of the process variables and proc-macro reads its record is filed under";
 
 /// What `unit` is across edits, telling apart units side by side (one package's lib built
-/// for a build script and for the target, or as a test and as a lib): its package, target,
-/// mode, platform, profile and whether it is std's or checked as a test. What `blaze why`
+/// for a build script and for the target, or as a test and as a lib, or for the target and
+/// for the wasm macros of one triple): its package, target, mode, platform and whether it is
+/// a wasm macro's, profile and whether it is std's or checked as a test. What `blaze why`
 /// compares it with its last miss by ([`blaze_kernel::Miss::subject`]).
 pub(super) fn unit_subject(job: &Job, u: &Unit) -> Result<ContentId, String> {
     // The workspace's root too: one `BLAZE_HOME`'s ledger holds every workspace's units, and a
     // registry crate's package id is the same in each (rule 18).
     let workspace = &job.input.config.invocation.root;
-    let named = (workspace, &u.pkg_id, &u.target.name, &u.target.kind, u.mode, &u.platform, &u.profile.name, u.is_std, u.checked_as_test);
+    let named = (
+        workspace,
+        &u.pkg_id,
+        &u.target.name,
+        &u.target.kind,
+        u.mode,
+        &u.platform,
+        u.macro_wasm,
+        &u.profile.name,
+        u.is_std,
+        u.checked_as_test,
+    );
     let bytes = blaze_protocol::cbor::to_vec(&named).map_err(|why| format!("encoding what unit `{}` is: {why}", span_unit(u)))?;
     Ok(Hasher::new(SUBJECT).part(&bytes).finish())
 }
@@ -309,7 +321,7 @@ pub(super) fn within(unit: ContentId, subject: ContentId) -> ContentId {
 }
 
 /// The domains of [`unit_subject`] and [`within`].
-const SUBJECT: &str = "blaze v2 why unit subject 2";
+const SUBJECT: &str = "blaze v2 why unit subject 3";
 const WITHIN: &str = "blaze v2 why subject within a unit 1";
 
 /// Why `unit`'s record was not in the store, for `blaze why`: its key's parts by name, which
@@ -462,6 +474,7 @@ impl RecordInputs<'_> {
             cbor("target", u.target)?,
             cbor("profile", u.profile)?,
             cbor("platform", u.platform)?,
+            flag("whether it is built to run as a wasm proc macro", u.macro_wasm),
             cbor("mode", &u.mode)?,
             cbor("features", &u.features)?,
             flag("whether it is std's", u.is_std),
@@ -579,6 +592,10 @@ pub(crate) struct KeyedUnit<'a> {
     target: &'a blaze_units::schema::Target,
     profile: &'a blaze_units::schema::Profile,
     platform: &'a Option<String>,
+    /// [`Unit::macro_wasm`]: a `--target wasm32-wasip1` unit and a wasm macro's of one
+    /// package differ by it alone. Left out when off, so every other unit's key is as it was.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    macro_wasm: bool,
     mode: blaze_units::schema::Mode,
     features: &'a [String],
     is_std: bool,
@@ -591,6 +608,9 @@ struct KeyedDep<'a> {
     target: &'a str,
     mode: blaze_units::schema::Mode,
     platform: &'a Option<String>,
+    /// As [`KeyedUnit::macro_wasm`].
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    macro_wasm: bool,
     extern_crate_name: &'a str,
     public: Option<bool>,
     noprelude: Option<bool>,
@@ -613,6 +633,7 @@ impl<'a> KeyedUnit<'a> {
                 target: &on.target.name,
                 mode: on.mode,
                 platform: &on.platform,
+                macro_wasm: on.macro_wasm,
                 extern_crate_name: &dep.extern_crate_name,
                 public: dep.public,
                 noprelude: dep.noprelude,
@@ -624,6 +645,7 @@ impl<'a> KeyedUnit<'a> {
             target: &u.target,
             profile: &u.profile,
             platform: &u.platform,
+            macro_wasm: u.macro_wasm,
             mode: u.mode,
             features: &u.features,
             is_std: u.is_std,
@@ -1533,14 +1555,13 @@ impl Module<'_> {
 
 /// The expanders of proc-macro unit `unit`, for the crates that use it
 /// ([`crate::serve::work::Writer::macros`]); none for a unit that is no proc macro or did not
-/// build. Each runs in this process, isolated by construction:
-///
-/// - a proc macro built for wasm32-wasip1 ([`codegen::wasm_macro`]) runs its `module`, each
-///   expansion in a fresh instance under Wasmtime ([`blaze_macro_eval::load_wasm`]); a module
-///   that can't be read or loaded is an error naming the macro crate, never run another way;
-/// - any other runs the macro's own code on blaze's MIR evaluator ([`blaze_macro_eval::load`],
-///   docs/v2/plan/design/compile-time.md change 20): nothing it compiled to is loaded, and no
-///   process is started.
+/// build. Every build plans its proc macros for wasm32-wasip1 ([`codegen::wasm_macro`]), and
+/// each runs its `module` in this process, every expansion in a fresh instance under Wasmtime
+/// ([`blaze_macro_eval::load_wasm`]); a module that can't be read or loaded is an error naming
+/// the macro crate, never run another way. A proc macro built for the host (a plan with
+/// `Spec::macro_wasm` off, which no build makes) is refused naming it: blaze's MIR evaluator
+/// is const eval's and the reference the wasm host is tested against, never a build's macro
+/// host (AGENTS.md rule 8).
 ///
 /// Asked again each time the unit compiles or its record is reused, as the front end it reads
 /// may have changed.
@@ -1550,6 +1571,14 @@ fn macros(job: &Job, reader: &UnitReader, unit: usize, ok: bool, module: Module<
     }
     let name = job.unit(unit).map_or("", |it| it.target.name.as_str());
     let failed = |what: String| Some(Err(ProcMacroLoadingError::Refused(what.into())));
+    if !codegen::wasm_macro(job, unit) {
+        // alloc: error path
+        let (package, built_for) = job.unit(unit).map(|it| (it.pkg_id.as_str(), it.built_for().to_string())).unwrap_or_default();
+        return failed(format!(
+            "proc macro `{name}` of {package} is built for {built_for}, not as a wasm module: a build runs proc \
+             macros only as wasm32-wasip1 modules, so its unit plan is wrong"
+        ));
+    }
     let Some(krate) = job.crates.krate(unit) else {
         return failed(format!("proc macro `{name}` has no crate in the front end"));
     };
@@ -1557,9 +1586,6 @@ fn macros(job: &Job, reader: &UnitReader, unit: usize, ok: bool, module: Module<
         Ok(it) => it.id,
         Err(why) => return failed(format!("proc macro `{name}`: its toolchain: {why}")),
     };
-    if !codegen::wasm_macro(job, unit) {
-        return Some(blaze_macro_eval::load(reader.db(), krate, toolchain, &job.input.macros));
-    }
     let bytes = match module.bytes(job) {
         Ok(it) => it,
         Err(why) => return failed(format!("the wasm module of the proc-macro crate `{name}`: {why}")),

@@ -65,7 +65,16 @@ fn a_where_clause_binder_takes_bounded_type_params() {
         has_run(&tree, &["WHERE_PRED", "FOR_BINDER", "FOR_KW \"for\"", "GENERIC_PARAM_LIST", "L_ANGLE \"<\"", "TYPE_PARAM"]),
         "{tree:#?}"
     );
-    assert_eq!(tree.iter().filter(|it| *it == "TYPE_PARAM").count(), 3, "{tree:#?}");
+    // `fn f<T>`'s own `T`, then the binders' `F`, `V` and `F`, in source order; the `T` and `V`
+    // in `Field<T>`, `Variant<T>` and `Field<V>` are arguments, not params.
+    let params: Vec<&str> = tree
+        .windows(3)
+        .filter(|it| it[0] == "TYPE_PARAM" && it[1] == "NAME")
+        .filter_map(|it| it[2].strip_prefix("IDENT \"")?.strip_suffix('"'))
+        .collect();
+    assert_eq!(params, ["T", "F", "V", "F"], "{tree:#?}");
+    assert_eq!(tree.iter().filter(|it| *it == "TYPE_PARAM").count(), 4, "{tree:#?}");
+    assert_eq!(tree.iter().filter(|it| *it == "FOR_BINDER").count(), 2, "{tree:#?}");
 }
 
 /// Code without the extension parses as before: no `const` taken after `for` unless written,

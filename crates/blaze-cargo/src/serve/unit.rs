@@ -179,6 +179,10 @@ impl Steps for Real {
         Ok(Library { at: named, fingerprint, source: Some(Source { files, under: String::new() }) })
     }
 
+    fn lease(&self, units: &blaze_units::query::Units, checkout: &str, builds: &str) -> crate::serve::work::Leased {
+        crate::serve::job::lease_build_dirs(units, checkout, builds)
+    }
+
     fn store_kept(&self, kept: &mut KeptLowered) -> Result<Vec<KeptPut>, ApiError> {
         if kept.stored {
             return Ok(Vec::new()); // alloc: none
@@ -237,11 +241,18 @@ impl Steps for Real {
             // record published while it runs moves the epoch past the one its front end is kept
             // at. One atomic load (`Keeping::retractions_now`).
             let retractions = input.macros.keeps().retractions_now();
-            let kept = kept.filter(|it| {
-                (Arc::ptr_eq(&it.units, &input.units) || it.units == input.units)
-                    && it.config == input.config
-                    && it.retractions == retractions
-            });
+            // A kept front end that is not lowered into is let go by name: the build lowers
+            // anew, and the daemon's log and the profile say which part of its inputs moved.
+            let kept = match kept {
+                Some(it) => match unkept(&it, input, retractions) {
+                    None => Some(it),
+                    Some(why) => {
+                        let_go(it, &why);
+                        None
+                    }
+                },
+                None => None,
+            };
             let lower = || Lower {
                 units: &input.units,
                 config: &input.config,
@@ -259,7 +270,13 @@ impl Steps for Real {
                 {
                     true => (lowered.into_inner(), Some(session), seeds),
                     false => {
-                        drop((session, lowered, seeds));
+                        let why = "the view moves the workspace's root or what its root manifest sets, which every crate is made with";
+                        let checkout = input.config.invocation.root.as_str();
+                        {
+                            let _span = tracing::info_span!(target: "blaze", "kept front end let go", checkout, why).entered();
+                            eprintln!("blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}");
+                            drop((session, lowered, seeds));
+                        }
                         (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new())
                     }
                 },
@@ -315,6 +332,68 @@ impl Steps for Real {
         let front = Arc::new(JobFront(writer.job.clone()));
         Ok(FrontEnd { front, writer, puts })
     }
+}
+
+/// Why job `input`'s lowering does not lower into the kept front end `kept`, by the part of
+/// its inputs that moved; `None` when it does. `retractions` is the epoch read now
+/// ([`proc_macro_api::kept::Keeping::retractions_now`]).
+fn unkept(kept: &KeptLowered, input: &JobInput, retractions: u64) -> Option<String> {
+    if !Arc::ptr_eq(&kept.units, &input.units) && kept.units != input.units {
+        // alloc: a reason, once per front end let go
+        return Some(format!("the plan's units moved ({})", units_differ(&kept.units, &input.units)));
+    }
+    if let Some(part) = blaze_lower::config_differs(&kept.config, &input.config) {
+        // alloc: a reason, once per front end let go
+        return Some(format!("its build config's {part} moved"));
+    }
+    if kept.retractions != retractions {
+        // alloc: a reason, once per front end let go
+        return Some(format!(
+            "a record retracting a value verified across checkouts was published since it was lowered \
+             (retractions epoch {} then, {retractions} now; rule 18)",
+            kept.retractions
+        ));
+    }
+    None
+}
+
+/// The first part of two plans' units that differs, by name. Every field is named, so one
+/// added to [`Units`] is named here too.
+fn units_differ(kept: &Units, now: &Units) -> &'static str {
+    let Units { graph, plans, packages, lock, warnings, target_dir, build_dir, finished, link_dirs, sandboxed_tests } = kept;
+    if graph != &now.graph {
+        "the unit graph"
+    } else if plans != &now.plans {
+        "a unit's plan"
+    } else if packages != &now.packages {
+        "the packages"
+    } else if lock != &now.lock {
+        "the lock file to write"
+    } else if warnings != &now.warnings {
+        "the load's warnings"
+    } else if target_dir != &now.target_dir {
+        "the target directory"
+    } else if build_dir != &now.build_dir {
+        "the build directory"
+    } else if finished != &now.finished {
+        "the profile"
+    } else if link_dirs != &now.link_dirs {
+        "the build-script link directories"
+    } else if sandboxed_tests != &now.sandboxed_tests {
+        "whether tests run sandboxed"
+    } else {
+        "nothing compared"
+    }
+}
+
+/// Lets go of the kept front end `kept`, which the build does not lower into because of
+/// `why`, inside a span naming its checkout and why (dropping a whole database takes time),
+/// and says so in the daemon's log.
+fn let_go(kept: KeptLowered, why: &str) {
+    let checkout = kept.root.as_str();
+    let _span = tracing::info_span!(target: "blaze", "kept front end let go", checkout, why).entered();
+    eprintln!("blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}");
+    drop(kept);
 }
 
 /// Hands each of the kept `seeds` to its file as its next parse
@@ -995,7 +1074,8 @@ pub(crate) fn phases(goal: Goal, unit: &Unit) -> &'static [Phase] {
 /// and small, they are admitted as any compile. The same program of the same profile and
 /// platform has the same key in every build and daemon.
 pub(crate) fn program_key(unit: &Unit, phase: Phase) -> Option<blaze_graph::Key> {
-    if unit.target.is_custom_build() || !matches!(unit.mode, Mode::Build | Mode::Test) {
+    // A wasm proc macro's units run in the macro host, never as a program of the client's.
+    if unit.target.is_custom_build() || unit.macro_wasm || !matches!(unit.mode, Mode::Build | Mode::Test) {
         return None;
     }
     if !matches!(codegen::makes(unit), Ok(codegen::Makes::Executable | codegen::Makes::Shared { proc_macro: false })) {

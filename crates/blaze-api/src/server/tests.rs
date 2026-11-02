@@ -152,6 +152,10 @@ fn frame_of(id: u64, request: Request) -> Vec<u8> {
     frames::encode(&Envelope::new(id, request)).unwrap()
 }
 
+fn frame_of_response(id: u64, response: Response) -> Vec<u8> {
+    frames::encode(&Envelope::new(id, response)).unwrap()
+}
+
 fn framed(item: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::new();
     blaze_protocol::write_frame(&mut bytes, item).unwrap();
@@ -505,6 +509,71 @@ fn stop_unlistens_and_hangs_up_every_connection() {
     rig.complete(listens[0], Done::Unlistened);
     rig.complete(listens[1], Done::Unlistened);
     assert_eq!(rig.server.failed(), None);
+}
+
+/// A stop while a reply is being sent and another waits behind it (a daemon that fails as it
+/// answers a job: its error in flight, its `Done` queued) sends both before it hangs up, so
+/// the client hears how its request ended; a hang-up at once dropped the queued `Done`.
+#[test]
+fn stop_sends_what_was_replied_before_it_hangs_up() {
+    let mut rig = Rig::new(config(true, false));
+    let conn = rig.accept(true, 1);
+    let error = Response::Error(ApiError::new("the daemon's store: it broke", None));
+    rig.reply(conn, 1, error.clone());
+    rig.reply(conn, 1, Response::Done { ok: false });
+    let mut effects = Vec::new();
+    rig.server.stop(&mut effects);
+    rig.took(effects);
+    assert!(!rig.hung_up(conn), "hung up with replies not yet sent");
+    // What the peer sends now is read by the receive `accept` asked for, and is no request:
+    // the receive ends, no other is asked, and nothing arrives.
+    rig.deliver(conn, &frame_of(3, Request::Status));
+    assert_eq!(rig.receiving(conn), None, "a stopped server reads on");
+    let arrived = rig.arrived();
+    assert!(arrived.is_empty(), "a stopped server took a request: {arrived:?}");
+    rig.reply(conn, 2, Response::Done { ok: true });
+    assert_eq!(responses(&rig.sent(conn)), [Envelope::new(1, error), Envelope::new(1, Response::Done { ok: false })]);
+    assert!(rig.hung_up(conn), "not hung up once all was sent");
+    assert_eq!(rig.arrived(), [Arrived::Gone { conn }]);
+    assert_eq!(rig.receiving(conn), None);
+}
+
+/// Review C1: [`Server::abandon`] ends what a stop left open. A peer that never reads keeps
+/// its answer's send in flight for ever; once the caller's bound passes, `abandon` hangs up on
+/// it, tells the session it is gone, and names how many bytes of which request's answer it
+/// never got. A connection with nothing left to send was hung up on by the stop itself.
+#[test]
+fn abandon_hangs_up_on_a_connection_a_stop_left_sending_and_names_what_went_unsent() {
+    let mut rig = Rig::new(config(true, false));
+    let (idle, stuck) = (rig.accept(true, 1), rig.accept(true, 2));
+    rig.reply(stuck, 4, Response::Status(status()));
+    rig.reply(stuck, 4, Response::Done { ok: true });
+    let sends = rig.sends(stuck);
+    assert_eq!(sends.len(), 1, "one send in flight");
+    let (tag, in_flight) = (sends[0].0, sends[0].1.len());
+    let queued = frame_of_response(4, Response::Done { ok: true }).len();
+    let mut effects = Vec::new();
+    rig.server.stop(&mut effects);
+    rig.took(effects);
+    assert!(rig.hung_up(idle) && !rig.hung_up(stuck), "the stop hangs up on the idle one alone");
+    // The send never ends: the bound passes.
+    let (mut effects, mut arrived) = (Vec::new(), Vec::new());
+    let abandoned = rig.server.abandon(&mut effects, &mut arrived);
+    rig.took(effects);
+    assert!(rig.hung_up(stuck), "abandon left the connection open");
+    // The session hears of both: the idle one the stop hung up on, told with the next news.
+    assert_eq!(arrived, [Arrived::Gone { conn: idle }, Arrived::Gone { conn: stuck }]);
+    let unsent = Unsent { conn: stuck, bytes: in_flight + queued, last_request: Some(4) };
+    assert_eq!(abandoned, Abandoned { conns: vec![unsent], unsent_bytes: in_flight + queued });
+    let said = abandoned.to_string();
+    assert!(said.contains("connection 2 (") && said.contains("request 4"), "{said}");
+    // The send's end after is ignored, and there is nothing left to abandon.
+    rig.complete(tag, Done::Sent(Vec::new()));
+    assert!(rig.arrived().is_empty());
+    assert!(rig.sends(stuck).is_empty());
+    let (mut effects, mut arrived) = (Vec::new(), Vec::new());
+    assert_eq!(rig.server.abandon(&mut effects, &mut arrived), Abandoned::default());
+    assert!(effects.is_empty() && arrived.is_empty(), "{effects:?} {arrived:?}");
 }
 
 #[test]

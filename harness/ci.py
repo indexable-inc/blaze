@@ -17,7 +17,7 @@ There is no backend to choose: v2 picks it by the profile (opt-level 0 and 1 wit
 rest with LLVM, crates/blaze-cargo/src/serve/unit/codegen.rs) and refuses every unit while
 BLAZE_BACKEND or BLAZE_OPT is set (crates/hir-ty-codegen/v2/backend.rs, CHANGES_CODE). A
 harness that is to cover LLVM builds the release profile (the fuzzers' `profiles`,
-`wholeprogram.py --release`).
+`wholeprogram.py '{"profile": "release"}'`).
 
 The fast tier, of every pull request and merge-queue entry, is the harnesses that FAST names,
 each on the hosts FAST gives it: on Linux x86-64 all of them, and on Linux AArch64 and macOS the
@@ -89,9 +89,9 @@ HARNESSES = [
     ("core", ["growth.py"], {}, DAEMON, 1),
     # 11 to 22 minutes a run under v1, longer than the rest of the fast tier, and it caught
     # nothing there in 2026-10-25 and 26's 270 runs: the full tier's alone.
-    ("core", ["wholeprogram.py"], {}, DAEMON, None),
+    ("core", ["wholeprogram.py", arg({})], {}, DAEMON, None),
     # The release profile, which v2 compiles with LLVM.
-    ("core", ["wholeprogram.py", "--release"], {}, DAEMON, None),
+    ("core", ["wholeprogram.py", arg({"profile": "release"})], {}, DAEMON, None),
     # `blaze build` from nothing: G's whole build, no cargo build.
     ("core", ["coldbuild.py"], {}, on("linux"), 2),
     # A load refused for configuration must be retried without stopping the daemon (#597).

@@ -117,6 +117,15 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
     // wasm32 code is written from the IR by `wasm::lower` where Cranelift's would be made
     // (`emit_with`): no other back end has code of the form a page links
     // (`blaze_codegen::wasm::Code`), and none counts into cells, which a page has none of.
+    // Nor is there a fuel runtime there (`blaze_stencil::fuel`): the plan meters native code
+    // only.
+    if toolchain.arch == Arch::Wasm32 && spec.fuel {
+        // alloc: the error's message
+        return Err(fail(format!(
+            "a wasm32 unit for {:?} metered for fuel: only native code calls the fuel runtime",
+            spec.backend
+        )));
+    }
     if toolchain.arch == Arch::Wasm32 && (!spec.backend.is_cranelift() || spec.counted) {
         // alloc: the error's message
         return Err(fail(format!(
@@ -381,6 +390,14 @@ pub(super) fn built_function(
     if let (Some(source), true) = (&source, lines) {
         inlined_scopes(db, hashes, source, &mut scopes).map_err(fail)?;
     }
+    // A test's fuel (#1605): ticks at the entry and loop heads, in the IR every back end
+    // compiles, before the shape is taken of it. The fuel runtime's own functions tick none.
+    let metered = spec.fuel && matches!(code, Built::Ir(_)) && !fuel_runtime(db, instance).map_err(fail)?;
+    if let (Built::Ir(pending), true) = (&mut code, metered) {
+        let call_conv = isa(unit, target)?.default_call_conv();
+        blaze_stencil::fuel::meter(&mut pending.func, &blaze_stencil::fuel::Runtime::blaze(), call_conv)
+            .map_err(fail)?;
+    }
     if let Built::Ir(pending) = &mut code {
         if !lines {
             pending.func.stencil.srclocs.clear();
@@ -414,8 +431,9 @@ pub(super) fn built_function(
         frame_pointers: spec.toolchain.frame_pointers,
         release: Default::default(),
         // A fold would share one function's counter cells between its members, and
-        // give one function's code of its own target features to the others.
-        foldable: !spec.counted && !own_features && foldable(db, instance).map_err(fail)?,
+        // give one function's code of its own target features to the others; a metered
+        // body's ticks are its own too.
+        foldable: !spec.counted && !metered && !own_features && foldable(db, instance).map_err(fail)?,
         wasm,
     })
 }
@@ -977,7 +995,33 @@ fn told(
     })
     .map_err(fail)?;
     let function = CompiledFunction { inlined, ..compiled };
-    Ok(Emitted { function, side: side.map(|it| it.0), extra: Vec::new() }) // alloc: empty
+    // alloc: empty but for a metered function
+    let mut extra = Vec::new();
+    fuel_externs(&function, &mut extra);
+    Ok(Emitted { function, side: side.map(|it| it.0), extra })
+}
+
+/// Adds to `extra` the fuel runtime's functions `function` calls (`blaze_stencil::fuel`),
+/// which no reference lists: the template keeps them as its own outside symbols.
+pub(super) fn fuel_externs(function: &CompiledFunction, extra: &mut Vec<String>) {
+    for target in function.relocs.targets() {
+        if let blaze_codegen::Target::Extern(name) = target
+            && name.starts_with(blaze_stencil::fuel::PREFIX)
+            && !extra.contains(name)
+        {
+            // clone: one of the two names of a metered function
+            extra.push(name.clone());
+        }
+    }
+}
+
+/// Whether `instance` is a function of the fuel runtime (its symbol starts with
+/// `blaze_stencil::fuel::PREFIX`), which metered code calls and which must not tick itself.
+fn fuel_runtime(db: &Db, instance: &HirInstance) -> Result<bool, String> {
+    if !matches!(instance.0, Kind::Code(..)) {
+        return Ok(false);
+    }
+    Ok(super::frontend::symbol_of(db, &instance.0)?.is_some_and(|it| it.starts_with(blaze_stencil::fuel::PREFIX)))
 }
 
 /// Compiles `ir` in place of a prepared function's IR, its names being the function's: a

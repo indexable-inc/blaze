@@ -74,8 +74,9 @@ macro_rules! vec {
 /// named too; restriction is off by default.
 pub(crate) const CLIPPY_OFF: &str = "-A clippy::all -A clippy::pedantic -A clippy::nursery -A clippy::cargo";
 
-/// The diagnostics clippy's lints have in the crate `main` of `fixture`, rustc's flags `flags`
-/// given, each as rustc writes it. The lints on by default stay on, as in a real `blaze check`
+/// The diagnostics clippy's lints have in the crate `fixture` writes at `/src/lib.rs` (named
+/// `main`, or the name a lint keys on, `blaze_vfs`), rustc's flags `flags` given, each as rustc
+/// writes it. The lints on by default stay on, as in a real `blaze check`
 /// (`blaze::general` among them): a fixture's flags turn on what it tests and off what would
 /// say the same, so a default lint that fails on a fixture fails its test too.
 pub(crate) fn lint(fixture: &str, flags: &str) -> String {
@@ -105,10 +106,11 @@ fn lint_once(fixture: &str, flags: &str, conf: Conf, given: fn(&mut fixture::Fix
     given(&mut built);
     let db = built.into_db();
     hir::attach_db(&db, || {
-        let krate = main_crate(&db);
+        let mut linted = None;
         let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
         let mut texts = Vec::new();
         for krate in hir::Crate::all(&db) {
+            let crate_root = krate.root_module(&db);
             for module in krate.modules(&db) {
                 let Some(file) = module.definition_source_file_id(&db).file_id() else { continue };
                 let file = file.file_id(&db);
@@ -116,11 +118,15 @@ fn lint_once(fixture: &str, flags: &str, conf: Conf, given: fn(&mut fixture::Fix
                 let root = db.source_root(root).source_root(&db);
                 let Some(path) = root.path_for_file(&file) else { continue };
                 let name = path.to_string().trim_start_matches('/').to_owned();
+                if module == crate_root && name == "src/lib.rs" {
+                    linted = Some(krate);
+                }
                 if names.insert(file, name.clone()).is_none() {
                     texts.push((name, db.file_text(file).text(&db).to_string()));
                 }
             }
         }
+        let krate = linted.expect("the fixture writes the crate it lints at `/src/lib.rs`");
         let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
         let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf };
         let name_of = |file: FileId| names.get(&file).cloned();

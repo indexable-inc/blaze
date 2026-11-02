@@ -455,8 +455,11 @@ disallowed-macros = [
 "#;
 
 /// A `serde` whose `Serialize` and `Deserialize` each name a trait and a derive, and a
-/// `blaze_serde` that names the same traits beside its own derives, as the real ones do.
+/// `blaze_serde` that names the same traits beside its own derives, as the real ones do, over a
+/// `core` whose prelude has the builtin `derive` (without it no `#[derive]` resolves, and the
+/// derive macros it names are never looked up).
 const SERDE_CRATES: &str = r#"
+//- minicore: derive
 //- /serde_derive/lib.rs crate:proc-macro:serde_derive
 #[proc_macro_derive(Serialize)]
 pub fn serialize(item: TokenStream) -> TokenStream {

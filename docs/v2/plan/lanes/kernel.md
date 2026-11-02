@@ -140,9 +140,9 @@ The driver still compiles templates in batches (the memo, flights, folding), so
 - The "store: N functions found, 0 compiled and added" line is the pinned v1 engine's: its
   LLVM per-function cache counts hits and misses, and v1 stores no checkout code once a patch
   base exists (diagnosed by lane warm-restart). The v2 driver puts every compiled template.
-- `driver::Out::finish` dedups its puts by key, so a second put of other bytes under one key
-  in a build is dropped before the store sees it. The store's `Mismatch` (rule 18) never
-  fires for that pair. A kernel step's keep refuses it instead.
+- `driver::Out::finish` deduped its puts by key, so a second put of other bytes under one
+  key in a build was dropped before the store saw it. It now refuses that pair (rule 18),
+  naming both puts (`put_twice`, driver/tests.rs).
 - `blaze_global`'s rule for public dev functions keyed a function by `stored(instance,
   built_in)` without `placed(.., refs)`. Since `placed` always rehashes, no key it marked
   public was ever one the driver keeps. `DevFunctionMade` now carries `refs`, and the rule

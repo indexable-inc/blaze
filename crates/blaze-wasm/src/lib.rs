@@ -162,6 +162,7 @@ fn policy(toolchain: Toolchain) -> Policy {
         pgo: Pgo::None,
         proc_macro_bridge: false,
         report: false,
+        fuel: false,
         heap_to_stack: false,
     }
 }

@@ -21,8 +21,11 @@ pub(crate) const WASI: &str = "wasi_snapshot_preview1";
 /// - `hashmap_random_keys(into)`: the 16 bytes of std's `RandomState` keys, the evaluator's
 ///   fixed ones (`os/random.rs`), so a macro that builds a `HashMap` reads no randomness;
 /// - `env_var(name, len, into, capacity) -> len`: one of the calling crate's variables, which
-///   the glue's `getenv` asks in place of wasi-libc's (which reads them all), noted read by name.
-pub(crate) const BRIDGE_SHIMS: &[&str] = &["dispatch", "reply", "output", "hashmap_random_keys", "env_var"];
+///   the glue's `getenv` asks in place of wasi-libc's (which reads them all), noted read by name;
+/// - `current_dir(into, capacity) -> len`: the directory cargo runs rustc in for the calling
+///   crate (`Os::current_dir`), which the glue enters before its macro runs, as wasi-libc
+///   resolves a relative path against its own working directory (`/` until then).
+pub(crate) const BRIDGE_SHIMS: &[&str] = &["dispatch", "reply", "output", "hashmap_random_keys", "env_var", "current_dir"];
 
 /// The WASI preview 1 functions std for `wasm32-wasip1` reaches, each answered in `wasi.rs`.
 pub(crate) const WASI_SHIMS: &[&str] = &[
@@ -59,8 +62,11 @@ pub(crate) const MEMORY: &str = "memory";
 pub(crate) const ALLOC: &str = "blaze_proc_macro_alloc";
 /// `blaze_proc_macro_expand(index, input, len) -> status`: runs the macro `index` (its place in
 /// the crate's `__blaze_proc_macros::listed`, sorted by name) on the input at
-/// `input`. 0 once it called `output`; 1 for no such macro.
+/// `input`. 0 once it called `output`; 1 for no such macro; [`UNENTERED`] when it could not
+/// enter the directory `current_dir` named.
 pub(crate) const EXPAND: &str = "blaze_proc_macro_expand";
+/// [`EXPAND`]'s status when the glue could not enter the working directory the host named.
+pub(crate) const UNENTERED: u32 = 2;
 /// A WASI reactor's constructors, run once per instance before anything else.
 pub(crate) const INITIALIZE: &str = "_initialize";
 

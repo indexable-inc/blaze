@@ -3,7 +3,8 @@
 //! own, a proc macro's to the def map, which no unit compiles: its macros are its functions,
 //! run by the const evaluator ([`hir_ty_mir::const_macro`]).
 //!
-//! There is one such crate a package and platform, rooted at the file. Its dependencies are the
+//! There is one such crate a package and platform (what its units are built for, a wasm proc
+//! macro's apart from a target's of the same triple), rooted at the file. Its dependencies are the
 //! package's library's (a binary's, else a test's, when the build has no library of it for that
 //! platform), never one of the package's own crates, then the standard library's `proc_macro`
 //! and blaze's copy of `const-ast`; its edition and cfgs are that unit's. Every crate of the
@@ -22,7 +23,7 @@ use blaze_ids::ContentId;
 use blaze_query::db::Durability;
 use blaze_units::{
     query::{PackagePlan, Units},
-    schema::{Mode, Unit},
+    schema::{BuiltFor, Mode, Unit},
     stdlib::target::{self, CfgArgs},
 };
 use cfg::{CfgAtom, CfgDiff, CfgOptions};
@@ -61,8 +62,9 @@ pub(crate) struct Plan {
     /// By unit: the units its crate is made after besides its dependencies, so that its
     /// group's macro crate is made before it (`crates::topological`).
     pub(crate) after: Vec<Vec<usize>>,
-    /// By platform (none: the host): the crate of `const-ast`, once made.
-    pub(crate) const_ast: HashMap<Option<String>, Crate, Global>,
+    /// By what it is built for ([`BuiltFor`] in the front end's form): the crate of
+    /// `const-ast`, once made.
+    pub(crate) const_ast: HashMap<base_db::BuiltFor, Crate, Global>,
 }
 
 impl Plan {
@@ -92,19 +94,19 @@ pub(crate) fn plan(units: &Units, package_of: &HashMap<&str, usize, Global>, wha
         after: vec![Vec::new(); all.len()],
         const_ast: HashMap::new_in(Global),
     };
-    let mut by: HashMap<(usize, Option<&str>), usize, Global> = HashMap::new_in(Global);
+    let mut by: HashMap<(usize, BuiltFor<'_>), usize, Global> = HashMap::new_in(Global);
     for (index, unit) in all.iter().enumerate() {
         if unit.mode == Mode::RunCustomBuild || unit.target.is_custom_build() {
             continue;
         }
         let Some(&package) = package_of.get(unit.pkg_id.as_str()) else { continue };
         let Some(file) = &units.packages[package].const_macros else { continue };
-        let key = (package, unit.platform.as_deref());
+        let key = (package, unit.built_for());
         let group = match by.get(&key) {
             Some(&group) => group,
             None => {
                 let group = plan.groups.len();
-                plan.groups.push(group_of(units, package, file, unit.platform.as_deref(), whats)?);
+                plan.groups.push(group_of(units, package, file, unit.built_for(), whats)?);
                 by.insert(key, group);
                 group
             }
@@ -120,14 +122,14 @@ fn group_of(
     units: &Units,
     package: usize,
     file: &str,
-    platform: Option<&str>,
+    built_for: BuiltFor<'_>,
     whats: &[String],
 ) -> Result<Group, LowerError> {
     let all = &units.graph.units;
     let plan = &units.packages[package];
     let id = plan.id.as_str();
     let compiles = |index: usize, unit: &Unit| {
-        unit.platform.as_deref() == platform
+        unit.built_for() == built_for
             && unit.mode != Mode::RunCustomBuild
             && !unit.target.is_custom_build()
             && !crates::is_test(unit, &units.plans[index])
@@ -136,7 +138,7 @@ fn group_of(
     let anchor = all
         .iter()
         .enumerate()
-        .filter(|(_, unit)| unit.pkg_id == id && unit.platform.as_deref() == platform)
+        .filter(|(_, unit)| unit.pkg_id == id && unit.built_for() == built_for)
         .filter(|(_, unit)| unit.mode != Mode::RunCustomBuild && !unit.target.is_custom_build())
         .min_by_key(|&(index, unit)| (crates::is_test(unit, &units.plans[index]), !unit.target.is_lib(), index))
         .map(|(index, _)| index);
@@ -160,7 +162,7 @@ fn group_of(
                         "the const macros of {} need the standard library's `{name}`, which the build \
                          has none of for {}",
                         whats[anchor],
-                        platform.unwrap_or("the host")
+                        built_for
                     ),
                     file,
                 )
@@ -250,7 +252,7 @@ pub(crate) fn make(
         })
     };
 
-    let platform = unit.platform.clone();
+    let platform = crates::built_for(unit.built_for());
     let const_ast = match plan.const_ast.get(&platform) {
         Some(&krate) => krate,
         None => {
@@ -273,6 +275,7 @@ pub(crate) fn make(
                 version: None,
                 display_name: Some(CrateDisplayName::from_canonical_name(CONST_AST_NAME)),
                 potential_cfg_options: None,
+                built_for: crates::built_for(unit.built_for()),
             };
             let mut cfg = CfgOptions::default();
             for it in target::target_cfg(cx.triple, &CfgArgs::default()).map_err(|why| LowerError::at(why, cx.triple))? {
@@ -318,6 +321,7 @@ pub(crate) fn make(
         version: Some(package_plan.version.clone()),
         display_name: Some(CrateDisplayName::from_canonical_name(stem)),
         potential_cfg_options: None,
+        built_for: crates::built_for(unit.built_for()),
     };
     let env: Env = plan_of.env.iter().cloned().collect();
     let krate = Crate::create(db, data, extra, cx.workspace, cfg, env, cx.durability);

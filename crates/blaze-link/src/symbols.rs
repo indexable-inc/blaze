@@ -121,6 +121,9 @@ pub(crate) enum SymKey {
     LazyStubs,
     /// A lazy function's entry in the stub region, by its instance key: its slot's first target.
     LazyEntry(IdNo),
+    /// A wasm static's entry in its module's `blaze.statics` list (`crate::wasm::STATICS`): its
+    /// item and its instance, as [`SymKey::Static`]'s.
+    StaticList(IdNo, IdNo),
 }
 
 const _: () = assert!(size_of::<SymKey>() == 20);
@@ -160,6 +163,7 @@ impl SymKey {
             Counters => [26, 0, 0, 0, 0],
             LazyStubs => [27, 0, 0, 0, 0],
             LazyEntry(a) => [28, a.0, 0, 0, 0],
+            StaticList(a, b) => [29, a.0, b.0, 0, 0],
         }
     }
 }
@@ -479,7 +483,9 @@ impl Symbols {
             | (WinInfo(x), WinInfo(y))
             | (CoveragePcs(x), CoveragePcs(y))
             | (LazyEntry(x), LazyEntry(y)) => id(x, y),
-            (Static(x, i), Static(y, j)) | (Tlv(x, i), Tlv(y, j)) => id(x, y).then_with(|| id(i, j)),
+            (Static(x, i), Static(y, j)) | (Tlv(x, i), Tlv(y, j)) | (StaticList(x, i), StaticList(y, j)) => {
+                id(x, y).then_with(|| id(i, j))
+            }
             (Name(x), Name(y)) | (FileName(x), FileName(y)) | (IatEnd(x), IatEnd(y)) | (Common(x), Common(y)) => {
                 name(x, y)
             }
@@ -530,6 +536,7 @@ impl Symbols {
             SymKey::Data(it) => write!(out, "Data({:?})", self.content(it)),
             SymKey::Static(a, b) => write!(out, "Static({:?}, {:?})", self.item(a), self.content(b)),
             SymKey::Tlv(a, b) => write!(out, "Tlv({:?}, {:?})", self.item(a), self.content(b)),
+            SymKey::StaticList(a, b) => write!(out, "StaticList({:?}, {:?})", self.item(a), self.content(b)),
             SymKey::Name(it) => write!(out, "Name({:?})", self.str(it)),
             SymKey::Local(o, at) => {
                 out.push_str("Local(");
@@ -594,7 +601,7 @@ impl Symbols {
             | SymKey::WinInfo(a)
             | SymKey::CoveragePcs(a)
             | SymKey::LazyEntry(a) => id(out, a),
-            SymKey::Static(a, b) | SymKey::Tlv(a, b) => {
+            SymKey::Static(a, b) | SymKey::Tlv(a, b) | SymKey::StaticList(a, b) => {
                 id(out, a);
                 id(out, b);
             }

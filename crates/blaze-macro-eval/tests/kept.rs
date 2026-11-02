@@ -202,7 +202,13 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
             .map(|name| format!("the verdict of the proc macros of `{name}`"));
         puts.iter().filter(|it| names.contains(&it.what)).map(|it| it.value.clone()).collect::<Vec<_>>()
     };
-    assert_eq!(verdict(&puts, "corpus_state"), [b"stateful".to_vec()], "`counter` was seen to keep state: {:?}", whats(&puts));
+    // Its first call changed the fresh state (it settles), its second what the first left.
+    assert_eq!(
+        verdict(&puts, "corpus_state"),
+        [b"settles".to_vec(), b"stateful".to_vec()],
+        "`counter` was seen to keep state: {:?}",
+        whats(&puts)
+    );
     // The verdicts of the crates that kept no state are left with the puts of the thread that
     // calls `flush`, as the daemon's loop does, and published with the build's.
     macros.flush();

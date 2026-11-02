@@ -175,3 +175,6 @@ include_data!(DATA, "data.txt");
 env_name!(PACKAGE);
 counter!(FIRST);
 counter!(SECOND);
+counter!(THIRD);
+counter!(FOURTH);
+counter!(FIFTH);

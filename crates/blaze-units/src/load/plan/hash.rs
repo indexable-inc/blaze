@@ -412,6 +412,16 @@ pub(super) fn kind_fingerprint_hash(triple: Option<&str>) -> Result<u64, LoadErr
     }
 }
 
+/// The kind hash of the wasm proc macros' units, built for `triple`: never a target's, even
+/// one of the same triple (`--target wasm32-wasip1`), so a unit of each never has one metadata
+/// hash.
+pub(super) fn macro_kind_hash(triple: &str) -> Result<u64, LoadError> {
+    let mut hasher = StableHasher::new();
+    "blaze wasm proc macros".hash(&mut hasher);
+    kind_fingerprint_hash(Some(triple))?.hash(&mut hasher);
+    Ok(Hasher::finish(&hasher))
+}
+
 /// What `hash_rustc_version` hashes of blaze's rustc.
 pub(super) enum RustcVersion {
     /// A pre-release's first segment (`nightly`, `beta`, `dev`).

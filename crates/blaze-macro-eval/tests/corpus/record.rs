@@ -4,7 +4,10 @@
 use std::{
     any::Any,
     fmt,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -121,6 +124,15 @@ impl Record {
 
 pub(crate) type Records = Arc<Mutex<Vec<Record>>>;
 
+/// Whether a recorder passes the front end's runs ahead of a call's turn on to its expander
+/// (`ProcMacroExpander::speculate`), as a build does, counting them; or runs each ordered call
+/// at its turn alone.
+#[derive(Clone)]
+pub(crate) enum Ahead {
+    On(Arc<AtomicUsize>),
+    Off,
+}
+
 /// blaze-macro-eval's expander of one macro, recording each call with what it gave.
 pub(crate) struct Recorder {
     krate: Box<str>,
@@ -128,14 +140,21 @@ pub(crate) struct Recorder {
     kind: ProcMacroKind,
     eval: Arc<dyn ProcMacroExpander>,
     records: Records,
+    ahead: Ahead,
 }
 
 /// A call that panicked records nothing: the records kept are each whole.
 impl std::panic::RefUnwindSafe for Recorder {}
 
 impl Recorder {
-    /// `eval`, of crate `krate`, recording into `records`.
+    /// `eval`, of crate `krate`, recording into `records`, its calls run ahead as a build runs
+    /// them.
     pub(crate) fn wrap(krate: &str, eval: ProcMacro, records: &Records) -> ProcMacro {
+        Recorder::wrap_ahead(krate, eval, records, Ahead::On(Arc::default()))
+    }
+
+    /// [`Recorder::wrap`], its calls run ahead or not as `ahead` says.
+    pub(crate) fn wrap_ahead(krate: &str, eval: ProcMacro, records: &Records, ahead: Ahead) -> ProcMacro {
         let ProcMacro { name, kind, expander, disabled } = eval;
         let recorder = Recorder {
             krate: krate.into(),
@@ -143,6 +162,7 @@ impl Recorder {
             kind,
             eval: expander,
             records: records.clone(),
+            ahead,
         };
         ProcMacro { name, kind, expander: Arc::new(recorder), disabled }
     }
@@ -182,6 +202,21 @@ impl fmt::Debug for Recorder {
 impl ProcMacroExpander for Recorder {
     fn requires_session(&self) -> bool {
         self.eval.requires_session()
+    }
+
+    fn ordered(&self) -> bool {
+        self.eval.ordered()
+    }
+
+    fn speculates(&self, db: &Db, calling_crate: Crate) -> bool {
+        matches!(self.ahead, Ahead::On(_)) && self.eval.speculates(db, calling_crate)
+    }
+
+    fn speculate(&self, db: &Db, calling_crate: Crate, call: ProcMacroCall<'_>) {
+        if let Ahead::On(count) = &self.ahead {
+            count.fetch_add(1, Ordering::Relaxed);
+            self.eval.speculate(db, calling_crate, call);
+        }
     }
 
     fn code(&self) -> Option<ContentId> {

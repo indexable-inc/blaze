@@ -82,6 +82,8 @@ struct End {
     closed: bool,
     /// The other end hung up.
     peer_closed: bool,
+    /// Its sends are held, in flight and never done, until it hangs up ([`Sim::hold_sends`]).
+    holds_sends: bool,
 }
 
 /// The simulation's random numbers: blaze's one seeded SplitMix64.
@@ -293,6 +295,8 @@ pub struct Sim {
     /// The syncs it holds, never told, each with the writes it covers as it was held; a crash
     /// drops them as it does every op in flight.
     held: Vec<(Effect, usize)>,
+    /// The sends [`Sim::hold_sends`] holds: in flight, never done until their end hangs up.
+    held_sends: Vec<(Conn, Tag, Vec<u8>)>,
     /// Syncs of files under this directory fail ([`Sim::fail_syncs`]): a disk that went bad.
     fail_syncs: Option<FileName>,
     /// Lists of this directory wait until [`Sim::release_lists`] ([`Sim::hold_lists`]).
@@ -361,6 +365,8 @@ impl Sim {
             hold_syncs: None,
             // alloc: none until a sync is held.
             held: Vec::new(),
+            // alloc: none until a send is held.
+            held_sends: Vec::new(),
             fail_syncs: None,
             hold_lists: None,
             held_lists: Vec::new(), // alloc: empty, allocates nothing
@@ -431,6 +437,7 @@ impl Sim {
             if it.closed {
                 self.ends.remove(end);
             }
+            self.let_go_sends(conn);
             self.wake();
         }
     }
@@ -450,6 +457,7 @@ impl Sim {
     pub fn crash(&mut self) {
         self.pending.drain(|_, _| {});
         self.held.clear();
+        self.held_sends.clear();
         self.hold_syncs = None;
         self.fail_syncs = None;
         self.hold_lists = None;
@@ -482,6 +490,20 @@ impl Sim {
     /// what the sync covers stays unsynced. For a test of a store whose commit hangs.
     pub fn hold_syncs(&mut self, dir: FileName) {
         self.hold_syncs = Some(dir);
+    }
+
+    /// From now on, each send on the simulation's end `conn` is taken and stays in flight,
+    /// never done, until that end hangs up, when it fails: a peer that stopped reading with
+    /// its socket's buffer full. For a test of what a send that never ends holds up.
+    pub fn hold_sends(&mut self, conn: Conn) {
+        if let Some(end) = self.ends.get_mut(end_of(conn)) {
+            end.holds_sends = true;
+        }
+    }
+
+    /// The sends held so far and still in flight ([`Sim::hold_sends`]).
+    pub fn held_sends(&self) -> usize {
+        self.held_sends.len()
     }
 
     /// From now on, a list of `dir` is taken and waits, not in flight, until
@@ -875,6 +897,20 @@ impl Sim {
         Conn(self.ends.insert(End { peer, ..End::default() }).to_bits())
     }
 
+    /// The sends held on `conn` ([`Sim::hold_sends`]) end, failed: its end hung up.
+    fn let_go_sends(&mut self, conn: Conn) {
+        let mut at = 0;
+        while at < self.held_sends.len() {
+            if self.held_sends[at].0 != conn {
+                at += 1;
+                continue;
+            }
+            let (_, tag, bytes) = self.held_sends.remove(at);
+            let done = Done::unsent(bytes, format_args!("{conn:?}: hung up with the send in flight"));
+            self.tell(tag, done, Of::Op);
+        }
+    }
+
     /// Every waiting receive that can be answered now is: with what came, or with nothing once
     /// either end hung up.
     fn wake(&mut self) {
@@ -1263,6 +1299,10 @@ impl Driver for Sim {
                 }
                 Effect::Send { conn, mut bytes, tag } => {
                     let end = end_of(conn);
+                    if self.ends.get(end).is_some_and(|it| it.holds_sends && !it.closed && !it.peer_closed) {
+                        self.held_sends.push((conn, tag, bytes));
+                        continue;
+                    }
                     let done = match self.ends.get(end).map(|it| (it.closed, it.peer_closed, it.peer)) {
                         None | Some((true, _, _)) => Done::unsent(bytes, format_args!("no connection {conn:?}")),
                         Some((_, true, _)) => {
@@ -1295,6 +1335,7 @@ impl Driver for Sim {
                         }
                         _ => None,
                     };
+                    self.let_go_sends(conn);
                     let done = match hung {
                         Some((peer, peer_closed)) => {
                             if let Some(it) = peer.and_then(|peer| self.ends.get_mut(peer)) {
@@ -1440,6 +1481,7 @@ impl Driver for Sim {
             )
         });
         self.pending.len()
+            + self.held_sends.len()
             + (self.watches.len() - self.ending)
             + self.listens.len()
             + self.receiving.len()

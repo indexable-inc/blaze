@@ -532,6 +532,67 @@ The build's top-level phases each have a span:
 
 Running a build script has no span yet.
 
+## What made a build slow: `blaze slow`
+
+`blaze slow [--build N] [--top N] [--json]` reads one build's profile (the last build that
+ended, unless `--build` says otherwise) and ranks what made it slow by the wall time each fix
+would save. A build of 30 s or more ends with a note pointing at it. `blaze debug time` stays
+the raw table; `blaze slow` is the verdict. It is a top-level command beside `blaze why`: `why`
+says what a build computed again, `slow` says where its time went. It is not `blaze profile`,
+because cargo's `--profile` means something else.
+
+Each finding has these fields:
+- a kind;
+- the fix, in words;
+- `saves_ns`;
+- how that saving was estimated;
+- what it is about (a span name, a wait's class, a query);
+- the module or file that owns it, when the spans say (`spans.target`, or a `crates/...rs:N`
+  in the subject);
+- its evidence, with numbers.
+
+Findings are sorted by saving, then kind, then subject. Ties never depend on hash order, so the
+same rows give the same bytes. Findings that save less than 1% of the wall time (and at least
+0.2 s) are counted, not listed. The kinds:
+
+| kind | what it finds | estimated saving |
+|---|---|---|
+| `serial` | critical-path running time, grouped by the innermost span it ran in, while most workers were idle | its path time x (1 - busy workers / workers) |
+| `starved` | the same, but the spans' `self_cpu_ns` was under 25% of their running time (1 s or more of running): on a core, or blocked outside any `wait` span, yet getting no CPU | its path time x (1 - CPU / running) |
+| `starved_workers` | workers whose CPU per running second is under a third of the median of the top half | the path's time on them x (1 - their rate / the reference) |
+| `wait` | waits by class (`report::wait_class`), with the jobs that woke them and what those jobs were running | the path's time while it waited: a wait the path crossed to its waker counts its whole span |
+| `queued` | the path's `queued` and `spawned` links: runnable but not run | their time |
+| `redone` | one query key (`name`, `crate`, `function`) run more than once in the build | its extra running / mean parallelism |
+| `reran`, `evicted` | `query_counts.reran` and `evicted_asked`, costed at the query's CPU per run from its spans | runs x CPU per run / mean parallelism |
+| `missed` | the `misses` rows by step and cause, except `first` | unknown |
+| `shed` | `live bytes` fell by more than half (and more than 256 MiB) between the end of the build before and the start of this one | unknown |
+
+The estimates are not additive. Each says what fixing that one thing alone would save, so a
+wait and the owner's serial work under it can both count the same stretch of the path.
+
+What the profile could not see is listed after the findings, as blind spots, never skipped:
+- critical-path time the record lost (`unrecorded` links, by reason and lane);
+- job running time inside no span, against the 1% gate;
+- worker running time with no span CPU counted for it. No OS CPU is recorded, so the spans'
+  total can't be checked against the process's;
+- waits with no `awaits` (rule 13), and named waits that never name an owner;
+- no `ready` rows;
+- `builds.misses` over the number of misses rows;
+- rows that didn't line up;
+- a critical path that stops short of the build's start.
+
+The analysis is `blaze_profile::slow::analyse`. It is a pure function over the time model
+(`time::Model`), its critical path (`time::path::critical`) and `slow::Facts` (the builds row,
+thread names, spans by name and query kind, the misses and query counts, and the memory
+counters). `slow::load` is its DuckDB driver. Its tests are fixtures for the hard part: what the
+critical path charges to serial work, to a crossed wait and its owner, and to a starved worker.
+
+Both `blaze slow` and `blaze debug time` read a build's switches, spans and events by its
+`build_id`, and also the rows with no build inside the build's window. The recorder leaves
+`build_id` null on a job's rows once the job's code has let go of the build. On 2026-11-02
+that was most of a cold build's switches and spans, and the tagged rows alone showed a tenth of
+the work.
+
 ## The flight recorder
 
 Every blaze process keeps a fixed ring per thread, holding that thread's recent spans, counter
@@ -566,32 +627,39 @@ misses that tick. Its cursor keeps its place, and rows written over meanwhile sh
 - spans closed per second;
 - the memo's hit rate from the last build's counts;
 - a warning when nothing has closed for 10 s while threads are inside spans (the watchdog
-  fails the request at 60 s).
+  fails the request once nothing at all has moved for its bound, 120 s by default).
 
 ## The stall watchdog
 
-While tasks are running, the daemon keeps three counts of progress, each with its own bound:
+The watchdog fires on no progress, never on elapsed time. While tasks are running, the daemon
+reads three counts, each of which only grows:
 
-| count | still for | the error says |
-| --- | --- | --- |
-| spans closed and tasks ended | 60 s | `no span closed and no task ended` |
-| queries completed (run or verified) and tasks ended | 120 s | `no query completed and no task ended` |
-| units' steps ended | 300 s | `no unit's step ended` |
+| count | what moves it |
+| --- | --- |
+| spans closed | any span closing on any thread, each pool job's own span and each query run among them |
+| queries completed | a query run or verified |
+| tasks and steps ended | a plane node settling: a task, or a unit's step |
 
-When one stays still for its bound, the daemon:
+When none of them has moved for the stall bound, 120 s unless `blaze serve --stall-bound SECS`
+says otherwise, the daemon:
 
 1. writes `state/stalls/<time>.json`: the flight recorder's last two minutes and the CPU
    samples as a Chrome trace (ui.perfetto.dev opens it);
-2. fails each running request with the error `blaze stalled: <what> for N s while M tasks
-   ran`, followed by each thread inside spans, outermost span first, and how long it has been
-   in each;
-3. stops the daemon, whose threads may be deadlocked or going around without end; the next
-   request starts a new one.
+2. fails each running request with the error `blaze stalled: no span closed, no query
+   completed and no task or step ended for N s while M tasks ran (the stall bound is B s,
+   ...); it got to <the three counts>`, followed by each thread inside spans, outermost span
+   first, with what each awaits, who runs it, and how long it has been in each;
+3. stops the daemon, whose threads may be deadlocked; the next request starts a new one.
 
-A deadlock (jobs that all wait on each other, as in blaze-pool's hang at 0% CPU) becomes the
-first error within its bound instead of a request that never ends. Work that keeps closing
-spans but never completes a query (a livelock) becomes the second. Queries that keep
-completing while no unit's step ends for five minutes becomes the third.
+A deadlock (jobs that all wait on each other, as in blaze-pool's hang at 0% CPU) becomes this
+error within the bound instead of a request that never ends. A step or a span that runs long
+while anything else moves is no stall: on 2026-11-02 the earlier per-count bounds (60 s for
+spans, 120 s for queries, 300 s for steps) killed self-builds whose `lower workspace` step was
+still completing queries. Two warnings go to the log and fail nothing: what every thread is
+inside once nothing has moved for half the bound (so a client's own watchdog that stops the
+daemon sooner still finds it), and again once one unit's step has run 300 s while no other
+ended. A livelock that keeps moving the counts is not the watchdog's to catch: each loop that
+waits for progress carries its own bound (fuel, depth or a deadline).
 
 ## `BLAZE_PROFILE` and `BLAZE_STATS`
 

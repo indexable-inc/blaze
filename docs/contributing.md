@@ -205,6 +205,9 @@ did about it in one line.
   pull request's diff should be its change), and
   `cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
   `python3 harness/unittests.py`, the one `cargo test` CI runs, with the failures it expects).
+  A test that fails is new unless `harness/known-failures.toml` lists it with an owner:
+  `uv run --frozen harness/failures.py '{"run": {"runner": "blaze", "packages": [...]}}'` runs the
+  crates you touched and says which failures are new ([harness.md](harness.md#ci)).
 - For anything that changes numbers in [results.md](results.md): the command, the commit
   and the machine, so the entry can be replaced and not just appended to.
 

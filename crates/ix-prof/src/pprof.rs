@@ -9,6 +9,9 @@ use crate::{
     view::{LabelValue, Sample, ValueType, View},
 };
 
+/// The most a gzipped profile may unpack to (256 MiB); a bigger one is refused by name.
+pub const MAX_PPROF_BYTES: u64 = 256 << 20;
+
 #[derive(Debug)]
 pub struct Error(pub String);
 
@@ -230,14 +233,21 @@ impl View {
         gz.finish().expect("writing to a Vec does not fail")
     }
 
-    /// Reads a pprof profile, gzipped or not.
+    /// Reads a pprof profile, gzipped or not. Gunzipped, it may be at most
+    /// [`MAX_PPROF_BYTES`]: a few bytes of gzip can stand for gigabytes.
     pub fn from_pprof(data: &[u8]) -> Result<View, Error> {
         let raw;
         let proto = if data.starts_with(&[0x1f, 0x8b]) {
             let mut out = Vec::new();
             flate2::read::GzDecoder::new(data)
+                .take(MAX_PPROF_BYTES + 1)
                 .read_to_end(&mut out)
                 .map_err(|it| Error(format!("gunzip: {it}")))?;
+            if out.len() as u64 > MAX_PPROF_BYTES {
+                return Err(Error(format!(
+                    "the gzipped profile is over {MAX_PPROF_BYTES} bytes unpacked: refused (gunzip it and pass the file)"
+                )));
+            }
             raw = out;
             &raw[..]
         } else {

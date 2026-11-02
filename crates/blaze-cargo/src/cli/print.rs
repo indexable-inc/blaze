@@ -500,6 +500,11 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             say::finished_into(&mut self.line, &built.profile, took);
             self.line.push('\n');
         }
+        // A slow build, done or not, points at what says why (`blaze slow`, docs/profiling.md).
+        if took >= SLOW_BUILD && !self.shown.quiet && !self.shown.format.json() {
+            let what = format!("this build took {}: `blaze slow` says what made it slow and what to fix", say::elapsed(took));
+            say::note_into(&mut self.line, &what, color);
+        }
         if self.shown.format.json() {
             self.to(true)?;
             json::build_finished(&mut self.line, ok);
@@ -510,6 +515,9 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         self.err.flush()
     }
 }
+
+/// A build at least this long ends with a pointer to `blaze slow`.
+const SLOW_BUILD: Duration = Duration::from_secs(30);
 
 /// rustc's closing lines, which cargo replaces with its own summary.
 fn summarizes(message: &str) -> bool {

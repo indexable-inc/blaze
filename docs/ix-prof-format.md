@@ -440,8 +440,22 @@ Designed, not built: `export --parquet <dir>` writes each table as `<dir>/<table
 
 ## 6. Live: the HTTP endpoint (`ix-prof` feature `http`)
 
-`ix_prof::http::serve("127.0.0.1:6060")` (or `IX_PROF_HTTP=127.0.0.1:6060`), modeled on
-Go's `net/http/pprof`. Loopback only by default; binding elsewhere needs an explicit address.
+`IX_PROF_HTTP=127.0.0.1:6060` (or `Config::http`), modeled on Go's `net/http/pprof`. Loopback
+only; Unix only. Every request carries the token, 128 random bits made at start: loopback alone lets every
+local account in. With `IX_PROF`, the address and the token are written to
+`<IX_PROF>/http.endpoint`: one 0600 file, `<addr>\n<token>\n`, renamed into place whole so a
+reader never pairs a new token with an old address, and removed at stop if it still holds this
+session's token. stderr then says where the file is, not the token; without `IX_PROF` the
+stderr line carries the token (`…/live?token=<token>`). The directory must be this user's own:
+ix-prof makes it 0700 if missing and refuses, at start, one that is a symbolic link, belongs
+to another user or has any group or other mode bits, never changing its mode. Clients
+(`blaze pprof --dir`, `--token-file`) apply the same directory rule, read only this user's own
+regular 0600 file of at most 64 bytes (never through a link, never a FIFO), require a loopback
+address, and send the token only to that address. A client sends it as
+`Authorization: Bearer <token>`; a browser, which cannot set the header on the explorer's
+fetches, as `token=<token>` in the query. A token on a command line is readable by every local
+user (`ps`), so non-browser clients read it from `http.endpoint`. The server
+thread stops and the port is released when the guard drops.
 
 | GET | answers | content type |
 |---|---|---|
@@ -457,14 +471,23 @@ Go's `net/http/pprof`. Loopback only by default; binding elsewhere needs an expl
 
 Only `profile` waits (Go's semantics: `seconds`, default 30, 1..3600); the rest answer at once
 from what is retained. Every endpoint answers 403 unless `Host` is `127.0.0.1:<port>`,
-`localhost:<port>` or `[::1]:<port>` (DNS rebinding), and the server refuses to bind a
-non-loopback address.
+`localhost:<port>` or `[::1]:<port>` (DNS rebinding) and the request carries the token (the
+`Authorization: Bearer` header, else the query's `token`), and the server refuses to bind a
+non-loopback address. Before the token check every local user can reach the parser, so it is
+bounded: request line and headers together at most 16 KiB and whole within 5 s of the accept
+(one deadline for the request, not a timeout per read), a 30 s write timeout, at most 32
+connections waiting for their token check at once (one more evicts the oldest of them, shut
+down; a connection that passed the check is never evicted), `%XX` decoded on bytes, and a failed `accept` pauses the listener (10 ms doubling to
+1 s) instead of spinning.
 CORS: answers carry `Access-Control-Allow-Origin` for `https://ix.dev` and loopback origins,
 and answer the Private Network Access preflight
 (`Access-Control-Allow-Private-Network: true`), so ix.dev/explore can fetch from
 `http://127.0.0.1:<port>`.
 
-So `go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=10` works unchanged.
+`go tool pprof` cannot send the header, so a Go user fetches with `blaze pprof --dir <IX_PROF>
+'profile?seconds=10' export --pprof cpu.pb.gz` and opens the file; `go tool pprof
+'…&token=<token>'` works but puts the token on its command line. A browser client that adds
+parameters (the explorer's `cursor=` on reconnect) keeps `token=`.
 
 Window snapshot (what the live view asks for when it zooms or opens late): 
 `GET /debug/pprof/ixprof?since_ns=<i64>&until_ns=<i64>` (either may be left out: from the
@@ -524,8 +547,8 @@ Rules:
   2.3); a window snapshot renumbers.
 - **Order**: frames are written in `seq` order (u64, one counter for all BATCH frames of the
   session, starting at 1). A TICK follows each tick's batches; clients render on TICK.
-- **Cursor**: `<session>.<seq>` (hex). `session` = blake3 of (pid, start_ns, start_unix_ns) in
-  hex, first 16 chars. Resuming with a cursor of the same session sends the catalog tables
+- **Cursor**: `<session>.<seq>` (hex). `session` = blake3 of (pid, start_ns, start_unix_ns, a random
+  u64 nonce) in hex, first 16 chars. Resuming with a cursor of the same session sends the catalog tables
   again only if the client asked with `catalog=1`, otherwise only what follows `seq`; a cursor
   of another session (the program restarted) is answered with `resumed: false` and a full start.
 - **Bounded buffering, never silent**:
@@ -552,8 +575,11 @@ so the live view can backfill a zoomed range or a gap from the retention ring.
 
 - `blaze pprof <file|url> --http [addr]` serves `GET /profile.ixprof` (an .ixprof input),
   `GET /profile.pb.gz` (the cpu view, or the pprof input) and `GET /profile.chrome.json` on
-  loopback (CORS and the Host check as above), then opens
-  `https://ix.dev/explore?profile=<url-encoded http://127.0.0.1:PORT/profile.ixprof>`.
+  loopback (CORS and the Host check as above, and a new token per run that every request must
+  carry, `token=` or `Authorization: Bearer`), then opens
+  `https://ix.dev/explore#profile=<url-encoded http://127.0.0.1:PORT/profile.ixprof?token=TOKEN>`
+  through a 0600 page in a new 0700 temporary directory (the browser's command line holds the
+  page's path, not the token).
   The explorer fetches that URL, parses the container (2) and draws it.
 - The explorer may also accept a dropped/picked `.ixprof` file, and a URL to a live
   `/debug/pprof/ixprof?seconds=N` endpoint.
@@ -576,7 +602,7 @@ frame `function` names, since ids differ between files).
 static ALLOC: ix_prof::alloc::Counting<std::alloc::System> = ix_prof::alloc::Counting::new(std::alloc::System);
 
 fn main() {
-    // IX_PROF=<dir> on: records CPU samples, spans, allocations; writes <dir>/<program>-<pid>.ixprof
+    // IX_PROF=<dir> on: records CPU samples, spans, allocations; writes <dir>/<program>-<pid>-<session>.ixprof
     // when the guard drops. Unset: returns a no-op guard, costs a branch per span.
     let _prof = ix_prof::start_from_env().expect("ix-prof");
     // or: ix_prof::start(ix_prof::Config { dir: Some(dir), cpu_hz: Some(99), ..Default::default() })?
@@ -586,7 +612,7 @@ fn main() {
 ```
 
 Environment: `IX_PROF=<dir>` (on, write there), `IX_PROF_HZ` (default 99 Hz; 0 turns the sampler
-off), `IX_PROF_ALLOC=<bytes>|off` (sample rate, default 524288), `IX_PROF_HTTP=<addr>` (loopback only), `IX_PROF_RETAIN=<bytes>` (live log, default 64 MiB).
+off), `IX_PROF_ALLOC=<bytes>|off` (sample rate, default 524288), `IX_PROF_HTTP=<addr>` (loopback only, token required), `IX_PROF_RETAIN=<bytes>` (live log, default 64 MiB).
 
 The aggregation core (`ix_prof::core::Recorder`) is sans-IO: it takes events
 (`span_new/record/enter/exit/close`, `cpu_sample`, `alloc`, `free`, `counter`) with times
@@ -602,15 +628,21 @@ blaze links `ix-prof` into the program it builds (the opt-in extension; a progra
 ask is unchanged), starts it before `main` and serves section 6 + 6a on a loopback port:
 
 - blaze sets `IX_PROF_HTTP=127.0.0.1:0` (any free port) and `IX_PROF=<target>/profile/<run>`;
-  the program's ix-prof writes the chosen address to `<IX_PROF>/http.addr` and to stderr as
-  `ix-prof: live at http://127.0.0.1:PORT/debug/pprof/live`. blaze prints
-  `https://ix.dev/explore?live=<url-encoded http://127.0.0.1:PORT/debug/pprof/live>`
-  (and opens it with `--profile=open`).
-- At exit the program writes `<IX_PROF>/<program>-<pid>.ixprof` (the whole run, from the
+  the program's ix-prof writes the chosen address and the token to `<IX_PROF>/http.endpoint`
+  (mode 0600; section 6), and to stderr only where that file is. blaze reads it, with the
+  same checks as `blaze pprof --dir`, and prints
+  `https://ix.dev/explore#live=<url-encoded http://127.0.0.1:PORT/debug/pprof/live?token=TOKEN>`
+  (and opens it with `--profile=open`). The stream URL, token and all, is in the fragment,
+  which the browser never sends to ix.dev's servers or CDN; and blaze opens it through a 0600
+  page, as `blaze pprof --http` does (section 7), never with the link on a command line.
+- At exit the program writes `<IX_PROF>/<program>-<pid>-<session>.ixprof` (the session id of
+  6a, so a later run with the same pid never replaces it; the whole run, from the
   retention ring plus what was aggregated) and the stream sends END.
 - `blaze test --profile`: one stream per test process; each test runs inside a span named
   `test` with field `name = <test path>`, so the live view lanes and the file both group by test.
-- The explorer's live URL parameter is `live=<stream url>`; the file one is `profile=<url>`.
+- The explorer's live URL parameter is `#live=<stream url>`; the file one is `profile=<url>`
+  (`#profile=` when the URL carries a token, as `blaze pprof --http`'s does). Both are read
+  from the fragment, so a token in them never leaves the browser.
 
 ## Notes from the explorer lane (v2-explore-general, 2026-11-02)
 

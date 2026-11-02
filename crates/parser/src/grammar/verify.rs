@@ -26,7 +26,7 @@ fn clause_kw(p: &Parser<'_>) -> Option<SyntaxKind> {
         .find(|&kw| p.at_contextual_kw(kw))
 }
 
-fn at_clause_kw(p: &Parser<'_>, n: usize) -> bool {
+pub(super) fn at_clause_kw(p: &Parser<'_>, n: usize) -> bool {
     p.nth_at_contextual_kw(n, T![requires])
         || p.nth_at_contextual_kw(n, T![recommends])
         || p.nth_at_contextual_kw(n, T![ensures])
@@ -93,23 +93,23 @@ fn at_named_ret_type(p: &Parser<'_>) -> bool {
     p.at(T!['(']) && p.nth_at(1, IDENT) && p.nth_at(2, T![:]) && !p.nth_at(2, T![::])
 }
 
-/// A function's return type, named or not.
+/// A function's return type, named or not. The name is looked for after `->` is bumped: the
+/// parser's positions count raw tokens, and `->` is two of them (`-`, `>`).
 pub(super) fn fn_ret_type(p: &mut Parser<'_>) -> bool {
     if !p.at(T![->]) {
         return false;
     }
-    if !(p.nth_at(1, T!['(']) && p.nth_at(2, IDENT) && p.nth_at(3, T![:]) && !p.nth_at(3, T![::]))
-    {
-        return opt_ret_type(p);
-    }
     let m = p.start();
     p.bump(T![->]);
-    debug_assert!(at_named_ret_type(p));
-    p.bump(T!['(']);
-    patterns::pattern(p);
-    p.expect(T![:]);
-    types::type_no_bounds(p);
-    p.expect(T![')']);
+    if at_named_ret_type(p) {
+        p.bump(T!['(']);
+        patterns::pattern(p);
+        p.expect(T![:]);
+        types::type_no_bounds(p);
+        p.expect(T![')']);
+    } else {
+        types::type_no_bounds(p);
+    }
     m.complete(p, RET_TYPE);
     true
 }

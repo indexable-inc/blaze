@@ -185,17 +185,70 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let on = ON.load(Ordering::Relaxed);
-        if on {
+        if !ON.load(Ordering::Relaxed) {
+            // SAFETY: the caller's contract, passed on.
+            return unsafe { self.inner.realloc(ptr, layout, new_size) };
+        }
+        if tracked(ptr as u64) {
+            // A sampled block is moved by hand, as `GlobalAlloc::realloc`'s default does: its
+            // free is recorded while it is still allocated (so its address names it, as in
+            // `dealloc`), and only once the new block exists, so a failed realloc leaves the
+            // block, the table and the counts as they were.
+            // SAFETY: the caller's contract: `new_size` with `layout`'s alignment is a valid layout.
+            let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+            // SAFETY: as above; `new_size` is not zero.
+            let p = unsafe { self.inner.alloc(new_layout) };
+            if p.is_null() {
+                return p;
+            }
+            // SAFETY: `ptr` is valid for `layout.size()` bytes and `p` for `new_size`; they are
+            // two live blocks, so they do not overlap.
+            unsafe { std::ptr::copy_nonoverlapping(ptr, p, layout.size().min(new_size)) };
             on_free(ptr as u64, layout.size() as u64);
+            // SAFETY: `ptr` was allocated by `inner` with `layout` (the caller's contract).
+            unsafe { self.inner.dealloc(ptr, layout) };
+            on_alloc(p as u64, new_size as u64);
+            return p;
         }
         // SAFETY: the caller's contract, passed on.
         let p = unsafe { self.inner.realloc(ptr, layout, new_size) };
-        if on && !p.is_null() {
+        // A block that is not sampled has only its bytes to count, and only on success: a null
+        // leaves it allocated. Its address is not looked up again: once `inner` moved it,
+        // another thread may have a new, sampled block there.
+        if !p.is_null() {
+            count_free(layout.size() as u64);
             on_alloc(p as u64, new_size as u64);
         }
         p
     }
+}
+
+/// Whether `address` is a sampled block whose free is watched for. Stable while the caller
+/// owns the block: no other block can take its address until it is freed.
+fn tracked(address: u64) -> bool {
+    if RATE.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let at = slot(address);
+    for i in 0..PROBES {
+        match SAMPLED[(at + i) % TABLE].load(Ordering::Relaxed) {
+            EMPTY => return false,
+            it if it == address => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Counts `size` bytes freed by this thread, outside the profiler's own bookkeeping.
+fn count_free(size: u64) {
+    let _ = LOCAL.try_with(|l| {
+        if l.busy.get() {
+            return;
+        }
+        l.freed.set(l.freed.get() + size);
+        FREED_BYTES.fetch_add(size, Ordering::Relaxed);
+    });
 }
 
 #[inline]
@@ -414,5 +467,67 @@ fn stack_high() -> Option<u64> {
     #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serves blocks of up to 64 bytes from the system allocator; refuses anything larger and
+    /// every realloc, as an allocator out of memory does.
+    struct Small;
+
+    // SAFETY: what it hands out comes from `System` with the same layout, and is freed there.
+    unsafe impl GlobalAlloc for Small {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if layout.size() > 64 {
+                return std::ptr::null_mut();
+            }
+            // SAFETY: the caller's contract, passed on.
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr` came from `System` with `layout`.
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, _ptr: *mut u8, _layout: Layout, _new_size: usize) -> *mut u8 {
+            std::ptr::null_mut()
+        }
+    }
+
+    #[test]
+    fn a_failed_realloc_leaves_the_block_and_its_accounting_as_they_were() {
+        let _globals = crate::TEST_GLOBALS.lock();
+        let a = Counting::new(Small);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let mut records = Vec::new();
+        // Not sampled (counts only), then sampled (a mean of one sample a byte: every block).
+        for rate in [None, Some(1)] {
+            turn_on(rate);
+            drain(&mut records);
+            records.clear();
+            // SAFETY: a non-zero layout.
+            let p = unsafe { a.alloc(layout) };
+            assert!(!p.is_null());
+            assert_eq!(tracked(p as u64), rate.is_some(), "rate {rate:?}: the block is watched when sampled");
+            let before = (totals(), thread_usage());
+            // SAFETY: `p` is live with `layout`; 4096 is non-zero.
+            let q = unsafe { a.realloc(p, layout, 4096) };
+            assert!(q.is_null(), "the inner allocator refuses");
+            assert_eq!((totals(), thread_usage()), before, "rate {rate:?}: a failed realloc frees nothing");
+            assert_eq!(tracked(p as u64), rate.is_some(), "rate {rate:?}: the block is still watched");
+            drain(&mut records);
+            assert!(
+                !records.iter().any(|r| r.free && r.address == p as u64),
+                "rate {rate:?}: no free is recorded for a block still allocated"
+            );
+            // SAFETY: `p` is still live with `layout`.
+            unsafe { a.dealloc(p, layout) };
+            turn_off();
+            drain(&mut records);
+        }
     }
 }

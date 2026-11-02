@@ -25,8 +25,15 @@ pub struct Unit {
     pub target: Target,
     pub profile: Profile,
     /// The triple built for; none for the host's own units (a build without `--target`, or a
-    /// build script or proc macro and what they depend on).
+    /// build script and what it depends on). Codegen reads it; what tells two units apart is
+    /// [`Unit::built_for`], which also says [`Unit::macro_wasm`].
     pub platform: Option<String>,
+    /// blaze's: the unit is a proc macro, or what one depends on, built for `platform` (always
+    /// `wasm32-wasip1`) to run as a wasm module in the macro host. A build for `--target
+    /// wasm32-wasip1` has units of both for one package and triple, told apart by this alone.
+    /// cargo's graph has none, and prints no such key.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub macro_wasm: bool,
     pub mode: Mode,
     /// Whether a `check` unit is checked as a test, with `--test`: cargo prints it as any
     /// other `check`, so it is not in the JSON.
@@ -36,6 +43,55 @@ pub struct Unit {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_std: bool,
     pub dependencies: Vec<UnitDep>,
+}
+
+impl Unit {
+    /// What the unit is built for, as two units of one package and target are told apart by
+    /// it: every key, directory and group that is per platform is per this.
+    pub fn built_for(&self) -> BuiltFor<'_> {
+        BuiltFor { platform: self.platform.as_deref(), macro_wasm: self.macro_wasm }
+    }
+
+    /// Whether the unit's code runs on the machine that builds it: [`runs_here`] of what it
+    /// is built for and its profile.
+    pub fn runs_here(&self) -> bool {
+        runs_here(self.built_for(), &self.profile.name)
+    }
+}
+
+/// Whether code built for `built_for` under the profile named `profile` runs on the machine
+/// that builds it (`hir_ty_codegen::v2::Runs::Here`, whose code may use every feature of this
+/// machine) or elsewhere (`Runs::Elsewhere`, the target's baseline). A dev build of the host's
+/// target (no `--target`) runs where it is built: `dev` and `test` are cargo's profiles of
+/// `build`, `run`, `test` and their build scripts and proc macros. A `--target` unit, a
+/// `release` or `bench` build, or one of a custom profile, which may be shipped, runs
+/// elsewhere. The one rule: the code generator's toolchain of a unit and the standard
+/// library's key ([`crate::query::StdKey::runs_here`]) both read it.
+pub fn runs_here(built_for: BuiltFor<'_>, profile: &str) -> bool {
+    built_for.platform.is_none() && matches!(profile, "dev" | "test")
+}
+
+/// [`Unit::built_for`]: the triple (none for the host's own units) and whether the unit is
+/// built to run as a wasm proc macro. Printed for errors: `the host`, the triple, or the triple
+/// and `(proc macros)`.
+///
+/// The source of truth of what a unit is built for. The front end's `base_db::BuiltFor`
+/// (base-db cannot depend on this crate) is made from it only by
+/// `blaze_lower::crates::built_for`, and prints the same text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BuiltFor<'a> {
+    pub platform: Option<&'a str>,
+    pub macro_wasm: bool,
+}
+
+impl std::fmt::Display for BuiltFor<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.platform, self.macro_wasm) {
+            (None, _) => f.write_str("the host"),
+            (Some(triple), false) => f.write_str(triple),
+            (Some(triple), true) => write!(f, "{triple} (proc macros)"),
+        }
+    }
 }
 
 /// A target as `cargo metadata` prints it.

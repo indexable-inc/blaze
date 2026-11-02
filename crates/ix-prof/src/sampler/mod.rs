@@ -59,15 +59,26 @@ impl std::error::Error for Unsampled {}
 /// Where samples go: a batch of samples and the names of threads seen for the first time.
 pub type Sink = Arc<dyn Fn(&[Sample], &[(u64, String)]) + Send + Sync>;
 
-/// A running sampler; dropping it stops the thread at its next tick.
+/// A running sampler. Dropping it stops the thread and joins it: by the time the drop
+/// returns, every sample taken (the last batch, and on Linux what was left in the kernel's
+/// buffers) has gone to the sink.
 pub struct Sampler {
     stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
     pub how: &'static str,
 }
 
 impl Drop for Sampler {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            // The loop parks between ticks; this ends the park now rather than at the tick.
+            thread.thread().unpark();
+            let _wait = tracing::info_span!(target: "ix_prof", "join", wait = "thread", on = "ix-prof-sampler").entered();
+            // A panic in the sampler thread was already printed by the panic hook; the
+            // profile is written with the samples that reached the sink.
+            let _ = thread.join();
+        }
     }
 }
 
@@ -75,26 +86,33 @@ impl Drop for Sampler {
 pub fn start(hz: u32, sink: Sink) -> Result<Sampler, Unsampled> {
     let hz = hz.clamp(1, 10_000);
     let stop = Arc::new(AtomicBool::new(false));
-    let how = run(hz, sink, Arc::clone(&stop))?;
-    Ok(Sampler { stop, how })
+    let (thread, how) = run(hz, sink, Arc::clone(&stop))?;
+    Ok(Sampler { stop, thread: Some(thread), how })
+}
+
+/// Waits out `d` on the sampler thread, or less when [`Sampler`]'s drop unparks it.
+#[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
+fn pause(d: std::time::Duration) {
+    #[allow(clippy::disallowed_methods, reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here, and the stop unparks it")]
+    std::thread::park_timeout(d);
 }
 
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
-fn run(hz: u32, sink: Sink, stop: Arc<AtomicBool>) -> Result<&'static str, Unsampled> {
+fn run(hz: u32, sink: Sink, stop: Arc<AtomicBool>) -> Result<(std::thread::JoinHandle<()>, &'static str), Unsampled> {
     #[cfg(target_os = "linux")]
     use linux as platform;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use macos as platform;
     platform::check(hz)?;
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("ix-prof-sampler".to_owned())
         .spawn(move || platform::run(hz, &sink, &stop))
         .map_err(|why| Unsampled(format!("its thread did not start: {why}")))?;
-    Ok(platform::HOW)
+    Ok((thread, platform::HOW))
 }
 
 #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
-fn run(_hz: u32, _sink: Sink, _stop: Arc<AtomicBool>) -> Result<&'static str, Unsampled> {
+fn run(_hz: u32, _sink: Sink, _stop: Arc<AtomicBool>) -> Result<(std::thread::JoinHandle<()>, &'static str), Unsampled> {
     Err(Unsampled(format!(
         "ix-prof has no in-process sampler for {}-{} yet (a SIGPROF sampler is planned)",
         std::env::consts::ARCH,

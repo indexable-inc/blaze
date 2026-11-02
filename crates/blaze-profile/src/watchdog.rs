@@ -2,12 +2,15 @@
 //! bound, instead of a daemon at 0% CPU that only `sample` can explain.
 //!
 //! [`Watchdog`] is sans IO: the daemon's loop tells it, each turn, the time on its driver's
-//! clock (virtual under the simulation), a count that grows with every span closed and every
-//! task ended ([`crate::flight::progress`] plus the tasks the plane saw end), and whether work
-//! only the daemon's own threads can finish is under way (tasks on its workers; a wait on a
-//! child process or on I/O is not the daemon's to finish). When that work makes no progress for
-//! the bound, [`Watchdog::tick`] says so once, and [`stall`] reads every thread's open spans and
-//! the flight recorder into a [`Stall`], the error the daemon fails the requests with.
+//! clock (virtual under the simulation), its counts of [`Progress`] (spans closed, every pool
+//! job's and query run's among them; queries completed; the plane's tasks and units' steps
+//! ended), and whether work only the daemon's own threads can finish is under way (tasks on its
+//! workers; a wait on a child process or on I/O is not the daemon's to finish). It fires on no
+//! progress, never on elapsed time: a step or a span that runs long while anything else moves
+//! is no stall. When none of the counts moves for the bound while work is under way,
+//! [`Watchdog::tick`] says so once, and [`stall`] reads every thread's open spans (what each
+//! awaits, and who runs it) and the flight recorder into a [`Stall`], the error the daemon
+//! fails the requests with.
 
 use std::{fmt, time::Duration};
 
@@ -18,39 +21,69 @@ const KEPT: Duration = Duration::from_secs(120);
 
 pub struct Watchdog {
     bound_ns: u64,
-    seen: u64,
+    seen: Progress,
     /// When the work under way last moved, while there is some.
     quiet_since: Option<u64>,
     /// Said for the present quiet stretch already.
     said: bool,
 }
 
-/// No progress from `since_ns` for `for_ns`, on the clock the watchdog was told.
+/// What the daemon counts as progress. Each count only grows; work moved when any of them did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    /// Spans closed on every thread, and query runs that close none ([`crate::flight::progress`]):
+    /// each pool job's own span is among them, so every job that ends counts.
+    pub spans: u64,
+    /// Queries completed, run or verified (`blaze_query::db::completed`).
+    pub queries: u64,
+    /// The plane's nodes that settled: its tasks and units' steps that ended.
+    pub steps: u64,
+}
+
+impl fmt::Display for Progress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} spans closed, {} queries completed and {} tasks or steps ended",
+            self.spans, self.queries, self.steps
+        )
+    }
+}
+
+/// No progress from `since_ns` for `for_ns`, on the clock the watchdog was told, with the
+/// counts where they stayed (`at`) and the bound that was reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quiet {
     pub since_ns: u64,
     pub for_ns: u64,
+    pub at: Progress,
+    pub bound_ns: u64,
 }
 
 impl Watchdog {
-    /// The bound `blaze serve` gives it: longer than any task that closes no info-level span
-    /// should run.
-    pub const BOUND: Duration = Duration::from_secs(60);
-    /// The bound of [`still::QUERIES`]: longer than any task that completes no query and ends
-    /// no other should run (a link, one function's LLVM).
-    pub const QUERY_BOUND: Duration = Duration::from_secs(120);
-    /// The bound of [`still::STEPS`]: longer than any one step of a unit should take while no
-    /// other ends.
-    pub const STEP_BOUND: Duration = Duration::from_secs(300);
+    /// The bound `blaze serve` gives it unless `--stall-bound` names another: longer than any
+    /// stretch in which no span closes, no query completes and no task ends anywhere in the
+    /// daemon should last, on a loaded host too.
+    pub const BOUND: Duration = Duration::from_secs(120);
 
     pub fn new(bound: Duration) -> Watchdog {
-        Watchdog { bound_ns: bound.as_nanos() as u64, seen: 0, quiet_since: None, said: false }
+        Watchdog {
+            bound_ns: u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX),
+            seen: Progress::default(),
+            quiet_since: None,
+            said: false,
+        }
     }
 
-    /// One turn: `now_ns` on the loop's clock, `progress` the count of spans closed and tasks
-    /// ended, `busy` whether the daemon's threads have work under way. `Some` once a quiet
-    /// stretch reaches the bound, and not again until progress resumes.
-    pub fn tick(&mut self, now_ns: u64, progress: u64, busy: bool) -> Option<Quiet> {
+    /// How long no progress may last while work is under way.
+    pub fn bound(&self) -> Duration {
+        Duration::from_nanos(self.bound_ns)
+    }
+
+    /// One turn: `now_ns` on the loop's clock, `progress` the counts, `busy` whether the
+    /// daemon's threads have work under way. `Some` once a stretch in which no count moved
+    /// reaches the bound, and not again until progress resumes.
+    pub fn tick(&mut self, now_ns: u64, progress: Progress, busy: bool) -> Option<Quiet> {
         if progress != self.seen || !busy {
             self.seen = progress;
             self.quiet_since = busy.then_some(now_ns);
@@ -63,38 +96,31 @@ impl Watchdog {
             return None;
         }
         self.said = true;
-        Some(Quiet { since_ns: since, for_ns })
+        Some(Quiet { since_ns: since, for_ns, at: progress, bound_ns: self.bound_ns })
     }
 }
 
-/// What a [`Watchdog`] counted that stayed still, as a stall says it.
-pub mod still {
-    /// [`crate::flight::progress`] and the tasks the plane saw end.
-    pub const SPANS: &str = "no span closed and no task ended";
-    /// The queries completed (`blaze_query::db::completed`) and the tasks the plane saw end:
-    /// still while spans close is query work that goes around without finishing.
-    pub const QUERIES: &str = "no query completed and no task ended";
-    /// The plane's nodes that settled: still while queries complete is work that never ends
-    /// a unit's step.
-    pub const STEPS: &str = "no unit's step ended";
-}
+/// What stayed still, as a stall says it: every count of [`Progress`].
+pub const STILL: &str = "no span closed, no query completed and no task or step ended";
 
-/// A build that stopped: what stayed still ([`still`]) and how long, how many tasks were under
-/// way, each thread's open spans, and the flight recorder's Chrome trace of the time up to it.
+/// A build that stopped: how long nothing moved and the bound it reached, the counts where
+/// they stayed, how many tasks were under way, each thread's open spans, and the flight
+/// recorder's Chrome trace of the time up to it.
 pub struct Stall {
-    pub still: &'static str,
     pub quiet_ns: u64,
+    pub bound_ns: u64,
+    pub at: Progress,
     pub running: usize,
     pub threads: Vec<ThreadNow>,
     pub trace: Vec<u8>,
 }
 
-/// The stall `quiet` found of what `still` names, with `running` tasks under way: every thread
-/// read now.
-pub fn stall(quiet: Quiet, running: usize, still: &'static str) -> Stall {
+/// The stall `quiet` found, with `running` tasks under way: every thread read now.
+pub fn stall(quiet: Quiet, running: usize) -> Stall {
     Stall {
-        still,
         quiet_ns: quiet.for_ns,
+        bound_ns: quiet.bound_ns,
+        at: quiet.at,
         running,
         threads: flight::threads_now(),
         trace: flight::dump(KEPT),
@@ -106,10 +132,12 @@ impl fmt::Display for Stall {
         let secs = |ns: u64| ns as f64 / 1e9;
         write!(
             f,
-            "blaze stalled: {} for {:.1} s while {} tasks ran",
-            self.still,
+            "blaze stalled: {STILL} for {:.1} s while {} tasks ran (the stall bound is {:.0} s, \
+             `blaze serve --stall-bound SECS` sets it); it got to {}",
             secs(self.quiet_ns),
-            self.running
+            self.running,
+            secs(self.bound_ns),
+            self.at
         )?;
         if self.threads.is_empty() {
             return f.write_str("; no thread is inside a span");
@@ -184,8 +212,9 @@ pub fn open_span(f: &mut impl fmt::Write, span: &OpenSpan) -> fmt::Result {
 impl fmt::Debug for Stall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Stall")
-            .field("still", &self.still)
             .field("quiet_ns", &self.quiet_ns)
+            .field("bound_ns", &self.bound_ns)
+            .field("at", &self.at)
             .field("running", &self.running)
             .field("threads", &self.threads)
             .field("trace_bytes", &self.trace.len())
@@ -241,19 +270,19 @@ mod tests {
         // The daemon's loop on a virtual clock, a turn each 100 ms: the jobs never end, so the
         // count of tasks ended stays where it is.
         let mut watchdog = Watchdog::new(Watchdog::BOUND);
-        let ended = 0;
         let mut now = 0;
         let quiet = loop {
             assert!(
                 now < 3600 * SEC,
                 "an hour of the clock went by with no stall said: the request hangs"
             );
-            if let Some(quiet) = watchdog.tick(now, flight::progress() + ended, true) {
+            let progress = Progress { spans: flight::progress(), queries: 7, steps: 3 };
+            if let Some(quiet) = watchdog.tick(now, progress, true) {
                 break quiet;
             }
             now += SEC / 10;
         };
-        let error = stall(quiet, JOBS, still::SPANS);
+        let error = stall(quiet, JOBS);
         let (released, cv) = &*gate;
         *released.lock() = true;
         cv.notify_all();
@@ -267,7 +296,9 @@ mod tests {
         );
         let text = error.to_string();
         for name in [
-            "blaze stalled: no span closed and no task ended for",
+            "blaze stalled: no span closed, no query completed and no task or step ended for",
+            "the stall bound is 120 s, `blaze serve --stall-bound SECS` sets it",
+            "7 queries completed and 3 tasks or steps ended",
             "job a",
             "job b",
             "job c",
@@ -299,7 +330,7 @@ mod tests {
         };
         for _ in 0..64 {
             let mut watchdog = Watchdog::new(Duration::from_secs(10));
-            let (mut now, mut progress) = (0, 0);
+            let (mut now, mut progress) = (0, Progress::default());
             for _ in 0..2000 {
                 now += next() % (2 * SEC);
                 // Moves at least every 10 s minus a turn; is idle (nothing under way) at times.
@@ -308,26 +339,60 @@ mod tests {
                 assert_eq!(watchdog.tick(now, progress, busy), None);
                 now += quiet_for;
                 assert_eq!(watchdog.tick(now, progress, busy), None);
-                progress += 1 + next() % 3;
+                // One count moves at a time, the others standing still for as long as they
+                // like: any of them is progress.
+                match next() % 3 {
+                    0 => progress.spans += 1 + next() % 3,
+                    1 => progress.queries += 1,
+                    _ => progress.steps += 1,
+                }
             }
         }
     }
 
+    /// The self-build profile's stalls (2026-11-02): one unit's step (lowering the workspace)
+    /// ran for minutes, and one span (`impls publish` of core) for a minute on a starved
+    /// thread, while other work moved. Neither is a stall; only all counts still is.
+    #[test]
+    fn a_long_step_or_span_while_anything_else_moves_is_no_stall() {
+        let mut watchdog = Watchdog::new(Duration::from_secs(10));
+        let mut progress = Progress { spans: 0, queries: 0, steps: 4 };
+        // Ten minutes in one step: no step ends, queries complete every 9 s and no span closes.
+        for at in 0..=600 {
+            if at % 9 == 0 {
+                progress.queries += 1;
+            }
+            assert_eq!(watchdog.tick(at * SEC, progress, true), None, "at {at} s");
+        }
+        // Then a span that runs for minutes: no query completes and no step ends, but other
+        // workers' jobs end, each closing its span.
+        for at in 601..=900 {
+            if at % 9 == 0 {
+                progress.spans += 1;
+            }
+            assert_eq!(watchdog.tick(at * SEC, progress, true), None, "at {at} s");
+        }
+        // Then nothing moves: said at the bound, with the counts where they stayed.
+        assert_eq!(watchdog.tick(909 * SEC, progress, true), None);
+        let quiet = watchdog.tick(910 * SEC, progress, true).expect("said at the bound");
+        assert_eq!(quiet, Quiet { since_ns: 900 * SEC, for_ns: 10 * SEC, at: progress, bound_ns: 10 * SEC });
+    }
+
     #[test]
     fn a_stall_is_said_once_a_quiet_stretch_and_again_after_progress() {
+        let at = |spans| Progress { spans, queries: 0, steps: 0 };
+        let quiet = |since_ns, spans| Some(Quiet { since_ns, for_ns: 10 * SEC, at: at(spans), bound_ns: 10 * SEC });
         let mut watchdog = Watchdog::new(Duration::from_secs(10));
-        assert_eq!(watchdog.tick(0, 5, true), None);
-        assert_eq!(watchdog.tick(9 * SEC, 5, true), None);
-        assert_eq!(watchdog.tick(10 * SEC, 5, true), Some(Quiet { since_ns: 0, for_ns: 10 * SEC }));
-        assert_eq!(watchdog.tick(30 * SEC, 5, true), None);
+        assert_eq!(watchdog.bound(), Duration::from_secs(10));
+        assert_eq!(watchdog.tick(0, at(5), true), None);
+        assert_eq!(watchdog.tick(9 * SEC, at(5), true), None);
+        assert_eq!(watchdog.tick(10 * SEC, at(5), true), quiet(0, 5));
+        assert_eq!(watchdog.tick(30 * SEC, at(5), true), None);
         // Nothing under way is no stall, however long.
-        assert_eq!(watchdog.tick(31 * SEC, 6, false), None);
-        assert_eq!(watchdog.tick(500 * SEC, 6, false), None);
-        assert_eq!(watchdog.tick(501 * SEC, 6, true), None);
-        assert_eq!(
-            watchdog.tick(511 * SEC, 6, true),
-            Some(Quiet { since_ns: 501 * SEC, for_ns: 10 * SEC })
-        );
+        assert_eq!(watchdog.tick(31 * SEC, at(6), false), None);
+        assert_eq!(watchdog.tick(500 * SEC, at(6), false), None);
+        assert_eq!(watchdog.tick(501 * SEC, at(6), true), None);
+        assert_eq!(watchdog.tick(511 * SEC, at(6), true), quiet(501 * SEC, 6));
     }
 
     #[test]

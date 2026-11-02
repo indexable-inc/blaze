@@ -27,7 +27,9 @@ pub enum Lowering {
         /// By the index of each user name `func` declares (`func.params.user_named_funcs()`),
         /// its target in the build, as `convert.rs` maps a relocation at it: namespace 0 a
         /// function, 1 data. No other namespace is in it: `counted` and `fold` are off.
-        names: Vec<Target>,
+        /// `None` for a body the IR builder built in, put in its place, whose declaration
+        /// stays and which no instruction calls.
+        names: Vec<Option<Target>>,
         /// The function's own data, which `names` name by [`Target::Data`]: its constants,
         /// `file!()` texts and panic locations, each pointing only at those before it.
         data: Vec<Data>,

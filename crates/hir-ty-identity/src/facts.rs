@@ -12,12 +12,12 @@ use blaze_ids::Hasher;
 use blaze_items::{ItemId, interface_hash, item_key, key};
 use blaze_query::db::FromId;
 use hir_def::{
-    AdtId, CallableDefId, FunctionId, ItemContainerId, StaticId, VariantId,
+    AdtId, CallableDefId, FunctionId, ItemContainerId, StaticId, UnionId, VariantId,
     attrs::AttrFlags,
     signatures::{StaticFlags, StaticSignature},
 };
 use hir_ty::{
-    ComplexMemoryMap, MemoryMap, ParamEnvAndCrate, PointerCast,
+    ComplexMemoryMap, MemoryMap, ParamEnvAndCrate, PointerAt, PointerCast,
     consteval::try_const_usize,
     layout::Layout,
     mir::VTableMap,
@@ -380,7 +380,8 @@ impl<'a, 'db> Facts<'a, 'db> {
         // as `index as fn(_)` does), so every value with a pointee is walked for the `dyn`s
         // its ids are vtables of.
         let walked = VtableWalk::new(self.cx, &value.memory_map).and_then(|mut walk| {
-            walk.walk(&value.memory, 0, ty)?;
+            walk.walk(&value.memory, At { kept: None, raw: false }, 0, ty)?;
+            walk.ids_left(&value.memory, ty)?;
             Ok((walk.found, walk.word))
         });
         let (found, word) = match walked {
@@ -405,9 +406,9 @@ impl<'a, 'db> Facts<'a, 'db> {
                     }
                 }
                 // A function item or closure no `dyn` names: a function pointer only.
-                // FIXME(comptime): one made a `dyn` in a union or a coroutine's capture is hashed
-                // as a pointer only, as its `dyn` is at no place the walk types; refuse it or
-                // find its trait there.
+                // FIXME(comptime): one made a `dyn` in a union of two non-empty fields or a
+                // coroutine's capture is hashed as a pointer only, as its `dyn` is at no place
+                // the walk types; refuse it or find its trait there.
                 None if function => {
                     self.h.update(&[2]).update(&0u64.to_le_bytes());
                 }
@@ -417,7 +418,7 @@ impl<'a, 'db> Facts<'a, 'db> {
                     self.h.update(&[3]);
                 }
                 // A vtable a word of the value holds at no place whose type names its trait:
-                // one in a union, a coroutine's capture, an unsafe binder or a `DynMetadata` of
+                // one in a union of two non-empty fields, a coroutine's capture, an unsafe binder or a `DynMetadata` of
                 // no `dyn`. Its trait is not known, so the code its slots run
                 // is not either (rule 3).
                 None => {
@@ -742,20 +743,93 @@ fn holds_word(value: &AllocationData<'_>, map: &ComplexMemoryMap<'_>, word: usiz
 /// never runs on (rule 15).
 const PLACES: u32 = 1 << 22;
 
+/// Where the bytes a walk goes through were in const eval, and whether a type says what they
+/// are, as the code generator's `Walk` (hir-ty-codegen's `relocate`) has it.
+#[derive(Clone, Copy)]
+struct At {
+    /// The address of the memory const eval kept they are, or `None` for the value's own bytes.
+    kept: Option<usize>,
+    /// Reached through a raw pointer or in a union, whose type may be a cast's: a word that type
+    /// says is a pointer is one only with provenance, and its vtable one only without.
+    raw: bool,
+}
+
+impl At {
+    /// Where const eval's provenance of the word at `offset` is.
+    fn word(self, offset: usize) -> PointerAt {
+        match self.kept {
+            Some(start) => PointerAt::Memory(start + offset),
+            None => PointerAt::Value(offset),
+        }
+    }
+}
+
+/// How a pointer reaches memory const eval kept, as the code generator's `Reach` says: the type
+/// the memory is walked as (a `dyn`'s concrete type), the pointer's pointee, the offset, whether
+/// a type there can be trusted, a slice's or `str`'s length, and the concrete type of a struct's
+/// `dyn` tail.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Reach<'db> {
+    ty: Ty<'db>,
+    pointee: Ty<'db>,
+    at: usize,
+    raw: bool,
+    len: Option<usize>,
+    tail: Option<Ty<'db>>,
+}
+
+/// What a walk by type says of one byte of a value's memory, as the code generator's walk
+/// finds it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Leaf {
+    /// A number (an integer, a float, a `bool`, a `char`, a slice's length) from the first
+    /// offset to the second.
+    Number(usize, usize),
+    /// A word from that offset the walk relocates by its type: a vtable, a function, a
+    /// `TypeId`'s.
+    Word(usize),
+    /// Nothing a type says: padding, a union's bytes, memory behind a raw pointer.
+    None,
+}
+
+/// Whether a value of `ty` is a number, with no pointer in it, as the code generator's
+/// `is_number` says.
+fn is_number(ty: Ty<'_>) -> bool {
+    matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char)
+}
+
+/// The memory const eval kept that holds `addr`, with the address it starts at, or that `addr`
+/// is one past the end of, as the code generator's `memory_holding` finds it for a raw pointer.
+fn memory_holding<'m>(map: &'m MemoryMap<'_>, addr: usize) -> Option<(usize, &'m [u8])> {
+    map.memory_at(addr).or_else(|| {
+        let (start, memory) = map.memory_at(addr.checked_sub(1)?)?;
+        (addr - start == memory.len()).then_some((start, memory))
+    })
+}
+
 /// The `dyn` each vtable in a constant's value is made for, found by walking the value with its
 /// type: a vtable is the metadata of a pointer to `dyn`, and is for the `dyn` that pointer's type
 /// names at its own place, as the code generator's `relocate` (hir-ty-codegen) pairs them. The
 /// constant's own type says nothing of a `dyn` behind another `dyn` (a `&dyn Debug` holding a
 /// `W(&'static dyn Display)`), and const eval's table of vtables names each type only.
 ///
-/// It follows what `relocate` follows: references and raw pointers (a raw one's pointee only
-/// where its memory holds all of it), the concrete value behind a `dyn` and at a struct's `dyn`
-/// tail, arrays, slices, tuples, a struct's fields, an enum's fields in the variant its bytes
-/// hold, a closure's captures, and `DynMetadata`; a vtable found for two traits is hashed once
-/// for each. A union's words, a coroutine's captures and memory a static owns are not walked
-/// (a static is its own facts). A vtable left unpaired is refused by the caller, unless no word
-/// of the value holds it (a dead temporary's) or it is a function item's or closure's, which is
-/// hashed as a function pointer only (the FIXME in `allocation`).
+/// It follows what `relocate` follows, under its rules: references and raw pointers, each place
+/// a pointer reaches walked once as the type it reaches it as (a raw one's pointee only where its
+/// memory holds all of it, or, where the memory is a whole number of the pointee and the pointer
+/// is at one, as `as_ptr` makes it, every element of it), the concrete value behind a `dyn` and
+/// at a struct's `dyn` tail, the elements of a struct's slice tail, arrays, slices, tuples, a
+/// struct's fields, an enum's fields in the variant its bytes hold, a closure's captures, the one
+/// field of a union whose other fields are empty, and `DynMetadata`. Behind a raw pointer or in a
+/// union, where the type may be a cast's, a pointer without provenance is a number and a vtable
+/// with it no vtable. A union of two or more non-empty fields, a coroutine's captures and memory
+/// a static owns are not walked (a static is its own facts). A vtable found for two traits is
+/// hashed once for each.
+///
+/// After the walk, [`VtableWalk::ids_left`] refuses what the code generator's `refuse_ids_left`
+/// refuses: a word holding a vtable's or function's id that a type reaching it does not say is
+/// one. A vtable left unpaired is refused by the caller, unless no word of the value holds it (a
+/// dead temporary's) or it is a function item's or closure's, which is hashed as a function
+/// pointer only (the FIXME in `allocation`).
 struct VtableWalk<'a, 'db> {
     cx: &'a Cx<'db>,
     map: &'a MemoryMap<'db>,
@@ -764,10 +838,12 @@ struct VtableWalk<'a, 'db> {
     /// Each vtable id's `dyn` types, deeply normalized with their free regions erased, in the
     /// order the walk first met them, which the value and its type fix.
     found: HashMap<usize, SmallVec<[Ty<'db>; 1]>, Global>,
-    /// The places walked behind a pointer: the allocation's start, the offset in it, the
-    /// pointee's type and a slice's length. A value that points at one place many times (a
-    /// DAG of references) is walked there once.
-    walked: HashSet<(usize, usize, Ty<'db>, usize), Global>,
+    /// The places walked behind a pointer, by the start of the memory they are in. A value that
+    /// points at one place many times (a DAG of references) is walked there once.
+    reached: HashSet<(usize, Reach<'db>), Global>,
+    /// The same, in the order the walk met them, with their memory, for
+    /// [`VtableWalk::ids_left`].
+    reaches: Vec<(usize, &'a [u8], Reach<'db>)>,
     /// Whether a value of each type can hold a pointer at all.
     pointers: HashMap<Ty<'db>, bool, Global>,
     places: u32,
@@ -787,7 +863,8 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
             // alloc: one value's vtables, dropped with the walk
             found: HashMap::new_in(Global),
             // alloc: one value's places behind pointers, dropped with the walk
-            walked: HashSet::new_in(Global),
+            reached: HashSet::new_in(Global),
+            reaches: Vec::new(), // alloc: one value's places behind pointers, dropped with the walk
             // alloc: one entry per distinct type in the value, dropped with the walk
             pointers: HashMap::new_in(Global),
             places: 0,
@@ -803,35 +880,54 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
     }
 
     fn word_at(&self, bytes: &[u8], offset: usize, ty: Ty<'db>) -> Result<usize, String> {
-        let word = bytes.get(offset..offset + self.word).ok_or_else(|| {
+        let word = offset.checked_add(self.word).and_then(|end| bytes.get(offset..end)).ok_or_else(|| {
             format!("a `{ty:?}` at offset {offset} is past its memory's {} bytes", bytes.len()) // alloc: error path
         })?;
         Ok(word.iter().rev().fold(0, |value, &byte| value << 8 | usize::from(byte)))
     }
 
-    /// The value of `ty` at `offset` in `bytes`. One level per level of the value, as deep as
-    /// the program built it (rule 17).
-    fn walk(&mut self, bytes: &[u8], offset: usize, ty: Ty<'db>) -> Result<(), String> {
-        stdx::ensure_sufficient_stack(|| self.walk_level(bytes, offset, ty))
+    /// Whether the word at `at` is a pointer with provenance. A map of a literal's reference
+    /// says nothing of provenance, and its pointers are what its type says.
+    fn provenance(&self, at: PointerAt) -> bool {
+        match self.map {
+            MemoryMap::Complex(_) => self.map.has_provenance(at),
+            MemoryMap::Empty | MemoryMap::Simple(_) => true,
+        }
     }
 
-    fn walk_level(&mut self, bytes: &[u8], offset: usize, ty: Ty<'db>) -> Result<(), String> {
-        let ty = self.cx.normalize(ty);
-        if !self.holds_pointer(ty) {
-            return Ok(());
-        }
+    /// Whether the map says which words have provenance, as const eval's always does.
+    fn tracks_provenance(&self) -> bool {
+        matches!(self.map, MemoryMap::Complex(_))
+    }
+
+    fn count_place(&mut self, ty: Ty<'db>) -> Result<(), String> {
         self.places += 1;
         if self.places > PLACES {
             return Err(format!("its value has more than {PLACES} places to look for a vtable in, at a `{ty:?}`")); // alloc: error path
         }
+        Ok(())
+    }
+
+    /// The value of `ty` at `offset` in `bytes`. One level per level of the value, as deep as
+    /// the program built it (rule 17).
+    fn walk(&mut self, bytes: &[u8], at: At, offset: usize, ty: Ty<'db>) -> Result<(), String> {
+        stdx::ensure_sufficient_stack(|| self.walk_level(bytes, at, offset, ty))
+    }
+
+    fn walk_level(&mut self, bytes: &[u8], at: At, offset: usize, ty: Ty<'db>) -> Result<(), String> {
+        let ty = self.cx.normalize(ty);
+        if !self.holds_pointer(ty) {
+            return Ok(());
+        }
+        self.count_place(ty)?;
         let (db, lang) = (self.cx.db, self.cx.interner.lang_items());
         match ty.kind() {
-            TyKind::Pat(base, _) => self.walk(bytes, offset, base)?,
-            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => self.pointer(bytes, offset, ty, pointee)?,
+            TyKind::Pat(base, _) => self.walk(bytes, at, offset, base)?,
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => self.pointer(bytes, at, offset, ty, pointee)?,
             TyKind::Adt(def, args) if lang.DynMetadata.is_some_and(|it| def.def_id() == AdtId::StructId(it)) => {
                 // `_vtable_ptr`, its first field.
-                let at = offset + self.layout(ty)?.fields.offset(0).bytes_usize();
-                let id = self.word_at(bytes, at, ty)?;
+                let place = offset + self.layout(ty)?.fields.offset(0).bytes_usize();
+                let id = self.word_at(bytes, place, ty)?;
                 let dyn_ty = self.cx.normalize(args.type_at(0));
                 if matches!(dyn_ty.kind(), TyKind::Dynamic(..)) && self.map.vtable_ty(id).is_ok() {
                     self.pair(id, dyn_ty)?;
@@ -841,8 +937,12 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                 let layout = self.layout(ty)?;
                 let (variant, variant_layout): (VariantId, Cow<'_, Layout>) = match def.def_id() {
                     AdtId::StructId(id) => (id.into(), Cow::Borrowed(layout)),
-                    // Nothing says which of its fields a union's bytes are.
-                    AdtId::UnionId(_) => return Ok(()),
+                    AdtId::UnionId(id) => {
+                        if let Some((field_at, field)) = self.union_field(ty, id, args)? {
+                            self.walk(bytes, At { raw: true, ..at }, offset + field_at, field)?;
+                        }
+                        return Ok(());
+                    }
                     AdtId::EnumId(id) => {
                         let Some(value) = bytes.get(offset..offset + layout.size.bytes_usize()) else {
                             return Err(format!("a `{ty:?}` at offset {offset} is past its memory's {} bytes", bytes.len())); // alloc: error path
@@ -854,14 +954,14 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                     }
                 };
                 let offsets = (0..variant_layout.fields.count()).map(|i| variant_layout.fields.offset(i).bytes_usize());
-                for ((_, field), at) in db.field_types(variant).iter().zip(offsets) {
-                    self.walk(bytes, offset + at, field.ty().instantiate(self.cx.interner, args).skip_norm_wip())?;
+                for ((_, field), field_at) in db.field_types(variant).iter().zip(offsets) {
+                    self.walk(bytes, at, offset + field_at, field.ty().instantiate(self.cx.interner, args).skip_norm_wip())?;
                 }
             }
             TyKind::Tuple(fields) => {
                 let layout = self.layout(ty)?;
                 for (i, field) in fields.iter().enumerate() {
-                    self.walk(bytes, offset + layout.fields.offset(i).bytes_usize(), field)?;
+                    self.walk(bytes, at, offset + layout.fields.offset(i).bytes_usize(), field)?;
                 }
             }
             // A closure's captures, as a struct's fields, as `relocate` walks them.
@@ -869,7 +969,7 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                 let layout = self.layout(ty)?;
                 let upvars = self.cx.normalize(args.as_closure().tupled_upvars_ty());
                 for (i, field) in upvars.tuple_fields().iter().enumerate() {
-                    self.walk(bytes, offset + layout.fields.offset(i).bytes_usize(), field)?;
+                    self.walk(bytes, at, offset + layout.fields.offset(i).bytes_usize(), field)?;
                 }
             }
             TyKind::Array(element, len) => {
@@ -878,7 +978,7 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
                 };
                 let size = self.layout(element)?.size.bytes_usize();
                 for i in 0..len as usize {
-                    self.walk(bytes, offset + i * size, element)?;
+                    self.walk(bytes, at, offset + i * size, element)?;
                 }
             }
             _ => {}
@@ -886,43 +986,64 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         Ok(())
     }
 
-    /// A pointer of type `ty` to `pointee` at `offset`: a pointer to `dyn` pairs its vtable with
-    /// that `dyn`, and the memory it points to is walked as the pointee's (the vtable's type, for
-    /// a `dyn`). A static's memory is the static's own facts.
-    fn pointer(&mut self, bytes: &[u8], offset: usize, ty: Ty<'db>, pointee: Ty<'db>) -> Result<(), String> {
+    /// The field a union `ty` holds, if all its other fields are empty (`MaybeUninit<T>`'s
+    /// `value`, besides `()`), with its offset, as the code generator's `relocate_union` finds
+    /// it: nothing says which of two non-empty fields its bytes are.
+    fn union_field(
+        &self,
+        ty: Ty<'db>,
+        id: UnionId,
+        args: GenericArgs<'db>,
+    ) -> Result<Option<(usize, Ty<'db>)>, String> {
+        let layout = self.layout(ty)?;
+        let mut held = None;
+        for (i, (_, field)) in self.cx.db.field_types(id.into()).iter().enumerate() {
+            let field = self.cx.normalize(field.ty().instantiate(self.cx.interner, args).skip_norm_wip());
+            if self.layout(field)?.size.bytes() == 0 {
+                continue;
+            }
+            if held.is_some() {
+                return Ok(None);
+            }
+            held = Some((layout.fields.offset(i).bytes_usize(), field));
+        }
+        Ok(held)
+    }
+
+    /// A pointer of type `ty` to `pointee` at `offset`, as the code generator's
+    /// `relocate_pointer` takes it: a pointer to `dyn` pairs its vtable with that `dyn`, and the
+    /// memory it points to is walked as the pointee's (the vtable's type, for a `dyn`). A
+    /// static's memory is the static's own facts.
+    fn pointer(&mut self, bytes: &[u8], at: At, offset: usize, ty: Ty<'db>, pointee: Ty<'db>) -> Result<(), String> {
         let addr = self.word_at(bytes, offset, ty)?;
-        let mut pointee = self.cx.normalize(pointee);
+        let raw = matches!(ty.kind(), TyKind::RawPtr(..));
+        let provenance = self.provenance(at.word(offset));
+        // Behind a raw pointer the type may be a cast's: a word without provenance is a number,
+        // its metadata too.
+        if at.raw && !provenance {
+            return Ok(());
+        }
+        let pointee = self.cx.normalize(pointee);
         // The pointer's metadata is its pointee's struct tail's, found as the code generator's
         // `relocate_pointer` finds it: a `&Wrap<dyn Handler>` carries the vtable of the
         // concrete type at its tail for `dyn Handler`.
         let tail = hir_ty::layout::struct_tail_erasing_lifetimes(self.cx.db, pointee, |it| self.cx.normalize(it));
         let wide = matches!(tail.kind(), TyKind::Str | TyKind::Slice(_) | TyKind::Dynamic(..));
-        // The concrete value at a struct's `dyn` tail, walked by its type (as `walk_allocation`
-        // walks it), at its offset in the struct.
-        let mut at_tail = None;
+        let mut concrete = None;
         if matches!(tail.kind(), TyKind::Dynamic(..)) {
+            // Behind a raw pointer, a metadata word with provenance (a pointer, a function) is
+            // no vtable.
+            if at.raw && self.tracks_provenance() && self.provenance(at.word(offset + self.word)) {
+                return Ok(());
+            }
             let id = self.word_at(bytes, offset + self.word, ty)?;
             // A raw pointer's metadata can be any id (a dangling `*const dyn Tr`).
-            let Ok(concrete) = self.map.vtable_ty(id) else { return Ok(()) };
+            let Ok(of) = self.map.vtable_ty(id) else { return Ok(()) };
             self.pair(id, tail)?;
-            // Only a pointer to a `dyn` itself points at the concrete value; one to a struct
-            // with a `dyn` tail points at the struct, walked as its own type (as `relocate`
-            // walks it).
-            if matches!(pointee.kind(), TyKind::Dynamic(..)) {
-                pointee = concrete;
-            } else if self.holds_pointer(concrete) {
-                let align = self.layout(concrete)?.align.abi.bytes_usize();
-                let place = hir_ty::layout::dyn_tail_place(
-                    self.cx.db,
-                    pointee,
-                    align,
-                    |it| Ok(self.cx.normalize(it)),
-                    |it| self.layout(it),
-                )?;
-                at_tail = place.map(|(offset, _)| (offset, concrete));
-            }
-        } else if matches!(ty.kind(), TyKind::RawPtr(..))
+            concrete = Some(of);
+        } else if raw
             && !wide
+            && provenance
             && self.map.vtable_ty(addr).is_ok_and(|it| matches!(it.kind(), TyKind::FnDef(..) | TyKind::Closure(..)))
         {
             // A function cast to a thin raw pointer keeps its id.
@@ -931,45 +1052,150 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
         if self.map.static_at(addr).is_some() {
             return Ok(());
         }
-        let Some((start, memory)) = self.map.memory_at(addr) else { return Ok(()) };
-        let at = addr - start;
-        // A raw pointer need not point at a whole value (one past the end, a slice of a length
-        // made up): what it points at is followed only where the memory holds all of it, as
-        // nothing reads through it in the constant.
-        let raw = matches!(ty.kind(), TyKind::RawPtr(..));
-        match pointee.kind() {
+        // What is walked by type: the concrete type behind a `dyn`, else the pointee.
+        let walked = match (pointee.kind(), concrete) {
+            (TyKind::Dynamic(..), Some(concrete)) => concrete,
+            _ => pointee,
+        };
+        let len = match tail.kind() {
+            TyKind::Str | TyKind::Slice(_) => Some(self.word_at(bytes, offset + self.word, ty)?),
+            _ => None,
+        };
+        let holding = if raw { memory_holding(self.map, addr) } else { self.map.memory_at(addr) };
+        let Some((start, memory)) = holding else { return Ok(()) };
+        // A reference to nothing (no bytes, or an empty slice) is walked by no type: the code
+        // generator makes it its alignment, or points it into the memory by provenance.
+        if !raw && (memory.is_empty() || (matches!(walked.kind(), TyKind::Str | TyKind::Slice(_)) && len == Some(0))) {
+            return Ok(());
+        }
+        let reach = Reach {
+            ty: walked,
+            pointee,
+            at: addr - start,
+            raw: at.raw || raw,
+            len,
+            // Only a pointer to a `dyn` itself points at the concrete value; one to a struct
+            // with a `dyn` tail points at the struct, its tail walked as the concrete type.
+            tail: concrete.filter(|_| !matches!(pointee.kind(), TyKind::Dynamic(..))),
+        };
+        if !self.reached.insert((start, reach)) {
+            return Ok(());
+        }
+        self.reaches.push((start, memory, reach));
+        self.reach(start, memory, reach)
+    }
+
+    /// The memory at `start` as `reach` walks it, as the code generator's `walk_allocation`
+    /// walks it by type: the pointee, or a slice's elements; a raw pointer's pointee only where
+    /// it fits, or at every element of memory that is a whole number of it; then a struct's
+    /// slice tail's elements, and its `dyn` tail as the concrete type.
+    fn reach(&mut self, start: usize, memory: &'a [u8], reach: Reach<'db>) -> Result<(), String> {
+        let at = At { kept: Some(start), raw: reach.raw };
+        let place = reach.at;
+        let fits = |size: usize| place.checked_add(size).is_some_and(|end| end <= memory.len());
+        match reach.ty.kind() {
             TyKind::Str => {}
             TyKind::Slice(element) => {
-                let len = self.word_at(bytes, offset + self.word, ty)?;
-                if !self.holds_pointer(self.cx.normalize(element)) {
-                    return Ok(());
-                }
-                let size = self.layout(element)?.size.bytes_usize();
-                if raw && size.checked_mul(len).is_none_or(|it| it > memory.len().saturating_sub(at)) {
-                    return Ok(());
-                }
-                if !self.walked.insert((start, at, pointee, len)) {
-                    return Ok(());
-                }
-                for i in 0..len {
-                    self.walk(memory, at + i * size, element)?;
+                let element = self.cx.normalize(element);
+                if self.holds_pointer(element) {
+                    let size = self.layout(element)?.size.bytes_usize();
+                    let len = reach.len.unwrap_or(0);
+                    if !reach.raw || size.checked_mul(len).is_some_and(fits) {
+                        for i in 0..len {
+                            self.walk(memory, at, place + i * size, element)?;
+                        }
+                    }
                 }
             }
-            _ => {
-                let fits = || self.layout(pointee).is_ok_and(|it| it.size.bytes_usize() <= memory.len().saturating_sub(at));
-                if (!raw || fits()) && self.walked.insert((start, at, pointee, 0)) {
-                    self.walk(memory, at, pointee)?;
+            _ if !reach.raw => self.walk(memory, at, place, reach.ty)?,
+            _ => match self.stride(memory, reach) {
+                Some(size) => {
+                    for pos in (0..memory.len()).step_by(size) {
+                        self.walk(memory, at, pos, reach.ty)?;
+                    }
+                }
+                None if self.sized(reach.ty).is_some_and(fits) => self.walk(memory, at, place, reach.ty)?,
+                None => {}
+            },
+        }
+        // A struct or tuple whose tail is a slice: its elements, after the sized fields.
+        if let Some(len) = reach.len
+            && !matches!(reach.ty.kind(), TyKind::Str | TyKind::Slice(_))
+            && let Some((tail, element)) = self.slice_tail(reach.pointee)?
+            && self.holds_pointer(element)
+        {
+            let size = self.layout(element)?.size.bytes_usize();
+            let whole = size.checked_mul(len).and_then(|it| it.checked_add(tail));
+            if !reach.raw || whole.is_some_and(fits) {
+                for i in 0..len {
+                    self.walk(memory, at, place + tail + i * size, element)?;
                 }
             }
         }
-        if let Some((offset, concrete)) = at_tail {
-            let size = self.layout(concrete)?.size.bytes_usize();
-            let fits = at.checked_add(offset).and_then(|it| it.checked_add(size)).is_some_and(|end| end <= memory.len());
-            if (!raw || fits) && self.walked.insert((start, at + offset, concrete, 0)) {
-                self.walk(memory, at + offset, concrete)?;
-            }
+        // A struct or tuple with a `dyn` tail: the tail is its concrete type, placed by the rule
+        // const eval and the code generator share.
+        if let Some(concrete) = reach.tail
+            && self.holds_pointer(concrete)
+            && let Some((tail, size)) = self.dyn_tail(reach.pointee, concrete)?
+            && (!reach.raw || fits(tail + size))
+        {
+            self.walk(memory, at, place + tail, concrete)?;
         }
         Ok(())
+    }
+
+    /// The size of a value of `ty`, if it has a layout and is sized.
+    fn sized(&self, ty: Ty<'db>) -> Option<usize> {
+        self.layout(ty).ok().filter(|it| it.is_sized()).map(|it| it.size.bytes_usize())
+    }
+
+    /// The stride a raw pointer's pointee is walked at over all of its memory: where the memory
+    /// is a whole number of the pointee and the pointer is at one of them, as `as_ptr` makes
+    /// it; `None` where only the pointee at the pointer is walked, if it fits.
+    fn stride(&self, memory: &[u8], reach: Reach<'db>) -> Option<usize> {
+        let size = self.sized(reach.ty)?;
+        (size > 0 && !is_number(reach.ty) && reach.at % size == 0 && memory.len() % size == 0).then_some(size)
+    }
+
+    /// Where the slice at the end of `ty`'s chain of last fields (through structs and tuples)
+    /// starts in a value of it, and its element type, as the code generator's `slice_tail`
+    /// finds it; `None` when the tail is no slice.
+    fn slice_tail(&self, ty: Ty<'db>) -> Result<Option<(usize, Ty<'db>)>, String> {
+        let (mut at, mut offset) = (ty, 0);
+        // A type's chain of last fields is as deep as the type: fuel for a cycle a bug makes.
+        for _ in 0..256 {
+            let (index, last) = match at.kind() {
+                TyKind::Slice(element) => return Ok(Some((offset, self.cx.normalize(element)))),
+                TyKind::Adt(def, args) => {
+                    let AdtId::StructId(id) = def.def_id() else { return Ok(None) };
+                    let fields = self.cx.db.field_types(id.into());
+                    let Some((_, last)) = fields.iter().next_back() else { return Ok(None) };
+                    (fields.iter().count() - 1, last.ty().instantiate(self.cx.interner, args).skip_norm_wip())
+                }
+                TyKind::Tuple(tys) => match tys.iter().next_back() {
+                    Some(last) => (tys.len() - 1, last),
+                    None => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+            offset += self.layout(at)?.fields.offset(index).bytes_usize();
+            at = self.cx.normalize(last);
+        }
+        Err(format!("the tail of `{ty:?}` is more than 256 fields deep")) // alloc: error path
+    }
+
+    /// Where the `dyn` tail of `pointee` holding a `concrete` starts in a value of it, and the
+    /// concrete value's size: the rule const eval and the code generator share.
+    fn dyn_tail(&self, pointee: Ty<'db>, concrete: Ty<'db>) -> Result<Option<(usize, usize)>, String> {
+        let layout = self.layout(concrete)?;
+        let place = hir_ty::layout::dyn_tail_place(
+            self.cx.db,
+            pointee,
+            layout.align.abi.bytes_usize(),
+            |it| Ok(self.cx.normalize(it)),
+            |it| self.layout(it),
+        )?;
+        Ok(place.map(|(offset, _)| (offset, layout.size.bytes_usize())))
     }
 
     /// `dyn_ty` is a trait the vtable `id` is for. Kept once per `dyn`, its lifetimes aside: two
@@ -985,6 +1211,301 @@ impl<'a, 'db> VtableWalk<'a, 'db> {
             dyns.push(dyn_ty);
         }
         Ok(())
+    }
+
+    /// Refuses a word left equal to one of const eval's ids of a function or a vtable, as the
+    /// code generator's `refuse_ids_left` refuses it: a word without provenance in the value's
+    /// bytes, or in memory a pointer reaches, that the walk by type there (the value's own type,
+    /// or each type a pointer reaches the memory as) does not relocate, and that no type of that
+    /// memory says is a number. It is a vtable behind a pointer cast to another type (`&&dyn Tr
+    /// as *const _ as *const u8`), or one in a union of two non-empty fields: const eval's ids
+    /// name its type only, so its trait, and the code its slots run, is not known, and the code
+    /// generator stops there too. Memory that only a word's provenance reaches is not looked at:
+    /// a vtable in it is paired at no place, which the caller refuses.
+    fn ids_left(&mut self, value: &[u8], ty: Ty<'db>) -> Result<(), String> {
+        if !self.tracks_provenance() {
+            return Ok(());
+        }
+        let own = Reach { ty, pointee: ty, at: 0, raw: false, len: None, tail: None };
+        let reaches = std::mem::take(&mut self.reaches);
+        let mut groups: Vec<(Option<usize>, &[u8], SmallVec<[Reach<'db>; 2]>)> = Vec::new(); // alloc: the memories a value's pointers reach, once per value with a vtable
+        groups.push((None, value, SmallVec::from_slice(&[own])));
+        for &(start, memory, reach) in &reaches {
+            match groups.iter_mut().find(|it| it.0 == Some(start)) {
+                Some(group) => group.2.push(reach),
+                None => groups.push((Some(start), memory, SmallVec::from_slice(&[reach]))),
+            }
+        }
+        for (kept, memory, of) in &groups {
+            let at = At { kept: *kept, raw: false };
+            let candidates = (0..memory.len().saturating_sub(self.word - 1)).step_by(self.word).filter(|&x| {
+                let id = memory[x..x + self.word].iter().rev().fold(0, |value, &byte| value << 8 | usize::from(byte));
+                id >= VTableMap::FIRST_ID && !self.provenance(at.word(x)) && self.map.vtable_ty(id).is_ok()
+            });
+            // alloc: the words to look at, almost always none
+            let candidates: SmallVec<[usize; 4]> = candidates.collect();
+            for x in candidates {
+                for &reach in of {
+                    if self.leaf_reach(*kept, memory, reach, x)? == Leaf::Word(x) || self.number(*kept, memory, of, x)? {
+                        continue;
+                    }
+                    let id = self.word_at(memory, x, reach.ty)?;
+                    let pointee = self.map.vtable_ty(id).map_err(|error| format!("{error:?}"))?; // alloc: error path
+                    let place = match kept {
+                        Some(start) => format!("the memory const eval kept at {start:#x}, reached as `{:?}`", reach.ty), // alloc: error path
+                        None => format!("its value, of `{ty:?}`"), // alloc: error path
+                    };
+                    let behind = if reach.raw { " behind a raw pointer" } else { "" };
+                    return Err(format!(
+                        // alloc: error path
+                        "the word at {x} of {place}{behind} is const eval's id of `{pointee:?}` (a function or a \
+                         vtable), which no type there says is a pointer: a vtable behind a pointer cast to \
+                         another type (`&&dyn Tr as *const _ as *const u8`) needs const eval's vtable ids \
+                         to name the trait, as the code generator says"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether every byte of the word at `x` of `memory` is a number by some type the memory is
+    /// reached as, as the code generator's `Relocations::is_number` says over the numbers its
+    /// walks noted there.
+    fn number(&mut self, kept: Option<usize>, memory: &[u8], of: &[Reach<'db>], x: usize) -> Result<bool, String> {
+        let mut pos = x;
+        // Each step moves `pos` to the end of a number that holds it, at least a byte on.
+        for _ in 0..=self.word {
+            if pos >= x + self.word {
+                return Ok(true);
+            }
+            let mut end = None;
+            for &reach in of {
+                if let Leaf::Number(start, to) = self.leaf_reach(kept, memory, reach, pos)?
+                    && start <= pos
+                    && pos < to
+                {
+                    end = Some(to);
+                    break;
+                }
+            }
+            match end {
+                Some(to) => pos = to,
+                None => return Ok(false),
+            }
+        }
+        Ok(pos >= x + self.word)
+    }
+
+    /// What `reach`'s walk of `memory` (kept at `kept`) says of the byte at `pos`, as
+    /// [`VtableWalk::reach`] walks it.
+    fn leaf_reach(&mut self, kept: Option<usize>, memory: &[u8], reach: Reach<'db>, pos: usize) -> Result<Leaf, String> {
+        let at = At { kept, raw: reach.raw };
+        let place = reach.at;
+        let fits = |size: usize| place.checked_add(size).is_some_and(|end| end <= memory.len());
+        let main = match reach.ty.kind() {
+            TyKind::Str => Leaf::None,
+            TyKind::Slice(element) => {
+                let element = self.cx.normalize(element);
+                let size = self.layout(element)?.size.bytes_usize();
+                let len = reach.len.unwrap_or(0);
+                match size.checked_mul(len).and_then(|whole| Some((whole, place.checked_add(whole)?))) {
+                    Some((whole, end)) if size > 0 && (!reach.raw || fits(whole)) && (place..end).contains(&pos) => {
+                        self.leaf(memory, at, place + (pos - place) / size * size, element, pos)?
+                    }
+                    _ => Leaf::None,
+                }
+            }
+            _ if !reach.raw => self.leaf(memory, at, place, reach.ty, pos)?,
+            _ => match self.stride(memory, reach) {
+                Some(size) => self.leaf(memory, at, pos / size * size, reach.ty, pos)?,
+                None if self.sized(reach.ty).is_some_and(fits) => self.leaf(memory, at, place, reach.ty, pos)?,
+                None => Leaf::None,
+            },
+        };
+        if main != Leaf::None {
+            return Ok(main);
+        }
+        if let Some(len) = reach.len
+            && !matches!(reach.ty.kind(), TyKind::Str | TyKind::Slice(_))
+            && let Some((tail, element)) = self.slice_tail(reach.pointee)?
+        {
+            let size = self.layout(element)?.size.bytes_usize();
+            let begin = place + tail;
+            if let Some(whole) = size.checked_mul(len)
+                && let Some(end) = begin.checked_add(whole)
+                && size > 0
+                && (begin..end).contains(&pos)
+            {
+                if is_number(element) {
+                    return Ok(if reach.raw { Leaf::None } else { Leaf::Number(begin, end) });
+                }
+                if !reach.raw || whole.checked_add(tail).is_some_and(fits) {
+                    return self.leaf(memory, at, begin + (pos - begin) / size * size, element, pos);
+                }
+            }
+        }
+        if let Some(concrete) = reach.tail
+            && let Some((tail, size)) = self.dyn_tail(reach.pointee, concrete)?
+            && (!reach.raw || fits(tail + size))
+        {
+            return self.leaf(memory, at, place + tail, concrete, pos);
+        }
+        Ok(Leaf::None)
+    }
+
+    /// What a value of `ty` at `base` in `bytes` says of the byte at `pos`, as the code
+    /// generator's `relocate` walks it: one level per level of the type, as deep as the program
+    /// built it (rule 17).
+    fn leaf(&mut self, bytes: &[u8], at: At, base: usize, ty: Ty<'db>, pos: usize) -> Result<Leaf, String> {
+        stdx::ensure_sufficient_stack(|| self.leaf_level(bytes, at, base, ty, pos))
+    }
+
+    fn leaf_level(&mut self, bytes: &[u8], at: At, base: usize, ty: Ty<'db>, pos: usize) -> Result<Leaf, String> {
+        let ty = self.cx.normalize(ty);
+        if pos < base {
+            return Ok(Leaf::None);
+        }
+        self.count_place(ty)?;
+        let (db, lang) = (self.cx.db, self.cx.interner.lang_items());
+        let word = self.word;
+        let in_word = |start: usize| start <= pos && pos < start + word;
+        // Where the field of a value of `layout` at `base` holding `pos` is, among `fields`: a
+        // sized one that holds it, or else the unsized one at the end, which holds what follows.
+        let field_at = |this: &Self,
+                        layout: &Layout,
+                        fields: &mut dyn Iterator<Item = Ty<'db>>|
+         -> Result<Option<(usize, Ty<'db>)>, String> {
+            let mut unsized_tail = None;
+            for (i, field) in fields.enumerate() {
+                let start = base + layout.fields.offset(i).bytes_usize();
+                match this.layout(this.cx.normalize(field)) {
+                    Ok(it) if it.is_sized() => {
+                        if start <= pos && pos < start + it.size.bytes_usize() {
+                            return Ok(Some((start, field)));
+                        }
+                    }
+                    Ok(_) => unsized_tail = Some((start, field)),
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(unsized_tail.filter(|&(start, _)| start <= pos))
+        };
+        let leaf = match ty.kind() {
+            TyKind::Pat(inner, _) => return self.leaf(bytes, at, base, inner, pos),
+            // The data word is relocated by its provenance only; the metadata by type.
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                let meta = base + word;
+                if !in_word(meta) || (at.raw && !self.provenance(at.word(base))) {
+                    Leaf::None
+                } else {
+                    let pointee = self.cx.normalize(pointee);
+                    let tail =
+                        hir_ty::layout::struct_tail_erasing_lifetimes(db, pointee, |it| self.cx.normalize(it));
+                    match tail.kind() {
+                        TyKind::Dynamic(..) => {
+                            let cast = at.raw && self.tracks_provenance() && self.provenance(at.word(meta));
+                            let id = self.word_at(bytes, meta, ty)?;
+                            if !cast && self.map.vtable_ty(id).is_ok() { Leaf::Word(meta) } else { Leaf::None }
+                        }
+                        TyKind::Str | TyKind::Slice(_) if !at.raw => Leaf::Number(meta, meta + word),
+                        _ => Leaf::None,
+                    }
+                }
+            }
+            TyKind::FnPtr(..) if in_word(base) => {
+                let id = self.word_at(bytes, base, ty)?;
+                let function =
+                    self.map.vtable_ty(id).is_ok_and(|it| matches!(it.kind(), TyKind::FnDef(..) | TyKind::Closure(..)));
+                if function && (!at.raw || self.provenance(at.word(base))) { Leaf::Word(base) } else { Leaf::None }
+            }
+            TyKind::Adt(def, args) if lang.DynMetadata.is_some_and(|it| def.def_id() == AdtId::StructId(it)) => {
+                let place = base + self.layout(ty)?.fields.offset(0).bytes_usize();
+                let dyn_ty = self.cx.normalize(args.type_at(0));
+                let paired = in_word(place)
+                    && matches!(dyn_ty.kind(), TyKind::Dynamic(..))
+                    && self.map.vtable_ty(self.word_at(bytes, place, ty)?).is_ok();
+                if paired { Leaf::Word(place) } else { Leaf::None }
+            }
+            // A `TypeId`'s words hold const eval's id of its type, which the code generator
+            // writes rustc's hash over.
+            TyKind::Adt(def, _) if lang.TypeId.is_some_and(|it| def.def_id() == AdtId::StructId(it)) => {
+                let id = bytes.get(base..base + 16).and_then(|it| it.try_into().ok()).map(u128::from_le_bytes);
+                match id.and_then(|it| self.map.type_id_ty(it)) {
+                    Some(_) if pos < base + 16 => Leaf::Word(base + (pos - base) / word * word),
+                    _ => Leaf::None,
+                }
+            }
+            TyKind::Adt(def, args) => {
+                let layout = self.layout(ty)?;
+                if layout.is_sized() && pos >= base + layout.size.bytes_usize() {
+                    return Ok(Leaf::None);
+                }
+                let (variant, variant_layout): (VariantId, Cow<'_, Layout>) = match def.def_id() {
+                    AdtId::StructId(id) => (id.into(), Cow::Borrowed(layout)),
+                    AdtId::UnionId(id) => {
+                        return match self.union_field(ty, id, args)? {
+                            Some((field_at, field)) => {
+                                self.leaf(bytes, At { raw: true, ..at }, base + field_at, field, pos)
+                            }
+                            None => Ok(Leaf::None),
+                        };
+                    }
+                    AdtId::EnumId(id) => {
+                        let Some(value) = bytes.get(base..base + layout.size.bytes_usize()) else {
+                            return Ok(Leaf::None);
+                        };
+                        let Some((variant, layout)) = detect_variant_from_bytes(layout, db, self.dl, value, id) else {
+                            return Ok(Leaf::None);
+                        };
+                        (variant.into(), layout)
+                    }
+                };
+                let interner = self.cx.interner;
+                let mut fields = db.field_types(variant).iter().map(|(_, it)| it.ty().instantiate(interner, args).skip_norm_wip());
+                match field_at(self, &*variant_layout, &mut fields)? {
+                    Some((start, field)) => return self.leaf(bytes, at, start, field, pos),
+                    None => Leaf::None,
+                }
+            }
+            TyKind::Tuple(fields) => {
+                let layout = self.layout(ty)?;
+                match field_at(self, layout, &mut fields.iter())? {
+                    Some((start, field)) => return self.leaf(bytes, at, start, field, pos),
+                    None => Leaf::None,
+                }
+            }
+            TyKind::Closure(_, args) => {
+                let layout = self.layout(ty)?;
+                let upvars = self.cx.normalize(args.as_closure().tupled_upvars_ty());
+                match field_at(self, layout, &mut upvars.tuple_fields().iter())? {
+                    Some((start, field)) => return self.leaf(bytes, at, start, field, pos),
+                    None => Leaf::None,
+                }
+            }
+            TyKind::Array(element, len) => {
+                let Some(len) = try_const_usize(db, len) else {
+                    return Err(format!("`{ty:?}` has a length that does not evaluate")); // alloc: error path
+                };
+                let element = self.cx.normalize(element);
+                let size = self.layout(element)?.size.bytes_usize();
+                let end = size.checked_mul(len as usize).and_then(|it| base.checked_add(it));
+                match end {
+                    Some(end) if size > 0 && pos < end => match is_number(element) {
+                        true if at.raw => Leaf::None,
+                        true => Leaf::Number(base, end),
+                        false => return self.leaf(bytes, at, base + (pos - base) / size * size, element, pos),
+                    },
+                    _ => Leaf::None,
+                }
+            }
+            _ if is_number(ty) && !at.raw => {
+                let end = base + self.layout(ty)?.size.bytes_usize();
+                if pos < end { Leaf::Number(base, end) } else { Leaf::None }
+            }
+            _ => Leaf::None,
+        };
+        Ok(leaf)
     }
 
     /// Whether a value of `ty`, normalized at its top, can hold a pointer, and so a vtable. A

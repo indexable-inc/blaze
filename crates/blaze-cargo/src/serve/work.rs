@@ -448,6 +448,12 @@ impl std::fmt::Display for OutputFields {
     }
 }
 
+/// A job's build dirs leased ([`Steps::lease`]): every lease taken; `Ok(Err((dir, wait)))`
+/// when `dir`'s cannot be taken now (held exclusively by a collector's rename, or its file
+/// without a whole nonce yet), and the lowering gives way and asks again for at most
+/// [`blaze_gc::lease::GIVE_WAY`]; `Err` naming why a dir may not be leased at all.
+pub type Leased = Result<Result<Vec<blaze_gc::lease::Lease>, (String, blaze_gc::lease::Wait)>, String>;
+
 /// The build of one job, as the daemon has it: one value for every job. Its associated types
 /// are its front end's, so the loop holds each by its own type.
 pub trait Steps: Sized + Send + Sync + 'static {
@@ -475,6 +481,11 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// fingerprint, and where that library is mounted) has it there, read before by this
     /// daemon or one before it.
     fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError>;
+    /// On a worker, before a job's lowering builds anything: the leases of `units`' build dirs
+    /// (`target_dir`, `build_dir`) for `checkout`, `builds` the dir of every workspace's build
+    /// dir, each dir made and marked on disk as docs/gc.md says (the daemon's is
+    /// [`super::job::lease_build_dirs`]). The leases are held until the job is dropped.
+    fn lease(&self, units: &Units, checkout: &str, builds: &str) -> Leased;
     /// On a worker: the job's units lowered into the front end. `kept` is the front end of
     /// the head's last build ([`Writer::keep`]): built from the same units and config, it is
     /// moved to the job's view, its memos kept, and what changed alone read again; else it

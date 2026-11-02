@@ -460,6 +460,32 @@ impl Db {
         self.run_tasks(std::panic::Location::caller(), count, true, task);
     }
 
+    /// Runs `task(db, item)` on every one of `items` at once, each in a frame of its own tagged
+    /// `tag`, and returns once each has run: a maintainer's apply working on each crate's own
+    /// state over the memos its reads made, which it then applies to the database in `items`'
+    /// order. Every task runs, under [`RunOrder::LeftToReaders`] too (in order), as
+    /// [`Db::run_all`]'s for a maintainer's reads do: what a task does to its item is its
+    /// result, and no reader asks for it.
+    ///
+    /// A build's database runs them on the pool (`blaze_graph::par`, inside a
+    /// [`blaze_query::db::pump_barrier`]); a test database runs them here, in [`RunOrder`].
+    pub fn run_each<T: Send>(&self, tag: Tag, items: &mut [T], task: impl Fn(&Db, &mut T) + Sync) {
+        let run = |item: &mut T| frame::task(tag, |_| task(self, item));
+        match self.run {
+            Run::Pool => blaze_query::db::pump_barrier(|| blaze_graph::par::for_each(items, run)),
+            Run::Here => match RUN_ORDER.get() {
+                RunOrder::InOrder | RunOrder::LeftToReaders => items.iter_mut().for_each(&run),
+                RunOrder::Reversed => items.iter_mut().rev().for_each(&run),
+                RunOrder::Strided(stride) => {
+                    let stride = stride.max(1);
+                    for first in 0..stride {
+                        items.iter_mut().skip(first).step_by(stride).for_each(&run);
+                    }
+                }
+            },
+        }
+    }
+
     fn run_tasks<F: Fn(&Db, usize) + Sync>(
         &self,
         caller: &'static std::panic::Location<'static>,

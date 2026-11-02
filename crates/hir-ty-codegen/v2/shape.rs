@@ -35,6 +35,9 @@ mod namespace {
     /// A body built in: Cranelift's inliner puts the body where it is called and leaves its
     /// name declared, which no instruction names any more (and the emit refuses one that is).
     pub(super) const BUILT_IN: u32 = 5;
+    /// A function of the fuel runtime a metered function calls (`blaze_stencil::fuel`), by
+    /// its index there. Only metered functions name one, so no other shape changes.
+    pub(super) const FUEL: u32 = 6;
 }
 
 /// The parts of a shape, each once, in this order.
@@ -79,6 +82,7 @@ pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shap
                         0 => UserExternalName::new(namespace::PLACE, place(places, name.index)?),
                         1 => data.name(name.index)?,
                         fragment::INLINED => UserExternalName::new(namespace::BUILT_IN, 0),
+                        blaze_stencil::fuel::NAMESPACE => UserExternalName::new(namespace::FUEL, name.index),
                         // alloc: the error's message
                         other => return Err(format!("a name in the unknown namespace {other}")),
                     };

@@ -133,15 +133,50 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::more_rules_tests::lint_only;
+    use crate::tests::{CLIPPY_OFF, lint};
 
     const FOUND: &str = "unnecessarily eager cloning of iterator items";
 
+    /// `core` with slices' `iter` and `Iterator`'s `cloned`, `last`, `count`, `skip`, `find` and
+    /// `flatten` (`iterators_more`), and a `std` with the owned `String` and `Vec` the cases name:
+    /// minicore has `core` only, and `more_rules_tests`' `std` has neither.
+    const FIXTURE: &str = r#"
+//- minicore: sized, copy, clone, option, fn, slice, iterator, iterators, iterators_more, builtin_impls
+//- /std/lib.rs crate:std
+pub mod prelude {
+    pub mod v1 {
+        pub use core::prelude::v1::*;
+        pub use crate::{string::String, vec::Vec};
+    }
+    pub mod rust_2015 { pub use super::v1::*; }
+    pub mod rust_2018 { pub use super::v1::*; }
+    pub mod rust_2021 { pub use super::v1::*; }
+    pub mod rust_2024 { pub use super::v1::*; }
+}
+pub mod string {
+    pub struct String { len: usize }
+    impl String {
+        pub fn is_empty(&self) -> bool { self.len == 0 }
+    }
+    impl Clone for String {
+        fn clone(&self) -> String { String { len: self.len } }
+    }
+}
+pub mod vec {
+    pub struct Vec<T> { ptr: *mut T, len: usize }
+    impl<T> FromIterator<T> for Vec<T> {
+        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Vec<T> { loop {} }
+    }
+}
+//- /src/lib.rs crate:main deps:std
+"#;
+
     #[test]
     fn cloned_before_a_dropping_adaptor_is_found_and_after_it_or_of_copy_items_is_not() {
-        let found = lint_only(
-            "iter_overeager_cloned",
-            r#"
+        let found = lint(
+            &format!(
+                "{FIXTURE}{}",
+                r#"
 pub fn f(v: &[String], n: &[u32]) {
     let _ = v.iter().cloned().last();
     let _: Vec<String> = v.iter().cloned().take(2).collect();
@@ -149,7 +184,9 @@ pub fn f(v: &[String], n: &[u32]) {
     let _ = v.iter().filter(|x| x.is_empty()).cloned();
     let _ = n.iter().cloned().last();
 }
-"#,
+"#
+            ),
+            &format!("{CLIPPY_OFF} -W clippy::iter_overeager_cloned"),
         );
         assert_eq!(found.matches(FOUND).count(), 3, "{found}");
         assert!(found.contains(".filter(|&x| x.is_empty()).cloned()"), "{found}");

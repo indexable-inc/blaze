@@ -685,6 +685,34 @@ fn error(unit: InstanceKey, item: ItemKey, what: impl Into<String>) -> CodegenEr
     CodegenError { unit, item, what: what.into() }
 }
 
+/// The refusal of one symbol defined by two functions or statics of a build (rule 18): the
+/// linker's table of names holds one target a name, and took whichever came last, so the
+/// program called one or the other by name. Two panic runtimes' `__rust_panic_cleanup` did
+/// that (#1611). Names the symbol and both definitions; `None` when every symbol is one's.
+fn symbol_defined_twice<B: Prepare>(
+    nodes: &Sorted<InstanceKey, Node<B>>,
+    statics: &Sorted<StaticId, StaticNode<B>>,
+) -> Option<CodegenError> {
+    // The definer's unit and item, and its name for the message.
+    let functions = nodes.iter().filter_map(|(key, node)| {
+        Some((node.described.symbol.as_deref()?, *key, node.unit.item, node.described.name.as_str()))
+    });
+    let statics = statics.iter().filter_map(|((item, _), node)| {
+        Some((node.described.symbol.as_deref()?, InstanceKey(ContentId::default()), *item, node.described.name.as_str()))
+    });
+    // alloc: per build, its symbols, a few hundred
+    let mut named: Vec<(&str, InstanceKey, ItemKey, &str)> = functions.chain(statics).collect();
+    named.sort_unstable();
+    let [a, b] = named.windows(2).find(|it| it[0].0 == it[1].0)? else { return None };
+    let (symbol, (unit, item, first), second) = (a.0, (a.1, a.2, a.3), b.3);
+    Some(error(
+        unit,
+        item,
+        // alloc: the error's message
+        format!("the symbol `{symbol}` is defined twice in one program, by `{first}` and by `{second}`"),
+    ))
+}
+
 /// A store read: what is there, nothing, or what is there and can't be read, which is an
 /// error of the build already recorded and never a reason to compile again.
 enum Read<T> {
@@ -1794,6 +1822,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             .filter_map(|((item, instance), node)| Some((*item, *instance, node.described.symbol.clone()?)))
             // alloc: per build, what it gives the linker
             .collect();
+        if let Some(twice) = symbol_defined_twice(&nodes, &statics) {
+            return Err(vec![twice]);
+        }
         // alloc: per build, what it gives the linker
         let patchable = nodes.iter().filter(|it| it.1.patchable).map(|it| *it.0).collect();
         // alloc: per build, what it gives the linker

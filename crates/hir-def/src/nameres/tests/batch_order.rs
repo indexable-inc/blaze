@@ -285,3 +285,191 @@ pub struct Same;
         ],
     );
 }
+
+/// How [`Counted`] changes its state: every call, as a counter does, or the first only, as
+/// proc-macro2's detection does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Counts {
+    Every,
+    First,
+}
+
+/// What [`Counted`] saw: its state, its calls run ahead of their turn, and each turn's name
+/// and the state it started from.
+#[derive(Debug, Default)]
+struct CountedState {
+    count: u32,
+    taken: usize,
+    /// Each call run ahead: its call site, the state it ran from, and the number it gave.
+    ahead: Vec<(span::Span, u32, u32)>,
+    ran_ahead: usize,
+    took_ahead: usize,
+    turns: Vec<(String, u32)>,
+}
+
+/// `#[counted(NAME)] item`: `pub const NAME: u32 = n;` in the item's place, `n` its state as
+/// the call starts, a static of a proc macro whose calls are ordered. An attribute, since an
+/// attribute's call is always resolved in a round (a bang macro's path that names another
+/// crate's macro is expanded at once, in collection). A call run ahead gives its turn what it gave only if
+/// the state is still the one it ran from, as blaze-macro-eval's sessions do.
+#[derive(Debug)]
+struct Counted {
+    counts: Counts,
+    state: parking_lot::Mutex<CountedState>,
+}
+
+/// A call that panicked leaves the state as it was at the panic.
+impl std::panic::RefUnwindSafe for Counted {}
+
+impl Counted {
+    /// The number a call from `count` gives, and the state it leaves.
+    fn run(&self, count: u32) -> (u32, u32) {
+        match self.counts {
+            Counts::Every => (count, count + 1),
+            Counts::First => (count, 1),
+        }
+    }
+}
+
+impl hir_expand::proc_macro::ProcMacroExpander for Counted {
+    fn requires_session(&self) -> bool {
+        true
+    }
+
+    fn speculates(&self, _: &base_db::Db, _: base_db::Crate) -> bool {
+        self.state.lock().taken > 0
+    }
+
+    fn speculate(&self, _: &base_db::Db, _: base_db::Crate, call: hir_expand::proc_macro::ProcMacroCall<'_>) {
+        let mut state = self.state.lock();
+        let count = state.count;
+        let (n, _) = self.run(count);
+        state.ahead.push((call.call_site, count, n));
+        state.ran_ahead += 1;
+    }
+
+    fn expand(
+        &self,
+        _: &base_db::Db,
+        _: hir_expand::proc_macro::ProcMacroCall<'_>,
+    ) -> Result<crate::tt::TopSubtree, hir_expand::proc_macro::ProcMacroExpansionError> {
+        unreachable!("a call of `#[counted]` is always in a calling crate")
+    }
+
+    fn expand_in(
+        &self,
+        _: &base_db::Db,
+        _: base_db::Crate,
+        call: hir_expand::proc_macro::ProcMacroCall<'_>,
+    ) -> Result<crate::tt::TopSubtree, hir_expand::proc_macro::ProcMacroExpansionError> {
+        let Some(crate::tt::TtElement::Leaf(crate::tt::Leaf::Ident(name))) = call.attrs.and_then(|it| it.iter().next()) else {
+            return Err(hir_expand::proc_macro::ProcMacroExpansionError::Panic("#[counted]: one identifier".into()));
+        };
+        let name = name.clone();
+        let mut state = self.state.lock();
+        state.taken += 1;
+        let count = state.count;
+        let ahead = state.ahead.iter().position(|it| it.0 == call.call_site).map(|at| state.ahead.swap_remove(at));
+        let n = match ahead {
+            Some((_, from, n)) if from == count => {
+                state.took_ahead += 1;
+                n
+            }
+            _ => self.run(count).0,
+        };
+        state.count = self.run(count).1;
+        state.turns.push((name.sym.as_str().to_owned(), n));
+        let call_site = call.call_site;
+        Ok(hir_expand::builtin::quote::quote! { call_site => pub const #name: u32 = #n; })
+    }
+
+    // dyn: `ProcMacroExpander::eq_dyn`'s signature, compared when a crate's macros are set
+    fn eq_dyn(&self, other: &dyn hir_expand::proc_macro::ProcMacroExpander) -> bool {
+        std::ptr::eq(self as *const Self as *const (), other as *const _ as *const ())
+    }
+}
+
+/// Six calls of `#[counted]` in one round, beside other macros, with each batch run in `order`:
+/// what each call's turn was given, and how many calls ran ahead and how many turns took one.
+fn counted_in(order: RunOrder, counts: Counts) -> (Vec<(String, u32)>, usize, usize) {
+    let previous = set_run_order(order);
+    let counted =
+        std::sync::Arc::new(Counted { counts, state: parking_lot::Mutex::new(CountedState::default()) });
+    let extra = vec![(
+        "#[proc_macro_attribute]\npub fn counted(_attr: TokenStream, item: TokenStream) -> TokenStream { item }\n".to_owned(),
+        hir_expand::proc_macro::ProcMacro {
+            name: intern::Symbol::intern("counted"),
+            kind: hir_expand::proc_macro::ProcMacroKind::Attr,
+            expander: counted.clone(),
+            disabled: false,
+        },
+    )];
+    let db = fixture::db_with_proc_macros(
+        r#"
+//- proc_macros: counted, identity
+//- /lib.rs
+macro_rules! items { ($($name:ident)*) => { $(pub struct $name;)* }; }
+#[proc_macros::counted(A)]
+pub struct HostA;
+items!(X Y);
+#[proc_macros::counted(B)]
+pub struct HostB;
+#[proc_macros::identity]
+pub struct Free;
+#[proc_macros::counted(C)]
+pub struct HostC;
+mod inner {
+    #[proc_macros::counted(D)]
+    pub struct HostD;
+}
+#[proc_macros::counted(E)]
+pub struct HostE;
+#[proc_macros::counted(F)]
+pub struct HostF;
+"#,
+        extra,
+    )
+    .into_db();
+    let krate = db.fetch_test_crate();
+    let dump = crate_def_map(&db, krate).dump(&db);
+    for item in ["A", "B", "C", "D", "E", "F", "Free", "X"] {
+        assert!(dump.contains(item), "`{item}` is not in the def map:\n{dump}");
+    }
+    set_run_order(previous);
+    let state = counted.state.lock();
+    (state.turns.clone(), state.ran_ahead, state.took_ahead)
+}
+
+/// A macro whose calls are ordered gets them in the round's order whatever order the batch
+/// runs its tasks in, and a call run ahead of its turn is taken only from the state its turn
+/// has: a counter counts in order, and a macro that changes its state on its first call only
+/// has each later call taken from its run ahead.
+#[test]
+fn ordered_calls_take_their_runs_ahead_only_from_their_turns_state() {
+    let orders = [RunOrder::LeftToReaders, RunOrder::InOrder, RunOrder::Reversed, RunOrder::Strided(2), RunOrder::Strided(3)];
+    for order in orders {
+        let (turns, _, _) = counted_in(order, Counts::Every);
+        let names: Vec<&str> = turns.iter().map(|it| it.0.as_str()).collect();
+        // `D` is in a module, collected after the root's calls of its round.
+        let numbers: Vec<u32> = turns.iter().map(|it| it.1).collect();
+        assert_eq!(numbers, [0, 1, 2, 3, 4, 5], "{order:?}: the counter counts its turns in order: {turns:?}");
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["A", "B", "C", "D", "E", "F"], "{order:?}: every call has one turn: {turns:?}");
+
+        let (turns, ran_ahead, took_ahead) = counted_in(order, Counts::First);
+        let numbers: Vec<u32> = turns.iter().map(|it| it.1).collect();
+        assert_eq!(numbers, [0, 1, 1, 1, 1, 1], "{order:?}: only the first call starts from nothing: {turns:?}");
+        if order == RunOrder::LeftToReaders {
+            assert_eq!((ran_ahead, took_ahead), (0, 0), "no batch ran, so no call ran ahead");
+        } else {
+            assert!(took_ahead > 0 && took_ahead == ran_ahead, "{order:?}: every run ahead is taken: {ran_ahead} {took_ahead}");
+        }
+    }
+    // Both the counter's names in their turns' order and the order the front end collects
+    // them in are the same in every order.
+    let reference = counted_in(RunOrder::LeftToReaders, Counts::Every).0;
+    for order in orders {
+        assert_eq!(counted_in(order, Counts::Every).0, reference, "{order:?}");
+    }
+}

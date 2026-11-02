@@ -44,21 +44,36 @@ const ZEROS: [u8; DIRENT_MAX] = [0; DIRENT_MAX];
 pub(super) const MANIFEST_DIR: &str = "CARGO_MANIFEST_DIR";
 pub(super) const OUT_DIR: &str = "OUT_DIR";
 
-/// The directories a macro may read, each its real path, and the working directory: the
-/// package's, as cargo runs rustc there.
+/// The directories a macro may read, each its real path.
 pub(super) struct Roots {
     dirs: [Option<String>; 2],
 }
 
 impl Roots {
-    fn cwd(&self) -> Option<&str> {
-        self.dirs[0].as_deref()
-    }
-
     /// The root `path` is below or is, when it is in one.
     fn holding(&self, path: &str) -> Option<&str> {
         self.dirs.iter().flatten().map(String::as_str).find(|root| under(path, root))
     }
+}
+
+/// Whether the absolute `path` names the real directory `dir` as it is spelt: `dir` with any
+/// trailing `/` and `/.`, and nothing else (no `..` or link, which would make the answer
+/// depend on what the walk passes through).
+fn same_dir(path: &str, dir: &str) -> bool {
+    let mut path = path;
+    loop {
+        if let Some(rest) = path.strip_suffix("/.") {
+            path = rest;
+        } else if path.len() > 1
+            && let Some(rest) = path.strip_suffix('/')
+        {
+            path = rest;
+        } else {
+            break;
+        }
+    }
+    let path = if path.is_empty() { "/" } else { path };
+    path == dir
 }
 
 /// Whether `path` is `dir` or below it.
@@ -110,7 +125,7 @@ pub(super) struct Stream {
 /// Where a relative path starts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum At {
-    /// The working directory: the package's, as cargo runs rustc there.
+    /// The working directory: the one cargo runs rustc in (the call's, `Os::cwd`).
     Cwd,
     /// `/`, the one directory a wasm macro's WASI is given (`wasm/wasi.rs`): wasi-libc hands
     /// the host an absolute path made relative to it.
@@ -291,20 +306,51 @@ impl<'a> Os<'a> {
         self.roots = Some(Roots { dirs });
     }
 
+    /// The real path of the working directory ([`Os::cwd`]), walked once, in
+    /// [`Os::cwd_real`]. Not noted: the expansion's key holds the directory it was given (the
+    /// call's directory), and its real path is walked as the roots' are, once per expansion.
+    fn find_cwd(&mut self) {
+        if self.cwd_real.is_some() {
+            return;
+        }
+        let dir = self.cwd;
+        let real = match dir.starts_with('/') {
+            // A directory that is not there is walked as far as it is, as a root is.
+            true => match walk(dir, true, None, &mut self.real, &mut self.rest) {
+                // alloc: once per expansion that names a relative path or asks its directory
+                Ok(_) => Some(self.real.clone()),
+                Err(_) => None,
+            },
+            false => None,
+        };
+        self.cwd_real = Some(real);
+    }
+
+    /// The real path of the working directory, or `None` when the expansion was given none it
+    /// can resolve from: what the wasm module's glue enters (`guest/entry.rs`) before its
+    /// macro runs, as rustc's process is in it.
+    pub(crate) fn current_dir(&mut self) -> Option<&str> {
+        self.find_cwd();
+        self.cwd_real.as_ref().and_then(Option::as_deref)
+    }
+
+    /// Why a relative path or the working directory can't be answered: the expansion was given
+    /// no absolute directory to start from.
+    fn no_cwd(&self, what: std::fmt::Arguments<'_>) -> Stop {
+        // alloc: error path
+        Stop(format!("{what}, and was given the working directory `{}`, which is not absolute", self.cwd))
+    }
+
     /// `path` made absolute from the directory `at` names, in [`Os::given`].
     fn absolute(&mut self, at: At, path: &str) -> Result<Result<(), Errno>, Stop> {
         self.given.clear();
         if !path.starts_with('/') {
             if let At::Cwd = at {
-                self.ready();
-                let Some(cwd) = self.roots.as_ref().and_then(Roots::cwd) else {
-                    // alloc: error path
-                    return Err(Stop(format!(
-                        "names the relative path `{path}`, and the calling crate has no \
-                         `{MANIFEST_DIR}` to resolve it from"
-                    )));
-                };
-                self.given.push_str(cwd);
+                self.find_cwd();
+                match &self.cwd_real {
+                    Some(Some(cwd)) => self.given.push_str(cwd),
+                    _ => return Err(self.no_cwd(format_args!("names the relative path `{path}`"))),
+                }
             } else if let At::Fd(at) = at {
                 match slot(&self.fds, at) {
                     Some(slot) if slot.open == Open::Dir => self.given.push_str(&slot.path),
@@ -340,6 +386,21 @@ impl<'a> Os<'a> {
         }
         if let Err(errno) = self.absolute(at, path)? {
             return Ok(Err(errno));
+        }
+        // A look at the working directory itself (wasi-libc's `chdir` makes one before it
+        // enters it, `stat(".")` another) says it is a directory, as it is for rustc's process:
+        // nothing the key does not hold, so it is noted as nothing, read nowhere and refused
+        // nowhere, even when the directory is outside the roots (a workspace's root). What is
+        // in it is not answered: a listing or an open of it is walked and checked as any path.
+        if seen == Seen::Looked {
+            self.find_cwd();
+            if let Some(Some(cwd)) = &self.cwd_real
+                && same_dir(&self.given, cwd)
+            {
+                self.real.clear();
+                self.real.push_str(cwd);
+                return Ok(Ok((Kind::Dir, 0)));
+            }
         }
         self.ready();
         let roots = self.roots.as_ref();
@@ -724,12 +785,9 @@ impl<'a> Os<'a> {
     }
 
     pub(super) fn getcwd(&mut self, t: Target, g: &mut impl Guest, ret: &mut [u8], (buf, size): (u64, u64)) -> Done {
-        self.ready();
-        let Some(cwd) = self.roots.as_ref().and_then(Roots::cwd) else {
-            // alloc: error path
-            return Err(Stop(format!(
-                "asks for its working directory, and the calling crate has no `{MANIFEST_DIR}`"
-            )));
+        self.find_cwd();
+        let Some(Some(cwd)) = &self.cwd_real else {
+            return Err(self.no_cwd(format_args!("asks for its working directory")));
         };
         self.bytes.clear();
         self.bytes.extend_from_slice(cwd.as_bytes());

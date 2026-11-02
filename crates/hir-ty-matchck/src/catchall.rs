@@ -131,6 +131,9 @@ pub(crate) fn catch_alls<'db>(
         exhaustive_patterns: features.exhaustive_patterns,
         deref_patterns: features.deref_patterns,
         never_patterns: features.never_patterns,
+        // Each witness left by the arms above a catch-all is a value it takes: with rustc's
+        // relevant witnesses only, `Some(_)` after `Some(A)` would take none of `Some(B)`.
+        exhaustive_witnesses: true,
         has_deref_pat: std::cell::Cell::new(false),
         range_lints: std::cell::RefCell::new(Vec::new()), // alloc: none kept, cleared per analysis
     };

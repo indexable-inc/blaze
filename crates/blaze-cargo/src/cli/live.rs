@@ -27,6 +27,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     process::{Child, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -35,6 +36,7 @@ use blaze_api::{Artifact, ArtifactKind, Level, Request, ResponseRef, TargetKind}
 use blaze_hash::HashSet;
 use blaze_ui::test_view::{BinaryEnd, Event, Paint, TestView, Verdict};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
+use parking_lot::Mutex;
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, text::Line};
 
 use super::{
@@ -58,15 +60,21 @@ const COLUMNS: u16 = 40;
 const ROWS: u16 = 8;
 /// libtest's arguments that change what it prints, which the view can't read: with any of
 /// them the run is plain.
+/// How long a test executable's output is read after its process exited. Whatever it wrote
+/// is in the pipe by then, so only a process it started and left running, which inherited its
+/// stdout or stderr, holds the pipe open past this; the runner then stops reading and says so.
+const DRAIN: Duration = Duration::from_secs(2);
 const PLAIN_ARGS: [&str; 9] = ["--format", "--list", "--nocapture", "--no-capture", "--logfile", "-q", "--quiet", "-h", "--help"];
 
 /// Whether `blaze test` draws its live view: a test run (not `--no-run`, `--reached`, a bench)
 /// whose stdout and stderr are terminals big enough, printed for a person (not JSON, `-q` or
-/// `-v`), with libtest's own output left as the view reads it.
+/// `-v`), with libtest's own output left as the view reads it, and not on CI ([`ci`]), whose
+/// workers may hand it a pseudo-terminal whose log is read as text.
 pub fn wanted(asked: &Invocation, shown: Shown) -> bool {
     let plain_ui = std::env::var_os("BLAZE_UI").is_some_and(|it| it == "plain");
     let dumb = std::env::var_os("TERM").is_some_and(|it| it == "dumb");
     if asked.command() != Command::Test
+        || ci(|name| std::env::var_os(name))
         || asked.flags.no_run
         || asked.flags.reached
         || asked.flags.ub
@@ -88,6 +96,14 @@ pub fn wanted(asked: &Invocation, shown: Shown) -> bool {
     reads_args && big
 }
 
+/// Whether this runs on CI: `CI` set to anything but empty, `0` or `false` (GitHub Actions,
+/// GitLab, Buildkite, CircleCI, Travis and most others set it), or `TF_BUILD` set (Azure
+/// Pipelines, which sets no `CI`).
+fn ci(var: impl Fn(&str) -> Option<OsString>) -> bool {
+    let ci = var("CI").is_some_and(|it| !(it.is_empty() || it == "0" || it.eq_ignore_ascii_case("false")));
+    ci || var("TF_BUILD").is_some_and(|it| !it.is_empty())
+}
+
 /// What the screen is sent: the view's events in the order they happened, then its end.
 enum Msg {
     View(Event),
@@ -98,8 +114,11 @@ enum Msg {
 enum Run {
     /// A test executable is linked and placed.
     Ready(Artifact),
-    /// One's stdout closed: what it printed that was not libtest's JSON, and its stderr.
-    Drained { binary: u32, output: String },
+    /// One's stdout and stderr closed: all it printed is in its [`Captured`].
+    Drained { binary: u32 },
+    /// One's process exited, and is not yet reaped (the runner reaps it): its output is read
+    /// for at most [`DRAIN`] more. `Err` says why its exit could not be waited for.
+    Exited { binary: u32, waited: Result<(), String> },
     /// The build is over: whether it passed, and everything it placed (the executables that
     /// came [`Run::Ready`] among them; the rest, the doc tests and any the daemon did not
     /// stream, are queued now).
@@ -135,7 +154,7 @@ pub fn drive<A: Api>(
         let to_runner = to_runner.clone();
         // The workspace's member count comes with `Built`, after the first executables run, so
         // "to rerun pass" always names the package: `-p calc --lib` reruns it in any workspace.
-        let runner = Runner::new(asked, to_screen, to_runner, true);
+        let runner = Runner::new(asked, to_screen, to_runner, true, shown.color);
         thread::Builder::new().name("blaze test runner".into()).spawn(move || runner.run(&runner_gets))?
     };
 
@@ -428,8 +447,32 @@ struct Binary {
 struct Running {
     binary: u32,
     child: Child,
+    pid: u32,
+    /// What it printed, as read so far.
+    captured: Arc<Mutex<Captured>>,
+    /// When its process exited, once [`Run::Exited`] said so: its output is read until
+    /// [`Runner::drain`] past this.
+    exited: Option<Instant>,
     /// Stopped by `fail-fast`: its end is no failure of its own.
     killed: bool,
+}
+
+/// What one executable printed outside libtest's JSON, and its stderr, as read so far: its
+/// readers fill it, and the runner takes it once both pipes closed, or once the drain's
+/// deadline passed with a pipe still open.
+#[derive(Default)]
+struct Captured {
+    out: String,
+    err: Vec<u8>,
+}
+
+impl Captured {
+    /// Its stdout's lines, then its stderr.
+    fn text(&self) -> String {
+        let mut text = self.out.clone(); // alloc: one executable's output, once it ended
+        text.push_str(&String::from_utf8_lossy(&self.err));
+        text
+    }
 }
 
 /// Starts each test executable as soon as it is ready, a few at a time, and says how each
@@ -449,14 +492,22 @@ struct Runner {
     failed: Vec<(String, Option<i32>)>,
     stopping: bool,
     build: Option<bool>,
+    /// Whether the warnings it prints are colored.
+    color: bool,
+    /// How long an executable's output is read after it exited: [`DRAIN`].
+    drain: Duration,
 }
 
 impl Runner {
-    fn new(asked: &Invocation, to_screen: Sender<Msg>, to_runner: Sender<Run>, spec_flag: bool) -> Runner {
+    fn new(asked: &Invocation, to_screen: Sender<Msg>, to_runner: Sender<Run>, spec_flag: bool, color: bool) -> Runner {
+        Runner::of(asked.test_args(), !asked.flags.no_fail_fast, to_screen, to_runner, spec_flag, color)
+    }
+
+    fn of(args: Vec<OsString>, fail_fast: bool, to_screen: Sender<Msg>, to_runner: Sender<Run>, spec_flag: bool, color: bool) -> Runner {
         let cpus = thread::available_parallelism().map_or(1, usize::from);
         Runner {
-            args: asked.test_args(),
-            fail_fast: !asked.flags.no_fail_fast,
+            args,
+            fail_fast,
             spec_flag,
             to_screen,
             to_runner,
@@ -468,6 +519,8 @@ impl Runner {
             failed: Vec::new(),        // alloc: one a command
             stopping: false,
             build: None,
+            color,
+            drain: DRAIN,
         }
     }
 
@@ -480,14 +533,39 @@ impl Runner {
             if self.build.is_some() && self.queued.is_empty() && self.running.is_empty() {
                 return self.code();
             }
-            let Ok(run) = gets.recv() else {
-                // Every sender gone with work left: the caller's thread ended early.
-                self.stop_all();
-                return FAILED;
+            // The first exited executable whose output is still open: its drain's deadline.
+            let deadline = self.running.iter().filter_map(|it| it.exited).min().map(|exited| exited + self.drain);
+            let got = {
+                let _waiting = tracing::info_span!(
+                    target: "blaze",
+                    "test.runner.wait",
+                    running = self.running.len(),
+                    queued = self.queued.len(),
+                    build_over = self.build.is_some(),
+                )
+                .entered();
+                match deadline {
+                    Some(deadline) => gets.recv_deadline(deadline),
+                    None => gets.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                }
+            };
+            let run = match got {
+                Ok(run) => run,
+                Err(RecvTimeoutError::Timeout) => {
+                    self.undrained();
+                    self.start();
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    // Every sender gone with work left: the caller's thread ended early.
+                    self.stop_all();
+                    return FAILED;
+                }
             };
             match run {
                 Run::Ready(artifact) => self.ready(artifact),
-                Run::Drained { binary, output } => self.ended(binary, output),
+                Run::Drained { binary } => self.ended(binary, false),
+                Run::Exited { binary, waited } => self.exited(binary, waited),
                 Run::BuildOver { ok, artifacts } => {
                     let (tests, docs) = test::executables(&artifacts);
                     for artifact in tests.into_iter().chain(docs) {
@@ -593,27 +671,95 @@ impl Runner {
             self.say(Event::TestStarted { binary, name });
         }
         let mut child = child;
+        let pid = child.id();
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        let (to_screen, to_runner) = (self.to_screen.clone(), self.to_runner.clone());
-        let read = thread::Builder::new()
-            .name("blaze test output".into())
-            .spawn(move || read(binary, json, stdout, stderr, &to_screen, &to_runner));
-        if let Err(error) = read {
+        let captured = Arc::new(Mutex::new(Captured::default())); // alloc: one an executable run
+        let read = {
+            let (to_screen, to_runner, captured) = (self.to_screen.clone(), self.to_runner.clone(), captured.clone());
+            let label = self.binaries[binary as usize].label.clone();
+            thread::Builder::new()
+                .name("blaze test output".into())
+                .spawn(move || read(binary, &label, json, stdout, stderr, &captured, &to_screen, &to_runner))
+        };
+        // Its exit is waited for apart from its output: a process it started may hold its
+        // pipes open long after it exited.
+        let wait = read.and_then(|_| {
+            let to_runner = self.to_runner.clone();
+            let label = self.binaries[binary as usize].label.clone();
+            thread::Builder::new().name("blaze test wait".into()).spawn(move || {
+                let _waiting = tracing::info_span!(target: "blaze", "test.wait_exit", test = %label, pid).entered();
+                let waited = crate::raw::process::wait_exited(pid).map_err(|error| error.to_string());
+                let _ = to_runner.send(Run::Exited { binary, waited });
+            })
+        });
+        if let Err(error) = wait {
             let _ = child.kill();
             let _ = child.wait();
-            let why = format!("could not read the output of {}: {error}", exec.shown());
+            let why = format!("could not read the output of {} or wait for it: {error}", exec.shown());
             let order = self.binaries[binary as usize].order.clone();
             self.say(Event::BinaryEnded { binary, end: BinaryEnd::NeverRan { why }, output: String::new() });
             self.failed(order, None, binary);
             return;
         }
-        self.running.push(Running { binary, child, killed: false });
+        self.running.push(Running { binary, child, pid, captured, exited: None, killed: false });
     }
 
-    /// One's output is drained: its status, then what it ended as.
-    fn ended(&mut self, binary: u32, output: String) {
+    /// One's process exited: its output is read for at most [`Runner::drain`] more.
+    fn exited(&mut self, binary: u32, waited: Result<(), String>) {
+        // Gone: its output was drained first, and it is reaped.
+        let Some(running) = self.running.iter_mut().find(|it| it.binary == binary) else { return };
+        match waited {
+            Ok(()) => {
+                running.exited.get_or_insert_with(Instant::now);
+            }
+            Err(why) => {
+                // Its output is read to its end, with no deadline: only its pipes' closing
+                // ends it now.
+                let label = &self.binaries[binary as usize].label;
+                let what = format!(
+                    "could not wait for {label} (pid {}) to exit: {why}; its end is now when its stdout and \
+                     stderr close, which a process it started and left running can hold off",
+                    running.pid
+                );
+                let _ = self.to_screen.send(Msg::View(Event::Said(say::warning(&what, self.color))));
+            }
+        }
+    }
+
+    /// Ends each executable that exited [`Runner::drain`] ago with a pipe still open, with
+    /// what it printed until now, and says so.
+    fn undrained(&mut self) {
+        let now = Instant::now();
+        let drain = self.drain;
+        // alloc: the few executables whose drain ended at once
+        let late: Vec<u32> = self
+            .running
+            .iter()
+            .filter(|it| it.exited.is_some_and(|exited| now >= exited + drain))
+            .map(|it| it.binary)
+            .collect();
+        for binary in late {
+            self.ended(binary, true);
+        }
+    }
+
+    /// One's output is drained, or `held` past its drain's deadline: its status, then what it
+    /// ended as.
+    fn ended(&mut self, binary: u32, held: bool) {
         let Some(at) = self.running.iter().position(|it| it.binary == binary) else { return };
         let mut running = self.running.swap_remove(at);
+        let output = running.captured.lock().text();
+        if held {
+            let label = &self.binaries[binary as usize].label;
+            let what = format!(
+                "{label} (pid {}) exited, but a process it started still holds its stdout or stderr open; \
+                 its output was read for {} ms after it exited, and what that process prints from now on \
+                 is not shown",
+                running.pid,
+                self.drain.as_millis()
+            );
+            let _ = self.to_screen.send(Msg::View(Event::Said(say::warning(&what, self.color))));
+        }
         let ended = running.child.wait().map(say::Ended::of);
         let it = &self.binaries[binary as usize];
         let took = it.began.map(|began| began.elapsed());
@@ -674,23 +820,39 @@ impl Runner {
 }
 
 /// Reads one executable's stdout (libtest's JSON when `json`) into the view's events, and its
-/// stderr beside it, then tells the runner it drained.
+/// stderr beside it, each into `captured` as it comes, then tells the runner both closed.
+#[expect(clippy::too_many_arguments, reason = "one thread's whole input, given once")]
 fn read(
     binary: u32,
+    label: &str,
     json: bool,
     stdout: Option<std::process::ChildStdout>,
     stderr: Option<std::process::ChildStderr>,
+    captured: &Arc<Mutex<Captured>>,
     to_screen: &Sender<Msg>,
     to_runner: &Sender<Run>,
 ) {
+    let _reading = tracing::info_span!(target: "blaze", "test.read_output", test = %label).entered();
     let errors = stderr.map(|mut stderr| {
-        thread::spawn(move || {
-            let mut bytes = Vec::new(); // alloc: one executable's stderr
-            let _ = stderr.read_to_end(&mut bytes);
-            String::from_utf8_lossy(&bytes).into_owned()
-        })
+        let (captured, into) = (captured.clone(), captured.clone());
+        let read = thread::Builder::new().name("blaze test stderr".into()).spawn(move || {
+            let captured = into;
+            let mut chunk = [0; 8192];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(n) => captured.lock().err.extend_from_slice(&chunk[..n]),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        let said = format!("\nblaze stopped reading this executable's stderr: {error}\n");
+                        captured.lock().err.extend_from_slice(said.as_bytes());
+                        return;
+                    }
+                }
+            }
+        });
+        (read, captured)
     });
-    let mut output = String::new(); // alloc: what one executable printed outside libtest's JSON
     if let Some(stdout) = stdout {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
@@ -700,18 +862,24 @@ fn read(
                 }
                 None if json && line.trim_start().starts_with('{') => {}
                 None => {
-                    output.push_str(&line);
-                    output.push('\n');
+                    let mut captured = captured.lock();
+                    captured.out.push_str(&line);
+                    captured.out.push('\n');
                 }
             }
         }
     }
-    if let Some(errors) = errors
-        && let Ok(errors) = errors.join()
-    {
-        output.push_str(&errors);
+    match errors {
+        Some((Ok(read), _)) => {
+            let _ = read.join();
+        }
+        Some((Err(error), captured)) => {
+            let said = format!("blaze could not read this executable's stderr: {error}\n");
+            captured.lock().err.extend_from_slice(said.as_bytes());
+        }
+        None => {}
     }
-    let _ = to_runner.send(Run::Drained { binary, output });
+    let _ = to_runner.send(Run::Drained { binary });
 }
 
 /// One line of libtest's JSON as the view's event: a suite's start, a test's start, end or
@@ -750,9 +918,66 @@ fn said(binary: u32, line: &str) -> Option<Event> {
 
 #[cfg(test)]
 mod tests {
-    use blaze_ui::test_view::{Event, Verdict};
+    use std::{ffi::OsString, time::Duration};
 
-    use super::said;
+    use blaze_ui::test_view::{BinaryEnd, Event, Verdict};
+    use crossbeam_channel::unbounded;
+
+    use super::{Msg, Run, Runner, ci, said};
+
+    #[test]
+    fn ci_is_told_by_its_variables() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| pairs.iter().find(|it| it.0 == name).map(|it| OsString::from(it.1))
+        };
+        assert!(ci(env(&[("CI", "true")])));
+        assert!(ci(env(&[("CI", "1")])));
+        assert!(ci(env(&[("TF_BUILD", "True")])));
+        assert!(!ci(env(&[])));
+        assert!(!ci(env(&[("CI", "false")])));
+        assert!(!ci(env(&[("CI", "0")])));
+        assert!(!ci(env(&[("CI", "")])));
+    }
+
+    /// A test executable that starts a process which inherits its stdout and outlives it ends
+    /// when it exits, its output read until then: the runner does not wait for the pipe to
+    /// close, which happens only when that process ends, and says that it stopped reading.
+    #[cfg(unix)]
+    #[test]
+    fn a_test_whose_child_outlives_it_ends_when_it_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut artifact = crate::cli::run::tests::artifact("calc", "test", "it", true, Some("deps/it-0"));
+        artifact.harness = false;
+        artifact.manifest_path = dir.path().join("Cargo.toml").to_string_lossy().into_owned();
+        // The executable is `sh`'s `$0`: the script starts a process holding its stdout, says
+        // its pid, and exits 0.
+        artifact.runner = ["/bin/sh", "-c", "sleep 60 & echo \"child $!\""].map(str::to_owned).to_vec();
+        let (to_screen, screen_gets) = unbounded::<Msg>();
+        let (to_runner, runner_gets) = unbounded::<Run>();
+        let mut runner = Runner::of(Vec::new(), true, to_screen, to_runner.clone(), true, false);
+        runner.drain = Duration::from_millis(300);
+        to_runner.send(Run::BuildOver { ok: true, artifacts: vec![artifact] }).unwrap();
+        let (done, finished) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || done.send(runner.run(&runner_gets)));
+        let code = finished.recv_timeout(Duration::from_secs(20));
+
+        let events: Vec<Event> = screen_gets.try_iter().filter_map(|msg| match msg {
+            Msg::View(event) => Some(event),
+            Msg::Finish => None,
+        }).collect();
+        let output = events.iter().find_map(|event| match event {
+            Event::BinaryEnded { end: BinaryEnd::Passed, output, .. } => Some(output.clone()),
+            _ => None,
+        });
+        // The process left running is ended here, whatever the runner did.
+        if let Some(pid) = output.as_deref().and_then(|it| it.trim().strip_prefix("child ")) {
+            let _ = std::process::Command::new("kill").arg(pid).status();
+        }
+        assert_eq!(code, Ok(0), "the runner did not end within 20 s: {events:#?}");
+        assert!(output.as_deref().is_some_and(|it| it.starts_with("child ")), "{events:#?}");
+        let warned = events.iter().any(|event| matches!(event, Event::Said(text) if text.contains("calc it (pid ") && text.contains("still holds its stdout or stderr open")));
+        assert!(warned, "{events:#?}");
+    }
 
     #[test]
     fn libtest_json_becomes_the_views_events() {

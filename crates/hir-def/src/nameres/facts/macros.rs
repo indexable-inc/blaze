@@ -81,7 +81,7 @@ enum Resolved {
 
 /// One `resolve_macros` over `pending` through `sink`: resolves each directive (all three
 /// kinds, eager calls, the builtin-derive fast path and its deferral), retains the rest,
-/// expands the resolved ones in one `collect::expand_all` batch, collects each expansion.
+/// expands the resolved ones in `batch::expand_round`'s batches, collects each expansion.
 pub(crate) fn resolve_round<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
     cx: &CollectCx<'db, 'f>,
     sink: &mut S,
@@ -649,34 +649,16 @@ fn recollect<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
     sink.take_macros(added);
 }
 
-/// Expands the macros a round resolved as one batch of plane tasks, before
-/// `collect_expansion` collects them one at a time in the round's order. An expansion is a
-/// query of its call alone, so which task runs it when changes no result, and collecting in the
-/// round's order keeps the def map the same whatever the scheduling.
-///
-/// A proc macro that keeps a session sees its calls in the order rustc makes them, so its
-/// calls are left to the collection, in order.
+/// Expands the macros a round resolved as batches of plane tasks
+/// ([`crate::nameres::batch::expand_round`]), before `collect_expansion` collects them one at a
+/// time in the round's order.
 fn expand_round(cx: &CollectCx<'_, '_>, limit: u32, resolved: &[ResolvedCall]) {
     if resolved.len() < 2 {
         return;
     }
-    let db = cx.db;
-    let in_session = |call: MacroCallId| {
-        let def = call.loc(db).def;
-        matches!(
-            def.kind,
-            MacroDefKind::ProcMacro(_, exp, _) if exp.requires_session(db, def.krate)
-        )
-    };
     let mut calls = Vec::with_capacity_in(resolved.len(), cx.frame);
-    calls.extend(
-        resolved
-            .iter()
-            .filter(|&&(_, depth, ..)| depth <= limit)
-            .map(|&(_, _, _, call, _)| call)
-            .filter(|&call| !in_session(call)),
-    );
-    collect::expand_all(db, cx.krate, &calls);
+    calls.extend(resolved.iter().filter(|&&(_, depth, ..)| depth <= limit).map(|&(_, _, _, call, _)| call));
+    crate::nameres::batch::expand_round(cx.db, cx.krate, &calls);
 }
 
 /// The first `Attr` directive's position, for `RoundOutcome::first_attr`.

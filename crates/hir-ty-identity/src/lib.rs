@@ -122,8 +122,16 @@ pub const LEAF_DOMAIN: &str = "blaze v2 behaviour identity leaf 1";
 /// value holds at no place whose type names its trait (in a union, a closure's or coroutine's
 /// capture, an unsafe binder, a `DynMetadata` of no `dyn`) is refused, naming the constant or
 /// static: its trait, and so the code its slots run, is not known. A refusal is no code id,
-/// never a different one. Nothing was persisted under 3 before these, so they are one bump.
-pub const CODE_ID_DOMAIN: &str = "blaze v2 code id 3";
+/// never a different one. Nothing was persisted under 3 before these, so they are one bump. 4:
+/// the vtable walk follows the code generator's relocation rules (`facts.rs`, `VtableWalk`):
+/// behind a raw pointer or in a union a pointer without provenance is a number and a metadata
+/// word with it no vtable, so neither is paired; a raw pointer into memory that is a whole
+/// number of its pointee walks every element (`as_ptr`), a union whose fields but one are empty
+/// walks that one, a struct's slice tail walks its elements, and a raw pointer one past its
+/// memory's end is to that memory; and a word holding a vtable's or function's id that a type
+/// reaching it does not say is one (a vtable behind `&&dyn Tr as *const _ as *const u8`) is
+/// refused, as the code generator refuses it.
+pub const CODE_ID_DOMAIN: &str = "blaze v2 code id 4";
 /// The domain of the bodies inlined into another.
 pub const INLINED_DOMAIN: &str = "blaze v2 code identity inlined 2";
 /// The domain of the stable name that orders the members of one component.

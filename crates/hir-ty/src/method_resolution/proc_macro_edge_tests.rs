@@ -34,6 +34,7 @@ impl<T> [T] {
 pub trait Parse {}
 impl Parse for u8 {}
 //- /pm.rs crate:proc-macro:pm deps:std,syn
+pub use syn::Parse;
 pub fn reverses_in_the_macro(v: &mut [u8]) { v.reverse() }
 //- /main.rs crate:main deps:alloc,pm
 pub fn sorts(v: &mut [u8]) { v.sort() }

@@ -118,5 +118,5 @@ fn the_corpus_macros_do_what_they_say() {
     assert_eq!(DATA, include_str!("../data.txt"));
     assert_eq!(PACKAGE, "corpus-calls");
     assert!(PACKAGE_UNSET, "CORPUS_UNSET is unset where the crate is built");
-    assert_eq!((FIRST, SECOND), (0, 1), "`counter!` counts its calls in the order rustc expands them");
+    assert_eq!([FIRST, SECOND, THIRD, FOURTH, FIFTH], [0, 1, 2, 3, 4], "`counter!` counts its calls in the order rustc expands them");
 }

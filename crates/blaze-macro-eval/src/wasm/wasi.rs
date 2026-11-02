@@ -20,8 +20,11 @@
 //!   below the calling crate's `CARGO_MANIFEST_DIR` and `OUT_DIR` only, noted so the expansion
 //!   is keyed by what it read, and a span each. A path outside them stops the expansion, naming
 //!   it; a write stops it too. A file the macro opens is descriptor [`ROOT_FD`] + 1 and up.
-//!   A relative path is resolved against `/`, as wasi-libc without `chdir` does, not against the
-//!   package's directory as under rustc.
+//!   wasi-libc makes a relative path absolute against its own working directory before the
+//!   host sees it, so the glue enters the directory cargo runs rustc in (`Os::current_dir`,
+//!   through the bridge's `current_dir`) before its macro runs: a relative path then starts
+//!   where it starts under rustc. `chdir`'s look at that directory is answered as a directory
+//!   even when it is outside the roots (a workspace's root); what is in it is not.
 //! - A wait (`poll_oneoff`, which `thread::sleep` makes) or an exit stops the expansion.
 //!
 //! [`Os`]: crate::os::Os

@@ -210,6 +210,11 @@ pub struct Policy {
     pub heap_to_stack: bool,
     /// Lint `blaze::vecreport` is on: every LLVM unit's [`Spec::report`].
     pub report: bool,
+    /// `blaze test --fuel`: the [`Spec::fuel`] of every native function the tests run (not
+    /// build-time code's, which runs out of them). Left out of the serialized form when off,
+    /// so [`Policy::id`] of every build without it is the one it had before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fuel: bool,
 }
 
 /// How one function is compiled.
@@ -341,6 +346,12 @@ impl Policy {
             // their settings leave out a flag that is the program's: one copy of each for every
             // program, whatever its allocator.
             heap_to_stack: self.heap_to_stack && !matches!(origin, Origin::Std),
+            // Only code of the tests' processes has the fuel runtime to call; wasm32's one
+            // producer has no lowering of it.
+            fuel: self.fuel
+                && self.toolchain.arch != crate::Arch::Wasm32
+                && !self.proc_macro_bridge
+                && !matches!(origin, Origin::BuildTime(_)),
         };
         // Build-time code runs out of the run's process, where no counter cells are: it is
         // compiled as an output's.
@@ -407,6 +418,7 @@ mod tests {
             proc_macro_bridge: false,
             report: false,
             heap_to_stack: false,
+            fuel: false,
         }
     }
 
@@ -616,6 +628,23 @@ mod tests {
         let (z, m) = (Package::new("zz-made-first"), Package::new("aa-made-second"));
         assert!(m < z && Origin::Member(m) < Origin::Member(z));
         assert_eq!(format!("{:?}", Origin::Member(a)), "Member(\"serde\")");
+    }
+
+    #[test]
+    fn fuel_meters_what_the_tests_run_and_leaves_the_rest_as_it_was() {
+        let off = policy(OptLevel::O0, Mode::Output);
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(!json.contains("fuel"), "a policy without fuel serializes as before: {json}");
+        let spec = off.choose(&member(), None).unwrap().first;
+        assert!(!serde_json::to_string(&spec).unwrap().contains("fuel"));
+        let mut on = off.clone();
+        on.fuel = true;
+        assert_ne!(on.id(), off.id());
+        for origin in [member(), Origin::Dependency(Package::new("regex")), Origin::Std] {
+            assert!(on.choose(&origin, None).unwrap().first.fuel, "{origin:?}");
+        }
+        let build = on.choose(&Origin::BuildTime(Package::new("serde_derive")), None).unwrap();
+        assert!(!build.first.fuel, "build-time code runs out of the tests");
     }
 
     #[test]
