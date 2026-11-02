@@ -237,8 +237,10 @@ threads inside it run as a loop that LLVM can vectorize. Three things make this 
 4. Barrier splitting and workgroup memory on the CPU. A tiled matmul gives bit-identical results
    on CPU and Metal for integer inputs.
 5. Subgroup ops, and SIMD-width compilation on the CPU.
-6. Autodiff on MIR (`#[differentiable]`), the one Slang feature with no Rust equivalent on a GPU.
-   `std::autodiff` runs Enzyme on LLVM IR, which device code reaches too late to use.
+6. Autodiff on MIR (`#[blaze::differentiable]`), the one Slang feature with no Rust equivalent
+   on a GPU. `std::autodiff` runs Enzyme on LLVM IR, which device code reaches too late to use.
+   Automatic, symbolic and e-graph layers, shared with the CPU, are in
+   [../autodiff/plan.md](../autodiff/plan.md).
 7. Ray tracing: inline query first, then typed pipelines. See [raytracing.md](raytracing.md).
 
 ## Open questions
