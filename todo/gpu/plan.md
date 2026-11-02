@@ -12,9 +12,11 @@ session, so generic kernels, shared structs and the borrow checker work across t
 Nothing here is built yet. The front matter uses the fields `tools/docs.py` checks, so this file
 can move under `docs/v2/plan/` unchanged once it's adopted.
 
-The 10-29 decision "no GPU" in [decisions.md](../../docs/v2/plan/process/decisions.md) covers
-blaze's own internals (query engine, codegen). This plan is about a target for the programs blaze
-builds, so it doesn't reopen that decision.
+The 10-29 decision "no GPU" in [decisions.md](../../docs/v2/plan/process/decisions.md) and
+[hardware.md](../../docs/v2/plan/design/hardware.md) covers blaze's own work. That work is
+pointer-chasing and branchy, the build machines have no GPU, and the parts that would map to one
+(hashing, compression) already run near memory bandwidth on SIMD. This plan is about a target for
+the programs blaze builds, so it doesn't reopen that decision.
 
 ## Why blaze and not rustc
 
@@ -129,6 +131,57 @@ thread's identity, never from an integer the thread computed.
 8. **Reads stay plain.** Shared `&[T]` is sound as long as nothing writes it during the launch,
    and point 7 guarantees that.
 
+## What NVIDIA's CUDA Rust already does
+
+NVIDIA released CUDA Rust in September 2026 (`github.com/NVIDIA/cuda-rust`, blog post "Introducing
+CUDA Rust: Two Tracks for Writing GPU Kernels", 2026-09-08). It's CUDA-only and early alpha, but
+it's the closest prior art and already settles several questions above. It has two tracks:
+
+**cuda-oxide (SIMT)** is a rustc codegen backend: MIR, then Pliron (an MLIR-like IR in Rust),
+then LLVM, then PTX. Host and `#[kernel]` code share one file and one build, which is the model
+this plan wants. Its safety pieces:
+
+- `DisjointSlice<T>` for outputs: each thread gets exclusive access to its own element. This is
+  this plan's `Out<T>`.
+- `thread::index_1d()` returns a typed index, and `DisjointSlice::get_mut` only takes that type,
+  returning an `Option`. This is the `Thread` token idea, with the tail handled by `None`.
+- `#[launch_contract(domain = 1, block = (256, 1, 1))]` declares the kernel's indexing.
+  `prepare_vecadd(config)` checks a launch config against the contract and the live device limits,
+  then returns a proof token the safe launch method requires. A kernel without a contract only
+  gets `unsafe` launches. Take this: it makes "the grid matches the indexing" a checked fact.
+- Passing the output buffer as an input fails with E0502, the same host-side borrow check this
+  plan describes.
+- Shared memory still needs `unsafe`, and NVIDIA calls making it safe "active work". The
+  phased `Shared<T>` above is a candidate answer.
+
+**cutile-rs (Tile)** runs on stable Rust. A kernel body runs once per tile as one logical thread,
+and a JIT through CUDA Tile IR decides how many real threads back it. Its safety pieces:
+
+- `&mut Tensor<f32, {[B]}>` is the tile this block owns. On the host,
+  `api::zeros(&[1024]).partition([128])` makes each tile's chunk exclusive, fixes the grid
+  (1024 / 128 = 8) and supplies `B`, so the grid can't disagree with the indexing.
+- The launch takes ownership of its tensors and hands them back when the GPU finishes. That's
+  stronger than borrowing for a scope: nothing on the host can touch a buffer in flight, and no
+  `Drop` guard is involved for `mem::forget` to skip. Reusing a partitioned tensor as an input
+  fails with E0382.
+- No thread indices, shared memory or barriers, so there are no data races within a kernel.
+  Users give up control of thread mapping in exchange.
+- Every operation is lazy until `.sync_on(&stream)`, so a chain of uploads, launches and
+  downloads is one submission.
+
+What this changes in the plan:
+
+1. Adopt launch contracts and proof tokens as the way `launch` checks the grid against the kernel.
+2. Offer an ownership-passing launch (`launch(..) -> (out, ..)`) beside `dev.scope`. Scopes are
+   better for many launches over long-lived buffers, ownership for pipelines.
+3. Treat a tile track as phase 5 or later, where `#[gpu::map]` grows into tiles. Tile IR is
+   NVIDIA-only, so on Metal and Vulkan blaze would lower tiles itself.
+4. Phased `Shared<T>` and the uniformity check are where this plan goes past cuda-oxide. That's
+   worth prototyping early, since NVIDIA says it doesn't have an answer yet.
+5. Read cuda-oxide's Pliron dialects and its ecosystem appendix (comparing Rust-GPU, rust-cuda
+   and CubeCL) before writing blaze's NVPTX path, and the paper "Fearless Concurrency on the GPU"
+   (Elibol, RustConf 2026).
+
 ## Where each piece lives
 
 The compiler and `core` own what has to be the same everywhere. A crate owns the drivers.
@@ -200,6 +253,9 @@ threads inside it run as a loop that LLVM can vectorize. Three things make this 
 
 - rust-gpu (`rustc_codegen_spirv`, `spirv-std`, `cargo-gpu`): Rust to SPIR-V, separate crate.
 - rust-cuda (`rustc_codegen_nvvm`, `cust`, `cuda_builder`): Rust to PTX, separate crate.
+- NVIDIA CUDA Rust: cuda-oxide (SIMT, single source, `DisjointSlice`, launch contracts) and
+  cutile-rs (Tile, partitioned tensors, ownership across the launch). See the section above.
+- CubeCL: Rust kernels through a proc macro, with CUDA, ROCm, Metal and Vulkan backends.
 - The 2025 Rust GPU demo running one crate on CUDA, Vulkan, Metal, DX12 and WebGPU through both.
 - Slang: the bar for ergonomics (automatic bindings, swizzles, `[Differentiable]`, reflection).
 - CUDA, SYCL and nvcc: the single-source, one-compiler-session model.
