@@ -9,11 +9,15 @@ use blaze_ids::Hasher;
 use hir_def::{ConstId, FunctionId, HasModule, StaticId};
 use hir_ty::{
     ParamEnvAndCrate,
+    db::HirDatabase,
     next_solver::{GenericArgs, ParamEnv, StoredGenericArgs, StoredTy},
 };
 use hir_ty_mir::mir::dispatch::Body;
 
-use crate::facts::{Cx, Edge, Facts, Holder};
+use crate::{
+    facts::{Cx, Edge, Facts, Holder},
+    instance::erased,
+};
 
 /// The value whose edges are asked for.
 #[derive(Clone, Copy, Debug)]
@@ -51,7 +55,7 @@ pub fn value_edges(db: &Db, of: ValueOf) -> Result<Vec<Hashed>, String> {
         ValueOf::Static(id) => facts.static_use(id),
         ValueOf::Const(id) => {
             let value = db
-                .const_eval(id, GenericArgs::empty(cx.interner), Some(cx.env))
+                .const_eval(id, GenericArgs::empty(), Some(cx.env))
                 .map_err(|error| format!("the constant does not evaluate: {error:?}"))?; // alloc: error path
             facts.ty(value.ty);
             facts.allocation(&value, value.ty, Holder::Body);
@@ -60,17 +64,16 @@ pub fn value_edges(db: &Db, of: ValueOf) -> Result<Vec<Hashed>, String> {
     if let Some(why) = facts.failed {
         return Err(why);
     }
-    let erased = |ty| crate::instance::erased(cx.interner, ty);
     Ok(facts
         .edges
         .iter()
         .map(|edge| match *edge {
             Edge::Vtable(concrete, dyn_ty) => {
-                Hashed::Vtable { concrete: erased(concrete).store(), dyn_ty: erased(dyn_ty).store() }
+                Hashed::Vtable { concrete: erased(cx.interner, concrete).store(), dyn_ty: erased(cx.interner, dyn_ty).store() }
             }
-            Edge::Call(func, args) => Hashed::Call { func, args: erased(args).store() },
-            Edge::Closure(body, parent) => Hashed::Closure { body, parent: erased(parent).store() },
-            Edge::Drop(ty) => Hashed::Drop(erased(ty).store()),
+            Edge::Call(func, args) => Hashed::Call { func, args: erased(cx.interner, args).store() },
+            Edge::Closure(body, parent) => Hashed::Closure { body, parent: erased(cx.interner, parent).store() },
+            Edge::Drop(ty) => Hashed::Drop(erased(cx.interner, ty).store()),
         })
         .collect()) // alloc: test support, the edges handed out
 }
