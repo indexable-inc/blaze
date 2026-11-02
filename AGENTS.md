@@ -41,25 +41,34 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
    are the documented manifest opt-outs and `BLAZE_SANDBOX=off`; nothing new that runs user code
    runs outside by default. See
    [docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox](docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox).
-8. **bump-allocate**: Allocate by lifetime, never from the global heap by default: a collection that
+8. **proc-macros-on-wasm**: A proc macro runs as a WebAssembly module: blaze compiles the macro crate
+   to `wasm32-wasip1` with its own front end and code generator (never rustc), and Wasmtime runs it
+   in process, Cranelift as its compiler, behind the `proc_macro` bridge, whose shims are its only
+   imports. Cranelift appears only there, inside Wasmtime for wasm. Native code (every target blaze
+   builds for, debug or release) never goes through Cranelift: it is copy-and-patch stencils or
+   LLVM, and a function with no stencil is a typed error naming it. The MIR evaluator stays for
+   const eval and as the reference a macro's wasm output is tested against; nothing hand-rolls a
+   wasm-style sandbox (`blaze-macro-eval`'s `tier.rs` is replaced by this). See
+   [docs/v2/plan/lanes/usercode/macros.md](docs/v2/plan/lanes/usercode/macros.md).
+9. **bump-allocate**: Allocate by lifetime, never from the global heap by default: a collection that
    lives within one task (a query run, a codegen unit, a maintainer pass) names its allocator,
    `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer
    lifetimes use the request, revision or image allocator. A global allocation (`Vec::new`,
    `vec![]`, `collect` into a heap `Vec`, `Box::new`, `to_owned`) needs `// alloc: <why>` on its
    line. `blaze::hot_alloc` enforces this wherever `blaze::hot` is denied. See
    [docs/v2/plan/design/memory.md](docs/v2/plan/design/memory.md).
-9. **standard-structures**: One choice per need, never a hand-rolled or std stand-in: locks are
-   `parking_lot::{Mutex, RwLock}`, held only for a field update and never across a query call; a
-   shared map is `papaya::HashMap`; a single-owner map or set is `blaze_hash::{HashMap, HashSet}`
-   (foldhash with a fixed seed), with `blaze_hash::KeyHasher` for keys that are already content
-   hashes and `blaze_hash::Blake3Hasher` for persisted content IDs; results of parallel items come
-   back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is
-   `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag
-   is an atomic. On a pool thread or fiber, a wait goes through the scheduler (a key, a counter, a
-   job), never a `Condvar`, a channel receive, `thread::sleep` or a raw `spin_loop`; elsewhere a
-   spin is the one bounded spin-then-park helper and a delay is a deadline in the sans-IO core or a
-   driver's timer. `BTreeMap` only where iteration order is part of the output.
-10. **fix-through-blaze-lints**: A change that moves a type, path, API or idiom across the code is a ban
+10. **standard-structures**: One choice per need, never a hand-rolled or std stand-in: locks are
+    `parking_lot::{Mutex, RwLock}`, held only for a field update and never across a query call; a
+    shared map is `papaya::HashMap`; a single-owner map or set is `blaze_hash::{HashMap, HashSet}`
+    (foldhash with a fixed seed), with `blaze_hash::KeyHasher` for keys that are already content
+    hashes and `blaze_hash::Blake3Hasher` for persisted content IDs; results of parallel items come
+    back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is
+    `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag
+    is an atomic. On a pool thread or fiber, a wait goes through the scheduler (a key, a counter, a
+    job), never a `Condvar`, a channel receive, `thread::sleep` or a raw `spin_loop`; elsewhere a
+    spin is the one bounded spin-then-park helper and a delay is a deadline in the sans-IO core or a
+    driver's timer. `BTreeMap` only where iteration order is part of the output.
+11. **fix-through-blaze-lints**: A change that moves a type, path, API or idiom across the code is a ban
     with a `replacement` in `.clippy.toml` (mirrored in the hot crates' `clippy.toml`), which
     blaze-lints' `disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce with a
     MachineApplicable fix, or a `blaze::` lint where the rule needs types or MIR; either is applied
@@ -69,96 +78,96 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
     compiling and lint-clean, so the rule keeps holding after the port. `sed`, `rg` replace and
     syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a build
     afterward.
-11. **sans-io-cores**: Every core (a scheduler decision, a protocol, a retry or backoff policy, a lease,
+12. **sans-io-cores**: Every core (a scheduler decision, a protocol, a retry or backoff policy, a lease,
     a maintainer's plan) is a synchronous state machine that reads time only from an injected clock
     (`advance_clock(now)`), owns no socket, file, thread, timer or sleep, and hands back decisions
     and deadlines (`take_decisions`, `next_deadline`). Drivers do the IO and stay thin. A test
     replays a transcript with no real clock.
-12. **every-wait-says-what**: A thread or fiber that blocks says what it waits for: the wait opens a
+13. **every-wait-says-what**: A thread or fiber that blocks says what it waits for: the wait opens a
     span naming the awaited key, lock, channel, IO or child, and its owner when known. A wait with
     no name, and time on a worker covered by no span, are bugs; the profile test fails on them.
-13. **slow-is-p0-traced**: Anything slow is a P0 until a span names it, and the trace comes before the
+14. **slow-is-p0-traced**: Anything slow is a P0 until a span names it, and the trace comes before the
     speed fix. Every stretch of worker time sits under a `tracing::info_span!(target: "blaze", ...)`
     that names the work: the macro path for a proc-macro expansion, the package, version and target
     kind for a unit, the query and key, the creator of a scope being waited on. Its own CPU time
     (`self_cpu_ns`) is filled, so a DuckDB query over `<BLAZE_HOME>/v2/profile/*.spans.parquet` says
     which item took the time and whether it was busy or waiting. A sampler stack or a guess from a
     log is a lead. The PR that makes something faster quotes the before and after from those spans.
-14. **bounded-progress**: Every loop that waits for progress (a solver, a fixpoint, a readiness probe, a
+15. **bounded-progress**: Every loop that waits for progress (a solver, a fixpoint, a readiness probe, a
     retry) has a bound (fuel, depth or a deadline from the injected clock) and ends in a typed
     outcome: done, or a failure naming what it was doing, the goal or key, and how far it got. Never
     an open loop whose only exit is success, and never a spin with no cap.
-15. **errors-name-the-thing**: An error names the item it is about (the function or instance with its
+16. **errors-name-the-thing**: An error names the item it is about (the function or instance with its
     path, the crate, the key, the file and line) and the rule that refused it, in the message
     itself. "a template made against 6 references is given 7" is unfinished until it says which
     function and which template.
-16. **panics-fail-one-job**: A panic inside a job (a query, a codegen unit, a proc-macro evaluation)
+17. **panics-fail-one-job**: A panic inside a job (a query, a codegen unit, a proc-macro evaluation)
     fails that job's units with a typed error naming the panic and the job; the daemon keeps serving
     and `--keep-going` keeps building the rest. Formatting an error must not panic: render what
     needs the database while the database is attached.
-17. **keys-cover-every-input**: A query key, store key, fold key or template key covers every input its
+18. **keys-cover-every-input**: A query key, store key, fold key or template key covers every input its
     value depends on, including the data a constant points to and the identity of a closure callee.
     Two different values under one key is a refusal with a typed error, never an overwrite, and the
     fix is the key, never the check.
-18. **measure-the-exact-tree**: A measurement, bisect or checkpoint names the exact tree it ran on (a
+19. **measure-the-exact-tree**: A measurement, bisect or checkpoint names the exact tree it ran on (a
     content digest of the sources and the blaze binary's hash) and keeps that tree; never re-sync or
     rebuild between measuring and committing. A result you can't tie to a tree is not evidence.
-19. **test-the-cause**: A causal claim (this change caused the regression, this lock causes the convoy,
+20. **test-the-cause**: A causal claim (this change caused the regression, this lock causes the convoy,
     this index makes it fast) is tested by removing the cause and watching the effect go, not by
     checking that its premises hold. Pin a load-bearing one with a test named for the property.
-20. **whole-ports**: A change to a shared signature or type (a struct's fields, a trait, a lock type)
+21. **whole-ports**: A change to a shared signature or type (a struct's fields, a trait, a lock type)
     updates every caller in the same batch, so the shared tree compiles at every save point. Do it
     through `blaze check --fix`, `blaze check --replace` or a scoped rewrite, then build, then hand
     the batch over. A half-ported tree blocks every lane's run.
-21. **deterministic-output**: No output (an object, a diagnostic's order, a store key, a profile row's
+22. **deterministic-output**: No output (an object, a diagnostic's order, a store key, a profile row's
     identity) depends on hash-map iteration order, thread timing, addresses or the wall clock.
     Hashers have fixed seeds; anything iterated into output is sorted or ordered by construction; a
     test builds twice and compares bytes.
-22. **persisted-state-round-trips**: Anything blaze persists (the daemon image, the store, the plane's
+23. **persisted-state-round-trips**: Anything blaze persists (the daemon image, the store, the plane's
     history) has a test that restores it and checks the result equals a fresh build byte for byte,
     and a budget for restart to first answer. A restore that silently starts empty is a failure the
     daemon reports, naming why.
-23. **no-wait-across-thread-locals**: A fiber can resume on another thread after any wait, so nothing
+24. **no-wait-across-thread-locals**: A fiber can resume on another thread after any wait, so nothing
     held across a wait may be tied to a thread: no thread-local borrow, lock guard or `Rc`. Mark
     regions that must not wait with `NoWait`; read thread-locals in `#[inline(never)]` functions
     that end before any wait.
-24. **best-long-term-design**: Pick the best long-term design, not the least work: own the layer or port
+25. **best-long-term-design**: Pick the best long-term design, not the least work: own the layer or port
     rustc's rule properly, and spend the effort on proving it right: real crates' own test suites
     passing under blaze, and fuzzing of blaze's own invariants. See
     [docs/contributing.md#rules-for-code](docs/contributing.md#rules-for-code).
-25. **semantics-in-front-end**: Language semantics (MIR building and passes, borrow checking, const
+26. **semantics-in-front-end**: Language semantics (MIR building and passes, borrow checking, const
     eval, layout, code-identity hashes) go in the front end's salsa crates in `crates/` (`hir-ty`,
     `hir-def` and the rest, derived from rust-analyzer but no longer synced with it), in a crate of
     their own where possible. Codegen, the store, the daemon, cargo integration and the runtime stay
     outside the front end. See
     [docs/contributing.md#where-new-code-goes](docs/contributing.md#where-new-code-goes).
-26. **no-mcp**: No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in
+27. **no-mcp**: No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in
     deterministic CBOR; the CLI is a client of the same API. See
     [docs/roadmap.md#8-the-agent-api](docs/roadmap.md#8-the-agent-api).
-27. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run in an ix VM, one per lane (`ix
+28. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run in an ix VM, one per lane (`ix
     new`, `ix shell`, `ix rm`), never on the Mac or AWS. Where an ix VM can't do it, stop and say
     what is missing. See
     [docs/contributing.md#working-in-parallel](docs/contributing.md#working-in-parallel).
-28. **worktree-per-lane**: One uniquely named worktree per lane with its own `CARGO_TARGET_DIR`; never
+29. **worktree-per-lane**: One uniquely named worktree per lane with its own `CARGO_TARGET_DIR`; never
     `git stash`.
-29. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
+30. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
     "what the branch does"` opens it, turns on auto-merge and waits for the merge gate (`--wait`
     resumes). Harnesses run after merge in the release train. Never push to main. See
     [docs/contributing.md#landing-a-change](docs/contributing.md#landing-a-change).
-30. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
+31. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
     conflicts, fix its gate, finish a draft) rather than hand it back; tell the owning lane what
     changed. Close one only when it is wrong, saying why.
-31. **clean-up-lane**: When a lane is done, delete its worktree, target directory, ix VM and merged
+32. **clean-up-lane**: When a lane is done, delete its worktree, target directory, ix VM and merged
     branch.
-32. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
+33. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
     `Co-authored-by: Name <id+login@users.noreply.github.com>` trailer for each of them and says
     where it came from. See [docs/contributing.md#credit](docs/contributing.md#credit).
-33. **docs-say-what-they-are**: Every doc under `docs/` has front matter: `current` (kept true), `plan`,
+34. **docs-say-what-they-are**: Every doc under `docs/` has front matter: `current` (kept true), `plan`,
     `record` (dated history) or `superseded` (naming its replacement). Trust current docs; read
     plans and records as of their date. A change that makes a current doc untrue fixes it or marks
     it superseded in the same change; `python3 tools/docs.py check` holds them to the tree. See
     [docs/contributing.md#documents](docs/contributing.md#documents).
-34. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
+35. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
     into a frozen dataclass that refuses unknown fields, not a set of flags or hidden environment
     variables. An existing script moves to this when next changed.
 
