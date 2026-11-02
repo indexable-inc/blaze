@@ -1443,6 +1443,8 @@ mod lazy;
 
 mod wasm_imports;
 
+mod wasm_statics;
+
 mod dev_run;
 
 mod natives;
@@ -1840,4 +1842,83 @@ mod resolution {
         };
         assert!(run(1).same(&run(4)));
     }
+}
+
+/// A function put again under its own key with another fill (its callee edited to a new key),
+/// removed and added in one change with the old callee, as blaze-cargo's relink does. Its old
+/// piece goes first, a direct referrer follows the new body, its new body calls the new
+/// callee, and the entry follows a refilled entry function. One added again without being
+/// removed is refused.
+#[test]
+fn a_function_refilled_under_its_own_key_relinks() {
+    // start (1) calls call (2) directly; call calls log (3) through its slot.
+    let start = function(1, &CALLER, vec![rel32(1, Target::Direct(key(2)))]);
+    let call = function(2, &CALLER, vec![rel32(1, Target::Function(key(3)))]);
+    let log = function(3, &returns(1), Vec::new());
+    let names = || vec![("_start".to_string(), Target::Direct(key(1)))];
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    let mut disk = Disk::default();
+    disk.link(
+        &mut image,
+        Change {
+            added: vec![&start, &call, &log],
+            names: names(),
+            debug_names: vec![(key(1), "start".into()), (key(2), "call".into()), (key(3), "log".into())],
+            ..Change::default()
+        },
+    )
+    .unwrap();
+    let a = Linked::of(disk.file(TO));
+    let (s, old_call) = (a.symbol("start"), a.symbol("call"));
+    assert_eq!(a.rel32(s + 1), old_call);
+    assert_eq!(a.through_stub(a.rel32(old_call + 1)), a.symbol("log"));
+
+    // log edited to key 4; call refilled against it under its own key 2.
+    let call2 = function(2, &CALLER, vec![rel32(1, Target::Function(key(4)))]);
+    let log2 = function(4, &returns(2), Vec::new());
+    disk.link(
+        &mut image,
+        Change {
+            added: vec![&call2, &log2],
+            removed: vec![key(2), key(3)],
+            names: names(),
+            debug_names: vec![(key(4), "log2".into())],
+            ..Change::default()
+        },
+    )
+    .expect("a refilled function removed and added under its own key");
+    let b = Linked::of(disk.file(TO));
+    let (s, new_call, log2_at) = (b.symbol("start"), b.symbol("call"), b.symbol("log2"));
+    assert_ne!(new_call, old_call, "new code never goes where old code was");
+    assert_eq!(b.rel32(s + 1), new_call, "the direct referrer follows the refilled body");
+    assert_eq!(b.through_stub(b.rel32(new_call + 1)), log2_at, "the refilled body calls the new callee");
+    assert_eq!(b.at(log2_at, 6), returns(2));
+    assert_eq!(b.elf().entry(), s);
+
+    // The entry function itself refilled: start (1) now calls a new call (5) directly.
+    let start2 = function(1, &CALLER, vec![rel32(1, Target::Direct(key(5)))]);
+    let call5 = function(5, &CALLER, vec![rel32(1, Target::Function(key(4)))]);
+    disk.link(
+        &mut image,
+        Change {
+            added: vec![&start2, &call5],
+            removed: vec![key(1), key(2)],
+            names: names(),
+            debug_names: vec![(key(5), "call5".into())],
+            ..Change::default()
+        },
+    )
+    .expect("the entry function refilled under its own key");
+    let c = Linked::of(disk.file(TO));
+    let (s2, call5_at) = (c.symbol("start"), c.symbol("call5"));
+    assert_ne!(s2, s, "the refilled entry function moved");
+    assert_eq!(c.elf().entry(), s2, "the entry follows the refilled entry function");
+    assert_eq!(c.rel32(s2 + 1), call5_at);
+    assert_eq!(c.through_stub(c.rel32(call5_at + 1)), log2_at);
+
+    // Put again without being removed: refused, naming it, never its old code quietly kept.
+    let again = function(5, &CALLER, vec![rel32(1, Target::Function(key(4)))]);
+    let error = image.stage(Change { added: vec![&again], names: names(), ..Change::default() }).unwrap_err();
+    assert_eq!(error.function, Some(key(5)));
+    assert!(error.what.contains("`call5`") && error.what.contains("already placed"), "{error}");
 }

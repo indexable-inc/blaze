@@ -1032,6 +1032,55 @@ impl MacroCallId {
     pub fn expansion_reads(self, db: &Db) -> &proc_macro::ExpansionReads {
         &self.proc_macro_expansion(db).1
     }
+
+    /// The proc macro this calls, as `def_crate` loaded it, and whether its calls from the
+    /// calling crate run one at a time in order ([`proc_macro::ProcMacroExpander::ordered`]):
+    /// `None` for a call of another kind of macro.
+    pub fn proc_macro_ordered(self, db: &Db) -> Option<(Crate, bool)> {
+        let def = self.loc(db).def;
+        match def.kind {
+            MacroDefKind::ProcMacro(_, expander, _) => Some((def.krate, expander.ordered(db, def.krate))),
+            _ => None,
+        }
+    }
+
+    /// Whether this proc-macro call can run ahead of its turn
+    /// ([`proc_macro::ProcMacroExpander::speculates`]).
+    pub fn proc_macro_speculates(self, db: &Db) -> bool {
+        let loc = self.loc(db);
+        match loc.def.kind {
+            MacroDefKind::ProcMacro(_, expander, _) => expander.speculates(db, loc.def.krate, loc.krate),
+            _ => false,
+        }
+    }
+
+    /// Runs this proc-macro call ahead of its turn, given what [`Self::proc_macro_expansion`]
+    /// gives its expander, for that query to take if the macro's session is in the same state
+    /// at its turn ([`proc_macro::ProcMacroExpander::speculate`]). Not a query: what it keeps
+    /// changes no query's value. Nothing for a call that is refused or of another kind.
+    pub fn speculate_proc_macro(self, db: &Db) {
+        let loc = self.loc(db);
+        let MacroDefKind::ProcMacro(ast, expander, _) = loc.def.kind else { return };
+        if self.arg_refusal(db, &loc.kind).is_some() {
+            return;
+        }
+        let (macro_arg, _, _) = self.macro_arg_considering_derives(db, &loc.kind);
+        let attr_arg = match &loc.kind {
+            MacroCallKind::Attr { attr_args: Some(attr_args), .. } => Some(&**attr_args),
+            _ => None,
+        };
+        let span = proc_macro_span(db, ast);
+        expander.speculate(
+            db,
+            loc.def.krate,
+            loc.krate,
+            macro_arg,
+            attr_arg,
+            span_with_def_site_ctxt(db, span, self.into(), loc.def.edition),
+            span_with_call_site_ctxt(db, span, self.into(), loc.def.edition),
+            span_with_mixed_site_ctxt(db, span, self.into(), loc.def.edition),
+        );
+    }
 }
 
 fn expand_unimplemented_builtin_macro(

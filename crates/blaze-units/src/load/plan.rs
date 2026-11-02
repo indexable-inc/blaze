@@ -10,6 +10,8 @@ mod outputs;
 #[cfg(test)]
 mod tests;
 
+pub(super) use outputs::macro_dir;
+
 use blaze_hash::hash_map::Entry;
 use std::path::Path;
 
@@ -64,8 +66,10 @@ pub(crate) struct PlanInput<'a, F: Files> {
     pub build_dir: &'a Path,
     pub host: &'a str,
     pub target: Option<&'a str>,
-    /// `-Z wasm-macros`' platform: its units are planned as a third kind, after the host's
-    /// and the target's, and their plans say [`UnitPlan::macro_wasm`].
+    /// The wasm proc macros' platform: their units ([`Unit::macro_wasm`]) are planned as a
+    /// third kind, after the host's and the target's, in a directory and under hashes of
+    /// their own even when the target's triple is the same, and their plans say
+    /// [`UnitPlan::macro_wasm`].
     pub macro_wasm: Option<&'a str>,
     /// The profile asked for, by name (`dev`), and its directory's name (`debug`).
     pub requested_profile: &'a str,
@@ -276,11 +280,13 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         layouts.push(Layout::new(input.target_dir, input.build_dir, Some(target), input.profile_dir));
     }
     let macro_kind = kinds.len();
-    // Never the target's triple: the load refuses that build before its graph is made.
+    // It may be the target's triple (`--target wasm32-wasip1`): its hash and its directory
+    // are the macros' own, so a unit of the target and one of the macros never share a
+    // metadata hash, an output or an `OUT_DIR`.
     if let Some(triple) = input.macro_wasm {
         kinds.push(flags::macro_wasm_info(triple)?);
-        kind_hashes.push(hash::kind_fingerprint_hash(Some(triple))?);
-        layouts.push(Layout::new(input.target_dir, input.build_dir, Some(triple), input.profile_dir));
+        kind_hashes.push(hash::macro_kind_hash(triple)?);
+        layouts.push(Layout::new(input.target_dir, input.build_dir, Some(&outputs::macro_dir(triple)), input.profile_dir));
     }
     if let Intent::Doc { open } = input.intent {
         flags::doc_unhonored(config, input.host, input.target, &kinds, open)?;
@@ -288,6 +294,14 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     let mut linkers = Vec::with_capacity(kinds.len());
     let mut runners = Vec::with_capacity(kinds.len());
     for (at, info) in kinds.iter().enumerate() {
+        // The macros' platform is blaze's: no `[target.<triple>]` of the user's names it, even
+        // one for a `--target` of the same triple (as `flags::macro_wasm_info` reads no
+        // rustflags).
+        if input.macro_wasm.is_some() && at == macro_kind {
+            linkers.push(None);
+            runners.push(Vec::new());
+            continue;
+        }
         let kind = if at == 0 { CompileKind::Host } else { CompileKind::Target(info.triple.clone()) };
         let linker = config.target_linker(&kind, input.host, &info.cfgs).map_err(|e| load_error(&e, None))?;
         linkers.push(linker.map(|it| it.display().to_string()));
@@ -344,14 +358,18 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             .manifests
             .get(id)
             .ok_or_else(|| error(format!("the package `{}` has no manifest", unit.pkg_id)))?;
-        let kind = match unit.platform.as_deref() {
-            None => 0,
-            Some(triple) if Some(triple) == input.target => 1,
-            Some(triple) if Some(triple) == input.macro_wasm => macro_kind,
-            Some(triple) => {
+        let kind = match (unit.platform.as_deref(), unit.macro_wasm) {
+            (Some(triple), true) if Some(triple) == input.macro_wasm => macro_kind,
+            (None, false) => 0,
+            (Some(triple), false) if Some(triple) == input.target => 1,
+            _ => {
                 return Err(error(format!(
-                    "the unit graph has a unit of `{}` for `{triple}` in a build for {:?}",
-                    unit.pkg_id, input.target
+                    "the unit graph has a unit of `{}` ({}) for {} in a build for {:?} whose proc macros are built for {:?}",
+                    unit.pkg_id,
+                    unit.target.name,
+                    unit.built_for(),
+                    input.target,
+                    input.macro_wasm
                 )));
             }
         };
@@ -502,7 +520,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
                 runner: Vec::new(),
                 harness: target.harness,
                 clippy: None,
-                macro_wasm: input.macro_wasm.is_some() && it.kind == macro_kind,
+                macro_wasm: unit.macro_wasm,
             }));
             continue;
         }
@@ -595,7 +613,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             },
             harness: target.harness,
             clippy,
-            macro_wasm: input.macro_wasm.is_some() && it.kind == macro_kind,
+            macro_wasm: unit.macro_wasm,
         }));
     }
 

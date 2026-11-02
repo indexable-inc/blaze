@@ -5,6 +5,16 @@ date: 2026-11-01
 ---
 # Proc macros
 
+2026-11-02 (lane pm-flip): wasm macros are the default. Every build plans each proc macro,
+and what it depends on, as the wasm macros' units (`Kind::MacroWasm`, `schema::Unit::macro_wasm`,
+under `target/wasm32-wasip1+macros/`), with no flag; `-Z wasm-macros` is accepted and does
+nothing, and there is no way back to the evaluator: a host-built proc macro reaching the daemon
+is refused naming it (`compile.rs`, `macros`). A proc macro's own tests stay the host's.
+`--target wasm32-wasip1` builds, its units and the macros' told apart by `macro_wasm` in every
+key, directory and std. Not done: the evaluator-reference tests (`tests/corpus.rs`,
+`tests/wasm.rs`, `hir-firewall/tests/real.rs`, `blaze-stencil/tests/coverage.rs`) load the
+crates of the default plan, which are now built for wasm32, with `blaze_macro_eval::load`.
+
 2026-11-02 (lane pm-wasm): `-Z wasm-macros` builds every proc-macro crate as a WASI reactor
 with the glue and runs each expansion in it; the corpus workspace's serde_derive,
 thiserror-impl, tokio-macros and corpus-macros expand in wasm, and a panicking call fails only
@@ -24,7 +34,7 @@ the store under its id and Wasmtime's (`src/wasm/code.rs`). The evaluator stays 
 and as the reference: `tests/wasm.rs` holds every serde and thiserror call of the corpus to
 the same tokens both ways. Not done: blaze building the module (a wasm32 macro kind in the unit
 graph, the crate linked as a WASI reactor with `guest/entry.rs`), so `compile.rs` loads every
-macro on the evaluator until then. The user-facing account is [docs/cargo.md](../../../../cargo.md#proc-macros-as-webassembly).
+macro on the evaluator until then. The user-facing account is [docs/cargo.md](../../../../cargo.md#proc-macros-run-as-webassembly).
 
 2026-10-30: the wasm host (`blaze-macro-wasm`), `blaze-wasi`, rust-analyzer's server
 (`proc-macro-srv`, `proc-macro-srv-cli`) and `proc-macro-api`'s client are deleted; every proc macro

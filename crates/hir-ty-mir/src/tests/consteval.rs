@@ -3804,6 +3804,32 @@ fn checked_u128_sub_without_i128_alignment() {
 /// pointer's pointee is an alias that normalizes to `dyn` (`&'static <H as Has>::Obj` in a
 /// field) or ends in one (`&Wrap<dyn Tr>`): the id is remapped to the one this evaluation
 /// gives the type, where `B` took the first id, so the call is `A`'s.
+/// A constant loaded into another evaluation whose pointee is a struct with an unsized tail
+/// (`&Wrap<dyn Tr>`, `&Wrap<[&i32]>`) has the pointers in its sized fields and in its tail (a
+/// `dyn`'s concrete value, a slice's elements) moved to where this evaluation keeps what they
+/// point to; the evaluation allocates first, so the constant's own addresses are elsewhere.
+#[test]
+fn a_loaded_constants_pointers_in_an_unsized_tail_are_its_own() {
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, dispatch_from_dyn, index, slice
+    trait Tr { fn f(&self) -> i32; }
+    struct P(&'static i32);
+    impl Tr for P { fn f(&self) -> i32 { *self.0 } }
+    struct Wrap<X: ?Sized>(&'static i32, X);
+    const WP: &Wrap<dyn Tr> = &Wrap(&5, P(&7));
+    const WS: &Wrap<[&'static i32]> = &Wrap(&1, [&2, &3]);
+    const GOAL: i32 = {
+        let pad: &[i32; 8] = &[9, 9, 9, 9, 9, 9, 9, 9];
+        let more: &[i32; 8] = &[8, 8, 8, 8, 8, 8, 8, 8];
+        *WP.0 * 10000 + WP.1.f() * 1000 + *WS.0 * 100 + *WS.1[0] * 10 + *WS.1[1]
+            + (pad[0] - 9) + (more[0] - 8)
+    };
+        "#,
+        57123,
+    );
+}
+
 #[test]
 fn a_loaded_constants_vtable_behind_an_alias_or_a_tail_is_its_own() {
     check_number(

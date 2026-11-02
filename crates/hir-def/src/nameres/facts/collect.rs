@@ -292,21 +292,6 @@ fn mod_file_head(
     }
 }
 
-/// Computes the item tree of each of `calls`' expansions as one batch of the database's tasks
-/// ([`Db::run_all`]). The results are left in the database, where the collection
-/// reads them in the round's order.
-pub(crate) fn expand_all(
-    db: &Db,
-    krate: Crate,
-    calls: &[MacroCallId],
-) {
-    if calls.len() > 1 {
-        db.run_all(Tag::Expand, calls.len(), |db, at| {
-            file_item_tree(db, calls[at].into(), krate);
-        });
-    }
-}
-
 // Round 0.
 
 #[cfg(test)]

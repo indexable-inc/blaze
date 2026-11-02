@@ -48,6 +48,7 @@ fn unit(pkg: &str, target: Target, mode: Mode, deps: &[usize]) -> Unit {
         target,
         profile: profile(),
         platform: None,
+        macro_wasm: false,
         mode,
         checked_as_test: false,
         features: vec!["default".to_owned()],
@@ -888,7 +889,9 @@ const MACROS: &[u8] = b"extern crate proc_macro;\nuse proc_macro::TokenStream;\n
 const PROC_MACRO_LIB: &[u8] = b"pub struct TokenStream;\n";
 
 /// A proc macro `m` on the standard library's `core` and `proc_macro`, lowered over files in
-/// memory: the proc macro is unit 2.
+/// memory: the proc macro is unit 2. It is built for the host, as a plan with
+/// `Spec::macro_wasm` off has it; every build plans its proc macros as wasm modules, whose
+/// roots have the bridge's glue appended (`blaze_lower::harness::wasm_macro`).
 fn lowered_proc_macro() -> blaze_lower::Lowered {
     use blaze_units::{
         query::{BuildConfig, Command, Invocation, Mount, Origin},
@@ -969,9 +972,9 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
     blaze_lower::lower(blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None }).unwrap()
 }
 
-/// A proc macro's lib builds no code: its expanders run its MIR and find its macros from its
-/// def map (`blaze_macro_eval::load`), so nothing is appended to its root, which is the file on
-/// disk itself, and the def map has each macro.
+/// A host-built proc macro's lib builds no code: its expanders run its MIR and find its macros
+/// from its def map (`blaze_macro_eval::load`), so nothing is appended to its root, which is
+/// the file on disk itself, and the def map has each macro.
 #[test]
 fn a_proc_macros_root_is_its_file_on_disk_and_its_def_map_has_its_macros() {
     let lowered = lowered_proc_macro();

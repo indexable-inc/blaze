@@ -337,6 +337,8 @@ pub enum Asked {
     Explain(Vec<OsString>),
     /// `blaze why [ITEM]`, with the words after it ([`super::observe::why`]).
     Why(Vec<OsString>),
+    /// `blaze slow`, with the words after it ([`super::observe::slow`]).
+    Slow(Vec<OsString>),
     /// `blaze pprof FILE|URL ...`, with the words after it ([`super::pprof::main`]).
     Pprof(Vec<OsString>),
     /// `blaze perf record|runs|diff ...`, with the words after it ([`super::perf::main`]).
@@ -621,6 +623,7 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("debug") => return Ok(Asked::Debug(words.collect())),
             Some("explain") => return Ok(Asked::Explain(words.collect())),
             Some("why") => return Ok(Asked::Why(words.collect())),
+            Some("slow") => return Ok(Asked::Slow(words.collect())),
             Some("pprof") => return Ok(Asked::Pprof(words.collect())),
             Some("perf") => return Ok(Asked::Perf(words.collect())),
             Some("clean") => return Ok(Asked::Clean(words.collect())),

@@ -79,6 +79,65 @@ pub struct Lower<'a, T> {
     pub host_cpu: Option<&'a HostCpu>,
 }
 
+/// The part of `now` a front end lowered from `kept` (with the same units) would read
+/// differently, by name; `None` when [`Lowered::refresh`] can move it to `now`. A front end
+/// reads the mounts, the host, the library's and the stores' paths, the checkout's root, and
+/// the process environment (the database's `ProcessEnv`, the dependency images' reads of it
+/// and the goal and item stores' modes). It never reads the command, its arguments, the
+/// working directory or cargo's config files: those only make the plan, whose units the
+/// caller compares whole, so `build` then `build --keep-going` or `-v` lowers into the same
+/// front end. Every field is named here, so a field added to [`BuildConfig`] is a decision.
+pub fn config_differs(kept: &BuildConfig, now: &BuildConfig) -> Option<String> {
+    let BuildConfig { invocation, mounts, host, library, std, builds } = kept;
+    let blaze_units::query::Invocation { command: _, args: _, root, cwd: _, env, files: _ } = invocation;
+    if mounts != &now.mounts {
+        return Some("its mounts".to_owned()); // alloc: a reason, once per front end let go
+    }
+    if host != &now.host {
+        return Some("its host".to_owned()); // alloc: a reason, once per front end let go
+    }
+    if library != &now.library {
+        return Some("where its library is named".to_owned()); // alloc: a reason, once per front end let go
+    }
+    if std != &now.std {
+        return Some("where its standard library's builds are placed".to_owned()); // alloc: a reason, once per front end let go
+    }
+    if builds != &now.builds {
+        return Some("where its build directories are placed".to_owned()); // alloc: a reason, once per front end let go
+    }
+    if root != &now.invocation.root {
+        return Some("its checkout's root".to_owned()); // alloc: a reason, once per front end let go
+    }
+    if env != &now.invocation.env {
+        // Named, never its value: a variable may hold a secret.
+        let named = first_difference(env, &now.invocation.env).unwrap_or("");
+        // alloc: a reason, once per front end let go
+        return Some(format!("its process environment (`{named}`)"));
+    }
+    None
+}
+
+/// The name of the first variable of two sorted environments that one has and the other has
+/// not, or has with another value.
+fn first_difference<'a>(a: &'a [(String, String)], b: &'a [(String, String)]) -> Option<&'a str> {
+    let (mut a, mut b) = (a.iter().peekable(), b.iter().peekable());
+    loop {
+        match (a.peek(), b.peek()) {
+            (None, None) => return None,
+            (Some((name, _)), None) | (None, Some((name, _))) => return Some(name),
+            (Some((x, u)), Some((y, v))) => match x.cmp(y) {
+                std::cmp::Ordering::Less => return Some(x),
+                std::cmp::Ordering::Greater => return Some(y),
+                std::cmp::Ordering::Equal if u != v => return Some(x),
+                std::cmp::Ordering::Equal => {
+                    a.next();
+                    b.next();
+                }
+            },
+        }
+    }
+}
+
 /// Why units could not be lowered, or a run applied: what, and the path or unit it is about.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct LowerError {
@@ -507,6 +566,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
             version: Some(package.version.clone()),
             display_name: Some(base_db::CrateDisplayName::from_canonical_name(&unit.target.name)),
             potential_cfg_options: None,
+            built_for: crates::built_for(unit.built_for()),
         };
         let env: Env = plan.env.iter().cloned().collect();
         let runs: Vec<usize> = unit

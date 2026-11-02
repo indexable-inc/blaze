@@ -44,6 +44,26 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
         false
     }
 
+    /// Whether a calling crate's calls of this macro's crate run one at a time, in the order
+    /// they expand: those of a crate that keeps a session, or whose state across calls is not
+    /// known. Other crates' calls and calls of macros not ordered still run beside them.
+    fn ordered(&self) -> bool {
+        self.requires_session()
+    }
+
+    /// Whether [`Self::speculate`] runs calls from `calling_crate`'s session as it is now: the
+    /// session ran a call in this revision and can give its state to another run. A batch asks
+    /// once the first of its calls of this crate ran.
+    fn speculates(&self, _db: &Db, _calling_crate: Crate) -> bool {
+        false
+    }
+
+    /// Runs `call` ahead of its turn, from the state `calling_crate`'s session is in now, and
+    /// keeps what it gave for [`Self::expand_in`] of the same call to take when its turn comes,
+    /// if the session is then still in that state; otherwise that call runs as it would have.
+    /// What any call gives is what it gives in order: a run ahead only saves time.
+    fn speculate(&self, _db: &Db, _calling_crate: Crate, _call: ProcMacroCall<'_>) {}
+
     /// The content ID of the library the macro is code of: what the key of a crate that
     /// uses it covers (`hir_def::deps`). `None` when it is not known, which keeps the crates
     /// that use the macro out of dependency images.
@@ -409,10 +429,71 @@ impl CustomProcMacroExpander {
 
     /// Whether this resolved macro shares mutable guest state with earlier calls.
     pub fn requires_session(self, db: &Db, def_crate: Crate) -> bool {
+        self.loaded(db, def_crate).is_some_and(|it| it.expander.requires_session())
+    }
+
+    /// The macro this names among those `def_crate` loaded, when it has one.
+    fn loaded(self, db: &Db, def_crate: Crate) -> Option<&ProcMacro> {
         ProcMacros::get_for_crate(db, def_crate)
             .and_then(|it| it.macros())
             .and_then(|it| it.get(self.proc_macro_id as usize))
-            .is_some_and(|it| it.expander.requires_session())
+    }
+
+    /// Whether a calling crate's calls of `def_crate`'s macros run one at a time, in order
+    /// ([`ProcMacroExpander::ordered`]).
+    pub fn ordered(self, db: &Db, def_crate: Crate) -> bool {
+        self.loaded(db, def_crate).is_some_and(|it| it.expander.ordered())
+    }
+
+    /// Whether calls of this macro from `calling_crate` can run ahead of their turn
+    /// ([`ProcMacroExpander::speculates`]).
+    pub fn speculates(self, db: &Db, def_crate: Crate, calling_crate: Crate) -> bool {
+        self.loaded(db, def_crate).is_some_and(|it| it.expander.speculates(db, calling_crate))
+    }
+
+    /// Runs the call ahead of its turn ([`ProcMacroExpander::speculate`]), given what
+    /// [`Self::expand`] gives it. Does nothing for a macro that is missing or disabled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn speculate(
+        self,
+        db: &Db,
+        def_crate: Crate,
+        calling_crate: Crate,
+        tt: &tt::TopSubtree,
+        attr_arg: Option<&tt::TopSubtree>,
+        def_site: Span,
+        call_site: Span,
+        mixed_site: Span,
+    ) {
+        if self.listed().is_none() {
+            return;
+        }
+        let Some(proc_macro) = self.loaded(db, def_crate) else { return };
+        let call = Self::call(db, calling_crate, tt, attr_arg, def_site, call_site, mixed_site);
+        proc_macro.expander.speculate(db, calling_crate, call);
+    }
+
+    /// What an expander is given for a call from `calling_crate`: [`Self::expand`]'s and
+    /// [`Self::speculate`]'s alike, so a run ahead is given what the call's turn gives.
+    fn call<'a>(
+        db: &'a Db,
+        calling_crate: Crate,
+        tt: &'a tt::TopSubtree,
+        attr_arg: Option<&'a tt::TopSubtree>,
+        def_site: Span,
+        call_site: Span,
+        mixed_site: Span,
+    ) -> ProcMacroCall<'a> {
+        // Proc macros have access to the environment variables of the invoking crate.
+        ProcMacroCall {
+            subtree: tt,
+            attrs: attr_arg,
+            env: calling_crate.env(db),
+            def_site,
+            call_site,
+            mixed_site,
+            current_dir: calling_crate.data(db).proc_macro_cwd.as_str(),
+        }
     }
 
     pub fn as_expand_error(&self, db: &Db, def_crate: Crate) -> Option<ExpandErrorKind> {
@@ -477,18 +558,7 @@ impl CustomProcMacroExpander {
                     }
                 };
 
-                // Proc macros have access to the environment variables of the invoking crate.
-                let env = calling_crate.env(db);
-                let call = ProcMacroCall {
-                    subtree: tt,
-                    attrs: attr_arg,
-                    env,
-                    def_site,
-                    call_site,
-                    mixed_site,
-                    current_dir: calling_crate.data(db).proc_macro_cwd.as_str(),
-                };
-
+                let call = Self::call(db, calling_crate, tt, attr_arg, def_site, call_site, mixed_site);
                 match proc_macro.expander.expand_in(db, calling_crate, call) {
                     Ok(t) => ExpandResult::ok(t),
                     Err(err) => match err {

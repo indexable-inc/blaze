@@ -1,6 +1,6 @@
 //! `redundant_clone`, `clone_on_ref_ptr`, `implicit_clone`, `unnecessary_to_owned`,
 //! `inefficient_to_string`, `format_collect` and `str_to_string` over clippy's UI test cases,
-//! each alone on the command line (`-A clippy::all -W clippy::<lint>`), with an `alloc` and a
+//! each alone on the command line (`tests::CLIPPY_OFF -W clippy::<lint>`), with an `alloc` and a
 //! `std` of the fixtures' own: minicore has `core` only.
 
 use crate::{
@@ -233,9 +233,11 @@ fn fixture(main: &str) -> String {
     format!("\n{MINICORE}//- /src/lib.rs crate:main deps:std,alloc\n{main}{ALLOC_STD}")
 }
 
-/// `lint` alone on the command line.
+/// `lint` alone on the command line: every other clippy lint off, pedantic and nursery
+/// included (`redundant_clone`, `implicit_clone`), which say true things of these fixtures that
+/// are not the tested lint's (clippy's own UI tests allow them the same way).
 fn only(lint: &str) -> String {
-    format!("-A clippy::all -W clippy::{lint}")
+    format!("{} -W clippy::{lint}", crate::tests::CLIPPY_OFF)
 }
 
 #[test]

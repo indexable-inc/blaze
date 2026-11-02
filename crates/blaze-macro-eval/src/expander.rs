@@ -15,15 +15,27 @@
 //! were left; when one holds an address, which no fresh run can be given, the session's earlier
 //! calls are run again on the same evaluator before the next one.
 //!
-//! A crate's wasm module ([`load_wasm`]) runs each expansion in a fresh instance, so it keeps
-//! no state and is stateless from its load; its expansions are kept apart from the evaluator's,
-//! under the module's id.
+//! A crate's wasm module ([`load_wasm`]) runs each expansion in a fresh instance given the
+//! statics the session's calls before it left, and says which it changed, as the evaluator
+//! does (`wasm.rs`); a static left holding an address of the heap stops the expansion, naming
+//! the static. Its expansions and its verdict are kept apart from the evaluator's, under the
+//! module's id.
 //!
-//! Whether a crate's macros keep state on the evaluator is learned, and kept in the
-//! store by the crate's code: unseen, its calls expand in a session (`requires_session`), in
-//! declaration order, and no kept expansion is used, since a hit skips a run that may have left
-//! state; once a build ran some and none left state ([`Macros::flush`]), it is stateless and its calls
-//! are found in the store; once one left state, it is stateful for good.
+//! A call is kept and found under the state it started from too: none for a call whose
+//! session's calls before it left nothing, else a digest of the statics they left, by item key
+//! and bytes ([`start_digest`]). It is kept only when it ran from that state and left it as it
+//! was, so a hit is what a run from the same state would give and leaves the session as a run
+//! would. A call after the calls before it are run again (a static holds an address) is never
+//! kept or found.
+//!
+//! Whether a crate's macros keep state is learned per engine, and kept in the store
+//! (`verdict_run`): unseen, its calls expand in a session (`requires_session`), in
+//! declaration order; once a build ran some and none left state ([`Macros::flush`]), it is
+//! stateless and its calls run in any order, each from nothing; once a call's first run changed
+//! the fresh state and none changed what a call before it left (proc-macro2's one-time
+//! `detection` is such), it settles: its calls still run in order, and after a session's
+//! first call, each is found under the state that call left; once one changed what a call
+//! before it left, it is stateful for good (`proc_macro_api::kept::verdict`).
 
 use std::{
     fmt,
@@ -46,7 +58,7 @@ use hir_expand::proc_macro::{
 };
 use intern::Symbol;
 use parking_lot::Mutex;
-use proc_macro_api::kept::verdict::{self as verdicts, STATEFUL, STATELESS, Verdict};
+use proc_macro_api::kept::verdict::{self as verdicts, Left, SETTLES, STATEFUL, STATELESS, Verdict};
 use proc_macro_api::kept::{Call, Keep, Keeping, Keeps, Mode, Put, checked, given, put, read, written};
 
 use crate::{
@@ -110,7 +122,7 @@ impl Macros {
         libraries.retain(|it| it.strong_count() != 0);
         for library in libraries.iter().filter_map(Weak::upgrade) {
             // Another build that saw one leave state may have told the store since the load.
-            if library.seen.flush() && verdict(&self.keeps, &library.loaded) == Ok(Verdict::Unseen) {
+            if library.seen.flush() && verdict(&self.keeps, &library.verdict_of) == Ok(Verdict::Unseen) {
                 tell(&library, STATELESS);
             }
         }
@@ -138,6 +150,9 @@ struct Library {
     engine: Engine,
     /// The code as it was at [`load`], which is asked again each time the crate compiles.
     loaded: ContentId,
+    /// What its verdict is kept under ([`verdict_run`]): its code on the evaluator, and its
+    /// code and module together for a wasm module, whose state is its own.
+    verdict_of: ContentId,
     code: code::Memo,
     /// What the store said of the crate's state when it was loaded, and what its expansions
     /// that ran (not found) did since.
@@ -162,8 +177,8 @@ struct KeptRoots {
 enum Engine {
     /// The MIR evaluator, through the bridge's functions in the crate's `proc_macro`.
     Evaluator(Bridge),
-    /// The crate's wasm module ([`load_wasm`]). Each expansion is a fresh instance, so the
-    /// library is stateless from its load.
+    /// The crate's wasm module ([`load_wasm`]). Each expansion is a fresh instance, given the
+    /// statics the calls before it left.
     Wasm(wasm::Library),
 }
 
@@ -171,12 +186,13 @@ enum Engine {
 /// and the next call takes them as they are.
 impl std::panic::RefUnwindSafe for Library {}
 
-/// The run a verdict of the crate whose code is `code` is kept under, in the store expansions
-/// are kept in, with nothing read. Each verdict has its own key, so neither is ever put under a
-/// key that holds the other, and a crate seen stateful by one build and stateless by another is
-/// stateful.
+/// The run a verdict of the crate whose code is `code` (its [`Library::verdict_of`]) is kept
+/// under, in the store expansions are kept in, with nothing read. Each verdict has its own key,
+/// so none is ever put under a key that holds another, and a crate seen stateful by one build
+/// and stateless by another is stateful ([`verdict`]).
 fn verdict_run(code: &ContentId, verdict: &[u8]) -> RunKey {
-    let given = blaze_ids::Hasher::new("whether a proc-macro crate on blaze's evaluator keeps state 2")
+    // 3: a change from the fresh state alone settles, no longer stateful.
+    let given = blaze_ids::Hasher::new("whether a proc-macro crate keeps state between calls 3")
         .part(verdict)
         .finish();
     RunKey { code: *code, given }
@@ -209,6 +225,9 @@ fn verdict(keeps: &Keeps, code: &ContentId) -> Result<Verdict, String> {
     if said(keeping, code, STATEFUL)? {
         return Ok(Verdict::Stateful);
     }
+    if said(keeping, code, SETTLES)? {
+        return Ok(Verdict::Settles);
+    }
     Ok(if said(keeping, code, STATELESS)? { Verdict::Stateless } else { Verdict::Unseen })
 }
 
@@ -218,7 +237,7 @@ fn tell(library: &Library, verdict: &'static [u8]) {
         return;
     }
     put(Put {
-        keep: Keep::Run { run: verdict_run(&library.loaded, verdict), traced: blaze_core::Traced::default() },
+        keep: Keep::Run { run: verdict_run(&library.verdict_of, verdict), traced: blaze_core::Traced::default() },
         value: verdict.to_vec(), // alloc: once per crate per build, a verdict
         // alloc: as above
         what: format!("the verdict of the proc macros of `{}`", library.name),
@@ -226,12 +245,13 @@ fn tell(library: &Library, verdict: &'static [u8]) {
 }
 
 impl Library {
-    /// Notes what a run did: one that left state is told the store with the run's puts. One
-    /// that left state where the store said the crate keeps none is an error: this build's
-    /// calls of it ran, or were reused, as if each started from nothing.
-    fn saw(&self, ran: &Ran) -> Result<(), ProcMacroExpansionError> {
-        let Some(contradicted) = self.seen.saw(!ran.statics.is_empty()) else { return Ok(()) };
-        tell(self, STATEFUL);
+    /// Notes what a run `left`: one that showed more state than the store said is told the
+    /// store with the run's puts. One that left state where the store said the crate keeps
+    /// none is an error: this build's calls of it ran, or were reused, as if each started from
+    /// nothing.
+    fn saw(&self, left: Left) -> Result<(), ProcMacroExpansionError> {
+        let Some((verdict, contradicted)) = self.seen.saw(left) else { return Ok(()) };
+        tell(self, verdict);
         if contradicted {
             // alloc: error path
             return Err(ProcMacroExpansionError::System(format!(
@@ -298,9 +318,74 @@ struct Session {
     holds: bool,
     /// The calls so far, while [`Session::holds`] can still become true or is.
     calls: Vec<Kept>,
+    /// The calls run in this revision, at their turn.
+    taken: usize,
+    /// Calls run ahead of their turn ([`ProcMacroExpander::speculate`]), each from the statics
+    /// it names, for its turn to take if the session is then in that state.
+    ahead: Vec<Ahead>,
+    /// Whether a call's turn found the session moved on from the state its run ahead started
+    /// in: then no call of this session runs ahead again in this revision, since each would
+    /// likely run twice.
+    serial: bool,
+}
+
+/// What a call run ahead of its turn gave: its run's result, or the panic it unwound with,
+/// which its turn unwinds with as a run at its turn would have.
+type AheadRan = Result<Result<Ran, ProcMacroExpansionError>, Box<dyn std::any::Any + Send>>; // dyn: a panic's payload, as `catch_unwind` gives it
+
+/// A call run ahead of its turn, from `preset`.
+struct Ahead {
+    this: Kept,
+    preset: Vec<(StaticId, Vec<u8>)>,
+    ran: AheadRan,
+}
+
+impl Session {
+    /// What `this`'s run ahead gave, when it ran from the statics the session has now: then
+    /// what its turn gives is what a run at its turn gives. A run ahead from other statics is
+    /// dropped, and no call of the session runs ahead again in this revision.
+    fn take_ahead(&mut self, this: &Kept) -> Option<AheadRan> {
+        if self.holds {
+            return None;
+        }
+        let at = self.ahead.iter().position(|it| it.this == *this)?;
+        let ahead = self.ahead.swap_remove(at);
+        if ahead.preset == self.statics {
+            return Some(ahead.ran);
+        }
+        self.serial = true;
+        self.ahead.clear();
+        None
+    }
+}
+
+/// The state a call ran from: after its session's calls before it run again (`replayed`), or
+/// the statics they left ([`start_digest`]).
+#[derive(Clone, Copy)]
+struct From {
+    replayed: bool,
+    start: Option<ContentId>,
+}
+
+/// A digest of the statics `statics` a session's calls left, each by its item key and its
+/// bytes, in item-key order: `None` for none, the fresh state, whose keys say no state.
+fn start_digest(db: &Db, statics: &[(StaticId, Vec<u8>)]) -> Option<ContentId> {
+    if statics.is_empty() {
+        return None;
+    }
+    // alloc: once per call with state, its statics in key order
+    let mut keyed: Vec<(blaze_items::ItemKey, &[u8])> =
+        statics.iter().map(|(id, bytes)| (blaze_items::item_key(db, blaze_items::ItemId::Static(*id)), bytes.as_slice())).collect();
+    keyed.sort_unstable_by(|a, b| a.0.0.0.cmp(&b.0.0.0));
+    let mut h = blaze_ids::Hasher::new("the statics a proc macro's session left 1");
+    for (key, bytes) in keyed {
+        h.id(&key.0).part(bytes);
+    }
+    Some(h.finish())
 }
 
 /// A call kept for running it again.
+#[derive(PartialEq)]
 struct Kept {
     function: FunctionId,
     attr: bool,
@@ -338,12 +423,7 @@ fn crate_name(db: &Db, krate: Crate) -> Box<str> {
 /// proc-macro crate, or its `proc_macro` is not the bridge blaze's server speaks. Its expansions
 /// are kept where the daemon's `macros` keeps them.
 pub fn load(db: &Db, krate: Crate, toolchain: ContentId, macros: &Arc<Macros>) -> ProcMacroLoadResult {
-    load_on(db, krate, toolchain, macros, |name, checked| {
-        let verdict = verdict(&macros.keeps, &checked.loaded)
-            // alloc: error path
-            .map_err(|why| refused(format!("the proc-macro crate `{name}`: its verdict in the store: {why}")))?;
-        Ok((Engine::Evaluator(checked.bridge), verdict))
-    })
+    load_on(db, krate, toolchain, macros, |_, checked| Ok((Engine::Evaluator(checked.bridge), checked.loaded)))
 }
 
 /// The macros of `krate`, each run in a fresh instance of `module`, the crate built by blaze
@@ -359,11 +439,16 @@ pub fn load_wasm(
     modules: &wasm::Modules,
     module: &[u8],
 ) -> ProcMacroLoadResult {
-    load_on(db, krate, toolchain, macros, |name, _| {
+    load_on(db, krate, toolchain, macros, |name, checked| {
         // alloc: error path, and once a crate the name its put says
         let what = format!("the wasm module of the proc-macro crate `{name}`");
-        let library = wasm::Library::load(modules, &macros.keeps, module, &what).map_err(|why| refused(format!("{what} {why}")))?; // alloc: error path
-        Ok((Engine::Wasm(library), Verdict::Stateless))
+        let mut library = wasm::Library::load(modules, &macros.keeps, module, &what).map_err(|why| refused(format!("{what} {why}")))?; // alloc: error path
+        library.watch(db, krate).map_err(|why| refused(format!("{what} {why}")))?; // alloc: error path
+        let verdict_of = blaze_ids::Hasher::new("the verdict of a proc-macro crate's wasm module 1")
+            .part(&checked.loaded.0)
+            .part(&library.id().0)
+            .finish();
+        Ok((Engine::Wasm(library), verdict_of))
     })
 }
 
@@ -373,14 +458,15 @@ struct Checked {
     loaded: ContentId,
 }
 
-/// [`load`] and [`load_wasm`]: the crate checked, and its macros on the engine (and the
-/// verdict of its state) `engine` makes of the crate's name and what was found of it.
+/// [`load`] and [`load_wasm`]: the crate checked, and its macros on the engine (and what its
+/// verdict is kept under, [`Library::verdict_of`]) `engine` makes of the crate's name and what
+/// was found of it.
 fn load_on(
     db: &Db,
     krate: Crate,
     toolchain: ContentId,
     macros: &Arc<Macros>,
-    engine: impl FnOnce(&str, Checked) -> Result<(Engine, Verdict), ProcMacroLoadingError>,
+    engine: impl FnOnce(&str, Checked) -> Result<(Engine, ContentId), ProcMacroLoadingError>,
 ) -> ProcMacroLoadResult {
     // alloc: once a proc-macro crate, the name its errors say
     let name = crate_name(db, krate);
@@ -394,7 +480,10 @@ fn load_on(
     let bridge = Bridge::find(db, proc_macro).map_err(|why| refused(format!("the proc-macro crate `{name}`: {why}")))?; // alloc: error path
     let code = code::Memo::default();
     let loaded = code.get(db, krate);
-    let (engine, verdict) = engine(&name, Checked { bridge, loaded })?;
+    let (engine, verdict_of) = engine(&name, Checked { bridge, loaded })?;
+    let verdict = verdict(&macros.keeps, &verdict_of)
+        // alloc: error path
+        .map_err(|why| refused(format!("the proc-macro crate `{name}`: its verdict in the store: {why}")))?;
     let library = Arc::new(Library { // alloc: once a proc-macro crate loaded
         macros: Arc::clone(macros), // clone: a refcount, once a proc-macro crate loaded
         krate,
@@ -402,6 +491,7 @@ fn load_on(
         toolchain,
         engine,
         loaded,
+        verdict_of,
         code,
         seen: verdicts::Seen::new(verdict),
         sessions: SharedMap::default(),
@@ -515,8 +605,9 @@ impl Evaluated {
     }
 
     /// Runs the call, after the session's calls before it when they must be run again, and
-    /// keeps the state it leaves in the session.
-    fn run(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) -> Result<Ran, ProcMacroExpansionError> {
+    /// keeps the state it leaves in the session: what it gave, and the state it ran from
+    /// ([`From`]).
+    fn run(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) -> Result<(Ran, From), ProcMacroExpansionError> {
         let library = &*self.library;
         let session = library.session(db, calling);
         let mut held = session.lock();
@@ -529,7 +620,25 @@ impl Evaluated {
             forced_keywords: forced_keywords(db, calling),
         };
         let stateless = held.statics.is_empty() && !held.holds;
-        let ran = if stateless {
+        held.taken += 1;
+        let from = From { replayed: held.holds, start: if held.holds { None } else { start_digest(db, &held.statics) } };
+        let ran = if let Some(ahead) = held.take_ahead(&this) {
+            // Run ahead from the statics the session has now: what a run now would give.
+            let ran = match ahead {
+                Ok(ran) => ran?,
+                Err(panic) => {
+                    drop(held);
+                    std::panic::resume_unwind(panic);
+                }
+            };
+            tracing::Span::current().record("ahead", true);
+            if ran.asked {
+                // What it asked the database of a span was read outside this query, which so
+                // depends on nothing it read: run again in the next revision.
+                blaze_query::db::report_untracked_read(db);
+            }
+            ran
+        } else if stateless {
             // Its calls run at once: the state of each is the start, which none of them change.
             drop(held);
             let ran = self.run_on(db, calling, call, &[], &[], &this);
@@ -540,11 +649,19 @@ impl Evaluated {
             let preset: &[(StaticId, Vec<u8>)] = if held.holds { &[] } else { &held.statics };
             self.run_on(db, calling, call, preset, replayed, &this)?
         };
-        library.saw(&ran)?;
+        let holds = ran.statics.iter().any(|it| it.2);
+        library.saw(match () {
+            () if ran.statics.is_empty() && !from.replayed => Left::Nothing,
+            () if stateless && !holds => Left::First,
+            () => Left::Moved,
+        })?;
         let session = &mut *held;
         if !ran.statics.is_empty() {
             session.holds |= ran.statics.iter().any(|it| it.2);
-            if !session.holds {
+            if session.holds {
+                // Its calls run again before each next one, from no preset: none runs ahead.
+                session.ahead.clear();
+            } else {
                 for (st, bytes, _) in &ran.statics {
                     match session.statics.iter_mut().find(|it| it.0 == *st) {
                         // clone: a changed static, kept for the session's next call
@@ -557,7 +674,27 @@ impl Evaluated {
         if !session.statics.is_empty() || session.holds {
             session.calls.push(this);
         }
-        Ok(ran)
+        Ok((ran, from))
+    }
+
+    /// Notes in the session of `calling` that `call`'s turn was found in the store, from the
+    /// state the session has: it left that state as it was, and is a call the session's later
+    /// ones may run after again.
+    fn found(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) {
+        let session = self.library.session(db, calling);
+        let mut held = session.lock();
+        held.taken += 1;
+        if !held.statics.is_empty() || held.holds {
+            let this = Kept {
+                function: self.function,
+                attr: self.kind == ProcMacroKind::Attr,
+                inputs: self.inputs(call),
+                sites: [call.def_site, call.call_site, call.mixed_site],
+                edition: call.call_site.anchor.file_id.edition(),
+                forced_keywords: forced_keywords(db, calling),
+            };
+            held.calls.push(this);
+        }
     }
 
     /// Runs `this` after `replayed`, from the statics `preset`.
@@ -599,8 +736,8 @@ impl Evaluated {
         let what = format!("the proc macro `{path}` for `{calling}`");
         let mut spent = run::Spent::default();
         let ran = match &library.engine {
-            Engine::Evaluator(bridge) => run::run(db, &what, bridge, call.env, preset, &expansions, &mut spent),
-            Engine::Wasm(module) => module.run(db, call.env, self.index, &expansions, &mut spent),
+            Engine::Evaluator(bridge) => run::run(db, &what, bridge, call.env, preset, call.current_dir, &expansions, &mut spent),
+            Engine::Wasm(module) => module.run(db, call.env, self.index, &expansions, preset, call.current_dir, &mut spent),
         };
         run::ran_on(span, &spent, &ran);
         // An expansion that stopped (a budget, a refused call) names what it expanded and where,
@@ -611,11 +748,62 @@ impl Evaluated {
         })
     }
 
-    /// Whether the session of `calling` starts each call from nothing.
-    fn stateless(&self, db: &Db, calling: Crate) -> bool {
+    /// Whether the session of `calling` can give its state to a run ahead of a call's turn: a
+    /// call of the session ran in this revision, no static it left holds an address (then each
+    /// call runs the earlier ones again), and no call's turn found its run ahead stale.
+    fn speculates_in(&self, db: &Db, calling: Crate) -> bool {
         let session = self.library.session(db, calling);
         let held = session.lock();
-        held.statics.is_empty() && !held.holds
+        held.taken > 0 && !held.holds && !held.serial
+    }
+
+    /// Runs `call` ahead of its turn from the statics the session of `calling` has now, and
+    /// keeps what it gave for its turn ([`Session::take_ahead`]). A panic is kept for its turn
+    /// to unwind with; a query's cancellation goes on at once, keeping nothing.
+    fn run_ahead(&self, db: &Db, calling: Crate, call: &ProcMacroCall<'_>) {
+        if !self.speculates_in(db, calling) {
+            return;
+        }
+        let session = self.library.session(db, calling);
+        // clone: the statics a run ahead starts from, once per call run ahead
+        let preset = session.lock().statics.clone();
+        let this = Kept {
+            function: self.function,
+            attr: self.kind == ProcMacroKind::Attr,
+            inputs: self.inputs(call),
+            sites: [call.def_site, call.call_site, call.mixed_site],
+            edition: call.call_site.anchor.file_id.edition(),
+            forced_keywords: forced_keywords(db, calling),
+        };
+        let _span = tracing::info_span!(
+            target: "blaze",
+            "proc macro run ahead",
+            r#macro = %MacroPath(self),
+            input = %InputItem(self.kind, call.subtree),
+        )
+        .entered();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.run_on(db, calling, call, &preset, &[], &this)
+        }));
+        let ran = match ran {
+            Err(payload) if payload.is::<blaze_query::db::Cancelled>() => std::panic::resume_unwind(payload),
+            ran => ran,
+        };
+        let mut held = session.lock();
+        // A turn already found a run ahead stale, or a static now holds an address: no turn
+        // takes this one.
+        if held.serial || held.holds {
+            return;
+        }
+        held.ahead.push(Ahead { this, preset, ran });
+    }
+
+    /// The state the session of `calling` would start its next call from: `None` when the
+    /// calls before it are run again (a static holds an address), else its [`start_digest`].
+    fn start(&self, db: &Db, calling: Crate) -> Option<Option<ContentId>> {
+        let session = self.library.session(db, calling);
+        let held = session.lock();
+        (!held.holds).then(|| start_digest(db, &held.statics))
     }
 
     /// The output of `ran`, or the error it ends in.
@@ -663,17 +851,18 @@ impl Evaluated {
                 Engine::Evaluator(_) => "evaluator",
                 Engine::Wasm(_) => "wasm",
             },
+            ahead = tracing::field::Empty,
         )
         .entered();
         let keeping: &Keeping = match &library.macros.keeps {
             Keeps::In(keeping) => keeping,
             Keeps::Nothing(why) => {
-                let ran = self.run(db, calling, &call)?;
+                let (ran, _) = self.run(db, calling, &call)?;
                 report_reads(ExpansionReads::Unknown(*why));
                 return self.output(&ran, call.call_site);
             }
         };
-        let stateless = self.stateless(db, calling);
+        let start = self.start(db, calling);
         let keyed = Call {
             name: self.name.as_str(),
             kind: self.kind,
@@ -695,13 +884,17 @@ impl Evaluated {
         if let Engine::Wasm(module) = &library.engine {
             given.part("wasm module", &module.id().0);
         }
+        // The state it starts from, when calls before it left some (the module doc).
+        if let Some(Some(digest)) = start {
+            given.part("start state", &digest.0);
+        }
         let key = RunKey { code: library.code.get(db, library.krate), given: given.finish() };
         let mut inputs = Calling::new(call.env);
         // What its key, reads and shape are written against: the calling crate's package and
         // `OUT_DIR` (`proc_macro_api::kept::roots`).
         let roots = proc_macro_api::kept::roots(call.env);
         let mut found = None;
-        if stateless && library.seen.verdict() == Verdict::Stateless {
+        if start.is_some() {
             let guard = blaze_cas::enter();
             let mut rooted = blaze_usercode::roots::Rooted::new(roots, &mut inputs);
             match index::find_reads(&keeping.expansions.store, &guard, &key, &mut rooted) {
@@ -722,6 +915,7 @@ impl Evaluated {
                     match keeping.mode {
                         Mode::Keep => {
                             let output = read(value, &spans).map_err(|why| system(format_args!("{}: {why}", self.what())))?;
+                            self.found(db, calling, &call);
                             report_reads(reads);
                             return Ok(output);
                         }
@@ -746,7 +940,7 @@ impl Evaluated {
                 }
             }
         }
-        let ran = self.run(db, calling, &call)?;
+        let (ran, from) = self.run(db, calling, &call)?;
         let output = self.output(&ran, call.call_site)?;
         let bytes = written(&output, &spans);
         // A check that found a value verified across checkouts expanding otherwise: the
@@ -787,8 +981,10 @@ impl Evaluated {
             unknown("it asked the database");
             return done(output);
         }
-        if !stateless || !ran.statics.is_empty() || library.seen.verdict() == Verdict::Stateful {
-            unknown("it ran with state its calls before it left");
+        // Kept only from the state its key says, left as it was: a hit then gives what a run
+        // gives and leaves the session as the run would.
+        if from.replayed || !ran.statics.is_empty() || start != Some(from.start) {
+            unknown("it ran after its calls before it, or changed the state they left");
             return done(output);
         }
         if !ran.emitted.is_empty() {
@@ -875,6 +1071,22 @@ impl Evaluated {
 impl ProcMacroExpander for Evaluated {
     fn requires_session(&self) -> bool {
         self.library.seen.verdict() != Verdict::Stateless
+    }
+
+    /// The calls of a crate whose state is not known, settles or is kept run at their turns,
+    /// on either engine.
+    fn ordered(&self) -> bool {
+        self.requires_session()
+    }
+
+    fn speculates(&self, db: &Db, calling_crate: Crate) -> bool {
+        self.requires_session() && self.speculates_in(db, calling_crate)
+    }
+
+    fn speculate(&self, db: &Db, calling_crate: Crate, call: ProcMacroCall<'_>) {
+        if self.requires_session() {
+            self.run_ahead(db, calling_crate, &call);
+        }
     }
 
     fn code(&self) -> Option<ContentId> {

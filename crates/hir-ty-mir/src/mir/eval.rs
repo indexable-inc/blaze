@@ -4189,6 +4189,76 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         Ok((start, (layout.align.bytes() as usize).max(field_align)))
     }
 
+    /// The parts of a value of `ty`, a struct or tuple with an unsized tail whose pointer's
+    /// metadata is `meta`, each as `(offset, type, count)`: the sized fields of `ty` and of
+    /// each struct in its chain of last fields, a slice tail's elements (`count` of them,
+    /// one after another; none when they hold no pointer), and a `dyn` tail's concrete value,
+    /// placed by `hir_ty::layout::dyn_tail_place`, the one rule codegen and code identity use.
+    /// Building a constant's memory map and patching its addresses walk these.
+    fn unsized_parts(
+        &self,
+        ty: Ty<'db>,
+        meta: &[u8],
+    ) -> Result<'db, SmallVec<[(usize, Ty<'db>, usize); 4]>> {
+        // A chain of last fields deeper than this is a type no program lays out.
+        const FUEL: usize = 256;
+        let mut parts = SmallVec::new();
+        let (mut base, mut at) = (0, ty);
+        for _ in 0..FUEL {
+            let Some(last) = self.last_field(at)? else { return Ok(parts) };
+            let layout = self.layout(at)?;
+            let sized: SmallVec<[Ty<'db>; 4]> = match at.kind() {
+                TyKind::Adt(adt, subst) => {
+                    let AdtId::StructId(id) = adt.def_id() else { return Ok(parts) };
+                    let field_types = self.db.field_types(id.into());
+                    (field_types.iter().take(last.index))
+                        .map(|(_, it)| it.ty().instantiate(self.interner(), subst).skip_norm_wip())
+                        .collect()
+                }
+                TyKind::Tuple(tys) => tys.iter().take(last.index).collect(),
+                _ => return Ok(parts),
+            };
+            for (i, field) in sized.into_iter().enumerate() {
+                let field = self.normalized(field, "a field of a constant's struct")?;
+                parts.push((base + layout.fields.offset(i).bytes_usize(), field, 1));
+            }
+            let Some((_, align)) = self.size_align_of_tail(last.ty, meta)? else {
+                return Ok(parts);
+            };
+            let (offset, _) = self.tail_offset(at, &last, align)?;
+            match last.ty.kind() {
+                TyKind::Slice(elem) => {
+                    if !self.holds_no_pointer(elem) {
+                        let len = from_bytes!(usize, self.cached_ptr_size, meta);
+                        parts.push((base + offset, elem, len));
+                    }
+                    return Ok(parts);
+                }
+                TyKind::Dynamic(..) => {
+                    let concrete = self.vtable_map.ty_of_bytes(meta)?;
+                    let align = self.layout(concrete)?.align.abi.bytes_usize();
+                    let place = crate::layout::dyn_tail_place(
+                        self.db,
+                        ty,
+                        align,
+                        |it| self.normalized(it, "a field of a constant's struct"),
+                        |it| self.layout(it).map(|it| &it.get().0),
+                    )?;
+                    if let Some((offset, _)) = place {
+                        parts.push((offset, concrete, 1));
+                    }
+                    return Ok(parts);
+                }
+                TyKind::Adt(..) | TyKind::Tuple(..) => {
+                    base += offset;
+                    at = last.ty;
+                }
+                _ => return Ok(parts),
+            }
+        }
+        Err(MirEvalError::StackOverflow)
+    }
+
     /// `ty` normalized when it is an alias (a field's `<T as Tr>::Obj`), as its size, layout or
     /// kind is read; one that does not normalize is an error naming `what` it is.
     fn normalized(&self, ty: Ty<'db>, what: &str) -> Result<'db, Ty<'db>> {
@@ -4639,8 +4709,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                     mm.memory.insert(addr.to_usize(this.cached_ptr_size), b);
                                     this.note_align(mm, addr.to_usize(this.cached_ptr_size));
                                     let depth = stack_depth_limit - 1;
-                                    unsized_fields(this, b, t, meta, locals, mm, depth)?;
-                                    dyn_tail(this, b, t, meta, locals, mm, depth)?;
+                                    for (offset, part, count) in this.unsized_parts(t, meta)? {
+                                        let size = this.size_of_sized(part, locals, "a part of an unsized value")?;
+                                        // Elements that take no room may be `usize::MAX` in number.
+                                        if size == 0 {
+                                            continue;
+                                        }
+                                        for i in 0..count {
+                                            let at = offset + i * size;
+                                            let Some(bytes) = b.get(at..at + size) else { break };
+                                            rec(this, bytes, part, locals, mm, depth)?;
+                                        }
+                                    }
                                 }
                                 return Ok(());
                             }
@@ -4830,95 +4910,6 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             Ok(())
         }
-        /// Follows the fields of `ty`, a struct or tuple with an unsized tail at `bytes` whose
-        /// pointer's metadata is `meta`: the tail starts where the sized fields end, at its own
-        /// alignment capped by `packed`, as [`Evaluator::tail_offset`] places it.
-        fn unsized_fields<'db, M: Machine<'db>>(
-            this: &Evaluator<'db, M>,
-            bytes: &[u8],
-            ty: Ty<'db>,
-            meta: &[u8],
-            locals: &Locals<'db>,
-            mm: &mut ComplexMemoryMap<'db>,
-            stack_depth_limit: usize,
-        ) -> Result<'db, ()> {
-            if stack_depth_limit.checked_sub(1).is_none() {
-                return Err(MirEvalError::StackOverflow);
-            }
-            let depth = stack_depth_limit - 1;
-            let Some(last) = this.last_field(ty)? else { return Ok(()) };
-            let layout = this.layout(ty)?;
-            // The sized fields, where the layout puts them.
-            let sized: SmallVec<[Ty<'db>; 4]> = match ty.kind() {
-                TyKind::Adt(adt, subst) => {
-                    let AdtId::StructId(id) = adt.def_id() else { return Ok(()) };
-                    let field_types = this.db.field_types(id.into());
-                    (field_types.iter().take(last.index))
-                        .map(|(_, it)| it.ty().instantiate(this.interner(), subst).skip_norm_wip())
-                        .collect()
-                }
-                TyKind::Tuple(tys) => tys.iter().take(last.index).collect(),
-                _ => return Ok(()),
-            };
-            for (i, field) in sized.into_iter().enumerate() {
-                let field = this.normalized(field, "a field of a constant's struct")?;
-                let offset = layout.fields.offset(i).bytes_usize();
-                let size = this.layout(field)?.size.bytes_usize();
-                let Some(bytes) = bytes.get(offset..offset + size) else { continue };
-                rec(this, bytes, field, locals, mm, depth)?;
-            }
-            let Some((size, align)) = this.size_align_of_tail(last.ty, meta)? else {
-                return Ok(());
-            };
-            let (offset, _) = this.tail_offset(ty, &last, align)?;
-            let Some(tail) = bytes.get(offset..offset + size) else { return Ok(()) };
-            match last.ty.kind() {
-                // `dyn_tail` walks a `dyn`'s concrete value, where code identity and the code
-                // generator find it.
-                TyKind::Slice(elem) if !this.holds_no_pointer(elem) => {
-                    let size = this.size_of_sized(elem, locals, "slice inner type")?;
-                    if size > 0 {
-                        for element in tail.chunks_exact(size) {
-                            rec(this, element, elem, locals, mm, depth)?;
-                        }
-                    }
-                }
-                TyKind::Adt(..) | TyKind::Tuple(..) => {
-                    unsized_fields(this, tail, last.ty, meta, locals, mm, depth)?
-                }
-                _ => (),
-            }
-            Ok(())
-        }
-        /// Follows the pointers in the concrete value of the `dyn` at the end of `ty`'s chain
-        /// of last fields, in `bytes`, a value of `ty` whose metadata is `meta`: placed by
-        /// `hir_ty::layout::dyn_tail_place`, the one rule codegen and code identity use too.
-        fn dyn_tail<'db, M: Machine<'db>>(
-            this: &Evaluator<'db, M>,
-            bytes: &[u8],
-            ty: Ty<'db>,
-            meta: &[u8],
-            locals: &Locals<'db>,
-            mm: &mut ComplexMemoryMap<'db>,
-            depth: usize,
-        ) -> Result<'db, ()> {
-            if !matches!(this.struct_tail(ty)?.kind(), TyKind::Dynamic(..)) {
-                return Ok(());
-            }
-            let concrete = this.vtable_map.ty_of_bytes(meta)?;
-            let layout = this.layout(concrete)?;
-            let (size, align) = (layout.size.bytes_usize(), layout.align.abi.bytes_usize());
-            let place = crate::layout::dyn_tail_place(
-                this.db,
-                ty,
-                align,
-                |it| this.normalized(it, "a field of a constant's struct"),
-                |it| this.layout(it).map(|it| &it.get().0),
-            )?;
-            let Some((offset, _)) = place else { return Ok(()) };
-            let Some(tail) = bytes.get(offset..offset + size) else { return Ok(()) };
-            rec(this, tail, concrete, locals, mm, depth)
-        }
         /// Keeps the whole allocation `addr` is in, the type of which a raw pointer does not
         /// say, and what every word of it that is in another allocation or a static points
         /// to: the reader of the map takes each such word to be a pointer, as it is in a
@@ -5066,6 +5057,26 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 concrete,
                                 locals,
                             )?;
+                        } else if let TyKind::Adt(..) | TyKind::Tuple(..) = t.kind() {
+                            // A struct or tuple with an unsized tail: its sized fields and its
+                            // tail's (a slice's elements, a `dyn`'s concrete value), where
+                            // building the memory map found them.
+                            for (offset, part, count) in self.unsized_parts(t, &metadata)? {
+                                let size = self.size_of_sized(part, locals, "a part of an unsized value to patch")?;
+                                if size == 0 {
+                                    continue;
+                                }
+                                for i in 0..count {
+                                    self.patch_addresses(
+                                        patch_map,
+                                        source,
+                                        ty_of_bytes,
+                                        patched.offset(offset + i * size),
+                                        part,
+                                        locals,
+                                    )?;
+                                }
+                            }
                         } else if let TyKind::Slice(inner) = t.kind() {
                             let len = from_bytes!(usize, self.cached_ptr_size, metadata);
                             let size = self.size_of_sized(inner, locals, "slice item to patch")?;

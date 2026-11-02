@@ -23,14 +23,17 @@ mod load;
 #[path = "corpus/record.rs"]
 mod record;
 
-use std::sync::OnceLock;
+use std::{
+    sync::{Arc, OnceLock, atomic::Ordering},
+    time::Instant,
+};
 
 use base_db::Crate;
 use hir_def::nameres::{crate_def_map, diagnostics::DefDiagnosticKind};
 use hir_expand::proc_macro::{ProcMacro, ProcMacroKind};
 
 use config::Corpus;
-use record::{Outcome, Record, Recorder};
+use record::{Ahead, Outcome, Record, Recorder};
 
 /// Every call of the workspace's two calling crates, in the order the front end made them.
 struct Expanded {
@@ -50,11 +53,17 @@ fn expanded() -> &'static Expanded {
 }
 
 fn expand() -> Result<Expanded, String> {
+    expand_with(&Ahead::On(Arc::default()))
+}
+
+/// The workspace's calls expanded, each ordered call run ahead of its turn or not as `ahead`
+/// says.
+fn expand_with(ahead: &Ahead) -> Result<Expanded, String> {
     let config = Corpus::read()?;
     let records = record::Records::default();
     let keeping = blaze_macro_eval::Macros::nothing("the corpus compares each expansion that runs, so none is kept");
     let workspace = load::lower(&config.workspace, &config.cargo_home, config.homes(), &keeping, |krate, macros| {
-        Ok(wrap(krate, macros, &records))
+        Ok(wrap(krate, macros, &records, ahead))
     })?;
     let calls = workspace.krate("corpus-calls")?;
     let panics = workspace.krate("corpus-panics")?;
@@ -71,8 +80,8 @@ fn expand() -> Result<Expanded, String> {
 }
 
 /// Each of blaze-macro-eval's macros of crate `krate`, recording its calls.
-fn wrap(krate: &str, macros: Vec<ProcMacro>, records: &record::Records) -> Vec<ProcMacro> {
-    macros.into_iter().map(|eval| Recorder::wrap(krate, eval, records)).collect()
+fn wrap(krate: &str, macros: Vec<ProcMacro>, records: &record::Records, ahead: &Ahead) -> Vec<ProcMacro> {
+    macros.into_iter().map(|eval| Recorder::wrap_ahead(krate, eval, records, ahead.clone())).collect()
 }
 
 /// The calls of macro `name` of crate `krate` from crate `calling`.
@@ -134,6 +143,9 @@ const COVERED: &[(&str, &str, &str)] = &[
     ("corpus_macros", "env_name", "PACKAGE"),
     ("corpus_state", "counter", "FIRST"),
     ("corpus_state", "counter", "SECOND"),
+    ("corpus_state", "counter", "THIRD"),
+    ("corpus_state", "counter", "FOURTH"),
+    ("corpus_state", "counter", "FIFTH"),
 ];
 
 /// The longest a serde derive of the corpus may take on the evaluator: past it, the
@@ -178,6 +190,10 @@ fn a_panic_is_its_message() {
     let tokio: Vec<&Record> = calls_of("tokio_macros", "select_priv_declare_output_enum", panics).collect();
     let expected = [(boom.first(), "boom: 0 tokens"), (boom.last(), "boom: 3 tokens"), (tokio.first(), "unexpected macro input")];
     assert_eq!((boom.len(), tokio.len()), (2, 1), "corpus-panics makes two calls of `boom` and one of tokio's");
+    // The calls of the same crate around them expand: a panic fails its own call alone.
+    for subject in ["before", "between", "after", "last"] {
+        output(call_on("corpus_macros", "make_fn", panics, subject));
+    }
     for (record, message) in expected {
         let record = record.expect("counted above");
         match &record.eval {
@@ -195,8 +211,58 @@ fn a_static_counts_calls_in_rustcs_order() {
     let counted: Vec<(String, Vec<String>)> = calls_of("corpus_state", "counter", calls)
         .map(|it| (it.call.subject().unwrap_or_default(), record::literals(output(it))))
         .collect();
-    let expected = [("FIRST".to_owned(), vec!["0".to_owned()]), ("SECOND".to_owned(), vec!["1".to_owned()])];
-    assert_eq!(counted, expected, "`counter!` is called once for each, in the order rustc expands them");
+    let expected: Vec<(String, Vec<String>)> = ["FIRST", "SECOND", "THIRD", "FOURTH", "FIFTH"]
+        .iter()
+        .enumerate()
+        .map(|(n, name)| (name.to_string(), vec![n.to_string()]))
+        .collect();
+    assert_eq!(
+        counted, expected,
+        "`counter!` is called once for each, in the order rustc expands them, its calls after the \
+         first run ahead from the state the first left and taken only while that is the state"
+    );
+}
+
+/// The workspace expanded with each ordered call run ahead of its turn, as a build does, and
+/// with each run at its turn alone: every call gives the same tokens, byte for byte, the
+/// stateful counter's included, and the panics are the same. Says the time each took.
+#[test]
+#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]
+fn runs_ahead_give_what_turns_give() {
+    let text = |expanded: &Expanded| -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = expanded
+            .records
+            .iter()
+            .map(|it| {
+                let said = match &it.eval {
+                    Outcome::Expanded(tree) => format!("expanded {tree}"),
+                    Outcome::Panicked(message) => format!("panicked {message}"),
+                    Outcome::Failed(why) => format!("failed {why}"),
+                };
+                (format!("{} at {:?}", it.what(), it.call.call_site), said)
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    let count = Arc::default();
+    let started = Instant::now();
+    let ahead = expand_with(&Ahead::On(Arc::clone(&count))).unwrap_or_else(|why| panic!("{why}"));
+    let ahead_took = started.elapsed();
+    let started = Instant::now();
+    let turns = expand_with(&Ahead::Off).unwrap_or_else(|why| panic!("{why}"));
+    let turns_took = started.elapsed();
+    let ran_ahead = count.load(Ordering::Relaxed);
+    let busy = |expanded: &Expanded| expanded.records.iter().map(|it| it.took).sum::<std::time::Duration>();
+    eprintln!(
+        "{} calls; runs ahead: {ran_ahead}, wall {ahead_took:?}, the calls' turns {:?}; at their turns alone: \
+         wall {turns_took:?}, the calls' turns {:?}",
+        ahead.records.len(),
+        busy(&ahead),
+        busy(&turns),
+    );
+    assert!(ran_ahead > 0, "no call ran ahead of its turn");
+    assert_eq!(text(&ahead), text(&turns), "a call run ahead of its turn gave other than at its turn");
 }
 
 #[test]

@@ -13,7 +13,7 @@ use base_db::{
 };
 use blaze_units::{
     query::{PackagePlan, UnitPlan, Units},
-    schema::{Mode, Unit, UnitDep},
+    schema::{BuiltFor, Mode, Unit, UnitDep},
     stdlib::target::{self, CfgArgs, HostCpu},
 };
 use cfg::{CfgAtom, CfgOptions};
@@ -34,7 +34,7 @@ pub(crate) fn describe(package: &PackagePlan, unit: &Unit) -> String {
         Mode::Docscrape => " docscrape",
         Mode::RunCustomBuild => " run",
     };
-    let platform = unit.platform.as_deref().unwrap_or("the host");
+    let platform = unit.built_for();
     format!(
         "`{}` ({}{mode} for {platform}) of {} v{}",
         unit.target.name,
@@ -307,6 +307,15 @@ pub(crate) fn edition(unit: &Unit, what: &str) -> Result<Edition, LowerError> {
     unit.target.edition.parse::<Edition>().map_err(|_| {
         LowerError::at(format!("{what} has edition `{}`, which blaze does not know", unit.target.edition), what)
     })
+}
+
+/// The front end's form of what a unit is built for ([`Unit::built_for`], the source of truth),
+/// as cargo's units tell two builds of one package apart (the host, a target triple or the wasm
+/// proc macros): two crates alike but for this are two, and their keys say so. The one
+/// conversion from `blaze_units::schema::BuiltFor` to `base_db::BuiltFor`: every crate the
+/// lowering makes is given it from here.
+pub(crate) fn built_for(of: BuiltFor<'_>) -> base_db::BuiltFor {
+    base_db::BuiltFor { platform: of.platform.map(Symbol::intern), macro_wasm: of.macro_wasm }
 }
 
 /// The standard library's crates are the language's, path packages local, the rest libraries.

@@ -55,6 +55,7 @@
 //!     int_impl: size_of, transmute
 //!     iterator: option
 //!     iterators: iterator, fn
+//!     iterators_more: iterators, clone
 //!     manually_drop: drop
 //!     matches:
 //!     mul:
@@ -2061,8 +2062,54 @@ pub mod iter {
                 loop {}
             }
         }
+
+        // region:iterators_more
+        pub struct Cloned<I> {
+            it: I,
+        }
+        impl<'a, I, T: 'a> Iterator for Cloned<I>
+        where
+            I: Iterator<Item = &'a T>,
+            T: crate::clone::Clone,
+        {
+            type Item = T;
+
+            fn next(&mut self) -> Option<T> {
+                loop {}
+            }
+        }
+
+        pub struct Skip<I> {
+            iter: I,
+            n: usize,
+        }
+        impl<I: Iterator> Iterator for Skip<I> {
+            type Item = I::Item;
+
+            fn next(&mut self) -> Option<I::Item> {
+                loop {}
+            }
+        }
+
+        pub struct Flatten<I> {
+            iter: I,
+        }
+        impl<I: Iterator> Iterator for Flatten<I>
+        where
+            I::Item: crate::iter::IntoIterator,
+        {
+            type Item = <I::Item as crate::iter::IntoIterator>::Item;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                loop {}
+            }
+        }
+        // endregion:iterators_more
     }
     pub use self::adapters::{Filter, FilterMap, Map, Take};
+    // region:iterators_more
+    pub use self::adapters::{Cloned, Flatten, Skip};
+    // endregion:iterators_more
 
     mod sources {
         mod repeat {
@@ -2149,6 +2196,47 @@ pub mod iter {
                 {
                     loop {}
                 }
+                // region:iterators_more
+                fn count(self) -> usize
+                where
+                    Self: Sized,
+                {
+                    loop {}
+                }
+                fn last(self) -> Option<Self::Item>
+                where
+                    Self: Sized,
+                {
+                    loop {}
+                }
+                fn skip(self, n: usize) -> crate::iter::Skip<Self>
+                where
+                    Self: Sized,
+                {
+                    loop {}
+                }
+                fn find<P>(&mut self, predicate: P) -> Option<Self::Item>
+                where
+                    Self: Sized,
+                    P: FnMut(&Self::Item) -> bool,
+                {
+                    loop {}
+                }
+                fn flatten(self) -> crate::iter::Flatten<Self>
+                where
+                    Self: Sized,
+                    Self::Item: crate::iter::IntoIterator,
+                {
+                    loop {}
+                }
+                fn cloned<'a, T>(self) -> crate::iter::Cloned<Self>
+                where
+                    T: 'a + crate::clone::Clone,
+                    Self: Sized + Iterator<Item = &'a T>,
+                {
+                    loop {}
+                }
+                // endregion:iterators_more
                 // endregion:iterators
             }
             impl<I: Iterator + PointeeSized> Iterator for &mut I {

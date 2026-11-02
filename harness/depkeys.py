@@ -5,24 +5,24 @@
 A crate of a registry is the same source wherever it is built, but not the same code: its
 features, the cfgs and variables its build script sets and the files the script writes differ
 between checkouts that share one store (the default) and between runs of the script, as a
-change to the sandbox reruns it. A program on such a crate is built with nothing of rustc's on
-an empty store; each case changes one of those and builds again on a copy of the store the first
-build filled: the program has to print what cargo's build of it does after the change, and the
-second build of `nothing` has to compile nothing the first kept.
+change to the sandbox reruns it. A program on such a crate is built once into a store; each case
+changes one of those and builds again, with a daemon of its own on a copy of that store. The
+program has to print what the case says it prints, the same as a build of it in an empty home
+(rebuild.py's `Project.check`), and the second build of `nothing` has to compile nothing (every
+artifact `fresh`).
 
 usage: depkeys.py '{}'
        depkeys.py '{"cases": ["a feature"]}'
 
 The input is one JSON object (inline, the path of a file, or `-` for standard input), an Input
 below; a field it does not have is refused. `cases` picks the cases whose names contain any of
-its strings (all of them when there are none). Linux: the programs blaze links with nothing of
-rustc's are Linux's so far.
+its strings (all of them when there are none). BLAZE_BIN names the blaze under test
+(blaze_cli.BLAZE).
 """
 
 import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from allblaze import blaze, linked, outcome, run
+from rebuild import Project
 from storelib import scratch
 from typed_input import fail, parse
 
@@ -109,13 +109,16 @@ def setenv(name, value):
     return lambda ws, env: env.__setitem__(name, value)
 
 
-# (name, the change)
+# What the program prints before any change.
+BEFORE = "plain unset unset 11"
+
+# (name, the change, what the program prints after it)
 CASES = [
-    ("nothing", lambda ws, env: None),
-    ("a feature of a dependency", features),
-    ("a cfg a dependency's build script sets", setenv("DEPKEYS_CFG", "1")),
-    ("a variable a dependency's build script sets", setenv("DEPKEYS_ENV", "other")),
-    ("a file a dependency's build script writes", setenv("DEPKEYS_GEN", "12")),
+    ("nothing", lambda ws, env: None, BEFORE),
+    ("a feature of a dependency", features, "extra unset unset 11"),
+    ("a cfg a dependency's build script sets", setenv("DEPKEYS_CFG", "1"), "plain set unset 11"),
+    ("a variable a dependency's build script sets", setenv("DEPKEYS_ENV", "other"), "plain unset other 11"),
+    ("a file a dependency's build script writes", setenv("DEPKEYS_GEN", "12"), "plain unset unset 12"),
 ]
 
 
@@ -151,18 +154,32 @@ def checkout(at, config):
     write(os.path.join(at, "src/main.rs"), APP_MAIN)
 
 
-def build(ws, work, env):
-    """What cargo's program prints, what blaze's does, and the entries blaze found and added."""
-    target = os.path.join(work, "cargo-target")
-    run(["cargo", "build", "-q", "--target-dir", target], ws, "cargo build", env)
-    want = outcome(os.path.join(target, "debug/app"), [], ws)
-    obj, binary = os.path.join(work, "app.o"), os.path.join(work, "app.bin")
-    ran, _ = blaze(ws, ["app"], obj, "--exe", binary, env=env)
-    linked(ran, "blaze")
-    counted = re.findall(r"entries: (\d+) found, (\d+) added", ran.stderr)
-    found = sum(int(it[0]) for it in counted)
-    added = sum(int(it[1]) for it in counted)
-    return want, outcome(binary, [], ws), found, added
+def compiled(said):
+    """The targets a `blaze build --message-format=json` compiled rather than took as built."""
+    names = []
+    for line in said.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("reason") == "compiler-artifact" and message.get("fresh") is False:
+            names.append(message.get("target", {}).get("name", "?"))
+    return names
+
+
+def build(ws, work, home, env, name):
+    """The verdict of a build of `app` by a daemon of `home` held to a fresh one, what the program
+    printed, and the targets it compiled. The daemon is stopped after, so its store is whole."""
+    project = Project(ws, work, env=env, home=home, name=name)
+    try:
+        built = project.build("app")
+        verdict, said = project.held(built, "app")
+        printed = project.ran(built)[1].strip() if built.status == 0 and built.executable else None
+        return verdict, said, printed, compiled(built.said)
+    finally:
+        project.stop()
 
 
 def main():
@@ -171,39 +188,37 @@ def main():
             it = parse(Input, text, SCRIPT)
         case _:
             fail(SCRIPT, f"usage: {SCRIPT} JSON (see the top of the file)")
-    if unknown := [case for case in it.cases if not any(case in name for name, _ in CASES)]:
+    if unknown := [case for case in it.cases if not any(case in name for name, _, _ in CASES)]:
         fail(SCRIPT, f"cases: {unknown} is in the name of no case")
-    if not sys.platform.startswith("linux"):
-        print("not run: the programs blaze links with nothing of rustc's are Linux's so far")
-        return
     work = scratch("blaze-depkeys-")
     config = registry(work)
-    ws, home, filled = (os.path.join(work, name) for name in ("app", "home", "filled"))
+    ws, cargo_home, filled = (os.path.join(work, name) for name in ("app", "cargo-home", "filled"))
     # The first build once: each case starts from a copy of the store it filled.
     checkout(ws, config)
-    before, got, _, _ = build(ws, work, {"CARGO_HOME": home, "BLAZE_CACHE": filled})
-    if got != before:
-        print(f"DIFFERENT the first build: cargo's prints {before[1]!r}, blaze's {got[1]!r}")
+    verdict, said, printed, _ = build(ws, os.path.join(work, "first"), filled, {"CARGO_HOME": cargo_home}, "first")
+    if verdict != "same" or printed != BEFORE:
+        print(f"WRONG the first build: {verdict}, printed {printed!r}, not {BEFORE!r}\n{said}")
         sys.exit(1)
     wrong = 0
-    chosen = [(name, change) for name, change in CASES if not it.cases or any(case in name for case in it.cases)]
-    for number, (name, change) in enumerate(chosen, 1):
-        store = os.path.join(work, f"store-{number}")
-        shutil.copytree(filled, store)
+    chosen = [case for case in CASES if not it.cases or any(name in case[0] for name in it.cases)]
+    for number, (name, change, want) in enumerate(chosen, 1):
+        home = os.path.join(work, f"home-{number}")
+        shutil.copytree(filled, home)
+        # What the case's build reuses comes from the store alone.
+        shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
         checkout(ws, config)
-        env = {"CARGO_HOME": home, "BLAZE_CACHE": store}
+        env = {"CARGO_HOME": cargo_home}
         change(ws, env)
-        want, got, found, added = build(ws, work, env)
+        verdict, said, printed, rebuilt = build(ws, os.path.join(work, f"case-{number}"), home, env, f"case-{number}")
         problems = []
-        if got != want:
-            problems.append(f"the second build differs: cargo's prints {want[1]!r}, blaze's {got[1]!r}")
-        if name == "nothing":
-            if added:
-                problems.append(f"the second build compiled {added} entries the first kept")
-        elif want == before:
-            problems.append("cargo's program is the same after the change")
+        if verdict != "same":
+            problems.append(f"{verdict}: {said}")
+        if printed != want:
+            problems.append(f"the program printed {printed!r}, not {want!r}")
+        if name == "nothing" and rebuilt:
+            problems.append(f"the second build compiled {', '.join(rebuilt)}, which the first kept")
         wrong += bool(problems)
-        print(f"{'same     ' if not problems else 'DIFFERENT'} {name}: {found} entries found, {added} added", flush=True)
+        print(f"{'same     ' if not problems else 'DIFFERENT'} {name}: compiled {len(rebuilt)} targets", flush=True)
         for problem in problems:
             print(f"    {problem}")
     print(f"{len(chosen) - wrong} of {len(chosen)} right; {work}")

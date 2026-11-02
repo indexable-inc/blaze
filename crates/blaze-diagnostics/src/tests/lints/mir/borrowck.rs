@@ -491,25 +491,3 @@ LL |     let a130 = wrap(a129);
    = help: consider increasing the recursion limit by adding a `#![recursion_limit = "256"]` attribute to your crate (`main`)"#
     );
 }
-
-#[test]
-fn zz_dropck_real_files() {
-    for (name, path) in [("param140.rs", "/tmp/blaze-lanes/v2-quadratic/param140.rs"), ("ident.rs", "/tmp/blaze-lanes/v2-quadratic/ident_2000_50.rs")] {
-        let text = std::fs::read_to_string(path).unwrap();
-        for raised in [false, true] {
-            let source = match raised {
-                true => format!("#![recursion_limit = \"4096\"]\n{text}\nfn main() {{}}\n"),
-                false => format!("{text}\nfn main() {{}}\n"),
-            };
-            let start = std::time::Instant::now();
-            let found = errors(Some("sized, option"), &source);
-            let e0320: Vec<&String> = found.iter().filter(|it| it.starts_with("E0320")).collect();
-            eprintln!("ZZ {name} raised={raised}: {} errors, {} E0320 in {:?}", found.len(), e0320.len(), start.elapsed());
-            for it in found.iter().filter(|it| !it.starts_with("E0320")) { eprintln!("ZZ   other: {}", &it[..it.len().min(200)]); }
-            let lines: Vec<String> = e0320.iter().map(|it| it.split(' ').nth(1).unwrap().to_owned()).collect();
-            eprintln!("ZZ   at: {}", lines.join(" "));
-            let owners: std::collections::BTreeSet<String> = e0320.iter().filter_map(|it| it.split(" in `").nth(1).map(|it| it.split('`').next().unwrap().to_owned())).collect();
-            eprintln!("ZZ   owners: {owners:?}");
-        }
-    }
-}

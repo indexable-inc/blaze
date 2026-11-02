@@ -19,14 +19,16 @@ workspace is keyed by its features, by whether it is of a package named, `CARGO_
 and by the keys of the crates it is built on), and the tests job takes those from the store the build job hands it
 (.github/workflows/blaze-platform.yaml). Only the crates built with `cfg(test)` are then compiled
 again. Each line of
-the run is passed on as it comes, so a CI log shows a slow build while it is slow. A failing test that is not in OPEN fails the run, and so does a test in
-OPEN that passes or no longer exists: take it out; so does the cargo run failing before any of
-its tests failed. `blaze-diagnostics` is the daemon's errors (its diagnostics are the verdict).
-`hir-ty-mir` has rust-analyzer's type inference tests; the ones in OPEN are what the
-fork does differently from upstream that its expectations have not caught up with.
+the run is passed on as it comes, so a CI log shows a slow build while it is slow. The run's
+output is kept in `target/known-failures/unittests.log` and held to harness/known-failures.toml
+by harness/failures.py: a failing test that is not listed there fails the run, and so does a
+listed test that passes or no longer exists (take it out), and a test binary that does not
+finish; so does the cargo run failing before any of its tests failed. Each listed failure has an
+owner and a cause. `blaze-diagnostics` is the daemon's errors (its diagnostics are the verdict).
 """
 import dataclasses, json, os, re, shutil, signal, subprocess, sys, threading, time, typing
 
+import failures
 import memory
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -38,41 +40,7 @@ CRATES += ["proc-macro-api"]
 # What the build job ships blaze with: LLVM as a second code producer.
 FEATURES = ["blaze-engine/llvm"]
 
-# crate::test, as libtest names it under the crate's test binary.
-OPEN = {
-    "hir_ty_mir::tests::display_source_code::render_dyn_ty_independent_of_order",
-    "hir_ty_mir::tests::display_source_code::render_dyn_ty_under_enclosing_binder",
-    "hir_ty_mir::tests::incremental::add_struct_invalidates_trait_solve",
-    "hir_ty_mir::tests::incremental::adding_enum_query_log",
-    "hir_ty_mir::tests::incremental::adding_impl_query_log",
-    "hir_ty_mir::tests::incremental::adding_struct_invalidates_infer",
-    "hir_ty_mir::tests::incremental::adding_use_query_log",
-    "hir_ty_mir::tests::mir::eval::caller_location_intrinsic",
-    "hir_ty_mir::tests::regression::issue_6628",
-    "hir_ty_mir::tests::regression::new_solver::trait_solving_with_error",
-    "hir_ty_mir::tests::regression::regression_21605",
-    "hir_ty_mir::tests::simple::box_into_vec",
-    "hir_ty_mir::tests::traits::assoc_types_from_bounds",
-    "hir_ty_mir::tests::traits::closure_signature_from_struct_where_clause",
-    "hir_ty_mir::tests::traits::infer_box_fn_arg",
-    "hir_ty_mir::tests::traits::infer_from_return_pos_impl_trait",
-    "hir_ty_mir::tests::traits::nested_impl_traits",
-}
-# Known to fail when blaze builds and tests them, and not when rustc does: OPEN too on a blaze run.
-OPEN_BLAZE = {
-    # https://github.com/indexable-inc/blaze/issues/892
-    *(f"blaze_cargo::socket::tests::{t}" for t in [
-        "a_client_that_never_reads_is_given_up_on", "a_directory_others_can_swap_is_refused",
-        "a_log_that_was_there_becomes_the_users_alone", "a_reply_has_a_time_limit_once_the_request_is_read",
-        "a_silent_or_endless_client_is_given_up_on", "a_socket_in_a_shared_directory_is_never_open_to_others",
-        "a_socket_let_go_of_is_free_while_processes_start", "one_connection_too_many_is_closed",
-        "one_process_serves_a_socket", "the_directory_and_the_socket_are_the_users_alone",
-    ]),
-    # https://github.com/indexable-inc/blaze/issues/960
-    "blaze_cargo::sandbox::linux::tests::a_confined_sandbox_writes_only_where_it_may_and_reaches_nothing",
-}
-# Pass or fail on a blaze run, by the runner's load: neither is an error.
-UNSURE_BLAZE: set[str] = set()
+# The failures known, each with its owner and cause: harness/known-failures.toml (failures.py).
 
 COLOR = re.compile(r"\x1b\[[0-9;]*m")
 # A test binary is `deps/<name>-<hash>` in cargo's first layout of the build directory and
@@ -240,22 +208,23 @@ class Watch:
         print(self.line(), flush=True)
 
 
-def run(command, cwd, env, seen, failed, watch_dirs):
-    """Runs one `cargo test`, adding its tests to seen and failed; returns its exit status,
-    whether any of its tests failed and its `Watch`."""
+def run(command, cwd, env, seen, failed, watch_dirs, log):
+    """Runs one `cargo test`, adding its tests to seen and failed and its output to `log`;
+    returns its exit status, whether any of its tests failed and its `Watch`."""
     print(" ".join(command), flush=True)
     proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
-    with Watch(proc, watch_dirs) as watch:
-        return *read(proc, seen, failed), watch
+    with Watch(proc, watch_dirs) as watch, open(log, "w", encoding="utf-8") as kept:
+        return *read(proc, seen, failed, kept), watch
 
 
-def read(proc, seen, failed):
+def read(proc, seen, failed, kept):
     binary, any_failed = "?", False
     for line in proc.stdout:
         # Flushed: a pipe's buffer (128 KiB from Python 3.14) held a whole build's lines until
         # the tests' output filled it, so CI's log showed nothing for half an hour.
         sys.stdout.write(line)
         sys.stdout.flush()
+        kept.write(line)
         line = COLOR.sub("", line)
         if m := RUNNING.match(line) or DOCTESTS.match(line):
             binary = m.group(1).replace("-", "_")
@@ -315,7 +284,6 @@ def main():
     else:
         verb = ["build"] if cfg.build else ["test", "--no-fail-fast"]
         command = ["blaze", *verb, "--release", "--locked", "--features", ",".join(FEATURES), *packages, *args]
-    open_ = OPEN if plain else OPEN | OPEN_BLAZE
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
     # blaze's frames are larger than rustc's, and blaze-diagnostics' 5204-arm test overflows the
@@ -326,7 +294,9 @@ def main():
         env.setdefault("RUST_MIN_STACK", str(16 << 20))
     seen, failed = set(), set()
     watch_dirs = [ROOT, *(d for d in [os.environ.get("BLAZE_CACHE"), "/mnt"] if d)]
-    status, any_failed, watch = run(command, ROOT, env, seen, failed, watch_dirs)
+    log = os.path.join(env["CARGO_TARGET_DIR"], "known-failures", "unittests.log")
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    status, any_failed, watch = run(command, ROOT, env, seen, failed, watch_dirs, log)
     sys.stdout.flush()
     took = (time.monotonic() - watch.began) / 60
     peak = f"{watch.peak / 1024:.1f} GB of memory and swap in use on the machine at most" if watch.at_peak else "no memory reading on this platform"
@@ -340,19 +310,17 @@ def main():
         print(f"::error::the machine had {watch.peak} MB of memory and swap in use at once, over the {cfg.max_mb} MB bound (max_mb; docs/memory-budget.md)")
     if cfg.build:
         sys.exit(status or (1 if over else 0))
-    unsure = set() if plain else UNSURE_BLAZE
-    new, fixed, gone = sorted(failed - open_ - unsure), sorted(open_ & seen - failed), sorted(open_ - seen)
-    print(f"\n{len(seen)} tests, {len(failed)} failed, {len(open_ & failed)} of them known (OPEN in harness/unittests.py)")
-    for name in new:
-        print(f"::error::{name} fails, and is not in OPEN in harness/unittests.py")
-    for name in fixed:
-        print(f"::error::{name} passes now: take it out of OPEN in harness/unittests.py")
-    for name in gone:
-        print(f"::error::{name} did not run: take it out of OPEN in harness/unittests.py")
+    print(f"\n{len(seen)} tests, {len(failed)} failed; held to harness/known-failures.toml:", flush=True)
+    context = failures.Context("cargo" if plain else "blaze", "release", failures.this_os())
+    try:
+        held = failures.check([failures.Path(log)], context, report=failures.Path(log).with_suffix(".json"))
+    except failures.Refused as e:
+        print(f"::error::harness/failures.py: {e}")
+        sys.exit(1)
     if status and not any_failed:
         print(f"::error::{' '.join(command)} failed (exit status {status}) before any test failed: the build, most likely")
         sys.exit(1)
-    sys.exit(1 if new or fixed or gone or over else 0)
+    sys.exit(0 if held and not over else 1)
 
 
 if __name__ == "__main__":

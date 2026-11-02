@@ -30,7 +30,12 @@ pub(super) fn doc(job: &Job, lowered: &mut Lowered, no_deps: bool, private: bool
     if crates.is_empty() {
         return Err(ApiError::new("nothing to document", None));
     }
-    let platform = units.graph.roots.first().and_then(|&root| units.graph.units[root].platform.as_deref());
+    // A proc macro is documented as the host's crate, as cargo documents it (its own pages in
+    // `target/doc` under `--target` too), though it is built for the wasm macros' platform.
+    let platform = units.graph.roots.first().and_then(|&root| match &units.graph.units[root] {
+        unit if unit.macro_wasm => None,
+        unit => unit.platform.as_deref(),
+    });
     let dir = match platform {
         Some(triple) => format!("{}/{triple}/doc", units.target_dir),
         None => format!("{}/doc", units.target_dir),

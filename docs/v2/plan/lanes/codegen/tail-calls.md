@@ -84,10 +84,10 @@ What the IR builder hands a back end, and what each back end relies on:
   stack depth 0, swap stack arguments, chain `StructReturn`, forward a `StructArgument`.
 - `crates/hir-ty-codegen/llvm.rs` tests: `musttail` then `ret`, sret passed on, indirect, a
   refusal; the self call survives O3.
-- `harness/wholeprogram.py tail_calls`: an interpreter of ten million steps on a 64 KiB stack,
-  a `countdown` returning through memory, rustc's `drop-order.rs`, `indirect.rs` and
-  `callee_is_track_caller.rs`, output as the pinned nightly prints it; with `--release`
-  (LLVM) it runs, and in dev the build has to fail naming the tail call.
+- `harness/wholeprogram.py '{"cases": ["tail_calls"]}'`: an interpreter of ten million steps
+  on a 64 KiB stack, a `countdown` returning through memory, rustc's `drop-order.rs`,
+  `indirect.rs` and `callee_is_track_caller.rs`, output as the pinned nightly prints it; with
+  `"profile": "release"` (LLVM) it runs, and in dev the build has to fail naming the tail call.
 - `crates/blaze-diagnostics/src/tests/lints/mir/tail_calls.rs`: the refusals with rustc's
   messages (`become_needs_matching_signatures_and_abis`, `what_become_refuses`, ...), E0597 for
   a borrow of a local, and the `#[track_caller]` warning.

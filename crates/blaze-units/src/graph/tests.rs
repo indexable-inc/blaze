@@ -177,7 +177,7 @@ fn dense_ranks_give_equal_items_one_rank() {
 mod load {
     use super::{Budget, armed};
     use crate::load::tests::{Ask, Fixture, HOST, WS, ask};
-    use crate::query::Planned;
+    use crate::query::{Command, Planned, Units};
     use crate::schema::{DebugInfo, Mode, Strip, Stripped, Unit, UnitGraph};
 
     /// The workspace's graph (not the standard library's, which the load builds too) of the
@@ -193,17 +193,16 @@ mod load {
         workspace_graph(built)
     }
 
-    /// The workspace's graph under `-Z wasm-macros`, as its unit graph made it.
-    fn wasm_macro_graph(files: &[(&str, &str)]) -> UnitGraph {
-        graph(files, &["-Z", "wasm-macros"]).1
+    /// The units the load plans for `ask`: its graph with the standard libraries merged in,
+    /// and each unit's plan.
+    fn units(ask: &Ask<'_>) -> Units {
+        let fixture = Fixture::new();
+        let view = fixture.open(ask);
+        ready(fixture.plan(view))
     }
 
-    /// The units the load plans under `-Z wasm-macros`: its graph with the standard libraries
-    /// merged in, and each unit's plan.
-    fn wasm_macro_units(files: &[(&str, &str)]) -> crate::query::Units {
-        let fixture = Fixture::new();
-        let view = fixture.open(&Ask { args: &["-Z", "wasm-macros"], ..ask(files) });
-        match fixture.plan(view) {
+    fn ready(planned: Planned) -> Units {
+        match planned {
             Planned::Ready(units) => units,
             Planned::Needs(fetches) => panic!("the load needs {fetches:?}"),
             Planned::Failed(error) => panic!("the load failed: {}", error.what),
@@ -281,6 +280,67 @@ mod load {
         let mut platforms: Vec<Option<&str>> = b.iter().map(|(_, it)| it.platform.as_deref()).collect();
         platforms.sort();
         assert_eq!(platforms, [None, Some(HOST)]);
+    }
+
+    /// The std units `at` depends on, by extern name with their indexes, sorted.
+    fn std_of(graph: &UnitGraph, at: usize) -> Vec<(&str, usize)> {
+        let mut std: Vec<(&str, usize)> = graph.units[at]
+            .dependencies
+            .iter()
+            .filter(|dep| graph.units[dep.index].is_std)
+            .map(|dep| (dep.extern_crate_name.as_str(), dep.index))
+            .collect();
+        std.sort();
+        std
+    }
+
+    /// The std of `a`'s library (the target's) and of its build script (the host's), built
+    /// with `args` beside `--target` of the host's own triple; asserting no file of std's is
+    /// planned twice.
+    fn target_and_host_std(args: &[&str]) -> (Units, Vec<(String, usize)>, Vec<(String, usize)>) {
+        let mut all = vec!["--target", HOST];
+        all.extend_from_slice(args);
+        let units = units(&Ask { args: &all, ..ask(&build_and_normal()) });
+        let graph = &units.graph;
+        let (a_at, a) = lib(graph, "a");
+        assert_eq!(a.platform.as_deref(), Some(HOST));
+        let script_at = script(graph, "a", Mode::Build);
+        assert_eq!(graph.units[script_at].platform, None, "the build script is the host's");
+        let owned = |std: Vec<(&str, usize)>| std.into_iter().map(|(name, at)| (name.to_owned(), at)).collect();
+        let (a_std, script_std) = (owned(std_of(graph, a_at)), owned(std_of(graph, script_at)));
+        let mut outputs: Vec<&str> = (0..graph.units.len())
+            .filter(|&at| graph.units[at].is_std)
+            .flat_map(|at| units.plans[at].outputs.iter().map(String::as_str))
+            .collect();
+        let count = outputs.len();
+        outputs.sort();
+        outputs.dedup();
+        assert_eq!(outputs.len(), count, "no file of std's is planned twice");
+        (units, a_std, script_std)
+    }
+
+    /// A dev build's host units run where they are built, so their std is compiled for this
+    /// machine's own CPU; the units of a `--target`, even of the host's own triple, may be
+    /// shipped, so theirs is compiled for the target's baseline. Two stds of two keys, in two
+    /// directories: the target's program never links the host's native std.
+    #[test]
+    fn in_a_dev_build_with_a_target_of_the_hosts_own_triple_the_host_and_the_target_have_a_std_each() {
+        let (units, a_std, script_std) = target_and_host_std(&[]);
+        assert!(!a_std.is_empty() && !script_std.is_empty(), "each has a std");
+        let shared: Vec<&(String, usize)> = a_std.iter().filter(|it| script_std.contains(it)).collect();
+        assert!(shared.is_empty(), "the host and the target share std units {shared:?}");
+        let runs_here = |std: &[(String, usize)]| std.iter().map(|(_, at)| units.graph.units[*at].runs_here()).collect::<Vec<_>>();
+        assert!(runs_here(&script_std).iter().all(|&it| it), "the host's std runs here");
+        assert!(runs_here(&a_std).iter().all(|&it| !it), "the target's std runs elsewhere");
+    }
+
+    /// In a release build both run elsewhere, so the host's std and the target's are one key:
+    /// one set of std units, which both use.
+    #[test]
+    fn in_a_release_build_with_a_target_of_the_hosts_own_triple_the_host_and_the_target_share_one_std() {
+        let (_, a_std, script_std) = target_and_host_std(&["--release"]);
+        assert!(!a_std.is_empty(), "a has a std");
+        assert_eq!(a_std, script_std, "the host and the target share one std");
     }
 
     #[test]
@@ -365,40 +425,75 @@ mod load {
     }
 
     #[test]
-    fn without_wasm_macros_a_proc_macro_and_its_dependencies_are_built_for_the_host() {
-        let (_, graph) = graph(&with_a_proc_macro(), &[]);
-        assert_eq!(lib(&graph, "m").1.platform, None);
-        let (b_at, _) = lib(&graph, "b");
-        assert!(lib(&graph, "m").1.dependencies.iter().any(|it| it.index == b_at), "a and m share b's unit");
+    fn with_host_macros_a_proc_macro_and_its_dependencies_are_built_for_the_host() {
+        let fixture = Fixture::new();
+        let view = fixture.open(&ask(&with_a_proc_macro()));
+        let units = ready(fixture.plan_with_host_macros(view));
+        let graph = &units.graph;
+        let (m_at, m) = lib(graph, "m");
+        assert_eq!(m.built_for(), crate::schema::BuiltFor { platform: None, macro_wasm: false });
+        assert!(!units.plans[m_at].macro_wasm);
+        let (b_at, _) = lib(graph, "b");
+        assert!(m.dependencies.iter().any(|it| it.index == b_at), "a and m share b's unit");
     }
 
     #[test]
-    fn wasm_macros_build_a_proc_macro_and_its_dependencies_for_wasm32_wasip1() {
-        let graph = wasm_macro_graph(&with_a_proc_macro());
+    fn a_proc_macro_and_its_dependencies_are_built_for_wasm32_wasip1() {
+        let (_, graph) = graph(&with_a_proc_macro(), &[]);
         let wasm = Some(crate::load::MACRO_WASM);
         let (_, m) = lib(&graph, "m");
-        assert_eq!(m.platform.as_deref(), wasm);
-        let mut b: Vec<Option<&str>> = libs(&graph, "b").iter().map(|(_, it)| it.platform.as_deref()).collect();
+        assert_eq!((m.platform.as_deref(), m.macro_wasm), (wasm, true));
+        let mut b: Vec<(Option<&str>, bool)> = libs(&graph, "b").iter().map(|(_, it)| (it.platform.as_deref(), it.macro_wasm)).collect();
         b.sort();
-        assert_eq!(b, [None, wasm], "a's b for the host, m's b for wasm");
-        let m_b = libs(&graph, "b").into_iter().find(|(_, it)| it.platform.as_deref() == wasm).map(|(at, _)| at);
+        assert_eq!(b, [(None, false), (wasm, true)], "a's b for the host, m's b for the wasm macros");
+        let m_b = libs(&graph, "b").into_iter().find(|(_, it)| it.macro_wasm).map(|(at, _)| at);
         assert!(m.dependencies.iter().any(|it| Some(it.index) == m_b), "m uses the wasm b");
         let built = &graph.units[script(&graph, "m", Mode::Build)];
-        assert_eq!(built.platform, None, "a build script still runs on the host");
+        assert_eq!((built.platform.as_deref(), built.macro_wasm), (None, false), "a build script still runs on the host");
         let run = &graph.units[script(&graph, "m", Mode::RunCustomBuild)];
-        assert_eq!(run.platform.as_deref(), wasm, "its run is for the unit it feeds");
+        assert_eq!((run.platform.as_deref(), run.macro_wasm), (wasm, true), "its run is for the unit it feeds");
+    }
+
+    #[test]
+    fn the_wasm_macros_flag_is_accepted_and_changes_nothing() {
+        let (_, flagged) = graph(&with_a_proc_macro(), &["-Z", "wasm-macros"]);
+        let (_, plain) = graph(&with_a_proc_macro(), &[]);
+        assert_eq!(flagged, plain);
+    }
+
+    #[test]
+    fn a_proc_macros_own_tests_are_built_for_the_host() {
+        // `--lib`: a doctest unit has no plan (blaze runs no rustdoc).
+        let graph = units(&Ask { command: Command::Test, args: &["-p", "m", "--lib"], ..ask(&with_a_proc_macro()) }).graph;
+        let tests: Vec<&Unit> = graph
+            .units
+            .iter()
+            .filter(|it| !it.is_std && it.mode == Mode::Test && it.target.name == "m")
+            .collect();
+        assert_eq!(tests.len(), 1, "{tests:?}");
+        let test = tests[0];
+        assert_eq!((test.platform.as_deref(), test.macro_wasm), (None, false), "a test is a program that runs here");
+        let deps: Vec<(&str, Option<&str>, bool)> = test
+            .dependencies
+            .iter()
+            .map(|dep| &graph.units[dep.index])
+            .filter(|it| !it.is_std && !it.target.is_custom_build())
+            .map(|it| (it.target.name.as_str(), it.platform.as_deref(), it.macro_wasm))
+            .collect();
+        assert_eq!(deps, [("b", None, false)], "its dependencies are the host's too");
     }
 
     #[test]
     fn a_wasm_macro_is_planned_with_a_wasm_std_that_takes_the_bridge() {
-        let units = wasm_macro_units(&with_a_proc_macro());
+        let units = units(&ask(&with_a_proc_macro()));
         let graph = &units.graph;
         let wasm = Some(crate::load::MACRO_WASM);
         let (m_at, m) = lib(graph, "m");
         assert!(units.plans[m_at].macro_wasm, "m is built to run as a wasm module");
         assert_eq!(m.profile.panic, "abort", "wasm32-wasip1 does not unwind");
-        let (a_at, _) = lib(graph, "a");
+        let (a_at, a) = lib(graph, "a");
         assert!(!units.plans[a_at].macro_wasm, "a is the build's own");
+        assert_eq!(a.profile.panic, "unwind", "the host unwinds");
         let std_of = |at: usize| -> Vec<(&str, Option<&str>, bool)> {
             graph.units[at]
                 .dependencies
@@ -406,6 +501,7 @@ mod load {
                 .filter(|dep| graph.units[dep.index].is_std)
                 .map(|dep| {
                     let unit = &graph.units[dep.index];
+                    assert_eq!(unit.macro_wasm, units.plans[dep.index].macro_wasm, "{unit:?}");
                     (dep.extern_crate_name.as_str(), unit.platform.as_deref(), units.plans[dep.index].macro_wasm)
                 })
                 .collect()
@@ -417,16 +513,59 @@ mod load {
         assert!(!a_std.is_empty() && a_std.iter().all(|&(_, platform, bridged)| platform.is_none() && !bridged), "{a_std:?}");
     }
 
+    /// A build for `wasm32-wasip1`, the wasm macros' own triple, plans two units of each
+    /// package both use, one for the target and one for the macros, under their own keys and
+    /// directories: the macros' are built with the `proc_macro` bridge and `panic = "abort"`,
+    /// and must never be taken for the target's.
     #[test]
-    fn wasm_macros_refuse_a_build_whose_target_is_their_platform() {
-        let fixture = Fixture::new();
-        let args = ["-Z", "wasm-macros", "--target", crate::load::MACRO_WASM];
-        let view = fixture.open(&Ask { args: &args, ..ask(&with_a_proc_macro()) });
-        match fixture.plan(view) {
-            Planned::Failed(error) => assert!(error.what.contains("-Z wasm-macros"), "{}", error.what),
-            Planned::Ready(_) => panic!("a unit of the target could not be told from a wasm macro's"),
-            Planned::Needs(fetches) => panic!("the load needs {fetches:?}"),
+    fn a_build_for_wasm32_wasip1_keeps_its_units_apart_from_its_wasm_macros() {
+        let wasm = crate::load::MACRO_WASM;
+        let units = units(&Ask { args: &["--target", wasm], ..ask(&with_a_proc_macro()) });
+        let graph = &units.graph;
+        let (a_at, a) = lib(graph, "a");
+        assert_eq!((a.platform.as_deref(), a.macro_wasm), (Some(wasm), false));
+        assert_eq!(a.profile.panic, "abort", "cargo passes no `-C panic=unwind`, and {wasm} aborts");
+        let (m_at, m) = lib(graph, "m");
+        assert_eq!((m.platform.as_deref(), m.macro_wasm), (Some(wasm), true));
+        let b = libs(graph, "b");
+        assert_eq!(b.len(), 2, "one b for the target, one for the macros: {b:?}");
+        let target_b = b.iter().find(|(_, it)| !it.macro_wasm).expect("the target's b").0;
+        let macro_b = b.iter().find(|(_, it)| it.macro_wasm).expect("the macros' b").0;
+        for at in [target_b, macro_b] {
+            assert_eq!(graph.units[at].platform.as_deref(), Some(wasm), "both are built for {wasm}");
         }
+        assert!(a.dependencies.iter().any(|it| it.index == target_b), "a uses the target's b");
+        assert!(m.dependencies.iter().any(|it| it.index == macro_b), "m uses the macros' b");
+        let (target, macros) = (&units.plans[target_b], &units.plans[macro_b]);
+        assert!(!target.macro_wasm && macros.macro_wasm);
+        assert_ne!(target.unit_id, macros.unit_id, "two units, two keys");
+        assert_ne!(target.metadata, macros.metadata);
+        let macro_dir = format!("/{wasm}+macros/");
+        let target_dir = format!("/{wasm}/");
+        assert!(!macros.outputs.is_empty() && macros.outputs.iter().all(|it| it.contains(&macro_dir)), "{:?}", macros.outputs);
+        assert!(
+            !target.outputs.is_empty() && target.outputs.iter().all(|it| it.contains(&target_dir) && !it.contains(&macro_dir)),
+            "{:?}",
+            target.outputs
+        );
+        assert!(target.outputs.iter().all(|it| !macros.outputs.contains(it)), "no output of one is the other's");
+        // The standard libraries: each its own units and plans, the macros' taking the bridge.
+        let std_of = |at: usize| -> Vec<usize> {
+            graph.units[at].dependencies.iter().map(|it| it.index).filter(|&dep| graph.units[dep].is_std).collect()
+        };
+        let (a_std, m_std) = (std_of(a_at), std_of(m_at));
+        assert!(!a_std.is_empty() && !m_std.is_empty());
+        assert!(a_std.iter().all(|it| !m_std.contains(it)), "a's std is not m's: {a_std:?} {m_std:?}");
+        assert!(a_std.iter().all(|&it| !graph.units[it].macro_wasm && !units.plans[it].macro_wasm));
+        assert!(m_std.iter().all(|&it| graph.units[it].macro_wasm && units.plans[it].macro_wasm));
+        let ids = |at: &[usize]| -> Vec<&str> { at.iter().map(|&it| units.plans[it].unit_id.as_str()).collect() };
+        let (a_ids, m_ids) = (ids(&a_std), ids(&m_std));
+        assert!(a_ids.iter().all(|it| !m_ids.contains(it)), "{a_ids:?} {m_ids:?}");
+        let outputs = |at: &[usize]| -> Vec<&str> {
+            at.iter().flat_map(|&it| units.plans[it].outputs.iter().map(String::as_str)).collect()
+        };
+        let (a_out, m_out) = (outputs(&a_std), outputs(&m_std));
+        assert!(a_out.iter().all(|it| !m_out.contains(it)), "{a_out:?} {m_out:?}");
     }
 
     #[test]

@@ -484,7 +484,9 @@ fn fn_(p: &mut Parser<'_>, m: Marker, is_in_trait: bool) {
     // test function_ret_type
     // fn foo() {}
     // fn bar() -> () {}
-    if !verify::fn_ret_type(p) {
+    // With no return type, a clause's keyword (`fn f(x: u32) requires x < 10 {}`) is the
+    // clause, not a return type missing its `->`.
+    if !verify::fn_ret_type(p) && !verify::at_clause_kw(p, 0) {
         // test_err function_ret_type_missing_arrow
         // fn foo() usize {}
         // fn bar() super::Foo {}

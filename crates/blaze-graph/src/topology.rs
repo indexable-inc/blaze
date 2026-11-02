@@ -7,7 +7,8 @@
 //! SMT siblings are a cluster) says nothing. A group never spans NUMA nodes (`cpuM/nodeN`):
 //! where a cache is shared across nodes (Intel's sub-NUMA clusters), each node's part of it is
 //! a group, so the memory a group's workers allocate is all local. On macOS a group is an L2
-//! cluster of one performance level, the CPUs of level 0 are `fast`, and there is one node. A
+//! cluster of one performance level, every CPU is `fast` ([`Topology::from_perflevels`]), and
+//! there is one node. A
 //! machine that says nothing is one group on one socket and node. Only online CPUs in the
 //! process's affinity mask are counted.
 //!
@@ -33,8 +34,9 @@ pub struct Cpu {
     /// Its NUMA node: the `nodeN` entry of `/sys/devices/system/cpu/cpuM/`; 0 where the
     /// machine has none, and on macOS.
     pub node: u32,
-    /// Of the fastest cores: Apple's performance level 0, or the largest `cpu_capacity` of an
-    /// Arm big.LITTLE machine; every CPU where the machine says nothing.
+    /// May run critical-path work: of the largest `cpu_capacity` of an Arm big.LITTLE
+    /// machine, whose workers are pinned to their CPUs; every CPU on macOS, which pins no
+    /// thread ([`Topology::from_perflevels`]), and where the machine says nothing.
     pub fast: bool,
 }
 
@@ -121,14 +123,21 @@ impl Topology {
 
     /// macOS's shape: for each performance level from the fastest, its CPUs and how many of
     /// them share an L2 (`hw.perflevel{N}.logicalcpu`, `hw.perflevel{N}.cpusperl2`).
+    ///
+    /// Every CPU is `fast`, whatever its level. macOS binds no thread to a core: which core a
+    /// worker's thread runs on is the kernel's choice, by the thread's QoS class, and every
+    /// worker runs at one class (`crate::pool`'s `bind_to`), so no worker is slower than
+    /// another. Workers of level 1 and below used to be slow and run at `utility` QoS, which a
+    /// loaded host starves (about 2% of a core against 30% for `user-initiated`), while they
+    /// still stole critical jobs and did most of a build's work.
     pub fn from_perflevels(levels: &[(u32, u32)]) -> Topology {
         // alloc: the pool's shape, once per pool
         let (mut cpus, mut id, mut first_group) = (Vec::new(), 0u32, 0u32);
-        for (level, &(logical, per_l2)) in levels.iter().enumerate() {
+        for &(logical, per_l2) in levels {
             let per_l2 = if per_l2 == 0 { logical.max(1) } else { per_l2 };
             for at in 0..logical {
                 let group = first_group + at / per_l2;
-                cpus.push(Cpu { id, group, socket: 0, node: 0, fast: level == 0 });
+                cpus.push(Cpu { id, group, socket: 0, node: 0, fast: true });
                 id += 1;
             }
             first_group += logical.div_ceil(per_l2);
@@ -590,13 +599,18 @@ mod tests {
     }
 
     /// An M-series Max: twelve performance cores in L2 clusters of six, four efficiency cores
-    /// sharing one.
+    /// sharing one. Every CPU is fast: macOS pins no worker, so none is slower than another,
+    /// and none is given a QoS class a loaded host starves.
     #[test]
-    fn apple_groups_by_l2_cluster_and_level_zero_is_fast() {
+    fn apple_groups_by_l2_cluster_and_every_level_is_fast() {
         let topology = Topology::from_perflevels(&[(12, 6), (4, 4)]);
         assert_eq!(topology.cpus.len(), 16);
         assert_eq!(groups(&topology), [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2]);
-        assert!(topology.cpus.iter().all(|it| it.fast == (it.id < 12)));
+        assert!(topology.cpus.iter().all(|it| it.fast));
+        // The Mac the self-build profile ran on: six "Super" and twelve "Performance" cores.
+        let topology = Topology::from_perflevels(&[(6, 6), (12, 6)]);
+        assert_eq!(groups(&topology), [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2]);
+        assert!(topology.cpus.iter().all(|it| it.fast));
         assert_eq!(topology.steal_order(2), [2, 1, 0]);
         assert_eq!(
             Topology::from_perflevels(&[(2, 0)]).cpus,

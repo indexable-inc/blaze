@@ -49,6 +49,7 @@
 
 pub mod assoc;
 pub mod attr_resolution;
+mod batch;
 #[cfg(test)]
 mod collector;
 pub mod delta;

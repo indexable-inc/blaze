@@ -11,7 +11,7 @@ use blaze_items::ItemKey;
 
 use super::{
     Full, KeptImage, LinkCause, Linked, Linking, Mounted, OutputFields, PgoFlag, StaticRow, codegen_backend,
-    kept_image, linking, pgo, read_profile, sanitize, static_rows,
+    function_rows, kept_image, linking, pgo, read_profile, sanitize, static_rows,
 };
 use blaze_codegen::InstanceKey;
 
@@ -202,6 +202,70 @@ fn a_static_linked_again_unchanged_is_neither_gone_nor_new() {
     assert_eq!(items(&new), [1, 3]);
 }
 
+/// Function `n` (its key `[n; 32]`), calling each of `callees` through its slot.
+fn calling(n: u8, callees: &[u8]) -> blaze_codegen::CompiledFunction {
+    let key = |n: u8| InstanceKey(ContentId([n; 32]));
+    let relocs: Vec<blaze_codegen::Relocation> = callees
+        .iter()
+        .enumerate()
+        .map(|(at, callee)| blaze_codegen::Relocation {
+            at: at as u32 * 5 + 1,
+            kind: blaze_codegen::RelocKind::PcRel32,
+            target: blaze_codegen::Target::Function(key(*callee)),
+            addend: -4,
+        })
+        .collect();
+    let mut code: Vec<u8> = callees.iter().flat_map(|_| [0xe8, 0, 0, 0, 0]).collect();
+    code.push(0xc3);
+    blaze_codegen::CompiledFunction {
+        key: key(n),
+        arch: blaze_codegen::Arch::X86_64,
+        align: 16,
+        code,
+        relocs: relocs.into(),
+        data: Vec::new(),
+        inlined: Vec::new(),
+        side: None,
+        unwind: None,
+        lines: Vec::new(),
+        coverage: None,
+        profile: None,
+    }
+}
+
+/// `log` (key 1) is edited, which gives it a new key (4). `call` (key 2), which calls it, keeps
+/// its key, as a function's key does not say which callee is at each of its places
+/// (`driver::placed`), and the build fills its relocation with key 4. The relink must take
+/// `call` again: its old piece still calls key 1, which the change removes ("the function ..
+/// is removed, and .. still refers to it"). `main` (key 3), which calls `call` and whose fill
+/// is unchanged, is in neither list. Two fills of one key in one build are refused, naming
+/// the function.
+#[test]
+fn an_edit_to_a_callee_relinks_its_unchanged_callers() {
+    let key = |n: u8| InstanceKey(ContentId([n; 32]));
+    let names = [(key(2), "call".to_string())];
+    let (first, gone, new) =
+        function_rows(&[], &[calling(3, &[2]), calling(2, &[1]), calling(1, &[])], &names).unwrap();
+    assert!(gone.is_empty());
+    assert_eq!(new, [key(1), key(2), key(3)]);
+
+    let (same, gone, new) =
+        function_rows(&first, &[calling(1, &[]), calling(2, &[1]), calling(3, &[2])], &names).unwrap();
+    assert_eq!(same, first);
+    assert!(gone.is_empty() && new.is_empty(), "linked again unchanged: {gone:?} {new:?}");
+
+    let (_, gone, new) =
+        function_rows(&first, &[calling(3, &[2]), calling(2, &[4]), calling(4, &[])], &names).unwrap();
+    assert_eq!(gone, [key(1), key(2)], "the old `log`, and `call` as it was filled against it");
+    assert_eq!(new, [key(2), key(4)], "`call` filled against the new `log`, and the new `log`");
+
+    let twice = function_rows(&[], &[calling(2, &[1]), calling(2, &[4])], &names).unwrap_err();
+    assert!(
+        twice.contains("filled two ways") && twice.contains("`call`") && twice.contains(&format!("{:?}", key(2))),
+        "{twice}"
+    );
+}
+
 fn shared(exports: &[&str]) -> blaze_link::Output {
     blaze_link::Output {
         format: blaze_link::Format::Elf,
@@ -231,7 +295,7 @@ fn kept(path: &str, output: &blaze_link::Output) -> KeptImage {
     let kept = Linked {
         image: blaze_link::Image::new(to, output.clone()).unwrap(),
         output: output.clone(),
-        functions: vec![InstanceKey(ContentId([9; 32]))],
+        functions: vec![(InstanceKey(ContentId([9; 32])), ContentId([9; 32]))],
         statics: Vec::new(),
         natives: Vec::new(),
         names: Vec::new(),

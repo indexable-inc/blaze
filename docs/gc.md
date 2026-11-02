@@ -184,7 +184,8 @@ directory, keeps it: the rename needs the exclusive lock, which the collector on
 
 - A daemon's job takes its build dir's lease before anything is built into it and holds it until
   no task, placing or run of the job is left (`crates/blaze-cargo/src/serve/job.rs`,
-  `lease_build_dirs`). It is taken on the worker pool, as the job's first step, never on the
+  `lease_build_dirs`, reached through `Steps::lease` so the daemon's simulated tests, whose
+  build dirs are not on disk, take none). It is taken on the worker pool, as the job's first step, never on the
   daemon's loop: it only tries the lock, and while a collector holds it exclusively, or its
   lease file's nonce is not whole yet, the step gives way and is posted again, for at most
   `lease::GIVE_WAY` (11 s: the 10 s after which a short nonce is abandoned and repaired, and a

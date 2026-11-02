@@ -1,6 +1,7 @@
 mod comptime;
 mod prefix_entries;
 mod top_entries;
+mod verify;
 
 use std::{
     fmt::Write,

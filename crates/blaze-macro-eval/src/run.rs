@@ -382,7 +382,8 @@ pub(crate) fn of_sysroot(db: &Db, st: StaticId) -> bool {
 }
 
 /// Runs `expansions` in order on one evaluator, each with its own server as rustc gives each
-/// expansion its own handles, starting from the statics `preset`: what the last gave, and
+/// expansion its own handles, starting from the statics `preset`, in the working directory
+/// `cwd` (the call's, [`Os::in_dir`]): what the last gave, and
 /// what all of them did. The ones before the last are the session's earlier calls, run again
 /// for the state they leave. What the evaluator spent goes in `spent`, however the run ends.
 pub(crate) fn run(
@@ -391,10 +392,11 @@ pub(crate) fn run(
     bridge: &Bridge,
     env: &Env,
     preset: &[(StaticId, Vec<u8>)],
+    cwd: &str,
     expansions: &[Expansion<'_>],
     spent: &mut Spent,
 ) -> Result<Ran, Stop> {
-    evaluate(db, what, bridge, env, preset, expansions, spent)
+    evaluate(db, what, bridge, env, preset, cwd, expansions, spent)
 }
 
 fn evaluate(
@@ -403,6 +405,7 @@ fn evaluate(
     bridge: &Bridge,
     env: &Env,
     preset: &[(StaticId, Vec<u8>)],
+    cwd: &str,
     expansions: &[Expansion<'_>],
     spent: &mut Spent,
 ) -> Result<Ran, Stop> {
@@ -412,7 +415,7 @@ fn evaluate(
     };
     let state = RefCell::new(State {
         server: Server::new(last.sites, last.edition, last.forced_keywords),
-        os: Os::new(env),
+        os: Os::in_dir(env, cwd),
         shims: HashMap::new_in(Global),
         stop: None,
         // alloc: once per run, the replies' buffer

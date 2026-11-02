@@ -242,7 +242,9 @@ pub fn call(job: *const dyn Job) {
     );
     let found = findings(&out, "noalloc");
     assert_eq!(found.len(), 1, "{out}");
-    assert!(found[0].contains("takes `dyn") && found[0].contains("whose calls the check can't see"), "{out}");
+    assert!(found[0].contains("takes `dyn Job") && found[0].contains("whose calls the check can't see"), "{out}");
+    // The type as a person writes it, not the solver's debug form (`dyn [Binder { .. }]`).
+    assert!(!found[0].contains("Binder"), "{out}");
 }
 
 /// The same `Vec` through `Global` is refused: the global allocator, through `Vec`'s own code.
@@ -313,7 +315,7 @@ pub fn take(m: &std::sync::Mutex<u32>) {
     );
     let found = findings(&out, "nonblocking");
     assert_eq!(found.len(), 1, "{out}");
-    assert!(found[0].contains("calls `lock`, which waits for the lock"), "{out}");
+    assert!(found[0].contains("calls `std::sync::Mutex::lock`, which waits for the lock"), "{out}");
 }
 
 /// A syscall that waits (`read`) is in the blocking set by its symbol.

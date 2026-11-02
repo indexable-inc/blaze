@@ -821,10 +821,11 @@ impl<'r, 'a> State<'r, 'a> {
         &self.targets(pkg)[at as usize]
     }
 
-    /// The kind of a unit of a target that a unit of kind `of` uses: a proc macro's is
-    /// `MacroWasm` in a build that runs macros as wasm; otherwise [`Kind::for_target`].
-    fn kind_for(&self, of: Kind, for_host: bool, proc_macro: bool) -> Kind {
-        match proc_macro && self.request.macro_wasm.is_some() {
+    /// The kind of a unit in `mode` of a target that a unit of kind `of` uses: a proc macro's
+    /// is `MacroWasm` in a build that runs macros as wasm; otherwise [`Kind::for_target`]. A
+    /// proc macro's own tests are a program that runs here, as cargo builds them: the host's.
+    fn kind_for(&self, of: Kind, for_host: bool, proc_macro: bool, mode: Mode) -> Kind {
+        match proc_macro && !mode.is_any_test() && self.request.macro_wasm.is_some() {
             true => Kind::MacroWasm,
             false => of.for_target(for_host),
         }
@@ -1058,7 +1059,7 @@ impl<'r, 'a> State<'r, 'a> {
             UnitFor::new_normal()
         };
         let profile = self.profile(pkg, unit_for, Kind::Target);
-        let kind = self.kind_for(Kind::Target, target.for_host, target.proc_macro);
+        let kind = self.kind_for(Kind::Target, target.for_host, target.proc_macro, mode);
         let class = self.profiles.class_of[profile as usize];
         self.intern(Key { pkg, target: at, features, class, kind, mode }, profile)
     }
@@ -1293,7 +1294,7 @@ impl<'r, 'a> State<'r, 'a> {
             let Some(lib) = self.pkgs[dep_pkg as usize].lib else { continue };
             let mode = check_or_build_mode(row.key.mode, lib.for_host);
             let dep_for = unit_for.with_dependency(custom_build, lib.for_host, lib.proc_macro);
-            let kind = self.kind_for(row.key.kind, lib.for_host, lib.proc_macro);
+            let kind = self.kind_for(row.key.kind, lib.for_host, lib.proc_macro, mode);
             let mut edge =
                 self.new_unit_dep(id, dep_pkg, lib.at, dep_for, kind, mode, None, dep.public)?;
             edge.dev = !transitive;
@@ -1325,7 +1326,7 @@ impl<'r, 'a> State<'r, 'a> {
                 if let Some(lib) = self.pkgs[pkg as usize].linkable {
                     let mode = check_or_build_mode(row.key.mode, lib.for_host);
                     let dep_for = unit_for.with_dependency(custom_build, lib.for_host, lib.proc_macro);
-                    let kind = self.kind_for(row.key.kind, lib.for_host, lib.proc_macro);
+                    let kind = self.kind_for(row.key.kind, lib.for_host, lib.proc_macro, mode);
                     let dep = self.new_unit_dep(id, pkg, lib.at, dep_for, kind, mode, None, own_public)?;
                     self.built.push(dep);
                 }
@@ -1696,6 +1697,9 @@ impl<'r, 'a> State<'r, 'a> {
                         // alloc: the output owns its strings.
                         Kind::MacroWasm => Some(self.platforms[Kind::MacroWasm as usize].triple.clone()),
                     },
+                    // Its triple may be the target's too (`--target wasm32-wasip1`): this tells
+                    // the two units apart downstream, as `kind` does here.
+                    macro_wasm: row.key.kind == Kind::MacroWasm,
                     mode: row.key.mode.schema(),
                     checked_as_test: row.key.mode == Mode::CheckTest,
                     // alloc: the output owns its strings.

@@ -108,6 +108,11 @@ pub(crate) struct Cx<'a, 'db> {
     pub(crate) deref_patterns: bool,
     /// An uninhabited witness is printed `!`, not `_`.
     pub(crate) never_patterns: bool,
+    /// Every witness of a non-exhaustive match, not only rustc's relevant ones: off for
+    /// diagnostics (as rustc, which skips a constructor that matches more rows than a missing
+    /// one, `Some(..)` when `None` is missing), on where the witnesses must cover every value
+    /// left (`catch_alls`). Bounded by the complexity limit either way.
+    pub(crate) exhaustive_witnesses: bool,
     /// Whether a deref pattern was lowered in the match being checked.
     pub(crate) has_deref_pat: Cell<bool>,
     /// What the analysis running now linted.
@@ -281,6 +286,10 @@ impl<'a, 'db> PatCx for Cx<'a, 'db> {
 
     fn is_exhaustive_patterns_feature_on(&self) -> bool {
         self.exhaustive_patterns
+    }
+
+    fn exhaustive_witnesses(&self) -> bool {
+        self.exhaustive_witnesses
     }
 
     fn ctor_arity(&self, ctor: &Constructor<Self>, ty: &Self::Ty) -> usize {

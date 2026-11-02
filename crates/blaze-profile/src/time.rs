@@ -173,6 +173,9 @@ pub struct SpanIn {
     pub job: Option<u64>,
     pub start_ns: i64,
     pub dur_ns: i64,
+    /// `spans.self_cpu_ns`: its job's CPU while it was open, less the spans under it; `None`
+    /// when not counted.
+    pub self_cpu_ns: Option<i64>,
 }
 
 /// The name of a span that is a wait (`blaze_graph::wait`'s spans).
@@ -276,6 +279,7 @@ impl Input {
                 job: it.get::<col::OfJob>(),
                 start_ns: it.start_ns,
                 dur_ns: it.dur_ns,
+                self_cpu_ns: it.self_cpu_ns.and_then(|it| i64::try_from(it).ok()),
             });
         }
         let events = read

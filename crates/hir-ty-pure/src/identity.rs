@@ -207,7 +207,7 @@ impl<'db> Facts<'db> {
     }
 
     fn ty_id(&self, ty: Ty<'db>) -> Result<ContentId, String> {
-        share::ty(self.db, ty).map_err(|it| format!("the type `{ty:?}` has no identity: {it}")) // alloc: an impure script's reason, once
+        share::ty(self.db, ty).map_err(|it| format!("the type `{}` has no identity: {it}", crate::walk::Shown::new(self.db, self.env.krate, ty))) // alloc: an impure script's reason, once
     }
 
     /// A static by its key and, unless it is foreign, its value.

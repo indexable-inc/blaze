@@ -228,8 +228,9 @@ pub(super) fn fixture(main: &str) -> String {
     format!("{MINICORE}{CRATES}{MAIN}{}", main.trim_start_matches('\n'))
 }
 
+/// `lint` alone on the command line: every other clippy lint off, pedantic and nursery included.
 fn only(lint: &str) -> String {
-    format!("-A clippy::all -W clippy::{lint}")
+    format!("{} -W clippy::{lint}", crate::tests::CLIPPY_OFF)
 }
 
 /// What `clippy::<lint>` alone says of `main`, each diagnostic as rustc writes it.

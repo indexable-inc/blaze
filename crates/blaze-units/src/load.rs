@@ -143,11 +143,14 @@ pub(crate) struct Spec {
     pub build_std_features: Option<Vec<String>>,
     /// A foreign workspace's ask: its units are a standard library's.
     pub foreign: Option<ForeignAsk>,
-    /// `-Z wasm-macros`: proc macros are built for [`MACRO_WASM`] to run as wasm modules.
+    /// Proc macros are built for [`MACRO_WASM`] to run as wasm modules: every build of a
+    /// workspace's (rule 8, `proc-macros-on-wasm`), with no flag and no way back to the
+    /// evaluator from the command line. Off only for a foreign workspace (a standard library,
+    /// which has no proc macros) and in tests that plan host-built macros on purpose.
     pub macro_wasm: bool,
 }
 
-/// The platform `-Z wasm-macros` builds proc macros for.
+/// The platform proc macros are built for to run as wasm modules.
 pub(crate) const MACRO_WASM: &str = "wasm32-wasip1";
 
 /// The view's spec, from its command line: as cargo's `Packages::from_flags`,
@@ -191,7 +194,6 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
     };
     let mut build_std = None;
     let mut build_std_features = None;
-    let mut macro_wasm = false;
     for flag in &asked.unstable {
         let (name, value) = flag.split_once('=').unwrap_or((flag.as_str(), ""));
         let list = || value.split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect::<Vec<_>>();
@@ -199,7 +201,8 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
             "unstable-options" | "bindeps" | "codegen-backend" => {}
             "build-std" => build_std = Some(list()),
             "build-std-features" => build_std_features = Some(list()),
-            "wasm-macros" => macro_wasm = true,
+            // What every build does now: kept so that scripts that pass it keep working.
+            "wasm-macros" => {}
             _ => return Err(error(&format!("blaze does not read `-Z {name}` yet"))),
         }
     }
@@ -235,7 +238,7 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         build_std,
         build_std_features,
         foreign: None,
-        macro_wasm,
+        macro_wasm: true,
     })
 }
 
@@ -311,7 +314,7 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 6");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 7");
     type Key = ();
     type Value = Cbor<Planned>;
 
@@ -389,6 +392,10 @@ pub struct ForeignAsk {
     pub panic_abort: Vec<String>,
     /// `Unit::is_std` of every unit.
     pub is_std: bool,
+    /// Every unit for `triple` is a wasm proc macro's ([`crate::schema::Unit::macro_wasm`]),
+    /// planned under the macros' kind: its metadata, id and directory are never those of the
+    /// same crate in a `--target wasm32-wasip1` build, whose code takes no macro host bridge.
+    pub macro_wasm: bool,
     /// Stands for the build's `target/[<triple>/]<profile dir>` in every path of the plans
     /// (`outputs`, `out_dir`, `OUT_DIR` in `env`).
     pub out: String,
@@ -410,12 +417,12 @@ pub struct ForeignProfile {
 impl Query for Foreign {
     const KIND: QueryKind = QueryKind(0x601a);
     const NAME: &'static str = "cargo foreign";
-    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 6");
+    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 7");
     type Key = ForeignAsk;
     type Value = Cbor<StdPlanned>;
 
     fn input(key: &ForeignAsk) -> ContentId {
-        key_id("blaze v2 cargo foreign key 2", key)
+        key_id("blaze v2 cargo foreign key 3", key)
     }
 
     fn execute(cx: &mut Cx<'_>, ask: &ForeignAsk) -> Result<Cbor<StdPlanned>, Cancelled> {

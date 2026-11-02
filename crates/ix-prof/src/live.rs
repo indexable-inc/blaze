@@ -91,12 +91,16 @@ pub fn parse_cursor(text: &str) -> Option<(&str, u64)> {
     Some((session, u64::from_str_radix(seq, 16).ok()?))
 }
 
-/// The session id: blake3 of (pid, start_ns, start_unix_ns), first 16 hex digits.
-pub fn session_id(pid: u32, start_ns: i64, start_unix_ns: i64) -> String {
+/// The session id: blake3 of (pid, start_ns, start_unix_ns, nonce), first 16 hex digits.
+/// The nonce is random, so two runs with the same pid (pid reuse, or the first process of
+/// two containers) and the same clock readings still get different ids, and different
+/// profile file names.
+pub fn session_id(pid: u32, start_ns: i64, start_unix_ns: i64, nonce: u64) -> String {
     let mut h = blake3::Hasher::new();
     h.update(&pid.to_le_bytes());
     h.update(&start_ns.to_le_bytes());
     h.update(&start_unix_ns.to_le_bytes());
+    h.update(&nonce.to_le_bytes());
     h.finalize().to_hex()[..16].to_owned()
 }
 

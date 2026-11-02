@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """wholeprogram.py: programs blaze builds whole, with a `main` of its own, and runs.
 
-usage: wholeprogram.py [CASE...] [--release] [--keep]
+usage: wholeprogram.py '{"cases": ["tail_calls"], "profile": "release", "keep": false}'
+
+The input is one JSON object (inline, the path of a file, or `-` for standard input) with the
+fields of `Input`, each optional: `cases` (the default is every case below), `profile` ("dev",
+the default, or "release") and `keep` (keep the copy of the workspace). A field it does not
+have is refused. Run it in the repository's Python workspace (`uv run --frozen python
+harness/wholeprogram.py '{}'`), whose typed_input reads it.
 
 Each case is a program of the workspace `harness/wholeprogram`, copied to a directory of
 its own, and built by `blaze build -p CASE` in an empty home. The program runs with no
@@ -20,17 +26,31 @@ order its functions were asked for, not the order the threads finished them (#20
   tail_calls     `become`: an interpreter loop of ten million steps on a 64 KiB stack, and
                  rustc's cases of drop order and of arguments passed by reference
 
-`--release` builds both with the release profile, which v2 compiles with LLVM; the dev
-profile it compiles with Cranelift. A case of `REFUSED_IN_DEV` is one Cranelift's native code
-can't make (a guaranteed tail call): its dev build has to fail with an error that says so.
+`"profile": "release"` builds both with the release profile, which v2 compiles with LLVM;
+the dev profile it compiles with Cranelift, but for a function with a tail call (`become`),
+which Cranelift's native code can't make and which the plan gives to LLVM with no passes
+(crates/blaze-codegen/src/plan.rs, `Policy::choose`). Every case has to run as Rust says in
+both profiles.
 """
-import argparse, os, re, shutil, sys
+import os, re, shutil, sys
+from dataclasses import dataclass
+from typing import Literal
+
+from typed_input import parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from rebuild import Project, copy, scratch
 
-CASES = ["default_alloc", "custom_alloc", "lib_alloc", "cfg_alloc", "trait_block", "c_main", "tail_calls"]
+type Case = Literal["default_alloc", "custom_alloc", "lib_alloc", "cfg_alloc", "trait_block", "c_main", "tail_calls"]
+CASES: tuple[Case, ...] = ("default_alloc", "custom_alloc", "lib_alloc", "cfg_alloc", "trait_block", "c_main", "tail_calls")
+
+
+@dataclass(frozen=True)
+class Input:
+    cases: tuple[Case, ...] = CASES
+    profile: Literal["dev", "release"] = "dev"
+    keep: bool = False
 
 
 def mixed(seed, rounds):
@@ -65,12 +85,6 @@ EXPECTED = {
                                 "drop order ok\nindirect ok\ntrack_caller ok\n"), ""),
 }
 
-# A case whose dev build Cranelift's native code refuses, and what the error has to say.
-REFUSED_IN_DEV = {
-    "tail_calls": r"a tail call \(`become`\)",
-}
-
-
 def built(ws, work, case, release, name):
     """`blaze build -p CASE` in the empty home `<work>/<name>`: (Built, the project)."""
     project = Project(ws, work, home=os.path.join(work, name), name=name)
@@ -83,12 +97,6 @@ def built(ws, work, case, release, name):
 def check(ws, work, case, release):
     shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
     first, project = built(ws, work, case, release, f"{case}-1")
-    if not release and case in REFUSED_IN_DEV:
-        if first.status == 0:
-            return "  the dev build made what Cranelift's native code can't guarantee"
-        if re.search(REFUSED_IN_DEV[case], first.said) is None:
-            return f"  the dev build failed without /{REFUSED_IN_DEV[case]}/:\n{first.said[-800:]}"
-        return None
     if first.status != 0 or not first.executable:
         return f"  blaze's build failed ({first.status}):\n{first.said[-800:]}"
     status, stdout, stderr = EXPECTED[case]
@@ -114,21 +122,21 @@ def check(ws, work, case, release):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("cases", nargs="*", default=CASES)
-    parser.add_argument("--release", action="store_true")
-    parser.add_argument("--keep", action="store_true", help="keep the copy of the workspace")
-    args = parser.parse_args()
+    if len(sys.argv) != 2:
+        sys.exit(__doc__)
+    it = parse(Input, sys.argv[1], "wholeprogram.py")
+    if not it.cases:
+        sys.exit("wholeprogram.py: cases is empty: leave it out for every case")
     work = scratch("blaze-wholeprogram-")
     ws = copy(os.path.join(HERE, "wholeprogram"), os.path.join(work, "ws"))
     failed = 0
-    for case in args.cases:
-        wrong = check(ws, work, case, args.release)
+    for case in it.cases:
+        wrong = check(ws, work, case, it.profile == "release")
         print(f"{case:15} {'WRONG' if wrong else 'ok'}")
         if wrong:
             print(wrong)
             failed += 1
-    if args.keep:
+    if it.keep:
         print(f"kept {ws}")
     else:
         shutil.rmtree(work, ignore_errors=True)

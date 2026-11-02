@@ -2,8 +2,11 @@
 //! its build scripts and proc macros, and the standard library, reached as a build reaches
 //! them, lowered to the IR copy-and-patch compiles and surveyed ([`blaze_stencil::survey`]).
 //! The table it writes lists each opcode and type no stencil writes, with how many
-//! instructions and functions hit it, then every other refusal. It fails while the table has
-//! a row: a gap is a build error, never another backend.
+//! instructions and functions hit it, then every other refusal, twice: over every function,
+//! and over the part a native dev build compiles as stencils (all but std's own functions,
+//! which are LLVM's as rustc ships std). It fails while the table has a row: a gap is a build
+//! error, never another backend. `"members_only": true` roots only the members, so std is
+//! surveyed as far as they reach it.
 //!
 //! `BLAZE_STENCIL_COVERAGE` is one JSON value, inline or a path to a file holding it:
 //!
@@ -16,7 +19,10 @@
 //! test reads each run's `output` and `OUT_DIR` from blaze's build directory), and its registry
 //! packages are fetched into `cargo_home` (`cargo fetch --locked`). `"unbuilt": true` on a
 //! project lowers it without its build scripts' runs instead: crates that read them lower
-//! without their generated code and cfgs, and the table says so. Run it with `--release`: the
+//! without their generated code and cfgs, and its proc macros run on blaze's MIR evaluator
+//! (the reference the wasm modules are tested against) over the same `wasm32-wasip1` crates,
+//! as no build linked their modules; the table says so. A built project's proc macros are the
+//! `wasm32-wasip1` modules its build linked, run under Wasmtime as a build runs them. Run it with `--release`: the
 //! front end lowers every function of the workspace and std. It prints one line per crate and
 //! rewrites `out` after each, so a run that dies still leaves its numbers. The test is
 //! `#[ignore]`d, as it reads the machine's checkouts: the harness runs it with `--ignored`.
@@ -64,6 +70,11 @@ struct Input {
     /// Print each function before it is lowered and surveyed: where a crash was.
     #[serde(default)]
     trace: bool,
+    /// Root only the projects' members: std's functions are surveyed as the members reach
+    /// them, not every function of std's crates. A dev build compiles std's own functions
+    /// with LLVM (shipped std), so only what the members instantiate is the stencils'.
+    #[serde(default)]
+    members_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -73,7 +84,8 @@ struct Project {
     dir: String,
     /// Where its registry packages were fetched.
     cargo_home: String,
-    /// Lower it without its build scripts' runs, for a workspace blaze has not built.
+    /// Lower it without its build scripts' runs and with its proc macros on the evaluator, for
+    /// a workspace blaze has not built.
     #[serde(default)]
     unbuilt: bool,
 }
@@ -102,20 +114,22 @@ fn coverage() {
     };
     let input: Input = serde_json::from_str(&text).unwrap_or_else(|error| panic!("BLAZE_STENCIL_COVERAGE: {error}"));
     let (policy, stencils) = policy().unwrap_or_else(|error| panic!("{error}"));
-    let mut tally = Tally::default();
+    let mut tally = Tallies::default();
     let out = input.out.as_deref();
-    tally.notes.push(
-        "std is planned as shipped (opt-level 3, its MIR inlined) and compiled by copy-and-patch; \
-         \"a relocation at a reference of a body built in\" is a reference inside an inlined body, \
-         which should go once std is planned at opt-level 0 (codegen queue 01466)"
+    tally.all.notes.push(
+        "std is planned as shipped (opt-level 3, its MIR inlined) and compiled by copy-and-patch \
+         here, though a build compiles std's own functions with LLVM"
             .to_owned(),
     );
     for project in &input.projects {
         if project.unbuilt {
-            tally.notes.push(format!("{}: lowered without its build scripts' runs", project.dir));
+            tally.all.notes.push(format!(
+                "{}: lowered without its build scripts' runs, its proc macros run on blaze's MIR evaluator, not as the modules a build links",
+                project.dir
+            ));
         }
         let (lowered, units) = lower(project).unwrap_or_else(|error| panic!("{error}"));
-        let crates = crates(&units, &lowered);
+        let crates = crates(&units, &lowered, input.members_only);
         eprintln!("{}: {} crates to survey", project.dir, crates.len());
         survey(lowered.db(), lowered.paths(), &crates, &policy, &stencils, &mut tally, out, input.trace)
             .unwrap_or_else(|error| panic!("{}: {error}", project.dir));
@@ -123,7 +137,43 @@ fn coverage() {
     let table = tally.table();
     eprintln!("{table}");
     write_out(out, &table);
-    assert!(tally.is_clean(), "functions copy-and-patch does not compile: the table is above");
+    assert!(tally.all.is_clean(), "functions copy-and-patch does not compile: the table is above");
+}
+
+/// Every function surveyed ([`Tallies::all`]) and the part of them a native dev build
+/// (opt-level 0, `Mode::Output`) compiles as stencils once stencils are its backend
+/// ([`Tallies::dev`]): all but what the plan gives LLVM at opt-level 2 or 3 (std's own
+/// functions, compiled as rustc ships them).
+#[derive(Default)]
+struct Tallies {
+    all: Tally,
+    dev: Tally,
+}
+
+impl Tallies {
+    fn function(&mut self, name: &str, errors: &[blaze_stencil::Error], dev: bool) {
+        self.all.function(name, errors);
+        if dev {
+            self.dev.function(name, errors);
+        }
+    }
+
+    fn unlowered(&mut self, name: &str, what: &str, dev: bool) {
+        self.all.unlowered(name, what);
+        if dev {
+            self.dev.unlowered(name, what);
+        }
+    }
+
+    fn table(&self) -> String {
+        let mut out = String::from("## Every function surveyed\n\n");
+        out.push_str(&self.all.table());
+        out.push_str(
+            "\n## What a native dev build compiles as stencils (all but std's own, which is LLVM's at -O3)\n\n",
+        );
+        out.push_str(&self.dev.table());
+        out
+    }
 }
 
 /// What the survey found, over every project.
@@ -301,6 +351,7 @@ fn policy() -> Result<(Policy, blaze_stencil::Target), String> {
         pgo: Pgo::None,
         proc_macro_bridge: false,
         report: false,
+        fuel: false,
         heap_to_stack: false,
     };
     Ok((policy, stencils))
@@ -317,9 +368,9 @@ fn tier_spec(mut spec: Spec) -> Spec {
 }
 
 /// Every crate to survey, once each, with the origin its code is asked as: the members'
-/// crates of every kind (libraries, binaries, tests, build scripts, proc macros) and the
-/// standard library's.
-fn crates(units: &Units, lowered: &Lowered) -> Vec<(Crate, PlanOrigin, String)> {
+/// crates of every kind (libraries, binaries, tests, build scripts, proc macros) and, unless
+/// `members_only`, the standard library's.
+fn crates(units: &Units, lowered: &Lowered, members_only: bool) -> Vec<(Crate, PlanOrigin, String)> {
     let members: HashMap<&str, &str> =
         units.packages.iter().filter(|it| it.is_member).map(|it| (it.id.as_str(), it.name.as_str())).collect();
     let mut out: Vec<(Crate, PlanOrigin, String)> = Vec::new();
@@ -328,6 +379,9 @@ fn crates(units: &Units, lowered: &Lowered) -> Vec<(Crate, PlanOrigin, String)> 
             continue;
         }
         let origin = if it.is_std {
+            if members_only {
+                continue;
+            }
             PlanOrigin::Std
         } else if let Some(name) = members.get(it.pkg_id.as_str()) {
             PlanOrigin::Member(Package::new(name))
@@ -351,7 +405,7 @@ fn survey(
     crates: &[(Crate, PlanOrigin, String)],
     policy: &Policy,
     stencils: &blaze_stencil::Target,
-    tally: &mut Tally,
+    tally: &mut Tallies,
     out: Option<&str>,
     trace: bool,
 ) -> Result<(), String> {
@@ -367,7 +421,7 @@ fn survey(
     let mut seen: HashSet<InstanceKey> = HashSet::new();
     let started = Instant::now();
     for (n, (krate, origin, name)) in crates.iter().enumerate() {
-        let (before, compiled) = (tally.functions, tally.compiled);
+        let (before, compiled) = (tally.all.functions, tally.all.compiled);
         eprintln!("[{}/{}] {name}: surveying", n + 1, crates.len());
         let surveyed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             survey_crate(&frontend, &backends, &memo, policy, stencils, &requester, *krate, *origin, &mut seen, tally, trace)
@@ -381,7 +435,7 @@ fn survey(
                     .map(String::as_str)
                     .or_else(|| panic.downcast_ref::<&str>().copied())
                     .unwrap_or("a panic");
-                tally.unreached(name, &format!("the survey of the crate panicked: {what}"));
+                tally.all.unreached(name, &format!("the survey of the crate panicked: {what}"));
                 (0, 0)
             }
         };
@@ -391,9 +445,9 @@ fn survey(
             crates.len(),
             roots,
             reached,
-            tally.functions - before,
-            tally.compiled - compiled,
-            tally.gaps.len(),
+            tally.all.functions - before,
+            tally.all.compiled - compiled,
+            tally.all.gaps.len(),
             started.elapsed()
         );
         write_out(out, &tally.table());
@@ -415,7 +469,7 @@ fn survey_crate(
     krate: Crate,
     origin: PlanOrigin,
     seen: &mut HashSet<InstanceKey>,
-    tally: &mut Tally,
+    tally: &mut Tallies,
     trace: bool,
 ) -> Result<(usize, usize), String> {
     let roots: Vec<(HirInstance, PlanOrigin)> = frontend.every_function(krate).into_iter().map(|it| (it, origin)).collect();
@@ -430,7 +484,7 @@ fn survey_crate(
                     Err(errors) => {
                         let name = frontend.describe(&root.0, requester).map_or_else(|_| format!("{:?}", root.0), |it| it.name);
                         let what = errors.first().map_or("no error given", |it| it.what.as_str());
-                        tally.unreached(&name, what);
+                        tally.all.unreached(&name, what);
                     }
                 }
             }
@@ -447,14 +501,17 @@ fn survey_crate(
             let described = match frontend.describe(instance, requester) {
                 Ok(described) => described,
                 Err(error) => {
-                    tally.unreached(&format!("{instance:?}"), &error.what);
+                    tally.all.unreached(&format!("{instance:?}"), &error.what);
                     continue;
                 }
             };
-            let spec = match policy.choose(&described.origin, described.overflow_checks) {
-                Ok(choice) => tier_spec(choice.first),
+            let (spec, dev) = match policy.choose(&described.origin, described.overflow_checks) {
+                Ok(choice) => {
+                    let dev = !matches!(choice.first.backend, Backend::Llvm { opt } if opt >= 2);
+                    (tier_spec(choice.first), dev)
+                }
                 Err(why) => {
-                    tally.unreached(&described.name, &why.to_string());
+                    tally.all.unreached(&described.name, &why.to_string());
                     continue;
                 }
             };
@@ -469,10 +526,10 @@ fn survey_crate(
             match lowered(frontend, &unit, &spec, instance, refs) {
                 Ok(Lowering::Ir { func, .. }) => {
                     let errors = blaze_stencil::survey(&func, stencils).map_err(|error| error.to_string())?;
-                    tally.function(&described.name, &errors);
+                    tally.function(&described.name, &errors, dev);
                 }
                 Ok(Lowering::Asm(_) | Lowering::Allocator(_)) => {}
-                Err(error) => tally.unlowered(&described.name, &error.what),
+                Err(error) => tally.unlowered(&described.name, &error.what, dev),
             }
         }
     }
@@ -651,7 +708,8 @@ fn ran(units: &Units, unit: usize) -> Result<Ran, String> {
 }
 
 /// The workspace at `dir` lowered as a build lowers it, each build script's run and each
-/// proc-macro crate's macros applied.
+/// proc-macro crate's macros applied: each its `wasm32-wasip1` module as `blaze build` linked
+/// it, run under Wasmtime as a build runs it.
 fn lower(project: &Project) -> Result<(Lowered, Units), String> {
     let (dir, cargo_home) = (project.dir.as_str(), project.cargo_home.as_str());
     let tree = tree();
@@ -674,14 +732,37 @@ fn lower(project: &Project) -> Result<(Lowered, Units), String> {
     }
     let toolchain = ContentId::of("blaze v2 stencil coverage toolchain 1", library()?.commit.as_bytes());
     let keeping = blaze_macro_eval::Macros::nothing("the stencil coverage test runs every expansion");
+    let modules = blaze_macro_eval::Modules::new().map_err(|why| format!("no Wasmtime engine for the proc macros: {why}"))?;
     for unit in 0..units.graph.units.len() {
         if !lowered.crates().is_proc_macro(unit) {
             continue;
         }
         let name = &units.graph.units[unit].target.name;
         let krate = lowered.krate(unit).ok_or_else(|| format!("proc macro `{name}` has no crate"))?;
-        let macros = blaze_macro_eval::load(lowered.db(), krate, toolchain, &keeping);
+        let macros = match project.unbuilt {
+            // No build linked its module: blaze's MIR evaluator, the wasm modules' reference
+            // engine, runs the same crate, and the table notes it.
+            true => blaze_macro_eval::load(lowered.db(), krate, toolchain, &keeping),
+            false => {
+                let bytes = module(&units, unit, name)?;
+                blaze_macro_eval::load_wasm(lowered.db(), krate, toolchain, &keeping, &modules, &bytes)
+            }
+        };
         lowered.macros(unit, macros).map_err(|error| format!("the macros of `{name}`: {error}"))?;
     }
     Ok((lowered, units))
+}
+
+/// The wasm module `blaze build` linked for proc-macro unit `unit`: the `.wasm` among its
+/// planned outputs, read from where that build wrote it.
+fn module(units: &Units, unit: usize, name: &str) -> Result<Vec<u8>, String> {
+    let plan = &units.plans[unit];
+    let path = plan
+        .outputs
+        .iter()
+        .find(|it| it.ends_with(".wasm"))
+        .ok_or_else(|| format!("proc macro `{name}` (unit {unit}) plans no `.wasm` module: every build plans its proc macros as wasm modules"))?;
+    std::fs::read(path).map_err(|error| {
+        format!("the wasm module of proc macro `{name}` at {path}: {error}; build the project with `blaze build` first")
+    })
 }

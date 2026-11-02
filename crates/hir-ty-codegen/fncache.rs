@@ -119,6 +119,17 @@ fn cached_closure_of<'db>(
     })
 }
 
+/// Why a cached function writes no hash of its body's code.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(super) enum Uncached {
+    /// What the body reaches, or what it is given, can make another result for the same
+    /// arguments: the program's doing. The function runs every time, and says why the first.
+    Impure(String),
+    /// blaze can't give the body a code identity. The build stops with this, naming the
+    /// function and the refusal: running it uncached in its place is a fallback (rule 3).
+    Refused(String),
+}
+
 /// The hash of the code of the closure a cached function keeps its body in and of all it
 /// reaches, or why the function can't be cached.
 #[blaze_query::tracked(returns(ref))]
@@ -126,10 +137,12 @@ pub(super) fn cache_code(
     db: &Db,
     closure: Instance,
     env: StoredParamEnvAndCrate,
-) -> std::result::Result<u128, String> {
+) -> std::result::Result<u128, Uncached> {
     let (trouble, counted) = arguments_trouble(db, &closure, &env);
-    // alloc: the error's message
-    let target = super::target_of_crate(db, env.as_ref(db).krate).map_err(|e| e.to_string())?;
+    let target = super::target_of_crate(db, env.as_ref(db).krate).map_err(|e| {
+        // alloc: the error's message
+        Uncached::Refused(format!("`{}` (`#[blaze::cache]`) has no target: {e}", cached_name(db, &closure)))
+    })?;
     let mut walk = Walk::new(db, target, counted);
     // clone: the root node owns its key; a stored param env is a reference count
     let root = walk.reach(Node::Instance(closure, env.clone()));
@@ -141,22 +154,30 @@ pub(super) fn cache_code(
     if let Some(why) = walk.impure(root).or(trouble) {
         let name = cached_name(db, &closure);
         // alloc: the error, why the function is not cached
-        return Err(format!("`{name}` is not cached: {why}"));
+        return Err(Uncached::Impure(format!("`{name}` is not cached: {why}")));
     }
     // What the closure can run is its behaviour identity: its code, its arguments, and the
     // CodeId of every instance it can reach, std's with them (docs/v2/plan/design/code-identity.md).
-    // One it can't be given is why the function is not cached, never another hash in its place.
+    // One it can't be given stops the build, never another hash or an uncached run in its place.
     let InstanceDef::Closure(id) = closure.def else {
         // alloc: the error's message
-        return Err(format!("`{}` is not cached: its body is not a closure", cached_name(db, &closure)));
+        return Err(Uncached::Refused(format!(
+            "`{}` (`#[blaze::cache]`): its body is not a closure",
+            cached_name(db, &closure)
+        )));
     };
     let root = hir_ty_identity::Instance {
         subject: hir_ty_identity::Subject::Body(hir_ty_mir::mir::dispatch::Body::Closure(id)),
         args: closure.args.clone(), // clone: the query's key, a reference count
     };
     let code = hir_ty_identity::code_id(db, &root, &env)
-        // alloc: the error, why the function is not cached
-        .map_err(|why| format!("`{}` is not cached: {why}", cached_name(db, &closure)))?;
+        .map_err(|why| {
+            // alloc: the error's message
+            Uncached::Refused(format!(
+                "`{}` (`#[blaze::cache]`) has no code identity for its body: {why}",
+                cached_name(db, &closure)
+            ))
+        })?;
     // The nightly: what is outside the checkout is linked as its pre-built std, whose code a
     // nightly can change.
     let mut hasher = blaze_ids::Hasher::new(CACHED_CODE_DOMAIN);
@@ -170,7 +191,8 @@ pub(super) fn cache_code(
 }
 
 /// What `instance` of the cached function `func` writes as the code of its body
-/// ([`FunctionCx::cache_code`]): the hash of all its closure reaches, or why it is not cached.
+/// ([`FunctionCx::cache_code`]): the hash of all its closure reaches, or why it is not cached
+/// or can't be compiled.
 /// `None` for a function that asks for no closure's code. The function's own code hash takes
 /// its closure by interface, so a key of its code must take this beside it.
 pub(super) fn written_code<'db>(
@@ -178,7 +200,7 @@ pub(super) fn written_code<'db>(
     func: FunctionId,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
-) -> Option<&'db std::result::Result<u128, String>> {
+) -> Option<&'db std::result::Result<u128, Uncached>> {
     let id = (*cached_closure_of(db, func))?;
     let closure = Instance {
         def: InstanceDef::Closure(id.as_id()),
@@ -1634,7 +1656,8 @@ fn trouble<'db>(
 impl<'db> FunctionCx<'_, 'db> {
     /// A call of `__blaze_cache_code::<F>`: writes the code of the closure `F` to `dst`, as
     /// the `Code` of `blaze::__private` has it. That is two words of hash, then the name of
-    /// the function, or why it can't be cached when the hash is zero.
+    /// the function, or why it can't be cached when the hash is zero. A body blaze can't give
+    /// a code identity is an error naming the function ([`Uncached::Refused`]).
     pub(super) fn cache_code(&mut self, generic_args: GenericArgs<'db>, dst: Value) -> Result<()> {
         let db = self.cg.db;
         let ty = generic_args.type_at(0);
@@ -1653,11 +1676,13 @@ impl<'db> FunctionCx<'_, 'db> {
         let env = Homes::default().home(db, &closure, &self.env.store());
         let (hash, text) = match cache_code(db, closure, env) {
             Ok(hash) => (*hash, cached_name(db, &closure)),
-            Err(why) => {
+            Err(Uncached::Impure(why)) => {
                 tracing::info!(target: "blaze", "{why}");
                 // clone: the constant's bytes own the text; the query keeps its own
                 (0, why.clone())
             }
+            // clone: the error owns its text; the query keeps its own
+            Err(Uncached::Refused(why)) => return Err(CodegenError::Refused(why.clone())),
         };
         let words = [hash as u64, (hash >> 64) as u64];
         for (i, word) in words.into_iter().enumerate() {

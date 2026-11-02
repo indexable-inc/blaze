@@ -669,10 +669,15 @@ fn hoisted<'db>(mir: &MirBody<'db>, if_: ExprId, condition: ExprId, lookup: Expr
     };
     // alloc: the temporaries one path writes, a few
     let mut written: Vec<LocalId> = Vec::new();
+    // A constant is inert in any of its forms: `Allocation` is how lowering writes a constant
+    // value it has the bytes of (a call's `FnDef` is one, with none), `Static` the address of a
+    // `static`.
     let readable = |operand: &Operand, written: &[LocalId]| match &operand.kind {
-        OperandKind::Copy(_) | OperandKind::Constant { .. } => true,
+        OperandKind::Copy(_)
+        | OperandKind::Constant { .. }
+        | OperandKind::Allocation { .. }
+        | OperandKind::Static(_) => true,
         OperandKind::Move(place) => place.projection.is_empty() && written.contains(&place.local),
-        _ => false,
     };
     for &block in &path {
         for statement in &blocks[block].statements {

@@ -64,7 +64,7 @@ a runtime bench, borrowck over the apps and wasm32 programs. The helpers other h
 moved: the DWARF reading of `debuginfo.py` to `dwarf.py`, and checking out and running the
 apps of `apps/apps.json` to `appruns.py`.
 
-`nativespans.py`: A native proc macro asks for a span's source text, line, column, byte range and file; edits and a daemon restart must print what blaze's build of the same source from nothing prints, under native and wasm expansion (#823).
+`nativespans.py`: A proc macro, run as a wasm module as every build runs it, asks for a span's source text, line, column, byte range and file; edits and a daemon restart must print what blaze's build of the same source from nothing prints (#823).
 
 `deriveerrors.py`: Unused invalid built-in derives fail check and build with the error each case names; a valid edit and a daemon restart preserve the verdict (#751).
 
@@ -130,8 +130,8 @@ home of their own when run by hand too.
 A part runs all of its harnesses even when one fails, then names the ones that failed and how
 long each took. Alongside the harnesses, CI runs `python3 harness/imports.py`, which imports
 every script of the harness, and
-`python3 harness/unittests.py`, which runs the Rust unit tests and holds them to its `OPEN`
-list (below). It is one `cargo test` from the root over blaze's crates and the front end's
+`python3 harness/unittests.py`, which runs the Rust unit tests and holds them to
+`harness/known-failures.toml` (below). It is one `cargo test` from the root over blaze's crates and the front end's
 (`hir-ty`, `hir-ty-mir`, `hir-def`, `ide-diagnostics` and the rest), all
 members of the one workspace; the root `.cargo/config.toml` sets `CARGO_WORKSPACE_DIR`, where
 expect-test finds the parser's `.rast` files.
@@ -158,7 +158,7 @@ code generator left in `crates/hir-ty-codegen/backend.rs`. So no harness sets th
 takes them away from its caller's environment: a run with one set fails as v2 says. CI's
 matrix has no backend; a harness that is to cover LLVM builds the release profile, as
 `fuzz/store.py` and `fuzz/edits.py` do (`"profiles": ["dev", "release"]`), `wholeprogram.py
---release`, and `bench.py`'s `llvm` (`--release` on both sides). `harness/v2/engine.py` (the
+'{"profile": "release"}'`, and `bench.py`'s `llvm` (`--release` on both sides). `harness/v2/engine.py` (the
 proof's) still sets `BLAZE_BACKEND` for every command ([The v2 proof](#the-v2-proof)). v1's
 recipe, for the record, was `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast` on that build.
 
@@ -173,7 +173,7 @@ recipe, for the record, was `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast` on 
 | `nightly_features.py '{"dry_run": true}'` | Not a check: keeps the GitHub issue tree of the pinned nightly's unstable features (#967), so every `#![feature(..)]` blaze has to accept is tracked. Each language feature of rustc_feature's `unstable.rs` at library/UPSTREAM's commit is an issue labelled `nightly-feature` under a group of at most 100 sub-issues; the library features (the `#[unstable]` and `#[rustc_const_unstable]` attributes of the sysroot crates in library/) are one issue, #969, for what blaze has to do for all of them (`'{"library": true}'` makes one each). A rerun creates only what is missing (by a hidden marker in each body), links what is not under its group, and comments on and closes the issue of a feature stabilized or removed since. `'{}'` makes the changes, paced under GitHub's limits. Needs `gh` |
 | `unwinds.py` | Edits to functions a panic unwinds through, each held to a fresh build (`rebuild.py`) |
 | `growth.py` | That the code of one function grows in a straight line with its source: the `serialize` `#[derive(Serialize)]` gives an internally tagged enum, a `?` in every arm, at 160 and 320 arms (issue #5); and a `load` filling a struct of 200 and 400 fields, each a call's `?` while a value with a destructor is live, as x11-dl opens Xlib's 781 functions. Built by `blaze build` (dev profile), measured with `llvm-nm`. Linux and macOS |
-| `wholeprogram.py` | Programs blaze builds whole, with its own `main`: one on the default allocator, one with a `#[global_allocator]` of its own, one with a library's, one whose allocator is under a `#[cfg]` that is false. Each is built by `blaze build` in an empty home and has to print and exit as its source says (`EXPECTED`), and a second build in another empty home has to give the same executable byte for byte ([#200](https://github.com/indexable-inc/blaze/issues/200)); `--release` builds them in the release profile |
+| `wholeprogram.py` | Programs blaze builds whole, with its own `main`: one on the default allocator, one with a `#[global_allocator]` of its own, one with a library's, one whose allocator is under a `#[cfg]` that is false, a trait's provided method calling a function declared in its body, a C `main`, and `become` tail calls (an interpreter of ten million steps on a 64 KiB stack). Each is built by `blaze build` in an empty home and has to print and exit as its source says (`EXPECTED`), and a second build in another empty home has to give the same executable byte for byte ([#200](https://github.com/indexable-inc/blaze/issues/200)); `'{"profile": "release"}'` builds them in the release profile. Its input is one JSON object (`cases`, `profile`, `keep`) |
 | `norustc.py` | How often rustc and rustdoc run when `harness/norustc/fixture` is built, edited, tested, doctested and checked with `blaze`, through a copy of the toolchain that logs every run; a count above `norustc/baseline.json` fails ([no-rustc.md](no-rustc.md), step A). `--record` lowers the baseline |
 
 ### Reading the workspace as cargo does
@@ -597,8 +597,23 @@ shows the rules, and Insights, Rule insights what they refused.
 What is known to be wrong is written down, says why, and does not fail the run. Once it comes
 out right, it fails the run until it is taken off the list:
 
-- `OPEN` in `unittests.py`: Rust unit tests that fail;
+- `harness/known-failures.toml`: Rust unit tests that fail, by crate and full name, each with
+  an owner (a lane or an issue) and a one-line cause, held by `harness/failures.py`;
 - `OPEN` in `dwarf.py`: `realdebug.py`'s checks whose frames or variables are wrong;
+
+`failures.py` reads a run's log (`cargo test` or `blaze test`, libtest's text or JSON format)
+and fails on a failing test that is not listed, a listed test that passes, is ignored or no
+longer exists, and a test binary that did not finish (a crash leaves the rest of its tests
+unchecked); each failure names the crate, the test and the tail of its output. Entries owned by
+`unowned` are listed without failing the run, and listed tests the run could not check (their
+crate did not run, filtered out, unreached by `blaze test`, or `only` for another runner,
+profile or OS) are counted, so a partial run never reads as clean. CI's `unittests.py` calls it
+on its log; a lane runs it on the crates it touched before saying a failure was there before:
+
+    uv run --frozen harness/failures.py '{"run": {"runner": "blaze", "packages": ["hir-def", "hir-ty-mir"]}}'
+    uv run --frozen harness/failures.py '{"results": ["test.log"], "runner": "cargo", "profile": "dev", "os": "macos"}'
+
+A failure joins the list only with an owner and a cause, in the change that explains it.
 
 ### The other workflows
 

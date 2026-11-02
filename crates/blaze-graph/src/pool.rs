@@ -28,8 +28,10 @@
 //! the calling worker, for memory it should keep local.
 //!
 //! Bound to its CPU, a worker is pinned to it on Linux (`sched_setaffinity`); on macOS, which
-//! pins nothing, it takes the QoS class of its kind of core: user-interactive on fast cores,
-//! utility on the others.
+//! pins nothing, every worker takes the QoS class `user-initiated`, the class of work a person
+//! waits for. No worker runs at `utility` or `background`: a loaded host gives those about 2%
+//! of a core, and any worker may run critical work, by stealing it or by a job others come to
+//! wait on, so a worker at such a class stalls the build ([`Topology::from_perflevels`]).
 //!
 //! Every job runs as a task of [`crate::pump`]'s stack, so a wait inside it pumps this pool.
 //!
@@ -1668,15 +1670,14 @@ fn bind_to(cpu: &Cpu) -> io::Result<()> {
     blaze_mem::chunks::set_thread_node(Some(cpu.node)).map_err(io::Error::other)
 }
 
+/// The QoS class of every worker on macOS: what a build someone waits for is.
+#[cfg(target_os = "macos")]
+const WORKER_QOS: libc::qos_class_t = libc::qos_class_t::QOS_CLASS_USER_INITIATED;
+
 #[cfg(target_os = "macos")]
 fn bind_to(cpu: &Cpu) -> io::Result<()> {
-    let class = if cpu.fast {
-        libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE
-    } else {
-        libc::qos_class_t::QOS_CLASS_UTILITY
-    };
     // SAFETY: sets the calling thread's own QoS class; no memory is passed.
-    let got = unsafe { libc::pthread_set_qos_class_self_np(class, 0) };
+    let got = unsafe { libc::pthread_set_qos_class_self_np(WORKER_QOS, 0) };
     if got == 0 {
         Ok(())
     } else {
@@ -2873,12 +2874,17 @@ mod tests {
         }
     }
 
-    /// Two fast groups of two and a slow group of four: a critical job goes to its `near`
-    /// group only if that is fast, else to a fast group; any other job goes to `near`, and one
-    /// near no group to a least loaded one (fast first on a tie, so group 0 when idle).
+    /// Two fast groups of two and a slow group of four (an Arm big.LITTLE machine's shape; a
+    /// Mac's are all fast): a critical job goes to its `near` group only if that is fast, else
+    /// to a fast group; any other job goes to `near`, and one near no group to a least loaded
+    /// one (fast first on a tie, so group 0 when idle).
     #[test]
     fn a_critical_job_is_placed_on_a_fast_group() {
-        let topology = Topology::from_perflevels(&[(4, 2), (4, 4)]);
+        let topology = Topology {
+            cpus: (0..8u32)
+                .map(|id| Cpu { id, group: (id / 2).min(2), socket: 0, node: 0, fast: id < 4 })
+                .collect(),
+        };
         let pool = Pool::new(&topology, false).unwrap();
         let shared = &*pool.shared;
         assert!(shared.mixed);
@@ -2977,6 +2983,49 @@ mod tests {
             move |it| _ = tx.send(it.unwrap()),
         );
         assert!(rx.recv_timeout(LONG).unwrap());
+    }
+
+    /// Every worker of a bound pool runs at `user-initiated`, whatever the performance level
+    /// of its CPU: none at `utility` or `background`, which a loaded host starves while the
+    /// worker steals critical jobs (the self-build profile of 2026-11-02: 12 of 18 workers at
+    /// `utility` got about 2% of a core each and did 78-92% of the build's job time).
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn no_worker_runs_at_a_qos_class_a_loaded_host_starves() {
+        let topology = Topology::detect().unwrap();
+        let pool = Pool::new(&topology, true).unwrap();
+        let workers = pool.workers();
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = unbounded::<(Option<usize>, u32)>();
+        for _ in 0..workers {
+            let (tx, arrived) = (tx.clone(), Arc::clone(&arrived));
+            pool.submit(
+                None,
+                move || {
+                    let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+                    let mut relative = 0;
+                    // SAFETY: the calling thread's own class and priority, written into the two
+                    // locals; the class is one of `qos_class_t`'s, as the kernel only has those.
+                    let got = unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut relative) };
+                    assert_eq!(got, 0, "pthread_get_qos_class_np");
+                    let index = super::with_local(|local| local.index);
+                    // Each job is held until every worker holds one, so each worker runs one.
+                    arrived.fetch_add(1, Ordering::SeqCst);
+                    until("every worker holds a job", || arrived.load(Ordering::SeqCst) == workers);
+                    (index, class as u32)
+                },
+                move |it| _ = tx.send(it.unwrap()),
+            );
+        }
+        drop(tx);
+        let mut ran = vec![false; workers];
+        for (index, class) in rx.iter() {
+            let index = index.expect("a job runs on a worker");
+            assert!(!std::mem::replace(&mut ran[index], true), "worker {index} ran two jobs");
+            assert_eq!(class, super::WORKER_QOS as u32, "the QoS class of worker {index} of {:?}", topology.cpus[index]);
+        }
+        assert!(ran.iter().all(|it| *it), "not every worker ran a job: {ran:?}");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -35,6 +35,7 @@ parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 smallvec.workspace = true
 thin-vec.workspace = true
+tracing.workspace = true
 triomphe.workspace = true
 
 [target.'cfg(blaze_check)'.dependencies]

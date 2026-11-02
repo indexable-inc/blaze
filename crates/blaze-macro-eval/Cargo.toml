@@ -25,6 +25,7 @@ blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-graph.workspace = true
 blaze-ids.workspace = true
+blaze-items.workspace = true
 blaze-profile.workspace = true
 blaze-usercode.workspace = true
 cfg.workspace = true
@@ -58,6 +59,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 # WebAssembly text for the host's tests' modules.
 wasmtime = { workspace = true, features = ["wat"] }
+# The binary of a test's module, whose custom sections the host reads itself.
+wat = "1.263.0"
 
 [lints]
 workspace = true

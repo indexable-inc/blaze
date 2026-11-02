@@ -106,7 +106,10 @@ fn what_an_edit_moves_is_found_where_it_moved_to() {
 #[test]
 fn a_crate_linted_with_syntactic_lints_only_infers_nothing() {
     let (db, _) = db(TWO);
-    let setup = setup("-A clippy::all -W clippy::collapsible_if");
+    // Every lint on by default that reads types is off: clippy's (pedantic and nursery warn by
+    // default too, `redundant_clone` reads MIR) and blaze's general lints (`borrow_workaround`
+    // infers bodies).
+    let setup = setup(&format!("{} -A blaze::general -W clippy::collapsible_if", crate::tests::CLIPPY_OFF));
     let mut found = 0;
     let executed = db.log_executed(|| found = lint(&db, &setup));
     assert_eq!(found, 1);

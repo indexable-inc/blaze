@@ -407,13 +407,29 @@ pub struct Inline<W: Work> {
     queue: VecDeque<Posted<W>>,
     /// Reused by every take.
     posted: Vec<Posted<W>>,
+    /// Kinds whose tasks stay queued, still running, until released ([`Inline::hold`]).
+    held: Vec<TaskKind>,
 }
 
 type Posted<W> = (Posting, Arc<W>, <W as Work>::Readers);
 
 impl<W: Work> Inline<W> {
     pub fn new(seed: u64) -> Inline<W> {
-        Inline { rng: Rng::new(seed), queue: VecDeque::new(), posted: Vec::new() }
+        // alloc: the simulation's runner, once per daemon; `held` stays empty unless a test holds a kind
+        Inline { rng: Rng::new(seed), queue: VecDeque::new(), posted: Vec::new(), held: Vec::new() }
+    }
+
+    /// Every task of `kind`, posted or to be, stays queued and counted running until
+    /// [`Inline::release`]: a task that runs long on a worker (a large front end's store), so a
+    /// test can ask something while it runs, which an inline run, over as it is taken, never
+    /// lets happen. Nothing else changes: with no kind held, a take is as it was, seed for seed.
+    pub fn hold(&mut self, kind: TaskKind) {
+        self.held.push(kind);
+    }
+
+    /// The tasks of `kind` run again from the next take ([`Inline::hold`]).
+    pub fn release(&mut self, kind: TaskKind) {
+        self.held.retain(|it| *it != kind);
     }
 
     fn post(&mut self, task: Posting, work: Arc<W>, readers: W::Readers) {
@@ -426,6 +442,20 @@ impl<W: Work> Inline<W> {
         }
         let mut posted = std::mem::take(&mut self.posted);
         posted.extend(self.queue.drain(..));
+        if !self.held.is_empty() {
+            let mut at = 0;
+            while at < posted.len() {
+                if self.held.contains(&posted[at].0.kind) {
+                    self.queue.push_back(posted.remove(at));
+                } else {
+                    at += 1;
+                }
+            }
+            if posted.is_empty() {
+                self.posted = posted;
+                return;
+            }
+        }
         self.rng.shuffle(&mut posted);
         let now = 1 + self.rng.below(posted.len() as u64) as usize;
         self.queue.extend(posted.drain(now..));
@@ -442,7 +472,7 @@ impl<W: Work> Inline<W> {
     }
 
     fn ready(&self) -> bool {
-        !self.queue.is_empty()
+        self.queue.iter().any(|(task, ..)| !self.held.contains(&task.kind))
     }
 
     fn running(&self) -> usize {
@@ -800,6 +830,12 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// How many thread tasks run.
     pub fn running(&self) -> usize {
         self.runner.running()
+    }
+
+    /// Its runner, for a test to hold a kind of task on the simulation's ([`Inline::hold`]).
+    #[cfg(test)]
+    pub(super) fn runner_mut(&mut self) -> &mut Runner<W> {
+        &mut self.runner
     }
 
     /// How many loop tasks run ([`Happened::Run`], not yet [`Plane::ended`]).

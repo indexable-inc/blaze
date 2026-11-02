@@ -7,10 +7,13 @@
 //!
 //! A module is compiled once a daemon, through the daemon's [`Modules`], and its machine code
 //! kept in the daemon's own store, from where alone it is loaded again ([`code`]). Each
-//! expansion runs in a fresh instance, so no expansion sees what another left: a library of
-//! modules is stateless, and its calls are kept and found as any other run of user code. An
-//! instance runs on an expansion thread, never on a fiber, and the job asking for it answers
-//! what it asks of the database ([`thread`]).
+//! expansion runs in a fresh instance, given the state the calls before it left: the statics
+//! of the macro's crates its code can write, which the link lists in the module ([`statics`]),
+//! are written after the instance's `_initialize` and before its macro runs, and what the macro
+//! changed of them is what it left ([`Ran::statics`]), as the evaluator says it. A static left
+//! holding an address of the heap, which a fresh instance has not, stops the expansion naming
+//! the static. An instance runs on an expansion thread, never on a fiber, and the job asking
+//! for it answers what it asks of the database ([`thread`]).
 //!
 //! Every way a module can't be loaded or run is an error naming the macro ([`LoadError`],
 //! [`Stop`]); nothing runs it on the evaluator instead.
@@ -23,17 +26,19 @@ mod code;
 mod engine;
 mod glue;
 mod host;
+mod statics;
 mod thread;
 mod wasi;
 
 #[cfg(test)]
 mod tests;
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
-use base_db::{Db, Env};
+use base_db::{Crate, Db, Env};
 use blaze_cas::{Kind, Origin, Reader};
 use blaze_ids::ContentId;
+use hir_def::StaticId;
 use proc_macro_api::kept::{Keeps, Put, put};
 use span::{Edition, Span};
 use wasmtime::InstancePre;
@@ -46,7 +51,8 @@ use self::{
     abi::Mismatch,
     code::{Codes, module_id},
     engine::Engines,
-    host::{Cx, Host},
+    host::{Cx, Host, Watch},
+    statics::{List, Statics},
 };
 use crate::{
     guest::Stop,
@@ -73,6 +79,9 @@ pub(crate) enum LoadError {
     Mismatch(Mismatch),
     /// Its imports did not link against the host's shims.
     Link(String),
+    /// Its list of the statics its code can write is missing or wrong, or names a static of
+    /// none of its crates (`statics.rs`).
+    Statics(String),
 }
 
 impl fmt::Display for LoadError {
@@ -96,6 +105,7 @@ impl fmt::Display for LoadError {
             ),
             LoadError::Mismatch(mismatch) => write!(f, "{mismatch}"),
             LoadError::Link(why) => write!(f, "does not link against the host's shims: {why}"),
+            LoadError::Statics(why) => f.write_str(why),
         }
     }
 }
@@ -144,10 +154,13 @@ struct Given<'a> {
     forced_keywords: bool,
 }
 
-/// A proc-macro crate's module, ready to instantiate once per expansion.
+/// A proc-macro crate's module, ready to instantiate once per expansion, and the statics its
+/// expansions watch and carry ([`Library::watch`]).
 pub(crate) struct Library {
     id: ContentId,
     pre: InstancePre<Host>,
+    list: List,
+    statics: Arc<Statics>,
 }
 
 impl fmt::Debug for Library {
@@ -187,7 +200,19 @@ impl Library {
         let linker = host::linker(&engines.engine).map_err(|e| LoadError::Link(format!("{e:#}")))?;
         // alloc: error path
         let pre = linker.instantiate_pre(&loaded.module).map_err(|e| LoadError::Link(format!("{e:#}")))?;
-        Ok((Library { id, pre }, loaded.put))
+        let list = List::parse(bytes).map_err(LoadError::Statics)?;
+        // alloc: once a module loaded
+        let statics = Arc::new(Statics::unresolved(&list));
+        Ok((Library { id, pre, list, statics }, loaded.put))
+    }
+
+    /// Finds each static its list names among the crates `krate`, the proc-macro crate it was
+    /// built from, reaches: the ones its expansions watch and carry, the standard library's
+    /// aside. Until then, a module whose list names any runs nothing.
+    pub(crate) fn watch(&mut self, db: &Db, krate: Crate) -> Result<(), LoadError> {
+        // alloc: once a module loaded
+        self.statics = Arc::new(Statics::resolve(db, krate, &self.list).map_err(LoadError::Statics)?);
+        Ok(())
     }
 
     /// The module's id, which the keys of its expansions say.
@@ -196,14 +221,18 @@ impl Library {
     }
 
     /// Runs the macro at `index` (of `run::functions`) on the one expansion of `expansions`,
-    /// with the calling crate's `env`. A fresh instance has no state, so there are no earlier
-    /// calls to run again; given some, it stops.
+    /// with the calling crate's `env`, from the statics `preset` (what the calls before it
+    /// left, as [`Ran::statics`] said each), in the working directory `cwd` (the call's, which
+    /// the module's glue enters). An instance can't be given what calls before it
+    /// left on its heap, so there are no earlier calls to run again; given some, it stops.
     pub(crate) fn run(
         &self,
         db: &Db,
         env: &Env,
         index: u32,
         expansions: &[Expansion<'_>],
+        preset: &[(StaticId, Vec<u8>)],
+        cwd: &str,
         spent: &mut Spent,
     ) -> Result<Ran, Stop> {
         spent.evaluated = false;
@@ -221,12 +250,51 @@ impl Library {
             edition: expansion.edition,
             forced_keywords: expansion.forced_keywords,
         };
-        self.expand(db, env, index, &given, spent)
+        self.expand(db, env, index, &given, preset, cwd, spent)
     }
 
-    /// Runs the macro at `index` on `given` in a fresh instance, on an expansion thread
-    /// ([`thread`]), what it asks of the database answered from `db` on this one.
-    fn expand(&self, db: &Db, env: &Env, index: u32, given: &Given<'_>, spent: &mut Spent) -> Result<Ran, Stop> {
+    /// Runs the macro at `index` on `given` in a fresh instance from the statics `preset`, on
+    /// an expansion thread ([`thread`]), what it asks of the database answered from `db` on
+    /// this one.
+    fn expand(
+        &self,
+        db: &Db,
+        env: &Env,
+        index: u32,
+        given: &Given<'_>,
+        preset: &[(StaticId, Vec<u8>)],
+        cwd: &str,
+        spent: &mut Spent,
+    ) -> Result<Ran, Stop> {
+        let statics = &*self.statics;
+        if !statics.resolved {
+            return Err(Stop(format!(
+                "ran from a module whose `{}` list was not resolved against its crates, so the state \
+                 it keeps between calls can't be named",
+                statics::SECTION
+            )));
+        }
+        // alloc: once per expansion, where the state it is given is written
+        let mut writes = Vec::with_capacity(preset.len());
+        for (id, bytes) in preset {
+            let Some(places) = statics.places(*id, bytes) else {
+                // alloc: error path
+                return Err(Stop(format!(
+                    "was given {} bytes of state for a static its module does not list as {:?}",
+                    bytes.len(),
+                    id
+                )));
+            };
+            writes.extend(places.map(|(at, part)| (at, part.to_vec()))); // alloc: as above
+        }
+        let mut watch = Watch {
+            statics: Arc::clone(&self.statics), // clone: a refcount, given to the expansion's thread
+            writes,
+            before: Vec::new(),
+            after: Vec::new(),
+            memory_len: 0,
+            started: false,
+        };
         let mut server = Server::new(given.sites, given.edition, given.forced_keywords);
         // alloc: once per expansion, its input's bytes
         let mut input = Vec::new();
@@ -235,9 +303,11 @@ impl Library {
         let pre = self.pre.clone();
         // clone: the calling crate's variables, given to the expansion's thread once per expansion
         let env = env.clone();
-        let (ran, used) = thread::run(db, move |link: &thread::Link<(Result<Ran, Stop>, host::Used)>| {
-            let mut cx = Cx::new(link, server, Os::wasm(&env));
-            let (output, used) = host::expand(&pre, &mut cx, index, &input);
+        // alloc: the call's directory, given to the expansion's thread once per expansion
+        let cwd = cwd.to_owned();
+        let (ran, used, watch) = thread::run(db, move |link: &thread::Link<(Result<Ran, Stop>, host::Used, Watch)>| {
+            let mut cx = Cx::new(link, server, Os::wasm_in(&env, &cwd));
+            let (output, used) = host::expand(&pre, &mut cx, index, &input, &mut watch);
             let Cx { server, os, .. } = cx;
             let ran = output.map(|output| Ran {
                 output,
@@ -249,11 +319,43 @@ impl Library {
                 unkeyable: os.unkeyable().map(str::to_owned),
                 statics: Vec::new(),
             });
-            (ran, used)
+            (ran, used, watch)
         })?;
         spent.steps = used.fuel;
         spent.peak_bytes = used.peak_bytes;
         spent.over = used.over;
-        ran
+        let mut ran = ran?;
+        ran.statics = self.left(&watch)?;
+        Ok(ran)
+    }
+
+    /// The statics `watch` saw the macro change, each with its bytes as it left them. One left
+    /// holding an address of the heap stops: a next instance has no such heap, and giving it
+    /// the calls before again in one instance is not done yet.
+    fn left(&self, watch: &Watch) -> Result<Vec<(StaticId, Vec<u8>, bool)>, Stop> {
+        let statics = &*self.statics;
+        // alloc: once per expansion, what it left (nothing for most)
+        let mut left = Vec::new();
+        if !watch.started {
+            return Ok(left);
+        }
+        for (at, watched) in statics.watched.iter().enumerate() {
+            let span = statics.span(at);
+            let (before, after) = (&watch.before[span.clone()], &watch.after[span]);
+            if before == after {
+                continue;
+            }
+            if statics.holds_heap_address(at, after, watch.memory_len) {
+                // alloc: error path
+                return Err(Stop(format!(
+                    "left an address of its heap in the static `{}`, which no next call's fresh \
+                     instance has: carrying it needs the calls before run again in one instance, \
+                     which the wasm host does not do yet",
+                    watched.path
+                )));
+            }
+            left.push((watched.id, after.to_vec(), false)); // alloc: as above
+        }
+        Ok(left)
     }
 }

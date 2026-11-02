@@ -97,6 +97,57 @@ pub fn ended_within(pid: u32, long: Duration) -> std::io::Result<bool> {
     readable_within(queue.as_fd(), long)
 }
 
+/// Waits for the child `pid` to exit without reaping it (`waitid` with `WNOWAIT`), so its
+/// `std::process::Child` still waits for it and its pid is no other process's until then: a
+/// test executable's exit, waited for apart from its output (`cli::live`). A `pid` that is no
+/// child of this process (one already reaped) is refused with `ECHILD`.
+#[cfg(unix)]
+pub fn wait_exited(pid: u32) -> std::io::Result<()> {
+    loop {
+        // SAFETY: `siginfo_t` is a C struct of integers and unions of them, for which all-zero
+        // bytes is a valid value.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live local the call writes and does not keep; `waitid` takes no
+        // other pointer, and `WNOWAIT` changes nothing of the child it waits for.
+        if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Waits for the process `pid` to exit. A child's pid is no other process's while its
+/// `std::process::Child` holds its handle, which the caller's does until it waited.
+#[cfg(windows)]
+pub fn wait_exited(pid: u32) -> std::io::Result<()> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::WAIT_OBJECT_0,
+        System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+    // SAFETY: `OpenProcess` takes no pointer; any `pid` is either opened or refused with null.
+    // The handle it opens is owned below, so it is closed once.
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if process.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `process` is an open handle that nothing else owns: `OpenProcess` just made it.
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    // SAFETY: the handle is open for as long as `process` lives, which outlives the call.
+    match unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } {
+        WAIT_OBJECT_0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn wait_exited(pid: u32) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("waiting for process {pid} to exit is not built for this platform")))
+}
+
 /// How a child of this process ended.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reaped {

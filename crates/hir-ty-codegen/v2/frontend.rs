@@ -1147,7 +1147,10 @@ fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String
             hasher.id(&code.0);
             match written {
                 Ok(hash) => hasher.update(&[0]).update(&hash.to_le_bytes()),
-                Err(why) => hasher.update(&[1]).update(why.as_bytes()),
+                Err(fncache::Uncached::Impure(why)) => hasher.update(&[1]).update(why.as_bytes()),
+                // The body has no code identity: the function has no code either (rule 3).
+                // clone: the error owns its text; the query keeps its own
+                Err(fncache::Uncached::Refused(why)) => return Err(why.clone()),
             };
             Ok(CodeHash(hasher.finish()))
         }

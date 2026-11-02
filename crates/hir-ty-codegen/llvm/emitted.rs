@@ -1128,6 +1128,11 @@ impl<'data, 'file> Emitted<'data, 'file> {
         if let Some(libcall) = LibCall::all_libcalls().iter().find(|&&it| names(it) == name) {
             return Ok(ModuleRelocTarget::LibCall(*libcall));
         }
+        // A metered function's calls of the fuel runtime, as the IR named them.
+        let fuel = [blaze_stencil::fuel::CELL, blaze_stencil::fuel::OUT];
+        if let Some(index) = fuel.into_iter().find(|&it| blaze_stencil::fuel::symbol(it) == Some(name)) {
+            return Ok(ModuleRelocTarget::user(blaze_stencil::fuel::NAMESPACE, index));
+        }
         // A function LLVM calls of its own accord that Cranelift has no name for: a libm
         // rounding function, wide division. Nothing is checked against the signature of an
         // import.

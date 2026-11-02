@@ -2,18 +2,28 @@
 //! their keys, the arrangements the slices are published from, and the read sets that say
 //! which keys a write may have changed.
 //!
-//! A run goes over the crates in dependency order, skipping frozen ones. For each it applies
-//! name resolution's delta (impls and derives added or removed, traits declared or gone),
-//! recomputes the keys of the impls the write woke and the body parts of the modules it may
-//! have changed the bodies of, publishes the slices whose rows changed, and hands the next
-//! maintainer what changed ([`ImplsDelta`]). A key or body part is recomputed through the pure
-//! queries, so recomputing one that did not change costs memo validations and changes nothing.
-//! What a run reads, the maintainer's reads read first, across the crates on the database's
-//! workers ([`warm`], then [`warm_bodies`]): the run diffs memos.
+//! A run goes over the crates not frozen. For each it applies name resolution's delta (impls
+//! and derives added or removed, traits declared or gone), recomputes the keys of the impls the
+//! write woke and the body parts of the modules it may have changed the bodies of, publishes
+//! the slices whose rows changed, and hands the next maintainer what changed ([`ImplsDelta`]).
+//! A key or body part is recomputed through the pure queries, so recomputing one that did not
+//! change costs memo validations and changes nothing. What a run reads, the maintainer's reads
+//! read first, across the crates on the database's workers ([`warm`], then [`warm_bodies`]):
+//! the run diffs memos.
+//!
+//! A crate's work reads only its own state, the memos and what the run's start fixed (which
+//! impls the write woke, and whose they were), so the crates are worked on at once on the
+//! database's workers ([`Db::run_each`]), each into its own [`CrateState`] and [`CrateScratch`].
+//! What they change of the state shared across crates (the read indexes, the impls' owners)
+//! and of the database (the slices) is applied after, one crate at a time in the crates' order,
+//! so no result depends on which worker ran which crate. Every new crate's directory is
+//! registered with one write at the end: a write opens a view, and a view sweeps every `lru`
+//! table, so a write per crate was a sweep per crate.
 
 use base_db::{Crate, Db, Written};
 use blaze_dbsp::{Arrangement, Pos, ReadIndex, Work};
 use blaze_hash::{HashMap, HashSet};
+use blaze_mem::Tag;
 use std::alloc::Global;
 use hir_def::{
     BuiltinDeriveImplId, HasModule, ImplId, ModuleDefId, ModuleId, TraitId,
@@ -33,7 +43,7 @@ use super::{
     ImplsDelta,
     head::Head,
     key::{ImplKey, Reads, assoc_names, derive_key, derive_module, impl_key, impl_reads},
-    publish::{CandidateRows, InherentRows, Published, TraitRows},
+    publish::{self, CandidateRows, InherentRows, Published, SliceDirectory, TraitRows},
     read::{BodyPart, body_part},
 };
 use crate::method_resolution::{frozen, macros_writing_impls};
@@ -87,6 +97,8 @@ pub(crate) struct CrateState {
     /// in a body, so a change of it reads every module's bodies again.
     macros: Option<Box<[(Symbol, bool)]>>,
     published: Published,
+    /// The crate's buffers, kept from one write to the next.
+    scratch: CrateScratch,
 }
 
 /// Every crate's state, and the read sets across crates: an alias edited in a dependency wakes
@@ -101,17 +113,26 @@ pub struct State {
     scratch: Scratch,
 }
 
-/// Buffers kept from one write to the next.
+/// The run's buffers across crates, kept from one write to the next.
 #[derive(Default)]
 struct Scratch {
-    reads: Reads,
     deltas: HashMap<Crate, usize, Global>,
     names: HashSet<Name, Global>,
     defs: HashSet<ModuleDefId, Global>,
     woken: HashSet<ImplId, Global>,
+    jobs: Vec<Job>,
+    directories: Vec<(Crate, SliceDirectory)>,
+}
+
+/// One crate's buffers, kept from one write to the next: what its work in a run uses, and what
+/// it hands the run's serial end ([`finish_crate`]).
+#[derive(Default)]
+struct CrateScratch {
+    reads: Reads,
     done: HashSet<ImplId, Global>,
     kinds: HashMap<ImplId, bool, Global>,
     kinds_of: HashSet<ModuleId, Global>,
+    woken: Vec<ImplId>,
     trait_keys: Vec<TraitId>,
     head_keys: Vec<Head>,
     name_keys: Vec<Name>,
@@ -121,6 +142,63 @@ struct Scratch {
     units: Vec<()>,
     keys_changed: Vec<ImplId>,
     traits_changed: Vec<TraitId>,
+    /// What the work did to the state shared across crates, in order: replayed by
+    /// [`finish_crate`]. A `Note`'s names and defs are the next ones of `read_names` and
+    /// `read_defs`.
+    index: Vec<IndexOp>,
+    read_names: Vec<Name>,
+    read_defs: Vec<ModuleDefId>,
+    /// The slices whose rows the work made, set by [`finish_crate`] unless they hold them.
+    trait_rows: Vec<(TraitId, TraitRows)>,
+    head_rows: Vec<(Head, InherentRows)>,
+    name_rows: Vec<(Name, CandidateRows)>,
+    /// The directory's body modules, when the work read them again.
+    inherent_bodies: Option<Vec<ModuleId>>,
+}
+
+impl CrateScratch {
+    /// Empties what one run's work fills.
+    fn start(&mut self) {
+        self.done.clear();
+        self.kinds.clear();
+        self.kinds_of.clear();
+        self.keys_changed.clear();
+        self.traits_changed.clear();
+        debug_assert!(self.index.is_empty() && self.trait_rows.is_empty());
+    }
+}
+
+/// A change to the state shared across crates, as a crate's work made it.
+#[derive(Clone, Copy)]
+enum IndexOp {
+    /// `forget_reads`: the impl's read set dropped.
+    Forget(ImplId),
+    /// The impl is no longer the crate's.
+    Disown(ImplId),
+    /// The impl is the crate's.
+    Own(ImplId),
+    /// The impl's read set, `names` names and `defs` defs, and whether it is wild.
+    Note { imp: ImplId, names: u32, defs: u32, wild: bool },
+}
+
+/// One crate's work in a run: its state out of [`State::crates`] while the run has it.
+struct Job {
+    krate: Crate,
+    /// Its delta, by index into the write's `LastWrite::crates`.
+    delta: Option<usize>,
+    fresh: bool,
+    crate_state: CrateState,
+    scratch: CrateScratch,
+    work: Work,
+}
+
+/// What every crate's work reads that is not its own: fixed at the run's start.
+struct Shared<'a> {
+    last: &'a LastWrite,
+    owner: &'a HashMap<ImplId, Crate, Global>,
+    woken: &'a HashSet<ImplId, Global>,
+    crates_changed: bool,
+    changed: bool,
 }
 
 impl State {
@@ -131,7 +209,7 @@ impl State {
     }
 }
 
-/// One write's run over every crate; what changed of each, into `out`.
+/// One write's run over every crate; what changed of each, into `out`, in the crates' order.
 pub(crate) fn run(
     db: &mut Db,
     state: &mut State,
@@ -148,9 +226,6 @@ pub(crate) fn run(
     scratch.names.clear();
     scratch.defs.clear();
     scratch.woken.clear();
-    scratch.done.clear();
-    scratch.kinds.clear();
-    scratch.kinds_of.clear();
     for (at, delta) in last.crates.iter().enumerate() {
         scratch.deltas.insert(delta.krate, at);
         scratch.names.extend(delta.bindings.iter().map(|&(_, name)| name));
@@ -167,14 +242,66 @@ pub(crate) fn run(
     if changed {
         scratch.woken.extend(state.wild.iter().copied());
     }
+    let mut jobs = std::mem::take(&mut state.scratch.jobs);
+    jobs.clear();
     for &krate in crates.iter() {
         if frozen::served(&*db, krate) {
             continue;
         }
-        let delta = state.scratch.deltas.get(&krate).map(|&at| &last.crates[at]);
-        let work = run_crate(db, state, krate, delta, written.crates, changed, out);
-        db.report_work(NAME, krate, work);
+        let delta = state.scratch.deltas.get(&krate).copied();
+        jobs.push(start_crate(state, last, krate, delta));
     }
+    {
+        let _span = tracing::info_span!(target: "blaze", "impls work", count = jobs.len()).entered();
+        let shared = Shared {
+            last,
+            owner: &state.owner,
+            woken: &state.scratch.woken,
+            crates_changed: written.crates,
+            changed,
+        };
+        db.run_each(Tag::Infer, &mut jobs, |db, job| work_crate(db, &shared, job));
+    }
+    let mut directories = std::mem::take(&mut state.scratch.directories);
+    directories.clear();
+    for job in jobs.drain(..) {
+        finish_crate(db, state, job, &mut directories, out);
+    }
+    {
+        let _span =
+            tracing::info_span!(target: "blaze", "impls register", count = directories.len()).entered();
+        publish::register(db, &directories);
+    }
+    directories.clear();
+    state.scratch.directories = directories;
+    state.scratch.jobs = jobs;
+}
+
+/// Takes `krate`'s state out for its work, forgetting what it held first when name resolution
+/// maintains it from empty (`fresh`).
+fn start_crate(state: &mut State, last: &LastWrite, krate: Crate, delta: Option<usize>) -> Job {
+    let fresh = delta.is_some_and(|at| last.crates[at].fresh);
+    let Some(mut crate_state) = state.crates.remove(&krate) else {
+        if !fresh {
+            panic!(
+                "impls: crate {krate:?} has no maintained impl tables and name resolution handed \
+                 it no fresh delta"
+            );
+        }
+        let mut scratch = CrateScratch::default();
+        scratch.start();
+        return Job { krate, delta, fresh, crate_state: CrateState::default(), scratch, work: Work::default() };
+    };
+    let mut scratch = std::mem::take(&mut crate_state.scratch);
+    scratch.start();
+    if fresh {
+        crate_state = reset(state, crate_state, &mut scratch);
+        let (traits, heads, names) = crate_state.published.keys();
+        scratch.trait_keys.extend(traits);
+        scratch.head_keys.extend(heads);
+        scratch.name_keys.extend(names);
+    }
+    Job { krate, delta, fresh, crate_state, scratch, work: Work::default() }
 }
 
 /// Drops the state of every crate no longer in the graph, with its impls' read sets.
@@ -198,19 +325,15 @@ fn forget_reads(state: &mut State, imp: ImplId) {
     state.wild.remove(&imp);
 }
 
-fn run_crate(
-    db: &mut Db,
-    state: &mut State,
-    krate: Crate,
-    delta: Option<&CrateDelta>,
-    crates_changed: bool,
-    changed: bool,
-    out: &mut Vec<ImplsDelta>,
-) -> Work {
+/// One crate's work: its delta applied, its woken impls rekeyed, its traits' names and its
+/// bodies read again, and the rows of the slices that changed made. It reads memos and its own
+/// state alone, so the crates' works run at once.
+fn work_crate(db: &Db, shared: &Shared<'_>, job: &mut Job) {
+    let krate = job.krate;
     let _span = tracing::info_span!(
         target: "blaze",
         "impls crate",
-        krate = hir_def::span_names::crate_name(&*db, krate)
+        krate = hir_def::span_names::crate_name(db, krate)
     )
     .entered();
     macro_rules! phase {
@@ -219,43 +342,48 @@ fn run_crate(
             $run
         }};
     }
-    let mut work = Work::default();
-    let fresh = delta.is_some_and(|it| it.fresh);
-    state.scratch.keys_changed.clear();
-    state.scratch.traits_changed.clear();
-    if fresh {
-        reset(state, krate);
-    } else if !state.crates.contains_key(&krate) {
-        panic!(
-            "impls: crate {krate:?} has no maintained impl tables and name resolution handed it \
-             no fresh delta"
-        );
-    }
-    let mut crate_state = state.crates.remove(&krate).unwrap_or_default();
-    if fresh {
-        let (traits, heads, names) = crate_state.published.keys();
-        state.scratch.trait_keys.extend(traits);
-        state.scratch.head_keys.extend(heads);
-        state.scratch.name_keys.extend(names);
-    }
+    let Job { delta, fresh, crate_state, scratch, work, .. } = job;
+    let (fresh, crates_changed, changed) = (*fresh, shared.crates_changed, shared.changed);
+    let delta = delta.map(|at| &shared.last.crates[at]);
     if let Some(delta) = delta {
-        phase!("impls apply_impls", apply_impls(db, state, &mut crate_state, krate, delta, &mut work));
-        phase!("impls apply_derives", apply_derives(db, &mut crate_state, delta, &mut work));
-        phase!("impls apply_traits", apply_traits(db, state, &mut crate_state, delta, &mut work));
+        phase!("impls apply_impls", apply_impls(db, scratch, crate_state, delta, work));
+        phase!("impls apply_derives", apply_derives(db, crate_state, delta, work));
+        phase!("impls apply_traits", apply_traits(db, scratch, crate_state, delta, work));
     }
-    phase!("impls rekey", rekey(db, state, &mut crate_state, krate, crates_changed, &mut work));
+    phase!("impls rekey", rekey(db, shared, scratch, crate_state, krate, crates_changed, work));
     if crates_changed || changed {
-        phase!("impls rename_wild_traits", rename_wild_traits(db, state, &mut crate_state, &mut work));
+        phase!("impls rename_wild_traits", rename_wild_traits(db, scratch, crate_state, work));
     }
     let lang_check = fresh || crates_changed || delta.is_some_and(touches_traits);
-    phase!("impls relang", relang(db, &mut crate_state, krate, lang_check, &mut work));
+    phase!("impls relang", relang(db, crate_state, krate, lang_check, work));
     let sweep = fresh || crates_changed;
     if sweep || changed || delta.is_some() {
-        apply_bodies(&*db, state, &mut crate_state, krate, delta, sweep, &mut work);
+        apply_bodies(db, scratch, crate_state, krate, delta, sweep, work);
     }
-    phase!("impls publish", publish(db, state, &mut crate_state, krate, fresh, &mut work));
-    state.crates.insert(krate, crate_state);
-    let scratch = &mut state.scratch;
+    phase!("impls rows", rows(scratch, crate_state, fresh));
+}
+
+/// The serial end of one crate's work, in the crates' order: what it changed of the shared
+/// state replayed, its slices set, its state put back, its delta handed on, its work reported,
+/// and its directory, when it is the crate's first, kept for [`publish::register`].
+fn finish_crate(
+    db: &mut Db,
+    state: &mut State,
+    job: Job,
+    directories: &mut Vec<(Crate, SliceDirectory)>,
+    out: &mut Vec<ImplsDelta>,
+) {
+    let Job { krate, mut crate_state, mut scratch, mut work, .. } = job;
+    let _span = tracing::info_span!(
+        target: "blaze",
+        "impls publish",
+        krate = hir_def::span_names::crate_name(&*db, krate)
+    )
+    .entered();
+    replay(state, &mut scratch, krate);
+    if let Some(directory) = publish(db, &mut scratch, &mut crate_state, krate, &mut work) {
+        directories.push((krate, directory));
+    }
     if !scratch.keys_changed.is_empty() || !scratch.traits_changed.is_empty() {
         scratch.keys_changed.sort_unstable();
         scratch.keys_changed.dedup();
@@ -268,20 +396,50 @@ fn run_crate(
             traits_changed: std::mem::take(&mut scratch.traits_changed),
         });
     }
-    work
+    crate_state.scratch = scratch;
+    state.crates.insert(krate, crate_state);
+    db.report_work(NAME, krate, work);
 }
 
-/// Forgets what `krate` held, keeping its published inputs: a crate maintained from empty sets
-/// every slice it had anew, emptied where it has no rows now.
-fn reset(state: &mut State, krate: Crate) {
-    let Some(old) = state.crates.remove(&krate) else { return };
+/// Applies a crate's changes to the state shared across crates, in the order its work made
+/// them.
+fn replay(state: &mut State, scratch: &mut CrateScratch, krate: Crate) {
+    let (mut names, mut defs) = (0, 0);
+    for op in scratch.index.drain(..) {
+        match op {
+            IndexOp::Forget(imp) => forget_reads(state, imp),
+            IndexOp::Disown(imp) => _ = state.owner.remove(&imp),
+            IndexOp::Own(imp) => _ = state.owner.insert(imp, krate),
+            IndexOp::Note { imp, names: n, defs: d, wild } => {
+                let (n, d) = (n as usize, d as usize);
+                for &name in &scratch.read_names[names..names + n] {
+                    state.by_name.add(name, imp);
+                }
+                for &def in &scratch.read_defs[defs..defs + d] {
+                    state.by_def.add(def, imp);
+                }
+                if wild {
+                    state.wild.insert(imp);
+                }
+                names += n;
+                defs += d;
+            }
+        }
+    }
+    scratch.read_names.clear();
+    scratch.read_defs.clear();
+}
+
+/// Forgets what a crate held, keeping its published inputs and buffers: a crate maintained
+/// from empty sets every slice it had anew, emptied where it has no rows now.
+fn reset(state: &mut State, old: CrateState, scratch: &mut CrateScratch) -> CrateState {
     for imp in old.impls.keys() {
         forget_reads(state, *imp);
         state.owner.remove(imp);
     }
-    state.scratch.keys_changed.extend(old.impls.keys().copied());
-    state.scratch.traits_changed.extend(old.assoc.keys().copied());
-    state.crates.insert(krate, CrateState { published: old.published, ..CrateState::default() });
+    scratch.keys_changed.extend(old.impls.keys().copied());
+    scratch.traits_changed.extend(old.assoc.keys().copied());
+    CrateState { published: old.published, ..CrateState::default() }
 }
 
 fn touches_traits(delta: &CrateDelta) -> bool {
@@ -289,7 +447,7 @@ fn touches_traits(delta: &CrateDelta) -> bool {
 }
 
 /// Whether `imp` is a trait impl, by its module's scope: the split the tables take.
-fn is_trait_impl(db: &Db, scratch: &mut Scratch, module: ModuleId, imp: ImplId) -> bool {
+fn is_trait_impl(db: &Db, scratch: &mut CrateScratch, module: ModuleId, imp: ImplId) -> bool {
     if scratch.kinds_of.insert(module) {
         let impls = module_impls(db, module);
         scratch.kinds.extend(impls.trait_impls.iter().map(|&it| (it, true)));
@@ -301,37 +459,36 @@ fn is_trait_impl(db: &Db, scratch: &mut Scratch, module: ModuleId, imp: ImplId) 
 }
 
 fn apply_impls(
-    db: &mut Db,
-    state: &mut State,
+    db: &Db,
+    scratch: &mut CrateScratch,
     crate_state: &mut CrateState,
-    krate: Crate,
     delta: &CrateDelta,
     work: &mut Work,
 ) {
     for (imp, pos, _) in delta.impls.iter().filter(|it| it.2 < 0) {
         work.ops += 1;
         if pos_of(crate_state, *imp).is_some_and(|it| it == pos)
-            && remove_impl(state, crate_state, *imp)
+            && remove_impl(scratch, crate_state, *imp)
         {
-            state.scratch.keys_changed.push(*imp);
+            scratch.keys_changed.push(*imp);
         }
     }
     for (imp, pos, _) in delta.impls.iter().filter(|it| it.2 > 0) {
         work.ops += 1;
-        remove_impl(state, crate_state, *imp);
-        state.scratch.keys_changed.push(*imp);
-        let module = imp.loc(&*db).container;
-        let trait_impl = is_trait_impl(&*db, &mut state.scratch, module, *imp);
-        let key = impl_key(&*db, *imp, trait_impl);
+        remove_impl(scratch, crate_state, *imp);
+        scratch.keys_changed.push(*imp);
+        let module = imp.loc(db).container;
+        let trait_impl = is_trait_impl(db, scratch, module, *imp);
+        let key = impl_key(db, *imp, trait_impl);
         work.rebuilt += 1;
         work.keys += 1;
         // clone: a position, inline to a depth of six
         let row = ImplRow { module, pos: pos.clone(), key, trait_impl };
         arrange(crate_state, *imp, &row, 1);
         crate_state.impls.insert(*imp, row);
-        state.owner.insert(*imp, krate);
-        note_reads(db, state, *imp);
-        state.scratch.done.insert(*imp);
+        scratch.index.push(IndexOp::Own(*imp));
+        note_reads(db, scratch, *imp);
+        scratch.done.insert(*imp);
     }
 }
 
@@ -340,11 +497,11 @@ fn pos_of(crate_state: &CrateState, imp: ImplId) -> Option<&Pos> {
 }
 
 /// Drops `imp`'s row and read set; whether it had one.
-fn remove_impl(state: &mut State, crate_state: &mut CrateState, imp: ImplId) -> bool {
+fn remove_impl(scratch: &mut CrateScratch, crate_state: &mut CrateState, imp: ImplId) -> bool {
     let Some(row) = crate_state.impls.remove(&imp) else { return false };
     arrange(crate_state, imp, &row, -1);
-    forget_reads(state, imp);
-    state.owner.remove(&imp);
+    scratch.index.push(IndexOp::Forget(imp));
+    scratch.index.push(IndexOp::Disown(imp));
     true
 }
 
@@ -379,65 +536,68 @@ fn arrange_derive(
     }
 }
 
-/// Records what `imp`'s key read in the read indexes.
-fn note_reads(db: &Db, state: &mut State, imp: ImplId) {
-    let reads = &mut state.scratch.reads;
+/// Notes what `imp`'s key read, for the read indexes ([`replay`]).
+fn note_reads(db: &Db, scratch: &mut CrateScratch, imp: ImplId) {
+    let reads = &mut scratch.reads;
     impl_reads(db, imp, reads);
-    for &name in &reads.names {
-        state.by_name.add(name, imp);
-    }
-    for &def in &reads.defs {
-        state.by_def.add(def, imp);
-    }
-    if reads.wild {
-        state.wild.insert(imp);
-    }
+    scratch.read_names.extend_from_slice(&reads.names);
+    scratch.read_defs.extend_from_slice(&reads.defs);
+    scratch.index.push(IndexOp::Note {
+        imp,
+        names: reads.names.len() as u32,
+        defs: reads.defs.len() as u32,
+        wild: reads.wild,
+    });
 }
 
 /// Recomputes the key of every impl of `krate` the write woke (all of them when the crate
-/// graph changed): a changed key moves its row.
+/// graph changed): a changed key moves its row. Which impls are `krate`'s is as the run found
+/// them at its start: one this write added is keyed already (`done`), and one it removed has no
+/// row.
 fn rekey(
-    db: &mut Db,
-    state: &mut State,
+    db: &Db,
+    shared: &Shared<'_>,
+    scratch: &mut CrateScratch,
     crate_state: &mut CrateState,
     krate: Crate,
     all: bool,
     work: &mut Work,
 ) {
-    let woken: Vec<ImplId> = if all {
-        // alloc: the impls to rekey, once per crate graph change
-        crate_state.impls.keys().copied().collect()
+    let mut woken = std::mem::take(&mut scratch.woken);
+    woken.clear();
+    if all {
+        woken.extend(crate_state.impls.keys().copied());
     } else {
-        let woken = state.scratch.woken.iter().copied();
-        // alloc: the impls to rekey, once per write that woke any
-        woken.filter(|imp| state.owner.get(imp) == Some(&krate)).collect()
-    };
-    for imp in woken {
-        if !state.scratch.done.insert(imp) {
+        let owner = shared.owner;
+        woken.extend(shared.woken.iter().copied().filter(|imp| owner.get(imp) == Some(&krate)));
+    }
+    for &imp in &woken {
+        if !scratch.done.insert(imp) {
             continue;
         }
         let Some(row) = crate_state.impls.get(&imp) else { continue };
         work.woken += 1;
         work.rebuilt += 1;
-        let trait_impl = is_trait_impl(&*db, &mut state.scratch, row.module, imp);
-        let key = impl_key(&*db, imp, trait_impl);
-        forget_reads(state, imp);
-        note_reads(db, state, imp);
+        let trait_impl = is_trait_impl(db, scratch, row.module, imp);
+        let key = impl_key(db, imp, trait_impl);
+        scratch.index.push(IndexOp::Forget(imp));
+        note_reads(db, scratch, imp);
         let row = crate_state.impls.remove(&imp).expect("the row just read");
         if key == row.key && trait_impl == row.trait_impl {
             crate_state.impls.insert(imp, row);
             continue;
         }
         work.keys += 1;
-        state.scratch.keys_changed.push(imp);
+        scratch.keys_changed.push(imp);
         arrange(crate_state, imp, &row, -1);
         let row = ImplRow { key, trait_impl, ..row };
         arrange(crate_state, imp, &row, 1);
         crate_state.impls.insert(imp, row);
     }
+    scratch.woken = woken;
 }
 
-fn apply_derives(db: &mut Db, crate_state: &mut CrateState, delta: &CrateDelta, work: &mut Work) {
+fn apply_derives(db: &Db, crate_state: &mut CrateState, delta: &CrateDelta, work: &mut Work) {
     for (imp, pos, _) in delta.derive_impls.iter().filter(|it| it.2 < 0) {
         work.ops += 1;
         if crate_state.derives.get(imp).is_some_and(|row| row.pos == *pos)
@@ -451,9 +611,9 @@ fn apply_derives(db: &mut Db, crate_state: &mut CrateState, delta: &CrateDelta, 
         if let Some(row) = crate_state.derives.remove(imp) {
             arrange_derive(crate_state, *imp, &row, -1);
         }
-        let module = derive_module(&*db, *imp);
-        let krate = module.krate(&*db);
-        let key = derive_key(&*db, *imp, lang_items(&*db, krate));
+        let module = derive_module(db, *imp);
+        let krate = module.krate(db);
+        let key = derive_key(db, *imp, lang_items(db, krate));
         work.rebuilt += 1;
         work.keys += 1;
         // clone: a position, inline to a depth of six
@@ -466,11 +626,11 @@ fn apply_derives(db: &mut Db, crate_state: &mut CrateState, delta: &CrateDelta, 
 /// Re-reads the traits the lang items give the built-in derives when a write may have changed
 /// them (a trait declared, gone or re-read, or the crate graph); a changed one rekeys the
 /// derive impls of that derive.
-fn relang(db: &mut Db, crate_state: &mut CrateState, krate: Crate, check: bool, work: &mut Work) {
+fn relang(db: &Db, crate_state: &mut CrateState, krate: Crate, check: bool, work: &mut Work) {
     if crate_state.derives.is_empty() || !(check || crate_state.lang.is_none()) {
         return;
     }
-    let items = lang_items(&*db, krate);
+    let items = lang_items(db, krate);
     let now: SmallVec<[Option<TraitId>; 16]> =
         BuiltinDeriveImplTrait::ALL.iter().map(|it| it.get_id(items)).collect(); // alloc: inline
     if crate_state.lang.as_ref() == Some(&now) {
@@ -480,7 +640,7 @@ fn relang(db: &mut Db, crate_state: &mut CrateState, krate: Crate, check: bool, 
     // alloc: the derive impls of a crate whose lang items changed, once per such write
     let derives: Vec<BuiltinDeriveImplId> = crate_state.derives.keys().copied().collect();
     for imp in derives {
-        let key = derive_key(&*db, imp, items);
+        let key = derive_key(db, imp, items);
         let row = crate_state.derives.remove(&imp).expect("a derive impl just listed");
         work.rebuilt += 1;
         if key == row.key {
@@ -497,8 +657,8 @@ fn relang(db: &mut Db, crate_state: &mut CrateState, krate: Crate, check: bool, 
 
 /// `AssocFn` (design §8): the item names of each trait declared, gone or re-read.
 fn apply_traits(
-    db: &mut Db,
-    state: &mut State,
+    db: &Db,
+    scratch: &mut CrateScratch,
     crate_state: &mut CrateState,
     delta: &CrateDelta,
     work: &mut Work,
@@ -506,15 +666,14 @@ fn apply_traits(
     for &(trait_, weight) in delta.traits.iter() {
         work.ops += 1;
         if weight < 0 {
-            set_names(&*db, &mut state.scratch, crate_state, trait_, false, work);
+            set_names(db, scratch, crate_state, trait_, false, work);
         }
     }
     for &(trait_, weight) in delta.traits.iter() {
         if weight > 0 {
-            set_names(&*db, &mut state.scratch, crate_state, trait_, true, work);
+            set_names(db, scratch, crate_state, trait_, true, work);
         }
     }
-    let scratch = &mut state.scratch;
     scratch.redo_traits.clear();
     scratch.redo_traits.extend(delta.touched.iter().filter_map(|it| match *it {
         ModuleDefId::TraitId(it) => Some(it),
@@ -523,7 +682,7 @@ fn apply_traits(
     let redo = std::mem::take(&mut scratch.redo_traits);
     for &trait_ in &redo {
         if crate_state.assoc.contains_key(&trait_) {
-            set_names(&*db, scratch, crate_state, trait_, true, work);
+            set_names(db, scratch, crate_state, trait_, true, work);
         }
     }
     scratch.redo_traits = redo;
@@ -531,21 +690,20 @@ fn apply_traits(
 
 /// The traits whose items a macro writes, re-read on a write that changed any binding or def.
 fn rename_wild_traits(
-    db: &mut Db,
-    state: &mut State,
+    db: &Db,
+    scratch: &mut CrateScratch,
     crate_state: &mut CrateState,
     work: &mut Work,
 ) {
     if crate_state.wild_traits.is_empty() {
         return;
     }
-    let scratch = &mut state.scratch;
     scratch.redo_traits.clear();
     scratch.redo_traits.extend(crate_state.wild_traits.iter().copied());
     let redo = std::mem::take(&mut scratch.redo_traits);
     for &trait_ in &redo {
         work.woken += 1;
-        set_names(&*db, scratch, crate_state, trait_, true, work);
+        set_names(db, scratch, crate_state, trait_, true, work);
     }
     scratch.redo_traits = redo;
 }
@@ -553,7 +711,7 @@ fn rename_wild_traits(
 /// Sets `trait_`'s names to its items' now (`present`) or to none, moving its candidate rows.
 fn set_names(
     db: &Db,
-    scratch: &mut Scratch,
+    scratch: &mut CrateScratch,
     crate_state: &mut CrateState,
     trait_: TraitId,
     present: bool,
@@ -592,16 +750,9 @@ fn set_names(
     }
 }
 
-/// Sets every slice whose rows changed, then the directory's new keys and body modules.
-fn publish(
-    db: &mut Db,
-    state: &mut State,
-    crate_state: &mut CrateState,
-    krate: Crate,
-    fresh: bool,
-    work: &mut Work,
-) {
-    let scratch = &mut state.scratch;
+/// The rows of every slice whose arrangement changed, and the directory's body modules when
+/// they may have: what [`publish`] sets.
+fn rows(scratch: &mut CrateScratch, crate_state: &mut CrateState, fresh: bool) {
     crate_state.traits.take_changed(&mut scratch.trait_keys);
     crate_state.body_traits.take_changed(&mut scratch.trait_keys);
     scratch.trait_keys.sort_unstable();
@@ -613,7 +764,7 @@ fn publish(
     crate_state.candidates.take_changed(&mut scratch.name_keys);
     for trait_ in scratch.trait_keys.drain(..) {
         let rows = trait_rows(&crate_state.traits, &crate_state.body_traits, trait_);
-        work.slices += u64::from(crate_state.published.set_trait(db, krate, trait_, rows));
+        scratch.trait_rows.push((trait_, rows));
     }
     for head in scratch.head_keys.drain(..) {
         let rows = InherentRows {
@@ -627,23 +778,48 @@ fn publish(
             // alloc: as above
             bodies: crate_state.body_heads.get(head).collect(),
         };
-        work.slices += u64::from(crate_state.published.set_head(db, krate, head, rows));
+        scratch.head_rows.push((head, rows));
     }
     crate_state.body_inherent.take_changed(&mut scratch.units);
     if !scratch.units.is_empty() || fresh {
         scratch.units.clear();
-        scratch.body_modules.clear();
-        scratch.body_modules.extend(crate_state.body_inherent.get(()));
-        crate_state.published.set_body_modules(&scratch.body_modules);
+        // alloc: the crate's inherent body modules, once per write that may have changed them
+        scratch.inherent_bodies = Some(crate_state.body_inherent.get(()).collect());
     }
     for name in scratch.name_keys.drain(..) {
         let rows = CandidateRows {
             // alloc: a changed slice's content, once at its length
             traits: crate_state.candidates.get(name).collect(),
         };
-        work.slices += u64::from(crate_state.published.set_name(db, krate, name, rows));
+        scratch.name_rows.push((name, rows));
     }
-    work.slices += crate_state.published.finish(db, krate);
+}
+
+/// Sets every slice whose rows changed, then the directory's new keys and body modules; the
+/// crate's first directory, which the run registers ([`publish::register`]).
+fn publish(
+    db: &mut Db,
+    scratch: &mut CrateScratch,
+    crate_state: &mut CrateState,
+    krate: Crate,
+    work: &mut Work,
+) -> Option<SliceDirectory> {
+    let published = &mut crate_state.published;
+    for (trait_, rows) in scratch.trait_rows.drain(..) {
+        work.slices += u64::from(published.set_trait(db, krate, trait_, rows));
+    }
+    for (head, rows) in scratch.head_rows.drain(..) {
+        work.slices += u64::from(published.set_head(db, krate, head, rows));
+    }
+    if let Some(modules) = scratch.inherent_bodies.take() {
+        published.set_body_modules(&modules);
+    }
+    for (name, rows) in scratch.name_rows.drain(..) {
+        work.slices += u64::from(published.set_name(db, krate, name, rows));
+    }
+    let (set, made) = published.finish(db, krate);
+    work.slices += set;
+    made
 }
 
 /// The rows of `trait_` in position order and its body modules, as a slice holds them.
@@ -685,7 +861,7 @@ pub(crate) fn trait_rows(
 /// A module no longer in the crate's `DefMap` has an empty part.
 fn apply_bodies(
     db: &Db,
-    state: &mut State,
+    scratch: &mut CrateScratch,
     crate_state: &mut CrateState,
     krate: Crate,
     delta: Option<&CrateDelta>,
@@ -700,7 +876,6 @@ fn apply_bodies(
         // alloc: clone: the crate's macro names, once per write that changed them
         crate_state.macros = Some(macros.into());
     }
-    let scratch = &mut state.scratch;
     let mut modules = std::mem::take(&mut scratch.body_modules);
     modules.clear();
     if sweep {
@@ -746,7 +921,7 @@ fn apply_bodies(
             crate_state.bodies.insert(module, now.clone());
         }
     }
-    state.scratch.body_modules = modules;
+    scratch.body_modules = modules;
 }
 
 /// The keys of `old` not in `new` (`-1`) and of `new` not in `old` (`+1`), both sorted.

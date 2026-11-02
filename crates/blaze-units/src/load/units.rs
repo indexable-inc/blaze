@@ -31,7 +31,7 @@ use crate::query::{
     LoadError, LockWrite, PackagePlan, StdGraph, StdKey, StdPlanned, StdUnits, TestSandbox,
     UnitPlan,
 };
-use crate::schema::{self, Mode, Unit, UnitDep};
+use crate::schema::{self, BuiltFor, Mode, Unit, UnitDep};
 use crate::stdlib::target::{self as platform, CfgArgs};
 use crate::stdlib::{STD_OUT, default_crates, default_features};
 use crate::{Filter, Intent, LibRule, Package, Platformed, Request, Rule};
@@ -204,9 +204,35 @@ pub(crate) fn units(
     // A wasm macro aborts on a panic: the guest's hook hands the host the message, and
     // wasm32-wasip1 has no unwinding. Before planning, so the units' hashes say so.
     let macro_platform = macro_wasm.as_ref().map(|it| it.triple.as_str());
-    if let Some(triple) = macro_platform {
-        for unit in &mut graph.units {
-            if unit.platform.as_deref() == Some(triple) {
+    for unit in graph.units.iter_mut().filter(|it| it.macro_wasm) {
+        "abort".clone_into(&mut unit.profile.panic);
+    }
+    // cargo passes `-C panic` only for a profile's `abort`, so a unit whose profile says
+    // `unwind` (cargo's default) is built by rustc with its target's own strategy: `abort`
+    // where the target has no unwinding (`--target wasm32-wasip1`). Its profile says so, for
+    // its cfg, its hashes, its standard library and its code alike.
+    if spec.foreign.is_none() {
+        let host_aborts = match target_aborts(&host.triple) {
+            Ok(it) => it,
+            Err(error) => return Ok(Staged::Failed(error)),
+        };
+        let target_aborts = match target.as_ref().map(|it| target_aborts(&it.triple)).transpose() {
+            Ok(it) => it,
+            Err(error) => return Ok(Staged::Failed(error)),
+        };
+        for unit in graph.units.iter_mut().filter(|it| !it.macro_wasm && it.profile.panic == "unwind") {
+            let aborts = match (&unit.platform, &target) {
+                (None, _) => host_aborts,
+                (Some(triple), Some(target)) if *triple == target.triple => target_aborts == Some(true),
+                (Some(triple), _) => {
+                    return Ok(fail(anyhow::anyhow!(
+                        "the unit graph has a unit of `{}` ({}) for {triple}, which the build is not for",
+                        unit.pkg_id,
+                        unit.target.name
+                    )));
+                }
+            };
+            if aborts {
                 "abort".clone_into(&mut unit.profile.panic);
             }
         }
@@ -265,23 +291,56 @@ pub(crate) fn units(
                 Ok(it) => it,
                 Err(error) => return Ok(fail(error)),
             };
-            let mut platforms_used: Vec<Option<String>> = graph.units.iter().map(|it| it.platform.clone()).collect();
+            // By what each unit is built for, of the build's platforms: the host, the target and
+            // the wasm macros (a `--target wasm32-wasip1` build has a std for its target and
+            // another for its macros, of one triple), in `BuiltFor`'s order.
+            let mut platforms_used: Vec<BuiltFor<'_>> = [
+                Some(BuiltFor { platform: None, macro_wasm: false }),
+                target.as_ref().map(|it| BuiltFor { platform: Some(it.triple.as_str()), macro_wasm: false }),
+                macro_platform.map(|triple| BuiltFor { platform: Some(triple), macro_wasm: true }),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|it| graph.units.iter().any(|unit| unit.built_for() == *it))
+            .collect(); // alloc: at most three, once per load
             platforms_used.sort();
-            platforms_used.dedup();
-            for platform in platforms_used {
-                let triple = platform.clone().unwrap_or_else(|| host.triple.clone());
+            if let Some(unit) = graph.units.iter().find(|unit| !platforms_used.contains(&unit.built_for())) {
+                return Ok(fail(anyhow::anyhow!(
+                    "the unit graph has a unit of `{}` ({}) built for {}, which is none of the build's \
+                     platforms: the host, its target {:?} and its wasm macros' {macro_platform:?}",
+                    unit.pkg_id,
+                    unit.target.name,
+                    unit.built_for(),
+                    target.as_ref().map(|it| it.triple.as_str())
+                )));
+            }
+            // Each std merged so far, by its key's ID, with its roots in the graph: a platform
+            // whose std has a key already merged (the host's and a `--target` of the host's own
+            // triple in a release build, alike in profile, rustflags and where they run) shares
+            // those units, as every workspace asking for one std shares its outputs. Two sets of
+            // units of one key would build and place the same files twice.
+            let mut merged: Vec<(blaze_ids::ContentId, Vec<(String, usize)>)> = Vec::new(); // alloc: a few platforms, once per load
+            for built_for in platforms_used {
+                let triple = built_for.platform.unwrap_or(host.triple.as_str());
                 // The wasm macros' std is planned as their units are: no rustflags, std's
                 // default crates, aborting.
-                let for_macros = platform.is_some() && platform.as_deref() == macro_platform;
-                let rustflags = match &platform {
-                    _ if for_macros => Vec::new(),
+                let rustflags = match built_for.platform {
+                    _ if built_for.macro_wasm => Vec::new(),
                     Some(_) => target_flags.clone(),
                     None => host_flags.clone(),
                 };
-                let key = match std_key(spec, &graph, &packages_by_spec, &base, &profiles, &triple, rustflags, for_macros) {
+                let key = match std_key(spec, &graph, &packages_by_spec, &base, &profiles, triple, rustflags, built_for) {
                     Ok(it) => it,
                     Err(error) => return Ok(Staged::Failed(error)),
                 };
+                let id = key.id();
+                if let Some((_, roots)) = merged.iter().find(|(it, _)| *it == id) {
+                    if let Err(error) = runs_as_keyed(&graph, roots, &key, id, built_for) {
+                        return Ok(Staged::Failed(error));
+                    }
+                    attach_std(&mut graph, roots, built_for);
+                    continue;
+                }
                 let std = match ctx.files().with_cx(|cx| cx.get::<StdUnits>(&key).map(|it| it.get()))? {
                     StdPlanned::Ready(std) => std,
                     StdPlanned::Failed(error) => return Ok(Staged::Failed(error)),
@@ -294,8 +353,12 @@ pub(crate) fn units(
                         spec.std
                     )));
                 }
-                let out = format!("{}/{:x}", spec.std, key.id());
-                merge_std(&mut graph, &mut std_plans, &mut std_packages, std, &platform, &out, for_macros);
+                let out = format!("{}/{:x}", spec.std, id);
+                let roots = merge_std(&mut graph, &mut std_plans, &mut std_packages, std, built_for, &out);
+                if let Err(error) = runs_as_keyed(&graph, &roots, &key, id, built_for) {
+                    return Ok(Staged::Failed(error));
+                }
+                merged.push((id, roots));
             }
         }
     }
@@ -352,6 +415,7 @@ pub(crate) fn units(
         let ours = |at: &Path| at.display().to_string();
         let prefixes = [
             ours(&Path::new(FOREIGN_TARGET).join(&ask.triple).join(&dir_name)),
+            ours(&Path::new(FOREIGN_TARGET).join(super::plan::macro_dir(&ask.triple)).join(&dir_name)),
             ours(&Path::new(FOREIGN_TARGET).join(&dir_name)),
         ];
         for plan in &mut plans {
@@ -466,7 +530,8 @@ pub(crate) struct Platforms {
     pub host_flags: Vec<String>,
     pub target: Option<Platformed>,
     pub target_flags: Vec<String>,
-    /// [`super::MACRO_WASM`]'s, under `-Z wasm-macros`.
+    /// [`super::MACRO_WASM`]'s, which proc macros are built for ([`Spec::macro_wasm`]): it
+    /// may be the target's triple too, whose units [`schema::Unit::macro_wasm`] tells apart.
     pub macro_wasm: Option<Platformed>,
 }
 
@@ -481,7 +546,11 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
             host_flags: Vec::new(),
             target: Some(Platformed { triple: ask.triple.clone(), cfg: parse(&ask.cfg)? }),
             target_flags: ask.rustflags.clone(),
-            macro_wasm: None,
+            // The wasm macros' std: its units are planned under the macros' kind.
+            macro_wasm: match ask.macro_wasm {
+                true => Some(Platformed { triple: ask.triple.clone(), cfg: parse(&ask.cfg)? }),
+                false => None,
+            },
         });
     }
     let target = match &spec.target {
@@ -511,14 +580,10 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
         Some((it, flags)) => (Some(it), flags),
         None => (None, Vec::new()),
     };
-    // With no rustflags, as `plan::flags::macro_wasm_info` plans its units.
+    // With no rustflags, as `plan::flags::macro_wasm_info` plans its units. A build for
+    // `--target wasm32-wasip1` has both: its units and the macros' are told apart by
+    // `schema::Unit::macro_wasm`, never by their triple.
     let macro_wasm = match spec.macro_wasm {
-        true if target.as_ref().is_some_and(|it| it.triple == super::MACRO_WASM) => {
-            return Err(error(format!(
-                "`-Z wasm-macros` builds proc macros for `{}`, which is this build's target too: a unit of one could not be told from the other's",
-                super::MACRO_WASM
-            )));
-        }
         true => {
             let cfg = platform::target_cfgs(super::MACRO_WASM, &CfgArgs { proc_macro: true, ..CfgArgs::default() })
                 .map_err(error)?;
@@ -706,9 +771,15 @@ fn debuginfo_text(debuginfo: &schema::DebugInfo) -> String {
     }
 }
 
-/// The standard library's key for the units built for `triple`. `for_macros`' is
-/// `-Z wasm-macros`' std, which `-Zbuild-std` and the build's tests do not shape: std's
-/// default crates and features, aborting.
+/// Whether rustc builds for `triple` with `panic = "abort"` when given no `-C panic`.
+fn target_aborts(triple: &str) -> Result<bool, LoadError> {
+    let facts = crate::stdlib::target::target_facts(triple).map_err(|what| LoadError { what, at: None })?;
+    Ok(facts.panic == "abort")
+}
+
+/// The standard library's key for the units built for `built_for`, of `triple`. The wasm
+/// macros' std is one `-Zbuild-std` and the build's tests do not shape: std's default crates
+/// and features, aborting, and a key of its own.
 fn std_key(
     spec: &Spec,
     graph: &schema::UnitGraph,
@@ -717,8 +788,9 @@ fn std_key(
     profiles: &Profiles,
     triple: &str,
     rustflags: Vec<String>,
-    for_macros: bool,
+    built_for: BuiltFor<'_>,
 ) -> Result<StdKey, LoadError> {
+    let for_macros = built_for.macro_wasm;
     let library = spec.library.clone().ok_or_else(|| LoadError {
         what: format!("the standard library is mounted nowhere: no mount is at `{}`", spec.library_at),
         at: None,
@@ -744,7 +816,12 @@ fn std_key(
         library,
         triple: triple.to_owned(),
         profile: base.name.clone(),
-        panic: if for_macros { "abort".to_owned() } else { base.panic.clone() },
+        // As each unit of `triple` is built (`units`): an `unwind` profile aborts where the
+        // target does.
+        panic: match for_macros || (base.panic == "unwind" && target_aborts(triple)?) {
+            true => "abort".to_owned(),
+            false => base.panic.clone(),
+        },
         opt_level: base.opt_level.clone(),
         debug_assertions: base.debug_assertions,
         overflow_checks: base.overflow_checks,
@@ -757,7 +834,36 @@ fn std_key(
         host: spec.host.clone(),
         rustflags,
         profile_root: root.to_owned(),
+        macro_wasm: for_macros,
+        // As each of its units is compiled: std's units carry the build's base profile's name
+        // (`foreign_units`) and, merged, `built_for` (`merge_std`).
+        runs_here: schema::runs_here(built_for, &base.name),
     })
+}
+
+/// Refuses std's `roots` for `built_for` when one of them runs elsewhere than `key`, of ID
+/// `id`, says: a key that missed where std's code runs would give the target a std compiled
+/// for this machine's CPU, or the host one for the baseline (rule 18).
+fn runs_as_keyed(
+    graph: &schema::UnitGraph,
+    roots: &[(String, usize)],
+    key: &StdKey,
+    id: blaze_ids::ContentId,
+    built_for: BuiltFor<'_>,
+) -> Result<(), LoadError> {
+    let at = |runs_here: bool| if runs_here { "on the machine that builds it" } else { "elsewhere" };
+    match roots.iter().find(|(_, index)| graph.units[*index].runs_here() != key.runs_here) {
+        None => Ok(()),
+        Some((name, index)) => Err(LoadError {
+            what: format!(
+                "the standard library's `{name}` for {built_for} runs {}, yet its key {id:x} says it runs {}: \
+                 one std key would name two builds of std",
+                at(graph.units[*index].runs_here()),
+                at(key.runs_here)
+            ),
+            at: None,
+        }),
+    }
 }
 
 /// Whether the test `unit` runs in libtest's harness: its target's `harness`.
@@ -785,21 +891,20 @@ fn kind_name(kind: &TargetKind) -> Option<&'static str> {
 /// has no sysroot, so a host unit (a build script, a proc macro) is given the host's std the
 /// same way. std's own units, merged after the build's, are given none: its build scripts are
 /// never compiled, their output blaze's port of each ([`crate::stdlib::scripts`]).
-/// `for_macros`: the platform is `-Z wasm-macros`', whose std's target units' plans say
-/// [`UnitPlan::macro_wasm`] as its own units' do.
+/// `built_for` is what its users are built for: for the wasm macros' platform, std's target
+/// units are wasm macros' units ([`schema::Unit::macro_wasm`]) as their users are, and their
+/// plans say [`UnitPlan::macro_wasm`]. Gives std's roots by name, with their units' indexes.
 fn merge_std(
     graph: &mut schema::UnitGraph,
     plans: &mut Vec<Option<UnitPlan>>,
     packages: &mut Vec<PackagePlan>,
     std: StdGraph,
-    platform: &Option<String>,
+    built_for: BuiltFor<'_>,
     out: &str,
-    for_macros: bool,
-) {
+) -> Vec<(String, usize)> {
     let offset = graph.units.len();
-    let users: Vec<usize> = (0..offset)
-        .filter(|at| &graph.units[*at].platform == platform && graph.units[*at].mode != Mode::RunCustomBuild)
-        .collect();
+    // alloc: the triple, once per platform's std.
+    let platform: Option<String> = built_for.platform.map(str::to_owned);
     graph.units.reserve(std.units.len());
     for mut unit in std.units {
         for dep in &mut unit.dependencies {
@@ -808,21 +913,35 @@ fn merge_std(
         // The library was planned with `--target` its platform's triple: its target units are
         // of the build's `platform` (none for the host's), its build scripts the host's.
         if unit.platform.is_some() {
-            unit.platform.clone_from(platform);
+            unit.platform.clone_from(&platform);
+            unit.macro_wasm = built_for.macro_wasm;
         }
         graph.units.push(unit);
     }
     plans.reserve(std.plans.len());
     for (at, mut plan) in std.plans.into_iter().enumerate() {
         rebase(&mut plan, &[STD_OUT], out);
-        plan.macro_wasm = for_macros && graph.units[offset + at].platform.is_some();
+        plan.macro_wasm = graph.units[offset + at].macro_wasm;
         plans.push(Some(plan));
     }
-    for at in users {
-        graph.units[at].dependencies.reserve(std.roots.len());
-        for (name, index) in &std.roots {
-            graph.units[at].dependencies.push(UnitDep {
-                index: index + offset,
+    // alloc: std's few roots, once per platform's std.
+    let roots: Vec<(String, usize)> = std.roots.into_iter().map(|(name, index)| (name, index + offset)).collect();
+    attach_std(graph, &roots, built_for);
+    packages.extend(std.packages);
+    roots
+}
+
+/// Every unit of the build's own built for `built_for` but a build script's run made to depend
+/// on each of std's `roots` (by name, at their indexes in `graph`), as [`merge_std`] says.
+fn attach_std(graph: &mut schema::UnitGraph, roots: &[(String, usize)], built_for: BuiltFor<'_>) {
+    for unit in &mut graph.units {
+        if unit.is_std || unit.built_for() != built_for || unit.mode == Mode::RunCustomBuild {
+            continue;
+        }
+        unit.dependencies.reserve(roots.len());
+        for (name, index) in roots {
+            unit.dependencies.push(UnitDep {
+                index: *index,
                 extern_crate_name: name.clone(),
                 public: Some(true),
                 noprelude: Some(true),
@@ -831,7 +950,6 @@ fn merge_std(
             });
         }
     }
-    packages.extend(std.packages);
 }
 
 /// The units of a foreign workspace as its ask says: every one `is_std` when asked, the
@@ -840,6 +958,8 @@ fn merge_std(
 fn foreign_units(graph: &mut schema::UnitGraph, packages: &BySpec<'_>, ask: &ForeignAsk) {
     for unit in &mut graph.units {
         unit.is_std = ask.is_std;
+        // The wasm macros' std: each unit for the triple is theirs, as `plan` keys and places it.
+        unit.macro_wasm = ask.macro_wasm && unit.platform.is_some();
         unit.profile.name.clone_from(&ask.profile.name);
         let script = unit.mode == Mode::RunCustomBuild || unit.target.is_custom_build();
         let aborts = packages

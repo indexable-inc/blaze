@@ -210,6 +210,7 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
         Counters => 25,
         LazyStubs => 26,
         LazyEntry(_) => 27,
+        StaticList(..) => 28,
     };
     let seven = |bytes: &[u8]| {
         let mut out = [0u8; 8];
@@ -219,7 +220,7 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
     };
     let rest = match key {
         Body(id) | Slot(id) | Data(id) | Cie(id) | Fde(id) | WinInfo(id) | Static(id, _) | Tlv(id, _)
-        | Position(id, _) | Coverage(id, _) | CoveragePcs(id) | LazyEntry(id) => seven(&symbols.content(id).0),
+        | StaticList(id, _) | Position(id, _) | Coverage(id, _) | CoveragePcs(id) | LazyEntry(id) => seven(&symbols.content(id).0),
         Local(obj, _) | Section(obj, _) | Frame(obj, ..) => seven(&symbols.content(obj.native).0),
         Name(name) | FileName(name) | IatEnd(name) | Common(name) => seven(symbols.str(name).as_bytes()),
         Got(kind, _) => (kind as u64) << 48,

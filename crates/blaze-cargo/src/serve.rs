@@ -172,10 +172,12 @@ struct Args {
     /// The descriptor of the pipe the CLI that started it waits on, told one byte once it
     /// listens ([`crate::cli::daemon`]).
     ready: Option<i32>,
+    /// `--stall-bound SECS`: the stall watchdog's bound ([`daemon::Options::stall`]).
+    stall: Option<std::time::Duration>,
 }
 
 fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
-    let mut parsed = Args { socket: None, http: None, activated: false, ready: None };
+    let mut parsed = Args { socket: None, http: None, activated: false, ready: None, stall: None };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let arg = arg.into_string().map_err(|it| anyhow::anyhow!("{} is not UTF-8", it.to_string_lossy()))?;
@@ -204,7 +206,17 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
                 let at = value()?;
                 parsed.http = Some(at.parse().with_context(|| format!("--http {at} is no address and port"))?);
             }
-            _ => bail!("blaze serve takes `--socket PATH`, `--http ADDR`, `--activated` and `--ready-fd N`, not `{arg}`"),
+            "--stall-bound" => {
+                let secs = value()?;
+                let bound = secs.parse::<u64>().ok().filter(|it| *it > 0).with_context(|| {
+                    format!("--stall-bound {secs}: the stall bound is a whole number of seconds above 0")
+                })?;
+                parsed.stall = Some(std::time::Duration::from_secs(bound));
+            }
+            _ => bail!(
+                "blaze serve takes `--socket PATH`, `--http ADDR`, `--activated`, `--ready-fd N` and \
+                 `--stall-bound SECS`, not `{arg}`"
+            ),
         }
     }
     Ok(parsed)
@@ -387,7 +399,7 @@ fn ready(fd: i32) -> anyhow::Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
-/// `blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N]`.
+/// `blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]`.
 pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     match serve(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -500,6 +512,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         color: false,
         build,
         outside: blaze_vfs::outside::dirs(),
+        stall: args.stall.unwrap_or(blaze_profile::Watchdog::BOUND),
         #[cfg(unix)]
         activated,
         profiling: Some(profiling),

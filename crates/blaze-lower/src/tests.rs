@@ -107,6 +107,7 @@ fn unit(pkg: &str, target: Target, mode: Mode, is_std: bool, dependencies: Vec<U
         target,
         profile: profile(),
         platform: None,
+        macro_wasm: false,
         mode,
         checked_as_test: false,
         features: Vec::new(),
@@ -495,19 +496,22 @@ fn a_run_is_refused_for_what_is_no_run() {
 }
 
 /// [`units`] with a wasm proc macro beside the native one: `core` and the macro again, for
-/// wasm32-wasip1, as `-Z wasm-macros` plans them. Returns the units and the two new indexes.
+/// wasm32-wasip1, as every build plans a proc macro (the native one is a test's, as a test
+/// that plans with `Spec::macro_wasm` off has it). Returns the units and the two new indexes.
 fn with_a_wasm_macro() -> (Units, usize, usize) {
     const WASM: &str = "wasm32-wasip1";
     let mut units = units();
     let wasm_core = units.graph.units.len();
     let mut core = units.graph.units[CORE].clone();
     core.platform = Some(WASM.to_owned());
+    core.macro_wasm = true;
     units.graph.units.push(core);
     // clone: a test's fixture.
     units.plans.push(UnitPlan { macro_wasm: true, ..units.plans[CORE].clone() });
     let wasm_macro = units.graph.units.len();
     let mut proc_macro = units.graph.units[MACRO].clone();
     proc_macro.platform = Some(WASM.to_owned());
+    proc_macro.macro_wasm = true;
     proc_macro.dependencies = vec![dep(wasm_core, "core", true)];
     units.graph.units.push(proc_macro);
     units.plans.push(UnitPlan { macro_wasm: true, ..units.plans[MACRO].clone() });
@@ -1317,4 +1321,74 @@ fn an_all_targets_example_and_test_of_one_name_lower_to_two_crates() {
     assert_eq!(kinds(test), (TargetKind::Test, TargetKind::Test));
     assert_ne!(krate(&built, example), krate(&built, test));
     blaze_items::key::check_crate_keys(db).unwrap_or_else(|clash| panic!("{clash}"));
+}
+
+/// `--target` of the host's own triple: [`const_macro_units`] as the host's side, and `core`,
+/// `proc_macro` and `a` again for the target, alike in cfg, with `a`'s build script run once
+/// more for the target with an `OUT_DIR` of its own, as cargo plans them. Each target crate is
+/// apart from its host twin, `a`'s const macros and `const-ast` are made once for each side,
+/// and no two crates have one key: a crate the lowering makes without what it is built for
+/// would share a key with its twin, and the build would stop on the clash.
+#[test]
+fn a_target_of_the_hosts_own_triple_lowers_to_crates_of_keys_of_their_own() {
+    const OUT_TARGET: &str = "/w/target/x86_64-unknown-linux-gnu/debug/build/a-2/out";
+    let mut units = const_macro_units();
+    let mut on_target = |mut unit: Unit, dependencies: Vec<UnitDep>, plan: UnitPlan| {
+        unit.platform = Some(HOST.to_owned());
+        unit.dependencies = dependencies;
+        units.graph.units.push(unit);
+        units.plans.push(plan);
+        units.graph.units.len() - 1
+    };
+    let fixture = const_macro_units();
+    let of = |at: usize| fixture.graph.units[at].clone();
+    let core = on_target(of(CORE), vec![], plan(&[], &[], None));
+    let proc_macro = on_target(of(PROC_MACRO), vec![dep(core, "core", true)], plan(&[], &[], None));
+    let run = on_target(of(RUN), vec![dep(BUILD_SCRIPT, "build_script_build", false)], plan(&[], &[], Some(OUT_TARGET)));
+    let env = [("CARGO_PKG_NAME", "a"), ("OUT_DIR", OUT_TARGET)];
+    let lib_deps = vec![dep(core, "core", true), dep(run, "build_script_build", false)];
+    let lib = on_target(of(LIB), lib_deps, plan(&["feature=\"fast\""], &env, None));
+    units.graph.roots.push(lib);
+    let tree = MemTree::default();
+    let built = lowered_with(&units, &tree, &[("a/src/macros.rs", Some(CONST_MACROS))]).unwrap();
+    let db = built.lowered.db();
+    let target = base_db::BuiltFor { platform: Some(Symbol::intern(HOST)), macro_wasm: false };
+    for (host, of_target) in [(CORE, core), (PROC_MACRO, proc_macro), (LIB, lib)] {
+        assert_ne!(krate(&built, host), krate(&built, of_target), "unit {host} and its target's twin {of_target}");
+        assert_eq!(krate(&built, host).extra_data(db).built_for, base_db::BuiltFor::default(), "unit {host}");
+        assert_eq!(krate(&built, of_target).extra_data(db).built_for, target, "unit {of_target}");
+    }
+    let macros = |unit| dependency_of(db, krate(&built, unit), "macros").expect("a's const macros");
+    assert_ne!(macros(LIB), macros(lib), "a's const macros, once for each side");
+    let const_ast = |unit| dependency_of(db, macros(unit), "const_ast").expect("const-ast");
+    assert_ne!(const_ast(LIB), const_ast(lib), "const-ast, once for each side");
+    assert_eq!(const_ast(lib).extra_data(db).built_for, target);
+    blaze_items::key::check_crate_keys(db).unwrap_or_else(|clash| panic!("{clash}"));
+}
+
+/// What a unit is built for prints the same in blaze-units, its source of truth, and in the
+/// front end's copy made by [`crates::built_for`].
+#[test]
+fn what_a_crate_is_built_for_reads_as_its_units_does() {
+    for (platform, macro_wasm) in [(None, false), (Some(HOST), false), (Some("wasm32-wasip1"), false), (Some("wasm32-wasip1"), true)] {
+        let of_units = blaze_units::schema::BuiltFor { platform, macro_wasm };
+        assert_eq!(crates::built_for(of_units).to_string(), of_units.to_string());
+    }
+}
+
+#[test]
+fn a_kept_front_end_is_lowered_into_whatever_the_plan_alone_reads() {
+    let kept = config(ContentId([1; 32]), ContentId([2; 32]));
+    let mut now = kept.clone();
+    now.invocation.command = Command::Check;
+    now.invocation.args = vec!["--keep-going".to_owned(), "-v".to_owned()];
+    now.invocation.cwd = "/w/sub".to_owned();
+    now.invocation.files = vec![("/home/.cargo/config.toml".to_owned(), b"[build]".to_vec())];
+    assert_eq!(crate::config_differs(&kept, &now), None);
+    now.invocation.env = vec![("SECRET_TOKEN".to_owned(), "hunter2".to_owned())];
+    let why = crate::config_differs(&kept, &now).expect("another environment is another front end");
+    assert!(why.contains("`SECRET_TOKEN`") && !why.contains("hunter2"), "{why}");
+    let mut now = kept.clone();
+    now.host = format!("{HOST}-other");
+    assert_eq!(crate::config_differs(&kept, &now).as_deref(), Some("its host"));
 }

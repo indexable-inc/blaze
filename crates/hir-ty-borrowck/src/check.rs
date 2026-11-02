@@ -2139,6 +2139,87 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
             })
     }
 
+    /// The error for a bound a signature's `for<'a>` implies that relating it with a more general
+    /// signature loses (rust-lang/rust#25860): the function or fn pointer, the type it becomes,
+    /// and the bound, with its lifetimes as the signature names them.
+    fn dropped_bound_message(&self, dropped: &regions::DroppedBound<'db>) -> &'f str {
+        use hir_ty::display::{DisplayTarget, HirDisplay as _};
+        let db = self.ctx.db;
+        let display = DisplayTarget::from_crate(db, self.ctx.krate);
+        // Whose late-bound lifetimes a function item's `for<'a>` binds; a constructor has none.
+        let owner = match dropped.function {
+            Some(hir_def::CallableDefId::FunctionId(it)) => Some(hir_def::GenericDefId::FunctionId(it)),
+            _ => None,
+        };
+        let name = |region: Option<Region<'db>>| -> &'f str {
+            let Some(region) = region else { return "'_" };
+            match region.kind() {
+                RegionKind::ReStatic => "'static",
+                RegionKind::ReBound(_, bound) => match bound.kind {
+                    rustc_type_ir::BoundRegionKind::NamedForPrinting(symbol) => {
+                        text!(self, "{}", symbol.0.as_str())
+                    }
+                    rustc_type_ir::BoundRegionKind::Named(_) => owner
+                        .and_then(|owner| {
+                            hir_def::hir::generics::GenericParams::of(db, owner)
+                                .iter_late_bound_lt()
+                                .nth(bound.var.as_usize())
+                                .map(|(_, it)| text!(self, "{}", it.name.as_str()))
+                        })
+                        .unwrap_or("'_"),
+                    _ => "'_",
+                },
+                _ => "'_",
+            }
+        };
+        // A fn pointer's own `for<'a>` written out, which the type's display leaves out.
+        let fn_ptr = |ty: Ty<'db>| -> &'f str {
+            let shown = ty.display(db, display);
+            match ty.kind() {
+                TyKind::FnPtr(sig, _) if !sig.bound_vars().is_empty() => {
+                    let mut names = Text::new(self.ctx.frame);
+                    for (index, kind) in sig.bound_vars().iter().enumerate() {
+                        let rustc_type_ir::BoundVariableKind::Region(kind) = kind else {
+                            continue;
+                        };
+                        if index > 0 {
+                            names.push(", ");
+                        }
+                        names.push(name(Some(Region::new_bound(
+                            self.ctx.infcx.interner,
+                            rustc_type_ir::INNERMOST,
+                            hir_ty::next_solver::BoundRegion {
+                                var: rustc_type_ir::BoundVar::from_usize(index),
+                                kind,
+                            },
+                        ))));
+                    }
+                    text!(self, "for<{}> {shown}", names.finish())
+                }
+                _ => text!(self, "{shown}"),
+            }
+        };
+        let bound = match dropped.subject {
+            Some(ty) => text!(self, "{}: {}", ty.display(db, display), name(dropped.shorter)),
+            None => text!(self, "{}: {}", name(dropped.longer), name(dropped.shorter)),
+        };
+        let source = match dropped.function {
+            Some(hir_def::CallableDefId::FunctionId(it)) => text!(
+                self,
+                "`{}`",
+                hir_def::signatures::FunctionSignature::of(db, it).name.as_str()
+            ),
+            _ => text!(self, "`{}`", fn_ptr(dropped.source)),
+        };
+        text!(
+            self,
+            "{source} coerced to `{}` loses the bound `{bound}` its signature implies, which no \
+             call of the fn pointer proves: rustc accepts this through its soundness hole \
+             rust-lang/rust#25860 (https://github.com/rust-lang/rust/issues/25860), blaze refuses it",
+            fn_ptr(dropped.target)
+        )
+    }
+
     /// The universal regions made to outlive what the signature does not say they outlive,
     /// and the type parameters made to outlive what they are not known to.
     fn report_region_errors(&mut self) {
@@ -2148,6 +2229,7 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
         let universals = &self.regions.universals;
         let in_closure = self.ctx.closure_local.is_some() || self.ctx.inline_const;
         let mut higher_ranked = mem::set(self.ctx.frame);
+        let mut dropped_reported = mem::set(self.ctx.frame);
         for (longer, &(longer_rv, kind)) in universals.iter().enumerate() {
             if matches!(kind, UniversalKind::Static | UniversalKind::FnBody)
                 || self.flow_universals_hold
@@ -2179,6 +2261,20 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
             let path =
                 regions::constraint_path(self.regions, self.region_count, longer_rv, shorter_rv);
             let Some(blamed) = regions::blame(&path) else { continue };
+            // A bound a signature's `for<'a>` implies, lost where it is related with a more
+            // general signature: rustc's soundness hole rust-lang/rust#25860, refused.
+            if let Some(dropped) = path
+                .iter()
+                .filter(|it| it.category == Category::ImpliedBound)
+                .find_map(|it| self.regions.dropped_bound(it.sup, it.sub))
+                .copied()
+            {
+                if dropped_reported.insert(dropped.span) {
+                    let message = self.dropped_bound_message(&dropped);
+                    self.report("", dropped.span, message);
+                }
+                continue;
+            }
             let named_anon = |a: UniversalKind, b: UniversalKind| {
                 a == UniversalKind::Named && b == UniversalKind::AnonParam
             };
@@ -2285,6 +2381,15 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                                 span: test.span,
                             });
                         }
+                    }
+                    continue;
+                }
+                if let Some(dropped) =
+                    self.regions.dropped_type_bound(test.ty, test.lower, test.span).copied()
+                {
+                    if reported.insert((test.ty, test.span)) {
+                        let message = self.dropped_bound_message(&dropped);
+                        self.report("", dropped.span, message);
                     }
                     continue;
                 }
@@ -2481,7 +2586,9 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
         let interner = self.ctx.infcx.interner;
         let frame = self.ctx.frame;
         let outlives = |bound: usize| self.outlives_all(bound, lower);
+        // Regions aside, and whether the solver found an alias rigid (`regions::unrigid`).
         let erase = |ty: Ty<'db>| {
+            let ty = regions::unrigid(interner, ty);
             rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner))
         };
         let erased = erase(ty);

@@ -32,6 +32,7 @@ pub mod arch;
 pub mod buf;
 pub mod code;
 pub mod enc;
+pub mod fuel;
 pub mod patch;
 pub mod shape;
 pub mod table;

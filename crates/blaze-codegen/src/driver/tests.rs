@@ -454,6 +454,7 @@ fn policy(level: OptLevel, mode: Mode) -> Policy {
         pgo: Pgo::None,
         proc_macro_bridge: false,
         report: false,
+        fuel: false,
         heap_to_stack: false,
     }
 }
@@ -517,6 +518,22 @@ fn the_front_end_hears_each_level_before_it_and_a_stop_ends_the_build() {
     let errors = build(&program, &stopped, &policy, &Memo::new(), &store).unwrap_err();
     assert!(errors.iter().all(|it| it.what.starts_with("stopped")), "{errors:?}");
     assert_eq!(stopped.prepared.load(Ordering::Relaxed), 0);
+}
+
+/// Two functions defining one symbol are refused, naming the symbol and both: the linker's
+/// table of names holds one target a name, so calls by that name went to whichever was
+/// given last (two panic runtimes' `__rust_panic_cleanup`, #1611).
+#[test]
+fn one_symbol_defined_by_two_functions_is_refused_naming_both() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let mut program = program();
+    for id in [4, 5] {
+        program.functions.get_mut(&id).unwrap().symbol = Some("__rust_panic_cleanup".to_owned());
+    }
+    let errors = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap_err();
+    let [error] = errors.as_slice() else { panic!("one error: {errors:?}") };
+    assert!(error.what.starts_with("the symbol `__rust_panic_cleanup` is defined twice in one program, by `f"), "{error:?}");
+    assert!(error.what.contains("`f4`") && error.what.contains("`f5`"), "{error:?}");
 }
 
 #[test]

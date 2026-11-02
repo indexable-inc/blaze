@@ -2142,6 +2142,14 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         match name {
             ExternalName::User(name) => {
                 let name = &self.func.params.user_named_funcs()[*name];
+                // A metered function's calls of the fuel runtime (`blaze_stencil::fuel`) are by
+                // the runtime's own symbols, which the object's relocations name again.
+                if name.namespace == blaze_stencil::fuel::NAMESPACE {
+                    let symbol = blaze_stencil::fuel::symbol(name.index)
+                        .ok_or(Unhandled::Shape("a fuel runtime function that is none of its two"))?;
+                    // alloc: the owned name `callees` keeps, once per callee
+                    return Ok(symbol.to_owned());
+                }
                 // The name is kept by `callees` and `globals`, once per callee or data object, and
                 // made at most once per call that passes an address (`pointer_params`).
                 // alloc: the owned name those maps keep
@@ -2160,6 +2168,10 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         match name {
             ExternalName::User(name) => {
                 let name = &self.func.params.user_named_funcs()[*name];
+                // The fuel runtime's functions are outside symbols, no request's.
+                if name.namespace == blaze_stencil::fuel::NAMESPACE {
+                    return None;
+                }
                 Some(super::Symbol::of_user(name.namespace, name.index))
             }
             _ => None,

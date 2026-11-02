@@ -343,6 +343,21 @@ impl MemoryPieces {
             .map(|index| (self.addresses[index], self.piece(index)))
     }
 
+    /// The lowest piece with bytes that holds `address` or that `address` is one past the end
+    /// of, with the address it starts at. A reference to nothing (an empty slice) keeps an
+    /// empty piece at its address, which may be inside or at the end of the memory it points
+    /// into; this finds that memory.
+    fn around(&self, address: usize) -> Option<(usize, &[u8])> {
+        let end = self.addresses.partition_point(|&it| it <= address);
+        let first = self.addresses[..end].partition_point(|&it| it.saturating_add(self.longest) < address);
+        (first..end)
+            .find(|&index| {
+                let len = self.extents[index].len;
+                len > 0 && address - self.addresses[index] <= len
+            })
+            .map(|index| (self.addresses[index], self.piece(index)))
+    }
+
     /// Keeps `bytes` at `address`, unless the piece already there is as long or longer.
     pub fn insert(&mut self, address: usize, bytes: &[u8]) {
         match self.position(address) {
@@ -473,6 +488,15 @@ impl<'db> MemoryMap<'db> {
             MemoryMap::Empty => None,
             MemoryMap::Simple(memory) => (addr == 0).then_some((0, &**memory)),
             MemoryMap::Complex(map) => map.memory.holding(addr),
+        }
+    }
+
+    /// The memory with bytes that holds `addr`, or that `addr` is one past the end of, with
+    /// the address it starts at, passing over the empty pieces that references to nothing keep.
+    pub fn kept_around(&self, addr: usize) -> Option<(usize, &[u8])> {
+        match self {
+            MemoryMap::Complex(map) => map.memory.around(addr),
+            MemoryMap::Empty | MemoryMap::Simple(_) => None,
         }
     }
 
@@ -654,6 +678,21 @@ mod memory_map_tests {
         assert_eq!(map.get(100, 2), Some(&[6, 6][..]));
         assert_eq!(map.get(101, 2), None);
         assert_eq!(map.get(104, 5), None);
+    }
+
+    #[test]
+    fn an_empty_piece_inside_memory_is_passed_over_for_that_memory() {
+        let mut map = ComplexMemoryMap::default();
+        map.insert(100, Box::new([6u8; 3]));
+        map.insert(101, Box::new([0u8; 0]));
+        map.insert(103, Box::new([0u8; 0]));
+        map.insert(200, Box::new([0u8; 0]));
+        let map = MemoryMap::Complex(Box::new(map));
+        assert_eq!(map.memory_at(101), Some((101, &[][..])));
+        assert_eq!(map.kept_around(101), Some((100, &[6; 3][..])));
+        assert_eq!(map.kept_around(103), Some((100, &[6; 3][..])));
+        assert_eq!(map.kept_around(104), None);
+        assert_eq!(map.kept_around(200), None);
     }
 
     #[test]

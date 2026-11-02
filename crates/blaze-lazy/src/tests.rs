@@ -55,6 +55,7 @@ pub(crate) fn policy(level: OptLevel, mode: Mode) -> Policy {
         pgo: Pgo::None,
         proc_macro_bridge: false,
         report: false,
+        fuel: false,
         heap_to_stack: false,
     }
 }

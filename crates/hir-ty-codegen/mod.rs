@@ -1013,24 +1013,117 @@ fn root_code(db: &Db, func: FunctionId, tier: bool) -> Result<Produced> {
     })
 }
 
-/// The crates of a program of `crates`: what they name
+/// The crates of the program of `krate`: what it names
 /// ([`hir_def::nameres::named::named_dependencies`]), as rustc loads them, and what that names
 /// in turn, but not through a proc macro, which is a library of the compiler's. A dependency
 /// nothing names is not linked, nor its constructors, `#[used]` statics or allocator.
-fn linked_crates(
-    db: &Db,
-    crates: impl IntoIterator<Item = Crate>,
-) -> HashSet<Crate, Global> {
+///
+/// One panic runtime (a `#![panic_runtime]` crate) at most, as rustc's `inject_panic_runtime`
+/// and `dependency_format` choose it: std and test depend on both `panic_unwind` and
+/// `panic_abort` and name neither, and the standard library's crates are taken to name every
+/// dependency, so a runtime reached only through them is linked only where it is the one the
+/// program's strategy names (`panic_unwind` for `panic = "unwind"`, `panic_abort` for
+/// `"abort"`), unless a crate of the program names a runtime itself. Both runtimes define
+/// `__rust_start_panic` and `__rust_panic_cleanup` under the same symbols: linking both let
+/// each symbol resolve to either, so a `catch_unwind` began an unwind with `panic_unwind`
+/// and cleaned it up with `panic_abort`, whose cleanup is `unreachable!()` (#1611).
+fn linked_crates(db: &Db, krate: Crate) -> std::result::Result<HashSet<Crate, Global>, String> {
+    let program = krate;
     let mut linked = HashSet::new_in(Global);
+    // Panic runtimes only the standard library's crates depend on: candidates for the one the
+    // program's strategy names. Few: std's and test's two.
     // alloc: once per program linked, setup
-    let mut stack: Vec<Crate> = crates.into_iter().collect();
-    while let Some(krate) = stack.pop() {
-        if linked.insert(krate) {
-            let deps = hir_def::nameres::named::named_dependencies(db, krate).iter().copied();
-            stack.extend(deps.filter(|it| !it.data(db).target_kind.is_proc_macro()));
+    let mut offered: Vec<Crate> = Vec::new();
+    // alloc: once per program linked, setup
+    let mut stack: Vec<Crate> = vec![krate];
+    let walk = |stack: &mut Vec<Crate>, linked: &mut HashSet<Crate, Global>, offered: &mut Vec<Crate>| {
+        while let Some(krate) = stack.pop() {
+            if !linked.insert(krate) {
+                continue;
+            }
+            let lang = krate.data(db).origin.is_lang();
+            for &dep in hir_def::nameres::named::named_dependencies(db, krate).iter() {
+                if dep.data(db).target_kind.is_proc_macro() {
+                    continue;
+                }
+                if lang && is_panic_runtime(db, dep) {
+                    if !offered.contains(&dep) {
+                        offered.push(dep);
+                    }
+                    continue;
+                }
+                stack.push(dep);
+            }
+        }
+    };
+    walk(&mut stack, &mut linked, &mut offered);
+    if offered.is_empty() {
+        return Ok(linked);
+    }
+    // A runtime a crate of the program names itself (`extern crate panic_abort;`) replaces
+    // the injected one, as rustc's `activate_injected_dep` has it. A runtime of no toolchain
+    // crate named beside the injected one makes their symbols defined twice, which codegen
+    // refuses naming them.
+    let named: Vec<Crate> = offered
+        .iter()
+        .copied()
+        .filter(|it| linked.contains(it))
+        // alloc: once per program linked, at most the toolchain's two runtimes
+        .collect();
+    match named.as_slice() {
+        [] => {}
+        [_] => return Ok(linked),
+        [a, b, ..] => {
+            let mut names = [fncache::crate_name(db, *a), fncache::crate_name(db, *b)];
+            names.sort_unstable();
+            let [first, second] = names;
+            // alloc: the error's message
+            return Err(format!(
+                "the program of crate `{}` names two panic runtimes, `{first}` and `{second}`: \
+                 a program links one",
+                fncache::crate_name(db, program)
+            ));
         }
     }
-    linked
+    let wanted = panic_runtime_of(db, program)?;
+    let Some(&runtime) = offered.iter().find(|&&it| fncache::crate_name(db, it) == wanted) else {
+        let mut names: Vec<String> = offered.iter().map(|&it| fncache::crate_name(db, it)).collect();
+        names.sort_unstable();
+        // alloc: the error's message
+        return Err(format!(
+            "the program of crate `{}` panics by `{wanted}`, and the standard library depends on \
+             no panic runtime of that name (only {names:?})",
+            fncache::crate_name(db, program)
+        ));
+    };
+    stack.push(runtime);
+    walk(&mut stack, &mut linked, &mut offered);
+    Ok(linked)
+}
+
+/// Whether `krate` is a panic runtime: `#![panic_runtime]` on its root.
+fn is_panic_runtime(db: &Db, krate: Crate) -> bool {
+    let root = hir_def::nameres::crate_def_map(db, krate).crate_root(db);
+    AttrFlags::has_word(db, hir_def::AttrDefId::ModuleId(root), "panic_runtime")
+}
+
+/// The crate name of the panic runtime the program of `krate` links, by its `-C panic` (its
+/// `cfg(panic = "..")`), as rustc's `inject_panic_runtime` names it.
+fn panic_runtime_of(db: &Db, krate: Crate) -> std::result::Result<&'static str, String> {
+    let cfg = krate.cfg_options(db);
+    let strategy = |value: intern::Symbol| cfg.check_atom(&cfg::CfgAtom::KeyValue { key: intern::sym::panic, value });
+    if strategy(intern::sym::abort) {
+        return Ok("panic_abort");
+    }
+    if strategy(intern::Symbol::intern("unwind")) {
+        return Ok("panic_unwind");
+    }
+    // alloc: the error's message
+    Err(format!(
+        "the program of crate `{}` has a panic strategy that names no panic runtime: its cfg \
+         has neither `panic = \"unwind\"` nor `panic = \"abort\"`",
+        fncache::crate_name(db, krate)
+    ))
 }
 
 /// The code of a function, closure, `async` block or shim with its generic arguments filled in.
@@ -2388,6 +2481,7 @@ fn build<'db>(
             variadic: false,
             abi: ExternAbi::Rust,
             location: None,
+            in_drop_glue: false,
             span: MirSpan::Unknown,
             constant_locals: Vec::new_in(frame),
             registers: FrameMap::new_in(frame),
@@ -3221,6 +3315,10 @@ struct FunctionCx<'cx, 'db> {
     /// The calling convention of the function being built.
     abi: ExternAbi,
     location: Option<Value>,
+    /// The function is drop glue, which is given no `Location`: a `#[track_caller]` callee
+    /// (a `Drop::drop` with it) is told the declaration of `core::ptr::drop_glue`, as rustc
+    /// spans its drop shim at the definition of its `DefId` (`build_drop_shim`).
+    in_drop_glue: bool,
     /// Where the statement being compiled comes from.
     span: MirSpan,
     /// Promoted locals that are read-only data instead of a slot the body writes to.
@@ -6687,7 +6785,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if empty
             && provenance
             && map.tracks_provenance()
-            && let Some((start, memory)) = memory_holding(map.map, addr)
+            && let Some((start, memory)) = map.map.kept_around(addr)
             && !memory.is_empty()
         {
             let target = self.walk_allocation(start, memory, None, mutability, map)?;
@@ -8724,9 +8822,20 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// statement are `#[track_caller]`. A shim passes on what it was given.
     fn caller_location(&mut self) -> Result<Value> {
         let Some(body) = self.body else {
-            match self.location {
-                Some(location) => return Ok(location),
-                None => unsupported!("a `Location` in a shim that was given none"),
+            match (self.location, self.in_drop_glue) {
+                (Some(location), _) => return Ok(location),
+                (None, true) => {
+                    let Some(glue) = self.interner.lang_items().DropGlue else {
+                        unsupported!(
+                            "a `Location` in drop glue, which is spanned at the `drop_glue` lang \
+                             item, and the library has none"
+                        );
+                    };
+                    let location = self.cg.declaration(glue);
+                    let location = self.cg.declare_data_in_func(location, self.builder.func);
+                    return Ok(self.builder.ins().symbol_value(self.cg.target.pointer(), location));
+                }
+                (None, false) => unsupported!("a `Location` in a shim that was given none"),
             }
         };
         let (owner, span) = match caller_location(self.cg.db, body, self.span, self.tracked) {
@@ -14659,6 +14768,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// The body of `drop_in_place::<ty>`.
     fn drop_glue(&mut self, ty: Ty<'db>) -> Result<()> {
+        self.in_drop_glue = true;
         let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(self.cg.target.pointer()));
         if self.is_unsized(ty) {

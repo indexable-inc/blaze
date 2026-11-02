@@ -221,13 +221,22 @@ impl Trace {
 /// directories it may read, its open descriptors and directory streams, and what it read.
 pub(crate) struct Os<'a> {
     env: &'a base_db::Env,
+    /// Where a relative path starts, as it was given: the call's directory
+    /// (`ProcMacroCall::current_dir`), the one cargo runs rustc in for the calling crate
+    /// (cargo's `path_args`, `src/util/workspace.rs` at the pinned nightly's cargo): the
+    /// workspace's root for a path package whose target is below it, the package's own
+    /// directory for any other. A relative path a macro names starts there, and `getcwd` says
+    /// it. The expansion's key holds it (`proc_macro_api::kept::given`'s `dir`).
+    cwd: &'a str,
+    /// Its real path, walked on first use: `Some(None)` when there is none to resolve from.
+    cwd_real: Option<Option<String>>,
     /// The directories it may read, found on its first path.
     roots: Option<files::Roots>,
     fds: Vec<files::Slot>,
     streams: Vec<files::Stream>,
     trace: Trace,
     unkeyable: Option<String>,
-    /// Whether a path outside the roots stops the expansion, naming it ([`Os::wasm`]), rather
+    /// Whether a path outside the roots stops the expansion, naming it ([`Os::wasm_in`]), rather
     /// than failing with `EACCES`.
     refusal_stops: bool,
     /// The value `getenv` gave of each variable it was asked of that is set, by its name.
@@ -249,10 +258,13 @@ pub(crate) struct Os<'a> {
 
 impl<'a> Os<'a> {
     /// `env` is the calling crate's (`ProcMacroCall::env`): what the macro's `getenv` answers.
-    /// It may read under `CARGO_MANIFEST_DIR` and `OUT_DIR` of `env`, and nothing else.
-    pub(crate) fn new(env: &'a Env) -> Os<'a> {
+    /// It may read under `CARGO_MANIFEST_DIR` and `OUT_DIR` of `env`, and nothing else. A
+    /// relative path starts at `cwd`, the call's directory ([`Os::cwd`]).
+    pub(crate) fn in_dir(env: &'a Env, cwd: &'a str) -> Os<'a> {
         Os {
             env,
+            cwd,
+            cwd_real: None,
             roots: None,
             fds: Vec::new(), // alloc: none until the first open, then each slot reused
             streams: Vec::new(), // alloc: none until the first `opendir`, then reused
@@ -270,11 +282,12 @@ impl<'a> Os<'a> {
         }
     }
 
-    /// The machine of a wasm macro's WASI (`wasm/wasi.rs`): [`Os::new`]'s, except that a read
-    /// outside the roots stops the expansion with an error naming the path, as the sandbox
-    /// refuses it, where the evaluator's `EACCES` would leave the macro to say it or not.
-    pub(crate) fn wasm(env: &'a Env) -> Os<'a> {
-        Os { refusal_stops: true, ..Os::new(env) }
+    /// The machine of a wasm macro's WASI (`wasm/wasi.rs`): [`Os::in_dir`]'s, except that a
+    /// read outside the roots stops the expansion with an error naming the path, as the sandbox
+    /// refuses it, where the evaluator's `EACCES` would leave the macro to say it or not. The
+    /// module's glue enters `cwd` before its macro runs.
+    pub(crate) fn wasm_in(env: &'a Env, cwd: &'a str) -> Os<'a> {
+        Os { refusal_stops: true, ..Os::in_dir(env, cwd) }
     }
 
     /// Whether `func` is one of the shims: an extern function of a known name (its

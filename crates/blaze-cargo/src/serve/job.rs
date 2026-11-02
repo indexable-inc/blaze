@@ -218,7 +218,7 @@ pub(super) enum Does<S: Steps> {
     /// Task `at` fetches `fetches[at]`.
     Fetch { steps: Arc<S>, fetches: Arc<[Fetch]> },
     /// The head's last front end, taken by the run that lowers into it.
-    /// Its build dirs leased first ([`lease_build_dirs`]) into `leases`, against `checkout`,
+    /// Its build dirs leased first ([`Steps::lease`]) into `leases`, against `checkout`,
     /// `builds` the dir of every workspace's build dir.
     Lower { steps: Arc<S>, input: JobInput, kept: Mutex<Option<S::KeptFront>>, leases: Arc<Mutex<Leases>>, checkout: String, builds: String },
     /// Task `at` compiles unit `at`. A compile that gives way puts the images it was given in
@@ -311,7 +311,7 @@ impl<S: Steps> plane::Work for Step<S> {
                     (held.held.is_empty(), held.first_try_ns)
                 };
                 if unleased {
-                    match lease_build_dirs(&input.units, checkout, builds) {
+                    match steps.lease(&input.units, checkout, builds) {
                         Ok(Ok(taken)) => {
                             let mut held = leases.lock();
                             if held.held.is_empty() {
@@ -1304,7 +1304,8 @@ pub(super) fn protected(root: &std::path::Path) -> Result<&'static blaze_gc::fs:
     made.as_ref().map_err(|why| format!("what no build dir may be or hold: {why}"))
 }
 
-/// The leases of `units`' build dirs (`target_dir` and `build_dir`), each dir's record touched
+/// The daemon's [`Steps::lease`] (the simulation's steps take none, having no disk): the leases
+/// of `units`' build dirs (`target_dir` and `build_dir`), each dir's record touched
 /// for `checkout`, with each profile's or target's directory the build writes into (docs/gc.md).
 /// Only the dirs under `builds` (`<root>/build/<dir>`) are ever collected; one a `--target-dir`
 /// or `CARGO_TARGET_DIR` names is leased too, so `blaze clean` refuses it while a build uses it.
@@ -1313,12 +1314,7 @@ pub(super) fn protected(root: &std::path::Path) -> Result<&'static blaze_gc::fs:
 /// `Ok(Err((dir, wait)))` when a lease cannot be taken now (held exclusively by a collector's
 /// rename, or its file without a whole nonce yet): the caller gives way and tries again, for at
 /// most [`blaze_gc::lease::GIVE_WAY`]. Runs on the pool: it may sync a record.
-#[allow(clippy::type_complexity, reason = "a lease taken, a lease to wait for, or an error")]
-fn lease_build_dirs(
-    units: &Units,
-    checkout: &str,
-    builds: &str,
-) -> Result<Result<Vec<blaze_gc::lease::Lease>, (String, blaze_gc::lease::Wait)>, String> {
+pub(super) fn lease_build_dirs(units: &Units, checkout: &str, builds: &str) -> super::work::Leased {
     let now = blaze_gc::record::now_ns();
     let builds = std::path::Path::new(builds);
     let root = builds.parent().unwrap_or(builds);

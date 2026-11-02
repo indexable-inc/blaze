@@ -606,6 +606,43 @@ pub struct ExtraCrateData {
     pub display_name: Option<CrateDisplayName>,
     /// The cfg options that could be used by the crate
     pub potential_cfg_options: Option<CfgOptions>,
+    /// What it is built for, as cargo's units tell two builds of one package apart.
+    pub built_for: BuiltFor,
+}
+
+/// What a crate is built for: the host (a build without `--target`, or a build script and
+/// what it depends on), a target triple, or a triple for blaze's wasm proc macros. Two crates
+/// alike in all else but this are two builds, as cargo keeps them (its `CompileKind`): a
+/// `--target` of the host's own triple builds the standard library for the host and the
+/// target, and a `--target wasm32-wasip1` builds it for the target and for the proc macros,
+/// each with its own `OUT_DIR` and build script run. A crate's keys cover it.
+///
+/// The front end's copy of `blaze_units::schema::BuiltFor`, the source of truth, which this
+/// crate cannot depend on: a build's crates get it only from `blaze_lower::crates::built_for`,
+/// and it prints the same text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)] // clone: setup: the crate graph, once per load
+pub struct BuiltFor {
+    /// The triple; none for the host's own units.
+    pub platform: Option<Symbol>,
+    /// Whether it is built to run as a wasm proc macro (or for one).
+    pub macro_wasm: bool,
+}
+
+impl BuiltFor {
+    /// What a crate's content ID and keys hash of it: the triple, or none, then the flag.
+    pub fn hash_into<'h>(&self, hasher: &'h mut Hasher) -> &'h mut Hasher {
+        hasher.opt_part(self.platform.as_ref().map(Symbol::as_str)).update(&[u8::from(self.macro_wasm)])
+    }
+}
+
+impl fmt::Display for BuiltFor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.platform, self.macro_wasm) {
+            (None, _) => f.write_str("the host"),
+            (Some(triple), false) => f.write_str(triple.as_str()),
+            (Some(triple), true) => write!(f, "{} (proc macros)", triple.as_str()),
+        }
+    }
 }
 
 #[derive(Default, Clone, PartialEq, Eq)] // clone: setup: the crate graph, once per load
@@ -1429,7 +1466,7 @@ impl CrateGraphBuilder {
                 crate_types: target_kind.default_crate_types(),
                 proc_macro_cwd,
             },
-            extra: ExtraCrateData { version, display_name, potential_cfg_options },
+            extra: ExtraCrateData { version, display_name, potential_cfg_options, built_for: BuiltFor::default() },
             cfg_options,
             env,
             ws_data,

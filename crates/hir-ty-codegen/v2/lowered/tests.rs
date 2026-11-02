@@ -88,6 +88,7 @@ fn spec() -> Spec {
         sanitize: Sanitize::default(),
         proc_macro_bridge: false,
         report: false,
+        fuel: false,
         heap_to_stack: false,
     }
 }
@@ -142,6 +143,7 @@ fn policy() -> Policy {
         pgo: Pgo::None,
         proc_macro_bridge: false,
         report: false,
+        fuel: false,
         heap_to_stack: false,
     }
 }
@@ -209,7 +211,7 @@ fn each_name_is_a_reference_or_the_functions_own_data() {
     assert_eq!(names.len(), declared.len());
     assert!(declared.values().any(|it| it.namespace == 0), "`caller` calls `callee`: {names:?}");
     assert!(declared.values().all(|it| it.namespace <= 1), "{declared:?}");
-    for name in &names {
+    for name in names.iter().flatten() {
         let known = match name {
             Target::Data(id) => data.iter().any(|it| it.id == *id),
             other => refs.contains(other),
@@ -302,7 +304,7 @@ fn the_reach_of_a_root_is_the_drivers() {
         let instance_of = UnitInstance { settings: tier.settings(), ..unit.instance };
         let unit = Unit { instance: instance_of, backend: Backend::Stencil, ..unit.clone() };
         match lowered(&frontend, &unit, &tier, instance, refs) {
-            Ok(Lowering::Ir { names, .. }) => assert!(names.iter().all(|it| !matches!(it, Target::Counter(_)))),
+            Ok(Lowering::Ir { names, .. }) => assert!(names.iter().flatten().all(|it| !matches!(it, Target::Counter(_)))),
             Ok(_) => {}
             Err(e) => panic!("{instance:?}: {e:?}"),
         }

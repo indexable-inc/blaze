@@ -11,13 +11,15 @@
 //! counts too, the message names the binding, and the fix is machine-applicable when it is
 //! whole: a `let` written in the file whose every use is a read `*m.lock()` (std's with its
 //! `.unwrap()` or `.expect(..)`), rewritten to `m.load(SeqCst)`, or an assignment
-//! `*m.lock() = e`, rewritten to `m.store(e, SeqCst)`. Any other use (a reference, a compound
+//! `*m.lock() = e`, rewritten to `m.store(e, SeqCst)`, each line so rewritten ending in the
+//! `// seqcst: <why>` that `blaze::seqcst_unexplained` asks for (a line that ends inside a string
+//! or a block comment can't take one, and blocks the fix). Any other use (a reference, a compound
 //! assignment, a `match` on it, a use in a macro's output) leaves the fix maybe incorrect, its
 //! uses named in a note. A static's fix is maybe incorrect: its uses are everywhere.
 
 use hir::HirDisplay as _;
 use syntax::{
-    SyntaxKind as K, TextRange,
+    SyntaxKind as K, TextRange, TextSize,
     view::{self as ast, AstNode as _, HasArgList as _, HasName as _},
 };
 
@@ -33,8 +35,16 @@ const ATOMIC: Implemented = Implemented::MutexAtomic;
 /// clippy's `MUTEX_INTEGER`: a fixed-size integer.
 const INTEGER: Implemented = Implemented::MutexInteger;
 
-/// The ordering the fix's loads and stores use: a lock's, the strongest.
+/// The ordering the fix's loads and stores use: a lock's, the strongest. Accesses only under
+/// locks are sequentially consistent (no data race, so one total order), and `Acquire` loads
+/// with `Release` stores are not: two threads each storing one flag then loading the other's can
+/// both miss the other's store.
 const SEQ_CST: &str = "std::sync::atomic::Ordering::SeqCst";
+
+/// What the fix writes at the end of each line it puts a `SeqCst` on: the reason
+/// `blaze::seqcst_unexplained` asks for, so the fixed code lints clean.
+const SEQ_CST_WHY: &str =
+    " // seqcst: keeps the one total order of the `Mutex` this replaces; `Acquire`/`Release` do unless a thread relies on it";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lock {
@@ -218,16 +228,44 @@ fn uses<'t>(
     };
     let root = cx.root();
     let after = stmt.text_range().end();
+    let first = edits.len();
     utils::each_path(cx, root, Some(after), &mut |path| {
         if utils::local_of(cx, path) != Some(local) {
             return;
         }
         let in_file = std::ptr::eq(path.syntax().file(), root.file());
-        match in_file.then(|| rewrite(cx, path, lock)).flatten() {
+        let rewritten = in_file.then(|| rewrite(cx, path, lock)).flatten();
+        match rewritten.filter(|(range, _)| line_end(cx.text(), root, range.end()).is_some()) {
             Some(edit) => edits.push(edit),
             None => blocked.push(cx.range(path.syntax()).unwrap_or(pat.syntax().text_range())),
         }
     });
+    explain_seq_cst(cx.text(), root, edits, first);
+}
+
+/// Each line the rewrites from `edits[first..]` put a `SeqCst` on gets [`SEQ_CST_WHY`] at its
+/// end, once: appended to the rewrite that ends there, or inserted.
+fn explain_seq_cst(text: &str, root: ast::Node<'_>, edits: &mut Vec<(TextRange, String)>, first: usize) {
+    let mut ends: Vec<TextSize> = edits[first..].iter().filter_map(|(range, _)| line_end(text, root, range.end())).collect(); // alloc: a few lines, on a finding
+    ends.sort_unstable();
+    ends.dedup();
+    for end in ends {
+        match edits[first..].iter_mut().find(|(range, _)| range.end() == end) {
+            Some((_, rewritten)) => rewritten.push_str(SEQ_CST_WHY),
+            None => edits.push((TextRange::empty(end), SEQ_CST_WHY.to_owned())), // alloc: an edit's text
+        }
+    }
+}
+
+/// Where the line holding `at` ends, when a `//` comment can go there: the line break is
+/// whitespace, not inside a string or a block comment (or the text ends there).
+fn line_end(text: &str, root: ast::Node<'_>, at: TextSize) -> Option<TextSize> {
+    let at = usize::from(at).min(text.len());
+    let Some(newline) = text[at..].find('\n') else { return Some(TextSize::of(text)) };
+    let end = TextSize::try_from(at + newline).ok()?;
+    let file = root.ancestors().last().unwrap_or(root);
+    let token = file.token_at_offset(end).right_biased()?;
+    (token.kind() == K::WHITESPACE).then_some(end)
 }
 
 /// `*m.lock()` read, to `m.load(..)`, or assigned, to `m.store(e, ..)`: the range rewritten and
@@ -350,7 +388,13 @@ pub fn f() -> bool {
         );
         assert_eq!(
             after,
-            "pub fn f() -> bool {\n    let done = std::sync::atomic::AtomicBool::new(false);\n    done.store(true, std::sync::atomic::Ordering::SeqCst);\n    let now = done.load(std::sync::atomic::Ordering::SeqCst);\n    now && done.load(std::sync::atomic::Ordering::SeqCst)\n}\n"
+            format!(
+                "pub fn f() -> bool {{\n    let done = std::sync::atomic::AtomicBool::new(false);\n    \
+                 done.store(true, std::sync::atomic::Ordering::SeqCst);{why}\n    \
+                 let now = done.load(std::sync::atomic::Ordering::SeqCst);{why}\n    \
+                 now && done.load(std::sync::atomic::Ordering::SeqCst){why}\n}}\n",
+                why = super::SEQ_CST_WHY
+            )
         );
     }
 

@@ -435,7 +435,9 @@ impl<'db> Walk<'_, 'db, '_> {
             _ => None,
         };
         let (looked, wrote) = (self.name(lookup.f), self.name(write.f));
-        let key_text = snippet(key).unwrap_or("the key");
+        // The key itself, as both calls name it through `&`, `*` and conversions (`k` of
+        // `contains_key(&k)` and `insert(k.clone(), ..)`): what is hashed twice.
+        let key_text = snippet(self.key_core(key, KEY_DEPTH)).unwrap_or("the key");
         let message = match map {
             Some(map) => format!("`{map}` hashes and looks up `{key_text}` twice: `{looked}` here, then `{wrote}`"),
             None => format!("this map hashes and looks up `{key_text}` twice: `{looked}` here, then `{wrote}`"),

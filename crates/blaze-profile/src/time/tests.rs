@@ -48,6 +48,7 @@ fn span(thread: u32, span_id: u64, parent: Option<u64>, name: &str, start_ns: i6
         job: None,
         start_ns,
         dur_ns,
+        self_cpu_ns: None,
     }
 }
 

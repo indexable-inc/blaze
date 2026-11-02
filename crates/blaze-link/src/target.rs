@@ -982,7 +982,7 @@ fn linker_dirs<A: Ask>(ask: &A, cc: &CDriver<'_>, triple: &str) -> Result<(Vec<P
         // alloc: error path
         .ok_or_else(|| fail(format!("{} printed no job: the C toolchain for {triple} is {}", shown(), cc.said)))?;
     // alloc: error path
-    let words = quoted_words(job).ok_or_else(|| fail(format!("{} printed a job that is not quoted words: {job}", shown())))?;
+    let words = quoted_words(job).ok_or_else(|| fail(format!("{} printed a linker job with an unclosed quote or a trailing `\\`: {job}", shown())))?;
     // alloc: once per toolchain asked, its directories
     let (mut dirs, mut frameworks): (Vec<PathBuf>, Vec<PathBuf>) = (Vec::new(), Vec::new());
     for (at, word) in words.iter().enumerate() {
@@ -1006,31 +1006,49 @@ fn linker_dirs<A: Ask>(ask: &A, cc: &CDriver<'_>, triple: &str) -> Result<(Vec<P
     Ok((dirs, frameworks))
 }
 
-/// The words of a job as a C driver's `-###` prints it: each in double quotes, `\` taking the
-/// next character as it is; `None` for a line that isn't.
+/// The words of a job as a C driver's `-###` prints it, split as a shell would: a word is in
+/// double quotes (clang, GCC before 16) or bare up to the next space (GCC 16 quotes only words
+/// that need it), and `\` takes the next character as it is in either; `None` for a line with an
+/// unclosed quote or a trailing `\`.
 fn quoted_words(line: &str) -> Option<Vec<String>> {
     // alloc: once per toolchain asked, its linker's words
     let mut out = Vec::new();
-    let mut chars = line.chars();
+    let mut chars = line.chars().peekable();
     loop {
-        match chars.next() {
+        match chars.peek() {
             None => return Some(out),
-            Some(' ') => {}
-            Some('"') => {
-                // alloc: once per toolchain asked, each word of its linker's job
-                let mut word = String::new();
-                loop {
-                    match chars.next()? {
-                        '"' => break,
-                        '\\' => word.push(chars.next()?),
-                        it => word.push(it),
-                    }
-                }
-                out.push(word);
+            Some(' ') => {
+                chars.next();
+                continue;
             }
-            Some(_) => return None,
+            Some(_) => {}
         }
+        // alloc: once per toolchain asked, each word of its linker's job
+        let mut word = String::new();
+        let mut quoted = false;
+        loop {
+            match (chars.next(), quoted) {
+                (None, false) => break,
+                (None, true) => return None,
+                (Some('"'), _) => quoted = !quoted,
+                (Some('\\'), _) => word.push(chars.next()?),
+                (Some(' '), false) => break,
+                (Some(it), _) => word.push(it),
+            }
+        }
+        out.push(word);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_linker_job_splits_into_the_same_words_quoted_or_bare() {
+    let quoted = r#" "/usr/bin/ld" "-L/usr/lib" "-o" "a b" "x\"y""#;
+    let bare = r#" /usr/bin/ld -L/usr/lib -o "a b" x\"y"#;
+    let want = ["/usr/bin/ld", "-L/usr/lib", "-o", "a b", "x\"y"].map(String::from).to_vec();
+    assert_eq!(quoted_words(quoted), Some(want.clone()));
+    assert_eq!(quoted_words(bare), Some(want));
+    assert_eq!(quoted_words(r#" "open"#), None, "an unclosed quote is refused");
 }
 
 /// The macOS SDK: its library and framework directories and its version.

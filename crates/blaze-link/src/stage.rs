@@ -401,7 +401,7 @@ impl<'a> Stage<'a> {
             let (Some(item), Some(instance)) = (self.symbols.find_id(&item.0), self.symbols.find_id(instance)) else {
                 continue;
             };
-            for key in [SymKey::Static(item, instance), SymKey::Tlv(item, instance)] {
+            for key in [SymKey::Static(item, instance), SymKey::Tlv(item, instance), SymKey::StaticList(item, instance)] {
                 if let Some(sym) = self.symbols.find(key) {
                     if let Def::Piece { piece, .. } = self.new.def(sym) {
                         self.unmake(piece);
@@ -704,7 +704,16 @@ impl<'a> Stage<'a> {
                 return Err(error(Some(function.key), "added, and it is lazy: the lazy placer places its code"));
             }
             if body.and_then(|it| self.new.home(it)).is_some() {
-                continue;
+                let name = self.symbols.find_id(&function.key.0).and_then(|it| self.new.debug_name(it));
+                return Err(error(
+                    Some(function.key),
+                    // alloc: error path
+                    format!(
+                        "the function `{}` is added, and its code is already placed: a change that puts a function \
+                         again removes it in the same change (`Change::removed`), so its old code is never kept",
+                        name.map_or("(no debug name)", |it| self.symbols.str(it)),
+                    ),
+                ));
             }
             todo.push(function);
         }
@@ -1132,6 +1141,11 @@ impl<'a> Stage<'a> {
         if let Def::Piece { piece, .. } = self.new.def(sym) {
             self.unmake(piece);
         }
+        if let Some(listed) = self.symbols.find(SymKey::StaticList(item, instance))
+            && let Def::Piece { piece, .. } = self.new.def(listed)
+        {
+            self.unmake(piece);
+        }
         for data in &it.data {
             let id = self.symbols.id(&data.id);
             let data_sym = self.sym(SymKey::Data(id));
@@ -1194,6 +1208,7 @@ impl<'a> Stage<'a> {
         let made = self.make(&piece, content);
         if self.arch() == Arch::Wasm32 {
             self.declare_wasm(made, None, &it.imports)?;
+            self.list_wasm_static(it, (item, instance), sym, class)?;
         }
         if thread_local && self.plan.tls_descriptors {
             let tlv = self.sym(SymKey::Tlv(item, instance));
@@ -1209,6 +1224,59 @@ impl<'a> Stage<'a> {
             self.make(&piece, Content::Zero);
         }
         self.statics += 1;
+        Ok(())
+    }
+
+    /// On wasm, the entry of `it` (placed as `sym` in `class`) in the module's list of what its
+    /// running code can write ([`crate::wasm::STATICS`]): the static's own bytes when it is
+    /// mutable or thread-local (plain data on wasm), and each writable allocation its value
+    /// points to ([`Data::writable`]). A static in no memory (a custom section, the init
+    /// array), or with nothing writable, has none. The entry is the static's, made and removed
+    /// with it, and the addresses in it are fixups, so they are where the link placed each.
+    fn list_wasm_static(&mut self, it: &'a Static, (item, instance): (IdNo, IdNo), sym: Sym, class: ClassId) -> Result<(), LinkError> {
+        let mut targets: FrameVec<'a, (Sym, u64)> = Vec::new_in(self.arena);
+        let own = match &it.init {
+            Init::Bytes { bytes, .. } => bytes.len() as u64,
+            Init::Zeroed { size } => *size,
+        };
+        if crate::wasm::in_memory(self.new.class(class)) && (it.mutable || it.thread_local) && own > 0 {
+            targets.push((sym, own));
+        }
+        for data in it.data.iter().filter(|it| it.writable && !it.bytes.is_empty()) {
+            let id = self.symbols.id(&data.id);
+            targets.push((self.sym(SymKey::Data(id)), data.bytes.len() as u64));
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        // alloc: error path
+        let static_error = |what: String| error(None, format!("the static {:?}: {what}", it.item));
+        let len = crate::wasm::STATICS_HEADER + crate::wasm::STATICS_RECORD * targets.len();
+        let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(len, |_| 0);
+        bytes[4..36].copy_from_slice(&it.item.0.0);
+        bytes[36..40].copy_from_slice(&(targets.len() as u32).to_le_bytes());
+        for (at, &(_, size)) in targets.iter().enumerate() {
+            let size = u32::try_from(size).map_err(|_| static_error(format!("{size} bytes, past 32-bit memory")))?;
+            let at = crate::wasm::STATICS_HEADER + crate::wasm::STATICS_RECORD * at;
+            bytes[at + 4..at + 8].copy_from_slice(&size.to_le_bytes());
+        }
+        let apply = crate::wasm::codegen_apply(RelocKind::WasmMemory, false).map_err(static_error)?;
+        let heap_base = self.sym_name("__heap_base");
+        let fixups = self.fixup_slice(std::iter::once(Fixup { at: 0, apply, target: heap_base, addend: 0, minus: None }).chain(
+            targets.iter().enumerate().map(|(at, &(target, _))| Fixup {
+                at: (crate::wasm::STATICS_HEADER + crate::wasm::STATICS_RECORD * at) as u64,
+                apply,
+                target,
+                addend: 0,
+                minus: None,
+            }),
+        ));
+        let (list, rank) = self.writer.section(crate::wasm::STATICS, false, false, false).map_err(static_error)?;
+        let list = self.new.class_id(&list);
+        let entry = self.sym(SymKey::StaticList(item, instance));
+        let mut piece = Self::piece_in(entry, list, 4, len as u64, fixups, What::Fixed);
+        piece.rank = rank;
+        self.make(&piece, Content::Bytes(bytes));
         Ok(())
     }
 

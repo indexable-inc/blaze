@@ -1317,6 +1317,7 @@ dependencies = [
  "blaze-graph",
  "blaze-hash",
  "blaze-ids",
+ "blaze-items",
  "blaze-lower",
  "blaze-profile",
  "blaze-query",
@@ -1344,6 +1345,7 @@ dependencies = [
  "tt",
  "unicode-normalization",
  "wasmtime",
+ "wat",
 ]
 
 [[package]]
@@ -1513,6 +1515,7 @@ dependencies = [
  "serde",
  "smallvec",
  "thin-vec",
+ "tracing",
  "triomphe",
 ]
 

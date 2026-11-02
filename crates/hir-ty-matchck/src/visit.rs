@@ -101,6 +101,7 @@ pub(crate) fn check_body<'db>(
         exhaustive_patterns: features.exhaustive_patterns,
         deref_patterns: features.deref_patterns,
         never_patterns: features.never_patterns,
+        exhaustive_witnesses: false,
         has_deref_pat: Cell::new(false),
         range_lints: RefCell::new(Vec::new()), // alloc: none until a lint fires.
     };

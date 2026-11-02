@@ -208,6 +208,11 @@ pub struct Spec {
     /// loops (lint `blaze::vecreport`, `hir_ty_codegen::v2::report`): LLVM is given its lines
     /// on every format and its remarks are caught. Only LLVM's units have it.
     pub report: bool,
+    /// The function counts down its thread's fuel at its entry and loop heads, and calls the
+    /// fuel runtime when it runs out (`blaze_stencil::fuel`, issue #1605): a test's budget.
+    /// Left out of the serialized form when off, so every spec without it reads as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fuel: bool,
 }
 
 impl Spec {
@@ -227,6 +232,7 @@ impl Spec {
             proc_macro_bridge,
             heap_to_stack,
             report,
+            fuel,
         } = self;
         let Toolchain {
             id,
@@ -285,6 +291,10 @@ impl Spec {
         if *report {
             hasher.update(b"vecreport");
         }
+        // As the report's: every function built without fuel keeps its key.
+        if *fuel {
+            hasher.update(b"fuel");
+        }
         Settings(hasher.finish())
     }
 
@@ -327,6 +337,7 @@ mod tests {
             proc_macro_bridge: false,
             report: false,
             heap_to_stack: false,
+            fuel: false,
         }
     }
 
@@ -365,6 +376,7 @@ mod tests {
             |it| it.pgo = Pgo::Use(ContentId([5; 32])),
             |it| it.proc_macro_bridge = true,
             |it| it.heap_to_stack = true,
+            |it| it.fuel = true,
         ];
         let mut seen = std::collections::BTreeSet::from([base.settings()]);
         for change in changes {

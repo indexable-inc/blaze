@@ -83,7 +83,7 @@ fn put(path: &Path, bytes: &[u8], doing: &'static str) -> Result<(), TimeError> 
     std::fs::write(path, bytes).map_err(|error| TimeError::Io { path: path.to_owned(), doing, error })
 }
 
-fn query(source: &Source<'_>, sql: &str, doing: &'static str) -> Result<Vec<RecordBatch>, TimeError> {
+pub(crate) fn query(source: &Source<'_>, sql: &str, doing: &'static str) -> Result<Vec<RecordBatch>, TimeError> {
     sql::run(&sql::Query { duckdb: source.duckdb, history: source.history, sql }).map_err(|error| TimeError::Sql { doing, error })
 }
 
@@ -110,6 +110,10 @@ pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError>
             build_row = Some((started.value(0), dur.value(0)));
         }
     }
+    // Rows of no build in the build's window are its too: the recorder leaves `build_id` null on
+    // a job's rows once its code let go of the build (most of a cold build's switches and spans
+    // on 2026-11-02), and a reader that took only the tagged rows saw a tenth of the work.
+    let window = build_row.map(|(start, dur)| (start, start + dur));
     // alloc: a query, once a report
     let sql = format!(
         "SELECT CAST(process AS BIGINT) AS process, CAST(thread AS BIGINT) AS thread, CAST(t_ns AS BIGINT) AS t_ns, \
@@ -117,7 +121,7 @@ pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError>
          CAST(core AS BIGINT) AS core, CAST(wait_kind AS VARCHAR) AS wait_kind, CAST(wait_value AS UBIGINT) AS wait_value, \
          CAST(by_job AS UBIGINT) AS by_job, CAST(since_ns AS BIGINT) AS since_ns, CAST(began_as AS UBIGINT) AS began_as \
          FROM {}",
-        of_build("switches", build, SWITCHES_SINCE_2)
+        of_build("switches", build, SWITCHES_SINCE_2, window.map(|(t0, t1)| format!("t_ns BETWEEN {t0} AND {t1}")))
     );
     let switches = switches(&query(source, &sql, "reading the build's switches")?)?;
     // alloc: a query, once a report
@@ -126,8 +130,9 @@ pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError>
          CAST(parent AS UBIGINT) AS parent, CAST(depth AS BIGINT) AS depth, CAST(name AS VARCHAR) AS name, \
          CAST(crate AS VARCHAR) AS krate, CAST(function AS VARCHAR) AS function, CAST(unit AS VARCHAR) AS unit, \
          CAST(awaits AS VARCHAR) AS awaits, CAST(owner AS UBIGINT) AS owner, CAST(job AS UBIGINT) AS job, \
-         CAST(start_ns AS BIGINT) AS start_ns, CAST(dur_ns AS BIGINT) AS dur_ns FROM {}",
-        of_build("spans", build, SPANS_SINCE_2)
+         CAST(start_ns AS BIGINT) AS start_ns, CAST(dur_ns AS BIGINT) AS dur_ns, \
+         CAST(self_cpu_ns AS BIGINT) AS self_cpu_ns FROM {}",
+        of_build("spans", build, SPANS_SINCE_2, window.map(|(t0, t1)| format!("start_ns >= {t0} AND start_ns < {t1}")))
     );
     let spans = spans(&query(source, &sql, "reading the build's spans")?)?;
     // alloc: a query, once a report
@@ -135,7 +140,8 @@ pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError>
         "SELECT CAST(process AS BIGINT) AS process, CAST(thread AS BIGINT) AS thread, CAST(t_ns AS BIGINT) AS t_ns, \
          CAST(job AS UBIGINT) AS job, CAST(level AS VARCHAR) AS level, CAST(target AS VARCHAR) AS target, \
          CAST(name AS VARCHAR) AS name, CAST(message AS VARCHAR) AS message, CAST(span_id AS UBIGINT) AS span_id \
-         FROM events WHERE build_id = {build}"
+         FROM events WHERE build_id = {build}{}",
+        window.map_or(String::new(), |(t0, t1)| format!(" OR (build_id IS NULL AND t_ns BETWEEN {t0} AND {t1})"))
     );
     let events = events(&query(source, &sql, "reading the build's events")?)?;
     Ok(Input { build, build_row, switches, spans, events })
@@ -146,20 +152,22 @@ pub fn load(source: &Source<'_>, build: Option<u64>) -> Result<Input, TimeError>
 const SWITCHES_SINCE_2: &str = "NULL::UBIGINT AS by_job, NULL::BIGINT AS since_ns, NULL::UBIGINT AS began_as";
 const SPANS_SINCE_2: &str = "NULL::UBIGINT AS job";
 
-/// `table`'s rows of `build`, with the `added` columns null where its files have none.
-fn of_build(table: &str, build: u64, added: &str) -> String {
+/// `table`'s rows of `build`, and its rows of no build that `window` holds (a condition on the
+/// row's time), with the `added` columns null where its files have none.
+fn of_build(table: &str, build: u64, added: &str, window: Option<String>) -> String {
+    let untagged = window.map_or(String::new(), |it| format!(" OR (build_id IS NULL AND {it})"));
     // alloc: a query, once a table a report
-    format!("(SELECT * FROM {table} WHERE build_id = {build} UNION ALL BY NAME SELECT {added} WHERE false)")
+    format!("(SELECT * FROM {table} WHERE build_id = {build}{untagged} UNION ALL BY NAME SELECT {added} WHERE false)")
 }
 
-fn array<'a>(batch: &'a RecordBatch, table: &'static str, column: &'static str) -> Result<&'a dyn Array, TimeError> {
+pub(crate) fn array<'a>(batch: &'a RecordBatch, table: &'static str, column: &'static str) -> Result<&'a dyn Array, TimeError> {
     batch
         .column_by_name(column)
         .map(|it| it.as_ref())
         .ok_or(TimeError::BadColumn { table, column, why: "is not among the rows DuckDB answered" })
 }
 
-fn ints<'a>(batch: &'a RecordBatch, table: &'static str, column: &'static str) -> Result<&'a PrimitiveArray<Int64Type>, TimeError> {
+pub(crate) fn ints<'a>(batch: &'a RecordBatch, table: &'static str, column: &'static str) -> Result<&'a PrimitiveArray<Int64Type>, TimeError> {
     array(batch, table, column)?.as_primitive_opt::<Int64Type>().ok_or(TimeError::BadColumn {
         table,
         column,
@@ -167,7 +175,7 @@ fn ints<'a>(batch: &'a RecordBatch, table: &'static str, column: &'static str) -
     })
 }
 
-fn uints<'a>(batch: &'a RecordBatch, table: &'static str, column: &'static str) -> Result<&'a PrimitiveArray<UInt64Type>, TimeError> {
+pub(crate) fn uints<'a>(batch: &'a RecordBatch, table: &'static str, column: &'static str) -> Result<&'a PrimitiveArray<UInt64Type>, TimeError> {
     array(batch, table, column)?.as_primitive_opt::<UInt64Type>().ok_or(TimeError::BadColumn {
         table,
         column,
@@ -175,7 +183,7 @@ fn uints<'a>(batch: &'a RecordBatch, table: &'static str, column: &'static str) 
     })
 }
 
-fn texts<'a>(batch: &'a RecordBatch, table: &'static str, column: &'static str) -> Result<&'a StringArray, TimeError> {
+pub(crate) fn texts<'a>(batch: &'a RecordBatch, table: &'static str, column: &'static str) -> Result<&'a StringArray, TimeError> {
     array(batch, table, column)?.as_string_opt::<i32>().ok_or(TimeError::BadColumn {
         table,
         column,
@@ -183,7 +191,7 @@ fn texts<'a>(batch: &'a RecordBatch, table: &'static str, column: &'static str) 
     })
 }
 
-fn get<'a, A: Array, T>(array: &'a A, row: usize, value: impl FnOnce(&'a A, usize) -> T) -> Option<T> {
+pub(crate) fn get<'a, A: Array, T>(array: &'a A, row: usize, value: impl FnOnce(&'a A, usize) -> T) -> Option<T> {
     (!array.is_null(row)).then(|| value(array, row))
 }
 
@@ -242,7 +250,7 @@ fn spans(batches: &[RecordBatch]) -> Result<Vec<SpanIn>, TimeError> {
         let (process, thread, span_id, parent) = (ints(batch, T, "process")?, ints(batch, T, "thread")?, uints(batch, T, "span_id")?, uints(batch, T, "parent")?);
         let (depth, name, krate, function) = (ints(batch, T, "depth")?, texts(batch, T, "name")?, texts(batch, T, "krate")?, texts(batch, T, "function")?);
         let (unit, awaits, owner, of_job) = (texts(batch, T, "unit")?, texts(batch, T, "awaits")?, uints(batch, T, "owner")?, uints(batch, T, "job")?);
-        let (start_ns, dur_ns) = (ints(batch, T, "start_ns")?, ints(batch, T, "dur_ns")?);
+        let (start_ns, dur_ns, self_cpu) = (ints(batch, T, "start_ns")?, ints(batch, T, "dur_ns")?, ints(batch, T, "self_cpu_ns")?);
         let null = |column: &'static str| TimeError::BadColumn { table: T, column, why: "is null" };
         for row in 0..batch.num_rows() {
             out.push(SpanIn {
@@ -260,6 +268,7 @@ fn spans(batches: &[RecordBatch]) -> Result<Vec<SpanIn>, TimeError> {
                 job: get(of_job, row, |it, row| it.value(row)),
                 start_ns: get(start_ns, row, |it, row| it.value(row)).ok_or(null("start_ns"))?,
                 dur_ns: get(dur_ns, row, |it, row| it.value(row)).ok_or(null("dur_ns"))?,
+                self_cpu_ns: get(self_cpu, row, |it, row| it.value(row)),
             });
         }
     }

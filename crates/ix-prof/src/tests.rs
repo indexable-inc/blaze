@@ -1,5 +1,7 @@
 //! Two properties: what the recorder aggregates survives the .ixprof round trip byte for byte
-//! and adds up in the views; a view survives the pprof round trip.
+//! and adds up in the views; a view survives the pprof round trip. And the session's
+//! lifecycle: a failed start leaves nothing behind, each run's profile gets its own file, and
+//! the sampler's last batch is in the profile, and the profile is private to the user.
 
 use hegel::{TestCase, generators as gs};
 
@@ -168,4 +170,105 @@ fn a_view_reads_back_from_pprof_as_written(tc: TestCase) {
     let back = View::from_pprof(&view.to_pprof()).expect("reads");
     assert_eq!(back, view);
     assert_eq!(back.to_pprof(), view.to_pprof(), "the same view, the same bytes");
+}
+
+/// A new directory under the system's temporary one, removed when dropped.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(what: &str) -> TempDir {
+        let dir = std::env::temp_dir().join(format!("ix-prof-{what}-{}-{}", std::process::id(), crate::nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // ix-prof refuses a directory open to group or other.
+        #[cfg(unix)]
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        TempDir(dir)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn quiet_config() -> crate::Config {
+    crate::Config { cpu_hz: None, alloc_sample_bytes: None, ..crate::Config::default() }
+}
+
+#[test]
+fn a_start_that_fails_leaves_nothing_running_and_the_next_start_works() {
+    let _globals = crate::TEST_GLOBALS.lock();
+    // The endpoint's address is taken: the start fails (with or without the `http` feature).
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = taken.local_addr().unwrap().to_string();
+    let failed = crate::start(crate::Config { http: Some(addr), ..quiet_config() });
+    assert!(matches!(failed, Err(crate::Error::Http(_))), "{:?}", failed.err());
+    assert!(!crate::recording() && crate::session().is_none(), "a failed start leaves no session");
+    drop(taken);
+    #[cfg(all(feature = "http", unix))]
+    {
+        // Fails after the ticker and the server started: `http.endpoint` cannot be renamed over
+        // a directory that holds a file. Both are stopped, and the server's port is free again.
+        let dir = TempDir::new("start-fails");
+        std::fs::create_dir_all(dir.0.join(crate::endpoint::FILE).join("in-the-way")).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let failed = crate::start(crate::Config { http: Some(port.to_string()), dir: Some(dir.0.clone()), ..quiet_config() });
+        assert!(matches!(failed, Err(crate::Error::Write { .. })), "{:?}", failed.err());
+        assert!(!crate::recording() && crate::session().is_none(), "a failed start leaves no session");
+        std::net::TcpListener::bind(port).expect("the failed start's server let its port go");
+    }
+    let guard = crate::start(quiet_config()).expect("a start after a failed one");
+    assert!(crate::recording());
+    assert_eq!(guard.finish().expect("stops"), None, "no directory, no file");
+    assert!(!crate::recording() && crate::session().is_none());
+}
+
+#[test]
+fn two_runs_with_the_same_program_and_pid_write_two_profiles() {
+    let _globals = crate::TEST_GLOBALS.lock();
+    let dir = TempDir::new("names");
+    let config = crate::Config { dir: Some(dir.0.clone()), program: Some("same".to_owned()), ..quiet_config() };
+    let first = crate::start(config.clone()).unwrap().finish().unwrap().expect("a path");
+    let second = crate::start(config).unwrap().finish().unwrap().expect("a path");
+    assert_ne!(first, second);
+    for path in [&first, &second] {
+        let bytes = std::fs::read(path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+        Profile::from_ixprof(&bytes).expect("a whole profile");
+    }
+}
+
+/// The run is shorter than the macOS sampler's batch (100 ms), so every sample is in the batch
+/// it sends after it sees the stop: the profile has samples only if the stop waits for it.
+#[cfg(all(feature = "sampler", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn the_samplers_last_batch_is_in_the_profile() {
+    let _globals = crate::TEST_GLOBALS.lock();
+    let dir = TempDir::new("tail");
+    let config = crate::Config { dir: Some(dir.0.clone()), cpu_hz: Some(1000), ..quiet_config() };
+    let guard = crate::start(config).unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(40);
+    let mut x = 0u64;
+    while std::time::Instant::now() < until {
+        x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(7));
+    }
+    let path = guard.finish().unwrap().expect("a path");
+    let profile = Profile::from_ixprof(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(!profile.cpu_samples.is_empty(), "the samples of a 40 ms run, all in the sampler's last batch");
+}
+
+/// The profile holds the program's function names and span fields: another local user must
+/// not read it, under any umask, so the file is 0600 and a directory ix-prof makes is 0700.
+#[cfg(unix)]
+#[test]
+fn the_profile_and_its_directory_are_readable_by_this_user_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _globals = crate::TEST_GLOBALS.lock();
+    let tmp = TempDir::new("private");
+    let dir = tmp.0.join("made-by-ix-prof");
+    let config = crate::Config { dir: Some(dir.clone()), ..quiet_config() };
+    let path = crate::start(config).unwrap().finish().unwrap().expect("a path");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+    assert_eq!(mode(&path), 0o600, "{}", path.display());
 }

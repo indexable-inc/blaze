@@ -28,6 +28,30 @@ pub mod __blaze_wasm_entry {
         /// The variable of the `len`-byte name at `name`, written at `into` if it fits in
         /// `capacity`: its length, or -1 when it is unset.
         fn env_var(name: *const u8, len: usize, into: *mut u8, capacity: usize) -> isize;
+        /// The directory cargo runs rustc in for the calling crate, written at `into` if it
+        /// fits in `capacity`: its length, or -1 when the host has none.
+        fn current_dir(into: *mut u8, capacity: usize) -> isize;
+    }
+
+    /// Enters the directory cargo runs rustc in for the calling crate, as rustc's process is
+    /// in it: wasi-libc makes a relative path absolute against its own working directory, `/`
+    /// until a `chdir`, before the host sees it. False when the host named one and it could not
+    /// be entered; with none named, the macro stays in `/`.
+    fn enter_working_directory() -> bool {
+        let mut dir = Vec::<u8>::new();
+        loop {
+            let len = unsafe { current_dir(dir.as_mut_ptr(), dir.capacity()) };
+            let Ok(len) = usize::try_from(len) else { return true };
+            if len <= dir.capacity() {
+                unsafe { dir.set_len(len) };
+                break;
+            }
+            dir.reserve_exact(len);
+        }
+        match String::from_utf8(dir) {
+            Ok(dir) => std::env::set_current_dir(dir).is_ok(),
+            Err(_) => false,
+        }
     }
 
     /// libc's `getenv`, linked in place of wasi-libc's, which reads every variable through
@@ -146,13 +170,17 @@ pub mod __blaze_wasm_entry {
     }
 
     /// Runs the macro at `index` of the list on the `len` bytes at `input`
-    /// ([`blaze_proc_macro_alloc`]'s), and gives the host its output: 0, or 1 for no such macro.
+    /// ([`blaze_proc_macro_alloc`]'s), in the directory cargo runs rustc in, and gives the host
+    /// its output: 0, 1 for no such macro, or 2 when that directory could not be entered.
     #[unsafe(no_mangle)]
     pub extern "C" fn blaze_proc_macro_expand(index: u32, input: *mut u8, len: usize) -> u32 {
         let input = unsafe { Vec::from_raw_parts(input, len, len) };
         let Some(client) = listed(index) else {
             return 1;
         };
+        if !enter_working_directory() {
+            return 2;
+        }
         panic::set_hook(Box::new(hook));
         // SAFETY: `Client` is the bridge's `#[repr(C)]` struct of one `extern "C" fn` pointer.
         let client: Client = unsafe { std::mem::transmute(client) };

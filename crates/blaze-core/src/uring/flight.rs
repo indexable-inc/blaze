@@ -260,7 +260,10 @@ impl Uring {
                 opcode: OP_ACCEPT,
                 ioprio: ACCEPT_MULTISHOT,
                 fd: self.listeners.get(Handle::from_bits(hot.of)).expect("an accept's listener").fd(),
-                op_flags: libc::SOCK_CLOEXEC as u32,
+                // No SOCK_CLOEXEC: a direct (fixed-slot) descriptor has no entry in the fd table to
+                // close on exec, and the kernel refuses the flag with a file slot (EINVAL,
+                // io_accept_prep), so the daemon could not listen on Linux at all.
+                op_flags: 0,
                 // Into a slot of the kernel's half of the table, which the completion names.
                 splice_fd_in: FILE_INDEX_ALLOC as i32,
                 user_data,

@@ -130,6 +130,7 @@ impl Fixture {
         let library = library(&tree);
         let mut db = Database::new(Config { tree: Some(tree.clone()), dir: None, tags: 0 });
         crate::query::register(&mut db);
+        db.register::<HostMacros>();
         Fixture { db, tree, library }
     }
 
@@ -161,6 +162,12 @@ impl Fixture {
 
     pub(crate) fn plan(&self, view: ViewId) -> Planned {
         self.db.pin().get::<Plan>(view, &()).expect("planned").get()
+    }
+
+    /// [`Fixture::plan`] with [`super::Spec::macro_wasm`] off, as no build plans it: each proc
+    /// macro and what it depends on built for the host, for a test of host-built macros.
+    pub(crate) fn plan_with_host_macros(&self, view: ViewId) -> Planned {
+        self.db.pin().get::<HostMacros>(view, &()).expect("planned").get()
     }
 
     /// Whether `Q` of `key` ran in `view`, rather than being verified or reused.
@@ -595,6 +602,45 @@ impl Query for Step {
             Ok(Stepped { lent, resolved: matches!(resolved, super::Staged::Done(())) })
         })?;
         Ok(crate::query::Cbor(outcome.unwrap_or_else(|error| panic!("{}", error.what))))
+    }
+}
+
+/// The view's units as [`Plan`] makes them, but with [`super::Spec::macro_wasm`] off: what a
+/// test that needs host-built proc macros plans with ([`Fixture::plan_with_host_macros`]).
+struct HostMacros;
+
+impl Query for HostMacros {
+    const KIND: blaze_query::QueryKind = blaze_query::QueryKind(0x63f3);
+    const NAME: &'static str = "cargo test plan with host macros";
+    const PRODUCER: ContentId = crate::query::producer("blaze v2 cargo test plan with host macros 1");
+    type Key = ();
+    type Value = crate::query::Cbor<Planned>;
+
+    fn input(key: &()) -> ContentId {
+        super::key_id("blaze v2 cargo test plan with host macros key 1", key)
+    }
+
+    fn execute(cx: &mut blaze_query::Cx<'_>, _: &()) -> Result<crate::query::Cbor<Planned>, blaze_query::Cancelled> {
+        let asked = cx.get::<Asking>(&())?.get().unwrap_or_else(|error| panic!("{}", error.what));
+        let library = cx.get::<super::files::Mounts>(&())?.get(&asked.library);
+        let mut spec = super::view_spec(&asked, library).unwrap_or_else(|error| panic!("{}", error.what));
+        spec.macro_wasm = false;
+        Ok(crate::query::Cbor(match super::load(cx, &spec)? {
+            super::Staged::Done(built) => Planned::Ready(Units {
+                graph: built.graph,
+                plans: built.plans,
+                packages: built.packages,
+                lock: built.lock,
+                warnings: built.warnings,
+                target_dir: built.target_dir,
+                build_dir: built.build_dir,
+                finished: built.finished,
+                link_dirs: built.link_dirs,
+                sandboxed_tests: built.sandboxed_tests,
+            }),
+            super::Staged::Needs(fetches) => Planned::Needs(fetches),
+            super::Staged::Failed(error) => Planned::Failed(error),
+        }))
     }
 }
 

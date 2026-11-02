@@ -83,9 +83,9 @@ pub(crate) fn wasm_macro(job: &Job, unit: usize) -> bool {
 }
 
 /// The roots codegen compiles for `unit`. A proc macro built for wasm (`wasm`) is a program
-/// whose roots are its glue's exports, kept by name as a `cdylib`'s are; any other proc macro
-/// builds no code (its expanders run its MIR, [`super::compile`]'s `macros`), so asking for
-/// its roots is an error naming it.
+/// whose roots are its glue's exports, kept by name as a `cdylib`'s are; a proc macro built for
+/// the host is no build's (every build plans wasm macros, and [`super::compile`]'s `macros`
+/// refuses one), so asking for its roots is an error naming it.
 fn root_kind(unit: &Unit, makes: &Makes, wasm: bool) -> Result<RootKind, String> {
     Ok(match makes {
         Makes::Executable if matches!(unit.mode, Mode::Test) => RootKind::Test,
@@ -93,7 +93,8 @@ fn root_kind(unit: &Unit, makes: &Makes, wasm: bool) -> Result<RootKind, String>
         Makes::Shared { proc_macro: true } if wasm => RootKind::Shared,
         Makes::Shared { proc_macro: true } => {
             return Err(format!(
-                "proc macro `{}` builds no code (its expanders run its MIR), yet its codegen was asked for",
+                "proc macro `{}` is built for the host, not as a wasm module, yet its codegen was asked for: \
+                 a build runs proc macros only as wasm32-wasip1 modules",
                 unit.target.name
             ));
         }
@@ -117,13 +118,11 @@ pub(crate) fn toolchain(job: &Job, unit: usize) -> Result<Toolchain, String> {
         .map_err(|it| format!("unit {unit} (`{}` of {}): {it}", u.target.name, u.pkg_id))
 }
 
-/// Where `unit`'s code runs. A dev build of the host's target (no `--target`) runs where it
-/// is built: `dev` and `test` are cargo's profiles of `build`, `run`, `test` and their
-/// build scripts and proc macros. A `--target` unit, a `release` or `bench` build, or one of a
-/// custom profile, which may be shipped, runs elsewhere: the target's baseline, as rustc's code.
+/// Where `unit`'s code runs: [`blaze_units::schema::runs_here`], the one rule, which the
+/// standard library's key reads too, so a std compiled for this machine's CPU and one for the
+/// target's baseline are two stds. Elsewhere is the target's baseline, as rustc's code.
 fn runs(unit: &Unit) -> Runs {
-    let dev = matches!(unit.profile.name.as_str(), "dev" | "test");
-    if unit.platform.is_none() && dev { Runs::Here } else { Runs::Elsewhere }
+    if unit.runs_here() { Runs::Here } else { Runs::Elsewhere }
 }
 
 fn opt_level(level: &str) -> Result<OptLevel, String> {
@@ -692,6 +691,7 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
         // A wasm macro's std reaches the host for what WASI would give (`RandomState`'s keys).
         proc_macro_bridge: plan.macro_wasm,
         report: vecreport(rustflags),
+        fuel: false,
         // What the program's allocator allows is read from its sources, which [`generate`]
         // has: there it is set for the unit's program.
         heap_to_stack: false,
@@ -907,12 +907,13 @@ pub(crate) fn generate<'db>(
 }
 
 /// An image kept linked at one path, and what is in it, so the next link of it is a change.
-/// Each column is sorted, so a link's diff against it is one merge pass: `O(n)` with no hashing
-/// and no allocation but the diff itself (keys are content hashes, 32 bytes each).
+/// Each column is sorted, so a link's diff against it is one merge pass. Functions and statics
+/// are rows of their key and the hash of all of them as built ([`function_rows`],
+/// [`static_rows`]), which each link hashes again; natives are their contents' hashes.
 pub struct Linked {
     image: Image,
     output: Output,
-    functions: Vec<InstanceKey>,
+    functions: Vec<FunctionRow>,
     statics: Vec<StaticRow>,
     natives: Vec<ContentId>,
     names: Vec<String>,
@@ -1314,6 +1315,96 @@ pub(crate) fn static_rows(
     Ok((rows, gone, new))
 }
 
+/// A function by its instance key and the hash of all of it as this build filled it
+/// ([`filled_id`]).
+pub(crate) type FunctionRow = (InstanceKey, ContentId);
+
+const FUNCTION_DOMAIN: &str = "blaze v2 link function 1";
+
+/// The hash of all of `function` as this build filled it: its key, what it does
+/// ([`blaze_codegen::content::code_id`]: its architecture, alignment, code, relocations as
+/// filled, its data by content ID, which covers each datum's bytes and relocations as filled,
+/// unwind information, lines, coverage and profile), what it inlined and its side table.
+/// Destructured, so a field added to [`blaze_codegen::CompiledFunction`] is a compile error
+/// here until it is hashed (or `code_id` is checked to cover it).
+fn filled_id(function: &blaze_codegen::CompiledFunction) -> ContentId {
+    let blaze_codegen::CompiledFunction {
+        key,
+        // In `code_id`.
+        arch: _,
+        align: _,
+        code: _,
+        relocs: _,
+        data: _,
+        unwind: _,
+        lines: _,
+        coverage: _,
+        profile: _,
+        // Not in `code_id`, which is what the code does.
+        inlined,
+        side,
+    } = function;
+    let mut hasher = blaze_ids::Hasher::new(FUNCTION_DOMAIN);
+    hasher.id(&key.0).id(&blaze_codegen::content::code_id(function));
+    hasher.update(&(inlined.len() as u64).to_le_bytes());
+    for it in inlined {
+        hasher.id(&it.0);
+    }
+    match side {
+        Some(side) => hasher.update(&[1]).id(side),
+        None => hasher.update(&[0]),
+    };
+    hasher.finish()
+}
+
+/// Each of `functions` as a row, sorted, and the keys of what of `old`'s rows is gone and what
+/// is new. A function's key is its code and settings, not which callee is at each of its
+/// places (`blaze_codegen::driver::placed`): an edit to a callee gives the callee a new key
+/// and fills its callers' relocations with it under the callers' old keys. So the row covers
+/// the whole function as filled, and a caller whose fill changed is in both lists: blaze-link
+/// removes its old piece, which still refers to the callee the change removes, and adds the
+/// new one (blaze-link's `Stage::apply` removes first). A function put again as it was is in
+/// neither. Two fills of one key in one build are refused (rule 18), naming the function by
+/// its entry in `debug_names` ([`Built::debug_names`]).
+pub(crate) fn function_rows(
+    old: &[FunctionRow],
+    functions: &[blaze_codegen::CompiledFunction],
+    debug_names: &[(InstanceKey, String)],
+) -> Result<(Vec<FunctionRow>, Vec<InstanceKey>, Vec<InstanceKey>), String> {
+    let span = tracing::info_span!(
+        target: "blaze",
+        "link function rows",
+        functions = functions.len(),
+        gone = tracing::field::Empty,
+        new = tracing::field::Empty,
+    )
+    .entered();
+    // alloc: the image's column, kept in `Linked` until its next link
+    let mut rows = blaze_graph::par::map(functions, |it| (it.key, filled_id(it)));
+    rows.sort_unstable();
+    if let Some(pair) = rows.windows(2).find(|it| it[0].0 == it[1].0 && it[0].1 != it[1].1) {
+        let key = pair[0].0;
+        let name = debug_names.iter().find(|it| it.0 == key).map_or("(no debug name)", |it| it.1.as_str());
+        // alloc: error path
+        return Err(format!(
+            "the function `{name}` ({key:?}) is filled two ways in one build ({:?} and {:?}): one key is one function",
+            pair[0].1, pair[1].1
+        ));
+    }
+    // alloc: the change's lists, once per link: `removed` goes into blaze-link's `Change`
+    let (mut gone, mut new) = (Vec::new(), Vec::new());
+    diff(old, &rows, &mut gone, &mut new);
+    span.record("gone", gone.len());
+    span.record("new", new.len());
+    let keys = |rows: Vec<FunctionRow>| {
+        // alloc: the change's lists, once per link, each key once
+        let mut keys: Vec<InstanceKey> = rows.into_iter().map(|it| it.0).collect();
+        keys.dedup();
+        keys
+    };
+    Ok((rows, keys(gone), keys(new)))
+}
+
 /// [`link`]'s change of `linked` to what `generated` built, with the crates' `global_asm!`
 /// objects `assembled` and the native inputs `located`, laid out by `heat` where the image is
 /// laid out whole, and whether blaze-link laid it out whole ([`blaze_link::Staged::full`]).
@@ -1379,12 +1470,8 @@ fn relink(
         }
     }
 
-    let mut functions: Vec<InstanceKey> = built.functions.iter().map(|it| it.key).collect();
-    functions.sort_unstable();
+    let (functions, removed, added_keys) = function_rows(&linked.functions, &built.functions, &built.debug_names)?;
     let (statics, gone_statics, new_statics) = static_rows(&linked.statics, &built.statics)?;
-    let mut removed = Vec::new();
-    let mut added_keys = Vec::new();
-    diff(&linked.functions, &functions, &mut removed, &mut added_keys);
     let mut patchable: Vec<InstanceKey> = built.patchable.iter().copied().collect();
     patchable.sort_unstable();
     let mut names: Vec<(String, Target)> = Vec::with_capacity(built.symbols.len() + built.static_symbols.len());

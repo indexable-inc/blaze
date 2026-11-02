@@ -288,9 +288,14 @@ pub(super) fn run(hz: u32, sink: &Sink, stop: &AtomicBool) {
         now.sort_unstable();
         events.retain(|tid, _| now.binary_search(tid).is_ok());
         refused.retain(|tid| now.binary_search(tid).is_ok());
-        #[allow(clippy::disallowed_methods, reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here")]
-        std::thread::sleep(EVERY.saturating_sub(started.elapsed()));
+        super::pause(EVERY.saturating_sub(started.elapsed()));
     }
+    // The tail: what the kernel wrote since the last read, before `Sampler`'s drop returns
+    // and the events (and their buffers) are closed.
+    for event in events.values() {
+        event.drain(period_ns, &mut batch);
+    }
+    sink(&batch, &names);
 }
 
 #[cfg(test)]

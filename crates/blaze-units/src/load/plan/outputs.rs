@@ -62,6 +62,15 @@ impl Layout {
     }
 }
 
+/// The directory the wasm proc macros' units are laid out in, under the target and build
+/// directories as a target's triple is (`target/<triple>`): `wasm32-wasip1+macros`. No
+/// profile's name and no target's has a `+` (cargo allows letters, digits, `-` and `_` in a
+/// profile's, and blaze builds for no target spec file), so it is never theirs, a `--target
+/// wasm32-wasip1` build's among them.
+pub(crate) fn macro_dir(triple: &str) -> String {
+    format!("{triple}+macros")
+}
+
 /// cargo's `FileFlavor`, of the flavors a compile has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Flavor {
@@ -124,9 +133,9 @@ fn prefix_suffix(triple: &str, crate_type: &CrateType) -> Result<Option<(String,
 /// cargo's `TargetInfo::file_types`.
 fn file_types(crate_type: &CrateType, flavor: Flavor, triple: &str) -> Result<Option<Vec<FileType>>, LoadError> {
     let crate_type = if *crate_type == CrateType::Lib { CrateType::Rlib } else { crate_type.clone() };
-    // A proc macro built for `-Z wasm-macros`' platform ([`crate::load::MACRO_WASM`]) is a WASI
+    // A proc macro built for the wasm macros' platform ([`crate::load::MACRO_WASM`]) is a WASI
     // reactor, a module named as a `cdylib` of that target is: rustc makes no proc macro for
-    // a wasm target.
+    // a wasm target, so a proc macro for it is always a wasm macro's unit.
     let named = match crate_type {
         CrateType::ProcMacro if triple == crate::load::MACRO_WASM => CrateType::Cdylib,
         _ => crate_type.clone(),

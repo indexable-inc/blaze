@@ -23,7 +23,8 @@ fn frame(build: &str, address: u64, inline_depth: u16) -> Frame {
 /// A profile read through the map of the build it ran: each sample's leaf is the function
 /// whose code holds its address, the functions inlined at that address one frame with it, its
 /// caller the next machine frame; a sample of another build or of no function is counted and
-/// read as nothing. A later build's instances of those functions take their weight.
+/// read as nothing. Each sample weighs the CPU time it stands for, so samples taken at two
+/// rates add up by time. A later build's instances of those functions take their weight.
 #[test]
 fn a_sampled_address_names_the_function_its_build_put_there() {
     let target = tempfile::tempdir().unwrap();
@@ -45,18 +46,19 @@ fn a_sampled_address_names_the_function_its_build_put_there() {
     let deep = interner.stack([caller, leaf, inlined]).unwrap();
     let elsewhere = interner.stack([other]).unwrap();
     let outside = interner.stack([nowhere]).unwrap();
-    let sample = |stack, on_cpu| CpuSample { process: 1, thread: 1, t_ns: 0, stack, span_id: None, on_cpu, weight_ns: 1 };
+    let sample = |stack, on_cpu, weight_ns| CpuSample { process: 1, thread: 1, t_ns: 0, stack, span_id: None, on_cpu, weight_ns };
     let profile = Profile {
         threads: vec![Thread { process: 1, process_name: "app".into(), thread: 1, thread_name: None, cpu_ns: None }],
         frames: interner.frame_rows,
         stacks: interner.stack_rows,
         cpu_samples: vec![
-            sample(deep, true),
-            sample(deep, true),
-            sample(deep, true),
-            sample(deep, false),
-            sample(elsewhere, true),
-            sample(outside, true),
+            // Two at 1 kHz, one at 250 Hz: 6 ms on the CPU, not 3 samples' worth.
+            sample(deep, true, 1_000_000),
+            sample(deep, true, 1_000_000),
+            sample(deep, true, 4_000_000),
+            sample(deep, false, 1_000_000),
+            sample(elsewhere, true, 1_000_000),
+            sample(outside, true, 1_000_000),
         ],
         ..Profile::default()
     };
@@ -64,11 +66,11 @@ fn a_sampled_address_names_the_function_its_build_put_there() {
 
     let profiles = Profiles::read(target.path()).unwrap().unwrap();
     let weights = profiles.weights(image).expect("the image's weights");
-    assert_eq!(*weights, Weights::new(vec![(identity(2), 3)], vec![(identity(1), identity(2), 3)]));
+    assert_eq!(*weights, Weights::new(vec![(identity(2), 6_000_000)], vec![(identity(1), identity(2), 6_000_000)]));
     assert_eq!(profiles.counts, Counts { files: 1, samples: 5, unmapped: 1, outside: 1 });
     assert!(profiles.weights("/w/target/release/deps/other").is_none());
 
     // The next build: 2's body edited (another key, one identity), 1 gone.
     let next = [(key(12), identity(2)), (key(13), identity(3))];
-    assert_eq!(weights.heat(&next), Heat::new([(key(12), 3)], []));
+    assert_eq!(weights.heat(&next), Heat::new([(key(12), 6_000_000)], []));
 }

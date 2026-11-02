@@ -74,7 +74,7 @@ pub(super) fn kind_info<F: Files>(config: &Config<F>, host: &str, target: Option
     }
 }
 
-/// The kind of `-Z wasm-macros`' units, built for `triple` with no rustflags: the build's
+/// The kind of the wasm proc macros' units, built for `triple` with no rustflags: the build's
 /// flags are for its own platforms (a host's `-C target-cpu=native` is no wasm cpu), and no
 /// `[target.<triple>]` of the user's names blaze's macro platform.
 pub(super) fn macro_wasm_info(triple: &str) -> Result<KindInfo, LoadError> {

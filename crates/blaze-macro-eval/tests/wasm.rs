@@ -1,7 +1,9 @@
 //! The wasm host against the evaluator: every call of serde's derives and thiserror's in the
 //! fixture workspace expanded by each proc-macro crate's `wasm32-wasip1` module
 //! (`blaze_macro_eval::load_wasm`) and on the evaluator (`load`), the two outputs the same in
-//! every token, delimiter, spacing, literal and span (`corpus/difference.rs`).
+//! every token, delimiter, spacing, literal and span (`corpus/difference.rs`). Both engines run
+//! one crate: the evaluator the macro crate as every build plans it, for `wasm32-wasip1` with
+//! wasm32's cfg, which is the crate the module is built from.
 //!
 //! What it needs is `BLAZE_MACRO_CORPUS` (`corpus/config.rs`) with `wasm`: each crate's module
 //! as blaze built it for `wasm32-wasip1` with the bridge's glue (`guest/entry.rs`).

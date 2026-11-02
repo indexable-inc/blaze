@@ -80,7 +80,7 @@ a build first needs it.
     blaze test  [cargo's flags] [TESTNAME] [-- test arguments]        (t)
     blaze bench [cargo's flags] [BENCHNAME] [-- bench arguments]
     blaze doc   [cargo's flags]                                       (d)
-    blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N]
+    blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]
     blaze stop
     blaze status
     blaze daemon install | uninstall
@@ -225,7 +225,7 @@ Any other name, or a value that is not a list of names, is an error that names t
 the names known (`crates/blaze-units/src/load/sandbox.rs`). A test that is not sandboxed is
 never kept as passed ([below](#which-tests-run)). Build scripts run in the sandbox
 whatever the workspace says ([below](#build-scripts-and-proc-macros-run-in-a-sandbox)), and
-proc macros run in blaze's own process, on its evaluator.
+proc macros run in blaze's own process, as WebAssembly modules.
 
 In a workspace that opts in, each test binary the daemon runs starts once in a sandbox of its
 own, tracing what it reads, as a fork server, and each test runs in a child forked from it
@@ -429,8 +429,8 @@ The table may also have `unsandboxed-proc-macros`, `build-script-env` and `wasi-
 each a list of names, which v1 read: v2 checks that each is a list of strings and does nothing
 else with it beyond naming the variables `build-script-link-dirs` may use
 (`crates/blaze-units/src/load/sandbox.rs`). Proc macros run in blaze's own
-process, confined by blaze's evaluator, which is their sandbox and has no way out
-([below](#proc-macros-run-on-blazes-evaluator)), and a script is given the command's whole
+process as WebAssembly modules, confined by the host, which is their sandbox and has no way out
+([below](#proc-macros-run-as-webassembly)), and a script is given the command's whole
 environment already.
 
 What a sandboxed script prints is checked before it is used (`crates/blaze-cargo/src/directives.rs`), since
@@ -518,65 +518,94 @@ runs again on the next build, as cargo reruns it. A run outside the sandbox
 A build script's sandbox costs one launch (8 ms on Linux, 38 ms on macOS, measured on
 2026-10-26), which is lost in a cold build's noise.
 
-### Proc macros run on blaze's evaluator
+### Proc macros run as WebAssembly
 
-Every proc macro is built by blaze from its source and run in the daemon's own process on
+Every build runs its proc macros as `wasm32-wasip1` modules under Wasmtime, in the daemon's own
+process (`crates/blaze-macro-eval/src/wasm.rs`, `blaze_macro_eval::load_wasm`;
+[v2/plan/lanes/usercode/macros.md](v2/plan/lanes/usercode/macros.md)). blaze builds each
+proc-macro crate, and every crate it depends on, for `wasm32-wasip1` with its own front end and
+code generator, against the real std and `library/proc_macro` (`UnitPlan::macro_wasm`,
+`crates/blaze-units/src/load.rs`): nothing rustc compiles is loaded and no process is started.
+The crate's root gets the module `__blaze_proc_macros` (its list of macros and the bridge's
+glue, `crates/blaze-macro-eval/src/wasm/glue.rs` and `guest/entry.rs`), and it is linked as a
+WASI reactor with no debug sections. A proc-macro crate's lang items, and its dependencies',
+never reach the crates that use its macros.
+
+These units are kept apart from the build's own. The unit graph marks each (`"macro_wasm":
+true`, a key cargo's graph has not), they are keyed and fingerprinted on their own, and their
+files go under `target/wasm32-wasip1+macros/<profile>/`, beside `target/<profile>/` and
+`target/<triple>/<profile>/`. So a `blaze build --target wasm32-wasip1` has two units of a
+package its code and its macros both use, one for each, which share no key and no file. The
+front end keeps them apart as well: a crate's key (`blaze_items::key::crate_key`) covers what
+it is built for (the host, a triple, or that triple's wasm macros), so its standard library
+and the macros' are two crates of two keys. A `--target` of the host's own triple asks a
+standard library for its host units and one for its target units. In a dev build these are
+two (two `StdKey`s, two directories): the host's units run where they are built, so their std
+is compiled for this machine's own CPU, while the target's, which may be shipped, is compiled
+for the target's baseline (`blaze_units::schema::runs_here`, the one rule both codegen and
+`StdKey` read). In a release build both run elsewhere, so they are one key and share one set
+of std units. Its
+own units abort too: a profile's `panic = "unwind"`, cargo's default, gets no `-C panic` from
+cargo, so blaze builds each unit with its target's own strategy, as rustc does
+(`crates/blaze-units/src/load/units.rs`). The standard library the macros link is their own
+too: planned and keyed as macro units, with their own metadata and directory, built with
+`panic = "abort"`, as every macro unit is, and with the bridge (std's `hashmap_random_keys` is
+the bridge's import of the evaluator's fixed keys, so `RandomState` reads no WASI randomness).
+A proc-macro crate's own
+`#[test]`s are built for the host and run there, as cargo builds them; its integration tests use
+its macros through the module, as any crate does. `blaze check` checks a proc macro as the
+module it builds, with `wasm32-wasip1`'s cfg.
+
+`-Z wasm-macros`, which asked for this before it was the default, is still accepted and
+changes nothing. There is no setting that runs a macro
+any other way.
+
+The module's only imports are the `proc_macro` bridge's shims and the WASI preview 1 functions
+std calls (`src/wasm/abi.rs`). A module that imports anything else is refused at load with an
+error naming the crate and the import. The bridge's requests reach blaze's own server, with a
+`usize` in eight bytes from every client, as the pinned bridge encodes it (`MAX_USIZE_SIZE`,
+`src/wire.rs`). The WASI calls see blaze-macro-eval's machine and are traced
+(`src/wasm/wasi.rs`, `src/os.rs`): the macro opens and reads files and directories, but only
+below the calling crate's `CARGO_MANIFEST_DIR` and `OUT_DIR`; it writes nothing (a path opened
+to create, truncate, append or write stops the expansion naming it), sets no variable and makes
+no system call blaze has no shim for. The glue's `getenv` replaces wasi-libc's, which reads the
+whole environment on its first call, and asks the host one variable at a time (the bridge's
+`env_var`). So `env::var` keys an expansion by the variables it read, and a per-run variable it
+never reads (`BLAZE_PROFILE`) never makes it miss. Only `env::vars` reads them all.
+
+Each expansion runs in a fresh instance under a fuel budget (`src/wasm/host.rs`, `FUEL`) and a
+memory budget. The instance runs on a kept expansion thread, never on a fiber, because a
+Wasmtime activation lives in its thread's locals and a fiber moves threads when it waits
+(`src/wasm/thread.rs`). The job waits on an event, holding no thread, and answers what the
+macro asks the database of a span outside any wasm call. Each expansion opens a `proc macro
+expansion` span naming the macro and the input item. A module's machine code is compiled once a
+process and kept in the store under the module's id and Wasmtime's version and settings
+(`src/wasm/code.rs`), so the next process loads it without compiling. A module that can't be
+compiled, loaded or run is an error naming the macro, and nothing then runs it another way. On
+wasm32 a `#[thread_local]` static is plain data (no TLS without atomics), a panic's `Location`
+is four 32-bit words, and a direct call of an undefined weak function traps as wasm-ld's stub
+does.
+
+A macro's state carries from one call to the next as it does under
+rustc: the link lists each static of the macro's crates its code can write in the module's
+`blaze.statics` section, and the host writes what the calls before left into each fresh
+instance before the macro runs, then reads back what it changed (`src/wasm/statics.rs`). A
+module without that section is refused at load. A static left holding an address of the heap
+stops the expansion with an error naming the static, since a fresh instance has no such heap.
+A call is kept and found under the state it started from, and only when it left that state as
+it was.
+
+Each expansion is kept in the store (`crates/proc-macro-api/src/kept.rs`) by the macro's
+library, its name, input and attribute tokens, the crate's variables, its directory and the
+toolchain, and found by what else it read; `BLAZE_PROC_MACRO_CACHE=check` expands every kept
+call anyway and fails naming a macro whose output differs.
+
 blaze's MIR evaluator (`crates/blaze-macro-eval`,
-[v2/plan/design/compile-time.md](v2/plan/design/compile-time.md), change 20): the macro's real
-code, with the real std and `library/proc_macro`, every access checked, and the bridge's one
-call answered by blaze's own server. Nothing rustc compiles is loaded and no process is
-started: the evaluator is the proc-macro sandbox. The macro reads only below the calling
-crate's `CARGO_MANIFEST_DIR` and `OUT_DIR`, writes nothing, sets no variable and makes no
-system call blaze has no shim for (`crates/blaze-macro-eval/src/os.rs`). The evaluator is
-also the reference the WebAssembly host's output is tested against (below). A macro
-blaze-macro-eval cannot run stops the build with an error naming the macro and its crate;
-nothing runs natively and nothing goes to another host (there is none). Each expansion is kept in the store
-(`crates/proc-macro-api/src/kept.rs`) by the macro's library, its name, input and attribute
-tokens, the crate's variables, its directory and the toolchain, and found by what else it
-read; `BLAZE_PROC_MACRO_CACHE=check` expands every kept call anyway and fails naming a macro
-whose output differs.
-
-### Proc macros as WebAssembly
-
-blaze-macro-eval also runs a proc macro as a `wasm32-wasip1` module under Wasmtime, in the
-daemon's process (`crates/blaze-macro-eval/src/wasm.rs`, `blaze_macro_eval::load_wasm`). The
-module is the macro crate built by blaze with the bridge's glue appended to its root
-(`crates/blaze-macro-eval/guest/entry.rs`). Its only imports are the `proc_macro` bridge's
-shims and the WASI preview 1 functions std calls (`src/wasm/abi.rs`). A module that imports
-anything else is refused at load with an error naming the crate and the import. The bridge's
-requests reach the same server as on the evaluator, with a `usize` in eight bytes from every
-client, as the pinned bridge encodes it (`MAX_USIZE_SIZE`, `src/wire.rs`). The WASI calls see the
-evaluator's machine and are traced the same way (`src/wasm/wasi.rs`). The glue's `getenv`
-replaces wasi-libc's, which reads the whole environment on its first call, and asks the host
-one variable at a time (the bridge's `env_var`). So `env::var` keys an expansion by the
-variables it read, as on the evaluator, and a per-run variable it never reads
-(`BLAZE_PROFILE`) never makes it miss. Only `env::vars` reads them all. The host serves no
-file yet. A macro that opens a path stops with an error naming it, never with an error the
-trace misses.
-
-Each expansion runs in a fresh instance under a fuel budget (`src/wasm/host.rs`, `FUEL`) and
-the evaluator's memory budget. The instance runs on a kept expansion thread, never on a
-fiber, because a Wasmtime activation lives in its thread's locals and a fiber moves threads
-when it waits (`src/wasm/thread.rs`). The job waits on an event, holding no thread, and answers
-what the macro asks the database of a span outside any wasm call. A module's machine code is compiled once a process and kept in
-the store under the module's id and Wasmtime's version and settings (`src/wasm/code.rs`), so
-the next process loads it without compiling. A module that can't be compiled, loaded or run is
-an error naming the macro. Nothing then runs it on the evaluator.
-
-`-Z wasm-macros` builds each proc-macro crate for `wasm32-wasip1` with blaze's own front end
-and code generator (`UnitPlan::macro_wasm`, `crates/blaze-units/src/load.rs`): the crate's root
-gets the module `__blaze_proc_macros` (its list of macros and the glue,
-`crates/blaze-macro-eval/src/wasm/glue.rs`), it is linked as a WASI reactor with no debug
-sections, and each expansion loads it with `load_wasm`. On wasm32 a `#[thread_local]` static is
-plain data (no TLS without atomics), a panic's `Location` is four 32-bit words, a direct call of
-an undefined weak function traps as wasm-ld's stub does, and std's `hashmap_random_keys` is the
-bridge's import of the evaluator's fixed keys, so `RandomState` reads no WASI randomness. A
-proc-macro crate's lang items, and its dependencies', never reach the crates that use its
-macros. Each expansion opens a `proc macro expansion` span naming the macro and the input item.
-Without the flag every proc macro still runs on the evaluator. The flag is not the default yet,
-because the host serves no file (a macro that reads one, as `include_str!`-style macros do,
-stops naming the path). A macro's state never carries from one call to the next, because each
-is a fresh instance; a macro that counts its calls sees every call as its first.
+[v2/plan/design/compile-time.md](v2/plan/design/compile-time.md), change 20) can run a proc
+macro's code too, on the same machine and server, and stays as const eval's and as the
+reference the module's output is tested against (`crates/blaze-macro-eval/tests/wasm.rs`). A
+build never runs a macro on it: a proc macro that reaches a build built for the host is an
+error naming it (`crates/blaze-cargo/src/serve/unit/compile.rs`, `macros`).
 
 v1 could compile a build script for `wasm32-wasip1` and run it under Wasmtime (`wasi-compare`,
 `wasi-build-scripts`), and could expand with rust-analyzer's out-of-process proc-macro server.
@@ -673,6 +702,12 @@ error. `blaze status` prints:
 
 the requests it is answering, how many views (a workspace at a checkout) it holds, and what it
 holds of its budget.
+
+A build whose tasks run while no span closes, no query completes and no task or step ends for
+the stall bound fails with an error naming what each thread is inside, and the daemon stops
+([profiling.md](profiling.md#the-stall-watchdog)). The bound is 120 s; `blaze serve
+--stall-bound SECS` sets another, for a daemon started by hand (`blaze stop` first) on a host
+so loaded that one piece of work can go that long with nothing else moving.
 
 ### Files
 

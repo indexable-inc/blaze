@@ -61,6 +61,7 @@ pub mod live;
 pub mod perf;
 pub mod sampler;
 pub mod schema;
+pub mod slow;
 pub mod span;
 pub mod sql;
 mod symbols;

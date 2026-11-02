@@ -10,7 +10,7 @@ use super::{Change, Disk, Image, Output, OutputKind, TO, function, id, key, name
 use crate::{Format, LinkError};
 
 /// The entry point and the functions importing [`PUTS`].
-const ENTRY: u8 = 1;
+pub(super) const ENTRY: u8 = 1;
 const F: u8 = 2;
 const G: u8 = 3;
 const G2: u8 = 4;
@@ -38,7 +38,7 @@ fn wasm_function(n: u8, code: &Code, body: &[u8], relocs: impl Fn(u32) -> Vec<Re
     CompiledFunction { arch: Arch::Wasm32, align: 1, ..function(n, &code, relocs(start)) }
 }
 
-fn entry() -> CompiledFunction {
+pub(super) fn entry() -> CompiledFunction {
     wasm_function(ENTRY, &Code::default(), &[0x00, 0x0b], |_| Vec::new())
 }
 
@@ -82,7 +82,7 @@ fn puts(image: &Image) -> (Option<&Import>, u32) {
 }
 
 /// The linked module.
-fn module(disk: &Disk) -> Vec<u8> {
+pub(super) fn module(disk: &Disk) -> Vec<u8> {
     let it = disk.file(TO);
     (0..it.len).map(|at| it.page(at / super::PAGE)[(at % super::PAGE) as usize]).collect()
 }

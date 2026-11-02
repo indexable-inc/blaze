@@ -7,6 +7,8 @@ description and store, and lazy callbacks must preserve identity and current cod
 An attribute macro also exercises anonymous-constant statics and an inlined
 method's local TypeId, the own-path analogue of Astral #73's symbol recovery.
 Crate-level cfg and cfg_attr must each leave an empty libtest harness (#1323).
+Its proc macro runs as a wasm module, as every build runs them: the `mode` field
+(`"native"` set a variable v2 never read) is gone, and an input naming it is refused.
 """
 
 import asyncio
@@ -15,7 +17,6 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from typed_input import parse
 
@@ -23,7 +24,6 @@ from typed_input import parse
 @dataclass(frozen=True)
 class Input:
     blaze: str
-    mode: Literal["wasm", "native"] = "wasm"
     timeout_seconds: int = 900
 
 
@@ -41,7 +41,6 @@ async def command(inp: Input, root: Path, step: str, *args: str) -> str:
         "RUST_BACKTRACE": "0",
         "CARGO_TARGET_DIR": str(root / "target"),
         "BLAZE_HOME": str(root.parent / f"{root.name}-h"),
-        "BLAZE_PROC_MACRO_WASM": "1" if inp.mode == "wasm" else "0",
         # Empty test roots must execute libtest rather than be considered cached.
         "BLAZE_TESTS": "all",
     }

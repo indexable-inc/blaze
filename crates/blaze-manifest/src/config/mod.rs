@@ -330,8 +330,8 @@ impl CliUnstable {
             "build-std" => self.build_std = Some(list()),
             "build-std-features" => self.build_std_features = Some(list()),
             "codegen-backend" => self.codegen_backend = bool_flag()?,
-            // blaze's own: proc macros built for wasm32-wasip1 and run as wasm modules, which
-            // the unit graph reads (`blaze_units::load`); nothing of the configuration's.
+            // blaze's own, and a no-op: every build runs its proc macros as wasm modules now
+            // (`blaze_units::load`); kept so that configurations that set it still load.
             "wasm-macros" => {}
             _ => bail!("blaze does not read `-Z {name}` yet"),
         }

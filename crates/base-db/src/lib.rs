@@ -43,7 +43,7 @@ pub use crate::{
     editioned_file_id::EditionedFileId,
     files::{AliasError, ExpansionRead, Files, ReadBy},
     input::{
-        BuiltCrateData, BuiltDependency, Crate, CrateBuilder, CrateBuilderId, CrateDataBuilder,
+        BuiltCrateData, BuiltDependency, BuiltFor, Crate, CrateBuilder, CrateBuilderId, CrateDataBuilder,
         CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateType, CrateTypes,
         CratesIdMap, CratesMap, DependencyBuilder, Env, ExtraCrateData, LangCrateOrigin,
         ProcMacroLoadingError, ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId,

@@ -82,7 +82,8 @@ pub type PureProof = EffectProof;
 pub struct Trusted {
     /// The function marked trusted, or the method of a trusted trait (a `ctx` door) reached.
     pub func: FunctionId,
-    /// Its path, crate first: `zstd_sys::ZSTD_compress`, `<KernelReads as Reads>::layout`.
+    /// Its path as an item, crate first, no instance's arguments: `zstd_sys::ZSTD_compress`,
+    /// `<KernelReads as Reads>::layout`, `par::map` for every `par::map::<F>` reached.
     pub path: Box<str>,
     /// The `trusted = ".."` text, as written.
     pub reason: Symbol,
@@ -248,7 +249,7 @@ fn checked(
     let root = Instance { def: Def::Body(Body::Fn(func)), args: args.clone() }; // clone: reference counts
     let mut found = Found::default();
     if let Some((reason, door)) = effects::trusted(db, func, def) {
-        found.trust(db, func, args.as_ref().as_slice(), reason, door);
+        found.trust(db, func, reason, door);
         return FnPurity::Pure(found.proof(1));
     }
     if let Some(refusal) = params(&cx, func, args.as_ref(), def, refuses, generic, &mut found) {
@@ -279,14 +280,9 @@ struct Found {
 }
 
 impl Found {
-    fn trust<'db>(
-        &mut self,
-        db: &'db Db,
-        func: FunctionId,
-        args: &[hir_ty::next_solver::GenericArg<'db>],
-        reason: Symbol,
-        door: Option<TraitId>,
-    ) {
+    /// Keep `func` as trusted, once, by its item path: trust is the item's attribute (or its
+    /// trait's), never an instance's, so the entry names the item whichever instance met it first.
+    fn trust(&mut self, db: &Db, func: FunctionId, reason: Symbol, door: Option<TraitId>) {
         if self.trusted.iter().any(|it| it.func == func) {
             return;
         }
@@ -297,7 +293,7 @@ impl Found {
             ),
             _ => None,
         };
-        let path = fn_path(db, func, args);
+        let path = crate::walk::fn_item_path(db, func).into_boxed_str();
         self.trusted.push(Trusted { func, path, reason, krate: func.krate(db), link, door });
     }
 
@@ -320,14 +316,14 @@ fn reach(db: &Db, env: &StoredParamEnvAndCrate, root: &Instance, def: &EffectDef
         let summary = summary(db, env.clone(), instance); // clone: the query's key, reference counts
         for &func in &summary.trusted_calls {
             if let Some((reason, door)) = effects::trusted(db, func, def) {
-                found.trust(db, func, &[], reason, door);
+                found.trust(db, func, reason, door);
             }
         }
         for site in &summary.sites {
             let callee = &site.instance;
             if let Def::Body(Body::Fn(func)) | Def::Leaf(func, _) = callee.def {
                 if let Some((reason, door)) = effects::trusted(db, func, def) {
-                    found.trust(db, func, callee.args.as_ref().as_slice(), reason, door);
+                    found.trust(db, func, reason, door);
                     continue;
                 }
                 if !def.through_never && never_returns(db, func) {
@@ -508,7 +504,7 @@ impl<'db> Params<'_, 'db> {
             if self.generic {
                 self.found.open = true;
             } else {
-                self.refuse(Rule::Unchecked, || format!("takes `{ty:?}`, a type the check can't see into"));
+                self.refuse(Rule::Unchecked, || format!("takes `{}`, a type the check can't see into", cx.shown(ty)));
             }
             return;
         }
@@ -516,7 +512,7 @@ impl<'db> Params<'_, 'db> {
         // state refuses; for the others the type is still scanned for code it hides.
         if shared && self.memory_matters() && !is_freeze(&cx.infcx, ty, cx.env.param_env) {
             return self.refuse(Rule::MutableState, || {
-                format!("takes `{ty:?}` behind a shared reference, state with interior mutability that another thread can change during the call")
+                format!("takes `{}` behind a shared reference, state with interior mutability that another thread can change during the call", cx.shown(ty))
             });
         }
         match ty.kind() {
@@ -527,10 +523,10 @@ impl<'db> Params<'_, 'db> {
             // a `dyn` or a function pointer behind it.
             TyKind::RawPtr(pointee, _) if toolchain || !self.memory_matters() => self.ty(pointee, true, false),
             TyKind::RawPtr(..) => self.refuse(Rule::Unchecked, || {
-                format!("takes the raw pointer `{ty:?}`, whose memory the check can't see: take a reference")
+                format!("takes the raw pointer `{}`, whose memory the check can't see: take a reference", cx.shown(ty))
             }),
             TyKind::FnPtr(..) => self.refuse(Rule::Unchecked, || {
-                format!("takes the function pointer `{ty:?}`, whose calls the check can't see: take a type parameter `F: Fn(..)`")
+                format!("takes the function pointer `{}`, whose calls the check can't see: take a type parameter `F: Fn(..)`", cx.shown(ty))
             }),
             TyKind::Dynamic(bounds, _) => {
                 let door = bounds.principal().map(|it| it.skip_binder().def_id.0);
@@ -538,12 +534,12 @@ impl<'db> Params<'_, 'db> {
                     Some((trait_, why)) => {
                         for (_, item) in trait_.trait_items(cx.db).items.iter() {
                             if let hir_def::AssocItemId::FunctionId(method) = *item {
-                                self.found.trust(cx.db, method, &[], why.clone(), Some(trait_)); // clone: a handle of an interned text
+                                self.found.trust(cx.db, method, why.clone(), Some(trait_)); // clone: a handle of an interned text
                             }
                         }
                     }
                     None => self.refuse(Rule::Unchecked, || {
-                        format!("takes `{ty:?}`, whose calls the check can't see: take a type parameter, or mark the trait trusted")
+                        format!("takes `{}`, whose calls the check can't see: take a type parameter, or mark the trait trusted", cx.shown(ty))
                     }),
                 }
             }
@@ -555,7 +551,7 @@ impl<'db> Params<'_, 'db> {
                     && self.memory_matters()
                 {
                     return self.refuse(Rule::Unchecked, || {
-                        format!("takes the union `{ty:?}`, whose live field the check can't know")
+                        format!("takes the union `{}`, whose live field the check can't know", cx.shown(ty))
                     });
                 }
                 // `Unique<T>` and `PhantomData<T>` own a `T` (a `Box`'s, a `Vec`'s elements).

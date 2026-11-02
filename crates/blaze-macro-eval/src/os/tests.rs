@@ -59,6 +59,12 @@ fn shim(t: Target, call: Call) -> Shim {
     Shim { call, target: Some(t) }
 }
 
+/// The calling crate's `CARGO_MANIFEST_DIR` in `env`, the working directory cargo gives a
+/// registry package's rustc; empty (not absolute, so a relative path stops) when unset.
+fn manifest_dir(env: &Env) -> &str {
+    env.iter().find(|it| it.0 == "CARGO_MANIFEST_DIR").map_or("", |it| it.1)
+}
+
 /// A macro's machine over a buffer, on the host's target.
 struct Run<'e> {
     os: Os<'e>,
@@ -70,7 +76,13 @@ impl<'e> Run<'e> {
     /// `None` on a host whose target the shims don't model, where there is nothing to test.
     fn new(env: &'e Env) -> Option<Run<'e>> {
         let t = Target::host()?;
-        Some(Run { os: Os::new(env), g: Buffer { base: 0x1000, bytes: vec![0; 64], errno: None }, t })
+        Some(Run { os: Os::in_dir(env, manifest_dir(env)), g: Buffer { base: 0x1000, bytes: vec![0; 64], errno: None }, t })
+    }
+
+    /// [`Run::new`]'s, in the working directory `cwd`, the call's directory.
+    fn in_dir(env: &'e Env, cwd: &'e str) -> Option<Run<'e>> {
+        let t = Target::host()?;
+        Some(Run { os: Os::in_dir(env, cwd), g: Buffer { base: 0x1000, bytes: vec![0; 64], errno: None }, t })
     }
 
     /// Calls `call` with a return place of `ret` bytes: what it returned, sign-extended.
@@ -135,6 +147,41 @@ fn a_file_in_the_package_is_read_whole_and_noted() {
     assert!(run.seen().contains(&(Seen::Read, format!("{}/src/lib.rs", scratch.pkg))));
     assert!(run.os.refused().next().is_none());
     assert_eq!(run.os.unkeyable(), None);
+}
+
+/// A workspace member's macro runs where cargo runs rustc for it, the workspace's root,
+/// outside its package: a relative path starts there, a look at `.` says it is a directory and
+/// is noted as nothing, and what is in it outside the package is still refused.
+#[test]
+fn a_relative_path_starts_at_the_calls_directory_and_only_the_roots_are_read() {
+    let scratch = Scratch::new("cwd");
+    let env = scratch.env();
+    let top = scratch.top.to_str().unwrap().to_owned();
+    let Some(mut run) = Run::in_dir(&env, &top) else { return };
+    let fd = run.open("pkg/data/a.txt", 0).unwrap();
+    assert_eq!(fd, 3, "a path relative to the workspace's root, into the package, is read");
+    let buf = run.room(64);
+    assert_eq!(run.read(fd, buf, 64), 12);
+    assert_eq!(run.g.read(buf, 12).unwrap(), b"hello, macro");
+    assert!(run.seen().contains(&(Seen::Read, format!("{}/data/a.txt", scratch.pkg))), "{:?}", run.seen());
+
+    let dot = run.c_str(".");
+    let stat = run.room(STAT_MAX);
+    assert_eq!(run.call(Call::Stat, &[&dot.to_le_bytes(), &stat.to_le_bytes()], 4).unwrap(), 0);
+    let Field(at, width) = run.t.stat_layout().mode;
+    let mut word = [0; 8];
+    word[..width].copy_from_slice(run.g.read(stat + at as u64, width).unwrap());
+    assert_eq!(u64::from_le_bytes(word) & 0o170000, 0o040000, "the working directory is a directory");
+    assert!(!run.seen().iter().any(|it| it.1 == top || it.1 == format!("{top}/.")), "{:?}", run.seen());
+
+    let cwd = run.call(Call::Getcwd, &[&0u64.to_le_bytes(), &0u64.to_le_bytes()], 8).unwrap() as u64;
+    assert_eq!(run.g.read_c_str(cwd, 4096).unwrap(), top.as_bytes());
+
+    assert_eq!(run.open("secret.txt", 0).unwrap(), -1, "a file of the workspace's root outside the package");
+    assert_eq!(run.g.errno, run.errno(Errno::Acces));
+    let listed = run.call(Call::Opendir, &[&dot.to_le_bytes()], 8).unwrap();
+    assert_eq!(listed, 0, "the working directory outside the package is not listed");
+    assert_eq!(run.os.refused().collect::<Vec<_>>(), [scratch.secret.as_str(), top.as_str()]);
 }
 
 #[test]
@@ -487,7 +534,7 @@ fn a_target_tuple_names_its_target() {
 #[test]
 fn a_shim_on_a_target_not_modelled_stops() {
     let env = Env::default();
-    let mut os = Os::new(&env);
+    let mut os = Os::in_dir(&env, "/");
     let mut g = Buffer { base: 0x1000, bytes: vec![0; 64], errno: None };
     let mut ret = [0; 8];
     let shim = Shim { call: Call::Getenv, target: None };

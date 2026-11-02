@@ -4,6 +4,13 @@
 //! of the workspace left beside its `OUT_DIR` (blaze's own runs, read as the daemon applies
 //! them); and each proc-macro crate's expanders those `blaze_macro_eval::load` gives, as the
 //! caller wraps them.
+//!
+//! The plan is every build's: its proc macros, and what they depend on, are built for
+//! `wasm32-wasip1` to run as modules, so each macro crate here is the one its module is built
+//! from, with wasm32's cfg, and the evaluator runs that crate. The tests compare engines on one
+//! input (rule 8: the evaluator is the modules' reference), so what a host cfg would change in a
+//! macro is not theirs to see. Its build scripts' runs are those that build left for the
+//! macros' kind (`wasm32-wasip1+macros`).
 
 use std::{
     path::{Path, PathBuf},
@@ -220,7 +227,7 @@ fn ran(units: &Units, unit: usize, std: &str) -> Result<Ran, String> {
     };
     let output = std::fs::read(&output_at).map_err(|error| {
         format!(
-            "no build script's run at {}: {error}; the harness builds the workspace with `blaze build -p corpus-calls` (without `-Z wasm-macros`, whose build scripts of proc macros' dependencies run for wasm32) first",
+            "no build script's run at {}: {error}; the harness builds the workspace with `blaze build -p corpus-calls` first, which plans it as this does",
             output_at.display()
         )
     })?;
