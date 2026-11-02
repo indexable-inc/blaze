@@ -34,6 +34,7 @@ blaze-bytes.workspace = true
 blaze-ids.workspace = true
 
 [dev-dependencies]
+blaze-serde.workspace = true
 blaze-spin.workspace = true
 cranelift-codegen = { workspace = true, features = ["x86", "arm64"] }
 cranelift-frontend.workspace = true

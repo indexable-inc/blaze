@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use blaze_codegen::{CompiledFunction, InstanceKey, plan::Mode, plan::OptLevel};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_inproc::CodeMemory;
 use blaze_inproc::frame::Kind;
 use blaze_items::ItemKey;
@@ -28,7 +29,7 @@ use crate::{
 /// The answers a runner sent, by client and sequence number, and the stops it asked for.
 #[derive(Default)]
 pub(crate) struct Mailbox {
-    answers: Mutex<HashMap<(u32, u32), (Kind, Vec<u8>)>>,
+    answers: Mutex<HashMap<(u32, u32), (Kind, Vec<u8>), Global>>,
     arrived: Condvar,
     stops: Mutex<Vec<(Option<(InstanceKey, ItemKey)>, String)>>,
 }
@@ -122,7 +123,7 @@ impl Counting {
 }
 
 /// Places each function at the address its key was given.
-pub(crate) struct Addresses(pub(crate) HashMap<InstanceKey, u64>);
+pub(crate) struct Addresses(pub(crate) HashMap<InstanceKey, u64, Global>);
 
 impl Placer for Addresses {
     fn place(&mut self, function: &CompiledFunction) -> Result<u64, String> {
@@ -361,7 +362,7 @@ const CODE_MEMORY: bool = cfg!(any(
 struct Slots {
     addresses: Addresses,
     cells: u64,
-    replaced: HashSet<InstanceKey>,
+    replaced: HashSet<InstanceKey, Global>,
 }
 
 impl Slots {
@@ -415,7 +416,7 @@ fn hot_cells_tier_a_function_up_and_its_late_asks_get_the_new_code() {
         session(&functions),
         &[],
         compiler.clone(),
-        Slots { addresses: addresses(3), cells, replaced: HashSet::default() },
+        Slots { addresses: addresses(3), cells, replaced: HashSet::new_in(Global) },
         Mail(Arc::clone(&mail)),
         Config { workers: 1, idle: false },
         Some(up),
@@ -465,7 +466,7 @@ fn a_failed_tier_up_leaves_the_first_code_and_is_reported() {
         session(&[function(0)]),
         &[],
         compiler.clone(),
-        Slots { addresses: addresses(1), cells, replaced: HashSet::default() },
+        Slots { addresses: addresses(1), cells, replaced: HashSet::new_in(Global) },
         Mail(Arc::clone(&mail)),
         Config { workers: 1, idle: false },
         Some(up),

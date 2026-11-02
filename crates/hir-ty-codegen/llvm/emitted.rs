@@ -13,6 +13,7 @@
 use std::borrow::Borrow;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use cranelift_codegen::{
     binemit::Reloc,
     gimli::{
@@ -43,14 +44,19 @@ pub(super) struct Emitted<'data, 'file> {
     file: &'file object::File<'data>,
     /// The section of the function.
     text: SectionIndex,
+    /// Where the function's code is in `text`: all of it, but on Mach-O, where the functions
+    /// of a unit share `__text`, the run of it from the function's symbol to the next ([`atom`]).
+    range: std::ops::Range<u64>,
+    /// Whether another function read from the object has its code in `text` too.
+    shares_text: bool,
     /// The sections of every function of the object that is read.
-    texts: &'file HashSet<SectionIndex>,
+    texts: &'file HashSet<SectionIndex, Global>,
     /// Sections the code of more than one of them refers to.
-    shared: &'file HashSet<SectionIndex>,
+    shared: &'file HashSet<SectionIndex, Global>,
     /// The name of the function, which is that of the file its lines are of.
     name: &'file str,
     /// What became of each section the code leads to.
-    placed: HashMap<SectionIndex, Placement>,
+    placed: HashMap<SectionIndex, Placement, Global>,
     /// The sections that are part of the code, in the order they are in `bytes`.
     inline: Vec<SectionIndex>,
     bytes: Vec<u8>,
@@ -144,11 +150,11 @@ fn read_all<S: Borrow<Signature>>(
         }
     }
     // alloc: once per object, the sections of its functions, which `Emitted` looks up per relocation
-    let texts: HashSet<SectionIndex> = found.iter().flatten().map(|it| it.0).collect();
-    let mut referrers: HashMap<SectionIndex, usize> = HashMap::default();
+    let texts: HashSet<SectionIndex, Global> = found.iter().flatten().map(|it| it.0).collect();
+    let mut referrers: HashMap<SectionIndex, usize, Global> = HashMap::new_in(Global);
     if texts.len() > 1 {
         for &text in &texts {
-            let mut targets = HashSet::default();
+            let mut targets = HashSet::new_in(Global);
             for (_, relocation) in file.section_by_index(text)?.relocations() {
                 if let Destination::Section(target) = Emitted::destination(&file, &relocation)?
                     && !texts.contains(&target)
@@ -163,26 +169,73 @@ fn read_all<S: Borrow<Signature>>(
     }
     // alloc: once per object, as `texts`; empty, allocating nothing, for a function alone
     let shared = referrers.into_iter().filter(|it| it.1 > 1).map(|it| it.0).collect();
+    let macho = file.format() == BinaryFormat::MachO;
     let mut codes = Vec::with_capacity(functions.len());
     for (at, (_, signature)) in functions.iter().enumerate() {
-        let code = match found[at] {
+        let place = match found[at] {
             None => Err(Unhandled::Shape("an object without the function")),
-            Some((_, address)) if address != 0 => {
-                Err(Unhandled::Shape("code ahead of the function"))
-            }
-            Some((text, _)) if found.iter().flatten().filter(|it| it.0 == text).count() > 1 => {
-                Err(Unhandled::Shape("functions that share a section"))
-            }
-            Some((text, _)) => {
-                let name = functions[at].0;
-                // clone: the one copy, which the `Code` owns
-                let signature = signature.borrow().clone();
-                Emitted::code(&file, text, &texts, &shared, name, signature, recorder, instrumented)
+            Some((text, address)) => {
+                let shares_text = found.iter().flatten().filter(|it| it.0 == text).count() > 1;
+                let range = match () {
+                    // Mach-O has no COMDATs to give each function a section of its own.
+                    () if macho => atom(&file, text, address, shares_text),
+                    () if address != 0 => Err(Unhandled::Shape("code ahead of the function")),
+                    () if shares_text => Err(Unhandled::Shape("functions that share a section")),
+                    () => file.section_by_index(text).map(|it| 0..it.size()).map_err(Into::into),
+                };
+                range.map(|range| Place { text, range, shares_text })
             }
         };
+        let code = place.and_then(|place| {
+            let name = functions[at].0;
+            // clone: the one copy, which the `Code` owns
+            let signature = signature.borrow().clone();
+            Emitted::code(&file, place, &texts, &shared, name, signature, recorder, instrumented)
+        });
         codes.push(code);
     }
     Ok(codes)
+}
+
+/// Where the code of a function is in the object ([`Emitted::text`] and what follows it).
+struct Place {
+    text: SectionIndex,
+    range: std::ops::Range<u64>,
+    shares_text: bool,
+}
+
+/// Where in `text`, a section of a Mach-O object, the code of the function whose symbol is
+/// at `address` is: up to the next symbol there, or the end of the section. Mach-O has no
+/// COMDATs, so the functions of a unit share `__text`; LLVM marks every Mach-O object
+/// `.subsections_via_symbols` (`MH_SUBSECTIONS_VIA_SYMBOLS`), under which each symbol starts
+/// a piece of a section the linker places on its own (ld64's atoms), so the code of one
+/// function leads into another's only by a relocation, as from another section. Names that
+/// start with `l` or `L` are the assembler's own and start none.
+fn atom(
+    file: &object::File<'_>,
+    text: SectionIndex,
+    address: u64,
+    shares_text: bool,
+) -> Result<std::ops::Range<u64>, Unhandled> {
+    let section = file.section_by_index(text)?;
+    let subsections = matches!(file.flags(), object::FileFlags::MachO { flags }
+        if flags.contains(macho::MH_SUBSECTIONS_VIA_SYMBOLS));
+    if shares_text && !subsections {
+        return Err(Unhandled::Shape(
+            "functions that share a section of a Mach-O object without `.subsections_via_symbols`",
+        ));
+    }
+    let next = file
+        .symbols()
+        .filter(|it| it.section() == SymbolSection::Section(text) && it.address() > address)
+        .filter(|it| it.name().is_ok_and(|name| !name.starts_with(['l', 'L'])))
+        .map(|it| it.address())
+        .min();
+    let end = next.unwrap_or(section.address() + section.size());
+    let start = address
+        .checked_sub(section.address())
+        .ok_or(Unhandled::Shape("a function ahead of its section"))?;
+    Ok(start..end - section.address())
 }
 
 /// Where a relocation leads: to a request or a library function by its name, or into a
@@ -196,15 +249,16 @@ enum Destination<'name> {
 impl<'data, 'file> Emitted<'data, 'file> {
     fn code(
         file: &'file object::File<'data>,
-        text: SectionIndex,
-        texts: &'file HashSet<SectionIndex>,
-        shared: &'file HashSet<SectionIndex>,
+        place: Place,
+        texts: &'file HashSet<SectionIndex, Global>,
+        shared: &'file HashSet<SectionIndex, Global>,
         name: &'file str,
         signature: Signature,
         recorder: &mut Wants,
         instrumented: Instrumented,
     ) -> Result<(Code, Covered, u32), Unhandled> {
         let Instrumented { covered, profiled } = instrumented;
+        let Place { text, range, shares_text } = place;
         if !covered && Self::has_coverage(file) {
             return Err(Unhandled::Shape("SanitizerCoverage in an object read without it"));
         }
@@ -214,10 +268,12 @@ impl<'data, 'file> Emitted<'data, 'file> {
         let mut emitted = Emitted {
             file,
             text,
+            range,
+            shares_text,
             texts,
             shared,
             name,
-            placed: HashMap::default(),
+            placed: HashMap::new_in(Global),
             // alloc: once per function read, the sections of its code
             inline: Vec::new(),
             // alloc: the code, which the `Code` keeps
@@ -391,7 +447,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             let address = base
                 .wrapping_add(held)
                 .wrapping_add_signed(relocation.addend())
-                .wrapping_sub(text.address());
+                .wrapping_sub(text.address() + self.range.start);
             let at = u32::try_from(address).ok().filter(|it| *it < self.code).ok_or(MALFORMED)?;
             pcs[offset / (2 * word)] = Some(at);
         }
@@ -540,9 +596,16 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 SymbolSection::Section(at) if self.texts.contains(&at) => Self::base(at),
                 _ => 0,
             };
-            let value = (base + symbol.address()).wrapping_add_signed(relocation.addend());
             let size = usize::from(relocation.size() / 8);
             let at = bytes.get_mut(offset as usize..)?.get_mut(..size)?;
+            // Mach-O and ELF's REL keep what is added in the field itself.
+            let mut held = [0u8; 8];
+            if relocation.has_implicit_addend() {
+                held.get_mut(..size)?.copy_from_slice(at);
+            }
+            let value = (base + symbol.address())
+                .wrapping_add(u64::from_le_bytes(held))
+                .wrapping_add_signed(relocation.addend());
             at.copy_from_slice(value.to_le_bytes().get(..size)?);
         }
         Some(bytes)
@@ -554,10 +617,18 @@ impl<'data, 'file> Emitted<'data, 'file> {
         (section.0 as u64 + 1) << 32
     }
 
+    /// Where the function starts as [`Self::relocated`] fills in addresses: the address of
+    /// its symbol, on from [`Self::base`] of its section.
+    fn start(&self) -> u64 {
+        let section = self.file.section_by_index(self.text).map_or(0, |it| it.address());
+        Self::base(self.text) + section + self.range.start
+    }
+
     /// How far into the function an address [`Self::relocated`] filled in is, if it is in the
-    /// function's section.
+    /// function's code or just past its end.
     fn local(&self, address: u64) -> Option<u32> {
-        u32::try_from(address.checked_sub(Self::base(self.text))?).ok()
+        let at = address.checked_sub(self.start())?;
+        u32::try_from(at).ok().filter(|_| at <= self.range.end - self.range.start)
     }
 
     /// Which source location the code is of from each offset on, from the line table: the
@@ -581,10 +652,12 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 if name.slice() == self.name.as_bytes())
         };
         let named = header.file_names().iter().any(ours);
-        // Each run of code is of one section: the function's are those that start in it.
+        // Each run of code is of one section: the function's are those that cover some of it,
+        // which on Mach-O, where a unit's functions share `__text`, is one run for them all.
+        let (start, end) = (self.start(), self.start() + (self.range.end - self.range.start));
         // alloc: once per function, its rows, which `LineRow::of_ranges` makes the line table of
         let mut ranges = Vec::new();
-        for sequence in sequences.iter().filter(|it| self.local(it.start).is_some()) {
+        for sequence in sequences.iter().filter(|it| it.start < end && it.end > start) {
             let mut rows = program.resume_from(sequence);
             while let Some((header, row)) = rows.next_row().map_err(|_| MALFORMED)? {
                 let line = row.line().map_or(0, |line| line.get());
@@ -603,10 +676,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
 
     /// Fills the function, which is all of `code`, up to the length of the shortest one
     /// there may be, and answers how long it is then: what LLVM makes of an empty body is a
-    /// `ret` alone.
-    fn lengthen(code: &mut Vec<u8>) -> Result<u32, Unhandled> {
-        let target = crate::Target::selected()
-            .map_err(|_| Unhandled::Shape("a target that is not known"))?;
+    /// `ret` alone, on `target`.
+    fn lengthen(target: &crate::Target, code: &mut Vec<u8>) -> Result<u32, Unhandled> {
         if let Some((shortest, filler)) = target.arch.shortest_function()
             && code.len() < shortest
         {
@@ -662,7 +733,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             self.bytes.resize(start as usize, 0);
             self.bytes.extend_from_slice(section.data()?);
             if index == first {
-                self.code = Self::lengthen(&mut self.bytes)?;
+                self.code = Self::lengthen(recorder.target, &mut self.bytes)?;
             }
             self.placed.insert(index, Placement::Inline(start));
             self.inline.push(index);
@@ -867,11 +938,14 @@ impl<'data, 'file> Emitted<'data, 'file> {
     fn place_paged(&mut self, text: SectionIndex, recorder: &mut Wants) -> Result<(), Unhandled> {
         let section = self.file.section_by_index(text)?;
         self.align = section.align().max(1);
-        self.bytes.extend_from_slice(section.data()?);
-        self.code = Self::lengthen(&mut self.bytes)?;
+        let (start, end) = (self.range.start as usize, self.range.end as usize);
+        let code = section.data()?.get(start..end).ok_or(Unhandled::Shape("a function past the end of its section"))?;
+        self.bytes.extend_from_slice(code);
+        self.code = Self::lengthen(recorder.target, &mut self.bytes)?;
         self.placed.insert(text, Placement::Inline(0));
         self.inline.push(text);
-        for (_, relocation) in section.relocations() {
+        let range = self.range.clone();
+        for (_, relocation) in section.relocations().filter(|it| range.contains(&it.0)) {
             let Destination::Section(index) = Self::destination(self.file, &relocation)? else {
                 continue;
             };
@@ -967,7 +1041,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
     /// the data objects its constants became.
     fn relocate_paged(&mut self, recorder: &mut Wants) -> Result<(), Unhandled> {
         let section = self.file.section_by_index(self.inline[0])?;
-        for (offset, relocation) in section.relocations() {
+        let range = self.range.clone();
+        for (offset, relocation) in section.relocations().filter(|it| range.contains(&it.0)) {
+            // From the start of the function, which is where its code starts in `bytes`.
+            let offset = offset - range.start;
             let kind = match relocation.flags() {
                 RelocationFlags::MachO { r_type, .. } => match r_type {
                     macho::ARM64_RELOC_BRANCH26 => Reloc::Arm64Call,
@@ -1072,11 +1149,18 @@ impl<'data, 'file> Emitted<'data, 'file> {
         let bases = BaseAddresses::default().set_eh_frame(0).set_text(0);
         let malformed = |_| Unhandled::Shape("an unwind table that does not parse");
         // Of an object of more than one function, the entries of this one: those whose
-        // start, eight bytes in, is relocated against its section.
-        let ours: Option<HashSet<u64>> = (self.texts.len() > 1).then(|| {
+        // start, eight bytes in, is relocated against its section, and, where the functions
+        // share it (Mach-O's `__text`), to the function's own symbol. Mach-O relocates the
+        // start as a pair, less the entry's own place (`ARM64_RELOC_SUBTRACTOR`, which
+        // `object` folds in) plus the function (`ARM64_RELOC_UNSIGNED`), against the symbol
+        // that starts the function's atom ([`atom`]); the field holds the pair's difference.
+        let start = self.start() - Self::base(self.text);
+        let ours: Option<HashSet<u64, Global>> = (self.texts.len() > 1 || self.shares_text).then(|| {
             let starts = section.relocations().filter(|(_, relocation)| {
-                Self::symbol(self.file, relocation)
-                    .is_ok_and(|it| it.section() == SymbolSection::Section(self.text))
+                Self::symbol(self.file, relocation).is_ok_and(|it| {
+                    it.section() == SymbolSection::Section(self.text)
+                        && (!self.shares_text || it.address() == start)
+                })
             });
             // alloc: once per function of a unit, none for a function alone
             starts.map(|(offset, _)| offset.wrapping_sub(8)).collect()
@@ -1118,7 +1202,12 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 rows: Self::rules(fde.instructions(&eh_frame, &bases), cie)?,
             });
         }
-        let Some(rows) = rows else { return Ok(None) };
+        let Some(rows) = rows else {
+            if ours.is_some_and(|it| !it.is_empty()) {
+                return Err(Unhandled::Shape("an unwind table entry of the function that does not parse"));
+            }
+            return Ok(None);
+        };
         let pads = match table {
             Some(table) => table,
             None => self.landing_pads()?,
@@ -1136,16 +1225,60 @@ impl<'data, 'file> Emitted<'data, 'file> {
             if !entry.contains(&offset) {
                 continue;
             }
-            let SymbolSection::Section(index) = Self::symbol(self.file, &relocation)?.section()
-            else {
+            let symbol = Self::symbol(self.file, &relocation)?;
+            let SymbolSection::Section(index) = symbol.section() else {
                 continue;
             };
             let table = self.file.section_by_index(index)?;
-            if table.name()?.starts_with(".gcc_except_table") {
+            let name = table.name()?;
+            if name.starts_with(".gcc_except_table") {
                 return Self::pads_of(&table).map(Some);
+            }
+            // Mach-O has one `__gcc_except_tab` for every function of a unit, whose functions
+            // share `__text`: the function's piece of it runs to where the next entry's starts.
+            // Each piece is an atom of its own, which the relocation names by its symbol.
+            if name == "__gcc_except_tab" {
+                return self.piece_of(&table, symbol.address(), self.lsdas(eh_frame, index)).map(Some);
             }
         }
         Ok(None)
+    }
+
+    /// Where in the section `table` the entries of `__eh_frame` find their landing pads.
+    fn lsdas(
+        &self,
+        eh_frame: &object::Section<'data, '_>,
+        table: SectionIndex,
+    ) -> SmallVec<[u64; 8]> {
+        let mut lsdas = SmallVec::new();
+        for (_, relocation) in eh_frame.relocations() {
+            if let Ok(symbol) = Self::symbol(self.file, &relocation)
+                && symbol.section() == SymbolSection::Section(table)
+            {
+                lsdas.push(symbol.address());
+            }
+        }
+        lsdas
+    }
+
+    /// The table of landing pads in `table` at `lsda`, to the next of `lsdas` or the end of
+    /// the section, as it is.
+    fn piece_of(
+        &self,
+        table: &object::Section<'data, '_>,
+        lsda: u64,
+        lsdas: impl IntoIterator<Item = u64>,
+    ) -> Result<Vec<u8>, Unhandled> {
+        if table.relocations().next().is_some() {
+            return Err(Unhandled::Shape("landing pads that name a type"));
+        }
+        let end = lsdas.into_iter().filter(|it| *it > lsda).min().unwrap_or(table.address() + table.size());
+        let pads = lsda
+            .checked_sub(table.address())
+            .and_then(|from| table.data().ok()?.get(from as usize..(end - table.address()) as usize))
+            .ok_or(Unhandled::Shape("landing pads outside their section"))?;
+        // alloc: the landing pads, which the `Code` keeps
+        Ok(pads.to_vec())
     }
 
     /// The function's entry of `.pdata` as the `UNWIND_INFO` of `.xdata` it names, which is
@@ -1270,12 +1403,21 @@ impl<'data, 'file> Emitted<'data, 'file> {
             return Ok(None);
         };
         let data = section.data()?;
-        let &[_, _, _, _, _, _, _, _, l0, l1, l2, l3, e0, e1, e2, e3, ..] = data else {
+        let (entry, pads) = match self.shares_text {
+            false if data.len() > 32 => {
+                return Err(Unhandled::Shape("more than one unwind table entry"));
+            }
+            false => (data, None),
+            // The functions of a unit share `__text` and each has an entry: this one's is
+            // that whose start is relocated to the function's own.
+            true => match self.compact_entry(&section)? {
+                Some((entry, pads)) => (entry, Some(pads)),
+                None => return Ok(None),
+            },
+        };
+        let &[_, _, _, _, _, _, _, _, l0, l1, l2, l3, e0, e1, e2, e3, ..] = entry else {
             return Ok(None);
         };
-        if data.len() != 32 {
-            return Err(Unhandled::Shape("more than one unwind table entry"));
-        }
         let (len, encoding) =
             (u32::from_le_bytes([l0, l1, l2, l3]), u32::from_le_bytes([e0, e1, e2, e3]));
         // alloc: the unwind rules, which the `Code` keeps
@@ -1297,8 +1439,16 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 ]);
                 -16
             }
-            // The frame was beyond the compact form, and has an entry of `__eh_frame`.
-            _ => return self.unwind(),
+            // The frame was beyond the compact form, and has an entry of `__eh_frame`, as does
+            // its LSDA (LLVM's `EmitCompactUnwind` leaves the compact entry's out).
+            _ => {
+                return match self.unwind()? {
+                    Some(unwind) => Ok(Some(unwind)),
+                    None => Err(Unhandled::Shape(
+                        "a compact unwind entry that leaves the frame to `__eh_frame`, which has none for it",
+                    )),
+                };
+            }
         };
         for (pair, register) in PAIRS {
             if encoding & pair != 0 {
@@ -1307,7 +1457,85 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 at -= 16;
             }
         }
-        Ok(Some(FunctionUnwind::from_rows(FrameRows { len, rows }, self.landing_pads()?)))
+        let pads = match pads {
+            Some(pads) => pads,
+            None => self.landing_pads()?,
+        };
+        Ok(Some(FunctionUnwind::from_rows(FrameRows { len, rows }, pads)))
+    }
+
+    /// The function's entry of `__compact_unwind`, of the entries of the functions that share
+    /// its section, and its table of landing pads: the piece of `__gcc_except_tab` from where
+    /// the entry's LSDA field points to the next any entry points to. Each entry is 32 bytes:
+    /// the function's address, its length, the encoding of its frame, its personality and its
+    /// LSDA; the addresses are relocations.
+    #[expect(clippy::type_complexity, reason = "one entry and its pads")]
+    fn compact_entry(
+        &self,
+        section: &object::Section<'data, '_>,
+    ) -> Result<Option<(&'data [u8], Option<Vec<u8>>)>, Unhandled> {
+        const MALFORMED: Unhandled = Unhandled::Shape("an unwind table that does not parse");
+        let data = section.data()?;
+        if data.len() % 32 != 0 {
+            return Err(MALFORMED);
+        }
+        let start = self.file.section_by_index(self.text)?.address() + self.range.start;
+        let mut ours = None;
+        // alloc: once per function of a Mach-O unit, where each entry's landing pads start
+        let mut lsdas: Vec<(u64, u64)> = Vec::new();
+        for (offset, relocation) in section.relocations() {
+            // The personality, at 16, is the same for every function.
+            if !matches!(offset % 32, 0 | 24) {
+                continue;
+            }
+            let address = Self::macho_address(self.file, data, offset, &relocation)?;
+            match offset % 32 {
+                0 if relocation_in(self.file, &relocation, self.text) && address == start => {
+                    if ours.replace(offset).is_some() {
+                        return Err(Unhandled::Shape("more than one unwind table entry"));
+                    }
+                }
+                0 => {}
+                _ => lsdas.push((offset - 24, address)),
+            }
+        }
+        let Some(ours) = ours else { return Ok(None) };
+        let entry = data.get(ours as usize..ours as usize + 32).ok_or(MALFORMED)?;
+        let Some(&(_, lsda)) = lsdas.iter().find(|it| it.0 == ours) else {
+            return Ok(Some((entry, None)));
+        };
+        let table = self
+            .file
+            .section_by_name("__gcc_except_tab")
+            .ok_or(Unhandled::Shape("an LSDA without `__gcc_except_tab`"))?;
+        let pads = self.piece_of(&table, lsda, lsdas.iter().map(|it| it.1))?;
+        Ok(Some((entry, Some(pads))))
+    }
+
+    /// The address the eight bytes of `data` at `offset` hold once `relocation`, an
+    /// `ARM64_RELOC_UNSIGNED` of Mach-O, is applied, in the object's own addresses: Mach-O
+    /// keeps what is added in the field, which is all of the address for a relocation
+    /// against a section.
+    fn macho_address(
+        file: &object::File<'data>,
+        data: &[u8],
+        offset: u64,
+        relocation: &object::Relocation,
+    ) -> Result<u64, Unhandled> {
+        const MALFORMED: Unhandled = Unhandled::Shape("an unwind table that does not parse");
+        let RelocationFlags::MachO { r_type: macho::ARM64_RELOC_UNSIGNED, r_length: 3, .. } =
+            relocation.flags()
+        else {
+            return Err(MALFORMED);
+        };
+        let field = data.get(offset as usize..).and_then(<[u8]>::first_chunk).ok_or(MALFORMED)?;
+        let held = if relocation.has_implicit_addend() { u64::from_le_bytes(*field) } else { 0 };
+        let base = match relocation.target() {
+            RelocationTarget::Symbol(symbol) => file.symbol_by_index(symbol)?.address(),
+            RelocationTarget::Section(_) => 0,
+            _ => return Err(MALFORMED),
+        };
+        Ok(base.wrapping_add(held).wrapping_add_signed(relocation.addend()))
     }
 
     const UNKNOWN_RULE: Unhandled = Unhandled::Shape("an unwind rule there is no answer for");
@@ -1373,6 +1601,17 @@ enum Field {
     TlsGd,
     /// How far into its section something is: a thread-local of a PE image.
     SectionOffset,
+}
+
+/// Whether `relocation` is against `section` or a symbol in it.
+fn relocation_in(file: &object::File<'_>, relocation: &object::Relocation, section: SectionIndex) -> bool {
+    match relocation.target() {
+        RelocationTarget::Section(it) => it == section,
+        RelocationTarget::Symbol(symbol) => file
+            .symbol_by_index(symbol)
+            .is_ok_and(|it| it.section() == SymbolSection::Section(section)),
+        _ => false,
+    }
 }
 
 /// The name of a symbol as the module had it: Mach-O puts an underscore before it.

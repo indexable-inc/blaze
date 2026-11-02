@@ -842,11 +842,30 @@ fn write_where_predicates<'db>(
 
         f.write_str("\n    ")?;
         match pred {
-            TypeBound { lifetimes, target, bound } => {
-                if let Some(lifetimes) = lifetimes {
-                    let lifetimes =
-                        store.names(*lifetimes).iter().map(|it| it.display(f.db, f.edition())).join(", ");
-                    write!(f, "for<{lifetimes}> ")?;
+            TypeBound { lifetimes, binder, target, bound } => {
+                if lifetimes.is_some() || !binder.is_empty() {
+                    f.write_str("for<")?;
+                    let mut first = true;
+                    for name in lifetimes.iter().flat_map(|it| store.names(*it)) {
+                        if !first {
+                            f.write_str(", ")?;
+                        }
+                        first = false;
+                        write!(f, "{}", name.display(f.db, f.edition()))?;
+                    }
+                    // `for<F: Field<T>>` (`#![feature(blaze_comptime)]`).
+                    for (_, param) in params.binder_params(*binder) {
+                        if !first {
+                            f.write_str(", ")?;
+                        }
+                        first = false;
+                        write!(f, "{}", param.name.display(f.db, f.edition()))?;
+                        for (i, bound) in param.bounds.iter().enumerate() {
+                            f.write_str(if i == 0 { ": " } else { " + " })?;
+                            bound.hir_fmt(f, owner, store)?;
+                        }
+                    }
+                    f.write_str("> ")?;
                 }
                 target.hir_fmt(f, owner, store)?;
                 f.write_str(": ")?;

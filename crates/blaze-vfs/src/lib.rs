@@ -21,6 +21,7 @@
 //! Unsafe code is only in `store` (docs/v2/plan/design/unsafe.md), whose API is safe.
 
 #![deny(unsafe_code)]
+#![feature(allocator_api)]
 
 mod disk;
 mod image;
@@ -41,6 +42,7 @@ use std::{borrow::Cow, fmt};
 
 use blaze_core::{Completion, Effect, FileName, Tag};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Idx};
 use serde::{Deserialize, Serialize};
 
@@ -264,7 +266,7 @@ pub struct Ticket(pub u64);
 /// through effects.
 pub struct Vfs {
     tree: Tree,
-    heads: HashMap<Box<str>, NodeId>,
+    heads: HashMap<Box<str>, NodeId, Global>,
     /// By view: its root while it is open. A closed view's number is not given out again.
     views: Vec<Option<NodeId>>,
     journal: Journal,

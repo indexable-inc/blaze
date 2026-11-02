@@ -6,6 +6,7 @@ use std::{
     hash::{Hash, Hasher},
     iter,
 };
+use std::alloc::Global;
 
 use base_db::{Db, target::TargetLoadError};
 use either::Either;
@@ -42,9 +43,9 @@ use crate::{
     },
 };
 
+pub mod devirt;
 mod held;
 pub(crate) mod persist;
-pub mod target;
 
 pub use held::{HeldLocals, YieldPoint};
 
@@ -209,6 +210,152 @@ pub enum ProjectionElem<V: PartialEq> {
     },
     /// "Downcast" to a variant of an enum or a coroutine.
     Downcast(VariantId),
+    /// `base.[f]` (`#![feature(blaze_comptime)]`, docs/v2/plan/design/comptime.md) in generic
+    /// MIR: the field the binder `F` of a `for const` loop names, of a base of type `B`
+    /// (`F: core::reflect::Field<B>`). Its type is `<F as core::field::Field>::Type`. Like
+    /// `Index`, it may be any field of the base, so it overlaps each. Monomorphization turns it
+    /// into `Field(i)` (`Field(0), Downcast(v), Field(i)` on a `VariantOf<E, v>`) once `F` is
+    /// the field's representing type; no monomorphic body has one.
+    ReflectedField(ComptimeBinder),
+}
+
+/// The binder `F` of a `for const` loop (`#![feature(blaze_comptime)]`): the placeholder type
+/// `!U_0` that inference gave the loop, in a universe `U` of its own (unique within the body).
+/// Persisted MIR keeps the universe's number, which inference of the same body gives again.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ComptimeBinder(pub u32);
+
+impl ComptimeBinder {
+    /// The binder `ty` is, if it is one: a placeholder for the first variable of an anonymous
+    /// binder, the shape inference gives a `for const` loop's `F`.
+    pub fn of(ty: Ty<'_>) -> Option<ComptimeBinder> {
+        let TyKind::Placeholder(placeholder) = ty.kind() else { return None };
+        let rustc_type_ir::BoundTy { var, kind } = placeholder.bound;
+        (var == rustc_type_ir::BoundVar::ZERO
+            && matches!(kind, rustc_type_ir::BoundTyKind::Anon))
+        .then(|| ComptimeBinder(placeholder.universe.as_u32()))
+    }
+
+    /// `F` itself.
+    pub fn ty<'db>(self, interner: DbInterner<'db>) -> Ty<'db> {
+        Ty::new_placeholder(
+            interner,
+            crate::next_solver::PlaceholderType::new_anon(
+                rustc_type_ir::UniverseIndex::from_u32(self.0),
+                rustc_type_ir::BoundVar::ZERO,
+            ),
+        )
+    }
+
+    /// The type of `base.[f]`: `<F as core::field::Field>::Type`, rigid, as inference has it
+    /// for a placeholder `F`. `None` where `core` has no `core::field::Field::Type`.
+    pub fn field_ty<'db>(self, interner: DbInterner<'db>) -> Option<Ty<'db>> {
+        reflected_field_ty(interner, self.ty(interner))
+    }
+}
+
+/// The `for const` loops (`#![feature(blaze_comptime)]`) whose body `expr` is in, outermost
+/// first: the binders a `const { .. }` block at `expr` may name, which its constant takes as
+/// generic arguments after its item's own. Empty in a body without one.
+pub fn comptime_loops_around(
+    store: &ExpressionStore,
+    infer: &InferenceResult<'_>,
+    expr: ExprId,
+) -> SmallVec<[ExprId; 2]> {
+    let mut around = SmallVec::<[ExprId; 2]>::new();
+    if infer.comptime_loops().len() == 0 {
+        return around;
+    }
+    let body_of = |loop_: ExprId| match store.expr(loop_) {
+        Expr::ComptimeFor { body, .. } => Some(body),
+        _ => None,
+    };
+    // Whether `inner` is `outer` or under it. Bounded by the store: each expression has one
+    // parent, so the walk visits each once.
+    let contains = |outer: ExprId, inner: ExprId| {
+        let mut stack: SmallVec<[ExprId; 16]> = smallvec![outer];
+        while let Some(it) = stack.pop() {
+            if it == inner {
+                return true;
+            }
+            store.walk_child_exprs(it, |child| stack.push(child));
+        }
+        false
+    };
+    for (loop_, _) in infer.comptime_loops() {
+        if let Some(body) = body_of(loop_)
+            && contains(body, expr)
+        {
+            around.push(loop_);
+        }
+    }
+    // They nest: the outer one has the others under it.
+    let under = |loop_: ExprId| {
+        body_of(loop_).map_or(0, |body| {
+            around.iter().filter(|&&other| other != loop_ && contains(body, other)).count()
+        })
+    };
+    let mut keyed: SmallVec<[(std::cmp::Reverse<usize>, ExprId); 2]> =
+        around.iter().map(|&loop_| (std::cmp::Reverse(under(loop_)), loop_)).collect();
+    keyed.sort();
+    keyed.into_iter().map(|(_, loop_)| loop_).collect()
+}
+
+/// The binders of [`comptime_loops_around`] `expr`, outermost first.
+pub fn comptime_binders_around(
+    store: &ExpressionStore,
+    infer: &InferenceResult<'_>,
+    expr: ExprId,
+) -> SmallVec<[ComptimeBinder; 2]> {
+    comptime_loops_around(store, infer, expr)
+        .into_iter()
+        .filter_map(|loop_| infer.comptime_loop(loop_))
+        .filter_map(|it| ComptimeBinder::of(it.binder.as_ref()))
+        .collect()
+}
+
+/// The binders the inline constant `konst` takes after its item's parameters: those of the
+/// `for const` loops its block is in. Empty for any other anonymous constant.
+pub fn comptime_binders_of_anon_const<'db>(
+    db: &'db Db,
+    konst: crate::db::AnonConstId<'db>,
+) -> SmallVec<[ComptimeBinder; 2]> {
+    if !konst.is_inline_const(db) {
+        return SmallVec::new();
+    }
+    let loc = konst.loc(db);
+    let store = ExpressionStore::of(db, loc.owner);
+    let infer = InferenceResult::of(db, konst);
+    comptime_binders_around(store, infer, loc.expr)
+}
+
+/// Another `for const` loop of `infer` whose binder lives in the same universe as `expr`'s.
+/// One body's loops each get their own universe, but an anonymous constant (an array length)
+/// with a loop is inferred in its own context and merged into its parent's table, so its
+/// universes can equal the parent's: the two binders would then be one placeholder, and a
+/// body's environment and the expansion would mix their assumptions and members.
+pub fn comptime_universe_clash(infer: &InferenceResult<'_>, expr: ExprId) -> Option<ExprId> {
+    let universe = infer.comptime_loop(expr)?.universe();
+    infer
+        .comptime_loops()
+        .find(|&(other, it)| other != expr && it.universe() == universe)
+        .map(|(other, _)| other)
+}
+
+/// `<field as core::field::Field>::Type`, the type of `base.[f]` with `f: field`, rigid: what the
+/// solver normalizes it to when `field` is a placeholder. `None` where `core` has no
+/// `core::field::Field::Type`.
+pub fn reflected_field_ty<'db>(interner: DbInterner<'db>, field: Ty<'db>) -> Option<Ty<'db>> {
+    let assoc = interner.lang_items().FieldType?;
+    Some(Ty::new_alias(
+        interner,
+        crate::next_solver::IsRigid::Yes,
+        crate::next_solver::AliasTy::new_from_args(
+            interner,
+            rustc_type_ir::AliasTyKind::Projection { def_id: assoc.into() },
+            GenericArgs::new_from_slice(&[field.into()]),
+        ),
+    ))
 }
 
 impl<V: PartialEq> ProjectionElem<V> {
@@ -222,6 +369,7 @@ impl<V: PartialEq> ProjectionElem<V> {
             }
             ProjectionElem::Subslice { from, to } => ProjectionElem::Subslice { from, to },
             ProjectionElem::Downcast(variant_id) => ProjectionElem::Downcast(variant_id),
+            ProjectionElem::ReflectedField(binder) => ProjectionElem::ReflectedField(binder),
         }
     }
 
@@ -238,14 +386,15 @@ impl<V: PartialEq> ProjectionElem<V> {
             }
             ProjectionElem::Subslice { from, to } => ProjectionElem::Subslice { from, to },
             ProjectionElem::Downcast(variant_id) => ProjectionElem::Downcast(variant_id),
+            ProjectionElem::ReflectedField(binder) => ProjectionElem::ReflectedField(binder),
         })
     }
 }
 
 pub type PlaceElem = ProjectionElem<LocalId>;
 
-// SAFETY: visits every field: no variant holds a type (fields, locals, offsets and variants
-// only).
+// SAFETY: visits every field: no variant holds a type (fields, locals, offsets, variants and
+// a binder's universe only).
 unsafe impl<W: crate::next_solver::WorldExposer> GenericTypeVisitable<W> for PlaceElem {
     fn generic_visit_with(&self, _: &mut W) {}
 }
@@ -748,6 +897,19 @@ pub enum TerminatorKind {
         /// of the `remove_noop_landing_pads` and `abort_unwinding_calls` passes.
         unwind: Option<BasicBlockId>,
     },
+
+    /// The head of `for const pat in domain { body }` (`#![feature(blaze_comptime)]`,
+    /// docs/v2/plan/design/comptime.md), in generic MIR: control goes to `body` once per field
+    /// (variant) of `domain` (`core::reflect::Fields<B>` or `Variants<B>`), with `binder` the
+    /// field's (variant's) type in that iteration, then to `after`. Each iteration ends in a
+    /// [`TerminatorKind::ComptimeNext`] back here. To every pass before monomorphization it
+    /// is a loop head with successors `body` and `after`: the body may run any number of times.
+    /// Monomorphization unrolls it once the domain is known (the copies of the blocks `body`
+    /// dominates, in declaration order); no monomorphic body has one.
+    ComptimeFor { binder: ComptimeBinder, domain: StoredTy, body: BasicBlockId, after: BasicBlockId },
+
+    /// The end of one iteration of the `ComptimeFor` in block `head`: goes back to it.
+    ComptimeNext { head: BasicBlockId },
 }
 
 // Order of variants in this enum matter: they are used to compare borrow kinds.
@@ -1349,7 +1511,9 @@ impl TerminatorKind {
             | TerminatorKind::Drop { .. }
             | TerminatorKind::CoroutineDrop
             | TerminatorKind::FalseEdge { .. }
-            | TerminatorKind::FalseUnwind { .. } => (),
+            | TerminatorKind::FalseUnwind { .. }
+            | TerminatorKind::ComptimeFor { .. }
+            | TerminatorKind::ComptimeNext { .. } => (),
         }
     }
 
@@ -1374,7 +1538,9 @@ impl TerminatorKind {
             | TerminatorKind::Drop { .. }
             | TerminatorKind::CoroutineDrop
             | TerminatorKind::FalseEdge { .. }
-            | TerminatorKind::FalseUnwind { .. } => (),
+            | TerminatorKind::FalseUnwind { .. }
+            | TerminatorKind::ComptimeFor { .. }
+            | TerminatorKind::ComptimeNext { .. } => (),
         }
     }
 
@@ -1387,7 +1553,9 @@ impl TerminatorKind {
             | TerminatorKind::DropAndReplace { target, .. }
             | TerminatorKind::Assert { target, .. }
             | TerminatorKind::FalseEdge { real_target: target, .. }
-            | TerminatorKind::FalseUnwind { real_target: target, .. } => ([Some(*target), None], &[]),
+            | TerminatorKind::FalseUnwind { real_target: target, .. }
+            | TerminatorKind::ComptimeNext { head: target } => ([Some(*target), None], &[]),
+            TerminatorKind::ComptimeFor { body, after, .. } => ([Some(*body), Some(*after)], &[]),
             TerminatorKind::SwitchInt { targets, .. } => ([None, None], targets.all_targets()),
             TerminatorKind::Call { target, .. } => ([*target, None], &[]),
             TerminatorKind::Yield { resume, drop, .. } => ([Some(*resume), *drop], &[]),
@@ -1419,7 +1587,10 @@ impl TerminatorKind {
     pub fn all_successors(&self) -> impl DoubleEndedIterator<Item = BasicBlockId> + '_ {
         use std::slice::from_ref;
         let (first, then, last): (&[BasicBlockId], _, _) = match self {
-            TerminatorKind::Goto { target } => (from_ref(target), None, None),
+            TerminatorKind::Goto { target } | TerminatorKind::ComptimeNext { head: target } => {
+                (from_ref(target), None, None)
+            }
+            TerminatorKind::ComptimeFor { body, after, .. } => (from_ref(body), Some(*after), None),
             TerminatorKind::SwitchInt { targets, .. } => (targets.all_targets(), None, None),
             TerminatorKind::Drop { target, unwind, .. }
             | TerminatorKind::DropAndReplace { target, unwind, .. }
@@ -1523,7 +1694,71 @@ pub struct InlinedPromoted {
     pub expr: ExprId,
 }
 
-/// What an optimized body inlined. Empty in every body as it is built.
+/// What a specialized copy of a function knows of the value of one of its parameters: of a
+/// `bool`, `char` or integer, its bits; of an enum, its discriminant as an `i128`'s bits (what
+/// `Rvalue::Discriminant` gives and `SwitchInt` compares). A value is compared truncated to
+/// the size of the operand it is compared with.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+pub enum ArgFact {
+    /// The value is this one, one of those the function compares the parameter with.
+    Is(u128),
+    /// The value is none of these, sorted and each once: every value the function compares
+    /// the parameter with, so that every value outside them shares one copy.
+    IsNot(Box<[u128]>),
+}
+
+/// A copy of `base` compiled knowing `facts` of its parameters: blaze's `Specialize` pass, which
+/// rustc has none of. Each fact is of the parameter at its index in `param_locals`; they are
+/// sorted by it, each index once, and never empty. The copy has `base`'s signature, ABI and
+/// attributes, and is called with the arguments `base` would be: only its body differs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+pub struct Specialization {
+    pub base: FunctionId,
+    pub facts: Box<[(u32, ArgFact)]>,
+}
+
+impl Specialization {
+    /// What the copy knows, as its spans and errors write it after the base's path:
+    /// ` knowing #0 = 1, #2 not [0, 3]`, each parameter by index, an enum by its discriminant.
+    pub fn knowing(&self) -> impl Display + '_ {
+        Knowing(&self.facts)
+    }
+}
+
+struct Knowing<'a>(&'a [(u32, ArgFact)]);
+
+impl Display for Knowing<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(" knowing ")?;
+        for (at, (index, fact)) in self.0.iter().enumerate() {
+            if at > 0 {
+                f.write_str(", ")?;
+            }
+            match fact {
+                ArgFact::Is(value) => write!(f, "#{index} = {value}")?,
+                ArgFact::IsNot(values) => write!(f, "#{index} not {values:?}")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A call of an optimized body that the code generator makes to a specialized copy of its
+/// callee: the call that ends `block`, whose `func` still names the callee (of a trait method,
+/// the method `clone.base` is the impl's item for). A reader that
+/// knows nothing of specializations (the interpreter, the reference walk) calls the base, with
+/// the same result.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+pub struct SpecializedCall {
+    pub block: BasicBlockId,
+    pub clone: Specialization,
+    /// `clone.base`'s generic arguments at the call, with regions erased, in the caller's
+    /// generic parameters (instantiated by monomorphization like the rest of the body).
+    pub args: StoredGenericArgs,
+}
+
+/// What an optimized body inlined, and which of its calls go to specialized copies. Empty in
+/// every body as it is built.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, blaze_query::Value)] // clone: inside `MirBody`
 pub struct Inlined<'db> {
     pub callees: Vec<InlinedCallee<'db>>,
@@ -1531,20 +1766,37 @@ pub struct Inlined<'db> {
     pub spans: Vec<InlinedSpan>,
     pub bindings: Vec<InlinedBinding>,
     pub promoted: Vec<InlinedPromoted>,
+    /// What `Devirtualize` read of the program's dyn facts ([`devirt::World`]), one entry a
+    /// call it looked at in block order: the digest of the object's facts, or
+    /// [`devirt::ABSENT`]. The code generator keys the body's code on them (rule 18), so a
+    /// body built against a world it no longer matches is not reused.
+    pub devirtualized: Vec<[u8; 32]>,
+    /// By block, ascending; each block once. Written by the last pass, so the blocks are the
+    /// body's own; nothing that inlines this body carries them over.
+    pub specialized: Vec<SpecializedCall>,
+    /// The bytes of allocations `HeapToStack` moved into this body's own frame (`hir-ty-mir`'s
+    /// `optimize/escape.rs`); 0 in every body as it is built. The code generator builds a body
+    /// with any into no other (LLVM never imports it): its slots would be in the importer's
+    /// frame, which may recur.
+    pub moved_to_frame: u32,
 }
 
 impl Inlined<'_> {
+    /// Whether the body has no inlined code: [`Inlined::specialized`] calls are not inlined.
     pub fn is_empty(&self) -> bool {
         self.callees.is_empty()
     }
 
     fn shrink_to_fit(&mut self) {
-        let Inlined { callees, scopes, spans, bindings, promoted } = self;
+        let Inlined { callees, scopes, spans, bindings, promoted, devirtualized, specialized, moved_to_frame: _ } =
+            self;
+        devirtualized.shrink_to_fit();
         callees.shrink_to_fit();
         scopes.shrink_to_fit();
         spans.shrink_to_fit();
         bindings.shrink_to_fit();
         promoted.shrink_to_fit();
+        specialized.shrink_to_fit();
     }
 }
 
@@ -1556,7 +1808,7 @@ pub struct MirBody<'db> {
     pub owner: InferBodyId<'db>,
     pub binding_locals: ArenaMap<BindingId, LocalId>,
     pub upvar_locals:
-        blaze_hash::HashMap<BindingId, Vec<(LocalId, crate::closure_analysis::Place)>>,
+        blaze_hash::HashMap<BindingId, Vec<(LocalId, crate::closure_analysis::Place)>, Global>,
     pub param_locals: Vec<LocalId>,
     /// Temporaries that hold a constant and are borrowed for `'static`, as in `&[1, 2]`. The
     /// value has to outlive the call.
@@ -1668,7 +1920,7 @@ impl Hash for MirBody<'_> {
 /// `raw` keeping their order, and each value is found again by its key; straight into `state`,
 /// with no hasher per entry.
 fn hash_by_key<K: Hash + Eq + Copy, V: Hash, H: Hasher>(
-    map: &blaze_hash::HashMap<K, V>,
+    map: &blaze_hash::HashMap<K, V, Global>,
     raw: impl Fn(K) -> u32,
     from_raw: impl Fn(u32) -> K,
     state: &mut H,
@@ -1812,6 +2064,8 @@ macro_rules! places_walker {
                         TerminatorKind::SwitchInt { discr, .. } => for_operand(discr, &mut f),
                         TerminatorKind::FalseEdge { .. }
                         | TerminatorKind::FalseUnwind { .. }
+                        | TerminatorKind::ComptimeFor { .. }
+                        | TerminatorKind::ComptimeNext { .. }
                         | TerminatorKind::Goto { .. }
                         | TerminatorKind::UnwindResume
                         | TerminatorKind::CoroutineDrop
@@ -1848,6 +2102,19 @@ macro_rules! places_walker {
 }
 
 impl MirBody<'_> {
+    /// Whether the body has a `for const` loop (`#![feature(blaze_comptime)]`): generic MIR
+    /// that monomorphization expands. A `base.[f]` place is only ever inside one.
+    pub fn has_comptime_loop(&self) -> bool {
+        self.basic_blocks.iter().any(|(_, block)| {
+            block.terminator.as_ref().is_some_and(|it| {
+                matches!(
+                    it.kind,
+                    TerminatorKind::ComptimeFor { .. } | TerminatorKind::ComptimeNext { .. }
+                )
+            })
+        })
+    }
+
     /// The future the body of an `async` block waits for at `point`: going on from there
     /// starts by borrowing it, to poll it again.
     pub fn awaited(&self, point: &YieldPoint) -> Option<LocalId> {
@@ -1938,7 +2205,7 @@ impl<'db> MirBody<'db> {
         &mut self,
         infcx: &InferCtxt<'db>,
         env: ParamEnv<'db>,
-        copy: &mut blaze_hash::HashMap<Ty<'db>, bool>,
+        copy: &mut blaze_hash::HashMap<Ty<'db>, bool, Global>,
     ) {
         let mut blocks = std::mem::take(&mut self.basic_blocks);
         let mut mark = |operand: &mut Operand| {
@@ -2204,6 +2471,13 @@ impl<'db> PlaceTy<'db> {
             ProjectionElem::Field(f) => {
                 PlaceTy::from_ty(handle_field(structurally_normalize(self.ty), self.variant_id, f))
             }
+            // Not normalized: nothing is known of `F::Type` but `F`'s bounds, which the
+            // body's own environment does not have.
+            ProjectionElem::ReflectedField(binder) => PlaceTy::from_ty(
+                binder.field_ty(tcx).unwrap_or_else(|| {
+                    panic!("`.[ ]` of {self:?} where `core` has no `core::field::Field::Type`")
+                }),
+            ),
         }
     }
 }
@@ -2217,7 +2491,10 @@ pub struct VTableMap<'db> {
 }
 
 impl<'db> VTableMap<'db> {
-    const OFFSET: usize = 1000; // We should add some offset to ids to make 0 (null) an invalid id.
+    /// Ids start far from 0 (null) and from the numbers a program plausibly holds, so a word
+    /// equal to one in memory no type describes is a function or vtable codegen must not
+    /// leave as a number. Under every target's heap addresses, and in 32 bits.
+    const OFFSET: usize = 0x0600_0000;
 
     /// The id of the first type: the `n`th of [`VTableMap::tys`] has id `FIRST_ID + n`.
     pub const FIRST_ID: usize = VTableMap::OFFSET;
@@ -2307,6 +2584,62 @@ pub enum MirEvalError<'db> {
     CoerceUnsizedError(StoredTy),
     /// These should not occur, usually indicates a bug in mir lowering.
     InternalError(Box<str>),
+    /// A comptime form only generic MIR holds, met by the evaluator.
+    ComptimeUnexpanded(ComptimeUnexpanded),
+}
+
+/// A comptime form of generic MIR (`#![feature(blaze_comptime)]`) that a pass met where it
+/// handles none: a pass that runs only on monomorphic MIR, which monomorphization's expansion
+/// leaves without any, or a pass that does not handle the form yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+pub struct ComptimeUnexpanded {
+    pub form: MirComptimeForm,
+    /// The pass that met it.
+    pub pass: &'static str,
+}
+
+/// The comptime forms of generic MIR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+pub enum MirComptimeForm {
+    /// [`TerminatorKind::ComptimeFor`].
+    ForHead,
+    /// [`TerminatorKind::ComptimeNext`].
+    ForNext,
+    /// [`ProjectionElem::ReflectedField`].
+    ReflectedField,
+}
+
+impl MirComptimeForm {
+    /// The form `kind` is, if it is one.
+    pub fn of_terminator(kind: &TerminatorKind) -> Option<MirComptimeForm> {
+        match kind {
+            TerminatorKind::ComptimeFor { .. } => Some(MirComptimeForm::ForHead),
+            TerminatorKind::ComptimeNext { .. } => Some(MirComptimeForm::ForNext),
+            _ => None,
+        }
+    }
+}
+
+impl ComptimeUnexpanded {
+    pub fn new(form: MirComptimeForm, pass: &'static str) -> Self {
+        ComptimeUnexpanded { form, pass }
+    }
+}
+
+impl std::fmt::Display for ComptimeUnexpanded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let form = match self.form {
+            MirComptimeForm::ForHead => "the head of a `for const` loop (`ComptimeFor`)",
+            MirComptimeForm::ForNext => "the end of a `for const` iteration (`ComptimeNext`)",
+            MirComptimeForm::ReflectedField => "a reflected field place `base.[f]`",
+        };
+        write!(
+            f,
+            "{form} reached {}, which does not handle it: only generic MIR has one, and \
+             monomorphization expands it",
+            self.pass
+        )
+    }
 }
 
 impl std::fmt::Debug for MirEvalError<'_> {
@@ -2354,6 +2687,7 @@ impl std::fmt::Debug for MirEvalError<'_> {
             Self::InFunction(e, stack) => {
                 f.debug_struct("WithStack").field("error", e).field("stack", &stack).finish()
             }
+            Self::ComptimeUnexpanded(it) => write!(f, "{it}"),
         }
     }
 }
@@ -2438,6 +2772,8 @@ pub enum MirLowerError<'db> {
     InaccessibleLocal,
     /// A call of a `#[rustc_intrinsic]` function whose name is none of rustc's intrinsics.
     UnknownIntrinsic(Symbol),
+    /// A comptime form only generic MIR holds, met by a pass that does not handle it.
+    ComptimeUnexpanded(ComptimeUnexpanded),
 
     // monomorphization errors:
     GenericArgNotProvided(GenericParamId, StoredGenericArgs),
@@ -2517,17 +2853,34 @@ pub struct MirOptions {
     /// rustc's `Inline::is_enabled`, which the level alone does not give: rustc inlines at
     /// mir-opt-level 2 only at `-Copt-level` 2 or 3, and not in an incremental build.
     pub inline: bool,
+    /// Whether no allocation of the program is observed: its global allocator is std's (no
+    /// `#[global_allocator]`, or one of `std::alloc::System`), so an allocation that never
+    /// leaves its function may live on the stack instead (`hir-ty-mir`'s `HeapToStack`).
+    /// rustc has no such setting; `core::alloc::GlobalAlloc` says whether an allocation
+    /// happens is not part of what a program does, and this keeps it so for an allocator the
+    /// program can read.
+    pub heap_to_stack: bool,
+    /// The whole program's dyn facts that `hir-ty-mir`'s `Devirtualize` turns calls through
+    /// a `dyn` into direct ones against ([`devirt::World`]). Only at Release with inlining,
+    /// and only where the code generator builds a body for one final binary whose every
+    /// instance it walked; `None` everywhere else, and in every body inlined into another.
+    pub world: Option<devirt::DevirtWorld>,
 }
 
 impl MirOptions {
     /// The interpreter's: no UB checks, markers as rustc keeps them without a code generator,
     /// nothing inlined (rustc's CTFE MIR is not, and the interpreter reads no [`Inlined`]).
+    /// Allocations go to the stack wherever the level optimizes: the interpreter runs no
+    /// `#[global_allocator]` a program could read, and every test that runs a program at each
+    /// level checks that this changes nothing it prints.
     pub fn at(level: MirOptLevel) -> MirOptions {
         MirOptions {
             level,
             ub_checks: false,
             lifetime_markers: level >= MirOptLevel::Release,
             inline: false,
+            heap_to_stack: level != MirOptLevel::Off,
+            world: None,
         }
     }
 
@@ -2693,9 +3046,17 @@ mod tests {
         for (level, lifetime_markers) in
             [(MirOptLevel::Off, false), (MirOptLevel::Debug, false), (MirOptLevel::Release, true)]
         {
+            let heap_to_stack = level != MirOptLevel::Off;
             assert_eq!(
                 MirOptions::at(level),
-                MirOptions { level, ub_checks: false, lifetime_markers, inline: false }
+                MirOptions {
+                    level,
+                    ub_checks: false,
+                    lifetime_markers,
+                    inline: false,
+                    heap_to_stack,
+                    world: None
+                }
             );
         }
     }
@@ -2732,7 +3093,7 @@ mod tests {
         assert_eq!(hash(&scoped), hash(&scoped.clone()));
     }
 
-    fn digest(map: &blaze_hash::HashMap<u32, Vec<u32>>) -> blaze_ids::ContentId {
+    fn digest(map: &blaze_hash::HashMap<u32, Vec<u32>, std::alloc::Global>) -> blaze_ids::ContentId {
         let mut hasher = blaze_ids::Hasher::new("hir-ty test");
         hash_by_key(map, |key| key, |raw| raw, &mut blaze_hash::Blake3Hasher(&mut hasher));
         hasher.finish()
@@ -2751,8 +3112,8 @@ mod tests {
     fn map(
         entries: impl IntoIterator<Item = (u32, Vec<u32>)>,
         capacity: usize,
-    ) -> blaze_hash::HashMap<u32, Vec<u32>> {
-        let mut map = blaze_hash::HashMap::with_capacity_and_hasher(capacity, Default::default());
+    ) -> blaze_hash::HashMap<u32, Vec<u32>, std::alloc::Global> {
+        let mut map = blaze_hash::HashMap::with_capacity_in(capacity, std::alloc::Global);
         map.extend(entries);
         map
     }

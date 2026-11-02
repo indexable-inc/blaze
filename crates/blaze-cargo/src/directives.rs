@@ -354,12 +354,10 @@ mod tests {
     use super::*;
 
     fn ran() -> Ran<'static> {
-        static DIRS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
-        let dirs = DIRS.get_or_init(|| vec!["/opt/vendor/lib".into()]);
         Ran {
             package_dir: Path::new("/src/pkg"),
             out_dir: Path::new("/t/debug/build/pkg/0123/out"),
-            link_dirs: dirs,
+            link_dirs: Vec::<PathBuf>::leak(vec!["/opt/vendor/lib".into()]), // alloc: a test's, leaked
         }
     }
 

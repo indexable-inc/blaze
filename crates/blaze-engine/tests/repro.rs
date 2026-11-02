@@ -406,6 +406,34 @@ fn a_struct_deriving_deserialize_reads_its_fields() {
     assert_eq!(case.ok(&["run"]), "3 -4 None\n");
 }
 
+/// blaze-serde-derive, the derive blaze's crates use in serde_derive's place, run on blaze's
+/// evaluator: its impls build and read a struct; a `#[serde]` attribute it does not read stops
+/// the build with an error naming the attribute, the item and the place, never with an impl
+/// that means something else.
+#[test]
+fn a_serde_attribute_blaze_serde_derive_lacks_is_an_error_naming_it() {
+    let case = Case::new("a_serde_attribute_blaze_serde_derive_lacks_is_an_error_naming_it");
+    let facade = Path::new(env!("CARGO_MANIFEST_DIR")).join("../blaze-serde");
+    case.write(
+        "Cargo.toml",
+        &format!(
+            "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n\
+             blaze-serde = {{ path = {:?} }}\n\n[workspace]\n",
+            facade.display().to_string()
+        ),
+    );
+    assert_eq!(case.ok(&["run"]), "3 -4 None\n");
+    case.write(
+        "src/main.rs",
+        "#[derive(blaze_serde::Serialize)]\n#[serde(rename = \"other\")]\nstruct Renamed {\n    a: u8,\n}\n\nfn main() {}\n",
+    );
+    let out = case.blaze_in("", &["build"]);
+    assert!(!out.ok, "a derive with an attribute it does not read built:\n{}", out.stderr);
+    let said = "`#[serde(rename = \"other\")]` on the container `Renamed` (";
+    assert!(out.stderr.contains(said), "the error does not name the attribute and item:\n{}", out.stderr);
+    assert!(out.stderr.contains("main.rs:2:"), "the error does not say where:\n{}", out.stderr);
+}
+
 /// `#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]` on a tuple struct with a const
 /// parameter (blaze-mem's `swiss::Ctrl`): the lint pass warned "unreachable pattern ... no value
 /// can reach this" at the derive, on code blaze itself wrote, and on llvm-sys's `include!`.
@@ -437,5 +465,37 @@ fn a_proc_macro_package_tests_build() {
     let said = format!("{}{}", out.stdout, out.stderr);
     for test in ["the_lib_test_runs", "the_macro_expands"] {
         assert!(said.contains(&format!("test {test} ... ok")), "`{test}` did not pass:\n{said}");
+    }
+}
+
+/// `#[blaze::contract_test]` (docs/v2/plan/lanes/contracts.md, part 2): a function whose
+/// `ensures` is wrong for one input gets a generated Hegel test that fails, naming the function
+/// and the clause, with the shrunk case as a test to paste; a contract that holds passes, and
+/// `skip` generates nothing. The crate's manifest names `vendor/hegeltest` by its absolute path,
+/// and blaze's own lock pins hegeltest's registry dependencies to the versions blaze builds.
+#[test]
+fn generated_test_finds_planted_bug() {
+    let case = Case::new("generated_test_finds_planted_bug");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    case.write(
+        "Cargo.toml",
+        &format!(
+            "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dev-dependencies]\n\
+             hegeltest = {{ path = {:?}, default-features = false, features = [\"static-engine\"] }}\n\n\
+             [profile.test]\ncontract-checks = false\n\n[workspace]\n",
+            root.join("vendor/hegeltest").display().to_string()
+        ),
+    );
+    case.write("Cargo.lock", &fs::read_to_string(root.join("Cargo.lock")).unwrap());
+    let out = case.blaze_in("", &["test"]);
+    let said = format!("{}{}", out.stdout, out.stderr);
+    assert!(!out.ok, "the planted bug was not found:\n{said}");
+    assert!(said.contains("test double_contract ... FAILED"), "`double`'s test did not fail:\n{said}");
+    assert!(said.contains("test count_contract ... ok"), "`count`'s test did not pass:\n{said}");
+    assert!(!said.contains("halve_contract"), "`skip` generated a test:\n{said}");
+    let named = "`#[blaze::contract_test]` on `double`: `ensures r > x` does not hold";
+    assert!(said.contains(named), "the failure does not name the function and clause:\n{said}");
+    for line in ["fn double_contract_case() {", "    let x: u32 = 0;", "    let r = double(x.clone());", "    assert!(r > x);"] {
+        assert!(said.contains(line), "the case to paste lacks `{line}`:\n{said}");
     }
 }

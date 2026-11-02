@@ -173,7 +173,10 @@ impl<'db> MirLowerCtx<'_, '_, 'db> {
                             Place::from(reference).project(ProjectionElem::Deref),
                             current,
                         ))),
-                        None => Ok(Some((self.binding_local(pat_id)?.into(), current))),
+                        None => match self.comptime_binding_value(pat_id, current, expr_id)? {
+                            Some(place) => Ok(Some((place, current))),
+                            None => Ok(Some((self.binding_local(pat_id)?.into(), current))),
+                        },
                     },
                     ValueNs::StaticId(s) => {
                         let ty = self.expr_ty_without_adjust(expr_id);
@@ -243,6 +246,9 @@ impl<'db> MirLowerCtx<'_, '_, 'db> {
                 };
                 self.push_field_projection(&mut r, expr_id)?;
                 Ok(Some((r, current)))
+            }
+            Expr::ReflectedField { base, field } => {
+                self.lower_reflected_field_as_place(current, expr_id, base, field)
             }
             Expr::Index { base, index } => {
                 let base_ty = self.expr_ty_after_adjustments(base);

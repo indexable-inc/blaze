@@ -52,8 +52,10 @@ fn expanded() -> &'static Expanded {
 fn expand() -> Result<Expanded, String> {
     let config = Corpus::read()?;
     let records = record::Records::default();
-    let workspace =
-        load::lower(&config.workspace, &config.cargo_home, |krate, macros| Ok(wrap(krate, macros, &records)))?;
+    let keeping = blaze_macro_eval::Macros::nothing("the corpus compares each expansion that runs, so none is kept");
+    let workspace = load::lower(&config.workspace, &config.cargo_home, config.homes(), &keeping, |krate, macros| {
+        Ok(wrap(krate, macros, &records))
+    })?;
     let calls = workspace.krate("corpus-calls")?;
     let panics = workspace.krate("corpus-panics")?;
     let db = workspace.lowered.db();

@@ -181,6 +181,9 @@ fn policy(arch: Arch) -> Policy {
         fold: false,
         sanitize: Sanitize::default(),
         pgo: Pgo::None,
+        proc_macro_bridge: false,
+        report: false,
+        heap_to_stack: false,
     }
 }
 

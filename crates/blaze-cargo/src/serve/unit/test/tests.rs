@@ -10,7 +10,7 @@ use blaze_cas::{Corrupt, Key, Mismatch, Ticket};
 use blaze_codegen::ExecTable;
 use blaze_core::Traced;
 use blaze_ids::{ContentId, rng::SplitMix64 as Rng};
-use blaze_testsel::{Basis, Bound, Cached, Choice, FnId, Ran, Record, Selector, Subject, Why};
+use blaze_testsel::{Basis, Bound, Cached, Choice, FnId, Ran, Reached, Record, Selector, Subject, Why};
 use blaze_usercode::{
     test::{Attrs, Executed, Lines, Passes, Trace},
     trace::{self, Inputs, Seen},
@@ -224,7 +224,8 @@ fn exec_table(versions: [u32; 3]) -> ExecTable {
     let slot_fn = vec![at(0), at(2)];
     let mut reached = vec![at(0), at(1), at(2)];
     reached.sort_unstable();
-    ExecTable { fns, slot_fn, beside: ContentId::default(), tests: vec![("t".to_owned(), reached)] }
+    let (graph, roots) = blaze_codegen::exec::TestGraph::listing(3, &[reached]);
+    ExecTable { fns, slot_fn, beside: ContentId::default(), tests: vec![("t".to_owned(), roots[0])], graph }
 }
 
 /// A fork server's record is selection's: whole when its hits are strictly increasing and in
@@ -297,7 +298,8 @@ fn choose(selector: &mut Selector, store: &Mem, subject: &Subject<'_>) -> Choice
 fn a_pass_stands_until_what_it_executed_changes() {
     let attrs = Attrs::default();
     let table = exec_table([0, 0, 0]);
-    let subject = Subject { name: "t", attrs: &attrs, outside: false, reached: &table.tests[0].1 };
+    let reached = table.reached(0);
+    let subject = Subject { name: "t", attrs: &attrs, outside: false, reached: Reached::Known(&reached) };
     let traced = Traced::default();
     let given = ContentId::of("blaze v2 cargo test given 1", b"suite");
 

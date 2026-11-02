@@ -51,11 +51,13 @@
 //! No fallback: a fetch that can't be answered (no connection, the server hung up, a malformed
 //! or too-long frame) completes [`Done::Failed`] naming what went wrong, for the store to see.
 
-use std::collections::{VecDeque, hash_map};
+use std::collections::VecDeque;
+use blaze_hash::hash_map;
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, IoError, RECV_MOST, Tag, Tags};
 use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_hash::{ByHashSet, HashMap};
+use std::alloc::Global;
 use blaze_ids::{ContentId, fuse::Fuse8, radix};
 
 use crate::{Asked, ByHash, Corrupt, Entry, Key, Kind, Remote, Store};
@@ -381,7 +383,7 @@ pub struct Client {
     out: Vec<u8>,
     /// The fetch of each key asked on this connection and not yet answered (answers come in
     /// any order), and whether a filter said the server may hold it.
-    waiting: ByHash<Key, (Tag, bool)>,
+    waiting: ByHash<Key, (Tag, bool), Global>, // alloc: a connection's or server's state, for its life
     /// Fetches of a key already waiting, not asked again: each gets a copy of its answer.
     again: Vec<(Key, Tag)>,
     /// Connects given up while in flight: a connection one of them makes is hung up.
@@ -428,7 +430,7 @@ impl Client {
             link: Link::Down,
             // alloc: empty, allocates nothing; once per client, setup.
             out: Vec::new(),
-            waiting: ByHash::default(),
+            waiting: ByHash::new_in(Global), // alloc: a connection's or server's state, for its life
             // alloc: empty, allocates nothing; once per client, setup.
             again: Vec::new(),
             // alloc: empty, allocates nothing; once per client, setup.
@@ -763,9 +765,9 @@ pub struct Server {
     closing: Vec<Tag>,
     failed: Option<IoError>,
     /// Sorted by connection once, where [`Server::stop`] hangs them up.
-    peers: HashMap<Conn, Peer>,
+    peers: HashMap<Conn, Peer, Global>, // alloc: a connection's or server's state, for its life
     /// The connection of each send and receive in flight.
-    ops: HashMap<Tag, Conn>,
+    ops: HashMap<Tag, Conn, Global>, // alloc: a connection's or server's state, for its life
     /// The frames of the filter of its store a peer is sent when it connects: a full one, then
     /// the deltas since. Empty until the first peer.
     filters: Vec<Vec<u8>>,
@@ -775,7 +777,7 @@ pub struct Server {
     delta_keys: usize,
     /// Keys a filter sent holds while they were readable and not yet packed: their packing,
     /// which [`Store::new_keys`] lists, sends them no second time.
-    announced: ByHashSet<Key>,
+    announced: ByHashSet<Key, Global>, // alloc: a connection's or server's state, for its life
 }
 
 #[derive(Default)]
@@ -817,13 +819,13 @@ impl Server {
             // alloc: empty, allocates nothing; once per server, setup.
             closing: Vec::new(),
             failed: None,
-            peers: HashMap::default(),
-            ops: HashMap::default(),
+            peers: HashMap::new_in(Global), // alloc: a connection's or server's state, for its life
+            ops: HashMap::new_in(Global), // alloc: a connection's or server's state, for its life
             // alloc: empty, allocates nothing; once per server, setup.
             filters: Vec::new(),
             full_keys: 0,
             delta_keys: 0,
-            announced: ByHashSet::default(),
+            announced: ByHashSet::new_in(Global), // alloc: a connection's or server's state, for its life
         })
     }
 
@@ -2207,7 +2209,11 @@ mod tests {
     /// between the two holds it, and its packing sends it no second time.
     #[test]
     fn a_put_not_yet_packed_is_in_the_next_delta() {
-        let (mut sim, mut store) = opened(Sim::new(11, Faults::default()), &[]);
+        // Four keys first: a full filter of none is rebuilt whole on the first new key
+        // (`Server::refresh`'s `4 * delta_keys > full_keys`), which sends no delta.
+        let held: &[(&str, Kind, &[u8])] =
+            &[("s1", Kind::Code, b"1"), ("s2", Kind::Code, b"2"), ("s3", Kind::Code, b"3"), ("s4", Kind::Code, b"4")];
+        let (mut sim, mut store) = opened(Sim::new(11, Faults::default()), held);
         let mut net = Net::new(usize::MAX);
         net.server.refresh(&mut store, &mut net.effects[S]);
         net.fetch("a probe", 0);

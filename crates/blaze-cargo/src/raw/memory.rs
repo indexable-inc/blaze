@@ -1,7 +1,7 @@
-//! Memory: what a process holds and the machine has on macOS, the allocator's purge, and,
-//! under `heap-profile`, jemalloc's controls that its safe API (`tikv_jemalloc_ctl`'s
-//! `Access`) does not reach: a purge, which takes no value, and a profile dump, whose safe
-//! form takes only a `&'static` path (one leaked per dump).
+//! Memory: what a process holds (macOS and Linux) and the machine has (macOS), the
+//! allocator's purge, and, under `heap-profile`, jemalloc's controls that its safe API
+//! (`tikv_jemalloc_ctl`'s `Access`) does not reach: a purge, which takes no value, and a
+//! profile dump, whose safe form takes only a `&'static` path (one leaked per dump).
 
 /// Bytes of memory a process of this user owns: its physical footprint, which is what
 /// Activity Monitor shows, and which still counts pages macOS has compressed.
@@ -18,6 +18,21 @@ pub fn footprint(pid: u32) -> Option<u64> {
     // SAFETY: the record is integers alone, for which the zeros `info` began as are a value,
     // and the call wrote another over them.
     Some(unsafe { info.assume_init() }.ri_phys_footprint)
+}
+
+/// Bytes of memory a process holds on Linux: its resident set, `VmRSS` in
+/// `/proc/<pid>/status`, which (unlike macOS's footprint) leaves out pages swapped out.
+#[cfg(target_os = "linux")]
+pub fn footprint(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?; // alloc: one read per plot
+    resident(&status)
+}
+
+/// The `VmRSS` line of a `/proc/<pid>/status`, in bytes.
+#[cfg(any(target_os = "linux", test))]
+fn resident(status: &str) -> Option<u64> {
+    let kib = status.lines().find_map(|it| it.strip_prefix("VmRSS:"))?.trim().strip_suffix("kB")?;
+    kib.trim().parse::<u64>().ok()?.checked_mul(1024)
 }
 
 /// Bytes of memory the machine has.
@@ -87,6 +102,19 @@ pub fn dump_heap_profile(path: &std::ffi::CStr) -> tikv_jemalloc_ctl::Result<()>
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_process_holds_some() {
+        assert!(super::footprint(std::process::id()).is_some_and(|it| it > 0));
+    }
+
+    #[test]
+    fn the_resident_set_is_read_from_its_line_in_kib() {
+        let status = "Name:\tblaze\nVmPeak:\t  9000 kB\nVmRSS:\t   1234 kB\nThreads:\t4\n";
+        assert_eq!(super::resident(status), Some(1234 * 1024));
+        assert_eq!(super::resident("Name:\tkthreadd\nThreads:\t1\n"), None);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn this_process_and_the_machine_hold_some() {

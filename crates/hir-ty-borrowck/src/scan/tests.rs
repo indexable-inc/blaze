@@ -6,6 +6,7 @@ pub(crate) mod db;
 
 use base_db::all_crates;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir_def::{
     DefWithBodyId, HasModule as _, ModuleDefId,
     expr_store::ExpressionStore,
@@ -23,8 +24,8 @@ use crate::regions::{Annotation, spells_generics};
 
 use self::db::TestDB;
 
-fn matched(store: &ExpressionStore, infer: &InferenceResult<'_>) -> HashSet<ExprId> {
-    let mut found = HashSet::default();
+fn matched(store: &ExpressionStore, infer: &InferenceResult<'_>) -> HashSet<ExprId, Global> {
+    let mut found = HashSet::new_in(Global);
     for (expr, it) in store.exprs() {
         if let Expr::Match { expr: scrutinee, arms } = it
             && (arms.is_empty() || arms.iter().any(|arm| !irrefutable(store, infer, arm.pat)))
@@ -36,8 +37,8 @@ fn matched(store: &ExpressionStore, infer: &InferenceResult<'_>) -> HashSet<Expr
     found
 }
 
-fn tested_at(store: &ExpressionStore) -> HashMap<PatId, ExprId> {
-    let mut found = HashMap::default();
+fn tested_at(store: &ExpressionStore) -> HashMap<PatId, ExprId, Global> {
+    let mut found = HashMap::new_in(Global);
     for (_, it) in store.exprs() {
         if let Expr::Match { expr: scrutinee, arms } = it {
             for arm in arms.iter() {
@@ -50,8 +51,8 @@ fn tested_at(store: &ExpressionStore) -> HashMap<PatId, ExprId> {
     found
 }
 
-fn union_literals(store: &ExpressionStore) -> HashSet<ExprId> {
-    let mut found = HashSet::default();
+fn union_literals(store: &ExpressionStore) -> HashSet<ExprId, Global> {
+    let mut found = HashSet::new_in(Global);
     for (expr, it) in store.exprs() {
         if let Expr::RecordLit { fields, .. } = it {
             found.insert(expr);
@@ -62,15 +63,15 @@ fn union_literals(store: &ExpressionStore) -> HashSet<ExprId> {
 }
 
 type Guarded = (
-    HashMap<PatId, usize>,
-    HashMap<PatId, (usize, Option<usize>)>,
+    HashMap<PatId, usize, Global>,
+    HashMap<PatId, (usize, Option<usize>), Global>,
     Vec<Vec<(usize, ExprId)>>,
 );
 
 /// The part of `guard_borrows` that read the store.
 fn guarded(store: &ExpressionStore) -> Guarded {
-    let mut tested_by = HashMap::default();
-    let mut bound_by = HashMap::default();
+    let mut tested_by = HashMap::new_in(Global);
+    let mut bound_by = HashMap::new_in(Global);
     let mut matches = Vec::new();
     let mut arms_of = 0;
     for (_, expr) in store.exprs() {
@@ -96,8 +97,8 @@ fn guarded(store: &ExpressionStore) -> Guarded {
     (tested_by, bound_by, matches)
 }
 
-fn scrutinees(store: &ExpressionStore) -> HashMap<BindingId, Option<ExprId>> {
-    let mut map = HashMap::default();
+fn scrutinees(store: &ExpressionStore) -> HashMap<BindingId, Option<ExprId>, Global> {
+    let mut map = HashMap::new_in(Global);
     let mut add = |pat, scrutinee: ExprId, is_let: bool| {
         let simple = is_let && matches!(store.pat(pat), Pat::Bind { subpat: None, .. });
         store.walk_bindings_in_pat(pat, |binding| {
@@ -125,8 +126,8 @@ fn scrutinees(store: &ExpressionStore) -> HashMap<BindingId, Option<ExprId>> {
     map
 }
 
-fn guard_bindings(store: &ExpressionStore) -> HashMap<ExprId, Vec<BindingId>> {
-    let mut out: HashMap<ExprId, Vec<BindingId>> = HashMap::default();
+fn guard_bindings(store: &ExpressionStore) -> HashMap<ExprId, Vec<BindingId>, Global> {
+    let mut out: HashMap<ExprId, Vec<BindingId>, Global> = HashMap::new_in(Global);
     for (_, expr) in store.exprs() {
         let Expr::Match { arms, .. } = expr else { continue };
         for arm in arms.iter() {
@@ -150,11 +151,11 @@ fn statement_values<'db>(
     store: &ExpressionStore,
     infer: &InferenceResult<'db>,
     interner: DbInterner<'db>,
-) -> HashMap<ExprId, Option<Ty<'db>>> {
+) -> HashMap<ExprId, Option<Ty<'db>>, Global> {
     let erased = |ty: Ty<'db>| {
         rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_erased(interner))
     };
-    let mut found = HashMap::default();
+    let mut found = HashMap::new_in(Global);
     for (_, expr) in store.exprs() {
         let Expr::Block { statements, .. } = expr else { continue };
         for statement in statements.iter() {
@@ -228,7 +229,7 @@ fn spelled_patterns(store: &ExpressionStore) -> Vec<(PatId, Option<ExprId>)> {
 /// The paths `path_arguments` reads, with the closure each is the closure's of, by the parent
 /// map it built.
 fn spelled_paths(store: &ExpressionStore) -> Vec<(ExprId, Option<ExprId>)> {
-    let mut parent = HashMap::default();
+    let mut parent = HashMap::new_in(Global);
     for expr in store.expr_ids() {
         store.walk_child_exprs(expr, |child| {
             parent.insert(child, expr);
@@ -271,7 +272,7 @@ struct Seen {
 
 fn same<K: Eq + std::hash::Hash, V: PartialEq, W>(
     got: &crate::mem::FMap<'_, K, V>,
-    want: &HashMap<K, W>,
+    want: &HashMap<K, W, Global>,
     eq: impl Fn(&V, &W) -> bool,
 ) -> bool {
     got.len() == want.len() && want.iter().all(|(k, w)| got.get(k).is_some_and(|v| eq(v, w)))
@@ -289,18 +290,18 @@ fn check_in(frame: &crate::mem::Frame, db: &TestDB, def: DefWithBodyId, seen: &m
     let scan = Scan::new(frame, store, infer, interner);
 
     let want = matched(store, infer);
-    let got: HashSet<ExprId> = store.expr_ids().filter(|&it| scan.is_matched(it)).collect();
+    let got: HashSet<ExprId, Global> = store.expr_ids().filter(|&it| scan.is_matched(it)).collect();
     assert_eq!(got, want, "{def:?}: matched");
     seen.matched += want.len();
 
     let want = tested_at(store);
-    let got: HashMap<PatId, ExprId> =
+    let got: HashMap<PatId, ExprId, Global> =
         store.pat_ids().filter_map(|pat| Some((pat, scan.tested_at(pat)?))).collect();
     assert_eq!(got, want, "{def:?}: tested_at");
     seen.tested_at += want.len();
 
     let want = union_literals(store);
-    let got: HashSet<ExprId> =
+    let got: HashSet<ExprId, Global> =
         store.expr_ids().filter(|&it| scan.is_union_literal(it)).collect();
     assert_eq!(got, want, "{def:?}: union_literals");
     seen.union_literals += want.len();

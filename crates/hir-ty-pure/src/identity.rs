@@ -6,6 +6,7 @@
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_item_hash::identity::identity;
 use blaze_items::{ItemId, item_key};
@@ -23,7 +24,7 @@ use hir_ty::{
     },
     traits::StoredParamEnvAndCrate,
 };
-use hir_ty_mir::mir::{MirBody, Operand, OperandKind};
+use hir_ty_mir::mir::{MirBody, Operand, OperandKind, dispatch::Body};
 use hir_ty_share::identity as share;
 
 use crate::{
@@ -44,7 +45,7 @@ pub(crate) fn of(
     env: &StoredParamEnvAndCrate,
     order: &[Instance],
     callees: &[&[Instance]],
-    index: &HashMap<Instance, u32>,
+    index: &HashMap<Instance, u32, Global>,
 ) -> Result<ContentId, String> {
     let mut h = Hasher::new(DOMAIN);
     h.update(&(order.len() as u32).to_le_bytes());
@@ -62,28 +63,33 @@ pub(crate) fn of(
     Ok(h.finish())
 }
 
-/// What the code of `instance` in `env` is: its body's identity, its arguments' identity, and
-/// the facts its monomorphized body reads past its body's identity: each local's type, and
-/// each constant's and static's value.
+/// What the code of `instance` is: its body's identity, its arguments' identity, and the facts
+/// its monomorphized body reads past its body's identity: each local's type, and each
+/// constant's and static's value. Asked from `env`, worked out in its home (`crate::home`).
+pub(crate) fn content(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> &Result<ContentId, String> {
+    content_in(db, crate::home::env_of(db, &env, &instance), instance)
+}
+
+/// [`content`] in `env`, the instance's home.
 #[blaze_query::tracked(returns(ref))]
-pub(crate) fn content(
+pub(crate) fn content_in(
     db: &Db,
     env: StoredParamEnvAndCrate,
     instance: Instance,
 ) -> Result<ContentId, String> {
     let mut h = Hasher::new(INSTANCE_DOMAIN);
     match instance.def {
-        Def::Fn(func) => {
+        Def::Body(Body::Fn(func)) => {
             h.update(&[1]).id(&body(db, func.into())?);
         }
-        Def::Closure(id) => {
+        Def::Body(Body::Closure(id)) => {
             let loc = InternedClosureId::from_id(id).loc(db);
             h.update(&[2]);
             closure(db, &mut h, loc)?;
         }
-        Def::Coroutine(id) | Def::CoroutineByMove(id) => {
+        Def::Body(Body::Coroutine(id) | Body::CoroutineByMove(id)) => {
             let loc = InternedCoroutineId::from_id(id).loc(db);
-            h.update(&[if matches!(instance.def, Def::Coroutine(_)) { 3 } else { 4 }]);
+            h.update(&[if matches!(instance.def, Def::Body(Body::Coroutine(_))) { 3 } else { 4 }]);
             closure(db, &mut h, loc)?;
         }
         Def::Leaf(func, leaf) => {
@@ -107,8 +113,8 @@ pub(crate) fn content(
         infcx,
         env,
         h,
-        tys: HashSet::default(),
-        statics: HashSet::default(),
+        tys: HashSet::new_in(Global),
+        statics: HashSet::new_in(Global),
     };
     facts.body(body)?;
     Ok(facts.h.finish())
@@ -137,8 +143,8 @@ struct Facts<'db> {
     infcx: InferCtxt<'db>,
     env: ParamEnvAndCrate<'db>,
     h: Hasher,
-    tys: HashSet<Ty<'db>>,
-    statics: HashSet<StaticId>,
+    tys: HashSet<Ty<'db>, Global>,
+    statics: HashSet<StaticId, Global>,
 }
 
 impl<'db> Facts<'db> {

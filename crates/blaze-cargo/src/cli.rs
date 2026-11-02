@@ -16,18 +16,26 @@
 //! - [`replace`]: `check --replace`, a path moved through the front end's name resolution.
 //! - [`baselines`]: `check --baselines`, a run's lint counts held to the checked-in ones.
 //! - [`fix`]: `check --fix`, the check's machine-applicable suggestions made and checked.
+//! - [`clean`]: `clean`, a workspace's build directory under blaze's root removed; `--list`
+//!   and `--all`, every workspace's.
+//! - [`cache`]: `cache gc`, one run of the collector of what blaze keeps on disk.
 
 #![forbid(unsafe_code)]
 
 pub mod args;
 pub mod baselines;
+pub mod cache;
+pub mod clean;
 pub mod daemon;
 pub mod doc;
 pub mod fix;
 pub mod inspect;
 pub mod json;
+pub mod live;
 pub mod observe;
 pub mod place;
+pub mod perf;
+pub mod pprof;
 pub mod print;
 pub mod replace;
 pub mod run;
@@ -72,6 +80,10 @@ Commands:
     test, t     Run the tests
     bench       Run the benchmarks
     doc, d      Build a package's documentation, from blaze's front end: no rustdoc runs
+    clean       Remove the workspace's build directory (under blaze's root, never in the checkout);
+                `--list` every workspace's with its size, `--all` removes them all
+    cache gc    Collect what blaze keeps on disk now (`--dry-run` removes nothing, `--last`
+                prints the daemon's last runs)
     serve       Run the daemon the other commands are clients of
     stop        Make the daemon's state durable and stop it
     status      What the daemon is doing
@@ -86,6 +98,9 @@ Commands:
     debug live                     The daemon's threads as they run
     debug sql [--live] QUERY       SQL over the profile history (with `--live`, the flight recorder too)
     explain VIEW [NAME=VALUE ...]  One of the history's named views
+    why [ITEM] [--all] [--json]    What the last build computed again instead of reusing, and why
+    pprof FILE|URL [top|peek|tree|list|flame|diff|export|--http]   Any program's profile (.ixprof or pprof), like `go tool pprof`
+    perf record|runs|diff          The performance history of programs blaze built: what changed between runs, and why
 
 Options:
     -V, --version  Print version info and exit
@@ -162,8 +177,8 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Unknown(name) => {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
-                 doc, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug \
-                 and explain"
+                 doc, clean, cache, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, \
+                 explain and why"
             );
             eprint!("{}", say::error(&what, auto_color()));
             FAILED
@@ -185,6 +200,11 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Explore(words) => observe::explore(words, auto_color()),
         Asked::Debug(words) => observe::debug(words, auto_color()),
         Asked::Explain(words) => observe::explain(words, auto_color()),
+        Asked::Why(words) => observe::why(words, auto_color()),
+        Asked::Pprof(words) => pprof::main(words, auto_color()),
+        Asked::Perf(words) => perf::main(words, auto_color()),
+        Asked::Clean(words) => clean::main(words, auto_color()),
+        Asked::Cache(words) => cache::main(words, auto_color()),
         Asked::Cargo(asked) => cargo(&asked),
     }
 }
@@ -302,6 +322,21 @@ fn cargo(asked: &Invocation) -> i32 {
     };
     let stats = std::env::var_os("BLAZE_STATS").is_some();
     let shown = Shown { format, quiet: asked.flags.quiet, verbose: asked.flags.verbose, color, stats };
+    // On a terminal, `test` draws its live view, whose screen thread writes stderr: the locks
+    // below are taken only off that path.
+    if live::wanted(asked, shown) {
+        let then = live::drive(&mut client, asked, &place, request, shown, started);
+        drop(client);
+        if blaze_profile::on() {
+            blaze_profile::note("client", blaze_profile::CLIENT, blaze_profile::began());
+            blaze_profile::finish();
+        }
+        return match then {
+            Ok(Then::Exit(code)) => code,
+            Ok(Then::Exec(_) | Then::Fix(_)) => refused("the live test view ended in neither an exit code nor an error", color),
+            Err(error) => refused(&error.to_string(), color),
+        };
+    }
     let (mut out, mut err) = (io::stdout().lock(), io::stderr().lock());
     let then = drive(&mut client, asked, &place, request, shown, started, &mut out, &mut err, &mut test::Spawned);
     drop(client);

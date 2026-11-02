@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use anyhow::anyhow;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_query::{Cancelled, Cx};
 use blaze_resolve::PackageId;
 use semver::Version;
@@ -27,7 +28,7 @@ struct Package {
 #[derive(Default)]
 struct Walk {
     packages: Vec<Package>,
-    visited: HashSet<String>,
+    visited: HashSet<String, Global>,
     errors: Vec<anyhow::Error>,
 }
 

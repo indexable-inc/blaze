@@ -128,7 +128,7 @@ impl<'a> LexedStr<'a> {
 
     /// [`LexedStr::lex`], with `HASH` each identifier's name hashed too.
     fn lex_with<const FAST: bool, const HASH: bool>(edition: Edition, text: &'a str) -> LexedStr<'a> {
-        let _p = tracing::info_span!("LexedStr::new").entered();
+        let _p = tracing::info_span!(target: "blaze", "LexedStr::new").entered();
         assert!(text.len() <= u32::MAX as usize, "a text of 4 GiB or more");
         let mut conv = Converter::new(edition, text);
         if HASH {

@@ -14,7 +14,7 @@ use blaze_codegen::{
     Backend,
     settings::{Panic, Spec},
 };
-use hir_ty_mir::mir::{MirOptLevel, MirOptions};
+use hir_ty_mir::mir::{MirOptLevel, MirOptions, devirt::DevirtWorld};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Build {
@@ -28,6 +28,16 @@ pub(crate) struct Build {
     /// The unit's bodies of crates other than the library's are MIR-inlined
     /// (`Spec::mir_inline`).
     pub(crate) inlines: bool,
+    /// The unit is a proc macro's wasm module's (`Spec::proc_macro_bridge`): a call of what
+    /// [`super::wasm::bridged`] names is the bridge's import.
+    pub(crate) bridged: bool,
+    /// The program observes no allocation (`Spec::heap_to_stack`): the bodies of crates other
+    /// than the library's move allocations that never leave their function to the stack.
+    pub(crate) heap_to_stack: bool,
+    /// The program's dyn facts, which a body at MIR level 2 with the inliner on is
+    /// devirtualized against ([`MirOptions::world`]): set only for a unit of a final binary
+    /// once the walk of the whole program is done (`super::devirt`), `None` in every walk.
+    pub(crate) world: Option<DevirtWorld>,
 }
 
 impl Build {
@@ -35,14 +45,30 @@ impl Build {
     /// a unit under which its IR asks for the most, so the walk lists what any unit asks for.
     /// Unwinding and debug assertions only add code; the passes of MIR level 2 that level 1
     /// lacks only remove it (`hir-ty-mir` `optimize`), all but the inliner, which
-    /// [`Self::WALK_INLINED`] walks for.
-    pub(crate) const WALK: Build =
-        Build { debug_assertions: true, aborts: false, optimized: false, inlines: false };
+    /// [`Self::WALK_INLINED`] walks for. Moving allocations to the stack only removes
+    /// references too (the allocation's calls, the box's free) but for the drop of a value
+    /// the box held, which the walk lists beside the drop of every box ([`super::refs`]).
+    pub(crate) const WALK: Build = Build {
+        debug_assertions: true,
+        aborts: false,
+        optimized: false,
+        inlines: false,
+        bridged: false,
+        heap_to_stack: false,
+        world: None,
+    };
 
     /// [`Self::WALK`] for an instance some unit of which MIR-inlines: the inlined body asks
     /// for what its callees' code does, which the body at level 1 calls instead.
-    pub(crate) const WALK_INLINED: Build =
-        Build { debug_assertions: true, aborts: false, optimized: true, inlines: true };
+    pub(crate) const WALK_INLINED: Build = Build {
+        debug_assertions: true,
+        aborts: false,
+        optimized: true,
+        inlines: true,
+        bridged: false,
+        heap_to_stack: false,
+        world: None,
+    };
 
     pub(crate) fn of(spec: &Spec) -> Self {
         Build {
@@ -54,6 +80,9 @@ impl Build {
             // it inlined (`super::refs::built_in`), so an edit of an inlined callee compiles its
             // callers again.
             inlines: spec.mir_inline,
+            bridged: spec.proc_macro_bridge,
+            heap_to_stack: spec.heap_to_stack,
+            world: None,
         }
     }
 
@@ -61,10 +90,14 @@ impl Build {
     /// rustc's rules: the library's crates' MIR at level 2 and inlined, as shipped, and every
     /// other at the unit's level, inlined where the unit inlines ([`Self::inlines`]); UB
     /// checks as `sess.ub_checks()` of the crate whose MIR it is, which for the compiling
-    /// crate is the unit's. The code generator always gives lifetimes.
+    /// crate is the unit's. The code generator always gives lifetimes. Allocations move to the
+    /// stack in every crate but the library's, whose bodies are one for every program.
     ///
     /// `hir-ty-mir`'s inliner gives a callee of another crate the options this gives it
-    /// (`inline.rs` `callee_options`): the two change together.
+    /// (`inline.rs` `callee_options`): the two change together. Neither moves an allocation
+    /// of a body built into another to the stack: the inliner's callees have
+    /// `heap_to_stack: false`, and a body this side builds into its caller is built under
+    /// [`Self::built_in`].
     pub(crate) fn options(self, db: &Db, written: Crate, compiling: Crate) -> MirOptions {
         let lang = written.data(db).origin.is_lang();
         let level = match self.optimized || lang {
@@ -76,7 +109,21 @@ impl Build {
             false => crate::debug_assertions(db, written),
         };
         let inline = lang || self.inlines;
-        MirOptions { level, ub_checks, lifetime_markers: true, inline }
+        let heap_to_stack = self.heap_to_stack && !lang;
+        // Devirtualized only where `hir-ty-mir` runs `Devirtualize` (level 2, inlined), and
+        // never in the library's bodies, which are one for every program.
+        let world = self.world.filter(|_| level == MirOptLevel::Release && inline && !lang);
+        MirOptions { level, ub_checks, lifetime_markers: true, inline, heap_to_stack, world }
+    }
+}
+
+impl Build {
+    /// These settings for a body built into the body of its caller (`always_inlinable`): no
+    /// allocation of it moves to the stack. Its stack slots would be the caller's, and
+    /// `HeapToStack` keeps a promoted slot out of every frame that may recur (`hir-ty-mir`'s
+    /// `optimize/escape.rs`), which it can only tell of the body it runs on.
+    pub(crate) fn built_in(self) -> Build {
+        Build { heap_to_stack: false, ..self }
     }
 }
 
@@ -112,8 +159,11 @@ mod tests {
 
     #[test]
     fn the_walks_differ_only_in_the_level_and_the_inliner() {
-        let Build { debug_assertions, aborts, optimized, inlines } = Build::WALK_INLINED;
+        let Build { debug_assertions, aborts, optimized, inlines, bridged, heap_to_stack, world } =
+            Build::WALK_INLINED;
         assert_eq!((debug_assertions, aborts), (Build::WALK.debug_assertions, Build::WALK.aborts));
+        assert_eq!((bridged, heap_to_stack), (Build::WALK.bridged, Build::WALK.heap_to_stack));
+        assert_eq!((world, Build::WALK.world), (None, None));
         assert!(optimized && inlines);
         assert!(!Build::WALK.optimized && !Build::WALK.inlines);
     }

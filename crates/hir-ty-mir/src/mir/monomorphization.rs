@@ -37,6 +37,8 @@ use crate::{
 
 use super::{MirBody, MirLowerError, Operand, OperandKind, Rvalue, StatementKind, TerminatorKind};
 
+mod comptime;
+
 /// `ty` with a top-level alias normalized in `env`, or `ty` itself where the solver can't
 /// normalize it. Almost no type asked of a place or a field is an alias, and one that isn't
 /// is given back as the solver would, without a fulfillment context made for it.
@@ -63,6 +65,10 @@ struct Filler<'db> {
     /// parameters, which instantiating again would take for the callee's: `F` of
     /// `goldschmidt::<F::ISet1>` in `sqrt_round<F>` would grow into `<F::ISet1 as ..>::ISet1`.
     instantiating: bool,
+    /// Set while the `for const` expansion makes one iteration's copy: the fold then only puts
+    /// the member in place of the loop's binder, neither instantiating nor normalizing, as the
+    /// copy may still name inner loops' binders ([`comptime`]).
+    replace: Option<(hir_ty::mir::ComptimeBinder, Ty<'db>)>,
 }
 
 impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
@@ -87,7 +93,10 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
             if !ty.has_type_flags(TypeFlags::HAS_PARAM) {
                 return Ok(ty);
             }
-            let TyKind::Param(param) = ty.kind() else { return ty.try_super_fold_with(self) };
+            // One guard per level of the type, which nests as deep as the program wrote it.
+            let TyKind::Param(param) = ty.kind() else {
+                return stdx::ensure_sufficient_stack(|| ty.try_super_fold_with(self));
+            };
             let arg = self.subst.as_slice().get(param.index as usize).and_then(|arg| arg.ty());
             return arg.ok_or_else(|| {
                 MirLowerError::GenericArgNotProvided(param.id.into(), self.subst.store())
@@ -121,8 +130,9 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                 ty
             }
             // An argument can be the `impl Future` of an `async fn`, which the body of the
-            // caller only knows by that name: an alias, normalized as the rest.
-            _ => ty.try_super_fold_with(self),
+            // caller only knows by that name: an alias, normalized as the rest. One guard per
+            // level, as above.
+            _ => stdx::ensure_sufficient_stack(|| ty.try_super_fold_with(self)),
         }
     }
 
@@ -198,8 +208,19 @@ impl<'db> Filler<'db> {
     fn new(db: &'db Db, env: ParamEnvAndCrate<'db>, subst: GenericArgs<'db>) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        // A caller's environment can assume things of a `for const` binder its arguments name
+        // (a call the optimizer inlines in a loop's body).
+        hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
         // alloc: none until a binder is entered; the solver's replacer takes a `&mut Vec`
-        Self { infcx, trait_env: env, subst, universes: Vec::new(), depth: 0, instantiating: false }
+        Self {
+            infcx,
+            trait_env: env,
+            subst,
+            universes: Vec::new(),
+            depth: 0,
+            instantiating: false,
+            replace: None,
+        }
     }
 
     /// The `impl Trait` a trait method returns is the one of the impl's method once the
@@ -249,6 +270,10 @@ impl<'db> Filler<'db> {
     where
         T: TypeFoldable<DbInterner<'db>> + TypeVisitableExt<DbInterner<'db>> + std::fmt::Debug,
     {
+        if let Some((binder, member)) = self.replace {
+            let interner = self.infcx.interner;
+            return Ok(t.fold_with(&mut comptime::ReplaceBinder { interner, binder, member }));
+        }
         // An alias rigid where the body was checked may normalize once its parameters are
         // filled in `PostAnalysis`, as rustc's `post_analysis_normalize` resets them.
         self.instantiating = true;
@@ -314,113 +339,135 @@ impl<'db> Filler<'db> {
         for callee in &mut body.inlined.callees {
             self.fill_args(&mut callee.args)?;
         }
+        for call in &mut body.inlined.specialized {
+            self.fill_args(&mut call.args)?;
+        }
         for (_, bb) in body.basic_blocks.iter_mut() {
-            for statement in &mut bb.statements {
-                match &mut statement.kind {
-                    StatementKind::Assign(_, r) => match r {
-                        Rvalue::Aggregate(ak, ops) => {
-                            for op in &mut **ops {
-                                self.fill_operand(op)?;
-                            }
-                            match ak {
-                                super::AggregateKind::Array(ty)
-                                | super::AggregateKind::Tuple(ty)
-                                | super::AggregateKind::Closure(ty) => self.fill_ty(ty)?,
-                                super::AggregateKind::Adt(_, subst) => self.fill_args(subst)?,
-                                super::AggregateKind::Union(_, _) => (),
-                            }
-                        }
-                        Rvalue::Use(op) => {
+            self.fill_block(bb)?;
+        }
+        Ok(())
+    }
+
+    /// The types, constants and argument lists of one block's statements and terminator.
+    fn fill_block(&mut self, bb: &mut super::BasicBlock) -> Result<(), MirLowerError<'db>> {
+        for statement in &mut bb.statements {
+            match &mut statement.kind {
+                StatementKind::Assign(_, r) => match r {
+                    Rvalue::Aggregate(ak, ops) => {
+                        for op in &mut **ops {
                             self.fill_operand(op)?;
                         }
-                        Rvalue::Repeat(op, len) => {
-                            self.fill_operand(op)?;
-                            self.fill_const(len)?;
-                        }
-                        Rvalue::Cast(_, op, ty) => {
-                            self.fill_operand(op)?;
-                            self.fill_ty(ty)?;
-                        }
-                        Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
-                            self.fill_operand(lhs)?;
-                            self.fill_operand(rhs)?;
-                        }
-                        Rvalue::UnaryOp(_, op) => {
-                            self.fill_operand(op)?;
-                        }
-                        Rvalue::Ref(_, _)
-                        | Rvalue::Len(_)
-                        | Rvalue::Discriminant(_)
-                        | Rvalue::CopyForDeref(_) => (),
-                        Rvalue::BinaryOp(_, lhs, rhs) => {
-                            self.fill_operand(lhs)?;
-                            self.fill_operand(rhs)?;
-                        }
-                        Rvalue::ThreadLocalRef(n) | Rvalue::AddressOf(n) | Rvalue::NullaryOp(n) => {
-                            match *n {}
-                        }
-                    },
-                    StatementKind::InlineAsm(asm) => {
-                        for operand in &mut asm.operands {
-                            match operand {
-                                super::AsmOperand::Reg { input: Some(value), .. }
-                                | super::AsmOperand::Const(value)
-                                | super::AsmOperand::Sym(value) => self.fill_operand(value)?,
-                                super::AsmOperand::Reg { input: None, .. }
-                                | super::AsmOperand::Label => (),
-                            }
+                        match ak {
+                            super::AggregateKind::Array(ty)
+                            | super::AggregateKind::Tuple(ty)
+                            | super::AggregateKind::Closure(ty) => self.fill_ty(ty)?,
+                            super::AggregateKind::Adt(_, subst) => self.fill_args(subst)?,
+                            super::AggregateKind::Union(_, _) => (),
                         }
                     }
-                    StatementKind::Deinit(_)
-                    | StatementKind::FakeRead(_)
-                    | StatementKind::StorageLive(_)
-                    | StatementKind::StorageDead(_)
-                    | StatementKind::Nop => (),
+                    Rvalue::Use(op) => {
+                        self.fill_operand(op)?;
+                    }
+                    Rvalue::Repeat(op, len) => {
+                        self.fill_operand(op)?;
+                        self.fill_const(len)?;
+                    }
+                    Rvalue::Cast(_, op, ty) => {
+                        self.fill_operand(op)?;
+                        self.fill_ty(ty)?;
+                    }
+                    Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+                        self.fill_operand(lhs)?;
+                        self.fill_operand(rhs)?;
+                    }
+                    Rvalue::UnaryOp(_, op) => {
+                        self.fill_operand(op)?;
+                    }
+                    Rvalue::Ref(_, _)
+                    | Rvalue::Len(_)
+                    | Rvalue::Discriminant(_)
+                    | Rvalue::CopyForDeref(_) => (),
+                    Rvalue::BinaryOp(_, lhs, rhs) => {
+                        self.fill_operand(lhs)?;
+                        self.fill_operand(rhs)?;
+                    }
+                    Rvalue::ThreadLocalRef(n) | Rvalue::AddressOf(n) | Rvalue::NullaryOp(n) => {
+                        match *n {}
+                    }
+                },
+                StatementKind::InlineAsm(asm) => {
+                    for operand in &mut asm.operands {
+                        match operand {
+                            super::AsmOperand::Reg { input: Some(value), .. }
+                            | super::AsmOperand::Const(value)
+                            | super::AsmOperand::Sym(value) => self.fill_operand(value)?,
+                            super::AsmOperand::Reg { input: None, .. }
+                            | super::AsmOperand::Label => (),
+                        }
+                    }
                 }
+                StatementKind::Deinit(_)
+                | StatementKind::FakeRead(_)
+                | StatementKind::StorageLive(_)
+                | StatementKind::StorageDead(_)
+                | StatementKind::Nop => (),
             }
-            if let Some(terminator) = &mut bb.terminator {
-                match &mut terminator.kind {
-                    TerminatorKind::Call { func, args, .. }
-                    | TerminatorKind::TailCall { func, args, .. } => {
-                        self.fill_operand(func)?;
-                        for op in &mut **args {
-                            self.fill_operand(op)?;
+        }
+        if let Some(terminator) = &mut bb.terminator {
+            match &mut terminator.kind {
+                TerminatorKind::Call { func, args, .. }
+                | TerminatorKind::TailCall { func, args, .. } => {
+                    self.fill_operand(func)?;
+                    for op in &mut **args {
+                        self.fill_operand(op)?;
+                    }
+                }
+                TerminatorKind::SwitchInt { discr, .. } => {
+                    self.fill_operand(discr)?;
+                }
+                TerminatorKind::Assert { cond, msg, .. } => {
+                    self.fill_operand(cond)?;
+                    match msg {
+                        super::AssertKind::BoundsCheck { len: a, index: b }
+                        | super::AssertKind::Overflow(_, a, b)
+                        | super::AssertKind::MisalignedPointerDereference {
+                            required: a,
+                            found: b,
+                        } => {
+                            self.fill_operand(a)?;
+                            self.fill_operand(b)?;
                         }
+                        super::AssertKind::OverflowNeg(a)
+                        | super::AssertKind::DivisionByZero(a)
+                        | super::AssertKind::RemainderByZero(a)
+                        | super::AssertKind::InvalidEnumConstruction(a) => self.fill_operand(a)?,
+                        super::AssertKind::NullPointerDereference
+                        | super::AssertKind::NullReferenceConstructed => (),
                     }
-                    TerminatorKind::SwitchInt { discr, .. } => {
-                        self.fill_operand(discr)?;
-                    }
-                    TerminatorKind::Assert { cond, msg, .. } => {
-                        self.fill_operand(cond)?;
-                        match msg {
-                            super::AssertKind::BoundsCheck { len: a, index: b }
-                            | super::AssertKind::Overflow(_, a, b)
-                            | super::AssertKind::MisalignedPointerDereference {
-                                required: a,
-                                found: b,
-                            } => {
-                                self.fill_operand(a)?;
-                                self.fill_operand(b)?;
-                            }
-                            super::AssertKind::OverflowNeg(a)
-                            | super::AssertKind::DivisionByZero(a)
-                            | super::AssertKind::RemainderByZero(a)
-                            | super::AssertKind::InvalidEnumConstruction(a) => self.fill_operand(a)?,
-                            super::AssertKind::NullPointerDereference
-                            | super::AssertKind::NullReferenceConstructed => (),
-                        }
-                    }
-                    TerminatorKind::Goto { .. }
-                    | TerminatorKind::UnwindResume
-                    | TerminatorKind::Abort
-                    | TerminatorKind::Return
-                    | TerminatorKind::Unreachable
-                    | TerminatorKind::Drop { .. }
-                    | TerminatorKind::DropAndReplace { .. }
-                    | TerminatorKind::Yield { .. }
-                    | TerminatorKind::CoroutineDrop
-                    | TerminatorKind::FalseEdge { .. }
-                    | TerminatorKind::FalseUnwind { .. } => (),
+                }
+                TerminatorKind::Goto { .. }
+                | TerminatorKind::UnwindResume
+                | TerminatorKind::Abort
+                | TerminatorKind::Return
+                | TerminatorKind::Unreachable
+                | TerminatorKind::Drop { .. }
+                | TerminatorKind::DropAndReplace { .. }
+                | TerminatorKind::Yield { .. }
+                | TerminatorKind::CoroutineDrop
+                | TerminatorKind::FalseEdge { .. }
+                | TerminatorKind::FalseUnwind { .. } => (),
+                // A copy the expansion makes still has its inner loops, whose domain may name
+                // the binder it replaces; the fill itself runs after the expansion left none.
+                TerminatorKind::ComptimeFor { domain, .. } if self.replace.is_some() => {
+                    self.fill_ty(domain)?;
+                }
+                TerminatorKind::ComptimeNext { .. } if self.replace.is_some() => (),
+                TerminatorKind::ComptimeFor { .. } | TerminatorKind::ComptimeNext { .. } => {
+                    return Err(MirLowerError::ComptimeUnexpanded(hir_ty::mir::ComptimeUnexpanded::new(
+                        hir_ty::mir::MirComptimeForm::of_terminator(&terminator.kind)
+                            .expect("a comptime terminator"),
+                        "monomorphization's fill",
+                    )));
                 }
             }
         }
@@ -439,7 +486,18 @@ pub fn monomorphized<'db>(
     let mut filler = Filler::new(db, trait_env.as_ref(db), subst.as_ref());
     // clone: the copy the query keeps; the fold changes it in place
     let mut body = body.clone();
+    // A `const { .. }` inside `for const` loops names their binders, which its arguments give
+    // past the item's: their members go in first, as the parameters' do in the fill.
+    comptime::bind_inline_const(db, &mut filler, &mut body)?;
+    // `for const` loops first: the fill can't normalize what names a binder.
+    let had_loop = body.has_comptime_loop();
+    comptime::expand(&mut filler, &mut body)?;
     filler.fill_body(&mut body)?;
+    if had_loop {
+        // Each copy's `if const { .. }` decided, and its dead arm gone before anything
+        // evaluates the arm's constants.
+        comptime::fold_if_const(db, &filler, &mut body)?;
+    }
     Ok(body)
 }
 

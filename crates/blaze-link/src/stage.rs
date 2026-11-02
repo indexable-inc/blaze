@@ -16,11 +16,12 @@
 use std::sync::Arc;
 
 use blaze_codegen::{
-    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Relocs, Static, Target, Unwind,
+    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, RelocKind, Relocs, Static, Target, Unwind,
 };
 use blaze_format::cursor::{self, Reader};
 use blaze_graph::par;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::{Hasher, radix};
 use blaze_live::patch::exec;
 use blaze_mem::Frame;
@@ -88,12 +89,12 @@ impl<'a> Content<'a> {
 pub(crate) struct Contents<'a> {
     first: PieceId,
     fresh: FrameVec<'a, Option<Content<'a>>>,
-    other: HashMap<PieceId, Content<'a>>,
+    other: HashMap<PieceId, Content<'a>, Global>,
 }
 
 impl<'a> Contents<'a> {
     pub fn new(first: PieceId, arena: &'a Frame) -> Contents<'a> {
-        Contents { first, fresh: Vec::new_in(arena), other: HashMap::default() }
+        Contents { first, fresh: Vec::new_in(arena), other: HashMap::new_in(Global) }
     }
 
     #[inline]
@@ -142,7 +143,7 @@ pub(crate) struct Stage<'a> {
     pub writer: &'a Formats,
     pub plan: &'a Plan,
     pub symbols: &'a mut Symbols,
-    pub objects: &'a mut HashMap<Obj, crate::native::Read>,
+    pub objects: &'a mut HashMap<Obj, crate::native::Read, Global>,
     /// Each native input's bytes, borrowed for the stage ([`crate::native`]).
     pub native: crate::native::Pass<'a>,
     pub old: &'a State,
@@ -189,6 +190,8 @@ pub(crate) struct Stage<'a> {
     pub frames_end: Option<u64>,
     /// A lazy image's session ([`crate::lazy`]).
     pub lazy: Option<&'a crate::lazy::Lazy>,
+    /// The profile and cold set a full link orders functions by ([`crate::layout`]).
+    pub layout: crate::layout::Pass<'a>,
 }
 
 pub(crate) fn error(function: Option<InstanceKey>, what: impl Into<String>) -> LinkError {
@@ -672,7 +675,7 @@ impl<'a> Stage<'a> {
             return Ok(());
         }
         let arena = self.arena;
-        let mut seen: HashSet<&InstanceKey> = HashSet::default();
+        let mut seen: HashSet<&InstanceKey, Global> = HashSet::new_in(Global);
         seen.reserve(added.len());
         let mut todo: FrameVec<'a, &'a CompiledFunction> = Vec::with_capacity_in(added.len(), arena);
         for function in added {
@@ -1143,15 +1146,28 @@ impl<'a> Stage<'a> {
         let (fixups, weak) = self.fixups(relocs, syms, None, false, None)?;
         // alloc: error path
         let static_error = |what: String| error(None, format!("the static {:?}: {what}", it.item));
+        // wasm32 without shared memory has one thread, so a `#[thread_local]` static is plain
+        // data, as LLVM's wasm backend strips thread-locals without the atomics feature: wasm
+        // codegen reaches it by its address in linear memory. That holds only for a module of
+        // one thread: a `-threads` target is refused here, and an object built with `atomics`
+        // or `shared-mem` where the module's target features are merged (`wasm/module.rs`).
+        if it.thread_local && self.arch() == Arch::Wasm32 && self.output.triple.split('-').any(|it| it == "threads") {
+            return Err(static_error(format!(
+                "a `#[thread_local]` static on {}, a wasm32 target of threads: blaze links wasm32 \
+                 modules of one thread with no shared memory, where a thread-local is plain data",
+                self.output.triple
+            )));
+        }
+        let thread_local = it.thread_local && self.arch() != Arch::Wasm32;
         let (class, rank) = match &it.section {
             Some(name) => {
                 let (class, rank) = self
                     .writer
-                    .section(name, it.mutable || !fixups.is_empty(), false, it.thread_local)
+                    .section(name, it.mutable || !fixups.is_empty(), false, thread_local)
                     .map_err(static_error)?;
                 (self.new.class_id(&class), rank)
             }
-            None => self.own(match (it.thread_local, it.mutable, zero, fixups.is_empty()) {
+            None => self.own(match (thread_local, it.mutable, zero, fixups.is_empty()) {
                 (true, _, false, _) => Class::Tdata,
                 (true, _, true, _) => Class::Tbss,
                 (false, true, true, _) => Class::Bss,
@@ -1171,7 +1187,7 @@ impl<'a> Stage<'a> {
             (true, _) => Content::Zero,
         };
         let mut piece =
-            Self::piece_in(sym, class, u64::from(it.align), size, fixups, What::Static { thread_local: it.thread_local });
+            Self::piece_in(sym, class, u64::from(it.align), size, fixups, What::Static { thread_local });
         piece.rank = rank;
         piece.zero = zeroed;
         piece.weak = weak;
@@ -1179,7 +1195,7 @@ impl<'a> Stage<'a> {
         if self.arch() == Arch::Wasm32 {
             self.declare_wasm(made, None, &it.imports)?;
         }
-        if it.thread_local && self.plan.tls_descriptors {
+        if thread_local && self.plan.tls_descriptors {
             let tlv = self.sym(SymKey::Tlv(item, instance));
             if let Def::Piece { piece, .. } = self.new.def(tlv) {
                 self.unmake(piece);
@@ -1224,7 +1240,7 @@ impl<'a> Stage<'a> {
                     continue;
                 };
                 let (bytes, file) = self.location(anchor, index)?;
-                let fixups = [Fixup { at: 0, apply: Apply::Abs64, target: file, addend: 0, minus: None }];
+                let fixups = [Fixup { at: 0, apply: self.location_layout().2, target: file, addend: 0, minus: None }];
                 self.retarget(id, &fixups);
                 self.contents.insert(id, Content::Bytes(bytes));
                 self.write.insert(id);
@@ -1266,7 +1282,10 @@ impl<'a> Stage<'a> {
             return Err(error(None, format!("span {index} of {anchor:?}, whose table has {len}")));
         };
         let name = table.file(at.file);
-        let record: &'a [u8] = arena.alloc_slice_copy(&position::location(name.len(), at));
+        let record: &'a [u8] = match self.arch() {
+            Arch::Wasm32 => arena.alloc_slice_copy(&position::wasm32_location(name.len(), at)),
+            Arch::X86_64 | Arch::Aarch64 => arena.alloc_slice_copy(&position::location(name.len(), at)),
+        };
         let file_name = self.symbols.name(name);
         let file = self.symbols.intern(SymKey::FileName(file_name));
         let bytes: Option<&'a [u8]> = self.new.home(file).is_none().then(|| {
@@ -1279,6 +1298,20 @@ impl<'a> Stage<'a> {
             self.make(&piece, Content::Bytes(bytes));
         }
         Ok((record, file))
+    }
+
+    /// A `Location` record as the image's arch lays it out: its size, its alignment and how its
+    /// pointer to the file name is written (on wasm32 a four-byte address in linear memory,
+    /// which nothing slides).
+    fn location_layout(&self) -> (u64, u64, Apply) {
+        match self.arch() {
+            Arch::Wasm32 => (
+                position::WASM32_LOCATION_SIZE,
+                position::WASM32_LOCATION_ALIGN,
+                crate::wasm::codegen_apply(RelocKind::WasmMemory, false).expect("wasm data has 4-byte addresses"),
+            ),
+            Arch::X86_64 | Arch::Aarch64 => (position::LOCATION_SIZE, position::LOCATION_ALIGN, Apply::Abs64),
+        }
     }
 
     /// The `Location` records the fresh pieces refer to and that don't exist yet.
@@ -1300,15 +1333,9 @@ impl<'a> Stage<'a> {
                 continue;
             }
             let (bytes, file) = self.location(anchor, index)?;
-            let fixups = self.fixup_slice([Fixup { at: 0, apply: Apply::Abs64, target: file, addend: 0, minus: None }]);
-            let piece = Self::piece_in(
-                sym,
-                class,
-                position::LOCATION_ALIGN,
-                position::LOCATION_SIZE,
-                fixups,
-                What::Shared,
-            );
+            let (size, align, pointer) = self.location_layout();
+            let fixups = self.fixup_slice([Fixup { at: 0, apply: pointer, target: file, addend: 0, minus: None }]);
+            let piece = Self::piece_in(sym, class, align, size, fixups, What::Shared);
             self.make(&piece, Content::Bytes(bytes));
         }
         Ok(())

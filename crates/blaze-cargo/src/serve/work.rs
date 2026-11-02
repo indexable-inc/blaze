@@ -127,6 +127,9 @@ pub struct JobInput {
     /// std unit's record is found there when `store` has none, as of the look the job's build
     /// waited for.
     pub std: blaze_cas::Reader,
+    /// The daemon's proc macros: where their expansions are kept (in `store`), lent to every
+    /// load of a proc-macro unit's macros and every read of what an expansion read.
+    pub macros: Arc<blaze_macro_eval::Macros>,
     pub color: bool,
     /// Diagnostics are rendered a line each: cargo's `--message-format=short` or
     /// `json-diagnostic-short`.
@@ -180,6 +183,15 @@ pub struct Put {
     pub bytes: Vec<u8>,
 }
 
+/// A value for the store from a kept front end ([`Steps::store_kept`]) and what it is ("the
+/// def-map image of dependency crate `serde`"): what an error names when the store holds other
+/// bytes under its key.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct KeptPut {
+    pub put: Put,
+    pub what: Arc<str>,
+}
+
 /// A file a unit writes: where cargo writes it (absolute, one of the unit's
 /// `UnitPlan::outputs`) and the store key of its bytes, in the store or among the puts.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -212,6 +224,10 @@ pub struct Compiled {
     /// Each image the compile linked, by its path, and how the link reached it: what the job's
     /// [`blaze_api::Worked`] says, and the bench fails an edit by.
     pub links: Vec<(String, Linking)>,
+    /// Why its record and each template its codegen missed were not in the store, each with
+    /// its subject within the unit ([`blaze_kernel::Miss`]): what `blaze why` explains once
+    /// the build ends. Empty for a unit its record replayed.
+    pub misses: Vec<blaze_kernel::Miss>,
 }
 
 /// A part of a unit's compile ([`Front::compile`]), each one node of the plane, so each is
@@ -299,6 +315,8 @@ impl Linking {
             }
             // alloc: one name, for a link that was not spliced
             Linking::Full(Full::NotIncremental) => blaze_api::LinkHow::Full { why: vec!["not incremental".to_owned()] },
+            // alloc: one name, for a link that was not spliced
+            Linking::Full(Full::Layout) => blaze_api::LinkHow::Full { why: vec!["layout".to_owned()] },
         }
     }
 }
@@ -310,6 +328,7 @@ impl std::fmt::Display for Linking {
             Linking::Spliced => f.write_str("spliced"),
             Linking::Full(Full::Output(fields)) => write!(f, "not spliced: the output changed: {fields}"),
             Linking::Full(Full::NotIncremental) => f.write_str("not spliced: the output keeps no room"),
+            Linking::Full(Full::Layout) => f.write_str("not spliced: the profile its code is laid out by changed"),
         }
     }
 }
@@ -323,6 +342,9 @@ pub enum Full {
     Output(OutputFields),
     /// The output keeps no room ([`blaze_link::Output::incremental`] is off): every link of it is whole.
     NotIncremental,
+    /// The profile its code is laid out by changed (docs/v2/plan/lanes/layout/layout.md): an
+    /// image keeps its first link's order, so it is laid out again.
+    Layout,
 }
 
 /// Fields of [`blaze_link::Output`] as a set, a bit each in [`OutputFields::NAMES`]'s order.
@@ -458,6 +480,15 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// moved to the job's view, its memos kept, and what changed alone read again; else it
     /// is dropped and the units lowered anew.
     fn lower(&self, job: &JobInput, kept: Option<Self::KeptFront>) -> Result<FrontEnd<Self>, Failed>;
+    /// On a worker, once a job's front end is kept ([`Writer::keep`]) and before the job is
+    /// reported done: what its build leaves for the store, written from it as the puts for the
+    /// loop to make (the images of the dependency crates it resolved, the outcomes and checked
+    /// bodies of those it checked, the constants they evaluated, the goals and bodies' steps
+    /// offered). So what one build computed is in the store, durable, by the time it answers,
+    /// whether or not the head builds again in this daemon's life: a stop, a crash or a reboot
+    /// after it loses none of it (persisted-state-round-trips). Called once per kept front
+    /// end, while no task reads it; one already stored hands back no puts.
+    fn store_kept(&self, kept: &mut Self::KeptFront) -> Result<Vec<KeptPut>, ApiError>;
     /// On the loop, once at start: the queries of the daemon's database.
     fn register(&self, db: &mut Database) {
         blaze_units::query::register(db);
@@ -482,8 +513,9 @@ pub trait Steps: Sized + Send + Sync + 'static {
 pub struct FrontEnd<S: Steps> {
     pub front: Arc<S::Front>,
     pub writer: S::Writer,
-    /// Values for the store the lowering made (the images of dependency crates the head's last
-    /// front end resolved), put by the loop as a compile's are.
+    /// Values for the store the lowering made, put by the loop as a compile's are. What a
+    /// head's last front end leaves for the store is put before that build answers
+    /// ([`Steps::store_kept`]), not here.
     pub puts: Vec<Put>,
 }
 
@@ -554,10 +586,12 @@ pub trait Writer<S: Steps>: Send + 'static {
     fn tables(&mut self) -> Result<Vec<(&'static str, u64, u64)>, Failed>;
     /// On the loop, once every task of the job's build has ended and before it is kept: what
     /// the build's front end found wrong only once all of it ran (a dependency's image that
-    /// differs from what its crate resolves to, under `BLAZE_DEP_IMAGES=check`), as the
-    /// build's error.
-    fn finished(&mut self) -> Result<(), ApiError> {
-        Ok(())
+    /// differs from what its crate resolves to, under `BLAZE_DEP_IMAGES=check`; a profile blaze
+    /// made that applied to nothing), as the build's error, or its warnings to say. `ok`:
+    /// whether the build succeeded; `built`: its nodes' units, a unit once a node.
+    fn finished(&mut self, ok: bool, built: &[u32]) -> Result<Vec<blaze_api::Diagnostic>, ApiError> {
+        let _ = (ok, built);
+        Ok(Vec::new())
     }
     /// On the loop, once every task of the job's build has ended and before it is kept: each
     /// library crate of the build that is not a workspace member, sorted by cargo package
@@ -686,4 +720,46 @@ pub trait Runs<S: Steps>: Send + 'static {
     /// Ends it early: what it runs is killed and ends through `complete`, not ok; with nothing
     /// running it ends here.
     fn cancel(&mut self, effects: &mut Vec<Effect>) -> Option<bool>;
+    /// What its `complete`s put into the store since this was last asked, taken after each
+    /// one so a ticket is handed over once. Its job is not reported done before every one is
+    /// durable (persisted-state-round-trips): a run's result kept under its key, a test's
+    /// record, a value fetched from the global cache, a retraction. No default: a run that
+    /// puts and hands nothing over is answered on before what it put survives a crash, and the
+    /// value a retraction refused is given again after it.
+    fn take_puts(&mut self) -> RunPuts;
+}
+
+/// What a run of user code put ([`Runs::take_puts`]).
+#[derive(Default, Debug)]
+pub struct RunPuts {
+    /// The last ticket of each segment its puts went to.
+    pub tickets: blaze_cas::Tickets,
+    /// Among them, a record that a value verified across checkouts depends on where its roots
+    /// are ([`blaze_usercode::roots::verify::retraction`]): a kept front end lowers afresh.
+    pub retracted: bool,
+    /// Why a run was not reused, for `blaze why`: handed to its job's misses with its puts.
+    pub misses: Vec<blaze_kernel::Miss>,
+}
+
+impl RunPuts {
+    /// Puts of what it kept, waited on.
+    pub fn kept(&mut self, tickets: impl IntoIterator<Item = blaze_cas::Ticket>) {
+        for ticket in tickets {
+            self.tickets.add(ticket);
+        }
+    }
+
+    /// The ticket of a retraction's record, when one was put.
+    pub fn retraction(&mut self, ticket: Option<blaze_cas::Ticket>) {
+        if let Some(ticket) = ticket {
+            self.tickets.add(ticket);
+            self.retracted = true;
+        }
+    }
+
+    /// What `other` put, too.
+    pub fn extend(&mut self, other: RunPuts) {
+        self.tickets.extend(&other.tickets);
+        self.retracted |= other.retracted;
+    }
 }

@@ -46,7 +46,7 @@ use crate::db::HirDatabase;
 use self::case_conv::{to_camel_case, to_lower_snake_case, to_upper_snake_case};
 
 pub fn incorrect_case(db: &Db, owner: ModuleDefId) -> Vec<IncorrectCase> {
-    let _p = tracing::info_span!("incorrect_case").entered();
+    let _p = tracing::info_span!(target: "blaze", "incorrect_case").entered();
     let mut validator = DeclValidator::new(db);
     validator.validate_item(owner);
     validator.sink

@@ -14,16 +14,17 @@
 //! one given. Nothing is allocated per function but the output itself; a set of columns per
 //! piece.
 
-use std::collections::hash_map::Entry;
+use blaze_hash::hash_map::Entry;
 
 use blaze_graph::par;
 use blaze_ids::radix;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use super::code::{Header, NOTHING, Sig};
 use super::leb::{self, PADDED, padded_uleb};
 use super::reader::{MAGIC, Reader, Wasm as _};
-use super::{FUNCTIONS, HEAP, PAGE, STACK_POINTER, Wasm, heap_base, in_memory};
+use super::{FUNCTIONS, HEAP, MEMORY_BASE, STACK_POINTER, Wasm, heap_base, in_memory, initial_pages};
 use crate::model::{Class, Placed, Region, SymbolKind, View};
 use crate::output::OutputKind;
 
@@ -288,7 +289,18 @@ fn check(placed: &Placed<'_>) -> Result<(), String> {
     }
     if let Some(addr) = placed.rebase.first() {
         // alloc: error path
-        return Err(format!("a rebase at {addr:#x}: a wasm32 module is never slid"));
+        let region = placed.regions.iter().find(|it| (it.addr..it.addr + it.size.max(1)).contains(addr));
+        let how = placed.rebase.len();
+        // alloc: error path
+        return Err(match region {
+            Some(region) => format!(
+                "a rebase at {addr:#x}, {:#x} into the {:?} region at {:#x} ({how} in all): a wasm32 module is never slid",
+                addr - region.addr,
+                region.class,
+                region.addr
+            ),
+            None => format!("a rebase at {addr:#x} ({how} in all): a wasm32 module is never slid"),
+        });
     }
     if let Some(tls) = &placed.tls {
         // alloc: error path
@@ -328,14 +340,14 @@ fn check(placed: &Placed<'_>) -> Result<(), String> {
 /// lookup, through the entry API.
 struct Types<'a> {
     list: Vec<Sig<'a>>,
-    index: HashMap<Sig<'a>, u32>,
+    index: HashMap<Sig<'a>, u32, Global>,
 }
 
 impl<'a> Types<'a> {
     fn with_capacity(capacity: usize) -> Types<'a> {
         Types {
             list: Vec::with_capacity(capacity),
-            index: HashMap::with_capacity_and_hasher(capacity, Default::default()),
+            index: HashMap::with_capacity_in(capacity, Global),
         }
     }
 
@@ -455,6 +467,15 @@ fn target_features(payloads: &[u8]) -> Result<Vec<u8>, String> {
         // alloc: error path
         return Err(format!("the target feature `{feature}` is used by one object and disallowed by another"));
     }
+    // A module is one thread with no shared memory, where the stage makes a `#[thread_local]`
+    // static plain data (stage.rs): code built for threads is refused, not given that.
+    if let Some(feature) = used.iter().find(|it| matches!(**it, "atomics" | "shared-mem")) {
+        // alloc: error path
+        return Err(format!(
+            "an object uses the target feature `{feature}`: blaze links wasm32 modules of one thread \
+             with no shared memory, where a thread-local static is plain data"
+        ));
+    }
     let mut out = Vec::with_capacity(payloads.len());
     leb::uleb(&mut out, used.len() as u64);
     for feature in used {
@@ -501,7 +522,7 @@ fn segment_name(class: &Class) -> &str {
 
 /// Adds an export, or checks that one of that name exports the same thing when `again` may.
 fn export<'n>(
-    named: &mut HashMap<&'n str, (u8, u32)>,
+    named: &mut HashMap<&'n str, (u8, u32), Global>,
     list: &mut Vec<(&'n str, u8, u32)>,
     name: &'n str,
     kind: u8,
@@ -810,8 +831,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     // The core keeps one import per name: a function that says another must not call it.
     if par::any(&units, |it| it.header.is_some_and(|it| it.imports().next().is_some())) {
         let names = placed.imports.iter().map(|it| it.name.as_str());
-        let mut by_name: HashMap<&str, Imported<'_>> =
-            HashMap::with_capacity_and_hasher(imports.len(), Default::default());
+        let mut by_name: HashMap<&str, Imported<'_>, Global> =
+            HashMap::with_capacity_in(imports.len(), Global);
         by_name.extend(names.zip(imports.iter().copied()));
         let conflict = par::find_map_first(&units, |unit| {
             unit.header?.imports().find_map(|(name, module, field, ty)| {
@@ -871,7 +892,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         // alloc: error path
         return Err(format!("data up to {heap:#x}, past 32-bit memory"));
     }
-    let pages = heap.div_ceil(PAGE).max(1);
+    // As many as `__heap_end` says.
+    let pages = initial_pages(placed.regions);
     let mut segments: Vec<(&str, u32, View<'_>)> = Vec::with_capacity(placed.regions.len());
     for (index, region) in placed.regions.iter().enumerate() {
         if !in_memory(&region.class) {
@@ -902,10 +924,12 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     }
 
     // Globals and exports.
-    let mut globals: Vec<(&str, bool, u32)> = Vec::with_capacity(1 + placed.exports.len());
+    let mut globals: Vec<(&str, bool, u32)> = Vec::with_capacity(2 + placed.exports.len());
     globals.push(("__stack_pointer", true, wasm.stack as u32));
+    globals.push(("__memory_base", false, 0));
+    debug_assert_eq!((globals[STACK_POINTER as usize].0, globals[MEMORY_BASE as usize].0), ("__stack_pointer", "__memory_base"));
     let mut exports: Vec<(&str, u8, u32)> = Vec::with_capacity(2 + placed.exports.len());
-    let mut named = HashMap::with_capacity_and_hasher(2 + placed.exports.len(), Default::default());
+    let mut named = HashMap::with_capacity_in(2 + placed.exports.len(), Global);
     export(&mut named, &mut exports, "memory", EXPORT_MEMORY, 0, false)?;
     if let OutputKind::Executable { entry } = &wasm.kind {
         // alloc: error path
@@ -952,8 +976,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     by_addr.extend(regions.filter(|(_, it)| is_custom(it)).map(|(index, it)| (it.addr, index)));
     radix::sort_copy_by_key(&mut by_addr, |&(addr, index)| radix::pack_64(addr, index as u64));
     let mut groups: Vec<(&str, bool)> = Vec::with_capacity(customs);
-    let mut group_of: HashMap<&str, u32> =
-        HashMap::with_capacity_and_hasher(customs, Default::default());
+    let mut group_of: HashMap<&str, u32, Global> =
+        HashMap::with_capacity_in(customs, Global);
     let mut parts: Vec<(u32, usize)> = Vec::with_capacity(customs);
     for &(_, index) in &by_addr {
         let Class::Named { name, .. } = &placed.regions[index].class else { continue };
@@ -1478,8 +1502,11 @@ mod tests {
         assert_eq!(find(&sections, 4, ""), [1, FUNCREF, 1, 5, 5]);
         // Memory to the heap's start: 0x10_0010 is 17 pages.
         assert_eq!(find(&sections, 5, ""), [1, 0, 17]);
-        let mut global = vec![1, I32, 1];
+        // `__stack_pointer`, then `__memory_base`, 0 in a module that is not PIC.
+        let mut global = vec![2, I32, 1];
         leb::i32_const(&mut global, STACK as i32);
+        global.extend([I32, 0]);
+        leb::i32_const(&mut global, 0);
         assert_eq!(find(&sections, 6, ""), global);
 
         let mut r = Reader::new(find(&sections, 7, ""));
@@ -1535,7 +1562,7 @@ mod tests {
             names(&mut Reader::new(subsections[&1])),
             owned(&[(0, "fd_write"), (1, "__wasm_call_ctors"), (2, "init"), (3, "_start")])
         );
-        assert_eq!(names(&mut Reader::new(subsections[&7])), owned(&[(0, "__stack_pointer")]));
+        assert_eq!(names(&mut Reader::new(subsections[&7])), owned(&[(0, "__stack_pointer"), (1, "__memory_base")]));
         assert_eq!(names(&mut Reader::new(subsections[&9])), owned(&[(0, ".rodata"), (1, ".data")]));
         assert_eq!(subsections.keys().copied().collect::<Vec<_>>(), [1, 7, 9]);
 
@@ -1719,12 +1746,14 @@ mod tests {
             [
                 ("memory".to_owned(), EXPORT_MEMORY, 0),
                 ("init".to_owned(), EXPORT_FUNCTION, 2),
-                ("__heap_base".to_owned(), EXPORT_GLOBAL, 1),
+                ("__heap_base".to_owned(), EXPORT_GLOBAL, 2),
                 ("_start".to_owned(), EXPORT_FUNCTION, 3),
             ]
         );
-        let mut global = vec![2, I32, 1];
+        let mut global = vec![3, I32, 1];
         leb::i32_const(&mut global, STACK as i32);
+        global.extend([I32, 0]);
+        leb::i32_const(&mut global, 0);
         global.extend([I32, 0]);
         leb::i32_const(&mut global, (DATA + 16) as i32);
         assert_eq!(find(&sections, 6, ""), global);
@@ -1852,5 +1881,10 @@ mod tests {
         payload.push(b'-');
         leb::name(&mut payload, "sign-ext");
         assert!(target_features(&payload).unwrap_err().contains("sign-ext"));
+        let mut atomics = Vec::new();
+        leb::uleb(&mut atomics, 1);
+        atomics.push(b'+');
+        leb::name(&mut atomics, "atomics");
+        assert!(target_features(&atomics).unwrap_err().contains("`atomics`"));
     }
 }

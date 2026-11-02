@@ -106,7 +106,8 @@ where
 
         // With eager normalization, we should normalize the args of alias before
         // normalizing the alias itself.
-        let ty = ty.try_super_fold_with(self)?;
+        // blaze: one guard per level of the type, which can nest as deep as a program writes it.
+        let ty = stdx::ensure_sufficient_stack(|| ty.try_super_fold_with(self))?;
         let ty::Alias(orig_is_rigid, alias_ty) = ty.kind() else { return Ok(ty) };
         // We support ambiguous aliases inside rigid alias. So we still recognize
         // the rigidness of the outer alias.
@@ -157,7 +158,8 @@ where
 
         // With eager normalization, we should normalize the args of alias before
         // normalizing the alias itself.
-        let ct = ct.try_super_fold_with(self)?;
+        // blaze: one guard per level of the constant, as for a type.
+        let ct = stdx::ensure_sufficient_stack(|| ct.try_super_fold_with(self))?;
         let ty::ConstKind::Alias(orig_is_rigid, alias_const) = ct.kind() else { return Ok(ct) };
         // We support ambiguous aliases inside rigid alias. So we still recognize
         // the rigidness of the outer alias.

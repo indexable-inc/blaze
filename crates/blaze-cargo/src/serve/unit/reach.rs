@@ -6,13 +6,15 @@
 //!
 //! Cost: one merge of each crate's sorted key columns (`changed_since`), so `O(items)` per
 //! member crate with nothing allocated per unchanged item; a path is resolved only for an item
-//! that changed; the tests are matched against a hash set of the old code hashes of what
-//! changed, `O(1)` per hash a test reached.
+//! that changed; each test is matched by walking its binary's table
+//! (`ExecTable::reaches`) against a hash set of the old code hashes of what changed, stopping
+//! at the first hit: `O(1)` per node walked, walked only here and never at build.
 
 #![forbid(unsafe_code)]
 
 use blaze_api::{FactRead, Reach, ReachedItem};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_items::{CodeHash, Fact, HashColumns, ItemHashes, ItemKey, ItemKind, Resolved};
 use blaze_lower::Db;
 
@@ -49,6 +51,40 @@ fn path(db: &Db, key: ItemKey) -> Option<String> {
     }
 }
 
+/// The execution table of the test binary unit `at` made, `done`, when it lists the tests its
+/// build listed, in order. Otherwise an error naming the binary (its package and target) and
+/// why it has none, as without it nothing says what its tests reach.
+fn table_of<'a>(from: &Job, at: usize, done: &'a super::compile::Made) -> Result<&'a blaze_codegen::ExecTable, Failed> {
+    // alloc: error path
+    let binary = || match from.units().graph.units.get(at) {
+        Some(unit) => match from.package(unit) {
+            Ok(package) => format!("test binary `{}` of package `{} {}`", unit.target.name, package.name, package.version),
+            Err(_) => format!("test binary `{}` of package `{}`", unit.target.name, unit.pkg_id),
+        },
+        None => format!("test binary of unit {at}"),
+    };
+    let why = match &done.table {
+        None => format!(
+            "its record has no execution table, which only its link makes: it lists {} tests but was not linked in this view",
+            done.tests.len()
+        ),
+        Some(table) if table.tests.len() != done.tests.len() => {
+            format!("its execution table lists {} tests where its build lists {}", table.tests.len(), done.tests.len())
+        }
+        Some(table) => match table.tests.iter().zip(&done.tests).position(|(kept, listed)| kept.0 != listed.name) {
+            None => return Ok(table),
+            Some(n) => format!(
+                "its execution table's test {n} is `{}` where its build lists `{}`",
+                table.tests[n].0, done.tests[n].name
+            ),
+        },
+    };
+    Err(Failed::Error(blaze_api::ApiError::new(
+        format!("what the tests of the {} reach can't be told: {why}", binary()),
+        Some("reach".to_owned()),
+    )))
+}
+
 /// What the change from `from`'s view, read through `before`, to `to`'s, read through `after`,
 /// reaches.
 pub(crate) fn reach(
@@ -60,8 +96,8 @@ pub(crate) fn reach(
 ) -> Result<Reach, Failed> {
     let mut items = Vec::new();
     let mut compiled = Vec::new();
-    let mut changed_code: HashSet<CodeHash> = HashSet::default();
-    let mut seen: HashSet<ItemKey> = HashSet::default();
+    let mut changed_code: HashSet<CodeHash, Global> = HashSet::new_in(Global);
+    let mut seen: HashSet<ItemKey, Global> = HashSet::new_in(Global);
     for (at, unit) in to.units().graph.units.iter().enumerate() {
         let package = to.package(unit)?;
         if !package.is_member || unit.is_std {
@@ -107,9 +143,20 @@ pub(crate) fn reach(
         }
     }
     let mut tests = Vec::new();
-    for done in from.made.iter().filter_map(|it| it.get()) {
-        for test in &done.tests {
-            if test.outside || test.reached.iter().any(|it| changed_code.contains(it)) {
+    for (at, done) in from.made.iter().enumerate().filter_map(|(at, it)| Some((at, it.get()?))) {
+        if done.tests.is_empty() {
+            continue;
+        }
+        let _span = tracing::info_span!(target: "blaze", "test reach", tests = done.tests.len()).entered();
+        // Each test's reach is walked from its binary's table, stopping at the first change. A
+        // binary without a table that lists its tests can't say what they reach: that is an
+        // error naming it, never every test counted reached (no-fallback).
+        let table = table_of(from, at, done)?;
+        // A changed span table reaches every test of its binary (a panic prints positions).
+        let spans = done.spans.iter().any(|it| changed_code.contains(it));
+        for (n, test) in done.tests.iter().enumerate() {
+            if test.outside || spans || table.reaches(n, |it| changed_code.contains(it)) {
+                // clone: the response owns its names
                 tests.push(test.name.clone());
             }
         }

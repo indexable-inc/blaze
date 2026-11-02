@@ -9,10 +9,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::{
-        OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -76,18 +73,13 @@ pub fn sections_of_their_own() -> bool {
     !edits_follow() || LINKS_OWN.load(Ordering::Relaxed)
 }
 
-/// Whether every function of the build under way keeps its frame pointer, as the program asks
-/// with `-C force-frame-pointers`: one answer for all the code a build writes, as the debug
-/// level is.
-static FRAME_POINTERS: AtomicBool = AtomicBool::new(false);
-
-pub(super) fn keep_frame_pointers(keep: bool) {
-    FRAME_POINTERS.store(keep, Ordering::Relaxed);
-}
-
-pub(super) fn frame_pointers() -> bool {
-    FRAME_POINTERS.load(Ordering::Relaxed)
-}
+/// Whether v1's compiles (`Backend::emit`, the tier, LLVM's units and exports) keep every
+/// function's frame pointer: no, as they never did. They have no toolchain to say otherwise,
+/// and keep one only where a function reads its own (`Isa::FramePointer`). v2 reads each
+/// unit's `Toolchain::frame_pointers` where its code is made (`v2::Function::frame_pointers`):
+/// one process compiles units of several toolchains at once, the target's and its build
+/// scripts', so no process-wide setting can stand for any one of them.
+pub(super) const V1_FRAME_POINTERS: bool = false;
 
 /// Whether rustc's build of the program has `-C link-dead-code`
 /// ([`rustc_links_dead_code`](super::rustc_links_dead_code)).
@@ -151,7 +143,7 @@ impl Optimization {
 impl Backend {
     /// The producer the environment asks for, or what is wrong with what it asks.
     pub fn from_env() -> std::result::Result<Backend, String> {
-        static SELECTED: OnceLock<std::result::Result<Backend, String>> = OnceLock::new();
+        static SELECTED: std::sync::OnceLock<std::result::Result<Backend, String>> = std::sync::OnceLock::new();
         match SELECTED.get_or_init(Self::read_env) {
             Ok(backend) => Ok(*backend),
             // clone: the error's message
@@ -196,7 +188,7 @@ impl Backend {
         recorder: &mut Recorder<'_>,
         context: &mut cranelift_codegen::Context,
     ) -> Result<Code> {
-        pad(Self::produce(recorder, context)?)
+        pad(Self::produce(recorder, context)?, recorder.target)
     }
 
     fn produce(
@@ -234,7 +226,7 @@ impl Backend {
             super::overlap::share(&mut context.func, &frame, &mut recorder.named);
         }
         let pairs = super::float_pair::lower(&mut context.func);
-        let mut code = super::emit(context)?;
+        let mut code = super::emit(context, recorder.target)?;
         if let Some(frame) = context.compiled_code().and_then(|it| it.buffer.frame_layout()) {
             code.slots =
                 SlotPlaces::of_frame(recorder.isa, frame, &context.func, recorder.named_slots());
@@ -249,8 +241,7 @@ impl Backend {
 
 /// A function is replaced in a linked program by a jump written over its entry, so none is
 /// shorter than that jump. Nothing runs the bytes that make up the length.
-pub(super) fn pad(mut code: Code) -> Result<Code> {
-    let target = super::Target::selected().map_err(CodegenError::Backend)?;
+pub(super) fn pad(mut code: Code, target: &super::Target) -> Result<Code> {
     if let Some((shortest, filler)) = target.arch.shortest_function()
         && code.bytes.len() < shortest
     {
@@ -374,6 +365,7 @@ pub(super) struct Produced(usize);
 /// ([`Registry::claim`]): nothing counted is lost, and there are never more of them than
 /// the most threads alive at once.
 #[repr(C, align(128))]
+#[expect(clippy::disallowed_types, reason = "a link set once, read with an acquire load: the list of the process's per-thread counts")]
 struct Counts {
     words: Lines<[AtomicU64; word::COUNT]>,
     /// What a report read of each word last, written by reports alone.
@@ -385,7 +377,7 @@ struct Counts {
     /// Whether a thread holds these counts. The counts of [`Registry::late`] are held by
     /// none and shared by all: their words are added to with `fetch_add`.
     held: AtomicBool,
-    next: OnceLock<&'static Counts>,
+    next: std::sync::OnceLock<&'static Counts>,
 }
 
 #[repr(C, align(128))]
@@ -393,6 +385,7 @@ struct Lines<T>(T);
 
 const _: () = assert!(size_of::<Lines<[AtomicU64; word::COUNT]>>() == 256);
 
+#[expect(clippy::disallowed_types, reason = "a link set once, read with an acquire load: the list of the process's per-thread counts")]
 impl Counts {
     const fn new(held: bool) -> Counts {
         Counts {
@@ -401,7 +394,7 @@ impl Counts {
             alone: Mutex::new(BTreeMap::new()),
             passes: Mutex::new(None),
             held: AtomicBool::new(held),
-            next: OnceLock::new(),
+            next: std::sync::OnceLock::new(),
         }
     }
 
@@ -432,14 +425,16 @@ impl Counts {
 /// Every thread's [`Counts`]: a list that only grows, of counts that are never freed, so a
 /// report reads them with no lock while threads count. A link is set once: reading one is an
 /// acquire load, and a thread appends at the end (once, as it starts).
+#[expect(clippy::disallowed_types, reason = "a link set once, read with an acquire load: the list of the process's per-thread counts")]
 struct Registry {
-    head: OnceLock<&'static Counts>,
+    head: std::sync::OnceLock<&'static Counts>,
     /// Where a thread counts once its own counts are gone, as it ends.
     late: Counts,
 }
 
+#[expect(clippy::disallowed_types, reason = "the process's one profile registry, which every thread's counts join as it starts")]
 static REGISTRY: Registry =
-    Registry { head: OnceLock::new(), late: Counts::new(false) };
+    Registry { head: std::sync::OnceLock::new(), late: Counts::new(false) };
 
 impl Registry {
     /// Counts no thread holds, now held by the calling one: those a thread that ended left,
@@ -551,7 +546,7 @@ impl cranelift_codegen::timing::Profiler for Untimed {
 
 /// Whether `BLAZE_STATS` asks for the steps and Cranelift's passes to be reported.
 fn stats() -> bool {
-    static STATS: OnceLock<bool> = OnceLock::new();
+    static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *STATS.get_or_init(|| std::env::var_os("BLAZE_STATS").is_some())
 }
 
@@ -701,8 +696,9 @@ impl Tally {
 mod tests {
     use super::*;
 
+    #[expect(clippy::disallowed_types, reason = "a registry of the test's own, built as the process's is")]
     fn registry() -> &'static Registry {
-        Box::leak(Box::new(Registry { head: OnceLock::new(), late: Counts::new(false) }))
+        Box::leak(Box::new(Registry { head: std::sync::OnceLock::new(), late: Counts::new(false) }))
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //! (`InvalidReferenceCastingDiag`) (MIT or Apache-2.0).
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{
     AdtId, HasModule, VariantId,
     hir::{BinaryOp, BindingId, Expr, ExprId, Pat, UnaryOp},
@@ -17,6 +18,7 @@ use hir_ty::{
     db::HirDatabase as _,
     next_solver::{DbInterner, Ty, TyKind},
 };
+use intern::sym;
 use rustc_type_ir::{
     Interner as _, Mutability,
     inherent::{AdtDef as _, IntoKind as _},
@@ -122,9 +124,8 @@ fn borrow_or_assign(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<(ExprId, Pat
     }
     let Expr::Call { callee, args } = store.expr(expr) else { return None };
     let [pointer, _] = args else { return None };
-    let items = util::items();
     let name = callee_item(b, callee)?;
-    [items.ptr_write, items.ptr_write_volatile, items.ptr_write_unaligned]
+    [sym::ptr_write, sym::ptr_write_volatile, sym::ptr_write_unaligned]
         .contains(&name)
         .then_some((*pointer, PatternKind::Assign))
 }
@@ -155,7 +156,7 @@ struct Bigger {
 
 fn is_cast_to_bigger_memory_layout(
     b: &BodyCx<'_, '_, '_>,
-    inits: &HashMap<BindingId, ExprId>,
+    inits: &HashMap<BindingId, ExprId, Global>,
     orig: ExprId,
     peel: &mut impl FnMut() -> ExprId,
 ) -> Option<Bigger> {

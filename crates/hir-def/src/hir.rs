@@ -442,6 +442,24 @@ pub enum Expr<'a> {
         expr: ExprId,
         ty: Option<TypeRefId>,
     },
+    /// `'label: for const pat in iterable body` (`#![feature(blaze_comptime)]`, a blaze
+    /// extension; `docs/v2/plan/design/comptime.md`), not desugared: `body` is unrolled once per
+    /// field or variant of the domain `iterable`'s type names, in declaration order. `pat`'s
+    /// bindings are constants in scope in `body`, also inside its `const { .. }` blocks;
+    /// `break` and `continue` (unlabeled, or with `label`) target this loop.
+    ComptimeFor {
+        pat: PatId,
+        iterable: ExprId,
+        body: ExprId,
+        label: Option<LabelId>,
+    },
+    /// `base.[field]` (`#![feature(blaze_comptime)]`): the field of the place `base`
+    /// (auto-deref'd) that the constant `field`, a `core::reflect::Field<B>` value, names. A
+    /// place expression, as `Field` is.
+    ReflectedField {
+        base: ExprId,
+        field: ExprId,
+    },
 }
 
 impl Expr<'_> {
@@ -464,12 +482,14 @@ impl Expr<'_> {
             | Expr::OffsetOf(_)
             | Expr::Underscore
             | Expr::IncludeBytes
-            | Expr::UnsafeBinderCast { .. } => ExprPrecedence::Unambiguous,
+            | Expr::UnsafeBinderCast { .. }
+            | Expr::ComptimeFor { .. } => ExprPrecedence::Unambiguous,
 
             Expr::Await { .. }
             | Expr::Call { .. }
             | Expr::Field { .. }
             | Expr::Index { .. }
+            | Expr::ReflectedField { .. }
             | Expr::MethodCall { .. } => ExprPrecedence::Postfix,
 
             Expr::Let { .. } | Expr::UnaryOp { .. } | Expr::Ref { .. } => ExprPrecedence::Prefix,

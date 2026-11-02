@@ -2,8 +2,8 @@
 //! types apart wherever a program or its code can (a `TypeId`, a `type_name`, a vtable, a
 //! `dyn` call, debug info, a closure's or coroutine's body). This is the one spelling of a type
 //! by content. The code generator's `Hashes::ty` and `Hashes::konst` (instance arguments,
-//! `TypeId` values, the types of its debug info) are this, and so are the share key's identity
-//! records, so a share key covers every type id a template holds.
+//! `TypeId` values, the types of its debug info) are this, and so are compile identity's
+//! records (`hir_ty_identity::instance_identity`), so it covers every type id a template holds.
 //!
 //! - An ADT by its key, its interface, its layout and the `Drop` impls its drop glue reads
 //!   ([`adt`], a tracked query); its arguments the same way.
@@ -16,6 +16,7 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, Unhashable, interface_hash, item_key, key, layout_hash};
 use hir_def::{AdtId, CallableDefId, HasModule};
@@ -70,7 +71,8 @@ pub fn konst<'db>(db: &'db Db, konst: Const<'db>) -> Result<ContentId, Unshared>
     Ok(spell.out.finish())
 }
 
-pub(crate) fn unhashable(db: &Db) -> impl Fn(Unhashable) -> Unshared + '_ {
+/// An item with no hash, as the error of what reads it.
+pub fn unhashable(db: &Db) -> impl Fn(Unhashable) -> Unshared + '_ {
     move |it| Unshared::Unhashable(it.describe(db))
 }
 
@@ -88,7 +90,7 @@ pub fn adt(db: &Db, adt: AdtId) -> Result<ContentId, Unshared> {
     h.id(&item_key(db, item).0)
         .id(&interface_hash(db, item).map_err(unhashable(db))?.0)
         .id(&layout_hash(db, adt).map_err(unhashable(db))?.0);
-    let mut seen: HashSet<AdtId> = HashSet::default();
+    let mut seen: HashSet<AdtId, Global> = HashSet::new_in(Global);
     seen.insert(adt);
     // alloc: the ADTs the fields reach, once per ADT: this query's miss, memoized after
     let mut next = vec![adt];
@@ -177,7 +179,16 @@ impl<'db> Spell<'db> {
         self.key(item_key(self.db, item));
     }
 
+    /// Spells `ty`, one frame per level of it. A callee's arguments are as deep as the program
+    /// built them (only an instance's own are bounded, by its `SHARED_DEPTH`), so each level
+    /// first makes sure of its stack: an overflow aborts the process, where an error fails one
+    /// job (rule 17). [`Self::konst`] and [`Self::pattern`] do the same; every recursion of a
+    /// spelling passes through one of the three.
     fn ty(&mut self, ty: Ty<'db>) -> Result<(), Unshared> {
+        stdx::ensure_sufficient_stack(|| self.ty_level(ty))
+    }
+
+    fn ty_level(&mut self, ty: Ty<'db>) -> Result<(), Unshared> {
         let db = self.db;
         match ty.kind() {
             TyKind::Bool => self.u8(0),
@@ -409,6 +420,10 @@ impl<'db> Spell<'db> {
     }
 
     fn pattern(&mut self, pattern: Pattern<'db>) -> Result<(), Unshared> {
+        stdx::ensure_sufficient_stack(|| self.pattern_level(pattern))
+    }
+
+    fn pattern_level(&mut self, pattern: Pattern<'db>) -> Result<(), Unshared> {
         match pattern.kind() {
             PatternKind::Range { start, end } => {
                 self.u8(0);
@@ -429,6 +444,10 @@ impl<'db> Spell<'db> {
 
     /// A constant by its value and its type's identity.
     fn konst(&mut self, konst: Const<'db>) -> Result<(), Unshared> {
+        stdx::ensure_sufficient_stack(|| self.konst_level(konst))
+    }
+
+    fn konst_level(&mut self, konst: Const<'db>) -> Result<(), Unshared> {
         match konst.kind() {
             ConstKind::Value(value) => {
                 self.u8(0);

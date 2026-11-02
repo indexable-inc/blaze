@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use blaze_cas::{Corrupt, Key};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_usercode::{
     RunKey,
@@ -245,7 +246,7 @@ pub struct Selector {
     versions: Versions,
     blocks: Vec<Block>,
     sets: Sets,
-    names: HashMap<Box<str>, u32>,
+    names: HashMap<Box<str>, u32, Global>,
     tests: Vec<Memo>,
 }
 
@@ -259,7 +260,7 @@ impl Selector {
             // alloc: empty, allocates nothing
             blocks: Vec::new(),
             sets: Sets::default(),
-            names: HashMap::default(),
+            names: HashMap::new_in(Global),
             // alloc: empty, allocates nothing
             tests: Vec::new(),
         }

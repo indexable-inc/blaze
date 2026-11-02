@@ -13,10 +13,10 @@ use crate::tests::lint;
 
 /// `dispatch_from_dyn` (with `unsize`) makes `&self` methods dispatchable, as with the real
 /// `core`: without its lang items no trait is dyn-compatible and no vtable call resolves.
-const MINICORE: &str =
+pub(super) const MINICORE: &str =
     "//- minicore: sized, clone, copy, derive, fn, default, from, deref, builtin_impls, dispatch_from_dyn\n";
 
-const ALLOC_STD: &str = r#"
+pub(super) const ALLOC_STD: &str = r#"
 //- /std/lib.rs crate:std
 #![feature(lang_items)]
 pub mod prelude {
@@ -68,7 +68,7 @@ pub mod intrinsics {
 }
 pub mod boxed {
     #[lang = "owned_box"]
-    pub struct Box<T: ?Sized>(pub *mut T);
+    pub struct Box<T: ?Sized, A: crate::alloc::Allocator = crate::alloc::Global>(pub *mut T, pub A);
     impl<T> Box<T> {
         pub fn new(x: T) -> Box<T> {
             crate::intrinsics::box_new(x)
@@ -232,9 +232,11 @@ macro_rules! vec {
     }};
 }
 pub mod hash {
+    pub trait BuildHasher {}
     pub struct RandomState {
         k0: u64,
     }
+    impl BuildHasher for RandomState {}
     impl RandomState {
         pub fn new() -> RandomState {
             RandomState { k0: 0 }
@@ -289,16 +291,46 @@ impl Default for FxBuildHasher {
         FxBuildHasher
     }
 }
+impl std::hash::BuildHasher for FxBuildHasher {}
 pub type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
+//- /foldhash/lib.rs crate:foldhash deps:std library
+pub mod fast {
+    pub struct RandomState;
+    impl std::hash::BuildHasher for RandomState {}
+}
+//- /hashbrown/lib.rs crate:hashbrown deps:std,foldhash library
+pub type DefaultHashBuilder = foldhash::fast::RandomState;
+pub struct HashMap<K, V, S = DefaultHashBuilder> {
+    keys: *const K,
+    values: *const V,
+    hasher: S,
+}
+impl<K, V> HashMap<K, V, DefaultHashBuilder> {
+    pub fn new() -> HashMap<K, V, DefaultHashBuilder> {
+        HashMap { keys: 0 as *const K, values: 0 as *const V, hasher: foldhash::fast::RandomState }
+    }
+}
+//- /blaze_hash/lib.rs crate:blaze_hash deps:std library
+pub struct FixedState;
+impl Default for FixedState {
+    fn default() -> FixedState {
+        FixedState
+    }
+}
+impl std::hash::BuildHasher for FixedState {}
+pub type HashMap<K, V> = std::collections::HashMap<K, V, FixedState>;
+pub type HashSet<K> = std::collections::HashSet<K, FixedState>;
 "#;
 
-const MAIN: &str = "//- /src/lib.rs crate:main deps:std,rustc_hash\n";
+const MAIN: &str = "//- /src/lib.rs crate:main deps:std,rustc_hash,foldhash,hashbrown,blaze_hash\n";
 
 const HOT_ATTR: &str = "#[deny(blaze::hot)]";
 
 /// The lint a message is blaze's of.
 fn lint_of(message: &str) -> Option<&'static str> {
-    if message.starts_with("this `clone` of") {
+    if message.contains("names its allocator") {
+        Some("implicit_allocator")
+    } else if message.starts_with("this `clone` of") {
         Some("hot_clone")
     } else if message.contains("through the workspace's own code") {
         Some("hot_alloc_call")
@@ -306,20 +338,26 @@ fn lint_of(message: &str) -> Option<&'static str> {
         Some("hot_alloc")
     } else if message.contains("goes through the vtable") {
         Some("hot_dyn")
-    } else if message.contains("SipHash") {
-        Some("std_hashmap")
+    } else if message.contains("the hasher is a choice") {
+        Some("default_hasher")
     } else {
         None
     }
 }
 
-/// The findings of blaze's lints in `src/lib.rs` of `out`, as (line, lint).
+/// The findings of blaze's hot lints in `src/lib.rs` of `out`, as (line, lint):
+/// `implicit_allocator`, in `blaze::hot` and warning everywhere else, has tests of its own.
 fn found(out: &str) -> Vec<(u32, &'static str)> {
+    found_of(out, |it| it != "implicit_allocator")
+}
+
+/// The findings in `src/lib.rs` of `out` of the lints `keep` says, as (line, lint).
+fn found_of(out: &str, keep: impl Fn(&str) -> bool) -> Vec<(u32, &'static str)> {
     let mut found = Vec::new();
     let mut lint = None;
     for line in out.lines() {
         if let Some(message) = line.strip_prefix("error: ").or_else(|| line.strip_prefix("warning: ")) {
-            lint = lint_of(message);
+            lint = lint_of(message).filter(|it| keep(it));
             continue;
         }
         let Some(at) = line.trim_start().strip_prefix("--> src/lib.rs:") else { continue };
@@ -342,7 +380,7 @@ fn expected(main: &str) -> Vec<(u32, &'static str)> {
             None => (number, marks),
         };
         for mark in marks.split_whitespace() {
-            let lint = ["hot_clone", "hot_alloc", "hot_alloc_call", "hot_dyn", "std_hashmap"]
+            let lint = ["hot_clone", "hot_alloc", "hot_alloc_call", "hot_dyn", "default_hasher", "implicit_allocator"]
                 .into_iter()
                 .find(|&it| it == mark)
                 .unwrap_or_else(|| panic!("`{mark}` is not a lint of blaze's"));
@@ -586,6 +624,121 @@ fn caller() {
     );
 }
 
+/// Runs `main` with `blaze::implicit_allocator` denied: its findings must be what the markers
+/// say, every other lint's left out.
+fn check_implicit(main: &str) {
+    let main = main.trim_start_matches('\n');
+    let fixture = format!("{MINICORE}{ALLOC_STD}{MAIN}{main}");
+    let out = lint(&fixture, "-A clippy::all --deny=blaze::implicit_allocator");
+    let found = found_of(&out, |it| it == "implicit_allocator");
+    assert_eq!(found, expected(main), "the findings of:\n{main}\nwere:\n{out}");
+}
+
+/// A field whose `Vec` leaves its allocator to `Global` is one finding, at the outermost type:
+/// the `String` inside it is not a second. A `Vec` that names its allocator is none.
+#[test]
+fn implicit_allocator_finds_a_field_of_a_global_vec() {
+    check_implicit(
+        r#"
+use std::alloc::Allocator;
+pub struct Frame;
+impl Allocator for Frame {
+    fn allocate(&self, _size: usize) -> *mut u8 {
+        0 as *mut u8
+    }
+}
+
+pub struct Index {
+    names: Vec<String>, //~ implicit_allocator
+    framed: Vec<u32, &'static Frame>,
+}
+"#,
+    );
+}
+
+/// A local made by `Vec::new()` is one finding, at the `let`, whether its type is written or
+/// inferred; `Box::new` is one too.
+#[test]
+fn implicit_allocator_finds_a_local_vec_and_box() {
+    check_implicit(
+        r#"
+pub fn locals() {
+    let v: Vec<u32> = Vec::new(); //~ implicit_allocator
+    let w = Vec::<u32>::new(); //~ implicit_allocator
+    let b = Box::new(1u32); //~ implicit_allocator
+    let _ = (v, w, b);
+}
+"#,
+    );
+}
+
+/// `collect` into a `Vec` of `Global` is a finding at the `let` it is bound by, or at the call
+/// when it is handed on; the call it is handed to is none.
+#[test]
+fn implicit_allocator_finds_a_collect_into_a_global_vec() {
+    check_implicit(
+        r#"
+pub struct Count(u32);
+impl Iterator for Count {
+    type Item = u32;
+}
+
+fn take<T>(_: T) {}
+
+pub fn collects() {
+    let c: Vec<u32> = Count(0).collect(); //~ implicit_allocator
+    take(Count(0).collect::<Vec<u32>>()); //~ implicit_allocator
+    let _ = c;
+}
+"#,
+    );
+}
+
+/// A `Vec` that names its allocator is fine; a line saying why it needs the global heap is
+/// kept, one with an empty reason is not, and neither is `#[expect]`'s.
+#[test]
+fn implicit_allocator_passes_a_named_allocator_and_an_exemption() {
+    check_implicit(
+        r#"
+use std::alloc::Allocator;
+pub struct Frame;
+impl Allocator for Frame {
+    fn allocate(&self, _size: usize) -> *mut u8 {
+        0 as *mut u8
+    }
+}
+
+pub fn task(frame: &Frame) {
+    let framed: Vec<u32, &Frame> = Vec::new_in(frame);
+    let empty: Vec<u32> = Vec::new(); // alloc:
+    //~^ implicit_allocator
+    let kept: Vec<u32> = Vec::new(); // alloc: handed to the caller, who outlives the task
+    let _ = (framed, empty, kept);
+}
+
+#[expect(blaze::implicit_allocator, reason = "the test's own")]
+pub fn expected() {
+    let v: Vec<u32> = Vec::new();
+    let _ = v;
+}
+"#,
+    );
+}
+
+/// `String` takes no allocator: a signature naming it and a local made by `String::from` are
+/// each a finding.
+#[test]
+fn implicit_allocator_finds_a_string() {
+    check_implicit(
+        r#"
+pub fn named(s: &str) -> String { //~ implicit_allocator
+    let t = String::from(s); //~ implicit_allocator
+    t
+}
+"#,
+    );
+}
+
 #[test]
 fn hot_dyn() {
     check(
@@ -636,8 +789,11 @@ fn exempt(s: &dyn Shape) {
     );
 }
 
+/// `default_hasher`: a hash collection whose hasher is left to its default or seeded at random,
+/// std's or another crate's, written or made; a hasher written out deterministic, an alias that
+/// fixes one, a parameter the caller picks and an `#[expect]` with its reason are not.
 #[test]
-fn std_hashmap() {
+fn default_hasher() {
     check(
         r#"
 use std::collections::{HashMap, HashSet};
@@ -650,22 +806,33 @@ impl Iterator for Pairs {
 
 #[deny(blaze::hot)]
 struct Index {
-    names: HashMap<u32, u32>, //~ std_hashmap
+    names: HashMap<u32, u32>, //~ default_hasher
     fast: FxHashMap<u32, u32>,
+    fixed: blaze_hash::HashMap<u32, u32>,
+    chosen: HashMap<u32, u32, blaze_hash::FixedState>,
+    seeded: HashMap<u32, u32, RandomState>, //~ default_hasher
+    brown: hashbrown::HashMap<u32, u32>, //~ default_hasher
+    folded: hashbrown::HashMap<u32, u32, foldhash::fast::RandomState>, //~ default_hasher
 }
 
 #[deny(blaze::hot)]
-type Map = HashMap<u32, u32>; //~ std_hashmap
+struct Picked<S> {
+    map: HashMap<u32, u32, S>,
+}
 
 #[deny(blaze::hot)]
-fn hot(m: &HashMap<u32, u32>) { //~ std_hashmap
+type Map = HashMap<u32, u32>; //~ default_hasher
+
+#[deny(blaze::hot)]
+fn hot(m: &HashMap<u32, u32>) { //~ default_hasher
     let _ = m;
-    let _: HashMap<u32, u32> = HashMap::new(); //~ std_hashmap std_hashmap
-    let _ = HashSet::<u32>::new(); //~ std_hashmap
-    let _: HashMap<u32, u32> = Default::default(); //~ std_hashmap std_hashmap
-    let _ = Pairs.collect::<HashMap<u32, u32>>(); //~ std_hashmap
-    let _: HashMap<u32, u32> = Pairs.collect(); //~ std_hashmap std_hashmap
-    let _: HashMap<u32, u32, RandomState> = HashMap::with_hasher(RandomState::new()); //~ std_hashmap std_hashmap
+    let _: HashMap<u32, u32> = HashMap::new(); //~ default_hasher default_hasher
+    let _ = HashSet::<u32>::new(); //~ default_hasher
+    let _: HashMap<u32, u32> = Default::default(); //~ default_hasher default_hasher
+    let _ = Pairs.collect::<HashMap<u32, u32>>(); //~ default_hasher
+    let _: HashMap<u32, u32> = Pairs.collect(); //~ default_hasher default_hasher
+    let _: HashMap<u32, u32, RandomState> = HashMap::with_hasher(RandomState::new()); //~ default_hasher default_hasher
+    let _ = hashbrown::HashMap::<u32, u32>::new(); //~ default_hasher
     let _: FxHashMap<u32, u32> = FxHashMap::default(); //~ hot_alloc
     let _: HashMap<u32, u32, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher); //~ hot_alloc
     let _: FxHashMap<u32, u32> = Pairs.collect(); //~ hot_alloc
@@ -682,14 +849,20 @@ fn cold() -> HashMap<u32, u32> {
 }
 
 #[deny(blaze::hot)]
-fn exempt() {
-    let _: HashMap<u32, u32> = HashMap::new(); // alloc: built once at startup
-    // alloc: the slow path
-    let _: HashMap<u32, u32> = HashMap::new();
-    let _: HashMap<u32, u32> = HashMap::new(); // alloc:
-    //~^ std_hashmap std_hashmap
-    let _: HashMap<u32, u32> = HashMap::new(); // dyn: the wrong tag
-    //~^ std_hashmap std_hashmap
+#[expect(blaze::default_hasher, reason = "keys come from peers on the network, so HashDoS matters")]
+struct Untrusted {
+    peers: HashMap<u32, u32, RandomState>,
+}
+
+#[allow(blaze::std_hashmap)]
+fn old_name() -> HashMap<u32, u32> {
+    HashMap::new()
+}
+
+#[deny(blaze::hot)]
+fn commented() {
+    let _: HashMap<u32, u32> = HashMap::new(); // alloc: an allocation's reason is no hasher's
+    //~^ default_hasher default_hasher
 }
 "#,
     );
@@ -703,6 +876,7 @@ mod fiber_boundary {
     use base_db::FileId;
     use blaze_diagnostics::emit::{Sources, Style};
     use blaze_hash::HashMap;
+    use std::alloc::Global;
     use hir_expand::fixture;
 
     use crate::{
@@ -747,7 +921,7 @@ pub mod sched {
                 .into_iter()
                 .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == linted))
                 .expect("the fixture has the crate linted");
-            let mut names: HashMap<FileId, String> = HashMap::default();
+            let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
             let mut texts = Vec::new();
             for krate in hir::Crate::all(&db) {
                 for module in krate.modules(&db) {
@@ -994,4 +1168,252 @@ fn the_registry_has_blazes_lints_and_group_as_here() {
     let hot: Vec<&str> = hot.lints.iter().map(|it| it.name).collect();
     let here: Vec<String> = super::HOT.iter().map(|it| format!("blaze::{}", it.name())).collect();
     assert_eq!(hot, here);
+}
+
+/// Lints `main` with blaze's lint `name` warned of and every clippy lint allowed.
+fn lint_only(main: &str, name: &str) -> String {
+    let fixture = format!("{MINICORE}{ALLOC_STD}{MAIN}{}", main.trim_start_matches('\n'));
+    lint(&fixture, &format!("-A clippy::all --warn=blaze::{name}"))
+}
+
+/// `struct_update`: a literal taking fields from a local is found with the fields written out
+/// as its fix, one taking them from `Default::default()` is found with no fix, and a literal
+/// that writes every field, or that a macro wrote, is not.
+#[test]
+fn struct_update_writes_out_the_fields_taken_from_a_place() {
+    let out = lint_only(
+        r#"
+pub struct Config {
+    pub a: u32,
+    pub b: u32,
+    pub c: u32,
+}
+impl Default for Config {
+    fn default() -> Config {
+        Config { a: 0, b: 0, c: 0 }
+    }
+}
+pub fn from_base(base: Config) -> Config {
+    Config { a: 1, ..base }
+}
+pub fn from_default() -> Config {
+    Config { a: 1, ..Default::default() }
+}
+pub fn whole(base: Config) -> Config {
+    Config { a: 1, b: base.b, c: base.c }
+}
+macro_rules! make {
+    ($base:expr) => {
+        Config { a: 2, ..$base }
+    };
+}
+pub fn by_macro(base: Config) -> Config {
+    make!(base)
+}
+"#,
+        "struct_update",
+    );
+    assert_eq!(out.matches("a field added to `Config` is filled here without a decision").count(), 2, "{out}");
+    assert!(out.contains("this `Config` literal takes `b`, `c` from `base`"), "{out}");
+    assert!(out.contains("Config { a: 1, b: base.b, c: base.c }"), "the fix writes the fields out:\n{out}");
+    assert!(out.contains("this `Config` literal takes `b`, `c` from `Default::default()`"), "{out}");
+}
+
+/// `struct_update` checks the workspace's structs only: another crate's may be
+/// `#[non_exhaustive]` or change under a version bump.
+#[test]
+fn struct_update_leaves_another_crates_struct_alone() {
+    let main = r#"
+pub fn ext(base: dep::Ext) -> dep::Ext {
+    dep::Ext { a: 1, ..base }
+}
+pub struct Own {
+    pub a: u32,
+    pub b: u32,
+}
+pub fn own(base: Own) -> Own {
+    Own { a: 1, ..base }
+}
+"#;
+    let fixture = format!(
+        "{MINICORE}{ALLOC_STD}//- /dep/lib.rs crate:dep deps:std library\npub struct Ext {{ pub a: u32, pub b: u32 }}\n\
+         //- /src/lib.rs crate:main deps:std,dep\n{}",
+        main.trim_start_matches('\n')
+    );
+    let out = lint(&fixture, "-A clippy::all --warn=blaze::struct_update");
+    assert!(out.contains("this `Own` literal takes `b` from `base`"), "{out}");
+    assert!(!out.contains("`Ext` literal"), "another crate's struct is not checked:\n{out}");
+}
+
+/// `bool_param`: a `bool` parameter of a public, crate-visible or private function, and of a
+/// trait's declaration, is found, the enum named from the parameter; a setter of one `bool`,
+/// a trait impl's method, a closure and an `extern "C"` function are not.
+#[test]
+fn bool_param_finds_a_flag_of_the_workspace() {
+    let out = lint_only(
+        r#"
+pub fn build(name: &str, verbose: bool) -> usize {
+    name.len() + verbose as usize
+}
+fn private(is_hot: bool) -> bool {
+    is_hot
+}
+pub struct Unit {
+    on: bool,
+}
+impl Unit {
+    pub fn set_on(&mut self, on: bool) {
+        self.on = on;
+    }
+    pub(crate) fn toggle(&mut self, on: bool, now: bool) {
+        self.on = on && now;
+    }
+}
+pub trait Shown {
+    fn show(&self, plain: bool) -> u32;
+}
+impl Shown for Unit {
+    fn show(&self, plain: bool) -> u32 {
+        plain as u32
+    }
+}
+pub fn closure() -> bool {
+    let flip = |flag: bool| !flag;
+    flip(true)
+}
+pub extern "C" fn exported(flag: bool) -> bool {
+    flag
+}
+"#,
+        "bool_param",
+    );
+    assert!(out.contains("`fn build` takes `verbose: bool`"), "{out}");
+    assert!(out.contains("take `Verbose`"), "{out}");
+    assert!(out.contains("`fn private` takes `is_hot: bool`"), "{out}");
+    assert!(out.contains("take `Hot`"), "{out}");
+    assert!(out.contains("`fn toggle` takes `on: bool`"), "{out}");
+    assert!(out.contains("`fn toggle` takes `now: bool`"), "{out}");
+    assert!(out.contains("`fn show` takes `plain: bool`"), "{out}");
+    assert!(!out.contains("`fn set_on`"), "a setter of one `bool` is not found:\n{out}");
+    assert!(!out.contains("`fn exported`"), "an `extern \"C\"` function is not found:\n{out}");
+    assert_eq!(out.matches("does not say what it chooses").count(), 5, "{out}");
+}
+
+/// `wildcard_arm`: a `_` over an enum of the workspace (behind a reference too) is found with
+/// the variants it stands for written out as its fix, by the path the other arms name them
+/// with; a `_` after every variant is listed stands for none and is not found.
+#[test]
+fn wildcard_arm_writes_out_the_variants_a_wildcard_stands_for() {
+    let out = lint_only(
+        r#"
+pub enum Kind {
+    A,
+    B(u32),
+    C { x: u32 },
+}
+pub fn one(k: &Kind) -> u32 {
+    match k {
+        Kind::A => 1,
+        _ => 2,
+    }
+}
+pub fn none(k: Kind) -> u32 {
+    match k {
+        Kind::A => 1,
+        Kind::B(_) => 2,
+        Kind::C { .. } => 3,
+        _ => 4,
+    }
+}
+"#,
+        "wildcard_arm",
+    );
+    assert!(out.contains("this `_` stands for `Kind::B`, `Kind::C` of `Kind`"), "{out}");
+    assert!(out.contains("Kind::B(..) | Kind::C { .. } => 2,"), "the fix lists the variants:\n{out}");
+    assert_eq!(out.matches("should be a compile error at every `match`").count(), 1, "{out}");
+}
+
+/// `wildcard_arm` checks the workspace's exhaustive enums only: another crate's enum and a
+/// `#[non_exhaustive]` one are not found, and a `_` of the workspace's enum nested in another
+/// crate's (`Opt::Some(_)`) is.
+#[test]
+fn wildcard_arm_checks_the_workspaces_exhaustive_enums_only() {
+    let main = r#"
+pub fn ext(o: dep::Ord3) -> u32 {
+    match o {
+        dep::Ord3::Less => 1,
+        _ => 2,
+    }
+}
+#[non_exhaustive]
+pub enum Open {
+    A,
+    B,
+    C,
+}
+pub fn open(o: Open) -> u32 {
+    match o {
+        Open::A => 1,
+        _ => 2,
+    }
+}
+pub enum Kind {
+    A,
+    B,
+    C,
+}
+pub fn nested(o: dep::Opt<Kind>) -> u32 {
+    match o {
+        dep::Opt::Some(Kind::A) => 1,
+        dep::Opt::Some(_) => 2,
+        dep::Opt::None => 3,
+    }
+}
+"#;
+    let fixture = format!(
+        "{MINICORE}{ALLOC_STD}//- /dep/lib.rs crate:dep deps:std library\n\
+         pub enum Ord3 {{ Less, Equal, Greater }}\npub enum Opt<T> {{ Some(T), None }}\n\
+         //- /src/lib.rs crate:main deps:std,dep\n{}",
+        main.trim_start_matches('\n')
+    );
+    let out = lint(&fixture, "-A clippy::all --warn=blaze::wildcard_arm");
+    assert!(!out.contains("of `Ord3`"), "another crate's enum is not checked:\n{out}");
+    assert!(!out.contains("of `Open`"), "a `#[non_exhaustive]` enum is not checked:\n{out}");
+    assert!(out.contains("this `_` stands for `Kind::B`, `Kind::C` of `Kind`"), "{out}");
+    assert!(out.contains("dep::Opt::Some(Kind::B | Kind::C) => 2,"), "the nested `_` is written out:\n{out}");
+}
+
+/// `wildcard_arm`: a guarded `_` and a catch-all binding get help with the variants, no fix; a
+/// guarded arm covers nothing, so the `_` after it stands for the same variants and is fixed.
+#[test]
+fn wildcard_arm_helps_a_guarded_or_bound_catch_all() {
+    let out = lint_only(
+        r#"
+pub enum Kind {
+    A,
+    B,
+    C,
+}
+pub fn guarded(k: Kind, hot: bool) -> u32 {
+    match k {
+        Kind::A => 1,
+        _ if hot => 2,
+        _ => 3,
+    }
+}
+pub fn bound(k: Kind) -> Kind {
+    match k {
+        Kind::A => Kind::B,
+        other => other,
+    }
+}
+"#,
+        "wildcard_arm",
+    );
+    assert!(out.contains("write the variants out, `Kind::B | Kind::C`, and keep the guard"), "{out}");
+    assert!(!out.contains("Kind::B | Kind::C if hot"), "a guarded arm gets no fix:\n{out}");
+    assert!(out.contains("Kind::B | Kind::C => 3,"), "the `_` after the guard is fixed:\n{out}");
+    assert!(out.contains("the catch-all binding `other` stands for `Kind::B`, `Kind::C` of `Kind`"), "{out}");
+    assert!(out.contains("bind the variants instead: `other @ (Kind::B | Kind::C)`"), "{out}");
+    assert!(!out.contains("Kind::B | Kind::C => other"), "a binding gets no fix:\n{out}");
 }

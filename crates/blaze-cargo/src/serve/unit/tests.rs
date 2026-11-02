@@ -3,8 +3,10 @@
 use std::{
     ffi::{OsStr, OsString},
     path::PathBuf,
-    sync::OnceLock,
 };
+
+#[expect(clippy::disallowed_types, reason = "a test job's slots, as the job keeps them: per job, not global")]
+use std::sync::OnceLock;
 
 use blaze_api::{Artifact, ArtifactKind, Level, UnitProfile};
 use blaze_ids::ContentId;
@@ -52,7 +54,7 @@ fn unit(pkg: &str, target: Target, mode: Mode, deps: &[usize]) -> Unit {
         is_std: false,
         dependencies: deps
             .iter()
-            .map(|it| UnitDep { index: *it, extern_crate_name: "dep".to_owned(), public: None, noprelude: None, nounused: None })
+            .map(|it| UnitDep { index: *it, extern_crate_name: "dep".to_owned(), public: None, noprelude: None, nounused: None, dev: false })
             .collect(),
     }
 }
@@ -75,6 +77,7 @@ fn plan(extra: &str, outputs: &[&str]) -> UnitPlan {
         runner: Vec::new(),
         harness: true,
         clippy: None,
+        macro_wasm: false,
     }
 }
 
@@ -134,6 +137,7 @@ fn build(dir: &std::path::Path) -> Units {
     }
 }
 
+#[expect(clippy::disallowed_types, reason = "a test job's slots, as the job keeps them: per job, not global")]
 fn slots(units: &Units) -> Vec<OnceLock<script::Applied>> {
     units.graph.units.iter().map(|_| OnceLock::new()).collect()
 }
@@ -142,6 +146,7 @@ fn value(code: i32, stdout: &str, stderr: &str) -> Value {
     Value { code: Some(code), signal: None, stdout: stdout.as_bytes().to_vec(), stderr: stderr.as_bytes().to_vec(), files: Vec::new() }
 }
 
+#[expect(clippy::disallowed_types, reason = "a test job's slots, as the job keeps them: per job, not global")]
 fn of<'a>(units: &'a Units, scripts: &'a [OnceLock<script::Applied>], tools: &'a std::path::Path) -> script::Of<'a> {
     script::Of {
         units,
@@ -249,11 +254,13 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
         ("PATH".to_owned(), "/usr/bin".to_owned()),
         ("SECRET_TOKEN".to_owned(), "hunter2".to_owned()),
         ("CARGO_PKG_NAME".to_owned(), "wrong".to_owned()),
+        ("BLAZE_SCRIPT_CACHE".to_owned(), "check".to_owned()),
     ];
     let dir = tempfile::tempdir().unwrap();
     let units = build(dir.path());
     let env = script::inherited(&job, &units.plans[1]);
     let get = |name: &str| env.iter().find(|(it, _)| it == name).map(|(_, value)| value.clone());
+    assert_eq!(get("BLAZE_SCRIPT_CACHE"), None, "how blaze checks its store is the job's, never a script's");
     assert_eq!(get("CARGO_PKG_NAME"), Some(OsString::from("z-sys")));
     assert_eq!(get("SECRET_TOKEN"), Some(OsString::from("hunter2")));
     assert_eq!(get("PATH"), Some(OsString::from("/usr/bin")));
@@ -267,6 +274,7 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
         network: false,
         memory: None,
         mode: blaze_usercode::run::Mode::Normal,
+        roots: blaze_usercode::roots::RootMap::default(),
     };
     let one = blaze_usercode::script::prepare(&z, &env, &place).unwrap();
     let other: Vec<(String, String)> =
@@ -545,7 +553,9 @@ fn a_records_header_is_checked_in_place() {
     let two = Key(ContentId::of("blaze v2 test 1", b"two"));
     let lib = ContentId([7; 32]);
     let mut bytes = Vec::new();
-    compile::header::write(&mut bytes, &[one, two], &[("/usr/lib/libz.so".to_owned(), lib)]);
+    let counts = blaze_codegen::driver::ProfileCounts { used: 5, mismatched: 1, applied: 3 };
+    let profiles = [(ContentId([3; 32]), counts)];
+    compile::header::write(&mut bytes, &[one, two], &[("/usr/lib/libz.so".to_owned(), lib)], &profiles);
     let body = bytes.len();
     bytes.extend_from_slice(b"cbor");
     let same = |path: &std::path::Path| (path == std::path::Path::new("/usr/lib/libz.so")).then_some([7; 32]);
@@ -555,6 +565,80 @@ fn a_records_header_is_checked_in_place() {
     assert_eq!(compile::header::check(&bytes, |_| true, &mut { changed }), None, "a library changed");
     assert_eq!(compile::header::check(&bytes[..body - 3], |_| true, &mut { same }), None, "cut short");
     assert_eq!(compile::header::check(b"nope", |_| true, &mut { same }), None);
+    assert_eq!(compile::header::profiles(&bytes).as_deref(), Some(&profiles[..]));
+    assert_eq!(compile::header::profiles(&bytes[..body - 3]), None, "cut short");
+}
+
+/// The job-wide check that a profile applied to something (`codegen::judge`, what
+/// `codegen::unapplied` calls): each unit's counts are this job's, else its record's, summed
+/// over every unit, and a job that failed is not judged.
+#[test]
+fn a_profile_is_judged_over_every_unit_counted_or_recorded() {
+    use blaze_codegen::driver::ProfileCounts;
+    use codegen::{Accounted, Recorded};
+    let profiled = ContentId([1; 32]);
+    let by_blaze = blaze_lints::profile::Names { records: 10, blaze: 10, rustc: 0, foreign: 0 };
+    let profiles = [codegen::Named { id: profiled, path: "a.profdata", names: Ok(by_blaze) }];
+    let ran = [(profiled, ProfileCounts { used: 10, mismatched: 0, applied: 4 })];
+    let never_ran = [(profiled, ProfileCounts { used: 6, mismatched: 0, applied: 0 })];
+    let replayed = |counts: &[(ContentId, ProfileCounts)]| -> Result<Recorded, blaze_api::ApiError> { Ok(Recorded::Read(counts.to_vec())) };
+    // `bin a` (unit 0) replayed from a record that applied, `bin b` (unit 1) built with
+    // nothing applied: one applied anywhere passes.
+    let units = [Accounted { unit: 0, counted: None }, Accounted { unit: 1, counted: Some(&never_ran[..]) }];
+    let judged = codegen::judge(true, units, |unit| {
+        assert_eq!(unit, 0, "only the unit nothing counted this job is read from its record");
+        replayed(&ran)
+    }, &profiles);
+    assert_eq!(judged.map_err(|it| it.what), Ok(Vec::new()));
+    // Both replayed, nothing applied: refused, naming the path, the ID and the cause.
+    let units = [Accounted { unit: 0, counted: None }, Accounted { unit: 1, counted: None }];
+    let refused = codegen::judge(true, units, |_| replayed(&never_ran), &profiles).unwrap_err().what;
+    assert!(refused.contains("`-C profile-use=a.profdata`") && refused.contains(&format!("{profiled:x}")), "{refused}");
+    assert!(refused.contains("none of the 12 functions") && refused.contains("key version"), "{refused}");
+    // A failed job is not judged: nothing is read, nothing refused.
+    let units = [Accounted { unit: 0, counted: Some(&never_ran[..]) }, Accounted { unit: 1, counted: None }];
+    let judged = codegen::judge(false, units, |_| panic!("a failed job reads no record"), &profiles);
+    assert_eq!(judged.map_err(|it| it.what), Ok(Vec::new()));
+    // In a job that succeeded, a unit with neither counts nor a record is an error naming it.
+    let units = [Accounted { unit: 1, counted: None }];
+    let missing = |_| Ok(Recorded::Missing("unit 1 (`b`): the store has no record under its key 0a0b".to_owned()));
+    let refused = codegen::judge(true, units, missing, &profiles).unwrap_err().what;
+    assert!(refused.starts_with("unit 1 (`b`): the store has no record under its key 0a0b"), "{refused}");
+}
+
+/// A profile that applied to nothing refuses the job only when blaze made it under other keys
+/// (rule 3); one rustc or clang made, or one edited, is a warning and the build goes on, as
+/// under rustc (rule 4).
+#[test]
+fn only_a_profile_blaze_made_is_refused_for_applying_to_nothing() {
+    use blaze_codegen::driver::ProfileCounts;
+    use blaze_lints::profile::Names;
+    use codegen::{Accounted, Named};
+    let id = ContentId([1; 32]);
+    let judge = |names: Result<Names, &str>, counts: ProfileCounts| {
+        let profiles = [Named { id, path: "a.profdata", names }];
+        let counted = [(id, counts)];
+        let units = [Accounted { unit: 0, counted: Some(&counted[..]) }];
+        codegen::judge(true, units, |_| panic!("every unit is counted"), &profiles).map_err(|it| it.what)
+    };
+    let nothing = ProfileCounts { used: 6, mismatched: 0, applied: 0 };
+    let by_rustc = Names { records: 4, blaze: 0, rustc: 3, foreign: 1 };
+    let warned = judge(Ok(by_rustc), nothing).unwrap();
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(warned[0].contains("`-C profile-use=a.profdata`") && warned[0].contains("3 are symbols rustc mangled"), "{warned:?}");
+    assert!(warned[0].contains("blaze can't apply profiles rustc made; make one with blaze's -Cprofile-generate"), "{warned:?}");
+    let by_blaze = Names { records: 4, blaze: 4, rustc: 0, foreign: 0 };
+    let refused = judge(Ok(by_blaze), nothing).unwrap_err();
+    assert!(refused.contains("a.profdata") && refused.contains("key version"), "{refused}");
+    // Any record found edited says the keys agree: the program changed, a warning.
+    let edited = ProfileCounts { used: 6, mismatched: 1, applied: 0 };
+    let warned = judge(Ok(by_blaze), edited).unwrap();
+    assert!(warned.len() == 1 && warned[0].contains("edited since it was profiled"), "{warned:?}");
+    // Names that don't read say nothing of who made it: a warning naming why.
+    let warned = judge(Err("is not an indexed profile"), nothing).unwrap();
+    assert!(warned.len() == 1 && warned[0].contains("is not an indexed profile"), "{warned:?}");
+    // Applied somewhere: nothing said.
+    assert_eq!(judge(Ok(by_rustc), ProfileCounts { used: 6, mismatched: 0, applied: 1 }), Ok(Vec::new()));
 }
 
 fn selection<'a>(filter: &'a [String], args: &'a [String]) -> crate::serve::work::Selection<'a> {
@@ -829,6 +913,7 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         public: None,
         noprelude: Some(true),
         nounused: None,
+        dev: false,
     };
     let made = |pkg: &str, target: Target, is_std: bool, dependencies: Vec<UnitDep>| Unit {
         profile: Profile { incremental: true, strip: Strip::Resolved(Stripped::None), ..Profile::dev() },
@@ -879,6 +964,7 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         host: HOST.to_owned(),
         library: "/rustc/abc/library".to_owned(),
         std: "/s/std".to_owned(),
+        builds: "/s/build".to_owned(),
     };
     blaze_lower::lower(blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None }).unwrap()
 }
@@ -959,4 +1045,257 @@ fn a_units_phase_spans_name_its_package_version_and_target() {
     assert_eq!(compile::span_unit(&unit(api, bin, Mode::Build, &[])), "blaze-api v0.1.0 (bin \"blaze\")");
     let tests = target("e2e", "test", "tests/e2e.rs");
     assert_eq!(compile::span_unit(&unit(api, tests, Mode::Test, &[])), "blaze-api v0.1.0 (test \"e2e\")");
+}
+
+/// A build script that reads `FOO` of the process through `option_env!` and nothing else.
+const SCRIPT: &[u8] = b"#[rustc_builtin_macro]\nmacro_rules! option_env { () => {} }\n\n\
+fn main() { let _ = option_env!(\"FOO\"); }\n";
+
+/// [`SCRIPT`] with its `main` edited.
+const SCRIPT_EDITED: &[u8] = b"#[rustc_builtin_macro]\nmacro_rules! option_env { () => {} }\n\n\
+fn main() { let _ = option_env!(\"FOO\"); let _ = 1; }\n";
+
+/// One run of blaze compiling build script `text` (unit 1, on `core` when `on_core`) for a
+/// process with the variables `env`: lowered over files in memory, its crate resolved so the
+/// `env!` log has what it read, and its record's base key worked out as `compile` works it out,
+/// with what its code read.
+fn script_run(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> (blaze_cas::Key, super::reads::Reads) {
+    let (lowered, base) = script_lowered(text, on_core, env);
+    let krate = lowered.krate(1).unwrap();
+    (base, super::reads::Reads::of(lowered.db(), krate).unwrap())
+}
+
+/// [`script_run`]'s front end, its crate resolved, and the record's base key.
+fn script_lowered(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> (blaze_lower::Lowered, blaze_cas::Key) {
+    use blaze_units::{
+        query::{BuildConfig, Command, Invocation, Mount, Origin},
+        schema::{Strip, Stripped},
+    };
+    let tree = blaze_query::MemTree::default();
+    let library = tree.root(&[("core/Cargo.toml", b"[package]\nname = \"core\"\n"), ("core/src/lib.rs", b"pub mod marker {}\n")]);
+    let view = tree.root(&[("Cargo.toml", b"[package]\nname = \"s\"\nbuild = \"build.rs\"\n"), ("build.rs", text)]);
+    let (core, s) = ("path+file:///rustc/abc/library/core#0.0.0", "path+file:///w#0.1.0");
+    let resolved = |mut it: Unit| {
+        it.profile = Profile { incremental: true, strip: Strip::Resolved(Stripped::None), ..Profile::dev() };
+        it
+    };
+    let mut core_unit = resolved(unit(core, target("core", "lib", "/rustc/abc/library/core/src/lib.rs"), Mode::Build, &[]));
+    core_unit.is_std = true;
+    let mut script = resolved(unit(s, target("build-script-build", "custom-build", "/w/build.rs"), Mode::Build, &[]));
+    script.dependencies = match on_core {
+        true => vec![UnitDep { index: 0, extern_crate_name: "core".to_owned(), public: None, noprelude: Some(true), nounused: None, dev: false }],
+        false => Vec::new(),
+    };
+    let units = Units {
+        graph: UnitGraph { version: 1, units: vec![core_unit, script], roots: vec![1] },
+        plans: vec![plan("", &[]), plan("", &[])],
+        packages: vec![PackagePlan { is_member: false, ..package(core, "core", "/rustc/abc/library/core") }, package(s, "s", "/w")],
+        lock: None,
+        warnings: Vec::new(),
+        target_dir: "/w/target".to_owned(),
+        build_dir: "/w/target".to_owned(),
+        finished: String::new(),
+        link_dirs: Vec::new(),
+        sandboxed_tests: false,
+    };
+    let config = BuildConfig {
+        invocation: Invocation {
+            command: Command::Build,
+            args: Vec::new(),
+            root: "/w".to_owned(),
+            cwd: "/w".to_owned(),
+            env: super::reads::tests::env(env),
+            files: Vec::new(),
+        },
+        mounts: vec![
+            Mount { at: "/rustc/abc/library".to_owned(), origin: Origin::Root(library), under: String::new() },
+            Mount { at: "/w".to_owned(), origin: Origin::View, under: String::new() },
+        ],
+        host: HOST.to_owned(),
+        library: "/rustc/abc/library".to_owned(),
+        std: "/s/std".to_owned(),
+        builds: "/s/build".to_owned(),
+    };
+    let lower = blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None };
+    let mut lowered = blaze_lower::lower(lower).unwrap();
+    let identity = lowered.identity(1).unwrap();
+    let krate = lowered.krate(1).unwrap();
+    // What its compile does to the front end: every body resolved, `option_env!` expanded.
+    hir_def::deps::checked_reads(lowered.db(), krate).unwrap();
+    let script = &units.graph.units[1];
+    let base = compile::RecordInputs {
+        identity,
+        unit: compile::KeyedUnit::among(script, |at| Ok(&units.graph.units[at])).unwrap(),
+        plan: &units.plans[1],
+        run_env: &[],
+        toolchain: ContentId::of("blaze v2 cargo test toolchain", b"one blaze"),
+        goal: compile::keyed_goal(crate::serve::work::Goal::Build, script),
+        color: false,
+        short: false,
+        verified: false,
+        reached: false,
+        pgo: None,
+        lint_profile: None,
+        layout: None,
+        width: None,
+        refused: None,
+    }
+    .key(1)
+    .unwrap();
+    (lowered, base)
+}
+
+/// The key of the record of `base` that `store` has for the variables `env`, as
+/// `compile::fresh` looks.
+fn look(store: &super::reads::tests::Store, base: blaze_cas::Key, env: &[(&str, &str)]) -> Option<blaze_cas::Key> {
+    store.find(base, &super::reads::tests::env(env)).map(|it| it.key)
+}
+
+/// Two runs of the same tree differ in the variables of the process that starts them: the
+/// coordinator's runs each set their own `BLAZE_PROFILE` directory, and the shell's `OLDPWD`,
+/// `SHLVL`, the client's pid and its temp directory differ too. A build script's compile
+/// reads none of them, so the second run finds the first run's record. Self-builds 47 to 55
+/// recomputed every build script, 1,232 s of `unit names` and 1,855 s of `unit codegen` in
+/// build 53, because the whole environment was in every crate's identity.
+#[test]
+fn build_script_compile_is_reused_across_runs() {
+    let first = [
+        ("FOO", "on"),
+        ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101"),
+        ("OLDPWD", "/w"),
+        ("SHLVL", "1"),
+        ("BLAZE_CLIENT_PID", "4242"),
+        ("TMPDIR", "/var/folders/aa/T"),
+    ];
+    let second = [
+        ("FOO", "on"),
+        ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0242"),
+        ("OLDPWD", "/tmp/elsewhere"),
+        ("SHLVL", "3"),
+        ("BLAZE_CLIENT_PID", "977"),
+        ("TMPDIR", "/var/folders/bb/T"),
+        ("TERM_SESSION_ID", "w0t0p0"),
+    ];
+    let (base, read) = script_run(SCRIPT, true, &first);
+    assert_eq!(read, super::reads::Reads::named(&["FOO"]), "the script read `FOO` and nothing else of the process");
+    let mut store = super::reads::tests::Store::default();
+    let filed = store.keep(base, &read, &super::reads::tests::env(&first));
+    let (again, read_again) = script_run(SCRIPT, true, &second);
+    assert_eq!(again, base, "a variable no crate read is not in the record's key");
+    assert_eq!(look(&store, again, &second), Some(filed), "the second run's compile is a store hit");
+    let slots = store.0.len();
+    assert_eq!(store.keep(again, &read_again, &super::reads::tests::env(&second)), filed);
+    assert_eq!(store.0.len(), slots, "the second run files nothing new");
+}
+
+/// What a build script's compile is made from makes its record miss when it changes: the
+/// value of a variable its code read (another value, or unset), its source, a dependency.
+#[test]
+fn a_real_input_of_a_build_script_makes_its_record_miss() {
+    let run = [("FOO", "on"), ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
+    let (base, read) = script_run(SCRIPT, true, &run);
+    let mut store = super::reads::tests::Store::default();
+    let filed = store.keep(base, &read, &super::reads::tests::env(&run));
+    let other_value: &[(&str, &str)] = &[("FOO", "off"), ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
+    let unset: &[(&str, &str)] = &[("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
+    for env in [other_value, unset] {
+        let (again, read_again) = script_run(SCRIPT, true, env);
+        assert_eq!(again, base, "{env:?}: the base key holds no variable's value");
+        assert_eq!(look(&store, again, env), None, "{env:?}: a variable the script read changed");
+        let elsewhere = super::reads::tests::Store::default().keep(again, &read_again, &super::reads::tests::env(env));
+        assert_ne!(elsewhere, filed, "{env:?}");
+    }
+    let (edited, _) = script_run(SCRIPT_EDITED, true, &run);
+    assert_ne!(edited, base, "its source");
+    assert_eq!(look(&store, edited, &run), None, "its source");
+    let (alone, _) = script_run(SCRIPT, false, &run);
+    assert_ne!(alone, base, "a dependency");
+    assert_eq!(look(&store, alone, &run), None, "a dependency");
+}
+
+/// A proc macro can read a file outside the source tree (a schema or a `.proto` beside the
+/// workspace), which no input of the record's base key names. The record is filed by what the
+/// expansion read, so a lookup after the file changed misses, with no macro run to find out,
+/// and finds it again once the file is as it was.
+#[test]
+fn a_file_a_proc_macro_read_outside_the_tree_makes_the_record_miss_once_it_changes() {
+    let run = [("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
+    let (lowered, base) = script_lowered(SCRIPT, true, &run);
+    let krate = lowered.krate(1).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let schema = outside.path().join("schema.sql");
+    let made: &[u8] = b"create table a (x int);";
+    std::fs::write(&schema, made).unwrap();
+    let hash = blaze_usercode::inputs::hash_reader(made).unwrap();
+    let traced = blaze_core::Traced { files: vec![(schema.clone(), Some(hash))], ..blaze_core::Traced::default() };
+    let shape = blaze_usercode::index::Shape::of(&traced).encode();
+    // What the daemon's `proc_macro_api::kept::Keeping::reads_now` works out, with no variable passed.
+    let now = |env: &base_db::Env, shape: &[u8]| proc_macro_api::kept::reads_in(&[], env, shape);
+    let db = lowered.db();
+    // As a crate served by its reads notes them (`hir_def::deps::filed::search`): the file's
+    // names with the values they had. An expansion that runs notes the same under its call.
+    let read = base_db::ExpansionRead::Traced { shape: shape.as_slice().into(), values: now(krate.env(db), &shape).unwrap() };
+    let served = base_db::ReadBy::Served(ContentId::of("blaze v2 cargo test image", b"script"));
+    db.files().expansions_are_read(krate, served, vec![read]);
+    let read = super::reads::Reads::of(db, krate).unwrap();
+    let env = super::reads::tests::env(&run);
+    let mut store = super::reads::tests::Store::default();
+    let filed = store.keep(base, &read, &env);
+    assert_ne!(filed, base, "a record whose expansion read a file is filed by it");
+    assert_eq!(store.find_now(base, &env, now).map(|it| it.key), Some(filed), "the file as it was");
+    std::fs::write(&schema, b"create table a (x int, y int);").unwrap();
+    assert_eq!(store.find_now(base, &env, now), None, "the file changed: the record misses");
+    std::fs::write(&schema, made).unwrap();
+    assert_eq!(store.find_now(base, &env, now).map(|it| it.key), Some(filed), "the file as it was again");
+}
+
+/// A span written in blaze-cargo with no target of its own has its module's path for one,
+/// `blaze_cargo::..`, and the flight recorder keeps it: a phase span here needs no
+/// `target: "blaze"` to be seen.
+#[test]
+fn a_span_with_no_target_written_in_blaze_cargo_reaches_the_flight_ring() {
+    const NAME: &str = "a blaze-cargo span with no target of its own";
+    blaze_profile::install();
+    std::thread::spawn(|| drop(tracing::info_span!(NAME).entered())).join().unwrap();
+    let mut read = blaze_profile::flight::Read::default();
+    blaze_profile::flight::window(std::time::Duration::from_secs(60), &mut read);
+    let targets: Vec<&str> = read
+        .spans
+        .iter()
+        .filter_map(|row| blaze_profile::flight::meta(row.site))
+        .filter(|meta| meta.name() == NAME)
+        .map(|meta| meta.target())
+        .collect();
+    assert_eq!(targets, [module_path!()], "the span is in the ring once, under its module's path");
+    assert!(module_path!().starts_with("blaze_cargo::"));
+}
+
+/// A `warn!` written in blaze-cargo with no target of its own is kept by the recorder's one
+/// rule for spans and events, and reaches the `events` table as one row: its level, its
+/// module's path for a target, and its message with its fields. The daemon's watchdog line
+/// ("no unit's step ended") is such a `warn!`.
+#[test]
+fn a_warn_with_no_target_written_in_blaze_cargo_reaches_the_events_table() {
+    use arrow_array::{Array as _, cast::AsArray as _, types::UInt32Type};
+
+    const MESSAGE: &str = "a blaze-cargo warn with no target of its own";
+    blaze_profile::install();
+    std::thread::spawn(|| tracing::warn!(steps = 3, "{MESSAGE}")).join().unwrap();
+    let mut read = blaze_profile::flight::Read::default();
+    blaze_profile::flight::window(std::time::Duration::from_secs(60), &mut read);
+    let batch = blaze_profile::batches::events(&read.events, blaze_profile::batches::Process::this()).unwrap();
+    let column = |name: &str| batch.column_by_name(name).unwrap_or_else(|| panic!("the events table has `{name}`"));
+    let messages = column("message").as_string::<i32>();
+    let rows: Vec<usize> = (0..batch.num_rows()).filter(|&row| messages.is_valid(row) && messages.value(row).contains(MESSAGE)).collect();
+    assert_eq!(rows.len(), 1, "the warn is one row of the events table: {:?}", read.events);
+    let row = rows[0];
+    assert!(messages.value(row).contains("steps=3"), "its fields are in its message: {}", messages.value(row));
+    let text = |name: &str| {
+        let dict = column(name).as_dictionary::<UInt32Type>();
+        dict.values().as_string::<i32>().value(dict.keys().value(row) as usize).to_owned()
+    };
+    assert_eq!(text("level"), "WARN");
+    assert_eq!(text("target"), module_path!());
+    assert!(text("name").starts_with("event "), "an event's name is its callsite: {}", text("name"));
+    assert!(column("job").is_null(row) && column("span_id").is_null(row), "a thread of no pool, in no span");
 }

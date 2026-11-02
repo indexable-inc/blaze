@@ -1,8 +1,8 @@
-//! What a monomorphized body can run, site by site, as the code generator dispatches it: each
-//! call and drop to its instances (the impl's method of a trait method with a concrete `Self`,
-//! `Fn*` of a closure or function, drop glue, the `Future::poll` of an `async` block, a builtin
-//! derive's calls on the fields), each vtable made to the impls in its slots, and each function
-//! pointer made to what it points at.
+//! What a monomorphized body can run, site by site, as the code generator dispatches it
+//! (`hir_ty_mir::mir::dispatch`): each call and drop to its instances (the impl's method of a
+//! trait method with a concrete `Self`, `Fn*` of a closure or function, drop glue, the
+//! `Future::poll` of an `async` block, a builtin derive's calls on the fields), each vtable made
+//! to the impls in its slots, and each function pointer made to what it points at.
 //!
 //! A call through `dyn` or a function pointer goes nowhere here: what it can reach is judged by
 //! the marker `#[blaze::may_suspend]` on the trait method, or on the struct field the pointer
@@ -11,67 +11,45 @@
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use blaze_query::db::{AsId, FromId};
-use either::Either;
+use std::alloc::Global;
+use blaze_query::db::AsId;
 use hir_def::{
-    AdtId, AssocItemId, CallableDefId, FieldId, FunctionId, GenericParamId, ItemContainerId,
-    VariantId,
+    CallableDefId, FieldId, FunctionId, GenericParamId, ItemContainerId, VariantId,
     attrs::AttrFlags,
     lang_item::{LangItems, lang_items},
     signatures::FunctionSignature,
 };
-use hir_expand::name::Name;
 use hir_ty::{
-    InferBodyId, ParamEnvAndCrate, PointerCast,
-    db::{HirDatabase, InternedClosureId, InternedCoroutineId},
-    drop::{DropGlue, destructor, has_drop_glue},
-    dyn_compatibility::generics_require_sized_self,
-    intrinsic::{Intrinsic, intrinsic_of},
-    method_resolution::is_dyn_method,
+    ParamEnvAndCrate, PointerCast,
+    db::HirDatabase as _,
     next_solver::{
-        DbInterner, GenericArg, GenericArgs, Region, RegionExt as _, StoredGenericArgs, TraitRef,
-        Ty, TyKind, TypingMode,
+        DbInterner, GenericArg, GenericArgs, Region, RegionExt as _, StoredGenericArgs, Ty, TyKind,
+        TypingMode,
         infer::{DbInternerInferExt as _, InferCtxt},
     },
     traits::StoredParamEnvAndCrate,
 };
 use hir_ty_mir::mir::{
-    BasicBlockId, CastKind, LocalId, MirBody, MirLowerError, MirSpan, Operand, OperandKind,
-    PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
-    is_by_move_coroutine, normalize_or_keep,
+    BasicBlockId, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind, PlaceTy,
+    ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
+    dispatch::{
+        self, Body, Call, Callee, DropStep, UnsizeStep, clone_parts, variants, vtable_methods,
+        within_longest,
+    },
+    normalize_or_keep,
 };
-use intern::sym;
-use rustc_type_ir::{
-    Interner as _,
-    inherent::{BoundExistentialPredicates as _, Clause as _, GenericArgs as _, IntoKind as _},
-};
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use smallvec::SmallVec;
-
-/// The most type nodes an instance's generic arguments may have: one past it is a type that
-/// grows without end (polymorphic recursion), which the walk reports instead of following.
-pub(crate) const LONGEST: usize = 256;
 
 /// How deep a builtin derive's calls on its fields are followed inline: past it, a chain of
 /// derived types nested that deep is reported.
 const DERIVE_DEPTH: u32 = 64;
 
-/// What an instance runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Def {
-    Fn(FunctionId),
-    /// An `InternedClosureId`, without its database lifetime.
-    Closure(blaze_query::db::Id),
-    /// An `InternedCoroutineId`: the `Future::poll` of an `async` block.
-    Coroutine(blaze_query::db::Id),
-    /// The same of the future an `async` closure gives when called by value.
-    CoroutineByMove(blaze_query::db::Id),
-}
-
-/// An instance: what it runs and its generic arguments (a closure's or coroutine's are its
+/// An instance: the body it runs and its generic arguments (a closure's or coroutine's are its
 /// parent's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Instance {
-    pub(crate) def: Def,
+    pub(crate) def: Body,
     pub(crate) args: StoredGenericArgs,
 }
 
@@ -85,10 +63,12 @@ pub enum Unseen {
     AsyncClosure,
     /// A `dyn*`.
     DynStar,
-    /// Generic arguments past [`LONGEST`] type nodes.
+    /// Generic arguments past [`dispatch::LONGEST`] type nodes.
     TooLong,
     /// Builtin derives nested past [`DERIVE_DEPTH`].
     TooDeep,
+    /// A call of a trait method that no impl's method is found for, where one should be.
+    NoImplMethod,
 }
 
 impl Unseen {
@@ -99,6 +79,7 @@ impl Unseen {
             Unseen::DynStar => "it makes a `dyn*`, which the walk does not follow",
             Unseen::TooLong => "it reaches an instance whose type arguments grow without end",
             Unseen::TooDeep => "it reaches builtin derives nested past 64 types",
+            Unseen::NoImplMethod => "it calls a trait method that no impl's method is found for",
         }
     }
 }
@@ -175,29 +156,6 @@ impl<'db> Cx<'db> {
     }
 }
 
-/// The monomorphized runtime body of `instance` in `env`.
-pub(crate) fn body_of<'db>(
-    db: &'db Db,
-    env: &StoredParamEnvAndCrate,
-    instance: &Instance,
-) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-    let (args, stored) = (instance.args, *env);
-    match instance.def {
-        Def::Fn(func) => db.monomorphized_runtime_mir_body(InferBodyId::from(func), args, stored),
-        Def::Closure(id) => {
-            db.monomorphized_runtime_mir_body_for_closure(InternedClosureId::from_id(id), args, stored)
-        }
-        Def::Coroutine(id) => {
-            db.monomorphized_runtime_mir_body_for_coroutine(InternedCoroutineId::from_id(id), args, stored)
-        }
-        Def::CoroutineByMove(id) => db.monomorphized_runtime_mir_body_for_coroutine_by_move(
-            InternedCoroutineId::from_id(id),
-            args,
-            stored,
-        ),
-    }
-}
-
 /// The arguments of the function `func` with every lifetime erased; `None` when it has a type
 /// or const parameter, its impl's or trait's included.
 pub(crate) fn concrete_args<'db>(interner: DbInterner<'db>, func: FunctionId) -> Option<GenericArgs<'db>> {
@@ -209,17 +167,13 @@ pub(crate) fn concrete_args<'db>(interner: DbInterner<'db>, func: FunctionId) ->
     (!generic).then_some(args)
 }
 
-fn short(args: GenericArgs<'_>) -> bool {
-    args.types().map(|it| it.walk().count()).sum::<usize>() <= LONGEST
-}
-
 /// The sites of `body`, every block's (cleanup blocks too), in block order.
 pub(crate) fn sites<'db>(cx: &Cx<'db>, body: &MirBody<'db>) -> Sites<'db> {
     let mut scan = Scan {
         cx,
         body,
         out: Sites { calls: Vec::new(), slots: Vec::new(), reified: Vec::new(), unseen: None },
-        loads: HashMap::default(),
+        loads: HashMap::new_in(Global),
         derive_depth: 0,
     };
     scan.loads();
@@ -237,7 +191,7 @@ pub(crate) fn sites<'db>(cx: &Cx<'db>, body: &MirBody<'db>) -> Sites<'db> {
             }
             TerminatorKind::Drop { place, .. } | TerminatorKind::DropAndReplace { place, .. } => {
                 let ty = scan.place_ty(place);
-                scan.drop_glue(ty, &mut HashSet::default(), &mut targets);
+                scan.drop_glue(ty, &mut HashSet::new_in(Global), &mut targets);
             }
             _ => continue,
         }
@@ -254,7 +208,7 @@ struct Scan<'a, 'db> {
     out: Sites<'db>,
     /// Each local assigned a copy or move of a place, as a whole: where a function pointer
     /// called through it was loaded from.
-    loads: HashMap<LocalId, &'a StoredPlace>,
+    loads: HashMap<LocalId, &'a StoredPlace, Global>,
     derive_depth: u32,
 }
 
@@ -329,8 +283,8 @@ impl<'a, 'db> Scan<'a, 'db> {
         }
     }
 
-    fn walk(&mut self, def: Def, args: GenericArgs<'db>, out: &mut SmallVec<[Target; 2]>) {
-        if !short(args) {
+    fn walk(&mut self, def: Body, args: GenericArgs<'db>, out: &mut SmallVec<[Target; 2]>) {
+        if !within_longest(args) {
             return self.unseen(Unseen::TooLong);
         }
         out.push(Target::Walk(Instance { def, args: args.store() }));
@@ -338,93 +292,39 @@ impl<'a, 'db> Scan<'a, 'db> {
 
     /// What calling `f` with `args` runs.
     fn call(&mut self, f: FunctionId, args: GenericArgs<'db>, out: &mut SmallVec<[Target; 2]>) {
-        let (db, lang) = (self.cx.db, self.cx.lang);
-        if !short(args) {
+        if !within_longest(args) {
             return self.unseen(Unseen::TooLong);
         }
-        if Some(f) == lang.DropInPlace || Some(f) == lang.DropGlue {
-            return self.drop_glue(args.type_at(0), &mut HashSet::default(), out);
-        }
-        match intrinsic_of(db, f) {
-            Ok(Some(Intrinsic::ConstEvalSelect)) => {
-                // `const_eval_select(args, const_fn, runtime_fn)` runs `runtime_fn`.
-                if let Some(TyKind::FnDef(def, fn_args)) = args.types().nth(2).map(|it| it.kind())
-                    && let CallableDefId::FunctionId(g) = def.0
-                {
-                    self.call(g, fn_args.skip_binder(), out);
-                }
-                return;
-            }
+        match dispatch::call(&self.cx.infcx, self.cx.env, f, args) {
+            Call::DropGlue(ty) => self.drop_glue(ty, &mut HashSet::new_in(Global), out),
+            Call::ConstEvalSelect(Some((CallableDefId::FunctionId(g), g_args))) => self.call(g, g_args, out),
             // No other intrinsic calls code.
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => {}
-        }
-        if let ItemContainerId::TraitId(trait_) = f.loc(db).container {
-            if [lang.Fn, lang.FnMut, lang.FnOnce].contains(&Some(trait_)) {
-                return self.fn_trait(f, args, args.type_at(0), out);
-            }
-            if [lang.AsyncFn, lang.AsyncFnMut, lang.AsyncFnOnce].contains(&Some(trait_)) {
-                return self.unseen(Unseen::AsyncClosure);
-            }
-        }
-        self.resolved(f, args, out)
-    }
-
-    /// `Fn*::call*` for `Self` = `self_ty`.
-    fn fn_trait(&mut self, f: FunctionId, args: GenericArgs<'db>, self_ty: Ty<'db>, out: &mut SmallVec<[Target; 2]>) {
-        match self.cx.normalize(self_ty).kind() {
-            TyKind::Ref(_, inner, _) => self.fn_trait(f, args, inner, out),
-            TyKind::Closure(id, closure_args) => {
-                let parent = GenericArgs::new_from_slice(closure_args.as_closure().parent_args());
-                self.walk(Def::Closure(id.0.as_id()), parent, out);
-            }
-            TyKind::FnDef(def, fn_args) => {
-                if let CallableDefId::FunctionId(g) = def.0 {
-                    self.call(g, fn_args.skip_binder(), out);
-                }
-            }
+            Call::ConstEvalSelect(_) | Call::Intrinsic(_) | Call::UnknownIntrinsic(_) => {}
+            Call::Closure(def, parent) => self.walk(def, parent, out),
+            Call::FnItem(CallableDefId::FunctionId(g), g_args) => self.call(g, g_args, out),
             // Through a pointer or `dyn Fn*`: the promise of `Fn*`'s unmarked methods, checked
             // where the pointer or vtable is made.
-            TyKind::FnPtr(..) | TyKind::Dynamic(..) => {}
-            TyKind::CoroutineClosure(..) => self.unseen(Unseen::AsyncClosure),
-            _ => self.resolved(f, args, out),
+            Call::FnItem(..) | Call::Indirect => {}
+            Call::AsyncClosure => self.unseen(Unseen::AsyncClosure),
+            Call::Method(Err(_)) => self.unseen(Unseen::NoImplMethod),
+            Call::Method(Ok(callee)) => self.method(f, args, callee, out),
         }
     }
 
     /// A call of `f` past the dispatch on intrinsics, drop glue and `Fn*`.
-    fn resolved(&mut self, f: FunctionId, args: GenericArgs<'db>, out: &mut SmallVec<[Target; 2]>) {
-        let cx = self.cx;
-        let db = cx.db;
-        if Some(f) == cx.lang.FuturePoll
-            && let TyKind::Coroutine(id, coroutine_args) = cx.normalize(args.type_at(0)).kind()
-        {
-            let coroutine = coroutine_args.as_coroutine();
-            let def = match is_by_move_coroutine(db, id.0, coroutine) {
-                true => Def::CoroutineByMove(id.0.as_id()),
-                false => Def::Coroutine(id.0.as_id()),
-            };
-            let parent = GenericArgs::new_from_slice(coroutine.parent_args());
-            return self.walk(def, parent, out);
-        }
-        if is_dyn_method(cx.interner, cx.env.param_env, f, args).is_some() {
-            if AttrFlags::query(db, f.into()).contains(AttrFlags::MAY_SUSPEND) {
-                out.push(Target::Marked(Marked::Method(f)));
+    fn method(&mut self, f: FunctionId, args: GenericArgs<'db>, callee: Callee<'db>, out: &mut SmallVec<[Target; 2]>) {
+        match callee {
+            Callee::Poll(def, parent) => self.walk(def, parent, out),
+            Callee::Virtual => {
+                if AttrFlags::query(self.cx.db, f.into()).contains(AttrFlags::MAY_SUSPEND) {
+                    out.push(Target::Marked(Marked::Method(f)));
+                }
             }
-            return;
+            Callee::Derived(..) => self.derived(f, args, out),
+            Callee::CloneBuiltin(_) => self.clone_builtin(f, args.type_at(0), out),
+            Callee::FnPtr(_) => {}
+            Callee::Fn(g, g_args) => self.function(g, g_args, out),
         }
-        let (callee, callee_args) = db.lookup_impl_method(cx.env, f, args);
-        let Either::Left(g) = callee else {
-            return self.derived(f, args, out);
-        };
-        if g == f && let ItemContainerId::TraitId(trait_) = f.loc(db).container {
-            if Some(trait_) == cx.lang.Clone {
-                return self.clone_builtin(f, args.type_at(0), out);
-            }
-            if Some(trait_) == cx.lang.FnPtrTrait || !FunctionSignature::of(db, f).has_body() {
-                return;
-            }
-        }
-        self.function(g, callee_args, out)
     }
 
     /// A call of the function `g` itself.
@@ -439,7 +339,7 @@ impl<'a, 'db> Scan<'a, 'db> {
         {
             return;
         }
-        self.walk(Def::Fn(g), args, out)
+        self.walk(Body::Fn(g), args, out)
     }
 
     /// A builtin derive's method `f` (`Clone`, `PartialEq`, `Hash`, `Debug`, ...) for `Self`:
@@ -469,60 +369,25 @@ impl<'a, 'db> Scan<'a, 'db> {
         self.derive_depth -= 1;
     }
 
-    /// `Clone::clone` of a type whose impl the compiler supplies: tuples, closures and arrays
-    /// clone their parts; the rest is `Copy`.
+    /// `Clone::clone` of a type whose impl the compiler supplies: each part cloned, and the ones
+    /// cloned before dropped when one unwinds.
     fn clone_builtin(&mut self, clone: FunctionId, ty: Ty<'db>, out: &mut SmallVec<[Target; 2]>) {
-        let ty = self.cx.normalize(ty);
-        let mut part = |this: &mut Self, part: Ty<'db>| {
-            this.call(clone, GenericArgs::new_from_slice(&[GenericArg::from(part)]), out);
-        };
-        match ty.kind() {
-            TyKind::Tuple(fields) => fields.iter().for_each(|it| part(self, it)),
-            TyKind::Closure(..) | TyKind::CoroutineClosure(..) => {
-                if let Some(TyKind::Tuple(fields)) = ty.closure_upvars_ty().map(|it| it.kind()) {
-                    fields.iter().for_each(|it| part(self, it));
-                }
-            }
-            TyKind::Array(element, _) => part(self, element),
-            _ => {}
+        let Some(parts) = clone_parts(&self.cx.infcx, self.cx.env, ty) else { return };
+        for part in parts {
+            self.call(clone, GenericArgs::new_from_slice(&[GenericArg::from(part)]), out);
+            self.drop_glue(part, &mut HashSet::new_in(Global), out);
         }
     }
 
     /// Drop glue of `ty`: its `Drop` impl's `drop`, then its fields'.
-    fn drop_glue(&mut self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>>, out: &mut SmallVec<[Target; 2]>) {
-        let cx = self.cx;
-        let db = cx.db;
-        let ty = cx.normalize(ty);
-        if !seen.insert(ty) || has_drop_glue(&cx.infcx, ty, cx.env.param_env) == DropGlue::None {
-            return;
-        }
-        match ty.kind() {
-            TyKind::Adt(def, args) => {
-                let adt = def.def_id();
-                if destructor(db, adt).is_some()
-                    && let Some(drop) = cx
-                        .lang
-                        .Drop
-                        .and_then(|it| it.trait_items(db).method_by_name(&Name::new_symbol_root(sym::drop)))
-                {
-                    self.call(drop, GenericArgs::new_from_slice(&[GenericArg::from(ty)]), out);
-                }
-                if let AdtId::StructId(it) = adt
-                    && cx.lang.OwnedBox == Some(it)
-                {
-                    self.drop_glue(args.type_at(0), seen, out);
-                }
-                for variant in variants(db, adt) {
-                    for (_, field) in db.field_types(variant).iter() {
-                        self.drop_glue(field.ty().instantiate(cx.interner, args).skip_norm_wip(), seen, out);
-                    }
-                }
-            }
-            TyKind::Tuple(fields) => fields.iter().for_each(|it| self.drop_glue(it, seen, out)),
-            TyKind::Array(element, _) | TyKind::Slice(element) => self.drop_glue(element, seen, out),
-            TyKind::Closure(_, args) => self.drop_glue(args.as_closure().tupled_upvars_ty(), seen, out),
+    fn drop_glue(&mut self, ty: Ty<'db>, seen: &mut HashSet<Ty<'db>, Global>, out: &mut SmallVec<[Target; 2]>) {
+        let mut steps = SmallVec::new();
+        dispatch::drop_glue(&self.cx.infcx, self.cx.env, ty, seen, &mut steps);
+        for step in steps {
             // A `dyn`'s drop is its vtable's, checked where the vtable is made.
-            _ => {}
+            if let DropStep::Drop(drop, args) = step {
+                self.call(drop, args, out);
+            }
         }
     }
 
@@ -542,13 +407,19 @@ impl<'a, 'db> Scan<'a, 'db> {
                 if let Some(TyKind::Closure(id, args)) = self.operand_ty(operand).map(|it| it.kind()) {
                     let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
                     let mut targets = SmallVec::new();
-                    self.walk(Def::Closure(id.0.as_id()), parent, &mut targets);
+                    self.walk(Body::Closure(id.0.as_id()), parent, &mut targets);
                     self.reified(place, span, targets);
                 }
             }
             CastKind::PointerCoercion(PointerCast::Unsize) => {
                 if let Some(from) = self.operand_ty(operand) {
-                    self.unsize(from, to.as_ref(), span);
+                    let mut steps = SmallVec::new();
+                    dispatch::unsized_vtables(&self.cx.infcx, self.cx.env, from, to.as_ref(), &mut steps);
+                    for step in steps {
+                        if let UnsizeStep::Vtable(concrete, dyn_ty) = step {
+                            self.vtable(concrete, dyn_ty, span);
+                        }
+                    }
                 }
             }
             CastKind::DynStar => self.unseen(Unseen::DynStar),
@@ -567,108 +438,17 @@ impl<'a, 'db> Scan<'a, 'db> {
         self.out.reified.push(Reified { span, targets: targets.into_iter().collect(), into_marked });
     }
 
-    /// The vtables an unsizing coercion of `from` to `to` makes.
-    fn unsize(&mut self, from: Ty<'db>, to: Ty<'db>, span: MirSpan) {
-        let cx = self.cx;
-        let (from, to) = (cx.normalize(from), cx.normalize(to));
-        if from == to {
-            return;
-        }
-        match (from.kind(), to.kind()) {
-            (
-                TyKind::RawPtr(from, _) | TyKind::Ref(_, from, _),
-                TyKind::RawPtr(to, _) | TyKind::Ref(_, to, _),
-            ) => self.unsize_pointee(from, to, span),
-            (TyKind::Pat(from, _), TyKind::Pat(to, _)) => self.unsize(from, to, span),
-            (TyKind::Adt(def, args), TyKind::Adt(to_def, to_args)) if def.def_id() == to_def.def_id() => {
-                let AdtId::StructId(id) = def.def_id() else { return };
-                for (_, field) in cx.db.field_types(id.into()).iter() {
-                    let from = field.ty().instantiate(cx.interner, args).skip_norm_wip();
-                    let to = field.ty().instantiate(cx.interner, to_args).skip_norm_wip();
-                    self.unsize(from, to, span);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn unsize_pointee(&mut self, from: Ty<'db>, to: Ty<'db>, span: MirSpan) {
-        let cx = self.cx;
-        let (from, to) = (cx.normalize(from), cx.normalize(to));
-        if from == to {
-            return;
-        }
-        match (from.kind(), to.kind()) {
-            // An upcast: the vtable it starts from was checked where it was made.
-            (TyKind::Dynamic(..), TyKind::Dynamic(..)) | (TyKind::Array(..), TyKind::Slice(_)) => {}
-            (_, TyKind::Dynamic(..)) => self.vtable(from, to, span),
-            (TyKind::Adt(def, args), TyKind::Adt(to_def, to_args)) if def.def_id() == to_def.def_id() => {
-                let AdtId::StructId(id) = def.def_id() else { return };
-                let fields = cx.db.field_types(id.into());
-                let Some((_, last)) = fields.iter().last() else { return };
-                let from = last.ty().instantiate(cx.interner, args).skip_norm_wip();
-                let to = last.ty().instantiate(cx.interner, to_args).skip_norm_wip();
-                self.unsize_pointee(from, to, span);
-            }
-            _ => {}
-        }
-    }
-
     /// The vtable of `concrete` for `dyn_ty`: its drop, and every method of the principal
     /// trait and its supertraits that a trait object can call.
     fn vtable(&mut self, concrete: Ty<'db>, dyn_ty: Ty<'db>, span: MirSpan) {
-        let cx = self.cx;
         let mut drop = SmallVec::new();
-        self.drop_glue(concrete, &mut HashSet::default(), &mut drop);
+        self.drop_glue(concrete, &mut HashSet::new_in(Global), &mut drop);
         if !drop.is_empty() {
             self.out.slots.push(Slot { span, concrete, method: None, targets: drop.into_iter().collect() });
         }
-        let TyKind::Dynamic(bounds, _) = dyn_ty.kind() else { return };
-        let Some(principal) = bounds.principal() else { return };
-        let trait_ref =
-            cx.interner.instantiate_bound_regions_with_erased(principal.with_self_ty(cx.interner, concrete));
-        let mut seen = HashSet::default();
-        self.trait_methods(trait_ref, concrete, span, &mut seen);
-    }
-
-    fn trait_methods(
-        &mut self,
-        trait_ref: TraitRef<'db>,
-        concrete: Ty<'db>,
-        span: MirSpan,
-        seen: &mut HashSet<TraitRef<'db>>,
-    ) {
-        if !seen.insert(trait_ref) {
-            return;
-        }
-        let cx = self.cx;
-        let (db, interner) = (cx.db, cx.interner);
-        let supertraits: SmallVec<[TraitRef<'db>; 4]> = interner
-            .explicit_super_clauses_of(trait_ref.def_id)
-            .iter_instantiated(interner, trait_ref.args.as_slice())
-            .filter_map(|clause| clause.skip_norm_wip().0.as_trait_clause())
-            .map(|pred| interner.instantiate_bound_regions_with_erased(pred).trait_ref)
-            .collect(); // alloc: inline up to four supertraits, all read before any is walked
-        for supertrait in supertraits {
-            self.trait_methods(supertrait, concrete, span, seen);
-        }
-        let trait_items = trait_ref.def_id.0.trait_items(db);
-        for &(_, item) in trait_items.items.iter() {
-            let AssocItemId::FunctionId(func) = item else { continue };
-            if generics_require_sized_self(db, func.into()) {
-                continue;
-            }
-            let mut generic = false;
-            let args = GenericArgs::fill_rest(interner, func.into(), trait_ref.args.iter(), |_, id, _| {
-                generic |= !matches!(id, GenericParamId::LifetimeParamId(_));
-                Region::new_erased(interner).into()
-            });
-            // A method with type or const parameters of its own has no slot.
-            if generic {
-                continue;
-            }
+        for (func, args) in vtable_methods(self.cx.interner, concrete, dyn_ty) {
             let mut targets = SmallVec::new();
-            self.resolved(func, args, &mut targets);
+            self.call(func, args, &mut targets);
             if !targets.is_empty() {
                 self.out.slots.push(Slot { span, concrete, method: Some(func), targets: targets.into_iter().collect() });
             }
@@ -756,19 +536,5 @@ fn only_into_marked<'db>(cx: &Cx<'db>, body: &MirBody<'db>, local: LocalId) -> b
 fn rvalue_operands(rvalue: &Rvalue, mut each: impl FnMut(&Operand)) {
     for operand in hir_ty_mir::mir::purity::operands(rvalue) {
         each(operand);
-    }
-}
-
-/// The variants of `adt`: its one for a struct or union.
-pub(crate) fn variants(db: &Db, adt: AdtId) -> SmallVec<[VariantId; 4]> {
-    match adt {
-        AdtId::StructId(it) => SmallVec::from_slice(&[VariantId::StructId(it)]),
-        AdtId::UnionId(it) => SmallVec::from_slice(&[VariantId::UnionId(it)]),
-        AdtId::EnumId(it) => it
-            .enum_variants(db)
-            .variants
-            .values()
-            .map(|&(id, _)| VariantId::EnumVariantId(id))
-            .collect(), // alloc: inline up to four variants
     }
 }

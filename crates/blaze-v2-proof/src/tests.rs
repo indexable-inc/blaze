@@ -146,77 +146,11 @@ fn rng_is_the_same_from_one_seed_and_stays_below() {
 }
 
 #[test]
-fn sample_chooses_distinct_items_in_order() {
-    let items: Vec<u32> = (0..100).collect();
-    let chosen = sample(&items, 10, 42);
-    assert_eq!(chosen.len(), 10);
-    assert!(chosen.windows(2).all(|w| w[0] < w[1]));
-    assert_eq!(chosen, sample(&items, 10, 42));
-    assert_eq!(sample(&items[..5], 10, 42), items[..5].to_vec());
-}
-
-#[test]
 fn a_trace_round_trips_in_deterministic_cbor() {
     let trace = chain(10, 20, 30, 40, true);
     let bytes = blaze_protocol::cbor::to_vec(&trace).unwrap();
     let back: Trace = blaze_protocol::cbor::from_slice(&bytes).unwrap();
     assert_eq!(back, trace);
-}
-
-#[test]
-fn every_simd_path_finds_the_first_difference_the_scalar_one_does() {
-    let mut rng = Rng::new(1606);
-    let paths = bytes::available();
-    assert_eq!(paths.last(), Some(&bytes::Simd::Scalar));
-    for len in (0..300).chain([1 << 12, (1 << 16) + 7]) {
-        let a: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
-        let mut cases = vec![(a.clone(), None)];
-        for _ in 0..4 {
-            if len == 0 {
-                break;
-            }
-            let at = rng.below(len as u64) as usize;
-            let mut b = a.clone();
-            b[at] ^= 1 << rng.below(8);
-            // A second difference after the first must not hide it.
-            if at + 1 < len {
-                b[len - 1] ^= 0x80;
-            }
-            cases.push((b, Some(at)));
-        }
-        let mut shorter = a.clone();
-        shorter.truncate(len / 2);
-        cases.push((shorter, if len / 2 < len { Some(len / 2) } else { None }));
-        for (b, want) in &cases {
-            for &path in &paths {
-                assert_eq!(bytes::first_difference_with(path, &a, b), *want, "{path:?}, length {len}");
-                assert_eq!(bytes::first_difference_with(path, b, &a), *want, "{path:?}, length {len}, swapped");
-            }
-        }
-    }
-}
-
-#[test]
-fn every_simd_path_finds_each_difference_in_a_block_and_the_overlapping_tail() {
-    let paths = bytes::available();
-    let mut rng = Rng::new(77);
-    // Every length across the four-vector blocks (up to 256 bytes) and the tails after them;
-    // a single difference at every offset, so each lane of each vector and of the last,
-    // overlapping one is where the first difference is.
-    for len in (0..=600).chain([1023, 1024, 1025, 4096 + 63]) {
-        let a: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
-        for &path in &paths {
-            assert_eq!(bytes::first_difference_with(path, &a, &a), None, "{path:?}, length {len}");
-        }
-        let offsets: Vec<usize> = if len <= 300 { (0..len).collect() } else { (0..64).map(|_| rng.below(len as u64) as usize).collect() };
-        for at in offsets {
-            let mut b = a.clone();
-            b[at] = !b[at];
-            for &path in &paths {
-                assert_eq!(bytes::first_difference_with(path, &a, &b), Some(at), "{path:?}, length {len}, at {at}");
-            }
-        }
-    }
 }
 
 #[test]

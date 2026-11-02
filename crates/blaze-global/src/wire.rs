@@ -35,6 +35,7 @@ use crate::{
     ByHash,
     sign::{SIGNED_LEN, Signed},
 };
+use std::alloc::Global;
 
 /// Whether a batch holding `bytes` of values takes a next of `len`.
 pub(crate) fn takes(bytes: u64, len: u64) -> bool {
@@ -163,7 +164,7 @@ static PIECE: Domain = Domain::new(PIECE_DOMAIN);
 /// The pieces one direction of a connection sent, as the receiver holds them.
 #[derive(Default)]
 pub(crate) struct SendWindow {
-    by_hash: ByHash<ContentId, u64>,
+    by_hash: ByHash<ContentId, u64, Global>,
     held: VecDeque<(ContentId, u32)>,
     first: u64,
     bytes: u64,

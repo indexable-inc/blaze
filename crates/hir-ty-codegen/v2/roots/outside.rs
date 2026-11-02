@@ -12,6 +12,7 @@ use std::borrow::Cow;
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use super::{
     super::{HirFrontend, HirInstance, Kind, places::Ref, refs, statics},
@@ -37,7 +38,7 @@ struct Visit<'db> {
 struct Graph<'a, 'f, 'db> {
     frontend: &'a HirFrontend<'f>,
     /// Each node, a [`Ref::Function`] or [`Ref::Static`], by its place.
-    places: HashMap<Ref, u32>,
+    places: HashMap<Ref, u32, Global>,
     visits: Vec<Visit<'db>>,
     /// Tarjan's stack: the nodes of the components not yet done.
     stack: Vec<u32>,
@@ -54,7 +55,7 @@ pub(super) fn of<'db>(
     let mut graph = Graph {
         frontend,
         // alloc: once a harness, sized by the program it reaches
-        places: HashMap::default(),
+        places: HashMap::new_in(Global),
         // alloc: as above
         visits: Vec::new(),
         // alloc: as above
@@ -158,7 +159,7 @@ impl<'db> Graph<'_, '_, 'db> {
                 Kind::Asm(..) => return Ok((true, Cow::Borrowed(&[]))),
                 // The walk without MIR inlining reaches what the one with does, through the
                 // callees it inlines.
-                _ => refs::listed(db, instance, false)?,
+                _ => refs::listed(db, instance, refs::Walking::plain(false))?,
             },
             // alloc: once a static of the program, the references its value gives
             Ref::Static(value) => {

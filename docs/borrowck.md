@@ -36,9 +36,25 @@ such an error still builds.
   default (`-Zpolonius=next`). It accepts more programs than NLL: a loan ends where nothing
   that can still reach it is live, which accepts the "conditional return of a borrow" cases
   NLL rejects.
+- `polonius-flow`: an opt-in extension that only ever accepts more than `polonius`. A body
+  `polonius` accepts gets exactly that result, at no extra cost. A body it rejects is checked
+  again, and this time each loan's scope is narrowed to where datalog (legacy) Polonius's
+  naive rules (`crates/hir-ty-borrowck/src/flow.rs`) also find it live. Those rules kill a
+  loan when its path is overwritten and propagate subsets along the control flow. A universal
+  region error is dropped only when those rules find no failing pair. This accepts the cases
+  in section 2.5 of [the research](research/borrowck.md) that the alpha rejects and legacy
+  Polonius accepts: the linked-list cursors of issues 57165, 63908 and 108704,
+  `flow-sensitive-invariance.rs` and issue 46589. Neither checker can find a live set smaller
+  than the real one, so their intersection is sound.
+  The rules have a fixed budget (`flow::BUDGET` steps). A body that hits it keeps `polonius`'s
+  errors, and each error carries a note saying the budget ran out. The second check is a
+  `borrowck.flow` span named for the function. The design and its proof are in
+  [the lane plan](v2/plan/lanes/borrowck-cursor.md).
 - `nll`: stable rustc's checker. The only difference from `polonius` is when a loan goes out
   of scope.
 - `off`.
+
+Any other value stops blaze with an error naming the value and the four choices.
 
 ## What rustc rules it follows
 
@@ -510,6 +526,20 @@ rust-analyzer and is gone, and was deleted on 2026-10-30; its v2 successor, over
 is queued. At 68be5dec all 22 applications checked
 clean; at 47793534 nushell (53, E0716 in its tests), ruff (19, E0716 and "lifetime may not live
 long enough") and rust-analyzer (1, E0515) got errors rustc does not give.
+
+Three checks hold `polonius-flow` to "accepts more, never less":
+
+- `harness/v2/frontend/borrowck_flow.py` runs the 46 tests with a Polonius revision that are
+  vendored in `docs/upstream/borrowck/rust-lang-rust/tests-ui` in both modes. It fails on any
+  of the following:
+  - `polonius-flow` rejects something `polonius` accepts.
+  - `polonius-flow` accepts a test that every upstream revision rejects.
+  - One of the five section 2.5 targets is not accepted.
+- `differential::analyses::polonius_flow_accepts_more_never_less` checks the differential
+  fixtures. Where the alpha has no error, the result must be the alpha's, field for field.
+  Where it has errors, `polonius-flow`'s errors must be a subset of them.
+- `flow_tests` holds std-free versions of the targets, which must be accepted, and of the tests
+  every Polonius rejects, which must stay rejected.
 
 ## What is left
 

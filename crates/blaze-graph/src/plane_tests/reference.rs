@@ -9,6 +9,7 @@
 use std::{cmp::Reverse, collections::BTreeSet};
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_protocol::events::{Event, Level, NodeState, Record};
 
 use crate::{
@@ -92,10 +93,10 @@ struct Request {
 pub(crate) struct Plane<M = NoMemo> {
     config: PlaneConfig,
     nodes: Vec<Node>,
-    index: HashMap<NodeId, usize>,
+    index: HashMap<NodeId, usize, Global>, // alloc: a test's model
     tasks: Vec<Task>,
     requests: Vec<Request>,
-    request_index: HashMap<RequestId, usize>,
+    request_index: HashMap<RequestId, usize, Global>, // alloc: a test's model
     /// Rooms of `nodes`, `tasks` and `requests` given back, taken again first.
     free_nodes: Vec<usize>,
     free_tasks: Vec<usize>,
@@ -103,7 +104,7 @@ pub(crate) struct Plane<M = NoMemo> {
     next_seq: u64,
     memo: M,
     /// Keys of tasks not yet settled.
-    flight: HashMap<Key, usize>,
+    flight: HashMap<Key, usize, Global>, // alloc: a test's model
     running: [usize; 2],
     granted: u64,
     held: u64,
@@ -155,16 +156,16 @@ impl<M: Memo> Plane<M> {
         Ok(Plane {
             config,
             nodes: Vec::new(),
-            index: HashMap::default(),
+            index: HashMap::new_in(Global), // alloc: a test's model
             tasks: Vec::new(),
             requests: Vec::new(),
-            request_index: HashMap::default(),
+            request_index: HashMap::new_in(Global), // alloc: a test's model
             free_nodes: Vec::new(),
             free_tasks: Vec::new(),
             free_requests: Vec::new(),
             next_seq: 0,
             memo,
-            flight: HashMap::default(),
+            flight: HashMap::new_in(Global), // alloc: a test's model
             running: [0; 2],
             granted: 0,
             held: 0,
@@ -525,7 +526,7 @@ impl<M: Memo> Plane<M> {
     /// `nodes`, each after its deps of them, or why they cannot be added to request `r`.
     /// Nothing of them is added yet.
     fn check(&self, r: usize, nodes: Vec<Spec>) -> Result<Vec<Spec>, Error> {
-        let mut new: HashMap<NodeId, usize> = HashMap::default();
+        let mut new: HashMap<NodeId, usize, Global> = HashMap::new_in(Global); // alloc: a test's model
         for (at, spec) in nodes.iter().enumerate() {
             if self.index.contains_key(&spec.id) || new.insert(spec.id, at).is_some() {
                 return Err(Error::Twice(spec.id));
@@ -1073,7 +1074,7 @@ impl<M: Memo> Plane<M> {
         if passed.is_empty() {
             return;
         }
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new_in(Global); // alloc: a test's model
         for &task in passed {
             if !seen.insert(task) {
                 continue;

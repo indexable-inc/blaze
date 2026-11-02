@@ -29,6 +29,7 @@
 //! Apache-2.0).
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir::{InFile, LangItem};
 use syntax::{
     SyntaxKind, TextRange, WalkEvent,
@@ -485,7 +486,7 @@ fn must_implement_one_of(fx: &mut Finalize<'_, '_, '_>, attr: usize, names: &[(S
             }
         }
     }
-    let mut seen: HashMap<&str, TextRange> = HashMap::default();
+    let mut seen: HashMap<&str, TextRange, Global> = HashMap::new_in(Global);
     for (name, range) in names {
         if let Some(dup) = seen.insert(name.as_str(), *range) {
             let mut diag = Diag::error(None, "functions names are duplicated", fx.span(attr, dup));

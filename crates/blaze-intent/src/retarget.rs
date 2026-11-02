@@ -7,7 +7,9 @@
 //! written, and each moved leaf becomes an import of its own of the new path, with the item's
 //! attributes and visibility, and its rename. A leaf whose new path ends in another name is
 //! imported under its old name (`use crossbeam_channel::Sender as SyncSender;`), so no other
-//! line of the file has to change. A glob (`use std::sync::*;`) stays, and the moved items of
+//! line of the file has to change. A leaf imports its name in every namespace, so one that
+//! moves for one item and also imports another the new path does not name is an error, never a
+//! dropped import. A glob (`use std::sync::*;`) stays, and the moved items of
 //! its module the file names get imports beside it, which shadow the glob's. A path outside any
 //! `use` that qualifies a moved item (`std::sync::Mutex::new`) is rewritten up to the item's
 //! name; its generic arguments stay. A path of one segment names the item through an import or
@@ -31,8 +33,10 @@ pub struct Rewrite {
     pub text: String,
 }
 
-/// What a path names, in the type and the value namespace.
-pub type Names = [Option<ModuleDef>; 2];
+/// What a path names, in the type, the value and the macro namespace. A `use` leaf imports
+/// all three at once: `use serde::Serialize` is a trait and, with serde's `derive` feature, a
+/// derive macro.
+pub type Names = [Option<ModuleDef>; 3];
 
 /// The references to move, and how the front end resolves them in the file.
 pub struct Retarget<'r, 't> {
@@ -41,6 +45,10 @@ pub struct Retarget<'r, 't> {
     pub resolve: &'r dyn Fn(ast::Path<'t>) -> Names,
     /// The new path of an item that moves (`parking_lot::Mutex`); `None` for one that stays.
     pub to: &'r dyn Fn(ModuleDef) -> Option<String>,
+    /// Whether the new path `to` names `def` too: a `use` leaf that moves for one item keeps
+    /// importing the others it imports only through a new path that names them
+    /// (`blaze_serde::Serialize` re-exports serde's trait beside its own derive).
+    pub carries: &'r dyn Fn(&str, ModuleDef) -> bool,
 }
 
 impl<'t> Retarget<'_, 't> {
@@ -72,8 +80,7 @@ impl<'t> Retarget<'_, 't> {
 
     /// The new path of what `path` names, in the type namespace first.
     fn moved(&self, path: ast::Path<'t>) -> Option<(ModuleDef, String)> {
-        let [ty, value] = (self.resolve)(path);
-        [ty, value].into_iter().flatten().find_map(|def| Some((def, (self.to)(def)?)))
+        (self.resolve)(path).into_iter().flatten().find_map(|def| Some((def, (self.to)(def)?)))
     }
 
     /// The rewrite of `path`, a path outside any `use`, when it qualifies a moved item: from its
@@ -158,6 +165,16 @@ impl<'t> Retarget<'_, 't> {
         }
         let Some(path) = tree.path() else { return Ok(Some(written)) };
         let Some((_, to)) = self.moved(path) else { return Ok(Some(written)) };
+        let dropped = (self.resolve)(path).into_iter().flatten().find(|def| {
+            (self.to)(*def).as_deref() != Some(to.as_str()) && !(self.carries)(&to, *def)
+        });
+        if let Some(def) = dropped {
+            let name = def.name(self.db).map_or_else(|| "an item".to_owned(), |it| format!("`{}`", it.as_str()));
+            return Err(format!(
+                "`{written}` also imports {name} of another namespace, which `{to}` does not name: \
+                 split the import by hand"
+            ));
+        }
         let old = path.segment().and_then(|it| it.name_ref()).map(|it| it.text().to_owned());
         let alias = match tree.rename() {
             Some(rename) => Some(rename.syntax().text().trim_start_matches("as").trim().to_owned()),
@@ -215,12 +232,12 @@ impl<'t> Retarget<'_, 't> {
 /// What `path` names as `sema` resolves it: [`Retarget::resolve`] for a file outside any body's
 /// analysis.
 pub fn names_in<'db>(sema: &Semantics<'db>, path: ast::Path<'db>) -> Names {
-    let Some(per_ns) = sema.resolve_path_per_ns(path) else { return [None, None] };
+    let Some(per_ns) = sema.resolve_path_per_ns(path) else { return [None, None, None] };
     let def = |it: Option<PathResolution<'db>>| match it {
         Some(PathResolution::Def(it)) => Some(it),
         _ => None,
     };
-    [def(per_ns.type_ns), def(per_ns.value_ns)]
+    [def(per_ns.type_ns), def(per_ns.value_ns), def(per_ns.macro_ns)]
 }
 
 /// The whitespace a line starts with before `at`.

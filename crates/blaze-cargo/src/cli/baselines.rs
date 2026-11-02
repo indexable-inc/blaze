@@ -7,13 +7,14 @@ use std::path::Path;
 
 use blaze_api::DiagnosticRef;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_lints::baseline::{self, Baseline, Counts};
 
 /// The findings a run printed, counted.
 #[derive(Default)]
 pub struct Counted {
     /// Each finding once, by lint and its first primary span's file and bytes.
-    seen: HashSet<(String, String, u32, u32)>,
+    seen: HashSet<(String, String, u32, u32), Global>,
     counts: Counts,
 }
 

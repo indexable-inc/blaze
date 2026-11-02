@@ -17,9 +17,12 @@ order its functions were asked for, not the order the threads finished them (#20
   cfg_alloc      a `#[global_allocator]` under a `#[cfg]` that is false, as ripgrep's
   trait_block    a method a trait provides calls a function declared in its body
   c_main         `#![no_main]` and a `main` of C's, as bun's, with a body of 16 384 statements
+  tail_calls     `become`: an interpreter loop of ten million steps on a 64 KiB stack, and
+                 rustc's cases of drop order and of arguments passed by reference
 
 `--release` builds both with the release profile, which v2 compiles with LLVM; the dev
-profile it compiles with Cranelift.
+profile it compiles with Cranelift. A case of `REFUSED_IN_DEV` is one Cranelift's native code
+can't make (a guaranteed tail call): its dev build has to fail with an error that says so.
 """
 import argparse, os, re, shutil, sys
 
@@ -27,7 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from rebuild import Project, copy, scratch
 
-CASES = ["default_alloc", "custom_alloc", "lib_alloc", "cfg_alloc", "trait_block", "c_main"]
+CASES = ["default_alloc", "custom_alloc", "lib_alloc", "cfg_alloc", "trait_block", "c_main", "tail_calls"]
 
 
 def mixed(seed, rounds):
@@ -56,6 +59,15 @@ EXPECTED = {
     "cfg_alloc": (0, re.escape("THE DEFAULT ALLOCATOR\n"), ""),
     "trait_block": (mixed(11, 7) % 7, re.escape(f"{mixed(3, 7)}\n"), ""),
     "c_main": (3, re.escape(f"A MAIN OF C'S {mix(1):x}\n"), re.escape("1 arguments\n")),
+    # What the pinned nightly's build prints, at -O0 and -O3 alike.
+    "tail_calls": (0, re.escape("interpreter dd031c98979d3bea\n"
+                                "countdown Big([12500005000001, 12500002500002, 12500000000003, 12499997500004])\n"
+                                "drop order ok\nindirect ok\ntrack_caller ok\n"), ""),
+}
+
+# A case whose dev build Cranelift's native code refuses, and what the error has to say.
+REFUSED_IN_DEV = {
+    "tail_calls": r"a tail call \(`become`\)",
 }
 
 
@@ -71,6 +83,12 @@ def built(ws, work, case, release, name):
 def check(ws, work, case, release):
     shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
     first, project = built(ws, work, case, release, f"{case}-1")
+    if not release and case in REFUSED_IN_DEV:
+        if first.status == 0:
+            return "  the dev build made what Cranelift's native code can't guarantee"
+        if re.search(REFUSED_IN_DEV[case], first.said) is None:
+            return f"  the dev build failed without /{REFUSED_IN_DEV[case]}/:\n{first.said[-800:]}"
+        return None
     if first.status != 0 or not first.executable:
         return f"  blaze's build failed ({first.status}):\n{first.said[-800:]}"
     status, stdout, stderr = EXPECTED[case]

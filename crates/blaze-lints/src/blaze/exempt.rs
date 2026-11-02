@@ -11,8 +11,11 @@ use super::Lint;
 const fn tag(lint: Lint) -> Option<&'static str> {
     match lint {
         Lint::HotClone => Some("clone"),
-        Lint::HotAlloc | Lint::HotAllocCall | Lint::StdHashmap => Some("alloc"),
+        Lint::HotAlloc | Lint::HotAllocCall | Lint::ImplicitAllocator => Some("alloc"),
         Lint::HotDyn => Some("dyn"),
+        Lint::SeqcstUnexplained => Some("seqcst"),
+        // `relaxed_publish` reads it on either side and on the atomic's declaration itself.
+        Lint::RelaxedPublish => Some("relaxed"),
         Lint::Parallelizable
         | Lint::SerialDependence
         | Lint::FiberBoundary
@@ -26,7 +29,88 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::BlockingOnPool
         | Lint::UnnamedWait
         | Lint::SharedCollectionLock
-        | Lint::OpenWaitLoop => None,
+        | Lint::OpenWaitLoop
+        | Lint::UnrecordedSpan
+        // Kept with `#[expect(blaze::fixed_key_lookup, reason = ..)]`: a table is a choice of
+        // the item, not of one line.
+        | Lint::FixedKeyLookup
+        // Kept with `#[expect(..)]`: a literal's base and a signature's `bool` are choices of
+        // the item, not of one line.
+        | Lint::StructUpdate
+        | Lint::BoolParam
+        // Kept with `#[expect(..)]`: a core and a key are choices of the item, not of one line
+        // (`key_ignores_field`'s `// not in key: <why>` names one field, through [`commented`]).
+        | Lint::SansIoCore
+        | Lint::KeyIgnoresField
+        // Kept with `#[expect(blaze::wildcard_arm, reason = ..)]` on the arm, the `match` or
+        // the item.
+        | Lint::WildcardArm
+        // Kept with `#[expect(..)]`: a struct's layout, a signature's type and a collection
+        // are choices of the item, not of one line.
+        | Lint::FalseSharing
+        | Lint::LargeMove
+        | Lint::CollectThenConsume
+        // Kept with `#[expect(..)]` on the item: a map's key type and a loop's shape are not
+        // one line's choice.
+        | Lint::HashTwice
+        | Lint::SyscallInLoop
+        | Lint::QueryInLoop
+        | Lint::StringKey
+        // Kept with `#[expect(..)]` on the item: a function's shape, a signature's error and a
+        // field's type are the item's choice, not one line's.
+        | Lint::OutlineGenericBody
+        | Lint::ColdError
+        | Lint::FrozenCollection
+        // Kept with `#[expect(..)]` on the item: a type's representation, a map's shape and a
+        // binding's ownership are the item's choice, not one line's.
+        | Lint::InternCandidate
+        | Lint::SmallMap
+        | Lint::ArcCloneOnlyBorrowed
+        // Kept with `#[expect(..)]` on the item: a blocking call, an ABI, a loop's cap, a map's
+        // hasher and a `drop` are the item's choice, not one line's.
+        | Lint::BlockingInAsync
+        | Lint::UnwindAcrossFfi
+        | Lint::UnboundedFromInput
+        | Lint::DosHasherOnInput
+        | Lint::PanicInDrop
+        // Kept with `#[expect(..)]` on the item: a loop's indexing, a stream's buffering, a
+        // collection's type, an iterator's hint, a sort and a field's type are the item's choice.
+        | Lint::BoundsCheckInLoop
+        | Lint::UnbufferedIo
+        | Lint::StdoutLockInLoop
+        | Lint::FrontVecOps
+        | Lint::MissingSizeHint
+        | Lint::FmtAllocates
+        | Lint::JaggedVec
+        | Lint::StableSortNeedless
+        | Lint::DynInHotField
+        // A profile's word on a function: no comment changes what it counted.
+        | Lint::ProfileHot
+        | Lint::StaleHotMarker
+        | Lint::HotMarkedCold
+        | Lint::PushWithoutReserve
+        | Lint::ScratchInLoop
+        | Lint::BoxedRecursiveNode
+        | Lint::WideIndex
+        | Lint::BoundedHeapField
+        | Lint::EnumVecPadded
+        | Lint::DeepDropAtExit
+        | Lint::DynFnParam
+        | Lint::BoxLargeNew
+        | Lint::PodSerializedByField
+        | Lint::Checkfree
+        | Lint::Nopanic
+        | Lint::Noalloc
+        | Lint::Nonblocking
+        | Lint::Pure
+        | Lint::Packable
+        | Lint::SoaCandidate
+        | Lint::BorrowWorkaround
+        | Lint::NllWorkaround
+        | Lint::NativeContracts
+        // A hasher is chosen in the type, or kept with `#[expect(blaze::default_hasher, reason = ..)]`:
+        // an allocation's comment says nothing about it.
+        | Lint::DefaultHasher => None,
     }
 }
 
@@ -34,6 +118,12 @@ const fn tag(lint: Lint) -> Option<&'static str> {
 /// `range` covers, or on the line above its first.
 pub(super) fn exempt(text: &str, range: TextRange, lint: Lint) -> bool {
     let Some(tag) = tag(lint) else { return false };
+    commented(text, range, tag)
+}
+
+/// Whether `// <tag>: <reason>` is on one of the lines `range` of `text` covers, or on the line
+/// above its first, with a reason that isn't empty.
+pub(super) fn commented(text: &str, range: TextRange, tag: &str) -> bool {
     let start = (usize::from(range.start())).min(text.len());
     let end = (usize::from(range.end())).clamp(start, text.len());
     let first = line_start(text, start);
@@ -94,7 +184,7 @@ mod tests {
         assert!(!exempt(text, at(text, "y.clone()"), Lint::HotClone));
         assert!(!exempt(text, at(text, "z.clone()"), Lint::HotClone));
         assert!(exempt(text, at(text, "z.clone()"), Lint::HotAlloc));
-        assert!(exempt(text, at(text, "z.clone()"), Lint::StdHashmap));
+        assert!(!exempt(text, at(text, "z.clone()"), Lint::DefaultHasher));
         assert!(!exempt(text, at(text, "z.clone()"), Lint::HotDyn));
     }
 

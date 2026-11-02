@@ -74,6 +74,7 @@ use std::{
 
 use blaze_core::{Untraceable, utf8::push_lossy};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use super::{Also, Bind, MARK, Recorder, Scope, Spec, View, tidy, tidy_into};
 
@@ -651,7 +652,7 @@ fn run_in(
         (None, true) => Around::Confined(first),
         (None, false) => Around::Namespaces,
     };
-    let mut watch = Watch { around, network: also.network, processes: HashMap::default() };
+    let mut watch = Watch { around, network: also.network, processes: HashMap::new_in(Global) };
     let supervised = listener.is_some();
     if let Some(listener) = listener {
         supervise(listener.as_raw_fd(), first, &mut recorder, &mut watch);
@@ -1867,7 +1868,7 @@ struct Watch {
     /// Whether the program may reach the network ([`Also::network`]).
     network: bool,
     /// The process of each thread seen, by the thread's id.
-    processes: HashMap<u64, u64>,
+    processes: HashMap<u64, u64, Global>,
 }
 
 /// The supervisor's buffers, kept from one notification to the next: a path a call names is

@@ -7,13 +7,11 @@ use std::{
     cell::UnsafeCell,
     marker::PhantomData,
     mem::MaybeUninit,
-    sync::{
-        OnceLock,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use blaze_mem::Tag;
+use parking_lot::Mutex;
 
 use super::{
     Id, MemoryUsage,
@@ -58,7 +56,10 @@ pub(crate) struct InputTable<I: Input> {
     ids: Ids,
     /// A singleton's ID and field nodes, reserved at the first `try_get` or `new`: before it
     /// is made, its field 0's node is what a read of its absence depends on.
-    singleton: OnceLock<Id>,
+    /// Its bits, 0 until reserved.
+    singleton: AtomicU32,
+    /// Held while the singleton is reserved, so it is reserved once.
+    reserving: Mutex<()>,
     _of: PhantomData<fn() -> I>,
 }
 
@@ -67,7 +68,8 @@ impl<I: Input> Table for InputTable<I> {
         InputTable {
             pages: Pages::new(Tag::Query),
             ids: Ids::new(Tag::Query),
-            singleton: OnceLock::new(),
+            singleton: AtomicU32::new(0),
+            reserving: Mutex::new(()),
             _of: PhantomData,
         }
     }
@@ -196,20 +198,34 @@ pub(crate) fn field_node<I: Input>(storage: &Storage, id: Id, field: u32) -> u32
 /// each field node stamped 0 (never changed) with durability `LOW`.
 fn reserved<I: Input>(storage: &Storage) -> (&InputTable<I>, Id) {
     let (table, index) = storage.table_or_make::<InputTable<I>>(I::ingredient());
-    let id = *table.singleton.get_or_init(|| {
-        let id = table.ids.next(storage, index, &table.pages, &storage.heap, layout::<RowOf<I>>());
-        let row = table.pages.row::<RowOf<I>>(id).expect("`Ids::next` made the row's page");
-        let first = storage.new_nodes(I::FIELDS.max(1));
-        for field in 0..I::FIELDS.max(1) {
-            let node = first + field;
-            storage.set_key(node, node_key(index, id, field));
-            storage.set_summary(node, input_bits(node));
-            storage.repaint(node, color(FIELD | u32::from(Durability::LOW.0), 0));
-        }
-        row.first.store(first, Ordering::Relaxed);
-        id
-    });
+    // Acquire: the row and field nodes `reserve` made before it stored the ID.
+    let id = match table.singleton.load(Ordering::Acquire) {
+        0 => reserve::<I>(storage, table, index),
+        bits => Id::from_u32(bits),
+    };
     (table, id)
+}
+
+#[cold]
+#[inline(never)]
+fn reserve<I: Input>(storage: &Storage, table: &InputTable<I>, index: u32) -> Id {
+    let _one = table.reserving.lock();
+    if let bits @ 1.. = table.singleton.load(Ordering::Acquire) {
+        return Id::from_u32(bits);
+    }
+    let id = table.ids.next(storage, index, &table.pages, &storage.heap, layout::<RowOf<I>>());
+    let row = table.pages.row::<RowOf<I>>(id).expect("`Ids::next` made the row's page");
+    let first = storage.new_nodes(I::FIELDS.max(1));
+    for field in 0..I::FIELDS.max(1) {
+        let node = first + field;
+        storage.set_key(node, node_key(index, id, field));
+        storage.set_summary(node, input_bits(node));
+        storage.repaint(node, color(FIELD | u32::from(Durability::LOW.0), 0));
+    }
+    row.first.store(first, Ordering::Relaxed);
+    // Release: a reader that loads the ID sees its row and field nodes.
+    table.singleton.store(id.as_u32(), Ordering::Release);
+    id
 }
 
 /// The singleton's ID, if made. Its absence is a read of its field 0's node, which making it

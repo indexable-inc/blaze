@@ -32,20 +32,35 @@ impl<'a> Os<'a> {
         ok(ret, value)
     }
 
-    /// `_NSGetEnviron()` on macOS, std's `environ()` on Linux: the address of the variable that
-    /// holds the array of `NAME=value` strings, the calling crate's variables sorted by name,
-    /// made once.
-    pub(super) fn environ(&mut self, g: &mut impl Guest, ret: &mut [u8]) -> Done {
+    /// The calling crate's variable `name`, noted read by name: what a wasm macro's `getenv`
+    /// asks the host, one variable at a time (`blaze_proc_macro::env_var`).
+    pub(crate) fn var(&mut self, name: &str) -> Option<&'a str> {
+        self.trace.note(Noted::Seen(Seen::Env), name);
+        self.env.iter().find(|(it, _)| *it == name).map(|(_, value)| value)
+    }
+
+    /// The calling crate's variables sorted by name, the whole environment noted read: what
+    /// `environ` gives, and WASI's `environ_get` to a wasm macro, which std's `env::vars`
+    /// reaches (its `getenv` asks by name, [`Os::var`]).
+    pub(crate) fn walk_environ(&mut self) -> Vec<(&'a str, &'a str)> {
         if !self.trace.all_env {
             self.trace.all_env = true;
             self.trace.note(Noted::Seen(Seen::Env), ALL_ENV);
         }
-        if let Some(cell) = self.environ {
-            return ok(ret, cell);
-        }
         // alloc: once per expansion that walks the whole environment
         let mut vars: Vec<(&str, &str)> = self.env.iter().collect();
         vars.sort_unstable();
+        vars
+    }
+
+    /// `_NSGetEnviron()` on macOS, std's `environ()` on Linux: the address of the variable that
+    /// holds the array of `NAME=value` strings, the calling crate's variables sorted by name,
+    /// made once.
+    pub(super) fn environ(&mut self, g: &mut impl Guest, ret: &mut [u8]) -> Done {
+        if let Some(cell) = self.environ {
+            return ok(ret, cell);
+        }
+        let vars = self.walk_environ();
         self.bytes.clear();
         // alloc: as above
         let mut starts = Vec::with_capacity(vars.len());

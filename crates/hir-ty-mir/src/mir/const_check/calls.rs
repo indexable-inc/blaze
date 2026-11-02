@@ -155,8 +155,14 @@ impl<'db> Checker<'_, 'db> {
         let holds = trait_is_const(self.db, trait_).then(|| self.conditions_hold(callee, fn_args));
         match holds {
             Some(true) => {
-                let kind = self.call_error(callee, fn_args, destination, source, true);
-                self.check_op(kind, Status::conditionally_const(), span);
+                // blaze: every impl of `ArbitraryInt` (`#![blaze::arbitrary_ints]`) is the trait
+                // solver's builtin, whose items are the trait's const default items. They are
+                // `u3`'s inherent items (`u3::wrapping_add`), so a `const fn` calls them as it
+                // calls `u8`'s, without `const_trait_impl`.
+                if self.lang.ArbitraryInt != Some(trait_) {
+                    let kind = self.call_error(callee, fn_args, destination, source, true);
+                    self.check_op(kind, Status::conditionally_const(), span);
+                }
                 self.check_callee_stability(Item::Trait(trait_), span);
             }
             // typeck's `E0277` of a `[const]` bound that does not hold; a closure's call is
@@ -512,8 +518,11 @@ fn has_const_conditions(db: &base_db::Db, callee: FunctionId) -> bool {
         GenericParams::of(db, def).where_predicates().iter().any(|it| {
             matches!(
                 it,
+                // A field binder's `[const]` bound is refused at lowering
+                // (`ComptimeBinderNotYetSupported`), as `const_conditions` lowers none.
                 WherePredicate::TypeBound {
                     lifetimes: None,
+                    binder: hir_def::hir::generics::BinderParams { len: 0, .. },
                     bound: TypeBound::Path(_, TraitBoundModifier::MaybeConst),
                     ..
                 }

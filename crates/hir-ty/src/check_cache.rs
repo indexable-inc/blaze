@@ -16,10 +16,11 @@ mod part;
 #[cfg(test)]
 mod tests;
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Domain, Hasher};
 use hir_def::{
     DefWithBodyId, HasModule,
@@ -40,7 +41,8 @@ static DOMAIN: Domain = Domain::new(BODIES_DOMAIN);
 
 /// What makes the parts: the schema of their bytes, which covers every encoding in them, so a
 /// part of another encoding is never found.
-pub static PRODUCER: LazyLock<ContentId> = LazyLock::new(|| {
+#[expect(clippy::disallowed_types, reason = "the process's one producer content ID: all body parts use the same schema")]
+pub static PRODUCER: std::sync::LazyLock<ContentId> = std::sync::LazyLock::new(|| {
     let mut hasher = Hasher::of(&DOMAIN);
     hasher.part(b"producer").id(&part::SCHEMA.0);
     hasher.finish()
@@ -77,7 +79,7 @@ pub fn open(bytes: &[u8]) -> Result<(), String> {
 /// Has `db` serve the bodies of each crate of `parts` from its part, which [`open`] accepted:
 /// one that does not open here is a panic naming its crate. The same parts as now (the same
 /// buffers) change nothing.
-pub fn set_served(db: &mut Db, parts: HashMap<Crate, ImageBuf>) {
+pub fn set_served(db: &mut Db, parts: HashMap<Crate, ImageBuf, Global>) {
     use blaze_query::db::{Durability, Setter};
     for (&krate, buf) in &parts {
         if let Err(why) = part::open(buf.bytes()) {
@@ -139,7 +141,7 @@ pub(crate) struct ServedBodies {
 /// The parts, by crate. Compares by identity: [`set_served`] gives a new one only when a part
 /// changed.
 #[derive(Clone)]
-pub(crate) struct Served(Arc<HashMap<Crate, ImageBuf>>);
+pub(crate) struct Served(Arc<HashMap<Crate, ImageBuf, Global>>);
 
 impl PartialEq for Served {
     fn eq(&self, other: &Served) -> bool {

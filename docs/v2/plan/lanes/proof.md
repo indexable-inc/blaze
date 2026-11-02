@@ -52,8 +52,16 @@ to blaze's own build from nothing, the corpus judges each crate's tests by their
 The scripts are in `harness/v2/`, one entry for all of them (`proof.py`), and what each
 checks is in [the harnesses](../../../harness.md#the-v2-proof). `crates/blaze-v2-proof` holds the
 part that reads v2's own record: the query trace compared to name the stale query and the read
-it missed, reruns for nothing counted, SIMD byte comparison, and the round-trip and in-place
-checks of every column encoding.
+it missed (`under`), reruns for nothing counted (`over`), two maps' differing keys (`apart`), the
+kernel's entries as rows of that trace (`kernel`), the multi-core and file byte comparisons, and
+the round-trip and in-place checks of every column encoding.
+
+Since 2026-11-02 it shares one sampler and one byte comparison with the store check: both live
+in `crates/blaze-store-check` (`Setting::sampled`, `blaze_store_check::bytes`), which the oracle depends on
+and re-exports; the oracle's own `sample` and the store check's scalar comparison are deleted.
+The edit fuzzer (`crates/hir-ty-codegen/v2/edits.rs`) judges each step with `under`, `over` and
+`apart`, so a failure names the stale query or kernel entry and the read it missed. Who owns
+what: [verifying the store and incremental builds](../design/verify.md#who-owns-what).
 
 ## Done when
 

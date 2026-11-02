@@ -8,6 +8,7 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_query::db::FromId;
 
 use super::{Loaded, check_db, module_path};
@@ -89,7 +90,7 @@ fn write(file: &str, text: &str) -> (Loaded, Vec<(String, blaze_query::db::Id)>)
 }
 
 /// The modules, as paths, whose `DeclKey` queries ran.
-fn decl_modules(db: &Db, events: &[(String, blaze_query::db::Id)]) -> HashSet<String> {
+fn decl_modules(db: &Db, events: &[(String, blaze_query::db::Id)]) -> HashSet<String, Global> {
     events
         .iter()
         .filter(|(name, _)| DECL_QUERIES.contains(&name.as_str()))
@@ -116,7 +117,7 @@ fn last_write(loaded: &mut Loaded) -> Vec<String> {
     out
 }
 
-fn set(paths: &[&str]) -> HashSet<String> {
+fn set(paths: &[&str]) -> HashSet<String, Global> {
     paths.iter().map(|it| (*it).to_owned()).collect()
 }
 

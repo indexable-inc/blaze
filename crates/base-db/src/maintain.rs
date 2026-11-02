@@ -29,6 +29,7 @@ use std::{
 
 use blaze_dbsp::Work;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_mem::{Tag, frame};
 use parking_lot::{Mutex, MutexGuard};
@@ -245,7 +246,7 @@ pub fn maintainers() -> &'static [&'static Maintainer] {
 pub(crate) struct Maintenance {
     /// Behind a lock so a maintainer's reads, on `&Db`, can have it lent ([`Db::lend_state`]).
     // dyn: write-side state, one lookup per maintainer per write
-    state: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    state: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>, Global>>,
     /// Whether a maintainer's reads are running: only they are lent state on `&Db`.
     reading: bool,
     pending: Pending,
@@ -612,7 +613,7 @@ struct InUse;
 /// marked out.
 fn take_state<T: Default + Send + Sync + 'static>(
     // dyn: write-side state, one lookup per maintainer per write
-    states: &mut HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    states: &mut HashMap<TypeId, Box<dyn Any + Send + Sync>, Global>,
 ) -> Box<T> {
     let id = TypeId::of::<T>();
     match states.get_mut(&id) {
@@ -639,7 +640,7 @@ fn take_state<T: Default + Send + Sync + 'static>(
 /// goes on with the call's result or its panic.
 fn put_state<T: Send + Sync + 'static, R>(
     // dyn: write-side state, one lookup per maintainer per write
-    states: &mut HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    states: &mut HashMap<TypeId, Box<dyn Any + Send + Sync>, Global>,
     state: Box<T>,
     ran: std::thread::Result<R>,
 ) -> R {

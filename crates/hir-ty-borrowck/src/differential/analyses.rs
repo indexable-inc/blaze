@@ -347,7 +347,7 @@ fn compare_body<'db>(what: &str, ctx: &Ctx<'_, 'db>, body: &MirBody<'db>) {
         mem::map(frame);
     let regions = regions::build(ctx, body, &cfg, &requirements);
     let count = ctx.infcx.num_region_vars();
-    let live = liveness::region_liveness(ctx, body, &cfg, &decoded, &new_moves, &regions, count);
+    let (live, _) = liveness::region_liveness(ctx, body, &cfg, &decoded, &new_moves, &regions, count);
     let old_live = old::liveness::region_liveness(ctx, body, &cfg, &old_moves, &regions, count);
     assert_eq!(live.len(), old_live.len(), "{what}: regions");
     let last = cfg.points - 1;
@@ -675,4 +675,45 @@ fn borrowck_reports_rustcs_codes_at_rustcs_spans_in_both_modes() {
             }
         });
     }
+}
+
+/// `polonius-flow` gives exactly the alpha's result for every function of the fixtures the alpha
+/// accepts (its own and minicore's), and where the alpha rejects, no error the alpha does not
+/// give: it only ever accepts more. `#[blaze::linear]` errors (`LINEAR`) are left out of
+/// "rejects": no mode changes them, and the whole result is still compared where only they are.
+#[test]
+fn polonius_flow_accepts_more_never_less() {
+    let mut rejected = 0;
+    for &(fixture, _, _) in DIAGNOSED {
+        let fx = fixture::db(fixture);
+        let _ = fx.only_file();
+        let db = fx.into_db();
+        hir_ty::attach_db(&db, || {
+            for (name, def) in budget::functions(&db) {
+                let alpha = borrowck_in_mode(&db, def, Mode::Polonius);
+                let flow = borrowck_in_mode(&db, def, Mode::PoloniusFlow);
+                let errors = |result: &crate::BorrowckResult| -> Vec<(&'static str, MirSpan)> {
+                    result
+                        .diagnostics
+                        .iter()
+                        .filter(|it| it.is_error())
+                        // `#[blaze::linear]`'s errors are the same in every mode.
+                        .filter(|it| it.code != hir_ty_linear::LinearDiagnostic::CODE)
+                        .map(|it| (it.code, it.span))
+                        .collect()
+                };
+                let (by_alpha, by_flow) = (errors(&alpha), errors(&flow));
+                if by_alpha.is_empty() {
+                    assert_eq!(flow, alpha, "`{name}`: the alpha accepts it");
+                    continue;
+                }
+                rejected += 1;
+                assert_eq!((&flow.skipped, flow.not_checked), (&alpha.skipped, alpha.not_checked));
+                for error in &by_flow {
+                    assert!(by_alpha.contains(error), "`{name}`: {error:?} is not the alpha's");
+                }
+            }
+        });
+    }
+    assert!(rejected >= 5, "{rejected} functions the alpha rejects");
 }

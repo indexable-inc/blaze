@@ -7,6 +7,7 @@
 //! every test when there are none.
 
 use blaze_hash::ByHash;
+use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_items::CodeHash;
 use memchr::memmem::Finder;
@@ -43,7 +44,7 @@ pub fn plan(binaries: &[Binary<'_>], filters: &[String]) -> Plan {
     let mut matched = vec![false; filters.len()];
     // Each filter's searcher is made once, not once per test name as `str::contains` makes it.
     let finders: Vec<Finder<'_>> = filters.iter().map(|it| Finder::new(it.as_bytes())).collect();
-    let mut count: ByHash<CodeHash, u32> = ByHash::default();
+    let mut count: ByHash<CodeHash, u32, Global> = ByHash::new_in(Global);
     for binary in binaries {
         let mut selected = false;
         for test in binary.tests {
@@ -76,7 +77,7 @@ pub fn plan(binaries: &[Binary<'_>], filters: &[String]) -> Plan {
 /// count and the hash's first four bytes, then a compare of the whole hash within each run that
 /// key leaves tied (a run of more than one is rare: two of `n` hashes share four bytes with
 /// probability about \(n^2 / 2^{33}\)).
-fn hottest_first(count: ByHash<CodeHash, u32>) -> Vec<CodeHash> {
+fn hottest_first(count: ByHash<CodeHash, u32, Global>) -> Vec<CodeHash> {
     let key = |n: u32, hash: &CodeHash| {
         let [a, b, c, d, ..] = hash.0.0;
         radix::pack_32(u32::MAX - n, u32::from_be_bytes([a, b, c, d]))
@@ -120,7 +121,7 @@ mod tests {
 
     #[test]
     fn the_radix_order_is_the_compare_order_ties_and_all() {
-        let mut count: ByHash<CodeHash, u32> = ByHash::default();
+        let mut count: ByHash<CodeHash, u32, Global> = ByHash::new_in(Global);
         for n in 0..2000u32 {
             let mut bytes = ContentId::of("blaze-intent test", &n.to_le_bytes()).0;
             // A tenth share their first four bytes, so the key leaves runs tied.

@@ -15,12 +15,13 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::hash_map::Entry;
+use blaze_hash::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 
 use anyhow::{Context as _, bail};
 use blaze_hash::{FixedHasher, HashMap, HashSet};
+use std::alloc::Global;
 use blaze_manifest::config::CompileKind as ProfileKind;
 use blaze_manifest::profiles::{
     Lto, PanicStrategy, Profile, ProfileRoot, Strip, StripInner, UnitFor,
@@ -74,12 +75,15 @@ impl Mode {
 
 /// What a unit is compiled for (cargo's `CompileKind`): `Host` for what runs while building,
 /// or `Target`, the one triple a build names (`--target`'s, or the host's own when no
-/// `--target` is given, until the graph is shared).
+/// `--target` is given, until the graph is shared). `MacroWasm` is blaze's own: a proc macro
+/// and what it depends on, built for [`Request::macro_wasm`] to run as a wasm module. No unit
+/// has it in a build that does not ask for it, so such a graph is cargo's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 enum Kind {
     Host,
     Target,
+    MacroWasm,
 }
 
 impl Kind {
@@ -192,7 +196,7 @@ use tests::{external, output};
 /// that share its hash.
 #[derive(Default)]
 struct Chains {
-    heads: HashMap<u64, u32>,
+    heads: HashMap<u64, u32, Global>,
     /// The entry before each in its chain.
     next: Vec<u32>,
 }
@@ -233,7 +237,7 @@ impl Chains {
 #[derive(Default)]
 struct Names {
     all: Vec<InternedString>,
-    ids: HashMap<usize, u32>,
+    ids: HashMap<usize, u32, Global>,
 }
 
 impl Names {
@@ -384,6 +388,7 @@ fn hash_class(p: &Profile, h: &mut FixedHasher) {
     }
     p.rustflags.hash(h);
     p.trim_paths.hash(h);
+    p.contract_checks.hash(h);
 }
 
 fn class_hash(p: &Profile) -> u64 {
@@ -456,7 +461,7 @@ struct PkgDep<'a> {
     id: PackageId,
     /// Whether the dependent depends on it publicly (cargo's `public_dependencies`).
     public: bool,
-    deps: &'a HashSet<Dependency>,
+    deps: &'a HashSet<Dependency, Global>,
 }
 
 /// What decides which of a package's dependencies a unit builds with (cargo's `State::deps`).
@@ -616,7 +621,7 @@ struct Shared {
     /// The dependencies of the units being shared, a stack of each one's.
     scratch: Vec<Dep>,
     /// A profile with `strip` lowered and its debuginfo settled, by the profile and how.
-    adjusted: HashMap<(u32, u8), u32>,
+    adjusted: HashMap<(u32, u8), u32, Global>,
     /// Whether the target's units become the host's (no `--target`).
     to_host: bool,
 }
@@ -647,17 +652,17 @@ struct Proposal {
 struct State<'r, 'a> {
     request: &'r Request<'a>,
     /// The platform of each kind, whose `cfg` decides a `[target.'cfg(..)'.dependencies]`.
-    platforms: [&'a Platformed; 2],
+    platforms: [&'a Platformed; 3],
     /// Each kind as a profile reads it.
-    profile_kinds: [ProfileKind; 2],
+    profile_kinds: [ProfileKind; 3],
     pkgs: Vec<Pkg<'a>>,
-    pkg_index: HashMap<PackageId, u32>,
+    pkg_index: HashMap<PackageId, u32, Global>,
     pkg_deps: Vec<PkgDep<'a>>,
     target_lists: Vec<u32>,
     public: Vec<PackageId>,
 
     units: Vec<Row>,
-    by_key: HashMap<Key, u32>,
+    by_key: HashMap<Key, u32, Global>,
     /// Each unit's edges in `built`, in the order computed; [`NONE`] until it is walked.
     ranges: Vec<(u32, u32)>,
     built: Vec<Dep>,
@@ -665,7 +670,7 @@ struct State<'r, 'a> {
 
     profiles: Profiles,
     /// The profile of a package's unit for a use and kind (cargo's `get_profile`).
-    profile_of: HashMap<(u32, UnitFor, Kind), u32>,
+    profile_of: HashMap<(u32, UnitFor, Kind), u32, Global>,
     /// The profile of the run of a build script, by the profile of the unit it runs for.
     run_profile_of: Vec<u32>,
     features: FeatureSets,
@@ -673,11 +678,11 @@ struct State<'r, 'a> {
     features_of: Vec<u32>,
     /// cargo's `resolve_all_features` less the package's own: `(dep, feature)` for each
     /// feature on in each dependency, by package, whether dev-dependencies count, and kind.
-    dep_features: HashMap<(u32, bool, Kind), (u32, u32)>,
+    dep_features: HashMap<(u32, bool, Kind), (u32, u32), Global>,
     dep_feature_pairs: Vec<(InternedString, InternedString)>,
     names: Names,
     /// The names a package calls another's target by (cargo's `extern_crate_name_and_dep_name`).
-    extern_names: HashMap<(u32, u32, u32), (u32, u32)>,
+    extern_names: HashMap<(u32, u32, u32), (u32, u32), Global>,
     ranks: Ranks,
 }
 
@@ -742,7 +747,7 @@ impl<'r, 'a> State<'r, 'a> {
         sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         let targets: usize = sorted.iter().map(|it| it.2.manifest.targets.len()).sum();
         let mut pkgs = Vec::with_capacity(n);
-        let mut pkg_index = HashMap::with_capacity_and_hasher(n, Default::default());
+        let mut pkg_index = HashMap::with_capacity_in(n, Global);
         let mut target_lists = Vec::with_capacity(targets);
         for (_, id, package) in sorted {
             pkg_index.insert(id, pkgs.len() as u32);
@@ -770,31 +775,39 @@ impl<'r, 'a> State<'r, 'a> {
             });
         }
         let units = n * 4;
+        // Without `macro_wasm` no unit is `MacroWasm`, so its slot is read by none.
+        let macro_wasm = request.macro_wasm.unwrap_or(request.host);
         State {
             request,
-            platforms: [request.host, explicit],
-            // alloc: the triple, once per build.
-            profile_kinds: [ProfileKind::Host, ProfileKind::Target(explicit.triple.clone())],
+            platforms: [request.host, explicit, macro_wasm],
+            profile_kinds: [
+                ProfileKind::Host,
+                // alloc: the triple, once per build.
+                ProfileKind::Target(explicit.triple.clone()),
+                // A wasm macro is built for another platform than the host's, as a target is.
+                // alloc: the triple, once per build.
+                ProfileKind::Target(macro_wasm.triple.clone()),
+            ],
             pkgs,
             pkg_index,
             pkg_deps: Vec::with_capacity(n * 4),
             target_lists,
             public: Vec::with_capacity(4),
             units: Vec::with_capacity(units),
-            by_key: HashMap::with_capacity_and_hasher(units, Default::default()),
+            by_key: HashMap::with_capacity_in(units, Global),
             ranges: Vec::with_capacity(units),
             built: Vec::with_capacity(units * 4),
             stack: Vec::with_capacity(64),
             profiles: Profiles::default(),
-            profile_of: HashMap::with_capacity_and_hasher(n * 2, Default::default()),
+            profile_of: HashMap::with_capacity_in(n * 2, Global),
             run_profile_of: Vec::with_capacity(8),
             features: FeatureSets::default(),
             // alloc: a column per build.
             features_of: vec![NONE; n * 2],
-            dep_features: HashMap::default(),
+            dep_features: HashMap::new_in(Global),
             dep_feature_pairs: Vec::with_capacity(16),
             names: Names::default(),
-            extern_names: HashMap::with_capacity_and_hasher(n * 4, Default::default()),
+            extern_names: HashMap::with_capacity_in(n * 4, Global),
             ranks: Ranks::new(n),
         }
     }
@@ -806,6 +819,15 @@ impl<'r, 'a> State<'r, 'a> {
 
     fn target(&self, pkg: u32, at: u32) -> &'a Target {
         &self.targets(pkg)[at as usize]
+    }
+
+    /// The kind of a unit of a target that a unit of kind `of` uses: a proc macro's is
+    /// `MacroWasm` in a build that runs macros as wasm; otherwise [`Kind::for_target`].
+    fn kind_for(&self, of: Kind, for_host: bool, proc_macro: bool) -> Kind {
+        match proc_macro && self.request.macro_wasm.is_some() {
+            true => Kind::MacroWasm,
+            false => of.for_target(for_host),
+        }
     }
 
     fn platform_activated(&self, dep: &Dependency, kind: Kind) -> bool {
@@ -1036,7 +1058,7 @@ impl<'r, 'a> State<'r, 'a> {
             UnitFor::new_normal()
         };
         let profile = self.profile(pkg, unit_for, Kind::Target);
-        let kind = Kind::Target.for_target(target.for_host);
+        let kind = self.kind_for(Kind::Target, target.for_host, target.proc_macro);
         let class = self.profiles.class_of[profile as usize];
         self.intern(Key { pkg, target: at, features, class, kind, mode }, profile)
     }
@@ -1271,7 +1293,7 @@ impl<'r, 'a> State<'r, 'a> {
             let Some(lib) = self.pkgs[dep_pkg as usize].lib else { continue };
             let mode = check_or_build_mode(row.key.mode, lib.for_host);
             let dep_for = unit_for.with_dependency(custom_build, lib.for_host, lib.proc_macro);
-            let kind = row.key.kind.for_target(lib.for_host);
+            let kind = self.kind_for(row.key.kind, lib.for_host, lib.proc_macro);
             let mut edge =
                 self.new_unit_dep(id, dep_pkg, lib.at, dep_for, kind, mode, None, dep.public)?;
             edge.dev = !transitive;
@@ -1303,7 +1325,7 @@ impl<'r, 'a> State<'r, 'a> {
                 if let Some(lib) = self.pkgs[pkg as usize].linkable {
                     let mode = check_or_build_mode(row.key.mode, lib.for_host);
                     let dep_for = unit_for.with_dependency(custom_build, lib.for_host, lib.proc_macro);
-                    let kind = row.key.kind.for_target(lib.for_host);
+                    let kind = self.kind_for(row.key.kind, lib.for_host, lib.proc_macro);
                     let dep = self.new_unit_dep(id, pkg, lib.at, dep_for, kind, mode, None, own_public)?;
                     self.built.push(dep);
                 }
@@ -1517,7 +1539,7 @@ impl<'r, 'a> State<'r, 'a> {
             // alloc: a column per build.
             memo: vec![NONE; n],
             scratch: Vec::with_capacity(64),
-            adjusted: HashMap::default(),
+            adjusted: HashMap::new_in(Global),
             to_host: self.request.target.is_none(),
         };
         shared.offsets.push(0);
@@ -1671,6 +1693,8 @@ impl<'r, 'a> State<'r, 'a> {
                         Kind::Host => None,
                         // alloc: the output owns its strings.
                         Kind::Target => Some(explicit.triple.clone()),
+                        // alloc: the output owns its strings.
+                        Kind::MacroWasm => Some(self.platforms[Kind::MacroWasm as usize].triple.clone()),
                     },
                     mode: row.key.mode.schema(),
                     checked_as_test: row.key.mode == Mode::CheckTest,
@@ -1687,6 +1711,7 @@ impl<'r, 'a> State<'r, 'a> {
                             public: Some(dep.public),
                             noprelude: Some(false),
                             nounused: Some(false),
+                            dev: dep.dev,
                         })
                         // alloc: the output.
                         .collect(),
@@ -1786,6 +1811,7 @@ fn schema_profile(p: &Profile) -> anyhow::Result<schema::Profile> {
             Strip::Resolved(_) => schema::Strip::Resolved(stripped),
             Strip::Deferred(_) => schema::Strip::Deferred(stripped),
         },
+        contract_checks: p.contract_checks,
         // clone: the output owns its strings.
         rustflags: p.rustflags.clone(),
         trim_paths: Some(trim_paths),

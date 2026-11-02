@@ -173,6 +173,18 @@ pub(super) fn args(
     Ok(size)
 }
 
+/// Where `sig`'s last stack argument ends, unrounded: what every caller of `sig`, of any
+/// backend, reserves at its stack pointer, so what a tail call from a function of `sig` may
+/// write.
+pub(super) fn arg_bytes(sig: &ir::Signature) -> Result<u32, Error> {
+    check(sig.call_conv)?;
+    let mut assign = Assign::new(sig.call_conv, false);
+    for param in &sig.params {
+        assign.next(param)?;
+    }
+    Ok(assign.next_stack)
+}
+
 /// The bytes of `sig`'s stack argument area.
 pub(super) fn stack_args(sig: &ir::Signature) -> Result<u32, Error> {
     args(sig, |_, _, _| Ok(()))

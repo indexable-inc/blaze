@@ -4,6 +4,7 @@
 use base_db::{Db, FileId};
 use blaze_diagnostics::emit::{Sources, Style};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_expand::fixture;
 
 use crate::{
@@ -67,8 +68,16 @@ macro_rules! vec {
 }
 "#;
 
+/// The flags that turn every clippy lint off, for a fixture that tests one lint alone and names
+/// it after these. `clippy::all` is clippy's five default groups only, while blaze also warns of
+/// pedantic, nursery and cargo by default (`registry::Group::default_level`), so those three are
+/// named too; restriction is off by default.
+pub(crate) const CLIPPY_OFF: &str = "-A clippy::all -A clippy::pedantic -A clippy::nursery -A clippy::cargo";
+
 /// The diagnostics clippy's lints have in the crate `main` of `fixture`, rustc's flags `flags`
-/// given, each as rustc writes it.
+/// given, each as rustc writes it. The lints on by default stay on, as in a real `blaze check`
+/// (`blaze::general` among them): a fixture's flags turn on what it tests and off what would
+/// say the same, so a default lint that fails on a fixture fails its test too.
 pub(crate) fn lint(fixture: &str, flags: &str) -> String {
     lint_with(fixture, flags, Conf::default())
 }
@@ -97,7 +106,7 @@ fn lint_once(fixture: &str, flags: &str, conf: Conf, given: fn(&mut fixture::Fix
     let db = built.into_db();
     hir::attach_db(&db, || {
         let krate = main_crate(&db);
-        let mut names: HashMap<FileId, String> = HashMap::default();
+        let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
         let mut texts = Vec::new();
         for krate in hir::Crate::all(&db) {
             for module in krate.modules(&db) {

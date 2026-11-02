@@ -23,7 +23,7 @@ use tracing::{debug, instrument};
 use super::trait_goals::TraitGoalProvenVia;
 use super::{has_only_region_constraints, inspect};
 use crate::delegate::SolverDelegate;
-use crate::solve::assembly::structural_traits::AmbiguousOrRerunNonErased;
+use crate::solve::assembly::structural_traits::{AmbiguousOrRerunNonErased, IntMarker};
 use crate::solve::inspect::ProbeKind;
 use crate::solve::{
     BuiltinImplSource, CandidateSource, CanonicalResponse, Certainty, EvalCtxt, Goal, GoalSource,
@@ -428,6 +428,24 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased>;
+
+    /// blaze: `ArbitraryInt`, `ArbitrarySigned`, `IntFrom<S>` and `IntTryFrom<S>`, the markers
+    /// of `#[blaze::arbitrary_ints]`, answered from the types alone
+    /// ([`structural_traits::int_marker_holds`]).
+    fn consider_builtin_int_marker_candidate(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+        marker: structural_traits::IntMarker,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased>;
+
+    /// blaze: `Struct`, `Enum`, `Field<B>`, `Variant<B>` and `FnItem` of
+    /// `#![feature(blaze_comptime)]`, answered from the types alone
+    /// ([`crate::solve::reflect::reflect_trait_holds`]).
+    fn consider_builtin_reflect_candidate(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+        item: SolverTraitLangItem,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased>;
 }
 
 /// Allows callers of `assemble_and_evaluate_candidates` to choose whether to limit
@@ -716,6 +734,25 @@ where
                     G::consider_builtin_try_as_dyn_candidate(self, goal)
                 }
                 Some(SolverTraitLangItem::Field) => G::consider_builtin_field_candidate(self, goal),
+                Some(SolverTraitLangItem::ArbitraryInt) => {
+                    G::consider_builtin_int_marker_candidate(self, goal, IntMarker::Arbitrary)
+                }
+                Some(SolverTraitLangItem::ArbitrarySigned) => {
+                    G::consider_builtin_int_marker_candidate(self, goal, IntMarker::Signed)
+                }
+                Some(SolverTraitLangItem::IntFrom) => {
+                    G::consider_builtin_int_marker_candidate(self, goal, IntMarker::From)
+                }
+                Some(SolverTraitLangItem::IntTryFrom) => {
+                    G::consider_builtin_int_marker_candidate(self, goal, IntMarker::TryFrom)
+                }
+                Some(
+                    item @ (SolverTraitLangItem::ReflectStruct
+                    | SolverTraitLangItem::ReflectEnum
+                    | SolverTraitLangItem::ReflectField
+                    | SolverTraitLangItem::ReflectVariant
+                    | SolverTraitLangItem::ReflectFnItem),
+                ) => G::consider_builtin_reflect_candidate(self, goal, item),
                 _ => Err(NoSolution.into()),
             }
         };
@@ -741,6 +778,12 @@ where
         let goal_lang_item = self.cx().as_trait_lang_item(goal.predicate.trait_def_id(self.cx()));
 
         for assumption in goal.param_env.caller_bounds() {
+            // blaze: a field binder (`for<F: Field<T>> P(F)`) is used only through its members,
+            // which `env_with_reflected_member` adds as clauses of their own: matching it with
+            // an inference variable for `F` would let `F` be any type (`solve::reflect`).
+            if super::reflect::is_field_binder::<I>(assumption) {
+                continue;
+            }
             match G::fast_reject_assumption(self, goal, goal_lang_item, assumption) {
                 Ok(()) => {
                     match G::probe_and_consider_param_env_candidate(self, goal, assumption)? {

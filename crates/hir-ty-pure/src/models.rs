@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use either::Either;
 use hir_def::{
     AdtId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup, ModuleDefId, ModuleId, TraitId,
@@ -205,7 +206,9 @@ pub fn check_resolved(db: &Db, std_crate: Crate) -> Vec<&'static str> {
 /// One toolchain crate's models, by function, and the paths of its table it does not have.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Models {
-    by_fn: HashMap<FunctionId, Model>,
+    by_fn: HashMap<FunctionId, Model, Global>,
+    /// The functions of the effect rows ([`crate::effects::MODELS`]), each to its row's index.
+    effects: HashMap<FunctionId, u16, Global>,
     unresolved: Box<[&'static str]>,
 }
 
@@ -215,14 +218,18 @@ pub struct Models {
 pub fn crate_models(db: &Db, krate: Crate) -> Models {
     blaze_mem::frame::task(blaze_mem::Tag::Mir, |_| {
         let Some(home) = toolchain(&krate.data(db).origin) else {
-            return Models { by_fn: HashMap::default(), unresolved: Box::default() };
+            return Models {
+                by_fn: HashMap::new_in(Global),
+                effects: HashMap::new_in(Global),
+                unresolved: Box::default(),
+            };
         };
         let table = match home {
             Home::Core => CORE,
             Home::Alloc => ALLOC,
             Home::Std => STD,
         };
-        let mut by_fn = HashMap::with_capacity_and_hasher(table.len() * 4, Default::default());
+        let mut by_fn = HashMap::with_capacity_in(table.len() * 4, Global);
         // alloc: once per toolchain crate, the paths a stale table misses
         let mut unresolved = Vec::new();
         let resolver = Resolver { db, krate };
@@ -241,8 +248,34 @@ pub fn crate_models(db: &Db, krate: Crate) -> Models {
             }
         }
         foreign(db, krate, &mut by_fn);
-        Models { by_fn, unresolved: unresolved.into_boxed_slice() }
+        let mut effects = HashMap::new_in(Global);
+        for (index, row) in crate::effects::MODELS.iter().enumerate() {
+            if row.home != home {
+                continue;
+            }
+            found.clear();
+            resolver.functions(row.site, &mut found);
+            if found.is_empty() {
+                if row.only.applies(db, krate) {
+                    unresolved.push(row.what);
+                }
+                continue;
+            }
+            for &func in &found {
+                effects.entry(func).or_insert(index as u16);
+            }
+        }
+        Models { by_fn, effects, unresolved: unresolved.into_boxed_slice() }
     })
+}
+
+/// The effect row of `func` ([`crate::effects::MODELS`]): a function of the toolchain's `core`,
+/// `alloc` or `std` a row names.
+pub(crate) fn effect_row(db: &Db, func: FunctionId) -> Option<&'static crate::effects::Modeled> {
+    let krate = func.krate(db);
+    toolchain(&krate.data(db).origin)?;
+    let index = *crate_models(db, krate).effects.get(&func)?;
+    crate::effects::MODELS.get(usize::from(index))
 }
 
 /// The toolchain crate an origin is, if it is one with a table.
@@ -335,8 +368,8 @@ fn refusal(value: Abs, want: Root, verb: Verb) -> String {
 }
 
 /// Which toolchain crate a table or a path is of.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Home {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Home {
     Core,
     Alloc,
     Std,
@@ -352,19 +385,30 @@ impl Home {
     }
 }
 
-type Path = &'static [&'static str];
+pub(crate) type Path = &'static [&'static str];
 
 /// The type an impl is for, with its references taken off: `File` is also `&File`, `str` also
 /// `&&str`.
 #[derive(Clone, Copy)]
-enum SelfTy {
+pub(crate) enum SelfTy {
     Adt(Home, Path),
     Str,
+    /// `*const T` or `*mut T`, any `T`.
+    RawPtr,
+}
+
+/// A primitive type whose inherent methods a [`Site::Prim`] names, in `core`.
+#[derive(Clone, Copy)]
+pub(crate) enum Prim {
+    /// Both `*const T` and `*mut T`.
+    RawPtr,
+    /// `[T]`.
+    Slice,
 }
 
 /// Where a table entry's functions are.
 #[derive(Clone, Copy)]
-enum Site {
+pub(crate) enum Site {
     /// A free function of the table's crate, by path (re-exports followed).
     Fn(Path),
     /// The inherent method `name` of the type at `ty`, in the table's crate.
@@ -375,11 +419,13 @@ enum Site {
     /// The foreign function `name` (its Rust name, whatever it links to) declared in a block of
     /// the body of the free function at `func`.
     ForeignIn { func: Path, name: &'static str },
+    /// The inherent method `name` of the primitive `prim`, in the table's crate (`core`).
+    Prim { prim: Prim, name: &'static str },
 }
 
 /// On which platforms an entry must resolve.
 #[derive(Clone, Copy)]
-enum Only {
+pub(crate) enum Only {
     All,
     /// `target_family = "unix"`: std's `os::fd`.
     Unix,
@@ -388,7 +434,7 @@ enum Only {
 }
 
 impl Only {
-    fn applies(self, db: &Db, krate: Crate) -> bool {
+    pub(crate) fn applies(self, db: &Db, krate: Crate) -> bool {
         let family = |want: &str| {
             krate.cfg_options(db).get_cfg_values("target_family").any(|it| it.as_str() == want)
         };
@@ -708,7 +754,7 @@ const CORE: &[Entry] = &[
 
 /// The foreign functions `krate` declares that are the allocator's (by attribute or link name)
 /// or the panic runtime's (by link name), into `by_fn`.
-fn foreign(db: &Db, krate: Crate, by_fn: &mut HashMap<FunctionId, Model>) {
+fn foreign(db: &Db, krate: Crate, by_fn: &mut HashMap<FunctionId, Model, Global>) {
     let allocator = AttrFlags::RUSTC_ALLOCATOR
         | AttrFlags::RUSTC_DEALLOCATOR
         | AttrFlags::RUSTC_REALLOCATOR
@@ -754,9 +800,9 @@ const SYMBOLS: &[(&str, Model)] = &[
 ];
 
 /// Resolves a table's sites in its crate.
-struct Resolver<'db> {
-    db: &'db Db,
-    krate: Crate,
+pub(crate) struct Resolver<'db> {
+    pub(crate) db: &'db Db,
+    pub(crate) krate: Crate,
 }
 
 impl<'db> Resolver<'db> {
@@ -783,10 +829,11 @@ impl<'db> Resolver<'db> {
                 let Some(trait_) = self.trait_at(home, trait_path) else { return };
                 let want = match ty {
                     SelfTy::Adt(home, path) => match self.at(home, path) {
-                        Some(ModuleDefId::AdtId(adt)) => Some(adt),
+                        Some(ModuleDefId::AdtId(adt)) => Want::Adt(adt),
                         _ => return,
                     },
-                    SelfTy::Str => None,
+                    SelfTy::Str => Want::Str,
+                    SelfTy::RawPtr => Want::RawPtr,
                 };
                 // alloc: setup, once per toolchain crate's table entry
                 let names: smallvec::SmallVec<[Symbol; 2]> = names.iter().map(|it| Symbol::intern(it)).collect();
@@ -798,6 +845,22 @@ impl<'db> Resolver<'db> {
                         }
                     }
                 });
+            }
+            Site::Prim { prim, name } => {
+                let name = Symbol::intern(name);
+                let self_tys: &[SimplifiedType<'_>] = match prim {
+                    Prim::RawPtr => &[
+                        SimplifiedType::Ptr(rustc_type_ir::Mutability::Not),
+                        SimplifiedType::Ptr(rustc_type_ir::Mutability::Mut),
+                    ],
+                    Prim::Slice => &[SimplifiedType::Slice],
+                };
+                let inherent = InherentImpls::for_crate(db, self.krate);
+                for self_ty in self_tys {
+                    for &imp in inherent.for_self_ty(self_ty) {
+                        methods(db, imp, std::slice::from_ref(&name), found);
+                    }
+                }
             }
             Site::ForeignIn { func, name } => {
                 let Some(ModuleDefId::FunctionId(owner)) = self.item(self.krate, func, false) else {
@@ -820,7 +883,7 @@ impl<'db> Resolver<'db> {
         }
     }
 
-    fn trait_at(&self, home: Home, path: Path) -> Option<TraitId> {
+    pub(crate) fn trait_at(&self, home: Home, path: Path) -> Option<TraitId> {
         match self.at(home, path)? {
             ModuleDefId::TraitId(it) => Some(it),
             _ => None,
@@ -828,7 +891,7 @@ impl<'db> Resolver<'db> {
     }
 
     /// The item at `path` in the toolchain crate `home`, in the type namespace.
-    fn at(&self, home: Home, path: Path) -> Option<ModuleDefId> {
+    pub(crate) fn at(&self, home: Home, path: Path) -> Option<ModuleDefId> {
         let krate = home_crate(self.db, self.krate, home.lang())?;
         self.item(krate, path, true)
     }
@@ -862,15 +925,23 @@ fn name_of(segment: &str) -> Name {
     Name::new_symbol_root(Symbol::intern(segment))
 }
 
-/// Whether `imp` is for the ADT `want` (`str` when `None`), its references taken off.
-fn self_ty_is(db: &Db, imp: ImplId, want: Option<AdtId>) -> bool {
+/// The self type an [`Site::Impls`] entry wants.
+#[derive(Clone, Copy)]
+enum Want {
+    Adt(AdtId),
+    Str,
+    RawPtr,
+}
+
+/// Whether `imp` is for `want`, its references taken off.
+fn self_ty_is(db: &Db, imp: ImplId, want: Want) -> bool {
     let mut ty = db.impl_self_ty(imp).skip_binder();
     while let TyKind::Ref(_, inner, _) = ty.kind() {
         ty = inner;
     }
     match (ty.kind(), want) {
-        (TyKind::Adt(def, _), Some(adt)) => def.def_id() == adt,
-        (TyKind::Str, None) => true,
+        (TyKind::Adt(def, _), Want::Adt(adt)) => def.def_id() == adt,
+        (TyKind::Str, Want::Str) | (TyKind::RawPtr(..), Want::RawPtr) => true,
         _ => false,
     }
 }

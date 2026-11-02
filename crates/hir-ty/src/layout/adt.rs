@@ -17,9 +17,10 @@ use crate::{
     db::HirDatabase,
     layout::{
         InternedLayout, Layout, LayoutCx, LayoutError, RustcEnumVariantIdx, RustcFieldIdx,
-        enum_variant_ids, intern_layout, struct_flags, struct_tail_may_be_unsized,
-        variant_field_ids,
+        bits_layout, enum_variant_ids, intern_layout, scalar_unit, struct_flags,
+        struct_tail_may_be_unsized, variant_field_ids,
     },
+    layout::field_order::{self, FieldLayouts},
     next_solver::{DbInterner, GenericArgs, StoredGenericArgs},
     representability::{Representability, representability},
     traits::StoredParamEnvAndCrate,
@@ -50,6 +51,19 @@ fn layout_of_adt_in(
         return Err(LayoutError::RecursiveTypeWithoutIndirection);
     }
     let dl = target;
+    if let AdtId::StructId(s) = def
+        && struct_flags(db, s).contains(StructFlags::IS_BLAZE_BITS)
+    {
+        // `#[blaze::bits]`: the backing integer, every bit pattern valid (a field's own
+        // values are checked by its type at each write), no field offsets.
+        return match bits_layout(db, s) {
+            Ok(bits) => Ok(intern_layout(Layout::scalar(
+                dl,
+                scalar_unit(dl, Primitive::Int(bits.backing, false)),
+            ))),
+            Err(err) => Err(LayoutError::Bits(Box::new(err.clone()))), // alloc: an error, once per refused struct
+        };
+    }
     let cx = LayoutCx::new(dl);
     let args = args.as_ref();
     let variant_count = match def {
@@ -106,29 +120,42 @@ fn layout_of_adt_in(
         AdtId::UnionId(_) | AdtId::EnumId(_) => false,
     };
     let variants = variants_of(&fields, &ends);
-    let mut result = if matches!(def, AdtId::UnionId(..)) {
-        cx.calc.layout_of_union(&repr, &variants)?
-    } else {
-        // As rustc has a discriminant: the bits of its type, and no more.
-        let discr_size = Integer::from_attr(dl, repr.discr_type()).size();
-        cx.calc.layout_of_struct_or_enum(
-            &repr,
-            &variants,
-            matches!(def, AdtId::EnumId(..)),
-            niche_optimizations,
-            // As rustc's `Integer::repr_discr`, a `#[repr]` too small for the values is a bug:
-            // the values are truncated to it above.
-            |min, max| {
-                repr_discr(dl, &repr, min.start, max.last).unwrap_or_else(|err| {
-                    panic!("`#[repr]` of {def:?} too small for its discriminants: {err}")
-                })
-            },
-            discriminants.iter().flat_map(|it| it.iter()).enumerate().filter_map(|(index, d)| {
-                Some((RustcEnumVariantIdx(index), discr_size.truncate(d.ok()? as u128)))
-            }),
-            !matches!(def, AdtId::EnumId(..)) && !maybe_unsized,
-        )?
+    // The calculator, given the `#[repr]` and the fields in some order: rustc's layout below,
+    // a hot-first one in `field_order`.
+    let layout_with = |repr: &ReprOptions,
+                       variants: &FieldLayouts<'_, 'static>|
+     -> Result<Layout, LayoutError> {
+        Ok(if matches!(def, AdtId::UnionId(..)) {
+            cx.calc.layout_of_union(repr, variants)?
+        } else {
+            // As rustc has a discriminant: the bits of its type, and no more.
+            let discr_size = Integer::from_attr(dl, repr.discr_type()).size();
+            cx.calc.layout_of_struct_or_enum(
+                repr,
+                variants,
+                matches!(def, AdtId::EnumId(..)),
+                niche_optimizations,
+                // As rustc's `Integer::repr_discr`, a `#[repr]` too small for the values is a
+                // bug: the values are truncated to it above.
+                |min, max| {
+                    repr_discr(dl, repr, min.start, max.last).unwrap_or_else(|err| {
+                        panic!("`#[repr]` of {def:?} too small for its discriminants: {err}")
+                    })
+                },
+                discriminants.iter().flat_map(|it| it.iter()).enumerate().filter_map(
+                    |(index, d)| {
+                        Some((RustcEnumVariantIdx(index), discr_size.truncate(d.ok()? as u128)))
+                    },
+                ),
+                !matches!(def, AdtId::EnumId(..)) && !maybe_unsized,
+            )?
+        })
     };
+    let result = layout_with(&repr, &variants)?;
+    // Without a plan ranking `def`, `result` as it is.
+    let shape = field_order::Shape { repr, flags, maybe_unsized, niches: niche_optimizations };
+    let mut result =
+        field_order::reorder(db, def, &shape, result, &variants, dl, frame, layout_with);
     // As rustc's `layout_of_uncached`: the `f16b` and `ppcf128` lang items are structs over an
     // integer of their size, laid out as the backend's float scalar of that format.
     if let Some(flags) = flags {

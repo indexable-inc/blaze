@@ -46,13 +46,21 @@ memory (bounded: the store's limbo is collected only by the store's owner).
 
 - A worker puts through a `Writer` of its own (`Store::writer()`): it encodes the record into
   its own segment's chunk and publishes a `Spot` (key, content, place, ticket) into the tier's
-  delta with one compare-and-swap. The ticket is `(segment << 40) | put`; it is durable once
+  delta with one compare-and-swap (two during an index swap, below). The ticket is `(segment << 40) | put`; it is durable once
   the segment's durable count passes it.
 - A commit drains every segment into pack memory, then per pack `Truncate`, `WriteAt` (block
   aligned, so a driver may skip the page cache), `Sync`, then external files, the index and the
-  head. Once a batch's packs are mapped, each spot is retargeted to its pack with one swap and
-  the segment's chunks are retired. An index swap publishes a fresh delta; the old one stays
-  readable as `prev` until a grace passes, then folds into the new one.
+  head. Once a batch's packs are mapped, each spot is retargeted to its pack with one swap (during
+  an index swap, one in `prev` and one in the delta, or an insert there, below) and the segment's
+  chunks are retired. An index swap publishes a fresh delta; the old one stays
+  readable as `prev` until a grace passes, then folds into the new one. During the swap a claim
+  goes into `prev` first, then the delta, so every claim of a key meets the others at `prev`'s
+  slot and the delta holds a key only where `prev` does. A claim that loses `prev`'s slot takes
+  the delta's answer, first putting the segment spot it lost to there when the delta lacks the
+  key; a move of `prev`'s spot puts its pack spot into the delta too, so a move and such a copy
+  meet at the delta's one slot. A move that finds the delta holding the key elsewhere breaks
+  the store at once, naming the batch, the key and both places; the fold breaks it, naming the
+  key, if the two disagree at the swap's end.
 - RocksDB and WiredTiger share one log and serialise appends through a lock or a CAS on its
   tail; here no two workers write the same line until the commit, which is the only
   serialisation point and already is one (one sync per pack).

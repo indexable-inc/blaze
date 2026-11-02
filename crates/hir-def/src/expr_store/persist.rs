@@ -40,6 +40,7 @@ use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
 use rustc_abi::ExternAbi;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 use span::Edition;
@@ -51,8 +52,8 @@ use crate::{
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
     deps::ImageBuf,
     expr_store::{
-        Body, ExprRoot, ExpressionOnlyStore, ExpressionStore, HygieneId, MissingBodyItemKind,
-        NO_OWNER, kinds_of,
+        Body, ComptimeForm, ExprRoot, ExpressionOnlyStore, ExpressionStore, HygieneId, MissingBodyItemKind,
+        NO_OWNER, SpecClauseKind, VerifyRefusal, kinds_of,
         body::Param,
         path::{BindingRow, GenericArg, GenericArgsRow, Names, PathColumns, PathTag, UseArgs},
     },
@@ -161,6 +162,8 @@ blaze_format::record! {
         /// The block and its edition, by block in increasing order.
         pub(crate) block_editions: Slice<IdPair>,
         pub(crate) overflow_inheriting: Slice<u32>,
+        /// blaze_verify's clause groups and their kinds, by group in increasing order.
+        pub(crate) spec_clauses: Slice<IdPair>,
         pub(crate) expr_roots: Slice<ExprRootRec>,
         /// The type and the syntax context, by type in increasing order.
         pub(crate) type_hygiene: Slice<IdPair>,
@@ -732,7 +735,7 @@ impl TypeSide {
 struct FieldNames {
     text: String,
     /// Each name's start in `text` and its length.
-    by_symbol: HashMap<Symbol, (u32, u32)>,
+    by_symbol: HashMap<Symbol, (u32, u32), Global>,
 }
 
 impl FieldNames {
@@ -838,6 +841,7 @@ struct StoreColumns {
     ident_hygiene: Column,
     block_editions: Column,
     overflow_inheriting: Column,
+    spec_clauses: Column,
     expr_roots: Column,
     type_hygiene: Column,
     flags: u32,
@@ -936,6 +940,11 @@ impl StoreColumns {
         });
         let inheriting = expr_only.map_or(&[][..], |it| &*it.overflow_inheriting);
         let overflow_inheriting = push_mapped(out, u32s, inheriting, |&closure| raw(closure));
+        let clauses = expr_only.map_or(&[][..], |it| &*it.spec_clauses);
+        let spec_clauses = push_mapped(out, pairs, clauses, |&(group, kind)| IdPair {
+            a: raw(group),
+            b: kind as u32,
+        });
         let expr_roots = expr_only.map_or(&[][..], |it| &it.expr_roots[..]);
         let expr_roots = push_mapped(out, roots, expr_roots, |root| ExprRootRec {
             root: raw(root.root),
@@ -985,6 +994,7 @@ impl StoreColumns {
             ident_hygiene,
             block_editions,
             overflow_inheriting,
+            spec_clauses,
             expr_roots,
             type_hygiene: type_hygiene_column,
             flags,
@@ -1026,6 +1036,7 @@ impl StoreColumns {
             block_editions: self.block_editions.slice(field(offset_of!(StoreRoot, block_editions))),
             overflow_inheriting: (self.overflow_inheriting)
                 .slice(field(offset_of!(StoreRoot, overflow_inheriting))),
+            spec_clauses: self.spec_clauses.slice(field(offset_of!(StoreRoot, spec_clauses))),
             expr_roots: self.expr_roots.slice(field(offset_of!(StoreRoot, expr_roots))),
             type_hygiene: self.type_hygiene.slice(field(offset_of!(StoreRoot, type_hygiene))),
             words: self.words.rec(field(offset_of!(StoreRoot, words))),
@@ -1071,6 +1082,7 @@ pub struct ExpressionStoreRef<'a> {
     ident_hygiene: &'a [IdPair],
     block_editions: &'a [IdPair],
     overflow_inheriting: &'a [u32],
+    spec_clauses: &'a [IdPair],
     expr_roots: &'a [ExprRootRec],
     type_hygiene: &'a [IdPair],
 }
@@ -1111,6 +1123,7 @@ impl<'a> ExpressionStoreRef<'a> {
             ident_hygiene: root.ident_hygiene.follow(buffer)?,
             block_editions: root.block_editions.follow(buffer)?,
             overflow_inheriting: root.overflow_inheriting.follow(buffer)?,
+            spec_clauses: root.spec_clauses.follow(buffer)?,
             expr_roots: root.expr_roots.follow(buffer)?,
             type_hygiene: root.type_hygiene.follow(buffer)?,
         };
@@ -1169,6 +1182,7 @@ impl<'a> ExpressionStoreRef<'a> {
                 && self.ident_hygiene.is_empty()
                 && self.block_editions.is_empty()
                 && self.overflow_inheriting.is_empty()
+                && self.spec_clauses.is_empty()
                 && self.expr_roots.is_empty();
             ensure(empty, root, buffer, "expression columns in a store without expressions")?;
         }
@@ -1210,6 +1224,12 @@ impl<'a> ExpressionStoreRef<'a> {
         ascending(self.overflow_inheriting, |&it| it, buffer, "closures out of order")?;
         for closure in self.overflow_inheriting {
             ensure(*closure < exprs, closure, buffer, "a closure past the expressions")?;
+        }
+        ascending(self.spec_clauses, |it| it.a, buffer, "clause groups out of order")?;
+        for pair in self.spec_clauses {
+            ensure(pair.a < exprs, pair, buffer, "a clause group past the expressions")?;
+            let kind = u8::try_from(pair.b).ok().and_then(SpecClauseKind::of_u8);
+            ensure(kind.is_some(), pair, buffer, "a clause kind out of range")?;
         }
         for (at, root) in self.expr_roots.iter().enumerate() {
             let fits = root.root < exprs
@@ -1318,6 +1338,12 @@ impl<'a> ExpressionStoreRef<'a> {
     pub fn block_edition(self, block: ExprId) -> Option<Edition> {
         let index = self.block_editions.binary_search_by_key(&raw(block), |it| it.a).ok()?;
         edition_of(self.block_editions[index].b)
+    }
+
+    /// As [`ExpressionStore::spec_clause`].
+    pub fn spec_clause(self, group: ExprId) -> Option<SpecClauseKind> {
+        let index = self.spec_clauses.binary_search_by_key(&raw(group), |it| it.a).ok()?;
+        SpecClauseKind::of_u8(u8::try_from(self.spec_clauses[index].b).ok()?)
     }
 
     /// The store, back as the value that was written.
@@ -1488,6 +1514,13 @@ impl<'a> ExpressionStoreRef<'a> {
                     .collect(),
                 // alloc: the decode's one copy of the column.
                 overflow_inheriting: self.overflow_inheriting.iter().map(|&it| idx(it)).collect(),
+                spec_clauses: (self.spec_clauses.iter())
+                    .filter_map(|pair| {
+                        let kind = SpecClauseKind::of_u8(u8::try_from(pair.b).ok()?)?;
+                        Some((idx(pair.a), kind))
+                    })
+                    // alloc: the decode's one copy of the column.
+                    .collect(),
                 expr_roots: (self.expr_roots.iter())
                     .map(|root| ExprRoot {
                         root: idx(root.root),
@@ -1555,7 +1588,10 @@ impl ExpressionStore {
 impl Persist for ExpressionStore {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ExpressionStore"),
-        Part::U64(8),
+        // 9: a fn pointer type keeps its `#[rustc_splat]` input.
+        // 10: `for const` and `x.[f]` (`Expr::ComptimeFor`, `Expr::ReflectedField`).
+        // 11: blaze_verify's clause groups (`ExpressionStore::spec_clauses`).
+        Part::U64(11),
         Part::Schema(<StoreRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreRef<'a>;
@@ -1628,7 +1664,10 @@ impl Body {
 impl Persist for Body {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("Body"),
-        Part::U64(8),
+        // 9: a fn pointer type keeps its `#[rustc_splat]` input.
+        // 10: `for const` and `x.[f]` (`Expr::ComptimeFor`, `Expr::ReflectedField`).
+        // 11: blaze_verify's clause groups (`ExpressionStore::spec_clauses`).
+        Part::U64(11),
         Part::Schema(<BodyRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodyRef<'a>;
@@ -1734,6 +1773,50 @@ fn get_lifetime(kind: LifetimeRefKind, r: &mut Read<'_>) -> Result<LifetimeRef, 
     })
 }
 
+/// `Code` for the integer types: each standard one its number, an arbitrary width of
+/// `#![blaze::arbitrary_ints]` [`ARBITRARY_WIDTH`] plus its width.
+macro_rules! int_codes {
+    ($($ty:ident { $($tag:literal => $variant:path),* $(,)? })*) => {$(
+        impl Code for $ty {
+            fn put(&self, w: &mut Words) {
+                w.u32(match self { $($variant => $tag,)* $ty::Bits(it) => ARBITRARY_WIDTH + it.bits() });
+            }
+
+            fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
+                Ok(match r.u32()? {
+                    $($tag => $variant,)*
+                    code => match code.checked_sub(ARBITRARY_WIDTH).and_then(crate::builtin_type::IntWidth::new) {
+                        Some(it) => $ty::Bits(it),
+                        None => return Err(r.invalid(concat!("a ", stringify!($ty), " out of range"))),
+                    },
+                })
+            }
+        }
+    )*};
+}
+
+/// Where the arbitrary widths' codes start in [`int_codes`].
+const ARBITRARY_WIDTH: u32 = 128;
+
+int_codes! {
+    BuiltinInt {
+        0 => BuiltinInt::Isize,
+        1 => BuiltinInt::I8,
+        2 => BuiltinInt::I16,
+        3 => BuiltinInt::I32,
+        4 => BuiltinInt::I64,
+        5 => BuiltinInt::I128,
+    }
+    BuiltinUint {
+        0 => BuiltinUint::Usize,
+        1 => BuiltinUint::U8,
+        2 => BuiltinUint::U16,
+        3 => BuiltinUint::U32,
+        4 => BuiltinUint::U64,
+        5 => BuiltinUint::U128,
+    }
+}
+
 /// `Code` for enums without fields: each variant its number.
 macro_rules! unit_codes {
     ($($ty:ty { $($tag:literal => $variant:path),* $(,)? })*) => {$(
@@ -1774,22 +1857,6 @@ unit_codes! {
         2 => TraitBoundModifier::Const,
         3 => TraitBoundModifier::MaybeConst,
     }
-    BuiltinInt {
-        0 => BuiltinInt::Isize,
-        1 => BuiltinInt::I8,
-        2 => BuiltinInt::I16,
-        3 => BuiltinInt::I32,
-        4 => BuiltinInt::I64,
-        5 => BuiltinInt::I128,
-    }
-    BuiltinUint {
-        0 => BuiltinUint::Usize,
-        1 => BuiltinUint::U8,
-        2 => BuiltinUint::U16,
-        3 => BuiltinUint::U32,
-        4 => BuiltinUint::U64,
-        5 => BuiltinUint::U128,
-    }
     BuiltinFloat {
         0 => BuiltinFloat::F16, 1 => BuiltinFloat::F32, 2 => BuiltinFloat::F64, 3 => BuiltinFloat::F128,
     }
@@ -1802,6 +1869,16 @@ unit_codes! {
         2 => MissingBodyItemKind::Const,
         3 => MissingBodyItemKind::Static,
         4 => MissingBodyItemKind::TypeAlias,
+    }
+    ComptimeForm {
+        0 => ComptimeForm::ForConst,
+        1 => ComptimeForm::ReflectedField,
+        2 => ComptimeForm::BinderBound,
+    }
+    VerifyRefusal {
+        0 => VerifyRefusal::WithoutFeature,
+        1 => VerifyRefusal::WithoutBody,
+        2 => VerifyRefusal::WithNightlyContracts,
     }
 }
 
@@ -2060,12 +2137,14 @@ impl Code for ExternAbi {
 
 impl Code for FnType {
     fn put(&self, w: &mut Words) {
-        let FnType { binder, params, is_varargs, is_unsafe, abi } = self;
+        let FnType { binder, params, is_varargs, is_unsafe, abi, splatted } = self;
         binder.put(w);
         params.put(w);
         is_varargs.put(w);
         is_unsafe.put(w);
         abi.put(w);
+        // `u8::MAX` for none, as `FnSigKind` marks it.
+        w.u32(splatted.map_or(u32::from(u8::MAX), u32::from));
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
@@ -2075,6 +2154,12 @@ impl Code for FnType {
             is_varargs: r.get()?,
             is_unsafe: r.get()?,
             abi: r.get()?,
+            splatted: {
+                let word = r.u32()?;
+                let index = u8::try_from(word)
+                    .map_err(|_| r.invalid("a fn pointer's splatted input past `u8`"))?;
+                (index != u8::MAX).then_some(index)
+            },
         })
     }
 }
@@ -2479,6 +2564,7 @@ pub(crate) fn assert_store_round_trip(
 mod tests {
     use blaze_format::Aligned;
     use blaze_hash::HashSet;
+    use std::alloc::Global;
     use hir_expand::fixture;
 
     use super::*;
@@ -2528,6 +2614,8 @@ mod tests {
             Expr::InlineAsm(_) => ExprKind::InlineAsm,
             Expr::IncludeBytes => ExprKind::IncludeBytes,
             Expr::UnsafeBinderCast { .. } => ExprKind::UnsafeBinderCast,
+            Expr::ComptimeFor { .. } => ExprKind::ComptimeFor,
+            Expr::ReflectedField { .. } => ExprKind::ReflectedField,
         }
     }
 
@@ -2724,7 +2812,7 @@ fn every_kind(x: u32, (y, _): (u32, u32)) -> u32 {
         let buffer = Aligned::copy_from(&blaze_format::to_bytes(&*body));
         let read = Body::read(&buffer).expect("a body just written");
         let store = read.store();
-        let kinds: HashSet<ExprKind> =
+        let kinds: HashSet<ExprKind, Global> =
             (0..store.exprs_len() as u32).filter_map(|id| store.expr_kind(idx(id))).collect();
         for kind in [
             ExprKind::Path,
@@ -2757,7 +2845,7 @@ fn every_kind(x: u32, (y, _): (u32, u32)) -> u32 {
         ] {
             assert!(kinds.contains(&kind), "no {kind:?} in the body");
         }
-        let pats: HashSet<PatKind> =
+        let pats: HashSet<PatKind, Global> =
             (0..store.pats_len() as u32).filter_map(|id| store.pat_kind(idx(id))).collect();
         for kind in [
             PatKind::Wild,

@@ -4,6 +4,13 @@
 //! takes its worker's puts as it ends ([`take_puts`]) and hands them to the store's owner with
 //! its result, which keeps them ([`publish`]).
 //!
+//! A [`Keep::Durable`] put is the exception: it goes to its daemon's own queue
+//! (`super::Keeping::put`), never to a thread's buffer nor to [`ORPHANS`], which any task's
+//! take drains: a task of another job could take it and be descheduled while the job that made
+//! it ends, so that job would be reported done before its record is durable. Only the store's
+//! owner takes that queue (`super::Keeping::publish`), and it hands the ticket to the jobs not
+//! ended as it does.
+//!
 //! A put is checked when it is kept, as it was when the expansion kept it itself: one whose
 //! key the store has other bytes of is an error naming the expansion, and fails the build
 //! ([`super::server_failed`]).
@@ -13,23 +20,53 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use blaze_cas::{Store, Ticket};
+use blaze_cas::{Key, Kind, Store, Ticket, Tickets, Unit};
 use blaze_core::Traced;
 use blaze_usercode::{
     RunKey,
     index::{self, KeepError},
+    roots::verify,
 };
 use crossbeam_queue::SegQueue;
 
-/// One expansion to keep: its run, what it read, and the value kept of it.
+/// One value to keep: where it goes, and the value.
 #[derive(Debug)]
 pub struct Put {
-    pub run: RunKey,
-    pub traced: Traced,
+    pub keep: Keep,
     pub value: Vec<u8>,
-    /// Which expansion it is, as an error about it begins: "the expansion of `Serialize` of
+    /// Which value it is, as an error about it begins: "the expansion of `Serialize` of
     /// /lib.so".
     pub what: String,
+}
+
+impl Put {
+    /// What [`blaze_usercode::roots::verify::keeps`] said to put, as a put of the expansion
+    /// `what`: a record that must be durable ([`verify::Put::durable`], a retraction) is
+    /// [`Keep::Durable`], so the job waits for it; every other is [`Keep::Run`].
+    pub fn of(it: verify::Put, what: String) -> Put {
+        let keep = match it.durable {
+            true => Keep::Durable { run: it.run, traced: it.traced },
+            false => Keep::Run { run: it.run, traced: it.traced },
+        };
+        Put { keep, value: it.value, what }
+    }
+}
+
+/// Where a [`Put`] is kept.
+#[derive(Debug)]
+pub enum Keep {
+    /// A run's result (an expansion, a verdict), found again by what it read
+    /// ([`blaze_usercode::index`]).
+    Run { run: RunKey, traced: Traced },
+    /// [`Keep::Run`] of a record that must be durable before the job that put it is reported
+    /// done: that an expansion verified across checkouts depends on where its roots are
+    /// ([`blaze_usercode::roots::verify::retraction`]). A crash before it is durable would
+    /// forget it, and the expansion would be given to every checkout again.
+    Durable { run: RunKey, traced: Traced },
+    /// Machine code the daemon compiled, under `key` as a [`Kind::Machine`]: the one kind a
+    /// fetch from a remote never keeps, so a reader that finds one in the store's own
+    /// directory knows this machine made it.
+    Machine(Key),
 }
 
 /// A thread's puts not taken yet.
@@ -48,8 +85,12 @@ thread_local! {
     static PUTS: Buffer = const { Buffer(RefCell::new(Vec::new())) }; // alloc: none, an empty buffer
 }
 
-/// The puts of threads that ended before they were taken, for the next [`take_puts`]. Pushed
-/// only as a thread ends with puts left, and drained by a take that sees [`ORPHANED`].
+/// The puts of threads that ended before they were taken, for the next [`take_puts`]: pushed
+/// as a thread ends with puts left, and drained by a take that sees [`ORPHANED`]. One process
+/// holds it, so with two daemons in it (the simulation) one may publish another's put into its
+/// own store: a [`Keep::Run`] or [`Keep::Machine`] put is under the key of every input it was
+/// made from (rule 18), so that is a value the other store lacks, never a wrong one. A
+/// [`Keep::Durable`] put is never here (see the module's docs).
 static ORPHANS: SegQueue<Put> = SegQueue::new();
 static ORPHANED: AtomicBool = AtomicBool::new(false);
 
@@ -60,8 +101,13 @@ fn orphan(puts: impl IntoIterator<Item = Put>) {
     ORPHANED.store(true, Ordering::Release);
 }
 
-/// Leaves `put` for this thread's next [`take_puts`].
+/// Leaves `put` for this thread's next [`take_puts`]. A [`Keep::Durable`] one is a bug of the
+/// caller, a panic naming it (rule 17: it fails the one query): it goes through its daemon
+/// (`super::Keeping::put`), as the module's docs say why.
 pub fn put(put: Put) {
+    if matches!(put.keep, Keep::Durable { .. }) {
+        panic!("{}: a durable put goes through its daemon's `Keeping::put`, not a thread's puts", put.what);
+    }
     let mut put = Some(put);
     _ = PUTS.try_with(|it| it.0.borrow_mut().extend(put.take()));
     // This thread is ending: its buffer is gone.
@@ -87,15 +133,35 @@ pub struct Published {
     pub tickets: Vec<Ticket>,
     /// What it could not keep, each naming its expansion; the first fails the build.
     pub refused: Vec<String>,
+    /// The tickets of its [`Keep::Durable`] puts, the last of each segment ([`Tickets`]): the
+    /// job is not done until they are durable, and the store is flushed for them.
+    pub durable: Tickets,
 }
 
 /// Keeps `puts` in `store`, in order. One the store can't keep is refused, naming it, and
 /// told [`super::server_failed`]; the rest are kept still.
-pub fn publish(store: &mut Store, puts: Vec<Put>) -> Published {
+pub(crate) fn publish(store: &mut Store, puts: Vec<Put>) -> Published {
     let mut published = Published::default();
-    for Put { run, traced, value, what } in puts {
-        match index::keep(store, &run, &traced, value) {
-            Ok(tickets) => published.tickets.extend(tickets),
+    for Put { keep, value, what } in puts {
+        let durable = matches!(keep, Keep::Durable { .. });
+        // Every put that landed, also of one that failed partway: its value is readable, so a
+        // durable one is waited on all the same (a record visible to every checkout and lost
+        // in a crash gives the value it retracts again).
+        let mut tickets = Vec::with_capacity(2); // alloc: a put's two tickets, value and shape
+        let kept = match keep {
+            Keep::Run { run, traced } | Keep::Durable { run, traced } => {
+                index::keep_into(store, Unit::SHARED, &run, &traced, value, &mut tickets)
+            }
+            Keep::Machine(key) => store.put(key, Kind::Machine, value).map(|ticket| tickets.push(ticket)).map_err(KeepError::Mismatch),
+        };
+        if durable {
+            for ticket in &tickets {
+                published.durable.add(*ticket);
+            }
+        }
+        published.tickets.extend(tickets);
+        match kept {
+            Ok(()) => {}
             Err(error) => {
                 let said = refused(&what, &error);
                 super::system(said.clone()); // clone: error path, a refused put, said and kept
@@ -111,9 +177,17 @@ fn refused(what: &str, error: &KeepError) -> String {
         KeepError::Corrupt(corrupt) => format!("{what}: {corrupt}"), // alloc: error path
         // alloc: error path
         KeepError::Mismatch(mismatch) => format!(
-            "{what}: the store has another expansion under the same key of every input it read, \
-             so the key misses an input or the macro is not deterministic: {mismatch:?}"
+            "{what}: the store has another value under the same key of every input it read, \
+             so the key misses an input or what made it is not deterministic: {mismatch:?}"
         ),
+        // alloc: error path
+        KeepError::NotACopy { key, why } => format!("{what}: the store's {key:?}, another checkout's copy of it: {why}"),
+        // alloc: error path
+        KeepError::TooManyShapes { run } => {
+            format!("{what}: run {run:?} has more than {} shapes, so this one's is not kept", index::MOST_SHAPES)
+        }
+        // alloc: error path
+        KeepError::Scan { run, why } => format!("{what}: run {run:?}: scanning what it wrote for its roots: {why}"),
     }
 }
 
@@ -142,10 +216,13 @@ mod tests {
         store
     }
 
+    fn run() -> RunKey {
+        RunKey { code: ContentId::of(super::super::LIBRARY, b"lib"), given: ContentId::of("test", b"call") }
+    }
+
     fn one(value: &[u8], what: &str) -> Put {
         Put {
-            run: RunKey { code: ContentId::of(super::super::LIBRARY, b"lib"), given: ContentId::of("test", b"call") },
-            traced: Traced { files: vec![(PathBuf::from("/a"), Some([1; 32]))], ..Traced::default() },
+            keep: Keep::Run { run: run(), traced: Traced { files: vec![(PathBuf::from("/a"), Some([1; 32]))], ..Traced::default() } },
             value: value.to_vec(),
             what: what.to_owned(),
         }
@@ -168,7 +245,6 @@ mod tests {
         let mut store = opened(&mut sim);
         let published = publish(&mut store, vec![one(b"out", "first"), one(b"out", "again")]);
         assert!(published.refused.is_empty(), "{:?}", published.refused);
-        let put = one(b"out", "x");
         struct Same;
         impl blaze_usercode::trace::Inputs for Same {
             type Error = String;
@@ -192,7 +268,7 @@ mod tests {
             }
         }
         let (reader, guard) = (store.reader(), blaze_cas::enter());
-        match index::find(&reader, &guard, &put.run, &mut Same) {
+        match index::find(&reader, &guard, &run(), &mut Same) {
             Ok(Found::Hit { value, .. }) => assert_eq!(value, b"out"),
             other => panic!("{other:?}"),
         }
@@ -201,5 +277,62 @@ mod tests {
         assert_eq!(published.refused.len(), 1);
         assert!(published.refused[0].starts_with("the expansion of `M` of /lib.so: the store has another"));
         assert!(super::super::server_failed().is_some());
+    }
+
+    /// D1 (round 5): a record that a value verified across checkouts depends on where its
+    /// roots are, as `verify::keeps` says to put it (another checkout's copy differed), is
+    /// published durable: the job waits for it, so a crash can't forget it and give the value
+    /// to every checkout again.
+    #[test]
+    fn a_record_verify_says_to_put_is_published_durable() {
+        let mut sim = Sim::new(7, Faults::default());
+        let mut store = opened(&mut sim);
+        let unmarked = blaze_cas::Key(ContentId::of("test", b"unmarked"));
+        let record = verify::retraction(&run(), &unmarked);
+        assert!(record.durable, "a retraction is a record that must be durable");
+        let here = verify::Put {
+            run: run(),
+            traced: Traced { files: vec![(PathBuf::from("/a"), Some([1; 32]))], ..Traced::default() },
+            value: b"out".to_vec(),
+            durable: false,
+        };
+        let puts = vec![Put::of(record, "the record of `M`".to_owned()), Put::of(here, "the expansion of `M`".to_owned())];
+        assert!(matches!(puts[0].keep, Keep::Durable { .. }) && matches!(puts[1].keep, Keep::Run { .. }));
+        let published = publish(&mut store, puts);
+        assert!(published.refused.is_empty(), "{:?}", published.refused);
+        let ticket = published.durable.iter().next().expect("the record's ticket is what the job waits for");
+        assert_eq!(published.tickets.first(), Some(&ticket), "the record's own ticket, not the expansion's");
+    }
+
+    /// C3 (round 4): a retraction's ticket is handed back for the job to wait on, and once the
+    /// store says it is durable it survives a restart.
+    #[test]
+    fn a_retraction_is_durable_before_the_run_is_reported() {
+        let mut sim = Sim::new(6, Faults::default());
+        let mut store = opened(&mut sim);
+        let unmarked = blaze_cas::Key(ContentId::of("test", b"unmarked"));
+        let record = blaze_usercode::roots::verify::retraction(&run(), &unmarked);
+        let put = Put {
+            keep: Keep::Durable { run: record.run, traced: record.traced },
+            value: record.value,
+            what: "the retraction of `M` of /lib.so".to_owned(),
+        };
+        let published = publish(&mut store, vec![one(b"out", "kept"), put]);
+        assert!(published.refused.is_empty(), "{:?}", published.refused);
+        let ticket = published.durable.iter().next().expect("a retraction's ticket is handed back");
+        assert!(published.tickets.contains(&ticket));
+        // Not reported done yet: nothing was flushed.
+        assert!(!store.durable(ticket));
+        let mut effects = Vec::new();
+        store.flush(&mut effects);
+        run_until_idle(&mut sim, &mut effects, |completion, effects| {
+            _ = store.complete(completion, effects);
+        });
+        assert!(store.durable(ticket), "a flushed retraction is durable");
+        drop(store);
+        // Restored, the record is there: no checkout is given the verified value again.
+        let store = opened(&mut sim);
+        let depends = index::depends_key(&run(), &unmarked);
+        assert!(store.get(&depends).unwrap().is_some(), "a durable retraction survives a restart");
     }
 }

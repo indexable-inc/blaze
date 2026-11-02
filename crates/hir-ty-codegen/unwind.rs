@@ -231,6 +231,7 @@ impl SystemV {
         // alloc: the function's frame rules, kept with its code; most instructions are a row
         let mut rows = Vec::with_capacity(insts.len() + 2);
         let mut clobbers_to_cfa = 0u32;
+        let mut ra_signed = false;
         let signed = |offset: u32| i32::try_from(offset).map_err(|_| overflow());
         for &(at, ref inst) in insts.iter() {
             match *inst {
@@ -260,8 +261,17 @@ impl SystemV {
                         self.arch
                     ));
                 }
+                // A row only where the signing state changes: every frame starts unsigned
+                // (the CIE's state), so Cranelift's `false` at entry (Apple's AArch64 only,
+                // "the macOS unwinder seems to require this") says nothing. LLVM writes no such
+                // row for aarch64-apple-darwin, and the macOS unwinder unwinds through frames
+                // without it; each one is a "non standard register 34" warning per FDE in ld64.
+                // `system_v_rows_unwind_as_cranelifts` holds the rows to Cranelift's unwinding.
                 UnwindInst::Aarch64SetPointerAuth { return_addresses } => {
-                    rows.push((at, FrameRule::RaSignState(return_addresses)));
+                    if return_addresses != ra_signed {
+                        rows.push((at, FrameRule::RaSignState(return_addresses)));
+                        ra_signed = return_addresses;
+                    }
                 }
             }
         }

@@ -201,6 +201,9 @@ enum Room {
 struct Placed<F> {
     header: Header,
     cell: Room,
+    /// The job running where this one was given to the pool, as a profiler numbers it
+    /// ([`crate::sched::fiber::observe_spawner`]); 0 for none.
+    spawner: u64,
     f: F,
 }
 
@@ -314,12 +317,16 @@ impl Job {
             let f = unsafe { &raw const (*at).f };
             // SAFETY: the closure is read out once, so it runs and drops once.
             let f = unsafe { f.read() };
+            // SAFETY: `at` is the live `Placed<F>` that `erase` wrote; a `u64` is `Copy`.
+            let spawner = unsafe { (*at).spawner };
             give_back(cell);
+            crate::sched::job_begins(spawner);
             let _span = JobSpan::begin(std::any::type_name::<F>());
             f();
         }
         let class = const { Placed::<F>::CLASS };
         let header = Header::new(run::<F>);
+        let spawner = crate::sched::spawner();
         CACHES.with(move |caches| {
             let mut caches = caches.borrow_mut();
             let caches = caches.get_or_insert_with(Caches::new);
@@ -332,7 +339,7 @@ impl Job {
             // SAFETY: the cell is this job's alone, committed, 64-byte aligned and at least
             // `size_of::<Placed<F>>()` bytes (`CLASS` chose its size), and holds nothing that
             // needs a drop.
-            unsafe { at.write(Placed { header, cell, f }) };
+            unsafe { at.write(Placed { header, cell, spawner, f }) };
             Job(at.cast())
         })
     }
@@ -1518,15 +1525,24 @@ impl Local {
         fence(Ordering::SeqCst);
         if !ended() && !shared.any_work() {
             #[cfg(not(blaze_check))]
-            if shared.parked.load(Ordering::Acquire) != 0 && pool_idle(ptr::from_ref(shared).expose_provenance()) {
-                // The last to sleep with jobs parked: none of them wakes unless a job ends a
-                // wait, so after a while with none, the scheduler checks for a stall.
-                thread::park_timeout(STALL_AFTER);
-                if slot.sleeping.load(Ordering::SeqCst) && !ended() && !shared.any_work() {
-                    crate::sched::check_stall();
+            {
+                // A timed wait of any pool's job ends only as a worker looks at the clock.
+                let due = crate::sched::until_due();
+                crate::sched::idle(true);
+                if shared.parked.load(Ordering::Acquire) != 0 && pool_idle(ptr::from_ref(shared).expose_provenance()) {
+                    // The last to sleep with jobs parked: none of them wakes unless a job ends a
+                    // wait, so after a while with none, the scheduler checks for a stall.
+                    thread::park_timeout(due.map_or(STALL_AFTER, |due| due.min(STALL_AFTER)));
+                    if slot.sleeping.load(Ordering::SeqCst) && !ended() && !shared.any_work() {
+                        crate::sched::check_stall();
+                    }
+                } else if let Some(due) = due {
+                    thread::park_timeout(due);
+                } else {
+                    thread::park();
                 }
-            } else {
-                thread::park();
+                crate::sched::idle(false);
+                crate::sched::fire_due();
             }
             #[cfg(blaze_check)]
             thread::park();
@@ -1569,6 +1585,7 @@ fn wake_parked(shared: usize, token: usize) {
     // only once no job of it is parked, so none is woken after; an `Arc` keeps it until then.
     let shared = unsafe { &*ptr::with_exposed_provenance::<Shared>(shared) };
     let header = NonNull::new(ptr::with_exposed_provenance_mut::<Header>(token)).expect("a parked job's header");
+    crate::sched::ready(token);
     if let Some(job) = push_next(shared, None, Job(header)) {
         shared.push(None, job);
     }
@@ -1598,6 +1615,8 @@ fn work(local: &Local) {
     // What the stop's drain backs off with while another worker takes what is left.
     let mut drain = crate::spin::SpinWait::new();
     loop {
+        #[cfg(not(blaze_check))]
+        crate::sched::fire_due();
         if let Some(job) = local.next() {
             if searching {
                 local.end_search(true);
@@ -1692,7 +1711,7 @@ mod tests {
     use crossbeam_channel::{bounded, unbounded};
     use parking_lot::Mutex;
 
-    use super::{Class, Group, Header, Job, Pending, Placed, Pool, Slot, group, searching, sleeping};
+    use super::{Class, Group, Header, Job, Pending, Placed, Pool, STALL_AFTER, Slot, group, searching, sleeping};
     use crate::{
         Cancelled, Key,
         pump::Flights,
@@ -2536,6 +2555,51 @@ mod tests {
             move |it| _ = tx.send(it.unwrap()),
         );
         assert_eq!(rx.recv_timeout(LONG).unwrap(), "after the fire");
+    }
+
+    /// On a pool of one worker, a job waits 20 ms on the pool's clock and holds no thread: the
+    /// worker runs another job meanwhile, then sleeps with nothing queued, and wakes for the
+    /// deadline. The job goes on no earlier than it; a wait for a time gone by ends at once.
+    #[test]
+    fn a_job_waiting_for_a_time_holds_no_thread_and_goes_on_once_it_is_due() {
+        use crate::sched::{self, Wait};
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
+        let (tx, rx) = unbounded::<Result<u64, String>>();
+        {
+            let tx = tx.clone();
+            pool.submit(
+                None,
+                || {
+                    let at = sched::now() + 20_000_000;
+                    sched::wait(Wait::Until(at)).unwrap();
+                    let late = sched::now().checked_sub(at).expect("the job went on before its deadline");
+                    sched::wait(Wait::Until(at)).unwrap();
+                    late
+                },
+                move |it| _ = tx.send(it.map_err(|it| message(&*it))),
+            );
+        }
+        until("the timed job to park", || pool.shared.parked.load(Ordering::SeqCst) == 1);
+        pool.submit(None, || u64::MAX, move |it| _ = tx.send(it.map_err(|it| message(&*it))));
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(u64::MAX), "the job meanwhile");
+        let late = rx.recv_timeout(LONG).unwrap().unwrap();
+        assert!(late < u64::try_from(LONG.as_nanos()).unwrap(), "the timed job went on {late} ns late");
+        assert_eq!(pool.shared.parked.load(Ordering::SeqCst), 0);
+    }
+
+    /// A job's wait for a time past the pool's stall check, with every pool idle meanwhile: no
+    /// stall, as the clock ends it, so the job goes on with its value.
+    #[test]
+    fn a_wait_for_a_time_is_never_a_stall() {
+        use crate::sched::{self, Wait};
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
+        let (tx, rx) = unbounded::<Result<(), String>>();
+        pool.submit(
+            None,
+            || sched::wait(Wait::Until(sched::now() + u64::try_from(STALL_AFTER.as_nanos()).unwrap() * 5 / 4)).unwrap(),
+            move |it| _ = tx.send(it.map_err(|it| message(&*it))),
+        );
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(()));
     }
 
     /// On a pool of one worker, busy while a background job and then two normal ones are

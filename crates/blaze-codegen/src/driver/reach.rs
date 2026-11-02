@@ -34,6 +34,9 @@ pub(crate) struct Node<'a> {
 
 /// What [`Reach::functions_of`] reuses from one root to the next: a bit per node, of which
 /// each walk clears only those it set, and the walk's stack and the nodes it visited.
+/// Only the tests use it now, as the reference the execution table's own walk
+/// ([`crate::exec::ExecTable::reached`]) is checked against.
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct Walk {
     seen: Vec<u64>,
@@ -119,6 +122,33 @@ impl Reach {
         }
     }
 
+    /// The node of the function `root`: its place in key order. `None` when `root` is no
+    /// function of the build.
+    pub(crate) fn node_of(&self, root: &InstanceKey) -> Option<u32> {
+        Some(self.functions.binary_search(root).ok()? as u32)
+    }
+
+    /// How many of the nodes are functions: those before are, those from it on statics.
+    pub(crate) fn function_count(&self) -> usize {
+        self.functions.len()
+    }
+
+    /// The graph as flat arrays, for a copy kept past the build
+    /// ([`crate::exec::TestGraph`]): per node where its edges start (one more than there are
+    /// nodes), the edges, and per node its marks.
+    pub(crate) fn arrays(&self) -> (&[u32], &[u32], &[[ContentId; 2]]) {
+        (&self.starts, &self.edges, &self.marks)
+    }
+
+    /// The graph for a link's code map (blaze-profile's `perf::map`,
+    /// docs/v2/plan/lanes/perf-history.md): the functions in key order (node `i`; the statics
+    /// follow them), per node where its edges start (one more than there are nodes), the
+    /// edges, and per node its marks (a function's code hash and arguments, a static's value
+    /// and instance).
+    pub fn graph(&self) -> (&[InstanceKey], &[u32], &[u32], &[[ContentId; 2]]) {
+        (&self.functions, &self.starts, &self.edges, &self.marks)
+    }
+
     /// The marks of every node `root` reaches, itself included, sorted and each once.
     /// `None` when `root` is no function of the build.
     pub(super) fn of(&self, root: &InstanceKey) -> Option<Vec<CodeHash>> {
@@ -150,6 +180,7 @@ impl Reach {
     /// The functions `root` reaches, itself included, as their places in key order (those of
     /// [`super::Built::inputs`]), sorted: through statics too, whose values point at functions.
     /// `None` when `root` is no function of the build.
+    #[cfg(test)]
     pub(crate) fn functions_of(&self, root: &InstanceKey, walk: &mut Walk) -> Option<Vec<u32>> {
         let root = self.functions.binary_search(root).ok()? as u32;
         walk.seen.resize(self.marks.len().div_ceil(64), 0);

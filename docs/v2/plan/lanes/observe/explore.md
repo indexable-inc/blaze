@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: the explorer's daemon side (crate blaze-explore): an HTTP/3 WebTransport server on 127.0.0.1 that https://ix.dev/explore connects to pinning a 13-day self-signed P-256 certificate by hash; the link, origin and token rules, certificate rotation, the ops and the live stream, the WebTransport probe, and the speed of light of live and tiles.
+summary: the explorer's daemon side (crate blaze-explore), one source of the general profile explorer beside ixprof files and live programs: an HTTP/3 WebTransport server on 127.0.0.1 that https://ix.dev/explore connects to pinning a 13-day self-signed P-256 certificate by hash; the link, origin and token rules, certificate rotation, the ops and the live stream, the WebTransport probe, and the speed of light of live and tiles.
 date: 2026-10-31
 ---
 # Lane observe: the explorer's daemon side
@@ -14,6 +14,37 @@ WebTransport are in explore-design.md and its addenda; the byte layout is
 daemon side as built in `crates/blaze-explore`.
 
 Written without building or running anything; the tests named here are written and not yet run.
+
+## One explorer, many sources (2026-11-02)
+
+The page is a general profiler UI, like pprof's web UI, and the blaze daemon is one source among
+several. The format is ixprof (`/tmp/blaze-lanes/v2-pprof-format.md`, the `ix-prof` crate's), and
+every source ends in one model on the page (indexable-inc/ix,
+`packages/web/src/lib/explore/profile/`):
+
+| source | how the page reaches it | link |
+|---|---|---|
+| an `.ixprof` file | `fetch()` from `blaze pprof --http <file>` on loopback, or a file picked or dropped in the page | `https://ix.dev/explore?profile=<url>`, `?open` |
+| a running program | `fetch()` streaming of ix-prof's `GET /debug/pprof/live` (`blaze run --profile`, `blaze test --profile`, or `IX_PROF_HTTP`) | `?live=<url>` |
+| the blaze daemon | this crate's WebTransport session: a build's `spans` and `samples`/`alloc_samples` (over `sql`), and the live feed | `#127.0.0.1:<port>/<token>/<certhash>` |
+| a base to diff against | `fetch()` or a picked file | `&base=<url>` |
+
+Files and programs need no server of blaze's: the page reads ixprof's Arrow sections in the
+browser, and the program's own endpoint answers CORS for `https://ix.dev`. So this crate stays
+the daemon's source only. `hello` says so: `source: {kind: "blaze", extensions: ["blaze"]}`. The
+`blaze` extension is the views only the daemon has (builds, SQL, the named views, the build
+world); the generic views (flame graph and icicle with a diff, top by flat or cum, source lines,
+the timeline, allocations, waits, each live too) are the page's, over any source, and the
+daemon's Profile and Live tabs feed them.
+
+What the daemon's tables give the generic views, and what they lack: CPU samples come from
+`samples` at blaze's 49 Hz (the rows do not carry the rate; the page names it
+`BLAZE_SAMPLE_PERIOD_NS`); allocations from `alloc_samples` (allocated bytes only, no frees, so
+no in-use view); waits from spans' `awaits`/`owner` with the kind unrecorded (`other`); the live
+feed has spans and the open set but no samples, so its live flame graph is of span self time.
+When blaze-profile's ixprof export (`blaze debug profile --ixprof`) lands, an op `ixprof {build}`
+answering the build as one `.ixprof` replaces the page's adapters for the daemon (queued; not
+written).
 
 ## Where it runs
 
@@ -90,7 +121,7 @@ page resets the stream or sends STOP_SENDING.
 
 | op | asks | answers |
 |---|---|---|
-| `hello` | `token` | `daemon`, `schema`, `clock`, `now_ns`, `certhash`, `cert_not_after_unix_s`, `live_every_ms`; no table |
+| `hello` | `token` | `daemon`, `schema`, `clock`, `now_ns`, `certhash`, `cert_not_after_unix_s`, `live_every_ms`, `source` (`{kind, extensions}`); no table |
 | `builds` | | the history's `builds`, oldest first |
 | `sql` | `sql` | its result; `sql` in the header |
 | `views` | | one row a view: `name`, `title`, `sql`, `args` (the JSON Schema of its arguments) |

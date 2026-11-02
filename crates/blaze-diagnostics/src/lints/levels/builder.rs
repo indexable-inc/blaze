@@ -35,13 +35,17 @@ type Place = Vec<(u32, u32)>;
 /// command line; the pre-expansion one and the early one also say what is wrong with an
 /// attribute that is not a lint (E0452, E0710), the pre-expansion one only of the crate's
 /// root file as parsed; only the early one gives the lints of the attributes
-/// (`lint_added_lints`). Written in full (`-Z deduplicate-diagnostics=no`), each is a copy.
+/// (`lint_added_lints`). AST lowering parses every attribute again and says what is malformed
+/// in a lint attribute (E0452) a third time. Written in full (`-Z deduplicate-diagnostics=no`),
+/// each is a copy.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum When {
     /// rustc's pre-expansion lint pass, after the parser.
     Pre,
     /// The early lint pass, after resolution, as it comes to the node.
     Early,
+    /// AST lowering's attribute parser (`LintParser`), after the early lint pass.
+    Lower,
     /// The HIR's levels of the crate's root, first asked for as the analysis starts.
     Hir,
 }
@@ -59,6 +63,9 @@ pub(super) struct Said<'a, 'b, 'db> {
     pub(super) cx: &'a Cx<'b, 'db>,
     /// What the early builder says, as the pre-expansion pass and as the early one.
     pub(super) early: Vec<Emitted>,
+    /// What AST lowering says of the lint attributes: the malformed ones, as the early builder
+    /// finds them.
+    pub(super) lower: Vec<Emitted>,
     /// What the HIR's builder says.
     pub(super) hir: Vec<Emitted>,
     /// Bit `i`: whether a lint at its level fulfilled the expectation of index `i`.
@@ -68,7 +75,7 @@ pub(super) struct Said<'a, 'b, 'db> {
 impl<'a, 'b, 'db> Said<'a, 'b, 'db> {
     pub(super) fn new(cx: &'a Cx<'b, 'db>) -> Self {
         // alloc: empty, allocates nothing
-        Said { cx, early: Vec::new(), hir: Vec::new(), fulfilled: BitSet::default() }
+        Said { cx, early: Vec::new(), lower: Vec::new(), hir: Vec::new(), fulfilled: BitSet::default() }
     }
 
     pub(super) fn fulfill(&mut self, id: ExpectId) {
@@ -283,7 +290,12 @@ impl<'db> Sink<'db> for Said<'_, '_, 'db> {
                     Malformed::ReasonNotLast => "reason in lint attribute must come last",
                 };
                 let diag = malformed(cx.span(at), label);
-                self.push(levels, pre, self.place(node), diag);
+                let place = self.place(node);
+                if levels.is_early() {
+                    // clone: a diagnostic lowering gives too, once per malformed attribute
+                    self.lower.push(Emitted { when: When::Lower, place: place.clone(), diag: diag.clone() });
+                }
+                self.push(levels, pre, place, diag);
             }
             Event::Name { node, at, tool, name, checked, pre } => {
                 self.name(levels, lcx, set, node, at, tool, name, checked, pre);

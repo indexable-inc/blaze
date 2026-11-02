@@ -7,6 +7,8 @@
 //! is a diagnostic as data, written by [`blaze_diagnostics::emit`] as rustc writes it, in text
 //! and in JSON.
 
+#![feature(allocator_api)]
+
 pub mod baseline;
 mod blaze;
 pub mod check;
@@ -18,6 +20,7 @@ pub mod level;
 mod lints;
 pub mod manifest;
 mod msrvs;
+pub mod profile;
 mod query;
 pub mod registry;
 pub mod serve;

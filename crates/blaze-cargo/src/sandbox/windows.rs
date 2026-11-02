@@ -42,7 +42,6 @@ use std::{
     os::windows::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     ptr::{null, null_mut},
-    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -363,7 +362,11 @@ struct Kept {
     network: [SidBuffer; 3],
 }
 
-static KEPT: OnceLock<Kept> = OnceLock::new();
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's sandbox SIDs, made once and kept for every run it launches"
+)]
+static KEPT: std::sync::OnceLock<Kept> = std::sync::OnceLock::new();
 
 /// The process's [`Kept`], made the first time; an error is not kept, so a later run asks again.
 fn kept() -> Result<&'static Kept, String> {
@@ -961,7 +964,11 @@ struct Lock {
 
 /// The handle of the session's [`LOCK`], opened by the first [`Lock::take`] of the process and
 /// never closed, so a run that takes the lock twice opens it once.
-static MUTEX: OnceLock<usize> = OnceLock::new();
+#[expect(
+    clippy::disallowed_types,
+    reason = "the handle of the session's lock, opened once per process and never closed"
+)]
+static MUTEX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 impl Lock {
     fn take() -> Result<Lock, String> {
@@ -1525,7 +1532,11 @@ pub fn end_every_run(code: u32, wait: Duration) {
 }
 
 fn on_interrupt() -> Result<(), String> {
-    static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the process's console interrupt handler, installed once"
+    )]
+    static INSTALLED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
     INSTALLED
         .get_or_init(|| {
             // SAFETY: `interrupted` has the PHANDLER_ROUTINE signature, is a `fn` item that lives

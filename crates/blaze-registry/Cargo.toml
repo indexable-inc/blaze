@@ -18,6 +18,7 @@ anyhow.workspace = true
 blaze-format.workspace = true
 blaze-hash.workspace = true
 blaze-resolve.workspace = true
+blaze-serde.workspace = true
 blaze-source.workspace = true
 # The index's lines and `[source]` replacement, read as the load reads them.
 blaze-units.workspace = true

@@ -649,7 +649,9 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
             | Expr::Literal(_)
             | Expr::Underscore
             | Expr::OffsetOf(_)
-            | Expr::IncludeBytes => {
+            | Expr::IncludeBytes
+            | Expr::ComptimeFor { .. }
+            | Expr::ReflectedField { .. } => {
                 store.walk_child_exprs_without_pats(current, |child| self.walk_expr(child));
             }
         }
@@ -854,7 +856,16 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
         let (infcx, env) = self.freeze.get_or_insert_with(|| {
             let interner = DbInterner::new_with(db, krate);
             let env = db.trait_environment(owner.generic_def(db));
-            (interner.infer_ctxt().build(TypingMode::non_body_analysis()), env)
+            let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+            // With what a body's `for const` loops assume of their binders, as inference had
+            // it (`#![feature(blaze_comptime)]`); a signature's store has no loop.
+            let env = match owner {
+                ExpressionStoreOwnerId::Body(body) => {
+                    hir_ty::comptime_env::owner_env(db, body.into(), &infcx, env)
+                }
+                _ => env,
+            };
+            (infcx, env)
         });
         is_freeze(infcx, ty, *env)
     }

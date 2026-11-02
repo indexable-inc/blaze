@@ -18,7 +18,7 @@ use blaze_usercode::test::Attrs;
 use crate::{
     record::Record,
     select::{
-        Choice, Ran, Subject, choose, keep,
+        Choice, Ran, Reached, Subject, choose, keep,
         tests::{Mem, World},
     },
     selector::Selector,
@@ -222,7 +222,7 @@ fn record_edit_select_never_skips_what_would_run_otherwise() {
             for t in 0..TESTS {
                 let root = t % SLOTS;
                 let reached = program.reached(root);
-                let subject = Subject { name: &names[t as usize], attrs: &attrs, outside: false, reached: &reached };
+                let subject = Subject { name: &names[t as usize], attrs: &attrs, outside: false, reached: Reached::Known(&reached) };
                 let truth = program.run(root, data);
                 let choice = choose(&store, given(), &image, &subject, false, &mut world(data)).unwrap();
                 match choice {
@@ -278,7 +278,7 @@ fn a_selector_chooses_as_the_store_alone_does() {
                 let reached = program.reached(root);
                 let attrs = if (t + step) % 7 == 0 { &ignored } else { &plain };
                 let outside = t == 5 && step % 9 == 0;
-                let subject = Subject { name: &names[t as usize], attrs, outside, reached: &reached };
+                let subject = Subject { name: &names[t as usize], attrs, outside, reached: Reached::Known(&reached) };
                 let all = step % 13 == 12;
                 let want = choose(&store, given(), &image, &subject, all, &mut world(data)).unwrap();
                 let got = selector.choose(&store, &subject, all, &mut world(data)).unwrap();
@@ -327,7 +327,7 @@ fn a_test_runs_exactly_when_what_it_executed_or_read_changed() {
         }
         let image = program.image();
         let reached = program.reached(root);
-        let subject = Subject { name: "t", attrs: &attrs, outside: false, reached: &reached };
+        let subject = Subject { name: "t", attrs: &attrs, outside: false, reached: Reached::Known(&reached) };
         let mut store = Mem::default();
         let traced = traced(&truth, data);
         let record = record(&truth, true);

@@ -16,8 +16,9 @@ use crate::{
     hir::{
         columns::{Checked, below, raw},
         generics::{
-            ConstParamData, GenericParams, LifetimeBoundType, LifetimeParamData,
-            TypeOrConstParamData, TypeParamData, TypeParamProvenance, WherePredicate,
+            BinderParamData, BinderParams, ConstParamData, GenericParams, LifetimeBoundType,
+            LifetimeParamData, TypeOrConstParamData, TypeParamData, TypeParamProvenance,
+            WherePredicate,
         },
         persist::{Code, Read, Words},
     },
@@ -106,9 +107,13 @@ fn in_store(store: &ExpressionStore, params: &GenericParams, bounds: &[TypeBound
     };
     for predicate in params.where_predicates.iter() {
         match *predicate {
-            WherePredicate::TypeBound { lifetimes: binder, target, bound } => {
+            WherePredicate::TypeBound { lifetimes: binder, binder: params_run, target, bound } => {
                 below(raw(target), types.len(), "a where predicate's type past its arena")?;
                 binder.map_or(Ok(()), |names| types.paths.check_names(names))?;
+                let end = u64::from(params_run.start) + u64::from(params_run.len);
+                if end > params.binder_params.len() as u64 {
+                    return Err("a where predicate's binder parameters past their arena");
+                }
                 types.check_outside_bound(&bound, lifetimes)?;
             }
             WherePredicate::Lifetime { target, bound } => {
@@ -116,6 +121,9 @@ fn in_store(store: &ExpressionStore, params: &GenericParams, bounds: &[TypeBound
                 lifetime(bound)?;
             }
         }
+    }
+    for (_, param) in params.binder_params.iter() {
+        param.bounds.iter().try_for_each(|bound| types.check_outside_bound(bound, lifetimes))?;
     }
     bounds.iter().try_for_each(|bound| types.check_outside_bound(bound, lifetimes))
 }
@@ -243,9 +251,10 @@ impl Code for LifetimeParamData {
 impl Code for WherePredicate {
     fn put(&self, w: &mut Words) {
         match self {
-            WherePredicate::TypeBound { lifetimes, target, bound } => {
+            WherePredicate::TypeBound { lifetimes, binder, target, bound } => {
                 w.u32(0);
                 w.put(lifetimes);
+                w.put(binder);
                 w.put(target);
                 w.put(bound);
             }
@@ -260,10 +269,37 @@ impl Code for WherePredicate {
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
         Ok(match r.tag(2, "a where predicate kind out of range")? {
             0 => {
-                WherePredicate::TypeBound { lifetimes: r.get()?, target: r.get()?, bound: r.get()? }
+                WherePredicate::TypeBound {
+                    lifetimes: r.get()?,
+                    binder: r.get()?,
+                    target: r.get()?,
+                    bound: r.get()?,
+                }
             }
             _ => WherePredicate::Lifetime { target: r.get()?, bound: r.get()? },
         })
+    }
+}
+
+impl Code for BinderParams {
+    fn put(&self, w: &mut Words) {
+        w.u32(self.start);
+        w.u32(self.len);
+    }
+
+    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
+        Ok(BinderParams { start: r.u32()?, len: r.u32()? })
+    }
+}
+
+impl Code for BinderParamData {
+    fn put(&self, w: &mut Words) {
+        w.put(&self.name);
+        w.put(&self.bounds);
+    }
+
+    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
+        Ok(BinderParamData { name: r.get()?, bounds: r.get()? })
     }
 }
 
@@ -273,6 +309,7 @@ impl Code for GenericParams {
         put_arena(w, &self.lifetimes);
         w.put(&self.where_predicates);
         w.put(&self.early_bound_lifetimes_len);
+        put_arena(w, &self.binder_params);
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
@@ -281,6 +318,7 @@ impl Code for GenericParams {
             lifetimes: get_arena(r)?,
             where_predicates: r.get()?,
             early_bound_lifetimes_len: r.get()?,
+            binder_params: get_arena(r)?,
         })
     }
 }
@@ -804,7 +842,7 @@ mod tests {
 
         let (binder, target, bound) = (params.where_predicates.iter())
             .find_map(|it| match *it {
-                WherePredicate::TypeBound { lifetimes: Some(names), target, bound } => {
+                WherePredicate::TypeBound { lifetimes: Some(names), binder: _, target, bound } => {
                     Some((names, target, bound))
                 }
                 _ => None,
@@ -815,17 +853,40 @@ mod tests {
             ..GenericParams::default()
         };
         let none = GenericParams::default();
-        let ok = WherePredicate::TypeBound { lifetimes: Some(binder), target, bound };
+        let ok = WherePredicate::TypeBound {
+            lifetimes: Some(binder),
+            binder: BinderParams::EMPTY,
+            target,
+            bound,
+        };
         assert_eq!(in_store(store, &one(ok), &[]), Ok(()));
 
         let names = store.types.paths.names.len() as u32;
         let past = Names { start: names, len: 1 };
-        let past = WherePredicate::TypeBound { lifetimes: Some(past), target, bound };
+        let past = WherePredicate::TypeBound {
+            lifetimes: Some(past),
+            binder: BinderParams::EMPTY,
+            target,
+            bound,
+        };
         assert!(in_store(store, &one(past), &[]).is_err(), "a `for<..>` run past the names");
 
         let types = store.types.len() as u32;
-        let past = WherePredicate::TypeBound { lifetimes: None, target: idx(types), bound };
+        let past = WherePredicate::TypeBound {
+            lifetimes: None,
+            binder: BinderParams::EMPTY,
+            target: idx(types),
+            bound,
+        };
         assert!(in_store(store, &one(past), &[]).is_err(), "a target past the types");
+
+        let past = WherePredicate::TypeBound {
+            lifetimes: None,
+            binder: BinderParams { start: 0, len: 1 },
+            target,
+            bound,
+        };
+        assert!(in_store(store, &one(past), &[]).is_err(), "a binder run past its arena");
 
         let lifetimes = store.lifetimes.len() as u32;
         let past = WherePredicate::Lifetime { target: idx(lifetimes), bound: idx(0) };

@@ -47,7 +47,7 @@ const LINT: Implemented = Implemented::LargeStackFrames;
 const SHARE: u64 = 32;
 
 /// The limit when `clippy.toml` sets none.
-pub(super) const DEFAULT_LIMIT: u64 = FIBER_STACK / SHARE;
+pub(crate) const DEFAULT_LIMIT: u64 = FIBER_STACK / SHARE;
 
 /// How many of a frame's largest locals the note names.
 const NAMED: usize = 3;
@@ -81,7 +81,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     }
     let Some(name) = function.name() else { return };
     let configured = cx.conf().int("stack-size-threshold", -1);
-    let limit = u64::try_from(configured).unwrap_or(DEFAULT_LIMIT);
+    let limit = limit(cx);
     let mut over = find(cx, function, name, limit);
     over.sort_by_key(|it| (it.range.start(), it.range.end()));
     let why = match configured {
@@ -199,6 +199,13 @@ fn say_local<'db>(
             format!("a temporary of `{}` ({})", ty.display(db, target), size_text(size))
         }
     }
+}
+
+
+/// The limit in bytes: `stack-size-threshold` from `clippy.toml`, else [`DEFAULT_LIMIT`]. Read by
+/// `blaze::box_large_new`, which leaves sizes past it to this lint.
+pub(crate) fn limit(cx: &crate::check::Cx<'_, '_>) -> u64 {
+    u64::try_from(cx.conf().int("stack-size-threshold", -1)).unwrap_or(DEFAULT_LIMIT)
 }
 
 #[cfg(test)]

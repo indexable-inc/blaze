@@ -31,6 +31,7 @@ use super::{
     cfg::{Cfg, index},
     dataflow::{backward, forward},
     decode::{Decoded, NONE, raw},
+    dropck::{ANY_DROP, DropFlags, INITIALIZED_DROP},
     intervals::IntervalSet,
     mem::{self, FMap, FVec, Frame, filled},
     moves::{InitKind, MoveData},
@@ -175,9 +176,12 @@ pub(super) fn region_liveness<'a, 'db>(
     moves: &MoveData<'_>,
     regions: &Regions<'_, 'db>,
     count: usize,
-) -> FVec<'a, IntervalSet<'a>> {
+) -> (FVec<'a, IntervalSet<'a>>, DropFlags<'a>) {
     let frame = ctx.frame;
     let mut values = filled(frame, count, IntervalSet::new(frame));
+    // Per local, whether it has a drop, and one that may find it initialized: which locals
+    // the drop check's errors are reported for (`super::dropck`).
+    let mut drops: DropFlags<'a> = filled(frame, regions.local_tys.len(), 0);
     // A drop of what cannot be initialized there does nothing.
     let (drops_initialized, init_at_exit) =
         maybe_initialized_at_drops(frame, body, cfg, decoded, moves);
@@ -188,8 +192,17 @@ pub(super) fn region_liveness<'a, 'db>(
     for &block in cfg.order.iter() {
         let dropped = decoded.dropped[index(block)];
         let point = cfg.block_end(body, block);
-        if dropped != NONE && drops_initialized.contains(point) {
+        if dropped == NONE {
+            continue;
+        }
+        if let Some(flags) = drops.get_mut(dropped as usize) {
+            *flags |= ANY_DROP;
+        }
+        if drops_initialized.contains(point) {
             facts.push(DROP, point, dropped as usize);
+            if let Some(flags) = drops.get_mut(dropped as usize) {
+                *flags |= INITIALIZED_DROP;
+            }
         }
     }
     let effects = Points { decoded, facts: facts.freeze(&[cfg.points; 2]) };
@@ -235,7 +248,7 @@ pub(super) fn region_liveness<'a, 'db>(
         }
     }
     if dropped.is_empty() {
-        return values;
+        return (values, drops);
     }
     // What dropping each local uses, found in the order a walk of the blocks in reverse
     // postorder, each from its end, first meets the local at a point it is drop live at only:
@@ -269,7 +282,7 @@ pub(super) fn region_liveness<'a, 'db>(
             }
         }
     }
-    values
+    (values, drops)
 }
 
 /// The least of `rank` over `points`, of `count` points in all, where `block_end` is the last

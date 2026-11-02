@@ -31,7 +31,7 @@ use blaze_mem::RegionVec;
 
 use super::{
     flight::{error, failed, filled, raw, spare_of},
-    ops::{DIRECT, LINKS, MADE, MAKE, NO_SLOT, SECOND, WHOLE, arena_of},
+    ops::{DIRECT, LINKS, MADE, MAKE, NO_FOLLOW, NO_SLOT, NOT_REGULAR, SECOND, WHOLE, arena_of},
     *,
 };
 
@@ -387,8 +387,8 @@ impl Uring {
     }
 
     /// Starts [`Effect::Map`] (with `kind` [`Kind::Map`]) or [`Effect::Stat`] (with
-    /// [`Kind::Stat`]) `tag` of `file`.
-    pub(super) fn look(&mut self, tag: Tag, kind: Kind, file: &FileName) -> io::Result<()> {
+    /// [`Kind::Stat`]; with `follow` false [`Effect::Lstat`]) `tag` of `file`.
+    pub(super) fn look(&mut self, tag: Tag, kind: Kind, follow: bool, file: &FileName) -> io::Result<()> {
         let push = |path: &Path, names: &mut RegionVec<u8>, at: &mut [u32; 5]| {
             at[0] = push_c(names, path.as_os_str().as_bytes())?;
             if kind == Kind::Stat {
@@ -396,7 +396,11 @@ impl Uring {
             }
             Ok(())
         };
-        self.named(Hot::new(tag, kind, 0), ops::NO_BYTES, Cold::EMPTY, push, file)?;
+        let mut hot = Hot::new(tag, kind, 0);
+        if !follow {
+            hot.flags |= NO_FOLLOW;
+        }
+        self.named(hot, ops::NO_BYTES, Cold::EMPTY, push, file)?;
         Ok(())
     }
 
@@ -790,9 +794,11 @@ impl Uring {
                 1
             }
             (Kind::Clone, _) => {
-                sqes[0] = open(name(0), libc::O_RDONLY, 0, NO_SLOT, SQE_IO_LINK, ud(0));
+                // A symbolic link is never cloned through, and a FIFO does not block the open.
+                sqes[0] = open(name(0), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK, 0, NO_SLOT, SQE_IO_LINK, ud(0));
                 let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL;
-                sqes[1] = open(name(1), flags, 0o644, NO_SLOT, 0, ud(1));
+                // A new file's mode, 0o666 less the umask, as every driver's clone and write.
+                sqes[1] = open(name(1), flags, 0o666, NO_SLOT, 0, ud(1));
                 2
             }
             (Kind::Map, _) => {
@@ -801,6 +807,9 @@ impl Uring {
             }
             (Kind::Stat, _) => {
                 sqes[0] = statx(name(0), STATX_META, name(4), ud(0));
+                if hot.flags & NO_FOLLOW != 0 {
+                    sqes[0].op_flags = libc::AT_SYMLINK_NOFOLLOW as u32;
+                }
                 1
             }
             (Kind::Load, phase) => {
@@ -1082,12 +1091,23 @@ impl Uring {
 
     fn cloned(&mut self, id: Id, hot: Hot, results: [i32; LINKS]) -> Step {
         if hot.phase == UNLINKING {
-            let res = -(self.ops.cold(id).at as i32);
+            // The errno in the low half; for a source that is no regular file, its `S_IFMT` bits
+            // in the high half.
+            let at = self.ops.cold(id).at;
+            let res = -(at as u32 as i32);
             let (from, to) = (self.name_of(id, 0).to_string_lossy(), self.name_of(id, 1).to_string_lossy());
+            if hot.flags & NOT_REGULAR != 0 {
+                let kind = crate::fs::kind_of_mode((at >> 32) as u32);
+                // alloc: an error path.
+                return Step::Ends(Some(Done::Failed(IoError(format!("{from} ({kind}) {}", crate::CLONE_OF_NO_FILE)))));
+            }
             let why = match matches!(-res, libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL) {
                 // alloc: an error path.
                 true => format!(
-                    "the file system of {to} cannot share blocks with {from} ({}); blaze does not copy instead",
+                    "the file system of {to} ({}) cannot share blocks with {from} ({}): {}; blaze does not copy \
+                     instead",
+                    crate::fs::volume_of(std::path::Path::new(&*to).parent().unwrap_or(std::path::Path::new(&*to))),
+                    crate::fs::volume_of(std::path::Path::new(&*from)),
                     error(res)
                 ),
                 false => error(res),
@@ -1099,6 +1119,21 @@ impl Uring {
         let [source, target] = [from, to].map(|it| (it >= 0).then(|| unsafe { OwnedFd::from_raw_fd(it) }));
         // A failed first open cancels the second: nothing was made.
         let Some(source) = source else {
+            if from == -libc::ELOOP {
+                let name = self.name_of(id, 0).to_string_lossy();
+                // alloc: an error path.
+                return Step::Ends(Some(Done::Failed(IoError(format!("{name} {}", crate::CLONE_THROUGH_A_LINK)))));
+            }
+            // A socket or a device with no driver fails its open before any `fstat`: looked at
+            // here (an `lstat` on the driver thread, on this error path only), it is refused as
+            // no regular file and written again, never reported as the open's error.
+            let name = self.name_of(id, 0);
+            let path = std::path::Path::new(std::ffi::OsStr::from_bytes(name.to_bytes()));
+            if let Some(kind) = crate::fs::no_file_after_open(path, -from) {
+                let name = name.to_string_lossy();
+                // alloc: an error path.
+                return Step::Ends(Some(Done::Failed(IoError(format!("{name} ({kind}) {}", crate::CLONE_OF_NO_FILE)))));
+            }
             return self.failed_on(id, "opening", 0, from);
         };
         let Some(target) = target else {
@@ -1110,18 +1145,39 @@ impl Uring {
             }
             return self.failed_on(id, "making", 1, to);
         };
-        /// `_IOW(0x94, 9, int)` of `linux/fs.h`.
-        const FICLONE: libc::c_ulong = 0x4004_9409;
-        // No io_uring op shares blocks: one `FICLONE` of the two files the ring opened, here.
-        // SAFETY: two open descriptors; the call reads the first's blocks into the second.
-        let cloned = unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
-        if cloned == 0 {
-            return Step::Ends(Some(Done::Cloned));
-        }
-        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        // A FIFO, socket or device swapped in (its open did not block, `O_NONBLOCK`) is refused
+        // naming it, never cloned or said to be on a file system that cannot share blocks.
+        let source = File::from(source);
+        let regular = source.metadata().map(|it| (it.file_type().is_file(), std::os::unix::fs::MetadataExt::mode(&it)));
+        let not_regular = matches!(regular, Ok((false, _)));
+        let mut kind_bits = 0u32;
+        let errno = match regular {
+            Ok((false, mode)) => {
+                kind_bits = mode & libc::S_IFMT;
+                libc::EINVAL
+            }
+            Err(error) => error.raw_os_error().unwrap_or(libc::EIO),
+            Ok((true, _)) => {
+                /// `_IOW(0x94, 9, int)` of `linux/fs.h`.
+                const FICLONE: libc::c_ulong = 0x4004_9409;
+                // No io_uring op shares blocks: one `FICLONE` of the two files the ring opened,
+                // here.
+                // SAFETY: two open descriptors; the call reads the first's blocks into the
+                // second.
+                let cloned = unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
+                if cloned == 0 {
+                    return Step::Ends(Some(Done::Cloned));
+                }
+                io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+            }
+        };
         drop((source, target));
-        self.ops.get_mut(id).expect("in flight").phase = UNLINKING;
-        self.ops.cold_mut(id).at = errno as u64;
+        let hot = self.ops.get_mut(id).expect("in flight");
+        hot.phase = UNLINKING;
+        if not_regular {
+            hot.flags |= NOT_REGULAR;
+        }
+        self.ops.cold_mut(id).at = u64::from(kind_bits) << 32 | errno as u32 as u64;
         Step::Again
     }
 

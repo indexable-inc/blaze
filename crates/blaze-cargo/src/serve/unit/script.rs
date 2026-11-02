@@ -39,6 +39,7 @@ use blaze_units::{
     stdlib,
 };
 use blaze_usercode::{
+    roots::{Role, RootMap, Rooted},
     run::{Begun, OutFile, Run, Value},
     script::{self, Place, Prepared},
 };
@@ -48,7 +49,7 @@ use super::{
     error::{UnitError, manifest_dir},
     package_of, say,
 };
-use crate::serve::work::{Runs, Writer};
+use crate::serve::work::{RunPuts, Runs, Writer};
 
 /// The job's variable that asks an inert script compiled and run as well, and checked against
 /// what elision said of it: `verify`, or unset.
@@ -65,6 +66,30 @@ fn verifies_in(env: &[(String, String)]) -> Result<bool, ApiError> {
         Some((_, value)) if value == "verify" => Ok(true),
         Some((_, value)) => Err(ApiError::new(
             format!("{ELIDE}={value} is not a value blaze takes: `verify` runs an inert build script as well, unset runs none"),
+            None,
+        )),
+    }
+}
+
+/// The job variable that says how a build script's kept run is used: `check` runs it again
+/// and compares ([`blaze_usercode::run::Mode::Verify`]), or unset.
+pub(crate) const SCRIPT_CACHE: &str = "BLAZE_SCRIPT_CACHE";
+
+/// Whether the job asks `BLAZE_SCRIPT_CACHE=check`; any other value of it is an error naming
+/// it.
+pub(crate) fn rechecks(job: &Job) -> Result<bool, ApiError> {
+    rechecks_in(&job.input.config.invocation.env)
+}
+
+fn rechecks_in(env: &[(String, String)]) -> Result<bool, ApiError> {
+    match env.iter().find(|(name, _)| name == SCRIPT_CACHE) {
+        None => Ok(false),
+        Some((_, value)) if value == "check" => Ok(true),
+        Some((_, value)) => Err(ApiError::new(
+            format!(
+                "{SCRIPT_CACHE}={value} is not a value blaze takes: `check` runs a build script the store kept \
+                 again and compares, unset uses what was kept"
+            ),
             None,
         )),
     }
@@ -187,6 +212,7 @@ pub(crate) struct Of<'a> {
     /// The compiled script.
     pub(crate) program: PathBuf,
     /// What each run told cargo, by its unit; a slot not set is a run not ended.
+    #[expect(clippy::disallowed_types, reason = "the job's slots, one per unit, each set once by its run: per job, not global")]
     pub(crate) scripts: &'a [std::sync::OnceLock<Applied>],
 }
 
@@ -329,13 +355,21 @@ fn triple_of<'a>(unit: &'a Unit, host: &'a str) -> &'a str {
     unit.platform.as_deref().unwrap_or(host)
 }
 
-/// The environment a script is started in: the job's whole environment, what cargo sets for
-/// the unit over it.
+/// The job's variables that say how blaze checks what it kept, never what a run does
+/// ([`ELIDE`], [`SCRIPT_CACHE`], [`pure::PURE`], `BLAZE_PROC_MACRO_CACHE`): of the job alone,
+/// as [`blaze_usercode::script::RUN_ONLY`] is of the run, so no script sees them. A script
+/// that reads its whole environment (`env::vars()`) would otherwise be traced reading
+/// `BLAZE_SCRIPT_CACHE=check`, and its check would miss what an unchecked build kept and
+/// compare with nothing.
+pub(crate) const JOB_ONLY: &[&str] = &[ELIDE, SCRIPT_CACHE, pure::PURE, proc_macro_api::kept::CACHE];
+
+/// The environment a script is started in: the job's whole environment but [`JOB_ONLY`], what
+/// cargo sets for the unit over it.
 pub(crate) fn inherited(job: &[(String, String)], plan: &UnitPlan) -> Vec<(OsString, OsString)> {
     // cargo's first, then a stable sort by name and the first of each name kept: cargo's over
     // the job's, in one sort with no map.
     let mut env: Vec<&(String, String)> = Vec::with_capacity(plan.env.len() + job.len());
-    env.extend(plan.env.iter().chain(job));
+    env.extend(plan.env.iter().chain(job.iter().filter(|it| !JOB_ONLY.contains(&it.0.as_str()))));
     env.sort_by(|a, b| a.0.cmp(&b.0));
     env.dedup_by(|later, first| later.0 == first.0);
     env.into_iter().map(|(name, value)| (OsString::from(name), OsString::from(value))).collect()
@@ -491,10 +525,13 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
     match &start.how {
         How::Inert => true,
         How::Outside(_) => false,
+        // Checked: it runs again whatever the store has.
+        How::Sandboxed(prepared) if prepared.spec.mode == blaze_usercode::run::Mode::Verify => false,
         How::Sandboxed(prepared) => {
             let guard = blaze_cas::enter();
+            let mut inputs = Rooted::new(prepared.spec.roots.view(), &mut start.disk);
             matches!(
-                blaze_usercode::index::find(&job.input.store, &guard, &prepared.spec.key, &mut start.disk),
+                blaze_usercode::index::find(&job.input.store, &guard, &prepared.spec.key, &mut inputs),
                 Ok(blaze_usercode::index::Found::Hit { .. })
             )
         }
@@ -538,13 +575,36 @@ pub(crate) fn named_program(units: &Units, compile: usize) -> Result<PathBuf, Ap
     plan.outputs.first().map(PathBuf::from).ok_or_else(|| UnitError::ScriptProgram { unit: compile }.into())
 }
 
+/// The roots every build script run of `job` has besides its own package and `OUT_DIR`
+/// ([`blaze_usercode::roots`]): the target directory, the workspace, blaze's tools and its
+/// launcher. What its key and what it read are written against, so the same script in another
+/// checkout, or another workspace on this machine, is found once a second checkout verified it
+/// ([`blaze_usercode::roots::verify`]). The cargo home's registry and git checkouts, where every
+/// registry and git package is, are machine-wide: a run that read there outside its own package
+/// can still be shared with another checkout.
+pub(crate) fn build_roots(job: &Job) -> RootMap {
+    let env = &job.input.config.invocation.env;
+    RootMap::default()
+        .with(Role::Target, Path::new(&job.units().target_dir))
+        .with(Role::Workspace, Path::new(&job.input.config.invocation.root))
+        .with(Role::Tools, &job.shared.tools)
+        .with(Role::Launcher, &job.shared.launcher)
+        .with_cargo_home(|name| env.iter().find(|it| it.0 == name).map(|it| it.1.as_str()))
+}
+
+/// [`build_roots`] with `unit`'s own: what [`script::prepare`] gives its run.
+pub(crate) fn run_roots(job: &Job, unit: &bs::Unit) -> RootMap {
+    build_roots(job).with(Role::Package, &unit.package.manifest_dir).with(Role::OutDir, &unit.out_dir)
+}
+
 /// Run `run` ready to begin; none while its script is not built.
 fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     let units = job.units();
     let Some(compile) = compile_of(units, run) else {
         return Err(ApiError::new(format!("the run of unit {run} has no build script compiled"), None));
     };
-    let verify = !ported(job, run) && (verifies(job)? || pure::verifies(job)?);
+    // `BLAZE_SCRIPT_CACHE=check` reruns a pure key's hit too, compared as an elided one is.
+    let verify = !ported(job, run) && (verifies(job)? || pure::verifies(job)? || (rechecks(job)? && pure::hit(job, run).is_some()));
     // clone: the run's own, kept with it until it ends; once per run of an inert script.
     let elided = inert(job, run)?.or_else(|| pure::hit(job, run)).cloned();
     let program = match (&elided, verify) {
@@ -581,7 +641,17 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         job.shared.tools.clone(),
     ];
     read.dedup();
-    let place = Place { code, read, network: false, memory: None, mode: blaze_usercode::run::Mode::Normal };
+    let place = Place {
+        code,
+        read,
+        network: false,
+        memory: None,
+        mode: match rechecks(job)? {
+            true => blaze_usercode::run::Mode::Verify,
+            false => blaze_usercode::run::Mode::Normal,
+        },
+        roots: build_roots(job),
+    };
     let prepared = script::prepare(&unit, &env, &place)
         .map_err(|error| ApiError::new(error.0, Some(unit.package.descr())))?;
     let disk = blaze_usercode::inputs::Disk::new(prepared.env.clone());
@@ -598,6 +668,9 @@ pub(crate) struct ScriptRun {
     unit: usize,
     tag: Tag,
     state: State,
+    /// The ticket of a record its run put that a value depends on where its roots are
+    /// ([`blaze_usercode::roots::verify::retraction`]): durable before its job is done.
+    puts: RunPuts,
 }
 
 enum State {
@@ -706,6 +779,51 @@ impl Quiet {
     }
 }
 
+/// Why run unit `unit` was not reused, for `blaze why`, under its unit's subject
+/// ([`super::compile::unit_subject`]): `missed` of its subject, or why it has none.
+fn run_miss(job: &Job, unit: usize, missed: impl FnOnce(blaze_ids::ContentId, String) -> blaze_kernel::Miss) -> blaze_kernel::Miss {
+    let (item, subject) = match job.unit(unit) {
+        Ok(u) => (super::compile::span_unit(u), super::compile::unit_subject(job, u)),
+        Err(error) => (format!("unit {unit}"), Err(error.what)), // alloc: once a miss
+    };
+    match subject {
+        Ok(subject) => missed(subject, item),
+        Err(why) => blaze_kernel::Miss {
+            step: RUN,
+            subject: blaze_ids::ContentId::default(),
+            item,
+            missed: blaze_kernel::Missed::Failed(why),
+            key: blaze_ids::ContentId::default(),
+            kept: None,
+            // alloc: none
+            parts: Vec::new(),
+            beyond: None,
+        },
+    }
+}
+
+/// The step `blaze why` names a build script's run by.
+const RUN: &str = "build script run";
+
+/// Why the sandboxed run of unit `unit`'s build script, keyed as `prepared` says, was not
+/// reused, for `blaze why`: its key's parts by name (its code, each variable it is given), and
+/// past them, what it read when it last ran. Made on a miss only.
+fn run_missed(job: &Job, unit: usize, prepared: &Prepared) -> blaze_kernel::Miss {
+    use blaze_kernel::Part;
+    run_miss(job, unit, |subject, item| {
+        let key = prepared.spec.key;
+        let mut hasher = blaze_ids::Hasher::new("blaze v2 why run key 1");
+        hasher.id(&key.code).id(&key.given);
+        let parts = std::iter::once(Part::new("the build script's code", Some(key.code)))
+            .chain(prepared.made.parts().into_iter().map(|(name, hash)| Part::new(name, Some(hash))))
+            // alloc: once a miss
+            .collect();
+        let mut miss = blaze_kernel::Miss::of_parts(RUN, subject, item, hasher.finish(), parts);
+        miss.beyond = Some("what it read when it last ran (the files and variables it traced)");
+        miss
+    })
+}
+
 /// `spec`, of a sandboxed run of `unit`, with its live record named ([`blaze_usercode::confine::LIVE`])
 /// at [`LIVE_FILE`] beside its `OUT_DIR`, so its bound can look at it ([`Quiet`]); an earlier
 /// run's record there removed. With the record's name.
@@ -751,7 +869,7 @@ pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<ScriptRun,
             }
         },
     };
-    Ok(ScriptRun { job: job.clone(), unit, tag: Tag(tags), state: State::Ready(Box::new(start)) })
+    Ok(ScriptRun { job: job.clone(), unit, tag: Tag(tags), state: State::Ready(Box::new(start)), puts: RunPuts::default() })
 }
 
 impl ScriptRun {
@@ -970,6 +1088,22 @@ impl Runs<Real> for ScriptRun {
                 self.finish(start, value, began, writer, effects, out)
             }
             How::Outside(command) => {
+                let miss = run_miss(&self.job, self.unit, |subject, item| blaze_kernel::Miss {
+                    step: RUN,
+                    subject,
+                    item,
+                    missed: blaze_kernel::Missed::Always(
+                        // alloc: once a run outside the sandbox
+                        "it runs outside the sandbox (`BLAZE_SANDBOX=off` or `unsandboxed-build-scripts`), so nothing of it is kept"
+                            .to_owned(),
+                    ),
+                    key: blaze_ids::ContentId::default(),
+                    kept: None,
+                    // alloc: none
+                    parts: Vec::new(),
+                    beyond: None,
+                });
+                self.puts.misses.push(miss);
                 effects.push(Effect::Spawn { command: Box::new(command.clone()), tag: self.tag });
                 self.state = State::Running { start, run: None, began, cancelled: false, quiet: None, stuck: None };
                 None
@@ -983,6 +1117,8 @@ impl Runs<Real> for ScriptRun {
                 match begun {
                     Ok(Begun::Reused(value)) => self.finish(start, value, began, writer, effects, out),
                     Ok(Begun::Running(run)) => {
+                        let miss = run_missed(&self.job, self.unit, prepared);
+                        self.puts.misses.push(miss);
                         let quiet = Some(Quiet::begin(&live, self.tag, effects));
                         self.state = State::Running { start, run: Some(run), began, cancelled: false, quiet, stuck: None };
                         None
@@ -994,6 +1130,10 @@ impl Runs<Real> for ScriptRun {
                 }
             }
         }
+    }
+
+    fn take_puts(&mut self) -> RunPuts {
+        std::mem::take(&mut self.puts)
     }
 
     fn owns(&self, tag: Tag) -> bool {
@@ -1043,14 +1183,82 @@ impl Runs<Real> for ScriptRun {
                     },
                 );
                 match completed {
-                    Ok((value, _, _)) => {
-                        if let Err(what) = pure::keep(&job, run_unit, unit, checked, store, disk, &value) {
+                    Ok(completed) => {
+                        // What the run kept under its sandboxed key, and a retraction it put.
+                        self.puts.kept(completed.tickets.iter().copied());
+                        self.puts.retraction(completed.retracted);
+                        let value = completed.value;
+                        // A pure key's hit verified across checkouts, run again and otherwise:
+                        // retracted before the run is kept under the pure key, which then
+                        // keeps this checkout's own here alone.
+                        let differed = match pure::retract(&job, run_unit, unit, store, &prepared.spec.roots, &value) {
+                            Ok(None) => None,
+                            Ok(Some((what, puts))) => {
+                                self.puts.extend(puts);
+                                Some(what)
+                            }
+                            Err((what, puts)) => {
+                                self.puts.extend(puts);
+                                return self.error(what, out);
+                            }
+                        };
+                        match pure::keep(&job, run_unit, unit, checked, store, disk, &prepared.spec.roots, &value) {
+                            Ok(puts) => self.puts.extend(puts),
+                            Err((what, puts)) => {
+                                self.puts.extend(puts);
+                                return self.error(what, out);
+                            }
+                        }
+                        if let Some(what) = differed {
+                            let what = format!(
+                                "the build script of `{}`: run again, it gave other than the result \
+                                 its pure key found, verified across checkouts for the same inputs ({what}): it \
+                                 depends on where its roots are, so it is recorded as doing so and no checkout is \
+                                 given that result again",
+                                unit.package.descr()
+                            );
                             return self.error(what, out);
                         }
                         value
                     }
                     Err(error) => {
-                        let what = format!("the build script of `{}`: {error}", unit.package.descr());
+                        // alloc: error path
+                        let mut what = format!("the build script of `{}`: {error}", unit.package.descr());
+                        // What it put before it failed is in the store: waited for as any put, and
+                        // a retraction among it flushed at once, whichever error carried it.
+                        self.puts.kept(error.landed().iter().copied());
+                        self.puts.retraction(error.retracted());
+                        if let blaze_usercode::run::RunError::Differs { ran, .. } = &error {
+                            // Its pure key may have found a value verified with the same
+                            // checkouts as its sandboxed key (both are kept by one run): the
+                            // rerun that differs from one is checked against the other too, and
+                            // retracts it, before the run is kept under the pure key, which then
+                            // keeps this checkout's own here alone. A failure of either is said
+                            // with the difference, which the build fails with all the same.
+                            match pure::retract(&job, run_unit, unit, store, &prepared.spec.roots, ran) {
+                                Ok(None) => {}
+                                Ok(Some((differs, puts))) => {
+                                    self.puts.extend(puts);
+                                    // alloc: error path
+                                    what = format!(
+                                        "{what}; and its pure key's result, verified across checkouts for the same \
+                                         inputs, differs too ({differs}), so it is recorded as depending on where its \
+                                         roots are and no checkout is given it again"
+                                    );
+                                }
+                                Err((more, puts)) => {
+                                    self.puts.extend(puts);
+                                    what = format!("{what}; and {more}"); // alloc: error path
+                                }
+                            }
+                            match pure::keep(&job, run_unit, unit, checked, store, disk, &prepared.spec.roots, ran) {
+                                Ok(puts) => self.puts.extend(puts),
+                                Err((more, puts)) => {
+                                    self.puts.extend(puts);
+                                    what = format!("{what}; and {more}"); // alloc: error path
+                                }
+                            }
+                        }
                         return self.error(what, out);
                     }
                 }

@@ -19,6 +19,7 @@
 //! ([`blaze_usercode::test::Passes`], [`blaze_usercode::index`], [`blaze_usercode::trace`]).
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 pub mod api;
 pub mod record;
@@ -27,7 +28,7 @@ pub mod selector;
 pub mod table;
 
 pub use record::Record;
-pub use select::{Basis, Cached, Choice, Ran, Subject, Why};
+pub use select::{Basis, Cached, Choice, Ran, Reached, Subject, Why};
 pub use selector::Selector;
 pub use table::{Bound, FnId, Image, Set, Version};
 

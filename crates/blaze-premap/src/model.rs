@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use blaze_codegen::{CompiledFunction, Init, InstanceKey, RelocKind, Static, Target};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_link::NativeKind;
@@ -49,7 +50,7 @@ struct Site {
 pub(crate) struct Layout {
     pub functions: Vec<(InstanceKey, u64, u64)>,
     pub statics: Vec<PlacedStatic>,
-    data: HashMap<ContentId, u64>,
+    data: HashMap<ContentId, u64, Global>,
     /// The open cells: name, address, referred to weakly only.
     pub cells: Vec<(String, u64, bool)>,
     sites: Vec<Site>,
@@ -87,7 +88,7 @@ pub(crate) fn place(from: u64, tls_from: u64, functions: &[&CompiledFunction], s
 
     let ro_at = (from + code.len() as u64).next_multiple_of(PAGE);
     let mut ro = Vec::new();
-    let mut data = HashMap::default();
+    let mut data = HashMap::new_in(Global);
     let blobs = functions.iter().flat_map(|it| &it.data).chain(statics.iter().flat_map(|it| &it.data));
     for blob in blobs {
         if data.contains_key(&blob.id) {

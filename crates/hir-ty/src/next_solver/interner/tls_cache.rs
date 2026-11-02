@@ -26,10 +26,7 @@ use std::{
     hash::BuildHasher,
     mem,
     ptr::{self, NonNull},
-    sync::{
-        LazyLock,
-        atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
 
 /// The search graph's cache, with the lifetime of the interner it is used through erased: it
@@ -144,11 +141,13 @@ struct SharedCaches {
     goals: crate::next_solver::global_goals::Goals,
 }
 
-static SHARED_GENERATIONS: LazyLock<Pool<Generation<Scope, View, SharedCaches>>> =
-    LazyLock::new(pool);
+#[expect(clippy::disallowed_types, reason = "the process's one shared solver generation pool: the shared table allocates all its generations here")]
+static SHARED_GENERATIONS: std::sync::LazyLock<Pool<Generation<Scope, View, SharedCaches>>> =
+    std::sync::LazyLock::new(pool);
 
-static SHARED: LazyLock<Shared<'static, Scope, View, SharedCaches>> =
-    LazyLock::new(|| Shared::new(SHARED_BITS, LazyLock::force(&SHARED_GENERATIONS)));
+#[expect(clippy::disallowed_types, reason = "the process's one shared solver cache table: all threads share its generations")]
+static SHARED: std::sync::LazyLock<Shared<'static, Scope, View, SharedCaches>> =
+    std::sync::LazyLock::new(|| Shared::new(SHARED_BITS, std::sync::LazyLock::force(&SHARED_GENERATIONS)));
 
 /// Runs `f` on the shared cache of `krate` (and `regions`) in `db`, as it is now.
 #[inline]
@@ -439,15 +438,18 @@ const SLOT_BITS: u32 = 9;
 #[derive(Default)]
 struct OfQuery {
     #[cfg(debug_assertions)]
+    #[expect(clippy::disallowed_types, reason = "the database and revision, set once per interner cache: not global")]
     state: std::sync::OnceLock<(Nonce, View)>,
     cache: Erased,
 }
 
-static OF_QUERY_GENERATIONS: LazyLock<Pool<Generation<Solved, (), OfQuery>>> =
-    LazyLock::new(pool);
+#[expect(clippy::disallowed_types, reason = "the process's one query solver generation pool: the query table allocates all its generations here")]
+static OF_QUERY_GENERATIONS: std::sync::LazyLock<Pool<Generation<Solved, (), OfQuery>>> =
+    std::sync::LazyLock::new(pool);
 
-static OF_QUERY: LazyLock<Shared<'static, Solved, (), OfQuery>> =
-    LazyLock::new(|| Shared::new(SLOT_BITS, LazyLock::force(&OF_QUERY_GENERATIONS)));
+#[expect(clippy::disallowed_types, reason = "the process's one query solver cache table: queries can move between threads")]
+static OF_QUERY: std::sync::LazyLock<Shared<'static, Solved, (), OfQuery>> =
+    std::sync::LazyLock::new(|| Shared::new(SLOT_BITS, std::sync::LazyLock::force(&OF_QUERY_GENERATIONS)));
 
 // A generation's header is one line; the rest is the search graph's cache.
 const _: () = assert!(

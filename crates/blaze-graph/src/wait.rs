@@ -91,7 +91,7 @@ impl WaitKind {
 /// Runs `block`, which blocks on `on`, inside a span `wait` saying so; `owner` is the job or
 /// thread that will end the wait, when known.
 pub fn wait<R>(on: WaitOn<'_>, owner: Option<u64>, block: impl FnOnce() -> R) -> R {
-    let waiting = Waiting::begin(on.kind(), &mut |it| on.write(it), owner);
+    let waiting = Waiting::begin(on.kind(), &mut |it| on.write(it), || owner);
     let result = block();
     drop(waiting);
     result

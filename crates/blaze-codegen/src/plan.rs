@@ -18,7 +18,7 @@
 //! - A tiered run ([`Mode::Tiered`]) starts each function at opt-level 0 as stencils that
 //!   count, patchable: `blaze_stencil::tier` tiers it up by its counts, not the plan.
 
-use std::{cmp::Ordering, collections::BTreeMap, fmt, sync::LazyLock};
+use std::{cmp::Ordering, collections::BTreeMap, fmt};
 
 use blaze_hashcons::{Consed, HashCons, Interned};
 use blaze_ids::{ContentId, Domain, Hasher};
@@ -115,7 +115,8 @@ impl Consed for PackageName {
 
 /// Every package name the process has made an [`Origin`] of: the packages of the workspaces
 /// it builds, a few thousand at most.
-static PACKAGES: LazyLock<HashCons<PackageName>> = LazyLock::new(HashCons::new);
+#[expect(clippy::disallowed_types, reason = "the process's one interner of package names, which every `Origin` points into")]
+static PACKAGES: std::sync::LazyLock<HashCons<PackageName>> = std::sync::LazyLock::new(HashCons::new);
 
 impl Package {
     /// The package named `name`. A name made before is found with no lock and no allocation.
@@ -201,6 +202,14 @@ pub struct Policy {
     pub sanitize: Sanitize,
     /// `-Cprofile-generate` or `-Cprofile-use`, the same for every function.
     pub pgo: Pgo,
+    /// The build is of a proc macro's wasm module, or of a crate in it: every function's
+    /// [`Spec::proc_macro_bridge`].
+    pub proc_macro_bridge: bool,
+    /// The program observes no allocation (its global allocator is std's): the
+    /// [`Spec::heap_to_stack`] of every function but std's, whose bodies never move one.
+    pub heap_to_stack: bool,
+    /// Lint `blaze::vecreport` is on: every LLVM unit's [`Spec::report`].
+    pub report: bool,
 }
 
 /// How one function is compiled.
@@ -294,8 +303,14 @@ impl Policy {
             debuginfo = layer.debuginfo.unwrap_or(debuginfo);
         }
         let llvm = self.toolchain.llvm.is_some();
-        let backend =
-            level.backend(llvm).ok_or(PlanError::NoLlvm { origin: *origin, level })?;
+        // wasm32 has one code producer, the lowering of the IR to wasm (`hir-ty-codegen`'s
+        // `wasm::lower`, which `check_built` holds every wasm32 unit to): the level picks
+        // no other, as LLVM writes no wasm32 for blaze (its pinned build has no WebAssembly
+        // target). The level still says what the IR is optimized for.
+        let backend = match self.toolchain.arch {
+            crate::Arch::Wasm32 => Backend::Cranelift { speed: level != OptLevel::O0 },
+            _ => level.backend(llvm).ok_or(PlanError::NoLlvm { origin: *origin, level })?,
+        };
         // Only a member's code is edited, so only it is recompiled: the rest is compiled once
         // and can afford Cranelift's optimizer.
         let member = matches!(origin, Origin::Member(_));
@@ -319,6 +334,13 @@ impl Policy {
             mir_inline: matches!(level, OptLevel::O2 | OptLevel::O3) && !live,
             sanitize: self.sanitize,
             pgo: self.pgo,
+            proc_macro_bridge: self.proc_macro_bridge,
+            // Only LLVM's code is read for it; the stencil and Cranelift tiers report nothing.
+            report: self.report && matches!(backend, Backend::Llvm { .. }),
+            // std's bodies never move an allocation (`hir-ty-codegen`'s `Build::options`), so
+            // their settings leave out a flag that is the program's: one copy of each for every
+            // program, whatever its allocator.
+            heap_to_stack: self.heap_to_stack && !matches!(origin, Origin::Std),
         };
         // Build-time code runs out of the run's process, where no counter cells are: it is
         // compiled as an output's.
@@ -382,6 +404,9 @@ mod tests {
             fold: false,
             sanitize: Sanitize::default(),
             pgo: Pgo::None,
+            proc_macro_bridge: false,
+            report: false,
+            heap_to_stack: false,
         }
     }
 
@@ -555,6 +580,21 @@ mod tests {
             Override { opt_level: Some(OptLevel::O3), ..Override::default() },
         );
         assert_ne!(settings(&a, &syn), settings(&c, &syn));
+    }
+
+    /// The program's allocator changes the settings of its own and its dependencies'
+    /// functions, never std's: std's bodies move no allocation, so one copy of each serves
+    /// every program.
+    #[test]
+    fn heap_to_stack_keys_every_function_but_stds() {
+        let off = policy(OptLevel::O2, Mode::Output);
+        let on = Policy { heap_to_stack: true, ..off.clone() };
+        let settings = |policy: &Policy, origin: &Origin| policy.choose(origin, None).unwrap().first.settings();
+        assert_eq!(settings(&off, &Origin::Std), settings(&on, &Origin::Std));
+        assert!(!on.choose(&Origin::Std, None).unwrap().first.heap_to_stack);
+        for origin in [member(), Origin::Dependency(Package::new("regex"))] {
+            assert_ne!(settings(&off, &origin), settings(&on, &origin), "{origin:?}");
+        }
     }
 
     fn std_hash(value: &impl std::hash::Hash) -> u64 {

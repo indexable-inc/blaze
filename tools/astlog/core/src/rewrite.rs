@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use crate::corpus::{Corpus, Value};
 use crate::error::{Error, OverlappingEditsSnafu, ReplaceNotNodeSnafu, TemplateVarSnafu};
@@ -46,7 +47,7 @@ pub(crate) fn collect(
 fn edit_of(
     corpus: &Corpus,
     rewrite: &Rewrite,
-    env: &HashMap<String, Value>,
+    env: &HashMap<String, Value, Global>,
 ) -> Result<Edit, Error> {
     let target = env.get(&rewrite.target).ok_or_else(|| {
         TemplateVarSnafu { var: rewrite.target.clone(), line: rewrite.line }.build()

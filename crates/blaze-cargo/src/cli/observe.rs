@@ -1,7 +1,8 @@
 //! blaze's looks at itself (docs/profiling.md): `blaze explore`, the explorer's link to the
 //! daemon (docs/v2/plan/lanes/observe/explore.md); `blaze debug profile`, `blaze debug live`
-//! and `blaze debug sql`, the daemon's flight recorder and its profile history; and `blaze
-//! explain`, a named view of that history.
+//! and `blaze debug sql`, the daemon's flight recorder and its profile history; `blaze
+//! explain`, a named view of that history; and `blaze why`, what the last build computed
+//! again and why.
 //!
 //! `blaze debug sql` and `blaze explain` run the DuckDB [`observe::DUCKDB`] names, here in
 //! the CLI over the history's files; `--live` asks the daemon, whose flight recorder it reads
@@ -11,7 +12,11 @@ use std::{ffi::OsString, fmt::Write as _, io::Write as _, path::PathBuf, time::D
 
 use arrow_array::{Array, RecordBatch, cast::AsArray, types};
 use blaze_api::{Request, ResponseRef};
-use blaze_profile::{history, live, sql, views};
+use blaze_profile::{
+    history, live, sql,
+    time::{load, report::By},
+    views,
+};
 use serde_json::{Map, Value};
 
 use super::{
@@ -24,8 +29,10 @@ use crate::serve::observe;
 const EXPLORE_USAGE: &str = "blaze explore [--dev] [--print]: the explorer's link, opened in the browser (`--print`: printed only; \
                              `--dev`: the page's development server, http://localhost:5173, may connect too)";
 const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live | blaze debug sql [--live] [--last SECONDS] [--json] QUERY \
-                           | blaze debug hot [--top N] [--last-build]";
+                           | blaze debug hot [--top N] [--last-build] | blaze debug time [--build N] [--by unit|item|wait] [--top N] \
+                           [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE]";
 const EXPLAIN_USAGE: &str = "blaze explain VIEW [NAME=VALUE ...] [--json]";
+const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--json]";
 
 /// `blaze explore`: the daemon's explorer started if it is not, its link printed (it carries
 /// the session's token: on this terminal only) and opened.
@@ -78,6 +85,7 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
         },
         Some("sql") => query(words.collect()),
         Some("hot") => hot(words.collect()),
+        Some("time") => time(words.collect()),
         _ => Err(Refusal::Usage(DEBUG_USAGE.to_owned())),
     };
     said(result, color)
@@ -115,10 +123,93 @@ fn hot(words: Vec<OsString>) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// `blaze debug time`: where a build's time went, per unit, item or wait, as running, parked,
+/// queued and uncovered time, with its critical path (blaze_profile::time).
+fn time(words: Vec<OsString>) -> Result<(), Refusal> {
+    let usage = |what: &str| {
+        Refusal::Usage(format!(
+            "blaze debug time [--build N] [--by unit|item|wait] [--top N] [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE]: {what}"
+        ))
+    };
+    let (mut build, mut by, mut top, mut cores) = (None, By::Unit, 20usize, None);
+    let (mut matching, mut html, mut trace): (Option<String>, Option<PathBuf>, Option<PathBuf>) = (None, None, None);
+    let mut words = texts(words)?.into_iter().peekable();
+    while let Some(word) = words.next() {
+        let mut value = |what: &str| words.next().ok_or_else(|| usage(&format!("`{word}` takes {what}")));
+        match word.as_str() {
+            "--build" => build = Some(value("a build id")?.parse().map_err(|_| usage("`--build` takes a build id"))?),
+            "--by" => {
+                let name = value(By::NAMES)?;
+                by = By::of(&name).ok_or_else(|| usage(&format!("`--by` takes {}, not `{name}`", By::NAMES)))?;
+            }
+            "--top" => top = value("a number of rows")?.parse().map_err(|_| usage("`--top` takes a number of rows"))?,
+            "--match" => matching = Some(value("a text the rows' keys hold")?),
+            "--html" => html = Some(PathBuf::from(value("a file")?)),
+            "--trace" => trace = Some(PathBuf::from(value("a file")?)),
+            "--cores" => {
+                let lines = words.next_if(|it| it.parse::<usize>().is_ok()).map(|it| it.parse::<usize>());
+                cores = Some(lines.transpose().map_err(|_| usage("`--cores` takes a number of lines"))?.unwrap_or(40));
+            }
+            _ => return Err(usage(&format!("not `{word}`"))),
+        }
+    }
+    let (duckdb, dir) = history_source()?;
+    let source = load::Source { duckdb: &duckdb, history: &dir };
+    let ask = load::Ask { build, by, top, matching: matching.as_deref(), cores, html: html.as_deref(), trace: trace.as_deref() };
+    let text = load::run(&source, &ask).map_err(|error| error.to_string())?;
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes()).and_then(|()| out.flush()).map_err(|error| Refusal::Failed(format!("stdout: {error}")))
+}
+
 /// `blaze explain VIEW [NAME=VALUE ...] [--json]`: the view's SQL with its arguments bound,
 /// run over the history.
 pub fn explain(words: Vec<OsString>, color: bool) -> i32 {
     said(explained(words), color)
+}
+
+/// `blaze why [ITEM] [--all] [--json]`: what the daemon's last build computed again instead
+/// of reusing, grouped by why on the daemon (each group's first items, every one with
+/// `--all`); with an item (a function, a unit, a build script, by path), its
+/// chain of reasons (`Request::Rebuilt`).
+pub fn why(words: Vec<OsString>, color: bool) -> i32 {
+    said(rebuilt(words), color)
+}
+
+fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
+    let (mut item, mut json, mut all) = (None, false, false);
+    for word in texts(words)? {
+        match word.as_str() {
+            "--json" => json = true,
+            "--all" => all = true,
+            _ if word.starts_with('-') => return Err(Refusal::Usage(format!("{WHY_USAGE}, not `{word}`"))),
+            _ if item.is_none() => item = Some(word),
+            _ => return Err(Refusal::Usage(format!("{WHY_USAGE}: one item, not `{word}` too"))),
+        }
+    }
+    let mut answer = None;
+    // The workspace holding this directory is the one whose last build is asked of.
+    let cwd = std::env::current_dir().map_err(|error| format!("`blaze why` reading the current directory: {error}"))?;
+    let Some(cwd) = cwd.to_str().map(str::to_owned) else {
+        return Err(Refusal::Failed(format!("`blaze why`: the current directory {} is not UTF-8", cwd.display())));
+    };
+    let cwd = Some(cwd);
+    ask(Request::Rebuilt { all, cwd, item }, Start::Never, |response| {
+        if let ResponseRef::Rebuilt(it) = response {
+            answer = Some(it);
+        }
+        Ok(())
+    })?;
+    let Some(rebuilt) = answer else {
+        return Err(Refusal::Failed("the daemon answered `blaze why` with no answer".to_owned()));
+    };
+    if json {
+        println!("{}", serde_json::to_string(&rebuilt).map_err(|error| format!("`blaze why`'s answer as JSON: {error}"))?);
+        return Ok(());
+    }
+    let mut text = String::new();
+    blaze_ui::why::lines(&mut text, &rebuilt);
+    print!("{text}");
+    Ok(())
 }
 
 enum Refusal {
@@ -324,13 +415,18 @@ fn argument(view: &views::View, key: &str, value: &str) -> Result<Value, Refusal
 /// `sql` over the history in the daemon's state directory, by the DuckDB [`observe::DUCKDB`]
 /// names.
 fn run(sql: &str) -> Result<Vec<RecordBatch>, Refusal> {
+    let (duckdb, dir) = history_source()?;
+    let query = sql::Query { duckdb: &duckdb, history: &dir, sql };
+    Ok(sql::run(&query).map_err(|error| error.to_string())?)
+}
+
+/// The DuckDB [`observe::DUCKDB`] names, and the history in the daemon's state directory.
+fn history_source() -> Result<(PathBuf, PathBuf), Refusal> {
     let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB))?.ok_or_else(|| {
         format!("{} is unset: it names the DuckDB `nix run .#duckdb` pins, which blaze's own package sets", observe::DUCKDB)
     })?;
     let state: PathBuf = crate::serve::state().map_err(|error| format!("{error:#}"))?;
-    let dir = history::dir_in(&state);
-    let query = sql::Query { duckdb: &duckdb, history: &dir, sql };
-    Ok(sql::run(&query).map_err(|error| error.to_string())?)
+    Ok((duckdb, history::dir_in(&state)))
 }
 
 fn print(batches: &[RecordBatch], shape: Shape) -> Result<(), Refusal> {

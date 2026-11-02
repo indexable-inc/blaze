@@ -18,6 +18,7 @@ use hir_ty::{
     consteval::try_const_usize,
     next_solver::{GenericArgs, Ty, TyKind},
 };
+use intern::sym;
 use rustc_abi::BackendRepr;
 use rustc_type_ir::inherent::IntoKind as _;
 use syntax::view::AstNode as _;
@@ -121,12 +122,12 @@ fn dangerous_init(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Init> {
         // `mem::zeroed()` and `mem::uninitialized()` take no argument, `transmute` one.
         Expr::Call { callee, args } if args.len() <= 1 => {
             let Expr::Path(_) = store.expr(callee) else { return None };
-            let (name, items) = (util::path_item(b, callee)?, util::items());
-            if name == items.mem_zeroed {
+            let name = util::path_item(b, callee)?;
+            if name == sym::mem_zeroed {
                 Some(Init::Zeroed)
-            } else if name == items.mem_uninitialized {
+            } else if name == sym::mem_uninitialized {
                 Some(Init::Uninit)
-            } else if name == items.transmute && args.first().is_some_and(|&it| is_zero(b, it)) {
+            } else if name == sym::transmute && args.first().is_some_and(|&it| is_zero(b, it)) {
                 Some(Init::Zeroed)
             } else {
                 None
@@ -136,14 +137,13 @@ fn dangerous_init(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Init> {
             let Expr::Call { callee, args: &[] } = store.expr(receiver) else { return None };
             let Expr::Path(_) = store.expr(callee) else { return None };
             let def = util::method_fn(b, expr)?;
-            let items = util::items();
-            if util::fn_item(b.db(), def) != Some(items.assume_init) {
+            if util::fn_item(b.db(), def) != Some(sym::assume_init) {
                 return None;
             }
             let name = util::path_item(b, callee)?;
-            if name == items.maybe_uninit_zeroed {
+            if name == sym::maybe_uninit_zeroed {
                 Some(Init::Zeroed)
-            } else if name == items.maybe_uninit_uninit {
+            } else if name == sym::maybe_uninit_uninit {
                 Some(Init::Uninit)
             } else {
                 None

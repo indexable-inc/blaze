@@ -28,6 +28,7 @@ blaze-diagnostics.workspace = true
 blaze-hash.workspace = true
 blaze-item-hash.workspace = true
 blaze-items.workspace = true
+blaze-serde.workspace = true
 hir.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
@@ -55,6 +56,9 @@ blaze-graph.workspace = true
 blaze-history.workspace = true
 # `BLAZE_PROFILE`: the client puts the profile together, the daemon writes its part of each build.
 blaze-profile.workspace = true
+# `blaze pprof`: the reader, views, reports and exports of .ixprof and pprof files.
+ix-prof.workspace = true
+regex.workspace = true
 # `blaze explore`: the explorer's server, started in the daemon on the first request for it.
 blaze-explore.workspace = true
 # The record batches of `blaze debug sql`, encoded in the daemon and printed by the CLI.
@@ -100,10 +104,13 @@ blaze-core.workspace = true
 blaze-vfs.workspace = true
 blaze-query.workspace = true
 blaze-cas.workspace = true
+blaze-gc.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-kernel.workspace = true
 blaze-usercode.workspace = true
 blaze-codegen.workspace = true
+blaze-store-check.workspace = true
 blaze-testsel.workspace = true
 blaze-lazy.workspace = true
 blaze-link.workspace = true
@@ -111,6 +118,8 @@ blaze-lower.workspace = true
 base-db.workspace = true
 crossbeam-channel.workspace = true
 crossbeam-queue.workspace = true
+# `cli/live.rs`: `blaze test`'s live view on a terminal, through crossterm.
+ratatui = { workspace = true, features = ["crossterm"] }
 # `extended`: the `mi_collect` binding.
 libmimalloc-sys = { workspace = true, features = ["extended"] }
 
@@ -122,6 +131,8 @@ tikv-jemalloc-sys = { workspace = true, optional = true }
 [dev-dependencies]
 # Counts allocations for the budget tests (`serve/unit/test/tests.rs` installs it).
 blaze-alloc-count.workspace = true
+# `Writer::hold_put`, for the gate's tests of a put counted and not yet published.
+blaze-cas = { workspace = true, features = ["test-hooks"] }
 tokio = { workspace = true, features = ["net"] }
 lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
 tempfile.workspace = true

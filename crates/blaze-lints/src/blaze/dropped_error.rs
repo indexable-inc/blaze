@@ -13,6 +13,7 @@
 //! closure whose parameter is exactly `_` is `map_err_ignore`'s.
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir::HirDisplay as _;
 use hir_def::{
     DefWithBodyId, HasModule as _, ItemContainerId,
@@ -167,9 +168,9 @@ fn of_result(db: &base_db::Db, f: hir_def::FunctionId, result: hir::Adt) -> bool
 }
 
 /// The expressions of `body` that are statements of their block (`x.ok();`).
-fn expression_statements(body: &Body) -> HashSet<ExprId> {
+fn expression_statements(body: &Body) -> HashSet<ExprId, Global> {
     // alloc: one set per body when `unused_result_ok` is on beside this lint
-    let mut found = HashSet::default();
+    let mut found = HashSet::new_in(Global);
     for (_, expr) in body.exprs() {
         let Expr::Block { statements, .. } = expr else { continue };
         for statement in statements {

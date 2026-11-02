@@ -2,6 +2,7 @@
 //! store key is made of (its code hash and the facts of its type arguments).
 
 use std::{collections::HashMap, sync::Arc};
+use std::alloc::Global;
 
 use base_db::{Crate, Db, FileId};
 use blaze_codegen::{
@@ -45,13 +46,16 @@ impl Codegen {
             fold: false,
             sanitize: Sanitize::default(),
             pgo: Pgo::None,
+            proc_macro_bridge: false,
+            report: false,
+            heap_to_stack: false,
         };
         Ok(Codegen { policy, origin: Origin::Member(Package::new(package)), names })
     }
 }
 
 /// What an instance's store key is made of: its code hash and its arguments' facts.
-pub(crate) type Keys = blaze_hash::HashMap<HirInstance, (ContentId, ContentId)>;
+pub(crate) type Keys = blaze_hash::HashMap<HirInstance, (ContentId, ContentId), Global>;
 
 /// Every instance `krate`'s functions reach, by what its key is made of. A dependency's
 /// instance is listed, and what it reaches is not walked: no edit of the crate reaches into

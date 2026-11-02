@@ -539,6 +539,7 @@ impl<T: Keyed> Drop for Table<T> {
 #[cfg(not(blaze_check))]
 mod tests {
     use blaze_hash::HashMap;
+    use std::alloc::Global;
 
     use super::*;
 
@@ -602,9 +603,9 @@ mod tests {
     fn the_table_answers_as_a_map_does_across_growth() {
         let table: Table<Value> = Table::new(64, 2);
         let held = Held::writer(&table);
-        let mut model: HashMap<u64, u64> = HashMap::default();
-        let mut rows: HashMap<u64, u64> = HashMap::default();
-        let mut flags: HashMap<u64, [bool; 2]> = HashMap::default();
+        let mut model: HashMap<u64, u64, Global> = HashMap::new_in(Global); // alloc: a test's model
+        let mut rows: HashMap<u64, u64, Global> = HashMap::new_in(Global); // alloc: a test's model
+        let mut flags: HashMap<u64, [bool; 2], Global> = HashMap::new_in(Global); // alloc: a test's model
         let mut rng = blaze_ids::rng::SplitMix64::new(11);
         for step in 0..200_000u64 {
             let key = rng.next_u64() % 60_000;

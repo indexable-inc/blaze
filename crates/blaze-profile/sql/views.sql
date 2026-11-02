@@ -3,7 +3,8 @@
 -- `blaze debug sql` runs this before each query, with every `@<table>` replaced by the list of
 -- globs of that table's files, `['<dir>/*.<table>.parquet', ...]`: the history's directory and,
 -- with `--live`, the recorder's last seconds beside it. Each directory holds an empty
--- `schema.<table>.parquet` of every table, so each glob matches a file with every column.
+-- `schema.<table>.parquet` of every table, so each glob matches a file with every column: the
+-- reader writes those a history older than the table lacks (`history::ensure_schemas`).
 
 CREATE OR REPLACE VIEW spans AS
 SELECT * FROM read_parquet(@spans, union_by_name = true);
@@ -32,6 +33,9 @@ SELECT * FROM read_parquet(@heap_by_owner, union_by_name = true);
 CREATE OR REPLACE VIEW switches AS
 SELECT * FROM read_parquet(@switches, union_by_name = true);
 
+CREATE OR REPLACE VIEW events AS
+SELECT * FROM read_parquet(@events, union_by_name = true);
+
 CREATE OR REPLACE VIEW errors AS
 SELECT * FROM read_parquet(@errors, union_by_name = true);
 
@@ -40,6 +44,36 @@ SELECT * FROM read_parquet(@links, union_by_name = true);
 
 CREATE OR REPLACE VIEW crate_deps AS
 SELECT * FROM read_parquet(@crate_deps, union_by_name = true);
+
+CREATE OR REPLACE VIEW query_counts AS
+SELECT * FROM read_parquet(@query_counts, union_by_name = true);
+
+-- What each build computed again instead of reusing, and why (`blaze why`).
+CREATE OR REPLACE VIEW misses AS
+SELECT * FROM read_parquet(@misses, union_by_name = true);
+
+-- Profiled runs of programs blaze built (`blaze perf record`, crates/blaze-profile/src/perf.rs).
+CREATE OR REPLACE VIEW perf_runs AS
+SELECT * FROM read_parquet(@perf_runs, union_by_name = true);
+
+CREATE OR REPLACE VIEW perf_functions AS
+SELECT * FROM read_parquet(@perf_functions, union_by_name = true);
+
+-- What crates/blaze-profile/src/time.rs derives from `switches` and `spans`, for each build
+-- `blaze debug time` has read: a job's intervals end to end, each span's time by its job's
+-- states, the critical path, and each core's running time per second. Empty for a build it
+-- has not read.
+CREATE OR REPLACE VIEW job_intervals AS
+SELECT * FROM read_parquet(@job_intervals, union_by_name = true);
+
+CREATE OR REPLACE VIEW span_time AS
+SELECT * FROM read_parquet(@span_time, union_by_name = true);
+
+CREATE OR REPLACE VIEW path_links AS
+SELECT * FROM read_parquet(@path_links, union_by_name = true);
+
+CREATE OR REPLACE VIEW core_busy AS
+SELECT * FROM read_parquet(@core_busy, union_by_name = true);
 
 -- One row a time a job on a fiber parked: its `parked` switch and the `resumed` one after it,
 -- with the thread before and after; `resumed_ns` and `thread_after` are null while it still

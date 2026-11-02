@@ -150,7 +150,7 @@ fn allocates_its_result_alone(fixture: &str, first: &[&str], errors: bool) {
         }
         let mut reported = 0;
         for (name, def) in &defs {
-            let (result, used) = measure(|| borrowck_in_mode(&db, *def, mode()));
+            let (result, used) = measure(|| borrowck_in_mode(&db, *def, mode(&db)));
             assert_eq!(result, *borrowck(&db, *def), "{name}");
             assert!(result.skipped.is_none() && result.not_checked.is_none(), "{name}: {result:?}");
             assert_eq!(

@@ -57,6 +57,7 @@ use std::{
 use arrayvec::ArrayVec;
 use base_db::{CrateDisplayName, CrateOrigin, Db, LangCrateOrigin, TargetKind, all_crates};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_hashcons::Interned;
 use either::Either;
 use hir_def::{
@@ -402,7 +403,7 @@ impl Crate {
         db: &Db,
         query: import_map::Query,
     ) -> impl Iterator<Item = (Either<ModuleDef, Macro>, Complete)> {
-        let _p = tracing::info_span!("query_external_importables").entered();
+        let _p = tracing::info_span!(target: "blaze", "query_external_importables").entered();
         let mut found = blaze_mem::scratch::lend::<crate::scratch::Importables>();
         let mut seen = crate::scratch::take_importables_seen();
         import_map::search_dependencies_each(db, self.into(), &query, |item, complete| {
@@ -4015,7 +4016,7 @@ impl Impl {
             }
         }
         // An impl in a block is one of its crate as well as of the block.
-        let mut seen = HashSet::default(); // alloc: editor edge, sized by the impls found
+        let mut seen = HashSet::new_in(Global); // alloc: editor edge, sized by the impls found
         result.retain(|it| seen.insert(*it));
         result
     }
@@ -4038,7 +4039,7 @@ impl Impl {
             handle_impls(impls);
         }
         // An impl in a block is one of its crate as well as of the block.
-        let mut seen = HashSet::default(); // alloc: editor edge, sized by the impls found
+        let mut seen = HashSet::new_in(Global); // alloc: editor edge, sized by the impls found
         all.retain(|it| seen.insert(*it));
         all
     }
@@ -4790,7 +4791,7 @@ impl<'db> Type<'db> {
         tys: impl IntoIterator<Item: Borrow<Type<'db>>>,
         infcx: &InferCtxt<'db>,
     ) -> impl Iterator<Item = Ty<'db>> {
-        let mut var_for_param = HashMap::default();
+        let mut var_for_param = HashMap::new_in(Global);
         tys.into_iter().map(move |ty| {
             let ty = ty.borrow();
             let owner = match ty.owner {
@@ -5055,7 +5056,24 @@ impl<'db> Type<'db> {
         let krate = self.krate(db);
         match self.owner {
             TypeOwnerId::GenericDefId(def) => {
-                ParamEnvAndCrate { param_env: db.trait_environment(def), krate }
+                let param_env = db.trait_environment(def);
+                // A type of a `for const` body (`#![feature(blaze_comptime)]`) that names a
+                // loop's binder holds in the environment inference checked the body in. Only
+                // such a type names a placeholder, so no other type asks for the body's table.
+                let body = match def {
+                    _ if !hir_ty::comptime_env::names_binder(self.ty.skip_binder()) => None,
+                    GenericDefId::FunctionId(it) => Some(DefWithBodyId::FunctionId(it)),
+                    GenericDefId::ConstId(it) => Some(DefWithBodyId::ConstId(it)),
+                    GenericDefId::StaticId(it) => Some(DefWithBodyId::StaticId(it)),
+                    _ => None,
+                };
+                let param_env = match body {
+                    Some(body) => {
+                        hir_ty::comptime_env::owner_param_env(db, body.into(), param_env)
+                    }
+                    None => param_env,
+                };
+                ParamEnvAndCrate { param_env, krate }
             }
             TypeOwnerId::BuiltinDeriveImplId(def) => ParamEnvAndCrate {
                 param_env: hir_ty::builtin_derive::param_env(DbInterner::new_with(db, krate), def),
@@ -5268,6 +5286,7 @@ impl<'db> Type<'db> {
         );
 
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
         let ty = structurally_normalize_ty(&infcx, projection, env.param_env);
         if ty.is_ty_error() {
             None
@@ -5713,11 +5732,11 @@ impl<'db> Type<'db> {
         &self,
         db: &'db Db,
         scope: &SemanticsScope<'db>,
-        traits_in_scope: &HashSet<TraitId>,
+        traits_in_scope: &HashSet<TraitId, Global>,
         name: Option<&Name>,
         mut callback: impl FnMut(Function) -> Option<T>,
     ) -> Option<T> {
-        let _p = tracing::info_span!("iterate_method_candidates_with_traits").entered();
+        let _p = tracing::info_span!(target: "blaze", "iterate_method_candidates_with_traits").entered();
         let mut slot = None;
         self.iterate_method_candidates_split_inherent(db, scope, traits_in_scope, name, |f| {
             match callback(f) {
@@ -5751,7 +5770,7 @@ impl<'db> Type<'db> {
         &self,
         db: &'db Db,
         resolver: &Resolver<'db>,
-        traits_in_scope: &HashSet<TraitId>,
+        traits_in_scope: &HashSet<TraitId, Global>,
         f: impl FnOnce(&MethodResolutionContext<'_, 'db>) -> R,
     ) -> R {
         let module = resolver.module();
@@ -5768,6 +5787,7 @@ impl<'db> Type<'db> {
         let infcx = interner.infer_ctxt().build(typing_mode);
         let features = resolver.top_level_def_map().features();
         let environment = self.param_env(db);
+        hir_ty::comptime_env::enter_universes(&infcx, environment.param_env);
         blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
             let ctx = MethodResolutionContext {
                 infcx: &infcx,
@@ -5795,11 +5815,12 @@ impl<'db> Type<'db> {
         &self,
         db: &'db Db,
         scope: &SemanticsScope<'db>,
-        traits_in_scope: &HashSet<TraitId>,
+        traits_in_scope: &HashSet<TraitId, Global>,
         name: Option<&Name>,
         mut callback: impl MethodCandidateCallback,
     ) {
         let _p = tracing::info_span!(
+            target: "blaze",
             "iterate_method_candidates_split_inherent",
             traits_in_scope = traits_in_scope.len(),
             ?name,
@@ -5870,16 +5891,16 @@ impl<'db> Type<'db> {
         })
     }
 
-    #[tracing::instrument(skip_all, fields(name = ?name))]
+    #[tracing::instrument(target = "blaze", skip_all, fields(name = ?name))]
     pub fn iterate_path_candidates<T>(
         &self,
         db: &'db Db,
         scope: &SemanticsScope<'db>,
-        traits_in_scope: &HashSet<TraitId>,
+        traits_in_scope: &HashSet<TraitId, Global>,
         name: Option<&Name>,
         mut callback: impl FnMut(AssocItem) -> Option<T>,
     ) -> Option<T> {
-        let _p = tracing::info_span!("iterate_path_candidates").entered();
+        let _p = tracing::info_span!(target: "blaze", "iterate_path_candidates").entered();
         let mut slot = None;
 
         self.iterate_path_candidates_split_inherent(db, scope, traits_in_scope, name, |item| {
@@ -5899,16 +5920,17 @@ impl<'db> Type<'db> {
     /// In some circumstances, inherent methods methods may actually be trait methods!
     /// For example, when `dyn Trait` is a receiver, _trait_'s methods would be considered
     /// to be inherent methods.
-    #[tracing::instrument(skip_all, fields(name = ?name))]
+    #[tracing::instrument(target = "blaze", skip_all, fields(name = ?name))]
     pub fn iterate_path_candidates_split_inherent(
         &self,
         db: &'db Db,
         scope: &SemanticsScope<'db>,
-        traits_in_scope: &HashSet<TraitId>,
+        traits_in_scope: &HashSet<TraitId, Global>,
         name: Option<&Name>,
         mut callback: impl PathCandidateCallback,
     ) {
         let _p = tracing::info_span!(
+            target: "blaze",
             "iterate_path_candidates_split_inherent",
             traits_in_scope = traits_in_scope.len(),
             ?name,
@@ -5993,7 +6015,7 @@ impl<'db> Type<'db> {
         &self,
         db: &'db Db,
     ) -> impl Iterator<Item = Trait> {
-        let _p = tracing::info_span!("applicable_inherent_traits").entered();
+        let _p = tracing::info_span!(target: "blaze", "applicable_inherent_traits").entered();
         self.autoderef_(db)
             .filter_map(|ty| ty.dyn_trait())
             .flat_map(move |dyn_trait_id| hir_ty::all_super_traits(db, dyn_trait_id))
@@ -6002,7 +6024,7 @@ impl<'db> Type<'db> {
     }
 
     pub fn env_traits(&self, db: &'db Db) -> impl Iterator<Item = Trait> {
-        let _p = tracing::info_span!("env_traits").entered();
+        let _p = tracing::info_span!(target: "blaze", "env_traits").entered();
         let env = self.param_env(db);
         self.autoderef_(db)
             .filter(|ty| matches!(ty.kind(), TyKind::Param(_)))
@@ -6104,7 +6126,7 @@ impl<'db> Type<'db> {
             interner: DbInterner<'db>,
             owner: TypeOwnerId,
             callback: F,
-            visited: HashSet<Ty<'db>>,
+            visited: HashSet<Ty<'db>, Global>,
         }
         impl<'db, F> TypeVisitor<DbInterner<'db>> for Visitor<'db, F>
         where
@@ -6133,7 +6155,7 @@ impl<'db> Type<'db> {
             interner: DbInterner::new_no_crate(db),
             owner: self.owner,
             callback,
-            visited: HashSet::default(),
+            visited: HashSet::new_in(Global),
         };
         self.ty.skip_binder().visit_with(&mut visitor);
     }
@@ -6186,7 +6208,7 @@ impl<'db> Type<'db> {
     }
 
     /// Returns unique `GenericParam`s contained in this type.
-    pub fn generic_params(&self, db: &'db Db) -> HashSet<GenericParam> {
+    pub fn generic_params(&self, db: &'db Db) -> HashSet<GenericParam, Global> {
         hir_ty::collect_params(&self.ty.skip_binder())
             .into_iter()
             .map(|id| TypeOrConstParam { id }.split(db).either_into())
@@ -6203,6 +6225,7 @@ impl<'db> Type<'db> {
         let env = self.param_env(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
         hir_ty::drop::has_drop_glue(&infcx, self.ty.skip_binder(), env.param_env)
     }
 }

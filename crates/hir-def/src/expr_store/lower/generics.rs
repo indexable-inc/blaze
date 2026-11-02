@@ -8,21 +8,22 @@ use hir_expand::name::{AsName, Name};
 use intern::sym;
 use la_arena::Arena;
 use syntax::{
-    AstPtr, ast as tag,
+    AstPtr, SyntaxNodePtr, ast as tag,
     view::{self as ast, HasName, HasTypeBounds},
 };
 
 use crate::{
     GenericDefId, TypeOrConstParamId, TypeParamId,
     expr_store::{
-        ListMark, TypePtr,
+        ComptimeForm, ListMark, TypePtr,
         lower::{ExprCollector, LifetimeBoundScope, NamedLifetimeStore},
         path::{Names, UseArgs},
     },
     hir::{
         columns::len,
         generics::{
-            ConstParamData, GenericParams, LifetimeBoundType, LifetimeParamData,
+            BinderParamData, BinderParams, ConstParamData, GenericParams, LifetimeBoundType,
+            LifetimeParamData,
             TypeOrConstParamData, TypeParamData, TypeParamProvenance, WherePredicate,
         },
     },
@@ -75,7 +76,12 @@ impl ImplTraitLowering<'_> {
                 }));
                 let type_ref = ec.alloc_type_ref(param_id, ptr);
                 where_predicates.extend(ec.store.drain_bounds(bounds).map(|bound| {
-                    WherePredicate::TypeBound { lifetimes: None, target: type_ref, bound }
+                    WherePredicate::TypeBound {
+                        lifetimes: None,
+                        binder: BinderParams::EMPTY,
+                        target: type_ref,
+                        bound,
+                    }
                 }));
                 type_ref
             }
@@ -87,6 +93,7 @@ pub(crate) struct GenericParamsCollector {
     type_or_consts: Arena<TypeOrConstParamData>,
     lifetimes: Arena<LifetimeParamData>,
     where_predicates: Vec<WherePredicate>,
+    binder_params: Arena<BinderParamData>,
     parent: GenericDefId,
 }
 
@@ -96,6 +103,7 @@ impl GenericParamsCollector {
             type_or_consts: Default::default(),
             lifetimes: Default::default(),
             where_predicates: Default::default(),
+            binder_params: Default::default(),
             parent,
         }
     }
@@ -144,17 +152,20 @@ impl GenericParamsCollector {
     }
 
     pub(crate) fn finish(self) -> GenericParams {
-        let Self { mut lifetimes, mut type_or_consts, where_predicates, parent: _ } = self;
+        let Self { mut lifetimes, mut type_or_consts, where_predicates, mut binder_params, parent: _ } =
+            self;
         let early_bound_lifetimes_len =
             lifetimes.iter().filter(|(_, lt)| lt.is_early_bound()).count();
 
         lifetimes.shrink_to_fit();
         type_or_consts.shrink_to_fit();
+        binder_params.shrink_to_fit();
         GenericParams {
             early_bound_lifetimes_len,
             type_or_consts,
             lifetimes,
             where_predicates: where_predicates.into_boxed_slice(),
+            binder_params,
         }
     }
 
@@ -246,11 +257,50 @@ impl GenericParamsCollector {
                             },
                         ))
                     });
+                let binder = match pred.for_binder().and_then(|it| it.generic_param_list()) {
+                    Some(param_list) => self.lower_binder_params(ec, param_list),
+                    None => BinderParams::EMPTY,
+                };
                 for bound in pred.type_bound_list().iter().flat_map(|l| l.bounds()) {
-                    self.lower_type_bound_as_predicate(ec, bound, lifetimes, target);
+                    self.lower_type_bound_as_predicate(ec, bound, lifetimes, binder, target);
                 }
             }
         });
+    }
+
+    /// The type parameters of a where predicate's `for<..>` binder (`for<F: Field<T>>`), with
+    /// `#![feature(blaze_comptime)]`. Without it a bounded one is the `ComptimeWithoutFeature`
+    /// error and an unbounded one is left out, as before the feature.
+    fn lower_binder_params(
+        &mut self,
+        ec: &mut ExprCollector<'_>,
+        param_list: ast::GenericParamList<'_>,
+    ) -> BinderParams {
+        let start = len(self.binder_params.len());
+        for generic_param in param_list.generic_params() {
+            let ast::GenericParam::TypeParam(type_param) = generic_param else { continue };
+            if !ec.check_cfg(generic_param) {
+                continue;
+            }
+            let bounded = type_param.type_bound_list().is_some_and(|l| l.bounds().next().is_some());
+            if !ec.features().blaze_comptime {
+                if bounded {
+                    let node = SyntaxNodePtr::from(AstPtr::<tag::TypeParam>::of(type_param));
+                    ec.comptime_enabled(node, ComptimeForm::BinderBound);
+                }
+                continue;
+            }
+            let name = type_param.name().map_or_else(Name::missing, |it| it.as_name());
+            let bounds = type_param
+                .type_bound_list()
+                .iter()
+                .flat_map(|l| l.bounds())
+                .map(|bound| ec.lower_type_bound(bound, &mut ImplTraitLowering::Error))
+                .filter(|bound| !matches!(bound, TypeBound::Error))
+                .collect(); // alloc: a signature's binder parameter, kept with its generics
+            self.binder_params.alloc(BinderParamData { name, bounds });
+        }
+        BinderParams { start, len: len(self.binder_params.len()) - start }
     }
 
     fn lower_bounds(
@@ -260,7 +310,7 @@ impl GenericParamsCollector {
         target: Either<TypeRefId, LifetimeRefId>,
     ) {
         for bound in type_bounds.iter().flat_map(|type_bound_list| type_bound_list.bounds()) {
-            self.lower_type_bound_as_predicate(ec, bound, None, target);
+            self.lower_type_bound_as_predicate(ec, bound, None, BinderParams::EMPTY, target);
         }
     }
 
@@ -269,13 +319,14 @@ impl GenericParamsCollector {
         ec: &mut ExprCollector<'_>,
         bound: ast::TypeBound<'_>,
         hrtb_lifetimes: Option<Names>,
+        binder: BinderParams,
         target: Either<TypeRefId, LifetimeRefId>,
     ) {
         let bound = ec.lower_type_bound(bound, &mut self.argument_impl_trait());
         let predicate = match (target, bound) {
             (_, TypeBound::Error | TypeBound::Use(_)) => return,
             (Either::Left(type_ref), bound) => {
-                WherePredicate::TypeBound { lifetimes: hrtb_lifetimes, target: type_ref, bound }
+                WherePredicate::TypeBound { lifetimes: hrtb_lifetimes, binder, target: type_ref, bound }
             }
             (Either::Right(lifetime), TypeBound::Lifetime(bound)) => {
                 WherePredicate::Lifetime { target: lifetime, bound }

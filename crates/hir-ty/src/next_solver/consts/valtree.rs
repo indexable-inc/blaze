@@ -238,6 +238,10 @@ impl<'db> Reader<'_, 'db> {
             TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::UnionId(_)) => {
                 Err(ValTreeCreationError::NonSupportedType(ty))
             }
+            // A `#[blaze::bits]` struct's fields have no bytes of their own to branch on.
+            TyKind::Adt(..) if crate::layout::bits_struct_of(self.interner.db, ty).is_some() => {
+                Err(ValTreeCreationError::NonSupportedType(ty))
+            }
             TyKind::Adt(def, args) => {
                 let db = self.interner.db;
                 let layout = self.layout(ty)?;

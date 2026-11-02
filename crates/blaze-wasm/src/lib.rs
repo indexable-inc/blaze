@@ -160,6 +160,9 @@ fn policy(toolchain: Toolchain) -> Policy {
         fold: true,
         sanitize: Sanitize::default(),
         pgo: Pgo::None,
+        proc_macro_bridge: false,
+        report: false,
+        heap_to_stack: false,
     }
 }
 
@@ -347,7 +350,7 @@ impl Compiler {
 
         let backends = Backends::default();
         let built = driver::Build::new(&backends, &frontend, &policy, &self.memo)
-            .run_with_statics(&asked, &roots.statics, &self.store)
+            .run_with_statics(&asked, &roots.statics, &roots.check_roots(origin), &self.store)
             .map_err(|errors| errors.into_iter().map(|it| it.what).collect::<Vec<_>>().join("\n"))?;
         let side = frontend.link_inputs(&built).map_err(|it| it.what)?;
         let codegen = start.elapsed() - listing;

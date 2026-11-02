@@ -16,6 +16,7 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 blaze-hash.workspace = true
+blaze-serde.workspace = true
 serde = { workspace = true, features = ["derive"] }
 blaze-format.workspace = true
 blaze-ids.workspace = true

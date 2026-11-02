@@ -56,7 +56,7 @@ impl ModDir {
     fn child_depth(&self) -> Option<u32> {
         let depth = self.depth + 1;
         if depth as usize > MOD_DEPTH_LIMIT {
-            tracing::error!("MOD_DEPTH_LIMIT exceeded");
+            tracing::error!(target: "blaze", "MOD_DEPTH_LIMIT exceeded");
             cov_mark::hit!(circular_mods);
             return None;
         }

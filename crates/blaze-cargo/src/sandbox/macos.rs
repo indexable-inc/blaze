@@ -57,6 +57,7 @@ use std::{
 };
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_usercode::trace::Seen;
 
 use super::{Also, Recorder, Spec, tidy};
@@ -697,7 +698,7 @@ fn still_runs(pid: libc::pid_t) -> bool {
 fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
     // Once per run, as it ends: the programs it ran, by reference.
     let mut ran = Vec::with_capacity(64);
-    let mut loaded = HashSet::default();
+    let mut loaded = HashSet::new_in(Global);
     let mut lost = None;
     for piece in raw.split_inclusive('\n') {
         let Some(line) = piece.strip_suffix('\n') else {

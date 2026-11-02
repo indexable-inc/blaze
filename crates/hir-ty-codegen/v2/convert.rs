@@ -461,7 +461,7 @@ fn reloc_target(
             // alloc: an error
             Err(format!("a relocation in the unknown namespace {namespace}"))
         }
-        RelocName::LibCall(libcall) => resolve.symbol(libcall_name(libcall)?),
+        RelocName::LibCall(libcall) => resolve.symbol(libcall_name(libcall)),
         RelocName::Known(symbol) => {
             // alloc: an error
             Err(format!("a relocation at the linker's {symbol:?}, which v2 has no target for"))

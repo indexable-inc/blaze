@@ -189,7 +189,7 @@ store:
 
     fn machinery() -> Machinery {
         let optimization = Optimization { passes: Passes::None, selection: Selection::Fast };
-        Machinery::new(Machine::create(optimization).unwrap())
+        Machinery::new(Machine::create(crate::Target::x86_64_linux(), optimization).unwrap())
     }
 
     fn parsed<'ctx>(context: &'ctx Context, machinery: &Machinery) -> Module<'ctx> {
@@ -289,8 +289,9 @@ store:
     fn a_function_with_its_sanitizer_off_is_not_marked() {
         let all = Sanitizers::ADDRESS.union(Sanitizers::THREAD);
         let text = instrumented(&of(all), Sanitizers::ADDRESS);
-        assert!(!text.contains("sanitize_address") && !own(&text).contains("__asan_"), "{text}");
-        assert!(text.contains("sanitize_thread") && own(&text).contains("__tsan_"), "{text}");
+        // The attribute, not the module's `nosanitize_address` flag the passes add.
+        assert!(!text.contains(" sanitize_address") && !own(&text).contains("__asan_"), "{text}");
+        assert!(text.contains(" sanitize_thread") && own(&text).contains("__tsan_"), "{text}");
         let off = Sanitizers::ADDRESS.union(Sanitizers::COVERAGE);
         let text = instrumented(&Sanitize { sanitizers: Sanitizers::ADDRESS, ..fuzzing(3) }, off);
         assert!(text.contains("nosanitize_coverage"), "{text}");
@@ -315,10 +316,6 @@ store:
     /// its blocks, the entry first.
     #[test]
     fn the_pc_table_reads_back() {
-        let target = crate::Target::selected().unwrap();
-        if target.object_format == crate::ObjectFormat::Coff {
-            return;
-        }
         let context = Context::create();
         let machinery = machinery();
         let module = parsed(&context, &machinery);
@@ -326,8 +323,8 @@ store:
         mark(&context, module.get_function(OWN).unwrap(), &sanitize, Sanitizers::NONE);
         instrument(&module, &machinery, &sanitize).unwrap();
         let object = machinery.write_to_memory_buffer(&module, FileType::Object).unwrap();
-        let isa = crate::target().unwrap();
-        let mut wants = crate::fragment::Wants::new(&**isa);
+        let isa = crate::isa_for(crate::Target::x86_64_linux()).unwrap();
+        let mut wants = crate::fragment::Wants::new(crate::Target::x86_64_linux(), &**isa);
         let signature = cranelift_codegen::ir::Signature::new(isa.default_call_conv());
         let (code, covered) =
             super::super::emitted::read_covered(object.as_slice(), (OWN, signature.clone()), &mut wants)
@@ -339,7 +336,7 @@ store:
         assert!(covered.pcs[1..].iter().all(|&(at, flags)| at > 0 && flags == 0), "{covered:?}");
         assert!(covered.pcs.iter().all(|&(at, _)| (at as usize) < code.bytes.len()));
         // Read without coverage, the same object is refused.
-        let mut wants = crate::fragment::Wants::new(&**isa);
+        let mut wants = crate::fragment::Wants::new(crate::Target::x86_64_linux(), &**isa);
         let plain = super::super::emitted::read(object.as_slice(), &[(OWN, signature)], &mut wants).unwrap();
         assert!(plain[0].is_err());
     }

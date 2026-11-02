@@ -86,6 +86,7 @@ impl MirLowerError<'_> {
             MirLowerError::UnknownIntrinsic(name) => {
                 writeln!(f, "{}", hir_ty::intrinsic::UnknownIntrinsic(name.clone()))?
             }
+            MirLowerError::ComptimeUnexpanded(it) => writeln!(f, "{it}")?,
             MirLowerError::LayoutError(_)
             | MirLowerError::IncompleteExpr
             | MirLowerError::IncompletePattern
@@ -226,6 +227,7 @@ impl MirEvalError<'_> {
             | MirEvalError::InternalError(_)
             | MirEvalError::MachineStop
             | MirEvalError::InvalidVTableId(_) => writeln!(f, "{err:?}")?,
+            MirEvalError::ComptimeUnexpanded(it) => writeln!(f, "{it}")?,
         }
         Ok(())
     }

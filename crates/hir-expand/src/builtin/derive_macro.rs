@@ -338,6 +338,19 @@ fn attr_words_have_view(attr: view::Attr<'_>, head: &str, skip: &[&str], word: &
     false
 }
 
+/// Whether `attr` is `#[blaze::bits]` or `#[blaze::bits(uN)]`: its path exactly the two
+/// segments `blaze::bits`, as hir-def's `is_blaze_bits` reads it (`#[blaze::other(bits)]` is
+/// not).
+fn is_blaze_bits(attr: view::Attr<'_>) -> bool {
+    let Some(path) = attr.path() else { return false };
+    let name_is = |name: Option<view::NameRef<'_>>, want: &str| {
+        name.is_some_and(|it| it.text().strip_prefix("r#").unwrap_or(it.text()) == want)
+    };
+    name_is(path.qualifier().and_then(|it| it.as_single_name_ref()), "blaze")
+        && name_is(path.segment().and_then(|it| it.name_ref()), "bits")
+        && path.segment().is_some_and(|it| it.generic_arg_list().is_none())
+}
+
 /// Whether one of the item's `#[derive]`s lists `Copy`.
 fn derives_copy(adt: view::Adt<'_>) -> bool {
     adt.attrs().any(|attr| attr_words_have_view(attr, "derive", &[], "Copy"))
@@ -855,7 +868,11 @@ fn parse_adt_from_syntax(
     if let Some(kind) = struct_fields {
         variants.push(Variant { name: name_token.clone(), kind, start: 0, end: len_u32(fields.len()) }); // clone: a copy (symbol and span)
     }
-    let packed = adt.attrs().any(|attr| attr_words_have_view(attr, "repr", &["r"], "packed"));
+    // A `#[blaze::bits]` struct's fields have no address either, so its derives copy them
+    // out the way a packed struct's do (they must be `Copy`).
+    let packed = adt
+        .attrs()
+        .any(|attr| attr_words_have_view(attr, "repr", &["r"], "packed") || is_blaze_bits(attr));
     Ok(BasicAdtInfo {
         name: name_token,
         shape: AdtShape { kind, variants, fields },
@@ -1583,10 +1600,19 @@ fn hash_derive<'f>(
                     delimited(b, tt::DelimiterKind::Brace, span, |b| {
                         for i in v.fields() {
                             let bound = &selfs[i];
+                            // The binding is the field's reference, as rustc's `__self_0` is, so
+                            // `Self` is the field's type and no `impl Hash for &T` is needed; a
+                            // packed struct's field is a copy out of it, hashed by reference.
                             in_group(b, span, |b| {
-                                quote_into!(b, span =>
-                                    #krate::hash::Hash::hash(&#bound, ra_expand_state);
-                                )
+                                if adt.packed {
+                                    quote_into!(b, span =>
+                                        #krate::hash::Hash::hash(&#bound, ra_expand_state);
+                                    )
+                                } else {
+                                    quote_into!(b, span =>
+                                        #krate::hash::Hash::hash(#bound, ra_expand_state);
+                                    )
+                                }
                             });
                         }
                     })

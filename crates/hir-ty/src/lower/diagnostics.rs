@@ -37,9 +37,39 @@ pub enum TyLoweringDiagnostic {
     /// A trait object whose bounds are only relaxed ones (`dyn ?Sized`), at the first:
     /// E0224. A `dyn` with no trait written at all is the parser's.
     ObjectWithoutTrait { source: TypeRefId },
+    /// A where predicate whose `for<..>` binder has type parameters (`for<F: Field<T>>`,
+    /// `#![feature(blaze_comptime)]`) in a form not lowered yet, at `source` (the bound or the
+    /// bounded type): a parameter bound other than exactly one `core::reflect::Field<C>` or
+    /// `Variant<C>` (filters), a `const`/`[const]` bound, generic arguments on the parameter or
+    /// its associated type, or an associated type of a supertrait with parameters. It makes no
+    /// clause (`docs/v2/plan/design/comptime.md`).
+    ComptimeBinderNotYetSupported { source: TypeRefId },
     /// The pattern of the pattern type `source` (`#![feature(pattern_types)]`), or one of its
     /// `|` alternatives, which is not lowered for `reason`.
     PatternTypeNotLowered { source: TypeRefId, reason: PatternTypeUnsupported },
+    /// Computing `query` of `def` needed itself: E0391 (rustc's cycle error of that query).
+    /// Each item in the cycle reports one, naming itself, so the errors of one cycle name
+    /// every item in it.
+    QueryCycle { def: GenericDefId, query: CycleQuery },
+}
+
+/// The query of `def` whose computation needed itself, in a [`TyLoweringDiagnostic::QueryCycle`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum CycleQuery {
+    /// Every where clause of the item (rustc's `predicates_of`).
+    Predicates,
+    /// A trait's `Self:` bounds, its supertraits (rustc's `explicit_super_predicates_of`).
+    SuperClauses,
+    /// A trait's `Self:` bounds and those of its associated types (rustc's
+    /// `explicit_implied_predicates_of`).
+    ImpliedClauses,
+    /// A trait's supertraits, by name: a supertrait that has the trait as its own supertrait
+    /// (rustc's `explicit_super_predicates_of` again).
+    Supertraits,
+    /// The self type of an impl (rustc's `type_of`).
+    ImplSelfTy,
+    /// The trait an impl implements (rustc's `impl_trait_header`).
+    ImplTrait,
 }
 
 /// Why a pattern type's pattern is not lowered.

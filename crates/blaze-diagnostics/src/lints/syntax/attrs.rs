@@ -35,6 +35,7 @@ pub(crate) mod target;
 pub(crate) use target::Target;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use either::Either;
 use hir::{HirFileId, InFile};
 use intern::Symbol;
@@ -218,7 +219,7 @@ pub(crate) fn owners<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>>
     // alloc: empty, allocates nothing
     let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else { return Vec::new() };
     let crate_root = HirFileId::from(root);
-    let mut declared: HashMap<HirFileId, InFile<SyntaxNodePtr>> = HashMap::default();
+    let mut declared: HashMap<HirFileId, InFile<SyntaxNodePtr>, Global> = HashMap::new_in(Global);
     for module in crate::checks::modules(cx) {
         if let Some(file) = module.as_source_file_id(cx.db)
             && let Some(declaration) = module.declaration_source_view(cx.db)
@@ -229,7 +230,7 @@ pub(crate) fn owners<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>>
     // alloc: setup, once per crate: the table of the owners every attribute check reads
     let mut owners: Vec<Owner<'db>> = Vec::new();
     // A module file's inner attributes are its `mod` item's: only those are looked up.
-    let mut module_items: HashMap<InFile<SyntaxNodePtr>, usize> = HashMap::default();
+    let mut module_items: HashMap<InFile<SyntaxNodePtr>, usize, Global> = HashMap::new_in(Global);
     for tree in &walk.trees {
         for node in tree.of_kind(|kind| ast::AnyHasAttrs::can_cast(kind) || kind == SyntaxKind::MACRO_EXPR) {
             // The parser puts a macro call expression's attributes on the `MACRO_EXPR`, which has

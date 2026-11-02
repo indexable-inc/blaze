@@ -438,6 +438,36 @@ fn a_value_signed_by_a_key_not_pinned_is_refused_naming_its_key() {
     assert_eq!(world.requests().len(), 1, "a refused value is not asked for again");
 }
 
+/// S1 (round 9): a value verified across checkouts is never public (`public::fetchable`): one
+/// the cache sends, signed and whole, is refused before the store keeps it, so no build reads
+/// it after a retraction only another machine's store holds.
+#[test]
+fn a_fetched_value_verified_across_checkouts_is_refused_before_it_is_kept() {
+    let unmarked = Key(ContentId::of("blaze-global test", b"unmarked"));
+    let bytes = blaze_usercode::index::verified_value(&unmarked, b"an expansion");
+    let mut world = answered(16, move |keys| vec![(keys[0], Item::Found(signed_by(1, keys[0], Kind::Run, &bytes), bytes.clone()))]);
+    world.fetch(&[public(key(0), Kind::Run)]);
+    let why = world.refused(&key(0));
+    assert!(why.contains("verified across checkouts"), "{why}");
+    assert_eq!(world.kept(&key(0)), None, "kept, and read by the next build");
+}
+
+/// M5 (round 10): what no machine may fetch is never published either: a value verified
+/// across checkouts is refused by name before it is signed or sent (`public::fetchable`).
+#[test]
+fn a_value_verified_across_checkouts_is_refused_before_it_is_published() {
+    let mut world = World::new(24);
+    let secrets = Secrets::new();
+    let unmarked = Key(ContentId::of("blaze-global test", b"unmarked"));
+    let bytes = blaze_usercode::index::verified_value(&unmarked, b"an expansion");
+    let refused = world.client.publish(&public(key(0), Kind::Run), bytes, &publisher(1), &secrets, &mut world.effects).unwrap_err();
+    assert_eq!(refused.key, key(0));
+    let why = refused.to_string();
+    assert!(why.contains(&format!("{:x}", key(0).0)) && why.contains("verified across checkouts"), "{why}");
+    world.run();
+    assert!(world.published.iter().all(|it| it.key != key(0)), "sent to the cache: {:?}", world.published);
+}
+
 #[test]
 fn a_value_whose_signature_is_damaged_is_refused() {
     let bytes = b"the value".to_vec();
@@ -595,7 +625,7 @@ fn a_cache_that_cannot_be_reached_refuses_what_was_asked() {
 #[should_panic(expected = "not shown public")]
 fn the_client_is_asked_for_no_key_not_shown_public() {
     let mut world = World::bare(17);
-    world.mine.fetch(&key(0), &mut world.client, &mut world.effects);
+    world.mine.fetch(&key(0), &mut world.client, crate::public::fetchable, &mut world.effects);
 }
 
 #[test]

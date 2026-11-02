@@ -30,6 +30,8 @@
 //!   (replace call "{e}?"))
 //! ```
 
+#![feature(allocator_api)]
+
 mod corpus;
 mod error;
 mod eval;

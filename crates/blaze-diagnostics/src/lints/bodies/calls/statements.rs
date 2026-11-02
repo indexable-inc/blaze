@@ -14,11 +14,9 @@
 //! `compiler/rustc_ast_lowering/src/expr.rs` (`lower_expr_assign`: a destructuring assignment
 //! is a `let` of `LocalSource::AssignDesugar`) (MIT or Apache-2.0).
 
-use std::sync::OnceLock;
-
 use base_db::Db;
 use hir::InFile;
-use intern::Symbol;
+use intern::{Symbol, sym};
 use hir_def::{
     AdtId, AttrDefId, EnumId, HasModule as _, Lookup as _,
     attrs::AttrFlags,
@@ -91,26 +89,6 @@ fn needs_drop<'db>(solver: &Solver<'db>, ty: Ty<'db>) -> bool {
 
 fn is_must_use(db: &Db, def: AttrDefId) -> bool {
     AttrFlags::must_use_message(db, def).is_some()
-}
-
-/// The diagnostic items these passes look for, interned once, so that a check is a pointer
-/// compare.
-struct Items {
-    result: Symbol,
-    control_flow: Symbol,
-    box_new: Symbol,
-    /// rustc's guards of a lock, which `let _ = ` drops at once.
-    sync_guards: [Symbol; 3],
-}
-
-fn items() -> &'static Items {
-    static ITEMS: OnceLock<Items> = OnceLock::new();
-    ITEMS.get_or_init(|| Items {
-        result: Symbol::intern("Result"),
-        control_flow: Symbol::intern("ControlFlow"),
-        box_new: Symbol::intern("box_new"),
-        sync_guards: ["MutexGuard", "RwLockReadGuard", "RwLockWriteGuard"].map(Symbol::intern),
-    })
 }
 
 /// Whether `id` is core's enum `name` (`Result`, `ControlFlow`): its diagnostic item, or the
@@ -254,12 +232,14 @@ fn let_underscore(b: &BodyCx<'_, '_, '_>, local: &Local, out: &mut Vec<Found>) {
         let Some(local_at) = written.get_or_insert_with(|| local.written(b)) else { return };
         let lang = lang_items(&solver);
         let lock = match ty.as_adt() {
-            Some((AdtId::EnumId(id), args)) if is_enum(b, id, items().result, lang.ResultOk) => args.type_at(0),
+            Some((AdtId::EnumId(id), args)) if is_enum(b, id, sym::Result, lang.ResultOk) => args.type_at(0),
             _ => ty,
         };
-        let is_sync_lock = lock.as_adt().is_some_and(|(adt, _)| {
-            diagnostic_item(b.db(), AttrDefId::AdtId(adt)).is_some_and(|it| items().sync_guards.contains(&it))
-        });
+        // rustc's guards of a lock, which `let _ = ` drops at once.
+        let guards = [sym::MutexGuard, sym::RwLockReadGuard, sym::RwLockWriteGuard];
+        let is_sync_lock = lock
+            .as_adt()
+            .is_some_and(|(adt, _)| diagnostic_item(b.db(), AttrDefId::AdtId(adt)).is_some_and(|it| guards.contains(&it)));
         let Some(pat_span) = b.pat_span(pat) else { continue };
         let init = if index == 0 { local.init.and_then(|it| b.expr_span(it)) } else { None };
         let drop_fn = init.as_ref().filter(|it| it.file == local_at.span.file).map(|init| {
@@ -424,10 +404,10 @@ fn ty_must_use<'db>(b: &BodyCx<'_, '_, 'db>, solver: &Solver<'db>, ty: Ty<'db>, 
                 return ty_must_use(b, solver, args.type_at(0), expr);
             }
             if let AdtId::EnumId(id) = adt {
-                if is_enum(b, id, items().result, lang.ResultOk) && uninhabited(args.type_at(1)) {
+                if is_enum(b, id, sym::Result, lang.ResultOk) && uninhabited(args.type_at(1)) {
                     return ty_must_use(b, solver, args.type_at(0), expr);
                 }
-                if is_enum(b, id, items().control_flow, lang.ControlFlowContinue) && uninhabited(args.type_at(0)) {
+                if is_enum(b, id, sym::ControlFlow, lang.ControlFlowContinue) && uninhabited(args.type_at(0)) {
                     return ty_must_use(b, solver, args.type_at(1), expr);
                 }
             }
@@ -600,7 +580,7 @@ impl LatePass for UnusedAllocation {
             return;
         }
         let Some(adjustments) = b.infer.expr_adjustment(expr) else { return };
-        if path_item(b, callee) != Some(items().box_new) {
+        if path_item(b, callee) != Some(sym::box_new) {
             return;
         }
         for adjustment in adjustments {

@@ -236,6 +236,12 @@ impl<I: Interner> FlagComputation<I> {
         if !value.bound_vars().is_empty() {
             computation.add_flags(TypeFlags::HAS_BINDER_VARS);
         }
+        // blaze: a reflected variable's container is inside the binder.
+        for var in value.bound_vars().iter() {
+            if let ty::BoundVariableKind::Reflected(var) = var {
+                computation.add_ty(var.container);
+            }
+        }
 
         f(&mut computation, value.skip_binder());
 

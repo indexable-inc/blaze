@@ -6,6 +6,7 @@ use std::sync::Arc;
 use base_db::{Crate, Db, all_crates};
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{
     DefWithBodyId, LoweringMode, expr_store::Body, nameres::demand::crate_body_owners,
     signatures::FunctionSignature,
@@ -53,7 +54,7 @@ fn served(passed: fn(DefWithBodyId) -> bool) -> (Db, Crate) {
     let mut db = fixture::db(FIXTURE).into_db();
     let dep = crate_named(&db, "dep");
     // alloc: test setup
-    let mut parts = HashMap::default();
+    let mut parts = HashMap::new_in(Global);
     // alloc: test setup
     parts.insert(dep, Arc::new(Aligned::copy_from(&bytes)) as hir_def::deps::ImageBuf);
     check_cache::set_served(&mut db, parts);

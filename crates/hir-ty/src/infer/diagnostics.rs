@@ -2,7 +2,7 @@
 //! and a wrapper around [`TyLoweringContext`] ([`InferenceTyLoweringContext`]) that replaces
 //! it and takes care of diagnostics in inference.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 
 use base_db::Db;
@@ -91,7 +91,7 @@ impl<'db, 'a, 'f> InferenceTyLoweringContext<'db, 'a, 'f> {
         diagnostics: &'a Diagnostics,
         def: ExpressionStoreOwnerId,
         generic_def: GenericDefId,
-        generics: &'a OnceCell<Generics<'db>>,
+        generics: &'a Generics<'db>,
         lifetime_elision: LifetimeElisionKind<'db>,
         allow_using_generic_params: bool,
         infer_vars: &'a mut InferenceTyLoweringVarsCtx<'a, 'db, 'f>,

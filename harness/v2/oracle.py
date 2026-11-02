@@ -67,10 +67,11 @@ import shutil
 import sys
 import tempfile
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal, cast
+from typing import Any, Literal
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -80,6 +81,10 @@ import engine  # noqa: E402
 import fixture  # noqa: E402
 import report  # noqa: E402
 from typed_input import fail, parse  # noqa: E402
+
+difference: Callable[[object, object], str | None] = getattr(blaze_cli, "difference")
+kept_passes: Callable[[str], list[str]] = getattr(blaze_cli, "kept_passes")
+test_results: Callable[[object], object] = getattr(blaze_cli, "test_results")
 
 SCRIPT = "oracle.py"
 BUILD_SECS = 1800
@@ -230,13 +235,13 @@ def compare(a: Built, b: Built, names: tuple[str, str]) -> list[str]:
             continue
         if program[0] != other[0]:
             out.append(f"{profile}: the program exits {program[0]} under {la}, {other[0]} under {lb}")
-        for stream, at in (("stdout", 1), ("stderr", 2)):
-            if program[at] != other[at]:
-                out.append(f"{profile}: the program's {stream} differs: {first_line_apart(program[at], other[at])}")
+        for stream, mine, theirs in (("stdout", program[1], other[1]), ("stderr", program[2], other[2])):
+            if mine != theirs:
+                out.append(f"{profile}: the program's {stream} differs: {first_line_apart(mine, theirs)}")
     for profile, tests in a.tests.items():
         other = b.tests.get(profile)
         if other is not None and tests != other:
-            out.append(f"{profile}: tests: {blaze_cli.difference(tests, other)}")
+            out.append(f"{profile}: tests: {difference(tests, other)}")
     for profile, files in a.outputs.items():
         other = b.outputs.get(profile, {})
         apart = sorted(n for n in set(files) | set(other) if files.get(n) != other.get(n))
@@ -318,8 +323,8 @@ class Round:
         kept_file.unlink(missing_ok=True)
         ran = self.eng.build(f"{step}: test", self.ws, env, args, command="test", timeout=BUILD_SECS)
         built.not_blazes = built.not_blazes or self.eng.not_blazes(ran)
-        kept = cast(list[str], blaze_cli.kept_passes(str(kept_file)))
-        return cast(object, blaze_cli.test_results(SimpleNamespace(returncode=ran.returncode, stdout=ran.stdout, kept=kept)))
+        kept = kept_passes(str(kept_file))
+        return test_results(SimpleNamespace(returncode=ran.returncode, stdout=ran.stdout, kept=kept))
 
     def codegen(self, env: dict[str, str]) -> dict[str, str] | None:
         if self.codegen_gap is not None:
@@ -359,7 +364,8 @@ class Round:
         found = json.loads(ran.stdout)
         stale = [f"the trace: {s['what']} {s['query']}: {s['detail']}" for s in found["stale"]]
         case = found.get("nameres")
-        for f in case["findings"] if case else []:
+        findings: list[dict[str, Any]] = case["findings"] if case else []
+        for f in findings:
             line = f"the {case['slot']} case ({case['claim']}): {f['side'].lower()}: {f['detail']}"
             if f["side"] != "Unmeasured":
                 stale.append(line)

@@ -1,0 +1,12 @@
+{
+  "old_builder": "/w/blaze-base/target/release/blaze",
+  "new_builder": "/w/blaze-v2/target/release/blaze",
+  "tree": "/w/blaze-v2",
+  "old_target": "/w/bench/layout/target-before",
+  "new_target": "/w/bench/layout/target-after",
+  "workload": "/w/bench/ripgrep",
+  "turns": [{"args": ["build"]}],
+  "scratch": "/w/bench/layout/scratch",
+  "out": "/w/bench/layout/result.json",
+  "rounds": 10
+}

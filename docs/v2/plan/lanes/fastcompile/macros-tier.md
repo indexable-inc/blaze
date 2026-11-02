@@ -1,7 +1,8 @@
 ---
-status: plan
-summary: blaze v2 lane fastcompile, change 20's second tier (crates/blaze-macro-eval/src/tier.rs and src/tier/): a proc-macro crate compiled by copy-and-patch from hir-ty-codegen's Cranelift IR and run in blaze's process, isolated as a wasm engine isolates a module. The memory model (4 GiB-aligned region, offsets as addresses, guard pages, shadow stack), the call table, the confining IR pass, externals bound to shims or refused at compile time, how the bridge's buffers cross, unwinding and faults, the policy, the cost per access, the speed of light, and the requests.
+status: superseded
+summary: blaze v2 lane fastcompile, change 20's second tier, deleted 2026-11-01 (rule proc-macros-on-wasm): a proc-macro crate compiled by copy-and-patch from hir-ty-codegen's Cranelift IR and run in blaze's process; proc macros now run as wasm32-wasip1 modules under Wasmtime.
 date: 2026-10-29
+superseded_by: ../usercode/macros.md
 ---
 # fastcompile: the compiled tier of proc macros
 

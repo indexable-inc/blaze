@@ -127,6 +127,8 @@ pub(super) fn check(asked: &Asked<'_>, shown: &str, source: &str, library: &Libr
         host: asked.host.to_owned(),
         library: stdlib::library_at(&library.commit),
         std: format!("{DIR}/std"),
+        // A check writes no file of the probe: its build directory is named, never made.
+        builds: format!("{DIR}/build"),
     };
     let view = db.open_with(View { root: tree.view }, &config.encode());
     let planned = db

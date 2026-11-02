@@ -13,6 +13,7 @@
 //! (`Span::find_ancestor_inside_same_ctxt`) (MIT or Apache-2.0).
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     AdtId, ModuleDefId,
@@ -37,7 +38,7 @@ const IGNORE: &str = "use `let _ = ...` to ignore the expression or result";
 pub(crate) struct DropForgetUseless {
     items: FnItems,
     /// The values of the arms of the body's matches visited so far that are calls.
-    arm_values: HashSet<ExprId>,
+    arm_values: HashSet<ExprId, Global>,
     /// The expression of the statement last visited, when the statement ends in `;`.
     semi_stmt: Option<ExprId>,
 }
@@ -46,7 +47,7 @@ impl Default for DropForgetUseless {
     fn default() -> DropForgetUseless {
         DropForgetUseless {
             items: FnItems::new(&[MEM_DROP, MEM_FORGET]),
-            arm_values: HashSet::default(),
+            arm_values: HashSet::new_in(Global),
             semi_stmt: None,
         }
     }

@@ -283,6 +283,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             Expr::Field { .. } | Expr::Index { .. } => true,
             // rustc's `is_place_expr`: an unsafe binder cast keeps its operand's place-ness.
             Expr::UnsafeBinderCast { expr, .. } => self.is_syntactic_place_expr(expr),
+            // A field of a place, as `Expr::Field`.
+            Expr::ReflectedField { .. } => true,
+            Expr::ComptimeFor { .. } => false,
             Expr::Call { .. }
             | Expr::MethodCall { .. }
             | Expr::Tuple { .. }
@@ -1016,6 +1019,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             Expr::UnsafeBinderCast { kind, expr, ty } => {
                 self.infer_unsafe_binder_cast(tgt_expr, kind, expr, ty, expected, is_read)
             }
+            Expr::ComptimeFor { pat, iterable, body, label } => {
+                self.infer_comptime_for(tgt_expr, pat, iterable, body, label)
+            }
+            Expr::ReflectedField { base, field } => {
+                self.infer_reflected_field(tgt_expr, base, field)
+            }
             Expr::IncludeBytes => {
                 let len = self.table.next_const_var(Span::Dummy);
                 let arr = Ty::new_array_with_const_len(self.interner(), self.types.types.u8, len);
@@ -1023,8 +1032,17 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             }
         };
         // rustc's `ExprKind::Err` is of the error type, which unifies with what it meets: a
-        // fresh variable in its place would leave its uses ambiguous (E0284).
-        let ty = if matches!(expr, Expr::Missing) { ty } else { self.insert_type_vars_shallow(ty) };
+        // fresh variable in its place would leave its uses ambiguous (E0284). So is an
+        // expression whose type is its `CoerceMany`'s where a coercion into it failed (`{}` of
+        // `fn f() -> u32`): a variable would take the expected type and hide the failure.
+        let ty = match expr {
+            Expr::Missing
+            | Expr::Block { .. }
+            | Expr::If { .. }
+            | Expr::Match { .. }
+            | Expr::Loop { .. } => ty,
+            _ => self.insert_type_vars_shallow(ty),
+        };
         // Non-block expressions whose children diverged.
         match expr {
             Expr::Block { .. }
@@ -1736,12 +1754,24 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                                 PatOrigin::LetStmt { has_else: else_branch.is_some() },
                             );
                             if let Some(expr) = else_branch {
+                                // rustc's `check_decl`: the block is checked as a block, not as an
+                                // expression, so a diverging initializer makes it `!`.
                                 let previous_diverges = this.diverges;
-                                this.infer_expr_coerce(
+                                let Expr::Block { statements, tail, label, .. } =
+                                    this.store.expr(expr)
+                                else {
+                                    unreachable!("a let-else's else is lowered to a block")
+                                };
+                                let else_ty = this.infer_block(
                                     expr,
-                                    &Expectation::HasType(this.types.types.never),
-                                    ExprIsRead::Yes,
+                                    statements,
+                                    tail,
+                                    label,
+                                    &Expectation::none(),
                                 );
+                                let else_ty = this.insert_type_vars_shallow(else_ty);
+                                this.write_expr_ty(expr, else_ty);
+                                _ = this.demand_eqtype(expr.into(), this.types.types.never, else_ty);
                                 this.diverges = previous_diverges;
                             }
                         }

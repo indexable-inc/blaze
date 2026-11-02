@@ -2536,4 +2536,33 @@ impl<FieldIdx: Idx> VariantLayout<FieldIdx> {
     pub fn has_fields(&self) -> bool {
         self.field_offsets.len() > 0
     }
+
+    /// blaze: the variant's fields by increasing offset.
+    pub fn fields_in_memory_order(&self) -> &IndexSlice<u32, FieldIdx> {
+        &self.fields_in_memory_order
+    }
+
+    /// blaze: names the fields of a variant laid out from its fields in another order by their
+    /// own indices again, as [`unpermute_fields`] says.
+    pub fn unpermute_fields(&mut self, declared: &IndexSlice<FieldIdx, FieldIdx>) {
+        unpermute_fields(&mut self.field_offsets, &mut self.fields_in_memory_order, declared);
+    }
+}
+
+/// blaze (`hir_ty::layout::field_order`): a layout made from a list of fields in which field
+/// `k` is field `declared[k]` of the type has its offsets and memory order indexed by that list;
+/// this indexes them by the type's own fields. `declared` is a permutation of the indices.
+pub fn unpermute_fields<FieldIdx: Idx>(
+    offsets: &mut IndexVec<FieldIdx, Size>,
+    in_memory_order: &mut IndexVec<u32, FieldIdx>,
+    declared: &IndexSlice<FieldIdx, FieldIdx>,
+) {
+    assert_eq!(offsets.len(), declared.len(), "a permutation of every field");
+    let laid_out = std::mem::replace(offsets, IndexVec::from_elem_n(Size::ZERO, declared.len()));
+    for (k, &field) in declared.iter_enumerated() {
+        offsets[field] = laid_out[k];
+    }
+    for field in in_memory_order.iter_mut() {
+        *field = declared[*field];
+    }
 }

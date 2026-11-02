@@ -36,10 +36,9 @@ impl std::hash::Hasher for KeyHasher {
 /// The `BuildHasher` of [`KeyHasher`], for a table built elsewhere (`hashbrown`, `with_hasher`).
 pub type BuildKeyHasher = std::hash::BuildHasherDefault<KeyHasher>;
 
-/// A map on hashes, indexed by the hash itself.
-#[expect(clippy::disallowed_types, reason = "std's map on the identity hasher")]
-pub type ByHash<K, V> = std::collections::HashMap<K, V, BuildKeyHasher>; // alloc: not SipHash: hashed by `KeyHasher`, the key's first word
+/// A map on hashes, indexed by the hash itself, in the allocator `A`, which every use names
+/// (`ByHash::new_in(frame)`).
+pub type ByHash<K, V, A> = crate::Map<K, V, BuildKeyHasher, A>;
 
-/// A set of hashes, indexed by the hash itself.
-#[expect(clippy::disallowed_types, reason = "std's set on the identity hasher")]
-pub type ByHashSet<K> = std::collections::HashSet<K, BuildKeyHasher>; // alloc: not SipHash: as above
+/// A set of hashes, indexed by the hash itself, in the allocator `A`, which every use names.
+pub type ByHashSet<K, A> = crate::Set<K, BuildKeyHasher, A>;

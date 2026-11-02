@@ -26,6 +26,7 @@ mod journal;
 use std::{mem, path::PathBuf, time::Duration};
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::{Slab, Tag as MemTag};
 
 pub use self::journal::Journal;
@@ -256,10 +257,10 @@ pub struct Sim {
     rng: Rng,
     faults: Faults,
     now: Duration,
-    files: HashMap<FileName, SimFile>,
+    files: HashMap<FileName, SimFile, Global>,
     /// Whose a file or directory is and who else can write it, where a test said it is not
     /// the user's alone ([`Sim::set_access`]).
-    access: HashMap<FileName, Access>,
+    access: HashMap<FileName, Access, Global>,
     /// Effects in flight by the tick of the virtual clock they are ready at. The clock ends
     /// some 584 years in ([`wheel::ticks`]): one due later is due at its end.
     pending: Wheel<Pending>,
@@ -277,7 +278,7 @@ pub struct Sim {
     told: Vec<Told>,
     /// What a poll left in `told`, swapped with it: both keep their room.
     later: Vec<Told>,
-    programs: HashMap<PathBuf, Program>,
+    programs: HashMap<PathBuf, Program, Global>,
     listens: Tagged<Address>,
     ends: Slab<End>,
     /// Receives waiting for bytes or a hang-up.
@@ -286,6 +287,27 @@ pub struct Sim {
     scratch: Vec<u8>,
     /// Completions told for an op that had ended when they were due.
     stale: u64,
+    /// Syncs of files under this directory never complete ([`Sim::hold_syncs`]): a disk that
+    /// stopped answering, as a hung NFS mount or a dying drive's queue does.
+    hold_syncs: Option<FileName>,
+    /// The syncs it holds, never told, each with the writes it covers as it was held; a crash
+    /// drops them as it does every op in flight.
+    held: Vec<(Effect, usize)>,
+    /// Syncs of files under this directory fail ([`Sim::fail_syncs`]): a disk that went bad.
+    fail_syncs: Option<FileName>,
+    /// Lists of this directory wait until [`Sim::release_lists`] ([`Sim::hold_lists`]).
+    hold_lists: Option<FileName>,
+    /// The lists it holds, each listed as the directory is when released.
+    held_lists: Vec<(FileName, Tag)>,
+    /// The next this many lists of this directory fail ([`Sim::fail_lists`]).
+    fail_lists: Option<(FileName, u32)>,
+    /// Writes, truncates and syncs of files under this directory each take this long
+    /// ([`Sim::slow_writes`]): a disk that is slow but moving.
+    slow: Option<(FileName, Duration)>,
+    /// Completions of writes and syncs of files under these directories, in the order told,
+    /// with the clock then ([`Sim::record`]).
+    recording: Vec<FileName>,
+    recorded: Vec<(Duration, FileName, bool)>,
 }
 
 /// A delay drawn up to the simulation's latency.
@@ -302,7 +324,7 @@ fn after_told(told: &[Told], at: Duration, a: Tag, b: Tag) -> Duration {
 }
 
 /// The file `name` of the simulated disk, made empty if it is not there.
-fn file_mut<'a>(files: &'a mut HashMap<FileName, SimFile>, name: &FileName) -> &'a mut SimFile {
+fn file_mut<'a>(files: &'a mut HashMap<FileName, SimFile, Global>, name: &FileName) -> &'a mut SimFile {
     if !files.contains_key(name) {
         // clone: once per file new to the simulated disk, its key.
         files.insert(name.clone(), SimFile::default());
@@ -316,8 +338,8 @@ impl Sim {
             rng: Rng::new(seed),
             faults,
             now: Duration::ZERO,
-            files: HashMap::default(),
-            access: HashMap::default(),
+            files: HashMap::new_in(Global),
+            access: HashMap::new_in(Global),
             pending: Wheel::new(),
             spawns: Tagged::new(RESERVE),
             ready: Vec::with_capacity(RESERVE),
@@ -326,7 +348,7 @@ impl Sim {
             disk: journal::Disk::default(),
             told: Vec::with_capacity(RESERVE),
             later: Vec::with_capacity(RESERVE),
-            programs: HashMap::default(),
+            programs: HashMap::new_in(Global),
             listens: Tagged::new(RESERVE),
             ends: match Slab::new(MAX_ENDS, MemTag::Io) {
                 Ok(ends) => ends,
@@ -336,6 +358,16 @@ impl Sim {
             // alloc: none until the first read of a file with unsynced changes.
             scratch: Vec::new(),
             stale: 0,
+            hold_syncs: None,
+            // alloc: none until a sync is held.
+            held: Vec::new(),
+            fail_syncs: None,
+            hold_lists: None,
+            held_lists: Vec::new(), // alloc: empty, allocates nothing
+            fail_lists: None,
+            slow: None,
+            recording: Vec::new(),
+            recorded: Vec::new(),
         }
     }
 
@@ -417,6 +449,13 @@ impl Sim {
     /// one in flight is not there.
     pub fn crash(&mut self) {
         self.pending.drain(|_, _| {});
+        self.held.clear();
+        self.hold_syncs = None;
+        self.fail_syncs = None;
+        self.hold_lists = None;
+        self.held_lists.clear();
+        self.fail_lists = None;
+        self.slow = None;
         self.spawns.clear();
         self.watches.clear();
         self.ending = 0;
@@ -437,6 +476,86 @@ impl Sim {
             }
             file.ops.clear();
         }
+    }
+
+    /// From now on, a sync of any file under `dir` is taken and never completes, until a crash:
+    /// what the sync covers stays unsynced. For a test of a store whose commit hangs.
+    pub fn hold_syncs(&mut self, dir: FileName) {
+        self.hold_syncs = Some(dir);
+    }
+
+    /// From now on, a list of `dir` is taken and waits, not in flight, until
+    /// [`Sim::release_lists`]: a slow walk of a large directory, for a test of what may happen
+    /// while it runs.
+    pub fn hold_lists(&mut self, dir: FileName) {
+        self.hold_lists = Some(dir);
+    }
+
+    /// The lists held so far ([`Sim::hold_lists`]).
+    pub fn lists_held(&self) -> usize {
+        self.held_lists.len()
+    }
+
+    /// Each held list answered with the directory as it is now, and lists no longer held.
+    pub fn release_lists(&mut self) {
+        self.hold_lists = None;
+        for (dir, tag) in mem::take(&mut self.held_lists) {
+            let done = self.list(&dir);
+            self.tell(tag, done, Of::Op);
+        }
+    }
+
+    /// The next `times` lists of `dir` fail, as a directory the user may not read does, until a
+    /// crash. For a test of a look that is asked again, and of one that never succeeds.
+    pub fn fail_lists(&mut self, dir: FileName, times: u32) {
+        self.fail_lists = Some((dir, times));
+    }
+
+    /// From now on, a sync of any file under `dir` fails, until a crash: what it covers stays
+    /// unsynced. For a test of a store that breaks.
+    pub fn fail_syncs(&mut self, dir: FileName) {
+        self.fail_syncs = Some(dir);
+    }
+
+    /// From now on, each write, truncate and sync of a file under `dir` completes `by` after it
+    /// is submitted, until a crash: a slow disk that still moves. For a test that a store's
+    /// commit taking long, step by step, is waited for.
+    pub fn slow_writes(&mut self, dir: FileName, by: Duration) {
+        self.slow = Some((dir, by));
+    }
+
+    /// Lets the syncs held so far go, each completing `after` from now, and holds no more: a
+    /// disk that stopped and came back.
+    pub fn release_held(&mut self, after: Duration) {
+        self.hold_syncs = None;
+        for (effect, covers) in mem::take(&mut self.held) {
+            // What it covers is what it covered as it was held, never the writes after it.
+            self.pend(after, effect, covers);
+        }
+    }
+
+    /// From now on, records each completion of a write or a sync of a file under one of
+    /// `dirs`, in the order it is told: the clock then, the file, and whether it was a sync.
+    /// For a test that two completions of one tick came in an order it means to test.
+    pub fn record(&mut self, dirs: Vec<FileName>) {
+        self.recording = dirs;
+    }
+
+    /// What [`Sim::record`] recorded so far.
+    pub fn recorded(&self) -> &[(Duration, FileName, bool)] {
+        &self.recorded
+    }
+
+    /// The syncs held so far ([`Sim::hold_syncs`]).
+    pub fn held_syncs(&self) -> usize {
+        self.held.len()
+    }
+
+    /// The virtual clock moved on by `by`, with nothing done: time a test lets pass while
+    /// nothing completes (a poll with nothing in flight never moves it). Whatever falls due
+    /// by then is told at the next poll.
+    pub fn advance(&mut self, by: Duration) {
+        self.now = self.now.saturating_add(by);
     }
 
     /// What a file holds now, synced or not.
@@ -867,7 +986,11 @@ impl Sim {
                 // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{from}: no such file"))),
             },
-            Effect::Mode { file, mode, .. } => match self.files.get_mut(&file) {
+            Effect::Seal { file, .. } if self.files.get(&file).is_some_and(|it| it.link) => {
+                // alloc: an error's message.
+                Done::Failed(IoError(format!("{file} {}", crate::SEAL_THROUGH_A_LINK)))
+            }
+            Effect::Mode { file, mode, .. } | Effect::Seal { file, mode, .. } => match self.files.get_mut(&file) {
                 Some(sim) => {
                     sim.mode = mode;
                     self.disk.attributes(&file);
@@ -892,6 +1015,10 @@ impl Sim {
                 // alloc: an error's message.
                 Done::Failed(IoError(format!("{from}: no such file")))
             }
+            Effect::Clone { from, .. } if self.files[&from].link => {
+                // alloc: an error's message.
+                Done::Failed(IoError(format!("{from} {}", crate::CLONE_THROUGH_A_LINK)))
+            }
             Effect::Clone { .. } if self.faults.no_clone => Done::Failed(IoError(
                 // alloc: an error's message.
                 "the simulated file system cannot share blocks; blaze does not copy instead"
@@ -903,13 +1030,16 @@ impl Sim {
             }
             Effect::Clone { from, to, .. } => {
                 self.copy(&from, &to);
+                // A clone is a new file's mode whatever its source's: `Effect::Clone`.
+                file_mut(&mut self.files, &to).mode = SimFile::default().mode;
                 Done::Cloned
             }
             Effect::Link { from, to, .. } => {
                 self.copy(&from, &to);
                 Done::Linked
             }
-            Effect::Stat { file, .. } => Done::Stat({
+            // A link is a file of its own length either way: the simulated disk follows none.
+            Effect::Stat { file, .. } | Effect::Lstat { file, .. } => Done::Stat({
                 let modified_ns = self.disk.mtime(&file).unwrap_or(0);
                 match self.files.get(&file) {
                     Some(it) => Some(Meta { len: it.len(), dir: false, modified_ns }),
@@ -1204,10 +1334,51 @@ impl Driver for Sim {
                 },
                 _ => {}
             }
-            let delay = match &effect {
-                Effect::Timer { after, .. } => *after,
+            let delay = match (&effect, &self.slow) {
+                (Effect::Timer { after, .. }, _) => *after,
+                (
+                    Effect::Sync { file, .. }
+                    | Effect::Write { file, .. }
+                    | Effect::WriteAt { file, .. }
+                    | Effect::Truncate { file, .. },
+                    Some((dir, by)),
+                ) if file.is_under(dir) => *by,
                 _ => self.delay(),
             };
+            if let (Effect::Sync { file, .. }, Some(dir)) = (&effect, &self.hold_syncs)
+                && file.is_under(dir)
+            {
+                let covers = self.files.get(file).map_or(0, |it| it.ops.len());
+                self.held.push((effect, covers));
+                continue;
+            }
+            if let (Effect::List { dir, tag }, Some(held)) = (&effect, &self.hold_lists)
+                && dir == held
+            {
+                // clone: the held list keeps its directory's name
+                self.held_lists.push((dir.clone(), *tag));
+                continue;
+            }
+            if let (Effect::List { dir, tag }, Some((failing, left))) = (&effect, &mut self.fail_lists)
+                && dir == failing
+                && *left > 0
+            {
+                *left -= 1;
+                // alloc: an error's message.
+                let done = Done::Failed(IoError(format!("{dir}: Permission denied (os error 13)")));
+                let tag = *tag;
+                self.tell(tag, done, Of::Op);
+                continue;
+            }
+            if let (Effect::Sync { file, tag }, Some(dir)) = (&effect, &self.fail_syncs)
+                && file.is_under(dir)
+            {
+                // alloc: an error's message.
+                let done = Done::Failed(IoError(format!("{file}: Input/output error (os error 5)")));
+                let tag = *tag;
+                self.tell(tag, done, Of::Op);
+                continue;
+            }
             let covers = match &effect {
                 Effect::Sync { file, .. } => self.files.get(file).map_or(0, |it| it.ops.len()),
                 _ => 0,
@@ -1229,6 +1400,19 @@ impl Driver for Sim {
         self.rng.shuffle(&mut ready);
         let before = out.len();
         for pending in ready.drain(..) {
+            if !self.recording.is_empty() {
+                let file = match &pending.effect {
+                    Effect::Sync { file, .. } => Some((file, true)),
+                    Effect::Write { file, .. } | Effect::WriteAt { file, .. } => Some((file, false)),
+                    _ => None,
+                };
+                if let Some((file, sync)) = file
+                    && self.recording.iter().any(|dir| file.is_under(dir))
+                {
+                    // clone: a test's record, once a completion recorded
+                    self.recorded.push((self.now, file.clone(), sync));
+                }
+            }
             let completion = self.complete(pending);
             out.push(completion);
         }
@@ -1970,7 +2154,7 @@ mod tests {
         for seed in 0..100 {
             let mut sim = Sim::new(seed, Faults::default());
             sim.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
-            let mut model: HashMap<u64, Old> = HashMap::default();
+            let mut model: HashMap<u64, Old, Global> = HashMap::new_in(Global);
             let mut conns: Vec<Conn> = Vec::new();
             let mut rng = Rng::new(seed ^ 0x5eed);
             let mut out = Vec::new();

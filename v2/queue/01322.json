@@ -6,10 +6,10 @@
     "crates/hir-ty-codegen/v2/places.rs"
   ],
   "what": "hello: 1 of 267 refused: HirStatic(StaticId(a808)) \"data the code writes to, which is no constant (`promoted_slot`)\" (hir-ty-codegen v2/places.rs:302). full list .coord-1030/b2-build/wt2-refused.txt (hello with blaze --features llvm at d38d64b4ea + 01313, refusal cap raised; 267 functions), counts wt2-causes.txt.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-10-31T16:48:55Z",
-  "updated": "2026-10-31T19:05:44Z",
-  "taken_by": null,
+  "updated": "2026-11-02T03:09:25Z",
+  "taken_by": "speed",
   "why": null,
   "source": null,
   "history": [
@@ -30,6 +30,12 @@
       "by": "coord-1030",
       "action": "reassign",
       "note": "speed -> speed: speed diagnosed it; the writable never-merged data kind spans blaze-codegen and blaze-link, no lane holds either (link lanes done, no-fallback-link told)."
+    },
+    {
+      "at": "2026-11-02T03:09:25Z",
+      "by": "speed",
+      "action": "done",
+      "note": "committed in round 13 (26a7dcfd2f); hello builds, links and runs (builder-2 wt29, 2026-10-31)"
     }
   ]
 }

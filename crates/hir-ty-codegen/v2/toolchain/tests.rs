@@ -15,7 +15,7 @@ fn runs(target: &str, flags: &[&str], runs: Runs) -> Result<Toolchain, String> {
 
 /// Whether blaze emits code for the machine the tests run on.
 fn host_is_a_target() -> bool {
-    Target::parse(Target::host()).is_ok()
+    Target::of(Target::host()).is_ok()
 }
 
 const LINUX: &str = "x86_64-unknown-linux-gnu";
@@ -41,10 +41,10 @@ fn another_blaze_build_is_another_toolchain() {
     assert!(NIGHTLY.starts_with("nightly-") && !NIGHTLY.contains(char::is_whitespace), "{NIGHTLY:?}");
     let this = build_of(&std::env::current_exe().unwrap()).unwrap();
     assert_eq!(build().unwrap(), this);
-    assert_eq!(of(LINUX, &[]).unwrap().id, id_of(&this));
+    assert_eq!(of(LINUX, &[]).unwrap().id, temporary_executable_id(&this));
     let mut other = this;
     other.0[0] ^= 1;
-    assert_ne!(id_of(&other), id_of(&this));
+    assert_ne!(temporary_executable_id(&other), temporary_executable_id(&this));
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn native_is_the_hosts_and_only_for_the_host() {
     let other = if Target::host() == LINUX { "aarch64-unknown-linux-gnu" } else { LINUX };
     let error = of(other, &["-C", "target-cpu=native"]).unwrap_err();
     assert!(error.contains("native"), "{error}");
-    if Target::parse(Target::host()).is_ok() {
+    if Target::of(Target::host()).is_ok() {
         let native = of(Target::host(), &["-C", "target-cpu=native"]).unwrap();
         let base = of(Target::host(), &[]).unwrap();
         assert!(native.features.iter().all(|it| it.starts_with('+')), "{:?}", native.features);
@@ -156,7 +156,7 @@ fn here_is_the_hosts_features_on_the_baseline_cpu() {
     assert!(here.features.is_sorted());
     assert_eq!(here.cpu, elsewhere.cpu, "the baseline CPU's name, as rustc without `-C target-cpu`");
     assert_eq!((&here.target, &here.arch, &here.id), (&elsewhere.target, &elsewhere.arch, &elsewhere.id));
-    assert_eq!(here.cpu, Target::parse(Target::host()).unwrap().cpu());
+    assert_eq!(here.cpu, Target::of(Target::host()).unwrap().cpu());
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn the_flags_win_over_where_it_runs() {
         return;
     }
     let host = Target::host();
-    let baseline = Target::parse(host).unwrap().cpu();
+    let baseline = Target::of(host).unwrap().cpu();
     let named = format!("target-cpu={baseline}");
     assert_eq!(here(&["-C", &named]).unwrap(), of(host, &["-C", &named]).unwrap());
     assert!(here(&["-C", &named]).unwrap().features.is_empty());
@@ -211,7 +211,7 @@ fn the_flags_win_over_where_it_runs() {
 }
 
 fn baseline_of(host: &str) -> &'static [&'static str] {
-    baseline(&Target::parse(host).unwrap())
+    baseline(Target::of(host).unwrap())
 }
 
 #[test]

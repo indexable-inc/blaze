@@ -1,3 +1,3 @@
 [workspace]
-members = ["default_alloc", "custom_alloc", "counter", "lib_alloc", "cfg_alloc", "trait_block", "c_main"]
+members = ["default_alloc", "custom_alloc", "counter", "lib_alloc", "cfg_alloc", "trait_block", "c_main", "tail_calls"]
 resolver = "2"

@@ -74,13 +74,13 @@ export const rules = [
 	},
 	{
 		id: "bump-allocate",
-		info: "Allocate by lifetime, never from the global heap by default: a collection that lives within one task (a query run, a codegen unit, a maintainer pass) names its allocator, `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer lifetimes use the request, revision or image allocator. A global allocation (`Vec::new`, `vec![]`, `collect` into a heap `Vec`, `Box::new`, `to_owned`) needs `// alloc: <why>` on its line. `blaze::hot_alloc` enforces this wherever `blaze::hot` is denied.",
+		info: "Allocate by lifetime, never from the global heap by default: a collection that lives within one task (a query run, a codegen unit, a maintainer pass) names its allocator, `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer lifetimes use the request, revision or image allocator. A global allocation (`Vec::new`, `vec![]`, `collect` into a heap `Vec`, `Box::new`, `to_owned`) needs `// alloc: <why>` on its line. `blaze::implicit_allocator` enforces this, warning everywhere and denied wherever `blaze::hot` is, with `blaze::hot_alloc` for what a call reaches.",
 		reason: "\"Allocate like a highly optimized game\" (Andrew, 2026-10-29, decisions.md). Andrew, 2026-10-31, on a fan-out that collected results into a heap Vec it did not need: heavily bump allocate, always give the Vec its allocator, and lint it.",
 		link: "docs/v2/plan/design/memory.md",
 	},
 	{
 		id: "standard-structures",
-		info: "One choice per need, never a hand-rolled or std stand-in: locks are `parking_lot::{Mutex, RwLock}`, held only for a field update and never across a query call; a shared map is `papaya::HashMap`; a single-owner map or set is `blaze_hash::{HashMap, HashSet}` (foldhash with a fixed seed), with `blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for persisted content IDs; results of parallel items come back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag is an atomic. On a pool thread or fiber, a wait goes through the scheduler (a key, a counter, a job), never a `Condvar`, a channel receive, `thread::sleep` or a raw `spin_loop`; elsewhere a spin is the one bounded spin-then-park helper and a delay is a deadline in the sans-IO core or a driver's timer. `BTreeMap` only where iteration order is part of the output.",
+		info: "One choice per need, never a hand-rolled or std stand-in: locks are `parking_lot::{Mutex, RwLock}`, held only for a field update and never across a query call; a shared map is `papaya::HashMap`; a single-owner map or set is `blaze_hash::{HashMap<K, V, A>, HashSet<K, A>}` (foldhash with a fixed seed, its allocator named: a frame's for a task, `Global` with a reason otherwise), with `blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for persisted content IDs; results of parallel items come back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag is an atomic. On a pool thread or fiber, a wait goes through the scheduler (a key, a counter, a job), never a `Condvar`, a channel receive, `thread::sleep` or a raw `spin_loop`; elsewhere a spin is the one bounded spin-then-park helper and a delay is a deadline in the sans-IO core or a driver's timer. `BTreeMap` only where iteration order is part of the output.",
 		reason: "Andrew, 2026-11-01: \"use the best data structure in general\", \"use proper hasher too\", parking_lot with std's Mutex denied. On macOS std's Mutex parks in the kernel with no spin; FxHash clusters on integer and pointer keys; a startup stall on 2026-11-01 was workers spinning with nothing recording why.",
 	},
 	{
@@ -178,7 +178,7 @@ export const rules = [
 	},
 	{
 		id: "worktree-per-lane",
-		info: "One uniquely named worktree per lane with its own `CARGO_TARGET_DIR`; never `git stash`.",
+		info: "One uniquely named worktree per lane; its build directory is its own under blaze's root, never in the checkout, so it needs no `CARGO_TARGET_DIR`; never `git stash`.",
 		reason: "The stash is shared by every worktree.",
 	},
 	{
@@ -193,7 +193,7 @@ export const rules = [
 	},
 	{
 		id: "clean-up-lane",
-		info: "When a lane is done, delete its worktree, target directory, ix VM and merged branch.",
+		info: "When a lane is done, delete its build directory (`blaze clean`), worktree, ix VM and merged branch.",
 	},
 	{
 		id: "credit-people",

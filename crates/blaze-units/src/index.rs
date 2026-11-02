@@ -4,13 +4,13 @@
 //! and the `config.json` at an index's root. One copy for the load (`load::source`, reading the
 //! file as served) and v1's blaze-registry (reading it through cargo's cache of it).
 
-use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::str::FromStr;
 
 use anyhow::{Context as _, bail};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_resolve::{
     DepKind, Dependency, IndexSummary, InternedString, PackageId, Platform, RustVersion, SourceId,
     Summary,
@@ -36,7 +36,7 @@ pub struct IndexEntry {
     pub deps: Vec<IndexDependency>,
     /// `features` with `features2` added, as cargo adds them. Unordered: the summary made of
     /// the entry sorts them.
-    pub features: HashMap<String, Vec<String>>,
+    pub features: HashMap<String, Vec<String>, Global>,
     /// The sha256 of the `.crate` file, in hex.
     pub checksum: String,
     pub links: Option<String>,
@@ -110,8 +110,8 @@ struct IndexPackage {
     vers: Version,
     deps: Vec<RegistryDependency>,
     #[serde(default)]
-    features: HashMap<String, Vec<String>>,
-    features2: Option<HashMap<String, Vec<String>>>,
+    features: HashMap<String, Vec<String>, Global>,
+    features2: Option<HashMap<String, Vec<String>, Global>>,
     cksum: String,
     yanked: Option<bool>,
     links: Option<String>,
@@ -233,7 +233,7 @@ pub fn parse_line(line: &[u8]) -> anyhow::Result<IndexLine> {
                 name,
                 version: vers,
                 deps: Vec::new(),
-                features: HashMap::default(),
+                features: HashMap::new_in(Global),
                 checksum: String::new(),
                 links: None,
                 rust_version,
@@ -277,7 +277,8 @@ pub struct Lines {
     raw: Vec<u8>,
     versions: Vec<Version>,
     spans: Vec<Range<usize>>,
-    parsed: Vec<OnceCell<Option<IndexLine>>>,
+    #[expect(clippy::disallowed_types, reason = "each line parsed the first time a query matches its version: per index file, not global")]
+    parsed: Vec<std::cell::OnceCell<Option<IndexLine>>>,
 }
 
 impl Lines {
@@ -297,7 +298,7 @@ impl Lines {
                 spans.push(span);
             }
         }
-        let parsed = (0..versions.len()).map(|_| OnceCell::new()).collect();
+        let parsed = (0..versions.len()).map(|_| Default::default()).collect();
         Lines { raw, versions, spans, parsed }
     }
 

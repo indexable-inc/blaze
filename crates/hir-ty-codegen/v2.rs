@@ -31,14 +31,19 @@ pub(crate) mod build;
 #[cfg(test)]
 pub(crate) mod by_id;
 pub(crate) mod convert;
+pub(crate) mod devirt;
+#[cfg(test)]
+mod edits;
 pub(crate) mod fold;
 pub(crate) mod frontend;
+pub(crate) mod global_asm;
 pub(crate) mod hashes;
 pub(crate) mod linked;
 mod lowered;
 pub(crate) mod places;
 pub(crate) mod refs;
 pub(crate) mod release;
+pub mod report;
 mod roots;
 pub(crate) mod shape;
 pub(crate) mod side;
@@ -49,12 +54,14 @@ pub(crate) mod toolchain;
 pub(crate) mod unwind;
 pub(crate) mod wasm;
 
+pub use allocator::allocations_unobserved;
 pub use backend::Backends;
 pub use frontend::{BodyChecks, Databases, HirFrontend};
+pub use global_asm::GlobalAsmObject;
 pub use hashes::ItemHashes;
 pub use linked::{LinkInputs, span_tables_of};
 pub use lowered::{Lowering, lowered};
-pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE, proc_macros as proc_macro_list};
+pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE};
 pub use toolchain::{Runs, build, select, toolchain};
 #[cfg(feature = "llvm")]
 pub use crate::llvm::pgo::Profile;
@@ -258,6 +265,13 @@ pub(crate) struct Function {
     /// The target features its code is compiled with: its unit's (`Toolchain::features`) and
     /// what its `#[target_feature(enable)]` turns on.
     pub(crate) features: crate::Features,
+    /// Its unit's target, which its toolchain names: what its code is compiled for.
+    pub(crate) target: &'static crate::Target,
+    /// Whether its code keeps every frame pointer: its unit's `Toolchain::frame_pointers`,
+    /// read where the code is made, never the process's (units of two toolchains, the
+    /// target's and its build scripts', compile side by side). Its key has it through the
+    /// unit's `Settings`.
+    pub(crate) frame_pointers: bool,
     /// Where [`release::summarize`] leaves what [`release::emit`] takes up.
     pub(crate) release: release::Kept,
     /// Whether a fold may give it another function's code: not where its address is
@@ -326,7 +340,7 @@ pub(crate) enum DataPlace {
 
 /// A crate the build compiles for its build scripts and proc macros, not for the program.
 #[derive(Default, Debug)]
-pub struct BuildTime(pub blaze_hash::HashSet<Crate>);
+pub struct BuildTime(pub blaze_hash::HashSet<Crate, std::alloc::Global>);
 
 /// The error of `unit`, saying `what`.
 pub(crate) fn failed(unit: &Unit, what: impl std::fmt::Display) -> CodegenError {
@@ -352,6 +366,22 @@ impl std::fmt::Display for Named<'_> {
 }
 
 impl std::fmt::Debug for Named<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+/// A static as an error names it: by its path.
+pub(crate) struct StaticNamed<'a>(pub(crate) &'a Db, pub(crate) StaticId);
+
+impl std::fmt::Display for StaticNamed<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let StaticNamed(db, id) = *self;
+        write!(f, "the static `{}`", blaze_items::key::path(db, blaze_items::ItemId::Static(id)))
+    }
+}
+
+impl std::fmt::Debug for StaticNamed<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)
     }

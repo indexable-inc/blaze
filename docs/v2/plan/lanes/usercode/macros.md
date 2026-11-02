@@ -1,9 +1,30 @@
 ---
 status: plan
-summary: How blaze v2 expands proc macros (warm sandboxed servers and wasm modules, until change 20's evaluator replaces both), keys and keeps the expansions, and what it does to be the fastest.
-date: 2026-10-29
+summary: How blaze v2 expands proc macros (a wasm32-wasip1 module under Wasmtime behind the proc_macro bridge, the MIR evaluator as its reference), keys and keeps the expansions, and what it does to be the fastest.
+date: 2026-11-01
 ---
 # Proc macros
+
+2026-11-02 (lane pm-wasm): `-Z wasm-macros` builds every proc-macro crate as a WASI reactor
+with the glue and runs each expansion in it; the corpus workspace's serde_derive,
+thiserror-impl, tokio-macros and corpus-macros expand in wasm, and a panicking call fails only
+its own expansion. Not done: the host's WASI files (`path_open`, `fd_read` and the rest under
+the root fd, onto the evaluator's `os/files.rs` so reads stay keyed), `tests/wasm.rs` run
+against a real build (its plan's build-script outputs sit at the virtual `/s/build`), and the
+flip of the default (`macro_wasm` in `crates/blaze-units/src/load.rs`).
+
+2026-11-01 (rule `proc-macros-on-wasm`): the wasm host is back, inside `blaze-macro-eval`
+(`src/wasm.rs`, `src/wasm/`), and the copy-and-patch tier (`src/tier.rs`, `src/tier/`,
+`blaze-mem`'s `vm`) is deleted. A macro's module speaks the pinned bridge to the same server
+the evaluator's client does (`src/wire.rs`; a `usize` is eight bytes from every client). Its imports are the
+bridge's shims and WASI preview 1 (`src/wasm/abi.rs`); any other import is refused at load,
+naming the crate and the import. Each expansion is a fresh instance under a fuel budget,
+traced as the evaluator traces (`src/wasm/wasi.rs`), and the module's machine code is kept in
+the store under its id and Wasmtime's (`src/wasm/code.rs`). The evaluator stays for const eval
+and as the reference: `tests/wasm.rs` holds every serde and thiserror call of the corpus to
+the same tokens both ways. Not done: blaze building the module (a wasm32 macro kind in the unit
+graph, the crate linked as a WASI reactor with `guest/entry.rs`), so `compile.rs` loads every
+macro on the evaluator until then. The user-facing account is [docs/cargo.md](../../../../cargo.md#proc-macros-as-webassembly).
 
 2026-10-30: the wasm host (`blaze-macro-wasm`), `blaze-wasi`, rust-analyzer's server
 (`proc-macro-srv`, `proc-macro-srv-cli`) and `proc-macro-api`'s client are deleted; every proc macro
@@ -38,7 +59,20 @@ An expansion is a run of user code: `RunKey { code, given }`, found and kept thr
 - `code` is the content ID of the library (a server) or of the module's bytes (wasm).
 - `given` holds the name, the kind, the proc-macro ABI, the toolchain (a server), the input and
   attribute tokens with spans relative to the call, the directory, and the crate's variables.
-- The result is keyed by what the run was traced reading:
+  The directory and the variables' values are written against the calling crate's roots (its
+  `CARGO_MANIFEST_DIR` and `OUT_DIR`, `proc_macro_api::kept::roots`), so the same call in
+  another checkout has the same key ([store.md](../store.md#portable-keys)). A workspace
+  member's directory is the workspace root, which is not one of an expansion's roots (no
+  variable names it, and a crate's reads are worked out again from its variables alone), so
+  its expansions are keyed by that absolute directory and are not shared between checkouts.
+- The result is keyed by what the run was traced reading, written against the same roots, and
+  kept against where its roots are; it is given to another checkout only once a second one
+  expanded it the same (`roots::verify`, [store.md](../store.md#portable-keys)). An output, a
+  read variable or a given string that still holds a root once ported, a read outside its
+  roots and the machine-wide places, or a root's links re-pointed since the memo was made
+  leave no copy to verify, so it stays here. The roots' spellings and the cargo home are worked
+  out once per calling crate and revision (`Library::kept_roots`), and made again when a keep
+  finds a root's links moved:
   - **A warm server:** the lines of the expansion's scope in the sandbox's live record. The
     server marks each scope with `access("/.blaze-test/expand-<n>")`.
   - **A wasm module:** the reads the WASI host recorded, plus each question the module asked

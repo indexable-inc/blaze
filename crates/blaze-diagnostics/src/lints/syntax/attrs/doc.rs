@@ -24,6 +24,7 @@ mod meta;
 use std::borrow::Cow;
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir::InFile;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
@@ -580,7 +581,7 @@ impl Parser<'_, '_, '_> {
         let mut any: Option<TextRange> = None;
         let mut first: Option<TextRange> = None;
         let mut has_none = false;
-        let mut seen: HashSet<Cow<'_, str>> = HashSet::default();
+        let mut seen: HashSet<Cow<'_, str>, Global> = HashSet::new_in(Global);
         for item in &list.items {
             match item {
                 Item::Lit(lit) => match lit.str() {

@@ -408,7 +408,8 @@ fn model_a_segment_chunk_is_read_whole_below_what_it_published() {
                 for n in 1..=2 {
                     let (header, payload) = record_of(n);
                     history.record(ChunkOp::Put, |_| {
-                        let (_, span) = own.write(Unit::SHARED, &header, &payload, 0);
+                        let (_, span) =
+                            own.write(Unit::SHARED, &header, &payload, 0).expect("a test record is under the bound");
                         own.keep(span);
                         None
                     });

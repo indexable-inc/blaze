@@ -1,0 +1,25 @@
+[package]
+name = "blaze-serde"
+description = "serde with blaze's own derive: the traits, the derives under the same names, and the helpers the derived impls share"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-serde-derive.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+blaze-protocol.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

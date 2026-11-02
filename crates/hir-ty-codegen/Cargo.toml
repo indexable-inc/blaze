@@ -17,6 +17,7 @@ doctest = false
 
 [dependencies]
 blaze-hash.workspace = true
+blaze-serde.workspace = true
 either.workspace = true
 hashbrown.workspace = true
 la-arena.workspace = true
@@ -42,6 +43,7 @@ hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
 hir-ty-mir.workspace = true
+hir-ty-identity.workspace = true
 hir-ty-share.workspace = true
 intern.workspace = true
 span.workspace = true
@@ -71,11 +73,17 @@ inkwell = { workspace = true, features = ["llvm23-1-prefer-static", "target-x86"
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-cas.workspace = true
+blaze-v2-proof.workspace = true
+blaze-store-check.workspace = true
+hegeltest.workspace = true
 hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [features]
 llvm = ["dep:inkwell"]
+# The LLVM producer of wasm32 code (`llvm.rs` `Machine::create_for`), for an LLVM built with
+# the WebAssembly target; the pinned one (llvm.json) is not yet.
+llvm-wasm = ["llvm", "inkwell/target-webassembly"]
 # The compiler as a WebAssembly module itself: see `crates/blaze-wasm`.
 wasm = []
 

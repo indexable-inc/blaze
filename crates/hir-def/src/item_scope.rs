@@ -12,7 +12,6 @@ use std::{
     fmt,
     hash::{BuildHasher, Hash},
     marker::PhantomData,
-    sync::{LazyLock, OnceLock},
 };
 
 use base_db::{Crate, Db};
@@ -348,6 +347,11 @@ const DEF_TYPE_ALIAS: u8 = 9;
 const DEF_MACRO2: u8 = 10;
 const DEF_MACRO_RULES: u8 = 11;
 const DEF_PROC_MACRO: u8 = 12;
+/// blaze: an `i1`..`i127` of `#![blaze::arbitrary_ints]`, its width standing in the id
+/// (one tag per width would not fit a `u8` next to the others).
+const DEF_INT_BITS: u8 = 13;
+/// blaze: a `u1`..`u127`, as [`DEF_INT_BITS`].
+const DEF_UINT_BITS: u8 = 14;
 /// A builtin type is this plus its place in [`BUILTIN_TYPES`], with no id.
 const DEF_BUILTIN: u8 = 32;
 
@@ -374,14 +378,23 @@ const BUILTIN_TYPES: [BuiltinType; 19] = [
     BuiltinType::Float(BuiltinFloat::F128),
 ];
 
-fn builtin_index(ty: BuiltinType) -> u8 {
+fn pack_builtin(ty: BuiltinType) -> (u8, Option<blaze_query::db::Id>) {
+    let width = |it: crate::builtin_type::IntWidth| Some(blaze_query::db::Id::from_u32(it.bits()));
     match ty {
-        BuiltinType::Char => 0,
-        BuiltinType::Bool => 1,
-        BuiltinType::Str => 2,
-        BuiltinType::Int(it) => 3 + it as u8,
-        BuiltinType::Uint(it) => 9 + it as u8,
-        BuiltinType::Float(it) => 15 + it as u8,
+        BuiltinType::Int(BuiltinInt::Bits(it)) => (DEF_INT_BITS, width(it)),
+        BuiltinType::Uint(BuiltinUint::Bits(it)) => (DEF_UINT_BITS, width(it)),
+        // A standard type's code is its place in `BUILTIN_TYPES`.
+        it => (DEF_BUILTIN + it.code() as u8, None),
+    }
+}
+
+fn unpack_bits(tag: u8, id: blaze_query::db::Id) -> BuiltinType {
+    let Some(width) = crate::builtin_type::IntWidth::new(id.as_u32()) else {
+        unreachable!("an arbitrary-width integer entry of width {}", id.as_u32())
+    };
+    match tag {
+        DEF_INT_BITS => BuiltinType::Int(BuiltinInt::Bits(width)),
+        _ => BuiltinType::Uint(BuiltinUint::Bits(width)),
     }
 }
 
@@ -436,7 +449,7 @@ impl PackedDef for ModuleDefId {
             ModuleDefId::StaticId(it) => (DEF_STATIC, raw(it)),
             ModuleDefId::TraitId(it) => (DEF_TRAIT, raw(it)),
             ModuleDefId::TypeAliasId(it) => (DEF_TYPE_ALIAS, raw(it)),
-            ModuleDefId::BuiltinType(it) => (DEF_BUILTIN + builtin_index(it), None),
+            ModuleDefId::BuiltinType(it) => pack_builtin(it),
             ModuleDefId::MacroId(it) => it.pack(),
         }
     }
@@ -457,6 +470,7 @@ impl PackedDef for ModuleDefId {
             DEF_STATIC => ModuleDefId::StaticId(typed(id)),
             DEF_TRAIT => ModuleDefId::TraitId(typed(id)),
             DEF_TYPE_ALIAS => ModuleDefId::TypeAliasId(typed(id)),
+            DEF_INT_BITS | DEF_UINT_BITS => ModuleDefId::BuiltinType(unpack_bits(tag, id)),
             DEF_MACRO2 | DEF_MACRO_RULES | DEF_PROC_MACRO => {
                 ModuleDefId::MacroId(MacroId::unpack(tag, Some(id)))
             }
@@ -854,11 +868,13 @@ pub struct ItemScope {
     /// Every name of the scope once, by text, as `namespace << 30 | position`: what
     /// [`ItemScope::entries`] lists. Made by the first `entries` after a name was added, and
     /// written only that once for a scope that is handed over.
-    pub(crate) sorted: OnceLock<Box<[u32]>>,
+    #[expect(clippy::disallowed_types, reason = "names sorted by text, set once per settled scope: not global")]
+    pub(crate) sorted: std::sync::OnceLock<Box<[u32]>>,
     /// The entries of the three namespaces by def, as `namespace << 30 | position` sorted by
     /// namespace, def and position: what [`ItemScope::name_of`] searches in a scope of more than
     /// [`LINEAR`] names. 4 bytes an entry, made by the first `name_of` after a def changed.
-    pub(crate) by_def: OnceLock<Box<[u32]>>,
+    #[expect(clippy::disallowed_types, reason = "entries sorted by definition, set once per settled scope: not global")]
+    pub(crate) by_def: std::sync::OnceLock<Box<[u32]>>,
 
     /// The defs declared in this scope. Each def has a single scope where it is
     /// declared.
@@ -1037,7 +1053,8 @@ impl BuiltinScope {
     }
 }
 
-pub(crate) static BUILTIN_SCOPE: LazyLock<BuiltinScope> = LazyLock::new(|| {
+#[expect(clippy::disallowed_types, reason = "the process's one builtin scope: all name resolution shares the same builtin types")]
+pub(crate) static BUILTIN_SCOPE: std::sync::LazyLock<BuiltinScope> = std::sync::LazyLock::new(|| {
     let all = BuiltinType::all_builtin_types();
     // alloc: once per process (LazyLock)
     let names: Box<[Name]> = all.iter().map(|(name, _)| *name).collect();
@@ -1227,19 +1244,20 @@ impl ItemScope {
 
     /// Builds the tables a settled scope is read by when it has more than [`LINEAR`] names, and
     /// drops them when it has fewer (a small scope scans its columns).
+    #[expect(clippy::disallowed_types, reason = "scope lookup tables, set once per settled scope: not global")]
     fn fill_tables(&mut self) {
         if self.indexed_len() <= LINEAR {
-            self.sorted = OnceLock::new();
-            self.by_def = OnceLock::new();
+            self.sorted = std::sync::OnceLock::new();
+            self.by_def = std::sync::OnceLock::new();
             return;
         }
         if self.sorted.get().is_none() {
             let table = self.sorted_table();
-            self.sorted = OnceLock::from(table);
+            self.sorted = std::sync::OnceLock::from(table);
         }
         if self.by_def.get().is_none() {
             let table = self.by_def_table();
-            self.by_def = OnceLock::from(table);
+            self.by_def = std::sync::OnceLock::from(table);
         }
     }
 
@@ -2327,6 +2345,7 @@ mod tests {
     mod budgets;
 
     use blaze_hash::{HashMap, HashSet};
+    use std::alloc::Global;
     use blaze_ids::rng::SplitMix64;
     use indexmap::map::Entry as MapEntry;
     use intern::Symbol;
@@ -2413,11 +2432,11 @@ mod tests {
         types: FxIndexMap<Name, TypesItem>,
         values: FxIndexMap<Name, ValuesItem>,
         macros: FxIndexMap<Name, MacrosItem>,
-        unresolved: HashSet<Name>,
-        use_imports_types: HashMap<ImportOrExternCrate, ImportOrDef>,
-        use_imports_values: HashMap<ImportOrGlob, ImportOrDef>,
-        use_imports_macros: HashMap<ImportOrExternCrate, ImportOrDef>,
-        legacy_macros: HashMap<Name, Vec<MacroId>>,
+        unresolved: HashSet<Name, Global>,
+        use_imports_types: HashMap<ImportOrExternCrate, ImportOrDef, Global>,
+        use_imports_values: HashMap<ImportOrGlob, ImportOrDef, Global>,
+        use_imports_macros: HashMap<ImportOrExternCrate, ImportOrDef, Global>,
+        legacy_macros: HashMap<Name, Vec<MacroId>, Global>,
     }
 
     impl Model {
@@ -2804,7 +2823,7 @@ mod tests {
     fn keyed_maps_as_a_hash_map() {
         let mut rng = SplitMix64::new(7);
         let mut keyed: Keyed<u32, u64> = Keyed::default();
-        let mut map: HashMap<u32, u64> = HashMap::default();
+        let mut map: HashMap<u32, u64, Global> = HashMap::new_in(Global);
         for step in 0..3000u64 {
             let key = rng.below(400) as u32;
             if rng.one_in(3) {
@@ -2838,7 +2857,7 @@ mod tests {
         let all = BuiltinType::all_builtin_types();
         assert_eq!(all.map(|(_, it)| it), BUILTIN_TYPES);
         for (index, (name, ty)) in all.iter().enumerate() {
-            assert_eq!(builtin_index(*ty) as usize, index);
+            assert_eq!(pack_builtin(*ty), (DEF_BUILTIN + index as u8, None));
             let expected = PerNs::types((*ty).into(), Visibility::Public, None);
             assert_eq!(BUILTIN_SCOPE.get(name).copied(), Some(expected));
         }

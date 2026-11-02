@@ -1,6 +1,7 @@
 //! The dense query engine: queries keyed by [`Id`], memos in place in pages by ID, a warm hit of
 //! four dependent loads, durability kinds, early cutoff by `==`, single flight through
-//! `blaze_graph`'s plane, fixpoint cycles, captured reads, LRU eviction, and provenance. What the front end
+//! `blaze_graph`'s plane, fixpoint cycles, captured reads, capped values evicted by W-TinyLFU
+//! admission (`admission`), and provenance. What the front end
 //! runs on (`#[blaze_query::tracked]` and the rest generate against it, see `plumbing`); the
 //! content-keyed engine of the crate root is a separate thing.
 //!
@@ -13,6 +14,7 @@
 
 use std::{fmt, panic::UnwindSafe};
 
+mod admission;
 mod capture;
 mod counts;
 mod dense;
@@ -31,7 +33,11 @@ mod tracked;
 mod value;
 mod verify;
 
-pub use capture::{Read, ReadKind, Reads, capture_reads, replay_reads, unshareable_reads};
+pub use admission::Eviction;
+pub use capture::{
+    Read, ReadKind, Reads, capture_reads, for_span_text, replay_reads, unshareable_reads,
+};
+pub use counts::{Counts, take as take_counts};
 pub use function::completed;
 pub use id::{AsId, FromId, FromIdIn, Id};
 pub use input::Setter;

@@ -46,6 +46,7 @@ use std::sync::Arc;
 
 use blaze_codegen::{Arch, CompiledFunction, InstanceKey, RelocKind, Relocs, Target};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_inproc::{CodeMemory, CodeRange};
 use blaze_lazy::runner::Placer;
 use blaze_lazy::stub::{self, Layout, Stubs};
@@ -173,7 +174,7 @@ pub struct LazyPlacer<S: Slots> {
     /// The arena code each slot runs, by the key the slot is named for: what a replacement
     /// retires.
     // HashMap: one entry per placed slot, probed once per placement.
-    placed: HashMap<InstanceKey, CodeRange>,
+    placed: HashMap<InstanceKey, CodeRange, Global>,
     scratch: Scratch,
 }
 
@@ -297,7 +298,7 @@ impl<S: Slots> LazyPlacer<S> {
             memory.store_word(at, hook.wrapping_add(slide)).map_err(|it| fail(it.what))?;
         }
         // alloc: once per run, the placer
-        Ok(LazyPlacer { image, memory, slots, slide, placed: HashMap::default(), scratch: Scratch::default() })
+        Ok(LazyPlacer { image, memory, slots, slide, placed: HashMap::new_in(Global), scratch: Scratch::default() })
     }
 
     /// The slide every run process of the memory has: one whose image is elsewhere must be

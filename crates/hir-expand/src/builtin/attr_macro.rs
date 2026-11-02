@@ -4,9 +4,12 @@ use blaze_mem::Frame;
 use intern::sym;
 use span::Span;
 
-use crate::{ExpandResult, MacroCallId, MacroCallKind, name, tt};
+use crate::{ExpandError, ExpandResult, MacroCallId, MacroCallKind, name, tt};
 
 use super::quote;
+
+mod contract_test;
+use contract_test::contract_test_expand;
 
 macro_rules! register_builtin {
     ($(($name:ident, $variant:ident) => $expand:ident),* $(,)? ) => {
@@ -86,6 +89,12 @@ register_builtin! {
     (test, Test) => dummy_gate_test_expand,
     (test_case, TestCase) => dummy_gate_test_expand,
     (define_opaque, DefineOpaque) => define_opaque_expand,
+    // Nightly's contracts (`core::contracts::{requires, ensures}`). Appended: the nameres image
+    // stores a builtin attribute by its index in `ALL`.
+    (contracts_requires, ContractsRequires) => contracts_requires_expand,
+    (contracts_ensures, ContractsEnsures) => contracts_ensures_expand,
+    // `#[blaze::contract_test]` (`core::blaze::contract_test`), appended as above.
+    (contract_test, ContractTest) => contract_test_expand,
 }
 
 pub fn find_builtin_attr(ident: &name::Name) -> Option<BuiltinAttrExpander> {
@@ -191,6 +200,193 @@ fn define_opaque_expand<'f>(
         #tt
     };
     ExpandResult::ok(result)
+}
+
+/// `#[core::contracts::requires(DECLS; COND)]`, as rustc's `rustc_builtin_macros::contracts`.
+fn contracts_requires_expand<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    id: MacroCallId,
+    tt: &tt::TopSubtree,
+    span: Span,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    contract_clause_expand(db, frame, id, tt, span, ContractClause::Requires)
+}
+
+/// `#[core::contracts::ensures(|ret| COND)]`, as rustc's `rustc_builtin_macros::contracts`.
+fn contracts_ensures_expand<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    id: MacroCallId,
+    tt: &tt::TopSubtree,
+    span: Span,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    contract_clause_expand(db, frame, id, tt, span, ContractClause::Ensures)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContractClause {
+    Requires,
+    Ensures,
+}
+
+impl ContractClause {
+    /// The attribute the clause leaves on its marker statement in the body.
+    fn marker(self) -> intern::Symbol {
+        match self {
+            ContractClause::Requires => sym::rustc_contract_requires,
+            ContractClause::Ensures => sym::rustc_contract_ensures,
+        }
+    }
+}
+
+/// The clause of a contract attribute, kept in the function's body as the marker statement
+/// `#[rustc_contract_requires] { ARGS };` (or `rustc_contract_ensures`), after the body's inner
+/// attributes and the clauses already there; hir-def's body lowering desugars it as rustc's
+/// `rustc_ast_lowering::contract` does.
+///
+/// rustc injects `contract_requires { ARGS }` into the signature, which its parser takes at most
+/// once and before at most one `contract_ensures`: a second clause of either kind, or a requires
+/// expanded after an ensures (an ensures written above it), is the parse error it is there,
+/// refused here. What rustc's expander refuses is refused here with its message; on an error the
+/// item is kept as it was, which then fails to build.
+fn contract_clause_expand<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    id: MacroCallId,
+    tt: &tt::TopSubtree,
+    span: Span,
+    clause: ContractClause,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let unchanged = || tt::TopSubtree::from_subtree_in(tt.view(), frame);
+    let fail = |msg: &str| ExpandResult::new(unchanged(), ExpandError::other(span, msg));
+    let args = match &id.loc(db).kind {
+        MacroCallKind::Attr { attr_args: Some(args), .. } if !args.token_trees().is_empty() => &**args,
+        _ => {
+            let (name, example) = match clause {
+                ContractClause::Requires => ("requires", "condition"),
+                ContractClause::Ensures => ("ensures", "|result: &T| condition"),
+            };
+            // alloc: an error's message, once per refused attribute
+            return fail(&format!(
+                "`{name}` attribute requires an argument, e.g., `#[{name}({example})]`"
+            ));
+        }
+    };
+    let is_kw = |it: &tt::TtElement<'_>, kw: &str| {
+        matches!(it, tt::TtElement::Leaf(tt::Leaf::Ident(ident)) if ident.is_raw == tt::IdentIsRaw::No && ident.sym.as_str() == kw)
+    };
+    let elements = tt.iter();
+    let mut before_fn = elements.clone();
+    let Some(fn_at) = before_fn.position(|it| is_kw(&it, "fn")) else {
+        return fail("contract annotations can only be used on functions");
+    };
+    if elements.clone().take(fn_at).any(|it| is_kw(&it, "async") || is_kw(&it, "gen")) {
+        return fail("contract annotations are not yet supported on async or gen functions");
+    }
+    // The body is the last token tree, a brace group, and there is one after the `fn`.
+    let count = elements.clone().count();
+    let body = match elements.clone().last() {
+        Some(tt::TtElement::Subtree(subtree, body))
+            if count > fn_at + 1 && subtree.delimiter.kind == tt::DelimiterKind::Brace =>
+        {
+            (subtree, body)
+        }
+        _ => return fail("contract annotations is only supported in functions with bodies"),
+    };
+    let (body_subtree, body) = body;
+
+    let punct = |char| tt::Leaf::Punct(tt::Punct { char, spacing: tt::Spacing::Alone, span });
+    let is_punct = |it: &Option<tt::TtElement<'_>>, ch: char| {
+        matches!(it, Some(tt::TtElement::Leaf(tt::Leaf::Punct(p))) if p.char == ch)
+    };
+    let mut rest = body.clone();
+    // The body's inner attributes (`#![..]`, inner doc comments) stay first.
+    let mut kept = 0;
+    loop {
+        let mut probe = rest.clone();
+        let (hash, bang, group) = (probe.next(), probe.next(), probe.next());
+        let is_inner = is_punct(&hash, '#')
+            && is_punct(&bang, '!')
+            && matches!(group, Some(tt::TtElement::Subtree(it, _)) if it.delimiter.kind == tt::DelimiterKind::Bracket);
+        if !is_inner {
+            break;
+        }
+        rest = probe;
+        kept += 3;
+    }
+    // The clauses expanded before this one: `#[rustc_contract_*] { .. };`.
+    loop {
+        let mut probe = rest.clone();
+        let hash = probe.next();
+        let marker = match probe.next() {
+            Some(tt::TtElement::Subtree(it, mut inner))
+                if is_punct(&hash, '#') && it.delimiter.kind == tt::DelimiterKind::Bracket =>
+            {
+                match (inner.next(), inner.next()) {
+                    (Some(tt::TtElement::Leaf(tt::Leaf::Ident(ident))), None)
+                        if ident.sym == sym::rustc_contract_requires
+                            || ident.sym == sym::rustc_contract_ensures =>
+                    {
+                        ident.sym
+                    }
+                    _ => break,
+                }
+            }
+            _ => break,
+        };
+        // A requires after any clause, or a second ensures, is what rustc's parser refuses.
+        if clause == ContractClause::Requires || marker == sym::rustc_contract_ensures {
+            let (name, earlier) = match (clause, marker == sym::rustc_contract_ensures) {
+                (ContractClause::Requires, true) => ("requires", "an `ensures` clause above it"),
+                (ContractClause::Requires, false) => ("requires", "a second `requires`"),
+                (ContractClause::Ensures, _) => ("ensures", "a second `ensures`"),
+            };
+            // alloc: an error's message, once per refused attribute
+            return fail(&format!(
+                "contract `{name}` attribute refused: a function takes at most one `requires` and then \
+                 at most one `ensures`, written in that order, and this one has {earlier}"
+            ));
+        }
+        let (block, semi) = (probe.next(), probe.next());
+        if !matches!(block, Some(tt::TtElement::Subtree(it, _)) if it.delimiter.kind == tt::DelimiterKind::Brace)
+            || !is_punct(&semi, ';')
+        {
+            break;
+        }
+        rest = probe;
+        kept += 4;
+    }
+
+    let mut out = tt::TopSubtreeBuilder::with_capacity(
+        tt.top_subtree().delimiter,
+        tt.token_trees().len() + args.token_trees().len() + 8,
+    );
+    let mut item = elements;
+    for _ in 0..count - 1 {
+        if let Some(view) = item.next_as_view() {
+            out.extend_with_tt(view);
+        }
+    }
+    out.open(tt::DelimiterKind::Brace, body_subtree.delimiter.open);
+    let mut body_iter = body.clone();
+    for _ in 0..kept {
+        if let Some(view) = body_iter.next_as_view() {
+            out.extend_with_tt(view);
+        }
+    }
+    out.push(punct('#'));
+    out.open(tt::DelimiterKind::Bracket, span);
+    out.push(tt::Leaf::Ident(tt::Ident { sym: clause.marker(), span, is_raw: tt::IdentIsRaw::No }));
+    out.close(span);
+    let args_delim = args.top_subtree().delimiter;
+    out.open(tt::DelimiterKind::Brace, args_delim.open);
+    out.extend_with_tt(args.token_trees());
+    out.close(args_delim.close);
+    out.push(punct(';'));
+    out.extend_with_tt(rest.remaining());
+    out.close(body_subtree.delimiter.close);
+    ExpandResult::ok(out.build_in(frame))
 }
 
 fn dummy_gate_test_expand<'f>(

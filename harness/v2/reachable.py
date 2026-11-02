@@ -63,7 +63,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -273,6 +273,11 @@ def cleaned(data: bytes, program: Path, port: int, scrub: tuple[str, ...]) -> st
     return text
 
 
+def run_table(run: object) -> dict[str, Any] | None:
+    """A `runs` entry that is a table (`{"tool": [...]}` or `{"args": [...], "stdin": ...}`), else `None`."""
+    return cast(dict[str, Any], run) if isinstance(run, dict) else None
+
+
 def run_name(run: object) -> str:
     if isinstance(run, dict):
         given = cast(dict[str, Any], run)
@@ -286,8 +291,8 @@ def behaviour(s: Subject, run: object, program: Path, ws: Path, env: dict[str, s
     """One command line of `runs`: the program's, or a tool's talking to it."""
     executable: Path | None = program
     stdin_path: Path | None = None
-    if isinstance(run, dict):
-        given = cast(dict[str, Any], run)
+    given = run_table(run)
+    if given is not None:
         if "tool" in given:
             argv, executable = filled(given["tool"], port), None
         else:
@@ -302,11 +307,12 @@ def behaviour(s: Subject, run: object, program: Path, ws: Path, env: dict[str, s
         return (f"no end in {RUN_SECS} s", "", "")
     except OSError as e:
         raise engine.Failed(f"{s.label}: `{run_name(run)}` did not start: {e}") from None
-    return (str(done.returncode), *(cleaned(out, program, port, s.scrub) for out in (done.stdout, done.stderr)))
+    return (str(done.returncode), cleaned(done.stdout, program, port, s.scrub),
+            cleaned(done.stderr, program, port, s.scrub))
 
 
 @contextlib.contextmanager
-def served(s: Subject, program: Path, ws: Path, env: dict[str, str], port: int, log: Path) -> Iterator[None]:
+def served(s: Subject, program: Path, ws: Path, env: dict[str, str], port: int, log: Path) -> Generator[None]:
     """The program served on `port` for as long as the block runs, when the entry has `serve`."""
     if s.serve is None:
         yield
@@ -488,8 +494,9 @@ def compare_symbols(a: dict[str, Symbols], b: dict[str, Symbols]) -> str | None:
             x, y = set(a[name].get(table, ())), set(b[name].get(table, ()))
             if x == y:
                 continue
+            only: tuple[tuple[Mode, set[str]], ...] = (("full", x - y), ("reached", y - x))
             how = [f"{len(names)} only in the {MODE_NAMES[mode]} build, first {', '.join(sorted(names)[:SYMBOLS_SHOWN])}"
-                   for mode, names in (("full", x - y), ("reached", y - x)) if names]
+                   for mode, names in only if names]
             lines.append(f"{name} ({table}): {'; '.join(how)}")
     if not lines:
         return None

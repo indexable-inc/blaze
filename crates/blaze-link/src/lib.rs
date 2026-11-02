@@ -26,6 +26,7 @@ mod dwarf;
 mod elf;
 mod file;
 mod intern;
+mod layout;
 mod lazy;
 mod live;
 mod macho;
@@ -62,10 +63,12 @@ use std::path::PathBuf;
 use blaze_codegen::{CompiledFunction, InstanceKey, Static, Target};
 use blaze_core::{Effect, FileName};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
 use blaze_mem::Frame;
 
+pub use layout::Heat;
 pub use lazy::{LazyPlacer, Slots};
 pub use output::{Debug, DevRun, Format, Live, Native, NativeKind, Output, OutputKind, Platform};
 pub use position::{
@@ -105,6 +108,13 @@ pub struct Change<'a> {
     pub removed_natives: Vec<ContentId>,
     /// The span side tables the positions are filled from, by anchor ([`SpanTable::encode`]).
     pub spans: Vec<(ContentId, &'a [u8])>,
+    /// A profile of the program, mapped onto its functions: a full link packs the functions
+    /// it saw run together in call order ([`Heat`], docs/v2/plan/lanes/layout/layout.md).
+    pub heat: Option<&'a Heat>,
+    /// The functions codegen inferred cold (`#[cold]`, the panic machinery, a diverging
+    /// `#[track_caller]` function): a full link puts those the heat does not name after
+    /// every other function. In any order, repeats allowed.
+    pub cold: Vec<InstanceKey>,
 }
 
 /// The output of a link, made visible only by a commit.
@@ -231,7 +241,7 @@ pub struct Image {
     writer: Formats,
     plan: Plan,
     symbols: Symbols,
-    objects: HashMap<Obj, native::Read>,
+    objects: HashMap<Obj, native::Read, Global>,
     state: State,
     history: VecDeque<Undo>,
     pending: Option<Pending>,
@@ -317,7 +327,7 @@ impl Image {
             plan,
             // alloc: error path
             symbols: Symbols::new().map_err(|error| fail(error.to_string()))?,
-            objects: HashMap::default(),
+            objects: HashMap::new_in(Global),
             state: State::new(),
             history: VecDeque::with_capacity(commit::HISTORY + 1),
             pending: None,
@@ -426,10 +436,12 @@ impl Image {
         self.stage_with(change, outside)
     }
 
-    fn stage_with<O: Outside>(&mut self, change: Change<'_>, outside: &O) -> Result<Staged, LinkError> {
+    fn stage_with<O: Outside>(&mut self, mut change: Change<'_>, outside: &O) -> Result<Staged, LinkError> {
         if self.pending.is_some() {
             return Err(LinkError { function: None, what: "a commit is in flight".into(), refusal: None });
         }
+        change.cold.sort_unstable();
+        change.cold.dedup();
         let full = !self.state.laid_out || !self.output.incremental;
         let table = has_table(&self.output, self.plan.indexed_code);
         // clone: reference counts; columns, the regions list and pages are shared until written (state.rs)
@@ -471,6 +483,7 @@ impl Image {
             sancov: [None; 4],
             frames_end: None,
             lazy: self.lazy.as_ref(),
+            layout: layout::Pass::new(change.heat, &change.cold),
         };
         stage.inputs(&change)?;
         stage.apply(&change)?;
@@ -718,6 +731,28 @@ impl Image {
     pub fn generation(&self) -> u64 {
         self.state.generation
     }
+
+    /// The image's build id as its file says it (Mach-O's `LC_UUID`, ELF's
+    /// `NT_GNU_BUILD_ID`): what a profiler records beside each sampled address, so
+    /// [`Image::functions`] of this image maps the address back to its function.
+    pub fn build_id(&self) -> [u8; 16] {
+        self.state.image_id()
+    }
+
+    /// Each Rust function's code, by address: its instance key, its address as the file
+    /// places it (a profiler's address with the load slide taken off) and its size. The
+    /// address map a profile of this image is read through (docs/v2/plan/lanes/layout/layout.md).
+    pub fn functions(&self) -> Vec<(InstanceKey, u64, u64)> {
+        // alloc: once per link that keeps an address map, which the caller writes out
+        let mut out: Vec<(InstanceKey, u64, u64)> = self
+            .state
+            .live_pieces()
+            .filter(|piece| piece.placed())
+            .filter_map(|piece| piece.function().map(|it| (it.key, piece.addr, piece.size)))
+            .collect();
+        out.sort_unstable_by_key(|it| (it.1, it.0));
+        out
+    }
 }
 
 /// The further inputs a native input names (a linker script's `INPUT`, `GROUP` objects and
@@ -827,7 +862,7 @@ fn lineage(stage: &Stage<'_>, to: &FileName) -> [u8; 16] {
     }
     let key = |it: &(u32, u32)| &bytes[it.0 as usize..(it.0 + it.1) as usize];
     let order = lineage_order(&keys, key);
-    let mut hasher = Hasher::new("blaze v2 link lineage 2");
+    let mut hasher = Hasher::new("blaze v2 link lineage 3");
     // alloc: once per image, at its first full link
     hasher.part(to.as_str().as_bytes()).part(format!("{:?}", stage.output).as_bytes());
     for (_, at) in &order {
@@ -836,6 +871,8 @@ fn lineage(stage: &Stage<'_>, to: &FileName) -> [u8; 16] {
     for input in stage.new.inputs.iter() {
         hasher.id(&input.id);
     }
+    // The order functions are in: the profile and the cold set it came from.
+    hasher.id(&stage.layout.id());
     let id = hasher.finish();
     let mut out = [0; 16];
     out.copy_from_slice(&id.0[..16]);

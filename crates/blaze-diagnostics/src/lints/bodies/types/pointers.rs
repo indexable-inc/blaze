@@ -20,6 +20,7 @@ use std::ops::ControlFlow;
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir::{InFile, db::HirDatabase};
 use hir_def::{
     DefWithBodyId, FunctionId, HasModule, Lookup,
@@ -29,7 +30,7 @@ use hir_def::{
 };
 use hir_expand::attrs::{AstPathExt as _, expand_cfg_attr_view};
 use hir_ty::{ParamEnvAndCrate, next_solver::Ty};
-use intern::Symbol;
+use intern::{Symbol, sym};
 use syntax::view::{self as ast, AstNode, HasAttrs};
 
 use super::util;
@@ -91,7 +92,9 @@ pub(super) struct LayoutFacts {
 /// rustc's `layout_of` of `ty`, when it can be computed (not of a type parameter's size).
 pub(super) fn layout<'db>(b: &BodyCx<'_, '_, 'db>, ty: Ty<'db>) -> Option<LayoutFacts> {
     let db = b.db();
-    let env = ParamEnvAndCrate { param_env: db.trait_environment(b.owner.generic_def(db)), krate: b.owner.krate(db) };
+    // With what the body's `for const` loops assume of their binders, as inference had it.
+    let param_env = b.infer.comptime_param_env(db.trait_environment(b.owner.generic_def(db)));
+    let env = ParamEnvAndCrate { param_env, krate: b.owner.krate(db) };
     let layout = db.layout_of_ty(ty.store(), env.store()).ok()?;
     Some(LayoutFacts {
         size: layout.size.bytes(),
@@ -113,11 +116,11 @@ pub(super) fn is_zero(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
 #[derive(Default)]
 pub(super) struct Inits {
     owner: Option<DefWithBodyId>,
-    map: HashMap<BindingId, ExprId>,
+    map: HashMap<BindingId, ExprId, Global>,
 }
 
 impl Inits {
-    pub(super) fn of(&mut self, b: &BodyCx<'_, '_, '_>) -> &HashMap<BindingId, ExprId> {
+    pub(super) fn of(&mut self, b: &BodyCx<'_, '_, '_>) -> &HashMap<BindingId, ExprId, Global> {
         if self.owner != Some(b.owner) {
             self.owner = Some(b.owner);
             self.map.clear();
@@ -152,7 +155,7 @@ impl Inits {
 
 /// rustc's `LateContext::expr_or_init`: through blocks, and from a path to a local binding to
 /// what initialized it, while there is one.
-pub(super) fn expr_or_init(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, ExprId>, expr: ExprId) -> ExprId {
+pub(super) fn expr_or_init(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, ExprId, Global>, expr: ExprId) -> ExprId {
     let mut expr = util::peel_blocks(b, expr);
     while let Expr::Path(_) = b.store().expr(expr)
         && let Some(ValueNs::LocalBinding(id)) = util::path_value(b, expr)
@@ -166,7 +169,7 @@ pub(super) fn expr_or_init(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, Ex
 /// rustc's `peel_casts`: through blocks, `as` casts, `.cast()`, `.cast_mut()`, `.cast_const()`,
 /// `ptr::from_ref`, `UnsafeCell::raw_get`, `mem::transmute` and the initializers of local
 /// bindings, to the expression the pointer comes from.
-pub(super) fn peel_casts(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, ExprId>, expr: ExprId) -> ExprId {
+pub(super) fn peel_casts(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, ExprId, Global>, expr: ExprId) -> ExprId {
     let mut e = expr;
     loop {
         e = util::peel_blocks(b, e);
@@ -175,8 +178,7 @@ pub(super) fn peel_casts(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, Expr
             Expr::MethodCall { receiver, args, .. }
                 if args.is_empty()
                     && method_item(b, e).is_some_and(|it| {
-                        let items = util::items();
-                        [items.ptr_cast, items.const_ptr_cast, items.ptr_cast_mut, items.ptr_cast_const].contains(&it)
+                        [sym::ptr_cast, sym::const_ptr_cast, sym::ptr_cast_mut, sym::ptr_cast_const].contains(&it)
                     }) =>
             {
                 receiver
@@ -184,8 +186,7 @@ pub(super) fn peel_casts(b: &BodyCx<'_, '_, '_>, inits: &HashMap<BindingId, Expr
             Expr::Call { callee, args }
                 if args.len() == 1
                     && callee_item(b, callee).is_some_and(|it| {
-                        let items = util::items();
-                        [items.ptr_from_ref, items.unsafe_cell_raw_get, items.transmute].contains(&it)
+                        [sym::ptr_from_ref, sym::unsafe_cell_raw_get, sym::transmute].contains(&it)
                     }) =>
             {
                 args[0]

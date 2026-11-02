@@ -7,7 +7,7 @@ use blaze_build_script::unit as bs;
 use blaze_core::{Completion, Done, Effect, FileName, IoError, Stamp, Tag};
 use blaze_usercode::run::OutFile;
 
-use super::{BYTES, CUT, LOOK, LOOK_EVERY, QUIET_MOST, Quiet, Stuck, TICK, TIMED, Writing, file_name, out_files, verifies_in};
+use super::{BYTES, CUT, LOOK, LOOK_EVERY, QUIET_MOST, Quiet, Stuck, TICK, TIMED, Writing, file_name, out_files, rechecks_in, verifies_in};
 
 const RUN: Tag = Tag(5 << 32);
 const BEGAN_NS: u64 = 1_761_782_400_123_456_789;
@@ -42,6 +42,17 @@ fn blaze_elide_is_verify_or_unset() {
     for refused in ["1", "", "Verify", "off"] {
         let error = verifies_in(&env(refused)).unwrap_err();
         assert!(error.what.starts_with(&format!("BLAZE_ELIDE={refused} is not a value blaze takes")), "{}", error.what);
+    }
+}
+
+#[test]
+fn blaze_script_cache_is_check_or_unset() {
+    let env = |value: &str| vec![("BLAZE_SCRIPT_CACHE".to_owned(), value.to_owned())];
+    assert!(!rechecks_in(&[("PATH".to_owned(), "/usr/bin".to_owned())]).unwrap());
+    assert!(rechecks_in(&env("check")).unwrap());
+    for refused in ["1", "", "verify", "Check"] {
+        let error = rechecks_in(&env(refused)).unwrap_err();
+        assert!(error.what.starts_with(&format!("BLAZE_SCRIPT_CACHE={refused} is not a value blaze takes")), "{}", error.what);
     }
 }
 

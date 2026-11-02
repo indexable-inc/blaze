@@ -2,13 +2,14 @@
 //! there): parsed into cargo's own schema, `workspace = true` fields and dependencies
 //! inherited, targets discovered, dependencies and features checked.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use cargo_platform::Platform;
 use cargo_util_schemas::core::{PackageIdSpec, PartialVersion};
 use cargo_util_schemas::manifest::{
@@ -36,12 +37,12 @@ use crate::workspace::find_workspace_root;
 /// Every file is read through the configuration's [`Files`].
 pub struct Context<F: Files> {
     pub config: Config<F>,
-    pub(crate) ws_roots: RefCell<HashMap<PathBuf, WorkspaceRootConfig>>,
+    pub(crate) ws_roots: RefCell<HashMap<PathBuf, WorkspaceRootConfig, Global>>,
 }
 
 impl<F: Files> Context<F> {
     pub fn new(config: Config<F>) -> Context<F> {
-        Context { config, ws_roots: RefCell::new(HashMap::default()) }
+        Context { config, ws_roots: RefCell::new(HashMap::new_in(Global)) }
     }
 
     pub fn files(&self) -> &F {
@@ -325,7 +326,7 @@ pub struct Manifest {
     pub custom_metadata: Option<toml::Value>,
     pub publish: Option<Vec<String>>,
     pub replace: Vec<(PackageIdSpec, Dependency)>,
-    pub patch: HashMap<Url, Vec<Dependency>>,
+    pub patch: HashMap<Url, Vec<Dependency>, Global>,
     pub workspace: WorkspaceConfig,
     pub unstable_features: Features,
     pub edition: Edition,
@@ -341,7 +342,7 @@ pub struct Manifest {
 #[derive(Debug)]
 pub struct VirtualManifest {
     pub replace: Vec<(PackageIdSpec, Dependency)>,
-    pub patch: HashMap<Url, Vec<Dependency>>,
+    pub patch: HashMap<Url, Vec<Dependency>, Global>,
     pub workspace: WorkspaceConfig,
     pub unstable_features: Features,
     pub resolve_behavior: Option<ResolveBehavior>,
@@ -470,7 +471,8 @@ fn to_workspace_config(
 /// What `[workspace]` gives a member: read from its workspace root the first time a field
 /// inherits, so a manifest that inherits nothing never reads the root.
 struct Inherit<'a, F: Files> {
-    fields: OnceCell<InheritableFields>,
+    #[expect(clippy::disallowed_types, reason = "the workspace root's fields, read the first time one is inherited: per manifest read, not global")]
+    fields: std::cell::OnceCell<InheritableFields>,
     ctx: &'a Context<F>,
     manifest_file: &'a Path,
     workspace_config: &'a WorkspaceConfig,
@@ -502,7 +504,7 @@ fn normalize_toml<F: Files>(
     let package_root = manifest_file.parent().unwrap();
     let files = ctx.files();
 
-    let inherit = Inherit { fields: OnceCell::new(), ctx, manifest_file, workspace_config };
+    let inherit = Inherit { fields: Default::default(), ctx, manifest_file, workspace_config };
 
     let mut normalized_toml = TomlManifest {
         cargo_features: original_toml.cargo_features.clone(),
@@ -1298,7 +1300,7 @@ fn to_real_manifest<F: Files>(
     let patch = patch(&normalized_toml, &mut manifest_ctx)?;
 
     {
-        let mut names_sources = HashMap::default();
+        let mut names_sources = HashMap::new_in(Global);
         for dep in &deps {
             let name = dep.name_in_toml();
             let prev = names_sources.insert(name, &dep.source_id);
@@ -1558,8 +1560,8 @@ fn replace<F: Files>(
 fn patch<F: Files>(
     me: &TomlManifest,
     manifest_ctx: &mut ManifestContext<'_, '_, F>,
-) -> anyhow::Result<HashMap<Url, Vec<Dependency>>> {
-    let mut patch = HashMap::default();
+) -> anyhow::Result<HashMap<Url, Vec<Dependency>, Global>> {
+    let mut patch = HashMap::new_in(Global);
     for (toml_url, deps) in me.patch.iter().flatten() {
         let url = match &toml_url[..] {
             CRATES_IO_REGISTRY => CRATES_IO_INDEX.parse().unwrap(),

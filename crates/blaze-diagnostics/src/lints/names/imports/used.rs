@@ -26,6 +26,7 @@ use std::{
 };
 
 use blaze_hash::{FixedHasher, HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::bits::Bits;
 use blaze_mem::Frame;
 use hashbrown::HashTable;
@@ -198,45 +199,45 @@ pub(super) struct Uses<'f, 'db> {
     /// The `extern crate` items, in that order.
     pub(super) crates: Vec<ExternCrate<'db>, &'f Frame>,
     /// The local bindings used, each as it was used most: rustc's `import_use_map`.
-    pub(super) used: HashMap<Binding, Used>,
+    pub(super) used: HashMap<Binding, Used, Global>,
     /// The trait imports a method call, field or type-relative path could use, in the order
     /// they were first found: rustc's `maybe_unused_trait_imports` before `check_unused`.
     pub(super) candidates: Vec<Binding, &'f Frame>,
     /// The bindings in `candidates`.
-    candidate_set: HashSet<Binding>,
+    candidate_set: HashSet<Binding, Global>,
     /// The trait imports type checking uses: rustc's `used_trait_imports`.
-    pub(super) typeck: HashSet<Binding>,
+    pub(super) typeck: HashSet<Binding, Global>,
     /// The bindings the crate re-exports: rustc's `effective_visibilities.is_exported`.
-    pub(super) exported: HashSet<Binding>,
+    pub(super) exported: HashSet<Binding, Global>,
     /// Each name in a namespace a binding is re-exported as.
-    pub(super) exported_names: HashSet<(Binding, Name, Ns)>,
+    pub(super) exported_names: HashSet<(Binding, Name, Ns), Global>,
     /// The modules reachable from other crates, through public names from the root.
-    public_modules: HashSet<ModuleId>,
+    public_modules: HashSet<ModuleId, Global>,
     /// The `#[macro_use]` imports used: of every macro (`None`) or of one.
-    pub(super) macro_uses: HashSet<(ExternCrateId, Option<Name>)>,
+    pub(super) macro_uses: HashSet<(ExternCrateId, Option<Name>), Global>,
     /// The macros invoked: by a call, an attribute or a derive.
-    pub(super) macros: HashSet<MacroId>,
+    pub(super) macros: HashSet<MacroId, Global>,
     /// The rules of each `macro_rules!` a call matched.
-    pub(super) arms: HashMap<MacroId, SmallSet>,
+    pub(super) arms: HashMap<MacroId, SmallSet, Global>,
     /// The macros invoked where which rule matched can't be told.
-    pub(super) arms_unknown: HashSet<MacroId>,
+    pub(super) arms_unknown: HashSet<MacroId, Global>,
     /// The names of macro calls that don't resolve: a macro of such a name may be used.
-    pub(super) macros_unknown: HashSet<Name>,
+    pub(super) macros_unknown: HashSet<Name, Global>,
     /// The names `--extern` puts in the crate's extern prelude.
-    pub(super) extern_prelude: HashSet<Name>,
+    pub(super) extern_prelude: HashSet<Name, Global>,
     /// Each module's `use` items, by index into `items`, in `items`' order.
-    pub(super) by_module: HashMap<ModuleId, SmallVec<[u32; 4]>>,
+    pub(super) by_module: HashMap<ModuleId, SmallVec<[u32; 4]>, Global>,
     /// Each module's glob trees, as (item, tree) indices, in `items`' order.
-    pub(super) globs: HashMap<ModuleId, SmallVec<[(u32, u32); 2]>>,
-    trees: HashMap<Binding, (u32, u32)>,
+    pub(super) globs: HashMap<ModuleId, SmallVec<[(u32, u32); 2]>, Global>,
+    trees: HashMap<Binding, (u32, u32), Global>,
     /// The traits in scope at a module with a value item of a name: a range of `trait_rows`.
-    traits: HashMap<(ModuleId, Name), (u32, u32)>,
+    traits: HashMap<(ModuleId, Name), (u32, u32), Global>,
     /// A trait in scope and the imports it is found through, a range of `trait_chains`.
     trait_rows: Vec<(TraitId, u32, u32), &'f Frame>,
     trait_chains: Vec<Binding, &'f Frame>,
     /// Each module's `use` items by file and start, filled once per module.
-    use_ids: HashMap<(HirFileId, TextSize), UseId>,
-    indexed: HashSet<ModuleId>,
+    use_ids: HashMap<(HirFileId, TextSize), UseId, Global>,
+    indexed: HashSet<ModuleId, Global>,
     lookups: RefCell<HashTable<Lookup>>,
     krate: base_db::Crate,
 }
@@ -257,27 +258,27 @@ impl<'f, 'db> Uses<'f, 'db> {
             frame,
             items: Vec::new_in(frame),
             crates: Vec::new_in(frame),
-            used: HashMap::default(),
+            used: HashMap::new_in(Global),
             candidates: Vec::new_in(frame),
-            candidate_set: HashSet::default(),
-            typeck: HashSet::default(),
-            exported: HashSet::default(),
-            exported_names: HashSet::default(),
-            public_modules: HashSet::default(),
-            macro_uses: HashSet::default(),
-            macros: HashSet::default(),
-            arms: HashMap::default(),
-            arms_unknown: HashSet::default(),
-            macros_unknown: HashSet::default(),
+            candidate_set: HashSet::new_in(Global),
+            typeck: HashSet::new_in(Global),
+            exported: HashSet::new_in(Global),
+            exported_names: HashSet::new_in(Global),
+            public_modules: HashSet::new_in(Global),
+            macro_uses: HashSet::new_in(Global),
+            macros: HashSet::new_in(Global),
+            arms: HashMap::new_in(Global),
+            arms_unknown: HashSet::new_in(Global),
+            macros_unknown: HashSet::new_in(Global),
             extern_prelude,
-            by_module: HashMap::default(),
-            globs: HashMap::default(),
-            trees: HashMap::default(),
-            traits: HashMap::default(),
+            by_module: HashMap::new_in(Global),
+            globs: HashMap::new_in(Global),
+            trees: HashMap::new_in(Global),
+            traits: HashMap::new_in(Global),
             trait_rows: Vec::new_in(frame),
             trait_chains: Vec::new_in(frame),
-            use_ids: HashMap::default(),
-            indexed: HashSet::default(),
+            use_ids: HashMap::new_in(Global),
+            indexed: HashSet::new_in(Global),
             lookups: RefCell::new(HashTable::new()),
             krate: cx.krate.base(),
         };

@@ -438,7 +438,14 @@ impl<'db> Compiler<'_, 'db> {
         };
         let [arg] = args.skip_binder().as_slice() else { return None };
         let of = arg.ty()?;
-        if of.has_param() || of.has_infer() || of.has_aliases() || of.references_error() {
+        // A placeholder is a `for const` loop's binder (`#![feature(blaze_comptime)]`), which
+        // only the instance's member decides: no fact of it is the same for every `subst`.
+        if of.has_param()
+            || of.has_infer()
+            || of.has_aliases()
+            || of.has_placeholders()
+            || of.references_error()
+        {
             return None;
         }
         let layout = self.db.layout_of_ty(of.store(), self.env.store()).ok()?;

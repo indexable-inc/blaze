@@ -44,7 +44,7 @@ pub(super) fn size_text(size: u64) -> String {
 const SHARE: u64 = 1024;
 
 /// The limit when `clippy.toml` sets none.
-pub(super) const DEFAULT_LIMIT: u64 = FIBER_STACK / SHARE;
+pub(crate) const DEFAULT_LIMIT: u64 = FIBER_STACK / SHARE;
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
     if !cx.on(LINT) {
@@ -63,7 +63,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
     let Ok(layout) = ty.layout(db) else { return };
     let size = layout.size();
     let configured = cx.conf().int("array-size-threshold", -1);
-    let limit = u64::try_from(configured).unwrap_or(DEFAULT_LIMIT);
+    let limit = limit(cx);
     if size <= limit {
         return;
     }
@@ -106,6 +106,13 @@ fn owner<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> Option<String> {
         }
     }
     None
+}
+
+
+/// The limit in bytes: `array-size-threshold` from `clippy.toml`, else [`DEFAULT_LIMIT`]. Read by
+/// `blaze::box_large_new`, which leaves sizes past it to this lint.
+pub(crate) fn limit(cx: &crate::check::Cx<'_, '_>) -> u64 {
+    u64::try_from(cx.conf().int("array-size-threshold", -1)).unwrap_or(DEFAULT_LIMIT)
 }
 
 #[cfg(test)]

@@ -57,6 +57,10 @@ mod wrapping;
 #[doc(hidden)]
 pub mod niche_types;
 
+// blaze: the integers of any width of `#![blaze::arbitrary_ints]`.
+#[stable(feature = "blaze_arbitrary_ints", since = "CURRENT_RUSTC_VERSION")]
+pub mod arbitrary;
+
 #[unstable(feature = "f16b", issue = "160630")]
 pub use bfloat::f16b;
 #[unstable(feature = "complex_numbers", issue = "154023")]

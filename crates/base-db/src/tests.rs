@@ -750,9 +750,10 @@ fn an_aliass_text_is_its_files() {
 fn a_table_finds_what_a_hash_map_does() {
     use crate::table::{Table, hash_of};
     use blaze_hash::HashMap;
+    use std::alloc::Global;
 
     let table: Table<Box<str>> = Table::new(1 << 16);
-    let mut model: HashMap<String, u32> = HashMap::default();
+    let mut model: HashMap<String, u32, Global> = HashMap::new_in(Global);
     let mut order = Vec::new();
     let mut rng = Rng::new(7);
     for _ in 0..20_000 {

@@ -7,6 +7,7 @@
 use std::mem;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::StaticId;
 use smallvec::SmallVec;
 
@@ -33,8 +34,8 @@ pub(super) enum Wait {
 }
 
 /// The bytes of the stack region of each thread: thread `t`'s starts at `t` times this.
-pub(super) fn thread_stack_span() -> usize {
-    stack_offset() >> 4
+pub(super) fn thread_stack_span(word: usize) -> usize {
+    stack_offset(word) >> 4
 }
 
 /// How many threads the addresses of the stack have room for.
@@ -42,8 +43,8 @@ const MAX_THREADS: usize = 240;
 
 /// The thread whose stack region the stack offset `offset` is in, and the position in it.
 #[inline]
-pub(super) fn stack_position(offset: usize) -> (usize, usize) {
-    let span = thread_stack_span();
+pub(super) fn stack_position(offset: usize, word: usize) -> (usize, usize) {
+    let span = thread_stack_span(word);
     (offset / span, offset % span)
 }
 
@@ -124,7 +125,7 @@ pub(super) struct Thread<'db> {
     stack: Vec<u8>,
     stack_allocations: Vec<Allocated>,
     tls: TlsData,
-    statics: HashMap<StaticId, Address>,
+    statics: HashMap<StaticId, Address, Global>,
     unwinding: Option<Unwinding<'db>>,
     running: Option<Running<'db>>,
     woken: Woken,
@@ -149,7 +150,7 @@ impl<'db> Thread<'db> {
             stack: Vec::new(), // alloc: empty, allocates nothing; one per spawned thread
             stack_allocations: Vec::new(), // alloc: empty, allocates nothing; one per spawned thread
             tls: TlsData::default(),
-            statics: HashMap::default(),
+            statics: HashMap::new_in(Global),
             unwinding: None,
             running: None,
             woken: Woken::default(),
@@ -172,7 +173,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// Where the running thread's stack region starts, in the stack's offsets.
     pub(super) fn stack_base(&self) -> usize {
-        self.thread as usize * thread_stack_span()
+        self.thread as usize * thread_stack_span(self.cached_ptr_size)
     }
 
     /// A new thread calling `start` (the bytes of a function pointer, `extern "C" fn(*mut u8)
@@ -278,8 +279,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// The stack region of `thread`: its lowest address and its size.
     pub(super) fn thread_stack(&self, thread: EvalThread) -> (usize, usize) {
-        let span = thread_stack_span();
-        (Address::stack(thread as usize * span).to_usize(), span)
+        let span = thread_stack_span(self.cached_ptr_size);
+        (Address::stack(thread as usize * span).to_usize(self.cached_ptr_size), span)
     }
 
     /// The virtual clock, in nanoseconds since the run started.
@@ -394,7 +395,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         result: Option<Address>,
         destination: Interval,
     ) -> Result<'db, ()> {
-        if retval.to_usize() != 0 {
+        if retval.to_usize(self.cached_ptr_size) != 0 {
             let result = result.unwrap_or(Address::invalid(0));
             self.write_pointer(retval, result)?;
         }
@@ -416,7 +417,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             Wait::Join { thread: joined, retval } => {
                 thread.woken.joined = Some(joined);
-                if retval.to_usize() != 0 {
+                if retval.to_usize(self.cached_ptr_size) != 0 {
                     let result = self.threads[joined as usize].result;
                     let thread = &mut self.threads[i];
                     thread.woken.pointer = Some((retval, result.unwrap_or(Address::invalid(0))));

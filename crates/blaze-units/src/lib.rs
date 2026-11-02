@@ -16,6 +16,7 @@
 //! workspace that needs one is an error naming it.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 #[cfg(test)]
 #[global_allocator]
@@ -35,6 +36,7 @@ pub mod sources;
 pub mod stdlib;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::Profiles;
 use blaze_resolve::resolver::ResolvedFeatures;
@@ -208,7 +210,7 @@ pub struct Package<'a> {
 /// Everything a unit graph is made from.
 pub struct Request<'a> {
     /// Every package of the resolve, by its id.
-    pub packages: &'a HashMap<PackageId, Package<'a>>,
+    pub packages: &'a HashMap<PackageId, Package<'a>, Global>,
     /// The resolve of the build (cargo's `targeted_resolve`).
     pub resolve: &'a Resolve,
     /// The features the feature resolver activated for the build.
@@ -222,6 +224,9 @@ pub struct Request<'a> {
     pub host: &'a Platformed,
     /// `--target`, when the build is for another platform than the host's.
     pub target: Option<&'a Platformed>,
+    /// The platform proc macros are built for to run as wasm modules (wasm32-wasip1), each
+    /// with the normal dependencies it has; `None` builds them for the host, as cargo does.
+    pub macro_wasm: Option<&'a Platformed>,
     /// Whether the dev-dependencies were resolved ([`Filter::need_dev_deps`]).
     pub has_dev_units: bool,
 }

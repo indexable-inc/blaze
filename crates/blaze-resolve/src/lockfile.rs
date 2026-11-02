@@ -12,6 +12,7 @@ use std::str::FromStr;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use serde::{Deserialize, de};
 use url::Url;
 
@@ -188,7 +189,7 @@ pub fn parse(text: &str) -> Result<TomlLockfile> {
 /// The path packages of the workspace, by name and version: what a lock file's entries
 /// without a source are matched to. cargo collects the workspace members, the path
 /// dependencies reachable from them, and those of the root `[patch]` and `[replace]`.
-pub type PathDeps = HashMap<String, HashMap<semver::Version, SourceId>>;
+pub type PathDeps = HashMap<String, HashMap<semver::Version, SourceId, Global>, Global>;
 
 /// The packages and edges of a lock file. Its edges have no dependencies and it has no
 /// features: it guides a resolve, it is not one. Entries without a source that match no path
@@ -199,7 +200,7 @@ pub fn into_resolve(
     original: &str,
     path_deps: &PathDeps,
 ) -> Result<Resolve> {
-    let mut checksums = HashMap::default();
+    let mut checksums = HashMap::new_in(Global);
 
     let mut version = match resolve.version {
         Some(4) => ResolveVersion::V4,
@@ -232,8 +233,8 @@ pub fn into_resolve(
     };
 
     let live_pkgs = {
-        let mut live_pkgs = HashMap::default();
-        let mut all_pkgs = HashSet::default();
+        let mut live_pkgs = HashMap::new_in(Global);
+        let mut all_pkgs = HashSet::new_in(Global);
         for pkg in packages.iter() {
             let enc_id = TomlLockfilePackageId {
                 name: pkg.name.clone(),
@@ -260,7 +261,7 @@ pub fn into_resolve(
     };
 
     // name -> version -> source -> id, to find the ids of edges written briefly.
-    let mut map: HashMap<&str, HashMap<String, HashMap<SourceId, PackageId>>> = HashMap::default();
+    let mut map: HashMap<&str, HashMap<String, HashMap<SourceId, PackageId, Global>, Global>, Global> = HashMap::new_in(Global);
     for (id, _) in live_pkgs.values() {
         map.entry(id.name().as_str())
             .or_default()
@@ -319,7 +320,7 @@ pub fn into_resolve(
     }
 
     let replacements = {
-        let mut replacements = HashMap::default();
+        let mut replacements = HashMap::new_in(Global);
         for &(ref id, pkg) in live_pkgs.values() {
             if let Some(ref replace) = pkg.replace {
                 assert!(pkg.dependencies.is_none());
@@ -378,25 +379,25 @@ pub fn into_resolve(
     Ok(Resolve::new(
         g,
         replacements,
-        HashMap::default(),
+        HashMap::new_in(Global),
         checksums,
         metadata,
         unused_patches,
         version,
-        HashMap::default(),
+        HashMap::new_in(Global),
     ))
 }
 
 /// How many packages of a name and version the resolve has, which decides how briefly an
 /// edge can be written.
 pub(crate) struct EncodeState<'a> {
-    counts: Option<HashMap<InternedString, HashMap<&'a semver::Version, usize>>>,
+    counts: Option<HashMap<InternedString, HashMap<&'a semver::Version, usize, Global>, Global>>,
 }
 
 impl<'a> EncodeState<'a> {
     pub(crate) fn new(resolve: &'a Resolve) -> EncodeState<'a> {
         let counts = (resolve.version() >= ResolveVersion::V2).then(|| {
-            let mut map: HashMap<_, HashMap<_, usize>> = HashMap::default();
+            let mut map: HashMap<_, HashMap<_, usize, Global>, Global> = HashMap::new_in(Global);
             for id in resolve.iter() {
                 *map.entry(id.name()).or_default().entry(id.version()).or_insert(0) += 1;
             }

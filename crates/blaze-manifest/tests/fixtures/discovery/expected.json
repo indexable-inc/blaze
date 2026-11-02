@@ -379,8 +379,8 @@
   "path+file://$ROOT/crates/app#0.3.0"
  ],
  "resolve": null,
- "target_directory": "$ROOT/target",
- "build_directory": "$ROOT/target",
+ "target_directory": "$BLAZE_HOME/build/discovery-ID",
+ "build_directory": "$BLAZE_HOME/build/discovery-ID",
  "version": 1,
  "workspace_root": "$ROOT",
  "metadata": null

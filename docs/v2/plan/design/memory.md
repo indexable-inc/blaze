@@ -20,6 +20,28 @@ All of it lives in `crates/blaze-mem`.
 | the image (results, interners, tables) | **mapped regions** in the store's packs ([restore.md](restore.md)) | by GC, by moving live data |
 | fixed-size objects that come and go (plane tasks, I/O operations, timers, watch slots) | **pools**: per-type slabs with free lists, per worker, refilled in batches | back to the pool, never to the OS in the warm loop |
 
+Owned text names its allocator too (`blaze_mem::text`). std's `String`, `OsString` and
+`PathBuf` take none, so blaze_mem has its own, each a `Vec<u8, A>` with no default `A`:
+
+| type | is | made in a frame with |
+|---|---|---|
+| `blaze_mem::String<A>` | UTF-8, as std's `String`; compares, orders and hashes as `str` and borrows as it, so it is a map key found by `&str`; `fmt::Write`, `into_boxed_str` | `frame::string(frame, text)`, `String::new_in(frame)`, `format_in!(frame, ..)` |
+| `blaze_mem::OsString<A>` | any bytes, as std's `OsString` on unix; as `OsStr` | `frame::os_string(frame, text)` |
+| `blaze_mem::PathBuf<A>` | as std's `PathBuf` on unix (`push`, `pop`, `join`); as `Path` | `frame::path(frame, path)` |
+
+`OsString` and `PathBuf` are unix only: on Windows an `OsStr` is WTF-8, and std has no public
+way to join two of them as bytes soundly, so there the types are absent (naming one is a compile
+error), never a quiet global-heap stand-in. `blaze::implicit_allocator` points at these.
+
+Single-owner maps and sets name theirs the same way: `blaze_hash::HashMap<K, V, A>`,
+`HashSet<K, A>`, `ByHash<K, V, A>` and `ByHashSet<K, A>` wrap hashbrown's tables with no default
+`A`, built with `new_in(alloc)`, `with_capacity_in(n, alloc)` and `from_iter_in(iter, alloc)`. A
+map that lives within a task takes the frame (`&Frame`); one that outlives it takes the request,
+revision or image allocator, or `std::alloc::Global` with `// alloc: <why>` on its line. Never a
+frame's allocator in something that outlives the frame. papaya's shared tables
+(`blaze_hash::SharedMap`, `SharedSet`, `SharedByHash`) are exempt: papaya takes no allocator, and
+they are long-lived by design, so `blaze::implicit_allocator` leaves them alone.
+
 The general-purpose allocator (mimalloc, with huge pages) serves only startup, configuration
 and rare large one-offs. The allocation-budget tests hold the warm loop to zero calls into it.
 

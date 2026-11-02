@@ -118,6 +118,12 @@ pub(super) const WHOLE: u8 = 1 << 3;
 pub(super) const MAKE: u8 = 1 << 5;
 /// A request on a path whose missing directories were made once: a second `ENOENT` fails it.
 pub(super) const MADE: u8 = 1 << 7;
+/// A [`Kind::Stat`] of a symbolic link itself, not followed ([`crate::Effect::Lstat`]; the bit
+/// [`WHOLE`] is).
+pub(super) const NO_FOLLOW: u8 = 1 << 3;
+/// A [`Kind::Clone`] whose source is no regular file, failing with
+/// [`crate::CLONE_OF_NO_FILE`] once its target is unlinked (the bit [`WHOLE`] is).
+pub(super) const NOT_REGULAR: u8 = 1 << 3;
 
 /// In [`Hot::buffer`]: none.
 pub(super) const NO_BUFFER: u16 = u16::MAX;
@@ -140,7 +146,9 @@ pub(super) struct Hot {
     pub of: u64,
     pub kind: Kind,
     /// [`ABANDONED`], [`STOPPING`], [`DIRECT`], [`STDERR`], [`SECOND`], [`ZERO_COPY`],
-    /// [`FINISHED`], [`WHOLE`], [`MAKE`], [`MADE`].
+    /// [`FINISHED`], [`WHOLE`], [`MAKE`], [`MADE`], [`NO_FOLLOW`] (a [`Kind::Stat`]'s) and
+    /// [`NOT_REGULAR`] (a [`Kind::Clone`]'s). The last two share [`WHOLE`]'s (and [`STDERR`]'s)
+    /// bit, read only for those kinds.
     pub flags: u8,
     /// The links asked of the kernel whose last completion is not in yet, a bit each.
     pub links: u8,
@@ -439,6 +447,7 @@ impl Lent {
 #[cfg(test)]
 mod tests {
     use blaze_hash::HashMap;
+    use std::alloc::Global;
 
     use super::*;
 
@@ -449,7 +458,7 @@ mod tests {
         for seed in 0..32 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut ops = Ops::new(1 << 12).unwrap();
-            let mut model: HashMap<u64, (Id, u64, Vec<u8>, u64)> = HashMap::default();
+            let mut model: HashMap<u64, (Id, u64, Vec<u8>, u64), Global> = HashMap::new_in(Global);
             for next in 0..2_000u64 {
                 if model.is_empty() || (model.len() < 128 && rng.below(3) != 0) {
                     let bytes = next.to_le_bytes().to_vec();

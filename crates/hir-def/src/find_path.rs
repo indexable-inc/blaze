@@ -12,7 +12,8 @@ use std::{
 };
 
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
-use blaze_hash::{FixedState, HashSet};
+use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_query::db::{AsId, FromId};
 use hir_expand::{
     Lookup,
@@ -75,7 +76,7 @@ pub fn find_path_with<'db>(
     ignore_local_imports: bool,
     mut cfg: FindPathConfig,
 ) -> Option<ModPath> {
-    let _p = tracing::info_span!("find_path").entered();
+    let _p = tracing::info_span!(target: "blaze", "find_path").entered();
 
     // - if the item is a builtin, it's in scope
     if let ItemInNs::Types(ModuleDefId::BuiltinType(builtin)) = item {
@@ -119,7 +120,7 @@ pub struct FindPathScratch {
     /// `(item, module)` pairs the local searches on the current stack have looked at, the module
     /// as its `blaze_query::db::Id`. Empty between top-level searches: each local search removes what it
     /// added.
-    visited: HashSet<(ItemInNs, blaze_query::db::Id)>,
+    visited: HashSet<(ItemInNs, blaze_query::db::Id), Global>,
     /// The segments of every candidate of the call, each linked to the one before it, so a
     /// candidate extended by a name shares its prefix instead of copying it.
     segments: Vec<Segment>,
@@ -140,7 +141,7 @@ thread_local! {
 impl FindPathScratch {
     pub const fn new() -> FindPathScratch {
         FindPathScratch {
-            visited: HashSet::with_hasher(FixedState),
+            visited: HashSet::with_hasher_in(blaze_hash::FixedState, Global),
             // alloc: none until the thread's first call grows it, then kept
             segments: Vec::new(),
             // alloc: none until the thread's first call grows it, then kept
@@ -448,6 +449,7 @@ fn calculate_best_path<'db>(
     if fuel == 0 {
         // we ran out of fuel, so we stop searching here
         tracing::warn!(
+            target: "blaze",
             "ran out of fuel while searching for a path for item {item:?} of krate {:?} from krate {:?}",
             item.krate(ctx.db),
             ctx.from_crate
@@ -821,8 +823,6 @@ fn find_local_import_locations<'db>(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::cell::LazyCell;
-
     use blaze_alloc_count::assert_at_most;
     use blaze_ids::rng::SplitMix64;
     use expect_test::{Expect, expect};
@@ -857,7 +857,8 @@ pub(crate) mod tests {
             syntax::SourceFile::parse(&format!("use {path};"), span::Edition::CURRENT);
         let ast_path =
             parsed_path_file.root().descendants().find_map(syntax::view::Path::cast).unwrap();
-        let span_map = LazyCell::new(|| hir_expand::HirFileId::from(pos.file_id).span_map(&db));
+        #[expect(clippy::disallowed_types, reason = "the fixture's span map, set once per path test: not global")]
+        let span_map = std::cell::LazyCell::new(|| hir_expand::HirFileId::from(pos.file_id).span_map(&db));
         let mod_path =
             ModPath::from_src_view(&db, ast_path, &mut |range| span_map.span_for_range(range).ctx)
                 .unwrap();
@@ -2456,6 +2457,7 @@ pub mod future {
 
         use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
         use blaze_hash::HashSet;
+        use std::alloc::Global;
         use hir_expand::{
             Lookup,
             mod_path::{ModPath, PathKind},
@@ -2530,7 +2532,7 @@ pub mod future {
             fuel: Cell<usize>,
         }
 
-        type Visited<'db> = HashSet<(ItemInNs, ModuleIdLt<'db>)>;
+        type Visited<'db> = HashSet<(ItemInNs, ModuleIdLt<'db>), Global>;
 
         fn find_path_inner(
             ctx: &FindPathCtx<'_>,
@@ -2542,7 +2544,7 @@ pub mod future {
             {
                 return find_path_for_module(
                     ctx,
-                    &mut HashSet::default(),
+                    &mut HashSet::new_in(Global),
                     module_id,
                     true,
                     max_len,
@@ -2581,7 +2583,7 @@ pub mod future {
                 }
             }
             let mut best_choice = None;
-            calculate_best_path(ctx, &mut HashSet::default(), item, max_len, &mut best_choice);
+            calculate_best_path(ctx, &mut HashSet::new_in(Global), item, max_len, &mut best_choice);
             best_choice.map(|choice| choice.path)
         }
 
@@ -2974,7 +2976,7 @@ pub mod future {
         name: String,
         is_pub: bool,
         lines: Vec<String>,
-        names: HashSet<String>,
+        names: HashSet<String, Global>,
     }
 
     /// One generated crate: its modules (0 the root) and the items and modules it declares, each
@@ -3039,7 +3041,7 @@ pub mod future {
             name: String::new(),
             is_pub: true,
             lines: Vec::new(),
-            names: HashSet::default(),
+            names: HashSet::new_in(Global),
         };
         let mut krate = GenCrate { modules: vec![root], items: Vec::new() };
         for i in 0..1 + rng.index(7) {
@@ -3051,7 +3053,7 @@ pub mod future {
                 name,
                 is_pub: !shape.private_modules || rng.below(100) < 70,
                 lines: Vec::new(),
-                names: HashSet::default(),
+                names: HashSet::new_in(Global),
             });
         }
         for i in 0..2 + rng.index(8) {
@@ -3311,6 +3313,7 @@ pub mod future {
         use std::collections::VecDeque;
 
         use blaze_hash::HashMap;
+        use std::alloc::Global;
 
         let def_map = from.def_map(db);
         let krate = from.krate(db);
@@ -3321,7 +3324,7 @@ pub mod future {
         };
         // The first name of each def in `module`, in scope order.
         let first_names = |module: crate::ModuleId| {
-            let mut seen = HashSet::default();
+            let mut seen = HashSet::new_in(Global);
             def_map
                 .module(db, module)
                 .scope(db)
@@ -3332,12 +3335,12 @@ pub mod future {
         };
 
         fn reach(
-            dist: &mut HashMap<crate::ModuleId, usize>,
+            dist: &mut HashMap<crate::ModuleId, usize, Global>,
             queue: &mut VecDeque<crate::ModuleId>,
             module: crate::ModuleId,
             len: usize,
         ) {
-            if let std::collections::hash_map::Entry::Vacant(slot) = dist.entry(module) {
+            if let blaze_hash::hash_map::Entry::Vacant(slot) = dist.entry(module) {
                 slot.insert(len);
                 queue.push_back(module);
             }
@@ -3355,7 +3358,7 @@ pub mod future {
 
         // Breadth first, every edge one segment: `self` (no segment) is taken first, then the
         // one-segment starts, so each module is reached at its fewest segments.
-        let mut dist = HashMap::default();
+        let mut dist = HashMap::new_in(Global);
         let mut queue = VecDeque::new();
         reach(&mut dist, &mut queue, from, 0);
         reach(&mut dist, &mut queue, root, 1);

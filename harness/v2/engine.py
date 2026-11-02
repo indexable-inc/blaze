@@ -36,10 +36,10 @@ import subprocess
 import sys
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import blake3
 
@@ -498,13 +498,12 @@ class V1(Engine):
     def not_blazes(self, ran: Ran) -> str | None:
         import blaze_cli
 
-        how = cast(str, blaze_cli.how_built(ran.stderr))
+        how_built: Callable[[str], str] = getattr(blaze_cli, "how_built")
+        how = how_built(ran.stderr)
         if how == "daemon" or how.startswith("unchanged"):
             return None
-        # Only the `Finished` line of a build says `[blaze]`: a build blaze refused is its own
-        # unless it says it went to cargo, or cargo's own `Finished` line is there.
-        if how == "cargo" and ran.returncode != 0 and not blaze_cli.by_rustc(ran.stderr):
-            return None
+        # `how_built` now says "daemon" or "failed: <error>", never "cargo", and blaze_cli's
+        # `by_rustc` (the check of a refused build that went to cargo) is gone (queue 01087).
         return how
 
     def build(self, step: str, ws: Path, env: dict[str, str], args: Sequence[str] = (), command: str = "build",
@@ -643,8 +642,9 @@ class V2(Engine):
         # although an image was kept is.
         if any("links" not in line for _, line in lines):
             raise Failed(f"what the daemon of {home} did: a `blaze-work` line without `links`")
-        full = [(label, it) for label, line in lines for it in line["links"] if it["how"] == "full"]
-        first = [(label, it) for label, line in lines for it in line["links"] if it["how"] == "first"]
+        links = [(label, it) for label, line in lines for it in cast(list[dict[str, Any]], line["links"])]
+        full = [(label, it) for label, it in links if it["how"] == "full"]
+        first = [(label, it) for label, it in links if it["how"] == "first"]
         if full:
             label, it = full[0]
             link = f"placed whole: {label}: {it['path']} ({', '.join(it['why'])})"

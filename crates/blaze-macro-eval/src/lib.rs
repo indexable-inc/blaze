@@ -1,16 +1,23 @@
-//! Proc macros run on blaze's own compiler, in process (docs/v2/plan/design/compile-time.md,
-//! change 20): the macro's real code, with the real std and the real `library/proc_macro`
-//! client, on the MIR evaluator, every access checked. The client's one call into its server
-//! (`Closure::call`) is claimed and answered by blaze's server ([`server`]), which speaks the
-//! pinned bridge's protocol on the bytes in the evaluator's memory ([`protocol`], [`wire`]).
-//! Everything else the macro reaches outside its own code is a traced shim ([`os`]) or an error
-//! naming the macro. Nothing runs natively and nothing goes back to another host (no-fallback).
+//! Proc macros run in process, behind blaze's server of the real `library/proc_macro` bridge
+//! (docs/v2/plan/design/compile-time.md, change 20). The client's one call into its server
+//! (`Closure::call`) is answered by blaze's server ([`server`]), which speaks the pinned
+//! bridge's protocol ([`protocol`], [`wire`]). A macro runs one of two ways:
 //!
-//! [`load`] gives a proc-macro crate's macros, each expanding through [`expander`]: kept in the
-//! store by a key that misses no input ([`keep`]), run by [`run`].
+//! - as a `wasm32-wasip1` module under Wasmtime ([`wasm`], [`load_wasm`]), whose imports are
+//!   the bridge's shims and the WASI calls of its std, each answered and traced;
+//! - on the MIR evaluator ([`run`], [`load`]), every access checked, its system calls traced
+//!   shims ([`os`]): the reference a module's output is tested against, and what a crate with
+//!   no module yet expands on.
+//!
+//! Either way, what the macro reaches outside its own code is a traced shim or an error naming
+//! the macro, and a macro that can't run one way is never run the other (no-fallback).
+//!
+//! Each macro expands through [`expander`]: kept in the store by a key that misses no input
+//! ([`keep`]).
 
 #![deny(unsafe_code)]
 #![feature(random)]
+#![feature(allocator_api)]
 
 mod code;
 mod expander;
@@ -23,9 +30,11 @@ mod protocol;
 mod run;
 mod server;
 mod stream;
+mod wasm;
 mod wire;
 
-pub use expander::{flush, load};
+pub use expander::{Macros, load, load_wasm};
+pub use wasm::{GLUE_MODULE, Loads, Modules, wasm_glue};
 
 #[cfg(test)]
 #[global_allocator]

@@ -1,6 +1,6 @@
 //! Trait solving using next trait solver.
 
-use std::{cell::OnceCell, fmt, hash::Hash};
+use std::{fmt, hash::Hash};
 
 use base_db::{Db, Crate};
 use hir_def::{
@@ -180,6 +180,7 @@ pub fn implements_trait_unique_with_infcx<'db>(
     let interner = DbInterner::new_with(db, env.krate);
     // FIXME(next-solver): I believe this should be `PostAnalysis`.
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    crate::comptime_env::enter_universes(&infcx, env.param_env);
 
     let args = create_args(&infcx);
     trait_ref_holds(&infcx, env, trait_, args)
@@ -198,6 +199,7 @@ pub fn implements_traits_unique<'db>(
 ) {
     let interner = DbInterner::new_with(db, env.krate);
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    crate::comptime_env::enter_universes(&infcx, env.param_env);
     for &trait_ in traits {
         let holds = infcx.probe(|_| {
             let args = infcx.fill_rest_fresh_args(Span::Dummy, trait_.into(), [ty.into()]);
@@ -360,7 +362,8 @@ pub fn where_predicate_must_hold<'db>(
     blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-        let generics = OnceCell::<Generics<'db>>::new();
+        crate::comptime_env::enter_universes(&infcx, env.param_env);
+        let generics = crate::generics::generics(db, generic_def);
         let mut ctx = TyLoweringContext::new(
             db,
             resolver,

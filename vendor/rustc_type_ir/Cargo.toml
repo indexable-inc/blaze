@@ -25,6 +25,8 @@ arrayvec = { version = "0.7", default-features = false }
 bitflags = "2.4.1"
 # Not upstream's: the solver's global cache keeps its tables in `blaze_mem::blocks` (patch 0010).
 blaze-mem.workspace = true
+# Not upstream's: deep folds grow the stack as blaze's other recursions do (patch 0012).
+stdx.workspace = true
 derive-where = "1.6.1"
 ena = "0.14.4"
 indexmap = "2.0.0"

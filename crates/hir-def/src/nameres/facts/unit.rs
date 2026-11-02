@@ -126,7 +126,7 @@ impl<A: Allocator + Clone> UnitState<A> {
 pub(super) struct ReadCheck<'db> {
     pub(super) partition: &'db Partition,
     /// The round's module order (`RoundModules::index`).
-    pub(super) index: &'db HashMap<ModuleId, u32>,
+    pub(super) index: &'db HashMap<ModuleId, u32, Global>,
     pub(super) component: u32,
 }
 
@@ -407,8 +407,8 @@ impl<'db, 'f> Unit<'db, 'f> {
             root: queries::crate_root(db, krate),
             modules: ModulesSlot::Unit { own, rows: blaze_query::db::AsId::as_id(&rows) },
             prelude: None,
-            macro_use_prelude: HashMap::default(),
-            derive_helpers_in_scope: HashMap::default(),
+            macro_use_prelude: HashMap::new_in(Global),
+            derive_helpers_in_scope: HashMap::new_in(Global),
             session_macros: false,
             names: uses::NameRecords::default(),
             // alloc: empty, a component's view keeps no diagnostics
@@ -1125,6 +1125,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     ) {
         let end = self.held.len();
         let span = tracing::info_span!(
+            target: "blaze",
             "nameres update",
             resolutions = end - start,
             names_pushed = tracing::field::Empty,
@@ -1537,8 +1538,8 @@ pub(crate) fn local_scope(
         root,
         modules: ModulesSlot::Building(rows),
         prelude: None,
-        macro_use_prelude: HashMap::default(),
-        derive_helpers_in_scope: HashMap::default(),
+        macro_use_prelude: HashMap::new_in(Global),
+        derive_helpers_in_scope: HashMap::new_in(Global),
         session_macros: false,
         names: uses::NameRecords::default(),
         // alloc: empty, a scope's view keeps no diagnostics

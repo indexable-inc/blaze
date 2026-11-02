@@ -127,6 +127,9 @@ extern "C" {
     /// How many functions the passes found a record of in their profile under the function's
     /// name with another hash, since this was last asked.
     pub fn LLVMBlazeTakeMismatched(Passes: LLVMBlazePassesRef) -> u32;
+    /// How many functions the profile the passes use gave counts to (an entry count), since
+    /// this was last asked.
+    pub fn LLVMBlazeTakeApplied(Passes: LLVMBlazePassesRef) -> u32;
     /// The indexed profile of IR instrumentation with `Count` records, as `llvm-profdata
     /// merge` writes it, into `*Out`, which the caller disposes of.
     pub fn LLVMBlazeWriteProfile(
@@ -134,7 +137,58 @@ extern "C" {
         Count: usize,
         Out: *mut LLVMMemoryBufferRef,
     ) -> LLVMErrorRef;
+    /// Starts a report: what was kept is let go, and the runs from now on catch the loop
+    /// vectorizer's remarks (missed and analysis) until [`LLVMBlazeReportStop`].
+    pub fn LLVMBlazeReportStart(Passes: LLVMBlazePassesRef);
+    /// Ends a report: the runs from now on catch no remarks, and what was kept is let go.
+    pub fn LLVMBlazeReportStop(Passes: LLVMBlazePassesRef);
+    /// Adds to the report each branch out of a loop of `Fn` (a defined function of a module
+    /// the passes ran) to a panic path, then gives every finding its loop's profile heat.
+    pub fn LLVMBlazeReportKept(Passes: LLVMBlazePassesRef, Fn: LLVMValueRef);
+    /// The findings as [`LLVMBlazeReportKept`] last made them, into `*Out`, live until the
+    /// next `LLVMBlazeReport*` call on `Passes`. Returns how many.
+    pub fn LLVMBlazeReportRows(Passes: LLVMBlazePassesRef, Out: *mut *const LLVMBlazeReportRow) -> usize;
 }
+
+/// blaze: a finding of the report (wrappers/passes.cpp's struct of the same name, field for
+/// field). The strings point into the passes, live as [`LLVMBlazeReportRows`] says.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LLVMBlazeReportRow {
+    /// [`LLVMBlazeFoundKept`], [`LLVMBlazeFoundMissed`] or [`LLVMBlazeFoundAnalysis`].
+    pub Kind: u8,
+    /// [`LLVMBlazeHeatUnprofiled`], [`LLVMBlazeHeatUncounted`], [`LLVMBlazeHeatCold`] or
+    /// [`LLVMBlazeHeatHot`].
+    pub Heat: u8,
+    /// The line of the code's debug location, through inlining to the function's own; 0: none.
+    pub Line: u32,
+    /// The line of the loop's start; 0 where not known.
+    pub LoopLine: u32,
+    /// The loop header's profile count, for cold and hot.
+    pub Count: u64,
+    /// Kept: the callee's name (empty through a pointer). A remark: its name.
+    pub Name: *const ::libc::c_char,
+    pub NameLength: usize,
+    /// A remark's message; empty for kept.
+    pub Message: *const ::libc::c_char,
+    pub MessageLength: usize,
+}
+
+/// A branch out of a loop to code that never returns: a check whose panic path survived.
+pub const LLVMBlazeFoundKept: u8 = 1;
+/// The loop vectorizer left a loop scalar (its "missed" remark).
+pub const LLVMBlazeFoundMissed: u8 = 2;
+/// Why the loop vectorizer left a loop scalar (its "analysis" remark).
+pub const LLVMBlazeFoundAnalysis: u8 = 3;
+
+/// Built without a profile.
+pub const LLVMBlazeHeatUnprofiled: u8 = 0;
+/// With a profile, and no count reaches the loop.
+pub const LLVMBlazeHeatUncounted: u8 = 1;
+/// The loop's count is not hot by the module's profile summary.
+pub const LLVMBlazeHeatCold: u8 = 2;
+/// The loop's count is hot by the module's profile summary.
+pub const LLVMBlazeHeatHot: u8 = 3;
 
 /// blaze: what [`LLVMBlazeCreatePgoPasses`] builds pipelines for (wrappers/passes.cpp's struct
 /// of the same name, field for field).

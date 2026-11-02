@@ -19,6 +19,83 @@ use crate::solve::{
     AdtDestructorKind, EvalCtxt, Goal, NoSolution, NoSolutionOrRerunNonErased, RerunNonErased,
 };
 
+/// blaze: which marker of `#[blaze::arbitrary_ints]` a goal is of
+/// (`docs/v2/plan/lanes/frontend/arbitrary-ints.md`). Each is a lang-item trait of
+/// `core::num::arbitrary` that no impl may implement; [`int_marker_holds`] answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::solve) enum IntMarker {
+    /// `Self: ArbitraryInt`: `Self` is a `uN` or `iN` whose width is not a standard one.
+    Arbitrary,
+    /// `Self: ArbitrarySigned`: `Self` is such an `iN`.
+    Signed,
+    /// `Self: IntFrom<S>`: `Self` and `S` are two different integer types, one of them of an
+    /// arbitrary width, and every value of `S` is a value of `Self`.
+    From,
+    /// `Self: IntTryFrom<S>`: as `IntFrom`, where some value of `S` is not one of `Self`.
+    TryFrom,
+}
+
+/// An integer type as the markers see it: its signedness, its width in bits (`None` for
+/// `isize` and `usize`), and whether that width is an arbitrary one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IntShape {
+    signed: bool,
+    bits: Option<u64>,
+    arbitrary: bool,
+}
+
+fn int_shape<I: Interner>(ty: I::Ty) -> Option<IntShape> {
+    match ty.kind() {
+        ty::Int(int) => Some(IntShape {
+            signed: true,
+            bits: int.bit_width(),
+            arbitrary: int.arbitrary_width().is_some(),
+        }),
+        ty::Uint(uint) => Some(IntShape {
+            signed: false,
+            bits: uint.bit_width(),
+            arbitrary: uint.arbitrary_width().is_some(),
+        }),
+        _ => None,
+    }
+}
+
+/// Whether every value of `source` is a value of `target`, on every target. A pointer-sized
+/// source never is, and a pointer-sized target is taken as 16 bits, the least any target has:
+/// rustc's rule for which `From` impls `usize` and `isize` have.
+fn int_conversion_is_lossless(source: IntShape, target: IntShape) -> bool {
+    let Some(source_bits) = source.bits else { return false };
+    let target_bits = target.bits.unwrap_or(16);
+    match (source.signed, target.signed) {
+        (false, false) | (true, true) => source_bits <= target_bits,
+        (false, true) => source_bits < target_bits,
+        (true, false) => false,
+    }
+}
+
+/// Whether `marker` holds of `self_ty` and, for `IntFrom` and `IntTryFrom`, of `source`, both
+/// structurally normalized and neither a type variable. An integer variable is no integer type
+/// here: it is never an arbitrary width through trait selection alone, so a goal of one never
+/// holds.
+pub(in crate::solve) fn int_marker_holds<I: Interner>(
+    marker: IntMarker,
+    self_ty: I::Ty,
+    source: Option<I::Ty>,
+) -> bool {
+    let Some(target) = int_shape::<I>(self_ty) else { return false };
+    match marker {
+        IntMarker::Arbitrary => target.arbitrary,
+        IntMarker::Signed => target.arbitrary && target.signed,
+        IntMarker::From | IntMarker::TryFrom => {
+            let Some(source) = source.and_then(int_shape::<I>) else { return false };
+            if source == target || !(source.arbitrary || target.arbitrary) {
+                return false;
+            }
+            int_conversion_is_lossless(source, target) == (marker == IntMarker::From)
+        }
+    }
+}
+
 // Calculates the constituent types of a type for `auto trait` purposes.
 #[instrument(level = "trace", skip(ecx), ret)]
 pub(in crate::solve) fn instantiate_constituent_tys_for_auto_trait<D, I>(

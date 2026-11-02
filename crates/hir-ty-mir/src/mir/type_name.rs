@@ -666,7 +666,10 @@ fn type_name_value(konst: Const<'_>) -> Option<String> {
                 rustc_type_ir::IntTy::I32 => "i32",
                 rustc_type_ir::IntTy::I64 => "i64",
                 rustc_type_ir::IntTy::I128 => "i128",
+                rustc_type_ir::IntTy::Bits(_) => int.name_str(),
             };
+            // An arbitrary width's value is sign-extended to its storage: `i3::MIN` is -4.
+            let unused = int.arbitrary_width().map_or(unused, |it| 128 - u64::from(it.bits()));
             match leaf.to_int_unchecked() {
                 it if it == i128::MIN >> unused => named(name, "MIN"),
                 it if it == i128::MAX >> unused => named(name, "MAX"),
@@ -682,7 +685,9 @@ fn type_name_value(konst: Const<'_>) -> Option<String> {
                 rustc_type_ir::UintTy::U32 => "u32",
                 rustc_type_ir::UintTy::U64 => "u64",
                 rustc_type_ir::UintTy::U128 => "u128",
+                rustc_type_ir::UintTy::Bits(_) => uint.name_str(),
             };
+            let unused = uint.arbitrary_width().map_or(unused, |it| 128 - u64::from(it.bits()));
             match leaf.to_uint_unchecked() {
                 it if it == u128::MAX >> unused => named(name, "MAX"),
                 // alloc: the text `type_name` returns is the result

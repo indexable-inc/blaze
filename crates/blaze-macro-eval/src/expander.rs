@@ -15,10 +15,14 @@
 //! were left; when one holds an address, which no fresh run can be given, the session's earlier
 //! calls are run again on the same evaluator before the next one.
 //!
-//! Whether a crate's macros keep state is learned, as the wasm host learns it, and kept in the
+//! A crate's wasm module ([`load_wasm`]) runs each expansion in a fresh instance, so it keeps
+//! no state and is stateless from its load; its expansions are kept apart from the evaluator's,
+//! under the module's id.
+//!
+//! Whether a crate's macros keep state on the evaluator is learned, and kept in the
 //! store by the crate's code: unseen, its calls expand in a session (`requires_session`), in
 //! declaration order, and no kept expansion is used, since a hit skips a run that may have left
-//! state; once a build ran some and none left state ([`flush`]), it is stateless and its calls
+//! state; once a build ran some and none left state ([`Macros::flush`]), it is stateless and its calls
 //! are found in the store; once one left state, it is stateful for good.
 
 use std::{
@@ -31,6 +35,7 @@ use blaze_hash::SharedMap;
 use blaze_ids::ContentId;
 use blaze_usercode::{
     RunKey,
+    roots::{Role, RootMap, Roots, verify},
     index::{self, FindError, Found},
     trace::{Seen, assemble_seen},
 };
@@ -42,7 +47,7 @@ use hir_expand::proc_macro::{
 use intern::Symbol;
 use parking_lot::Mutex;
 use proc_macro_api::kept::verdict::{self as verdicts, STATEFUL, STATELESS, Verdict};
-use proc_macro_api::kept::{Call, Keeping, Mode, Put, checked, given, keeping, put, read, written};
+use proc_macro_api::kept::{Call, Keep, Keeping, Keeps, Mode, Put, checked, given, put, read, written};
 
 use crate::{
     code,
@@ -50,15 +55,87 @@ use crate::{
     protocol,
     run::{self, Bridge, Expansion, Ran},
     stream::Stream,
+    wasm,
 };
+
+/// What a daemon's proc macros share: where their expansions are kept, and every library
+/// loaded, which [`Macros::flush`] tells the store of. Made once by the daemon and lent to every
+/// [`load`] and [`load_wasm`]; two in one process see neither each other's store nor each
+/// other's libraries. Its libraries are held weakly, so a library holding it makes no cycle.
+pub struct Macros {
+    keeps: Keeps,
+    libraries: Mutex<Vec<Weak<Library>>>,
+    /// The daemon's wasm modules ([`load_wasm`]'s), made with it: or why Wasmtime made no
+    /// engine, which every wasm macro's load then says.
+    modules: Result<wasm::Modules, String>,
+}
+
+const _: fn() = || {
+    fn shared<T: Send + Sync>() {}
+    shared::<Macros>();
+};
+
+impl Macros {
+    pub fn new(keeps: Keeps) -> Arc<Macros> {
+        // alloc: once per daemon, or per test that loads macros
+        Arc::new(Macros { keeps, libraries: Mutex::new(Vec::new()), modules: wasm::Modules::new() })
+    }
+
+    /// The daemon's wasm modules, which a proc macro built for wasm loads through
+    /// ([`load_wasm`]): or why there are none, Wasmtime having made no engine.
+    pub fn modules(&self) -> Result<&wasm::Modules, &str> {
+        self.modules.as_ref().map_err(String::as_str)
+    }
+
+    /// Macros that keep and find nothing, for `why` (a bench, a test of the evaluator alone),
+    /// which each expansion that runs says of its reads.
+    pub fn nothing(why: &'static str) -> Arc<Macros> {
+        Macros::new(Keeps::Nothing(why))
+    }
+
+    /// Where its expansions are kept.
+    pub fn keeps(&self) -> &Keeps {
+        &self.keeps
+    }
+
+    /// Tells the store of each crate whose macros ran in this build and left no state that it
+    /// is stateless: called once a build has expanded everything, on the thread of the store's
+    /// owner, which then publishes this thread's puts (`proc_macro_api::kept::take_puts`).
+    /// Writes nothing itself and blocks on nothing.
+    pub fn flush(&self) {
+        if let Keeps::Nothing(_) = self.keeps {
+            return;
+        }
+        let mut libraries = self.libraries.lock();
+        libraries.retain(|it| it.strong_count() != 0);
+        for library in libraries.iter().filter_map(Weak::upgrade) {
+            // Another build that saw one leave state may have told the store since the load.
+            if library.seen.flush() && verdict(&self.keeps, &library.loaded) == Ok(Verdict::Unseen) {
+                tell(&library, STATELESS);
+            }
+        }
+    }
+}
+
+impl fmt::Debug for Macros {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let keeps = match &self.keeps {
+            Keeps::In(keeping) => format!("in a store, {:?}", keeping.mode), // alloc: debug output
+            Keeps::Nothing(why) => format!("nothing: {why}"), // alloc: debug output
+        };
+        f.debug_struct("Macros").field("keeps", &keeps).field("libraries", &self.libraries.lock().len()).finish()
+    }
+}
 
 /// What the macros of one proc-macro crate share.
 struct Library {
+    /// The daemon's, which says where this crate's expansions are kept.
+    macros: Arc<Macros>,
     krate: Crate,
     /// The crate's name, as an error about one of its macros says it.
     name: Box<str>,
     toolchain: ContentId,
-    bridge: Bridge,
+    engine: Engine,
     /// The code as it was at [`load`], which is asked again each time the crate compiles.
     loaded: ContentId,
     code: code::Memo,
@@ -68,6 +145,26 @@ struct Library {
     /// Each calling crate's session, each held while a call that has state runs: its calls
     /// run in order.
     sessions: SharedMap<Crate, Arc<Mutex<Session>>>,
+    /// Each calling crate's roots as its expansions are kept against them ([`Library::kept_roots`]).
+    kept_roots: SharedMap<Crate, Arc<KeptRoots>>,
+}
+
+/// A calling crate's roots with their other spellings and machine-wide directories, and what
+/// they were made of: the database's revision (a root's links are read again in each), the
+/// package and `OUT_DIR` and the passed `CARGO_HOME` and `HOME`. Made again when any differs.
+struct KeptRoots {
+    at: (Nonce, blaze_query::db::View),
+    made_of: [Option<String>; 4],
+    map: RootMap,
+}
+
+/// What a library's macros run on.
+enum Engine {
+    /// The MIR evaluator, through the bridge's functions in the crate's `proc_macro`.
+    Evaluator(Bridge),
+    /// The crate's wasm module ([`load_wasm`]). Each expansion is a fresh instance, so the
+    /// library is stateless from its load.
+    Wasm(wasm::Library),
 }
 
 /// A call that panicked holding a session or the sessions leaves them as they were at the panic,
@@ -100,52 +197,32 @@ fn said(keeping: &Keeping, code: &ContentId, verdict: &[u8]) -> Result<bool, Str
         Err(FindError::NotAShape { key, why }) => Err(format!("the store's {key:?} is not a shape: {why}")),
         // alloc: error path
         Err(FindError::Inputs(unreadable)) => Err(unreadable.to_string()),
+        // alloc: error path
+        Err(FindError::TooManyShapes { run }) => Err(format!("verdict run {run:?} has more than {} shapes", index::MOST_SHAPES)),
     }
 }
 
-/// What the store says of the crate whose code is `code`. With nothing installed to keep
-/// expansions in (a bench, a test that keeps nothing), nothing is known and nothing is found.
-fn verdict(code: &ContentId) -> Result<Verdict, String> {
-    let Some(keeping) = keeping() else { return Ok(Verdict::Unseen) };
-    if said(&keeping, code, STATEFUL)? {
+/// What the store `keeps` says of the crate whose code is `code`. Keeping nothing (a bench, a
+/// test that keeps nothing), nothing is known and nothing is found.
+fn verdict(keeps: &Keeps, code: &ContentId) -> Result<Verdict, String> {
+    let Keeps::In(keeping) = keeps else { return Ok(Verdict::Unseen) };
+    if said(keeping, code, STATEFUL)? {
         return Ok(Verdict::Stateful);
     }
-    Ok(if said(&keeping, code, STATELESS)? { Verdict::Stateless } else { Verdict::Unseen })
+    Ok(if said(keeping, code, STATELESS)? { Verdict::Stateless } else { Verdict::Unseen })
 }
 
 /// Leaves `verdict` of `library` for the store's owner to publish with this thread's puts.
 fn tell(library: &Library, verdict: &'static [u8]) {
-    if keeping().is_none() {
+    if let Keeps::Nothing(_) = library.macros.keeps {
         return;
     }
     put(Put {
-        run: verdict_run(&library.loaded, verdict),
-        traced: blaze_core::Traced::default(),
+        keep: Keep::Run { run: verdict_run(&library.loaded, verdict), traced: blaze_core::Traced::default() },
         value: verdict.to_vec(), // alloc: once per crate per build, a verdict
         // alloc: as above
         what: format!("the verdict of the proc macros of `{}`", library.name),
     });
-}
-
-/// Every library loaded, for [`flush`].
-static LIBRARIES: Mutex<Vec<Weak<Library>>> = Mutex::new(Vec::new()); // alloc: none: an empty `Vec` in a const
-
-/// Tells the store of each crate whose macros ran in this build and left no state that it is
-/// stateless: called once a build has expanded everything, on the thread of the store's
-/// owner, which then publishes this thread's puts (`proc_macro_api::kept::take_puts`). Writes nothing
-/// itself and blocks on nothing.
-pub fn flush() {
-    if keeping().is_none() {
-        return;
-    }
-    let mut libraries = LIBRARIES.lock();
-    libraries.retain(|it| it.strong_count() != 0);
-    for library in libraries.iter().filter_map(Weak::upgrade) {
-        // Another build that saw one leave state may have told the store since the load.
-        if library.seen.flush() && verdict(&library.loaded) == Ok(Verdict::Unseen) {
-            tell(&library, STATELESS);
-        }
-    }
 }
 
 impl Library {
@@ -180,6 +257,28 @@ impl Library {
             }
         }
         session
+    }
+
+    /// The roots `calling`'s expansion with `roots` is kept against, given `passed`: made once
+    /// per calling crate and revision ([`KeptRoots`]), not once per expansion, as making them
+    /// reads each root's links.
+    fn kept_roots(&self, db: &Db, calling: Crate, roots: Roots<'_>, passed: &[(String, String)]) -> Arc<KeptRoots> {
+        let at = db.nonce_and_revision();
+        let var = |name: &str| passed.iter().rev().find(|it| it.0 == name).map(|it| it.1.as_str());
+        let made_of = [roots.get(Role::Package), roots.get(Role::OutDir), var("CARGO_HOME"), var("HOME")];
+        let same = |kept: &KeptRoots| kept.at == at && kept.made_of.iter().map(Option::as_deref).eq(made_of.iter().copied());
+        let pinned = self.kept_roots.pin();
+        if let Some(kept) = pinned.get(&calling).filter(|it| same(it)) {
+            return Arc::clone(kept); // clone: the roots' handle, held for one expansion
+        }
+        let kept = Arc::new(KeptRoots {
+            // alloc: once per calling crate and revision
+            at,
+            made_of: made_of.map(|it| it.map(str::to_owned)), // alloc: as above
+            map: roots.to_map(|map| map.with_cargo_home(var)),
+        });
+        pinned.insert(calling, Arc::clone(&kept)); // clone: as above
+        kept
     }
 }
 
@@ -217,15 +316,15 @@ struct Evaluated {
     name: Symbol,
     kind: ProcMacroKind,
     function: FunctionId,
+    /// Its place in the crate's `__blaze_proc_macros` list, sorted by name, as a wasm module
+    /// numbers its macros.
+    index: u32,
 }
 
 fn refused(why: String) -> ProcMacroLoadingError {
     ProcMacroLoadingError::Refused(why.into_boxed_str())
 }
 
-/// The macros of `krate`, a proc-macro crate, each run on blaze's compiler in this process
-/// for a crate built with `toolchain`. An error says why none can run: the crate is no
-/// proc-macro crate, or its `proc_macro` is not the bridge blaze's server speaks.
 /// The name of `krate` as its errors and spans say it.
 fn crate_name(db: &Db, krate: Crate) -> Box<str> {
     match &krate.extra_data(db).display_name {
@@ -234,7 +333,55 @@ fn crate_name(db: &Db, krate: Crate) -> Box<str> {
     }
 }
 
-pub fn load(db: &Db, krate: Crate, toolchain: ContentId) -> ProcMacroLoadResult {
+/// The macros of `krate`, a proc-macro crate, each run on blaze's MIR evaluator in this
+/// process for a crate built with `toolchain`. An error says why none can run: the crate is no
+/// proc-macro crate, or its `proc_macro` is not the bridge blaze's server speaks. Its expansions
+/// are kept where the daemon's `macros` keeps them.
+pub fn load(db: &Db, krate: Crate, toolchain: ContentId, macros: &Arc<Macros>) -> ProcMacroLoadResult {
+    load_on(db, krate, toolchain, macros, |name, checked| {
+        let verdict = verdict(&macros.keeps, &checked.loaded)
+            // alloc: error path
+            .map_err(|why| refused(format!("the proc-macro crate `{name}`: its verdict in the store: {why}")))?;
+        Ok((Engine::Evaluator(checked.bridge), verdict))
+    })
+}
+
+/// The macros of `krate`, each run in a fresh instance of `module`, the crate built by blaze
+/// for `wasm32-wasip1` with the bridge's glue (`guest/entry.rs`), under Wasmtime. The module
+/// comes from `modules`, the daemon's, which compiles it or loads its machine code from the
+/// store the daemon's `macros` keeps expansions in. An error says why none can run: [`load`]'s,
+/// or the module's, naming the crate; nothing runs on the evaluator instead.
+pub fn load_wasm(
+    db: &Db,
+    krate: Crate,
+    toolchain: ContentId,
+    macros: &Arc<Macros>,
+    modules: &wasm::Modules,
+    module: &[u8],
+) -> ProcMacroLoadResult {
+    load_on(db, krate, toolchain, macros, |name, _| {
+        // alloc: error path, and once a crate the name its put says
+        let what = format!("the wasm module of the proc-macro crate `{name}`");
+        let library = wasm::Library::load(modules, &macros.keeps, module, &what).map_err(|why| refused(format!("{what} {why}")))?; // alloc: error path
+        Ok((Engine::Wasm(library), Verdict::Stateless))
+    })
+}
+
+/// What [`load_on`] found of a crate for its engine: the bridge's functions, and its code.
+struct Checked {
+    bridge: Bridge,
+    loaded: ContentId,
+}
+
+/// [`load`] and [`load_wasm`]: the crate checked, and its macros on the engine (and the
+/// verdict of its state) `engine` makes of the crate's name and what was found of it.
+fn load_on(
+    db: &Db,
+    krate: Crate,
+    toolchain: ContentId,
+    macros: &Arc<Macros>,
+    engine: impl FnOnce(&str, Checked) -> Result<(Engine, Verdict), ProcMacroLoadingError>,
+) -> ProcMacroLoadResult {
     // alloc: once a proc-macro crate, the name its errors say
     let name = crate_name(db, krate);
     if !crate_def_map(db, krate).is_proc_macro() {
@@ -247,31 +394,41 @@ pub fn load(db: &Db, krate: Crate, toolchain: ContentId) -> ProcMacroLoadResult 
     let bridge = Bridge::find(db, proc_macro).map_err(|why| refused(format!("the proc-macro crate `{name}`: {why}")))?; // alloc: error path
     let code = code::Memo::default();
     let loaded = code.get(db, krate);
-    let verdict = verdict(&loaded)
-        // alloc: error path
-        .map_err(|why| refused(format!("the proc-macro crate `{name}`: its verdict in the store: {why}")))?;
+    let (engine, verdict) = engine(&name, Checked { bridge, loaded })?;
     let library = Arc::new(Library { // alloc: once a proc-macro crate loaded
+        macros: Arc::clone(macros), // clone: a refcount, once a proc-macro crate loaded
         krate,
         name,
         toolchain,
-        bridge,
+        engine,
         loaded,
         code,
         seen: verdicts::Seen::new(verdict),
         sessions: SharedMap::default(),
+        kept_roots: SharedMap::default(),
     });
-    LIBRARIES.lock().push(Arc::downgrade(&library));
+    macros.libraries.lock().push(Arc::downgrade(&library));
     let functions = run::functions(db, krate);
     if functions.is_empty() {
         return Err(refused(format!("the proc-macro crate `{}` has no proc macros", library.name))); // alloc: error path
     }
+    // A module numbers its macros by their place in `__blaze_proc_macros`, which is sorted by
+    // name (`hir_ty_codegen::v2::roots::proc_macros`).
+    // alloc: once a proc-macro crate, its macros' places
+    let mut by_name: Vec<usize> = (0..functions.len()).collect();
+    by_name.sort_by(|&a, &b| functions[a].0.as_str().cmp(functions[b].0.as_str()));
+    let mut places = vec![0u32; functions.len()]; // alloc: as above
+    for (place, &at) in by_name.iter().enumerate() {
+        places[at] = place as u32;
+    }
     Ok(functions
         .into_iter()
-        .map(|(name, kind, function)| ProcMacro {
+        .zip(places)
+        .map(|((name, kind, function), index)| ProcMacro {
             name: name.clone(), // clone: a symbol, once a macro
             kind,
             // alloc: once a macro loaded
-            expander: Arc::new(Evaluated { library: Arc::clone(&library), name, kind, function }),
+            expander: Arc::new(Evaluated { library: Arc::clone(&library), name, kind, function, index }),
             disabled: false,
         })
         .collect()) // alloc: once a proc-macro crate, its macros
@@ -281,6 +438,54 @@ pub fn load(db: &Db, krate: Crate, toolchain: ContentId) -> ProcMacroLoadResult 
 /// expand while that is built.
 fn forced_keywords(db: &Db, calling: Crate) -> bool {
     UnstableFeatures::of_root(db, calling).forced_keywords
+}
+
+/// What a call of a macro of `kind` was given, as an error about it says it: the item a derive
+/// or attribute is on (`struct Config`, `fn main`), found by its keyword among the input's
+/// outermost tokens past its attributes and visibility, or a bang macro's input by its length.
+fn input_item(kind: ProcMacroKind, input: &tt::TopSubtree) -> String {
+    const ITEMS: [&str; 11] = ["struct", "enum", "union", "fn", "trait", "impl", "mod", "type", "const", "static", "use"];
+    let keyword = |it: &tt::TtElement<'_>| match it {
+        tt::TtElement::Leaf(tt::Leaf::Ident(ident)) => ITEMS.iter().find(|k| **k == ident.sym.as_str()).copied(),
+        _ => None,
+    };
+    if kind != ProcMacroKind::Bang {
+        let mut tokens = input.iter().peekable();
+        while let Some(token) = tokens.next() {
+            let Some(mut said) = keyword(&token) else { continue };
+            // `const fn`, `unsafe impl`: the last keyword is the item's.
+            while let Some(next) = tokens.peek().and_then(keyword) {
+                said = next;
+                tokens.next();
+            }
+            return match tokens.next() {
+                // alloc: error path
+                Some(tt::TtElement::Leaf(tt::Leaf::Ident(name))) => format!("`{said} {}`", name.sym.as_str()),
+                // alloc: error path
+                _ => format!("an item `{said} ...`"),
+            };
+        }
+    }
+    // alloc: error path
+    format!("an input of {} token trees", input.iter().count())
+}
+
+/// A macro as an expansion's span names it: `m::answer`, its crate then its name.
+struct MacroPath<'a>(&'a Evaluated);
+
+impl fmt::Display for MacroPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}::{}", self.0.library.name, self.0.name.as_str())
+    }
+}
+
+/// What an expansion was given, as [`input_item`] says it, for its span.
+struct InputItem<'a>(ProcMacroKind, &'a tt::TopSubtree);
+
+impl fmt::Display for InputItem<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&input_item(self.0, self.1))
+    }
 }
 
 fn system(why: impl fmt::Display) -> ProcMacroExpansionError {
@@ -393,9 +598,17 @@ impl Evaluated {
         // alloc: once per call, what its progress lines say
         let what = format!("the proc macro `{path}` for `{calling}`");
         let mut spent = run::Spent::default();
-        let ran = run::run(db, &what, &library.bridge, call.env, preset, &expansions, &mut spent);
+        let ran = match &library.engine {
+            Engine::Evaluator(bridge) => run::run(db, &what, bridge, call.env, preset, &expansions, &mut spent),
+            Engine::Wasm(module) => module.run(db, call.env, self.index, &expansions, &mut spent),
+        };
         run::ran_on(span, &spent, &ran);
-        ran.map_err(|stop| system(format_args!("{} {stop}", self.what())))
+        // An expansion that stopped (a budget, a refused call) names what it expanded and where,
+        // beside the macro and what stopped it: a step limit says the steps it ran.
+        ran.map_err(|stop| {
+            let item = input_item(self.kind, call.subtree);
+            system(format_args!("{}, expanding {item} in `{calling}`, {stop}", self.what()))
+        })
     }
 
     /// Whether the session of `calling` starts each call from nothing.
@@ -438,12 +651,28 @@ impl Evaluated {
     }
 
     fn expand_keyed(&self, db: &Db, calling: Crate, call: ProcMacroCall<'_>) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
-        let Some(keeping) = keeping() else {
-            let ran = self.run(db, calling, &call)?;
-            report_reads(ExpansionReads::Unknown("expansions are not kept here"));
-            return self.output(&ran, call.call_site);
-        };
         let library = &*self.library;
+        // One span per expansion, kept or run: which macro, on what, by which engine. The
+        // fields format only when a subscriber records them.
+        let _span = tracing::info_span!(
+            target: "blaze",
+            "proc macro expansion",
+            r#macro = %MacroPath(self),
+            input = %InputItem(self.kind, call.subtree),
+            engine = match library.engine {
+                Engine::Evaluator(_) => "evaluator",
+                Engine::Wasm(_) => "wasm",
+            },
+        )
+        .entered();
+        let keeping: &Keeping = match &library.macros.keeps {
+            Keeps::In(keeping) => keeping,
+            Keeps::Nothing(why) => {
+                let ran = self.run(db, calling, &call)?;
+                report_reads(ExpansionReads::Unknown(*why));
+                return self.output(&ran, call.call_site);
+            }
+        };
         let stateless = self.stateless(db, calling);
         let keyed = Call {
             name: self.name.as_str(),
@@ -462,22 +691,41 @@ impl Evaluated {
         given.part("edition", &[call.call_site.anchor.file_id.edition() as u8]);
         // Whether each `k#` the macro lexes is gated, which the crate's attributes say.
         given.part("forced_keywords", &[forced_keywords(db, calling) as u8]);
+        // A module's expansion is kept apart from the evaluator's, under the module it ran.
+        if let Engine::Wasm(module) = &library.engine {
+            given.part("wasm module", &module.id().0);
+        }
         let key = RunKey { code: library.code.get(db, library.krate), given: given.finish() };
         let mut inputs = Calling::new(call.env);
+        // What its key, reads and shape are written against: the calling crate's package and
+        // `OUT_DIR` (`proc_macro_api::kept::roots`).
+        let roots = proc_macro_api::kept::roots(call.env);
         let mut found = None;
         if stateless && library.seen.verdict() == Verdict::Stateless {
             let guard = blaze_cas::enter();
-            match index::find_reads(&keeping.expansions.store, &guard, &key, &mut inputs) {
-                Ok(Found::Hit { value, shape, values: Some(values), .. }) => {
-                    // alloc: what the query reporting it owns
-                    let reads = ExpansionReads::Traced { shape: shape.into(), values };
+            let mut rooted = blaze_usercode::roots::Rooted::new(roots, &mut inputs);
+            match index::find_reads(&keeping.expansions.store, &guard, &key, &mut rooted) {
+                Ok(Found::Hit { value, shape, values: Some(values), verified, .. }) => {
+                    let reads = match verified {
+                        // alloc: what the query reporting it owns
+                        None => ExpansionReads::Traced { shape: shape.into(), values },
+                        // Verified across checkouts: what it reports changes once it is
+                        // retracted, so what was filed by it is made again; a warm front
+                        // end is not lowered into again once a record is published
+                        // (`Keeping::retractions_now`).
+                        Some(unmarked) => {
+                            let depends = index::depends_key(&key, &unmarked);
+                            let (shape, values) = proc_macro_api::kept::verified_reads(&depends, shape, values);
+                            ExpansionReads::Traced { shape: shape.into(), values }
+                        }
+                    };
                     match keeping.mode {
                         Mode::Keep => {
                             let output = read(value, &spans).map_err(|why| system(format_args!("{}: {why}", self.what())))?;
                             report_reads(reads);
                             return Ok(output);
                         }
-                        Mode::Check => found = Some((checked(value), reads)),
+                        Mode::Check => found = Some((checked(value), reads, verified)),
                     }
                 }
                 Ok(Found::Hit { values: None, .. }) => {
@@ -489,41 +737,67 @@ impl Evaluated {
                     return Err(system(format_args!("{}: the store's {key:?} is not a shape: {why}", self.what())));
                 }
                 Err(FindError::Inputs(unreadable)) => return Err(system(format_args!("{}: {unreadable}", self.what()))),
+                Err(FindError::TooManyShapes { run }) => {
+                    return Err(system(format_args!(
+                        "{}: run {run:?} has more than {} shapes",
+                        self.what(),
+                        index::MOST_SHAPES
+                    )));
+                }
             }
         }
         let ran = self.run(db, calling, &call)?;
         let output = self.output(&ran, call.call_site)?;
         let bytes = written(&output, &spans);
-        if let Some((kept, reads)) = found {
-            if bytes.as_deref().map(checked) != Some(kept) {
+        // A check that found a value verified across checkouts expanding otherwise: the
+        // record that retracts it is put (durable before the job is done), the expansion is
+        // kept here alone below, and the check's error is what every way out gives.
+        let mut retracted = false;
+        if let Some((kept, reads, verified)) = found {
+            if bytes.as_deref().map(checked) == Some(kept) {
+                report_reads(reads);
+                return Ok(output);
+            }
+            let Some(unmarked) = verified else {
                 return Err(system(format_args!(
                     "{}: {}=check: it expanded otherwise than the store kept it, under a key of \
                      every input it was traced to read",
                     self.what(),
                     proc_macro_api::kept::CACHE
                 )));
-            }
-            report_reads(reads);
-            return Ok(output);
+            };
+            let record = verify::retraction(&key, &unmarked);
+            keeping.put(Put { keep: Keep::Durable { run: record.run, traced: record.traced }, value: record.value, what: self.what() });
+            retracted = true;
         }
+        let done = |output: tt::TopSubtree| match retracted {
+            false => Ok(output),
+            true => Err(system(format_args!(
+                "{}: {}=check: it expanded otherwise than the expansion verified across checkouts \
+                 for the same inputs: it depends on where its roots are, so it is recorded as doing \
+                 so and no checkout is given that expansion again",
+                self.what(),
+                proc_macro_api::kept::CACHE
+            ))),
+        };
         let unknown = |why: &'static str| {
             report_reads(ExpansionReads::Unknown(why));
         };
         if ran.asked {
             unknown("it asked the database");
-            return Ok(output);
+            return done(output);
         }
         if !stateless || !ran.statics.is_empty() || library.seen.verdict() == Verdict::Stateful {
             unknown("it ran with state its calls before it left");
-            return Ok(output);
+            return done(output);
         }
         if !ran.emitted.is_empty() {
             unknown("it emitted a diagnostic");
-            return Ok(output);
+            return done(output);
         }
         if ran.unkeyable.is_some() {
             unknown("what it read can't be keyed");
-            return Ok(output);
+            return done(output);
         }
         // alloc: once per kept expansion, its tracked paths made absolute
         let mut tracked = Vec::new();
@@ -534,17 +808,67 @@ impl Evaluated {
             .map_err(|why| system(format_args!("{}: {why}", self.what())))?;
         if index::untraceable(&traced) {
             unknown("it read what can't be traced (the clock, randomness)");
-            return Ok(output);
+            return done(output);
         }
-        report_reads(ExpansionReads::Traced {
-            shape: index::Shape::of(&traced).encode().into(), // alloc: once, as an expansion is kept
-            values: index::VALUES.traced(&traced),
-        });
+        // Kept and reported written against the crate's roots, marked with every one, and
+        // given to another checkout only once a second one expanded it the same
+        // (`blaze_usercode::roots::verify`). No copy for another to check when the output,
+        // a variable it read or a string its key was given still holds a root in any spelling
+        // (a literal path the macro made), it read outside its roots and the machine-wide
+        // places, the cargo home's registry and git checkouts among them, or a root's links
+        // moved since the memo was made (then it is made again).
+        let kept = library.kept_roots(db, calling, roots, keeping.expansions.environment.passed());
+        let view = kept.map.view();
+        let marked = view.kept_bytes(&traced, bytes.as_deref(), proc_macro_api::kept::left(&keyed, &view));
+        if marked.relinked {
+            library.kept_roots.pin().remove(&calling);
+        }
         let Some(value) = bytes else {
-            return Ok(output);
+            // Nothing is kept: what it read is reported as this checkout's.
+            report_reads(ExpansionReads::Traced {
+                shape: index::Shape::of(&marked.local).encode().into(), // alloc: once, as an expansion is kept
+                values: index::VALUES.traced(&marked.local),
+            });
+            return done(output);
         };
-        put(Put { run: key, traced, value, what: self.what() });
-        Ok(output)
+        let puts = match retracted {
+            // Retracted: kept here alone, as no checkout is given what was verified (the
+            // record is not in the store yet, so [`verify::keeps`] would not see it).
+            // alloc: once, its one put
+            true => vec![verify::Put { run: key, traced: marked.local, value, durable: false }],
+            false => {
+                let guard = blaze_cas::enter();
+                let store = &keeping.expansions.store;
+                let same = |theirs: &[u8], ours: &[u8]| -> Result<Option<String>, String> {
+                    Ok((theirs != ours).then(|| "its output differs".to_owned())) // alloc: a difference said
+                };
+                let keeps = verify::keeps(|key| Ok(store.get(&guard, key)?.map(|it| it.bytes)), &view, &key, marked, value, same);
+                keeps.map_err(|error| system(format_args!("{}: keeping it: {error:?}", self.what())))?.0
+            }
+        };
+        // What it reports is the put made under its own key: here, marked with every root, or
+        // verified, with the roots that were the same in every checkout compared, and then
+        // also whether it was retracted since ([`proc_macro_api::kept::verified_reads`]).
+        if let Some(it) = puts.iter().find(|it| it.run == key) {
+            // alloc: once, as an expansion is kept
+            let shape = index::Shape::of(&it.traced).encode();
+            let values = index::VALUES.traced(&it.traced);
+            let reads = match index::split_verified(&it.value) {
+                None => ExpansionReads::Traced { shape: shape.into(), values },
+                Some((unmarked, _)) => {
+                    let (shape, values) = proc_macro_api::kept::verified_reads(&index::depends_key(&key, &unmarked), &shape, values);
+                    ExpansionReads::Traced { shape: shape.into(), values }
+                }
+            };
+            report_reads(reads);
+        }
+        // A record that a value verified across checkouts depends on where its roots are (another
+        // checkout's copy expanded otherwise) is durable before the job is done: a crash
+        // before would forget it, and the expansion would be verified and given again.
+        for it in puts {
+            keeping.put(Put::of(it, self.what()));
+        }
+        done(output)
     }
 }
 

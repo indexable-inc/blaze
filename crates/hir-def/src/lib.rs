@@ -8,13 +8,16 @@
 //! actually true.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, register_tool)]
+// `#[blaze::noalloc]` (docs/v2/plan/lanes/effects.md); inert under rustc.
+#![register_tool(blaze)]
 #![deny(unsafe_code)]
 
 extern crate rustc_parse_format;
 
 pub extern crate rustc_abi;
 pub extern crate rustc_abi as layout;
+extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 
 pub mod attrs;
 pub mod builtin_type;
@@ -781,7 +784,7 @@ impl ModuleId {
     pub fn macro_use_prelude(
         self,
         db: &Db,
-    ) -> &blaze_hash::HashMap<Name, (MacroId, Option<ExternCrateId>)> {
+    ) -> &blaze_hash::HashMap<Name, (MacroId, Option<ExternCrateId>), std::alloc::Global> {
         crate_def_map(db, self.krate(db)).macro_use_prelude()
     }
 }
@@ -1829,6 +1832,7 @@ mod loc_hash_tests {
     };
 
     use blaze_hash::{FixedState, HashSet};
+    use std::alloc::Global;
     use blaze_query::db::FromId;
     use hir_expand::{
         EditionedFileId, HirFileId, InFile, MacroCallId, MacroCallStyles,
@@ -1944,7 +1948,7 @@ mod loc_hash_tests {
     #[test]
     fn expander_words_are_distinct() {
         let all = expanders();
-        let words: HashSet<u16> = all.iter().map(|it| it.hash_word()).collect();
+        let words: HashSet<u16, Global> = all.iter().map(|it| it.hash_word()).collect();
         assert_eq!(words.len(), all.len());
     }
 

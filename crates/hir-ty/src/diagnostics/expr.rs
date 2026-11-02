@@ -4,6 +4,7 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, EnumVariantId, HasModule, ItemContainerId,
@@ -60,13 +61,15 @@ impl<'db> BodyValidationDiagnostic<'db> {
         owner: DefWithBodyId,
         validate_lints: bool,
     ) -> Vec<BodyValidationDiagnostic<'db>> {
-        let _p = tracing::info_span!("BodyValidationDiagnostic::collect").entered();
+        let _p = tracing::info_span!(target: "blaze", "BodyValidationDiagnostic::collect").entered();
         let infer = InferenceResult::of(db, owner);
         let body = Body::of(db, owner);
         let env = db.trait_environment(owner.generic_def(db));
         let interner = DbInterner::new_with(db, owner.krate(db));
         let infcx =
             interner.infer_ctxt().build(TypingMode::typeck_for_body(interner, owner.into()));
+        // With what the body's `for const` loops assume of their binders, as inference had it.
+        let env = crate::comptime_env::body_env(&infcx, infer, env);
         let mut validator = ExprValidator {
             owner,
             body,
@@ -438,7 +441,7 @@ pub fn record_literal_missing_fields<'db>(
 
     let variant_data = variant_def.fields(db);
 
-    let specified_fields: HashSet<_> = fields.iter().map(|f| &f.name).collect();
+    let specified_fields: HashSet<_, Global> = fields.iter().map(|f| &f.name).collect();
     // don't show missing fields if:
     // - has ..expr
     // - or has default value + ..
@@ -492,7 +495,7 @@ pub fn record_pattern_missing_fields<'db>(
 
     let variant_data = variant_def.fields(db);
 
-    let specified_fields: HashSet<_> = fields.iter().map(|f| &f.name).collect();
+    let specified_fields: HashSet<_, Global> = fields.iter().map(|f| &f.name).collect();
     // don't show missing fields if:
     // - in code
     // - or has ..

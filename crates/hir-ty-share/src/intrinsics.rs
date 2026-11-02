@@ -50,7 +50,14 @@ pub fn classify(intrinsic: Intrinsic) -> Class {
         | ConstEvalSelect
         | ContractCheckEnsures
         | ContractCheckRequires
-        | RustcPeek => Class::Identity,
+        | RustcPeek
+        // `core::reflect`'s: a field's or variant's name, index and attributes, which a layout
+        // does not tell apart.
+        | BlazeAdtName
+        | BlazeFieldAttrs
+        | BlazeFieldIndex
+        | BlazeVariantDiscriminant
+        | BlazeVariantIndex => Class::Identity,
         Autodiff | Offload => Class::PerInstance,
         Atomic(..)
         | Simd(_)
@@ -113,6 +120,7 @@ pub fn classify(intrinsic: Intrinsic) -> Class {
         | FsubAlgebraic
         | FsubFast
         | GpuLaunchSizedWorkgroupMem
+        | BlazeIntCast
         | IntegerMax
         | IntegerMin
         | IsValStaticallyKnown

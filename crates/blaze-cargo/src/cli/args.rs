@@ -335,6 +335,16 @@ pub enum Asked {
     Debug(Vec<OsString>),
     /// `blaze explain VIEW ...`, with the words after it ([`super::observe::explain`]).
     Explain(Vec<OsString>),
+    /// `blaze why [ITEM]`, with the words after it ([`super::observe::why`]).
+    Why(Vec<OsString>),
+    /// `blaze pprof FILE|URL ...`, with the words after it ([`super::pprof::main`]).
+    Pprof(Vec<OsString>),
+    /// `blaze perf record|runs|diff ...`, with the words after it ([`super::perf::main`]).
+    Perf(Vec<OsString>),
+    /// `blaze clean`, with the words after it ([`super::clean::main`]).
+    Clean(Vec<OsString>),
+    /// `blaze cache`, with the words after it ([`super::cache::main`]).
+    Cache(Vec<OsString>),
     Help(Option<Command>),
     Version,
     /// A command that is none of blaze's.
@@ -610,6 +620,11 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("explore") => return Ok(Asked::Explore(words.collect())),
             Some("debug") => return Ok(Asked::Debug(words.collect())),
             Some("explain") => return Ok(Asked::Explain(words.collect())),
+            Some("why") => return Ok(Asked::Why(words.collect())),
+            Some("pprof") => return Ok(Asked::Pprof(words.collect())),
+            Some("perf") => return Ok(Asked::Perf(words.collect())),
+            Some("clean") => return Ok(Asked::Clean(words.collect())),
+            Some("cache") => return Ok(Asked::Cache(words.collect())),
             Some("daemon") => {
                 return Ok(match words.next().as_deref().and_then(std::ffi::OsStr::to_str) {
                     Some("install") => Asked::Daemon(DaemonVerb::Install),

@@ -6,10 +6,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    sync::{
-        LazyLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -37,7 +34,9 @@ pub struct Flown {
 }
 
 /// The compiles under way, by the number each took.
-static LIVE: LazyLock<SharedMap<u64, (Crate, String, Instant)>> = LazyLock::new(Default::default);
+#[expect(clippy::disallowed_types, reason = "the process's one table of compiles under way, which the terminal reads from any thread")]
+static LIVE: std::sync::LazyLock<SharedMap<u64, (Crate, String, Instant)>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// The compiles done since [`begin`] that took [`SLOW`] or more: the [`KEPT`] slowest, a lock
 /// only a compile that slow takes.

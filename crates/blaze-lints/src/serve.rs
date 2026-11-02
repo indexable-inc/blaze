@@ -11,6 +11,7 @@ use blaze_diagnostics::{
     model::{Child, Diag},
 };
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -81,7 +82,7 @@ pub struct Message {
 #[derive(Debug, Default)]
 pub struct Setups {
     /// By manifest directory: each setup made there, with what it was made of.
-    by_dir: HashMap<PathBuf, Vec<(SetupOf, Result<Setup, String>)>>,
+    by_dir: HashMap<PathBuf, Vec<(SetupOf, Result<Setup, String>)>, Global>,
 }
 
 /// What of a [`Package`] its [`Setup`] is made from, besides its manifest directory.
@@ -170,7 +171,7 @@ pub fn answer_with<P: AsRef<Path>>(
     let setups = &*setups;
     // alloc: a request's packages, once per request
     let mut chosen: Vec<Option<&Setup>> = Vec::with_capacity(ask.packages.len());
-    let mut by_dir: HashMap<&Path, usize> = HashMap::default();
+    let mut by_dir: HashMap<&Path, usize, Global> = HashMap::new_in(Global);
     for (at, package) in ask.packages.iter().enumerate() {
         by_dir.entry(package.manifest_dir.as_path()).or_insert(at);
         match setups.get(package) {
@@ -189,7 +190,7 @@ pub fn answer_with<P: AsRef<Path>>(
     };
     // A crate built for its tests as well is linted once, as that build: what it finds outside
     // `cfg(test)` is what the plain build finds.
-    let tested: HashSet<FileId> = crates
+    let tested: HashSet<FileId, Global> = crates
         .iter()
         .filter(|&&it| has_tests(it))
         .map(|&it| hir::Crate::from(it).root_file(db))
@@ -236,7 +237,9 @@ pub fn answer_with<P: AsRef<Path>>(
 fn setup(package: &Package) -> Result<Setup, String> {
     let command_line = CommandLine::parse(&package.flags)?;
     let path = conf::find(package.conf_dir.as_deref(), &package.manifest_dir);
-    let conf = Conf::load(path, package.rust_version.as_deref())?;
+    // The profile `clippy.toml` names, read once per request; this path is given no workspace
+    // metadata, so `[workspace.metadata.blaze.lints]`'s `profile` is `blaze check`'s alone.
+    let conf = Conf::load(path, package.rust_version.as_deref())?.with_profile(None)?;
     Ok(Setup { command_line, conf })
 }
 
@@ -254,8 +257,8 @@ pub(crate) fn written<'a>(
     for name in sources.unread(found.iter().map(|it| &it.diagnostic)) {
         sources.add(name, read(name));
     }
-    let mut once: HashSet<Child> = HashSet::default();
-    let mut seen = HashSet::default();
+    let mut once: HashSet<Child, Global> = HashSet::new_in(Global);
+    let mut seen = HashSet::new_in(Global);
     let mut messages = Vec::new();
     for Found { diagnostic, .. } in found {
         // clone: a diagnostic of the crate, once per build it is written in

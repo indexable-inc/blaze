@@ -5,6 +5,7 @@
 use parking_lot::Mutex;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_query::db::{Database as _, Event, EventKind};
 
 use super::Db;
@@ -13,7 +14,7 @@ use super::Db;
 const ORDER_KEPT: usize = 300;
 
 /// By ingredient index ([`blaze_query::db::Storage::ingredient_name`] names one).
-static RAN: Mutex<Option<HashMap<u32, u32>>> = Mutex::new(None);
+static RAN: Mutex<Option<HashMap<u32, u32, Global>>> = Mutex::new(None);
 static ORDER: Mutex<Vec<u32>> = Mutex::new(Vec::new()); // alloc: empty until traced
 
 /// Whether a database made now counts its executions.

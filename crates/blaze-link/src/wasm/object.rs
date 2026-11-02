@@ -8,7 +8,7 @@
 //! init functions [`Class::InitArray`] pieces of their priority holding the function's slot.
 //! The format: <https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md>.
 
-use std::collections::hash_map::Entry;
+use blaze_hash::hash_map::Entry;
 use std::ops::Range;
 
 use blaze_hash::HashMap;
@@ -147,8 +147,8 @@ fn archive(bytes: &[u8], whole: bool) -> Result<Archive, String> {
             // A BSD `__.SYMDEF` names its strings by offset, so many entries may name one: each
             // string is pushed once, keyed by where it is in the input (O(1) per entry, and the
             // arena no bigger than the index's strings).
-            let mut pushed: HashMap<(usize, usize), Name> =
-                HashMap::with_capacity_and_hasher(entries, Default::default());
+            let mut pushed: HashMap<(usize, usize), Name, std::alloc::Global> =
+                HashMap::with_capacity_in(entries, std::alloc::Global);
             for symbol in symbols {
                 // alloc: error path
                 let symbol = symbol.map_err(|e| format!("the archive's index: {e}"))?;
@@ -351,7 +351,14 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                 id::DATA_COUNT => {
                     r.uleb32()?;
                 }
-                id::TABLE | id::MEMORY | id::GLOBAL | id::START | id::ELEMENT | id::TAG => {
+                // LLVM's element section lists the functions whose address the object takes
+                // (wasi-sdk's `libc.a` has it): the module's table is the link's, a slot for
+                // each function a `TABLE_INDEX_*` relocation names, so it is left, as wasm-ld
+                // leaves it.
+                id::ELEMENT => {
+                    r.take_rest();
+                }
+                id::TABLE | id::MEMORY | id::GLOBAL | id::START | id::TAG => {
                     // alloc: error path
                     return Err(format!(
                         "a {} section, which LLVM's objects don't have: linked module or \
@@ -361,7 +368,6 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                             id::MEMORY => "memory",
                             id::GLOBAL => "global",
                             id::START => "start",
-                            id::ELEMENT => "element",
                             _ => "tag",
                         }
                     ));
@@ -908,9 +914,9 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
         }
         let run = fixups.len() as u32;
         for r in relocs_of(custom.index) {
-            let at = start_of(custom.index) + r.offset;
-            let offset = at
-                .checked_sub(custom.payload.start)
+            // A custom section's relocation is at an offset from its payload, after its name
+            // (LLVM's `ContentsOffset`, which its reader checks so), not from its contents.
+            let offset = Some(r.offset)
                 .filter(|&it| it + width(r.r_type) <= custom.payload.len())
                 // alloc: error path
                 .ok_or_else(|| format!("{} outside the section `{}`", named(r), custom.name))?;
@@ -1336,8 +1342,9 @@ mod tests {
 
         reloc_section(&mut out, "reloc.CODE", 4, code_relocs);
         reloc_section(&mut out, "reloc.DATA", 5, &[(2, 28, 1, 0)]);
-        // `.debug_info`'s contents start with its name: 12 bytes.
-        reloc_section(&mut out, "reloc..debug_info", 7, &[(9, 12, 9, 0)]);
+        // At `.debug_info`'s payload's first byte: offsets in a custom section are from after
+        // its name, as LLVM writes and reads them.
+        reloc_section(&mut out, "reloc..debug_info", 7, &[(9, 0, 9, 0)]);
         out
     }
 

@@ -66,6 +66,7 @@ use std::{
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::{Handle, Slab, Tag as MemTag, scratch};
 use blaze_radix as radix;
 
@@ -1587,7 +1588,7 @@ pub struct Uring {
     lent: ops::Lent,
     /// Each file opened, for reading and appending, and the name each is kept under.
     kept: Slab<Kept>,
-    names: HashMap<FileName, Handle<Kept>>,
+    names: HashMap<FileName, Handle<Kept>, Global>,
     /// Every request in flight or waiting, by the handle its `user_data` carries ([`data`]).
     /// Not freed while the kernel may still read or write what a request holds (see `Drop`).
     ops: ManuallyDrop<ops::Ops>,
@@ -1615,12 +1616,12 @@ pub struct Uring {
     /// Completions to hand out at the next poll, in order.
     ready: Vec<Completion>,
     /// The request reading each watch's events, by the watch's tag.
-    watches: HashMap<Tag, Id>,
+    watches: HashMap<Tag, Id, Global>,
     /// What each watch's read reads for. Not freed while the kernel may still write into a
     /// buffer of one (see `Drop`).
     watchings: ManuallyDrop<Slab<Watching>>,
     /// The request accepting each listen's connections, by the listen's tag.
-    listens: HashMap<Tag, Id>,
+    listens: HashMap<Tag, Id, Global>,
     /// What each listen accepts on, by the handle in its accept's [`ops::Hot::of`].
     listeners: Slab<crate::net::Listener>,
     /// Each connect in flight, by the handle in its request's [`ops::Hot::of`]. Not freed while
@@ -1628,7 +1629,7 @@ pub struct Uring {
     connectings: ManuallyDrop<Slab<Connecting>>,
     spawns: Slab<Spawning>,
     /// Each spawn in flight by its tag, for a kill.
-    spawning: HashMap<Tag, Handle<Spawning>>,
+    spawning: HashMap<Tag, Handle<Spawning>, Global>,
     conns: Slab<Connection>,
     /// By ticks since `start`; a wait of the ring ends at the next one due.
     timers: Wheel<Tag>,
@@ -1673,7 +1674,7 @@ impl Uring {
             provided,
             lent: ops::Lent::new(DIRECT_BUFFERS),
             kept: slab(KEPT)?,
-            names: HashMap::default(),
+            names: HashMap::new_in(Global),
             ops: ManuallyDrop::new(ops::Ops::new(PENDING).map_err(io::Error::other)?),
             paths: ManuallyDrop::new(ops::Paths::new().map_err(io::Error::other)?),
             // alloc: setup, once per driver: room for as many as the ring holds.
@@ -1689,13 +1690,13 @@ impl Uring {
             direct_writes: 0,
             zero_copy_sends: 0,
             ready: Vec::new(), // alloc: empty, nothing allocated; reused after.
-            watches: HashMap::default(),
+            watches: HashMap::new_in(Global),
             watchings: ManuallyDrop::new(slab(WATCHES)?),
-            listens: HashMap::default(),
+            listens: HashMap::new_in(Global),
             listeners: slab(LISTENS)?,
             connectings: ManuallyDrop::new(slab(CONNS)?),
             spawns: slab(SPAWNS)?,
-            spawning: HashMap::default(),
+            spawning: HashMap::new_in(Global),
             conns: slab(CONNS)?,
             timers: Wheel::new(),
             confine: None,
@@ -1999,7 +2000,7 @@ fn unflushed(ready: &mut Vec<Completion>, flushes: &mut Vec<Tag>) {
 
 /// Forgets the descriptor kept for `name`: the name now is another file. It is closed once no
 /// request in flight holds it.
-fn forget(names: &mut HashMap<FileName, Handle<Kept>>, kept: &mut Slab<Kept>, name: &FileName) {
+fn forget(names: &mut HashMap<FileName, Handle<Kept>, Global>, kept: &mut Slab<Kept>, name: &FileName) {
     let Some(file) = names.remove(name) else { return };
     let it = kept.get_mut(file).expect("named files are kept");
     it.named = false;
@@ -2139,13 +2140,18 @@ impl Driver for Uring {
                 Effect::Write { file, bytes, .. } => self.write(tag, file, bytes).map(|()| None),
                 Effect::Clone { from, to, .. } => self.copy(tag, Kind::Clone, &from, &to).map(|()| None),
                 Effect::Link { from, to, .. } => self.copy(tag, Kind::Link, &from, &to).map(|()| None),
-                Effect::Stat { file, .. } => self.look(tag, Kind::Stat, &file).map(|()| None),
+                Effect::Stat { file, .. } => self.look(tag, Kind::Stat, true, &file).map(|()| None),
+                Effect::Lstat { file, .. } => self.look(tag, Kind::Stat, false, &file).map(|()| None),
                 list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
                 private @ Effect::Private { .. } => self.off_ring(private).map(|()| None),
                 Effect::WriteAt { file, at, bytes, .. } => self.write_at(tag, &file, at, bytes).map(|()| None),
                 Effect::Rename { from, to, .. } => self.rename(tag, &from, &to).map(|()| None),
                 Effect::Mode { file, mode, .. } => {
                     under(&self.root, &file, |path| crate::fs::set_mode(path, mode)).map(|()| Some(Done::Moded))
+                }
+                // An open, an `fstat` and an `fchmod`, here as a mode is set.
+                Effect::Seal { file, mode, .. } => {
+                    under(&self.root, &file, |path| crate::fs::seal(path, mode)).map(|()| Some(Done::Moded))
                 }
                 // No io_uring op sets a file's times: one `utimensat` here on the driver's
                 // thread, as a mode is set, its path in the thread's scratch buffers. A thread
@@ -2217,7 +2223,7 @@ impl Driver for Uring {
                     self.timers.insert(due, tag);
                     Ok(None)
                 }
-                Effect::Map { file, .. } => self.look(tag, Kind::Map, &file).map(|()| None),
+                Effect::Map { file, .. } => self.look(tag, Kind::Map, true, &file).map(|()| None),
                 Effect::Spawn { command, .. } => self.spawn(tag, command).map(|()| None),
                 Effect::Listen { at: address, .. } => {
                     crate::net::listen(&self.root, &address).and_then(|listener| {
@@ -3322,7 +3328,7 @@ mod tests {
         for seed in 0..64 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut ours = ops::Ops::new(PENDING).unwrap();
-            let mut theirs: HashMap<u64, Model> = HashMap::default();
+            let mut theirs: HashMap<u64, Model, Global> = HashMap::new_in(Global);
             let (mut live, mut ended): (Vec<(u64, Id)>, Vec<Id>) = (Vec::new(), Vec::new());
             for next in 0..2_000u64 {
                 match rng.below(4) {

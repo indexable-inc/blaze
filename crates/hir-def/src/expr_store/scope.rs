@@ -471,6 +471,23 @@ impl<S: ScopeSink> StoreVisitor for ExprScopeVisitor<'_, S> {
                 let scope = self.new_scope(self.scope, NewScope::labeled(label));
                 self.with_scope(scope, |this| this.on_expr(body));
             }
+            // `for const`: `pat`'s bindings are constants of each unrolled copy, so they are in
+            // scope in the body and also in its `const { .. }` blocks and array lengths.
+            Expr::ComptimeFor { pat, iterable, body, label } => {
+                self.on_expr(iterable);
+                let scope = self.new_scope(self.scope, NewScope::labeled(label));
+                let const_scope = self.new_scope(self.const_scope, NewScope::Plain);
+                let (store, scopes) = (self.store, &mut *self.scopes);
+                store.walk_bindings_in_pat(pat, |binding| {
+                    add_binding(&mut *scopes, store, const_scope, binding)
+                });
+                let old_const_scope = mem::replace(&mut self.const_scope, const_scope);
+                self.with_scope(scope, |this| {
+                    this.on_pat(pat);
+                    this.on_expr(body);
+                });
+                self.const_scope = old_const_scope;
+            }
             Expr::Closure { args, arg_types, ret_type, body, capture_by: _, closure_kind: _ } => {
                 arg_types.iter().for_each(|type_ref| self.on_type_opt(*type_ref));
                 self.on_type_opt(ret_type);

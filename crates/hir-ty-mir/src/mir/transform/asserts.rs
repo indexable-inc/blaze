@@ -282,6 +282,13 @@ fn binary_op<'db>(
         }
         BinOp::Shl | BinOp::Shr => {
             let rhs_ty = operand_ty(ctx, body, &b);
+            // An amount of a type too narrow to reach the width (a `u2` amount of a `u8`, under
+            // `#![blaze::arbitrary_ints]`) is always in bounds, and the bound would not fit
+            // its type.
+            let amount_bits = value_bits(ctx, rhs_ty);
+            if amount_bits < 64 && 1u64 << amount_bits <= value_bits(ctx, ty) {
+                return Rvalue::BinaryOp(op, a, b);
+            }
             let mut setup = ArrayVec::new();
             let (unsigned, unsigned_ty) = match rhs_ty.kind() {
                 TyKind::Int(int) => {
@@ -298,8 +305,7 @@ fn binary_op<'db>(
                 }
                 _ => (copy(&b), rhs_ty),
             };
-            let bits = ty.primitive_size(ctx.infcx.interner).bits();
-            let bits = int_value(ctx, unsigned_ty, u128::from(bits));
+            let bits = int_value(ctx, unsigned_ty, u128::from(value_bits(ctx, ty)));
             let inbounds = temp(body, ctx.bool_ty());
             setup.push(Statement {
                 kind: StatementKind::Assign(
@@ -406,13 +412,29 @@ enum Bound {
 }
 
 fn int_const<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, bound: Bound) -> Operand {
-    let bytes = ty.primitive_size(ctx.infcx.interner).bytes() as u32;
     let value = match bound {
         Bound::Zero => 0,
         Bound::MinusOne => u128::MAX,
-        Bound::Min => 1u128 << (bytes * 8 - 1),
+        // The least value at the type's width, sign-extended: `i8`'s `0x80`, and `i3`'s
+        // `0xFC` in the `i8` it is stored as (`#![blaze::arbitrary_ints]`).
+        Bound::Min => (-(1i128 << (value_bits(ctx, ty) - 1))) as u128,
     };
     int_value(ctx, ty, value)
+}
+
+/// How many bits a value of the integer type `ty` has: its size's, but for an integer of
+/// `#![blaze::arbitrary_ints]`, whose value is narrower than what it is stored in (`u3` in a
+/// `u8`; docs/v2/plan/lanes/frontend/arbitrary-ints.md).
+fn value_bits<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> u64 {
+    let width = match ty.kind() {
+        TyKind::Int(it) => it.arbitrary_width(),
+        TyKind::Uint(it) => it.arbitrary_width(),
+        _ => None,
+    };
+    match width {
+        Some(width) => u64::from(width.bits()),
+        None => ty.primitive_size(ctx.infcx.interner).bits(),
+    }
 }
 
 /// The integer `value` of the integer type `ty`, truncated to its width.
@@ -430,6 +452,7 @@ fn unsigned_of(int: rustc_type_ir::IntTy) -> rustc_type_ir::UintTy {
         IntTy::I32 => UintTy::U32,
         IntTy::I64 => UintTy::U64,
         IntTy::I128 => UintTy::U128,
+        IntTy::Bits(it) => UintTy::Bits(it),
     }
 }
 

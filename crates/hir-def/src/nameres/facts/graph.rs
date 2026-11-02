@@ -11,7 +11,7 @@
 //! worklist over `(module, name)` pairs interned to `u32`: each fact is derived once and sent
 //! only to the consumers it is new for (difference propagation), with no recursion.
 
-use std::{iter, sync::LazyLock};
+use std::iter;
 
 use base_db::Crate;
 use blaze_hash::FixedState;
@@ -120,7 +120,8 @@ pub(super) struct ImportGraph<'f> {
 impl<'f> ImportGraph<'f> {
     /// The graph of `edges` (`(reader, read)`) over `nodes` modules, by `Csr`'s two counting
     /// sorts (by target, then stably by source), so it depends on the set of edges only, not
-    /// their order or repeats. Columns and scratch are in `frame`.
+    /// their order or repeats. Columns and scratch are in `frame`: `#[blaze::noalloc]`.
+    #[blaze::noalloc]
     pub(super) fn from_edges(frame: &'f Frame, nodes: u32, edges: &[(u32, u32)]) -> ImportGraph<'f> {
         let kept = edges.iter().copied().filter(move |&(src, dst)| {
             assert!(src < nodes && dst < nodes, "import graph edge {src} -> {dst} outside {nodes} modules");
@@ -269,7 +270,8 @@ pub(super) fn import_graph<'f>(frame: &'f Frame, shape: &ImportShape) -> ImportG
 
 /// Blaze's test harness module (`blaze-engine`'s `test_harness::MODULE`). A path of the harness
 /// reads the children of the harness's parent (`DefMap::is_test_harness`).
-static TEST_HARNESS: LazyLock<Symbol> = LazyLock::new(|| Symbol::intern("__blaze_test_harness"));
+#[expect(clippy::disallowed_types, reason = "the process's one test harness name symbol for this solver: the constant is interned once")]
+static TEST_HARNESS: std::sync::LazyLock<Symbol> = std::sync::LazyLock::new(|| Symbol::intern("__blaze_test_harness"));
 
 const ROOT: u32 = 0;
 const NONE: u32 = u32::MAX;

@@ -46,12 +46,53 @@ fn specializes_query_cycle(_db: &Db, _: blaze_query::db::Id, _pair: ImplPair) ->
     false
 }
 
-/// Whether the crate of `impl_id` enables `specialization` or `min_specialization`: only
-/// then may it specialize another impl.
+/// How a crate may specialize, and which rules its specializing impls are held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpecializationMode {
+    /// Neither feature nor blaze's extension: no impl of the crate specializes another.
+    Off,
+    /// `#![feature(specialization)]` alone: rustc checks nothing of a specializing impl
+    /// (the feature is `incomplete` and unsound), and neither does blaze.
+    Unchecked,
+    /// `#![feature(min_specialization)]`: rustc's `check_min_specialization`, ported, with
+    /// `#[rustc_unsafe_specialization_marker]` traits allowed as rustc allows them.
+    Rustc,
+    /// `#![blaze::specialization]`: blaze's sound subset, rustc's always-applicable rule with
+    /// no unsafe marker and `default fn` the only specializable item
+    /// (docs/v2/plan/lanes/frontend/specialization.md). It wins over either feature.
+    Blaze,
+}
+
+impl SpecializationMode {
+    /// Whether an impl of the crate may specialize another.
+    pub fn may_specialize(self) -> bool {
+        self != SpecializationMode::Off
+    }
+}
+
+/// How `krate` may specialize: from its `#![feature]`s and its root's `#![blaze::specialization]`.
+pub fn specialization_mode(db: &Db, krate: base_db::Crate) -> SpecializationMode {
+    let root = hir_def::nameres::crate_def_map(db, krate).root_module_id();
+    if hir_def::attrs::AttrFlags::query(db, hir_def::AttrDefId::ModuleId(root))
+        .contains(hir_def::attrs::AttrFlags::BLAZE_SPECIALIZATION)
+    {
+        return SpecializationMode::Blaze;
+    }
+    let features = UnstableFeatures::query(db, krate);
+    if features.min_specialization {
+        SpecializationMode::Rustc
+    } else if features.specialization {
+        SpecializationMode::Unchecked
+    } else {
+        SpecializationMode::Off
+    }
+}
+
+/// Whether the crate of `impl_id` enables `specialization`, `min_specialization` or blaze's
+/// `#![blaze::specialization]`: only then may it specialize another impl.
 #[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub(crate) fn may_specialize(db: &Db, impl_id: ImplId) -> bool {
-    let features = UnstableFeatures::query(db, impl_id.krate(db));
-    features.specialization || features.min_specialization
+    specialization_mode(db, impl_id.krate(db)).may_specialize()
 }
 
 /// Is `specializing_impl_def_id` a specialization of `parent_impl_def_id`?
@@ -176,8 +217,9 @@ pub(crate) fn specializes(
 }
 
 /// The impl that `impl_id` takes an item it leaves out from: the closest of the impls it
-/// specializes for which `has_item` holds.
-pub(crate) fn specialized_ancestor(
+/// specializes for which `has_item` holds. With `|_| true`, rustc's parent of `impl_id` in
+/// its trait's specialization graph (`ancestors(..).nth(1)`), when that is an impl.
+pub fn specialized_ancestor(
     db: &Db,
     impl_id: ImplId,
     has_item: impl Fn(ImplId) -> bool,

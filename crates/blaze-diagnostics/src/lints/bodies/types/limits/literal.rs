@@ -139,10 +139,21 @@ pub(super) fn lint_literal(b: &BodyCx<'_, '_, '_>, expr: ExprId, negation: Optio
                 return;
             }
             let Ok(value) = number.value() else { return };
+            if t.arbitrary_width().is_some() {
+                let (min, max) = int_ty_range(t);
+                refuse_arbitrary(b, &lit, t.name_str(), (min, max as u128), value, negation, out);
+                return;
+            }
             lint_int_literal(b, &lit, t, value, negation, out);
         }
         TyKind::Uint(t) => {
             if negation.is_some() {
+                return;
+            }
+            if t.arbitrary_width().is_some() {
+                let ast::LiteralKind::IntNumber(number) = &lit.kind else { return };
+                let Ok(value) = number.value() else { return };
+                refuse_arbitrary(b, &lit, t.name_str(), (0, uint_ty_range(t).1), value, None, out);
                 return;
             }
             lint_uint_literal(b, &lit, t, out);
@@ -174,6 +185,43 @@ pub(super) fn lint_literal(b: &BodyCx<'_, '_, '_>, expr: ExprId, negation: Optio
         }
         _ => {}
     }
+}
+
+/// blaze: a literal out of the range of an integer of `#![blaze::arbitrary_ints]`
+/// (docs/v2/plan/lanes/frontend/arbitrary-ints.md), `ty` with the range `min..=max`, of
+/// magnitude `value` and negated when `negation` is the `-`'s span. Such a type is new, so no
+/// program's meaning rests on its literal wrapping: unlike `overflowing_literals` of a
+/// standard type it is a hard error at every lint level, naming the literal as written, the
+/// type and its range.
+fn refuse_arbitrary(
+    b: &BodyCx<'_, '_, '_>,
+    lit: &Lit<'_>,
+    ty: &str,
+    (min, max): (i128, u128),
+    value: u128,
+    negation: Option<Span>,
+    out: &mut Vec<Found>,
+) {
+    let negative = negation.is_some();
+    let fits = match negative {
+        true => value <= min.unsigned_abs(),
+        false => value <= max,
+    };
+    if fits {
+        return;
+    }
+    // clone: a span or node handle, for a literal `may_overflow` found
+    let span = negation.unwrap_or_else(|| lit.span.clone());
+    // alloc: the error's text, for a literal `may_overflow` found
+    let written = snippet(b, &span).unwrap_or_else(|| if negative { format!("-{value}") } else { value.to_string() });
+    // alloc: the error's text, for a literal `may_overflow` found
+    let mut diag = Diag::error(None, format!("literal `{written}` out of range for `{ty}`"), span);
+    // alloc: the error's text, for a literal `may_overflow` found
+    diag.note(format!(
+        "`{ty}` holds `{min}..={max}`, and a literal of an integer of `#![blaze::arbitrary_ints]` must fit its type"
+    ));
+    b.code_fact(&mut diag);
+    out.push(Found::new(diag, Phase::Bodies));
 }
 
 /// The literal `expr` is written as, and whether it is a pattern's with a `-` before it.
@@ -225,6 +273,10 @@ pub(super) fn int_ty_range(t: IntTy) -> (i128, i128) {
         IntTy::I32 => (i32::MIN.into(), i32::MAX.into()),
         IntTy::I64 => (i64::MIN.into(), i64::MAX.into()),
         IntTy::I128 => (i128::MIN, i128::MAX),
+        IntTy::Bits(width) => {
+            let half = 1i128 << (width.bits() - 1);
+            (-half, half - 1)
+        }
     }
 }
 
@@ -236,6 +288,7 @@ pub(super) fn uint_ty_range(t: UintTy) -> (u128, u128) {
         UintTy::U32 => u32::MAX.into(),
         UintTy::U64 => u64::MAX.into(),
         UintTy::U128 => u128::MAX,
+        UintTy::Bits(width) => (1u128 << width.bits()) - 1,
     };
     (0, max)
 }

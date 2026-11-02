@@ -6,9 +6,18 @@
 
 use base_db::{Crate, FileText};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir_expand::proc_macro::ProcMacros;
 
 use super::{ContentId, Db, LowerError, Lowered};
+use blaze_units::{query::UnitPlan, schema::Unit};
+
+/// Whether `unit` is a proc macro built to run as a wasm module ([`UnitPlan::macro_wasm`]):
+/// its root has the list of its macros and the bridge's glue appended
+/// (`blaze_macro_eval::wasm_glue`), so its crate's root is an alias of its own.
+pub fn wasm_macro(unit: &Unit, plan: &UnitPlan) -> bool {
+    plan.macro_wasm && unit.target.is_proc_macro() && !super::crates::is_test(unit, plan)
+}
 
 /// What a crate's root is to be: the file on disk, then `after`, the module named `module`.
 #[derive(Debug)]
@@ -41,7 +50,7 @@ impl Lowered {
     ) -> Result<usize, LowerError> {
         // alloc: once a call, the units given and the roots made in it
         let units: Vec<u32> = units.into_iter().collect();
-        let mut made: HashSet<base_db::FileId> = HashSet::default();
+        let mut made: HashSet<base_db::FileId, Global> = HashSet::new_in(Global);
         let mut written = 0;
         for &unit in &units {
             let unit = unit as usize;
@@ -96,7 +105,7 @@ impl Lowered {
 pub fn macros_loaded(db: &Db, krate: Crate) -> bool {
     let by_crate = ProcMacros::get(db).by_crate(db);
     // alloc: once a test crate a write, its closure walked
-    let mut seen: HashSet<Crate> = HashSet::default();
+    let mut seen: HashSet<Crate, Global> = HashSet::new_in(Global);
     let mut stack = vec![krate]; // alloc: as `seen`
     while let Some(at) = stack.pop() {
         for dep in &at.data(db).dependencies {

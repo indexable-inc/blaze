@@ -5,6 +5,7 @@
 use std::cmp::Ordering;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 
 use crate::dependency::Dependency;
 use crate::interning::InternedString;
@@ -21,8 +22,8 @@ use crate::version::PartialVersion;
 /// introduce more granular preferences.
 #[derive(Default)]
 pub struct VersionPreferences {
-    try_to_use: HashSet<PackageId>,
-    prefer_patch_deps: HashMap<InternedString, HashSet<Dependency>>,
+    try_to_use: HashSet<PackageId, Global>,
+    prefer_patch_deps: HashMap<InternedString, HashSet<Dependency, Global>, Global>,
     version_ordering: VersionOrdering,
     rust_versions: Vec<PartialVersion>,
 }

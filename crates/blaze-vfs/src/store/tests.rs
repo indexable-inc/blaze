@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, rng::SplitMix64 as Rng};
 
 use super::{Base, Building, Column, DIR, FILE, FIRST, Writer, chunk_of, chunk_start, run};
@@ -110,7 +111,7 @@ fn a_file_shape_has_no_entries() {
 #[test]
 fn the_index_finds_what_a_map_holds() {
     let mut writer = Writer::new();
-    let mut model: HashMap<ContentId, u32> = HashMap::default();
+    let mut model: HashMap<ContentId, u32, Global> = HashMap::new_in(Global);
     for at in 0..5000u32 {
         let bytes: Arc<[u8]> = Arc::from(at.to_le_bytes().as_slice());
         let id = ContentId::of("store test", &bytes);

@@ -16,6 +16,7 @@ use hir_def::{
 };
 
 use blaze_hash::{Equivalent, HashMap, SharedMap};
+use std::alloc::Global;
 use rustc_abi::{TagEncoding, Variants};
 use rustc_type_ir::{
     UintTy,
@@ -182,8 +183,8 @@ struct Types<'db> {
     /// The types the one being told of is made of so far, by the places the [`DebugType`] it
     /// is told as names them by.
     parts: Vec<Made<Key>>,
-    names: HashMap<Ty<'db>, Option<String>>,
-    normalized: HashMap<Ty<'db>, Ty<'db>>,
+    names: HashMap<Ty<'db>, Option<String>, Global>,
+    normalized: HashMap<Ty<'db>, Ty<'db>, Global>,
 }
 
 impl<'db> Types<'db> {
@@ -197,8 +198,8 @@ impl<'db> Types<'db> {
             infcx,
             // alloc: empty until a type is told of; its parts end in the `Own` kept
             parts: Vec::new(),
-            names: HashMap::default(),
-            normalized: HashMap::default(),
+            names: HashMap::new_in(Global),
+            normalized: HashMap::new_in(Global),
         }
     }
 
@@ -312,6 +313,11 @@ impl<'db> Types<'db> {
             TyKind::Adt(def, args) => {
                 of.parameters = self.parameters(def.def_id().into(), args, pointers);
                 match def.def_id() {
+                    // A `#[blaze::bits]` struct is told of as its backing integer: its fields
+                    // sit at bit offsets, which a field list of byte offsets has no word for.
+                    AdtId::StructId(id) if hir_ty::layout::is_bits_struct(self.db, id) => {
+                        return base(of.name, encoding::UNSIGNED);
+                    }
                     AdtId::StructId(id) => {
                         of.fields = self.fields(
                             id.into(),

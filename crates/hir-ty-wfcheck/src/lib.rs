@@ -28,8 +28,6 @@ mod budget;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
-use std::sync::LazyLock;
-
 use crate::mem::FVec;
 use base_db::Db;
 use blaze_mem::frame::Frame;
@@ -108,7 +106,7 @@ pub fn wfcheck(db: &Db, def: GenericDefId) -> WfResult {
 
 /// [`wfcheck`] of `def`, not cached: what it reads is asked through the database as before.
 fn check_item(db: &Db, def: GenericDefId) -> WfResult {
-    if off() {
+    if base_db::FrontSettings::get(db).borrowck(db) == base_db::BorrowckMode::Off {
         return WfResult::default();
     }
     blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
@@ -123,14 +121,6 @@ fn check_item(db: &Db, def: GenericDefId) -> WfResult {
         }
         WfResult { diagnostics: mem::owned(found.drain(..)) }
     })
-}
-
-/// `BLAZE_BORROWCK=off`, read once for the process as the borrow checker reads it, so a
-/// result does not depend on when its query ran.
-fn off() -> bool {
-    static OFF: LazyLock<bool> =
-        LazyLock::new(|| matches!(std::env::var("BLAZE_BORROWCK").as_deref(), Ok("off" | "0")));
-    *OFF
 }
 
 struct Check<'a, 'f, 'db> {

@@ -8,6 +8,7 @@
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir::db::HirDatabase;
 use hir_def::{
     AdtId, AttrDefId, HasModule as _, ModuleId, VariantId,
@@ -51,7 +52,7 @@ pub(super) struct Preds<'s, 'db> {
     db: &'db Db,
     krate: base_db::Crate,
     pairs: Vec<[Pred<'db>; 2]>,
-    adts: HashMap<AdtId, Pred<'db>>,
+    adts: HashMap<AdtId, Pred<'db>, Global>,
 }
 
 impl<'s, 'db> Preds<'s, 'db> {
@@ -60,7 +61,7 @@ impl<'s, 'db> Preds<'s, 'db> {
     pub(super) fn new(solver: &'s Solver<'db>, krate: base_db::Crate) -> Preds<'s, 'db> {
         let db = solver.interner().db;
         // alloc: empty, pushed to only for an `And` or `Or` of a type asked about
-        Preds { solver, db, krate, pairs: Vec::new(), adts: HashMap::default() }
+        Preds { solver, db, krate, pairs: Vec::new(), adts: HashMap::new_in(Global) }
     }
 
     fn interner(&self) -> DbInterner<'db> {

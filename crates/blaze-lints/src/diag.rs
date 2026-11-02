@@ -42,6 +42,36 @@ impl std::fmt::Display for Unnamed {
 
 impl std::error::Error for Unnamed {}
 
+/// Why the lints of a crate could not be checked.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CheckError {
+    Unnamed(Unnamed),
+    /// A lint looked up `path` of `core`, `alloc` or `std`, which [`crate::famous`]'s `KNOWN`
+    /// does not list, in the lints of the file `file`: a lint's bug. The lint can't run there, so
+    /// the crate's lints are not given as if it had.
+    NotKnown { file: String, path: String },
+}
+
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckError::Unnamed(it) => it.fmt(f),
+            CheckError::NotKnown { file, path } => write!(
+                f,
+                "a lint run over `{file}` looks up `{path}`, which `famous::KNOWN` (crates/blaze-lints/src/famous.rs) does not list: a bug in blaze-lints, fixed by adding the path there"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CheckError {}
+
+impl From<Unnamed> for CheckError {
+    fn from(it: Unnamed) -> CheckError {
+        CheckError::Unnamed(it)
+    }
+}
+
 /// Names the files of every span of `diag` a lint query made ([`place`]).
 pub(crate) fn place_diag(
     diag: &mut Diag,

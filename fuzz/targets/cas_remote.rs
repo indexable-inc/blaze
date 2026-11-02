@@ -202,6 +202,11 @@ fn frame_at(stream: &[u8], at: usize) -> Option<&[u8]> {
 /// Fetches `keys` into an empty store through a client whose connection receives `stream` in
 /// pieces of at most `piece` bytes (and at most [`RECEIVES_MOST`] of them, so a long stream in
 /// small pieces is not a hang), checking each fetch ends as its frame says; how each ended.
+/// Lets in every value that hashes as sent: the fuzzer drives the wire, not what is admitted.
+fn admit_any(_: blaze_cas::Kind, _: &[u8]) -> Result<(), String> {
+    Ok(())
+}
+
 fn fetch_all(keys: &[Key], stream: &[u8], piece: usize) -> Vec<(Key, Fetched)> {
     let piece = piece.max(stream.len().div_ceil(RECEIVES_MOST));
     let mut sim = shared::sim();
@@ -210,7 +215,7 @@ fn fetch_all(keys: &[Key], stream: &[u8], piece: usize) -> Vec<(Key, Fetched)> {
     let mut effects = Vec::new();
     let tags: Vec<Tag> = keys
         .iter()
-        .map(|key| store.fetch(key, &mut client, &mut effects).expect("an empty store fetches a key it lacks"))
+        .map(|key| store.fetch(key, &mut client, admit_any, &mut effects).expect("an empty store fetches a key it lacks"))
         .collect();
     let (mut at, mut answered, mut theirs) = (0, Vec::new(), Vec::new());
     while !effects.is_empty() {

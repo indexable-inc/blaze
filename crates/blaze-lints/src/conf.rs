@@ -34,6 +34,11 @@ pub struct Conf {
     pub table: toml::Table,
     /// `msrv`, else the package's `rust-version`.
     pub msrv: Option<Version>,
+    /// The profile the profile lints read ([`crate::profile`]), once loaded
+    /// ([`Conf::profile_settings`], [`crate::profile::load`]): hashed by its content ID, so a
+    /// lint query keyed by the configuration is keyed by the profile's bytes.
+    #[serde(skip)]
+    pub profile: Option<crate::profile::Loaded>,
 }
 
 /// A `clippy.toml` holds no NaN that two equal configurations could differ by in practice; a
@@ -45,6 +50,7 @@ impl std::hash::Hash for Conf {
         self.path.hash(state);
         self.msrv.hash(state);
         state.write_u64(table_hash(&self.table));
+        self.profile.hash(state);
     }
 }
 
@@ -77,7 +83,7 @@ fn value_hash(value: &toml::Value) -> u64 {
 }
 
 /// The counts the lints read ([`Conf::int`]): `u64` in clippy's `Conf`, and blaze's own.
-const COUNTS: [&str; 9] = [
+const COUNTS: [&str; 19] = [
     "array-size-threshold",
     "stack-size-threshold",
     "enum-variant-size-threshold",
@@ -85,8 +91,19 @@ const COUNTS: [&str; 9] = [
     "too-large-for-stack",
     "type-complexity-threshold",
     "vec-box-size-threshold",
+    "large-error-threshold",
     "parallel-threshold",
     "parallel-assumed-trips",
+    // The general `blaze::` lints' thresholds (docs/lints.md).
+    "outline-generic-body-threshold",
+    "cache-line-size",
+    "intern-candidate-uses",
+    "small-map-max-entries",
+    "unbuffered-io-writes",
+    "unbuffered-io-small-read",
+    "bounded-heap-field-string-bytes",
+    "bounded-heap-field-vec-len",
+    "large-box-threshold",
 ];
 
 /// The flags the lints read ([`Conf::bool`]).
@@ -134,7 +151,34 @@ fn checked(table: &toml::Table) -> Result<(), String> {
     for kind in Kind::ALL {
         disallowed(table, kind)?;
     }
+    match table.get("profile") {
+        None | Some(toml::Value::String(_)) => {}
+        Some(other) => {
+            return Err(format!(
+                "error reading Clippy's configuration file: invalid type: {}, expected a path for `profile`",
+                other.type_str()
+            ));
+        }
+    }
+    for key in ["profile-hot-percent", "profile-cold-percent"] {
+        if let Some(text) = percent_text(table, key)? {
+            crate::profile::percent_ppb(&text, key, "Clippy's configuration file")
+                .map_err(|why| format!("error reading Clippy's configuration file: {why}"))?;
+        }
+    }
     Ok(())
+}
+
+/// The TOML text of the number `key` holds, if it holds one; an error for any other value.
+fn percent_text(table: &toml::Table, key: &str) -> Result<Option<String>, String> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(it @ (toml::Value::Integer(_) | toml::Value::Float(_))) => Ok(Some(it.to_string())),
+        Some(other) => Err(format!(
+            "error reading Clippy's configuration file: invalid type: {}, expected a percent for `{key}`",
+            other.type_str()
+        )),
+    }
 }
 
 /// Which list of disallowed items an entry is in.
@@ -293,7 +337,51 @@ impl Conf {
             }
             None => rust_version.and_then(Version::parse),
         };
-        Ok(Conf { path, table, msrv })
+        Ok(Conf { path, table, msrv, profile: None })
+    }
+
+    /// The profile the lints are to read: `profile` and its percents from this file, each key
+    /// it does not set from the workspace's `[workspace.metadata.blaze.lints]`. `None` when
+    /// neither names a profile, and the profile lints are silent. A path in `clippy.toml` is
+    /// from the file's directory.
+    pub fn profile_settings(&self, workspace: Option<&crate::profile::Workspace<'_>>) -> Result<Option<crate::profile::Settings>, String> {
+        use crate::profile::{COLD_DEFAULT_PPB, HOT_DEFAULT_PPB, Settings, percent_ppb};
+        let file = self.path.as_ref().map(|it| format!("`{}`", it.display()));
+        let workspace_named = workspace.map(|it| format!("`[workspace.metadata.blaze.lints]` of `{}`", it.manifest));
+        let (path, named_in) = match (self.table.get("profile").and_then(toml::Value::as_str), workspace.and_then(|it| it.path)) {
+            (Some(path), _) => {
+                let dir = self.path.as_deref().and_then(Path::parent).unwrap_or(Path::new(""));
+                (dir.join(path), file.clone().unwrap_or_else(|| "`clippy.toml`".to_owned()))
+            }
+            (None, Some(path)) => (PathBuf::from(path), workspace_named.clone().unwrap_or_default()),
+            (None, None) => return Ok(None),
+        };
+        let percent = |key: &str, of_workspace: Option<&str>, default: u64| -> Result<u64, String> {
+            if let Some(text) = percent_text(&self.table, key)? {
+                return percent_ppb(&text, key, file.as_deref().unwrap_or("`clippy.toml`"));
+            }
+            match of_workspace {
+                Some(text) => percent_ppb(text, key, workspace_named.as_deref().unwrap_or_default()),
+                None => Ok(default),
+            }
+        };
+        let hot_ppb = percent("profile-hot-percent", workspace.and_then(|it| it.hot_percent), HOT_DEFAULT_PPB)?;
+        let cold_ppb = percent("profile-cold-percent", workspace.and_then(|it| it.cold_percent), COLD_DEFAULT_PPB)?;
+        if cold_ppb > hot_ppb {
+            return Err(format!(
+                "`profile-cold-percent` is above `profile-hot-percent` for the profile named in {named_in}: a function can't be both"
+            ));
+        }
+        Ok(Some(Settings { path, named_in, hot_ppb, cold_ppb }))
+    }
+
+    /// This configuration with the profile of [`Conf::profile_settings`] read in; an error
+    /// naming the profile's path when it doesn't read.
+    pub fn with_profile(mut self, workspace: Option<&crate::profile::Workspace<'_>>) -> Result<Conf, String> {
+        if let Some(settings) = self.profile_settings(workspace)? {
+            self.profile = Some(crate::profile::load(settings)?);
+        }
+        Ok(self)
     }
 
     pub fn bool(&self, key: &str, default: bool) -> bool {

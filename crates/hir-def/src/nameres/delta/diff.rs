@@ -6,6 +6,7 @@
 use base_db::Db;
 use blaze_dbsp::{Pos, Weight};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 
 use super::state::{CrateState, Key};
 use crate::{
@@ -69,7 +70,7 @@ fn unnamed(scope: &ItemScope) -> impl Iterator<Item = crate::per_ns::PerNs> + '_
 pub(super) struct Items {
     pub(super) impls: Vec<(ImplId, Pos)>,
     pub(super) derive_impls: Vec<(BuiltinDeriveImplId, Pos)>,
-    pub(super) traits: HashSet<TraitId>,
+    pub(super) traits: HashSet<TraitId, Global>,
 }
 
 impl Items {
@@ -101,12 +102,12 @@ pub(super) fn items(
 }
 
 fn weighted<T: Copy + Eq + std::hash::Hash>(
-    held: &mut HashMap<T, Pos>,
+    held: &mut HashMap<T, Pos, Global>,
     old: &[(T, Pos)],
     new: Vec<(T, Pos)>,
     out: &mut Vec<(T, Pos, Weight)>,
 ) {
-    let now: HashSet<T> = new.iter().map(|&(it, _)| it).collect(); // alloc: the touched modules' impls, once per write that changed them
+    let now: HashSet<T, Global> = new.iter().map(|&(it, _)| it).collect(); // alloc: the touched modules' impls, once per write that changed them
     for &(it, _) in old {
         if !now.contains(&it)
             && let Some(pos) = held.remove(&it)
@@ -136,14 +137,14 @@ pub(super) fn update_positions(state: &mut CrateState) -> Vec<ModuleId> {
     // reached every group but the root from one of them. `group_of` is as of the last run, and
     // a write that moves a module into or out of round 0 (an attribute that may be a macro)
     // leaves it naming a group that no longer declares the child.
-    let mut declared: HashMap<DeclKey, (ModuleId, u32)> = HashMap::default(); // alloc: the tree's children, once per change of the tree
+    let mut declared: HashMap<DeclKey, (ModuleId, u32), Global> = HashMap::new_in(Global); // alloc: the tree's children, once per change of the tree
     declared.reserve(state.groups.len());
     for (&group, g) in &state.groups {
         for (at, &key) in (0u32..).zip(&g.children) {
             declared.insert(key, (group, at));
         }
     }
-    let mut now: HashMap<ModuleId, Pos> = HashMap::default();
+    let mut now: HashMap<ModuleId, Pos, Global> = HashMap::new_in(Global);
     now.reserve(state.groups.len());
     // Group order is DFS preorder: a parent's position is known before its children's.
     for (&group, g) in &state.groups {

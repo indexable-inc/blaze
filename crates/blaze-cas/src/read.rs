@@ -19,7 +19,7 @@ use blaze_format::{Aligned, SchemaHash};
 use blaze_ids::ContentId;
 use blaze_reclaim::Limbo;
 use crate::{
-    ByHash, Columns, Corrupt, Encodings, Entry, Heat, Key, Kind, Ticket, Use, cold, encodings_of,
+    ByHash, Columns, Corrupt, Encodings, Entry, Heat, Key, Kind, Origin, Ticket, Use, cold, encodings_of,
     location,
     disk::{self, Form, Loc, NO_DICTIONARY, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, content_of},
     flags::{Flag, FlagColumns, Row},
@@ -27,6 +27,7 @@ use crate::{
     segment::{ChunkRef, Segment},
     table::{Held, Keyed, Table},
 };
+use std::alloc::Global;
 use crate::sync::{
     OnceLock,
     atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
@@ -144,10 +145,11 @@ pub(crate) struct TierView {
     pub(crate) index_file: FileName,
     pub(crate) index: Option<Arc<Index>>,
     pub(crate) delta: Arc<Table<Spot>>,
-    /// The delta an index swap left, while a writer may still put into it.
+    /// The delta an index swap left, while a writer may still put into it. A claim goes into
+    /// it before the delta, so two claims of one key meet in it (`Own::claim`).
     pub(crate) prev: Option<Arc<Table<Spot>>>,
     pub(crate) packs: Vec<PackView>,
-    pub(crate) externals: ByHash<ContentId, ExternalView>,
+    pub(crate) externals: ByHash<ContentId, ExternalView, Global>, // alloc: a published view's, freed with the view
     pub(crate) dictionaries: Vec<(Kind, Result<Arc<cold::Prepared>, String>)>,
 }
 
@@ -214,6 +216,17 @@ impl Place {
     }
 }
 
+/// Where a record is, for an error: its pack and offset, or its segment and offset in its
+/// chunk (never the chunk's address, so the message is the same each run).
+impl std::fmt::Display for Place {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Place::Pack(loc) => write!(f, "pack {} at {}", loc.pack, loc.offset),
+            Place::Segment(seg) => write!(f, "segment {} at {} of its chunk", seg.segment, seg.offset),
+        }
+    }
+}
+
 /// A record in a writer's segment: `offset` is where its header starts in `chunk`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Seg {
@@ -245,6 +258,22 @@ impl Spot {
     /// It, at `place`.
     pub(crate) fn at(&self, place: Place) -> Spot {
         Spot::new(self.key, self.content, place, self.ticket)
+    }
+}
+
+/// Carries a spot's flags to its copy in another delta table (the index swap's copy, the fold's,
+/// a claim's of `prev`'s spot, a move's of its pack spot), as `replace` keeps a row's flags
+/// for a spot moved within one table. What that changes: `Tried` outlives an index swap, so a
+/// record whose compression saved too little is not tried again; and `Read` with `ReadBefore`
+/// can promote a record at the first settle after a swap (promotion waits for no period). It
+/// never changes a demotion: an index swap starts the periods over, demotion waits for two,
+/// and the two rotations by then have cleared every carried `Read`, `ReadBefore`, `New` and
+/// `NewBefore`. `Flag::Verified` is no delta table's: a spot keeps it itself.
+pub(crate) fn carry_flags(from: &Table<Spot>, row: u64, to: &Table<Spot>, at: u64) {
+    for flag in [Flag::Read, Flag::ReadBefore, Flag::Tried, Flag::New, Flag::NewBefore] {
+        if from.flag(row, flag as usize) {
+            to.set_flag(at, flag as usize);
+        }
     }
 }
 
@@ -442,23 +471,26 @@ impl<'a> Look<'a> {
         let it = &view.tiers[tier];
         // alloc: the listing is the output, for collection and checks
         let mut out = Vec::new();
-        let mut shadow = blaze_hash::HashSet::default();
-        for table in std::iter::once(&it.delta).chain(&it.prev) {
-            for (row, spot) in table.iter(self.held) {
-                if shadow.insert(spot.key) {
-                    out.push((spot.key, Found { view, tier, place: spot.place, at: At::Spot(table, row, spot) }));
+        // The keys seen live only while the listing is made: a frame's.
+        blaze_mem::frame::task(blaze_mem::Tag::Store, |frame| {
+            let mut shadow = blaze_hash::HashSet::new_in(frame);
+            for table in std::iter::once(&it.delta).chain(&it.prev) {
+                for (row, spot) in table.iter(self.held) {
+                    if shadow.insert(spot.key) {
+                        out.push((spot.key, Found { view, tier, place: spot.place, at: At::Spot(table, row, spot) }));
+                    }
                 }
             }
-        }
-        if let Some(index) = &it.index {
-            for (slot, key, loc) in index.table().iter() {
-                match loc {
-                    Ok(_) if shadow.contains(&key) => {}
-                    Ok(loc) => out.push((key, Found { view, tier, place: Place::Pack(loc), at: At::Slot(index, slot) })),
-                    Err(what) => bad.push((key, what)),
+            if let Some(index) = &it.index {
+                for (slot, key, loc) in index.table().iter() {
+                    match loc {
+                        Ok(_) if shadow.contains(&key) => {}
+                        Ok(loc) => out.push((key, Found { view, tier, place: Place::Pack(loc), at: At::Slot(index, slot) })),
+                        Err(what) => bad.push((key, what)),
+                    }
                 }
             }
-        }
+        });
         out
     }
 
@@ -729,6 +761,18 @@ impl<'a> Look<'a> {
     pub(crate) fn get(self, key: &Key) -> Result<Option<Entry<'a>>, Corrupt> {
         let Some(found) = self.find(key) else { return Ok(None) };
         self.read(found?, key).map(Some)
+    }
+
+    /// [`Look::get`] and the directory the value is in: its own tier's, or a tier behind it.
+    pub(crate) fn get_from(self, key: &Key) -> Result<Option<(Origin, Entry<'a>)>, Corrupt> {
+        let Some(found) = self.find(key) else { return Ok(None) };
+        let found = found?;
+        let origin = match found.tier {
+            0 => Origin::Own,
+            // clone: the name of the directory a reader refuses a value of
+            tier => Origin::Behind(found.view.tiers[tier].dir.clone()),
+        };
+        self.read(found, key).map(|entry| Some((origin, entry)))
     }
 
     pub(crate) fn get_in_place(self, key: &Key) -> Result<Option<(Heat, Entry<'a>)>, Corrupt> {

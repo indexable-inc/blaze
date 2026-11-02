@@ -589,6 +589,7 @@ fn a_profile_is_the_daemons_dump_and_the_loops_requests_are_refused_by_name() {
         (2, Request::Explore { dev: false }, "blaze explore"),
         (3, Request::Live, "blaze debug live"),
         (4, Request::Sql { sql: "SELECT 1".to_owned(), last_s: 30 }, "blaze debug sql --live"),
+        (5, Request::Gc { dry_run: true }, "blaze cache gc"),
     ] {
         let refused = world.request(1, id, request);
         assert_eq!(error_at(&refused).as_deref(), Some(named), "{refused:?}");
@@ -737,6 +738,7 @@ fn worked() -> Response {
         links: vec![crate::Linked { how: crate::LinkHow::First, path: "target/debug/app".to_owned() }],
         critical_path_us: 70,
         steps_us: vec![(crate::NodeKind::Codegen, 70)],
+        placed: crate::PlacedBytes::default(),
     })
 }
 

@@ -5,6 +5,7 @@ use std::mem;
 
 use arrayvec::ArrayVec;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use rustc_type_ir::error::TypeError;
 use rustc_type_ir::inherent::{IntoKind, Term as _, Ty as _};
 use rustc_type_ir::relate::VarianceDiagInfo;
@@ -347,12 +348,12 @@ const CACHE_INLINE: usize = 8;
 /// first `CACHE_INLINE` entries live in place and nothing is allocated unless it spills.
 pub(in crate::next_solver::infer) struct GeneralizeCache<K, V> {
     inline: ArrayVec<(K, V), CACHE_INLINE>,
-    spill: HashMap<K, V>,
+    spill: HashMap<K, V, Global>,
 }
 
 impl<K, V> Default for GeneralizeCache<K, V> {
     fn default() -> Self {
-        GeneralizeCache { inline: ArrayVec::new(), spill: HashMap::default() }
+        GeneralizeCache { inline: ArrayVec::new(), spill: HashMap::new_in(Global) }
     }
 }
 
@@ -449,7 +450,7 @@ impl<'db> Generalizer<'_, 'db> {
                         self.for_universe.can_name(alias_max_universe)
                             && !alias.has_escaping_bound_vars();
                     if !infer_replacement_is_complete {
-                        warn!("may incompletely handle alias type: {alias:?}");
+                        warn!(target: "blaze", "may incompletely handle alias type: {alias:?}");
                     }
 
                     debug!("generalization failure in alias");

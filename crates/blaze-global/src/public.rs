@@ -26,8 +26,11 @@
 //! Never public: a workspace member, a path dependency, a git dependency, a registry other
 //! than crates.io, a variable of the machine's environment a run read with a value, a run
 //! that read the whole environment or what can't be traced, a test, and code compiled for
-//! more than the target's baseline. And whatever the inputs, a value holding a [`Secrets`]
-//! entry is never published.
+//! more than the target's baseline, nor a value verified across checkouts
+//! (`blaze_usercode::roots::verify`): the record that retracts one is kept in the store of the
+//! machine that found it differs, and no other machine would see it ([`ImageRead::Verified`],
+//! and [`fetchable`], which refuses one the cache sends before the store keeps it). And whatever the inputs, a
+//! value holding a [`Secrets`] entry is never published.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -36,7 +39,7 @@ use std::{
 };
 
 use blaze_cas::{Key, Kind};
-use blaze_codegen::{Backend, Instance, InstanceKey, query::keys, settings::Spec, summary::Imports};
+use blaze_codegen::{Instance, InstanceKey, Target, query::keys, settings::Spec, summary::Imports};
 use blaze_core::{Traced, Untraceable};
 use blaze_diagnostics::cache::{self, Inputs};
 use blaze_format::SchemaHash;
@@ -187,17 +190,35 @@ pub struct FnSource {
 }
 
 /// An LLVM-optimized function as the release driver keeps it: under
-/// `keys::release(imports.blob_key(stored(instance, built_in)))`.
+/// `blaze_codegen::driver::release_template_key(instance, built_in, refs, imports, imported_units, imported_refs, imported_built_in)`,
+/// the driver's own function for it.
 #[derive(Clone, Copy, Debug)]
 pub struct FunctionMade<'a> {
     /// The settings its instance's `Settings` are of.
     pub spec: &'a Spec,
     pub function: &'a FnSource,
-    /// The bodies its code builds in, in the driver's order.
+    /// The bodies its code builds in, in the driver's order: strictly ascending by instance key.
     pub built_in: &'a [FnSource],
+    /// What its code references, in its relocations' order, as the driver resolved them.
+    pub refs: &'a [Target],
     pub imports: &'a Imports,
-    /// Each of `imports.imported`, in its order.
+    /// The instance each of `imports.imported` names, in its order: the walk's, whose key is
+    /// the name. In a whole live build's tier-up that is the import's first tier.
+    pub imported_names: &'a [Instance],
+    /// Each of `imports.imported` as its export is built, in its order: the instance of
+    /// `imported_names` of the same code and type arguments, at the settings it is exported
+    /// at (in a tier-up, its next tier's), which the key holds.
     pub imported: &'a [FnSource],
+    /// The settings each of `imported` is built at, in its order: its export is LLVM's IR
+    /// (`Backend::is_release`) of the pinned toolchain, whose `Spec::settings` are its
+    /// instance's.
+    pub imported_specs: &'a [&'a Spec],
+    /// The references of each of `imported`, in its order.
+    pub imported_refs: &'a [&'a [Target]],
+    /// The bodies each of `imported` builds in, in its order, each in the driver's order
+    /// (strictly ascending by instance key): an import's export holds them, so they are in
+    /// this function's code and its key.
+    pub imported_built_in: &'a [&'a [FnSource]],
 }
 
 /// A dependency crate's image key and what it covers, as `hir_def::deps` made it. The key is a
@@ -228,6 +249,11 @@ pub enum ImageRead<'a> {
     Env(&'a OsStr),
     /// What an expansion read that can't be traced.
     Untraceable(Untraceable),
+    /// An expansion found verified across checkouts (`proc_macro_api::kept::verified_reads`):
+    /// what it reads is whether the record that retracts it is in the store, and that record
+    /// is in the store of the machine that put it alone, so on any other machine the image
+    /// would be served after the value was retracted. Never public.
+    Verified,
 }
 
 /// Which key of a crate's image.
@@ -242,16 +268,22 @@ pub enum ImagePart {
     Filed(ContentId),
 }
 
-/// A dev function (Cranelift's or copy-and-patch's) as the dev driver keeps it: under
-/// `keys::template(stored(instance, built_in))`. It has no import decisions: those are
-/// release code's.
+/// A function compiled alone, with no import decisions, by Cranelift or copy-and-patch (a
+/// whole build's, a lazy build's first compiles, a lazy build's tier-up (`Later::tier_up`) to
+/// Cranelift), as the driver keeps it: under
+/// `blaze_codegen::driver::dev_template_key(instance, built_in, refs, toolchain)`, the driver's
+/// own function for it.
+/// It has no import decisions: those are release code's.
 #[derive(Clone, Copy, Debug)]
 pub struct DevFunctionMade<'a> {
     /// The settings its instance's `Settings` are of.
     pub spec: &'a Spec,
     pub function: &'a FnSource,
-    /// The bodies its code builds in, in the driver's order.
+    /// The bodies its code builds in, in the driver's order: strictly ascending by instance key.
     pub built_in: &'a [FnSource],
+    /// What its code references, in its relocations' order: the key covers each one's kind
+    /// (`blaze_codegen::driver::placed`), as the driver's does.
+    pub refs: &'a [Target],
 }
 
 /// A dependency's front-end result, keyed by its owner from a public base key (a crate's
@@ -462,24 +494,100 @@ impl Rule {
     }
 
     pub fn function(&self, made: &FunctionMade<'_>) -> Result<Public, Private> {
-        let instance = made.function.instance.key();
-        let stored = with_keys(made.built_in, |built_in| blaze_codegen::driver::stored(instance, built_in));
-        let key = keys::release(&made.imports.blob_key(stored));
+        // alloc: per function shown public, the keys of the bodies its imports build in
+        let imported_keys: Vec<Vec<InstanceKey>> = (made.imported_built_in.iter())
+            // alloc: per import of a function shown public, the keys of what it builds in
+            .map(|it| it.iter().map(|it| it.instance.key()).collect())
+            .collect();
+        // alloc: per function shown public, one per import
+        let imported_built_in: Vec<&[InstanceKey]> = imported_keys.iter().map(Vec::as_slice).collect();
+        // alloc: per function shown public, one per import
+        let imported_units: Vec<InstanceKey> = made.imported.iter().map(|it| it.instance.key()).collect();
+        let (_, key) = with_keys(made.built_in, |built_in| {
+            blaze_codegen::driver::release_template_key(
+                &made.function.instance,
+                built_in,
+                made.refs,
+                made.imports,
+                &imported_units,
+                made.imported_refs,
+                &imported_built_in,
+            )
+        });
         let private = |why: String| Private { key, why };
+        ascending(made.built_in).map_err(private)?;
+        for (given, what) in [(made.imported_refs.len(), "the references"), (made.imported_built_in.len(), "the bodies built in")] {
+            if given != made.imports.imported.len() {
+                // alloc: an error's message, made only when it fails.
+                return Err(private(format!(
+                    "it is given {what} of {given} imported functions for its {} imports",
+                    made.imports.imported.len()
+                )));
+            }
+        }
+        for (at, built_in) in made.imported_built_in.iter().enumerate() {
+            // alloc: an error's message, made only when it fails.
+            ascending(built_in).map_err(|why| private(format!("its import {at}: {why}")))?;
+        }
         let spec = made.spec;
         if spec.settings() != made.function.instance.settings {
             return Err(private("its settings are not those of the spec given".into()));
         }
-        if !matches!(spec.backend, Backend::Llvm { .. }) {
+        if !spec.backend.is_release() {
             return Err(private("it is not compiled by LLVM: dev code is shown public by `Rule::dev_function`".into()));
         }
-        if made.imported.len() != made.imports.imported.len()
-            || made.imported.iter().zip(&made.imports.imported).any(|(it, key)| it.instance.key() != *key)
+        let decided = made.imports.imported.len();
+        for (given, what) in
+            [(made.imported_names.len(), "names"), (made.imported.len(), "built imports"), (made.imported_specs.len(), "import specs")]
         {
-            return Err(private("the functions given are not those it imports".into()));
+            if given != decided {
+                // alloc: an error's message, made only when it fails.
+                return Err(private(format!("it is given {given} {what} for its {decided} imports")));
+            }
+        }
+        for (at, (name, key)) in made.imported_names.iter().zip(&made.imports.imported).enumerate() {
+            if name.key() != *key {
+                // alloc: an error's message, made only when it fails.
+                return Err(private(format!(
+                    "its import {at} is named {:x}, not the {:x} its import decision names",
+                    name.key().0,
+                    key.0
+                )));
+            }
+        }
+        for (at, (built, import_spec)) in made.imported.iter().zip(made.imported_specs).enumerate() {
+            // alloc: an error's message, made only when it fails.
+            let refused = |why: String| private(format!("its import {at}, built as {:x}: {why}", built.instance.key().0));
+            if import_spec.settings() != built.instance.settings {
+                return Err(refused("its settings are not those of the spec given for it".into()));
+            }
+            if !import_spec.backend.is_release() {
+                return Err(refused("it is not built by LLVM: an export is LLVM's IR".into()));
+            }
+            if import_spec.toolchain.id != self.toolchain {
+                // alloc: an error's message, made only when it fails.
+                return Err(refused(format!(
+                    "it is built by the toolchain {:x}, not the pinned {:x}",
+                    import_spec.toolchain.id, self.toolchain
+                )));
+            }
+        }
+        for (at, (built, name)) in made.imported.iter().zip(made.imported_names).enumerate() {
+            if (built.instance.code, built.instance.args) != (name.code, name.args) {
+                // alloc: an error's message, made only when it fails.
+                return Err(private(format!(
+                    "its import {at} is built as {:x}, which is not of the code and type arguments of the {:x} it names",
+                    built.instance.key().0,
+                    name.key().0
+                )));
+            }
         }
         let all = std::iter::once(made.function).chain(made.built_in).chain(made.imported);
         self.code(spec, all).map_err(private)?;
+        for (at, built_in) in made.imported_built_in.iter().enumerate() {
+            // alloc: an error's message, made only when it fails.
+            self.code(spec, built_in.iter()).map_err(|why| private(format!("import {at}'s built-in body: {why}")))?;
+        }
         Ok(Public { key, kind: Kind::Code })
     }
 
@@ -489,15 +597,20 @@ impl Rule {
     /// with the host's features) is not: its key is of those features, which no build of
     /// another machine asks for.
     pub fn dev_function(&self, made: &DevFunctionMade<'_>) -> Result<Public, Private> {
-        let instance = made.function.instance.key();
-        let stored = with_keys(made.built_in, |built_in| blaze_codegen::driver::stored(instance, built_in));
-        let key = keys::template(&stored);
-        let private = |why: String| Private { key, why };
         let spec = made.spec;
+        let key = with_keys(made.built_in, |built_in| {
+            blaze_codegen::driver::dev_template_key(&made.function.instance, built_in, made.refs, &spec.toolchain.id)
+        });
+        let private = |why: String| Private { key, why };
+        ascending(made.built_in).map_err(private)?;
         if spec.settings() != made.function.instance.settings {
             return Err(private("its settings are not those of the spec given".into()));
         }
-        if matches!(spec.backend, Backend::Llvm { .. }) {
+        // LLVM code compiled alone (a lazy build's tier-up, `Later::tier_up`) is dev-keyed, but
+        // no builder publishes it yet, and a whole build's LLVM code, a whole live build's
+        // tier-up's too, is compiled with imports under the release key: refused until a
+        // publisher of the lone kind is written with a test.
+        if spec.backend.is_release() {
             return Err(private("it is compiled by LLVM: release code is shown public by `Rule::function`".into()));
         }
         if !spec.toolchain.features.is_empty() {
@@ -635,6 +748,11 @@ impl Rule {
                     // alloc: an error path.
                     return Err(private(format!("it read what can't be traced ({})", trace::untraceable_name(it))));
                 }
+                ImageRead::Verified => {
+                    return Err(private(
+                        "it was filed by an expansion verified across checkouts, whose retraction only this machine's store would hold".into(),
+                    ));
+                }
                 // alloc: an error path.
                 ImageRead::Env(name) if name == trace::ALL_ENV_NAME => return Err(private("it read the whole environment".into())),
                 ImageRead::Env(name) if self.public_env.iter().any(|it| it.as_os_str() == name) => {}
@@ -648,6 +766,37 @@ impl Rule {
             }
         }
         Ok(Public { key, kind: Kind::Query })
+    }
+}
+
+/// Whether a value fetched from the global cache may be kept (the `admit` of `blaze_cas::Store::fetch`):
+/// never one verified across checkouts (`blaze_usercode::index::verified_value`). The record
+/// that retracts it would be in the store of the machine that found it differs alone, so this
+/// machine would be given it after it was retracted (rule 18). Checked on the bytes as they
+/// come, before the store keeps them; a value this machine verified is never fetched (the
+/// store has it), so never refused here.
+/// Every kind is checked: a run's value is a [`Kind::Run`], and no other value starts as one
+/// verified does.
+pub fn fetchable(_kind: Kind, bytes: &[u8]) -> Result<(), String> {
+    match index::split_verified(bytes).is_some() {
+        // alloc: an error path.
+        true => Err("it is a value verified across checkouts, which is never published: its retraction would be one machine's".into()),
+        false => Ok(()),
+    }
+}
+
+/// Refuses bodies built in that are not strictly ascending by instance key, as the driver
+/// keeps them: under any other order the key is one no build reads.
+fn ascending(built_in: &[FnSource]) -> Result<(), String> {
+    match built_in.windows(2).position(|it| it[0].instance.key() >= it[1].instance.key()) {
+        None => Ok(()),
+        // alloc: an error's message, made only when it fails.
+        Some(at) => Err(format!(
+            "the bodies it builds in are not strictly ascending by instance key, as the driver keeps them: {:?} at {at} is not below {:?} at {}",
+            built_in[at].instance.key(),
+            built_in[at + 1].instance.key(),
+            at + 1
+        )),
     }
 }
 
@@ -758,7 +907,7 @@ impl Default for Secrets {
 #[cfg(test)]
 mod tests {
     use blaze_codegen::{
-        Settings,
+        Backend, Settings,
         settings::{DebugInfo, Panic, Pgo, Relocation, Sanitize, Toolchain},
         Arch,
     };
@@ -988,6 +1137,9 @@ mod tests {
             mir_inline: false,
             sanitize: Sanitize::default(),
             pgo: Pgo::None,
+            proc_macro_bridge: false,
+            report: false,
+            heap_to_stack: false,
         }
     }
 
@@ -1008,10 +1160,84 @@ mod tests {
         let built_in = [source(20, settings, Origin::Toolchain(TOOLCHAIN))];
         let imported = [source(30, settings, serde())];
         let imports = Imports { imported: vec![imported[0].instance.key()], ..Imports::default() };
-        let made = FunctionMade { spec: &release, function: &function, built_in: &built_in, imports: &imports, imported: &imported };
+        let imported_names = [imported[0].instance];
+        let callee = Target::Function(InstanceKey(ContentId([40; 32])));
+        let refs = [callee.clone(), Target::Data(ContentId([41; 32]))];
+        let imported_own = [callee, Target::Data(ContentId([42; 32]))];
+        let imported_refs: [&[Target]; 1] = [&imported_own];
+        let inlined = [source(50, settings, Origin::Toolchain(TOOLCHAIN))];
+        let imported_built_in: [&[FnSource]; 1] = [&inlined];
+        let made = FunctionMade {
+            spec: &release,
+            function: &function,
+            built_in: &built_in,
+            refs: &refs,
+            imports: &imports,
+            imported_names: &imported_names,
+            imported: &imported,
+            imported_specs: &[&release],
+            imported_refs: &imported_refs,
+            imported_built_in: &imported_built_in,
+        };
         let public = rule.function(&made).unwrap();
+        // A tier-up's import: named by its first tier, built at another tier's settings. The
+        // key is of the built unit, so it moves with the tier the import is built at.
+        let other_tier = spec(Backend::Llvm { opt: 2 }, TOOLCHAIN);
+        let tiered = [source(30, other_tier.settings(), serde())];
+        let up = rule.function(&FunctionMade { imported: &tiered, imported_specs: &[&other_tier], ..made }).unwrap();
+        assert_ne!(up.key(), public.key(), "the key covers the settings an import is built at");
+        let why = rule.function(&FunctionMade { imported: &tiered, ..made }).unwrap_err().why;
+        assert!(why.contains("its import 0, built as") && why.contains("spec given for it"), "{why}");
+        // The likeliest caller's slip in a tier-up: the walk's first tier given as built.
+        let first_tier = spec(Backend::Cranelift { speed: false }, TOOLCHAIN);
+        let cranelift = [source(30, first_tier.settings(), serde())];
+        let why =
+            rule.function(&FunctionMade { imported: &cranelift, imported_specs: &[&first_tier], ..made }).unwrap_err().why;
+        assert!(why.contains("not built by LLVM"), "{why}");
+        let unpinned = spec(Backend::Llvm { opt: 3 }, ContentId([9; 32]));
+        let elsewhere_built = [source(30, unpinned.settings(), serde())];
+        let why = (rule.function(&FunctionMade { imported: &elsewhere_built, imported_specs: &[&unpinned], ..made }))
+            .unwrap_err()
+            .why;
+        assert!(why.contains("its import 0") && why.contains("not the pinned"), "{why}");
+        let elsewhere = [source(31, settings, serde())];
+        let why = rule.function(&FunctionMade { imported: &elsewhere, ..made }).unwrap_err().why;
+        assert!(why.contains("its import 0 is built as") && why.contains("code and type arguments"), "{why}");
+        let why = rule.function(&FunctionMade { imported_names: &[], ..made }).unwrap_err().why;
+        assert!(why.contains("given 0 names for its 1 imports"), "{why}");
+        let other_name = [source(32, settings, serde()).instance];
+        let why = rule.function(&FunctionMade { imported_names: &other_name, ..made }).unwrap_err().why;
+        assert!(why.contains("its import 0 is named") && why.contains("its import decision names"), "{why}");
+        let why = rule.function(&FunctionMade { imported_specs: &[], ..made }).unwrap_err().why;
+        assert!(why.contains("given 0 import specs"), "{why}");
+        // The key as the driver's release compile spells it, by hand: its own and its imports'
+        // references laid out, of its placed stored key.
         let stored = blaze_codegen::driver::stored(function.instance.key(), &[built_in[0].instance.key()]);
-        assert_eq!((public.key(), public.kind()), (keys::release(&imports.blob_key(stored)), Kind::Code));
+        let placed = blaze_codegen::driver::placed(stored, &refs);
+        let (_, places) = blaze_codegen::backend::release_refs(&refs, &imported_refs);
+        assert_eq!(places, [0, 1, 0, 2], "the import's call of the same callee is one place");
+        let laid = blaze_codegen::backend::laid_out(placed, &places);
+        let inlined_keys = [inlined[0].instance.key()];
+        let imported = blaze_codegen::driver::with_imported(laid, &[imported[0].instance.key()], &imported_refs, &[&inlined_keys]);
+        let key = keys::release(&imports.blob_key(imported));
+        assert_eq!((public.key(), public.kind()), (key, Kind::Code));
+        // An edit of a body an import builds in moves no import's key, but this one's: its
+        // code holds the import's export, which holds that body.
+        let edited = [source(51, settings, Origin::Toolchain(TOOLCHAIN))];
+        let after = rule.function(&FunctionMade { imported_built_in: &[&edited], ..made }).unwrap();
+        assert_ne!(after.key(), public.key(), "the key covers the bodies its imports build in");
+        let why = rule.function(&FunctionMade { imported_built_in: &[], ..made }).unwrap_err().why;
+        assert!(why.contains("bodies built in of 0"), "{why}");
+        let mut unsorted = [source(52, settings, Origin::Toolchain(TOOLCHAIN)), source(53, settings, Origin::Toolchain(TOOLCHAIN))];
+        if unsorted[0].instance.key() < unsorted[1].instance.key() {
+            unsorted.swap(0, 1);
+        }
+        let why = rule.function(&FunctionMade { imported_built_in: &[&unsorted], ..made }).unwrap_err().why;
+        assert!(why.contains("its import 0") && why.contains("strictly ascending"), "{why}");
+        let other_layout = [Target::Data(ContentId([43; 32])), Target::Data(ContentId([42; 32]))];
+        let moved = rule.function(&FunctionMade { imported_refs: &[&other_layout], ..made }).unwrap();
+        assert_ne!(moved.key(), public.key(), "the key covers which of its and its imports' references are one");
+        assert!(rule.function(&FunctionMade { imported_refs: &[], ..made }).unwrap_err().why.contains("references of 0"));
         assert_eq!(rule.side(&ContentId([1; 32]), &public).unwrap().kind(), Kind::Debug);
 
         let dev = spec(Backend::Cranelift { speed: false }, TOOLCHAIN);
@@ -1035,26 +1261,44 @@ mod tests {
             assert!(rule.function(&FunctionMade { imported: &imported, ..made }).is_err());
         }
         assert!(rule.function(&FunctionMade { imported: &[], ..made }).unwrap_err().why.contains("imports"));
+        for private in private_origins() {
+            let inlined = [source(50, settings, private.clone())];
+            let why = rule.function(&FunctionMade { imported_built_in: &[&inlined], ..made }).unwrap_err().why;
+            assert!(why.contains("import 0's built-in body"), "{private}: {why}");
+        }
     }
 
     #[test]
     fn a_dev_function_of_public_crates_for_the_baseline_is_public_under_its_template_key() {
         let rule = rule();
-        for backend in [Backend::Cranelift { speed: true }, Backend::Cranelift { speed: false }, Backend::Stencil] {
+        let alone = [Backend::Cranelift { speed: true }, Backend::Cranelift { speed: false }, Backend::Stencil];
+        for backend in alone {
             let dev = spec(backend, TOOLCHAIN);
             let settings = dev.settings();
             let function = source(10, settings, serde());
             let built_in = [source(20, settings, Origin::Toolchain(TOOLCHAIN))];
-            let made = DevFunctionMade { spec: &dev, function: &function, built_in: &built_in };
+            let refs = [Target::Function(InstanceKey(ContentId([40; 32]))), Target::Data(ContentId([41; 32]))];
+            let made = DevFunctionMade { spec: &dev, function: &function, built_in: &built_in, refs: &refs };
             let public = rule.dev_function(&made).unwrap();
             let stored = blaze_codegen::driver::stored(function.instance.key(), &[built_in[0].instance.key()]);
-            assert_eq!((public.key(), public.kind()), (keys::template(&stored), Kind::Code));
+            let placed = blaze_codegen::driver::placed(stored, &refs);
+            let key = blaze_codegen::kernel::template(&placed, &settings, &dev.toolchain.id);
+            assert_eq!((public.key(), public.kind()), (key, Kind::Code));
+            let direct = [Target::Direct(InstanceKey(ContentId([40; 32]))), Target::Data(ContentId([41; 32]))];
+            let moved = rule.dev_function(&DevFunctionMade { refs: &direct, ..made }).unwrap();
+            assert_ne!(moved.key(), public.key(), "the key covers each reference's kind");
+            let mut unsorted = [source(21, settings, Origin::Toolchain(TOOLCHAIN)), source(20, settings, Origin::Toolchain(TOOLCHAIN))];
+            if unsorted[0].instance.key() < unsorted[1].instance.key() {
+                unsorted.swap(0, 1);
+            }
+            let why = rule.dev_function(&DevFunctionMade { built_in: &unsorted, ..made }).unwrap_err().why;
+            assert!(why.contains("strictly ascending"), "{why}");
             assert_eq!(rule.side(&ContentId([1; 32]), &public).unwrap().kind(), Kind::Debug);
 
             let mut native = spec(backend, TOOLCHAIN);
             native.toolchain.features = vec!["+avx2".into()];
             let native_fn = source(10, native.settings(), serde());
-            let tuned = DevFunctionMade { spec: &native, function: &native_fn, built_in: &built_in };
+            let tuned = DevFunctionMade { spec: &native, function: &native_fn, built_in: &built_in, refs: &refs };
             let why = rule.dev_function(&tuned).unwrap_err().why;
             assert!(why.contains("baseline") && why.contains("+avx2"), "{why}");
             assert!(rule.dev_function(&DevFunctionMade { spec: &native, ..made }).unwrap_err().why.contains("settings"));
@@ -1072,10 +1316,12 @@ mod tests {
                 assert!(why.contains("the code of"), "{private}: {why}");
             }
         }
+        // LLVM code is release code, shown public only under its release key.
         let release = spec(Backend::Llvm { opt: 3 }, TOOLCHAIN);
         let function = source(10, release.settings(), serde());
-        let made = DevFunctionMade { spec: &release, function: &function, built_in: &[] };
-        assert!(rule.dev_function(&made).unwrap_err().why.contains("Rule::function"));
+        let made = DevFunctionMade { spec: &release, function: &function, built_in: &[], refs: &[] };
+        let why = rule.dev_function(&made).unwrap_err().why;
+        assert!(why.contains("Rule::function"), "{why}");
     }
 
     #[test]
@@ -1237,6 +1483,7 @@ mod tests {
             (ImageRead::Env(OsStr::new("HOME")), "HOME"),
             (ImageRead::Env(OsStr::new(trace::ALL_ENV_NAME)), "whole environment"),
             (ImageRead::Untraceable(Untraceable::Network), "traced"),
+            (ImageRead::Verified, "verified across checkouts"),
         ];
         for (read, says) in reads {
             let made = image(&crates, &out_dirs, std::slice::from_ref(&read));

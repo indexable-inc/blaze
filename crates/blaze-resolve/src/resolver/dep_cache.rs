@@ -25,6 +25,7 @@ use crate::resolver::{
 use crate::{Dependency, FeatureValue, PackageId, PackageIdSpec, Registry, Summary};
 
 use crate::resolver::{HashMap, HashSet};
+use std::alloc::Global;
 use anyhow::Context as _;
 use blaze_ids::radix;
 use std::cell::RefCell;
@@ -39,7 +40,7 @@ pub(super) struct RegistryQueryerAsync<'a, T: Registry> {
     replacements: &'a [(PackageIdSpec, Dependency)],
     version_prefs: &'a VersionPreferences,
     /// all the cases we ended up using a supplied replacement
-    used_replacements: RefCell<HashMap<PackageId, Summary>>,
+    used_replacements: RefCell<HashMap<PackageId, Summary, Global>>,
 }
 
 impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
@@ -52,7 +53,7 @@ impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
             registry,
             replacements,
             version_prefs,
-            used_replacements: RefCell::new(HashMap::default()),
+            used_replacements: RefCell::new(HashMap::new_in(Global)),
         }
     }
 
@@ -204,8 +205,7 @@ pub(super) struct RegistryQueryer<'a, T: Registry, Q> {
     /// execution.
     summary_cache: HashMap<
         (Option<PackageId>, Summary, ResolveOpts),
-        (Rc<(HashSet<InternedString>, Rc<[DepInfo]>)>, bool),
-    >,
+        (Rc<(HashSet<InternedString, Global>, Rc<[DepInfo]>)>, bool), Global>,
 }
 
 /// The [`RegistryQueryer`] over `registry`.
@@ -218,7 +218,7 @@ pub(super) fn registry_queryer<'a, T: Registry>(
     RegistryQueryer {
         inner: Rc::clone(&inner),
         poller: LocalPollAdapter::new(inner, start_query::<T>),
-        summary_cache: HashMap::default(),
+        summary_cache: HashMap::new_in(Global),
     }
 }
 
@@ -271,7 +271,7 @@ impl<'a, T: Registry, Q: Query> RegistryQueryer<'a, T, Q> {
         candidate: &Summary,
         opts: &ResolveOpts,
         first_version: Option<VersionOrdering>,
-    ) -> ActivateResult<Rc<(HashSet<InternedString>, Rc<[DepInfo]>)>> {
+    ) -> ActivateResult<Rc<(HashSet<InternedString, Global>, Rc<[DepInfo]>)>> {
         // if we have calculated a result before, then we can just return it,
         // as it is a "pure" query of its arguments.
         if let Some(out) = self.summary_cache.get(&(parent, candidate.clone(), opts.clone())) {
@@ -328,7 +328,7 @@ pub(super) fn resolve_features<'b>(
     parent: Option<PackageId>,
     s: &'b Summary,
     opts: &'b ResolveOpts,
-) -> ActivateResult<(HashSet<InternedString>, Vec<(Dependency, FeaturesSet)>)> {
+) -> ActivateResult<(HashSet<InternedString, Global>, Vec<(Dependency, FeaturesSet)>)> {
     // First, filter by dev-dependencies.
     let deps = s.dependencies();
     let deps = deps.iter().filter(|d| d.is_transitive() || opts.dev_deps);
@@ -336,7 +336,7 @@ pub(super) fn resolve_features<'b>(
     let reqs = build_requirements(parent, s, opts)?;
     let mut ret = Vec::new();
     let default_dep = BTreeSet::new();
-    let mut valid_dep_names = HashSet::default();
+    let mut valid_dep_names = HashSet::new_in(Global);
 
     // Next, collect all actually enabled dependencies and their features.
     for dep in deps {
@@ -433,10 +433,10 @@ struct Requirements<'a> {
     /// The resolver will activate all of these dependencies, with the given
     /// features enabled.
     // BTreeSet: each becomes a `FeaturesSet`, part of the `DepsCache` key.
-    deps: HashMap<InternedString, BTreeSet<InternedString>>,
+    deps: HashMap<InternedString, BTreeSet<InternedString>, Global>,
     /// The set of features enabled on this package which is later used when
     /// compiling to instruct the code what features were enabled.
-    features: HashSet<InternedString>,
+    features: HashSet<InternedString, Global>,
 }
 
 /// An error for a requirement.
@@ -457,10 +457,10 @@ enum RequirementError {
 
 impl Requirements<'_> {
     fn new(summary: &Summary) -> Requirements<'_> {
-        Requirements { summary, deps: HashMap::default(), features: HashSet::default() }
+        Requirements { summary, deps: HashMap::new_in(Global), features: HashSet::new_in(Global) }
     }
 
-    fn into_features(self) -> HashSet<InternedString> {
+    fn into_features(self) -> HashSet<InternedString, Global> {
         self.features
     }
 

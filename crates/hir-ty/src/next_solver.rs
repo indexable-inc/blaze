@@ -41,8 +41,6 @@ mod coroutine_witness_tests;
 #[cfg(test)]
 mod ported_rules_tests;
 
-use std::sync::OnceLock;
-
 pub use allocation::*;
 pub use binder::*;
 pub use consts::*;
@@ -161,7 +159,8 @@ impl std::fmt::Debug for DefaultAny<'_> {
 
 #[inline]
 pub fn default_types<'db>() -> &'db DefaultAny<'db> {
-    static TYPES: OnceLock<DefaultAny<'static>> = OnceLock::new();
+    #[expect(clippy::disallowed_types, reason = "the process's one set of default types: shared by every database")]
+    static TYPES: std::sync::OnceLock<DefaultAny<'static>> = std::sync::OnceLock::new();
 
     let types = TYPES.get_or_init(|| {
         let create_ty = Ty::new_without_interner;

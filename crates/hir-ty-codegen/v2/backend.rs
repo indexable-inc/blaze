@@ -84,7 +84,7 @@ fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
             spec.backend
         )));
     }
-    let isa = isa(unit)?;
+    let isa = isa(unit, unit_target(unit, spec)?)?;
     let pic = isa.flags().is_pic();
     if pic != (spec.toolchain.relocation == Relocation::Pic) {
         // alloc: an error
@@ -97,9 +97,11 @@ fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
     Ok(())
 }
 
-/// Whether the process's IR builder builds the IR `spec` asks for: the IR builder and
-/// Cranelift take the target and frame pointers from the process, and the unit's target
-/// features are a set the process compiles with (one ISA and one LLVM target machine a set).
+/// Whether the process's IR builder builds the IR `spec` asks for: the IR builder and the
+/// back ends take the target and the frame pointers from the unit's toolchain (the latter
+/// where the code is made, [`super::Function::frame_pointers`]), and the unit's target
+/// features are a set the process compiles with (one ISA and one LLVM target machine a
+/// target and set).
 /// What the IR is compiled to (its relocation model, whether it counts) is no part of it.
 pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
     let fail = |what: String| failed(unit, what);
@@ -124,18 +126,17 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
             if spec.counted { " that counts its calls" } else { "" }
         )));
     }
-    let target = crate::Target::selected().map_err(fail)?;
+    let target = unit_target(unit, spec)?;
     let arch = match target.arch {
         crate::Arch::X86_64 => Arch::X86_64,
         crate::Arch::Aarch64 => Arch::Aarch64,
         crate::Arch::Wasm32 => Arch::Wasm32,
     };
-    if target.triple() != toolchain.target || arch != toolchain.arch {
+    if arch != toolchain.arch {
         // alloc: the error's message
         return Err(fail(format!(
-            "the process compiles for {}, the unit is for {}",
-            target.triple(),
-            toolchain.target
+            "the unit's toolchain names {} for {:?}, whose architecture is {arch:?}",
+            toolchain.target, toolchain.arch
         )));
     }
     let cranelift = spec.backend.is_cranelift();
@@ -146,8 +147,8 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
     if !cranelift && target.cpu() != toolchain.cpu {
         // alloc: the error's message
         return Err(fail(format!(
-            "the process compiles for the CPU {}, the unit for {}: the {:?} back end is told \
-             no other CPU yet",
+            "the target's CPU is {}, the unit's {}: the {:?} back end is told no other CPU \
+             yet",
             target.cpu(),
             toolchain.cpu,
             spec.backend
@@ -160,7 +161,7 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
     // compiled with; a set that can't be made is the unit's error, never the baseline's code.
     let features = target.features_of(&toolchain.features).map_err(fail)?;
     if cranelift {
-        crate::target_with(features).map_err(|e| {
+        crate::target_with(target, features).map_err(|e| {
             // alloc: the error's message
             failed(unit, format!("Cranelift has no ISA for the target features {:?}: {e}", toolchain.features))
         })?;
@@ -178,14 +179,6 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
             "PGO ({:?}: -Cprofile-generate, -Cprofile-use) is instrumented and used by the LLVM \
              back end (Backend::Llvm), and this unit is compiled by {:?}",
             spec.pgo, spec.backend
-        )));
-    }
-    if toolchain.frame_pointers != crate::backend::frame_pointers() {
-        // alloc: the error's message
-        return Err(fail(format!(
-            "the unit keeps frame pointers: {}, the process: {}",
-            toolchain.frame_pointers,
-            crate::backend::frame_pointers()
         )));
     }
     if let Some(knob) = set_knob() {
@@ -236,16 +229,20 @@ fn check_stencils(unit: &Unit, target: &crate::Target, spec: &Spec) -> Result<()
     Ok(())
 }
 
-/// The first of [`CHANGES_CODE`] that is set, read once: the environment is the process's,
-/// and reading it takes the environment's lock.
+/// The first of [`CHANGES_CODE`] that is set: a handful of lookups a unit, next to its compile.
 fn set_knob() -> Option<&'static str> {
-    static SET: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
-    *SET.get_or_init(|| CHANGES_CODE.iter().copied().find(|it| std::env::var_os(it).is_some()))
+    CHANGES_CODE.iter().copied().find(|it| std::env::var_os(it).is_some())
 }
 
-// dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
-fn isa(unit: &Unit) -> Result<&'static dyn TargetIsa, CodegenError> {
-    crate::target().map(|it| &**it).map_err(|e| failed(unit, e))
+/// The target `spec`'s toolchain names: the unit's own, which its code is compiled for. Units
+/// of two targets compile side by side in one process.
+pub(super) fn unit_target(unit: &Unit, spec: &Spec) -> Result<&'static crate::Target, CodegenError> {
+    crate::Target::of(&spec.toolchain.target).map_err(|e| failed(unit, e))
+}
+
+// dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per target
+fn isa(unit: &Unit, target: &'static crate::Target) -> Result<&'static dyn TargetIsa, CodegenError> {
+    crate::isa_for(target).map(|it| &**it).map_err(|e| failed(unit, e))
 }
 
 impl Backends<'_> {
@@ -258,14 +255,14 @@ impl Backends<'_> {
         hashes: &HashSource,
         unit: &Unit,
         spec: &Spec,
-        (instance, inlined): (&HirInstance, bool),
+        (instance, walking): (&HirInstance, super::refs::Walking),
         refs: &Refs,
     ) -> Result<(Shape, Prepared), CodegenError> {
         // What preparing one instance makes and lets go of (the placer's index, the scope
         // tables, the shape's tables) is in a frame of the worker's, reset when it returns;
         // what it keeps (the IR, its places, spans, variables and scopes) is the heap's.
         blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
-            let function = built_function(db, homes, hashes, unit, spec, (instance, inlined), refs, frame)?;
+            let function = built_function(db, homes, hashes, unit, spec, (instance, walking), refs, frame)?;
             let shape = shape::of(unit, &function, frame)
                 // alloc: an error
                 .map_err(|what| failed(unit, format!("{}: {what}", super::Named(db, instance))))?;
@@ -304,13 +301,20 @@ pub(super) fn built_function(
     hashes: &HashSource,
     unit: &Unit,
     spec: &Spec,
-    (instance, inlined): (&HirInstance, bool),
+    (instance, walking): (&HirInstance, super::refs::Walking),
     refs: &Refs,
     frame: &Frame,
 ) -> Result<Function, CodegenError> {
     // alloc: an error
     let fail = |what: String| failed(unit, format!("{}: {what}", super::Named(db, instance)));
-    let build = Build::of(spec);
+    let inlined = walking.inlined;
+    // Its body is built against the program's dyn facts where its references were walked so
+    // (`super::devirt::walking`) and the unit inlines: only then are its direct callees among
+    // them. A unit that inlines nothing (a generic instance in a crate built at a lower level
+    // than another that asks for it, as a proc macro's wasm module is) builds the plain body,
+    // which every walk lists too (`refs::code_refs` walks `Build::WALK` first).
+    let plain = Build::of(spec);
+    let build = Build { world: walking.world.filter(|_| plain.inlines), ..plain };
     if build.inlines && !inlined {
         // alloc: an error
         return Err(fail(format!(
@@ -319,7 +323,7 @@ pub(super) fn built_function(
             unit.backend
         )));
     }
-    let walked = refs::listed(db, instance, inlined).map_err(fail)?;
+    let walked = refs::listed(db, instance, walking).map_err(fail)?;
     if walked.len() != refs.len() {
         // alloc: an error
         return Err(fail(format!(
@@ -329,10 +333,23 @@ pub(super) fn built_function(
         )));
     }
     let mut placer = Placer::listed_in(walked, frame);
-    let mut code = build::with(build, || built(db, instance, spec.overflow_checks))
+    let target = unit_target(unit, spec)?;
+    let krate = compiled_in(db, instance);
+    // The IR builder lays the code out for its crate's target, the back end for the unit's.
+    if let Some(krate) = krate {
+        let built_for = crate::target_of_crate(db, krate).map_err(|e| failed(unit, e))?;
+        if !std::ptr::eq(built_for, target) {
+            // alloc: the error's message
+            return Err(fail(format!(
+                "the unit is for {}, its crate's target is {}",
+                target.triple(),
+                built_for.triple()
+            )));
+        }
+    }
+    let mut code = build::with(build, || built(db, instance, target, spec.overflow_checks))
         .map_err(fail)?
         .map_err(fail)?;
-    let krate = compiled_in(db, instance);
     let (places, source, variables) = match &mut code {
         Built::Ir(pending) => {
             let requests = &mut pending.wants.requests;
@@ -352,7 +369,7 @@ pub(super) fn built_function(
         // alloc: none, empty
         _ => Vec::new(),
     };
-    let told = matches!(spec.debuginfo, DebugInfo::Limited | DebugInfo::Full);
+    let told = spec.debuginfo.tells_locals();
     let (variables, mut scopes) = match (&source, variables) {
         (Some(source), Some((env, variables))) if told => {
             let krate = env.as_ref(db).krate;
@@ -372,14 +389,14 @@ pub(super) fn built_function(
             colocate(&mut pending.func, &places, placer.refs(), frame);
         }
     }
-    let inlined = super::frontend::inlined(db, hashes, (instance, inlined)).map_err(fail)?;
-    let (features, own_features) = features(db, spec, instance).map_err(fail)?;
+    let inlined = super::frontend::inlined(db, hashes, (instance, walking)).map_err(fail)?;
+    let (features, own_features) = features(db, spec, target, instance).map_err(fail)?;
     let wasm = if unit.arch == Arch::Wasm32 {
         let requests = match &code {
             Built::Ir(pending) => &pending.wants.requests,
             Built::Assembled(_, requests) => requests,
         };
-        super::wasm::header(db, instance, requests).map_err(fail)?
+        super::wasm::header(db, target, instance, requests).map_err(fail)?
     } else {
         Default::default()
     };
@@ -393,10 +410,12 @@ pub(super) fn built_function(
         hint: hint(db, instance),
         unsanitized: unsanitized(db, spec, instance).map_err(fail)?,
         features,
+        target,
+        frame_pointers: spec.toolchain.frame_pointers,
         release: Default::default(),
         // A fold would share one function's counter cells between its members, and
         // give one function's code of its own target features to the others.
-        foldable: !spec.counted && !own_features && foldable(db, instance),
+        foldable: !spec.counted && !own_features && foldable(db, instance).map_err(fail)?,
         wasm,
     })
 }
@@ -435,8 +454,12 @@ fn hint(db: &Db, instance: &HirInstance) -> Hint {
 /// or reify shim has those of the function it is of, and drop glue and the `FnOnce` shims
 /// none; as its `codegen_fn_attrs`, a closure or coroutine has its function's. They change the
 /// code only, never `cfg(target_feature)`.
-fn features(db: &Db, spec: &Spec, instance: &HirInstance) -> Result<(crate::Features, bool), String> {
-    let target = crate::Target::selected()?;
+fn features(
+    db: &Db,
+    spec: &Spec,
+    target: &crate::Target,
+    instance: &HirInstance,
+) -> Result<(crate::Features, bool), String> {
     let unit = target.features_of(&spec.toolchain.features)?;
     let func = match &instance.0 {
         Kind::Code(Instance { def: InstanceDef::Fn(func) | InstanceDef::VtableShim(func), .. }, _) => {
@@ -522,9 +545,10 @@ fn unsanitized(
     };
     let mut unsanitized = Sanitizers(off & sanitize.sanitizers.0);
     let callback = || {
-        super::frontend::symbol_of(db, &instance.0).is_some_and(|it| it.starts_with("__sanitizer_"))
+        super::frontend::symbol_of(db, &instance.0)
+            .map(|it| it.is_some_and(|it| it.starts_with("__sanitizer_")))
     };
-    if sanitize.coverage.is_on() && callback() {
+    if sanitize.coverage.is_on() && callback()? {
         unsanitized = unsanitized.union(Sanitizers::COVERAGE);
     }
     Ok(unsanitized)
@@ -532,21 +556,26 @@ fn unsanitized(
 
 /// Whether a fold may give the instance another's code: its address is no symbol's, and it
 /// takes no C variadic arguments, whose `va_list` a thunk could not pass on.
-fn foldable(db: &Db, instance: &HirInstance) -> bool {
-    if super::frontend::symbol_of(db, &instance.0).is_some() {
-        return false;
+fn foldable(db: &Db, instance: &HirInstance) -> Result<bool, String> {
+    if super::frontend::symbol_of(db, &instance.0)?.is_some() {
+        return Ok(false);
     }
-    match &instance.0 {
+    Ok(match &instance.0 {
         Kind::Code(Instance { def: InstanceDef::Fn(func), .. }, _) => {
             !FunctionSignature::of(db, *func).is_varargs()
         }
         Kind::Code(..) => true,
         Kind::Asm(..) | Kind::Start(_) | Kind::Allocator(_) => false,
-    }
+    })
 }
 
 /// The IR of an instance, built as a unit with overflow checks `checked` asks.
-pub(super) fn built(db: &Db, instance: &HirInstance, checked: bool) -> Result<Built, String> {
+pub(super) fn built(
+    db: &Db,
+    instance: &HirInstance,
+    target: &'static crate::Target,
+    checked: bool,
+) -> Result<Built, String> {
     let produced = match &instance.0 {
         Kind::Code(instance, env) => {
             let instance = Instance { checked, ..*instance };
@@ -559,7 +588,7 @@ pub(super) fn built(db: &Db, instance: &HirInstance, checked: bool) -> Result<Bu
         Kind::Asm(text, _) => {
             // An `asm!` block's code is its text, the same under every unit's settings.
             _ = super::build::building();
-            return assembled(text);
+            return assembled(target, text);
         }
         Kind::Allocator(forward) => super::allocator::built(db, forward, checked),
     }
@@ -571,14 +600,14 @@ pub(super) fn built(db: &Db, instance: &HirInstance, checked: bool) -> Result<Bu
 }
 
 /// The function of an `asm!` block: its assembly, which names nothing.
-fn assembled(text: &str) -> Result<Built, String> {
-    if crate::Target::selected()?.is_wasm() {
+fn assembled(target: &'static crate::Target, text: &str) -> Result<Built, String> {
+    if target.is_wasm() {
         // alloc: the error's message
         return Err("an `asm!` or `global_asm!` function on wasm32: blaze assembles x86-64 and \
                     AArch64, and wasm32's ISA is one whose settings only the IR borrows"
             .to_owned());
     }
-    let isa = crate::target().map_err(|e| e.to_string())?; // alloc: the error's message
+    let isa = crate::isa_for(target).map_err(|e| e.to_string())?; // alloc: the error's message
     // alloc: only an `asm!` function, whose assembler takes the triple as text
     let assembled = crate::asm::assemble(&isa.triple().to_string(), text)?;
     if !assembled.relocs.is_empty() {
@@ -835,13 +864,16 @@ pub(crate) fn emit_cranelift(
     refs: &Refs,
     counted: bool,
 ) -> Result<Emitted, CodegenError> {
-    let features = function.features;
-    emit_built(unit, function, refs, |func, named| compiled(unit, func, named, counted, features))
+    let (features, target, frame_pointers) = (function.features, function.target, function.frame_pointers);
+    emit_built(unit, function, refs, |func, named| {
+        compiled(unit, target, func, named, counted, features, frame_pointers)
+    })
 }
 
 /// Compiles a prepared function by copy-and-patch (`blaze_stencil`), against `refs`.
 fn emit_stencil(unit: &Unit, function: Box<Function>, refs: &Refs) -> Result<Emitted, CodegenError> {
-    emit_built(unit, function, refs, |func, named| stenciled(unit, func, named))
+    let target = function.target;
+    emit_built(unit, function, refs, |func, named| stenciled(unit, target, func, named))
 }
 
 /// A prepared function's code, its IR made code by `backend` (given the stack slots of its
@@ -864,14 +896,14 @@ fn emit_built(
             ),
         ));
     }
-    let Function { code, places, spans, variables, scopes, inlined, wasm, .. } = *function;
+    let Function { code, places, spans, variables, scopes, inlined, wasm, target, .. } = *function;
     let named = Named { spans: &spans, variables: &variables, scopes: &scopes, inlined };
     match code {
         Built::Ir(pending) => {
             let code = backend(pending.func, &pending.named)?;
-            told(unit, (&places, &wasm), &pending.wants.requests, code, refs, named)
+            told(unit, target, (&places, &wasm), &pending.wants.requests, code, refs, named)
         }
-        Built::Assembled(code, requests) => told(unit, (&places, &wasm), &requests, code, refs, named),
+        Built::Assembled(code, requests) => told(unit, target, (&places, &wasm), &requests, code, refs, named),
     }
 }
 
@@ -905,11 +937,12 @@ pub(crate) fn emitted(
     code: fragment::Code,
     refs: &Refs,
 ) -> Result<Emitted, CodegenError> {
-    told(unit, (&function.places, &function.wasm), function.requests(), code, refs, function.named())
+    told(unit, function.target, (&function.places, &function.wasm), function.requests(), code, refs, function.named())
 }
 
 fn told(
     unit: &Unit,
+    target: &'static crate::Target,
     (places, wasm): (&Places, &super::wasm::Header),
     requests: &Requests,
     code: fragment::Code,
@@ -925,7 +958,7 @@ fn told(
             places.refs
         )));
     }
-    let isa = isa(unit)?;
+    let isa = isa(unit, target)?;
     let (compiled, side) = resolve(places, refs, |resolve| {
         let side = side::of(variables, scopes, &code, resolve.frame())?;
         let compiled = super::convert::function(
@@ -970,39 +1003,44 @@ fn emit_ir(
     };
     // A fold's members never count: `merge` refuses them.
     if thunk {
-        let code = compiled(unit, ir, &[], false, function.features)?;
+        let code = compiled(unit, function.target, ir, &[], false, function.features, function.frame_pointers)?;
         let none = side::Scopes::default();
         // alloc: empty, allocates nothing
         let named = Named { spans: &[], variables: &[], scopes: &none, inlined: Vec::new() };
-        told(unit, (&function.places, &function.wasm), function.requests(), code, refs, named)
+        told(unit, function.target, (&function.places, &function.wasm), function.requests(), code, refs, named)
     } else {
-        let code = compiled(unit, ir, &pending.named, false, function.features)?;
+        let code =
+            compiled(unit, function.target, ir, &pending.named, false, function.features, function.frame_pointers)?;
         emitted(unit, function, code, refs)
     }
 }
 
 /// Cranelift's code of the IR at the unit's level, `named` being the stack slots of its
 /// named locals; `counted`, counting into the function's own cells; with the ISA of the
-/// function's target features ([`features`]).
+/// function's target features ([`features`]), keeping every frame pointer when
+/// `frame_pointers` ([`Function::frame_pointers`]).
 fn compiled(
     unit: &Unit,
+    target: &'static crate::Target,
     func: ir::Function,
     named: &[ir::StackSlot],
     counted: bool,
     features: crate::Features,
+    frame_pointers: bool,
 ) -> Result<fragment::Code, CodegenError> {
     let Backend::Cranelift { speed } = unit.backend else {
         // alloc: the error's message
         return Err(failed(unit, format!("Cranelift's code of a unit for {:?}", unit.backend)));
     };
-    let isa = isa(unit)?;
+    let isa = isa(unit, target)?;
     crate::with_context(func, |context| {
         // Before the pairs are lowered: the counting is of the IR's own calls and loops.
         if counted {
             blaze_stencil::tier::instrument(&mut context.func).map_err(|e| failed(unit, e))?;
         }
         let pairs = crate::float_pair::lower(&mut context.func);
-        let mut code = crate::emit_lent(context, speed, features).map_err(|e| failed(unit, e))?;
+        let mut code =
+            crate::emit_lent(context, target, speed, features, frame_pointers).map_err(|e| failed(unit, e))?;
         if let Some(frame) = context.compiled_code().and_then(|it| it.buffer.frame_layout()) {
             code.slots = SlotPlaces::of_frame(isa, frame, &context.func, named.iter().copied());
         }
@@ -1026,6 +1064,7 @@ pub(super) fn stencil_ir(func: &mut ir::Function) -> Option<crate::float_pair::L
 
 fn stenciled(
     unit: &Unit,
+    target: &'static crate::Target,
     func: ir::Function,
     named: &[ir::StackSlot],
 ) -> Result<fragment::Code, CodegenError> {
@@ -1033,7 +1072,6 @@ fn stenciled(
         // alloc: an error
         return Err(failed(unit, format!("copy-and-patch code of a unit for {:?}", unit.backend)));
     }
-    let target = crate::Target::selected().map_err(|e| failed(unit, e))?;
     let Some(stencils) = target.stencil() else {
         // alloc: an error
         return Err(failed(unit, format!("copy-and-patch code for {}, which has no stencils", target.triple())));
@@ -1129,8 +1167,8 @@ impl<'db> Prepare for Backends<'db> {
     ) -> Result<(Shape, Prepared), CodegenError> {
         check_spec(unit, spec)?;
         frontend.with(|db, homes| {
-            let inlined = frontend.inlines(db, instance).map_err(|e| failed(unit, e))?;
-            self.prepared(db, homes, &frontend.hashes, unit, spec, (instance, inlined), refs)
+            let walking = frontend.walking(db, instance).map_err(|e| failed(unit, e))?;
+            self.prepared(db, homes, &frontend.hashes, unit, spec, (instance, walking), refs)
         })
     }
 
@@ -1211,7 +1249,7 @@ impl<'db> Prepare for Backends<'db> {
             .map(|(unit, spec, function, refs)| (*unit, *spec, &**function, *refs))
             // alloc: once a fold group, exact size: borrows of the boxes `functions` owns
             .collect();
-        let Some(&(first, ..)) = members.first() else {
+        let Some(&(first, first_spec, ..)) = members.first() else {
             return Err(CodegenError {
                 unit: group.key(),
                 item: ItemKey(ContentId::default()),
@@ -1222,7 +1260,7 @@ impl<'db> Prepare for Backends<'db> {
         // pointers; the IR's are 32-bit.
         let pointer = match first.arch {
             Arch::Wasm32 => ir::types::I32,
-            Arch::X86_64 | Arch::Aarch64 => isa(first)?.pointer_type(),
+            Arch::X86_64 | Arch::Aarch64 => isa(first, unit_target(first, first_spec)?)?.pointer_type(),
         };
         super::fold::merge(group, &members, pointer, |unit, _, function, ir, refs| {
             emit_ir(unit, function, ir, refs)
@@ -1239,7 +1277,7 @@ impl<'db> Prepare for Backends<'db> {
         frontend.with(|db, homes| {
             let hashes = &frontend.hashes;
             super::statics::compile(db, homes, hashes, spec.toolchain.arch, value.0, refs)
-                .map_err(|what| super::undescribed(db, value, None, what))
+                .map_err(|what| super::undescribed(db, &super::StaticNamed(db, value.0), None, what))
         })
     }
 }
@@ -1269,7 +1307,7 @@ mod features_tests {
     /// baseline feature not at all, and one the unit turns off on again.
     #[test]
     fn a_functions_set_is_its_units_with_what_it_enables() {
-        let x86 = crate::Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let x86 = crate::Target::of("x86_64-unknown-linux-gnu").expect("a target");
         let set = with_enabled(&x86, &[], ["avx", "avx2", "sse2"].into_iter()).expect("a set");
         assert_eq!(set.names(), names(&["+avx", "+avx2"]));
         let unit = names(&["+avx", "+popcnt"]);

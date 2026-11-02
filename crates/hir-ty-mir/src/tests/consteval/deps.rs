@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use base_db::{ContentId, Crate, Env, all_crates};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{
     ConstId, ModuleDefId,
     deps::{Held, ImageBuf, ImageStore, Mode},
@@ -59,7 +60,7 @@ impl Held for Bytes {
 /// A store in memory; [`Memory::replace`] stands for one whose bytes changed under their key.
 #[derive(Default)]
 struct Memory {
-    values: Mutex<HashMap<ContentId, Arc<Bytes>>>,
+    values: Mutex<HashMap<ContentId, Arc<Bytes>, Global>>,
 }
 
 impl ImageStore for Memory {
@@ -131,7 +132,7 @@ fn const_named(db: &TestDB, krate: Crate, name: &str) -> ConstId {
 fn database(store: &Arc<Memory>, base: Option<ContentId>, mode: Mode) -> (TestDB, Crate) {
     let mut db = fixture::db(FIXTURE).into_db();
     let lib = crate_named(&db, "lib");
-    let crates = HashMap::from_iter([(lib, base)]);
+    let crates = HashMap::from_iter_in([(lib, base)], Global);
     // dyn: hir-ty's `set` takes the driver's store, a boundary (`consteval::deps::Shared::store`)
     set(&mut db, Arc::clone(store) as Arc<dyn ImageStore + Send + Sync>, crates, mode);
     (db, lib)
@@ -153,7 +154,7 @@ fn values(db: &TestDB, krate: Crate, names: &[&str]) -> Vec<String> {
 fn evaluated(store: &Arc<Memory>) -> Vec<String> {
     let (db, lib) = database(store, None, Mode::Serve);
     let evaluated = values(&db, lib, &KEPT);
-    let bases = HashMap::from_iter([(lib, BASE)]);
+    let bases = HashMap::from_iter_in([(lib, BASE)], Global);
     assert_eq!(drain(&db, &bases), Ok(Drained { written: KEPT.len(), unkeyed: 0 }));
     assert_eq!(store.len(), KEPT.len());
     evaluated
@@ -165,7 +166,7 @@ fn a_served_constant_equals_the_evaluated_one() {
     let evaluated = evaluated(&store);
     let (db, lib) = database(&store, Some(BASE), Mode::Serve);
     assert_eq!(values(&db, lib, &KEPT), evaluated);
-    assert_eq!(drain(&db, &HashMap::default()), Ok(Drained::default()), "every one was served");
+    assert_eq!(drain(&db, &HashMap::new_in(Global)), Ok(Drained::default()), "every one was served");
     let main = crate_named(&db, "main");
     let mine = db.const_eval(const_named(&db, main, "MINE"), GenericArgs::empty(), None).unwrap();
     assert_eq!(mine.memory[..], [2], "a member's constant reads a served one");

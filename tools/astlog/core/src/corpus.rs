@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use ast_merge_langs::Lang;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use snafu::ResultExt as _;
 
 use crate::error::{
@@ -56,7 +57,7 @@ pub struct SourceFile {
     pub text: String,
     pub nodes: Vec<NodeInfo>,
     line_starts: Vec<usize>,
-    by_id: HashMap<usize, usize>,
+    by_id: HashMap<usize, usize, Global>,
     tree: tree_sitter::Tree,
 }
 
@@ -165,12 +166,12 @@ fn load_file(
 /// Preorder node table with parent indices, plus tree-sitter node id lookup.
 struct NodeTable {
     nodes: Vec<NodeInfo>,
-    by_id: HashMap<usize, usize>,
+    by_id: HashMap<usize, usize, Global>,
 }
 
 fn build_node_table(tree: &tree_sitter::Tree) -> NodeTable {
     let mut nodes = Vec::new();
-    let mut by_id = HashMap::default();
+    let mut by_id = HashMap::new_in(Global);
     let mut parents: Vec<usize> = Vec::new();
     let mut cursor = tree.walk();
     loop {

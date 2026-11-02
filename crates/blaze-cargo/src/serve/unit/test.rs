@@ -32,7 +32,7 @@ use blaze_cas::Store;
 use blaze_codegen::ExecTable;
 use blaze_core::{Completion, Effect, FileName, Tag};
 use blaze_ids::ContentId;
-use blaze_testsel::{Choice, Selector, Subject};
+use blaze_testsel::{Choice, Reached, Selector, Subject};
 use blaze_usercode::test::{
     self, Attrs, Binary, Config, Filter, Finished, Ignored, Job as TestJob, Mode as TestMode, Outcome, Queue,
     Reported, ShouldPanic, Suite, Wanted, select,
@@ -47,7 +47,7 @@ use super::{
     graph::flag,
     package_of,
 };
-use crate::serve::work::{Failed, Runs, Selection};
+use crate::serve::work::{Failed, RunPuts, Runs, Selection};
 
 /// How long one test may run: libtest sets no limit, so a day, past which it is surely hung.
 const TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -399,6 +399,8 @@ pub(crate) struct TestRun {
     suite_of: Vec<u32>,
     queue: Option<Queue>,
     ok: bool,
+    /// What keeping how its tests ran put ([`Runs::take_puts`]).
+    puts: RunPuts,
 }
 
 pub(crate) fn start(
@@ -536,7 +538,7 @@ pub(crate) fn start(
             common: traced::Common::default(),
         });
     }
-    Ok(TestRun { job: job.clone(), tags, filter, all, suites, suite_of: Vec::new(), queue: None, ok: true })
+    Ok(TestRun { job: job.clone(), tags, filter, all, suites, suite_of: Vec::new(), queue: None, ok: true, puts: RunPuts::default() })
 }
 
 impl TestRun {
@@ -589,11 +591,18 @@ impl TestRun {
                 out.push(refused(format!("test `{name}` of `{}` ran after its run gave its selector back", suite.name)));
                 continue;
             };
+            // What the test reaches is walked only when its record is not whole, which is the
+            // only run kept under it: never at link, as a binary of many tests would walk the
+            // program once per test.
+            let walk = || {
+                let _span = tracing::info_span!(target: "blaze", "test reach", suite = %suite.name, test = %name).entered();
+                table.reached(n)
+            };
             let subject = Subject {
                 name,
                 attrs: &suite.attrs[n],
                 outside: tests[n].outside || !suite.inside[n],
-                reached: &table.tests[n].1,
+                reached: Reached::Lazy(&walk),
             };
             let record = image::record(done.executed);
             let took = done.took;
@@ -609,11 +618,14 @@ impl TestRun {
                     continue;
                 }
             };
-            if let Err(error) = kept {
-                self.ok = false;
-                suite.kept_all = false;
-                // alloc: error path
-                out.push(refused(format!("keeping how test `{name}` of the test binary `{}` ran: {error}", suite.name)));
+            match kept {
+                Ok(kept) => self.puts.kept(kept.tickets),
+                Err(error) => {
+                    self.ok = false;
+                    suite.kept_all = false;
+                    // alloc: error path
+                    out.push(refused(format!("keeping how test `{name}` of the test binary `{}` ran: {error}", suite.name)));
+                }
             }
         }
     }
@@ -685,8 +697,10 @@ impl Runs<Real> for TestRun {
                     }
                     Wanted::Yes => {}
                 }
+                // Choosing reads no reach: only keeping a run whose record is not whole does.
+                let walk = || table.reached(n);
                 let subject =
-                    Subject { name: &test.name, attrs, outside: test.outside || !inside, reached: &table.tests[n].1 };
+                    Subject { name: &test.name, attrs, outside: test.outside || !inside, reached: Reached::Lazy(&walk) };
                 match selector.choose(store, &subject, self.all, &mut suite.disk) {
                     Ok(Choice::Cached(kept)) => {
                         out.push(Response::TestResult(blaze_testsel::api::result(&suite.name, at, &test.name, &kept)));
@@ -777,5 +791,9 @@ impl Runs<Real> for TestRun {
             }
             None => self.end(),
         }
+    }
+
+    fn take_puts(&mut self) -> RunPuts {
+        std::mem::take(&mut self.puts)
     }
 }

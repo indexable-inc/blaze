@@ -25,6 +25,36 @@ impl<'db> Features<'db> {
     pub fn sized_hierarchy(self) -> bool {
         self.unstable.sized_hierarchy
     }
+
+    /// Whether an interner of `a` and one of `b` (`DbInterner::new_with`) answer a goal alike
+    /// wherever they see the same impls: the same `#![recursion_limit]`, and the same answer
+    /// from everything of [`inherent::Features`] below. Its one reader keys a query by the
+    /// lowest crate that sees what the query solves in place of the crate that asked
+    /// (`hir_ty_pure`'s summaries, its `stands_for`); a feature the solver starts reading is added
+    /// here, or such a key misses it (rule 18).
+    pub fn solve_alike(db: &Db, a: Crate, b: Crate) -> bool {
+        if a == b {
+            return true;
+        }
+        if hir_def::nameres::crate_recursion_limit(db, a)
+            != hir_def::nameres::crate_recursion_limit(db, b)
+        {
+            return false;
+        }
+        let (a, b) = (UnstableFeatures::query(db, a), UnstableFeatures::query(db, b));
+        // `feature_bound_holds_in_crate`: the features enabled, none in a `staged_api` crate.
+        let any_bound_holds = |it: &UnstableFeatures| !it.staged_api && it.iter().next().is_some();
+        let same_bounds = match (any_bound_holds(a), any_bound_holds(b)) {
+            (false, false) => true,
+            (true, true) => a == b,
+            _ => false,
+        };
+        same_bounds
+            && a.generic_const_exprs == b.generic_const_exprs
+            && a.gca_const_items == b.gca_const_items
+            && a.coroutine_clone == b.coroutine_clone
+            && a.sized_hierarchy == b.sized_hierarchy
+    }
 }
 
 impl<'db> inherent::Features<DbInterner<'db>> for Features<'db> {

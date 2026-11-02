@@ -6,7 +6,7 @@
 //! caller wraps them.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
 
@@ -21,6 +21,8 @@ use blaze_units::{
 use blaze_vfs::View;
 use hir_expand::proc_macro::ProcMacro;
 use blaze_lower::{Lower, Lowered, Ran};
+
+use crate::config::Homes;
 
 const LIBRARY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../library");
 
@@ -133,7 +135,9 @@ fn host() -> Result<&'static str, String> {
 
 /// The units of the workspace at `dir` (whose files are the view `view`), as `blaze build`
 /// plans them there, each package it needs mounted from where cargo fetched it.
-fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str) -> Result<(Units, BuildConfig), String> {
+/// `homes` is where the daemon that built it placed build directories and the standard
+/// library's, so that each build script's `OUT_DIR` in the plan is where that build left its run.
+fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str, homes: Homes<'_>) -> Result<(Units, BuildConfig), String> {
     let library = library()?;
     let home = std::env::var("HOME").map_err(|_| "HOME is not set, and cargo reads it".to_owned())?;
     let mut env = vec![("CARGO_HOME".to_owned(), cargo_home.to_owned()), ("HOME".to_owned(), home)];
@@ -163,7 +167,8 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str) -> Result<(
             mounts: mounts.clone(),
             host: host()?.to_owned(),
             library: stdlib::library_at(&library.commit),
-            std: "/s/std".to_owned(),
+            std: homes.std.to_owned(),
+            builds: homes.builds.to_owned(),
         };
         let opened = db.open_with(View { root: view }, &config.encode());
         let planned = db.pin().get::<Plan>(opened, &()).map_err(|error| format!("planning {dir}: {error:?}"))?.get();
@@ -193,18 +198,33 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str) -> Result<(
     }
 }
 
-/// The run of build-script unit `unit` as `blaze build` left it: `output` beside its
-/// `OUT_DIR`, as cargo lays a run out, and the files in `OUT_DIR`.
-fn ran(units: &Units, unit: usize) -> Result<Ran, String> {
-    let out_dir = units.plans[unit].out_dir.clone().ok_or_else(|| format!("build script run {unit} has no OUT_DIR"))?;
-    let output_at = Path::new(&out_dir).parent().map(|it| it.join("output")).ok_or_else(|| format!("{out_dir} has no parent"))?;
+/// The run of build-script unit `unit` as `blaze build` left it: its stdout where the plan
+/// names it (the first of the run's outputs: `run/stdout` beside `out/` in the new layout,
+/// `output` beside `OUT_DIR` in cargo's first), and the files in `OUT_DIR`. A run of the
+/// standard library's is read where the daemon placed it under `std` ([`std_placed`]), its
+/// `OUT_DIR` still the plan's.
+fn ran(units: &Units, unit: usize, std: &str) -> Result<Ran, String> {
+    let plan = &units.plans[unit];
+    let out_dir = plan.out_dir.as_deref().ok_or_else(|| format!("build script run {unit} has no OUT_DIR"))?;
+    let output_at = plan.outputs.first().ok_or_else(|| format!("build script run {unit} names no stdout"))?;
+    let (read_from, output_at) = match std_placed(output_at, std)? {
+        Some((planned, placed)) => {
+            let under = |path: &str| {
+                path.strip_prefix(planned.as_str())
+                    .map(|rest| format!("{}{rest}", placed.display()))
+                    .ok_or_else(|| format!("build script run {unit}: {path} is not under {planned}, where its stdout is"))
+            };
+            (under(out_dir)?, PathBuf::from(under(output_at)?))
+        }
+        None => (out_dir.to_owned(), PathBuf::from(output_at)),
+    };
     let output = std::fs::read(&output_at).map_err(|error| {
         format!(
-            "no build script's run at {}: {error}; the harness builds the workspace with `blaze build -p corpus-calls` first",
+            "no build script's run at {}: {error}; the harness builds the workspace with `blaze build -p corpus-calls` (without `-Z wasm-macros`, whose build scripts of proc macros' dependencies run for wasm32) first",
             output_at.display()
         )
     })?;
-    let mut ran = Ran { out_dir: out_dir.clone(), ..Ran::default() };
+    let mut ran = Ran { out_dir: out_dir.to_owned(), ..Ran::default() };
     for line in String::from_utf8_lossy(&output).lines() {
         let Some(directive) = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:")) else { continue };
         let Some((key, value)) = directive.split_once('=') else { continue };
@@ -219,29 +239,79 @@ fn ran(units: &Units, unit: usize) -> Result<Ran, String> {
             _ => {}
         }
     }
-    ran.files = read_tree(Path::new(&out_dir), &|_: &str| true, &[])?;
+    ran.files = read_tree(Path::new(&read_from), &|_: &str| true, &[])?;
     Ok(ran)
 }
 
-/// The workspace at `dir` (absolute) in the front end, its packages fetched into `cargo_home`:
-/// each proc-macro crate's macros are what `wrap` makes of those `blaze_macro_eval::load`
-/// gives, given the crate's name.
+/// For `path` of the plan under `std/<key>` (the standard library's directory, its key the
+/// daemon's `std_key`), that directory as planned and the one of `std` the daemon left the
+/// file in. This plan's key covers the library as the test mounts it, which is not the
+/// daemon's mount byte for byte, so the file is looked for under every key and found in
+/// exactly one: none, or two, is an error naming them. None when `path` is not under `std`.
+fn std_placed(path: &str, std: &str) -> Result<Option<(String, PathBuf)>, String> {
+    let Some(rest) = path.strip_prefix(std).and_then(|it| it.strip_prefix('/')) else { return Ok(None) };
+    let (key, below) = rest.split_once('/').ok_or_else(|| format!("{path} names no file under a key of {std}"))?;
+    let entries = std::fs::read_dir(std).map_err(|error| format!("the standard library's directory {std}: {error}"))?;
+    let mut found = Vec::new();
+    for entry in entries {
+        let dir = entry.map_err(|error| format!("{std}: {error}"))?.path();
+        if dir.join(below).is_file() {
+            found.push(dir);
+        }
+    }
+    found.sort();
+    match found.as_slice() {
+        [placed] => Ok(Some((format!("{std}/{key}"), placed.clone()))),
+        [] => Err(format!(
+            "no build script's run of the standard library at {below} under any key of {std} (planned under {key}): \
+             the corpus reads the std the daemon that built the workspace shared"
+        )),
+        more => Err(format!(
+            "the standard library's run at {below} is under {} keys of {std}, {}: the corpus can't tell which the \
+             daemon's build of the workspace used; a fresh `std` names one",
+            more.len(),
+            more.iter().map(|it| it.display().to_string()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// The workspace at `dir` (absolute) in the front end, its packages fetched into `cargo_home`
+/// and built by a daemon that placed its outputs in `homes`: each proc-macro crate's
+/// macros are what `wrap` makes of those `blaze_macro_eval::load` gives with `macros`, given
+/// the crate's name.
 pub(crate) fn lower(
     dir: &str,
     cargo_home: &str,
+    homes: Homes<'_>,
+    macros: &std::sync::Arc<blaze_macro_eval::Macros>,
     mut wrap: impl FnMut(&str, Vec<ProcMacro>) -> Result<Vec<ProcMacro>, String>,
+) -> Result<Workspace, String> {
+    lower_with(dir, cargo_home, homes, |db, krate, toolchain, name| {
+        let macros = blaze_macro_eval::load(db, krate, toolchain, macros)
+            .map_err(|error| format!("blaze_macro_eval::load of `{name}`: {error}"))?;
+        wrap(name, macros)
+    })
+}
+
+/// [`lower`], each proc-macro crate's macros what `load` gives of the database, the crate, the
+/// toolchain and the crate's name.
+pub(crate) fn lower_with(
+    dir: &str,
+    cargo_home: &str,
+    homes: Homes<'_>,
+    mut load: impl FnMut(&base_db::Db, Crate, ContentId, &str) -> Result<Vec<ProcMacro>, String>,
 ) -> Result<Workspace, String> {
     let tree = tree();
     let files = read_tree(Path::new(dir), &|_: &str| true, &["target"])?;
     let view = root_of(&files);
     let mut db = Database::new(Config { tree: Some(tree.clone()), dir: None, tags: 0 });
     query::register(&mut db);
-    let (units, config) = plan(&db, dir, view, cargo_home)?;
+    let (units, config) = plan(&db, dir, view, cargo_home, homes)?;
     let mut lowered = blaze_lower::lower(Lower { units: &units, config: &config, files: &**tree, root: view, host_cpu: None })
         .map_err(|error| format!("lowering {dir}: {error}"))?;
     for (unit, it) in units.graph.units.iter().enumerate() {
         if it.mode == Mode::RunCustomBuild {
-            let run = ran(&units, unit)?;
+            let run = ran(&units, unit, homes.std)?;
             lowered.ran(unit, &run).map_err(|error| format!("applying build script run {unit} of {dir}: {error}"))?;
         }
     }
@@ -252,9 +322,7 @@ pub(crate) fn lower(
         }
         let name = units.graph.units[unit].target.name.clone();
         let krate = lowered.krate(unit).ok_or_else(|| format!("proc macro `{name}` has no crate"))?;
-        let macros = blaze_macro_eval::load(lowered.db(), krate, toolchain)
-            .map_err(|error| format!("blaze_macro_eval::load of `{name}`: {error}"))?;
-        let macros = wrap(&name, macros)?;
+        let macros = load(lowered.db(), krate, toolchain, &name)?;
         lowered.macros(unit, Ok(macros)).map_err(|error| format!("the macros of `{name}`: {error}"))?;
     }
     Ok(Workspace { dir: dir.to_owned(), units, lowered })

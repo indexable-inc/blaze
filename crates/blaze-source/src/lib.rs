@@ -4,6 +4,8 @@
 //! blaze-resolve and the crates over it build for wasm (#458), and blaze-registry, which
 //! fetches, names its directories from the same type.
 
+#![feature(allocator_api)]
+
 pub mod interning;
 pub mod source_id;
 

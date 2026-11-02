@@ -467,11 +467,53 @@ where
         unreachable!("Unsize is not const")
     }
 
+    /// blaze: `Field<B>` and `Variant<B>` are `const` traits (their default methods read
+    /// only their constants), and every member is `const Field` (`const Variant`) of its
+    /// container. `Struct`, `Enum` and `FnItem` are not `const`.
+    fn consider_builtin_reflect_candidate(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+        item: SolverTraitLangItem,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        use crate::solve::reflect::{domain_of, reflect_trait_holds};
+
+        if domain_of(item).is_none() {
+            return Err(NoSolution.into());
+        }
+        let answer = reflect_trait_holds(ecx.cx(), item, goal.predicate.self_ty());
+        let base = Some(goal.predicate.trait_ref.args.type_at(1));
+        ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc)
+            .enter(|ecx| ecx.reflect_candidate_response(goal.param_env, answer, base))
+    }
+
     fn consider_builtin_field_candidate(
         _ecx: &mut EvalCtxt<'_, D>,
         _goal: Goal<<D as SolverDelegate>::Interner, Self>,
     ) -> Result<Candidate<<D as SolverDelegate>::Interner>, NoSolutionOrRerunNonErased> {
         unreachable!("Field is not const")
+    }
+
+    /// blaze: `ArbitraryInt` is a `const trait` (its default items are the arbitrary-width
+    /// integers' inherent items, callable in a `const fn`), and every arbitrary-width integer
+    /// is `const ArbitraryInt` and `const ArbitrarySigned` exactly when it is the plain one.
+    fn consider_builtin_int_marker_candidate(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+        marker: structural_traits::IntMarker,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        use structural_traits::{IntMarker, int_marker_holds};
+
+        match marker {
+            IntMarker::Arbitrary | IntMarker::Signed => {}
+            IntMarker::From | IntMarker::TryFrom => {
+                unreachable!("`IntFrom` and `IntTryFrom` are not const: {:?}", goal)
+            }
+        }
+        if !int_marker_holds::<I>(marker, goal.predicate.self_ty(), None) {
+            return Err(NoSolution.into());
+        }
+        ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc)
+            .enter(|ecx| ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes))
     }
 }
 

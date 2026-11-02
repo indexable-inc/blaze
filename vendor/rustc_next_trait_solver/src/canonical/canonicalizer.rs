@@ -410,7 +410,8 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
             | ty::Alias(_, _)
             | ty::Bound(_, _)
             | ty::Error(_) => {
-                return t.super_fold_with(self);
+                // blaze: one guard per level of the type, which can nest as deep as a program builds it.
+                return stdx::ensure_sufficient_stack(|| t.super_fold_with(self));
             }
         };
 

@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+aho-corasick.workspace = true
 blaze-build-script.workspace = true
 blaze-cas.workspace = true
 blaze-core.workspace = true
@@ -24,7 +25,9 @@ blaze-inproc = { workspace = true, features = ["host"] }
 blaze-items.workspace = true
 blaze-mem.workspace = true
 blaze-query.workspace = true
+blaze-serde.workspace = true
 blaze-vfs.workspace = true
+memchr.workspace = true
 postcard.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

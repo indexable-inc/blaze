@@ -6,6 +6,8 @@
 //! each crate (declarations, docs with intra-doc links resolved, members, impls); [`html`]
 //! writes the pages, source pages, sidebars and search index from the model alone.
 
+#![feature(allocator_api)]
+
 mod attrs;
 mod cfg;
 mod collect;
@@ -24,13 +26,14 @@ mod tests;
 use hir::Crate;
 use base_db::Db;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 
 pub use crate::places::Documented;
 
 /// Each crate's dependencies only its tests use (a workspace member's dev-dependencies), which
 /// rust-analyzer's crate graph gives the crate itself and `cargo doc` neither documents nor
 /// links: `(crate, dependency)`.
-pub type TestOnly = HashSet<(Crate, Crate)>;
+pub type TestOnly = HashSet<(Crate, Crate), Global>;
 
 /// A crate the user asked to document.
 #[derive(Debug, Clone, Copy)]
@@ -51,8 +54,8 @@ pub fn crates_to_document(
     test_only: &TestOnly,
 ) -> Vec<Documented> {
     let mut out: Vec<Documented> = vec![];
-    let mut names = HashSet::default();
-    let mut seen = HashSet::default();
+    let mut names = HashSet::new_in(Global);
+    let mut seen = HashSet::new_in(Global);
     for it in asked {
         let name = crate_name(db, it.krate);
         if names.insert(name.clone()) {
@@ -66,7 +69,7 @@ pub fn crates_to_document(
     // Each crate reached, and whether a path to it leads through no proc macro: cargo builds
     // a proc macro and everything it depends on for the host, the rest for the target.
     let mut reached: Vec<(Crate, bool)> = vec![];
-    let mut walked = HashSet::default();
+    let mut walked = HashSet::new_in(Global);
     let mut stack: Vec<(Crate, bool)> = asked.iter().map(|it| (it.krate, false)).collect();
     while let Some((krate, host)) = stack.pop() {
         for dep in krate.dependencies(db) {
@@ -97,7 +100,7 @@ pub fn crates_to_document(
         .filter(|it| !names.contains(&it.name))
         .collect();
     let kept = one_per_name(reached);
-    let keep: HashSet<Crate> = kept.iter().map(|it| it.krate).collect();
+    let keep: HashSet<Crate, Global> = kept.iter().map(|it| it.krate).collect();
     let roots: Vec<Crate> = asked.iter().map(|it| it.krate).collect();
     let linked = still_reached(&roots, &keep, |krate| {
         krate
@@ -157,10 +160,10 @@ fn one_per_name<K>(reached: Vec<Reached<K>>) -> Vec<Reached<K>> {
 /// (`remove_duplicate_doc` in `src/cargo/ops/cargo_compile/mod.rs`, cargo 749d85d9fc).
 fn still_reached<K: Copy + Eq + std::hash::Hash>(
     roots: &[K],
-    kept: &HashSet<K>,
+    kept: &HashSet<K, Global>,
     deps: impl Fn(K) -> Vec<K>,
-) -> HashSet<K> {
-    let mut out = HashSet::default();
+) -> HashSet<K, Global> {
+    let mut out = HashSet::new_in(Global);
     let mut stack = roots.to_vec();
     while let Some(it) = stack.pop() {
         for dep in deps(it) {

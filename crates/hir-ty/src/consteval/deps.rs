@@ -15,10 +15,11 @@ mod codec;
 #[cfg(test)]
 mod tests;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Domain, Hasher};
 use crossbeam_queue::SegQueue;
 use hir_def::{
@@ -73,7 +74,7 @@ struct Shared {
     /// Each crate whose constants are kept, with the key its check results are filed under
     /// when that is known now: `None` for a crate checked in this session, whose key is known
     /// only once its bodies are, at [`drain`].
-    crates: HashMap<Crate, Option<ContentId>>,
+    crates: HashMap<Crate, Option<ContentId>, Global>,
     pending: SegQueue<Pending>,
 }
 
@@ -122,7 +123,7 @@ pub fn set(
     db: &mut Db,
     // dyn: the driver's store, as `Shared::store`
     store: Arc<dyn ImageStore + Send + Sync>,
-    crates: HashMap<Crate, Option<ContentId>>,
+    crates: HashMap<Crate, Option<ContentId>, Global>,
     mode: Mode,
 ) {
     use blaze_query::db::{Durability, Setter};
@@ -294,7 +295,7 @@ pub struct Drained {
 ///
 /// A value the store will not keep, and two values of one key (an evaluation that is not a
 /// function of what its key covers), are errors naming the constant.
-pub fn drain(db: &Db, bases: &HashMap<Crate, ContentId>) -> Result<Drained, String> {
+pub fn drain(db: &Db, bases: &HashMap<Crate, ContentId, Global>) -> Result<Drained, String> {
     let Some(kept) = KeptConsts::try_get(db) else { return Ok(Drained::default()) };
     let shared = &*kept.kept(db).0;
     let mut drained = Drained::default();
@@ -318,9 +319,10 @@ pub fn drain(db: &Db, bases: &HashMap<Crate, ContentId>) -> Result<Drained, Stri
             crate_name(db, pending.krate)
         ));
     }
-    let done: Vec<OnceLock<Result<(), String>>> =
+    #[expect(clippy::disallowed_types, reason = "constant write results, set once per filed value: not global")]
+    let done: Vec<std::sync::OnceLock<Result<(), String>>> =
         // alloc: setup: one slot per value, once per session
-        filed.iter().map(|_| OnceLock::new()).collect();
+        filed.iter().map(|_| std::sync::OnceLock::new()).collect();
     shared.store.for_each(filed.len(), &|at| {
         let (key, pending) = &filed[at];
         _ = done[at].set(shared.store.put(*key, codec::file(*key, &pending.body)));

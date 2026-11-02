@@ -32,6 +32,7 @@ mod const_traits;
 mod deps;
 mod hir_eval;
 mod intrinsics;
+mod word;
 
 fn simplify(e: ConstEvalError<'_>) -> ConstEvalError<'_> {
     match e {
@@ -222,6 +223,86 @@ fn overflow_in_a_constant() {
     check_fail(r#"const GOAL: u32 = { let x = 1u32; x << 32 };"#, overflow("Shl"));
     check_fail(r#"const GOAL: u8 = { let x = 0u8; x - 1 };"#, overflow("Sub"));
     check_number(r#"const fn add(a: u8, b: u8) -> u8 { a + b } const GOAL: u8 = add(255, 1);"#, 0);
+}
+
+/// `u3` and `i7` (`#![blaze::arbitrary_ints]`) compute at their width. A constant's own
+/// arithmetic is checked and panics naming the operation and the type; a function wraps at the
+/// width in a crate without `overflow-checks` and panics in one with them; division panics
+/// under both, as at every width.
+#[test]
+fn arbitrary_ints_overflow_at_their_width() {
+    let panic = |message: &'static str| {
+        move |e: ConstEvalError<'_>| {
+            e == ConstEvalError::MirEvalError(MirEvalError::Panic(message.to_owned()))
+        }
+    };
+    let opted = |body: &str| format!("#![blaze::arbitrary_ints]\n{body}");
+    let checking = |body: &str| {
+        format!("//- /main.rs crate:main cfg:overflow_checks\n#![blaze::arbitrary_ints]\n{body}")
+    };
+    // In range: the values of the width.
+    check_number(&opted("const GOAL: u3 = { let x: u3 = 5; x + 2 };"), 7);
+    check_number(&opted("const GOAL: i7 = { let x: i7 = -60; x - 4 };"), -64);
+    check_number(&opted("const GOAL: i7 = { let x: i7 = -21; x * 3 };"), -63);
+    check_number(&opted("const GOAL: u3 = { let x = 6u3; x / 4 + x % 4 };"), 3);
+    check_number(&opted("const GOAL: i7 = { let x: i7 = 63; !x };"), -64);
+    check_number(&opted("const GOAL: u3 = { let x: u3 = 2; !x };"), 5);
+    // A constant checks its own arithmetic.
+    let constant = [
+        ("const GOAL: u3 = { let x = 7u3; x + 1 };", "attempt to add with overflow at type `u3`"),
+        ("const GOAL: u3 = { let x = 0u3; x - 1 };", "attempt to subtract with overflow at type `u3`"),
+        ("const GOAL: u3 = { let x = 3u3; x * 3 };", "attempt to multiply with overflow at type `u3`"),
+        ("const GOAL: i7 = { let x = 63i7; x + 1 };", "attempt to add with overflow at type `i7`"),
+        ("const GOAL: i7 = { let x = -64i7; x - 1 };", "attempt to subtract with overflow at type `i7`"),
+        ("const GOAL: i7 = { let x = -64i7; -x };", "attempt to negate with overflow at type `i7`"),
+        ("const GOAL: u3 = { let x = 1u3; x << 3 };", "attempt to shift left with overflow at type `u3`"),
+        ("const GOAL: i7 = { let x = 1i7; x >> 7 };", "attempt to shift right with overflow at type `i7`"),
+    ];
+    for (body, message) in constant {
+        check_fail(&opted(body), panic(message));
+    }
+    // A function wraps at the width without `overflow-checks`, and panics with them.
+    let functions = [
+        ("const fn f(a: u3, b: u3) -> u3 { a + b } const GOAL: u3 = f(7, 1);", 0, "attempt to add with overflow at type `u3`"),
+        ("const fn f(a: u3, b: u3) -> u3 { a - b } const GOAL: u3 = f(0, 1);", 7, "attempt to subtract with overflow at type `u3`"),
+        ("const fn f(a: u3, b: u3) -> u3 { a * b } const GOAL: u3 = f(3, 3);", 1, "attempt to multiply with overflow at type `u3`"),
+        ("const fn f(a: i7, b: i7) -> i7 { a + b } const GOAL: i7 = f(63, 1);", -64, "attempt to add with overflow at type `i7`"),
+        ("const fn f(a: i7, b: i7) -> i7 { a - b } const GOAL: i7 = f(-64, 1);", 63, "attempt to subtract with overflow at type `i7`"),
+        ("const fn f(a: i7, b: i7) -> i7 { a * b } const GOAL: i7 = f(-64, -1);", -64, "attempt to multiply with overflow at type `i7`"),
+        ("const fn f(a: i7) -> i7 { -a } const GOAL: i7 = f(-64);", -64, "attempt to negate with overflow at type `i7`"),
+        // Unchecked, a shift is by its amount mod N: 4 mod 3 is 1, and 13 mod 7 is 6.
+        ("const fn f(a: u3, b: u32) -> u3 { a << b } const GOAL: u3 = f(3, 4);", 6, "attempt to shift left with overflow at type `u3`"),
+        ("const fn f(a: i7, b: u32) -> i7 { a << b } const GOAL: i7 = f(1, 13);", -64, "attempt to shift left with overflow at type `i7`"),
+    ];
+    for (body, wrapped, message) in functions {
+        check_number(&opted(body), wrapped);
+        check_fail(&checking(body), panic(message));
+    }
+    // Division overflows under both settings.
+    for fixture in [opted, checking] {
+        let body = "const fn f(a: i7, b: i7) -> i7 { a / b } const GOAL: i7 = f(-64, -1);";
+        check_fail(&fixture(body), panic("attempt to divide with overflow at type `i7`"));
+        let body = "const fn f(a: u3, b: u3) -> u3 { a % b } const GOAL: u3 = f(5, 0);";
+        check_fail(
+            &fixture(body),
+            panic("attempt to calculate the remainder with a divisor of zero at type `u3`"),
+        );
+    }
+}
+
+/// `as` to an arbitrary width truncates to it and extends from it; from a float it saturates
+/// at the width.
+#[test]
+fn arbitrary_ints_casts() {
+    let opted = |body: &str| format!("#![blaze::arbitrary_ints]\n{body}");
+    check_number(&opted("const GOAL: u3 = 13u8 as u3;"), 5);
+    check_number(&opted("const GOAL: i3 = 7u8 as i3;"), -1);
+    check_number(&opted("const GOAL: u8 = { let x: i3 = -1; x as u8 };"), 255);
+    check_number(&opted("const GOAL: u3 = { let x: i7 = -3; x as u3 };"), 5);
+    check_number(&opted("const GOAL: i7 = { let x: u3 = 7; x as i7 };"), 7);
+    check_number(&opted("const GOAL: u3 = 9.5f64 as u3;"), 7);
+    check_number(&opted("const GOAL: i7 = -1000.0f32 as i7;"), -64);
+    check_number(&opted("const GOAL: i7 = 63.9f64 as i7;"), 63);
 }
 
 #[test]
@@ -3717,4 +3798,43 @@ fn uninhabited_enum_discriminant_read() {
 fn checked_u128_sub_without_i128_alignment() {
     // The fixtures' data layout gives `u128` an alignment of 8, so `(u128, bool)` is 24 bytes.
     check_number("const GOAL: u128 = (1 << 61) - 1;", (1i128 << 61) - 1);
+}
+
+/// A constant loaded into another evaluation keeps the vtable it was made with when its
+/// pointer's pointee is an alias that normalizes to `dyn` (`&'static <H as Has>::Obj` in a
+/// field) or ends in one (`&Wrap<dyn Tr>`): the id is remapped to the one this evaluation
+/// gives the type, where `B` took the first id, so the call is `A`'s.
+#[test]
+fn a_loaded_constants_vtable_behind_an_alias_or_a_tail_is_its_own() {
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, dispatch_from_dyn
+    trait Tr { fn f(&self) -> i32; }
+    struct A;
+    impl Tr for A { fn f(&self) -> i32 { 1 } }
+    struct B;
+    impl Tr for B { fn f(&self) -> i32 { 2 } }
+    trait Has { type Obj: ?Sized + 'static; }
+    struct H;
+    impl Has for H { type Obj = dyn Tr; }
+    struct W<U: Has>(&'static U::Obj);
+    const WC: W<H> = W(&A as &dyn Tr);
+    const GOAL: i32 = { let b: &dyn Tr = &B; b.f() * 10 + WC.0.f() };
+        "#,
+        21,
+    );
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, dispatch_from_dyn
+    trait Tr { fn f(&self) -> i32; }
+    struct A;
+    impl Tr for A { fn f(&self) -> i32 { 1 } }
+    struct B;
+    impl Tr for B { fn f(&self) -> i32 { 2 } }
+    struct Wrap<X: ?Sized>(i32, X);
+    const WT: &Wrap<dyn Tr> = &Wrap(3, A);
+    const GOAL: i32 = { let b: &dyn Tr = &B; b.f() * 100 + WT.0 * 10 + WT.1.f() };
+        "#,
+        231,
+    );
 }

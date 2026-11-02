@@ -17,6 +17,7 @@ mod eval_ctxt;
 pub mod inspect;
 mod normalizes_to;
 mod project_goals;
+mod reflect;
 mod scratch;
 mod search_graph;
 mod trait_goals;

@@ -13,6 +13,8 @@
 //! vendored-directory package the lock file does not pin, a registry with a git index, and a
 //! dependency of a registry package whose `.crate` cannot be fetched.
 
+#![feature(allocator_api)]
+
 mod graph;
 
 use std::collections::BTreeMap;
@@ -21,6 +23,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_manifest::config::RegistryConfig;
 use blaze_manifest::config::schema::FeatureUnification;
 use blaze_manifest::files::Disk;
@@ -208,7 +211,7 @@ pub fn metadata_no_deps(asked: &Asked<'_>) -> Result<String> {
     config.start("metadata", asked.config)?;
     let ctx = Context::new(config);
     let ws = Workspace::new(&root_manifest(asked.manifest_path, &ctx)?, &ctx)?;
-    Ok(serde_json::to_string(&blaze_manifest::metadata::export_no_deps(&ws))?)
+    Ok(serde_json::to_string(&blaze_manifest::metadata::export_no_deps(&ws)?)?)
 }
 
 /// [`metadata`] of a workspace whose lock file is never written, as `cargo metadata
@@ -233,7 +236,7 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
     let Made { json, roots, unharnessed } = made(asked)?;
     let metadata: serde_json::Value = serde_json::from_str(&json)?;
     let nodes = metadata["resolve"]["nodes"].as_array().into_iter().flatten();
-    let features: HashMap<&str, Vec<&str>> = nodes
+    let features: HashMap<&str, Vec<&str>, Global> = nodes
         .filter_map(|node| {
             let on = node["features"].as_array()?.iter().filter_map(|it| it.as_str());
             Some((node["id"].as_str()?, on.collect()))
@@ -368,7 +371,7 @@ pub fn units(asked: &Asked<'_>, units: &Units<'_>) -> Result<blaze_units::UnitGr
         let features =
             FeatureResolver::resolve(&packages, resolve, &member_features, &kinds, opts)?;
         let roots = resolved.selected_ids(&specs);
-        let mut by_id = HashMap::default();
+        let mut by_id = HashMap::new_in(Global);
         for id in resolve.iter() {
             let manifest = resolved
                 .manifests
@@ -387,6 +390,8 @@ pub fn units(asked: &Asked<'_>, units: &Units<'_>) -> Result<blaze_units::UnitGr
             filter: units.filter,
             host: units.host,
             target: units.target,
+            // Metadata answers as cargo's graph does: proc macros for the host.
+            macro_wasm: None,
             has_dev_units,
         })
     })
@@ -409,9 +414,9 @@ pub struct Resolved<'a> {
     /// `resolver.feature-unification`: which members the features are resolved for.
     pub unification: FeatureUnification,
     /// What was read of every package the lock file names.
-    pub packages: &'a HashMap<PackageId, Read>,
+    pub packages: &'a HashMap<PackageId, Read, Global>,
     /// The manifest of every package the lock file names.
-    pub manifests: &'a HashMap<PackageId, &'a Manifest>,
+    pub manifests: &'a HashMap<PackageId, &'a Manifest, Global>,
     /// The configuration the workspace was read with.
     pub config: &'a Config<Disk>,
 }
@@ -644,7 +649,7 @@ fn resolving_with<R>(
         }
         serialized.push(it);
     }
-    let mut reads = HashMap::default();
+    let mut reads = HashMap::new_in(Global);
     let mut ids = Vec::with_capacity(serialized.len());
     for package in &serialized {
         let mut read = summary::read(package)?;
@@ -661,7 +666,7 @@ fn resolving_with<R>(
         registry.add(IndexSummary::Candidate(read.summary.clone()));
     }
     let patch = summary::patch_tables(&root_table)?;
-    let by_path: HashMap<SourceId, Summary> = reads
+    let by_path: HashMap<SourceId, Summary, Global> = reads
         .values()
         .filter(|it| it.summary.source_id().is_path())
         .map(|it| (it.summary.source_id(), it.summary.clone()))
@@ -759,7 +764,7 @@ fn resolving_with<R>(
             .with_context(|| format!("failed to write {}", lock_path.display()))?;
     }
     let unused_patches = whole.unused_patches().to_vec();
-    let manifests: HashMap<PackageId, &Manifest> = ws
+    let manifests: HashMap<PackageId, &Manifest, Global> = ws
         .members()
         .map(|(_, m)| m)
         .chain(path_packages.iter().chain(&fetched).chain(&picked).map(|it| &*it.manifest))
@@ -829,7 +834,7 @@ fn described(
     };
 
     // The packages the graph reaches, in the order of their ids, as cargo lists them.
-    let reached: HashMap<PackageId, usize> =
+    let reached: HashMap<PackageId, usize, Global> =
         ids.iter().enumerate().map(|(at, id)| (*id, at)).collect();
     let mut listed: Vec<(PackageId, usize)> = Vec::new();
     for node in &resolve.nodes {
@@ -841,7 +846,7 @@ fn described(
     let mut slots: Vec<Option<SerializedPackage<'_>>> = serialized.into_iter().map(Some).collect();
     let packages: Vec<SerializedPackage<'_>> =
         listed.iter().filter_map(|(_, at)| slots[*at].take()).collect();
-    let json = serde_json::to_string(&export(ws, packages, Some(resolve)))?;
+    let json = serde_json::to_string(&export(ws, packages, Some(resolve))?)?;
     let targets = ws.members().flat_map(|(_, it)| &it.targets);
     let unharnessed = targets.filter(|it| !it.harness).filter_map(|it| it.src_path.clone());
     let roots = roots.iter().map(|it| it.to_spec().to_string()).collect();
@@ -859,7 +864,7 @@ struct Made {
 
 /// What the resolve graph and the feature resolver read of the packages.
 pub(crate) struct Packages<'a> {
-    reads: &'a HashMap<PackageId, Read>,
+    reads: &'a HashMap<PackageId, Read, Global>,
     platform: Option<&'a TargetPlatform<'a>>,
     /// The host's platform, for what is built for it, when it is not `platform`.
     host: Option<&'a TargetPlatform<'a>>,
@@ -946,7 +951,7 @@ fn locked_ids(lock: &blaze_resolve::Resolve) -> Vec<PackageId> {
 /// with `checksums` those of a lock file or resolve.
 fn fetch(
     ids: &[PackageId],
-    checksums: &HashMap<PackageId, Option<String>>,
+    checksums: &HashMap<PackageId, Option<String>, Global>,
     ctx: &Context<Disk>,
     sources: &blaze_registry::Sources,
 ) -> Result<Vec<Package>> {

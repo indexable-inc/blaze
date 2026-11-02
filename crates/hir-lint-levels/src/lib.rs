@@ -19,6 +19,7 @@
 //! and `compiler/rustc_session/src/config.rs` (`get_cmd_lint_options`) (MIT or Apache-2.0).
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 pub mod attrs;
 pub mod builder;

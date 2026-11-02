@@ -11,6 +11,7 @@ use std::alloc::Allocator;
 
 use base_db::{BuiltDependency, Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::{Frame, Tag};
 use cfg::CfgExpr;
 use either::Either;
@@ -131,7 +132,7 @@ pub(crate) fn crate_data(
     db: &Db,
     krate: Crate,
 ) -> Arc<DefMapCrateData> {
-    let _p = tracing::info_span!("crate_data").entered();
+    let _p = tracing::info_span!(target: "blaze", "crate_data").entered();
     let krate_data = krate.data(db);
     let file_id = krate.root_file_id(db);
     let item_tree = file_item_tree(db, file_id.into(), krate);
@@ -312,8 +313,8 @@ pub(crate) fn expand_all(
 thread_local! {
     /// The scope each `module_decls` execution's `DeclSink` held at its end, by key. The
     /// `TestDB` runs its queries on the calling thread.
-    static HELD: std::cell::RefCell<HashMap<DeclKey, crate::nameres::BuildingScope>> =
-        std::cell::RefCell::new(HashMap::default());
+    static HELD: std::cell::RefCell<HashMap<DeclKey, crate::nameres::BuildingScope, Global>> =
+        std::cell::RefCell::new(HashMap::new_in(Global));
 }
 
 /// The scope the last execution of `module_decls(key)` on this thread held at its end.
@@ -329,7 +330,7 @@ pub(crate) fn module_decls(
     frame: &Frame,
     key: DeclKey,
 ) -> ModuleDecls {
-    let _p = tracing::info_span!("module_decls").entered();
+    let _p = tracing::info_span!(target: "blaze", "module_decls").entered();
     let decl = key.decl(db);
     let cx = cx(db, frame, decl.krate, false);
     let mut sink = DeclSink::new(&cx, key, decl);
@@ -473,8 +474,8 @@ impl<'a, 'db, 'f> DeclSink<'a, 'db, 'f> {
             root: queries::crate_root(db, decl.krate),
             modules: ModulesSlot::Unit { own: ModulesMap::new(), rows },
             prelude: None,
-            macro_use_prelude: HashMap::default(),
-            derive_helpers_in_scope: HashMap::default(),
+            macro_use_prelude: HashMap::new_in(Global),
+            derive_helpers_in_scope: HashMap::new_in(Global),
             session_macros: false,
             diagnostics: Vec::new(), // alloc: empty, the view's diagnostics go to the log
             diagnostics_by_module: DiagnosticsByModule::default(),
@@ -1062,7 +1063,7 @@ pub(crate) fn collect_expansion<'db, S: Sink<'db>, A: Allocator + Clone>(
     container: ItemContainerId,
     attr_macro_item: Option<AstId<ast::Item>>,
 ) {
-    let _p = tracing::info_span!("nameres collect_expansion", depth).entered();
+    let _p = tracing::info_span!(target: "blaze", "nameres collect_expansion", depth).entered();
     let db = cx.db;
     if depth > sink.def_map().recursion_limit() {
         cov_mark::hit!(macro_expansion_overflow);

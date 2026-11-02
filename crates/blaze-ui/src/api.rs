@@ -264,6 +264,14 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
         }
         Response::Queried { rows, ipc } => put!(out, "{} {rows} rows, {} bytes of Arrow IPC\n", status("Queried"), ipc.len()),
         Response::Hot(hot) => hot_lines(out, hot),
+        Response::Collected { report } => out.push_str(report),
+        Response::UnitBegan(unit) => {
+            put!(out, "{} {} ({})\n", status("Began"), unit.target.name, unit.package_id);
+        }
+        Response::TestReady(it) => {
+            put!(out, "{} {} at {}\n", status("Linked"), it.target.name, it.executable.as_deref().unwrap_or(&it.path));
+        }
+        Response::Rebuilt(rebuilt) => crate::why::lines(out, rebuilt),
     }
 }
 
@@ -473,7 +481,14 @@ pub fn work_json(worked: &Worked) -> String {
     for (at, (kind, us)) in worked.steps_us.iter().enumerate() {
         put!(&mut out, "{}\"{}\": {us}", if at == 0 { "" } else { ", " }, kind.name());
     }
-    out.push_str("}}\n");
+    let placed = worked.placed;
+    put!(
+        &mut out,
+        "}}, \"placed\": {{\"cloned\": {}, \"written\": {}, \"copied\": {}}}}}\n",
+        placed.cloned,
+        placed.written,
+        placed.copied
+    );
     out
 }
 
@@ -673,13 +688,15 @@ mod tests {
             links: Vec::new(),
             critical_path_us: 1500,
             steps_us: vec![(NodeKind::Bodies, 900), (NodeKind::Codegen, 600)],
+            placed: blaze_api::PlacedBytes { cloned: 7, written: 5, copied: 2 },
         };
         let line = work_json(&worked);
         assert_eq!(
             line,
             "{\"reason\": \"blaze-work\", \"reran\": 12, \"green\": 300, \"compiled\": 2, \
              \"found\": 40, \"link\": \"patched\", \"critical_path_us\": 1500, \"links\": [], \
-             \"steps_us\": {\"bodies\": 900, \"codegen\": 600}}\n"
+             \"steps_us\": {\"bodies\": 900, \"codegen\": 600}, \
+             \"placed\": {\"cloned\": 7, \"written\": 5, \"copied\": 2}}\n"
         );
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["link"], "patched");
@@ -721,6 +738,7 @@ mod tests {
             links,
             critical_path_us: 0,
             steps_us: Vec::new(),
+            placed: blaze_api::PlacedBytes::default(),
         };
         assert!(lines(&Response::Work(worked.clone()), false).ends_with(&text));
         let value: serde_json::Value = serde_json::from_str(&work_json(&worked)).unwrap();

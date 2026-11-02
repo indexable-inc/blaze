@@ -42,7 +42,7 @@ pub fn is_ty_uninhabited_from_in<'db>(
     target_mod: ModuleId,
     env: ParamEnv<'db>,
 ) -> bool {
-    let _p = tracing::info_span!("is_ty_uninhabited_from", ?ty).entered();
+    let _p = tracing::info_span!(target: "blaze", "is_ty_uninhabited_from", ?ty).entered();
     let local = target_mod.krate(infcx.interner.db);
     let mut uninhabited_from = UninhabitedFrom::new(frame, infcx, Some(target_mod), local, env);
     let inhabitedness = ty.visit_with(&mut uninhabited_from);
@@ -73,7 +73,7 @@ pub fn is_enum_variant_uninhabited_from_in<'db>(
     target_mod: ModuleId,
     env: ParamEnv<'db>,
 ) -> bool {
-    let _p = tracing::info_span!("is_enum_variant_uninhabited_from").entered();
+    let _p = tracing::info_span!(target: "blaze", "is_enum_variant_uninhabited_from").entered();
 
     let local = target_mod.krate(infcx.interner.db);
     let mut uninhabited_from = UninhabitedFrom::new(frame, infcx, Some(target_mod), local, env);

@@ -3,6 +3,7 @@
 //! range is now; anything else is refused with the path, so the agent decides.
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use crate::{
     CommitError, Op,
@@ -17,7 +18,7 @@ pub(crate) fn rebase(
     head: NodeId,
     ops: &[Op],
 ) -> Result<Vec<Option<Op>>, CommitError> {
-    let mut touched: HashMap<&str, usize> = HashMap::default();
+    let mut touched: HashMap<&str, usize, Global> = HashMap::new_in(Global);
     for op in ops {
         for path in op_paths(op) {
             *touched.entry(path).or_default() += 1;

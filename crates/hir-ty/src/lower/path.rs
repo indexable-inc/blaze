@@ -528,7 +528,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         Some(res)
     }
 
-    #[tracing::instrument(skip(self), ret)]
+    #[tracing::instrument(target = "blaze", skip(self), ret)]
     fn select_associated_type(
         &mut self,
         ty: Ty<'db>,

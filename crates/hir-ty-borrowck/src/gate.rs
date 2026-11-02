@@ -120,7 +120,7 @@ pub fn checked(db: &Db, def: DefWithBodyId) -> Result<Checked<'_>, Refused> {
 /// Whether the item store holds a passing verdict of `def` by the checker in use, filed by
 /// [`borrowck`] when one passed.
 fn stored_passed(db: &Db, def: DefWithBodyId) -> bool {
-    let Some(checker) = crate::checker(crate::mode()) else { return false };
+    let Some(checker) = crate::checker(crate::mode(db)) else { return false };
     hir_ty::body_store::lookup_passed(db, def, checker, || verdict(def, borrowck(db, def)).is_ok())
 }
 
@@ -241,6 +241,9 @@ impl<'db> std::ops::Deref for UncheckedMir<'db> {
 /// sent to the task that finishes it.
 #[derive(PartialEq, Eq, Debug)]
 #[must_use = "a live patch is rolled back unless its borrow check finishes without error"]
+/// Linear (`hir-ty-linear`): a `Pending` dropped without [`Pending::finish`] is a patch whose
+/// rollback is never decided, so dropping one is a compile error under blaze, not a warning.
+#[blaze::linear]
 pub struct Pending {
     owner: DefWithBodyId,
 }
@@ -252,6 +255,7 @@ impl Pending {
 
     /// Runs the borrow check, or takes its result if it ran: `Err` means the patch must be
     /// rolled back.
+    #[blaze::consumes]
     pub fn finish(self, db: &Db) -> Result<Checked<'_>, Refused> {
         checked(db, self.owner)
     }

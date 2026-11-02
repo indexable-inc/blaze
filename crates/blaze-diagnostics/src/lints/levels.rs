@@ -63,6 +63,14 @@ pub struct CommandLine {
 }
 
 impl CommandLine {
+    /// No flags: [`Default`]'s, made in a constant.
+    pub(crate) const NONE: CommandLine = CommandLine {
+        lints: LintOptions { opts: Vec::new(), cap: None },
+        check_cfg: CheckCfg::NONE,
+        cfg: Vec::new(),
+        codegen: false,
+    };
+
     /// The lint flags among rustc's arguments `args`: `-A x`, `-Ax`, `--allow x`,
     /// `--allow=x` and so on, `--cap-lints` ([`LintOptions::take`]), `--check-cfg` and
     /// `--cfg`. The other arguments are not lint flags and are passed by. `--emit` is read for
@@ -244,10 +252,13 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
         std::mem::take(&mut said.early).into_iter().partition(|it| it.when == When::Pre);
     pre.sort_by(|a, b| a.place.cmp(&b.place));
     during.sort_by(|a, b| a.place.cmp(&b.place));
+    let mut lower = std::mem::take(&mut said.lower);
+    lower.sort_by(|a, b| a.place.cmp(&b.place));
     let hir = std::mem::take(&mut said.hir);
-    let extra = pre.len() + during.len() + hir.len();
+    let extra = pre.len() + during.len() + lower.len() + hir.len();
     let mut pre = pre.into_iter().map(|it| it.diag);
     let mut during = during.into_iter().map(|it| it.diag);
+    let mut lower = lower.into_iter().map(|it| it.diag);
     let mut hir = hir.into_iter().map(|it| it.diag);
 
     let mut found = found;
@@ -269,6 +280,7 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
             out.extend(during.by_ref());
         }
         if index == hir_at {
+            out.extend(lower.by_ref());
             out.extend(hir.by_ref());
         }
         let lint = it.diag.lint_name().map(|name| {
@@ -292,6 +304,7 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
     }
     out.extend(pre);
     out.extend(during);
+    out.extend(lower);
     out.extend(hir);
     if aborted {
         return out;

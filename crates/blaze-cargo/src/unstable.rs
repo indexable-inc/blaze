@@ -36,10 +36,12 @@ enum Row {
     /// Modelled when the flag turns the thing off, which is what blaze's code does; refused
     /// when it turns it on.
     OffOnly(&'static str),
+    /// Modelled with any value: blaze's code does what the flag asks.
+    Modelled(&'static str),
     Refused(&'static str),
 }
 
-use Row::{Ignored, OffOnly, Refused};
+use Row::{Ignored, Modelled, OffOnly, Refused};
 
 const SPEED: &str = "how fast rustc compiles";
 const PRINTS: &str = "what rustc prints or writes beside its output";
@@ -83,7 +85,10 @@ const TABLE: &[(&str, Row)] = &[
     ),
     ("codegen-emit-retag", Refused(INSTRUMENTS)),
     ("codegen-source-order", Ignored(RUSTC_BACKEND)),
-    ("contract-checks", OffOnly("blaze compiles `contract_checks()` as false")),
+    (
+        "contract-checks",
+        Modelled("blaze sets `cfg(contract_checks)` and lowers nightly's contract clauses as rustc does"),
+    ),
     ("coverage-options", Refused(INSTRUMENTS)),
     ("crate-attr", Refused("blaze's front end does not see the attribute it adds")),
     ("cross-crate-inline-threshold", Refused(EXPORTS)),
@@ -329,6 +334,10 @@ impl Flag<'_> {
             Err(_) => Treatment::Refused(UNKNOWN),
             Ok(Ignored(why)) => Treatment::Ignored(why),
             Ok(Refused(why)) => Treatment::Refused(why),
+            Ok(Modelled(why)) => match off(self.value) {
+                Some(_) => Treatment::Modelled(why),
+                None => Treatment::Refused("blaze does not know the value"),
+            },
             Ok(OffOnly(why)) => match off(self.value) {
                 Some(true) => Treatment::Modelled(why),
                 Some(false) => Treatment::Refused(why),

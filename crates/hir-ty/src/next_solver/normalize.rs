@@ -144,7 +144,8 @@ impl<'db> TypeFolder<DbInterner<'db>> for ReplaceAliasWithInfer<'_, 'db> {
             return ty;
         }
 
-        let ty = ty.super_fold_with(self);
+        // One level per level of `ty`, as deep as the program built it (rule 17).
+        let ty = stdx::ensure_sufficient_stack(|| ty.super_fold_with(self));
         let TyKind::Alias(orig_is_rigid, alias) = ty.kind() else { return ty };
         if !self.cx().renormalize_rigid_aliases() && orig_is_rigid == IsRigid::Yes {
             return ty;
@@ -167,7 +168,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for ReplaceAliasWithInfer<'_, 'db> {
             return ct;
         }
 
-        let ct = ct.super_fold_with(self);
+        let ct = stdx::ensure_sufficient_stack(|| ct.super_fold_with(self));
         let ConstKind::Alias(orig_is_rigid, alias_const) = ct.kind() else { return ct };
         if !self.cx().renormalize_rigid_aliases() && orig_is_rigid == IsRigid::Yes {
             return ct;

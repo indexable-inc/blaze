@@ -12,6 +12,7 @@
 //! ([`Leak`], [`CodeLeak`]).
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 mod codegen;
 mod keys;
@@ -20,6 +21,7 @@ use std::fmt;
 
 use base_db::{Crate, Db, FileId};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_query::db::{Database as _, DatabaseKeyIndex, Durability, EventKind};
 use hir_def::{
@@ -160,8 +162,8 @@ pub struct Harness {
     codegen: Option<Codegen>,
     /// Every key executed or validated by a pass so far: a key executed outside it is work
     /// an edit's new text asked for, not work done again.
-    seen: HashSet<DatabaseKeyIndex>,
-    volatile: HashSet<DatabaseKeyIndex>,
+    seen: HashSet<DatabaseKeyIndex, Global>,
+    volatile: HashSet<DatabaseKeyIndex, Global>,
     interned: Interned,
     /// The cold pass's code hashes and instances: what each undo must give again.
     base: Pass,
@@ -180,8 +182,8 @@ impl Harness {
             bodies,
             modules,
             codegen,
-            seen: HashSet::default(),
-            volatile: HashSet::default(),
+            seen: HashSet::new_in(Global),
+            volatile: HashSet::new_in(Global),
             interned: Interned::default(),
             base: Pass::default(),
         };

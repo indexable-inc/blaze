@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::Result as CargoResult;
@@ -111,11 +110,7 @@ impl<T: AsRef<str>, U: AsRef<str>> ToPkgId for (T, U) {
 }
 
 fn registry_loc() -> SourceId {
-    static EXAMPLE_DOT_COM: OnceLock<SourceId> = OnceLock::new();
-    let example_dot = EXAMPLE_DOT_COM.get_or_init(|| {
-        SourceId::for_registry(&"https://example.com".into_url().unwrap()).unwrap()
-    });
-    *example_dot
+    SourceId::for_registry(&"https://example.com".into_url().unwrap()).unwrap()
 }
 
 pub(crate) fn pkg<T: ToPkgId>(name: T) -> Summary {

@@ -18,6 +18,12 @@
 //! carry it. An atomic carries the orderings its name gives ([`AtomicOrders`]); the pinned
 //! nightly passes them as const generic arguments instead (`atomic_load::<T, ORD>`), and
 //! [`atomic_orderings`] reads both forms to the same [`AtomicOrdering`]s.
+//!
+//! blaze's own intrinsics ([`Intrinsic::is_blaze`], `blaze_*`: `core::reflect`'s, under
+//! `#![feature(blaze_comptime)]`, and `core::num::arbitrary`'s `blaze_int_cast`) follow rustc's,
+//! from [`Intrinsic::FIRST_BLAZE`] on, in the order they were added. Their indices are persisted
+//! (MIR words, under [`Intrinsic::SCHEMA`]; code identity hashes the name), so the range is
+//! append-only: a new one goes at its end, and no rustc name is renumbered by one of blaze's.
 
 use std::fmt;
 
@@ -76,6 +82,12 @@ pub enum Intrinsic {
     VaCopy, VaEnd, VariantCount, VolatileCopyMemory, VolatileCopyNonoverlappingMemory,
     VolatileLoad, VolatileSetMemory, VolatileStore, VtableAlign, VtableSize, WrappingAdd,
     WrappingMul, WrappingSub, WriteBoxViaMove, WriteBytes, WriteViaMove,
+    /// `core::reflect`'s (`#![feature(blaze_comptime)]`), answered only by blaze's const
+    /// evaluator: each is called from a constant's initializer alone.
+    BlazeAdtName, BlazeFieldAttrs, BlazeFieldIndex, BlazeVariantDiscriminant, BlazeVariantIndex,
+    /// `core::num::arbitrary`'s (`#![blaze::arbitrary_ints]`): `x as D` between two integer
+    /// types of any width, which the const evaluator and the code generator both answer.
+    BlazeIntCast,
 }
 
 const _: () = assert!(size_of::<Intrinsic>() == 2);
@@ -270,8 +282,12 @@ pub fn intrinsic_of(
 }
 
 impl Intrinsic {
-    /// How many names there are: rustc's intrinsics, and the older names.
+    /// How many names there are: rustc's intrinsics, the older names, and blaze's own.
     pub const COUNT: usize = BY_INDEX.as_slice().len();
+
+    /// The index of blaze's first own intrinsic: rustc's names are below it, in byte order;
+    /// blaze's are from it on, in the order they were added (an append-only range).
+    pub const FIRST_BLAZE: u16 = Intrinsic::BlazeAdtName.index();
 
     /// The intrinsic named `name`, if there is one: a pointer subtraction and one load.
     #[inline]
@@ -285,8 +301,9 @@ impl Intrinsic {
         BY_INDEX.as_slice().get(usize::from(index)).copied()
     }
 
-    /// The name's rank among the names in byte order: dense, below [`Self::COUNT`], so a
-    /// set of intrinsics is a bitset.
+    /// The name's rank: among rustc's names in byte order, or for blaze's own
+    /// ([`Self::is_blaze`]) [`Self::FIRST_BLAZE`] plus the order they were added. Dense, below
+    /// [`Self::COUNT`], so a set of intrinsics is a bitset.
     pub const fn index(self) -> u16 {
         self.entry().0
     }
@@ -294,6 +311,12 @@ impl Intrinsic {
     /// The intrinsic's name.
     pub const fn symbol(self) -> Symbol {
         self.entry().1
+    }
+
+    /// Whether it is blaze's own (`blaze_*`: `core::reflect`'s and `blaze_int_cast`), which no
+    /// rustc has.
+    pub const fn is_blaze(self) -> bool {
+        self.index() >= Self::FIRST_BLAZE
     }
 
     /// Whether the name is an older nightly's, which the pinned nightly's rustc refuses.
@@ -318,6 +341,17 @@ macro_rules! intrinsics {
         const MEMBERS: &[Declared] = &[$(Declared::$name,)+];
 
         const BY_INDEX: [Intrinsic; MEMBERS.len()] = [$(Intrinsic::$variant $(($($data)*))?,)+];
+
+        impl Intrinsic {
+            /// The table's schema: its names in [`Intrinsic::index`] order. A buffer that
+            /// stores an intrinsic by its index includes it, so one written under another
+            /// table (an intrinsic added before others shifts theirs) reads as a schema
+            /// mismatch, never as another intrinsic.
+            pub const SCHEMA: blaze_format::SchemaHash = blaze_format::schema_of(&[
+                blaze_format::Part::Str("hir_ty::intrinsic::Intrinsic"),
+                $(blaze_format::Part::Str(stringify!($name)),)+
+            ]);
+        }
 
         impl Intrinsic {
             const fn entry(self) -> (u16, Symbol) {
@@ -713,6 +747,14 @@ intrinsics! {
     374 write_box_via_move => WriteBoxViaMove,
     375 write_bytes => WriteBytes,
     376 write_via_move => WriteViaMove,
+    // blaze's own, append-only (see the module's doc): never inserted among rustc's.
+    377 blaze_adt_name => BlazeAdtName,
+    378 blaze_field_attrs => BlazeFieldAttrs,
+    379 blaze_field_index => BlazeFieldIndex,
+    380 blaze_variant_discriminant => BlazeVariantDiscriminant,
+    381 blaze_variant_index => BlazeVariantIndex,
+    // `core::num::arbitrary`'s (`#![blaze::arbitrary_ints]`).
+    382 blaze_int_cast => BlazeIntCast,
 }
 
 #[cfg(test)]
@@ -721,8 +763,9 @@ mod tests {
 
     #[test]
     fn every_name_is_its_own_intrinsic() {
-        assert_eq!(Intrinsic::COUNT, 377);
-        assert_eq!(BY_INDEX.iter().filter(|intrinsic| !intrinsic.is_legacy()).count(), 277);
+        assert_eq!(Intrinsic::COUNT, 383);
+        assert_eq!(BY_INDEX.iter().filter(|intrinsic| !intrinsic.is_legacy()).count(), 283);
+        assert_eq!(BY_INDEX.iter().filter(|intrinsic| intrinsic.is_blaze()).count(), 6);
         let mut seen = [false; Intrinsic::COUNT];
         for (at, intrinsic) in BY_INDEX.into_iter().enumerate() {
             assert_eq!(usize::from(intrinsic.index()), at, "{intrinsic}");
@@ -736,10 +779,33 @@ mod tests {
     }
 
     #[test]
-    fn names_are_in_byte_order() {
-        for pair in BY_INDEX.windows(2) {
+    fn rustcs_names_are_in_byte_order() {
+        let rustc = &BY_INDEX[..usize::from(Intrinsic::FIRST_BLAZE)];
+        for pair in rustc.windows(2) {
             let (a, b) = (pair[0].symbol(), pair[1].symbol());
             assert!(a.as_str().as_bytes() < b.as_str().as_bytes(), "{a} before {b}");
+        }
+        assert!(rustc.iter().all(|it| !it.is_blaze() && !it.symbol().as_str().starts_with("blaze_")));
+    }
+
+    /// Persisted MIR and code identity hold these numbers: adding blaze's intrinsics renumbers
+    /// none of rustc's, and blaze's own keep theirs.
+    #[test]
+    fn blaze_intrinsics_keep_their_indices() {
+        assert_eq!(Intrinsic::AbortImmediate.index(), 0);
+        assert_eq!(Intrinsic::WriteViaMove.index(), 376);
+        assert_eq!(Intrinsic::FIRST_BLAZE, 377);
+        for (index, name) in [
+            (377, "blaze_adt_name"),
+            (378, "blaze_field_attrs"),
+            (379, "blaze_field_index"),
+            (380, "blaze_variant_discriminant"),
+            (381, "blaze_variant_index"),
+            (382, "blaze_int_cast"),
+        ] {
+            let intrinsic = Intrinsic::from_symbol(&Symbol::intern(name)).expect(name);
+            assert_eq!(intrinsic.index(), index, "{name}");
+            assert!(intrinsic.is_blaze() && !intrinsic.is_legacy(), "{name}");
         }
     }
 

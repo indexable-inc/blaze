@@ -26,6 +26,7 @@ use std::{borrow::Cow, convert::Infallible, iter::Peekable, ops::ControlFlow};
 
 use base_db::{Crate, Db, EditionedFileId};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_mem::Frame;
 use blaze_query::db::{AsId, FromId};
 use cfg::{CfgExpr, CfgOptions};
@@ -493,18 +494,38 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     }
                     _ => {}
                 },
-                Some(second_segment) => {
-                    if first == Some(Word::rust_analyzer) {
-                        match word(name_text(second_segment)) {
-                            Some(Word::completions) => extract_ra_completions(attr_flags, tt),
-                            Some(Word::macro_style) => extract_ra_macro_style(attr_flags, tt),
-                            Some(Word::define_opaque) => {
-                                attr_flags.insert(AttrFlags::HAS_DEFINE_OPAQUE)
-                            }
-                            _ => {}
+                Some(second_segment) => match (first, word(name_text(second_segment))) {
+                    (Some(Word::rust_analyzer), Some(Word::completions)) => {
+                        extract_ra_completions(attr_flags, tt)
+                    }
+                    (Some(Word::rust_analyzer), Some(Word::macro_style)) => {
+                        extract_ra_macro_style(attr_flags, tt)
+                    }
+                    (Some(Word::rust_analyzer), Some(Word::define_opaque)) => {
+                        attr_flags.insert(AttrFlags::HAS_DEFINE_OPAQUE)
+                    }
+                    // `#[blaze::pure(trusted = "why")]`; any other arguments are the value
+                    // query's to refuse.
+                    (Some(Word::blaze), Some(Word::pure)) => {
+                        attr_flags.insert(AttrFlags::PURE);
+                        if tt_has_token(tt, "trusted") {
+                            attr_flags.insert(AttrFlags::PURE_TRUSTED);
                         }
                     }
-                }
+                    // `#[blaze::bits(u32)]`; the backing integer is
+                    // [`AttrFlags::blaze_bits`]'s to read and refuse.
+                    (Some(Word::blaze), Some(Word::bits)) => {
+                        attr_flags.insert(AttrFlags::BLAZE_BITS)
+                    }
+                    // `#[blaze::nopanic(trusted = "why")]` and the other two effects; the
+                    // arguments are [`AttrFlags::effect_attr`]'s to read and refuse.
+                    (Some(Word::blaze), Some(Word::nopanic)) => attr_flags.insert(AttrFlags::NOPANIC),
+                    (Some(Word::blaze), Some(Word::noalloc)) => attr_flags.insert(AttrFlags::NOALLOC),
+                    (Some(Word::blaze), Some(Word::nonblocking)) => {
+                        attr_flags.insert(AttrFlags::NONBLOCKING)
+                    }
+                    _ => {}
+                },
             }
         }
         ast::Meta::PathMeta(attr) => {
@@ -601,6 +622,12 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                         AttrFlags::RUSTC_CANONICAL_SYMBOL
                     }
                     Some(Word::marker) if single => AttrFlags::MARKER,
+                    Some(Word::rustc_specialization_trait) if single => {
+                        AttrFlags::RUSTC_SPECIALIZATION_TRAIT
+                    }
+                    Some(Word::rustc_unsafe_specialization_marker) if single => {
+                        AttrFlags::RUSTC_UNSAFE_SPECIALIZATION_MARKER
+                    }
                     Some(Word::automatically_derived) if single => {
                         AttrFlags::AUTOMATICALLY_DERIVED
                     }
@@ -627,6 +654,23 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     AttrFlags::DIAGNOSTIC_DO_NOT_RECOMMEND
                 }
                 (Some(Word::blaze), Some(Word::may_suspend)) => AttrFlags::MAY_SUSPEND,
+                (Some(Word::blaze), Some(Word::sans_io)) => AttrFlags::SANS_IO,
+                (Some(Word::blaze), Some(Word::checkfree)) => AttrFlags::CHECKFREE,
+                (Some(Word::blaze), Some(Word::pure)) => AttrFlags::PURE,
+                (Some(Word::blaze), Some(Word::bits)) => AttrFlags::BLAZE_BITS,
+                (Some(Word::blaze), Some(Word::specialization)) => AttrFlags::BLAZE_SPECIALIZATION,
+                (Some(Word::blaze), Some(Word::specialization_trait)) => {
+                    AttrFlags::BLAZE_SPECIALIZATION_TRAIT
+                }
+                (Some(Word::blaze), Some(Word::nopanic)) => AttrFlags::NOPANIC,
+                (Some(Word::blaze), Some(Word::noalloc)) => AttrFlags::NOALLOC,
+                (Some(Word::blaze), Some(Word::nonblocking)) => AttrFlags::NONBLOCKING,
+                (Some(Word::blaze), Some(Word::linear)) => AttrFlags::LINEAR,
+                (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
+                (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
+                (Some(Word::clippy), Some(Word::has_significant_drop)) => {
+                    AttrFlags::HAS_SIGNIFICANT_DROP
+                }
                 _ => return ControlFlow::Continue(()),
             };
             attr_flags.insert(flag);
@@ -788,9 +832,13 @@ name_set! {
     enum Word {
     automatically_derived,
     bench,
+    bits,
     blaze,
+    checkfree,
+    clippy,
     cold,
     completions,
+    consumes,
     default,
     define_opaque,
     deprecated,
@@ -799,10 +847,12 @@ name_set! {
     doc,
     export_name,
     fundamental,
+    has_significant_drop,
     ignore,
     inline,
     instruction_set,
     lang,
+    linear,
     link_name,
     link_ordinal,
     link_section,
@@ -817,13 +867,18 @@ name_set! {
     naked,
     no_mangle,
     no_std,
+    noalloc,
     non_exhaustive,
+    nonblocking,
+    nopanic,
     optimize,
     panic_handler,
     path,
     pointee,
     prefer_underscore_import,
     proc_macro_derive,
+    pure,
+    reflect,
     repr,
     rust_analyzer,
     rustc_allocator,
@@ -863,9 +918,14 @@ name_set! {
     rustc_scalable_vector,
     rustc_skip_array_during_method_dispatch,
     rustc_skip_during_method_dispatch,
+    rustc_specialization_trait,
     rustc_std_internal_symbol,
+    rustc_unsafe_specialization_marker,
     sanitize,
+    sans_io,
     skip,
+    specialization,
+    specialization_trait,
     stable,
     target_feature,
     thread_local,
@@ -1027,6 +1087,79 @@ bitflags::bitflags! {
         /// rustc's `#[must_not_suspend]`, one segment, a word or `= "reason"`, on an ADT: a value
         /// of it must not be held across a suspend.
         const MUST_NOT_SUSPEND = 1 << 91;
+        /// `#![blaze::sans_io]`, a word, inner, on a module or a crate root: a blaze extension
+        /// (inert under rustc with `#![register_tool(blaze)]`), read by blaze-lints'
+        /// `blaze::sans_io_core` (the module is a sans-IO core, AGENTS.md rule 12).
+        const SANS_IO = 1 << 92;
+        /// `#[blaze::checkfree]`, a word, on a function: a blaze extension (inert under rustc
+        /// with `#![register_tool(blaze)]`), read by blaze-lints' `blaze::checkfree` and the
+        /// release backend's check (no bounds check, overflow check or panic may stay in its
+        /// optimized code). It changes diagnostics, never code: no codegen key reads it.
+        const CHECKFREE = 1 << 93;
+        /// `#[blaze::pure]` or `#[blaze::pure(..)]`, on a function, a method, a foreign
+        /// function or a trait: a blaze extension (inert under rustc with
+        /// `#![register_tool(blaze)]`), read by `hir-ty-pure`'s `fn_purity` and blaze-lints'
+        /// `blaze::pure` ([`AttrFlags::pure_attr`]). It changes diagnostics and what the
+        /// kernel may memoize, never code: no codegen key reads it.
+        const PURE = 1 << 94;
+        /// `#[blaze::pure(trusted = "..")]`: [`AttrFlags::pure_attr`] reads the reason.
+        const PURE_TRUSTED = 1 << 95;
+        /// `#[blaze::bits]` or `#[blaze::bits(uN)]`, on a struct: a blaze extension (inert
+        /// under rustc with `#![register_tool(blaze)]`), a bit-packed struct whose fields sit
+        /// at bit offsets in one backing integer ([`AttrFlags::blaze_bits`] reads which).
+        /// `StructFlags::IS_BLAZE_BITS` carries it to the layout and MIR; a struct without it
+        /// lays out and compiles as before.
+        const BLAZE_BITS = 1 << 96;
+        /// `#[blaze::nopanic]` or `#[blaze::nopanic(..)]`, on a function, a method, a foreign
+        /// function or a trait: a blaze extension (inert under rustc with
+        /// `#![register_tool(blaze)]`), read by `hir-ty-effects` and blaze-lints'
+        /// `blaze::nopanic` ([`AttrFlags::effect_attr`]): the function and everything it can
+        /// call cannot panic or abort. It changes diagnostics, never code: no codegen key
+        /// reads it.
+        const NOPANIC = 1 << 97;
+        /// `#[blaze::noalloc]` or `#[blaze::noalloc(..)]`: as [`AttrFlags::NOPANIC`], for no
+        /// call of the global allocator (`blaze::noalloc`).
+        const NOALLOC = 1 << 98;
+        /// `#[blaze::nonblocking]` or `#[blaze::nonblocking(..)]`: as [`AttrFlags::NOPANIC`],
+        /// for no call that blocks the thread (`blaze::nonblocking`).
+        const NONBLOCKING = 1 << 99;
+        /// `#[blaze::linear]`, a word: a blaze extension (inert under rustc with
+        /// `#![register_tool(blaze)]`), read by `hir-ty-linear`
+        /// (docs/v2/plan/lanes/linear.md). On a struct or enum: a value of it may not be
+        /// dropped implicitly, it must be consumed. On a type parameter, a trait (its `Self`) or
+        /// a trait's associated type: it may be a linear type, and generic code treats it as
+        /// one. It changes diagnostics, never code: no codegen key reads it.
+        const LINEAR = 1 << 110;
+        /// `#[blaze::consumes]`, a word, on a function or method: it is where values of the
+        /// linear types its by-value parameters have end, so in its body those types are not
+        /// linear (`hir-ty-linear`). It changes diagnostics, never code.
+        const CONSUMES = 1 << 111;
+        /// `#[rustc_specialization_trait]`, one segment, on a trait: rustc's
+        /// `TraitSpecializationKind::AlwaysApplicable` (`TraitFlags::SPECIALIZATION_ALWAYS_APPLICABLE`).
+        const RUSTC_SPECIALIZATION_TRAIT = 1 << 120;
+        /// `#[rustc_unsafe_specialization_marker]`, one segment, on a trait: rustc's
+        /// `TraitSpecializationKind::Marker` (`TraitFlags::SPECIALIZATION_UNSAFE_MARKER`).
+        const RUSTC_UNSAFE_SPECIALIZATION_MARKER = 1 << 121;
+        /// `#![blaze::specialization]`, a word, inner, on a crate root: a blaze extension
+        /// (refused under rustc, whose feature gate refuses the `default fn` it allows), sound
+        /// specialization: `default fn` and impls that specialize, each impl checked as always
+        /// applicable (docs/v2/plan/lanes/frontend/specialization.md). Read by
+        /// `hir_ty::specialization_mode`.
+        const BLAZE_SPECIALIZATION = 1 << 122;
+        /// `#[blaze::specialization_trait]`, a word, on a trait: a blaze extension (inert under
+        /// rustc with `#![register_tool(blaze)]`), the trait is always applicable: an impl may
+        /// specialize on it, and every impl of it is checked as always applicable.
+        const BLAZE_SPECIALIZATION_TRAIT = 1 << 123;
+        /// `#[blaze::reflect]`, a word, on a struct: a blaze extension (inert under rustc with
+        /// `#![register_tool(blaze)]`), the author's consent that `#![feature(blaze_comptime)]`
+        /// reflection reads and writes every field, private ones too (`hir_ty_comptime`'s
+        /// `struct_domain`, docs/v2/plan/design/comptime.md "Which fields").
+        const BLAZE_REFLECT = 1 << 124;
+        /// `#[clippy::has_significant_drop]`, a word, on a struct or enum: dropping a value of
+        /// it does something another part of the program can see (releases a lock, ends a
+        /// borrow), read by blaze-lints' `significant_drop_tightening`. It changes diagnostics,
+        /// never code.
+        const HAS_SIGNIFICANT_DROP = 1 << 127;
     }
 }
 
@@ -1468,6 +1601,128 @@ fn link_symbol(tt: ast::TokenTree<'_>, key: &str) -> Option<Symbol> {
     None
 }
 
+/// What `#[blaze::pure]` on an item says: a blaze extension (inert under rustc with
+/// `#![register_tool(blaze)]`), read by `hir-ty-pure` (docs/v2/plan/lanes/pure-fns.md).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PureAttr {
+    /// `#[blaze::pure]`: the function, and everything it can call, is checked. On a trait:
+    /// every method of every impl of it is.
+    Checked,
+    /// `#[blaze::pure(trusted = "why")]`: taken as pure without being walked into, for the
+    /// reason given, which the check reports with each use.
+    Trusted(Symbol),
+    /// `#[blaze::pure(..)]` with arguments that are neither: their text, for the error.
+    Malformed(Symbol),
+}
+
+/// Whether `path` is the two segments `blaze::pure`.
+fn is_blaze_pure(path: Option<ast::Path<'_>>) -> bool {
+    path.and_then(up_to_two_segments).is_some_and(|(first, second)| {
+        name_text(first) == "blaze" && second.is_some_and(|it| name_text(it) == "pure")
+    })
+}
+
+/// What the arguments of `#[blaze::pure(..)]` say: nothing, or exactly `trusted = "why"`.
+fn pure_args(tt: ast::TokenTree<'_>) -> PureAttr {
+    // Without the delimiters, whitespace and comments.
+    let tokens: SmallVec<[NodeOrToken<_, _>; 4]> = TokenTreeChildren::new(tt).take(4).collect(); // alloc: inline, the few tokens of one attribute
+    match tokens.as_slice() {
+        [] => PureAttr::Checked,
+        [NodeOrToken::Token(key), NodeOrToken::Token(eq), NodeOrToken::Token(value)]
+            if key.kind() == SyntaxKind::IDENT && key.text() == "trusted" && eq.kind() == T![=] =>
+        {
+            match ast::String::cast(*value).and_then(|it| it.value().ok()) {
+                Some(reason) => PureAttr::Trusted(Symbol::intern(&reason)),
+                None => PureAttr::Malformed(Symbol::intern(&tt.syntax().text().to_string())),
+            }
+        }
+        _ => PureAttr::Malformed(Symbol::intern(&tt.syntax().text().to_string())),
+    }
+}
+
+/// Which of the effect attributes `hir-ty-effects` checks (docs/v2/plan/lanes/effects.md): the
+/// word after `blaze::`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum EffectWord {
+    /// `#[blaze::nopanic]`.
+    Nopanic,
+    /// `#[blaze::noalloc]`.
+    Noalloc,
+    /// `#[blaze::nonblocking]`.
+    Nonblocking,
+}
+
+impl EffectWord {
+    /// The word, as written after `blaze::`.
+    pub const fn text(self) -> &'static str {
+        match self {
+            EffectWord::Nopanic => "nopanic",
+            EffectWord::Noalloc => "noalloc",
+            EffectWord::Nonblocking => "nonblocking",
+        }
+    }
+
+    /// The flag that says an item carries it.
+    pub const fn flag(self) -> AttrFlags {
+        match self {
+            EffectWord::Nopanic => AttrFlags::NOPANIC,
+            EffectWord::Noalloc => AttrFlags::NOALLOC,
+            EffectWord::Nonblocking => AttrFlags::NONBLOCKING,
+        }
+    }
+}
+
+/// Whether `path` is the two segments `blaze::<word>`.
+fn is_blaze_word(path: Option<ast::Path<'_>>, word: &str) -> bool {
+    path.and_then(up_to_two_segments).is_some_and(|(first, second)| {
+        name_text(first) == "blaze" && second.is_some_and(|it| name_text(it) == word)
+    })
+}
+
+/// What `#[blaze::bits]` on a struct says of the integer its fields are packed into.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BitsBacking {
+    /// `#[blaze::bits]`: the least of `u8`, `u16`, `u32`, `u64` and `u128` that holds every
+    /// field.
+    Smallest,
+    /// `#[blaze::bits(uN)]`, `uN` one of `u8`, `u16`, `u32`, `u64`, `u128`: that integer, and
+    /// the struct is refused when its fields take more bits.
+    Explicit(rustc_abi::Integer),
+    /// `#[blaze::bits(..)]` with arguments that are none of these: their text, for the error.
+    Malformed(Symbol),
+}
+
+/// Whether `path` is the two segments `blaze::bits`.
+fn is_blaze_bits(path: Option<ast::Path<'_>>) -> bool {
+    path.and_then(up_to_two_segments).is_some_and(|(first, second)| {
+        name_text(first) == "blaze" && second.is_some_and(|it| name_text(it) == "bits")
+    })
+}
+
+/// What the arguments of `#[blaze::bits(..)]` say: nothing, or exactly one unsigned integer
+/// type of 8 to 128 bits.
+fn bits_args(tt: ast::TokenTree<'_>) -> BitsBacking {
+    // Without the delimiters, whitespace and comments.
+    let tokens: SmallVec<[NodeOrToken<_, _>; 2]> = TokenTreeChildren::new(tt).take(2).collect(); // alloc: inline, the few tokens of one attribute
+    let integer = match tokens.as_slice() {
+        [] => return BitsBacking::Smallest,
+        [NodeOrToken::Token(ty)] if ty.kind() == SyntaxKind::IDENT => match ty.text() {
+            "u8" => Some(rustc_abi::Integer::I8),
+            "u16" => Some(rustc_abi::Integer::I16),
+            "u32" => Some(rustc_abi::Integer::I32),
+            "u64" => Some(rustc_abi::Integer::I64),
+            "u128" => Some(rustc_abi::Integer::I128),
+            _ => None,
+        },
+        _ => None,
+    };
+    match integer {
+        Some(integer) => BitsBacking::Explicit(integer),
+        None => BitsBacking::Malformed(Symbol::intern(&tt.syntax().text().to_string())),
+    }
+}
+
 /// The `cfg(...)` of a `link(...)`, the group after `cfg`: read as the predicate of a
 /// `#[cfg]` with that group. Only a `#[link(.., cfg(..))]`, once per extern block, inside its
 /// memo.
@@ -1774,6 +2029,97 @@ impl AttrFlags {
         }
     }
 
+    /// What `#[blaze::pure]` on `owner` says ([`PureAttr`]); `None` without it, one bit test.
+    #[inline]
+    pub fn pure_attr(db: &Db, owner: AttrDefId) -> Option<PureAttr> {
+        if !AttrFlags::query(db, owner).contains(AttrFlags::PURE) {
+            return None;
+        }
+        return pure_attr(db, owner);
+
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        fn pure_attr(db: &Db, owner: AttrDefId) -> Option<PureAttr> {
+            collect_attrs(db, owner, |attr| {
+                let read = match attr {
+                    ast::Meta::PathMeta(attr) if is_blaze_pure(attr.path()) => PureAttr::Checked,
+                    ast::Meta::TokenTreeMeta(attr) if is_blaze_pure(attr.path()) => {
+                        match attr.token_tree() {
+                            Some(tt) => pure_args(tt),
+                            None => PureAttr::Checked,
+                        }
+                    }
+                    _ => return ControlFlow::Continue(()),
+                };
+                ControlFlow::Break(read)
+            })
+        }
+    }
+
+    /// What `#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]` (`effect`) on
+    /// `owner` says, in the shape of `#[blaze::pure]`'s ([`PureAttr`]: checked, trusted with
+    /// its reason, or malformed); `None` without it, one bit test.
+    #[inline]
+    pub fn effect_attr(db: &Db, owner: AttrDefId, effect: EffectWord) -> Option<PureAttr> {
+        if !AttrFlags::query(db, owner).contains(effect.flag()) {
+            return None;
+        }
+        // clone: a handle of an interned reason
+        return effect_attrs(db, owner)[effect as usize].clone();
+
+        /// The three effect attributes of `owner` at once, by [`EffectWord`]'s index: an
+        /// item with one of them has the others read in the same pass over its attributes.
+        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+        fn effect_attrs(db: &Db, owner: AttrDefId) -> [Option<PureAttr>; 3] {
+            let mut read: [Option<PureAttr>; 3] = [None, None, None];
+            for effect in [EffectWord::Nopanic, EffectWord::Noalloc, EffectWord::Nonblocking] {
+                let word = effect.text();
+                read[effect as usize] = collect_attrs(db, owner, |attr| {
+                    let it = match attr {
+                        ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), word) => PureAttr::Checked,
+                        ast::Meta::TokenTreeMeta(attr) if is_blaze_word(attr.path(), word) => {
+                            match attr.token_tree() {
+                                Some(tt) => pure_args(tt),
+                                None => PureAttr::Checked,
+                            }
+                        }
+                        _ => return ControlFlow::Continue(()),
+                    };
+                    ControlFlow::Break(it)
+                });
+            }
+            read
+        }
+    }
+
+    /// What `#[blaze::bits]` on `owner` says of its backing integer ([`BitsBacking`]); `None`
+    /// without it, one bit test.
+    #[inline]
+    pub fn blaze_bits(db: &Db, owner: AttrDefId) -> Option<BitsBacking> {
+        if !AttrFlags::query(db, owner).contains(AttrFlags::BLAZE_BITS) {
+            return None;
+        }
+        return blaze_bits(db, owner);
+
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        fn blaze_bits(db: &Db, owner: AttrDefId) -> Option<BitsBacking> {
+            collect_attrs(db, owner, |attr| {
+                let read = match attr {
+                    ast::Meta::PathMeta(attr) if is_blaze_bits(attr.path()) => {
+                        BitsBacking::Smallest
+                    }
+                    ast::Meta::TokenTreeMeta(attr) if is_blaze_bits(attr.path()) => {
+                        match attr.token_tree() {
+                            Some(tt) => bits_args(tt),
+                            None => BitsBacking::Smallest,
+                        }
+                    }
+                    _ => return ControlFlow::Continue(()),
+                };
+                ControlFlow::Break(read)
+            })
+        }
+    }
+
     /// Whether `owner` has the attribute `#[name]`, once its `cfg_attr`s are expanded. The words
     /// the flags record are one bit test; any other name walks the attributes.
     pub fn has_word(db: &Db, owner: AttrDefId, name: &str) -> bool {
@@ -1943,15 +2289,15 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn target_features(db: &Db, owner: FunctionId) -> &HashSet<Symbol> {
+    pub fn target_features(db: &Db, owner: FunctionId) -> &HashSet<Symbol, Global> {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_TARGET_FEATURE) {
-            return const { &HashSet::with_hasher(blaze_hash::FixedState) };
+            return const { &HashSet::with_hasher_in(blaze_hash::FixedState, Global) };
         }
 
         return target_features(db, owner);
 
         #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-        fn target_features(db: &Db, owner: FunctionId) -> HashSet<Symbol> {
+        fn target_features(db: &Db, owner: FunctionId) -> HashSet<Symbol, Global> {
             blaze_mem::frame::current(|frame| {
                 let mut found = Vec::new_in(frame);
                 collect_attrs::<Infallible>(db, owner.into(), |attr| {
@@ -1983,7 +2329,7 @@ impl AttrFlags {
                 // alloc: the memo's set, once: room for every feature named (a feature named
                 // twice is the one case with room to spare)
                 let mut set =
-                    HashSet::with_capacity_and_hasher(found.len(), Default::default());
+                    HashSet::with_capacity_in(found.len(), Global);
                 set.extend(found.drain(..));
                 set
             })

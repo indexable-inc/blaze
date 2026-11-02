@@ -164,6 +164,27 @@ and the blocks of an evicted cache are the next cache's, already backed by pages
 inserts are unchanged; an insert's critical section is a few instructions, so a spin lock that
 yields is enough.
 
+### 0011-arbitrary-int-lang-items
+
+What: `lang_items::SolverTraitLangItem` has `ArbitraryInt`, `ArbitrarySigned`, `IntFrom` and
+`IntTryFrom`, the markers of `#[blaze::arbitrary_ints]` (`core::num::arbitrary`).
+`rustc_next_trait_solver`'s patch `0011-int-marker-builtins` answers them.
+
+Why: blaze's integers of any width (`docs/v2/plan/lanes/frontend/arbitrary-ints.md`) get their
+trait impls as blanket impls in core over markers the solver answers from the type, which needs
+the solver to know the markers by lang item.
+
+### 0012-deep-folds-guarded
+
+What: `RigidnessFolder::fold_ty` and `fold_const` (`set_aliases_to_rigid` /
+`set_aliases_to_non_rigid`) run each level inside `stdx::ensure_sufficient_stack`, so the crate
+depends on `stdx`.
+
+Why: a type nests as deep as a program writes it, and the folder recursed once per level on the
+caller's stack, so a deep type overflowed a release build's default stack. Blaze's other deep
+recursions grow the stack the same way (fiber-aware). Test:
+`hir-ty-identity`'s `a_type_with_an_alias_at_the_bottom_normalizes_at_any_depth` overflows without it.
+
 ## Dropped since the previous base (ra-ap-rustc_type_ir 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#159228 (the retry with twice the recursion limit:

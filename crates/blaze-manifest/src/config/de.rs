@@ -5,6 +5,7 @@
 use std::vec;
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use serde::de::{self, IntoDeserializer};
 
 use super::error::ConfigError;
@@ -225,7 +226,7 @@ impl<'c, F: Files> ConfigMapAccess<'c, F> {
             }
         }
 
-        let mut fields = HashSet::default();
+        let mut fields = HashSet::new_in(Global);
         for field in given_fields {
             let mut field_key = de.key.clone();
             field_key.push(field);

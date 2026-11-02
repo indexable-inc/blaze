@@ -20,6 +20,40 @@ fn opened(sim: &mut Sim) -> blaze_cas::Store {
     store
 }
 
+/// Proc macros that keep nothing: these tests read no expansion's reads.
+fn no_macros() -> Arc<blaze_macro_eval::Macros> {
+    blaze_macro_eval::Macros::nothing("a test of the images alone")
+}
+
+/// A daemon's proc macros, keeping in `store`, its shell passing `PATH` as `path`.
+fn macros_of(store: &blaze_cas::Store, path: &str) -> Arc<blaze_macro_eval::Macros> {
+    let environment = proc_macro_api::kept::Environment::new();
+    environment.pass(vec![("PATH".into(), path.into())]).unwrap();
+    let expansions = proc_macro_api::kept::Expansions {
+        store: store.reader(),
+        toolchain: ContentId::of("blaze v2 serve deps test", b"toolchain"),
+        environment,
+    };
+    let keeping = proc_macro_api::kept::Keeping::new(expansions).unwrap();
+    blaze_macro_eval::Macros::new(proc_macro_api::kept::Keeps::In(keeping))
+}
+
+#[test]
+fn each_daemons_images_work_out_an_expansions_reads_with_its_own_macros_and_none_without() {
+    let mut sim = Sim::new(1, Faults::default());
+    let store = opened(&mut sim);
+    let traced = blaze_core::Traced { env: vec![("PATH".into(), Some("/one/bin".into()))], ..blaze_core::Traced::default() };
+    let shape = blaze_usercode::index::Shape::of(&traced).encode();
+    let reported = blaze_usercode::index::VALUES.traced(&traced);
+    let call = Env::default();
+    let one = Images::new(store.reader(), macros_of(&store, "/one/bin"));
+    let other = Images::new(store.reader(), macros_of(&store, "/other/bin"));
+    assert_eq!(one.reads_now(&call, &shape), Ok(reported));
+    assert_ne!(other.reads_now(&call, &shape), Ok(reported), "one daemon's images read another's shell");
+    let refused = Images::new(store.reader(), no_macros()).reads_now(&call, &shape).unwrap_err();
+    assert!(refused.contains("not kept here"), "{refused}");
+}
+
 fn key(n: u8) -> ContentId {
     ContentId::of("blaze v2 serve deps test", &[n])
 }
@@ -29,7 +63,7 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
     let mut sim = Sim::new(1, Faults::default());
     let mut store = opened(&mut sim);
     let reader = store.reader();
-    let images = Images::new(reader.clone());
+    let images = Images::new(reader.clone(), no_macros());
     assert!(images.get(&key(1)).unwrap().is_none());
     images.put(key(1), b"image one".to_vec()).unwrap();
     images.put(key(1), b"image one".to_vec()).unwrap();
@@ -45,7 +79,7 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
     for put in puts {
         store.put(put.key, put.kind, put.bytes).unwrap();
     }
-    let images = Images::new(reader);
+    let images = Images::new(reader, no_macros());
     let found = images.get(&key(1)).unwrap().expect("put by the loop");
     assert_eq!(found.bytes(), b"image one");
     images.put(key(2), b"image two".to_vec()).unwrap();

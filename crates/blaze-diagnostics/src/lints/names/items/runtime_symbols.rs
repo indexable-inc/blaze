@@ -9,6 +9,7 @@
 //! and `compiler/rustc_lint/src/lints.rs` (`RedefiningRuntimeSymbolsDiag`) (MIT or Apache-2.0).
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir::{ModuleDef, view::HasSourceView as _};
 use hir_def::{
@@ -39,20 +40,20 @@ use crate::{
 /// declares canonical, with the foreign function that declares it. Keyed by interned symbol:
 /// one hash of a pointer per lookup.
 pub(super) struct Canonical {
-    symbols: HashMap<Symbol, FunctionId>,
+    symbols: HashMap<Symbol, FunctionId, Global>,
 }
 
 impl Canonical {
     /// rustc's `all_canonical_symbols`, read only for the symbols `items` define, so that a
     /// crate defining none reads no other crate.
     pub(super) fn of<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Canonical {
-        let mut wanted = HashSet::default();
+        let mut wanted = HashSet::new_in(Global);
         for item in items {
             if let Some(candidate) = candidate(cx, item) {
                 wanted.insert(candidate.symbol);
             }
         }
-        let mut symbols = HashMap::default();
+        let mut symbols = HashMap::new_in(Global);
         if wanted.is_empty() {
             return Canonical { symbols };
         }

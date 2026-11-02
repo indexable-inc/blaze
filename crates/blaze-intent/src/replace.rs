@@ -29,6 +29,7 @@
 use base_db::{Db, FileId};
 use blaze_api::{ApiError, How};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir::{Crate, ItemInNs, ModPath, ModuleDef, Name, PathKind, PathResolution};
 use hir_def::{
     Lookup as _, ModuleDefId, ModuleId,
@@ -172,7 +173,7 @@ pub(crate) fn replace(
 
     let mut hits = Vec::new();
     let mut adds: Vec<(usize, Add)> = Vec::new();
-    let mut direct = HashSet::default();
+    let mut direct = HashSet::new_in(Global);
     for (krate, file) in files_of(db, &scanned) {
         let holds = |at: usize, bytes: &[u8]| {
             if !reach[at].contains(&krate) {
@@ -228,7 +229,12 @@ pub(crate) fn replace(
             // alloc: the new path of one moved reference, which its rewrite owns
             Some(written[at].as_ref().unwrap_or(&placeholder).clone())
         };
-        let retarget = Retarget { db, resolve: &resolve, to: &to_of };
+        let carries = |to: &str, def: ModuleDef| {
+            pairs.iter().zip(&written).any(|(pair, spelled)| {
+                spelled.as_deref() == Ok(to) && pair.new.names.contains(&Some(def))
+            })
+        };
+        let retarget = Retarget { db, resolve: &resolve, to: &to_of, carries: &carries };
         let root = cx.roots[index as usize];
         let rewrites = retarget.file(root).map_err(|what| fail(format!("{path}: {what}")))?;
         let mut found = Vec::new();
@@ -271,7 +277,7 @@ pub(crate) fn replace(
         }
     }
 
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     for (at, add) in adds {
         let add = match add {
             Add::Prelude(module, name) => Add::Prelude(module.nearest_non_block_module(db), name),
@@ -376,7 +382,7 @@ fn def_of(db: &Db, view: &[Crate], path: &str) -> Result<Def, String> {
     let root = krate.root_module(db);
     let found =
         root.resolve_mod_path(db, rest.iter().map(|it| Name::new_root(it))).into_iter().flatten();
-    let mut names: Names = [None, None];
+    let mut names: Names = [None, None, None];
     for item in found {
         let (slot, def) = match item {
             ItemInNs::Types(def) => (0, def),
@@ -399,7 +405,7 @@ fn def_of(db: &Db, view: &[Crate], path: &str) -> Result<Def, String> {
             _ => names[slot] = Some(def),
         }
     }
-    if names == [None, None] {
+    if names == [None, None, None] {
         return Err(format!("`{path}` names nothing in crate `{first}`"));
     }
     Ok(Def { krate, rest, names })
@@ -418,7 +424,7 @@ fn name_of(db: &Db, krate: Crate) -> String {
 fn names_of(db: &Db, view: &[Crate], old: &Def, from: &str) -> Vec<String> {
     let last = from.rsplit("::").next().unwrap_or(from).trim();
     let mut names = vec![last.strip_prefix("r#").unwrap_or(last).to_owned()]; // alloc: a few names, once a replace
-    let mut deps = HashSet::default();
+    let mut deps = HashSet::new_in(Global);
     for krate in view {
         deps.extend(krate.dependencies_iter(db).map(|it| it.krate).filter(|it| !view.contains(it)));
     }
@@ -450,14 +456,14 @@ fn names_of(db: &Db, view: &[Crate], old: &Def, from: &str) -> Vec<String> {
 /// The view's crates that can name `old`: the crates its items are in, and those depending on
 /// them.
 fn crates_of(db: &Db, view: &[Crate], old: &Def) -> Vec<Crate> {
-    let mut homes = HashSet::default();
+    let mut homes = HashSet::new_in(Global);
     homes.insert(old.krate);
     for def in old.names.iter().flatten() {
         if let Some(module) = def.module(db) {
             homes.insert(module.krate(db));
         }
     }
-    let mut reach = HashSet::default();
+    let mut reach = HashSet::new_in(Global);
     for home in homes {
         reach.insert(home);
         reach.extend(home.transitive_reverse_dependencies(db));
@@ -467,7 +473,7 @@ fn crates_of(db: &Db, view: &[Crate], old: &Def) -> Vec<Crate> {
 
 /// The files of `crates`' modules, each once, with the crate it is first a module of.
 fn files_of(db: &Db, crates: &[Crate]) -> Vec<(Crate, FileId)> {
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     let mut files = Vec::new();
     for krate in crates {
         for module in krate.modules(db) {
@@ -532,7 +538,7 @@ fn visible<'db>(
     path: ast::Path<'db>,
 ) -> Names {
     let mut names = retarget::names_in(&cx.sema, path);
-    if let [Some(ModuleDef::Module(module)), _] = names
+    if let [Some(ModuleDef::Module(module)), ..] = names
         && path
             .syntax()
             .parent()
@@ -540,7 +546,7 @@ fn visible<'db>(
             .is_some_and(|it| it.star_token().is_some())
         && view.contains(&module.krate(cx.db))
     {
-        return [None, None];
+        return [None, None, None];
     }
     let moved = |it: &ModuleDef| pairs.iter().find(|pair| pair.old.names.contains(&Some(*it)));
     let Some(pair) = names.iter().flatten().find_map(moved) else { return names };

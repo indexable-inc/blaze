@@ -23,8 +23,9 @@
 //!   link gets them through `cc`; a library only there (nix's libiconv on macOS) is found.
 //! - Windows (MSVC): the directories of `$LIB`; without it, the MSVC tools vswhere names and
 //!   the newest Windows SDK the registry names, as `find_msvc_tools` finds them.
-//! - wasm32-wasip1: wasi-libc's `crt1-command.o` and `libc.a`, in blaze's toolchain's
-//!   self-contained directory (the `sysroot` [`locate`] is given).
+//! - wasm32-wasip1: wasi-libc's `crt1-command.o` (`crt1-reactor.o` for a [`reactor`]) and
+//!   `libc.a`, in blaze's toolchain's self-contained directory (the `sysroot` [`locate`] is
+//!   given).
 //!
 //! What the toolchain says is asked once per process for each triple and each value of the
 //! environment variables read, and kept. Each file found is still hashed by the caller, so a
@@ -59,6 +60,7 @@ use std::sync::Arc;
 use blaze_codegen::settings::{Sanitize, Sanitizers};
 use blaze_codegen::{Arch, NativeLib, NativeLibKind};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
@@ -253,6 +255,25 @@ fn rpaths(target: Target, output: &Output, sysroot: &Path) -> Result<Vec<String>
     Ok(vec![dir.to_owned()])
 }
 
+/// The entry of a WASI reactor, which wasi-libc's `crt1-reactor.o` defines: it runs the
+/// constructors, and the host calls the module's exports after it.
+const REACTOR_ENTRY: &str = "_initialize";
+
+/// How a proc macro built for wasm32-wasip1 links: a WASI reactor, as rustc links a binary
+/// under `-Z wasi-exec-model=reactor`. It is entered at `_initialize` and exports its
+/// `#[no_mangle]` functions (`blaze_proc_macro_expand` and the rest), which its code headers
+/// name, and its memory.
+pub fn reactor(debug: Debug, incremental: bool) -> Result<Output, LinkError> {
+    reactor_with(&CACHE, &System, debug, incremental)
+}
+
+fn reactor_with<A: Ask>(cache: &Cache, ask: &A, debug: Debug, incremental: bool) -> Result<Output, LinkError> {
+    let mut output = output_with(cache, ask, Target::Wasip1.triple(), None, debug, incremental)?;
+    // alloc: once per link, the entry's name
+    output.kind = OutputKind::Executable { entry: REACTOR_ENTRY.to_owned() };
+    Ok(output)
+}
+
 fn output_with<A: Ask>(
     cache: &Cache,
     ask: &A,
@@ -331,10 +352,9 @@ fn locate_with<A: Ask>(
     }
     let runtimes = runtimes(target, output, sysroot)?;
     let found = cache.found(ask, target, Some(sysroot))?;
-    let executable = matches!(output.kind, OutputKind::Executable { .. });
     let mut line =
         Line { cache, output, search, found: &found, out: Vec::with_capacity(libs.len() + 8), listings: RefCell::default() };
-    for name in target.start(executable) {
+    for name in target.start(&output.kind)? {
         line.object(name)?;
     }
     for (path, kind) in runtimes {
@@ -450,15 +470,29 @@ impl Target {
     }
 
     /// The C runtime's objects first on the line: glibc's as the system `cc` adds them for a
-    /// PIE (rustc's glibc specs leave them to it), wasi-libc's command start as rustc's
-    /// `pre_link_objects_self_contained` has it (none for a `cdylib`).
-    fn start(self, executable: bool) -> &'static [&'static str] {
-        match (self, executable) {
-            (Target::LinuxX86_64 | Target::LinuxAarch64, true) => &["Scrt1.o", "crti.o", "crtbeginS.o"],
-            (Target::LinuxX86_64 | Target::LinuxAarch64, false) => &["crti.o", "crtbeginS.o"],
-            (Target::Wasip1, true) => &["crt1-command.o"],
+    /// PIE (rustc's glibc specs leave them to it), wasi-libc's command or reactor start by the
+    /// entry, as rustc's `pre_link_objects_self_contained` has them (none for a `cdylib`).
+    fn start(self, kind: &OutputKind) -> Result<&'static [&'static str], LinkError> {
+        Ok(match (self, kind) {
+            (Target::LinuxX86_64 | Target::LinuxAarch64, OutputKind::Executable { .. }) => {
+                &["Scrt1.o", "crti.o", "crtbeginS.o"]
+            }
+            (Target::LinuxX86_64 | Target::LinuxAarch64, OutputKind::Shared { .. }) => &["crti.o", "crtbeginS.o"],
+            (Target::Wasip1, OutputKind::Executable { entry }) => match entry.as_str() {
+                "_start" => &["crt1-command.o"],
+                REACTOR_ENTRY => &["crt1-reactor.o"],
+                _ => {
+                    return Err(fail(
+                        // alloc: error path
+                        format!(
+                            "a wasm32-wasip1 executable entered at `{entry}`: wasi-libc starts a command \
+                             at `_start` and a reactor at `{REACTOR_ENTRY}`"
+                        ),
+                    ));
+                }
+            },
             _ => &[],
-        }
+        })
     }
 
     /// The C runtime's objects last on the line.
@@ -1164,8 +1198,27 @@ fn wasi(key: &Key) -> Result<Found, LinkError> {
             ),
         ));
     }
+    // Every wasm32-wasip1 link takes it (`late`); named here with its path, where a search's
+    // miss would name only `-lc`.
+    let libc = dir.join("libc.a");
+    if !libc.is_file() {
+        return Err(fail(
+            // alloc: error path
+            format!(
+                "{} is not there: blaze's toolchain at {} has no wasi-libc for wasm32-wasip1",
+                libc.display(),
+                sysroot.display()
+            ),
+        ));
+    }
     // alloc: once per toolchain asked, its files
-    Ok(Found { dirs: vec![dir], objects: vec![("crt1-command.o", start)], ..Found::default() })
+    let mut objects = vec![("crt1-command.o", start)];
+    // A toolchain without it links commands still; a reactor's line then names it missing.
+    let reactor = dir.join("crt1-reactor.o");
+    if reactor.is_file() {
+        objects.push(("crt1-reactor.o", reactor));
+    }
+    Ok(Found { dirs: vec![dir], objects, ..Found::default() })
 }
 
 /// A link line as it is found.
@@ -1176,11 +1229,11 @@ struct Line<'a> {
     found: &'a Found,
     out: Vec<Located>,
     /// Each search directory's entry names, read once per link ([`listing`]).
-    listings: RefCell<HashMap<PathBuf, Option<Listing>>>,
+    listings: RefCell<HashMap<PathBuf, Option<Listing>, Global>>,
 }
 
 /// A directory's entry names, ASCII lowercased.
-type Listing = HashSet<Box<[u8]>>;
+type Listing = HashSet<Box<[u8]>, Global>;
 
 /// The entry names of `dir`, ASCII lowercased; none when it or an entry can't be read, which
 /// leaves every name of it to a stat, as a directory that can be searched but not listed is.

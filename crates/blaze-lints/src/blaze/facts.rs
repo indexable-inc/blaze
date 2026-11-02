@@ -6,6 +6,7 @@
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir::AsAssocItem as _;
 use hir_def::{FunctionId, ModuleDefId, ModuleId, expr_store::Body, hir::ExprId, nameres::crate_def_map, per_ns::PerNs};
 use hir_expand::name::Name;
@@ -33,13 +34,19 @@ const HASH_CRATES: &[(&str, &[&str])] = &[
     ("hashbrown", &["HashMap", "HashSet", "HashTable"]),
     ("papaya", &["HashMap", "HashSet"]),
     ("dashmap", &["DashMap", "DashSet"]),
-    ("blaze_hash", &["HashMap", "HashSet"]),
+    // `Map` and `Set`: what `blaze_hash::HashMap<K, V, A>`, `ByHash` and the rest are.
+    ("blaze_hash", &["HashMap", "HashSet", "Map", "Set"]),
 ];
 
 /// Whether `ty`, its references peeled, is a hash map or set: std's `HashMap` or `HashSet`
 /// with any hasher (`FxHashMap` is one), or one of [`HASH_CRATES`]'s.
 pub(crate) fn hash_collection(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> bool {
-    let Some(adt) = ty.strip_references().as_adt() else { return false };
+    ty.strip_references().as_adt().is_some_and(|adt| hash_adt(cx, adt))
+}
+
+/// Whether `adt` is a hash map or set, as [`hash_collection`] says of a type: what a method's
+/// impl is of when a call through `Deref` (`blaze_hash::Map` to hashbrown's) is asked about.
+pub(crate) fn hash_adt(cx: &Cx<'_, '_>, adt: hir::Adt) -> bool {
     let std = |path: &[&str]| cx.std_def(path) == Some(hir::ModuleDef::Adt(adt));
     if std(&["std", "collections", "HashMap"]) || std(&["std", "collections", "HashSet"]) {
         return true;
@@ -51,12 +58,12 @@ pub(crate) fn hash_collection(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> bool {
 }
 
 /// The expression each expression of a body is a child of.
-pub(super) struct Parents(HashMap<ExprId, ExprId>);
+pub(super) struct Parents(HashMap<ExprId, ExprId, Global>);
 
 impl Parents {
     pub(super) fn of(body: &Body) -> Parents {
         // alloc: one map per body a lint of errors or order is on for, once per edit of it
-        let mut parents = HashMap::default();
+        let mut parents = HashMap::new_in(Global);
         for (id, _) in body.exprs() {
             body.walk_child_exprs(id, |child| {
                 parents.insert(child, id);
@@ -78,24 +85,29 @@ impl Parents {
 /// Reports `found`, each at the node of the walked tree that covers its range, its level asked
 /// there.
 pub(super) fn report(cx: &mut Cx<'_, '_>, found: Vec<Finding>) {
-    let root = cx.root();
     for finding in found {
-        let at = match root.text_range().contains_range(finding.range) {
-            true => match root.covering_element(finding.range) {
-                NodeOrToken::Node(it) => it,
-                NodeOrToken::Token(it) => it.parent().unwrap_or(root),
-            },
-            false => root,
-        };
-        let span = cx.span(finding.range);
-        let diagnostic = cx.blaze(finding.lint, at, span, finding.message);
-        if let Some(note) = finding.note {
-            diagnostic.note(note);
-        }
-        diagnostic
-            .help(finding.lint.help())
-            .help(format!("for further information visit {}", finding.lint.docs_url()));
+        report_one(cx, finding);
     }
+}
+
+/// Reports one finding as [`report`] does, giving back its diagnostic for what else it says.
+pub(super) fn report_one<'c>(cx: &'c mut Cx<'_, '_>, finding: Finding) -> &'c mut crate::diag::Diag {
+    let root = cx.root();
+    let at = match root.text_range().contains_range(finding.range) {
+        true => match root.covering_element(finding.range) {
+            NodeOrToken::Node(it) => it,
+            NodeOrToken::Token(it) => it.parent().unwrap_or(root),
+        },
+        false => root,
+    };
+    let span = cx.span(finding.range);
+    let diagnostic = cx.blaze(finding.lint, at, span, finding.message);
+    if let Some(note) = finding.note {
+        diagnostic.note(note);
+    }
+    diagnostic
+        .help(finding.lint.help())
+        .help(format!("for further information visit {}", finding.lint.docs_url()))
 }
 
 /// Adds a finding of `lint` at `range` to `found`, once per lint and range.

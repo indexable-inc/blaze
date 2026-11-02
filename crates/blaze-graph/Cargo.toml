@@ -22,6 +22,7 @@ blaze-mem.workspace = true
 blaze-radix.workspace = true
 blaze-protocol.workspace = true
 blaze-reclaim.workspace = true
+blaze-serde.workspace = true
 blaze-spin.workspace = true
 corosensei.workspace = true
 crossbeam-channel.workspace = true

@@ -13,6 +13,7 @@
 //! (MIT or Apache-2.0).
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::{bits::BitSet, radix};
 use hir::{HirFileId, InFile, ModuleSourceView, Name};
 use hir_expand::builtin::BuiltinDeriveExpander;
@@ -168,7 +169,7 @@ pub(super) struct ModuleItems {
 #[derive(Debug)]
 pub(super) struct Defs {
     pub(super) defs: Vec<Def>,
-    ids: HashMap<Id, DefIdx>,
+    ids: HashMap<Id, DefIdx, Global>,
     /// CSR: the children of definition `d` (a trait's or an impl's associated items, an enum's
     /// variants, a struct's, a union's or a variant's fields, in order) are
     /// `child_list[child_at[d]..child_at[d + 1]]`.
@@ -192,7 +193,7 @@ pub(super) struct Defs {
     pub(super) in_anon: bool,
     /// The impls an expanded `#[derive(Clone)]` or `#[derive(Debug)]` makes, with the trait's
     /// name: `rustc_trivial_field_reads`, so their items read nothing (`should_ignore_item`).
-    pub(super) trivial_derives: HashMap<DefIdx, &'static str>,
+    pub(super) trivial_derives: HashMap<DefIdx, &'static str, Global>,
 }
 
 impl Defs {
@@ -200,7 +201,7 @@ impl Defs {
         let mut walk = Walk {
             cx,
             defs: Vec::new(), // alloc: setup, the crate's tables, once per crate
-            ids: HashMap::default(),
+            ids: HashMap::new_in(Global),
             edges: Vec::new(), // alloc: setup, once per crate
             modules: Vec::new(), // alloc: setup, once per crate
             module_of: Vec::new(), // alloc: setup, once per crate
@@ -208,10 +209,10 @@ impl Defs {
             impl_items: Vec::new(), // alloc: setup, once per crate
             free_owners: Vec::new(), // alloc: setup, once per crate
             foreign_owners: Vec::new(), // alloc: setup, once per crate
-            derives: HashMap::default(),
-            scopes: HashSet::default(),
+            derives: HashMap::new_in(Global),
+            scopes: HashSet::new_in(Global),
             unported: false,
-            trivial_derives: HashMap::default(),
+            trivial_derives: HashMap::new_in(Global),
         };
         let module_ids = crate::checks::modules(cx);
         walk.modules.reserve_exact(module_ids.len());
@@ -354,7 +355,7 @@ enum Container {
 struct Walk<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
     defs: Vec<Def>,
-    ids: HashMap<Id, DefIdx>,
+    ids: HashMap<Id, DefIdx, Global>,
     /// (owner, child), in the order the children are met.
     edges: Vec<(DefIdx, DefIdx)>,
     modules: Vec<ModuleItems>,
@@ -364,10 +365,10 @@ struct Walk<'c, 'a, 'db> {
     impl_items: Vec<DefIdx>,
     foreign_owners: Vec<DefIdx>,
     /// The builtin derives of each ADT, of the scopes read so far.
-    derives: HashMap<AdtId, SmallVec<[BuiltinDeriveImplId; 4]>>,
-    scopes: HashSet<hir_def::ModuleId>,
+    derives: HashMap<AdtId, SmallVec<[BuiltinDeriveImplId; 4]>, Global>,
+    scopes: HashSet<hir_def::ModuleId, Global>,
     unported: bool,
-    trivial_derives: HashMap<DefIdx, &'static str>,
+    trivial_derives: HashMap<DefIdx, &'static str, Global>,
 }
 
 impl<'db> Walk<'_, '_, 'db> {

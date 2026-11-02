@@ -8,6 +8,7 @@
 //! `wasm` feature of `hir-ty-codegen` reaching the native build.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ use base_db::{
     target::{Arch, TargetData},
 };
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use cfg::CfgAtom;
 use hir_expand::proc_macro::{
     ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
@@ -124,7 +126,7 @@ pub struct Expansion {
 /// a call the pack has no expansion of: `None` when it has no such macro.
 pub type Builtin = fn(&Call) -> Option<Result<String, String>>;
 
-pub type Expansions = HashMap<Call, Result<String, String>>;
+pub type Expansions = HashMap<Call, Result<String, String>, Global>;
 
 /// A proc macro that is the expansions it had when the pack was made.
 #[derive(Debug)]
@@ -202,7 +204,7 @@ impl Kind {
 
 impl Pack {
     pub fn project(self, builtin: Builtin) -> Result<Project, String> {
-        let paths: HashMap<u32, &str> = self.files.iter().map(|it| (it.id, &*it.path)).collect();
+        let paths: HashMap<u32, &str, Global> = self.files.iter().map(|it| (it.id, &*it.path)).collect();
         let roots = self
             .roots
             .iter()

@@ -7,7 +7,7 @@
 //! is a [`CowBytes`] the writer and the core's states share: a patch copies only the pages it
 //! changes, and the table handed to the core is a clone, never a copy.
 
-use std::collections::hash_map::Entry;
+use blaze_hash::hash_map::Entry;
 
 use blaze_codegen::Arch;
 use blaze_format::cursor::Put;
@@ -15,6 +15,7 @@ use blaze_graph::par;
 use blaze_ids::radix;
 use object::elf;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use super::{
     BUILD_ID, DYNAMIC, DYNSTR, DYNSYM, EH_FRAME_HDR, Elf, GNU_HASH, INTERP, RELA_DYN, Segment, VERNEED,
@@ -111,7 +112,7 @@ const NOTE_HEADER: u64 = 12 + 4;
 /// probe (entry API) per string and no allocation per string.
 pub(crate) struct Strings<'a> {
     pub(crate) bytes: Vec<u8>,
-    at: HashMap<&'a str, u32>,
+    at: HashMap<&'a str, u32, Global>,
 }
 
 impl<'a> Strings<'a> {
@@ -119,7 +120,7 @@ impl<'a> Strings<'a> {
     pub(crate) fn with_capacity(bytes: usize, strings: usize) -> Strings<'a> {
         let mut table = Vec::with_capacity(1 + bytes);
         table.push(0);
-        Strings { bytes: table, at: HashMap::with_capacity_and_hasher(strings, Default::default()) }
+        Strings { bytes: table, at: HashMap::with_capacity_in(strings, Global) }
     }
 
     pub(crate) fn add(&mut self, string: &'a str) -> u32 {
@@ -330,8 +331,8 @@ impl Tables {
         versym.put_u16(elf::VER_NDX_LOCAL.0);
         let versioned = imports.iter().filter(|it| it.library.is_some() && it.version.is_some()).count();
         let mut needs: Vec<(u32, &str, u16)> = Vec::with_capacity(versioned);
-        let mut version_index: HashMap<(u32, &str), u16> =
-            HashMap::with_capacity_and_hasher(versioned, Default::default());
+        let mut version_index: HashMap<(u32, &str), u16, Global> =
+            HashMap::with_capacity_in(versioned, Global);
         let mut next = 2u16;
         for import in imports {
             let version = match (import.library, &import.version) {
@@ -1116,6 +1117,7 @@ mod tests {
     use blaze_ids::rng::SplitMix64;
     use gimli::UnwindSection;
     use blaze_hash::HashMap;
+    use std::alloc::Global;
 
     use super::fdes;
     use crate::cow::CowBytes;
@@ -1127,7 +1129,7 @@ mod tests {
         eh_frame.set_address_size(8);
         let bases = gimli::BaseAddresses::default().set_eh_frame(section);
         let mut entries = eh_frame.entries(&bases);
-        let mut cies = HashMap::default();
+        let mut cies = HashMap::new_in(Global);
         let mut table = Vec::new();
         while let Some(entry) = entries.next().map_err(|it| it.to_string())? {
             match entry {

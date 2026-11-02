@@ -11,6 +11,7 @@
 use base_db::{Db, FileId};
 use blaze_api::{ApiError, How, Target};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_vfs::Op;
 use either::Either;
@@ -223,8 +224,8 @@ fn files_of(db: &Db, def: Def) -> Vec<FileId> {
     if public {
         crates.extend(krate.transitive_reverse_dependencies(db));
     }
-    let mut seen_crates = HashSet::default();
-    let mut seen = HashSet::default();
+    let mut seen_crates = HashSet::new_in(Global);
+    let mut seen = HashSet::new_in(Global);
     let mut files = Vec::new();
     for krate in crates {
         if !seen_crates.insert(krate) {

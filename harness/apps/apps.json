@@ -835,6 +835,25 @@
    "5000"
   ]
  },
+ "fieldorder": {
+  "source": "fieldorder",
+  "package": "fieldorder",
+  "runs": [
+   [],
+   [
+    "4",
+    "100"
+   ],
+   [
+    "16",
+    "100000"
+   ]
+  ],
+  "bench": [
+   "20",
+   "50000000"
+  ]
+ },
  "websvc": {
   "source": "websvc",
   "package": "websvc",

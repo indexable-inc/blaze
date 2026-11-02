@@ -563,6 +563,44 @@ fn an_unused_type_parameter_of_an_enum() {
     assert_reports(&ui("E0392.rs", "2015", source), &[error(1, &["`T`"])]);
 }
 
+/// addr2line's `MappedLookup` (src/lookup.rs, 0.26 and 0.27, which std uses): `T` is named
+/// only by the `Fn` sugar's return type, the projection `<F as FnOnce<(L::Output,)>>::Output
+/// == T`, which constrains it because the fields constrain `F` and `L`
+/// (`identify_constrained_generic_params`).
+#[test]
+fn a_parameter_only_an_fn_bounds_return_names_is_constrained() {
+    let source = "pub trait LookupContinuation { type Output; }
+pub struct MappedLookup<T, L, F>
+where
+    L: LookupContinuation,
+    F: FnOnce(L::Output) -> T,
+{
+    original: L,
+    mutator: F,
+}
+";
+    assert_eq!(ui_core("mapped-lookup.rs", "2021", "sized, fn", source), "");
+}
+
+/// The projection constrains `T` only once everything it reads is: with no field naming `L`,
+/// neither `L` nor `T` is constrained, and both are E0392.
+#[test]
+fn an_fn_bounds_return_constrains_nothing_while_its_inputs_are_unused() {
+    let source = "pub trait LookupContinuation { type Output; }
+pub struct MappedLookup<T, L, F>
+where
+    L: LookupContinuation,
+    F: FnOnce(L::Output) -> T,
+{
+    mutator: F,
+}
+";
+    assert_reports(
+        &ui_core("mapped-lookup.rs", "2021", "sized, fn", source),
+        &[error(2, &["E0392", "`T`"]), error(2, &["E0392", "`L`"])],
+    );
+}
+
 #[test]
 fn a_bounded_unused_type_parameter_of_an_alias_is_not_a_const() {
     // tests/ui/type-alias/unused_type_parameter.rs
@@ -648,4 +686,26 @@ error: aborting due to 2 previous errors
 For more information about this error, try `rustc --explain E0732`.
 "#;
     assert_eq!(ui("arbitrary_enum_discriminant-no-repr.rs", "2015", source), stderr);
+}
+
+#[test]
+fn a_bits_field_of_no_fixed_width_names_the_struct_the_field_and_the_type() {
+    // blaze's own: `usize` is as wide as the target's pointers.
+    let checked = crate::tests::checked(
+        "//- /main.rs crate:other:main\n#[blaze::bits]\nstruct Wire { tag: bool, len: usize }\nfn main() {}\n",
+    );
+    let errors: Vec<String> = checked
+        .diags
+        .iter()
+        .filter(|it| it.is_error() && !it.is_lint())
+        .map(|it| it.message.to_string())
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            "field `len` of `#[blaze::bits]` struct `Wire`: type `usize` is as wide as the \
+             target's pointers, and a bit-packed layout may not change with the target: use a \
+             fixed-width integer"
+        ]
+    );
 }

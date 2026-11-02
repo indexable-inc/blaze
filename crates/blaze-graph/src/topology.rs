@@ -20,6 +20,7 @@ use std::{
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_radix as radix;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,7 +71,7 @@ impl Topology {
         let online = list(&read(&root.join("online"))?)
             .map_err(|why| at(&root.join("online"), &why))?;
         let mut found = Vec::with_capacity(online.len());
-        let mut capacities: HashMap<u32, u64> = HashMap::default();
+        let mut capacities: HashMap<u32, u64, Global> = HashMap::new_in(Global); // alloc: setup, once per pool
         for &id in &online {
             // alloc: a sysfs path, once per CPU per pool
             let cpu = root.join(format!("cpu{id}"));
@@ -95,12 +96,12 @@ impl Topology {
             }
             found.push((id, share, socket.unwrap_or(0), node_of(&cpu)?));
         }
-        let node: HashMap<u32, u32> =
+        let node: HashMap<u32, u32, Global> = // alloc: setup, once per pool
             // alloc: once per pool, setup
             found.iter().map(|&(id, _, _, node)| (id, node)).collect();
         let fastest = capacities.values().copied().max();
         // Groups are numbered in the order they are first met, so the map's order is never read.
-        let mut sets: HashMap<Vec<u32>, u32> = HashMap::default();
+        let mut sets: HashMap<Vec<u32>, u32, Global> = HashMap::new_in(Global); // alloc: setup, once per pool
         let mut cpus = Vec::with_capacity(found.len());
         for (id, share, socket, home) in found {
             // A cache shared across nodes is split by node: a group's memory is all local.
@@ -149,7 +150,7 @@ impl Topology {
     /// its NUMA node, then of its socket, then the rest, each nearest by id first (ties to the
     /// lower). Empty for a group the topology does not have.
     pub fn steal_order(&self, group: u32) -> Vec<u32> {
-        let mut place_of: HashMap<u32, (u32, u32)> = HashMap::default();
+        let mut place_of: HashMap<u32, (u32, u32), Global> = HashMap::new_in(Global); // alloc: setup, once per pool
         for cpu in &self.cpus {
             place_of.entry(cpu.group).or_insert((cpu.socket, cpu.node));
         }
@@ -183,7 +184,7 @@ impl Topology {
 /// `cpus` by id, their groups numbered from 0 in the order of their first CPU.
 fn dense(mut cpus: Vec<Cpu>) -> Topology {
     radix::sort_copy_by_key(&mut cpus, |it| it.id);
-    let mut renamed: HashMap<u32, u32> = HashMap::default();
+    let mut renamed: HashMap<u32, u32, Global> = HashMap::new_in(Global); // alloc: setup, once per pool
     for cpu in &mut cpus {
         let next = u32::try_from(renamed.len()).unwrap_or(u32::MAX);
         cpu.group = *renamed.entry(cpu.group).or_insert(next);

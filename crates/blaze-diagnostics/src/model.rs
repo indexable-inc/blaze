@@ -557,7 +557,7 @@ impl Diag {
         applicability: Applicability,
         style: SuggestionStyle,
     ) -> &mut Diag {
-        let mut seen = blaze_hash::HashSet::default();
+        let mut seen = blaze_hash::HashSet::new_in(std::alloc::Global);
         // clone: the parts of a suggestion being built, the edge; `retain` keeps no borrow of them
         parts.retain(|(span, code)| seen.insert((span.lo, span.hi, code.clone())));
         self.suggestions.push(Suggestion {

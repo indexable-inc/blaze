@@ -22,6 +22,7 @@ blaze-lint-defs.workspace = true
 blaze-radix.workspace = true
 blaze-protocol = { workspace = true, optional = true }
 blaze-query = { workspace = true, optional = true }
+blaze-serde.workspace = true
 blaze-source = { workspace = true, optional = true }
 blaze-manifest.workspace = true
 blaze-resolve.workspace = true

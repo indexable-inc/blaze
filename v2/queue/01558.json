@@ -1,0 +1,25 @@
+{
+  "id": "01558",
+  "from_lane": "db",
+  "owner": "diagnostics",
+  "paths": [
+    "crates/blaze-diagnostics/src/cache.rs",
+    "crates/blaze-cargo/src/serve/unit/deps.rs",
+    "crates/blaze-item-hash/src/identity/inputs.rs"
+  ],
+  "what": "FYI, done by db as a whole port for the OnceLock/LazyLock ban (unbuilt, RA clean): the borrow checker mode is no longer a process static. base_db::FrontSettings (a singleton input set from the process variables when a Db is made) holds BLAZE_BORROWCK, BLAZE_BORROWCK_DEBUG, BLAZE_TRACE_HOLDERS and RA_CHECK_RELATIVE_BODIES. hir_ty_borrowck::mode now takes db, and Mode is base_db::BorrowckMode re-exported (same variants). Callers updated: blaze-diagnostics cache.rs Inputs::of(db, lint_flags, options); its two callers in blaze-cargo serve/unit/deps.rs (db = lowered.db() was in scope); blaze-item-hash identity/inputs.rs crate_inputs (mode(db)).",
+  "state": "open",
+  "created": "2026-11-02T03:52:57Z",
+  "updated": "2026-11-02T03:52:57Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T03:52:57Z",
+      "by": "db",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,8 +1,10 @@
 //! Defining `SolverContext` for next-trait-solver.
 
-use std::{collections::hash_map::Entry, fmt::Debug, mem, ops::ControlFlow};
+use std::{fmt::Debug, mem, ops::ControlFlow};
+use blaze_hash::hash_map::Entry;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{
     AssocItemId,
     signatures::{ConstSignature, TypeAliasSignature},
@@ -483,7 +485,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
             return;
         }
         let base = into.len();
-        let mut seen: Option<HashMap<RegionConstraint<'db>, usize>> = None;
+        let mut seen: Option<HashMap<RegionConstraint<'db>, usize, Global>> = None;
         self.0.for_each_query_region_constraint(|constraint, visible| {
             if says_nothing(constraint) {
                 return;

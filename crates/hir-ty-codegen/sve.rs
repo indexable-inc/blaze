@@ -35,7 +35,7 @@ use rustc_type_ir::TypeVisitableExt;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _};
 use smallvec::SmallVec;
 
-use super::{CodegenError, FunctionCx, MEM, Result, ptr};
+use super::{CodegenError, FunctionCx, MEM, Result};
 
 /// The bytes of a Z register at the largest vector length, 2048 bits.
 pub(super) const DATA_MAX: u64 = 256;
@@ -1639,11 +1639,11 @@ impl<'db> FunctionCx<'_, 'db> {
             values.push(value);
             params.push(AbiParam::new(scalar.ty));
         }
-        params.extend(addresses.iter().map(|_| AbiParam::new(ptr())));
+        params.extend(addresses.iter().map(|_| AbiParam::new(self.cg.target.pointer())));
         values.extend(addresses);
         let mut sig = self.cg.make_signature();
         let ret = if let Some(shape) = self.scalable(dst_ty)? {
-            sig.params.push(AbiParam::new(ptr()));
+            sig.params.push(AbiParam::new(self.cg.target.pointer()));
             values.insert(0, dst);
             Ret::Vector(shape)
         } else if self.layout(dst_ty)?.is_zst() {
@@ -1743,7 +1743,7 @@ impl<'db> FunctionCx<'_, 'db> {
             ) => {
                 let text = select(*mask_shape, *value).map_err(CodegenError::Unsupported)?;
                 let mut sig = self.cg.make_signature();
-                sig.params.extend([AbiParam::new(ptr()); 4]);
+                sig.params.extend([AbiParam::new(self.cg.target.pointer()); 4]);
                 self.call_stub(text, &sig, &[dst, *mask, *a, *b], Ret::Vector(to), dst);
             }
             (Intrinsic::Simd(SimdOp::Cast), [(src, Some(from))]) => {
@@ -1751,7 +1751,7 @@ impl<'db> FunctionCx<'_, 'db> {
                     None => self.copy(dst, *src, Size::from_bytes(to.storage())),
                     Some(text) => {
                         let mut sig = self.cg.make_signature();
-                        sig.params.extend([AbiParam::new(ptr()); 2]);
+                        sig.params.extend([AbiParam::new(self.cg.target.pointer()); 2]);
                         self.call_stub(text, &sig, &[dst, *src], Ret::Vector(to), dst);
                     }
                 }

@@ -13,6 +13,10 @@
 //! A journal's reads of the volume's USN journal are on the port too ([`usn`]); what each read
 //! names is made on the driver's threads, which ask the volume where files are, and the next
 //! read is asked for once they hand the journal back. Stamps and listings run on the threads.
+//! A flush of a journal is marked on the threads with where the volume's journal ends now and
+//! told once its reads have told every record before that (`journal::barrier`): no
+//! cookie is written, in the watched directory or anywhere. A `ReadDirectoryChangesW` watch has
+//! no such position, and its flush fails, naming why.
 //!
 //! The rule every request keeps (see [`Request`]): what the kernel reads or writes for it (its
 //! `OVERLAPPED`, its bytes, the handle it is on) is the request's, in its entry of the driver's
@@ -66,6 +70,7 @@ use std::{
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::{Slab, Tag as MemTag};
 use crossbeam_channel::{Receiver, Sender};
 use windows_sys::Win32::{
@@ -90,6 +95,7 @@ use crate::{
     Address, Command, Completion, Confine, Confined, Conn, Cursor, Done, Driver, Effect, FileName,
     IoError, RECV_MOST, Sandbox, Tag,
     handoff::Wake,
+    journal::barrier::{At, Barrier, Decision},
     wheel::{self, Wheel},
 };
 
@@ -323,6 +329,8 @@ enum Back {
     Connected { tag: Tag, at: Address, made: io::Result<OwnedSocket> },
     /// A journal opened, or a read of it named: the journal to read on with, unless it ended.
     Journal { tag: Tag, journal: Option<Box<usn::Journal>>, taken: usn::Taken },
+    /// Where the volume of the journal `journal` ended as the flush `flush` was marked.
+    Marked { journal: Tag, flush: Tag, mark: io::Result<At> },
 }
 
 /// What the driver's threads are given.
@@ -333,13 +341,42 @@ enum Work {
     Open { tag: Tag, dir: FileName, since: Cursor },
     /// What a read of a journal ended with, to be named.
     Took { tag: Tag, journal: Box<usn::Journal>, result: io::Result<u32> },
+    /// The flush `flush` of the journal `journal`, marked with where its volume's journal ends
+    /// now, through the volume's synchronous handle.
+    Mark { journal: Tag, flush: Tag, querier: Arc<OwnedHandle> },
 }
 
 /// A journal's watch: whether its read is in flight (its request) or its journal is on the
-/// driver's threads, and whether it was asked to end.
+/// driver's threads, whether it was asked to end, and its flushes.
 struct Journaling {
     request: Option<Id>,
     stopping: bool,
+    /// The volume's synchronous handle, once the journal has opened: what a flush is marked
+    /// through.
+    querier: Option<Arc<OwnedHandle>>,
+    /// The watched directory as the system names it, once opened, for a flush's errors.
+    shown: String,
+    /// Flushes asked before the journal opened, marked once it has.
+    unmarked: Vec<Tag>,
+    /// The read in flight was cancelled so that a flush is told: its abort is no failure.
+    hurrying: bool,
+    barrier: Barrier,
+}
+
+impl Journaling {
+    fn new() -> Journaling {
+        Journaling {
+            request: None,
+            stopping: false,
+            querier: None,
+            // alloc: none until it opens.
+            shown: String::new(),
+            // alloc: none unless a flush is asked before it opens.
+            unmarked: Vec::new(),
+            hurrying: false,
+            barrier: Barrier::new(),
+        }
+    }
 }
 
 struct Spawned {
@@ -424,7 +461,7 @@ pub struct Iocp {
     /// The launcher runs are handed to now.
     warm_now: Option<WarmId>,
     /// The runs in flight in it, by the run the frame names.
-    runs: HashMap<u64, SpawnId>,
+    runs: HashMap<u64, SpawnId, Global>,
     /// The last run handed.
     run: u64,
     /// Frames not yet written to the launcher, in the order of their spawns.
@@ -433,8 +470,8 @@ pub struct Iocp {
     failing: Vec<SpawnId>,
     dirs: RunDirs,
     files: Slab<Cached>,
-    readers: HashMap<FileName, FileId>,
-    appenders: HashMap<FileName, FileId>,
+    readers: HashMap<FileName, FileId, Global>,
+    appenders: HashMap<FileName, FileId, Global>,
     /// Every request in flight. Dropped only once none is (`Drop`): the kernel may write any
     /// of their entries until its packet is taken.
     requests: ManuallyDrop<Slab<Request>>,
@@ -447,11 +484,11 @@ pub struct Iocp {
     ready: Vec<Completion>,
     /// By ticks since `start`: due, then the order they were asked for.
     timers: Wheel<Tag>,
-    watches: HashMap<Tag, Id>,
-    journals: HashMap<Tag, Journaling>,
-    listens: HashMap<Tag, Id>,
+    watches: HashMap<Tag, Id, Global>,
+    journals: HashMap<Tag, Journaling, Global>,
+    listens: HashMap<Tag, Id, Global>,
     spawns: Slab<Spawned>,
-    spawning: HashMap<Tag, SpawnId>,
+    spawning: HashMap<Tag, SpawnId, Global>,
     conns: Slab<Connection>,
     entries: [OVERLAPPED_ENTRY; ENTRIES],
     in_flight: usize,
@@ -468,9 +505,9 @@ pub struct Iocp {
 // tied to the thread that made it; the driver is used from one thread at a time (`&mut self`).
 unsafe impl Send for Iocp {}
 
-fn reserved<K, V>() -> HashMap<K, V> {
+fn reserved<K, V>() -> HashMap<K, V, Global> {
     // alloc: setup, the room of a map of what is named by tag.
-    HashMap::with_capacity_and_hasher(TAGGED, Default::default())
+    HashMap::with_capacity_in(TAGGED, Global)
 }
 
 impl Iocp {
@@ -531,9 +568,9 @@ impl Iocp {
             dirs,
             files: Slab::new(FILES, MemTag::Io).map_err(mem)?,
             // alloc: setup, room for every handle kept.
-            readers: HashMap::with_capacity_and_hasher(CACHED, Default::default()),
+            readers: HashMap::with_capacity_in(CACHED, Global),
             // alloc: as above.
-            appenders: HashMap::with_capacity_and_hasher(CACHED, Default::default()),
+            appenders: HashMap::with_capacity_in(CACHED, Global),
             requests: ManuallyDrop::new(Slab::new(REQUESTS, MemTag::Io).map_err(mem)?),
             stale: 0,
             buffers: ManuallyDrop::new(Buffers::new(BUFFERS).map_err(mem)?),
@@ -748,8 +785,10 @@ impl Iocp {
             | Effect::Sync { .. }
             | Effect::Truncate { .. }
             | Effect::Stat { .. }
+            | Effect::Lstat { .. }
             | Effect::List { .. }
             | Effect::Mode { .. }
+            | Effect::Seal { .. }
             | Effect::Private { .. }
             | Effect::Map { .. }
             | Effect::Stamp { .. }
@@ -767,7 +806,7 @@ impl Iocp {
                 if self.watches.contains_key(&tag) || self.journals.contains_key(&tag) {
                     return Err(watched_already(tag));
                 }
-                self.journals.insert(tag, Journaling { request: None, stopping: false });
+                self.journals.insert(tag, Journaling::new());
                 self.to_threads(Work::Open { tag, dir, since });
                 Ok(())
             }
@@ -790,14 +829,34 @@ impl Iocp {
                 self.put(request);
                 Ok(())
             }
-            Effect::Flush { watch, .. } => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
+            Effect::Flush { watch, tag } => {
+                if let Some(journaling) = self.journals.get_mut(&watch) {
+                    if journaling.stopping {
+                        // alloc: an error path.
+                        return Err(io::Error::other(format!("flushing the watch {watch:?}: it is being stopped")));
+                    }
+                    let Some(querier) = journaling.querier.as_ref().map(Arc::clone) else {
+                        // alloc: grown once to the flushes asked before the journal opened.
+                        journaling.unmarked.push(tag);
+                        return Ok(());
+                    };
+                    self.to_threads(Work::Mark { journal: watch, flush: tag, querier });
+                    return Ok(());
+                }
+                if self.watches.contains_key(&watch) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        // alloc: an error path.
+                        format!(
+                            "flushing the watch {watch:?}: ReadDirectoryChangesW has no barrier that says every \
+                             change made before it has been read; a journal's watch (Effect::Journal) has one, \
+                             the USN journal's position"
+                        ),
+                    ));
+                }
                 // alloc: an error path.
-                format!(
-                    "flushing the watch {watch:?}: ReadDirectoryChangesW has no barrier that says \
-                     every change made before it has been read, so a watch on Windows vouches for nothing"
-                ),
-            )),
+                Err(io::Error::other(format!("flushing the watch {watch:?}: nothing is watched as it")))
+            }
             Effect::Spawn { command, tag } => self.spawn(command, tag),
             Effect::Listen { at, tag } => self.listen(at, tag),
             Effect::Connect { at, tag } => self.connect(at, tag),
@@ -1793,6 +1852,7 @@ impl Iocp {
                     self.connected(tag, &at, made);
                 }
                 Back::Journal { tag, journal, taken } => self.journaled(tag, journal, taken),
+                Back::Marked { journal, flush, mark } => self.marked(journal, flush, mark),
             }
         }
         while self.at_threads < WORK {
@@ -1802,24 +1862,47 @@ impl Iocp {
         out.append(&mut self.ready);
     }
 
-    /// A journal the threads handed back: its batch told, then its next read asked for, or its
-    /// end, or, asked to end meanwhile, its unwatch.
+    /// A journal the threads handed back: its batch told, its flushes told what they may be,
+    /// then its next read asked for (without waiting while a flush waits), or its end, or, asked
+    /// to end meanwhile, its unwatch.
     fn journaled(&mut self, tag: Tag, journal: Option<Box<usn::Journal>>, taken: usn::Taken) {
-        let Some(journaling) = self.journals.get(&tag) else { return };
+        let Some(journaling) = self.journals.get_mut(&tag) else { return };
         let stopping = journaling.stopping;
+        let mut opened = None;
+        if let Some(journal) = &journal
+            && journaling.querier.is_none()
+        {
+            let querier = journal.querier();
+            journaling.querier = Some(Arc::clone(&querier));
+            // alloc: once per watch, as it opens.
+            journaling.shown = journal.shown().to_owned();
+            opened = Some((querier, std::mem::take(&mut journaling.unmarked)));
+        }
         if let Some(batch) = taken.batch {
             self.ready.push(Completion { tag, done: Done::Journaled(batch) });
         }
         if let Some(why) = taken.end {
-            self.journals.remove(&tag);
+            self.unjournal(tag, &why);
             return self.fail(tag, why);
         }
         if stopping {
-            self.journals.remove(&tag);
+            self.unjournal(tag, "it was stopped");
             self.ready.push(Completion { tag, done: Done::Unwatched });
             return;
         }
-        let journal = journal.expect("a journal handed back without an end is handed back with it");
+        if let Some((querier, unmarked)) = opened {
+            for flush in unmarked {
+                self.to_threads(Work::Mark { journal: tag, flush, querier: Arc::clone(&querier) });
+            }
+        }
+        let journaling = self.journals.get_mut(&tag).expect("looked up above");
+        if let Some(read) = taken.read {
+            journaling.barrier.read(read.told, read.stalled);
+        }
+        let hurry = journaling.barrier.hurried();
+        self.decide(tag);
+        let mut journal = journal.expect("a journal handed back without an end is handed back with it");
+        journal.set_hurry(hurry);
         let request = self.request(tag, Op::Journal(journal));
         if let Some(journaling) = self.journals.get_mut(&tag) {
             journaling.request = Some(request);
@@ -1829,17 +1912,88 @@ impl Iocp {
 
     /// A read of the journal `tag` ended: its records to be named on the threads, or, asked to
     /// end, the journal let go. What it read as it was cancelled is after the last batch's
-    /// cursor, so a watch from that cursor reads it again.
-    fn journal_read(&mut self, tag: Tag, journal: Box<usn::Journal>, result: io::Result<u32>) {
+    /// cursor, so a watch from that cursor reads it again. A read cancelled so that a flush is
+    /// told read nothing: it is asked again at once, without waiting.
+    fn journal_read(&mut self, tag: Tag, mut journal: Box<usn::Journal>, result: io::Result<u32>) {
         let Some(journaling) = self.journals.get_mut(&tag) else { return };
         journaling.request = None;
+        let hurried = std::mem::take(&mut journaling.hurrying);
         if journaling.stopping {
-            self.journals.remove(&tag);
             drop(journal);
+            self.unjournal(tag, "it was stopped");
             self.ready.push(Completion { tag, done: Done::Unwatched });
             return;
         }
+        let code = result.as_ref().err().and_then(io::Error::raw_os_error).map(|it| it as u32);
+        if hurried && code == Some(ERROR_OPERATION_ABORTED) {
+            journal.set_hurry(true);
+            let request = self.request(tag, Op::Journal(journal));
+            if let Some(journaling) = self.journals.get_mut(&tag) {
+                journaling.request = Some(request);
+            }
+            self.put(request);
+            return;
+        }
         self.to_threads(Work::Took { tag, journal, result });
+    }
+
+    /// The flush `flush` of the journal `tag` marked: told now, or once the journal's reads
+    /// reach the mark.
+    fn marked(&mut self, tag: Tag, flush: Tag, mark: io::Result<At>) {
+        let Some(journaling) = self.journals.get_mut(&tag) else {
+            return self.fail(flush, format_args!("flushing the watch {tag:?}: the watch ended before the flush was marked"));
+        };
+        match mark {
+            Ok(mark) => journaling.barrier.mark(flush, mark),
+            Err(error) => {
+                // alloc: an error path.
+                let why = format!(
+                    "flushing the watch {tag:?} of {}: asking where its volume's USN journal ends: {error}",
+                    journaling.shown,
+                );
+                return self.fail(flush, why);
+            }
+        }
+        self.decide(tag);
+    }
+
+    /// What the barrier of the journal `tag` decided: flushes told or failed, and a read in
+    /// flight that waits for a record cancelled, to be asked again without waiting.
+    fn decide(&mut self, tag: Tag) {
+        let Some(journaling) = self.journals.get_mut(&tag) else { return };
+        let mut hurry = false;
+        for decision in journaling.barrier.take_decisions() {
+            match decision {
+                Decision::Told(flush) => self.ready.push(Completion { tag: flush, done: Done::Flushed }),
+                Decision::Failed { tag: flush, why } => {
+                    self.ready.push(failed(flush, format_args!("flushing the watch {tag:?} of {}: {why}", journaling.shown)));
+                }
+                Decision::Hurry => hurry = true,
+            }
+        }
+        if hurry
+            && !journaling.hurrying
+            && !journaling.stopping
+            && let Some(request) = journaling.request.and_then(|id| self.requests.get(id))
+            && matches!(&request.op, Op::Journal(journal) if journal.waits())
+        {
+            request.cancel();
+            journaling.hurrying = true;
+        }
+    }
+
+    /// The journal `tag` ended (`why`): let go, and its flushes, marked or not, failed first.
+    fn unjournal(&mut self, tag: Tag, why: &str) {
+        let Some(mut journaling) = self.journals.remove(&tag) else { return };
+        journaling.barrier.end(why);
+        for decision in journaling.barrier.take_decisions() {
+            if let Decision::Failed { tag: flush, why } = decision {
+                self.ready.push(failed(flush, format_args!("flushing the watch {tag:?} of {}: {why}", journaling.shown)));
+            }
+        }
+        for flush in journaling.unmarked {
+            self.ready.push(failed(flush, format_args!("flushing the watch {tag:?}: the watch ended before it opened: {why}")));
+        }
     }
 }
 
@@ -2074,9 +2228,12 @@ fn work_on(
                     Ok((journal, first))
                 });
                 let (journal, taken) = match opened {
-                    Ok((journal, batch)) => (Some(journal), usn::Taken { batch, end: None }),
+                    Ok((journal, batch)) => {
+                        let read = Some(journal.reached(false));
+                        (Some(journal), usn::Taken { batch, end: None, read })
+                    }
                     // alloc: an error path.
-                    Err(error) => (None, usn::Taken { batch: None, end: Some(error.to_string()) }),
+                    Err(error) => (None, usn::Taken { batch: None, end: Some(error.to_string()), read: None }),
                 };
                 back.send(Back::Journal { tag, journal, taken })
             }
@@ -2084,6 +2241,10 @@ fn work_on(
                 let taken = journal.take(result);
                 let journal = taken.end.is_none().then_some(journal);
                 back.send(Back::Journal { tag, journal, taken })
+            }
+            Work::Mark { journal, flush, querier } => {
+                let mark = usn::mark(&querier);
+                back.send(Back::Marked { journal, flush, mark })
             }
         };
         if sent.is_err() {
@@ -2124,6 +2285,7 @@ fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
             files::rename(joined(at, root, &from), joined(to, root, &into)).map(|()| Done::Renamed)
         }
         Effect::Mode { file, mode, .. } => files::set_mode(joined(at, root, &file), mode).map(|()| Done::Moded),
+        Effect::Seal { file, mode, .. } => files::seal(joined(at, root, &file), mode).map(|()| Done::Moded),
         Effect::Clone { from, to: into, .. } => {
             files::clone(joined(at, root, &from), joined(to, root, &into)).map(|()| Done::Cloned)
         }
@@ -3000,12 +3162,86 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A flush of nothing watched, or of a `ReadDirectoryChangesW` watch, which has no
+    /// position to wait for, fails naming why.
     #[test]
-    fn a_flush_fails_naming_why() {
+    fn a_flush_with_no_journal_fails_naming_why() {
         let root = dir("flush");
+        std::fs::create_dir_all(root.join("src")).unwrap();
         let mut driver = Iocp::new(&root, 1).unwrap();
         let seen = run(&mut driver, vec![Effect::Flush { watch: Tag(7), tag: Tag(8) }]);
-        assert!(matches!(&seen[&8], Done::Failed(why) if why.0.contains("no barrier")), "{seen:?}");
+        assert!(matches!(&seen[&8], Done::Failed(why) if why.0.contains("nothing is watched")), "{seen:?}");
+        driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
+        let mut effects = vec![Effect::Flush { watch: Tag(7), tag: Tag(9) }, Effect::Unwatch { tag: Tag(7) }];
+        let (mut refused, mut ended) = (false, false);
+        run_until_idle(&mut driver, &mut effects, |it, _| match (it.tag.0, it.done) {
+            (9, Done::Failed(why)) => refused = why.0.contains("no barrier"),
+            (7, Done::Changed { .. }) => {}
+            (7, Done::Unwatched) => ended = true,
+            other => panic!("{other:?}"),
+        });
+        assert!(refused && ended);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A flush of a journal's watch is told after the batch that names every file written
+    /// before it, every round, with nothing written for it: one asked before the journal
+    /// opened, one with a change before it, one with none (the live read is cancelled and
+    /// asked again without waiting, as no record would wake it).
+    #[test]
+    fn a_journals_flush_follows_the_changes_before_it_and_writes_nothing() {
+        let root = dir("journal-flush");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut driver = Iocp::new(&root, 2).unwrap();
+        let mut out = Vec::new();
+        let mut until = |driver: &mut Iocp, flush: Tag, heard: &mut Vec<FileName>| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                assert!(Instant::now() < deadline, "the flush {flush:?} was never told; heard {heard:?}");
+                driver.poll(&mut out, Duration::from_millis(50));
+                let mut told = false;
+                for it in out.drain(..) {
+                    match (it.tag, it.done) {
+                        (Tag(7), Done::Journaled(batch)) => heard.extend(batch.files),
+                        (tag, Done::Flushed) if tag == flush => told = true,
+                        other => panic!("{other:?}"),
+                    }
+                }
+                if told {
+                    return;
+                }
+            }
+        };
+        let mut heard = Vec::new();
+        driver.submit(&mut vec![
+            Effect::Journal { dir: name("src"), since: Cursor::None, tag: Tag(7) },
+            Effect::Flush { watch: Tag(7), tag: Tag(8) },
+        ]);
+        until(&mut driver, Tag(8), &mut heard);
+        for round in 0..20u64 {
+            let file = format!("src/deep/edit-{round}.rs");
+            std::fs::create_dir_all(src.join("deep")).unwrap();
+            std::fs::write(root.join(&file), b"edited").unwrap();
+            heard.clear();
+            let flush = Tag(100 + round);
+            driver.submit(&mut vec![Effect::Flush { watch: Tag(7), tag: flush }]);
+            until(&mut driver, flush, &mut heard);
+            assert!(heard.contains(&name(&file)), "round {round}: told before {file}: {heard:?}");
+            // Nothing changed since: told all the same.
+            let quiet = Tag(1000 + round);
+            driver.submit(&mut vec![Effect::Flush { watch: Tag(7), tag: quiet }]);
+            until(&mut driver, quiet, &mut heard);
+        }
+        let mut names: Vec<_> = std::fs::read_dir(&src).unwrap().map(|it| it.unwrap().file_name()).collect();
+        names.sort();
+        assert_eq!(names, ["deep"], "a flush writes nothing into the watched directory");
+        let mut effects = vec![Effect::Unwatch { tag: Tag(7) }];
+        run_until_idle(&mut driver, &mut effects, |it, _| {
+            assert!(matches!(it.done, Done::Journaled(_) | Done::Unwatched), "{it:?}");
+        });
+        assert_eq!(driver.in_flight(), 0);
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3023,7 +3259,7 @@ mod tests {
         for seed in 0..64 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut slab: Slab<Model> = Slab::new(1 << 12, MemTag::Io).unwrap();
-            let mut map: HashMap<u64, Tag> = HashMap::default();
+            let mut map: HashMap<u64, Tag, Global> = HashMap::new_in(Global);
             let mut next = 0u64;
             let (mut live, mut ended): (Vec<(u64, Of)>, Vec<(u64, Of)>) = (Vec::new(), Vec::new());
             for _ in 0..2000 {

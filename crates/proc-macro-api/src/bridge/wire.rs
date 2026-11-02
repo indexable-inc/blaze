@@ -4,6 +4,7 @@
 //! bytes are written only of text a macro asks to be tokens of.
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use span::{EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext};
 use tt::{DelimiterKind, Leaf, LitKind, Spacing, Subtree, TokenTree, TopSubtree, TopSubtreeBuilder, WirePart};
 
@@ -27,7 +28,7 @@ pub struct Parts {
     /// The part asked for last and its index: tokens near each other share one.
     last: Option<(Part, u32)>,
     wide: Vec<[u32; 3]>,
-    wides: HashMap<[u32; 3], u32>,
+    wides: HashMap<[u32; 3], u32, Global>,
 }
 
 impl Parts {

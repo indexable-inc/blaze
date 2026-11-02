@@ -30,6 +30,9 @@
 //! the kernel calls of `arena` and [`topology`], each in a small module of its own.
 
 #![deny(unsafe_code)]
+#![feature(allocator_api, register_tool)]
+// `#[blaze::nonblocking]` / `#[blaze::noalloc]` (docs/v2/plan/lanes/effects.md); inert under rustc.
+#![register_tool(blaze)]
 
 pub mod admission;
 pub mod arena;

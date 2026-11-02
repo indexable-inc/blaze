@@ -17,6 +17,7 @@ pub enum FrameRule {
     ArgsSize(u32),
     /// AArch64's return-address signing state from here (`true`: signed), DWARF's
     /// `RA_SIGN_STATE` pseudo-register 34 as `ValExpression(34, [DW_OP_lit0 or DW_OP_lit1])`,
-    /// as Cranelift's `Aarch64SetPointerAuth` row writes it.
+    /// as Cranelift's `Aarch64SetPointerAuth` row writes it. Only where the state changes:
+    /// a frame starts unsigned, so a function that signs nothing has no such row.
     RaSignState(bool),
 }

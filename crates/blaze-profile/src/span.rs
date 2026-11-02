@@ -34,6 +34,7 @@ use arrow_array::{
 };
 use blaze_graph::wait::WaitKind;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use crate::{
     flight::{self, SpanRow, Sym},
@@ -65,7 +66,7 @@ impl Name {
 thread_local! {
     /// The names [`Name::kept`] gave on this thread, by the address and length of their text.
     // alloc: once per thread, grown to the kept names it opens spans of
-    static KEPT: RefCell<HashMap<(usize, usize), Name>> = RefCell::new(HashMap::default());
+    static KEPT: RefCell<HashMap<(usize, usize), Name, Global>> = RefCell::new(HashMap::new_in(Global));
 }
 
 impl Name {
@@ -116,6 +117,34 @@ impl Outcome {
             Outcome::StepLimit => "step limit",
             Outcome::MemoryLimit => "memory limit",
             Outcome::Error => "error",
+        }
+    }
+}
+
+/// Where a `macro module` got its module's machine code, as its column `module_from` says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleFrom {
+    /// The process had it from an earlier load.
+    Memo,
+    /// The daemon's own store kept it, and it was loaded from there.
+    Store,
+    /// It was compiled.
+    Compiled,
+}
+
+impl ModuleFrom {
+    /// Every source, each at its [`ModuleFrom::index`].
+    pub const ALL: [ModuleFrom; 3] = [ModuleFrom::Memo, ModuleFrom::Store, ModuleFrom::Compiled];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            ModuleFrom::Memo => "memo",
+            ModuleFrom::Store => "store",
+            ModuleFrom::Compiled => "compiled",
         }
     }
 }
@@ -244,7 +273,7 @@ macro_rules! enum_values {
     )*};
 }
 
-enum_values!(Outcome, WaitKind);
+enum_values!(Outcome, WaitKind, ModuleFrom);
 
 /// The fields a column of value `V` may have: `V`, or `Option<V>` where it may go unsaid.
 pub trait FieldOf<V: Value>: Value {}
@@ -256,7 +285,7 @@ macro_rules! fields_of {
     )*};
 }
 
-fields_of!(Name, u64, Outcome, WaitKind);
+fields_of!(Name, u64, Outcome, WaitKind, ModuleFrom);
 
 // --- Columns ----------------------------------------------------------------------------
 
@@ -832,7 +861,7 @@ span_kinds! {
         Awaits = "awaits" (Utf8): Name,
             "what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it";
         Owner = "owner" (U64): u64,
-            "who runs what a `wait` waits for (the job or thread running the awaited key; null when not known), or who holds a `hold`";
+            "who runs what a `wait` waits for (for a key, the job running it, as `switches.job` names it; null when not known), or the job that holds a `hold`";
         Steps = "steps" (U64): u64,
             "the basic blocks a `macro expand` ran on the evaluator; null for a compiled run, a run that did not end, and any other span";
         PeakBytes = "peak_bytes" (U64): u64,
@@ -841,6 +870,12 @@ span_kinds! {
             "how a `macro expand` ended: ok, panic, step limit, memory limit or error; null for one that did not end (an unwind)";
         WaitsOn = "waits_on" (Dict): WaitKind,
             "the kind of thing a `wait` waits on: key, lock, channel, io, child or scope";
+        OfJob = "job" (U64): u64,
+            "the pool job a `job` span is of, as `switches.job` names it (or `switches.began_as` for a job that joined the graph after the span opened); the spans under it are its job's too; null for any other span, and for the process's first job (slot 0, generation 0), which reads as 0";
+        ModuleFrom = "module_from" (Dict): ModuleFrom,
+            "where a `macro module` got its wasm module's machine code: memo (the process had it), store (loaded from the daemon's own store) or compiled; null for one that did not end and any other span";
+        CodeBytes = "code_bytes" (U64): u64,
+            "the bytes of a `macro module`'s machine code: read from the store, or made by its compile and kept; null for a memo hit, a compile with no store to keep it in, and any other span";
     }
     kinds {
         /// A unit's names phase: its crate's names resolved, or its record replayed.
@@ -864,8 +899,14 @@ span_kinds! {
         Hold = "hold" { what: Name => Function, holder: u64 => Owner }
         /// A job a pool runs, `kind` the type of its closure (or of the plane's runner), from
         /// its start to its end or its fiber's park, and again from each resume: every job's
-        /// time is inside one (`blaze_graph::pool::span_jobs`).
-        Job = "job" { kind: Name => Function }
+        /// time is inside one (`blaze_graph::pool::span_jobs`). `job` names the job, so a span
+        /// is laid on the job it ran in by its row, never by when it began.
+        Job = "job" { kind: Name => Function, job: u64 => OfJob }
+        /// A proc-macro crate's wasm module made ready to instantiate, `module` what names it
+        /// (`the wasm module of the proc-macro crate `serde_derive``): from the process's memo,
+        /// the store (its lookup and `Module::deserialize`), or a compile.
+        MacroModule = "macro module" { module: Name => Function }
+            => MacroModuleLoaded { from: ModuleFrom => ModuleFrom, code_bytes: Option<u64> => CodeBytes }
     }
 }
 

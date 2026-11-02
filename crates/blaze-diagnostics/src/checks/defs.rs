@@ -4,7 +4,8 @@
 //! `repr` of an enum with no variants (E0084); a type of infinite size (E0072); a type or
 //! lifetime parameter of a type never used (E0392), or of a type alias (E0091); a generic
 //! parameter declared twice (E0403), named `'static` (E0262) or named by an earlier default
-//! (E0128); a name bound twice in a parameter list (E0415) or a pattern (E0416).
+//! (E0128); a name bound twice in a parameter list (E0415) or a pattern (E0416); a foreign
+//! function with type or const parameters (E0044).
 //!
 //! Follows rustc's `compiler/rustc_resolve/src/build_reduced_graph.rs` and
 //! `diagnostics/impls.rs` (`report_conflict`), `late.rs` (`with_generic_param_rib`,
@@ -16,9 +17,11 @@
 //! (MIT or Apache-2.0).
 
 mod bindings;
+mod bits;
 mod conflicts;
 mod discriminants;
 mod fields;
+mod foreign;
 mod generics;
 mod packed;
 mod recursive;
@@ -53,12 +56,15 @@ pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
             found.extend(discriminants::check(cx, it));
         }
         found.extend(packed::check(cx, adt));
+        found.extend(bits::check(cx, adt));
         found.extend(unused::check(cx, adt));
         found.extend(infinite.check(cx, adt));
     }
     for def in scopes.iter().flat_map(|module| module.declarations_iter(cx.db)) {
-        if let hir::ModuleDef::TypeAlias(alias) = def {
-            found.extend(unused::check_alias(cx, alias));
+        match def {
+            hir::ModuleDef::TypeAlias(alias) => found.extend(unused::check_alias(cx, alias)),
+            hir::ModuleDef::Function(func) => found.extend(foreign::check(cx, func)),
+            _ => {}
         }
     }
     found

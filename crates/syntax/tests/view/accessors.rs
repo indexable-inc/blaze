@@ -403,6 +403,7 @@ pub fn check(handle: &SyntaxNode, node: view::Node<'_>) {
         assert_eq!(h.abi().map(|it| range(it.syntax())), v.abi().map(|it| view_range(it.syntax())), "Fn::abi");
         assert_eq!(h.param_list().map(|it| range(it.syntax())), v.param_list().map(|it| view_range(it.syntax())), "Fn::param_list");
         assert_eq!(h.ret_type().map(|it| range(it.syntax())), v.ret_type().map(|it| view_range(it.syntax())), "Fn::ret_type");
+        assert!(h.spec_clauses().map(|it| range(it.syntax())).eq(v.spec_clauses().map(|it| view_range(it.syntax()))), "Fn::spec_clauses");
         assert_eq!(h.semicolon_token().map(|it| (it.kind(), it.text_range())), v.semicolon_token().map(|it| (it.kind(), it.text_range())), "Fn::semicolon_token");
         assert_eq!(h.async_token().map(|it| (it.kind(), it.text_range())), v.async_token().map(|it| (it.kind(), it.text_range())), "Fn::async_token");
         assert_eq!(h.const_token().map(|it| (it.kind(), it.text_range())), v.const_token().map(|it| (it.kind(), it.text_range())), "Fn::const_token");
@@ -433,6 +434,7 @@ pub fn check(handle: &SyntaxNode, node: view::Node<'_>) {
     if let (Some(h), Some(v)) = (ast::ForExpr::cast(handle.clone()), view::ForExpr::cast(node)) {
         assert_eq!(range(h.syntax()), view_range(v.syntax()));
         assert_eq!(h.pat().map(|it| range(it.syntax())), v.pat().map(|it| view_range(it.syntax())), "ForExpr::pat");
+        assert_eq!(h.const_token().map(|it| (it.kind(), it.text_range())), v.const_token().map(|it| (it.kind(), it.text_range())), "ForExpr::const_token");
         assert_eq!(h.for_token().map(|it| (it.kind(), it.text_range())), v.for_token().map(|it| (it.kind(), it.text_range())), "ForExpr::for_token");
         assert_eq!(h.in_token().map(|it| (it.kind(), it.text_range())), v.in_token().map(|it| (it.kind(), it.text_range())), "ForExpr::in_token");
     }
@@ -527,6 +529,7 @@ pub fn check(handle: &SyntaxNode, node: view::Node<'_>) {
     assert_eq!(<ast::IndexExpr>::can_cast(handle.kind()), <view::IndexExpr<'_>>::can_cast(node.kind()));
     if let (Some(h), Some(v)) = (ast::IndexExpr::cast(handle.clone()), view::IndexExpr::cast(node)) {
         assert_eq!(range(h.syntax()), view_range(v.syntax()));
+        assert_eq!(h.dot_token().map(|it| (it.kind(), it.text_range())), v.dot_token().map(|it| (it.kind(), it.text_range())), "IndexExpr::dot_token");
         assert_eq!(h.l_brack_token().map(|it| (it.kind(), it.text_range())), v.l_brack_token().map(|it| (it.kind(), it.text_range())), "IndexExpr::l_brack_token");
         assert_eq!(h.r_brack_token().map(|it| (it.kind(), it.text_range())), v.r_brack_token().map(|it| (it.kind(), it.text_range())), "IndexExpr::r_brack_token");
     }
@@ -609,6 +612,7 @@ pub fn check(handle: &SyntaxNode, node: view::Node<'_>) {
     assert_eq!(<ast::LoopExpr>::can_cast(handle.kind()), <view::LoopExpr<'_>>::can_cast(node.kind()));
     if let (Some(h), Some(v)) = (ast::LoopExpr::cast(handle.clone()), view::LoopExpr::cast(node)) {
         assert_eq!(range(h.syntax()), view_range(v.syntax()));
+        assert!(h.spec_clauses().map(|it| range(it.syntax())).eq(v.spec_clauses().map(|it| view_range(it.syntax()))), "LoopExpr::spec_clauses");
         assert_eq!(h.loop_token().map(|it| (it.kind(), it.text_range())), v.loop_token().map(|it| (it.kind(), it.text_range())), "LoopExpr::loop_token");
     }
     assert_eq!(<ast::MacroCall>::can_cast(handle.kind()), <view::MacroCall<'_>>::can_cast(node.kind()));
@@ -967,6 +971,7 @@ pub fn check(handle: &SyntaxNode, node: view::Node<'_>) {
     assert_eq!(<ast::RetType>::can_cast(handle.kind()), <view::RetType<'_>>::can_cast(node.kind()));
     if let (Some(h), Some(v)) = (ast::RetType::cast(handle.clone()), view::RetType::cast(node)) {
         assert_eq!(range(h.syntax()), view_range(v.syntax()));
+        assert_eq!(h.pat().map(|it| range(it.syntax())), v.pat().map(|it| view_range(it.syntax())), "RetType::pat");
         assert_eq!(h.ty().map(|it| range(it.syntax())), v.ty().map(|it| view_range(it.syntax())), "RetType::ty");
         assert_eq!(h.thin_arrow_token().map(|it| (it.kind(), it.text_range())), v.thin_arrow_token().map(|it| (it.kind(), it.text_range())), "RetType::thin_arrow_token");
     }
@@ -1005,6 +1010,16 @@ pub fn check(handle: &SyntaxNode, node: view::Node<'_>) {
         assert_eq!(h.ty().map(|it| range(it.syntax())), v.ty().map(|it| view_range(it.syntax())), "SliceType::ty");
         assert_eq!(h.l_brack_token().map(|it| (it.kind(), it.text_range())), v.l_brack_token().map(|it| (it.kind(), it.text_range())), "SliceType::l_brack_token");
         assert_eq!(h.r_brack_token().map(|it| (it.kind(), it.text_range())), v.r_brack_token().map(|it| (it.kind(), it.text_range())), "SliceType::r_brack_token");
+    }
+    assert_eq!(<ast::SpecClause>::can_cast(handle.kind()), <view::SpecClause<'_>>::can_cast(node.kind()));
+    if let (Some(h), Some(v)) = (ast::SpecClause::cast(handle.clone()), view::SpecClause::cast(node)) {
+        assert_eq!(range(h.syntax()), view_range(v.syntax()));
+        assert!(h.exprs().map(|it| range(it.syntax())).eq(v.exprs().map(|it| view_range(it.syntax()))), "SpecClause::exprs");
+        assert_eq!(h.decreases_token().map(|it| (it.kind(), it.text_range())), v.decreases_token().map(|it| (it.kind(), it.text_range())), "SpecClause::decreases_token");
+        assert_eq!(h.ensures_token().map(|it| (it.kind(), it.text_range())), v.ensures_token().map(|it| (it.kind(), it.text_range())), "SpecClause::ensures_token");
+        assert_eq!(h.invariant_token().map(|it| (it.kind(), it.text_range())), v.invariant_token().map(|it| (it.kind(), it.text_range())), "SpecClause::invariant_token");
+        assert_eq!(h.recommends_token().map(|it| (it.kind(), it.text_range())), v.recommends_token().map(|it| (it.kind(), it.text_range())), "SpecClause::recommends_token");
+        assert_eq!(h.requires_token().map(|it| (it.kind(), it.text_range())), v.requires_token().map(|it| (it.kind(), it.text_range())), "SpecClause::requires_token");
     }
     assert_eq!(<ast::SourceFile>::can_cast(handle.kind()), <view::SourceFile<'_>>::can_cast(node.kind()));
     if let (Some(h), Some(v)) = (ast::SourceFile::cast(handle.clone()), view::SourceFile::cast(node)) {
@@ -1285,6 +1300,7 @@ pub fn check(handle: &SyntaxNode, node: view::Node<'_>) {
     assert_eq!(<ast::WhileExpr>::can_cast(handle.kind()), <view::WhileExpr<'_>>::can_cast(node.kind()));
     if let (Some(h), Some(v)) = (ast::WhileExpr::cast(handle.clone()), view::WhileExpr::cast(node)) {
         assert_eq!(range(h.syntax()), view_range(v.syntax()));
+        assert!(h.spec_clauses().map(|it| range(it.syntax())).eq(v.spec_clauses().map(|it| view_range(it.syntax()))), "WhileExpr::spec_clauses");
         assert_eq!(h.while_token().map(|it| (it.kind(), it.text_range())), v.while_token().map(|it| (it.kind(), it.text_range())), "WhileExpr::while_token");
     }
     assert_eq!(<ast::WildcardPat>::can_cast(handle.kind()), <view::WildcardPat<'_>>::can_cast(node.kind()));

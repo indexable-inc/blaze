@@ -14,7 +14,7 @@
 //! place (here) and one function ([`is_item_tree_filtered_attr()`]) that decides whether
 //! an attribute participate in name resolution.
 
-use std::{borrow::Cow, cell::OnceCell, convert::Infallible, fmt, ops::ControlFlow};
+use std::{borrow::Cow, convert::Infallible, fmt, ops::ControlFlow};
 
 use ::tt::TextRange;
 use base_db::{Db, Crate};
@@ -458,7 +458,8 @@ impl AttrId {
         krate: Crate,
         owner: view::AnyHasAttrs<'t>,
     ) -> Option<(view::Attr<'t>, view::Meta<'t>)> {
-        let cfg_options = OnceCell::new();
+        #[expect(clippy::disallowed_types, reason = "crate cfg options, set once per attribute lookup: not global")]
+        let cfg_options = std::cell::OnceCell::new();
         let mut index = 0;
         let result = collect_item_tree_attrs_view(
             owner,

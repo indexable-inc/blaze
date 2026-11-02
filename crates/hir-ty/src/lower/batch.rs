@@ -13,7 +13,6 @@ use base_db::{Db, Crate};
 use blaze_ids::radix;
 use blaze_mem::Frame;
 use hir_def::{AdtId, ImplId, ModuleDefId, ModuleId, VariantId, nameres::crate_def_map};
-use rustc_type_ir::inherent::Ty as _;
 use blaze_query::db::AsId;
 
 use crate::{
@@ -23,9 +22,7 @@ use crate::{
         FieldType, FieldTypes, FrameLowered, GenericPredicates, Lowered, generic_predicates,
         lower_field_types, lower_impl_self_ty, lower_impl_trait,
     },
-    next_solver::{
-        Clauses, DbInterner, ErrorGuaranteed, StoredEarlyBinder, StoredTraitRef, StoredTy, Ty,
-    },
+    next_solver::{StoredEarlyBinder, StoredTraitRef, StoredTy},
 };
 
 /// The crate whose batch holds the signatures of the items of `module`, `None` when they have a
@@ -168,14 +165,6 @@ impl<'db, K: Ord + Copy, V> Batch<'db, K, V> {
         }
         // alloc: the batch's keys, exact size; `values` is at its capacity, so boxing it moves
         Batch { keys: Box::from(keys), values: values.into_boxed_slice(), side: side.finish() }
-    }
-
-    /// `value()` for each of `keys`: the batch when computing it reached itself, which only code
-    /// rustc rejects does (an impl header naming its own self type or trait). Each row is what
-    /// the per-item query's cycle result gives.
-    fn filled(keys: &[K], value: impl Fn() -> V) -> Self {
-        let values = keys.iter().map(|_| value()).collect(); // alloc: the batch's column, exact size
-        Batch { keys: Box::from(keys), values, side: SideTable::default() }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -355,7 +344,16 @@ fn crate_field_types<'db>(db: &'db Db, krate: Crate) -> CrateFieldTypes<'db> {
     })
 }
 
-#[blaze_query::tracked(returns(ref), cycle_result = crate_impl_self_tys_cycle, mem_tag = Infer)]
+/// No `cycle_result`, as `crate_impl_predicates`. Lowering an impl's self type reads paths,
+/// type aliases, generics and const parameter types. It reads an impl's self type only for
+/// `Self` written in the self type itself (`impl Tr for Box<Self>`), which rustc refuses, so in
+/// a dependency crate rustc accepts only a blaze bug makes the batch reach itself; that panics
+/// naming the queries of the cycle and fails the job that asked. A fallback here gave every impl of the crate an
+/// error self type, which hides each impl from coherence and method resolution with nothing
+/// said. Without one, a batch that is only a member of an outer cycle (it read a provisional
+/// row of a query below it on the stack, such as a type alias cycle, which reports its own
+/// E0391) keeps the self types it lowered instead of having them replaced.
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn crate_impl_self_tys<'db>(db: &'db Db, krate: Crate) -> CrateImplSelfTys<'db> {
     blaze_mem::frame::current(|frame| {
         let impls = module_impls(db, krate, frame);
@@ -363,20 +361,16 @@ fn crate_impl_self_tys<'db>(db: &'db Db, krate: Crate) -> CrateImplSelfTys<'db> 
     })
 }
 
-fn crate_impl_self_tys_cycle<'db>(
-    db: &'db Db,
-    _: blaze_query::db::Id,
-    krate: Crate,
-) -> CrateImplSelfTys<'db> {
-    let error = StoredEarlyBinder::bind_no_rigid_aliases(
-        Ty::new_error(DbInterner::new_no_crate(db), ErrorGuaranteed).store(),
-    );
-    // clone: an interned row, on a cycle only code rustc rejects reaches
-    Batch::filled(&module_impls(db, krate, std::alloc::Global), || error.clone())
-}
-
 /// Reads the crate's self types: a trait's arguments may name `Self`.
-#[blaze_query::tracked(returns(ref), cycle_result = crate_impl_traits_cycle, mem_tag = Infer)]
+///
+/// No `cycle_result`, as `crate_impl_self_tys`. Lowering an impl's trait reference reads the
+/// trait's generics and the arguments' paths. It reads an impl's trait only for `Self::Name`
+/// written in that trait reference (`impl Tr<Self::Name> for S`), which rustc refuses (E0391),
+/// so in a dependency crate rustc accepts only a blaze bug makes the batch reach itself, which
+/// panics naming the cycle. A fallback here gave every impl of the
+/// crate no trait, so each trait impl looked inherent: its methods resolved as inherent
+/// methods and coherence never saw it.
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn crate_impl_traits<'db>(db: &'db Db, krate: Crate) -> CrateImplTraits<'db> {
     let self_tys = CrateImplSelfTys::of(db, krate);
     blaze_mem::frame::current(|frame| {
@@ -394,33 +388,22 @@ fn crate_impl_traits<'db>(db: &'db Db, krate: Crate) -> CrateImplTraits<'db> {
     })
 }
 
-fn crate_impl_traits_cycle<'db>(
-    db: &'db Db,
-    _: blaze_query::db::Id,
-    krate: Crate,
-) -> CrateImplTraits<'db> {
-    Batch::filled(&module_impls(db, krate, std::alloc::Global), || None)
-}
-
 /// Reads the crate's self types and traits: a where clause may name `Self` and `Self::Assoc`.
-#[blaze_query::tracked(returns(ref), cycle_result = crate_impl_predicates_cycle, mem_tag = Infer)]
+///
+/// No `cycle_result`: a batch that reaches itself panics naming the queries of the cycle, which
+/// fails the job that asked. A fallback here would give every impl of the crate no where clause
+/// at all, so a blanket impl such as hashbrown's `impl<Q, K> Equivalent<K> for Q where K:
+/// Borrow<Q>` would hold for any `Q` and type check would accept what rustc refuses (E0277). It
+/// also matters when the batch is only a member of an outer cycle (it read a provisional row of
+/// a query below it on the stack): a `cycle_result` would replace its value with the fallback,
+/// and the outer head finalizes that, while without one it keeps the predicates it lowered.
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn crate_impl_predicates<'db>(db: &'db Db, krate: Crate) -> CrateImplPredicates<'db> {
     let self_tys = CrateImplSelfTys::of(db, krate);
     blaze_mem::frame::current(|frame| {
         Batch::build(&self_tys.keys, frame, |impl_id, item| {
             generic_predicates(db, impl_id.into(), item)
         })
-    })
-}
-
-fn crate_impl_predicates_cycle<'db>(
-    db: &'db Db,
-    _: blaze_query::db::Id,
-    krate: Crate,
-) -> CrateImplPredicates<'db> {
-    let empty = StoredEarlyBinder::bind_no_rigid_aliases(Clauses::empty().store());
-    Batch::filled(&module_impls(db, krate, std::alloc::Global), || {
-        GenericPredicates::from_explicit_own_predicates(empty.clone()) // clone: an interned row, on a cycle
     })
 }
 

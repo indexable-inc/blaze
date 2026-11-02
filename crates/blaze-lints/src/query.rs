@@ -11,6 +11,7 @@ mod tests;
 
 use base_db::{Db, EditionedFileId};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir::HasVisibility as _;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, ImplId, ItemContainerId, Lookup as _, ModuleDefId,
@@ -23,7 +24,7 @@ use crate::{
     conf::Conf,
     diag::Diag,
     famous::{self, Famous},
-    lints,
+    lints, profile,
 };
 
 /// The lints a query runs, which may be above `allow` where it looks, and the configuration
@@ -42,6 +43,9 @@ pub(crate) struct Lints {
     pub(crate) findings: Vec<Finding>,
     /// The `#[expect]`s of the lints run, on what the query walked of the file.
     pub(crate) expects: Vec<Expect>,
+    /// The first path of `core`, `alloc` or `std` a lint looked up that `famous::KNOWN` does not
+    /// list (`core::iter::Foo`), which the driver refuses the crate's check with.
+    pub(crate) not_known: Option<String>,
 }
 
 pub(crate) type BodyLints = Lints;
@@ -163,6 +167,21 @@ pub(crate) fn lint_plan(db: &Db, krate: base_db::Crate) -> Plan {
     check::plan_of(db, krate)
 }
 
+/// The profile a crate's profile lints read ([`crate::profile`]), keyed by its settings and
+/// its content ID.
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
+pub(crate) struct ProfileKey {
+    #[returns(ref)]
+    pub(crate) loaded: profile::Loaded,
+}
+
+/// The functions of `krate` as `key`'s profile has them: once per crate, edit and profile, so
+/// each body's lints look a function up in a map.
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn profile_hits(db: &Db, krate: base_db::Crate, key: ProfileKey) -> profile::Hits {
+    profile::hits_of(db, krate, key.loaded(db))
+}
+
 /// What `krate` resolves each path of [`famous::KNOWN`] to, by index: once per crate, so a
 /// lint's lookup is a hash of its path and one load, not a walk of `std`'s scopes.
 #[blaze_query::tracked(returns(ref))]
@@ -178,7 +197,7 @@ pub(crate) struct Exported {
     /// The definitions named by a public path from the crate's root, through public modules,
     /// enums and traits and `pub use`s; impls and their items are read off their self type and
     /// trait ([`Exported::has_impl`]).
-    defs: HashSet<ModuleDefId>,
+    defs: HashSet<ModuleDefId, Global>,
 }
 
 impl Exported {

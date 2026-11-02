@@ -1,0 +1,21 @@
+[package]
+name = "blaze-serde-derive"
+description = "derive(Serialize) and derive(Deserialize) for serde's traits, read from proc_macro's tokens with no syn, quote or proc-macro2, so blaze's macro engine runs it cheaply"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+doctest = false
+
+# No dependencies, on purpose: the derive is one small crate to compile and to interpret
+# (docs/v2/plan/lanes/usercode/macros.md). Its tests are blaze-serde's, which re-exports it.
+
+[lints]
+workspace = true

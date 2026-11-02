@@ -4,6 +4,7 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::{FixedState, HashMap};
+use std::alloc::Global;
 use blaze_mem::frame::Frame;
 use hashbrown::hash_map::Entry;
 use intern::Symbol;
@@ -25,7 +26,7 @@ mod tests;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DiagnosticItems {
     /// The item each diagnostic item names.
-    pub by_name: HashMap<Symbol, AttrDefId>,
+    pub by_name: HashMap<Symbol, AttrDefId, Global>,
     /// Each name given to a second item, which rustc refuses ("duplicate diagnostic item"):
     /// the name, the item `by_name` keeps for it, and the other. In a crate's own items, the
     /// first in the def map's order is kept; across crates, the crate asked about, then its
@@ -65,7 +66,7 @@ fn insert(
 /// The memo's value, made once at its size from what a run gathered in its frame.
 fn settle(mut by_name: FrameMap<'_>, mut duplicates: Duplicates<'_>) -> DiagnosticItems {
     // alloc: the memo's map, exact
-    let mut result = HashMap::with_capacity_and_hasher(by_name.len(), FixedState);
+    let mut result = HashMap::with_capacity_in(by_name.len(), Global);
     result.extend(by_name.drain());
     // alloc: the memo's duplicates, exact
     DiagnosticItems { by_name: result, duplicates: duplicates.drain(..).collect() }

@@ -1083,8 +1083,11 @@ mod tests {
         let other = CompiledFunction { relocs: function.relocs.clone(), profile: function.profile, ..other };
         assert_eq!(template.instantiate(other.key, &other_refs).unwrap().profile, function.profile);
         assert_ne!(template.id(), Template { profile: None, ..template.clone() }.id());
-        let used = Template { profile: Some(Profiled::Used { mismatched: true }), ..template.clone() };
-        assert_ne!(used.id(), Template { profile: Some(Profiled::Used { mismatched: false }), ..used.clone() }.id());
+        let used = Template { profile: Some(Profiled::Used { mismatched: true, applied: false }), ..template.clone() };
+        let unmatched = Profiled::Used { mismatched: false, applied: false };
+        assert_ne!(used.id(), Template { profile: Some(unmatched), ..used.clone() }.id());
+        let applied = Profiled::Used { mismatched: false, applied: true };
+        assert_ne!(used.id(), Template { profile: Some(applied), ..used.clone() }.id());
 
         assert_eq!(Template::of(&uncounted, &refs, &[]).unwrap_err(), TemplateError::ProfileCounters);
         assert_eq!(used.instantiate(function.key, &refs).unwrap_err(), TemplateError::ProfileCounters);

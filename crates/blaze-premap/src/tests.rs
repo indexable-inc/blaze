@@ -9,6 +9,7 @@ use blaze_codegen::{
 use blaze_core::sim::{Faults, Sim};
 use blaze_core::{Effect, FileName, run_until_idle};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_link::{Debug, DevRun, Format, Native, NativeKind, Output, OutputKind, Platform};
@@ -935,7 +936,7 @@ fn start_binds_as_a_whole_link_resolves() {
     ];
     names.sort_by(|a, b| a.0.cmp(&b.0));
     let start = start::plan(&image, &names).unwrap();
-    let writes: HashMap<u64, u64> = start.writes.iter().map(|it| (it.place, it.value)).collect();
+    let writes: HashMap<u64, u64, Global> = start.writes.iter().map(|it| (it.place, it.value)).collect();
     assert_eq!(writes[&(BASE + PAGE)], 0x9000, "a strong definition beats a weak one");
     assert_eq!(writes[&(BASE + PAGE + 8)], 0x9100, "of two weak ones the first on the line");
     assert_eq!(writes[&(BASE + PAGE + 16)], 0x9200);
@@ -1071,7 +1072,7 @@ fn store_round_trip() {
 }
 
 #[derive(Default)]
-struct Shelved(HashMap<ImageKey, Vec<u8>>, u32);
+struct Shelved(HashMap<ImageKey, Vec<u8>, Global>, u32);
 
 impl Shelf for Shelved {
     fn get_image(&self, key: &ImageKey) -> Result<Option<&[u8]>, PremapError> {

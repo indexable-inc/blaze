@@ -9,6 +9,7 @@ use base_db::{Crate, Db, Env, all_crates};
 use blaze_alloc_count::assert_at_most;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_query::QueryKind;
 use blaze_query::db::Setter;
@@ -124,8 +125,8 @@ fn local_crate(db: &Db) -> Crate {
     *all_crates(db).iter().find(|krate| krate.data(db).origin.is_local()).expect("a local crate")
 }
 
-fn functions(db: &Db, krate: Crate) -> HashMap<String, FunctionId> {
-    let mut found = HashMap::default();
+fn functions(db: &Db, krate: Crate) -> HashMap<String, FunctionId, Global> {
+    let mut found = HashMap::new_in(Global);
     for (_, module) in crate_def_map(db, krate).modules(db) {
         for def in module.scope(db).declarations() {
             if let ModuleDefId::FunctionId(id) = def {
@@ -139,7 +140,7 @@ fn functions(db: &Db, krate: Crate) -> HashMap<String, FunctionId> {
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
 #[derive(Default)]
 struct Memory {
-    images: Mutex<HashMap<ContentId, Arc<Aligned>>>,
+    images: Mutex<HashMap<ContentId, Arc<Aligned>, Global>>,
 }
 
 impl Memory {
@@ -174,7 +175,7 @@ impl ImageStore for Memory {
 /// so [`Back`] can read a stable form back; every read but an interned one is [`KNOB`] (or none,
 /// when not `expressible`).
 struct TestFacts {
-    defs: Mutex<HashMap<ContentId, Vec<u32>>>,
+    defs: Mutex<HashMap<ContentId, Vec<u32>, Global>>,
     knob: Knob,
     expressible: bool,
     names: Mutex<Vec<&'static str>>,
@@ -260,7 +261,7 @@ impl<'db> Source<'db> for RawSource<'_> {
 /// A stable form, read back: children inline, definitions by the keys [`TestFacts`] made.
 struct Back<'a, 'db> {
     words: &'a [u32],
-    defs: &'a HashMap<ContentId, Vec<u32>>,
+    defs: &'a HashMap<ContentId, Vec<u32>, Global>,
     db: PhantomData<&'db ()>,
 }
 
@@ -312,7 +313,7 @@ impl<'db> Source<'db> for Back<'_, 'db> {
 /// The head words, predicate and clauses of the stable form `words`.
 fn decode<'db>(
     words: &[u32],
-    defs: &HashMap<ContentId, Vec<u32>>,
+    defs: &HashMap<ContentId, Vec<u32>, Global>,
 ) -> Result<([u32; 3], Predicate<'db>, Clauses<'db>), &'static str> {
     let mut back = Back { words, defs, db: PhantomData };
     let head = [back.word()?, back.word()?, back.word()?];
@@ -369,7 +370,7 @@ const KINDS: [&str; 24] = [
 
 /// Every type of the fixture's two bodies, two that no body has, and one long enough that its
 /// stable form spans many of the hash's buffers.
-fn fixture_types<'db>(db: &'db Db, interner: DbInterner<'db>, functions: &HashMap<String, FunctionId>) -> Vec<Ty<'db>> {
+fn fixture_types<'db>(db: &'db Db, interner: DbInterner<'db>, functions: &HashMap<String, FunctionId, Global>) -> Vec<Ty<'db>> {
     let mut tys = Vec::new();
     for name in ["every", "generic"] {
         let result = InferenceResult::of(db, functions[name]);
@@ -433,7 +434,7 @@ fn a_goal_reads_back_from_its_stable_form_and_its_record() {
     let version = solver_version(&BUILD);
     let memory = Memory::default();
     let limit = rustc_type_ir::Interner::recursion_limit(interner) as u32;
-    let mut keys = HashMap::default();
+    let mut keys = HashMap::new_in(Global);
     let mut longest = 0;
     for (n, &goal) in goals.iter().enumerate() {
         let mut words = Vec::new();

@@ -1,9 +1,10 @@
 //! Where pieces go.
 //!
 //! A full link sorts each class's pieces by rank, then link-line order (native sections),
-//! then symbol key, so the image is the same whatever the core count or the order changes
-//! came in, and lays the classes out in the writer's order with a page boundary at each
-//! change of protection. An incremental image keeps room in each region; an incremental
+//! then, for functions, the profile's order ([`crate::layout`]: hot ones in call order, cold
+//! ones last), then symbol key, so the image is the same whatever the core count or the order
+//! changes came in, and lays the classes out in the writer's order with a page boundary at
+//! each change of protection. An incremental image keeps room in each region; an incremental
 //! link puts new code in [`Class::Patch`] and new data in [`Class::PatchData`], never
 //! reusing what an old piece had (a running program may still be in it, and a rollback
 //! returns to it), and lays out again in place only the regions whose order the program
@@ -18,11 +19,13 @@ use std::sync::Arc;
 
 use blaze_graph::par;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_mem::align::align_up_u64;
 
 use crate::arena::{FrameVec, collect_in};
 use crate::cow::{CowBytes, IdSet};
+use crate::layout;
 use crate::model::{Apply, Class, Counts, Prot, Region, Reserve, Sym, Writer, reserved};
 use crate::stage::{Stage, error, function_of, refused};
 use crate::state::{ClassId, PieceId, PieceRef, Sort, Space, State, What, zeroed};
@@ -351,7 +354,7 @@ impl<'a> Stage<'a> {
     /// What the image exports: the name, the symbol it is, and whether it is data whatever
     /// it is defined in (`/EXPORT:name=symbol,DATA`).
     pub fn exports(&self) -> FrameVec<'a, (&str, &str, bool)> {
-        let mut seen: HashSet<&str> = HashSet::default();
+        let mut seen: HashSet<&str, Global> = HashSet::new_in(Global);
         let mut out: FrameVec<'a, (&str, &str, bool)> = Vec::new_in(self.arena);
         if let crate::OutputKind::Shared { exports, .. } = &self.output.kind {
             out.reserve(exports.len());
@@ -373,7 +376,60 @@ impl<'a> Stage<'a> {
     }
 
     pub fn place(&mut self) -> Result<(), LinkError> {
+        self.order_functions();
         if self.full { self.lay_out() } else { self.allocate() }
+    }
+
+    /// Orders the functions of a full link's code classes by the profile and the cold set
+    /// ([`crate::layout`]), once per stage, under a span that says what it did, or why it
+    /// did nothing.
+    fn order_functions(&mut self) {
+        use tracing::field::{Empty, display};
+        if self.layout.order.is_some() {
+            return;
+        }
+        let heat = self.layout.heat;
+        let span = tracing::info_span!(
+            target: "blaze",
+            "link.layout",
+            profile = Empty,
+            functions = Empty,
+            hot = Empty,
+            clusters = Empty,
+            cold = Empty,
+            overruled = Empty,
+            unmatched = Empty,
+            skipped = Empty,
+        );
+        let _enter = span.enter();
+        if let Some(heat) = heat {
+            span.record("profile", display(heat.id()));
+        }
+        let skipped = if !self.layout.wanted() {
+            Some("no profile and no function inferred cold")
+        } else if !self.full {
+            Some("an incremental link: new code goes to the patch region; the order applies at the next full link")
+        } else if self.plan.indexed_code {
+            Some("code is reached by function index (wasm), not laid out by address")
+        } else {
+            None
+        };
+        if let Some(why) = skipped {
+            span.record("skipped", why);
+            self.layout.order = Some(None);
+            return;
+        }
+        let functions = self.new.live_pieces().filter_map(|piece| piece.function().map(|it| (it.key, piece.size)));
+        let mut functions = collect_in(functions, self.arena);
+        let order = layout::order(&mut functions, heat, self.layout.cold);
+        let summary = order.summary;
+        span.record("functions", summary.functions);
+        span.record("hot", summary.hot);
+        span.record("clusters", summary.clusters);
+        span.record("cold", summary.cold);
+        span.record("overruled", summary.overruled);
+        span.record("unmatched", summary.unmatched);
+        self.layout.order = Some(Some(order));
     }
 
     /// A dev run's reservations, in address order ([`reservations`]).
@@ -495,12 +551,21 @@ impl<'a> Stage<'a> {
         {
             let symbols: &Symbols = self.symbols;
             let state = &self.new;
+            let order = self.layout.order.as_ref().and_then(Option::as_ref);
             par::for_each(par::enumerate(&mut groups), |(class, ids)| {
                 if iat.is_some_and(|it| it.0 as usize == class) {
                     return;
                 }
                 let mut entries: Vec<Entry> = Vec::with_capacity(ids.len());
-                entries.extend(ids.iter().map(|id| Entry::of(symbols, state.piece(*id).expect("live"), NOT_IAT)));
+                entries.extend(ids.iter().map(|id| {
+                    let piece = state.piece(*id).expect("live");
+                    let mut entry = Entry::of(symbols, piece, NOT_IAT);
+                    // A function's link-line order is none (`u32::MAX`): the profile's in its place.
+                    if let (Some(order), Some(function)) = (order, piece.function()) {
+                        entry.key[2] = order.key(function.key);
+                    }
+                    entry
+                }));
                 sort_entries(symbols, &mut entries);
                 ids.clear();
                 ids.extend(entries.iter().map(|it| it.id));

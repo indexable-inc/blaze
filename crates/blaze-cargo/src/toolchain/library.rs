@@ -21,7 +21,6 @@
 use std::{
     io::Read as _,
     path::{Path, PathBuf},
-    sync::OnceLock,
     time::Duration,
 };
 
@@ -88,10 +87,18 @@ impl Library {
     }
 }
 
-static FOUND: OnceLock<Result<Library, String>> = OnceLock::new();
+#[expect(
+    clippy::disallowed_types,
+    reason = "where this blaze's standard library is: looked for on disk once, then fixed for the process"
+)]
+static FOUND: std::sync::OnceLock<Result<Library, String>> = std::sync::OnceLock::new();
 
 /// What [`fetch`] downloaded, when the library was not found before.
-static FETCHED: OnceLock<Library> = OnceLock::new();
+#[expect(
+    clippy::disallowed_types,
+    reason = "the standard library this process fetched, once, then fixed for the process"
+)]
+static FETCHED: std::sync::OnceLock<Library> = std::sync::OnceLock::new();
 
 /// Where the library is, found with nothing fetched (or fetched by this process); `Err` says
 /// why there is none.

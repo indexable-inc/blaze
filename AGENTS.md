@@ -57,14 +57,16 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
    `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer
    lifetimes use the request, revision or image allocator. A global allocation (`Vec::new`,
    `vec![]`, `collect` into a heap `Vec`, `Box::new`, `to_owned`) needs `// alloc: <why>` on its
-   line. `blaze::hot_alloc` enforces this wherever `blaze::hot` is denied. See
+   line. `blaze::implicit_allocator` enforces this, warning everywhere and denied wherever
+   `blaze::hot` is, with `blaze::hot_alloc` for what a call reaches. See
    [docs/v2/plan/design/memory.md](docs/v2/plan/design/memory.md).
 10. **standard-structures**: One choice per need, never a hand-rolled or std stand-in: locks are
     `parking_lot::{Mutex, RwLock}`, held only for a field update and never across a query call; a
-    shared map is `papaya::HashMap`; a single-owner map or set is `blaze_hash::{HashMap, HashSet}`
-    (foldhash with a fixed seed), with `blaze_hash::KeyHasher` for keys that are already content
-    hashes and `blaze_hash::Blake3Hasher` for persisted content IDs; results of parallel items come
-    back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is
+    shared map is `papaya::HashMap`; a single-owner map or set is `blaze_hash::{HashMap<K, V, A>,
+    HashSet<K, A>}` (foldhash with a fixed seed, its allocator named: a frame's for a task, `Global`
+    with a reason otherwise), with `blaze_hash::KeyHasher` for keys that are already content hashes
+    and `blaze_hash::Blake3Hasher` for persisted content IDs; results of parallel items come back
+    from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is
     `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag
     is an atomic. On a pool thread or fiber, a wait goes through the scheduler (a key, a counter, a
     job), never a `Condvar`, a channel receive, `thread::sleep` or a raw `spin_loop`; elsewhere a
@@ -150,8 +152,8 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
     new`, `ix shell`, `ix rm`), never on the Mac or AWS. Where an ix VM can't do it, stop and say
     what is missing. See
     [docs/contributing.md#working-in-parallel](docs/contributing.md#working-in-parallel).
-29. **worktree-per-lane**: One uniquely named worktree per lane with its own `CARGO_TARGET_DIR`; never
-    `git stash`.
+29. **worktree-per-lane**: One uniquely named worktree per lane; its build directory is its own under
+    blaze's root, never in the checkout, so it needs no `CARGO_TARGET_DIR`; never `git stash`.
 30. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
     "what the branch does"` opens it, turns on auto-merge and waits for the merge gate (`--wait`
     resumes). Harnesses run after merge in the release train. Never push to main. See
@@ -159,8 +161,8 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
 31. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
     conflicts, fix its gate, finish a draft) rather than hand it back; tell the owning lane what
     changed. Close one only when it is wrong, saying why.
-32. **clean-up-lane**: When a lane is done, delete its worktree, target directory, ix VM and merged
-    branch.
+32. **clean-up-lane**: When a lane is done, delete its build directory (`blaze clean`), worktree, ix VM
+    and merged branch.
 33. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
     `Co-authored-by: Name <id+login@users.noreply.github.com>` trailer for each of them and says
     where it came from. See [docs/contributing.md#credit](docs/contributing.md#credit).

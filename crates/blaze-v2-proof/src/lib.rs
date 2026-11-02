@@ -16,9 +16,19 @@
 //!   what it read before and came out as before is work for nothing; it is measured and
 //!   budgeted.
 //! - [`apart`]: where two maps differ, for the codegen inputs (each `InstanceKey` with its
-//!   `CodeHash`) and the output files.
-//! - [`Rng`] and [`sample`]: the seeded choice of what to check when not everything is.
-//! - [`bytes`]: where two outputs first differ, by SIMD chosen at run time.
+//!   `CodeHash`), the kernel's entries (each instance with the key its entry is kept under) and
+//!   the output files.
+//! - [`kernel`]: the kernel's entries as rows of a [`Trace`] (blaze-kernel, docs/v2/plan/lanes/kernel.md):
+//!   an entry is a result keyed by its step and identity, its value's hash its fingerprint, the
+//!   reads it recorded its edges; so [`under`] names the stale entry and the read it missed as
+//!   it names a query.
+//! - [`bytes`]: where two output files first differ, mapped, across cores; a slice by
+//!   [`blaze_store_check::bytes`], the one byte comparison.
+//!
+//! Who owns what: this crate compares two builds' records (offline, in the oracle and in the
+//! edit fuzzer of `hir-ty-codegen/v2/edits.rs`). `blaze-store-check` holds what runs inside a build
+//! (the store check `BLAZE_VERIFY_STORE`) and the two pieces both share, the sampler
+//! ([`blaze_store_check::Setting::sampled`]) and the byte comparison ([`blaze_store_check::bytes`]).
 //! - [`columns`]: the exact round trip every column encoding must make.
 //! - [`join`]: [`under`] and [`over`] across cores, on owned traces or on [`wire::View`]s read in place.
 //! - [`wire`]: a trace as a file, one byte string per column, read in place by [`wire::View`].
@@ -36,6 +46,7 @@ pub mod bytes;
 pub mod columns;
 pub mod dbsp;
 pub mod join;
+pub mod kernel;
 pub mod nameres;
 pub mod tree;
 pub mod wire;
@@ -46,7 +57,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::collections::BTreeMap;
 
-use blaze_ids::{Fingerprint, bits::BitSet, radix};
+use blaze_ids::{Fingerprint, bits::BitSet};
 use blaze_query::{Edge, Memo, QueryKey};
 use serde::{Deserialize, Serialize};
 
@@ -469,27 +480,9 @@ pub fn apart<K: Ord + Clone, V: PartialEq + Clone>(
     }
 }
 
-/// SplitMix64: the same numbers from the same seed on every machine.
+/// SplitMix64: the same numbers from the same seed on every machine, for the cases the tests
+/// draw. What a check samples is [`blaze_store_check::Setting::sampled`]'s, the one sampler.
 pub use blaze_ids::rng::SplitMix64 as Rng;
-
-/// `n` of `items` chosen by `seed` (all of them when there are no more), in their order.
-pub fn sample<T: Clone>(items: &[T], n: usize, seed: u64) -> Vec<T> {
-    if n >= items.len() {
-        // alloc: the answer, once a sample: every item when there are no more.
-        return items.to_vec();
-    }
-    let mut rng = Rng::new(seed);
-    // alloc: once a sample, the partial shuffle's indices.
-    let mut at: Vec<usize> = (0..items.len()).collect();
-    for i in 0..n {
-        let j = i + rng.below((items.len() - i) as u64) as usize;
-        at.swap(i, j);
-    }
-    at.truncate(n);
-    radix::sort(&mut at);
-    // clone: the answer, the chosen items, once a sample.
-    at.iter().map(|&i| items[i].clone()).collect()
-}
 
 #[cfg(test)]
 mod tests;

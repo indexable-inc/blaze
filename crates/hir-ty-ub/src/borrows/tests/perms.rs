@@ -2,6 +2,7 @@
 //! `foreign_access_skipping.rs`, `test_order`.
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 
 use crate::{
     borrows::{
@@ -145,7 +146,7 @@ fn permission_sifa_is_correct() {
 /// The order on `PermissionPriv` is reachability by transitions.
 #[test]
 fn permissionpriv_partialord_is_reachability() {
-    let mut reach = HashSet::default();
+    let mut reach = HashSet::new_in(Global);
     for start in PermissionPriv::exhaustive() {
         reach.insert((start, start));
         for (access, rel) in <(AccessKind, AccessRelatedness)>::exhaustive() {

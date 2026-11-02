@@ -2,9 +2,12 @@
 //! its lines, the versions each kind of query is offered, offline, and the lock file's
 //! versions read with no update.
 
+#![feature(allocator_api)]
+
 use std::{path::PathBuf, pin::pin, sync::Arc, task::Poll};
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_registry::{
     Context, IndexRegistry, SourceConfig, SourceDef, Sources,
     http::{Http, Response},
@@ -19,7 +22,7 @@ const BASE: &str = "https://index.example.com/";
 
 #[derive(Default)]
 struct Server {
-    files: Mutex<HashMap<String, Vec<u8>>>,
+    files: Mutex<HashMap<String, Vec<u8>, Global>>,
     asked: Mutex<Vec<String>>,
 }
 

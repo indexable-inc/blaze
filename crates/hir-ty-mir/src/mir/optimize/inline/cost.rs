@@ -235,7 +235,11 @@ pub(super) fn cost(
                     penalty += landing_pad(cleanup);
                 }
             }
-            TerminatorKind::TailCall { .. } => return None,
+            // Not inlined: a `for const` loop is expanded once its own body's arguments are
+            // known, which the caller's monomorphization does not do for an inlined copy.
+            TerminatorKind::TailCall { .. }
+            | TerminatorKind::ComptimeFor { .. }
+            | TerminatorKind::ComptimeNext { .. } => return None,
             TerminatorKind::UnwindResume => penalty += RESUME_PENALTY,
             TerminatorKind::Unreachable => bonus += INSTR_COST,
             TerminatorKind::Goto { .. }

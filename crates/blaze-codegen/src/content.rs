@@ -92,7 +92,9 @@ pub(crate) fn profiled_into(hasher: &mut Hasher, profiled: Option<&Profiled>) {
             hasher.update(&record.hash.to_le_bytes()).update(&record.counters.to_le_bytes());
             hasher.update(&record.version.to_le_bytes())
         }
-        Some(Profiled::Used { mismatched }) => hasher.update(&[2, u8::from(*mismatched)]),
+        Some(Profiled::Used { mismatched, applied }) => {
+            hasher.update(&[2, u8::from(*mismatched) | u8::from(*applied) << 1])
+        }
     };
 }
 
@@ -329,8 +331,9 @@ mod tests {
             code_id(&profiled(Profiled::Counted(crate::ProfileRecord { hash: 8, ..record }))),
             code_id(&profiled(Profiled::Counted(crate::ProfileRecord { name: [4; 16], ..record }))),
             code_id(&profiled(Profiled::Counted(crate::ProfileRecord { counters: 3, ..record }))),
-            code_id(&profiled(Profiled::Used { mismatched: false })),
-            code_id(&profiled(Profiled::Used { mismatched: true })),
+            code_id(&profiled(Profiled::Used { mismatched: false, applied: false })),
+            code_id(&profiled(Profiled::Used { mismatched: true, applied: false })),
+            code_id(&profiled(Profiled::Used { mismatched: false, applied: true })),
         ];
         let distinct: std::collections::BTreeSet<ContentId> = ids.iter().copied().collect();
         assert_eq!(distinct.len(), ids.len());

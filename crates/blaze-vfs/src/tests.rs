@@ -5,6 +5,7 @@ use blaze_core::{
     sim::{Faults, Rng, Sim},
 };
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 
 use crate::{
@@ -1041,15 +1042,15 @@ fn journal_run(seed: u64) {
     let mut effects = Vec::new();
     let mut done = Vec::new();
     // Each head move's sequence number, and the head and files it moved to.
-    let mut moves: HashMap<u64, (String, BTreeMap<String, Vec<u8>>)> = HashMap::default();
+    let mut moves: HashMap<u64, (String, BTreeMap<String, Vec<u8>>), Global> = HashMap::new_in(Global);
     // Each ticket's head, sequence and whether it removed the head.
-    let mut tickets: HashMap<Ticket, (String, u64, bool)> = HashMap::default();
+    let mut tickets: HashMap<Ticket, (String, u64, bool), Global> = HashMap::new_in(Global);
     // By head: the latest record acknowledged durable, and whether it was a removal.
-    let mut acknowledged: HashMap<String, (u64, bool)> = HashMap::default();
+    let mut acknowledged: HashMap<String, (u64, bool), Global> = HashMap::new_in(Global);
     // By head: the sequence of each removal, acknowledged or not. A crash keeps a random prefix
     // of what was appended and not synced, so an unacknowledged removal can survive one while
     // a later one of the same head (after it was made again) is cut.
-    let mut removed: HashMap<String, Vec<u64>> = HashMap::default();
+    let mut removed: HashMap<String, Vec<u64>, Global> = HashMap::new_in(Global);
     let mut old_bases: Vec<ContentId> = Vec::new();
 
     for step in 0..300 {

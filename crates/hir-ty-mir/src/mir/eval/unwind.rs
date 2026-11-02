@@ -114,7 +114,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if self.limits_frames {
             return None;
         }
-        *self.panic_handler.get_or_init(|| panic_handler(self.db, self.crate_id))
+        panic_handler(self.db, self.crate_id)
     }
 
     /// The frames of [`Self::code_stack`] a panic's error names, innermost first.
@@ -302,7 +302,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 self.write_memory(text, message.as_bytes())?;
                 let boxed = self.allocate(2 * size, size, Origin::Allocator, false)?;
                 self.write_pointer(boxed, text)?;
-                self.write_memory(boxed.offset(size), &word_bytes(message.len()))?;
+                self.write_memory(boxed.offset(size), &word_bytes(message.len(), self.cached_ptr_size))?;
                 let str_ty = Ty::new(self.interner(), TyKind::Str);
                 let static_str = Ty::new_ref(
                     self.interner(),
@@ -315,7 +315,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         };
         let cell = self.heap_allocate(2 * size, size)?;
         self.write_pointer(cell, data)?;
-        self.write_memory(cell.offset(size), &word_bytes(vtable))?;
+        self.write_memory(cell.offset(size), &word_bytes(vtable, self.cached_ptr_size))?;
         Ok(cell)
     }
 
@@ -336,7 +336,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             not_supported!("catch_unwind called by the evaluator itself");
         }
         let data = self.read_pointer(data.interval.addr)?;
-        let catch_fn = from_bytes!(usize, self.read_scalar(catch_fn.interval)?);
+        let catch_fn = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(catch_fn.interval)?);
         destination.write_from_bytes(self, &0i32.to_le_bytes())?;
         self.moved_args.clear();
         let unit = Interval::new(Address::invalid(1), 0);
@@ -401,7 +401,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     span,
                 )?;
                 let data = self.read_pointer(boxed)?;
-                let vtable = from_bytes!(usize, self.read_scalar(Interval::new(boxed.offset(size), size))?);
+                let vtable = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(Interval::new(boxed.offset(size), size))?);
                 let message = self.payload_message(data, vtable)?;
                 let payload = Payload::Boxed { data, vtable };
                 self.unwinding = Some(Unwinding { payload, error: None, trace: Vec::new() }); // alloc: empty, allocates nothing
@@ -434,7 +434,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         {
             let size = self.ptr_size();
             let text = self.read_pointer(data)?;
-            let len = from_bytes!(usize, self.read_scalar(Interval::new(data.offset(size), size))?);
+            let len = from_bytes!(usize, self.cached_ptr_size, self.read_scalar(Interval::new(data.offset(size), size))?);
             let bytes = self.read_memory(text, len)?;
             return Ok(String::from_utf8_lossy(bytes).into_owned()); // alloc: a panic's message, error path
         }
@@ -455,7 +455,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, Option<StackFrame<'db>>> {
         let size = self.ptr_size();
         let func_cell = self.heap_allocate(size, size)?;
-        self.write_memory(func_cell, &word_bytes(func))?;
+        self.write_memory(func_cell, &word_bytes(func, self.cached_ptr_size))?;
         let args = args.iter().map(|&it| self.byte_pointer_arg(it)).collect::<Result<'db, Vec<_>>>()?;
         let locals = Locals { ptr: ArenaMap::new(), body };
         self.exec_fn_pointer(Interval::new(func_cell, size), destination, &args, &locals, then, span)

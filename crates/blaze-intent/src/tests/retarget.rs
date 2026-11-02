@@ -46,7 +46,8 @@ fn retargeted(main: &str) -> Result<String, String> {
             .then(|| format!("parking_lot::{}", name.as_str()))
     };
     let resolve = |path| names_in(&sema, path);
-    let retarget = Retarget { db: &db, resolve: &resolve, to: &to };
+    let carries = |_: &str, _: ModuleDef| false;
+    let retarget = Retarget { db: &db, resolve: &resolve, to: &to, carries: &carries };
     let rewrites = retarget.file(root)?;
     let mut text = root.text().to_owned();
     for Rewrite { range, text: insert } in rewrites.iter().rev() {
@@ -70,7 +71,7 @@ fn crates_named(main: &str) -> Vec<String> {
         if !matches!(name.text(), "Mutex" | "RwLock" | "Condvar" | "M") {
             continue;
         }
-        let [ty, value] = names_in(&sema, path);
+        let [ty, value, _] = names_in(&sema, path);
         let krate = ty
             .or(value)
             .and_then(|it| it.module(&db))

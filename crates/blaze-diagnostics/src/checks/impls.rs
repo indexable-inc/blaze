@@ -19,6 +19,7 @@ mod builtin;
 mod compare;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use hir_def::{BuiltinDeriveImplId, attrs::AttrFlags, lang_item::lang_items};
@@ -91,7 +92,7 @@ pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
     // rustc's `local_trait_impls`: the traits in the order their first impl is written, each
     // impl's trait by its place among them (one probe per impl), and the impls of each trait
     // as a CSR list in impl order, all in the check's frame.
-    let mut slots: HashMap<hir::Trait, u32> = HashMap::default();
+    let mut slots: HashMap<hir::Trait, u32, Global> = HashMap::new_in(Global);
     let mut traits: Vec<hir::Trait, _> = Vec::new_in(frame);
     let mut of_impl: Vec<Option<u32>, _> = Vec::with_capacity_in(impls.len(), frame);
     for (impl_, _) in &impls {

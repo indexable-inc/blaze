@@ -1,0 +1,35 @@
+{
+  "id": "01556",
+  "from_lane": "cargo",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/observe.rs"
+  ],
+  "what": "From the Lead via coord-1030: two blaze serve processes over one profile history (pids 52479 and 89279) both wrote build id 48. History::open numbers builds from the files already there, so two writers pick the same next id. Fix: keep_history claims the history first, with an exclusive lock on <history>/owner.lock holding the daemon pid. The lock is held on the blaze-history thread until its last flush is written. A second claimant fails blaze serve with Claim::Owned naming the history directory and the holder pid. Test: serve::observe::tests::a_history_has_one_writer_and_a_second_claimant_is_told_who.",
+  "state": "applied",
+  "created": "2026-11-02T03:49:55Z",
+  "updated": "2026-11-02T03:49:55Z",
+  "taken_by": "cargo",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T03:49:55Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-02T03:49:55Z",
+      "by": "cargo",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-11-02T03:49:55Z",
+      "by": "cargo",
+      "action": "done",
+      "note": "observe.rs claim() and the test; rust-analyzer clean; unbuilt."
+    }
+  ]
+}

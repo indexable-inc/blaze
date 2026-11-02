@@ -1,6 +1,6 @@
 [package]
 name = "hir-ty-share"
-description = "Which generic instances compile to one body: a key of everything an instance's code depends on beyond the layouts of its arguments"
+description = "The building blocks of compile identity: a type's fact (its layout and shape), the identity of types and constants by content, a body's code, a drop's key and the intrinsics' classes"
 publish = false
 
 version.workspace = true
@@ -15,10 +15,9 @@ doctest = false
 
 [dependencies]
 blaze-hash.workspace = true
-either.workspace = true
 blaze-query.workspace = true
 smallvec.workspace = true
-parking_lot.workspace = true
+stdx.workspace = true
 
 rustc_abi.workspace = true
 rustc_type_ir.workspace = true
@@ -27,13 +26,11 @@ base-db.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
 hir-ty-mir.workspace = true
-stdx.workspace = true
 
 blaze-ids.workspace = true
 blaze-items.workspace = true
 
 [dev-dependencies]
-blaze-alloc-count.workspace = true
 hegeltest.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 

@@ -908,8 +908,7 @@ mod tests {
     fn put(what: &str) -> proc_macro_api::kept::Put {
         let id = ContentId::of("blaze-cargo plane test put", what.as_bytes());
         proc_macro_api::kept::Put {
-            run: RunKey { code: id, given: id },
-            traced: Traced::default(),
+            keep: proc_macro_api::kept::Keep::Run { run: RunKey { code: id, given: id }, traced: Traced::default() },
             value: what.as_bytes().to_vec(),
             what: what.to_owned(),
         }
@@ -1078,6 +1077,56 @@ mod tests {
         plane.ended(Duration::from_millis(5), looped, Outcome::Built);
         let last = observed.lock().last().copied();
         assert_eq!(last, Some((loops::SCRIPT_RUN, None, 5_000_000, 0)));
+    }
+
+    /// Many programs built at once (the 211 test binaries of a `blaze test --workspace`) run
+    /// on the process's one worker pool, their own parallel work too: the threads that ran
+    /// them are that pool's workers and no more, however many programs there are. In the
+    /// released engine each program's build made a pool of its own, and 211 of them at once
+    /// ran past macOS's per-process thread limit (1,150 "failed to spawn thread" panics).
+    #[test]
+    fn programs_built_at_once_share_the_one_pool_whatever_their_count() {
+        const PROGRAMS: u32 = 256;
+        let pool = blaze_graph::exec::shared().workers();
+        let config = PlaneConfig { io: 1, work: pool, budget: None, starve_after: 8 };
+        let history = blaze_history::History::new(blaze_history::Config::default());
+        let mut plane = Plane::new(config, history, Runner::Threads(Threads::new(1, pool))).unwrap();
+        let ran_on: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let work = Each({
+            let ran_on = Arc::clone(&ran_on);
+            move |arg| {
+                // A program's build is parallel inside, as codegen and the linker are.
+                let names = blaze_graph::par::map(0..64usize, |_| {
+                    std::thread::current().name().unwrap_or("a thread with no name").to_owned()
+                });
+                let mut ran_on = ran_on.lock();
+                ran_on.extend(names);
+                ran_on.push(std::thread::current().name().unwrap_or("a thread with no name").to_owned());
+                built(arg)
+            }
+        });
+        let request = plane.open(Duration::ZERO, true, false);
+        let names: Vec<String> = (0..PROGRAMS).map(|it| format!("program {it}")).collect();
+        let mut fresh = plane.fresh(PROGRAMS, names.iter().map(String::len).sum(), 0);
+        let ids: Vec<NodeId> = (0..PROGRAMS)
+            .map(|at| {
+                let node = NodeRef { kind: NodeKind::Codegen, name: &names[at as usize], deps: &[], pool: Pool::Work, cost: 1, key: None, memory: 0 };
+                plane.push(&mut fresh, node, Task::Thread { kind: kinds::COMPILE, arg: at })
+            })
+            .collect();
+        plane.add(Duration::ZERO, request, fresh, Some(work), false).unwrap();
+        let settled = settle(&mut plane, &ids);
+        assert!(settled.iter().all(|it| it.1), "every program builds: {settled:?}");
+
+        let mut threads = std::mem::take(&mut *ran_on.lock());
+        assert_eq!(threads.len(), PROGRAMS as usize * 65, "every program and its parallel work ran");
+        threads.sort_unstable();
+        threads.dedup();
+        assert!(
+            threads.iter().all(|it| it.starts_with("blaze-work-")),
+            "only the pool's workers ran the programs: {threads:?}"
+        );
+        assert!(threads.len() <= pool, "{} threads ran {PROGRAMS} programs, past the pool's {pool}", threads.len());
     }
 
     /// Runs `plane` until each of `ids` settled, saying which did well.

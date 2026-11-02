@@ -15,6 +15,7 @@
 use std::hash::BuildHasher;
 
 use blaze_hash::{FixedState, HashMap};
+use std::alloc::Global;
 use blaze_mem::Frame;
 use hashbrown::HashTable;
 use hir::{HirFileId, InFile};
@@ -39,7 +40,7 @@ use crate::cx::Cx;
 /// The index's table lives in the check's frame and goes with it.
 pub(super) struct Index<'a, 'b, 'db> {
     cx: &'a Cx<'b, 'db>,
-    staged: HashMap<hir::Crate, bool>,
+    staged: HashMap<hir::Crate, bool, Global>,
     enabled: HashTable<(Symbol, bool), &'b Frame>,
     /// `RustcVersion::CURRENT` of this crate's graph; none when it names no toolchain.
     pub(super) current: Option<RustcVersion>,
@@ -49,7 +50,7 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
     pub(super) fn new(cx: &'a Cx<'b, 'db>) -> Self {
         Index {
             cx,
-            staged: HashMap::default(),
+            staged: HashMap::new_in(Global),
             enabled: HashTable::new_in(cx.frame()),
             current: RustcVersion::current(cx.db, cx.krate.base()),
         }
@@ -160,9 +161,17 @@ fn enabled_in(cx: &Cx<'_, '_>, enabled: &mut HashTable<(Symbol, bool), &Frame>, 
 /// token comes from is defined with `#[allow_internal_unstable(feature)]`. A builtin macro's
 /// expansion is its own, not the one rustc checks with the features its definition allows,
 /// so it may use any.
+///
+/// The module blaze appends to a crate root (a test harness, a wasm proc macro's glue:
+/// `FileText::appended_root_module`) is the compiler's own code, as rustc's injected harness
+/// and proc-macro declarations are, whose spans rustc marks with the internal features they
+/// use (`test`, `proc_macro_internals`): a use in it may use any.
 fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange, feature: &Symbol) -> bool {
     use hir_expand::MacroDefKind;
     let db = cx.db;
+    if in_appended(cx, file, range) {
+        return true;
+    }
     let ctxt = file.span_map(db).span_for_range(range).ctx;
     let Some(call) = ctxt.outer_expn(db) else { return false };
     let def = hir_expand::MacroCallId::from(call).loc(db).def;
@@ -178,4 +187,16 @@ fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange, feature: 
         | MacroDefKind::UnimplementedBuiltIn(..) => return true,
     };
     attr::allows_internal_unstable(node, hir::Crate::from(def.krate).cfg(db), feature)
+}
+
+/// Whether `range` of `file` is in the module the compiler appended to the crate root `file`
+/// is: the root's last item, a module of that name ([`allows_unstable`]).
+fn in_appended(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) -> bool {
+    use syntax::view::{self as ast, HasModuleItem as _, HasName as _};
+    let db = cx.db;
+    let Some(real) = file.file_id() else { return false };
+    let Some(name) = db.file_text(real.file_id(db)).appended_root_module(db) else { return false };
+    let Some(root) = ast::SourceFile::cast(cx.root(file)) else { return false };
+    let Some(ast::Item::Module(module)) = root.items().last() else { return false };
+    module.name().is_some_and(|it| it.text() == name) && module.syntax().text_range().contains_range(range)
 }

@@ -7,7 +7,7 @@ use std::{
     future::Future,
     io::Read,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -271,7 +271,11 @@ impl HyperHttp {
 
     /// One shared by the whole process, with cargo's default timeout of 30 seconds.
     pub fn shared() -> anyhow::Result<Arc<HyperHttp>> {
-        static SHARED: OnceLock<Result<Arc<HyperHttp>, String>> = OnceLock::new();
+        #[expect(
+            clippy::disallowed_types,
+            reason = "the process's one HTTP client: its runtime and connection pool are shared by every fetch"
+        )]
+        static SHARED: std::sync::OnceLock<Result<Arc<HyperHttp>, String>> = std::sync::OnceLock::new();
         let shared = SHARED.get_or_init(|| {
             HyperHttp::new(Duration::from_secs(30)).map(Arc::new).map_err(|e| format!("{e:#}"))
         });

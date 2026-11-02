@@ -1,7 +1,5 @@
 //! Item signature IR definitions
 
-use std::cell::LazyCell;
-
 use base_db::{Db, EditionedFileId};
 use bitflags::bitflags;
 use blaze_ids::bits::Bits;
@@ -787,6 +785,9 @@ bitflags! {
         const HAS_UNSAFE_FIELDS = 1 << 11;
         /// Indicates whether this struct is `FieldRepresentingType` (`field_projections`).
         const IS_FIELD_REPRESENTING_TYPE = 1 << 12;
+        /// `#[blaze::bits]`: a bit-packed struct, laid out as its backing integer, its fields
+        /// at bit offsets (`hir_ty::layout::bits_layout`).
+        const IS_BLAZE_BITS = 1 << 13;
     }
 }
 
@@ -824,6 +825,7 @@ impl StructFlags {
             HAS_REPR => HAS_REPR,
             RUSTC_HAS_INCOHERENT_INHERENT_IMPLS => RUSTC_HAS_INCOHERENT_INHERENT_IMPLS,
             FUNDAMENTAL => FUNDAMENTAL,
+            BLAZE_BITS => IS_BLAZE_BITS,
         })
     }
 
@@ -1256,6 +1258,17 @@ bitflags::bitflags! {
         const CONST = 1 << 10;
         /// `#[rustc_deny_explicit_impl]`: no impl of the trait may be written.
         const DENY_EXPLICIT_IMPL = 1 << 11;
+        /// `#[rustc_specialization_trait]` or `#[blaze::specialization_trait]`: rustc's
+        /// `TraitSpecializationKind::AlwaysApplicable`. An impl may specialize on the trait, and
+        /// each impl of it is checked as always applicable.
+        const SPECIALIZATION_ALWAYS_APPLICABLE = 1 << 12;
+        /// `#[rustc_unsafe_specialization_marker]`: rustc's `TraitSpecializationKind::Marker`, a
+        /// trait `min_specialization` lets an impl specialize on without checking its impls;
+        /// blaze's sound subset refuses it.
+        const SPECIALIZATION_UNSAFE_MARKER = 1 << 13;
+        /// `#[blaze::specialization_trait]`: the always-applicable kind came from blaze's
+        /// extension, so its impls are held to blaze's rules in every crate.
+        const BLAZE_SPECIALIZATION_TRAIT = 1 << 14;
     }
 }
 
@@ -1269,6 +1282,10 @@ impl TraitFlags {
             RUSTC_SKIP_ARRAY_DURING_METHOD_DISPATCH => SKIP_ARRAY_DURING_METHOD_DISPATCH,
             RUSTC_SKIP_BOXED_SLICE_DURING_METHOD_DISPATCH => SKIP_BOXED_SLICE_DURING_METHOD_DISPATCH,
             RUSTC_DENY_EXPLICIT_IMPL => DENY_EXPLICIT_IMPL,
+            RUSTC_SPECIALIZATION_TRAIT => SPECIALIZATION_ALWAYS_APPLICABLE,
+            BLAZE_SPECIALIZATION_TRAIT => SPECIALIZATION_ALWAYS_APPLICABLE,
+            RUSTC_UNSAFE_SPECIALIZATION_MARKER => SPECIALIZATION_UNSAFE_MARKER,
+            BLAZE_SPECIALIZATION_TRAIT => BLAZE_SPECIALIZATION_TRAIT,
         })
     }
 }
@@ -1819,8 +1836,9 @@ fn lower_fields<'t, Field: ast::HasAttrs<'t> + ast::HasVisibility<'t> + Copy>(
     let mut col =
         ExprCollector::with_maps(db, module, fields.file_id, crate::LoweringMode::Analysis, maps);
     col.set_lowering(lowering);
+    #[expect(clippy::disallowed_types, reason = "override visibility, set once per signature lowering: not global")]
     let override_visibility = override_visibility.map(|vis| {
-        LazyCell::new(move || {
+        std::cell::LazyCell::new(move || {
             let span_map = match maps {
                 Some((span_map, _)) => SpanMap::RealSpanMap(span_map),
                 None => fields.file_id.span_map(db),
@@ -2097,6 +2115,9 @@ mod tests {
         if attrs.contains(AttrFlags::HAS_REPR) {
             flags |= StructFlags::HAS_REPR;
         }
+        if attrs.contains(AttrFlags::BLAZE_BITS) {
+            flags |= StructFlags::IS_BLAZE_BITS;
+        }
         flags
     }
 
@@ -2136,6 +2157,17 @@ mod tests {
         }
         if attrs.contains(AttrFlags::RUSTC_DENY_EXPLICIT_IMPL) {
             flags |= TraitFlags::DENY_EXPLICIT_IMPL;
+        }
+        if attrs.intersects(
+            AttrFlags::RUSTC_SPECIALIZATION_TRAIT | AttrFlags::BLAZE_SPECIALIZATION_TRAIT,
+        ) {
+            flags |= TraitFlags::SPECIALIZATION_ALWAYS_APPLICABLE;
+        }
+        if attrs.contains(AttrFlags::RUSTC_UNSAFE_SPECIALIZATION_MARKER) {
+            flags |= TraitFlags::SPECIALIZATION_UNSAFE_MARKER;
+        }
+        if attrs.contains(AttrFlags::BLAZE_SPECIALIZATION_TRAIT) {
+            flags |= TraitFlags::BLAZE_SPECIALIZATION_TRAIT;
         }
         flags
     }

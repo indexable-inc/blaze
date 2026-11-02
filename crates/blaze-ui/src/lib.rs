@@ -10,12 +10,15 @@
 //! - [`Plain`], elsewhere (CI, a pipe): one line per step and crate, as cargo writes them,
 //!   and a line every [`HEARTBEAT_NS`] that nothing else was said.
 //! - [`api`]: the agent API's responses, for a client of it to print.
+//! - [`test_view`]: `blaze test`'s live view, a ratatui buffer drawn from what the build
+//!   and the test executables say, for the command's inline viewport.
 //!
 //! A record costs what it changes: [`Build`] keeps indexes and counts as records come (no
 //! scan of every crate, node or step), and the renderers write into one buffer each, with no
 //! `String` per line.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 /// `write!` into a `String`, which cannot fail.
 macro_rules! put {
@@ -27,8 +30,10 @@ macro_rules! put {
 pub mod api;
 mod live;
 mod plain;
+pub mod test_view;
 #[cfg(test)]
 mod tests;
+pub mod why;
 
 #[cfg(test)]
 #[global_allocator]
@@ -41,6 +46,7 @@ use std::fmt::{self, Write as _};
 use std::hash::BuildHasher;
 
 use blaze_hash::{FixedState, HashMap};
+use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_protocol::events::{
     Cache, Cause, CrateState, Event, Fns, Level, NodeBatch, NodeKind, NodeState, Order, Record,
@@ -111,7 +117,7 @@ struct Index {
     /// and one compare of names a lookup, the name kept once, in its row.
     rows: HashTable<u32>,
     /// The index in [`Build::graph`] of the node said last with each id.
-    nodes: HashMap<u32, u32>,
+    nodes: HashMap<u32, u32, Global>,
     /// The steps under way, by index in [`Build::steps`], in the order they began.
     open: Vec<u32>,
     /// Each kind of step begun, in the order it first began ([`Build::strip_into`]).

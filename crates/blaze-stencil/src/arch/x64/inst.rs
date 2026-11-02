@@ -456,14 +456,21 @@ fn call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     .map_err(blame(inst))
 }
 
-/// `return_call` and `return_call_indirect` from a `tail` function to one (the frame's layout
-/// checked both), as Cranelift's `gen_call_args` (`is_tail_call`) and
-/// `emit_return_call_common_sequence` write them: the stack arguments into the top of the
-/// incoming argument area (`IncomingArg`, `pop` bytes above the saved `rbp` and return
-/// address), the callee to `r11`, the register arguments, the frame popped, the return
-/// address moved up to below the new arguments and `rsp` with it, then the jump. Every slot is
-/// read before the restores give `r12` back; the incoming area holds nothing the function
-/// still reads, its own stack arguments copied to slots by the prologue.
+/// `return_call` and `return_call_indirect` (the frame's layout checked each), as Cranelift's
+/// `gen_call_args` (`is_tail_call`) and `emit_return_call_common_sequence` write them: the
+/// stack arguments into the incoming argument area, the callee to `r11`, the register
+/// arguments, the frame popped as a `return` pops it, then the jump. From a `tail` function
+/// the arguments go into the top of the area (`IncomingArg`, `pop` bytes above the saved `rbp`
+/// and return address), and the return address is moved up to below them and `rsp` with it.
+/// From a System V or Windows function (`become` in the target's convention) they go where
+/// the function's own caller put its own, which that caller pops, and the return address
+/// stays: a forwarded StructArgument is already in place and is not touched.
+///
+/// No argument's move reads what another's wrote: every source is a slot (below the saved
+/// `rbp`) or a constant, every destination is above the return address or a register, and
+/// the incoming area holds nothing the function still reads, its own stack arguments copied
+/// to slots by the prologue. Every slot is read before the restores give `r12` back; `r11`
+/// is neither an argument register nor callee-saved in either convention.
 fn return_call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     let func = cx.func;
     let (callee, sig_ref, args) = call_of(func, inst)?;
@@ -472,8 +479,13 @@ fn return_call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
         return Err(Error::at(inst, "a return call with other arguments than its signature's"));
     }
     let frame = *cx.frame;
+    let tail = func.signature.call_conv == CallConv::Tail;
     let new = abi::stack_args(sig).map_err(blame(inst))?;
-    let base = 16 + frame.pop as i32 - new as i32;
+    let (base, shrink) = if tail {
+        (16 + frame.pop as i32 - new as i32, frame.pop - new)
+    } else {
+        (16, 0)
+    };
     let to = |at_: u32| at(RBP, base + at_ as i32);
 
     abi::args(sig, |i, param, place| {
@@ -497,6 +509,8 @@ fn return_call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
                     }
                 }
             }
+            // The caller's own, where its caller copied it (the frame's layout checked).
+            Place::Struct { .. } if !tail => {}
             Place::Struct { .. } | Place::Implicit { .. } => {
                 return Err(Error::at(inst, "a tail call's argument copied to the stack"));
             }
@@ -544,7 +558,6 @@ fn return_call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
         let (buf, side) = (&mut *cx.buf, &mut *cx.side);
         frame::unframe(buf, &mut |at, rule| side.rule(at, rule), &frame);
     }
-    let shrink = frame.pop - new;
     if shrink > 0 {
         asm::load(cx.buf, R10, at(RSP, 0));
         asm::store(cx.buf, at(RSP, shrink as i32), R10);

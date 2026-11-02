@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use base_db::{Crate, CrateOrigin, Db};
 use blaze_codegen::{
-    CodegenError, Owner,
-    backend::{Address, Described, DescribedStatic, FrontRef, Frontend},
+    CodegenError, InstanceKey, Owner,
+    backend::{Address, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates, Limit},
     plan::{Mode, Origin, Package, PlanError, Policy},
 };
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey};
 use blaze_query::db::FromId;
@@ -20,14 +21,14 @@ use hir_def::{
 };
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
-    db::{HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
+    db::{InternedClosure, InternedClosureId, InternedCoroutineId},
     next_solver::{DbInterner, GenericArgs, ParamEnv, Region, RegionExt, Ty, TyKind},
 };
 use hir_ty_mir::mir::{MirOptions, overflow::crate_checks_overflow};
-use hir_ty_share::{BodyOptions, OptionsSet, ShareDef, ShareInstance, Unshared};
-use rustc_type_ir::inherent::{
-    BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike as _,
-};
+use hir_ty_identity::{Compiled, OptionsSet, Shim, Subject, instance_identity};
+use hir_ty_mir::mir::dispatch;
+use hir_ty_share::Unshared;
+use rustc_type_ir::inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind};
 use smallvec::{SmallVec, smallvec};
 
 use super::{
@@ -79,6 +80,8 @@ pub struct HirFrontend<'db> {
     checks: Option<&'db dyn BodyChecks>, // dyn: never per instruction, as above
     /// Set when the build's job is cancelled or gives way to another task.
     stop: Option<&'db AtomicBool>,
+    /// What the walk of a final binary found of its trait objects ([`super::devirt`]).
+    pub(crate) devirt: super::devirt::State,
 }
 
 /// One value for each origin of the build's [`Policy`], told apart as the plan tells them.
@@ -89,7 +92,7 @@ struct ByOrigin<T> {
     dependency: T,
     build_time: T,
     /// Of a package the profile names (`[profile.*.package.<name>]`), the same three.
-    packages: HashMap<Package, [T; 3]>,
+    packages: HashMap<Package, [T; 3], Global>,
     std: T,
 }
 
@@ -101,7 +104,7 @@ impl<T> ByOrigin<T> {
         };
         // No package is named the empty name: these are of one the profile has nothing for.
         let [member, dependency, build_time] = kinds(Package::new(""));
-        let packages: HashMap<_, _> = (policy.profile.packages.keys())
+        let packages: HashMap<_, _, Global> = (policy.profile.packages.keys())
             .filter(|it| *it != "*")
             .map(|name| {
                 let name = Package::new(name);
@@ -150,10 +153,16 @@ struct Units {
     /// Some origin's units inline: what a generic, which every origin may ask for, is walked
     /// with.
     any: bool,
+    /// Whether some unit of the origin tells a debugger of its named locals
+    /// ([`DebugInfo::tells_locals`](blaze_codegen::settings::DebugInfo::tells_locals), at the
+    /// first spec or the one a build tiers it up to):
+    /// a generic it asks for is then keyed by its arguments as well
+    /// ([`HirFrontend::generic_args`]).
+    tells: ByOrigin<Result<bool, PlanError>>,
     /// Every options a unit of the origin may build a body with ([`Build::options`]), by
-    /// whether the body is of the library's crates: what a generic it asks for is shared
-    /// under ([`hir_ty_share::share_key`]).
-    options: ByOrigin<Result<BodyOptions, String>>,
+    /// whether the body is of the library's crates: what a generic it asks for has its compile
+    /// identity under ([`hir_ty_identity::instance_identity`]).
+    options: ByOrigin<Result<Compiled, String>>,
 }
 
 impl Units {
@@ -164,19 +173,29 @@ impl Units {
             Err(e) => Err(e.clone()), // clone: once a build, an error
         });
         let any = inlines.values().any(|it| it == &Ok(true));
+        let tells = ByOrigin::of(policy, |origin| tells_of(policy, origin));
         let crates = base_db::all_crates(db);
-        let mut by_build: HashMap<Build, Asked> = HashMap::default();
-        let options = builds.map(|it| -> Result<BodyOptions, String> {
+        let mut by_build: HashMap<Build, Asked, Global> = HashMap::new_in(Global);
+        let options = builds.map(|it| -> Result<Compiled, String> {
             let builds = it.as_ref().map_err(ToString::to_string)?;
             let mut asked = Asked::default();
             for &build in builds {
                 let of = by_build.entry(build).or_insert_with(|| asked_of(db, &crates, build));
                 asked.add(of);
             }
-            Ok(BodyOptions { lang: options_set(&asked.lang)?, other: options_set(&asked.other)? })
+            Ok(Compiled { lang: options_set(&asked.lang)?, other: options_set(&asked.other)? })
         });
-        Units { inlines, any, options }
+        Units { inlines, any, tells, options }
     }
+}
+
+/// Whether a unit of `origin` tells a debugger of its named locals, at its first spec or the
+/// spec a live build tiers it up to: what `hir-ty-codegen`'s `built_function` builds
+/// `Function::variables` for.
+fn tells_of(policy: &Policy, origin: &Origin) -> Result<bool, PlanError> {
+    let choice = policy.choose(origin, None)?;
+    let told = |spec: &blaze_codegen::settings::Spec| spec.debuginfo.tells_locals();
+    Ok(told(&choice.first) || choice.then.as_ref().is_some_and(told))
 }
 
 /// How the units of `origin` build bodies: at its first spec, at the spec a live build tiers
@@ -227,7 +246,7 @@ fn asked_of(db: &Db, crates: &[Crate], build: Build) -> Asked {
     asked
 }
 
-/// `options` as the share key takes them. The set must hold each whole: options it can't tell
+/// `options` as compile identity takes them. The set must hold each whole: options it can't tell
 /// apart would key two bodies as one.
 fn options_set(options: &[MirOptions]) -> Result<OptionsSet, String> {
     let set = OptionsSet::of(options);
@@ -235,8 +254,8 @@ fn options_set(options: &[MirOptions]) -> Result<OptionsSet, String> {
         None => Ok(set),
         // alloc: once a build, an error
         Some(lost) => Err(format!(
-            "`hir_ty_share::OptionsSet` can't hold the MIR options {lost:?} a unit builds bodies \
-             with, so no generic can be shared by what its code reads"
+            "`hir_ty_identity::OptionsSet` can't hold the MIR options {lost:?} a unit builds bodies \
+             with, so no generic has a compile identity"
         )),
     }
 }
@@ -247,7 +266,15 @@ const NO_POLICY: &str = "the front end was made with no policy (`HirFrontend::wi
 impl<'db> HirFrontend<'db> {
     /// `build_time` is shared: a daemon makes one a job and hands it to each unit's front end.
     pub fn new(databases: Databases<'db>, hashes: HashSource, build_time: std::sync::Arc<BuildTime>) -> Self {
-        HirFrontend { databases, hashes, build_time, units: None, checks: None, stop: None }
+        HirFrontend {
+            databases,
+            hashes,
+            build_time,
+            units: None,
+            checks: None,
+            stop: None,
+            devirt: Default::default(),
+        }
     }
 
     /// The front end of a build that stops before its next function once `stop` is set: its
@@ -281,6 +308,28 @@ impl<'db> HirFrontend<'db> {
         instance: &HirInstance,
     ) -> Result<bool, String> {
         self.inlines_as(db, instance, None)
+    }
+
+    /// [`Self::inlines`] and the program's world, as describing `instance` walked it
+    /// ([`super::devirt::walking`]): what a unit builds its body with.
+    pub(crate) fn walking(&self, db: &Db, instance: &HirInstance) -> Result<refs::Walking, String> {
+        let inlined = self.inlines(db, instance)?;
+        super::devirt::walking(db, self.devirt.world(), instance, inlined)
+    }
+
+    /// [`Self::inlines`] as describing `instance` for `requester` decides it: of the origin of
+    /// its crate when it is not generic, else of the requester's.
+    pub(crate) fn inlines_for(
+        &self,
+        db: &Db,
+        instance: &HirInstance,
+        requester: &Origin,
+    ) -> Result<bool, String> {
+        let origin = match crate_of(db, &instance.0) {
+            Some(krate) if !generic(&instance.0) => self.origin(db, krate),
+            _ => *requester,
+        };
+        self.inlines_as(db, instance, Some(&origin))
     }
 
     /// [`Self::inlines`], with the origin of the instance's crate when the caller has it.
@@ -350,25 +399,31 @@ impl<'db> HirFrontend<'db> {
         }
         .map_err(|what| undescribed(db, &super::Named(db, instance), None, what))?;
         let fail = |what: String| undescribed(db, &super::Named(db, instance), Some(item), what);
-        let code = code_of(db, hashes, &instance.0).map_err(fail)?;
         let generic = generic(&instance.0);
         let origin = match crate_of(db, &instance.0) {
             Some(krate) if !generic => self.origin(db, krate),
             _ => *requester,
         };
+        let inlined = self.inlines_as(db, instance, Some(&origin)).map_err(fail)?;
+        let walking =
+            super::devirt::walking(db, self.devirt.world(), instance, inlined).map_err(fail)?;
+        // A body built against the program's dyn facts is keyed by those it read (rule 18).
+        let code = super::devirt::code(
+            code_of(db, hashes, &instance.0).map_err(fail)?,
+            refs::read(db, instance, walking).map_err(fail)?,
+        );
+        let plain = args_of(db, hashes, &instance.0).map_err(fail)?;
         let args = match generic {
-            true => self.shared_args(db, &instance.0, &origin),
-            false => args_of(db, hashes, &instance.0),
-        }
-        .map_err(fail)?;
+            true => self.generic_args(db, &instance.0, &origin, plain).map_err(fail)?,
+            false => plain,
+        };
         let owner = self.owner(db, &instance.0, requester);
-        let plain = if generic { args_of(db, hashes, &instance.0).map_err(fail)? } else { args };
         let identity = identity(db, &instance.0, item, plain);
         let bound = bound(db, &instance.0, code, plain);
+        let cold = cold_of(db, &instance.0);
         let overflow_checks = if generic { written_checks(db, &instance.0) } else { None };
-        let symbol = symbol_of(db, &instance.0);
-        let inlined = self.inlines_as(db, instance, Some(&origin)).map_err(fail)?;
-        let mut refs = refs::walk(db, instance, inlined, homes).map_err(fail)?;
+        let symbol = symbol_of(db, &instance.0).map_err(fail)?;
+        let mut refs = refs::walk(db, instance, walking, homes).map_err(fail)?;
         if owner == Owner::Dependency {
             for it in &mut refs {
                 if let FrontRef::Function(HirInstance(Kind::Asm(_, image))) = it {
@@ -377,7 +432,7 @@ impl<'db> HirFrontend<'db> {
             }
         }
         // alloc: `Described::built_in` owns its list, which the memo's is borrowed from
-        let built_in = refs::built_in(db, instance, inlined).map_err(fail)?.to_vec();
+        let built_in = refs::built_in(db, instance, walking).map_err(fail)?.to_vec();
         Ok(Described {
             item,
             code,
@@ -392,31 +447,59 @@ impl<'db> HirFrontend<'db> {
             owner,
             identity,
             bound,
+            cold,
         })
     }
 
-    /// A generic's arguments as its code reads them, compiled as `origin` asks: its share key
-    /// under every options a unit of `origin` builds a body with, or, for an instance that is
+    /// A generic's arguments in its key, compiled as `origin` asks: what its code reads of them
+    /// ([`Self::shared_args`]) and, where a unit of `origin` tells a debugger of its named
+    /// locals ([`Units::tells`]), `plain`, its arguments' content ID ([`args_of`]). A told
+    /// local's type is in the IR's shape and the side table (`side::Variable::ty`), and it is
+    /// the instance's own (`&UnsafeCell<usize>` or `&UnsafeCell<Align8<*mut ()>>` for one body
+    /// of one compile identity), so two instances sharing one key would give the store two
+    /// shapes under it, or one instance the other's debug info (rule 18). Without told locals
+    /// the instances stay one.
+    fn generic_args(&self, db: &Db, kind: &Kind, origin: &Origin, plain: ContentId) -> Result<ContentId, String> {
+        let shared = self.shared_args(db, kind, origin)?;
+        // Already the instance's own arguments ([`args_of`]): mixing `plain` in again would only
+        // change the key, not what it covers.
+        if shared == plain {
+            return Ok(shared);
+        }
+        match self.tells(origin)? {
+            true => Ok(Hasher::new(TOLD_ARGS_DOMAIN).id(&shared).id(&plain).finish()),
+            false => Ok(shared),
+        }
+    }
+
+    /// Whether some unit of `origin` tells a debugger of its named locals ([`Units::tells`]).
+    fn tells(&self, origin: &Origin) -> Result<bool, String> {
+        let Some(units) = &self.units else { return Err(NO_POLICY.to_owned()) }; // alloc: an error
+        units.tells.get(origin).as_ref().copied().map_err(|it| it.to_string()) // alloc: the error's message
+    }
+
+    /// A generic's arguments as its code reads them, compiled as `origin` asks: its compile
+    /// identity under every options a unit of `origin` builds a body with, or, for an instance that is
     /// per instance by what it is ([`per_instance`]), its arguments' content ID
     /// ([`args_of`]). Both give exact code. A key that can't be made for any other reason is
     /// an error: the instance is never compiled per instance in its place. A generic callee is
     /// of its caller's origin, so its key here is the one its caller's key holds.
     fn shared_args(&self, db: &Db, kind: &Kind, origin: &Origin) -> Result<ContentId, String> {
         let Kind::Code(instance, env) = kind else { return args_of(db, &self.hashes, kind) };
-        let options = self.body_options(origin)?;
+        let compiled = self.body_options(origin)?;
         // clone: the query's key, a reference count
-        let shared = ShareInstance { def: share_def(instance.def), args: instance.args.clone() };
-        match hir_ty_share::share_key(db, &shared, env, options) {
-            Ok(key) => Ok(Hasher::new(SHARED_ARGS_DOMAIN).id(&key.0).finish()),
+        let of = hir_ty_identity::Instance { subject: subject_of(instance.def), args: instance.args.clone() };
+        match instance_identity(db, &of, env, compiled) {
+            Ok(identity) => Ok(Hasher::new(SHARED_ARGS_DOMAIN).id(&identity.0).finish()),
             Err(why) if per_instance(why) => args_of(db, &self.hashes, kind),
             // alloc: the error's message
-            Err(why) => Err(hir_ty::attach_db(db, || format!("no share key for {instance:?}: {why}"))),
+            Err(why) => Err(hir_ty::attach_db(db, || format!("no compile identity for {instance:?}: {why}"))),
         }
     }
 
-    /// Every options a unit of `origin` builds a body with: what a generic it asks for is
-    /// shared under.
-    pub(super) fn body_options(&self, origin: &Origin) -> Result<BodyOptions, String> {
+    /// Every options a unit of `origin` builds a body with: what a generic it asks for has its
+    /// compile identity under.
+    pub(super) fn body_options(&self, origin: &Origin) -> Result<Compiled, String> {
         match &self.units {
             Some(units) => units.options.get(origin).clone(), // clone: a copy, or an error
             None => Err(NO_POLICY.to_owned()), // alloc: an error
@@ -496,9 +579,9 @@ impl<'db> HirFrontend<'db> {
         let hashes = &self.hashes;
         let item = hashes
             .item(db, ItemId::Static(value.0))
-            .map_err(|what| undescribed(db, value, None, what))?;
+            .map_err(|what| undescribed(db, &super::StaticNamed(db, value.0), None, what))?;
         let held = super::statics::value(db, homes, hashes, value.0)
-            .map_err(|what| undescribed(db, value, Some(item), what))?;
+            .map_err(|what| undescribed(db, &super::StaticNamed(db, value.0), Some(item), what))?;
         Ok(DescribedStatic {
             item,
             instance: ContentId::default(),
@@ -509,6 +592,8 @@ impl<'db> HirFrontend<'db> {
             origin: self.origin(db, value.0.krate(db)),
             // alloc: only an exported static, whose `DescribedStatic::symbol` owns its name
             symbol: exported_static(db, value.0).map(|it| it.as_str().to_owned()),
+            // alloc: per static described, its path, which errors name it by
+            name: crate::fncache::static_name(db, value.0),
             refs: held.refs,
         })
     }
@@ -534,6 +619,7 @@ impl Frontend for HirFrontend<'_> {
     }
 
     fn reached(&self, functions: &[(HirInstance, Origin)], statics: &[HirStatic]) {
+        self.devirt.reached(functions, statics);
         let Some(checks) = self.checks else { return };
         let bodies: Vec<DefWithBodyId> = self.with(|db, _| {
             (functions.iter().filter_map(|(instance, _)| body_of(db, instance)))
@@ -546,6 +632,196 @@ impl Frontend for HirFrontend<'_> {
 
     fn stopped(&self) -> bool {
         self.stop.is_some_and(|it| it.load(Ordering::Relaxed)) || self.checks.is_some_and(|it| it.stopped())
+    }
+
+    fn counted(&self, functions: &[(HirInstance, Origin)]) -> Vec<Counted> {
+        // alloc: once a level of the walk, sized by it
+        self.with(|db, _| functions.iter().map(|(instance, _)| counted(db, &instance.0)).collect())
+    }
+
+    fn spell(&self, instance: &HirInstance) -> String {
+        self.with(|db, _| spelled(db, &instance.0))
+    }
+
+    fn past_recursion_limit(
+        &self,
+        instance: &HirInstance,
+        depth: u32,
+        limit: u32,
+        head: &HirInstance,
+        limit_of: &HirInstance,
+    ) -> CodegenError {
+        self.with(|db, _| past_recursion_limit(db, instance, depth, limit, head, limit_of))
+    }
+    fn closed(&self) -> Result<bool, CodegenError> {
+        self.devirt.closed(self)
+    }
+}
+
+/// The domain of the body a shim is an instance of, for the walk's recursion limit.
+const SHIM_BODY_DOMAIN: &str = "blaze v2 recursion shim body 2";
+
+/// What the build's walk reads of `kind` for rustc's recursion limit ([`Counted`]).
+fn counted(db: &Db, kind: &Kind) -> Counted {
+    let limit = limit_crate(db, kind).map(|krate| Limit {
+        krate: blaze_items::key::crate_key(db, krate),
+        value: hir_def::nameres::crate_def_map(db, krate).recursion_limit(),
+    });
+    Counted { body: instantiates(db, kind), limit, heads_own_path: heads_own_path(db, kind) }
+}
+
+/// Whether `kind` is collected in its own crate's build only, as rustc's
+/// `should_codegen_locally` is false for it in a crate that uses it: a function with no type or
+/// const arguments that is not `#[inline]` (nor `#[rustc_force_inline]`). A shim, a closure and
+/// a coroutine are built where they are used, as rustc builds them.
+fn heads_own_path(db: &Db, kind: &Kind) -> bool {
+    let Kind::Code(instance, _) = kind else { return false };
+    let InstanceDef::Fn(func) = instance.def else { return false };
+    let generic = instance.args.as_ref().iter().any(|arg| arg.region().is_none());
+    !generic
+        && !AttrFlags::query(db, func.into()).intersects(AttrFlags::IS_INLINE | AttrFlags::RUSTC_FORCE_INLINE)
+}
+
+/// What `kind` is an instance of, as rustc's `check_recursion_limit` counts its `DefId`
+/// (`InstanceKind::def_id`): a function, its vtable shim and its reify shim are the function's;
+/// each closure and coroutine is its own; all drop glue is one (counted at a quarter); the
+/// `FnOnce::call_once` of a closure, by value in a vtable (`CallOnceShim`) or behind a fn
+/// pointer (`FnPointerShim`), is `FnOnce::call_once`'s, as rustc's `ClosureOnceShim` is; a
+/// constructor's reify shim is the constructor's. The `Fn`-trait call of a fn item or pointer
+/// in a vtable (rustc's `FnPtrShim`, one per trait method) is one body here, as blaze makes one
+/// shim for the three methods. The C `main`, an `asm!` function and the allocator shim's are
+/// none: rustc's collector counts no such item.
+fn instantiates(db: &Db, kind: &Kind) -> Option<Instantiates> {
+    let Kind::Code(instance, _) = kind else { return None };
+    let shim = |what: &str| ContentId::of(SHIM_BODY_DOMAIN, what.as_bytes());
+    let function = |func| blaze_items::item_key(db, ItemId::Function(func)).0;
+    let body = match instance.def {
+        InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => function(func),
+        InstanceDef::Closure(id) => blaze_items::key::closure_key(db, InternedClosureId::from_id(id)).0,
+        InstanceDef::Coroutine(id) => {
+            blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0
+        }
+        // rustc's by-move body of a coroutine is a `DefId` of its own.
+        InstanceDef::CoroutineByMove(id) => {
+            let coroutine = blaze_items::key::coroutine_key(db, InternedCoroutineId::from_id(id)).0;
+            Hasher::new(SHIM_BODY_DOMAIN).part(b"by move").id(&coroutine).finish()
+        }
+        InstanceDef::DropGlue => shim("drop glue"),
+        InstanceDef::CallOnceShim | InstanceDef::FnPointerShim => shim("FnOnce::call_once"),
+        InstanceDef::ReifyShim { receiver: true } => shim("the Fn-trait call of a fn item or pointer"),
+        InstanceDef::ReifyShim { receiver: false } => match instance.args.as_ref().type_at(0).kind() {
+            TyKind::FnDef(def, _) => match def.0 {
+                CallableDefId::FunctionId(func) => function(func),
+                CallableDefId::StructId(it) => blaze_items::item_key(db, ItemId::Adt(AdtId::StructId(it))).0,
+                CallableDefId::EnumVariantId(it) => {
+                    let variant = it.lookup(db);
+                    let parent = blaze_items::item_key(db, ItemId::Adt(AdtId::EnumId(variant.parent))).0;
+                    Hasher::new(SHIM_BODY_DOMAIN).part(b"variant").id(&parent).part(variant.name.as_str().as_bytes()).finish()
+                }
+            },
+            _ => shim("the Fn-trait call of a fn item or pointer"),
+        },
+    };
+    Some(Instantiates { body, drop_glue: matches!(instance.def, InstanceDef::DropGlue) })
+}
+
+/// The crate whose `#![recursion_limit]` holds what the walk reaches from `kind`: the crate it
+/// is built for (a function's, a closure's owner's, a shim's environment's). `None` for an
+/// `asm!` function and the allocator shim's, which are of no crate.
+fn limit_crate(db: &Db, kind: &Kind) -> Option<Crate> {
+    match kind {
+        Kind::Code(instance, env) => match instance.def {
+            InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => Some(func.krate(db)),
+            def @ (InstanceDef::Closure(_) | InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_)) => {
+                closure_loc(db, def).map(|loc| loc.owner.module(db).krate(db))
+            }
+            InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => Some(env.krate),
+        },
+        Kind::Start(main) => Some(main.krate(db)),
+        Kind::Asm(..) | Kind::Allocator(_) => None,
+    }
+}
+
+/// How many characters of an argument an error spells before `…` (`display_truncated`'s
+/// `max_size`): a type of rust#37311's chain has 2^k parts as a tree, which only a bounded
+/// spelling can print.
+const SPELLED_CHARS: usize = 40;
+
+/// An instance as an error spells it: its body and its arguments, each cut short.
+fn spelled(db: &Db, kind: &Kind) -> String {
+    use hir_ty::display::HirDisplay as _;
+    let Kind::Code(instance, env) = kind else { return super::linked::debug_name(db, kind) };
+    let target = hir_ty::display::DisplayTarget::from_crate(db, env.krate);
+    let args: Vec<String> = (instance.args.as_ref().iter())
+        .filter(|arg| arg.region().is_none())
+        .map(|arg| arg.display_truncated(db, Some(SPELLED_CHARS), target).to_string())
+        .collect(); // alloc: an error's text
+    match args.is_empty() {
+        true => body_named(db, instance.def),
+        false => format!("{}::<{}>", body_named(db, instance.def), args.join(", ")), // alloc: an error's text
+    }
+}
+
+/// The body an instance is of, by its path.
+fn body_named(db: &Db, def: InstanceDef) -> String {
+    let path = |func| blaze_items::key::path(db, ItemId::Function(func)).to_string(); // alloc: an error's text
+    match def {
+        InstanceDef::Fn(func) => path(func),
+        InstanceDef::VtableShim(func) => format!("the vtable shim of {}", path(func)), // alloc: an error's text
+        def @ (InstanceDef::Closure(_) | InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_)) => {
+            match closure_loc(db, def).map(|loc| loc.owner) {
+                Some(InferBodyId::DefWithBodyId(owner)) => {
+                    format!("a closure in {}", blaze_items::key::path(db, ItemId::of_body(db, owner))) // alloc: an error's text
+                }
+                _ => "a closure in an anonymous constant".to_owned(), // alloc: an error's text
+            }
+        }
+        InstanceDef::DropGlue => "core::ptr::drop_in_place".to_owned(), // alloc: an error's text
+        InstanceDef::CallOnceShim => "the `FnOnce::call_once` shim".to_owned(), // alloc: an error's text
+        InstanceDef::FnPointerShim => "the fn pointer shim".to_owned(), // alloc: an error's text
+        InstanceDef::ReifyShim { .. } => "the reify shim".to_owned(), // alloc: an error's text
+    }
+}
+
+/// [`Frontend::past_recursion_limit`]: rustc's error, with the function, the instance, how often
+/// the function repeats above it on its path, and the crate whose limit it is.
+fn past_recursion_limit(
+    db: &Db,
+    instance: &HirInstance,
+    depth: u32,
+    limit: u32,
+    head: &HirInstance,
+    limit_of: &HirInstance,
+) -> CodegenError {
+    let krate = match limit_crate(db, &limit_of.0) {
+        Some(krate) => fncache::crate_name(db, krate),
+        None => "<none>".to_owned(), // alloc: an error's text; a head of no crate has no limit
+    };
+    let (body, counted) = match &instance.0 {
+        Kind::Code(it, _) => {
+            let quarter = if matches!(it.def, InstanceDef::DropGlue) { ", drop glue counting a quarter" } else { "" };
+            (body_named(db, it.def), quarter)
+        }
+        kind => (super::linked::debug_name(db, kind), ""),
+    };
+    // The item it is an instance of. It has no instance key: the walk refused it before it
+    // described it, and its key is its description's. An `asm!` function and the allocator
+    // shim's are never counted, so never here.
+    let item = item_of(db, &instance.0).map_or(ItemKey(ContentId::default()), |it| blaze_items::item_key(db, it));
+    CodegenError {
+        unit: InstanceKey(ContentId::default()),
+        item,
+        // alloc: the error's message
+        what: format!(
+            "reached the recursion limit while instantiating `{}`: `{body}` is instantiated {depth} \
+             times above it on the path the build reached it by from `{}`{counted}, past crate \
+             `{krate}`'s recursion_limit of {limit} (`#![recursion_limit = \"N\"]` in `{krate}` raises it)",
+            spelled(db, &instance.0),
+            spelled(db, &head.0),
+        ),
     }
 }
 
@@ -682,18 +958,24 @@ fn rooted<'db>(db: &'db Db, homes: &mut Homes, func: FunctionId, args: GenericAr
 pub(crate) fn inlined<'a>(
     db: &'a Db,
     hashes: &HashSource,
-    (instance, inlined): (&'a HirInstance, bool),
+    (instance, walking): (&'a HirInstance, refs::Walking),
 ) -> Result<Vec<CodeHash>, String> {
     let mut found = Vec::new(); // alloc: the list returned, empty for nearly every instance
     // alloc: inline, eight on the stack
     let mut queue: SmallVec<[&HirInstance; 8]> = smallvec![instance];
-    let mut seen = HashSet::default();
+    let mut seen = HashSet::new_in(Global);
     while let Some(at) = queue.pop() {
-        let built_in = refs::built_in(db, at, inlined)?;
+        // A callee's code is built in as its own walk without the world lists it: the inliner
+        // devirtualizes no callee (`hir-ty-mir` `inline.rs` `callee_options`).
+        let walking = match std::ptr::eq(at, instance) {
+            true => walking,
+            false => refs::Walking::plain(walking.inlined),
+        };
+        let built_in = refs::built_in(db, at, walking)?;
         if built_in.is_empty() {
             continue;
         }
-        let refs = refs::walked(db, at, inlined)?;
+        let refs = refs::walked(db, at, walking)?;
         for &place in built_in {
             let Some(FrontRef::Function(callee)) = refs.get(place as usize) else {
                 // alloc: the error's message
@@ -734,6 +1016,23 @@ fn owner_item(db: &Db, owner: InferBodyId<'_>) -> Result<ItemId, String> {
             Err("a closure in an anonymous constant, which is no item".to_owned())
         }
     }
+}
+
+/// Whether `kind` runs only when something has gone wrong ([`Described::cold`]): a
+/// [`crate::cold_fn`], or a closure or coroutine of one. A shim is not.
+fn cold_of(db: &Db, kind: &Kind) -> bool {
+    let Kind::Code(instance, env) = kind else { return false };
+    let func = match instance.def {
+        InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => func,
+        InstanceDef::Closure(_) | InstanceDef::Coroutine(_) | InstanceDef::CoroutineByMove(_) => {
+            match closure_loc(db, instance.def).map(|it| it.owner) {
+                Some(InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func))) => func,
+                _ => return false,
+            }
+        }
+        _ => return false,
+    };
+    crate::cold_fn(db, DbInterner::new_with(db, env.krate).lang_items(), func)
 }
 
 /// Which item an instance is of. A shim is of the trait method or lang item rustc names it
@@ -786,41 +1085,33 @@ const ASM_DOMAIN: &str = "blaze v2 asm 1";
 const START_DOMAIN: &str = "blaze v2 start 1";
 /// A cached function's code with the code of its body it writes ([`fncache::written_code`]).
 const CACHED_DOMAIN: &str = "blaze v2 cached function 1";
-const ARGS_DOMAIN: &str = "blaze v2 args 1";
-/// A share key in place of the arguments: never equal to an [`ARGS_DOMAIN`] hash.
-const SHARED_ARGS_DOMAIN: &str = "blaze v2 shared args 1";
+/// The PGO name of an instance hashes this ID ([`blaze_items::pgo`]), so the profile lints
+/// compute a plain function's name with the same domain.
+use blaze_items::pgo::ARGS_DOMAIN;
+/// A compile identity in place of the arguments: never equal to an [`ARGS_DOMAIN`] hash.
+const SHARED_ARGS_DOMAIN: &str = "blaze v2 shared args 2";
+/// A compile identity and the arguments' content ID, for a generic whose told locals' types
+/// are in its shape ([`HirFrontend::generic_args`]).
+const TOLD_ARGS_DOMAIN: &str = "blaze v2 told args 1";
 
-/// Whether an instance with no share key for `why` is compiled for its arguments alone by
-/// what it is: one of a cycle (the query engine's answer for all of it), a shim built without MIR, or a
-/// call of an intrinsic whose code is the instance's. Every other reason is something the key
-/// could not read (a layout, a constant, an intrinsic missing from the table), and an error.
+/// Whether an instance with no compile identity for `why` is compiled for its arguments alone:
+/// [`Unshared::is_per_instance`], which compile identity reads for a caller too.
 fn per_instance(why: &Unshared) -> bool {
-    match why {
-        Unshared::Recursive | Unshared::Shim(_) | Unshared::PerInstance(_) => true,
-        Unshared::UnknownIntrinsic(_)
-        | Unshared::NoOptions
-        | Unshared::NoMir(_)
-        | Unshared::NoLayout(_)
-        | Unshared::NoContent(_)
-        | Unshared::ConstEval(_)
-        | Unshared::Unhashable(_)
-        | Unshared::Shape(_)
-        | Unshared::RecursionLimit { .. } => false,
-    }
+    why.is_per_instance()
 }
 
-/// What an instance runs, as the share key names it.
-fn share_def(def: InstanceDef) -> ShareDef {
+/// What an instance runs, as compile identity names it.
+fn subject_of(def: InstanceDef) -> Subject {
     match def {
-        InstanceDef::Fn(func) => ShareDef::Fn(func),
-        InstanceDef::Closure(id) => ShareDef::Closure(id),
-        InstanceDef::Coroutine(id) => ShareDef::Coroutine(id),
-        InstanceDef::CoroutineByMove(id) => ShareDef::CoroutineByMove(id),
-        InstanceDef::DropGlue => ShareDef::DropGlue,
-        InstanceDef::CallOnceShim => ShareDef::CallOnceShim,
-        InstanceDef::VtableShim(func) => ShareDef::VtableShim(func),
-        InstanceDef::FnPointerShim => ShareDef::FnPointerShim,
-        InstanceDef::ReifyShim { receiver } => ShareDef::ReifyShim { receiver },
+        InstanceDef::Fn(func) => Subject::Body(dispatch::Body::Fn(func)),
+        InstanceDef::Closure(id) => Subject::Body(dispatch::Body::Closure(id)),
+        InstanceDef::Coroutine(id) => Subject::Body(dispatch::Body::Coroutine(id)),
+        InstanceDef::CoroutineByMove(id) => Subject::Body(dispatch::Body::CoroutineByMove(id)),
+        InstanceDef::DropGlue => Subject::Shim(Shim::DropGlue),
+        InstanceDef::CallOnceShim => Subject::Shim(Shim::CallOnce),
+        InstanceDef::VtableShim(func) => Subject::Shim(Shim::Vtable(func)),
+        InstanceDef::FnPointerShim => Subject::Shim(Shim::FnPointer),
+        InstanceDef::ReifyShim { receiver } => Subject::Shim(Shim::Reify { receiver }),
     }
 }
 
@@ -1019,25 +1310,37 @@ fn written_checks(db: &Db, kind: &Kind) -> Option<bool> {
     if inherits {
         return None;
     }
-    Some(crate_checks_overflow(db, krate).unwrap_or(false))
+    Some(match crate_checks_overflow(db, krate) {
+        Some(checked) => checked,
+        // A crate of the toolchain (`origin.is_lang()`), which has no `-C overflow-checks` of
+        // its own: the standard library ships built without them, so a body of it that does
+        // not inherit its callers' setting is written unchecked. Not a guess for a missing
+        // value: it is what the toolchain's MIR says.
+        None => false,
+    })
 }
 
 /// The symbol outside code names an instance by: `#[no_mangle]`, `#[export_name]`, the
-/// standard library's functions linked by name, the C `main`.
-pub(super) fn symbol_of(db: &Db, kind: &Kind) -> Option<String> {
-    match kind {
+/// standard library's functions linked by name, the C `main`. The C `main`'s name is its
+/// crate's target's, so a target that does not load is an error.
+pub(super) fn symbol_of(db: &Db, kind: &Kind) -> Result<Option<String>, String> {
+    Ok(match kind {
         Kind::Code(instance, _) => match instance.def {
             InstanceDef::Fn(func) if instance.args.as_ref().iter().all(|it| it.region().is_some()) => {
                 exported_symbol(db, func).or_else(|| linked_symbol(db, func))
             }
             _ => None,
         },
-        // alloc: once per program, the C `main`; `Described::symbol` owns its name
-        Kind::Start(_) => Some(crate::Target::current().entry().0.to_owned()),
+        Kind::Start(main) => {
+            // alloc: the error's message
+            let target = crate::target_of_crate(db, main.krate(db)).map_err(|e| e.to_string())?;
+            // alloc: once per program, the C `main`; `Described::symbol` owns its name
+            Some(target.entry().0.to_owned())
+        }
         // alloc: one of the shim's few entries, once per program
         Kind::Allocator(forward) => Some(forward.symbol.to_owned()),
         Kind::Asm(..) => None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1053,8 +1356,13 @@ mod tests {
         assert!(per_instance(&Unshared::Recursive));
         assert!(per_instance(&Unshared::Shim("drop glue")));
         assert!(per_instance(&Unshared::PerInstance("size_of".to_owned())));
+        assert!(per_instance(&Unshared::TooDeep { depth: 129, limit: 128 }));
         for refused in [
-            Unshared::UnknownIntrinsic("new_intrinsic".to_owned()),
+            Unshared::UnknownIntrinsic {
+                name: "new_intrinsic".to_owned(),
+                body: "`f`".to_owned(),
+                through: hir_ty_share::Through::Own,
+            },
             Unshared::NoOptions,
             Unshared::NoLayout("T".to_owned()),
             Unshared::ConstEval("N".to_owned()),

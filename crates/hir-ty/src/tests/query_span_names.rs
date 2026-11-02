@@ -115,6 +115,6 @@ fn an_infer_query_span_names_the_crate_and_path_of_its_fn() {
 }
 
 #[test]
-fn an_infer_query_span_names_a_method_under_its_impl_type() {
-    assert_eq!(infer_span_of("side"), pairs("shapes", "shapes::area::<impl Square>::side"));
+fn an_infer_query_span_names_a_method_under_its_impl_ordinal() {
+    assert_eq!(infer_span_of("side"), pairs("shapes", "shapes::area::<impl#0>::side"));
 }

@@ -39,6 +39,7 @@ use std::{
 };
 
 use blaze_hash::{FixedState, HashMap};
+use std::alloc::Global;
 use blaze_ids::{bits::BitArray, radix};
 use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
 use syntax::{
@@ -207,13 +208,17 @@ const fn pack(hash: u16, index: u32, in_body: bool, kind: u32) -> u32 {
 }
 
 impl ErasedFileAstId {
+    /// The hash of what the node is keyed by: for a block or an unnamed item, its parent item,
+    /// so ids under one parent share it.
     #[inline]
-    fn hash_value(self) -> u16 {
+    pub fn hash_value(self) -> u16 {
         self.0 as u16
     }
 
+    /// The node's ordinal among the nodes of its kind with its hash, in the order the file (or
+    /// the body, [`Self::in_body`]) is walked: a block's among the blocks of its parent item.
     #[inline]
-    fn index(self) -> u32 {
+    pub fn index(self) -> u32 {
         (self.0 >> HASH_BITS) & INDEX_MASK
     }
 
@@ -503,7 +508,7 @@ fn block_expr_ast_id(
 /// The next index of each kind and hash value, keyed by both in one word (`kind << 16 | hash`),
 /// so a key hashes with one multiply.
 #[derive(Default)]
-struct ErasedAstIdNextIndexMap(HashMap<u32, u32>);
+struct ErasedAstIdNextIndexMap(HashMap<u32, u32, Global>);
 
 impl ErasedAstIdNextIndexMap {
     #[inline]
@@ -516,14 +521,14 @@ impl ErasedAstIdNextIndexMap {
         let mut hash = initial_hash;
         let index = loop {
             match self.0.entry(((kind as u32) << HASH_BITS) | u32::from(hash)) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                blaze_hash::hash_map::Entry::Occupied(mut entry) => {
                     let i = entry.get_mut();
                     if *i < ((1 << INDEX_BITS) - 1) {
                         *i += 1;
                         break *i;
                     }
                 }
-                std::collections::hash_map::Entry::Vacant(entry) => {
+                blaze_hash::hash_map::Entry::Vacant(entry) => {
                     entry.insert(0);
                     break 0;
                 }
@@ -1535,6 +1540,7 @@ mod tests {
     };
 
     use blaze_hash::{FixedState, HashMap, HashSet};
+    use std::alloc::Global;
     use blaze_ids::rng::SplitMix64;
     use syntax::{
         AstNode, AstPtr, Edition, Parse, SourceFile, SyntaxKind, SyntaxNode, SyntaxNodePtr,
@@ -1780,9 +1786,9 @@ fn foo() {
             let full = full_of(&text);
             let full_map = AstIdMap::from_view(full.root());
             let want = ids(&full_map);
-            let distinct: HashSet<_> = want.iter().map(|&(_, id)| id).collect();
+            let distinct: HashSet<_, Global> = want.iter().map(|&(_, id)| id).collect();
             assert_eq!(distinct.len(), want.len(), "{path}: two nodes have one id");
-            let with_id: HashSet<_> = want.iter().map(|&(ptr, _)| ptr).collect();
+            let with_id: HashSet<_, Global> = want.iter().map(|&(ptr, _)| ptr).collect();
             for node in full.root().descendants() {
                 let ptr = view::ptr(node);
                 if ErasedFileAstId::should_alloc(node.kind()).is_some() {
@@ -1826,8 +1832,8 @@ fn foo() {
                     });
                 }
             });
-            let got: HashMap<_, _> = ids(&map).into_iter().collect();
-            assert!(got == want.into_iter().collect::<HashMap<_, _>>(), "{path}: `ptrs` differ");
+            let got: HashMap<_, _, Global> = ids(&map).into_iter().collect();
+            assert!(got == want.into_iter().collect::<HashMap<_, _, Global>>(), "{path}: `ptrs` differ");
         }
     }
 
@@ -1880,7 +1886,7 @@ fn foo() {
         let want = ids(&full_map);
         assert_eq!(count(&want, SyntaxKind::FN), 5000);
         assert_eq!(count(&want, SyntaxKind::MACRO_CALL), 3 * 5000);
-        let distinct: HashSet<_> = want.iter().map(|&(_, id)| id).collect();
+        let distinct: HashSet<_, Global> = want.iter().map(|&(_, id)| id).collect();
         assert_eq!(distinct.len(), want.len());
         let map = AstIdMap::from_view(outline_of(&text).root());
         for &(ptr, id) in want.iter().rev() {
@@ -2159,8 +2165,8 @@ fn foo() {
             let outline = outline_of(&text);
             for map in [AstIdMap::from_view(full.root()), AstIdMap::from_view(outline.root())] {
                 let stored = stored(&map);
-                let by_ptr: HashMap<_, _> = stored.iter().copied().collect();
-                let by_id: HashMap<_, _> = stored.iter().map(|&(ptr, id)| (id, ptr)).collect();
+                let by_ptr: HashMap<_, _, Global> = stored.iter().copied().collect();
+                let by_id: HashMap<_, _, Global> = stored.iter().map(|&(ptr, id)| (id, ptr)).collect();
                 assert_eq!(by_ptr.len(), stored.len(), "{path}: a node is kept twice");
                 assert_eq!(by_id.len(), stored.len(), "{path}: an id is kept twice");
                 for node in full.root().descendants() {
@@ -2227,12 +2233,12 @@ fn foo() {
     /// `(kind, hash)` did, also past 1024 nodes of one kind and hash.
     #[test]
     fn packed_index_keys_number_as_pairs_did() {
-        use std::collections::hash_map::Entry;
+        use blaze_hash::hash_map::Entry;
 
         use super::{ErasedAstIdNextIndexMap, ErasedFileAstIdKind as Kind, INDEX_BITS, pack};
 
         #[derive(Default)]
-        struct Pairs(HashMap<(Kind, u16), u32>);
+        struct Pairs(HashMap<(Kind, u16), u32, Global>);
 
         impl Pairs {
             fn new_id(&mut self, kind: Kind, data: u64) -> ErasedFileAstId {
@@ -2383,9 +2389,9 @@ fn foo() {
     fn by_node(
         ids: Vec<(SyntaxNodePtr, ErasedFileAstId)>,
         what: &str,
-    ) -> HashMap<SyntaxNodePtr, ErasedFileAstId> {
+    ) -> HashMap<SyntaxNodePtr, ErasedFileAstId, Global> {
         let len = ids.len();
-        let map: HashMap<_, _> = ids.into_iter().collect();
+        let map: HashMap<_, _, Global> = ids.into_iter().collect();
         assert_eq!(map.len(), len, "{what}: a node is kept twice");
         map
     }

@@ -13,6 +13,7 @@
 //! (MIT or Apache-2.0).
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir::{HasVisibility as _, InFile, ItemInNs};
 use hir_def::{
     AdtId, HasModule as _, ItemContainerId, Lookup as _,
@@ -54,20 +55,20 @@ pub(super) enum Decl {
 /// What the source of a body tells about its bindings and assignments, for the body and the
 /// closures in it.
 pub(super) struct Source {
-    decls: HashMap<BindingId, Decl>,
+    decls: HashMap<BindingId, Decl, Global>,
     /// The place an assignment `place = value` assigns, as the span its MIR assigns it at,
     /// with the assignment: the span rustc gives the assignment is the assignment's.
-    assigns: HashMap<MirSpan, ExprId>,
+    assigns: HashMap<MirSpan, ExprId, Global>,
     /// The span of what an assignment assigns, by its value, for those whose value is an
     /// operator rustc builds into the place (`x = x + 1`).
-    assigned_by_value: HashMap<ExprId, MirSpan>,
+    assigned_by_value: HashMap<ExprId, MirSpan, Global>,
 }
 
 impl Source {
     pub(super) fn new(b: &BodyCx<'_, '_, '_>) -> Source {
         let store = b.store();
         let mut source =
-            Source { decls: HashMap::default(), assigns: HashMap::default(), assigned_by_value: HashMap::default() };
+            Source { decls: HashMap::new_in(Global), assigns: HashMap::new_in(Global), assigned_by_value: HashMap::new_in(Global) };
         for param in b.body.params.iter() {
             source.matched(b, param.formal, MirSpan::PatId(param.formal));
             source.matched(b, param.user_written, MirSpan::PatId(param.user_written));
@@ -307,8 +308,8 @@ pub(super) fn string_literals(b: &BodyCx<'_, '_, '_>, root: ExprId) -> Vec<(Span
 }
 
 /// The bindings a path of the body built from `root` names: rustc's `is_local_used_in_source`.
-pub(super) fn used_in_source(b: &BodyCx<'_, '_, '_>, root: ExprId) -> HashSet<BindingId> {
-    let mut used = HashSet::default();
+pub(super) fn used_in_source(b: &BodyCx<'_, '_, '_>, root: ExprId) -> HashSet<BindingId, Global> {
+    let mut used = HashSet::new_in(Global);
     own_exprs(b, root, |expr, it| {
         if let Expr::Path(_) = it
             && let Some(ValueNs::LocalBinding(binding)) = util::path_value(b, expr)

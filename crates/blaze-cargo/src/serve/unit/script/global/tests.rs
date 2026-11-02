@@ -5,6 +5,7 @@ use blaze_global::Root;
 use blaze_ids::ContentId;
 use blaze_usercode::RunKind;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use super::*;
 
@@ -75,7 +76,7 @@ fn shape(path: &str) -> Vec<u8> {
     Shape::of(&traced).encode()
 }
 
-fn step(fetch: &mut Fetch, made: &Made<'_>, store: &HashMap<Key, Vec<u8>>) -> Result<Step, String> {
+fn step(fetch: &mut Fetch, made: &Made<'_>, store: &HashMap<Key, Vec<u8>, Global>) -> Result<Step, String> {
     fetch.step(&rule(), made, |key| Ok(store.get(key).map(Vec::as_slice)), &mut now())
 }
 
@@ -92,7 +93,7 @@ fn a_run_the_store_has_nothing_of_asks_for_its_first_shape_once() {
     let run = run_of(&given);
     let origin = serde();
     let made = Made { run: &run, given: &given, origin: &origin };
-    let store = HashMap::default();
+    let store = HashMap::new_in(Global);
     let mut fetch = Fetch::default();
     let public = fetched(step(&mut fetch, &made, &store));
     assert_eq!(public.key(), index::slot(&run, 0));
@@ -112,7 +113,7 @@ fn a_shape_kept_here_asks_for_its_result_for_the_inputs_as_they_are_now() {
     let run = run_of(&given);
     let origin = serde();
     let made = Made { run: &run, given: &given, origin: &origin };
-    let mut store = HashMap::default();
+    let mut store = HashMap::new_in(Global);
     store.insert(index::slot(&run, 0), shape(BUILD_RS));
     let mut fetch = Fetch::default();
     let public = fetched(step(&mut fetch, &made, &store));
@@ -120,7 +121,10 @@ fn a_shape_kept_here_asks_for_its_result_for_the_inputs_as_they_are_now() {
     assert_eq!(public.key(), index::result_key(&run, &values));
     // The cache had it: the store keeps it, and the run begins and finds it.
     store.insert(public.key(), b"the run's value".to_vec());
-    assert_eq!(fetch.fetched(&public.key(), &Fetched::Kept(Ticket(0))), Ok(true));
+    assert_eq!(fetch.fetched(&public.key(), &Fetched::Kept(Ticket(1 << 40 | 3))), Ok(true));
+    // Its put is handed over to be waited on before the job answers, once.
+    assert_eq!(fetch.take_puts().tickets.iter().collect::<Vec<_>>(), [Ticket(1 << 40 | 3)]);
+    assert!(fetch.take_puts().tickets.is_empty());
     assert_eq!(step(&mut fetch, &made, &store), Ok(Step::Run));
 }
 
@@ -130,7 +134,7 @@ fn a_result_missing_from_the_cache_moves_on_to_the_next_shape() {
     let run = run_of(&given);
     let origin = serde();
     let made = Made { run: &run, given: &given, origin: &origin };
-    let mut store = HashMap::default();
+    let mut store = HashMap::new_in(Global);
     store.insert(index::slot(&run, 0), shape(BUILD_RS));
     let mut fetch = Fetch::default();
     let result = fetched(step(&mut fetch, &made, &store));
@@ -147,7 +151,7 @@ fn a_shape_that_read_what_is_not_public_is_never_asked_for_its_result() {
     let run = run_of(&given);
     let origin = serde();
     let made = Made { run: &run, given: &given, origin: &origin };
-    let mut store = HashMap::default();
+    let mut store = HashMap::new_in(Global);
     store.insert(index::slot(&run, 0), shape("/home/me/.ssh/config"));
     let mut fetch = Fetch::default();
     assert_eq!(fetched(step(&mut fetch, &made, &store)).key(), index::slot(&run, 1));
@@ -160,7 +164,7 @@ fn a_run_given_a_private_path_asks_nothing() {
     let origin = serde();
     let made = Made { run: &run, given: &given, origin: &origin };
     let mut fetch = Fetch::default();
-    assert_eq!(step(&mut fetch, &made, &HashMap::default()), Ok(Step::Run));
+    assert_eq!(step(&mut fetch, &made, &HashMap::new_in(Global)), Ok(Step::Run));
     assert_eq!(fetch.waiting(), None);
 }
 
@@ -171,7 +175,7 @@ fn a_refused_value_is_an_error_naming_its_key() {
     let origin = serde();
     let made = Made { run: &run, given: &given, origin: &origin };
     let mut fetch = Fetch::default();
-    let public = fetched(step(&mut fetch, &made, &HashMap::default()));
+    let public = fetched(step(&mut fetch, &made, &HashMap::new_in(Global)));
     let error = fetch.fetched(&public.key(), &Fetched::Refused("a bad signature".into())).unwrap_err();
     assert!(error.contains(&format!("{:x}", public.key().0)), "{error}");
     assert!(error.contains("a bad signature"), "{error}");

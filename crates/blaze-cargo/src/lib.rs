@@ -2,9 +2,14 @@
 //! the remote store. The engine (crates/blaze-engine) compiles and links; its modules of the same
 //! names (`check`, `doctest`, `link`, ...) take what is here of them and add the rest.
 
-#![allow(clippy::print_stderr, reason = "a command line program: stderr is where it speaks")]
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the `blaze` command line: stdout is its output, stderr is where it speaks"
+)]
 #![deny(unsafe_code)]
 #![feature(random)]
+#![feature(allocator_api)]
 
 use std::path::{Path, PathBuf};
 

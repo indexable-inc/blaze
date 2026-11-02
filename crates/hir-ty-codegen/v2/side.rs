@@ -340,7 +340,41 @@ fn extend<'f, T>(
     Ok(())
 }
 
-/// The table in `bytes`, its frame base borrowed from them.
+/// A table that tells nothing: what a function's report ([`super::report`]) follows when the
+/// function has no other table.
+pub(crate) fn empty() -> Result<Vec<u8>, String> {
+    let side = Side {
+        version: VERSION,
+        frame_base: Cow::Borrowed(&[]),
+        // alloc: empty, no allocation
+        scopes: Vec::new(),
+        // alloc: empty, no allocation
+        variables: Vec::new(),
+        // alloc: empty, no allocation
+        inlined: Vec::new(),
+    };
+    // alloc: a few bytes kept in the store; the error's message
+    postcard::to_extend(&side, Vec::new()).map_err(|e| e.to_string())
+}
+
+/// The content ID of a side table's `bytes`, as [`encode`] gives it.
+pub(crate) fn id(bytes: &[u8]) -> ContentId {
+    ContentId::of(SIDE_DOMAIN, bytes)
+}
+
+/// What follows the table in `bytes`: its function's report ([`super::report`]), empty for
+/// one without. [`decode`] reads the table alone and leaves it.
+pub(crate) fn after(bytes: &[u8]) -> Result<&[u8], String> {
+    // alloc: the error's message
+    let (side, rest) = postcard::take_from_bytes::<Side<'_>>(bytes).map_err(|e| e.to_string())?;
+    if side.version != VERSION {
+        // alloc: the error's message
+        return Err(format!("a side table of version {}, not {VERSION}", side.version));
+    }
+    Ok(rest)
+}
+
+/// The table in `bytes`, its frame base borrowed from them. A report after it is left.
 pub(crate) fn decode(bytes: &[u8]) -> Result<Side<'_>, String> {
     // alloc: the error's message
     let side: Side<'_> = postcard::from_bytes(bytes).map_err(|e| e.to_string())?;

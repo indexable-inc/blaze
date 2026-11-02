@@ -5,7 +5,7 @@
 use std::{
     alloc::{Allocator, Global},
     borrow::Cow,
-    cell::{OnceCell, RefCell},
+    cell::RefCell,
     hash::BuildHasher as _,
 };
 
@@ -113,7 +113,8 @@ fn bodyless(
     let name = FunctionSignature::of(db, func).name.as_str();
     match func.lookup(db).container {
         ItemContainerId::ExternBlockId(_) => {
-            let Some(symbol) = link_name(db, func) else {
+            // alloc: the error's message, where the crate's target did not load
+            let Some(symbol) = link_name(db, func).map_err(|e| e.to_string())? else {
                 // alloc: the error's message
                 return Err(format!("`{name}` of an `extern` block has no link name"));
             };
@@ -143,7 +144,8 @@ pub(crate) fn static_ref(db: &Db, id: StaticId) -> Result<Ref, String> {
     if weak_symbol(db, id)?.is_some() {
         return Ok(FrontRef::Static(HirStatic(id)));
     }
-    match static_link_name(db, id) {
+    // alloc: the error's message, where the crate's target did not load
+    match static_link_name(db, id).map_err(|e| e.to_string())? {
         Some(symbol) => Ok(FrontRef::Extern(symbol)),
         None => Ok(FrontRef::Static(HirStatic(id))),
     }
@@ -154,7 +156,8 @@ pub(crate) fn weak_symbol(db: &Db, id: StaticId) -> Result<Option<String>, Strin
     if !AttrFlags::linkage(db, id.into()).is_some_and(|it| it.as_str() == "extern_weak") {
         return Ok(None);
     }
-    match static_link_name(db, id) {
+    // alloc: the error's message, where the crate's target did not load
+    match static_link_name(db, id).map_err(|e| e.to_string())? {
         Some(symbol) => Ok(Some(symbol)),
         // alloc: the error's message
         None => Err(format!(
@@ -170,21 +173,32 @@ pub(crate) fn libcall_ref(libcall: ir::LibCall) -> Ref {
 }
 
 pub(crate) fn libcall_symbol(libcall: ir::LibCall) -> String {
-    cranelift_module::default_libcall_names()(libcall)
+    libcall_name(libcall).to_owned() // alloc: the symbol a reference owns
 }
 
-/// The C library's name of each routine Cranelift calls itself, made once a process:
-/// `default_libcall_names` makes a boxed closure and a `String` a call.
-pub(crate) fn libcall_name(libcall: ir::LibCall) -> Result<&'static str, String> {
-    static NAMES: std::sync::LazyLock<Box<[(ir::LibCall, String)]>> = std::sync::LazyLock::new(|| {
-        let name = cranelift_module::default_libcall_names();
-        // alloc: once a process
-        ir::LibCall::all_libcalls().iter().map(|&it| (it, name(it))).collect()
-    });
-    match NAMES.iter().find(|it| it.0 == libcall) {
-        Some((_, name)) => Ok(name.as_str()),
-        // alloc: an error
-        None => Err(format!("{libcall:?}, which Cranelift's list of its libcalls lacks")),
+/// The C library's name of each routine Cranelift calls itself, as
+/// `cranelift_module::default_libcall_names` names it, which makes a boxed closure and a
+/// `String` a call.
+pub(crate) const fn libcall_name(libcall: ir::LibCall) -> &'static str {
+    match libcall {
+        ir::LibCall::Probestack => "__cranelift_probestack",
+        ir::LibCall::CeilF32 => "ceilf",
+        ir::LibCall::CeilF64 => "ceil",
+        ir::LibCall::FloorF32 => "floorf",
+        ir::LibCall::FloorF64 => "floor",
+        ir::LibCall::TruncF32 => "truncf",
+        ir::LibCall::TruncF64 => "trunc",
+        ir::LibCall::NearestF32 => "nearbyintf",
+        ir::LibCall::NearestF64 => "nearbyint",
+        ir::LibCall::FmaF32 => "fmaf",
+        ir::LibCall::FmaF64 => "fma",
+        ir::LibCall::Memcpy => "memcpy",
+        ir::LibCall::Memset => "memset",
+        ir::LibCall::Memmove => "memmove",
+        ir::LibCall::Memcmp => "memcmp",
+        ir::LibCall::ElfTlsGetAddr => "__tls_get_addr",
+        ir::LibCall::ElfTlsGetOffset => "__tls_get_offset",
+        ir::LibCall::X86Pshufb => "__cranelift_x86_pshufb",
     }
 }
 
@@ -435,7 +449,7 @@ pub(crate) const OWN: u32 = u32::MAX;
 /// worker's that `work` gets through [`Placed::frame`] and that is reset when it returns.
 pub(crate) fn resolve<T>(places: &Places, refs: &Refs, work: impl FnOnce(&Placed<'_>) -> T) -> T {
     blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
-        work(&Placed { places, refs, frame, symbols: OnceCell::new(), own: None })
+        work(&Placed { places, refs, frame, symbols: RefCell::new(None), own: None })
     })
 }
 
@@ -449,7 +463,7 @@ pub(crate) fn resolve_owning<T>(
 ) -> (T, Vec<String>) {
     blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
         let own = Some(RefCell::default());
-        let placed = Placed { places, refs, frame, symbols: OnceCell::new(), own };
+        let placed = Placed { places, refs, frame, symbols: RefCell::new(None), own };
         let done = work(&placed);
         (done, placed.own.map(RefCell::into_inner).unwrap_or_default())
     })
@@ -463,7 +477,7 @@ pub(crate) struct Placed<'a> {
     refs: &'a Refs,
     /// The unit's frame: its emit's tables are kept there.
     frame: &'a Frame,
-    symbols: OnceCell<HashTable<(u64, u32), &'a Frame>>,
+    symbols: RefCell<Option<HashTable<(u64, u32), &'a Frame>>>,
     /// The symbols the backend named that `refs` does not list, when it may name its own. Kept
     /// past the emit ([`blaze_codegen::backend::Emitted::extra`]).
     own: Option<RefCell<Vec<String>>>,
@@ -514,7 +528,8 @@ impl Resolver for Placed<'_> {
     fn symbol(&self, name: &str) -> Result<Target, String> {
         let refs = self.refs;
         let frame = self.frame;
-        let symbols = self.symbols.get_or_init(|| {
+        let mut symbols = self.symbols.borrow_mut();
+        let symbols = symbols.get_or_insert_with(|| {
             let mut index: HashTable<(u64, u32), &Frame> = HashTable::new_in(frame);
             for (at, it) in refs.iter().enumerate() {
                 if let Target::Extern(it) = it {
@@ -526,9 +541,11 @@ impl Resolver for Placed<'_> {
         });
         let same =
             |&(_, at): &(u64, u32)| matches!(&refs[at as usize], Target::Extern(it) if it == name);
-        match symbols.find(symbol_hash(name), same) {
+        let found = symbols.find(symbol_hash(name), same).map(|&(_, at)| at);
+        drop(symbols);
+        match found {
             // clone: `Resolver::symbol` returns an owned `Target`, as `target` does
-            Some(&(_, at)) => Ok(refs[at as usize].clone()),
+            Some(at) => Ok(refs[at as usize].clone()),
             None => match &self.own {
                 Some(own) if !name.is_empty() => {
                     let mut own = own.borrow_mut();
@@ -564,8 +581,8 @@ mod tests {
     fn every_libcall_is_named_as_cranelift_names_it() {
         let name = cranelift_module::default_libcall_names();
         for &libcall in LibCall::all_libcalls() {
-            assert_eq!(super::libcall_name(libcall), Ok(name(libcall).as_str()));
-            assert_eq!(super::libcall_name(libcall).map(str::to_owned), Ok(super::libcall_symbol(libcall)));
+            assert_eq!(super::libcall_name(libcall), name(libcall));
+            assert_eq!(super::libcall_symbol(libcall), name(libcall));
         }
     }
 

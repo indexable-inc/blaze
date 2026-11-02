@@ -36,6 +36,7 @@ use std::{
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::{MemError, Slab, Tag as MemTag};
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
 
@@ -305,15 +306,15 @@ pub struct Kqueue {
     /// By ticks since `start`; the wait ends at the next one due.
     timers: Wheel<Tag>,
     watches: Slab<fsevents::Watch<Watched>>,
-    watch_tags: HashMap<Tag, WatchId>,
+    watch_tags: HashMap<Tag, WatchId, Global>,
     /// Stopped, for the next watch.
     spare: Vec<fsevents::Watch<Watched>>,
     /// The flushes a stopping watch had not told.
     untold: Vec<Tag>,
     spawns: Slab<Spawned>,
-    spawn_tags: HashMap<Tag, SpawnId>,
+    spawn_tags: HashMap<Tag, SpawnId, Global>,
     listens: Slab<Listening>,
-    listen_tags: HashMap<Tag, ListenId>,
+    listen_tags: HashMap<Tag, ListenId, Global>,
     connecting: Slab<Connecting>,
     conns: Slab<Connection>,
     in_flight: usize,
@@ -367,8 +368,8 @@ impl Kqueue {
             })
             // alloc: setup, once per driver.
             .collect::<io::Result<Vec<_>>>()?;
-        fn tags<V>() -> HashMap<Tag, V> {
-            HashMap::with_capacity_and_hasher(TAGS, Default::default())
+        fn tags<V>() -> HashMap<Tag, V, Global> {
+            HashMap::with_capacity_in(TAGS, Global)
         }
         let spawn_dirs = root.join(".blaze-spawn"); // alloc: setup, once per driver.
         Ok(Kqueue {
@@ -453,11 +454,13 @@ impl Kqueue {
             | Effect::WriteAt { .. }
             | Effect::Rename { .. }
             | Effect::Mode { .. }
+            | Effect::Seal { .. }
             | Effect::Private { .. }
             | Effect::Times { .. }
             | Effect::Clone { .. }
             | Effect::Link { .. }
             | Effect::Stat { .. }
+            | Effect::Lstat { .. }
             | Effect::List { .. }
             | Effect::Remove { .. }
             | Effect::Stamp { .. }
@@ -1989,7 +1992,7 @@ mod tests {
     /// trigger's, never reused.
     struct OldOwners {
         next: u64,
-        owners: HashMap<u64, Owner>,
+        owners: HashMap<u64, Owner, Global>,
     }
 
     impl OldOwners {
@@ -2031,7 +2034,7 @@ mod tests {
         for seed in 0..300 {
             let mut rng = Rng::new(seed);
             let mut owners = Owners::new().unwrap();
-            let mut old = OldOwners { next: TRIGGER + 1, owners: HashMap::default() };
+            let mut old = OldOwners { next: TRIGGER + 1, owners: HashMap::new_in(Global) };
             // Each registration made: its id in each, and whether it is live.
             let mut made: Vec<(u64, u64, bool)> = Vec::new();
             for _ in 0..500 {

@@ -7,6 +7,7 @@
 use base_db::{Crate, Db};
 use hir_expand::name::Name;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_query::db::{Durability, Setter};
 use triomphe::Arc;
 
@@ -69,7 +70,7 @@ pub(in crate::nameres) struct CrateResolution {
     #[returns(copy)]
     prelude: Option<(ModuleId, Option<UseId>)>,
     #[returns(ref)]
-    macro_use_prelude: HashMap<Name, (MacroId, Option<ExternCrateId>)>,
+    macro_use_prelude: HashMap<Name, (MacroId, Option<ExternCrateId>), Global>,
     #[returns(copy)]
     session_macros: bool,
     #[returns(ref)]
@@ -81,7 +82,7 @@ pub(in crate::nameres) struct CrateResolution {
 #[blaze_query::input(singleton)]
 pub(in crate::nameres) struct Resolutions {
     #[returns(ref)]
-    crates: HashMap<Crate, CrateResolution>,
+    crates: HashMap<Crate, CrateResolution, Global>,
 }
 
 fn scope_input(id: blaze_query::db::Id) -> ScopeInput {
@@ -181,7 +182,7 @@ pub(in crate::nameres) fn published(db: &Db, krate: Crate) -> Option<(DefMap, Lo
         prelude: resolution.prelude(db),
         // clone: the crate's `macro_use` prelude, a handful of names, once per def map
         macro_use_prelude: resolution.macro_use_prelude(db).clone(),
-        derive_helpers_in_scope: HashMap::default(),
+        derive_helpers_in_scope: HashMap::new_in(Global),
         session_macros: resolution.session_macros(db),
         names: NameRecords::default(),
         // alloc: empty, allocates nothing: the diagnostics are in the records
@@ -200,13 +201,13 @@ pub(in crate::nameres) fn published(db: &Db, krate: Crate) -> Option<(DefMap, Lo
 /// write that changes none of them runs no `crate_local_def_map` of the crate again.
 #[cfg(test)]
 pub(in crate::nameres) struct Slices {
-    resolutions: HashMap<Crate, CrateResolution>,
+    resolutions: HashMap<Crate, CrateResolution, Global>,
     resolution: CrateResolution,
     root: ModuleId,
     local: LocalDefMap,
     data: Arc<DefMapCrateData>,
     prelude: Option<(ModuleId, Option<UseId>)>,
-    macro_use_prelude: HashMap<Name, (MacroId, Option<ExternCrateId>)>,
+    macro_use_prelude: HashMap<Name, (MacroId, Option<ExternCrateId>), Global>,
     session_macros: bool,
 }
 
@@ -296,7 +297,7 @@ pub(super) struct Assembled {
     pub(super) local: LocalDefMap,
     pub(super) data: Arc<DefMapCrateData>,
     pub(super) prelude: Option<(ModuleId, Option<UseId>)>,
-    pub(super) macro_use_prelude: HashMap<Name, (MacroId, Option<ExternCrateId>)>,
+    pub(super) macro_use_prelude: HashMap<Name, (MacroId, Option<ExternCrateId>), Global>,
     pub(super) session_macros: bool,
     pub(super) records: Option<OwnedRecords>,
 }
@@ -382,7 +383,7 @@ pub(super) fn enter(db: &mut Db, krate: Crate, resolution: Option<CrateResolutio
             all.set_crates(db).to(crates);
         }
         None => {
-            let mut crates = HashMap::default();
+            let mut crates = HashMap::new_in(Global);
             if let Some(it) = resolution {
                 crates.insert(krate, it);
             }

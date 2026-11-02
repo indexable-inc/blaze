@@ -87,8 +87,8 @@ fn roots<'db>(
 /// the same id is what the stored files hold.
 fn stable_ids(out: &str) -> String {
     use std::fmt::Write as _;
-    let mut labels = blaze_hash::HashMap::<(&str, &str), usize>::default();
-    let mut counts = blaze_hash::HashMap::<&str, usize>::default();
+    let mut labels = blaze_hash::HashMap::<(&str, &str), usize, std::alloc::Global>::default();
+    let mut counts = blaze_hash::HashMap::<&str, usize, std::alloc::Global>::default();
     let mut result = String::with_capacity(out.len());
     let (mut at, mut copied) = (0, 0);
     while let Some(found) = out[at..].find("Id(") {

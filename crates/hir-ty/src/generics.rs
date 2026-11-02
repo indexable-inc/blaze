@@ -193,6 +193,7 @@ impl<'db> Generics<'db> {
         for predicate in owner.params.where_predicates() {
             let &WherePredicate::TypeBound {
                 lifetimes: None,
+                binder: hir_def::hir::generics::BinderParams { len: 0, .. },
                 target,
                 bound: TypeBound::Lifetime(lifetime),
             } = predicate
@@ -250,6 +251,12 @@ impl<'db> Generics<'db> {
 
     pub(crate) fn has_no_params(&self) -> bool {
         self.iter_owners().all(|owner| owner.has_no_params())
+    }
+
+    /// The generic parameters whose where predicates live in `store`: those of the owner or
+    /// the parent that wrote them, which hold their `for<F: ..>` binder parameters.
+    pub(crate) fn params_of_store(&self, store: &ExpressionStore) -> Option<&'db GenericParams> {
+        self.chain.iter().find(|it| std::ptr::eq(it.store, store)).map(|it| it.params)
     }
 
     pub(crate) fn def(&self) -> GenericDefId {

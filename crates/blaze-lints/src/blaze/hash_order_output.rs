@@ -273,7 +273,7 @@ impl<'db> Walk<'_, 'db> {
 }
 
 /// The local the path expression `expr` of `def`'s body names, if it names one.
-fn local_of(db: &Db, def: DefWithBodyId, body: &Body, expr: ExprId) -> Option<BindingId> {
+pub(super) fn local_of(db: &Db, def: DefWithBodyId, body: &Body, expr: ExprId) -> Option<BindingId> {
     let Expr::Path(path) = body.expr(expr) else { return None };
     let scope = ExprScopes::of(db, def).scope_for(expr);
     match resolver_for_scope(db, def, scope).resolve_path_in_value_ns_fully(db, path, body.expr_path_hygiene(expr)) {

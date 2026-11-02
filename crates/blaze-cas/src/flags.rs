@@ -52,7 +52,11 @@ pub(crate) const FLAGS: usize = 6;
 /// Words of one block of 64 rows: a word for each flag, padded to a 64-byte line.
 const BLOCK: usize = 8;
 
-const _: () = assert!(FLAGS <= BLOCK && BLOCK * size_of::<AtomicU64>() == 64);
+const _: () = assert!(FLAGS <= BLOCK);
+// One block a cache line holds for `std`'s atomics; a model checker's (`cfg(blaze_check)`) carry
+// its bookkeeping and are larger, and a model checks orderings, not lines.
+#[cfg(not(blaze_check))]
+const _: () = assert!(BLOCK * size_of::<AtomicU64>() == 64);
 
 /// A flag is a hint about bytes that never change at a place, so no ordering is needed.
 const RELAXED: Ordering = Ordering::Relaxed;

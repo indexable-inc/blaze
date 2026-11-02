@@ -25,6 +25,7 @@ use std::collections::VecDeque;
 
 use blaze_core::Conn;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, radix};
 use blaze_mem::{
     Handle, Slab, Tag,
@@ -72,18 +73,18 @@ pub struct Session {
     next_serial: u64,
     /// Every request not yet over, by the session's own number for it; a gone connection's
     /// stay until their jobs finish.
-    pending: HashMap<u64, Pending>,
+    pending: HashMap<u64, Pending, Global>,
     /// The number of each request of a live connection not yet over. A gone connection's are
     /// found by a walk and put in order of id; a request's begin and end touch one slot and
     /// allocate nothing.
-    live: HashMap<RequestRef, u64>,
+    live: HashMap<RequestRef, u64, Global>,
     /// Every job not finished, by its slot ([`JobId`]): what it is for.
     jobs: Slab<Job>,
     /// Commits waiting to be durable.
-    tickets: HashMap<Ticket, u64>,
+    tickets: HashMap<Ticket, u64, Global>,
     /// The views each connection opened with [`Request::Open`], by root, one per open; sorted
     /// by root where a gone connection's are closed.
-    held: HashMap<Conn, HashMap<ContentId, Vec<ViewId>>>,
+    held: HashMap<Conn, HashMap<ContentId, Vec<ViewId>, Global>, Global>,
     /// The database's view of the last job that ended on each of the latest [`KEPT`] roots,
     /// oldest first: what [`Request::Why`] reads, since a view's reruns are its own.
     kept: VecDeque<(ContentId, ViewId)>,
@@ -211,15 +212,15 @@ impl Session {
     pub fn new() -> Session {
         Session {
             next_serial: 0,
-            pending: HashMap::default(),
-            live: HashMap::default(),
+            pending: HashMap::new_in(Global),
+            live: HashMap::new_in(Global),
             // alloc: none, address space reserved.
             jobs: match Slab::new(JOBS, Tag::Api) {
                 Ok(it) => it,
                 Err(error) => panic!("the session's table of jobs: {error}"),
             },
-            tickets: HashMap::default(),
-            held: HashMap::default(),
+            tickets: HashMap::new_in(Global),
+            held: HashMap::new_in(Global),
             kept: VecDeque::new(),
             intents: Intents::default(),
             now_ns: 0,
@@ -743,10 +744,11 @@ impl Session {
                 let hot = (cx.hot)(top, since)?;
                 answer(out, req, Response::Hot(hot));
             }
-            Request::Explore { .. } | Request::Live | Request::Sql { .. } => {
+            Request::Explore { .. } | Request::Live | Request::Sql { .. } | Request::Gc { .. } | Request::Rebuilt { .. } => {
                 return Err(ApiError::new(
-                    "the explorer, the live feed and live SQL are answered by the daemon's loop, \
-                     which holds their servers and feeds; this one handed the request on instead",
+                    "the explorer, the live feed, live SQL, the collector and the last build's \
+                     reasons are answered by the daemon's loop, which holds their servers, feeds, \
+                     collector and reasons; this one handed the request on instead",
                     Some(request_name(&request).to_owned()),
                 ));
             }
@@ -921,7 +923,7 @@ impl Session {
 
     /// The views the session holds open: the connections' and the jobs'.
     fn views(&self) -> u32 {
-        let held: usize = self.held.values().flat_map(HashMap::values).map(Vec::len).sum();
+        let held: usize = self.held.values().flat_map(|it| it.values()).map(Vec::len).sum();
         let jobs: usize = self.pending.values().map(|it| it.what.views()).sum();
         u32::try_from(held + jobs + self.intents.views()).expect("fewer than 2^32 open views")
     }
@@ -1083,6 +1085,8 @@ fn request_name(request: &Request) -> &'static str {
         Request::Explore { .. } => "blaze explore",
         Request::Live => "blaze debug live",
         Request::Sql { .. } => "blaze debug sql --live",
+        Request::Gc { .. } => "blaze cache gc",
+        Request::Rebuilt { .. } => "blaze why",
         _ => "a request",
     }
 }

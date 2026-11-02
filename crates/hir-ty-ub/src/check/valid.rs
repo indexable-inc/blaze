@@ -13,6 +13,7 @@ use std::{fmt, ops::Range};
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::radix;
 use hir_def::{
     AdtId, EnumId, EnumVariantId, HasModule, Lookup, VariantId,
@@ -255,16 +256,16 @@ fn range(r: (u32, u32)) -> Range<usize> {
 pub(crate) struct Plans<'db> {
     plans: Vec<Plan>,
     ops: Vec<Op<'db>>,
-    by_ty: HashMap<Ty<'db>, u32>,
+    by_ty: HashMap<Ty<'db>, u32, Global>,
     enums: Vec<EnumPlan>,
     variants: Vec<VariantPlan>,
     paths: Vec<PathNode>,
     pointees: Vec<Pointee<'db>>,
-    pointee_by_ty: HashMap<Ty<'db>, u32>,
+    pointee_by_ty: HashMap<Ty<'db>, u32, Global>,
     cells: Vec<Span>,
     levels: Vec<(u64, u64)>,
     unions: Vec<(u64, u64)>,
-    layouts: HashMap<Ty<'db>, &'static Layout>,
+    layouts: HashMap<Ty<'db>, &'static Layout, Global>,
     infcx: Option<(base_db::Crate, InferCtxt<'db>)>,
     // Scratch, reused by every copy.
     data: Vec<(u64, u64)>,
@@ -280,7 +281,7 @@ impl<'db> Default for Plans<'db> {
             plans: Vec::new(),
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             ops: Vec::new(),
-            by_ty: HashMap::default(),
+            by_ty: HashMap::new_in(Global),
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             enums: Vec::new(),
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
@@ -289,14 +290,14 @@ impl<'db> Default for Plans<'db> {
             paths: vec![PathNode { parent: 0, elem: Elem::Root }],
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             pointees: Vec::new(),
-            pointee_by_ty: HashMap::default(),
+            pointee_by_ty: HashMap::new_in(Global),
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             cells: Vec::new(),
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             levels: Vec::new(),
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             unions: Vec::new(),
-            layouts: HashMap::default(),
+            layouts: HashMap::new_in(Global),
             infcx: None,
             // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             data: Vec::new(),
@@ -921,7 +922,10 @@ impl<'db> Plans<'db> {
             let infcx = DbInterner::new_with(db, env.krate).infer_ctxt().build(TypingMode::PostAnalysis);
             self.infcx = Some((env.krate, infcx));
         }
-        &self.infcx.as_ref().expect("built above").1
+        let infcx = &self.infcx.as_ref().expect("built above").1;
+        // Each environment asked in can assume things of a `for const` binder; idempotent.
+        hir_ty::comptime_env::enter_universes(infcx, env.param_env);
+        infcx
     }
 
     fn path(&mut self, parent: u32, elem: Elem) -> u32 {
@@ -1115,6 +1119,11 @@ impl<'db> Plans<'db> {
                         let fl = self.layout(cx, fty)?;
                         self.compile(cx, fty, &fl, at + layout.fields.offset(i).bytes(), fpath, ops, dense)?;
                     }
+                }
+                // A `#[blaze::bits]` struct is its backing integer: its fields have no bytes of
+                // their own to visit.
+                AdtId::StructId(id) if hir_ty::layout::is_bits_struct(db, id) => {
+                    ops.push(Op::Int { at, size: layout.size.bytes() as u8, float: false, path })
                 }
                 AdtId::StructId(id) => {
                     self.fields(cx, VariantId::StructId(id), args, layout, &layout.fields, at, path, ops, dense)?;

@@ -180,6 +180,7 @@ impl Db {
             parses: Parses::new(crate::trees::installed().cloned()),
         };
         set_all_crates_with_durability(&mut db, std::iter::empty(), Durability::HIGH);
+        crate::settings::set_from_env(&mut db);
         db
     }
 

@@ -9,6 +9,11 @@
 //!   looks keeps its result (#805). Which is which is [`blaze_build_script::Env::origin`].
 //! - **Traced**: every file, listing and variable the script and every program it ran read,
 //!   the C compiler and its headers among them (#1480).
+//! - **Portable** (docs/v2/plan/lanes/store.md, "Portable keys"): every path and value in
+//!   the key and in what is traced is written against the run's roots ([`crate::roots`]): its
+//!   package, its `OUT_DIR`, the target directory, the workspace, blaze's tools and launcher
+//!   ([`Place::roots`]), so the same script of the same package in another checkout is found
+//!   (not on Windows, where a run has no roots).
 //! - The jobserver's variables ([`RUN_ONLY`]) are of this run alone, as they are not in
 //!   cargo's fingerprint: neither given nor traced.
 //! - **Elided** (#1296): a script that provably only prints constant cargo directives is not
@@ -27,6 +32,7 @@ use blaze_ids::ContentId;
 
 use crate::{
     Given, RunKey, RunKind,
+    roots::{Role, RoleSet, RootMap},
     rule::CargoRule,
     run::{self, Mode, OutFile, Value},
 };
@@ -46,6 +52,9 @@ pub struct Place {
     pub network: bool,
     pub memory: Option<u64>,
     pub mode: Mode,
+    /// The roots the build has besides the run's own package and `OUT_DIR`, which
+    /// [`prepare`] adds: the target directory, the workspace, blaze's tools and its launcher.
+    pub roots: RootMap,
 }
 
 /// A script's run, ready to begin, and the environment a check of its inputs is made in.
@@ -65,15 +74,32 @@ pub struct Prepared {
 /// [`blaze_build_script::env::cargo_started`]).
 pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -> Result<Prepared, Error> {
     let env = blaze_build_script::env(unit, inherited)?;
+    let mut roots = place
+        .roots
+        .clone() // clone: setup, the run's roots are the build's and its own
+        .with(Role::Package, &unit.package.manifest_dir)
+        .with(Role::OutDir, &unit.out_dir);
+    let view = roots.view();
     let mut given = Given::new(RunKind::BuildScript);
+    // The roots a given string still holds once ported (`-L/ws/p/lib`, a root after a path
+    // byte): its key is then this checkout's string, and the run is kept here alone.
+    let mut bound = RoleSet::default();
     let mut names = Vec::new(); // alloc: setup, the names the check leaves out
     for (name, value) in env.set_from_unit().filter(|(name, _)| !run_only(name)) {
-        given.env(name.to_owned(), value.to_owned()); // alloc: setup, the given variables
+        bound = bound.union(view.left(value.as_encoded_bytes()));
+        given.env(name.to_owned(), view.os(value).into_owned()); // alloc: setup, the given variables
         names.push(name.to_owned()); // alloc: setup, as above
     }
-    given.part("program", &crate::trace::os_bytes(unit.script.as_os_str()));
-    given.part("dir", &crate::trace::os_bytes(unit.package.manifest_dir.as_os_str()));
+    given.roots(&view);
+    // Its binary is `place.code`, by content; its path is what it sees as `argv[0]`. On Windows
+    // `os_bytes` is UTF-16 units and a run has no roots, so these stay absolute there.
+    let program = crate::trace::os_bytes(unit.script.as_os_str());
+    let dir = crate::trace::os_bytes(unit.package.manifest_dir.as_os_str());
+    given.ported("program", &program, &view);
+    given.ported("dir", &dir, &view);
+    bound = bound.union(view.left(&program)).union(view.left(&dir));
     let key = RunKey { code: place.code, given: given.finish() };
+    roots.bind(bound);
     let vars: Vec<(OsString, OsString)> = env.vars.into_iter().collect(); // alloc: setup, the script's environment
     let command = Command {
         program: unit.script.clone(), // clone: setup, the command owns its program
@@ -91,7 +117,7 @@ pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -
         memory: place.memory,
     };
     // clone: setup, the run owns its OUT_DIR
-    let spec = run::Spec { key, command, out_dir: Some(unit.out_dir.clone()), mode: place.mode };
+    let spec = run::Spec { key, command, out_dir: Some(unit.out_dir.clone()), mode: place.mode, roots };
     Ok(Prepared { spec, env: vars, given: names, made: given })
 }
 
@@ -162,7 +188,54 @@ mod tests {
     }
 
     fn place() -> Place {
-        Place { code: ContentId::of("blaze v2 test 1", b"script"), read: vec!["/ws/p".into()], network: false, memory: None, mode: Mode::Normal }
+        Place {
+            code: ContentId::of("blaze v2 test 1", b"script"),
+            read: vec!["/ws/p".into()],
+            network: false,
+            memory: None,
+            mode: Mode::Normal,
+            roots: RootMap::default().with(Role::Target, Path::new("/t")).with(Role::Tools, Path::new("/bin")),
+        }
+    }
+
+    /// `unit()` in a checkout at `home`.
+    #[cfg(not(windows))]
+    fn moved(home: &str) -> (Unit, Place) {
+        let mut unit = unit();
+        let at = |path: &Path| PathBuf::from(format!("{home}{}", path.display()));
+        unit.package.manifest_dir = at(&unit.package.manifest_dir);
+        unit.package.manifest_path = at(&unit.package.manifest_path);
+        unit.tools.cargo = at(&unit.tools.cargo);
+        unit.tools.rustc = at(&unit.tools.rustc);
+        unit.tools.rustdoc = at(&unit.tools.rustdoc);
+        unit.script = at(&unit.script);
+        unit.out_dir = at(&unit.out_dir);
+        let mut place = place();
+        place.roots = RootMap::default()
+            .with(Role::Target, &at(Path::new("/t")))
+            .with(Role::Workspace, &at(Path::new("/ws")))
+            .with(Role::Tools, &at(Path::new("/bin")));
+        (unit, place)
+    }
+
+    #[cfg(not(windows))] // Windows has no roots (`blaze_usercode::roots`).
+    #[test]
+    fn two_checkouts_at_different_paths_give_one_key() {
+        let (a, a_place) = moved("/home/a");
+        let (b, b_place) = moved("/srv/ci/b");
+        let one = prepare(&a, &inherited("/a"), &a_place).unwrap();
+        let two = prepare(&b, &inherited("/a"), &b_place).unwrap();
+        assert_eq!(one.spec.key, two.spec.key);
+        // What it is given is still its checkout's.
+        assert_ne!(one.spec.command.env, two.spec.command.env);
+        // Without its roots, a checkout elsewhere is another key.
+        let (mut c, mut c_place) = moved("/srv/ci/c");
+        c_place.roots = RootMap::default();
+        assert_ne!(one.spec.key, prepare(&c, &inherited("/a"), &c_place).unwrap().spec.key);
+        // A path given that is under no root stays absolute.
+        c_place = moved("/srv/ci/c").1;
+        c.tools.rustc = "/opt/rustc".into();
+        assert_ne!(one.spec.key, prepare(&c, &inherited("/a"), &c_place).unwrap().spec.key);
     }
 
     fn inherited(path: &str) -> Vec<(OsString, OsString)> {

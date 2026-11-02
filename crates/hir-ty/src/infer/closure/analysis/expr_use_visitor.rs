@@ -804,6 +804,18 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
                 self.walk_expr(base)?;
             }
 
+            // `for const`: the iterable is consumed and the body walked once, as it is checked
+            // once; `base.[f]` is a place of `base`, `f` a value.
+            Expr::ComptimeFor { pat: _, iterable, body, label: _ } => {
+                self.consume_expr(iterable)?;
+                self.walk_expr(body)?;
+            }
+
+            Expr::ReflectedField { base, field } => {
+                self.walk_expr(base)?;
+                self.consume_expr(field)?;
+            }
+
             Expr::Index { base: lhs, index: rhs } => {
                 // lhs[rhs]
                 self.walk_expr(lhs)?;
@@ -1652,6 +1664,14 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                     expr_ty,
                     ProjectionKind::UnwrapUnsafeBinder,
                 ))
+            }
+
+            // `base.[f]` (`#![feature(blaze_comptime)]`): which field it is, only
+            // monomorphization knows, so to captures it is as an index of the base: the whole
+            // base is captured, as for `base[i]`.
+            Expr::ReflectedField { base, field: _ } => {
+                let base = self.cat_expr(base)?;
+                Ok(self.cat_projection(expr.into(), base, expr_ty, ProjectionKind::Index))
             }
 
             Expr::Index { base, index: _ } => {

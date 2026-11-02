@@ -15,10 +15,7 @@ pub mod own;
 
 pub use own::home;
 
-use std::{
-    path::{Path, PathBuf},
-    sync::OnceLock,
-};
+use std::path::{Path, PathBuf};
 
 use blaze_registry::http::{Http as _, HttpNotSuccessful, HyperHttp};
 
@@ -128,7 +125,11 @@ pub fn ensure() -> Result<Chosen, String> {
 }
 
 /// Where [`found`] found blaze's release, or was told it is ([`known_at`]).
-static FOUND: OnceLock<PathBuf> = OnceLock::new();
+#[expect(
+    clippy::disallowed_types,
+    reason = "where this blaze's release is: found on disk once, or told by the blaze that started the process, then fixed for it"
+)]
+static FOUND: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Tells this process where blaze's release is, as the blaze that started it found it: a
 /// build script's sandbox may not see where rustup and blaze keep toolchains.

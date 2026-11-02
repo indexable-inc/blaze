@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hegel::TestCase;
 use hegel::generators as gs;
 
@@ -82,18 +83,18 @@ struct Sim {
     jobs: u32,
     rank: Vec<u64>,
     /// A parallel map's job and its counter.
-    maps: HashMap<u32, CounterId>,
+    maps: HashMap<u32, CounterId, Global>, // alloc: a test's model
     /// Each counter's jobs.
-    counted: HashMap<u32, Vec<u32>>,
-    waits: HashMap<u32, ModelWait>,
+    counted: HashMap<u32, Vec<u32>, Global>, // alloc: a test's model
+    waits: HashMap<u32, ModelWait, Global>, // alloc: a test's model
     /// Key number to claimer (`None` for the driver's).
-    flights: HashMap<u32, Option<u32>>,
+    flights: HashMap<u32, Option<u32>, Global>, // alloc: a test's model
     next_key: u32,
     woken: Vec<u32>,
     /// Cores whose move flag is set.
-    flags: HashSet<u32>,
-    ran: HashSet<u32>,
-    done: HashSet<u32>,
+    flags: HashSet<u32, Global>, // alloc: a test's model
+    ran: HashSet<u32, Global>, // alloc: a test's model
+    done: HashSet<u32, Global>, // alloc: a test's model
 }
 
 const MAX_SIM_JOBS: u32 = 120;
@@ -105,15 +106,15 @@ impl Sim {
             mode,
             jobs: 0,
             rank: Vec::new(),
-            maps: HashMap::default(),
-            counted: HashMap::default(),
-            waits: HashMap::default(),
-            flights: HashMap::default(),
+            maps: HashMap::new_in(Global), // alloc: a test's model
+            counted: HashMap::new_in(Global), // alloc: a test's model
+            waits: HashMap::new_in(Global), // alloc: a test's model
+            flights: HashMap::new_in(Global), // alloc: a test's model
             next_key: 0,
             woken: Vec::new(),
-            flags: HashSet::default(),
-            ran: HashSet::default(),
-            done: HashSet::default(),
+            flags: HashSet::new_in(Global), // alloc: a test's model
+            ran: HashSet::new_in(Global), // alloc: a test's model
+            done: HashSet::new_in(Global), // alloc: a test's model
         }
     }
 
@@ -224,7 +225,7 @@ impl Sim {
 
     /// Whether the model's waits reach `job` from `wait`.
     fn reaches(&self, job: u32, wait: ModelWait) -> bool {
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new_in(Global); // alloc: a test's model
         let mut todo: VecDeque<u32> = self.resolve(wait).into();
         while let Some(next) = todo.pop_front() {
             if next == job {
@@ -1078,5 +1079,98 @@ fn a_warm_scheduler_allocates_nothing() {
             round(&mut sched, 200 + at * 20);
         }
     });
+    sched.audit();
+}
+
+#[test]
+fn a_background_job_runs_after_every_other_queued_with_it() {
+    let mut sched = Sched::new(Cores::flat(1).unwrap(), 8);
+    all_busy(&mut sched);
+    sched.spawn(JobId(1), Spawn::child(JobId(0)).background());
+    sched.spawn(JobId(2), Spawn::child(JobId(0)));
+    sched.spawn(JobId(3), Spawn::child(JobId(0)));
+    for (ended, next) in [(0, 3), (3, 2), (2, 1)] {
+        sched.done(JobId(ended));
+        assert_eq!(decisions(&mut sched), [run(0, next)]);
+        sched.audit();
+    }
+}
+
+/// Job 0 waits for its background child, queued behind two normal ones: the wait raises it, and
+/// it runs next.
+#[test]
+fn a_job_waiting_on_a_background_job_raises_it_ahead_of_normal_work() {
+    let mut sched = Sched::new(Cores::flat(1).unwrap(), 8);
+    all_busy(&mut sched);
+    sched.spawn(JobId(1), Spawn::child(JobId(0)).background());
+    sched.spawn(JobId(2), Spawn::child(JobId(0)));
+    sched.spawn(JobId(3), Spawn::child(JobId(0)));
+    assert_eq!(sched.suspended(JobId(0), Wait::Job(JobId(1))), Ok(Suspend::Waiting));
+    assert_eq!(decisions(&mut sched), [run(0, 1)]);
+    sched.audit();
+    for (ended, next) in [(1, 0), (0, 3), (3, 2)] {
+        sched.done(JobId(ended));
+        assert_eq!(decisions(&mut sched), [run(0, next)]);
+        sched.audit();
+    }
+}
+
+/// Job 1 claims key 9 and waits for job 2, queued. A critical job waiting on key 9 makes the
+/// key's claimer and the job it waits for critical.
+#[test]
+fn a_critical_wait_on_a_key_raises_its_claimer_and_what_it_waits_for() {
+    let mut sched = Sched::new(Cores::flat(1).unwrap(), 8);
+    all_busy(&mut sched);
+    sched.spawn(JobId(1), Spawn::child(JobId(0)));
+    assert_eq!(sched.suspended(JobId(0), Wait::Job(JobId(1))), Ok(Suspend::Waiting));
+    assert_eq!(decisions(&mut sched), [run(0, 1)]);
+    assert!(sched.claim(key(9), Some(JobId(1))));
+    sched.spawn(JobId(2), Spawn::child(JobId(1)));
+    sched.spawn(JobId(3), Spawn::child(JobId(1)));
+    assert_eq!(sched.suspended(JobId(1), Wait::Job(JobId(2))), Ok(Suspend::Waiting));
+    assert_eq!(decisions(&mut sched), [run(0, 3)]);
+    sched.set_critical(JobId(3), true);
+    assert_eq!(sched.suspended(JobId(3), Wait::Key(key(9))), Ok(Suspend::Waiting));
+    for job in [1, 2] {
+        assert!(sched.is_critical(JobId(job)), "job {job} along job 3's wait on key 9");
+    }
+    assert!(!sched.is_critical(JobId(0)), "job 0 waits for job 1, not the other way");
+    assert_eq!(decisions(&mut sched), [run(0, 2)]);
+    sched.audit();
+}
+
+#[test]
+fn a_background_job_is_stolen_only_when_no_core_has_other_work() {
+    let mut sched = Sched::new(Cores::flat(2).unwrap(), 8);
+    all_busy(&mut sched);
+    sched.spawn(JobId(2), Spawn::child(JobId(0)).background());
+    sched.spawn(JobId(3), Spawn::child(JobId(0)));
+    sched.done(JobId(1));
+    assert_eq!(decisions(&mut sched), [run(1, 3)]);
+    sched.audit();
+    sched.done(JobId(3));
+    assert_eq!(decisions(&mut sched), [run(1, 2)]);
+    sched.audit();
+}
+
+/// Job 0 waits for job 1, which waits for job 2, queued. Job 0 turning critical makes the jobs
+/// along its waits critical too.
+#[test]
+fn a_critical_waiter_raises_every_job_along_its_waits() {
+    let mut sched = Sched::new(Cores::flat(1).unwrap(), 8);
+    all_busy(&mut sched);
+    sched.spawn(JobId(1), Spawn::child(JobId(0)));
+    assert_eq!(sched.suspended(JobId(0), Wait::Job(JobId(1))), Ok(Suspend::Waiting));
+    assert_eq!(decisions(&mut sched), [run(0, 1)]);
+    sched.spawn(JobId(2), Spawn::child(JobId(1)));
+    sched.spawn(JobId(3), Spawn::child(JobId(1)));
+    assert_eq!(sched.suspended(JobId(1), Wait::Job(JobId(2))), Ok(Suspend::Waiting));
+    assert_eq!(decisions(&mut sched), [run(0, 3)]);
+    assert!(!sched.is_critical(JobId(2)));
+    sched.set_critical(JobId(0), true);
+    for job in [1, 2] {
+        assert!(sched.is_critical(JobId(job)), "job {job} along job 0's waits");
+    }
+    assert!(!sched.is_critical(JobId(3)), "job 3 is along no wait of job 0");
     sched.audit();
 }

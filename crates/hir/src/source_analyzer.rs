@@ -7,8 +7,6 @@
 //! purely for "IDE needs".
 mod view;
 
-use std::cell::OnceCell;
-
 use base_db::Db;
 use either::Either;
 use hir_def::{
@@ -143,7 +141,19 @@ impl<'db> SourceAnalyzer<'db> {
     }
 
     fn trait_environment(&self, db: &'db Db) -> ParamEnvAndCrate<'db> {
-        self.param_and(self.generic_def(db).map_or_else(ParamEnv::empty, |def| db.trait_environment(def)))
+        self.param_and(self.body_env(
+            self.generic_def(db).map_or_else(ParamEnv::empty, |def| db.trait_environment(def)),
+        ))
+    }
+
+    /// `env` with what the analyzed body's `for const` loops assume of their binders
+    /// (`#![feature(blaze_comptime)]`), the environment its types were inferred in: `env`
+    /// itself for a signature, a body without a loop, or one not inferred.
+    fn body_env(&self, env: ParamEnv<'db>) -> ParamEnv<'db> {
+        match self.body_or_sig {
+            Some(BodyOrSig::Body { infer: Some(infer), .. }) => infer.comptime_param_env(env),
+            _ => env,
+        }
     }
 
     fn resolve_impl_method_or_trait_def(
@@ -165,7 +175,7 @@ impl<'db> SourceAnalyzer<'db> {
             Some(it) => it,
             None => return (func.into(), substs),
         };
-        let env = self.param_and(db.trait_environment(owner));
+        let env = self.param_and(self.body_env(db.trait_environment(owner)));
         let (func, args) = db.lookup_impl_method(env, func, substs);
         match func {
             Either::Left(func) => (func.into(), args),
@@ -185,9 +195,10 @@ impl<'db> SourceAnalyzer<'db> {
             Some(it) => it,
             None => return (const_id, subs),
         };
-        let env = self.param_and(db.trait_environment(owner));
+        let env = self.param_and(self.body_env(db.trait_environment(owner)));
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
         method_resolution::lookup_impl_const(&infcx, env.param_env, const_id, subs)
     }
 
@@ -231,7 +242,7 @@ fn resolve_hir_path_<'db>(
         let (ty, unresolved, ty_is_visible) = match path.type_anchor() {
             Some(type_ref) => resolver.generic_def().and_then(|def| {
                 let store = store?;
-                let generics = OnceCell::new();
+                let generics = hir_ty::generics::generics(db, def);
                 let (_, res) = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
                     TyLoweringContext::new(
                         db,
@@ -440,7 +451,7 @@ fn resolve_hir_path_qualifier<'db>(
         let (ty, unresolved) = match path.type_anchor() {
             Some(type_ref) => resolver.generic_def().and_then(|def| {
                 let store = store?;
-                let generics = OnceCell::new();
+                let generics = hir_ty::generics::generics(db, def);
                 let (_, res) = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
                     TyLoweringContext::new(
                         db,

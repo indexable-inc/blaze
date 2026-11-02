@@ -1366,6 +1366,7 @@ pub fn could_coerce<'db>(
     blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        crate::comptime_env::enter_universes(&infcx, env.param_env);
         let ((ty1_with_vars, ty2_with_vars), _) = infcx.instantiate_canonical(Span::Dummy, tys);
 
         // FIXME: Target features.

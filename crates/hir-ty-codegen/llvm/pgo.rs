@@ -32,7 +32,7 @@
 use std::sync::{Arc, Weak};
 
 use blaze_codegen::settings::Pgo;
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use inkwell::{
     context::Context,
@@ -85,7 +85,7 @@ pub(crate) fn in_pipeline(optimization: Optimization) -> bool {
     matches!(optimization.passes, Passes::Default | Passes::Aggressive)
 }
 
-pub const NAME_DOMAIN: &str = "blaze v2 pgo name 1";
+pub use blaze_items::pgo::NAME_DOMAIN;
 
 /// The name a function's counts are kept under: of its item, which a rename or a move
 /// changes and an edit does not, and of its type arguments' facts. Two functions of one item
@@ -97,10 +97,7 @@ pub(crate) fn name(item: ItemKey, args: ContentId) -> String {
 
 /// The bytes [`name`] spells: what [`blaze_codegen::ProfileRecord::name`] keeps.
 pub(crate) fn name_bytes(item: ItemKey, args: ContentId) -> [u8; 16] {
-    let id = Hasher::new(NAME_DOMAIN).id(&item.0).id(&args).finish();
-    let mut bytes = [0; 16];
-    bytes.copy_from_slice(&id.0[..16]);
-    bytes
+    blaze_items::pgo::name_bytes(item, args)
 }
 
 pub const PROFILE_DOMAIN: &str = "blaze v2 pgo profile 1";
@@ -295,7 +292,7 @@ store:
     const NONE: Optimization = Optimization { passes: Passes::None, selection: Selection::Fast };
 
     fn machinery(wanted: Option<Wanted>) -> Machinery {
-        let machine = Machine::create(NONE).unwrap();
+        let machine = Machine::create(crate::Target::x86_64_linux(), NONE).unwrap();
         match wanted {
             None => Machinery::new(machine),
             Some(wanted) => Machinery::profiled(machine, wanted).unwrap(),
@@ -358,7 +355,8 @@ store:
         let text = text(&module);
         assert!(text.contains(&format!("@__profc_{name}")), "{text}");
         assert!(text.contains(COUNTERS[0]) || text.contains(COUNTERS[1]), "{text}");
-        assert!(!text.contains("llvm.instrprof.increment"), "{text}");
+        // Each increment is lowered; LLVM keeps the intrinsic's declaration, which emits nothing.
+        assert!(!text.contains("call void @llvm.instrprof.increment"), "{text}");
         assert!(text.contains("define i32 @blaze.own("), "{text}");
         assert!(!text.contains("__llvm_profile_instrument_target"), "{text}");
         let counted = counted(&module, &name).unwrap();
@@ -372,7 +370,7 @@ store:
 
     #[test]
     fn an_instrumented_object_reads_back_with_its_counters() {
-        let target = crate::Target::selected().unwrap();
+        let target = crate::Target::x86_64_linux();
         let context = Context::create();
         let machinery = machinery(Some(Wanted::Generate));
         let module = parsed(&context, &machinery);
@@ -382,8 +380,8 @@ store:
         renamed.restore();
         let counted = counted(&module, &function_name()).unwrap();
         let object = machinery.write_to_memory_buffer(&module, FileType::Object).unwrap();
-        let isa = crate::target().unwrap();
-        let mut wants = crate::fragment::Wants::new(&**isa);
+        let isa = crate::isa_for(crate::Target::x86_64_linux()).unwrap();
+        let mut wants = crate::fragment::Wants::new(crate::Target::x86_64_linux(), &**isa);
         let signature = cranelift_codegen::ir::Signature::new(isa.default_call_conv());
         let (code, _, bytes) = super::super::emitted::read_profiled(
             object.as_slice(),
@@ -400,14 +398,14 @@ store:
             .count();
         assert!(counts >= 1, "{:?}", code.relocs);
         // Read without PGO, the same object is refused.
-        let mut wants = crate::fragment::Wants::new(&**isa);
+        let mut wants = crate::fragment::Wants::new(crate::Target::x86_64_linux(), &**isa);
         let plain = super::super::emitted::read(object.as_slice(), &[(OWN, signature)], &mut wants);
         assert!(plain.is_err() || plain.unwrap()[0].is_err(), "{:?}", target.triple());
     }
 
-    /// `BODY` built with a profile of `records`: its text and how many functions the profile
-    /// had a record of under their name with another hash.
-    fn used(records: &[(&str, u64, &[u64])]) -> (String, u32) {
+    /// `BODY` built with a profile of `records`: its text, how many functions the profile had a
+    /// record of under their name with another hash, and how many it gave counts to.
+    fn used(records: &[(&str, u64, &[u64])]) -> (String, u32, u32) {
         let bytes = written(records);
         let id = profile_id(&bytes);
         let held = give(id, &bytes).unwrap();
@@ -420,7 +418,7 @@ store:
         renamed.restore();
         module.verify().unwrap();
         drop(held);
-        (text(&module), machinery.take_mismatched())
+        (text(&module), machinery.take_mismatched(), machinery.take_applied())
     }
 
     #[test]
@@ -428,24 +426,45 @@ store:
         let (hash, counters) = instrumented_hash();
         let name = function_name();
         let counts: Vec<u64> = (0..u64::from(counters)).map(|it| 1000 >> (it * 6)).collect();
-        let (text, mismatched) = used(&[(&name, hash, &counts)]);
+        let (text, mismatched, _) = used(&[(&name, hash, &counts)]);
         assert_eq!(mismatched, 0);
         assert!(text.contains("!\"branch_weights\""), "{text}");
         assert!(text.contains("!\"function_entry_count\""), "{text}");
-        let (plain, _) = used(&[("blaze.pgo.another", hash, &counts)]);
+        let (plain, ..) = used(&[("blaze.pgo.another", hash, &counts)]);
         assert!(!plain.contains("!\"branch_weights\""), "{plain}");
+    }
+
+    /// `LLVMBlazeTakeApplied`, which a job's "the profile applied to nothing" refusal rests
+    /// on: a record of the function's name and hash applies, one of another hash is a
+    /// mismatch that applies nothing, and a profile with no record of the name is neither.
+    #[test]
+    fn a_profile_counts_the_functions_it_gave_counts_to() {
+        let (hash, counters) = instrumented_hash();
+        let name = function_name();
+        let counts: Vec<u64> = (0..u64::from(counters)).map(|it| 1000 >> (it * 6)).collect();
+        let (text, mismatched, applied) = used(&[(&name, hash, &counts)]);
+        assert_eq!((mismatched, applied), (0, 1), "{text}");
+        let (text, mismatched, applied) = used(&[(&name, hash ^ 1, &counts)]);
+        assert_eq!((mismatched, applied), (1, 0), "{text}");
+        let (text, mismatched, applied) = used(&[("blaze.pgo.another", hash, &counts)]);
+        assert_eq!((mismatched, applied), (0, 0), "{text}");
+        // A function the profiled run never executed has a record of all zero counts, which
+        // still gives it counts (`function_entry_count 0`): it applies.
+        let zeros = vec![0; counters as usize];
+        let (text, mismatched, applied) = used(&[(&name, hash, &zeros)]);
+        assert_eq!((mismatched, applied), (0, 1), "{text}");
     }
 
     #[test]
     fn a_record_of_another_hash_is_counted_and_applies_nothing() {
         let (hash, counters) = instrumented_hash();
         let counts = vec![500; counters as usize];
-        let (text, mismatched) = used(&[(&function_name(), hash ^ 1, &counts)]);
-        assert_eq!(mismatched, 1);
+        let (text, mismatched, applied) = used(&[(&function_name(), hash ^ 1, &counts)]);
+        assert_eq!((mismatched, applied), (1, 0));
         assert!(!text.contains("!\"branch_weights\""), "{text}");
         // A profile with no record of the name is no mismatch.
-        let (_, missing) = used(&[("blaze.pgo.another", hash ^ 1, &counts)]);
-        assert_eq!(missing, 0);
+        let (_, missing, applied) = used(&[("blaze.pgo.another", hash ^ 1, &counts)]);
+        assert_eq!((missing, applied), (0, 0));
     }
 
     #[test]

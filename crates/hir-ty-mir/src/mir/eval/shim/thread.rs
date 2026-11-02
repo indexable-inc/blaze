@@ -326,7 +326,7 @@ fn missing<'db>(name: &str) -> MirEvalError<'db> {
 }
 
 fn null() -> Address {
-    Address::from_usize(0)
+    Address::invalid(0)
 }
 
 impl<'db, M: Machine<'db>> Evaluator<'db, M> {
@@ -414,7 +414,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let field = if name == "pthread_attr_getstacksize" { 2 } else { 3 };
                 let value = self.peek_word(self.attr_field(attr, field))?;
                 let out = self.ptr_of(arg(1)?)?;
-                self.write_memory(out, &word_bytes(value))?;
+                self.write_memory(out, &word_bytes(value, self.cached_ptr_size))?;
                 self.ret_int(destination, 0)?
             }
             "pthread_attr_getstack" => {
@@ -422,8 +422,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let addr = self.peek_word(self.attr_field(attr, 1))?;
                 let size = self.peek_word(self.attr_field(attr, 2))?;
                 let (addr_out, size_out) = (self.ptr_of(arg(1)?)?, self.ptr_of(arg(2)?)?);
-                self.write_memory(addr_out, &word_bytes(addr))?;
-                self.write_memory(size_out, &word_bytes(size))?;
+                self.write_memory(addr_out, &word_bytes(addr, self.cached_ptr_size))?;
+                self.write_memory(size_out, &word_bytes(size, self.cached_ptr_size))?;
                 self.ret_int(destination, 0)?
             }
             "pthread_attr_setdetachstate" => {
@@ -463,7 +463,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let (low, size) = self.thread_stack(thread);
                 // Apple's stack address is the top: the stack grows down from it.
                 let value = if name == "pthread_get_stackaddr_np" { low + size } else { size };
-                destination.write_from_bytes(self, &word_bytes(value))?
+                destination.write_from_bytes(self, &word_bytes(value, self.cached_ptr_size))?
             }
             "pthread_key_create" => self.pthread_key_create(args, destination, locals)?,
             "pthread_key_delete" => {
@@ -533,7 +533,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             "pthread_mutex_init" => {
                 let mutex = self.ptr_of(arg(0)?)?;
                 let attr = self.ptr_of(arg(1)?)?;
-                let kind = match attr.to_usize() {
+                let kind = match attr.to_usize(self.cached_ptr_size) {
                     0 => MutexKind::Normal,
                     _ => {
                         let kind_at = self.mutexattr_kind_at(attr)?;
@@ -567,7 +567,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         state.owner = me;
                         state.count = 1;
                         self.mutex_set(mutex, state)?;
-                        self.machine.acquire(mutex.to_usize() as u64)?;
+                        self.machine.acquire(mutex.to_usize(self.cached_ptr_size) as u64)?;
                         0
                     }
                     owner if owner == me && state.kind == MutexKind::Recursive => {
@@ -618,7 +618,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let cond = self.ptr_of(arg(0)?)?;
                 let attr = self.ptr_of(arg(1)?)?;
                 let target = self.target()?;
-                let clock = match (target.os, attr.to_usize()) {
+                let clock = match (target.os, attr.to_usize(self.cached_ptr_size)) {
                     (Os::Linux, 0) | (Os::Apple, _) => 0,
                     (Os::Linux, _) => self.peek_u32(attr)?,
                 };
@@ -662,7 +662,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let cond = self.ptr_of(arg(0)?)?;
                 self.cond_ready(cond)?;
                 let count = if name == "pthread_cond_signal" { 1 } else { usize::MAX };
-                self.wake(cond.to_usize(), u32::MAX, count)?;
+                self.wake(cond.to_usize(self.cached_ptr_size), u32::MAX, count)?;
                 self.ret_int(destination, 0)?
             }
             "pthread_cond_destroy" => {
@@ -707,7 +707,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     not_supported!("__ulock_wake of one thread (ULF_WAKE_THREAD)")
                 }
                 let count = if op & ULF_WAKE_ALL != 0 { usize::MAX } else { 1 };
-                match self.wake(addr.to_usize(), u32::MAX, count)? {
+                match self.wake(addr.to_usize(self.cached_ptr_size), u32::MAX, count)? {
                     0 => {
                         let noent = self.target()?.errno.noent;
                         self.fail(destination, errors, noent)?
@@ -748,7 +748,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     return self.fail(destination, Errors::Errno, target.errno.inval).map(|()| true);
                 }
                 let count = if name == "os_sync_wake_by_address_any" { 1 } else { usize::MAX };
-                match self.wake(addr.to_usize(), u32::MAX, count)? {
+                match self.wake(addr.to_usize(self.cached_ptr_size), u32::MAX, count)? {
                     0 => self.fail(destination, Errors::Errno, target.errno.noent)?,
                     _ => self.ret_int(destination, 0)?,
                 }
@@ -776,7 +776,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let semaphore = self.semaphore_of(arg(0)?)?;
                 let count = from_bytes!(i64, self.peek_memory(semaphore, 8)?);
                 self.poke_memory(semaphore, 8)?.copy_from_slice(&(count + 1).to_le_bytes());
-                let woken = self.wake(semaphore.to_usize(), u32::MAX, 1)?;
+                let woken = self.wake(semaphore.to_usize(self.cached_ptr_size), u32::MAX, 1)?;
                 self.ret_int(destination, (woken != 0).into())?
             }
             "dispatch_time" => {
@@ -900,7 +900,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     At::Heap(pos) => self.heap_blocks.get(&pos).copied(),
                     _ => None,
                 };
-                let at = addr.to_usize();
+                let at = addr.to_usize(self.cached_ptr_size);
                 match block {
                     Some(block)
                         if block.origin == Origin::Mmap
@@ -924,7 +924,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             && addr.offset + len <= start + block.size
                     },
                 );
-                let at = addr.to_usize();
+                let at = addr.to_usize(self.cached_ptr_size);
                 if !matches!(addr.at(), At::Heap(_)) || !mapped || at % page != 0 {
                     not_supported!("mprotect of {len} bytes at {at:#x}: only pages mmap mapped")
                 }
@@ -986,13 +986,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             let key_id = pass.next_key;
             let key = self.process.keys[key_id];
+            let ptr_size = self.cached_ptr_size;
             let tls = self.tls();
             tls.destructors.next_key = key_id + 1;
             if !key.live || key.destructor == 0 {
                 continue;
             }
             let Some(value) = tls.values.get_mut(key_id) else { continue };
-            if value.to_usize() == 0 {
+            if value.to_usize(ptr_size) == 0 {
                 continue;
             }
             let value = std::mem::replace(value, null());
@@ -1048,7 +1049,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let out = self.ptr_of(thread)?;
         let out_size = self.pointee_size(thread, locals, "pthread_create's pthread_t")?;
         let attr = self.ptr_of(attr)?;
-        let detached = match attr.to_usize() {
+        let detached = match attr.to_usize(self.cached_ptr_size) {
             0 => false,
             _ => {
                 self.attr_ready(attr)?;
@@ -1056,7 +1057,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 state == self.target()?.os.detach_states()[1]
             }
         };
-        let start = from_bytes!(usize, start.get(self)?);
+        let start = from_bytes!(usize, self.cached_ptr_size, start.get(self)?);
         let arg = self.ptr_of(arg)?;
         let spawned = self.spawn_thread(start, arg, span)?;
         self.write_int(out, out_size, i128::from(spawned) + 1)?;
@@ -1186,14 +1187,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Os::Apple => (2 * word, word),
         };
         let disable = target.os.ss_disable();
-        let set = match new.to_usize() {
+        let set = match new.to_usize(self.cached_ptr_size) {
             0 => None,
             _ => {
                 let flags = from_bytes!(i32, self.read_memory(new.offset(flags_at), 4)?);
                 match flags & disable {
                     0 => {
                         let stack = self.read_pointer(new)?;
-                        let size = from_bytes!(usize, self.read_memory(new.offset(size_at), word)?);
+                        let size = from_bytes!(usize, self.cached_ptr_size, self.read_memory(new.offset(size_at), word)?);
                         if size < target.os.minsigstksz() {
                             return self.fail(destination, Errors::Errno, target.errno.nomem);
                         }
@@ -1203,14 +1204,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
             }
         };
-        if old.to_usize() != 0 {
+        if old.to_usize(self.cached_ptr_size) != 0 {
             let current = self.tls().altstack;
             let (stack, size, flags) = match current {
                 Some((stack, size)) => (stack, size, 0),
                 None => (null(), 0, disable),
             };
             self.write_pointer(old, stack)?;
-            self.write_memory(old.offset(size_at), &word_bytes(size))?;
+            self.write_memory(old.offset(size_at), &word_bytes(size, self.cached_ptr_size))?;
             self.write_memory(old.offset(flags_at), &flags.to_le_bytes())?;
         }
         if let Some(set) = set {
@@ -1234,7 +1235,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let size = self.pointee_size(act, locals, "sigaction's struct sigaction")?;
         let (act, old) = (self.ptr_of(act)?, self.ptr_of(old)?);
         let signal = signal as usize;
-        if old.to_usize() != 0 {
+        if old.to_usize(self.cached_ptr_size) != 0 {
             // alloc: `sigaction` is setup.
             let installed = self.process.actions.get(signal).cloned().flatten();
             match installed {
@@ -1243,7 +1244,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 None => self.write_memory_using_ref(old, size)?.fill(0),
             }
         }
-        if act.to_usize() != 0 {
+        if act.to_usize(self.cached_ptr_size) != 0 {
             // alloc: `sigaction` is setup.
             let bytes: Box<[u8]> = self.read_memory(act, size)?.into();
             let actions = &mut self.process.actions;
@@ -1272,12 +1273,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         if let FUTEX_WAKE | FUTEX_WAKE_BITSET = cmd {
             let count = self.int_of(arg(2)?)?.clamp(1, i128::from(i32::MAX)) as usize;
-            let woken = self.wake(addr.to_usize(), bitset, count)?;
+            let woken = self.wake(addr.to_usize(self.cached_ptr_size), bitset, count)?;
             return self.ret_int(destination, woken as i128);
         }
         let expected = self.uint_of(arg(2)?)? as u32;
         let timeout = self.ptr_of(arg(3)?)?;
-        let deadline = match timeout.to_usize() {
+        let deadline = match timeout.to_usize(self.cached_ptr_size) {
             0 => None,
             _ => {
                 let Some(ns) = self.timespec(timeout)? else {
@@ -1326,7 +1327,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, ()> {
         let errno = self.target()?.errno;
         let FutexWait { addr, size, expected, bitset, deadline } = wait;
-        if addr.to_usize() % size != 0 {
+        if addr.to_usize(self.cached_ptr_size) % size != 0 {
             return self.fail(destination, errors, errno.inval);
         }
         if self.futex_load(addr, size)? != expected {
@@ -1339,7 +1340,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             return self.fail(destination, errors, errno.timedout);
         }
         let resume = Resume::Wait { errors };
-        self.block_on(Wait::Shim { addr: addr.to_usize(), bitset, deadline, resume });
+        self.block_on(Wait::Shim { addr: addr.to_usize(self.cached_ptr_size), bitset, deadline, resume });
         Ok(())
     }
 
@@ -1370,7 +1371,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             state.owner = me;
             state.count = 1;
             self.mutex_set(mutex, state)?;
-            self.machine.acquire(mutex.to_usize() as u64)?;
+            self.machine.acquire(mutex.to_usize(self.cached_ptr_size) as u64)?;
             return self.ret_int(destination, result.into());
         }
         if state.owner == me {
@@ -1394,7 +1395,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
         }
         let resume = Resume::MutexLock { mutex, result };
-        self.block_on(Wait::Shim { addr: mutex.to_usize(), bitset: u32::MAX, deadline: None, resume });
+        self.block_on(Wait::Shim { addr: mutex.to_usize(self.cached_ptr_size), bitset: u32::MAX, deadline: None, resume });
         Ok(())
     }
 
@@ -1408,7 +1409,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 // alloc: the error that ends the run.
                 return Err(MirEvalError::UndefinedBehavior(format!(
                     "pthread_mutex_unlock of a mutex at {:#x} the thread does not hold",
-                    mutex.to_usize()
+                    mutex.to_usize(self.cached_ptr_size)
                 )));
             }
             return Ok(self.target()?.errno.perm);
@@ -1417,7 +1418,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if state.count == 0 {
             state.owner = 0;
             self.mutex_set(mutex, state)?;
-            self.wake(mutex.to_usize(), u32::MAX, 1)?;
+            self.wake(mutex.to_usize(self.cached_ptr_size), u32::MAX, 1)?;
         } else {
             self.mutex_set(mutex, state)?;
         }
@@ -1449,7 +1450,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     // alloc: the error that ends the run.
                     return Err(MirEvalError::UndefinedBehavior(format!(
                         "a pthread_mutex_t at {:#x} that is not initialized",
-                        mutex.to_usize()
+                        mutex.to_usize(self.cached_ptr_size)
                     )));
                 }
             };
@@ -1513,7 +1514,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             // alloc: the error that ends the run.
             _ => Err(MirEvalError::UndefinedBehavior(format!(
                 "a pthread_cond_t at {:#x} that is not initialized",
-                cond.to_usize()
+                cond.to_usize(self.cached_ptr_size)
             ))),
         }
     }
@@ -1544,7 +1545,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             not_supported!("pthread_cond_wait with a recursive mutex locked more than once")
         }
         let bound = self.peek_word(cond.offset(layout.mutex))?;
-        if bound != 0 && bound != mutex.to_usize() {
+        if bound != 0 && bound != mutex.to_usize(self.cached_ptr_size) {
             return Err(MirEvalError::UndefinedBehavior(
                 // alloc: the error that ends the run.
                 "pthread_cond_wait with two mutexes for one condition variable at once".to_owned(),
@@ -1553,12 +1554,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if deadline.is_some_and(|it| it <= self.now()) {
             return self.ret_int(destination, target.errno.timedout.into());
         }
-        self.poke_word(cond.offset(layout.mutex), mutex.to_usize())?;
+        self.poke_word(cond.offset(layout.mutex), mutex.to_usize(self.cached_ptr_size))?;
         let waiters = self.peek_u32(cond.offset(layout.waiters))?;
         self.poke_u32(cond.offset(layout.waiters), waiters + 1)?;
         self.mutex_unlock(mutex)?;
         let resume = Resume::CondWait { cond, mutex };
-        self.block_on(Wait::Shim { addr: cond.to_usize(), bitset: u32::MAX, deadline, resume });
+        self.block_on(Wait::Shim { addr: cond.to_usize(self.cached_ptr_size), bitset: u32::MAX, deadline, resume });
         Ok(())
     }
 
@@ -1587,14 +1588,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let count = from_bytes!(i64, self.peek_memory(semaphore, 8)?);
         if count > 0 {
             self.poke_memory(semaphore, 8)?.copy_from_slice(&(count - 1).to_le_bytes());
-            self.machine.acquire(semaphore.to_usize() as u64)?;
+            self.machine.acquire(semaphore.to_usize(self.cached_ptr_size) as u64)?;
             return self.ret_int(destination, 0);
         }
         if deadline.is_some_and(|it| it <= self.now()) {
             return self.ret_int(destination, SEMAPHORE_TIMED_OUT);
         }
         let resume = Resume::Semaphore { semaphore, deadline };
-        let addr = semaphore.to_usize();
+        let addr = semaphore.to_usize(self.cached_ptr_size);
         self.block_on(Wait::Shim { addr, bitset: u32::MAX, deadline, resume });
         Ok(())
     }
@@ -1702,8 +1703,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     fn write_timespec(&mut self, at: Address, ns: u64) -> Result<'db, ()> {
         let word = self.ptr_size();
-        self.write_memory(at, &word_bytes((ns / NANOS) as usize))?;
-        self.write_memory(at.offset(word), &word_bytes((ns % NANOS) as usize))
+        self.write_memory(at, &word_bytes((ns / NANOS) as usize, self.cached_ptr_size))?;
+        self.write_memory(at.offset(word), &word_bytes((ns % NANOS) as usize, self.cached_ptr_size))
     }
 
     fn pointee_size(
@@ -1751,12 +1752,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     fn peek_word(&self, at: Address) -> Result<'db, usize> {
-        Ok(from_bytes!(usize, self.peek_memory(at, self.ptr_size())?))
+        Ok(from_bytes!(usize, self.cached_ptr_size, self.peek_memory(at, self.ptr_size())?))
     }
 
     fn poke_word(&mut self, at: Address, value: usize) -> Result<'db, ()> {
         let word = self.ptr_size();
-        self.poke_memory(at, word)?.copy_from_slice(&word_bytes(value));
+        self.poke_memory(at, word)?.copy_from_slice(&word_bytes(value, word));
         Ok(())
     }
 }

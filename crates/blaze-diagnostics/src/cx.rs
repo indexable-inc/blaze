@@ -5,12 +5,13 @@
 //! check shares, each made the first time a pass asks: the walk of the crate's syntax, the
 //! HIR lint levels, and the set of lints that may fire.
 
+#[expect(clippy::disallowed_types, reason = "OnceCell: memos of one check, dropped with it, not global state")]
 use std::{
     cell::{OnceCell, RefCell},
     collections::HashMap,
     ops::ControlFlow,
-    sync::LazyLock,
 };
+use std::alloc::Global;
 
 use base_db::Db;
 use blaze_items::{Fact, ItemId, ItemKey, NameHash, SimplifiedType};
@@ -76,6 +77,7 @@ impl<'a> Files<'a> {
 }
 
 /// A diagnostic of a crate being lowered.
+#[expect(clippy::disallowed_types, reason = "OnceCell: memos of one check, dropped with it, not global state")]
 pub struct Cx<'a, 'db> {
     /// The `Semantics` of views. Every view handed to it is of a tree it gave out: roots are
     /// taken through [`Cx::root`], never `HirFileId::root`.
@@ -92,7 +94,7 @@ pub struct Cx<'a, 'db> {
     /// lint's level; none is rustc's defaults.
     lints: Option<&'a crate::lints::CommandLine>,
     /// The file each name shown stands for, as spans were made.
-    named: RefCell<blaze_hash::HashMap<String, FileId>>,
+    named: RefCell<blaze_hash::HashMap<String, FileId, Global>>,
     /// The paths types are printed by, made the first time one is printed.
     paths: OnceCell<crate::print::Paths<'a>>,
     /// The crate as rustc's early lint pass walks it, made the first time a pass asks.
@@ -108,6 +110,7 @@ pub struct Cx<'a, 'db> {
 }
 
 impl<'a, 'db> Cx<'a, 'db> {
+    #[expect(clippy::disallowed_types, reason = "OnceCell: memos of one check, dropped with it, not global state")]
     pub fn new(
         db: &'db Db,
         krate: hir::Crate,
@@ -116,7 +119,7 @@ impl<'a, 'db> Cx<'a, 'db> {
     ) -> Cx<'a, 'db> {
         // A file of two crates (a crate built for the host and the target) is a module of each:
         // its syntax must map to this crate's items, not the first crate's.
-        let within = std::sync::Arc::new(blaze_hash::HashSet::from_iter([krate.base()])); // alloc: once a check, one crate
+        let within = std::sync::Arc::new(blaze_hash::HashSet::from_iter_in([krate.base()], Global)); // alloc: once a check, one crate
         Cx {
             vsema: hir::view::Semantics::new_within(db, within),
             db,
@@ -126,7 +129,7 @@ impl<'a, 'db> Cx<'a, 'db> {
             files,
             frame,
             lints: None,
-            named: RefCell::new(blaze_hash::HashMap::default()),
+            named: RefCell::new(blaze_hash::HashMap::new_in(Global)),
             paths: OnceCell::new(),
             walk: OnceCell::new(),
             items: OnceCell::new(),
@@ -163,8 +166,8 @@ impl<'a, 'db> Cx<'a, 'db> {
 
     /// The lint flags the crate is checked with: rustc's defaults when none were given.
     pub fn lint_flags(&self) -> &'a crate::lints::CommandLine {
-        static DEFAULT: LazyLock<crate::lints::CommandLine> = LazyLock::new(crate::lints::CommandLine::default);
-        self.lints.unwrap_or(&*DEFAULT)
+        static NONE: crate::lints::CommandLine = crate::lints::CommandLine::NONE;
+        self.lints.unwrap_or(&NONE)
     }
 
     /// The crate as rustc's early lint pass walks it: made once per check, for every pass that

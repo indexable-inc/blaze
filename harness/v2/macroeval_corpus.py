@@ -24,12 +24,15 @@ In order, each step one outcome, the run stopping at the first that does not pas
                 CARGO_HOME of its own; every package of its Cargo.lock has to be unpacked there
     build ...   `blaze build -p corpus-calls` in each of `workspace` and `scratch` with that
                 CARGO_HOME, one daemon for both; each build script's run (std's among them)
-                has to be left as `output` beside its `OUT_DIR`, where load.rs reads it
+                has to leave `run/stdout` beside its `OUT_DIR` in the copy's build directory
+                (`WORK/h/build/<copy>-<id>`, blaze_manifest::home::build_dir), where load.rs
+                reads it
     fixture     `blaze test -p corpus-calls` in `fixture`, same daemon: one outcome per test of
                 the fixture crate (calls/src/tests.rs, and `tokio_test`, a test tokio's
                 `#[test]` makes), each built with the expansions blaze made
     test        the `BLAZE_MACRO_CORPUS` config (crates/blaze-macro-eval/tests/corpus/config.rs:
-                `workspace`, `scratch`, `cargo_home`) written to
+                `workspace`, `scratch`, `cargo_home`, `builds`: the build daemon's
+                `BLAZE_HOME/build`) written to
                 `WORK/corpus.json`, then `blaze test -p blaze-macro-eval --test corpus --test
                 kept -- --ignored` in this repository, BLAZE_PROC_MACRO_CACHE unset; then
                 one outcome per test of the two files, by libtest's name
@@ -54,6 +57,8 @@ import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+import blake3
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -95,17 +100,53 @@ class Stop(Exception):
 
 def config_fields(source: str) -> tuple[list[str], bool]:
     """The fields of config.rs's `Corpus`, in order, and whether it refuses unknown ones."""
+    return [name for name, _ in config_field_types(source)], config_refuses(source)
+
+
+def config_body(source: str) -> tuple[str, str]:
     found = re.search(r"((?:#\[[^\n]*\]\n)*)pub\(crate\) struct Corpus \{\n(.*?)\n\}", source, re.S)
     if found is None:
         raise engine.Failed(f"{CONFIG_RS} has no `pub(crate) struct Corpus`")
-    attrs, body = found.groups()
-    return re.findall(r"^\s*pub\(crate\) (\w+):", body, re.M), "deny_unknown_fields" in attrs
+    return found.group(1), found.group(2)
 
 
-def corpus_config(workspace: Path, scratch: Path, cargo_home: Path) -> dict[str, str]:
-    """The value of `BLAZE_MACRO_CORPUS`, every path absolute."""
+def config_refuses(source: str) -> bool:
+    return "deny_unknown_fields" in config_body(source)[0]
+
+
+def config_field_types(source: str) -> list[tuple[str, str]]:
+    """Each field of config.rs's `Corpus` and its type, in order."""
+    return re.findall(r"^\s*pub\(crate\) (\w+): ([^\n]*?),?$", config_body(source)[1], re.M)
+
+
+def config_required(source: str) -> list[str]:
+    """The fields of config.rs's `Corpus` a config has to give: every one not an `Option`."""
+    return [name for name, ty in config_field_types(source) if not ty.startswith("Option<")]
+
+
+def corpus_config(workspace: Path, scratch: Path, cargo_home: Path, builds: Path, std: Path) -> dict[str, str]:
+    """The value of `BLAZE_MACRO_CORPUS`, every path absolute. `builds` is where the daemon
+    that built the copies placed their build directories (`BLAZE_HOME/build`), `std` the
+    standard library's directory it shared (`std_dir`)."""
     return dict(workspace=str(workspace.resolve()), scratch=str(scratch.resolve()),
-                cargo_home=str(cargo_home.resolve()))
+                cargo_home=str(cargo_home.resolve()), builds=str(builds.resolve()), std=str(std.resolve()))
+
+
+def std_dir(blaze: Path, env: dict[str, str]) -> Path:
+    """The standard library's directory a daemon of the binary `blaze` shares on this machine,
+    as blaze-cargo's `serve.rs` names it: `machine()/std/<build id>`, the machine's directory
+    `$XDG_CACHE_HOME/blaze` or `~/.cache/blaze`, the build id BLAKE3's `derive_key` of the
+    binary in the context `blaze v2 build id 1` (`build_of`)."""
+    caches = env.get("XDG_CACHE_HOME") or ""
+    if caches:
+        machine = Path(caches) / "blaze"
+    else:
+        home = env.get("HOME")
+        if not home:
+            raise engine.Failed("neither XDG_CACHE_HOME nor HOME says where the daemon shares the standard library")
+        machine = Path(home) / ".cache" / "blaze"
+    build_id = blake3.blake3(blaze.read_bytes(), derive_key_context="blaze v2 build id 1").hexdigest()
+    return machine.absolute() / "std" / build_id
 
 
 def registry_packages(lock: str) -> list[tuple[str, str]]:
@@ -121,11 +162,20 @@ def unfetched(cargo_home: Path, packages: list[tuple[str, str]]) -> list[str]:
             if not any((root / f"{name}-{version}").is_dir() for root in roots)]
 
 
-def runs_left(target: Path) -> tuple[int, list[str]]:
-    """How many build scripts' runs `target` holds (`build/<package>-<hash>/out`, cargo's first
-    layout, as the harness's builds ask), and each whose `output` is not beside its `OUT_DIR`."""
-    outs = sorted(d for d in target.glob("**/build/*/out") if d.is_dir())
-    return len(outs), [str(d) for d in outs if not (d.parent / "output").is_file()]
+def build_dirs(builds: Path, ws: Path) -> list[Path]:
+    """The build directories under `builds` of the workspace `ws`: `<name>-<id>`, its root's
+    last part and the id of its path (blaze_manifest::home::build_dir); the copies' names
+    differ, so each copy's are its own."""
+    return sorted(d for d in builds.glob(f"{ws.name}-*") if d.is_dir())
+
+
+def runs_left(builds: Path, ws: Path) -> tuple[int, list[str]]:
+    """How many build scripts' runs the build directory of `ws` under `builds` holds
+    (`build/<package>/<hash>/run`, beside its `OUT_DIR` `out`: cargo's new layout, which blaze
+    builds in), and each that has no `stdout`, which load.rs reads (the plan's first output of
+    the run)."""
+    runs = sorted(d for at in build_dirs(builds, ws) for d in at.glob("**/build/*/*/run") if d.is_dir())
+    return len(runs), [str(d) for d in runs if not (d / "stdout").is_file()]
 
 
 def expected_tests(sources: dict[str, str], prefix: str = "") -> list[str]:
@@ -203,9 +253,9 @@ def fetch(ws: Path, cargo_home: Path, work: Path) -> None:
                             f"{', '.join(missing)}")
 
 
-def build(rep: report.Report, eng: engine.Engine, name: str, ws: Path, env: dict[str, str]) -> None:
-    """`blaze build -p corpus-calls` in `ws`: a fail when it does not build or leaves a run
-    where load.rs does not find it."""
+def build(rep: report.Report, eng: engine.Engine, name: str, ws: Path, env: dict[str, str], builds: Path) -> None:
+    """`blaze build -p corpus-calls` in `ws`, its build directory under `builds`: a fail when
+    it does not build or leaves a run where load.rs does not find it."""
     label = f"{LABEL}/build {name}"
     try:
         ran = eng.build(label, ws, env, ("-p", PACKAGE), timeout=BUILD_SECS)
@@ -217,10 +267,10 @@ def build(rep: report.Report, eng: engine.Engine, name: str, ws: Path, env: dict
         detail = f"not blaze's: {who}" if who is not None else f"exit {ran.returncode}"
         rep.add(label, "fail", f"`blaze build -p {PACKAGE}` in {ws}: {detail}:\n{ran.said()}")
         raise Stop
-    count, left = runs_left(ws / "target")
+    count, left = runs_left(builds, ws)
     if not count or left:
-        what = (f"no build script's run under {ws / 'target'}" if not count
-                else f"{len(left)} of {count} runs have no `output` beside their OUT_DIR: {', '.join(left[:5])}")
+        what = (f"no build script's run under {builds}/{ws.name}-*" if not count
+                else f"{len(left)} of {count} runs have no `stdout`: {', '.join(left[:5])}")
         rep.add(label, "fail", f"`blaze build -p {PACKAGE}` in {ws}: {what}")
         raise Stop
     rep.add(label, "pass", seconds=round(ran.seconds, 2), runs=count)
@@ -244,7 +294,8 @@ def fixture_tests(rep: report.Report, eng: engine.Engine, ws: Path, env: dict[st
         rep.add(label, "pass", seconds=round(ran.seconds, 2))
     import blaze_cli
 
-    kept: list[str] = blaze_cli.kept_passes(str(kept_at)) if kept_at.is_file() else []
+    kept_passes: Callable[[str], list[str]] = getattr(blaze_cli, "kept_passes")
+    kept = kept_passes(str(kept_at)) if kept_at.is_file() else []
     expected = [*expected_tests({"tests": FIXTURE_TESTS.read_text()}, "tests::"), *FIXTURE_OWN]
     for judged in judge_tests(expected, ran.stdout + "\n" + ran.stderr, kept):
         rep.add(f"{LABEL}/fixture/{judged.name}", judged.verdict, judged.detail)
@@ -278,7 +329,8 @@ def run_tests(rep: report.Report, eng: engine.Engine, work: Path, target: Path, 
         rep.add(label, "pass", seconds=round(ran.seconds, 2))
     import blaze_cli
 
-    kept: list[str] = blaze_cli.kept_passes(str(kept_at))
+    kept_passes: Callable[[str], list[str]] = getattr(blaze_cli, "kept_passes")
+    kept = kept_passes(str(kept_at))
     sources = {t: (TESTS / f"{t}.rs").read_text() for t in TEST_FILES}
     for judged in judge_tests(expected_tests(sources), ran.stdout + "\n" + ran.stderr, kept):
         rep.add(f"{LABEL}/{judged.name}", judged.verdict, judged.detail)
@@ -288,10 +340,12 @@ def main(args: Input) -> None:
     for needed in (FIXTURE / "Cargo.lock", FIXTURE_TESTS, CONFIG_RS, *(TESTS / f"{t}.rs" for t in TEST_FILES)):
         if not needed.is_file():
             fail(SCRIPT, f"no file {needed}")
-    fields, refuses = config_fields(CONFIG_RS.read_text())
-    if not refuses or sorted(fields) != sorted(corpus_config(Path(), Path(), Path())):
-        fail(SCRIPT, f"{CONFIG_RS}'s `Corpus` has the fields {fields} (deny_unknown_fields: {refuses}); "
-                     "this writes another config")
+    source = CONFIG_RS.read_text()
+    fields, refuses = config_fields(source)
+    written = corpus_config(Path(), Path(), Path(), Path(), Path())
+    if not refuses or not set(config_required(source)) <= set(written) or not set(written) <= set(fields):
+        fail(SCRIPT, f"{CONFIG_RS}'s `Corpus` has the fields {fields}, of which {config_required(source)} are "
+                     f"required (deny_unknown_fields: {refuses}); this writes {list(written)}")
     try:
         eng = engine.Engine.of(args.engine)
     except engine.Failed as e:
@@ -310,7 +364,7 @@ def main(args: Input) -> None:
         step(rep, "fetch", lambda: fetch(copies["workspace"], cargo_home, work))
         try:
             for name in COPIES:
-                build(rep, eng, name, copies[name], build_env)
+                build(rep, eng, name, copies[name], build_env, home / "build")
             fixture_tests(rep, eng, copies["fixture"], build_env)
         finally:
             try:
@@ -318,7 +372,8 @@ def main(args: Input) -> None:
                     eng.stop(copies["workspace"], build_env)
             except engine.Failed as e:
                 rep.add(f"{LABEL}: stopping the daemon", "error", str(e))
-        config = corpus_config(copies["workspace"], copies["scratch"], cargo_home)
+        config = corpus_config(copies["workspace"], copies["scratch"], cargo_home, home / "build",
+                               std_dir(eng.blaze, build_env))
         rep.extra.update(config=config)
         config_at = work / "corpus.json"
         config_at.write_text(json.dumps(config, indent=1) + "\n")
@@ -350,12 +405,21 @@ def test_input() -> None:
 
 def test_config() -> None:
     fields, refuses = config_fields(CONFIG_RS.read_text())
-    assert refuses and fields == ["workspace", "scratch", "cargo_home"], fields
+    assert refuses and fields[:5] == ["workspace", "scratch", "cargo_home", "builds", "std"], fields
+    required = config_required(CONFIG_RS.read_text())
+    assert required == ["workspace", "cargo_home", "builds", "std"], required
     with tempfile.TemporaryDirectory() as tmp:
         top = Path(tmp).resolve()
-        config = corpus_config(top / "workspace", top / "scratch", top / "cargo-home")
-    assert list(config) == fields, list(config)
+        config = corpus_config(top / "workspace", top / "scratch", top / "cargo-home", top / "h" / "build", top / "std")
+        binary = top / "blaze"
+        binary.write_bytes(b"blaze")
+        # XDG_CACHE_HOME wins over HOME, as `serve::machine` takes them.
+        expected = blake3.blake3(b"blaze", derive_key_context="blaze v2 build id 1").hexdigest()
+        assert std_dir(binary, {"XDG_CACHE_HOME": str(top / "c"), "HOME": "/nowhere"}) == top / "c" / "blaze" / "std" / expected
+        assert std_dir(binary, {"HOME": str(top)}) == top / ".cache" / "blaze" / "std" / expected
+    assert set(required) <= set(config) <= set(fields), list(config)
     assert config["workspace"] == str(top / "workspace") and config["cargo_home"] == str(top / "cargo-home"), config
+    assert config["builds"] == str(top / "h" / "build"), config
     assert json.loads(json.dumps(config)) == config
     assert config_fields("#[derive(Deserialize)]\npub(crate) struct Corpus {\n    pub(crate) a: String,\n}") == (["a"], False)
     assert "no `pub(crate) struct Corpus`" in refused(lambda: config_fields("struct Other {}"))
@@ -376,7 +440,7 @@ def test_lock() -> None:
 
 def test_fixture() -> None:
     """The fixture's own proc-macro crates, and the tests this runs of this repository."""
-    own = []
+    own: list[str] = []
     for manifest in sorted(FIXTURE.glob("*/Cargo.toml")):
         parsed = tomllib.loads(manifest.read_text())
         if parsed.get("lib", {}).get("proc-macro"):
@@ -387,13 +451,18 @@ def test_fixture() -> None:
 
 def test_runs() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        target = Path(tmp)
-        assert runs_left(target) == (0, [])
-        for package in ("serde-0123456789abcdef", "thiserror-fedcba9876543210"):
-            (target / "debug" / "build" / package / "out").mkdir(parents=True)
-        (target / "debug" / "build" / "serde-0123456789abcdef" / "output").write_text("cargo:rustc-cfg=x\n")
-        count, left = runs_left(target)
-        assert count == 2 and left == [str(target / "debug" / "build" / "thiserror-fedcba9876543210" / "out")], left
+        builds, ws = Path(tmp) / "build", Path(tmp) / "workspace"
+        assert runs_left(builds, ws) == (0, [])
+        target = builds / "workspace-0123456789abcdef0123456789abcdef"
+        for package in ("serde/0123456789abcdef", "thiserror/fedcba9876543210"):
+            (target / "debug" / "build" / package / "run").mkdir(parents=True)
+        # A library's unit has an `out` and no run.
+        (target / "debug" / "build" / "serde" / "1111111111111111" / "out").mkdir(parents=True)
+        (target / "debug" / "build" / "serde" / "0123456789abcdef" / "run" / "stdout").write_text("cargo:rustc-cfg=x\n")
+        # Another copy's build directory is not this one's.
+        (builds / "scratch-fedcba9876543210fedcba9876543210" / "debug" / "build" / "x" / "1" / "run").mkdir(parents=True)
+        count, left = runs_left(builds, ws)
+        assert count == 2 and left == [str(target / "debug" / "build" / "thiserror" / "fedcba9876543210" / "run")], left
 
 
 LIBTEST = """running 2 tests

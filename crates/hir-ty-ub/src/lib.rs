@@ -17,6 +17,7 @@
 //! nothing, and what Rust means is unchanged (superset-of-rust).
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 pub mod borrows;
 pub mod check;

@@ -21,6 +21,106 @@ use crate::{
 pub mod aarch64;
 pub mod x64;
 
+/// Checks a `return_call` or `return_call_indirect` (`inst`) of `func` to `sig` outside the
+/// `tail` convention, where the caller's caller reserved the stack arguments and pops them
+/// (Rust's `become` in the target's own convention), and gives its arguments: the callee's
+/// convention and returns are the caller's, its stack arguments fit in the caller's own
+/// (`arg_bytes` of each signature: where the last one ends, unrounded, which is all a caller of
+/// another backend reserves), and a StructReturn pointer is the caller's own. The glue then
+/// writes the callee's stack arguments over the caller's, tears the frame down as a `return`
+/// does and jumps, so the stack does not grow. Each refusal names `inst`.
+pub(crate) fn caller_pops_tail_call<'f>(
+    func: &'f ir::Function,
+    inst: ir::Inst,
+    sig: &ir::Signature,
+    arg_bytes: impl Fn(&ir::Signature) -> Result<u32, Error>,
+) -> Result<&'f [ir::Value], Error> {
+    let opcode = func.dfg.insts[inst].opcode();
+    let caller = &func.signature;
+    if sig.call_conv != caller.call_conv {
+        return Err(Error::at(
+            inst,
+            // alloc: the error's message.
+            format!(
+                "`{opcode}` from a {} function to a {} one: outside the `tail` convention a \
+                 tail call is to a function of the caller's own convention, whose stack \
+                 arguments the caller's caller pops",
+                caller.call_conv, sig.call_conv
+            ),
+        ));
+    }
+    if sig.returns != caller.returns {
+        return Err(Error::at(
+            inst,
+            // alloc: the error's message.
+            format!(
+                "`{opcode}` to a function of `{sig}` from one of `{caller}`: the callee returns \
+                 to the caller's caller, so its return values must be the caller's"
+            ),
+        ));
+    }
+    let bytes = |sig: &ir::Signature| arg_bytes(sig).map_err(|e| Error::at(inst, e.what));
+    let (have, need) = (bytes(caller)?, bytes(sig)?);
+    if need > have {
+        return Err(Error::at(
+            inst,
+            // alloc: the error's message.
+            format!(
+                "`{opcode}` passing {need} bytes of stack arguments (`{sig}`) from a function \
+                 given {have} (`{caller}`): in the {} convention the caller's caller reserved \
+                 only those and pops them, so a tail call can pass no more",
+                caller.call_conv
+            ),
+        ));
+    }
+    let args = match func.dfg.insts[inst].analyze_call(&func.dfg.value_lists, &func.dfg.exception_tables) {
+        ir::instructions::CallInfo::Direct(_, args)
+        | ir::instructions::CallInfo::DirectWithSig(_, _, args)
+        | ir::instructions::CallInfo::Indirect(_, args) => args,
+        ir::instructions::CallInfo::NotACall => {
+            return Err(Error::at(inst, "a return call the IR says is not a call"));
+        }
+    };
+    if args.len() != sig.params.len() {
+        return Err(Error::at(inst, "a return call with other arguments than its signature's"));
+    }
+    let entry = func
+        .layout
+        .entry_block()
+        .ok_or_else(|| Error::at(inst, "a return call in a function with no entry block"))?;
+    let params = func.dfg.block_params(entry);
+    let sret = ir::ArgumentPurpose::StructReturn;
+    match (caller.special_param_index(sret), sig.special_param_index(sret)) {
+        (None, None) => {}
+        (Some(own), Some(at)) => {
+            let passed = func.dfg.resolve_aliases(args[at]);
+            if params.get(own) != Some(&passed) {
+                return Err(Error::at(
+                    inst,
+                    // alloc: the error's message.
+                    format!(
+                        "`{opcode}` passes {passed} as the callee's StructReturn pointer, not the \
+                         caller's own: the callee would write its return value where the \
+                         caller's caller does not read it"
+                    ),
+                ));
+            }
+        }
+        _ => {
+            return Err(Error::at(
+                inst,
+                // alloc: the error's message.
+                format!(
+                    "`{opcode}` to a function of `{sig}` from one of `{caller}`: one has a \
+                     StructReturn parameter and the other not, so the callee would not return \
+                     what the caller's caller reads"
+                ),
+            ));
+        }
+    }
+    Ok(args)
+}
+
 /// Where a value is, as the glue reads or writes it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Loc {

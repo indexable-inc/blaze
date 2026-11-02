@@ -34,6 +34,8 @@ rustc_apfloat.workspace = true
 
 rustc_parse_format.workspace = true
 rustc_abi.workspace = true
+# The integer widths of `#![blaze::arbitrary_ints]`.
+ra-ap-rustc_ast_ir.workspace = true
 
 # local deps
 stdx.workspace = true

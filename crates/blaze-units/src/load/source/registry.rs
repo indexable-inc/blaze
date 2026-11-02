@@ -11,6 +11,7 @@ use std::rc::Rc;
 
 use anyhow::bail;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_query::{Cancelled, Cx};
 use blaze_resolve::{
     Dependency, IndexSummary, MemRegistry, OptVersionReq, QueryKind, Registry, SourceId,
@@ -32,7 +33,7 @@ pub(crate) struct Index<'s, 'c, 'db> {
     cx: RefCell<&'c mut Cx<'db>>,
     pinned: MemRegistry,
     /// Each index file read, by its registry and the name asked for.
-    files: RefCell<HashMap<SourceId, HashMap<String, Rc<Lines>>>>,
+    files: RefCell<HashMap<SourceId, HashMap<String, Rc<Lines>, Global>, Global>>,
     needs: RefCell<Vec<Fetch>>,
     cancelled: Cell<bool>,
 }

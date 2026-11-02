@@ -9,6 +9,7 @@ use std::{
 use base_db::{Crate, CrateOrigin, Db, Env};
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use hir_expand::fixture;
 use hir_expand::proc_macro::{
@@ -64,7 +65,7 @@ fn crate_named(db: &TestDB, name: &str) -> Crate {
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
 #[derive(Default)]
 struct Memory {
-    images: Mutex<HashMap<ContentId, Arc<Aligned>>>,
+    images: Mutex<HashMap<ContentId, Arc<Aligned>, Global>>,
     gets: Mutex<usize>,
 }
 
@@ -262,7 +263,7 @@ fn a_stored_image_is_served_under_the_key_store_filed_it_by() {
         let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
         let stored = store(&db, &served, &memory).unwrap();
         assert_eq!(stored.filed.len(), stored.written.len());
-        let filed: HashMap<String, ContentId> = stored
+        let filed: HashMap<String, ContentId, Global> = stored
             .filed
             .iter()
             .map(|(&krate, &key)| (serve::crate_name(&db, krate), key))
@@ -419,8 +420,27 @@ pub fn f() -> Shown { Shown }
 pub mod inner { #[proc_macros::reading] pub trait T {} }
 "#;
 
+/// [`READING`] and a library on it that imports what its expansions made.
+const READING_APP: &str = r#"
+//- proc_macros: reading
+//- /lib.rs crate:lib new_source_root:library
+#[proc_macros::reading]
+pub struct Shown;
+#[proc_macros::reading]
+pub fn f() -> Shown { Shown }
+pub mod inner { #[proc_macros::reading] pub trait T {} }
+//- /app.rs crate:app deps:lib new_source_root:library
+pub use lib::Shown;
+pub fn g() -> Shown { lib::f() }
+"#;
+
 /// A database of [`READING`], its library of macros a dependency as a registry's would be.
 fn reading_db() -> TestDB {
+    reading_db_of(READING)
+}
+
+/// [`reading_db`] of `fixture`, one of [`READING`] and [`READING_APP`].
+fn reading_db_of(fixture: &str) -> TestDB {
     let source = "#[proc_macro_attribute]\n\
                   pub fn reading(_attr: TokenStream, item: TokenStream) -> TokenStream { item }\n";
     let reading = ProcMacro {
@@ -429,7 +449,7 @@ fn reading_db() -> TestDB {
         expander: Arc::new(Reading),
         disabled: false,
     };
-    let mut db = fixture::db_with_proc_macros(READING, vec![(source.into(), reading)]).into_db();
+    let mut db = fixture::db_with_proc_macros(fixture, vec![(source.into(), reading)]).into_db();
     let macros = crate_named(&db, "proc_macros");
     let mut data = macros.data(&db).clone();
     data.origin = CrateOrigin::Library { repo: None, name: intern::Symbol::intern("proc_macros") };
@@ -513,6 +533,174 @@ fn a_changed_read_misses_the_image_and_the_next_one_is_found() {
     VALUE.store(0, SeqCst);
 }
 
+/// A crate's image holds what its dependencies' expansions made (`app` imports `lib`'s
+/// `Shown`, which an expansion gave back), and neither crate's key covers what those
+/// expansions read: once a value one of them read is another, the dependent's image is not
+/// served either, though its key is the same (rule 18). Its reads are the same whether the
+/// dependency was resolved or served as it was imaged, so either files it under one key.
+#[test]
+fn a_dependents_image_is_not_served_once_a_dependencys_expansion_reads_another_value() {
+    let _turn = TURN.lock();
+    VALUE.store(0, SeqCst);
+    let memory = Memory::default();
+    let serve_app = || {
+        let mut db = reading_db_of(READING_APP);
+        let crates = all(&db);
+        let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+        let (lib, app) = (crate_named(&db, "lib"), crate_named(&db, "app"));
+        (db, served, lib, app)
+    };
+    let (db, served, lib, app) = serve_app();
+    let stored = store(&db, &served, &memory).unwrap();
+    assert!(stored.written.contains(&lib) && stored.written.contains(&app), "{stored:?}");
+
+    let (db, served, lib, app) = serve_app();
+    assert!(served.hits.contains(&lib) && served.hits.contains(&app));
+    let raw: &Db = &db;
+    let filed = DepImages::try_get(raw).unwrap().images(raw)[&app].key();
+    assert_ne!(filed, served.keys[&app], "a dependency's reads file the dependent's image");
+    assert!(memory.images.lock().remove(&filed).is_some());
+
+    // Imaged again with `lib` served from its image, not resolved: the same reads.
+    let (db, served, lib, app) = serve_app();
+    assert!(served.hits.contains(&lib) && !served.hits.contains(&app));
+    let stored = store(&db, &served, &memory).unwrap();
+    assert!(stored.written.contains(&app), "{stored:?}");
+    assert!(memory.images.lock().contains_key(&filed), "the same reads file it under the same key");
+
+    VALUE.store(1, SeqCst);
+    let (db, served, lib, app) = serve_app();
+    assert!(!served.hits.contains(&lib));
+    assert!(!served.hits.contains(&app), "served with what `lib`'s expansions made before");
+    assert!(served.stale.contains(&app));
+    store(&db, &served, &memory).unwrap();
+    let (_db, served, lib, app) = serve_app();
+    assert!(served.hits.contains(&lib) && served.hits.contains(&app));
+    VALUE.store(0, SeqCst);
+}
+
+/// The expansion log has what a crate's expansions read, with their values, whether they ran
+/// or the crate was served from an image filed by them, which runs none: what keys a value by
+/// the log (`blaze-cargo`'s unit records) sees the same reads either way.
+#[test]
+fn the_expansion_log_has_a_crates_reads_whether_they_ran_or_were_served() {
+    let _turn = TURN.lock();
+    VALUE.store(0, SeqCst);
+    let logged = |db: &TestDB| -> Vec<base_db::ExpansionRead> {
+        let lib = crate_named(db, "lib");
+        db.files().expansions_read().into_iter().filter(|(by, _)| *by == lib).map(|(_, it)| it).collect()
+    };
+    let read = vec![base_db::ExpansionRead::Traced { shape: SHAPE.into(), values: values_of(SHAPE) }];
+    let memory = Memory::default();
+    store_reading(&memory);
+    let ran = reading_db();
+    let _ = crate::nameres::crate_def_map(&ran, crate_named(&ran, "lib"));
+    assert_eq!(logged(&ran), read, "resolved: each expansion ran");
+    let mut db = reading_db();
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    assert!(served.hits.contains(&crate_named(&db, "lib")));
+    assert_eq!(logged(&db), read, "served from its image, filed by those reads");
+}
+
+/// Whether [`Flaky`]'s expansions report their reads: off, they are unknown, as a server that
+/// could not trace them reports.
+static TRACES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// An attribute that gives back its item and reads [`SHAPE`] when [`TRACES`] is on, and what
+/// is not known when it is off.
+#[derive(Debug)]
+struct Flaky;
+
+impl ProcMacroExpander for Flaky {
+    fn expand(
+        &self,
+        _: &Db,
+        call: ProcMacroCall<'_>,
+    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+        match TRACES.load(SeqCst) {
+            true => report_reads(ExpansionReads::Traced { shape: SHAPE.into(), values: values_of(SHAPE) }),
+            false => report_reads(ExpansionReads::Unknown("its server could not trace it")),
+        }
+        Ok(call.subtree.copy())
+    }
+
+    fn code(&self) -> Option<ContentId> {
+        Some(ContentId([LIBRARY.load(SeqCst); 32]))
+    }
+
+    // dyn: `ProcMacroExpander::eq_dyn`'s signature, compared when a crate's macros are set
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+        other.type_id() == TypeId::of::<Self>()
+    }
+}
+
+/// `lib`'s first file is [`Flaky`]'s call; `main` depends on `lib`.
+const FLAKY: &str = r#"
+//- proc_macros: flaky
+//- /lib.rs crate:lib new_source_root:library
+#[proc_macros::flaky]
+pub struct Made;
+//- /main.rs crate:main deps:lib new_source_root:local
+pub fn f() -> lib::Made { lib::Made }
+"#;
+
+/// A database of [`FLAKY`], and `lib.rs`.
+fn flaky_db() -> (TestDB, base_db::FileId) {
+    let source = "#[proc_macro_attribute]\n\
+                  pub fn flaky(_attr: TokenStream, item: TokenStream) -> TokenStream { item }\n";
+    let flaky = ProcMacro {
+        name: intern::Symbol::intern("flaky"),
+        kind: ProcMacroKind::Attr,
+        expander: Arc::new(Flaky),
+        disabled: false,
+    };
+    let fixture = fixture::db_with_proc_macros(FLAKY, vec![(source.into(), flaky)]);
+    let file = fixture.files()[0];
+    let db = fixture.into_db();
+    let file = file.file_id(&db);
+    (db, file)
+}
+
+/// The log has each call's latest expansion. Once a macro whose expansion was unknown expands
+/// again and traces (its call edited, as the next build after its server is fixed expands it),
+/// the unknown read is gone from the log and a dependent's reads are kept again, in the same
+/// database: no restart. A call edited out of its crate leaves its unknown read in the log,
+/// and the crate's calls as they are now are what decide.
+#[test]
+fn an_unknown_expansion_that_traces_once_expanded_again_stops_refusing_its_dependents() {
+    let _turn = TURN.lock();
+    VALUE.store(0, SeqCst);
+    TRACES.store(false, SeqCst);
+    let (mut db, file) = flaky_db();
+    let (lib, main) = (crate_named(&db, "lib"), crate_named(&db, "main"));
+    let unknown = |db: &TestDB| {
+        let log = db.files().expansions_read();
+        log.iter().any(|(by, read)| *by == lib && matches!(read, base_db::ExpansionRead::Unknown(_)))
+    };
+    let _ = crate::nameres::crate_def_map(&db, lib);
+    assert!(unknown(&db), "the expansion ran and could not be traced");
+    let refused = closure_expansion_reads(&db, main).unwrap_err();
+    assert!(matches!(&refused, Refused::ProcMacro { why: "its server could not trace it", .. }), "{refused:?}");
+
+    TRACES.store(true, SeqCst);
+    db.set_file_text(file, "#[proc_macros::flaky]\npub struct Made {}\n");
+    let _ = crate::nameres::crate_def_map(&db, lib);
+    assert!(!unknown(&db), "the call's latest expansion traced: its unknown read is replaced");
+    let read = closure_expansion_reads(&db, main).unwrap();
+    assert_eq!(read, vec![(lib, vec![(Box::<[u8]>::from(SHAPE), values_of(SHAPE))])], "main's reads are kept again");
+
+    TRACES.store(false, SeqCst);
+    db.set_file_text(file, "#[proc_macros::flaky]\npub struct Made;\n");
+    let _ = crate::nameres::crate_def_map(&db, lib);
+    assert!(closure_expansion_reads(&db, main).is_err(), "unknown again");
+    db.set_file_text(file, "pub struct Made;\n");
+    let _ = crate::nameres::crate_def_map(&db, lib);
+    assert!(unknown(&db), "the call is gone, and what it last read stays in the log");
+    assert!(closure_expansion_reads(&db, main).is_ok(), "the crate's calls as they are now refuse nothing");
+    TRACES.store(false, SeqCst);
+}
+
 /// A rebuilt library of macros is another library: its dependents' keys change with it.
 #[test]
 fn a_key_covers_the_library_of_its_macros() {
@@ -535,17 +723,18 @@ fn a_key_covers_the_library_of_its_macros() {
 fn process_variables_read_file_the_image_by_their_values() {
     let mut db = fixture::db(FIXTURE).into_db();
     let reads = Reads::for_tests(&["BLAZE_DEPS_TEST"], &[]);
-    let unset = reads.values_then(&db);
+    let of = crate_named(&db, "lib");
+    let unset = reads.values_then(&db, of);
     base_db::set_process_env(&mut db, Env::from_iter([("BLAZE_DEPS_TEST".into(), "1".into())]));
-    let one = reads.values_then(&db);
+    let one = reads.values_then(&db, of);
     base_db::set_process_env(&mut db, Env::from_iter([("BLAZE_DEPS_TEST".into(), "2".into())]));
-    let two = reads.values_then(&db);
+    let two = reads.values_then(&db, of);
     assert!(unset != one && one != two && unset != two);
     let record = reads.encode();
     let key = ContentId([4; 32]);
     assert_ne!(reads::image_key(key, &record, one), reads::image_key(key, &record, two));
     let lib = crate_named(&db, "lib");
-    assert_eq!(reads.values_now(&db, lib, &Memory::default()).unwrap(), two);
+    assert_eq!(reads.values_now(&db, lib, &Memory::default(), |_, _| {}).unwrap(), two);
 }
 
 #[test]
@@ -823,6 +1012,58 @@ fn a_body_s_process_variable_files_a_value_in_a_slot() {
     assert_eq!(found_in(&db, lib, key, &memory), None);
     set(&mut db, "1");
     assert_eq!(found_in(&db, lib, key, &memory), Some(filed));
+}
+
+/// A value found by its reads stands in for the `env!`s that read them, which never run: the
+/// `env!` log has their variables as the crate's, as when it is resolved, so what is keyed by
+/// the log (a unit's record) does not miss them.
+#[test]
+fn a_value_found_by_its_reads_notes_their_variables_as_read() {
+    let source = "//- /lib.rs crate:lib new_source_root:library\n\
+                  #[rustc_builtin_macro]\n\
+                  macro_rules! env {() => {}}\n\
+                  pub fn f() -> &'static str { env!(\"BLAZE_DEPS_NOTED\") }\n";
+    let made = |value: &str| {
+        let mut db = fixture::db(source).into_db();
+        let vars = Env::from_iter([("BLAZE_DEPS_NOTED".into(), value.into())]);
+        base_db::set_process_env(&mut db, vars);
+        db
+    };
+    let db = made("1");
+    let lib = crate_named(&db, "lib");
+    let reads = checked_reads(&db, lib).unwrap();
+    let memory = Memory::default();
+    let key = ContentId([7; 32]);
+    let filed = file_by_reads(&db, lib, key, &reads, &memory).unwrap().unwrap();
+    memory.put(filed, b"a check".to_vec()).unwrap();
+    let fresh = made("1");
+    let lib = crate_named(&fresh, "lib");
+    assert_eq!(fresh.files().env_read(), Vec::new());
+    assert_eq!(found_in(&fresh, lib, key, &memory), Some(filed));
+    assert_eq!(fresh.files().env_read(), vec![(lib, "BLAZE_DEPS_NOTED".to_owned())]);
+    let changed = made("2");
+    let lib = crate_named(&changed, "lib");
+    assert_eq!(found_in(&changed, lib, key, &memory), None);
+    assert_eq!(changed.files().env_read(), Vec::new(), "a value not found notes nothing");
+}
+
+/// A crate's outside reads name the values its `env!`s read: the same id while they are as they
+/// were, another once one changed, so a record filed by it misses exactly then.
+#[test]
+fn outside_reads_follow_the_values_read() {
+    let source = "//- /lib.rs crate:lib new_source_root:library\n\
+                  #[rustc_builtin_macro]\n\
+                  macro_rules! env {() => {}}\n\
+                  pub fn f() -> &'static str { env!(\"BLAZE_DEPS_OUTSIDE\") }\n";
+    let outside = |value: &str| {
+        let mut db = fixture::db(source).into_db();
+        let vars = Env::from_iter([("BLAZE_DEPS_OUTSIDE".into(), value.into())]);
+        base_db::set_process_env(&mut db, vars);
+        let lib = crate_named(&db, "lib");
+        outside_reads(&db, lib).unwrap()
+    };
+    assert_eq!(outside("1"), outside("1"));
+    assert_ne!(outside("1"), outside("2"));
 }
 
 /// A proc macro in a body whose reads are not known refuses the crate's checked reads, though

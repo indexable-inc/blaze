@@ -2219,6 +2219,17 @@ pub const fn saturating_add<T: Copy>(a: T, b: T) -> T;
 #[rustc_intrinsic]
 pub const fn saturating_sub<T: Copy>(a: T, b: T) -> T;
 
+/// blaze: `x as D` between two integer types of any width, the standard ones and those of
+/// `#![blaze::arbitrary_ints]` (`u3`, `i24`): it truncates to `D`'s width, or extends by `S`'s
+/// sign, and never panics. Core's items of the integers of any width
+/// (`core::num::arbitrary`) are written with it, since `as` cannot name a generic type.
+///
+/// Both types must be integers.
+#[rustc_intrinsic_const_stable_indirect]
+#[rustc_nounwind]
+#[rustc_intrinsic]
+pub const fn blaze_int_cast<S: Copy, D: Copy>(x: S) -> D;
+
 /// Funnel Shift left.
 ///
 /// Concatenates `a` and `b` (with `a` in the most significant half),

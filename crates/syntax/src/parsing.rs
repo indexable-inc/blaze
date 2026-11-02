@@ -20,7 +20,7 @@ pub(crate) fn parse_text(
     edition: Edition,
     outline: bool,
 ) -> (Tree, Vec<SyntaxError>) {
-    let _p = tracing::info_span!("parse_text", outline).entered();
+    let _p = tracing::info_span!(target: "blaze", "parse_text", outline).entered();
     let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);
     let parser_output = match outline {
@@ -36,7 +36,7 @@ pub(crate) fn parse_text_at(
     entry: parser::TopEntryPoint,
     edition: Edition,
 ) -> (Tree, Vec<SyntaxError>) {
-    let _p = tracing::info_span!("parse_text_at").entered();
+    let _p = tracing::info_span!(target: "blaze", "parse_text_at").entered();
     let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);
     let parser_output = entry.parse(&parser_input);
@@ -67,7 +67,7 @@ fn build_parsed(
     parser_output: &parser::Output,
     edition: Edition,
 ) -> (FlatTree, Vec<SyntaxError>, bool) {
-    let _p = tracing::info_span!("build_tree").entered();
+    let _p = tracing::info_span!(target: "blaze", "build_tree").entered();
     debug_assert_eq!(lexed.as_str(), &source[range]);
     let start = range.start();
     let mut builder = SyntaxTreeBuilder::sourced_range(source, range);

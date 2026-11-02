@@ -15,6 +15,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnplacedDiagnostic) -> Vec<Found> 
         // clone: the error's text, for an error hir found
         hir::Unplaced::Inference(text) => text.clone(),
         // alloc: the error's text, for an error hir found
+        hir::Unplaced::Lowering(text) => format!("lowering a type: {text}"),
+        // alloc: the error's text, for an error hir found
+        hir::Unplaced::TailCall(message) => format!("{message}"),
+        // alloc: the error's text, for an error hir found
         hir::Unplaced::MissingUnsafe { reason, lint } => format!("{reason:?} ({lint:?}) needs `unsafe`"),
         hir::Unplaced::Borrowck { code, message } | hir::Unplaced::ConstCheck { code, message } => {
             // alloc: the error's text, for an error hir found

@@ -20,7 +20,7 @@ fn targets() -> Targets {
 }
 
 fn setup(runs: u64, runs_end: u64) -> Setup {
-    Setup { views: "/v".into(), std: "/s/std".into(), host: "h".into(), env: Vec::new(), color: false, tags: 6 << 32, runs, runs_end }
+    Setup { views: "/v".into(), std: "/s/std".into(), builds: "/s/build".into(), host: "h".into(), env: Vec::new(), color: false, tags: 6 << 32, runs, runs_end }
 }
 
 fn opened(root: u8) -> Opened {
@@ -40,26 +40,36 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         cancelled: Arc::new(AtomicBool::new(false)),
         stage: Stage::Over,
         value: None,
-        updating: HashSet::default(),
+        updating: HashSet::new_in(std::alloc::Global),
         queries: Vec::new(),
         built: None,
         borrowed: Vec::new(),
         placing: 0,
-        busy: HashMap::default(),
+        placed: blaze_cas::PlacedBytes::default(),
+        worked: None,
+        busy: HashMap::new_in(std::alloc::Global),
         held: Vec::new(),
         look: 0,
         awaiting: None,
         shared: false,
         runs: 0,
+        durable: blaze_cas::Tickets::default(),
+        storing: None,
+        stored: blaze_cas::Tickets::default(),
+        stored_of: None,
+        durable_since: None,
         over: None,
         stats: RequestStats::default(),
         fresh: 0,
         compiled: 0,
         served: Vec::new(),
         links: Vec::new(),
+        linked: Vec::new(),
+        misses: Vec::new(),
         profiled: false,
         opened_ns: 0,
         opened_unix_ns: None,
+        leases: Arc::default(),
     }
 }
 
@@ -444,4 +454,31 @@ fn a_job_ending_after_the_plane_finished_its_request_neither_cancels_nor_closes_
     for (ok, closed) in [(false, false), (false, true), (true, false), (true, true)] {
         assert_eq!(at_its_end(false, ok, closed), (false, false), "ok {ok}, closed {closed}");
     }
+}
+
+#[test]
+fn a_builds_crate_graph_has_an_edge_for_each_table_a_dependency_is_in() {
+    use crate::serve::tests::{of_graph, unit};
+    let root = "/w";
+    let app = format!("path+file://{root}#app@0.1.0");
+    let dep = "registry+https://github.com/rust-lang/crates.io-index#dep@1.0.0".to_owned();
+    let mut tested = unit(&app, "lib", UnitMode::Test, &[0, 3]);
+    tested.dependencies[0].dev = true;
+    let graph = blaze_units::schema::UnitGraph {
+        version: 1,
+        units: vec![
+            unit(&dep, "lib", UnitMode::Build, &[]),
+            unit(&app, "custom-build", UnitMode::Build, &[0]),
+            unit(&app, "custom-build", UnitMode::RunCustomBuild, &[1]),
+            unit(&app, "lib", UnitMode::Build, &[0, 2]),
+            tested,
+        ],
+        roots: vec![4],
+    };
+    let units = of_graph(root, String::new(), graph);
+    let rows = crate_deps(7, &units, &[0, 1, 2, 3, 4]);
+    let edges: Vec<_> = rows.iter().map(|it| (it.build_id, it.krate.as_str(), it.dep.as_str(), it.kind)).collect();
+    // The script's run, and the test's edge to its own library, are no table's.
+    assert_eq!(edges, [(7, "app", "dep", DepKind::Build), (7, "app", "dep", DepKind::Dev), (7, "app", "dep", DepKind::Normal)]);
+    assert!(crate_deps(7, &units, &[0]).is_empty(), "a build of the dependency alone has no edge");
 }

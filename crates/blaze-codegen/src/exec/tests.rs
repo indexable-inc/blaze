@@ -254,7 +254,11 @@ fn a_table_has_every_function_each_slot_s_and_each_test_s() {
     assert_eq!(table.fns, [(id(0), plain(ran(0))), (id(1), plain(ran(1))), (id(2), plain(ran(2)))]);
     assert_eq!(table.slot_fn, [1, ExecTable::EMPTY, 0, ExecTable::EMPTY]);
     assert_eq!(table.beside, beside);
-    assert_eq!(table.tests, [("calls".to_owned(), vec![0, 1]), ("alone".to_owned(), vec![2])]);
+    let names: Vec<&str> = table.tests.iter().map(|it| it.0.as_str()).collect();
+    assert_eq!(names, ["calls", "alone"]);
+    assert_eq!(table.reached(0), [0, 1]);
+    assert_eq!(table.reached(1), [2]);
+    assert_eq!(table.reached(2), Vec::<u32>::new(), "no test past the table");
 }
 
 /// Functions 0 to 4 and statics 0 to 2: 0 names table 1 by a position, 1 by its data, 2 by a
@@ -377,9 +381,22 @@ fn a_table_is_in_identity_order_and_says_each_place_in_it() {
     assert_eq!(ids, (0..1000).map(|n| numbered(n, 4)).collect::<Vec<_>>());
     assert_eq!(table.fns[999].1, plain(numbered(0, 8)), "function 0 is last");
     assert_eq!(table.slot_fn, [ExecTable::EMPTY, 999]);
-    // A sort for the test reaching two of 1000, the bits for the one reaching all.
-    assert_eq!(table.tests[0].1, [998, 999]);
-    assert_eq!(table.tests[1].1, (0..1000).collect::<Vec<u32>>());
+    // Walked when asked, by table place, which is no function of key order.
+    assert_eq!(table.reached(0), [998, 999]);
+    assert_eq!(table.reached(1), (0..1000).collect::<Vec<u32>>());
+    assert!(table.reaches(1, |it| it.0 == ContentId([9; 32])), "a mark of what it reaches");
+    assert!(!table.reaches(0, |it| it.0 == ContentId([8; 32])), "no node has that mark");
+}
+
+/// A table made from lists reaches what each list names and nothing past `fns`.
+#[test]
+fn a_listed_table_reaches_each_list() {
+    let (graph, roots) = crate::exec::TestGraph::listing(3, &[vec![0, 2], vec![], vec![1, 7]]);
+    let tests = ["a", "b", "c"].iter().zip(roots).map(|(name, root)| ((*name).to_owned(), root)).collect();
+    let table = ExecTable { tests, graph, ..ExecTable::default() };
+    assert_eq!(table.reached(0), [0, 2]);
+    assert_eq!(table.reached(1), Vec::<u32>::new());
+    assert_eq!(table.reached(2), [1], "a place past `fns` is dropped");
 }
 
 #[test]

@@ -182,8 +182,10 @@ pub(super) fn layout(func: &ir::Function, target: &Target, area: Area) -> Result
 }
 
 /// The signature of `inst` when it is a `return_call` or `return_call_indirect`, after
-/// checking the glue can make it: from a `tail` function to one (Cranelift's verifier and
-/// `gen_call_args`), not patchable.
+/// checking the glue can make it: not patchable, and from a `tail` function to one
+/// (Cranelift's verifier and `gen_call_args`) or between two functions of one of the
+/// conventions whose caller pops (AAPCS64, Apple's, Windows'), as
+/// [`crate::arch::caller_pops_tail_call`] says.
 pub(super) fn return_call_signature(
     func: &ir::Function,
     inst: ir::Inst,
@@ -202,17 +204,18 @@ pub(super) fn return_call_signature(
         InstructionData::CallIndirect { opcode: Opcode::ReturnCallIndirect, sig_ref, .. } => sig_ref,
         _ => return Ok(None),
     };
-    for (what, conv) in [("in", func.signature.call_conv), ("to", func.dfg.signatures[sig].call_conv)] {
-        if conv != CallConv::Tail {
-            return Err(Error::at(
-                inst,
-                // alloc: the error's message, once, as the function fails to compile.
-                format!(
-                    "`{opcode}` {what} a {conv} function: Cranelift's AArch64 backend tail-calls \
-                     only from a `tail` function to one"
-                ),
-            ));
-        }
+    let conv = func.dfg.signatures[sig].call_conv;
+    if func.signature.call_conv != CallConv::Tail {
+        crate::arch::caller_pops_tail_call(func, inst, &func.dfg.signatures[sig], abi::arg_bytes)?;
+    } else if conv != CallConv::Tail {
+        return Err(Error::at(
+            inst,
+            // alloc: the error's message, once, as the function fails to compile.
+            format!(
+                "`{opcode}` to a {conv} function: Cranelift's AArch64 backend tail-calls from a \
+                 `tail` function only to one"
+            ),
+        ));
     }
     Ok(Some(sig))
 }

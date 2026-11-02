@@ -11,10 +11,7 @@
 //! Each script test runs a fixed number of cases; `HEGEL_TEST_CASES=<n>` runs `n` instead, for a
 //! long run. A failure is shrunk to the shortest script that still breaks.
 
-use std::{
-    panic::{self, AssertUnwindSafe},
-    sync::OnceLock,
-};
+use std::panic::{self, AssertUnwindSafe};
 
 use blaze_ids::rng::SplitMix64;
 use hegel::generators as gs;
@@ -268,7 +265,8 @@ fn apply_text_edit(loaded: &Loaded, edit: TextEdit) -> Option<(FileId, String)> 
 /// The fixtures of the test files that load, by name, with what the comparison with `facts`
 /// leaves out of each.
 fn all_fixtures() -> &'static [(String, &'static str, Exempt)] {
-    static ALL: OnceLock<Vec<(String, &'static str, Exempt)>> = OnceLock::new();
+    #[expect(clippy::disallowed_types, reason = "the process's one test fixture list: test cases share the parsed fixtures")]
+    static ALL: std::sync::OnceLock<Vec<(String, &'static str, Exempt)>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
         let mut out = Vec::new();
         for &(file, source) in NAMERES.iter().chain(MACRO_EXPANSION) {

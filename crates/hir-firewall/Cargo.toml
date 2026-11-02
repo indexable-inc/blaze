@@ -31,6 +31,7 @@ syntax.workspace = true
 [dev-dependencies]
 blaze-macro-eval.workspace = true
 blaze-query.workspace = true
+blaze-serde.workspace = true
 blaze-units.workspace = true
 blaze-vfs.workspace = true
 hegeltest.workspace = true

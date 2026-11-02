@@ -363,15 +363,28 @@ fn print_where_clauses(
                     w!(p, ",\n");
                 }
                 match pred {
-                    WherePredicate::TypeBound { lifetimes, target, bound } => {
-                        if let Some(lifetimes) = *lifetimes {
+                    WherePredicate::TypeBound { lifetimes, binder, target, bound } => {
+                        if lifetimes.is_some() || !binder.is_empty() {
                             w!(p, "for<");
                             let store = p.store;
-                            for (i, lifetime) in store.names(lifetimes).iter().enumerate() {
+                            let names = lifetimes.map_or(&[][..], |it| store.names(it));
+                            for (i, lifetime) in names.iter().enumerate() {
                                 if i != 0 {
                                     w!(p, ", ");
                                 }
                                 w!(p, "{}", lifetime.display(db, p.edition));
+                            }
+                            for (i, (_, param)) in
+                                generic_params.binder_params(*binder).enumerate()
+                            {
+                                if i != 0 || !names.is_empty() {
+                                    w!(p, ", ");
+                                }
+                                w!(p, "{}", param.name.display(db, p.edition));
+                                if !param.bounds.is_empty() {
+                                    w!(p, ": ");
+                                    p.print_type_bounds(&param.bounds);
+                                }
                             }
                             w!(p, "> ");
                         }
@@ -627,6 +640,17 @@ impl Printer<'_> {
                 w!(self, "loop ");
                 self.print_expr(body);
             }
+            Expr::ComptimeFor { pat, iterable, body, label } => {
+                if let Some(lbl) = label {
+                    w!(self, "{}: ", self.store[lbl].name.display(self.db, self.edition));
+                }
+                w!(self, "for const ");
+                self.print_pat(pat);
+                w!(self, " in ");
+                self.print_expr(iterable);
+                w!(self, " ");
+                self.print_expr(body);
+            }
             Expr::Call { callee, args } => {
                 self.print_expr_in(prec, callee);
                 w!(self, "(");
@@ -793,6 +817,12 @@ impl Printer<'_> {
                 self.print_expr_in(prec, base);
                 w!(self, "[");
                 self.print_expr(index);
+                w!(self, "]");
+            }
+            Expr::ReflectedField { base, field } => {
+                self.print_expr_in(prec, base);
+                w!(self, ".[");
+                self.print_expr(field);
                 w!(self, "]");
             }
             Expr::Closure { args, arg_types, ret_type, mut body, closure_kind, capture_by } => {

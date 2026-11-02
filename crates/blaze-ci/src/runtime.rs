@@ -33,6 +33,7 @@ use std::{
 
 use blaze_api::{ApiError, Request, Response, ViewRef, client::Client};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_vfs::{Op, View};
 use parking_lot::Mutex;
 
@@ -136,7 +137,7 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
 
     let mut out = Vec::new(); // alloc: once, at start, the outputs reused for every step
     let mut service = Service::new(Settings::of(config), state, &mut out);
-    let mut workers = HashMap::default();
+    let mut workers = HashMap::new_in(Global);
     loop {
         let mut changed = false;
         for output in out.drain(..) {
@@ -196,7 +197,7 @@ fn dispatch(
     config: &Config,
     shared: &Arc<Shared>,
     to_github: &Posts,
-    workers: &mut HashMap<JobId, crossbeam_channel::Sender<worker::Command>>,
+    workers: &mut HashMap<JobId, crossbeam_channel::Sender<worker::Command>, Global>,
     changed: &mut bool,
     output: Output,
 ) {
@@ -300,7 +301,7 @@ pub(crate) fn post(
     backoff: Duration,
 ) {
     let mut waiting: Vec<Post> = Vec::new(); // alloc: once per lane, reused for every post
-    let mut last: HashMap<u64, usize> = HashMap::default();
+    let mut last: HashMap<u64, usize, Global> = HashMap::new_in(Global);
     while let Ok(first) = posts.recv() {
         waiting.push(first);
         waiting.extend(posts.try_iter());

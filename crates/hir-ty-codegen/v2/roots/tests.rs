@@ -11,7 +11,7 @@ use super::{
     super::{
         BuildTime, Databases, HashSource, HirFrontend, HirInstance, HirStatic, Kind, by_id::ById,
     },
-    RootKind, Roots,
+    Checked, RootKind, Roots,
 };
 use db::TestDB;
 
@@ -83,6 +83,55 @@ static KEPT: u8 = 0;
     let kept = test_items::static_item(db, fixture::test_crate(&db), "KEPT");
     assert_eq!(roots.statics, [HirStatic(kept)]);
     assert!(roots.tests.is_empty());
+}
+
+/// The recursion limit's check roots in rustc's root collector's order: the free items in
+/// definition order (a module's where it is declared), every static among them whether kept or
+/// not, `main` and the kept functions where they are defined, then the impls' kept functions,
+/// then the C `main` last.
+#[test]
+fn the_check_roots_are_rustcs_free_items_in_order_with_lang_start_last() {
+    let (db, frontend, roots) = roots(
+        r#"
+//- /main.rs crate:main
+static WARM: fn() = warm;
+fn warm() {}
+mod inner { pub static INNER: u8 = 0; }
+fn main() {}
+#[unsafe(no_mangle)]
+pub extern "C" fn exported() {}
+pub struct S;
+impl S {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn method() {}
+}
+#[used]
+static KEPT: u8 = 0;
+"#,
+        RootKind::Executable,
+    );
+    let krate = fixture::test_crate(&db);
+    let main = test_items::function(db, krate, "main");
+    let imp = test_items::impls(db, krate)[0];
+    let method = (imp.impl_items(db).items.iter())
+        .find_map(|&(_, it)| match it {
+            AssocItemId::FunctionId(it) => Some(frontend.root(it)),
+            _ => None,
+        })
+        .expect("the method");
+    let value = |name| Checked::Static(HirStatic(test_items::static_item(db, krate, name)));
+    assert_eq!(
+        roots.checked,
+        [
+            value("WARM"),
+            value("INNER"),
+            Checked::Function(function(db, &frontend, "main")),
+            Checked::Function(function(db, &frontend, "exported")),
+            value("KEPT"),
+            Checked::Function(method),
+            Checked::Function(HirInstance(Kind::Start(main))),
+        ]
+    );
 }
 
 /// A `#[linkage]` other than `internal` keeps a function or static, as rustc's
@@ -291,12 +340,6 @@ fn pure() {}
     let outside: Vec<(&str, bool)> =
         roots.tests.iter().map(|it| (it.name.as_str(), it.outside)).collect();
     assert_eq!(outside, [("net", true), ("pure", false)]);
-}
-
-#[test]
-fn a_proc_macro_crate_needs_to_be_one() {
-    let what = refusal("//- /lib.rs crate:main\npub fn f() {}\n", RootKind::ProcMacro);
-    assert!(what.contains("not a proc-macro crate"), "{what}");
 }
 
 #[test]

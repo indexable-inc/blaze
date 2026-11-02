@@ -34,3 +34,35 @@ a reboot, takes about as long as the same answer from a warm daemon, plus a few 
   pools (test fork servers, macro runtimes) come back lazily, on first use.
 - **Proof:** `proof`'s budgets time restart to first answer, after a clean shutdown and after
   `kill -9`, on the corpus's biggest workspace.
+
+## Where a restart stands (2026-11-02, lane v2-warm-restart)
+
+- **What a build computed is in the store once it answers.** As a head's front end is kept,
+  one task (`store kept front end`, `crates/blaze-cargo/src/serve/job.rs` `Jobs::store_kept`)
+  writes what its build left for the store: the dependency crates' def-map images, check
+  outcomes and checked bodies, their constants, the goal cache and the item store
+  (`deps::store`). The build is reported done only once those puts are durable, so a stop, a
+  `kill -9` or a reboot after the answer loses none of it. A failed build's front end is
+  kept and stored too.
+  - Before, this was written only when the same daemon's next build of the head lowered into
+    the front end, so a build followed by a restart left the store none of it.
+  - A build of the head asked while that store runs waits for it and then lowers into the
+    stored front end, rather than lowering anew beside it.
+  - Test: `what_a_build_left_for_the_store_is_durable_once_it_answers_and_survives_a_crash`
+    in `crates/blaze-cargo/src/serve/tests.rs`.
+- **Each phase of a start is a span** (target `blaze`, under `daemon start`):
+  - `read the state` (the journal, the image's map, both stores' opens);
+  - `restore the symbols`;
+  - `restore the VFS`;
+  - `open the database`;
+  - `restore the plane's history`;
+  - `install the library's trees`.
+
+  The budgets are `harness/v2/budgets.py`'s `restart-first-answer-clean` and
+  `restart-first-answer-kill9`.
+- **Still not restored: the front end itself.** The kept front end (`KeptLowered`: the dense
+  `base_db` database with its def maps, inference and MIR of the members) lives in memory
+  only. A restarted daemon lowers the workspace again and resolves its members again, reading
+  dependencies from their images. Restoring it needs the front end's memos in the image as
+  `Persist` values, the work [query-unify](../lanes/db/query-unify.md) names.
+

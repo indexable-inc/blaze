@@ -190,7 +190,10 @@ mod tests {
         assert!(module.contains("enum Option<T> {\n        Some(t),\n        None,\n    }"));
         assert!(module.contains("enum Result<T, E> {\n        Ok(t),\n        Err(e),\n    }"));
         assert!(module.contains("Included(x),\n        Excluded(x),\n        Unbounded,"));
-        assert!(rpc.contains("rpc_encode_decode!(le usize);"));
+        assert!(rpc.contains("#[cfg(target_pointer_width = \"64\")]\nrpc_encode_decode!(le usize);"));
+        // A narrower client's `usize` is padded to eight bytes, so every client's is eight.
+        assert!(rpc.contains("const MAX_USIZE_SIZE: usize = 8;"));
+        assert!(rpc.contains("*r = &r[MAX_USIZE_SIZE..];"));
         // A request is its tag, then its arguments in order; a reply is
         // `Result<_, PanicMessage>`.
         assert!(client.contains("ApiTags::$method.encode(&mut buf, &mut ());\n                    $($arg.encode(&mut buf, &mut ());)*"));

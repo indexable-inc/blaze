@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 
 use base_db::{Crate, Db};
 use hir_def::{
-    DefWithBodyId, ExpressionStoreOwnerId, HasModule,
+    DefWithBodyId, HasModule,
     expr_store::{ExpressionStore, pretty::print_expr_hir},
     hir::{Expr, ExprId, ExprOrPatIdPacked},
     span_names,
@@ -140,18 +140,17 @@ fn why_unresolved(db: &Db, owner: InferBodyId<'_>, callee: ExprId, out: &mut Str
     out.push_str("inference gave its callee no type and recorded no reason");
 }
 
-/// `owner` by its path: a body's `crate::module::item`, a constant in a signature by its crate.
+/// `owner` by its path, as its query's span names it: a body's `crate::module::item`, a constant
+/// `item::{const#N}` under the item it is written in.
 fn owner_path(db: &Db, owner: InferBodyId<'_>) -> String {
-    match (owner, owner.expression_store_owner(db)) {
-        (InferBodyId::DefWithBodyId(def), _) => body_path(db, def),
-        (InferBodyId::AnonConstId(_), ExpressionStoreOwnerId::Body(def)) => {
-            let mut path = body_path(db, def);
-            path.push_str("::{const}");
-            path
-        }
-        (InferBodyId::AnonConstId(_), store_owner) => {
+    match owner {
+        InferBodyId::DefWithBodyId(def) => body_path(db, def),
+        InferBodyId::AnonConstId(it) => {
+            let loc = it.loc(db);
             // alloc: error path
-            format!("a constant of `{}`", span_names::crate_name(db, store_owner.krate(db)))
+            let mut path = String::new();
+            span_names::write_inner_path(db, loc.owner, loc.expr, span_names::InnerBody::Const, &mut path);
+            path
         }
     }
 }
@@ -159,7 +158,7 @@ fn owner_path(db: &Db, owner: InferBodyId<'_>) -> String {
 fn body_path(db: &Db, def: DefWithBodyId) -> String {
     // alloc: error path
     let mut path = String::new();
-    span_names::write_body_path(db, def, &mut |it| path.push_str(it));
+    span_names::write_body_path(db, def, &mut path);
     path
 }
 

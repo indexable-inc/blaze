@@ -4,6 +4,7 @@
 // alloc: expansion time, once per annotated item; no query runs this
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};
@@ -127,7 +128,7 @@ pub(crate) fn expand(input: &syn::DeriveInput) -> syn::Result<TokenStream> {
     let ident = &input.ident;
     let (_, type_generics, _) = input.generics.split_for_impl();
     let self_ty: Type = syn::parse_quote!(#ident #type_generics);
-    let type_params: HashSet<&syn::Ident> =
+    let type_params: HashSet<&syn::Ident, Global> =
         // alloc: expansion time, once per annotated item; no query runs this
         input.generics.type_params().map(|it| &it.ident).collect();
 
@@ -194,9 +195,9 @@ pub(crate) fn expand(input: &syn::DeriveInput) -> syn::Result<TokenStream> {
     })
 }
 
-fn uses_type_param(ty: &Type, params: &HashSet<&syn::Ident>) -> bool {
+fn uses_type_param(ty: &Type, params: &HashSet<&syn::Ident, Global>) -> bool {
     struct Uses<'a, 'b> {
-        params: &'a HashSet<&'b syn::Ident>,
+        params: &'a HashSet<&'b syn::Ident, Global>,
         found: bool,
     }
     impl<'ast> Visit<'ast> for Uses<'_, '_> {

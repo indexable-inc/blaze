@@ -1,6 +1,7 @@
 use std::hash::Hash;
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 
 /// The DRed over-delete closure: from `seeds`, every node `step` reaches, each once, in BFS
 /// order; `out` is cleared first. `step(n, next)` appends `n`'s successors to `next`.
@@ -18,7 +19,7 @@ pub fn closure<N: Copy + Eq + Hash>(
 /// reaches no more nodes than an earlier one allocates nothing.
 #[derive(Debug)]
 pub struct Closure<N> {
-    seen: HashSet<N>,
+    seen: HashSet<N, Global>,
     next: Vec<N>,
 }
 
@@ -30,7 +31,7 @@ impl<N: Copy + Eq + Hash> Default for Closure<N> {
 
 impl<N: Copy + Eq + Hash> Closure<N> {
     pub fn new() -> Self {
-        Closure { seen: HashSet::default(), next: Vec::new() } // alloc: setup: empty buffers, grown once and kept
+        Closure { seen: HashSet::new_in(Global), next: Vec::new() } // alloc: setup: empty buffers, grown once and kept
     }
 
     /// `O(nodes reached + edges stepped)`, one set probe per edge.

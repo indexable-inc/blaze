@@ -640,7 +640,7 @@ impl MacroCallId {
         self,
         db: &Db,
     ) -> ExpandResult<(Parse<view::Untyped>, ExpansionSpanMap)> {
-        let _p = tracing::info_span!("parse_macro_expansion").entered();
+        let _p = tracing::info_span!(target: "blaze", "parse_macro_expansion").entered();
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
             let loc = self.loc(db);
             // A refused call's empty tree is no expression, pattern or type: parsed as one it
@@ -859,7 +859,7 @@ impl MacroCallId {
         frame: &'f Frame,
         loc: &MacroCallLoc,
     ) -> ExpandResult<(Expansion<'db, 'f>, MatchedArmIndex, mbe::MadeIdents)> {
-        let _p = tracing::info_span!("macro_expand").entered();
+        let _p = tracing::info_span!(target: "blaze", "macro_expand").entered();
 
         let mut made = mbe::MadeIdents::new();
         let ExpandResult { value: (tt, matched_arm), err } = match loc.def.kind {
@@ -964,6 +964,7 @@ impl MacroCallId {
         let (macro_arg, undo_info, _) = self.macro_arg_considering_derives(db, &loc.kind);
         if let Some(refusal) = self.arg_refusal(db, &loc.kind) {
             let empty = tt::TopSubtree::empty(macro_arg.top_subtree().delimiter.delim_span());
+            db.files().expansions_are_read(loc.krate, base_db::ReadBy::Call(self.into()), Vec::new());
             return (ExpandResult::new(empty, refusal), proc_macro::ExpansionReads::Nothing);
         }
 
@@ -1001,6 +1002,18 @@ impl MacroCallId {
                 "its expander reported nothing of what it read",
             )),
         };
+        // What keys a value by the crate's reads (a unit's record) reads them from the log, which
+        // has this call's latest expansion only: one that was unknown and traces now replaces it.
+        let logged = match &reads {
+            proc_macro::ExpansionReads::Nothing => Vec::new(),
+            proc_macro::ExpansionReads::Traced { shape, values } => {
+                // alloc: a shape, once per expansion that read something
+                vec![base_db::ExpansionRead::Traced { shape: Box::from(&**shape), values: *values }]
+            }
+            // alloc: one entry, once per expansion of unknown reads
+            &proc_macro::ExpansionReads::Unknown(why) => vec![base_db::ExpansionRead::Unknown(why)],
+        };
+        db.files().expansions_are_read(loc.krate, base_db::ReadBy::Call(self.into()), logged);
 
         fixup::reverse_fixups(&mut tt, undo_info);
 
@@ -1577,7 +1590,7 @@ impl<'db> ExpansionInfo<'db> {
     }
 
     pub fn new(db: &'db Db, macro_file: MacroCallId) -> ExpansionInfo<'db> {
-        let _p = tracing::info_span!("ExpansionInfo::new").entered();
+        let _p = tracing::info_span!(target: "blaze", "ExpansionInfo::new").entered();
         let loc = macro_file.loc(db);
 
         let arg = loc.kind.arg_view(db);

@@ -20,6 +20,7 @@ One flat directory per store (`Config::dir`):
 | `index-0`, `index-1` | the two index slots: an open-addressed table on keys, written whole into the slot the head does not name. |
 | `head` packs | each pack's entry also holds its dead bytes (records since moved) and whether it is removed; a removed pack keeps its place in the list so the numbers records name stay put. |
 | `file-<content>` | a hot value of 4 MiB or more (not an output), a file of its own: mapped on its own, placed by cloning. |
+| `placed/<content>` | the whole bytes of an output of 16 KiB or more that a build placed, read-only (0o444), which every build directory's copy is a clone of. Not in the head: named by its content and written whole (temporary file, sync, rename). The open lists the directory before any place may write into it or remove from it (places and `unplace` wait for it), keeps each file named for a content and removes anything else (a write a crash cut short), and logs what it found; a `placed` it cannot look through (an error on each of its own 8 tries, or a file where the directory goes) breaks the store, naming it and the error, so nothing is placed by cloning; a kept file's bytes are hashed against its name before it is first cloned from. It is made again when missing or wrong and goes when the path that held it is placed with other bytes ([Chunks and placing](#chunks-and-placing)). |
 
 Packs sit next to the head so the directory sync of the head's write makes a new pack's name
 durable with it.
@@ -48,7 +49,9 @@ A `Reader` (`Store::reader()`, `Send + Sync + Clone`) reads through the publishe
 task's guard. A worker puts through a `Writer` of its own (`Store::writer()`; `Store::put` is
 the owner's): it encodes the record into its own segment's chunk and publishes a spot (key,
 content, place, ticket) into the delta with one compare-and-swap, so the value is readable at
-once and has a ticket, `(segment << 40) | put`. `flush` starts one commit for everything put
+once and has a ticket, `(segment << 40) | put`. During an index swap a claim goes into `prev`
+(the delta the swap left) first, then the new delta, and the fold at the swap's end breaks the
+store, naming the key, if the two disagree. `flush` starts one commit for everything put
 since the last, by the store and by every writer: it drains every segment into pack memory, then
 
 1. each pack written to is cut back to its committed length (`Truncate`), then written at that
@@ -110,11 +113,60 @@ otherwise: a chunk is copied out when its output is assembled, so decompressing 
 the copy. Two builds of a binary that differ in a few functions share
 all but the chunks around the differences.
 
-`Store::place` puts a value at a path outside the store. A file of its own is cloned
-(`Effect::Clone`: `FICLONE`, `clonefile`), after removing what is at the path; anything else,
-chunked outputs included, is written whole, copied with non-temporal stores from 4 MiB on (the
-copy goes to the kernel, not back to the store). The form decides, never a try: where blocks cannot
-be shared the clone fails, naming the file system, and nothing copies instead.
+`Store::place` puts a value at a path outside the store, after removing what is at the path.
+The value decides how, never a try:
+
+- A file of its own (`file-<content>`) is cloned (`Effect::Clone`: `FICLONE`, `fclonefileat`, ReFS block cloning).
+- An output of 16 KiB or more (`CLONE_FROM`), chunked or not, is cloned from `placed/<content>`.
+  The first place of those bytes in a run looks for that file (`Effect::Lstat`, which never
+  follows a symbolic link: a link put there is its own length, under 16 KiB, so it takes the
+  wrong-length path below on every platform). One of the
+  value's length (an earlier run's) is mapped and hashed against its name, then made read-only
+  again; one that is missing, of another length or of other bytes is written once from the
+  verified value (the others removed first, each logged as a warning, target `blaze`, naming
+  the file), made read-only (0o444) and cloned. The hash runs under a `placed check` span
+  naming the file and its bytes. Every later place, in any checkout, clones it again. A clone
+  that fails for the file being gone (removed outside the daemon) or no regular file (a
+  symbolic link, a FIFO, a socket, a device, or on Windows a reparse point such as a deduplicated
+  file, swapped in after the look) has it written again, once, with a warning; so does a seal
+  refused for a link or no regular file found there after the write or the check. Any other
+  failure is the place's. The chunks stay
+  the canonical copy, so two versions of a binary still share their chunks in the packs, and
+  the placed file is what every build directory shares blocks with: a second checkout's build
+  directory adds only the blocks its own outputs differ in. `Store::unplace` drops the file of
+  bytes a path no longer holds (the job places an output of other bytes over it), so relinking does not
+  keep one whole file per version; a clone already placed keeps its blocks.
+- Anything smaller is written whole, copied with non-temporal stores from 4 MiB on (the copy
+  goes to the kernel, not back to the store).
+
+Where blocks cannot be shared the clone fails, naming both files and the volume each is on (its
+mount point and file system on macOS, the file system's type and the device on Linux), and
+nothing copies instead. Each place reports its bytes (`Placed::bytes`: cloned, written to make
+the placed file, copied), which a build sums into the `placed` of its `blaze-work` line and the
+`build placed` span.
+
+A clone is given a new file's mode (0o666 less the umask), though `fclonefileat` copies its
+source's: the store's copy stays read-only while the build directory's may be written; its time
+is now, not the store copy's. A symbolic link is never cloned or cloned through: the source is
+opened `O_NOFOLLOW | O_NONBLOCK` (on Windows `FILE_FLAG_OPEN_REPARSE_POINT`: a link or
+junction is refused as a link, any other reparse point as no regular file, naming its tag),
+anything but a regular file is refused naming what it is (a socket, or a device with no driver,
+whose open fails with `ENXIO`, `ENODEV` or `EOPNOTSUPP` before any `fstat`, is looked at with
+`lstat` and refused the same), and it is cloned from that descriptor
+(`FICLONE`, `fclonefileat`). Making the placed file read-only is its own effect,
+`Effect::Seal`: the file is opened `O_NOFOLLOW` and its mode set on the descriptor (`fchmod`),
+so a link is refused, never followed. On Windows the seal opens the name itself
+(`FILE_FLAG_OPEN_REPARSE_POINT`), refuses a link, junction or directory, and sets the read-only
+attribute on that same handle (`FileBasicInfo`); any other reparse point (a deduplicated file, a
+cloud placeholder) holds a regular file's data and is sealed. It never calls `fchmodat(AT_SYMLINK_NOFOLLOW)`, which
+glibc 2.39 and later make the `fchmodat2` system call that older seccomp filters (Docker before
+23.0.10, 24.0.10 or 25.0.3 on those lines, libseccomp before 2.5.5) refuse with `EPERM`. Every other mode (`Effect::Mode`, such as
+a linked executable's 0o755) is a plain `chmod` that follows a link. Copy on
+write is what keeps a write into a build directory's clone from reaching the store's copy, so
+the read-only mode guards against a writer that opens the store's file itself; the immutable
+flags (`UF_IMMUTABLE`, `FS_IMMUTABLE_FL`) are not set, as `fclonefileat` passes them to every clone
+and they stop removal and gc, and Linux grants them only with `CAP_LINUX_IMMUTABLE`. Nothing
+places by hard link.
 
 ## Verified
 
@@ -262,4 +314,6 @@ leaves, warm or hot, must read element by element in place (`columns::reads_in_p
 ## Not done here
 
 - Eviction: no live record is removed from a store; settling removes only dead space. The VM's
-  disk is taken as unlimited (plan/design/model.md); a store is removed whole.
+  disk is taken as unlimited (plan/design/model.md); a store is removed whole. What is collected
+  around the stores (build dirs, the machine's shared std stores whole, trash) is in
+  [gc.md](gc.md).

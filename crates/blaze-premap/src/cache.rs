@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 
 use crate::PremapError;
 use crate::image::View;
@@ -59,11 +60,11 @@ pub enum Pick {
 
 #[derive(Default)]
 pub struct Images {
-    open: HashMap<ImageKey, Arc<Ready>>,
-    newest: HashMap<GraphKey, ImageKey>,
-    making: HashSet<ImageKey>,
-    failed: HashMap<ImageKey, PremapError>,
-    used: HashMap<GraphKey, u64>,
+    open: HashMap<ImageKey, Arc<Ready>, Global>,
+    newest: HashMap<GraphKey, ImageKey, Global>,
+    making: HashSet<ImageKey, Global>,
+    failed: HashMap<ImageKey, PremapError, Global>,
+    used: HashMap<GraphKey, u64, Global>,
     clock: u64,
 }
 
@@ -114,7 +115,7 @@ impl Images {
             let (&graph, _) = self
                 .used
                 .iter()
-                .filter(|(graph, _)| self.newest.contains_key(graph))
+                .filter(|(graph, _)| self.newest.contains_key(*graph))
                 .min_by_key(|(_, at)| **at)
                 .expect("more graphs than none");
             let key = self.newest.remove(&graph).expect("a graph with an image");

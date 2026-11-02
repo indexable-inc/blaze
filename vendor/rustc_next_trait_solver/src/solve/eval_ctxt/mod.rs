@@ -1019,6 +1019,10 @@ where
     ) -> QueryResultOrRerunNonErased<I> {
         let Goal { param_env, predicate } = goal;
         let kind = predicate.kind();
+        // blaze: a field binder ranges over its container's members, not over every type.
+        if let Some(index) = super::reflect::reflected_binder(&kind) {
+            return self.compute_reflected_forall_goal(param_env, kind, index);
+        }
         self.enter_forall_with_assumptions(kind, param_env, |ecx, kind| {
             Ok(match kind {
                 ty::PredicateKind::Clause(ty::ClauseKind::Trait(predicate)) => {
@@ -1414,6 +1418,12 @@ where
         value: ty::Binder<I, T>,
     ) -> T {
         self.delegate.instantiate_binder_with_infer(value)
+    }
+
+    /// blaze: a new universe, for the placeholder member of a field binder over a generic
+    /// container (`solve::reflect`).
+    pub(super) fn create_next_universe(&self) -> ty::UniverseIndex {
+        self.delegate.create_next_universe()
     }
 
     /// `enter_forall_with_assumptions`, but takes `&mut self` and passes it back through

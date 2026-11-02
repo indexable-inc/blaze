@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::{Profiles, requested_profile};
 use blaze_manifest::targets::TargetKind;
@@ -69,7 +70,7 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(Staged::Failed(error)),
     };
-    let Platforms { host, host_flags, target, target_flags } = &platforms;
+    let Platforms { host, host_flags, target, target_flags, macro_wasm } = &platforms;
     let requested = match &spec.foreign {
         Some(ask) => ask.profile.root.clone(),
         None => match requested_profile(spec.intent.default_profile(), spec.release, spec.profile.as_deref()) {
@@ -84,10 +85,20 @@ pub(crate) fn units(
         },
         None => ws.profiles().cloned(),
     };
-    let profiles = match Profiles::new(manifest_profiles.as_ref(), ws.unstable_features(), config, &requested, &host.triple) {
+    let mut profiles = match Profiles::new(manifest_profiles.as_ref(), ws.unstable_features(), config, &requested, &host.triple) {
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
+    // blaze's `contract-checks` (docs/v2/plan/lanes/contracts.md, part 1), which cargo's
+    // profile tables do not carry. A foreign load builds another build's dependencies with
+    // the profile it asks for, whose root default stands.
+    if spec.foreign.is_none() {
+        let set = blaze_manifest::profiles::read_contract_checks(ctx.files(), ws.root_manifest())
+            .and_then(|keys| profiles.set_contract_checks(&keys));
+        if let Err(error) = set {
+            return Ok(fail(error));
+        }
+    }
     let mut warnings: Vec<String> = read.config.warnings.clone();
     warnings.extend(read.warnings.iter().cloned());
     warnings.extend(resolved.warnings.iter().cloned());
@@ -128,9 +139,9 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
-    let members: HashSet<PackageId> = resolved.member_ids.iter().copied().collect();
-    let mut by_id: HashMap<PackageId, Package<'_>> = HashMap::with_capacity_and_hasher(all_ids.len(), Default::default());
-    let mut packages_by_spec: BySpec<'_> = HashMap::with_capacity_and_hasher(all_ids.len(), Default::default());
+    let members: HashSet<PackageId, Global> = resolved.member_ids.iter().copied().collect();
+    let mut by_id: HashMap<PackageId, Package<'_>, Global> = HashMap::with_capacity_in(all_ids.len(), Global);
+    let mut packages_by_spec: BySpec<'_> = HashMap::with_capacity_in(all_ids.len(), Global);
     for id in &all_ids {
         let Some((_, manifest)) = resolved.manifests.get(id) else { continue };
         let package = Package { manifest, is_member: members.contains(id) };
@@ -142,9 +153,9 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(Staged::Failed(error)),
     };
-    let mut unsandboxed: HashSet<&str> = HashSet::default();
+    let mut unsandboxed: HashSet<&str, Global> = HashSet::new_in(Global);
     // A member's tests keys, by id: a dependency's own table is not read (it can't opt out).
-    let mut test_sandbox: HashMap<PackageId, TestSandbox> = HashMap::default();
+    let mut test_sandbox: HashMap<PackageId, TestSandbox, Global> = HashMap::new_in(Global);
     for (spec, (id, package)) in &packages_by_spec {
         let own = match package.is_member {
             true => match super::sandbox::package(package.manifest.custom_metadata.as_ref(), resolved.manifests[id].0) {
@@ -170,6 +181,7 @@ pub(crate) fn units(
         filter: &filter,
         host,
         target: target.as_ref(),
+        macro_wasm: macro_wasm.as_ref(),
         has_dev_units: resolved.has_dev_units == HasDevUnits::Yes,
     };
     let mut graph = match crate::unit_graph(&request) {
@@ -189,10 +201,34 @@ pub(crate) fn units(
             return Ok(fail(error));
         }
     }
+    // A wasm macro aborts on a panic: the guest's hook hands the host the message, and
+    // wasm32-wasip1 has no unwinding. Before planning, so the units' hashes say so.
+    let macro_platform = macro_wasm.as_ref().map(|it| it.triple.as_str());
+    if let Some(triple) = macro_platform {
+        for unit in &mut graph.units {
+            if unit.platform.as_deref() == Some(triple) {
+                "abort".clone_into(&mut unit.profile.panic);
+            }
+        }
+    }
 
-    let target_dir = match &spec.target_dir {
-        Some(dir) => PathBuf::from(dir),
-        None => ws.target_dir(),
+    // `--target-dir`, else `CARGO_TARGET_DIR` or `build.target-dir`, else the workspace's
+    // directory under blaze's root: never in the checkout. A foreign workspace's units are
+    // placed under `FOREIGN_TARGET` below, whatever this says.
+    let target_dir = match (&spec.target_dir, ws.explicit_target_dir()) {
+        (Some(dir), _) => PathBuf::from(dir),
+        (None, Some(dir)) => dir.to_path_buf(),
+        (None, None) if spec.foreign.is_some() => PathBuf::from(FOREIGN_TARGET),
+        (None, None) if Path::new(&spec.builds).is_absolute() => {
+            blaze_manifest::home::build_dir(Path::new(&spec.builds), ws.root())
+        }
+        (None, None) => {
+            return Ok(fail(anyhow::anyhow!(
+                "the daemon names `{}`, no absolute directory, for the build directory of the workspace at {}",
+                spec.builds,
+                ws.root().display()
+            )));
+        }
     };
     let build_dir = match config.build_dir(ws.root_manifest()) {
         Ok(Some(dir)) => dir,
@@ -234,11 +270,15 @@ pub(crate) fn units(
             platforms_used.dedup();
             for platform in platforms_used {
                 let triple = platform.clone().unwrap_or_else(|| host.triple.clone());
+                // The wasm macros' std is planned as their units are: no rustflags, std's
+                // default crates, aborting.
+                let for_macros = platform.is_some() && platform.as_deref() == macro_platform;
                 let rustflags = match &platform {
+                    _ if for_macros => Vec::new(),
                     Some(_) => target_flags.clone(),
                     None => host_flags.clone(),
                 };
-                let key = match std_key(spec, &graph, &packages_by_spec, &base, &profiles, &triple, rustflags) {
+                let key = match std_key(spec, &graph, &packages_by_spec, &base, &profiles, &triple, rustflags, for_macros) {
                     Ok(it) => it,
                     Err(error) => return Ok(Staged::Failed(error)),
                 };
@@ -255,7 +295,7 @@ pub(crate) fn units(
                     )));
                 }
                 let out = format!("{}/{:x}", spec.std, key.id());
-                merge_std(&mut graph, &mut std_plans, &mut std_packages, std, &platform, &out);
+                merge_std(&mut graph, &mut std_plans, &mut std_packages, std, &platform, &out, for_macros);
             }
         }
     }
@@ -290,6 +330,7 @@ pub(crate) fn units(
         build_dir: &out_build,
         host: &host.triple,
         target: target.as_ref().map(|it| it.triple.as_str()),
+        macro_wasm: macro_platform,
         requested_profile: &requested,
         profile_dir: &dir_name,
         base_profile: &base_profile,
@@ -425,6 +466,8 @@ pub(crate) struct Platforms {
     pub host_flags: Vec<String>,
     pub target: Option<Platformed>,
     pub target_flags: Vec<String>,
+    /// [`super::MACRO_WASM`]'s, under `-Z wasm-macros`.
+    pub macro_wasm: Option<Platformed>,
 }
 
 fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platforms, LoadError> {
@@ -438,6 +481,7 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
             host_flags: Vec::new(),
             target: Some(Platformed { triple: ask.triple.clone(), cfg: parse(&ask.cfg)? }),
             target_flags: ask.rustflags.clone(),
+            macro_wasm: None,
         });
     }
     let target = match &spec.target {
@@ -467,12 +511,27 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
         Some((it, flags)) => (Some(it), flags),
         None => (None, Vec::new()),
     };
-    Ok(Platforms { host, host_flags, target, target_flags })
+    // With no rustflags, as `plan::flags::macro_wasm_info` plans its units.
+    let macro_wasm = match spec.macro_wasm {
+        true if target.as_ref().is_some_and(|it| it.triple == super::MACRO_WASM) => {
+            return Err(error(format!(
+                "`-Z wasm-macros` builds proc macros for `{}`, which is this build's target too: a unit of one could not be told from the other's",
+                super::MACRO_WASM
+            )));
+        }
+        true => {
+            let cfg = platform::target_cfgs(super::MACRO_WASM, &CfgArgs { proc_macro: true, ..CfgArgs::default() })
+                .map_err(error)?;
+            Some(Platformed { triple: super::MACRO_WASM.to_owned(), cfg })
+        }
+        false => None,
+    };
+    Ok(Platforms { host, host_flags, target, target_flags, macro_wasm })
 }
 
 /// What the feature resolver reads of the packages.
 struct Targets<'a> {
-    reads: &'a HashMap<PackageId, Read>,
+    reads: &'a HashMap<PackageId, Read, Global>,
     host: &'a Platformed,
     target: Option<&'a Platformed>,
 }
@@ -547,7 +606,7 @@ fn run_one(graph: &schema::UnitGraph, filter: &Filter) -> anyhow::Result<()> {
 }
 
 /// The packages by the spec a unit's `pkg_id` names them by.
-type BySpec<'a> = HashMap<String, (PackageId, Package<'a>)>;
+type BySpec<'a> = HashMap<String, (PackageId, Package<'a>), Global>;
 
 /// The first unit that depends on an artifact dependency (`-Z bindeps`, #601), which blaze
 /// does not build: refused, naming both. Units that depend on none build.
@@ -647,7 +706,9 @@ fn debuginfo_text(debuginfo: &schema::DebugInfo) -> String {
     }
 }
 
-/// The standard library's key for the units built for `triple`.
+/// The standard library's key for the units built for `triple`. `for_macros`' is
+/// `-Z wasm-macros`' std, which `-Zbuild-std` and the build's tests do not shape: std's
+/// default crates and features, aborting.
 fn std_key(
     spec: &Spec,
     graph: &schema::UnitGraph,
@@ -656,17 +717,18 @@ fn std_key(
     profiles: &Profiles,
     triple: &str,
     rustflags: Vec<String>,
+    for_macros: bool,
 ) -> Result<StdKey, LoadError> {
     let library = spec.library.clone().ok_or_else(|| LoadError {
         what: format!("the standard library is mounted nowhere: no mount is at `{}`", spec.library_at),
         at: None,
     })?;
     let mut crates = match &spec.build_std {
-        Some(crates) => crates.clone(),
-        None => default_crates(triple).map_err(|what| LoadError { what, at: None })?,
+        Some(crates) if !for_macros => crates.clone(),
+        _ => default_crates(triple).map_err(|what| LoadError { what, at: None })?,
     };
     // cargo's `std_crates`: `test` when a unit is a test in libtest's harness.
-    let harnessed = graph.units.iter().any(|unit| {
+    let harnessed = !for_macros && graph.units.iter().any(|unit| {
         unit.mode == Mode::Test && harness_of(unit, packages)
     });
     if crates.iter().any(|it| it == "std") && harnessed && !crates.iter().any(|it| it == "test") {
@@ -682,13 +744,16 @@ fn std_key(
         library,
         triple: triple.to_owned(),
         profile: base.name.clone(),
-        panic: base.panic.clone(),
+        panic: if for_macros { "abort".to_owned() } else { base.panic.clone() },
         opt_level: base.opt_level.clone(),
         debug_assertions: base.debug_assertions,
         overflow_checks: base.overflow_checks,
         debuginfo: debuginfo_text(&base.debuginfo),
         crates,
-        features: spec.build_std_features.clone().unwrap_or_else(default_features),
+        features: match &spec.build_std_features {
+            Some(features) if !for_macros => features.clone(),
+            _ => default_features(),
+        },
         host: spec.host.clone(),
         rustflags,
         profile_root: root.to_owned(),
@@ -720,6 +785,8 @@ fn kind_name(kind: &TargetKind) -> Option<&'static str> {
 /// has no sysroot, so a host unit (a build script, a proc macro) is given the host's std the
 /// same way. std's own units, merged after the build's, are given none: its build scripts are
 /// never compiled, their output blaze's port of each ([`crate::stdlib::scripts`]).
+/// `for_macros`: the platform is `-Z wasm-macros`', whose std's target units' plans say
+/// [`UnitPlan::macro_wasm`] as its own units' do.
 fn merge_std(
     graph: &mut schema::UnitGraph,
     plans: &mut Vec<Option<UnitPlan>>,
@@ -727,6 +794,7 @@ fn merge_std(
     std: StdGraph,
     platform: &Option<String>,
     out: &str,
+    for_macros: bool,
 ) {
     let offset = graph.units.len();
     let users: Vec<usize> = (0..offset)
@@ -745,8 +813,9 @@ fn merge_std(
         graph.units.push(unit);
     }
     plans.reserve(std.plans.len());
-    for mut plan in std.plans {
+    for (at, mut plan) in std.plans.into_iter().enumerate() {
         rebase(&mut plan, &[STD_OUT], out);
+        plan.macro_wasm = for_macros && graph.units[offset + at].platform.is_some();
         plans.push(Some(plan));
     }
     for at in users {
@@ -758,6 +827,7 @@ fn merge_std(
                 public: Some(true),
                 noprelude: Some(true),
                 nounused: Some(true),
+                dev: false,
             });
         }
     }

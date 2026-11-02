@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{ImplId, TraitId};
 use hir_expand::name::Name;
 use intern::Symbol;
@@ -279,8 +280,8 @@ impl Model {
 fn check_delta(
     db: &mut Db,
     krate: Crate,
-    keys: &mut HashMap<ImplId, ImplKey>,
-    names: &mut HashMap<TraitId, SmallVec<[Name; 8]>>,
+    keys: &mut HashMap<ImplId, ImplKey, Global>,
+    names: &mut HashMap<TraitId, SmallVec<[Name; 8]>, Global>,
     what: &str,
     failures: &mut String,
 ) {

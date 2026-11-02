@@ -180,6 +180,11 @@ pub struct BuildConfig {
     /// blaze build (`<user cache>/blaze/std/<build id>`), one directory of each [`StdKey`],
     /// the same whatever workspace or `BLAZE_HOME` asks for it.
     pub std: String,
+    /// Where the daemon places workspaces' build directories when nothing names one, absolute:
+    /// `build` under blaze's root (`blaze_manifest::home::builds`), each workspace's in a
+    /// directory of its root's id (`blaze_manifest::home::build_dir`). Nothing of a build is
+    /// written into the checkout.
+    pub builds: String,
 }
 
 impl BuildConfig {
@@ -274,7 +279,7 @@ pub enum Planned {
 }
 
 impl Versioned for Planned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 6");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 8");
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -335,7 +340,7 @@ pub struct Units {
 }
 
 impl Versioned for Units {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 8");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 11");
 }
 
 /// What cargo passes and writes for one unit.
@@ -380,6 +385,10 @@ pub struct UnitPlan {
     /// other command, a package outside the workspace, the standard library, a build script's
     /// run).
     pub clippy: Option<Clippy>,
+    /// The unit is built for `-Z wasm-macros`' platform, its own or the standard library's
+    /// for it: its code calls the macro host's bridge (`proc_macro_bridge`), and a proc macro's
+    /// links as a WASI reactor the host loads.
+    pub macro_wasm: bool,
 }
 
 /// What `check` lints a crate with beyond its compile, as cargo-clippy gives clippy's driver;
@@ -389,6 +398,22 @@ pub struct Clippy {
     /// The configuration file clippy's search finds (`.clippy.toml` or `clippy.toml`, from
     /// `CLIPPY_CONF_DIR` or the package's directory up), absolute, with its text.
     pub conf: Option<(String, String)>,
+    /// What `[workspace.metadata.blaze.lints]` says of the profile the profile lints read
+    /// (`blaze_lints::profile`); `clippy.toml`'s keys override it.
+    pub profile: Option<LintProfile>,
+}
+
+/// The profile keys of `[workspace.metadata.blaze.lints]` (`profile`, `profile-hot-percent`,
+/// `profile-cold-percent`): the path absolute against the workspace's root, each percent as
+/// its TOML number. Only the path is in the plan; the profile's bytes are keyed where the
+/// lints run (`blaze_cargo`'s record key).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct LintProfile {
+    pub path: Option<String>,
+    pub hot_percent: Option<String>,
+    pub cold_percent: Option<String>,
+    /// The workspace's root manifest, for errors.
+    pub manifest: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -503,7 +528,7 @@ pub enum StdPlanned {
 }
 
 impl Versioned for StdPlanned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 5");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 7");
 }
 
 /// The standard library's units: a graph of their own, whose units the user's units depend on
@@ -602,6 +627,7 @@ mod tests {
             host: "aarch64-unknown-linux-gnu".to_owned(),
             library: "/rustc/0123/library".to_owned(),
             std: "/s/std".to_owned(),
+            builds: "/s/build".to_owned(),
         };
         assert_eq!(BuildConfig::decode(&config.encode()).unwrap(), config);
         assert!(BuildConfig::decode(b"\xff").is_err());

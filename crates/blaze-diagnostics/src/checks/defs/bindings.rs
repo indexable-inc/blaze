@@ -7,6 +7,7 @@
 //! (MIT or Apache-2.0).
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_items::{Fact, ItemId};
 use hir::{EditionedFileId, InFile, Name};
 use hir_def::{
@@ -39,11 +40,11 @@ pub(super) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
 /// What [`check_body`] keeps of one body, cleared and reused for the next.
 #[derive(Default)]
 struct Scratch {
-    parent: HashMap<PatId, PatId>,
-    seen: HashSet<InFile<SyntaxNodePtr>>,
+    parent: HashMap<PatId, PatId, Global>,
+    seen: HashSet<InFile<SyntaxNodePtr>, Global>,
     roots: Vec<Root>,
     /// The product context of each parameter list, its parameters' names in it.
-    lists: HashMap<InFile<SyntaxNodePtr>, Ctx>,
+    lists: HashMap<InFile<SyntaxNodePtr>, Ctx, Global>,
     ctxs: Vec<Ctx>,
 }
 
@@ -123,16 +124,16 @@ struct Root {
 /// rustc's `PatBoundCtx` with the names bound in it.
 struct Ctx {
     product: bool,
-    names: HashSet<(Name, HygieneId)>,
+    names: HashSet<(Name, HygieneId), Global>,
 }
 
 impl Ctx {
     fn product() -> Ctx {
-        Ctx { product: true, names: HashSet::default() }
+        Ctx { product: true, names: HashSet::new_in(Global) }
     }
 
     fn or() -> Ctx {
-        Ctx { product: false, names: HashSet::default() }
+        Ctx { product: false, names: HashSet::new_in(Global) }
     }
 }
 

@@ -194,11 +194,42 @@ mod unix {
         checked(unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) }).map(drop)
     }
 
-    /// `to` made a clone of `from` (`clonefile`, no flags).
+    /// The `statfs` of the file system that holds `path`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn statfs(path: &CStr) -> io::Result<libc::statfs> {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `path` NUL-terminated and borrowed across the call, `stat` room for one
+        // `libc::statfs` the call writes whole on success and does not keep.
+        checked(unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) })?;
+        // SAFETY: the call succeeded, so it filled the `statfs`.
+        Ok(unsafe { stat.assume_init() })
+    }
+
+    /// `to` made a clone of the open file `from` (`fclonefileat`, no flags).
     #[cfg(target_os = "macos")]
-    pub(crate) fn clonefile(from: &CStr, to: &CStr) -> io::Result<()> {
-        // SAFETY: two NUL-terminated paths borrowed across the call, which keeps neither.
-        checked(unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) }).map(drop)
+    pub(crate) fn fclonefileat(from: BorrowedFd<'_>, to: &CStr) -> io::Result<()> {
+        // SAFETY: a descriptor borrowed open for the call and a NUL-terminated path borrowed
+        // across it, which keeps neither.
+        checked(unsafe { libc::fclonefileat(from.as_raw_fd(), libc::AT_FDCWD, to.as_ptr(), 0) }).map(drop)
+    }
+
+    /// `path`'s permission bits set to `mode`, a symbolic link not followed (`fchmodat` with
+    /// `AT_SYMLINK_NOFOLLOW`, which sets a link's own bits). macOS only: glibc makes this call
+    /// `fchmodat2`, which some seccomp filters refuse.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn chmod_no_follow(path: &CStr, mode: u32) -> io::Result<()> {
+        // SAFETY: a NUL-terminated path borrowed across the call.
+        checked(unsafe { libc::fchmodat(libc::AT_FDCWD, path.as_ptr(), mode as libc::mode_t, libc::AT_SYMLINK_NOFOLLOW) })
+            .map(drop)
+    }
+
+    /// The access and modification times of `path` set to now, a symbolic link not followed
+    /// (`utimensat` with no times).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn touch(path: &CStr) -> io::Result<()> {
+        // SAFETY: a NUL-terminated path borrowed across the call; a null `times` means now.
+        checked(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), std::ptr::null(), libc::AT_SYMLINK_NOFOLLOW) })
+            .map(drop)
     }
 
     /// `F_NOCACHE` on `fd`: its reads and writes stay out of the unified buffer cache.

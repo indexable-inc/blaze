@@ -43,6 +43,7 @@ use std::{
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use crate::{
     flat::FlatTree, Direction, FlatTreeBuilder, NodeOrToken, SyntaxKind, SyntaxText, TextRange,
@@ -56,7 +57,7 @@ struct FlatRoot {
     /// For a part's root: the file's root, which owns it, and the lazy node it is the part of.
     file: Option<(ptr::NonNull<FlatRoot>, u32)>,
     /// For a file's root: the roots of the parts cursors entered, by their lazy node.
-    parts: RefCell<HashMap<u32, ptr::NonNull<FlatRoot>>>,
+    parts: RefCell<HashMap<u32, ptr::NonNull<FlatRoot>, Global>>,
 }
 
 impl Drop for FlatRoot {

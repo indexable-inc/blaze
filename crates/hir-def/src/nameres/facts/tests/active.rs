@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 
 use base_db::Db;
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_query::db::FromId;
 
 use super::{Exempt, compare_db, fixture_db, new_crate_local_def_map};
@@ -70,7 +71,7 @@ fn name(db: &Db, module: ModuleId) -> String {
 
 /// The modules whose `query` ran for round `round`: its key's module (a component's anchor
 /// for `scc_state`).
-fn ran_at(db: &TestDB, events: &[(String, blaze_query::db::Id)], query: &str, round: u32) -> HashSet<String> {
+fn ran_at(db: &TestDB, events: &[(String, blaze_query::db::Id)], query: &str, round: u32) -> HashSet<String, Global> {
     events
         .iter()
         .filter(|(it, _)| it == query)
@@ -91,7 +92,7 @@ fn ran_at(db: &TestDB, events: &[(String, blaze_query::db::Id)], query: &str, ro
         .collect()
 }
 
-fn set(names: &[&str]) -> HashSet<String> {
+fn set(names: &[&str]) -> HashSet<String, Global> {
     names.iter().map(|it| (*it).to_owned()).collect()
 }
 

@@ -26,6 +26,7 @@ mod variance;
 
 use base_db::{Crate, EditionedFileId};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use expect_test::Expect;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, GenericDefId, HasModule, ModuleDefId, ModuleId, VariantId,
@@ -201,9 +202,9 @@ fn check_impl(
 
     crate::attach_db(&db, || {
         let mut had_annotations = false;
-        let mut mismatches = HashMap::default();
-        let mut types = HashMap::default();
-        let mut adjustments = HashMap::default();
+        let mut mismatches = HashMap::new_in(Global);
+        let mut types = HashMap::new_in(Global);
+        let mut adjustments = HashMap::new_in(Global);
         for (file_id, annotations) in db.extract_annotations() {
             for (range, expected) in annotations {
                 let file_range = FileRange { file_id, range };
@@ -408,7 +409,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
                     }
                     _ => None,
                 })
-                .collect::<HashMap<_, _>>();
+                .collect::<HashMap<_, _, Global>>();
             let mut mismatches: Vec<(InFile<SyntaxNode>, (Ty<'_>, Ty<'_>))> = Vec::new();
 
             if let Some((binding_id, syntax_ptr)) = self_param {
@@ -432,7 +433,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
                     Err(SyntheticSyntax) => continue,
                 };
                 types.push((node.clone(), ty.as_ref()));
-                if let Some(mismatch) = type_mismatch_for_node.get(&pat.into()) {
+                if let Some(mismatch) = type_mismatch_for_node.get(&hir_def::hir::ExprOrPatIdPacked::from(pat)) {
                     mismatches.push((node, *mismatch));
                 }
             }
@@ -446,7 +447,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
                     Err(SyntheticSyntax) => continue,
                 };
                 types.push((node.clone(), ty.as_ref()));
-                if let Some(mismatch) = type_mismatch_for_node.get(&expr.into()) {
+                if let Some(mismatch) = type_mismatch_for_node.get(&hir_def::hir::ExprOrPatIdPacked::from(expr)) {
                     mismatches.push((node, *mismatch));
                 }
             }

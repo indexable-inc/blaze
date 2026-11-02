@@ -44,6 +44,12 @@ pub struct CheckCfg {
     pub cargo: bool,
 }
 
+impl CheckCfg {
+    /// No `--check-cfg`: [`Default`]'s, made in a constant.
+    pub(crate) const NONE: CheckCfg =
+        CheckCfg { given: false, exhaustive_names: false, expecteds: Vec::new(), cargo: false };
+}
+
 /// rustc's `ExpectedValues`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Values {

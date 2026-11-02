@@ -211,6 +211,7 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str) -> Result<(
             host: host()?.to_owned(),
             library: stdlib::library_at(&library.commit),
             std: "/s/std".to_owned(),
+            builds: "/s/build".to_owned(),
         };
         let opened = db.open_with(View { root: view }, &config.encode());
         let planned = db.pin().get::<Plan>(opened, &()).map_err(|error| format!("planning {dir}: {error:?}"))?.get();
@@ -285,13 +286,14 @@ fn lower(dir: &str, cargo_home: &str) -> Result<(Lowered, Units), String> {
         }
     }
     let toolchain = ContentId::of("blaze v2 firewall toolchain 1", library()?.commit.as_bytes());
+    let keeping = blaze_macro_eval::Macros::nothing("the firewall test runs every expansion");
     for unit in 0..units.graph.units.len() {
         if !lowered.crates().is_proc_macro(unit) {
             continue;
         }
         let name = &units.graph.units[unit].target.name;
         let krate = lowered.krate(unit).ok_or_else(|| format!("proc macro `{name}` has no crate"))?;
-        let macros = blaze_macro_eval::load(lowered.db(), krate, toolchain);
+        let macros = blaze_macro_eval::load(lowered.db(), krate, toolchain, &keeping);
         lowered.macros(unit, macros).map_err(|error| format!("the macros of `{name}`: {error}"))?;
     }
     Ok((lowered, units))

@@ -296,3 +296,220 @@ fn main() {
 "#;
     assert_eq!(ui("mutated.rs", "2015", source), "");
 }
+
+#[test]
+fn a_reference_to_a_bits_field_names_the_struct_and_the_field() {
+    // blaze's own: a field of a `#[blaze::bits]` struct sits at a bit offset and has no
+    // address. A reference to the whole struct and a copy of the field are fine.
+    let source = r#"#[blaze::bits]
+struct Flags { valid: bool, level: u8 }
+
+fn main() {
+    let mut f = Flags { valid: true, level: 3 };
+    let r = &f.level;
+    let p = &raw const f.valid;
+    let whole = &f;
+    let copied = { f.level };
+}
+"#;
+    assert_eq!(
+        errors(None, source),
+        [
+            "E0793 6:13 reference to field `level` of `#[blaze::bits]` struct `Flags`: a \
+             bit-packed field has no address; copy it out with `{ f.level }` or borrow the \
+             whole struct",
+            "E0793 7:13 reference to field `valid` of `#[blaze::bits]` struct `Flags`: a \
+             bit-packed field has no address; copy it out with `{ f.valid }` or borrow the \
+             whole struct",
+        ]
+    );
+}
+
+/// `#![feature(blaze_comptime)]` and `library/core/src/reflect.rs` reduced to what inference,
+/// lowering and borrowck read: the head of each `for const` test's `main.rs`.
+const REFLECT: &str = r#"#![feature(blaze_comptime)]
+#[lang = "field"]
+pub unsafe trait FieldOf: Copy {
+    #[lang = "field_base"]
+    type Base: ?Sized;
+    #[lang = "field_type"]
+    type Type: ?Sized;
+}
+#[lang = "blaze_field"]
+pub unsafe trait Field<B: ?Sized>: FieldOf {}
+#[lang = "blaze_fields"]
+pub struct Fields<T: ?Sized, P = ()>(*const T, P);
+pub fn fields_of<T: ?Sized>() -> Fields<T> { loop {} }
+"#;
+
+/// The line and column (1-based) of the `nth` (from 0) `needle` in `source`, as [`errors`]
+/// writes a primary span's start.
+fn at(source: &str, needle: &str, nth: usize) -> String {
+    let (offset, _) = source.match_indices(needle).nth(nth).expect("the needle is in the source");
+    let before = &source[..offset];
+    let line = before.matches('\n').count() + 1;
+    let column = before[before.rfind('\n').map_or(0, |it| it + 1)..].chars().count() + 1;
+    format!("{line}:{column}")
+}
+
+#[test]
+fn two_mutable_borrows_of_one_reflected_field_conflict() {
+    // One iteration of a `for const` body names one field: `&mut x.[f]` twice in it is two
+    // mutable borrows of the same place, named as the source writes it.
+    let source = format!(
+        "{REFLECT}\
+pub trait Touch {{ fn touch(&mut self); }}
+fn twice<T>(x: &mut T) where for<F: Field<T>> F::Type: Touch {{
+    for const f in fields_of::<T>() {{
+        let a = &mut x.[f];
+        let b = &mut x.[f];
+        a.touch();
+        b.touch();
+    }}
+}}
+fn main() {{}}
+"
+    );
+    assert_eq!(
+        errors(Some("sized, copy"), &source),
+        [format!(
+            "E0499 {} cannot borrow `x.[f]` as mutable more than once at a time",
+            at(&source, "&mut x.[f]", 1)
+        )]
+    );
+}
+
+#[test]
+fn a_move_out_of_a_reflected_field_is_refused_naming_the_place() {
+    // Behind a reference, as a named field's: E0507 naming `x.[f]`. Out of an owned base, a
+    // partial move per field is not built yet (drop elaboration runs on the generic body,
+    // which cannot say which field an open drop of `y` skips): E0507 that says so.
+    let source = format!(
+        "{REFLECT}\
+fn borrowed<T>(x: &T) where for<F: Field<T>> F::Type: Sized {{
+    for const f in fields_of::<T>() {{
+        let v = x.[f];
+    }}
+}}
+fn owned<T>(y: T) where for<F: Field<T>> F::Type: Sized {{
+    for const f in fields_of::<T>() {{
+        let v = y.[f];
+    }}
+}}
+fn main() {{}}
+"
+    );
+    assert_eq!(
+        errors(Some("sized, copy"), &source),
+        [
+            format!(
+                "E0507 {} cannot move out of `x.[f]` which is behind a shared reference",
+                at(&source, "x.[f]", 0)
+            ),
+            format!(
+                "E0507 {} cannot move out of the reflected field `y.[f]`: moving a field out of \
+                 its base in a `for const` loop is not supported yet \
+                 (`#![feature(blaze_comptime)]`); borrow it or copy it",
+                at(&source, "y.[f]", 0)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_for_const_body_holds_its_binders_bounds_in_borrowck_and_lints() {
+    // `T` is generic: the loop's `F::Type` is `Show + Copy` only by the field binder. Copying
+    // `t.[f]` out of a `&T` twice and calling `show` passes borrowck with no error and no
+    // unsatisfied bound; a lint that asks `Copy` of the type gets inference's answer (yes), so
+    // `dropping_copy_types` fires, which it cannot without the loop's environment.
+    let source = format!(
+        "#![warn(dropping_copy_types)]
+{REFLECT}\
+#[rustc_diagnostic_item = \"mem_drop\"]
+pub fn drop<X>(_x: X) {{}}
+pub trait Show {{ fn show(&self); }}
+fn each<T>(t: &T) where for<F: Field<T>> F::Type: Show + Copy {{
+    for const f in fields_of::<T>() {{
+        let v = t.[f];
+        let w = v;
+        v.show();
+        w.show();
+        drop(t.[f]);
+    }}
+}}
+fn main() {{}}
+"
+    );
+    let checked = checked(&format!(
+        "//- minicore: sized, copy, clone\n//- /main.rs crate:other:main\n{source}"
+    ));
+    let messages: Vec<&str> = checked.diags.iter().map(|it| it.message.as_str()).collect();
+    let refused: Vec<&str> = checked
+        .diags
+        .iter()
+        .filter(|it| {
+            it.is_error()
+                || it.message.contains("not satisfied")
+                || it.message.contains("does not implement")
+                || it.message.contains("moved")
+        })
+        .map(|it| it.message.as_str())
+        .collect();
+    assert_eq!(refused, Vec::<&str>::new(), "every diagnostic: {messages:?}");
+    assert!(
+        messages
+            .contains(&"calls to `std::mem::drop` with a value that implements `Copy` does nothing"),
+        "`dropping_copy_types` sees `F::Type: Copy`: {messages:?}"
+    );
+}
+
+/// E0320 of a local whose type nests `Option` past the recursion limit around a projection
+/// the drop check cannot see through (`/tmp/blaze-lanes/v2-quadratic/param140.rs`, cut to the
+/// first refusal): rustc's message with its type abbreviated by `short_string`, its note of
+/// what overflowed, and the body, the limit and a raised limit to try.
+#[test]
+fn drop_check_overflow_names_the_body_the_type_and_the_limit() {
+    let mut source = String::from(
+        "pub trait Tr { type A; }\npub fn wrap<T>(x: T) -> Option<T> { Some(x) }\n\
+         pub fn caller<T: Tr>(x: T::A) {\n    let a0 = x;\n",
+    );
+    for i in 1..=130 {
+        source += &format!("    let a{i} = wrap(a{});\n", i - 1);
+    }
+    source += "    let _ = a130;\n}\nfn main() {}\n";
+    let stderr = ui_core("param140.rs", "2024", "sized, option", &source);
+    let first = stderr.split("\n\n").find(|it| it.contains("E0320")).expect(&stderr);
+    assert_eq!(
+        first,
+        r#"error[E0320]: overflow while adding drop-check rules for `Option<Option<Option<Option<Option<Option<Option<Option<_>>>>>>>>` in `caller`, past the recursion limit of 128
+  --> $DIR/param140.rs:134:9
+   |
+LL |     let a130 = wrap(a129);
+   |         ^^^^
+   |
+   = note: overflowed on `Option<<T as Tr>::A>`
+   = help: consider increasing the recursion limit by adding a `#![recursion_limit = "256"]` attribute to your crate (`main`)"#
+    );
+}
+
+#[test]
+fn zz_dropck_real_files() {
+    for (name, path) in [("param140.rs", "/tmp/blaze-lanes/v2-quadratic/param140.rs"), ("ident.rs", "/tmp/blaze-lanes/v2-quadratic/ident_2000_50.rs")] {
+        let text = std::fs::read_to_string(path).unwrap();
+        for raised in [false, true] {
+            let source = match raised {
+                true => format!("#![recursion_limit = \"4096\"]\n{text}\nfn main() {{}}\n"),
+                false => format!("{text}\nfn main() {{}}\n"),
+            };
+            let start = std::time::Instant::now();
+            let found = errors(Some("sized, option"), &source);
+            let e0320: Vec<&String> = found.iter().filter(|it| it.starts_with("E0320")).collect();
+            eprintln!("ZZ {name} raised={raised}: {} errors, {} E0320 in {:?}", found.len(), e0320.len(), start.elapsed());
+            for it in found.iter().filter(|it| !it.starts_with("E0320")) { eprintln!("ZZ   other: {}", &it[..it.len().min(200)]); }
+            let lines: Vec<String> = e0320.iter().map(|it| it.split(' ').nth(1).unwrap().to_owned()).collect();
+            eprintln!("ZZ   at: {}", lines.join(" "));
+            let owners: std::collections::BTreeSet<String> = e0320.iter().filter_map(|it| it.split(" in `").nth(1).map(|it| it.split('`').next().unwrap().to_owned())).collect();
+            eprintln!("ZZ   owners: {owners:?}");
+        }
+    }
+}

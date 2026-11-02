@@ -3,6 +3,7 @@
 //! with their intra-doc links resolved, and the impls of every type and trait.
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 /// Every crate documented in one run.
 #[derive(Debug, Default)]
@@ -426,9 +427,9 @@ pub struct Doc {
     pub markdown: String,
     /// Keyed by the link's destination as the docs write it (`Foo::bar`, `crate::Baz`), or its
     /// text for a shortcut link (`[Foo]`).
-    pub links: HashMap<String, Target>,
+    pub links: HashMap<String, Target, Global>,
     /// What a link whose text is the link itself shows instead: `[struct@Foo]` shows `Foo`.
-    pub texts: HashMap<String, String>,
+    pub texts: HashMap<String, String, Global>,
 }
 
 impl Doc {

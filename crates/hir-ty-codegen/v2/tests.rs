@@ -64,6 +64,9 @@ fn policy(level: OptLevel) -> Policy {
         fold: false,
         sanitize: Sanitize::default(),
         pgo: blaze_codegen::settings::Pgo::None,
+        proc_macro_bridge: false,
+        report: false,
+        heap_to_stack: false,
     }
 }
 
@@ -78,13 +81,13 @@ fn function(db: &TestDB, name: &str) -> FunctionId {
 }
 
 fn spec() -> Spec {
-    let target = crate::Target::selected().expect("a target");
+    let target = crate::Target::for_fixtures();
     let arch = match target.arch {
         crate::Arch::X86_64 => blaze_codegen::Arch::X86_64,
         crate::Arch::Aarch64 => blaze_codegen::Arch::Aarch64,
         crate::Arch::Wasm32 => blaze_codegen::Arch::Wasm32,
     };
-    let pic = crate::target().expect("a code generator").flags().is_pic();
+    let pic = crate::isa_for(crate::Target::for_fixtures()).expect("a code generator").flags().is_pic();
     Spec {
         toolchain: Toolchain {
             id: ContentId::default(),
@@ -95,7 +98,7 @@ fn spec() -> Spec {
             cranelift: "0.136".to_owned(),
             llvm: None,
             stencils: None,
-            frame_pointers: crate::backend::frame_pointers(),
+            frame_pointers: false,
             relocation: if pic { Relocation::Pic } else { Relocation::Static },
         },
         backend: Backend::Cranelift { speed: false },
@@ -108,6 +111,9 @@ fn spec() -> Spec {
         mir_inline: false,
         pgo: blaze_codegen::settings::Pgo::None,
         sanitize: Sanitize::default(),
+        proc_macro_bridge: false,
+        report: false,
+        heap_to_stack: false,
     }
 }
 
@@ -134,7 +140,7 @@ fn called(
     let is_of = |instance: &HirInstance| {
         matches!(&instance.0, Kind::Code(called, _) if called.def == InstanceDef::Fn(of))
     };
-    refs::walk(db, root, false, homes)
+    refs::walk(db, root, refs::Walking::plain(false), homes)
         .expect("the walk of the root")
         .into_iter()
         .filter_map(|it| match it {
@@ -150,7 +156,7 @@ fn refs_of(
     homes: &mut Homes,
     (instance, inlined): (&HirInstance, bool),
 ) -> Vec<blaze_codegen::Target> {
-    let walked = refs::walk(db, instance, inlined, homes).expect("the walk");
+    let walked = refs::walk(db, instance, refs::Walking::plain(inlined), homes).expect("the walk");
     (0..walked.len()).map(|at| blaze_codegen::Target::Extern(format!("ref{at}"))).collect()
 }
 
@@ -162,7 +168,7 @@ fn prepared(frontend: &HirFrontend, spec: &Spec, instance: &HirInstance) -> (Sha
     frontend.with(|db, homes| {
         let refs = refs_of(db, homes, (instance, inlines(spec)));
         let refs: &Refs = &refs;
-        let walked = (instance, inlines(spec));
+        let walked = (instance, refs::Walking::plain(inlines(spec)));
         Backends::default()
             .prepared(db, homes, &frontend.hashes, &unit(spec), spec, walked, refs)
             .unwrap_or_else(|e| panic!("{instance:?}: {e:?}"))
@@ -232,7 +238,7 @@ pub fn roots() -> (TypeId, TypeId) {
 "#;
 
 /// Two instances of one body whose code reads nothing that tells their arguments apart
-/// (`id::<&A>`, `id::<&B>`) have one share key in their arguments' place, so they are one
+/// (`id::<&A>`, `id::<&B>`) have one compile identity in their arguments' place, so they are one
 /// instance: one key, which the build compiles once, and one shape. `tid::<&A>` and
 /// `tid::<&B>` read `type_id`, which tells them apart, and stay two.
 #[test]
@@ -266,6 +272,187 @@ fn instances_with_one_share_key_are_one() {
     });
 }
 
+const SHAPES: &str = r#"
+//- minicore: sized, option
+pub struct A(pub u32);
+pub struct B(pub u32);
+pub struct C(pub u64);
+#[repr(transparent)]
+pub struct W(pub u32);
+pub enum E1 { X, Y }
+pub enum E3 { P, Q }
+pub struct F(pub f32);
+pub struct G(pub f32);
+pub fn id<T>(x: T) -> T { x }
+pub fn swap<T>(a: T, b: T) -> (T, T) { (b, a) }
+pub fn wrap<T>(x: T) -> Option<T> { Some(x) }
+pub extern "C" fn c<T>(_x: T) {}
+pub fn roots() {
+    id(A(1)); id(B(2)); id(C(3)); id(W(4)); id(E1::X); id(E3::P); id(F(1.0)); id(G(2.0));
+    swap(A(1), A(2)); swap(B(1), B(2)); swap(C(1), C(2)); swap(W(1), W(2));
+    swap(E1::X, E1::Y); swap(E3::P, E3::Q); swap(F(1.0), F(2.0)); swap(G(1.0), G(2.0));
+    wrap(A(1)); wrap(B(2)); wrap(C(3)); wrap(W(4)); wrap(E1::X); wrap(E3::P); wrap(F(1.0)); wrap(G(2.0));
+    c(A(1)); c(B(2)); c(W(4));
+}
+"#;
+
+/// The property polymorphization rests on (docs/v2/plan/lanes/polymorph.md): instances whose
+/// keys are equal compile to one shape, at every debuginfo level. Values of two types of one
+/// shape (`A` and `B`, `E1` and `E3`, `F` and `G`) are one instance of `id`, `swap` and `wrap`
+/// where no local is told to a debugger; a `u64`, a `transparent` wrapper and a float are not
+/// one with a `u32` struct. Where locals are told (`DebugInfo::tells_locals`) their types are
+/// the instance's own, so no two instances share. `c` is an `extern "C"` function, whose
+/// arguments are passed as the C ABI reads them (`scalar_leaves`, `classify`, `decays_in_c`):
+/// `A` and `B` are one instance of it and the `transparent` `W` is not. Each of the 27
+/// instances is prepared on its own at its unit's spec and every pair is compared, so any
+/// input a key misses fails here.
+#[test]
+fn equal_share_keys_compile_to_one_shape() {
+    use blaze_codegen::backend::Frontend as _;
+    for debuginfo in [DebugInfo::None, DebugInfo::LineTablesOnly, DebugInfo::Limited, DebugInfo::Full] {
+        let mut policy = policy(OptLevel::O0);
+        policy.profile.debuginfo = debuginfo;
+        let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
+        hir_ty::attach_db(db, || {
+            let root = frontend.root(function(db, "roots"));
+            let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+            let keyed = |instance: &HirInstance| {
+                let described = (frontend.describe(instance, &origin))
+                    .unwrap_or_else(|e| panic!("{debuginfo:?} {instance:?}: {}", e.what));
+                let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+                let key = UnitInstance { code: described.code, args: described.args, settings: choice.first.settings() }.key();
+                (key, prepared(&frontend, &choice.first, instance).0)
+            };
+            // `roots` asks for each body with `A, B, C, W, E1, E3, F, G`, in that order.
+            let expected: &[(usize, usize)] =
+                if debuginfo.tells_locals() { &[] } else { &[(0, 1), (4, 5), (6, 7)] };
+            let mut all = Vec::new(); // alloc: a test's list
+            for name in ["id", "swap", "wrap"] {
+                let func = function(db, name);
+                let instances = frontend.with(|hir, homes| called(hir, homes, &root, func));
+                assert_eq!(instances.len(), 8, "{debuginfo:?} `{name}`: {instances:?}");
+                let keyed: Vec<_> = instances.into_iter().map(|it| { let k = keyed(&it); (it, k) }).collect(); // alloc: a test's list
+                let mut shared = Vec::new(); // alloc: a test's list
+                for (at, (_, (key_a, _))) in keyed.iter().enumerate() {
+                    for (other, (_, (key_b, _))) in keyed.iter().enumerate().skip(at + 1) {
+                        if key_a == key_b {
+                            shared.push((at, other));
+                        }
+                    }
+                }
+                assert_eq!(shared, expected, "{debuginfo:?} `{name}`: the instances of one key");
+                all.extend(keyed);
+            }
+            // `roots` asks for `c` with `A, B, W`, in that order.
+            {
+                let func = function(db, "c");
+                let instances = frontend.with(|hir, homes| called(hir, homes, &root, func));
+                assert_eq!(instances.len(), 3, "{debuginfo:?} `c`: {instances:?}");
+                let keyed: Vec<_> = instances.into_iter().map(|it| { let k = keyed(&it); (it, k) }).collect(); // alloc: a test's list
+                let shared: Vec<(usize, usize)> = (0..keyed.len()) // alloc: a test's list
+                    .flat_map(|at| (at + 1..keyed.len()).map(move |other| (at, other)))
+                    .filter(|&(at, other)| keyed[at].1.0 == keyed[other].1.0)
+                    .collect();
+                let expected: &[(usize, usize)] = if debuginfo.tells_locals() { &[] } else { &[(0, 1)] };
+                assert_eq!(shared, expected, "{debuginfo:?} `c`: the instances of one key");
+                all.extend(keyed);
+            }
+            // Equal key => equal shape, across every instance of every body.
+            for (at, (a, (key_a, shape_a))) in all.iter().enumerate() {
+                for (b, (key_b, shape_b)) in all.iter().skip(at + 1) {
+                    if key_a == key_b {
+                        assert_eq!(shape_a, shape_b, "{debuginfo:?}: {a:?} and {b:?} share a key");
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Rule 18 for debug info: a local a debugger is told of carries its own instance's type into
+/// the shape and the side table (`side::Variable::ty`), so where the unit tells them
+/// (`DebugInfo::Limited` and `Full`) `id::<A>` and `id::<B>`, one compile identity, have two
+/// keys; where none is told they stay one key and one shape. Each is prepared at its unit's
+/// spec, so a key that is equal where the shape is not fails. Two builds of the blaze repo
+/// gave `UnsafeCell<usize>::get` and `UnsafeCell<Align8<*mut ()>>::get` one key and two shapes.
+#[test]
+fn a_key_covers_the_types_of_the_locals_a_debugger_is_told() {
+    use blaze_codegen::backend::Frontend as _;
+    for debuginfo in [DebugInfo::None, DebugInfo::LineTablesOnly, DebugInfo::Limited, DebugInfo::Full] {
+        let mut policy = policy(OptLevel::O0);
+        policy.profile.debuginfo = debuginfo;
+        let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
+        hir_ty::attach_db(db, || {
+            let root = frontend.root(function(db, "roots"));
+            let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+            let func = function(db, "id");
+            let instances = frontend.with(|hir, homes| called(hir, homes, &root, func));
+            // `roots` asks for `id` with `A` first, then `B`, one compile identity.
+            let [a, b, ..] = &instances[..] else { panic!("{instances:?}") };
+            let keyed = |instance: &HirInstance| {
+                let described = (frontend.describe(instance, &origin))
+                    .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
+                let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+                let key = UnitInstance { code: described.code, args: described.args, settings: choice.first.settings() }.key();
+                (key, prepared(&frontend, &choice.first, instance).0)
+            };
+            let ((key_a, shape_a), (key_b, shape_b)) = (keyed(a), keyed(b));
+            let told = debuginfo.tells_locals();
+            assert_eq!(shape_a == shape_b, !told, "{debuginfo:?}: the told locals' types are in the shape");
+            assert_eq!(key_a == key_b, !told, "{debuginfo:?}: the key follows the shape");
+        });
+    }
+}
+
+/// Rule 18 across specs: one instance compiled under two specs that differ only in debug info
+/// gets either equal keys and equal shapes, or two keys. Which locals the shape tells of is
+/// decided at the spec it is prepared at, and the key's settings hold that spec's debug info,
+/// so a unit at another level than its origin's first spec can't share a key with a shape of
+/// another set of told locals. Every instance of `id`, `swap`, `wrap` and `c` is keyed and
+/// prepared under each level, in the order `roots` asks for them.
+#[test]
+fn one_instance_under_two_debuginfo_levels_shares_a_key_only_with_its_shape() {
+    use blaze_codegen::backend::Frontend as _;
+    let levels = [DebugInfo::None, DebugInfo::LineTablesOnly, DebugInfo::Limited, DebugInfo::Full];
+    let keyed: Vec<Vec<(String, blaze_codegen::InstanceKey, Shape)>> = levels // alloc: a test's list
+        .iter()
+        .map(|&debuginfo| {
+            let mut policy = policy(OptLevel::O0);
+            policy.profile.debuginfo = debuginfo;
+            let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
+            hir_ty::attach_db(db, || {
+                let root = frontend.root(function(db, "roots"));
+                let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+                let mut all = Vec::new(); // alloc: a test's list
+                for name in ["id", "swap", "wrap", "c"] {
+                    let func = function(db, name);
+                    let instances = frontend.with(|hir, homes| called(hir, homes, &root, func));
+                    for (at, instance) in instances.iter().enumerate() {
+                        let described = (frontend.describe(instance, &origin))
+                            .unwrap_or_else(|e| panic!("{debuginfo:?} {instance:?}: {}", e.what));
+                        let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+                        let settings = choice.first.settings();
+                        let key = UnitInstance { code: described.code, args: described.args, settings }.key();
+                        let shape = prepared(&frontend, &choice.first, instance).0;
+                        all.push((format!("`{name}` #{at}"), key, shape)); // alloc: a test's name
+                    }
+                }
+                all
+            })
+        })
+        .collect();
+    for (i, a) in keyed.iter().enumerate() {
+        for (j, b) in keyed.iter().enumerate().skip(i + 1) {
+            assert_eq!(a.len(), b.len(), "{:?} and {:?} ask for as many instances", levels[i], levels[j]);
+            for ((name, key_a, shape_a), (_, key_b, shape_b)) in a.iter().zip(b) {
+                if key_a == key_b {
+                    assert_eq!(shape_a, shape_b, "{name} at {:?} and {:?}: one key, two shapes", levels[i], levels[j]);
+                }
+            }
+        }
+    }
+}
+
 /// A function `#[blaze::cache]` made, with `deep` its closure reaches: `{deep}` is its body.
 fn cached_fixture(deep: &str) -> String {
     format!(
@@ -283,9 +470,10 @@ pub fn cached(x: u32) -> u32 {{
     )
 }
 
-/// A cached function writes the hash of all its closure reaches into its own code, so an
-/// edit of a function the closure reaches, which leaves the cached function's body, its
-/// closure's and every interface as they were, still changes the cached function's code.
+/// A cached function writes the hash of all its closure reaches into its own code (its
+/// closure's `hir_ty_identity::code_id`), so an edit of a function the closure reaches, which
+/// leaves the cached function's body, its closure's and every interface as they were, still
+/// changes the cached function's code, and a comment or formatting there does not.
 #[test]
 fn a_cached_function_is_new_code_when_what_its_closure_reaches_is() {
     use blaze_codegen::backend::Frontend as _;
@@ -300,6 +488,7 @@ fn a_cached_function_is_new_code_when_what_its_closure_reaches_is() {
         })
     };
     assert_eq!(code("x ^ 1"), code("x ^ 1"));
+    assert_eq!(code("x ^ 1"), code("/* a comment */ x  ^\n 1"));
     assert_ne!(code("x ^ 1"), code("x ^ 2"));
 }
 
@@ -342,7 +531,14 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
             HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time).with_policy(policy);
         frontend.body_options(&origin).expect("the options")
     };
-    let at = |level, ub_checks, inline| MirOptions { level, ub_checks, lifetime_markers: true, inline };
+    let at = |level, ub_checks, inline| MirOptions {
+        level,
+        ub_checks,
+        lifetime_markers: true,
+        inline,
+        heap_to_stack: false,
+        world: None,
+    };
     let o0 = options(&policy(OptLevel::O0));
     assert!(o0.other.contains(at(Debug, false, false)), "{o0:?}");
     assert!(!o0.other.contains(at(Release, false, false)), "{o0:?}");
@@ -433,9 +629,9 @@ fn the_walk_lists_what_the_ir_asks_for() {
         let mut at = 0;
         while let Some(instance) = seen.get(at).cloned() {
             at += 1;
-            let walked = refs::walk(db, &instance, false, homes).expect("the walk");
-            assert_eq!(walked, refs::walk(db, &instance, false, homes).expect("the walk again"));
-            let mut code = build::with(Build::of(&spec), || built(db, &instance, false))
+            let walked = refs::walk(db, &instance, refs::Walking::plain(false), homes).expect("the walk");
+            assert_eq!(walked, refs::walk(db, &instance, refs::Walking::plain(false), homes).expect("the walk again"));
+            let mut code = build::with(Build::of(&spec), || built(db, &instance, crate::Target::for_fixtures(), false))
                 .and_then(|it| it)
                 .unwrap_or_else(|e| panic!("{instance:?}: {e}"));
             let requests = match &mut code {
@@ -466,7 +662,7 @@ fn a_reference_left_out_of_the_walk_is_an_error() {
     let root = frontend.root(function(&db, "callee"));
     let spec = spec();
     frontend.with(|db, homes| {
-        let mut code = build::with(Build::of(&spec), || built(db, &root, false))
+        let mut code = build::with(Build::of(&spec), || built(db, &root, crate::Target::for_fixtures(), false))
             .and_then(|it| it)
             .expect("the IR");
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
@@ -498,8 +694,8 @@ fn an_always_inline_callee_of_a_dependency_is_built_in() {
     let root = frontend.root(function(&db, "roots"));
     let spec = spec();
     frontend.with(|db, homes| {
-        let walked = refs::walk(db, &root, false, homes).expect("the walk");
-        let built_in = refs::built_in(db, &root, false).expect("the walk");
+        let walked = refs::walk(db, &root, refs::Walking::plain(false), homes).expect("the walk");
+        let built_in = refs::built_in(db, &root, refs::Walking::plain(false)).expect("the walk");
         let [at, nested] = built_in[..] else { panic!("built in: {built_in:?} of {walked:?}") };
         let FrontRef::Function(outer) = &walked[at as usize] else { panic!("{walked:?}") };
         let FrontRef::Function(twice) = &walked[nested as usize] else { panic!("{walked:?}") };
@@ -517,9 +713,9 @@ fn an_always_inline_callee_of_a_dependency_is_built_in() {
         };
         assert!(walked.iter().any(calls_helper), "{walked:?}");
         let inlined =
-            super::frontend::inlined(db, &HashSource::ById(ById), (&root, false)).expect("what is built in");
+            super::frontend::inlined(db, &HashSource::ById(ById), (&root, refs::Walking::plain(false))).expect("what is built in");
         assert_eq!(inlined.len(), 2, "outer and twice: {inlined:?}");
-        let mut code = build::with(Build::of(&spec), || built(db, &root, false))
+        let mut code = build::with(Build::of(&spec), || built(db, &root, crate::Target::for_fixtures(), false))
             .and_then(|it| it)
             .unwrap_or_else(|e| panic!("{root:?}: {e}"));
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
@@ -646,9 +842,9 @@ fn an_allocator_entry_calls_what_its_walk_lists() {
     assert!(allocator::walk(&entry(None)).is_empty());
     let spec = spec();
     frontend.with(|db, homes| {
-        let walked = refs::walk(db, &ours, false, homes).expect("the walk");
+        let walked = refs::walk(db, &ours, refs::Walking::plain(false), homes).expect("the walk");
         assert_eq!(walked, vec![FrontRef::Extern("__blaze_global_alloc".to_owned())]);
-        let mut code = build::with(Build::of(&spec), || built(db, &ours, false))
+        let mut code = build::with(Build::of(&spec), || built(db, &ours, crate::Target::for_fixtures(), false))
             .and_then(|it| it)
             .expect("the IR");
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
@@ -658,6 +854,107 @@ fn an_allocator_entry_calls_what_its_walk_lists() {
     });
     // The fixture links no `alloc`: its program has no shim.
     assert!(frontend.allocator_shim(krate).expect("the shim").is_empty());
+}
+
+/// What every allocator fixture links: a `std` (a lang crate, as std is) whose `System` only
+/// allocates, and which declares `#[global_allocator]` as std's prelude does.
+const ALLOCATORS: &str = r#"
+//- minicore: sized, allocator_api, add
+//- /std.rs crate:std
+#![feature(decl_macro, rustc_attrs)]
+pub mod alloc {
+    pub struct System;
+    unsafe impl core::alloc::GlobalAlloc for System {
+        unsafe fn alloc(&self, _layout: core::alloc::Layout) -> *mut u8 { 0 as *mut u8 }
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
+    }
+}
+#[rustc_builtin_macro]
+pub macro global_allocator($item:item) {
+    /* compiler built-in */
+}
+"#;
+
+/// A crate whose global allocator is std's `System`.
+const SYSTEM_ALLOCATOR: &str = r#"
+use std::global_allocator;
+#[global_allocator]
+static GLOBAL: std::alloc::System = std::alloc::System;
+"#;
+
+/// A crate whose global allocator counts the allocations, which the program can read.
+const COUNTING_ALLOCATOR: &str = r#"
+use core::alloc::{GlobalAlloc, Layout};
+use std::global_allocator;
+pub static mut ALLOCATIONS: usize = 0;
+pub struct Counting;
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+        unsafe { ALLOCATIONS = ALLOCATIONS + 1 };
+        0 as *mut u8
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+#[global_allocator]
+static GLOBAL: Counting = Counting;
+"#;
+
+/// An allocator entry, written out, that names two statics: no one static is the allocator.
+const TWO_STATICS: &str = r#"
+use core::alloc::{GlobalAlloc, Layout};
+pub struct Counting;
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 { 0 as *mut u8 }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+static A: Counting = Counting;
+static B: Counting = Counting;
+#[export_name = "__blaze_global_alloc"]
+unsafe extern "C" fn __blaze_global_alloc(size: usize, align: usize) -> *mut u8 {
+    let _first = unsafe { GlobalAlloc::alloc(&A, Layout::from_size_align_unchecked(size, align)) };
+    unsafe { GlobalAlloc::alloc(&B, Layout::from_size_align_unchecked(size, align)) }
+}
+"#;
+
+/// Whether the program of [`ALLOCATORS`] and `program` declares a global allocator, and what
+/// [`allocator::allocations_unobserved`] says of it.
+fn unobserved(program: &str) -> (bool, Result<bool, String>) {
+    let db = fixture::db(&format!("{ALLOCATORS}//- /main.rs crate:main deps:std\n{program}\nfn main() {{}}\n")).into_db();
+    let krate = fixture::test_crate(&db);
+    (crate::declares_global_allocator(&db, krate), allocator::allocations_unobserved(&db, krate))
+}
+
+/// A program's allocations are unobserved under std's allocator, none declared or `System`,
+/// and observed under any other: one that counts, or one whose static can't be told, which
+/// keeps every allocation (`false`) and is no error.
+#[test]
+fn allocations_are_unobserved_only_under_stds_allocator() {
+    assert_eq!(unobserved(""), (false, Ok(true)));
+    assert_eq!(unobserved(SYSTEM_ALLOCATOR), (true, Ok(true)));
+    assert_eq!(unobserved(COUNTING_ALLOCATOR), (true, Ok(false)));
+    assert_eq!(unobserved(TWO_STATICS), (true, Ok(false)));
+}
+
+/// Two `#[global_allocator]`s are an error naming both crates in order of name, whichever
+/// order the fixture, and so the crate graph, lists them in. `main` names both: rustc links
+/// only the dependencies a crate's code names.
+#[test]
+fn two_allocators_are_named_in_order_of_name() {
+    for (first, second) in [("zz_alloc", "aa_alloc"), ("aa_alloc", "zz_alloc")] {
+        let text = format!(
+            "{ALLOCATORS}//- /{first}.rs crate:{first} deps:std\n{SYSTEM_ALLOCATOR}\
+             //- /{second}.rs crate:{second} deps:std\n{SYSTEM_ALLOCATOR}\
+             //- /main.rs crate:main deps:std,{first},{second}\n\
+             extern crate {first};\nextern crate {second};\nfn main() {{}}\n"
+        );
+        let db = fixture::db(&text).into_db();
+        let krate = fixture::test_crate(&db);
+        assert_eq!(
+            allocator::allocations_unobserved(&db, krate),
+            Err("two `#[global_allocator]`s in one program, in crates `aa_alloc` and `zz_alloc`".to_owned()),
+            "{first} listed first"
+        );
+    }
 }
 
 const SANITIZED: &str = r#"
@@ -702,7 +999,7 @@ fn a_functions_sanitizers_off_are_its_nearest_attributes() {
     assert_eq!(off(&all, &root("inherited")), both);
     assert_eq!(off(&all, &root("nearest")), Sanitizers::ADDRESS);
     let closure = frontend.with(|db, homes| {
-        refs::walk(db, &root("closure"), false, homes)
+        refs::walk(db, &root("closure"), refs::Walking::plain(false), homes)
             .expect("the walk")
             .into_iter()
             .find_map(|it| match it {
@@ -765,7 +1062,7 @@ fn is_call(it: &places::Ref, func: FunctionId) -> bool {
 
 /// The IR of `instance` built as `spec` says, with what it asked for.
 fn built_as(db: &Db, spec: &Spec, instance: &HirInstance) -> super::Built {
-    build::with(Build::of(spec), || built(db, instance, false))
+    build::with(Build::of(spec), || built(db, instance, crate::Target::for_fixtures(), false))
         .and_then(|it| it)
         .unwrap_or_else(|e| panic!("{instance:?}: {e}"))
 }
@@ -857,15 +1154,15 @@ fn the_walk_lists_what_inlined_code_calls() {
     let (f, g) = (function(db, "f"), function(db, "g"));
     frontend.with(|db, homes| {
         assert!(frontend.inlines(db, &root).expect("the policy"));
-        let plain = refs::walk(db, &root, false, homes).expect("the walk");
-        let walked = refs::walk(db, &root, true, homes).expect("the walk for inlining");
+        let plain = refs::walk(db, &root, refs::Walking::plain(false), homes).expect("the walk");
+        let walked = refs::walk(db, &root, refs::Walking::plain(true), homes).expect("the walk for inlining");
         assert!(plain.iter().any(|it| is_call(it, f)), "{plain:?}");
         assert!(!plain.iter().any(|it| is_call(it, g)), "{plain:?}");
         assert!(walked.iter().any(|it| is_call(it, g)), "{walked:?}");
         assert_eq!(walked[..plain.len()], plain[..]);
-        let built_in = refs::built_in(db, &root, true).expect("the walk");
+        let built_in = refs::built_in(db, &root, refs::Walking::plain(true)).expect("the walk");
         assert!(built_in.iter().any(|&at| is_call(&walked[at as usize], f)), "{built_in:?}");
-        assert!(refs::built_in(db, &root, false).expect("the walk").is_empty());
+        assert!(refs::built_in(db, &root, refs::Walking::plain(false)).expect("the walk").is_empty());
         let krate = compiled_in(db, &root);
         let mut place = |refs: Vec<places::Ref>| {
             let mut code = built_as(db, &llvm(2), &root);
@@ -896,15 +1193,65 @@ fn a_callee_inlined_twice_is_built_in_once() {
     let root = frontend.root(function(db, "caller"));
     let (leaf, mid) = (function(db, "leaf"), function(db, "mid"));
     frontend.with(|db, homes| {
-        let walked = refs::walk(db, &root, true, homes).expect("the walk");
-        let built_in = refs::built_in(db, &root, true).expect("the walk");
+        let walked = refs::walk(db, &root, refs::Walking::plain(true), homes).expect("the walk");
+        let built_in = refs::built_in(db, &root, refs::Walking::plain(true)).expect("the walk");
         assert_eq!(walked.iter().filter(|it| is_call(it, leaf)).count(), 1, "{walked:?}");
         let [one, two] = built_in[..] else { panic!("built in: {built_in:?} of {walked:?}") };
         assert_ne!(one, two);
         let of = |func| built_in.iter().any(|&at| is_call(&walked[at as usize], func));
         assert!(of(leaf) && of(mid), "{built_in:?} of {walked:?}");
-        let inlined = super::frontend::inlined(db, &HashSource::ById(ById), (&root, true)).expect("the code");
+        let inlined = super::frontend::inlined(db, &HashSource::ById(ById), (&root, refs::Walking::plain(true))).expect("the code");
         assert_eq!(inlined.len(), 2, "leaf and mid: {inlined:?}");
+    });
+}
+
+const BUILT_IN_INLINES: &str = r#"
+//- minicore: sized, copy
+//- /dep.rs crate:dep library
+#[inline(never)]
+pub fn leaf(x: u32) -> u32 { x ^ 7 }
+#[inline]
+pub fn mid(x: u32) -> u32 { leaf(x) }
+#[cold]
+#[inline(always)]
+pub fn load(x: u32) -> u32 { mid(x) }
+//- /main.rs crate:main deps:dep
+pub fn caller(x: u32) -> u32 { dep::load(x) }
+"#;
+
+/// A body the MIR inliner inlines nothing into still builds in its `#[inline(always)]`
+/// callees, whose own bodies a unit that inlines has MIR-inlined: foldhash's
+/// `hash_bytes_long`, whose built-in `load` calls `check_language_ub::runtime` once
+/// `read_unaligned` is inlined into it. `caller` has nothing inlined (a cold callee is never
+/// MIR-inlined), yet built at level 2 it asks for `leaf`, which `load` reaches through `mid`:
+/// the walk for inlining units lists it, the walk without does not.
+#[test]
+fn the_walk_lists_what_a_built_in_callees_inlined_body_calls() {
+    let (db, frontend) = held_as(fixture::db(BUILT_IN_INLINES).into_db(), &policy(OptLevel::O3));
+    let root = frontend.root(function(db, "caller"));
+    frontend.with(|db, homes| {
+        let named = |it: &places::Ref, name: &str| match it {
+            FrontRef::Function(HirInstance(Kind::Code(called, _))) => match called.def {
+                InstanceDef::Fn(func) => FunctionSignature::of(db, func).name.as_str() == name,
+                _ => false,
+            },
+            _ => false,
+        };
+        assert!(frontend.inlines(db, &root).expect("the policy"));
+        let plain = refs::walk(db, &root, refs::Walking::plain(false), homes).expect("the walk");
+        let walked = refs::walk(db, &root, refs::Walking::plain(true), homes).expect("the walk for inlining");
+        assert!(!plain.iter().any(|it| named(it, "leaf")), "{plain:?}");
+        assert!(walked.iter().any(|it| named(it, "leaf")), "{walked:?}");
+        let krate = compiled_in(db, &root);
+        let mut place = |refs: Vec<places::Ref>| {
+            let mut code = built_as(db, &llvm(2), &root);
+            let super::Built::Ir(pending) = &mut code else { panic!("asm") };
+            let mut placer = Placer::listed(refs);
+            place_requests(db, homes, &HashSource::ById(ById), krate, &mut placer, &mut pending.wants.requests)
+                .map(drop)
+        };
+        assert!(place(plain).is_err(), "the unit's IR asks for `leaf`");
+        place(walked).expect("the unit's IR asks only for what its walk lists");
     });
 }
 
@@ -927,8 +1274,8 @@ fn an_inlined_track_caller_callee_reports_the_call() {
     let here = function(db, "here");
     let caller: DefWithBodyId = function(db, "caller").into();
     frontend.with(|db, homes| {
-        let walked = refs::walk(db, &root, true, homes).expect("the walk");
-        let built_in = refs::built_in(db, &root, true).expect("the walk");
+        let walked = refs::walk(db, &root, refs::Walking::plain(true), homes).expect("the walk");
+        let built_in = refs::built_in(db, &root, refs::Walking::plain(true)).expect("the walk");
         assert!(built_in.iter().any(|&at| is_call(&walked[at as usize], here)), "{built_in:?}");
         let locations = |spec: &Spec| {
             let code = built_as(db, spec, &root);
@@ -1164,7 +1511,7 @@ pub fn roots(x: u32) {
             UnitInstance { code: described.code, args: described.args, settings: choice.first.settings() }.key()
         };
         let glues: Vec<HirInstance> = frontend.with(|hir, homes| {
-            refs::walk(hir, &root, false, homes)
+            refs::walk(hir, &root, refs::Walking::plain(false), homes)
                 .expect("the walk of the root")
                 .into_iter()
                 .filter_map(|it| match it {
@@ -1180,4 +1527,752 @@ pub fn roots(x: u32) {
         let [a, b] = &glues[..] else { panic!("{glues:?}") };
         assert_ne!(key(a), key(b), "{a:?} and {b:?}");
     });
+}
+
+const POINTERS_TO_DYN: &str = r#"
+//- minicore: sized, coerce_unsized, dispatch_from_dyn
+pub trait Tr { fn f(&self) -> u32; }
+pub struct A(pub u32);
+impl Tr for A { fn f(&self) -> u32 { self.0 } }
+pub struct B(pub u32);
+impl Tr for B { fn f(&self) -> u32 { self.0 } }
+pub struct C(pub u32);
+impl Tr for C { fn f(&self) -> u32 { self.0 } }
+pub const RAW: *const dyn Tr = &A(9) as &dyn Tr;
+pub fn raw() -> *const dyn Tr { RAW }
+pub trait Has { type Obj: ?Sized + 'static; }
+pub struct H;
+impl Has for H { type Obj = dyn Tr; }
+pub struct W<U: Has>(pub &'static U::Obj);
+pub const ALIASED: W<H> = W(&B(8) as &dyn Tr);
+pub fn aliased() -> W<H> { ALIASED }
+pub struct RawRef(pub *const &'static dyn Tr);
+pub const BEHIND: RawRef = RawRef(&(&C(7) as &dyn Tr) as *const &dyn Tr);
+pub fn behind() -> RawRef { BEHIND }
+pub struct D(pub u32);
+impl Tr for D { fn f(&self) -> u32 { self.0 } }
+pub struct Wrap<X: ?Sized>(pub u32, pub X);
+pub const WRAP: &Wrap<dyn Tr> = &Wrap(100, D(5));
+pub fn wrap() -> &'static Wrap<dyn Tr> { WRAP }
+pub struct E(pub u32);
+impl Tr for E { fn f(&self) -> u32 { self.0 } }
+pub const RAW_SLICE: *const [&dyn Tr] = &[&E(1) as &dyn Tr] as *const [&dyn Tr];
+pub fn raw_slice() -> *const [&'static dyn Tr] { RAW_SLICE }
+pub fn eleven() -> u32 { 11 }
+pub struct RawFn(pub *const fn() -> u32);
+pub const FN_BEHIND: RawFn = RawFn(&(eleven as fn() -> u32) as *const fn() -> u32);
+pub fn fn_behind() -> RawFn { FN_BEHIND }
+"#;
+
+/// A constant's pointer to `dyn` points at its value and its metadata at the vtable whatever
+/// reaches it, as rustc relocates every pointer by its provenance: a raw `*const dyn Tr`
+/// (const eval's id was kept as the vtable pointer, and a call through it crashed), a
+/// reference whose pointee is an alias that normalizes to `dyn` (`&<H as Has>::Obj`, whose
+/// value const eval did not keep either), a `&dyn` in memory behind a raw pointer or a raw
+/// slice, and a reference to a struct with a `dyn` tail. A function pointer behind a raw
+/// pointer is the function's address.
+#[test]
+fn every_pointer_to_dyn_in_a_constant_points_at_its_vtable() {
+    use crate::fragment::DataRequest;
+    let (db, frontend) = frontend(POINTERS_TO_DYN);
+    let word = crate::Target::for_fixtures().word() as u32;
+    hir_ty::attach_db(db, || {
+        let cases =
+            [("raw", "A"), ("aliased", "B"), ("behind", "C"), ("wrap", "D"), ("raw_slice", "E")];
+        for (name, of) in cases {
+            let root = frontend.root(function(db, name));
+            let (vtable, pointers) = frontend.with(|db, _| {
+                let super::Built::Ir(pending) = built_as(db, &spec(), &root) else {
+                    panic!("asm")
+                };
+                let datas = &pending.wants.requests.datas;
+                let vtable = datas.iter().position(|it| {
+                    let DataRequest::Vtable { ty, .. } = it else { return false };
+                    format!("{:?}", ty.as_ref()).contains(of)
+                });
+                // Each blob's relocated words: the offset and what it points at.
+                let pointers: Vec<Vec<(u32, u32)>> = (datas.iter())
+                    .filter_map(|it| match it {
+                        DataRequest::Blob { blob, .. } => {
+                            let mut it: Vec<_> =
+                                blob.relocs.iter().map(|&(at, to, _)| (at, to.as_u32())).collect();
+                            it.sort_unstable();
+                            Some(it)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                (vtable, pointers)
+            });
+            let Some(vtable) = vtable else {
+                panic!("`{name}` asks for no vtable of `{of}`: {pointers:?}")
+            };
+            // The `dyn` pointer: its data pointer relocated, its metadata the vtable.
+            assert!(
+                pointers.iter().any(|it| {
+                    matches!(it[..], [(0, _), (at, to)] if at == word && to == vtable as u32)
+                }),
+                "`{name}`'s pointer to `dyn` is not relocated whole: {pointers:?}"
+            );
+        }
+        let root = frontend.root(function(db, "fn_behind"));
+        let functions = frontend.with(|db, _| {
+            let super::Built::Ir(pending) = built_as(db, &spec(), &root) else { panic!("asm") };
+            (pending.wants.requests.datas.iter())
+                .filter_map(|it| match it {
+                    DataRequest::Blob { blob, .. } => {
+                        Some(blob.fn_relocs.iter().map(|it| it.0).collect::<Vec<_>>())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            functions.iter().any(|it| it[..] == [0]),
+            "the `fn` behind `FN_BEHIND` is not relocated: {functions:?}"
+        );
+    });
+}
+
+const CONSTANT_MEMORY: &str = r#"
+//- minicore: sized, coerce_unsized, dispatch_from_dyn, fn, sync, transmute, copy, manually_drop, phantom_data, pointee, index, slice
+pub trait Tr { fn f(&self) -> u32; }
+pub struct A(pub u32);
+impl Tr for A { fn f(&self) -> u32 { self.0 } }
+pub struct B(pub u32);
+impl Tr for B { fn f(&self) -> u32 { self.0 } }
+pub struct F(pub u32);
+impl Tr for F { fn f(&self) -> u32 { self.0 } }
+pub struct G(pub u32);
+impl Tr for G { fn f(&self) -> u32 { self.0 } }
+pub struct K(pub u32);
+impl Tr for K { fn f(&self) -> u32 { self.0 } }
+pub struct Vt { pub name: &'static u32 }
+pub struct P(pub *const u8);
+pub const CAST: P = P(&Vt { name: &5 } as *const Vt as *const u8);
+pub fn cast() -> P { CAST }
+pub struct Two(pub *const u8, pub &'static &'static dyn Tr);
+pub const TWO: Two = {
+    let t: &&dyn Tr = &(&A(1) as &dyn Tr);
+    Two(t as *const &dyn Tr as *const u8, t)
+};
+pub fn two() -> Two { TWO }
+pub struct Holder(pub &'static dyn Tr);
+impl Tr for Holder { fn f(&self) -> u32 { self.0.f() } }
+pub struct Wrap<X: ?Sized>(pub u32, pub X);
+pub const TAIL: &Wrap<dyn Tr> = &Wrap(1, Holder(&F(2) as &dyn Tr));
+pub fn tail() -> &'static Wrap<dyn Tr> { TAIL }
+pub trait Has { type Obj: ?Sized + 'static; }
+pub struct H;
+impl Has for H { type Obj = dyn Tr; }
+pub struct Outer<U: Has>(pub &'static Wrap<U::Obj>);
+pub const ALIAS_TAIL: Outer<H> = Outer(&Wrap(3, G(4)) as &Wrap<dyn Tr>);
+pub fn alias_tail() -> Outer<H> { ALIAS_TAIL }
+pub const CLOSURE: &dyn Fn() -> u32 = &{ let t: &'static dyn Tr = &K(6); move || t.f() };
+pub fn closure() -> &'static dyn Fn() -> u32 { CLOSURE }
+#[repr(C)]
+pub struct End(pub [u8; 4], pub ());
+pub static ENDS: End = End([1, 2, 3, 4], ());
+pub struct Range(pub *const u8, pub *const ());
+pub const STATIC_END: Range = Range(&raw const ENDS.0 as *const u8, &raw const ENDS.1);
+pub fn static_end() -> Range { STATIC_END }
+pub const KEPT: &End = &End([5, 6, 7, 8], ());
+pub const KEPT_END: Range = Range(&raw const KEPT.0 as *const u8, &raw const KEPT.1);
+pub fn kept_end() -> Range { KEPT_END }
+pub static AA: A = A(7);
+pub const TO_STATIC: *const dyn Tr = &AA as &dyn Tr as *const dyn Tr;
+pub fn to_static() -> *const dyn Tr { TO_STATIC }
+pub const BYTES: [u8; 8] = unsafe { core::mem::transmute::<&u32, [u8; 8]>(&5) };
+pub fn bytes() -> [u8; 8] { BYTES }
+pub const END_REF: &() = &ENDS.1;
+pub fn end_ref() -> &'static () { END_REF }
+pub const DEEP: P = P(&(&raw const ENDS.1) as *const *const () as *const u8);
+pub fn deep() -> P { DEEP }
+#[repr(C)]
+pub struct End8(pub [u8; 8], pub ());
+pub struct Pair(pub Range, pub &'static End8);
+pub const PAIR: Pair = {
+    let a: &End8 = &End8([1; 8], ());
+    let b: &End8 = &End8([2; 8], ());
+    Pair(Range(&raw const a.0 as *const u8, &raw const a.1), b)
+};
+pub fn pair() -> Pair { PAIR }
+pub struct Prefix<X: ?Sized>(pub &'static u32, pub X);
+pub const PREFIX: &Prefix<[u8]> = &Prefix(&9, [1, 2]);
+pub fn prefix() -> &'static Prefix<[u8]> { PREFIX }
+pub struct OrderP(pub *const &'static u32);
+pub const ORDER: (&[&u32], OrderP) = {
+    let arr: &'static [&'static u32; 3] = &[&1, &2, &3];
+    let a: &'static [&'static u32] = arr;
+    (a, OrderP(&arr[1] as *const &'static u32))
+};
+pub fn order() -> (&'static [&'static u32], OrderP) { ORDER }
+fn seven() -> u32 { 7 }
+pub const NUM: ([u64; 4], fn() -> u32) = ([0x0600_0000, 0x0600_0001, 0x0600_0002, 0x0600_0003], seven);
+pub fn num() -> ([u64; 4], fn() -> u32) { NUM }
+pub const SLTAIL: &Wrap<[&dyn Tr]> = &Wrap(1, [&F(5) as &dyn Tr, &G(6) as &dyn Tr]);
+pub fn sltail() -> &'static Wrap<[&'static dyn Tr]> { SLTAIL }
+pub struct AsPtr(pub *const &'static dyn Tr);
+pub const PAIR_OF_DYN: &[&dyn Tr; 2] = &[&F(1) as &dyn Tr, &G(2) as &dyn Tr];
+pub const ASPTR: AsPtr = AsPtr(PAIR_OF_DYN as *const [&dyn Tr; 2] as *const &dyn Tr);
+pub fn asptr() -> AsPtr { ASPTR }
+pub union Mu<T: Copy> { pub uninit: (), pub value: T }
+pub const MUNINIT: Mu<&dyn Tr> = Mu { value: &K(4) as &dyn Tr };
+pub fn muninit() -> Mu<&'static dyn Tr> { MUNINIT }
+pub union U2 { pub d: &'static dyn Tr, pub n: (usize, usize) }
+pub const U2_DYN: U2 = U2 { d: &A(1) as &dyn Tr };
+pub fn u2_dyn() -> U2 { U2_DYN }
+pub const U2_NUM: U2 = U2 { n: (1, 2) };
+pub fn u2_num() -> U2 { U2_NUM }
+#[repr(C, packed(2))]
+pub struct Pk<X: ?Sized>(pub u16, pub core::mem::ManuallyDrop<Prefix<X>>);
+pub const PKPRE: &Pk<dyn Tr> =
+    &Pk(1, core::mem::ManuallyDrop::new(Prefix(&77, Holder(&K(9) as &dyn Tr))));
+pub fn pkpre() -> &'static Pk<dyn Tr> { PKPRE }
+pub const TWO_VIEWS: (&(usize, usize), &&dyn Tr) = {
+    let t: &&dyn Tr = &(&A(1) as &dyn Tr);
+    (unsafe { core::mem::transmute::<&&dyn Tr, &(usize, usize)>(t) }, t)
+};
+pub fn two_views() -> (&'static (usize, usize), &'static &'static dyn Tr) { TWO_VIEWS }
+fn eight() -> u32 { 8 }
+pub const FN_NUM: (fn() -> u32, *const fn() -> u32) =
+    (eight, &0x0600_0000usize as *const usize as *const fn() -> u32);
+pub fn fn_num() -> (fn() -> u32, *const fn() -> u32) { FN_NUM }
+pub struct Meta(pub *const (), pub core::ptr::DynMetadata<<H as Has>::Obj>);
+pub const META: Meta = unsafe { core::mem::transmute::<&dyn Tr, Meta>(&F(3) as &dyn Tr) };
+pub fn meta() -> Meta { META }
+#[repr(C)]
+pub struct E3(pub [u8; 3], pub [u8; 0]);
+pub const EMP: (&[u8], &[u8], &[u8]) = {
+    let e: &'static E3 = &E3([1, 2, 3], []);
+    let a: &'static [u8] = &e.0;
+    unsafe {
+        (
+            a,
+            core::mem::transmute::<(*const u8, usize), &[u8]>((&e.0[1] as *const u8, 0)),
+            core::mem::transmute::<(*const u8, usize), &[u8]>((&e.1 as *const [u8; 0] as *const u8, 0)),
+        )
+    }
+};
+pub fn emp() -> (&'static [u8], &'static [u8], &'static [u8]) { EMP }
+pub const TUP: &(u8, dyn Tr) = unsafe {
+    let held: &dyn Tr = &Holder(&G(0) as &dyn Tr);
+    let parts = core::mem::transmute::<&dyn Tr, (*const (), *const ())>(held);
+    let tuple: &'static (u8, Holder) = &(1u8, Holder(&G(5) as &dyn Tr));
+    core::mem::transmute::<(*const (u8, Holder), *const ()), &(u8, dyn Tr)>((tuple, parts.1))
+};
+pub fn tup() -> &'static (u8, dyn Tr) { TUP }
+"#;
+
+/// What the IR of `name`, a function of [`CONSTANT_MEMORY`], asks for as data, each with a
+/// description (a vtable's type), or the error building it stops with.
+fn constant_datas(name: &str) -> Result<Vec<(crate::fragment::DataRequest, String)>, String> {
+    let (db, frontend) = frontend(CONSTANT_MEMORY);
+    hir_ty::attach_db(db, || {
+        let root = frontend.root(function(db, name));
+        frontend.with(|db, _| {
+            let built = build::with(Build::of(&spec()), || {
+                built(db, &root, crate::Target::for_fixtures(), false)
+            });
+            match built.and_then(|it| it) {
+                Ok(super::Built::Ir(pending)) => {
+                    let datas = pending.wants.requests.datas;
+                    let named = (datas.into_iter().enumerate())
+                        .map(|(index, it)| {
+                            let name = described(index, &it);
+                            (it, name)
+                        })
+                        .collect();
+                    Ok(named)
+                }
+                Ok(_) => Err("not IR".to_owned()),
+                Err(e) => Err(e.to_string()),
+            }
+        })
+    })
+}
+
+/// Each blob's relocated words, sorted: the offset, the data it points at and the addend.
+fn relocated_words(datas: &[(crate::fragment::DataRequest, String)]) -> Vec<Vec<(u32, u32, i64)>> {
+    use crate::fragment::DataRequest;
+    (datas.iter())
+        .filter_map(|it| match &it.0 {
+            DataRequest::Blob { blob, .. } => {
+                let mut it: Vec<_> =
+                    blob.relocs.iter().map(|&(at, to, add)| (at, to.as_u32(), add)).collect();
+                it.sort_unstable();
+                Some(it)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the data request `index` is, for a test to find it and for a failure's message.
+fn described(index: usize, data: &crate::fragment::DataRequest) -> String {
+    use crate::fragment::DataRequest;
+    match data {
+        DataRequest::Blob { blob, .. } => {
+            let (len, relocs, fns) = (blob.bytes.len(), &blob.relocs, &blob.fn_relocs);
+            format!("{index}: {len} bytes, relocs {relocs:?}, functions {fns:?}")
+        }
+        DataRequest::Vtable { ty, .. } => format!("{index}: vtable of {:?}", ty.as_ref()),
+        DataRequest::Static(_) => format!("{index}: a static"),
+        _ => format!("{index}: other"),
+    }
+}
+
+/// [`described`] of each.
+fn all_described(datas: &[(crate::fragment::DataRequest, String)]) -> String {
+    datas.iter().map(|it| &*it.1).collect::<Vec<_>>().join("\n")
+}
+
+/// The index of the vtable asked for of a type whose name has `of` in it.
+fn vtable_of(datas: &[(crate::fragment::DataRequest, String)], of: &str) -> Option<u32> {
+    let vtable = datas.iter().position(|it| it.1.contains("vtable of") && it.1.contains(of));
+    vtable.map(|it| it as u32)
+}
+
+/// A pointer in memory behind a raw pointer cast to a type that says nothing of pointers
+/// (`*const u8` from a `*const Vt`) is relocated by its provenance: the walk by type of `u8`
+/// covers its first byte and must not hide the pointer there.
+#[test]
+fn a_pointer_behind_a_raw_pointer_of_another_type_is_relocated() {
+    let datas = constant_datas("cast").unwrap();
+    let words = relocated_words(&datas);
+    // `CAST`'s own pointer, and the `&5` at offset 0 of the `Vt` it points to.
+    assert!(
+        words.iter().filter(|it| matches!(it[..], [(0, _, 0)])).count() >= 2,
+        "the `&u32` behind the `*const u8` is not relocated: {words:?}"
+    );
+}
+
+/// A vtable in memory reached through a pointer of a type that does not say it is there
+/// (`*const u8` from a `&&dyn Tr`) is an error, not const eval's id left as a number: the id
+/// names the type only, so which trait's vtable it is is not known there.
+#[test]
+fn a_vtable_no_type_says_is_there_is_refused() {
+    let e = match constant_datas("two") {
+        Ok(datas) => panic!("`TWO` built: {}", all_described(&datas)),
+        Err(e) => e,
+    };
+    assert!(e.contains("const eval's id of `A`"), "{e}");
+}
+
+/// A `&dyn` inside the `dyn` tail of a struct (`&Wrap<dyn Tr>` holding a `Holder(&dyn Tr)`)
+/// gets its vtable: the tail is walked as its concrete type, where the sized fields end at its
+/// alignment.
+#[test]
+fn a_dyn_pointer_in_a_dyn_tail_points_at_its_vtable() {
+    let datas = constant_datas("tail").unwrap();
+    let vtable = vtable_of(&datas, "F")
+        .unwrap_or_else(|| panic!("no vtable of `F`: {}", all_described(&datas)));
+    let words = relocated_words(&datas);
+    // The tail, a `Holder`, at 8: its data pointer and its vtable.
+    assert!(
+        words.iter().any(|it| matches!(it[..], [(8, _, 0), (16, to, 0)] if to == vtable)),
+        "the `&dyn Tr` in the tail is not relocated whole: {words:?}"
+    );
+}
+
+/// A reference to a struct whose tail is an alias that normalizes to `dyn`
+/// (`&Wrap<<H as Has>::Obj>`) keeps its memory and points at its vtable.
+#[test]
+fn a_dyn_tail_named_by_an_alias_is_relocated() {
+    let datas = constant_datas("alias_tail").unwrap();
+    let vtable = vtable_of(&datas, "G")
+        .unwrap_or_else(|| panic!("no vtable of `G`: {}", all_described(&datas)));
+    let word = crate::Target::for_fixtures().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        words.iter().any(|it| matches!(it[..], [(0, _, 0), (at, to, 0)]
+            if at == word && to == vtable)),
+        "the `&Wrap<<H as Has>::Obj>` is not relocated whole: {words:?}"
+    );
+}
+
+/// A closure's captures are walked as a struct's fields: a captured `&dyn Tr` in a constant
+/// closure points at its value and its vtable.
+#[test]
+fn a_closures_captured_dyn_pointer_points_at_its_vtable() {
+    let datas = constant_datas("closure").unwrap();
+    let vtable = vtable_of(&datas, "K")
+        .unwrap_or_else(|| panic!("no vtable of `K`: {}", all_described(&datas)));
+    let word = crate::Target::for_fixtures().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        words.iter().any(|it| matches!(it[..], [(0, _, 0), (at, to, 0)]
+            if at == word && to == vtable)),
+        "the closure's `&dyn Tr` is not relocated whole: {words:?}"
+    );
+}
+
+/// A pointer one past the end of a static is the static's, at its size.
+#[test]
+fn a_pointer_one_past_a_statics_end_points_into_it() {
+    use crate::fragment::DataRequest;
+    let datas = constant_datas("static_end").unwrap();
+    let statics: Vec<u32> = (datas.iter().enumerate())
+        .filter(|(_, it)| matches!(it.0, DataRequest::Static(_)))
+        .map(|(index, _)| index as u32)
+        .collect();
+    let word = crate::Target::for_fixtures().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        words.iter().any(|it| matches!(it[..], [(0, a, 0), (at, b, 4)]
+            if at == word && a == b && statics.contains(&a))),
+        "`STATIC_END` does not point at `ENDS` and one past its end: {words:?}, statics {statics:?}"
+    );
+}
+
+/// A pointer one past the end of memory const eval kept is that memory's, at its size, and
+/// not the start of the memory after it.
+#[test]
+fn a_pointer_one_past_kept_memorys_end_points_into_it() {
+    let datas = constant_datas("kept_end").unwrap();
+    let word = crate::Target::for_fixtures().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        words.iter().any(|it| matches!(it[..], [(0, a, 0), (at, b, 4)] if at == word && a == b)),
+        "`KEPT_END` does not point at `KEPT` and one past its end: {words:?}"
+    );
+}
+
+/// A raw pointer to `dyn` to a static points at the static and at its vtable.
+#[test]
+fn a_raw_dyn_pointer_to_a_static_points_at_it_and_its_vtable() {
+    use crate::fragment::DataRequest;
+    let datas = constant_datas("to_static").unwrap();
+    let vtable = vtable_of(&datas, "A").unwrap_or_else(|| panic!("no vtable of `A`"));
+    let word = crate::Target::for_fixtures().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        words.iter().any(|it| matches!(it[..], [(0, a, 0), (at, to, 0)]
+            if at == word && to == vtable
+                && matches!(datas[a as usize].0, DataRequest::Static(_)))),
+        "`TO_STATIC` is not relocated to `AA` and its vtable: {words:?}"
+    );
+}
+
+/// A pointer with provenance to memory const eval did not keep (no type of the constant says
+/// it is a pointer, so nothing it points to was kept: `[u8; 8]` transmuted from a `&u32`) is
+/// an error, not const eval's address emitted as bytes.
+#[test]
+fn a_pointer_to_memory_not_kept_is_refused() {
+    let e = match constant_datas("bytes") {
+        Ok(datas) => panic!("`BYTES` built: {}", all_described(&datas)),
+        Err(e) => e,
+    };
+    assert!(e.contains("dangling"), "{e}");
+}
+
+/// The relocations of the data asked for that point at a static.
+fn static_targets(datas: &[(crate::fragment::DataRequest, String)]) -> Vec<u32> {
+    use crate::fragment::DataRequest;
+    (datas.iter().enumerate())
+        .filter(|(_, it)| matches!(it.0, DataRequest::Static(_)))
+        .map(|(index, _)| index as u32)
+        .collect()
+}
+
+/// A reference one past the end of a static (`&ENDS.1`, a `&()` at its size) is to the static,
+/// not to memory of nothing: const eval takes it as the static's, as rustc's provenance does.
+#[test]
+fn a_reference_one_past_a_statics_end_is_to_the_static() {
+    let datas = constant_datas("end_ref").unwrap();
+    let statics = static_targets(&datas);
+    let words = relocated_words(&datas);
+    assert!(
+        words.iter().any(|it| matches!(it[..], [(0, a, 4)] if statics.contains(&a))),
+        "`END_REF` does not point one past `ENDS`'s end: {words:?}, statics {statics:?}"
+    );
+}
+
+/// A pointer one past the end of a static in memory behind a raw pointer of no pointer type
+/// (`*const u8`) is to the static: const eval keeps what such a word points to by the static
+/// it is in, one past its end included.
+#[test]
+fn a_pointer_one_past_a_statics_end_behind_a_raw_pointer_is_to_the_static() {
+    let datas = constant_datas("deep").unwrap_or_else(|e| panic!("`DEEP` is refused: {e}"));
+    let statics = static_targets(&datas);
+    let words = relocated_words(&datas);
+    assert!(
+        words.iter().any(|it| matches!(it[..], [(0, a, 4)] if statics.contains(&a))),
+        "`DEEP`'s pointer does not point one past `ENDS`'s end: {words:?}, statics {statics:?}"
+    );
+}
+
+/// A pointer one past the end of a heap block whose size is its whole size class
+/// (`End8`, 8 bytes) is that block's, at its size, and not the start of the next block, which
+/// const eval places after a gap.
+#[test]
+fn a_pointer_one_past_a_full_blocks_end_is_not_the_next_block() {
+    let datas = constant_datas("pair").unwrap();
+    let word = crate::Target::for_fixtures().word() as u32;
+    let words = relocated_words(&datas);
+    // The fields may be laid out in any order: the `Range` is two words that point at one
+    // block, at 0 and at its end.
+    assert!(
+        words.iter().any(|it| it.windows(2).any(|pair| matches!(pair, [(at, a, 0), (end, b, 8)]
+            if end - at == word && a == b))),
+        "`PAIR`'s end pointer is not one past its block's end: {words:?}"
+    );
+}
+
+/// A pointer in the sized fields of a struct with an unsized tail (`&Prefix<[u8]>` holding a
+/// `&u32`) is followed: const eval keeps what it points to, and the code points at it.
+#[test]
+fn a_pointer_before_an_unsized_tail_is_relocated() {
+    let datas = constant_datas("prefix").unwrap_or_else(|e| panic!("`PREFIX` is refused: {e}"));
+    let words = relocated_words(&datas);
+    assert!(
+        words.iter().filter(|it| matches!(it[..], [(0, _, 0)])).count() >= 2,
+        "the `&u32` before the `[u8]` tail is not relocated: {words:?}"
+    );
+}
+
+const LEAF: &str = r#"
+pub fn leaf(x: u32) -> u32 { x }
+"#;
+
+/// A unit's code keeps frame pointers as its own toolchain says (`Toolchain::frame_pointers`),
+/// whatever another toolchain selected in the same process between its check and its emit
+/// says: one function in two units, one keeping frame pointers and one not, each selected and
+/// prepared (its spec checked) before either is emitted, as a cross build's target and build
+/// scripts are. Each one's code is the code it gets built alone.
+///
+/// LLVM's x86-64 leaf sets up `rbp` only when frame pointers are kept (Cranelift's x86-64 code
+/// always does), and the fixture's crate is x86-64's, whatever the host.
+#[cfg(feature = "llvm")]
+#[test]
+fn interleaved_units_keep_their_own_frame_pointers() {
+    use blaze_codegen::backend::Prepare;
+    let (db, frontend) = frontend(LEAF);
+    let root = frontend.root(function(&db, "leaf"));
+    let target = crate::Target::of("x86_64-unknown-linux-gnu").expect("x86-64's target");
+    let pic = crate::isa_for(target).expect("a code generator").flags().is_pic();
+    let with = |keep: bool| {
+        let base = spec();
+        let toolchain = Toolchain {
+            target: target.triple().to_owned(),
+            arch: blaze_codegen::Arch::X86_64,
+            cpu: target.cpu().to_owned(),
+            llvm: Some("test".to_owned()),
+            frame_pointers: keep,
+            relocation: if pic { Relocation::Pic } else { Relocation::Static },
+            ..base.toolchain
+        };
+        Spec { toolchain, backend: Backend::Llvm { opt: 1 }, mir_inline: false, ..base }
+    };
+    let (keeps, omits) = (with(true), with(false));
+    assert_ne!(unit(&keeps).instance.key(), unit(&omits).instance.key(), "the setting is in the unit's key");
+    let refs: Vec<blaze_codegen::Target> = frontend.with(|db, homes| refs_of(db, homes, (&root, false)));
+    let backends = Backends::default();
+    let prepare = |spec: &Spec| {
+        super::toolchain::select(&spec.toolchain).expect("the toolchain");
+        backends.prepare(&frontend, &unit(spec), spec, &root, &refs).unwrap_or_else(|e| panic!("prepared: {e:?}")).1
+    };
+    let emit = |spec: &Spec, prepared| {
+        let emitted = backends.emit(&unit(spec), spec, prepared, &refs, None);
+        emitted.unwrap_or_else(|e| panic!("emitted: {e:?}")).function.code
+    };
+    let alone_keeps = emit(&keeps, prepare(&keeps));
+    let alone_omits = emit(&omits, prepare(&omits));
+    // `push rbp; mov rbp, rsp`
+    let frame = [0x55, 0x48, 0x89, 0xe5];
+    assert!(alone_keeps.starts_with(&frame), "kept frame pointers set up rbp: {alone_keeps:02x?}");
+    assert!(!alone_omits.starts_with(&frame), "omitted frame pointers set up none: {alone_omits:02x?}");
+    // Each order: the second toolchain is selected after the first unit's check, before its emit.
+    let (first, second) = (prepare(&keeps), prepare(&omits));
+    assert_eq!(emit(&keeps, first), alone_keeps, "the unit keeping frame pointers, emitted after the other's select");
+    assert_eq!(emit(&omits, second), alone_omits, "the unit omitting frame pointers");
+    let (first, second) = (prepare(&omits), prepare(&keeps));
+    assert_eq!(emit(&omits, first), alone_omits, "the unit omitting frame pointers, emitted after the other's select");
+    assert_eq!(emit(&keeps, second), alone_keeps, "the unit keeping frame pointers");
+}
+
+/// What `name` builds or the error it stops with, and a failure message's description.
+fn datas_or(name: &str) -> Result<Vec<(crate::fragment::DataRequest, String)>, String> {
+    constant_datas(name)
+}
+
+/// The data `index` of `datas` points at a vtable of a type whose name has `of` in it, at
+/// `at`.
+fn points_at_vtable(
+    datas: &[(crate::fragment::DataRequest, String)],
+    words: &[Vec<(u32, u32, i64)>],
+    at: u32,
+    of: &str,
+) -> bool {
+    let vtable = vtable_of(datas, of);
+    words.iter().any(|it| it.iter().any(|&(here, to, _)| here == at && Some(to) == vtable))
+}
+
+/// One allocation reached by a slice and by a raw pointer into its middle is one data object:
+/// the walks relocate the same words, in whatever order they find them.
+#[test]
+fn an_allocation_reached_from_its_middle_is_one_object() {
+    let datas = datas_or("order").unwrap_or_else(|e| panic!("`ORDER` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    // The value: the slice at 0 and the raw pointer at 16, into one object, at 0 and a word.
+    assert!(
+        words.iter().any(|it| matches!(it[..], [(0, a, 0), (at, b, add)]
+            if at == 2 * word && a == b && add == i64::from(word))),
+        "`ORDER`'s pointers are not into one object: {}",
+        all_described(&datas)
+    );
+}
+
+/// A number a type says is one stays a number, though it equals one of const eval's ids.
+#[test]
+fn a_number_equal_to_an_id_is_a_number() {
+    let datas = datas_or("num").unwrap_or_else(|e| panic!("`NUM` is refused: {e}"));
+    assert!(
+        datas.iter().all(|it| !it.1.contains("relocs [(0,")),
+        "a number of `NUM` is relocated: {}",
+        all_described(&datas)
+    );
+}
+
+/// A struct whose tail is a slice of `&dyn` points at each element's vtable.
+#[test]
+fn a_slice_tails_dyn_pointers_point_at_their_vtables() {
+    let datas = datas_or("sltail").unwrap_or_else(|e| panic!("`SLTAIL` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        points_at_vtable(&datas, &words, 2 * word, "F")
+            && points_at_vtable(&datas, &words, 4 * word, "G"),
+        "the slice tail's vtables are not relocated: {}",
+        all_described(&datas)
+    );
+}
+
+/// A raw pointer to the first of an array of `&dyn` (`as_ptr`) reaches every element: each
+/// points at its vtable.
+#[test]
+fn a_raw_pointer_to_an_array_of_dyn_pointers_reaches_each() {
+    let datas = datas_or("asptr").unwrap_or_else(|e| panic!("`ASPTR` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        points_at_vtable(&datas, &words, word, "F")
+            && points_at_vtable(&datas, &words, 3 * word, "G"),
+        "the array's vtables are not relocated: {}",
+        all_described(&datas)
+    );
+}
+
+/// A union whose one non-empty field is a `&dyn` (`MaybeUninit<&dyn Tr>`) points at its
+/// vtable.
+#[test]
+fn a_union_of_one_dyn_pointer_points_at_its_vtable() {
+    let datas = datas_or("muninit").unwrap_or_else(|e| panic!("`MUNINIT` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        points_at_vtable(&datas, &words, word, "K"),
+        "`MUNINIT`'s vtable is not relocated: {}",
+        all_described(&datas)
+    );
+}
+
+/// A vtable in a union of two fields, which const eval does not say it holds, is an error
+/// naming the union, in the constant's own value too.
+#[test]
+fn a_vtable_in_a_union_of_two_fields_is_refused_naming_it() {
+    let e = match datas_or("u2_dyn") {
+        Ok(datas) => panic!("`U2_DYN` built: {}", all_described(&datas)),
+        Err(e) => e,
+    };
+    assert!(e.contains("union `U2`") && e.contains("value"), "{e}");
+}
+
+/// A union's fields are not walked by type: numbers in one (`U2 { n: (1, 2) }`) are no
+/// `&dyn`'s, and no vtable is looked for.
+#[test]
+fn a_union_holding_numbers_is_not_walked_as_its_pointer_field() {
+    datas_or("u2_num").unwrap_or_else(|e| panic!("`U2_NUM` is refused: {e}"));
+}
+
+/// The sized fields of an unsized struct inside a `repr(packed(2))` one are where the packed
+/// layout puts them: the `&u32` at 2, then the `Holder`'s `&dyn` at 2 plus a word.
+#[test]
+fn a_packed_structs_unsized_field_is_at_its_capped_offset() {
+    let datas = datas_or("pkpre").unwrap_or_else(|e| panic!("`PKPRE` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        words.iter().any(|it| it.iter().any(|&(at, _, _)| at == 2))
+            && points_at_vtable(&datas, &words, 2 + 2 * word, "K"),
+        "`PKPRE`'s fields are not relocated at the packed offsets: {}",
+        all_described(&datas)
+    );
+}
+
+/// One allocation reached as two types that relocate it differently (`&(usize, usize)` and
+/// `&&dyn Tr`) is refused: the first walk would decide what the second sees.
+#[test]
+fn an_allocation_two_types_relocate_differently_is_refused() {
+    let e = match datas_or("two_views") {
+        Ok(datas) => panic!("`TWO_VIEWS` built: {}", all_described(&datas)),
+        Err(e) => e,
+    };
+    assert!(e.contains("relocate it differently"), "{e}");
+}
+
+/// A word equal to a function's id behind a raw pointer, with no provenance, is no function:
+/// only the `fn` const eval made is relocated as one.
+#[test]
+fn a_number_equal_to_a_functions_id_behind_a_raw_pointer_is_no_function() {
+    match datas_or("fn_num") {
+        Ok(datas) => {
+            let functions = datas.iter().filter(|it| it.1.contains("functions [(")).count();
+            assert!(functions <= 1, "a number became a function: {}", all_described(&datas));
+        }
+        Err(e) => assert!(e.contains("const eval's id of"), "{e}"),
+    }
+}
+
+/// A `DynMetadata` of an alias that normalizes to `dyn` points at its vtable.
+#[test]
+fn a_dyn_metadata_of_an_alias_points_at_its_vtable() {
+    let datas = datas_or("meta").unwrap_or_else(|e| panic!("`META` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        points_at_vtable(&datas, &words, word, "F"),
+        "`META`'s vtable is not relocated: {}",
+        all_described(&datas)
+    );
+}
+
+/// An empty slice into memory const eval kept points into it, in the middle and at its end,
+/// not at its alignment.
+#[test]
+fn an_empty_slice_into_kept_memory_points_into_it() {
+    let datas = datas_or("emp").unwrap_or_else(|e| panic!("`EMP` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        words.iter().any(|it| matches!(it[..], [(0, a, 0), (m, b, 1), (e, c, 3)]
+            if m == 2 * word && e == 4 * word && a == b && b == c)),
+        "`EMP`'s empty slices do not point into `e`: {}",
+        all_described(&datas)
+    );
+}
+
+/// A tuple whose tail is `dyn` keeps its memory, and the `&dyn` in its concrete value points
+/// at its vtable.
+#[test]
+fn a_tuple_with_a_dyn_tail_is_relocated() {
+    let datas = datas_or("tup").unwrap_or_else(|e| panic!("`TUP` is refused: {e}"));
+    let word = crate::Target::for_host().word() as u32;
+    let words = relocated_words(&datas);
+    assert!(
+        points_at_vtable(&datas, &words, 2 * word, "G"),
+        "the tuple tail's `&dyn` is not relocated: {}",
+        all_described(&datas)
+    );
 }

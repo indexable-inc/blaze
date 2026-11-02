@@ -21,6 +21,7 @@ use std::{
 
 use base_db::{ConstEvalBudget, Crate, CrateOrigin, Db, Env};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_profile::span::{Ending, MacroExpand, MacroExpanded, Name as SpanName, Outcome};
 use hir_def::{AssocItemId, FunctionId, HasModule, ModuleDefId, StaticId, nameres::crate_def_map};
 use hir_expand::name::Name;
@@ -42,7 +43,6 @@ use crate::{
     os::{Answer, Os, Shim},
     server::{Emitted, Server},
     stream::Stream,
-    wire::Width,
 };
 
 /// What a macro's expansion may use of the evaluator's memory, stack and heap together. A
@@ -56,10 +56,6 @@ pub(crate) const MEMORY: u64 = 1 << 30;
 /// A derive of serde's size runs a few million basic blocks natively: this is ten to a hundred
 /// times that, and minutes of the evaluator at most.
 pub(crate) const STEPS: u64 = 1 << 27;
-
-/// The `usize` of the evaluated client: the shims model only 64-bit targets (`os/target.rs`),
-/// and [`State::word`] is the same eight bytes.
-const WIDTH: Width = Width::W64;
 
 /// The functions of the `proc_macro` crate a run calls or claims.
 #[derive(Clone, Copy, Debug)]
@@ -123,6 +119,7 @@ pub(crate) struct Expansion<'a> {
 }
 
 /// What an expansion gave and what it did besides.
+#[derive(Debug)]
 pub(crate) struct Ran {
     /// The output, or the macro's panic message.
     pub(crate) output: Result<Stream, String>,
@@ -139,15 +136,17 @@ pub(crate) struct Ran {
     pub(crate) statics: Vec<(StaticId, Vec<u8>, bool)>,
 }
 
-/// What a run spent on the evaluator, read from it whether the run ended or stopped: what the
-/// run's `macro expand` span says.
+/// What a run spent on the evaluator or in a wasm module, read whether the run ended or
+/// stopped: what the run's `macro expand` span says.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Spent {
-    /// Whether it ran on the evaluator: a compiled run counts no steps.
+    /// Whether it ran on the evaluator: the span gives steps and peak bytes only then, since a
+    /// module's are of other units.
     pub(crate) evaluated: bool,
-    /// Basic blocks run, over every expansion of the run (the session's earlier calls too).
+    /// Basic blocks run, over every expansion of the run (the session's earlier calls too); a
+    /// module's fuel (`wasm::host::FUEL`).
     pub(crate) steps: u64,
-    /// The most bytes of stack and heap the evaluator held at once.
+    /// The most bytes of stack and heap the evaluator held at once; a module's linear memory.
     pub(crate) peak_bytes: u64,
     /// The budget that stopped it, when one did.
     pub(crate) over: Option<Over>,
@@ -207,7 +206,7 @@ pub(crate) fn over_budget(error: &MirEvalError<'_>) -> Option<Over> {
 struct State<'e> {
     server: Server,
     os: Os<'e>,
-    shims: HashMap<FunctionId, Shim>,
+    shims: HashMap<FunctionId, Shim, Global>,
     /// Why a claimed call stopped the evaluation.
     stop: Option<Stop>,
     reply: Vec<u8>,
@@ -412,9 +411,9 @@ fn evaluate(
         return Err(Stop("was given nothing to expand".to_owned())); // alloc: error path
     };
     let state = RefCell::new(State {
-        server: Server::new(last.sites, last.edition, last.forced_keywords, WIDTH),
+        server: Server::new(last.sites, last.edition, last.forced_keywords),
         os: Os::new(env),
-        shims: HashMap::default(),
+        shims: HashMap::new_in(Global),
         stop: None,
         // alloc: once per run, the replies' buffer
         reply: Vec::new(),
@@ -508,7 +507,7 @@ fn expand_all<'db>(
     let mut config = Vec::new(); // alloc: once per run, as above
     for (at, expansion) in expansions.iter().enumerate() {
         if at > 0 {
-            state.borrow_mut().server = Server::new(expansion.sites, expansion.edition, expansion.forced_keywords, WIDTH);
+            state.borrow_mut().server = Server::new(expansion.sites, expansion.edition, expansion.forced_keywords);
             spent.steps += eval.steps_spent();
             eval.set_budget(budget);
         }

@@ -2,8 +2,6 @@
 //! (`lower::InferVars`): each variant lowers the same `let` type, whose `_`, `'_` and array
 //! length `_` are the three kinds of variable.
 
-use std::cell::OnceCell;
-
 use base_db::{Db, all_crates};
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
@@ -64,6 +62,10 @@ impl Fixture {
         self.body().resolver(&self.db)
     }
 
+    fn generics(&self) -> Generics<'_> {
+        crate::generics::generics(&self.db, self.function.into())
+    }
+
     fn body(&self) -> DefWithBodyId {
         self.function.into()
     }
@@ -91,7 +93,7 @@ impl Fixture {
     fn lower<'db, 'a>(
         &'db self,
         resolver: &'a Resolver<'db>,
-        generics: &'a OnceCell<Generics<'db>>,
+        generics: &'a Generics<'db>,
         frame: &'a Frame,
         vars: impl FnOnce(TyLoweringContext<'db, 'a>) -> TyLoweringContext<'db, 'a>,
     ) -> (Ty<'db>, ThinVec<TyLoweringDiagnostic>) {
@@ -137,7 +139,7 @@ fn an_inference_context_gives_a_variable_of_each_kind() {
     let krate = hir_def::HasModule::module(&fixture.function, &fixture.db).krate(&fixture.db);
     let interner = DbInterner::new_with(&fixture.db, krate);
     let infcx: InferCtxt<'_> = interner.infer_ctxt().build(TypingMode::non_body_analysis());
-    let (resolver, generics) = (fixture.resolver(), OnceCell::new());
+    let (resolver, generics) = (fixture.resolver(), fixture.generics());
     let (ty, diagnostics) = frame::task(Tag::Infer, |frame| {
         fixture.lower(&resolver, &generics, frame, |ctx| ctx.with_infer_ctxt_vars(Some(&infcx)))
     });
@@ -153,7 +155,7 @@ fn an_inference_context_gives_a_variable_of_each_kind() {
 #[test]
 fn without_an_inference_context_a_placeholder_is_refused() {
     let fixture = Fixture::new();
-    let (resolver, generics) = (fixture.resolver(), OnceCell::new());
+    let (resolver, generics) = (fixture.resolver(), fixture.generics());
     let (ty, diagnostics) = frame::task(Tag::Infer, |frame| {
         fixture.lower(&resolver, &generics, frame, |ctx| ctx.with_infer_ctxt_vars(None))
     });
@@ -169,7 +171,7 @@ fn without_an_inference_context_a_placeholder_is_refused() {
 fn a_finished_inference_answers_a_placeholder_and_errs_the_rest() {
     let fixture = Fixture::new();
     let infer = InferenceResult::of(&fixture.db, fixture.body());
-    let (resolver, generics) = (fixture.resolver(), OnceCell::new());
+    let (resolver, generics) = (fixture.resolver(), fixture.generics());
     let (ty, diagnostics) = frame::task(Tag::Infer, |frame| {
         fixture.lower(&resolver, &generics, frame, |ctx| ctx.with_answered_infer_vars(Some(infer)))
     });
@@ -186,7 +188,7 @@ fn a_finished_inference_answers_a_placeholder_and_errs_the_rest() {
 #[test]
 fn without_a_finished_inference_a_placeholder_is_an_error_not_a_diagnostic() {
     let fixture = Fixture::new();
-    let (resolver, generics) = (fixture.resolver(), OnceCell::new());
+    let (resolver, generics) = (fixture.resolver(), fixture.generics());
     let (ty, diagnostics) = frame::task(Tag::Infer, |frame| {
         fixture.lower(&resolver, &generics, frame, |ctx| ctx.with_answered_infer_vars(None))
     });

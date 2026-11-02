@@ -9,6 +9,7 @@
 //!
 //! Available flags:
 //!     add:
+//!     allocator_api: sized, result
 //!     asm:
 //!     assert:
 //!     async_iterator: option, future, pin
@@ -561,6 +562,9 @@ pub mod ptr {
     pub unsafe fn drop_in_place<T: crate::marker::PointeeSized>(to_drop: *mut T) {
         unsafe { drop_in_place(to_drop) }
     }
+    // As core has it: the item drop glue is an instance of, which the compiler replaces.
+    #[lang = "drop_glue"]
+    pub(crate) const unsafe fn drop_glue<T: crate::marker::PointeeSized>(_: &mut T) {}
     pub const unsafe fn read<T>(src: *const T) -> T {
         // As core reads: `*src` moves out of a raw pointer, which rustc refuses (E0507) for a
         // `T` that is not `Copy`, and so does the borrow checker.
@@ -585,6 +589,8 @@ pub mod ptr {
 
     #[lang = "dyn_metadata"]
     pub struct DynMetadata<Dyn: PointeeSized> {
+        // The vtable, as core's `NonNull<VTable>` is.
+        _vtable_ptr: *const (),
         _phantom: crate::marker::PhantomData<Dyn>,
     }
 
@@ -2764,6 +2770,35 @@ macro_rules! matches {
     };
 }
 // endregion:matches
+
+// region:allocator_api
+pub mod alloc {
+    pub struct Layout {
+        size: usize,
+        align: usize,
+    }
+    impl Layout {
+        pub const fn from_size_align_unchecked(size: usize, align: usize) -> Layout {
+            Layout { size, align }
+        }
+    }
+    pub struct AllocError;
+    pub unsafe trait Allocator {
+        fn allocate(&self, layout: Layout) -> Result<*mut u8, AllocError>;
+        unsafe fn deallocate(&self, ptr: *mut u8, layout: Layout);
+        fn by_ref(&self) -> &Self
+        where
+            Self: Sized,
+        {
+            self
+        }
+    }
+    pub unsafe trait GlobalAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8;
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout);
+    }
+}
+// endregion:allocator_api
 
 pub mod prelude {
     pub mod v1 {

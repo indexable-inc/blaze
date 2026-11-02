@@ -11,6 +11,7 @@ use base_db::{Crate, Db, all_crates};
 use blaze_alloc_count::{assert_at_most, measure};
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::QueryKind;
 use blaze_query::db::Setter;
@@ -112,7 +113,7 @@ const BODIES: [&str; 4] = ["uses_show", "plain", "seven", "closures"];
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
 #[derive(Default)]
 pub(super) struct Memory {
-    images: Mutex<HashMap<ContentId, Arc<Aligned>>>,
+    images: Mutex<HashMap<ContentId, Arc<Aligned>, Global>>,
 }
 
 impl Memory {
@@ -150,7 +151,7 @@ impl ImageStore for Memory {
 
 /// The items every test database's keys name: a key is the hash of an item's portable form in
 /// `main`'s table (frontend-deps' frozen encoding), kept so another database finds it again.
-pub(super) type Defs = Arc<Mutex<HashMap<ContentId, (u8, Vec<u8>)>>>;
+pub(super) type Defs = Arc<Mutex<HashMap<ContentId, (u8, Vec<u8>), Global>>>;
 
 /// Lane item-hash's part, for tests, one per database: a body's identity is its key and its HIR
 /// printed (no ids, no spans); every read of an impl table is [`IMPLS`], `refuse` is refused, and
@@ -158,7 +159,7 @@ pub(super) type Defs = Arc<Mutex<HashMap<ContentId, (u8, Vec<u8>)>>>;
 pub(super) struct TestFacts {
     defs: Defs,
     main: Crate,
-    identities: Mutex<HashMap<DefWithBodyId, Option<ContentId>>>,
+    identities: Mutex<HashMap<DefWithBodyId, Option<ContentId>, Global>>,
     refuse: Option<&'static str>,
     names: Mutex<Vec<&'static str>>,
 }
@@ -307,11 +308,11 @@ fn stable(db: &Db, facts: &TestFacts, def: DefWithBodyId) -> Vec<u8> {
 }
 
 /// The first database's bodies, inferred and flushed into a new store.
-fn stored(mode: Mode) -> (Arc<Memory>, Defs, HashMap<&'static str, Vec<u8>>) {
+fn stored(mode: Mode) -> (Arc<Memory>, Defs, HashMap<&'static str, Vec<u8>, Global>) {
     let memory = Arc::new(Memory::default());
     let defs = Defs::default();
     let first = session(db_of(FIXTURE), &memory, &defs, None, mode);
-    let mut forms = HashMap::default();
+    let mut forms = HashMap::new_in(Global);
     for name in BODIES {
         let def = function(&first.db, name);
         forms.insert(name, stable(&first.db, &first.facts, def));

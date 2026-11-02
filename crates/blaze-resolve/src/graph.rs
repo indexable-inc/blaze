@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::hash::Hash;
 
-use blaze_hash::{FixedState, HashSet};
+use blaze_hash::HashSet;
+use std::alloc::Global;
 
 use crate::persistent;
 
@@ -65,7 +66,7 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
         N: Hash,
     {
         let mut ret = Vec::with_capacity(self.nodes.len());
-        let mut marks = HashSet::with_capacity_and_hasher(self.nodes.len(), FixedState);
+        let mut marks = HashSet::with_capacity_in(self.nodes.len(), Global);
 
         for node in self.nodes.keys() {
             self.sort_inner_visit(node, &mut ret, &mut marks);
@@ -78,7 +79,7 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
         &'a self,
         node: &'a N,
         dst: &mut Vec<N>,
-        marks: &mut HashSet<&'a N>,
+        marks: &mut HashSet<&'a N, Global>,
     ) where
         N: Hash,
     {
@@ -107,7 +108,7 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
         N: Hash,
     {
         let mut stack = vec![from];
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new_in(Global);
         seen.insert(from);
         while let Some(iter) = stack.pop().and_then(|p| self.nodes.get(p)) {
             for p in iter.keys() {

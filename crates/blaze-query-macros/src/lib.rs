@@ -5,6 +5,7 @@
 //! fixes them. Every option the front end doesn't use is refused with an error naming it.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;

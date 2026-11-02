@@ -128,6 +128,7 @@ use std::{
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 pub struct Key<K, V, P> {
     _phantom: PhantomData<(K, V, P)>,
@@ -163,12 +164,12 @@ pub struct DynMap {
 
 /// The map of one key: indexing a [`DynMap`] by the key is a field access.
 pub struct KeyMap<K, V> {
-    map: HashMap<K, V>,
+    map: HashMap<K, V, Global>,
 }
 
 impl<K, V> Default for KeyMap<K, V> {
     fn default() -> Self {
-        KeyMap { map: HashMap::default() }
+        KeyMap { map: HashMap::new_in(Global) }
     }
 }
 

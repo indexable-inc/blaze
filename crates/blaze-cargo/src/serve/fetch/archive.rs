@@ -8,6 +8,7 @@
 use std::io::Read as _;
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_registry::download::{LimitErrorReader, is_windows_reserved_path};
 use blaze_vfs::Mode;
 use tar::{Archive, EntryType};
@@ -103,8 +104,8 @@ fn inside(raw: &[u8], shown: &str, prefix: &str, is_dir: bool) -> Result<String,
 /// The paths unpacked so far: files, and directories named or under a file.
 #[derive(Default)]
 struct Paths {
-    files: HashSet<String>,
-    dirs: HashSet<String>,
+    files: HashSet<String, Global>,
+    dirs: HashSet<String, Global>,
 }
 
 impl Paths {

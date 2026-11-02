@@ -21,6 +21,7 @@
 
 #![deny(unsafe_code)]
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![feature(allocator_api)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
@@ -428,7 +429,7 @@ impl ast::Expr {
     /// ast::Expr::parse("let fail = true;", Edition::CURRENT).tree();
     /// ```
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::Expr> {
-        let _p = tracing::info_span!("Expr::parse").entered();
+        let _p = tracing::info_span!(target: "blaze", "Expr::parse").entered();
         let (tree, errors) =
             parsing::parse_text_at(&text.into(), parser::TopEntryPoint::Expr, edition);
         let root = tree.root();
@@ -446,7 +447,7 @@ impl ast::MacroStmts {
     /// Parses `text` as the statements a macro call in statement position expands to, as
     /// rustc retries an expansion that is no expression (`failed_to_match_macro`).
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::MacroStmts> {
-        let _p = tracing::info_span!("MacroStmts::parse").entered();
+        let _p = tracing::info_span!(target: "blaze", "MacroStmts::parse").entered();
         let (tree, errors) =
             parsing::parse_text_at(&text.into(), parser::TopEntryPoint::MacroStmts, edition);
         assert_eq!(tree.root().kind(), SyntaxKind::MACRO_STMTS);
@@ -500,7 +501,7 @@ impl SourceFile {
 
     /// A full parse of `text`, whose tree shares it: the parse costs the tree's arrays only.
     pub fn parse_shared(text: impl Into<Text>, edition: Edition) -> Parse<SourceFile> {
-        let _p = tracing::info_span!("SourceFile::parse").entered();
+        let _p = tracing::info_span!(target: "blaze", "SourceFile::parse").entered();
         let (tree, errors) = parsing::parse_text(&text.into(), edition, false);
         let root = tree.root();
 
@@ -514,7 +515,7 @@ impl SourceFile {
     /// tokens could parse otherwise alone (`parser::lazy_block_len`) is parsed in full here.
     /// Its errors: [`Parse::errors`], [`Parse::errors_with_bodies`].
     pub fn parse_outline(text: impl Into<Text>, edition: Edition) -> Parse<SourceFile> {
-        let _p = tracing::info_span!("SourceFile::parse_outline").entered();
+        let _p = tracing::info_span!(target: "blaze", "SourceFile::parse_outline").entered();
         let (tree, errors) = parsing::parse_text(&text.into(), edition, true);
         let root = tree.root();
 

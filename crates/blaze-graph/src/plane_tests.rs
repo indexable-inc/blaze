@@ -11,6 +11,7 @@ mod reference;
 use std::sync::Arc;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Order, Record};
 use parking_lot::Mutex;
@@ -265,7 +266,7 @@ fn one_request_without_keys_or_budget_says_what_the_machine_says() {
 
 /// What the query database has, as the plane's [`crate::plane::Memo`] sees it: the test puts a
 /// task's value in it before its `Done`, as the work does.
-type Db = Arc<Mutex<HashMap<Key, Outcome>>>;
+type Db = Arc<Mutex<HashMap<Key, Outcome, Global>>>; // alloc: a test's model
 
 /// A test's [`Db`] as the plane's memo.
 struct DbMemo(Db);
@@ -964,26 +965,26 @@ struct Planned {
 struct Model {
     seed: u64,
     budget: Option<u64>,
-    specs: HashMap<u32, Spec>,
-    request_of: HashMap<u32, u32>,
-    nodes_of: HashMap<u32, Vec<u32>>,
-    dependents: HashMap<u32, Vec<u32>>,
-    states: HashMap<u32, NodeState>,
+    specs: HashMap<u32, Spec, Global>, // alloc: a test's model
+    request_of: HashMap<u32, u32, Global>, // alloc: a test's model
+    nodes_of: HashMap<u32, Vec<u32>, Global>, // alloc: a test's model
+    dependents: HashMap<u32, Vec<u32>, Global>, // alloc: a test's model
+    states: HashMap<u32, NodeState, Global>, // alloc: a test's model
     /// The tasks running, by the node they run as.
     running: Vec<u32>,
-    running_keys: HashSet<Key>,
+    running_keys: HashSet<Key, Global>, // alloc: a test's model
     granted: u64,
     /// What the database has: keys whose task ended well, some that failed, less those
     /// dropped since.
     db: Db,
-    finished: HashMap<u32, bool>,
-    cancelled: HashSet<u32>,
+    finished: HashMap<u32, bool, Global>, // alloc: a test's model
+    cancelled: HashSet<u32, Global>, // alloc: a test's model
     /// The requests idle now.
-    idle: HashSet<u32>,
+    idle: HashSet<u32, Global>, // alloc: a test's model
     /// The running tasks asked to give way, by the node they run as.
-    yielding: HashSet<u32>,
+    yielding: HashSet<u32, Global>, // alloc: a test's model
     /// How many `Run`s each request was said, less those that gave way.
-    ran: HashMap<u32, u64>,
+    ran: HashMap<u32, u64, Global>, // alloc: a test's model
     outputs: Vec<PlaneOutput>,
 }
 
@@ -1000,7 +1001,7 @@ impl Model {
     }
 
     /// The longest path of expected cost from `id` to the end of its request.
-    fn priority(&self, id: u32, memo: &mut HashMap<u32, u64>) -> u64 {
+    fn priority(&self, id: u32, memo: &mut HashMap<u32, u64, Global>) -> u64 { // alloc: a test's model
         if let Some(&it) = memo.get(&id) {
             return it;
         }
@@ -1094,12 +1095,12 @@ impl Model {
                     assert_eq!(self.states[&id.0], NodeState::Running, "seed {seed}: #{id}");
                     // Critical exactly when nothing ready or running of its request has a
                     // longer path to go, counted from the whole graph.
-                    let mut memo = HashMap::default();
+                    let mut memo = HashMap::new_in(Global); // alloc: a test's model
                     let mine = self.priority(id.0, &mut memo);
                     let most = self.nodes_of[&self.request_of[&id.0]]
                         .iter()
                         .filter(|it| {
-                            matches!(self.states.get(it), Some(NodeState::Ready | NodeState::Running))
+                            matches!(self.states.get(*it), Some(NodeState::Ready | NodeState::Running))
                         })
                         .map(|it| self.priority(*it, &mut memo))
                         .max()
@@ -1131,7 +1132,7 @@ impl Model {
                         }
                     }
                     if plane.config().budget.is_none() {
-                        let mut memo = HashMap::default();
+                        let mut memo = HashMap::new_in(Global); // alloc: a test's model
                         let request = self.request_of[&id.0];
                         let mine = self.priority(id.0, &mut memo);
                         for other in &self.nodes_of[&request] {

@@ -18,6 +18,7 @@ anyhow.workspace = true
 # The versions the pinned nightly's rustfmt is built with (rust-lang/rust's Cargo.lock at
 # 12433c307): widths, grapheme breaks and the line diff of `--check` are theirs.
 annotate-snippets.workspace = true
+blaze-serde.workspace = true
 diff.workspace = true
 unicode-segmentation.workspace = true
 rustfmt-unicode-width.workspace = true

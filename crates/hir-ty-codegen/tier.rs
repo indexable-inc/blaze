@@ -26,6 +26,7 @@ use std::{cell::RefCell, sync::Arc, time::Duration};
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use cranelift_codegen::ir::{self, InstBuilder, Opcode, types};
 use hir_def::{FunctionId, HasModule, attrs::AttrFlags};
 use parking_lot::Mutex;
@@ -176,7 +177,7 @@ impl Tiered {
 /// The functions of a program at a level above 1.
 #[derive(Default)]
 pub struct Tiers {
-    nodes: HashMap<Node, Arc<Tiered>>,
+    nodes: HashMap<Node, Arc<Tiered>, Global>,
     /// What was installed since a patch last held the code, with the code each replaced.
     fresh: Vec<(Node, Option<Arc<Tiered>>)>,
     /// Code installed together with code no patch could hold, to install again one by one.
@@ -324,10 +325,10 @@ pub(super) struct Request {
 
 /// The hot functions the compile under way on this thread may build into what it compiles.
 struct Inlining {
-    roots: HashSet<FunctionId>,
+    roots: HashSet<FunctionId, Global>,
     /// By what they are and their generic arguments: whether a call checks overflow is the
     /// caller's to say, which the last build may have settled otherwise.
-    instances: HashSet<(InstanceDef, StoredGenericArgs)>,
+    instances: HashSet<(InstanceDef, StoredGenericArgs), Global>,
     inlined: Vec<(Instance, StoredParamEnvAndCrate)>,
     /// Of a build's compile ([`for_build`]) rather than of one at a level above 1.
     whole: bool,
@@ -344,14 +345,13 @@ struct Inlining {
     /// The bodies built so far, by what they are of: `None` for one that is not built in.
     built: HashMap<
         (InstanceDef, StoredGenericArgs, bool),
-        Option<std::rc::Rc<super::fragment::Inlinable>>,
-    >,
+        Option<std::rc::Rc<super::fragment::Inlinable>>, Global>,
     /// The size of a body that was built and then found too large, which a build of it with
     /// more room only adds to: it is not built again for a call that allows no more. A body
     /// built while its callees found no room is not kept in [`Inlining::built`], and what it
     /// counted is given back ([`untally`]), so each call would build it again, and each of
     /// its callees, at every depth.
-    oversized: HashMap<(InstanceDef, StoredGenericArgs, bool), usize>,
+    oversized: HashMap<(InstanceDef, StoredGenericArgs, bool), usize, Global>,
 }
 
 thread_local! {
@@ -378,8 +378,8 @@ pub(super) fn for_build<T>(work: impl FnOnce() -> T) -> T {
     #[cfg(not(feature = "llvm"))]
     let imports = false;
     let fresh = (across() && !imports).then(|| Inlining {
-        roots: HashSet::default(),
-        instances: HashSet::default(),
+        roots: HashSet::new_in(Global),
+        instances: HashSet::new_in(Global),
         // alloc: empty until a body is built in, then one small list per function compile
         inlined: Vec::new(),
         whole: true,
@@ -388,8 +388,8 @@ pub(super) fn for_build<T>(work: impl FnOnce() -> T) -> T {
         depth: 0,
         spent: 0,
         seen: 0,
-        built: HashMap::default(),
-        oversized: HashMap::default(),
+        built: HashMap::new_in(Global),
+        oversized: HashMap::new_in(Global),
     });
     let held = INLINING.with(|it| std::mem::replace(&mut *it.borrow_mut(), fresh));
     let out = work();
@@ -398,8 +398,7 @@ pub(super) fn for_build<T>(work: impl FnOnce() -> T) -> T {
 }
 
 /// Whether a build's compiles build in what they call across crates: in a build of a whole
-/// program unless `BLAZE_INLINE=crate` (or `0`, which builds nothing in), and in any build
-/// with `BLAZE_INLINE=all`.
+/// program unless `BLAZE_INLINE=crate`, and in any build with `BLAZE_INLINE=all`.
 /// The builds of a process that builds edits of them do not, whatever it says: an entry of
 /// the store, and a function an edit's patch compares with the build before, is keyed by its
 /// own function alone, so a body built into a function of another crate would outlive an
@@ -408,7 +407,7 @@ pub(super) fn across() -> bool {
     static ASKED: std::sync::LazyLock<Option<bool>> =
         std::sync::LazyLock::new(|| match std::env::var("BLAZE_INLINE").as_deref() {
             Ok("all") => Some(true),
-            Ok("crate" | "0") => Some(false),
+            Ok("crate") => Some(false),
             _ => None,
         });
     !super::backend::edits_follow()
@@ -812,12 +811,12 @@ fn build_body(
         }
     });
     let built = (|| {
-        let mut cg = Recorder::new(
-            db,
-            &**super::target().ok()?,
-            super::selected_target().ok()?,
-            instance.checked,
-        );
+        // Declined, never guessed: the compile asking loaded this crate's target with `?`.
+        let target = super::target_of_crate(db, env.as_ref(db).krate)
+            .map_err(|e| self::refused(db, instance, e))
+            .ok()?;
+        let isa = super::isa_for(target).map_err(|e| self::refused(db, instance, e)).ok()?;
+        let mut cg = Recorder::new(db, &**isa, target, instance.checked);
         cg.unlocated = true;
         let args = instance.args;
         let mut ctx =
@@ -888,8 +887,8 @@ pub fn prepare(db: &Db, asked: &Asked) -> std::result::Result<Prepared, String> 
         return Err("Cranelift does not compile it".to_owned());
     }
     let mut inlining = Inlining {
-        roots: HashSet::default(),
-        instances: HashSet::default(),
+        roots: HashSet::new_in(Global),
+        instances: HashSet::new_in(Global),
         // alloc: empty until a body is built in; once per function the daemon tiers
         inlined: Vec::new(),
         whole: false,
@@ -898,8 +897,8 @@ pub fn prepare(db: &Db, asked: &Asked) -> std::result::Result<Prepared, String> 
         depth: 0,
         spent: 0,
         seen: 0,
-        built: HashMap::default(),
-        oversized: HashMap::default(),
+        built: HashMap::new_in(Global),
+        oversized: HashMap::new_in(Global),
     };
     for node in &asked.hot {
         match &node.0 {
@@ -1023,7 +1022,8 @@ fn count(
     branches: &[ir::Inst],
 ) -> Result<()> {
     use cranelift_codegen::cursor::{Cursor as _, FuncCursor};
-    let pointer = super::ptr();
+    // Tier-up runs native code only, whose ISA addresses are the target's.
+    let pointer = recorder.isa.pointer_type();
     let mut sig = recorder.make_signature();
     sig.returns.push(ir::AbiParam::new(pointer));
     let id = recorder.import(COUNTERS, &sig)?;
@@ -1063,6 +1063,7 @@ fn count(
 /// LLVM has none, as the function then stays where it is.
 pub(super) fn emit(
     recorder: &mut Wants,
+    target: &'static super::Target,
     named: &[ir::StackSlot],
     func: &mut ir::Function,
     request: &Request,
@@ -1084,7 +1085,7 @@ pub(super) fn emit(
     if super::dumps_tier() {
         eprintln!("tier {:?}:\n{}", request.level, func.display());
     }
-    produce(recorder, named, func, weights.as_ref())
+    produce(recorder, target, named, func, weights.as_ref())
 }
 
 /// What level 3 tells LLVM: how often the function is entered, and how often each branch
@@ -1092,12 +1093,13 @@ pub(super) fn emit(
 #[cfg_attr(not(feature = "llvm"), allow(dead_code))]
 pub(super) struct Weights {
     pub(super) entered: u64,
-    pub(super) taken: HashMap<ir::Inst, [u64; 2]>,
+    pub(super) taken: HashMap<ir::Inst, [u64; 2], Global>,
 }
 
 #[cfg(feature = "llvm")]
 fn produce(
     recorder: &mut Wants,
+    target: &'static super::Target,
     named: &[ir::StackSlot],
     func: &ir::Function,
     weights: Option<&Weights>,
@@ -1106,12 +1108,13 @@ fn produce(
     let optimization = Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
     let code = super::llvm::emit(recorder, named, func, optimization, weights, &[])
         .map_err(CodegenError::LlvmRefused)?;
-    super::backend::pad(code)
+    super::backend::pad(code, target)
 }
 
 #[cfg(not(feature = "llvm"))]
 fn produce(
     _: &mut Wants,
+    _: &'static super::Target,
     _: &[ir::StackSlot],
     _: &ir::Function,
     _: Option<&Weights>,

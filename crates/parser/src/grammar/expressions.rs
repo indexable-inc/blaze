@@ -41,7 +41,7 @@ pub(super) fn match_arm_expr(p: &mut Parser<'_>) -> Option<(CompletedMarker, Blo
     expr_bp(p, None, r, 1)
 }
 
-fn expr_no_struct(p: &mut Parser<'_>) {
+pub(super) fn expr_no_struct(p: &mut Parser<'_>) {
     let r = Restrictions { forbid_structs: true, prefer_stmt: false, macro_ends_stmt: true };
     expr_bp(p, None, r, 1);
 }
@@ -531,6 +531,13 @@ fn postfix_dot_expr<const FLOAT_RECOVERY: bool>(
     //     x.0.0.await;
     //     x.0. await;
     // }
+    // `x.[f]` (blaze's `#![feature(blaze_comptime)]`): an `INDEX_EXPR` with a `.` before its
+    // `[`. `.[` is a syntax error in Rust, so taking it changes no program; lowering refuses it
+    // without the feature.
+    if p.nth(nth1) == T!['['] {
+        return Ok(reflected_field_expr::<FLOAT_RECOVERY>(p, lhs));
+    }
+
     if p.nth(nth1) == T![await] {
         let m = lhs.precede(p);
         if !FLOAT_RECOVERY {
@@ -568,6 +575,21 @@ fn call_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
 fn index_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
     assert!(p.at(T!['[']));
     let m = lhs.precede(p);
+    p.bump(T!['[']);
+    expr(p);
+    p.expect(T![']']);
+    m.complete(p, INDEX_EXPR)
+}
+
+/// `x.[f]`, the `.` already split off a float (`x.0.[f]`) when `FLOAT_RECOVERY`.
+fn reflected_field_expr<const FLOAT_RECOVERY: bool>(
+    p: &mut Parser<'_>,
+    lhs: CompletedMarker,
+) -> CompletedMarker {
+    let m = lhs.precede(p);
+    if !FLOAT_RECOVERY {
+        p.bump(T![.]);
+    }
     p.bump(T!['[']);
     expr(p);
     p.expect(T![']']);

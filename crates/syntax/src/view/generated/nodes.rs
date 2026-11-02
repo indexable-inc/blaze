@@ -689,6 +689,8 @@ impl<'t> Fn<'t> {
     #[inline]
     pub fn ret_type(self) -> Option<RetType<'t>> { support::child(self.syntax) }
     #[inline]
+    pub fn spec_clauses(self) -> AstChildren<'t, SpecClause<'t>> { support::children(self.syntax) }
+    #[inline]
     pub fn semicolon_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![;]) }
     #[inline]
     pub fn async_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![async]) }
@@ -742,6 +744,8 @@ pub struct ForExpr<'t> {
 impl<'t> ForExpr<'t> {
     #[inline]
     pub fn pat(self) -> Option<Pat<'t>> { support::child(self.syntax) }
+    #[inline]
+    pub fn const_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![const]) }
     #[inline]
     pub fn for_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![for]) }
     #[inline]
@@ -905,6 +909,8 @@ pub struct IndexExpr<'t> {
 }
 impl<'t> IndexExpr<'t> {
     #[inline]
+    pub fn dot_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![.]) }
+    #[inline]
     pub fn l_brack_token(self) -> Option<Token<'t>> { support::token(self.syntax, T!['[']) }
     #[inline]
     pub fn r_brack_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![']']) }
@@ -1041,6 +1047,8 @@ pub struct LoopExpr<'t> {
     pub(crate) syntax: Node<'t>,
 }
 impl<'t> LoopExpr<'t> {
+    #[inline]
+    pub fn spec_clauses(self) -> AstChildren<'t, SpecClause<'t>> { support::children(self.syntax) }
     #[inline]
     pub fn loop_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![loop]) }
 }
@@ -1651,6 +1659,8 @@ pub struct RetType<'t> {
 }
 impl<'t> RetType<'t> {
     #[inline]
+    pub fn pat(self) -> Option<Pat<'t>> { support::child(self.syntax) }
+    #[inline]
     pub fn ty(self) -> Option<Type<'t>> { support::child(self.syntax) }
     #[inline]
     pub fn thin_arrow_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![->]) }
@@ -1716,6 +1726,24 @@ impl<'t> SliceType<'t> {
     pub fn l_brack_token(self) -> Option<Token<'t>> { support::token(self.syntax, T!['[']) }
     #[inline]
     pub fn r_brack_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![']']) }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SpecClause<'t> {
+    pub(crate) syntax: Node<'t>,
+}
+impl<'t> SpecClause<'t> {
+    #[inline]
+    pub fn exprs(self) -> AstChildren<'t, Expr<'t>> { support::children(self.syntax) }
+    #[inline]
+    pub fn decreases_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![decreases]) }
+    #[inline]
+    pub fn ensures_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![ensures]) }
+    #[inline]
+    pub fn invariant_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![invariant]) }
+    #[inline]
+    pub fn recommends_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![recommends]) }
+    #[inline]
+    pub fn requires_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![requires]) }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourceFile<'t> {
@@ -2202,6 +2230,8 @@ pub struct WhileExpr<'t> {
     pub(crate) syntax: Node<'t>,
 }
 impl<'t> WhileExpr<'t> {
+    #[inline]
+    pub fn spec_clauses(self) -> AstChildren<'t, SpecClause<'t>> { support::children(self.syntax) }
     #[inline]
     pub fn while_token(self) -> Option<Token<'t>> { support::token(self.syntax, T![while]) }
 }
@@ -5484,6 +5514,28 @@ impl<'t> AstNode<'t> for SliceType<'t> {
 impl fmt::Debug for SliceType<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SliceType").field("syntax", &self.syntax).finish()
+    }
+}
+impl<'t> AstNode<'t> for SpecClause<'t> {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        SPEC_CLAUSE
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == SPEC_CLAUSE }
+    #[inline]
+    fn cast(syntax: Node<'t>) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> Node<'t> { self.syntax }
+}
+impl fmt::Debug for SpecClause<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpecClause").field("syntax", &self.syntax).finish()
     }
 }
 impl<'t> AstNode<'t> for SourceFile<'t> {
@@ -8955,6 +9007,11 @@ impl fmt::Display for SliceType<'_> {
         fmt::Display::fmt(&self.syntax(), f)
     }
 }
+impl fmt::Display for SpecClause<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.syntax(), f)
+    }
+}
 impl fmt::Display for SourceFile<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.syntax(), f)
@@ -9694,6 +9751,9 @@ impl view::Typed for crate::ast::SlicePat {
 }
 impl view::Typed for crate::ast::SliceType {
     type Of<'t> = SliceType<'t>;
+}
+impl view::Typed for crate::ast::SpecClause {
+    type Of<'t> = SpecClause<'t>;
 }
 impl view::Typed for crate::ast::SourceFile {
     type Of<'t> = SourceFile<'t>;

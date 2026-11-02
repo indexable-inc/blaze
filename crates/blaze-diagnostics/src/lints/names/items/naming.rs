@@ -17,6 +17,7 @@
 //! `NonUpperCaseGlobals`) and `compiler/rustc_lint/src/lints.rs` (`NonSnakeCaseDiag`,
 //! `NonUpperCaseGlobal`) (MIT or Apache-2.0).
 
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
 use std::cell::OnceCell;
 
 use base_db::TargetKind;
@@ -77,6 +78,7 @@ pub(super) fn krate(cx: &Cx<'_, '_>) -> Option<Found> {
 /// What rustc's `NonSnakeCase` and `NonUpperCaseGlobals` lint of `item` that `IncorrectCase`
 /// does not, in the order rustc visits its nodes. Each node is told apart by its kind, and a
 /// name is tested for its case before anything resolves it.
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one item's check, dropped with it, not global state")]
 pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Vec<Found> {
     // alloc: empty, no allocation, unless a name fires a lint
     let mut found = Vec::new();

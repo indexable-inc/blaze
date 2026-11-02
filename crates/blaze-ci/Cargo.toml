@@ -25,6 +25,7 @@ blaze-format.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-protocol.workspace = true
+blaze-serde.workspace = true
 blaze-vfs.workspace = true
 crossbeam-channel.workspace = true
 hashbrown.workspace = true

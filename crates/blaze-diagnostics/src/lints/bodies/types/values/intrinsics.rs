@@ -7,6 +7,7 @@
 
 use hir_def::hir::{Expr, ExprId};
 use hir_ty::next_solver::{Ty, TyKind};
+use intern::sym;
 use rustc_type_ir::{
     TypeVisitableExt as _,
     inherent::{GenericArgs as _, IntoKind as _},
@@ -34,10 +35,9 @@ impl LatePass for EnumIntrinsicsNonEnums {
         }
         let Expr::Path(_) = store.expr(callee) else { return };
         let Some(name) = util::path_item(b, callee) else { return };
-        let items = util::items();
-        let discriminant = if name == items.mem_discriminant {
+        let discriminant = if name == sym::mem_discriminant {
             true
-        } else if name == items.mem_variant_count {
+        } else if name == sym::mem_variant_count {
             false
         } else {
             return;

@@ -6,6 +6,7 @@ use crate::graph::Graph;
 use crate::interning::InternedString;
 use crate::persistent;
 use crate::resolver::HashMap;
+use std::alloc::Global;
 use crate::resolver::HashSet;
 use crate::{Dependency, PackageId, Registry, Summary};
 use anyhow::format_err;
@@ -170,15 +171,15 @@ impl ResolverContext {
     pub(super) fn resolve_replacements(
         &self,
         registry: &RegistryQueryer<'_, impl Registry, impl Query>,
-    ) -> HashMap<PackageId, PackageId> {
+    ) -> HashMap<PackageId, PackageId, Global> {
         self.activations
             .values()
             .filter_map(|(s, _)| registry.used_replacement_for(s.package_id()))
             .collect()
     }
 
-    pub(super) fn graph(&self) -> Graph<PackageId, HashSet<Dependency>> {
-        let mut graph: Graph<PackageId, HashSet<Dependency>> = Graph::new();
+    pub(super) fn graph(&self) -> Graph<PackageId, HashSet<Dependency, Global>> {
+        let mut graph: Graph<PackageId, HashSet<Dependency, Global>> = Graph::new();
         self.activations.values().for_each(|(r, _)| graph.add(r.package_id()));
         for i in self.parents.iter() {
             graph.add(*i);

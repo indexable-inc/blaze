@@ -135,12 +135,20 @@ pub(crate) struct Spec {
     /// [`crate::query::BuildConfig::std`]: where the standard library's units place what they
     /// make, in a directory of their [`crate::query::StdKey`]'s.
     pub std: String,
+    /// [`crate::query::BuildConfig::builds`]: where the workspace's build directory is when
+    /// nothing names one.
+    pub builds: String,
     /// `-Zbuild-std=` and `-Zbuild-std-features=`.
     pub build_std: Option<Vec<String>>,
     pub build_std_features: Option<Vec<String>>,
     /// A foreign workspace's ask: its units are a standard library's.
     pub foreign: Option<ForeignAsk>,
+    /// `-Z wasm-macros`: proc macros are built for [`MACRO_WASM`] to run as wasm modules.
+    pub macro_wasm: bool,
 }
+
+/// The platform `-Z wasm-macros` builds proc macros for.
+pub(crate) const MACRO_WASM: &str = "wasm32-wasip1";
 
 /// The view's spec, from its command line: as cargo's `Packages::from_flags`,
 /// `CompileFilter::from_raw_arguments` and the commands read it. `library` is the view's mount
@@ -183,6 +191,7 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
     };
     let mut build_std = None;
     let mut build_std_features = None;
+    let mut macro_wasm = false;
     for flag in &asked.unstable {
         let (name, value) = flag.split_once('=').unwrap_or((flag.as_str(), ""));
         let list = || value.split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect::<Vec<_>>();
@@ -190,6 +199,7 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
             "unstable-options" | "bindeps" | "codegen-backend" => {}
             "build-std" => build_std = Some(list()),
             "build-std-features" => build_std_features = Some(list()),
+            "wasm-macros" => macro_wasm = true,
             _ => return Err(error(&format!("blaze does not read `-Z {name}` yet"))),
         }
     }
@@ -221,9 +231,11 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         library,
         library_at: asked.library.clone(),
         std: asked.std.clone(),
+        builds: asked.builds.clone(),
         build_std,
         build_std_features,
         foreign: None,
+        macro_wasm,
     })
 }
 
@@ -270,9 +282,14 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
         library_at: String::new(),
         // Its units are a standard library's, placed where the workspace that asks puts them.
         std: String::new(),
+        // Its units are placed under `FOREIGN_TARGET` and moved to `std`'s: it has no build
+        // directory of its own.
+        builds: String::new(),
         build_std: None,
         build_std_features: None,
         foreign: Some(ask.clone()),
+        // A standard library has no proc macros of its own to run.
+        macro_wasm: false,
     }
 }
 
@@ -294,7 +311,7 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 5");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 6");
     type Key = ();
     type Value = Cbor<Planned>;
 
@@ -393,7 +410,7 @@ pub struct ForeignProfile {
 impl Query for Foreign {
     const KIND: QueryKind = QueryKind(0x601a);
     const NAME: &'static str = "cargo foreign";
-    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 5");
+    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 6");
     type Key = ForeignAsk;
     type Value = Cbor<StdPlanned>;
 

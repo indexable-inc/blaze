@@ -8,7 +8,12 @@
 //!   const-eval budget ([`base_db::CrateWorkspaceData::content`]); each dependency as its key,
 //!   its name and whether it is a prelude, sysroot or private dependency. Each of
 //!   [`base_db::BuiltCrateData`]'s and [`ExtraCrateData`]'s fields is named where it is hashed,
-//!   so a field added to either does not build until the key covers it.
+//!   so a field added to either does not build until the key covers it. One is named and left
+//!   out on purpose: `manifest_kind`, the kind of the manifest target a `--test` crate is built
+//!   from. Nothing in an image reads it (def maps, lang items and signatures are made from
+//!   `target_kind`, crate types and cfg), and the root file's path above already tells one
+//!   package's targets apart (`tests/fetch.rs` and `examples/fetch.rs`), so hashing it would
+//!   only split one image into two equal ones.
 //! - Each file of the source root of the crate's root file: its path and its text's content
 //!   ID ([`base_db::FileText::content`], which has no path in it), sorted by path.
 //! - Of a proc-macro crate, each macro's name and kind and the content ID of the library it is
@@ -36,6 +41,7 @@
 
 use base_db::{Crate, Db, ExtraCrateData, FileText, TargetKind};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use hir_expand::proc_macro::{ProcMacroKind, ProcMacros};
 
@@ -49,6 +55,7 @@ pub const KEY_DOMAIN: &str = "blaze v2 dependency image key 3";
 
 /// What makes the images: the version of each encoding in them, so an image of another
 /// encoding is never found.
+#[expect(clippy::disallowed_types, reason = "the process's one producer content id: all image keys use the same encoding identity")]
 pub static PRODUCER: std::sync::LazyLock<ContentId> = std::sync::LazyLock::new(|| {
     let mut hasher = Hasher::new(KEY_DOMAIN);
     hasher.part(b"producer");
@@ -63,7 +70,7 @@ pub static PRODUCER: std::sync::LazyLock<ContentId> = std::sync::LazyLock::new(|
 /// dependencies is one either (a member's def map changes with every edit, so nothing that
 /// names it is kept), and every proc-macro crate among them with its library known.
 pub fn eligible(db: &Db, krate: Crate) -> bool {
-    let mut memo = HashMap::default();
+    let mut memo = HashMap::new_in(Global);
     walk(db, krate, &mut |_, _| ContentId::default(), &mut memo).is_some()
 }
 
@@ -72,7 +79,7 @@ pub fn eligible(db: &Db, krate: Crate) -> bool {
 ///
 /// One walk of the crate graph: each crate is visited once, whether eligible and its key
 /// decided together, so the work is the crates' files and their dependency edges.
-pub fn keys(db: &Db, crates: &[Crate], build: ContentId) -> HashMap<Crate, ContentId> {
+pub fn keys(db: &Db, crates: &[Crate], build: ContentId) -> HashMap<Crate, ContentId, Global> {
     // alloc: setup: the keys of a session, once
     walked(db, crates, build).into_iter().filter_map(|(krate, key)| Some((krate, key?))).collect()
 }
@@ -93,7 +100,7 @@ pub struct KeyInputs {
 
 /// [`keys`], each with what it was made from: the same walk, so the closure is exactly the
 /// crates whose keys the key hashed.
-pub fn key_inputs(db: &Db, crates: &[Crate], build: ContentId) -> HashMap<Crate, KeyInputs> {
+pub fn key_inputs(db: &Db, crates: &[Crate], build: ContentId) -> HashMap<Crate, KeyInputs, Global> {
     let memo = walked(db, crates, build);
     let inputs = |(&krate, key): (&Crate, &Option<ContentId>)| {
         // alloc: setup: once per crate a driver publishes
@@ -118,7 +125,7 @@ pub fn key_inputs(db: &Db, crates: &[Crate], build: ContentId) -> HashMap<Crate,
 /// The walk of [`keys`] and [`key_inputs`]: each crate of `crates` and of their dependencies,
 /// with its key or `None` when it is not [`eligible`].
 fn walked(db: &Db, crates: &[Crate], build: ContentId) -> Memo {
-    let mut memo = HashMap::default();
+    let mut memo = HashMap::new_in(Global);
     let mut hash = |krate, memo: &Memo| key(db, krate, build, memo);
     for &krate in crates {
         walk(db, krate, &mut hash, &mut memo);
@@ -127,7 +134,7 @@ fn walked(db: &Db, crates: &[Crate], build: ContentId) -> Memo {
 }
 
 /// Each crate walked: its key, or `None` when it is not [`eligible`].
-type Memo = HashMap<Crate, Option<ContentId>>;
+type Memo = HashMap<Crate, Option<ContentId>, Global>;
 
 /// `krate`'s key by `hash` of it and the memo holding its dependencies' keys, if it and every
 /// crate it depends on is eligible, its dependencies' first. The crate graph has no cycles,
@@ -185,6 +192,9 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, memo: &Memo, hasher: &mut Ha
         origin,
         crate_attrs,
         target_kind,
+        // Nothing an image holds reads it, and the root's path below tells the targets of one
+        // package apart.
+        manifest_kind: _,
         crate_types,
         proc_macro_cwd,
     } = krate.data(db);

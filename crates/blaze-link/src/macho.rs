@@ -1634,7 +1634,7 @@ impl MachO {
         let base = placed.plan.base;
         let section_at = |addr: u64, what: &str| -> Result<u8, LinkError> { section_in(ranges, addr, what) };
 
-        let exported: blaze_hash::HashSet<&str> =
+        let exported: blaze_hash::HashSet<&str, std::alloc::Global> =
             // alloc: one set per link, sized once by the exports
             placed.exports.iter().map(|it| it.name.as_str()).collect();
         let mut locals: Vec<(u64, &str)> = Vec::with_capacity(placed.functions.len());

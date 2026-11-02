@@ -17,22 +17,31 @@
 //!   emits none (`!emit_lifetime_markers()`).
 //!
 //! Each pass is a port of rustc's pass of the same name; where it does less than rustc's, its
-//! module says what. Passes rustc runs at a level and these do not are listed in
-//! [`passes_not_ported`].
+//! module says what. Two passes rustc has none of: `HeapToStack` ([`escape`]), which moves an
+//! allocation that never leaves its function into the function's frame, and `BoxInPlace`
+//! ([`box_in_place`]), which builds the value of a large `Box::new(value)` in the box instead of
+//! on the stack. Passes rustc runs at a level and these do not are listed in
+//! [`passes_not_ported`]. `Specialize` ([`specialize`]), last, with `Inline`, is blaze's too:
+//! it lists the calls the code generator gives a copy of the callee specialized on constant
+//! arguments.
 //!
 //! The passes run on the generic body, as rustc's do, once per function: monomorphization
 //! substitutes after. An edit to one function optimizes that one again.
 //!
 //! [`MirPhase::Runtime`]: super::MirPhase::Runtime
 
+mod box_in_place;
 mod cfg;
 mod check_enums;
 mod check_pointers;
 mod copy_prop;
+mod devirt;
 mod dse;
+mod escape;
 mod inline;
 mod inst_simplify;
 mod locals;
+mod specialize;
 
 use base_db::Db;
 use blaze_mem::{Frame, Tag, frame};
@@ -52,7 +61,10 @@ use super::{
     transform::Ctx,
 };
 
+pub use box_in_place::BOX_IN_PLACE_MIN;
+pub use escape::heap_held;
 pub use inline::{CallerLocation, caller_location, owner_of, source_span, written_checked_at};
+pub use specialize::{CloneId, MAX_COPIES, MAX_COPIES_PER_BODY, specialized_mir_body};
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
@@ -89,11 +101,18 @@ pub fn passes_not_ported(level: MirOptLevel) -> &'static [&'static str] {
 ///
 /// A pass run only at [`MirOptLevel::Release`] never adds a call, constant, static, drop or
 /// vtable the body does not have at [`MirOptLevel::Debug`]: those passes only remove code or
-/// replace a local by another holding the same value. The one exception is `Inline`
+/// replace a local by another holding the same value. The exceptions run with `Inline`
 /// (`options.inline`, only at `Release`): an inlined callee brings what its own body
 /// references, which the `Debug` body reaches through the call, and lists the callee in
-/// `body.inlined.callees`. The code generator's walk of what a unit references reads `Debug`
-/// bodies for every level and relies on this; `tests/mir/references.rs` holds it.
+/// `body.inlined.callees`; `Specialize` changes no statement but lists, in
+/// `body.inlined.specialized`, the calls the code generator makes to a copy of the callee
+/// ([`specialized_mir_body`]) instead, whose body references what the callee's does or less.
+/// The code generator's walk of what a unit references reads `Debug` bodies for every level and
+/// relies on this, reading both lists of the bodies it compiles; `tests/mir/references.rs`
+/// holds it. Another exception is `Devirtualize` (`options.world`), whose direct calls are
+/// of methods the vtables it compares against hold, and whose compares unsize to vtables the
+/// program makes already: the walk lists them through the vtables, and the code generator walks
+/// a body with a world with that world (`hir-ty-codegen` `refs`).
 pub(super) fn optimize<'db>(
     db: &'db Db,
     body: &MirBody<'db>,
@@ -107,17 +126,20 @@ pub(super) fn optimize<'db>(
         return Ok(body);
     }
     frame::task(Tag::Mir, |outer| {
-        passes(&Ctx::new(db, body.owner, outer), &mut body, options, caller, optimizing)
+        passes(&Ctx::new(db, body.owner, outer), &mut body, options, caller, optimizing, None)
     })?;
     Ok(body)
 }
 
+/// The pipeline over `body`, of `caller` where it is a function's: `within` is the copy
+/// ([`specialized_mir_body`]) `body` is the body of, if it is one.
 fn passes<'db>(
     ctx: &Ctx<'_, 'db>,
     body: &mut MirBody<'db>,
     options: MirOptions,
     caller: Option<InlinedBody<'db>>,
     optimizing: bool,
+    within: Option<&super::Specialization>,
 ) -> Result<'db, ()> {
     let release = options.level >= MirOptLevel::Release;
     // Each pass in a frame of its own, and in a debug build a check that it left a body the
@@ -140,6 +162,12 @@ fn passes<'db>(
         run!("CleanupPostBorrowck", |frame| cfg::cleanup_post_borrowck(body, frame));
         run!("SimplifyCfg", |frame| cfg::simplify_cfg(body, frame));
     }
+    // blaze's own, at both levels, before the UB checks: a value it moves out of its box is
+    // read through no pointer, so it has none to check, and a check of the box's pointer would
+    // name the box itself, which `HeapToStack` then refuses to move.
+    if optimizing && options.heap_to_stack {
+        run!("HeapToStack", |frame| escape::heap_to_stack(ctx, body, frame)?);
+    }
     if options.ub_checks {
         use check_pointers::{PointerCheck, check_pointers};
         run!("CheckAlignment", |frame| check_pointers(ctx, body, PointerCheck::Alignment, frame)?);
@@ -150,8 +178,24 @@ fn passes<'db>(
         return Ok(());
     }
 
+    // blaze's own, at both levels and before `Inline` takes `Box::new` apart. `HeapToStack`
+    // (above, before the UB checks) takes values of at most 512 bytes and `BoxInPlace` of at
+    // least 4 KiB, so they never want the same `Box::new`.
+    run!("BoxInPlace", |frame| box_in_place::box_in_place(ctx, body, frame)?);
     run!("LowerSliceLenCalls", |frame| inst_simplify::lower_slice_len_calls(ctx, body, frame));
     run!("InstSimplify", |frame| inst_simplify::inst_simplify(ctx, body, frame));
+    // blaze's own: a `dyn` call the whole program makes one to four types' objects for becomes
+    // direct, before `Inline` so that it can be inlined, and after it for the `dyn` calls the
+    // callees brought.
+    let world = options.world.filter(|_| release && options.inline);
+    let inlines = options.inline && caller.is_some();
+    // alloc: the receivers of the calls kept behind compares, a handful a body
+    let mut behind = Vec::new();
+    if let Some(world) = world {
+        run!("Devirtualize", |frame| {
+            devirt::devirtualize(ctx, body, world, !inlines, &mut behind, frame)?
+        });
+    }
     // `options.inline` is set only at `Release` (rustc's `Inline::is_enabled`).
     if options.inline
         && let Some(caller) = caller
@@ -161,6 +205,11 @@ fn passes<'db>(
                 cfg::simplify_cfg(body, frame);
             }
         });
+        if let Some(world) = world {
+            run!("Devirtualize", |frame| {
+                devirt::devirtualize(ctx, body, world, true, &mut behind, frame)?
+            });
+        }
     }
     // rustc keeps storage markers only where it gives the backend lifetimes.
     if !options.lifetime_markers {
@@ -189,6 +238,10 @@ fn passes<'db>(
     }
     run!("SimplifyLocals", |frame| locals::simplify_locals(body, frame));
     run!("CriticalCallEdges", |frame| cfg::critical_call_edges(body, frame));
+    // Last, so that the blocks it lists are the body's: it changes no statement or block.
+    if options.inline && caller.is_some() {
+        run!("Specialize", |frame| specialize::specialize(ctx, body, within, frame));
+    }
     Ok(())
 }
 
@@ -311,12 +364,26 @@ fn validate(body: &MirBody<'_>, frame: &Frame) -> std::result::Result<(), String
             ));
         }
     }
+    let mut last = None;
+    for call in &body.inlined.specialized {
+        let at = block_index(call.block);
+        let is_call = at < blocks
+            && matches!(
+                body.basic_blocks[call.block].terminator.as_ref().map(|it| &it.kind),
+                Some(TerminatorKind::Call { .. })
+            );
+        if !is_call || last.is_some_and(|last| last >= at) {
+            // alloc: error path
+            return Err(format!("specialized call in bb{at}: not a call, or out of order"));
+        }
+        last = Some(at);
+    }
     Ok(())
 }
 
 /// Every block a terminator can go to, unwinding and coroutine drops included, as rustc's
 /// `Terminator::successors_mut`.
-fn successors_mut(kind: &mut TerminatorKind, mut f: impl FnMut(&mut BasicBlockId)) {
+pub(super) fn successors_mut(kind: &mut TerminatorKind, mut f: impl FnMut(&mut BasicBlockId)) {
     match kind {
         TerminatorKind::Goto { target } => f(target),
         TerminatorKind::SwitchInt { targets, .. } => targets.targets.iter_mut().for_each(f),
@@ -342,6 +409,11 @@ fn successors_mut(kind: &mut TerminatorKind, mut f: impl FnMut(&mut BasicBlockId
             f(real_target);
             f(imaginary_target);
         }
+        TerminatorKind::ComptimeFor { body, after, .. } => {
+            f(body);
+            f(after);
+        }
+        TerminatorKind::ComptimeNext { head } => f(head),
         TerminatorKind::UnwindResume
         | TerminatorKind::Abort
         | TerminatorKind::Return
@@ -417,13 +489,13 @@ fn reverse_postorder<'f>(body: &MirBody<'_>, frame: &'f Frame) -> Vec<BasicBlock
 }
 
 /// Immediate dominators of the reachable blocks (Cooper, Harvey and Kennedy).
-struct Dominators<'f> {
+pub(super) struct Dominators<'f> {
     /// By block index: the immediate dominator, `None` for a block that is not reachable.
     idom: Vec<Option<usize>, &'f Frame>,
 }
 
 impl<'f> Dominators<'f> {
-    fn new(body: &MirBody<'_>, frame: &'f Frame) -> Dominators<'f> {
+    pub(super) fn new(body: &MirBody<'_>, frame: &'f Frame) -> Dominators<'f> {
         let rpo = reverse_postorder(body, frame);
         let count = body.basic_blocks.len();
         let mut order = Vec::with_capacity_in(count, frame);
@@ -498,7 +570,7 @@ impl<'f> Dominators<'f> {
     }
 
     /// Whether `a` dominates `b`; a block dominates itself.
-    fn dominates(&self, a: BasicBlockId, b: BasicBlockId) -> bool {
+    pub(super) fn dominates(&self, a: BasicBlockId, b: BasicBlockId) -> bool {
         let (a, mut b) = (block_index(a), block_index(b));
         if self.idom[a].is_none() || self.idom[b].is_none() {
             return false;
@@ -774,4 +846,13 @@ fn renumber_blocks(body: &mut MirBody<'_>, map: &[Option<usize>]) {
         }
         _ => false,
     });
+    let specialized = &mut body.inlined.specialized;
+    specialized.retain_mut(|call| match moved(call.block) {
+        Some(new) => {
+            call.block = new;
+            true
+        }
+        None => false,
+    });
+    specialized.sort_by_key(|call| block_index(call.block));
 }

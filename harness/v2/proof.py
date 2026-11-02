@@ -53,7 +53,7 @@ from typed_input import fail, parse  # noqa: E402
 SCRIPT = "proof.py"
 type Name = Literal["oracle", "corpus", "cases", "dbsp", "share", "determinism", "tightmemory", "macroeval",
                     "budgets"]
-SCRIPTS: dict[str, tuple[str, ...]] = {
+SCRIPTS: dict[Name, tuple[str, ...]] = {
     "oracle": ("oracle.py", "run"),
     "corpus": ("corpus.py",),
     "cases": ("frontend/cases.py",),
@@ -83,9 +83,10 @@ class Input:
 
 
 def argv_of(check: Check, spec: engine.EngineSpec, out: Path, work: str) -> list[str]:
-    if not isinstance(check.given, dict | None):
+    given_in: object = check.given
+    if not isinstance(given_in, dict | None):
         fail(SCRIPT, f"checks: {check.name}: `given` is a JSON object, not {json.dumps(check.given)}")
-    given: dict[str, object] = dict(typing.cast(dict[str, object], check.given or {}))
+    given: dict[str, object] = dict(typing.cast(dict[str, object], given_in or {}))
     for field in ("engine", "out", "work"):
         if field in given:
             fail(SCRIPT, f"checks: {check.name}: `{field}` is proof.py's to give, not `given`'s")
@@ -98,7 +99,10 @@ def argv_of(check: Check, spec: engine.EngineSpec, out: Path, work: str) -> list
 
 def verdict_of(outcomes: list[dict[str, Any]]) -> report.Verdict:
     seen = {o["verdict"] for o in outcomes}
-    return next((v for v in WORST if v in seen), "pass")
+    for v in WORST:
+        if v in seen:
+            return v
+    return "pass"
 
 
 def run_check(check: Check, spec: engine.EngineSpec, out: Path, work: str) -> tuple[report.Verdict, str, dict[str, Any] | None]:

@@ -6,6 +6,7 @@
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (`LangString::parse`, `map_line`).
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use pulldown_cmark::{
     BrokenLink, BrokenLinkCallback, CodeBlockKind, CowStr, Event, HeadingLevel, LinkType, Parser,
     Tag, TagEnd,
@@ -20,7 +21,7 @@ use crate::{
 /// The ids a page has used, so a heading in docs gets one of its own.
 #[derive(Default)]
 pub(crate) struct Ids {
-    used: HashMap<String, usize>,
+    used: HashMap<String, usize, Global>,
 }
 
 impl Ids {

@@ -31,5 +31,8 @@ intern.workspace = true
 proc-macro-api.workspace = true
 span.workspace = true
 
+[dev-dependencies]
+blaze-items.workspace = true
+
 [lints]
 workspace = true

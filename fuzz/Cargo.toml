@@ -236,6 +236,7 @@ blaze-mem.workspace = true
 # `cbor::reference`, the codec's oracle, which the CBOR targets compare the fast one with.
 blaze-protocol = { workspace = true, features = ["reference"] }
 blaze-query.workspace = true
+blaze-serde.workspace = true
 blaze-usercode.workspace = true
 blaze-vfs.workspace = true
 hir-def.workspace = true

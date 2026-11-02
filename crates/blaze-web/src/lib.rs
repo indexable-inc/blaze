@@ -13,6 +13,7 @@
 
 #![deny(unsafe_code)]
 #![feature(random)]
+#![feature(allocator_api)]
 
 mod flecs;
 mod http;

@@ -44,7 +44,9 @@ pub(super) fn successors(kind: &TerminatorKind) -> impl Iterator<Item = BasicBlo
             | TerminatorKind::DropAndReplace { target, .. }
             | TerminatorKind::Assert { target, .. }
             | TerminatorKind::FalseEdge { real_target: target, .. }
-            | TerminatorKind::FalseUnwind { real_target: target, .. } => (Some(*target), None, &[]),
+            | TerminatorKind::FalseUnwind { real_target: target, .. }
+            | TerminatorKind::ComptimeNext { head: target } => (Some(*target), None, &[]),
+            TerminatorKind::ComptimeFor { body, after, .. } => (Some(*body), Some(*after), &[]),
             TerminatorKind::SwitchInt { targets, .. } => (None, None, targets.all_targets()),
             TerminatorKind::Call { target, .. } => (*target, None, &[]),
             TerminatorKind::Yield { resume, drop, .. } => (Some(*resume), *drop, &[]),
@@ -112,6 +114,19 @@ impl<'f, 'db> MoveData<'f, 'db> {
         live: &Bits<'_>,
         frame: &'f Frame,
     ) -> Self {
+        Self::gather_rooted(ctx, body, live, frame, |ty| ctx.needs_drop(ty))
+    }
+
+    /// [`MoveData::gather`] with a path for each local whose type `root` picks, in place of
+    /// those with drop glue: for an analysis of other values than the ones drops drop
+    /// ([`super::drop_states`]).
+    pub(super) fn gather_rooted(
+        ctx: &Ctx<'_, 'db>,
+        body: &MirBody<'db>,
+        live: &Bits<'_>,
+        frame: &'f Frame,
+        mut root: impl FnMut(crate::next_solver::Ty<'db>) -> bool,
+    ) -> Self {
         let mut data = MoveData {
             paths: Vec::new_in(frame),
             locals: frame.alloc_slice_fill_with(body.locals.len(), |_| None),
@@ -121,7 +136,7 @@ impl<'f, 'db> MoveData<'f, 'db> {
         };
         for (local, decl) in body.locals.iter() {
             let ty = decl.ty.as_ref();
-            if ctx.needs_drop(ty) {
+            if root(ty) {
                 let id = data.paths.len();
                 data.paths.push(MovePath {
                     place: Place::from(local).store(),

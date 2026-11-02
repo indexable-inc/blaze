@@ -9,7 +9,7 @@ use syntax::view::{self as ast, AstNode as _, HasName as _};
 
 use hir_ty::{
     InferBodyId,
-    mir::{LocalId, MirBody, PlaceElem, PlaceTy, ProjectionElem},
+    mir::{ComptimeBinder, LocalId, MirBody, PlaceElem, PlaceTy, ProjectionElem},
     next_solver::TyKind,
 };
 
@@ -67,6 +67,17 @@ impl<'a, 'db> Ctx<'a, 'db> {
         Some(self.store[binding].name.as_str())
     }
 
+    /// The variable a `for const` loop binds its binder to, `f` of `for const f in ..`: the
+    /// first binding (by local) whose type is the binder. `None` for a `_` pattern.
+    fn binder_name(&self, body: &MirBody<'db>, binder: ComptimeBinder) -> Option<&'a str> {
+        let (_, &binding) = self
+            .bindings
+            .iter()
+            .filter(|(local, _)| ComptimeBinder::of(body.locals[**local].ty.as_ref()) == Some(binder))
+            .min_by_key(|(local, _)| local.into_raw())?;
+        Some(self.store[binding].name.as_str())
+    }
+
     /// The place as rustc writes it in a message, or `None` for a temporary.
     pub(super) fn describe(
         &self,
@@ -90,8 +101,10 @@ impl<'a, 'db> Ctx<'a, 'db> {
         for (index, elem) in projection.iter().enumerate().skip(start) {
             match elem {
                 ProjectionElem::Deref => {
-                    let next_is_field =
-                        matches!(projection.get(index + 1), Some(ProjectionElem::Field(_)));
+                    let next_is_field = matches!(
+                        projection.get(index + 1),
+                        Some(ProjectionElem::Field(_) | ProjectionElem::ReflectedField(_))
+                    );
                     if !next_is_field {
                         name.prefix(b'*');
                     }
@@ -101,6 +114,13 @@ impl<'a, 'db> Ctx<'a, 'db> {
                     self.field_name(ty, field.0, &mut name);
                 }
                 ProjectionElem::Index(_) => name.push("[_]"),
+                // The field of the `for const` loop's current iteration, by the loop's
+                // variable: `x.[f]`, as the source writes it.
+                ProjectionElem::ReflectedField(binder) => {
+                    name.push(".[");
+                    name.push(self.binder_name(body, *binder).unwrap_or("_"));
+                    name.push("]");
+                }
                 ProjectionElem::ConstantIndex { .. } | ProjectionElem::Subslice { .. } => {
                     name.push("[..]")
                 }

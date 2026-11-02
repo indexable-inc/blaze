@@ -73,7 +73,7 @@ class Input:
 @dataclass
 class FileResult:
     rewrites: int = 0
-    left: list[str] = field(default_factory=list)
+    left: list[str] = field(default_factory=list[str])
 
 
 def strip_from_uses(text: str, name: str = "SourceDatabase") -> tuple[str, int]:
@@ -111,7 +111,10 @@ def add_db_import(text: str, crate: str) -> str:
     braced = re.compile(rf"^use {root}::\{{", re.MULTILINE)
     if m := braced.search(text):
         if text[m.end() :].startswith("\n"):
-            indent = re.match(r"\n([ \t]*)", text[m.end() :]).group(1)
+            # The text there starts with a newline, so this always matches.
+            starts = re.match(r"\n([ \t]*)", text[m.end() :])
+            assert starts is not None
+            indent = starts.group(1)
             return text[: m.end()] + f"\n{indent}Db," + text[m.end() :]
         return text[: m.end()] + "Db, " + text[m.end() :]
     single = re.compile(rf"^use {root}::(?P<name>[\w:]+(?: as \w+)?);", re.MULTILINE)

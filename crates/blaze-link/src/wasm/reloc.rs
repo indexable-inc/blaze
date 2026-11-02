@@ -18,6 +18,7 @@ pub(super) const TYPE_INDEX_LEB: u32 = 6;
 pub(super) const GLOBAL_INDEX_LEB: u32 = 7;
 pub(super) const FUNCTION_OFFSET_I32: u32 = 8;
 pub(super) const SECTION_OFFSET_I32: u32 = 9;
+pub(super) const MEMORY_ADDR_REL_SLEB: u32 = 11;
 pub(super) const GLOBAL_INDEX_I32: u32 = 13;
 pub(super) const TABLE_NUMBER_LEB: u32 = 20;
 pub(super) const FUNCTION_INDEX_I32: u32 = 26;
@@ -71,12 +72,14 @@ pub(super) enum Kind {
     Debug,
 }
 
-/// How the reader takes a relocation type, or why it can't: PIC, TLS (shared memory) and
-/// memory64 relocations, which objects for wasm32-wasip1 and wasm32-unknown-unknown don't have.
+/// How the reader takes a relocation type, or why it can't: TLS (shared memory) and memory64
+/// relocations, which objects for wasm32-wasip1 and wasm32-unknown-unknown don't have, and the
+/// position-independent ones but an address from `__memory_base` (wasi-sdk's
+/// `crt1-reactor.o` has it), which in a module that is not position-independent is 0.
 pub(super) fn kind(r_type: u32) -> Result<Kind, String> {
     match r_type {
         FUNCTION_INDEX_LEB | FUNCTION_INDEX_I32 | TABLE_INDEX_SLEB | TABLE_INDEX_I32
-        | MEMORY_ADDR_LEB | MEMORY_ADDR_SLEB | MEMORY_ADDR_I32 | GLOBAL_INDEX_LEB
+        | MEMORY_ADDR_LEB | MEMORY_ADDR_SLEB | MEMORY_ADDR_REL_SLEB | MEMORY_ADDR_I32 | GLOBAL_INDEX_LEB
         | GLOBAL_INDEX_I32 | TABLE_NUMBER_LEB => Ok(Kind::Applied),
         TYPE_INDEX_LEB => Ok(Kind::Type),
         FUNCTION_OFFSET_I32 | SECTION_OFFSET_I32 => Ok(Kind::Debug),
@@ -133,6 +136,8 @@ pub(super) fn apply(r_type: u32, bytes: &mut [u8], s: u64, addend: i64) -> Resul
         MEMORY_ADDR_LEB => put(bytes, &padded_uleb(address()?), what()),
         // `i32.const` takes the address as a signed number: one past 2 GiB is negative.
         MEMORY_ADDR_SLEB => put(bytes, &padded_sleb(address()? as i32), what()),
+        // From `__memory_base`, which is 0: the address itself (wasm-ld's rule out of PIC).
+        MEMORY_ADDR_REL_SLEB => put(bytes, &padded_sleb(address()? as i32), what()),
         MEMORY_ADDR_I32 => put(bytes, &address()?.to_le_bytes(), what()),
         GLOBAL_INDEX_LEB | TABLE_NUMBER_LEB => {
             no_addend()?;
@@ -205,6 +210,8 @@ mod tests {
         let at = 0x10_0000;
         assert_eq!(applied(MEMORY_ADDR_SLEB, at, 8, 5).unwrap(), [0x88, 0x80, 0xc0, 0x80, 0]);
         assert_eq!(applied(MEMORY_ADDR_LEB, at, 8, 5).unwrap(), [0x88, 0x80, 0xc0, 0x80, 0]);
+        // From `__memory_base`, which is 0 out of PIC.
+        assert_eq!(applied(MEMORY_ADDR_REL_SLEB, at, 8, 5).unwrap(), [0x88, 0x80, 0xc0, 0x80, 0]);
         assert_eq!(applied(MEMORY_ADDR_I32, at, -8, 4).unwrap(), [0xf8, 0xff, 0x0f, 0]);
         // Past 2 GiB the signed form is negative, the unsigned one is not.
         let high = 0x8000_0000;
@@ -244,6 +251,7 @@ mod tests {
             (TABLE_INDEX_I32, 0),
             (MEMORY_ADDR_LEB, 8),
             (MEMORY_ADDR_SLEB, -8),
+            (MEMORY_ADDR_REL_SLEB, 8),
             (MEMORY_ADDR_I32, 4),
             (GLOBAL_INDEX_LEB, 0),
             (GLOBAL_INDEX_I32, 0),

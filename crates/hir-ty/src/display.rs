@@ -9,6 +9,7 @@ use std::{
 
 use base_db::{Crate, Db, FxIndexMap};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use either::Either;
 use hir_def::{
     CallableDefId, ExpressionStoreOwnerId, FindPathConfig, GenericDefId, HasModule,
@@ -134,7 +135,7 @@ pub struct HirFormatter<'a, 'db> {
     /// ```
     /// So, record the projection types met while formatting bounds and
     /// prevent recursing into their bounds to avoid infinite loops.
-    currently_formatting_bounds: HashSet<AliasTy<'db>>,
+    currently_formatting_bounds: HashSet<AliasTy<'db>, Global>,
     /// Whether formatting `impl Trait1 + Trait2` or `dyn Trait1 + Trait2` needs parentheses around it,
     /// for example when formatting `&(impl Trait1 + Trait2)`.
     trait_bounds_need_parens: bool,
@@ -965,6 +966,7 @@ fn render_const_scalar_inner<'db>(
                     write!(f, "{}", data.name.display(f.db, f.edition()))?;
                     let field_types = f.db.field_types(s.into());
                     render_variant_after_name(
+                        Some(s),
                         s.fields(f.db),
                         f,
                         field_types,
@@ -991,6 +993,7 @@ fn render_const_scalar_inner<'db>(
                     write!(f, "{}", loc.name.display(f.db, f.edition()))?;
                     let field_types = f.db.field_types(var_id.into());
                     render_variant_after_name(
+                        None,
                         var_id.fields(f.db),
                         f,
                         field_types,
@@ -1196,6 +1199,7 @@ fn render_const_scalar_from_valtree_inner<'db>(
 }
 
 fn render_variant_after_name<'db>(
+    strukt: Option<hir_def::StructId>,
     data: &VariantFields,
     f: &mut HirFormatter<'_, 'db>,
     field_types: &'db FieldTypes,
@@ -1206,13 +1210,30 @@ fn render_variant_after_name<'db>(
     memory_map: &MemoryMap<'db>,
 ) -> Result {
     let param_env = ParamEnvAndCrate { param_env, krate: f.krate() };
+    // A `#[blaze::bits]` struct's bytes are its backing integer: each field is read out of it.
+    let bits = match strukt {
+        Some(s) if crate::layout::is_bits_struct(f.db, s) => match crate::layout::bits_layout(f.db, s) {
+            Ok(bits) => Some(bits),
+            Err(_) => return f.write_str("<layout-error>"),
+        },
+        _ => None,
+    };
     let render_field = |f: &mut HirFormatter<'_, 'db>, id: LocalFieldId| {
-        let offset = layout.fields.offset(u32::from(id.into_raw()) as usize).bytes_usize();
         let ty = field_types[id].ty().instantiate(f.interner, args).skip_norm_wip();
-        let Ok(layout) = f.db.layout_of_ty(ty.store(), param_env.store()) else {
+        let Ok(field_layout) = f.db.layout_of_ty(ty.store(), param_env.store()) else {
             return f.write_str("<layout-error>");
         };
-        let size = layout.size.bytes_usize();
+        let size = field_layout.size.bytes_usize();
+        if let Some(bits) = bits {
+            let mut backing = [0u8; 16];
+            let Some(field) = bits.field(id).filter(|_| b.len() <= 16 && size <= 16) else {
+                return f.write_str("<layout-error>");
+            };
+            backing[..b.len()].copy_from_slice(b);
+            let value = field.read(u128::from_le_bytes(backing)).to_le_bytes();
+            return render_const_scalar(f, &value[..size], memory_map, ty);
+        }
+        let offset = layout.fields.offset(u32::from(id.into_raw()) as usize).bytes_usize();
         render_const_scalar(f, &b[offset..offset + size], memory_map, ty)
     };
     match data.shape {
@@ -2384,8 +2405,12 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
                                 .where_predicates()
                                 .iter()
                                 .filter_map(|it| match it {
-                                    WherePredicate::TypeBound { lifetimes: _, target, bound }
-                                        if matches!(
+                                    WherePredicate::TypeBound {
+                                        lifetimes: _,
+                                        binder: _,
+                                        target,
+                                        bound,
+                                    } if matches!(
                                             store.type_ref(*target),
                                             TypeRef::TypeParam(t) if t == param
                                         ) =>

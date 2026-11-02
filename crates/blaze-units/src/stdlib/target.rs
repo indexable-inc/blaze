@@ -12,7 +12,7 @@
 //! then a binary search for the triple, a few word operations per `-C target-feature`, and the
 //! copy of the output; it reads no lock (a `OnceLock` once set is one atomic load).
 
-use std::{borrow::Cow, collections::BTreeMap, sync::OnceLock};
+use std::{borrow::Cow, collections::BTreeMap};
 
 use blaze_ids::bits::BitArray;
 use blaze_resolve::Cfg;
@@ -317,7 +317,11 @@ fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
 }
 
 fn release() -> &'static Release {
-    static READ: OnceLock<Release> = OnceLock::new();
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the table compiled into the program (`DATA`), decoded once: a constant of the process"
+    )]
+    static READ: std::sync::OnceLock<Release> = std::sync::OnceLock::new();
     READ.get_or_init(|| {
         let raw: RawRelease =
             serde_json::from_str(DATA).expect("stdlib/rustc.json is what harness/answers.py writes");
@@ -499,6 +503,9 @@ pub struct CfgArgs {
     /// The sanitizer `-Z sanitizer` turns on (its lists add up; [`SANITIZERS`] exclude each
     /// other), which rustc sets `cfg(sanitize = "..")` for.
     pub sanitizer: Option<&'static str>,
+    /// `-Z contract-checks`, which sets `cfg(contract_checks)` and runs nightly's contract
+    /// clauses (`#[core::contracts::requires/ensures]`).
+    pub contract_checks: bool,
     /// Whether rustc is asked as on a channel that allows no unstable features
     /// (`RUSTC_BOOTSTRAP=-1`): its cfgs of unstable features (`nightly_cfg`, `overflow_checks`,
     /// `ub_checks`, `sanitize`) are left out, and tuning (`target_cpu`, `target_features`) is
@@ -657,6 +664,18 @@ impl CfgArgs {
                         "unstable-options" | "threads" | "macro-backtrace" | "time-passes" | "share-generics"
                         | "external-clangrt" | "linker-features" | "sanitizer-recover"
                         | "sanitizer-memory-track-origins" => {}
+                        // rustc's `parse_bool`: no value is `yes`.
+                        "contract-checks" => {
+                            args.contract_checks = match value {
+                                None | Some("y" | "yes" | "on" | "true") => true,
+                                Some("n" | "no" | "off" | "false") => false,
+                                Some(other) => {
+                                    return Err(format!(
+                                        "-Z {option}: rustc wants one of `y`, `yes`, `on`, `true`, `n`, `no`, `off` or `false`, not `{other}`"
+                                    ));
+                                }
+                            };
+                        }
                         "sanitizer" => {
                             let list = value.ok_or_else(|| {
                                 format!("-Z {option}: rustc wants a comma-separated list of sanitizers")
@@ -832,6 +851,12 @@ pub fn target_cfg_told<'a>(triple: &str, args: &'a CfgArgs) -> Result<(Vec<Strin
             return Err(format!("`-Z sanitizer={name}` where unstable features are not allowed"));
         }
         cfgs.push(format!("sanitize=\"{name}\""));
+    }
+    if args.contract_checks {
+        if args.stable {
+            return Err("`-Z contract-checks` where unstable features are not allowed".to_owned());
+        }
+        cfgs.push("contract_checks".to_owned());
     }
     if args.proc_macro {
         cfgs.push("proc_macro".to_owned());

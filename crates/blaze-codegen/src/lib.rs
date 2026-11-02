@@ -34,6 +34,7 @@ pub mod exec;
 pub mod flight;
 pub mod fold;
 pub mod imports;
+pub mod kernel;
 #[allow(unsafe_code)]
 pub mod memo;
 pub mod plan;
@@ -96,6 +97,20 @@ impl Backend {
     pub const fn is_cranelift(self) -> bool {
         matches!(self, Backend::Cranelift { .. })
     }
+
+    /// Whether a whole build compiles code at this backend as release code: with the imports
+    /// it decides from the whole build's summaries, kept under
+    /// [`driver::release_template_key`](crate::driver::release_template_key) (LLVM). Code
+    /// compiled alone, with no imports, is kept under
+    /// [`driver::dev_template_key`](crate::driver::dev_template_key) whatever its backend: a
+    /// whole build's Cranelift and stencil code, a lazy build's first compiles (never LLVM's,
+    /// whose imports need the whole build), and a lazy build's tier-up (`Later::tier_up`),
+    /// LLVM's too. A whole live build's tier-up (`Build::tier_up`) compiles LLVM with imports,
+    /// under the release key. The backend is in the instance's settings, so code of two
+    /// backends never shares a key.
+    pub const fn is_release(self) -> bool {
+        matches!(self, Backend::Llvm { .. })
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -153,8 +168,11 @@ pub enum Profiled {
     Counted(ProfileRecord),
     /// Built with a profile (`Pgo::Use`). `mismatched`: the profile has a record under its
     /// name with another control flow hash (it was edited since), so none of its counts
-    /// applied; the build's summary counts these ([`crate::driver::Stats::profile_mismatched`]).
-    Used { mismatched: bool },
+    /// applied. `applied`: the profile gave it counts (a record under its name with its hash).
+    /// Never both; neither when the profile has no record of its name. The build's summary
+    /// counts both by profile ([`crate::driver::Stats::profiles`]), and a job none of whose
+    /// functions a profile applied to is refused.
+    Used { mismatched: bool, applied: bool },
 }
 
 impl Profiled {
@@ -166,7 +184,11 @@ impl Profiled {
     }
 
     pub fn mismatched(&self) -> bool {
-        matches!(self, Profiled::Used { mismatched: true })
+        matches!(self, Profiled::Used { mismatched: true, .. })
+    }
+
+    pub fn applied(&self) -> bool {
+        matches!(self, Profiled::Used { applied: true, .. })
     }
 }
 
@@ -205,7 +227,7 @@ pub fn profile_name(name: &[u8; 16]) -> String {
     out
 }
 
-pub const PROFILE_NAME_PREFIX: &str = "blaze.pgo.";
+pub use blaze_items::pgo::NAME_PREFIX as PROFILE_NAME_PREFIX;
 
 /// What LLVM's SanitizerCoverage made for one function: its arrays, which start zeroed and
 /// which the link gathers with every other function's into one section each, in one order,

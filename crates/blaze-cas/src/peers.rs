@@ -23,6 +23,7 @@
 
 use blaze_core::{Done, Effect, FileName};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::ContentId;
 
 use crate::{Config, FAILURES_MOST, HEAD_FILE, Head, Op, Store, Tier};
@@ -52,9 +53,9 @@ pub(crate) struct Peers {
     /// Its own directory.
     own: FileName,
     /// The tier of each other writer's directory.
-    tier_of: HashMap<FileName, usize>,
+    tier_of: HashMap<FileName, usize, Global>, // alloc: the store's view of the other writers, for its life
     /// Failed tries of each tier since it last opened.
-    tries: HashMap<usize, u32>,
+    tries: HashMap<usize, u32, Global>, // alloc: the store's view of the other writers, for its life
     look: Option<Looking>,
     /// A look asked for while one was in flight, whose listing may have come before what the
     /// asker missed was committed.
@@ -69,7 +70,7 @@ pub(crate) struct Peers {
 struct Looking {
     listed: bool,
     /// The tiers whose heads it read that are not yet open as those heads say.
-    waiting: HashSet<usize>,
+    waiting: HashSet<usize, Global>, // alloc: the store's view of the other writers, for its life
 }
 
 impl Peers {
@@ -99,8 +100,8 @@ impl Store {
             root: config.root,
             // clone: setup, once per store
             own: own.clone(),
-            tier_of: HashMap::default(),
-            tries: HashMap::default(),
+            tier_of: HashMap::new_in(Global), // alloc: the store's view of the other writers, for its life
+            tries: HashMap::new_in(Global), // alloc: the store's view of the other writers, for its life
             look: None,
             again: false,
             // alloc: empty, allocates nothing
@@ -152,7 +153,7 @@ impl Store {
         let tag = self.tags.ask(Op::Peers);
         let peers = self.peers.as_mut().expect("a look is of a shared store");
         peers.asked += 1;
-        peers.look = Some(Looking { listed: false, waiting: HashSet::default() });
+        peers.look = Some(Looking { listed: false, waiting: HashSet::new_in(Global) }); // alloc: the store's view of the other writers, for its life
         // clone: once per look, the effect owns the name
         effects.push(Effect::Entries { dir: peers.root.clone(), tag });
         peers.asked

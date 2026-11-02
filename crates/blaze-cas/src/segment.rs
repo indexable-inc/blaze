@@ -25,8 +25,8 @@ use crate::{
     CHUNK_FROM, EXTERNAL_FROM, Kind, Key, Mismatch, Ticket, Unit, chunk, cold, cold_columns,
     disk::{self, CHUNK_DOMAIN, Form, NO_DICTIONARY, RECORD_HEADER, RecordHeader, content_of},
     flags::Flag,
-    read::{Look, Place, Seg, Shared, Spot},
-    table::Held,
+    read::{Look, Place, Seg, Shared, Spot, carry_flags},
+    table::{Held, Table},
     words::stop,
 };
 use crate::sync::{
@@ -52,6 +52,15 @@ pub(crate) const COPY: u8 = 1;
 
 /// A chunk's published word: bytes below `1 << BYTES_BITS`, puts ended in it above.
 const BYTES_BITS: u32 = 40;
+
+/// Puts that may end in one chunk: a put that would reach it rolls to a new chunk before it is
+/// counted ([`Own::room_for_a_put`]), so [`Chunk::publish`] never refuses one.
+const MOST_PUTS: u64 = 1 << (64 - BYTES_BITS);
+
+/// Bytes one chunk may hold: a record whose span with its frame would reach it is refused
+/// before it is written ([`Own::write`]), so every chunk's cap, and what it publishes, stays
+/// below it and [`Chunk::publish`] never refuses one.
+const MOST_BYTES: u64 = 1 << BYTES_BITS;
 
 /// Where a chunk's bytes start in its region: its header comes first, a cache line to itself.
 const HEAD: usize = std::mem::size_of::<Chunk>().next_multiple_of(64);
@@ -169,7 +178,7 @@ impl Chunk {
 
     fn publish(&self, bytes: u64, puts: u64) {
         assert!(
-            bytes < 1 << BYTES_BITS && puts < 1 << (64 - BYTES_BITS),
+            bytes < MOST_BYTES && puts < MOST_PUTS,
             "a chunk of 2^40 bytes or 2^24 puts"
         );
         self.published.store(bytes | (puts << BYTES_BITS), Ordering::Release);
@@ -244,6 +253,13 @@ pub(crate) struct Segment {
     first: AtomicPtr<Chunk>,
     /// How many of its puts are durable.
     durable: AtomicU64,
+    /// How many puts its writer has begun past finding the key kept already: a put is counted
+    /// here before any key of it is readable (before its first claim), so a reader that saw
+    /// one of its keys and then reads this sees the put counted. What a wait for every put made
+    /// so far waits on ([`crate::Store::last_puts`]). A put counted here may not be published
+    /// to the store's drain yet ([`Own::end_put`] publishes, then counts it again): a wait on
+    /// it flushes again until a commit takes it.
+    made: AtomicU64,
     /// Why a put of it could not be kept: zstd refused the value. The store stops on it.
     failed: OnceLock<String>,
 }
@@ -259,6 +275,13 @@ impl Segment {
 
     pub(crate) fn set_durable(&self, puts: u64) {
         self.durable.store(puts, Ordering::Release);
+    }
+
+    /// The ticket of its writer's last put, if that is not durable yet: once it is, every put
+    /// of the segment before it is too (a segment's puts turn durable in order).
+    pub(crate) fn last_pending(&self) -> Option<crate::Ticket> {
+        let made = self.made.load(Ordering::Acquire);
+        (made > self.durable()).then(|| crate::Ticket::of(self.number, made))
     }
 
     pub(crate) fn failed(&self) -> Option<&str> {
@@ -323,6 +346,27 @@ impl Writer {
     pub fn durable(&self, ticket: Ticket) -> bool {
         self.shared.durable(ticket)
     }
+
+    /// A put counted ([`crate::Store::last_puts`] covers it) that writes nothing and ends when
+    /// the [`HeldPut`] drops: what another thread's put is to a waiter between its count and
+    /// its publish, for as long as a test holds it.
+    #[cfg(feature = "test-hooks")]
+    pub fn hold_put(&mut self) -> HeldPut<'_> {
+        self.own.room_for_a_put();
+        self.own.segment.made.store(self.own.puts + 1, Ordering::Release);
+        HeldPut(&mut self.own)
+    }
+}
+
+/// A put counted and not yet ended, from [`Writer::hold_put`]: it ends, empty, when dropped.
+#[cfg(feature = "test-hooks")]
+pub struct HeldPut<'a>(&'a mut Own);
+
+#[cfg(feature = "test-hooks")]
+impl Drop for HeldPut<'_> {
+    fn drop(&mut self) {
+        self.0.end_put();
+    }
 }
 
 /// The writing end of a segment.
@@ -335,6 +379,46 @@ pub(crate) struct Own {
     puts: u64,
     /// Puts that ended in `tail`.
     puts_here: u64,
+    /// Run by each put at each [`PutAt`]: a test holds a put there, counted and not
+    /// published, while another thread reads, puts or flushes.
+    #[cfg(test)]
+    pub(crate) pause: Option<Arc<dyn Fn(PutAt) + Send + Sync>>,
+}
+
+/// Where a put is when it runs a test's [`Own::pause`].
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PutAt {
+    /// Counted in `made`, before it wrote or claimed anything.
+    Counted,
+    /// An output's chunk looked up and not found kept, before its claim: another writer may
+    /// claim that chunk first.
+    ChunkMissed,
+    /// A record written and the view it claims the key in loaded, before the key goes into
+    /// that view's tables (`prev` first, then the delta): an index swap may come between,
+    /// leaving that delta as `prev`, or an `end_migration`, leaving that `prev` as no store's.
+    Claiming,
+    /// The key won in the view's `prev`, before it goes into the delta: another writer's claim
+    /// may meet it in `prev` while the delta lacks it.
+    InPrev,
+    /// The key lost in the view's `prev`, before the claim reads the delta: a move may take
+    /// `prev`'s spot it lost to meanwhile.
+    LostInPrev,
+    /// Its records written and its keys claimed (readable), before it ends.
+    Written,
+}
+
+/// A put counted in its segment's `made`: it ends ([`Own::end_put`]) when this drops, a panic
+/// of the put's included, so `made` is never left ahead of what its writer publishes (a
+/// `Writer` lives on past a panic of its put: its lock does not poison). Every record the put
+/// wrote is whole before its key is published, so publishing them is sound; a put that wrote
+/// nothing ends empty, and the next flush with nothing to write makes its count durable.
+struct Counted<'a>(&'a mut Own);
+
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        self.0.end_put();
+    }
 }
 
 impl Own {
@@ -345,9 +429,18 @@ impl Own {
             number,
             first: AtomicPtr::new(tail.0.as_ptr()),
             durable: AtomicU64::new(0),
+            made: AtomicU64::new(0),
             failed: OnceLock::new(),
         });
-        Own { segment, tail, at: 0, puts: 0, puts_here: 0 }
+        Own {
+            segment,
+            tail,
+            at: 0,
+            puts: 0,
+            puts_here: 0,
+            #[cfg(test)]
+            pause: None,
+        }
     }
 
     pub(crate) fn segment(&self) -> &Arc<Segment> {
@@ -370,7 +463,30 @@ impl Own {
                 false => Err(Mismatch { key, kept, given: content }),
             };
         }
+        self.room_for_a_put();
         let ticket = Ticket::of(self.segment.number, self.puts + 1);
+        // Counted before any key of it is readable: a reader on another thread that reads one
+        // of its keys from here on, then waits for every put made, waits for this one.
+        self.segment.made.store(self.puts + 1, Ordering::Release);
+        let counted = Counted(self);
+        #[cfg(test)]
+        if let Some(pause) = &counted.0.pause {
+            pause(PutAt::Counted);
+        }
+        counted.0.make(look, unit, key, kind, content, bytes, ticket)
+    }
+
+    /// The records of a put counted as `ticket` ([`Own::put`]), which ends it.
+    fn make(
+        &mut self,
+        look: Look<'_>,
+        unit: Unit,
+        key: Key,
+        kind: Kind,
+        content: ContentId,
+        bytes: &[u8],
+        ticket: Ticket,
+    ) -> Result<Ticket, Mismatch> {
         let raw = bytes.len() as u64;
         let record = |form, dictionary, stored: &[u8]| RecordHeader {
             kind,
@@ -389,9 +505,13 @@ impl Own {
                         let piece = &bytes[range];
                         let chunk = Key(ContentId::of(CHUNK_DOMAIN, piece));
                         let kept = look.kept(&chunk);
-                        let copy = kept.is_some_and(|(_, there)| {
-                            there.segment() != self.segment.number && !look.shared.durable(there)
-                        });
+                        let copy = kept.is_some_and(|(_, there)| self.waits_on(look, there));
+                        #[cfg(test)]
+                        if kept.is_none()
+                            && let Some(pause) = &self.pause
+                        {
+                            pause(PutAt::ChunkMissed);
+                        }
                         if kept.is_none() || copy {
                             let (form, stored) = match cold::lz4_into(piece, packed) {
                                 true => (Form::Lz4, &packed[..]),
@@ -406,11 +526,19 @@ impl Own {
                                 key: chunk,
                                 content: content_of(piece),
                             };
-                            match copy {
-                                true => self.write_copy(Unit::SHARED, &header, stored),
-                                // A chunk another put kept meanwhile is the same bytes: either
-                                // is it.
-                                false => _ = self.claim(look, Unit::SHARED, header, stored, ticket),
+                            // A chunk another put claimed between the look and this claim is the
+                            // same bytes (its key is their hash), but its record may be that
+                            // put's, not yet published: then this put keeps a copy, as it does
+                            // for one found kept at the look, or its ticket could turn durable
+                            // with the chunk only in the other writer's memory.
+                            let lost = match copy {
+                                true => true,
+                                false => self
+                                    .claim(look, Unit::SHARED, header, stored, ticket)
+                                    .is_err_and(|(_, there)| self.waits_on(look, there)),
+                            };
+                            if lost {
+                                self.write_copy(Unit::SHARED, &header, stored);
                             }
                         }
                         disk::encode_chunk(payload, chunk, piece.len() as u64);
@@ -446,7 +574,10 @@ impl Own {
             // trained on the samples.
             self.claim(look, unit, record(Form::Raw, 0, bytes), bytes, ticket)
         };
-        self.end_put();
+        #[cfg(test)]
+        if let Some(pause) = &self.pause {
+            pause(PutAt::Written);
+        }
         match won {
             Ok(()) => Ok(ticket),
             Err((kept, there)) if kept == content => Ok(there),
@@ -455,18 +586,47 @@ impl Own {
     }
 
     /// zstd refusing a value is a broken build of it (a missing feature), not something a
-    /// value can cause: the store stops on it rather than keep the value another way. The put
-    /// still takes its ticket, which is never durable.
+    /// value can cause: the store stops on it rather than keep the value another way.
     fn fail(&mut self, kind: Kind, why: String) -> Ticket {
         // alloc: the store's failure, once: it stops on it
-        _ = self.segment.failed.set(format!("compressing a {} value: {why}", kind.name()));
-        let ticket = Ticket::of(self.segment.number, self.puts + 1);
-        self.end_put();
-        ticket
+        self.stop(format!("compressing a {} value: {why}", kind.name()))
+    }
+
+    /// Stops the store on `why`, a put this segment cannot keep. The put still takes its
+    /// ticket, which is never durable, and ends as it returns ([`Counted`]), empty.
+    fn stop(&mut self, why: String) -> Ticket {
+        _ = self.segment.failed.set(why);
+        Ticket::of(self.segment.number, self.puts + 1)
+    }
+
+    /// Whether a put of this segment that found `there`'s record under a key would wait on
+    /// another segment's put not yet durable: then it writes the record again ([`COPY`]).
+    fn waits_on(&self, look: Look<'_>, there: Ticket) -> bool {
+        there.segment() != self.segment.number && !look.shared.durable(there)
     }
 
     /// Writes a record and publishes its key; when the key was published meanwhile, keeps
-    /// nothing and gives back the content and ticket of what is there.
+    /// nothing and gives back the content and ticket of what is there. A record [`Own::write`]
+    /// refuses keeps nothing either, and gives `Ok`: the store stops on it.
+    ///
+    /// During an index swap the view has two tables, `prev` (the delta the swap left) and the
+    /// new delta, and the key goes into `prev` first. A writer that loaded the view before the
+    /// swap claims with `prev` as its last table (after an older `prev`, for a view of the swap
+    /// before), so every claim of a key while `prev` is the store's meets the others at one
+    /// slot, `prev`'s, which one compare-and-swap wins. The new delta then holds a key `prev`
+    /// holds only at the same place: the swap copies `prev`'s spots in, a claim adds the one it
+    /// won in `prev`, a claim that lost in `prev` copies the spot it lost to
+    /// (`Own::lost_in_prev`), and a move of `prev`'s spot puts its pack spot into the delta as
+    /// well (`Store::finish_batches`), where it meets such a copy at one slot. So no writer
+    /// claims in the delta a key whose record `prev` already holds (made durable, perhaps, and
+    /// dropped by `end_migration` in favour of a record not yet durable), and a second value
+    /// put across a swap is refused (a [`Mismatch`]) rather than kept beside the first.
+    ///
+    /// The delta can refuse a key won in `prev` only once `end_migration` has run and the view
+    /// this claim loaded is stale: then `prev` is no store's table, and the delta decides. The
+    /// record stays kept (a stale reader may find it in `prev`): of the same value, the drain
+    /// makes it the home of the other record or a duplicate (`Store::record_home`), as for a
+    /// put whose look missed; of another value, the put is refused.
     fn claim(
         &mut self,
         look: Look<'_>,
@@ -475,29 +635,152 @@ impl Own {
         payload: &[u8],
         ticket: Ticket,
     ) -> Result<(), (ContentId, Ticket)> {
-        let (seg, span) = self.write(unit, &header, payload, 0);
-        let spot = Spot::new(header.key, header.content, Place::Segment(seg), ticket);
-        let delta = &look.view().tiers[0].delta;
-        match delta.insert(look.held, spot) {
-            Ok((row, _)) => {
-                delta.set_flag(row, Flag::New as usize);
-                self.at += span;
-                Ok(())
+        // Refused by its length: the store stops on it, and the put ends having kept nothing,
+        // its ticket never durable.
+        let Some((seg, span)) = self.write(unit, &header, payload, 0) else { return Ok(()) };
+        let tier = &look.view().tiers[0];
+        #[cfg(test)]
+        if let Some(pause) = &self.pause {
+            pause(PutAt::Claiming);
+        }
+        let mut kept = false;
+        #[cfg(test)]
+        let mut paused = false;
+        for table in tier.prev.iter().chain([&tier.delta]) {
+            let spot = Spot::new(header.key, header.content, Place::Segment(seg), ticket);
+            match table.insert(look.held, spot) {
+                Ok((row, _)) => {
+                    if !kept {
+                        // Kept before anything else can panic: the key now names these bytes,
+                        // so the writer's next record must not be written over them.
+                        self.at += span;
+                        kept = true;
+                    }
+                    table.set_flag(row, Flag::New as usize);
+                    // The first table won is `prev` whenever the view has one.
+                    #[cfg(test)]
+                    if let Some(pause) = &self.pause
+                        && tier.prev.is_some()
+                        && !std::mem::replace(&mut paused, true)
+                    {
+                        pause(PutAt::InPrev);
+                    }
+                }
+                // Lost in the delta, or in a `prev` no longer the store's, which the delta
+                // decides (`Own::lost_in_prev`).
+                Err((_, (_, there))) if !kept && tier.prev.is_none() => return Err((there.content, there.ticket)),
+                Err((_, (row, there))) if !kept => {
+                    let prev = tier.prev.as_deref().expect("a view with `prev`, the arm above");
+                    return Err(self.lost_in_prev(look, prev, row, there, &tier.delta));
+                }
+                // Won in `prev`, and the delta holds this spot already: a claim that lost in
+                // `prev` put it there (`Own::lost_in_prev`), or `end_migration` copied it. It is
+                // this put's record.
+                Err((_, (row, there))) if there.place == Place::Segment(seg) => {
+                    table.set_flag(row, Flag::New as usize);
+                }
+                // Won in `prev`, and the delta holds another record of the same value. With a
+                // stale view, another writer's, which the drain sorts (`Store::record_home`).
+                // With a fresh one, the pack spot of a chunk's copy (`COPY`): its move took
+                // this claim's spot in `prev` while this claim was between its inserts
+                // (`Store::copy_home`) and put the pack spot into the delta too, so this
+                // record drains as a duplicate.
+                Err((_, (_, there))) if there.content == header.content => {}
+                Err((_, (_, there))) => return Err((there.content, there.ticket)),
             }
-            Err((_, (_, there))) => Err((there.content, there.ticket)),
+        }
+        Ok(())
+    }
+
+    /// What a claim that lost `prev`'s slot to `there` (at `row`) meets: the delta's spot of the
+    /// key.
+    ///
+    /// While `prev` is the store's, the delta holds the key only at the place `prev` holds it
+    /// (see [`Own::claim`]), so its answer is `prev`'s. Once `end_migration` has run, `prev` is
+    /// no store's table and `there` may be a put the delta refused: a writer that won the dead
+    /// `prev` and met another value in the delta, its put a [`Mismatch`] and its ticket no key's
+    /// home. Taking that ticket would end this put `Ok` on a record the key never reads (review
+    /// 12, L1), so the delta decides.
+    ///
+    /// The delta can lack the key, at a segment place: while the claim that won `prev`'s slot
+    /// is between its two inserts, or after a claim from a view older than the swap, whose
+    /// delta `prev` was, put it there alone. This claim then puts `there` into the delta, so the
+    /// delta's answer is fixed before this put ends: a writer with a fresh view can no longer
+    /// win the delta after this put took `there`'s ticket, and a claim still between its
+    /// inserts meets its own place there and is kept. `there` is what `prev` held when this
+    /// claim lost, and a move may have taken it since: of the record of a claim that ended, or
+    /// of a chunk's copy standing in for a record whose claim is still between its inserts
+    /// (`Store::copy_home`). A move of `prev`'s spot during a swap also puts its pack spot into
+    /// the delta
+    /// (`Store::finish_batches`), so the two meet at the delta's one slot: a copy put first is
+    /// replaced by the move, and a copy put after is refused and answers with the pack spot.
+    ///
+    /// At a pack place, `there` was moved: the record of a claim that ended, or a chunk's copy
+    /// standing in for a record whose claim may still be between its inserts. The delta holds
+    /// it (found here: a move during the swap put it there too), or it was moved before the
+    /// swap and the fold will copy it, or the index holds it, which the swap and the fold leave
+    /// out. Its content and ticket are the key's, and a move never changes them.
+    fn lost_in_prev(
+        &self,
+        look: Look<'_>,
+        prev: &Table<Spot>,
+        row: u64,
+        there: &Spot,
+        delta: &Table<Spot>,
+    ) -> (ContentId, Ticket) {
+        #[cfg(test)]
+        if let Some(pause) = &self.pause {
+            pause(PutAt::LostInPrev);
+        }
+        if let Some((_, kept)) = delta.get(look.held, &there.key) {
+            return (kept.content, kept.ticket);
+        }
+        if !matches!(there.place, Place::Segment(_)) {
+            return (there.content, there.ticket);
+        }
+        match delta.insert(look.held, there.at(there.place)) {
+            Ok((at, _)) => {
+                carry_flags(prev, row, delta, at);
+                (there.content, there.ticket)
+            }
+            Err((_, (_, kept))) => (kept.content, kept.ticket),
         }
     }
 
     /// Writes a record no key will point at, kept for its bytes (see [`COPY`]).
     fn write_copy(&mut self, unit: Unit, header: &RecordHeader, payload: &[u8]) {
-        let (_, span) = self.write(unit, header, payload, COPY);
-        self.at += span;
+        if let Some((_, span)) = self.write(unit, header, payload, COPY) {
+            self.at += span;
+        }
     }
 
     /// Writes a record at the writer's next bytes, not yet kept: gives its place and length.
-    pub(crate) fn write(&mut self, unit: Unit, header: &RecordHeader, payload: &[u8], copy: u8) -> (Seg, u64) {
+    /// `None` for a record whose span with its frame reaches [`MOST_BYTES`]: it writes nothing
+    /// and stops the store on it, naming the record's key ([`Segment::failed`]).
+    pub(crate) fn write(
+        &mut self,
+        unit: Unit,
+        header: &RecordHeader,
+        payload: &[u8],
+        copy: u8,
+    ) -> Option<(Seg, u64)> {
         assert_eq!(payload.len() as u64, header.stored, "a record's payload is its stored length");
         let span = FRAME + header.span();
+        // Every form's exact length, checked before a chunk is made for it: a chunk's cap is
+        // the larger of `CHUNK` and the span it was rolled for, so each stays below the bound.
+        if span >= MOST_BYTES {
+            // alloc: the store's failure, once: it stops on it
+            _ = self.segment.failed.set(format!(
+                "segment {}: the {} record of {:x}, {span} bytes with its frame ({:?}, {} raw), \
+                 reaches a segment chunk's bound of {MOST_BYTES} bytes",
+                self.segment.number,
+                header.kind.name(),
+                header.key.0,
+                header.form,
+                header.raw,
+            ));
+            return None;
+        }
         if self.at + span > self.tail().cap() {
             self.roll(span);
         }
@@ -527,7 +810,7 @@ impl Own {
             stored: header.stored,
             raw: header.raw,
         };
-        (seg, span)
+        Some((seg, span))
     }
 
     /// Keeps and publishes the record [`Own::write`] wrote last, `span` bytes: for the store's
@@ -553,10 +836,27 @@ impl Own {
         self.puts_here = 0;
     }
 
+    /// Rolls to a new chunk when one more put would pass what a chunk counts ([`MOST_PUTS`]):
+    /// run before a put is counted, so its [`Own::end_put`] (in [`Counted`]'s drop, perhaps in
+    /// an unwind) never meets [`Chunk::publish`]'s bound.
+    fn room_for_a_put(&mut self) {
+        if self.puts_here + 1 >= MOST_PUTS {
+            self.roll(0);
+        }
+    }
+
     fn end_put(&mut self) {
+        let puts_here = self.puts_here + 1;
+        // Published before `puts`/`puts_here` move, so they never pass what the chunk
+        // published. `made` was stored at the count (`Own::put`), so a panic here would leave
+        // it one ahead: what keeps `publish` from refusing are the bounds checked before the
+        // put was counted (`room_for_a_put`) and before each record is written (`write`).
+        self.tail().publish(self.at, puts_here);
         self.puts += 1;
-        self.puts_here += 1;
-        self.tail().publish(self.at, self.puts_here);
+        self.puts_here = puts_here;
+        // After the publish: a load of `made` that sees this count sees the record published,
+        // so a commit begun after it drains the put.
+        self.segment.made.store(self.puts, Ordering::Release);
     }
 }
 

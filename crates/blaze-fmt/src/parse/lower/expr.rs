@@ -16,6 +16,17 @@ impl Lower<'_> {
         self.expr_with(e, ThinVec::new())
     }
 
+    /// `form` at `span`, which the formatter cannot format yet: refused, an error expression.
+    fn comptime_unsupported(&self, span: Span, form: &str) -> Box<ast::Expr> {
+        // alloc: the refusal's message, an error path
+        self.unsupported(span, format!("{form} is not supported by the formatter yet"));
+        self.mk_expr(
+            span,
+            ast::ExprKind::Err(ast::ErrorGuaranteed::unchecked_error_guaranteed()),
+            ThinVec::new(),
+        )
+    }
+
     pub(crate) fn expr_err(&self, span: Span) -> Box<ast::Expr> {
         self.unsupported(span, "an expression rust-analyzer did not parse");
         self.mk_expr(
@@ -114,6 +125,17 @@ impl Lower<'_> {
                     None => return self.expr_err(span),
                 };
                 ast::ExprKind::Field(self.opt_expr(f.expr(), span), ident)
+            }
+            // blaze's `#![feature(blaze_comptime)]` forms have no rustc AST: refused rather
+            // than formatted as the plain `for` or index they would lose their mark to.
+            ra::Expr::ForExpr(f) if f.const_token().is_some() => {
+                return self.comptime_unsupported(span, "`for const` (`#![feature(blaze_comptime)]`)");
+            }
+            ra::Expr::IndexExpr(i) if i.dot_token().is_some() => {
+                return self.comptime_unsupported(
+                    span,
+                    "a reflected field access `base.[field]` (`#![feature(blaze_comptime)]`)",
+                );
             }
             ra::Expr::ForExpr(f) => {
                 let label = self.label(f.label());

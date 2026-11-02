@@ -317,6 +317,22 @@ where
             return cand;
         }
 
+        // blaze: an integer of an arbitrary width (`#[blaze::arbitrary_ints]`) is `Copy` here,
+        // with no constituents: core cannot write `impl<T: ArbitraryInt> Copy for T` (E0206).
+        // Its `Clone` and `TrivialClone` are impls in core, as the standard widths' are.
+        let arbitrary_width = match goal.predicate.self_ty().kind() {
+            ty::Int(int) => int.arbitrary_width().is_some(),
+            ty::Uint(uint) => uint.arbitrary_width().is_some(),
+            _ => false,
+        };
+        if arbitrary_width
+            && ecx.cx().is_trait_lang_item(goal.predicate.def_id(), SolverTraitLangItem::Copy)
+        {
+            return ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
+                ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+            });
+        }
+
         ecx.probe_and_evaluate_goal_for_constituent_tys(
             CandidateSource::BuiltinImpl(BuiltinImplSource::Misc),
             goal,
@@ -916,6 +932,68 @@ where
                 _ => Err(NoSolution.into()),
             }
         })
+    }
+
+    /// blaze: a marker of `#[blaze::arbitrary_ints]`. Its self type is never a type variable
+    /// here (the goal is ambiguous before builtins are asked); a type variable as the source of
+    /// `IntFrom` or `IntTryFrom` is ambiguous. Every goal of a type that is not an integer is
+    /// refused before any probe.
+    fn consider_builtin_int_marker_candidate(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+        marker: structural_traits::IntMarker,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        use structural_traits::{IntMarker, int_marker_holds};
+
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
+            return Err(NoSolution.into());
+        }
+        let self_ty = goal.predicate.self_ty();
+        match marker {
+            IntMarker::Arbitrary | IntMarker::Signed => {
+                if !int_marker_holds::<I>(marker, self_ty, None) {
+                    return Err(NoSolution.into());
+                }
+                ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
+                    ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+                })
+            }
+            IntMarker::From | IntMarker::TryFrom => {
+                if !matches!(self_ty.kind(), ty::Int(_) | ty::Uint(_)) {
+                    return Err(NoSolution.into());
+                }
+                ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
+                    let source = ecx.structurally_normalize_ty(
+                        goal.param_env,
+                        goal.predicate.trait_ref.args.type_at(1),
+                    )?;
+                    if let ty::Infer(ty::TyVar(_)) = source.kind() {
+                        return ecx
+                            .evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS);
+                    }
+                    if !int_marker_holds::<I>(marker, self_ty, Some(source)) {
+                        return Err(NoSolution.into());
+                    }
+                    ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+                })
+            }
+        }
+    }
+
+    fn consider_builtin_reflect_candidate(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+        item: SolverTraitLangItem,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        use crate::solve::reflect::{domain_of, reflect_trait_holds};
+
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
+            return Err(NoSolution.into());
+        }
+        let answer = reflect_trait_holds(ecx.cx(), item, goal.predicate.self_ty());
+        let base = domain_of(item).map(|_| goal.predicate.trait_ref.args.type_at(1));
+        ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc)
+            .enter(|ecx| ecx.reflect_candidate_response(goal.param_env, answer, base))
     }
 
     fn consider_builtin_field_candidate(

@@ -186,6 +186,9 @@ pub(super) struct HashedProfile<'a> {
     strip: StripInner,
     rustflags: &'a [String],
     pub trim_paths: TrimPaths,
+    /// blaze's `contract-checks`, which cargo's profile does not have: hashed as whether it
+    /// differs from `debug_assertions`, and only when it does (see [`Hash`] below).
+    contract_checks_apart: bool,
 }
 
 impl<'a> HashedProfile<'a> {
@@ -217,6 +220,7 @@ impl<'a> HashedProfile<'a> {
             strip,
             rustflags: &profile.rustflags,
             trim_paths: TrimPaths::of(profile.trim_paths.as_ref())?,
+            contract_checks_apart: profile.contract_checks != profile.debug_assertions,
         })
     }
 }
@@ -235,6 +239,13 @@ impl Hash for HashedProfile<'_> {
         (self.incremental, self.panic, &self.strip).hash(into);
         self.rustflags.hash(into);
         self.trim_paths.hash(into);
+        // `debug_assertions` is hashed above, so its pair with `contract_checks` is told apart
+        // by this bit; written only when set, so a profile whose contract checks follow its
+        // debug assertions (`dev`, `release` and their defaults) keeps cargo's hash, and with
+        // it every file and symbol name.
+        if self.contract_checks_apart {
+            "blaze contract-checks".hash(into);
+        }
     }
 }
 

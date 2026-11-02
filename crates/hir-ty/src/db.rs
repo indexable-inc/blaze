@@ -1209,7 +1209,14 @@ pub fn signature_anon_consts_and_diagnostics<'db>(
         GenericDefId::StaticId(def) => {
             push(&mut result, db.type_for_static_with_diagnostics(def).as_lowered())
         }
-        GenericDefId::TraitId(_) | GenericDefId::AdtId(_) => {}
+        GenericDefId::TraitId(id) => {
+            // Only cycles are reported from these: the rest of their clauses' diagnostics are
+            // the predicates' above.
+            for clauses in crate::lower::trait_clauses_with_diagnostics(db, id) {
+                push(&mut result, clauses);
+            }
+        }
+        GenericDefId::AdtId(_) => {}
     }
 
     return result;
@@ -1360,6 +1367,8 @@ pub mod kinds {
         CRATE_TARGET_ARCH = 0x2458, "crate_target_arch";
         DECLARED_TARGET_FEATURES = 0x2459, "declared_target_features";
         CRATE_TARGET_FEATURES = 0x245a, "crate_target_features";
+        FIELD_ORDER = 0x245e, "FieldOrder";
+        FIELD_RANKS = 0x245f, "field_ranks";
 
         // Method resolution, impls, coherence, specialization.
         LOOKUP_IMPL_METHOD = 0x2460, "lookup_impl_method_stored";
@@ -1504,6 +1513,7 @@ pub mod kinds {
         use std::path::Path;
 
         use blaze_hash::HashSet;
+        use std::alloc::Global;
 
         use super::*;
 
@@ -1511,8 +1521,8 @@ pub mod kinds {
         fn kinds_are_distinct_and_hir_tys() {
             assert!(blaze_query::kinds::FRONT.start <= RANGE.start);
             assert!(RANGE.end <= blaze_query::kinds::FRONT.end);
-            let mut numbers = HashSet::default();
-            let mut names = HashSet::default();
+            let mut numbers = HashSet::new_in(Global);
+            let mut names = HashSet::new_in(Global);
             for &(kind, name) in ALL {
                 assert!(RANGE.contains(&kind.0), "{name}: {:#x} is not hir-ty's", kind.0);
                 assert!(numbers.insert(kind), "{name}: {:#x} is given twice", kind.0);

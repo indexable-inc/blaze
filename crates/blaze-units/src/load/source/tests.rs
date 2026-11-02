@@ -170,6 +170,7 @@ fn open(db: &Database, tree: &MemTree, files: &[(&str, &str)], mounts: Vec<Mount
         host: "x86_64-unknown-linux-gnu".to_owned(),
         library: "/rustc/0/library".to_owned(),
         std: "/s/std".to_owned(),
+        builds: "/s/build".to_owned(),
     };
     db.open_with(View { root: tree.root(&files) }, &config.encode())
 }

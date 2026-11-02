@@ -16,6 +16,7 @@
 //! allocation on a lookup.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 mod arrangement;
 mod closure;

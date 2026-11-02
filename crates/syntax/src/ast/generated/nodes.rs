@@ -704,6 +704,8 @@ impl Fn {
     #[inline]
     pub fn ret_type(&self) -> Option<RetType> { support::child(&self.syntax) }
     #[inline]
+    pub fn spec_clauses(&self) -> AstChildren<SpecClause> { support::children(&self.syntax) }
+    #[inline]
     pub fn semicolon_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![;]) }
     #[inline]
     pub fn async_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![async]) }
@@ -755,6 +757,8 @@ impl ast::HasAttrs for ForExpr {}
 impl ForExpr {
     #[inline]
     pub fn pat(&self) -> Option<Pat> { support::child(&self.syntax) }
+    #[inline]
+    pub fn const_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![const]) }
     #[inline]
     pub fn for_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![for]) }
     #[inline]
@@ -918,6 +922,8 @@ pub struct IndexExpr {
 impl ast::HasAttrs for IndexExpr {}
 impl IndexExpr {
     #[inline]
+    pub fn dot_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![.]) }
+    #[inline]
     pub fn l_brack_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T!['[']) }
     #[inline]
     pub fn r_brack_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![']']) }
@@ -1052,6 +1058,8 @@ pub struct LoopExpr {
 impl ast::HasAttrs for LoopExpr {}
 impl ast::HasLoopBody for LoopExpr {}
 impl LoopExpr {
+    #[inline]
+    pub fn spec_clauses(&self) -> AstChildren<SpecClause> { support::children(&self.syntax) }
     #[inline]
     pub fn loop_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![loop]) }
 }
@@ -1658,6 +1666,8 @@ pub struct RetType {
 }
 impl RetType {
     #[inline]
+    pub fn pat(&self) -> Option<Pat> { support::child(&self.syntax) }
+    #[inline]
     pub fn ty(&self) -> Option<Type> { support::child(&self.syntax) }
     #[inline]
     pub fn thin_arrow_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![->]) }
@@ -1721,6 +1731,23 @@ impl SliceType {
     pub fn l_brack_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T!['[']) }
     #[inline]
     pub fn r_brack_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![']']) }
+}
+pub struct SpecClause {
+    pub(crate) syntax: SyntaxNode,
+}
+impl SpecClause {
+    #[inline]
+    pub fn exprs(&self) -> AstChildren<Expr> { support::children(&self.syntax) }
+    #[inline]
+    pub fn decreases_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![decreases]) }
+    #[inline]
+    pub fn ensures_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![ensures]) }
+    #[inline]
+    pub fn invariant_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![invariant]) }
+    #[inline]
+    pub fn recommends_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![recommends]) }
+    #[inline]
+    pub fn requires_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![requires]) }
 }
 pub struct SourceFile {
     pub(crate) syntax: SyntaxNode,
@@ -2222,6 +2249,8 @@ pub struct WhileExpr {
 }
 impl ast::HasAttrs for WhileExpr {}
 impl WhileExpr {
+    #[inline]
+    pub fn spec_clauses(&self) -> AstChildren<SpecClause> { support::children(&self.syntax) }
     #[inline]
     pub fn while_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![while]) }
 }
@@ -6876,6 +6905,38 @@ impl fmt::Debug for SliceType {
         f.debug_struct("SliceType").field("syntax", &self.syntax).finish()
     }
 }
+impl AstNode for SpecClause {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        SPEC_CLAUSE
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == SPEC_CLAUSE }
+    #[inline]
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> &SyntaxNode { &self.syntax }
+}
+impl hash::Hash for SpecClause {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.syntax.hash(state); }
+}
+impl Eq for SpecClause {}
+impl PartialEq for SpecClause {
+    fn eq(&self, other: &Self) -> bool { self.syntax == other.syntax }
+}
+impl Clone for SpecClause {
+    fn clone(&self) -> Self { Self { syntax: self.syntax.clone() } }
+}
+impl fmt::Debug for SpecClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpecClause").field("syntax", &self.syntax).finish()
+    }
+}
 impl AstNode for SourceFile {
     #[inline]
     fn kind() -> SyntaxKind
@@ -11048,6 +11109,11 @@ impl std::fmt::Display for SlicePat {
     }
 }
 impl std::fmt::Display for SliceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
+impl std::fmt::Display for SpecClause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self.syntax(), f)
     }

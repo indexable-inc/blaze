@@ -35,6 +35,7 @@ fn profile(name: &str, opt_level: &str, backend: Option<&str>) -> Profile {
         rustflags: Vec::new(),
         trim_paths: None,
         hint_mostly_unused: None,
+        contract_checks: true,
     }
 }
 
@@ -234,6 +235,7 @@ fn kept(path: &str, output: &blaze_link::Output) -> KeptImage {
         statics: Vec::new(),
         natives: Vec::new(),
         names: Vec::new(),
+        layout: None,
     };
     KeptImage { path: path.to_owned(), kept }
 }
@@ -268,28 +270,36 @@ fn how_a_link_went_is_first_only_with_nothing_kept() {
 }
 
 /// The image kept at a path is the one the link stages against, taken out of the kept images;
-/// one of another output is let go only once its replacement is made.
+/// one of another output, or laid out by another profile, is let go only once its replacement
+/// is made.
 #[test]
-fn a_kept_image_is_taken_only_for_its_own_output() {
+fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
     let (path, output) = ("/w/target/debug/libm.so", shared(&["f"]));
     let mut images = vec![kept(path, &output)];
-    let (linked, changed) = kept_image(&mut images, path, &output).unwrap();
-    assert_eq!((linked.functions.len(), changed), (1, Some(OutputFields::default())));
+    let (linked, changed, relaid) = kept_image(&mut images, path, &output, None).unwrap();
+    assert_eq!((linked.functions.len(), changed, relaid), (1, Some(OutputFields::default()), false));
     assert!(images.is_empty(), "taken out for the link");
 
     images.push(KeptImage { path: path.to_owned(), kept: linked });
+    let heat = Some(ContentId([3; 32]));
+    let (fresh, changed, relaid) = kept_image(&mut images, path, &output, heat).unwrap();
+    assert!(fresh.functions.is_empty() && fresh.layout == heat && relaid, "another profile: laid out again");
+    assert_eq!(changed, Some(OutputFields::default()));
+    assert!(images.is_empty(), "the image of the old layout is let go");
+
+    images.push(KeptImage { path: path.to_owned(), kept: fresh });
     let other = shared(&["f", "g"]);
-    let (fresh, changed) = kept_image(&mut images, path, &other).unwrap();
+    let (fresh, changed, _) = kept_image(&mut images, path, &other, heat).unwrap();
     assert!(fresh.functions.is_empty() && fresh.output == other);
     assert_eq!(changed.map(|it| it.to_string()).as_deref(), Some("exports"));
     assert!(images.is_empty(), "the image of the old output is let go");
 
-    let (fresh, changed) = kept_image(&mut images, path, &output).unwrap();
-    assert!(fresh.functions.is_empty() && changed.is_none(), "nothing kept: a first link");
+    let (fresh, changed, relaid) = kept_image(&mut images, path, &output, None).unwrap();
+    assert!(fresh.functions.is_empty() && changed.is_none() && !relaid, "nothing kept: a first link");
 
     let unnamed = "/w/../libm.so";
     let mut images = vec![kept("/w/target/debug/libm.so", &output), KeptImage { path: unnamed.into(), ..kept(path, &output) }];
-    let error = kept_image(&mut images, unnamed, &other).err().expect("a path the linker can't name");
+    let error = kept_image(&mut images, unnamed, &other, None).err().expect("a path the linker can't name");
     assert!(matches!(error, LinkCause::Unnamed), "{error}");
     assert_eq!(images.len(), 2, "a link that fails before staging leaves the kept images as they were");
 }

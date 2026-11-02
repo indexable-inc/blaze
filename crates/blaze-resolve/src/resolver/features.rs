@@ -48,6 +48,7 @@ use cargo_platform::Platform;
 
 use super::types::{FeaturesSet, ResolveBehavior};
 use super::{CargoResult, HashMap, HashSet};
+use std::alloc::Global;
 use crate::dependency::{DepKind, Dependency};
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
@@ -77,7 +78,7 @@ pub enum CompileKind {
 pub type PackageFeaturesKey = (PackageId, FeaturesFor);
 /// Map of activated features.
 // BTreeSet: grown while resolving and read in order by every `activated_features` call.
-pub type ActivateMap = HashMap<PackageFeaturesKey, BTreeSet<InternedString>>;
+pub type ActivateMap = HashMap<PackageFeaturesKey, BTreeSet<InternedString>, Global>;
 
 /// Set of all activated features for all packages in the resolve graph.
 pub struct ResolvedFeatures {
@@ -378,7 +379,7 @@ pub struct FeatureResolver<'a, T> {
     activated_dependencies: ActivateMap,
     /// Keeps track of which packages have had its dependencies processed.
     /// Used to avoid cycles, and to speed up processing.
-    processed_deps: HashSet<PackageFeaturesKey>,
+    processed_deps: HashSet<PackageFeaturesKey, Global>,
     /// If this is `true`, then a non-default `feature_key` needs to be tracked while
     /// traversing the graph.
     ///
@@ -396,7 +397,7 @@ pub struct FeatureResolver<'a, T> {
     /// dependency will trigger the addition of new features. The value is the
     /// set of features to activate.
     deferred_weak_dependencies:
-        HashMap<(PackageId, FeaturesFor, InternedString), HashSet<InternedString>>,
+        HashMap<(PackageId, FeaturesFor, InternedString), HashSet<InternedString, Global>, Global>,
 }
 
 impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
@@ -418,11 +419,11 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
             requested_targets,
             resolve,
             opts,
-            activated_features: HashMap::default(),
-            activated_dependencies: HashMap::default(),
-            processed_deps: HashSet::default(),
+            activated_features: HashMap::new_in(Global),
+            activated_dependencies: HashMap::new_in(Global),
+            processed_deps: HashSet::new_in(Global),
             track_for_host,
-            deferred_weak_dependencies: HashMap::default(),
+            deferred_weak_dependencies: HashMap::new_in(Global),
         };
         r.do_resolve(member_features)?;
         tracing::debug!("features={:#?}", r.activated_features);

@@ -15,14 +15,21 @@
 //! name of a rename, is told as its directory's names changed ([`Lost::Unnamed`]). A record
 //! that has its name (an elevated reader's) is named from its parent with no call at all.
 //! Records whose parent is outside the watched directory cost one lookup in a map.
+//!
+//! A flush of the watch ([`crate::Effect::Flush`]) is marked with the journal's `NextUsn`,
+//! queried after it was asked ([`mark`]), and told once every record before that is told
+//! ([`crate::journal::barrier`]): nothing is written for it. While a flush waits, reads are
+//! asked without waiting, so one returns at the journal's end even when no record comes.
 
 use std::{
     fmt, io,
     os::windows::io::{AsRawHandle as _, OwnedHandle},
     path::Path,
+    sync::Arc,
 };
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use windows_sys::Win32::{
     Foundation::{
         ERROR_ACCESS_DENIED, ERROR_CANT_ACCESS_FILE, ERROR_DELETE_PENDING, ERROR_FILE_NOT_FOUND,
@@ -57,7 +64,7 @@ use windows_sys::Win32::{
 };
 
 use super::sys;
-use crate::{Cursor, FileName, Journaled, Lost};
+use crate::{Cursor, FileName, Journaled, Lost, journal::barrier::At};
 
 /// What one read of the journal fills at most.
 const BUFFER: usize = 256 << 10;
@@ -241,11 +248,11 @@ impl How {
 pub(super) struct Names {
     dir: FileName,
     root: u128,
-    dirs: HashMap<u128, Place>,
+    dirs: HashMap<u128, Place, Global>,
     /// The names [`Place`]s point at; the watched directory's is the first.
     paths: Vec<FileName>,
     /// Files of this read already named where they are now.
-    seen: HashSet<u128>,
+    seen: HashSet<u128, Global>,
     files: Vec<FileName>,
     lost: Vec<(FileName, Lost)>,
     /// The watched directory itself moved or went: the watch ends after this read.
@@ -255,7 +262,7 @@ pub(super) struct Names {
 
 impl Names {
     pub(super) fn new(dir: FileName, root: u128) -> Names {
-        let mut dirs = HashMap::default();
+        let mut dirs = HashMap::new_in(Global);
         dirs.insert(root, Place::Under(0));
         // alloc: setup, once per watch; the buffers are reused for its life.
         Names {
@@ -264,7 +271,7 @@ impl Names {
             dir,
             root,
             dirs,
-            seen: HashSet::default(),
+            seen: HashSet::new_in(Global),
             // alloc: setup.
             files: Vec::new(),
             lost: Vec::new(), // alloc: setup.
@@ -682,10 +689,28 @@ fn query(handle: &OwnedHandle) -> io::Result<USN_JOURNAL_DATA_V1> {
     Ok(data)
 }
 
-/// What one read and its records came to: a batch to tell, and the watch's end with why.
+/// Where the volume's journal ends now, through a synchronous handle of it: a flush's mark.
+/// Any user may ask (the handle is opened for traversal only, as [`Journal::open`] opens it).
+pub(super) fn mark(querier: &OwnedHandle) -> io::Result<At> {
+    query(querier).map(|data| At { journal: data.UsnJournalID, usn: data.NextUsn })
+}
+
+/// What one read and its records came to: a batch to tell, the watch's end with why, and,
+/// unless it ended, how far it has told.
 pub(super) struct Taken {
     pub(super) batch: Option<Box<Journaled>>,
     pub(super) end: Option<String>,
+    pub(super) read: Option<Read>,
+}
+
+/// How far a watch has told, after a read and its batch: what a flush's mark is compared with.
+#[derive(Clone, Copy)]
+pub(super) struct Read {
+    /// Every record before it is told: the next USN to read once nothing gathered waits to
+    /// be told, else the cursor of the last batch.
+    pub(super) told: At,
+    /// The read was asked without waiting and moved no further.
+    pub(super) stalled: bool,
 }
 
 /// A watch of the journal: the volume's handles, where the read is, and the names it makes.
@@ -694,8 +719,9 @@ pub(super) struct Journal {
     volume: Volume,
     /// The volume, overlapped on the port: the reads.
     reader: OwnedHandle,
-    /// The volume, synchronous: the queries.
-    querier: OwnedHandle,
+    /// The volume, synchronous: the queries, and a flush's mark, which the driver asks on its
+    /// threads while a read holds the journal.
+    querier: Arc<OwnedHandle>,
     /// The watched directory as the system names it, for errors.
     shown: String,
     serial: u64,
@@ -705,6 +731,8 @@ pub(super) struct Journal {
     /// The `NextUsn` the watch began at: its history ends there.
     target: i64,
     caught_up: bool,
+    /// A flush waits: the next read is asked without waiting.
+    hurry: bool,
     /// The cursor's USN of the last batch told.
     told: i64,
     /// The request the kernel reads while a read is in flight (`METHOD_NEITHER`: in place), in
@@ -757,6 +785,8 @@ impl Journal {
         let mut device = scratch[..end].to_vec();
         device.push(0);
         let querier = open(&device, FILE_TRAVERSE, 0).map_err(|it| context("opening its volume", it))?;
+        // alloc: setup, shared with the flushes' marks for the watch's life.
+        let querier = Arc::new(querier);
         let reader = open(&device, FILE_TRAVERSE, FILE_FLAG_OVERLAPPED).map_err(|it| context("opening its volume", it))?;
         let data = query(&querier).map_err(|error| match error.raw_os_error().map(|it| it as u32) {
             // alloc: an error path.
@@ -798,6 +828,7 @@ impl Journal {
             next,
             target: now,
             caught_up: next >= now,
+            hurry: false,
             told: next,
             input: READ_USN_JOURNAL_DATA_V1::default(),
             // alloc: setup, the one buffer every read of the watch fills.
@@ -811,6 +842,36 @@ impl Journal {
     /// The volume handle the reads are on: what the port is told of and a cancel names.
     pub(super) fn raw(&self) -> HANDLE {
         self.reader.as_raw_handle()
+    }
+
+    /// The synchronous handle of the volume a flush's [`mark`] is asked through.
+    pub(super) fn querier(&self) -> Arc<OwnedHandle> {
+        // clone: an `Arc`, once per watch as it opens.
+        Arc::clone(&self.querier)
+    }
+
+    /// The watched directory as the system names it, for errors.
+    pub(super) fn shown(&self) -> &str {
+        &self.shown
+    }
+
+    /// Whether the next read is asked without waiting, as it is while a flush waits.
+    pub(super) fn set_hurry(&mut self, hurry: bool) {
+        self.hurry = hurry;
+    }
+
+    /// Whether the read last asked waits for a record: one a flush must cancel to be told.
+    pub(super) fn waits(&self) -> bool {
+        self.input.BytesToWaitFor != 0
+    }
+
+    /// How far the watch has told, `stalled` as the read was.
+    pub(super) fn reached(&self, stalled: bool) -> Read {
+        let usn = match self.names.is_empty() {
+            true => self.next,
+            false => self.told,
+        };
+        Read { told: At { journal: self.journal, usn }, stalled }
     }
 
     /// Asks for the next records, completing on the port through `overlapped`. The request
@@ -831,7 +892,9 @@ impl Journal {
             // Ignored on an overlapped handle: a live read waits until a record comes or it is
             // cancelled.
             Timeout: 0,
-            BytesToWaitFor: u64::from(self.caught_up),
+            // Live, a read waits for a record, unless a flush waits: then it returns at once, at
+            // the journal's end, which is past the flush's mark.
+            BytesToWaitFor: u64::from(self.caught_up && !self.hurry),
             UsnJournalID: self.journal,
             MinMajorVersion: 2,
             MaxMajorVersion: 3,
@@ -885,6 +948,7 @@ impl Journal {
     /// The batch to tell after a read from `start`, if one is due, and the end if the watched
     /// directory moved.
     fn after(&mut self, start: i64) -> Taken {
+        let stalled = !self.waits() && self.next == start;
         let mut tell = false;
         if !self.caught_up && (self.next >= self.target || self.next == start) {
             self.caught_up = true;
@@ -897,7 +961,8 @@ impl Journal {
         if self.names.root_changed {
             return self.end(format_args!("the watched directory was moved, replaced or removed: it is to be watched again"));
         }
-        Taken { batch: tell.then(|| self.batch()), end: None }
+        let batch = tell.then(|| self.batch());
+        Taken { batch, end: None, read: Some(self.reached(stalled)) }
     }
 
     fn batch(&mut self) -> Box<Journaled> {
@@ -916,7 +981,7 @@ impl Journal {
     fn end(&mut self, why: fmt::Arguments<'_>) -> Taken {
         let batch = (!self.names.is_empty()).then(|| self.batch());
         // alloc: the watch's end, once.
-        Taken { batch, end: Some(format!("the USN journal of {}: {why}", self.shown)) }
+        Taken { batch, end: Some(format!("the USN journal of {}: {why}", self.shown)), read: None }
     }
 
     /// The journal read again from its `NextUsn` now, after what is between being `lost`.
@@ -926,7 +991,8 @@ impl Journal {
         self.target = data.NextUsn;
         self.caught_up = true;
         self.names.lose_all(lost);
-        Taken { batch: Some(self.batch()), end: None }
+        let batch = Some(self.batch());
+        Taken { batch, end: None, read: Some(self.reached(false)) }
     }
 
     fn failed(&mut self, error: io::Error) -> Taken {
@@ -974,7 +1040,7 @@ mod tests {
     /// A volume as a map of where each reference number is now.
     #[derive(Default)]
     struct Fake {
-        now: HashMap<u128, Found>,
+        now: HashMap<u128, Found, Global>,
         moved: bool,
         asked: Vec<u128>,
     }

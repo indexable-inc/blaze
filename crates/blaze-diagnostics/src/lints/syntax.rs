@@ -29,9 +29,10 @@ mod early;
 pub(crate) use self::early::validation::pretty;
 pub use check_cfg::CheckCfg;
 
-use std::collections::hash_map::Entry;
+use blaze_hash::hash_map::Entry;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use cfg::{CfgExpr, CfgOptions};
@@ -196,9 +197,9 @@ pub(crate) struct Walk<'db> {
     pub(crate) trees: Vec<Tree<'db>>,
     /// The crate's cfg: `--cfg` and the target's.
     pub(crate) cfg: &'db CfgOptions,
-    index: HashMap<HirFileId, usize>,
+    index: HashMap<HirFileId, usize, Global>,
     /// Each module of the crate by the order rustc checks it in (`checks::modules`).
-    modules: HashMap<hir::Module, usize>,
+    modules: HashMap<hir::Module, usize, Global>,
 }
 
 impl<'db> Walk<'db> {
@@ -208,11 +209,11 @@ impl<'db> Walk<'db> {
             // alloc: setup, the walk is made once per check (`Cx::walk`)
             trees: Vec::new(),
             cfg: cx.krate.cfg(cx.db),
-            index: HashMap::default(),
+            index: HashMap::new_in(Global),
             // alloc: setup, as above
             modules: modules.iter().enumerate().map(|(rank, it)| (*it, rank)).collect(),
         };
-        let mut places: HashMap<HirFileId, Vec<(u32, u32)>> = HashMap::default();
+        let mut places: HashMap<HirFileId, Vec<(u32, u32)>, Global> = HashMap::new_in(Global);
         for module in modules {
             let Some(file) = module.as_source_file_id(cx.db) else { continue };
             let file_id = HirFileId::from(file);
@@ -564,7 +565,7 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
 /// rustc's `par_hir_for_each_module`), in it every item whose module it is, then for the
 /// crate root the crate's own attributes. A module file's inner attributes are of its `mod`
 /// item, checked in the module that has it.
-fn checked_in(cx: &Cx<'_, '_>, modules: &HashMap<hir::Module, usize>, at: InFile<SyntaxNodePtr>) -> (usize, bool) {
+fn checked_in(cx: &Cx<'_, '_>, modules: &HashMap<hir::Module, usize, Global>, at: InFile<SyntaxNodePtr>) -> (usize, bool) {
     let node = cx.syntax_view(at);
     let rank = |module: hir::Module| modules.get(&module).copied().unwrap_or(usize::MAX);
     if let Some(file) = ast::SourceFile::cast(node.value) {
@@ -866,8 +867,8 @@ extern "C" {
                 let mut again = Walk {
                     trees: Vec::with_capacity(1),
                     cfg: walk.cfg,
-                    index: HashMap::with_capacity_and_hasher(1, Default::default()),
-                    modules: HashMap::default(),
+                    index: HashMap::with_capacity_in(1, Global),
+                    modules: HashMap::new_in(Global),
                 };
                 blaze_alloc_count::assert_at_most(4, "the walk of a tree", || {
                     again.add(cx, tree.file, tree.root, Vec::new());

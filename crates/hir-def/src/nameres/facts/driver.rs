@@ -10,6 +10,7 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_mem::Frame;
 use hir_expand::{
     MacroCallId, MacroDefId,
@@ -277,9 +278,9 @@ pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundMod
 }
 
 /// The round's index of each module in `order`, sized once.
-fn module_index(order: &[ModuleId]) -> HashMap<ModuleId, u32> {
+fn module_index(order: &[ModuleId]) -> HashMap<ModuleId, u32, Global> {
     // alloc: the round's index, at its size, once per round.
-    let mut index = HashMap::with_capacity_and_hasher(order.len(), Default::default());
+    let mut index = HashMap::with_capacity_in(order.len(), Global);
     index.extend((0u32..).zip(order).map(|(at, &module)| (module, at)));
     index
 }
@@ -289,7 +290,7 @@ fn has_directive(log: &OpLog, module: ModuleId) -> bool {
     log.iter().any(|op| matches!(op, DeclOp::Macro(it) if it.module == module))
 }
 
-fn index_of_in(index: &HashMap<ModuleId, u32>, module: ModuleId, round: u32) -> u32 {
+fn index_of_in(index: &HashMap<ModuleId, u32, Global>, module: ModuleId, round: u32) -> u32 {
     *index.get(&module).unwrap_or_else(|| panic!("nameres facts: {module:?} is not a module of round {round}"))
 }
 
@@ -753,7 +754,7 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (D
         root,
         modules: ModulesSlot::Building(table),
         prelude: None,
-        macro_use_prelude: HashMap::default(),
+        macro_use_prelude: HashMap::new_in(Global),
         derive_helpers_in_scope: owned_helpers(&derive_helpers),
         session_macros,
         names: NameRecords::default(),
@@ -1022,11 +1023,9 @@ pub(crate) fn name_records<'a>(
 /// The def map's derive helpers, from a run's frame tables: the table and each list at exact
 /// size.
 fn owned_helpers(helpers: &FrameMap<'_, AstId<ast::Item>, FrameVec<'_, DeriveHelper>>) -> DeriveHelpers {
-    // alloc: the def map's table, at its size, once per def map.
-    let mut out = DeriveHelpers::with_capacity_and_hasher(helpers.len(), Default::default());
-    // alloc: each item's list, at exact size, once per def map; clone: each helper once.
-    out.extend(helpers.iter().map(|(&item, list)| (item, list.to_vec())));
-    out
+    // alloc: the def map's table, at its size, once per def map; each item's list, at exact
+    // size, once per def map; clone: each helper once.
+    DeriveHelpers::from_iter_in(helpers.iter().map(|(&item, list)| (item, list.to_vec())), Global)
 }
 
 /// A copy of a diagnostic of a log (a query value) for the def map, which owns its list.

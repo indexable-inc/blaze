@@ -217,6 +217,19 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
         (self.parent[at as usize] == at).then(|| &self.value[at as usize])
     }
 
+    /// The root of `key`'s set, read without path halving, so a shared borrow is enough.
+    #[inline]
+    pub(crate) fn find_shared(&self, key: K) -> K {
+        let mut at = key.index();
+        loop {
+            let parent = self.parent[at as usize];
+            if parent == at {
+                return K::from_index(at);
+            }
+            at = parent;
+        }
+    }
+
     /// The root of every set whose value satisfies `keep`, in index order: one pass over the
     /// columns, as a root is its own parent.
     pub(crate) fn roots_where(&self, keep: impl Fn(V) -> bool) -> Vec<K> {

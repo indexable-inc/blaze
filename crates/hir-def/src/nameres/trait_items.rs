@@ -8,8 +8,6 @@
 //! collected is read from its syntax instead, as [`TraitItems`] would list it: the same items,
 //! the same ids. Where that needs a macro, the lookup stops with [`ItemsFromMacros`].
 
-use std::sync::LazyLock;
-
 use base_db::Db;
 use hir_expand::{
     InFile, Intern, Lookup,
@@ -30,8 +28,9 @@ use crate::{
     visibility::Visibility,
 };
 
-static FEATURE: LazyLock<Symbol> =
-    LazyLock::new(|| Symbol::intern("import_trait_associated_functions"));
+#[expect(clippy::disallowed_types, reason = "the process's one trait item import feature symbol: the constant is interned once")]
+static FEATURE: std::sync::LazyLock<Symbol> =
+    std::sync::LazyLock::new(|| Symbol::intern("import_trait_associated_functions"));
 
 /// A trait in the def map being collected has an item that comes from a macro, or an attribute
 /// that may be an attribute macro's.

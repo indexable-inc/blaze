@@ -17,6 +17,7 @@ doctest = false
 anyhow.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
+blaze-serde.workspace = true
 blaze-source.workspace = true
 cargo-platform.workspace = true
 imbl.workspace = true

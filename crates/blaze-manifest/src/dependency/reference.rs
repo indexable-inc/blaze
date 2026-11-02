@@ -8,6 +8,7 @@ use std::fmt;
 
 use anyhow::bail;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use cargo_util_schemas::manifest::FeatureName;
 
 use super::Dependency;
@@ -78,7 +79,7 @@ pub(super) fn build_summary_features(
         }
     }
 
-    let mut dep_map: HashMap<&str, bool> = HashMap::default();
+    let mut dep_map: HashMap<&str, bool, Global> = HashMap::new_in(Global);
     for dep in dependencies {
         *dep_map.entry(dep.name_in_toml()).or_insert(false) |= dep.optional;
     }
@@ -90,7 +91,7 @@ pub(super) fn build_summary_features(
         })
         .collect();
 
-    let explicitly_listed: HashSet<String> =
+    let explicitly_listed: HashSet<String, Global> =
         map.values().flatten().filter_map(|fv| fv.explicit_dep_name()).map(str::to_owned).collect();
 
     for dep in dependencies {
@@ -192,7 +193,7 @@ pub(super) fn build_summary_features(
         }
     }
 
-    let used: HashSet<&str> = map
+    let used: HashSet<&str, Global> = map
         .values()
         .flatten()
         .filter_map(|fv| match fv {

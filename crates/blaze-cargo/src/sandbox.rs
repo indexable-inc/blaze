@@ -28,6 +28,7 @@ use std::{
 
 use blaze_core::utf8::push_lossy;
 use blaze_hash::{FixedState, HashMap, HashSet};
+use std::alloc::Global;
 use blaze_usercode::trace::{self, Seen};
 use serde::{Deserialize, Serialize};
 
@@ -320,7 +321,7 @@ struct Names {
     /// Where each name ends in `text`, by its id.
     ends: Vec<u32>,
     /// The last name of each hash; [`Names::next`] has the others of that hash before it.
-    first: HashMap<u64, u32>,
+    first: HashMap<u64, u32, Global>,
     next: Vec<u32>,
 }
 
@@ -400,7 +401,7 @@ const LINE: usize = 512;
 pub struct Recorder {
     names: Names,
     /// Every line seen, kept or not: one seen before is not looked at again.
-    noted: HashSet<Noted>,
+    noted: HashSet<Noted, Global>,
     /// The lines kept, in the order they were first seen.
     lines: Vec<Noted>,
     /// The live record, each new line appended before the call it notes goes on.
@@ -415,10 +416,10 @@ pub struct Recorder {
     /// The scope each thread runs in, by the thread's id, as [`MARK`] said or as the thread
     /// that forked its process had it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    threads: HashMap<u64, u32>,
+    threads: HashMap<u64, u32, Global>,
     /// Every thread seen, scoped or not: one not seen yet is new.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    known: HashSet<u64>,
+    known: HashSet<u64, Global>,
     /// Whether the processes load the interposer: one that ran a program and never said it
     /// loaded is an `X` line ([`Recorder::ended`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -427,11 +428,11 @@ pub struct Recorder {
     /// process id: the ids of the program's name and of the scope it ran in. Walked in process
     /// id order once, as the run ends ([`Recorder::ended`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pending: HashMap<u64, (u32, u32)>,
+    pending: HashMap<u64, (u32, u32), Global>,
     reads: bool,
     /// What is no input of the run's own process: the program it is, read again by a test
     /// that runs it, is an input of that test ([`Recorder::input`]).
-    not_inputs: HashSet<String>,
+    not_inputs: HashSet<String, Global>,
     /// What is the sandbox's and no input of any line: the interposer.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ours: Vec<String>,
@@ -475,16 +476,16 @@ impl Recorder {
         names.intern("");
         Recorder {
             names,
-            noted: HashSet::default(),
+            noted: HashSet::new_in(Global),
             lines: Vec::with_capacity(LINES),
             live: None,
             live_failed: None,
             appending: Vec::with_capacity(LINE),
             text: String::with_capacity(LINE),
-            threads: HashMap::default(),
-            known: HashSet::default(),
+            threads: HashMap::new_in(Global),
+            known: HashSet::new_in(Global),
             interposed: false,
-            pending: HashMap::default(),
+            pending: HashMap::new_in(Global),
             reads: spec.record_reads,
             // alloc: once per sandbox, the paths that are no input by name.
             not_inputs: spec.not_inputs.iter().map(|it| tidy(it)).collect(),
@@ -958,6 +959,10 @@ enum Probe {
 
 /// [`available`] for `kind`, the probe run once per process.
 fn probed(kind: Probe) -> Result<(), String> {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "whether this machine can make each kind of sandbox: a probe of the machine, run once per process"
+    )]
     static AVAILABLE: [std::sync::OnceLock<Result<(), String>>; 3] =
         [std::sync::OnceLock::new(), std::sync::OnceLock::new(), std::sync::OnceLock::new()];
     AVAILABLE[kind as usize]

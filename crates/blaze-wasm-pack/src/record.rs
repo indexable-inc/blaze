@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use base_db::{Crate, CrateOrigin, Db};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use cfg::CfgAtom;
 use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacros};
 use intern::sym;
@@ -84,7 +85,7 @@ fn name(db: &Db, krate: Crate) -> Option<String> {
 /// The crates `program` is made of, dependencies first. Of a proc macro crate only what its
 /// macros expand to is needed, so none of its dependencies are.
 fn closure(db: &Db, program: Crate) -> Vec<Crate> {
-    fn visit(db: &Db, krate: Crate, seen: &mut HashSet<Crate>, out: &mut Vec<Crate>) {
+    fn visit(db: &Db, krate: Crate, seen: &mut HashSet<Crate, Global>, out: &mut Vec<Crate>) {
         if seen.insert(krate) {
             let data = krate.data(db);
             if !data.target_kind.is_proc_macro() {
@@ -96,7 +97,7 @@ fn closure(db: &Db, program: Crate) -> Vec<Crate> {
         }
     }
     let mut crates = Vec::new();
-    visit(db, program, &mut HashSet::default(), &mut crates);
+    visit(db, program, &mut HashSet::new_in(Global), &mut crates);
     crates
 }
 
@@ -133,10 +134,10 @@ pub fn record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -
     let db = &*db;
     expand(db, &crates);
 
-    let index: HashMap<Crate, usize> = crates.iter().enumerate().map(|(at, &it)| (it, at)).collect();
+    let index: HashMap<Crate, usize, Global> = crates.iter().enumerate().map(|(at, &it)| (it, at)).collect();
     let mut pack = Pack { main: program.data(db).root_file_id.index(), ..Pack::default() };
-    let mut roots = HashSet::default();
-    let mut modules = HashSet::default();
+    let mut roots = HashSet::new_in(Global);
+    let mut modules = HashSet::new_in(Global);
     for &krate in &crates {
         let mut pending = vec![hir::Crate::from(krate).root_module(db)];
         while let Some(module) = pending.pop() {

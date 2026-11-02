@@ -5,6 +5,7 @@
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_query::db::{Database as _, Setter as _};
 use hir_def::{
     DefWithBodyId, FunctionId, ItemContainerId, Lookup,
@@ -47,10 +48,10 @@ fn calls_location_macros(db: &Db, body: &Body) -> bool {
 /// build's rule's ([`name_sources`]), not the expander's. The source map changes with every
 /// edit above the body, and this keeps code without such literals from changing with it.
 #[blaze_query::tracked(returns(ref))]
-pub fn location_macros<'db>(db: &'db Db, owner: DefWithBodyId) -> HashMap<ExprId, HirFileId> {
+pub fn location_macros<'db>(db: &'db Db, owner: DefWithBodyId) -> HashMap<ExprId, HirFileId, Global> {
     let body = Body::of(db, owner);
     if !calls_location_macros(db, body) {
-        return HashMap::default();
+        return HashMap::new_in(Global);
     }
     let source_map = Body::unmoved_source_map(db, owner);
     body.exprs()
@@ -70,11 +71,11 @@ pub fn location_macros<'db>(db: &'db Db, owner: DefWithBodyId) -> HashMap<ExprId
 /// move above the body changes no MIR of it. `column!()` stays a literal: a `Location`'s column
 /// is rustc's display width, `column!()`'s counts chars, and no move above a body changes it.
 #[blaze_query::tracked(returns(ref))]
-pub fn line_literals<'db>(db: &'db Db, owner: DefWithBodyId) -> HashSet<ExprId> {
+pub fn line_literals<'db>(db: &'db Db, owner: DefWithBodyId) -> HashSet<ExprId, Global> {
     let line = |kind| matches!(kind, MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::Line));
     let body = Body::of(db, owner);
     if !body.macro_calls().iter().any(|call| line(call.loc(db).def.kind)) {
-        return HashSet::default();
+        return HashSet::new_in(Global);
     }
     let source_map = Body::unmoved_source_map(db, owner);
     body.exprs()
@@ -119,16 +120,29 @@ pub fn location_caller(db: &Db, location: hir_def::StructId) -> Option<FunctionI
     })
 }
 
+/// Whether expression `expr` of `owner`'s body (a promoted constant's) takes its value from
+/// where it is in the source: a `file!()`-made literal or a `concat!` with one, anywhere in it.
+/// The code generator makes such a constant itself and never builds its MIR; compile identity
+/// reads the same answer, so the two skip one set.
+pub fn mentions_location(db: &Db, owner: DefWithBodyId, expr: ExprId) -> bool {
+    if location_macros(db, owner).contains_key(&expr) || located_concats(db, owner).contains_key(&expr) {
+        return true;
+    }
+    let mut found = false;
+    Body::of(db, owner).walk_child_exprs(expr, |child| found |= mentions_location(db, owner, child));
+    found
+}
+
 /// The literals of a body that `concat!` made of arguments with `file!()` among them, each with
 /// the expansion it is in.
 #[blaze_query::tracked(returns(ref))]
 pub fn located_concats<'db>(
     db: &'db Db,
     owner: DefWithBodyId,
-) -> HashMap<ExprId, HirFileId> {
+) -> HashMap<ExprId, HirFileId, Global> {
     let body = Body::of(db, owner);
     if !calls_location_macros(db, body) {
-        return HashMap::default();
+        return HashMap::new_in(Global);
     }
     let source_map = Body::unmoved_source_map(db, owner);
     body.exprs()
@@ -428,6 +442,15 @@ pub fn line_and_column(
     let text = db.file_text(file_id);
     let place = base_db::line_index(db, text).place(range.start())?;
     Some((file_id, place.line(), place.display_column(text.text(db))?))
+}
+
+/// The file and range of a place in a body as rustc reports it (the range whose start
+/// [`source_location_in_file`] gives the line and column of), in the file it is written in,
+/// not a macro's expansion.
+pub fn source_file_range(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<(base_db::FileId, TextRange)> {
+    let (file_id, range) = source_range(db, owner, span)?;
+    let FileRange { file_id, range } = reported_file_range(db, file_id, range);
+    Some((file_id.file_id(db), range))
 }
 
 /// File, line and column of a place in a body, as rustc reports them, found from where the

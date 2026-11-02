@@ -87,6 +87,11 @@ pub struct Profile {
     pub incremental: bool,
     pub panic: String,
     pub strip: Strip,
+    /// blaze: whether the unit checks its native contract clauses at run time (the profile's
+    /// `contract-checks`; docs/v2/plan/lanes/contracts.md, part 1). cargo prints no such key; a
+    /// graph that lacks it (cargo's own) has it off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub contract_checks: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rustflags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +118,7 @@ impl Profile {
             incremental: false,
             panic: "unwind".to_owned(),
             strip: Strip::Deferred(Stripped::None),
+            contract_checks: true,
             rustflags: Vec::new(),
             trim_paths: None,
             hint_mostly_unused: None,
@@ -173,4 +179,8 @@ pub struct UnitDep {
     pub noprelude: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nounused: Option<bool>,
+    /// Only a dev-dependency makes the edge (cargo's `dev_dependency_edges`): blaze's, not in
+    /// cargo's graph. An edge of a build script's compile is a build-dependency either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev: bool,
 }

@@ -63,6 +63,8 @@
 ))]
 #![no_core]
 #![rustc_coherence_is_core]
+// blaze: `u3` and `i24` name integers of those widths here (`num::arbitrary`).
+#![blaze::arbitrary_ints]
 #![rustc_preserve_ub_checks]
 //
 // Lints:
@@ -283,6 +285,13 @@ pub mod default;
 pub mod error;
 #[unstable(feature = "field_projections", issue = "145383")]
 pub mod field;
+// blaze's compile-time reflection (`library/UPSTREAM` lists it among blaze's changes).
+#[unstable(feature = "blaze_comptime", issue = "none")]
+pub mod reflect;
+// blaze's own attribute macros, `blaze::contract_test` (`library/UPSTREAM` lists it among blaze's
+// changes).
+#[unstable(feature = "blaze_verify", issue = "none")]
+pub mod blaze;
 pub mod index;
 pub mod marker;
 pub mod ops;

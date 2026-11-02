@@ -3,6 +3,7 @@
 //! [`SyntaxMappingBuilder`] should be used to create mappings to add to a `SyntaxEditor`
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use itertools::Itertools;
 
 use crate::{SyntaxElement, SyntaxNode};
@@ -16,7 +17,7 @@ pub struct SyntaxMapping {
 
     // mappings ->  parents
     entry_parents: Vec<SyntaxNode>,
-    node_mappings: HashMap<SyntaxNode, MappingEntry>,
+    node_mappings: HashMap<SyntaxNode, MappingEntry, Global>,
 }
 
 impl SyntaxMapping {

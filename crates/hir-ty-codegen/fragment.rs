@@ -14,6 +14,7 @@ use std::{
 
 use base_db::{Db, FileId};
 use blaze_hash::{FixedHasher, FixedState, HashMap};
+use std::alloc::Global;
 use cranelift_codegen::{
     MachReloc, RelocTarget, binemit,
     ir::{self, Signature},
@@ -913,8 +914,8 @@ pub(super) struct Recorder<'db> {
     /// The places in `wants.requests.datas` of the vtables, by the hash of their key
     /// ([`vtable_hash`]): looked up without cloning a key, whose types clone by refcount.
     vtables: HashTable<Slot>,
-    statics: HashMap<StaticId, DataId>,
-    pub(super) layouts: Option<RefCell<HashMap<Ty<'db>, (u64, u64)>>>,
+    statics: HashMap<StaticId, DataId, Global>,
+    pub(super) layouts: Option<RefCell<HashMap<Ty<'db>, (u64, u64), Global>>>,
     /// With `layouts`: each `async fn`'s future as rustc names it, with the offsets of what
     /// each of its variants holds, for `harness/layoutdiff.py` to set against rustc's.
     pub(super) coroutine_layouts: RefCell<Vec<(String, u64, u64)>>,
@@ -924,7 +925,7 @@ pub(super) struct Recorder<'db> {
     pub(super) naked: Option<(String, Vec<Option<ModuleRelocTarget>>)>,
     /// The statements instructions were built for, which their source locations index.
     spans: Vec<MirSpan>,
-    span_ids: HashMap<MirSpan, u32>,
+    span_ids: HashMap<MirSpan, u32, Global>,
     /// The locals written with a name that a stack slot of their own tells where they are.
     pub(super) named: Vec<Named>,
     /// The slots of the locals of the body, for [`overlap`](super::overlap) to share.
@@ -952,6 +953,8 @@ pub(super) struct Recorder<'db> {
 /// the part of a [`Recorder`] that has nothing of the database, which LLVM is run with
 /// once the database is let go of (see `tier::Prepared`).
 pub(super) struct Wants {
+    /// The target the code is for, which LLVM is told: `isa` is only its settings on wasm32.
+    pub(super) target: &'static Target,
     // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     pub(super) isa: &'static dyn TargetIsa,
     pub(super) requests: Requests,
@@ -1077,8 +1080,9 @@ impl BlobView<'_> {
 
 impl Wants {
     // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
-    pub(super) fn new(isa: &'static dyn TargetIsa) -> Wants {
+    pub(super) fn new(target: &'static Target, isa: &'static dyn TargetIsa) -> Wants {
         Wants {
+            target,
             isa,
             requests: Requests::default(),
             funcs: HashTable::new(),
@@ -1142,7 +1146,7 @@ impl Wants {
     /// The `asm!` blocks it calls the wrappers of that go where they are called as LLVM's
     /// inline assembly, by the places of the wrappers among the requests.
     #[cfg(feature = "llvm")]
-    pub(super) fn asm_blocks(&self) -> HashMap<u32, &'static super::asm::Inline> {
+    pub(super) fn asm_blocks(&self) -> HashMap<u32, &'static super::asm::Inline, Global> {
         let funcs = self.requests.funcs.iter().enumerate();
         funcs
             .filter_map(|(at, it)| match &it.target {
@@ -1475,16 +1479,16 @@ impl<'db> Recorder<'db> {
             target,
             checked,
             unit: super::v2::build::building(),
-            wants: Wants::new(isa),
+            wants: Wants::new(target, isa),
             vtables: HashTable::new(),
-            statics: HashMap::default(),
+            statics: HashMap::new_in(Global),
             layouts: (*LAYOUTS).then(RefCell::default),
             coroutine_layouts: RefCell::default(),
             builder_ctx: FunctionBuilderContext::new(),
             naked: None,
             // alloc: empty, allocates nothing, as are the others
             spans: Vec::new(),
-            span_ids: HashMap::default(),
+            span_ids: HashMap::new_in(Global),
             named: Vec::new(), // alloc: empty, allocates nothing
             frame_locals: None,
             // alloc: empty, allocates nothing
@@ -1545,6 +1549,13 @@ impl<'db> Recorder<'db> {
     ) -> Result<FuncId> {
         // Lifetimes change nothing about the code, and the ones a caller passes on are its
         // own parameters, which mean nothing in the callee.
+        if let InstanceDef::Fn(func) = def
+            && self.unit.is_some_and(|it| it.bridged)
+            && let Some(import) = super::v2::wasm::bridged(self.db, func)
+        {
+            // alloc: the import's name, once a call of it
+            return Ok(self.func(FuncTarget::Symbol(import.to_owned()), sig));
+        }
         let interner = DbInterner::new_with(self.db, env.krate);
         let args = super::erase_regions(interner, args);
         let instance = Instance { def, args: args.store(), checked: self.checked };
@@ -2031,9 +2042,9 @@ mod tests {
     /// before gives it, as the map of whole requests to numbers did.
     #[test]
     fn requests_are_numbered_as_a_search_of_those_before_numbers_them() {
-        let isa = &**crate::target().unwrap();
+        let isa = &**crate::isa_for(crate::Target::for_host()).unwrap();
         let mut random = SplitMix64::new(11);
-        let mut wants = Wants::new(isa);
+        let mut wants = Wants::new(crate::Target::for_host(), isa);
         let mut model: Vec<(FuncTarget, Signature)> = Vec::new();
         for _ in 0..2000 {
             let (target, sig) = (target(random.below(60)), signature(random.below(3) as usize));

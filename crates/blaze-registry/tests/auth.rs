@@ -3,9 +3,12 @@
 //! missing or refused token said as cargo says it; credential processes and
 //! `cargo:token-from-stdout` asked as cargo asks them.
 
+#![feature(allocator_api)]
+
 use std::{io::Write, path::PathBuf, sync::Arc};
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_registry::{
     Context, Locked, Package, SourceConfig, Sources,
     auth::{Auth, Shell},
@@ -23,7 +26,7 @@ const LOGIN: &str = "https://private.example.com/me";
 /// Files by URL, every one of which wants `authorization: <token>`, and what was asked.
 struct Server {
     token: String,
-    files: Mutex<HashMap<String, Vec<u8>>>,
+    files: Mutex<HashMap<String, Vec<u8>, Global>>,
     asked: Mutex<Vec<(String, Option<String>)>>,
 }
 
@@ -100,7 +103,7 @@ impl Fixture {
         }
         let bytes = tarball("secret");
         let sum = checksum(&bytes);
-        let files = HashMap::from_iter([
+        let files = HashMap::from_iter_in([
             (
                 format!("{BASE}config.json"),
                 format!(r#"{{"dl":"{DL}{{crate}}/{{version}}","auth-required":true}}"#).into_bytes(),
@@ -111,7 +114,7 @@ impl Fixture {
                     .into_bytes(),
             ),
             (format!("{DL}secret/1.0.0"), bytes),
-        ]);
+        ], Global);
         let server = Arc::new(Server {
             token: token.to_owned(),
             files: Mutex::new(files),

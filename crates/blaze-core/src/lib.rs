@@ -23,6 +23,10 @@
 //! the simulation with it, is safe Rust.
 
 #![deny(unsafe_code)]
+#![feature(allocator_api)]
+// `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core`; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 
 pub mod busy;
 #[cfg(target_os = "linux")]
@@ -209,6 +213,28 @@ impl fmt::Display for FileName {
     }
 }
 
+/// What an [`Effect::Clone`] whose source is a symbolic link fails with, after the source's
+/// name: a clone is made of a file, never through a link. Every driver says it the same, so an
+/// asker can tell this refusal (the name is something other than the file it made) from a file
+/// system that cannot share blocks.
+pub const CLONE_THROUGH_A_LINK: &str = "is a symbolic link: blaze clones a file, never through a link";
+
+/// What a failed [`Effect::Clone`] says after its source's name (and what it is, where known)
+/// when the source is no regular file: a FIFO, a socket or a device, or on Windows a reparse
+/// point that is no link (data deduplication, a cloud placeholder). Refused as it is opened,
+/// never reported as a file system that cannot share blocks.
+pub const CLONE_OF_NO_FILE: &str = "is no regular file: blaze clones a regular file";
+
+/// What an [`Effect::Seal`] whose file is a symbolic link (on Windows, a junction too) fails
+/// with, after the name: a seal is never set through a link. Every driver says it the same, so
+/// an asker can tell this refusal (the name is something other than the file it wrote) from a
+/// seal that could not be set.
+pub const SEAL_THROUGH_A_LINK: &str = "is a symbolic link: a seal is never set through one";
+
+/// What an [`Effect::Seal`] says after the name (and what it is) when the file is no regular
+/// file: a FIFO, a socket, a device or a directory.
+pub const SEAL_OF_NO_FILE: &str = "is no regular file: only a regular file is sealed";
+
 /// The most bytes one [`Effect::Recv`] appends, whatever its `most`: a receive reserves its
 /// room before the bytes come, so an asker of a long frame grows its buffer by this much a
 /// receive, not by the frame's length at once.
@@ -248,9 +274,16 @@ pub enum Effect {
     /// `from` renamed over `to`, atomically: a reader sees the old `to` or the new, and the
     /// new name survives a crash once it completes. Completes with [`Done::Renamed`].
     Rename { from: FileName, to: FileName, tag: Tag },
-    /// The file's permission bits set to `mode` (0o755 for an executable). Completes with
-    /// [`Done::Moded`].
+    /// The file's permission bits set to `mode` (0o755 for an executable), through a symbolic
+    /// link at `file` to the file it points to on Unix (`chmod`); Windows sets the link's own.
+    /// Completes with [`Done::Moded`].
     Mode { file: FileName, mode: u32, tag: Tag },
+    /// As [`Effect::Mode`], of the file itself, for a store sealing what it placed: a symbolic
+    /// link (on Windows any reparse point) or anything else that is no regular file at `file`
+    /// is refused, naming it, never followed or changed. Set on the file opened `O_NOFOLLOW`
+    /// (`fchmod`), never by `fchmodat(AT_SYMLINK_NOFOLLOW)`, which glibc makes `fchmodat2`, a
+    /// call some seccomp filters refuse. Completes with [`Done::Moded`].
+    Seal { file: FileName, mode: u32, tag: Tag },
     /// `dir` made the user's alone, and checked to be with everything under it, for what keeps
     /// code it runs (the store: a value is checked against its own hash, never against what its
     /// key says made it, so whoever may write there can plant code under any key). A missing
@@ -269,13 +302,20 @@ pub enum Effect {
     /// file system's resolution of it (100 ns on NTFS, 1 s on HFS+).
     Times { file: FileName, modified_ns: u64, tag: Tag },
     /// `to` made a file with `from`'s contents that shares its blocks (`FICLONE`,
-    /// `clonefile`). Fails where the file system cannot share blocks, naming it: nothing
-    /// copies instead.
+    /// `fclonefileat`): a new file's mode (0o666 less the umask) and modified now, whatever
+    /// `from`'s are (a store's copies are read-only). A symbolic link `from` is refused, never
+    /// followed or cloned, with [`CLONE_THROUGH_A_LINK`]. Fails where the file system cannot
+    /// share blocks, naming both files' volumes: nothing copies instead.
     Clone { from: FileName, to: FileName, tag: Tag },
     /// `to` made another name of `from`, for outputs nothing writes in place.
     Link { from: FileName, to: FileName, tag: Tag },
-    /// What the file is, or that it is not there.
+    /// What the file is, or that it is not there; a symbolic link is followed to what it
+    /// points to.
     Stat { file: FileName, tag: Tag },
+    /// As [`Effect::Stat`], a symbolic link at `file` not followed: it is a file of its own
+    /// length (as [`Effect::List`] lists it; on Windows a reparse point's own), so a store's
+    /// first look at a file it placed sees a link put there as the wrong length.
+    Lstat { file: FileName, tag: Tag },
     /// The file, or an empty directory, gone. Gone already is done.
     Remove { file: FileName, tag: Tag },
     /// Completes with [`Done::Changed`] each time files under `dir` change, until an
@@ -364,11 +404,13 @@ impl Effect {
             | Effect::WriteAt { tag, .. }
             | Effect::Rename { tag, .. }
             | Effect::Mode { tag, .. }
+            | Effect::Seal { tag, .. }
             | Effect::Private { tag, .. }
             | Effect::Times { tag, .. }
             | Effect::Clone { tag, .. }
             | Effect::Link { tag, .. }
             | Effect::Stat { tag, .. }
+            | Effect::Lstat { tag, .. }
             | Effect::Remove { tag, .. }
             | Effect::Watch { tag, .. }
             | Effect::Journal { tag, .. }
@@ -553,7 +595,7 @@ impl fmt::Debug for Mapping {
     }
 }
 
-/// What [`Effect::Stat`] found.
+/// What [`Effect::Stat`] or [`Effect::Lstat`] found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Meta {
     pub len: u64,

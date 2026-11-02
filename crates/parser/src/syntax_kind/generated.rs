@@ -348,6 +348,13 @@ pub enum SyntaxKind {
     WRAP_BINDER_KW,
     UNSAFE_BINDER_CAST_EXPR,
     UNSAFE_BINDER_TYPE,
+    // blaze_verify's specification clauses (docs/v2/plan/lanes/verus.md), after the others too.
+    DECREASES_KW,
+    ENSURES_KW,
+    INVARIANT_KW,
+    RECOMMENDS_KW,
+    REQUIRES_KW,
+    SPEC_CLAUSE,
     #[doc(hidden)]
     __LAST,
 }
@@ -466,6 +473,7 @@ impl SyntaxKind {
             | OFFSET_OF_EXPR
             | UNSAFE_BINDER_CAST_EXPR
             | UNSAFE_BINDER_TYPE
+            | SPEC_CLAUSE
             | OR_PAT
             | PARAM
             | PARAM_LIST
@@ -690,6 +698,11 @@ impl SyntaxKind {
             UNION_KW => "union",
             UNWRAP_BINDER_KW => "unwrap_binder",
             WRAP_BINDER_KW => "wrap_binder",
+            DECREASES_KW => "decreases",
+            ENSURES_KW => "ensures",
+            INVARIANT_KW => "invariant",
+            RECOMMENDS_KW => "recommends",
+            REQUIRES_KW => "requires",
             YEET_KW => "yeet",
             ASYNC_KW => "async",
             AWAIT_KW => "await",
@@ -803,6 +816,11 @@ impl SyntaxKind {
             UNION_KW => true,
             UNWRAP_BINDER_KW => true,
             WRAP_BINDER_KW => true,
+            DECREASES_KW => true,
+            ENSURES_KW => true,
+            INVARIANT_KW => true,
+            RECOMMENDS_KW => true,
+            REQUIRES_KW => true,
             YEET_KW => true,
             _ => false,
         }
@@ -904,6 +922,11 @@ impl SyntaxKind {
             UNION_KW => true,
             UNWRAP_BINDER_KW => true,
             WRAP_BINDER_KW => true,
+            DECREASES_KW => true,
+            ENSURES_KW => true,
+            INVARIANT_KW => true,
+            RECOMMENDS_KW => true,
+            REQUIRES_KW => true,
             YEET_KW => true,
             _ => false,
         }
@@ -1166,6 +1189,11 @@ macro_rules ! T_ {
     [union] => { $ crate :: SyntaxKind :: UNION_KW };
     [unwrap_binder] => { $ crate :: SyntaxKind :: UNWRAP_BINDER_KW };
     [wrap_binder] => { $ crate :: SyntaxKind :: WRAP_BINDER_KW };
+    [decreases] => { $ crate :: SyntaxKind :: DECREASES_KW };
+    [ensures] => { $ crate :: SyntaxKind :: ENSURES_KW };
+    [invariant] => { $ crate :: SyntaxKind :: INVARIANT_KW };
+    [recommends] => { $ crate :: SyntaxKind :: RECOMMENDS_KW };
+    [requires] => { $ crate :: SyntaxKind :: REQUIRES_KW };
     [yeet] => { $ crate :: SyntaxKind :: YEET_KW };
     [async] => { $ crate :: SyntaxKind :: ASYNC_KW };
     [await] => { $ crate :: SyntaxKind :: AWAIT_KW };

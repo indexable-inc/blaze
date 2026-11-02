@@ -93,7 +93,8 @@ pub(crate) fn literals(tree: &TopSubtree) -> Vec<String> {
     tree.as_token_trees()
         .iter_flat_tokens()
         .filter_map(|it| match it {
-            tt::TokenTree::Leaf(tt::Leaf::Literal(literal)) => Some(format!("{}{}", literal.text(), literal.suffix())),
+            // As written: a string's quotes and a suffix are part of it (`"corpus-calls"`, `1u8`).
+            tt::TokenTree::Leaf(tt::Leaf::Literal(literal)) => Some(literal.to_string()),
             _ => None,
         })
         .collect()

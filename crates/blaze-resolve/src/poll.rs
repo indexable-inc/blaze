@@ -10,6 +10,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::Thread;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 /// Caches and runs an async method from code that is not async, on one thread.
 ///
@@ -19,7 +20,7 @@ use blaze_hash::HashMap;
 /// one computation per key is in flight; a success is kept, an error is handed out once.
 pub(crate) struct LocalPollAdapter<S, K, R, Q> {
     pool: Vec<Pin<Box<Q>>>,
-    cache: HashMap<K, Poll<R>>,
+    cache: HashMap<K, Poll<R>, Global>,
     self_parameter: S,
     start: fn(S, K) -> Q,
 }
@@ -32,7 +33,7 @@ where
     Q: Future<Output = (K, Result<V, E>)>,
 {
     pub(crate) fn new(self_parameter: S, start: fn(S, K) -> Q) -> Self {
-        Self { pool: Vec::new(), cache: HashMap::default(), self_parameter, start }
+        Self { pool: Vec::new(), cache: HashMap::new_in(Global), self_parameter, start }
     }
 
     /// The result for `key`, starting the work if needed. On [`Poll::Pending`], call

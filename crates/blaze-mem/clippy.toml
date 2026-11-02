@@ -28,11 +28,22 @@ disallowed-types = [
     { path = "parking_lot::Mutex", reason = "no lock on the hot path (docs/v2/plan/design/concurrency.md); see std::sync::Mutex", allow-invalid = true },
     { path = "parking_lot::RwLock", reason = "a read writes no shared memory (docs/v2/plan/design/concurrency.md); see std::sync::RwLock", allow-invalid = true },
     # AGENTS.md rule 9, standard-structures: one choice per need.
-    { path = "once_cell::sync::Lazy", replacement = "std::sync::LazyLock", reason = "std has it", allow-invalid = true },
-    { path = "once_cell::sync::OnceCell", replacement = "std::sync::OnceLock", reason = "std has it", allow-invalid = true },
+    { path = "std::sync::OnceLock", reason = "global state: build the value where the program starts (or as a query) and pass it to what needs it; a process-wide singleton (the allocator, the profile ring) says why with #[expect(clippy::disallowed_types, reason = ..)]" },
+    { path = "std::sync::LazyLock", reason = "global state: build the value where the program starts (or as a query) and pass it to what needs it; a process-wide singleton (the allocator, the profile ring) says why with #[expect(clippy::disallowed_types, reason = ..)]" },
+    { path = "std::cell::OnceCell", reason = "global state: build the value where the program starts (or as a query) and pass it to what needs it; a process-wide singleton (the allocator, the profile ring) says why with #[expect(clippy::disallowed_types, reason = ..)]" },
+    { path = "std::cell::LazyCell", reason = "global state: build the value where the program starts (or as a query) and pass it to what needs it; a process-wide singleton (the allocator, the profile ring) says why with #[expect(clippy::disallowed_types, reason = ..)]" },
+    { path = "once_cell::sync::Lazy", reason = "global state: build the value where the program starts (or as a query) and pass it to what needs it; a process-wide singleton (the allocator, the profile ring) says why with #[expect(clippy::disallowed_types, reason = ..)]", allow-invalid = true },
+    { path = "once_cell::sync::OnceCell", reason = "global state: build the value where the program starts (or as a query) and pass it to what needs it; a process-wide singleton (the allocator, the profile ring) says why with #[expect(clippy::disallowed_types, reason = ..)]", allow-invalid = true },
+    { path = "once_cell::unsync::Lazy", reason = "global state: build the value where the program starts (or as a query) and pass it to what needs it; a process-wide singleton (the allocator, the profile ring) says why with #[expect(clippy::disallowed_types, reason = ..)]", allow-invalid = true },
+    { path = "once_cell::unsync::OnceCell", reason = "global state: build the value where the program starts (or as a query) and pass it to what needs it; a process-wide singleton (the allocator, the profile ring) says why with #[expect(clippy::disallowed_types, reason = ..)]", allow-invalid = true },
     { path = "std::sync::Barrier", reason = "a pool thread waits through the scheduler (AGENTS.md rule 9): join on a counter or a job" },
     { path = "std::hash::DefaultHasher", replacement = "blaze_hash::FixedHasher", reason = "SipHash: slow, and not `blaze_hash`'s one hasher" },
     { path = "std::collections::hash_map::DefaultHasher", replacement = "blaze_hash::FixedHasher", reason = "SipHash: slow, and not `blaze_hash`'s one hasher" },
+    { path = "hir_ty_share::ShareKey", replacement = "hir_ty_identity::CompileIdentity", reason = "one definition of code identity (docs/v2/plan/design/code-identity.md): the share walk is compile identity now", allow-invalid = true },
+    { path = "hir_ty_share::ShareInstance", replacement = "hir_ty_identity::Instance", reason = "one definition of code identity (docs/v2/plan/design/code-identity.md): the share walk is compile identity now", allow-invalid = true },
+    { path = "hir_ty_share::ShareDef", replacement = "hir_ty_identity::Subject", reason = "one definition of code identity (docs/v2/plan/design/code-identity.md): the share walk is compile identity now", allow-invalid = true },
+    { path = "hir_ty_share::BodyOptions", replacement = "hir_ty_identity::Compiled", reason = "one definition of code identity (docs/v2/plan/design/code-identity.md): the share walk is compile identity now", allow-invalid = true },
+    { path = "hir_ty_share::OptionsSet", replacement = "hir_ty_identity::OptionsSet", reason = "one definition of code identity (docs/v2/plan/design/code-identity.md): the share walk is compile identity now", allow-invalid = true },
 ]
 
 disallowed-methods = [
@@ -52,8 +63,13 @@ disallowed-methods = [
     { path = "std::env::var_os", reason = "configuration is typed and read once at the entry point, with no default for a missing value (AGENTS.md rule 3)" },
     { path = "std::process::exit", reason = "return a typed error from `main`, so destructors and the profile's flush run" },
     { path = "std::mem::forget", replacement = "std::mem::ManuallyDrop::new", reason = "says what it keeps from being dropped" },
+    { path = "hir_ty_share::share_key", replacement = "hir_ty_identity::instance_identity", reason = "one definition of code identity (docs/v2/plan/design/code-identity.md): the share walk is compile identity now", allow-invalid = true },
 ]
 
 disallowed-macros = [
-    { path = "lazy_static::lazy_static", replacement = "std::sync::LazyLock", reason = "std has it", allow-invalid = true },
+    { path = "lazy_static::lazy_static", reason = "global state: build the value where the program starts (or as a query) and pass it to what needs it; a process-wide singleton (the allocator, the profile ring) says why with #[expect(clippy::disallowed_types, reason = ..)]", allow-invalid = true },
+    { path = "serde::Serialize", replacement = "blaze_serde::Serialize", reason = "blaze builds with its own derive (no syn, quote or proc-macro2): crates/blaze-serde-derive", allow-invalid = true },
+    { path = "serde::Deserialize", replacement = "blaze_serde::Deserialize", reason = "blaze builds with its own derive (no syn, quote or proc-macro2): crates/blaze-serde-derive", allow-invalid = true },
+    { path = "serde_derive::Serialize", replacement = "blaze_serde::Serialize", reason = "blaze builds with its own derive (no syn, quote or proc-macro2): crates/blaze-serde-derive", allow-invalid = true },
+    { path = "serde_derive::Deserialize", replacement = "blaze_serde::Deserialize", reason = "blaze builds with its own derive (no syn, quote or proc-macro2): crates/blaze-serde-derive", allow-invalid = true },
 ]

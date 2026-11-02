@@ -37,6 +37,7 @@ mod abi;
 mod calls;
 mod flow;
 mod frames;
+mod tail;
 mod traps;
 mod unwind;
 

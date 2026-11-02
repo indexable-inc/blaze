@@ -78,6 +78,7 @@ macro_rules! quote_impl__ {
         $builder.push(
             $crate::tt::Leaf::Ident($crate::tt::Ident {
                 sym: {
+                    #[expect(clippy::disallowed_types, reason = "the process's one symbol for this quote site: its constant identifier is interned once")]
                     static SYMBOL: ::std::sync::OnceLock<intern::Symbol> = ::std::sync::OnceLock::new();
                     *SYMBOL.get_or_init(|| intern::Symbol::intern(stringify!($tt)))
                 },

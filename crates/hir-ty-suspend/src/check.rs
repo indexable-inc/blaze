@@ -10,6 +10,7 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule as _, ModuleId,
     attrs::AttrFlags,
@@ -22,12 +23,15 @@ use hir_ty::{
     next_solver::{DbInterner, GenericArgKind, ParamEnv, StoredTy, Ty, TyKind},
     traits::{StoredParamEnvAndCrate, implements_trait_unique},
 };
-use hir_ty_mir::mir::{BasicBlockId, LocalId, MirBody, MirSpan, StatementKind, TerminatorKind};
+use hir_ty_mir::mir::{
+    BasicBlockId, LocalId, MirBody, MirSpan, StatementKind, TerminatorKind,
+    dispatch::{Body, body_of},
+};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use smallvec::SmallVec;
 
 use crate::{
-    dispatch::{Cx, Def, Instance, Target, Unseen, body_of, concrete_args, sites},
+    dispatch::{Cx, Instance, Target, Unseen, concrete_args, sites},
     root::{roots, send_trait},
     summary::{owner_of, path, summary, suspends},
 };
@@ -168,7 +172,7 @@ fn walk(db: &Db, krate: Crate) -> Walk {
             && FunctionSignature::of(db, func).has_body()
             && let Some(args) = concrete_args(interner, func)
         {
-            starts.push(Instance { def: Def::Fn(func), args: args.store() });
+            starts.push(Instance { def: Body::Fn(func), args: args.store() });
         }
     });
     let order = reached(db, &env, &starts);
@@ -202,8 +206,8 @@ pub fn suspend_check(db: &Db, krate: Crate) -> Found {
     let env = env_of(krate);
     let mut held: Vec<Held> = Vec::new();
     let mut broken: Vec<Broken> = Vec::new();
-    let mut seen_held: HashSet<(Site, Option<Site>, Why)> = HashSet::default();
-    let mut seen_broken: HashSet<(Site, Promise)> = HashSet::default();
+    let mut seen_held: HashSet<(Site, Option<Site>, Why), Global> = HashSet::new_in(Global);
+    let mut seen_broken: HashSet<(Site, Promise), Global> = HashSet::new_in(Global);
     for instance in walk(db, krate).checked.iter() {
         let checked = instance_check(db, env, *instance);
         // The same error, found again in another instance of one generic body, is said once.
@@ -266,7 +270,7 @@ pub fn may_suspend_at(db: &Db, krate: Crate, site: Site) -> Option<String> {
 pub fn on_fiber(db: &Db, krate: Crate) -> Box<[FunctionId]> {
     let env = env_of(krate);
     let walk = walk(db, krate);
-    let mut seen: HashSet<Instance> = HashSet::default();
+    let mut seen: HashSet<Instance, Global> = HashSet::new_in(Global);
     let mut stack: Vec<Instance> = walk
         .order
         .iter()
@@ -279,12 +283,12 @@ pub fn on_fiber(db: &Db, krate: Crate) -> Box<[FunctionId]> {
         if !seen.insert(instance) {
             continue;
         }
-        if let Def::Fn(func) = instance.def
+        if let Body::Fn(func) = instance.def
             && !out.contains(&func)
         {
             out.push(func);
         }
-        stack.extend(summary(db, env, instance).callees.iter().filter(|it| !seen.contains(it)));
+        stack.extend(summary(db, env, instance).callees.iter().filter(|it| !seen.contains(*it)));
     }
     out.into_boxed_slice()
 }
@@ -292,7 +296,7 @@ pub fn on_fiber(db: &Db, krate: Crate) -> Box<[FunctionId]> {
 /// Every instance `starts` reach, in walk order (depth first, each where first reached).
 fn reached(db: &Db, env: &StoredParamEnvAndCrate, starts: &[Instance]) -> Vec<Instance> {
     let mut order: Vec<Instance> = Vec::new(); // alloc: the instances, once per crate
-    let mut index: HashMap<Instance, u32> = HashMap::default();
+    let mut index: HashMap<Instance, u32, Global> = HashMap::new_in(Global);
     let mut stack: Vec<(usize, usize)> = Vec::new(); // alloc: the walk's path, once per crate
     for start in starts {
         if index.contains_key(start) {
@@ -326,7 +330,7 @@ fn checked_here(db: &Db, krate: Crate, instance: &Instance) -> bool {
     own || instance.args.as_ref().iter().any(|it| !matches!(it.kind(), GenericArgKind::Lifetime(_)))
 }
 
-fn module_of(db: &Db, def: Def) -> Option<ModuleId> {
+fn module_of(db: &Db, def: Body) -> Option<ModuleId> {
     owner_of(db, def).map(|it| it.module(db))
 }
 
@@ -352,7 +356,7 @@ fn instance_check(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> C
             path: Box::default(),
         }),
     }
-    let Ok(body) = body_of(db, &cx.stored, &instance) else {
+    let Ok(body) = body_of(db, cx.stored, instance.def, instance.args) else {
         return Checked { broken: broken.into_boxed_slice(), ..Checked::default() };
     };
     let sites = sites(&cx, body);

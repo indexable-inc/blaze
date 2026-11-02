@@ -19,6 +19,8 @@ pub(crate) const WS: &str = "/home/u/ws";
 pub(crate) const COMMIT: &str = "16d1ffac17ad8b739e32483ac2e65fe7e1804977";
 /// [`crate::query::BuildConfig::std`]: outside every workspace.
 pub(crate) const STD: &str = "/home/u/.cache/blaze/std/0b";
+/// Where the daemon places build directories nothing names ([`crate::query::BuildConfig::builds`]).
+pub(crate) const BUILDS: &str = "/home/u/.cache/blaze/build";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_SRC: &str = "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f";
 const CRATES_IO_INDEX: &str = "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f";
@@ -152,6 +154,7 @@ impl Fixture {
             host: HOST.to_owned(),
             library: library_at(COMMIT),
             std: STD.to_owned(),
+            builds: BUILDS.to_owned(),
         };
         self.db.open_with(View { root: self.tree.root(&files) }, &config.encode())
     }
@@ -237,8 +240,11 @@ fn one_package_plans_its_library_and_binary_with_the_standard_library() {
     let units = ready(fixture.plan(fixture.open(&ask(&files))));
     assert_eq!(roots_named(&units), ["a bin", "a lib"]);
     assert_eq!(units.plans.len(), units.graph.units.len());
-    assert_eq!(units.target_dir, "/home/u/ws/target");
-    assert_eq!(units.build_dir, "/home/u/ws/target");
+    // The build directory is the workspace's under blaze's root, never in the checkout.
+    let build = blaze_manifest::home::build_dir(std::path::Path::new(BUILDS), std::path::Path::new("/home/u/ws"));
+    assert_eq!(units.target_dir, build.display().to_string());
+    assert_eq!(units.build_dir, units.target_dir);
+    assert!(!units.target_dir.starts_with("/home/u/ws/"));
     assert_eq!(units.finished, "`dev` profile [unoptimized + debuginfo]");
     assert!(units.warnings.is_empty(), "{:?}", units.warnings);
     let lock = units.lock.as_ref().expect("a new lock file");
@@ -257,7 +263,8 @@ fn one_package_plans_its_library_and_binary_with_the_standard_library() {
     assert_eq!(env_of(lib_plan, "CARGO_MANIFEST_DIR"), Some(WS));
     assert!(lib_plan.extra_filename.starts_with('-'), "{lib_plan:?}");
     let (bin_at, bin) = units_of(&units, "a").into_iter().find(|(_, it)| it.target.kind == ["bin"]).expect("a bin");
-    assert!(units.plans[bin_at].outputs.iter().any(|it| it == "/home/u/ws/target/debug/a"), "{:?}", units.plans[bin_at]);
+    let bin_out = format!("{}/debug/a", units.target_dir);
+    assert!(units.plans[bin_at].outputs.iter().any(|it| *it == bin_out), "{:?}", units.plans[bin_at]);
     assert!(bin.dependencies.iter().any(|it| it.index == lib_at && it.extern_crate_name == "a"));
 
     // cargo's `attach_std_deps`: every unit but a build script's run gets each of the
@@ -421,6 +428,34 @@ fn a_virtual_workspace_builds_its_glob_members() {
     let only_b = Ask { args: &["-p", "b"], ..ask(&files) };
     let units = ready(fixture.plan(fixture.open(&only_b)));
     assert_eq!(roots_named(&units), ["b lib"]);
+}
+
+#[test]
+fn an_edge_only_a_dev_dependency_makes_says_so() {
+    let fixture = Fixture::new();
+    let b = "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    let c = "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\na = { path = \"../a\" }\n\n[dev-dependencies]\nb = { path = \"../b\" }\n";
+    let files = [
+        ("ws/Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n"),
+        ("ws/crates/a/Cargo.toml", A),
+        ("ws/crates/a/src/lib.rs", ""),
+        ("ws/crates/b/Cargo.toml", b),
+        ("ws/crates/b/src/lib.rs", ""),
+        ("ws/crates/c/Cargo.toml", c),
+        ("ws/crates/c/src/lib.rs", ""),
+    ];
+    let test = Ask { command: Command::Test, args: &["-p", "c"], ..ask(&files) };
+    let units = ready(fixture.plan(fixture.open(&test)));
+    let (a_at, _, _) = lib_of(&units, "a");
+    let (b_at, _, _) = lib_of(&units, "b");
+    let (_, tested) = units_of(&units, "c")
+        .into_iter()
+        .find(|(_, it)| it.target.is_lib() && it.mode == Mode::Test)
+        .expect("c's library is tested");
+    let edge = |to: usize| tested.dependencies.iter().find(|it| it.index == to).expect("an edge of c's test");
+    assert!(!edge(a_at).dev, "a is a dependency of c");
+    assert!(edge(b_at).dev, "b is only a dev-dependency of c");
 }
 
 #[test]

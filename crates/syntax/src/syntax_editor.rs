@@ -13,6 +13,7 @@ use std::{
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use syntax_tree::TextRange;
 
 use crate::{
@@ -217,7 +218,7 @@ pub struct SyntaxEdit {
     old_root: SyntaxNode,
     new_root: SyntaxNode,
     changed_elements: Vec<SyntaxElement>,
-    annotations: HashMap<SyntaxAnnotation, Vec<SyntaxElement>>,
+    annotations: HashMap<SyntaxAnnotation, Vec<SyntaxElement>, Global>,
 }
 
 impl SyntaxEdit {

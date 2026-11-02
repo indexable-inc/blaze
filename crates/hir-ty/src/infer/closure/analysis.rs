@@ -33,6 +33,7 @@
 use std::{cmp, iter, mem};
 
 use blaze_hash::{FixedState, HashMap};
+use std::alloc::Global;
 use blaze_mem::Frame;
 use hir_def::{
     expr_store::ExpressionStore,
@@ -263,7 +264,7 @@ impl<'f> MinCapturesBuf<'f> {
 impl<'db, 'f> InferenceContext<'db, 'f> {
     pub(crate) fn closure_analyze(&mut self) {
         let upvars = hir_def::upvars::upvars_mentioned(self.db, self.store_owner)
-            .unwrap_or(const { &HashMap::with_hasher(FixedState) });
+            .unwrap_or(const { &HashMap::with_hasher_in(blaze_hash::FixedState, Global) });
         for root_expr in self.store.expr_roots() {
             self.analyze_closures_in_expr(root_expr, upvars);
         }
@@ -272,7 +273,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         assert!(self.deferred_call_resolutions.is_empty());
     }
 
-    fn analyze_closures_in_expr(&mut self, expr: ExprId, upvars: &'db HashMap<ExprId, Upvars>) {
+    fn analyze_closures_in_expr(&mut self, expr: ExprId, upvars: &'db HashMap<ExprId, Upvars, Global>) {
         self.store.walk_child_exprs(expr, |expr| self.analyze_closures_in_expr(expr, upvars));
 
         match self.store.expr(expr) {
@@ -1211,7 +1212,10 @@ fn should_reborrow_from_env_of_parent_coroutine_closure(
 
 /// Truncate the capture so that the place being borrowed is in accordance with RFC 1240,
 /// which states that it's unsafe to take a reference into a struct marked `repr(packed)`.
+/// A field of a `#[blaze::bits]` struct has no address at all, so a capture by reference
+/// stops at the struct too: the closure borrows the whole struct and reads the field from it.
 fn restrict_repr_packed_field_ref_capture<'f>(
+    db: &base_db::Db,
     mut place: PlaceBuf<'f>,
     capture_info: &mut CaptureInfoBuf<'f>,
 ) -> PlaceBuf<'f> {
@@ -1227,6 +1231,7 @@ fn restrict_repr_packed_field_ref_capture<'f>(
                     // shouldn't affect how we compute our captures.
                     true
                 }
+                TyKind::Adt(..) => crate::layout::bits_struct_of(db, ty).is_some(),
 
                 _ => false,
             },
@@ -1321,7 +1326,7 @@ impl<'db, 'f> euv::Delegate<'db, 'f> for InferBorrowKind<'f> {
         let place = restrict_capture_precision(place, &mut dummy_capture_info);
 
         dummy_capture_info.capture_kind = dummy_capture_kind;
-        let place = restrict_repr_packed_field_ref_capture(place, &mut dummy_capture_info);
+        let place = restrict_repr_packed_field_ref_capture(ctx.db, place, &mut dummy_capture_info);
         self.fake_reads.push((place, cause, origins));
     }
 
@@ -1386,7 +1391,7 @@ impl<'db, 'f> euv::Delegate<'db, 'f> for InferBorrowKind<'f> {
         // We only want repr packed restriction to be applied to reading references into a packed
         // struct, and not when the data is being moved. Therefore we call this method here instead
         // of in `restrict_capture_precision`.
-        let place = restrict_repr_packed_field_ref_capture(place, &mut capture_info);
+        let place = restrict_repr_packed_field_ref_capture(ctx.db, place, &mut capture_info);
 
         // Raw pointers don't inherit mutability
         if place.deref_tys().any(Ty::is_raw_ptr) {

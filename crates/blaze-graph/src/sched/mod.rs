@@ -40,6 +40,7 @@
 mod cores;
 pub mod fiber;
 #[cfg(all(test, not(blaze_check)))]
+#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod fiber_tests;
 mod graph;
 mod host;
@@ -52,11 +53,14 @@ use blaze_core::wheel::Wheel;
 
 pub use cores::{CoreInfo, Cores, Distances, LEVELS, Level, MAX_CORES, ShapeError};
 pub use fiber::{
-    Carried, Idle, IdleReason, NoWait, Switch, SwitchEvent, carry, current_job, miss, observe, observe_idle, on_fiber,
+    Carried, Idle, IdleReason, NoWait, Switch, SwitchEvent, carry, current_job, miss, observe, observe_idle, observe_spawner,
+    on_fiber,
 };
-pub(crate) use host::{Host, check_stall, join_pool, leave_pool};
+pub(crate) use fiber::spawner;
+pub(crate) use host::{Host, check_stall, fire_due, idle, job_begins, join_pool, leave_pool, ready, until_due};
 pub use host::{
-    Event, EventWait, FIBER_STACK, claim, claim_for, close_scope, count_towards, innermost_scope, job_here, key_done, open_scope, release, wait,
+    Event, EventWait, FIBER_STACK, claim, claim_for, close_scope, count_towards, innermost_scope, job_here, key_done, now, observed,
+    open_scope, release, wait,
 };
 
 use crate::Key;
@@ -124,6 +128,9 @@ pub struct Spawn {
     pub hint: Affinity,
     /// On the critical path, by the profiler's data: it runs on the highest-capacity cores.
     pub critical: bool,
+    /// Work ahead of demand: until it starts, it runs only when no other job is runnable, and a
+    /// job that waits for it raises it. Once started it runs as any other.
+    pub background: bool,
     /// The counter it counts towards until it ends.
     pub counter: Option<CounterId>,
 }
@@ -131,12 +138,12 @@ pub struct Spawn {
 impl Spawn {
     /// A job of the driver's, on the least loaded core.
     pub const fn root() -> Spawn {
-        Spawn { parent: None, hint: Affinity::Any, critical: false, counter: None }
+        Spawn { parent: None, hint: Affinity::Any, critical: false, background: false, counter: None }
     }
 
     /// A job of `parent`'s, on its core.
     pub const fn child(parent: JobId) -> Spawn {
-        Spawn { parent: Some(parent), hint: Affinity::Spawner, critical: false, counter: None }
+        Spawn { parent: Some(parent), hint: Affinity::Spawner, critical: false, background: false, counter: None }
     }
 
     pub const fn hint(mut self, hint: Affinity) -> Spawn {
@@ -146,6 +153,14 @@ impl Spawn {
 
     pub const fn critical(mut self, critical: bool) -> Spawn {
         self.critical = critical;
+        self.background &= !critical;
+        self
+    }
+
+    /// Background work ([`Spawn::background`]'s field), never critical.
+    pub const fn background(mut self) -> Spawn {
+        self.background = true;
+        self.critical = false;
         self
     }
 
@@ -317,6 +332,8 @@ pub(crate) struct StealRecord {
 struct Job {
     state: JobState,
     critical: bool,
+    /// Queued and never started, as [`Spawn::background`]: in its core's `later` queue.
+    background: bool,
     /// Suspended on a timed wait, which the placement keeps; any other wait is the graph's.
     timed: bool,
     /// Queued: the core that holds it; running: its core; suspended or done: where it last ran.
@@ -327,7 +344,7 @@ struct Job {
 
 const _: () = assert!(size_of::<Job>() <= 16);
 
-const VACANT: Job = Job { state: JobState::Vacant, critical: false, timed: false, core: NONE, global: NONE };
+const VACANT: Job = Job { state: JobState::Vacant, critical: false, background: false, timed: false, core: NONE, global: NONE };
 
 /// One driver's cores, queues and clock: where its jobs run. Its job ids are its own.
 pub(crate) struct Place {
@@ -346,11 +363,16 @@ pub(crate) struct Place {
     queue: Vec<VecDeque<u32>>,
     /// Critical-path jobs, taken before `queue`.
     urgent: Vec<VecDeque<u32>>,
+    /// Background jobs not started, oldest first: taken after every other, stolen only when no
+    /// core has another job to steal.
+    later: Vec<VecDeque<u32>>,
     /// Bit per parked core.
     parked: Vec<u64>,
     parked_count: u32,
     /// Bit per core with a job in its slot, inbox or queues.
     stealable: Vec<u64>,
+    /// Bit per core with a job in `later`.
+    stealable_later: Vec<u64>,
     /// Bit per core below the top capacity running a critical job.
     critical_small: Vec<u64>,
     /// Bit per core asked to move its job and not answered yet.
@@ -377,10 +399,12 @@ impl Place {
         let mut inbox = Vec::with_capacity(n);
         let mut queue = Vec::with_capacity(n);
         let mut urgent = Vec::with_capacity(n);
+        let mut later = Vec::with_capacity(n);
         for _ in 0..n {
             inbox.push(VecDeque::with_capacity(64));
             queue.push(VecDeque::with_capacity(256));
             urgent.push(VecDeque::with_capacity(64));
+            later.push(VecDeque::new());
         }
         let mut place = Place {
             now: 0,
@@ -394,9 +418,11 @@ impl Place {
             inbox,
             queue,
             urgent,
+            later,
             parked,
             parked_count: n as u32,
             stealable: zeros(words),
+            stealable_later: zeros(words),
             critical_small: zeros(words),
             yield_sent: zeros(words),
             jobs: Vec::with_capacity(jobs),
@@ -466,7 +492,7 @@ impl Place {
 
     /// `job` is new, world id `global`; `spawner` is its parent's local id when its parent
     /// runs here.
-    fn spawn(&mut self, job: u32, global: JobId, spawner: Option<u32>, hint: Affinity, critical: bool) {
+    fn spawn(&mut self, job: u32, global: JobId, spawner: Option<u32>, hint: Affinity, critical: bool, background: bool) {
         let need = job as usize + 1;
         if self.jobs.len() < need {
             self.jobs.resize(need, VACANT);
@@ -501,7 +527,7 @@ impl Place {
             },
             Affinity::Any => self.least_loaded(critical, |_, _| true),
         };
-        self.jobs[j] = Job { state: JobState::Queued, critical, timed: false, core: home, global: global.0 };
+        self.jobs[j] = Job { state: JobState::Queued, critical, background, timed: false, core: home, global: global.0 };
         if spawner == Some(home) {
             self.enqueue(home, job);
             self.refresh(home);
@@ -585,6 +611,30 @@ impl Place {
         }
     }
 
+    /// A job waits for `job`: a background job not started leaves its core's `later` queue for
+    /// its other one, and a critical waiter makes it critical. Never lowers it. Whether it
+    /// changed.
+    fn raise(&mut self, job: u32, critical: bool) -> bool {
+        let j = job as usize;
+        let mut changed = false;
+        if self.jobs[j].background {
+            self.jobs[j].background = false;
+            changed = true;
+            let core = self.jobs[j].core;
+            let later = &mut self.later[core as usize];
+            if let Some(at) = later.iter().position(|&it| it == job) {
+                later.remove(at);
+                self.enqueue(core, job);
+                self.refresh(core);
+            }
+        }
+        if critical && !self.jobs[j].critical {
+            self.set_critical(job, true);
+            changed = true;
+        }
+        changed
+    }
+
     fn core_idle(&mut self, core: CoreId) {
         let c = core.0 as usize;
         assert!(self.running[c] == NONE, "core {} idle while it runs job {}", core.0, self.running[c]);
@@ -621,10 +671,12 @@ impl Place {
         set(&mut self.yield_sent, core, false);
     }
 
-    /// On `core`'s critical queue or its other one, by the job's class.
+    /// On `core`'s critical queue, its background one or its other one, by the job's class.
     fn enqueue(&mut self, core: u32, job: u32) {
         self.jobs[job as usize].core = core;
-        if self.jobs[job as usize].critical {
+        if self.jobs[job as usize].background {
+            self.later[core as usize].push_back(job);
+        } else if self.jobs[job as usize].critical {
             self.urgent[core as usize].push_back(job);
         } else {
             self.queue[core as usize].push_back(job);
@@ -656,6 +708,11 @@ impl Place {
         let critical = self.jobs[job as usize].critical;
         match self.nearest_parked(home, critical) {
             Some(parked) => self.hand(parked, job),
+            // Taken when its core has nothing else: nothing to tell it now.
+            None if self.jobs[job as usize].background => {
+                self.enqueue(home, job);
+                self.refresh(home);
+            }
             None => {
                 self.inbox[home as usize].push_back(job);
                 self.jobs[job as usize].core = home;
@@ -719,11 +776,14 @@ impl Place {
             || !self.queue[c].is_empty()
             || !self.urgent[c].is_empty();
         set(&mut self.stealable, core, has);
+        let later = !self.later[c].is_empty();
+        set(&mut self.stealable_later, core, later);
     }
 
     /// The nearest parked core to `core` for a job of this class, itself first: for a critical
     /// job the nearest of the top capacity, then any; for another, within each tier a smaller
     /// core first.
+    #[blaze::nonblocking]
     fn nearest_parked(&self, core: u32, critical: bool) -> Option<u32> {
         if self.parked_count == 0 {
             return None;
@@ -752,6 +812,7 @@ impl Place {
     }
 
     /// The nearest parked core other than `core` that `filter` allows, tier by tier.
+    #[blaze::nonblocking]
     fn search_parked(&self, core: u32, filter: Option<&[u64]>) -> Option<u32> {
         if self.parked_count == 0 {
             return None;
@@ -792,7 +853,9 @@ impl Place {
         best.map(|(_, core)| core).expect("a placement hint names a group or node with no core")
     }
 
-    /// `core` is free: it runs its next job, or steals, or parks.
+    /// `core` is free: it runs its next job, or steals, or parks. `#[blaze::nonblocking]`, as
+    /// what it calls: a core's pick never waits (it allocates: its queues grow).
+    #[blaze::nonblocking]
     fn pick(&mut self, core: u32) {
         let c = core as usize;
         debug_assert_eq!(self.running[c], NONE);
@@ -805,6 +868,7 @@ impl Place {
                 self.core_state[c] = CoreState::Busy;
                 self.running[c] = job;
                 self.jobs[job as usize].state = JobState::Running;
+                self.jobs[job as usize].background = false;
                 self.jobs[job as usize].core = core;
                 self.decisions.push(Decision::Run { core: CoreId(core), job: JobId(job) });
                 self.stats.runs += 1;
@@ -817,6 +881,7 @@ impl Place {
         }
     }
 
+    #[blaze::nonblocking]
     fn take_own(&mut self, core: u32) -> Option<u32> {
         let c = core as usize;
         let reserved = std::mem::replace(&mut self.reserved[c], NONE);
@@ -834,24 +899,39 @@ impl Place {
             .pop_front()
             .or_else(|| self.urgent[c].pop_back())
             .or_else(|| self.queue[c].pop_back())
-            .or_else(|| (self.slot[c] != NONE).then(|| std::mem::replace(&mut self.slot[c], NONE)));
+            .or_else(|| (self.slot[c] != NONE).then(|| std::mem::replace(&mut self.slot[c], NONE)))
+            .or_else(|| self.later[c].pop_front());
         self.refresh(core);
         job
     }
 
     /// The nearest core with work, tier by tier; the thief runs the oldest of half its queue
     /// and keeps the rest.
+    #[blaze::nonblocking]
     fn steal_for(&mut self, thief: u32) -> Option<u32> {
         let start = thief as usize + 1;
-        let (level, victim) = self
+        let found = self
             .cores
             .tiers(thief)
-            .find_map(|(level, mask)| first_from(&self.stealable, mask, None, start).map(|victim| (level, victim)))?;
+            .find_map(|(level, mask)| first_from(&self.stealable, mask, None, start).map(|victim| (level, victim)));
+        let Some((level, victim)) = found else {
+            // Background work, oldest first, one job at a time: no core has other work.
+            let (level, victim) = self
+                .cores
+                .tiers(thief)
+                .find_map(|(level, mask)| first_from(&self.stealable_later, mask, None, start).map(|victim| (level, victim)))?;
+            self.stats.steals[level as usize] += 1;
+            self.record_steal(thief, victim);
+            let job = self.later[victim as usize].pop_front().expect("a core with background work has a job in it");
+            self.refresh(victim);
+            return Some(job);
+        };
         self.stats.steals[level as usize] += 1;
         self.record_steal(thief, victim);
         Some(self.steal_half(thief, victim))
     }
 
+    #[blaze::nonblocking]
     fn steal_half(&mut self, thief: u32, victim: u32) -> u32 {
         let (t, v) = (thief as usize, victim as usize);
         let big = self.cores.is_big(thief);
@@ -886,6 +966,7 @@ impl Place {
             .or_else(|| self.queue[c].pop_front())
             .or_else(|| self.inbox[c].pop_front())
             .or_else(|| (self.slot[c] != NONE).then(|| std::mem::replace(&mut self.slot[c], NONE)))
+            .or_else(|| self.later[c].pop_front())
             .expect("a stealable core has a job");
         self.refresh(core);
         job
@@ -893,7 +974,7 @@ impl Place {
 
     /// While a core is parked, `core`'s stealable jobs go one each to the nearest parked cores.
     fn balance(&mut self, core: u32) {
-        while self.parked_count > 0 && get(&self.stealable, core) {
+        while self.parked_count > 0 && (get(&self.stealable, core) || get(&self.stealable_later, core)) {
             let job = self.take_oldest(core);
             let thief = self
                 .nearest_parked(core, self.jobs[job as usize].critical)
@@ -939,11 +1020,15 @@ impl Place {
                 || !self.queue[c].is_empty()
                 || !self.urgent[c].is_empty();
             assert_eq!(get(&self.stealable, core), held, "core {c}'s stealable bit");
+            assert_eq!(get(&self.stealable_later, core), !self.later[c].is_empty(), "core {c}'s background bit");
             assert_eq!(get(&self.parked, core), self.core_state[c] == CoreState::Parked, "core {c}'s parked bit");
             match self.core_state[c] {
                 CoreState::Parked => {
                     parked += 1;
-                    assert!(!held && self.running[c] == NONE && self.reserved[c] == NONE, "parked core {c} holds work");
+                    assert!(
+                        !held && self.later[c].is_empty() && self.running[c] == NONE && self.reserved[c] == NONE,
+                        "parked core {c} holds work"
+                    );
                 }
                 CoreState::Woken => assert!(self.running[c] == NONE && self.reserved[c] != NONE, "woken core {c}"),
                 CoreState::Busy => assert!(self.running[c] != NONE && self.reserved[c] == NONE, "busy core {c}"),
@@ -966,17 +1051,29 @@ impl Place {
                 seen[job as usize] += 1;
                 assert_eq!(self.jobs[job as usize].state, JobState::Queued, "job {job} held by core {c}");
                 assert_eq!(self.jobs[job as usize].core, core, "job {job} held by core {c}");
+                assert!(
+                    !self.jobs[job as usize].background || job == self.reserved[c],
+                    "background job {job} outside core {c}'s background queue"
+                );
+            }
+            for &job in &self.later[c] {
+                seen[job as usize] += 1;
+                assert_eq!(self.jobs[job as usize].state, JobState::Queued, "job {job} in core {c}'s background queue");
+                assert_eq!(self.jobs[job as usize].core, core, "job {job} in core {c}'s background queue");
+                assert!(self.jobs[job as usize].background, "job {job} raised but in core {c}'s background queue");
             }
         }
         assert_eq!(parked, self.parked_count, "parked count");
         if parked > 0 {
             assert!(self.stealable.iter().all(|&it| it == 0), "a job is stealable while a core is parked");
+            assert!(self.stealable_later.iter().all(|&it| it == 0), "background work waits while a core is parked");
         }
         for (job, record) in self.jobs.iter().enumerate() {
             let state = record.state;
             let held = seen[job];
             assert_eq!(held, u32::from(state == JobState::Queued), "job {job} ({state:?}) is held {held} times");
             assert!(!record.timed || state == JobState::Suspended, "job {job} timed while {state:?}");
+            assert!(!record.background || state == JobState::Queued, "background job {job} {state:?}, not queued");
         }
     }
 }
@@ -1011,6 +1108,10 @@ pub(crate) struct World {
     /// The waits of the last stall ([`World::stall`]), and the jobs it woke not yet told.
     stall: Vec<(JobId, StallWait)>,
     stalled: Vec<JobId>,
+    /// The timed waits of jobs of members of their own placement, by world id, on the clock
+    /// [`World::advance_own_clock`] reads; made at the first.
+    own_timers: Option<Wheel<u32>>,
+    own_now: u64,
 }
 
 impl World {
@@ -1027,6 +1128,8 @@ impl World {
             here: Vec::with_capacity(64),
             stall: Vec::new(),
             stalled: Vec::new(),
+            own_timers: None,
+            own_now: 0,
         }
     }
 
@@ -1144,7 +1247,7 @@ impl World {
             (home.member == member).then_some(home.local)
         });
         assert!(self.graph.life(job) != Life::Live, "job {} spawned while it is live", job.0);
-        self.place_mut(member).spawn(local, job, spawner, how.hint, how.critical);
+        self.place_mut(member).spawn(local, job, spawner, how.hint, how.critical, how.background);
         self.graph.add(job, Home { member, local }, how.counter);
         self.touch(member);
     }
@@ -1309,7 +1412,15 @@ impl World {
         assert_eq!(home, member, "job {} suspended on a member not its own", job.0);
         if member & OWN != 0 {
             let on = match on {
-                Wait::Until(_) => panic!("job {} of a member of its own placement waits for a time", job.0),
+                Wait::Until(at) => {
+                    // Not a wait in the graph: no stall counts it, as its clock ends it.
+                    if at <= self.own_now {
+                        return Ok(Suspend::Ready);
+                    }
+                    self.own_timers.get_or_insert_with(Wheel::new).insert(at, job.0);
+                    self.own_mut(member).state[local as usize] = OwnState::Waiting;
+                    return Ok(Suspend::Waiting);
+                }
                 Wait::Job(other) => On::Job(other),
                 Wait::Key(key) => On::Key(key),
                 Wait::Counter(counter) => On::Counter(counter),
@@ -1335,6 +1446,9 @@ impl World {
         match self.graph.wait(job, on) {
             Ok(Waited::Ready) => Ok(Suspend::Ready),
             Ok(Waited::Waiting) => {
+                // Before its core picks its next job, which may be the one raised.
+                let critical = self.place(member).is_critical(local);
+                self.raise_along(job, critical);
                 self.place_mut(member).suspend(local);
                 self.touch(member);
                 Ok(Suspend::Waiting)
@@ -1344,6 +1458,50 @@ impl World {
                 Err(cycle)
             }
         }
+    }
+
+    /// `waiter` (critical or not) waits: each job along its waits (the job it waits for, the
+    /// claimer of its key, and theirs in turn) is raised to it ([`Place::raise`]). A job of a
+    /// member of its own placement ends the walk: its member orders its own queues.
+    fn raise_along(&mut self, waiter: JobId, critical: bool) {
+        let mut at = waiter;
+        // The graph refuses a cycle of waits, so the walk ends; the bound says so.
+        for _ in 0..=self.graph.job_count() {
+            let Some(next) = self.graph.waits_for(at) else { return };
+            let home = self.graph.home(next);
+            if home.member & OWN != 0 {
+                return;
+            }
+            let Some(Some(place)) = self.members.get_mut(home.member as usize) else { return };
+            // A job already at the waiter's class raised its own waits to it, as it began them
+            // or as it was raised ([`World::set_critical`] too).
+            if !place.raise(home.local, critical) {
+                return;
+            }
+            self.touch(home.member);
+            at = next;
+        }
+        panic!("the waits from job {} go on past every job of the graph: a cycle the graph let in", waiter.0);
+    }
+
+    /// The clock of the timed waits of members of their own placement reads `now`: each due by
+    /// then wakes, handed back to its member as a woken job is.
+    pub(crate) fn advance_own_clock(&mut self, now: u64) {
+        self.own_now = self.own_now.max(now);
+        let Some(timers) = &mut self.own_timers else {
+            return;
+        };
+        let mut woken = std::mem::take(&mut self.woken);
+        woken.clear();
+        timers.advance(self.own_now, |_, job| woken.push(job));
+        self.woken = woken;
+        self.split(None);
+    }
+
+    /// When the next timed wait of a member of its own placement is due, on the clock of
+    /// [`World::advance_own_clock`].
+    pub(crate) fn next_own_deadline(&mut self) -> Option<u64> {
+        self.own_timers.as_mut()?.next_deadline()
     }
 
     /// The woken jobs in `self.woken` of `member` into `self.here` (local ids), the others
@@ -1449,6 +1607,9 @@ impl World {
         if let Some(Some(place)) = self.members.get_mut(member as usize) {
             place.set_critical(local, critical);
             self.touch(member);
+            if critical {
+                self.raise_along(job, true);
+            }
         }
     }
 

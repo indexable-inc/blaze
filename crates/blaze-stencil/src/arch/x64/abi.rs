@@ -270,6 +270,18 @@ pub fn stack_args(sig: &ir::Signature) -> Result<u32, Error> {
     args(sig, |_, _, _| Ok(()))
 }
 
+/// Where `sig`'s last stack argument ends, unrounded, Windows' shadow space counted and its
+/// implicit copies not: what every caller of `sig`, of any backend, reserves above its return
+/// address, so what a tail call from a function of `sig` may write.
+pub fn arg_bytes(sig: &ir::Signature) -> Result<u32, Error> {
+    check(sig.call_conv)?;
+    let mut assign = Assign::new(sig.call_conv, false, 0);
+    for param in &sig.params {
+        assign.next(param)?;
+    }
+    Ok(assign.stack)
+}
+
 /// Calls `f` with each return value of `sig` and its place (a register, or a pair of them),
 /// in order. A signature with a `StructReturn` argument returns nothing but that pointer, in
 /// `rax`; `f` is not given it (`k` counts `sig.returns`), and a caller ignores it, as

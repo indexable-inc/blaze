@@ -23,10 +23,11 @@
 //! waiters the run had at once, on an ask of one not compiled yet or on its answers.
 
 use std::collections::VecDeque;
-use std::collections::hash_map::Entry;
+use blaze_hash::hash_map::Entry;
 use std::sync::Arc;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_inproc::ask;
 use blaze_mem::{Handle, Slab, Tag};
@@ -97,11 +98,11 @@ pub struct Fetcher {
     target: Vec<u64>,
     queues: [VecDeque<LazyId>; PRIORITIES],
     /// The first and last waiter of each function being asked for.
-    waiters: HashMap<u32, (Handle<Waiting>, Handle<Waiting>)>,
+    waiters: HashMap<u32, (Handle<Waiting>, Handle<Waiting>), Global>,
     waiting: Slab<Waiting>,
-    failures: HashMap<u32, Arc<str>>,
+    failures: HashMap<u32, Arc<str>, Global>,
     /// Whether a failed function was asked for: stopped once.
-    stopped: HashSet<u32>,
+    stopped: HashSet<u32, Global>,
     workers: u32,
     running: u32,
     running_background: u32,
@@ -120,10 +121,10 @@ impl Fetcher {
             priority: vec![Priority::Idle; count], // alloc: setup, a column per run
             target: vec![0; count], // alloc: setup, a column per run
             queues: Default::default(),
-            waiters: HashMap::default(),
+            waiters: HashMap::new_in(Global),
             waiting,
-            failures: HashMap::default(),
-            stopped: HashSet::default(),
+            failures: HashMap::new_in(Global),
+            stopped: HashSet::new_in(Global),
             workers: workers.max(1),
             running: 0,
             running_background: 0,

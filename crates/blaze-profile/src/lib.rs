@@ -26,6 +26,8 @@
 //! naming every thread's open spans; and in the daemon the CPU [`sampler`].
 //! docs/profiling.md says how to read them.
 
+#![feature(allocator_api)]
+
 use std::{
     cell::{Cell, RefCell},
     fmt::Write as _,
@@ -39,6 +41,7 @@ use std::{
 };
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use crossbeam_queue::SegQueue;
 use parking_lot::{Mutex, MutexGuard};
 use serde_derive::{Deserialize, Serialize};
@@ -55,15 +58,17 @@ pub mod history;
 pub mod hot;
 pub mod identity;
 pub mod live;
+pub mod perf;
 pub mod sampler;
 pub mod schema;
 pub mod span;
 pub mod sql;
 mod symbols;
+pub mod time;
 pub mod views;
 pub mod watchdog;
 
-pub use flight::{FiberStack, Plot, QueryCounts, fiber_stack, moved, plot, query_counts};
+pub use flight::{FiberStack, Plot, fiber_stack, moved, plot};
 pub use watchdog::{Stall, Watchdog};
 
 /// The variable that turns profiling on, naming the directory the profile is written to.
@@ -281,15 +286,16 @@ fn carry_with_fiber_jobs() {
         fiber::carry(fiber::Carried { take: flight::take_open, put: flight::put_open });
         _ = fiber::observe(observed);
         _ = fiber::observe_idle(idled);
+        _ = fiber::observe_spawner(flight::running_job);
         _ = pump::span_waits(pump::WaitSpans { begin: wait_began, end: wait_ended, held: hold_began });
         _ = pool::span_jobs(pool::JobSpans { began: job_began, ended: job_ended });
     });
 }
 
-/// Opens and enters the span of a job of `kind` beginning on this thread ([`span::Job`]): the
-/// span of the job it runs inside, for [`job_ended`].
+/// Opens and enters the span of a job of `kind` beginning on this thread ([`span::Job`]), named
+/// by the job its switches name: the span of the job it runs inside, for [`job_ended`].
 fn job_began(kind: &'static str) -> u64 {
-    flight::job_began(span::open_raw(span::Job { kind: span::Name::kept(kind) }))
+    flight::job_began(span::open_raw(span::Job { kind: span::Name::kept(kind), job: flight::running_job() }))
 }
 
 /// Closes the span of the job that ended on this thread, its last segment if it parked, and
@@ -357,14 +363,17 @@ fn observed(switch: blaze_graph::sched::Switch) {
     use blaze_graph::sched::{SwitchEvent, Wait};
     use flight::{Switched, WaitedOn};
     let (event, waited) = match switch.event {
+        SwitchEvent::Began { spawner } => return flight::job_begins(spawner),
         SwitchEvent::Started => (Switched::Started, None),
+        SwitchEvent::Ready => (Switched::Ready, None),
         SwitchEvent::Resumed => (Switched::Resumed, None),
         SwitchEvent::Ended => (Switched::Ended, None),
+        SwitchEvent::Ran => (Switched::Ran, None),
         SwitchEvent::Parked(None) => (Switched::Parked, Some((WaitedOn::Moved, 0))),
         SwitchEvent::Parked(Some(on)) => (
             Switched::Parked,
             Some(match on {
-                Wait::Job(job) => (WaitedOn::Job, u64::from(job.0)),
+                Wait::Job(job) => (WaitedOn::Job, u64::from(switch.awaited) << 32 | u64::from(job.0)),
                 Wait::Key(key) => {
                     let [a, b, c, d, e, f, g, h, ..] = key.0;
                     (WaitedOn::Key, u64::from_le_bytes([a, b, c, d, e, f, g, h]))
@@ -415,9 +424,9 @@ struct Recorded {
     tid: u64,
     thread: String,
     events: Vec<Event>,
-    phases: HashMap<&'static str, Cost>,
-    subjects: HashMap<(&'static str, Box<str>), Cost>,
-    passes: HashMap<&'static str, Cost>,
+    phases: HashMap<&'static str, Cost, Global>,
+    subjects: HashMap<(&'static str, Box<str>), Cost, Global>,
+    passes: HashMap<&'static str, Cost, Global>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -516,11 +525,33 @@ pub fn thread_cpu() -> Option<u64> {
 struct Recorder;
 
 impl Recorder {
+    /// A span or an event is kept by one rule: an event's name (`event <file>:<line>`) is no
+    /// query's, so its target decides.
     fn wanted(meta: &tracing::Metadata<'_>) -> bool {
-        meta.is_span()
-            && *meta.level() <= tracing::Level::INFO
-            && (ours(meta) || meta.name().ends_with("_query"))
+        (meta.is_span() || meta.is_event()) && *meta.level() <= LEVEL && keeps(meta.target(), meta.name())
     }
+}
+
+/// The target a span names to be kept wherever it is written: a span's target is its module's
+/// path unless it names one, so a span outside a `blaze*` crate writes `target: "blaze"`.
+pub const TARGET: &str = "blaze";
+
+/// The least severe level of a span kept.
+pub const LEVEL: tracing::Level = tracing::Level::INFO;
+
+/// Whether a span or event of `target` named `name`, at a level [`keeps_level`] keeps, is kept: a
+/// `blaze` one (its target starts with [`TARGET`]) or a rust-analyzer query's span (`*_query`;
+/// an event's name, `event <file>:<line>`, is never one). Every other one costs its call and is
+/// never seen, as `blaze::unrecorded_span` says where it is written. A kept event is a row of
+/// the `events` table.
+pub fn keeps(target: &str, name: &str) -> bool {
+    target.starts_with(TARGET) || name.ends_with("_query")
+}
+
+/// Whether spans of the level `tracing` names `level` (`"info"`, `"DEBUG"`, `"3"`) are kept;
+/// false for a name that is no level's.
+pub fn keeps_level(level: &str) -> bool {
+    level.parse::<tracing::Level>().is_ok_and(|it| it <= LEVEL)
 }
 
 /// Whether spans of `meta` are kept; those that are get a site in the flight recorder.
@@ -564,7 +595,7 @@ pub(crate) fn closed(id: u64) -> bool {
 }
 
 fn ours(meta: &tracing::Metadata<'_>) -> bool {
-    meta.target().starts_with("blaze")
+    meta.target().starts_with(TARGET)
 }
 
 /// The field `subject` of a span: what it is of, a function or a crate.
@@ -598,7 +629,7 @@ impl tracing::Subscriber for Recorder {
     }
 
     fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
-        Some(tracing::level_filters::LevelFilter::INFO)
+        Some(tracing::level_filters::LevelFilter::from_level(LEVEL))
     }
 
     fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
@@ -620,7 +651,11 @@ impl tracing::Subscriber for Recorder {
 
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
 
-    fn event(&self, _: &tracing::Event<'_>) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if let Some(site) = flight::site(event.metadata()) {
+            flight::evented(event, site);
+        }
+    }
 
     fn enter(&self, id: &tracing::span::Id) {
         flight::entered(id.into_u64());
@@ -808,6 +843,10 @@ struct Part {
     /// What the CPU sampler was: on and how, or why it was off.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     sampler: String,
+    /// The fibers' tracks as trace events ([`time::trace::of_read`]): their runs on cores,
+    /// their parks and the wakes between them. Only the flight recorder's part has them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fibers: Vec<serde_json::Value>,
 }
 
 /// A [`Plot`]'s value at a moment, on the thread that gave it.
@@ -1025,9 +1064,9 @@ fn put_together(dir: &Path, spans: &[Span], start: u64, end: u64) -> std::io::Re
     let mut out = std::io::BufWriter::new(std::fs::File::create(&trace)?);
     chrome(&mut out, spans, &parts, start, end)?;
     out.flush()?;
-    let mut phases: HashMap<&str, Cost> = HashMap::default();
-    let mut subjects: HashMap<(&str, &str), Cost> = HashMap::default();
-    let mut passes: HashMap<&str, Cost> = HashMap::default();
+    let mut phases: HashMap<&str, Cost, Global> = HashMap::new_in(Global);
+    let mut subjects: HashMap<(&str, &str), Cost, Global> = HashMap::new_in(Global);
+    let mut passes: HashMap<&str, Cost, Global> = HashMap::new_in(Global);
     for part in &parts {
         for (name, cost) in &part.phases {
             phases.entry(name.as_str()).or_default().merge(*cost);
@@ -1083,7 +1122,7 @@ fn put_together(dir: &Path, spans: &[Span], start: u64, end: u64) -> std::io::Re
     for file in files {
         _ = std::fs::remove_file(file);
     }
-    let processes = parts.iter().map(|it| it.pid).collect::<blaze_hash::HashSet<_>>().len();
+    let processes = parts.iter().map(|it| it.pid).collect::<blaze_hash::HashSet<_, Global>>().len();
     // alloc: writing the profile, once a build
     let mut said = format!(
         "blaze: profile of {processes} processes in {}: trace.json (ui.perfetto.dev), \
@@ -1118,7 +1157,7 @@ fn chrome(
         write!(out, "{comma}{event}")
     };
     out.write_all(b"{\"traceEvents\":[\n")?;
-    let mut named = blaze_hash::HashSet::default();
+    let mut named = blaze_hash::HashSet::new_in(Global);
     for part in parts {
         if named.insert((part.pid, u64::MAX)) {
             put(
@@ -1188,6 +1227,10 @@ fn chrome(
                 "ts": it.at_us, "dur": 1, "args": {"stack": it.stack.join("\n")}}),
             )?;
         }
+        for it in &part.fibers {
+            // clone: writing the profile, on demand
+            put(&mut *out, it.clone())?;
+        }
     }
     for it in spans {
         let process = match it.level {
@@ -1230,7 +1273,7 @@ fn chrome(
     let mut ours = json!({"start_us": start, "total_us": end - start, "breakdown": breakdown});
     // The samples folded, outermost function first and `;` between, with how often each stack
     // was seen, most first: a flame graph's input, and text an agent reads.
-    let mut folded: HashMap<String, u64> = HashMap::default();
+    let mut folded: HashMap<String, u64, Global> = HashMap::new_in(Global);
     for it in parts.iter().flat_map(|part| &part.samples) {
         // alloc: writing the profile, once a build
         let stack: Vec<&str> = it.stack.iter().rev().map(String::as_str).collect();

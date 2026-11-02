@@ -6,6 +6,7 @@
 //! where a woken job goes. No IO, no clock.
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 
 use super::{CounterId, Cycle, JobId, MAX_JOBS, NONE};
 use crate::Key;
@@ -121,7 +122,7 @@ pub(crate) struct Graph {
     dfs: Vec<u32>,
 
     // Per key flight.
-    keys: HashMap<Key, u32>,
+    keys: HashMap<Key, u32, Global>, // alloc: a graph's key index, for the graph's life, longer than any task
     key_name: Vec<Key>,
     key_claimer: Vec<u32>,
     key_waiters: Vec<u32>,
@@ -152,7 +153,7 @@ impl Graph {
             jobs: Vec::with_capacity(jobs),
             epoch: 0,
             dfs: Vec::with_capacity(64),
-            keys: HashMap::with_capacity_and_hasher(jobs, Default::default()),
+            keys: HashMap::with_capacity_in(jobs, Global), // alloc: a graph's key index, for the graph's life, longer than any task
             key_name: Vec::with_capacity(jobs),
             key_claimer: Vec::with_capacity(jobs),
             key_waiters: Vec::with_capacity(jobs),
@@ -699,6 +700,30 @@ impl Graph {
             let head = std::mem::replace(&mut self.counter_waiters[c], NONE);
             self.drain(head, woken);
         }
+    }
+
+    /// The job that makes `key`'s current flight, if a job does.
+    pub(crate) fn claimer(&self, key: Key) -> Option<JobId> {
+        let claimer = self.key_claimer[*self.keys.get(&key)? as usize];
+        (claimer != NONE).then_some(JobId(claimer))
+    }
+
+    /// The job `job`'s wait ends with: the one it waits for, or the claimer of the key it
+    /// waits for. None for a wait on a counter, or on a key no job claimed.
+    pub(crate) fn waits_for(&self, job: JobId) -> Option<JobId> {
+        match self.jobs.get(job.0 as usize)?.wait {
+            Target::Job(other) => Some(JobId(other)),
+            Target::Key(entry) => {
+                let claimer = self.key_claimer[entry as usize];
+                (claimer != NONE).then_some(JobId(claimer))
+            }
+            Target::None | Target::Counter(_) => None,
+        }
+    }
+
+    /// How many job ids the graph has room for: a bound on any walk along its waits.
+    pub(crate) fn job_count(&self) -> usize {
+        self.jobs.len()
     }
 
     /// Whether `job` waits on the graph now.

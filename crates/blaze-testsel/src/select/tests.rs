@@ -119,7 +119,7 @@ impl Case {
     }
 
     fn subject(&self) -> Subject<'_> {
-        Subject { name: "parse::nested", attrs: &self.attrs, outside: self.outside, reached: &self.reached }
+        Subject { name: "parse::nested", attrs: &self.attrs, outside: self.outside, reached: Reached::Known(&self.reached) }
     }
 
     fn choose(&self, image: &Image, world: &World) -> Choice {
@@ -127,7 +127,7 @@ impl Case {
     }
 
     fn keep(&mut self, image: &Image, ran: &Ran<'_>) -> Result<Kept, RecordError> {
-        let subject = Subject { name: "parse::nested", attrs: &self.attrs, outside: self.outside, reached: &self.reached };
+        let subject = Subject { name: "parse::nested", attrs: &self.attrs, outside: self.outside, reached: Reached::Known(&self.reached) };
         keep(&mut self.store, given(), image, &subject, ran)
     }
 

@@ -19,6 +19,8 @@
 //!
 //! [`Resolve`] is a resolved graph, and [`lockfile`] reads and writes it as `Cargo.lock`.
 
+#![feature(allocator_api)]
+
 mod dependency;
 mod graph;
 pub mod lockfile;

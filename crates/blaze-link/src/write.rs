@@ -21,6 +21,7 @@ use std::sync::Arc;
 use blaze_codegen::Arch;
 use blaze_graph::par;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::radix;
 
 use crate::arena::{FrameVec, collect_in};
@@ -396,6 +397,12 @@ struct Job<'f, 's> {
     source: Source<'s>,
 }
 
+/// wasm's `call`, `return_call`, `unreachable` and `nop` opcodes.
+const CALL: u8 = 0x10;
+const RETURN_CALL: u8 = 0x12;
+const UNREACHABLE: u8 = 0x00;
+const NOP: u8 = 0x01;
+
 /// A piece is split into jobs of this many fixups when it has more.
 const SPLIT: usize = 2048;
 
@@ -580,6 +587,55 @@ impl Reloc<'_> {
                                 Err(_) => return Err(fail(fixup, "not a function's start".into())),
                             },
                             Value::Absolute(0) if slot == 1 => 0,
+                            // A direct call of an undefined weak function, which C guards
+                            // with a test of its address (wasi-libc's preopens.c calls
+                            // `__wasilibc_find_relpath_alloc` only when `chdir` is linked):
+                            // the call becomes a trap, as wasm-ld's `undefined_weak:` stub
+                            // traps, `unreachable` and the index's five bytes as `nop`s.
+                            // `unreachable` takes any arguments and gives any results.
+                            Value::Absolute(0)
+                                if r_type == reloc::WASM_FUNCTION_INDEX_LEB && place.len() >= 5 =>
+                            {
+                                // The opcode is the piece's byte before the index: a piece with
+                                // a format relocation is never cut into jobs (`split`), so this
+                                // job is the whole piece and `field` its bytes.
+                                if job.lo != 0 {
+                                    return Err(fail(
+                                        fixup,
+                                        // alloc: error path
+                                        format!(
+                                            "{} is an undefined weak function called from a job cut at {:#x} \
+                                             of its piece, whose call opcode is before the cut",
+                                            symbols.describe(fixup.target),
+                                            job.lo
+                                        ),
+                                    ));
+                                }
+                                let at = fixup.at as usize;
+                                match at.checked_sub(1).map(|it| field[it]) {
+                                    // `call` and `return_call` alike: `unreachable` ends the
+                                    // function either way.
+                                    Some(CALL | RETURN_CALL) => {
+                                        field[at - 1] = UNREACHABLE;
+                                        field[at..at + 5].fill(NOP);
+                                        continue;
+                                    }
+                                    // The same call rewritten by the link before, whose bytes
+                                    // a relink starts from (`Source::Bytes`).
+                                    Some(UNREACHABLE) if field.get(at..at + 5) == Some(&[NOP; 5][..]) => continue,
+                                    _ => {
+                                        return Err(fail(
+                                            fixup,
+                                            // alloc: error path
+                                            format!(
+                                                "{} is an undefined weak function, reached by an index \
+                                                 that is no call's, which has no null function to go to",
+                                                symbols.describe(fixup.target)
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
                             _ => {
                                 return Err(fail(
                                     fixup,
@@ -1621,12 +1677,7 @@ impl<'a> Stage<'a> {
             }
             None => None,
         };
-        let full = blaze_ids::Hasher::new("blaze v2 link image 1")
-            .update(&self.new.lineage[..])
-            .update(&self.new.generation.to_le_bytes())
-            .finish();
-        let mut id = [0; 16];
-        id.copy_from_slice(&full.0[..16]);
+        let id = self.new.image_id();
         let (init, fini) = (image("_init"), image("_fini"));
         Ok(Parts { regions, exports: out, entry, init, fini, id })
     }
@@ -1672,7 +1723,7 @@ impl<'a> Stage<'a> {
                 let from = chunk * DEBUG_CHUNK;
                 // alloc: once per task of DEBUG_CHUNK functions, its files (a few)
                 let mut met: Met<'_> = Vec::new();
-                let mut file_of: HashMap<(IdNo, u32), u32> = HashMap::default();
+                let mut file_of: HashMap<(IdNo, u32), u32, Global> = HashMap::new_in(Global);
                 let mut last: Option<(&blaze_ids::ContentId, IdNo, &crate::position::Spans)> = None;
                 let mut at = 0;
                 for (info, _) in &functions[from..(from + DEBUG_CHUNK).min(functions.len())] {
@@ -1707,7 +1758,7 @@ impl<'a> Stage<'a> {
             }); // alloc: once per stage that makes debug info, a result per task
         // alloc: once per stage that makes debug info, the files and each task's numbers for its own
         let mut files: Vec<&str> = Vec::new();
-        let mut file_of: HashMap<(IdNo, u32), u32> = HashMap::default();
+        let mut file_of: HashMap<(IdNo, u32), u32, Global> = HashMap::new_in(Global);
         let mut renumber: Vec<Vec<u32>> = Vec::with_capacity(met.len());
         for met in met {
             let numbers = met?

@@ -52,19 +52,55 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 20);
+    assert_eq!(blaze_lints().len(), 81);
     assert!(!lint.is_externally_loaded);
-    assert!(blaze_lints()[1..].iter().all(|it| it.default_level == Level::Allow && it.is_externally_loaded));
+    // The compiler's own and the release build's; blaze-lints loads every other.
+    let built: Vec<&str> = blaze_lints().iter().filter(|it| !it.is_externally_loaded).map(|it| it.name).collect();
+    assert_eq!(built, ["blaze::const_impure", "blaze::vecreport"]);
+    let general = group("blaze::general").expect("blaze's general group");
+    let internal = group("blaze::internal").expect("blaze's internal group");
+    let pedantic = group("blaze::pedantic_perf").expect("blaze's pedantic_perf group");
+    // `deny` by default: they fire only where the code asked for them (`#[blaze::checkfree]`,
+    // `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, `#[blaze::pure]`).
+    let deny = ["blaze::checkfree", "blaze::nopanic", "blaze::noalloc", "blaze::nonblocking", "blaze::pure"];
+    for it in &blaze_lints()[1..] {
+        let in_ = |g: &Group| g.lints.iter().any(|m| m.name == it.name);
+        let (in_general, in_internal, in_pedantic) = (in_(general), in_(internal), in_(pedantic));
+        assert_eq!(
+            usize::from(in_general) + usize::from(in_internal) + usize::from(in_pedantic),
+            1,
+            "`{}` is general, internal or pedantic_perf, once",
+            it.name
+        );
+        let level = if deny.contains(&it.name) {
+            Level::Deny
+        } else if in_general {
+            Level::Warn
+        } else {
+            Level::Allow
+        };
+        assert_eq!(it.default_level, level, "`{}`: a general lint warns, an internal or pedantic_perf one waits", it.name);
+    }
     let hot = group("blaze::hot").expect("blaze's group");
     let members: Vec<&str> = hot.lints.iter().map(|it| it.name).collect();
     assert_eq!(
         members,
-        ["blaze::hot_clone", "blaze::hot_alloc", "blaze::hot_alloc_call", "blaze::hot_dyn", "blaze::std_hashmap"]
+        [
+            "blaze::hot_clone",
+            "blaze::hot_alloc",
+            "blaze::hot_alloc_call",
+            "blaze::hot_dyn",
+            "blaze::default_hasher",
+            "blaze::implicit_allocator",
+            "blaze::large_move",
+            "blaze::cold_error",
+        ]
     );
     assert_eq!(store.check("hot", Some(BLAZE_TOOL)), Checked::Tool(&hot.lints, None));
     let hot_dyn = super::lint("blaze::hot_dyn").expect("blaze-lints' lint");
     assert_eq!(store.check("hot_dyn", Some(BLAZE_TOOL)), Checked::Tool(hot_dyn.id().alone(), None));
     assert_eq!(store.group_of(hot_dyn), None);
+    assert_eq!(store.check("std_hashmap", Some(BLAZE_TOOL)), Checked::Renamed("blaze::default_hasher"));
     assert_eq!(store.check("const_impure", Some(BLAZE_TOOL)), Checked::Tool(lint.id().alone(), None));
     assert_eq!(store.find_lints("blaze::const_impure"), Some(lint.id().alone()));
     assert!(matches!(store.check("const_purity", Some(BLAZE_TOOL)), Checked::NoLint { .. }));
@@ -106,6 +142,9 @@ fn counts_are_rustcs() {
             "unknown_or_malformed_diagnostic_attributes",
             "bad_style",
             "blaze::hot",
+            "blaze::general",
+            "blaze::pedantic_perf",
+            "blaze::internal",
         ]
     );
     assert_eq!(group("unused").unwrap().lints.len(), 24);

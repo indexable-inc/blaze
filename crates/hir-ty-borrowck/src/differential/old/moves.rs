@@ -17,6 +17,7 @@
 use std::ops::Range;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use rustc_type_ir::inherent::IntoKind;
 
 use hir_ty::{
@@ -96,7 +97,7 @@ pub(crate) struct MoveData {
     /// Each local's path, by its index.
     locals: Vec<u32>,
     /// The path below a path by one step.
-    steps: HashMap<(u32, PlaceElem), u32>,
+    steps: HashMap<(u32, PlaceElem), u32, Global>,
     pub(crate) moves: Vec<MoveOut>,
     pub(crate) inits: Vec<Init>,
     /// The moves and inits at each point and of each path, each in the order it was found.
@@ -115,7 +116,7 @@ struct Tree {
     /// The step from its parent of each path but a local's, by id less the number of locals.
     step: Vec<PlaceElem>,
     roots: usize,
-    steps: HashMap<(u32, PlaceElem), u32>,
+    steps: HashMap<(u32, PlaceElem), u32, Global>,
     moves: Vec<MoveOut>,
     inits: Vec<Init>,
 }
@@ -132,7 +133,7 @@ impl MoveData {
             next_sibling: Vec::with_capacity(roots * 2),
             step: Vec::with_capacity(roots),
             roots,
-            steps: HashMap::default(),
+            steps: HashMap::new_in(Global),
             moves: Vec::with_capacity(cfg.points / 2),
             inits: Vec::with_capacity(cfg.points / 2),
         };
@@ -484,7 +485,7 @@ impl Tree {
                 end[up] = end[up].max(end[path]);
             }
         }
-        let mut steps = HashMap::with_capacity_and_hasher(count - self.roots, Default::default());
+        let mut steps = HashMap::with_capacity_in(count - self.roots, Global);
         for old in self.roots..count {
             let up = renumbered[self.parent[old] as usize];
             steps.insert((up, self.step[old - self.roots]), renumbered[old]);
@@ -536,7 +537,10 @@ impl<'db> Ctx<'_, 'db> {
                 TyKind::Adt(def, _) if self.has_destructor(def.def_id()) => None,
                 _ => Some(*elem),
             },
-            ProjectionElem::Index(_) | ProjectionElem::Subslice { .. } => None,
+            // Not a path of its own: a move out of one is refused (`MoveErrorKind::ReflectedField`).
+            ProjectionElem::Index(_)
+            | ProjectionElem::Subslice { .. }
+            | ProjectionElem::ReflectedField(_) => None,
             &ProjectionElem::ConstantIndex { offset, from_end, .. } => match ty.ty.kind() {
                 TyKind::Array(_, len) => {
                     let len = try_const_usize(self.db, len)? as u64;

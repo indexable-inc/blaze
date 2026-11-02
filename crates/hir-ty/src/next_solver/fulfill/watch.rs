@@ -23,7 +23,7 @@ use super::{FulfillmentCtxt, NextSolverError, Pending};
 use crate::next_solver::{
     DbInterner, SolverContext, global_goals,
     infer::{
-        InferCtxt,
+        InferCtxt, InferCtxtInner,
         touched::{TouchedAt, VarTable},
     },
 };
@@ -165,21 +165,44 @@ impl Watches {
         !get(&self.dead, row)
     }
 
-    /// Watches `row` on every row of a table and on the storage `stalled_on` was read from.
-    fn watch(&mut self, row: usize, stalled_on: &GoalStalledOn<DbInterner<'_>>) {
+    /// Watches `row` on the root row, in its table, of every variable `stalled_on` names and on
+    /// the storage it was read from.
+    ///
+    /// The root, not the variable: a variable's value lives in its root's row, so once two
+    /// variables are unified, instantiating them writes only the root's row and a watch on the
+    /// other one would never wake. rustc's stalled-on check (`ty_or_const_infer_var_changed`,
+    /// `is_sub_unification_table_root_var`) reads through the root the same way. A root's row
+    /// is written when it gets a value and when it is put under another root, so a watch on it
+    /// wakes on every change of the set's value or root; the stall check then decides. The
+    /// roots are read without path halving, which never changes a root anyway.
+    fn watch(
+        &mut self,
+        row: usize,
+        stalled_on: &GoalStalledOn<DbInterner<'_>>,
+        inner: &InferCtxtInner<'_>,
+    ) {
         set(&mut self.watched, row);
         let row = row as u32;
         for &var in &stalled_on.stalled_vars {
             let (table, index) = match var {
-                TyOrConstInferVar::Ty(vid) => (VarTable::Ty, vid.as_u32()),
-                TyOrConstInferVar::TyInt(vid) => (VarTable::Int, vid.as_u32()),
-                TyOrConstInferVar::TyFloat(vid) => (VarTable::Float, vid.as_u32()),
-                TyOrConstInferVar::Const(vid) => (VarTable::Const, vid.as_u32()),
+                TyOrConstInferVar::Ty(vid) => {
+                    (VarTable::Ty, inner.type_variable_storage.root_var_shared(vid).as_u32())
+                }
+                TyOrConstInferVar::TyInt(vid) => {
+                    (VarTable::Int, inner.int_unification_storage.find_shared(vid).as_u32())
+                }
+                TyOrConstInferVar::TyFloat(vid) => {
+                    (VarTable::Float, inner.float_unification_storage.find_shared(vid).as_u32())
+                }
+                TyOrConstInferVar::Const(vid) => {
+                    (VarTable::Const, inner.const_unification_storage.find_shared(vid).as_u32())
+                }
             };
             self.link(table, index, row);
         }
         for &vid in &stalled_on.sub_roots {
-            self.link(VarTable::Sub, vid.as_u32(), row);
+            let root = inner.type_variable_storage.sub_root_var_shared(vid);
+            self.link(VarTable::Sub, root.as_u32(), row);
         }
         if let GoalStalledOnOpaques::Yes { .. } = stalled_on.opaques {
             // alloc: grown to the most rows stalled on opaque types at once.
@@ -279,7 +302,7 @@ fn get(bits: &[u64], at: usize) -> bool {
 impl<'db> Pending<'db> {
     /// Drops the rows finished in this call, keeping the others in order, and watches the kept
     /// rows that are not ready again under their new indices.
-    fn compact(&mut self) {
+    fn compact(&mut self, infcx: &InferCtxt<'_>) {
         let watches = &mut self.watches;
         let mut kept = 0;
         for at in 0..self.predicate.len() {
@@ -304,12 +327,13 @@ impl<'db> Pending<'db> {
         self.predicate.truncate(kept);
         self.recursion_depth.truncate(kept);
         self.stalled_on.truncate(kept);
-        self.rewatch();
+        self.rewatch(infcx);
     }
 
     /// Rebuilds every list from the rows that are not ready, which are watched on what they
     /// are stalled on. The cursors stay: nothing was written since the last drain.
-    fn rewatch(&mut self) {
+    fn rewatch(&mut self, infcx: &InferCtxt<'_>) {
+        let inner = infcx.inner.borrow();
         let watches = &mut self.watches;
         watches.unlink_all();
         watches.dead.fill(0);
@@ -322,7 +346,7 @@ impl<'db> Pending<'db> {
             let stalled_on = self.stalled_on[at]
                 .as_ref()
                 .expect("a pending obligation that is not ready was found stalled");
-            watches.watch(at, stalled_on);
+            watches.watch(at, stalled_on, &inner);
         }
     }
 }
@@ -381,7 +405,7 @@ impl<'db> FulfillmentCtxt<'db> {
                 if let Some(stalled_on) = &pending.stalled_on[at]
                     && delegate.goal_remains_stalled(stalled_on)
                 {
-                    pending.watches.watch(at, stalled_on);
+                    pending.watches.watch(at, stalled_on, &infcx.inner.borrow());
                     continue;
                 }
 
@@ -449,9 +473,9 @@ impl<'db> FulfillmentCtxt<'db> {
 
         let watches = &pending.watches;
         if watches.any_dead {
-            pending.compact();
+            pending.compact(infcx);
         } else if watches.linked > 2 * watches.keys + 64 {
-            pending.rewatch();
+            pending.rewatch(infcx);
         }
         any
     }

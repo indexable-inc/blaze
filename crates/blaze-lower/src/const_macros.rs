@@ -17,6 +17,7 @@ use base_db::{
     CrateTypes, CrateWorkspaceData, Db, Env, FileId,
 };
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_query::db::Durability;
 use blaze_units::{
@@ -61,7 +62,7 @@ pub(crate) struct Plan {
     /// group's macro crate is made before it (`crates::topological`).
     pub(crate) after: Vec<Vec<usize>>,
     /// By platform (none: the host): the crate of `const-ast`, once made.
-    pub(crate) const_ast: HashMap<Option<String>, Crate>,
+    pub(crate) const_ast: HashMap<Option<String>, Crate, Global>,
 }
 
 impl Plan {
@@ -83,15 +84,15 @@ pub(crate) struct Loaded {
 
 /// The macro crates `units` need: one for each package with const macros and platform a unit of
 /// it compiles for but its build script.
-pub(crate) fn plan(units: &Units, package_of: &HashMap<&str, usize>, whats: &[String]) -> Result<Plan, LowerError> {
+pub(crate) fn plan(units: &Units, package_of: &HashMap<&str, usize, Global>, whats: &[String]) -> Result<Plan, LowerError> {
     let all = &units.graph.units;
     let mut plan = Plan {
         group_of: vec![None; all.len()],
         groups: Vec::new(),
         after: vec![Vec::new(); all.len()],
-        const_ast: HashMap::default(),
+        const_ast: HashMap::new_in(Global),
     };
-    let mut by: HashMap<(usize, Option<&str>), usize> = HashMap::default();
+    let mut by: HashMap<(usize, Option<&str>), usize, Global> = HashMap::new_in(Global);
     for (index, unit) in all.iter().enumerate() {
         if unit.mode == Mode::RunCustomBuild || unit.target.is_custom_build() {
             continue;
@@ -264,6 +265,7 @@ pub(crate) fn make(
                 origin: CrateOrigin::Library { repo: None, name: Symbol::intern(CONST_AST_NAME) },
                 crate_attrs: Box::new([]),
                 target_kind: base_db::TargetKind::Lib { is_proc_macro: false },
+                manifest_kind: base_db::TargetKind::Lib { is_proc_macro: false },
                 crate_types: CrateTypes::of(&[CrateType::Rlib]),
                 proc_macro_cwd: Arc::new(abs(cx.const_ast_dir)?),
             };
@@ -308,6 +310,7 @@ pub(crate) fn make(
         origin: crates::origin(package_plan, unit),
         crate_attrs: Box::new([]),
         target_kind: base_db::TargetKind::Lib { is_proc_macro: true },
+        manifest_kind: base_db::TargetKind::Lib { is_proc_macro: true },
         crate_types: CrateTypes::of(&[CrateType::ProcMacro]),
         proc_macro_cwd: Arc::new(cx.proc_macro_cwd),
     };

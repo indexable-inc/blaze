@@ -22,9 +22,10 @@ use std::{marker::PhantomData, ptr};
 
 #[cfg(blaze_check)]
 use blaze_check::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use blaze_cas::Key;
 use blaze_ids::ContentId;
 
-use crate::{flight::Flights, template::Template};
+use crate::{backend::Shape, flight::Flights, template::Template};
 
 /// Slots of level 0; level `n` has `FIRST << n`. Under the model checker a level is a few
 /// slots, so a handful of puts spill and race to make the next level.
@@ -39,6 +40,13 @@ struct Entry {
 }
 
 type Level = [AtomicPtr<Entry>];
+
+/// A template [`Memo::put_keyed`] refused: another, `kept`, is under its store key.
+#[derive(Debug)]
+pub struct Refused<'m> {
+    pub kept: &'m Template,
+    pub given: Template,
+}
 
 pub struct Memo {
     /// Each a `Box<Level>` of `FIRST << n` slots, leaked; null until first used.
@@ -142,8 +150,35 @@ impl Memo {
 
     /// Keeps `template` as what `shape` compiles to, and gives what is kept: the first, if
     /// two workers compiled one shape at once. Both are the same compile; the first is kept
-    /// so every instantiation of the shape in a build shares one template.
-    pub fn put(&self, shape: ContentId, template: Template) -> &Template {
+    /// so every instantiation of the shape in a build shares one template. A [`Shape`], never
+    /// a store key: a template under a store key goes through [`Memo::put_keyed`], which
+    /// refuses another, so a build that takes one from the memo by its key may take it as a
+    /// store hit.
+    pub fn put(&self, shape: Shape, template: Template) -> &Template {
+        self.insert(shape.key(), template).0
+    }
+
+    /// [`Memo::put`] by a shape's content ID, for the memo's own tests.
+    #[cfg(test)]
+    fn put_id(&self, shape: ContentId, template: Template) -> &Template {
+        self.insert(shape, template).0
+    }
+
+    /// Keeps `template` under `key`, a store key (a folded body's, a thunk's, a release
+    /// compile's), and gives what is kept. A template already kept under `key` that is equal
+    /// is given back; one that differs is refused, both given back (rule 18: the key misses
+    /// an input), and never instantiated for the unit that compiled `template`.
+    pub fn put_keyed(&self, key: Key, template: Template) -> Result<&Template, Refused<'_>> {
+        match self.insert(key.0, template) {
+            (kept, None) => Ok(kept),
+            (kept, Some(given)) if *kept == given => Ok(kept),
+            (kept, Some(given)) => Err(Refused { kept, given }),
+        }
+    }
+
+    /// Keeps `template` under `shape`: what is kept, and `template` back when another was kept
+    /// under `shape` first.
+    fn insert(&self, shape: ContentId, template: Template) -> (&Template, Option<Template>) {
         let start = start(&shape);
         // A slot is one pointer so that a CAS publishes the whole entry.
         // alloc: one per compiled shape, after a compile that costs far more
@@ -155,10 +190,10 @@ impl Memo {
                 let slot = &level[(start + probe) & mask];
                 if let Some(entry) = Self::entry(slot) {
                     if entry.shape == shape {
-                        // SAFETY: `ours` is the `Box` leaked at the top of `put`, not yet
-                        // offered to any slot, so no other thread can have it; freed once here.
-                        drop(unsafe { Box::from_raw(ours) });
-                        return &entry.template;
+                        // SAFETY: `ours` is the `Box` leaked at the top of `insert`, not yet
+                        // offered to any slot, so no other thread can have it; taken back once here.
+                        let ours = unsafe { Box::from_raw(ours) };
+                        return (&entry.template, Some(ours.template));
                     }
                     continue;
                 }
@@ -168,7 +203,7 @@ impl Memo {
                         // SAFETY: `ours` is the live entry this CAS just published; from here
                         // the memo owns it, never writes it again, and frees it only in `drain`
                         // under `&mut self`, which the returned borrow of `&self` excludes.
-                        return unsafe { &(*ours).template };
+                        return (unsafe { &(*ours).template }, None);
                     }
                     Err(theirs) => {
                         // SAFETY: the CAS expected null and failed, so `theirs` is non-null: an
@@ -177,9 +212,9 @@ impl Memo {
                         let theirs = unsafe { &*theirs };
                         if theirs.shape == shape {
                             // SAFETY: the CAS failed, so `ours` was never published: this is
-                            // its only owner, and it is freed once.
-                            drop(unsafe { Box::from_raw(ours) });
-                            return &theirs.template;
+                            // its only owner, and it is taken back once.
+                            let ours = unsafe { Box::from_raw(ours) };
+                            return (&theirs.template, Some(ours.template));
                         }
                     }
                 }
@@ -233,7 +268,7 @@ impl Memo {
         for entry in self.drain() {
             if kept(&entry.shape) {
                 let Entry { shape, template } = *entry;
-                self.put(shape, template);
+                self.insert(shape, template);
             }
         }
     }
@@ -280,8 +315,8 @@ mod tests {
         let memo = Memo::new();
         let shape = ContentId([5; 32]);
         assert!(memo.get(&shape).is_none());
-        assert_eq!(*memo.put(shape, template(1)), template(1));
-        assert_eq!(*memo.put(shape, template(2)), template(1));
+        assert_eq!(*memo.put_id(shape, template(1)), template(1));
+        assert_eq!(*memo.put_id(shape, template(2)), template(1));
         assert_eq!(*memo.get(&shape).unwrap(), template(1));
         assert_eq!(memo.len(), 1);
     }
@@ -289,8 +324,8 @@ mod tests {
     #[test]
     fn collection_keeps_what_it_is_told() {
         let mut memo = Memo::new();
-        memo.put(ContentId([1; 32]), template(1));
-        memo.put(ContentId([2; 32]), template(2));
+        memo.put_id(ContentId([1; 32]), template(1));
+        memo.put_id(ContentId([2; 32]), template(2));
         memo.retain(|shape| shape.0[0] == 2);
         assert!(memo.get(&ContentId([1; 32])).is_none());
         assert_eq!(*memo.get(&ContentId([2; 32])).unwrap(), template(2));
@@ -309,7 +344,7 @@ mod tests {
             })
             .collect();
         for (n, shape) in crowded.iter().enumerate() {
-            memo.put(*shape, template(n as u8));
+            memo.put_id(*shape, template(n as u8));
         }
         for (n, shape) in crowded.iter().enumerate() {
             assert_eq!(*memo.get(shape).unwrap(), template(n as u8));
@@ -328,7 +363,7 @@ mod tests {
             id
         };
         for n in 0..(PROBES * 2) as u8 {
-            memo.put(crowded(n), template(n));
+            memo.put_id(crowded(n), template(n));
         }
         let missing = crowded(u8::MAX);
         let found = blaze_alloc_count::assert_at_most(0, "a memo lookup", || {
@@ -363,7 +398,7 @@ mod tests {
                 1..8 => {
                     let template = template(n as u8);
                     let want = reference.entry(shape).or_insert(template.clone()).clone();
-                    assert_eq!(*memo.put(shape, template), want);
+                    assert_eq!(*memo.put_id(shape, template), want);
                 }
                 _ => assert_eq!(memo.get(&shape), reference.get(&shape)),
             }
@@ -381,7 +416,7 @@ mod tests {
                 let (memo, shapes) = (&memo, &shapes);
                 scope.spawn(move || {
                     for it in shapes {
-                        let kept = memo.put(*it, template(worker));
+                        let kept = memo.put_id(*it, template(worker));
                         assert_eq!(memo.get(it).unwrap() as *const Template, kept as *const Template);
                     }
                 });
@@ -438,9 +473,9 @@ mod model {
             let memo = Arc::new(Memo::new());
             let other = {
                 let memo = memo.clone();
-                thread::spawn(move || kept_at(memo.put(crowded(0), template(1))))
+                thread::spawn(move || kept_at(memo.put_id(crowded(0), template(1))))
             };
-            let kept = memo.put(crowded(0), template(2));
+            let kept = memo.put_id(crowded(0), template(2));
             assert_eq!(kept_at(kept), other.join().unwrap(), "one template kept");
             assert!(*kept == template(1) || *kept == template(2));
             assert_eq!(memo.get(&crowded(0)).map(kept_at), Some(kept_at(kept)));
@@ -456,11 +491,11 @@ mod model {
                 let memo = memo.clone();
                 thread::spawn(move || {
                     for n in [0, 1] {
-                        assert_eq!(*memo.put(crowded(n), template(n)), template(n));
+                        assert_eq!(*memo.put_id(crowded(n), template(n)), template(n));
                     }
                 })
             };
-            assert_eq!(*memo.put(crowded(2), template(2)), template(2));
+            assert_eq!(*memo.put_id(crowded(2), template(2)), template(2));
             other.join().unwrap();
             for n in 0..3 {
                 assert_eq!(*memo.get(&crowded(n)).unwrap(), template(n));
@@ -474,11 +509,11 @@ mod model {
     fn model_a_get_sees_nothing_or_what_a_put_kept() {
         blaze_check::model(|| {
             let memo = Arc::new(Memo::new());
-            memo.put(crowded(0), template(0));
-            memo.put(crowded(1), template(1));
+            memo.put_id(crowded(0), template(0));
+            memo.put_id(crowded(1), template(1));
             let other = {
                 let memo = memo.clone();
-                thread::spawn(move || kept_at(memo.put(crowded(2), template(2))))
+                thread::spawn(move || kept_at(memo.put_id(crowded(2), template(2))))
             };
             let seen = memo.get(&crowded(2)).map(kept_at);
             let kept = other.join().unwrap();

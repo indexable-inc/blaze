@@ -35,6 +35,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 use base_db::{Db, FileId, FileText};
 use blaze_api::{ApiError, Edit, Edited, EditedItem};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_vfs::Op;
 use hir::view::Semantics;
@@ -111,8 +112,8 @@ pub(crate) struct Edits<'a, F: Files> {
     /// Each working copy's tree before any splice, as the front end has it: the views `sema`
     /// answers for.
     pub roots: Vec<ast::Node<'a>>,
-    pub by_path: HashMap<Box<str>, u32>,
-    pub by_id: HashMap<FileId, u32>,
+    pub by_path: HashMap<Box<str>, u32, Global>,
+    pub by_id: HashMap<FileId, u32, Global>,
     pub touches: Vec<Touch>,
     /// The moves of renamed modules' files, after every text edit.
     pub moves: Vec<Op>,
@@ -129,8 +130,8 @@ pub fn apply<F: Files>(db: &Db, files: &F, edits: &[Edit]) -> Result<Applied, Ap
         working: Vec::new(),
         ids: Vec::new(),
         roots: Vec::new(), // alloc: one view per file the request opens, beside `ids`
-        by_path: HashMap::default(),
-        by_id: HashMap::default(),
+        by_path: HashMap::new_in(Global),
+        by_id: HashMap::new_in(Global),
         touches: Vec::new(),
         moves: Vec::new(),
     };

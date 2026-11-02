@@ -12,13 +12,14 @@ use blaze_codegen::{
     settings::{DebugInfo, Panic, Relocation, Sanitize, Spec, Toolchain},
 };
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use blaze_ids::ContentId;
 use cranelift_codegen::ir;
 use hir_def::{FunctionId, StaticId, signatures::FunctionSignature};
 use hir_expand::fixture;
 use hir_ty::db::HirDatabase;
 
-use super::walk;
+use super::{Walking, walk};
 use crate::{
     Instance, InstanceDef,
     home::Homes,
@@ -49,13 +50,13 @@ fn static_named(db: &TestDB, name: &str) -> StaticId {
 }
 
 fn spec() -> Spec {
-    let target = crate::Target::selected().expect("a target");
+    let target = crate::Target::for_fixtures();
     let arch = match target.arch {
         crate::Arch::X86_64 => blaze_codegen::Arch::X86_64,
         crate::Arch::Aarch64 => blaze_codegen::Arch::Aarch64,
         crate::Arch::Wasm32 => blaze_codegen::Arch::Wasm32,
     };
-    let pic = crate::target().expect("a code generator").flags().is_pic();
+    let pic = crate::isa_for(crate::Target::for_fixtures()).expect("a code generator").flags().is_pic();
     Spec {
         toolchain: Toolchain {
             id: ContentId::default(),
@@ -66,7 +67,7 @@ fn spec() -> Spec {
             cranelift: "0.136".to_owned(),
             llvm: None,
             stencils: None,
-            frame_pointers: crate::backend::frame_pointers(),
+            frame_pointers: false,
             relocation: if pic { Relocation::Pic } else { Relocation::Static },
         },
         backend: Backend::Cranelift { speed: false },
@@ -79,6 +80,9 @@ fn spec() -> Spec {
         mir_inline: false,
         pgo: blaze_codegen::settings::Pgo::None,
         sanitize: Sanitize::default(),
+        proc_macro_bridge: false,
+        report: false,
+        heap_to_stack: false,
     }
 }
 
@@ -107,14 +111,14 @@ fn walked(
     homes: &mut Homes,
     instance: &HirInstance,
 ) -> Vec<Ref> {
-    let first = walk(db, instance, false, homes).unwrap_or_else(|e| panic!("{e}"));
-    let again = walk(db, instance, false, homes).unwrap_or_else(|e| panic!("again: {e}"));
+    let first = walk(db, instance, Walking::plain(false), homes).unwrap_or_else(|e| panic!("{e}"));
+    let again = walk(db, instance, Walking::plain(false), homes).unwrap_or_else(|e| panic!("again: {e}"));
     assert_eq!(first, again, "{instance:?} walks two ways");
     let elsewhere = frontend
-        .with(|db, homes| walk(db, instance, false, homes))
+        .with(|db, homes| walk(db, instance, Walking::plain(false), homes))
         .unwrap_or_else(|e| panic!("in another database: {e}"));
     assert_eq!(first, elsewhere, "{instance:?} walks otherwise in another database");
-    let distinct: HashSet<&Ref> = first.iter().collect();
+    let distinct: HashSet<&Ref, Global> = first.iter().collect();
     assert_eq!(distinct.len(), first.len(), "{instance:?} lists a reference twice: {first:?}");
     first
 }
@@ -133,7 +137,7 @@ fn placed(
         "overflow checks {checked}, debug assertions {}, panic {:?}",
         spec.debug_assertions, spec.panic
     );
-    let mut code = build::with(Build::of(spec), || built(db, instance, checked))
+    let mut code = build::with(Build::of(spec), || built(db, instance, crate::Target::for_fixtures(), checked))
         .and_then(|it| it)
         .unwrap_or_else(|e| panic!("{instance:?} with {setting}: {e}"));
     let requests = match &mut code {
@@ -152,7 +156,7 @@ fn placed(
 fn reach(frontend: &HirFrontend, root: HirInstance) -> Reached {
     let specs = specs();
     frontend.with(|db, homes| {
-        let mut seen = HashSet::default();
+        let mut seen = HashSet::new_in(Global);
         seen.insert(root.clone());
         let mut queue = vec![root];
         let mut reached = Reached::new();
@@ -169,7 +173,7 @@ fn reach(frontend: &HirFrontend, root: HirInstance) -> Reached {
                             queue.push(next.clone());
                         }
                     }
-                    Kind::Asm(..) => assert_eq!(walk(db, next, false, homes), Ok(Vec::new())),
+                    Kind::Asm(..) => assert_eq!(walk(db, next, Walking::plain(false), homes), Ok(Vec::new())),
                     Kind::Start(_) | Kind::Allocator(_) => (),
                 }
             }
@@ -368,7 +372,7 @@ fn a_dyn_fn_call_lists_the_closure_vtable() {
 }
 
 const DERIVED: &str = r#"
-//- minicore: sized, copy, clone, derive, eq, unsize, coerce_unsized, dispatch_from_dyn
+//- minicore: sized, copy, clone, derive, eq, ord, unsize, coerce_unsized, dispatch_from_dyn
 #[derive(Clone, PartialEq)]
 pub struct Pair(pub u32, pub u64);
 pub fn roots(p: &Pair) -> bool {
@@ -393,7 +397,7 @@ fn a_derived_method_is_reached_where_derives_are_expanded() {
 
     let (db, frontend) = frontend(DERIVED);
     let root = frontend.root(function(db, "roots"));
-    let refused = frontend.with(|db, homes| walk(db, &root, false, homes)).expect_err("the call of `clone`");
+    let refused = frontend.with(|db, homes| walk(db, &root, Walking::plain(false), homes)).expect_err("the call of `clone`");
     assert!(refused.contains("`Clone::clone` of") && refused.contains("#[derive(Clone)]"), "{refused}");
 }
 
@@ -605,8 +609,8 @@ fn extern_and_variadic_calls_list_their_symbols() {
     }
     let [assembly] = assembly[..] else { panic!("{walked:?}") };
     frontend.with(|db, homes| {
-        assert_eq!(walk(db, assembly, false, homes), Ok(Vec::new()));
-        let mut code = built(db, assembly, false).expect("the assembly");
+        assert_eq!(walk(db, assembly, Walking::plain(false), homes), Ok(Vec::new()));
+        let mut code = built(db, assembly, crate::Target::for_fixtures(), false).expect("the assembly");
         let Built::Assembled(_, requests) = &mut code else { panic!("IR of assembly") };
         place_requests(db, homes, &HashSource::ById(ById), None, &mut Placer::listed(Vec::new()), requests)
             .expect("assembly that names nothing");
@@ -711,7 +715,7 @@ fn a_constant_lists_the_functions_it_points_at() {
 fn assembly_walks_empty() {
     let (_, frontend) = frontend(PLAIN);
     let assembly = HirInstance(Kind::Asm("nop".to_owned(), false));
-    frontend.with(|db, homes| assert_eq!(walk(db, &assembly, false, homes), Ok(Vec::new())));
+    frontend.with(|db, homes| assert_eq!(walk(db, &assembly, Walking::plain(false), homes), Ok(Vec::new())));
 }
 
 const BROKEN: &str = r#"
@@ -724,7 +728,82 @@ pub fn broken() -> u32 { "not a number" }
 fn a_body_that_does_not_lower_is_an_error_naming_the_instance() {
     let (db, frontend) = frontend(BROKEN);
     let root = frontend.root(function(&db, "broken"));
-    let walked = frontend.with(|db, homes| walk(db, &root, false, homes));
+    let walked = frontend.with(|db, homes| walk(db, &root, Walking::plain(false), homes));
     let error = walked.expect_err("the walk of a body with a type error");
     assert!(error.contains(&format!("{root:?}")), "{error}");
+}
+
+const VTABLES_APART_IN_LIFETIMES: &str = r#"
+//- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn
+pub trait Tr { fn m(&self) -> u32; }
+impl<'a> Tr for &'a u32 { fn m(&self) -> u32 { **self } }
+static S: &'static u32 = &1;
+pub fn root() -> u32 {
+    let y = 2u32;
+    let local: &u32 = &y;
+    let a: &dyn Tr = &local;
+    let b: &dyn Tr = &S;
+    a.m() + b.m()
+}
+"#;
+
+/// A vtable is one per type and trait, whatever lifetimes the type names (landed-shape lane,
+/// run 3: `psm`'s build script made `&'{region error} OsString` and `&'{erased} OsString`
+/// vtables of one trait, which the program's dyn facts refused as two types of one content
+/// ID). The code generator keys a vtable with its free regions erased, so the walk lists one
+/// type, with none left in it.
+#[test]
+fn vtables_whose_types_differ_in_lifetimes_only_are_one() {
+    use rustc_type_ir::{TypeVisitableExt as _, inherent::IntoKind as _};
+    let (db, frontend) = frontend(VTABLES_APART_IN_LIFETIMES);
+    let root = frontend.root(function(&db, "root"));
+    frontend.with(|db, _| {
+        hir_ty::attach_db(db, || {
+            let facts = super::facts(db, &root, Walking::plain(false))
+                .unwrap_or_else(|e| panic!("{e}"))
+                .expect("the root's facts");
+            let tys: Vec<String> = facts.vtables.iter().map(|(ty, _)| format!("{:?}", ty.as_ref())).collect();
+            for (ty, _) in &facts.vtables {
+                let ty = ty.as_ref();
+                assert!(!ty.has_type_flags(rustc_type_ir::TypeFlags::HAS_FREE_REGIONS), "`{ty:?}` keeps a region: {tys:?}");
+                assert!(matches!(ty.kind(), rustc_type_ir::TyKind::Ref(..)), "{tys:?}");
+            }
+            assert_eq!(facts.vtables.len(), 1, "one vtable of `&u32` for `Tr`: {tys:?}");
+        })
+    });
+}
+
+const VTABLES_APART_IN_BINDERS: &str = r#"
+//- minicore: sized, fn, unsize, coerce_unsized, dispatch_from_dyn
+pub trait Tr { fn m(&self) -> u32; }
+impl Tr for fn(&u32) -> bool { fn m(&self) -> u32 { 1 } }
+pub type Named = for<'a> fn(&'a u32) -> bool;
+fn yes(_: &u32) -> bool { true }
+pub fn root() -> u32 {
+    let f: fn(&u32) -> bool = yes;
+    let g: Named = yes;
+    let a: &dyn Tr = &f;
+    let b: &dyn Tr = &g;
+    a.m() + b.m()
+}
+"#;
+
+/// A vtable is one per type and trait whichever way the type's binder is written (review 8,
+/// C2): `fn(&u32) -> bool` binds an anonymous lifetime and `for<'a> fn(&'a u32) -> bool` a
+/// named one, one type with two keys unless the key anonymizes its binders, as rustc's
+/// `erase_and_anonymize_regions` does. Two keys are two vtables of one content ID, which the
+/// program's dyn facts refuse ("have one content ID").
+#[test]
+fn vtables_whose_types_differ_in_binder_names_only_are_one() {
+    let (db, frontend) = frontend(VTABLES_APART_IN_BINDERS);
+    let root = frontend.root(function(&db, "root"));
+    frontend.with(|db, _| {
+        hir_ty::attach_db(db, || {
+            let facts = super::facts(db, &root, Walking::plain(false))
+                .unwrap_or_else(|e| panic!("{e}"))
+                .expect("the root's facts");
+            let tys: Vec<String> = facts.vtables.iter().map(|(ty, _)| format!("{:?}", ty.as_ref())).collect();
+            assert_eq!(facts.vtables.len(), 1, "one vtable of `fn(&u32) -> bool` for `Tr`: {tys:?}");
+        })
+    });
 }

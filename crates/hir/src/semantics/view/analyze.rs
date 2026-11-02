@@ -49,7 +49,7 @@ impl<'db> Semantics<'db> {
         node: InFile<Node<'db>>,
         infer: bool,
     ) -> Option<SourceAnalyzer<'db>> {
-        let _p = tracing::info_span!("view::Semantics::analyze_impl").entered();
+        let _p = tracing::info_span!(target: "blaze", "view::Semantics::analyze_impl").entered();
         let db = self.db;
         let container = self.find_container(node)?;
         let generic_def = |def| SourceAnalyzer::new_generic_def_view(db, &self.imp, def, node, infer);
@@ -288,7 +288,7 @@ impl<'db> Semantics<'db> {
         InFile { value: token, file_id }: InFile<Token<'db>>,
         f: &mut impl FnMut(InFile<Token<'db>>, SyntaxContext),
     ) {
-        let _p = tracing::info_span!("view::descend_into_macros").entered();
+        let _p = tracing::info_span!(target: "blaze", "view::descend_into_macros").entered();
         let db = self.db;
         let span = file_id.span_map(db).span_for_range(token.text_range());
 

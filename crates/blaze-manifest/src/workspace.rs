@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use annotate_snippets::{Level, Renderer};
 use anyhow::{Context as _, bail};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use cargo_util_schemas::manifest::TomlProfiles;
 
 use crate::features::{Edition, Features, ResolveBehavior};
@@ -89,13 +90,13 @@ fn find_root_iter<'a, F: Files>(
 pub struct Workspace<'c, F: Files> {
     ctx: &'c Context<F>,
     current_manifest: PathBuf,
-    packages: HashMap<PathBuf, EitherManifest>,
+    packages: HashMap<PathBuf, EitherManifest, Global>,
     root_manifest: Option<PathBuf>,
     target_dir: Option<PathBuf>,
     build_dir: Option<PathBuf>,
     /// In the order cargo finds them, which is the order `cargo metadata` prints them.
     members: Vec<PathBuf>,
-    member_set: HashSet<PathBuf>,
+    member_set: HashSet<PathBuf, Global>,
     default_members: Vec<PathBuf>,
     resolve_behavior: ResolveBehavior,
     custom_metadata: Option<toml::Value>,
@@ -107,12 +108,12 @@ impl<'c, F: Files> Workspace<'c, F> {
         let mut ws = Workspace {
             ctx,
             current_manifest: manifest_path.to_owned(),
-            packages: HashMap::default(),
+            packages: HashMap::new_in(Global),
             root_manifest: None,
             target_dir: None,
             build_dir: None,
             members: Vec::new(),
-            member_set: HashSet::default(),
+            member_set: HashSet::new_in(Global),
             default_members: Vec::new(),
             resolve_behavior: ResolveBehavior::V1,
             custom_metadata: None,
@@ -162,15 +163,42 @@ impl<'c, F: Files> Workspace<'c, F> {
         matches!(self.get(&self.current_manifest), EitherManifest::Virtual(_))
     }
 
-    pub fn target_dir(&self) -> PathBuf {
-        self.target_dir.clone().unwrap_or_else(|| self.root().join("target"))
+    /// The target directory `CARGO_TARGET_DIR` or `build.target-dir` names, if one does.
+    pub fn explicit_target_dir(&self) -> Option<&Path> {
+        self.target_dir.as_deref()
     }
 
-    pub fn build_dir(&self) -> PathBuf {
-        self.build_dir
-            .clone()
-            .or_else(|| self.target_dir.clone())
-            .unwrap_or_else(|| self.target_dir())
+    /// The directory `build.build-dir` names, if it does.
+    pub fn explicit_build_dir(&self) -> Option<&Path> {
+        self.build_dir.as_deref()
+    }
+
+    /// The target directory: [`Workspace::explicit_target_dir`], else the workspace's
+    /// directory under blaze's root ([`crate::home::build_dir`]), never one in the checkout.
+    /// The root is read from the configuration's variables; with none to say it this is an
+    /// error naming the workspace, never a directory guessed.
+    pub fn target_dir(&self) -> anyhow::Result<PathBuf> {
+        if let Some(dir) = &self.target_dir {
+            return Ok(dir.clone());
+        }
+        let config = &self.ctx.config;
+        let root = crate::home::root(|name| config.env(name).map(std::ffi::OsString::from));
+        let root = root.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no BLAZE_HOME, XDG_CACHE_HOME or HOME says where blaze keeps the build \
+                 directory of the workspace at {}",
+                self.root().display()
+            )
+        })?;
+        Ok(crate::home::build_dir(&crate::home::builds(&root), self.root()))
+    }
+
+    /// `build.build-dir`, else [`Workspace::target_dir`].
+    pub fn build_dir(&self) -> anyhow::Result<PathBuf> {
+        match &self.build_dir {
+            Some(dir) => Ok(dir.clone()),
+            None => self.target_dir(),
+        }
     }
 
     pub fn custom_metadata(&self) -> Option<&toml::Value> {
@@ -404,7 +432,7 @@ impl<'c, F: Files> Workspace<'c, F> {
     }
 
     fn validate_unique_names(&self) -> anyhow::Result<()> {
-        let mut names = HashMap::default();
+        let mut names = HashMap::new_in(Global);
         for member in &self.members {
             let name = match self.get(member) {
                 EitherManifest::Real(m) => &m.package_id.name,

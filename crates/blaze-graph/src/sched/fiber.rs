@@ -35,7 +35,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     ptr,
     sync::{
-        Arc, LazyLock, Once, OnceLock,
+        Arc, Once,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle, Thread},
@@ -221,7 +221,8 @@ struct CoreSlot {
     moving: AtomicBool,
     /// A `Wake` (or the stop) since the worker last looked.
     woken: AtomicBool,
-    thread: OnceLock<Thread>,
+    #[expect(clippy::disallowed_types, reason = "no global state: its worker's handle, set once as it is spawned, read with no lock by each wake")]
+    thread: std::sync::OnceLock<Thread>,
 }
 
 impl CoreSlot {
@@ -245,6 +246,8 @@ pub(super) struct Global {
     pub(super) own: Vec<Option<OwnIo>>,
     dirty: Vec<u32>,
     woken: Vec<usize>,
+    /// The clients' member ([`super::host`]), joined at the first client's claim or wait.
+    pub(super) clients: Option<u32>,
 }
 
 /// How a member of its own placement takes back a woken job: `wake(ctx, token)`, called under
@@ -265,7 +268,8 @@ struct Io {
     pending: Vec<u32>,
 }
 
-static GLOBAL: LazyLock<Mutex<Global>> = LazyLock::new(|| {
+#[expect(clippy::disallowed_types, reason = "the process's one scheduler: every driver, pool and client thread shares its wait graph")]
+static GLOBAL: std::sync::LazyLock<Mutex<Global>> = std::sync::LazyLock::new(|| {
     // alloc: the process's scheduler, once
     Mutex::new(Global {
         world: World::new(1024),
@@ -273,6 +277,7 @@ static GLOBAL: LazyLock<Mutex<Global>> = LazyLock::new(|| {
         own: Vec::with_capacity(8),
         dirty: Vec::with_capacity(8),
         woken: Vec::with_capacity(64),
+        clients: None,
     })
 });
 
@@ -297,7 +302,7 @@ pub(super) fn global() -> MutexGuard<'static, Global> {
 /// `mine` (a driver's member and core), if any, is returned (a local job id).
 pub(super) fn dispatch_global(global: &mut Global, mine: Option<(u32, u32)>) -> Option<u32> {
     let mut found = None;
-    let Global { world, io, own, dirty, woken } = global;
+    let Global { world, io, own, dirty, woken, clients: _ } = global;
     world.take_dirty(dirty);
     for &member in dirty.iter() {
         if member & OWN != 0 {
@@ -744,7 +749,8 @@ pub struct Carried {
 /// The most thread-locals carried with a job.
 pub const MAX_CARRIED: usize = 32;
 
-static CARRIED: [OnceLock<Carried>; MAX_CARRIED] = [const { OnceLock::new() }; MAX_CARRIED];
+#[expect(clippy::disallowed_types, reason = "the process's carried thread-locals: a job carries every one registered, on any thread")]
+static CARRIED: [std::sync::OnceLock<Carried>; MAX_CARRIED] = [const { std::sync::OnceLock::new() }; MAX_CARRIED];
 static CARRIED_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// The fiber stack limit `stdx::ensure_sufficient_stack` checks against, carried with the job
@@ -881,24 +887,39 @@ pub struct Switch {
     pub job: JobId,
     /// The job's generation: with `job`, one job of the process's life ([`Handle`]).
     pub generation: u32,
+    /// For a park on a job ([`Wait::Job`]): that job's generation, so the wait names one job of
+    /// the process's life. 0 otherwise.
+    pub awaited: u32,
     pub fiber: u32,
     pub core: CoreId,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SwitchEvent {
-    /// The job's first run, on a fiber from the idle pool.
+    /// A pool job begins on its fiber, before anything joins it to the graph: its `job` is
+    /// [`UNREGISTERED`] and its `fiber` 0. `spawner` is what [`observe_spawner`]'s reader said
+    /// as the job was given to the pool, 0 for none. Told with no lock held.
+    Began { spawner: u64 },
+    /// The job joined the graph (a pool job at its first claim or wait, after its `Began`), or
+    /// its first run on the fiber driver.
     Started,
     /// The job parked: waiting for `Some(on)`, or `None` moving to another core. Told before
     /// its carried thread-locals are taken, so they are still the job's.
     Parked(Option<Wait>),
+    /// A parked job was made runnable: told on the waker's thread, under the scheduler's lock,
+    /// before it is queued. `core` is the waker's.
+    Ready,
     /// A parked job runs again, on this thread; told after its thread-locals are put back.
     Resumed,
     /// The job ended; its fiber goes back to the idle pool.
     Ended,
+    /// A pool job that never joined the graph ended: the one switch after its `Began`, its
+    /// `job` [`UNREGISTERED`]. Told with no lock held.
+    Ran,
 }
 
-static OBSERVER: OnceLock<fn(Switch)> = OnceLock::new();
+#[expect(clippy::disallowed_types, reason = "the process's one profiler hook, set once, read with no lock at every switch")]
+static OBSERVER: std::sync::OnceLock<fn(Switch)> = std::sync::OnceLock::new();
 
 /// Has `observer` told of every job's switches (the profiler's). Once a process; a second is
 /// refused.
@@ -915,8 +936,45 @@ pub(super) fn observing() -> bool {
 pub(super) fn switched(world: &World, event: SwitchEvent, job: JobId, fiber: u32, me: u32) {
     if let Some(observer) = OBSERVER.get() {
         let generation = world.generation(job);
-        observer(Switch { event, job, generation, fiber, core: CoreId(me) });
+        let awaited = match event {
+            SwitchEvent::Parked(Some(Wait::Job(on))) => world.generation(on),
+            _ => 0,
+        };
+        observer(Switch { event, job, generation, awaited, fiber, core: CoreId(me) });
     }
+}
+
+/// A switch of a job not in the graph ([`SwitchEvent::Began`], [`SwitchEvent::Ran`]): no
+/// world to read, so it needs no lock.
+#[inline]
+pub(super) fn switched_unregistered(event: SwitchEvent, fiber: u32, me: u32) {
+    switched_known(event, UNREGISTERED, 0, fiber, me);
+}
+
+/// A switch of `job` whose generation the caller kept ([`SwitchEvent::Ready`] from a parked
+/// record), told without reading the world.
+#[inline]
+pub(super) fn switched_known(event: SwitchEvent, job: JobId, generation: u32, fiber: u32, me: u32) {
+    if let Some(observer) = OBSERVER.get() {
+        observer(Switch { event, job, generation, awaited: 0, fiber, core: CoreId(me) });
+    }
+}
+
+#[expect(clippy::disallowed_types, reason = "the process's one profiler hook, set once, read with no lock at every pool submit")]
+static SPAWNER: std::sync::OnceLock<fn() -> u64> = std::sync::OnceLock::new();
+
+/// Has `running` say, as a pool job is given to the pool, the observer's number for the job
+/// running on this thread: the new job's spawner, told in its [`SwitchEvent::Began`]. Once a
+/// process; a second is refused.
+pub fn observe_spawner(running: fn() -> u64) -> Result<(), fn() -> u64> {
+    SPAWNER.set(running)
+}
+
+/// The job running on this thread, as [`observe_spawner`]'s reader numbers it; 0 when none is
+/// set or none runs.
+#[inline]
+pub(crate) fn spawner() -> u64 {
+    SPAWNER.get().map_or(0, |running| running())
 }
 
 /// A worker going idle or waking, as the idle observer ([`observe_idle`]) is told it: on the
@@ -939,7 +997,8 @@ pub enum IdleReason {
     Until(u64),
 }
 
-static IDLE_OBSERVER: OnceLock<fn(Idle)> = OnceLock::new();
+#[expect(clippy::disallowed_types, reason = "the process's one profiler hook, set once, read with no lock as a worker idles")]
+static IDLE_OBSERVER: std::sync::OnceLock<fn(Idle)> = std::sync::OnceLock::new();
 
 /// Has `observer` told of every worker's idle stretches (the profiler's). Once a process; a
 /// second is refused.
@@ -948,7 +1007,7 @@ pub fn observe_idle(observer: fn(Idle)) -> Result<(), fn(Idle)> {
 }
 
 #[inline]
-fn idled(core: u32, reason: IdleReason, began: bool) {
+pub(super) fn idled(core: u32, reason: IdleReason, began: bool) {
     if let Some(observer) = IDLE_OBSERVER.get() {
         observer(Idle { core: CoreId(core), reason, began });
     }
@@ -1001,8 +1060,9 @@ impl<W: Work> Driver<W> {
     ) -> Result<Driver<W>, DriverError> {
         carry_stack_limit();
         let n = cores.len();
+        #[allow(clippy::disallowed_types, reason = "no global state: each core's worker handle, set as it is spawned")]
         let slots: Arc<[CoreSlot]> = (0..n)
-            .map(|_| CoreSlot { moving: AtomicBool::new(false), woken: AtomicBool::new(false), thread: OnceLock::new() })
+            .map(|_| CoreSlot { moving: AtomicBool::new(false), woken: AtomicBool::new(false), thread: std::sync::OnceLock::new() })
             .collect(); // alloc: setup, once per driver
         let mut pending = Vec::with_capacity(n);
         pending.resize(n, NONE);

@@ -21,6 +21,7 @@
 
 use base_db::{Crate, CrateOrigin, Db};
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use either::Either;
 use hir_expand::{HirFileId, MacroCallId};
 use syntax::{
@@ -53,7 +54,7 @@ pub fn named_dependencies(db: &Db, krate: Crate) -> Box<[Crate]> {
         return dependencies.iter().map(|it| it.crate_id).collect();
     }
     // Names are unique among a crate's dependencies: each is its `--extern` name.
-    let unnamed: HashSet<&str> = dependencies
+    let unnamed: HashSet<&str, Global> = dependencies
         .iter()
         .filter(|it| !matches!(it.crate_id.data(db).origin, CrateOrigin::Lang(_)))
         .map(|it| it.name.as_str())
@@ -62,9 +63,9 @@ pub fn named_dependencies(db: &Db, krate: Crate) -> Box<[Crate]> {
     let mut walk = Walk {
         db,
         cfg: krate.cfg_options(db),
-        named: HashSet::default(),
+        named: HashSet::new_in(Global),
         unnamed,
-        read: HashSet::default(),
+        read: HashSet::new_in(Global),
     };
     walk.crate_(krate);
     dependencies
@@ -82,10 +83,10 @@ struct Walk<'db> {
     db: &'db Db,
     cfg: &'db cfg::CfgOptions,
     /// The dependencies not named yet, by the name the crate has for them.
-    unnamed: HashSet<&'db str>,
-    named: HashSet<&'db str>,
+    unnamed: HashSet<&'db str, Global>,
+    named: HashSet<&'db str, Global>,
     /// The files and expansions read.
-    read: HashSet<HirFileId>,
+    read: HashSet<HirFileId, Global>,
 }
 
 impl<'db> Walk<'db> {
@@ -97,7 +98,7 @@ impl<'db> Walk<'db> {
         self.expansions_of(def_map);
         let mut owners = crate_body_owners(self.db, krate);
         // alloc: one set per crate's walk
-        let mut seen: HashSet<_> = owners.iter().copied().collect();
+        let mut seen: HashSet<_, Global> = owners.iter().copied().collect();
         owners.reverse();
         while !self.unnamed.is_empty()
             && let Some(owner) = owners.pop()

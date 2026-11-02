@@ -40,6 +40,8 @@ include = [
   "harness/v2",
   "python/**/*.py",
   "tools/astlog/scan.py",
+  "tools/devirt/*.py",
+  "tools/layout",
   "tools/similar",
   "tools/v2",
 ]
@@ -67,6 +69,8 @@ include = [
   "harness/v2",
   "python",
   "tools/astlog/scan.py",
+  "tools/devirt",
+  "tools/layout",
   "tools/v2",
 ]
 pythonVersion = "3.13"

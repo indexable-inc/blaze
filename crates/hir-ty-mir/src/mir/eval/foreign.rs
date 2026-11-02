@@ -8,6 +8,7 @@ use std::mem;
 
 use base_db::{ConstEvalBudget, Db};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir_def::{FunctionId, StaticId, attrs::AttrFlags};
 use la_arena::ArenaMap;
 use rustc_type_ir::inherent::IntoKind;
@@ -62,30 +63,30 @@ pub(super) struct Embedder<'db, M: Machine<'db>> {
     // dyn: the embedder's, one per evaluation and reached only by the calls it claims
     foreign: Option<Box<dyn Foreign<'db, M> + 'db>>,
     /// [`Foreign::claims`] of each function asked about.
-    claims: HashMap<FunctionId, bool>,
+    claims: HashMap<FunctionId, bool, Global>,
     /// The arguments of a claimed call, end to end, kept for the next one.
     args: Vec<u8>,
     /// The return place of a claimed call, kept for the next one.
     ret: Vec<u8>,
     /// With [`Evaluator::track_statics`], each static's bytes as first written, by where its
     /// memory starts.
-    first_statics: Option<HashMap<usize, Box<[u8]>>>,
+    first_statics: Option<HashMap<usize, Box<[u8]>, Global>>,
     /// What [`Evaluator::preset_static`] gave, until the static is first used (each thread's
     /// first use, for a `#[thread_local]` one).
-    preset_statics: HashMap<StaticId, Box<[u8]>>,
+    preset_statics: HashMap<StaticId, Box<[u8]>, Global>,
 }
 
 impl<'db, M: Machine<'db>> Default for Embedder<'db, M> {
     fn default() -> Self {
         Embedder {
             foreign: None,
-            claims: HashMap::default(),
+            claims: HashMap::new_in(Global),
             // alloc: none until the first claimed call, then reused
             args: Vec::new(),
             // alloc: none until the first claimed call, then reused
             ret: Vec::new(),
             first_statics: None,
-            preset_statics: HashMap::default(),
+            preset_statics: HashMap::new_in(Global),
         }
     }
 }
@@ -121,7 +122,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// [`Self::call`] of what the function-pointer value `pointer` points to.
     pub fn call_pointer(&mut self, pointer: &[u8], args: &[&[u8]]) -> Result<'db, Vec<u8>> {
-        let callee = self.vtable_map.ty(from_bytes!(usize, pointer))?;
+        let callee = self.vtable_map.ty(from_bytes!(usize, self.cached_ptr_size, pointer))?;
         self.call_value(callee, Some(pointer), args)
     }
 
@@ -144,12 +145,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// `len` bytes at `addr`, an address as the program holds it.
     pub fn read_bytes(&self, addr: u64, len: usize) -> Result<'db, &[u8]> {
-        self.read_memory(Address::from_usize(addr as usize), len)
+        self.read_memory(Address::from_usize(addr as usize, self.cached_ptr_size), len)
     }
 
     /// Writes `bytes` at `addr`, an address as the program holds it.
     pub fn write_bytes(&mut self, addr: u64, bytes: &[u8]) -> Result<'db, ()> {
-        self.write_memory(Address::from_usize(addr as usize), bytes)
+        self.write_memory(Address::from_usize(addr as usize, self.cached_ptr_size), bytes)
     }
 
     /// `bytes` copied to fresh heap memory the program never frees, as the `getenv` shim makes
@@ -157,7 +158,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     pub fn alloc_bytes(&mut self, bytes: &[u8], align: usize) -> Result<'db, u64> {
         let addr = self.heap_allocate(bytes.len(), align)?;
         self.write_memory(addr, bytes)?;
-        Ok(addr.to_usize() as u64)
+        Ok(addr.to_usize(self.cached_ptr_size) as u64)
     }
 
     /// In place of the const-eval budget of the crate the evaluation is for, with all of its
@@ -210,11 +211,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let Some(&location) = self.thread_statics.get(&st) else {
                     continue;
                 };
-                if from_bytes!(usize, self.peek_memory(location, ptr_size)?) != start {
+                if from_bytes!(usize, self.cached_ptr_size, self.peek_memory(location, ptr_size)?) != start {
                     continue;
                 }
             }
-            let now = self.peek_memory(Address::from_usize(start), size)?;
+            let now = self.peek_memory(Address::from_usize(start, self.cached_ptr_size), size)?;
             if now == &**was {
                 continue;
             }
@@ -224,7 +225,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 .any(|word| {
                     let mut bytes = [0; 8];
                     bytes[..ptr_size].copy_from_slice(&now[word - start..][..ptr_size]);
-                    let addr = Address::from_usize(u64::from_le_bytes(bytes) as usize);
+                    let addr = Address::from_usize(u64::from_le_bytes(bytes) as usize, self.cached_ptr_size);
                     matches!(addr.at(), At::Stack(_) | At::Heap(_))
                 });
             // alloc: one per changed static, kept by the embedder
@@ -299,12 +300,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         size: usize,
         st: StaticId,
     ) -> Result<'db, ()> {
-        self.static_memory.push((start.to_usize(), size, st));
+        self.static_memory.push((start.to_usize(self.cached_ptr_size), size, st));
         if self.embedder.first_statics.is_some() {
             // alloc: once per static, with `track_statics`
             let bytes: Box<[u8]> = self.peek_memory(start, size)?.into();
             if let Some(first) = &mut self.embedder.first_statics {
-                first.insert(start.to_usize(), bytes);
+                first.insert(start.to_usize(self.cached_ptr_size), bytes);
             }
         }
         Ok(())

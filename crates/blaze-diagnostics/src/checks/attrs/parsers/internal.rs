@@ -274,6 +274,21 @@ const LANG_ITEMS: &[(&str, &[Policy])] = &[
     ("bitor_assign", TRAIT),
     ("bitxor", TRAIT),
     ("bitxor_assign", TRAIT),
+    // blaze's own, `core::reflect`'s (`#![feature(blaze_comptime)]`): rustc has none of them.
+    ("blaze_enum", TRAIT),
+    ("blaze_field", TRAIT),
+    ("blaze_fields", STRUCT),
+    ("blaze_fn_item", TRAIT),
+    ("blaze_marked", TRAIT),
+    ("blaze_only_marked", STRUCT),
+    ("blaze_only_unmarked", STRUCT),
+    ("blaze_struct", TRAIT),
+    ("blaze_unmarked", TRAIT),
+    ("blaze_variant", TRAIT),
+    ("blaze_variant_of", STRUCT),
+    ("blaze_variant_representing_type", STRUCT),
+    ("blaze_variant_view", ASSOC_TY),
+    ("blaze_variants", STRUCT),
     ("branch", REQUIRED_METHOD),
     ("c_void", ENUM),
     ("call_once_future", ASSOC_TY),
@@ -738,7 +753,7 @@ mod tests {
     #[test]
     fn lang_items_are_sorted_by_their_bytes() {
         assert!(LANG_ITEMS.windows(2).all(|it| it[0].0.as_bytes() < it[1].0.as_bytes()));
-        assert_eq!(LANG_ITEMS.len(), 216);
+        assert_eq!(LANG_ITEMS.len(), 230);
     }
 
     #[test]

@@ -528,6 +528,9 @@ pub use core::convert;
 pub use core::default;
 #[unstable(feature = "field_projections", issue = "145383")]
 pub use core::field;
+// blaze's compile-time reflection (`library/UPSTREAM` lists it among blaze's changes).
+#[unstable(feature = "blaze_comptime", issue = "none")]
+pub use core::reflect;
 #[stable(feature = "futures_api", since = "1.36.0")]
 pub use core::future;
 #[stable(feature = "core_hint", since = "1.27.0")]

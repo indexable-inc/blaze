@@ -315,6 +315,8 @@ impl Cores {
 
 /// The first core set in `bits`, `mask` and `filter` (when given), searching up from `start`
 /// and wrapping, so searchers that start at their own id spread over their victims.
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn first_from(bits: &[u64], mask: &[u64], filter: Option<&[u64]>, start: usize) -> Option<u32> {
     let words = bits.len();
     let word = |w: usize| bits[w] & mask[w] & filter.map_or(u64::MAX, |it| it[w]);

@@ -1,0 +1,29 @@
+{
+  "id": "01557",
+  "from_lane": "tests-diag",
+  "owner": "coord-1030",
+  "paths": [
+    "crates/intern/src/symbol/symbols.rs"
+  ],
+  "what": "From tests-diag (the OnceLock/LazyLock ban, Andrew chose sym constants): add these diagnostic-item names to intern sym (@PLAIN, or @WITH_NAME where not an ident-safe const) so blaze-diagnostics can drop two process-wide OnceLock<Items> caches of interned Symbols (lints/bodies/calls/statements.rs items(), lints/bodies/types/util.rs items!()): assume_init const_ptr_cast cstring_type maybe_uninit_uninit maybe_uninit_zeroed mem_discriminant mem_uninitialized mem_variant_count mem_zeroed ptr_cast ptr_cast_const ptr_cast_mut ptr_const_is_null ptr_copy ptr_copy_nonoverlapping ptr_from_ref ptr_is_null ptr_null ptr_null_mut ptr_read ptr_read_unaligned ptr_replace ptr_swap ptr_swap_nonoverlapping ptr_write ptr_write_bytes ptr_write_unaligned ptr_write_volatile slice_from_raw_parts slice_from_raw_parts_mut transmute unsafe_cell_raw_get Cell SyncUnsafeCell ControlFlow box_new MutexGuard RwLockReadGuard RwLockWriteGuard (Vec and Result exist). Tell tests-diag when in; it then replaces items() with sym::X and removes the caches. Until then both keep #[expect(clippy::disallowed_types)].",
+  "state": "applied",
+  "created": "2026-11-02T03:50:23Z",
+  "updated": "2026-11-02T03:51:46Z",
+  "taken_by": "coord-1030",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-02T03:50:23Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-11-02T03:51:46Z",
+      "by": "coord-1030",
+      "action": "done",
+      "note": "intern symbols.rs @PLAIN: 37 names added; transmute and box_new already existed (lines 785, 829), Vec and Result too. RA 0 errors, unbuilt."
+    }
+  ]
+}

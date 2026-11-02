@@ -1,41 +1,57 @@
 //! What blaze hashes in memory with: one choice per kind of key, so no crate picks its own.
 //!
-//! - Ordinary keys (ids, names, tuples, paths): [`HashMap`] and [`HashSet`], std's map and set
-//!   on [`FixedState`], foldhash's fast hasher with its one fixed seed. It costs about what
+//! - Ordinary keys (ids, names, tuples, paths): [`HashMap`] and [`HashSet`], hashbrown's map
+//!   and set on [`FixedState`], foldhash's fast hasher with its one fixed seed, in the
+//!   allocator the type names (`HashMap<K, V, &Frame>` for a task's, `HashMap<K, V, Global>`
+//!   with `// alloc: <why>` for the global heap's; see [`table`]). It costs about what
 //!   FxHash does per key, and it spreads sequential integers and aligned pointers over the whole
 //!   word, which FxHash's single multiply does not: hashbrown places a key by the low bits of its
 //!   hash and tells keys of a group apart by the top seven. The seed is fixed so that a run is
 //!   reproducible; no output may depend on a map's order all the same.
 //! - Keys that are hashes already (a content ID, a store key, a fingerprint): [`ByHash`] and
-//!   [`ByHashSet`], on [`KeyHasher`], which takes the key's first word and hashes nothing.
+//!   [`ByHashSet`], on [`KeyHasher`], which takes the key's first word and hashes nothing, in
+//!   a named allocator as above.
 //! - A map or set shared between threads: [`SharedMap`] and [`SharedSet`] (and [`SharedByHash`]
 //!   for keys that are hashes), papaya's lock-free tables on the same hashers. A read takes no
 //!   lock and writes no shared memory, and nothing is held across a call, so no thread waits on
 //!   another's lookup. Its values are lent (`map.pin().get(..)`), never moved out: a table whose
-//!   entries are taken by value stays a locked [`HashMap`].
+//!   entries are taken by value stays a locked [`HashMap`]. These name no allocator: papaya
+//!   takes none, and a shared table is long-lived (a daemon's, a view's), so the global heap is
+//!   its lifetime's allocator; `blaze::implicit_allocator` leaves them alone for that reason.
 //! - Hashes that are persisted or compared across runs are BLAKE3, never these: a content ID
 //!   is `blaze_ids::Hasher`, and a value's `Hash` is fed to it through [`Blake3Hasher`]. This
 //!   crate depends on nothing of blaze's, so every crate can use it.
+
+#![feature(allocator_api)]
 
 use std::hash::{BuildHasher, Hasher};
 
 mod blake3;
 mod key;
+pub mod table;
 #[cfg(test)]
 mod tests;
 
 pub use blake3::{Blake3, Blake3Hasher};
 pub use key::{BuildKeyHasher, ByHash, ByHashSet, KeyHasher};
+pub use table::{Map, Set};
 
-/// A map of ordinary keys.
-#[expect(clippy::disallowed_types, reason = "the one place std's map is named, on blaze's hasher")]
-pub type HashMap<K, V> = std::collections::HashMap<K, V, FixedState>; // alloc: not SipHash: hashed by `FixedState`
+/// The entry and iterator types of [`HashMap`] and [`ByHash`]: hashbrown's
+/// (`hash_map::Entry::Vacant(..)`), not std's.
+pub use hashbrown::hash_map;
+/// The iterator types of [`HashSet`] and [`ByHashSet`]: hashbrown's.
+pub use hashbrown::hash_set;
 
-/// A set of ordinary keys.
-#[expect(clippy::disallowed_types, reason = "the one place std's set is named, on blaze's hasher")]
-pub type HashSet<K> = std::collections::HashSet<K, FixedState>; // alloc: not SipHash: as above
+/// A map of ordinary keys in the allocator `A`, which every use names: `HashMap::new_in(frame)`,
+/// `HashMap::with_capacity_in(n, frame)`, `HashMap::from_iter_in(iter, frame)`.
+pub type HashMap<K, V, A> = Map<K, V, FixedState, A>;
 
-/// A map of ordinary keys shared between threads, made by `SharedMap::default()`.
+/// A set of ordinary keys in the allocator `A`, which every use names, as for [`HashMap`].
+pub type HashSet<K, A> = Set<K, FixedState, A>;
+
+/// A map of ordinary keys shared between threads, made by `SharedMap::default()`. Like the
+/// other shared tables it names no allocator: papaya takes none, and a shared table is
+/// long-lived, so it is on the global heap (see the crate's documentation).
 pub type SharedMap<K, V> = papaya::HashMap<K, V, FixedState>;
 
 /// A set of ordinary keys shared between threads, made by `SharedSet::default()`.

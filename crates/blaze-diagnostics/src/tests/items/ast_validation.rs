@@ -647,8 +647,15 @@ fn test<
 
 fn main() { }
 "###;
+    // The test has `Box` and `Send` from std's prelude: minicore's `Send` and a std of `Box`.
+    let fixture = format!(
+        "//- minicore: sized, send\n//- /std.rs crate:std\n#![feature(lang_items)]\n\
+         pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; pub use crate::boxed::Box; }} }}\n\
+         pub mod boxed {{\n    #[lang = \"owned_box\"]\n    pub struct Box<T: ?Sized>(*mut T);\n}}\n\
+         //- /region-bounds-on-objects-and-type-parameters.rs crate:other:main edition:2015 deps:std\n{source}"
+    );
     assert_reports(
-        &ui("region-bounds-on-objects-and-type-parameters.rs", "2015", source),
+        &super::ui_fixture(&fixture),
         &[
             error(21, &[]),
             error(11, &["`'c`"]),

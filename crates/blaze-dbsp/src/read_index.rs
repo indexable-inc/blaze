@@ -1,6 +1,7 @@
 use std::hash::Hash;
 
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use smallvec::SmallVec;
 
 /// Readers of keys, both ways: what woke whom. K: the key read ((module, name), negative reads
@@ -15,12 +16,12 @@ pub struct ReadIndex<K, R> {
     by_key: Side<K, R>,
     by_reader: Side<R, K>,
     /// (key row, reader row) -> (place in the key's list, place in the reader's list).
-    pairs: HashMap<(u32, u32), (u32, u32)>,
+    pairs: HashMap<(u32, u32), (u32, u32), Global>,
 }
 
 #[derive(Debug)]
 struct Side<A, B> {
-    slot: HashMap<A, u32>,
+    slot: HashMap<A, u32, Global>,
     rows: Vec<Row<A, B>>,
     free: Vec<u32>,
 }
@@ -34,7 +35,7 @@ struct Row<A, B> {
 
 impl<A: Copy + Eq + Hash, B: Copy> Side<A, B> {
     fn new() -> Self {
-        Side { slot: HashMap::default(), rows: Vec::new(), free: Vec::new() } // alloc: setup: empty buffers, grown once and kept
+        Side { slot: HashMap::new_in(Global), rows: Vec::new(), free: Vec::new() } // alloc: setup: empty buffers, grown once and kept
     }
 
     fn intern(&mut self, a: A) -> u32 {
@@ -86,13 +87,13 @@ impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> Default for ReadIndex<K, R> {
 
 impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> ReadIndex<K, R> {
     pub fn new() -> Self {
-        ReadIndex { by_key: Side::new(), by_reader: Side::new(), pairs: HashMap::default() }
+        ReadIndex { by_key: Side::new(), by_reader: Side::new(), pairs: HashMap::new_in(Global) }
     }
 
     pub fn add(&mut self, key: K, reader: R) {
         let k = self.by_key.intern(key);
         let r = self.by_reader.intern(reader);
-        let std::collections::hash_map::Entry::Vacant(edge) = self.pairs.entry((k, r)) else {
+        let blaze_hash::hash_map::Entry::Vacant(edge) = self.pairs.entry((k, r)) else {
             return;
         };
         let key_items = &mut self.by_key.rows[k as usize].items;

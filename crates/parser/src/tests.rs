@@ -1,3 +1,4 @@
+mod comptime;
 mod prefix_entries;
 mod top_entries;
 

@@ -18,6 +18,7 @@ doctest = false
 # `annotate_snippet_emitter_writer.rs`), so that ours read byte for byte as rustc's do.
 annotate-snippets.workspace = true
 blaze-hash.workspace = true
+blaze-serde.workspace = true
 either.workspace = true
 hashbrown.workspace = true
 memchr.workspace = true

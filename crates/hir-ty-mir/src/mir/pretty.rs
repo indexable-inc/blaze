@@ -136,6 +136,10 @@ impl<'db> Printer<'_, '_, 'db> {
                     // alloc: printing MIR for people, the edge
                     format!("({text} as {})", self.variant_name(*variant))
                 }
+                ProjectionElem::ReflectedField(binder) => {
+                    // alloc: printing MIR for people, the edge
+                    format!("({text}.[!U{}]: {})", binder.0, self.ty(next.ty))
+                }
             };
             ty = next;
         }
@@ -552,6 +556,18 @@ impl<'db> Printer<'_, '_, 'db> {
                 self.block(*real_target),
                 self.unwind(*unwind, in_cleanup)
             ),
+            // alloc: printing MIR for people, the edge
+            TerminatorKind::ComptimeFor { binder, domain, body, after } => format!(
+                "for const !U{} in {} -> [body: {}, after: {}];",
+                binder.0,
+                self.ty(domain.as_ref()),
+                self.block(*body),
+                self.block(*after)
+            ),
+            // alloc: printing MIR for people, the edge
+            TerminatorKind::ComptimeNext { head } => {
+                format!("next const -> {};", self.block(*head))
+            }
         }
     }
 

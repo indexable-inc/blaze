@@ -8,6 +8,7 @@
 //! The tables are the check's: [`Paths`] lives in [`Cx`] and keeps them in its frame, each built
 //! the first time it is read, and every later answer is a hash probe and a slice.
 
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
 use std::cell::OnceCell;
 
 use base_db::{CrateOrigin, LangCrateOrigin};
@@ -457,6 +458,7 @@ impl<'f> Tree<'f> {
 /// - printing's (`trimmed_def_paths`, `visible_parent_map`, the crate's `extern crate` items),
 ///   the first time a path is printed;
 /// - [`Decls`], every declaration by its name, the first time an import is looked for.
+#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
 pub(crate) struct Paths<'f> {
     frame: &'f Frame,
     printing: OnceCell<Printing<'f>>,
@@ -473,6 +475,7 @@ struct Printing<'f> {
 }
 
 impl<'f> Paths<'f> {
+    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
     pub(crate) fn new(cx: &Cx<'f, '_>) -> Paths<'f> {
         Paths { frame: cx.frame(), printing: OnceCell::new(), decls: OnceCell::new() }
     }

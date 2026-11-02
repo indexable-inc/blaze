@@ -34,6 +34,7 @@
 use base_db::Db;
 use blaze_format::cursor::Put;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_items::{ItemId, key};
 use blaze_mem::scratch;
 use blaze_query::db::AsId;
@@ -95,7 +96,7 @@ pub(crate) fn names_of(db: &Db, def: DefWithBodyId) -> Result<Names, &'static st
     let mut blank = vec![u16::MAX; path_count(body)];
     // alloc: the targets, at most one per path, and the set that keeps each once
     let mut targets = Vec::with_capacity(blank.len());
-    let mut seen = HashMap::default();
+    let mut seen = HashMap::new_in(Global);
     write(db, def, body, &mut names, &mut traits, &mut blank, &mut targets, &mut seen)?;
     for it in &mut blank {
         if *it == u16::MAX {
@@ -123,7 +124,7 @@ fn write(
     traits: &mut Vec<u8>,
     blank: &mut [u16],
     targets: &mut Vec<Target>,
-    seen: &mut HashMap<Target, ()>,
+    seen: &mut HashMap<Target, (), Global>,
 ) -> R {
     let store: &ExpressionStore = body;
     let root = body.root_expr();
@@ -368,7 +369,7 @@ struct Out<'a, 'db> {
     /// The body's own item, written as "self".
     own: Option<ItemId>,
     targets: &'a mut Vec<Target>,
-    seen: &'a mut HashMap<Target, ()>,
+    seen: &'a mut HashMap<Target, (), Global>,
     /// The fewest leading segments any resolution of the path being written resolved,
     /// `usize::MAX` while none has.
     resolved: usize,

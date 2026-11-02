@@ -156,8 +156,9 @@ PATH for an installed release).
 
 - **std** (no dependencies; the merge gate runs these on every pull request, under two minutes):
   `HashMap` insert and iterate, `thread::spawn` + `join`, `thread_local!`, `Mutex`/`OnceLock`/
-  atomic statics, `std::env` and `std::fs` basics, and `const_heap` (`Vec`, `String`, `Box` and
-  `BTreeMap` in constants).
+  atomic statics, `std::env` and `std::fs` basics, `const_heap` (`Vec`, `String`, `Box` and
+  `BTreeMap` in constants), and `arbitrary_ints` (`u3` and `i7` of `#![blaze::arbitrary_ints]`:
+  overflow panics in dev and wraps in release, compiled code agrees with const eval).
 - **crates** (from crates.io, at the versions their Cargo.lock pins): tokio (multi-threaded
   runtime, a TCP echo on localhost), a serde_json round trip, proc-macro derives (thiserror,
   clap's derive), and three constants of real crates: SHA-256 of 1 MiB (`ce_sha256`, sha2), a

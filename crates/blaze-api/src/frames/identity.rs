@@ -21,8 +21,8 @@ use crate::{
     UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 30;
-const RESPONSES: usize = 35;
+const REQUESTS: usize = 32;
+const RESPONSES: usize = 39;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -297,6 +297,8 @@ impl Gen {
                 top: self.u32(),
                 since: if self.yes() { crate::HotSince::LastBuild } else { crate::HotSince::Start },
             },
+            29 => Request::Gc { dry_run: self.yes() },
+            30 => Request::Rebuilt { all: self.yes(), cwd: self.maybe_text(), item: self.maybe_text() },
             _ => Request::Stop,
         }
     }
@@ -531,6 +533,7 @@ impl Gen {
                     (NodeKind::ALL[(g.next() % NodeKind::ALL.len() as u64) as usize], g.wide())
                 }),
                 critical_path_us: self.wide(),
+                placed: crate::PlacedBytes { cloned: self.wide(), written: self.wide(), copied: self.wide() },
             }),
             8 => Response::TestResult(TestResult {
                 name: self.text(),
@@ -677,9 +680,77 @@ impl Gen {
                 error_ns: self.wide(),
                 total_ns: self.wide(),
             }),
+            34 => Response::Collected { report: self.text() },
+            35 => Response::UnitBegan(self.unit_of()),
+            36 => Response::TestReady(self.artifact()),
+            37 => Response::Rebuilt(self.rebuilt(depth)),
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }  // alloc: test and fuzz reference only
             }
+        }
+    }
+
+    fn maybe_id(&mut self) -> Option<ContentId> {
+        if self.yes() { Some(self.id()) } else { None }
+    }
+
+    fn maybe_text(&mut self) -> Option<String> {
+        if self.yes() { Some(self.text()) } else { None }
+    }
+
+    fn rebuilt(&mut self, depth: u32) -> crate::Rebuilt {
+        crate::Rebuilt {
+            torn: self.maybe_text(),
+            build: if self.yes() { Some(self.wide()) } else { None },
+            chain: self.yes(),
+            count: self.u32(),
+            groups: self.many(depth, |g| crate::RebuildGroup {
+                step: g.text(),
+                cause: g.rebuild_cause(depth),
+                count: g.u32(),
+                items: g.many(depth, |g| g.text()),
+            }),
+            command: self.maybe_text(),
+            dropped: if self.yes() { Some(self.wide()) } else { None },
+            rebuilt: self.many(depth, |g| crate::Rebuild { item: g.text(), step: g.text(), cause: g.rebuild_cause(depth) }),
+            restoring: self.yes(),
+            workspace: self.maybe_text(),
+        }
+    }
+
+    fn rebuild_cause(&mut self, depth: u32) -> crate::RebuildCause {
+        use crate::{PartChanged, RebuildCause};
+        match self.below(13) {
+            0 => RebuildCause::First,
+            1 => RebuildCause::Parts {
+                parts: self.u32(),
+                since: self.wide(),
+                changed: self.many(depth, |g| PartChanged {
+                    now: g.maybe_id(),
+                    was: g.maybe_id(),
+                    part: g.text(),
+                    names: g.maybe_text(),
+                }),
+            },
+            2 => RebuildCause::Lost { since: self.wide() },
+            3 => RebuildCause::Beyond { what: self.text(), since: self.wide() },
+            4 => RebuildCause::Unnamed { since: self.wide() },
+            5 => RebuildCause::Read {
+                now: self.maybe_id(),
+                was: self.maybe_id(),
+                read: self.text(),
+                names: self.maybe_text(),
+                reads: self.u32(),
+                since: if self.yes() { Some(self.wide()) } else { None },
+                changed: self.u32(),
+            },
+            6 => RebuildCause::Unrecorded,
+            7 => RebuildCause::Collected,
+            8 => RebuildCause::Unshaped,
+            9 => RebuildCause::Twice { count: self.u32() },
+            10 => RebuildCause::Always { why: self.text() },
+            11 => RebuildCause::NotExplained { what: self.text() },
+            _ => RebuildCause::Failed { why: self.text() },
         }
     }
 
@@ -742,7 +813,9 @@ fn request_index(request: &Request) -> usize {
         Request::Live => 26,
         Request::Sql { .. } => 27,
         Request::Hot { .. } => 28,
-        Request::Stop => 29,
+        Request::Gc { .. } => 29,
+        Request::Rebuilt { .. } => 30,
+        Request::Stop => 31,
     }
 }
 
@@ -783,7 +856,11 @@ fn response_index(response: &Response) -> usize {
         Response::Live(_) => 31,
         Response::Queried { .. } => 32,
         Response::Hot(_) => 33,
-        Response::Of { .. } => 34,
+        Response::Collected { .. } => 34,
+        Response::UnitBegan(_) => 35,
+        Response::TestReady(_) => 36,
+        Response::Rebuilt(_) => 37,
+        Response::Of { .. } => 38,
     }
 }
 

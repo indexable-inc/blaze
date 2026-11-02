@@ -26,7 +26,10 @@ fn tree(name: &str, files: &[(&str, &str)]) -> PathBuf {
 }
 
 fn context(root: &Path) -> Context<Disk> {
-    let env = [("CARGO_HOME".to_owned(), root.join("cargo-home").display().to_string())];
+    let env = [
+        ("CARGO_HOME".to_owned(), root.join("cargo-home").display().to_string()),
+        ("BLAZE_HOME".to_owned(), root.join("blaze-home").display().to_string()),
+    ];
     Context::new(Config::load(root, env, &[]).unwrap())
 }
 
@@ -126,7 +129,7 @@ fn a_path_base_joins_the_workspace_root() {
     );
     let ctx = context(&root);
     let ws = workspace(&ctx).unwrap();
-    let json = serde_json::to_value(blaze_manifest::metadata::export_no_deps(&ws)).unwrap();
+    let json = serde_json::to_value(blaze_manifest::metadata::export_no_deps(&ws).unwrap()).unwrap();
     let a = json["packages"].as_array().unwrap().iter().find(|p| p["name"] == "a").unwrap();
     let dep = &a["dependencies"][0];
     assert_eq!(dep["path"].as_str().unwrap(), root.join("crates").join("b").display().to_string());

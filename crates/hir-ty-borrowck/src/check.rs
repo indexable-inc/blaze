@@ -31,6 +31,7 @@ use super::{
     mem::{self, FMap, FSet, FVec, Frame},
     moves::{InitFlow, InitKind, Lookup, MoveData, Mpi, apply},
     decode::Decoded,
+    flow,
     names::Text,
     polonius,
     regions::{self, Category, RegionValues, Regions, UniversalKind},
@@ -55,6 +56,8 @@ pub(super) struct Draft<'f> {
     pub(super) labels: FVec<'f, (PartSpan, &'f str)>,
     pub(super) children: FVec<'f, DraftChild<'f>>,
     suggestions: FVec<'f, DraftSuggestion<'f>>,
+    /// [`BorrowckDiagnostic::dropped_at_scope_end`].
+    pub(super) dropped_at_scope_end: Option<hir_def::hir::BindingId>,
 }
 
 /// A [`Child`] while drafted.
@@ -89,6 +92,7 @@ impl<'f> Draft<'f> {
             labels: Vec::new_in(frame),
             children: Vec::new_in(frame),
             suggestions: Vec::new_in(frame),
+            dropped_at_scope_end: None,
         }
     }
 
@@ -162,6 +166,8 @@ impl<'f> Draft<'f> {
                     verbose: it.verbose,
                 })
                 .collect(), // alloc: the owned diagnostic
+            dropped_at_scope_end: self.dropped_at_scope_end,
+            drop_check: None,
         }
     }
 }
@@ -207,7 +213,7 @@ pub(super) fn check<'o, 'f, 'db>(
         });
     let mut regions = phase(Phase::Constraints, || regions::build(ctx, body, &cfg, requirements));
     let count = ctx.infcx.num_region_vars();
-    let live = phase(Phase::Liveness, || {
+    let (live, drops) = phase(Phase::Liveness, || {
         liveness::region_liveness(ctx, body, &cfg, &decoded, &moves, &regions, count)
     });
     let (values, unnamed) = phase(Phase::Infer, || {
@@ -246,12 +252,50 @@ pub(super) fn check<'o, 'f, 'db>(
     };
     let mut loans =
         phase(Phase::Loans, || Loans::gather(ctx, body, &cfg, &decoded, &regions, unique));
+    // rustc reports the drop check's errors from liveness, before the walk's: with the
+    // loans known, as a polonius run defers some locals only in a body with a borrow.
+    let mut dropck_errors: FVec<'_, BorrowckDiagnostic> = Vec::new_in(ctx.frame);
+    phase(Phase::Liveness, || {
+        super::dropck::report(
+            ctx,
+            body,
+            &regions,
+            &drops,
+            count,
+            !loans.loans.is_empty(),
+            &mut dropck_errors,
+        )
+    });
+    // `polonius-flow`: whether datalog Polonius found every subset among universal regions
+    // given by the signature, and where it ran out of budget if it did.
+    let mut flow_universals_hold = false;
+    let mut flow_gave_up = None;
     phase(Phase::Scopes, || match ctx.mode {
         Mode::Polonius => {
             let live_loans = polonius::live_loans(ctx, body, &cfg, &regions, count, &live, &loans);
             loans.compute_polonius_scopes(ctx, body, &cfg, &live_loans);
         }
-        _ => loans.compute_scopes(ctx, body, &cfg, &values),
+        Mode::PoloniusFlow => {
+            let mut live_loans =
+                polonius::live_loans(ctx, body, &cfg, &regions, count, &live, &loans);
+            let outcome = phase(Phase::Flow, || {
+                flow::analyze(ctx, body, &cfg, &regions, count, &live, &loans)
+            });
+            match outcome {
+                flow::Outcome::Done { live_loans: flowing, universals_hold } => {
+                    // Live where both say so: a ∩ b is a − (a − b).
+                    for (alpha, flowing) in live_loans.iter_mut().zip(flowing.iter()) {
+                        let mut only_alpha = alpha.clone();
+                        only_alpha.subtract(flowing);
+                        alpha.subtract(&only_alpha);
+                    }
+                    flow_universals_hold = universals_hold;
+                }
+                flow::Outcome::GaveUp { during, steps } => flow_gave_up = Some((during, steps)),
+            }
+            loans.compute_polonius_scopes(ctx, body, &cfg, &live_loans);
+        }
+        Mode::Nll | Mode::Off => loans.compute_scopes(ctx, body, &cfg, &values),
     });
     let borrows_entry = phase(Phase::EntrySets, || loans.entry_sets(ctx, body, &cfg));
     crate::timings::count(|it| {
@@ -331,6 +375,7 @@ pub(super) fn check<'o, 'f, 'db>(
         dead_reported: mem::set(frame),
         reservation_reported: mem::set(frame),
         static_muts: static_muts(ctx, body, &decoded),
+        flow_universals_hold,
         mut_errors: mem::map(frame),
         requirements: Vec::new_in(out_frame),
         mut_upvars,
@@ -428,7 +473,20 @@ pub(super) fn check<'o, 'f, 'db>(
         checker.unused_mut()
     });
     crate::timings::finish(Phase::Errors, errors);
+    if let Some((during, steps)) = flow_gave_up {
+        // No fallback that is not said: these are the alpha's errors, unnarrowed.
+        let note = text!(
+            checker,
+            "`BLAZE_BORROWCK=polonius-flow` stopped {during} after {steps} steps (its budget is \
+             {}), so this is the default checker's error",
+            flow::BUDGET
+        );
+        for draft in checker.errors.iter_mut().flatten() {
+            draft.note(note);
+        }
+    }
     frame_only(|| {
+        out.extend(dropck_errors);
         out.extend(checker.errors.iter().flatten().map(Draft::owned));
         // rustc's `buffered_move_errors` is a `BTreeMap` by the moves each error is about.
         let mut reported = checker.move_reported;
@@ -810,6 +868,10 @@ enum MoveErrorKind {
     SliceOrArray(usize),
     /// Out of a variable in its `match` arm's guard.
     Guard,
+    /// Out of a reflected field `x.[f]` of an owned base (`#![feature(blaze_comptime)]`):
+    /// the length of the base. The plan allows it as a partial move of an unknown field; the
+    /// move paths do not track one per iteration yet, so it is refused.
+    ReflectedField(usize),
 }
 
 struct MoveError<'f> {
@@ -861,6 +923,9 @@ struct Checker<'a, 'f, 'o, 'db> {
     assigned_local: LocalId,
     /// The temporaries that point to a `static mut`.
     static_muts: BitSet<'f>,
+    /// `polonius-flow` found no subset among universal regions the signature does not give
+    /// ([`flow::Outcome::Done`]): the universal regions' errors are not reported.
+    flow_universals_hold: bool,
     regions: &'a Regions<'f, 'db>,
     region_count: usize,
     values: &'a RegionValues<'f>,
@@ -1222,7 +1287,10 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
             | TerminatorKind::Unreachable
             | TerminatorKind::CoroutineDrop
             | TerminatorKind::FalseEdge { .. }
-            | TerminatorKind::FalseUnwind { .. } => (),
+            | TerminatorKind::FalseUnwind { .. }
+            // No operands; the loop is one in the control flow, its body run any number of times.
+            | TerminatorKind::ComptimeFor { .. }
+            | TerminatorKind::ComptimeNext { .. } => (),
         }
         // A loop's way back is rustc's `FalseUnwind` at the loop's head, which may unwind.
         let loops = matches!(
@@ -1283,6 +1351,34 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
         ))
     }
 
+    /// The outermost field of a `#[blaze::bits]` struct `place` goes through, and that
+    /// struct: such a field sits at a bit offset inside the backing integer and has no address
+    /// of its own, behind a reference to the struct or not.
+    fn bits_field(
+        &self,
+        place: PlaceRef<'_>,
+    ) -> Option<(hir_def::StructId, hir_def::LocalFieldId)> {
+        (0..place.projection.len()).find_map(|at| {
+            let ProjectionElem::Field(field) = place.projection[at] else { return None };
+            let base = self.ctx.place_ty(self.body, place.local, &place.projection[..at]);
+            let strukt = hir_ty::layout::bits_struct_of(self.ctx.db, base.ty)?;
+            Some((strukt, field.to_local_field_id()))
+        })
+    }
+
+    /// The names of the `#[blaze::bits]` struct `strukt` and its field `field`, for a message.
+    fn bits_names(
+        &self,
+        strukt: hir_def::StructId,
+        field: hir_def::LocalFieldId,
+    ) -> (&'f str, &'f str) {
+        let db = self.ctx.db;
+        let name = hir_def::signatures::StructSignature::of(db, strukt).name.as_str();
+        let fields = hir_def::VariantId::from(strukt).fields(db);
+        let field = fields.fields()[field].name.as_str();
+        (text!(self, "{name}"), text!(self, "{field}"))
+    }
+
     /// rustc's `is_disaligned`: whether `place` is in a `#[repr(packed)]` struct, not behind a
     /// reference, that may leave it less aligned than its type asks for, as one whose layout
     /// is not known (of a type parameter) may.
@@ -1331,9 +1427,20 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
             Rvalue::Ref(..) if self.loans.promoted.contains(&location) => (),
             // Lowering computes `offset_of!` as the address of the field of a value at address
             // 0, where rustc has `NullOp::OffsetOf`, which accesses no place.
-            Rvalue::Ref(..)
+            Rvalue::Ref(_, place)
                 if matches!(span, MirSpan::ExprId(expr)
-                    if matches!(self.ctx.store.expr(expr), hir_def::hir::Expr::OffsetOf(_))) => {}
+                    if matches!(self.ctx.store.expr(expr), hir_def::hir::Expr::OffsetOf(_))) =>
+            {
+                if let Some((strukt, field)) = self.bits_field(PlaceRef::of(place)) {
+                    let (strukt, field) = self.bits_names(strukt, field);
+                    let message = text!(
+                        self,
+                        "`offset_of!` of field `{field}` of `#[blaze::bits]` struct `{strukt}`: a \
+                         bit-packed field has a bit offset, not a byte offset"
+                    );
+                    self.report("E0793", span, message);
+                }
+            }
             Rvalue::Ref(kind, place) => {
                 let place = PlaceRef::of(place);
                 let (access, depth, action) = match kind {
@@ -1353,6 +1460,19 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                 self.access_place(location, place, span, access, Allowed::No, depth);
                 self.check_if_path_or_subpath_is_moved(location, action, place, span);
                 if !matches!(kind, BorrowKind::Shallow)
+                    && let Some((strukt, field)) = self.bits_field(place)
+                {
+                    // Raw borrows too: `&raw const s.f` has no address to take either.
+                    let (strukt, field) = self.bits_names(strukt, field);
+                    let shown = self.describe(place).unwrap_or(field);
+                    let message = text!(
+                        self,
+                        "reference to field `{field}` of `#[blaze::bits]` struct `{strukt}`: a \
+                         bit-packed field has no address; copy it out with `{{ {shown} }}` or \
+                         borrow the whole struct"
+                    );
+                    self.report("E0793", span, message);
+                } else if !matches!(kind, BorrowKind::Shallow)
                     && !self.is_raw_borrow(span)
                     && self.is_disaligned(place)
                 {
@@ -2029,7 +2149,9 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
         let in_closure = self.ctx.closure_local.is_some() || self.ctx.inline_const;
         let mut higher_ranked = mem::set(self.ctx.frame);
         for (longer, &(longer_rv, kind)) in universals.iter().enumerate() {
-            if matches!(kind, UniversalKind::Static | UniversalKind::FnBody) {
+            if matches!(kind, UniversalKind::Static | UniversalKind::FnBody)
+                || self.flow_universals_hold
+            {
                 continue;
             }
             // As rustc, only the representative of the universal regions that outlive each
@@ -2956,6 +3078,17 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                     self.check_if_full_path_is_moved(location, InitAction::Use, base, span);
                     break;
                 }
+                // Any field of the base, whose type may have a destructor (a parameter's
+                // may): assigning it needs all of the base, as a field of a `Drop` type.
+                ProjectionElem::ReflectedField(_) => {
+                    self.check_if_path_or_subpath_is_moved(
+                        location,
+                        InitAction::Assignment,
+                        base,
+                        span,
+                    );
+                    break;
+                }
                 ProjectionElem::Field(_) => {
                     let ty = self.ctx.place_ty(self.body, base.local, base.projection);
                     match ty.ty.kind() {
@@ -3081,6 +3214,7 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                 (ProjectionElem::Index(_), TyKind::Array(..)) => {
                     Some(MoveErrorKind::SliceOrArray(len))
                 }
+                (ProjectionElem::ReflectedField(_), _) => Some(MoveErrorKind::ReflectedField(len)),
                 _ => None,
             };
             if let Some(kind) = kind {
@@ -3302,7 +3436,8 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                         let len = match error.kind {
                             MoveErrorKind::Borrowed(len)
                             | MoveErrorKind::Destructor(len)
-                            | MoveErrorKind::SliceOrArray(len) => len,
+                            | MoveErrorKind::SliceOrArray(len)
+                            | MoveErrorKind::ReflectedField(len) => len,
                             MoveErrorKind::Guard => 0,
                         };
                         let projection = error.place.1;
@@ -3319,7 +3454,9 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
             let message = self.move_error_message(&error);
             let code = match error.kind {
                 MoveErrorKind::Borrowed(len) if self.is_slice_or_array(&error, len + 1) => "E0508",
-                MoveErrorKind::Borrowed(_) | MoveErrorKind::Guard => "E0507",
+                MoveErrorKind::Borrowed(_)
+                | MoveErrorKind::Guard
+                | MoveErrorKind::ReflectedField(_) => "E0507",
                 MoveErrorKind::SliceOrArray(_) => "E0508",
                 MoveErrorKind::Destructor(_) => "E0509",
             };
@@ -3382,6 +3519,20 @@ impl<'a, 'f, 'o, 'db> Checker<'a, 'f, 'o, 'db> {
                 let kind = if matches!(ty.kind(), TyKind::Slice(_)) { "slice" } else { "array" };
                 text!(self, "cannot move out of type `{}`, a non-copy {kind}", self.array_name(ty))
             }
+            MoveErrorKind::ReflectedField(_) => match self.describe(place) {
+                Some(name) => text!(
+                    self,
+                    "cannot move out of the reflected field `{name}`: moving a field out of its \
+                     base in a `for const` loop is not supported yet (`#![feature(blaze_comptime)]`); \
+                     borrow it or copy it"
+                ),
+                None => text!(
+                    self,
+                    "cannot move out of a reflected field: moving a field out of its base in a \
+                     `for const` loop is not supported yet (`#![feature(blaze_comptime)]`); \
+                     borrow it or copy it"
+                ),
+            },
         }
     }
 }

@@ -13,6 +13,7 @@
 
 extern crate ra_ap_rustc_pattern_analysis as rustc_pattern_analysis;
 
+mod catchall;
 mod cx;
 mod lower;
 mod print;
@@ -29,6 +30,8 @@ use hir_def::{
     item_scope::ImportId,
 };
 use hir_ty::{InferenceResult, next_solver::StoredTy};
+
+pub use catchall::{CatchAll, CatchAlls};
 
 /// What match checking finds in a body and the closures and inline constants in it.
 #[derive(Debug, Default, PartialEq, Eq, Hash)]
@@ -292,4 +295,15 @@ pub fn match_check(db: &Db, def: DefWithBodyId) -> MatchCheck {
         return MatchCheck { not_checked: true, ..MatchCheck::default() };
     }
     visit::check_body(db, def, infer)
+}
+
+/// The catch-alls of `def`'s `match`es and the variants each stands for ([`CatchAll`]), for
+/// `blaze::wildcard_arm`; nothing for a body type checking found an error in.
+#[blaze_query::tracked(returns(ref))]
+pub fn catch_alls(db: &Db, def: DefWithBodyId) -> CatchAlls {
+    let infer = InferenceResult::of(db, def);
+    if infer.has_errors || infer.has_type_mismatches() || infer.is_erroneous() {
+        return CatchAlls { incomplete: true, ..CatchAlls::default() };
+    }
+    catchall::catch_alls(db, def, infer)
 }

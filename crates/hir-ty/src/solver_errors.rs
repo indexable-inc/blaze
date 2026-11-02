@@ -19,11 +19,13 @@ use rustc_type_ir::{
     elaborate::elaborate,
     inherent::{GenericArg as _, GenericArgs as _, GenericsOf as _, IntoKind, SliceLike, Term as _},
     lang_items::SolverTraitLangItem,
+    reflect::{first_reflected_var, instantiate_reflected_var},
     solve::TyOrConstInferVar,
 };
 
 use crate::{
     InferenceDiagnostic, Span,
+    comptime::ReflectedMember,
     next_solver::{
         AliasTermKind, AnyImplId, ClauseKind, DbInterner, GenericArg, ParamEnv, PolyProjectionClause,
         PolyTraitClause, Predicate, PredicateKind, ProjectionClause, StoredGenericArg,
@@ -113,6 +115,17 @@ pub enum SolverDiagnosticKind {
     Unreported {
         #[type_visitable(ignore)]
         code: UnreportedSolverError,
+    },
+    /// blaze: a field binder `for<F: Field<C>> P(F)` (or `for<V: Variant<C>>`,
+    /// `#![feature(blaze_comptime)]`) that does not hold because `P` fails of `member` of
+    /// `container`, the first such member in declaration order; `inner` is why `P` fails of it.
+    ReflectedMemberUnmet {
+        container: StoredTy,
+        #[type_visitable(ignore)]
+        member: ReflectedMember,
+        /// The field's type in `container`'s arguments; `None` for a variant.
+        member_ty: Option<StoredTy>,
+        inner: Box<SolverDiagnosticKind>,
     },
 }
 
@@ -295,6 +308,9 @@ impl SolverDiagnostic {
         }
 
         let interner = infcx.interner;
+        if let Some(kind) = reflected_member_unmet(infcx, error) {
+            return Some(SolverDiagnostic { span, cause: error.obligation.cause.code(), kind });
+        }
         let goal = || {
             StoredGoal::new(interner, infcx.deeply_resolve_ignoring_regions(error.obligation.predicate))
         };
@@ -363,6 +379,60 @@ impl SolverDiagnostic {
         };
         Some(SolverDiagnostic { span, cause: error.obligation.cause.code(), kind })
     }
+}
+
+/// blaze: the error of a field binder `for<F: Field<C>> P(F)` (`#![feature(blaze_comptime)]`)
+/// that fails, naming the member it fails of. The solver proves the binder by proving `P` of
+/// each member of `C` in declaration order (`rustc_next_trait_solver`'s
+/// `compute_reflected_forall_goal`); this proves them again in a probe and names the first that
+/// fails, with the error `P` gives for it. `None` when no binder is behind the error, or the
+/// container has no members (`C: Struct` fails, which the error's own goal says), or no member
+/// fails definitely.
+fn reflected_member_unmet<'db>(
+    infcx: &InferCtxt<'db>,
+    error: &FulfillmentError<'db>,
+) -> Option<SolverDiagnosticKind> {
+    if !error.is_true_error() {
+        return None;
+    }
+    let interner = infcx.interner;
+    // The outermost binder: the parents run from the root goal to the leaf's parent.
+    let binder = error
+        .parent_trait_obligations
+        .iter()
+        .copied()
+        .chain([error.obligation.predicate])
+        .map(|predicate| infcx.deeply_resolve_ignoring_regions(predicate))
+        .find(|predicate| first_reflected_var::<DbInterner<'db>>(predicate.kind().bound_vars()).is_some())?;
+    let kind = binder.kind();
+    let (index, var) = first_reflected_var::<DbInterner<'db>>(kind.bound_vars())?;
+    let members = crate::comptime::reflect_members_checked(interner, var.container, var.domain)?;
+    infcx.probe(|_| {
+        for member in members.iter() {
+            let goal = instantiate_reflected_var(interner, kind, index, member);
+            let obligation =
+                Obligation::new(interner, error.obligation.cause, error.obligation.param_env, goal);
+            let mut ocx = ObligationCtxt::new(infcx);
+            ocx.register_obligation(obligation);
+            let Some(failure) = ocx.evaluate_obligations_error_on_ambiguity().into_iter().next()
+            else {
+                continue;
+            };
+            let failure = failure.into_fulfillment_error(infcx);
+            let Some(inner) = SolverDiagnostic::from_fulfillment_error(infcx, &failure) else {
+                continue;
+            };
+            let (member, member_ty) = crate::comptime::reflected_member(interner, member)?;
+            return Some(SolverDiagnosticKind::ReflectedMemberUnmet {
+                container: var.container.store(),
+                member,
+                member_ty: member_ty.map(|ty| ty.store()),
+                // alloc: error path, the diagnostic's own reason
+                inner: Box::new(inner.kind),
+            });
+        }
+        None
+    })
 }
 
 /// What the alias of a projection goal normalizes to, when that differs from the goal's term:

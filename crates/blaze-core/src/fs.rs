@@ -175,10 +175,50 @@ pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
+/// [`crate::Effect::Mode`]: `path`'s permission bits set to `mode`, through a symbolic link
+/// (`chmod`).
 #[cfg(unix)]
 pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// [`crate::Effect::Seal`]: `path` opened `O_NOFOLLOW` (a symbolic link fails with `ELOOP`;
+/// `O_NONBLOCK` keeps a FIFO from blocking the open), refused unless a regular file, and its
+/// bits set on the descriptor (`fchmod`). No `fchmodat` with a flag, which glibc 2.39 and
+/// later make the `fchmodat2` call that older seccomp filters refuse with `EPERM`. An error
+/// names `path`.
+#[cfg(unix)]
+pub(crate) fn seal(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    // alloc: an error path.
+    let named = |error: io::Error| io::Error::new(error.kind(), format!("{}: sealing it: {error}", path.display()));
+    let file = match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path) {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                // alloc: an error path.
+                format!("{} {}", path.display(), crate::SEAL_THROUGH_A_LINK),
+            ));
+        }
+        // A socket fails its open before any `fstat`: refused naming it, as one that opens.
+        Err(error) => match error.raw_os_error().and_then(|code| no_file_after_open(path, code)) {
+            Some(kind) => return Err(not_sealed(path, kind)),
+            None => return Err(named(error)),
+        },
+    };
+    let kind = file.metadata().map_err(named)?.file_type();
+    if !kind.is_file() {
+        return Err(not_sealed(path, kind_of(kind)));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(mode)).map_err(named)
+}
+
+#[cfg(unix)]
+fn not_sealed(path: &Path, kind: &str) -> io::Error {
+    // alloc: an error path.
+    io::Error::new(io::ErrorKind::InvalidInput, format!("{} ({kind}) {}", path.display(), crate::SEAL_OF_NO_FILE))
 }
 
 /// The access and modification times of `path` (through a symbolic link) both `modified_ns`
@@ -203,7 +243,7 @@ pub(crate) fn set_times(path: &Path, modified_ns: u64) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub(crate) use crate::iocp::files::{clone, rename, set_mode, set_times, write_atomically};
+pub(crate) use crate::iocp::files::{clone, rename, seal, set_mode, set_times, write_atomically};
 
 #[cfg(unix)]
 fn sync_dir_of(path: &Path) -> io::Result<()> {
@@ -213,8 +253,14 @@ fn sync_dir_of(path: &Path) -> io::Result<()> {
     }
 }
 
-pub(crate) fn stat(path: &Path) -> io::Result<Option<Meta>> {
-    match std::fs::metadata(path) {
+/// [`crate::Effect::Stat`], through a symbolic link, or with `follow` false
+/// [`crate::Effect::Lstat`], of the link itself.
+pub(crate) fn stat(path: &Path, follow: bool) -> io::Result<Option<Meta>> {
+    let meta = match follow {
+        true => std::fs::metadata(path),
+        false => std::fs::symlink_metadata(path),
+    };
+    match meta {
         Ok(meta) => Ok(Some(meta_of(&meta))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -296,14 +342,68 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
             io::ErrorKind::Unsupported,
             // alloc: an error path.
             format!(
-                "the file system of {} cannot share blocks with {} ({error}); blaze does not \
-                 copy instead",
+                "the file system of {} ({}) cannot share blocks with {} ({}): {error}; blaze \
+                 does not copy instead",
                 to.display(),
-                from.display()
+                volume_of(to.parent().unwrap_or(to)),
+                from.display(),
+                volume_of(from)
             ),
         ),
         _ => error,
     })
+}
+
+/// The volume that holds `path`, for an error: where it is mounted and its file system on
+/// macOS; the file system's type and the device on Linux. Two different devices are what a
+/// cross-volume clone (`EXDEV`) refuses.
+#[cfg(unix)]
+pub(crate) fn volume_of(path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    // alloc: an error path.
+    let device = match std::fs::metadata(path) {
+        Ok(meta) => format!("device {}:{}", libc::major(meta.dev() as _), libc::minor(meta.dev() as _)),
+        Err(error) => format!("device unknown: {error}"),
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    match with_c_path(path, crate::raw::statfs) {
+        Ok(stat) => format!("{}, {device}", file_system(&stat)),
+        Err(error) => format!("statfs failed: {error}, {device}"),
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    device
+}
+
+#[cfg(target_os = "macos")]
+fn file_system(stat: &libc::statfs) -> String {
+    let text = |chars: &[libc::c_char]| {
+        let bytes: Vec<u8> = chars.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect(); // alloc: an error path.
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    // alloc: an error path.
+    format!("{} on {}", text(&stat.f_fstypename), text(&stat.f_mntonname))
+}
+
+#[cfg(target_os = "linux")]
+fn file_system(stat: &libc::statfs) -> String {
+    // `f_type`'s magic numbers, of `linux/magic.h`.
+    let magic = stat.f_type as u32;
+    let name = match magic {
+        0x9123_683e => "btrfs",
+        0x5846_5342 => "xfs",
+        0xca45_1a4e => "bcachefs",
+        0xef53 => "ext2/3/4",
+        0xf2f5_2010 => "f2fs",
+        0x2fc1_2fc1 => "zfs",
+        0x0102_1994 => "tmpfs",
+        0x794c_7630 => "overlayfs",
+        0x6573_5546 => "fuse or virtiofs",
+        0x0102_1997 => "9p",
+        0x6969 => "nfs",
+        _ => "a file system",
+    };
+    // alloc: an error path.
+    format!("{name} (magic {magic:#x})")
 }
 
 #[cfg(target_os = "linux")]
@@ -321,10 +421,87 @@ fn refuses_sharing(_: i32) -> bool {
     false
 }
 
+/// The source of a clone opened, a symbolic link refused ([`crate::CLONE_THROUGH_A_LINK`]):
+/// `O_NOFOLLOW` fails a link at the last name with `ELOOP`. `O_NONBLOCK` keeps a FIFO put
+/// there from blocking the open; a regular file ignores it. Anything else that is no regular
+/// file (a FIFO, a socket, a device) is refused naming it, never reported as a file system
+/// that cannot share blocks.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_source(from: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(from).map_err(|error| match error.raw_os_error() {
+        // alloc: an error path.
+        Some(libc::ELOOP) => io::Error::new(io::ErrorKind::InvalidInput, format!("{} {}", from.display(), crate::CLONE_THROUGH_A_LINK)),
+        Some(code) => match no_file_after_open(from, code) {
+            // alloc: an error path.
+            Some(kind) => io::Error::new(io::ErrorKind::InvalidInput, format!("{} ({kind}) {}", from.display(), crate::CLONE_OF_NO_FILE)),
+            None => error,
+        },
+        None => error,
+    })?;
+    let kind = file
+        .metadata()
+        // alloc: an error path.
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: reading what it is: {error}", from.display())))?
+        .file_type();
+    match kind.is_file() {
+        true => Ok(file),
+        false => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            // alloc: an error path.
+            format!("{} ({}) {}", from.display(), kind_of(kind), crate::CLONE_OF_NO_FILE),
+        )),
+    }
+}
+
+/// Where the open of a clone's source failed with `code`: what the name is, when that is no
+/// regular file. A socket fails its open before any `fstat` (`ENXIO` on Linux, `EOPNOTSUPP` on
+/// macOS), and so does a device with no driver behind it (`ENXIO`, `ENODEV`); the name is then
+/// looked at without following a link, so it is refused with [`crate::CLONE_OF_NO_FILE`] and
+/// written again, never reported as the open's error. `None` for any other code, or where the
+/// name is gone or a regular file again.
+#[cfg(unix)]
+pub(crate) fn no_file_after_open(from: &Path, code: i32) -> Option<&'static str> {
+    if !matches!(code, libc::ENXIO | libc::ENODEV | libc::EOPNOTSUPP) {
+        return None;
+    }
+    let kind = std::fs::symlink_metadata(from).ok()?.file_type();
+    (!kind.is_file()).then(|| kind_of(kind))
+}
+
+/// What a file is from its `st_mode` type bits (`S_IFMT`), for an error (uring's clone, which
+/// keeps only those bits).
+#[cfg(target_os = "linux")]
+pub(crate) fn kind_of_mode(mode: u32) -> &'static str {
+    match mode & libc::S_IFMT as u32 {
+        it if it == libc::S_IFREG as u32 => "a regular file",
+        it if it == libc::S_IFDIR as u32 => "a directory",
+        it if it == libc::S_IFLNK as u32 => "a symbolic link",
+        it if it == libc::S_IFIFO as u32 => "a FIFO",
+        it if it == libc::S_IFSOCK as u32 => "a socket",
+        it if it == libc::S_IFBLK as u32 || it == libc::S_IFCHR as u32 => "a device",
+        _ => "an unknown kind of file",
+    }
+}
+
+/// What a file that is no regular file is, for an error.
+#[cfg(unix)]
+fn kind_of(kind: std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt as _;
+    match () {
+        () if kind.is_dir() => "a directory",
+        () if kind.is_symlink() => "a symbolic link",
+        () if kind.is_fifo() => "a FIFO",
+        () if kind.is_socket() => "a socket",
+        () if kind.is_block_device() || kind.is_char_device() => "a device",
+        () => "an unknown kind of file",
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::fd::AsFd as _;
-    let source = File::open(from)?;
+    let source = open_source(from)?;
     let target = OpenOptions::new().write(true).create_new(true).open(to)?;
     let Err(error) = crate::raw::ficlone(target.as_fd(), source.as_fd()) else {
         return Ok(());
@@ -334,9 +511,50 @@ fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
     Err(error)
 }
 
+/// The source is opened `O_NOFOLLOW` (a symbolic link refused, as on Linux) and cloned from
+/// its descriptor (`fclonefileat`), so no link swapped in between is followed or cloned.
+/// `fclonefileat` copies the source's mode, owner, flags and times onto the clone: a store's
+/// placed copy is read-only (0o444) and as old as its first write, so the clone is given a new
+/// file's mode (0o666 less the umask) and the time now, as Linux's `FICLONE` into a new file
+/// and a `Write` leave it, each set on the name `to` without following a link there.
 #[cfg(target_os = "macos")]
 fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
-    with_c_path(from, |source| with_c_path(to, |target| crate::raw::clonefile(source, target)))
+    use std::os::fd::AsFd as _;
+    let source = open_source(from)?;
+    with_c_path(to, |target| crate::raw::fclonefileat(source.as_fd(), target))?;
+    drop(source);
+    let made = created_mode()
+        .and_then(|mode| with_c_path(to, |target| crate::raw::chmod_no_follow(target, mode)))
+        .and_then(|()| with_c_path(to, crate::raw::touch));
+    if let Err(error) = made {
+        _ = std::fs::remove_file(to);
+        // alloc: an error path.
+        return Err(io::Error::new(error.kind(), format!("{}: giving the clone a new file's mode and time: {error}", to.display())));
+    }
+    Ok(())
+}
+
+/// The mode a file this process creates with 0o666 is given: 0o666 less the umask. Read once,
+/// from a file made and removed in the temporary directory, as `umask(2)` can only be read by
+/// setting it, which would race every other thread's creates.
+#[cfg(target_os = "macos")]
+fn created_mode() -> io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if let Some(&mode) = MODE.get() {
+        return Ok(mode);
+    }
+    let probe = temporary_next_to(&std::env::temp_dir().join("blaze-umask"));
+    let made = OpenOptions::new().write(true).create_new(true).open(&probe).and_then(|file| file.metadata());
+    _ = std::fs::remove_file(&probe);
+    let mode = made.map_err(|error| {
+        // alloc: an error path.
+        io::Error::new(error.kind(), format!("reading the umask from {}: {error}", probe.display()))
+    })?
+    .permissions()
+    .mode()
+        & 0o777;
+    Ok(*MODE.get_or_init(|| mode))
 }
 
 /// The [`Stamp`] of a `stat` of a name, not followed through a symlink.
@@ -452,6 +670,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Pins C1 of review 4: a seal of a symbolic link is refused, naming the link, and the
+    /// file it points to keeps its mode (the seal acts on the descriptor of the name itself,
+    /// never through the link).
+    #[test]
+    fn a_seal_of_a_symbolic_link_is_refused_and_leaves_the_target_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = dir("seal-link");
+        let target = root.join("target");
+        std::fs::write(&target, b"bytes").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let refused = seal(&link, 0o444).unwrap_err().to_string();
+        assert!(refused.contains(crate::SEAL_THROUGH_A_LINK), "{refused}");
+        assert!(refused.contains(&*link.to_string_lossy()), "{refused}");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
+        seal(&target, 0o444).unwrap();
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o444);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A seal of a FIFO is refused as no regular file, without blocking on its open
+    /// (`O_NONBLOCK`): a test that hangs here is that fix undone.
+    #[test]
+    fn a_seal_of_a_fifo_is_refused_without_blocking() {
+        let root = dir("seal-fifo");
+        let fifo = root.join("fifo");
+        // std's `mkfifo` is unstable, and this module makes no raw calls.
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let refused = seal(&fifo, 0o444).unwrap_err().to_string();
+        assert!(refused.contains(crate::SEAL_OF_NO_FILE) && refused.contains("a FIFO"), "{refused}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Pins C1 of review 5: a socket fails its open before any `fstat` (`ENXIO`, `EOPNOTSUPP`);
+    /// a clone from it and a seal of it are still refused as no regular file, naming it, so the
+    /// store writes the file again rather than failing the place with the open's error.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_socket_is_refused_as_no_regular_file_by_a_clone_and_a_seal() {
+        let root = dir("socket");
+        let socket = root.join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let refused = open_source(&socket).unwrap_err().to_string();
+        assert!(refused.contains(crate::CLONE_OF_NO_FILE) && refused.contains("a socket"), "{refused}");
+        let refused = seal(&socket, 0o444).unwrap_err().to_string();
+        assert!(refused.contains(crate::SEAL_OF_NO_FILE) && refused.contains("a socket"), "{refused}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Pins C3 of review 4: a stat that does not follow ([`crate::Effect::Lstat`]) gives a
+    /// symbolic link's own length; one that follows ([`crate::Effect::Stat`]) the target's.
+    #[test]
+    fn a_stat_not_followed_gives_the_link_its_own_length() {
+        let root = dir("lstat");
+        let target = root.join("target");
+        std::fs::write(&target, vec![7u8; 100_000]).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let own = stat(&link, false).unwrap().expect("there");
+        assert_eq!(own.len, target.as_os_str().len() as u64, "the link's own length");
+        assert!(!own.dir);
+        assert_eq!(stat(&link, true).unwrap().expect("there").len, 100_000);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A write, rename or link whose directories are missing makes them and is done; one

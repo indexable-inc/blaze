@@ -88,10 +88,12 @@
 //! active crate for a given position, and then provide an API to resolve all
 //! syntax nodes against this specific crate.
 
-use std::{collections::hash_map::Entry, sync::Arc};
+use std::sync::Arc;
+use blaze_hash::hash_map::Entry;
 
 use base_db::{Crate, Db, relevant_crates};
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use hir_def::{
     AdtId, DefWithBodyId, EnumId, ExpressionStoreOwnerId, GenericDefId, ImplId, Lookup, ModuleId,
     TraitId, VariantId, dyn_map::DynMap, nameres::crate_def_map,
@@ -105,14 +107,14 @@ use crate::db::HirDatabase;
 
 #[derive(Default)]
 pub(super) struct SourceToDefCache<'db> {
-    pub(super) dynmap_cache: HashMap<(ChildContainer, HirFileId), DynMap>,
+    pub(super) dynmap_cache: HashMap<(ChildContainer, HirFileId), DynMap, Global>,
     /// Where each macro file's expansion is in `expansions`.
-    expansion_at: HashMap<MacroCallId, u32>,
+    expansion_at: HashMap<MacroCallId, u32, Global>,
     expansions: Vec<ExpansionInfo<'db>>,
-    pub(super) file_to_def_cache: HashMap<FileId, SmallVec<[ModuleId; 1]>>,
-    pub(super) included_file_cache: HashMap<EditionedFileId, Option<MacroCallId>>,
+    pub(super) file_to_def_cache: HashMap<FileId, SmallVec<[ModuleId; 1]>, Global>,
+    pub(super) included_file_cache: HashMap<EditionedFileId, Option<MacroCallId>, Global>,
     /// The crates a file is taken to be a module of, of those it may be, when any is.
-    pub(super) within: Option<Arc<HashSet<Crate>>>,
+    pub(super) within: Option<Arc<HashSet<Crate, Global>>>,
 }
 
 /// The crates `file` may be a module of: those `within` first, then the others. The file of a
@@ -120,7 +122,7 @@ pub(super) struct SourceToDefCache<'db> {
 /// module tree built.
 fn crates_of<'a>(
     db: &'a Db,
-    within: Option<&'a HashSet<Crate>>,
+    within: Option<&'a HashSet<Crate, Global>>,
     file: FileId,
     first: bool,
 ) -> impl Iterator<Item = Crate> + 'a {
@@ -180,7 +182,7 @@ pub(super) struct SourceToDefCtx<'db, 'cache> {
 
 impl<'db> SourceToDefCtx<'db, '_> {
     pub(super) fn file_to_def(&mut self, file: FileId) -> &SmallVec<[ModuleId; 1]> {
-        let _p = tracing::info_span!("SourceToDefCtx::file_to_def").entered();
+        let _p = tracing::info_span!(target: "blaze", "SourceToDefCtx::file_to_def").entered();
         if !self.cache.file_to_def_cache.contains_key(&file) {
             // clone: `Arc` bump so the set outlives `&mut self` below, once per file cache miss
             let within = self.cache.within.clone();
@@ -289,12 +291,12 @@ impl ChildContainer {
 #[derive(Default)]
 struct Carry {
     at: Option<(base_db::Nonce, blaze_query::db::View)>,
-    dynmap_cache: HashMap<(ChildContainer, HirFileId), DynMap>,
-    expansion_at: HashMap<MacroCallId, u32>,
+    dynmap_cache: HashMap<(ChildContainer, HirFileId), DynMap, Global>,
+    expansion_at: HashMap<MacroCallId, u32, Global>,
     /// Always empty: its storage, for the next `Semantics`' expansions.
     expansions: Vec<ExpansionInfo<'static>>,
-    file_to_def_cache: HashMap<FileId, SmallVec<[ModuleId; 1]>>,
-    included_file_cache: HashMap<EditionedFileId, Option<MacroCallId>>,
+    file_to_def_cache: HashMap<FileId, SmallVec<[ModuleId; 1]>, Global>,
+    included_file_cache: HashMap<EditionedFileId, Option<MacroCallId>, Global>,
 }
 
 /// More dyn maps than this are not carried: a thread that walked many files keeps their

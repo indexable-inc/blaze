@@ -455,38 +455,35 @@ GROUP BY kind
 ORDER BY errors DESC, kind
 
 -- name: reexecution_per_query_kind
--- says: per query kind in a build, the work repeated: runs, rows verified without running and runs of a key already run (the query engine's counters), beside its spans' runs, distinct keys, repeats and time
-WITH counted AS (
-    SELECT query_kind,
-        max(value) FILTER (WHERE name = 'query executed') AS executed,
-        max(value) FILTER (WHERE name = 'query verified') AS verified,
-        max(value) FILTER (WHERE name = 'query reran') AS reran
-    FROM counters
-    WHERE build_id = $build AND query_kind IS NOT NULL
-    GROUP BY query_kind
-), spanned AS (
-    SELECT query_kind, count(*) AS span_runs, count(DISTINCT function) AS span_keys, sum(dur_ns) AS span_ns
+-- says: per query function in a build, the work repeated and what eviction cost: runs, rows verified without running, runs of a row in a view it already ran in, runs for an evicted value, and values swept, refused or dropped (the query engine's counts, `query_counts`), beside its spans' runs, distinct function names and time; a span's `function` is a display name several bodies share, so span_names undercounts keys
+WITH spanned AS (
+    SELECT query_kind, count(*) AS span_runs, count(DISTINCT function) AS span_names, sum(dur_ns) AS span_ns
     FROM spans
     WHERE build_id = $build AND query_kind IS NOT NULL
     GROUP BY query_kind
+), counted AS (
+    SELECT * FROM query_counts WHERE build_id = $build
 ), kinds AS (
-    SELECT query_kind FROM counted
+    SELECT query AS query_kind FROM counted
     UNION
     SELECT query_kind FROM spanned
 )
 SELECT
     kinds.query_kind AS query_kind,
-    CAST(counted.executed AS BIGINT) AS executed,
-    CAST(counted.verified AS BIGINT) AS verified,
-    CAST(counted.reran AS BIGINT) AS reran,
+    counted.executed AS executed,
+    counted.verified AS verified,
+    counted.reran AS reran,
+    counted.evicted_asked AS evicted_asked,
+    counted.evicted AS evicted,
+    counted.refused AS refused,
+    counted.dropped AS dropped,
     spanned.span_runs AS span_runs,
-    spanned.span_keys AS span_keys,
-    CASE WHEN spanned.span_keys > 0 THEN spanned.span_runs - spanned.span_keys END AS span_repeats,
+    spanned.span_names AS span_names,
     round(spanned.span_ns / 1e6, 1) AS span_ms
 FROM kinds
-LEFT JOIN counted ON counted.query_kind = kinds.query_kind
+LEFT JOIN counted ON counted.query = kinds.query_kind
 LEFT JOIN spanned ON spanned.query_kind = kinds.query_kind
-ORDER BY coalesce(CAST(counted.reran AS BIGINT), spanned.span_runs - spanned.span_keys) DESC NULLS LAST
+ORDER BY coalesce(counted.reran + counted.evicted_asked, spanned.span_runs - spanned.span_names) DESC NULLS LAST
 LIMIT $limit
 
 -- name: footprint_per_build

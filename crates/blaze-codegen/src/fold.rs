@@ -133,16 +133,25 @@ pub struct Group {
     pub varying: Vec<u32>,
     /// Sorted by key.
     pub members: Vec<InstanceKey>,
+    /// `stored[i]` is what member `i`'s code is kept under (the driver's `stored`): its thunk
+    /// is kept under it with the group's key (`keys::thunk`), as the thunk passes constants
+    /// its IR gives, which can come from a body it builds in that its instance key misses;
+    /// and `stored[0]` is [`Group::first`].
+    pub stored: Vec<InstanceKey>,
     /// `constants[i]` are member `i`'s values of `varying`, in its order.
     pub constants: Vec<Vec<Constant>>,
 }
 
-pub const FOLDED_DOMAIN: &str = "blaze v2 folded 1";
+pub const FOLDED_DOMAIN: &str = "blaze v2 folded 2";
 const MASKED_DOMAIN: &str = "blaze v2 masked 2";
 const FOLD_SHAPE_DOMAIN: &str = "blaze v2 fold shape 1";
 
 impl Group {
-    /// The merged body's key: from what the body is, so one group anywhere is one body.
+    /// The merged body's key: from what the body is, so one group anywhere is one body. That
+    /// is its masked IR and parameters ([`Group::shape`]), its settings, which constants it
+    /// takes, and its first member's code ([`Group::first`]), which it is emitted as: two
+    /// groups alike but for their first member are two bodies of other line rows and debug
+    /// info, and one key for both is two values under it (rule 18).
     pub fn key(&self) -> InstanceKey {
         let mut hasher = Hasher::new(FOLDED_DOMAIN);
         hasher.id(&self.shape).id(&self.settings.0);
@@ -150,7 +159,15 @@ impl Group {
         for at in &self.varying {
             hasher.update(&at.to_le_bytes());
         }
+        hasher.id(&self.first().0);
         InstanceKey(hasher.finish())
+    }
+
+    /// What `members[0]`'s code is kept under: the body is that member's IR rewritten, so its
+    /// line rows, side table (its told locals' types), list of inlined bodies and places are
+    /// that member's, none of which the masked IR holds.
+    pub fn first(&self) -> InstanceKey {
+        self.stored[0]
     }
 
     /// The parameter of the merged body each of `varying` reads, and how many parameters
@@ -264,6 +281,8 @@ fn kind(constant: &Constant) -> [u8; 2] {
 #[derive(Clone, Copy)]
 struct Candidate<'a> {
     key: InstanceKey,
+    /// What its code is kept under: [`Group::stored`] when it is in a group.
+    stored: InstanceKey,
     settings: Settings,
     masked_id: ContentId,
     size: u32,
@@ -391,6 +410,8 @@ impl<'a> Split<'a> {
                 varying,
                 // alloc: the group's own list, exact size
                 members: members.iter().map(|&it| self.members[it as usize].key).collect(),
+                // alloc: the group's own list, exact size
+                stored: members.iter().map(|&it| self.members[it as usize].stored).collect(),
                 constants,
             });
         }
@@ -478,12 +499,15 @@ fn profitable(size: u32, members: usize, params: u32, limits: &Limits) -> bool {
 ///
 /// Hashes no IR: a candidate's bucket is its form's content ID, computed when it was
 /// interned, with its references' count and kinds ([`with_refs`]).
+///
+/// Each candidate is its key, what its code is kept under ([`Group::stored`]), its settings,
+/// its masked IR and its references.
 pub fn groups(
-    candidates: &[(InstanceKey, Settings, Masking<'_>, &Refs)],
+    candidates: &[(InstanceKey, InstanceKey, Settings, Masking<'_>, &Refs)],
     limits: &Limits,
 ) -> Vec<Group> {
     let mut all: Vec<Candidate<'_>> = Vec::with_capacity(candidates.len());
-    for &(key, settings, masked, refs) in candidates {
+    for &(key, stored, settings, masked, refs) in candidates {
         let form = masked.form.get();
         if form.kinds.len() != 2 * masked.constants.len() {
             panic!(
@@ -504,6 +528,7 @@ pub fn groups(
         }
         all.push(Candidate {
             key,
+            stored,
             settings,
             masked_id: with_refs(masked.form.content(), refs),
             size: form.size,
@@ -512,7 +537,8 @@ pub fn groups(
         });
     }
     // One sort makes every bucket a run, its members in key order. Stable, so of candidates
-    // given twice under one key in one bucket, the first given stays.
+    // given twice under one key in one bucket, the first given stays; they must be kept
+    // under one stored key too, or which stays would pick the group's key (rule 18).
     // alloc: one exact-size column per build
     let mut order: Vec<u32> = (0..all.len() as u32).collect();
     order.sort_by(|&a, &b| {
@@ -540,8 +566,17 @@ pub fn groups(
         split.members.clear();
         for &it in bucket {
             let it = all[it as usize];
-            if split.members.last().is_none_or(|last| last.key != it.key) {
-                split.members.push(it);
+            match split.members.last() {
+                Some(last) if last.key == it.key => {
+                    if last.stored != it.stored {
+                        panic!(
+                            "{:?} is a fold candidate twice, its code kept under {:?} and {:?}: one \
+                             instance key is one code",
+                            it.key, last.stored, it.stored
+                        );
+                    }
+                }
+                _ => split.members.push(it),
             }
         }
         if split.members.len() >= limits.min_members as usize {
@@ -600,16 +635,64 @@ mod tests {
         vec![Target::Function(key(call)), Target::Direct(key(addr))]
     }
 
-    /// The forms of every test, as a daemon's are of every build.
-    fn masking(masked: &Masked) -> Masking<'_> {
-        static FORMS: std::sync::LazyLock<Forms> = std::sync::LazyLock::new(Forms::new);
-        Masking::of(&FORMS, masked)
+    fn masking<'a>(forms: &'a Forms, masked: &'a Masked) -> Masking<'a> {
+        Masking::of(forms, masked)
     }
 
+    /// Each item kept under its own key.
     fn of<'a>(
+        forms: &'a Forms,
         items: &'a [(InstanceKey, Masked, Vec<Target>)],
-    ) -> Vec<(InstanceKey, Settings, Masking<'a>, &'a Refs)> {
-        items.iter().map(|(k, m, r)| (*k, settings(1), masking(m), r.as_slice())).collect()
+    ) -> Vec<(InstanceKey, InstanceKey, Settings, Masking<'a>, &'a Refs)> {
+        items.iter().map(|(k, m, r)| (*k, *k, settings(1), masking(forms, m), r.as_slice())).collect()
+    }
+
+    /// The body is emitted as the group's first member, with that member's line rows, side
+    /// table and list of inlined bodies, which its masked IR does not hold: what was two
+    /// values under one key when building blaze-bytes after blaze-reclaim (`<*const u8>::add`
+    /// and `<*mut (Grace, Box<dyn ..>)>::add` first in groups of one shape). Groups alike but
+    /// for their first member, or for what its code is kept under (a body it builds in
+    /// edited), have other keys; groups of one first member and stored key share one.
+    #[test]
+    fn a_folded_bodys_key_covers_its_first_members_code() {
+        let forms = Forms::new();
+        let rs = refs(9, 10);
+        // Every pair below varies in both constants, as two parameters.
+        let (a, b, c, d) = (grow(4, 4), grow(8, 2), grow(16, 8), grow(32, 16));
+        let (ma, mb) = (masking(&forms, &a), masking(&forms, &b));
+        let (mc, md) = (masking(&forms, &c), masking(&forms, &d));
+        let group = |candidates: &[(InstanceKey, InstanceKey, Settings, Masking<'_>, &Refs)]| {
+            let found = groups(candidates, &Limits::default());
+            assert_eq!(found.len(), 1);
+            let group = &found[0];
+            (group.shape, group.varying.clone(), group.first(), group.key())
+        };
+        let s = settings(1);
+        let first_1 = group(&[(key(1), key(1), s, ma, &rs[..]), (key(3), key(3), s, mc, &rs[..])]);
+        let first_2 = group(&[(key(2), key(2), s, mb, &rs[..]), (key(3), key(3), s, mc, &rs[..])]);
+        // One masked IR, parameters and settings: the old key's every input is equal.
+        assert_eq!((first_1.0, &first_1.1), (first_2.0, &first_2.1));
+        assert_ne!(first_1.3, first_2.3, "another first member is another body");
+
+        let edited = group(&[(key(1), key(41), s, ma, &rs[..]), (key(3), key(3), s, mc, &rs[..])]);
+        assert_eq!(edited.2, key(41));
+        assert_ne!(first_1.3, edited.3, "the first member's code kept under another key is another body");
+
+        let other_rest = group(&[(key(1), key(1), s, ma, &rs[..]), (key(4), key(4), s, md, &rs[..])]);
+        assert_eq!(first_1.3, other_rest.3, "one first member and shape is one body, whatever the others");
+    }
+
+    /// One instance key given twice with its code kept under two keys: which one stays would
+    /// pick the group's first member, and so its key, by the order given; it is refused.
+    #[test]
+    #[should_panic(expected = "is a fold candidate twice, its code kept under")]
+    fn one_key_kept_under_two_stored_keys_is_refused() {
+        let forms = Forms::new();
+        let rs = refs(9, 10);
+        let (a, b) = (grow(4, 4), grow(8, 2));
+        let (ma, mb) = (masking(&forms, &a), masking(&forms, &b));
+        let s = settings(1);
+        groups(&[(key(1), key(1), s, ma, &rs[..]), (key(1), key(41), s, ma, &rs[..]), (key(3), key(3), s, mb, &rs[..])], &Limits::default());
     }
 
     /// 3 has one reference more than 1 and 2, which no instruction names: the merged body is
@@ -617,25 +700,27 @@ mod tests {
     /// no group with them, and a group of one key always has references alike.
     #[test]
     fn functions_of_other_references_do_not_fold_together() {
+        let forms = Forms::new();
         let mut more = refs(9, 10);
         more.push(Target::Extern("memcpy".to_owned()));
         let items = [(key(1), grow(4, 4), refs(9, 10)), (key(2), grow(8, 8), refs(9, 10)), (key(3), grow(16, 8), more)];
-        let groups = groups(&of(&items), &Limits::default());
+        let groups = groups(&of(&forms, &items), &Limits::default());
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members, vec![key(1), key(2)]);
 
         let alike = [(key(1), grow(4, 4), refs(9, 10)), (key(2), grow(8, 8), refs(9, 10))];
-        assert_eq!(groups[0].key(), super::groups(&of(&alike), &Limits::default())[0].key());
+        assert_eq!(groups[0].key(), super::groups(&of(&forms, &alike), &Limits::default())[0].key());
     }
 
     #[test]
     fn element_sizes_fold() {
+        let forms = Forms::new();
         let items = [
             (key(2), grow(8, 8), refs(9, 10)),
             (key(1), grow(4, 4), refs(9, 10)),
             (key(3), grow(16, 8), refs(9, 10)),
         ];
-        let groups = groups(&of(&items), &Limits::default());
+        let groups = groups(&of(&forms, &items), &Limits::default());
         assert_eq!(groups.len(), 1);
         let group = &groups[0];
         assert_eq!(group.members, vec![key(1), key(2), key(3)]);
@@ -648,34 +733,42 @@ mod tests {
 
     #[test]
     fn other_control_flow_does_not_fold() {
+        let forms = Forms::new();
         let mut other = grow(4, 4);
         other.shape = b"block0: v0 = iconst #0; brif v0, block1, block2; ...".to_vec();
         let items = [(key(1), grow(8, 8), refs(9, 10)), (key(2), other, refs(9, 10))];
-        assert!(groups(&of(&items), &Limits::default()).is_empty());
+        assert!(groups(&of(&forms, &items), &Limits::default()).is_empty());
     }
 
     #[test]
     fn other_settings_do_not_fold() {
+        let forms = Forms::new();
         let (a, b) = (grow(8, 8), grow(4, 4));
         let (ra, rb) = (refs(9, 10), refs(9, 10));
-        let candidates =
-            [(key(1), settings(1), masking(&a), &ra[..]), (key(2), settings(2), masking(&b), &rb[..])];
+        let candidates = [
+            (key(1), key(1), settings(1), masking(&forms, &a), &ra[..]),
+            (key(2), key(2), settings(2), masking(&forms, &b), &rb[..]),
+        ];
         assert!(groups(&candidates, &Limits::default()).is_empty());
     }
 
     #[test]
     fn a_place_varies_only_when_its_targets_do() {
+        let forms = Forms::new();
+        // Both places of one kind, so members whose places are swapped share a bucket
+        // (`with_refs` keys on each reference's kind in order).
+        let fns = |a, b| vec![Target::Function(key(a)), Target::Function(key(b))];
         // The same targets at other places.
         let mut swapped = grow(4, 8);
         swapped.constants[2] = Constant::Place(1);
         swapped.constants[3] = Constant::Place(0);
-        let swapped_refs = vec![Target::Direct(key(10)), Target::Function(key(9))];
-        let items = [(key(1), grow(8, 8), refs(9, 10)), (key(2), swapped, swapped_refs)];
-        let groups_same = groups(&of(&items), &Limits::default());
+        let items = [(key(1), grow(8, 8), fns(9, 10)), (key(2), swapped, fns(10, 9))];
+        let groups_same = groups(&of(&forms, &items), &Limits::default());
+        assert_eq!(groups_same.len(), 1, "swapped places of one kind still group");
         assert_eq!(groups_same[0].varying, vec![0]);
 
-        let items = [(key(1), grow(8, 8), refs(9, 10)), (key(2), grow(4, 8), refs(11, 10))];
-        let groups_other = groups(&of(&items), &Limits::default());
+        let items = [(key(1), grow(8, 8), fns(9, 10)), (key(2), grow(4, 8), fns(11, 10))];
+        let groups_other = groups(&of(&forms, &items), &Limits::default());
         assert_eq!(groups_other[0].varying, vec![0, 2]);
         assert_eq!(groups_other[0].constants[1], vec![int(4), Constant::Place(0)]);
         assert_ne!(groups_same[0].key(), groups_other[0].key());
@@ -683,30 +776,33 @@ mod tests {
 
     #[test]
     fn a_data_object_varies_by_content() {
+        let forms = Forms::new();
         let vtable = |n| {
             let mut it = grow(8, 8);
             it.constants.push(Constant::Data(ContentId([n; 32])));
             it
         };
         let items = [(key(1), vtable(1), refs(9, 10)), (key(2), vtable(2), refs(9, 10))];
-        let group = &groups(&of(&items), &Limits::default())[0];
+        let group = &groups(&of(&forms, &items), &Limits::default())[0];
         assert_eq!(group.varying, vec![4]);
         assert_eq!(group.constants[1], vec![Constant::Data(ContentId([2; 32]))]);
         let items = [(key(1), vtable(1), refs(9, 10)), (key(2), vtable(1), refs(9, 10))];
-        assert!(groups(&of(&items), &Limits::default()).is_empty());
+        assert!(groups(&of(&forms, &items), &Limits::default()).is_empty());
     }
 
     #[test]
     fn equal_constants_alone_are_not_folded() {
+        let forms = Forms::new();
         let items = [(key(1), grow(8, 8), refs(9, 10)), (key(2), grow(8, 8), refs(9, 10))];
-        assert!(groups(&of(&items), &Limits::default()).is_empty());
+        assert!(groups(&of(&forms, &items), &Limits::default()).is_empty());
     }
 
     #[test]
     fn a_fixed_target_is_in_the_key() {
+        let forms = Forms::new();
         let a = [(key(1), grow(8, 8), refs(9, 10)), (key(2), grow(4, 8), refs(9, 10))];
         let b = [(key(1), grow(8, 8), refs(12, 10)), (key(2), grow(4, 8), refs(12, 10))];
-        let (a, b) = (groups(&of(&a), &Limits::default()), groups(&of(&b), &Limits::default()));
+        let (a, b) = (groups(&of(&forms, &a), &Limits::default()), groups(&of(&forms, &b), &Limits::default()));
         assert_eq!(a[0].varying, b[0].varying);
         assert_ne!(a[0].key(), b[0].key());
     }
@@ -721,15 +817,16 @@ mod tests {
 
     #[test]
     fn the_parameter_cap_splits() {
+        let forms = Forms::new();
         let limits = Limits::default();
         let items = [(key(1), many(17, 0), vec![]), (key(2), many(17, 100), vec![])];
-        assert!(groups(&of(&items), &limits).is_empty());
+        assert!(groups(&of(&forms, &items), &limits).is_empty());
         let items = [(key(1), many(16, 0), vec![]), (key(2), many(16, 100), vec![])];
-        assert_eq!(groups(&of(&items), &limits)[0].parameters().1, 16);
+        assert_eq!(groups(&of(&forms, &items), &limits)[0].parameters().1, 16);
         // Twenty constants that are one value per member are one parameter.
         let same = |value| Masked { constants: vec![int(value); 20], ..many(20, 0) };
         let items = [(key(1), same(1), vec![]), (key(2), same(2), vec![])];
-        let group = &groups(&of(&items), &limits)[0];
+        let group = &groups(&of(&forms, &items), &limits)[0];
         assert_eq!(group.varying.len(), 20);
         assert_eq!(group.parameters(), (vec![0; 20], 1));
         // Members far apart in their constants split into the groups they fit.
@@ -744,25 +841,27 @@ mod tests {
             (key(3), near(3), vec![]),
             (key(4), many(17, 200), vec![]),
         ];
-        let groups = groups(&of(&items), &limits);
+        let groups = groups(&of(&forms, &items), &limits);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members, vec![key(1), key(3)]);
     }
 
     #[test]
     fn small_bodies_are_not_worth_thunks() {
+        let forms = Forms::new();
         let small = |size| Masked { size, ..grow(8, 8) };
         let small_b = |size| Masked { size, ..grow(4, 4) };
         let items = [(key(1), small(4), refs(9, 10)), (key(2), small_b(4), refs(9, 10))];
-        assert!(groups(&of(&items), &Limits::default()).is_empty());
+        assert!(groups(&of(&forms, &items), &Limits::default()).is_empty());
         let items = [(key(1), small(40), refs(9, 10)), (key(2), small_b(40), refs(9, 10))];
-        assert_eq!(groups(&of(&items), &Limits::default()).len(), 1);
+        assert_eq!(groups(&of(&forms, &items), &Limits::default()).len(), 1);
         assert!(!profitable(8, 2, 2, &Limits::default()));
         assert!(profitable(16, 2, 2, &Limits::default()));
     }
 
     #[test]
     fn the_input_order_changes_nothing() {
+        let forms = Forms::new();
         let items: Vec<(InstanceKey, Masked, Vec<Target>)> = (0..12u8)
             .map(|n| {
                 let size = u128::from(n);
@@ -770,13 +869,13 @@ mod tests {
                 (key(n), masked, refs(9, 10 + n % 2))
             })
             .collect();
-        let want = groups(&of(&items), &Limits::default());
+        let want = groups(&of(&forms, &items), &Limits::default());
         assert!(!want.is_empty());
         let mut order: Vec<usize> = (0..items.len()).collect();
         for round in 0..8 {
             order.rotate_left(5);
             order.swap(round % 12, (round * 7 + 3) % 12);
-            let candidates = of(&items);
+            let candidates = of(&forms, &items);
             let permuted: Vec<_> = order.iter().map(|&it| candidates[it]).collect();
             assert_eq!(groups(&permuted, &Limits::default()), want);
         }
@@ -807,6 +906,7 @@ mod tests {
 
         struct Candidate<'a> {
             key: InstanceKey,
+            stored: InstanceKey,
             masked: &'a Masked,
             cells: Vec<Cell<'a>>,
         }
@@ -834,11 +934,11 @@ mod tests {
         }
 
         pub(super) fn groups(
-            candidates: &[(InstanceKey, Settings, &Masked, &Refs)],
+            candidates: &[(InstanceKey, InstanceKey, Settings, &Masked, &Refs)],
             limits: &Limits,
         ) -> Vec<Group> {
             let mut buckets: BTreeMap<(Settings, ContentId), Vec<Candidate<'_>>> = BTreeMap::new();
-            for &(key, settings, masked, refs) in candidates {
+            for &(key, stored, settings, masked, refs) in candidates {
                 let mut hasher = Hasher::new(MASKED_DOMAIN);
                 hasher.part(&masked.shape).update(&masked.size.to_le_bytes());
                 hasher.update(&(masked.constants.len() as u64).to_le_bytes());
@@ -849,6 +949,7 @@ mod tests {
                 let masked_id = super::with_refs(hasher.finish(), refs);
                 buckets.entry((settings, masked_id)).or_default().push(Candidate {
                     key,
+                    stored,
                     masked,
                     cells,
                 });
@@ -903,6 +1004,7 @@ mod tests {
                         settings,
                         varying,
                         members: part.iter().map(|&it| bucket[it].key).collect(),
+                        stored: part.iter().map(|&it| bucket[it].stored).collect(),
                         constants,
                     });
                 }
@@ -939,6 +1041,7 @@ mod tests {
 
     #[test]
     fn groups_are_the_reference_groups() {
+        let forms = Forms::new();
         let limits = [
             Limits::default(),
             Limits { max_params: 1, min_members: 2, thunk_size: 0 },
@@ -950,9 +1053,9 @@ mod tests {
         for _ in 0..400 {
             let items = random(&mut rng);
             let candidates: Vec<_> =
-                items.iter().map(|(k, s, m, r)| (*k, *s, m, r.as_slice())).collect();
+                items.iter().map(|(k, s, m, r)| (*k, *k, *s, m, r.as_slice())).collect();
             let interned: Vec<_> =
-                items.iter().map(|(k, s, m, r)| (*k, *s, masking(m), r.as_slice())).collect();
+                items.iter().map(|(k, s, m, r)| (*k, *k, *s, masking(&forms, m), r.as_slice())).collect();
             for limits in &limits {
                 let want = reference::groups(&candidates, limits);
                 found += want.len();
@@ -1034,9 +1137,9 @@ mod tests {
 
         let rs = refs(9, 10);
         let candidates = [
-            (key(1), settings(1), ma, &rs[..]),
-            (key(2), settings(1), mb, &rs[..]),
-            (key(3), settings(1), mc, &rs[..]),
+            (key(1), key(1), settings(1), ma, &rs[..]),
+            (key(2), key(2), settings(1), mb, &rs[..]),
+            (key(3), key(3), settings(1), mc, &rs[..]),
         ];
         let before = HASHED.with(std::cell::Cell::get);
         let found = groups(&candidates, &Limits::default());
@@ -1054,14 +1157,15 @@ mod tests {
         let rs = refs(9, 10);
         let ma = Masking::of(&forms, &a);
         let wrong = Masking { form: Masking::of(&forms, &b).form, constants: &other };
-        let candidates = [(key(1), settings(1), ma, &rs[..]), (key(2), settings(1), wrong, &rs[..])];
+        let candidates = [(key(1), key(1), settings(1), ma, &rs[..]), (key(2), key(2), settings(1), wrong, &rs[..])];
         groups(&candidates, &Limits::default());
     }
 
     #[test]
     fn thunks_call_the_body_last() {
+        let forms = Forms::new();
         let items = [(key(1), grow(8, 8), refs(9, 10)), (key(2), grow(4, 8), refs(9, 10))];
-        let group = &groups(&of(&items), &Limits::default())[0];
+        let group = &groups(&of(&forms, &items), &Limits::default())[0];
         let refs = group.thunk_refs(&items[0].2);
         assert_eq!(refs.len(), 3);
         assert_eq!(refs[2], Target::Direct(group.key()));

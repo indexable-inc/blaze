@@ -4,6 +4,7 @@
 
 use base_db::FileId;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use hir::attach_db;
 use hir_expand::fixture;
 
@@ -245,7 +246,7 @@ pub(super) fn fixed(lint_name: &str, main: &str) -> String {
     let krate = attach_db(&db, || crate::tests::main_crate(&db));
     let file = file.file_id(&db);
     let before = db.file_text(file).text(&db).to_string();
-    let mut names: HashMap<FileId, String> = HashMap::default();
+    let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
     names.insert(file, "src/lib.rs".to_owned());
     let name_of = |file: FileId| names.get(&file).cloned();
     let flags: Vec<String> = only(lint_name).split_whitespace().map(str::to_owned).collect();

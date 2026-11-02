@@ -112,6 +112,7 @@ impl Names {
 #[cfg(test)]
 mod tests {
     use blaze_hash::HashMap;
+    use std::alloc::Global;
     use blaze_ids::rng::SplitMix64;
 
     use super::*;
@@ -136,7 +137,7 @@ mod tests {
     fn names_intern_as_a_map_would() {
         let mut rng = SplitMix64::new(0x853c_49e6_748f_ea9b);
         let mut names = Names::new();
-        let mut map: HashMap<String, u32> = HashMap::default();
+        let mut map: HashMap<String, u32, Global> = HashMap::new_in(Global);
         for _ in 0..20_000 {
             let name = format!("/ws/{}", rng.below(3_000));
             let next = map.len() as u32;

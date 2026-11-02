@@ -19,7 +19,7 @@ use crate::{
     Error, Target, TlsModel,
     arch::Loc,
     buf::Buf,
-    code::{Name, Rule},
+    code::Name,
     enc::Form,
 };
 
@@ -117,11 +117,11 @@ pub(super) fn bound_fixed(frame: &Frame) -> u32 {
 /// parameters from their registers and the caller's stack to their slots, and the count.
 pub(super) fn prologue<'f, 'm>(cx: &mut impl Ctx<'f, 'm>) -> Result<(), Error> {
     let (func, frame) = (cx.func(), cx.frame());
-    // Cranelift's `gen_prologue_frame_setup` says it before anything on Apple's ("the macOS
-    // unwinder seems to require this"), with return addresses left unsigned.
-    if func.signature.call_conv == CallConv::AppleAarch64 {
-        cx.rule_at(0, Rule::RaSignState(false));
-    }
+    // No `RaSignState(false)` row first, as Cranelift's `gen_prologue_frame_setup` has on
+    // Apple's: a frame's return address starts unsigned (DWARF's `RA_SIGN_STATE` is 0 until a
+    // row says otherwise), and the stencils sign none, so the row says nothing. Apple's ld64
+    // reads it as a save of register 34 and warns once per function that it can't make a
+    // compact unwind entry of the FDE, which scans the symbol table each time.
     let mut rows = frame::Rows::default();
     frame::enter(cx.buf(), frame, &mut rows);
     for &(at, rule) in rows.as_slice() {
@@ -490,13 +490,20 @@ fn call<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> 
     .map_err(|e| Error::at(inst, e.what))
 }
 
-/// `return_call` and `return_call_indirect` from a `tail` function to one (the frame's layout
-/// checked both), as Cranelift's `gen_call_args` (`is_tail_call`) and
-/// `emit_return_call_common_sequence` write them: the stack arguments into the top of the
-/// incoming argument area (`IncomingArg`, `pop` bytes above the frame record), the register
-/// arguments, the callee to `x17`, the frame popped, `sp` up to the new arguments, then `b` or
-/// `br x17`. Every slot is read before the restores give `x20` back; the incoming area holds
-/// nothing the function still reads, its own stack arguments copied to slots by the prologue.
+/// `return_call` and `return_call_indirect` (the frame's layout checked each), as
+/// Cranelift's `gen_call_args` (`is_tail_call`) and `emit_return_call_common_sequence` write
+/// them: the stack arguments into the incoming argument area, the register arguments, the
+/// callee to `x17`, the frame popped as a `return` pops it, then `b` or `br x17`. From a
+/// `tail` function the arguments go into the top of the area (`IncomingArg`, `pop` bytes
+/// above the frame record) and `sp` goes up to them; from an AAPCS64, Apple or Windows
+/// function (`become` in the target's convention) they go where the function's own caller
+/// put its own, which that caller pops, and `sp` stays at the area.
+///
+/// No argument's move reads what another's wrote: every source is a slot (below the frame
+/// record) or a constant, every destination is above the frame record or a register, and
+/// the incoming area holds nothing the function still reads, its own stack arguments copied
+/// to slots by the prologue. Every slot is read before the restores give `x20` back; `x17`
+/// is neither an argument register nor callee-saved.
 fn return_call<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
     let (func, target, frame) = (cx.func(), cx.target(), cx.frame());
     let sig = frame::return_call_signature(func, inst)?
@@ -519,7 +526,8 @@ fn return_call<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), 
         return Err(Error::at(inst, "a return call of other arguments than its signature's"));
     }
     let new = abi::stack_args(sig).map_err(|e| Error::at(inst, e.what))?;
-    let base = 16 + frame.pop - new;
+    let tail = func.signature.call_conv == CallConv::Tail;
+    let base = if tail { 16 + frame.pop - new } else { 16 };
     abi::args(sig, |i, _, place| {
         let Place::Stack(at, ty) = place else { return Ok(()) };
         match cx.loc(args[i]) {
@@ -561,7 +569,7 @@ fn return_call<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), 
     };
     let buf = cx.buf();
     frame::unframe(buf, frame);
-    if frame.pop > new {
+    if tail && frame.pop > new {
         inst::add_any(buf, SP, SP, u64::from(frame.pop - new), false, X16);
     }
     match near {

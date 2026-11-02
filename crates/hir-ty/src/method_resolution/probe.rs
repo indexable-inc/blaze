@@ -344,17 +344,24 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
                 .iter_opaque_types()
                 .map(|(key, hidden_ty)| (key, hidden_ty.ty)),
         );
-        let query_input =
-            self.infcx.canonicalize_query((self_ty, predefined_opaques_in_body), &mut orig_values);
+        // The steps are worked out in this context (`instantiate_canonical_as_caller`), where
+        // the environment's placeholders (a `for const` binder's) are this context's own: as
+        // inputs, a step that names one maps back to it, not to the input it was unified with.
+        let env_placeholders = env_placeholders(self.param_env);
+        let query_input = self.infcx.canonicalize_query_naming(
+            (self_ty, predefined_opaques_in_body),
+            &env_placeholders,
+            &mut orig_values,
+        );
         match mode {
             Mode::MethodCall => pick_cache::with_steps(
                 self,
                 &query_input,
-                || self.method_autoderef_steps(&query_input),
+                || self.method_autoderef_steps(&query_input, &orig_values),
                 |steps| self.probe_steps(mode, self_ty, &orig_values, steps, choice, facts),
             ),
             Mode::Path => {
-                let steps = self.path_steps(&query_input);
+                let steps = self.path_steps(&query_input, &orig_values);
                 self.probe_steps(mode, self_ty, &orig_values, &steps, choice, facts)
             }
         }
@@ -364,6 +371,7 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
     fn path_steps(
         &self,
         query_input: &Canonical<'db, (Ty<'db>, PredefinedOpaques<'db>)>,
+        orig_values: &OriginalQueryValues<'db>,
     ) -> MethodAutoderefStepsResult<'db> {
         self.infcx.probe(|_| {
             // Mode::Path - the deref steps is "trivial". This turns
@@ -373,7 +381,7 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
 
             let infcx = self.infcx;
             let ((self_ty, _), var_values) =
-                infcx.instantiate_canonical(self.call_span, query_input);
+                infcx.instantiate_canonical_as_caller(self.call_span, query_input, orig_values);
             debug!(?self_ty, ?query_input, "probe_op: Mode::Path");
             let prev_opaque_entries = self.infcx.inner.borrow_mut().opaque_types().num_entries();
             MethodAutoderefStepsResult {
@@ -491,6 +499,7 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
     fn method_autoderef_steps(
         &self,
         goal: &Canonical<'db, (Ty<'db>, PredefinedOpaques<'db>)>,
+        orig_values: &OriginalQueryValues<'db>,
     ) -> MethodAutoderefStepsResult<'db> {
         self.infcx.probe(|_| {
             debug!("method_autoderef_steps({:?})", goal);
@@ -500,7 +509,7 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
             // infer var is not an opaque.
             let infcx = self.infcx;
             let ((self_ty, predefined_opaques_in_body), inference_vars) =
-                infcx.instantiate_canonical(self.receiver_span, goal);
+                infcx.instantiate_canonical_as_caller(self.receiver_span, goal, orig_values);
             // Instantiating the goal gave `self_ty` fresh inference variables: point the
             // opaques at them too, or `self_ty_is_opaque` never sees a hidden type. The
             // probe undoes this.
@@ -637,6 +646,60 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
             MethodAutoderefStepsResult { steps, opt_bad_ty, reached_recursion_limit }
         })
     }
+}
+
+/// The placeholders `env` names, in the order its clauses name them: a `for const` binder's,
+/// which only inference puts in an environment. None outside a `for const` body.
+fn env_placeholders<'db>(env: ParamEnv<'db>) -> SmallVec<[GenericArg<'db>; 2]> {
+    use rustc_type_ir::{
+        RegionKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
+    };
+
+    use crate::next_solver::{Const, ConstKind};
+
+    struct Placeholders<'db>(SmallVec<[GenericArg<'db>; 2]>);
+    impl<'db> Placeholders<'db> {
+        fn push(&mut self, arg: GenericArg<'db>) {
+            if !self.0.contains(&arg) {
+                self.0.push(arg);
+            }
+        }
+    }
+    impl<'db> TypeVisitor<DbInterner<'db>> for Placeholders<'db> {
+        type Result = ();
+        fn visit_ty(&mut self, ty: Ty<'db>) {
+            if !ty.has_placeholders() {
+                return;
+            }
+            if let TyKind::Placeholder(_) = ty.kind() {
+                self.push(ty.into());
+            } else {
+                ty.super_visit_with(self);
+            }
+        }
+        fn visit_region(&mut self, region: Region<'db>) {
+            if let RegionKind::RePlaceholder(_) = region.kind() {
+                self.push(region.into());
+            }
+        }
+        fn visit_const(&mut self, konst: Const<'db>) {
+            if !konst.has_placeholders() {
+                return;
+            }
+            if let ConstKind::Placeholder(_) = konst.kind() {
+                self.push(konst.into());
+            } else {
+                konst.super_visit_with(self);
+            }
+        }
+    }
+    let clauses = env.clauses;
+    // alloc: none: inline up to two placeholders, and none outside a `for const` body.
+    let mut placeholders = Placeholders(SmallVec::new());
+    if clauses.has_placeholders() {
+        clauses.visit_with(&mut placeholders);
+    }
+    placeholders.0
 }
 
 /// The impl or trait whose items a probe looks among.
@@ -1166,6 +1229,16 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
             TyKind::Param(_) => {
                 self.assemble_inherent_candidates_from_param(raw_self_ty);
             }
+            // blaze: an integer of an arbitrary width (`#![blaze::arbitrary_ints]`): its inherent
+            // impls in core (`to_le_bytes` of `u24`), then the items of `ArbitraryInt`.
+            TyKind::Int(int) if int.arbitrary_width().is_some() => {
+                self.assemble_inherent_candidates_for_incoherent_ty(raw_self_ty, receiver_steps);
+                self.assemble_inherent_candidates_of_arbitrary_int(raw_self_ty);
+            }
+            TyKind::Uint(uint) if uint.arbitrary_width().is_some() => {
+                self.assemble_inherent_candidates_for_incoherent_ty(raw_self_ty, receiver_steps);
+                self.assemble_inherent_candidates_of_arbitrary_int(raw_self_ty);
+            }
             TyKind::Bool
             | TyKind::Char
             | TyKind::Int(_)
@@ -1299,6 +1372,23 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
                 Candidate { item, kind: WhereClauseCandidate(poly_trait_ref) },
                 true,
             );
+        });
+    }
+
+    /// blaze: an integer of an arbitrary width (`#![blaze::arbitrary_ints]`) has the items of
+    /// core's `ArbitraryInt` (`wrapping_add`, `MAX`, ..) as inherent items, as a parameter has
+    /// those of its bounds, so `x.wrapping_add(y)` and `u3::MAX` need no import. The solver's
+    /// builtin holds the trait of every such type, so the reference is the concrete
+    /// `self_ty: ArbitraryInt`, and the item resolves to the trait's default
+    /// (docs/v2/plan/lanes/frontend/arbitrary-ints.md). A crate graph whose core has no
+    /// `ArbitraryInt` has no such items.
+    #[instrument(level = "debug", skip(self))]
+    fn assemble_inherent_candidates_of_arbitrary_int(&mut self, self_ty: Ty<'db>) {
+        let interner = self.interner();
+        let Some(trait_) = interner.lang_items().ArbitraryInt else { return };
+        let trait_ref = Binder::dummy(TraitRef::new(interner, trait_.into(), [self_ty]));
+        self.assemble_candidates_for_bounds(std::iter::once(trait_ref), |this, trait_ref, item| {
+            this.push_candidate(Candidate { item, kind: TraitCandidate(trait_ref) }, true);
         });
     }
 

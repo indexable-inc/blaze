@@ -2,6 +2,8 @@
 //! store of their expansions ([`kept`]) and what its in-process server speaks to a macro
 //! ([`bridge`]).
 
+#![feature(allocator_api)]
+
 #[cfg(test)]
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;

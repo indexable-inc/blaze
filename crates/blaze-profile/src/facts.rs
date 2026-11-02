@@ -1,9 +1,14 @@
-//! What a build did that its spans don't say: how each image it linked was linked (`links`) and
-//! the crate graph it built (`crate_deps`), so "patched or relinked" and the crates' edges are
-//! queries over the history like the rest. The daemon notes them with [`crate::history::History::linked`]
-//! and [`crate::history::History::crate_graph`]; the next flush writes them.
+//! What a build did that its spans don't say: how each image it linked was linked (`links`),
+//! the crate graph it built (`crate_deps`) and what the query engine counted of each query
+//! function (`query_counts`), so "patched or relinked", the crates' edges and "what did eviction
+//! cost" are queries over the history like the rest. The daemon notes them with
+//! [`crate::history::History::linked`], [`crate::history::History::crate_graph`] and
+//! [`crate::history::History::query_counted`]; the next flush writes them. What a build
+//! computed again, and why (`misses`), is noted with [`crate::history::History::missed`].
 
-use arrow_array::{ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt64Array, types::UInt32Type};
+use arrow_array::{
+    ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array, types::UInt32Type,
+};
 use arrow_schema::ArrowError;
 
 use crate::{batches, schema};
@@ -65,6 +70,38 @@ pub struct CrateDepRow {
     pub kind: DepKind,
 }
 
+/// A row of the schema's `query_counts` table: what the query engine counted of one query
+/// function by the end of a build (`blaze_query::db::Counts`, field for field).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryCountRow {
+    pub build_id: u64,
+    pub query: &'static str,
+    pub executed: u64,
+    pub verified: u64,
+    pub reran: u64,
+    pub evicted_asked: u64,
+    pub evicted: u64,
+    pub refused: u64,
+    pub dropped: u64,
+}
+
+/// A row of the schema's `misses` table: one thing a build computed again, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissRow {
+    pub build_id: u64,
+    pub step: String,
+    pub item: String,
+    /// The cause's name, as the table's `cause` column lists them.
+    pub cause: &'static str,
+    pub what: Option<String>,
+    pub names: Option<String>,
+    pub was: Option<String>,
+    pub now: Option<String>,
+    pub changed: Option<u32>,
+    pub of: Option<u32>,
+    pub since: Option<u64>,
+}
+
 /// The `links` rows of `rows`.
 pub fn links(rows: &[LinkRow]) -> Result<RecordBatch, ArrowError> {
     // alloc: a batch's columns, once a flush
@@ -88,6 +125,44 @@ pub fn crate_deps(rows: &[CrateDepRow]) -> Result<RecordBatch, ArrowError> {
         dict(rows.iter().map(|it| Some(it.kind.name()))),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::CRATE_DEPS), columns)
+}
+
+/// The `query_counts` rows of `rows`.
+pub fn query_counts(rows: &[QueryCountRow]) -> Result<RecordBatch, ArrowError> {
+    let count = |of: fn(&QueryCountRow) -> u64| column(UInt64Array::from_iter_values(rows.iter().map(of)));
+    // alloc: a batch's columns, once a flush
+    let columns: Vec<ArrayRef> = vec![
+        count(|it| it.build_id),
+        dict(rows.iter().map(|it| Some(it.query))),
+        count(|it| it.executed),
+        count(|it| it.verified),
+        count(|it| it.reran),
+        count(|it| it.evicted_asked),
+        count(|it| it.evicted),
+        count(|it| it.refused),
+        count(|it| it.dropped),
+    ];
+    RecordBatch::try_new(batches::schema_of(&schema::QUERY_COUNTS), columns)
+}
+
+/// The `misses` rows of `rows`.
+pub fn misses(rows: &[MissRow]) -> Result<RecordBatch, ArrowError> {
+    let text = |of: fn(&MissRow) -> Option<&str>| column(StringArray::from_iter(rows.iter().map(of)));
+    // alloc: a batch's columns, once a flush
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
+        dict(rows.iter().map(|it| Some(it.step.as_str()))),
+        column(StringArray::from_iter_values(rows.iter().map(|it| it.item.as_str()))),
+        dict(rows.iter().map(|it| Some(it.cause))),
+        text(|it| it.what.as_deref()),
+        text(|it| it.names.as_deref()),
+        text(|it| it.was.as_deref()),
+        text(|it| it.now.as_deref()),
+        column(UInt32Array::from_iter(rows.iter().map(|it| it.changed))),
+        column(UInt32Array::from_iter(rows.iter().map(|it| it.of))),
+        column(UInt64Array::from_iter(rows.iter().map(|it| it.since))),
+    ];
+    RecordBatch::try_new(batches::schema_of(&schema::MISSES), columns)
 }
 
 fn column(array: impl arrow_array::Array + 'static) -> ArrayRef {

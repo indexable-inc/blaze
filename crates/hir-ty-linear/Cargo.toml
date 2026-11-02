@@ -1,0 +1,35 @@
+[package]
+name = "hir-ty-linear"
+version = "0.0.0"
+repository.workspace = true
+description = "`#[blaze::linear]`: a value of a marked type is never dropped implicitly; every path consumes it (docs/v2/plan/lanes/linear.md)."
+publish = false
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-mem.workspace = true
+blaze-query.workspace = true
+
+either.workspace = true
+rustc_type_ir.workspace = true
+tracing.workspace = true
+
+# local deps
+base-db.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+hir-ty-mir.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

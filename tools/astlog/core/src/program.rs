@@ -16,6 +16,7 @@
 
 use ast_merge_langs::Lang;
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 
 use crate::error::{
     ArityMismatchSnafu, BuiltinAritySnafu, DslSnafu, Error, LintSeveritySnafu, LintVarSnafu,
@@ -178,8 +179,8 @@ impl Program {
 
     /// Arity of each defined relation, taken from its first rule head.
     #[must_use]
-    pub fn arities(&self) -> HashMap<&str, usize> {
-        let mut arities = HashMap::default();
+    pub fn arities(&self) -> HashMap<&str, usize, Global> {
+        let mut arities = HashMap::new_in(Global);
         for rule in &self.rules {
             arities.entry(rule.name.as_str()).or_insert(rule.head_vars.len());
         }
@@ -249,7 +250,7 @@ impl Program {
         // a negative edge needs level(a) > level(b). A negative edge inside a cycle
         // forces unbounded growth, so if anything still changes after one pass per
         // relation the program is unstratifiable.
-        let mut level: HashMap<&str, usize> =
+        let mut level: HashMap<&str, usize, Global> =
             self.rules.iter().map(|r| (r.name.as_str(), 0)).collect();
         let passes = level.len() + 1;
         for pass in 0..=passes {
@@ -308,7 +309,7 @@ pub(crate) fn builtin_arity(name: &str) -> Option<usize> {
     BUILTINS.iter().find(|(builtin, _)| *builtin == name).map(|(_, arity)| *arity)
 }
 
-fn check_atoms(atoms: &[BodyAtom], arities: &HashMap<&str, usize>) -> Result<(), Error> {
+fn check_atoms(atoms: &[BodyAtom], arities: &HashMap<&str, usize, Global>) -> Result<(), Error> {
     for atom in atoms {
         if let BodyAtom::Negation(neg) = atom {
             // A negated atom must name a defined relation (not a builtin: builtins
@@ -384,7 +385,7 @@ fn check_arity(app: &AppAtom, expected: usize, builtin: bool) -> Result<(), Erro
 /// rather than filtering -- this check rejects exactly that. Applied to rule and
 /// rewrite bodies alike.
 fn check_negation_safety(body: &[BodyAtom]) -> Result<(), Error> {
-    let mut bound: HashSet<&str> = HashSet::default();
+    let mut bound: HashSet<&str, Global> = HashSet::new_in(Global);
     for atom in body {
         match atom {
             BodyAtom::Match(m) => bound.extend(capture_names(&m.query)),
@@ -410,7 +411,7 @@ fn check_negation_safety(body: &[BodyAtom]) -> Result<(), Error> {
 }
 
 fn check_template(rewrite: &Rewrite) -> Result<(), Error> {
-    let mut mentioned: HashSet<&str> = HashSet::default();
+    let mut mentioned: HashSet<&str, Global> = HashSet::new_in(Global);
     for atom in &rewrite.body {
         match atom {
             BodyAtom::Match(m) => mentioned.extend(capture_names(&m.query)),

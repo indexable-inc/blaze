@@ -77,6 +77,7 @@ TrivialTypeTraversalImpls! {
     crate::UintTy,
     crate::UniverseIndex,
     crate::Variance,
+    crate::reflect::ReflectedDomain,
     crate::region_constraint::NoSpan,
     crate::solve::BuiltinImplSource,
     crate::solve::Certainty,

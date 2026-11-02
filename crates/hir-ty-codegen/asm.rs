@@ -12,13 +12,14 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        Arc, LazyLock, OnceLock,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
 };
 
 use blaze_hash::{FixedState, HashMap};
-use cranelift_codegen::binemit::Reloc;
+use std::alloc::Global;
+use cranelift_codegen::{binemit::Reloc, isa::CallConv};
 use hir_def::hir::{AsmOptions, AsmPiece, InlineAsmRegOrRegClass};
 use object::{
     Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags,
@@ -41,8 +42,8 @@ const SYM: &str = "blaze_sym_";
 
 /// A function of one instruction that Cranelift does not have: `xgetbv` reads the extended
 /// control register its argument numbers.
-pub(super) fn xgetbv() -> String {
-    let [number, ..] = Convention::of_target().arguments;
+pub(super) fn xgetbv(call_conv: CallConv) -> String {
+    let [number, ..] = Convention::of(call_conv).arguments;
     let number = GPR[number][1];
     // alloc: the stub's text, the output
     format!(
@@ -112,8 +113,8 @@ pub(super) fn crc32(instruction: &str) -> String {
 
 /// x86's CRC-32C (SSE4.2's `crc32`) of its second argument, `bits` wide, into the checksum of
 /// its first: LLVM's `x86.sse42.crc32.32.{8,16,32}` and `x86.sse42.crc32.64.64`.
-pub(super) fn x86_crc32(bits: u32) -> String {
-    let [crc, data, _] = Convention::of_target().arguments;
+pub(super) fn x86_crc32(call_conv: CallConv, bits: u32) -> String {
+    let [crc, data, _] = Convention::of(call_conv).arguments;
     let (into, crc, data) = match bits {
         64 => ("rax", GPR[crc][0], GPR[data][0]),
         32 => ("eax", GPR[crc][1], GPR[data][1]),
@@ -231,9 +232,9 @@ fn aarch64_extension(feature: &str) -> Option<&'static str> {
 /// `vcvtps2ph` makes half-precision floats of the single-precision ones at its first
 /// argument and writes them to its second. The rounding is part of the instruction, so there
 /// is one for each of the eight, and the third argument says which runs.
-pub(super) fn vcvtps2ph(register: &str) -> String {
+pub(super) fn vcvtps2ph(call_conv: CallConv, register: &str) -> String {
     let [[from, ..], [to, ..], [which, which_low, ..]] =
-        Convention::of_target().arguments.map(|row| GPR[row]);
+        Convention::of(call_conv).arguments.map(|row| GPR[row]);
     // alloc: the stub's text, the output
     let mut text = format!(
         ".globl {SYMBOL}\n{SYMBOL}:\nvmovups {register}, [{from}]\nand {which_low}, 7\n\
@@ -250,8 +251,8 @@ pub(super) fn vcvtps2ph(register: &str) -> String {
 /// A function of one instruction over 128-bit vectors that Cranelift does not have. `xmm0`
 /// and `xmm1` are loaded from where the first two arguments point and `xmm2` from where the
 /// third does, which is where `result` is written once `instruction` ran.
-pub(super) fn vector_instruction(instruction: &str, result: &str) -> String {
-    let [[a, ..], [b, ..], [c, ..]] = Convention::of_target().arguments.map(|row| GPR[row]);
+pub(super) fn vector_instruction(call_conv: CallConv, instruction: &str, result: &str) -> String {
+    let [[a, ..], [b, ..], [c, ..]] = Convention::of(call_conv).arguments.map(|row| GPR[row]);
     // alloc: the stub's text, the output
     format!(
         ".globl {SYMBOL}\n{SYMBOL}:\nmovdqu xmm0, [{a}]\nmovdqu xmm1, [{b}]\n\
@@ -347,12 +348,13 @@ fn x86_move(out: &mut String, name: &str, base: &str, offset: u32, load: bool) {
 /// and the upper halves of the vector registers are zeroed once a 256- or 512-bit one is
 /// used, as LLVM does before a function returns.
 pub(super) fn x86_function(
+    call_conv: CallConv,
     text: &str,
     args: &[(&str, u32)],
     results: &[(&str, u32)],
     clobbers: &[&str],
 ) -> Result<String, String> {
-    let convention = Convention::of_target();
+    let convention = Convention::of(call_conv);
     let [from, to, _] = convention.arguments.map(|row| GPR[row][0]);
     // alloc: the stub's text, the output
     let mut out = format!(".globl {SYMBOL}\n{SYMBOL}:\nmov r10, {from}\nmov r11, {to}\n");
@@ -416,8 +418,8 @@ pub(super) fn x86_function(
 /// register. `text` runs after the reads and leaves the result where `out` says, which is
 /// written to the first address. A mask of 8 bits is read with AVX512F's `kmovw`, as LLVM
 /// moves one without AVX512DQ.
-pub(super) fn avx512_function(loads: &[Load], text: &str, out: Out) -> String {
-    let slot = GPR[Convention::of_target().arguments[0]][0];
+pub(super) fn avx512_function(call_conv: CallConv, loads: &[Load], text: &str, out: Out) -> String {
+    let slot = GPR[Convention::of(call_conv).arguments[0]][0];
     // alloc: the stub's text, the output
     let mut s = format!(".globl {SYMBOL}\n{SYMBOL}:\nmov r10, {slot}\n");
     for (i, load) in loads.iter().enumerate() {
@@ -507,8 +509,8 @@ fn vector_width(bytes: u32) -> &'static str {
 /// `sha1rnds4` does four rounds of SHA-1 on the vectors at its first two arguments. Which
 /// function the rounds use is part of the instruction, so there is one for each of the four:
 /// the byte at the third argument says which runs, and the result is written over it.
-pub(super) fn sha1rnds4() -> String {
-    let [[a, ..], [b, ..], [c, ..]] = Convention::of_target().arguments.map(|row| GPR[row]);
+pub(super) fn sha1rnds4(call_conv: CallConv) -> String {
+    let [[a, ..], [b, ..], [c, ..]] = Convention::of(call_conv).arguments.map(|row| GPR[row]);
     // alloc: the stub's text, the output
     let mut text = format!(
         ".globl {SYMBOL}\n{SYMBOL}:\nmovdqu xmm0, [{a}]\nmovdqu xmm1, [{b}]\n\
@@ -691,9 +693,10 @@ struct Convention {
 }
 
 impl Convention {
-    fn of_target() -> Convention {
-        match super::Target::selected().map(|target| target.call_conv) {
-            Ok(cranelift_codegen::isa::CallConv::WindowsFastcall) => Convention {
+    /// The convention of a target whose C functions are `call_conv`'s.
+    fn of(call_conv: CallConv) -> Convention {
+        match call_conv {
+            CallConv::WindowsFastcall => Convention {
                 arguments: [1, 2, 5],
                 kept: &[3, 4, 9, 10, 11, 12],
                 kept_vectors: 6..16,
@@ -842,7 +845,7 @@ pub(super) fn wrapper(
     }
     let format = target.object_format;
     match target.arch {
-        Arch::X86_64 => wrapper_x86_64(format, template, options, operands),
+        Arch::X86_64 => wrapper_x86_64((format, target.call_conv), template, options, operands),
         Arch::Aarch64 => aarch64::wrapper(format, template, options, operands),
         // alloc: the error's message
         Arch::Wasm32 => Err("inline assembly in a wasm module".to_owned()),
@@ -851,7 +854,7 @@ pub(super) fn wrapper(
 
 /// The function for a block on x86-64.
 fn wrapper_x86_64(
-    format: ObjectFormat,
+    (format, call_conv): (ObjectFormat, CallConv),
     template: &[AsmPiece],
     options: AsmOptions,
     operands: &[Operand<'_>],
@@ -886,7 +889,7 @@ fn wrapper_x86_64(
         regs[index] = Some(found);
     }
 
-    let convention = Convention::of_target();
+    let convention = Convention::of(call_conv);
     let mut kept: SmallVec<[usize; 8]> = SmallVec::new();
     kept.extend(convention.kept.iter().copied().filter(|&row| regs.contains(&Some(Reg::Gpr(row)))));
     let mut kept_vectors: SmallVec<[usize; 16]> = SmallVec::new();
@@ -1060,8 +1063,9 @@ pub(super) struct Inline {
 /// the key's hash, and a level whose probes are all taken leads to the next, of twice as many,
 /// so nothing is moved or rehashed and a lookup is acquire loads alone. Two threads that set
 /// one slot meet on it for the move of an entry, never while one computes it.
+#[expect(clippy::disallowed_types, reason = "a slot set once, read with an acquire load: the table's entries, not global state")]
 struct Table<K, V> {
-    levels: [OnceLock<Box<[OnceLock<(K, V)>]>>; LEVELS],
+    levels: [std::sync::OnceLock<Box<[std::sync::OnceLock<(K, V)>]>>; LEVELS],
 }
 
 /// Levels of a [`Table`], the first of `FIRST` slots: room for 2^36 entries.
@@ -1070,18 +1074,19 @@ const FIRST: usize = 1 << 10;
 /// The slots of a level a key may be in, from the one its hash names on.
 const PROBES: usize = 16;
 
+#[expect(clippy::disallowed_types, reason = "a slot set once, read with an acquire load: the table's entries, not global state")]
 impl<K: PartialEq, V> Table<K, V> {
     const fn new() -> Table<K, V> {
-        Table { levels: [const { OnceLock::new() }; LEVELS] }
+        Table { levels: [const { std::sync::OnceLock::new() }; LEVELS] }
     }
 
     /// The slots `hash` may be in, in the order every lookup and insert takes them. An insert
     /// (`make`) makes a level the first time a key gets to it; a lookup stops before one that
     /// is not made, as no key is in it.
-    fn slots(&self, hash: u64, make: bool) -> impl Iterator<Item = &OnceLock<(K, V)>> {
+    fn slots(&self, hash: u64, make: bool) -> impl Iterator<Item = &std::sync::OnceLock<(K, V)>> {
         let levels = self.levels.iter().enumerate().map_while(move |(at, level)| match make {
             // alloc: a level, made once per process
-            true => Some(level.get_or_init(|| (0..FIRST << at).map(|_| OnceLock::new()).collect())),
+            true => Some(level.get_or_init(|| (0..FIRST << at).map(|_| std::sync::OnceLock::new()).collect())),
             false => level.get(),
         });
         levels.flat_map(move |level| {
@@ -1498,7 +1503,7 @@ impl Named {
 pub(super) fn assemble(triple: &str, text: &str) -> Result<&'static Assembled, String> {
     thread_local! {
         /// What this thread had assembled for the triple it names, by text.
-        static SEEN: RefCell<(String, HashMap<Box<str>, &'static Assembled>)> =
+        static SEEN: RefCell<(String, HashMap<Box<str>, &'static Assembled, Global>)> =
             RefCell::default();
     }
     let seen = SEEN.with_borrow(|(of, seen)| match of == triple {
@@ -1522,20 +1527,53 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<&'static Assembled, S
 /// [`assemble`] of a text this thread has not asked for.
 fn assembled(triple: &str, text: &str) -> Result<&'static Assembled, String> {
     static ASSEMBLED: Table<[u8; 32], Assembled> = Table::new();
-    let mut hasher = blaze_ids::b3::Hasher::new_derive_key("blaze asm 4");
+    let (key, hash) = keyed("blaze asm 4", triple, text);
+    if let Some((_, code)) = ASSEMBLED.get(hash, &key) {
+        return Ok(code);
+    }
+    let code = code(&Assembler::selected().object(triple, text, &key)?)?;
+    // Two threads may both have assembled it: the first one kept is the one all are given.
+    let (_, code) = ASSEMBLED.insert(hash, key, code).expect("2^36 blocks of assembly at most");
+    Ok(code)
+}
+
+/// The object file `text` assembles to for `triple`, whole: every section and symbol it
+/// defines, its unwind entries and the relocations of what it names, for the link to take as
+/// it takes a C object. What a crate's `global_asm!`s are (`v2::global_asm`). Each text is
+/// assembled once a process, and every caller is given the one object kept.
+pub(super) fn object(triple: &str, text: &str) -> Result<Arc<[u8]>, String> {
+    static OBJECTS: Table<[u8; 32], Arc<[u8]>> = Table::new();
+    let (key, hash) = keyed("blaze global asm 1", triple, text);
+    if let Some((_, object)) = OBJECTS.get(hash, &key) {
+        // clone: an `Arc`, the one object kept
+        return Ok(object.clone());
+    }
+    // alloc: once per text assembled, the object the process keeps
+    let object: Arc<[u8]> = Assembler::selected().object(triple, text, &key)?.into();
+    let (_, object) = OBJECTS.insert(hash, key, object).expect("2^36 objects of assembly at most");
+    // clone: an `Arc`, the one object kept
+    Ok(object.clone())
+}
+
+/// How many lines the assembler is given before a text: the switch to Intel's syntax on
+/// x86-64 (`llvm::assemble`, [`as_rustc_gives_it`]). A line its error names is this many
+/// past the text's own.
+pub(super) fn lines_before(arch: Arch) -> usize {
+    match arch {
+        Arch::X86_64 => 1,
+        Arch::Aarch64 | Arch::Wasm32 => 0,
+    }
+}
+
+/// The key of `text` assembled for `triple` in the table `domain` names, and its hash.
+fn keyed(domain: &str, triple: &str, text: &str) -> ([u8; 32], u64) {
+    let mut hasher = blaze_ids::b3::Hasher::new_derive_key(domain);
     hasher.update(triple.as_bytes());
     hasher.update(&[0]);
     hasher.update(text.as_bytes());
     let key: [u8; 32] = hasher.finalize();
     // A digest's bytes are as good a hash as any of them.
-    let hash = u64::from_le_bytes(key[..8].try_into().expect("8 bytes"));
-    if let Some((_, code)) = ASSEMBLED.get(hash, &key) {
-        return Ok(code);
-    }
-    let code = Assembler::selected().assemble(triple, text, &key)?;
-    // Two threads may both have assembled it: the first one kept is the one all are given.
-    let (_, code) = ASSEMBLED.insert(hash, key, code).expect("2^36 blocks of assembly at most");
-    Ok(code)
+    (key, u64::from_le_bytes(key[..8].try_into().expect("8 bytes")))
 }
 
 /// What turns the text of a block into an object file. `BLAZE_ASSEMBLER=cc` picks the C
@@ -1562,11 +1600,12 @@ impl Assembler {
         Assembler::Cc
     }
 
-    fn assemble(self, triple: &str, text: &str, key: &[u8; 32]) -> Result<Assembled, String> {
+    /// The object file of `text`, whose [`keyed`] key is `key`.
+    fn object(self, triple: &str, text: &str, key: &[u8; 32]) -> Result<Vec<u8>, String> {
         match self {
             Assembler::Cc => run_cc(triple, text, key).unwrap_or_else(|| Err(no_assembler(triple))),
             #[cfg(feature = "llvm")]
-            Assembler::Llvm => code(&super::llvm::assemble(text)?),
+            Assembler::Llvm => super::llvm::assemble(super::Target::of(triple)?, text),
         }
     }
 }
@@ -1658,8 +1697,9 @@ fn no_assembler(triple: &str) -> String {
     )
 }
 
-/// The block assembled by the platform's C compiler. `None` when there is none for `triple`.
-fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Assembled, String>> {
+/// The object file of the block, assembled by the platform's C compiler. `None` when there
+/// is none for `triple`.
+fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Vec<u8>, String>> {
     let (compiler, target) = c_compiler(triple)?;
     static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1696,7 +1736,7 @@ fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Assembled, 
     let said = compiler.display().to_string();
     let code = match output {
         Ok(output) if output.status.success() => {
-            std::fs::read(&object).map_err(|e| failed("no object", &e)).and_then(|it| code(&it))
+            std::fs::read(&object).map_err(|e| failed("no object", &e))
         }
         // An `xcrun` shim (`/usr/bin/clang` without the command line tools) is one that runs
         // and assembles nothing: the error names it and what would.
@@ -1721,7 +1761,9 @@ fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Assembled, 
     Some(code)
 }
 
-/// The function in an object that defines it alone.
+/// The function in an object that defines it alone. What else the object holds that the
+/// function would go without (a symbol it defines, bytes in another section, a symbol its
+/// text names) is an error naming it, never left out: only a `global_asm!` is linked whole.
 fn code(object: &[u8]) -> Result<Assembled, String> {
     fn failed(e: impl std::fmt::Display) -> String {
         // alloc: the error's message
@@ -1736,23 +1778,54 @@ fn code(object: &[u8]) -> Result<Assembled, String> {
         .section_index()
         .and_then(|it| file.section_by_index(it).ok())
         .ok_or_else(|| failed(&"the function is in no section"))?;
+    if let Some(other) = file.symbols().find(|it| {
+        it.index() != symbol.index() && it.is_definition() && it.is_global()
+    }) {
+        return Err(failed(&format_args!(
+            "a block that defines the symbol `{}`: blaze takes an `asm!` or `naked_asm!` \
+             block as one function, and links what else assembly defines only from a \
+             `global_asm!`",
+            other.name().unwrap_or("?")
+        )));
+    }
+    if let Some(other) = file.sections().find(|it| {
+        it.index() != section.index() && it.size() > 0 && holds_code_or_data(it)
+    }) {
+        return Err(failed(&format_args!(
+            "a block that puts {} bytes in the section `{}`: blaze takes an `asm!` or \
+             `naked_asm!` block as one function, and links other sections only of a \
+             `global_asm!`",
+            other.size(),
+            other.name().unwrap_or("?")
+        )));
+    }
     let bytes = section.data().map_err(|e| failed(&e))?;
     let start = symbol.address() - section.address();
     // alloc: the code the process keeps, once per text assembled
     let mut code = bytes[start as usize..].to_vec();
     let format = file.format();
-    // FIXME: a block that names a symbol of its own, or has data in another section.
     let relocs = section.relocations().map(|(offset, relocation)| {
-        let operand = match relocation.target() {
+        let target = match relocation.target() {
             RelocationTarget::Symbol(index) => file.symbol_by_index(index).ok(),
             _ => None,
         };
         // The name is as the text has it: an assembler adds nothing to one, on Mach-O either.
-        let operand = operand
-            .and_then(|it| it.name().ok()?.strip_prefix(SYM)?.parse().ok())
-            .ok_or("inline assembly that names a symbol")?;
+        let named = target.as_ref().and_then(|it| it.name().ok());
+        let operand = named.and_then(|it| it.strip_prefix(SYM)?.parse().ok()).ok_or_else(|| {
+            failed(&format_args!(
+                "a block whose text names the symbol `{}`: blaze links what an `asm!` or \
+                 `naked_asm!` block names only through a `sym` operand",
+                named.unwrap_or("?")
+            ))
+        })?;
         let (kind, elf_type) = Named::kind(format, file.architecture(), relocation.flags())
-            .ok_or("inline assembly that names a symbol in a way that is not read")?;
+            .ok_or_else(|| {
+                failed(&format_args!(
+                    "a block that names its `sym` operand {operand} with the relocation {:?}, \
+                     which blaze does not read",
+                    relocation.flags()
+                ))
+            })?;
         let offset = offset.checked_sub(start).ok_or("inline assembly before its function")?;
         let mut addend = relocation.addend();
         // COFF keeps what is added in the field, and Mach-O does for an address that is data,
@@ -1778,8 +1851,35 @@ fn code(object: &[u8]) -> Result<Assembled, String> {
         }
         Ok(Named { offset: offset as u32, kind, elf_type, operand, addend })
     });
-    let relocs = relocs.collect::<Result<_, &str>>()?;
+    let relocs = relocs.collect::<Result<_, String>>()?;
     Ok(Assembled { code, relocs })
+}
+
+/// Whether a section the assembler wrote holds code or data a program runs with, which a
+/// block's function would go without. Its unwind entries and debug info are not that:
+/// blaze writes the function's own (`Code::unwind` is `None` for a block).
+// FIXME: a `naked_asm!` with `.cfi_*` directives (compiler_builtins' `__rust_probestack`)
+// has its entries dropped here, so nothing unwinds through it. Carry them into
+// `fragment::Code::unwind` and refuse what does not carry.
+fn holds_code_or_data(section: &object::Section<'_, '_>) -> bool {
+    use object::SectionKind as Kind;
+    let name = section.name().unwrap_or("");
+    let unwind_or_debug = matches!(name, ".eh_frame" | "__eh_frame" | "__compact_unwind")
+        || name.starts_with(".debug")
+        || name.starts_with("__debug");
+    !unwind_or_debug
+        && matches!(
+            section.kind(),
+            Kind::Text
+                | Kind::Data
+                | Kind::ReadOnlyData
+                | Kind::ReadOnlyDataWithRel
+                | Kind::ReadOnlyString
+                | Kind::UninitializedData
+                | Kind::Tls
+                | Kind::UninitializedTls
+                | Kind::TlsVariables
+        )
 }
 
 #[cfg(test)]
@@ -1819,7 +1919,7 @@ mod tests {
         use super::{AsmOptions, AsmPiece, ObjectFormat, wrapper_x86_64};
         let text = |template: &str, options| {
             let template = [AsmPiece::Lit(template.into())];
-            wrapper_x86_64(ObjectFormat::Coff, &template, options, &[]).unwrap().text
+            wrapper_x86_64((ObjectFormat::Coff, super::Target::for_host().call_conv), &template, options, &[]).unwrap().text
         };
         let intel = text("int $$0x29\nmov eax, $$$$5", AsmOptions::NORETURN);
         assert!(intel.contains("int 0x29\nmov eax, 5\n"), "{intel}");
@@ -1833,6 +1933,7 @@ mod tests {
     #[test]
     fn a_table_keeps_one_entry_a_key_whoever_adds_it() {
         use super::{BuildHasher, FIRST, FixedState, HashMap, Table};
+        use std::alloc::Global;
         let table: Table<u64, u64> = Table::new();
         let keys = 4 * FIRST as u64;
         let given = std::thread::scope(|scope| {
@@ -1851,7 +1952,7 @@ mod tests {
             let threads = threads.collect::<Vec<_>>();
             threads.into_iter().map(|it| it.join().unwrap()).collect::<Vec<_>>()
         });
-        let mut model = HashMap::default();
+        let mut model = HashMap::new_in(Global);
         for (key, value) in given.into_iter().flatten() {
             assert_eq!(*model.entry(key).or_insert(value), value, "key {key}");
         }

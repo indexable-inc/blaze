@@ -32,6 +32,21 @@ use crate::{
     tt,
 };
 
+/// Whether `attr` is `#[blaze::bits]` or `#[blaze::bits(uN)]`: its path exactly the two
+/// segments `blaze::bits` (hir-def's `is_blaze_bits`), never `#[blaze::other(bits)]`.
+pub(super) fn is_blaze_bits(attr: &ast::Attr) -> bool {
+    let name_is = |name: Option<ast::NameRef>, want: &str| {
+        name.is_some_and(|it| it.text().trim_start_matches("r#") == want)
+    };
+    attr.path().is_some_and(|path| {
+        name_is(path.qualifier().and_then(|it| it.as_single_name_ref()), "blaze")
+            && path.segment().is_some_and(|segment| {
+                ast::HasGenericArgs::generic_arg_list(&segment).is_none()
+                    && name_is(segment.name_ref(), "bits")
+            })
+    })
+}
+
 /// Whether the words of `attr`'s text (its runs of letters, digits and `_`, leaving out those in
 /// `skip`) start with `head` and then have `word`. A word never spans two tokens, so the tokens
 /// are split one by one and nothing is copied.
@@ -749,7 +764,10 @@ pub(super) fn parse_adt_from_handle(
     if let Some(kind) = struct_fields {
         variants.push(Variant { name: name_token.clone(), kind, start: 0, end: len_u32(fields.len()) }); // clone: a copy (symbol and span)
     }
-    let packed = adt.attrs().any(|attr| attr_words_have(&attr, "repr", &["r"], "packed"));
+    // A `#[blaze::bits]` struct's fields have no address either: copied out as a packed one's.
+    let packed = adt
+        .attrs()
+        .any(|attr| attr_words_have(&attr, "repr", &["r"], "packed") || is_blaze_bits(&attr));
     Ok(BasicAdtInfo {
         name: name_token,
         shape: AdtShape { kind, variants, fields },

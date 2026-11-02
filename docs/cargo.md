@@ -46,7 +46,8 @@ blaze ships. It ignores `rust-toolchain`/`rust-toolchain.toml`, `rustup override
 to learn anything ([toolchain.md](toolchain.md)). The nightly builds
 what older releases built, so a project on a stable release or an older nightly builds as it
 is, `#![feature(...)]` included. A project that needs another Rust pins another blaze. Plain
-`cargo` still builds with the project's toolchain, in the same target directory.
+`cargo` still builds with the project's toolchain, in its own `target/` in the checkout:
+blaze's build directory is elsewhere ([Where a build writes](#where-a-build-writes)).
 
 Where the nightly's files come from, found with nothing run: rustup's `nightly-2026-10-27`,
 when rustup has it (only as a copy of the same files; what rustup would pick
@@ -125,8 +126,9 @@ with a name those they pick, as cargo's unit graph of the check has them. A targ
 a test (a library's unit tests under `--tests`) is checked with `cfg(test)` and the
 dev-dependencies; a member the selected packages only depend on is checked as its library.
 
-`build`, `run`, `test` and `bench` take the flags cargo takes and leave the same files in the
-same places under `target/`. The client reads no manifest: it finds the checkout, sends the
+`build`, `run`, `test` and `bench` take the flags cargo takes and leave the files cargo would
+in the same layout, under the workspace's build directory, which is never in the checkout
+([Where a build writes](#where-a-build-writes)). The client reads no manifest: it finds the checkout, sends the
 daemon one request with the whole command line, its environment and the configuration files
 outside the checkout, and prints the responses as cargo prints its build (`Compiling`,
 `Fresh` under `-v`, warnings, `Finished`), with cargo's exit codes. `check` is the daemon's
@@ -146,8 +148,8 @@ ones) and documents what `cargo doc` documents, with no rustdoc: the daemon chec
 `cargo doc` picks (a library, and each binary not named as it; `Intent::Doc` in
 `crates/blaze-units`) and every dependency, as any check, then makes every page from that front
 end with `cfg(doc)` set (`crates/blaze-doc`, `crates/blaze-cargo/src/serve/unit/doc.rs`, the
-agent API's `Request::Doc`). The client writes the pages to `target/doc`, or
-`target/<triple>/doc` with `--target`, keeps the crates earlier runs documented there in the
+agent API's `Request::Doc`). The client writes the pages to `doc` in the build directory, or
+`<triple>/doc` there with `--target`, prints that path, keeps the crates earlier runs documented there in the
 search's list, and says `Documenting`, `Finished` and `Generated` (or `Opening`, and opens the
 page with `$BROWSER` or the system's opener, for `--open`) as cargo does. What `cargo doc`
 reads and blaze can't honor yet stops it with an error naming it: rustdoc's flags
@@ -166,8 +168,8 @@ reads the command line as cargo does, into cargo's unit graph (`crates/blaze-uni
 packages, features, profiles, targets and build-script runs cargo would have), and builds
 each unit itself: every crate is compiled by blaze over blaze's standard library, a
 function at a time ([v2/plan/design/model.md](v2/plan/design/model.md)), and each program is
-linked by blaze's linker (`crates/blaze-link`) where cargo puts it (`target/debug/<name>`,
-`target/release/<name>`, `examples/` for an example). No `cargo build` runs. A function the
+linked by blaze's linker (`crates/blaze-link`) where cargo puts it in the build directory
+(`debug/<name>`, `release/<name>`, `examples/` for an example). No `cargo build` runs. A function the
 program can reach that blaze cannot compile fails its unit, naming the function and why;
 nothing is handed to cargo or rustc.
 
@@ -525,25 +527,62 @@ code, with the real std and `library/proc_macro`, every access checked, and the 
 call answered by blaze's own server. Nothing rustc compiles is loaded and no process is
 started: the evaluator is the proc-macro sandbox. The macro reads only below the calling
 crate's `CARGO_MANIFEST_DIR` and `OUT_DIR`, writes nothing, sets no variable and makes no
-system call blaze has no shim for (`crates/blaze-macro-eval/src/os.rs`). Its compiled tier,
-off by default (`Policy::DEFAULT`), keeps the same confinement: the macro's code reaches only
-a 4 GiB region of its own and calls only checked table entries and the same shims
-(`crates/blaze-macro-eval/src/tier.rs`, `tier/confine.rs`). A macro blaze-macro-eval cannot
-run stops the build with an error naming the macro and its crate; nothing runs natively and
-nothing goes to another host (there is none). Each expansion is kept in the store
+system call blaze has no shim for (`crates/blaze-macro-eval/src/os.rs`). The evaluator is
+also the reference the WebAssembly host's output is tested against (below). A macro
+blaze-macro-eval cannot run stops the build with an error naming the macro and its crate;
+nothing runs natively and nothing goes to another host (there is none). Each expansion is kept in the store
 (`crates/proc-macro-api/src/kept.rs`) by the macro's library, its name, input and attribute
 tokens, the crate's variables, its directory and the toolchain, and found by what else it
 read; `BLAZE_PROC_MACRO_CACHE=check` expands every kept call anyway and fails naming a macro
 whose output differs.
 
-### Build scripts under WASI, and proc macros as WebAssembly (v1, not in v2)
+### Proc macros as WebAssembly
+
+blaze-macro-eval also runs a proc macro as a `wasm32-wasip1` module under Wasmtime, in the
+daemon's process (`crates/blaze-macro-eval/src/wasm.rs`, `blaze_macro_eval::load_wasm`). The
+module is the macro crate built by blaze with the bridge's glue appended to its root
+(`crates/blaze-macro-eval/guest/entry.rs`). Its only imports are the `proc_macro` bridge's
+shims and the WASI preview 1 functions std calls (`src/wasm/abi.rs`). A module that imports
+anything else is refused at load with an error naming the crate and the import. The bridge's
+requests reach the same server as on the evaluator, with a `usize` in eight bytes from every
+client, as the pinned bridge encodes it (`MAX_USIZE_SIZE`, `src/wire.rs`). The WASI calls see the
+evaluator's machine and are traced the same way (`src/wasm/wasi.rs`). The glue's `getenv`
+replaces wasi-libc's, which reads the whole environment on its first call, and asks the host
+one variable at a time (the bridge's `env_var`). So `env::var` keys an expansion by the
+variables it read, as on the evaluator, and a per-run variable it never reads
+(`BLAZE_PROFILE`) never makes it miss. Only `env::vars` reads them all. The host serves no
+file yet. A macro that opens a path stops with an error naming it, never with an error the
+trace misses.
+
+Each expansion runs in a fresh instance under a fuel budget (`src/wasm/host.rs`, `FUEL`) and
+the evaluator's memory budget. The instance runs on a kept expansion thread, never on a
+fiber, because a Wasmtime activation lives in its thread's locals and a fiber moves threads
+when it waits (`src/wasm/thread.rs`). The job waits on an event, holding no thread, and answers
+what the macro asks the database of a span outside any wasm call. A module's machine code is compiled once a process and kept in
+the store under the module's id and Wasmtime's version and settings (`src/wasm/code.rs`), so
+the next process loads it without compiling. A module that can't be compiled, loaded or run is
+an error naming the macro. Nothing then runs it on the evaluator.
+
+`-Z wasm-macros` builds each proc-macro crate for `wasm32-wasip1` with blaze's own front end
+and code generator (`UnitPlan::macro_wasm`, `crates/blaze-units/src/load.rs`): the crate's root
+gets the module `__blaze_proc_macros` (its list of macros and the glue,
+`crates/blaze-macro-eval/src/wasm/glue.rs`), it is linked as a WASI reactor with no debug
+sections, and each expansion loads it with `load_wasm`. On wasm32 a `#[thread_local]` static is
+plain data (no TLS without atomics), a panic's `Location` is four 32-bit words, a direct call of
+an undefined weak function traps as wasm-ld's stub does, and std's `hashmap_random_keys` is the
+bridge's import of the evaluator's fixed keys, so `RandomState` reads no WASI randomness. A
+proc-macro crate's lang items, and its dependencies', never reach the crates that use its
+macros. Each expansion opens a `proc macro expansion` span naming the macro and the input item.
+Without the flag every proc macro still runs on the evaluator. The flag is not the default yet,
+because the host serves no file (a macro that reads one, as `include_str!`-style macros do,
+stops naming the path). A macro's state never carries from one call to the next, because each
+is a fresh instance; a macro that counts its calls sees every call as its first.
 
 v1 could compile a build script for `wasm32-wasip1` and run it under Wasmtime (`wasi-compare`,
-`wasi-build-scripts`), built every proc macro as a WebAssembly module (`native-proc-macros`),
-and could expand with rust-analyzer's out-of-process proc-macro server. v2 does none of these,
-and their crates are deleted: every build script runs natively in the sandbox, and every proc
-macro on blaze's evaluator (above). Nothing in blaze reads v1's variables or manifest lists
-for them, so setting them changes nothing. The comparison of the two ways of running scripts is
+`wasi-build-scripts`), and could expand with rust-analyzer's out-of-process proc-macro server.
+v2 does neither, and their crates are deleted: every build script runs natively in the
+sandbox. Nothing in blaze reads v1's variables or manifest lists for them, so setting them
+changes nothing. The comparison of the two ways of running scripts is
 [reports/BSWASI.md](reports/BSWASI.md).
 
 ### Which tests run
@@ -647,8 +686,62 @@ to use them. The socket is 0600, and a connection from another user is refused b
 request is read. `blaze serve --http ADDR` listens on TCP as well, only with a bearer token in
 `BLAZE_API_TOKEN`.
 
-In a project, the daemon writes the programs and test executables where cargo would, under
-`target/<profile>/`.
+In a project, the daemon writes the programs and test executables where cargo would in the
+workspace's build directory, under `<profile>/` there.
+
+### Where a build writes
+
+blaze writes no build file into the checkout: there is no `./target`. A workspace builds into
+`<root>/build/<name>-<id>`, where `<root>` is blaze's root on the machine (`$BLAZE_HOME`, else
+`blaze` in `$XDG_CACHE_HOME`, else `~/.cache/blaze`; the daemon's state is `v2/` beside it),
+`<name>` is the last part of the workspace root's path and `<id>` is the first 32 hex digits of
+the BLAKE3 of that path (domain `blaze workspace build dir 1`,
+`crates/blaze-manifest/src/home.rs`). Two checkouts of one repository, worktrees among them,
+get two directories; a lane needs no `CARGO_TARGET_DIR` of its own. The directory has no `v2/`
+on purpose: it is the user's to open and delete, not the daemon's state.
+
+The directory holds what has to be a real path: build scripts' `OUT_DIR`s, the executables
+that are run (programs, tests, build scripts) and the `doc` pages a user opens. What is
+addressed by content lives in the store. An output of 16 KiB or more (a library, an executable,
+a test) is placed in the directory as a clone of the store's read-only copy of its bytes
+([v2-store.md](v2-store.md#chunks-and-placing)), so a second checkout of the same project adds
+only the blocks its own outputs differ in; a volume that cannot clone (or a build directory on
+another volume than the store) fails the build, naming both volumes, and nothing is copied
+instead. Each build reports the bytes it placed by clone, wrote and copied in its `blaze-work`
+line (`placed`). `OUT_DIR`s are still written whole on restore and `doc` pages by the client.
+
+`--target-dir`, `CARGO_TARGET_DIR` and `build.target-dir` still name the directory, as tools
+and scripts pass them; `build.build-dir` still names where the intermediate files go. The paths
+blaze prints (a test executable, `blaze doc`'s pages) are the real ones, and `cargo metadata`'s
+`target_directory` and `build_directory` (as `crates/blaze-metadata` makes them) name the same
+directory, so rust-analyzer and editors look there.
+
+The daemon tells when its watch of a checkout has caught up with a request by flushing the
+watch, so it writes no sync file into the checkout either (`crates/blaze-cargo/src/serve/heads.rs`).
+On macOS the flush is a cookie in a directory of the watch's own, outside the checkout; on
+Linux io_uring drains the watch's queue. On Windows the checkout's watch reads the volume's
+NTFS USN journal (unprivileged, Windows 10 1709 or later), and a flush is the journal's own
+position: the driver asks where the journal ends (`FSCTL_QUERY_USN_JOURNAL`) after the request
+arrived and holds the request until the watch has told every record before it
+(`crates/blaze-core/src/journal/barrier.rs`). A file a program still holds open and writes is
+heard as it is first written and as it is closed, not at each write. A checkout on a network
+share, on a volume with no USN journal (FAT, exFAT) or on one whose journal was never made
+can't be watched: each request on it fails, naming the checkout and why (the last says how an
+administrator makes the journal).
+
+`blaze clean` is normally not needed: the daemon collects what is unused on its own, and works
+harder the fuller the disk gets, so free space stays above its floor without anyone asking
+([gc.md](gc.md#pacing-how-hard-it-works)). It stays as an escape hatch. It removes the
+workspace's build directory (the one named by `--target-dir` or the
+configuration, if one is), with `--dry-run` and cargo's `Removed` summary. `blaze clean --list`
+prints every workspace's directory under blaze's root with its size, whether a build holds it,
+when it was last used and its checkout, and `blaze clean --all` removes them all. A directory a
+build holds is refused, naming it. Only a directory that is no symlink, is not the same directory as (by device and inode) and
+does not hold the checkout, `$HOME`, `/` or the current directory, and carries a build directory's mark (blaze's
+lease or record, or a `CACHEDIR.TAG` with its signature) is removed: renamed away and unlinked
+while its lease is held ([gc.md](gc.md#commands)). `blaze cache gc` runs one collection now,
+and `blaze cache gc --dry-run` shows each volume's free space, its levels and what would go
+([gc.md](gc.md)).
 
 The store is always on: one per daemon, in `$BLAZE_HOME/v2/store`, the user's alone (the
 daemon refuses one another user owns or others may write to;
@@ -715,6 +808,7 @@ it, for that request alone:
 | `BLAZE_SANDBOX` | `off` (or `0`) runs build scripts and proc macros, and tests under `--reached`, outside the sandbox ([above](#build-scripts-and-proc-macros-run-in-a-sandbox)) | sandboxed |
 | `BLAZE_ELIDE` | `verify` also compiles and runs a build script blaze elided as inert, and checks it said what elision did; any other value is an error | unset: an inert script is not run |
 | `BLAZE_PROC_MACRO_CACHE` | `check` expands again each expansion the store kept and compares; any other value is an error | unset: a kept expansion is used |
+| `BLAZE_SCRIPT_CACHE` | `check` runs again each build script run the store kept and compares, failing the build where they differ; a result another checkout verified that differs is recorded as depending on where its roots are, so no checkout is given it again; any other value is an error | unset: a kept run is used |
 
 These are read by the process itself, the client or the daemon (from the environment of
 whichever command started it; to change one there, run `blaze stop` first):
@@ -856,7 +950,7 @@ once the client asks the daemon for it. None of it runs in v2.
 | `tree` | yes | `crates/blaze-tree`, cargo 1.101's `cargo tree` ported onto blaze-resolve: every flag (`-p`, `--workspace`, `--exclude`, `-e`, `-i`, `--prune`, `--depth`, `--prefix`, `--no-dedupe`, `-d`, `-f`, `--target`, `--charset`, `--color`, the feature flags). Measured equal to cargo's before the comparison harnesses were deleted (2026-10-30): 26 forms over ripgrep, fd, helix, nushell and biome, 130 of 130 byte-equal. Package patterns with globs (`-p 'serde*'`) and `-i` with no value are refused |
 | `pkgid` | yes | the package's full spec from `Cargo.lock`, with cargo's errors for none or several matches |
 | `fetch` | yes | every package `Cargo.lock` names, downloaded by blaze-registry. `--target` fetches every platform's, and with no lock file it fails (choosing versions is #321) |
-| `clean` | yes | the target and build directories, one profile's (`--release`, `--profile`), or `--doc`, with `--target-dir`, `--dry-run` and cargo's `Removed` summary. `-p` and `--workspace` (one package's files) are refused |
+| `clean` | yes | the workspace's whole build directory under blaze's root ([Where a build writes](#where-a-build-writes)), or the one `--target-dir`, `CARGO_TARGET_DIR` or `build.target-dir` names, and `build.build-dir`'s; `--dry-run`, `--manifest-path` and cargo's `Removed` summary. `--list` prints every workspace's build directory with its size, `--all` removes them all. One profile's (`--release`, `--profile`), `--doc`, `-p`, `--workspace` and `--target` are refused (`crates/blaze-cargo/src/cli/clean.rs`) |
 | `new`, `init` | yes | `crates/blaze-new`, cargo 1.101's `ops/cargo_new.rs`: the manifest, source file, ignore file and repository, the workspace's `members`, and cargo's checks of the name. The repository is made by `git init` (or `hg`, `pijul`, `fossil`, as cargo runs them). Cargo runs rustfmt on the file it writes; blaze does not, so a `rustfmt.toml` above the package that would change the template is not applied. Measured equal to cargo's before the comparison harnesses were deleted (2026-10-30): 50 of 50 cases, what each prints and every file it leaves |
 | `remove` (`rm`) | yes | the dependencies out of the member's manifest, with `toml_edit` keeping its layout and comments, as cargo 1.99's `cargo_remove.rs` and `toml_mut` do: the features that named them, then the `[workspace.dependencies]`, `[profile.*.package]`, `[replace]` and `[patch]` entries nothing uses any more; then the lock file resolved again by blaze with every version it keeps locked as it was (blaze-metadata's `relock`), honouring `--locked`. A workspace with no lock file is refused: writing one chooses versions (#321). Measured equal to cargo's before the comparison harnesses were deleted (2026-10-30), manifests and lock files byte for byte: 43 of 43 cases on ripgrep and a made-up workspace |
 | `vendor` | yes | every registry package of the lock file unpacked from its `.crate` into the vendor directory as cargo 1.99's `ops/vendor.rs` does, with `.cargo-checksum.json`, `--versioned-dirs`, `--no-delete`, `-s`/`--sync` and `--respect-source-config`, and the `[source]` configuration printed; the workspace resolved again first, as cargo does (blaze-metadata's `vendored`). A git package is refused: cargo vendors it with its manifest as `cargo package` writes it, which blaze does not write yet. A workspace with no lock file is refused: writing one chooses versions (#321). Measured equal to cargo's before the comparison harnesses were deleted (2026-10-30), every file by its sha256: 18 of 18 cases on fd, ripgrep and a made-up workspace |

@@ -2,11 +2,13 @@
 //! [`blaze_intent`] over the job's view: an edit reads the view's files as the VFS has them
 //! and builds nothing; a build ahead picks the test units its filters select and runs nothing.
 
+#[expect(clippy::disallowed_types, reason = "each read once, the first time an edit asks: per edit, not global")]
 use std::cell::OnceCell;
 
 use base_db::FileId;
 use blaze_api::{ApiError, Edit, Edited};
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_intent::ahead;
 use blaze_vfs::Bytes;
 
@@ -56,15 +58,17 @@ pub(crate) fn ahead(job: &Job, reader: &UnitReader, filter: &[String]) -> Result
 
 /// The front end's files in the view, by their path in it, each one's bytes read from the VFS
 /// the first time an edit opens it.
+#[expect(clippy::disallowed_types, reason = "each read once, the first time an edit asks: per edit, not global")]
 struct ViewFiles<'a> {
     mounted: &'a Mounted,
     files: Vec<ViewFile<'a>>,
-    by_path: HashMap<Box<str>, u32>,
-    by_id: HashMap<FileId, u32>,
+    by_path: HashMap<Box<str>, u32, Global>,
+    by_id: HashMap<FileId, u32, Global>,
     /// The first file whose bytes failed their check, and why.
     corrupt: OnceCell<(String, String)>,
 }
 
+#[expect(clippy::disallowed_types, reason = "each read once, the first time an edit asks: per edit, not global")]
 struct ViewFile<'a> {
     id: FileId,
     absolute: &'a str,
@@ -75,16 +79,16 @@ struct ViewFile<'a> {
 impl<'a> ViewFiles<'a> {
     fn new(mounted: &'a Mounted, paths: &'a std::collections::HashMap<FileId, String>) -> ViewFiles<'a> {
         let mut files = Vec::new();
-        let (mut by_path, mut by_id) = (HashMap::default(), HashMap::default());
+        let (mut by_path, mut by_id) = (HashMap::new_in(Global), HashMap::new_in(Global));
         for (&id, absolute) in paths {
             let Some(path) = mounted.in_view(absolute) else { continue };
             let at = u32::try_from(files.len()).expect("under 2^32 files");
             let path: Box<str> = path.into();
             by_path.insert(path.clone(), at);
             by_id.insert(id, at);
-            files.push(ViewFile { id, absolute, path, bytes: OnceCell::new() });
+            files.push(ViewFile { id, absolute, path, bytes: Default::default() });
         }
-        ViewFiles { mounted, files, by_path, by_id, corrupt: OnceCell::new() }
+        ViewFiles { mounted, files, by_path, by_id, corrupt: Default::default() }
     }
 }
 

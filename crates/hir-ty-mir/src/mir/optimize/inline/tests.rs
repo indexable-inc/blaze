@@ -3,6 +3,7 @@
 //! What it inlines from fixtures is `fixtures.rs`, an integration test.
 
 use blaze_hash::HashSet;
+use std::alloc::Global;
 use hir_def::hir::ExprId;
 use la_arena::RawIdx;
 use rustc_abi::ExternAbi;
@@ -31,7 +32,7 @@ fn walk_from(
     walk(root, root, 16, |node| node, callees, local)
 }
 
-fn set(of: &[u32]) -> HashSet<u32> {
+fn set(of: &[u32]) -> HashSet<u32, Global> {
     of.iter().copied().collect()
 }
 

@@ -44,7 +44,9 @@ impl<'a, 'db> TypeFolder<DbInterner<'db>> for DeepResolverIgnoringRegions<'a, 'd
             ty
         } else {
             let shallow = self.infcx.shallow_resolve(t);
-            let res = shallow.super_fold_with(self);
+            // One guard per level of the type, which can nest as deep as a program writes it
+            // (rule 17).
+            let res = stdx::ensure_sufficient_stack(|| shallow.super_fold_with(self));
             assert!(self.cache.insert(t, res));
             res
         }
@@ -55,7 +57,7 @@ impl<'a, 'db> TypeFolder<DbInterner<'db>> for DeepResolverIgnoringRegions<'a, 'd
             ct // micro-optimize -- if there is nothing in this const that this fold affects...
         } else {
             let ct = self.infcx.shallow_resolve_const(ct);
-            ct.super_fold_with(self)
+            stdx::ensure_sufficient_stack(|| ct.super_fold_with(self))
         }
     }
 

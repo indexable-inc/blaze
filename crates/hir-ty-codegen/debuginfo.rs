@@ -26,6 +26,7 @@ pub(super) use types::{ByEnv, Sets, described};
 use blaze_core::decimal::decimal;
 use blaze_format::leb;
 use blaze_hash::{FixedHasher, HashMap};
+use std::alloc::Global;
 use cranelift_codegen::{
     binemit::CodeOffset,
     gimli::{
@@ -84,6 +85,13 @@ impl LineRow {
 
     fn span_of(loc: ir::SourceLoc) -> Option<u32> {
         super::unwind::seh::unguarded(loc).bits().checked_sub(Self::FIRST)
+    }
+
+    /// The statement of a line of LLVM's debug locations, which LLVM's lowering makes the
+    /// source location of the code (`llvm::lower`'s marks): `None` for code of none.
+    #[cfg(feature = "llvm")]
+    pub(super) fn span_of_line(line: u32) -> Option<u32> {
+        Self::span_of(ir::SourceLoc::new(line))
     }
 
     /// The rows of a function from the source location its code has from each offset on, in
@@ -438,14 +446,15 @@ pub(super) enum DebugContext {
 }
 
 impl DebugContext {
-    /// The tables of an object for `isa` whose files are named from `directory`, or `None`
-    /// where they are not written yet: ELF and Mach-O have DWARF and COFF has CodeView.
+    /// The tables of an object for `target` (its settings `isa`'s) whose files are named from
+    /// `directory`, or `None` where they are not written yet (a wasm module has none): ELF and Mach-O have DWARF and COFF has CodeView.
     /// DWARF leaves the variables of the functions out unless `variables` asks for them, and
     /// on ELF keeps its entries apart from what is linked when `apart` names the file a
     /// debugger reads them from; Mach-O links none of it, and CodeView has neither yet.
     /// With `grouped`, each unit linked on ELF has sections of its own (see
     /// [`Dwarf::sections`]).
     pub(super) fn new(
+        target: &super::Target,
         // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
         isa: &dyn TargetIsa,
         directory: &str,
@@ -453,7 +462,7 @@ impl DebugContext {
         apart: Option<String>,
         grouped: bool,
     ) -> Option<Self> {
-        if super::Target::current().is_wasm() {
+        if target.is_wasm() {
             return None;
         }
         match isa.triple().binary_format {
@@ -521,18 +530,18 @@ pub(super) struct Dwarf {
     id: FixedHasher,
     encoding: Encoding,
     directory: Vec<u8>,
-    files: HashMap<String, FileId>,
+    files: HashMap<String, FileId, Global>,
     ranges: Vec<Range>,
     /// The addresses the entries of a unit kept apart name by their place in this list.
     addresses: Vec<Address>,
-    types: HashMap<SharedType, UnitEntryId>,
+    types: HashMap<SharedType, UnitEntryId, Global>,
     /// The first entry of each name among `types`.
-    names: HashMap<Symbol, UnitEntryId>,
+    names: HashMap<Symbol, UnitEntryId, Global>,
     /// The entry of the type each set seen is of, by where the set is, with the set so that
     /// nothing else comes to be there.
-    sets: HashMap<usize, (TypeSet, Option<UnitEntryId>)>,
+    sets: HashMap<usize, (TypeSet, Option<UnitEntryId>), Global>,
     /// The modules and functions of the unit that a type is written in, by their paths.
-    namespaces: HashMap<String, UnitEntryId>,
+    namespaces: HashMap<String, UnitEntryId, Global>,
     /// Whether the variables of the functions are told of, and not their lines alone.
     variables: bool,
     /// Whether each unit is written in sections of its own.
@@ -555,7 +564,7 @@ enum SharedType {
 #[derive(Default)]
 struct FunctionTypes {
     /// By where each type's set is.
-    entries: HashMap<usize, UnitEntryId>,
+    entries: HashMap<usize, UnitEntryId, Global>,
     /// How many types the one being told of is inside of.
     inside: u32,
 }
@@ -594,13 +603,13 @@ impl Dwarf {
             addresses: Vec::new(),
             encoding,
             directory,
-            files: HashMap::default(),
+            files: HashMap::new_in(Global),
             // alloc: empty, allocates nothing: a unit reserves its ranges at its first function
             ranges: Vec::new(),
-            types: HashMap::default(),
-            names: HashMap::default(),
-            sets: HashMap::default(),
-            namespaces: HashMap::default(),
+            types: HashMap::new_in(Global),
+            names: HashMap::new_in(Global),
+            sets: HashMap::new_in(Global),
+            namespaces: HashMap::new_in(Global),
             variables,
             grouped: false,
             // alloc: empty, allocates nothing: reused for every function
@@ -1313,7 +1322,7 @@ fn place(product: &mut ObjectProduct, sections: Vec<Section>) -> Result<(), Stri
 /// [`place`] for the sections of several [`Dwarf`]s, each of which reads only its own.
 fn place_all(product: &mut ObjectProduct, all: Vec<Vec<Section>>) -> Result<(), String> {
     let macho = product.object.format() == BinaryFormat::MachO;
-    let mut placed = HashMap::default();
+    let mut placed = HashMap::new_in(Global);
     // alloc: once per object, its debug sections
     let mut linked = Vec::new();
     // A section with nothing in it is still there when another says where in it to read. A

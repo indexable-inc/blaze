@@ -8,7 +8,7 @@
 //! the client built of trees it was given back. The output goes back as the tree the kept layer
 //! writes ([`Stream::into_top`]).
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use proc_macro_api::bridge::wire;
 use intern::Symbol;
@@ -94,15 +94,16 @@ impl Tree {
 }
 
 /// A token stream: shared, so that the client's `clone` and the trees of a group given back
-/// copy nothing. The empty stream holds nothing.
+/// copy nothing. The empty stream holds nothing. An `Arc`: a wasm expansion's server, which holds
+/// its streams, goes to the expansion's thread, and its output comes back (`wasm::thread`).
 #[derive(Clone, Default, Debug)]
-pub(crate) struct Stream(Option<Rc<Vec<Tree>>>);
+pub(crate) struct Stream(Option<Arc<Vec<Tree>>>);
 
 impl Stream {
     pub(crate) fn of(trees: Vec<Tree>) -> Stream {
         match trees.is_empty() {
             true => Stream(None),
-            false => Stream(Some(Rc::new(trees))), // alloc: one shared list per stream the macro builds
+            false => Stream(Some(Arc::new(trees))), // alloc: one shared list per stream the macro builds
         }
     }
 
@@ -118,14 +119,14 @@ impl Stream {
     /// `Lrc::make_mut` does.
     pub(crate) fn trees_mut(&mut self) -> &mut Vec<Tree> {
         // alloc: none for a stream given back alone; the edge of a shared one.
-        Rc::make_mut(self.0.get_or_insert_with(Default::default))
+        Arc::make_mut(self.0.get_or_insert_with(Default::default))
     }
 
     /// Its trees, taken from it: copied only when another handle shares them.
     pub(crate) fn into_trees(self) -> Vec<Tree> {
         match self.0 {
             None => Vec::new(), // alloc: none: an empty `Vec`
-            Some(trees) => Rc::try_unwrap(trees).unwrap_or_else(|shared| (*shared).clone()), // clone: a shared stream taken apart
+            Some(trees) => Arc::try_unwrap(trees).unwrap_or_else(|shared| (*shared).clone()), // clone: a shared stream taken apart
         }
     }
 

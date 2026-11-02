@@ -259,9 +259,11 @@ main with all the others, so:
   - Remove it: `ix rm <lane>` when the lane is done.
   - Where an ix VM can't do something, stop and say what is missing; never take it to a dev
     host or the Mac instead.
-- **One worktree per lane, named for it** (`blaze-<lane>-<date>`), with its own
-  `CARGO_TARGET_DIR`. Two lanes building into one target directory wait on each other's lock
-  and overwrite each other's binaries.
+- **One worktree per lane, named for it** (`blaze-<lane>-<date>`). Its build directory is its
+  own without a `CARGO_TARGET_DIR`: blaze builds each workspace root into a directory of its
+  own under blaze's root, never in the checkout ([cargo.md](cargo.md#where-a-build-writes)).
+  Two lanes that pass one `CARGO_TARGET_DIR` still wait on each other's lock and overwrite each
+  other's binaries.
 - **Never `git stash`.** The stash is one stack for every worktree of the repository, so a pop
   can take another lane's changes. Commit work in progress to the lane's branch.
 - **Run harnesses with `RUST_BACKTRACE=0`**, so a test that panics prints its message and
@@ -270,8 +272,8 @@ main with all the others, so:
   waits hours for one large merge meets every other lane's changes at once. For anything the
   fast tier does not cover, run the release train on the branch first
   (`gh workflow run train.yaml --ref <branch>`: everything, without the release).
-- **Clean up when done:** remove the worktree (`git worktree remove`), its target directory
-  and the lane's VM (`ix rm <lane>`); delete the merged branch.
+- **Clean up when done:** remove the worktree's build directory (`blaze clean` in it), the
+  worktree (`git worktree remove`) and the lane's VM (`ix rm <lane>`); delete the merged branch.
 
 ## Landing a change
 

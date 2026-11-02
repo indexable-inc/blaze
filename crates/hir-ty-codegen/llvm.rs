@@ -17,8 +17,8 @@
 //! This module is the crate's one door to LLVM's C API (`vendor/llvm-sys`, whose root states
 //! the contract: who owns each handle, which strings need a NUL, the thread rules). Every
 //! call into it is here or in two children, each behind a safe function:
-//! - this file: the passes kept per target machine ([`Kept`]), the diagnostic handler
-//!   ([`diagnosed`]), the process's command-line options, the host CPU, the byte GEPs the
+//! - this file: the passes kept per target machine ([`Kept`]) and the report they keep
+//!   ([`report`]), the diagnostic handler ([`diagnosed`]), the process's command-line options, the host CPU, the byte GEPs the
 //!   lowering builds ([`byte_offset`]), and the handful of inkwell calls that are `unsafe`
 //!   (deleting a function nothing uses, wrapping a raw call site);
 //! - [`rebase`] and [`release`]: walks of a module's raw IR (use lists, constant expressions,
@@ -27,13 +27,15 @@
 //!
 //! The safe version of all of it is LLVM's own `LLVMRunPasses` and inkwell's safe surface,
 //! which rebuild the pass builder, its analysis managers and a process-wide lock on every run
-//! ([`Kept`]), and cannot reach what `rebase` and `release` read. `lower`, `pgo`, `sanitize`
-//! and `emitted` forbid unsafe code. The values are of one context, the thread's
+//! ([`Kept`]), and cannot reach what `rebase` and `release` read. `lower`, `pgo`, `report`,
+//! `sanitize` and `emitted` forbid unsafe code. The values are of one context, the thread's
 //! ([`Machine`]): no handle crosses threads.
 
-use std::{cell::RefCell, collections::hash_map::Entry, fmt, sync::Once};
+use std::{cell::RefCell, fmt, sync::Once};
+use blaze_hash::hash_map::Entry;
 
 use blaze_hash::{HashMap, HashSet};
+use std::alloc::Global;
 use cranelift_codegen::ir::{self, Opcode, Type};
 use inkwell::{
     AddressSpace, GlobalVisibility, OptimizationLevel,
@@ -69,6 +71,7 @@ mod lower;
 pub(crate) mod pgo;
 mod rebase;
 pub(crate) mod release;
+pub(crate) mod report;
 pub(crate) mod sanitize;
 
 /// What runs again where [`rebase::rebase`] said what addresses are based on: what is stored
@@ -174,6 +177,7 @@ fn compiled(
     imports: &[Import],
 ) -> Result<Unit, Unhandled> {
     let tally = Tally::global();
+    let target = recorder.target;
     let alone = match &members {
         Members::Alone(alone) => Some(alone),
         Members::Unit(_) => None,
@@ -224,7 +228,7 @@ fn compiled(
     let wrapped = alone.is_some()
         && optimization.pipeline().is_some()
         && alone.is_some_and(|it| it.pointees.iter().any(|(_, it)| it.unique))
-        && super::Target::selected().is_ok_and(|it| it.object_format == super::ObjectFormat::MachO);
+        && target.object_format == super::ObjectFormat::MachO;
     let names = requested
         .iter()
         .map(|name| match name {
@@ -236,26 +240,26 @@ fn compiled(
     let defined = std::iter::zip(&names, defined)
         .map(|(&name, defined)| Defined { name, ..defined })
         .collect::<SmallVec<[Defined<'_>; 1]>>();
-    Machine::with(optimization, |context, machine| {
+    Machine::with(target, optimization, |context, machine| {
         let module = context.create_module("blaze");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
         // alloc: once per module; `Wants` (fragment.rs) lists these, and the lowering looks them up
-        let constants: HashMap<u32, &[u8]> = recorder.constants().collect();
+        let constants: HashMap<u32, &[u8], Global> = recorder.constants().collect();
         // alloc: once per module, as `constants`
-        let statics: HashSet<u32> = recorder.statics().collect();
+        let statics: HashSet<u32, Global> = recorder.statics().collect();
         let resume = recorder.resume();
         let memcmp = recorder.memcmp();
         let blocks_asm = recorder.asm_blocks();
         // alloc: once per module, as `constants`
-        let readonly: HashMap<u32, &super::ConstBlob> = recorder.readonly().collect();
+        let readonly: HashMap<u32, &super::ConstBlob, Global> = recorder.readonly().collect();
         told_constants(
             context,
             &module,
             &readonly,
             machine.get_target_data().get_pointer_byte_size(None) as usize,
         );
-        let debug = lower::Debug::of(&module)?;
+        let debug = lower::Debug::of(&module, target, false)?;
         let (shown, failed) = tally.time(Phase::Lower, || {
             // What is wrong with the function of each member, which is then only declared.
             let mut failed = std::iter::repeat_with(|| None::<Unhandled>)
@@ -263,7 +267,7 @@ fn compiled(
                 .collect::<SmallVec<[_; 1]>>();
             let mut functions = Vec::with_capacity(defined.len());
             for (at, defined) in defined.iter().enumerate() {
-                match Lowering::add(context, &module, defined) {
+                match Lowering::add(context, &module, target, defined, super::backend::V1_FRAME_POINTERS) {
                     Ok(function) => functions.push(Some(function)),
                     Err(e) if alone.is_some() => return Err(e),
                     Err(e) => {
@@ -273,12 +277,12 @@ fn compiled(
                 }
             }
             // Each function of a unit is a section of its own, which `emitted` reads as the
-            // code of that function.
-            if alone.is_none() {
-                for (function, name) in std::iter::zip(&functions, &names) {
-                    if let Some(function) = function {
-                        function.as_global_value().set_comdat(module.get_or_insert_comdat(name));
-                    }
+            // code of that function: by a COMDAT of its own where the format has them. Mach-O
+            // has none and keeps the functions apart in `__text` by their symbols
+            // (`.subsections_via_symbols`), which is how `emitted` reads them there.
+            if alone.is_none() && target.object_format.supports_comdat() {
+                for function in functions.iter().flatten() {
+                    own_comdat(&module, target, *function)?;
                 }
             }
             // Before the functions' bodies: their calls of what is imported are of the bodies.
@@ -299,9 +303,9 @@ fn compiled(
                 marked: false,
             }));
             // Every body shown is declared before any is defined, as one may call another.
-            let mut by_id = HashMap::default();
+            let mut by_id = HashMap::new_in(Global);
             for (it, defined) in std::iter::zip(&seen, &shown) {
-                if let Ok(function) = Lowering::add(context, &module, defined) {
+                if let Ok(function) = Lowering::add(context, &module, target, defined, super::backend::V1_FRAME_POINTERS) {
                     mark_hint(context, function, it.hint);
                     by_id.insert(it.id.as_u32(), function);
                 }
@@ -317,6 +321,7 @@ fn compiled(
                 let defined = Lowering::define(
                     context,
                     &module,
+                    target,
                     function,
                     defined,
                     &constants,
@@ -340,6 +345,7 @@ fn compiled(
                 let lowered = Lowering::define(
                     context,
                     &module,
+                    target,
                     function,
                     defined,
                     &constants,
@@ -403,7 +409,10 @@ fn compiled(
                     continue;
                 }
                 body.set_linkage(Linkage::External);
-                body.as_global_value().set_comdat(module.get_or_insert_comdat(&name));
+                // A section of its own, as the members' above.
+                if target.object_format.supports_comdat() {
+                    own_comdat(&module, target, body)?;
+                }
                 kept.push((name, import));
             }
         }
@@ -441,6 +450,28 @@ fn compiled(
             kept: kept.collect(),
         })
     })
+}
+
+/// Puts `function` in a COMDAT of its own, of its name, which has LLVM write its code in a
+/// section of its own. Refused before LLVM sees it for a format without COMDATs
+/// ([`super::ObjectFormat::supports_comdat`]), where LLVM would end the process when it
+/// writes the object instead of answering an error.
+fn own_comdat<'ctx>(
+    module: &Module<'ctx>,
+    target: &super::Target,
+    function: FunctionValue<'ctx>,
+) -> Result<(), Unhandled> {
+    let name = function.get_name().to_string_lossy();
+    if !target.object_format.supports_comdat() {
+        // alloc: the error's message
+        return Err(Unhandled::Llvm(format!(
+            "a COMDAT for `{name}`, which {:?} objects of {} have no place for",
+            target.object_format,
+            target.triple(),
+        )));
+    }
+    function.as_global_value().set_comdat(module.get_or_insert_comdat(&name));
+    Ok(())
 }
 
 /// Leaves `function`, whose body could not be lowered, a declaration of the same name and
@@ -500,6 +531,15 @@ fn wrap<'ctx>(
         .map(Into::into)
         .collect::<SmallVec<[inkwell::values::BasicMetadataValueEnum<'ctx>; 8]>>();
     let call = builder.build_direct_call(inner, &args, "")?;
+    // LLVM's inliner keeps a `musttail` call of the inner function one only where the call it
+    // builds the function into is one too, so the outer call is, with the attributes of what it
+    // passes on: else `become` would grow the stack by a frame each time.
+    if lower::has_musttail(inner) {
+        Lowering::same_abi_attributes(outer, call)
+            // alloc: the error's message
+            .map_err(|why| Unhandled::TailCall(format!("the call of the wrapped function: {why}")))?;
+        call.set_tail_call_kind(inkwell::values::LLVMTailCallKind::LLVMTailCallKindMustTail);
+    }
     match call.try_as_basic_value().basic() {
         Some(returned) => builder.build_return(Some(&returned))?,
         None => builder.build_return(None)?,
@@ -630,26 +670,19 @@ fn mark_hint<'ctx>(context: &'ctx Context, function: FunctionValue<'ctx>, hint: 
 fn mark_features<'ctx>(
     context: &'ctx Context,
     function: FunctionValue<'ctx>,
+    target: &super::Target,
     features: super::Features,
 ) -> Result<(), Unhandled> {
-    let told = told(features)?;
+    let told = told(target, features)?;
     if !told.is_empty() {
-        function.add_attribute(AttributeLoc::Function, context.create_string_attribute("target-features", told));
+        function.add_attribute(AttributeLoc::Function, context.create_string_attribute("target-features", &told));
     }
     Ok(())
 }
 
-/// `features` in LLVM's names for the selected target ([`super::Target::llvm_features`]), made
-/// once per set a process compiles with, and read with no lock after.
-fn told(features: super::Features) -> Result<&'static str, Unhandled> {
-    static TOLD: [std::sync::OnceLock<Box<str>>; super::target::MOST_FEATURE_SETS] =
-        [const { std::sync::OnceLock::new() }; super::target::MOST_FEATURE_SETS];
-    let slot = &TOLD[features.index()];
-    if let Some(told) = slot.get() {
-        return Ok(told);
-    }
-    let made = super::Target::selected().map_err(Unhandled::Llvm)?.llvm_features(features);
-    Ok(slot.get_or_init(|| made.into_boxed_str()))
+/// `features` in LLVM's names for `target` ([`super::Target::llvm_features`]).
+fn told(target: &super::Target, features: super::Features) -> Result<String, Unhandled> {
+    Ok(target.llvm_features(features))
 }
 
 /// The passes an export is simplified by before compiles import it: ThinLTO's pre-link
@@ -677,23 +710,24 @@ pub(super) fn export(
     if func.dfg.num_insts() > super::LARGE {
         return Err(Unhandled::Shape("a body too large to export"));
     }
-    Machine::with(optimization, |context, machine| {
+    Machine::with(recorder.target, optimization, |context, machine| {
         let module = context.create_module("blaze");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
         // alloc: once per export; `Wants` (fragment.rs) lists these, and the lowering looks them up
-        let constants: HashMap<u32, &[u8]> = recorder.constants().collect();
+        let constants: HashMap<u32, &[u8], Global> = recorder.constants().collect();
         // alloc: once per export, as `constants`
-        let statics: HashSet<u32> = recorder.statics().collect();
+        let statics: HashSet<u32, Global> = recorder.statics().collect();
         let own = Defined { name: OWN, func, pointees, named: &[], weights: None, marked: false };
-        let function = Lowering::add(context, &module, &own)?;
+        let function = Lowering::add(context, &module, recorder.target, &own, super::backend::V1_FRAME_POINTERS)?;
         mark_hint(context, function, hint);
-        let shown = HashMap::default();
+        let shown = HashMap::new_in(Global);
         let (resume, memcmp) = (recorder.resume(), recorder.memcmp());
         let blocks_asm = recorder.asm_blocks();
         Lowering::define(
             context,
             &module,
+            recorder.target,
             function,
             &own,
             &constants,
@@ -870,6 +904,20 @@ fn agree_calls<'ctx>(context: &'ctx Context, module: &Module<'ctx>) -> Result<()
                 if through == ty {
                     continue;
                 }
+                // A `musttail` call is of the caller's type, which its callee's must then be:
+                // turned into a call of the callee's type it would not verify.
+                if call.get_tail_call_kind() == inkwell::values::LLVMTailCallKind::LLVMTailCallKindMustTail {
+                    // alloc: the error's message
+                    return Err(Unhandled::TailCall(format!(
+                        "`{}` tail-calls `{}`, whose body has parameters that are pointers where \
+                         the caller's are integers or the other way (`{}` where the caller is \
+                         `{}`), which a `musttail` call can't convert",
+                        function.get_name().to_string_lossy(),
+                        callee.get_name().to_string_lossy(),
+                        ty.print_to_string().to_string_lossy(),
+                        through.print_to_string().to_string_lossy(),
+                    )));
+                }
                 if !Lowering::same_but_pointers(through, ty) {
                     return Err(Unhandled::Shape("an import called with another signature"));
                 }
@@ -986,12 +1034,12 @@ fn unshow<'ctx>(
 /// The object file LLVM's assembler makes of `text`, which is assembly in the syntax
 /// `asm!` is written in. Assembly LLVM rejects is an error naming what it said
 /// ([`diagnosed`]).
-pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
-    Machine::with(Optimization::NONE, |context, machine| {
+pub(super) fn assemble(target: &'static super::Target, text: &str) -> Result<Vec<u8>, String> {
+    Machine::with(target, Optimization::NONE, |context, machine| {
         let module = context.create_module("blaze_asm");
         module.set_triple(&machine.get_triple());
         // What rustc wraps `global_asm!` in, where there are two syntaxes.
-        let text = match super::Target::selected().map_err(Unhandled::Llvm)?.arch {
+        let text = match target.arch {
             // alloc: once per block of assembly the store does not have (`asm::assemble`)
             Arch::X86_64 => format!(".intel_syntax noprefix\n{text}\n.att_syntax\n"),
             // alloc: as above
@@ -1233,6 +1281,14 @@ impl Kept {
         unsafe { LLVMBlazeTakeMismatched(self.0.as_ptr()) }
     }
 
+    /// How many functions the profile the passes use gave counts to (an entry count they had
+    /// not), since this was last asked.
+    fn take_applied(&self) -> u32 {
+        use inkwell::llvm_sys::transforms::pass_builder::LLVMBlazeTakeApplied;
+        // SAFETY: `self.0` is live and used by this thread only, as in `run`.
+        unsafe { LLVMBlazeTakeApplied(self.0.as_ptr()) }
+    }
+
     /// Runs `passes` over `module`, vectorizing straight-line code if `slp`, as
     /// `Module::run_passes` would with `PassBuilderOptions::set_loop_slp_vectorization(slp)`
     /// and nothing else set.
@@ -1252,6 +1308,58 @@ impl Kept {
         };
         // SAFETY: `failed` is what LLVMBlazeRunPasses just returned, taken nowhere else.
         unsafe { Kept::taken(failed) }
+    }
+
+    /// Starts a report ([`report`]): the runs from now on catch the loop vectorizer's remarks.
+    fn report_start(&self) {
+        use inkwell::llvm_sys::transforms::pass_builder::LLVMBlazeReportStart;
+        // SAFETY: `self.0` is live and used by this thread only, as in `run`.
+        unsafe { LLVMBlazeReportStart(self.0.as_ptr()) }
+    }
+
+    /// Ends a report: the runs from now on catch nothing, and what was caught is let go.
+    fn report_stop(&self) {
+        use inkwell::llvm_sys::transforms::pass_builder::LLVMBlazeReportStop;
+        // SAFETY: `self.0` is live and used by this thread only, as in `run`.
+        unsafe { LLVMBlazeReportStop(self.0.as_ptr()) }
+    }
+
+    /// The report since [`Kept::report_start`]: the remarks caught, then what `function`'s
+    /// optimized code keeps in its loops, each with its loop's heat, in the order LLVM made
+    /// them ([`report::Raw`]).
+    fn report_of(&self, function: FunctionValue<'_>) -> Result<Vec<report::Raw>, Unhandled> {
+        use inkwell::llvm_sys::transforms::pass_builder::{LLVMBlazeReportKept, LLVMBlazeReportRow, LLVMBlazeReportRows};
+        use inkwell::values::AsValueRef as _;
+        // SAFETY: `self.0` is live and this thread's (as in `run`); `function` is a live function
+        // of a module of the context the passes ran, which the wrapper only reads.
+        unsafe { LLVMBlazeReportKept(self.0.as_ptr(), function.as_value_ref()) };
+        let mut rows: *const LLVMBlazeReportRow = core::ptr::null();
+        // SAFETY: `self.0` is live; `rows` is written with a pointer to the wrapper's rows.
+        let count = unsafe { LLVMBlazeReportRows(self.0.as_ptr(), &mut rows) };
+        if count == 0 || rows.is_null() {
+            // alloc: empty, allocates nothing
+            return Ok(Vec::new());
+        }
+        // SAFETY: the wrapper's `count` rows start at `rows` and stay live until the next
+        // `LLVMBlazeReport*` call on these passes, which none of what follows makes.
+        let rows = unsafe { core::slice::from_raw_parts(rows, count) };
+        let text = |at: *const core::ffi::c_char, len: usize| -> String {
+            if at.is_null() || len == 0 {
+                // alloc: empty, allocates nothing
+                return String::new();
+            }
+            // SAFETY: `at` points at `len` bytes of a string the wrapper keeps live as `rows`.
+            let bytes = unsafe { core::slice::from_raw_parts(at.cast::<u8>(), len) };
+            // alloc: a finding's text, kept in the function's report
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        // alloc: the function's findings, kept in its report
+        rows.iter()
+            .map(|row| {
+                let (name, message) = (text(row.Name, row.NameLength), text(row.Message, row.MessageLength));
+                report::Raw::of(row.Kind, row.Heat, row.Line, row.LoopLine, row.Count, name, message)
+            })
+            .collect()
     }
 
     /// Instruments `module` for `wanted`: SanitizerCoverage, then MemorySanitizer,
@@ -1343,6 +1451,12 @@ impl Machinery {
         self.passes.take_mismatched()
     }
 
+    /// How many functions the profile the passes use gave counts to, since this was last
+    /// asked.
+    fn take_applied(&self) -> u32 {
+        self.passes.take_applied()
+    }
+
     /// Instruments `module` for the sanitizers `wanted` ([`sanitize::instrument`]).
     fn instrument(
         &self,
@@ -1350,6 +1464,19 @@ impl Machinery {
         wanted: &inkwell::llvm_sys::transforms::pass_builder::LLVMBlazeSanitizers,
     ) -> Result<(), Unhandled> {
         self.passes.instrument(module, wanted)
+    }
+
+    /// Runs `work` with the loop vectorizer's remarks caught, then gives what it returned with
+    /// the report of `function` of what it made ([`report`]): its remarks and what its loops
+    /// keep. The passes catch nothing after, whatever `work` returned.
+    fn reported<'ctx, T>(
+        &self,
+        work: impl FnOnce() -> Result<(T, FunctionValue<'ctx>), Unhandled>,
+    ) -> Result<(T, Vec<report::Raw>), Unhandled> {
+        self.passes.report_start();
+        let done = work().and_then(|(value, function)| Ok((value, self.passes.report_of(function)?)));
+        self.passes.report_stop();
+        done
     }
 }
 
@@ -1368,10 +1495,11 @@ impl std::ops::Deref for Machinery {
 /// go of it at the next function, by when a context of that one module would be gone.
 #[derive(Default)]
 struct Machine {
-    // Before the context, which has to outlive them and their passes. By level, what they
-    // build with for PGO and the target features they are told: a daemon builds a dev job
+    // Before the context, which has to outlive them and their passes. By target (its
+    // `Target::index`), level, what they build with for PGO and the target features they are
+    // told: a daemon builds a dev job
     // with the host's and a release job with the baseline's.
-    machines: HashMap<(Optimization, Option<pgo::Wanted>, super::Features), Machinery>,
+    machines: HashMap<(usize, Optimization, Option<pgo::Wanted>, super::Features), Machinery, Global>,
     context: Option<Context>,
     /// How many modules were made in the context.
     modules: usize,
@@ -1382,17 +1510,20 @@ impl Machine {
     /// of them stay in it.
     const MODULES: usize = 1024;
 
-    /// The thread's machine of `optimization` for the baseline: v1's compiles, the assembler.
+    /// The thread's machine of `target` and `optimization` for the baseline: v1's compiles,
+    /// the assembler.
     fn with<T>(
+        target: &'static super::Target,
         optimization: Optimization,
         work: impl FnOnce(&Context, &Machinery) -> Result<T, Unhandled>,
     ) -> Result<T, Unhandled> {
-        Self::with_pgo(optimization, None, super::Features::BASELINE, work)
+        Self::with_pgo(target, optimization, None, super::Features::BASELINE, work)
     }
 
     /// [`Machine::with`], with passes that build for `pgo` ([`Machinery::profiled`]), told the
     /// target features `features` ([`Machine::create_for`]).
     fn with_pgo<T>(
+        target: &'static super::Target,
         optimization: Optimization,
         pgo: Option<pgo::Wanted>,
         features: super::Features,
@@ -1406,10 +1537,10 @@ impl Machine {
                 *this = Machine::default();
             }
             this.modules += 1;
-            let machine = match this.machines.entry((optimization, pgo, features)) {
+            let machine = match this.machines.entry((target.index(), optimization, pgo, features)) {
                 Entry::Occupied(known) => known.into_mut(),
                 Entry::Vacant(slot) => {
-                    let machine = Self::create_for(optimization, features)?;
+                    let machine = Self::create_for(target, optimization, features)?;
                     slot.insert(match pgo {
                         None => Machinery::new(machine),
                         Some(wanted) => Machinery::profiled(machine, wanted)?,
@@ -1429,38 +1560,56 @@ impl Machine {
         })
     }
 
-    fn create(optimization: Optimization) -> Result<TargetMachine, Unhandled> {
-        Self::create_for(optimization, super::Features::BASELINE)
+    fn create(target: &super::Target, optimization: Optimization) -> Result<TargetMachine, Unhandled> {
+        Self::create_for(target, optimization, super::Features::BASELINE)
     }
 
-    /// A target machine of the baseline CPU told `features` in LLVM's names
+    /// A target machine of `target`'s baseline CPU told `features` in LLVM's names
     /// ([`super::Target::llvm_features`]), as rustc tells its own the features of
     /// `-C target-feature` and `-C target-cpu`. A name LLVM's target lacks is an error naming
     /// it, never left out.
-    fn create_for(optimization: Optimization, features: super::Features) -> Result<TargetMachine, Unhandled> {
-        let emitted = super::Target::selected().map_err(Unhandled::Llvm)?;
+    fn create_for(
+        emitted: &super::Target,
+        optimization: Optimization,
+        features: super::Features,
+    ) -> Result<TargetMachine, Unhandled> {
         set_options(emitted.arch);
         match emitted.arch {
             Arch::X86_64 => Target::initialize_x86(&InitializationConfig::default()),
             Arch::Aarch64 => Target::initialize_aarch64(&InitializationConfig::default()),
-            // The lowering of `wasm.rs` produces a module's functions.
-            // alloc: the error's message
-            Arch::Wasm32 => return Err(Unhandled::Llvm("no LLVM producer for wasm32".to_owned())),
+            #[cfg(feature = "llvm-wasm")]
+            Arch::Wasm32 => Target::initialize_webassembly(&InitializationConfig::default()),
+            // The pinned LLVM (`llvm.json`) is built without the WebAssembly target, so its
+            // initializer is not in the library this links.
+            #[cfg(not(feature = "llvm-wasm"))]
+            Arch::Wasm32 => {
+                return Err(Unhandled::Llvm(
+                    "no LLVM producer for wasm32: blaze's LLVM (llvm.json) is built without the \
+                     WebAssembly target, and blaze is built without `llvm-wasm`"
+                        // alloc: the error's message
+                        .to_owned(),
+                ));
+            }
         }
         let name = emitted.triple();
         let triple = TargetTriple::create(name);
         let target = Target::from_triple(&triple)
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into()))?;
         // The baseline CPU, as rustc compiles for; position-independent, as the rest of
-        // the program is.
-        let told = told(features)?;
+        // the program is. A wasm module is static, as rustc's wasm targets are: its code is
+        // reached by index and its data placed at link.
+        let told = told(emitted, features)?;
+        let relocation = match emitted.arch {
+            Arch::X86_64 | Arch::Aarch64 => RelocMode::PIC,
+            Arch::Wasm32 => RelocMode::Static,
+        };
         let machine = target
             .create_target_machine(
                 &triple,
                 emitted.cpu(),
-                told,
+                &told,
                 optimization.level(),
-                RelocMode::PIC,
+                relocation,
                 CodeModel::Default,
             )
             // alloc: an error
@@ -1584,7 +1733,7 @@ impl std::ops::Deref for SymbolName {
 fn told_constants<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
-    readonly: &HashMap<u32, &super::ConstBlob>,
+    readonly: &HashMap<u32, &super::ConstBlob, Global>,
     pointer: usize,
 ) {
     let i8 = context.i8_type();
@@ -1677,7 +1826,7 @@ fn told_constants<'ctx>(
 fn retold_bytes<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
-    readonly: &HashMap<u32, &super::ConstBlob>,
+    readonly: &HashMap<u32, &super::ConstBlob, Global>,
 ) {
     for (&index, blob) in readonly {
         if !blob.points_nowhere() || blob.bytes.is_empty() {
@@ -1706,6 +1855,10 @@ pub enum Unhandled {
     /// A relocation type of the object format, by its number.
     Relocation(u32),
     Llvm(String),
+    /// A `return_call` (Rust's `become`) that LLVM can't make a `musttail` call of, with what
+    /// stops it: LLVM guarantees the tail call only where the callee is called through the
+    /// caller's own type and parameter attributes.
+    TailCall(String),
 }
 
 impl fmt::Display for Unhandled {
@@ -1719,6 +1872,7 @@ impl fmt::Display for Unhandled {
             Unhandled::Llvm(message) => {
                 write!(f, "llvm: {}", message.lines().next().unwrap_or_default())
             }
+            Unhandled::TailCall(why) => write!(f, "a tail call (`become`) LLVM can't guarantee: {why}"),
         }
     }
 }
@@ -1728,6 +1882,17 @@ mod tests {
     use inkwell::{memory_buffer::MemoryBuffer, passes::PassBuilderOptions, values::AnyValue};
 
     use super::*;
+
+    #[cfg(not(feature = "llvm-wasm"))]
+    #[test]
+    fn wasm32_is_refused_by_name_while_blazes_llvm_has_no_webassembly() {
+        let wasm32 = crate::Target::of("wasm32-wasip1").unwrap();
+        match Machine::create(wasm32, Optimization::NONE) {
+            Err(Unhandled::Llvm(what)) => assert!(what.contains("wasm32") && what.contains("llvm-wasm"), "{what}"),
+            Err(other) => panic!("{other:?}"),
+            Ok(_) => panic!("a target machine from an LLVM without WebAssembly"),
+        }
+    }
 
     /// Reduced with `llvm-reduce` from a function of bun 1.4.3 at `-O3` on AArch64, where one
     /// run of instruction combining after `default<O3>` leaves more to combine.
@@ -1842,7 +2007,7 @@ define void @"blaze.own"(ptr %to, i64 %from) {
 
         let optimization =
             Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
-        let machine = Machine::create(optimization).unwrap();
+        let machine = Machine::create(crate::Target::for_host(), optimization).unwrap();
         let pipeline = optimization.pipeline().unwrap();
         module.run_passes(pipeline, &machine, PassBuilderOptions::create()).unwrap();
         module.run_passes("elim-avail-extern", &machine, PassBuilderOptions::create()).unwrap();
@@ -1905,7 +2070,7 @@ define void @"blaze.own"(ptr %to, i64 %from) {
 
         let optimization =
             Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
-        let machine = Machine::create(optimization).unwrap();
+        let machine = Machine::create(crate::Target::for_host(), optimization).unwrap();
         let pipeline = optimization.pipeline().unwrap();
         module.run_passes(pipeline, &machine, PassBuilderOptions::create()).unwrap();
         module.run_passes("elim-avail-extern", &machine, PassBuilderOptions::create()).unwrap();
@@ -1938,14 +2103,43 @@ define void @"blaze.own"(ptr %to, i64 %from) {
     /// by the other names the callee's request, and the constant both load is one object.
     #[test]
     fn a_unit_reads_back_each_function_with_its_calls_and_constants() {
+        reads_back_a_unit_of_two(crate::Target::for_host());
+    }
+
+    /// The unit of [`a_unit_reads_back_each_function_with_its_calls_and_constants`] for each
+    /// object format: ELF has each function in a section of its own by a COMDAT, Mach-O,
+    /// which has no COMDATs (LLVM ends the process on one), in `__text` by its symbol.
+    #[test]
+    fn a_unit_reads_back_from_mach_o_and_elf_alike() {
+        for triple in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"] {
+            reads_back_a_unit_of_two(crate::Target::of(triple).unwrap());
+        }
+    }
+
+    /// A COMDAT for a format without them is an error naming the function and the target,
+    /// before LLVM is given it.
+    #[test]
+    fn a_comdat_on_mach_o_is_refused_by_name() {
+        let context = Context::create();
+        let module = context.create_module("blaze");
+        let function = module.add_function("blaze.f.3", context.void_type().fn_type(&[], false), None);
+        let apple = crate::Target::of("aarch64-apple-darwin").unwrap();
+        let refused = own_comdat(&module, apple, function).unwrap_err().to_string();
+        assert!(refused.contains("blaze.f.3") && refused.contains("aarch64-apple-darwin"), "{refused}");
+        assert!(function.as_global_value().get_comdat().is_none());
+        own_comdat(&module, crate::Target::x86_64_linux(), function).unwrap();
+        assert!(function.as_global_value().get_comdat().is_some());
+    }
+
+    fn reads_back_a_unit_of_two(target: &'static crate::Target) {
         use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types::F64};
         use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
         use cranelift_module::FuncId;
 
         use super::super::fragment::{FuncTarget, RelocName};
 
-        let isa = super::super::target().unwrap();
-        let mut wants = Wants::new(&**isa);
+        let isa = super::super::isa_for(target).unwrap();
+        let mut wants = Wants::new(target, &**isa);
         let mut sig = ir::Signature::new(isa.default_call_conv());
         sig.params.push(AbiParam::new(F64));
         sig.returns.push(AbiParam::new(F64));
@@ -2030,8 +2224,8 @@ define double @"blaze.own"(double %x) #0 {
 }
 attributes #0 = { alwaysinline }
 "#;
-        let isa = super::super::target().unwrap();
-        let mut wants = Wants::new(&**isa);
+        let isa = super::super::isa_for(crate::Target::for_host()).unwrap();
+        let mut wants = Wants::new(crate::Target::for_host(), &**isa);
         let mut sig = ir::Signature::new(isa.default_call_conv());
         sig.params.push(AbiParam::new(F64));
         sig.returns.push(AbiParam::new(F64));
@@ -2086,7 +2280,7 @@ attributes #0 = { alwaysinline }
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn assembly_llvm_cannot_encode_is_an_error() {
-        let refused = assemble("mov ah, sil\nret").unwrap_err();
+        let refused = assemble(crate::Target::for_host(), "mov ah, sil\nret").unwrap_err();
         assert!(refused.contains("can't encode 'ah'"), "{refused}");
     }
 
@@ -2097,8 +2291,8 @@ attributes #0 = { alwaysinline }
         use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types::I64};
         use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
-        let isa = super::super::target().unwrap();
-        let mut wants = Wants::new(&**isa);
+        let isa = super::super::isa_for(crate::Target::for_host()).unwrap();
+        let mut wants = Wants::new(crate::Target::for_host(), &**isa);
         let mut sig = ir::Signature::new(isa.default_call_conv());
         sig.returns.push(AbiParam::new(I64));
         let mut func = ir::Function::with_name_signature(UserFuncName::default(), sig);
@@ -2122,25 +2316,25 @@ attributes #0 = { alwaysinline }
     /// and a name LLVM's target lacks is an error naming it, not a machine of fewer features.
     #[test]
     fn a_machine_is_told_its_features_and_refuses_one_llvm_lacks() {
-        let target = super::super::Target::selected().unwrap();
+        let target = crate::Target::for_host();
         let wanted = match target.arch {
             Arch::X86_64 => "+avx2",
             Arch::Aarch64 => "+dotprod",
             Arch::Wasm32 => return,
         };
         let set = target.features_of(&[wanted.to_owned()]).unwrap();
-        let machine = Machine::create_for(Optimization::NONE, set).unwrap();
+        let machine = Machine::create_for(crate::Target::for_host(), Optimization::NONE, set).unwrap();
         let told = |it: &TargetMachine| it.get_feature_string().to_string_lossy().into_owned();
         assert!(told(&machine).contains(wanted), "{}", told(&machine));
-        let baseline = Machine::create(Optimization::NONE).unwrap();
+        let baseline = Machine::create(crate::Target::for_host(), Optimization::NONE).unwrap();
         assert!(!told(&baseline).contains(wanted), "{}", told(&baseline));
         let unknown = target.features_of(&["+no-such-feature".to_owned()]).unwrap();
-        let Err(Unhandled::Llvm(refused)) = Machine::create_for(Optimization::NONE, unknown) else {
+        let Err(Unhandled::Llvm(refused)) = Machine::create_for(crate::Target::for_host(), Optimization::NONE, unknown) else {
             panic!("a machine told a feature LLVM lacks");
         };
         assert!(refused.contains("no-such-feature"), "{refused}");
-        let with_set = Machine::with_pgo(Optimization::NONE, None, set, |_, it| Ok(told(it))).unwrap();
-        let without = Machine::with(Optimization::NONE, |_, it| Ok(told(it))).unwrap();
+        let with_set = Machine::with_pgo(crate::Target::for_host(), Optimization::NONE, None, set, |_, it| Ok(told(it))).unwrap();
+        let without = Machine::with(crate::Target::for_host(), Optimization::NONE, |_, it| Ok(told(it))).unwrap();
         assert!(with_set.contains(wanted) && !without.contains(wanted), "{with_set} {without}");
     }
 
@@ -2151,8 +2345,8 @@ attributes #0 = { alwaysinline }
         let optimization =
             Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
         let context = Context::create();
-        let machinery = Machinery::new(Machine::create(optimization).unwrap());
-        let fresh = Machine::create(optimization).unwrap();
+        let machinery = Machinery::new(Machine::create(crate::Target::for_host(), optimization).unwrap());
+        let fresh = Machine::create(crate::Target::for_host(), optimization).unwrap();
         let pipelines = [
             optimization.pipeline().unwrap(),
             Optimization { passes: Passes::Default, ..optimization }.pipeline().unwrap(),
@@ -2199,7 +2393,7 @@ attributes #0 = { alwaysinline }
     fn instruction_combining_short_of_a_fixpoint_does_not_abort() {
         let optimization =
             Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
-        let machine = Machine::create(optimization).unwrap();
+        let machine = Machine::create(crate::Target::for_host(), optimization).unwrap();
         let context = Context::create();
         // LLVM reads to a nul.
         let text = format!("{SHORT_OF_A_FIXPOINT}\0");
@@ -2235,5 +2429,259 @@ attributes #0 = { alwaysinline }
         // Unpositioned, the builder refuses as inkwell's own call does.
         let loose = context.create_builder();
         assert!(byte_offset(&loose, &context, base, by).is_err());
+    }
+
+    /// The text of the module `func` lowers to as the function being compiled, whose
+    /// parameters point to `pointees`, once it verifies, and once `pipeline` ran over it (and
+    /// it verified again) if one is given.
+    fn lowered_alone(
+        func: &ir::Function,
+        pointees: &[(u32, super::super::fragment::Pointee)],
+        pipeline: Option<&str>,
+    ) -> Result<String, Unhandled> {
+        let target = crate::Target::for_host();
+        let context = Context::create();
+        let module = context.create_module("tail");
+        let own = Defined { name: OWN, func, pointees, named: &[], weights: None, marked: false };
+        let function = Lowering::add(&context, &module, target, &own, false)?;
+        let constants: HashMap<u32, &[u8], Global> = HashMap::new_in(Global);
+        let statics: HashSet<u32, Global> = HashSet::new_in(Global);
+        let blocks_asm: HashMap<u32, &'static crate::asm::Inline, Global> = HashMap::new_in(Global);
+        let shown: HashMap<u32, FunctionValue<'_>, Global> = HashMap::new_in(Global);
+        Lowering::define(
+            &context, &module, target, function, &own, &constants, &statics, None, None,
+            &blocks_asm, &shown, None,
+        )?;
+        let verified = |module: &Module<'_>| {
+            module.verify().map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))
+        };
+        verified(&module)?;
+        if let Some(pipeline) = pipeline {
+            let optimization =
+                Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
+            let machine = Machine::create(target, optimization)?;
+            module.set_triple(&machine.get_triple());
+            module.set_data_layout(&machine.get_target_data().get_data_layout());
+            Machinery::new(machine).run(&module, pipeline, true)?;
+            verified(&module)?;
+        }
+        Ok(module.print_to_string().to_string())
+    }
+
+    /// Each `musttail` call of `text` is followed by a `ret`, and there is one.
+    fn musttail_then_ret(text: &str) {
+        let lines: Vec<&str> = text.lines().collect();
+        let calls = lines.iter().enumerate().filter(|(_, it)| it.contains("musttail call"));
+        let mut found = 0;
+        for (at, call) in calls {
+            found += 1;
+            let next = lines.get(at + 1).map_or("", |it| it.trim_start());
+            assert!(next.starts_with("ret "), "`{call}` is followed by `{next}`:\n{text}");
+        }
+        assert!(found > 0, "no `musttail` call:\n{text}");
+    }
+
+    /// `n, acc, rest...` in a function of `sig`, all `i64`: `acc` once `n` is 0, else what
+    /// `tail` makes of the parameters and of `n - 1, acc + 1, rest...` in the builder, a tail
+    /// call.
+    fn counting_down(
+        sig: &ir::Signature,
+        config: cranelift_codegen::isa::TargetFrontendConfig,
+        tail: impl FnOnce(&mut cranelift_frontend::FunctionBuilder<'_>, &[ir::Value], &[ir::Value]),
+    ) -> ir::Function {
+        use cranelift_codegen::ir::{InstBuilder, UserFuncName, types::I64};
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+        let mut func = ir::Function::with_name_signature(UserFuncName::default(), sig.clone());
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut context);
+        let (entry, again, done) =
+            (builder.create_block(), builder.create_block(), builder.create_block());
+        builder.append_block_params_for_function_params(entry);
+        builder.append_block_param(done, I64);
+        builder.switch_to_block(entry);
+        let params = builder.block_params(entry).to_vec();
+        builder.ins().brif(params[0], again, &[], done, &[params[1].into()]);
+        builder.switch_to_block(again);
+        let mut args = params.clone();
+        let (less, one) = (builder.ins().iconst(I64, -1), builder.ins().iconst(I64, 1));
+        args[0] = builder.ins().iadd(params[0], less);
+        args[1] = builder.ins().iadd(params[1], one);
+        tail(&mut builder, &params, &args);
+        builder.switch_to_block(done);
+        let acc = builder.block_params(done)[0];
+        builder.ins().return_(&[acc]);
+        builder.seal_all_blocks();
+        builder.finalize(config);
+        func
+    }
+
+    /// `become f(n - 1, acc + 1, ...)` in `f` is a `musttail` call of `f`'s request followed by
+    /// the `ret` of what it returns, with arguments in registers only and with some on the
+    /// stack; LLVM's optimizing pipeline keeps every call of it `musttail`, and the code reads
+    /// back with the call as a relocation to the request.
+    #[test]
+    fn a_tail_call_of_itself_is_musttail_then_ret_with_arguments_on_the_stack_too() {
+        use cranelift_codegen::ir::{AbiParam, InstBuilder, types::I64};
+
+        use super::super::fragment::{FuncTarget, RelocName};
+
+        let isa = super::super::isa_for(crate::Target::for_host()).unwrap();
+        // Twelve take more than the registers of SysV x86-64 (6) and AArch64 (8).
+        for count in [2, 12] {
+            let mut wants = Wants::new(crate::Target::for_host(), &**isa);
+            let mut sig = ir::Signature::new(isa.default_call_conv());
+            sig.params.extend(std::iter::repeat_n(AbiParam::new(I64), count));
+            sig.returns.push(AbiParam::new(I64));
+            let own = wants.func(FuncTarget::Symbol("counting down".into()), &sig);
+            let func = counting_down(&sig, isa.frontend_config(), |builder, _, args| {
+                let callee = wants.declare_func_in_func(own, builder.func);
+                builder.ins().return_call(callee, args);
+            });
+            let text = lowered_alone(&func, &[], None).unwrap();
+            musttail_then_ret(&text);
+            let optimized = optimized_pipeline();
+            let text = lowered_alone(&func, &[], Some(optimized)).unwrap();
+            let request = Symbol::Func(own.as_u32()).named();
+            let calls = text.lines().filter(|it| it.contains(&format!("@{}(", request.bare())));
+            for call in calls.filter(|it| it.contains("call ")) {
+                assert!(call.contains("musttail call"), "{count}: `{call}`:\n{text}");
+            }
+            for optimization in [Optimization::NONE, optimized_level()] {
+                let code = emit(&mut wants, &[], &func, optimization, None, &[]).unwrap();
+                let calls = code.relocs.iter().filter(|it| it.name == RelocName::Func(own.as_u32()));
+                assert!(calls.count() > 0, "{count}: {:?}", code.relocs);
+            }
+        }
+    }
+
+    fn optimized_level() -> Optimization {
+        Optimization { passes: Passes::Aggressive, selection: Selection::Optimized }
+    }
+
+    fn optimized_pipeline() -> &'static str {
+        optimized_level().pipeline().unwrap()
+    }
+
+    /// A function that returns through `sret` and tail-calls another that does passes its own
+    /// `sret` on, with the attribute at the call; a pointer parameter of the caller is passed
+    /// an integer and an integer one a pointer, each turned into what the caller has there,
+    /// and the whole compile (wrapped on Mach-O, where the pointer is the only way to its
+    /// memory) keeps the call.
+    #[test]
+    fn a_tail_call_passes_on_sret_and_converts_pointers_to_the_callers_types() {
+        use cranelift_codegen::ir::{AbiParam, ArgumentPurpose, InstBuilder, MemFlagsData, types::I64};
+
+        use super::super::fragment::{FuncTarget, Pointee};
+
+        let isa = super::super::isa_for(crate::Target::for_host()).unwrap();
+        let mut wants = Wants::new(crate::Target::for_host(), &**isa);
+
+        let mut sig = ir::Signature::new(isa.default_call_conv());
+        sig.params.push(AbiParam::special(I64, ArgumentPurpose::StructReturn));
+        sig.params.push(AbiParam::new(I64));
+        let other = wants.func(FuncTarget::Symbol("returns through memory".into()), &sig);
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig.clone());
+        let callee = wants.declare_func_in_func(other, &mut func);
+        {
+            let mut context = cranelift_frontend::FunctionBuilderContext::new();
+            let mut builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut context);
+            let block = builder.create_block();
+            builder.append_block_params_for_function_params(block);
+            builder.switch_to_block(block);
+            let [to, n] = *builder.block_params(block) else { unreachable!() };
+            builder.ins().store(MemFlagsData::new().with_notrap(), n, to, 0);
+            let one = builder.ins().iconst(I64, 1);
+            let less = builder.ins().isub(n, one);
+            builder.ins().return_call(callee, &[to, less]);
+            builder.seal_all_blocks();
+            builder.finalize(isa.frontend_config());
+        }
+        let text = lowered_alone(&func, &[], None).unwrap();
+        musttail_then_ret(&text);
+        let call = text.lines().find(|it| it.contains("musttail call")).unwrap();
+        assert!(call.contains("sret(i8)") && call.contains("%0, i64 %"), "{call}");
+        assert!(text.contains("ret void"), "{text}");
+
+        let mut sig = ir::Signature::new(isa.default_call_conv());
+        sig.params.extend([AbiParam::new(I64), AbiParam::new(I64)]);
+        sig.returns.push(AbiParam::new(I64));
+        let other = wants.func(FuncTarget::Symbol("swapped".into()), &sig);
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig.clone());
+        let callee = wants.declare_func_in_func(other, &mut func);
+        {
+            let mut context = cranelift_frontend::FunctionBuilderContext::new();
+            let mut builder = cranelift_frontend::FunctionBuilder::new(&mut func, &mut context);
+            let block = builder.create_block();
+            builder.append_block_params_for_function_params(block);
+            builder.switch_to_block(block);
+            let [address, n] = *builder.block_params(block) else { unreachable!() };
+            let eight = builder.ins().iconst(I64, 8);
+            let past = builder.ins().iadd(address, eight);
+            builder.ins().return_call(callee, &[n, past]);
+            builder.seal_all_blocks();
+            builder.finalize(isa.frontend_config());
+        }
+        let pointee = Pointee { unique: true, frozen: false, size: 16, align: 8 };
+        let text = lowered_alone(&func, &[(0, pointee)], None).unwrap();
+        musttail_then_ret(&text);
+        assert!(text.contains("define i64 @blaze.own(ptr"), "{text}");
+        assert!(text.contains("inttoptr i64 %"), "{text}");
+        assert!(text.contains("ptrtoint ptr %"), "{text}");
+        let call = text.lines().find(|it| it.contains("musttail call")).unwrap();
+        assert!(call.contains("(ptr %") && call.contains(", i64 %"), "{call}");
+        wants.pointees = vec![(0, pointee)];
+        emit(&mut wants, &[], &func, optimized_level(), None, &[]).unwrap();
+    }
+
+    /// `return_call_indirect` is a `musttail` call through the pointer, of the caller's type.
+    #[test]
+    fn an_indirect_tail_call_is_musttail_then_ret() {
+        use cranelift_codegen::ir::{AbiParam, InstBuilder, types::I64};
+
+        let isa = super::super::isa_for(crate::Target::for_host()).unwrap();
+        let mut sig = ir::Signature::new(isa.default_call_conv());
+        sig.params.extend([AbiParam::new(I64), AbiParam::new(I64)]);
+        sig.returns.push(AbiParam::new(I64));
+        // `(n, f)`: `f`, the function itself, is passed on and called.
+        let func = counting_down(&sig, isa.frontend_config(), |builder, params, args| {
+            let called = builder.import_signature(sig.clone());
+            builder.ins().return_call_indirect(called, params[1], &[args[0], params[1]]);
+        });
+        let text = lowered_alone(&func, &[], None).unwrap();
+        musttail_then_ret(&text);
+        let call = text.lines().find(|it| it.contains("musttail call")).unwrap();
+        assert!(call.contains("musttail call i64 %"), "{call}");
+    }
+
+    /// A tail call of a callee that takes other parameters than the caller, as a call through
+    /// a vtable does (the receiver one pointer where the caller has two), is refused, naming
+    /// both signatures, rather than made a call that grows the stack.
+    #[test]
+    fn a_tail_call_of_other_parameters_is_refused() {
+        use cranelift_codegen::ir::{AbiParam, InstBuilder, types::I64};
+
+        let isa = super::super::isa_for(crate::Target::for_host()).unwrap();
+        let mut wants = Wants::new(crate::Target::for_host(), &**isa);
+        let mut sig = ir::Signature::new(isa.default_call_conv());
+        sig.params.extend([AbiParam::new(I64), AbiParam::new(I64)]);
+        sig.returns.push(AbiParam::new(I64));
+        let mut method = ir::Signature::new(isa.default_call_conv());
+        method.params.push(AbiParam::new(I64));
+        method.returns.push(AbiParam::new(I64));
+        let func = counting_down(&sig, isa.frontend_config(), |builder, params, args| {
+            let called = builder.import_signature(method.clone());
+            builder.ins().return_call_indirect(called, params[1], &[args[0]]);
+        });
+        let Err(Unhandled::TailCall(why)) = lowered_alone(&func, &[], None) else {
+            panic!("a tail call of one parameter from a function of two was lowered");
+        };
+        assert!(why.contains("passes 1 parameters") && why.contains("the caller has 2"), "{why}");
+        let Err(refused) = emit(&mut wants, &[], &func, Optimization::NONE, None, &[]) else {
+            panic!("a tail call of one parameter from a function of two was emitted");
+        };
+        assert!(matches!(&refused, Unhandled::TailCall(it) if *it == why), "{refused:?}");
+        let error = super::super::CodegenError::LlvmRefused(refused).to_string();
+        assert!(error.contains("tail call") && error.contains("vtable"), "{error}");
     }
 }

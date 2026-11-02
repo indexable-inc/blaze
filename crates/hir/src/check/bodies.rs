@@ -15,14 +15,12 @@
 
 use std::{
     ptr,
-    sync::{
-        OnceLock,
-        atomic::{AtomicBool, AtomicU32, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use std::alloc::Global;
 use blaze_ids::bits::AtomicBits;
 use blaze_mem::Tag;
 use hir_def::{
@@ -100,7 +98,8 @@ pub struct Plan<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> {
     /// Each task's work, in the order the batch gives them: a module, then its bodies.
     tasks: Vec<u32>,
     /// Each listed body's index in `bodies`, made on the first [`Plan::reached`].
-    index: OnceLock<HashMap<DefWithBodyId, u32>>,
+    #[expect(clippy::disallowed_types, reason = "body index, set once per check plan: not global")]
+    index: std::sync::OnceLock<HashMap<DefWithBodyId, u32, Global>>,
     queue: Queue,
     started: AtomicBool,
     #[cfg(test)]
@@ -119,7 +118,8 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             crate_ends.push(u32::try_from(modules.len()).expect("a check of fewer than 2^31 modules"));
         }
         assert!(modules.len() < MODULE as usize, "a check of fewer than 2^31 modules");
-        let lists: Vec<OnceLock<Vec<Planned>>> = modules.iter().map(|_| OnceLock::new()).collect();
+        #[expect(clippy::disallowed_types, reason = "body lists, set once per module of the check plan: not global")]
+        let lists: Vec<std::sync::OnceLock<Vec<Planned>>> = modules.iter().map(|_| std::sync::OnceLock::new()).collect();
         db.run_all(Tag::Infer, modules.len(), |db, at| {
             let mut out = Vec::new();
             list_module(db, modules[at].id, asked, &mut out);
@@ -146,7 +146,7 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             starts,
             bodies,
             tasks,
-            index: OnceLock::new(),
+            index: Default::default(),
             queue,
             started: AtomicBool::new(false),
             #[cfg(test)]
@@ -160,7 +160,7 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     /// thread, before or while the plan runs.
     pub fn reached(&self, defs: &[DefWithBodyId]) {
         let index = self.index.get_or_init(|| {
-            let mut index = HashMap::default();
+            let mut index = HashMap::new_in(Global);
             index.reserve(self.bodies.len());
             index.extend(self.bodies.iter().enumerate().map(|(at, it)| (it.def, at as u32)));
             index
@@ -177,9 +177,11 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     /// the other. A plan runs once.
     pub fn run<'db>(&self, db: &'db Db, style_lints: bool) -> Vec<Vec<AnyDiagnostic<'db>>> {
         assert!(!self.started.swap(true, Ordering::Relaxed), "a plan of a check runs once");
-        let modules: Vec<OnceLock<Checked<'db>>> = self.modules.iter().map(|_| OnceLock::new()).collect();
-        let bodies: Vec<OnceLock<Vec<AnyDiagnostic<'db>>>> =
-            self.bodies.iter().map(|_| OnceLock::new()).collect();
+        #[expect(clippy::disallowed_types, reason = "diagnostics and marks, set once per module of the check: not global")]
+        let modules: Vec<std::sync::OnceLock<Checked<'db>>> = self.modules.iter().map(|_| std::sync::OnceLock::new()).collect();
+        #[expect(clippy::disallowed_types, reason = "diagnostics, set once per body of the check: not global")]
+        let bodies: Vec<std::sync::OnceLock<Vec<AnyDiagnostic<'db>>>> =
+            self.bodies.iter().map(|_| std::sync::OnceLock::new()).collect();
         let slots = Slots { modules: &modules, bodies: &bodies };
         let home = ptr::from_ref(db).cast::<()>().addr();
         db.run_all(Tag::Infer, self.tasks.len(), |task_db, task| {
@@ -253,10 +255,11 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     }
 
     /// Each crate's diagnostics: each module's, with each of its bodies' at its mark.
+    #[expect(clippy::disallowed_types, reason = "diagnostic slots, set once per module or body of the check: not global")]
     fn assemble<'db>(
         &self,
-        modules: Vec<OnceLock<Checked<'db>>>,
-        mut bodies: Vec<OnceLock<Vec<AnyDiagnostic<'db>>>>,
+        modules: Vec<std::sync::OnceLock<Checked<'db>>>,
+        mut bodies: Vec<std::sync::OnceLock<Vec<AnyDiagnostic<'db>>>>,
     ) -> Vec<Vec<AnyDiagnostic<'db>>> {
         let mut out = Vec::with_capacity(self.crate_ends.len());
         let mut modules = modules.into_iter().enumerate();
@@ -303,8 +306,10 @@ type Checked<'db> = (Vec<AnyDiagnostic<'db>>, Vec<u32>);
 /// The slots a run's tasks write, each once.
 #[derive(Clone, Copy)]
 struct Slots<'a, 'db> {
-    modules: &'a [OnceLock<Checked<'db>>],
-    bodies: &'a [OnceLock<Vec<AnyDiagnostic<'db>>>],
+    #[expect(clippy::disallowed_types, reason = "diagnostics and marks, set once per module of the check: not global")]
+    modules: &'a [std::sync::OnceLock<Checked<'db>>],
+    #[expect(clippy::disallowed_types, reason = "diagnostics, set once per body of the check: not global")]
+    bodies: &'a [std::sync::OnceLock<Vec<AnyDiagnostic<'db>>>],
 }
 
 /// Appends to `out` the bodies the collector meets at `module`'s level, in its order

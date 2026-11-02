@@ -14,10 +14,7 @@ mod table;
 #[cfg(test)]
 mod tests;
 
-use std::{
-    hash::{Hash, Hasher},
-    sync::LazyLock,
-};
+use std::hash::{Hash, Hasher};
 
 use base_db::Nonce;
 use blaze_hash::FixedHasher;
@@ -116,8 +113,9 @@ enum Answer {
 /// scope) triples checked in one revision, across every crate being checked.
 const PICK_BITS: u32 = 16;
 
-static PICKS: LazyLock<Table<PickKey, View, Cached>> =
-    LazyLock::new(|| Table::new(PICK_BITS));
+#[expect(clippy::disallowed_types, reason = "the process's one method pick table: shared across all databases")]
+static PICKS: std::sync::LazyLock<Table<PickKey, View, Cached>> =
+    std::sync::LazyLock::new(|| Table::new(PICK_BITS));
 
 /// The answer of the probe for `name` on `self_ty` in `ctx`: from the table when it holds it,
 /// else `probe`'s, kept when its shape allows (`PickKey::new`, `Answer::of`).
@@ -379,8 +377,9 @@ struct CachedSteps {
 /// probed in a revision.
 const STEPS_BITS: u32 = 14;
 
-static STEPS: LazyLock<Table<StepsKey, View, CachedSteps>> =
-    LazyLock::new(|| Table::new(STEPS_BITS));
+#[expect(clippy::disallowed_types, reason = "the process's one autoderef steps table: shared across all databases")]
+static STEPS: std::sync::LazyLock<Table<StepsKey, View, CachedSteps>> =
+    std::sync::LazyLock::new(|| Table::new(STEPS_BITS));
 
 /// Runs `f` on the autoderef steps of `input`: the table's, borrowed in place, when it holds
 /// them, else `compute`'s, kept when their reads were captured.

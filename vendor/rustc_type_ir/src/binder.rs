@@ -82,16 +82,24 @@ impl<I: Interner, T: TypeFoldable<I>> TypeSuperFoldable<I> for Binder<I, T> {
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
-        self.try_map_bound(|t| t.try_fold_with(folder))
+        // blaze: a reflected variable's container is inside the binder, and folds with it.
+        let bound_vars = crate::reflect::try_fold_reflected_containers(self.bound_vars, folder)?;
+        Ok(Binder { value: self.value.try_fold_with(folder)?, bound_vars })
     }
 
     fn super_fold_with<F: TypeFolder<I>>(self, folder: &mut F) -> Self {
-        self.map_bound(|t| t.fold_with(folder))
+        let bound_vars = crate::reflect::fold_reflected_containers(self.bound_vars, folder);
+        Binder { value: self.value.fold_with(folder), bound_vars }
     }
 }
 
 impl<I: Interner, T: TypeVisitable<I>> TypeSuperVisitable<I> for Binder<I, T> {
     fn super_visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result {
+        // blaze: a reflected variable's container is inside the binder.
+        crate::visit::try_visit!(crate::reflect::visit_reflected_containers(
+            self.bound_vars,
+            visitor
+        ));
         self.as_ref().skip_binder().visit_with(visitor)
     }
 }
@@ -1080,6 +1088,9 @@ pub enum BoundVariableKind<I: Interner> {
     Ty(BoundTyKind<I>),
     Region(BoundRegionKind<I>),
     Const,
+    /// blaze: a type variable of a field binder, `F` of `for<F: Field<T>>`, ranging over the
+    /// members of its container only (`crate::reflect`).
+    Reflected(crate::reflect::ReflectedVar<I>),
 }
 
 impl<I: Interner> BoundVariableKind<I> {
@@ -1093,6 +1104,8 @@ impl<I: Interner> BoundVariableKind<I> {
     pub fn expect_ty(self) -> BoundTyKind<I> {
         match self {
             BoundVariableKind::Ty(ty) => ty,
+            // A reflected variable is a type variable everywhere but where it is instantiated.
+            BoundVariableKind::Reflected(var) => var.kind,
             _ => panic!("expected a type, but found another kind"),
         }
     }

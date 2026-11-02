@@ -205,6 +205,8 @@ impl<'db> Types<'db> {
         let interner = DbInterner::new_with(db, krate);
         let param_env: ParamEnv<'db> = db.trait_environment(GenericDefId::FunctionId(func));
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+        // With what the body's `for const` loops assume of their binders, as inference had it.
+        let param_env = hir_ty::comptime_env::body_env(&infcx, b.infer, param_env);
         Types { db, interner, infcx, env: ParamEnvAndCrate { param_env, krate }, func }
     }
 

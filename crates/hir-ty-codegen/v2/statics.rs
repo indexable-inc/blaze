@@ -44,6 +44,7 @@ pub(crate) fn value(
     hashes: &HashSource,
     id: StaticId,
 ) -> Result<Value, String> {
+    let target = crate::target_of_crate(db, id.krate(db)).map_err(|e| e.to_string())?;
     let thread_local = is_thread_local(db, id);
     // alloc: only a static with `#[link_section]`, whose `Static::section` owns its name
     let section = AttrFlags::link_section(db, id.into()).map(|it| it.as_str().to_owned());
@@ -52,7 +53,7 @@ pub(crate) fn value(
         // What code reads of it is the address of the symbol.
         Some(symbol) => {
             placer.place(FrontRef::Weak(symbol))?;
-            let word = crate::Target::selected()?.word();
+            let word = target.word();
             let blob = ConstBlob {
                 bytes: vec![0; word], // alloc: only an `extern_weak` static, its one address
                 relocs: Vec::new(), // alloc: empty, allocates nothing
@@ -75,7 +76,7 @@ pub(crate) fn value(
         }
     };
     let places = place_requests(db, homes, hashes, Some(id.krate(db)), &mut placer, &mut requests)?;
-    let imports = wasm_imports(db, id, &requests)?;
+    let imports = wasm_imports(db, target, id, &requests)?;
     let mut bytes = super::shape::value(&blob, &requests, &places)?;
     Ok(Value {
         value: value_id(&mut bytes, mutable, thread_local, &imports, section.as_deref()),
@@ -115,9 +116,14 @@ fn value_id(
     ContentId::of(VALUE_DOMAIN, bytes)
 }
 
-fn wasm_imports(db: &Db, id: StaticId, requests: &Requests) -> Result<Vec<(String, Import)>, String> {
+fn wasm_imports(
+    db: &Db,
+    target: &crate::Target,
+    id: StaticId,
+    requests: &Requests,
+) -> Result<Vec<(String, Import)>, String> {
     // alloc: an error's name of the static
-    super::wasm::imports(db, requests, || format!("the static `{}`", StaticSignature::of(db, id).name.as_str()))
+    super::wasm::imports(db, target, requests, || format!("the static `{}`", StaticSignature::of(db, id).name.as_str()))
 }
 
 /// The static `id` with its references at `refs`.
@@ -130,14 +136,14 @@ pub(crate) fn compile(
     refs: &Refs,
 ) -> Result<Static, String> {
     let item: ItemKey = hashes.item(db, ItemId::Static(id))?;
-    // `wasm_import_module` reads the selected target, so `arch` has to be its.
-    let selected = crate::Target::selected()?;
-    if (arch == Arch::Wasm32) != selected.is_wasm() {
+    // The static's value is laid out for its crate's target, so `arch` has to be its.
+    let target = crate::target_of_crate(db, id.krate(db)).map_err(|e| e.to_string())?;
+    if (arch == Arch::Wasm32) != target.is_wasm() {
         // alloc: an error
         return Err(format!(
-            "the static `{}` compiled for {arch:?} while the selected target is {:?}",
+            "the static `{}` compiled for {arch:?} while its crate's target is {:?}",
             StaticSignature::of(db, id).name.as_str(),
-            selected.arch
+            target.arch
         ));
     }
     let value = value(db, homes, hashes, id)?;

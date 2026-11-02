@@ -30,6 +30,7 @@ fn lib(name: &str, kind: NativeLibKind) -> NativeLib {
     NativeLib { name: name.to_owned(), kind, verbatim: false }
 }
 
+/// A block's `wasm_import_module` names its imports' module, no library.
 #[test]
 fn a_crates_libraries_are_its_links_in_the_order_written() {
     let (db, frontend) = frontend(
@@ -41,6 +42,8 @@ extern "C" {}
 extern "C" {}
 #[link(name = "left_out", cfg(any()))]
 #[link(name = "exact.so", kind = "dylib", modifiers = "+verbatim")]
+extern "C" {}
+#[link(wasm_import_module = "blaze_proc_macro")]
 extern "C" {}
 "#,
     );
@@ -60,7 +63,6 @@ extern "C" {}
 fn a_link_blaze_cannot_make_is_an_error_naming_it() {
     for (text, named) in [
         ("#[link(name = \"kernel32\", kind = \"raw-dylib\")]\nextern \"C\" {}", "raw-dylib"),
-        ("#[link(wasm_import_module = \"env\")]\nextern \"C\" {}", "wasm_import_module"),
         ("#[link(name = \"m\", modifiers = \"+whole-archive\")]\nextern \"C\" {}", "whole-archive"),
         ("#[link(name = \"-Wl,-z\", kind = \"link-arg\")]\nextern \"C\" {}", "kind = \"link-arg\""),
         ("#[link(name = \"m\", modifiers = \"+as-needed\")]\nextern \"C\" {}", "+as-needed"),
