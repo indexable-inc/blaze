@@ -217,8 +217,9 @@ fn core() -> u32 {
 /// A pool job begins on this thread's fiber, given to the pool as `given` says
 /// ([`super::fiber::spawner`]): its lifetime starts here, not at the claim or wait that joins
 /// it to the graph later, if ever. Nothing on a thread that is no pool worker's fiber, or for a
-/// job already in the graph.
-#[inline]
+/// job already in the graph. Not inlined: it reads `HERE`, and a job's code it were inlined
+/// into could keep that thread-local's address across a wait (rule 24).
+#[inline(never)]
 pub(crate) fn job_begins(given: Given) {
     if observing() && HERE.get().is_some_and(|here| here.job == UNREGISTERED) {
         switched_unregistered(SwitchEvent::Began { given }, 0, core());
