@@ -95,7 +95,7 @@ jobs:
       - run: uv run --frozen python harness/imports.py
       # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
       - run: python3 harness/rustcsites.py
-      # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md is what it generates.
+      # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates.
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile --cwd site
       - run: site/node_modules/.bin/tsc -p tools/agents
