@@ -20,7 +20,7 @@ use crate::{
 
 #[track_caller]
 fn val(db: &TestDB, fact: Fact) -> ContentId {
-    value(db, &fact).unwrap_or_else(|err| panic!("{}", err.describe(db)))
+    value(db, fixture::test_crate(db), &fact).unwrap_or_else(|err| panic!("{}", err.describe(db)))
 }
 
 #[track_caller]

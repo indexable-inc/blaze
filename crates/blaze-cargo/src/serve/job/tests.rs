@@ -20,7 +20,7 @@ fn targets() -> Targets {
 }
 
 fn setup(runs: u64, runs_end: u64) -> Setup {
-    Setup { views: "/v".into(), std: "/s/std".into(), builds: "/s/build".into(), host: "h".into(), env: Vec::new(), color: false, tags: 6 << 32, runs, runs_end }
+    Setup { views: "/v".into(), std: "/s/std".into(), builds: "/s/build".into(), sources: "/s/sources".into(), host: "h".into(), env: Vec::new(), color: false, tags: 6 << 32, runs, runs_end }
 }
 
 fn opened(root: u8) -> Opened {
@@ -51,6 +51,8 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         held: Vec::new(),
         look: 0,
         awaiting: None,
+        applied: 0,
+        applying: None,
         shared: false,
         runs: 0,
         durable: blaze_cas::Tickets::default(),

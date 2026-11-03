@@ -53,7 +53,6 @@ pub fn ensure_sufficient_stack<R>(f: impl FnOnce() -> R) -> R {
     })
 }
 
-#[cfg(not(target_family = "wasm"))]
 thread_local! {
     static FIBER_STACK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -61,14 +60,12 @@ thread_local! {
 /// The lowest usable address of the fiber stack this thread runs now; 0 on the thread's own
 /// stack. `inline(never)`: a job can resume on another thread after a wait, and an inlined
 /// thread-local's address could be kept across it.
-#[cfg(not(target_family = "wasm"))]
 #[inline(never)]
 pub fn fiber_stack_limit() -> usize {
     FIBER_STACK_LIMIT.get()
 }
 
 /// Sets [`fiber_stack_limit`]; `inline(never)` for the same reason.
-#[cfg(not(target_family = "wasm"))]
 #[inline(never)]
 pub fn set_fiber_stack_limit(limit: usize) {
     FIBER_STACK_LIMIT.set(limit);
@@ -95,15 +92,33 @@ impl Drop for FiberLimit {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
+/// Where this frame's memory is: the machine stack, or on wasm the shadow stack in linear
+/// memory (an address-taken local lives there).
 #[inline(always)]
 fn stack_pointer() -> usize {
     let here = 0u8;
     std::ptr::addr_of!(here).addr()
 }
 
+/// On wasm a fiber's stack is linear memory with no guard below it (blaze-graph's
+/// `sched::stack`), and nothing can grow it: a call that would leave less than the red zone of
+/// a fiber's stack stops with a panic naming how much is left, instead of running on into the
+/// memory below. wasm32-wasip1 builds with panic=abort (its target spec's `panic-strategy`), so
+/// that panic aborts the whole seed, naming it, rather than failing one job: rule 17 can't hold
+/// there until blaze's wasm codegen supports exception handling (todo/bootstrap/plan.md, "Fibers
+/// in the seed"). Off a fiber (limit 0) it runs as is: the module's own stack is the linker's
+/// ("Stack in the seed").
 #[cfg(target_family = "wasm")]
 pub fn ensure_sufficient_stack<R>(f: impl FnOnce() -> R) -> R {
+    const RED_ZONE: usize = if cfg!(debug_assertions) { 1024 * 1024 } else { 100 * 1024 };
+    let limit = fiber_stack_limit();
+    if limit != 0 {
+        let left = stack_pointer().saturating_sub(limit);
+        assert!(
+            left >= RED_ZONE,
+            "a fiber's stack is used up: {left} bytes left above its limit {limit:#x}, the red zone is {RED_ZONE}, and a wasm fiber's stack cannot grow"
+        );
+    }
     f()
 }
 

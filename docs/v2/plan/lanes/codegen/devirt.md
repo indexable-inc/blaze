@@ -37,6 +37,16 @@ each match a direct call.
   - Open, with a profile: the hottest type is compared first and the `dyn` call kept.
   - Anything else stays virtual. A `kept` event under the `devirtualize` span says why.
 
+  A direct call names the trait's method on the type, which the code generator resolves in
+  the body's crate. A type whose impl that crate can't see (a member's logger behind log's
+  `&dyn Log`: impls are looked up in the crates a crate depends on) is left out of the
+  compares and reaches the `dyn` call kept last. So does a type whose method is
+  `#[track_caller]` while the trait's declaration is not (a `dyn` call reports the
+  declaration's location, a direct one the call site's; `Specialize` refuses the same), and
+  one whose method a downstream impl may specialize (a `default fn`, or an item of a `default
+  impl`). A closed object with one such type is kept (`seen`). Resolving an unseen method in
+  the crate that made the vtable, so that it becomes a direct call too, is open.
+
   Each site records the digest it read in `Inlined::devirtualized`, or `ABSENT` when the
   program makes no vtable of it.
 - **Two walks** (`crates/blaze-codegen/src/driver.rs`, `Frontend::closed`). The first walk is
@@ -101,16 +111,42 @@ lazy loader) would let a closed two-to-four set drop it.
 
 - `MirOptions::world` is in the body's query key and in the identity hash
   (`crates/hir-ty-identity/src/lib.rs`). Library bodies never take a world, so they stay one
-  for every program.
-- An instance's code hash folds in the sorted digests its body read (`devirt::code`). A body
+  for every program, and neither do the dependency image's (`Owner::Dependency`): built
+  against the world, a dependency's generic (hashbrown's `resize_inner::<Global>`) calls the
+  program's one closure directly, which is the workspace's when it names a member's type, and
+  the image would change with workspace code. One rule says which body takes the world,
+  `devirt::takes_world`: both a body's walk and whether a program builds a world at all read
+  it, so a program whose only `dyn` sites are in the image's code builds none.
+- Only a build that links a dependency image splits its code: a dev executable over the
+  daemon's code memory, as blaze-cargo's `links_image` decides once for both the front end
+  (`HirFrontend::with_image`) and the link. A build that links none (a file: an executable, a
+  test binary, a release build) makes every crate but the library's the workspace's, so every
+  such body may take the world and the whole program is devirtualized as before the split.
+- A site's digest is the object's when the body's crate saw every target it looked up (a
+  closed object past `MAX_TARGETS`, or an open one with no profile counts, looks up none) and
+  each met the call's bounds; otherwise it also hashes what the body found of each target
+  (`devirt::site_digest`): out of the bounds, seen, or unseen (its method not resolvable in
+  the body's crate, `#[track_caller]` where the trait's declaration is not, or specializable).
+  What the body's crate sees depends on its dependencies, which its code hash leaves out, so
+  a feature or lockfile change that gives it another crate rekeys the body.
+- A body lists each digest it read once, in the order first read (`Inlined::read_devirt`):
+  the pass runs before and after `Inline` and looks again at a call it kept, which reads the
+  same facts again. An instance's code hash folds in the sorted digests its body read
+  (`devirt::code`). A body
   with no site is keyed exactly as without devirtualization.
+- A world is given process-wide by its ID (`devirt::give`), which is of the facts' content,
+  while the world holds one database's interned rows. A world of the same ID with other rows
+  (another database that interned the same program otherwise) is refused, naming the program
+  and the object that differs, never handed the first one's rows.
 - The walk runs with debug assertions and unwinding on, so the walk's body has at least the
   unit's sites. A unit that asks for a callee the walk did not list is the `unwalked` error.
 
 ## Profile-guided ordering
 
 `Target::count` orders the compares, hottest first, and lets the last run speculate the
-hottest type of an open object. Both are in the digest. Nothing fills the counts yet. The
+hottest type of an open object: only counted types are looked up, hottest first, up to the
+first whose method the body's crate can name, so an open object with no counts costs no
+lookup and keeps the object's digest. Both are in the digest. Nothing fills the counts yet. The
 producer is to read the entry counts of each target's method (`<T as Trait>::m`) from the
 `.profdata` of `Pgo::Use`, by its `blaze.pgo.` record name. Its tests are a profile that
 reorders two types, and an open object speculated.
@@ -118,14 +154,30 @@ reorders two types, and an open object speculated.
 ## Cost
 
 The second walk describes every instance again, but only for a final binary in which some
-reached body has a site, and every walk without the world is a memo hit. A dependency's
-instance with a site is keyed per program; one without one is shared as before.
+reached body that takes the world has a site, and every walk without the world is a memo hit.
+In a build that links no image every non-library body with a site is keyed per program, as
+before the split. A build that links one costs nothing today: it is a live dev build, which
+never inlines MIR (`mir_inline` is off for live code, `plan.rs`), so no body of it takes the
+world at all, and an optimized live run is refused (`blaze_lazy::mode::allow`). The owner
+test in `takes_world` is the guard for when live builds inline: then a dependency's instance
+with a site is keyed per program when the workspace owns it (one of its type arguments is a
+member's, or its crate reaches a local crate through its non-proc-macro dependencies,
+`reaches_local`: a registry crate over a path or `[patch]`ed crate, whose non-generic
+functions and statics are the workspace's too), and every other is the image's, shared and
+never devirtualized.
 
 ## Tests and benchmark
 
 - `crates/hir-ty-mir/src/mir/optimize/devirt/fixtures.rs` covers: one type becomes direct;
   three types are compared with the `dyn` call last; an open object stays virtual with its
-  reason under the span; an absent object is read as `ABSENT`; the same bytes come out twice.
+  reason under the span; an absent object is read as `ABSENT`; the same bytes come out twice;
+  a type of a crate the body's crate does not depend on stays virtual, and one beside a seen
+  type is left to the `dyn` call after the seen one's compare, each with a site digest of its
+  own; a `#[track_caller]` method behind a declaration without it stays virtual, naming the
+  rule. What such a call reports when run (rustc: the method's own definition, through its
+  `ReifyShim`) is an ignored fixture until the MIR evaluator models the shim: it passes the
+  `dyn` call's location today. Each fixture's world IDs are of its text and names, as tests run in
+  parallel with a database each and worlds are shared by ID.
 - `tools/devirt/bench.py` over `tools/devirt/dyn_loop` covers a one-type `dyn`, a three-type
   `dyn` and a `Box<dyn Fn>` in hot loops. It times the merge base's blaze against this
   change's, on one tree, and checks that the outputs are equal and the binaries differ.

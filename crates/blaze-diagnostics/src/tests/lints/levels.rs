@@ -2,13 +2,16 @@
 //! lint names in them, against rustc's UI tests as they are, under compiletest's flags
 //! (`-Z deduplicate-diagnostics=no` with them).
 
+use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
+
 use crate::{
     Options,
     emit::Style,
     lints::{CommandLine, Level, LintOptions},
     model,
     tests::{
-        Mode, checked, checked_expanding_derives, checked_with, compiletest, normalized, ui_with,
+        Mode, checked, checked_expanding_derives, checked_with, checked_with_proc_macros, compiletest, normalized,
+        ui_with,
     },
 };
 
@@ -864,6 +867,61 @@ fn main() { from_dep(); from_here(); }
     let unused: Vec<_> = checked.diags.iter().filter(|it| it.lint_name() == Some("unused_variables")).collect();
     assert_eq!(unused.len(), 1, "{:?}", checked.messages());
     assert_eq!(unused[0].span.primary[0].file, "main.rs", "{:?}", checked.messages());
+}
+
+/// A derive whose `#[proc_macro_derive]` function a `macro_rules!` macro of its crate wrote, as
+/// synstructure's `decl_derive!` writes rustc_type_ir_macros' and vir_macros' derives.
+#[derive(Debug)]
+struct DeclaredByMacro;
+
+impl ProcMacroExpander for DeclaredByMacro {
+    fn expand(&self, _: &base_db::Db, call: ProcMacroCall<'_>) -> Result<hir_expand::tt::TopSubtree, ProcMacroExpansionError> {
+        let call_site = call.call_site;
+        Ok(hir_expand::quote! { call_site =>
+            fn generated_by_derive() { let unused = (); }
+        })
+    }
+
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
+        other.type_id() == std::any::TypeId::of::<Self>()
+    }
+}
+
+/// What a derive declared by a macro of its crate writes is still another crate's macro's: its
+/// expansion is named whether or not its declaration is in a file. vir's `ToDebugSNode` gave
+/// 94 `noop_method_call` warnings rustc doesn't, and rustc_type_ir's `Lift_Generic` an unused
+/// `interner`, as their expansions were left out of the spans.
+#[test]
+fn the_lints_of_what_a_derive_declared_by_a_macro_writes_are_not_reported() {
+    let source = r#"
+macro_rules! declare {
+    ($name:ident) => {
+        #[proc_macro_derive(DeclaredByMacro)]
+        pub fn $name(item: TokenStream) -> TokenStream { item }
+    };
+}
+declare!(declared_by_macro);
+"#;
+    let extra = vec![(
+        source.to_owned(),
+        ProcMacro {
+            name: intern::Symbol::intern("DeclaredByMacro"),
+            kind: ProcMacroKind::CustomDerive,
+            expander: std::sync::Arc::new(DeclaredByMacro), // dyn: hir-expand's `ProcMacro::expander`
+            disabled: false,
+        },
+    )];
+    let fixture = r#"//- proc_macros: declared_by_macro
+//- minicore: derive
+//- /main.rs crate:other:main
+#[derive(proc_macros::DeclaredByMacro)]
+struct S;
+fn main() { let by_hand = (); }
+"#;
+    let checked = checked_with_proc_macros(fixture, extra);
+    let unused: Vec<_> = checked.diags.iter().filter(|it| it.lint_name() == Some("unused_variables")).collect();
+    assert_eq!(unused.len(), 1, "{:?}", checked.messages());
+    assert!(unused[0].message.contains("by_hand"), "{:?}", checked.messages());
 }
 
 /// What a builtin derive writes is another crate's macro's: derive(Debug)'s `&mut Formatter`

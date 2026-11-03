@@ -144,6 +144,12 @@ pub(crate) fn cfg(
     if test {
         options.insert_atom(Symbol::intern("test"));
     }
+    // rustdoc reads a library's examples from the library as `--cfg doc --cfg doctest` has it
+    // (`rustdoc::doctest::run`); the examples themselves are built without either.
+    if unit.mode == Mode::Doctest {
+        options.insert_atom(Symbol::intern("doc"));
+        options.insert_atom(Symbol::intern("doctest"));
+    }
     // blaze's own atom, after the target's cfgs and rustc's flags, so `--print cfg` and build
     // scripts' `CARGO_CFG_*` never see it: MIR building reads it to check native contract
     // clauses (docs/v2/plan/lanes/contracts.md, part 1). The crate's cfg is an input of every
@@ -152,6 +158,51 @@ pub(crate) fn cfg(
         options.insert_atom(Symbol::intern(cfg::CONTRACT_CHECKS));
     }
     Ok(options)
+}
+
+/// The cfg keys a crate that links `proc_macro` is not told of the wasm proc macros' platform
+/// ([`host_side`]).
+const HOST_SIDE_UNTOLD: [&str; 2] = ["target_os", "target_family"];
+
+/// `cfg`, of a crate built to run in the macro host ([`UnitPlan::macro_wasm`]) that links
+/// `proc_macro` ([`links_proc_macro`]), without the platform's `target_os` and
+/// `target_family`. rustc builds a proc macro and the crates it uses for the host, which has
+/// neither `target_os = "wasi"` nor `target_family = "wasm"`, and crates gate their
+/// `proc_macro` items on just that: synstructure 0.12 to 0.14 and syn 1 leave out
+/// `extern crate proc_macro` (and synstructure its `decl_derive!`) under
+/// `all(target_arch = "wasm32", any(target_os = "unknown", target_os = "wasi"))`, so a proc
+/// macro built with `synstructure::decl_derive` would not resolve (`superset-of-rust`). Every
+/// other crate of the macro host keeps the platform's cfg whole: libc, getrandom and wasi pick
+/// the WASI code the module's std runs on by it. The arch and pointer width stay, as they are
+/// the code's. Not for the build script's `CARGO_CFG_*`, which describe the platform.
+pub(crate) fn host_side(cfg: &mut CfgOptions) {
+    let mut untold = Vec::new(); // alloc: once per macro-host crate, a handful of atoms
+    for key in HOST_SIDE_UNTOLD {
+        for value in cfg.get_cfg_values(key) {
+            untold.push(CfgAtom::KeyValue { key: Symbol::intern(key), value: value.clone() });
+        }
+    }
+    cfg.apply_diff(cfg::CfgDiff::new(Vec::new(), untold));
+}
+
+/// Whether a crate of the macro host links `proc_macro`, so is told of the host's side
+/// ([`host_side`]): a proc macro, or a crate with an `extern crate proc_macro` item anywhere in
+/// its root file, under any cfg (the cfg that would hide it is the one being decided). Read
+/// from the root's syntax, so a comment, a string or a macro's body that only says it is not
+/// taken for it, nor `extern crate proc_macro2`.
+pub(crate) fn links_proc_macro(is_proc_macro: bool, root_text: &str, edition: Edition) -> bool {
+    use syntax::{AstNode, ast};
+    if is_proc_macro {
+        return true;
+    }
+    // A cheap refusal first: most roots of the macro host never say it.
+    if !root_text.contains("proc_macro") {
+        return false;
+    }
+    let parse = ast::SourceFile::parse(root_text, edition);
+    parse.tree().syntax().descendants().filter_map(ast::ExternCrate::cast).any(|item| {
+        item.name_ref().is_some_and(|name| name.text() == "proc_macro")
+    })
 }
 
 /// A cfg as `--cfg` takes it: `name`, or `name="value"` with the value a string literal.

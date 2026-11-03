@@ -21,7 +21,7 @@ use hir_def::{
     GenericParamId, ImplId, LifetimeParamId, StructId, TraitId, TupleFieldId, TupleId, TypeAliasId,
     TypeOrConstParamId, TypeParamId, UnionId, VariantId,
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinType, BuiltinUint},
-    expr_store::ComptimeForm,
+    expr_store::{ComptimeForm, ExpressionStore},
     hir::{
         ArithOp, BinaryOp, BindingId, ExprId, ExprOrPatId, ExprOrPatIdPacked, PatId, UnaryOp,
         UnsafeBinderCastKind,
@@ -286,8 +286,9 @@ fn id_bits<T: crate::check_cache::Relocate>(id: T) -> u64 {
     crate::check_cache::id_bits(id)
 }
 
-/// [`id_bits`]' id back; `None` for index 0 or a place not in the table.
-fn id_of<T: crate::check_cache::Relocate>(bits: u64) -> Option<T> {
+/// [`id_bits`]' id back, or why the bits name none (`IdRefused::at` makes it the record's
+/// error).
+fn id_of<T: crate::check_cache::Relocate>(bits: u64) -> Result<T, crate::check_cache::IdRefused> {
     crate::check_cache::id_of(bits)
 }
 
@@ -325,9 +326,9 @@ fn variant_key(variant: VariantId) -> (u8, u64) {
 
 fn variant_of(tag: u8, bits: u64) -> Option<VariantId> {
     Some(match tag {
-        0 => id_of::<EnumVariantId>(bits)?.into(),
-        1 => id_of::<StructId>(bits)?.into(),
-        2 => id_of::<UnionId>(bits)?.into(),
+        0 => id_of::<EnumVariantId>(bits).ok()?.into(),
+        1 => id_of::<StructId>(bits).ok()?.into(),
+        2 => id_of::<UnionId>(bits).ok()?.into(),
         _ => return None,
     })
 }
@@ -410,8 +411,8 @@ fn candidate_key(candidate: CandidateId) -> (u8, u64) {
 
 fn candidate_of(tag: u8, bits: u64) -> Option<CandidateId> {
     Some(match tag {
-        0 => id_of::<FunctionId>(bits)?.into(),
-        1 => id_of::<ConstId>(bits)?.into(),
+        0 => id_of::<FunctionId>(bits).ok()?.into(),
+        1 => id_of::<ConstId>(bits).ok()?.into(),
         _ => return None,
     })
 }
@@ -658,7 +659,7 @@ impl TyDecode for TableDecode<'_, '_> {
 
     fn trait_ref(&self, [low, high, args]: [u32; 3]) -> Result<StoredTraitRef, FormatError> {
         let id = id_of::<TraitId>(u64::from(low) | (u64::from(high) << 32))
-            .ok_or(FormatError::Invalid { at: self.at, what: "a trait of id 0 or not in the table" })?;
+            .map_err(|refused| refused.at(self.at))?;
         let args = self.table.args(args)?;
         Ok(StoredTraitRef::new(crate::check_cache::outside(|| {
             TraitRef::new_from_args(self.interner, id.into(), args)
@@ -1065,9 +1066,61 @@ impl Persist for InferenceRecord {
     }
 }
 
+/// How many expressions and patterns the store of the body a record infers has: a node a
+/// record keys a map by is checked against them before it sizes the map (each map is dense up
+/// to its last node while it is built).
+#[derive(Clone, Copy, Debug)]
+pub struct Nodes {
+    pub exprs: u32,
+    pub pats: u32,
+}
+
+impl Nodes {
+    /// The counts of `store`, the store the body's expressions and patterns are of. A store of
+    /// `2^32` rows or more (none fits in memory) bounds nothing a word can name, so a count
+    /// saturates rather than wrap.
+    pub fn of(store: &ExpressionStore) -> Nodes {
+        let len = |len: usize| u32::try_from(len).unwrap_or(u32::MAX);
+        Nodes { exprs: len(store.expr_count()), pats: len(store.pat_count()) }
+    }
+}
+
+/// How many expressions, and how many patterns, a packed node can name: `ExprOrPatIdPacked`
+/// keeps its top bit for the kind.
+const PACKED_NODES: u32 = 1 << 31;
+
+/// `node` packed, its index below [`PACKED_NODES`] (checked by the caller).
+fn pack(node: ExprOrPatId) -> ExprOrPatIdPacked {
+    match node {
+        ExprOrPatId::ExprId(it) => it.into(),
+        ExprOrPatId::PatId(it) => it.into(),
+    }
+}
+
 impl<'a> InferenceRecordRef<'a> {
     fn invalid(&self, what: &'static str) -> FormatError {
         FormatError::Invalid { at: self.at, what }
+    }
+
+    /// `node`, which keys the map `what` names (`[of an expression, of a pattern]`), below
+    /// `nodes`' count of its kind, then packed. The bound comes before the packing: a packed
+    /// node keeps its top bit for the kind, so an index of `2^31` or more would pack as
+    /// another node (an expression `0x8000_0003` as pattern 3).
+    fn node_below(
+        &self,
+        node: ExprOrPatId,
+        nodes: Nodes,
+        what: [&'static str; 2],
+    ) -> Result<ExprOrPatIdPacked, FormatError> {
+        let (index, bound, what) = match node {
+            ExprOrPatId::ExprId(expr) => (expr.into_raw().into_u32(), nodes.exprs, what[0]),
+            ExprOrPatId::PatId(pat) => (pat.into_raw().into_u32(), nodes.pats, what[1]),
+        };
+        let bound = bound.min(PACKED_NODES);
+        match index < bound {
+            true => Ok(pack(node)),
+            false => Err(FormatError::Bound { at: self.at, what, found: index.into(), bound: bound.into() }),
+        }
     }
 
     fn ensure(&self, holds: bool, what: &'static str) -> Result<(), FormatError> {
@@ -1103,7 +1156,7 @@ impl<'a> InferenceRecordRef<'a> {
     }
 
     fn id<T: crate::check_cache::Relocate>(&self, bits: u64) -> Result<T, FormatError> {
-        id_of(bits).ok_or(self.invalid("an id of index 0 or not in the table"))
+        id_of(bits).map_err(|refused| refused.at(self.at))
     }
 
     fn same_len(&self, lens: &[usize], what: &'static str) -> Result<(), FormatError> {
@@ -1188,8 +1241,13 @@ impl<'a> InferenceRecordRef<'a> {
         self.lists(present, ends, items)
     }
 
-    /// The result again, its types read from the record's type table.
-    pub fn to_result<'db>(&self, interner: DbInterner<'db>) -> Result<InferenceResult<'db>, FormatError> {
+    /// The result again, its types read from the record's type table, its nodes checked
+    /// against `nodes`, the counts of its body's store.
+    pub fn to_result<'db>(
+        &self,
+        interner: DbInterner<'db>,
+        nodes: Nodes,
+    ) -> Result<InferenceResult<'db>, FormatError> {
         let copy;
         let bytes: &[u8] = match self.table {
             TableView::InPlace(bytes) => bytes,
@@ -1199,18 +1257,19 @@ impl<'a> InferenceRecordRef<'a> {
             }
         };
         let table = TyTableReader::open(interner, bytes, self.table_root)?;
-        self.decode(&TableDecode { interner, table, at: self.at })
+        self.decode(&TableDecode { interner, table, at: self.at }, nodes)
     }
 
     /// [`Self::decode_in`] in a task of its own: decoding runs outside any query (R1).
-    fn decode<'db>(&self, tys: &impl TyDecode) -> Result<InferenceResult<'db>, FormatError> {
-        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| self.decode_in(tys, frame))
+    fn decode<'db>(&self, tys: &impl TyDecode, nodes: Nodes) -> Result<InferenceResult<'db>, FormatError> {
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| self.decode_in(tys, nodes, frame))
     }
 
-    /// The result of this record, its temporaries in `frame`.
+    /// The result of this record, its temporaries in `frame`, its nodes below `nodes`.
     fn decode_in<'db>(
         &self,
         tys: &impl TyDecode,
+        nodes: Nodes,
         frame: &Frame,
     ) -> Result<InferenceResult<'db>, FormatError> {
         let (fns, args) = (self.u64s(C64::MethodFns), self.u32s(C32::MethodArgs));
@@ -1372,8 +1431,12 @@ impl<'a> InferenceRecordRef<'a> {
         };
         let value_resolutions = {
             let mut map = ExprOrPatMap::new_in(frame);
+            const WHAT: [&str; 2] = [
+                "a value path resolution's expression, below the store's expression count",
+                "a value path resolution's pattern, below the store's pattern count",
+            ];
             for _ in 0..words.len()? {
-                let node = words.node()?;
+                let node = self.node_below(words.expr_or_pat()?, nodes, WHAT)?;
                 let value = words.value_ns()?;
                 self.ensure(map.insert(node, value).is_none(), "a node with two value path resolutions")?;
             }
@@ -1381,8 +1444,12 @@ impl<'a> InferenceRecordRef<'a> {
         };
         let qualifier_resolutions = {
             let mut map = ExprOrPatMap::new_in(frame);
+            const WHAT: [&str; 2] = [
+                "a qualifier resolution's expression, below the store's expression count",
+                "a qualifier resolution's pattern, below the store's pattern count",
+            ];
             for _ in 0..words.len()? {
-                let node = words.node()?;
+                let node = self.node_below(words.expr_or_pat()?, nodes, WHAT)?;
                 let qualifier = (words.type_ns()?, words.word()?);
                 self.ensure(map.insert(node, qualifier).is_none(), "a node with two qualifier resolutions")?;
             }
@@ -1390,8 +1457,12 @@ impl<'a> InferenceRecordRef<'a> {
         };
         let unstable_candidates = {
             let mut map = ExprOrPatMap::new_in(frame);
+            const WHAT: [&str; 2] = [
+                "an unstable item list's expression, below the store's expression count",
+                "an unstable item list's pattern, below the store's pattern count",
+            ];
             for _ in 0..words.len()? {
-                let node = words.node()?;
+                let node = self.node_below(words.expr_or_pat()?, nodes, WHAT)?;
                 let len = words.len()?;
                 self.ensure(len != 0, "a node that passed over no unstable items")?;
                 let candidates =
@@ -2638,7 +2709,7 @@ impl Source<'_> {
 
     fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
         let bits = self.u64()?;
-        id_of(bits).ok_or(self.invalid("an id of index 0 or not in the table"))
+        id_of(bits).map_err(|refused| refused.at(self.at))
     }
 
     /// A list's length, which is at most the words left: each entry is at least a word.
@@ -2699,11 +2770,23 @@ impl Source<'_> {
         })
     }
 
+    /// A node packed: refused where its index has no packed form (`2^31` or more), which
+    /// would pack as another node.
     fn node(&mut self) -> Result<ExprOrPatIdPacked, FormatError> {
-        Ok(match self.expr_or_pat()? {
-            ExprOrPatId::ExprId(it) => it.into(),
-            ExprOrPatId::PatId(it) => it.into(),
-        })
+        let node = self.expr_or_pat()?;
+        let index = match node {
+            ExprOrPatId::ExprId(it) => it.into_raw().into_u32(),
+            ExprOrPatId::PatId(it) => it.into_raw().into_u32(),
+        };
+        match index < PACKED_NODES {
+            true => Ok(pack(node)),
+            false => Err(FormatError::Bound {
+                at: self.at,
+                what: "a node, below the nodes a packed node can name",
+                found: index.into(),
+                bound: PACKED_NODES.into(),
+            }),
+        }
     }
 
     fn opt_expr(&mut self) -> Result<Option<ExprId>, FormatError> {
@@ -4123,7 +4206,6 @@ mod tests {
         let reasons = [
             CreateConstError::UsedForbiddenParam,
             CreateConstError::LocalBinding,
-            CreateConstError::Static,
             CreateConstError::ImplSelf,
             CreateConstError::NeedsAnonConst,
             CreateConstError::DoesNotResolve,
@@ -4448,8 +4530,8 @@ mod tests {
         let record = InferenceRecord::of(result, &mut model);
         let bytes = blaze_format::Aligned::copy_from(&to_bytes(&record));
         let read = InferenceRecord::read(&bytes).unwrap();
-        let back: InferenceResult<'static> = read.decode(&model).unwrap();
-        let in_memory: InferenceResult<'static> = record.as_ref().decode(&model).unwrap();
+        let back: InferenceResult<'static> = read.decode(&model, NODES).unwrap();
+        let in_memory: InferenceResult<'static> = record.as_ref().decode(&model, NODES).unwrap();
         assert_eq!(in_memory, back);
         back
     }
@@ -4707,8 +4789,56 @@ mod tests {
         assert!(!decodes(&record, &model));
     }
 
+    /// The counts of a store above every node the sample result names.
+    const NODES: Nodes = Nodes { exprs: 1 << 10, pats: 1 << 10 };
+
+    /// A node a map is keyed by past its store's count of its kind is refused before it sizes
+    /// the map, which is dense up to its last node while it is built: a damaged node word once
+    /// sized it by the word, up to `2^31` slots.
+    #[test]
+    fn a_map_node_past_the_store_is_refused_before_it_sizes_the_map() {
+        let mut model = Model::default();
+        let record = InferenceRecord::of(&result(), &mut model);
+        let cases = [
+            // The value resolutions' last expression is 17, their last pattern 6.
+            (Nodes { exprs: 17, ..NODES }, "a value path resolution's expression, below the store's expression count", 17),
+            (Nodes { pats: 6, ..NODES }, "a value path resolution's pattern, below the store's pattern count", 6),
+            // The qualifier resolutions have the expressions 14 to 21.
+            (Nodes { exprs: 18, ..NODES }, "a qualifier resolution's expression, below the store's expression count", 18),
+        ];
+        for (nodes, wanted, node) in cases {
+            let read: Result<InferenceResult<'static>, _> = record.as_ref().decode(&model, nodes);
+            match read {
+                Err(FormatError::Bound { what, found, bound, .. }) => {
+                    assert_eq!(what, wanted);
+                    assert_eq!((found, bound), (node, node));
+                }
+                other => panic!("{nodes:?} read as {other:?}"),
+            }
+        }
+        // An expression word with the top bit set is refused as an expression, never packed
+        // first: packed, `0x8000_0003` is pattern 3, below any store of 4 patterns or more.
+        // The value resolutions are 8 entries, the first expression 12: `[8, 0, 12]`.
+        let mut damaged = record.clone(); // clone: a test's copy
+        let [start, count] = damaged.spans32[C32::Words as usize];
+        let words = &mut damaged.u32s[start as usize..(start + count) as usize];
+        let found: Vec<usize> = (0..words.len().saturating_sub(2))
+            .filter(|&at| words[at..at + 3] == [8, 0, 12])
+            .collect(); // alloc: a test's list
+        let [at] = found[..] else { panic!("the value resolutions start in {} places, not one", found.len()) };
+        words[at + 2] = 0x8000_0003;
+        let read: Result<InferenceResult<'static>, _> = damaged.as_ref().decode(&model, NODES);
+        match read {
+            Err(FormatError::Bound { what, found, bound, .. }) => {
+                assert_eq!(what, "a value path resolution's expression, below the store's expression count");
+                assert_eq!((found, bound), (0x8000_0003, NODES.exprs.into()));
+            }
+            other => panic!("expression 0x8000_0003 read as {other:?}"),
+        }
+    }
+
     fn decodes(record: &InferenceRecord, model: &Model) -> bool {
-        let result: Result<InferenceResult<'static>, _> = record.as_ref().decode(model);
+        let result: Result<InferenceResult<'static>, _> = record.as_ref().decode(model, NODES);
         result.is_ok()
     }
 }

@@ -138,6 +138,8 @@ pub(crate) struct Spec {
     /// [`crate::query::BuildConfig::builds`]: where the workspace's build directory is when
     /// nothing names one.
     pub builds: String,
+    /// [`crate::query::BuildConfig::sources`]: where fetched packages are mounted.
+    pub sources: String,
     /// `-Zbuild-std=` and `-Zbuild-std-features=`.
     pub build_std: Option<Vec<String>>,
     pub build_std_features: Option<Vec<String>>,
@@ -165,18 +167,19 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         (true, true, _) => Select::All,
         (true, false, _) => Select::OptOut(asked.exclude.clone()),
     };
-    if asked.doc {
-        return Err(error("blaze does not run doctests yet (`cargo test --doc`)"));
-    }
     let intent = match asked.command() {
         Command::Build | Command::Run => Intent::Build,
         Command::Check => Intent::Check { test: asked.profile.as_deref() == Some("test") },
+        // cargo's `--doc`: the libraries' doctests only, blaze's own build of their examples.
+        Command::Test if asked.doc => Intent::Doctest,
         Command::Test => Intent::Test,
         Command::Bench => Intent::Bench,
         Command::Doc => Intent::Doc { open: asked.open },
     };
+    // cargo's `CompileFilter::lib_only` under `--doc`, which the command line keeps from
+    // mixing with any other target flag.
     let filter = Filter::from_flags(
-        asked.lib,
+        asked.lib || intent == Intent::Doctest,
         asked.bins.clone(),
         asked.all_bins,
         asked.tests.clone(),
@@ -235,6 +238,7 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         library_at: asked.library.clone(),
         std: asked.std.clone(),
         builds: asked.builds.clone(),
+        sources: asked.sources.clone(),
         build_std,
         build_std_features,
         foreign: None,
@@ -245,6 +249,10 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
 /// Stands for `$CARGO_HOME` of a foreign workspace's configuration: under no mount, so its
 /// config files are absent and nothing is read from it.
 const NO_CARGO_HOME: &str = "/@blaze-no-cargo-home";
+
+/// Stands for where a foreign workspace's fetched packages are: under no mount, so it locates
+/// none there (it reads offline, and fetches nothing).
+const NO_SOURCES: &str = "/@blaze-no-sources";
 
 fn foreign_spec(ask: &ForeignAsk) -> Spec {
     let config = ConfigOf::Fixed {
@@ -288,6 +296,8 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
         // Its units are placed under `FOREIGN_TARGET` and moved to `std`'s: it has no build
         // directory of its own.
         builds: String::new(),
+        // Read offline from its own mounts: it fetches nothing, so no package is ever there.
+        sources: NO_SOURCES.to_owned(),
         build_std: None,
         build_std_features: None,
         foreign: Some(ask.clone()),
@@ -412,6 +422,9 @@ pub struct ForeignProfile {
     pub overflow_checks: bool,
     pub debuginfo: String,
     pub panic: String,
+    /// The build's `codegen-backend`, set on every unit as is ([`crate::query::StdKey::codegen_backend`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codegen_backend: Option<String>,
 }
 
 impl Query for Foreign {

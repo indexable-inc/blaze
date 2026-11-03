@@ -18,9 +18,11 @@ use crate::query::{
     BuildConfig, Cbor, Command, Fetch, FetchKind, Invocation, LoadError, Mount, Origin, Versioned, producer,
 };
 
-const HOME: &str = "/home/u/.cargo";
-const CRATES_IO_SRC: &str = "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f";
-const CRATES_IO_INDEX: &str = "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f";
+/// Where the daemon keeps fetched packages ([`crate::query::BuildConfig::sources`]): blaze's,
+/// never `$CARGO_HOME`.
+const SOURCES: &str = "/home/u/.cache/blaze/sources";
+const CRATES_IO_SRC: &str = "/home/u/.cache/blaze/sources/registry/src/index.crates.io-1949cf8c6b5b557f";
+const CRATES_IO_INDEX: &str = "/home/u/.cache/blaze/sources/registry/index/index.crates.io-1949cf8c6b5b557f";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 /// A package to locate, with the configuration the sources are made of.
 #[derive(Serialize, Deserialize, Clone)]
@@ -60,7 +62,7 @@ fn sources(asked: &Asked) -> Sources {
     let env = [("HOME".to_owned(), "/home/u".to_owned())];
     let config = blaze_manifest::Config::load(Path::new("/home/u/ws"), env, &asked.config)
         .expect("a configuration");
-    Sources::new(&config, asked.offline.then_some("--offline")).expect("the sources")
+    Sources::new(&config, SOURCES, asked.offline.then_some("--offline")).expect("the sources")
 }
 
 struct Locate;
@@ -171,6 +173,7 @@ fn open(db: &Database, tree: &MemTree, files: &[(&str, &str)], mounts: Vec<Mount
         library: "/rustc/0/library".to_owned(),
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
+        sources: SOURCES.to_owned(),
     };
     db.open_with(View { root: tree.root(&files) }, &config.encode())
 }
@@ -197,10 +200,11 @@ fn failed(answer: Answer) -> String {
 }
 
 #[test]
-fn a_crates_io_package_is_fetched_from_static_crates_io_into_cargos_directory() {
+fn a_crates_io_package_is_fetched_from_static_crates_io_into_blazes_sources_never_cargo_home() {
     let serde = asked(CRATES_IO, "serde", "1.0.219", Some(SERDE_SHA256));
     let at = format!("{CRATES_IO_SRC}/serde-1.0.219");
-    assert_eq!(at, "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.219");
+    assert!(at.starts_with(&format!("{SOURCES}/registry/src/")), "{at}");
+    assert!(!at.contains(".cargo"), "a fetched package is kept under blaze's sources, never $CARGO_HOME: {at}");
     assert_eq!(
         locate(&[], vec![], &serde),
         Answer::Needs(Fetch {
@@ -215,6 +219,19 @@ fn a_crates_io_package_is_fetched_from_static_crates_io_into_cargos_directory() 
         locate(&files, vec![mount(&at, "serde")], &serde),
         Answer::Here(format!("{at}/Cargo.toml"))
     );
+}
+
+/// A lock file names the directory a fetched package is written to on disk, before any
+/// sandbox runs: a name or a git commit that is no name (`../..`) is refused here, so no fetch
+/// is ever asked to write outside `<sources>`.
+#[test]
+fn a_lock_file_with_a_traversal_name_is_refused() {
+    let evil = asked(CRATES_IO, "../../../../home/u/.vim/pack/p/start/x", "1.0.0", Some(SERDE_SHA256));
+    let error = failed(locate(&[], vec![], &evil));
+    assert!(error.contains("whose name cargo refuses") && error.contains("invalid character"), "{error}");
+    let url = "git+https://github.com/o/r?branch=main#../../../../escaped";
+    let error = failed(locate(&[], vec![], &asked(url, "r", "0.1.0", None)));
+    assert!(error.contains("no git object id"), "{error}");
 }
 
 #[test]
@@ -260,7 +277,7 @@ fn an_alternative_sparse_registry_needs_its_config_json_then_its_dl_template() {
     let dir = SourceId::from_url(url).unwrap().registry_dir_name();
     assert!(dir.starts_with("alt.example.com-"), "{dir}");
     let demo = asked(url, "Demo", "0.1.0", Some("ab12"));
-    let config_json = format!("{HOME}/registry/index/{dir}/config.json");
+    let config_json = format!("{SOURCES}/registry/index/{dir}/config.json");
     let fetch = needs(locate(&[], vec![], &demo));
     assert_eq!(
         (fetch.url.as_str(), &fetch.kind, fetch.at.as_str()),
@@ -274,7 +291,7 @@ fn an_alternative_sparse_registry_needs_its_config_json_then_its_dl_template() {
             what: "Demo v0.1.0".to_owned(),
             url: "https://dl.example.com/Demo/0.1.0/De/mo/de/mo/ab12".to_owned(),
             kind: FetchKind::Crate { sha256: "ab12".to_owned() },
-            at: format!("{HOME}/registry/src/{dir}/Demo-0.1.0"),
+            at: format!("{SOURCES}/registry/src/{dir}/Demo-0.1.0"),
         }
     );
     let plain = r#"{"dl":"https://dl.example.com/api/v1/crates"}"#;
@@ -293,14 +310,14 @@ fn a_mirror_of_crates_io_changes_the_directory_and_the_url() {
         "source.mirror.registry=\"sparse+https://mirror.example.com/index/\"".to_owned(),
     ];
     let dir = SourceId::from_url("sparse+https://mirror.example.com/index/").unwrap().registry_dir_name();
-    let config_json = format!("{HOME}/registry/index/{dir}/config.json");
+    let config_json = format!("{SOURCES}/registry/index/{dir}/config.json");
     let fetch = needs(locate(&[], vec![], &serde));
     assert_eq!(fetch.url, "https://mirror.example.com/index/config.json");
     assert_eq!(fetch.at, config_json);
     let dl = r#"{"dl":"https://mirror.example.com/dl"}"#;
     let fetch = needs(locate(&[("mirror.json", dl)], vec![mount(&config_json, "mirror.json")], &serde));
     assert_eq!(fetch.url, "https://mirror.example.com/dl/serde/1.0.219/download");
-    assert_eq!(fetch.at, format!("{HOME}/registry/src/{dir}/serde-1.0.219"));
+    assert_eq!(fetch.at, format!("{SOURCES}/registry/src/{dir}/serde-1.0.219"));
 }
 
 #[test]
@@ -317,7 +334,7 @@ fn a_git_package_is_found_in_its_checkout() {
     let url = format!("git+https://github.com/serde-rs/serde?branch=master#{commit}");
     let ident = SourceId::from_url(&url).unwrap().git_ident();
     assert!(ident.starts_with("serde-"), "{ident}");
-    let at = format!("{HOME}/git/checkouts/{ident}/0123456");
+    let at = format!("{SOURCES}/git/checkouts/{ident}/{commit}");
     let serde = asked(&url, "serde", "1.0.219", None);
     assert_eq!(
         locate(&[], vec![], &serde),

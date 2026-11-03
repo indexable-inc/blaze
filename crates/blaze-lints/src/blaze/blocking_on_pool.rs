@@ -120,7 +120,7 @@ const FREE: &[(&[&str], Instead)] = &[
 ];
 
 pub(super) fn check(cx: &mut Cx<'_, '_>) {
-    if !cx.on_blaze(Lint::BlockingOnPool) {
+    if !cx.on_blaze(Lint::BlockingOnPool) || !cx.suspend_checked() {
         return;
     }
     let found = find(cx);

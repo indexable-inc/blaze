@@ -577,9 +577,11 @@ impl Reloc<'_> {
                         reloc::WASM_FUNCTION_INDEX_LEB
                         | reloc::WASM_FUNCTION_INDEX_I32
                         | reloc::WASM_TABLE_INDEX_SLEB
-                        | reloc::WASM_TABLE_INDEX_I32,
+                        | reloc::WASM_TABLE_INDEX_I32
+                        | reloc::WASM_TABLE_INDEX_SLEB64
+                        | reloc::WASM_TABLE_INDEX_I64,
                     ) => {
-                        let slot = u64::from(matches!(r_type, reloc::WASM_TABLE_INDEX_SLEB | reloc::WASM_TABLE_INDEX_I32));
+                        let slot = u64::from(reloc::wasm_is_table_slot(r_type));
                         match value {
                             Value::Import(at) => u64::from(at) + slot,
                             Value::Image(s) => match self.wasm.binary_search(&s) {
@@ -1781,6 +1783,7 @@ impl<'a> Stage<'a> {
         });
         let size = match self.output.arch {
             Arch::Wasm32 => 4,
+            Arch::Wasm64 => 8,
             Arch::X86_64 | Arch::Aarch64 => 8,
         };
         // alloc: error path

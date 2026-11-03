@@ -155,6 +155,26 @@ impl<'db> Trees<'db> {
         (gt.kind() == SyntaxKind::R_ANGLE).then(|| TextRange::new(eq.text_range().start(), gt.text_range().end()))
     }
 
+    /// Takes the punctuation written right after `token` that rustc's lexer glues to it into one
+    /// token (`::`, `=>`, `..=`, [`tt::glue`]), and returns the glued token's range. A
+    /// token tree holds single-character punctuation, so `$(a)::*` is `:`, `:` here but one
+    /// separator to rustc.
+    fn glue(&mut self, token: Token<'db>) -> TextRange {
+        let mut range = token.text_range();
+        let mut glued = token.text();
+        let mut last = token;
+        // Each step glues one more character, and no glued token is longer than three.
+        while let Some(NodeOrToken::Token(next)) = last.next_sibling_or_token() {
+            let Some(joined) = tt::glue_str(glued, next.text()) else { break };
+            // `next` is the next tree: no whitespace or comment sits between them.
+            self.next();
+            glued = joined;
+            range = range.cover(next.text_range());
+            last = next;
+        }
+        range
+    }
+
     /// Takes a `=>` ([`Self::peek_fat_arrow`]); `false`, taking nothing, when none is next.
     fn eat_fat_arrow(&mut self) -> bool {
         let Some(arrow) = self.peek_fat_arrow() else { return false };
@@ -594,24 +614,27 @@ impl<'db> Checker<'_, '_, 'db> {
 
     /// rustc's `parse_sep_and_kleene_op`: whether there is a separator, the operator and its range.
     fn separator_and_kleene(&mut self, trees: &mut Trees<'db>, span: TextRange) -> (bool, Kleene, TextRange) {
-        let first = trees.next();
-        let at = match first {
-            Some(tree) => match (Kleene::of(tree.kind()), tree) {
-                (Some(op), tree) => return (false, op, tree.range()),
-                (None, Tree::Token(separator)) => match trees.next() {
-                    Some(tree) => match Kleene::of(tree.kind()) {
-                        Some(Kleene::ZeroOrOne) => {
-                            let msg = "the `?` macro repetition operator does not take a separator";
-                            self.error(separator.text_range(), msg);
-                            return (false, Kleene::ZeroOrMore, tree.range());
-                        }
-                        Some(op) => return (true, op, tree.range()),
-                        None => tree.range(),
+        let at = match trees.next() {
+            Some(Tree::Token(token)) => {
+                // A `*` or `+` glued to what follows (`*=`, `+=`) is a separator, as to rustc.
+                let separator = trees.glue(token);
+                match Kleene::of(Some(token.kind())) {
+                    Some(op) if separator == token.text_range() => return (false, op, separator),
+                    _ => match trees.next() {
+                        Some(tree) => match Kleene::of(tree.kind()) {
+                            Some(Kleene::ZeroOrOne) => {
+                                let msg = "the `?` macro repetition operator does not take a separator";
+                                self.error(separator, msg);
+                                return (false, Kleene::ZeroOrMore, tree.range());
+                            }
+                            Some(op) => return (true, op, tree.range()),
+                            None => tree.range(),
+                        },
+                        None => separator,
                     },
-                    None => separator.text_range(),
-                },
-                (None, group) => group.range(),
-            },
+                }
+            }
+            Some(group) => group.range(),
             None => span,
         };
         self.error(at, "expected one of: `*`, `+`, or `?`");

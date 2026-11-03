@@ -44,6 +44,7 @@ pub mod fiber;
 mod fiber_tests;
 mod graph;
 mod host;
+mod stack;
 #[cfg(test)]
 mod tests;
 
@@ -59,13 +60,14 @@ pub use fiber::{
 pub(crate) use fiber::spawner;
 pub(crate) use host::{Host, check_stall, fire_due, idle, job_begins, join_pool, leave_pool, ready, until_due};
 pub use host::{
-    Event, EventWait, FIBER_STACK, claim, claim_for, close_scope, count_towards, innermost_scope, job_here, key_done, now, observed,
-    open_scope, release, wait,
+    Event, EventWait, claim, claim_for, close_scope, count_towards, innermost_scope, job_here, key_done, now, observed,
+    open_scope, release, stall_while_quiet, stuck_while_quiet, wait, waits_now,
 };
 
 use crate::Key;
 use cores::{any_in, first_from, get, set};
 pub use graph::StallWait;
+pub use stack::FIBER_STACK;
 use graph::{Graph, Home, Life, On, Waited};
 
 /// How many slot jobs a core runs in a row before it looks at its inbox and queues (Tokio's
@@ -241,28 +243,54 @@ const STALL_NAMED: usize = 64;
 impl fmt::Display for Stalled {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "stalled: nothing can run and no wait can end ({} jobs wait), so job {} fails: ", self.waits.len(), self.job.0)?;
-        for (at, (job, wait)) in self.waits.iter().take(STALL_NAMED).enumerate() {
-            if at > 0 {
-                f.write_str("; ")?;
-            }
-            write!(f, "job {} waits for ", job.0)?;
-            match wait {
-                StallWait::Job(other) => write!(f, "job {}", other.0)?,
-                StallWait::Key { key, claimer } => {
-                    f.write_str("key ")?;
-                    for byte in key.0 {
-                        write!(f, "{byte:02x}")?;
-                    }
-                    write!(f, ", claimed by job {}", claimer.0)?;
-                }
-                StallWait::Counter(counter) => write!(f, "counter {} (a scope's jobs)", counter.0)?,
-            }
-        }
-        if self.waits.len() > STALL_NAMED {
-            write!(f, "; and {} more", self.waits.len() - STALL_NAMED)?;
-        }
-        Ok(())
+        say_waits(f, &self.waits)
     }
+}
+
+/// Every job of the wait graph that waits now and what on, stuck or not ([`waits_now`]): what a
+/// report of a build that stopped names, since a parked job's spans are on no thread while it
+/// waits (rule 13).
+#[derive(Clone, PartialEq, Eq, Debug, Default)] // clone: a report, off every hot path
+pub struct Waits(pub Vec<(JobId, StallWait)>);
+
+impl fmt::Display for Waits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.len() {
+            0 => f.write_str("no job waits in the wait graph"),
+            n => {
+                write!(f, "{n} jobs wait in the wait graph: ")?;
+                say_waits(f, &self.0)
+            }
+        }
+    }
+}
+
+/// `job 3 waits for key 00ab.., claimed by job 1; ...`, the first [`STALL_NAMED`] of `waits`.
+fn say_waits(f: &mut fmt::Formatter<'_>, waits: &[(JobId, StallWait)]) -> fmt::Result {
+    for (at, (job, wait)) in waits.iter().take(STALL_NAMED).enumerate() {
+        if at > 0 {
+            f.write_str("; ")?;
+        }
+        write!(f, "job {} waits for ", job.0)?;
+        match wait {
+            StallWait::Job(other) => write!(f, "job {}", other.0)?,
+            StallWait::Key { key, claimer } => {
+                f.write_str("key ")?;
+                for byte in key.0 {
+                    write!(f, "{byte:02x}")?;
+                }
+                match claimer {
+                    Some(claimer) => write!(f, ", claimed by job {}", claimer.0)?,
+                    None => f.write_str(", claimed by no job (an event a thread fires)")?,
+                }
+            }
+            StallWait::Counter(counter) => write!(f, "counter {} (a scope's jobs)", counter.0)?,
+        }
+    }
+    if waits.len() > STALL_NAMED {
+        write!(f, "; and {} more", waits.len() - STALL_NAMED)?;
+    }
+    Ok(())
 }
 
 impl fmt::Display for Cycle {
@@ -1134,16 +1162,11 @@ impl World {
     }
 
     /// Every pool is idle, as its caller found under the scheduler's lock: if no driver runs
-    /// and no wait in the graph can end by what is in it ([`Graph::stuck`]), every waiting job
-    /// wakes, to fail with the stall ([`World::take_stall`]). How many woke.
-    pub(crate) fn stall(&mut self) -> usize {
-        if self.members.iter().any(Option::is_some) {
-            return 0;
-        }
-        let mut waits = std::mem::take(&mut self.stall);
-        let stuck = self.graph.stuck(&mut waits);
-        self.stall = waits;
-        if !stuck {
+    /// and no wait in the graph can end by what is in it ([`Graph::stuck`], `clients` the
+    /// member of the threads on no fiber, `quiet` whether those threads said they are still),
+    /// every waiting job wakes, to fail with the stall ([`World::take_stall`]). How many woke.
+    pub(crate) fn stall(&mut self, clients: Option<u32>, quiet: bool) -> usize {
+        if !self.stuck(clients, quiet) {
             return 0;
         }
         let mut woken = std::mem::take(&mut self.woken);
@@ -1155,6 +1178,30 @@ impl World {
         self.woken = woken;
         self.split(None);
         count
+    }
+
+    /// Whether no driver runs and no wait in the graph can end by what is in it, as
+    /// [`World::stall`] finds it; the waits found are kept for the stall's report.
+    pub(crate) fn stuck(&mut self, clients: Option<u32>, quiet: bool) -> bool {
+        if self.members.iter().any(Option::is_some) {
+            return false;
+        }
+        let mut waits = std::mem::take(&mut self.stall);
+        let stuck = self.graph.stuck(&mut waits, clients, quiet);
+        self.stall = waits;
+        stuck
+    }
+
+    /// Every job that waits in the graph now and what on ([`Graph::waits`]).
+    pub(crate) fn waits(&self) -> Waits {
+        let mut waits = Vec::new(); // alloc: a report, off every hot path
+        self.graph.waiting(&mut waits);
+        Waits(waits)
+    }
+
+    /// The waits the last [`World::stuck`] found.
+    pub(crate) fn stuck_waits(&self) -> &[(JobId, StallWait)] {
+        &self.stall
     }
 
     /// The stall `job` woke for, if it did: told once. The job leaves the scopes it has open

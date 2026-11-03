@@ -42,9 +42,9 @@ pub(super) fn read(name: &str, text: &str, arch: Arch, platform: u32) -> Result<
 const MAX_TEXT: usize = 1 << 31;
 
 fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Shared, String> {
-    if matches!(arch, Arch::Wasm32) {
+    if arch.is_wasm() {
         // alloc: error path
-        return Err("a `.tbd` describes a Mach-O library; this output is wasm32".to_owned());
+        return Err(format!("a `.tbd` describes a Mach-O library; this output is {arch:?}"));
     }
     if text.trim_start().starts_with('{') {
         // alloc: error path
@@ -639,6 +639,7 @@ fn arch_name(arch: Arch) -> &'static str {
         Arch::Aarch64 => "arm64",
         Arch::X86_64 => "x86_64",
         Arch::Wasm32 => "wasm32",
+        Arch::Wasm64 => "wasm64",
     }
 }
 
@@ -657,7 +658,7 @@ fn arch_rank(arch: Arch, name: &str) -> Option<u8> {
             "x86_64h" => Some(1),
             _ => None,
         },
-        Arch::Wasm32 => None,
+        Arch::Wasm32 | Arch::Wasm64 => None,
     }
 }
 

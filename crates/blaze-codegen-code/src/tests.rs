@@ -223,6 +223,38 @@ fn llvm_is_an_input_by_its_pin_and_needs_no_prefix() {
     assert_eq!(cross.keys().collect::<Vec<_>>(), ["pin aarch64-apple-darwin", "pin x86_64-unknown-linux-gnu"]);
 }
 
+/// C3 of the seedprof review: the stencil libraries are inputs by the ids their pin names
+/// (blaze-stencil's build script holds every library it includes to them), and the seed, which
+/// links no LLVM and makes no stencils with it, keys and checks no LLVM pin or prefix.
+#[test]
+fn the_stencils_are_inputs_by_their_pin_and_the_seed_keys_no_llvm() {
+    let workspace = Workspace::with_llvm("stencils");
+    let worked = workspace.work_out().unwrap();
+    let stencils = of_kind(&worked, "stencils");
+    assert_eq!(stencils.keys().collect::<Vec<_>>(), ["aarch64.stencils", "x86_64.stencils"], "{}", worked.listing());
+    assert_eq!(stencils["x86_64.stencils"], [0x44; 32]);
+    workspace.write("crates/blaze-stencil/stencils.json", &fixture::STENCILS_JSON.replace(&"4".repeat(64), &"6".repeat(64)));
+    let repinned = workspace.work_out().unwrap();
+    assert_eq!(of_kind(&repinned, "stencils")["x86_64.stencils"], [0x66; 32]);
+    assert_ne!(repinned.code, worked.code, "another pinned library is another code");
+
+    let mut seed = env();
+    seed.vars.insert(SEED_FEATURE.to_owned(), Some(String::new()));
+    // Neither is read in the seed: no LLVM is checked, and the bytes are blaze-stencil's to check.
+    seed.llvm_prefix = Some(workspace.above().join("no-llvm").to_str().unwrap().to_owned());
+    seed.stencils_dir = Some("/prebuilt".to_owned());
+    let worked = work_out(&workspace.read().unwrap(), &seed).expect("the seed checks no LLVM prefix");
+    assert!(of_kind(&worked, "llvm").is_empty(), "{}", worked.listing());
+    assert!(!worked.rerun_env.iter().any(|it| it == LLVM_PREFIX));
+    assert!(worked.llvm_prefix.is_none());
+    assert_eq!(worked.stencils_dir.as_deref(), Some(Path::new("/prebuilt")));
+    assert_eq!(of_kind(&worked, "stencils"), of_kind(&repinned, "stencils"));
+
+    workspace.write("crates/blaze-stencil/stencils.json", "{ \"x86_64.stencils\": \"44\" }\n");
+    let error = workspace.work_out().unwrap_err();
+    assert!(error.contains("stencils.json") && error.contains("x86_64.stencils"), "{error}");
+}
+
 /// A prefix set is checked to be the pin by pin.rs, refused with its message when it is not,
 /// and its marker is an input when it is.
 #[test]

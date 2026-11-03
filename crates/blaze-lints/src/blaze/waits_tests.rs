@@ -1,7 +1,7 @@
 //! The lints of waits (`held_across_wait`, `lock_across_query`, `blocking_on_pool`,
-//! `unnamed_wait`) over fixtures of their own: a stand-in `corosensei` whose `Yielder::suspend`
-//! parks the fiber, an engine whose query (`variance` → `fetch` → `get_or_run` → `suspend`)
-//! reaches it, a `std` with the thread-locals, locks, channels and IO they look for, and a `main`
+//! `unnamed_wait`) over fixtures of their own: a stand-in `blaze_graph` whose
+//! `sched::stack::Yielder::suspend` parks the fiber, an engine whose query (`variance` →
+//! `fetch` → `get_or_run` → `suspend`) reaches it, a `std` with the thread-locals, locks, channels and IO they look for, and a `main`
 //! that says what it expects. A line of `main` marked `//~ held_across_wait` has that lint's
 //! finding; `//~^ held_across_wait` the line above has one.
 
@@ -14,25 +14,13 @@ mod unnamed;
 
 const MINICORE: &str = "//- minicore: sized, copy, clone, drop, deref, fn, unsize, coerce_unsized, dispatch_from_dyn, send, sync, option, result, builtin_impls, iterator\n";
 
-/// `corosensei`, and the engine of `hir_ty_suspend`'s own tests: its `fiber` module is the fiber
-/// driver (it calls the root), and `spawn` runs a job there.
+/// The engine of `hir_ty_suspend`'s own tests, over [`BLAZE_GRAPH`]'s stack layer: its `fiber`
+/// module is the fiber driver (it calls the root), and `spawn` runs a job there.
 const ENGINE: &str = r#"
-//- /corosensei.rs crate:corosensei
-pub struct Yielder {
-    stack: *mut u8,
-}
-
-impl Yielder {
-    pub fn suspend(&self, value: u32) -> u32 {
-        let _ = self.stack;
-        value
-    }
-}
-
-//- /engine.rs crate:engine deps:corosensei
+//- /engine.rs crate:engine deps:blaze_graph
 pub mod fiber {
     pub struct Db {
-        yielder: *const corosensei::Yielder,
+        yielder: *const blaze_graph::sched::stack::Yielder,
     }
 
     unsafe impl Send for Db {}
@@ -188,10 +176,22 @@ pub mod net {
 }
 "#;
 
-/// `blaze_graph`'s wait API and `NoWait`, where the crate keeps them.
+/// `blaze_graph`'s wait API, `NoWait` and the stack layer's `Yielder::suspend` (the root of
+/// the may-suspend check), where the crate keeps them.
 const BLAZE_GRAPH: &str = r#"
 //- /blaze_graph/lib.rs crate:blaze_graph deps:std
 pub mod sched {
+    pub mod stack {
+        pub struct Yielder {
+            stack: *mut u8,
+        }
+        impl Yielder {
+            pub fn suspend(&self, value: u32) -> u32 {
+                let _ = self.stack;
+                value
+            }
+        }
+    }
     pub mod fiber {
         pub struct NoWait(());
         impl NoWait {
@@ -345,4 +345,38 @@ fn check_in(crates: &str, main: &str, flags: &str) -> String {
     let out = lint(&fixture, flags);
     assert_marked(&out, &source, flags);
     out
+}
+
+/// A `blaze_graph` whose stack layer has no `Yielder::suspend` (it moved, and hir-ty-suspend's
+/// root did not follow) refuses the crate's check with the error naming the root and which
+/// `blaze_graph`, for each fiber lint: the walk they read would be empty, and they would find
+/// nothing, silently.
+#[test]
+fn a_blaze_graph_without_the_root_refuses_the_fiber_lints() {
+    let fixture = format!(
+        "{MINICORE}{STD}\
+//- /blaze_graph/lib.rs crate:blaze_graph@0.3.0,https://example.invalid/blaze deps:std
+pub mod sched {{
+    pub mod fiber {{
+        pub struct Yielder;
+    }}
+}}
+//- /src/lib.rs crate:main deps:std,blaze_graph
+pub fn waits(lock: &std::sync::Mutex<u32>, condvar: &std::sync::Condvar) {{
+    let held = lock.lock();
+    let _ = condvar.wait(held);
+}}
+"
+    );
+    for lint in ["held_across_wait", "blocking_on_pool", "unnamed_wait"] {
+        let flags = format!("-A clippy::all --deny=blaze::{lint}");
+        let refused = crate::tests::try_lint_once(&fixture, &flags, crate::conf::Conf::default(), |_| {});
+        let Err(crate::diag::CheckError::SuspendUnchecked { file, why }) = refused else {
+            panic!("`{lint}` refuses a graph without the root, not {refused:?}")
+        };
+        assert_eq!(file, "src/lib.rs", "{lint}");
+        assert!(why.contains("no `blaze_graph::sched::stack::Yielder::suspend` (no `stack` there)"), "{lint}: {why}");
+        assert!(why.contains("that `blaze_graph` is 0.3.0 at `/blaze_graph/lib.rs`"), "{lint} names which: {why}");
+        assert!(why.ends_with("the check of `main` stops"), "{lint}: {why}");
+    }
 }

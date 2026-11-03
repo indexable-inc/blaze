@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 
-use std::{os::unix::process::ExitStatusExt, path::PathBuf};
+use std::path::PathBuf;
 
 use blaze_ids::rng::SplitMix64;
 
@@ -39,11 +39,11 @@ fn package(test: &str) -> Unit {
     }
 }
 
-fn exited(code: i32) -> ExitStatus {
-    ExitStatus::from_raw(code << 8)
+fn exited(code: i32) -> Ended {
+    Ended::exited(code)
 }
 
-fn judged(unit: &Unit, status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> Result<Output, Failed> {
+fn judged(unit: &Unit, status: Ended, stdout: &[u8], stderr: &[u8]) -> Result<Output, Failed> {
     judge(unit, &Context::of(unit, &[]), status, stdout, stderr)
 }
 
@@ -200,9 +200,8 @@ fn judged_from_the_bytes() {
     ];
     for out_dir in [first, second] {
         unit.out_dir = out_dir;
-        for status in [0, 101 << 8, 9] {
+        for status in [Ended::exited(0), Ended::exited(101), Ended::signalled(9)] {
             for stdout in outputs {
-                let status = ExitStatus::from_raw(status);
                 let cx = Context::of(&unit, &[]);
                 let judged = judge(&unit, &cx, status, stdout, b"err\n");
                 let logs_error = stdout.starts_with(b"cargo::error") || stdout.windows(14).any(|it| it == b"\ncargo::error=");
@@ -227,7 +226,7 @@ fn a_run_cargo_accepts_is_judged_without_allocating() {
     let unit = Unit::default();
     let (logged, accepted) = blaze_alloc_count::assert_at_most(0, "the check for an error", || {
         let logged = log_lines(stdout).count();
-        (logged, refused(&unit, ExitStatus::from_raw(0), stdout, b"err\n").is_ok())
+        (logged, refused(&unit, Ended::exited(0), stdout, b"err\n").is_ok())
     });
     assert_eq!((logged, accepted), (2, true));
 }

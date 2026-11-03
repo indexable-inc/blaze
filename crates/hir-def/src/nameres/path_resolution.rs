@@ -943,7 +943,7 @@ impl DefMap {
 
 /// Given a block module, returns its nearest non-block module and the `DefMap` it belongs to.
 #[inline]
-fn adjust_to_nearest_non_block_module<'db>(
+pub(super) fn adjust_to_nearest_non_block_module<'db>(
     db: &'db Db,
     mut def_map: &'db DefMap,
     mut local_id: ModuleId,

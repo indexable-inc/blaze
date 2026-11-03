@@ -46,6 +46,13 @@ pub enum FrontRef<I, S> {
 pub struct Described<I, S> {
     pub item: ItemKey,
     pub code: CodeHash,
+    /// The code a caller that builds its body in has of it, which a
+    /// [`CompiledFunction::inlined`] names it by: a copy built in is built under the copy's
+    /// options (`MirOptions::built_in`), which read no dyn facts, so for one whose own unit is
+    /// built against them (`code` then hashes this code with the facts it read) the two
+    /// differ; `code` otherwise. The caller's own `Devirtualize` may still make a `dyn` call
+    /// in the copy direct; what it read keys the caller's `code`, not this.
+    pub built_in_code: CodeHash,
     /// The content ID of its type arguments' facts its code reads.
     pub args: ContentId,
     /// Whose code it is: the item's crate's, or for a generic, the crate that instantiates it.
@@ -66,14 +73,16 @@ pub struct Described<I, S> {
     /// The places among `refs` of the functions whose bodies its code builds in, as LLVM's
     /// always-inliner does at -O0: `#[inline(always)]` callees of crates no edit reaches.
     /// Their keys, and those of what they build in, are in its store key; its
-    /// [`CompiledFunction::inlined`] may name only their code hashes.
+    /// [`CompiledFunction::inlined`] may name only their [`Self::built_in_code`]s.
     pub built_in: Vec<u32>,
     /// What a debugger and a backtrace call it: rustc's demangled name of the instance,
     /// with its generic arguments (`core::ptr::drop_in_place<alloc::string::String>`).
     pub name: String,
-    /// Whose it is for a dependency image: [`Owner::Dependency`] when its item is a
-    /// dependency's or the standard library's and none of its type arguments names a
-    /// workspace crate's type, closure or item; an `asm!` function is its asker's.
+    /// Whose it is for a dependency image, as the front end decides for every function and
+    /// static of the build by one rule: [`Owner::Dependency`] for the standard library's code
+    /// in every build, and for a dependency's when the build links an image, no edit reaches
+    /// its crate and none of its type arguments names a workspace crate's type, closure or
+    /// item; [`Owner::Workspace`] otherwise. An `asm!` function is its asker's.
     pub owner: Owner,
     /// What it is across versions, before its settings ([`crate::exec::fn_id`]): its item's
     /// key, which instance of the item it is (a closure by its place in its owner's body, a
@@ -89,6 +98,16 @@ pub struct Described<I, S> {
     /// panic machinery, a diverging `#[track_caller]` function, a closure of one of those.
     /// A profile that saw it run wins (docs/v2/plan/lanes/layout/layout.md).
     pub cold: bool,
+}
+
+impl<I, S> Described<I, S> {
+    /// The codes a store key that holds this body holds: its own `code`, which an import of
+    /// its compiled body is, and its [`Self::built_in_code`], which `code` hashes, which a
+    /// copy of its body built into a caller is. What [`CompiledFunction::inlined`] may name
+    /// of it (`driver`'s `unkept_inline`).
+    pub fn held_codes(&self) -> [CodeHash; 2] {
+        [self.code, self.built_in_code]
+    }
 }
 
 /// What the front end says of a static.
@@ -112,6 +131,10 @@ pub struct DescribedStatic<I, S> {
     /// `#[link_section]`, as written.
     pub section: Option<String>,
     pub origin: Origin,
+    /// Whose it is for a dependency image: its crate's, by the rule that decides a function's
+    /// ([`Described::owner`]), so a static of a crate whose functions are the workspace's is
+    /// the workspace's too. Never read off `origin`, which is the settings' concept.
+    pub owner: Owner,
     pub symbol: Option<String>,
     /// Its path, as errors name it (`krate::module::NAME`).
     pub name: String,

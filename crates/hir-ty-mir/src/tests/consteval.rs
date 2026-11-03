@@ -2664,6 +2664,47 @@ fn static_read_through_another() {
     );
 }
 
+/// A constant may read a static (rustc's `const_refs_to_static`, stable since Rust 1.83): the
+/// const argument `{ S }` and the array length `S` are anon consts whose evaluation reads `S`,
+/// with no E0013 and no other diagnostic. Type checking `m::<{ S }>()` normalizes `{ S }`, which
+/// evaluates it, so this needs MIR: it lives here, not in hir-ty's tests, which link none.
+#[test]
+fn a_static_as_a_const_arg_is_an_anon_const_that_reads_it() {
+    let fixture = r#"
+//- minicore: sized
+struct T;
+impl T {
+    fn m<const N: usize>(&self) {}
+}
+static S: usize = 5;
+fn statik() {
+    T.m::<{ S }>();
+}
+const fn n<const N: usize>() -> usize { N }
+const fn len<const N: usize>(_: [u8; N]) -> usize { N }
+const fn of_s(a: [u8; S]) -> usize { len(a) }
+const GOAL: usize = n::<{ S }>() * 10 + of_s([0; 5]);
+"#;
+    let fx = fixture::db(fixture);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    crate::attach_db(&db, || {
+        let def_map = hir_def::nameres::crate_def_map(&db, fixture::test_crate(&db));
+        for (_, module) in def_map.modules(&db) {
+            for def in module.scope(&db).declarations() {
+                let body = match def {
+                    hir_def::ModuleDefId::FunctionId(it) => hir_def::DefWithBodyId::FunctionId(it),
+                    hir_def::ModuleDefId::ConstId(it) => hir_def::DefWithBodyId::ConstId(it),
+                    _ => continue,
+                };
+                let infer = crate::InferenceResult::of(&db, crate::InferBodyId::DefWithBodyId(body));
+                assert!(infer.diagnostics().is_empty(), "{body:?} reads a static: {:?}", infer.diagnostics());
+            }
+        }
+    });
+    check_number_in(&db, file_id, 55);
+}
+
 #[test]
 fn static_written_by_a_static() {
     let modifying = |e: ConstEvalError<'_>| {

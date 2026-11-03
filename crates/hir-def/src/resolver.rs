@@ -13,7 +13,7 @@ use hir_expand::{
 use intern::{Symbol, sym};
 use smallvec::SmallVec;
 use span::SyntaxContext;
-use syntax::{SyntaxKind, view::HasName};
+use syntax::view::HasName;
 
 use crate::{
     AdtId, AstIdLoc, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId,
@@ -34,7 +34,8 @@ use crate::{
     item_scope::{BUILTIN_SCOPE, BuiltinShadowMode, ImportOrExternCrate, ItemScope},
     lang_item::LangItemTarget,
     nameres::{
-        DefMap, LocalDefMap, MacroSubNs, ResolvePathResultPrefixInfo, block_def_map, uses::Use,
+        DefMap, Hygienic, LocalDefMap, MacroSubNs, ResolvePathResultPrefixInfo, block_def_map,
+        uses::Use,
     },
     per_ns::{MacrosItem, Namespace, PerNs},
     signatures::ImplSignature,
@@ -227,16 +228,28 @@ impl<'db> Resolver<'db> {
         )
     }
 
-    /// The scope where the `macro` that wrote a name with `hygiene` is defined, for the
-    /// items it names there.
-    pub fn def_site(db: &'db Db, hygiene: HygieneId) -> Option<Resolver<'db>> {
-        Some(macro_def_site(db, hygiene)?.resolver(db))
-    }
-
     pub fn resolve_path_in_type_ns_with_prefix_info(
         &self,
         db: &Db,
         path: Path<'_>,
+    ) -> Option<(
+        TypeNs,
+        Option<usize>,
+        Option<ImportOrExternCrate>,
+        ResolvePathResultPrefixInfo,
+        Visibility,
+    )> {
+        self.resolve_path_in_type_ns_hygienic(db, path, HygieneId::ROOT)
+    }
+
+    /// [`Self::resolve_path_in_type_ns_with_prefix_info`] of a path whose first segment has
+    /// `hygiene`: a path a `macro` wrote is looked up in the item scopes its def-site hygiene
+    /// says ([`DefMap::hygienic_origin`]).
+    pub fn resolve_path_in_type_ns_hygienic(
+        &self,
+        db: &Db,
+        path: Path<'_>,
+        hygiene: HygieneId,
     ) -> Option<(
         TypeNs,
         Option<usize>,
@@ -271,9 +284,13 @@ impl<'db> Resolver<'db> {
             }
         };
         let first_name = path.segments().first()?;
+        let hygienic = self.hygienic_items(db, path, Namespace::Types, hygiene);
         let skip_to_mod = path.kind != PathKind::Plain;
         if skip_to_mod {
-            return self.skip_to_mod(|scope| scope.resolve_path_in_type_ns(db, path));
+            return match hygienic {
+                Some(items) => items?.resolve_path_in_type_ns(db, path),
+                None => self.skip_to_mod(|scope| scope.resolve_path_in_type_ns(db, path)),
+            };
         }
 
         let remaining_idx = || {
@@ -315,6 +332,8 @@ impl<'db> Resolver<'db> {
                         ));
                     }
                 }
+                // The scope def-site hygiene says, below.
+                Scope::BlockScope { .. } if hygienic.is_some() => continue,
                 Scope::BlockScope { def_map, module_id } => {
                     let m = self.block_items(def_map, module_id);
                     if let Some(res) = m.resolve_path_in_type_ns(db, path) {
@@ -345,7 +364,10 @@ impl<'db> Resolver<'db> {
                 }
             }
         }
-        self.module_scope.resolve_path_in_type_ns(db, path)
+        match hygienic {
+            Some(items) => items?.resolve_path_in_type_ns(db, path),
+            None => self.module_scope.resolve_path_in_type_ns(db, path),
+        }
     }
 
     pub fn resolve_path_in_type_ns_fully(
@@ -460,18 +482,15 @@ impl<'db> Resolver<'db> {
         let tmp = Name::new_symbol_root(sym::self_);
         let first_name = if path.is_self() { &tmp } else { path.segments().first()? };
         let skip_to_mod = path.kind != PathKind::Plain && !path.is_self();
-        let path_hygiene = hygiene_id;
+        // Where the item scopes are for a path a `macro` wrote: its locals are told apart by
+        // `hygiene_id` below, its items by def-site hygiene.
+        let ns = if n_segments <= 1 { Namespace::Values } else { Namespace::Types };
+        let hygienic = self.hygienic_items(db, path, ns, hygiene_id);
         if skip_to_mod {
-            // A `macro` names the modules of where it is defined, private ones too: its
-            // `crate::` path is looked up there when it is not visible where the macro is used,
-            // as a plain path is below.
-            return self.skip_to_mod(|scope| scope.resolve_path_in_value_ns(db, path)).or_else(
-                || {
-                    macro_def_site(db, path_hygiene).and_then(|module| {
-                        module.resolver(db).module_scope.resolve_path_in_value_ns(db, path)
-                    })
-                },
-            );
+            return match hygienic {
+                Some(items) => items?.resolve_path_in_value_ns(db, path),
+                None => self.skip_to_mod(|scope| scope.resolve_path_in_value_ns(db, path)),
+            };
         }
 
         if n_segments <= 1 {
@@ -521,6 +540,8 @@ impl<'db> Resolver<'db> {
                             ));
                         }
                     }
+                    // The scope def-site hygiene says, below.
+                    Scope::BlockScope { .. } if hygienic.is_some() => continue,
                     Scope::BlockScope { def_map, module_id } => {
                         let m = self.block_items(def_map, module_id);
                         if let Some(def) = m.resolve_path_in_value_ns(db, path) {
@@ -561,6 +582,8 @@ impl<'db> Resolver<'db> {
                             ));
                         }
                     }
+                    // The scope def-site hygiene says, below.
+                    Scope::BlockScope { .. } if hygienic.is_some() => continue,
                     Scope::BlockScope { def_map, module_id } => {
                         let m = self.block_items(def_map, module_id);
                         if let Some(def) = m.resolve_path_in_value_ns(db, path) {
@@ -571,13 +594,11 @@ impl<'db> Resolver<'db> {
             }
         }
 
-        if let Some(res) = self.module_scope.resolve_path_in_value_ns(db, path) {
-            return Some(res);
-        }
-
-        if let Some(res) = macro_def_site(db, path_hygiene)
-            .and_then(|module| module.resolver(db).module_scope.resolve_path_in_value_ns(db, path))
-        {
+        let items = match hygienic {
+            Some(items) => items,
+            None => Some(self.module_scope),
+        };
+        if let Some(res) = items.and_then(|items| items.resolve_path_in_value_ns(db, path)) {
             return Some(res);
         }
 
@@ -688,8 +709,16 @@ impl<'db> Resolver<'db> {
         if !in_items {
             return;
         }
-        // The item scope the lookup answered from: the innermost block that has the path, the
-        // module, or the module where the macro that wrote it is defined.
+        // The item scope the lookup answered from: where def-site hygiene says for a path a
+        // `macro` wrote, else the innermost block that has the path, or the module.
+        if let Some(items) = self.hygienic_items(db, mod_path, ns, hygiene) {
+            if let Some(items) = items
+                && items.answers(db, mod_path, ns)
+            {
+                items.record_uses(db, mod_path, ns, out);
+            }
+            return;
+        }
         let block = self.scopes().find_map(|scope| match scope {
             Scope::BlockScope { def_map, module_id } => {
                 let items = self.block_items(def_map, module_id);
@@ -701,15 +730,6 @@ impl<'db> Resolver<'db> {
             self.module_scope.answers(db, mod_path, ns).then_some(self.module_scope)
         }) {
             items.record_uses(db, mod_path, ns, out);
-            return;
-        }
-        if ns == Namespace::Values
-            && let Some(module) = macro_def_site(db, hygiene)
-        {
-            let items = module.resolver(db).module_scope;
-            if items.answers(db, mod_path, ns) {
-                items.record_uses(db, mod_path, ns, out);
-            }
         }
     }
 
@@ -1252,25 +1272,6 @@ fn handle_macro_def_scope(
     }
 }
 
-/// The module of the `macro` whose expansion produced a name. Items named in such a macro are
-/// the ones in scope where the macro is defined.
-// FIXME: rustc looks there first; this is only reached when the name is unknown at the call site.
-pub(crate) fn macro_def_site(db: &Db, hygiene_id: HygieneId) -> Option<ModuleId> {
-    let (_, def) = hygiene_info(db, hygiene_id)?;
-    // Only a `macro` is found below, and it is defined by a `MACRO_DEF` node: a `macro_rules!`
-    // or a proc macro is turned away by one look at its node, not a walk over the crate's
-    // macros.
-    if def.kind.erased_ast_id().to_ptr(db).kind() != SyntaxKind::MACRO_DEF {
-        return None;
-    }
-    crate::crate_def_map(db, def.krate).modules(db).find_map(|(_, data)| {
-        data.scope(db).macros().find_map(|(_, it)| match it.def {
-            MacroId::Macro2Id(id) if it.def.definition(db) == def => Some(id.lookup(db).container),
-            _ => None,
-        })
-    })
-}
-
 #[inline]
 fn hygiene_info(
     db: &Db,
@@ -1319,6 +1320,38 @@ impl<'db> Resolver<'db> {
     /// The items of a module of a block's def map, which share the crate's local def map.
     fn block_items(&self, def_map: &'db DefMap, module_id: ModuleId) -> ModuleItemMap<'db> {
         ModuleItemMap { def_map, local_def_map: self.module_scope.local_def_map, module_id }
+    }
+
+    /// The item scope a path whose first segment has `hygiene` is looked up in, by a `macro`'s
+    /// def-site hygiene ([`DefMap::hygienic_origin`]), `ns` the first segment's namespace:
+    /// `None` where it is written (the blocks around it, then the module), `Some(None)` in none.
+    fn hygienic_items<'a>(
+        &'a self,
+        db: &'a Db,
+        path: &ModPath,
+        ns: Namespace,
+        hygiene: HygieneId,
+    ) -> Option<Option<ModuleItemMap<'a>>> {
+        if hygiene.is_root() {
+            return None;
+        }
+        let (def_map, module_id) = self
+            .scopes()
+            .find_map(|scope| match scope {
+                Scope::BlockScope { def_map, module_id } => Some((def_map, module_id)),
+                _ => None,
+            })
+            .unwrap_or((self.module_scope.def_map, self.module_scope.module_id));
+        let local_def_map = self.module_scope.local_def_map;
+        match def_map.hygienic_origin(db, module_id, path, Some(ns), hygiene.syntax_context()) {
+            Hygienic::Here => None,
+            Hygienic::Unknown => Some(None),
+            Hygienic::At(at) => Some(Some(ModuleItemMap {
+                def_map: def_map.map_for(db, at),
+                local_def_map: def_map.local_for(db, at, local_def_map),
+                module_id: at,
+            })),
+        }
     }
 
     fn resolve_module_path(

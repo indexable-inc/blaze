@@ -9,7 +9,9 @@
 //! MIR. Where the IR builder decides with code what it calls, the walk makes the same
 //! decision of the types. What it lists is the union over the settings of a unit: the blocks
 //! that any of them compiles (it walks with unwinding, `ub_checks()` and debug assertions
-//! on), each check overflow checks may make, each landing pad's routines.
+//! on), each check overflow checks may make, each landing pad's routines, and for a body some
+//! unit MIR-inlines, what the inliner takes with debug assertions and without
+//! ([`Build::WALKS_INLINED`]), which is no superset of either.
 
 use std::{borrow::Cow, hash::BuildHasher};
 
@@ -200,7 +202,7 @@ fn memo<'db>(
     match walked {
         Ok(walked) => Ok(Some(walked)),
         // alloc: the error's message
-        Err(what) => Err(hir_ty::attach_db(db, || format!("the references of {instance:?}: {what}"))),
+        Err(what) => Err(hir_ty::attach_db(db, || format!("the references of {}: {what}", super::Named(db, instance)))),
     }
 }
 
@@ -269,18 +271,18 @@ fn code_refs(
     // A body of the library's is inlined under `WALK` already, as in every unit; a coroutine
     // has nothing inlined into it (`hir-ty-mir` `inline.rs`). A body with nothing inlined is
     // walked again too: the callees it builds in are built under the unit's settings, where
-    // their own bodies are inlined.
+    // their own bodies are inlined. It is walked under each of [`Build::WALKS_INLINED`]: what
+    // the inliner takes is not monotone in debug assertions, so neither walk lists all a
+    // unit's code may ask for.
     let written = body.owner.module(db).krate(db);
-    let inlined = match inlined && !written.data(db).origin.is_lang() && body.coroutine.is_none()
-    {
-        true => Some(
-            // clone: as above, two `Copy` ids in a `Clone`-only type
-            crate::instance_body(db, instance, env.clone(), Some(Build { world, ..Build::WALK_INLINED }))
-                .map_err(told)?,
-        ),
-        false => None,
-    };
-    let inlined = inlined.as_deref();
+    let inlines = inlined && !written.data(db).origin.is_lang() && body.coroutine.is_none();
+    // alloc: inline, one body a walk of `WALKS_INLINED`
+    let mut inlined: SmallVec<[(Build, _); 2]> = SmallVec::new();
+    for build in Build::WALKS_INLINED.into_iter().filter(|_| inlines) {
+        let build = Build { world, ..build };
+        // clone: as above, two `Copy` ids in a `Clone`-only type
+        inlined.push((build, crate::instance_body(db, instance, env.clone(), Some(build)).map_err(told)?));
+    }
     // clone: `Found` owns the env the requests hold; two `Copy` ids in a `Clone`-only type
     let mut found = Found::new(env.clone(), Some(body));
     let env = env.as_ref(db);
@@ -292,11 +294,12 @@ fn code_refs(
         walk.edge(body, abi)?;
         walk.body(body)
     })?;
-    if let Some(inlined) = inlined {
+    for (build, inlined) in &inlined {
+        let inlined = &**inlined;
         found.read.extend_from_slice(&inlined.inlined.devirtualized);
         found.read.sort_unstable();
         found.read.dedup();
-        pass(db, env, Some(inlined), tracked, (Build { world, ..Build::WALK_INLINED }, &mut found), |walk| {
+        pass(db, env, Some(inlined), tracked, (*build, &mut found), |walk| {
             walk.fx.abi = abi;
             walk.fx.variadic = variadic;
             walk.fx.args = Some(instance.args);
@@ -530,6 +533,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             }
             if let DataRequest::Static(id) = request {
                 listed.add(places::static_ref(db, *id)?);
+                // A static of an `extern` block is at the program's edge, as a foreign
+                // function's signature is: code outside the program made what it holds.
+                let flags = hir_def::signatures::StaticSignature::of(db, *id).flags;
+                if flags.contains(hir_def::signatures::StaticFlags::EXTERN) {
+                    facts.foreign(&fx.infcx, fx.env.param_env, fx.static_ty(*id));
+                }
                 if is_thread_local(db, *id) {
                     listed.libcall(ir::LibCall::ElfTlsGetAddr);
                 }
@@ -682,7 +691,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         self.fx.cg.declare_inlined(&instance, body, self.fx.builder.func);
         self.build_in(at);
         // A unit builds the body under its own settings, where a callee this build has in
-        // it may not be built in and is called instead.
+        // it may not be built in and is called instead. What the body has in it, built in or
+        // put there by the MIR inliner under these settings, is the caller's code: listed
+        // here, as the callee's own units may have none of it (`built_in_body`).
         for nested in &body.built_in {
             let at = self.call_place(nested.def, nested.args.as_ref())?;
             if !matches!(self.found.listed.refs[at as usize], FrontRef::Function(_)) {

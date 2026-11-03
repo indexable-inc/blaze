@@ -1,0 +1,5 @@
+{
+  "x86_64.stencils": "554d9ac9dedcae30631dc38f144bb6ea892d711d47f3cbca348f4564b367338a",
+  "aarch64.stencils": "008913679efefb178efc7dd35733d0e879e3a1fb9b9221c188cb19bfdc610a93",
+  "aarch64_lse.stencils": "fb985f4fc006369070b61618ffa8972923c91022fc351b752211bfa1d7bdae2f"
+}

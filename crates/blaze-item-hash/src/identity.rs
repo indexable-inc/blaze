@@ -185,7 +185,7 @@ pub(crate) fn own_attrs(db: &Db, def: DefWithBodyId) -> Option<ContentId> {
         DefWithBodyId::StaticId(it) => AttrDefId::StaticId(it),
         DefWithBodyId::VariantId(_) => return None,
     };
-    crate::values::value(db, crate::values::attrs(db, owner)?)
+    crate::values::value(db, def.krate(db), crate::values::attrs(db, owner)?)
 }
 
 /// Which reads of a [`covered_queries`] query the identity covers, by its key.

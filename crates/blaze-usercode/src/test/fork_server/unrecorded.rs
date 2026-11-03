@@ -4,8 +4,13 @@
 // armed, and every end says the record is not whole and why.
 #[cfg(unix)]
 mod exec {
+    use super::std;
+    #[allow(unused_imports)]
+    use self::std::prelude::rust_2021::*;
+    #[allow(unused_imports)]
+    use self::std::{eprintln, format, vec};
     use super::{End, UNRECORDED};
-    use ::std::borrow::Cow;
+    use self::std::borrow::Cow;
 
     pub struct Exec;
 

@@ -113,6 +113,10 @@ pub(crate) fn kind(unit: &Unit) -> Result<ArtifactKind, ApiError> {
     if matches!(unit.mode, Mode::Test) {
         return Ok(ArtifactKind::Test);
     }
+    // A library's doctests: its runner, which runs each example as its own program.
+    if matches!(unit.mode, Mode::Doctest) {
+        return Ok(ArtifactKind::Doctest);
+    }
     if kinds.iter().any(|it| it == "proc-macro") {
         return Ok(ArtifactKind::ProcMacro);
     }
@@ -134,7 +138,8 @@ pub(crate) fn profile(unit: &Unit) -> UnitProfile {
         debuginfo: debuginfo(&profile.debuginfo),
         debug_assertions: profile.debug_assertions,
         overflow_checks: profile.overflow_checks,
-        test: matches!(unit.mode, Mode::Test),
+        // cargo's `is_any_test`, which a doctest is.
+        test: matches!(unit.mode, Mode::Test | Mode::Doctest),
     }
 }
 
@@ -206,7 +211,8 @@ pub(crate) fn filenames(_unit: &Unit, plan: &UnitPlan) -> Vec<String> {
 /// of any target), at its uplifted path when cargo uplifts it; none for a build script.
 pub(crate) fn executable(unit: &Unit, plan: &UnitPlan) -> Option<String> {
     let runs = match unit.mode {
-        Mode::Test => true,
+        // A doctest unit's program is its runner (docs/v2/plan/doctests.md).
+        Mode::Test | Mode::Doctest => true,
         Mode::Build => {
             let kinds = &unit.target.kind;
             kinds.iter().any(|it| it == "bin")

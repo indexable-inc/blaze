@@ -48,6 +48,7 @@ use blaze_usercode::{Given, RunKey, index, trace};
 use hir_ty_borrowck::Mode;
 use memchr::memmem;
 
+#[cfg(feature = "net")]
 use crate::sign::Publisher;
 
 /// Where an input of a key comes from.
@@ -866,6 +867,7 @@ impl Secrets {
     }
 
     /// The publisher's seed, raw and as hex.
+    #[cfg(feature = "net")]
     pub fn publisher(&mut self, publisher: &Publisher) {
         let seed = publisher.seed();
         self.add("the publisher's seed", seed).expect("a seed is 32 bytes");
@@ -1365,6 +1367,7 @@ mod tests {
         assert!(error.why.contains("a dependency's check key"), "{error}");
     }
 
+    #[cfg(feature = "net")]
     #[test]
     fn secrets_are_found_and_never_named_by_value() {
         let publisher = crate::sign::tests::publisher(42);

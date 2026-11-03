@@ -33,6 +33,7 @@
 mod answer;
 mod const_macros;
 mod crates;
+mod doctests;
 mod files;
 mod harness;
 #[cfg(test)]
@@ -63,6 +64,7 @@ pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
 
 pub use self::answer::{SubRequest, SubResponse, answer};
 pub use self::crates::{lint_flags, local, target_data};
+pub use self::doctests::DoctestProgram;
 pub use self::harness::{Appended, macros_loaded, wasm_macro};
 
 /// What [`lower`] lowers.
@@ -95,7 +97,7 @@ pub struct Lower<'a, T> {
 /// run (`SHLVL`, `OLDPWD`, `TERM_SESSION_ID`, `INVOCATION_ID`), so a no-op build lowered all
 /// again: 86 s in place of about 1 s.
 pub fn config_differs(kept: &BuildConfig, now: &BuildConfig) -> Option<String> {
-    let BuildConfig { invocation, mounts, host, library, std, builds } = kept;
+    let BuildConfig { invocation, mounts, host, library, std, builds, sources } = kept;
     let blaze_units::query::Invocation { command: _, args: _, root, cwd: _, env: _, files: _ } = invocation;
     if mounts != &now.mounts {
         return Some("its mounts".to_owned()); // alloc: a reason, once per front end let go
@@ -111,6 +113,9 @@ pub fn config_differs(kept: &BuildConfig, now: &BuildConfig) -> Option<String> {
     }
     if builds != &now.builds {
         return Some("where its build directories are placed".to_owned()); // alloc: a reason, once per front end let go
+    }
+    if sources != &now.sources {
+        return Some("where its fetched packages are kept".to_owned()); // alloc: a reason, once per front end let go
     }
     if root != &now.invocation.root {
         return Some("its checkout's root".to_owned()); // alloc: a reason, once per front end let go
@@ -193,6 +198,8 @@ pub struct Lowered {
     /// Each package's const macros, listed again by [`Lowered::refresh`] when their file
     /// changes.
     const_macros: Vec<const_macros::Loaded>,
+    /// The crates of each `Doctest` unit's examples and runner ([`Lowered::doctests`]).
+    doctests: Vec<doctests::OfUnit>,
 }
 
 /// A directory read into a package's source root.
@@ -245,6 +252,20 @@ struct Lowering {
     env: Vec<(String, String)>,
     /// Whether its crate is a proc macro's dylib (a `proc-macro` target built without `--test`).
     proc_macro: bool,
+    /// For a unit built to run in the macro host, whether its crate links `proc_macro`, as its
+    /// root read when lowered.
+    macro_host: Option<MacroHost>,
+}
+
+/// What a macro-host crate's cfg was decided by ([`crates::host_side`]): its root, the root's
+/// text when read and its edition, and whether it links `proc_macro`: always, for a proc
+/// macro, whatever its root says.
+struct MacroHost {
+    root: FileId,
+    content: ContentId,
+    edition: span::Edition,
+    proc_macro: bool,
+    links: bool,
 }
 
 struct Applied {
@@ -279,6 +300,7 @@ pub fn lower_into<T: blaze_query::Tree>(mut db: Db, lower: Lower<'_, T>) -> Resu
         view,
         workspace_root,
         const_macros,
+        doctests: Vec::new(),
     })
 }
 
@@ -461,6 +483,7 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
             cfg: CfgOptions::default(),
             env: Vec::new(),
             proc_macro: compiles && unit.target.is_proc_macro() && !crates::is_test(unit, plan),
+            macro_host: None,
         });
     }
     for (index, unit) in units.graph.units.iter().enumerate() {
@@ -557,6 +580,22 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
                 src,
             ));
         };
+        // A crate of the macro host that links `proc_macro` is told of the host's side, as
+        // rustc builds it for the host (`crates::host_side`). Decided from the root's text,
+        // which `Lowered::refresh` reads again.
+        let macro_host = match plan.macro_wasm {
+            true => {
+                let read: &Db = &*db;
+                let text = read.file_text(root_file);
+                let (edition, proc_macro) = (crates::edition(unit, what)?, unit.target.is_proc_macro());
+                let links = crates::links_proc_macro(proc_macro, &**text.text(read), edition);
+                if links {
+                    crates::host_side(&mut cfg);
+                }
+                Some(MacroHost { root: root_file, content: text.content(read), edition, proc_macro, links })
+            }
+            false => None,
+        };
         let mut dependencies = Vec::with_capacity(unit.dependencies.len());
         for dep in &unit.dependencies {
             let on = &units.graph.units[dep.index];
@@ -635,6 +674,7 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
         let lowering = &mut lowerings[index];
         lowering.krate = Some(krate);
         lowering.cfg = cfg;
+        lowering.macro_host = macro_host;
         lowering.env = plan.env.clone();
     }
     base_db::set_all_crates_with_durability(db, all, Durability::MEDIUM);
@@ -831,7 +871,9 @@ impl Lowered {
     /// mounts' fixed roots not read again), so the database's memos stay and only what the
     /// change reaches runs again. The runs and proc macros applied stay until applied again.
     /// `Ok(false)`, nothing changed, when the view moves the workspace's root or what its
-    /// manifest sets, which every crate is made with: it is to be [`lower`]ed anew.
+    /// manifest sets, which every crate is made with, or whether a crate of the macro host
+    /// links `proc_macro` ([`MacroHost`]), which its cfg is made with: it is to be [`lower`]ed
+    /// anew. In the last case the view's files are already written, to a front end let go.
     ///
     /// `seed` runs in the same write once the new texts are set, before the write's
     /// maintainers parse them: where an edit's trees are handed over
@@ -864,7 +906,21 @@ impl Lowered {
         self.db.admit_parses();
         // One change: the view's files, the seeds and the const macros they list, one batch.
         self.batch(Trigger::named("the view moved"), |this| this.refresh_writes(&tree, root, seed))?;
-        Ok(true)
+        // A crate of the macro host whose root now links `proc_macro` or no longer does is
+        // made with another cfg (`crates::host_side`): lowered anew, as a moved root is.
+        Ok(!self.macro_host_moved())
+    }
+
+    /// Whether a macro-host crate's root, read again, links `proc_macro` other than it did
+    /// when lowered ([`MacroHost`]).
+    fn macro_host_moved(&self) -> bool {
+        let db = &self.db;
+        self.crates.units.iter().filter_map(|it| it.macro_host.as_ref()).any(|host| {
+            let text = db.file_text(host.root);
+            !host.proc_macro
+                && text.content(db) != host.content
+                && crates::links_proc_macro(false, &**text.text(db), host.edition) != host.links
+        })
     }
 
     /// [`Lowered::refresh`]'s writes, in its batch: the view `root` read through `tree`.

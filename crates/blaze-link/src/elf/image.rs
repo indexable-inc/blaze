@@ -14,10 +14,10 @@ use object::elf;
 use super::dynamic::{CHUNK, Strings, Sym, info, numbered, shndx, value};
 use super::{
     BUILD_ID, DYNAMIC, DYNSTR, DYNSYM, EH_FRAME_HDR, EHDR, Elf, GNU_HASH, INTERP, PHDR, RELA_DYN, Segment, VERNEED,
-    VERSYM, error, in_file,
+    VERSYM, error,
 };
 use crate::cow::CowBytes;
-use crate::model::{Class, File, Function, Placed, Plan, Region, Reserve, Splice, SymbolKind};
+use crate::model::{Class, File, Function, Placed, Plan, Region, Reserve, Splice, SymbolKind, zeroed};
 use crate::{LinkError, OutputKind};
 
 const SYM: usize = 24;
@@ -372,7 +372,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     for region in regions {
         let segment = Segment::of(&region.class);
         let end = region.addr + region.capacity.max(region.size);
-        let file = in_file(&region.class);
+        let file = !zeroed(&region.class);
         match loads.last_mut() {
             Some(load) if load.segment == segment => {
                 if file && load.zeroed {
@@ -610,7 +610,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
 
     let tail = regions
         .iter()
-        .filter(|it| in_file(&it.class))
+        .filter(|it| !zeroed(&it.class))
         .map(|it| it.addr - plan.base + it.capacity.max(it.size))
         .fold(plan.headers, u64::max)
         .next_multiple_of(8);

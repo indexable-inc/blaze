@@ -1,7 +1,12 @@
 //! Lowers one function of Cranelift IR to a WebAssembly function body.
 //!
 //! Cranelift has no WebAssembly backend, so this takes the IR the rest of codegen builds and
-//! writes wasm from it directly. The target is `wasm32`, so an address is an `i32`.
+//! writes wasm from it directly. The target is `wasm32`, where an address is an `i32`, or
+//! `wasm64` (memory64, blaze's `wasm64-blaze-wasip1`), where it is an `i64`: the IR's pointer
+//! type is the address's, and what the lowering makes of its own (the stack pointer and the
+//! frame, the address of data or of a slot, the pointer a function returns through) is of the
+//! [`Address`] the target has. The function table stays 32-bit on both, so a slot is wrapped
+//! to an `i32` for `call_indirect`.
 //!
 //! What comes out is not a module. A [`WasmFunction`] names the functions and data it uses
 //! through relocations, like machine code does, and a linker gives them places:
@@ -53,10 +58,42 @@ use super::target::Calls;
 /// How many bytes an operand a linker fills in takes: a LEB128 padded to full length.
 pub const INDEX_LEN: usize = 5;
 
-/// The relocation of a `call` operand: the index of the function. The other relocation
-/// here, `Abs4`, is of an `i32.const` operand: the address of data, or the slot of a function.
+/// The relocation of a `call` operand: the index of the function. The others here are of
+/// the address of data or the slot of a function: `Abs4` of an `i32.const` operand (wasm32),
+/// `Abs8` of an `i64.const` operand (wasm64), each a padded LEB of its full length.
 pub(super) const CALL: cranelift_codegen::binemit::Reloc =
     cranelift_codegen::binemit::Reloc::X86CallPCRel4;
+
+/// How many bytes an `i64.const` operand a linker fills in takes: a signed LEB128 padded to the
+/// full length of a 64-bit value.
+pub const INDEX64_LEN: usize = 10;
+
+/// The width of an address in the target's linear memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Address {
+    /// wasm32: an `i32`.
+    Bits32,
+    /// wasm64 (memory64): an `i64`.
+    Bits64,
+}
+
+impl Address {
+    /// Of a target: [`Address::Bits64`] where it addresses a 64-bit memory.
+    pub fn of(target: &super::Target) -> Address {
+        if target.memory64() { Address::Bits64 } else { Address::Bits32 }
+    }
+
+    pub fn wasm(self) -> WasmType {
+        match self {
+            Address::Bits32 => WasmType::I32,
+            Address::Bits64 => WasmType::I64,
+        }
+    }
+
+    fn is_64(self) -> bool {
+        self == Address::Bits64
+    }
+}
 
 /// A value type, as its byte in the binary format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -129,11 +166,13 @@ impl WasmSignature {
         Ok(WasmSignature { params: types(&signature.params)?, results: types(&signature.results)? })
     }
 
-    pub fn of(sig: &Signature) -> Result<WasmSignature, String> {
+    /// The type of a function of `sig` whose addresses are `address`: the pointer it returns
+    /// through, when it does, is one.
+    pub fn of(sig: &Signature, address: Address) -> Result<WasmSignature, String> {
         let mut params = Vec::with_capacity(sig.params.len() + 1);
         let returned = Returned::of(sig)?;
         if let Returned::Through(_) = returned {
-            params.push(WasmType::I32);
+            params.push(address.wasm());
         }
         for param in &sig.params {
             match Class::of(param.value_type)? {
@@ -250,12 +289,14 @@ impl WasmFunction {
     }
 }
 
-/// Lowers `func`. The relocations are relative to the start of the body.
+/// Lowers `func` for a memory whose addresses are `address`. The relocations are relative to
+/// the start of the body.
 pub(super) fn lower(
     func: &Function,
     calls: Calls,
+    address: Address,
 ) -> Result<(WasmFunction, Vec<ModuleReloc>), String> {
-    Lower::new(func, calls)?.run()
+    Lower::new(func, calls, address)?.run()
 }
 
 /// How a Cranelift type is held in wasm locals.
@@ -461,6 +502,8 @@ impl Op {
 struct Lower<'a> {
     func: &'a Function,
     calls: Calls,
+    /// The width of the addresses of the memory.
+    address: Address,
     signature: WasmSignature,
     returned: Returned,
     /// Where in the frame the values are written that a called function returns through a
@@ -498,8 +541,8 @@ fn mem(offset: u64) -> MemArg {
 }
 
 impl<'a> Lower<'a> {
-    fn new(func: &'a Function, calls: Calls) -> Result<Self, String> {
-        let signature = WasmSignature::of(&func.signature)?;
+    fn new(func: &'a Function, calls: Calls, address: Address) -> Result<Self, String> {
+        let signature = WasmSignature::of(&func.signature, address)?;
         let returned = Returned::of(&func.signature)?;
         let mut order = SecondaryMap::new();
         let mut block_count = 0;
@@ -531,6 +574,7 @@ impl<'a> Lower<'a> {
         let mut this = Lower {
             func,
             calls,
+            address,
             returned,
             returned_at,
             reachable: Self::reachable(func),
@@ -556,7 +600,7 @@ impl<'a> Lower<'a> {
             stack_pointer_fixups: Vec::new(),
         };
         if size != 0 || !this.slot_offsets.is_empty() {
-            let frame = this.temp(ValType::I32);
+            let frame = this.temp(address.wasm().into());
             this.frame = Some((frame, size.next_multiple_of(16)));
         }
         Ok(this)
@@ -588,8 +632,8 @@ impl<'a> Lower<'a> {
         }
         if let Some((frame, size)) = self.frame {
             self.stack_pointer(false);
-            self.i(I::I32Const(size as i32));
-            self.i(I::I32Sub);
+            self.address_const(size as i64);
+            self.i(if self.address.is_64() { I::I64Sub } else { I::I32Sub });
             self.i(I::LocalTee(frame));
             self.stack_pointer(true);
         }
@@ -712,6 +756,21 @@ impl<'a> Lower<'a> {
     fn index_to_fill(&mut self) {
         self.code.extend([0x80; INDEX_LEN - 1]);
         self.code.push(0);
+    }
+
+    /// Pushes a constant of the address's width.
+    fn address_const(&mut self, value: i64) {
+        self.constant(value, self.address.is_64());
+    }
+
+    /// Adds the two addresses (or address and offset) on the stack.
+    fn address_add(&mut self) {
+        self.i(if self.address.is_64() { I::I64Add } else { I::I32Add });
+    }
+
+    /// A fresh local that holds an address.
+    fn address_temp(&mut self) -> u32 {
+        self.temp(self.address.wasm().into())
     }
 
     fn temp(&mut self, ty: ValType) -> u32 {
@@ -867,15 +926,25 @@ impl<'a> Lower<'a> {
             return Err(format!("wasm: address of {name:?}"));
         };
         let name = &self.func.params.user_named_funcs()[*name];
-        // `i32.const`, then the operand.
-        self.code.push(0x41);
+        // `i32.const` or `i64.const`, then the operand.
+        let (opcode, kind) = match self.address {
+            Address::Bits32 => (0x41, cranelift_codegen::binemit::Reloc::Abs4),
+            Address::Bits64 => (0x42, cranelift_codegen::binemit::Reloc::Abs8),
+        };
+        self.code.push(opcode);
         self.relocs.push(ModuleReloc {
             offset: self.code.len() as u32,
-            kind: cranelift_codegen::binemit::Reloc::Abs4,
+            kind,
             name: ModuleRelocTarget::user(name.namespace, name.index),
             addend,
         });
-        self.index_to_fill();
+        match self.address {
+            Address::Bits32 => self.index_to_fill(),
+            Address::Bits64 => {
+                self.code.extend([0x80; INDEX64_LEN - 1]);
+                self.code.push(0);
+            }
+        }
         Ok(())
     }
 
@@ -902,9 +971,13 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Calls through the table the function whose slot is on the stack.
+    /// Calls through the table the function whose slot is on the stack: an address, which the
+    /// 32-bit table takes as an `i32`.
     fn call_slot(&mut self, signature: &Signature) -> Result<(), String> {
-        let signature = WasmSignature::of(signature)?;
+        let signature = WasmSignature::of(signature, self.address)?;
+        if self.address.is_64() {
+            self.i(I::I32WrapI64);
+        }
         let index = match self.types.iter().position(|it| *it == signature) {
             Some(index) => index,
             None => {
@@ -928,8 +1001,8 @@ impl<'a> Lower<'a> {
         let offset = self.slot_offsets[slot.index()] as i64 + offset;
         self.i(I::LocalGet(frame));
         if offset != 0 {
-            self.i(I::I32Const(offset as i32));
-            self.i(I::I32Add);
+            self.address_const(offset);
+            self.address_add();
         }
         Ok(())
     }
@@ -941,8 +1014,8 @@ impl<'a> Lower<'a> {
         if offset >= 0 {
             return Ok(offset as u64);
         }
-        self.i(I::I32Const(offset as i32));
-        self.i(I::I32Add);
+        self.address_const(offset);
+        self.address_add();
         Ok(0)
     }
 
@@ -1088,8 +1161,8 @@ impl<'a> Lower<'a> {
         stored?;
         if let Some((frame, size)) = self.frame {
             self.i(I::LocalGet(frame));
-            self.i(I::I32Const(size as i32));
-            self.i(I::I32Add);
+            self.address_const(size as i64);
+            self.address_add();
             self.stack_pointer(true);
         }
         self.i(I::Return);
@@ -1131,7 +1204,7 @@ impl<'a> Lower<'a> {
             Class::Pair => {
                 let high = self.temp(ValType::I64);
                 let low = self.temp(ValType::I64);
-                let address = self.temp(ValType::I32);
+                let address = self.address_temp();
                 self.i(I::LocalSet(high));
                 self.i(I::LocalSet(low));
                 self.i(I::LocalTee(address));
@@ -1153,7 +1226,7 @@ impl<'a> Lower<'a> {
             Class::F64 => self.i(I::F64Load(mem(offset))),
             Class::V128 => self.i(I::V128Load(mem(offset))),
             Class::Pair => {
-                let address = self.temp(ValType::I32);
+                let address = self.address_temp();
                 self.i(I::LocalTee(address));
                 self.i(I::I64Load(mem(offset)));
                 self.i(I::LocalGet(address));
@@ -1172,8 +1245,8 @@ impl<'a> Lower<'a> {
             };
             let (frame, _) = self.frame.ok_or("wasm: no frame for what a call returns")?;
             self.i(I::LocalGet(frame));
-            self.i(I::I32Const(at as i32));
-            self.i(I::I32Add);
+            self.address_const(at as i64);
+            self.address_add();
         }
         for (&arg, param) in args.iter().zip(&signature.params) {
             self.get_for(arg, param.extension == ir::ArgumentExtension::Sext)?;
@@ -1303,9 +1376,11 @@ impl<'a> Lower<'a> {
         if let (&[to, ..], &[result]) = (args, results) {
             self.get(to)?;
             // Cranelift's frontend types what the routine returns as an address of the
-            // machine it has a backend for.
-            if self.func.dfg.value_type(result) == types::I64 {
-                self.i(I::I64ExtendI32U);
+            // machine it has a backend for, which a wasm32 address is narrower than.
+            match (self.ty(to) == types::I64, self.func.dfg.value_type(result) == types::I64) {
+                (false, true) => self.i(I::I64ExtendI32U),
+                (true, false) => self.i(I::I32WrapI64),
+                _ => {}
             }
             self.set(result)?;
         }
@@ -1332,9 +1407,12 @@ impl<'a> Lower<'a> {
             for ret in &signature.returns {
                 let wide = ret.value_type == types::I64;
                 let local = self.temp(if wide { ValType::I64 } else { ValType::I32 });
-                self.get(*args.first().ok_or("wasm: a memory routine of no address")?)?;
-                if wide {
-                    self.i(I::I64ExtendI32U);
+                let to = *args.first().ok_or("wasm: a memory routine of no address")?;
+                self.get(to)?;
+                match (self.ty(to) == types::I64, wide) {
+                    (false, true) => self.i(I::I64ExtendI32U),
+                    (true, false) => self.i(I::I32WrapI64),
+                    _ => {}
                 }
                 self.i(I::LocalSet(local));
                 returned.push(local);

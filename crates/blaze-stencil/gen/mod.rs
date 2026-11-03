@@ -9,7 +9,10 @@ mod ir;
 mod llvm;
 mod ops;
 
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     format::{Variant, Writer},
@@ -18,10 +21,9 @@ use crate::{
 
 const PREFIX: &str = "LLVM_SYS_231_PREFIX";
 
-pub fn main() {
-    for path in ["build.rs", "gen", "src/shape.rs", "src/enc.rs", "src/table/format.rs"] {
-        println!("cargo:rerun-if-changed={path}");
-    }
+/// Each variant's library written to `out`, which `build.rs` then holds to the pin. `build.rs`
+/// says what the generator reads (`READS`); this says which LLVM.
+pub fn main(out: &Path) {
     println!("cargo:rerun-if-env-changed={PREFIX}");
     let prefix = env::var_os(PREFIX).filter(|it| !it.is_empty()).unwrap_or_else(|| {
         panic!(
@@ -31,7 +33,6 @@ pub fn main() {
         )
     });
     println!("cargo:rerun-if-changed={}", PathBuf::from(prefix).join("blaze-llvm.json").display());
-    let out = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
 
     llvm::init();
     let mut refused = Vec::new();

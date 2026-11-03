@@ -284,7 +284,7 @@ fn carry_with_fiber_jobs() {
     use blaze_graph::{pool, pump, sched::fiber};
     static CARRIED: std::sync::Once = std::sync::Once::new();
     CARRIED.call_once(|| {
-        fiber::carry(fiber::Carried { take: flight::take_open, put: flight::put_open });
+        fiber::carry(fiber::Carried { take: flight::take_open, put: flight::put_open, end: flight::end_open });
         _ = fiber::observe(observed);
         _ = fiber::observe_idle(idled);
         _ = fiber::observe_spawner(given);
@@ -293,10 +293,10 @@ fn carry_with_fiber_jobs() {
     });
 }
 
-/// The job running on this thread and the time, as a pool job is given to the pool: its
-/// spawner, and the start of its wait for a core.
+/// The job running on this thread, the time and the build, as a pool job is given to the pool:
+/// its spawner, the start of its wait for a core, and the build it works for.
 fn given() -> blaze_graph::sched::Given {
-    blaze_graph::sched::Given { spawner: flight::running_job(), at: clock::ticks() }
+    blaze_graph::sched::Given { spawner: flight::running_job(), at: clock::ticks(), build: flight::current_build() }
 }
 
 /// Opens and enters the span of a pool worker's own work between jobs ([`span::Worker`]),
@@ -381,7 +381,7 @@ fn observed(switch: blaze_graph::sched::Switch) {
     use blaze_graph::sched::{SwitchEvent, Wait};
     use flight::{Switched, WaitedOn};
     let (event, waited) = match switch.event {
-        SwitchEvent::Began { given } => return flight::job_begins(given.spawner, given.at),
+        SwitchEvent::Began { given } => return flight::job_begins(given.spawner, given.at, given.build),
         SwitchEvent::Started => (Switched::Started, None),
         SwitchEvent::Ready => (Switched::Ready, None),
         SwitchEvent::Resumed => (Switched::Resumed, None),

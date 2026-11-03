@@ -115,6 +115,102 @@ fn file(path: &str, bytes: &[u8], mode: Mode) -> SourceFile {
     SourceFile { path: path.to_owned(), bytes: bytes.to_vec(), mode }
 }
 
+/// A fetched package is written on disk where it is mounted, whole, modes kept: a build script
+/// runs in its package's directory and its sandbox is given that directory, which must exist
+/// though cargo never unpacked the package into `$CARGO_HOME` (im and tree-sitter-language
+/// failed on a machine with an empty `~/.cargo`). An index file is the load's alone.
+#[test]
+fn a_fetched_package_is_on_disk_where_it_is_mounted() {
+    let dir = tempfile::tempdir().unwrap();
+    let sources = dir.path().join("sources");
+    let source = fetch_crate(&[
+        Entry::File("serde-1.0.219/Cargo.toml", b"[package]\n", 0o644),
+        Entry::File("serde-1.0.219/build.sh", b"#!/bin/sh\n", 0o755),
+        Entry::File("serde-1.0.219/src/lib.c", b"int f(void) { return 0; }\n", 0o644),
+    ])
+    .unwrap();
+    let at = sources.join("registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.219");
+    let fetch = Fetch { at: at.to_str().unwrap().to_owned(), ..crate_fetch(&"0".repeat(64)) };
+    super::keep_on_disk(&fetch, &source, &sources).unwrap();
+    assert_eq!(std::fs::read(at.join("src/lib.c")).unwrap(), b"int f(void) { return 0; }\n");
+    assert_eq!(std::fs::read(at.join(".cargo-ok")).unwrap(), br#"{"v":1}"#);
+    assert_eq!(super::on_disk_mark(&at).unwrap(), Some(super::source_on_disk_id(&source)));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &str| std::fs::metadata(at.join(path)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode("build.sh"), 0o555, "executable, and read-only");
+        assert_eq!(mode("src/lib.c"), 0o444, "read-only");
+    }
+    let siblings: Vec<_> = std::fs::read_dir(at.parent().unwrap()).unwrap().map(|it| it.unwrap().file_name()).collect();
+    assert_eq!(siblings, ["serde-1.0.219"], "nothing left of the write beside the package");
+    // Written once: a second fetch of the same package keeps it.
+    super::keep_on_disk(&fetch, &source, &sources).unwrap();
+    let index_at = sources.join("registry/index/x/.cache/se/rd/serde");
+    let index = Fetch { at: index_at.to_str().unwrap().to_owned(), kind: FetchKind::IndexFile, ..fetch };
+    super::keep_on_disk(&index, &Source { files: vec![file("serde", b"{}", Mode::Regular)], under: "serde".into() }, &sources).unwrap();
+    assert!(!index_at.exists());
+}
+
+/// A lock file names the package a fetch writes (its name, version and git commit), and the
+/// daemon writes it before any sandbox runs: nothing a lock file says moves that write out of
+/// `<sources>/registry/src/` and `<sources>/git/checkouts/`.
+#[test]
+fn a_lock_files_traversal_name_is_refused_before_anything_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let sources = dir.path().join("sources");
+    let source = Source { files: vec![file("Cargo.toml", b"[package]\n", Mode::Regular)], under: String::new() };
+    let root = sources.to_str().unwrap();
+    for at in [
+        format!("{root}/registry/src/index.crates.io-1949cf8c6b5b557f/../../../../escaped/x-1.0.0"),
+        format!("{root}/registry/src/index.crates.io-1949cf8c6b5b557f/./x-1.0.0"),
+        format!("{root}/registry/src//x-1.0.0"),
+        format!("{root}/registry/index/x-1.0.0"),
+        format!("{}/escaped/x-1.0.0", dir.path().to_str().unwrap()),
+        "relative/registry/src/d/x-1.0.0".to_owned(),
+    ] {
+        let fetch = Fetch { at: at.clone(), ..crate_fetch(&"0".repeat(64)) };
+        let error = super::keep_on_disk(&fetch, &source, &sources).unwrap_err();
+        assert!(error.what.contains("serde v1.0.219") && error.what.contains(&at), "{at}: {}", error.what);
+    }
+    assert!(!dir.path().join("escaped").exists() && !sources.exists(), "nothing written");
+}
+
+/// A copy on disk is the package only while its mark holds the fetched files' id: one edited
+/// in place or left by another write is refused by name, never read as the package.
+#[test]
+fn a_copy_on_disk_that_is_not_the_fetched_package_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let sources = dir.path().join("sources");
+    let at = sources.join("git/checkouts/repo-0123456789abcdef/0123456789abcdef0123456789abcdef01234567");
+    let fetch = Fetch { at: at.to_str().unwrap().to_owned(), ..crate_fetch(&"0".repeat(64)) };
+    let one = Source { files: vec![file("Cargo.toml", b"[package]\n", Mode::Regular)], under: String::new() };
+    let two = Source { files: vec![file("Cargo.toml", b"[package] # two\n", Mode::Regular)], under: String::new() };
+    super::keep_on_disk(&fetch, &one, &sources).unwrap();
+    let error = super::keep_on_disk(&fetch, &two, &sources).unwrap_err();
+    let (one, two) = (super::source_on_disk_id(&one), super::source_on_disk_id(&two));
+    assert!(error.what.contains(&format!("{one:x}")) && error.what.contains(&format!("{two:x}")), "{}", error.what);
+    std::fs::remove_file(at.join(super::ON_DISK_MARK)).unwrap();
+    let error = super::keep_on_disk(&fetch, &Source { files: Vec::new(), under: String::new() }, &sources).unwrap_err();
+    assert!(error.what.contains("without the .blaze-ok"), "{}", error.what);
+}
+
+/// A write that stopped midway leaves `.<name>.part-<pid>-<n>` beside where its package goes;
+/// the next start removes it and nothing else.
+#[test]
+fn a_half_written_package_is_swept_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let sources = dir.path().join("sources");
+    let group = sources.join("registry/src/index.crates.io-1949cf8c6b5b557f");
+    let half = group.join(".serde-1.0.219.part-77-0");
+    std::fs::create_dir_all(half.join("src")).unwrap();
+    std::fs::write(half.join("src/lib.rs"), b"").unwrap();
+    std::fs::create_dir_all(group.join("serde-1.0.218")).unwrap();
+    assert_eq!(super::sweep_parts(&sources).unwrap(), [half.clone()]);
+    assert!(!half.exists() && group.join("serde-1.0.218").exists());
+    assert!(super::sweep_parts(&dir.path().join("none")).unwrap().is_empty());
+}
+
 #[test]
 fn a_fetcher_is_shared_by_the_io_threads() {
     fn shared<T: Send + Sync>() {}

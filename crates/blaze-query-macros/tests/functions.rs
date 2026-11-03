@@ -359,3 +359,26 @@ fn debug_reads_the_attached_database() {
         format!(r#"Source {{ [id]: {id:?}, text: "x", weight: 7 }} Name {{ text: "n" }}"#)
     );
 }
+
+/// A bound that trips names the key's value, not its number (rule 16): an argument's `Debug`
+/// through the database the walk ran on, each argument of a key of several, and `()` for none.
+#[test]
+fn out_of_fuel_names_the_keys_value() {
+    let db = TestDb::new();
+    let source = Source::new(&db, "ab".to_owned(), 1);
+    let id = source.as_id();
+
+    let out = blaze_query::db::with_fuel(0, || length(&db, source)).expect_err("no fuel");
+    assert_eq!((out.steps, out.query), (0, "length"), "{out}");
+    assert_eq!(out.value, format!(r#"Source {{ [id]: {id:?}, text: "ab", weight: 1 }}"#), "{out}");
+    assert!(out.to_string().contains(r#"text: "ab""#), "{out}");
+
+    let out = blaze_query::db::with_fuel(0, || repeat(&db, source, 3, '-')).expect_err("no fuel");
+    assert_eq!(out.value, format!(r#"(Source {{ [id]: {id:?}, text: "ab", weight: 1 }}, 3, '-')"#), "{out}");
+
+    let out = blaze_query::db::with_fuel(0, || answer(&db)).expect_err("no fuel");
+    assert_eq!(out.value, "()", "{out}");
+
+    let ran = blaze_query::db::with_fuel(1 << 10, || length(&db, source));
+    assert!(matches!(ran, Ok((2, 1..))), "enough fuel ends, and says what it spent: {ran:?}");
+}

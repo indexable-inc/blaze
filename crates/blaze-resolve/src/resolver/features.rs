@@ -310,6 +310,13 @@ impl ResolvedFeatures {
         self.activated_features.get(&(pkg_id, fk)).map(|fs| fs.iter().cloned().collect())
     }
 
+    /// Whether the resolve activated `pkg_id` for `features_for` at all: a package can be in
+    /// the resolve and reached only as a host dependency (a build dependency, or under a proc
+    /// macro), or only as a dev-dependency a build without dev units does not walk.
+    pub fn is_activated(&self, pkg_id: PackageId, features_for: FeaturesFor) -> bool {
+        self.activated_features.contains_key(&(pkg_id, features_for.apply_opts(&self.opts)))
+    }
+
     /// Returns if the given dependency should be included.
     ///
     /// This handles dependencies disabled via `cfg` expressions and optional

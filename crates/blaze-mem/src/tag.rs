@@ -8,6 +8,11 @@
 //! Counters move at coarse grain only, never per allocation: a region's commit, a chunk taken
 //! or given back, a pool's batch of 64, a frame's task ending. Each tag's counters sit on their
 //! own 128-byte line, so subsystems never write each other's.
+//!
+//! Besides what it holds, each tag counts the address space its regions reserve and how many
+//! regions it has ([`Counters::reserved`], [`Counters::regions`]), counted by the tag a region
+//! was reserved for: a target without virtual memory takes a reservation whole, so the
+//! reserved sum is the memory such a target needs before anything is committed.
 
 use std::{cell::Cell, fmt};
 
@@ -136,6 +141,11 @@ struct Line {
     grow_copies: AtomicU64,
     grow_copied: AtomicU64,
     budget: AtomicU64,
+    /// Address space its live regions reserve, and the most they reserved.
+    reserved: AtomicU64,
+    reserved_high_water: AtomicU64,
+    /// Its live regions.
+    regions: AtomicU64,
 }
 
 impl Line {
@@ -148,6 +158,9 @@ impl Line {
             grow_copies: AtomicU64::new(0),
             grow_copied: AtomicU64::new(0),
             budget: AtomicU64::new(u64::MAX),
+            reserved: AtomicU64::new(0),
+            reserved_high_water: AtomicU64::new(0),
+            regions: AtomicU64::new(0),
         }
     }
 }
@@ -163,6 +176,10 @@ struct Committed {
 /// Bytes committed in every region, whatever holds them.
 static COMMITTED: Committed =
     Committed { now: AtomicU64::new(0), high_water: AtomicU64::new(0) };
+
+/// Address space every live region reserves, and the most it reserved: [`Committed`]'s shape,
+/// on a line of its own, since reserving is rarer than committing.
+static RESERVED: Committed = Committed { now: AtomicU64::new(0), high_water: AtomicU64::new(0) };
 
 fn line(tag: Tag) -> &'static Line {
     &LINES[tag.index()]
@@ -312,6 +329,24 @@ pub(crate) fn decommitted(bytes: usize) {
     COMMITTED.now.fetch_sub(as_u64(bytes), Ordering::Relaxed);
 }
 
+/// A region of `tag` reserved `bytes` of address space.
+pub(crate) fn reserved(tag: Tag, bytes: usize) {
+    let line = line(tag);
+    let now = line.reserved.fetch_add(as_u64(bytes), Ordering::Relaxed) + as_u64(bytes);
+    raise(&line.reserved_high_water, now);
+    line.regions.fetch_add(1, Ordering::Relaxed);
+    let all = RESERVED.now.fetch_add(as_u64(bytes), Ordering::Relaxed) + as_u64(bytes);
+    raise(&RESERVED.high_water, all);
+}
+
+/// A region of `tag` gave back its reservation of `bytes`.
+pub(crate) fn released(tag: Tag, bytes: usize) {
+    let line = line(tag);
+    line.reserved.fetch_sub(as_u64(bytes), Ordering::Relaxed);
+    line.regions.fetch_sub(1, Ordering::Relaxed);
+    RESERVED.now.fetch_sub(as_u64(bytes), Ordering::Relaxed);
+}
+
 /// The most `tag` should hold; `u64::MAX` (no limit) until set.
 pub fn set_budget(tag: Tag, bytes: u64) {
     line(tag).budget.store(bytes, Ordering::Relaxed);
@@ -351,6 +386,10 @@ pub struct Counters {
     pub grow_copies: u64,
     pub grow_copied: u64,
     pub budget: u64,
+    /// Address space its live regions reserve now, and at most; how many regions it has.
+    pub reserved: u64,
+    pub reserved_high_water: u64,
+    pub regions: u64,
 }
 
 /// Every tag's counters, read with relaxed loads: each number is exact, the set is not one
@@ -361,6 +400,9 @@ pub struct Snapshot {
     /// Bytes committed in every region now, and at most.
     pub committed: u64,
     pub committed_high_water: u64,
+    /// Address space every live region reserves now, and at most.
+    pub reserved: u64,
+    pub reserved_high_water: u64,
 }
 
 impl Snapshot {
@@ -371,6 +413,11 @@ impl Snapshot {
     /// What every tag holds, summed.
     pub fn live(&self) -> u64 {
         self.tags.iter().map(|c| c.live).sum()
+    }
+
+    /// The live regions of every tag, summed.
+    pub fn regions(&self) -> u64 {
+        self.tags.iter().map(|c| c.regions).sum()
     }
 }
 
@@ -388,12 +435,17 @@ pub fn snapshot() -> Snapshot {
             grow_copies: line.grow_copies.load(Ordering::Relaxed),
             grow_copied: line.grow_copied.load(Ordering::Relaxed),
             budget: line.budget.load(Ordering::Relaxed),
+            reserved: line.reserved.load(Ordering::Relaxed),
+            reserved_high_water: line.reserved_high_water.load(Ordering::Relaxed),
+            regions: line.regions.load(Ordering::Relaxed),
         };
     }
     Snapshot {
         tags,
         committed: COMMITTED.now.load(Ordering::Relaxed),
         committed_high_water: COMMITTED.high_water.load(Ordering::Relaxed),
+        reserved: RESERVED.now.load(Ordering::Relaxed),
+        reserved_high_water: RESERVED.high_water.load(Ordering::Relaxed),
     }
 }
 

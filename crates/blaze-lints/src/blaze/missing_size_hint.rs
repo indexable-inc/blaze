@@ -62,7 +62,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Impl<'t>) {
             )
         }
         Some(hint) => {
-            if !exact(db, hint) || impls_exact(db, &self_ty) {
+            if !exact(db, hint) || impls_exact(db, cx.krate(), &self_ty) {
                 return;
             }
             (
@@ -156,10 +156,10 @@ fn same(db: &base_db::Db, def: DefWithBodyId, body: &hir_def::expr_store::Body, 
     }
 }
 
-/// Whether `ty` has an `ExactSizeIterator` impl.
-fn impls_exact(db: &base_db::Db, ty: &hir::Type<'_>) -> bool {
+/// Whether `ty` has an `ExactSizeIterator` impl `krate` sees.
+fn impls_exact(db: &base_db::Db, krate: hir::Crate, ty: &hir::Type<'_>) -> bool {
     // clone: the type handed to the impl search, once per iterator impl
-    hir::Impl::all_for_type(db, ty.clone())
+    hir::Impl::all_for_type(db, krate, ty.clone())
         .into_iter()
         .any(|imp| imp.trait_(db).is_some_and(|it| it.name(db).as_str() == "ExactSizeIterator"))
 }

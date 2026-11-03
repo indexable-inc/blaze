@@ -546,3 +546,38 @@ fn main() {
         ]
     );
 }
+
+/// `missing_docs` of `mod m;` reads the module's file: its `//!`, `#![doc = ..]` or
+/// `#![doc(hidden)]` documents it, as rustc's `hir_attrs` of the module item holds the inner
+/// attributes of its file (cranelift-codegen's `pub mod binemit;`).
+#[test]
+fn missing_docs_reads_the_file_of_an_out_of_line_module() {
+    let fixture = r#"
+//- /lib.rs crate:main edition:2021
+//! The crate.
+#![deny(missing_docs)]
+pub mod commented;
+pub mod attributed;
+pub mod hidden;
+pub mod undocumented;
+/// Outer.
+pub mod outer;
+pub mod inline {
+    //! Inline.
+}
+//- /commented.rs
+//! Commented.
+//- /attributed.rs
+#![doc = "Attributed."]
+//- /hidden.rs
+#![doc(hidden)]
+//- /undocumented.rs
+pub(crate) fn f() {}
+//- /outer.rs
+"#;
+    let checked = checked(fixture);
+    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("missing_docs")).collect();
+    assert_eq!(messages, ["missing_docs: missing documentation for a module"], "{messages:?}");
+    let stderr = checked.stderr();
+    assert!(stderr.contains("pub mod undocumented;"), "{stderr}");
+}

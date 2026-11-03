@@ -118,6 +118,17 @@ pub enum Arch {
     X86_64,
     Aarch64,
     Wasm32,
+    /// WebAssembly with 64-bit addresses (memory64): blaze's own `wasm64-blaze-wasip1`, the
+    /// target of the bootstrap seed. Its addresses in code are `i64.const` operands and in data
+    /// eight bytes ([`RelocKind::WasmMemory64`], [`RelocKind::WasmTable64`]).
+    Wasm64,
+}
+
+impl Arch {
+    /// Whether code of it is a WebAssembly function, of either address width.
+    pub const fn is_wasm(self) -> bool {
+        matches!(self, Arch::Wasm32 | Arch::Wasm64)
+    }
 }
 
 /// One unit of codegen: an instance and how to compile it.
@@ -344,7 +355,8 @@ pub enum RelocKind {
     GotPageOffset12,
     /// Thread-local, local exec: the offset in the thread's block (x86-64 ELF `TPOFF32`).
     TlsOffset,
-    /// wasm: a function or table index, a memory address.
+    /// wasm: a function or table index, a memory address. In wasm32 code a table index or an
+    /// address is an `i32.const` operand (a padded LEB of five bytes), in data four bytes.
     WasmFunction,
     WasmTable,
     WasmMemory,
@@ -376,6 +388,11 @@ pub enum RelocKind {
     /// COFF: the offset in its section (`IMAGE_REL_AMD64_SECREL`, `IMAGE_REL_ARM64_SECREL`):
     /// a thread-local's place in the `.tls` block.
     SectionRel32,
+    /// wasm64: a function's slot in the table (`R_WASM_TABLE_INDEX_SLEB64`/`_I64`) or a memory
+    /// address (`R_WASM_MEMORY_ADDR_SLEB64`/`_I64`): in code an `i64.const` operand, a padded
+    /// LEB of ten bytes; in data eight bytes.
+    WasmTable64,
+    WasmMemory64,
 }
 
 /// What a relocation points at.

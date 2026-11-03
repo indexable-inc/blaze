@@ -1035,10 +1035,21 @@ pub enum FormatError {
     Header(&'static str),
     /// A record at `at` that is not a valid value: `what` says why.
     Invalid { at: u64, what: &'static str },
+    /// A length or index past what bounds it: `at` is the buffer's byte the value is at (the
+    /// word or field holding it, or the record holding it where the reader has no finer
+    /// place), `what` names the field and the bound (a list at most as long as the bytes left
+    /// can hold, an index below its table's length), `found` is the value read and `bound` the
+    /// bound's value.
+    Bound { at: u64, what: &'static str, found: u64, bound: u64 },
+    /// An ID word at `at` that is 0, which names nothing: `what` names the field.
+    Zero { at: u64, what: &'static str },
     /// A reference at `at` that leaves the buffer or is misaligned.
     OutOfBounds { at: u64 },
     /// Bytes that are not the buffer their key names ([`open_verified`]).
     Hash { found: ContentId, wanted: ContentId },
+    /// A cold column whose frame, at byte `at`, is not a standard zstd frame: `found` is what it
+    /// starts with (a legacy or skippable frame's magic, or garbage), never handed to zstd.
+    Frame { at: u64, found: [u8; 4] },
 }
 
 impl fmt::Display for FormatError {
@@ -1049,11 +1060,23 @@ impl fmt::Display for FormatError {
             }
             FormatError::Header(what) => write!(f, "not a blaze buffer: {what}"),
             FormatError::Invalid { at, what } => write!(f, "invalid record at byte {at}: {what}"),
+            FormatError::Bound { at, what, found, bound } => {
+                write!(f, "invalid record at byte {at}: {what}: found {found}, past its bound {bound}")
+            }
+            FormatError::Zero { at, what } => {
+                write!(f, "invalid record at byte {at}: {what} is 0, which names nothing")
+            }
             FormatError::OutOfBounds { at } => {
                 write!(f, "a reference at byte {at} leaves the buffer or is misaligned")
             }
             FormatError::Hash { found, wanted } => {
                 write!(f, "a buffer of content {found} where {wanted} was wanted")
+            }
+            FormatError::Frame { at, found } => {
+                write!(
+                    f,
+                    "a cold column's frame at byte {at} starts with {found:02x?}, not zstd's magic [28, b5, 2f, fd]"
+                )
             }
         }
     }

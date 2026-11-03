@@ -7,7 +7,10 @@ mod derive_macro;
 mod fn_macro;
 
 pub use self::{
-    attr_macro::{BuiltinAttrExpander, find_builtin_attr, pseudo_derive_attr_expansion},
+    attr_macro::{
+        ALLOC_ERROR_HANDLER_EXPORT, BuiltinAttrExpander, find_builtin_attr,
+        pseudo_derive_attr_expansion,
+    },
     derive_macro::{BuiltinDeriveExpander, find_builtin_derive},
     fn_macro::{
         BuiltinFnLikeExpander, EagerExpander, MODULE_PATH_PLACEHOLDER, find_builtin_macro,

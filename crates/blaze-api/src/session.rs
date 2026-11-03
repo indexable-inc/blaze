@@ -263,6 +263,13 @@ impl Session {
         }
     }
 
+    /// How many jobs of requests are not finished: the builds clients wait on, which a stall
+    /// watchdog holds as work under way. A declared intent's job is not counted: nothing waits
+    /// on it.
+    pub fn building(&self) -> usize {
+        self.jobs.iter().filter(|(_, job)| matches!(job, Job::Request { .. })).count()
+    }
+
     /// When [`Session::tick`] next has something to do, on the clock it is given.
     pub fn deadline(&self) -> Option<u64> {
         self.intents.deadline()
@@ -992,7 +999,8 @@ fn close(cx: &mut Daemon<'_>, opened: Opened) {
 }
 
 /// Whether `work` runs the view's queries incrementally, so their reruns answer
-/// [`Request::Why`]: a reach builds nothing, a verify builds from nothing, tables only count.
+/// [`Request::Why`]: a reach, an edit and a build ahead's choice build only their views' proc
+/// macros and build scripts and keep no view, a verify builds from nothing, tables only count.
 fn incremental(work: &Work) -> bool {
     match work {
         Work::Check(_)

@@ -14,6 +14,8 @@
 //!   and `pack`, the in-browser compiler's pack of a program.
 //! - [`observe`]: blaze's looks at itself: `explore`, `debug profile|live|sql`, `explain`.
 //! - [`replace`]: `check --replace`, a path moved through the front end's name resolution.
+//! - [`reach`]: `reach`, what the checkout's edits since a root reach, building only what its
+//!   front end applies.
 //! - [`baselines`]: `check --baselines`, a run's lint counts held to the checked-in ones.
 //! - [`fix`]: `check --fix`, the check's machine-applicable suggestions made and checked.
 //! - [`clean`]: `clean`, a workspace's build directory under blaze's root removed; `--list`
@@ -35,8 +37,10 @@ pub mod live;
 pub mod observe;
 pub mod place;
 pub mod perf;
+#[cfg(feature = "pprof")]
 pub mod pprof;
 pub mod print;
+pub mod reach;
 pub mod replace;
 pub mod run;
 pub mod say;
@@ -99,6 +103,7 @@ Commands:
     debug sql [--live] QUERY       SQL over the profile history (with `--live`, the flight recorder too)
     explain VIEW [NAME=VALUE ...]  One of the history's named views
     why [ITEM] [--all] [--json]    What the last build computed again instead of reusing, and why
+    reach [ROOT] [--json]          What the edits since ROOT reach (items, functions, tests), and the root now
     slow [--build N] [--top N] [--json]   What made the last build slow, ranked by the time each fix saves
     pprof FILE|URL [top|peek|tree|list|flame|diff|export|--http]   Any program's profile (.ixprof or pprof), like `go tool pprof`
     perf record|runs|diff          The performance history of programs blaze built: what changed between runs, and why
@@ -123,7 +128,13 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     _ = blaze_profile::flight::count_cpu(blaze_profile::thread_cpu);
     let words = words(args);
     if words.first().is_some_and(|it| it == "serve") {
+        #[cfg(feature = "daemon")]
         return crate::serve::main(words.into_iter().skip(1));
+        #[cfg(not(feature = "daemon"))]
+        {
+            eprint!("{}", say::error(&format!("blaze serve: {}", daemon::NO_DAEMON), auto_color()));
+            return ExitCode::from(101); // FAILED
+        }
     }
     let code = command(words);
     match u8::try_from(code) {
@@ -179,7 +190,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
                  doc, clean, cache, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, \
-                 explain, why and slow"
+                 explain, why, reach and slow"
             );
             eprint!("{}", say::error(&what, auto_color()));
             FAILED
@@ -202,8 +213,14 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Debug(words) => observe::debug(words, auto_color()),
         Asked::Explain(words) => observe::explain(words, auto_color()),
         Asked::Why(words) => observe::why(words, auto_color()),
+        Asked::Reach(words) => reach::main(words, auto_color()),
         Asked::Slow(words) => observe::slow(words, auto_color()),
+        #[cfg(feature = "pprof")]
         Asked::Pprof(words) => pprof::main(words, auto_color()),
+        #[cfg(not(feature = "pprof"))]
+        Asked::Pprof(_) => said(Err(anyhow::anyhow!(
+            "blaze pprof: this blaze is built without blaze-cargo's `pprof` feature (the seed profile, todo/bootstrap/plan.md)"
+        ))),
         Asked::Perf(words) => perf::main(words, auto_color()),
         Asked::Clean(words) => clean::main(words, auto_color()),
         Asked::Cache(words) => cache::main(words, auto_color()),
@@ -328,10 +345,14 @@ fn cargo(asked: &Invocation) -> i32 {
     // below are taken only off that path.
     if live::wanted(asked, shown) {
         let then = live::drive(&mut client, asked, &place, request, shown, started);
-        drop(client);
+        // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
+        let closed = client.close();
         if blaze_profile::on() {
             blaze_profile::note("client", blaze_profile::CLIENT, blaze_profile::began());
             blaze_profile::finish();
+        }
+        if let Err(error) = closed {
+            return refused(&format!("closing the connection to the build engine: {error}"), color);
         }
         return match then {
             Ok(Then::Exit(code)) => code,
@@ -341,11 +362,16 @@ fn cargo(asked: &Invocation) -> i32 {
     }
     let (mut out, mut err) = (io::stdout().lock(), io::stderr().lock());
     let then = drive(&mut client, asked, &place, request, shown, started, &mut out, &mut err, &mut test::Spawned);
-    drop(client);
+    // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
+    let closed = client.close();
     // The daemon wrote its part before its last response, so every part is in by now.
     if blaze_profile::on() {
         blaze_profile::note("client", blaze_profile::CLIENT, blaze_profile::began());
         blaze_profile::finish();
+    }
+    if let Err(error) = closed {
+        let _ = err.write_all(say::error(&format!("closing the connection to the build engine: {error}"), color).as_bytes());
+        return FAILED;
     }
     match then {
         Ok(Then::Exit(code)) => code,
@@ -503,7 +529,10 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     {
         return Ok(Then::Fix(found));
     }
-    if !ok {
+    // Under `--keep-going` the tests of every unit that built still run when another failed
+    // (each failure was said, naming its unit), and the run then fails.
+    let tests_past_failure = asked.flags.keep_going && matches!(asked.command(), Command::Test | Command::Bench);
+    if !ok && !tests_past_failure {
         return Ok(Then::Exit(FAILED));
     }
     let speaking =
@@ -536,7 +565,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         Command::Run => {
             let exec = run::pick(&artifacts, &asked.flags).and_then(|it| {
                 let mut exec = run::planned(it, &asked.program, &place.cwd)?;
-                run::launch(it, &mut exec)?;
+                programs.launch(it, &mut exec)?;
                 Ok(exec)
             });
             match exec {
@@ -556,10 +585,11 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         Command::Test | Command::Bench if in_daemon(asked) => {
             let (out, err) = printer.streams();
             let passed = test::reached(&results, speaking, out, err)?;
-            Ok(Then::Exit(if passed { 0 } else { FAILED }))
+            Ok(Then::Exit(if passed && ok { 0 } else { FAILED }))
         }
         Command::Test | Command::Bench => {
-            test::run(asked, &artifacts, members, speaking, printer.err(), programs).map(Then::Exit)
+            let code = test::run(asked, &artifacts, members, speaking, printer.err(), programs)?;
+            Ok(Then::Exit(if ok { code } else { code.max(FAILED) }))
         }
     }
 }

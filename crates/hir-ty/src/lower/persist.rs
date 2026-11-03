@@ -197,9 +197,10 @@ fn bytes_of(words: &[u128]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), size_of_val(words)) }
 }
 
-/// The id whose bits are the word `bits`: `None` for 0 or a word past `u32`.
+/// The id whose bits are the word `bits`: `None` for 0 or a word past
+/// [`blaze_query::db::Id::MAX_U32`].
 fn query_id(bits: u64) -> Option<blaze_query::db::Id> {
-    u32::try_from(bits).ok().filter(|&bits| bits != 0).map(blaze_query::db::Id::from_u32)
+    u32::try_from(bits).ok().and_then(blaze_query::db::Id::new)
 }
 
 fn id_bits(id: impl AsId) -> u64 {
@@ -545,7 +546,7 @@ impl<'a> ColdBatchRef<'a> {
         let keys: Box<[ImplId]> = exact(
             self.keys.len(),
             self.keys.iter().map(|&bits| {
-                query_id(bits).map(ImplId::from_id).ok_or(self.invalid("an impl of id 0"))
+                blaze_query::db::Id::decode(bits, self.at, "an impl's id").map(ImplId::from_id)
             }),
         )?;
         self.ensure(keys.is_sorted_by(|a, b| a < b), "impls that are not ascending")?;
@@ -612,9 +613,8 @@ impl<'a> ColdBatchRef<'a> {
                 if trait_id == 0 {
                     return Ok::<_, FormatError>(None);
                 }
-                let trait_id = query_id(trait_id)
-                    .map(TraitId::from_id)
-                    .ok_or(self.invalid("a trait of id index 0"))?;
+                let trait_id = blaze_query::db::Id::decode(trait_id, self.at, "a trait's id")
+                    .map(TraitId::from_id)?;
                 let trait_ref = TraitRef::new_from_args(interner, trait_id.into(), tys.args(args)?);
                 Ok(Some(StoredEarlyBinder::bind(interner, StoredTraitRef::new(trait_ref))))
             }),
@@ -675,7 +675,7 @@ impl<'a> ColdBatchRef<'a> {
         let anon_consts: Box<[AnonConstId<'db>]> = exact(
             side.anon_consts.len(),
             side.anon_consts.iter().map(|&bits| {
-                query_id(bits).map(AnonConstId::from_id).ok_or(self.invalid("a constant of id 0"))
+                blaze_query::db::Id::decode(bits, self.at, "a constant's id").map(AnonConstId::from_id)
             }),
         )?;
         let range = |starts: &[u32], at: usize, len: usize| {
@@ -785,7 +785,7 @@ pub(crate) fn const_error_word(reason: &CreateConstError) -> u32 {
     match reason {
         CreateConstError::UsedForbiddenParam => 0,
         CreateConstError::LocalBinding => 1,
-        CreateConstError::Static => 2,
+        // 2 was `Static`, a reason no longer: a static is an anon const's to read.
         CreateConstError::ImplSelf => 3,
         CreateConstError::NeedsAnonConst => 4,
         CreateConstError::DoesNotResolve => 5,
@@ -803,7 +803,6 @@ pub(crate) fn const_error_of(word: u32) -> Option<CreateConstError> {
     Some(match word {
         0 => CreateConstError::UsedForbiddenParam,
         1 => CreateConstError::LocalBinding,
-        2 => CreateConstError::Static,
         3 => CreateConstError::ImplSelf,
         4 => CreateConstError::NeedsAnonConst,
         5 => CreateConstError::DoesNotResolve,
@@ -1081,7 +1080,7 @@ impl Words<'_> {
 
     fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
         let bits = self.u64()?;
-        crate::check_cache::id_of(bits).ok_or(self.invalid("an id of index 0 or not in the table"))
+        crate::check_cache::id_of(bits).map_err(|refused| refused.at(self.at))
     }
 
     fn generic_def(&mut self) -> Result<GenericDefId, FormatError> {

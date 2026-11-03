@@ -191,3 +191,41 @@ fn a_write_that_panics_leaves_the_thread_running_code() {
     assert_eq!(call(first.code_address()), 42);
     assert_eq!(call(Executable::new(FORTY_TWO, 0).unwrap().code_address()), 42);
 }
+
+/// A child forked right after its parent wrote an `Executable` runs the code once it calls
+/// [`Executable::after_fork`]. The write blocks, so the kernel switches the thread out while
+/// its `MAP_JIT` view is writable: on macOS the child's thread starts with the state saved
+/// then, and its first instruction fetch from the code faults (`SIGBUS`) without the call.
+#[cfg(unix)]
+#[test]
+fn a_child_forked_after_a_write_runs_the_code() {
+    for round in 0..16 {
+        let exec = Executable::written(FORTY_TWO.len(), 0, |code, _| {
+            code.copy_from_slice(FORTY_TWO);
+            // SAFETY: a plain sleep of this thread, which takes it off its CPU mid-write.
+            unsafe { libc::usleep(1000) };
+        })
+        .unwrap();
+        // SAFETY: the child only sets its view of the code's pages, calls the code (no
+        // allocation, no lock) and `_exit`s.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            Executable::after_fork();
+            let got = call(exec.code_address());
+            // SAFETY: leaves the child at once, running nothing of the parent's.
+            unsafe { libc::_exit(got as i32) };
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child just forked.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "waitpid: {}", std::io::Error::last_os_error());
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 42,
+            "round {round}: the child forked after writing an Executable at {:#x} ended with status {status:#x} \
+             (signal {}) instead of returning 42 from its code",
+            exec.code_address(),
+            if libc::WIFSIGNALED(status) { libc::WTERMSIG(status) } else { 0 },
+        );
+    }
+}

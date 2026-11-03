@@ -32,7 +32,7 @@ fn fork_server(_: bool) -> &'static str {
 fn frontend(fixture: &str) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(fixture::db(fixture).into_db()));
     let frontend =
-        HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default())));
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default());
     (db, frontend)
 }
 

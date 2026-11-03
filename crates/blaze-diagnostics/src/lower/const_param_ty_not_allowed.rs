@@ -102,7 +102,7 @@ fn suggest_derive(cx: &Cx<'_, '_>, diag: &mut Diag, ty: &hir::Type<'_>, adt: hir
     let Some(const_param_ty) = hir::Trait::lang(cx.db, cx.krate, LangItem::ConstParamTy) else {
         return;
     };
-    if hir::Impl::all_for_type(cx.db, ty.clone()) // clone: error path, the ADT's impls
+    if hir::Impl::all_for_type(cx.db, cx.krate, ty.clone()) // clone: error path, the ADT's impls
         .iter()
         .any(|it| it.trait_(cx.db) == Some(const_param_ty))
     {

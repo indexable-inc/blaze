@@ -57,9 +57,11 @@ pub struct SideTable<'db> {
     pub(super) anon_consts: Box<[AnonConstId<'db>]>,
 }
 
-const _: () = assert!(size_of::<SideTable<'static>>() == 5 * 16);
-const _: () = assert!(size_of::<CrateImplSelfTys<'static>>() == 2 * 16 + size_of::<SideTable<'static>>());
-const _: () = assert!(size_of::<CrateFieldTypes<'static>>() == 3 * 16 + size_of::<SideTable<'static>>());
+// Boxed slices only, two words each (16 bytes on a 64-bit target).
+const SLICE: usize = size_of::<Box<[u32]>>();
+const _: () = assert!(size_of::<SideTable<'static>>() == 5 * SLICE);
+const _: () = assert!(size_of::<CrateImplSelfTys<'static>>() == 2 * SLICE + size_of::<SideTable<'static>>());
+const _: () = assert!(size_of::<CrateFieldTypes<'static>>() == 3 * SLICE + size_of::<SideTable<'static>>());
 
 impl<'db> SideTable<'db> {
     /// The diagnostics and anonymous constants of `row`.

@@ -203,7 +203,7 @@ pub const END: u64 = 1 << 39;
 /// - PE: one granule past the executable's base `0x1_4000_0000`, where its headers are.
 pub fn base(format: Format, arch: Arch) -> Result<u64, PremapError> {
     match (format, arch) {
-        (Format::Wasm, _) | (_, Arch::Wasm32) => {
+        (Format::Wasm, _) | (_, Arch::Wasm32 | Arch::Wasm64) => {
             Err(PremapError::of(format_args!("wasm has no dependency image: code is reached by index, not mapped")))
         }
         (Format::Elf, _) => Ok(0x40_0000),

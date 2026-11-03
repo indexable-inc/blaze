@@ -365,7 +365,56 @@ mod sys {
     }
 }
 
-#[cfg(not(any(unix, windows)))]
+/// WASI has no mapping, so a "mapping" there is the file read whole, once, into memory of its
+/// own, page-aligned as a mapping is: the bytes a mapping would show when it was made, which no
+/// later write to the file changes. Every read of them is then a read of memory; the options
+/// say nothing to a read.
+#[cfg(target_os = "wasi")]
+mod sys {
+    use std::{alloc::Layout, fs::File, io, os::wasi::fs::FileExt as _, ptr::NonNull};
+
+    use super::MapOptions;
+
+    /// A page, as elsewhere: what a reader that views the bytes in place may count on.
+    const ALIGN: usize = 4096;
+
+    /// # Safety
+    ///
+    /// `len` is not 0.
+    pub(super) unsafe fn map(file: &File, len: usize, _: MapOptions) -> io::Result<(NonNull<u8>, usize)> {
+        let layout = Layout::from_size_align(len, ALIGN)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a file larger than memory"))?;
+        // SAFETY: `layout` is not of size 0, by the caller. Zeroed, so the bytes are
+        // initialized before they are read into.
+        // alloc: the file's bytes, WASI's stand-in for its mapping; freed by `unmap`.
+        let at = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).ok_or_else(|| {
+            // alloc: an error path.
+            io::Error::new(io::ErrorKind::OutOfMemory, format!("{len} bytes to read the file into: WASI maps no file"))
+        })?;
+        // SAFETY: `len` initialized bytes at `at`, just allocated, this function's alone.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(at.as_ptr(), len) };
+        match file.read_exact_at(bytes, 0) {
+            Ok(()) => Ok((at, len)),
+            Err(error) => {
+                // SAFETY: allocated above with `layout`, and lent to nothing now.
+                unsafe { std::alloc::dealloc(at.as_ptr(), layout) };
+                // alloc: an error path.
+                Err(io::Error::new(error.kind(), format!("reading its {len} bytes whole (WASI maps no file): {error}")))
+            }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// `at` and `len` are of one `map`, freed once, that nothing borrows.
+    pub(super) unsafe fn unmap(at: NonNull<u8>, len: usize) {
+        // SAFETY: the caller's contract: `map` allocated `len` bytes at `at` with this layout,
+        // which `Layout::from_size_align` accepted then.
+        unsafe { std::alloc::dealloc(at.as_ptr(), Layout::from_size_align_unchecked(len, ALIGN)) };
+    }
+}
+
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
 mod sys {
     use std::{fs::File, io, ptr::NonNull};
 

@@ -250,10 +250,48 @@ fn offer_mir<'db>(
     body: &MirBody<'db>,
     reads: Option<blaze_query::db::Reads>,
 ) {
-    super::offer(db, def, Step::Mir, schema, reads, |facts, out| {
+    let mut unreadable = None;
+    super::offer(db, def, Step::Mir, schema, reads, |facts, out| match encode(db, facts, def, body, out) {
+        Ok(()) => Ok(()),
         // alloc: the reason a body is not stored
-        encode(db, facts, def, body, out).map_err(|why| format!("{owner:?}: {why}"))
+        Err(EncodeError::Refused(why)) => Err(format!("{owner:?}: {why}")),
+        Err(EncodeError::Unreadable(why)) => {
+            // alloc: the reason a body is not stored
+            let why = format!("{owner:?}: {why}");
+            unreadable = Some(why.clone()); // clone: the build's error, once per broken body
+            Err(why)
+        }
     });
+    // A body that does not read back is a lowering or writer bug: the build's error, never a
+    // body quietly left unstored. Reported once the store's offer is done with.
+    if let Some(why) = unreadable {
+        super::fail(db, def, Step::Mir, format_args!("{why}"));
+    }
+}
+
+/// Why [`encode`] wrote no answer.
+#[derive(Debug)]
+pub(super) enum EncodeError {
+    /// What has no stored form (optimized MIR, a location with no slot, an item with no key):
+    /// the body is not stored and is built again next time.
+    Refused(String),
+    /// The body's buffer does not read back as the body: the build's error.
+    Unreadable(persist::ReadBack),
+}
+
+impl From<String> for EncodeError {
+    fn from(why: String) -> Self {
+        EncodeError::Refused(why)
+    }
+}
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncodeError::Refused(why) => f.write_str(why),
+            EncodeError::Unreadable(why) => why.fmt(f),
+        }
+    }
 }
 
 fn format_error(error: FormatError) -> String {
@@ -270,13 +308,16 @@ pub(super) fn encode<'db>(
     def: DefWithBodyId,
     body: &MirBody<'db>,
     out: &mut Vec<u8>,
-) -> R {
+) -> Result<(), EncodeError> {
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = Table::default();
     // alloc: the reason a body is not stored
     let locations = locations(db, def)?;
-    let record = ids::relocating(&mut table, || persist::write(db, body, Some(locations)))
-        .map_err(str::to_owned)?;
+    let record = ids::relocating(&mut table, || persist::write(db, body, Some(locations))).map_err(|why| match why {
+        // alloc: the reason a body is not stored
+        persist::WriteError::Unwritable(why) => EncodeError::Refused(why.to_owned()),
+        persist::WriteError::Unreadable(why) => EncodeError::Unreadable(why),
+    })?;
     let mut locs = TyTableWriter::new(interner);
     let mut items = Keyed::new(db, facts, def);
     let words = ids::write_with(db, &mut table, &mut locs, &mut items)?;
@@ -328,5 +369,5 @@ pub(super) fn decode<'db>(
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = ids::read(db, interner, &items, words, bytes, root.locs)?;
     let locations = locations(db, def)?;
-    ids::relocating(&mut table, || persist::read(db, record, Some(locations))).map_err(format_error)
+    ids::relocating(&mut table, || persist::read(db, record, locations)).map_err(format_error)
 }

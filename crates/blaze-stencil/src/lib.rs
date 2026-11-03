@@ -163,8 +163,8 @@ pub fn compile_to<R>(
         blaze_codegen::Arch::Aarch64 => {
             patch::compile::<arch::aarch64::Aarch64, R>(func, target, library, sink)
         }
-        blaze_codegen::Arch::Wasm32 => {
-            Err(Error::new("wasm32 has no stencils: its code is written from the IR as a module"))
+        blaze_codegen::Arch::Wasm32 | blaze_codegen::Arch::Wasm64 => {
+            Err(Error::new("wasm has no stencils: its code is written from the IR as a module"))
         }
     }
 }
@@ -177,8 +177,8 @@ pub fn survey(func: &ir::Function, target: &Target) -> Result<Vec<Error>, Error>
     match target.arch {
         blaze_codegen::Arch::X86_64 => Ok(patch::survey::<arch::x64::X64>(func, target, library)),
         blaze_codegen::Arch::Aarch64 => Ok(patch::survey::<arch::aarch64::Aarch64>(func, target, library)),
-        blaze_codegen::Arch::Wasm32 => {
-            Err(Error::new("wasm32 has no stencils: its code is written from the IR as a module"))
+        blaze_codegen::Arch::Wasm32 | blaze_codegen::Arch::Wasm64 => {
+            Err(Error::new("wasm has no stencils: its code is written from the IR as a module"))
         }
     }
 }

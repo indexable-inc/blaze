@@ -154,6 +154,45 @@ fn main() {
     .assert_eq(&parse.debug_dump());
 }
 
+/// Each leaf of `tree` in order, as its kind and text, delimiters included.
+fn leaves(tree: &tt::TopSubtree) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = Cursor::new(tree.as_token_trees());
+    while !cursor.eof() {
+        match cursor.token_tree() {
+            Some(tt::TokenTree::Leaf(Leaf::Literal(lit))) => {
+                out.push(format!("{:?} {}{}", lit.kind, lit.text(), lit.suffix()))
+            }
+            Some(tt::TokenTree::Leaf(Leaf::Punct(punct))) => out.push(punct.char.to_string()),
+            Some(tt::TokenTree::Leaf(Leaf::Ident(ident))) => out.push(ident.sym.as_str().to_owned()),
+            Some(tt::TokenTree::Subtree(subtree)) => out.push(format!("{:?}", subtree.delimiter.kind)),
+            None => out.push("end".to_owned()),
+        }
+        cursor.bump_or_end();
+    }
+    out
+}
+
+/// An integer and a `.` that are two token trees stay two through a parse and back: the text
+/// the parse writes for a macro call in an expansion (quote's `#ident.1.expect(..)`, whose
+/// windows hand `1` and `.` on as a call's last two tokens) is made a token tree again, and
+/// `1.}` would be read as the float `1.`, a token fewer (darling_core's `Initializer`). A float
+/// the parser split for a field (`x.0.1`) is one token again, and no other text moves.
+#[test]
+fn an_integer_then_a_dot_stay_two_tokens_through_a_parse() {
+    let text = "fn f() { one! {1 .} two! {(1 . (2)) [3 . 4] 5 . 'a 6 . +} x.0.1; y.1.e; z.1..2; }";
+    let parse = ast::SourceFile::parse(text, Edition::CURRENT);
+    assert!(parse.errors().is_empty(), "the fixture parses");
+    let tree = token_tree(parse.root());
+    let mut edition = |_: span::SyntaxContext| Edition::CURRENT;
+    let (sunk, _) =
+        token_tree_to_syntax_node(tree.view(), parser::TopEntryPoint::SourceFile, &mut edition);
+    let again = token_tree(sunk.root());
+    assert_eq!(leaves(&again), leaves(&tree));
+    let written = sunk.root().text();
+    assert!(written.contains("x.0.1;y.1.e;z.1..2;"), "only an integer and a `.` that glue move: {written}");
+}
+
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))

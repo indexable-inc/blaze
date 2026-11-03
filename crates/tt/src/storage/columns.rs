@@ -124,7 +124,10 @@ impl CompressedSpanPart {
     #[inline]
     pub(super) fn ctx(self) -> SyntaxContext {
         // `self.ctx` is what `SyntaxContext::into_u32` gave for a context of this process: `new`
-        // writes it so, and `from_row` reads the words of a part (the type's doc).
+        // writes it so, and `from_row` reads the words of a part (the type's doc). Those words
+        // can come from a persisted buffer, so this is persisted but trusted (hash-checked),
+        // not process-made: a corrupt word panics at `SyntaxContext`'s assert on use or names
+        // another context, never a typed error and never UB.
         SyntaxContext::from_u32(self.ctx)
     }
 

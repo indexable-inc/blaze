@@ -46,9 +46,9 @@ anyhow.workspace = true
 # The host's target triple, which names the release archive a pin fetches (`versions.rs`).
 hir-ty-codegen.workspace = true
 blaze-graph.workspace = true
-mimalloc.workspace = true
+mimalloc = { workspace = true, optional = true }
 # mimalloc on the huge pages `blaze-mem` chose (`huge.rs`).
-libmimalloc-sys = { workspace = true, features = ["extended"] }
+libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
 blaze-mem.workspace = true
 # `IX_PROF=<dir>` samples blaze itself (`program.rs`): the profile a build of blaze is laid out by
 # (docs/v2/plan/lanes/layout/layout.md).
@@ -59,10 +59,11 @@ parking_lot.workspace = true
 toml.workspace = true
 toml_edit = { workspace = true, features = ["display", "parse"] }
 # The releases of blaze a workspace pins arrive over HTTPS as `.tar.gz`, checked against
-# `B3SUMS`.
+# every list of sums the release publishes: `B3SUMS` (blaze-ids) and `SHA256SUMS`.
 blaze-registry.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-sha256.workspace = true
 tar = { workspace = true, features = ["default"] }
 flate2 = { workspace = true, features = ["rust_backend"] }
 url.workspace = true
@@ -89,8 +90,30 @@ blaze-alloc-count.workspace = true
 blaze-codegen-code.workspace = true
 
 [features]
+default = ["llvm-stencils", "net", "explore", "mimalloc", "tui", "daemon", "pprof"]
 # Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm`.
 llvm = ["hir-ty-codegen/llvm", "blaze-cargo/llvm"]
+# The default build's C, C++ and assembly dependencies, one feature each; the seed profile
+# has none of them (todo/bootstrap/plan.md, "The seed has no C").
+# blaze-stencil's stencils made by the pinned LLVM at build time (llvm-sys).
+llvm-stencils = ["blaze-cargo/llvm-stencils", "hir-ty-codegen/llvm-stencils"]
+# Fetching over HTTPS: rustls on ring, and the global cache's client.
+net = ["blaze-cargo/net", "blaze-registry/net"]
+# `blaze explore` (Flecs, wtransport on ring).
+explore = ["blaze-cargo/explore"]
+# mimalloc as the general allocator; without it, std's.
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys", "blaze-cargo/mimalloc"]
+# `blaze test`'s live view on a terminal, through crossterm, which has no wasm32.
+tui = ["blaze-cargo/tui"]
+# `blaze serve` and the CLI's client of it; without it (the seed) each command builds in its own
+# process with the same engine, one-shot.
+daemon = ["blaze-cargo/daemon"]
+# `blaze pprof`.
+pprof = ["blaze-cargo/pprof"]
+# The wasm seed: `--no-default-features --features seed`. Each choice is the fastest with no C:
+# blake3's wasm32 SIMD128 code; stencils prebuilt (`BLAZE_STENCILS`); std's allocator; no
+# network; rsasm as the assembler, which has no LLVM. Native builds keep the defaults above.
+seed = ["blaze-ids/wasm32-simd", "blaze-codegen-code/wasm32-simd", "hir-ty-codegen/rsasm"]
 
 
 [lints]

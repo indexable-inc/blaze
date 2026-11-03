@@ -278,6 +278,10 @@ impl<'q> Driver<'q> {
             // clone: an error's names, once
             return Err(diag::CheckError::NotKnown { file: file.name.clone(), path: path.clone() });
         }
+        if let Some(why) = &lints.unchecked {
+            // clone: an error's names, once
+            return Err(diag::CheckError::SuspendUnchecked { file: file.name.clone(), why: why.clone() });
+        }
         let moved = |range: TextRange| range + TextSize::new(offset);
         for Finding { lint, at: found_at, place, diagnostic } in &lints.findings {
             // clone: a finding's diagnostic, out of the query's value, to be given its level
@@ -812,6 +816,9 @@ pub(crate) struct Cx<'q: 't, 't> {
     disallowed: OnceCell<&'q lints::disallowed::Resolved>,
     /// The first path a lint looked up that [`famous::KNOWN`] does not list.
     not_known: OnceCell<String>,
+    /// Why the may-suspend check a fiber lint asked of checks nothing, said
+    /// ([`Cx::suspend_checked`]).
+    unchecked: OnceCell<String>,
     /// The expansions read, with the call of each.
     trees: RefCell<Vec<(&'q FlatTree, MacroCallId)>>,
     walking: Walking,
@@ -845,6 +852,7 @@ impl<'q: 't, 't> Cx<'q, 't> {
             famous_defs: OnceCell::new(),
             disallowed: OnceCell::new(),
             not_known: OnceCell::new(),
+            unchecked: OnceCell::new(),
             trees: RefCell::new(Vec::new()),
             walking: Walking::default(),
             found: Vec::new(),
@@ -853,7 +861,12 @@ impl<'q: 't, 't> Cx<'q, 't> {
     }
 
     fn done(self) -> Lints {
-        Lints { findings: self.found, expects: self.expects, not_known: self.not_known.into_inner() }
+        Lints {
+            findings: self.found,
+            expects: self.expects,
+            not_known: self.not_known.into_inner(),
+            unchecked: self.unchecked.into_inner(),
+        }
     }
 
     pub(crate) fn db(&self) -> &'q Db {
@@ -1241,6 +1254,17 @@ impl<'q: 't, 't> Cx<'q, 't> {
             let key = lints::disallowed::ConfKey::new(self.db, self.conf.clone());
             lints::disallowed::disallowed_defs(self.db, self.krate, key)
         })
+    }
+
+    /// Whether the may-suspend check ([`hir_ty_suspend`]) checks the crate's graph, which a
+    /// lint asks before it reads [`hir_ty_suspend::suspend_points`] or
+    /// [`hir_ty_suspend::on_fiber`]. A graph with `blaze_graph` it can't check (no root, no
+    /// `Send`) is `false`, and the query's [`Lints::unchecked`], which fails the crate's check
+    /// naming why: those reads would be empty, and the lint would find nothing.
+    pub(crate) fn suspend_checked(&self) -> bool {
+        let Some(why) = hir_ty_suspend::unchecked(self.db, self.krate) else { return true };
+        self.unchecked.get_or_init(|| why.said(self.db, self.krate));
+        false
     }
 
     /// The item at `path` in the crate `path[0]` (`core`, `alloc`, `std`): one perfect hash of

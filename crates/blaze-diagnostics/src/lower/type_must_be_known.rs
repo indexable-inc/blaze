@@ -687,7 +687,7 @@ fn annotate_source_of_ambiguity<'db>(
                     let Some(src) = cx.vsema.source(*it) else { continue };
                     spans.push(cx.span(src.map(|it| def_range(it.syntax()))));
                 } else {
-                    crates.push(crate_name(cx, krate));
+                    crates.push(cx.crate_name(krate));
                     if let Some(header) = impl_header(cx, *it) {
                         post.push(header);
                     }
@@ -754,18 +754,6 @@ fn annotate_source_of_ambiguity<'db>(
             diag.span_note(multi(), msg);
             // alloc: the error's text, for an error hir found
             diag.note(format!("and more `impl`s found in the following crates: {}{post}", crate_names.join(", ")));
-        }
-    }
-}
-
-/// rustc's `tcx.crate_name`: the crate's name, else its root file's stem.
-pub(crate) fn crate_name(cx: &Cx<'_, '_>, krate: hir::Crate) -> String {
-    match krate.display_name(cx.db) {
-        Some(name) => name.crate_name().to_string(), // alloc: the error's text, for an error hir found
-        None => {
-            let path = cx.file_name(krate.root_file(cx.db));
-            let stem = path.rsplit('/').next().unwrap_or(&path);
-            stem.strip_suffix(".rs").unwrap_or(stem).replace('-', "_")
         }
     }
 }

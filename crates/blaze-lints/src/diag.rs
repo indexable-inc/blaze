@@ -50,6 +50,11 @@ pub enum CheckError {
     /// does not list, in the lints of the file `file`: a lint's bug. The lint can't run there, so
     /// the crate's lints are not given as if it had.
     NotKnown { file: String, path: String },
+    /// A fiber lint (`held_across_wait`, `blocking_on_pool`, `unnamed_wait`) run over `file`
+    /// reads the may-suspend check, which checks nothing in this crate's graph: `why`
+    /// ([`hir_ty_suspend::Unchecked`], said). The lint can't run, so the crate's lints are not
+    /// given as if it had found nothing.
+    SuspendUnchecked { file: String, why: String },
 }
 
 impl std::fmt::Display for CheckError {
@@ -59,6 +64,10 @@ impl std::fmt::Display for CheckError {
             CheckError::NotKnown { file, path } => write!(
                 f,
                 "a lint run over `{file}` looks up `{path}`, which `famous::KNOWN` (crates/blaze-lints/src/famous.rs) does not list: a bug in blaze-lints, fixed by adding the path there"
+            ),
+            CheckError::SuspendUnchecked { file, why } => write!(
+                f,
+                "a fiber lint run over `{file}` reads the may-suspend check, which checks nothing here: {why}"
             ),
         }
     }

@@ -18,7 +18,7 @@ use db::TestDB;
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(fixture::db(text).into_db()));
     let hashes = HashSource::Items(ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned()))));
-    (db, HirFrontend::new(Databases::new(db), hashes, std::sync::Arc::new(BuildTime(Default::default()))))
+    (db, HirFrontend::new(Databases::new(db), hashes, BuildTime::default()))
 }
 
 #[track_caller]

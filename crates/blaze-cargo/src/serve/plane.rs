@@ -185,6 +185,16 @@ impl<W: Work> Runner<W> {
             Runner::Inline(it) => it.running(),
         }
     }
+
+    /// How many of [`Runner::running`] were posted to the process's worker pool ([`Pool::Work`]
+    /// on [`Threads`]): each ends only as its pool job's `done` runs, so with the pool idle and
+    /// none of its jobs parked, such a task can never end. The simulation's run on the loop.
+    pub fn running_on_pool(&self) -> usize {
+        match self {
+            Runner::Threads(it) => it.on_pool,
+            Runner::Inline(_) => 0,
+        }
+    }
 }
 
 /// A thread task as the plane posts it.
@@ -209,6 +219,8 @@ pub struct Threads<W: Work> {
     done: Receiver<Ran<W::Value>>,
     io: Sender<IoJob<W>>,
     running: usize,
+    /// Of `running`, those posted to the worker pool.
+    on_pool: usize,
 }
 
 struct IoJob<W: Work> {
@@ -254,7 +266,7 @@ impl<W: Work> Threads<W> {
                 })
                 .unwrap_or_else(|why| panic!("an IO thread of the daemon's plane: {why}"));
         }
-        Threads { done_tx, done, io: io_tx, running: 0 }
+        Threads { done_tx, done, io: io_tx, running: 0, on_pool: 0 }
     }
 }
 
@@ -375,7 +387,10 @@ impl<W: Work> Threads<W> {
     fn post(&mut self, task: Posting, work: Arc<W>, readers: W::Readers) {
         self.running += 1;
         match task.pool {
-            Pool::Work => post_work(task, work, readers, self.done_tx),
+            Pool::Work => {
+                self.on_pool += 1;
+                post_work(task, work, readers, self.done_tx);
+            }
             Pool::Io => {
                 let job = IoJob { task, work, readers };
                 // The IO threads hold the receiver for as long as the process lives.
@@ -387,6 +402,9 @@ impl<W: Work> Threads<W> {
     fn take(&mut self, out: &mut Vec<Ran<W::Value>>) {
         while let Ok(ran) = self.done.try_recv() {
             self.running -= 1;
+            if matches!(ran.task.pool, Pool::Work) {
+                self.on_pool -= 1;
+            }
             out.push(ran);
         }
     }
@@ -885,6 +903,11 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// How many thread tasks run.
     pub fn running(&self) -> usize {
         self.runner.running()
+    }
+
+    /// How many thread tasks run on the worker pool ([`Runner::running_on_pool`]).
+    pub fn running_on_pool(&self) -> usize {
+        self.runner.running_on_pool()
     }
 
     /// Its runner, for a test to hold a kind of task on the simulation's ([`Inline::hold`]).

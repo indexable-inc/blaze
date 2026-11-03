@@ -317,6 +317,36 @@ fn a_module_that_imports_around_the_shims_is_refused_naming_its_macro_and_the_im
     assert!(said.contains("`env::open`"), "{said}");
 }
 
+/// The macro sandbox's WASI is the reads, stdio, clocks and exits it always was: these 24 calls
+/// and no other. A module importing a p1 call that writes the file system, the 64-bit calls,
+/// or any of the seed's own (`blaze_wasi::seed`, which only the seed runner links) is refused
+/// before it runs.
+#[test]
+fn a_macro_is_served_only_the_sandboxs_wasi_and_never_a_call_that_writes() {
+    let sandbox = [
+        "args_get", "args_sizes_get", "clock_res_get", "clock_time_get", "environ_get", "environ_sizes_get", "fd_close",
+        "fd_fdstat_get", "fd_fdstat_set_flags", "fd_filestat_get", "fd_prestat_dir_name", "fd_prestat_get", "fd_read",
+        "fd_readdir", "fd_seek", "fd_tell", "fd_write", "path_filestat_get", "path_open", "path_readlink", "poll_oneoff",
+        "proc_exit", "random_get", "sched_yield",
+    ];
+    assert_eq!(super::abi::WASI_SHIMS, &sandbox[..]);
+    let writes = [
+        "fd_allocate", "fd_datasync", "fd_filestat_set_size", "fd_filestat_set_times", "fd_pwrite", "fd_renumber", "fd_sync",
+        "path_create_directory", "path_filestat_set_times", "path_link", "path_remove_directory", "path_rename",
+        "path_symlink", "path_unlink_file",
+    ];
+    let refused = writes
+        .iter()
+        .map(|name| ("wasi_snapshot_preview1", *name))
+        .chain([("wasi_snapshot_preview1_64", "fd_write")])
+        .chain(blaze_wasi::seed::FUNCTIONS.iter().map(|name| (blaze_wasi::seed::MODULE, *name)));
+    for (module, name) in refused {
+        let import = format!("(import \"{module}\" \"{name}\" (func))\n  (memory");
+        let error = Library::load_with(&modules(), ECHO.replacen("(memory", &import, 1).as_bytes(), None, WHAT).unwrap_err();
+        assert_eq!(error, LoadError::Mismatch(Mismatch::Import { module: module.to_owned(), name: name.to_owned() }));
+    }
+}
+
 #[test]
 fn a_module_without_the_abis_exports_is_refused_naming_the_export() {
     let bare = r#"(module (memory (export "memory") 1))"#;

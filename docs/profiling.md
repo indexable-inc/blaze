@@ -67,11 +67,11 @@ outermost first. `?` marks a nullable column.
 | target | dict | its tracing target: the module path it was made in, unless it names one (`blaze` for blaze's steps) |
 | start_ns | i64 | when it began |
 | dur_ns | i64 | how long it was open |
-| self_cpu_ns | i64? | the CPU time its job had while it was open, less that of the spans under it: a wait's is about 0, as other jobs run while it parks; null when the binary counts no CPU (`flight::count_cpu`) or it closed under another job |
+| self_cpu_ns | i64? | the CPU time its job had while it was open, less that of the spans under it: a wait's is about 0, as other jobs run while it parks; null when the binary counts no CPU (`flight::count_cpu`) or it closed under another job. A held span's (one with the field `held`, open across a state machine's steps) counts only while it is entered |
 | alloc_bytes | u64? | bytes its thread allocated while it was open |
 | allocs | u64? | allocations its thread made while it was open |
 | query_kind | dict? | the query it ran, for a span of a query |
-| crate | dict? | the crate it was of: a kind's `krate`, or an ad hoc span's field `crate` |
+| crate | dict? | the crate it was of: a kind's `krate`, or an ad hoc span's field `crate`; a front-end span's names one build of it, `serde v1.0.219 (lib)`, `(lib-test)` for its `cfg(test)` copy, `(lib, wasm)` for the proc macros' wasm copy |
 | function | utf8? | the function it was of: a `macro expand`'s macro path, what a `wait` awaits, what a `hold` holds, or an ad hoc span's field `function` or `subject` |
 | unit | utf8? | the unit it was of: a unit phase's package, version and target (`serde v1.0.219 (build script)`), or an ad hoc span's field `unit` (a codegen unit) |
 | frame_grow_copies | u64? | blocks its thread's task frames moved to grow them while it was open; null when not counted or closed on another thread |
@@ -95,7 +95,7 @@ A query span on a body names it: `infer_query`, `infer_anon_const_query`, `mir_b
 `body_with_source_map_query` carry the body's crate in `crate` and its path in `function`. No
 two bodies of a crate share a path, so a repeated `function` is a repeated body. The path is
 `crate::module::item`, and `crates/hir-def/src/span_names.rs` writes it:
-- an impl by its ordinal among its file's impls, `<impl#3>::swap_bytes`, and one a macro wrote also by the call, `<impl#0 in macro call 3fa2.5>::get`. Its self type and trait are not in the name, because only its signature has them;
+- an impl by its ordinal among its file's impls, `<impl#3>::swap_bytes`, and one a macro wrote also by the call, `<impl#0 in macro call 3fa2.5>::get`, and by each call out to the source file when that call is itself in a macro's output, `<impl#0 in macro call c6a9.0 in macro call 77e1.3>`. Its self type and trait are not in the name, because only its signature has them;
 - a block after the body it is in, with its ordinal among that item's blocks:
   `outer::{block#2}::inner`;
 - a `const _` by its ordinal among the module's: `_#1`;
@@ -145,7 +145,7 @@ noted only when the span closes on the thread it began on.
 |---|---|---|
 | build_id | u64? | the build, or null |
 | process | u32 | the process id |
-| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, `footprint bytes` (the process's physical footprint, all the OS counts against it; `footprint_per_build` gives each build's peak), `macro modules from memo`, `macro modules from store` and `macro modules compiled` (each a daemon's running total of its wasm module loads), and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes) |
+| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, `footprint bytes` (the process's physical footprint, all the OS counts against it; `footprint_per_build` gives each build's peak), `committed bytes` and `reserved bytes` (what every `blaze_mem` region has committed and reserves; footprint less committed is what the process holds outside `blaze_mem`, its global heap), `macro modules from memo`, `macro modules from store` and `macro modules compiled` (each a daemon's running total of its wasm module loads), `profile spans lost` and `profile rows skipped` (the process's running totals of spans the recorder could not record and rows its rings wrote over before the history drained them, written by the history with each build's flush and whenever they grow), and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes) |
 | t_ns | i64 | when |
 | value | f64 | the value then |
 | fiber | u32? | the fiber a `fiber stack` counter is of, or null |
@@ -501,9 +501,10 @@ before a worker's first switch in the build and after its last as uncovered and 
 on another thread: the 47.9% (self-build b1) and 57.5% (hf b5) it reported were mostly that. On
 hf's profile from that day the view below gives 1.1% mean and 3.2% at most for b1, 3.5% and 10.1%
 for b5. What is left is stretches with neither a switch row nor a span. On a busy worker they
-recur every flush (`history::EVERY`, 5 s): rows a ring (`flight::CAP` rows a thread) wrote over
-before the flush read them, which the flush counts (`Flushed::skipped`) and the history does not
-keep; that is the lead, not yet tested. It also fails on every perf sample blocked in a mutex, condition
+recurred every flush (`history::EVERY`, 5 s): a self-build's busiest threads wrote 16,379 rows
+in one 5 s stretch, a whole ring (`flight::CAP`). Since 2026-11-02 the history drains the rings
+every `history::DRAIN` (250 ms) into the next flush, and counts what was still written over in
+the `profile rows skipped` counter. It also fails on every perf sample blocked in a mutex, condition
 variable, `kevent` or `read` while no wait span is open on its thread (`raw_blocks`, which names
 the stack), and on every `wait` span without `awaits`. Its verdict names the build's `tree` and `blaze`, the exact tree and
 binary measured, and a history with no such build is an error naming it. Its test runs on a
@@ -545,7 +546,18 @@ The build's top-level phases each have a span:
   per-function `mir`, `translate` and `monomorphize`;
 - the daemon loop's `loop turn`, opened only for a turn with completions or ready work.
 
-Running a build script has no span yet.
+- a build script's run: `build script run`, a root span open from the run's start on the daemon's
+  loop to its end (its program's whole time, which no daemon thread spends), with the package
+  and version in `unit` (`anyhow v1.0.98 (build script run)`). It is held (the field `held`): it
+  is entered only while the loop does a step of the run, so its `self_cpu_ns` is the daemon's
+  work for that run alone, and a run whose wall is far above it was its program's time.
+- blaze's own toolchain downloaded into a home that lacks it: `toolchain download`, with the
+  release in `toolchain` and the bytes in `bytes`. The client downloads it before the daemon
+  starts and records no spans, so there it is a step of the client's part of a `BLAZE_PROFILE`
+  profile and of the table it prints, `toolchain download nightly-2026-10-27 (116917942 bytes)`.
+- the dependencies' image keys: `dependency image keys`, with the crates asked in `crates` and
+  the database's view in `function` (`View(1234)`). A serve at the view the same crates were last keyed at, none
+  moved, walks nothing and opens no span.
 
 ## What made a build slow: `blaze slow`
 
@@ -590,7 +602,14 @@ What the profile could not see is listed after the findings, as blind spots, nev
 - job running time inside no span, against the 1% gate;
 - worker running time with no span CPU counted for it. No OS CPU is recorded, so the spans'
   total can't be checked against the process's;
-- waits with no `awaits` (rule 13), and named waits that never name an owner;
+- waits with no wait span (rule 13), classed by their kind alone (`key wait with no wait span`)
+  and sized by the wall they cover, with the recorder's `profile spans lost` over the build
+  beside them; and named waits that never name an owner. A class's evidence says its waits'
+  parked time summed over the jobs waiting, which is not workers' time;
+- waits the record never ends (`unended_wait`): still parked as it ends, or their `resumed` row
+  lost. Each one's parked time runs to the record's end, so they are kept out of the classes
+  above (before 2026-11-02, 65,439 of them made one 613 s self-build's `key` waits 4.1 million
+  seconds) and sized by the wall with one open;
 - no `ready` rows;
 - `builds.misses` over the number of misses rows;
 - rows that didn't line up;
@@ -606,7 +625,9 @@ Both `blaze slow` and `blaze debug time` read a build's switches, spans and even
 `build_id`, and also the rows with no build inside the build's window. The recorder leaves
 `build_id` null on a job's rows once the job's code has let go of the build. On 2026-11-02
 that was most of a cold build's switches and spans, and the tagged rows alone showed a tenth of
-the work.
+the work. Since then a pool job works for the build of the job that gave it to the pool
+(`blaze_graph::sched::Given::build`), on whichever thread it runs, so a `par::map` a build's
+codegen gives the pool is that build's.
 
 ## The flight recorder
 
@@ -625,7 +646,11 @@ callsite, depth, the ring that made the span and its allocation count, the inter
 function, the build and unit, and the bytes allocated. A ring holds 16384 rows (1 MiB). A span's
 open state lives from its start to its close in a slot of the ring of the thread that made it.
 Its id names that ring, slot and a sequence number, so a span closed on another thread still
-finds where it began. Readers take rows with a cursor (`flight::read`): only what is new, and a
+finds where it began. A thread has 16,384 slots, allocated 256 at a time as its open spans reach
+them: a fiber parked with its enter stack keeps its spans open in the ring of the thread that made
+them, so one worker holds the open spans of hundreds of parked jobs. Until 2026-11-02 it had 64,
+and most workers of a self-build used every one, losing the spans past them (the waits of the
+`key with no awaits` blind spot). A span past the slots is still lost, and counted. Readers take rows with a cursor (`flight::read`): only what is new, and a
 reader slower than the writers skips what was written over, counted.
 
 ## The live feed
@@ -646,28 +671,50 @@ misses that tick. Its cursor keeps its place, and rows written over meanwhile sh
 
 ## The stall watchdog
 
-The watchdog fires on no progress, never on elapsed time. While tasks are running, the daemon
-reads three counts, each of which only grows:
+The watchdog fires on no progress, never on elapsed time. While work is under way (a plane
+task runs, or a job a client waits on is not over, whether or not a task of it runs; a job
+waiting for its puts to be durable has its own bound and is left out), the daemon reads four
+counts, each of which only grows:
 
 | count | what moves it |
 | --- | --- |
-| spans closed | any span closing on any thread, each pool job's own span and each query run among them |
+| jobs ended | a worker pool job finishing (`Pool::ended`); never a worker's idle, search or switch span, nor the daemon loop's own turns |
 | queries completed | a query run or verified |
-| tasks and steps ended | a plane node settling: a task, or a unit's step |
+| tasks and steps ended | a plane node settling (a task, or a unit's step), or a job's own effect ending (a placement, a look, its runs' IO) |
+| looks that found work running | a turn that finds a worker inside a job's code (`Pool::working`, one long compile) or a run of user code alive |
 
 When none of them has moved for the stall bound, 120 s unless `blaze serve --stall-bound SECS`
 says otherwise, the daemon:
 
 1. writes `state/stalls/<time>.json`: the flight recorder's last two minutes and the CPU
    samples as a Chrome trace (ui.perfetto.dev opens it);
-2. fails each running request with the error `blaze stalled: no span closed, no query
-   completed and no task or step ended for N s while M tasks ran (the stall bound is B s,
+2. fails each running request with the error `blaze stalled: no job ended, no query
+   completed, no task or step ended and no job's code or run of user code was running for N s
+   while M tasks ran (the stall bound is B s,
    ...); it got to <the three counts>`, followed by each thread inside spans, outermost span
-   first, with what each awaits, who runs it, and how long it has been in each;
+   first, with what each awaits, who runs it, and how long it has been in each, then every
+   job waiting in the pool's wait graph with the key, counter or job it waits on and that
+   key's claimer, then the thread tasks the loop waits on (request, node, name), then each
+   job clients wait on with the stage it waits in (its library, plan, fetches, lowering,
+   units, runs, snapshot or end) and what it holds (runs, placements, its store);
 3. stops the daemon, whose threads may be deadlocked; the next request starts a new one.
 
 A deadlock (jobs that all wait on each other, as in blaze-pool's hang at 0% CPU) becomes this
-error within the bound instead of a request that never ends. A step or a span that runs long
+error within the bound instead of a request that never ends. Closed spans were the first count
+and did not work: on 2026-11-02 a lost pool job (poolborrow) sat ten minutes while the loop's
+turns and the workers' idle spans kept closing. Tasks running were the first measure of work
+under way and did not work either: a job left with every node settled and nothing to move
+it (lane seedmem's hang the same day, a blaze without `net` whose fetches all failed) had no
+task running, so nothing was watched.
+
+Two faster checks come first. The pool's last sleeper asks the wait graph every 2 s whether
+any job's wait can still end; a job on a thread outside the pool (the daemon's main thread,
+a client) no longer hides one, and a wait on a key that such a thread claimed counts as stuck
+once the daemon says its loop and IO threads are still. Each turn the daemon also asks
+whether anything can move the build (`serve/still.rs`, sans IO): with the loop, IO threads and
+pool all still, a task posted to the pool with no job parked has lost its job, and fails the
+request after 2 s naming the tasks; with jobs parked, it fails once no wait can end, naming
+each wait and its key. A step or a span that runs long
 while anything else moves is no stall: on 2026-11-02 the earlier per-count bounds (60 s for
 spans, 120 s for queries, 300 s for steps) killed self-builds whose `lower workspace` step was
 still completing queries. Two warnings go to the log and fail nothing: what every thread is

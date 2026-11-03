@@ -53,9 +53,21 @@ pub fn fork_server(record: bool) -> &'static str {
     }
 }
 
+/// std, its prelude and the macros of it the protocol and the server name, imported into the
+/// module `fork_server` after the protocol's inner docs (each module of `fork_server.rs`
+/// imports them too). `std` is the harness module's `extern crate std`, never `::std`: a
+/// `#![no_std]` crate's extern prelude has no `std` and its harness has core's prelude alone,
+/// where `format!`, `vec!`, `String` and `Vec` are not (flecs-c's tests).
+macro_rules! std_prelude {
+    () => {
+        "\n    use super::std;\n    #[allow(unused_imports)]\n    use self::std::prelude::rust_2021::*;\n    #[allow(unused_imports)]\n    use self::std::{eprintln, format, vec};\n"
+    };
+}
+
 const RECORDED: &str = concat!(
     "\n    #[allow(dead_code)]\n    pub mod fork_server {\n",
     include_str!("test/wire.rs"),
+    std_prelude!(),
     include_str!("test/fork_server.rs"),
     include_str!("test/fork_server/recorded.rs"),
     "    }\n"
@@ -64,6 +76,7 @@ const RECORDED: &str = concat!(
 const UNRECORDED: &str = concat!(
     "\n    #[allow(dead_code)]\n    pub mod fork_server {\n",
     include_str!("test/wire.rs"),
+    std_prelude!(),
     include_str!("test/fork_server.rs"),
     include_str!("test/fork_server/unrecorded.rs"),
     "    }\n"

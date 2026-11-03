@@ -395,53 +395,46 @@ fn is_boolean_literal(lit: &tt::Literal) -> bool {
     lit.text_and_suffix == sym::true_ || lit.text_and_suffix == sym::false_
 }
 
+/// rustc's `parse_sep_and_kleene_op`: the separator, if any, and the operator after a `$(...)`.
+/// The separator is any one token but a delimited group or an operator, punctuation glued into
+/// one as rustc's lexer glues it ([`tt::glue`]): `$(a)::+` and `$(a)=>*` have the separators
+/// `::` and `=>`, `$(a)+=*` the separator `+=`, while `$(a)++` is the operator `+` and then a
+/// `+` token, and `$(a),?` is refused, as `?` takes no separator.
 fn parse_repeat(src: &mut TtIter<'_>) -> Result<(Option<Separator>, RepeatKind), ParseError> {
-    let mut separator = Separator::Puncts(ArrayVec::new());
-    for tt in src {
-        let tt = match tt {
-            TtElement::Leaf(leaf) => leaf,
-            TtElement::Subtree(..) => return Err(ParseError::InvalidRepeat),
-        };
-        let has_sep = match &separator {
-            Separator::Puncts(puncts) => !puncts.is_empty(),
-            _ => true,
-        };
-        match tt {
-            tt::Leaf::Ident(ident) => match separator {
-                Separator::Puncts(puncts) if puncts.is_empty() => {
-                    // clone: the template, once per rule, when the macro is defined.
-                    separator = Separator::Ident(ident.clone());
-                }
-                Separator::Puncts(puncts) => match puncts.as_slice() {
-                    [tt::Punct { char: '\'', .. }] => {
-                        // clone: the template, once per rule, when the macro is defined.
-                        separator = Separator::Lifetime(puncts[0], ident.clone());
-                    }
-                    _ => return Err(ParseError::InvalidRepeat),
-                },
-                _ => return Err(ParseError::InvalidRepeat),
-            },
-            tt::Leaf::Literal(_) if has_sep => return Err(ParseError::InvalidRepeat),
-            // clone: the template, once per rule, when the macro is defined.
-            tt::Leaf::Literal(lit) => separator = Separator::Literal(lit.clone()),
-            tt::Leaf::Punct(punct) => {
-                let repeat_kind = match punct.char {
-                    '*' => RepeatKind::ZeroOrMore,
-                    '+' => RepeatKind::OneOrMore,
-                    '?' => RepeatKind::ZeroOrOne,
-                    _ => match &mut separator {
-                        Separator::Puncts(puncts) if puncts.len() < 3 => {
-                            puncts.push(punct);
-                            continue;
-                        }
-                        _ => return Err(ParseError::InvalidRepeat),
-                    },
-                };
-                return Ok((has_sep.then_some(separator), repeat_kind));
-            }
-        }
+    let separator = match kleene_or_separator(src)? {
+        Ok(kind) => return Ok((None, kind)),
+        Err(separator) => separator,
+    };
+    match kleene_or_separator(src)? {
+        Ok(RepeatKind::ZeroOrOne) | Err(_) => Err(ParseError::InvalidRepeat),
+        Ok(kind) => Ok((Some(separator), kind)),
     }
-    Err(ParseError::InvalidRepeat)
+}
+
+/// rustc's `parse_kleene_op`: the next token, as an operator (`Ok`) or as a separator (`Err`);
+/// an error when it is a group or there is none.
+fn kleene_or_separator(src: &mut TtIter<'_>) -> Result<Result<RepeatKind, Separator>, ParseError> {
+    let separator = match src.peek() {
+        Some(TtElement::Leaf(tt::Leaf::Ident(ident))) => Separator::Ident(ident),
+        Some(TtElement::Leaf(tt::Leaf::Literal(lit))) => Separator::Literal(lit),
+        Some(TtElement::Leaf(tt::Leaf::Punct(_))) => {
+            let puncts = src.expect_glued_punct().map_err(|()| ParseError::InvalidRepeat)?;
+            return Ok(match puncts.as_slice() {
+                [tt::Punct { char: '*', .. }] => Ok(RepeatKind::ZeroOrMore),
+                [tt::Punct { char: '+', .. }] => Ok(RepeatKind::OneOrMore),
+                [tt::Punct { char: '?', .. }] => Ok(RepeatKind::ZeroOrOne),
+                // A lifetime is one token to rustc.
+                [quote @ tt::Punct { char: '\'', .. }] => {
+                    let name = src.expect_ident_or_underscore().map_err(|()| ParseError::InvalidRepeat)?;
+                    Err(Separator::Lifetime(*quote, name))
+                }
+                _ => Err(Separator::Puncts(puncts)),
+            });
+        }
+        Some(TtElement::Subtree(..)) | None => return Err(ParseError::InvalidRepeat),
+    };
+    src.next();
+    Ok(Err(separator))
 }
 
 fn parse_metavar_expr(src: &mut TtIter<'_>) -> Result<Op, ()> {

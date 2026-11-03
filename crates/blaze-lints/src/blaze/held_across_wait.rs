@@ -42,7 +42,7 @@ const LENDS: &[(&str, &str)] = &[
 ];
 
 pub(super) fn check(cx: &mut Cx<'_, '_>) {
-    if !cx.on_blaze(Lint::HeldAcrossWait) {
+    if !cx.on_blaze(Lint::HeldAcrossWait) || !cx.suspend_checked() {
         return;
     }
     let found = find(cx);

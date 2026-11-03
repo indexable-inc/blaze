@@ -364,6 +364,12 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
 
         let written_checked = overflow::body_written_checked(db, generic);
         let index = self.list(body, site.callee, site.args, written_checked);
+        // What the callee's body read of the program's dyn facts is read by its copy here, so
+        // it keys the caller's code (rule 18) whatever options the callee is optimized with.
+        // A copy's options read none (`MirOptions::built_in`), so this adds nothing today.
+        for &digest in &callee.inlined.devirtualized {
+            body.inlined.read_devirt(digest);
+        }
         // `monomorphized` instantiated the arguments of the callee's own inlined callees.
         let nested: SmallVec<[u32; 8]> = callee
             .inlined
@@ -591,19 +597,15 @@ fn optimized<'db>(
 /// compiles one of the crate `caller` with `options`, as `Build::options` gives them
 /// (`hir-ty-codegen/v2/build.rs`): the standard library's are its own, at level 2 without UB
 /// checks; a crate of the build has the caller's, its `debug_assertions` deciding its UB
-/// checks. No callee is devirtualized ([`MirOptions::world`]): the caller's `Devirtualize`
-/// runs again after `Inline` over what the callees brought, and records what it read in the
-/// caller's own body, which is what the code generator keys. No callee moves an allocation
-/// to the stack ([`MirOptions::heap_to_stack`]): built into a caller, its stack slots would be
-/// the caller's, and a caller may recurse, which `HeapToStack` never moves an allocation
-/// across (`escape.rs`).
+/// checks. Each is a copy built into its caller ([`MirOptions::built_in`]): no dyn facts, no
+/// allocation moved to the stack.
 fn callee_options(
     db: &Db,
     caller: Crate,
     callee: Crate,
     options: MirOptions,
 ) -> MirOptions {
-    let options = MirOptions { world: None, heap_to_stack: false, ..options };
+    let options = options.built_in();
     if callee == caller {
         return options;
     }

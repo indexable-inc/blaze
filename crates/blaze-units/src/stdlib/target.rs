@@ -6,6 +6,14 @@
 //! them (`rustc_session::config::cfg::default_configuration`, `rustc_codegen_ssa`'s
 //! `target_features`). A triple the data does not have is an error naming it, never a guess.
 //!
+//! Beside rustc's targets blaze defines its own, in the same form, in `own_targets.json`: a
+//! target no rustc has, so nothing was printed for it, and its cfgs, data layout, pointer width
+//! and linker flavour are blaze's decision, made there and nowhere else. It is
+//! `wasm64-blaze-wasip1`, the target of the bootstrap seed (`todo/bootstrap/plan.md`): wasm64
+//! (memory64) with WASI preview 1 over 64-bit pointers and sizes, whose calls import from the
+//! module `wasi_snapshot_preview1_64` (blaze's `library/`), so a stock wasip1 host refuses it at
+//! instantiation, naming them. A triple in both files is an error.
+//!
 //! The JSON is read once per process and compiled per target into columns: feature names
 //! interned to bits of a [`Features`] in their sorted order, what each turns on and off as a set,
 //! the target spec's facts and every `target_feature="..."` line made once. [`target_cfg`] is
@@ -19,6 +27,13 @@ use blaze_resolve::Cfg;
 use serde::Deserialize;
 
 const DATA: &str = include_str!("rustc.json");
+/// The targets blaze defines itself, in [`RawTarget`]'s form: `targets` only.
+const OWN: &str = include_str!("own_targets.json");
+
+#[derive(Deserialize)]
+struct RawOwn {
+    targets: BTreeMap<String, RawTarget>,
+}
 
 #[derive(Deserialize)]
 struct RawRelease {
@@ -323,8 +338,17 @@ fn release() -> &'static Release {
     )]
     static READ: std::sync::OnceLock<Release> = std::sync::OnceLock::new();
     READ.get_or_init(|| {
-        let raw: RawRelease =
+        let mut raw: RawRelease =
             serde_json::from_str(DATA).expect("stdlib/rustc.json is what harness/answers.py writes");
+        let own: RawOwn = serde_json::from_str(OWN).expect("stdlib/own_targets.json is blaze's targets");
+        for (triple, target) in own.targets {
+            // A target of rustc's that blaze also defined would be two answers for one triple.
+            assert!(
+                !raw.targets.contains_key(&triple),
+                "stdlib/own_targets.json defines `{triple}`, which rustc.json records from rustc"
+            );
+            raw.targets.insert(triple, target);
+        }
         Release {
             version: raw.version,
             verbose: raw.verbose,

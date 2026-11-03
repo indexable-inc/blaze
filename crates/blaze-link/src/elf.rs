@@ -28,7 +28,7 @@ use blaze_codegen::Arch;
 use blaze_ids::radix;
 use parking_lot::Mutex;
 
-use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special, Writer};
+use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special, Writer, zeroed};
 use crate::reset::{self, Reset};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
 
@@ -61,7 +61,7 @@ pub(crate) fn writer(output: &Output) -> Result<Elf, LinkError> {
     }
     match output.arch {
         Arch::X86_64 | Arch::Aarch64 => {}
-        Arch::Wasm32 => return Err(error("an ELF image for wasm32: wasm is linked as wasm".into())),
+        Arch::Wasm32 | Arch::Wasm64 => return Err(error(format!("an ELF image for {:?}: wasm is linked as wasm", output.arch))),
     }
     let last = output.incremental.then(Mutex::default);
     // clone: once per link, the writer owns its `Output` (the public API's type)
@@ -146,12 +146,6 @@ impl Segment {
     pub(crate) fn loader_writes(self) -> bool {
         matches!(self, Segment::Relro | Segment::Write)
     }
-}
-
-/// Whether a region's bytes are in the file: everything but the zeroed tail of the writable
-/// segment and the reservations.
-pub(crate) fn in_file(class: &Class) -> bool {
-    !matches!(class, Class::Tbss | Class::Bss | Class::Reserve(_))
 }
 
 /// A class's place in the address space: its segment, its rank in it, then its name.
@@ -311,7 +305,7 @@ fn tls_start(regions: &[Region]) -> u64 {
 }
 /// The end of the last region whose bytes are in the file.
 fn edata(regions: &[Region]) -> u64 {
-    end(regions, in_file).unwrap_or(0)
+    end(regions, |it| !zeroed(it)).unwrap_or(0)
 }
 /// The end of the image's own memory: a dev run's reservations are not its.
 fn image_end(regions: &[Region]) -> u64 {
@@ -429,7 +423,7 @@ impl Writer for Elf {
     }
 
     fn offset(&self, placed: &Placed<'_>, region: &Region) -> Option<u64> {
-        in_file(&region.class).then(|| region.addr - placed.plan.base)
+        (!zeroed(&region.class)).then(|| region.addr - placed.plan.base)
     }
 
     fn file(&self, placed: &Placed<'_>) -> Result<File, LinkError> {
@@ -454,14 +448,14 @@ impl Elf {
     fn page(&self) -> u64 {
         match self.output.arch {
             Arch::Aarch64 => 0x10000,
-            Arch::X86_64 | Arch::Wasm32 => 0x1000,
+            Arch::X86_64 | Arch::Wasm32 | Arch::Wasm64 => 0x1000,
         }
     }
 
     pub(crate) fn machine(&self) -> u16 {
         match self.output.arch {
             Arch::Aarch64 => object::elf::EM_AARCH64.0,
-            Arch::X86_64 | Arch::Wasm32 => object::elf::EM_X86_64.0,
+            Arch::X86_64 | Arch::Wasm32 | Arch::Wasm64 => object::elf::EM_X86_64.0,
         }
     }
 }

@@ -28,7 +28,8 @@ pub struct ModPath {
     segments: Option<InternedSlice<PathSegments>>,
 }
 
-const _: () = assert!(size_of::<ModPath>() == 16);
+// The kind (8 bytes) and a pointer: 16 bytes on a 64-bit target.
+const _: () = assert!(size_of::<ModPath>() == 8 + size_of::<usize>());
 
 /// Segments are gathered here before they are interned: paths longer than this spill to the heap.
 type SegmentBuf = SmallVec<[Name; 8]>;

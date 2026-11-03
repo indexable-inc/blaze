@@ -1,5 +1,14 @@
 //! The daemon this CLI is a client of: found at its socket ([`crate::serve::socket`]), started
 //! as `blaze serve` when none answers there, spoken to through [`blaze_api::client::Client`].
+//!
+//! Without blaze-cargo's `daemon` feature (the wasm seed, todo/bootstrap/plan.md) there is no
+//! daemon to find or start: [`connect`] hands back a client of the same engine run in this
+//! process for this command alone ([`crate::serve::once`]), and `blaze stop`, `status` and
+//! `daemon` are refused, naming the feature ([`NO_DAEMON`]).
+#![cfg_attr(
+    not(feature = "daemon"),
+    allow(dead_code, unused_imports, reason = "the daemon's start and its helpers are not in the seed")
+)]
 
 use std::{
     io,
@@ -11,14 +20,21 @@ use blaze_api::{
     Request, ResponseRef, Status,
     client::{Client, ClientError},
 };
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 use blaze_api::units::Installed;
 
 use super::args::DaemonVerb;
 use crate::{raw::process::Reaped, serve::Phase};
 
-/// How long a daemon that was told to stop is waited for.
-pub const PATIENCE: Duration = Duration::from_secs(10);
+/// Why a command that needs a running daemon is refused in a blaze built without one.
+pub const NO_DAEMON: &str = "this blaze is built without blaze-cargo's `daemon` feature (the seed profile, \
+     todo/bootstrap/plan.md): it runs no daemon, and each command builds in its own process and exits";
+
+/// How long a daemon that was told to stop is waited for after the last step of its stop it
+/// said ([`blaze_api::Response::Stopping`]): one step is the making of its image, which grows
+/// with the daemon (679 MiB took 11 s in the self-build survey), so as long as a step of a
+/// start ([`STARTING`]).
+pub const PATIENCE: Duration = Duration::from_secs(60);
 
 /// How long a daemon this command started is given for each phase of its start
 /// ([`crate::serve::Phase`]): reading a large image is one.
@@ -52,9 +68,20 @@ impl Api for Client {
         Ok(ok)
     }
 
+    #[cfg(feature = "daemon")]
     fn died(&mut self) -> Option<anyhow::Result<Died>> {
         Some(died())
     }
+}
+
+/// Tells the daemon on `client` to stop: Stop's Done, then, on the same request, each step of
+/// its stop ([`blaze_api::Response::Stopping`]) until it hangs up. One read may hold the Done
+/// and the first steps, so this is [`Client::call_ref`], never [`Api::call`] (which refuses
+/// what follows a Done on a connection of one request), and the caller's
+/// [`Client::until_hung_up`] takes the steps held. `on` is given each response up to the Done;
+/// the Done's `ok`.
+pub(crate) fn told_to_stop(client: &mut Client, on: impl FnMut(ResponseRef<'_>, bool)) -> Result<bool, ClientError> {
+    client.call_ref(Request::Stop, on)
 }
 
 /// Whether a daemon is started when none answers.
@@ -132,7 +159,7 @@ pub fn nothing_listens(error: &ClientError) -> bool {
 /// A command that may start one ([`Start::IfMissing`]) first asks the daemon that answers which
 /// blaze it is ([`builds`]): one of another build is stopped, saying so, and this one started,
 /// so no request of this blaze runs on another's.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     let socket = crate::serve::socket()?;
     let refused = match Client::unix(&socket) {
@@ -172,7 +199,7 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
 }
 
 /// How a process ended, as its status says.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 fn reaped(status: std::process::ExitStatus) -> Option<Reaped> {
     use std::os::unix::process::ExitStatusExt as _;
     status.code().map(Reaped::Code).or_else(|| status.signal().map(Reaped::Signal))
@@ -232,7 +259,7 @@ pub fn builds<A: Api>(
 }
 
 /// `build`'s path and the start of its hash, as a line names it.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 fn named(build: &blaze_api::Build) -> String {
     let id = format!("{:x}", build.id); // alloc: a line, once a replaced daemon
     format!("{} {}", build.exe.path, &id[..id.len().min(12)])
@@ -240,7 +267,7 @@ fn named(build: &blaze_api::Build) -> String {
 
 /// The connection `client` was, made again for the command's own request, when its daemon is
 /// this blaze; `None` once one of another build was stopped, for this one to start.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client>> {
     use anyhow::Context as _;
     let exe = std::env::current_exe().context("finding blaze's own executable")?;
@@ -272,7 +299,7 @@ fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client
         named(&ours)
     );
     let mut client = Client::unix(socket).map_err(|error| DaemonError::Connect { socket: socket.to_owned(), error })?;
-    let ok = Api::call(&mut client, Request::Stop, |_, _| {})
+    let ok = told_to_stop(&mut client, |_, _| {})
         .with_context(|| format!("telling the daemon of another build at {} (pid {pid}) to stop", socket.display()))?;
     if !ok {
         anyhow::bail!("the daemon of another build at {} (pid {pid}) refused to stop", socket.display());
@@ -307,7 +334,7 @@ fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client
 
 /// The line a command that starts the daemon says first, or why it starts none: a socket
 /// unit serves `socket` and nothing listens there (`refused`).
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 fn say_start(socket: &Path, refused: &ClientError) -> anyhow::Result<()> {
     match activation(socket)? {
         Installed::Yes => {
@@ -334,7 +361,7 @@ fn say_start(socket: &Path, refused: &ClientError) -> anyhow::Result<()> {
 }
 
 /// What the daemon this command started said on its pipe ([`started`]).
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Heard {
     /// It listens: it said [`Phase::Listening`].
@@ -356,7 +383,7 @@ fn within(phase: Phase, long: Duration) -> Duration {
 
 /// Waits for the daemon to say on `ready` that it listens, or to end: at most [`within`] its
 /// phase for each.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 fn heard(ready: &std::io::PipeReader, long: Duration) -> io::Result<Heard> {
     use std::{io::Read as _, os::fd::AsFd as _};
     let mut phase = Phase::Launched;
@@ -389,7 +416,7 @@ fn heard(ready: &std::io::PipeReader, long: Duration) -> io::Result<Heard> {
 
 /// Whether a launchd or systemd unit serves `socket`. Units live under `HOME`: without one,
 /// none is installed.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 fn activation(socket: &Path) -> anyhow::Result<Installed> {
     if blaze_api::activation::Manager::here().is_none() || std::env::var_os("HOME").is_none_or(|it| it.is_empty()) {
         return Ok(Installed::No);
@@ -397,13 +424,21 @@ fn activation(socket: &Path) -> anyhow::Result<Installed> {
     Ok(blaze_api::units::installed(&blaze_api::units::place_here()?, socket)?)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), feature = "daemon"))]
 pub fn connect(_: Start) -> anyhow::Result<Option<Client>> {
     anyhow::bail!(
         "blaze's CLI speaks to its daemon over the Unix socket {}, and blaze_api's client has \
          Unix sockets on Unix only",
         crate::serve::socket()?.display()
     )
+}
+
+/// The seed's connection: the engine `blaze serve` runs, started in this process for this
+/// command alone and stopped as the client closes ([`crate::serve::once`]), whatever `start`
+/// says, as there is no daemon running to find.
+#[cfg(not(feature = "daemon"))]
+pub fn connect(_: Start) -> anyhow::Result<Option<Client>> {
+    crate::serve::once::connect().map(Some)
 }
 
 /// What a start that never listened says.
@@ -495,6 +530,7 @@ impl std::fmt::Display for Died {
 
 /// The pid of the daemon's last start in `log` (its [`crate::serve::LISTENING`] line), and
 /// its lines after that are not blank, the last [`TAIL`]; `None` when `log` has no start.
+#[cfg(feature = "daemon")]
 pub fn last_start(log: &str) -> Option<(u32, Vec<&str>)> {
     // alloc: an error path, once a command
     let lines: Vec<&str> = log.lines().collect();
@@ -506,6 +542,7 @@ pub fn last_start(log: &str) -> Option<(u32, Vec<&str>)> {
 }
 
 /// `7` of `blaze serve: listening on /run/blaze/v2.sock (pid 7)`.
+#[cfg(feature = "daemon")]
 fn listening_pid(line: &str) -> Option<u32> {
     let (_, pid) = line.strip_prefix(crate::serve::LISTENING)?.rsplit_once(" (pid ")?;
     pid.strip_suffix(')')?.parse().ok()
@@ -513,7 +550,7 @@ fn listening_pid(line: &str) -> Option<u32> {
 
 /// What came of the daemon that hung up on a request: its log's last start and what it wrote
 /// since, and how its process ended, given [`ENDING`] to.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 pub fn died() -> anyhow::Result<Died> {
     use std::io::{Read as _, Seek as _};
 
@@ -544,7 +581,7 @@ pub fn died() -> anyhow::Result<Died> {
     Ok(Died { log, ended: Some((pid, ended)), said })
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), feature = "daemon"))]
 pub fn died() -> anyhow::Result<Died> {
     anyhow::bail!("blaze's CLI speaks to its daemon over a Unix socket, which this system lacks")
 }
@@ -553,7 +590,7 @@ pub fn died() -> anyhow::Result<Died> {
 /// terminal's foreground does not end it, with its output appended to its log; the log, and
 /// the pipe it writes one byte to once it listens, which closes with nothing written if it
 /// ends first.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 fn started() -> anyhow::Result<(std::path::PathBuf, std::io::PipeReader, std::process::Child)> {
     use std::os::{fd::AsRawFd as _, unix::process::CommandExt as _};
     use anyhow::Context as _;
@@ -578,13 +615,14 @@ fn started() -> anyhow::Result<(std::path::PathBuf, std::io::PipeReader, std::pr
 
 /// `blaze stop`: the daemon made durable and ended, waited for until its socket is gone.
 // dyn: the CLI's output writer, written a few times per command.
+#[cfg(feature = "daemon")]
 pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     let Some(mut client) = connect(Start::Never)? else {
         writeln!(err, "no daemon is running")?;
         return Ok(0);
     };
     let mut said = Vec::new();
-    let ok = Api::call(&mut client, Request::Stop, |response, _| {
+    let ok = told_to_stop(&mut client, |response, _| {
         if let ResponseRef::Error(error) = response {
             // alloc: error path, the daemon's errors, said once it is done.
             said.push(error.what.to_owned());
@@ -597,12 +635,9 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
         return Ok(super::FAILED);
     }
     let socket = crate::serve::socket()?;
-    // With a unit installed the socket answers on (the manager listens, and a connect would
-    // start the daemon again): the daemon hangs up its connection last, once its image is
-    // written.
-    // The daemon stops listening, then hangs up its connection last, once its image is
-    // written. With a unit installed the socket answers on (the manager listens, and a connect
-    // would start the daemon again).
+    // The daemon stops listening, says each step of its stop, then hangs up its connection
+    // last, once its image is written. With a unit installed the socket answers on (the
+    // manager listens, and a connect would start the daemon again).
     if let Err(error) = client.until_hung_up(PATIENCE) {
         let what = format!("the daemon at {} was told to stop: {error}", socket.display());
         err.write_all(super::say::error(&what, color).as_bytes())?;
@@ -619,7 +654,7 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
 
 /// Whether the daemon still answers at `socket`; a connect that fails for another reason than
 /// that nothing listens is the error.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 fn answers(socket: &Path) -> Result<bool, DaemonError> {
     match Client::unix(socket) {
         Ok(_) => Ok(true),
@@ -631,6 +666,7 @@ fn answers(socket: &Path) -> Result<bool, DaemonError> {
 
 /// `blaze status`: what the daemon is doing, on stdout.
 // dyn: the CLI's output writer, written a few times per command.
+#[cfg(feature = "daemon")]
 pub fn status(out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     let Some(mut client) = connect(Start::Never)? else {
         writeln!(out, "no daemon is running")?;
@@ -657,7 +693,7 @@ pub fn status(out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, color:
 /// written and loaded ([`blaze_api::units::install`]), so the system listens on the socket and
 /// starts the daemon at the first connection. `blaze daemon uninstall`: the daemon stopped,
 /// the units unloaded and removed.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 // dyn: the CLI's output writer, written a few times per command.
 pub fn units(verb: DaemonVerb, err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     use anyhow::Context as _;
@@ -699,10 +735,30 @@ pub fn units(verb: DaemonVerb, err: &mut dyn std::io::Write, color: bool) -> any
     Ok(0)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), feature = "daemon"))]
 // dyn: the CLI's output writer, written a few times per command.
 pub fn units(_: DaemonVerb, _: &mut dyn std::io::Write, _: bool) -> anyhow::Result<i32> {
     anyhow::bail!("blaze daemon: socket activation is systemd's and launchd's, and this system has neither")
+}
+
+/// `blaze stop`, `blaze status` and `blaze daemon` in a blaze with no daemon: refused, naming
+/// the feature, as there is none to stop, ask or install.
+#[cfg(not(feature = "daemon"))]
+// dyn: the CLI's output writer, unused: the refusal is the error.
+pub fn stop(_: &mut dyn std::io::Write, _: bool) -> anyhow::Result<i32> {
+    anyhow::bail!("blaze stop: {NO_DAEMON}")
+}
+
+#[cfg(not(feature = "daemon"))]
+// dyn: the CLI's output writers, unused: the refusal is the error.
+pub fn status(_: &mut dyn std::io::Write, _: &mut dyn std::io::Write, _: bool) -> anyhow::Result<i32> {
+    anyhow::bail!("blaze status: {NO_DAEMON}")
+}
+
+#[cfg(not(feature = "daemon"))]
+// dyn: the CLI's output writer, unused: the refusal is the error.
+pub fn units(_: DaemonVerb, _: &mut dyn std::io::Write, _: bool) -> anyhow::Result<i32> {
+    anyhow::bail!("blaze daemon: {NO_DAEMON}")
 }
 
 /// The daemon's [`Status`] for people.
@@ -743,7 +799,7 @@ pub fn bytes(count: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "daemon"))]
 mod refusals {
     use super::*;
 

@@ -155,6 +155,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::dropped_error",
             "blaze::hash_order_output",
             "blaze::held_across_wait",
+            "blaze::thread_local_in_waiting_fn",
             "blaze::lock_across_query",
             "blaze::blocking_on_pool",
             "blaze::unnamed_wait",

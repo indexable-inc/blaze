@@ -39,6 +39,7 @@
 
 use std::{
     fmt,
+    path::PathBuf,
     sync::{Arc, Weak},
 };
 
@@ -76,6 +77,10 @@ use crate::{
 /// other's libraries. Its libraries are held weakly, so a library holding it makes no cycle.
 pub struct Macros {
     keeps: Keeps,
+    /// Where the daemon keeps the packages it fetches (`blaze_manifest::home::sources`): a
+    /// read under it is of the same file in every checkout ([`RootMap::with_sources`]). None
+    /// where nothing is fetched (a test, a bench): such a read is then this checkout's.
+    sources: Option<PathBuf>,
     libraries: Mutex<Vec<Weak<Library>>>,
     /// The daemon's wasm modules ([`load_wasm`]'s), made with it: or why Wasmtime made no
     /// engine, which every wasm macro's load then says.
@@ -88,9 +93,9 @@ const _: fn() = || {
 };
 
 impl Macros {
-    pub fn new(keeps: Keeps) -> Arc<Macros> {
+    pub fn new(keeps: Keeps, sources: Option<PathBuf>) -> Arc<Macros> {
         // alloc: once per daemon, or per test that loads macros
-        Arc::new(Macros { keeps, libraries: Mutex::new(Vec::new()), modules: wasm::Modules::new() })
+        Arc::new(Macros { keeps, sources, libraries: Mutex::new(Vec::new()), modules: wasm::Modules::new() })
     }
 
     /// The daemon's wasm modules, which a proc macro built for wasm loads through
@@ -102,7 +107,7 @@ impl Macros {
     /// Macros that keep and find nothing, for `why` (a bench, a test of the evaluator alone),
     /// which each expansion that runs says of its reads.
     pub fn nothing(why: &'static str) -> Arc<Macros> {
-        Macros::new(Keeps::Nothing(why))
+        Macros::new(Keeps::Nothing(why), None)
     }
 
     /// Where its expansions are kept.
@@ -169,7 +174,7 @@ struct Library {
 /// package and `OUT_DIR` and the passed `CARGO_HOME` and `HOME`. Made again when any differs.
 struct KeptRoots {
     at: (Nonce, blaze_query::db::View),
-    made_of: [Option<String>; 4],
+    made_of: [Option<String>; 2],
     map: RootMap,
 }
 
@@ -282,10 +287,10 @@ impl Library {
     /// The roots `calling`'s expansion with `roots` is kept against, given `passed`: made once
     /// per calling crate and revision ([`KeptRoots`]), not once per expansion, as making them
     /// reads each root's links.
-    fn kept_roots(&self, db: &Db, calling: Crate, roots: Roots<'_>, passed: &[(String, String)]) -> Arc<KeptRoots> {
+    fn kept_roots(&self, db: &Db, calling: Crate, roots: Roots<'_>) -> Arc<KeptRoots> {
         let at = db.nonce_and_revision();
-        let var = |name: &str| passed.iter().rev().find(|it| it.0 == name).map(|it| it.1.as_str());
-        let made_of = [roots.get(Role::Package), roots.get(Role::OutDir), var("CARGO_HOME"), var("HOME")];
+        // The sources directory is the daemon's, the same for every call: not in `made_of`.
+        let made_of = [roots.get(Role::Package), roots.get(Role::OutDir)];
         let same = |kept: &KeptRoots| kept.at == at && kept.made_of.iter().map(Option::as_deref).eq(made_of.iter().copied());
         let pinned = self.kept_roots.pin();
         if let Some(kept) = pinned.get(&calling).filter(|it| same(it)) {
@@ -295,7 +300,10 @@ impl Library {
             // alloc: once per calling crate and revision
             at,
             made_of: made_of.map(|it| it.map(str::to_owned)), // alloc: as above
-            map: roots.to_map(|map| map.with_cargo_home(var)),
+            map: roots.to_map(|map| match &self.macros.sources {
+                Some(sources) => map.with_sources(sources),
+                None => map,
+            }),
         });
         pinned.insert(calling, Arc::clone(&kept)); // clone: as above
         kept
@@ -498,10 +506,8 @@ fn load_on(
         kept_roots: SharedMap::default(),
     });
     macros.libraries.lock().push(Arc::downgrade(&library));
+    // None for a proc-macro crate with none, which rustc builds: a use fails at the use.
     let functions = run::functions(db, krate);
-    if functions.is_empty() {
-        return Err(refused(format!("the proc-macro crate `{}` has no proc macros", library.name))); // alloc: error path
-    }
     // A module numbers its macros by their place in `__blaze_proc_macros`, which is sorted by
     // name (`hir_ty_codegen::v2::roots::proc_macros`).
     // alloc: once a proc-macro crate, its macros' places
@@ -1011,9 +1017,9 @@ impl Evaluated {
         // (`blaze_usercode::roots::verify`). No copy for another to check when the output,
         // a variable it read or a string its key was given still holds a root in any spelling
         // (a literal path the macro made), it read outside its roots and the machine-wide
-        // places, the cargo home's registry and git checkouts among them, or a root's links
+        // places, blaze's fetched packages among them, or a root's links
         // moved since the memo was made (then it is made again).
-        let kept = library.kept_roots(db, calling, roots, keeping.expansions.environment.passed());
+        let kept = library.kept_roots(db, calling, roots);
         let view = kept.map.view();
         let marked = view.kept_bytes(&traced, bytes.as_deref(), proc_macro_api::kept::left(&keyed, &view));
         if marked.relinked {

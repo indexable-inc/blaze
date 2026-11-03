@@ -455,19 +455,18 @@ fn module_item_keys<'db>(
 
 #[blaze_query::tracked(returns(ref))]
 fn impl_item_keys(db: &Db, impl_: ImplId) -> Vec<(ItemId, ItemKey)> {
-    let items = &impl_.impl_items(db).items;
-    let mut batch = Batch::with_capacity(items.len());
-    for &(_, it) in items.iter() {
-        batch.push(ItemId::from(it), |b| item_preimage(db, it.into(), b));
-    }
-    batch.finish()
+    assoc_item_keys(db, &impl_.impl_items(db).items)
 }
 
 #[blaze_query::tracked(returns(ref))]
 fn trait_item_keys(db: &Db, trait_: TraitId) -> Vec<(ItemId, ItemKey)> {
-    let items = &trait_.trait_items(db).items;
+    assoc_item_keys(db, &trait_.trait_items(db).items)
+}
+
+/// The keys of an impl's or a trait's associated items, in order.
+fn assoc_item_keys(db: &Db, items: &[(Name, hir_def::AssocItemId)]) -> Vec<(ItemId, ItemKey)> {
     let mut batch = Batch::with_capacity(items.len());
-    for &(_, it) in items.iter() {
+    for &(_, it) in items {
         batch.push(ItemId::from(it), |b| item_preimage(db, it.into(), b));
     }
     batch.finish()
@@ -1129,9 +1128,8 @@ impl ClashingCrate {
     fn of(db: &Db, krate: Crate) -> ClashingCrate {
         let extra = krate.extra_data(db);
         let data = krate.data(db);
-        let name = extra.display_name.as_ref().map_or("<unnamed>", |it| it.canonical_name().as_str());
         ClashingCrate {
-            name: name.to_owned(), // alloc: an error's, once
+            name: crate::hash::crate_name(db, krate).to_owned(), // alloc: an error's, once
             version: extra.version.clone(), // clone: an error's, once
             origin: format!("{:?}", data.origin), // alloc: an error's, once
             kind: if data.target_kind == data.manifest_kind {

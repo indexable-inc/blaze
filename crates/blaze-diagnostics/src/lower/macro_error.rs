@@ -29,12 +29,6 @@ use crate::{
 /// from its binding errors, which all start with `expected `.
 const MATCH_FAILURES: &[&str] = &["no rule matches input tokens", "unexpected token in input", "leftover tokens"];
 
-/// rustc's glued punctuation, longest first, as `Token::glue` builds it.
-const GLUED: &[&str] = &[
-    "<<=", ">>=", "...", "..=", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=",
-    "*=", "/=", "%=", "^=", "&=", "|=", "<<", ">>", "..", "<-",
-];
-
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MacroError) -> Vec<Found> {
     let file = d.range.file_id;
     let root = cx.root(file);
@@ -222,14 +216,7 @@ fn compile_error(cx: &Cx<'_, '_>, file: hir::HirFileId, call: &Call<'_>, message
 fn recursion_limit(cx: &Cx<'_, '_>, file: hir::HirFileId, call: Option<&Call<'_>>, range: TextRange) -> Diag {
     let limit = hir_def::nameres::crate_def_map(cx.db, cx.krate.into()).recursion_limit();
     let suggested = if limit == 0 { 2 } else { limit * 2 };
-    let crate_name = match cx.krate.display_name(cx.db) {
-        Some(name) => name.crate_name().to_string(), // alloc: the error's text, for an error hir found
-        None => {
-            let path = cx.file_name(cx.krate.root_file(cx.db));
-            let stem = path.rsplit('/').next().unwrap_or(&path);
-            stem.strip_suffix(".rs").unwrap_or(stem).replace('-', "_")
-        }
-    };
+    let crate_name = cx.crate_name(cx.krate);
     let (descr, range) = match call {
         Some(call) => (call.descr(), call.range),
         None => (String::from("this macro"), range), // alloc: the error's text, for an error hir found
@@ -273,20 +260,15 @@ fn glued(token: Token<'_>) -> (TextRange, String) {
         // alloc: the error's text, for an error hir found
         return (token.text_range(), token.text().to_owned());
     }
-    // alloc: the error's text, for an error hir found
-    let mut text = token.text().to_owned();
+    let mut glued = token.text();
     let mut next = token.next_token();
-    while let Some(it) = next.filter(|it| it.kind().is_punct() && text.len() < 3) {
-        text.push_str(it.text());
+    while let Some(it) = next.filter(|it| it.kind().is_punct()) {
+        let Some(joined) = tt::glue_str(glued, it.text()) else { break };
+        glued = joined;
         next = it.next_token();
     }
-    let glued = GLUED.iter().find(|op| text.starts_with(**op) && op.len() > token.text().len());
-    match glued {
-        // alloc: the error's text, for an error hir found
-        Some(op) => (TextRange::at(token.text_range().start(), syntax::TextSize::of(*op)), (*op).to_owned()),
-        // alloc: the error's text, for an error hir found
-        None => (token.text_range(), token.text().to_owned()),
-    }
+    // alloc: the error's text, for an error hir found
+    (TextRange::at(token.text_range().start(), syntax::TextSize::of(glued)), glued.to_owned())
 }
 
 const USED_KEYWORDS: &[&str] = &[

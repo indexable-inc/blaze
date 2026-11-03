@@ -20,14 +20,14 @@ use blaze_ids::ContentId;
 use blaze_query::db::{AsId, FromId};
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, HasModule, ImplId, StaticId,
-    StructId, TraitId, TypeAliasId, UnionId,
+    StructId, TraitId, TypeAliasId, UnionId, expr_store::Body,
 };
 
 use super::{BodyFacts, INSTALLED, Lookup, Step};
 use crate::{
     InferenceResult,
     check_cache::ids::{self, IdKind, ItemSink, Table},
-    infer::persist::InferenceRecord,
+    infer::persist::{InferenceRecord, Nodes},
     next_solver::{
         DbInterner, SolverDefId,
         persist::{TABLE_SCHEMA, TyTableWriter},
@@ -190,7 +190,8 @@ pub(super) fn decode<'db>(
     let items = items_of(db, facts, def, keys, kinds)?;
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = ids::read(db, interner, &items, words, bytes, root.locs)?;
-    ids::relocating(&mut table, || InferenceRecord::read(record)?.to_result(interner)).map_err(format_error)
+    let nodes = Nodes::of(Body::of(db, def));
+    ids::relocating(&mut table, || InferenceRecord::read(record)?.to_result(interner, nodes)).map_err(format_error)
 }
 
 /// The items a [`Keyed`] table listed (`keys`, each of the kind at the same index of `kinds`),
@@ -270,7 +271,7 @@ impl ItemSink for Keyed<'_, '_> {
 
     fn index(&mut self, kind: IdKind, bits: u64) -> R<u32> {
         // alloc: the reason a result is not stored
-        let def = solver_def(kind, bits).ok_or_else(|| format!("a {kind:?} is no item"))?;
+        let def = solver_def(kind, bits).ok_or_else(|| format!("a {kind:?} of id bits {bits} is no item"))?;
         let key = self.facts.def_key(self.db, self.body, def);
         match self.seen.entry(key) {
             Entry::Occupied(found) => match *found.get() {
@@ -290,9 +291,10 @@ impl ItemSink for Keyed<'_, '_> {
     }
 }
 
-/// The item `bits` of `kind` name, as the solver names it; `None` for a kind that is no item.
+/// The item `bits` of `kind` name, as the solver names it; `None` for a kind that is no item
+/// or bits that are no id (0, or past `Id::MAX_U32`).
 fn solver_def<'db>(kind: IdKind, bits: u64) -> Option<SolverDefId<'db>> {
-    let id = blaze_query::db::Id::from_u32(u32::try_from(bits).ok().filter(|&bits| bits != 0)?);
+    let id = u32::try_from(bits).ok().and_then(blaze_query::db::Id::new)?;
     Some(match kind {
         IdKind::Function => SolverDefId::FunctionId(FunctionId::from_id(id)),
         IdKind::Struct => SolverDefId::AdtId(AdtId::StructId(StructId::from_id(id))),

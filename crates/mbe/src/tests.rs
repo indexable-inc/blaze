@@ -709,3 +709,59 @@ fn concat_gives_the_spans_of_the_identifiers_it_made() {
     assert_eq!(made.as_slice(), [idents[1].1, idents[3].1]);
     assert!(!made.contains(&idents[0].1) && !made.contains(&idents[2].1), "{made:?}");
 }
+
+/// rustc's `parse_sep_and_kleene_op`: a repetition's separator is one token, punctuation glued as
+/// rustc's lexer glues it, so `::`, `=>`, `..=`, `->` and `+=` are separators; an operator is
+/// one `*`, `+` or `?` token, so `$(..)++` is the operator `+` and then a `+`; and `?` takes no
+/// separator.
+#[test]
+fn a_repetitions_separator_is_one_glued_token_and_its_operator_is_one_character() {
+    let anchor = SpanAnchor {
+        file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
+        ast_id: ROOT_ERASED_FILE_AST_ID,
+    };
+    let ctx = SyntaxContext::root(Edition::CURRENT);
+    let parse = |text: &str| {
+        let decl = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, text).unwrap();
+        DeclarativeMacro::parse_macro_rules(&decl, |_| Edition::CURRENT)
+    };
+    let mac = parse(
+        r#"
+(:: $($a:ident)::+) => { $($a)::+ };
+(=> $($a:ident)=>*) => { $($a)=>* };
+(..= $($a:literal)..=*) => { $($a)..=* };
+(-> $($a:ident)->*) => { $($a)->* };
+(&& $($a:ident)&&*) => { $($a)&&* };
+(+= $($a:ident)+=*) => { $($a)+=* };
+(++ $($a:ident)++) => { $($a)* };
+"#,
+    );
+    assert!(mac.err().is_none(), "{:?}", mac.err());
+    let db = base_db::Db::for_tests();
+    let expand = |arg: &str| {
+        let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, arg).unwrap();
+        let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor, ctx };
+        let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCallStyle::FnLike, call_site);
+        assert!(expanded.err.is_none(), "{:?}", expanded.err);
+        let leaves: Vec<String> = expanded
+            .value
+            .0
+            .iter()
+            .map(|it| match it {
+                tt::iter::TtElement::Leaf(leaf) => leaf.to_string(),
+                tt::iter::TtElement::Subtree(..) => "(..)".to_owned(),
+            })
+            .collect();
+        leaves.join(" ")
+    };
+    assert_eq!(expand(":: a::b::c"), "a : : b : : c");
+    assert_eq!(expand("=> a => b => c"), "a = > b = > c");
+    assert_eq!(expand("..= 1 ..= 2"), "1 . . = 2");
+    assert_eq!(expand("-> a -> b"), "a - > b");
+    assert_eq!(expand("&& a && b"), "a & & b");
+    assert_eq!(expand("+= a += b"), "a + = b");
+    assert_eq!(expand("++ a b c +"), "a b c");
+    // `?` takes no separator, and a separator is followed by one operator token, not a glued one.
+    assert!(parse("($($a:ident),?) => {}").err().is_some());
+    assert!(parse("($($a:ident),+=) => {}").err().is_some());
+}

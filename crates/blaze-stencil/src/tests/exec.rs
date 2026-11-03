@@ -713,12 +713,16 @@ fn forked(len: usize, f: impl FnOnce(*mut u8)) -> Outcome<Vec<u8>> {
         )
     };
     assert_ne!(shared, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
-    // SAFETY: `fork` in a process with other threads: the child only runs `f` (mapped code
-    // that allocates nothing and takes no lock the parent's threads could hold) and then
-    // `_exit`s, and its handlers only `_exit`.
+    // SAFETY: `fork` in a process with other threads: the child only sets its view of the
+    // code's pages, runs `f` (mapped code that allocates nothing and takes no lock the
+    // parent's threads could hold) and then `_exit`s, and its handlers only `_exit`.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
     if pid == 0 {
+        // The child's thread may not have this thread's view of the code's pages: without
+        // this, a call that does not trap sometimes ends with `SIGBUS` at its first
+        // instruction on macOS.
+        Executable::after_fork();
         for signal in [libc::SIGILL, libc::SIGTRAP, libc::SIGFPE, libc::SIGSEGV, libc::SIGBUS] {
             // SAFETY: in the child: a handler that only `_exit`s, so a trap ends the child
             // with a status the parent reads, with no core dump or crash report.

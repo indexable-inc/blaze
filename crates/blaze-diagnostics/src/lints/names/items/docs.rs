@@ -1,7 +1,8 @@
 //! `missing_docs`: an exported item, associated item, foreign item, variant or named field
 //! with no doc comment, no `#[doc = ..]` and no `#[doc(hidden)]`, and the crate with none.
 //! Impls, `use`s and `extern crate`s are not linted, nor the items of a trait impl or of an
-//! inherent impl of a `#[doc(hidden)]` type.
+//! inherent impl of a `#[doc(hidden)]` type. A `mod m;` is documented by its file's `//!` or
+//! `#![doc ..]` as well as by its own outer attributes.
 //!
 //! Follows `compiler/rustc_lint/src/builtin.rs` (`MissingDoc`, `has_doc`) and
 //! `compiler/rustc_middle/src/ty/mod.rs` (`article_and_description`, `def_descr`) (MIT or
@@ -67,7 +68,12 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effectiv
         ast::Item::Module(it) => it.item_list(),
         _ => None,
     };
-    if exported && !has_doc(cx, node, list.map(|it| it.syntax()), list) && !hidden_impl() {
+    // `mod m;`: its inner attributes, `//!` and `#![doc ..]`, are in its own file.
+    let file_doc = || match node {
+        ast::Item::Module(it) if list.is_none() => module_file_has_doc(cx, item.node.with_value(it)),
+        _ => false,
+    };
+    if exported && !has_doc(cx, node, list.map(|it| it.syntax()), list) && !file_doc() && !hidden_impl() {
         found.push(lint(cx, item.syntax(), desc));
     }
     if !matches!(node, ast::Item::Struct(_) | ast::Item::Union(_) | ast::Item::Enum(_)) {
@@ -130,6 +136,16 @@ fn has_doc<'t>(cx: &Cx<'_, '_>, owner: impl HasAttrs<'t>, inner: Option<ast::Nod
         return true;
     }
     list.is_some_and(|list| walk::any_named(cx, list, "doc", documented))
+}
+
+/// Whether the file of the out-of-line module `module` documents it: rustc reads a module's
+/// inner attributes from its file as its own (`hir_attrs` of the module item).
+fn module_file_has_doc<'db>(cx: &Cx<'_, 'db>, module: InFile<ast::Module<'db>>) -> bool {
+    let Some(def) = cx.vsema.to_def2(module) else { return false };
+    let source = def.definition_source_view(cx.db);
+    let ModuleSourceView::SourceFile(_) = source.value else { return false };
+    let Some(file) = ast::SourceFile::cast(cx.root(source.file_id)) else { return false };
+    has_doc(cx, file, Some(file.syntax()), None)
 }
 
 fn is_doc_comment(node: ast::Node<'_>, kind: SyntaxKind) -> bool {

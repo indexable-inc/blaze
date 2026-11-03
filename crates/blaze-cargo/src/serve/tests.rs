@@ -35,7 +35,7 @@ use parking_lot::Mutex;
 
 use super::{
     Daemon, Options,
-    job::{DURABLE_WITHIN, RECHECK},
+    job::{DURABLE_WITHIN, ENDED_ROWS, RECHECK},
     plane::{Inline, Runner},
     work::{
         Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, KeptPut, Library, Output, Phase, Put,
@@ -67,6 +67,8 @@ thread_local! {
     static ASKED: Cell<usize> = const { Cell::new(0) };
     /// Whether a build script's run is [`Lost`].
     static LOSES_RUNS: Cell<bool> = const { Cell::new(false) };
+    /// Whether every fetch fails, as each does in a blaze built without `net`.
+    static FAILS_FETCHES: Cell<bool> = const { Cell::new(false) };
     /// How many times a writer applied what was asked of it.
     static APPLIES: Cell<usize> = const { Cell::new(0) };
     /// The build script's run whose write panics as it is applied, as a maintainer's would.
@@ -85,6 +87,11 @@ thread_local! {
     static SEEN: RefCell<Vec<(usize, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
     /// Each phase of a unit's compile as it ran, in order.
     static PHASES: RefCell<Vec<(usize, Phase)>> = const { RefCell::new(Vec::new()) };
+    /// Each reach's runs applied in the front ends it read: its view's from, then its to.
+    static REACHED: RefCell<Vec<(Vec<usize>, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
+    /// Each edit's and each build ahead's choice's runs applied in the front end it read.
+    static EDITED: RefCell<Vec<Vec<usize>>> = const { RefCell::new(Vec::new()) };
+    static AHEAD_READ: RefCell<Vec<Vec<usize>>> = const { RefCell::new(Vec::new()) };
     /// Whether the first unit's compile keeps its reader in [`HOLD`]: a reader still alive,
     /// as one of a task that is still running.
     static KEEP: Cell<bool> = const { Cell::new(false) };
@@ -181,7 +188,7 @@ fn warning_of_app(message: &str) -> Diagnostic {
         src_path: "/w/src/main.rs".into(),
         crate_types: vec![CrateType::Bin],
     };
-    let unit = UnitOf { id: 0, test: false, target, package_id: "app".into(), manifest_path: "/w/Cargo.toml".into() };
+    let unit = UnitOf { id: 0, test: false, doctest: false, target, package_id: "app".into(), manifest_path: "/w/Cargo.toml".into() };
     Diagnostic {
         level: Level::Warning,
         code: None,
@@ -247,6 +254,7 @@ impl Query for FakePlan {
             Some(scripts) => wave_units(&config.invocation.root, manifest, scripts),
             None if manifest.starts_with("two scripts") => two_script_units(&config.invocation.root, manifest),
             None if manifest.starts_with("links scripts") => links_script_units(&config.invocation.root, manifest),
+            None if manifest.starts_with("proc macro") => proc_macro_units(&config.invocation.root, manifest),
             None => units(&config.invocation.root, manifest),
         })))
     }
@@ -353,6 +361,25 @@ fn links_script_units(root: &str, manifest: String) -> Units {
     of_graph(root, manifest, graph)
 }
 
+/// `dep`'s proc macro (unit 1) on `dep`'s library (unit 0), the program's build script
+/// (compiled as 2, run as 3), and the program's library, checked (4), on the macro and the run.
+fn proc_macro_units(root: &str, manifest: String) -> Units {
+    let app = format!("path+file://{root}#app@0.1.0");
+    let dep = "registry+https://github.com/rust-lang/crates.io-index#dep@1.0.0".to_owned();
+    let graph = UnitGraph {
+        version: 1,
+        units: vec![
+            unit(&dep, "lib", Mode::Build, &[]),
+            unit(&dep, "proc-macro", Mode::Build, &[0]),
+            unit(&app, "custom-build", Mode::Build, &[]),
+            unit(&app, "custom-build", Mode::RunCustomBuild, &[2]),
+            unit(&app, "lib", Mode::Check, &[1, 3]),
+        ],
+        roots: vec![4],
+    };
+    of_graph(root, manifest, graph)
+}
+
 /// A wave of `scripts` build scripts' runs (units `1..=scripts`), each on `dep`'s library
 /// (unit 0), all ready at once, and the program on all of them.
 fn wave_units(root: &str, manifest: String, scripts: usize) -> Units {
@@ -432,6 +459,14 @@ impl Steps for Fake {
 
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
         *self.fetched.lock().entry(fetch.at.clone()).or_default() += 1;
+        if FAILS_FETCHES.get() {
+            // The text of blaze-registry's `NoNet`, which only a blaze without `net` has.
+            let why = format!(
+                "{}: this blaze is built without blaze-registry's `net` feature, so it has no HTTP client to ask it with",
+                fetch.url
+            );
+            return Err(ApiError::new(why, Some(fetch.what.clone())));
+        }
         let source = match fetch.kind {
             FetchKind::IndexFile => Source {
                 files: vec![SourceFile { path: "dep".into(), bytes: b"{}\n".to_vec(), mode: blaze_vfs::Mode::Regular }],
@@ -923,7 +958,6 @@ impl Front<Fake> for FakeFront {
     }
 
     fn compile(&self, reader: FakeReader, unit: usize, phase: Phase, _: &mut Vec<Image<Fake>>) -> Result<Option<Compiled>, Failed> {
-        assert_ne!(self.goal, Goal::Reach, "a reach compiles nothing");
         PHASES.with(|it| it.borrow_mut().push((unit, phase)));
         assert_ne!(PANICS_COMPILE.get(), Some(unit), "serve-test: the unit's compile panics");
         if ERRS_COMPILE.get() == Some(unit) {
@@ -1008,15 +1042,18 @@ impl Front<Fake> for FakeFront {
         Ok(FakeRuns::Over(Over(vec![Response::Ran { code: Some(0), stdout: b"hi\n".to_vec(), stderr: Vec::new() }])))
     }
 
-    fn reach(&self, FakeReader(_): FakeReader, _: &FakeFront, FakeReader(_): FakeReader, changes: &[Change]) -> Result<Reach, Failed> {
+    fn reach(&self, FakeReader(to): FakeReader, _: &FakeFront, FakeReader(from): FakeReader, changes: &[Change]) -> Result<Reach, Failed> {
+        REACHED.with_borrow_mut(|it| it.push((from.runs.clone(), to.runs.clone())));
         Ok(Reach { changes: changes.to_vec(), items: Vec::new(), compiled: Vec::new(), tests: Vec::new() })
     }
 
-    fn edit(&self, FakeReader(_): FakeReader, _: &[blaze_api::Edit]) -> Result<blaze_api::Edited, Failed> {
+    fn edit(&self, FakeReader(read): FakeReader, _: &[blaze_api::Edit]) -> Result<blaze_api::Edited, Failed> {
+        EDITED.with_borrow_mut(|it| it.push(read.runs.clone()));
         Ok(blaze_api::Edited { ops: Vec::new(), items: Vec::new() })
     }
 
-    fn ahead(&self, FakeReader(_): FakeReader, filter: &[String]) -> Result<Vec<u32>, Failed> {
+    fn ahead(&self, FakeReader(read): FakeReader, filter: &[String]) -> Result<Vec<u32>, Failed> {
+        AHEAD_READ.with_borrow_mut(|it| it.push(read.runs.clone()));
         Ok(if filter.iter().all(|it| "a::adds".contains(&**it)) { vec![0] } else { Vec::new() })
     }
 
@@ -1062,8 +1099,9 @@ fn options() -> Options {
         state: name(STATE),
         std: name(STD),
         builds: name("cache/blaze/build"),
+        sources: name("cache/blaze/sources"),
         writer: Hasher::new("blaze v2 test writer").part(STATE.as_bytes()).finish(),
-        socket: name(SOCKET),
+        socket: Some(name(SOCKET)),
         http: None,
         budget: None,
         threads: 2,
@@ -1301,6 +1339,45 @@ fn a_build_nothing_can_move_fails_with_the_stall_naming_each_wait() {
     assert!((2.0..10.0).contains(&quiet), "the stall is said within seconds of the build going still: {said}");
 }
 
+/// Lane seedmem's hang (2026-11-02): a blaze built without `net` fails every fetch (`NoNet`),
+/// and a fetch that settled after the first failure was never counted, so the job sat in its
+/// fetch stage with each fetch settled, no task running and nothing in flight: an idle engine,
+/// no error and no stall. Every fetch failing, the build ends with the fetch's error. Were a
+/// job left so again, the clock run past the stall bound makes the watchdog fail it, naming
+/// the job and the stage it waits in (what this test then shows, failing).
+#[test]
+fn a_build_whose_fetches_all_fail_ends_with_the_fetch_error_rather_than_hanging() {
+    FAILS_FETCHES.set(true);
+    let mut sim = Sim::new(4, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 4);
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    for _ in 0..3 {
+        turns(&mut daemon, &mut client, 5_000);
+        if client.done(id) {
+            break;
+        }
+        // The simulation's clock moves only to what is due: a job nothing moves sees no time
+        // pass until it is moved on.
+        daemon.driver().advance(blaze_profile::Watchdog::BOUND);
+    }
+    FAILS_FETCHES.set(false);
+    let got = client.of(id);
+
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let errors: Vec<&str> = got
+        .iter()
+        .filter_map(|it| match it {
+            Response::Error(error) => Some(error.what.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(errors.iter().any(|it| it.contains("has no HTTP client")), "the build fails with the fetch's error: {errors:?}");
+    assert!(!errors.iter().any(|it| it.starts_with("blaze stalled")), "the build ends, not stalls: {errors:?}");
+}
+
 /// The 2026-11-02 self-build stall: a build script's run that the plane starts while its
 /// program's placement is still in flight is held for it ([`Jobs::release_held`]); the job
 /// ends meanwhile (here the writer's apply failing as a whole, there a proc macro's write), and the held run
@@ -1383,7 +1460,7 @@ fn what_one_homes_daemon_shares_of_std_another_homes_finds() {
 
     let other = Options {
         state: name("cache/blaze/v2-other"),
-        socket: name("run/blaze/other.sock"),
+        socket: Some(name("run/blaze/other.sock")),
         writer: Hasher::new("blaze v2 test writer").part(b"cache/blaze/v2-other").finish(),
         ..options()
     };
@@ -1391,6 +1468,118 @@ fn what_one_homes_daemon_shares_of_std_another_homes_finds() {
         .unwrap_or_else(|why| panic!("{why}"));
     assert_eq!(second.std_store().get(&shared_key()).unwrap().map(|it| it.bytes.to_vec()), Some(SHARED.to_vec()));
     assert!(second.store().get(&shared_key()).unwrap().is_none(), "the home's own store has none of it");
+}
+
+/// A reach reads each view's front end as rustc compiles it, so before it is answered each
+/// view builds, through the units and the plane a check uses, its proc macros (unit 1, with
+/// the library it depends on, 0) and its build scripts' runs (3, with the script's compile,
+/// 2), applied to the front end the reach then reads; the library the change is of (4) is never
+/// compiled. Before, a reach built nothing, so on a fresh front end every crate with a proc
+/// macro was refused as pending (pmwait2's backstop) and a crate's build script never applied.
+/// Both views' builds are made in the reach's one plane request: one row of the history, kept
+/// records or not (before, each view's build was a request and a row of its own).
+#[test]
+fn a_reach_builds_its_views_proc_macros_and_build_scripts_before_it_reads_them() {
+    PHASES.with(|it| it.borrow_mut().clear());
+    REACHED.with(|it| it.borrow_mut().clear());
+    ENDED_ROWS.with(|it| it.borrow_mut().clear());
+    let mut sim = Sim::new(61, Faults::default());
+    checkout(&mut sim, "proc macro\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 61);
+    let mut client = dial(&mut daemon);
+    let head = || ViewRef::Head("/w".into());
+    let id = client.send(&mut daemon, Request::Reach { to: head(), from: head(), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    assert!(got.iter().any(|it| matches!(it, Response::Reached(_))), "{got:#?}");
+
+    let ran = PHASES.with(|it| it.take());
+    for unit in [0, 1, 2] {
+        let stores = ran.iter().filter(|it| **it == (unit, Phase::Store)).count();
+        assert_eq!(stores, 2, "unit {unit} is built once for each of the reach's two views: {ran:?}");
+    }
+    assert!(!ran.iter().any(|it| it.0 == 4), "the library a reach reads is never compiled: {ran:?}");
+    let reached = REACHED.with(|it| it.take());
+    assert_eq!(reached, vec![(vec![3], vec![3])], "both views read with the build script's run applied: {reached:?}");
+    let rows = ENDED_ROWS.with(|it| it.take());
+    assert_eq!(rows, ["reach"], "a reach is one plane request and one row of the history, both views' builds in it");
+
+    // Again, with every record kept: its builds make nothing again, and still cost no row.
+    let id = client.send(&mut daemon, Request::Reach { to: head(), from: head(), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    let rows = ENDED_ROWS.with(|it| it.take());
+    assert_eq!(rows, ["reach"], "a reach whose builds are all kept is still one row");
+}
+
+/// An edit reads its view's def maps as rustc would resolve them: before it is posted, the view
+/// builds its proc macros (unit 1, with its library 0) and its build script (compiled as 2, run
+/// as 3), applied to the front end the edit reads, in the edit's one plane request (one row);
+/// the library it edits (4) is never compiled. Before, an edit on a fresh front end read the
+/// crates with no derive expanded and no build script's cfg applied, and said nothing.
+#[test]
+fn an_edit_builds_its_views_proc_macros_and_build_scripts_before_it_reads_it() {
+    PHASES.with(|it| it.borrow_mut().clear());
+    EDITED.with(|it| it.borrow_mut().clear());
+    ENDED_ROWS.with(|it| it.borrow_mut().clear());
+    let mut sim = Sim::new(270, Faults::default());
+    checkout(&mut sim, "proc macro\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 270);
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Open { view: ViewRef::Head("/w".into()) });
+    let got = client.wait(&mut daemon, id);
+    let Some(root) = got.iter().find_map(|it| match it {
+        Response::Opened { root } => Some(*root),
+        _ => None,
+    }) else {
+        panic!("the open said no root: {got:#?}")
+    };
+    let id = client.send(&mut daemon, Request::Edit { base: root, head: "/w".into(), edits: Vec::new() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    assert!(got.iter().any(|it| matches!(it, Response::Edited(_))), "{got:#?}");
+
+    let ran = PHASES.with(|it| it.take());
+    for unit in [0, 1, 2] {
+        let stores = ran.iter().filter(|it| **it == (unit, Phase::Store)).count();
+        assert_eq!(stores, 1, "unit {unit} is built once, for the edit's view: {ran:?}");
+    }
+    assert!(!ran.iter().any(|it| it.0 == 4), "the library an edit reads is never compiled: {ran:?}");
+    let edited = EDITED.with(|it| it.take());
+    assert_eq!(edited, vec![vec![3]], "the edit read its view with the build script's run applied: {edited:?}");
+    let rows = ENDED_ROWS.with(|it| it.take());
+    assert_eq!(rows, ["edit"], "an edit is one plane request and one row of the history, its view's build in it");
+}
+
+/// A build ahead chooses its tests from its view's def maps: before it chooses, the view builds
+/// its proc macros (unit 1, with 0) and its build script (2, run as 3), applied to the front
+/// end it reads, then builds what it chose, all in one plane request (one row).
+#[test]
+fn a_build_ahead_builds_its_views_proc_macros_and_build_scripts_before_it_chooses() {
+    PHASES.with(|it| it.borrow_mut().clear());
+    AHEAD_READ.with(|it| it.borrow_mut().clear());
+    ENDED_ROWS.with(|it| it.borrow_mut().clear());
+    let mut sim = Sim::new(271, Faults::default());
+    checkout(&mut sim, "proc macro\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 271);
+    let mut client = dial(&mut daemon);
+    let intent = Request::WillTest { view: ViewRef::Head("/w".into()), filter: vec!["adds".into()], targets: agent(), wait_ms: 600_000 };
+    let id = client.send(&mut daemon, intent);
+    let got = client.wait(&mut daemon, id);
+    assert!(got.iter().any(|it| matches!(it, Response::Announced { .. })), "{got:#?}");
+    turn_until(&mut daemon, |_| ENDED_ROWS.with_borrow(|it| !it.is_empty()));
+
+    let read = AHEAD_READ.with(|it| it.take());
+    assert_eq!(read, vec![vec![3]], "the build ahead chose with the build script's run applied: {read:?}");
+    let ran = PHASES.with(|it| it.take());
+    let first = ran.iter().position(|it| *it == (1, Phase::Store));
+    assert!(first.is_some(), "the view's proc macro was built: {ran:?}");
+    assert!(!ran.iter().any(|it| it.0 == 4), "the library no chosen test needs is never compiled: {ran:?}");
+    let rows = ENDED_ROWS.with(|it| it.take());
+    assert_eq!(rows, ["ahead"], "a build ahead is one plane request and one row of the history");
 }
 
 /// Each unit's compile is a node a phase: its names first, its check and its codegen once those
@@ -1595,6 +1784,46 @@ fn a_daemon_stopped_as_its_first_build_answers_writes_the_image_the_next_start_r
         "the next start opens the stop's image: {started}"
     );
     assert!(!matches!(started.cold, Some(super::daemon::Cold::NoImage)), "{started}");
+}
+
+/// A stop while the cold build's settle image is still being made, with nothing asked since,
+/// waits for that image and makes none of its own: one image, which the next start opens. A
+/// request between the settle and the stop changes the daemon, so the stop makes a second,
+/// fresher one (durability: never a stop that keeps an image older than what it answered).
+#[test]
+fn a_stop_during_an_unchanged_settle_writes_one_image_and_a_change_between_writes_a_second() {
+    for changed in [false, true] {
+        let seed = if changed { 72 } else { 71 };
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut client = dial(&mut daemon);
+        let check = || Request::Check { view: ViewRef::Head("/w".into()), targets: agent() };
+        let id = client.send(&mut daemon, check());
+        assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
+        turn_until(&mut daemon, |it| it.images_made() == 1);
+        if changed {
+            let id = client.send(&mut daemon, check());
+            assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
+        } else {
+            assert!(!daemon.settled(), "the stop comes while the settle image is still being made");
+        }
+        daemon.stop();
+        let mut turns = 0;
+        while daemon.turn() {
+            turns += 1;
+            assert!(turns < TURNS, "the daemon never stopped");
+        }
+        let made = daemon.images_made();
+        assert_eq!(made, if changed { 2 } else { 1 }, "changed between the settle and the stop: {changed}");
+        let daemon = start(daemon.into_driver(), &steps, seed + 10);
+        let started = daemon.started();
+        assert!(
+            started.restored.is_some() || matches!(started.cold, Some(super::daemon::Cold::Interned)),
+            "the next start opens the stop's image: {started}"
+        );
+    }
 }
 
 /// What a build leaves for the store as its front end is kept ([`Steps::store_kept`]) is
@@ -3125,6 +3354,7 @@ fn a_daemon_started_while_the_one_before_it_ends_waits_for_it_and_then_holds_the
 }
 
 #[test]
+#[cfg(feature = "daemon")]
 fn serve_takes_activated_alone_and_names_it_among_its_flags() {
     let parse = |args: &[&str]| super::parse(args.iter().map(std::ffi::OsString::from));
     let args = parse(&["--activated", "--socket", "/run/b.sock"]).unwrap();
@@ -3132,7 +3362,7 @@ fn serve_takes_activated_alone_and_names_it_among_its_flags() {
     assert_eq!(args.socket.as_deref(), Some(std::path::Path::new("/run/b.sock")));
     assert!(!parse(&[]).unwrap().activated);
     let refused = parse(&["--activated=yes"]).err().unwrap().to_string();
-    assert!(refused.contains("`--activated` and `--ready-fd N`, not `--activated=yes`"), "{refused}");
+    assert!(refused.contains("`--activated`, `--ready-fd N` and `--stall-bound SECS`, not `--activated=yes`"), "{refused}");
 }
 
 #[test]

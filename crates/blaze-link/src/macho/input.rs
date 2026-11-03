@@ -63,7 +63,7 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
         Arch::Aarch64 => macho::CPU_TYPE_ARM64,
         Arch::X86_64 => macho::CPU_TYPE_X86_64,
         // alloc: error path
-        Arch::Wasm32 => return Err(format!("{name}: a Mach-O object in a wasm32 link")),
+        Arch::Wasm32 | Arch::Wasm64 => return Err(format!("{name}: a Mach-O object in a {arch:?} link")),
     };
     let found = header.cputype(LE);
     if found != cpu {
@@ -433,7 +433,7 @@ pub(crate) fn asked_libraries(name: &str, bytes: &[u8], arch: Arch) -> Result<Ve
         Arch::Aarch64 => macho::CPU_TYPE_ARM64,
         Arch::X86_64 => macho::CPU_TYPE_X86_64,
         // alloc: error path
-        Arch::Wasm32 => return Err(format!("{name}: Mach-O linker options in a wasm32 link")),
+        Arch::Wasm32 | Arch::Wasm64 => return Err(format!("{name}: Mach-O linker options in a {arch:?} link")),
     };
     let bytes = slice(name, bytes, cpu)?;
     // alloc: once per file searched for its linker options (setup, kept per process)
@@ -751,9 +751,9 @@ impl Reader<'_> {
                     i += self.x86_64(s, &relocations[i..])?;
                 }
             }
-            Arch::Wasm32 if relocations.is_empty() => {}
+            Arch::Wasm32 | Arch::Wasm64 if relocations.is_empty() => {}
             // alloc: error path
-            Arch::Wasm32 => return Err(format!("{}: a Mach-O object in a wasm32 link", self.name)),
+            arch @ (Arch::Wasm32 | Arch::Wasm64) => return Err(format!("{}: a Mach-O object in a {arch:?} link", self.name)),
         }
         Ok(())
     }

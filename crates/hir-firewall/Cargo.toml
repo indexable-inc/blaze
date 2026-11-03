@@ -24,7 +24,7 @@ hir.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
-hir-ty-codegen.workspace = true
+hir-ty-codegen = { workspace = true, features = ["llvm-stencils"] }
 hir-ty-share.workspace = true
 syntax.workspace = true
 

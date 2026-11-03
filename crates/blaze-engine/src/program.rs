@@ -34,9 +34,21 @@ pub fn main() -> ExitCode {
     if as_rustc::rustdoc::is_me() {
         as_rustc::rustdoc::command();
     }
-    let words = blaze_cargo::cli::words(std::env::args_os());
-    if let Some(ended) = pinned_elsewhere(&words) {
-        return ended;
+    // `--ignore-pin` is the launcher's alone: blaze's cargo never sees it.
+    let (args, ignore_pin) = pin::take_ignore_pin(std::env::args_os());
+    let words = blaze_cargo::cli::words(args.iter().cloned());
+    let asks_version = matches!(words.as_slice(), [it] if it == "--version" || it == "-V");
+    match pinned_elsewhere(&words, ignore_pin) {
+        Ok(Some(ended)) => return ended,
+        Ok(None) => {}
+        // `--version` answers in any workspace: which blaze this is, and why the one pinned
+        // can't run here.
+        Err(why) if asks_version => {
+            println!("{}", blaze_cargo::version());
+            println!("this blaze does not run here: {why}");
+            return ExitCode::SUCCESS;
+        }
+        Err(why) => return failed(&why),
     }
     let first = words.first().and_then(|it| it.to_str());
     let rest = || words.iter().skip(1).map(|it| it.to_string_lossy().into_owned());
@@ -46,10 +58,11 @@ pub fn main() -> ExitCode {
         Some("version-resolve") => versions::resolve_command(rest()).map(|()| 0),
         Some("--version" | "-V") if words.len() == 1 => {
             println!("{}", blaze_cargo::version());
-            println!("{}", versions::why_this_one());
+            println!("{}", versions::why_this_one(ignore_pin));
             Ok(0)
         }
         _ => {
+            #[cfg(feature = "mimalloc")]
             if let Err(error) = crate::huge::huge_pages_for_mimalloc() {
                 return failed(&format!("{error:#}"));
             }
@@ -61,7 +74,7 @@ pub fn main() -> ExitCode {
                 Ok(guard) => guard,
                 Err(error) => return failed(&error.to_string()),
             };
-            return blaze_cargo::cli::main(std::env::args_os());
+            return blaze_cargo::cli::main(args.into_iter());
         }
     };
     match done {
@@ -71,67 +84,95 @@ pub fn main() -> ExitCode {
 }
 
 /// Runs the release of blaze the workspace pins with `words`, when it pins one and that is not
-/// this one, fetching it first when it is not there. `None` when this one is to run. `blaze
-/// pin` always runs this one: it pins this one.
-fn pinned_elsewhere(words: &[OsString]) -> Option<ExitCode> {
+/// this one, fetching it first when it is not there: `Some` of how it ended. `None` when this
+/// one is to run: the pin names it, [`pin::IGNORE_PIN`] (`given` here, or to a blaze above this
+/// one for this workspace: [`pin::ignores`]), or it is a build of the source tree in blaze's
+/// tree; such a build anywhere else hands off as a release does, saying so on stderr
+/// ([`pin::choose`]). `Err` is why the pinned one can't run, and no other runs in its place.
+/// `blaze pin` always runs this one: it pins this one.
+fn pinned_elsewhere(words: &[OsString], given: bool) -> Result<Option<ExitCode>, String> {
     let text: Vec<String> = words.iter().map(|it| it.to_string_lossy().into_owned()).collect();
     if matches!(text.first().map(String::as_str), Some("pin" | "version-fetch" | "version-resolve" | "serve")) {
-        return None;
+        return Ok(None);
     }
-    let cwd = match std::env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(error) => return Some(failed(&pin::PinError::NoWorkingDirectory(error).to_string())),
+    let cwd = std::env::current_dir()
+        .map_err(|error| pin::PinError::NoWorkingDirectory(error).to_string())?;
+    let Some(manifest) =
+        pin::root_manifest(&pin::start(&text, &cwd)).map_err(|why| why.to_string())?
+    else {
+        return Ok(None);
     };
-    let manifest = match pin::root_manifest(&pin::start(&text, &cwd)) {
-        Ok(Some(manifest)) => manifest,
-        Ok(None) => return None,
-        Err(why) => return Some(failed(&why.to_string())),
-    };
-    let wanted = match pin::pinned(&manifest) {
-        Ok(Some(wanted)) => wanted,
-        Ok(None) => return None,
-        Err(why) => return Some(failed(&why.to_string())),
+    let Some(named) = pin::pinned(&manifest).map_err(|why| why.to_string())? else {
+        return Ok(None);
     };
     let shown = manifest.display();
-    let wanted = if pin::is_channel(&wanted) {
-        match channel_version(&wanted) {
-            Ok(version) => version,
-            Err(why) => {
-                return Some(failed(&format!(
-                    "{shown} pins blaze's {wanted} channel, and {why}; no other blaze builds in its place"
-                )));
+    let ignore = pin::ignores(given, &manifest);
+    let for_tree =
+        match pin::choose(pin::OURS, &manifest, &named, ignore).map_err(|why| why.to_string())? {
+            // `--ignore-pin` given here, for a workspace no blaze above this one was told it
+            // for: this blaze runs again with `BLAZE_IGNORE_PIN_FOR` naming the manifest, so a
+            // blaze a test or build script runs in this workspace (`$CARGO`) runs itself too,
+            // and one run in another workspace is held to that one's pin. Run again, not set
+            // here: setting a variable in this process is unsafe, and the word is rare.
+            pin::Choice::Ignored
+                if given && !pin::names(std::env::var_os(pin::IGNORE_PIN_FOR).as_deref(), &manifest) =>
+            {
+                let this = std::env::current_exe().map_err(|error| {
+                    format!("`{}` runs this blaze again for {shown}, and where it is can't be told: {error}", pin::IGNORE_PIN)
+                })?;
+                let mut command = std::process::Command::new(&this);
+                command.args(words).env(pin::IGNORE_PIN_FOR, &manifest);
+                return Ok(Some(ended(&mut command, &this)));
             }
-        }
+            pin::Choice::Pinned | pin::Choice::Ignored | pin::Choice::OwnTree => return Ok(None),
+            pin::Choice::Release => false,
+            pin::Choice::ReleaseForTree => true,
+        };
+    let ignoring = format!("`blaze {} <command>` runs this one", pin::IGNORE_PIN);
+    let wanted = if pin::is_channel(&named) {
+        channel_version(&named).map_err(|why| {
+            format!("{shown} pins blaze's {named} channel, and {why}; no other blaze builds in its place ({ignoring})")
+        })?
     } else {
-        wanted
+        named.clone()
     };
     if wanted == pin::OURS {
-        return None;
+        return Ok(None);
     }
-    if std::env::var_os(pin::PINNED_BY).is_some() {
+    // Run by a launcher for this same manifest, and not what it pins: a non-release where the
+    // release should be. `BLAZE_PINNED_BY` naming another workspace is inherited (a test of a
+    // pinned release building a temporary workspace) and says nothing here.
+    if pin::names(std::env::var_os(pin::PINNED_BY).as_deref(), &manifest) {
         let this = std::env::current_exe().unwrap_or_default();
-        return Some(failed(&format!(
-            "{shown} pins blaze {wanted}, and {}, run for it, is blaze {}: removing {} has it fetched again",
+        return Err(format!(
+            "{shown} pins blaze {wanted}, and {}, which a blaze ran for it (`{}` names {shown}), is blaze {}: removing {} has it fetched again",
             this.display(),
+            pin::PINNED_BY,
             pin::OURS,
             this.parent().unwrap_or(Path::new("")).display()
-        )));
+        ));
     }
-    let pinned = match versions::fetch(&wanted) {
-        Ok(pinned) => pinned,
-        Err(why) => {
-            return Some(failed(&format!(
-                "{shown} pins blaze {wanted}, which could not be fetched ({why:#}); no other blaze builds in its place"
-            )));
-        }
-    };
+    // A build of the tree runs the pinned release as a release does, and says so: what runs is
+    // not the blaze that was built.
+    if for_tree {
+        eprintln!(
+            "blaze: blaze {}, a build of blaze's source tree, runs blaze {wanted} here, as {shown} pins {}; {ignoring}",
+            pin::OURS,
+            pin::pinned_text(&named)
+        );
+    }
+    let pinned = versions::fetch(&wanted).map_err(|why| {
+        format!(
+            "{shown} pins blaze {wanted}, which could not be fetched ({why:#}); no other blaze builds in its place ({ignoring})"
+        )
+    })?;
     // A release from before pins says only its version.
     if matches!(text.as_slice(), [it] if it == "--version" || it == "-V") {
         println!("blaze {} runs blaze {wanted} here, as {shown} pins it:", pin::OURS);
     }
     let mut command = std::process::Command::new(&pinned);
     command.args(words).env(pin::PINNED_BY, &manifest);
-    Some(ended(&mut command, &pinned))
+    Ok(Some(ended(&mut command, &pinned)))
 }
 
 /// Why the release a channel names can't be told.
@@ -199,7 +240,10 @@ mod tests {
     #[test]
     fn the_pins_own_commands_run_this_blaze() {
         for first in ["pin", "version-fetch", "version-resolve", "serve"] {
-            assert!(pinned_elsewhere(&[OsString::from(first)]).is_none(), "{first}");
+            assert!(
+                matches!(pinned_elsewhere(&[OsString::from(first)], false), Ok(None)),
+                "{first}"
+            );
         }
     }
 }

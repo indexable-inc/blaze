@@ -26,9 +26,9 @@ use blaze_mem::align::align_up_u64;
 use crate::arena::{FrameVec, collect_in};
 use crate::cow::{CowBytes, IdSet};
 use crate::layout;
-use crate::model::{Apply, Class, Counts, Prot, Region, Reserve, Sym, Writer, reserved};
+use crate::model::{Apply, Class, Counts, Prot, Region, Reserve, Sym, Writer, reserved, zeroed};
 use crate::stage::{Stage, error, function_of, refused};
-use crate::state::{ClassId, PieceId, PieceRef, Sort, Space, State, What, zeroed};
+use crate::state::{ClassId, PieceId, PieceRef, Sort, Space, State, What};
 use crate::symbols::{SymKey, Symbols};
 use crate::{DevRun, Format, LinkError, Refusal};
 
@@ -794,7 +794,11 @@ impl<'a> Stage<'a> {
 
     /// Lays out an ordered region again in place, its pieces `ids`: pieces that move are
     /// written again (from their old bytes, which relocation reads for a moved piece), and
-    /// what refers to them.
+    /// what refers to them: their symbols' referrers ([`Stage::referrers`]), and a moved GOT
+    /// cell's readers ([`Stage::cell_readers`]), which refer to its target, not to it. A PE
+    /// image's GOT is its import address table, laid out again when an import or a DLL comes
+    /// or goes: every cell after it moves, and code still reading a cell's old place would
+    /// call another import, or null.
     fn relay(&mut self, space: usize, ids: &[PieceId]) -> Result<(), LinkError> {
         let arena = self.arena;
         let ids = collect_in(self.sort_pieces(&self.new.spaces[space].region.class, ids), arena);
@@ -821,16 +825,26 @@ impl<'a> Stage<'a> {
                 format!("{class:?} needs {size} bytes and has room for {capacity}: link the image from scratch"),
             ));
         }
+        let mut readers: FrameVec<'a, PieceId> = Vec::new_in(arena);
         for (id, addr) in moved {
             let piece = self.new.piece(id).expect("live");
             self.changed.insert(piece.sym);
             for sym in piece.defines() {
                 self.changed.insert(*sym);
             }
+            // A fresh cell's readers are what made it: written already.
+            if let What::Got { kind, target } = piece.what()
+                && !self.fresh.contains(id)
+            {
+                self.cell_readers(kind, target, &mut readers);
+            }
             self.write.insert(id);
             let hot = self.new.hot_mut(id);
             hot.addr = addr;
             hot.set_zero(zero);
+        }
+        for id in readers {
+            self.write.insert(id);
         }
         let old = self.new.spaces[space].region.size;
         if size != old {

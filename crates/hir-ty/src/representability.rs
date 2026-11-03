@@ -95,6 +95,8 @@ fn representability_adt_ty<'db>(
 /// first 64 parameters in its one inline word, which allocates nothing for nearly every ADT.
 type ParamsInRepr = Bits<SmallVec<[u64; 1]>>;
 
+// The inline `u64` aligns it to 8 on every target, so the size is per target: checked on 64-bit.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<ParamsInRepr>() == 24);
 
 /// A [`ParamsInRepr`] while its ADT's fields are walked, its words in a frame.

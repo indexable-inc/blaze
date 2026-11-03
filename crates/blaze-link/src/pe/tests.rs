@@ -127,7 +127,7 @@ impl Fixture {
             let size = data.len();
             contents.push(match data.bytes(&[]).unwrap() {
                 Some(bytes) => bytes.to_vec(),
-                None if super::zeroed(&class) => Vec::new(),
+                None if crate::model::zeroed(&class) => Vec::new(),
                 None => vec![0; size as usize],
             });
             regions.push(Region { class, addr, capacity: size, size, prot, align: 16 });
@@ -1396,7 +1396,7 @@ fn what_blaze_does_not_link_is_named() {
 }
 
 /// A short import member (`IMPORT_OBJECT_HEADER`).
-fn short_import(symbol: &str, dll: &str, hint: u16, typ: u16, name: u16) -> Vec<u8> {
+pub(crate) fn short_import(symbol: &str, dll: &str, hint: u16, typ: u16, name: u16) -> Vec<u8> {
     let mut out = Buf::default();
     out.put_u16(0);
     out.put_u16(0xffff);
@@ -1419,7 +1419,7 @@ fn member_header(name: &str, size: usize) -> Vec<u8> {
 
 /// A COFF archive: the first and second linker members, then the members, each indexed by
 /// the symbols given.
-fn archive(members: &[(&str, Vec<u8>, &[&str])]) -> Vec<u8> {
+pub(crate) fn archive(members: &[(&str, Vec<u8>, &[&str])]) -> Vec<u8> {
     let mut symbols: Vec<(&str, u16)> = Vec::new();
     for (index, (_, _, names)) in members.iter().enumerate() {
         symbols.extend(names.iter().map(|it| (*it, index as u16 + 1)));

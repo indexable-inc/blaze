@@ -142,10 +142,11 @@ impl<'a, 'b, 'db> Builtin<'a, 'b, 'db> {
 
     /// rustc's `adt_destructor`: the `Drop` impl of `adt`, if it has one.
     fn destructor(&mut self, adt: hir::Adt) -> Option<hir::Impl> {
-        let db = self.cx.db;
+        let (db, krate) = (self.cx.db, self.cx.krate);
         let drop_trait = self.lang.Drop.map(hir::Trait::from);
+        // The `Drop` impls the crate sees: rustc's `adt_destructor` asks only of types it names.
         let all = self.destructors.get_or_insert_with(|| match drop_trait {
-            Some(trait_) => hir::Impl::all_for_trait(db, trait_)
+            Some(trait_) => hir::Impl::all_for_trait(db, krate, trait_)
                 .into_iter()
                 .filter(|it| !it.is_negative(db))
                 .filter_map(|it| Some((it.self_ty(db).as_adt()?, it)))

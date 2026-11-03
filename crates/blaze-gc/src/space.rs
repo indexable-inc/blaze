@@ -93,6 +93,16 @@ fn pool_of(_path: &Path) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// WASI (the wasm32-wasip1 seed) has no call that reports a volume's size or free space, so
+/// measuring one is an error naming the path, never a size made up.
+#[cfg(target_os = "wasi")]
+fn measure(path: &Path) -> Result<Volume, String> {
+    Err(format!(
+        "{}: statvfs is refused on WASI (the wasm32-wasip1 seed): WASI reports no volume's size or free space",
+        path.display()
+    ))
+}
+
 /// Whether `error` (an [`std::io::Error`]'s text, as an error that crossed the daemon's API
 /// carries it) says a disk or a quota is full: `ENOSPC` and `EDQUOT` on unix,
 /// `ERROR_DISK_FULL` and `ERROR_HANDLE_DISK_FULL` on Windows.

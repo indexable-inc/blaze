@@ -37,7 +37,13 @@ use blaze_mem::{Region, Tag};
 use crate::sync::atomic::{AtomicPtr, AtomicU64};
 
 /// Address space for every interned value and probe table of the process.
+#[cfg(target_pointer_width = "64")]
 const RESERVED: usize = 64 << 30;
+
+/// The same on a 32-bit target (wasm32), where a reservation is memory taken whole and the
+/// whole address space is 4 GB: a budget of 512 MiB (`64 << 30` would wrap to 0 there).
+#[cfg(not(target_pointer_width = "64"))]
+const RESERVED: usize = 512 << 20;
 
 /// Every claim starts and ends on a cache line, so two claims never share one.
 pub(crate) const LINE: usize = 64;
@@ -195,11 +201,20 @@ pub(crate) struct Slots<T> {
 #[cfg(not(blaze_check))]
 const SLOT: usize = size_of::<AtomicPtr<()>>();
 
+/// The slots a column reserves: one for every `u32` index.
+#[cfg(all(not(blaze_check), target_pointer_width = "64"))]
+const SLOTS: usize = u32::MAX as usize;
+
+/// On a 32-bit target, where every `u32` index would be 16 GiB taken whole: 2^22 (16 MiB) a
+/// column, a budget; an index past it stops [`Slots::ensure`] with the region's error.
+#[cfg(all(not(blaze_check), not(target_pointer_width = "64")))]
+const SLOTS: usize = 1 << 22;
+
 #[cfg(not(blaze_check))]
 impl<T> Slots<T> {
     pub(crate) fn new() -> Slots<T> {
         Slots {
-            slots: Region::reserve_huge(u32::MAX as usize * SLOT, Tag::Intern)
+            slots: Region::reserve_huge(SLOTS * SLOT, Tag::Intern)
                 .unwrap_or_else(|error| panic!("intern: {error}")),
             _of: PhantomData,
         }

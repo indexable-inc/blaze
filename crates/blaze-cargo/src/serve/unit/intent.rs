@@ -12,12 +12,21 @@ use std::alloc::Global;
 use blaze_intent::ahead;
 use blaze_vfs::Bytes;
 
-use super::{Job, UnitReader, files::Mounted, graph::flag};
+use super::{Job, UnitReader, answer_macros_built, files::Mounted, graph::flag};
 use crate::serve::work::Failed;
 
 /// `edits` made in the job's view ([`blaze_intent::apply`]): what they change, for the session
 /// to commit. Bytes of the view that fail their check end it with an error naming the file.
 pub(crate) fn edit(job: &Job, reader: &UnitReader, edits: &[Edit]) -> Result<Edited, Failed> {
+    // An edit resolves names in any crate of the view: every one's proc macros were built and
+    // applied before it was posted (`Jobs::next`); checked again here.
+    for at in 0..job.graph.len() {
+        let Some(krate) = job.crates.krate(at) else { continue };
+        if job.cancelled() {
+            return Err(Failed::Again);
+        }
+        answer_macros_built(reader.db(), krate, &job.unit(at)?.target.name, "edit")?;
+    }
     let files = ViewFiles::new(&job.mounted, reader.paths());
     let applied = blaze_intent::apply(reader.db(), &files, edits);
     if let Some((path, why)) = files.corrupt.into_inner() {
@@ -42,6 +51,11 @@ pub(crate) fn ahead(job: &Job, reader: &UnitReader, filter: &[String]) -> Result
             return Err(Failed::Again);
         }
         let unit = job.unit(at)?;
+        // Its tests are listed from its def map: its proc macros were built and applied before
+        // this was posted (`Jobs::next`); checked again here.
+        if let Some(krate) = job.crates.krate(at) {
+            answer_macros_built(reader.db(), krate, &unit.target.name, "ahead")?;
+        }
         let roots = super::codegen::test_roots(job, reader, at)
             .map_err(|what| ApiError::new(what, Some(unit.target.name.clone())))?;
         let unit = u32::try_from(at).expect("under 2^32 units");

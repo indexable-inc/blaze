@@ -53,39 +53,86 @@ pub const CLOSURE_CODE_DOMAIN: &str = "blaze v2 closure code hash 1";
 pub const COROUTINE_CODE_DOMAIN: &str = "blaze v2 coroutine code hash 1";
 
 /// Why an item has no hash: a part of it is not of a program rustc accepts (an error type,
-/// MIR that failed to lower, a macro without rules). A build stops at it, naming the item.
+/// MIR that failed to lower, a macro without rules), or it was read before the proc macros its
+/// crate can expand were built. A build stops at it, naming the item.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Unhashable {
-    pub item: ItemId,
+    pub of: Unhashed,
     pub what: &'static str,
+    /// For a read before proc macros were built ([`form::Missed::MacroPending`]): the
+    /// proc-macro crate found unbuilt when it was refused, kept so that the error names it
+    /// whenever it is said, after that build too.
+    pub pending: Option<base_db::Crate>,
+}
+
+/// What has no hash.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Unhashed {
+    /// An item.
+    Item(ItemId),
+    /// What a crate reads of the crates it loads: the impls and traits its `Implements`,
+    /// `Method` and `Vtable` facts cover, or its code, at the start of a job of it.
+    Crate(base_db::Crate),
 }
 
 impl Unhashable {
-    /// The error a build stops with: the item by kind and path, what could not be hashed, and
-    /// for MIR that failed to lower, the error lowering it gave.
+    /// `item` has no hash, for `what`.
+    pub(crate) fn of(item: ItemId, what: &'static str) -> Unhashable {
+        Unhashable { of: Unhashed::Item(item), what, pending: None }
+    }
+
+    /// The error a build stops with: the item by kind and path (or the crate), what could not
+    /// be hashed, and for MIR that failed to lower, the error lowering it gave.
     pub fn describe(&self, db: &Db) -> String {
         // alloc: the message a build stops with, written once at the edge.
-        let mut said = format!(
-            "blaze-items: {:?} `{}` has no hash: {}",
-            self.item.kind(),
-            key::path(db, self.item),
-            self.what
-        );
-        if self.what == form::Missed::NoMir.what()
-            && let Some(error) = form::Cx::new(db).mir_error(self.item)
-        {
-            _ = write!(said, " ({error})");
+        let mut said = match self.of {
+            Unhashed::Item(item) => format!(
+                "blaze-items: {:?} `{}` has no hash: {}",
+                item.kind(),
+                key::path(db, item),
+                self.what
+            ),
+            Unhashed::Crate(krate) => format!(
+                "blaze-items: what crate `{}` reads of the crates it loads has no hash: {}",
+                crate_name(db, krate),
+                self.what
+            ),
+        };
+        if let Unhashed::Item(item) = self.of {
+            if self.what == form::Missed::NoMir.what()
+                && let Some(error) = form::Cx::new(db).mir_error(item)
+            {
+                _ = write!(said, " ({error})");
+            }
+            if self.what == form::Missed::ErrorType.what()
+                && let Some(site) = form::Cx::new(db).error_type_site(item)
+            {
+                _ = write!(said, " ({site})");
+            }
+        }
+        if let Some(pending) = self.pending {
+            let reader = match self.of {
+                Unhashed::Item(item) => item.krate(db),
+                Unhashed::Crate(krate) => krate,
+            };
+            _ = write!(
+                said,
+                " (`{}` was read before the proc macros of `{}` were built, whose calls expand to \
+                 nothing until they are; a read of it must wait on that build)",
+                crate_name(db, reader),
+                crate_name(db, pending)
+            );
         }
         said
     }
 
     /// Whether the miss is MIR that failed to lower.
     pub fn missed_mir(&self) -> bool {
-        self.what == form::Missed::NoMir.what()
+        matches!(self.of, Unhashed::Item(_)) && self.what == form::Missed::NoMir.what()
     }
 
-    /// For an item missed at MIR that failed to lower, the error lowering gave, as data, and the
-    /// body it was in: `None` for the item's own body, else the first closure or coroutine in it
+    /// For an item missed at MIR that failed to lower, the item, the error lowering gave, as
+    /// data, and the body it was in: `None` for the item's own body, else the first closure or coroutine in it
     /// that failed. `None` for any other miss. What reads an item's hash can so give a typed
     /// reason where lowering had one (a call of an intrinsic missing from the table is the
     /// caller's `UnknownIntrinsic`) and name the body that failed, not its owner. A closure's or
@@ -95,17 +142,50 @@ impl Unhashable {
     pub fn mir_lowering_error<'db>(
         &self,
         db: &'db Db,
-    ) -> Option<(Option<form::Nested<'db>>, hir_ty::mir::MirLowerError<'db>)> {
+    ) -> Option<(ItemId, Option<form::Nested<'db>>, hir_ty::mir::MirLowerError<'db>)> {
+        let Unhashed::Item(item) = self.of else { return None };
         if !self.missed_mir() {
             return None;
         }
-        form::Cx::new(db).mir_lowering_error(self.item)
+        let (within, error) = form::Cx::new(db).mir_lowering_error(item)?;
+        Some((item, within, error))
     }
+}
+
+/// A crate as an error names it: its display name.
+pub(crate) fn crate_name(db: &Db, krate: base_db::Crate) -> &str {
+    krate.extra_data(db).display_name.as_ref().map_or("<unnamed>", |it| it.canonical_name().as_str())
+}
+
+/// `Ok` once every proc macro `krate`'s items can expand is built
+/// ([`form::pending_proc_macro`]); otherwise [`form::Missed::MacroPending`] for `of`, naming
+/// the first such proc-macro crate. The one check every read of a crate's half-expanded items
+/// goes through: a form's hash, a fact's value, and a job of the crate as it starts
+/// ([`macros_built`]).
+pub(crate) fn macros_built_for(db: &Db, krate: base_db::Crate, of: Unhashed) -> Result<(), Unhashable> {
+    match form::pending_proc_macro(db, krate) {
+        None => Ok(()),
+        Some(pending) => {
+            Err(Unhashable { of, what: form::Missed::MacroPending.what(), pending: Some(pending) })
+        }
+    }
+}
+
+/// `Ok` once every proc macro `krate` can expand (its own dependencies' and those of every crate
+/// it sees) is built. A job of `krate` (its check, its bodies' inference, its codegen) asks it
+/// as it starts: a build builds those first, so an error here is a job ordered ahead of a proc
+/// macro's build, never a state to go on from (rule 3: nothing of `krate` is inferred,
+/// checked or kept on a half-expanded program).
+pub fn macros_built(db: &Db, krate: base_db::Crate) -> Result<(), Unhashable> {
+    macros_built_for(db, krate, Unhashed::Crate(krate))
 }
 
 impl fmt::Display for Unhashable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?} {:?} has no hash: {}", self.item.kind(), self.item, self.what)
+        match self.of {
+            Unhashed::Item(item) => write!(f, "{:?} {:?} has no hash: {}", item.kind(), item, self.what),
+            Unhashed::Crate(krate) => write!(f, "what crate {krate:?} reads has no hash: {}", self.what),
+        }
     }
 }
 
@@ -178,14 +258,14 @@ impl Graph {
     /// What `id` is apart from its refs.
     fn own(self, db: &Db, id: ItemId) -> Result<ContentId, Unhashable> {
         let interface = self.form(db, id);
-        missed(interface, id)?;
+        missed(db, interface, id)?;
         match self {
             Graph::Interface | Graph::Signature => Ok(interface.digest),
             Graph::Layout => {
                 let target = match &id.krate(db).workspace_data(db).target {
                     Ok(target) => target,
                     Err(_) => {
-                        return Err(Unhashable { item: id, what: "its crate has no target" });
+                        return Err(Unhashable::of(id, "its crate has no target"));
                     }
                 };
                 let mut h = Hasher::new(LAYOUT_DOMAIN);
@@ -207,7 +287,7 @@ impl Graph {
                 h.update(b"own").id(&interface.digest);
                 match body_form(db, id) {
                     Some(body) => {
-                        missed(body, id)?;
+                        missed(db, body, id)?;
                         h.update(&[1]).id(&body.digest)
                     }
                     None => h.update(&[0]),
@@ -238,9 +318,17 @@ fn arch_name(arch: base_db::target::Arch) -> &'static str {
     }
 }
 
-fn missed(sub: &form::Sub, item: ItemId) -> Result<(), Unhashable> {
+/// Why `item`'s form `sub` has no hash, if it has none. A form of an item whose crate's proc
+/// macros are pending names the proc-macro crate as it is refused (`Unhashable::pending`).
+fn missed(db: &Db, sub: &form::Sub, item: ItemId) -> Result<(), Unhashable> {
     match sub.missed {
-        Some(why) => Err(Unhashable { item, what: why.what() }),
+        Some(form::Missed::MacroPending) => {
+            macros_built_for(db, item.krate(db), Unhashed::Item(item))?;
+            // Written pending in this revision, and its crate's macros built in it: the form is
+            // read with the check that wrote it, so this is not reached.
+            Err(Unhashable::of(item, form::Missed::MacroPending.what()))
+        }
+        Some(why) => Err(Unhashable::of(item, why.what())),
         None => Ok(()),
     }
 }
@@ -291,7 +379,10 @@ fn filled_into(
     sub: &form::Sub,
     owner: ItemId,
 ) -> Result<ContentId, Unhashable> {
-    missed(sub, owner)?;
+    missed(db, sub, owner)?;
+    // A form other than the item's own (a field's, a closure's captures, an opaque's auto
+    // traits) is written without the check `form::Cx::item_form` makes, so it is made here.
+    macros_built_for(db, owner.krate(db), Unhashed::Item(owner))?;
     h.id(&sub.digest).update(&(sub.refs.len() as u64).to_le_bytes());
     for &to in sub.refs.iter() {
         h.id(&interface_of(db, to)?);
@@ -307,7 +398,8 @@ pub(crate) fn signature_filled(
     sub: &form::Sub,
     owner: ItemId,
 ) -> Result<ContentId, Unhashable> {
-    missed(sub, owner)?;
+    missed(db, sub, owner)?;
+    macros_built_for(db, owner.krate(db), Unhashed::Item(owner))?;
     let mut h = Hasher::new(domain);
     h.id(&sub.digest).update(&(sub.refs.len() as u64).to_le_bytes());
     for &to in sub.refs.iter() {

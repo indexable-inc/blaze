@@ -415,12 +415,12 @@ fn bodies<'db>(
 /// naming the item.
 fn unhashable_body(db: &Db) -> impl Fn(blaze_items::Unhashable) -> Unshared + '_ {
     move |it| match it.mir_lowering_error(db) {
-        Some((within, MirLowerError::UnknownIntrinsic(name))) => Unshared::UnknownIntrinsic {
+        Some((item, within, MirLowerError::UnknownIntrinsic(name))) => Unshared::UnknownIntrinsic {
             name: name.as_str().to_owned(), // alloc: error path
             // The body that failed, a closure or an `async` block in the item where it is one
             // (review 7, C2): the item's code covers theirs, but it is theirs that calls it.
             body: match within {
-                None => format!("`{}`", key::path(db, it.item)), // alloc: error path
+                None => format!("`{}`", key::path(db, item)), // alloc: error path
                 Some(blaze_items::Nested::Closure(closure)) => {
                     name_of(db, Subject::Body(Body::Closure(closure.as_id())))
                 }

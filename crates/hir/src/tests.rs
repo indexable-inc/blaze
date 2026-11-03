@@ -22,7 +22,7 @@ use hir_ty::{
     GenericPredicates, InferBodyId, InferenceResult,
     consteval::{AllocationRec, read_allocation, write_allocation},
     db::HirDatabase,
-    infer::persist::InferenceRecord,
+    infer::persist::{InferenceRecord, Nodes},
     next_solver::{
         DbInterner, GenericArg, GenericArgs, ParamEnv, Ty, TypingMode,
         infer::{DbInternerInferExt, select::EvaluationResult},
@@ -1138,8 +1138,9 @@ fn f(s: &S, v: &mut Vec<u32>) -> u32 {
             let record = result.to_record(interner);
             let bytes = Aligned::copy_from(&blaze_format::to_bytes(&record));
             let read = <InferenceRecord as Persist>::read(&bytes).unwrap();
-            assert_eq!(read.to_result(interner).unwrap(), *result);
-            assert_eq!(record.as_ref().to_result(interner).unwrap(), *result);
+            let nodes = Nodes::of(hir_def::expr_store::Body::of(&db, def));
+            assert_eq!(read.to_result(interner, nodes).unwrap(), *result);
+            assert_eq!(record.as_ref().to_result(interner, nodes).unwrap(), *result);
         }
     });
 }

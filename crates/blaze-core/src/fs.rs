@@ -12,7 +12,14 @@ mod private;
 
 pub(crate) use private::private;
 
-#[cfg(unix)]
+/// The calls WASI makes its own way or has none of (the wasm32-wasip1 seed).
+#[cfg(target_os = "wasi")]
+mod wasi;
+
+#[cfg(target_os = "wasi")]
+pub(crate) use wasi::{clone, entries, seal, set_mode, set_times, stamps};
+
+#[cfg(any(unix, target_os = "wasi"))]
 use std::{fs::File, io::Write as _};
 use std::{
     fs::OpenOptions,
@@ -29,6 +36,7 @@ use crate::{FileName, Meta};
 static TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 /// A name next to `path` no other write of this process or another uses.
+#[cfg(any(unix, windows))]
 pub(crate) fn temporary_next_to(path: &Path) -> PathBuf {
     // alloc: once per caller that keeps the name (a listen's socket).
     let mut temporary = PathBuf::new();
@@ -46,9 +54,22 @@ fn temporary_into(path: &Path, into: &mut PathBuf) {
     }
     let name = path.file_name().map(|it| it.to_string_lossy()).unwrap_or_default();
     blaze_mem::scratch::with_string(|file| {
-        _ = write!(file, ".{name}.{}-{n}.tmp", std::process::id());
+        _ = write!(file, ".{name}.{}-{n}.tmp", writer());
         into.push(&*file);
     });
+}
+
+/// What tells this process's temporary names from every other's: its id.
+#[cfg(not(target_os = "wasi"))]
+fn writer() -> u32 {
+    std::process::id()
+}
+
+/// What tells this process's temporary names from every other's: WASI has no process ids
+/// (`std::process::id` panics there), so 64 random bits, drawn for each name.
+#[cfg(target_os = "wasi")]
+fn writer() -> u64 {
+    std::random::random(..)
 }
 
 /// `f` of a NUL-terminated copy of `path`, made in the thread's byte buffer.
@@ -105,7 +126,7 @@ pub(crate) fn making_parent<T>(path: &Path, mut make: impl FnMut() -> io::Result
 
 /// `bytes` as the whole of `path`: written to a temporary file next to it, synced, renamed over
 /// it, and the directory synced, so the new name survives a crash.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     blaze_mem::scratch::with_path(|temporary| {
         temporary_into(path, temporary);
@@ -124,7 +145,7 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// `from` renamed to `to`, and `to`'s directory synced.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 pub(crate) fn commit_rename(from: &Path, to: &Path) -> io::Result<()> {
     if let Err(error) = std::fs::rename(from, to) {
         _ = std::fs::remove_file(from);
@@ -135,7 +156,7 @@ pub(crate) fn commit_rename(from: &Path, to: &Path) -> io::Result<()> {
 
 /// `from` renamed over `to`, made the new name durably; `from` is left as it was when the
 /// rename fails.
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     making_parent(to, || std::fs::rename(from, to))?;
     sync_dir_of(to)?;
@@ -157,6 +178,8 @@ pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
     }
     #[cfg(unix)]
     return std::os::unix::fs::FileExt::write_all_at(&file, bytes, at);
+    #[cfg(target_os = "wasi")]
+    return std::os::wasi::fs::FileExt::write_all_at(&file, bytes, at);
     #[cfg(windows)]
     {
         let mut done = 0;
@@ -245,7 +268,7 @@ pub(crate) fn set_times(path: &Path, modified_ns: u64) -> io::Result<()> {
 #[cfg(windows)]
 pub(crate) use crate::iocp::files::{clone, rename, seal, set_mode, set_times, write_atomically};
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 fn sync_dir_of(path: &Path) -> io::Result<()> {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => File::open(parent)?.sync_all(),

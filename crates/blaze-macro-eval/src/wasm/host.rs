@@ -1,7 +1,7 @@
 //! One expansion in a fresh instance of a macro's module: its input written to the module's
 //! memory, its macro run, and each request its `proc_macro` client makes answered by
 //! [`Server::dispatch`] through the bridge's shims ([`abi::BRIDGE_SHIMS`]); the WASI calls of
-//! its std by [`wasi`].
+//! its std by `blaze_wasi` over the sandbox's [`wasi`].
 //!
 //! A Wasmtime store's data is `'static`, and what a call answers from borrows the calling
 //! crate's environment and the [`Answer`] for the call. So the store holds a pointer to the
@@ -16,7 +16,7 @@ use std::ptr::NonNull;
 use wasmtime::{Caller, Engine, InstancePre, Linker, Memory, ResourceLimiter, Store, Trap, TypedFunc};
 
 use super::{
-    abi::{self, BRIDGE, WASI},
+    abi::{self, BRIDGE},
     statics::Statics,
     wasi,
 };
@@ -120,7 +120,7 @@ fn with<R>(caller: &mut Caller<'_, Host>, f: impl FnOnce(&mut [u8], &mut Cx<'_>)
 pub(crate) fn linker(engine: &Engine) -> wasmtime::Result<Linker<Host>> {
     let mut l = Linker::new(engine);
     bridge(&mut l)?;
-    wasi_shims(&mut l)?;
+    blaze_wasi::link::<blaze_wasi::W32, Host>(&mut l)?;
     Ok(l)
 }
 
@@ -201,95 +201,15 @@ fn env_var(mem: &mut [u8], cx: &mut Cx<'_>, name: u32, len: u32, into: u32, capa
     Ok(n)
 }
 
-fn wasi_shims(l: &mut Linker<Host>) -> wasmtime::Result<()> {
-    l.func_wrap(WASI, "args_get", |mut c: Caller<'_, Host>, a: u32, b: u32| with(&mut c, |m, _| wasi::args_get(m, a, b)))?;
-    l.func_wrap(WASI, "args_sizes_get", |mut c: Caller<'_, Host>, a: u32, b: u32| {
-        with(&mut c, |m, _| wasi::args_sizes_get(m, a, b))
-    })?;
-    l.func_wrap(WASI, "environ_get", |mut c: Caller<'_, Host>, a: u32, b: u32| {
-        with(&mut c, |m, cx| wasi::environ_get(m, cx, a, b))
-    })?;
-    l.func_wrap(WASI, "environ_sizes_get", |mut c: Caller<'_, Host>, a: u32, b: u32| {
-        with(&mut c, |m, cx| wasi::environ_sizes_get(m, cx, a, b))
-    })?;
-    l.func_wrap(WASI, "clock_res_get", |mut c: Caller<'_, Host>, id: u32, out: u32| {
-        with(&mut c, |m, _| wasi::clock_res_get(m, id, out))
-    })?;
-    l.func_wrap(WASI, "clock_time_get", |mut c: Caller<'_, Host>, id: u32, _precision: u64, out: u32| {
-        let fuel = FUEL.saturating_sub(c.get_fuel()?);
-        with(&mut c, |m, cx| wasi::clock_time_get(m, cx, id, out, fuel))
-    })?;
-    l.func_wrap(WASI, "random_get", |mut c: Caller<'_, Host>, buf: u32, len: u32| {
-        with(&mut c, |m, cx| wasi::random_get(m, cx, buf, len))
-    })?;
-    l.func_wrap(WASI, "fd_write", |mut c: Caller<'_, Host>, fd: u32, iovs: u32, n: u32, out: u32| {
-        with(&mut c, |m, _| wasi::fd_write(m, fd, iovs, n, out))
-    })?;
-    l.func_wrap(WASI, "fd_read", |mut c: Caller<'_, Host>, fd: u32, iovs: u32, n: u32, out: u32| {
-        with(&mut c, |m, cx| wasi::fd_read(m, cx, fd, iovs, n, out))
-    })?;
-    l.func_wrap(WASI, "fd_prestat_get", |mut c: Caller<'_, Host>, fd: u32, out: u32| {
-        with(&mut c, |m, _| wasi::fd_prestat_get(m, fd, out))
-    })?;
-    l.func_wrap(WASI, "fd_prestat_dir_name", |mut c: Caller<'_, Host>, fd: u32, path: u32, len: u32| {
-        with(&mut c, |m, _| wasi::fd_prestat_dir_name(m, fd, path, len))
-    })?;
-    l.func_wrap(WASI, "fd_fdstat_get", |mut c: Caller<'_, Host>, fd: u32, out: u32| {
-        with(&mut c, |m, cx| wasi::fd_fdstat_get(m, cx, fd, out))
-    })?;
-    l.func_wrap(WASI, "fd_fdstat_set_flags", |mut c: Caller<'_, Host>, fd: u32, _flags: u32| {
-        with(&mut c, |_, cx| wasi::fd_fdstat_set_flags(cx, fd))
-    })?;
-    l.func_wrap(WASI, "fd_close", |mut c: Caller<'_, Host>, fd: u32| with(&mut c, |_, cx| wasi::fd_close(cx, fd)))?;
-    l.func_wrap(WASI, "fd_seek", |mut c: Caller<'_, Host>, fd: u32, offset: i64, whence: u32, out: u32| {
-        with(&mut c, |m, cx| wasi::fd_seek(m, cx, fd, offset, whence, out))
-    })?;
-    // `fd_tell` is a seek by 0 from where it is (`SEEK_CUR`).
-    l.func_wrap(WASI, "fd_tell", |mut c: Caller<'_, Host>, fd: u32, out: u32| with(&mut c, |m, cx| wasi::fd_seek(m, cx, fd, 0, 1, out)))?;
-    l.func_wrap(WASI, "fd_filestat_get", |mut c: Caller<'_, Host>, fd: u32, out: u32| {
-        with(&mut c, |m, cx| wasi::fd_filestat_get(m, cx, fd, out))
-    })?;
-    l.func_wrap(WASI, "fd_readdir", |mut c: Caller<'_, Host>, fd: u32, buf: u32, len: u32, cookie: u64, out: u32| {
-        with(&mut c, |m, cx| wasi::fd_readdir(m, cx, fd, (buf, len), cookie, out))
-    })?;
-    l.func_wrap(
-        WASI,
-        "path_open",
-        |mut c: Caller<'_, Host>,
-         fd: u32,
-         dirflags: u32,
-         path: u32,
-         len: u32,
-         oflags: u32,
-         base: u64,
-         _inheriting: u64,
-         fdflags: u32,
-         out: u32| {
-            with(&mut c, |m, cx| wasi::path_open(m, cx, (fd, dirflags, path, len), oflags, base, fdflags, out))
-        },
-    )?;
-    l.func_wrap(
-        WASI,
-        "path_filestat_get",
-        |mut c: Caller<'_, Host>, fd: u32, flags: u32, path: u32, len: u32, out: u32| {
-            with(&mut c, |m, cx| wasi::path_filestat_get(m, cx, (fd, flags, path, len), out))
-        },
-    )?;
-    l.func_wrap(
-        WASI,
-        "path_readlink",
-        |mut c: Caller<'_, Host>, fd: u32, path: u32, len: u32, buf: u32, buf_len: u32, out: u32| {
-            with(&mut c, |m, cx| wasi::path_readlink(m, cx, (fd, path, len), (buf, buf_len, out)))
-        },
-    )?;
-    l.func_wrap(WASI, "poll_oneoff", |mut c: Caller<'_, Host>, _in: u32, _out: u32, _n: u32, _events: u32| {
-        with(&mut c, |_, _| wasi::poll_oneoff())
-    })?;
-    l.func_wrap(WASI, "proc_exit", |mut c: Caller<'_, Host>, code: u32| {
-        with(&mut c, |_, _| Err::<(), _>(wasi::proc_exit(code)))
-    })?;
-    l.func_wrap(WASI, "sched_yield", |_: Caller<'_, Host>| 0i32)?;
-    Ok(())
+/// The WASI calls' way to a module's memory and the call's [`Cx`], the macro sandbox's
+/// [`blaze_wasi::System`] (`wasi.rs`).
+impl blaze_wasi::Embed for Host {
+    fn with<R>(
+        caller: &mut Caller<'_, Host>,
+        f: impl FnOnce(&mut [u8], &mut dyn blaze_wasi::System) -> Result<R, Stop>, // dyn: `blaze_wasi`'s calls, shared with the seed runner
+    ) -> wasmtime::Result<R> {
+        with(caller, |mem, cx| f(mem, cx))
+    }
 }
 
 /// The statics an expansion is given and watched by: each written after the module's

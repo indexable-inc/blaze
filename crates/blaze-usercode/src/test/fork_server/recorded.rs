@@ -7,8 +7,13 @@
 // steady stream of tests makes no `mmap`, `munmap` or fresh page of them.
 #[cfg(unix)]
 mod exec {
+    use super::std;
+    #[allow(unused_imports)]
+    use self::std::prelude::rust_2021::*;
+    #[allow(unused_imports)]
+    use self::std::{eprintln, format, vec};
     use super::{End, HEADER, header, read_region};
-    use ::std::borrow::Cow;
+    use self::std::borrow::Cow;
 
     type Int = ::core::ffi::c_int;
 
@@ -84,7 +89,7 @@ mod exec {
                 mmap(::core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0)
             };
             if at as usize == usize::MAX {
-                return Err(format!("mapping the execution record: {}", ::std::io::Error::last_os_error())); // alloc: error path
+                return Err(format!("mapping the execution record: {}", std::io::Error::last_os_error())); // alloc: error path
             }
             let region = Region { at: at as *mut u8, len, slots: self.slots };
             let head = header(self.slots);

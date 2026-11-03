@@ -158,6 +158,10 @@ pub enum Arch {
     Aarch64,
     /// WebAssembly with 32-bit addresses.
     Wasm32,
+    /// WebAssembly with 64-bit addresses (memory64): blaze's own `wasm64-blaze-wasip1`, the
+    /// bootstrap seed's target. An address is an `i64`; the table stays 32-bit, so a function
+    /// pointer is an `i64` that `call_indirect` takes wrapped to an `i32`.
+    Wasm64,
 }
 
 impl Arch {
@@ -172,7 +176,7 @@ impl Arch {
             // `udf #0`.
             Arch::Aarch64 => Some((12, 0)),
             // A function of a module is replaced by its slot in the table, not by a jump.
-            Arch::Wasm32 => None,
+            Arch::Wasm32 | Arch::Wasm64 => None,
         }
     }
 }
@@ -339,7 +343,7 @@ impl Target {
         let (table, always): (&[(&str, &str)], &[&str]) = match self.arch {
             Arch::X86_64 => (&X86_FEATURES, &["x87", "fxsr", "sse", "sse2", "cmpxchg16b"]),
             Arch::Aarch64 => (&AARCH64_FEATURES, &["neon", "fp-armv8"]),
-            Arch::Wasm32 => (&[], &[]),
+            Arch::Wasm32 | Arch::Wasm64 => (&[], &[]),
         };
         if always.contains(&name) {
             if !on && name != "cmpxchg16b" {
@@ -403,6 +407,7 @@ impl Target {
             Some("x86_64") => Arch::X86_64,
             Some("aarch64") => Arch::Aarch64,
             Some("wasm32") => Arch::Wasm32,
+            Some("wasm64") => Arch::Wasm64,
             // alloc: an error
             _ => return Err(format!("blaze emits no code for the architecture of {triple}")),
         };
@@ -411,7 +416,7 @@ impl Target {
         // AAPCS64 on AArch64, which Apple's differs from in what goes on the stack.
         let (object_format, unwind, call_conv) = match (system, arch) {
             // The calling convention is the one of the ISA whose settings are borrowed.
-            (_, Arch::Wasm32) => (ObjectFormat::Wasm, UnwindFormat::None, CallConv::SystemV),
+            (_, Arch::Wasm32 | Arch::Wasm64) => (ObjectFormat::Wasm, UnwindFormat::None, CallConv::SystemV),
             (Some("linux"), _) => (ObjectFormat::Elf, UnwindFormat::EhFrame, CallConv::SystemV),
             (Some("darwin"), Arch::Aarch64) => {
                 (ObjectFormat::MachO, UnwindFormat::EhFrame, CallConv::AppleAarch64)
@@ -429,7 +434,14 @@ impl Target {
     }
 
     pub fn is_wasm(&self) -> bool {
-        self.arch == Arch::Wasm32
+        matches!(self.arch, Arch::Wasm32 | Arch::Wasm64)
+    }
+
+    /// Whether its wasm code addresses a 64-bit memory (memory64): `i64` addresses, `i64.const`
+    /// for the address of data and a slot, an `i64` stack pointer, and `memory.size`,
+    /// `memory.grow`, `memory.copy` and `memory.fill` on `i64`s.
+    pub fn memory64(&self) -> bool {
+        self.arch == Arch::Wasm64
     }
 
     /// Whether an object is written as a relocatable wasm object, for a linker. A page links
@@ -446,7 +458,7 @@ impl Target {
     /// The integer an address is.
     pub(super) fn pointer(&self) -> Type {
         match self.arch {
-            Arch::X86_64 | Arch::Aarch64 => types::I64,
+            Arch::X86_64 | Arch::Aarch64 | Arch::Wasm64 => types::I64,
             Arch::Wasm32 => types::I32,
         }
     }
@@ -472,8 +484,8 @@ impl Target {
     /// gives it.
     pub fn entry(&self) -> (&'static str, bool) {
         match self.arch {
-            Arch::Wasm32 if self.triple.contains("-wasi") => ("__main_void", false),
-            Arch::Wasm32 => ("__main_argc_argv", true),
+            Arch::Wasm32 | Arch::Wasm64 if self.triple.contains("-wasi") => ("__main_void", false),
+            Arch::Wasm32 | Arch::Wasm64 => ("__main_argc_argv", true),
             Arch::X86_64 | Arch::Aarch64 => ("main", true),
         }
     }
@@ -481,7 +493,7 @@ impl Target {
     /// Whether the program is linked with a C library, for `write` and `abort`: not on a wasm
     /// that is not WASI's, as wasm32-unknown-unknown has nothing to link but the program.
     pub fn has_libc(&self) -> bool {
-        self.arch != Arch::Wasm32 || self.triple.contains("-wasi")
+        !self.is_wasm() || self.triple.contains("-wasi")
     }
 
     /// Whether a call can name its landing pad and the pad is entered with the exception in a
@@ -494,7 +506,7 @@ impl Target {
     /// definition of one is compiled for.
     pub fn variable_arguments(&self) -> Option<VariableArguments> {
         match (self.call_conv, self.arch) {
-            (_, Arch::Wasm32) => Some(VariableArguments::Buffer),
+            (_, Arch::Wasm32 | Arch::Wasm64) => Some(VariableArguments::Buffer),
             (CallConv::SystemV, Arch::X86_64 | Arch::Aarch64) => Some(VariableArguments::Registers),
             (CallConv::WindowsFastcall, Arch::X86_64) => Some(VariableArguments::Homed),
             (CallConv::AppleAarch64, Arch::Aarch64) => Some(VariableArguments::Stack),
@@ -514,7 +526,7 @@ impl Target {
     pub fn cpu(&self) -> &'static str {
         match (self.arch, self.object_format) {
             (Arch::X86_64, _) => "x86-64",
-            (Arch::Wasm32, _) => "generic",
+            (Arch::Wasm32 | Arch::Wasm64, _) => "generic",
             (Arch::Aarch64, ObjectFormat::MachO) => "apple-m1",
             (Arch::Aarch64, _) => "generic",
         }
@@ -569,7 +581,7 @@ impl Target {
         // stack ends in a guard page that a frame larger than it would step over, into
         // whatever is mapped below, rather than fault where std says the stack overflowed.
         // WebAssembly's stack is the engine's.
-        if self.arch != Arch::Wasm32 {
+        if !self.is_wasm() {
             flags.set("enable_probestack", "true").map_err(message)?;
             flags.set("probestack_strategy", "inline").map_err(message)?;
         }
@@ -594,7 +606,7 @@ impl Target {
         // Cranelift has no ISA for WebAssembly: its code is written from the IR, and the
         // settings of this one are what the IR is made under.
         let triple = match self.arch {
-            Arch::Wasm32 => "x86_64-unknown-linux-gnu",
+            Arch::Wasm32 | Arch::Wasm64 => "x86_64-unknown-linux-gnu",
             Arch::X86_64 | Arch::Aarch64 => &self.triple,
         };
         let mut isa = isa::lookup_by_name(triple).map_err(message)?;
@@ -634,7 +646,7 @@ impl Target {
         let arch = match self.arch {
             Arch::X86_64 => blaze_codegen::Arch::X86_64,
             Arch::Aarch64 => blaze_codegen::Arch::Aarch64,
-            Arch::Wasm32 => return None,
+            Arch::Wasm32 | Arch::Wasm64 => return None,
         };
         let os = match self.object_format {
             ObjectFormat::Elf => blaze_stencil::Os::Linux,
@@ -695,7 +707,7 @@ fn renamed_for_llvm(arch: Arch, name: &str, on: bool) -> Option<&'static [&'stat
             "fpmr" | "tme" => &[],
             _ => return None,
         },
-        Arch::Wasm32 => return None,
+        Arch::Wasm32 | Arch::Wasm64 => return None,
     })
 }
 
@@ -935,7 +947,7 @@ mod tests {
     #[hegel::test]
     fn a_target_is_its_triple_whatever_was_named_before(tc: hegel::TestCase) {
         use hegel::generators as gs;
-        let triples = vec![Target::host(), "wasm32-wasip1"];
+        let triples = vec![Target::host(), "wasm32-wasip1", "wasm64-blaze-wasip1"];
         let order: Vec<&str> = tc.draw(gs::vecs(gs::sampled_from(triples)).min_size(1).max_size(8));
         for triple in order {
             let target = Target::of(triple).expect("a target");
@@ -943,7 +955,7 @@ mod tests {
             assert!(std::ptr::eq(target, Target::of(triple).expect("a target")));
             let word = match target.arch {
                 Arch::Wasm32 => 4,
-                Arch::X86_64 | Arch::Aarch64 => 8,
+                Arch::X86_64 | Arch::Aarch64 | Arch::Wasm64 => 8,
             };
             assert_eq!(target.word(), word);
             assert_eq!(target.pointer().bytes() as usize, word);

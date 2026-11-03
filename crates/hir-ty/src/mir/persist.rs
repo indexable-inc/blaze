@@ -3,9 +3,10 @@
 //! build, branch or machine reads the body instead of lowering it again.
 //!
 //! The body is a column of `u32` words in prefix form: each value's first word is its tag, and
-//! each list starts with its length; [`read`] checks every tag, length, local and block as it
-//! rebuilds the body. Types, constants and generic arguments are places in the buffer's own
-//! type table (`next_solver::persist`); an allocation (a constant operand's value) is
+//! each list starts with its length; [`read`] checks every tag, length and index (a local, a
+//! block, an id of the store, a reference into the body's own tables) as it rebuilds the body.
+//! Types, constants and generic arguments are places in the buffer's own type table
+//! (`next_solver::persist`); an allocation (a constant operand's value) is
 //! `consteval`'s record, written once however often the body uses it; text (an `asm!`
 //! template's literals, register names) is one byte column. Locals, blocks, fields and spans
 //! are the body's own indices: a span is an `ExprId`, `PatId` or `BindingId` of the body's
@@ -39,17 +40,16 @@ use hir_def::{
     expr_store::ExpressionStore,
     hir::{
         AsmOperand as HirAsmOperand, AsmOptions, AsmPiece, BindingId, Expr, ExprId,
-        InlineAsmRegOrRegClass, Literal, Pat,
+        InlineAsmRegOrRegClass, Literal, Pat, PatId,
     },
 };
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
-use rustc_type_ir::{IntTy, UintTy, inherent::IntoKind as _};
+use rustc_type_ir::{IntTy, UintTy, UniverseIndex, inherent::IntoKind as _};
 use smallvec::SmallVec;
 
 use super::{
     AggregateKind, AsmOperand, AssertKind, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind,
-    ComptimeBinder, CoroutineLocals, FieldIndex, InlineAsm, Inlined, InlinedBinding, InlinedBody, InlinedCallee,
-    InlinedPromoted, InlinedScope, InlinedSpan, Local, LocalId, MirBody, MirPhase, MirSpan,
+    ComptimeBinder, CoroutineLocals, FieldIndex, InlineAsm, Inlined, Local, LocalId, MirBody, MirPhase, MirSpan,
     MutBorrowKind, Operand, OperandKind, Place, PlaceElem, Projection, ProjectionElem, Rvalue,
     Statement, StatementKind, StoredPlace, SwitchTargets, Terminator, TerminatorKind, UnOp,
     UnreachableAfterCall,
@@ -70,7 +70,8 @@ use crate::{
 };
 
 /// The version of the words [`write`] writes: changes with any change to what a word means.
-const WORDS_VERSION: u64 = 4;
+/// 5: no inlined tables (only built MIR is kept, which has none).
+const WORDS_VERSION: u64 = 5;
 
 /// The literals of a body that a location macro expanded to, sorted, with the store they are
 /// expressions of: the constants a body's MIR makes of them are written as slots and filled
@@ -174,10 +175,125 @@ pub(crate) const SCHEMA: SchemaHash = schema_of(&[
     Part::Schema(Intrinsic::SCHEMA),
 ]);
 
+/// Why [`write`] refused a body.
+#[derive(Debug)]
+pub(crate) enum WriteError {
+    /// What of the body has no word, or is never kept: a lint's description lowering did not
+    /// make, a location literal used with no operand of its own or whose constant is not what
+    /// its literal makes, anything of optimized MIR (an inlined table or span, a specialized
+    /// call, an allocation moved into the frame).
+    Unwritable(&'static str),
+    /// The buffer written does not read back as the body: a lowering or writer bug, the
+    /// build's error when the body is offered (`body_store::fail`), never a body left unstored.
+    /// Checked in debug builds, against `locations`' store.
+    Unreadable(ReadBack),
+}
+
+/// How a buffer [`write`] wrote failed to read back.
+#[derive(Debug)]
+pub(crate) enum ReadBack {
+    /// [`read`] refuses it: the body breaks one of `read`'s rules.
+    Refused(FormatError),
+    /// It reads as another body: writer and reader skew that keeps every index in range. The
+    /// first field of [`MirBody`] that differs.
+    Differs(&'static str),
+}
+
+impl std::fmt::Display for ReadBack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadBack::Refused(why) => write!(f, "a body written that does not read back: {why}"),
+            ReadBack::Differs(what) => write!(f, "a body written that reads back as another: its {what} differ"),
+        }
+    }
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::Unwritable(why) => f.write_str(why),
+            WriteError::Unreadable(why) => why.fmt(f),
+        }
+    }
+}
+
 /// `body` as a buffer of its own, the constants of `locations` as slots. Refused, with why,
-/// only for what has no word: a lint's description lowering did not make, a location literal
-/// used with no operand of its own, and a location literal's constant that is not what its literal makes.
+/// for what has no word ([`WriteError::Unwritable`]) and, in debug builds with `locations`
+/// given, for a buffer [`read`] refuses or reads as another body ([`WriteError::Unreadable`]):
+/// `read`'s rules are checked once, in `read`, and `write` holds to them by reading its own
+/// buffer back and comparing it with `body`.
 pub(crate) fn write<'db>(
+    db: &'db Db,
+    body: &MirBody<'db>,
+    locations: Option<Locations<'_>>,
+) -> Result<Vec<u8>, WriteError> {
+    let buffer = write_unchecked(db, body, locations).map_err(WriteError::Unwritable)?;
+    if cfg!(debug_assertions)
+        && let Some(locations) = locations
+    {
+        let read = read(db, &blaze_format::Aligned::copy_from(&buffer), locations)
+            .map_err(|why| WriteError::Unreadable(ReadBack::Refused(why)))?;
+        if let Some(what) = first_difference(body, &read) {
+            return Err(WriteError::Unreadable(ReadBack::Differs(what)));
+        }
+    }
+    Ok(buffer)
+}
+
+/// The first field of `read` that is not `written`'s, by name; `None` when they are equal.
+fn first_difference(written: &MirBody<'_>, read: &MirBody<'_>) -> Option<&'static str> {
+    let MirBody {
+        basic_blocks,
+        locals,
+        start_block,
+        owner,
+        binding_locals,
+        upvar_locals,
+        param_locals,
+        promoted_locals,
+        closures,
+        coroutine,
+        unreached,
+        scope_ends,
+        inherits_overflow_checks,
+        phase,
+        upvars_in_place,
+        panic_unwinds,
+        promoted_constants,
+        unreachable_after_calls,
+        guard_refs,
+        capture_copies,
+        inlined,
+    } = written;
+    [
+        ("basic blocks", *basic_blocks == read.basic_blocks),
+        ("locals", *locals == read.locals),
+        ("start blocks", *start_block == read.start_block),
+        ("owners", *owner == read.owner),
+        ("binding locals", *binding_locals == read.binding_locals),
+        ("upvar locals", *upvar_locals == read.upvar_locals),
+        ("parameter locals", *param_locals == read.param_locals),
+        ("promoted locals", *promoted_locals == read.promoted_locals),
+        ("closures", *closures == read.closures),
+        ("coroutine locals", *coroutine == read.coroutine),
+        ("unreached blocks", *unreached == read.unreached),
+        ("scope ends", *scope_ends == read.scope_ends),
+        ("overflow check inheritances", *inherits_overflow_checks == read.inherits_overflow_checks),
+        ("phases", *phase == read.phase),
+        ("upvars in place", *upvars_in_place == read.upvars_in_place),
+        ("panic unwinds", *panic_unwinds == read.panic_unwinds),
+        ("promoted constants", *promoted_constants == read.promoted_constants),
+        ("unreachable-after calls", *unreachable_after_calls == read.unreachable_after_calls),
+        ("guard references", *guard_refs == read.guard_refs),
+        ("capture copies", *capture_copies == read.capture_copies),
+        ("inlined tables", *inlined == read.inlined),
+    ]
+    .into_iter()
+    .find_map(|(what, same)| (!same).then_some(what))
+}
+
+/// [`write`] without reading the buffer back.
+fn write_unchecked<'db>(
     db: &'db Db,
     body: &MirBody<'db>,
     locations: Option<Locations<'_>>,
@@ -231,19 +347,38 @@ pub(crate) fn write<'db>(
 }
 
 /// The body [`write`] wrote into `buffer`, made in `db`: its header, schema and columns checked
-/// in place, then every word as it is read. A buffer that does not read is an error, never a
-/// panic and never another body. Slots are filled from `locations`; a slot it does not list, or
-/// whose expression is no longer such a literal, is an error.
+/// in place, then every word as it is read. Input this read can bound and that is out of range
+/// is an error, never a panic, and no length or index it holds is trusted to size an
+/// allocation: a list is at most as long as the words left can hold. Every index is checked
+/// against the length of the table it indexes: an expression, pattern or binding against
+/// `locations`' store (the store the body's spans and bindings index), a union's field against
+/// the union's fields, the body's references into its own tables (a statement of a block, an
+/// `asm!` operand) against those tables as read, a switch's targets against its values, and a
+/// `for const` binder against the universes. Built MIR has no inlined code, so an inlined span
+/// is refused. Slots are filled from `locations`; a slot it does not list, or whose expression
+/// is no longer such a literal, is an error.
+///
+/// What this read does not catch: damage that keeps every index in range reads as another
+/// body (another local, block, operator or field). The store rules that out, checking each
+/// value against the content hash it was put with (`ImageStore::get`,
+/// hir-def/src/deps/serve.rs); this read's checks guard against writer and reader skew and
+/// crafted values. Field indexes of place projections (`ProjectionElem::Field`, a captured
+/// place's `ProjectionKind::Field`) are relative to a type and are not checked here: that needs
+/// the place types, which `Mode::Verify` gets by building the body again.
 pub(crate) fn read<'db>(
     db: &'db Db,
     buffer: &[u8],
-    locations: Option<Locations<'_>>,
+    locations: Locations<'_>,
 ) -> Result<MirBody<'db>, FormatError> {
     let root = open_as::<MirRoot>(buffer, SCHEMA)?;
     let tys = TyTableReader::open(DbInterner::new_no_crate(db), buffer, root.tys)?;
     let allocs = root.allocs.follow(buffer)?;
+    let words = root.words.follow(buffer)?;
+    let store = locations.store;
     let mut decode = Decode {
-        words: root.words.follow(buffer)?,
+        db,
+        words,
+        words_at: (words.as_ptr().addr() - buffer.as_ptr().addr()) as u64,
         at: 0,
         text: root.text.follow(buffer)?,
         tys,
@@ -253,13 +388,25 @@ pub(crate) fn read<'db>(
         buffer,
         locals: 0,
         blocks: 0,
+        exprs: table_len(store.expr_count()),
+        pats: table_len(store.pat_count()),
+        bindings: table_len(store.bindings().count()),
         locations,
     };
     let body = decode.body()?;
     match decode.at == decode.words.len() {
         true => Ok(body),
-        false => Err(decode.invalid("words left over after the body")),
+        false => Err(FormatError::Invalid {
+            at: decode.byte(decode.at),
+            what: "words left over after the body",
+        }),
     }
+}
+
+/// A table's length as the `u32` its indices are: a table of `2^32` rows or more (none fits
+/// in memory) bounds nothing a word can name, so it saturates rather than wrap.
+fn table_len(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
 }
 
 /// About how many words `body` writes, so the column grows once or not at all.
@@ -552,63 +699,31 @@ impl<'db> Encode<'_, 'db> {
         }
     }
 
+    /// Nothing: only built MIR is kept, and a built body has no inlined code, specialized
+    /// calls or allocations moved into its frame. A body with any is optimized MIR, refused.
     fn inlined(&mut self, inlined: &Inlined<'db>) {
         let Inlined { callees, scopes, spans, bindings, promoted, devirtualized, specialized, moved_to_frame } =
             inlined;
-        // Only an optimized body calls specialized copies, and only built bodies are kept.
-        if !specialized.is_empty() {
-            self.refused
-                .get_or_insert("a body with specialized calls, which only optimized MIR has");
-        }
-        // Likewise only an optimized body has allocations moved into its frame.
-        if *moved_to_frame != 0 {
-            self.refused.get_or_insert(
-                "a body with allocations moved into its frame, which only optimized MIR has",
-            );
-        }
-        self.count(callees.len());
-        for InlinedCallee { body, args, written_checked } in callees {
-            match *body {
-                InlinedBody::Fn(it) => {
-                    self.word(0);
-                    self.id(it);
-                }
-                InlinedBody::Closure(it) => {
-                    self.word(1);
-                    self.id(it);
-                }
-            }
-            self.args(args);
-            self.bool(*written_checked);
-        }
-        self.count(scopes.len());
-        for &InlinedScope { callee, call_site } in scopes {
-            self.word(callee);
-            self.span(call_site);
-        }
-        self.count(spans.len());
-        for &InlinedSpan { scope, span } in spans {
-            self.word(scope);
-            self.span(span);
-        }
-        self.count(bindings.len());
-        for &InlinedBinding { scope, binding, local } in bindings {
-            self.word(scope);
-            self.word(binding.into_raw().into_u32());
-            self.local(local);
-        }
-        self.count(promoted.len());
-        for &InlinedPromoted { local, callee, expr } in promoted {
-            self.local(local);
-            self.word(callee);
-            self.word(expr.into_raw().into_u32());
-        }
-        self.count(devirtualized.len());
-        for digest in devirtualized {
-            for word in digest.chunks_exact(4) {
-                self.word(u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
-            }
-        }
+        let why = if !callees.is_empty() {
+            "a body with inlined callees, which only optimized MIR has"
+        } else if !scopes.is_empty() {
+            "a body with inlined scopes, which only optimized MIR has"
+        } else if !spans.is_empty() {
+            "a body with inlined spans, which only optimized MIR has"
+        } else if !bindings.is_empty() {
+            "a body with inlined bindings, which only optimized MIR has"
+        } else if !promoted.is_empty() {
+            "a body with inlined promoted locals, which only optimized MIR has"
+        } else if !devirtualized.is_empty() {
+            "a body with devirtualized calls, which only optimized MIR has"
+        } else if !specialized.is_empty() {
+            "a body with specialized calls, which only optimized MIR has"
+        } else if *moved_to_frame != 0 {
+            "a body with allocations moved into its frame, which only optimized MIR has"
+        } else {
+            return;
+        };
+        self.refused.get_or_insert(why);
     }
 
     fn basic_block(&mut self, block: &BasicBlock) {
@@ -651,9 +766,8 @@ impl<'db> Encode<'_, 'db> {
             }
             MirSpan::SelfParam => self.word(4),
             MirSpan::Unknown => self.word(5),
-            MirSpan::Inlined(n) => {
-                self.word(6);
-                self.word(n);
+            MirSpan::Inlined(_) => {
+                self.refused.get_or_insert("an inlined span, which only optimized MIR has");
             }
         }
     }
@@ -1152,7 +1266,10 @@ impl<'db> Encode<'_, 'db> {
 }
 
 struct Decode<'a, 'db> {
+    db: &'db Db,
     words: &'a [u32],
+    /// Where the words column starts in the buffer, so an error names the byte of its word.
+    words_at: u64,
     /// The next word to read.
     at: usize,
     text: &'a [u8],
@@ -1165,7 +1282,14 @@ struct Decode<'a, 'db> {
     /// them, so the body read never indexes past its arenas.
     locals: u32,
     blocks: u32,
-    locations: Option<Locations<'a>>,
+    /// How many expressions, patterns and bindings the body's store has: every one the
+    /// words name is checked against them, so the body read never indexes past the store (a
+    /// binding the body maps to a local is also a slot of a dense map up to it, so one past
+    /// them is refused before it sizes that map).
+    exprs: u32,
+    pats: u32,
+    bindings: u32,
+    locations: Locations<'a>,
 }
 
 type R<T> = Result<T, FormatError>;
@@ -1175,9 +1299,20 @@ fn idx<T>(raw: u32) -> Idx<T> {
 }
 
 impl<'a, 'db> Decode<'a, 'db> {
-    /// An error at the word being read.
+    /// Where the words column's word `word` is in the buffer, in bytes.
+    fn byte(&self, word: usize) -> u64 {
+        self.words_at + 4 * word as u64
+    }
+
+    /// An error at the word just read, by its byte in the buffer.
     fn invalid(&self, what: &'static str) -> FormatError {
-        FormatError::Invalid { at: self.at as u64, what }
+        self.invalid_at(self.at.saturating_sub(1), what)
+    }
+
+    /// An error at the word `word` (a value of several words, by its first), by its byte in
+    /// the buffer.
+    fn invalid_at(&self, word: usize, what: &'static str) -> FormatError {
+        FormatError::Invalid { at: self.byte(word), what }
     }
 
     #[inline]
@@ -1187,7 +1322,7 @@ impl<'a, 'db> Decode<'a, 'db> {
                 self.at += 1;
                 Ok(word)
             }
-            None => Err(self.invalid("a MIR body cut short")),
+            None => Err(self.invalid_at(self.at, "a MIR body cut short")),
         }
     }
 
@@ -1211,19 +1346,87 @@ impl<'a, 'db> Decode<'a, 'db> {
         Ok(u128::from(low) | (u128::from(high) << 64))
     }
 
-    /// The length of a list whose items are a word or more each: never more than the words
-    /// left, so a list is allocated only as long as the buffer can fill.
-    fn count(&mut self) -> R<usize> {
-        let count = self.word()? as usize;
-        match count <= self.words.len() - self.at {
-            true => Ok(count),
-            false => Err(self.invalid("a list longer than the words left")),
+    /// An error at the word just read, by its byte in the buffer: `what`, `found`, is past
+    /// its bound `bound`.
+    fn past(&self, what: &'static str, found: impl Into<u64>, bound: impl Into<u64>) -> FormatError {
+        self.past_at(self.at.saturating_sub(1), what, found, bound)
+    }
+
+    /// [`Self::past`] of the word `word`.
+    fn past_at(
+        &self,
+        word: usize,
+        what: &'static str,
+        found: impl Into<u64>,
+        bound: impl Into<u64>,
+    ) -> FormatError {
+        FormatError::Bound { at: self.byte(word), what, found: found.into(), bound: bound.into() }
+    }
+
+    /// The length of the list `what` names, whose items are a word or more each: never more
+    /// than the words left, so a list is allocated only as long as the buffer can fill.
+    fn count(&mut self, what: &'static str) -> R<usize> {
+        self.count_of(what, 1)
+    }
+
+    /// The length of the list `what` names, whose items are `words` words each at least: never
+    /// more items than the words left can hold.
+    fn count_of(&mut self, what: &'static str, words: usize) -> R<usize> {
+        let count = self.word()?;
+        let fits = (self.words.len() - self.at) / words;
+        match count as usize <= fits {
+            true => Ok(count as usize),
+            false => Err(self.past(what, count, fits as u64)),
+        }
+    }
+
+    /// An index of a table of `len` rows, `what` naming the field and the table.
+    fn below<T>(&mut self, what: &'static str, len: u32) -> R<Idx<T>> {
+        match self.word()? {
+            raw if raw < len => Ok(idx(raw)),
+            raw => Err(self.past(what, raw, len)),
+        }
+    }
+
+    /// An expression of the body's store.
+    fn expr(&mut self, what: &'static str) -> R<ExprId> {
+        self.below(what, self.exprs)
+    }
+
+    /// A pattern of the body's store.
+    fn pat(&mut self, what: &'static str) -> R<PatId> {
+        self.below(what, self.pats)
+    }
+
+    /// A binding of the body's store.
+    fn binding(&mut self, what: &'static str) -> R<BindingId> {
+        self.below(what, self.bindings)
+    }
+
+    /// A `for const` loop's binder, `what` naming the field: a universe index, at most
+    /// [`UniverseIndex::MAX_AS_U32`] (`ComptimeBinder::ty` makes the universe of it, which
+    /// asserts that).
+    fn binder(&mut self, what: &'static str) -> R<ComptimeBinder> {
+        let universes = u64::from(UniverseIndex::MAX_AS_U32) + 1;
+        match self.word()? {
+            raw if u64::from(raw) < universes => Ok(ComptimeBinder(raw)),
+            raw => Err(self.past(what, raw, universes)),
+        }
+    }
+
+    /// An index of one of the body's own tables already read, of `len` rows.
+    fn own(&mut self, what: &'static str, len: usize) -> R<u32> {
+        let raw = self.word()?;
+        match (raw as usize) < len {
+            true => Ok(raw),
+            false => Err(self.past(what, raw, len as u64)),
         }
     }
 
     fn id<T: Relocate>(&mut self) -> R<T> {
+        let start = self.at;
         let bits = self.u64()?;
-        id_of(bits).ok_or_else(|| self.invalid("an id the record's table has no entry of its kind at"))
+        id_of(bits).map_err(|refused| refused.at(self.byte(start)))
     }
 
     fn ty(&mut self) -> R<StoredTy> {
@@ -1247,7 +1450,9 @@ impl<'a, 'db> Decode<'a, 'db> {
             return Ok(*made);
         }
         let (allocs, buffer): (&'a [Rel<AllocationRec>], &'a [u8]) = (self.allocs, self.buffer);
-        let rel = allocs.get(index).ok_or_else(|| self.invalid("an allocation past the body's"))?;
+        let rel = allocs.get(index).ok_or_else(|| {
+            self.past("an allocation operand's index, below the body's allocation count", index as u64, allocs.len() as u64)
+        })?;
         let record = rel.follow(buffer)?.ok_or_else(|| self.invalid("an allocation of no record"))?;
         let made = read_allocation(record, buffer, &self.tys)?.store();
         self.made[index] = Some(made);
@@ -1255,21 +1460,22 @@ impl<'a, 'db> Decode<'a, 'db> {
     }
 
     fn text(&mut self) -> R<&'a str> {
+        let word = self.at;
         let start = self.word()? as usize;
         let len = self.word()? as usize;
         let text: &'a [u8] = self.text;
         let bytes = start
             .checked_add(len)
             .and_then(|end| text.get(start..end))
-            .ok_or_else(|| self.invalid("text past the body's"))?;
-        std::str::from_utf8(bytes).map_err(|_| self.invalid("text that is not UTF-8"))
+            .ok_or_else(|| self.invalid_at(word, "text past the body's"))?;
+        std::str::from_utf8(bytes).map_err(|_| self.invalid_at(word, "text that is not UTF-8"))
     }
 
     fn local(&mut self) -> R<LocalId> {
         let raw = self.word()?;
         match raw < self.locals {
             true => Ok(idx(raw)),
-            false => Err(self.invalid("a local past the body's")),
+            false => Err(self.past("a local, below the body's local count", raw, self.locals)),
         }
     }
 
@@ -1277,7 +1483,7 @@ impl<'a, 'db> Decode<'a, 'db> {
         let raw = self.word()?;
         match raw < self.blocks {
             true => Ok(idx(raw)),
-            false => Err(self.invalid("a block past the body's")),
+            false => Err(self.past("a block, below the body's block count", raw, self.blocks)),
         }
     }
 
@@ -1285,12 +1491,12 @@ impl<'a, 'db> Decode<'a, 'db> {
         match self.word()? {
             0 => Ok(None),
             raw if raw - 1 < self.blocks => Ok(Some(idx(raw - 1))),
-            _ => Err(self.invalid("a block past the body's")),
+            raw => Err(self.past("an optional block, below the body's block count", raw - 1, self.blocks)),
         }
     }
 
-    fn locals(&mut self) -> R<Vec<LocalId>> {
-        let len = self.count()?;
+    fn locals(&mut self, what: &'static str) -> R<Vec<LocalId>> {
+        let len = self.count(what)?;
         // alloc: the body's own list, at its length
         let mut locals = Vec::with_capacity(len);
         for _ in 0..len {
@@ -1299,9 +1505,19 @@ impl<'a, 'db> Decode<'a, 'db> {
         Ok(locals)
     }
 
-    /// A list of `len` items, each read by `item`.
-    fn list<T>(&mut self, mut item: impl FnMut(&mut Self) -> R<T>) -> R<Vec<T>> {
-        let len = self.count()?;
+    /// The list `what` names, each item read by `item`.
+    fn list<T>(&mut self, what: &'static str, item: impl FnMut(&mut Self) -> R<T>) -> R<Vec<T>> {
+        self.list_of(what, 1, item)
+    }
+
+    /// The list `what` names, of items `words` words each at least, each read by `item`.
+    fn list_of<T>(
+        &mut self,
+        what: &'static str,
+        words: usize,
+        mut item: impl FnMut(&mut Self) -> R<T>,
+    ) -> R<Vec<T>> {
+        let len = self.count_of(what, words)?;
         // alloc: the body's own list, at its length
         let mut items = Vec::with_capacity(len);
         for _ in 0..len {
@@ -1318,13 +1534,15 @@ impl<'a, 'db> Decode<'a, 'db> {
             _ => return Err(self.invalid("a MIR phase of no kind")),
         };
         let inherits_overflow_checks = self.bool()?;
-        let local_count = self.count()?;
+        let local_count = self.count("the body's locals")?;
         let mut locals = Arena::with_capacity(local_count);
         for _ in 0..local_count {
             locals.alloc(Local { ty: self.ty()? });
         }
         self.locals = local_count as u32;
-        let block_count = self.count()?;
+        // A block is three words at least: its cleanup flag, its statements' count, its
+        // terminator's tag.
+        let block_count = self.count_of("the body's blocks", 3)?;
         self.blocks = block_count as u32;
         let start_block = self.block()?;
         let mut basic_blocks = Arena::with_capacity(block_count);
@@ -1332,11 +1550,20 @@ impl<'a, 'db> Decode<'a, 'db> {
             let block = self.basic_block()?;
             basic_blocks.alloc(block);
         }
-        let binding_count = self.count()?;
+        let binding_count = self.count_of("the body's binding locals", 2)?;
         let mut binding_locals = ArenaMap::with_capacity(binding_count);
         let mut last = None;
         for _ in 0..binding_count {
             let binding = self.word()?;
+            // The map is dense up to its last binding: one past the store's would size it by
+            // a damaged word, up to 2^32 slots.
+            if binding >= self.bindings {
+                return Err(self.past(
+                    "a binding mapped to a local, below the body's store's binding count",
+                    binding,
+                    self.bindings,
+                ));
+            }
             if last.is_some_and(|last| binding <= last) {
                 return Err(self.invalid("bindings out of order"));
             }
@@ -1344,21 +1571,29 @@ impl<'a, 'db> Decode<'a, 'db> {
             binding_locals.insert(idx(binding), self.local()?);
         }
         let upvar_locals = self.upvar_locals()?;
-        let param_locals = self.locals()?;
-        let promoted_locals = self.list(|it| Ok((it.local()?, idx(it.word()?))))?;
-        let closures = self.list(|it| it.id())?;
+        let param_locals = self.locals("the body's parameter locals")?;
+        let promoted_locals = self.list_of("the body's promoted locals", 2, |it| {
+            Ok((it.local()?, it.expr("a promoted local's expression, below the store's expression count")?))
+        })?;
+        let closures = self.list_of("the body's closures", 2, |it| it.id())?;
         let coroutine = match self.word()? {
             0 => None,
             1 => Some(CoroutineLocals { poll: self.local()?, context: self.local()? }),
             _ => return Err(self.invalid("a coroutine's locals of no kind")),
         };
-        let unreached = self.list(|it| it.block())?;
-        let scope_ends = self.locals()?;
-        let upvars_in_place = self.list(|it| Ok((it.local()?, it.word()?)))?;
-        let panic_unwinds =
-            self.list(|it| Ok((it.block()?, it.word()? as usize, it.block()?)))?;
-        let promoted_constants = self.locals()?;
-        let unreachable_after_calls = self.list(|it| {
+        let unreached = self.list("the body's unreached blocks", |it| it.block())?;
+        let scope_ends = self.locals("the body's scope ends")?;
+        let upvars_in_place =
+            self.list_of("the body's upvars in place", 2, |it| Ok((it.local()?, it.word()?)))?;
+        let panic_unwinds = self.list_of("the body's panic unwinds", 3, |it| {
+            let block = it.block()?;
+            let statements = basic_blocks[block].statements.len();
+            let statement = it.own("a panic unwind's statement, below its block's statement count", statements)?;
+            Ok((block, statement as usize, it.block()?))
+        })?;
+        let promoted_constants = self.locals("the body's promoted constants")?;
+        // Two spans of a word at least, a description, a type.
+        let unreachable_after_calls = self.list_of("the body's unreachable calls", 4, |it| {
             let call = it.span()?;
             let next = it.span()?;
             let descr = match it.word()? {
@@ -1368,9 +1603,14 @@ impl<'a, 'db> Decode<'a, 'db> {
             };
             Ok(UnreachableAfterCall { call, next, descr, ty: it.ty()? })
         })?;
-        let guard_refs = self.list(|it| Ok((it.local()?, idx(it.word()?))))?;
-        let capture_copies = self.list(|it| Ok((it.local()?, FieldIndex(it.word()?))))?;
-        let inlined = self.inlined()?;
+        let guard_refs = self.list_of("the body's guard references", 2, |it| {
+            Ok((it.local()?, it.binding("a guard reference's binding, below the store's binding count")?))
+        })?;
+        let capture_copies = self.list_of("the body's capture copies", 2, |it| {
+            Ok((it.local()?, FieldIndex(it.word()?)))
+        })?;
+        // Built MIR has no inlined code (`Encode::inlined`).
+        let inlined = Inlined::default();
         Ok(MirBody {
             basic_blocks,
             locals,
@@ -1410,18 +1650,23 @@ impl<'a, 'db> Decode<'a, 'db> {
     fn upvar_locals(
         &mut self,
     ) -> R<HashMap<BindingId, Vec<(LocalId, closure_analysis::Place)>, Global>> {
-        let len = self.count()?;
+        // A captured binding and its places' count.
+        let len = self.count_of("the body's captured bindings", 2)?;
         // alloc: the body's own map, at its length
         let mut upvars = HashMap::with_capacity_in(len, Global);
         let mut last = None;
         for _ in 0..len {
-            let binding = self.word()?;
-            if last.is_some_and(|last| binding <= last) {
+            let binding = self.binding("a captured binding, below the store's binding count")?;
+            let raw = binding.into_raw().into_u32();
+            if last.is_some_and(|last| raw <= last) {
                 return Err(self.invalid("captured bindings out of order"));
             }
-            last = Some(binding);
-            let places = self.list(|it| Ok((it.local()?, it.capture_place()?)))?;
-            upvars.insert(idx(binding), places);
+            last = Some(raw);
+            // A local, then a place: its base type, its base's tag, its projections' count.
+            let places = self.list_of("a captured binding's places", 4, |it| {
+                Ok((it.local()?, it.capture_place()?))
+            })?;
+            upvars.insert(binding, places);
         }
         Ok(upvars)
     }
@@ -1432,11 +1677,14 @@ impl<'a, 'db> Decode<'a, 'db> {
         let base = match self.word()? {
             0 => PlaceBase::Rvalue,
             1 => PlaceBase::StaticItem,
-            2 => PlaceBase::Local(idx(self.word()?)),
-            3 => PlaceBase::Upvar { closure: idx(self.word()?), var_id: idx(self.word()?) },
+            2 => PlaceBase::Local(self.binding("a captured place's binding, below the store's binding count")?),
+            3 => PlaceBase::Upvar {
+                closure: self.expr("a captured upvar's closure, below the store's expression count")?,
+                var_id: self.binding("a captured upvar's binding, below the store's binding count")?,
+            },
             _ => return Err(self.invalid("a captured place's base of no kind")),
         };
-        let projections = self.list(|it| {
+        let projections = self.list_of("a captured place's projections", 2, |it| {
             let ty = it.ty()?;
             let kind = match it.word()? {
                 0 => ProjectionKind::Deref,
@@ -1451,39 +1699,10 @@ impl<'a, 'db> Decode<'a, 'db> {
         Ok(closure_analysis::Place { base_ty, base, projections: projections.into_boxed_slice() })
     }
 
-    fn inlined(&mut self) -> R<Inlined<'db>> {
-        let callees = self.list(|it| {
-            let body = match it.word()? {
-                0 => InlinedBody::Fn(it.id()?),
-                1 => InlinedBody::Closure(it.id()?),
-                _ => return Err(it.invalid("an inlined body of no kind")),
-            };
-            Ok(InlinedCallee { body, args: it.args()?, written_checked: it.bool()? })
-        })?;
-        let scopes = self.list(|it| Ok(InlinedScope { callee: it.word()?, call_site: it.span()? }))?;
-        let spans = self.list(|it| Ok(InlinedSpan { scope: it.word()?, span: it.span()? }))?;
-        let bindings = self.list(|it| {
-            Ok(InlinedBinding { scope: it.word()?, binding: idx(it.word()?), local: it.local()? })
-        })?;
-        let promoted = self.list(|it| {
-            Ok(InlinedPromoted { local: it.local()?, callee: it.word()?, expr: idx(it.word()?) })
-        })?;
-        let devirtualized = self.list(|it| {
-            let mut digest = [0; 32];
-            for word in digest.chunks_exact_mut(4) {
-                word.copy_from_slice(&it.word()?.to_le_bytes());
-            }
-            Ok(digest)
-        })?;
-        // alloc: empty, so never allocated: only optimized bodies have specialized calls
-        let specialized = Vec::new();
-        // Only optimized bodies have allocations moved into their frame.
-        Ok(Inlined { callees, scopes, spans, bindings, promoted, devirtualized, specialized, moved_to_frame: 0 })
-    }
-
     fn basic_block(&mut self) -> R<BasicBlock> {
         let is_cleanup = self.bool()?;
-        let statements = self.list(|it| {
+        // A statement's tag and a span of a word at least.
+        let statements = self.list_of("a block's statements", 2, |it| {
             let kind = it.statement()?;
             Ok(Statement { kind, span: it.span()? })
         })?;
@@ -1498,15 +1717,18 @@ impl<'a, 'db> Decode<'a, 'db> {
         Ok(BasicBlock { statements, terminator, is_cleanup })
     }
 
+    /// A span of the body, of its store: never an inlined span, which only optimized MIR has.
     fn span(&mut self) -> R<MirSpan> {
         Ok(match self.word()? {
-            0 => MirSpan::ExprId(idx(self.word()?)),
-            1 => MirSpan::ExprEnd(idx(self.word()?)),
-            2 => MirSpan::PatId(idx(self.word()?)),
-            3 => MirSpan::BindingId(idx(self.word()?)),
+            0 => MirSpan::ExprId(self.expr("a span's expression, below the store's expression count")?),
+            1 => MirSpan::ExprEnd(self.expr("a span's expression end, below the store's expression count")?),
+            2 => MirSpan::PatId(self.pat("a span's pattern, below the store's pattern count")?),
+            3 => MirSpan::BindingId(self.binding("a span's binding, below the store's binding count")?),
             4 => MirSpan::SelfParam,
             5 => MirSpan::Unknown,
-            6 => MirSpan::Inlined(self.word()?),
+            6 => {
+                return Err(self.invalid("an inlined span, which only optimized MIR has and is never kept"));
+            }
             _ => return Err(self.invalid("a span of no kind")),
         })
     }
@@ -1522,7 +1744,7 @@ impl<'a, 'db> Decode<'a, 'db> {
 
     fn place(&mut self) -> R<StoredPlace> {
         let local = self.local()?;
-        let len = self.count()?;
+        let len = self.count("a place's projections")?;
         let mut elems: SmallVec<[PlaceElem; 8]> = SmallVec::with_capacity(len);
         for _ in 0..len {
             elems.push(match self.word()? {
@@ -1536,7 +1758,10 @@ impl<'a, 'db> Decode<'a, 'db> {
                 },
                 4 => ProjectionElem::Subslice { from: self.u64()?, to: self.u64()? },
                 5 => ProjectionElem::Downcast(self.variant()?),
-                6 => ProjectionElem::ReflectedField(ComptimeBinder(self.word()?)),
+                6 => {
+                    let what = "a reflected field's binder, below the universe count";
+                    ProjectionElem::ReflectedField(self.binder(what)?)
+                }
                 _ => return Err(self.invalid("a projection of no kind")),
             });
         }
@@ -1576,7 +1801,7 @@ impl<'a, 'db> Decode<'a, 'db> {
         let Some(MirSpan::ExprId(expr)) = span else {
             return Err(self.invalid("a location slot with no expression"));
         };
-        let locations = self.locations.ok_or_else(|| self.invalid("a location slot in a body read with none"))?;
+        let locations = self.locations;
         if !locations.has(expr) {
             return Err(self.invalid("a location slot of an expression that is no location literal now"));
         }
@@ -1592,7 +1817,8 @@ impl<'a, 'db> Decode<'a, 'db> {
     }
 
     fn operands(&mut self) -> R<Box<[Operand]>> {
-        self.list(|it| it.operand()).map(Vec::into_boxed_slice)
+        // An operand is three words at least: its span's tag, its kind's tag, one more.
+        self.list_of("a list of operands", 3, |it| it.operand()).map(Vec::into_boxed_slice)
     }
 
     fn bin_op(&mut self) -> R<BinOp> {
@@ -1684,7 +1910,26 @@ impl<'a, 'db> Decode<'a, 'db> {
                     3 => {
                         let union = self.id()?;
                         let parent = self.variant()?;
-                        let local_id: LocalFieldId = idx(self.word()?);
+                        match parent {
+                            VariantId::UnionId(it) if it == union => {}
+                            VariantId::UnionId(_) => {
+                                return Err(self.invalid("a union aggregate's field of another union"));
+                            }
+                            VariantId::StructId(_) => {
+                                let what = "a union aggregate's field of a struct, not its union";
+                                return Err(self.invalid(what));
+                            }
+                            VariantId::EnumVariantId(_) => {
+                                let what = "a union aggregate's field of an enum variant, not its union";
+                                return Err(self.invalid(what));
+                            }
+                        }
+                        // A query, outside the relocating scope (`ids::relocating`'s contract):
+                        // the union's fields are hir-def's and name no id of the record.
+                        let fields = crate::check_cache::outside(|| parent.fields(self.db).fields().len());
+                        let fields = table_len(fields);
+                        let local_id: LocalFieldId =
+                            self.below("a union aggregate's field, below its union's field count", fields)?;
                         AggregateKind::Union(union, FieldId { parent, local_id })
                     }
                     4 => AggregateKind::Closure(self.ty()?),
@@ -1712,11 +1957,19 @@ impl<'a, 'db> Decode<'a, 'db> {
     }
 
     fn inline_asm(&mut self) -> R<InlineAsm> {
-        let template = self.list(|it| {
+        // The largest operand index of the template and the word it is at: the operands it
+        // indexes come next.
+        let mut most: Option<(u32, usize)> = None;
+        // A piece is three words: its tag and two.
+        let template = self.list_of("an `asm!` template", 3, |it| {
             Ok(match it.word()? {
                 0 => AsmPiece::Lit(Box::from(it.text()?)),
                 1 => {
-                    let index = it.word()? as usize;
+                    let index = it.word()?;
+                    if most.is_none_or(|(most, _)| index > most) {
+                        most = Some((index, it.at - 1));
+                    }
+                    let index = index as usize;
                     let modifier = match it.word()? {
                         0 => None,
                         code => Some(
@@ -1729,7 +1982,7 @@ impl<'a, 'db> Decode<'a, 'db> {
                 _ => return Err(it.invalid("a template piece of no kind")),
             })
         })?;
-        let operands = self.list(|it| {
+        let operands = self.list("an `asm!` block's operands", |it| {
             Ok(match it.word()? {
                 0 => {
                     let reg = match it.word()? {
@@ -1750,6 +2003,12 @@ impl<'a, 'db> Decode<'a, 'db> {
                 _ => return Err(it.invalid("an `asm!` operand of no kind")),
             })
         })?;
+        if let Some((index, word)) = most
+            && index as usize >= operands.len()
+        {
+            let what = "an `asm!` template's operand, below the block's operand count";
+            return Err(self.past_at(word, what, index, operands.len() as u64));
+        }
         let options = u16::try_from(self.word()?)
             .ok()
             .and_then(AsmOptions::from_bits)
@@ -1787,12 +2046,18 @@ impl<'a, 'db> Decode<'a, 'db> {
             0 => TerminatorKind::Goto { target: self.block()? },
             1 => {
                 let discr = self.operand()?;
-                let len = self.count()?;
+                // A value is a `u128`, four words.
+                let len = self.count_of("a switch's values", 4)?;
                 let mut values = SmallVec::with_capacity(len);
                 for _ in 0..len {
                     values.push(self.u128()?);
                 }
-                let len = self.count()?;
+                // `SwitchTargets::new` makes one target a value and the last for the rest.
+                let len = self.count("a switch's targets")?;
+                if len != values.len() + 1 {
+                    let what = "a switch's targets, one more than its values";
+                    return Err(self.past(what, len as u64, values.len() as u64 + 1));
+                }
                 let mut targets = SmallVec::with_capacity(len);
                 for _ in 0..len {
                     targets.push(self.block()?);
@@ -1859,7 +2124,7 @@ impl<'a, 'db> Decode<'a, 'db> {
                 unwind: self.opt_block()?,
             },
             15 => TerminatorKind::ComptimeFor {
-                binder: ComptimeBinder(self.word()?),
+                binder: self.binder("a `for const` loop's binder, below the universe count")?,
                 domain: self.ty()?,
                 body: self.block()?,
                 after: self.block()?,

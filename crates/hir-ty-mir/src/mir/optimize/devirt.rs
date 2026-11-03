@@ -33,15 +33,21 @@
 //! looked at: the facts are of concrete object types.
 
 use blaze_mem::Frame;
-use hir_def::{CallableDefId, FunctionId, ItemContainerId};
+use either::Either;
+use hir_def::{
+    CallableDefId, FunctionId, ItemContainerId,
+    attrs::AttrFlags,
+    signatures::{FunctionSignature, ImplSignature},
+};
 use hir_ty::{
     GenericPredicates,
-    method_resolution::is_dyn_method,
+    method_resolution::{NoImplMethod, is_dyn_method},
     mir::devirt::{self, ABSENT, Object, Target, World},
     next_solver::{
         DbInterner, GenericArg, GenericArgs, Region, RegionExt as _, Ty, TyKind,
         infer::traits::{Obligation, ObligationCause},
     },
+    traits::ParamEnvAndCrate,
 };
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::{
@@ -53,7 +59,7 @@ use crate::mir::{
     BasicBlock, BasicBlockId, BinOp, CastKind, Local, LocalId, MirBody, MirLowerError, Operand, OperandKind, Place, ProjectionElem, Rvalue, Statement, StatementKind, SwitchTargets,
     Terminator, TerminatorKind, transform::Ctx,
 };
-use crate::{db::HirDatabase as _, infer::PointerCast};
+use crate::{db::HirDatabase as _, infer::PointerCast, mir::location::track_caller};
 
 use super::{Result, block_index};
 
@@ -81,15 +87,22 @@ pub(super) fn devirtualize<'db>(
             body.owner
         )));
     };
-    let _span = tracing::info_span!(
+    let span = tracing::info_span!(
         target: "blaze",
         "devirtualize",
         body = ?body.owner,
         world = ?id,
         program = %world.program,
         speculate,
-    )
-    .entered();
+        krate = tracing::field::Empty,
+        function = tracing::field::Empty,
+    );
+    // The body's crate and path, so a profile says whose `dyn` calls were made direct.
+    let span = match body.owner {
+        hir_ty::InferBodyId::DefWithBodyId(def) => hir_def::span_names::of_body(ctx.db, def, span),
+        hir_ty::InferBodyId::AnonConstId(_) => span,
+    };
+    let _span = span.entered();
     // Block order, the order `inlined.devirtualized` records in: new blocks are allocated past
     // the ones looked at.
     let blocks = body.basic_blocks.len();
@@ -97,7 +110,7 @@ pub(super) fn devirtualize<'db>(
         let block = BasicBlockId::from_raw(la_arena::RawIdx::from_u32(at as u32));
         let Some(site) = site(ctx, body, block, behind) else { continue };
         let Some(object) = world.object(&site.key) else {
-            body.inlined.devirtualized.push(ABSENT.0);
+            body.inlined.read_devirt(ABSENT.0);
             tracing::info!(
                 target: "blaze",
                 block = block_index(block),
@@ -106,8 +119,11 @@ pub(super) fn devirtualize<'db>(
             );
             continue;
         };
-        body.inlined.devirtualized.push(object.digest.0);
-        match plan(ctx, &site, object, &world, speculate) {
+        // alloc: one byte a target, a handful a call
+        let mut found = vec![Found::Unasked; object.targets.len()];
+        let plan = plan(ctx, &site, object, &world, speculate, &mut found);
+        body.inlined.read_devirt(site_digest(object, &found));
+        match plan {
             Plan::Keep(reason) => tracing::info!(
                 target: "blaze",
                 block = block_index(block),
@@ -204,6 +220,73 @@ fn erased<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
     rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_erased(interner))
 }
 
+/// What the body's crate found of one target of the object, in the object's order: beside
+/// the object's facts, what a site's plan depends on. Which impls a crate sees follows from its
+/// dependencies, which its code hash leaves out, so a site's digest holds these (rule 18).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum Found {
+    /// Not looked up: the plan was decided without it.
+    Unasked = 0,
+    /// Its type does not meet the call's projection bounds.
+    OutOfBounds = 1,
+    /// The solver can't say whether its type meets them; the call is kept.
+    Undecided = 2,
+    /// Its method is one a direct call may name ([`sees`]).
+    Seen = 3,
+    /// Its method is not ([`Unseen`]): the `dyn` call takes it.
+    Unseen = 4,
+}
+
+/// The digest a site records in `Inlined::devirtualized`: the object's, when the body's crate
+/// saw every target it looked up and none was out of the bounds or undecided, so a body built
+/// where every impl is seen keeps the object's digest; otherwise the object's with what was
+/// found of each target ([`devirt::site_digest`]).
+fn site_digest(object: &Object, found: &[Found]) -> [u8; 32] {
+    if found.iter().all(|it| matches!(it, Found::Unasked | Found::Seen)) {
+        return object.digest.0;
+    }
+    // alloc: one byte a target, a handful a call
+    let found: Vec<u8> = found.iter().map(|it| *it as u8).collect();
+    devirt::site_digest(&object.digest, &found).0
+}
+
+/// Why a direct call may not name a target's method.
+#[derive(Clone, Copy, Debug)]
+enum Unseen {
+    /// The body's crate finds no method for it: its impl is in a crate the body's does not
+    /// depend on (impls are looked up in the crates a crate loads), or the lookup fails so.
+    NoMethod(NoImplMethod),
+    /// The impl's method is `#[track_caller]` and the trait's declaration is not: a `dyn` call
+    /// reports the declaration's location, a direct one the call's (`Specialize` refuses the
+    /// same).
+    TrackCaller,
+    /// The method is a `default fn` or an item of a `default impl`: an impl the body's crate
+    /// does not see may specialize it.
+    Specializable,
+}
+
+impl Unseen {
+    fn describe(self) -> String {
+        match self {
+            // alloc: a reason, once a call kept
+            Unseen::NoMethod(why) => {
+                format!("it finds no method ({}): an impl in a crate it does not depend on is not seen there", why.describe())
+            }
+            Unseen::TrackCaller => {
+                "its method is `#[track_caller]` where the trait's declaration is not, so a direct call would report \
+                 another location"
+                    .to_owned()
+            }
+            Unseen::Specializable => {
+                "its method is a `default fn` or of a `default impl`, which an impl the crate does not see may \
+                 specialize"
+                    .to_owned()
+            }
+        }
+    }
+}
+
 enum Plan<'db> {
     Keep(String),
     /// Compare the vtable against each of `guarded` in order and call its method on a match;
@@ -218,17 +301,19 @@ fn plan<'db>(
     object: &Object,
     world: &World,
     speculate: bool,
+    found: &mut [Found],
 ) -> Plan<'db> {
     let keep = Plan::Keep;
     // The targets this `dyn` type can be: its projection bounds (`Item = u32`) are not part of
     // the vtable's key, so a type whose `Item` differs is not one of this call's. One the
     // solver can't decide keeps the call: dropping a type the object may be would be wrong.
-    let mut targets: Vec<&Target> = Vec::with_capacity(object.targets.len()); // alloc: a handful a call
-    for target in object.targets.iter() {
+    let mut targets: Vec<(usize, &Target)> = Vec::with_capacity(object.targets.len()); // alloc: a handful a call
+    for (at, target) in object.targets.iter().enumerate() {
         match bounds_hold(ctx, site.dyn_ty, target.ty.as_ref()) {
-            Some(true) => targets.push(target),
-            Some(false) => {}
+            Some(true) => targets.push((at, target)),
+            Some(false) => found[at] = Found::OutOfBounds,
             None => {
+                found[at] = Found::Undecided;
                 return keep(format!(
                     "can't tell whether {:?} meets the projection bounds of {}",
                     target.ty.as_ref(),
@@ -249,23 +334,45 @@ fn plan<'db>(
             object.name,
             targets.len()
         )),
-        // One type: every object of the type is of it, whichever copy of its vtable it holds,
-        // so no compare.
-        None if targets.len() == 1 => {
-            Plan::Rewrite { guarded: Vec::new(), last: Some(targets[0].ty.as_ref()), outcome: "direct" }
-        }
-        // A compare of each, and the `dyn` call past them: a vtable is one object per content
-        // in a staged image, but not in a lazy run, nor where two origins' settings key one
-        // method twice (docs/v2/plan/lanes/codegen/devirt.md, "Vtable identity"). Past the
-        // compares is where an object with another copy of a listed type's vtable goes.
-        None => Plan::Rewrite { guarded: tys(&targets), last: None, outcome: "compared" },
-        Some(open) => {
-            let hottest = targets
-                .iter()
-                .copied()
-                .filter(|it| it.count.is_some())
-                .min_by(|a, b| b.count.cmp(&a.count).then(a.id.0.cmp(&b.id.0)));
-            match hottest.filter(|_| speculate) {
+        None => match seen(ctx, site, &targets, found) {
+            // One type: every object of the type is of it, whichever copy of its vtable it
+            // holds, so no compare.
+            (seen, None) if seen.len() == 1 => {
+                Plan::Rewrite { guarded: Vec::new(), last: Some(seen[0].ty.as_ref()), outcome: "direct" }
+            }
+            (seen, Some((unseen, why))) if seen.is_empty() => keep(format!(
+                "the body's crate {} can't name the method of {} for {:?}: {}",
+                hir_def::deps::crate_name(ctx.db, ctx.krate()),
+                object.name,
+                unseen.ty.as_ref(),
+                why.describe()
+            )),
+            // A compare of each, and the `dyn` call past them: a vtable is one object per
+            // content in a staged image, but not in a lazy run, nor where two origins'
+            // settings key one method twice (docs/v2/plan/lanes/codegen/devirt.md, "Vtable
+            // identity"). Past the compares is where an object with another copy of a listed
+            // type's vtable goes, and one of a type the body can't name the method of.
+            (seen, _) => Plan::Rewrite { guarded: tys(&seen), last: None, outcome: "compared" },
+        },
+        Some(open) if speculate => {
+            // Only a type the profile counts can be the hottest: those are looked up, hottest
+            // first (ties by content), up to the first whose method the body's crate can name,
+            // and only those are recorded, so an open object with no counts costs no lookup
+            // and keeps the object's digest.
+            let mut counted: Vec<(usize, &Target)> = // alloc: a handful a call
+                targets.iter().copied().filter(|(_, it)| it.count.is_some()).collect();
+            counted.sort_by(|(_, a), (_, b)| b.count.cmp(&a.count).then(a.id.0.cmp(&b.id.0)));
+            let hottest = counted.into_iter().find_map(|(at, target)| match sees(ctx, site, target.ty.as_ref()) {
+                Ok(()) => {
+                    found[at] = Found::Seen;
+                    Some(target)
+                }
+                Err(_) => {
+                    found[at] = Found::Unseen;
+                    None
+                }
+            });
+            match hottest {
                 Some(hottest) => {
                     Plan::Rewrite { guarded: tys(&[hottest]), last: None, outcome: "speculated" }
                 }
@@ -273,14 +380,67 @@ fn plan<'db>(
                 None => keep(format!("{} in {} is open: {open}", object.name, world.program)),
             }
         }
+        // alloc: a reason, once a call kept
+        Some(open) => keep(format!("{} in {} is open: {open}", object.name, world.program)),
     }
+}
+
+/// The targets of `targets` whose method a direct call may name ([`sees`]), in order, each
+/// looked up once and recorded in `found`; and the first that is not, with why.
+fn seen<'t, 'db>(
+    ctx: &Ctx<'_, 'db>,
+    site: &Site<'db>,
+    targets: &[(usize, &'t Target)],
+    found: &mut [Found],
+) -> (Vec<&'t Target>, Option<(&'t Target, Unseen)>) {
+    let mut seen = Vec::with_capacity(targets.len()); // alloc: a handful a call
+    let mut unseen = None;
+    for &(at, target) in targets {
+        match sees(ctx, site, target.ty.as_ref()) {
+            Ok(()) => {
+                found[at] = Found::Seen;
+                seen.push(target);
+            }
+            Err(why) => {
+                found[at] = Found::Unseen;
+                unseen = unseen.or(Some((target, why)));
+            }
+        }
+    }
+    (seen, unseen)
+}
+
+/// Whether a direct call in the body's crate may name `site`'s method for `ty`, as the code
+/// generator resolves it there: the crate finds the method (the impl's, or the trait's own
+/// where the lookup rightly leaves it to later), the method reports the location a `dyn` call
+/// does, and no impl the crate does not see may specialize it.
+fn sees<'db>(ctx: &Ctx<'_, 'db>, site: &Site<'db>, ty: Ty<'db>) -> std::result::Result<(), Unseen> {
+    let mut args: Vec<GenericArg<'db>> = site.args.iter().collect(); // alloc: a call's generic arguments
+    args[0] = ty.into();
+    let env = ParamEnvAndCrate { param_env: ctx.env, krate: ctx.krate() };
+    let (method, _) = crate::mir::dispatch::impl_method(ctx.db, env, site.method, GenericArgs::new_from_slice(&args))
+        .map_err(Unseen::NoMethod)?;
+    // A builtin derive's method: the compiler's, never `#[track_caller]` nor specialized.
+    let Either::Left(func) = method else { return Ok(()) };
+    let declared = AttrFlags::query(ctx.db, site.method.into()).contains(AttrFlags::TRACK_CALLER);
+    if func != site.method && !declared && track_caller(ctx.db, func) {
+        return Err(Unseen::TrackCaller);
+    }
+    // Conservative where an impl's item is inherited along a specialization chain: rustc
+    // finalizes such an item at the leaf impl, which the lookup does not name.
+    if let ItemContainerId::ImplId(impl_id) = func.loc(ctx.db).container
+        && (FunctionSignature::of(ctx.db, func).is_default() || ImplSignature::of(ctx.db, impl_id).is_default())
+    {
+        return Err(Unseen::Specializable);
+    }
+    Ok(())
 }
 
 /// Hottest first where the profile counts every target, else in the world's order (by
 /// content); ties by content. Either is the same for the same facts.
-fn order(targets: &mut [&Target]) {
-    if targets.iter().all(|it| it.count.is_some()) {
-        targets.sort_by(|a, b| b.count.cmp(&a.count).then(a.id.0.cmp(&b.id.0)));
+fn order(targets: &mut [(usize, &Target)]) {
+    if targets.iter().all(|(_, it)| it.count.is_some()) {
+        targets.sort_by(|(_, a), (_, b)| b.count.cmp(&a.count).then(a.id.0.cmp(&b.id.0)));
     }
 }
 

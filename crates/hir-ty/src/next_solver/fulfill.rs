@@ -36,8 +36,11 @@ pub(crate) struct Pending<'db> {
     watches: watch::Watches,
 }
 
+// Padded to the watches' alignment (8, for their `u64`s), which on a 32-bit target is more
+// than a `Vec`'s; on a 64-bit target the sum is already a multiple of it.
 const _: () = assert!(
-    size_of::<Pending<'static>>() == 5 * size_of::<Vec<u8>>() + size_of::<watch::Watches>()
+    size_of::<Pending<'static>>()
+        == (5 * size_of::<Vec<u8>>() + size_of::<watch::Watches>()).next_multiple_of(align_of::<watch::Watches>())
 );
 
 impl<'db> Pending<'db> {

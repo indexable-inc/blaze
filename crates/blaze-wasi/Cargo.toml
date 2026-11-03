@@ -1,0 +1,26 @@
+[package]
+name = "blaze-wasi"
+description = "WASI preview 1 as blaze serves it to a wasm guest: one implementation of every call's memory layout, for 32-bit (wasm32-wasip1) and 64-bit (memory64) pointers, over a System that says what each call does (the macro sandbox's, the seed runner's)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+# The seed's own calls (`seed::link`), for the seed runner: its fibers run on Wasmtime's async
+# fibers, which no wasm build of Wasmtime has, so the macro host (built into the seed too) goes
+# without.
+seed = ["wasmtime/async"]
+
+[dependencies]
+wasmtime.workspace = true
+
+[lints]
+workspace = true

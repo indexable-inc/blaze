@@ -58,6 +58,16 @@ pub fn builds(root: &Path) -> PathBuf {
     root.join("build")
 }
 
+/// Where the daemon keeps the packages it fetches: `sources` under [`root`], laid out as
+/// cargo lays out its home (`registry/src/<registry dir>/<name>-<version>`,
+/// `git/checkouts/<ident>/<commit>`), each package mounted where it is and written there
+/// for what reads it from disk (a build script, the C compiler it runs). Never `$CARGO_HOME`:
+/// blaze keeps no packages of cargo's there. No `v2` in it: a fetched package is
+/// the same in every format of the daemon's state.
+pub fn sources(root: &Path) -> PathBuf {
+    root.join("sources")
+}
+
 /// The id of the workspace at `workspace_root`: the BLAKE3 of its path's bytes in
 /// [`WORKSPACE_ID_DOMAIN`]. The caller names the root as the daemon does, absolute with
 /// symlinks resolved (the process's real current directory), so that a client and the daemon

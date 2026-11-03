@@ -317,6 +317,20 @@ pub fn could_not_compile_into<'a>(
 ) {
     out.push_str("could not compile ");
     unit_named_into(out, package, target, test);
+    previous_into(out, errors, warnings);
+}
+
+/// `` could not compile `foo` (lib doctest) due to 1 previous error ``: a library's doc tests
+/// that failed to build, named as its doc tests and not as the library, whose unit built.
+pub fn doctests_could_not_compile_into(out: &mut String, package: &str, errors: u32, warnings: u32) {
+    out.push_str("could not compile `");
+    out.push_str(package);
+    out.push_str("` (lib doctest)");
+    previous_into(out, errors, warnings);
+}
+
+/// `` due to 1 previous error; 1 warning emitted ``, what ends a "could not compile".
+fn previous_into(out: &mut String, errors: u32, warnings: u32) {
     // Writing to a String cannot fail.
     let _ = match errors {
         0 => Ok(()),

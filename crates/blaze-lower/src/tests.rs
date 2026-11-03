@@ -227,6 +227,7 @@ fn config(view: ContentId, library: ContentId) -> BuildConfig {
         library: LIBRARY.to_owned(),
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
+        sources: "/s/sources".to_owned(),
     }
 }
 
@@ -534,11 +535,69 @@ fn a_wasm_unit_is_a_crate_of_its_own_target() {
     assert_eq!(target(wasm_macro), ("wasm32-wasip1".to_owned(), true));
     assert_eq!(target(MACRO), (HOST.to_owned(), false));
     let cfg = krate(&built, wasm_macro).cfg_options(db).clone();
-    assert!(cfg.check_atom(&key_value("target_arch", "wasm32")) && cfg.check_atom(&key_value("target_os", "wasi")));
-    assert!(!cfg.check_atom(&key_value("target_os", "linux")));
+    assert!(cfg.check_atom(&key_value("target_arch", "wasm32")) && !cfg.check_atom(&key_value("target_os", "linux")));
+    let core = krate(&built, wasm_core).cfg_options(db).clone();
+    assert!(core.check_atom(&key_value("target_arch", "wasm32")) && core.check_atom(&key_value("target_os", "wasi")));
     let (native, wasm) = (built.lowered.identity(MACRO), built.lowered.identity(wasm_macro));
     assert!(native.is_some() && wasm.is_some());
     assert_ne!(native, wasm, "a unit's identity names its target");
+}
+
+/// [`with_a_wasm_macro`]'s `units` with a lib of `a` for the macro host whose root is `root`,
+/// named `name`. Returns its index.
+fn push_wasm_lib(units: &mut Units, wasm_core: usize, name: &str, root: &str) -> usize {
+    let at = units.graph.units.len();
+    let mut lib = units.graph.units[LIB].clone();
+    lib.target = target("lib", name, root, "2021");
+    lib.platform = Some("wasm32-wasip1".to_owned());
+    lib.macro_wasm = true;
+    lib.dependencies = vec![dep(wasm_core, "core", true)];
+    units.graph.units.push(lib);
+    // clone: a test's fixture.
+    units.plans.push(UnitPlan { macro_wasm: true, ..units.plans[LIB].clone() });
+    at
+}
+
+/// A crate built to run in the macro host that links `proc_macro` (a proc macro, or a root
+/// with an `extern crate proc_macro` item under any cfg) is told no `target_os` and no
+/// `target_family`, as rustc builds it for the host: synstructure gates `decl_derive!` on
+/// `not(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "wasi")))`, and
+/// blaze's own `crates/macros` uses it. Every other crate of the macro host keeps the
+/// platform's cfg whole, and a refresh that moves the answer lowers anew.
+#[test]
+fn a_macro_host_crate_that_links_proc_macro_is_told_the_hosts_side() {
+    let (mut units, wasm_core, wasm_macro) = with_a_wasm_macro();
+    let links = push_wasm_lib(&mut units, wasm_core, "a", "/w/a/src/lib.rs");
+    let unlinked = push_wasm_lib(&mut units, wasm_core, "a_more", "/w/a/src/more.rs");
+    let gated: &'static [u8] = b"#[cfg(all(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"wasi\"))), feature = \"fast\"))]\nextern crate proc_macro;\n";
+    let unrelated: &'static [u8] =
+        b"extern crate proc_macro2; // extern crate proc_macro;\nconst _: &str = \"extern crate proc_macro;\";\n";
+    let tree = MemTree::default();
+    let files = [("a/src/lib.rs", Some(gated)), ("a/src/more.rs", Some(unrelated))];
+    let mut built = lowered_with(&units, &tree, &files).unwrap();
+    let db = built.lowered.db();
+    let cfg = |unit| krate(&built, unit).cfg_options(db).clone();
+    for unit in [wasm_macro, links] {
+        let cfg = cfg(unit);
+        assert!(cfg.check_atom(&key_value("target_arch", "wasm32")), "unit {unit} keeps the code's arch");
+        assert!(!cfg.check_atom(&key_value("target_os", "wasi")), "unit {unit} links proc_macro: no target_os");
+        assert!(!cfg.check_atom(&key_value("target_family", "wasm")), "unit {unit} links proc_macro: no target_family");
+    }
+    for unit in [wasm_core, unlinked] {
+        let cfg = cfg(unit);
+        assert!(cfg.check_atom(&key_value("target_os", "wasi")), "unit {unit} does not link proc_macro");
+        assert!(cfg.check_atom(&key_value("target_family", "wasm")), "unit {unit} does not link proc_macro");
+    }
+    assert!(cfg(MACRO).check_atom(&key_value("target_os", "linux")), "the native proc macro is the host's");
+
+    let config_of = |root| config(root, library_with_proc_macro(&tree));
+    let refresh = |built: &mut Built, more: &'static [u8]| {
+        let root = changed(&tree, &[("a/src/lib.rs", Some(gated)), ("a/src/more.rs", Some(more))]);
+        let config = config_of(root);
+        built.lowered.refresh(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }, |_| Ok(()))
+    };
+    assert_eq!(refresh(&mut built, b"pub fn more() {}\n"), Ok(true), "still links no proc_macro");
+    assert_eq!(refresh(&mut built, b"extern crate proc_macro;\n"), Ok(false), "now links proc_macro: another cfg");
 }
 
 #[test]

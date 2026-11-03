@@ -581,6 +581,11 @@ compiler is gone too. Every block is assembled by the pinned LLVM's MC assembler
 nothing else; a blaze built without LLVM, and a set `BLAZE_ASSEMBLER`, are errors that say so,
 never a run of the machine's clang or `cc`, whose output no key named.
 
+2026-11-02 (the `seedstd` lane): a blaze built without LLVM and with `--features rsasm` (the
+seed) assembles every block with rsasm in process (`crates/hir-ty-codegen/asm/rsasm.rs`); one
+with neither is still an error. Making rsasm the one assembler of every build is in
+[todo/bootstrap/plan.md](../todo/bootstrap/plan.md), "std and assembly in the seed".
+
 **D. blaze's verdict is the final word.** ([#84](https://github.com/indexable-inc/blaze/issues/84)) An error is blaze's, written as rustc writes it,
 with the status cargo returns; the build does not go to cargo to have rustc print it.
 `blaze check` is rust-analyzer's diagnostics and blaze's borrow checker, with the deny

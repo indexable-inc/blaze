@@ -2,7 +2,8 @@
 //! server (the harness side, [`crate::test::fork_server`]) say on the Unix socket blaze listens
 //! on. This file is compiled twice: as this module of blaze, and as text inside the harness of
 //! every test binary blaze writes, in whatever edition the tested crate has. So it names
-//! everything from `::std` and `::core`, uses nothing of blaze and nothing an edition changes,
+//! everything from `std` (the harness's own `extern crate std`, which a `#![no_std]` crate's
+//! extern prelude lacks) and `::core`, uses nothing of blaze and nothing an edition changes,
 //! has no `unsafe` (blaze-usercode forbids it), and holds no tests (they are in
 //! `crate::test`'s).
 //!
@@ -597,7 +598,7 @@ impl<'a> Cursor<'a> {
 
     fn string(&mut self, what: &str) -> Result<&'a str, String> {
         let bytes = self.bytes(what)?;
-        match ::std::str::from_utf8(bytes) {
+        match std::str::from_utf8(bytes) {
             Ok(text) => Ok(text),
             Err(_) => Err(format!("the {} of a frame is not UTF-8", what)), // alloc: error path
         }

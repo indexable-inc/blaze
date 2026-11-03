@@ -10,9 +10,14 @@
 //!   (`lookup_impl_method`), sorted: a method left generic resolves to itself, and the
 //!   instance's type arguments say the rest;
 //! - for each trait object an unsize coercion makes, the key of the trait and of each of its
-//!   supertraits with the value of every impl of it (`all_impls_value`), sorted: the methods
-//!   the vtable holds are the impls' items of the trait's names, by key. Which impl the source
-//!   type picks is left to that set, so it changes with any impl of the trait.
+//!   supertraits with the value of every impl of it the item's crate sees
+//!   (`seen_impls_value`), sorted: the methods the vtable holds are the impls' items of the
+//!   trait's names, by key. Which impl the source type picks is left to that set, so it
+//!   changes with any impl of the trait in a crate the item's crate loads. An impl in a crate
+//!   it does not load can't be picked by a type its body names, and the vtable a generic body
+//!   makes of a downstream type is its instance's, among that instance's refs; so another
+//!   crate of the graph (a sibling member or test target, one that fails to type-check) never
+//!   reaches the hash.
 //!
 //! It is no part of [`crate::CodeHash`]: codegen's memo is keyed as before.
 //!
@@ -72,7 +77,7 @@ fn bound_of(db: &Db, id: ItemId) -> Result<Option<ContentId>, Unhashable> {
         }
         h.update(&(reached.traits.len() as u64).to_le_bytes());
         for &(key, trait_) in reached.traits.iter() {
-            h.id(&key.0).id(&index::all_impls_value(db, trait_)?);
+            h.id(&key.0).id(&index::seen_impls_value(db, id.krate(db), trait_)?);
         }
         Ok(Some(h.finish()))
     })
@@ -94,7 +99,7 @@ fn reached<'db, 'f>(
     env: ParamEnvAndCrate<'db>,
     frame: &'f Frame,
 ) -> Result<Reached<'f>, Unhashable> {
-    let no_mir = |_| Unhashable { item: id, what: "its MIR failed to lower" };
+    let no_mir = |_| Unhashable::of(id, "its MIR failed to lower");
     // alloc: std's set takes no allocator; one per bound hash.
     let mut seen: HashSet<Either<InternedClosureId<'db>, InternedCoroutineId<'db>>, Global> =
         HashSet::new_in(Global);

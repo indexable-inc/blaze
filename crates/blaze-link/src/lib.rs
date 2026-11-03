@@ -15,7 +15,7 @@
 //! The one `unsafe` block is `intern::name_at`'s `from_utf8_unchecked` of names it appended as
 //! `&str`s.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, variant_count)]
 #![deny(unsafe_code)]
 
 mod arena;
@@ -496,7 +496,7 @@ impl Image {
         stage.lazy_hook()?;
         stage.referrers();
         stage.needs()?;
-        stage.sweep();
+        stage.sweep()?;
         stage.cells_of_removed();
         stage.asan_globals(&change)?;
         stage.dangling()?;
@@ -707,6 +707,28 @@ impl Image {
         Ok(out)
     }
 
+    /// The whole file as the last commit left it, at the generation it is at: for a caller
+    /// whose link would change nothing, so it keeps the file it has rather than stage a new
+    /// generation (whose build id alone differs). An error before the first commit or while
+    /// one is in flight, naming the image.
+    pub fn file(&self) -> Result<Vec<u8>, LinkError> {
+        if !self.state.laid_out || self.pending.is_some() {
+            return Err(LinkError {
+                function: None,
+                refusal: None,
+                // alloc: error path
+                what: format!("{}: no committed file to give: the image is not laid out, or a commit is in flight", self.to),
+            });
+        }
+        // alloc: the file, which the caller owns
+        let mut out = vec![0; self.state.file_len as usize];
+        for (at, bytes) in &file::whole(&self.state) {
+            let at = *at as usize;
+            out[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        Ok(out)
+    }
+
     /// Each table the image keeps as `(name, elements, bytes)`, for `blaze inspect tables`
     /// (`blaze_api::Response::Tables`): `relocation` and the rest.
     pub fn tables(&self) -> Vec<(&'static str, u64, u64)> {
@@ -804,7 +826,7 @@ pub fn fuzz_read(format: Format, arch: blaze_codegen::Arch, kind: NativeKind, by
         sanitize: blaze_codegen::settings::Sanitize::default(),
         // alloc: a fuzz target's setup, once per input
         rpaths: Vec::new(),
-        triple: match (format, arch) { (Format::Elf, blaze_codegen::Arch::Aarch64) => "aarch64-unknown-linux-gnu", (Format::Elf, _) => "x86_64-unknown-linux-gnu", (Format::MachO, blaze_codegen::Arch::X86_64) => "x86_64-apple-darwin", (Format::MachO, _) => "aarch64-apple-darwin", (Format::Pe, _) => "x86_64-pc-windows-msvc", (Format::Wasm, _) => "wasm32-unknown-unknown" }.into(),
+        triple: match (format, arch) { (Format::Elf, blaze_codegen::Arch::Aarch64) => "aarch64-unknown-linux-gnu", (Format::Elf, _) => "x86_64-unknown-linux-gnu", (Format::MachO, blaze_codegen::Arch::X86_64) => "x86_64-apple-darwin", (Format::MachO, _) => "aarch64-apple-darwin", (Format::Pe, _) => "x86_64-pc-windows-msvc", (Format::Wasm, blaze_codegen::Arch::Wasm64) => "wasm64-blaze-wasip1", (Format::Wasm, _) => "wasm32-unknown-unknown" }.into(),
     };
     model::writer(&output).is_ok_and(|writer| writer.read("fuzz", bytes, &kind).is_ok())
 }

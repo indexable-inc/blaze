@@ -205,10 +205,11 @@ fn context(db: &Db, raw: u32) -> Result<SyntaxContext, String> {
         return Ok(ctx);
     }
     let storage = db.storage();
-    let owned = raw < Id::MAX_U32
-        && storage
-            .owner(Id::from_u32(raw + 1))
-            .is_some_and(|owner| storage.ingredient_name(owner) == "SyntaxContextImpl");
+    let owned = raw
+        .checked_add(1)
+        .and_then(Id::new)
+        .and_then(|id| storage.owner(id))
+        .is_some_and(|owner| storage.ingredient_name(owner) == "SyntaxContextImpl");
     match owned {
         true => Ok(ctx),
         // alloc: the message of a question refused.

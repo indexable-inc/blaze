@@ -87,6 +87,9 @@ use crate::serve::{
 pub struct Real {
     fetcher: Fetcher<blaze_registry::http::HyperHttp>,
     shared: Arc<Shared>,
+    /// blaze's sources directory ([`blaze_manifest::home::sources`]), the one place a fetched
+    /// package is written on disk ([`crate::serve::fetch::keep_on_disk`]).
+    sources: PathBuf,
 }
 
 /// What every job's front shares: the daemon's paths, what was read of the machine's files,
@@ -111,7 +114,7 @@ pub(crate) struct Shared {
 }
 
 impl Real {
-    pub fn new(paths: &Paths) -> Result<Real, String> {
+    pub fn new(paths: &Paths, sources: PathBuf) -> Result<Real, String> {
         let fetcher = Fetcher::new(paths.state.join("fetch"))?;
         let tools = paths.state.join("tools");
         stand_ins(&tools, &paths.launcher)?;
@@ -128,7 +131,7 @@ impl Real {
             selectors: test::image::Selectors::default(),
             dev_runs: run::inproc::DevRuns::new(paths.state.join("inproc")),
         };
-        Ok(Real { fetcher, shared: Arc::new(shared) })
+        Ok(Real { fetcher, shared: Arc::new(shared), sources })
     }
 }
 
@@ -162,7 +165,9 @@ impl Steps for Real {
     type Runs = UnitRuns;
 
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
-        self.fetcher.fetch(fetch)
+        let source = self.fetcher.fetch(fetch)?;
+        crate::serve::fetch::keep_on_disk(fetch, &source, &self.sources)?;
+        Ok(source)
     }
 
     fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError> {
@@ -283,7 +288,7 @@ impl Steps for Real {
                 {
                     true => (lowered.into_inner(), Some(session), seeds),
                     false => {
-                        let why = "the view moves the workspace's root or what its root manifest sets, which every crate is made with";
+                        let why = "the view moves the workspace's root or what its root manifest sets, which every crate is made with, or whether a crate of the macro host links proc_macro, which its cfg is made with";
                         let checkout = input.config.invocation.root.as_str();
                         {
                             let variable = "";
@@ -500,6 +505,26 @@ fn seed(db: &base_db::Db, seeds: &[blaze_intent::Seed]) -> Result<(), blaze_lowe
 
 fn lower_error(error: blaze_lower::LowerError) -> ApiError {
     ApiError::new(error.what, error.at)
+}
+
+/// `Ok` once every proc macro `krate` can expand is built in the view `db` is of; otherwise an
+/// error naming the answer (`work`: "reach", "edit", "ahead"), the target, the crate and the
+/// proc macro. The backstop of the job's order, which builds and applies a view's proc macros
+/// and build scripts' runs before any answer that reads its def maps unbuilt is posted
+/// (`Jobs::next`, `reads_front_unbuilt`): an error here is a unit that order left out, never a
+/// read of a half-expanded crate. The one check every such answer makes.
+pub(crate) fn answer_macros_built(db: &Db, krate: base_db::Crate, target: &str, work: &str) -> Result<(), Failed> {
+    blaze_items::macros_built(db, krate).map_err(|pending| {
+        Failed::Error(ApiError::new(
+            // alloc: error path
+            format!(
+                "the {work}'s answer in `{target}` can't be told before its proc macros are built, and it was posted \
+                 with one not built (the job builds the proc macros and build scripts each view applies first): {}",
+                pending.describe(db)
+            ),
+            Some(work.to_owned()),
+        ))
+    })
 }
 
 impl KeptDb for KeptLowered {
@@ -1004,8 +1029,6 @@ pub(crate) struct Job {
     /// Each build script run prepared by `fresh`, taken by `script`, so it is prepared once.
     /// Only the loop touches it: the lock is never contended.
     pub(crate) starts: Box<[Mutex<Option<Box<script::Start>>>]>,
-    /// The crates built for build scripts and proc macros, as the code generator takes them.
-    pub(crate) build_time: OnceLock<std::sync::Arc<hir_ty_codegen::v2::BuildTime>>,
     /// The profiles its units' `-C profile-use`s name, read and given to the code generator
     /// once, and held while the job lives.
     pub(crate) profiles: OnceLock<codegen::Profiles>,
@@ -1040,6 +1063,9 @@ pub(crate) struct Job {
     /// Every memo entry each unit's build took or put ([`blaze_codegen::driver::Built::memo_used`]),
     /// by unit, set once at its link; held with its front end once it is kept.
     pub(crate) memo_used: Box<[OnceLock<Vec<ContentId>>]>,
+    /// Each `Doctest` unit's examples and runner, made into crates on the loop's writer
+    /// ([`compile::doctest::expand`]), by unit.
+    pub(crate) doctests: Box<[OnceLock<compile::doctest::Expanded>]>,
     /// What the head's last build used of the memo, kept there until this job's front end is.
     _held: Option<memo::Held>,
 }
@@ -1066,7 +1092,6 @@ impl Job {
             inert: (0..slots).map(|_| Default::default()).collect(),
             pure: (0..slots).map(|_| Default::default()).collect(),
             starts: (0..slots).map(|_| Mutex::new(None)).collect(),
-            build_time: Default::default(),
             profiles: Default::default(),
             counted: (0..slots).map(|_| Default::default()).collect(),
             lint_profiles: Default::default(),
@@ -1078,6 +1103,7 @@ impl Job {
             _seeded: Vec::new(),
             memo,
             memo_used: (0..slots).map(|_| Default::default()).collect(),
+            doctests: (0..slots).map(|_| Default::default()).collect(),
             _held: held,
         })
     }
@@ -1129,6 +1155,7 @@ impl Job {
         Ok(UnitOf {
             id,
             test: matches!(unit.mode, Mode::Test) || (matches!(unit.mode, Mode::Check) && unit.checked_as_test),
+            doctest: matches!(unit.mode, Mode::Doctest),
             package_id: unit.pkg_id.clone(),
             manifest_path: package.manifest_path.clone(),
             target: unit_target(unit)?,

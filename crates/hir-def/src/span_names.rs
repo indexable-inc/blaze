@@ -8,7 +8,9 @@
 //! file's impls, `<impl#3>`; a block by its body and its ordinal among that item's blocks,
 //! `outer::{block#2}`; a `const _` by its ordinal, `_#1`; a closure, an `async` block and an
 //! anonymous const by their expression in the body, `outer::{closure#14}`; a node a macro
-//! wrote also by the call, `<impl#0 in macro call 3fa2.5>`; a build script by its package,
+//! wrote also by the call, `<impl#0 in macro call 3fa2.5>`, and by each enclosing call out to
+//! the source file when the call is in a macro's output too,
+//! `<impl#0 in macro call c6a9.0 in macro call 77e1.3>`; a build script by its package,
 //! `build_script[serde]::main`. The path is written into the span's one buffer: no part of it
 //! takes a buffer of its own.
 //!
@@ -135,13 +137,13 @@ pub fn of_file(db: &Db, file: HirFileId, krate: Crate, span: tracing::Span) -> t
     span
 }
 
-/// Writes `krate`'s name and the path `path` writes in `span`'s fields `krate` and `function`,
-/// reading nothing into the running query. The path's queries may name spans of their own, so
-/// each span has its own buffer.
+/// Writes `krate`'s label ([`write_crate_label`]) and the path `path` writes in `span`'s fields
+/// `krate` and `function`, reading nothing into the running query. The path's queries may name
+/// spans of their own, so each span has its own buffer.
 fn name(db: &Db, krate: Crate, span: &tracing::Span, path: impl FnOnce(&mut String)) {
     // alloc: only while a subscriber records the span, which interns it
     let mut text = String::new();
-    span_text(db, &mut text, |db, text| text.push_str(crate_name(db, krate)));
+    span_text(db, &mut text, |db, text| write_crate_label(db, krate, text));
     let krate_len = text.len();
     span_text(db, &mut text, |_, text| path(text));
     span.record("krate", &text[..krate_len]);
@@ -157,7 +159,65 @@ fn span_text(db: &Db, out: &mut String, write: impl FnOnce(&Db, &mut String)) {
     blaze_query::db::for_span_text(db, out, write);
 }
 
-/// `krate`'s display name, `{crate}` for one with none: a span's `krate`.
+/// `span`, a span that declares `krate`, with `krate`'s label written in it
+/// ([`write_crate_label`]), reading nothing into the running query.
+pub fn with_crate(db: &Db, krate: Crate, span: tracing::Span) -> tracing::Span {
+    if !span.is_disabled() {
+        // alloc: only while a subscriber records the span, which interns it
+        let mut text = String::new();
+        span_text(db, &mut text, |db, text| write_crate_label(db, krate, text));
+        span.record("krate", text.as_str());
+    }
+    span
+}
+
+/// What a span's `krate` says: the crate as one build of it, `name vVERSION (kind[, for])`, so
+/// the copies of one package a build makes are told apart, where its name alone made a survey
+/// read different bodies as work done again: `serde v1.0.219 (lib)`, its `cfg(test)` copy
+/// `serde v1.0.219 (lib-test)`, the proc macros' wasm copy `serde v1.0.219 (lib, wasm)`, a
+/// `--target` copy `serde v1.0.219 (lib, x86_64-unknown-linux-gnu)`, and each version apart.
+/// No version for a crate with none; `{crate}` for the name of one with none.
+pub fn write_crate_label(db: &Db, krate: Crate, out: &mut String) {
+    let (data, extra) = (krate.data(db), krate.extra_data(db));
+    out.push_str(crate_name(db, krate));
+    if let Some(version) = &extra.version {
+        out.push_str(" v");
+        out.push_str(version);
+    }
+    out.push_str(" (");
+    out.push_str(kind_label(data.target_kind, data.manifest_kind));
+    match (&extra.built_for.platform, extra.built_for.macro_wasm) {
+        (_, true) => out.push_str(", wasm"),
+        (Some(triple), false) => {
+            out.push_str(", ");
+            out.push_str(triple.as_str());
+        }
+        (None, false) => {}
+    }
+    out.push(')');
+}
+
+/// A crate's kind in its label: what it is built as, and a `--test` or `--bench` crate's
+/// target before it (`lib-test`), as cargo names a unit's target and mode.
+fn kind_label(kind: TargetKind, manifest: TargetKind) -> &'static str {
+    match (kind, manifest) {
+        (TargetKind::Test, TargetKind::Lib { .. }) => "lib-test",
+        (TargetKind::Test, TargetKind::Bin) => "bin-test",
+        (TargetKind::Test, TargetKind::Example) => "example-test",
+        (TargetKind::Test, TargetKind::Bench) | (TargetKind::Bench, TargetKind::Bench) => "bench",
+        (TargetKind::Bench, TargetKind::Lib { .. }) => "lib-bench",
+        (TargetKind::Bench, _) => "bench",
+        (TargetKind::Test, _) => "test",
+        (TargetKind::Lib { is_proc_macro: true }, _) => "proc-macro",
+        (TargetKind::Lib { is_proc_macro: false }, _) => "lib",
+        (TargetKind::Bin, _) => "bin",
+        (TargetKind::Example, _) => "example",
+        (TargetKind::BuildScript, _) => "build-script",
+        (TargetKind::Other, _) => "other",
+    }
+}
+
+/// `krate`'s display name, `{crate}` for one with none: the name in its label.
 pub fn crate_name(db: &Db, krate: Crate) -> &str {
     match &krate.extra_data(db).display_name {
         Some(name) => name.crate_name().symbol().as_str(),
@@ -406,11 +466,19 @@ fn write_ordinal(db: &Db, file: HirFileId, id: ErasedFileAstId, out: &mut String
 }
 
 /// ` in macro call 3fa2.5` for a node of `file` when a macro call's expansion is the file: the
-/// call by its hash and ordinal in its own file.
+/// call by its hash and ordinal in its own file, and, when that file is a macro's output too,
+/// the call that wrote it, out to the source file: ` in macro call c6a9.0 in macro call
+/// 77e1.3`. A call's ordinal counts within its own file only, so the inner calls of two outer
+/// calls (cranelift's `entity_impl!` calling itself, 15 entities) are one ordinal of one hash;
+/// without the outer call their bodies shared a name (selfbuild2: 1,691 of the test run's
+/// `mir_body_query` "repeats" were such bodies). The chain ends: each macro file is the
+/// expansion of a call in a file made before it.
 fn write_macro_call(db: &Db, file: HirFileId, out: &mut String) {
-    if let HirFileId::MacroFile(call) = file {
+    let mut file = file;
+    while let HirFileId::MacroFile(call) = file {
         let kind = &call.lookup(db).kind;
         let at = kind.erased_ast_id();
         _ = write!(out, " in {} {:04x}.{}", kind.descr(), at.hash_value(), at.index());
+        file = kind.file_id();
     }
 }

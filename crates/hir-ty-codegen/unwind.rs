@@ -83,7 +83,7 @@ pub(super) struct FrameRows {
 pub(super) fn on_entry(arch: super::Arch) -> &'static [FrameRule] {
     match arch {
         super::Arch::Aarch64 => &[FrameRule::Cfa(31, 0)],
-        super::Arch::Wasm32 => &[],
+        super::Arch::Wasm32 | super::Arch::Wasm64 => &[],
         super::Arch::X86_64 => &[FrameRule::Cfa(7, 8), FrameRule::Offset(16, -8)],
     }
 }

@@ -30,7 +30,7 @@ use hir_expand::{
 };
 use intern::sym;
 use smallvec::SmallVec;
-use span::FileAstId;
+use span::{Edition, FileAstId, SyntaxContext};
 use syntax::ast;
 use triomphe::Arc;
 
@@ -40,16 +40,15 @@ use crate::{
     item_tree::{AttrsOrCfgRef, ImportKind, ModItemId, ModItemKind, TreeId},
     macro_call_as_call_id,
     nameres::{
-        DefMap, DiagnosticsByModule, LocalDefMap, MacroSubNs, ModuleData, ModuleOrigin,
+        DefMap, DiagnosticsByModule, Hygienic, LocalDefMap, MacroSubNs, ModuleData, ModuleOrigin,
         ModuleScope, ModulesMap, ModulesSlot,
         attr_resolution::{attr_macro_as_call_id, derive_macro_as_call_id},
         crate_def_map,
         diagnostics::DefDiagnostic,
-        path_resolution::ResolveMode,
         sub_namespace_match,
         uses::{DeriveHelperUse, NameRecords},
     },
-    per_ns::{Item, PerNs},
+    per_ns::{Item, Namespace, PerNs},
     visibility::Visibility,
 };
 
@@ -165,25 +164,41 @@ struct Round<'a, 'f> {
     deferred_eager: &'a mut bool,
 }
 
-/// What `path` names as a macro of the sub-namespace `subns` in `module`.
+/// What `path` names as a macro of the sub-namespace `subns` in `module`, `ctxt` the syntax
+/// context of its first segment: a `macro`'s def-site hygiene ([`DefMap::hygienic_origin`]).
 fn resolve_macro<'db, S: Sink<'db>>(
     sink: &S,
     module: ModuleId,
     path: &ModPath,
     subns: MacroSubNs,
+    ctxt: SyntaxContext,
+) -> Option<(MacroId, MacroDefId)> {
+    let db = sink.db();
+    let def_map = sink.def_map();
+    let origin = def_map.hygienic_origin(db, module, path, Some(Namespace::Macros), ctxt);
+    resolve_macro_from(sink, module, path, subns, origin)
+}
+
+/// [`resolve_macro`] from `origin`.
+fn resolve_macro_from<'db, S: Sink<'db>>(
+    sink: &S,
+    module: ModuleId,
+    path: &ModPath,
+    subns: MacroSubNs,
+    origin: Hygienic,
 ) -> Option<(MacroId, MacroDefId)> {
     let db = sink.db();
     sink.def_map()
-        .resolve_path_fp_with_macro(
+        .resolve_path_from(
             sink.local_def_map(),
             db,
-            ResolveMode::Other,
             module,
             path,
             BuiltinShadowMode::Module,
             Some(subns),
+            origin,
         )
-        .resolved_def
+        .0
         .take_macros()
         .map(|it| (it, it.definition(db)))
 }
@@ -194,13 +209,19 @@ fn resolve_macro_def<'db, S: Sink<'db>>(
     module: ModuleId,
     path: &ModPath,
     subns: MacroSubNs,
+    ctxt: SyntaxContext,
 ) -> Option<MacroDefId> {
     let db = sink.db();
-    resolve_macro(sink, module, path, subns).map(|(_, it)| it).or_else(|| {
+    let origin = sink.def_map().hygienic_origin(db, module, path, Some(Namespace::Macros), ctxt);
+    resolve_macro_from(sink, module, path, subns, origin).map(|(_, it)| it).or_else(|| {
         // A `macro_rules!` only the textual scope has, named where a call that resolves late
         // (an eager one, as `include!` from the prelude) names it: rquickjs-sys's
         // `include!(concat!("bindings/", bindings_env!("TARGET"), ".rs"))`, after an `include!`
-        // from `OUT_DIR` that defines `bindings_env!`.
+        // from `OUT_DIR` that defines `bindings_env!`. A path a `macro` wrote is looked up
+        // where its hygiene says, textual scopes included.
+        if origin != Hygienic::Here {
+            return None;
+        }
         let name = path.as_ident()?;
         sink.def_map()
             .legacy_macro_in_textual_scope(db, module, name)
@@ -245,7 +266,13 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                 directive.depth,
                 view.def_map().recursion_limit(),
                 |path| {
-                    let def = resolve_macro_def(view, module, path, MacroSubNs::Bang);
+                    // The call's own path carries its context; a path in its eager arguments is
+                    // looked up where the call is.
+                    let ctxt = match path == &ast_id.path {
+                        true => *call_site,
+                        false => SyntaxContext::root(Edition::Edition2015),
+                    };
+                    let def = resolve_macro_def(view, module, path, MacroSubNs::Bang, ctxt);
                     unresolved.set(unresolved.get() || def.is_none());
                     if let Some(def) = def
                         && path != &ast_id.path
@@ -298,7 +325,7 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                 *derive_pos as u32,
                 *call_site,
                 krate,
-                |path| resolve_macro(view, module, path, MacroSubNs::Attr),
+                |path| resolve_macro(view, module, path, MacroSubNs::Attr, unhygienic()),
                 *derive_macro_id,
                 directive.depth,
             );
@@ -362,7 +389,7 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
             {
                 let view: &S = sink;
                 let helper_of = |derive_path: &ModPath| {
-                    let (macro_id, def) = resolve_macro(view, module, derive_path, MacroSubNs::Attr)?;
+                    let (macro_id, def) = resolve_macro(view, module, derive_path, MacroSubNs::Attr, unhygienic())?;
                     if def.krate == krate {
                         return None;
                     }
@@ -386,7 +413,7 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                 }
             }
 
-            let def = match resolve_macro_def(&*sink, module, path, MacroSubNs::Attr) {
+            let def = match resolve_macro_def(&*sink, module, path, MacroSubNs::Attr, unhygienic()) {
                 Some(def) if def.is_attribute() => def,
                 _ => return Resolved::No,
             };
@@ -460,7 +487,7 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                                 idx as u32,
                                 call_site.ctx,
                                 krate,
-                                |path| resolve_macro(view, module, path, MacroSubNs::Attr),
+                                |path| resolve_macro(view, module, path, MacroSubNs::Attr, unhygienic()),
                                 call_id,
                                 directive.depth,
                             );
@@ -729,7 +756,7 @@ pub(crate) fn unresolved_macro_diagnostics<'db, 'p, S: Sink<'db>>(
                     cx.krate,
                     directive.depth,
                     view.def_map().recursion_limit(),
-                    |path| resolve_macro(view, module, path, MacroSubNs::Bang).map(|(_, it)| it),
+                    |path| resolve_macro(view, module, path, MacroSubNs::Bang, unhygienic()).map(|(_, it)| it),
                     // Global until `macro_call_as_call_id` takes `Vec<EagerCall, A>`.
                     // alloc: none unless an eager input holds macro calls; only the error is kept
                     &mut Vec::new(),
@@ -1517,4 +1544,10 @@ pub fn f() {}
             );
         }
     }
+}
+
+/// The context of a path no `macro` wrote, for an attribute's or derive's path and an eager
+/// call's: def-site hygiene is not applied to them (their directives keep no context per path).
+fn unhygienic() -> SyntaxContext {
+    SyntaxContext::root(Edition::Edition2015)
 }

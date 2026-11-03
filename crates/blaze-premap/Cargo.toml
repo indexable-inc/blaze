@@ -23,7 +23,7 @@ blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-inproc.workspace = true
 blaze-items.workspace = true
-blaze-link.workspace = true
+blaze-link = { workspace = true, features = ["llvm-stencils"] }
 blaze-mem.workspace = true
 
 [dev-dependencies]

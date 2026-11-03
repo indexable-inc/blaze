@@ -11,6 +11,8 @@ mod summary;
 mod tests;
 
 pub use check::{
-    Broken, Found, Held, HeldLocal, Point, Promise, Site, Why, may_suspend_at, on_fiber, suspend_check, suspend_points,
+    Broken, Found, Held, HeldLocal, Point, Promise, Site, Unchecked, Why, may_suspend_at, on_fiber, suspend_check,
+    suspend_points, unchecked,
 };
 pub use dispatch::Unseen;
+pub use root::MissingRoot;

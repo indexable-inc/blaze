@@ -1766,10 +1766,13 @@ pub struct Inlined<'db> {
     pub spans: Vec<InlinedSpan>,
     pub bindings: Vec<InlinedBinding>,
     pub promoted: Vec<InlinedPromoted>,
-    /// What `Devirtualize` read of the program's dyn facts ([`devirt::World`]), one entry a
-    /// call it looked at in block order: the digest of the object's facts, or
-    /// [`devirt::ABSENT`]. The code generator keys the body's code on them (rule 18), so a
-    /// body built against a world it no longer matches is not reused.
+    /// What `Devirtualize` read of the program's dyn facts ([`devirt::World`]): the digest of
+    /// each site's facts (the object's, or the site's where what the body's crate sees of its
+    /// targets counts), or [`devirt::ABSENT`]; each once, in the order first read
+    /// ([`Inlined::read_devirt`]). The pass runs before and after `Inline` and looks again at
+    /// a call it kept, which reads the same facts again. The code generator keys the body's
+    /// code on them (rule 18), so a body built against a world it no longer matches is not
+    /// reused.
     pub devirtualized: Vec<[u8; 32]>,
     /// By block, ascending; each block once. Written by the last pass, so the blocks are the
     /// body's own; nothing that inlines this body carries them over.
@@ -1785,6 +1788,14 @@ impl Inlined<'_> {
     /// Whether the body has no inlined code: [`Inlined::specialized`] calls are not inlined.
     pub fn is_empty(&self) -> bool {
         self.callees.is_empty()
+    }
+
+    /// Records that the body read the dyn facts `digest`, once however many sites or runs read
+    /// them: what keys the code is the set read, and the list stays in the order first read.
+    pub fn read_devirt(&mut self, digest: [u8; 32]) {
+        if !self.devirtualized.contains(&digest) {
+            self.devirtualized.push(digest);
+        }
     }
 
     fn shrink_to_fit(&mut self) {
@@ -2981,6 +2992,19 @@ impl MirOptions {
     /// Whether these ask for nothing beyond the runtime body: no passes and no checks.
     pub fn is_runtime(self) -> bool {
         self.level == MirOptLevel::Off && !self.ub_checks
+    }
+
+    /// These for a body built into the body of its caller, the one rule for every copy of a
+    /// body put in another: `hir-ty-mir`'s inliner (`callee_options`) and the code
+    /// generator's always-inliner (`hir-ty-codegen` `v2::build::Build::built_in`) both derive
+    /// theirs from it. It reads no dyn facts ([`Self::world`]): what the caller's own
+    /// `Devirtualize` reads over the copy after `Inline` is recorded in the caller's body
+    /// (`Inlined::devirtualized`), so the copy's code is its plain code, which is what a
+    /// caller's key names it by. It moves no allocation to the stack
+    /// ([`Self::heap_to_stack`]): its stack slots would be the caller's, and a caller may
+    /// recur, which `HeapToStack` never moves an allocation across (`escape.rs`).
+    pub fn built_in(self) -> MirOptions {
+        MirOptions { world: None, heap_to_stack: false, ..self }
     }
 }
 

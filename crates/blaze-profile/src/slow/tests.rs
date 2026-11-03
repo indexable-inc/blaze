@@ -135,3 +135,23 @@ fn a_worker_given_a_fraction_of_the_others_cpu_rate_is_starved_and_charged_its_p
     assert!(starved.evidence[0].contains("blaze-work-1"), "{:?}", starved.evidence);
     assert_eq!(starved.saves_ns, 90 * U);
 }
+
+/// Many jobs parked on one key the record never resumes: their parked time, each to the
+/// record's end, is told apart as waits that never end, its size the wall they cover, never
+/// summed into a wait class of millions of seconds.
+#[test]
+fn waits_the_record_never_ends_are_told_apart_by_the_wall_they_cover() {
+    let jobs: Vec<u64> = (1..=50).map(|it| 1 << 32 | it).collect();
+    let mut switches = Vec::new();
+    for (i, &job) in jobs.iter().enumerate() {
+        let thread = 10 + (i % 4) as u32;
+        switches.push(switch(thread, i as i64, Event::Started, job));
+        switches.push(switch(thread, i as i64 + 1, Event::Parked { on: WaitedOn::Key, value: 9 }, job));
+    }
+    let it = report(switches, Vec::new(), 100, &workers(10..=13));
+    let unended = it.blind_spots.iter().find(|it| it.kind == BlindKind::UnendedWait).unwrap_or_else(|| panic!("{:#?}", it.blind_spots));
+    assert!(unended.title.starts_with("50 waits never end in the record"), "{}", unended.title);
+    assert!(unended.hidden_ns <= 100 * U, "the wall the waits cover, not their sum: {}", unended.hidden_ns);
+    assert!(it.findings.iter().all(|it| it.kind != Kind::Wait), "no wait class holds them: {:#?}", it.findings);
+    assert!(it.blind_spots.iter().all(|it| it.kind != BlindKind::UnnamedWait), "{:#?}", it.blind_spots);
+}

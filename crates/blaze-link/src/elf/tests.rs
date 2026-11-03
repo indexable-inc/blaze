@@ -3,7 +3,8 @@ use object::{Endianness, SymbolIndex, elf};
 
 use super::dynamic::{elf_hash, gnu_hash};
 use super::image::section_name;
-use super::{Elf, Segment, in_file, section, writer};
+use super::{Elf, Segment, section, writer};
+use crate::model::zeroed;
 use parking_lot::Mutex;
 
 use crate::cow::CowBytes;
@@ -88,7 +89,7 @@ impl Fixture {
             addr += size;
         }
         let contents =
-            regions.iter().map(|it| if in_file(&it.class) { vec![0; it.size as usize] } else { Vec::new() }).collect();
+            regions.iter().map(|it| if !zeroed(&it.class) { vec![0; it.size as usize] } else { Vec::new() }).collect();
         Fixture {
             writer,
             plan,
@@ -419,7 +420,7 @@ fn an_executable_reads_back() {
             .iter()
             .find(|it| it.p_vaddr(endian) <= region.addr && end <= it.p_vaddr(endian) + it.p_memsz(endian))
             .unwrap_or_else(|| panic!("{:?} in no PT_LOAD", region.class));
-        if in_file(&region.class) {
+        if !zeroed(&region.class) {
             assert!(end <= load.p_vaddr(endian) + load.p_filesz(endian), "{:?} past the file", region.class);
         }
         let flags = load.p_flags(endian).0;
@@ -1742,7 +1743,7 @@ fn a_dev_executable_is_laid_out_for_its_start_hook() {
     );
     for class in [Class::Reserve(Reserve::Arena), Class::Reserve(Reserve::Cells), Class::Reserve(Reserve::Fixed)] {
         assert_eq!(image.writer.prot(&class), crate::model::Prot::NONE);
-        assert!(!in_file(&class));
+        assert!(zeroed(&class));
     }
     let (text, preinit, init) = (image.at(&Class::Text), image.at(&Class::PreinitArray), image.at(&Class::InitArray));
     image.put(&Class::PreinitArray, 0, &text.to_le_bytes());

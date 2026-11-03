@@ -69,8 +69,8 @@ pub use bound::{BOUND_DOMAIN, bound_hash};
 pub use facts::*;
 pub use form::{Nested, observes_names};
 pub use hash::{
-    Unhashable, closure_code, code_hash, coroutine_code, deep_hash, hashes, interface_hash,
-    layout_hash, signature_hash,
+    Unhashable, Unhashed, closure_code, code_hash, coroutine_code, deep_hash, hashes, interface_hash,
+    layout_hash, macros_built, signature_hash,
 };
 pub use index::*;
 pub use key::{Resolved, item_key, resolve};

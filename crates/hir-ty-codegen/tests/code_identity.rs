@@ -186,12 +186,23 @@ fn the_code_identity_hashes_every_input_the_code_generator_read() {
         })
     };
     let llvm_prefix = worked.llvm_prefix.as_ref().and_then(|it| it.canonicalize().ok());
+    // The seed's prebuilt stencil libraries: blaze-stencil includes only bytes the pin names,
+    // and only the pinned files in that directory, never anything else under it.
+    let stencils_dir = worked.stencils_dir.as_ref().and_then(|it| it.canonicalize().ok());
+    let pinned: Vec<&str> = worked.inputs.iter().filter(|it| it.kind == "stencils").map(|it| it.name.as_str()).collect();
+    let pinned_library = |path: &Path| {
+        stencils_dir.as_ref().is_some_and(|dir| {
+            path.parent() == Some(dir.as_path())
+                && path.file_name().and_then(|it| it.to_str()).is_some_and(|name| pinned.contains(&name))
+        })
+    };
     let dirs: Vec<PathBuf> = worked.dirs.iter().filter_map(|it| it.canonicalize().ok()).collect();
     let covered = |path: &Path| {
         files.contains(path)
             || in_registry(path)
             || made_by_closure(path)
             || llvm_prefix.as_ref().is_some_and(|it| path.starts_with(it))
+            || pinned_library(path)
     };
     // A path that is not there is hashed once made if it is in a package of the checkout and
     // in no part the hash skips (a dot name, or `target`, `tests`, `benches`, `examples` at the
@@ -302,6 +313,7 @@ fn the_code_identity_hashes_every_input_the_code_generator_read() {
                     || derived(var)
                     || var.starts_with("CARGO_FEATURE_")
                     || (var == blaze_codegen_code::LLVM_PREFIX && worked.inputs.iter().any(|it| it.kind == "llvm"))
+                    || (var == blaze_codegen_code::STENCILS_DIR && worked.inputs.iter().any(|it| it.kind == "stencils"))
                     || blaze_codegen_code::unkeyed_env(var).is_some();
                 if !keyed {
                     missing.push(format!("{package}'s build script reads ${var} ({})", output.display()));

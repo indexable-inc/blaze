@@ -799,9 +799,10 @@ fn std_key(
         Some(crates) if !for_macros => crates.clone(),
         _ => default_crates(triple).map_err(|what| LoadError { what, at: None })?,
     };
-    // cargo's `std_crates`: `test` when a unit is a test in libtest's harness.
+    // cargo's `std_crates`: `test` when a unit is a test in libtest's harness, or a library's
+    // doctests, whose runner is a libtest harness blaze writes (docs/v2/plan/doctests.md).
     let harnessed = !for_macros && graph.units.iter().any(|unit| {
-        unit.mode == Mode::Test && harness_of(unit, packages)
+        (unit.mode == Mode::Test && harness_of(unit, packages)) || unit.mode == Mode::Doctest
     });
     if crates.iter().any(|it| it == "std") && harnessed && !crates.iter().any(|it| it == "test") {
         crates.push("test".to_owned());
@@ -850,6 +851,8 @@ fn std_key(
         // As each of its units is compiled: std's units carry the build's base profile's name
         // (`foreign_units`) and, merged, `built_for` (`merge_std`).
         runs_here: schema::runs_here(built_for, &base.name),
+        // clone: the key owns its strings
+        codegen_backend: base.codegen_backend.clone(),
     })
 }
 
@@ -980,6 +983,9 @@ fn foreign_units(graph: &mut schema::UnitGraph, packages: &BySpec<'_>, ask: &For
         // The wasm macros' std: each unit for the triple is theirs, as `plan` keys and places it.
         unit.macro_wasm = ask.macro_wasm && unit.platform.is_some();
         unit.profile.name.clone_from(&ask.profile.name);
+        // Not a setting of the workspace's tables, which would need the `codegen-backend`
+        // cargo feature in library/Cargo.toml: the build's own, on every unit as it asked.
+        unit.profile.codegen_backend.clone_from(&ask.profile.codegen_backend);
         let script = unit.mode == Mode::RunCustomBuild || unit.target.is_custom_build();
         let aborts = packages
             .get(unit.pkg_id.as_str())

@@ -98,6 +98,66 @@ pub(crate) enum Op {
     SingleQuote,
 }
 
+/// Every [`Op`], in declaration order.
+const ALL: [Op; 47] = [
+    Op::Eq,
+    Op::Lt,
+    Op::Le,
+    Op::EqEq,
+    Op::Ne,
+    Op::Ge,
+    Op::Gt,
+    Op::AndAnd,
+    Op::OrOr,
+    Op::Bang,
+    Op::Tilde,
+    Op::Plus,
+    Op::Minus,
+    Op::Star,
+    Op::Slash,
+    Op::Percent,
+    Op::Caret,
+    Op::And,
+    Op::Or,
+    Op::Shl,
+    Op::Shr,
+    Op::PlusEq,
+    Op::MinusEq,
+    Op::StarEq,
+    Op::SlashEq,
+    Op::PercentEq,
+    Op::CaretEq,
+    Op::AndEq,
+    Op::OrEq,
+    Op::ShlEq,
+    Op::ShrEq,
+    Op::At,
+    Op::Dot,
+    Op::DotDot,
+    Op::DotDotDot,
+    Op::DotDotEq,
+    Op::Comma,
+    Op::Semi,
+    Op::Colon,
+    Op::PathSep,
+    Op::RArrow,
+    Op::LArrow,
+    Op::FatArrow,
+    Op::Pound,
+    Op::Dollar,
+    Op::Question,
+    Op::SingleQuote,
+];
+
+const _: () = {
+    assert!(ALL.len() == Op::SingleQuote as usize + 1);
+    let mut at = 0;
+    while at < ALL.len() {
+        assert!(ALL[at] as usize == at, "ALL is in Op's declaration order");
+        at += 1;
+    }
+};
+
 impl Op {
     /// rustc's `ToInternal` of a `Punct`.
     pub(crate) fn of(ch: u8) -> Option<Op> {
@@ -128,43 +188,19 @@ impl Op {
         })
     }
 
-    /// rustc's `Token::glue` of two punctuation tokens.
+    /// rustc's `Token::glue` of two punctuation tokens: [`tt::glue_str`], the one copy of the
+    /// rule, over their text.
     pub(crate) fn glue(self, next: Op) -> Option<Op> {
-        Some(match (self, next) {
-            (Op::Eq, Op::Eq) => Op::EqEq,
-            (Op::Eq, Op::Gt) => Op::FatArrow,
-            (Op::Lt, Op::Eq) => Op::Le,
-            (Op::Lt, Op::Lt) => Op::Shl,
-            (Op::Lt, Op::Le) => Op::ShlEq,
-            (Op::Lt, Op::Minus) => Op::LArrow,
-            (Op::Gt, Op::Eq) => Op::Ge,
-            (Op::Gt, Op::Gt) => Op::Shr,
-            (Op::Gt, Op::Ge) => Op::ShrEq,
-            (Op::Bang, Op::Eq) => Op::Ne,
-            (Op::Plus, Op::Eq) => Op::PlusEq,
-            (Op::Minus, Op::Eq) => Op::MinusEq,
-            (Op::Minus, Op::Gt) => Op::RArrow,
-            (Op::Star, Op::Eq) => Op::StarEq,
-            (Op::Slash, Op::Eq) => Op::SlashEq,
-            (Op::Percent, Op::Eq) => Op::PercentEq,
-            (Op::Caret, Op::Eq) => Op::CaretEq,
-            (Op::And, Op::Eq) => Op::AndEq,
-            (Op::And, Op::And) => Op::AndAnd,
-            (Op::Or, Op::Eq) => Op::OrEq,
-            (Op::Or, Op::Or) => Op::OrOr,
-            (Op::Shl, Op::Eq) => Op::ShlEq,
-            (Op::Shr, Op::Eq) => Op::ShrEq,
-            (Op::Dot, Op::Dot) => Op::DotDot,
-            (Op::Dot, Op::DotDot) => Op::DotDotDot,
-            (Op::DotDot, Op::Dot) => Op::DotDotDot,
-            (Op::DotDot, Op::Eq) => Op::DotDotEq,
-            (Op::Colon, Op::Colon) => Op::PathSep,
-            _ => return None,
-        })
+        tt::glue_str(self.text(), next.text()).and_then(Op::named)
+    }
+
+    /// The token written `text`.
+    fn named(text: &str) -> Option<Op> {
+        ALL.iter().copied().find(|op| op.text() == text)
     }
 
     /// `token_kind_to_string`.
-    pub(crate) fn text(self) -> &'static str {
+    pub(crate) const fn text(self) -> &'static str {
         match self {
             Op::Eq => "=",
             Op::Lt => "<",

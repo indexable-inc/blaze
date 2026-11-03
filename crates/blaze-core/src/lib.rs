@@ -15,7 +15,9 @@
 //! driver does. A process of [`Effect::Spawn`] in a sandbox is made
 //! by the [`Confine`] a driver is given; a driver given none refuses it.
 //!
-//! On Windows [`iocp::Iocp`]. Each target's is its [`Native`] driver.
+//! On Windows [`iocp::Iocp`]. On WASI (the wasm32-wasip1 seed, todo/bootstrap/plan.md)
+//! [`threads::Threads`], which starts no thread there and makes each file call as it is
+//! submitted. Each target's is its [`Native`] driver.
 //!
 //! Unsafe code is the kernel's and the mappings' only (docs/v2/plan/design/unsafe.md): each
 //! driver of a kernel interface is one module allowed it below, as are `fs::mapped`,
@@ -27,6 +29,10 @@
 // `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core`; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+// The seed's target (todo/bootstrap/plan.md): WASI's positional reads and writes
+// (`std::os::wasi::fs::FileExt`) and its random source (`std::random`), for temporary names
+// where there is no process id.
+#![cfg_attr(target_os = "wasi", feature(wasi_ext, random))]
 
 pub mod busy;
 #[cfg(target_os = "linux")]
@@ -770,6 +776,8 @@ pub type Native = uring::Uring;
 pub type Native = kqueue::Kqueue;
 #[cfg(windows)]
 pub type Native = iocp::Iocp;
+#[cfg(target_os = "wasi")]
+pub type Native = threads::Threads;
 
 /// This target's [`Native`] driver over `root`. `threads` sizes the pool kqueue and IOCP run
 /// file calls on; io_uring's off-ring errands start their own.
@@ -784,6 +792,11 @@ pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native>
 #[cfg(windows)]
 pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native> {
     iocp::Iocp::new(root, threads)
+}
+/// `threads` is not used: WASI starts none.
+#[cfg(target_os = "wasi")]
+pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native> {
+    Ok(threads::Threads::new(root, threads))
 }
 
 #[cfg(test)]

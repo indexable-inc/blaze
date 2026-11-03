@@ -10,6 +10,7 @@
 #![deny(unsafe_code)]
 
 mod as_rustc;
+#[cfg(feature = "mimalloc")]
 mod huge;
 mod pin;
 mod program;
@@ -21,10 +22,16 @@ pub use program::main;
 /// bulk of a build comes from `blaze-mem`, which gives its pages back itself) wants the fastest
 /// small-object allocator, mimalloc. Counted, so that the plane's `arena::measure` and
 /// admission's `arena::held` see its bytes.
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "mimalloc"))]
 #[global_allocator]
 static ALLOC: blaze_graph::arena::Counting<mimalloc::MiMalloc> =
     blaze_graph::arena::Counting(mimalloc::MiMalloc);
+
+/// Without `mimalloc` (the seed profile, which has no C): std's allocator, counted the same way.
+#[cfg(all(not(test), not(feature = "mimalloc")))]
+#[global_allocator]
+static ALLOC: blaze_graph::arena::Counting<std::alloc::System> =
+    blaze_graph::arena::Counting(std::alloc::System);
 
 /// The tests hold the hot paths to allocation budgets.
 #[cfg(test)]

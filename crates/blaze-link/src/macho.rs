@@ -45,7 +45,7 @@ pub(crate) fn reexported(name: &str, bytes: &[u8], arch: Arch, platform: u32) ->
         Arch::Aarch64 => macho::CPU_TYPE_ARM64,
         Arch::X86_64 => macho::CPU_TYPE_X86_64,
         // alloc: error path
-        Arch::Wasm32 => return Err(format!("{name}: a Mach-O library in a wasm32 link")),
+        Arch::Wasm32 | Arch::Wasm64 => return Err(format!("{name}: a Mach-O library in a {arch:?} link")),
     };
     let bytes = input::slice(name, bytes, cpu)?;
     let magic = bytes.get(..4).map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]));
@@ -81,7 +81,7 @@ use parking_lot::Mutex;
 use crate::cow::CowBytes;
 use crate::model::{
     Class, Counts, Data, Delta, File, Holds, Name, NativeFile, Names, Placed, Plan, Prot, Region,
-    Reserve, SectionKind, SectionName, Special, Writer,
+    Reserve, SectionKind, SectionName, Special, Writer, zeroed,
 };
 use smallvec::SmallVec;
 use crate::output::Platform;
@@ -109,7 +109,7 @@ pub(crate) fn writer(output: &Output) -> Result<MachO, LinkError> {
     let (cpu, subtype, page) = match output.arch {
         Arch::Aarch64 => (macho::CPU_TYPE_ARM64.0, macho::CPU_SUBTYPE_ARM64_ALL.0, 0x4000),
         Arch::X86_64 => (macho::CPU_TYPE_X86_64.0, macho::CPU_SUBTYPE_X86_64_ALL.0, 0x1000),
-        Arch::Wasm32 => return Err(error("a Mach-O image for wasm32, which has no Mach-O")),
+        Arch::Wasm32 | Arch::Wasm64 => return Err(error("a Mach-O image for wasm, which has no Mach-O")),
     };
     if output.dev_run.is_some() {
         if output.arch != Arch::Aarch64 {
@@ -375,11 +375,6 @@ fn place(class: &Class) -> (Segment, u8) {
 
 fn split(name: &str) -> (&str, &str) {
     name.split_once(',').unwrap_or((name, ""))
-}
-
-/// Not in the file: zeroed data, and a dev run's reservations, which hold nothing.
-fn zeroed(class: &Class) -> bool {
-    matches!(class, Class::Tbss | Class::Bss | Class::Reserve(_))
 }
 
 /// The segment, name and flags of the section a region is in the file.

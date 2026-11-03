@@ -618,7 +618,7 @@ fn push_fields(
             fields.reserve(it.fields().count());
             for field in it.fields() {
                 let name = name_to_token(call_site, tm, field.name())?;
-                fields.push(tt::Ident { span: at_field(name.span), ..name });
+                fields.push(super::field_name_in_derive(name, call_site));
             }
             FieldsKind::Record
         }

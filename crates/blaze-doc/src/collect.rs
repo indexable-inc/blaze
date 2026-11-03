@@ -1052,7 +1052,8 @@ impl Builder<'_> {
         let ty = adt.ty(db);
         let mut seen = HashSet::new_in(Global);
         let by_trait_arg = self.by_trait_arg.get(&adt).into_iter().flatten().copied();
-        for imp in Impl::all_for_type(db, ty).into_iter().chain(by_trait_arg) {
+        let documented = self.documented().krate;
+        for imp in Impl::all_for_type(db, documented, ty).into_iter().chain(by_trait_arg) {
             if !seen.insert(imp) || !self.impl_shown(imp) {
                 continue;
             }
@@ -1110,7 +1111,7 @@ impl Builder<'_> {
         while let Some(adt) = own
             && seen.insert(adt)
         {
-            let impls = Impl::all_for_type(db, ty.clone());
+            let impls = Impl::all_for_type(db, self.documented().krate, ty.clone());
             let of = |trait_: Option<hir::Trait>| {
                 impls.iter().copied().find(|imp| {
                     imp.trait_(db) == trait_ && trait_.is_some() && !imp.is_negative(db)
@@ -1131,7 +1132,7 @@ impl Builder<'_> {
             let Some(target_code) = sig::alias_type(db, self.places, alias) else { break };
             let copy = self.std.copy.is_some_and(|it| target.impls_trait(db, it, &[]));
             let mut members = vec![];
-            for imp in Impl::all_for_type(db, target.clone()) {
+            for imp in Impl::all_for_type(db, self.documented().krate, target.clone()) {
                 if imp.trait_(db).is_some()
                     || !self.impl_shown(imp)
                     || !target.unifies_with_any_params(db, &imp.self_ty(db))
@@ -1312,7 +1313,16 @@ impl Builder<'_> {
             places::krate_of(db, ModuleDef::Trait(trait_)).unwrap_or(self.documented().krate),
         );
         allowed.extend(self.places.crates.iter().map(|it| it.krate));
-        for imp in Impl::all_for_trait(db, trait_) {
+        // The impls each documented crate sees, once: a documented crate downstream of the trait
+        // lists its own impls among the implementors, as rustdoc's shared docs do.
+        let mut found = HashSet::new_in(Global);
+        let impls = self
+            .places
+            .crates
+            .iter()
+            .flat_map(|it| Impl::all_for_trait(db, it.krate, trait_))
+            .filter(|it| found.insert(*it));
+        for imp in impls {
             if !allowed.contains(&imp.module(db).krate(db)) {
                 continue;
             }

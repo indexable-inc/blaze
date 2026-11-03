@@ -40,8 +40,10 @@ use crate::time::{
 
 pub use render::text;
 
-/// The version of the report's JSON: bumped when a field changes meaning or goes away.
-pub const VERSION: u32 = 1;
+/// The version of the report's JSON: bumped when a field changes meaning or goes away. 2: an
+/// unnamed wait's `hidden_ns` is the wall its waits cover, not their parked time summed, and
+/// waits the record never ends are their own blind spot (`unended_wait`).
+pub const VERSION: u32 = 2;
 
 /// The build the report is of, as its `builds` row says.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -70,6 +72,16 @@ pub struct Facts {
     pub misses: Vec<MissGroup>,
     pub query_counts: Vec<QueryCount>,
     pub memory: Memory,
+    pub recorder: Recorder,
+}
+
+/// What the flight recorder itself dropped over the build's window, from its own counters
+/// (`profile spans lost`, `profile rows skipped`); `None` where the record has none (a blaze
+/// before them).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Recorder {
+    pub spans_lost: Option<i64>,
+    pub rows_skipped: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -278,6 +290,9 @@ pub enum BlindKind {
     UnnamedWait,
     /// Waits that name what they wait for but never who runs it.
     OwnerlessWait,
+    /// Waits the record never ends: still waiting as it ends, or their resume row lost. Their
+    /// parked time runs to the record's end, so they are kept out of the wait classes.
+    UnendedWait,
     /// Workers' running time the spans counted no CPU for.
     CpuGap,
     /// No `ready` rows: parked and queued time can't be told apart.
@@ -664,6 +679,9 @@ impl<'a> Ctx<'a> {
             }
         }
         let mut classes: HashMap<String, Class, Global> = HashMap::new_in(Global);
+        // Waits the record never ends: their time runs to its end, summed over every one
+        // (65,439 of them made millions of seconds of one build), so they are told apart.
+        let mut unended = Class::default();
         for (w, wait) in model.waits.iter().enumerate() {
             if of_wait[w] == 0 {
                 continue;
@@ -674,8 +692,15 @@ impl<'a> Ctx<'a> {
             let (class, of) = match named {
                 true => by_package(report::wait_class(model, wait)),
                 // alloc: a row's key
-                false => (format!("{} with no awaits", wait.on.map_or("span", |it| it.name())), None),
+                false => (format!("{} wait with no wait span", wait.on.map_or("span", |it| it.name())), None),
             };
+            if wait.resumed_ns.is_none() {
+                unended.count += 1;
+                unended.ns += of_wait[w];
+                unended.stretches.append(&mut stretches[w]);
+                unended.of.push((class, of_wait[w]));
+                continue;
+            }
             let class = classes.entry(class).or_default();
             if let Some(of) = of {
                 class.of.push((of, of_wait[w]));
@@ -710,7 +735,7 @@ impl<'a> Ctx<'a> {
             let idle = (1.0 - busy as f64 / (workers as f64 * wall.max(1) as f64)).clamp(0.0, 1.0);
             let owners = top(&mut class.owners);
             let mut evidence = vec![format!(
-                "{} waits, {} of job time, {} of wall with one or more waiting, {:.0}% of workers idle meanwhile",
+                "{} waits, {} parked in all (summed over the jobs waiting, not workers' time), {} of wall with one or more waiting, {:.0}% of workers idle meanwhile",
                 class.count,
                 s(class.ns),
                 s(wall),
@@ -727,13 +752,20 @@ impl<'a> Ctx<'a> {
                 true => evidence.push("no wait of it names who woke it".to_owned()),
             }
             if !class.named {
+                match self.facts.recorder.spans_lost {
+                    Some(0) => evidence.push("the recorder lost no span in the build's window: the wait opened none".to_owned()),
+                    Some(lost) => evidence.push(format!(
+                        "the recorder lost {lost} spans in the build's window (`profile spans lost`): a wait's span may be one of them"
+                    )),
+                    None => evidence.push("the record has no `profile spans lost` counter: a lost span can't be told from a wait that opened none".to_owned()),
+                }
                 blind.push(BlindSpot {
                     kind: BlindKind::UnnamedWait,
-                    hidden_ns: class.ns,
-                    title: format!("waits on `{name}` say nothing of what they wait for: {} of job time", s(class.ns)),
+                    hidden_ns: wall,
+                    title: format!("waits on `{name}` say nothing of what they wait for: {} of wall, {} parked in all", s(wall), s(class.ns)),
                     subject: name,
                     evidence,
-                    fix: "open a `wait` span naming the awaited key, lock, channel or child, and its owner (rule 13)".to_owned(),
+                    fix: "open a `wait` span naming the awaited key, lock, channel or child, and its owner (rule 13); or, when the recorder lost spans, find what held its open slots".to_owned(),
                 });
                 continue;
             }
@@ -741,7 +773,7 @@ impl<'a> Ctx<'a> {
                 blind.push(BlindSpot {
                     kind: BlindKind::OwnerlessWait,
                     hidden_ns: class.ns,
-                    title: format!("waits on `{name}` never name who runs what they wait for: {} of job time", s(class.ns)),
+                    title: format!("waits on `{name}` never name who runs what they wait for: {} parked in all", s(class.ns)),
                     // clone: a blind spot's subject
                     subject: name.clone(),
                     // clone: its evidence, also the finding's
@@ -764,6 +796,25 @@ impl<'a> Ctx<'a> {
                 subject: name,
                 owner,
                 evidence,
+            });
+        }
+        if unended.count > 0 {
+            merge(&mut unended.stretches);
+            let wall: i64 = unended.stretches.iter().map(|it| it.1 - it.0).sum();
+            let mut evidence = vec![
+                format!("{} parked in all, each to the record's end; by class: {}", s(unended.ns), list(&top(&mut unended.of))),
+                "still waiting as the record ends (a stalled build) or their resumed row lost (`profile rows skipped`)".to_owned(),
+            ];
+            if let Some(skipped) = self.facts.recorder.rows_skipped.filter(|it| *it > 0) {
+                evidence.push(format!("the recorder skipped {skipped} rows in the build's window"));
+            }
+            blind.push(BlindSpot {
+                kind: BlindKind::UnendedWait,
+                hidden_ns: wall,
+                subject: "waits".to_owned(),
+                title: format!("{} waits never end in the record: {} of wall with one open, left out of the waits above", unended.count, s(wall)),
+                evidence,
+                fix: "a stalled build: its open waits and their owners (`blaze debug stalls`); rows skipped: drain the rings sooner".to_owned(),
             });
         }
         blind

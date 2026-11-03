@@ -56,7 +56,9 @@ impl Kept {
     /// What a later [`serve`] of the same front end served, added: a crate's latest key holds,
     /// and a crate keyed again is a hit or stale only as that serve found it.
     fn add(&mut self, more: Served) {
-        let Served { keys, hits, stale } = more;
+        let Served { keys, hits, stale, build } = more;
+        // Every serve of one front end is by one blaze: what `store` makes the keys again with.
+        self.served.build = build;
         self.served.hits.retain(|it| !keys.contains_key(it));
         self.served.stale.retain(|it| !keys.contains_key(it));
         self.served.keys.extend(keys);
@@ -124,16 +126,29 @@ pub(crate) fn serve(
     // dyn: the constants' store keeps it for the database's life: the same `Arc` each build
     let adapter: Arc<dyn ImageStore + Send + Sync> = session.images.clone(); // clone: an `Arc`, once per serve
     hir_ty::consteval::deps::set(lowered.served_db(), adapter, consts, mode);
+    stamp(lowered, build, session);
     Ok(())
+}
+
+/// What a [`serve`] that served images leaves: what this serve wrote (images, lang items, check
+/// outcomes, constants) is no input of a key, so the keys it walked stand at the view it
+/// leaves, and a later serve of those crates there walks nothing ([`images`]). Under debug
+/// assertions that is checked: each crate walked keys there as `keyed` holds it.
+pub(crate) fn stamp(lowered: &Lowered, build: ContentId, session: &mut Session) {
+    #[cfg(debug_assertions)]
+    session.walked.assert_stands(lowered.db(), build, &session.keyed);
+    session.walked.stamp(lowered.db().nonce_and_revision(), build);
 }
 
 /// The images of `crates`' eligible crates and their dependencies whose key ([`hir_def::deps::keys`])
 /// is not the one `session` last served or resolved them under, served through `session` by
 /// `build` in `mode` ([`Lowered::serve_deps`]): what that serve did of those crates alone, or
-/// `None`, nothing written, when no key moved. A crate whose key moved loses the image it was
-/// read from: it is read from the image under its new key, or resolved. A crate whose key did
-/// not move is asked of the store again only as a dependency of one whose key did, and is not
-/// imaged again.
+/// `None`, nothing written, when no key moved: with no walk when every crate of `crates` was
+/// keyed at the database's present view, or by a [`serve`] that left it (no write came
+/// between). A crate whose
+/// key moved loses the image it was read from: it is read from the image under its new key,
+/// or resolved. A crate whose key did not move is asked of the store again only as a
+/// dependency of one whose key did, and is not imaged again.
 pub(crate) fn images(
     lowered: &mut Lowered,
     crates: &[Crate],
@@ -141,26 +156,39 @@ pub(crate) fn images(
     session: &mut Session,
     mode: Mode,
 ) -> Result<Option<Served>, ApiError> {
+    let at = lowered.db().nonce_and_revision();
+    if session.walked.covers(at, build, crates) {
+        return Ok(None);
+    }
     let keys = {
-        let _span = tracing::info_span!(target: "blaze", "dependency image keys", crates = crates.len()).entered();
+        let _span = tracing::info_span!(target: "blaze", "dependency image keys", crates = crates.len(), subject = ?at.1).entered();
+        session.walked.walks += 1;
         hir_def::deps::keys(lowered.db(), crates, build)
     };
     let mut moved: Vec<Crate> =
         keys.iter().filter(|&(krate, key)| session.keyed.get(krate) != Some(key)).map(|(&krate, _)| krate).collect(); // alloc: once per serve, one per crate whose key moved
     if moved.is_empty() {
+        // `keyed` holds every key walked already.
+        session.walked.note(at, build, crates.iter().chain(keys.keys()));
         return Ok(None);
     }
     moved.sort_unstable();
     let served = lowered.serve_deps(&moved, build, &*session.images, mode).map_err(super::lower_error)?;
     debug_assert!(session.images.take_puts().is_empty(), "serving puts nothing");
-    session.keyed.extend(keys);
-    let Served { keys, hits, stale } = served;
+    // The walk is noted only once `keyed` holds its keys: a serve that failed above leaves no
+    // record that a later serve at this view could skip on with the old keys (rule 18).
+    session.keyed.extend(keys.iter().map(|(&krate, &key)| (krate, key)));
+    session.walked.note(at, build, crates.iter().chain(keys.keys()));
+    // Written: what was walked stands again only once [`serve`] is done and stamps its view.
+    session.walked.at = None;
+    let Served { keys, hits, stale, build } = served;
     let of_moved = |krate: &Crate| moved.binary_search(krate).is_ok();
     // alloc: once per serve that moved a key, one entry per crate whose key moved
     Ok(Some(Served {
         keys: keys.into_iter().filter(|(krate, _)| of_moved(krate)).collect(),
         hits: hits.into_iter().filter(of_moved).collect(),
         stale: stale.into_iter().filter(of_moved).collect(),
+        build,
     }))
 }
 
@@ -202,12 +230,82 @@ pub(crate) struct Session {
     /// resolved under, over every job of the front end it is kept with: [`images`] serves
     /// again exactly the crates whose key moved since.
     keyed: HashMap<Crate, ContentId, Global>,
+    /// The crates [`images`] keyed and the database's view they were keyed at, or that the
+    /// [`serve`] that served them left: a later serve of those crates at the same view (no
+    /// write came between, so each key is the one `keyed` holds) walks nothing.
+    walked: Walked,
+}
+
+/// [`Session::walked`]: the crates keyed at one view of one database by one `build`, each of
+/// whose keys (and its dependencies') `keyed` holds; no view while a serve that moved a key is
+/// writing.
+struct Walked {
+    at: Option<(base_db::Nonce, blaze_query::db::View, ContentId)>,
+    crates: HashSet<Crate, Global>,
+    /// How many walks [`images`] ran over the session's life: what a test of the skip counts.
+    walks: u64,
+}
+
+impl Walked {
+    fn new() -> Walked {
+        Walked { at: None, crates: HashSet::new_in(Global), walks: 0 }
+    }
+
+    /// That each crate walked keys at `db`'s present view by `build` as `keyed` holds it: what
+    /// [`stamp`] rests on, that a serve's writes are no input of a key. A write that becomes
+    /// one (a file set, a crate's env, a source root) would make every later skip serve stale
+    /// images, so it fails here, naming the crate (rule 18).
+    #[cfg(debug_assertions)]
+    fn assert_stands(&self, db: &Db, build: ContentId, keyed: &HashMap<Crate, ContentId, Global>) {
+        let mut crates: Vec<Crate> = self.crates.iter().copied().collect(); // alloc: debug assertions only, once per serve that served
+        crates.sort_unstable();
+        let now = hir_def::deps::keys(db, &crates, build);
+        let mut moved: Vec<(Crate, Option<ContentId>, ContentId)> = now
+            .iter()
+            .filter(|&(krate, key)| keyed.get(krate) != Some(key))
+            .map(|(&krate, &key)| (krate, keyed.get(&krate).copied(), key))
+            .collect(); // alloc: debug assertions only, as above
+        moved.sort_unstable_by_key(|it| it.0);
+        assert!(
+            moved.is_empty(),
+            "a dependency serve wrote an input of a crate's image key, so the walk it stamps would \
+             skip on stale keys (rule 18): (crate, key walked, key now) {moved:?}"
+        );
+    }
+
+    /// Whether every crate of `crates` was keyed at `at` by `build`.
+    fn covers(&self, at: (base_db::Nonce, blaze_query::db::View), build: ContentId, crates: &[Crate]) -> bool {
+        self.at == Some((at.0, at.1, build)) && crates.iter().all(|it| self.crates.contains(it))
+    }
+
+    /// `crates` (those asked and the dependencies keyed with them) keyed at `at` by `build`:
+    /// added to those keyed there, or in place of those keyed at another view.
+    fn note<'a>(&mut self, at: (base_db::Nonce, blaze_query::db::View), build: ContentId, crates: impl Iterator<Item = &'a Crate>) {
+        let at = Some((at.0, at.1, build));
+        if self.at != at {
+            self.at = at;
+            self.crates.clear();
+        }
+        self.crates.extend(crates.copied());
+    }
+
+    /// The view `at` a serve that moved a key left, by `build`: what it walked stands there.
+    fn stamp(&mut self, at: (base_db::Nonce, blaze_query::db::View), build: ContentId) {
+        if self.at.is_none() {
+            self.at = Some((at.0, at.1, build));
+        }
+    }
 }
 
 impl Session {
     /// [`Session::env`].
     pub(crate) fn env_read(&self) -> &EnvReads {
         &self.env
+    }
+
+    /// How many walks of the crates' keys its serves ran ([`Walked::walks`]).
+    pub(crate) fn walks(&self) -> u64 {
+        self.walked.walks
     }
 }
 
@@ -244,7 +342,7 @@ pub(crate) fn session(
         }
     };
     let checks = Arc::new(cache::Served::default()); // alloc: setup, once per database
-    Ok(Session { installed, items, images, checks, refused: HashMap::new_in(Global), env: read, keyed: HashMap::new_in(Global) })
+    Ok(Session { installed, items, images, checks, refused: HashMap::new_in(Global), env: read, keyed: HashMap::new_in(Global), walked: Walked::new() })
 }
 
 /// What the job's `BLAZE_ITEM_STORE` asks of the item store: unset serves what it holds,

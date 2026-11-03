@@ -1202,10 +1202,10 @@ impl<'a> ExpressionStoreRef<'a> {
             ensure(*owner == NO_OWNER || *owner < exprs, owner, buffer, "a binding owner past the expressions")?;
         }
         for block in self.block_scopes {
-            ensure(id_of_bits(*block).is_some(), block, buffer, "a block id of 0 or past 32 bits")?;
+            blaze_query::db::Id::decode(*block, at_of(block, buffer), "a block scope's id")?;
         }
         for call in self.macro_calls {
-            ensure(id_of_bits(*call).is_some(), call, buffer, "a macro call id of 0 or past 32 bits")?;
+            blaze_query::db::Id::decode(*call, at_of(call, buffer), "a macro call's id")?;
         }
         ascending(self.ident_hygiene, |it| it.a, buffer, "ident hygiene out of order")?;
         for pair in self.ident_hygiene {

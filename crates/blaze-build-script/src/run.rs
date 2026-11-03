@@ -11,8 +11,8 @@
 use std::{
     fs,
     io::Write,
+    fmt,
     path::{Path, PathBuf},
-    process::ExitStatus,
     time::SystemTime,
 };
 
@@ -21,6 +21,48 @@ use crate::{
     output::{self, Context, Output, Severity},
     unit::Unit,
 };
+
+/// How a run of a script ended: its exit code, or the signal that ended it. Not `std`'s
+/// `ExitStatus`, which WASI (the wasm32-wasip1 seed, todo/bootstrap/plan.md) has no way to
+/// make: a run there is a wasm module's, which ends with a code too.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Ended {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+impl Ended {
+    pub const fn exited(code: i32) -> Ended {
+        Ended { code: Some(code), signal: None }
+    }
+
+    pub const fn signalled(signal: i32) -> Ended {
+        Ended { code: None, signal: Some(signal) }
+    }
+
+    /// It exited with code 0, and no signal ended it.
+    pub const fn success(self) -> bool {
+        matches!(self, Ended { code: Some(0), signal: None })
+    }
+}
+
+/// `exit_status_to_string` of cargo-util: `signal: N` and what the signal is, else std's text
+/// of the exit code on this host (`exit status: N` on Unix, `exit code: N` on Windows).
+impl fmt::Display for Ended {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.signal, self.code) {
+            (Some(signal), _) => write!(f, "signal: {signal}{}", blaze_core::signal::described(signal)),
+            // std's Windows text: a code with the high bit set is an exception's, said in hex.
+            #[cfg(windows)]
+            (None, Some(code)) if code as u32 & 0x8000_0000 != 0 => write!(f, "exit code: {:#x}", code as u32),
+            #[cfg(windows)]
+            (None, Some(code)) => write!(f, "exit code: {code}"),
+            #[cfg(not(windows))]
+            (None, Some(code)) => write!(f, "exit status: {code}"),
+            (None, None) => f.write_str("ended with neither an exit code nor a signal"),
+        }
+    }
+}
 
 /// Why the build fails, with what the script asked to be shown.
 #[derive(Debug, PartialEq, Eq)]
@@ -149,14 +191,14 @@ fn log_lines(stdout: &[u8]) -> impl Iterator<Item = (Severity, &[u8])> {
 /// Why cargo fails a run that printed `stdout` and `stderr` and ended with `status`, before
 /// it reads what was printed: the script failed, or logged an error. What is shown of the
 /// run is read only then.
-fn refused(unit: &Unit, status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> Result<(), Failed> {
+fn refused(unit: &Unit, status: Ended, stdout: &[u8], stderr: &[u8]) -> Result<(), Failed> {
     let failed = |error: String| Failed { error: Error(error), log_messages: logged(stdout) };
     if !status.success() {
         // alloc: error path.
         let mut cause = format!(
             "process didn't exit successfully: `{}` ({})",
             unit.script.display(),
-            status_to_string(status)
+            status
         );
         for (name, out) in [("stdout", stdout), ("stderr", stderr)] {
             if let Ok(out) = std::str::from_utf8(out)
@@ -188,7 +230,7 @@ fn refused(unit: &Unit, status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> Res
 pub fn judge(
     unit: &Unit,
     cx: &Context<'_>,
-    status: ExitStatus,
+    status: Ended,
     stdout: &[u8],
     stderr: &[u8],
 ) -> Result<Output, Failed> {
@@ -234,20 +276,6 @@ fn path_bytes(path: &Path) -> std::io::Result<&[u8]> {
             std::io::Error::other(format!("invalid non-unicode path: {}", path.display()))
         })
     }
-}
-
-/// `exit_status_to_string` of cargo-util.
-fn status_to_string(status: ExitStatus) -> String {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            // alloc: error path.
-            return format!("signal: {signal}{}", blaze_core::signal::described(signal));
-        }
-    }
-    // alloc: error path.
-    status.to_string()
 }
 
 #[cfg(test)]

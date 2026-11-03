@@ -343,6 +343,7 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
         unstable, Normal,
         template!(List: r#"feature = "name", reason = "...", issue = "N""#), DuplicatesOk,
     ),
+    ungated!(unstable_feature_bound, Normal, template!(Word, List: "feat1, feat2, ..."), DuplicatesOk),
     ungated!(rustc_const_unstable, Normal, template!(List: r#"feature = "name""#), DuplicatesOk),
     ungated!(
         rustc_const_stable, Normal,

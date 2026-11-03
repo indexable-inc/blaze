@@ -851,7 +851,7 @@ macro_rules! span_kinds {
 span_kinds! {
     generic {
         Crate = "crate" (Dict) fields "crate" | "krate",
-            "the crate it was of: a kind's `krate`, or an ad hoc span's field `crate`";
+            "the crate it was of: a kind's `krate`, or an ad hoc span's field `crate`; a front-end span's names one build of it, `serde v1.0.219 (lib)`, `(lib-test)` for its `cfg(test)` copy, `(lib, wasm)` for the proc macros' wasm copy";
         Function = "function" (Utf8) fields "function" | "subject",
             "the function it was of: a `macro expand`'s macro path, what a `wait` awaits, what a `hold` holds, or an ad hoc span's field `function` or `subject`";
         Unit = "unit" (Utf8) fields "unit" | "cgu",

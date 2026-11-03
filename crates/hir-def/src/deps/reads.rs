@@ -93,12 +93,7 @@ impl Reads {
 
     /// [`Reads::of`] but for what its dependencies read.
     fn own(db: &Db, krate: Crate, calls: &[MacroCallId]) -> Result<Reads, Refused> {
-        // alloc: setup: the calls of one crate, walked once as its image is written
-        let mut todo: Vec<MacroCallId> = calls.to_vec();
-        for (_, module) in crate_def_map(db, krate).modules(db) {
-            todo.extend(module.scope(db).all_macro_calls());
-        }
-        Reads::of_calls(db, krate, todo)
+        Reads::of_calls(db, krate, image_calls(db, krate, calls))
     }
 
     /// Adds what each crate `krate` depends on, directly or not, read ([`Reads::deps`]): a
@@ -133,24 +128,13 @@ impl Reads {
     pub(crate) fn of_calls(
         db: &Db,
         krate: Crate,
-        mut todo: Vec<MacroCallId>,
+        todo: Vec<MacroCallId>,
     ) -> Result<Reads, Refused> {
         let own = krate.env(db);
-        let mut seen = HashSet::new_in(Global);
         let mut reads = Reads::default();
-        while let Some(call) = todo.pop() {
-            if !seen.insert(call) {
-                continue;
-            }
-            let loc = call.lookup(db);
-            if loc.krate != krate {
-                continue;
-            }
-            if let HirFileId::MacroFile(parent) = loc.kind.file_id() {
-                todo.push(parent);
-            }
+        each_call(db, krate, todo, |call, loc| {
             if !matches!(loc.def.kind, MacroDefKind::ProcMacro(..)) {
-                continue;
+                return Ok(());
             }
             match call.expansion_reads(db) {
                 ExpansionReads::Nothing => {}
@@ -164,7 +148,8 @@ impl Reads {
                     return Err(Refused::ProcMacro { call, why });
                 }
             }
-        }
+            Ok(())
+        })?;
         // Every `env!` and `option_env!` expansion notes its variable as it runs, nested ones
         // too, and the log is never cleared: what the crate's resolution read is in it.
         for (read, name) in db.files().env_read() {
@@ -325,6 +310,46 @@ impl Reads {
         }
         Ok(hasher.finish())
     }
+}
+
+/// The macro calls an image of `krate` is made from, before [`each_call`] adds those they are
+/// expanded in: `calls` (those its signatures name, [`super::signatures::encode`]) and every
+/// macro call of its modules' scopes. One list for what the image's reads cover ([`Reads::of`])
+/// and the files it may read (`serve::refusal`), so the two never walk different calls.
+pub(super) fn image_calls(db: &Db, krate: Crate, calls: &[MacroCallId]) -> Vec<MacroCallId> {
+    // alloc: setup: the calls of one crate, walked once as its image is written
+    let mut todo: Vec<MacroCallId> = calls.to_vec();
+    for (_, module) in crate_def_map(db, krate).modules(db) {
+        todo.extend(module.scope(db).all_macro_calls());
+    }
+    todo
+}
+
+/// Runs `each` once for every call of `todo` that `krate` makes and every call one of them is in
+/// the expansion of, with its location; stops at the first error. An eager macro's argument is
+/// expanded as a call of its own (`eager: None`), the parent of the calls inside it: `each`
+/// sees it too, and tells it from the real call by its kind.
+pub(super) fn each_call<E>(
+    db: &Db,
+    krate: Crate,
+    mut todo: Vec<MacroCallId>,
+    mut each: impl FnMut(MacroCallId, &hir_expand::MacroCallLoc) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut seen = HashSet::new_in(Global);
+    while let Some(call) = todo.pop() {
+        if !seen.insert(call) {
+            continue;
+        }
+        let loc = call.lookup(db);
+        if loc.krate != krate {
+            continue;
+        }
+        if let HirFileId::MacroFile(parent) = loc.kind.file_id() {
+            todo.push(parent);
+        }
+        each(call, loc)?;
+    }
+    Ok(())
 }
 
 /// What `krate`, served from its image under the key `base`, was filed by, as serving it

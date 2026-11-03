@@ -78,7 +78,7 @@ fn check_new<'t>(
         return;
     }
     let Some(default) = cx.famous().core_default_Default() else { return };
-    if hir::Impl::all_for_type(db, self_ty.clone())
+    if hir::Impl::all_for_type(db, cx.krate(), self_ty.clone())
         .into_iter()
         .any(|it| it.trait_(db) == Some(default))
         || derives_default(cx, adt)

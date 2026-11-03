@@ -60,9 +60,22 @@ const LONGEST_COLUMN: usize = ENTRIES * CHUNK;
 /// Address space each pool reserves, committed only as slots are carved: 32 GiB for a pool of
 /// column chunks or pages, 8 GiB for a class of longer lists, 2 GiB (a million nodes) for a
 /// pool of table nodes. Past it the pool stops with the `MemError` naming `Tag::Link`.
+#[cfg(target_pointer_width = "64")]
 pub(crate) const CHUNKS: usize = 1 << 35;
+#[cfg(target_pointer_width = "64")]
 pub(crate) const LONG: usize = 1 << 33;
+#[cfg(target_pointer_width = "64")]
 pub(crate) const NODES: usize = 1 << 31;
+
+/// The same on a 32-bit target (wasm32), where a reservation is memory taken whole and the
+/// whole address space is 4 GB, so each is a budget: 64 MiB, 16 MiB (but one slot, for a class
+/// whose slot is larger) and 8 MiB.
+#[cfg(not(target_pointer_width = "64"))]
+pub(crate) const CHUNKS: usize = 64 << 20;
+#[cfg(not(target_pointer_width = "64"))]
+pub(crate) const LONG: usize = 16 << 20;
+#[cfg(not(target_pointer_width = "64"))]
+pub(crate) const NODES: usize = 8 << 20;
 
 /// A static pool of `A`s, reserved on first use.
 pub(crate) struct LazyPool<A: 'static> {
@@ -815,8 +828,9 @@ type Page = [u8; PAGE];
 type PageRef = Shared<'static, Page>;
 
 /// The longest region: 2^18 pages, 4 GiB. Past rustc's reach too: its default code model
-/// keeps code and data within 2 GiB.
-const LONGEST_BYTES: usize = ENTRIES * PAGE;
+/// keeps code and data within 2 GiB. On a 32-bit target every length fits (4 GiB is past
+/// `usize`), so it saturates there.
+const LONGEST_BYTES: usize = ENTRIES.saturating_mul(PAGE);
 
 /// The family of [`CowBytes`]' pages and their tables' nodes.
 struct Bytes;

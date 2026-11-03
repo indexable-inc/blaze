@@ -184,7 +184,22 @@ pub(crate) fn compress_long(raw: &[u8]) -> Result<Vec<u8>, String> {
 /// The length a zstd frame of `stored` bytes may decode to, checked before anything of that
 /// length is allocated: `raw` comes from a record header, which nothing has verified yet.
 /// Every frame here is one `ZSTD_compress2` of a whole value, which writes its length.
+///
+/// Only a standard zstd frame (magic `28 B5 2F FD`, RFC 8878 3.1.1) is read: the store never
+/// wrote another, and a legacy (v0.1 to v0.7) or skippable frame in a pack, which nothing has
+/// verified yet, never reaches zstd's decoders.
 fn zstd_length(stored: &[u8], raw: u64) -> Result<usize, String> {
+    match stored.first_chunk::<4>() {
+        Some(magic) if u32::from_le_bytes(*magic) == zstd_safe::zstd_sys::ZSTD_MAGICNUMBER => {}
+        Some(magic) => {
+            // alloc: the error's message
+            return Err(format!(
+                "it starts with {magic:02x?}, not zstd's frame magic [28, b5, 2f, fd]"
+            ));
+        }
+        // alloc: the error's message
+        None => return Err(format!("its {} bytes are too short for a zstd frame", stored.len())),
+    }
     match zstd::zstd_safe::get_frame_content_size(stored) {
         Ok(Some(said)) if said == raw => {}
         // alloc: the error's message
@@ -306,6 +321,26 @@ mod tests {
         assert!(decompress(&dictionary, &stored, value.len() as u64 + 1).is_err());
         assert!(decompress(&dictionary, &stored, value.len() as u64 - 1).is_err());
         assert!(decompress(&dictionary, b"not zstd at all", 10).is_err());
+    }
+
+    /// Only a standard zstd frame reaches zstd: a legacy frame (v0.7's magic), a skippable frame
+    /// and a stub are refused naming what they start with, whatever decoders this target's zstd
+    /// was built with.
+    #[test]
+    fn a_frame_of_another_magic_is_refused_naming_it() {
+        let dictionary = Prepared::new(OLD_DICTIONARY.to_vec()).unwrap();
+        for (stored, named) in [
+            (&[0x27, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0][..], "[27, b5, 2f, fd]"),
+            (&[0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0][..], "[50, 2a, 4d, 18]"),
+            (&[0x28, 0xb5][..], "2 bytes are too short"),
+        ] {
+            for why in [
+                decompress(&dictionary, stored, 10).unwrap_err(),
+                decompress_long(stored, 10).unwrap_err(),
+            ] {
+                assert!(why.contains(named), "{why}");
+            }
+        }
     }
 
     /// Bytes zstd will not load as a dictionary, its magic number then a corrupt header, are
@@ -462,5 +497,88 @@ mod tests {
             let kept = lz4_into(&value, &mut out);
             assert_eq!(lz4(&value), kept.then(|| out.clone()), "{} bytes", value.len());
         }
+    }
+
+    /// What C zstd 1.5.7 (zstd-sys 2.1.2+zstd.1.5.7, the zstd every target used until wasm got
+    /// libzstd-rs-sys: vendor/zstd-sys/SOURCE.md) wrote with this module's calls: a dictionary
+    /// [`train`]ed on 200 [`fixture_sample`]s, one of them through [`compress`], and
+    /// [`fixture_long`] through [`compress_long`] on its 4 workers. Never regenerated: they stand
+    /// for what stores already hold.
+    const OLD_DICTIONARY: &[u8] = include_bytes!("fixtures/zstd-1.5.7/dictionary");
+    const OLD_FRAME: &[u8] = include_bytes!("fixtures/zstd-1.5.7/dictionary-level6.zst");
+    const OLD_LONG_FRAME: &[u8] = include_bytes!("fixtures/zstd-1.5.7/long-level6.zst");
+
+    /// The fixtures' values: kept apart from [`sample`], which may change.
+    fn fixture_sample(n: usize) -> Vec<u8> {
+        format!(
+            "{{\"unit\": \"crate-{n}\", \"cfg\": [\"feature=\\\"std\\\"\", \"target_os=\\\"linux\\\"\"], \
+             \"env\": {{\"OUT_DIR\": \"/build/out/{n}\", \"PROFILE\": \"debug\"}}, \"links\": \
+             [\"z\", \"ssl\", \"crypto\"], \"rerun\": [\"build.rs\", \"src/{n}.c\"], \"n\": {}}}\n",
+            n * 7919 % 1000
+        )
+        .repeat(4)
+        .into_bytes()
+    }
+
+    /// 9 MiB of numbered copies of one 60 KiB block. zstd runs a frame of at most 512 KiB on one
+    /// thread whatever its worker count (`ZSTDMT_JOBSIZE_MIN`); this one it cuts into 2 MiB jobs
+    /// (level 6 with long-distance matching), five of them for the 4 workers, so the frame pins
+    /// zstdmt's output and, on wasm, libzstd-rs-sys's inline pool (vendor/libzstd-rs-sys
+    /// SOURCE.md). It compresses to 26 KB.
+    fn fixture_long() -> Vec<u8> {
+        const LEN: usize = 9 << 20;
+        let block: String = (0..4096u64)
+            .map(|i| format!("{i:06} {:07}\n", i * 2_654_435_761 % 1_000_003))
+            .collect();
+        let mut out = String::with_capacity(LEN + block.len() + 32);
+        let mut copy = 0u64;
+        while out.len() < LEN {
+            out.push_str(&format!("copy {copy}\n"));
+            out.push_str(&block);
+            copy += 1;
+        }
+        out.truncate(LEN);
+        out.into_bytes()
+    }
+
+    /// Durability: frames the old zstd wrote read back to their values, whichever zstd this
+    /// target builds.
+    #[test]
+    fn frames_c_zstd_1_5_7_wrote_decode_to_the_same_values() {
+        let dictionary = Prepared::new(OLD_DICTIONARY.to_vec()).unwrap();
+        let value = fixture_sample(12_345);
+        assert_eq!(decompress(&dictionary, OLD_FRAME, value.len() as u64).unwrap(), value);
+        let long = fixture_long();
+        assert_eq!(decompress_long(OLD_LONG_FRAME, long.len() as u64).unwrap(), long);
+    }
+
+    /// What every target writes is what C zstd 1.5.7 wrote, so a store made on one target is the
+    /// store another makes. On wasm that is libzstd-rs-sys, a translation of zstd's dev branch
+    /// after 1.5.7 (vendor/libzstd-rs-sys/SOURCE.md): the same bytes are measured, not promised,
+    /// and this test is what holds them, on every bump of either zstd.
+    #[test]
+    fn every_target_writes_the_bytes_c_zstd_1_5_7_wrote() {
+        let samples: Vec<Vec<u8>> = (0..200).map(fixture_sample).collect();
+        let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
+        assert_eq!(train(&refs).unwrap(), OLD_DICTIONARY, "the trained dictionary");
+        let dictionary = Prepared::new(OLD_DICTIONARY.to_vec()).unwrap();
+        assert_eq!(compress(&dictionary, &fixture_sample(12_345)).unwrap(), OLD_FRAME, "a dictionary frame");
+        let long = fixture_long();
+        assert_eq!(compress_long(&long).unwrap(), OLD_LONG_FRAME, "a long frame on 4 workers");
+        // The fixture stands for the threaded path only while zstd cuts it into jobs: on one
+        // thread the same parameters write other bytes.
+        let mut alone = zstd::bulk::Compressor::new(LEVEL).unwrap();
+        for parameter in [
+            CParameter::EnableLongDistanceMatching(true),
+            CParameter::WindowLog(WINDOW_LOG),
+            CParameter::NbWorkers(0),
+        ] {
+            alone.set_parameter(parameter).unwrap();
+        }
+        assert_ne!(
+            alone.compress(&long).unwrap(),
+            OLD_LONG_FRAME,
+            "the long fixture runs on one thread"
+        );
     }
 }

@@ -6,7 +6,8 @@
 //! it is refused for being another user's or anyone's to write, and for its group's to write
 //! while the directory lets its group in. On Windows it is the owner and the access list: a
 //! directory made under the user's profile inherits one that lets in the user, the system and
-//! the administrators, and one that lets anyone else write is refused.
+//! the administrators, and one that lets anyone else write is refused. On WASI, which has
+//! neither owners nor modes, it is refused.
 
 use std::{io, path::Path};
 
@@ -88,6 +89,43 @@ mod os {
         } else {
             Access::Alone
         }
+    }
+}
+
+/// WASI files have no owner and no permission bits, so whether a directory is the user's alone
+/// can't be told from inside: every step is refused, naming the directory, and nothing is made.
+/// Whoever runs the seed (todo/bootstrap/plan.md) holds what the guest is given.
+#[cfg(target_os = "wasi")]
+mod os {
+    use std::{io, path::Path};
+
+    use crate::Access;
+
+    /// Never made: no directory is found the user's alone.
+    pub(super) enum Gate {}
+
+    fn refused(dir: &Path) -> io::Error {
+        crate::fs::wasi::refused(
+            dir,
+            format_args!("making it the user's alone"),
+            "WASI files have no owner and no permission bits, so who else may write there can't be told",
+        )
+    }
+
+    pub(super) fn make(dir: &Path) -> io::Result<()> {
+        Err(refused(dir))
+    }
+
+    pub(super) fn top(dir: &Path) -> io::Result<(Access, Gate)> {
+        Err(refused(dir))
+    }
+
+    pub(super) fn close(dir: &Path) -> io::Result<()> {
+        Err(refused(dir))
+    }
+
+    pub(super) fn under(_: &Path, gate: &Gate) -> io::Result<Access> {
+        match *gate {}
     }
 }
 

@@ -115,8 +115,8 @@ fn check(pairs: &[Pair]) {
         let (before, after) =
             (db_of(&format!("{PRELUDE}{}", pair.before)), db_of(&format!("{PRELUDE}{}", pair.after)));
         let fact = (pair.of)(&before);
-        let was = values::value(&before, fact);
-        let is = values::value(&after, (pair.of)(&after));
+        let was = values::value(&before, local_crate(&before), fact);
+        let is = values::value(&after, local_crate(&after), (pair.of)(&after));
         assert!(was.is_some(), "{}: the fact has no value before", pair.what);
         assert!(is.is_some(), "{}: the fact has no value after", pair.what);
         assert_eq!(was != is, pair.changes, "{}: {fact:?}", pair.what);
@@ -192,9 +192,10 @@ fn a_rename_keeps_the_signature_and_changes_the_fields() {
     let (before, after) =
         (db_of("pub struct S { pub a: u32 }"), db_of("pub struct S { pub b: u32 }"));
     let signature = |db: &Db| items_fact(Fact::Signature(key::item_key(db, named(db, "S"))));
-    assert_eq!(values::value(&before, signature(&before)), values::value(&after, signature(&after)));
+    let value = |db: &Db, fact: FactRef| values::value(db, local_crate(db), fact);
+    assert_eq!(value(&before, signature(&before)), value(&after, signature(&after)));
     let fields = fields_of("S");
-    assert_ne!(values::value(&before, fields(&before)), values::value(&after, fields(&after)));
+    assert_ne!(value(&before, fields(&before)), value(&after, fields(&after)));
 }
 
 #[test]
@@ -335,11 +336,11 @@ fn items_facts_change_through_value() {
 fn a_fact_of_this_crates_kind_that_names_nothing_has_no_value() {
     let db = db_of("pub struct S;");
     let unused = FactRef { kind: blaze_query::QueryKind(0x180f), subject: ContentId([1; 32]), object: FactObject::None };
-    assert_eq!(values::value(&db, unused), None);
+    assert_eq!(values::value(&db, local_crate(&db), unused), None);
     let with_object = FactRef { object: FactObject::Field(0), ..values::fields(&db, named(&db, "S")) };
-    assert_eq!(values::value(&db, with_object), None);
+    assert_eq!(values::value(&db, local_crate(&db), with_object), None);
     let gone = FactRef { subject: ContentId([2; 32]), ..values::fields(&db, named(&db, "S")) };
-    assert_eq!(values::value(&db, gone), Some(values::absent(kinds::FIELDS)));
+    assert_eq!(values::value(&db, local_crate(&db), gone), Some(values::absent(kinds::FIELDS)));
 }
 
 #[test]
@@ -501,8 +502,8 @@ impl BodyFacts for Probe {
         class
     }
 
-    fn value(&self, db: &Db, fact: FactRef) -> Option<ContentId> {
-        values::value(db, fact)
+    fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
+        values::value(db, def.krate(db), fact)
     }
 
     fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
@@ -608,7 +609,7 @@ fn leak_reads_are_lane_items_facts() {
         if let Some(kind) = want {
             let Classified::Fact(fact) = it.class else { panic!("{}: {:?}, not a fact", it.name, it.class) };
             assert_eq!(fact.kind, kind, "{}", it.name);
-            assert!(values::value(&db, fact).is_some(), "{}: {fact:?} has a value", it.name);
+            assert!(values::value(&db, local_crate(&db), fact).is_some(), "{}: {fact:?} has a value", it.name);
         }
         if it.name == "fact_value" {
             assert!(matches!(it.class, Classified::Fact(_)), "fact_value: {:?}", it.class);
@@ -698,12 +699,13 @@ fn hashing_this_crates_facts_again_allocates_nothing() {
         values::crate_root(&db, local_crate(&db)),
         attrs_of_item_or_adt(&db, "S"),
     ];
+    let krate = local_crate(&db);
     for &fact in &facts {
-        assert!(values::value(&db, fact).is_some(), "{fact:?} has a value");
+        assert!(values::value(&db, krate, fact).is_some(), "{fact:?} has a value");
     }
     assert_at_most(0, "hashing this crate's facts again", || {
         for &fact in &facts {
-            let _ = values::value(&db, fact);
+            let _ = values::value(&db, krate, fact);
         }
     });
 }

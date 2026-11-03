@@ -1411,7 +1411,7 @@ fn long_import<'a, C: CoffHeader>(
                 return Ok(Parsed::Object(Object::default()));
             }
             let section = number as usize - 1;
-            if let Some(stripped) = symbol_name.strip_prefix(b"__imp_")
+            if let Some(stripped) = symbol_name.strip_prefix(super::IMP.as_bytes())
                 && sections.names.get(section).is_some_and(|it| it.starts_with(".idata$5"))
             {
                 imp = Some((stripped, section));
@@ -1471,7 +1471,7 @@ fn long_import<'a, C: CoffHeader>(
         let number = it.section_number().0;
         it.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
             && number > 0
-            && it.name(strings).is_ok_and(|it| it == stripped && !it.starts_with(b"__imp_"))
+            && it.name(strings).is_ok_and(|it| it == stripped && !it.starts_with(super::IMP.as_bytes()))
             && headers.get(number as usize - 1).is_some_and(|header| {
                 header.characteristics.get(LE).0 & (pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_CNT_CODE.0) != 0
             })

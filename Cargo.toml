@@ -25,6 +25,8 @@ exclude = [
     "vendor/sonic-rs",
     # Its own tests need dev-dependencies blaze has no use for (vendor/blake3-servil/SOURCE.md).
     "vendor/blake3-servil",
+    # Patched below; its own tests need dev-dependencies blaze has no use for (vendor/wasmtime/SOURCE.md).
+    "vendor/wasmtime",
     # Verus's verifier crates, built only as dependencies of hir-ty-verus, and its user-side
     # libraries, which blaze does not build yet (vendor/verus/SOURCE.md).
     "vendor/verus/air",
@@ -32,6 +34,10 @@ exclude = [
     "vendor/verus/vir_macros",
     "vendor/verus/builtin",
     "vendor/verus/vstd",
+    # blaze's zstd, picked per target: patched below (vendor/zstd-sys/SOURCE.md); libzstd-rs-sys
+    # is its wasm implementation, built only there (vendor/libzstd-rs-sys/SOURCE.md).
+    "vendor/zstd-sys",
+    "vendor/libzstd-rs-sys",
 ]
 resolver = "2"
 
@@ -213,6 +219,16 @@ cranelift-codegen = { path = "vendor/cranelift-codegen" }
 sonic-rs = { path = "vendor/sonic-rs" }
 # The integer widths of `#![blaze::arbitrary_ints]` (vendor/rustc_ast_ir/SOURCE.md).
 ra-ap-rustc_ast_ir = { path = "vendor/rustc_ast_ir" }
+# The one zstd API: C zstd 1.5.7 on native targets; on wasm, where the seed has no C,
+# libzstd-rs-sys, zstd's dev branch after 1.5.7 in Rust, whose bytes match C's as the fixtures
+# pin (vendor/zstd-sys/SOURCE.md).
+zstd-sys = { path = "vendor/zstd-sys" }
+# `std` without virtual memory builds, for the wasm seed's Pulley; native code is upstream's
+# (vendor/wasmtime/SOURCE.md).
+wasmtime = { path = "vendor/wasmtime" }
+# rsasm's master after 0.1.3, which has aarch64's exclusive and LSE atomics that compiler_builtins'
+# outline atomics are written in (vendor/rsasm/SOURCE.md).
+rsasm = { path = "vendor/rsasm" }
 
 [workspace.dependencies]
 # local crates
@@ -242,7 +258,7 @@ hir-ty-coherence = { path = "crates/hir-ty-coherence", version = "0.0.0" }
 hir-ty-specialization = { path = "crates/hir-ty-specialization", version = "0.0.0" }
 hir-ty-ub = { path = "crates/hir-ty-ub", version = "0.0.0" }
 hir-ty-wfcheck = { path = "crates/hir-ty-wfcheck", version = "0.0.0" }
-hir-ty-codegen = { path = "crates/hir-ty-codegen" }
+hir-ty-codegen = { path = "crates/hir-ty-codegen", default-features = false }
 blaze-macro-eval = { path = "crates/blaze-macro-eval" }
 blaze-manifest = { path = "crates/blaze-manifest" }
 blaze-metadata = { path = "crates/blaze-metadata" }
@@ -286,18 +302,18 @@ blaze-rng = { path = "crates/blaze-rng" }
 blaze-sha256 = { path = "crates/blaze-sha256" }
 blaze-items = { path = "crates/blaze-items" }
 blaze-item-hash = { path = "crates/blaze-item-hash" }
-blaze-link = { path = "crates/blaze-link" }
+blaze-link = { path = "crates/blaze-link", default-features = false }
 blaze-store-check = { path = "crates/blaze-store-check" }
 blaze-phf = { path = "crates/blaze-phf", version = "0.0.0" }
 # fastcompile (docs/v2/plan/lanes/fastcompile/notes.md)
-blaze-global = { path = "crates/blaze-global" }
+blaze-global = { path = "crates/blaze-global", default-features = false }
 blaze-hashcons = { path = "crates/blaze-hashcons" }
 blaze-history = { path = "crates/blaze-history" }
 blaze-inproc = { path = "crates/blaze-inproc" }
 blaze-intent = { path = "crates/blaze-intent" }
 blaze-lints = { path = "crates/blaze-lints" }
-blaze-lazy = { path = "crates/blaze-lazy" }
-blaze-stencil = { path = "crates/blaze-stencil" }
+blaze-lazy = { path = "crates/blaze-lazy", default-features = false }
+blaze-stencil = { path = "crates/blaze-stencil", default-features = false }
 blaze-testsel = { path = "crates/blaze-testsel" }
 blaze-query = { path = "crates/blaze-query" }
 blaze-query-macros = { path = "crates/blaze-query-macros" }
@@ -306,6 +322,10 @@ blaze-mem = { path = "crates/blaze-mem" }
 blaze-usercode = { path = "crates/blaze-usercode" }
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 blaze-vfs = { path = "crates/blaze-vfs" }
+# WASI preview 1 for wasm guests at both pointer widths, and the bootstrap seed's runner
+# (todo/bootstrap/plan.md).
+blaze-wasi = { path = "crates/blaze-wasi" }
+blaze-seed-run = { path = "crates/blaze-seed-run" }
 # Flecs's C and its read-only REST, for the build page's world (vendor/flecs-c/SOURCE.md).
 flecs-c = { path = "vendor/flecs-c" }
 intern = { path = "crates/intern", version = "0.0.0" }
@@ -369,7 +389,7 @@ cranelift-reader = "=0.137.1"
 # so the patched `vendor/cranelift-codegen` is the only Cranelift in the tree. No component
 # model, async, GC, WASI crates or pooling allocator: blaze answers the module's imports itself.
 # No `parallel-compilation`: it compiles on rayon's pool, and a second pool beside blaze's
-# deadlocked the self-build (blaze_graph::par is the one pool).
+# deadlocked the self-build (blaze_graph::par is the one pool). `vendor/wasmtime` by the patch above.
 wasmtime = { version = "=50.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
 # `vendor/llvm-sys` by the patch above.
 llvm-sys = "231"
@@ -492,8 +512,8 @@ unicode-normalization = "=0.1.25"
 unicode-security = "=0.1.2"
 
 # Dependencies of one member, moved to the root (dedup, 2026-10-30).
-blaze-cargo = { path = "crates/blaze-cargo" }
-blaze-registry = { path = "crates/blaze-registry" }
+blaze-cargo = { path = "crates/blaze-cargo", default-features = false }
+blaze-registry = { path = "crates/blaze-registry", default-features = false }
 cargo-platform = "0.3.3"
 cargo-util-schemas = "=0.14.3"
 cov-mark = "2.2.0"
@@ -511,12 +531,16 @@ fst = { version = "0.4.7", default-features = false }
 futures-util = { version = "0.3.34", default-features = false }
 glob = "0.3.4"
 http-body-util = "0.1.5"
+# A request's method, status and header names, hyper's own (blaze-registry, with or without `net`).
+http = "1.5.0"
 hyper = { version = "1.12.0", default-features = false }
 hyper-rustls = { version = "0.27.10", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
 # The persistent maps of blaze-resolve: im-rc's maintained fork (im-rc has had no release since 2021).
 imbl = "7.0.2"
 inkwell = { version = "0.11.0", default-features = false }
+# The assembler of a blaze without LLVM (the seed): hir-ty-codegen's `asm/rsasm.rs`.
+rsasm = { version = "=0.1.3", default-features = false, features = ["x86", "aarch64"] }
 lzma-rust2 = { version = "0.24.0", default-features = false }
 # blaze's map shared between threads (`blaze_hash::SharedMap`): lock-free reads, no guard held across calls.
 papaya = "0.2.5"

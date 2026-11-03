@@ -78,8 +78,10 @@ pub const LIVE_FILE: &str = "live";
 #[serde(deny_unknown_fields)]
 pub struct Spec {
     pub program: PathBuf,
+    #[cfg_attr(target_os = "wasi", serde(with = "wasi_os::args"))]
     pub args: Vec<OsString>,
     /// All of its environment: the launcher's own is not passed on.
+    #[cfg_attr(target_os = "wasi", serde(with = "wasi_os::env"))]
     pub env: Vec<(OsString, OsString)>,
     pub dir: PathBuf,
     /// Seen read-only, with what is under them; the rest of the machine is seen read-only
@@ -108,6 +110,7 @@ pub struct Spec {
 #[derive(Serialize, Debug)]
 pub struct SpecOf<'a> {
     program: &'a Path,
+    #[cfg_attr(target_os = "wasi", serde(serialize_with = "wasi_os::args::serialize"))]
     args: &'a [OsString],
     env: Passed<'a>,
     dir: &'a Path,
@@ -127,7 +130,74 @@ struct Passed<'a>(&'a [(OsString, OsString)]);
 
 impl Serialize for Passed<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.0.iter().filter(|(name, _)| name != LIVE))
+        let passed = self.0.iter().filter(|(name, _)| name != LIVE);
+        #[cfg(target_os = "wasi")]
+        let passed = passed.map(|(name, value)| (wasi_os::Os(name), wasi_os::Os(value)));
+        serializer.collect_seq(passed)
+    }
+}
+
+/// serde for `OsString` on WASI, which serde has none for: its bytes, in the form serde writes
+/// a Unix one (`{"Unix": [bytes]}`), so a spec reads the same on every target.
+#[cfg(target_os = "wasi")]
+mod wasi_os {
+    use std::{
+        ffi::{OsStr, OsString},
+        os::wasi::ffi::{OsStrExt as _, OsStringExt as _},
+    };
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// One, borrowed, to write.
+    pub(super) struct Os<'a>(pub(super) &'a OsStr);
+
+    impl Serialize for Os<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_newtype_variant("OsString", 0, "Unix", self.0.as_bytes())
+        }
+    }
+
+    /// One, read.
+    struct Read(OsString);
+
+    impl<'de> Deserialize<'de> for Read {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Read, D::Error> {
+            #[derive(Deserialize)]
+            #[serde(rename = "OsString")]
+            enum Wire {
+                Unix(Vec<u8>),
+            }
+            let Wire::Unix(bytes) = Wire::deserialize(deserializer)?;
+            Ok(Read(OsString::from_vec(bytes)))
+        }
+    }
+
+    pub(super) mod args {
+        use super::*;
+
+        pub(crate) fn serialize<S: Serializer>(args: &[OsString], serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(args.iter().map(|arg| Os(arg)))
+        }
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<OsString>, D::Error> {
+            // alloc: the spec's arguments, read once a run
+            Ok(Vec::<Read>::deserialize(deserializer)?.into_iter().map(|it| it.0).collect())
+        }
+    }
+
+    pub(super) mod env {
+        use super::*;
+
+        pub(crate) fn serialize<S: Serializer>(env: &[(OsString, OsString)], serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(env.iter().map(|(name, value)| (Os(name), Os(value))))
+        }
+
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<(OsString, OsString)>, D::Error> {
+            // alloc: the spec's environment, read once a run
+            Ok(Vec::<(Read, Read)>::deserialize(deserializer)?.into_iter().map(|(name, value)| (name.0, value.0)).collect())
+        }
     }
 }
 

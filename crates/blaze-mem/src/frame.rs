@@ -48,6 +48,7 @@ use std::{
     alloc::{AllocError, Allocator, Layout},
     cell::Cell,
     mem::{self, ManuallyDrop, MaybeUninit},
+    num::NonZeroUsize,
     panic::Location,
     ptr::{self, NonNull},
     slice, str,
@@ -1484,10 +1485,10 @@ pub fn current<R>(f: impl FnOnce(&Frame) -> R) -> R {
 /// [`put_current`] puts back what this took, on the thread the job resumes on. With
 /// [`take_below`] and [`take_cancelling`], the rest of the job's task state.
 #[inline(never)]
-pub fn take_current() -> usize {
+pub fn take_current() -> Option<NonZeroUsize> {
     let taken = STACK.try_with(|stack| stack.current.replace(ptr::null())).unwrap_or(ptr::null());
     check_carried(taken, "switched out");
-    taken.expose_provenance()
+    NonZeroUsize::new(taken.expose_provenance())
 }
 
 /// Puts back what [`take_current`] took, on a thread in no task.
@@ -1496,8 +1497,8 @@ pub fn take_current() -> usize {
 ///
 /// Where the thread is in a task: another job's frame would be lost.
 #[inline(never)]
-pub fn put_current(taken: usize) {
-    let frame: *const Frame = ptr::with_exposed_provenance(taken);
+pub fn put_current(taken: NonZeroUsize) {
+    let frame: *const Frame = ptr::with_exposed_provenance(taken.get());
     check_carried(frame, "switched in");
     STACK.with(|stack| {
         assert!(stack.current.get().is_null(), "a job's frame put back on a thread inside another task");
@@ -1509,24 +1510,24 @@ pub fn put_current(taken: usize) {
 
 /// What the frames enclosing the switching job's task used ([`take_current`]).
 #[inline(never)]
-pub fn take_below() -> usize {
-    STACK.try_with(|stack| stack.below.replace(0)).unwrap_or(0)
+pub fn take_below() -> Option<NonZeroUsize> {
+    NonZeroUsize::new(STACK.try_with(|stack| stack.below.replace(0)).unwrap_or(0))
 }
 
 #[inline(never)]
-pub fn put_below(taken: usize) {
-    STACK.with(|stack| stack.below.set(taken));
+pub fn put_below(taken: NonZeroUsize) {
+    STACK.with(|stack| stack.below.set(taken.get()));
 }
 
 /// Whether the switching job is unwinding from [`cancel`] ([`take_current`]).
 #[inline(never)]
-pub fn take_cancelling() -> usize {
-    STACK.try_with(|stack| usize::from(stack.cancelling.replace(false))).unwrap_or(0)
+pub fn take_cancelling() -> Option<NonZeroUsize> {
+    STACK.try_with(|stack| stack.cancelling.replace(false)).unwrap_or(false).then_some(NonZeroUsize::MIN)
 }
 
 #[inline(never)]
-pub fn put_cancelling(taken: usize) {
-    STACK.with(|stack| stack.cancelling.set(taken != 0));
+pub fn put_cancelling(_: NonZeroUsize) {
+    STACK.with(|stack| stack.cancelling.set(true));
 }
 
 /// Whether the calling thread is in a [`task`], so [`current`] has a frame to give.
@@ -1660,7 +1661,7 @@ pub fn os_string<'f>(frame: &'f Frame, text: impl AsRef<std::ffi::OsStr>) -> cra
     crate::text::OsString::from_os_str_in(text, frame)
 }
 
-const _: () = assert!(mem::size_of::<Marker>() == 16);
+const _: () = assert!(mem::size_of::<Marker>() == 2 * mem::size_of::<usize>());
 
 #[cfg(test)]
 mod tests {
@@ -1719,7 +1720,7 @@ mod tests {
         let stale: *const Frame = slot.as_ptr();
         // SAFETY: as in the test of a task inside a dropped frame.
         unsafe { slot.assume_init_drop() };
-        let taken = stale.expose_provenance();
+        let taken = NonZeroUsize::new(stale.expose_provenance()).expect("a frame's address");
         let got = panic::catch_unwind(|| put_current(taken));
         let payload = got.expect_err("a dropped frame put back on a thread panics");
         let text = payload.downcast_ref::<String>().cloned().expect("the panic's text is formatted");
@@ -1732,7 +1733,7 @@ mod tests {
     fn a_live_frame_carried_across_a_switch_is_current_again() {
         task(Tag::Other, |frame| {
             let at: *const Frame = frame;
-            let taken = take_current();
+            let taken = take_current().expect("a task's frame is taken");
             assert!(!in_task());
             put_current(taken);
             assert_eq!(STACK.with(|stack| stack.current.get()), at);

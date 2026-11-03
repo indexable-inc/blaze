@@ -351,6 +351,7 @@ dependencies = [
  "std_detect",
  "unwind",
  "vex-sdk",
+ "wasi_rt",
  "wasip1",
  "wasip2",
  "wasip3",
@@ -412,6 +413,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79e5fe15afde1305478b35e2cb717fff59f485428534cf49cfdbfa4723379bf6"
 dependencies = [
  "rustc-std-workspace-core",
+]
+
+[[package]]
+name = "wasi_rt"
+version = "0.0.0"
+dependencies = [
+ "dlmalloc",
+ "libc",
+ "rustc-std-workspace-core",
+ "wasip1",
 ]
 
 [[package]]

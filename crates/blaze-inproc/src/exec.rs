@@ -38,6 +38,14 @@ impl Executable {
         Ok(Executable { memory: sys::Exec::new(code_len, data_len, write)? })
     }
 
+    /// Makes the calling thread able to run every `Executable`'s code: what a child forked
+    /// from a process with `Executable`s calls before it runs any. On macOS the child's one
+    /// thread may start with `MAP_JIT` pages writable and not executable, whatever its
+    /// parent's thread had; elsewhere it does nothing. Async-signal-safe.
+    pub fn after_fork() {
+        sys::Exec::after_fork();
+    }
+
     /// Where the code's first byte is.
     pub fn code_address(&self) -> u64 {
         self.memory.code_address()

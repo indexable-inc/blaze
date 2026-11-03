@@ -25,6 +25,8 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::DroppedError
         | Lint::HashOrderOutput
         | Lint::HeldAcrossWait
+        // Kept with `#[expect(..)]`: where a function reads a thread-local is its own choice.
+        | Lint::ThreadLocalInWaitingFn
         | Lint::LockAcrossQuery
         | Lint::BlockingOnPool
         | Lint::UnnamedWait

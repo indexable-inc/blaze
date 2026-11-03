@@ -30,6 +30,7 @@ before any command runs. It says
 
     blaze 0.20261028.9 (fb82b09 2026-10-28)     a release: the version, the commit and its date (UTC)
     blaze 0.0.0-dev (fb82b09)                   a build of the tree: no release, and no pin names it
+                                                (it runs itself in any checkout of blaze's tree, or with --ignore-pin)
 
 The version is the second field (`.github/actions/blaze` reads it). The binary does not know its
 channel: a canary is made stable unchanged. Where a manifest's version must be the release's
@@ -92,9 +93,25 @@ main's HEAD the same way (`train_release.py`): a tag through the API and release
 no commit. Both count every tag, so they never take the same number.
 
 Either way `release.yaml` builds the archives on the tag for macOS (Apple silicon) and Linux
-(x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS` (what install.sh checks) and `B3SUMS` (what a
-pinned release's fetch checks). PGO is off for now (#870):
+(x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS` (what install.sh checks) and `B3SUMS`; a
+pinned release's fetch checks both, and a release from before `B3SUMS` (dated before 2026-10-31,
+when no release lacks it) by its `SHA256SUMS` alone; one dated later that lacks `B3SUMS` is
+refused ([cargo.md](cargo.md#pinning-a-release-of-blaze)). PGO is off for now (#870):
 the release is built with `--no-pgo`.
+
+The sums come from the same release as the archives, so they show an archive arrived whole and
+unchanged, not that blaze's release workflow made it: whoever can replace a release's assets can
+replace its sums too. The plan for that, in order:
+
+1. A pin records the digest. `blaze pin` writes each host's archive digest beside the version
+   (`[workspace.metadata.blaze] b3 = { "<host>" = "<hex>", ... }`), read from the release's
+   lists at pin time and then reviewed and committed with the manifest, as `go.sum` is: trust on
+   first use, then the launcher refuses an archive whose digest is not the pinned one. This
+   covers every pin to a version.
+2. Releases are signed. release.yaml signs `B3SUMS` (`B3SUMS.sig`, a key blaze carries, or
+   GitHub's artifact attestations) and the launcher checks the signature before it reads the
+   list. This covers pins to a channel, which can't record a digest, and the first pin of a
+   version.
 
 ## Promotion to stable
 

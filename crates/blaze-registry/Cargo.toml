@@ -40,15 +40,22 @@ blaze-ids.workspace = true
 blaze-manifest.workspace = true
 toml.workspace = true
 # The HTTP stack the rest of blaze uses (crates/blaze-engine/Cargo.toml): hyper 1 over rustls with ring.
-hyper = { workspace = true, features = ["client", "http1"] }
-hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
-hyper-rustls = { workspace = true, features = ["http1", "native-tokio", "ring", "tls12"] }
-http-body-util.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+hyper = { workspace = true, optional = true, features = ["client", "http1"] }
+# The method, status and header names `api` asks with, which the seed has without hyper and tokio.
+http.workspace = true
+hyper-util = { workspace = true, optional = true, features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { workspace = true, optional = true, features = ["http1", "native-tokio", "ring", "tls12"] }
+http-body-util = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[features]
+default = ["net"]
+# `http::HyperHttp` over hyper and rustls on ring. Without it (the seed profile, which builds
+# offline from vendored sources) every request is `http::NoNet`, naming its URL.
+net = ["dep:hyper", "dep:hyper-util", "dep:hyper-rustls", "dep:http-body-util", "dep:tokio"]
 
 [lints]
 workspace = true

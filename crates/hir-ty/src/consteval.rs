@@ -307,11 +307,9 @@ pub enum CreateConstError {
     UsedForbiddenParam,
     /// A local binding: E0435.
     LocalBinding,
-    /// A static: E0013.
-    Static,
     /// The `Self` constructor of an impl.
     ImplSelf,
-    /// A function or constructor named by a bare path, which only an anon const holds.
+    /// A function, constructor or static named by a bare path, which only an anon const holds.
     NeedsAnonConst,
     /// A path that names no value: E0425.
     DoesNotResolve,
@@ -350,10 +348,15 @@ pub(crate) fn path_to_const<'a, 'db: 'a>(
             return Ok(Const::new_param(interner, ParamConst { id: param, index }));
         }
         ValueNs::LocalBinding(_) => return Err(CreateConstError::LocalBinding),
-        ValueNs::StaticId(_) => return Err(CreateConstError::Static),
         ValueNs::ImplSelf(_) => return Err(CreateConstError::ImplSelf),
-        // A function or a constructor is a value, but only an anon const can hold it.
-        ValueNs::FunctionId(_) | ValueNs::StructId(_) | ValueNs::EnumVariantId(_) => {
+        // A function or a constructor is a value, but only an anon const can hold it. So is a
+        // static: a constant may read one (`const_refs_to_static`, stable since Rust 1.83), so
+        // `[u8; S]` is an anon const whose evaluation reads `S`, and reading mutable memory
+        // there is the evaluator's error, as rustc's E0080, not lowering's.
+        ValueNs::StaticId(_)
+        | ValueNs::FunctionId(_)
+        | ValueNs::StructId(_)
+        | ValueNs::EnumVariantId(_) => {
             return Err(CreateConstError::NeedsAnonConst);
         }
     };
@@ -885,8 +888,7 @@ fn read_memory_map<'db>(
         map.aligns.push((word(align.address)?, word(align.align)?));
     }
     for it in statics {
-        let id = crate::check_cache::id_of::<StaticId>(it.id)
-            .ok_or_else(|| invalid("a static of id index 0 or not in the table"))?;
+        let id = crate::check_cache::id_of::<StaticId>(it.id).map_err(|refused| refused.at(at))?;
         map.statics.push(StaticMemory { start: word(it.start)?, size: word(it.size)?, id });
     }
     if vtable_dyns.len() != vtable.len() {

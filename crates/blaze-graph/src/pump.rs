@@ -100,13 +100,15 @@ pub fn gave_way() -> u64 {
 }
 
 /// The switching job's give-ways, which move with it (a loop compares them before and after an
-/// item, which may resume on another thread).
-pub(crate) fn take_gave_ways() -> usize {
-    GAVE_WAYS.with(|it| it.replace(0)) as usize
+/// item, which may resume on another thread). Not inlined, as [`gave_way`] is not.
+#[inline(never)]
+pub(crate) fn take_gave_ways() -> Option<std::num::NonZeroUsize> {
+    std::num::NonZeroUsize::new(GAVE_WAYS.with(|it| it.replace(0)) as usize)
 }
 
-pub(crate) fn put_gave_ways(taken: usize) {
-    GAVE_WAYS.with(|it| it.set(taken as u64));
+#[inline(never)]
+pub(crate) fn put_gave_ways(taken: std::num::NonZeroUsize) {
+    GAVE_WAYS.with(|it| it.set(taken.get() as u64));
 }
 
 /// Counts a give-way of this task and says it: what a wait outside these flights calls when it

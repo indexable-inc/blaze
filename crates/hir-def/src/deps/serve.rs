@@ -111,6 +111,9 @@ pub struct Served {
     /// The crates with reads kept under their key but no image for the values those reads
     /// have now: something they read changed, so they are resolved and imaged again.
     pub stale: Vec<Crate>,
+    /// The blaze the keys were made by: [`store`] makes each key again with it, to check the
+    /// database did not move a crate's key between the serve and the store.
+    pub build: ContentId,
 }
 
 /// Why [`store`] wrote no image of a crate. Each is an input the key and the reads do not
@@ -122,9 +125,16 @@ pub enum Refused {
     SessionMacros,
     /// A procedural macro's expansion of it whose reads are not known, and why.
     ProcMacro { call: String, why: &'static str },
-    /// A module or an `include!` of it is a file outside the crate's source root, whose text
-    /// the key does not cover (`OUT_DIR`, a `#[path]` out of the crate).
+    /// A module, an `include!`, `include_str!` or `include_bytes!` of it reads a file outside
+    /// the crate's source root (a `#[path]` or a path into another package, a file no source
+    /// root has): the key, made before the crate is resolved, covers only the source root's
+    /// files ([`refusal`], [`include_refusal`]). A build script's `OUT_DIR` files are in it.
+    /// `what` names the module or the macro, where it is, and the file.
     OutsideSourceRoot { what: String },
+    /// The crate's key as the database has it when its image would be written is not the one
+    /// it was served under: something it is made from changed between the serve and the
+    /// store, so the image would be filed under a key that does not name it (rule 18).
+    KeyMoved { served: ContentId, now: Option<ContentId> },
     /// A part of it holds a path its key writes as a marker ([`Base`]): the image would not be
     /// the same in another checkout with the same key.
     MachinePath { part: Part, path: String },
@@ -142,8 +152,19 @@ impl std::fmt::Display for Refused {
                 write!(f, "what procedural macro {call} read is not known: {why}")
             }
             Refused::OutsideSourceRoot { what } => {
-                write!(f, "{what} is outside the crate's source root")
+                write!(f, "{what}, outside the crate's source root, which its key covers")
             }
+            Refused::KeyMoved { served, now } => match now {
+                Some(now) => write!(
+                    f,
+                    "its key moved from {served:?}, which it was served under, to {now:?} \
+                     before its image was written"
+                ),
+                None => write!(
+                    f,
+                    "it had key {served:?} when served and is not eligible for an image now"
+                ),
+            },
             Refused::MachinePath { part, path } => {
                 write!(f, "its {} hold the path {path}, which its key does not", part.name())
             }
@@ -226,7 +247,7 @@ pub fn serve(
     if order.is_empty() {
         hits.sort_unstable_by_key(|krate| keys[krate]);
         // alloc: none: an empty `Vec` holds no buffer
-        return Ok(Served { keys, hits, stale: Vec::new() });
+        return Ok(Served { keys, hits, stale: Vec::new(), build });
     }
     // clone: what was served before, once per serve that fetches a crate, to add to
     let mut served = (*before).clone();
@@ -262,7 +283,7 @@ pub fn serve(
     }
     hits.sort_unstable_by_key(|krate| keys[krate]);
     if !changed {
-        return Ok(Served { keys, hits, stale });
+        return Ok(Served { keys, hits, stale, build });
     }
     frozen::set(db, maps);
     frozen::set_lang_items(db, lang_items);
@@ -270,7 +291,7 @@ pub fn serve(
     // A served crate's modules are the decoded map's, not the ones its dependents were
     // maintained against: the maintainers run again over the crates now served.
     db.note_crates_changed();
-    Ok(Served { keys, hits, stale })
+    Ok(Served { keys, hits, stale, build })
 }
 
 /// The frozen bytes a database was given, to add to.
@@ -352,13 +373,25 @@ pub fn store(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<Stored
         // alloc: setup: once per session
         .collect();
     order.sort_unstable_by_key(|&(_, key)| key);
+    // The keys as the database has them now, in one walk: a crate whose key moved since the
+    // serve is not written under the old one.
+    let now = {
+        // alloc: setup: once per store
+        let crates: Vec<Crate> = order.iter().map(|&(krate, _)| krate).collect();
+        let _span = tracing::info_span!(target: "blaze", "dependency image keys at store", crates = crates.len()).entered();
+        keys(db, &crates, served.build)
+    };
     #[expect(clippy::disallowed_types, reason = "image creation results, set once per crate in a session: not global")]
     let made: Vec<std::sync::OnceLock<Result<Result<ContentId, Refused>, String>>> =
         // alloc: setup: one slot per crate, once per session
         order.iter().map(|_| std::sync::OnceLock::new()).collect();
     images.for_each(order.len(), &|at| {
         let (krate, key) = order[at];
-        _ = made[at].set(make(db, krate, key, images));
+        let made_now = match now.get(&krate) {
+            Some(&it) if it == key => make(db, krate, key, images),
+            now => Ok(Err(Refused::KeyMoved { served: key, now: now.copied() })),
+        };
+        _ = made[at].set(made_now);
     });
     let mut stored = Stored::default();
     for (&(krate, _), made) in order.iter().zip(made) {
@@ -394,6 +427,9 @@ fn make(
         Ok(parts) => parts,
         Err(why) => return Ok(Err(why)),
     };
+    if let Some(why) = include_refusal(db, krate, &calls) {
+        return Ok(Err(why));
+    }
     if let Some(why) = Base::of(db, krate).held_by(&parts) {
         return Ok(Err(why));
     }
@@ -425,43 +461,113 @@ fn encode(db: &Db, krate: Crate, calls: &mut Vec<MacroCallId>) -> Result<[Vec<u8
     ])
 }
 
-/// Why the image of `krate` would leave out an input its reads do not cover, if it would.
+/// Why the image of `krate` would leave out an input its key and reads do not cover, if it
+/// would, as far as its def map says, before its image is encoded: a def map that uses the
+/// session's macros, or a module whose file is outside the crate's source root.
+///
+/// The key covers every file of the crate's source root by its path and content, a file with
+/// no text by its bytes ([`super::key`]), and a frozen def map's files are looked up there
+/// alone when it is read. A file the crate's resolution or signatures read from anywhere else
+/// is not known until the crate is resolved, so no key made before that can cover it, and an
+/// image filed by it (as by [`Reads`]) would be kept as it is by a [`serve`] whose key did not
+/// move after that file was edited: such a crate is refused. The `include!`s the image depends
+/// on are asked once it is encoded, when its signatures' calls are known
+/// ([`include_refusal`]).
 pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
     let def_map = crate_def_map(db, krate);
     if def_map.session_macros {
         return Some(Refused::SessionMacros);
     }
     let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
-    for (_, module) in def_map.modules(db) {
+    for (id, module) in def_map.modules(db) {
         if let Some(file) = module.origin.file_id() {
             let file = file.file_id(db);
             if db.file_source_root(file).source_root_id(db) != root {
                 // alloc: why a crate is refused, once per refused crate
-                return Some(Refused::OutsideSourceRoot { what: format!("module file {file:?}") });
-            }
-        }
-        for call in module.scope(db).all_macro_calls() {
-            let loc = call.lookup(db);
-            if let MacroDefKind::BuiltInEager(_, expander) = &loc.def.kind
-                && expander.is_include_like()
-                && include_outside(db, call, root)
-            {
-                // alloc: why a crate is refused, once per refused crate
-                return Some(Refused::OutsideSourceRoot { what: format!("include {call:?}") });
+                let what = format!(
+                    "module `{}` of crate {} is the file {}",
+                    module_path(db, id),
+                    crate_name(db, krate),
+                    shown_path(db, file),
+                );
+                return Some(Refused::OutsideSourceRoot { what });
             }
         }
     }
     None
 }
 
-/// Whether the file the eager `include!`, `include_str!` or `include_bytes!` `call` reads is
-/// outside the source root `root`, or not known: its eager argument, expanded, is the path.
-fn include_outside(db: &Db, call: MacroCallId, root: base_db::SourceRootId) -> bool {
-    let MacroCallKind::FnLike { eager: Some(eager), .. } = &call.lookup(db).kind else {
-        return true;
-    };
-    match include_input_to_file_id(db, call, &eager.arg) {
-        Ok(file) => db.file_source_root(file.file_id(db)).source_root_id(db) != root,
-        Err(_) => true,
+/// Why the image of `krate` would leave out a file an `include!`, `include_str!` or
+/// `include_bytes!` it depends on reads, if it would: one of `calls` (those its signatures
+/// name) or of its modules' scopes, or one any of them is expanded in, whose file is outside
+/// the crate's source root or not known ([`refusal`]). The calls walked are those its reads
+/// are worked out from ([`super::reads::image_calls`]).
+pub(super) fn include_refusal(db: &Db, krate: Crate, calls: &[MacroCallId]) -> Option<Refused> {
+    let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
+    let todo = super::reads::image_calls(db, krate, calls);
+    let refused = super::reads::each_call(db, krate, todo, |call, loc| {
+        let MacroDefKind::BuiltInEager(_, expander) = &loc.def.kind else { return Ok(()) };
+        if !expander.is_include_like() {
+            return Ok(());
+        }
+        // The argument of an eager macro, expanded as a call of its own (`eager: None`): the
+        // parent of the calls in it (`concat!`, `env!`). The include it is the argument of is a
+        // call of the scope or store too, and is asked there.
+        let MacroCallKind::FnLike { eager: Some(eager), .. } = &loc.kind else { return Ok(()) };
+        let read = match include_input_to_file_id(db, call, &eager.arg) {
+            Ok(file) => {
+                let file = file.file_id(db);
+                if db.file_source_root(file).source_root_id(db) == root {
+                    return Ok(());
+                }
+                // alloc: why a crate is refused, once per refused crate
+                format!("reads {}", shown_path(db, file))
+            }
+            // alloc: as above
+            Err(why) => format!("names a file no source root has ({})", why.kind().render_to_string(db).message),
+        };
+        let name = match expander {
+            hir_expand::builtin::EagerExpander::Include => "include!",
+            hir_expand::builtin::EagerExpander::IncludeStr => "include_str!",
+            _ => "include_bytes!",
+        };
+        // alloc: as above
+        let what = format!("`{name}` of crate {} at {} {read}", crate_name(db, krate), call_site(db, loc));
+        Err(Refused::OutsideSourceRoot { what })
+    });
+    refused.err()
+}
+
+/// The path the source root has `file` at, as an error shows it.
+fn shown_path(db: &Db, file: base_db::FileId) -> String {
+    match db.path_for_file(file) {
+        Some(path) => path.to_string(), // alloc: error text
+        None => format!("{file:?}, which has no path"), // alloc: error text
     }
+}
+
+/// Where the call `loc` is in a file of its crate: the file's path and the line, from 1.
+fn call_site(db: &Db, loc: &hir_expand::MacroCallLoc) -> String {
+    let range = loc.kind.original_call_range_with_input(db);
+    let file = range.file_id.file_id(db);
+    let start = usize::from(range.range.start());
+    let text = db.file_text(file).text(db);
+    let line = text.get(..start).map_or(0, |it| it.matches('\n').count()) + 1;
+    // alloc: error text
+    format!("{}:{line}", shown_path(db, file))
+}
+
+/// The path of `module` in its crate, as `crate::a::b`.
+fn module_path(db: &Db, module: crate::ModuleId) -> String {
+    // alloc: error text
+    let mut names = Vec::new();
+    let mut at = Some(module);
+    while let Some(it) = at {
+        let Some(name) = it.name(db) else { break };
+        names.push(name.as_str().to_owned()); // alloc: error text
+        at = it.containing_module(db).map(|it| it.to_static());
+    }
+    names.push("crate".to_owned()); // alloc: error text
+    names.reverse();
+    names.join("::")
 }

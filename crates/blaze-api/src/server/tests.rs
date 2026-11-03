@@ -18,6 +18,7 @@ fn config(unix: bool, http: bool) -> Config {
             token: "s3cret-token".to_owned(),
         }),
         tags: 1 << 40,
+        local: false,
         most_connections: 8,
     }
 }
@@ -478,7 +479,7 @@ fn an_empty_token_or_no_address_is_a_failure() {
     let rig = Rig::new(config);
     assert!(rig.server.failed().unwrap().contains("empty token"));
     assert!(rig.listen(false).is_none());
-    let rig = Rig::new(Config { unix: None, http: None, tags: 0, most_connections: 1 });
+    let rig = Rig::new(Config { unix: None, http: None, local: false, tags: 0, most_connections: 1 });
     assert!(rig.server.failed().is_some());
 }
 
@@ -915,4 +916,30 @@ fn a_connection_waits_while_its_send_is_in_flight() {
     assert!(!sent.is_empty());
     assert!(!rig.server.waiting(conn), "the send completed");
     assert!(!rig.server.waiting(Conn(99)), "a connection the server has none of waits on nothing");
+}
+
+/// The one-shot build's connection: a request handed in as the socket's frames arrives, and
+/// its replies wait, with nothing asked of the driver, until taken; a stop keeps the ones not
+/// yet taken until they are. A server that listens takes no such connection.
+#[test]
+fn a_local_connection_takes_its_replies_from_the_server_never_the_driver() {
+    let mut rig = Rig::new(config(true, false));
+    assert_eq!(rig.server.open_local(), None);
+    let mixed = Rig::new(Config { local: true, ..config(true, false) });
+    assert!(mixed.server.failed().unwrap().contains("only when it listens on nothing"), "{:?}", mixed.server.failed());
+    let mut rig = Rig::new(Config { local: true, ..config(false, false) });
+    assert_eq!(rig.server.failed(), None);
+    assert!(rig.in_flight.is_empty(), "{:?}", rig.in_flight);
+    let conn = rig.server.open_local().unwrap();
+    let (mut effects, mut arrived) = (Vec::new(), Vec::new());
+    rig.server.send_local(conn, &frame_of(3, Request::Status), &mut effects, &mut arrived);
+    assert_eq!(arrived, [asked(conn, 3, Request::Status)]);
+    rig.server.reply(Reply { to: RequestRef { conn, id: 3 }, response: Response::Done { ok: true } }, &mut effects);
+    rig.server.stop(&mut effects);
+    assert!(effects.is_empty(), "{effects:?}");
+    let mut taken = Vec::new();
+    assert!(rig.server.take_local(conn, &mut taken, &mut effects));
+    assert_eq!(responses(&taken), [Envelope::new(3, Response::Done { ok: true })]);
+    assert!(!rig.server.take_local(conn, &mut taken, &mut effects));
+    assert!(effects.is_empty(), "{effects:?}");
 }

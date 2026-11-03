@@ -60,6 +60,18 @@ pub fn search_path_of(path: &Path) -> &Path {
     }
 }
 
+/// The directory a link searches for native libraries from a search path, as rustc's
+/// `SearchPath::from_cli_opt` reads `-L KIND=PATH`: `native=`, `framework=`, `all=` or no
+/// kind are searched, without the kind; `crate=` and `dependency=` name where crates are, never
+/// native libraries, so `None`. The kind is never part of the directory: `native=/out` is
+/// `/out` (cc's `cargo:rustc-link-search=native=OUT_DIR`, blake3's and tree-sitter's).
+pub fn native_search_dir(path: &Path) -> Option<&Path> {
+    match path.to_str().and_then(|it| it.split_once('=')) {
+        Some(("crate" | "dependency", _)) => None,
+        _ => Some(search_path_of(path)),
+    }
+}
+
 /// Which of the package's targets a `rustc-link-arg*` is for.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum LinkArgTarget {

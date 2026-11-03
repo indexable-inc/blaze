@@ -1133,7 +1133,7 @@ pub(super) fn assemble(target: &'static super::Target, text: &str) -> Result<Vec
             // alloc: once per block of assembly the store does not have (`asm::assemble`)
             Arch::X86_64 => format!(".intel_syntax noprefix\n{text}\n.att_syntax\n"),
             // alloc: as above
-            Arch::Aarch64 | Arch::Wasm32 => format!("{text}\n"),
+            Arch::Aarch64 | Arch::Wasm32 | Arch::Wasm64 => format!("{text}\n"),
         };
         module.set_inline_assembly(&text);
         let object = machine
@@ -1670,11 +1670,11 @@ impl Machine {
             Arch::X86_64 => Target::initialize_x86(&InitializationConfig::default()),
             Arch::Aarch64 => Target::initialize_aarch64(&InitializationConfig::default()),
             #[cfg(feature = "llvm-wasm")]
-            Arch::Wasm32 => Target::initialize_webassembly(&InitializationConfig::default()),
+            Arch::Wasm32 | Arch::Wasm64 => Target::initialize_webassembly(&InitializationConfig::default()),
             // The pinned LLVM (`llvm.json`) is built without the WebAssembly target, so its
             // initializer is not in the library this links.
             #[cfg(not(feature = "llvm-wasm"))]
-            Arch::Wasm32 => {
+            Arch::Wasm32 | Arch::Wasm64 => {
                 return Err(Unhandled::Llvm(
                     "no LLVM producer for wasm32: blaze's LLVM (llvm.json) is built without the \
                      WebAssembly target, and blaze is built without `llvm-wasm`"
@@ -1693,7 +1693,7 @@ impl Machine {
         let told = told(emitted, features)?;
         let relocation = match emitted.arch {
             Arch::X86_64 | Arch::Aarch64 => RelocMode::PIC,
-            Arch::Wasm32 => RelocMode::Static,
+            Arch::Wasm32 | Arch::Wasm64 => RelocMode::Static,
         };
         let machine = target
             .create_target_machine(
@@ -2520,6 +2520,89 @@ attributes #0 = { alwaysinline }
         assert!(error.to_string().contains("get_stack_pointer"), "{error}");
     }
 
+    /// Every instruction on vectors the front end makes (`neon.rs` and `x86.rs` for the
+    /// `core::arch` intrinsics a vector instruction is, `wasm_simd.rs` for the generic `simd_*`
+    /// ones, on every target) is one LLVM lowers, as the stencils do: a function of each, its
+    /// operands loaded and its result stored as the front end does, compiles. `vpadalq_u8`
+    /// (`uwiden_low`), `vqtbl1q_u8` (`swizzle`) and `vcombine_u64` (`scalar_to_vector`) were
+    /// refused at release, so code using NEON did not build (sb-simd, 2026-11-02).
+    #[test]
+    fn every_vector_instruction_the_front_end_makes_is_lowered_by_llvm() {
+        use cranelift_codegen::ir::{
+            AbiParam, InstBuilder, UserFuncName, Value, condcodes::FloatCC, types::*,
+        };
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+        type Make = fn(&mut FunctionBuilder<'_>, Value) -> Value;
+        fn at(b: &mut FunctionBuilder<'_>, ty: ir::Type, p: Value, offset: i32) -> Value {
+            b.ins().load(ty, crate::MEM, p, offset)
+        }
+        let cases: &[(&str, Make)] = &[
+            ("swizzle", |b, p| { let (x, i) = (at(b, I8X16, p, 0), at(b, I8X16, p, 16)); b.ins().swizzle(x, i) }),
+            ("uwiden_low", |b, p| { let x = at(b, I8X16, p, 0); b.ins().uwiden_low(x) }),
+            ("uwiden_high", |b, p| { let x = at(b, I16X8, p, 0); b.ins().uwiden_high(x) }),
+            ("swiden_low", |b, p| { let x = at(b, I32X4, p, 0); b.ins().swiden_low(x) }),
+            ("swiden_high", |b, p| { let x = at(b, I8X16, p, 0); b.ins().swiden_high(x) }),
+            ("scalar_to_vector", |b, p| { let x = at(b, I64, p, 0); b.ins().scalar_to_vector(I64X2, x) }),
+            ("scalar_to_vector f32", |b, p| { let x = at(b, F32, p, 0); b.ins().scalar_to_vector(F32X4, x) }),
+            ("avg_round", |b, p| { let (x, y) = (at(b, I8X16, p, 0), at(b, I8X16, p, 16)); b.ins().avg_round(x, y) }),
+            ("sqmul_round_sat", |b, p| { let (x, y) = (at(b, I16X8, p, 0), at(b, I16X8, p, 16)); b.ins().sqmul_round_sat(x, y) }),
+            ("snarrow", |b, p| { let (x, y) = (at(b, I16X8, p, 0), at(b, I16X8, p, 16)); b.ins().snarrow(x, y) }),
+            ("unarrow", |b, p| { let (x, y) = (at(b, I32X4, p, 0), at(b, I32X4, p, 16)); b.ins().unarrow(x, y) }),
+            ("uunarrow", |b, p| { let (x, y) = (at(b, I64X2, p, 0), at(b, I64X2, p, 16)); b.ins().uunarrow(x, y) }),
+            ("iabs", |b, p| { let x = at(b, I8X16, p, 0); b.ins().iabs(x) }),
+            ("iabs scalar", |b, p| { let x = at(b, I32, p, 0); b.ins().iabs(x) }),
+            ("popcnt", |b, p| { let x = at(b, I8X16, p, 0); b.ins().popcnt(x) }),
+            ("fadd", |b, p| { let (x, y) = (at(b, F32X4, p, 0), at(b, F32X4, p, 16)); b.ins().fadd(x, y) }),
+            ("fdiv", |b, p| { let (x, y) = (at(b, F64X2, p, 0), at(b, F64X2, p, 16)); b.ins().fdiv(x, y) }),
+            ("fmin", |b, p| { let (x, y) = (at(b, F32X4, p, 0), at(b, F32X4, p, 16)); b.ins().fmin(x, y) }),
+            ("fneg", |b, p| { let x = at(b, F64X2, p, 0); b.ins().fneg(x) }),
+            ("sqrt", |b, p| { let x = at(b, F32X4, p, 0); b.ins().sqrt(x) }),
+            ("nearest", |b, p| { let x = at(b, F32X4, p, 0); b.ins().nearest(x) }),
+            ("fcmp", |b, p| { let (x, y) = (at(b, F32X4, p, 0), at(b, F32X4, p, 16)); b.ins().fcmp(FloatCC::LessThan, x, y) }),
+            ("bitselect", |b, p| { let (c, x, y) = (at(b, I8X16, p, 0), at(b, I8X16, p, 16), at(b, I8X16, p, 32)); b.ins().bitselect(c, x, y) }),
+            ("bitselect f32", |b, p| { let (c, x, y) = (at(b, F32X4, p, 0), at(b, F32X4, p, 16), at(b, F32X4, p, 32)); b.ins().bitselect(c, x, y) }),
+            ("fcvt_from_sint", |b, p| { let x = at(b, I32X4, p, 0); b.ins().fcvt_from_sint(F32X4, x) }),
+            ("fcvt_from_uint", |b, p| { let x = at(b, I32X4, p, 0); b.ins().fcvt_from_uint(F32X4, x) }),
+            ("fcvt_to_sint_sat", |b, p| { let x = at(b, F32X4, p, 0); b.ins().fcvt_to_sint_sat(I32X4, x) }),
+            ("fcvt_to_uint_sat", |b, p| { let x = at(b, F32X4, p, 0); b.ins().fcvt_to_uint_sat(I32X4, x) }),
+            ("fvpromote_low", |b, p| { let x = at(b, F32X4, p, 0); b.ins().fvpromote_low(x) }),
+            ("fvdemote", |b, p| { let x = at(b, F64X2, p, 0); b.ins().fvdemote(x) }),
+            ("uload8x8", |b, p| b.ins().uload8x8(crate::MEM, p, 0)),
+            ("sload32x2", |b, p| b.ins().sload32x2(crate::MEM, p, 8)),
+            ("umulhi", |b, p| { let (x, y) = (at(b, I16X8, p, 0), at(b, I16X8, p, 16)); b.ins().umulhi(x, y) }),
+            ("vconst", |b, _| {
+                let constant = b.func.dfg.constants.insert((0..16).collect::<Vec<u8>>().into());
+                b.ins().vconst(I32X4, constant)
+            }),
+        ];
+        let isa = super::super::isa_for(crate::Target::for_host()).unwrap();
+        let mut refused = Vec::new();
+        for (name, make) in cases {
+            let mut wants = Wants::new(crate::Target::for_host(), &**isa);
+            let mut sig = ir::Signature::new(isa.default_call_conv());
+            sig.params.push(AbiParam::new(I64));
+            let mut func = ir::Function::with_name_signature(UserFuncName::default(), sig);
+            let mut context = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut func, &mut context);
+            let block = builder.create_block();
+            builder.append_block_params_for_function_params(block);
+            builder.switch_to_block(block);
+            builder.seal_block(block);
+            let p = builder.block_params(block)[0];
+            let value = make(&mut builder, p);
+            builder.ins().store(crate::MEM, value, p, 64);
+            builder.ins().return_(&[]);
+            builder.finalize(isa.frontend_config());
+            for optimization in [Optimization::NONE, Optimization { passes: Passes::Aggressive, selection: Selection::Optimized }] {
+                if let Err(why) = emit(&mut wants, &[], &func, optimization, None, &[]) {
+                    refused.push(format!("{name}: {why}"));
+                }
+            }
+        }
+        assert!(refused.is_empty(), "LLVM refused:\n{}", refused.join("\n"));
+    }
+
     /// A target machine is told its set in LLVM's names, one per set a thread compiles with,
     /// and a name LLVM's target lacks is an error naming it, not a machine of fewer features.
     #[test]
@@ -2528,7 +2611,7 @@ attributes #0 = { alwaysinline }
         let wanted = match target.arch {
             Arch::X86_64 => "+avx2",
             Arch::Aarch64 => "+dotprod",
-            Arch::Wasm32 => return,
+            Arch::Wasm32 | Arch::Wasm64 => return,
         };
         let set = target.features_of(&[wanted.to_owned()]).unwrap();
         let machine = Machine::create_for(crate::Target::for_host(), Optimization::NONE, set).unwrap();

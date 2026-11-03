@@ -2462,6 +2462,93 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         }
     }
 
+    /// blaze: the expansion errors of the items the modules of `krate` declare outside any
+    /// body into `acc`, nothing type-checked: what [`crate::check::check_expansions`] gives of
+    /// the crate's def map.
+    pub(crate) fn collect_item_expansions(
+        db: &'db Db,
+        krate: base_db::Crate,
+        acc: &'a mut Vec<AnyDiagnostic<'db>>,
+        bodies: &'a F,
+    ) {
+        let edition = krate.data(db).edition;
+        let mut this =
+            DiagnosticsCollector { db, krate, edition, style_lints: false, acc, bodies, deferred: None };
+        for (module, _) in hir_def::nameres::crate_def_map(db, krate).modules(db) {
+            this.collect_module_expansions(module);
+        }
+    }
+
+    /// blaze: what lowering body `def` found into `acc`, its macro calls' expansion errors
+    /// included, and the expansion errors of the items its blocks declare; nothing
+    /// type-checked: what [`crate::check::check_expansions`] gives of a body. The bodies of
+    /// the items its blocks declare are their own.
+    pub(crate) fn collect_body_expansions(
+        db: &'db Db,
+        def: DefWithBodyId,
+        acc: &'a mut Vec<AnyDiagnostic<'db>>,
+        bodies: &'a F,
+    ) {
+        let krate = hir_def::HasModule::krate(&def, db);
+        let edition = krate.data(db).edition;
+        let mut this =
+            DiagnosticsCollector { db, krate, edition, style_lints: false, acc, bodies, deferred: None };
+        let body = Body::of(db, def);
+        if !Body::unmoved_source_map(db, def).diagnostics().is_empty() || store_macro_failed(db, body) {
+            this.collect_store_diagnostics(&Body::with_source_map(db, def).1);
+        }
+        for (_, block_def_map) in body.blocks(db) {
+            for (module, _) in block_def_map.modules(db) {
+                this.collect_module_expansions(module);
+            }
+        }
+    }
+
+    /// The expansion errors of the items `module` declares: its def map's errors of macro
+    /// calls and derives, its item-level macro calls' (a block module's are its body's), and
+    /// those of the items of its traits and impls.
+    fn collect_module_expansions(&mut self, module: ModuleId) {
+        let db = self.db;
+        let def_map = module.def_map(db);
+        for diag in def_map.diagnostics_of(db, module) {
+            self.emit_expansion_diagnostic(&diag.kind);
+        }
+        let scope = def_map.module(db, module).scope(db);
+        if !module.is_block_module(db) {
+            scope.all_macro_calls().for_each(|call| self.collect_macro_call(call));
+        }
+        for def in scope.declarations() {
+            if let ModuleDefId::TraitId(trait_) = def {
+                let items = TraitItems::query_with_diagnostics(db, trait_);
+                items.1.iter().for_each(|diag| self.emit_expansion_diagnostic(&diag.kind));
+                items.0.macro_calls().for_each(|(_, call)| self.collect_macro_call(call));
+            }
+        }
+        for impl_ in scope.impls() {
+            let items = ImplItems::of(db, impl_);
+            items.1.iter().for_each(|diag| self.emit_expansion_diagnostic(&diag.kind));
+            items.0.macro_calls().for_each(|(_, call)| self.collect_macro_call(call));
+        }
+    }
+
+    /// `diag` if it is of expanding a macro call or a derive; any other (name resolution, an
+    /// inactive item) is left to the checks that report it.
+    fn emit_expansion_diagnostic(&mut self, diag: &DefDiagnosticKind) {
+        // `UnimplementedBuiltinMacro` is left out: it is said at a built-in macro's definition
+        // (core's `pub macro autodiff_forward`), which is no error until something calls it, and
+        // a call's failure is a `MacroError` at the call.
+        if matches!(
+            diag,
+            DefDiagnosticKind::MacroError { .. }
+                | DefDiagnosticKind::UnresolvedMacroCall { .. }
+                | DefDiagnosticKind::MacroDefError { .. }
+                | DefDiagnosticKind::InvalidDeriveTarget { .. }
+                | DefDiagnosticKind::MalformedDerive { .. }
+        ) {
+            self.emit_def_diagnostic(diag);
+        }
+    }
+
     /// [`Self::collect_sealed`] of the items `module` declares.
     fn collect_sealed_module(
         &mut self,

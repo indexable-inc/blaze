@@ -2,11 +2,14 @@
 use base_db::Db;
 use blaze_mem::Frame;
 use intern::sym;
-use span::Span;
+use span::{Edition, Span};
 
-use crate::{ExpandError, ExpandResult, MacroCallId, MacroCallKind, name, tt};
+use crate::{
+    ExpandError, ExpandResult, MacroCallId, MacroCallKind, hygiene::span_with_def_site_ctxt, name,
+    tt,
+};
 
-use super::quote;
+use super::quote::{self, dollar_crate};
 
 mod contract_test;
 use contract_test::contract_test_expand;
@@ -95,6 +98,8 @@ register_builtin! {
     (contracts_ensures, ContractsEnsures) => contracts_ensures_expand,
     // `#[blaze::contract_test]` (`core::blaze::contract_test`), appended as above.
     (contract_test, ContractTest) => contract_test_expand,
+    // `#[alloc_error_handler]` (`core::prelude::v1::alloc_error_handler`), appended as above.
+    (alloc_error_handler, AllocErrorHandler) => alloc_error_handler_expand,
 }
 
 pub fn find_builtin_attr(ident: &name::Name) -> Option<BuiltinAttrExpander> {
@@ -115,10 +120,18 @@ fn dummy_attr_expand<'f>(
 /// and the others, which its allocator shim calls. These have names of blaze's, which the
 /// stand-in rustc builds for a crate whose code is blaze's calls from a `#[global_allocator]`
 /// of its own (blaze's `stub.rs`).
+///
+/// What the expansion adds is the macro's own code, as rustc's (`global_allocator.rs`) is: it
+/// is spanned in the expansion's def-site context (rustc's `with_def_site_ctxt(item.span)`),
+/// so it is code of an attribute macro's expansion (`Span::in_external_macro`), where the
+/// `unsafe_code` lint of its `unsafe fn`s and blocks is not given, under any lint level of the
+/// crate; and its paths start at `$crate` (`std_path`), core. Its exports are written
+/// `unsafe(export_name = ..)`, which every edition accepts, so a crate of edition 2024 gets no
+/// "unsafe attribute used without unsafe" for code it did not write.
 fn global_allocator_expand<'f>(
-    _db: &Db,
+    db: &Db,
     frame: &'f Frame,
-    _id: MacroCallId,
+    id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
@@ -132,28 +145,30 @@ fn global_allocator_expand<'f>(
         return ExpandResult::ok(tt::TopSubtree::from_subtree_in(tt.view(), frame));
     };
     let name = &name;
+    let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
+    let krate = &dollar_crate(span);
     let result = quote::quote_in! { frame, span=>
         #tt
-        #[export_name = "__blaze_global_alloc"]
+        #[unsafe(export_name = "__blaze_global_alloc")]
         unsafe extern "C" fn __blaze_global_alloc(size: usize, align: usize) -> *mut u8 {
             unsafe {
-                ::core::alloc::GlobalAlloc::alloc(
+                #krate::alloc::GlobalAlloc::alloc(
                     &#name,
-                    ::core::alloc::Layout::from_size_align_unchecked(size, align),
+                    #krate::alloc::Layout::from_size_align_unchecked(size, align),
                 )
             }
         }
-        #[export_name = "__blaze_global_dealloc"]
+        #[unsafe(export_name = "__blaze_global_dealloc")]
         unsafe extern "C" fn __blaze_global_dealloc(ptr: *mut u8, size: usize, align: usize) {
             unsafe {
-                ::core::alloc::GlobalAlloc::dealloc(
+                #krate::alloc::GlobalAlloc::dealloc(
                     &#name,
                     ptr,
-                    ::core::alloc::Layout::from_size_align_unchecked(size, align),
+                    #krate::alloc::Layout::from_size_align_unchecked(size, align),
                 )
             }
         }
-        #[export_name = "__blaze_global_realloc"]
+        #[unsafe(export_name = "__blaze_global_realloc")]
         unsafe extern "C" fn __blaze_global_realloc(
             ptr: *mut u8,
             size: usize,
@@ -161,22 +176,79 @@ fn global_allocator_expand<'f>(
             new_size: usize,
         ) -> *mut u8 {
             unsafe {
-                ::core::alloc::GlobalAlloc::realloc(
+                #krate::alloc::GlobalAlloc::realloc(
                     &#name,
                     ptr,
-                    ::core::alloc::Layout::from_size_align_unchecked(size, align),
+                    #krate::alloc::Layout::from_size_align_unchecked(size, align),
                     new_size,
                 )
             }
         }
-        #[export_name = "__blaze_global_alloc_zeroed"]
+        #[unsafe(export_name = "__blaze_global_alloc_zeroed")]
         unsafe extern "C" fn __blaze_global_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
             unsafe {
-                ::core::alloc::GlobalAlloc::alloc_zeroed(
+                #krate::alloc::GlobalAlloc::alloc_zeroed(
                     &#name,
-                    ::core::alloc::Layout::from_size_align_unchecked(size, align),
+                    #krate::alloc::Layout::from_size_align_unchecked(size, align),
                 )
             }
+        }
+    };
+    ExpandResult::ok(result)
+}
+
+/// The symbol the expansion of `#[alloc_error_handler]` exports its `__rg_oom` under, which
+/// the allocator shim's `__rust_alloc_error_handler` calls (hir-ty-codegen `v2::allocator`).
+pub const ALLOC_ERROR_HANDLER_EXPORT: &str = "__rg_oom";
+
+/// `#[alloc_error_handler] fn handler(layout: Layout) -> ! { .. }`, as rustc's
+/// `rustc_builtin_macros::alloc_error_handler`: the function stays as written, and the
+/// expansion adds
+///
+/// ```ignore
+/// unsafe extern "C" fn __rg_oom(size: usize, align: usize) -> ! {
+///     handler(unsafe { $crate::alloc::Layout::from_size_align_unchecked(size, align) })
+/// }
+/// ```
+///
+/// which the allocator shim's `__rust_alloc_error_handler` calls when the program has the
+/// handler, as rustc's shim calls its `__rg_oom`. The call type checks the handler's signature
+/// as rustc's does. rustc wraps the function in a `const _: () = { .. };` and marks it
+/// `#[rustc_std_internal_symbol]`; blaze's is a module item exported as `__rg_oom`, which is
+/// how the shim finds it, as it finds the `#[global_allocator]`'s. Its code is spanned in the
+/// expansion's def-site context, as rustc's (`with_def_site_ctxt(item.span)`), so its `unsafe`
+/// is the macro's and no lint of the crate is given for it.
+fn alloc_error_handler_expand<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    id: MacroCallId,
+    tt: &tt::TopSubtree,
+    span: Span,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let unchanged = || tt::TopSubtree::from_subtree_in(tt.view(), frame);
+    // The function's name: the identifier after `fn`. Attributes and visibility before it are
+    // passed over as written.
+    let mut idents = tt.iter().filter_map(|it| match it {
+        tt::TtElement::Leaf(tt::Leaf::Ident(ident)) => Some(ident),
+        _ => None,
+    });
+    let name = match idents.find(|it| it.sym == sym::fn_).and_then(|_| idents.next()) {
+        // clone: a copy (symbol and span), once per handler
+        Some(name) => name.clone(),
+        None => {
+            // rustc: "alloc_error_handler must be a function"
+            let msg = "`#[alloc_error_handler]` is only allowed on a function";
+            return ExpandResult::new(unchanged(), ExpandError::other(span, msg));
+        }
+    };
+    let name = &name;
+    let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
+    let krate = &dollar_crate(span);
+    let result = quote::quote_in! { frame, span=>
+        #tt
+        #[unsafe(export_name = "__rg_oom")]
+        unsafe extern "C" fn __rg_oom(size: usize, align: usize) -> ! {
+            #name(unsafe { #krate::alloc::Layout::from_size_align_unchecked(size, align) })
         }
     };
     ExpandResult::ok(result)

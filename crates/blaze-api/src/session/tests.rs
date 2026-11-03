@@ -570,11 +570,14 @@ fn counters() -> Snapshot {
             grow_copies: 0,
             grow_copied: 0,
             budget: u64::MAX,
+            reserved: 0,
+            reserved_high_water: 0,
+            regions: 0,
         };
     }
     tags[Tag::Infer.index()].budget = 4096;
     tags[Tag::Parse.index()].allocated = 3_000_000 * reads;
-    Snapshot { tags, committed: 1 << 20, committed_high_water: 1 << 21 }
+    Snapshot { tags, committed: 1 << 20, committed_high_water: 1 << 21, reserved: 0, reserved_high_water: 0 }
 }
 
 /// A profile request is answered with the daemon's dump of the seconds it asks for; the

@@ -733,3 +733,64 @@ fn a_piece_aligned_otherwise_at_the_same_address_is_two_code_ids() {
     assert_eq!(step(&bytes, "f"), step(&case("&[0u8; 8] as *const [u8; 8] as *const u8"), "f"), "built twice");
     assert_ne!(step(&bytes, "f"), step(&word, "f"), "a piece's alignment is in `f`'s code id");
 }
+
+/// A program whose trait method returns `impl Trait` (RPITIT) and whose one impl gives
+/// `hidden` behind it, called through the trait from a generic function.
+fn rpitit(hidden: &str) -> Db {
+    program(
+        "/src/lib.rs",
+        &format!(
+            "pub trait Gen {{ fn get(&mut self) -> u32; }}
+pub struct Small(u32);
+impl Gen for Small {{ fn get(&mut self) -> u32 {{ self.0 }} }}
+pub struct Twice(u32);
+impl Gen for Twice {{ fn get(&mut self) -> u32 {{ self.0 * 2 }} }}
+pub struct Wide(u64, u64);
+impl Gen for Wide {{ fn get(&mut self) -> u32 {{ self.1 as u32 }} }}
+pub trait G {{ fn roots(&self) -> impl Gen; }}
+pub struct F(u32);
+impl G for F {{ fn roots(&self) -> impl Gen {{ {hidden} }} }}
+fn walk<T: G>(g: &T) -> u32 {{ let mut it = g.roots(); it.get() }}
+pub fn run(x: u32) -> u32 {{ walk(&F(x)) }}
+"
+        ),
+    )
+}
+
+/// Every identity of `walk::<F>` in a program of [`rpitit`]'s.
+fn walk_of_f(db: &Db) -> (CompileIdentity, CompileIdentity, CodeId) {
+    hir_ty::attach_db(db, || {
+        let instance = Instance {
+            subject: Subject::Body(Body::Fn(function(db, "walk"))),
+            args: GenericArgs::new_from_slice(&[struct_ty(db, "F").into()]).store(),
+        };
+        let compile = |compiled| match instance_identity(db, &instance, &env(db), compiled) {
+            Ok(it) => *it,
+            Err(error) => panic!("`walk::<F>` has no identity: {error}"),
+        };
+        let step = code_id(db, &instance, &env(db))
+            .unwrap_or_else(|error| panic!("`walk::<F>` has no CodeId: {error}"));
+        (compile(DEBUG), compile(INLINE), step)
+    })
+}
+
+/// Rule 18: a trait method's `impl Trait` is the impl's once the implementing type is known,
+/// so the code identity of an instance that reaches it through the trait (`walk::<F>`) covers
+/// the impl's hidden type: another layout (`Wide`) or the same layout with other code
+/// (`Twice`) changes every identity of it, and of `run`'s step, and the same program keeps
+/// them.
+#[test]
+fn an_impls_hidden_type_for_a_trait_methods_impl_trait_is_in_its_callers_identity() {
+    let small = rpitit("Small(self.0)");
+    let (walk, run) = (walk_of_f(&small), step(&small, "run"));
+    let again = rpitit("Small(self.0)");
+    assert_eq!((walk_of_f(&again), step(&again, "run")), (walk, run), "one program, one identity");
+    for other in ["Wide(self.0 as u64, 1)", "Twice(self.0)"] {
+        let db = rpitit(other);
+        let (debug, inline, code) = walk_of_f(&db);
+        assert_ne!(debug, walk.0, "{other}: debug compile identity of `walk::<F>`");
+        assert_ne!(inline, walk.1, "{other}: inlining compile identity of `walk::<F>`");
+        assert_ne!(code, walk.2, "{other}: behaviour identity of `walk::<F>`");
+        assert_ne!(step(&db, "run"), run, "{other}: behaviour identity of `run`");
+    }
+}

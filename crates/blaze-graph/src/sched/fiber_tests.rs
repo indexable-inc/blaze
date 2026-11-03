@@ -626,13 +626,13 @@ thread_local! {
 }
 
 #[inline(never)]
-fn mark_take() -> usize {
-    MARK.replace(0)
+fn mark_take() -> Option<std::num::NonZeroUsize> {
+    std::num::NonZeroUsize::new(MARK.replace(0))
 }
 
 #[inline(never)]
-fn mark_put(value: usize) {
-    MARK.set(value);
+fn mark_put(value: std::num::NonZeroUsize) {
+    MARK.set(value.get());
 }
 
 #[inline(never)]
@@ -669,7 +669,7 @@ impl Work for &'static Marks {
 #[test]
 fn a_carried_thread_local_follows_its_job_across_waits() {
     static CARRY: std::sync::Once = std::sync::Once::new();
-    CARRY.call_once(|| fiber::carry(fiber::Carried { take: mark_take, put: mark_put }));
+    CARRY.call_once(|| fiber::carry(fiber::Carried::word(mark_take, mark_put)));
     static WORK: OnceLock<Marks> = OnceLock::new();
     let work = WORK.get_or_init(|| Marks { checked: AtomicU32::new(0) });
     let driver = start(Cores::flat(1).unwrap(), work);
@@ -678,6 +678,219 @@ fn a_carried_thread_local_follows_its_job_across_waits() {
     }
     driver.join().unwrap();
     assert_eq!(work.checked.load(Ordering::Relaxed), 6);
+}
+
+thread_local! {
+    /// A carried thread-local that owns what it holds: the address of a boxed [`Owned`], 0 for
+    /// none.
+    static OWNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// A worker's own [`Owned`], set by its setup and checked as the thread ends.
+    static BACK: Back = const { Back(std::cell::Cell::new(0)) };
+}
+
+/// One test's [`Owned`] boxes (tests run at once, so each counts its own): how many are live,
+/// how many the scheduler ended, and how many a worker found back on its thread as it ended.
+#[derive(Default)]
+struct OwnedCounts {
+    live: AtomicU32,
+    ended: AtomicU32,
+    back: AtomicU32,
+}
+
+impl OwnedCounts {
+    fn new() -> &'static OwnedCounts {
+        Box::leak(Box::default()) // alloc: one per test, for the life of the test process
+    }
+}
+
+struct Owned {
+    mine: usize,
+    counts: &'static OwnedCounts,
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        self.counts.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Carries [`OWNED`] with each job, once for every test of it.
+fn carry_owned() {
+    static CARRY: std::sync::Once = std::sync::Once::new();
+    CARRY.call_once(|| fiber::carry(fiber::Carried { take: owned_take, put: owned_put, end: owned_end }));
+}
+
+#[inline(never)]
+fn owned_take() -> Option<std::num::NonZeroUsize> {
+    std::num::NonZeroUsize::new(OWNED.replace(0))
+}
+
+#[inline(never)]
+fn owned_put(taken: std::num::NonZeroUsize) {
+    assert_eq!(OWNED.get(), 0, "an owned value put on a thread that holds another");
+    OWNED.set(taken.get());
+}
+
+#[inline(never)]
+#[allow(unsafe_code)]
+fn owned_end(taken: std::num::NonZeroUsize) {
+    // SAFETY: every value of `OWNED` is a box `set_owned` leaked, handed to one put or end.
+    let owned = unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Owned>(taken.get())) };
+    owned.counts.ended.fetch_add(1, Ordering::SeqCst);
+}
+
+#[inline(never)]
+fn set_owned(mine: usize, counts: &'static OwnedCounts) {
+    counts.live.fetch_add(1, Ordering::SeqCst);
+    // alloc: one per test job, the value the test carries
+    OWNED.set(Box::into_raw(Box::new(Owned { mine, counts })).expose_provenance());
+}
+
+#[inline(never)]
+#[allow(unsafe_code)]
+fn owned() -> Option<usize> {
+    let at = OWNED.get();
+    // SAFETY: a nonzero value is a live box `set_owned` leaked, which this thread's job holds.
+    (at != 0).then(|| unsafe { &*std::ptr::with_exposed_provenance::<Owned>(at) }.mine)
+}
+
+/// The address of a worker's own [`Owned`]: as the thread ends, a worker that holds it again
+/// counts it back and frees it. One it does not hold stays unfreed, so its count stays live.
+struct Back(std::cell::Cell<usize>);
+
+impl Drop for Back {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        let mine = self.0.get();
+        // `OWNED` needs no destructor, so it is still readable while the thread's are run.
+        if mine != 0 && OWNED.get() == mine {
+            OWNED.set(0);
+            // SAFETY: the box `set_owned` leaked for this worker, held by its thread again, so
+            // never ended by a job.
+            let owned = unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Owned>(mine)) };
+            owned.counts.back.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Jobs on one core each set a carried thread-local that owns a box, wait (so the box moves
+/// with them) and end still holding it, as a job that forgets to clear one does.
+struct Forgetful {
+    counts: &'static OwnedCounts,
+    ended: AtomicU32,
+}
+
+impl Work for &'static Forgetful {
+    type Job = usize;
+
+    fn run(&self, cx: &Cx<'_, Self>, mine: usize) {
+        assert_eq!(owned(), None, "job {mine} came on to a value it did not set");
+        set_owned(mine, self.counts);
+        cx.wait(Wait::Until(cx.now() + 200_000)).expect("a timed wait closes no cycle");
+        assert_eq!(owned(), Some(mine), "job {mine} lost its value across a wait");
+        self.ended.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The leak class `go_off_ended` once had: a value a job ends holding was dropped unfreed
+/// wherever the worker held one too (5.2 GiB of query stacks building blaze's tree with one
+/// worker). Every value a job ends holding is ended through its `end`, and the worker gets its
+/// own back: none outlives its job, and none is lost.
+#[test]
+fn a_carried_value_a_job_ends_holding_is_ended_never_leaked() {
+    carry_owned();
+    let work: &'static Forgetful = Box::leak(Box::new(Forgetful { counts: OwnedCounts::new(), ended: AtomicU32::new(0) }));
+    let driver = start(Cores::flat(1).unwrap(), work);
+    for mine in 1..=6 {
+        driver.spawn(mine, Spawn::root());
+    }
+    driver.join().unwrap();
+    assert_eq!(work.ended.load(Ordering::Relaxed), 6);
+    assert_eq!(work.counts.ended.load(Ordering::SeqCst), 6, "a value a job ended holding was not ended");
+    assert_eq!(work.counts.live.load(Ordering::SeqCst), 0, "a value a job ended holding outlived it");
+}
+
+/// A worker that holds a carried value of its own (set by its setup, before any job) keeps
+/// it: set aside as each job comes on, given back as each goes off, whether it parks or ends.
+/// No job sees it, no job's end ends it, and the thread holds it again as it ends.
+#[test]
+fn a_workers_own_carried_value_is_set_aside_for_each_job_and_back_when_it_ends() {
+    carry_owned();
+    let worker = OwnedCounts::new();
+    let work: &'static Forgetful = Box::leak(Box::new(Forgetful { counts: OwnedCounts::new(), ended: AtomicU32::new(0) }));
+    let setup = move |_| {
+        set_owned(0, worker);
+        BACK.with(|back| back.0.set(OWNED.get()));
+        Ok(())
+    };
+    let driver = Driver::start(Cores::flat(1).unwrap(), work, config(256 << 10), setup).expect("the driver starts");
+    for mine in 1..=6 {
+        driver.spawn(mine, Spawn::root());
+    }
+    driver.join().unwrap();
+    assert_eq!(work.ended.load(Ordering::Relaxed), 6);
+    assert_eq!(work.counts.ended.load(Ordering::SeqCst), 6, "a value a job ended holding was not ended");
+    assert_eq!(work.counts.live.load(Ordering::SeqCst), 0, "a value a job ended holding outlived it");
+    assert_eq!(worker.ended.load(Ordering::SeqCst), 0, "a job's end ended its worker's own value");
+    assert_eq!(worker.back.load(Ordering::SeqCst), 1, "the worker did not hold its own value again as it ended");
+    assert_eq!(worker.live.load(Ordering::SeqCst), 0, "the worker's own value was lost");
+}
+
+/// A record of what a parked job carried, dropped without being put back or ended (a pool or
+/// driver gone first), ends what it holds: `Taken`'s `Drop` is the backstop that keeps the
+/// "never dropped unended" promise on every path.
+#[test]
+fn a_dropped_record_of_carried_values_ends_what_it_holds() {
+    carry_owned();
+    let counts = OwnedCounts::new();
+    set_owned(7, counts);
+    let (mut job, mut worker) = (fiber::Taken::EMPTY, fiber::Taken::EMPTY);
+    assert!(fiber::go_off(&mut job, &mut worker).is_none(), "taking this thread's carried values panicked");
+    assert_eq!(owned(), None, "the value stayed on the thread");
+    assert_eq!(counts.ended.load(Ordering::SeqCst), 0);
+    drop(job);
+    assert_eq!(counts.ended.load(Ordering::SeqCst), 1, "a dropped record did not end its value");
+    assert_eq!(counts.live.load(Ordering::SeqCst), 0, "a dropped record leaked its value");
+}
+
+/// A job that sets a carried value and waits on a flight that never ends.
+struct Stranded {
+    counts: &'static OwnedCounts,
+    waiting: AtomicBool,
+}
+
+/// The flight [`Stranded`] waits on, which no test ends.
+const STRANDED: u32 = 0xca22_0001;
+
+impl Work for &'static Stranded {
+    type Job = usize;
+
+    fn run(&self, cx: &Cx<'_, Self>, mine: usize) {
+        set_owned(mine, self.counts);
+        self.waiting.store(true, Ordering::Release);
+        let _ = cx.wait(Wait::Key(key(STRANDED)));
+        unreachable!("job {mine} resumed from a flight no one ends");
+    }
+}
+
+/// A driver that fails (here, its second fiber cannot be made) is joined with a job still
+/// parked: that job never resumes, and what it carried is ended as the driver shuts down,
+/// after its lock is let go, never dropped unended.
+#[test]
+fn a_failed_drivers_parked_job_has_what_it_carried_ended() {
+    carry_owned();
+    let work: &'static Stranded = Box::leak(Box::new(Stranded { counts: OwnedCounts::new(), waiting: AtomicBool::new(false) }));
+    let driver = Driver::start(Cores::flat(1).unwrap(), work, Config { fibers: 1, stack: 256 << 10, spin: 64 }, |_| Ok(()))
+        .expect("the driver starts");
+    driver.fail_new_fibers();
+    assert!(driver.claim(key(STRANDED)), "the flight is new");
+    driver.spawn(1, Spawn::root());
+    until("the job to wait", || work.waiting.load(Ordering::Acquire));
+    driver.spawn(2, Spawn::root());
+    let failed = driver.join().expect_err("a driver whose second fiber failed fails");
+    assert!(matches!(failed, fiber::DriverError::Stack { .. }), "{failed}");
+    assert_eq!(work.counts.ended.load(Ordering::SeqCst), 1, "the parked job's carried value was not ended");
+    assert_eq!(work.counts.live.load(Ordering::SeqCst), 0, "the parked job's carried value leaked");
 }
 
 /// A job's `Cx` is `Sync`, but a wait through it from another thread panics there, without

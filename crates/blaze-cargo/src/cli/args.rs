@@ -49,11 +49,11 @@ impl Clap for Command {
                 TARGET, MANIFEST, REPORTS, REFUSED,
             ],
             Command::Test => &[
-                GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, FEATURES, JOBS, NO_KEEP_GOING,
+                GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, FEATURES, JOBS, KEEP_GOING,
                 RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED,
             ],
             Command::Bench => &[
-                GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, NO_KEEP_GOING, PROFILE,
+                GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, KEEP_GOING, PROFILE,
                 TARGET, REPORTS, MANIFEST, REFUSED,
             ],
             Command::Doc => &[
@@ -189,13 +189,9 @@ const PACKAGES: &[Flag] = &[
 /// `run`'s `-p`, one package (`optional_opt`, not `optional_multi_opt`).
 const PACKAGE: &[Flag] = &[Flag::new("package", Some('p'), Takes::Optional, "SPEC")];
 const JOBS: &[Flag] = &[Flag { hyphen: true, ..Flag::new("jobs", Some('j'), Takes::Value, "N") }];
+/// cargo refuses it on `test` and `bench`; blaze takes it there too (`useful-not-parity`): a unit
+/// that fails to build fails alone, and the tests of every unit that built still run.
 const KEEP_GOING: &[Flag] = &[Flag::switch("keep-going")];
-/// `test` and `bench`: `arg_unsupported_keep_going`.
-const NO_KEEP_GOING: &[Flag] = &[Flag::pointing(
-    Some("keep-going"),
-    None,
-    Points::Says("use `--no-fail-fast` to run as many tests as possible regardless of failure"),
-)];
 const FUTURE: &[Flag] = &[Flag::switch("future-incompat-report")];
 const TARGETS: &[Flag] = &[
     Flag::switch("lib"),
@@ -337,6 +333,8 @@ pub enum Asked {
     Explain(Vec<OsString>),
     /// `blaze why [ITEM]`, with the words after it ([`super::observe::why`]).
     Why(Vec<OsString>),
+    /// `blaze reach [ROOT]`, with the words after it ([`super::reach::main`]).
+    Reach(Vec<OsString>),
     /// `blaze slow`, with the words after it ([`super::observe::slow`]).
     Slow(Vec<OsString>),
     /// `blaze pprof FILE|URL ...`, with the words after it ([`super::pprof::main`]).
@@ -480,6 +478,8 @@ pub struct Flags {
     pub private: bool,
     pub no_run: bool,
     pub no_fail_fast: bool,
+    /// `--keep-going`: also passed on to the daemon, which builds past a failed unit.
+    pub keep_going: bool,
     pub reached: bool,
     /// `--ub`, or either of its values, which imply it.
     pub ub: bool,
@@ -537,6 +537,7 @@ impl Flags {
             "document-private-items" => self.private = true,
             "no-run" => self.no_run = true,
             "no-fail-fast" => self.no_fail_fast = true,
+            "keep-going" => self.keep_going = true,
             "reached" => self.reached = true,
             "ub" => self.ub = true,
             name @ ("unit-graph" | "timings") => self.reports.push(name),
@@ -623,6 +624,7 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("debug") => return Ok(Asked::Debug(words.collect())),
             Some("explain") => return Ok(Asked::Explain(words.collect())),
             Some("why") => return Ok(Asked::Why(words.collect())),
+            Some("reach") => return Ok(Asked::Reach(words.collect())),
             Some("slow") => return Ok(Asked::Slow(words.collect())),
             Some("pprof") => return Ok(Asked::Pprof(words.collect())),
             Some("perf") => return Ok(Asked::Perf(words.collect())),

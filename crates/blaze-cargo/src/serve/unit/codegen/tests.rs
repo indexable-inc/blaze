@@ -42,30 +42,30 @@ fn profile(name: &str, opt_level: &str, backend: Option<&str>) -> Profile {
 #[test]
 fn llvm_and_no_backend_leave_the_choice_to_blaze() {
     for level in [OptLevel::O0, OptLevel::O3] {
-        assert_eq!(codegen_backend(&profile("dev", "0", None), "app", level), Ok(()));
-        assert_eq!(codegen_backend(&profile("dev", "0", Some("llvm")), "app", level), Ok(()));
+        assert_eq!(codegen_backend(&profile("dev", "0", None), "app", level), Ok(false));
+        assert_eq!(codegen_backend(&profile("dev", "0", Some("llvm")), "app", level), Ok(false));
     }
 }
 
 #[test]
 fn cranelift_is_taken_where_the_level_compiles_with_stencils() {
     let dev = profile("dev", "0", Some("cranelift"));
-    assert_eq!(codegen_backend(&dev, "app", OptLevel::O0), Ok(()));
-    assert_eq!(codegen_backend(&dev, "app", OptLevel::O1), Ok(()));
+    assert_eq!(codegen_backend(&dev, "app", OptLevel::O0), Ok(false));
+    assert_eq!(codegen_backend(&dev, "app", OptLevel::O1), Ok(false));
     let release = profile("release", "3", Some("cranelift"));
     let why = codegen_backend(&release, "app", OptLevel::O3).unwrap_err();
-    assert_eq!(
-        why,
-        "the profile `release` of `app` asks for codegen-backend `cranelift`, and blaze's code \
-         generator takes no backend over the one opt-level 3 compiles with"
-    );
+    assert!(why.contains("`release` of `app`") && why.contains("never Cranelift's") && why.contains("`stencil`"), "{why}");
+}
+
+/// The seed's builds: `stencil` asks for stencils at every level, LLVM's too.
+#[test]
+fn stencil_asks_for_stencils_at_every_level() {
+    assert_eq!(codegen_backend(&profile("dev", "0", Some("stencil")), "app", OptLevel::O0), Ok(true));
+    assert_eq!(codegen_backend(&profile("release", "3", Some("stencil")), "app", OptLevel::O3), Ok(true));
 }
 
 #[test]
 fn a_backend_blaze_has_no_setting_for_is_an_error_naming_it() {
-    assert_eq!(codegen_backend(&profile("dev", "0", Some("stencil")), "app", OptLevel::O0), Ok(()));
-    let stencil = codegen_backend(&profile("release", "3", Some("stencil")), "app", OptLevel::O3).unwrap_err();
-    assert!(stencil.contains("`release` of `app`") && stencil.contains("`stencil`"), "{stencil}");
     let gcc = codegen_backend(&profile("dev", "0", Some("gcc")), "dep", OptLevel::O0).unwrap_err();
     assert_eq!(
         gcc,
@@ -304,6 +304,7 @@ fn kept(path: &str, output: &blaze_link::Output) -> KeptImage {
         loaded: None,
         slotted: Vec::new(),
         assumed: Vec::new(),
+        given: None,
     };
     KeptImage { path: path.to_owned(), kept }
 }

@@ -179,7 +179,8 @@ pub(crate) struct Span {
     pub(super) len: usize,
 }
 
-const _: () = assert!(size_of::<Span>() == 24);
+// `at` and two `usize`s: 24 bytes on a 64-bit target.
+const _: () = assert!(size_of::<Span>() == 8 + 2 * size_of::<usize>());
 
 impl Span {
     pub(crate) fn end(&self) -> u64 {

@@ -163,6 +163,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             (said, Said::Nothing, Instead::Span)
         } else if name.starts_with("wait") && of.is_some_and(|it| is_condvar(cx, it)) {
             let DefWithBodyId::FunctionId(owner) = def else { continue };
+            if !cx.suspend_checked() {
+                return found;
+            }
             if *on_fiber.get_or_insert_with(|| on_fiber_set(db, owner.krate(db)).contains(owner)) {
                 continue;
             }

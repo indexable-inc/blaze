@@ -9,7 +9,7 @@ use blaze_codegen::{
     backend::{Address, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates, Limit},
     plan::{Mode, Origin, Package, PlanError, Policy},
 };
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::HashMap;
 use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey};
@@ -70,7 +70,13 @@ pub trait BodyChecks: Sync {
 pub struct HirFrontend<'db> {
     pub(crate) databases: Databases<'db>,
     pub(crate) hashes: HashSource,
-    pub(crate) build_time: std::sync::Arc<BuildTime>,
+    pub(crate) build_time: BuildTime,
+    /// Whether the build links a dependency image (`premap`): a dev executable's, which takes
+    /// edits on the daemon's code memory. Without one, no code is the image's: every crate but
+    /// the standard library's is the workspace's ([`Self::workspace`]), so every body may take
+    /// the program's world and none is split off. Set only by [`Self::with_image`], from the
+    /// one place a build decides it (blaze-cargo's `links_image`); `false` until then.
+    image: bool,
     /// How each origin's units build bodies: what a function's references are walked for and
     /// what a generic is shared under.
     units: Option<Units>,
@@ -263,12 +269,13 @@ const NO_POLICY: &str = "the front end was made with no policy (`HirFrontend::wi
                          it can't tell how the instance's units build its MIR";
 
 impl<'db> HirFrontend<'db> {
-    /// `build_time` is shared: a daemon makes one a job and hands it to each unit's front end.
-    pub fn new(databases: Databases<'db>, hashes: HashSource, build_time: std::sync::Arc<BuildTime>) -> Self {
+    /// `build_time`: whether the build is of code that runs at build time ([`BuildTime`]).
+    pub fn new(databases: Databases<'db>, hashes: HashSource, build_time: BuildTime) -> Self {
         HirFrontend {
             databases,
             hashes,
             build_time,
+            image: false,
             units: None,
             checks: None,
             stop: None,
@@ -292,8 +299,19 @@ impl<'db> HirFrontend<'db> {
 
     /// The front end of a build compiled as `policy` says: what describing and preparing a
     /// function need, which list what its code calls as the units of its origin inline it.
+    /// It leaves whether the build links a dependency image to [`Self::with_image`].
     pub fn with_policy(mut self, policy: &Policy) -> Self {
         self.units = Some(Units::of(self.databases.db, policy));
+        self
+    }
+
+    /// The front end of a build that links a dependency image (`image`), whose code is split
+    /// between the image and the workspace ([`Self::image`]): what blaze-cargo's `links_image`
+    /// says of the unit, or a harness that asks what an edit of a crate reaches
+    /// (`hir-firewall`), which is what the split follows. In any order with
+    /// [`Self::with_policy`], which leaves it alone.
+    pub fn with_image(mut self, image: bool) -> Self {
+        self.image = image;
         self
     }
 
@@ -313,7 +331,7 @@ impl<'db> HirFrontend<'db> {
     /// ([`super::devirt::walking`]): what a unit builds its body with.
     pub(crate) fn walking(&self, db: &Db, instance: &HirInstance) -> Result<refs::Walking, String> {
         let inlined = self.inlines(db, instance)?;
-        super::devirt::walking(db, self.devirt.world(), instance, inlined)
+        super::devirt::walking(db, self.devirt.world(), instance, inlined, || self.owner(db, &instance.0))
     }
 
     /// [`Self::inlines`] as describing `instance` for `requester` decides it: of the origin of
@@ -403,32 +421,24 @@ impl<'db> HirFrontend<'db> {
             _ => *requester,
         };
         let inlined = self.inlines_as(db, instance, Some(&origin)).map_err(fail)?;
-        let walking =
-            super::devirt::walking(db, self.devirt.world(), instance, inlined).map_err(fail)?;
-        // A body built against the program's dyn facts is keyed by those it read (rule 18).
-        let code = super::devirt::code(
-            code_of(db, hashes, &instance.0).map_err(fail)?,
-            refs::read(db, instance, walking).map_err(fail)?,
-        );
+        let owner = self.owner(db, &instance.0);
+        let walking = super::devirt::walking(db, self.devirt.world(), instance, inlined, || owner).map_err(fail)?;
+        let built_in_code = built_in_code(db, hashes, &instance.0).map_err(fail)?;
+        // A body built against the program's dyn facts is keyed by those it read (rule 18). A
+        // copy of it built into a caller is built against none: `built_in_code`.
+        let code = super::devirt::code(built_in_code, refs::read(db, instance, walking).map_err(fail)?);
         let plain = args_of(db, hashes, &instance.0).map_err(fail)?;
         let args = match generic {
             true => self.generic_args(db, &instance.0, &origin, plain).map_err(fail)?,
             false => plain,
         };
-        let owner = self.owner(db, &instance.0, requester);
         let identity = identity(db, &instance.0, item, plain);
         let bound = bound(db, &instance.0, code, plain);
         let cold = cold_of(db, &instance.0);
         let overflow_checks = if generic { written_checks(db, &instance.0) } else { None };
         let symbol = symbol_of(db, &instance.0).map_err(fail)?;
         let mut refs = refs::walk(db, instance, walking).map_err(fail)?;
-        if owner == Owner::Dependency {
-            for it in &mut refs {
-                if let FrontRef::Function(HirInstance(Kind::Asm(_, image))) = it {
-                    *image = true;
-                }
-            }
-        }
+        asked_by(owner, &mut refs);
         // alloc: `Described::built_in` owns its list, which the memo's is borrowed from
         let built_in = refs::built_in(db, instance, walking).map_err(fail)?.to_vec();
         // Written in a workspace crate: the complement of what a caller may build in
@@ -437,6 +447,7 @@ impl<'db> HirFrontend<'db> {
         Ok(Described {
             item,
             code,
+            built_in_code,
             args,
             origin,
             editable,
@@ -508,7 +519,8 @@ impl<'db> HirFrontend<'db> {
         }
     }
 
-    /// Whose code a crate's is, for its settings.
+    /// Whose code a crate's is, for its settings: build-time code's in a build-time build
+    /// ([`BuildTime`]), never the standard library.
     pub(crate) fn origin(&self, db: &Db, krate: Crate) -> Origin {
         let data = krate.data(db);
         let name = match &data.origin {
@@ -520,7 +532,7 @@ impl<'db> HirFrontend<'db> {
                 Package::new(&fncache::crate_name(db, krate))
             }
         };
-        if self.build_time.0.contains(&krate) {
+        if self.build_time.0 {
             return Origin::BuildTime(name);
         }
         match data.origin {
@@ -529,34 +541,35 @@ impl<'db> HirFrontend<'db> {
         }
     }
 
-    /// Whether a crate's code is the workspace's for a dependency image: a member's or a
-    /// build-time crate's, never the standard library's.
+    /// Whether a crate's code is the workspace's for a dependency image, never the standard
+    /// library's: in a build that links no image ([`Self::image`]) or a build-time build
+    /// ([`BuildTime`]) every other crate's, as no image holds it; in a live program's, a crate
+    /// an edit reaches ([`reaches_local`]). The one rule of ownership: every function's and
+    /// static's owner ([`Self::owner`], [`Self::static_owner`]) is made from it.
     fn workspace(&self, db: &Db, krate: Crate) -> bool {
         match krate.data(db).origin {
             CrateOrigin::Lang(_) => false,
-            CrateOrigin::Local { .. } => true,
-            _ => self.build_time.0.contains(&krate),
+            _ if !self.image => true,
+            _ if self.build_time.0 => true,
+            _ => reaches_local(db, krate),
         }
     }
 
     /// Whose an instance is for a dependency image ([`Owner`]): the workspace's when its item
-    /// is or any of its type arguments names a workspace crate's type, closure or item. A
-    /// shim's item is the standard library's (`drop_in_place`, `FnOnce::call_once`), so its
-    /// type arguments decide; an `asm!` function is its asker's, the allocator shim the
-    /// program's.
-    fn owner(&self, db: &Db, kind: &Kind, requester: &Origin) -> Owner {
+    /// is or any of its type arguments names a workspace crate's type, closure or item
+    /// ([`Self::workspace`]). A shim's item is the standard library's (`drop_in_place`,
+    /// `FnOnce::call_once`), so its type arguments decide. An `asm!` function is its asker's:
+    /// the walk names it with `false` and the front end sets `true` on the references of code
+    /// the image holds ([`asked_by`]), so the flag is its asker's owner. The allocator shim
+    /// is the program's. No requester changes it.
+    pub(crate) fn owner(&self, db: &Db, kind: &Kind) -> Owner {
         let ours = |krate: Crate| self.workspace(db, krate);
         let instance = match kind {
             Kind::Code(instance, _) => instance,
             Kind::Start(main) if ours(main.krate(db)) => return Owner::Workspace,
             Kind::Start(_) => return Owner::Dependency,
             Kind::Asm(_, true) => return Owner::Dependency,
-            Kind::Asm(_, false) => {
-                return match requester {
-                    Origin::Member(_) | Origin::BuildTime(_) => Owner::Workspace,
-                    Origin::Dependency(_) | Origin::Std => Owner::Dependency,
-                };
-            }
+            Kind::Asm(_, false) => return Owner::Workspace,
             Kind::Allocator(_) => return Owner::Workspace,
         };
         let item = match instance.def {
@@ -572,6 +585,12 @@ impl<'db> HirFrontend<'db> {
         if item.is_some_and(&ours) || named() { Owner::Workspace } else { Owner::Dependency }
     }
 
+    /// Whose a static is for a dependency image: its crate's, by [`Self::workspace`], as a
+    /// function of that crate is.
+    fn static_owner(&self, db: &Db, value: &HirStatic) -> Owner {
+        if self.workspace(db, value.0.krate(db)) { Owner::Workspace } else { Owner::Dependency }
+    }
+
     fn described_static(
         &self,
         db: &Db,
@@ -581,8 +600,10 @@ impl<'db> HirFrontend<'db> {
         let item = hashes
             .item(db, ItemId::Static(value.0))
             .map_err(|what| undescribed(db, &super::StaticNamed(db, value.0), None, what))?;
-        let held = super::statics::value(db, hashes, value.0)
+        let mut held = super::statics::value(db, hashes, value.0)
             .map_err(|what| undescribed(db, &super::StaticNamed(db, value.0), Some(item), what))?;
+        let owner = self.static_owner(db, value);
+        asked_by(owner, &mut held.refs);
         Ok(DescribedStatic {
             item,
             instance: ContentId::default(),
@@ -591,6 +612,7 @@ impl<'db> HirFrontend<'db> {
             thread_local: held.thread_local,
             section: held.section,
             origin: self.origin(db, value.0.krate(db)),
+            owner,
             // alloc: only an exported static, whose `DescribedStatic::symbol` owns its name
             symbol: exported_static(db, value.0).map(|it| it.as_str().to_owned()),
             // alloc: per static described, its path, which errors name it by
@@ -949,42 +971,53 @@ fn rooted<'db>(db: &'db Db, func: FunctionId, args: GenericArgs<'db>) -> HirInst
     HirInstance(Kind::Code(instance, env))
 }
 
-/// The code hashes of the instances whose bodies the IR of `instance` builds in, at any depth,
-/// sorted, each once: its [`blaze_codegen::CompiledFunction::inlined`]. Nothing is allocated
-/// for one that builds nothing in, as nearly every one. `inlined` is whether its references
-/// were walked for a unit that MIR-inlines ([`HirFrontend::inlines`]), and so the callees'
-/// are: what was inlined into a callee was inlined with it.
-pub(crate) fn inlined<'a>(
-    db: &'a Db,
+/// The code of the body of `kind` as a caller builds it in
+/// ([`blaze_codegen::backend::Described::built_in_code`]): its [`code_of`]. A copy built in is
+/// built under the copy's options (`MirOptions::built_in`, which `hir-ty-mir`'s inliner and
+/// `Build::built_in` both follow), which read no dyn facts: the copy's own part of the code is
+/// its plain body. The caller's `Devirtualize` may still make a `dyn` call in the copy direct
+/// after `Inline`; the facts it read are the caller's (`Inlined::devirtualized`), keying the
+/// caller's code. The callee's node holds this code and [`inlined`] names it by it, so the two
+/// compare (`blaze-codegen` `driver`'s `unkept_inline`); its own unit's code may hash the dyn
+/// facts it read beside it ([`super::devirt::code`]).
+pub(crate) fn built_in_code(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String> {
+    code_of(db, hashes, kind)
+}
+
+/// The code hashes of the bodies the compile of `instance` built in, sorted, each once, each by
+/// its [`built_in_code`]: its [`blaze_codegen::CompiledFunction::inlined`]. `built_in` is what
+/// the build recorded it put there under its unit's settings ([`crate::Pending::built_in`]),
+/// never a walk of it again: the driver checks it against what the walk ahead of the build
+/// listed, which its key holds (`unkept_inline`), so a walk that misses what a build does is
+/// refused, not keyed. A callee is named as the walk names it ([`super::places::call_ref`] in the
+/// environment the walk lists its calls in). Nothing is allocated for one that builds nothing
+/// in, as nearly every one.
+pub(crate) fn inlined(
+    db: &Db,
     hashes: &HashSource,
-    (instance, walking): (&'a HirInstance, refs::Walking),
+    instance: &HirInstance,
+    built_in: &[Instance],
 ) -> Result<Vec<CodeHash>, String> {
-    let mut found = Vec::new(); // alloc: the list returned, empty for nearly every instance
-    // alloc: inline, eight on the stack
-    let mut queue: SmallVec<[&HirInstance; 8]> = smallvec![instance];
-    let mut seen = HashSet::new_in(Global);
-    while let Some(at) = queue.pop() {
-        // A callee's code is built in as its own walk without the world lists it: the inliner
-        // devirtualizes no callee (`hir-ty-mir` `inline.rs` `callee_options`).
-        let walking = match std::ptr::eq(at, instance) {
-            true => walking,
-            false => refs::Walking::plain(walking.inlined),
+    if built_in.is_empty() {
+        return Ok(Vec::new()); // alloc: empty, allocates nothing
+    }
+    let env = match &instance.0 {
+        Kind::Code(_, env) => env.clone(), // clone: two `Copy` ids in a `Clone`-only type
+        Kind::Start(main) => {
+            ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) }.store()
+        }
+        Kind::Allocator(_) | Kind::Asm(..) => {
+            // alloc: the error's message
+            return Err(format!("{instance:?} built in {built_in:?}, though nothing of its kind builds a body in"));
+        }
+    };
+    let mut found = Vec::with_capacity(built_in.len()); // alloc: the list returned
+    for it in built_in {
+        let FrontRef::Function(callee) = super::places::call_ref(db, it.def, it.args.as_ref(), &env)? else {
+            // alloc: the error's message
+            return Err(format!("{instance:?} built in {it:?}, which its callers name as no function"));
         };
-        let built_in = refs::built_in(db, at, walking)?;
-        if built_in.is_empty() {
-            continue;
-        }
-        let refs = refs::walked(db, at, walking)?;
-        for &place in built_in {
-            let Some(FrontRef::Function(callee)) = refs.get(place as usize) else {
-                // alloc: the error's message
-                return Err(format!("{at:?} builds in place {place}, which is no function"));
-            };
-            if seen.insert(callee) {
-                found.push(code_of(db, hashes, &callee.0)?);
-                queue.push(callee);
-            }
-        }
+        found.push(built_in_code(db, hashes, &callee.0)?);
     }
     found.sort_unstable();
     found.dedup();
@@ -1197,6 +1230,18 @@ fn generic(kind: &Kind) -> bool {
     instance.is_generic()
 }
 
+/// Marks the `asm!` functions among the references of code of `owner` as the image's when
+/// the image holds that code ([`Kind::Asm`]'s flag), so an `asm!` function is its asker's.
+fn asked_by(owner: Owner, refs: &mut [FrontRef<HirInstance, HirStatic>]) {
+    if owner == Owner::Dependency {
+        for it in refs {
+            if let FrontRef::Function(HirInstance(Kind::Asm(_, image))) = it {
+                *image = true;
+            }
+        }
+    }
+}
+
 /// The crate an instance's code is written in, for one that is not generic.
 pub(super) fn crate_of(db: &Db, kind: &Kind) -> Option<Crate> {
     match kind {
@@ -1206,6 +1251,25 @@ pub(super) fn crate_of(db: &Db, kind: &Kind) -> Option<Crate> {
         },
         Kind::Start(main) => Some(main.krate(db)),
         Kind::Asm(..) | Kind::Allocator(_) => None,
+    }
+}
+
+/// Whether `krate`'s code refers to code an edit can change: it is local (a member, or a path
+/// package such as one `[patch]`ed in), or it depends on such a crate, directly or not. A
+/// registry crate over a local one (`zstd-safe` over a vendored `zstd-sys`) names the local
+/// crate's types and calls its functions, so its code is the workspace's: in the dependency
+/// image it would refer to code an edit changes. A proc-macro dependency is not followed: its
+/// code never runs in the program, so nothing of the image refers to it, and an edit of a
+/// local proc macro changes the code hashes of what it expands into, which rekeys the image.
+#[blaze_query::tracked(returns(copy))]
+fn reaches_local(db: &Db, krate: Crate) -> bool {
+    let data = krate.data(db);
+    match data.origin {
+        CrateOrigin::Local { .. } => true,
+        CrateOrigin::Lang(_) => false,
+        _ => (data.dependencies.iter())
+            .filter(|dep| !dep.crate_id.data(db).target_kind.is_proc_macro())
+            .any(|dep| reaches_local(db, dep.crate_id)),
     }
 }
 

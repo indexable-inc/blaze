@@ -181,6 +181,7 @@ pub fn foreign_ask(key: &StdKey) -> Result<ForeignAsk, LoadError> {
             overflow_checks: key.overflow_checks,
             debuginfo: key.debuginfo.clone(),
             panic: key.panic.clone(),
+            codegen_backend: key.codegen_backend.clone(),
         },
         panic_abort: ALWAYS_ABORT.map(str::to_owned).to_vec(),
         is_std: true,

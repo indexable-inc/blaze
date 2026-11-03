@@ -12,7 +12,7 @@
 //! closure that never calls user code or [`with`] again (every caller below is a few loads and
 //! stores), so no two `&mut` of it are alive at once.
 
-use std::{cell::UnsafeCell, hash::BuildHasher, ptr};
+use std::{cell::UnsafeCell, hash::BuildHasher, num::NonZeroUsize, ptr};
 
 use blaze_hash::FixedState;
 
@@ -157,6 +157,20 @@ pub(crate) struct Local {
     /// The nodes [`Local::dedup_from`] has kept, empty between its calls.
     seen: hashbrown::HashSet<u32, FixedState>,
     pub(crate) attached: *const Storage,
+    /// The task's bound on the rows it brings up to date ([`super::with_fuel`]), moved with it
+    /// across fibers as the rest of its stack is.
+    pub(crate) fuel: Option<Fuel>,
+    /// The barriers on the stack that are not lifted: a job pumped above one is not the
+    /// fueled task's, and is not charged.
+    walls: u32,
+}
+
+/// [`Local::fuel`]: the steps given and left, and how many barriers stood when it was given.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Fuel {
+    pub(crate) given: u64,
+    pub(crate) left: u64,
+    walls: u32,
 }
 
 impl Local {
@@ -174,7 +188,62 @@ impl Local {
             occurrences: hashbrown::HashMap::with_hasher(FixedState),
             seen: hashbrown::HashSet::with_hasher(FixedState),
             attached: ptr::null(),
+            fuel: None,
+            walls: 0,
         }
+    }
+
+    /// Holds nothing of a task: no frame, read, capture, cycle member, pending row, walk, fuel,
+    /// barrier, occurrence or attached storage. Its buffers' capacity and serial are the
+    /// thread's.
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+            && self.edges.is_empty()
+            && self.captures.is_empty()
+            && self.members.is_empty()
+            && self.pending.is_empty()
+            && self.walk.is_empty()
+            && self.occurrences.is_empty()
+            && self.attached.is_null()
+            && self.fuel.is_none()
+            && self.walls == 0
+    }
+
+    /// Gives the task `steps` of fuel, a part of what it has if it has some: the fuel it had.
+    /// A bound given below an unlifted barrier is another task's (this one was pumped onto its
+    /// thread while it waits), as [`Local::burn`] has it: this one is not bounded by what that
+    /// one has left.
+    pub(crate) fn fuel(&mut self, steps: u64) -> Option<Fuel> {
+        let walls = self.walls;
+        let ours = self.fuel.filter(|outer| outer.walls == walls);
+        let steps = ours.map_or(steps, |outer| outer.left.min(steps));
+        self.fuel.replace(Fuel { given: steps, left: steps, walls })
+    }
+
+    /// Takes the task's fuel away, `outer` (what [`Local::fuel`] gave back) in its place, less
+    /// what was spent when `outer` is this task's (given above the same barriers): the fuel
+    /// taken. Another task's bound below a barrier is put back as it was.
+    pub(crate) fn unfuel(&mut self, outer: Option<Fuel>) -> Option<Fuel> {
+        let ours = std::mem::replace(&mut self.fuel, outer);
+        if let (Some(outer), Some(ours)) = (&mut self.fuel, ours)
+            && outer.walls == ours.walls
+        {
+            outer.left = outer.left.saturating_sub(ours.given - ours.left);
+        }
+        ours
+    }
+
+    /// One step of the fueled task, if this is its part of the stack: `Some(steps spent)` when
+    /// none was left.
+    #[inline]
+    pub(crate) fn burn(&mut self) -> Option<u64> {
+        let walls = self.walls;
+        let fuel = self.fuel.as_mut().filter(|it| it.walls == walls)?;
+        if fuel.left == 0 {
+            return Some(fuel.given);
+        }
+        fuel.left -= 1;
+        None
     }
 }
 
@@ -202,8 +271,8 @@ pub(crate) fn with<R>(f: impl FnOnce(&mut Local) -> R) -> R {
 /// out there.
 struct Spare(Box<Local>);
 
-// SAFETY: a spare is empty (no frame, `attached` null: checked as it is kept), so it points at
-// no storage.
+// SAFETY: a spare is empty ([`Local::is_empty`], checked as it is kept: `attached` null and no
+// frame), so it points at no storage.
 unsafe impl Send for Spare {}
 
 // alloc: none: an empty `Vec` in a static; it grows to the most jobs switched out at once.
@@ -212,14 +281,23 @@ static SPARES: ShortLock<Vec<Spare>> = ShortLock::new(Vec::new());
 /// Moves the stack of the job switching out off this thread, leaving an empty one
 /// ([`blaze_graph::sched::Carried`]): the job's frames, reads and cycle state are its
 /// own wherever it resumes, and a job that runs here meanwhile starts a stack of its own.
+///
+/// An empty stack ([`Local::is_empty`]) is not moved: `None`, and the thread keeps it with its
+/// buffers. A job holds nothing in it that another could see, and whichever thread it resumes
+/// on lends it that thread's empty stack. Every job starts and ends with an empty stack, so a
+/// switch moves a box only for a job that waits inside a query; one a job still holds as it
+/// ends is freed by [`end`].
 #[inline(never)]
-pub(crate) fn take() -> usize {
+pub(crate) fn take() -> Option<NonZeroUsize> {
+    if with(|local| local.is_empty()) {
+        return None;
+    }
     let spare = SPARES.lock().pop().map(|it| it.0);
-    // alloc: a stack once per job switched out at once, then kept in `SPARES`.
+    // alloc: a stack once per job switched out at once holding frames, then kept in `SPARES`.
     let mut moved = spare.unwrap_or_else(|| Box::new(Local::empty()));
     // A switch happens in no `with`, so `with` lends the only reference to the stack.
     with(|local| std::mem::swap(local, &mut *moved));
-    Box::into_raw(moved).expose_provenance()
+    NonZeroUsize::new(Box::into_raw(moved).expose_provenance())
 }
 
 /// Puts the stack [`take`] moved off back, on the thread the job resumes on.
@@ -228,17 +306,27 @@ pub(crate) fn take() -> usize {
 ///
 /// If the thread's own stack is not empty: a job left frames on it when it ended or switched.
 #[inline(never)]
-pub(crate) fn put(taken: usize) {
+pub(crate) fn put(taken: NonZeroUsize) {
     // SAFETY: `taken` is the box `take` gave up for this job, which the driver puts back once.
-    let mut left = unsafe { Box::from_raw(ptr::with_exposed_provenance_mut::<Local>(taken)) };
+    let mut left = unsafe { Box::from_raw(ptr::with_exposed_provenance_mut::<Local>(taken.get())) };
     with(|local| std::mem::swap(local, &mut *left));
     assert!(
-        left.frames.is_empty() && left.attached.is_null(),
-        "a job resumed on a thread whose query stack still holds {} frames",
-        left.frames.len()
+        left.is_empty(),
+        "a job resumed on a thread whose query stack was not empty: {} frames, {} reads, {} walk rows",
+        left.frames.len(),
+        left.edges.len(),
+        left.walk.len()
     );
     // alloc: none once warm: `SPARES` grows to its high-water mark.
     SPARES.lock().push(Spare(left));
+}
+
+/// Frees the stack [`take`] moved off a job that ended holding it (or whose parked record was
+/// dropped): its frames name no storage anyone reads again.
+#[inline(never)]
+pub(crate) fn end(taken: NonZeroUsize) {
+    // SAFETY: `taken` is the box `take` gave up for this job, which the driver ends once.
+    drop(unsafe { Box::from_raw(ptr::with_exposed_provenance_mut::<Local>(taken.get())) });
 }
 
 #[inline(always)]
@@ -305,6 +393,7 @@ impl Local {
         frame.pending_start = self.pending.len() as u32;
         self.serial += 1;
         frame.serial = self.serial;
+        self.walls += u32::from(frame.kind == Kind::Barrier { lifted: false });
         if matches!(frame.kind, Kind::Run | Kind::Verify) {
             let slot = &mut self.bloom[bucket(frame.node)];
             *slot =
@@ -319,6 +408,7 @@ impl Local {
     pub(crate) fn pop(&mut self, at: u32) {
         while self.frames.len() > at as usize {
             let frame = self.frames.pop().expect("a frame above `at`");
+            self.walls -= u32::from(frame.kind == Kind::Barrier { lifted: false });
             if matches!(frame.kind, Kind::Run | Kind::Verify) {
                 self.bloom[bucket(frame.node)] -= 1;
             }
@@ -447,6 +537,9 @@ fn set_lifted(at: u32, lifted: bool) {
     with(|local| {
         if let Some(frame) = local.frames.get_mut(at as usize) {
             debug_assert!(matches!(frame.kind, Kind::Barrier { .. }));
+            if frame.kind != (Kind::Barrier { lifted }) {
+                local.walls = if lifted { local.walls - 1 } else { local.walls + 1 };
+            }
             frame.kind = Kind::Barrier { lifted };
         }
     });

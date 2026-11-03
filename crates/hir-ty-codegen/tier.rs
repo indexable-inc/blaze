@@ -22,7 +22,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{cell::RefCell, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
@@ -323,8 +323,16 @@ pub(super) struct Request {
     branches: std::cell::Cell<u32>,
 }
 
-/// The hot functions the compile under way on this thread may build into what it compiles.
-struct Inlining {
+/// The hot functions a compile may build into what it compiles, and what it built in so far.
+///
+/// It is the compile's own: its [`Recorder`] holds it (`Recorder::inlining`), the compile's
+/// caller hands it in and takes it back (`compile_as`'s `inlining`), and a body built in
+/// ([`build_body`]) moves it into its own `Recorder` and back. Never the thread's: a compile
+/// waits in queries, and a fiber resumes on any thread, whose state would be another
+/// compile's or none (rule 24). A query run inside a compile builds with a `Recorder` of its
+/// own, which holds none, so what the database keeps never depends on what a compile builds
+/// in.
+pub(super) struct Inlining {
     roots: HashSet<FunctionId, Global>,
     /// By what they are and their generic arguments: whether a call checks overflow is the
     /// caller's to say, which the last build may have settled otherwise.
@@ -345,7 +353,7 @@ struct Inlining {
     /// The bodies built so far, by what they are of: `None` for one that is not built in.
     built: HashMap<
         (InstanceDef, StoredGenericArgs, bool),
-        Option<std::rc::Rc<super::fragment::Inlinable>>, Global>,
+        Option<Arc<super::fragment::Inlinable>>, Global>,
     /// The size of a body that was built and then found too large, which a build of it with
     /// more room only adds to: it is not built again for a call that allows no more. A body
     /// built while its callees found no room is not kept in [`Inlining::built`], and what it
@@ -354,30 +362,18 @@ struct Inlining {
     oversized: HashMap<(InstanceDef, StoredGenericArgs, bool), usize, Global>,
 }
 
-thread_local! {
-    static INLINING: RefCell<Option<Inlining>> = const { RefCell::new(None) };
-}
-
-/// Runs `work` with no compile at a level above 1 under way on the thread, for what the
-/// database keeps: its result must not depend on what that compile builds in.
-pub(super) fn plain<T>(work: impl FnOnce() -> T) -> T {
-    let held = INLINING.with(|it| it.borrow_mut().take());
-    let out = work();
-    INLINING.with(|it| *it.borrow_mut() = held);
-    out
-}
-
-/// As [`plain`], for the compile of a function of a build. In a build of a whole program or
-/// with `BLAZE_INLINE=all` (see [`across`]), and LLVM at `-O2` or above, `work` builds in
-/// and shows LLVM what the function calls of any crate, as a compile at a level above 1
-/// does with no function hot: what it builds in then depends on the database alone. A build
-/// whose compiles import what they call ([`super::imports`]) builds nothing in here.
-pub(super) fn for_build<T>(work: impl FnOnce() -> T) -> T {
+/// What the compile of a function of a build builds in, handed to its `compile_as`. In a
+/// build of a whole program or with `BLAZE_INLINE=all` (see [`across`]), and LLVM at `-O2`
+/// or above, the compile builds in and shows LLVM what the function calls of any crate, as a
+/// compile at a level above 1 does with no function hot: what it builds in then depends on
+/// the database alone. Otherwise, and in a build whose compiles import what they call
+/// ([`super::imports`]), it builds nothing in here: `None`.
+pub(super) fn for_build() -> Option<Inlining> {
     #[cfg(feature = "llvm")]
     let imports = super::imports::enabled();
     #[cfg(not(feature = "llvm"))]
     let imports = false;
-    let fresh = (across() && !imports).then(|| Inlining {
+    (across() && !imports).then(|| Inlining {
         roots: HashSet::new_in(Global),
         instances: HashSet::new_in(Global),
         // alloc: empty until a body is built in, then one small list per function compile
@@ -390,11 +386,7 @@ pub(super) fn for_build<T>(work: impl FnOnce() -> T) -> T {
         seen: 0,
         built: HashMap::new_in(Global),
         oversized: HashMap::new_in(Global),
-    });
-    let held = INLINING.with(|it| std::mem::replace(&mut *it.borrow_mut(), fresh));
-    let out = work();
-    INLINING.with(|it| *it.borrow_mut() = held);
-    out
+    })
 }
 
 /// Whether a build's compiles build in what they call across crates: in a build of a whole
@@ -415,49 +407,50 @@ pub(super) fn across() -> bool {
         && ASKED.unwrap_or_else(super::backend::whole_program)
 }
 
-/// How large a body of `instance` the compile under way may build into its caller, if it may
-/// build it in at all: a hot one up to [`HOT_INSTRUCTIONS`], any other up to
-/// [`SMALL_INSTRUCTIONS`], as rustc builds in what is small. The body is then built with
+/// How large a body of `instance` the compile whose state is `inlining` may build into its
+/// caller, if it may build it in at all: a hot one up to [`HOT_INSTRUCTIONS`], any other up
+/// to [`SMALL_INSTRUCTIONS`], as rustc builds in what is small. The body is then built with
 /// [`hot_body`].
-pub(super) fn inline_limit(db: &Db, instance: &Instance) -> Option<usize> {
+pub(super) fn inline_limit(
+    db: &Db,
+    inlining: Option<&mut Inlining>,
+    instance: &Instance,
+) -> Option<usize> {
     let func = match instance.def {
         InstanceDef::Fn(func) => Some(func),
         InstanceDef::Closure(_) => None,
         _ => return None,
     };
-    INLINING.with(|it| {
-        let mut it = it.borrow_mut();
-        let inlining = it.as_mut()?;
-        if inlining.whole && built_in() == 0 {
-            return None;
-        }
-        let spent = if inlining.whole { !inlining.has_room() } else { inlining.spent >= BUDGET };
-        if inlining.depth >= if inlining.whole { BUILD_DEPTH } else { DEPTH } || spent {
-            inlining.starved += usize::from(inlining.whole);
-            return None;
-        }
-        if func
-            .is_some_and(|func| AttrFlags::query(db, func.into()).contains(AttrFlags::INLINE_NEVER))
-        {
-            return None;
-        }
-        if inlining.whole && !shared(db, instance) {
-            return None;
-        }
-        Some(if inlining.whole {
-            built_in()
-        } else if inlining.is_hot(instance) {
-            HOT_INSTRUCTIONS
-        } else {
-            SMALL_INSTRUCTIONS
-        })
+    let inlining = inlining?;
+    if inlining.whole && built_in() == 0 {
+        return None;
+    }
+    let spent = if inlining.whole { !inlining.has_room() } else { inlining.spent >= BUDGET };
+    if inlining.depth >= if inlining.whole { BUILD_DEPTH } else { DEPTH } || spent {
+        inlining.starved += usize::from(inlining.whole);
+        return None;
+    }
+    if func.is_some_and(|func| AttrFlags::query(db, func.into()).contains(AttrFlags::INLINE_NEVER))
+    {
+        return None;
+    }
+    if inlining.whole && !shared(db, instance) {
+        return None;
+    }
+    Some(if inlining.whole {
+        built_in()
+    } else if inlining.is_hot(instance) {
+        HOT_INSTRUCTIONS
+    } else {
+        SMALL_INSTRUCTIONS
     })
 }
 
-/// Whether the compile under way is a build's that builds nothing in (`BLAZE_BUILT_IN=0`),
-/// the library's `#[inline]` and generic functions neither: LLVM's inliner has every body.
-pub(super) fn builds_in_nothing() -> bool {
-    built_in() == 0 && INLINING.with(|it| it.borrow().as_ref().is_some_and(|it| it.whole))
+/// Whether the compile whose state is `inlining` is a build's that builds nothing in
+/// (`BLAZE_BUILT_IN=0`), the library's `#[inline]` and generic functions neither: LLVM's
+/// inliner has every body.
+pub(super) fn builds_in_nothing(inlining: Option<&Inlining>) -> bool {
+    built_in() == 0 && inlining.is_some_and(|it| it.whole)
 }
 
 /// Whether a build may build `instance` in, or show it to LLVM: one of the standard library
@@ -488,77 +481,80 @@ impl Inlining {
 
 /// The body of a hot callee, built to be put where it is called, with the hot functions it
 /// calls built into it in turn, if it has at most `limit` instructions once its locals are
-/// out of the frame.
+/// out of the frame. `inlining` is the state of the compile asking, which counts it.
 pub(super) fn hot_body(
     db: &Db,
+    inlining: &mut Option<Inlining>,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
     limit: usize,
     tracked: bool,
-) -> Option<std::rc::Rc<super::fragment::Inlinable>> {
-    if let Some(known) = oversized(instance, tracked, limit) {
+) -> Option<Arc<super::fragment::Inlinable>> {
+    if let Some(known) = oversized(inlining, instance, tracked, limit) {
         refused(db, instance, format_args!("too large ({known} instructions)"));
         return None;
     }
-    let before = tally();
-    let Some(body) = body(db, instance, env, tracked) else {
-        untally(before);
+    let before = tally(inlining);
+    let Some(body) = body(db, inlining, instance, env, tracked) else {
+        untally(inlining, before);
         return None;
     };
     if size(&body.func) > limit {
-        untally(before);
-        oversize(instance, tracked, size(&body.func));
+        untally(inlining, before);
+        oversize(inlining, instance, tracked, size(&body.func));
         refused(db, instance, format_args!("too large ({} instructions)", size(&body.func)));
         return None;
     }
-    spend(instance, env, &body);
+    spend(inlining, instance, env, &body);
     Some(body)
 }
 
 /// How large a build of `instance` was found, if that is more than `limit`.
-fn oversized(instance: &Instance, tracked: bool, limit: usize) -> Option<usize> {
+fn oversized(
+    inlining: &Option<Inlining>,
+    instance: &Instance,
+    tracked: bool,
+    limit: usize,
+) -> Option<usize> {
     let key = (instance.def, instance.args, tracked);
-    INLINING.with(|it| it.borrow().as_ref()?.oversized.get(&key).copied().filter(|&it| it > limit))
+    inlining.as_ref()?.oversized.get(&key).copied().filter(|&it| it > limit)
 }
 
-fn oversize(instance: &Instance, tracked: bool, size: usize) {
+fn oversize(inlining: &mut Option<Inlining>, instance: &Instance, tracked: bool, size: usize) {
     let key = (instance.def, instance.args, tracked);
-    INLINING.with(|it| {
-        if let Some(it) = it.borrow_mut().as_mut() {
-            let known = it.oversized.entry(key).or_default();
-            *known = (*known).max(size);
-        }
-    });
+    if let Some(it) = inlining {
+        let known = it.oversized.entry(key).or_default();
+        *known = (*known).max(size);
+    }
 }
 
-/// What the compile under way has built in and shown so far.
-fn tally() -> Option<(usize, usize)> {
-    INLINING.with(|it| it.borrow().as_ref().map(|it| (it.spent, it.seen)))
+/// What the compile has built in and shown so far.
+fn tally(inlining: &Option<Inlining>) -> Option<(usize, usize)> {
+    inlining.as_ref().map(|it| (it.spent, it.seen))
 }
 
 /// Takes back what building a body counted of the bodies it built in and showed, when the
 /// body is not used: else a body too large to build in, at the head of a long chain, uses
 /// up the share of its call, and is then not shown either (`vec![false; n]`'s
 /// `SpecFromElem::from_elem`, whose length LLVM then does not know).
-fn untally(before: Option<(usize, usize)>) {
-    INLINING.with(|it| {
-        if let (Some(it), Some((spent, seen))) = (it.borrow_mut().as_mut(), before) {
-            (it.spent, it.seen) = (spent, seen);
-        }
-    });
+fn untally(inlining: &mut Option<Inlining>, before: Option<(usize, usize)>) {
+    if let (Some(it), Some((spent, seen))) = (inlining, before) {
+        (it.spent, it.seen) = (spent, seen);
+    }
 }
 
-/// The body of a callee that the compile under way calls rather than builds in, for LLVM to
-/// see what it does: one that is `#[inline(never)]` and hot, whose call LLVM keeps and knows
-/// then what it reads and writes, or one too large for [`inline_limit`], which LLVM builds in
-/// itself where its own measure, after optimization, finds it small enough. What its
-/// `#[inline]` asks comes with it.
+/// The body of a callee that the compile whose state is `inlining` calls rather than builds
+/// in, for LLVM to see what it does: one that is `#[inline(never)]` and hot, whose call LLVM
+/// keeps and knows then what it reads and writes, or one too large for [`inline_limit`],
+/// which LLVM builds in itself where its own measure, after optimization, finds it small
+/// enough. What its `#[inline]` asks comes with it.
 pub(super) fn seen_body(
     db: &Db,
+    inlining: &mut Option<Inlining>,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
     tracked: bool,
-) -> Option<(std::rc::Rc<super::fragment::Inlinable>, super::fragment::Hint)> {
+) -> Option<(Arc<super::fragment::Inlinable>, super::fragment::Hint)> {
     let func = match instance.def {
         InstanceDef::Fn(func) => Some(func),
         InstanceDef::Closure(_) | InstanceDef::DropGlue => None,
@@ -566,21 +562,20 @@ pub(super) fn seen_body(
     };
     // Bodies built in show theirs too: one call left opaque, such as a drop on the unwind path,
     // has LLVM take every pointer passed to it as escaped and load it again after each store.
-    let (hot, room) = INLINING.with(|it| {
-        let mut it = it.borrow_mut();
-        let inlining = it.as_mut()?;
-        let room = match inlining.whole {
-            true if inlining.depth >= BUILD_DEPTH => Err("not shown: depth"),
-            true if !inlining.has_room() => Err("not shown: budget"),
+    let (hot, room) = {
+        let state = inlining.as_mut()?;
+        let room = match state.whole {
+            true if state.depth >= BUILD_DEPTH => Err("not shown: depth"),
+            true if !state.has_room() => Err("not shown: budget"),
             true => Ok(shared(db, instance)),
-            false if inlining.depth >= DEPTH => Err("not shown: depth"),
-            false => Ok(inlining.seen < SEEN_BUDGET),
+            false if state.depth >= DEPTH => Err("not shown: depth"),
+            false => Ok(state.seen < SEEN_BUDGET),
         };
-        if room.is_err() && inlining.whole {
-            inlining.starved += 1;
+        if room.is_err() && state.whole {
+            state.starved += 1;
         }
-        Some((inlining.is_hot(instance), room))
-    })?;
+        (state.is_hot(instance), room)
+    };
     let room = match room {
         Ok(room) => room,
         Err(why) => {
@@ -607,63 +602,58 @@ pub(super) fn seen_body(
     if hint == super::fragment::Hint::Never && !hot {
         return None;
     }
-    if let Some(known) = oversized(instance, tracked, limit) {
+    if let Some(known) = oversized(inlining, instance, tracked, limit) {
         refused(db, instance, format_args!("not shown: {known} instructions"));
         return None;
     }
-    let before = tally();
-    let Some(body) = body(db, instance, env, tracked) else {
-        untally(before);
+    let before = tally(inlining);
+    let Some(body) = body(db, inlining, instance, env, tracked) else {
+        untally(inlining, before);
         return None;
     };
     if size(&body.func) > limit {
-        untally(before);
-        oversize(instance, tracked, size(&body.func));
+        untally(inlining, before);
+        oversize(inlining, instance, tracked, size(&body.func));
         refused(db, instance, format_args!("not shown: {} instructions", size(&body.func)));
         return None;
     }
-    INLINING.with(|it| {
-        if let Some(it) = it.borrow_mut().as_mut() {
-            it.seen += size(&body.func);
-            if !it.inlined.iter().any(|(known, _)| known == instance) {
-                // clone: a few `u32` ids, nothing on the heap; once per body shown
-                it.inlined.push((instance.clone(), env.clone()));
-            }
+    if let Some(it) = inlining {
+        it.seen += size(&body.func);
+        if !it.inlined.iter().any(|(known, _)| known == instance) {
+            // clone: a few `u32` ids, nothing on the heap; once per body shown
+            it.inlined.push((instance.clone(), env.clone()));
         }
-    });
+    }
     Some((body, hint))
 }
 
 /// The body of `instance`, built once per compile.
 fn body(
     db: &Db,
+    inlining: &mut Option<Inlining>,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
     tracked: bool,
-) -> Option<std::rc::Rc<super::fragment::Inlinable>> {
+) -> Option<Arc<super::fragment::Inlinable>> {
     let key = (instance.def, instance.args, tracked);
-    let known = INLINING.with(|it| it.borrow().as_ref()?.built.get(&key).cloned());
+    let known = inlining.as_ref().and_then(|it| it.built.get(&key).cloned());
     match known {
         Some(body) => body,
         None => {
             // A body that calls itself, while it is built, is not built in again.
-            let starved = INLINING.with(|it| {
-                let mut it = it.borrow_mut();
-                let it = it.as_mut()?;
+            let starved = inlining.as_mut().map(|it| {
                 it.built.insert(key, None);
-                Some(it.starved)
+                it.starved
             });
-            let body = build_body(db, instance, env, tracked).map(std::rc::Rc::new);
-            INLINING.with(|it| {
-                if let Some(it) = it.borrow_mut().as_mut() {
-                    if Some(it.starved) == starved {
-                        // clone: a count on the `Rc` of a body just built, kept and returned
-                        it.built.insert(key, body.clone());
-                    } else {
-                        it.built.remove(&key);
-                    }
+            let body = build_body(db, inlining, instance, env, tracked).map(Arc::new);
+            if let Some(it) = inlining {
+                if Some(it.starved) == starved {
+                    // clone: a count on the `Arc` of a body just built, kept and returned
+                    it.built.insert(key, body.clone());
+                } else {
+                    it.built.remove(&key);
                 }
-            });
+            }
             body
         }
     }
@@ -747,18 +737,21 @@ pub(super) fn known_value(func: &ir::Function, value: ir::Value) -> Option<i64> 
     }
 }
 
-/// Counts `body` as built into the compile under way, which an edit of it then sends back
-/// to level 1.
-fn spend(instance: &Instance, env: &StoredParamEnvAndCrate, body: &super::fragment::Inlinable) {
-    INLINING.with(|it| {
-        if let Some(it) = it.borrow_mut().as_mut() {
-            it.spent += size(&body.func);
-            if !it.inlined.iter().any(|(known, _)| known == instance) {
-                // clone: a few `u32` ids, nothing on the heap; once per body built in
-                it.inlined.push((instance.clone(), env.clone()));
-            }
+/// Counts `body` as built into the compile whose state is `inlining`, which an edit of it then
+/// sends back to level 1.
+fn spend(
+    inlining: &mut Option<Inlining>,
+    instance: &Instance,
+    env: &StoredParamEnvAndCrate,
+    body: &super::fragment::Inlinable,
+) {
+    if let Some(it) = inlining {
+        it.spent += size(&body.func);
+        if !it.inlined.iter().any(|(known, _)| known == instance) {
+            // clone: a few `u32` ids, nothing on the heap; once per body built in
+            it.inlined.push((instance.clone(), env.clone()));
         }
-    });
+    }
 }
 
 /// Says why a body is not built in, with `BLAZE_DUMP_TIER`.
@@ -776,8 +769,12 @@ fn refused(db: &Db, instance: &Instance, why: impl std::fmt::Display) {
     }
 }
 
+/// Builds the body of `instance` for the compile whose state is `inlining`, which the body's
+/// own `Recorder` holds while it is built, so that what it builds in is counted with the
+/// compile's, and hands back.
 fn build_body(
     db: &Db,
+    inlining: &mut Option<Inlining>,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
     tracked: bool,
@@ -802,14 +799,12 @@ fn build_body(
             }
         },
     };
-    INLINING.with(|it| {
-        if let Some(it) = it.borrow_mut().as_mut() {
-            if it.depth == 0 {
-                it.base = it.spent + it.seen;
-            }
-            it.depth += 1;
+    if let Some(it) = inlining.as_mut() {
+        if it.depth == 0 {
+            it.base = it.spent + it.seen;
         }
-    });
+        it.depth += 1;
+    }
     let built = (|| {
         // Declined, never guessed: the compile asking loaded this crate's target with `?`.
         let target = super::target_of_crate(db, env.as_ref(db).krate)
@@ -818,8 +813,9 @@ fn build_body(
         let isa = super::isa_for(target).map_err(|e| self::refused(db, instance, e)).ok()?;
         let mut cg = Recorder::new(db, &**isa, target, instance.checked, None);
         cg.unlocated = true;
+        cg.inlining = inlining.take();
         let args = instance.args;
-        let mut ctx =
+        let built =
             super::build(&mut cg, env.as_ref(db), body.as_deref(), tracked, |fx| match fx.body {
                 Some(_) => {
                     fx.args = Some(args);
@@ -829,9 +825,10 @@ fn build_body(
                     use rustc_type_ir::inherent::GenericArgs as _;
                     fx.drop_glue(args.as_ref().type_at(0))
                 }
-            })
-            .map_err(|e| self::refused(db, instance, e))
-            .ok()?;
+            });
+        // Back to the compile before anything can return: nothing after the build reads it.
+        *inlining = cg.inlining.take();
+        let mut ctx = built.map_err(|e| self::refused(db, instance, e)).ok()?;
         if cg.naked.is_some() || cg.opaque {
             refused("naked or opaque");
             return None;
@@ -849,11 +846,9 @@ fn build_body(
         }
         inlinable
     })();
-    INLINING.with(|it| {
-        if let Some(it) = it.borrow_mut().as_mut() {
-            it.depth -= 1;
-        }
-    });
+    if let Some(it) = inlining.as_mut() {
+        it.depth -= 1;
+    }
     built
 }
 
@@ -923,22 +918,25 @@ pub fn prepare(db: &Db, asked: &Asked) -> std::result::Result<Prepared, String> 
             }
         }
     }
-    let held = INLINING.with(|it| it.borrow_mut().replace(inlining));
-    let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &asked.node.0 {
-        Kind::Root(func) => super::root_code(db, *func, true),
-        Kind::Instance(instance, env) => {
+    let mut inlining = Some(inlining);
+    let compiled = match &asked.node.0 {
+        Kind::Root(func) => super::root_code(db, *func, true, &mut inlining),
+        Kind::Instance(instance, env) => super::instance_code(
+            db,
             // clone: the query takes them by value; a few `u32` ids, nothing on the heap
-            super::instance_code(db, instance.clone(), env.clone(), super::Detach::Tier, None)
-        }
-    }));
-    let inlining = INLINING.with(|it| std::mem::replace(&mut *it.borrow_mut(), held));
+            instance.clone(),
+            env.clone(),
+            super::Detach::Tier,
+            None,
+            &mut inlining,
+        ),
+    };
     let pending = match compiled {
-        Ok(Ok(super::Produced::Pending(pending))) => pending,
+        Ok(super::Produced::Pending(pending)) => pending,
         // alloc: the error's message
-        Ok(Ok(super::Produced::Code(_))) => return Err("its code is its assembly".to_owned()),
+        Ok(super::Produced::Code(_)) => return Err("its code is its assembly".to_owned()),
         // alloc: the error's message
-        Ok(Err(e)) => return Err(e.to_string()),
-        Err(panic) => std::panic::resume_unwind(panic),
+        Err(e) => return Err(e.to_string()),
     };
     let built_in = inlining.map(|it| it.inlined).unwrap_or_default();
     let mut inlined = Vec::with_capacity(built_in.len());

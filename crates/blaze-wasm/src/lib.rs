@@ -160,6 +160,7 @@ fn policy(toolchain: Toolchain) -> Policy {
             panic: Panic::Abort,
             packages: BTreeMap::new(),
             build_override: Override::default(),
+            stencils: false,
         },
         mode: Mode::Live,
         fold: true,
@@ -343,7 +344,7 @@ impl Compiler {
         let frontend = HirFrontend::new(
             Databases::new(db),
             HashSource::Items(ItemHashes::new(Box::new(names))),
-            Arc::new(BuildTime::default()),
+            BuildTime::default(),
         )
         .with_policy(&policy);
         let roots = frontend.roots(app, RootKind::Shared).map_err(|it| it.what)?;

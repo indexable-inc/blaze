@@ -18,7 +18,16 @@
 //! code is cargo's either way: 0, the code of the first failing executable in cargo's order,
 //! or 101 under `--no-fail-fast` or when the build failed.
 //!
+//! Without blaze-cargo's `tui` feature (the wasm seed, which has no terminal library) a run
+//! that would draw the view is refused, naming the feature ([`drive`]); the runtime around the
+//! terminal still builds and its tests still run.
+//!
 //! [`Response::TestReady`]: blaze_api::Response::TestReady
+
+#![cfg_attr(
+    not(feature = "tui"),
+    allow(dead_code, unused_imports, reason = "without `tui`, only `wanted` and the refusing `drive` are reached")
+)]
 
 use std::{
     alloc::Global,
@@ -37,7 +46,9 @@ use blaze_hash::HashSet;
 use blaze_ui::test_view::{BinaryEnd, Event, Paint, TestView, Verdict};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use parking_lot::Mutex;
-use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, text::Line};
+use ratatui::text::Line;
+#[cfg(feature = "tui")]
+use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
 
 use super::{
     FAILED, Then,
@@ -92,8 +103,38 @@ pub fn wanted(asked: &Invocation, shown: Shown) -> bool {
         let arg = arg.to_string_lossy();
         !PLAIN_ARGS.iter().any(|plain| arg == *plain || arg.starts_with(&format!("{plain}=")))
     });
-    let big = ratatui::crossterm::terminal::size().is_ok_and(|(columns, rows)| columns >= COLUMNS && rows >= ROWS);
-    reads_args && big
+    reads_args && fits()
+}
+
+/// Whether the terminal is big enough for the view.
+#[cfg(feature = "tui")]
+fn fits() -> bool {
+    ratatui::crossterm::terminal::size().is_ok_and(|(columns, rows)| columns >= COLUMNS && rows >= ROWS)
+}
+
+/// Without `tui` there is no terminal library to ask the size, and the view is what this run
+/// asks for whatever it is: [`drive`] refuses it, naming the feature.
+#[cfg(not(feature = "tui"))]
+fn fits() -> bool {
+    true
+}
+
+/// What a blaze built without blaze-cargo's `tui` feature says when a run asks for the view.
+#[cfg(not(feature = "tui"))]
+const NO_TUI: &str = "`blaze test` on a terminal draws a live view, and this blaze is built without blaze-cargo's \
+                      `tui` feature (the seed profile, which has no terminal library); `BLAZE_UI=plain` prints plain lines";
+
+/// [`NO_TUI`]: the run is refused before anything is built.
+#[cfg(not(feature = "tui"))]
+pub fn drive<A: Api>(
+    _api: &mut A,
+    _asked: &Invocation,
+    _place: &Place,
+    _request: Request,
+    _shown: Shown,
+    _started: Instant,
+) -> io::Result<Then> {
+    Err(io::Error::other(NO_TUI))
 }
 
 /// Whether this runs on CI: `CI` set to anything but empty, `0` or `false` (GitHub Actions,
@@ -126,6 +167,7 @@ enum Run {
 }
 
 /// The build and its tests, drawn live: what `cli::drive` does for `test` on a terminal.
+#[cfg(feature = "tui")]
 pub fn drive<A: Api>(
     api: &mut A,
     asked: &Invocation,
@@ -242,6 +284,7 @@ pub fn drive<A: Api>(
 }
 
 /// The terminal with its inline region, on stderr as cargo's own lines are.
+#[cfg(feature = "tui")]
 fn open() -> io::Result<Terminal<CrosstermBackend<io::Stderr>>> {
     let (_, rows) = ratatui::crossterm::terminal::size()?;
     let height = REGION.min(rows.saturating_sub(4)).max(3);
@@ -294,6 +337,7 @@ impl Write for Above {
 
 /// The runtime's screen: each message is the view's update, each tick its view, and what the
 /// view hands back is printed above the region.
+#[cfg(feature = "tui")]
 struct Screen {
     terminal: Terminal<CrosstermBackend<io::Stderr>>,
     view: TestView,
@@ -303,6 +347,7 @@ struct Screen {
     started: Instant,
 }
 
+#[cfg(feature = "tui")]
 impl Screen {
     fn run(mut self, gets: &Receiver<Msg>) -> io::Result<()> {
         loop {
@@ -403,6 +448,7 @@ impl Screen {
 }
 
 /// `lines` printed above the region, into the scrollback.
+#[cfg(feature = "tui")]
 fn above(terminal: &mut Terminal<CrosstermBackend<io::Stderr>>, lines: &[Line<'static>]) -> io::Result<()> {
     // A chunk at most a screen's worth of rows, so no height overflows.
     for chunk in lines.chunks(256) {
@@ -420,6 +466,7 @@ fn above(terminal: &mut Terminal<CrosstermBackend<io::Stderr>>, lines: &[Line<'s
 }
 
 /// `lines` as text, once the region is gone.
+#[cfg(feature = "tui")]
 fn plain(lines: &[Line<'static>]) {
     let mut text = String::new(); // alloc: once a frame after the view broke
     for line in lines {

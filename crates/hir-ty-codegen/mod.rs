@@ -163,7 +163,6 @@ mod unwind;
 pub mod v2;
 mod vtable;
 pub mod wasm;
-mod wasm_object;
 mod x86;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -958,7 +957,7 @@ fn rows_of(db: &Db, compiled: &CompiledFunction) -> Vec<Row> {
 #[blaze_query::tracked(returns(ref))]
 fn compiled_root(db: &Db, func: FunctionId) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
-    tier::for_build(|| root_code(db, func, false)).map(Produced::code)
+    root_code(db, func, false, &mut tier::for_build()).map(Produced::code)
 }
 
 /// The last name of what an instance is of.
@@ -1012,8 +1011,14 @@ fn backtrace_name(db: &Db, instance: &Instance) -> String {
 }
 
 /// The code of a non-generic function: Cranelift's, or, for a compile at a level above 1
-/// (`tier`), its IR for LLVM.
-fn root_code(db: &Db, func: FunctionId, tier: bool) -> Result<Produced> {
+/// (`tier`), its IR for LLVM. `inlining` is what the compile builds in, handed back with what
+/// it built in (see `compile_as`).
+fn root_code(
+    db: &Db,
+    func: FunctionId,
+    tier: bool,
+    inlining: &mut Option<tier::Inlining>,
+) -> Result<Produced> {
     let (body, env) = root_body(db, func)?;
     if dump_mir_of().is_some_and(|want| FunctionSignature::of(db, func).name.as_str() == want) {
         dump_mir(body);
@@ -1023,7 +1028,7 @@ fn root_code(db: &Db, func: FunctionId, tier: bool) -> Result<Produced> {
     let body = body_for_abi(abi, Cow::Borrowed(body))?;
     let args = GenericArgs::new_from_slice(&[]).store();
     let checked = crate_checks_overflow(db, func.krate(db)).unwrap_or(false);
-    compile_as(db, env, Some(&*body), track_caller(db, func), checked, tier, None, |fx| {
+    compile_as(db, env, Some(&*body), track_caller(db, func), checked, tier, None, inlining, |fx| {
         fx.abi = abi;
         fx.variadic = variadic;
         fx.args = Some(args);
@@ -1265,7 +1270,7 @@ fn compiled_instance<'db>(
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "blaze", "compiled_instance").entered();
-    tier::for_build(|| instance_code(db, instance, env, Detach::No, None)).map(Produced::code)
+    instance_code(db, instance, env, Detach::No, None, &mut tier::for_build()).map(Produced::code)
 }
 
 /// Whether a compile leaves LLVM's part to later ([`Produced::Pending`]): not at all, for a
@@ -1280,18 +1285,21 @@ enum Detach {
 
 /// The code of an instance: Cranelift's, or, detached, its IR for LLVM.
 ///
-/// `unit` is the v2 unit's settings its body is read under; `None` in v1.
+/// `unit` is the v2 unit's settings its body is read under; `None` in v1. `inlining` is what
+/// the compile builds in, handed back with what it built in (see `compile_as`).
 fn instance_code(
     db: &Db,
     instance: Instance,
     env: StoredParamEnvAndCrate,
     detach: Detach,
     unit: Option<v2::build::Build>,
+    inlining: &mut Option<tier::Inlining>,
 ) -> Result<Produced> {
     let stored_env = env;
     let env = stored_env.as_ref(db);
     let ty = || instance.args.as_ref().type_at(0);
     let (tier, shim) = (detach != Detach::No, detach == Detach::Unit);
+    let checked = instance.checked;
     if detach == Detach::Tier
         && !matches!(
             instance.def,
@@ -1305,7 +1313,7 @@ fn instance_code(
     }
     let body = match instance.def {
         InstanceDef::DropGlue => {
-            return compile_as(db, env, None, false, instance.checked, shim, unit, |fx| {
+            return compile_as(db, env, None, false, checked, shim, unit, inlining, |fx| {
                 let ty = ty();
                 fx.drop_glue(ty)?;
                 if dumps_clif() {
@@ -1315,23 +1323,23 @@ fn instance_code(
             });
         }
         InstanceDef::CallOnceShim => {
-            return compile_as(db, env, None, false, instance.checked, shim, unit, |fx| {
+            return compile_as(db, env, None, false, checked, shim, unit, inlining, |fx| {
                 fx.call_once_shim(ty())
             });
         }
         InstanceDef::VtableShim(func) => {
             let args = instance.args.as_ref();
-            return compile_as(db, env, None, false, instance.checked, shim, unit, |fx| {
+            return compile_as(db, env, None, false, checked, shim, unit, inlining, |fx| {
                 fx.vtable_shim(func, args)
             });
         }
         InstanceDef::FnPointerShim => {
-            return compile_as(db, env, None, false, instance.checked, shim, unit, |fx| {
+            return compile_as(db, env, None, false, checked, shim, unit, inlining, |fx| {
                 fx.fn_pointer_shim(ty())
             });
         }
         InstanceDef::ReifyShim { receiver } => {
-            return compile_as(db, env, None, false, instance.checked, shim, unit, |fx| {
+            return compile_as(db, env, None, false, checked, shim, unit, inlining, |fx| {
                 fx.reify_shim(ty(), receiver)
             });
         }
@@ -1365,7 +1373,7 @@ fn instance_code(
         }
         _ => None,
     };
-    let compiled = compile_as(db, env, Some(body), tracked, instance.checked, tier, unit, |fx| {
+    let compiled = compile_as(db, env, Some(body), tracked, checked, tier, unit, inlining, |fx| {
         fx.abi = abi;
         fx.variadic = variadic;
         fx.args = Some(args);
@@ -1718,12 +1726,36 @@ fn instance_body<'db>(
     let body = tally
         .step(Step::Mir, || db.mir(owner, MirStage::compiled(owner, options)))
         .and_then(|it| filled(it, &args, &env));
-    // alloc: the error's message
-    let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+    let body = body.map_err(|e| mir_failed(db, owner, &e))?;
     match instance.def {
         InstanceDef::Fn(func) => body_for_abi(FunctionSignature::of(db, func).abi, body),
         _ => Ok(body),
     }
+}
+
+/// The error of a body whose MIR did not build or fill: the body by its path (a closure's or
+/// coroutine's by the body it is written in), and the lowering error in words, which for a call
+/// with no function is the callee as written, where the call is and why it resolved to nothing,
+/// in the body it was met in (rule 16).
+fn mir_failed(db: &Db, owner: MirOwner<'_>, error: &hir_ty::mir::MirLowerError<'_>) -> CodegenError {
+    use blaze_items::lowering;
+    use std::fmt::Write as _;
+    let written = owner.written_in(db);
+    // alloc: the error's message
+    let mut what = format!("the MIR of `{}`", lowering::owner_path(db, written));
+    match owner {
+        MirOwner::Body(_) => {}
+        MirOwner::Closure(_) => what.push_str(" (a closure in it)"),
+        MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => what.push_str(" (a coroutine in it)"),
+    }
+    what.push_str(" did not lower: ");
+    if let hir_ty::mir::MirLowerError::MissingFunctionDefinition(met, _) = error
+        && *met != written
+    {
+        _ = write!(what, "in `{}`, ", lowering::owner_path(db, *met));
+    }
+    lowering::write(db, error, &mut what);
+    CodegenError::Frontend(what)
 }
 
 /// The body as its native entry point receives its arguments: the final tuple of an
@@ -1896,7 +1928,8 @@ fn instance_def(body: dispatch::Body) -> InstanceDef {
 /// until the code of one of them, or of a static it found, changes.
 type Walked = Vec<(Instance, StoredParamEnvAndCrate)>;
 
-/// The value of a static that rustc exports no symbol for.
+/// The value of a static with an initializer: any but one of an `extern` block, whose value is
+/// another object's (readers ask `v2::statics::source`, which tells the two apart).
 #[blaze_query::tracked(returns(ref))]
 fn compiled_static(db: &Db, id: StaticId) -> Result<CompiledStatic> {
     let checked = crate_checks_overflow(db, id.krate(db)).unwrap_or(false);
@@ -2167,8 +2200,15 @@ pub fn link_name(db: &Db, func: FunctionId) -> Result<Option<String>> {
 }
 
 /// [`link_name`] on `target`, the target of the code that names the item.
+///
+/// On wasm, an item of a block that names its module (`#[link(wasm_import_module = "m")]`) is
+/// that module's import and never a definition the link finds by name, so its symbol is
+/// `m.field` ([`wasm_import`] has the field): it never takes the place of a definition of the
+/// same name, as `wasi_rt`'s `unlink` beside the seed's `blaze_seed.unlink` import. rustc
+/// mangles such an import's symbol for the same reason. A block that names no module imports
+/// from `env` by the plain name, which a definition of that name satisfies.
 pub(crate) fn link_name_for(db: &Db, target: &Target, func: FunctionId) -> Option<String> {
-    let ItemContainerId::ExternBlockId(_) = func.lookup(db).container else {
+    let ItemContainerId::ExternBlockId(block) = func.lookup(db).container else {
         return None;
     };
     let written = AttrFlags::link_name(db, func.into());
@@ -2176,19 +2216,29 @@ pub(crate) fn link_name_for(db: &Db, target: &Target, func: FunctionId) -> Optio
         Some(it) => it.as_str(),
         None => FunctionSignature::of(db, func).name.as_str(),
     };
-    // alloc: the symbol written into the object; callers outside this range take a `String`
+    if target.is_wasm()
+        && let Some(module) = AttrFlags::wasm_import_module(db, block)
+    {
+        // alloc: the symbol written into the object; callers outside this range take a `String`
+        return Some(format!("{}.{name}", module.as_str()));
+    }
+    // alloc: as above
     Some(as_declared(name, global_prefix(target)).to_owned())
 }
 
-/// The module of a wasm module's imports an item of an `extern` block is one of, on a target
-/// whose objects are wasm's.
-fn wasm_import_module(db: &Db, target: &Target, func: FunctionId) -> Option<String> {
-    let ItemContainerId::ExternBlockId(block) = func.lookup(db).container else { return None };
-    if !target.writes_wasm_objects() {
+/// The module and field a wasm module imports `func`, an item of an `extern` block, as: its
+/// block's `#[link(wasm_import_module)]`, or `None` for `env`, and its link name.
+pub(crate) fn wasm_import(db: &Db, func: FunctionId) -> Option<(Option<String>, String)> {
+    let ItemContainerId::ExternBlockId(block) = func.lookup(db).container else {
         return None;
-    }
-    // alloc: the import's module, written into the object; its caller takes a `String`
-    AttrFlags::wasm_import_module(db, block).map(|it| it.as_str().to_owned())
+    };
+    let written = AttrFlags::link_name(db, func.into());
+    let field = match &written {
+        Some(it) => it.as_str(),
+        None => FunctionSignature::of(db, func).name.as_str(),
+    };
+    // alloc: the import's module and field, which it keeps
+    Some((AttrFlags::wasm_import_module(db, block).map(|it| it.as_str().to_owned()), field.to_owned()))
 }
 
 /// The prefix the object writer puts in front of every name declared to it for `target`:
@@ -2267,7 +2317,8 @@ const ALLOCATOR_ENTRIES: [(&str, &str, usize, bool); 4] = [
     ("__rust_alloc_zeroed", "__blaze_global_alloc_zeroed", 2, true),
 ];
 
-/// The function of `krate` the `#[global_allocator]`'s expansion exports as `exported`.
+/// The function of `krate` a builtin attribute's expansion exports as `exported`: the
+/// `#[global_allocator]`'s functions, the `#[alloc_error_handler]`'s `__rg_oom`.
 fn global_allocator_export(
     db: &Db,
     krate: Crate,
@@ -2315,12 +2366,16 @@ fn compile<'db>(
     checked: bool,
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<CompiledFunction> {
-    compile_as(db, env, body, tracked, checked, false, None, fill).map(Produced::code)
+    compile_as(db, env, body, tracked, checked, false, None, &mut None, fill).map(Produced::code)
 }
 
 /// Builds the IR of one function and compiles it with Cranelift, or, for a compile at a level
 /// above 1 (`tier`), leaves it to LLVM to compile once the database is let go of. `unit` is
 /// the v2 unit's settings it is built under, as its caller was asked for them; `None` in v1.
+/// `inlining` is what the compile may build in ([`tier::Inlining`]): the compile's `Recorder`
+/// holds it while the IR is built, and it is handed back with what was built in, which a
+/// compile at a level above 1 reads. The caller owns it, never the thread: the build waits
+/// in queries, and a fiber resumes on any thread (rule 24).
 #[allow(clippy::too_many_arguments)]
 fn compile_as<'db>(
     db: &'db Db,
@@ -2330,17 +2385,22 @@ fn compile_as<'db>(
     checked: bool,
     tier: bool,
     unit: Option<v2::build::Build>,
+    inlining: &mut Option<tier::Inlining>,
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<Produced> {
     let target = target_of_crate(db, env.krate)?;
     let isa = &**isa_for(target)?;
     let mut cg = Recorder::new(db, isa, target, checked, unit);
+    cg.inlining = inlining.take();
     let tally = backend::Tally::global();
-    let mut ctx = tally.step(Step::Translate, || {
+    let built = tally.step(Step::Translate, || {
         let mut ctx = build(&mut cg, env, body, tracked, fill)?;
         settle(&mut ctx, &cg)?;
         Result::Ok(ctx)
-    })?;
+    });
+    // Back to the caller before anything can return: nothing after the build reads it.
+    *inlining = cg.inlining.take();
+    let mut ctx = built?;
     let code = match cg.naked.take() {
         // The function is its assembly: what was built of it is only its signature.
         Some((text, syms)) => {
@@ -2377,6 +2437,7 @@ fn compile_as<'db>(
             // alloc: the pending compile keeps them, once per function
             let named = cg.named_slots().collect();
             let (source, variables) = described(&mut cg, env, body)?;
+            let built_in = built_in_of(&mut cg, body);
             let (wants, layouts) = cg.detach();
             let func = std::mem::replace(&mut ctx.func, ir::Function::new());
             spare::keep_context(ctx);
@@ -2390,6 +2451,7 @@ fn compile_as<'db>(
                 layouts,
                 closure: None,
                 moves_to_frame: body.is_some_and(|it| it.inlined.moved_to_frame != 0),
+                built_in,
             }));
         }
         None => Backend::emit(&mut cg, &mut ctx)?,
@@ -2451,6 +2513,8 @@ pub struct Pending {
     /// Its body has allocations `HeapToStack` moved into its frame
     /// (`Inlined::moved_to_frame`): it is built into no other function.
     moves_to_frame: bool,
+    /// The instances whose bodies its code has in it ([`built_in_of`]).
+    built_in: Vec<Instance>,
 }
 
 impl Pending {
@@ -2465,6 +2529,13 @@ impl Pending {
         self.moves_to_frame
     }
 
+    /// The instances whose bodies its code has in it, at any depth, each once, as the build
+    /// put them there ([`built_in_of`]): what its template's key must hold
+    /// (`v2::frontend::inlined`).
+    pub(crate) fn built_in(&self) -> &[Instance] {
+        &self.built_in
+    }
+
     /// The code LLVM makes of the function, at the level `request` asks for.
     pub(crate) fn produce(mut self, request: &tier::Request) -> Result<CompiledFunction> {
         let code = tier::emit(&mut self.wants, self.target, &self.named, &mut self.func, request)?;
@@ -2477,6 +2548,28 @@ impl Pending {
             layouts: self.layouts,
         })
     }
+}
+
+/// The instances whose bodies the code of a function built from `body` by `cg` has in it, at
+/// any depth, each once: those the MIR inliner put in `body` (`MirBody::inlined`, whose list
+/// is transitive) and those the IR builder built in (`Recorder::built_in`, which holds what
+/// each of those has in it, `built_in_body`). The one record of what a compile built in, as
+/// the build did it under its unit's settings: the walk that keys a unit lists the same ahead
+/// of the build (`v2/refs.rs` `Walk::inlined_callees`, `Walk::instance_call`), and the driver
+/// refuses a compile whose key misses one (`blaze-codegen` `unkept_inline`).
+fn built_in_of(cg: &mut Recorder<'_>, body: Option<&MirBody<'_>>) -> Vec<Instance> {
+    let mut built_in = std::mem::take(&mut cg.built_in);
+    for callee in body.into_iter().flat_map(|it| &it.inlined.callees) {
+        let def = match callee.body {
+            hir_ty_mir::mir::InlinedBody::Fn(func) => InstanceDef::Fn(func),
+            hir_ty_mir::mir::InlinedBody::Closure(closure) => InstanceDef::Closure(closure.as_id()),
+        };
+        let inlined = Instance { def, args: callee.args, checked: cg.checked };
+        if !built_in.contains(&inlined) {
+            built_in.push(inlined);
+        }
+    }
+    built_in
 }
 
 /// What tells the code of a function's lines and variables: the statements of `body` its
@@ -2652,16 +2745,15 @@ fn inlinable(
     const BLOCKS: usize = 4;
     const STATEMENTS: usize = 12;
     const INSTRUCTIONS: usize = 64;
-    tier::plain(|| {
-        let InstanceDef::Fn(func) = instance.def else { return None };
-        let generic = db.mir_body(func.into()).ok()?;
-        let statements: usize = generic.basic_blocks.iter().map(|it| it.1.statements.len()).sum();
-        if generic.basic_blocks.len() > BLOCKS || statements > STATEMENTS {
-            return None;
-        }
-        // v1's alone: a v2 unit builds in `always_inlinable` bodies only.
-        built_in_body(db, &instance, env, INSTRUCTIONS, None)
-    })
+    // Its `Recorder` is its own, which builds in no compile's hot functions (`tier::Inlining`).
+    let InstanceDef::Fn(func) = instance.def else { return None };
+    let generic = db.mir_body(func.into()).ok()?;
+    let statements: usize = generic.basic_blocks.iter().map(|it| it.1.statements.len()).sum();
+    if generic.basic_blocks.len() > BLOCKS || statements > STATEMENTS {
+        return None;
+    }
+    // v1's alone: a v2 unit builds in `always_inlinable` bodies only.
+    built_in_body(db, &instance, env, INSTRUCTIONS, None)
 }
 
 /// The body of an `#[inline(always)]` function of any size, built to be put where the function
@@ -2675,7 +2767,7 @@ fn always_inlinable(
     env: StoredParamEnvAndCrate,
     unit: Option<v2::build::Build>,
 ) -> Option<fragment::Inlinable> {
-    tier::plain(|| built_in_body(db, &instance, env, usize::MAX, unit))
+    built_in_body(db, &instance, env, usize::MAX, unit)
 }
 
 /// The body of the function `instance`, with what it calls built into it, where it is at
@@ -2689,9 +2781,7 @@ fn built_in_body(
     unit: Option<v2::build::Build>,
 ) -> Option<fragment::Inlinable> {
     let InstanceDef::Fn(func) = instance.def else { return None };
-    // No callee built in is devirtualized, as the MIR inliner devirtualizes none
-    // (`hir-ty-mir` `inline.rs` `callee_options`): its walk without the world lists it.
-    let unit = unit.map(|it| v2::build::Build { world: None, ..it });
+    // A v2 caller asks under `Build::built_in`, a copy's settings (`MirOptions::built_in`).
     let generic = db.mir_body(func.into()).ok()?;
     if !generic.closures.is_empty() || generic.coroutine.is_some() {
         return None;
@@ -2718,7 +2808,13 @@ fn built_in_body(
         return None;
     }
     let pointees = std::mem::take(&mut cg.pointees);
-    let built_in = std::mem::take(&mut cg.built_in);
+    // The callees the MIR inliner put in the body under `unit`'s settings are in it as much
+    // as the ones built in: a caller that builds this body in has their code, so its walk
+    // lists them as built in (`v2/refs.rs` `Walk::instance_call`) and its key holds their code
+    // (rule 18). The callee's own unit may inline none of them: `winnow`'s
+    // `#[inline(always)] <&str as Stream>::eof_offset`, built into an `opt-level = 3` caller,
+    // has `<str>::len` and `<str>::as_bytes` in it, which at its crate's level 0 it calls.
+    let built_in = built_in_of(&mut cg, Some(&*body));
     let func = std::mem::replace(&mut ctx.func, ir::Function::new());
     spare::keep_context(ctx);
     // alloc: empty, allocates nothing
@@ -2882,7 +2978,7 @@ fn emit_with(
 ) -> Result<Code> {
     refuse_tail_calls(&ctx.func, target)?;
     if target.is_wasm() {
-        return emit_wasm(&ctx.func, target.calls());
+        return emit_wasm(&ctx.func, target.calls(), wasm::Address::of(target));
     }
     let large = ctx.func.dfg.num_insts() > SINGLE_PASS;
     let kind = if large { Isa::Large } else { Isa::Usual };
@@ -3019,8 +3115,12 @@ fn refuse_tail_calls(func: &ir::Function, target: &'static Target) -> Result<()>
 
 /// Lowers a finished function to WebAssembly. The bytes are a [`wasm::WasmFunction`], which
 /// goes through the object like machine code and is made a module of by a linker.
-fn emit_wasm(func: &cranelift_codegen::ir::Function, calls: Calls) -> Result<Code> {
-    let (function, mut relocs) = wasm::lower(func, calls).map_err(CodegenError::Unsupported)?;
+fn emit_wasm(
+    func: &cranelift_codegen::ir::Function,
+    calls: Calls,
+    address: wasm::Address,
+) -> Result<Code> {
+    let (function, mut relocs) = wasm::lower(func, calls, address).map_err(CodegenError::Unsupported)?;
     let (bytes, body) = function.encode().map_err(CodegenError::Backend)?;
     for reloc in &mut relocs {
         reloc.offset += body;
@@ -3053,8 +3153,7 @@ fn root_body<'db>(
     let options = mir_options_of(db, krate)?;
     let stage = MirStage::compiled(MirOwner::Body(owner), options);
     let body = tally.step(Step::Mir, || db.mir(MirOwner::Body(owner), stage));
-    // alloc: the error's message
-    let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+    let body = body.map_err(|e| mir_failed(db, MirOwner::Body(owner), &e))?;
     // Not the function's own bounds: with nothing generic they are bounds on concrete
     // types, which hold through impls, and the calls have to resolve to those.
     let env = ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate };
@@ -3071,8 +3170,7 @@ fn root_body<'db>(
             .step(Step::Monomorphize, || {
                 db.monomorphized_mir(MirOwner::Body(owner), stage, args, env.store())
             })
-            // alloc: the error's message
-            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?
+            .map_err(|e| mir_failed(db, MirOwner::Body(owner), &e))?
     } else {
         body
     };
@@ -6294,12 +6392,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
     }
 
-    /// The value of a static that rustc exports no symbol for, and whether it can be written to.
+    /// The value of a static with an initializer, and whether it can be written to.
     fn static_value(&mut self, id: StaticId) -> Result<(ConstBlob, bool)> {
         let db = self.cg.db;
         let flags = StaticSignature::of(db, id).flags;
         if flags.contains(StaticFlags::EXTERN) {
-            unsupported!("extern static without a rustc symbol");
+            // A reader that gets here asked for the value of a static that has none.
+            unsupported!(
+                "the value of `{}`, a static of an `extern` block: it has no initializer, and its \
+                 symbol is linked to (`v2::statics::source`)",
+                blaze_items::key::path(db, blaze_items::ItemId::Static(id))
+            );
         }
         let allocation = db.const_eval_static(id).map_err(|e| {
             refused_const_eval(db, GeneralConstId::StaticId(id), &e)
@@ -11154,8 +11257,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // A closure is built in by a compile at a level above 1 alone.
         if let InstanceDef::Closure(_) = def {
             let instance = Instance { def, args: erased(args).store(), checked: self.cg.checked };
-            let limit = tier::inline_limit(db, &instance)?;
-            let body = tier::hot_body(db, &instance, &self.env.store(), limit, false)?;
+            let env = self.env.store();
+            let limit = tier::inline_limit(db, self.cg.inlining.as_mut(), &instance)?;
+            let body = tier::hot_body(db, &mut self.cg.inlining, &instance, &env, limit, false)?;
             return (body.func.signature == *sig)
                 .then(|| self.cg.declare_inlined(&instance, &body, self.builder.func));
         }
@@ -11176,14 +11280,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let instance = Instance { def, args: args.store(), checked: self.cg.checked };
         // A compile at a level above 1 builds in what it calls that is hot or small, of any
         // crate, as rustc's optimized builds do.
-        if let Some(limit) = tier::inline_limit(db, &instance)
-            && let Some(body) =
-                tier::hot_body(db, &instance, &self.env.store(), limit, track_caller(db, func))
+        let env = self.env.store();
+        if let Some(limit) = tier::inline_limit(db, self.cg.inlining.as_mut(), &instance)
+            && let Some(body) = tier::hot_body(
+                db,
+                &mut self.cg.inlining,
+                &instance,
+                &env,
+                limit,
+                track_caller(db, func),
+            )
             && body.func.signature == *sig
         {
             return Some(self.cg.declare_inlined(&instance, &body, self.builder.func));
         }
-        if track_caller(db, func) || tier::builds_in_nothing() {
+        if track_caller(db, func) || tier::builds_in_nothing(self.cg.inlining.as_ref()) {
             return None;
         }
         if let Some(callee) = self.always_inlined(def, args, sig) {
@@ -11280,7 +11391,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let args = erase_regions(DbInterner::new_with(db, self.env.krate), args);
         let instance = Instance { def, args: args.store(), checked: self.cg.checked };
-        if let Some((body, hint)) = tier::seen_body(db, &instance, &self.env.store(), tracked) {
+        let env = self.env.store();
+        if let Some((body, hint)) =
+            tier::seen_body(db, &mut self.cg.inlining, &instance, &env, tracked)
+        {
             if body.func.signature == *sig {
                 self.cg.declare_seen(id, &body, hint);
             } else if dumps_tier() {

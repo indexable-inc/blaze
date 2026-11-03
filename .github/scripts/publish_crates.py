@@ -85,9 +85,27 @@ EXTRAS: dict[str, list[Extra]] = {
         Extra(
             "harness/toolchain",
             "toolchain",
-            "src/cargo/toolchain.rs",
-            'include_str!("../../../../harness/toolchain")',
-            'include_str!("../../toolchain")',
+            "src/toolchain.rs",
+            'include_str!("../../../harness/toolchain")',
+            'include_str!("../toolchain")',
+        ),
+    ],
+    # The LLVM pin and the stencil pin, each one file it shares with its owner (llvm-sys's and
+    # blaze-stencil's build scripts), so the code identity checks and keys exactly what they do.
+    "blaze-codegen-code": [
+        Extra(
+            "vendor/llvm-sys/pin.rs",
+            "src/llvm_pin.rs",
+            "src/lib.rs",
+            'include!("../../../vendor/llvm-sys/pin.rs")',
+            'include!("llvm_pin.rs")',
+        ),
+        Extra(
+            "crates/blaze-stencil/pin.rs",
+            "src/stencil_pin.rs",
+            "src/lib.rs",
+            'include!("../../blaze-stencil/pin.rs")',
+            'include!("stencil_pin.rs")',
         ),
     ],
     "blaze-engine": [Extra("README.md", "README.md", "", "", "")],
@@ -97,7 +115,7 @@ EXTRAS: dict[str, list[Extra]] = {
 def tt_span_with_query(m: dict[str, Any]) -> None:
     # tt calls `SyntaxContext::is_root`, which span has only with its default `query` feature:
     # in the repository another crate turns it on, but a crate on crates.io is built alone.
-    m["dependencies"]["span"].pop("default-features")
+    m["dependencies"]["span"].pop("default-features", None)
 
 
 def macros_syn_full(m: dict[str, Any]) -> None:
@@ -202,7 +220,84 @@ class Repo:
             return (ROOT / patched["path"]).resolve()
         return self.upstream.get(name)
 
+    def spec_of(self, key: str, spec: Any) -> tuple[list[str], bool]:
+        """The features a dependency entry turns on in the crate it names, and whether its
+        default features are on: its own `features` and the workspace entry's when it inherits,
+        defaults on unless the entry (or, inheriting, the workspace entry) says
+        `default-features = false`."""
+        if isinstance(spec, str):
+            return [], True
+        features = list(spec.get("features", []))
+        default = spec.get("default-features", spec.get("default_features", True))
+        if spec.get("workspace"):
+            ws = self.ws_deps.get(key, {})
+            ws = {"version": ws} if isinstance(ws, str) else ws
+            features += ws.get("features", [])
+            ws_default = ws.get("default-features", ws.get("default_features", True))
+            default = ws_default or spec.get("default-features") is True
+        return features, default
+
+    def enabled_optional(self) -> dict[Path, set[str]]:
+        """The optional dependencies, by key, that blaze's default build turns on in each local
+        crate, resolved as cargo does: from the root's `default` feature through every feature's
+        list (another feature, `dep:x`, `x/f`, `x?/f`, or an optional dependency's own name) and
+        every dependency entry's `features` and `default-features`, across crates, to a fixed
+        point. Build dependencies count; dev-dependencies don't."""
+        features: dict[Path, set[str]] = {ROOT_CRATE.resolve(): {"default"}}
+        optional_on: dict[Path, set[str]] = {}
+        manifests: dict[Path, dict[str, Any]] = {}
+        changed = True
+        while changed:
+            changed = False
+            for d in list(features):
+                manifest = manifests.setdefault(d, load(d / "Cargo.toml"))
+                table: dict[str, list[str]] = manifest.get("features", {})
+                entries = {k: v for t in dep_tables(manifest) for k, v in t.items()}
+                optional = {k for k, v in entries.items() if isinstance(v, dict) and v.get("optional")}
+                on = features[d]
+                deps_on = optional_on.setdefault(d, set())
+                wanted: list[tuple[str, str, bool]] = []  # (dependency key, feature, weak)
+                todo = list(on)
+                while todo:
+                    feature = todo.pop()
+                    if feature not in table:
+                        if feature in optional and feature not in deps_on:
+                            deps_on.add(feature)  # an optional dependency's implicit feature
+                            changed = True
+                        continue
+                    for item in table[feature]:
+                        if item.startswith("dep:"):
+                            if item[4:] not in deps_on:
+                                deps_on.add(item[4:])
+                                changed = True
+                        elif "/" in item:
+                            dep, sub = item.split("/", 1)
+                            weak = dep.endswith("?")
+                            dep = dep.removesuffix("?")
+                            if not weak and dep in optional and dep not in deps_on:
+                                deps_on.add(dep)
+                                changed = True
+                            wanted.append((dep, sub, weak))
+                        elif item not in on:
+                            on.add(item)
+                            todo.append(item)
+                            changed = True
+                for key, spec in entries.items():
+                    if key in optional and key not in deps_on:
+                        continue
+                    if (dep_dir := self.local_dir(d, key, spec)) is None:
+                        continue
+                    dep_features, default = self.spec_of(key, spec)
+                    add = set(dep_features) | ({"default"} if default else set())
+                    add |= {sub for dep, sub, _ in wanted if dep == key}
+                    have = features.setdefault(dep_dir, set())
+                    if not add <= have:
+                        have |= add
+                        changed = True
+        return optional_on
+
     def closure(self) -> dict[Path, Crate]:
+        enabled = self.enabled_optional()
         crates: dict[Path, Crate] = {}
         todo = [ROOT_CRATE.resolve()]
         while todo:
@@ -228,9 +323,11 @@ class Repo:
             crate = Crate(orig, name, version, d, manifest, fork)
             for table in dep_tables(manifest):
                 for key, spec in table.items():
-                    # An optional local crate is left out with the features that name it:
-                    # blaze enables none.
-                    if isinstance(spec, dict) and spec.get("optional"):
+                    # An optional local crate blaze's default build turns on (`llvm-sys` for
+                    # the stencils, `blaze-explore`) is published as any dependency; one it
+                    # doesn't is left out with the features that name it.
+                    on = key in enabled.get(d, set())
+                    if isinstance(spec, dict) and spec.get("optional") and not on:
                         if (dep := self.local_dir(d, key, spec)) is not None:
                             crate.optional.add(dep)
                         continue

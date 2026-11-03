@@ -26,14 +26,20 @@ blaze-usercode.workspace = true
 hir-ty.workspace = true
 hir-ty-borrowck.workspace = true
 memchr.workspace = true
-ring.workspace = true
-rustls.workspace = true
-rustls-native-certs.workspace = true
+ring = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
 toml.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-items.workspace = true
+
+[features]
+default = ["net"]
+# The cache over the network: client, server, TLS (rustls on ring) and Ed25519 signatures.
+# Without it (the seed profile) only `public`, what may be published, is built.
+net = ["dep:ring", "dep:rustls", "dep:rustls-native-certs"]
 
 [lints]
 workspace = true

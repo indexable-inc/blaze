@@ -560,10 +560,15 @@ impl<'db> Ctx<'db> {
                 ast::Stmt::Item(item) => item,
                 // Macro calls can be both items and expressions. The syntax library always treats
                 // them as expressions here, so we undo that.
+                // Its attributes are on the expression, as in a block (`lower_macro_stmt`):
+                // `#[cfg(test)] m!();` a macro wrote is no item outside tests.
                 ast::Stmt::ExprStmt(es) => match es.expr() {
                     Some(ast::Expr::MacroExpr(expr)) => {
                         cov_mark::hit!(macro_call_in_macro_stmts_is_added_to_item_tree);
                         let Some(call) = expr.macro_call() else { continue };
+                        if self.cfg_disabled(ast::Expr::MacroExpr(expr)) {
+                            continue;
+                        }
                         call.into()
                     }
                     _ => continue,
@@ -575,6 +580,7 @@ impl<'db> Ctx<'db> {
 
         if let Some(ast::Expr::MacroExpr(tail_macro)) = stmts.expr()
             && let Some(call) = tail_macro.macro_call()
+            && !self.cfg_disabled(ast::Expr::MacroExpr(tail_macro))
         {
             cov_mark::hit!(macro_stmt_with_trailing_macro_expr);
             self.pend_top(call.into());
