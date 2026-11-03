@@ -8,8 +8,8 @@
 //! kept open and registered in the ring's table of files, so requests name its slot. A whole
 //! file's write is one linked chain (written, synced, renamed over the old, its directory
 //! synced), and a rename is linked to its directories' syncs. A large aligned write at an
-//! offset bypasses the page cache from a registered buffer. A truncation, which comes only in
-//! recovery, is a call made where it is submitted.
+//! offset bypasses the page cache from a registered buffer. A truncation is an open of its name
+//! and a call made where it is submitted, never through a kept descriptor.
 //!
 //! A spawned process is watched through the ring too: a poll of its pidfd for its exit, its
 //! output pipes read and its input written by the ring. A listen's accepts (one multishot
@@ -1761,6 +1761,35 @@ impl Uring {
         Ok(file)
     }
 
+    /// A kept file's sync, done: [`Done::Synced`], unless the file kept under its name has no
+    /// name left, removed by another process while the driver kept it open (`blaze clean`, an
+    /// `rm` of blaze's state). What was appended to it is then in no file: an error naming the
+    /// path, never a sync that passes for one of the file at the name. The name is let go, so
+    /// the next request on it opens what is there now.
+    fn synced(&mut self, file: Handle<Kept>) -> Done {
+        let Some(kept) = self.kept.get(file) else { return Done::Synced };
+        if !kept.named {
+            return Done::Synced;
+        }
+        let links = links_of(kept.fixed.fd());
+        if matches!(links, Ok(1..)) {
+            return Done::Synced;
+        }
+        // clone: an error path, the name it is about.
+        let Some(name) = self.names.iter().find(|(_, it)| **it == file).map(|(name, _)| name.clone()) else {
+            return Done::Synced;
+        };
+        let path = under(&self.root, &name, |path| path.display().to_string());
+        self.forget(&name);
+        // alloc: an error.
+        Done::Failed(IoError(match links {
+            Ok(_) => format!(
+                "{path}: removed while blaze kept it open, so what was written to it since it was opened is in no file"
+            ),
+            Err(error) => format!("{path}: looking at the file kept open after its sync: {error}"),
+        }))
+    }
+
     /// `file` held by one more request, until [`unkeep`].
     fn hold(&mut self, file: Handle<Kept>) -> Handle<Kept> {
         self.kept.get_mut(file).expect("a file just kept").users += 1;
@@ -2054,6 +2083,17 @@ fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
     with_c(dir, |dir| open_c(dir, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC))
 }
 
+/// How many names the file open as `fd` has: 0 once it was removed.
+fn links_of(fd: RawFd) -> io::Result<u64> {
+    // SAFETY: as `size_of_file`'s.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: an open descriptor and a `stat` to write.
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat.st_nlink as u64)
+}
+
 fn size_of_file(fd: RawFd) -> io::Result<u64> {
     // SAFETY: `libc::stat` is a C struct of integers and arrays of them, for which all-zero
     // bytes is a valid value.
@@ -2213,11 +2253,16 @@ impl Driver for Uring {
                     self.start(Hot::new(tag, Kind::Sync, file.to_bits()), ops::NO_BYTES, Cold::EMPTY);
                     None
                 }),
-                Effect::Truncate { file, len, .. } => self.file(&file, true).map(|file| {
-                    let file = self.hold(file);
-                    self.start(Hot::new(tag, Kind::Truncate, file.to_bits()), ops::NO_BYTES, Cold { at: len, ..Cold::EMPTY });
-                    None
-                }),
+                // No io_uring op cuts a file below Linux 6.9 (`IORING_OP_FTRUNCATE`): one open
+                // and `ftruncate` of the name here, as a mode is set. Never through a kept
+                // descriptor, which may be of a file no longer at the name (a build directory
+                // removed by `blaze clean` and made again): the cut would go to the removed file
+                // and the writes after it, which open the name, find nothing there. A file kept
+                // under the name is let go, so the next request on it opens what the name is now.
+                Effect::Truncate { file, len, .. } => {
+                    self.forget(&file);
+                    under(&self.root, &file, |path| crate::fs::truncate(path, len)).map(|()| Some(Done::Truncated))
+                }
                 Effect::Timer { after, .. } => {
                     let due = wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
                     self.timers.insert(due, tag);
@@ -2290,7 +2335,7 @@ impl Driver for Uring {
                 let until_timer =
                     self.timers.next_deadline().map(|due| Duration::from_nanos(due.saturating_sub(now)));
                 if let Err(error) = self.ring.enter(Some(until_timer.map_or(left, |it| it.min(left)))) {
-                    self.fail_unsubmitted(error);
+                    self.fail_unsubmitted(&error);
                     out.append(&mut self.ready);
                     break;
                 }
@@ -2405,6 +2450,75 @@ mod tests {
         for it in [ours, theirs] {
             std::fs::remove_dir_all(it).unwrap();
         }
+    }
+
+    /// A file cut, then its directory removed by another process (`blaze clean` of a build
+    /// directory while the daemon runs) and the file cut and written again (the next build's
+    /// run of a build script): the second cut makes the file again at its name, and the write
+    /// at an offset after it, which opens the name, finds it, as on the threads' driver. A cut
+    /// through a descriptor kept from the first went to the removed file, and the write failed
+    /// "opening .../run/stdout: No such file or directory".
+    #[test]
+    fn a_cut_after_its_directory_was_removed_makes_the_file_again() {
+        let file = FileName::new("build/run/stdout").unwrap();
+        fn script(driver: &mut impl Driver, root: &Path, file: &FileName) -> Vec<Done> {
+            let mut seen = Vec::new();
+            for round in 0..2u64 {
+                if round == 1 {
+                    std::fs::remove_dir_all(root.join("build")).unwrap();
+                }
+                let mut effects = vec![Effect::Truncate { file: file.clone(), len: 0, tag: Tag(10 * round + 1) }];
+                run_until_idle(driver, &mut effects, |done, effects| {
+                    if done.tag.0 % 10 == 1 {
+                        let bytes = format!("round {round}").into_bytes();
+                        effects.push(Effect::WriteAt { file: file.clone(), at: 0, bytes, tag: Tag(done.tag.0 + 1) });
+                    }
+                    seen.push(done.done);
+                });
+            }
+            seen
+        }
+        let (ours, theirs) = (dir("uring-cut-removed"), dir("uring-threads-cut-removed"));
+        let ring = script(&mut Uring::new(&ours).unwrap(), &ours, &file);
+        let threads = script(&mut Threads::new(&theirs, 2), &theirs, &file);
+        let wanted = [Done::Truncated, Done::Written, Done::Truncated, Done::Written];
+        assert_eq!(ring, wanted);
+        assert_eq!(threads, wanted);
+        for it in [ours, theirs] {
+            assert_eq!(std::fs::read(it.join(file.as_str())).unwrap(), b"round 1");
+            std::fs::remove_dir_all(it).unwrap();
+        }
+    }
+
+    /// A file kept open for appends, removed by another process: its sync fails naming the
+    /// path, as what was appended is in no file, and the next append makes the file again at
+    /// its name.
+    #[test]
+    fn a_sync_of_a_kept_file_removed_under_it_fails_naming_it() {
+        let root = dir("uring-sync-removed");
+        let file = FileName::new("state/journal").unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        let mut seen = BTreeMap::new();
+        let mut effects = vec![Effect::Append { file: file.clone(), bytes: b"one".to_vec(), tag: Tag(1) }];
+        run_until_idle(&mut driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done));
+        std::fs::remove_dir_all(root.join("state")).unwrap();
+        let mut effects = vec![Effect::Sync { file: file.clone(), tag: Tag(2) }];
+        run_until_idle(&mut driver, &mut effects, |done, effects| {
+            if done.tag == Tag(2) {
+                effects.push(Effect::Append { file: file.clone(), bytes: b"two".to_vec(), tag: Tag(3) });
+            }
+            _ = seen.insert(done.tag.0, done.done);
+        });
+        assert_eq!(seen[&1], Done::Appended);
+        let path = root.join("state/journal").display().to_string();
+        assert!(
+            matches!(&seen[&2], Done::Failed(IoError(why)) if why.starts_with(&path) && why.contains("removed while blaze kept it open")),
+            "{:?}",
+            seen[&2]
+        );
+        assert_eq!(seen[&3], Done::Appended);
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// More requests than the ring holds, all in flight at once, each to its own file, with
@@ -2617,7 +2731,7 @@ mod tests {
     /// A connection to the listen `Tag(1)`, submitted already, at `at`: a ping and a pong, each
     /// side hung up, a receive on a connection gone, the listen ended and an unlisten of
     /// nothing. What each step did, by its tag, with connections by their role.
-    fn round_trip(driver: &mut impl Driver, at: Address) -> BTreeMap<u64, Vec<String>> {
+    fn round_trip(driver: &mut impl Driver, at: &Address) -> BTreeMap<u64, Vec<String>> {
         let mut seen: BTreeMap<u64, Vec<String>> = BTreeMap::new();
         let (mut server, mut client, mut pinged) = (None, None, false);
         let mut effects = vec![Effect::Timer { after: Duration::from_millis(20), tag: Tag(2) }];
@@ -2694,12 +2808,12 @@ mod tests {
         ring.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
         assert_eq!(ring.in_flight(), 1);
         assert_eq!(ring.local_addr(Tag(1)), None);
-        let ours = round_trip(&mut ring, at.clone());
+        let ours = round_trip(&mut ring, &at);
         assert_eq!(ours, round_tripped());
         assert!(!root.join("run/api.sock").exists());
         let mut threads = Threads::new(dir("uring-unix-threads"), 2);
         threads.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
-        assert_eq!(ours, round_trip(&mut threads, at));
+        assert_eq!(ours, round_trip(&mut threads, &at));
     }
 
     #[test]
@@ -2710,7 +2824,7 @@ mod tests {
         assert_eq!(ring.in_flight(), 1);
         let at = ring.local_addr(Tag(1)).expect("listening");
         assert_ne!(at.port(), 0);
-        assert_eq!(round_trip(&mut ring, Address::Tcp(at)), round_tripped());
+        assert_eq!(round_trip(&mut ring, &Address::Tcp(at)), round_tripped());
         assert_eq!(ring.local_addr(Tag(1)), None);
         // Nothing listens there now.
         let mut effects = vec![Effect::Connect { at: Address::Tcp(at), tag: Tag(1) }];

@@ -214,8 +214,8 @@ impl World {
     fn seed(&mut self, key: Key, kind: Kind, bytes: &[u8]) -> Signed {
         let signed = publisher(1).sign(Record::of(key, kind, bytes));
         let store = &mut self.cache.as_mut().expect("a world with the cache's server").store;
-        store.put(key, kind, bytes.to_vec()).unwrap();
-        store.put(record_key(&key), Kind::Query, signed.encode().to_vec()).unwrap();
+        store.put(key, kind, bytes).unwrap();
+        store.put(record_key(&key), Kind::Query, &signed.encode()).unwrap();
         store.flush(&mut self.effects);
         self.run();
         signed
@@ -881,7 +881,7 @@ fn a_cold_build_is_one_download() {
     assert!(world.published.iter().all(|it| it.result.is_ok()), "{:?}", world.published);
     assert!(world.published.iter().any(|it| it.key == Key(id.0)));
 
-    world.mine.put(key(0), Kind::Query, values()[0].2.clone()).unwrap();
+    world.mine.put(key(0), Kind::Query, &values()[0].2).unwrap();
     world.download = Some(Download::start(id, &mut world.client, &mut world.effects));
     world.run();
     let bytes: u64 = values()[1..].iter().map(|it| it.2.len() as u64).sum();

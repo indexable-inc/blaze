@@ -1,7 +1,10 @@
 //! What rustc's resolver checks of the generic parameters of an item and of the `for<>`
 //! binders in its signature: a name declared twice, the parameters of the impl or trait
 //! around included (E0403); a lifetime parameter named `'static` (E0262); a default naming a
-//! parameter declared after it, or itself (E0128).
+//! parameter declared after it, or itself (E0128). Names compare with their macros 2.0 keys,
+//! as rustc's ribs bind `param.ident.normalize_to_macros_2_0()`: an opaque `macro`'s own `'a`
+//! and the caller's `$a` are two parameters, a semi-opaque or transparent one's are one
+//! (`tests/ui/hygiene/duplicate_lifetimes.rs`).
 //!
 //! Follows rustc's `compiler/rustc_resolve/src/late.rs` (`with_generic_param_rib`,
 //! `visit_generic_params`), `ident.rs` (`validate_res_from_ribs`) and its
@@ -9,8 +12,9 @@
 //! `ForwardDeclaredGenericParam` (MIT or Apache-2.0).
 
 use blaze_items::{Fact, ItemId};
-use hir::InFile;
+use hir::{HirFileId, InFile};
 use hir_def::ImplId;
+use span::SyntaxContext;
 use syntax::{
     TextRange, WalkEvent,
     view::{self as ast, AstNode as _, HasGenericParams as _, HasName as _},
@@ -108,6 +112,20 @@ impl<'t> ParamName<'t> {
     fn is_lifetime(&self) -> bool {
         matches!(self, ParamName::Lifetime(_))
     }
+
+    /// The key it binds its name with, written in `file` ([`key`]).
+    fn key(&self, cx: &Cx<'_, '_>, file: HirFileId) -> Option<SyntaxContext> {
+        key(cx, file, self.range())
+    }
+}
+
+/// The key a generic parameter's name, or a path's first segment naming one, written at
+/// `range` of `file` is bound or looked up with: its context normalized to macros 2.0, as
+/// generic parameters always have macros 2.0 hygiene (`hir_def::nameres::param_name`). Two
+/// names are one parameter's when their texts and keys are equal; `None` for a name not
+/// written by a `macro`, so ordinary code compares texts.
+fn key(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) -> Option<SyntaxContext> {
+    hir_def::nameres::binding_key_at(cx.db, file, range)
 }
 
 /// Checks the parameters of `node` and of the binders in it, `outer` being the parameters of
@@ -151,28 +169,36 @@ fn check_item<'db>(
 fn check_list(cx: &Cx<'_, '_>, list: List<'_>, outer: &[Option<List<'_>>], fact: Option<&Fact>, found: &mut Vec<Found>) {
     let outer = || outer.iter().flatten();
     // A lifetime shadowing one of the item around is E0496, which is not this check's.
-    let shadows = |name: &ParamName<'_>| {
+    let shadows = |name: &ParamName<'_>, file: HirFileId| {
+        let name_key = name.key(cx, file);
         name.is_lifetime()
             && outer().any(|it| {
-                it.value.lifetime_params().filter_map(|it| it.lifetime()).any(|it| it.text() == name.text())
+                it.value.lifetime_params().filter_map(|it| it.lifetime()).any(|lt| {
+                    lt.text() == name.text() && key(cx, it.file_id, lt.syntax().text_range()) == name_key
+                })
             })
     };
     for (at, param) in list.value.generic_params().enumerate() {
         let Some(name) = ParamName::of(param) else { continue };
-        if shadows(&name) {
+        if shadows(&name, list.file_id) {
             continue;
         }
         let text = name.text();
+        let name_key = name.key(cx, list.file_id);
+        // The same parameter: its text and its key ([`key`]).
+        let same = |it: &ParamName<'_>, file: HirFileId| it.text() == text && it.key(cx, file) == name_key;
         // The outermost declaration of a name wins, as rustc extends its map rib by rib
         // outwards; the lifetimes around are not in it.
         let first = outer()
             .find_map(|outer| {
                 let mut names = outer.value.generic_params().filter_map(ParamName::of);
-                names.find(|it| !it.is_lifetime() && it.text() == text).map(|it| outer.with_value(it.range()))
+                names.find(|it| !it.is_lifetime() && same(it, outer.file_id)).map(|it| outer.with_value(it.range()))
             })
             .or_else(|| {
                 let mut names = list.value.generic_params().take(at).filter_map(ParamName::of);
-                names.find(|it| !shadows(it) && it.text() == text).map(|it| list.with_value(it.range()))
+                names
+                    .find(|it| !shadows(it, list.file_id) && same(it, list.file_id))
+                    .map(|it| list.with_value(it.range()))
             });
         if let Some(first) = first {
             let span = cx.span(list.with_value(name.range()));
@@ -208,17 +234,24 @@ fn check_list(cx: &Cx<'_, '_>, list: List<'_>, outer: &[Option<List<'_>>], fact:
 
 /// rustc's `ForwardGenericParamBan` ribs: a default may name only the parameters before it.
 fn forward(cx: &Cx<'_, '_>, list: List<'_>, fact: Option<&Fact>, found: &mut Vec<Found>) {
-    // Whether `text` names a type (or, with `is_const`, a const) parameter at or after the
-    // `at`th and none before it.
-    let banned_at = |at: usize, is_const: bool, text: &str| {
+    // Whether `text` with key `name_key` ([`key`]) names a type (or, with `is_const`, a const)
+    // parameter at or after the `at`th and none before it.
+    let banned_at = |at: usize, is_const: bool, text: &str, name_key: Option<SyntaxContext>| {
+        let names = |it: Option<ast::Name<'_>>| {
+            it.is_some_and(|it| {
+                it.text() == text && key(cx, list.file_id, it.syntax().text_range()) == name_key
+            })
+        };
         let mut named = list.value.type_or_const_params().map(|param| match param {
-            ast::TypeOrConstParam::Type(it) => !is_const && it.name().is_some_and(|it| it.text() == text),
-            ast::TypeOrConstParam::Const(it) => is_const && it.name().is_some_and(|it| it.text() == text),
+            ast::TypeOrConstParam::Type(it) => !is_const && names(it.name()),
+            ast::TypeOrConstParam::Const(it) => is_const && names(it.name()),
         });
         !named.by_ref().take(at).any(|it| it) && named.any(|it| it)
     };
     for (at, param) in list.value.type_or_const_params().enumerate() {
-        let is_banned = |is_const: bool, text: &str| banned_at(at, is_const, text);
+        let is_banned = |is_const: bool, text: &str, name_key: Option<SyntaxContext>| {
+            banned_at(at, is_const, text, name_key)
+        };
         match param {
             ast::TypeOrConstParam::Type(it) => {
                 if let Some(default) = it.default_type() {
@@ -239,7 +272,7 @@ fn forward(cx: &Cx<'_, '_>, list: List<'_>, fact: Option<&Fact>, found: &mut Vec
 fn banned(
     cx: &Cx<'_, '_>,
     default: InFile<ast::Node<'_>>,
-    is_banned: impl Fn(bool, &str) -> bool,
+    is_banned: impl Fn(bool, &str, Option<SyntaxContext>) -> bool,
     fact: Option<&Fact>,
     found: &mut Vec<Found>,
 ) {
@@ -254,13 +287,14 @@ fn banned(
         let Some(name) = segment.name_ref() else { continue };
         let Some(parent) = path.syntax().parent() else { continue };
         let text = name.text();
+        let name_key = key(cx, default.file_id, name.syntax().text_range());
         let hit = if ast::PathExpr::can_cast(parent.kind()) {
-            is_banned(true, text)
+            is_banned(true, text, name_key)
         } else if ast::Path::can_cast(parent.kind()) {
-            is_banned(false, text)
+            is_banned(false, text, name_key)
         } else if ast::PathType::can_cast(parent.kind()) {
-            is_banned(false, text)
-                || (is_banned(true, text)
+            is_banned(false, text, name_key)
+                || (is_banned(true, text, name_key)
                     && parent.parent().is_some_and(|it| ast::TypeArg::can_cast(it.kind())))
         } else {
             false

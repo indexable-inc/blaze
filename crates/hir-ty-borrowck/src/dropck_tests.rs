@@ -72,7 +72,7 @@ fn overflows(fixture: &str) -> (Vec<String>, Vec<u32>) {
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = function(&db, "caller");
         let (_, source_map) = Body::with_source_map(&db, def);
         let result = crate::borrowck(&db, def);

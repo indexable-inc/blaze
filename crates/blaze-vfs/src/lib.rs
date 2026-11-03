@@ -409,6 +409,20 @@ impl Vfs {
         Ok(self.tree.id(root))
     }
 
+    /// The root `files` written over `base` make, each a whole file with its mode, as
+    /// [`Vfs::apply_owned`] of `Op::Write`s: for bytes already held where they live (a fetched
+    /// source's, [`blaze_mem::Kept`]), which become the tree's with no copy.
+    pub fn apply_files(
+        &mut self,
+        base: ContentId,
+        files: impl IntoIterator<Item = (String, Bytes, Mode)>,
+    ) -> Result<ContentId, OpError> {
+        let base = self.root(base).ok_or(OpError::UnknownRoot(base))?;
+        let root = self.tree.apply_files(base, files)?;
+        self.tree.reclaim();
+        Ok(self.tree.id(root))
+    }
+
     /// Hashes a commit's new files on `jobs` once they are many bytes (a checkout, a large
     /// write): the daemon's pool, so a checkout hashes on every core. The IDs are the same
     /// either way.

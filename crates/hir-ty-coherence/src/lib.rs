@@ -139,7 +139,7 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
                 "`{}` implements the sealed trait `{}` of crate `{}` outside it",
                 this(),
                 trait_name(db, trait_),
-                crate_name(db, trait_.krate(db)),
+                trait_.krate(db).named(db),
             ),
             Some("only the crate that defines a `#[blaze::sealed]` trait may implement it"),
         ));
@@ -171,7 +171,7 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
                      `{}` implements `{sealed_name}` for a type that is not local to crate `{}`",
                     this(),
                     impl_text(db, krate, open.into()),
-                    crate_name(db, krate),
+                    krate.named(db),
                 ),
                 Some(
                     "a blanket impl over a sealed trait is allowed only when every impl of the \
@@ -317,7 +317,7 @@ pub fn check_trait(db: &Db, trait_: TraitId) -> Vec<CoherenceError> {
                     "trait `{name}` has the sealed trait `{}` of crate `{}` among its supertraits \
                      (`{}`), so `dyn {name}` would implement `{}` outside that crate",
                     trait_name(db, sup),
-                    crate_name(db, sup.krate(db)),
+                    sup.krate(db).named(db),
                     supertrait_path(db, trait_, sup),
                     trait_name(db, sup),
                 ),
@@ -518,13 +518,6 @@ fn trait_name(db: &Db, trait_: TraitId) -> String {
     TraitSignature::of(db, trait_).name.display(db, edition).to_string()
 }
 
-fn crate_name(db: &Db, krate: Crate) -> String {
-    match &krate.extra_data(db).display_name {
-        Some(name) => name.to_string(),
-        None => format!("{krate:?}"),
-    }
-}
-
 /// The name of the type parameter `param`, as an error names it.
 fn param_name(db: &Db, param: TypeParamId) -> String {
     let edition = param.parent().module(db).krate(db).data(db).edition;
@@ -545,7 +538,7 @@ fn impl_text(db: &Db, krate: Crate, impl_: AnyImplId) -> String {
             if owner == krate {
                 String::new()
             } else {
-                format!(" in crate `{}`", crate_name(db, owner))
+                format!(" in crate `{}`", owner.named(db))
             }
         }
         AnyImplId::BuiltinDeriveImplId(_) => " (derived)".to_owned(),

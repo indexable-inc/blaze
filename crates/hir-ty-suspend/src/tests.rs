@@ -129,7 +129,7 @@ impl Drop for Plain {
 fn check(x: &str, test: impl FnOnce(&Db, &Found)) {
     // alloc: a test's fixture text
     let db = &fixture::db(&format!("{ENGINE}{x}")).into_db();
-    hir_ty::attach_db(db, || test(db, suspend_check(db, crate_named(db, "x"))));
+    blaze_query::db::attach(db, || test(db, suspend_check(db, crate_named(db, "x"))));
 }
 
 #[track_caller]
@@ -513,7 +513,7 @@ pub fn f() -> u32 {
     )
     .into_db();
     let db = &db;
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let krate = crate_named(db, "x");
         assert_eq!(*roots(db, krate), Roots::default(), "no root and no error without `blaze_graph`");
         nothing(suspend_check(db, krate));
@@ -539,7 +539,7 @@ pub fn f() -> u32 {
     )
     .into_db();
     let db = &db;
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let krate = crate_named(db, "x");
         let found = suspend_check(db, krate);
         let Some(Unchecked::MissingRoot(missing)) = found.unchecked else {
@@ -627,7 +627,7 @@ pub fn counted(db: &Db) -> u32 {
     )
     .into_db();
     let db = &db;
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let krate = crate_named(db, "x");
         let roots = roots(db, krate);
         assert_eq!(roots.missing, None, "the root is found through the re-export");

@@ -31,7 +31,7 @@ pub(super) fn pack(job: &Job, lowered: &mut Lowered, program: &str) -> Result<Ve
         for &it in crates {
             crate_def_map(db, it);
         }
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             for body in bodies(db, krate) {
                 hir_ty::InferenceResult::of(db, body);
             }

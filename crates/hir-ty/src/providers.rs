@@ -20,10 +20,10 @@ use rustc_type_ir::{
 
 use crate::{
     InferBodyId,
-    db::{InternedClosureId, InternedCoroutineId, InternedOpaqueTyId},
+    db::{InternedClosureId, InternedCoroutineId},
     mir::{InlinedBody, MirBody, MirEvalError, MirLowerError, MirOptions, MirOwner, MirStage},
     next_solver::{
-        Allocation, DbInterner, GenericArgs, Region, StoredGenericArgs, StoredTy, Ty,
+        Allocation, DbInterner, Region, StoredGenericArgs, StoredTy, Ty,
         default_types,
     },
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
@@ -60,12 +60,6 @@ pub struct Mir {
         &'db MirBody<'db>,
         Option<ParamEnvAndCrate<'db>>,
     ) -> Result<Allocation<'db>, MirEvalError<'db>>,
-    pub opaque_of_impl: for<'db> fn(
-        &'db Db,
-        ParamEnvAndCrate<'db>,
-        InternedOpaqueTyId<'db>,
-        GenericArgs<'db>,
-    ) -> Option<Ty<'db>>,
     /// `cfg!(test)` where the table is built. A crate's own unit tests link it twice, their
     /// test build and the library copy a dev-dependency links; the test build is the one tested.
     pub own_tests: bool,

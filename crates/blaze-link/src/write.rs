@@ -1909,13 +1909,8 @@ mod tests {
     /// of none, some or all.
     #[test]
     fn a_planned_splice_gives_the_serial_lists_and_runs() {
-        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = move |below: u64| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed % below.max(1)
-        };
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+        let mut next = move |below: u64| rng.below(below);
         let frame = crate::arena::stage_frame().unwrap();
         for (round, pieces) in [0u32, 1, 3, 40, 500, 9_000, 30_000].into_iter().cycle().take(42).enumerate() {
             let mut old: Vec<(PieceId, u64)> = Vec::new();

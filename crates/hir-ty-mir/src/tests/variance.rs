@@ -511,7 +511,7 @@ fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected: Expect) {
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut defs: Vec<GenericDefId> = Vec::new();
         let module = db.module_for_file_opt(file_id.file_id(&db)).unwrap();
         let def_map = module.def_map(&db);

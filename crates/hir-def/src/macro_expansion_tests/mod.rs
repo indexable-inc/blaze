@@ -122,6 +122,11 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
 
     let mut text_edits = Vec::new();
     let mut expansions = Vec::new();
+    // A fixture that is itself mid-edit (`bar.;`) hands its errors on to what expands it.
+    let source_parses =
+        syntax::SourceFile::parse(&source_file.syntax().to_string(), Edition::CURRENT)
+            .errors()
+            .is_empty();
 
     for macro_call_node in source_file.syntax().descendants().filter_map(ast::MacroCall::cast) {
         let ast_id =
@@ -221,6 +226,9 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
                 show_spans |= comment.text().contains("+spans");
                 show_ctxt |= comment.text().contains("+syntaxctxt");
             }
+            if source_parses {
+                assert_expansion_parses(&db, file_id);
+            }
             let pp = pretty_print_macro_expansion(
                 src.value,
                 src.file_id.span_map(&db),
@@ -251,6 +259,9 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         if let Some(macro_file) = src.file_id.macro_file()
             && let MacroKind::DeriveBuiltIn | MacroKind::Derive = macro_file.kind(&db)
         {
+            if source_parses {
+                assert_expansion_parses(&db, macro_file);
+            }
             let pp = pretty_print_macro_expansion(
                 src.value.syntax(),
                 HirFileId::from(macro_file).span_map(&db),
@@ -265,6 +276,20 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
 
     expect.indent(false);
     expect.assert_eq(&expanded_text);
+}
+
+/// A derive's or attribute's expansion that is printed parses without errors, as a fn-like
+/// one's must: each of its tokens is read in its own context's edition, so a name the item wrote
+/// (a 2021 field `gen`) stays a name. The printer prints a token the parser refused all the same.
+fn assert_expansion_parses(db: &Db, macro_file: MacroCallId) {
+    let (parse, _) = &macro_file.parse_macro_expansion(db).value;
+    assert!(
+        parse.errors().is_empty(),
+        "parse errors in the expansion of {:?}: \n{:#?}\n```\n{}\n```",
+        macro_file.kind(db),
+        parse.errors(),
+        parse.root(),
+    );
 }
 
 fn resolve_macro_call_id(

@@ -366,7 +366,7 @@ impl Run {
             // another checkout's, and no checkout is given it again.
             let record = verify::retraction(&key, &unmarked);
             let mut landed = Vec::new(); // alloc: error path, the tickets of what it puts
-            if let Err(error) = index::keep_into(store, Unit::SHARED, &record.run, &record.traced, record.value, &mut landed) {
+            if let Err(error) = index::keep_into(store, Unit::SHARED, &record.run, &record.traced, &record.value, &mut landed) {
                 // The record's value may have landed before its put failed: its ticket is
                 // the first, and it is a retraction all the same.
                 let retracted = landed.first().copied();
@@ -383,7 +383,7 @@ impl Run {
                     let roots = self.spec.roots.view();
                     let kept = roots.kept(&traced, &value).map_err(|error| KeepError::Scan { run: key, why: error.to_string() });
                     let put = kept.and_then(|(marked, stored)| {
-                        index::keep_into(store, Unit::SHARED, &key, &marked.local, stored.encode(), &mut landed)
+                        index::keep_into(store, Unit::SHARED, &key, &marked.local, &stored.encode(), &mut landed)
                     });
                     match put {
                         Ok(()) => what,

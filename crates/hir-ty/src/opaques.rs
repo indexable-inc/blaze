@@ -144,7 +144,7 @@ fn type_aliases_of(frame: &Frame, items: &[(Name, AssocItemId)]) -> Box<[TypeAli
 /// The hidden type of each `impl Trait` `function` returns, by its index, as its body defines
 /// it. A function with no body defines none: a trait method's `impl Trait` without a default
 /// body is rustc's synthesized associated type with no value, whose type each impl's method
-/// gives (`hir_ty_mir::opaque_of_impl`), so nothing is inferred for it and its map is empty.
+/// gives (`crate::rpitit::impl_rpitit_tys`), so nothing is inferred for it and its map is empty.
 #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub fn rpit_hidden_types(
     db: &Db,

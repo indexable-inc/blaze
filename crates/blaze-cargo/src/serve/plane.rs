@@ -117,8 +117,9 @@ pub enum Happened<T> {
     Run { id: NodeId },
     /// A thread task panicked, before its node settles failed with the panic as its `why`.
     Panicked { id: NodeId, panic: Panic },
-    /// A node settled: done (`why` none) or not (failed, skipped or cancelled, saying why).
-    Settled { id: NodeId, ok: bool, why: Option<String> },
+    /// A node settled: done (`why` none) or not (failed, skipped or cancelled, saying why);
+    /// `skipped` names the failed node it was skipped behind.
+    Settled { id: NodeId, ok: bool, why: Option<String>, skipped: Option<NodeId> },
     /// Every node of the request settled and it was closed; what it did, taken before the
     /// plane let it go.
     Finished { request: RequestId, ok: bool, stats: RequestStats },
@@ -954,15 +955,16 @@ impl<W: Work, P: Predict> Plane<W, P> {
                     }
                     let id = NodeId(id);
                     self.settled(id);
-                    let (ok, why) = match state {
-                        NodeState::Built | NodeState::Cached { .. } => (true, None),
-                        NodeState::Failed { why } => (false, Some(why)),
+                    let (ok, why, skipped) = match state {
+                        NodeState::Built | NodeState::Cached { .. } => (true, None, None),
+                        NodeState::Failed { why } => (false, Some(why), None),
                         NodeState::Skipped { because } => {
-                            (false, Some(format!("skipped: node {because} it waited for did not end well")))
+                            let why = format!("skipped: node {because} it waited for did not end well"); // alloc: a node skipped, once
+                            (false, Some(why), Some(NodeId(because)))
                         }
-                        _ => (false, Some("cancelled".to_owned())),
+                        _ => (false, Some("cancelled".to_owned()), None), // alloc: a node cancelled, once
                     };
-                    self.happened.push(Happened::Settled { id, ok, why });
+                    self.happened.push(Happened::Settled { id, ok, why, skipped });
                 }
                 PlaneOutput::Run { id, pool, near, critical } => {
                     let watch = match self.task(id) {

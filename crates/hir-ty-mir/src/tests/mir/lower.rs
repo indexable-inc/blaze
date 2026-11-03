@@ -7,7 +7,7 @@ fn lower_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     let fx = fixture::db(ra_fixture);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
@@ -28,7 +28,7 @@ fn lower_mir_all(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     let fx = fixture::db(ra_fixture);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
@@ -138,7 +138,7 @@ fn main() {
     );
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let scope = &module_id.def_map(&db).module(&db, module_id).scope(&db);
         for decl in scope.declarations() {
@@ -158,7 +158,7 @@ fn lower_mir_all_and_closures(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     let fx = fixture::db(ra_fixture);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let module_id = db.module_for_file(file_id.file_id(&db));
         let scope = &module_id.def_map(&db).module(&db, module_id).scope(&db);

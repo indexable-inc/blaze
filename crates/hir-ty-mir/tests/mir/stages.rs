@@ -172,7 +172,7 @@ fn every_owner_at_every_stage_is_the_memo_of_its_query() {
     let fx = fixture::db(BODIES);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         for (owner, _) in owners(&db) {
             for stage in stages() {
                 let driven = providers::mir_at(&db, owner, stage);
@@ -191,7 +191,7 @@ fn every_owner_at_every_stage_monomorphized_is_the_memo_of_its_query() {
     let fx = fixture::db(BODIES);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let subst = || GenericArgs::empty().store();
         for (owner, env) in owners(&db) {
             for stage in stages() {
@@ -215,7 +215,7 @@ fn a_body_read_again_through_mir_allocates_nothing() {
     let fx = fixture::db(BODIES);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let closes: InferBodyId<'_> = function(&db, "closes").into();
         let owner = MirOwner::Body(closes);
         let optimized = MirStage::Optimized(MirOptions::at(MirOptLevel::Release));
@@ -237,7 +237,7 @@ fn the_compiled_stage_is_the_runtime_body_unless_more_is_asked() {
     let fx = fixture::db(BODIES);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let off = MirOptions::at(MirOptLevel::Off);
         let checked = MirOptions { ub_checks: true, ..off };
         let release = MirOptions::at(MirOptLevel::Release);

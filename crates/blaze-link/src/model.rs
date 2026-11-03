@@ -203,6 +203,11 @@ pub(crate) enum Reserve {
     Fixed,
 }
 
+impl Reserve {
+    /// Every reservation, in address order.
+    pub(crate) const ALL: [Reserve; 3] = [Reserve::Arena, Reserve::Cells, Reserve::Fixed];
+}
+
 /// Whether a class is a dev run's reservation ([`Class::Reserve`]): no bytes in memory or in
 /// the file, unlike [`Class::Bss`], which is zeroed memory. Its region's `size` is 0 and its
 /// `capacity` the range reserved.

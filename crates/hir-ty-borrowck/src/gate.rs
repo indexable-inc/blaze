@@ -130,7 +130,8 @@ fn mir_of<'db>(
     body: Result<&'db MirBody<'db>, MirLowerError<'db>>,
 ) -> Result<&'db MirBody<'db>, Refused> {
     let body = body.map_err(|error| {
-        let error = format!("{error:?}"); // alloc: a refusal's message, on the error path
+        // Rendered with `db` attached: the error's types name themselves only through it.
+        let error = blaze_query::db::attach(db, || format!("{error:?}")); // alloc: a refusal's message, on the error path
         Refused::Lowering { owner: def, error }
     })?;
     // MIR of `def`'s body or of a closure, coroutine or `const` block in it, which its borrow

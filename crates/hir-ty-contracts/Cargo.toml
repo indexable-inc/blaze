@@ -28,6 +28,7 @@ hir-ty-verus.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
+blaze-query.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 # MIR building, registered into hir-ty's provider table; the pass itself reads hir-ty's MIR types
 # only, so hir-ty-mir's pipeline can call it through a hook without depending on Verus.

@@ -1169,6 +1169,30 @@ fn walk(g: &impl G) -> Option<u32> { g.roots().next() }
 pub fn run(x: &[u32]) -> Option<u32> { walk(&F(x)) }",
         ),
         (
+            // sb-printer: rustc_type_ir's `Interner::item_bounds` (`EarlyBinder<_, impl ..>`).
+            "nested in `Option`, a tuple, a reference and a `Box`",
+            "pub struct Bx<T>(T);
+pub(crate) trait G {
+    fn roots(self) -> Option<impl Iterator<Item = u32>>;
+    fn pair(&self) -> (u32, impl Iterator<Item = u32>);
+    fn refd(&self) -> &impl Iterator<Item = u32>;
+    fn boxed(&self) -> Bx<impl Iterator<Item = u32>>;
+}
+struct F(Once);
+impl G for F {
+    fn roots(self) -> Option<impl Iterator<Item = u32>> { Some(self.0) }
+    fn pair(&self) -> (u32, impl Iterator<Item = u32>) { (1, Once(1)) }
+    fn refd(&self) -> &impl Iterator<Item = u32> { &self.0 }
+    fn boxed(&self) -> Bx<impl Iterator<Item = u32>> { Bx(Once(2)) }
+}
+fn walk(g: impl G) -> Option<u32> {
+    let (_, mut p) = g.pair();
+    let _ = (p.next(), g.refd(), g.boxed());
+    match g.roots() { Some(mut it) => it.next(), None => None }
+}
+pub fn run() -> Option<u32> { walk(F(Once(3))) }",
+        ),
+        (
             "by-value `self`",
             "pub(crate) trait G { fn roots(self) -> impl Iterator<Item = u32>; }
 struct F(u32);

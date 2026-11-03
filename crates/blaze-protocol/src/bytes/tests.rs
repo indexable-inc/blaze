@@ -65,14 +65,11 @@ fn an_array_of_bytes_is_refused() {
 /// byte string is the bytes behind one head.
 #[test]
 fn bytes_read_back_as_the_old_array_did() {
-    let mut state = 0x853c_49e6_748f_ea9b_u64;
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x853c_49e6_748f_ea9b);
     for round in 0..500 {
-        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-        let len = match round % 5 {
-            0 => (state >> 40) as usize % 70_000,
-            _ => (state >> 40) as usize % 300,
-        };
-        let data: Vec<u8> = (0..len).map(|at| (state >> (at % 57)) as u8 ^ at as u8).collect();
+        let len = rng.index(if round % 5 == 0 { 70_000 } else { 300 });
+        let mut data = vec![0u8; len];
+        rng.fill(&mut data);
         let new = cbor::to_vec(&Held { data: data.clone() }).unwrap();
         let old = cbor::to_vec(&Plain { data: data.clone() }).unwrap();
         assert_eq!(&new[new.len() - len..], &data[..]);

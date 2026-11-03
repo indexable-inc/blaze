@@ -17,7 +17,7 @@ use crate::{
 
 /// The free function `name` of the crate root of `krate`.
 #[track_caller]
-fn fn_named(db: &Db, krate: Crate, name: &str) -> FunctionId {
+pub(super) fn fn_named(db: &Db, krate: Crate, name: &str) -> FunctionId {
     let root = crate_def_map(db, krate).root_module_id();
     let data = root.to_db(db).def_map(db).module(db, root);
     match data.name_in_scope(db, &Name::new_symbol_root(Symbol::intern(name))).take_values() {
@@ -32,7 +32,7 @@ fn purity(crates: &str, name: &str) -> FnPurity {
     let db = db_with(crates);
     let krate = crate_named(&db, "kernel");
     let func = fn_named(&db, krate, name);
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let args = GenericArgs::new_from_slice(&[]).store();
         // The summaries through each instance's home are the ones worked out in `kernel`.
         let root = Instance { def: Def::Body(Body::Fn(func)), args: args.clone() }; // clone: reference counts

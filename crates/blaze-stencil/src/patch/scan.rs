@@ -9,7 +9,7 @@
 use cranelift_codegen::ir::{self, InstructionData, Opcode};
 
 use super::{Konst, NONE, Plan, slots::GLOBAL};
-use crate::Error;
+use crate::{Error, enc::sign_extend};
 
 pub(super) fn run(plan: &mut Plan<'_>, func: &ir::Function) -> Result<(), Error> {
     let insts = func.dfg.num_insts();
@@ -133,15 +133,6 @@ fn konst(func: &ir::Function, inst: ir::Inst) -> Option<Konst> {
         }
         _ => None,
     }
-}
-
-/// `value`'s low `bits` bits, sign-extended.
-pub(super) const fn sign_extend(value: i64, bits: u32) -> i64 {
-    if bits == 0 || bits >= 64 {
-        return value;
-    }
-    let shift = 64 - bits;
-    (value << shift) >> shift
 }
 
 /// `value`'s low `bits` bits, zero-extended.

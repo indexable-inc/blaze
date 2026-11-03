@@ -17,11 +17,18 @@ use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
 use syntax::view::{self, AstNode as _};
 
-intern::impl_slice_internable!(PathSegments, (), Name);
+intern::impl_slice_internable!(PathContexts, (), SyntaxContext);
+intern::impl_slice_internable!(PathSegments, Option<InternedSlice<PathContexts>>, Name);
 
 /// A path's kind and its segments. 16 bytes, `Copy`: the segments are interned once per
 /// distinct list (one hash of the names' pointers and a probe, no allocation when the list
 /// exists), so equality and hashing are two words and a clone is a copy. `None` is no segments.
+///
+/// The interned list's header holds each segment's syntax context normalized to macros 2.0
+/// ([`ModPath::contexts`]), the input def-site hygiene reads for the segments after the first
+/// (rustc's `Ident` of each segment): `None` when every one is a root context, as in every
+/// path a real file or a `macro_rules!` writes. Two paths of the same names written with
+/// different contexts are two paths.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModPath {
     pub kind: PathKind,
@@ -34,12 +41,38 @@ const _: () = assert!(size_of::<ModPath>() == 8 + size_of::<usize>());
 /// Segments are gathered here before they are interned: paths longer than this spill to the heap.
 type SegmentBuf = SmallVec<[Name; 8]>;
 
+/// The segments' contexts, gathered as [`SegmentBuf`].
+type ContextBuf = SmallVec<[SyntaxContext; 8]>;
+
 fn intern_segments(segments: &[Name]) -> Option<InternedSlice<PathSegments>> {
+    intern_segments_in(segments, &[])
+}
+
+/// `segments` with `contexts`, one per segment or none at all: a list of root contexts is
+/// stored as none.
+fn intern_segments_in(
+    segments: &[Name],
+    contexts: &[SyntaxContext],
+) -> Option<InternedSlice<PathSegments>> {
     if segments.is_empty() {
         return None;
     }
+    let contexts = match contexts.iter().all(|it| it.is_root()) {
+        true => None,
+        false => {
+            assert_eq!(
+                contexts.len(),
+                segments.len(),
+                "a path of {} segments given {} contexts",
+                segments.len(),
+                contexts.len()
+            );
+            // alloc: none: `to_owned` makes the interned reference an owned handle
+            Some(InternedSlice::from_header_and_slice((), contexts).to_owned())
+        }
+    };
     // alloc: none: `to_owned` makes the interned reference an owned handle, a pointer copy
-    Some(InternedSlice::from_header_and_slice((), segments).to_owned())
+    Some(InternedSlice::from_header_and_slice(contexts, segments).to_owned())
 }
 
 impl PartialOrd for ModPath {
@@ -49,14 +82,22 @@ impl PartialOrd for ModPath {
     }
 }
 
-/// By kind, then by the segments' text, as when the segments were stored inline.
+/// By kind, then by the segments' text, as when the segments were stored inline, then by the
+/// segments' contexts (paths that differ only there were written by different expansions).
 impl Ord for ModPath {
     fn cmp(&self, other: &Self) -> Ordering {
         self.kind.cmp(&other.kind).then_with(|| {
             if self.segments == other.segments {
                 Ordering::Equal
             } else {
-                self.segments().cmp(other.segments())
+                self.segments().cmp(other.segments()).then_with(|| {
+                    match (self.contexts(), other.contexts()) {
+                        (Some(a), Some(b)) => {
+                            a.iter().map(|it| it.into_u32()).cmp(b.iter().map(|it| it.into_u32()))
+                        }
+                        (a, b) => a.is_some().cmp(&b.is_some()),
+                    }
+                })
             }
         })
     }
@@ -67,6 +108,7 @@ impl fmt::Debug for ModPath {
         f.debug_struct("ModPath")
             .field("kind", &self.kind)
             .field("segments", &self.segments())
+            .field("contexts", &self.contexts())
             .finish()
     }
 }
@@ -106,7 +148,18 @@ impl ModPath {
         path: view::Path<'_>,
         span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
     ) -> Option<ModPath> {
-        convert_path_view(db, path, span_for_range)
+        convert_path_view(db, path, span_for_range, false)
+    }
+
+    /// [`ModPath::from_src_view`] with each segment's context ([`ModPath::contexts`]), read
+    /// with `span_for_range`: for a path of a macro expansion that is resolved (every segment
+    /// of a real file has a root context, so its reader need not ask).
+    pub fn from_src_view_with_contexts(
+        db: &Db,
+        path: view::Path<'_>,
+        span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
+    ) -> Option<ModPath> {
+        convert_path_view(db, path, span_for_range, true)
     }
 
     pub fn from_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
@@ -117,6 +170,17 @@ impl ModPath {
         // alloc: none for up to 8 segments, gathered on the stack
         let segments: SegmentBuf = segments.into_iter().collect();
         ModPath { kind, segments: intern_segments(&segments) }
+    }
+
+    /// [`ModPath::from_segments`] with each segment's syntax context, normalized to macros 2.0
+    /// ([`ModPath::contexts`]): one per segment.
+    pub fn from_segments_in(
+        kind: PathKind,
+        segments: impl IntoIterator<Item = (Name, SyntaxContext)>,
+    ) -> ModPath {
+        // alloc: none for up to 8 segments, gathered on the stack
+        let (names, contexts): (SegmentBuf, ContextBuf) = segments.into_iter().unzip();
+        ModPath { kind, segments: intern_segments_in(&names, &contexts) }
     }
 
     /// Creates a `ModPath` from a `PathKind`, with no extra path segments.
@@ -132,15 +196,62 @@ impl ModPath {
         }
     }
 
+    /// The syntax context each segment is written with, normalized to macros 2.0: what
+    /// def-site hygiene keys the lookup of a segment after the first by. `None` when every one
+    /// is a root context.
+    #[inline]
+    pub fn contexts(&self) -> Option<&[SyntaxContext]> {
+        self.segments.as_ref()?.header.header.as_ref().map(|it| &it.slice[..])
+    }
+
+    /// The context of the `i`th segment, as [`ModPath::contexts`]: a root context when it has
+    /// none.
+    pub fn context_of(&self, i: usize, root: SyntaxContext) -> SyntaxContext {
+        self.contexts().and_then(|it| it.get(i).copied()).unwrap_or(root)
+    }
+
     pub fn push_segment(&mut self, segment: Name) {
+        self.push_segment_in(segment, SyntaxContext::root(Edition::Edition2015));
+    }
+
+    /// [`ModPath::push_segment`] of a segment written with `ctxt` (normalized to macros 2.0).
+    pub fn push_segment_in(&mut self, segment: Name, ctxt: SyntaxContext) {
         let mut segments = SegmentBuf::from_slice(self.segments());
         segments.push(segment);
-        self.segments = intern_segments(&segments);
+        let contexts = self.contexts_or_roots(ctxt);
+        self.segments = intern_segments_in(&segments, &contexts);
+    }
+
+    /// The contexts of the segments, then `last`, or none when all are root contexts.
+    fn contexts_or_roots(&self, last: SyntaxContext) -> ContextBuf {
+        match (self.contexts(), last.is_root()) {
+            (None, true) => ContextBuf::new(),
+            (Some(it), _) => it.iter().copied().chain(iter::once(last)).collect(),
+            (None, false) => iter::repeat_n(SyntaxContext::root(Edition::Edition2015), self.segments().len())
+                .chain(iter::once(last))
+                .collect(),
+        }
+    }
+
+    /// `other`'s segments after this path's, with their contexts.
+    pub fn append(&mut self, other: &ModPath) {
+        let mut segments = SegmentBuf::from_slice(self.segments());
+        segments.extend_from_slice(other.segments());
+        let root = SyntaxContext::root(Edition::Edition2015);
+        let contexts: ContextBuf = match (self.contexts(), other.contexts()) {
+            (None, None) => ContextBuf::new(),
+            _ => (0..self.segments().len())
+                .map(|i| self.context_of(i, root))
+                .chain((0..other.segments().len()).map(|i| other.context_of(i, root)))
+                .collect(),
+        };
+        self.segments = intern_segments_in(&segments, &contexts);
     }
 
     pub fn pop_segment(&mut self) -> Option<Name> {
         let (&last, rest) = self.segments().split_last()?;
-        self.segments = intern_segments(rest);
+        let contexts = self.contexts().map_or(&[][..], |it| &it[..rest.len()]);
+        self.segments = intern_segments_in(rest, contexts);
         Some(last)
     }
 
@@ -203,7 +314,12 @@ impl Extend<Name> for ModPath {
     fn extend<T: IntoIterator<Item = Name>>(&mut self, iter: T) {
         let mut segments = SegmentBuf::from_slice(self.segments());
         segments.extend(iter);
-        self.segments = intern_segments(&segments);
+        let root = SyntaxContext::root(Edition::Edition2015);
+        let contexts: ContextBuf = match self.contexts() {
+            Some(it) => it.iter().copied().chain(iter::repeat(root)).take(segments.len()).collect(),
+            None => ContextBuf::new(),
+        };
+        self.segments = intern_segments_in(&segments, &contexts);
     }
 }
 
@@ -269,18 +385,29 @@ fn convert_path_view(
     db: &Db,
     path: view::Path<'_>,
     span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
+    with_contexts: bool,
 ) -> Option<ModPath> {
+    let root = SyntaxContext::root(Edition::Edition2015);
     let mut segments = path.segments();
 
     let segment = segments.next()?;
     let mut names = SegmentBuf::new_const();
-    let handle_super_kw = &mut |init_deg, names: &mut SegmentBuf| {
+    // Each name's context normalized to macros 2.0, pushed with it (`ModPath::contexts`).
+    let mut contexts = ContextBuf::new_const();
+    let handle_super_kw = &mut |init_deg,
+                                names: &mut SegmentBuf,
+                                contexts: &mut ContextBuf,
+                                span_for_range: &mut (dyn FnMut(::tt::TextRange) -> SyntaxContext + '_)| {
         let mut deg = init_deg;
         for segment in segments.by_ref() {
             match segment.kind()? {
                 view::PathSegmentKind::SuperKw => deg += 1,
                 view::PathSegmentKind::Name(name) => {
                     names.push(name.as_name());
+                    contexts.push(match with_contexts {
+                        true => span_for_range(name.syntax().text_range()).normalize_to_macros_2_0(db),
+                        false => root,
+                    });
                     break;
                 }
                 view::PathSegmentKind::Type { .. }
@@ -300,16 +427,21 @@ fn convert_path_view(
                     .unwrap_or(PathKind::Crate)
             } else {
                 names.push(name_ref.as_name());
+                contexts.push(match with_contexts {
+                    true => span_for_range(name_ref.syntax().text_range()).normalize_to_macros_2_0(db),
+                    false => root,
+                });
                 segment.coloncolon_token().map_or(PathKind::Plain, |_| PathKind::Abs)
             }
         }
         view::PathSegmentKind::SelfTypeKw => {
             names.push(Name::new_symbol_root(sym::Self_));
+            contexts.push(SyntaxContext::root(Edition::Edition2015));
             PathKind::Plain
         }
         view::PathSegmentKind::CrateKw => PathKind::Crate,
-        view::PathSegmentKind::SelfKw => handle_super_kw(0, &mut names)?,
-        view::PathSegmentKind::SuperKw => handle_super_kw(1, &mut names)?,
+        view::PathSegmentKind::SelfKw => handle_super_kw(0, &mut names, &mut contexts, &mut |range| span_for_range(range))?,
+        view::PathSegmentKind::SuperKw => handle_super_kw(1, &mut names, &mut contexts, &mut |range| span_for_range(range))?,
         view::PathSegmentKind::Type { .. } => {
             // not allowed in imports
             return None;
@@ -317,13 +449,22 @@ fn convert_path_view(
     };
 
     for segment in segments {
-        let name = match segment.kind()? {
-            view::PathSegmentKind::Name(name) => name.as_name(),
+        let (name, ctxt) = match segment.kind()? {
+            view::PathSegmentKind::Name(name) => {
+                let ctxt = match with_contexts {
+                    true => span_for_range(name.syntax().text_range()).normalize_to_macros_2_0(db),
+                    false => root,
+                };
+                (name.as_name(), ctxt)
+            }
             view::PathSegmentKind::SelfKw => continue,
-            view::PathSegmentKind::SelfTypeKw => Name::new_symbol_root(sym::Self_),
+            view::PathSegmentKind::SelfTypeKw => {
+                (Name::new_symbol_root(sym::Self_), SyntaxContext::root(Edition::Edition2015))
+            }
             _ => return None,
         };
         names.push(name);
+        contexts.push(ctxt);
     }
 
     // handle local_inner_macros :
@@ -345,7 +486,7 @@ fn convert_path_view(
         }
     }
 
-    Some(ModPath { kind, segments: intern_segments(&names) })
+    Some(ModPath { kind, segments: intern_segments_in(&names, &contexts) })
 }
 
 fn convert_path_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
@@ -354,6 +495,7 @@ fn convert_path_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
         tt::TtElement::Subtree(..) => None,
     });
     let mut segments = SegmentBuf::new_const();
+    let mut contexts = ContextBuf::new_const();
     let kind = match leaves.next()? {
         tt::Leaf::Punct(tt::Punct { char: ':', .. }) => match leaves.next()? {
             tt::Leaf::Punct(tt::Punct { char: ':', .. }) => PathKind::Abs,
@@ -370,6 +512,7 @@ fn convert_path_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
             {
                 if text != sym::super_ {
                     segments.push(Name::new_symbol(text, span.ctx));
+                    contexts.push(span.ctx.normalize_to_macros_2_0(db));
                     break;
                 }
                 deg += 1;
@@ -379,15 +522,18 @@ fn convert_path_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
         tt::Leaf::Ident(tt::Ident { sym: text, .. }) if text == sym::crate_ => PathKind::Crate,
         tt::Leaf::Ident(ident) => {
             segments.push(Name::new_symbol(ident.sym, ident.span.ctx));
+            contexts.push(ident.span.ctx.normalize_to_macros_2_0(db));
             PathKind::Plain
         }
         _ => return None,
     };
-    segments.extend(leaves.filter_map(|leaf| match leaf {
-        ::tt::Leaf::Ident(ident) => Some(Name::new_symbol(ident.sym, ident.span.ctx)),
-        _ => None,
-    }));
-    Some(ModPath { kind, segments: intern_segments(&segments) })
+    for leaf in leaves {
+        if let ::tt::Leaf::Ident(ident) = leaf {
+            segments.push(Name::new_symbol(ident.sym, ident.span.ctx));
+            contexts.push(ident.span.ctx.normalize_to_macros_2_0(db));
+        }
+    }
+    Some(ModPath { kind, segments: intern_segments_in(&segments, &contexts) })
 }
 
 pub fn resolve_crate_root(db: &Db, mut ctxt: SyntaxContext) -> Option<Crate> {

@@ -34,7 +34,7 @@ use super::{
     replay_reads, report_untracked_read,
     row::VIEW_MASK,
     storage::{Summary, input_bits},
-    unshareable_reads, unwind_if_cancelled, with_attached,
+    unshareable_reads, unwind_if_cancelled, with_attached, with_attached_db,
 };
 
 /// The database of every test: the storage, a log of runs, and what particular tests share
@@ -283,6 +283,22 @@ query!(Untracked, u64, |db, key| {
     report_untracked_read(db);
     key.b(db)
 });
+
+query!(SeesItsDatabase, u64, |db, _key| {
+    u64::from(with_attached_db(|it: Option<&TestDb>| it.is_some_and(|it| std::ptr::eq(it, db))))
+});
+
+/// A query's run has its own database attached, whoever asked and wherever it runs, so the
+/// text it makes reads the same database on every thread; the asker's thread has none again
+/// once it returns.
+#[test]
+fn a_query_runs_with_its_database_attached() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    assert!(!with_attached(|it| it.is_some()));
+    assert_eq!(*get::<SeesItsDatabase>(&db, cell), 1);
+    assert!(!with_attached(|it| it.is_some()));
+}
 
 #[test]
 fn a_hit_returns_the_memo_without_running() {
@@ -1554,6 +1570,30 @@ fn a_new_view_evicts_past_the_cap_and_keep_every_value_stops_it() {
     assert_eq!(db.runs("Capped"), 6, "two evicted values ran again");
 }
 
+/// Each input write opens a view and sweeps every capped function, thousands of times a build:
+/// a sweep that read every row a function ever made, not the values it holds, was most of a
+/// daemon self-build's time (`parse_macro_expansion`, sb3slow).
+#[test]
+fn a_sweep_reads_the_values_held_never_every_row_made() {
+    let mut db = TestDb::new();
+    let cells: Vec<Cell> = (0..1000).map(|i| Cell::new(&db, i, 0)).collect();
+    for &cell in &cells {
+        get::<Capped>(&db, cell);
+    }
+    db.storage_mut().synthetic_write(Durability::LOW);
+    assert_eq!(values_held(&db, "Capped"), 2);
+    assert_eq!(db.storage().swept(), 1000, "the view that made them: each value read once");
+    db.storage_mut().synthetic_write(Durability::LOW);
+    assert_eq!(db.storage().swept(), 2, "a view that made none: the two values held, not 1000 rows");
+    let late = Cell::new(&db, 1000, 0);
+    assert_eq!(*get::<Capped>(&db, late), 1000);
+    db.storage_mut().synthetic_write(Durability::LOW);
+    assert_eq!(db.storage().swept(), 3, "the two held and the one made");
+    assert_eq!(values_held(&db, "Capped"), 2);
+    db.storage_mut().synthetic_write(Durability::LOW);
+    assert_eq!(db.storage().swept(), 2);
+}
+
 query!(
     CapLater,
     u64,
@@ -1716,6 +1756,34 @@ fn attach_lends_the_storage_to_its_closure() {
     let view = attach(&db, || with_attached(|it| it.map(Storage::view)));
     assert_eq!(view, Some(db.storage().view()));
     assert!(!with_attached(|it| it.is_some()));
+}
+
+/// `with_attached_db` hands back the lent database as its own type, never as another's, and
+/// the one attached before (another database, or none) is back once an inner `attach` ends.
+#[test]
+fn attach_lends_the_database_as_its_own_type_and_restores_the_one_before() {
+    let outer = TestDb::new();
+    let inner = TestDb::new();
+    let addr = |db: Option<&TestDb>| db.map(|it| std::ptr::from_ref(it).addr());
+    assert_eq!(with_attached_db(addr), None);
+    attach(&outer, || {
+        assert_eq!(with_attached_db(addr), Some(std::ptr::from_ref(&outer).addr()));
+        assert!(with_attached_db(|it: Option<&Wrong>| it.is_none()), "lent only as a `TestDb`");
+        attach(&inner, || assert_eq!(with_attached_db(addr), Some(std::ptr::from_ref(&inner).addr())));
+        assert_eq!(with_attached_db(addr), Some(std::ptr::from_ref(&outer).addr()));
+    });
+    assert_eq!(with_attached_db(addr), None);
+
+    #[expect(dead_code, reason = "only its type is asked for: none is made")]
+    struct Wrong(Storage);
+    impl Database for Wrong {
+        fn storage(&self) -> &Storage {
+            &self.0
+        }
+        fn storage_mut(&mut self) -> &mut Storage {
+            &mut self.0
+        }
+    }
 }
 
 query!(Wide, u64, |db, _key| {

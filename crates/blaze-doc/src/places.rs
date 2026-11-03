@@ -223,10 +223,12 @@ impl<'a> Linking<'a> {
         let found = match lang_crate_name(db, krate) {
             Some(name) => defined_ref(db, def, name),
             // rustdoc's `extern_location`: a crate with no docs here is linked where its
-            // `html_root_url` says, else not at all.
-            None => defined_ref(db, def, &crate::crate_name(db, krate)).map(|mut it| {
-                it.remote = self.html_root_url(db, krate);
-                it
+            // `html_root_url` says, else not at all; one with no name has no path to link by.
+            None => krate.base().rust_name(db).ok().and_then(|name| {
+                defined_ref(db, def, name.as_str()).map(|mut it| {
+                    it.remote = self.html_root_url(db, krate);
+                    it
+                })
             }),
         };
         self.elsewhere.pin().insert(def, found.clone());
@@ -276,7 +278,7 @@ fn declared_path(db: &Db, def: ModuleDef) -> Option<String> {
                 at = Some(parent);
             }
             None => {
-                parts.push(crate::crate_name(db, module.krate(db)));
+                parts.push(module.krate(db).base().rust_name(db).ok()?.as_str().to_owned());
                 at = None;
             }
         }
@@ -442,7 +444,7 @@ pub(crate) fn place(db: &Db, crates: Vec<Documented>, test_only: TestOnly) -> Pl
     // A worker waiting on a query runs other jobs of the pool, which may be another database's:
     // each item puts back the database attached below it.
     let placed: Vec<Vec<Placed>> = base_db::par_map(crates.len(), |at| {
-        hir::attach_db_allow_change(db, || Walker::new(db, &crates[at]).walk())
+        blaze_query::db::attach(db, || Walker::new(db, &crates[at]).walk())
     });
     let mut canonical: HashMap<ModuleDef, ((u8, usize), (usize, usize)), Global> = HashMap::new_in(Global);
     let mut own: Vec<HashMap<ModuleDef, usize, Global>> = vec![];

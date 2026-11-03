@@ -172,9 +172,10 @@ impl DefMap {
         out: &mut Vec<Use, impl Allocator>,
     ) {
         let (_, db, mode) = q;
+        let all = super::path_resolution::Segments::of(path);
         let segments = path.segments();
         let kind = path.kind;
-        let full = self.resolve_segments(q, module, kind, segments, shadow, subns, around);
+        let full = self.resolve_segments(q, module, kind, all, shadow, subns, around);
         let reached = full.segment_index.unwrap_or(segments.len());
         let mut push = |at: usize, import: Option<ImportOrExternCrate>, ns: Namespace| {
             let Some(import) = import else { return };
@@ -186,7 +187,7 @@ impl DefMap {
             out.push(Use { import, name, ns, used });
         };
         for len in 1..reached {
-            let prefix = &segments[..len];
+            let prefix = all.prefix(len);
             let module_shadow = BuiltinShadowMode::Module;
             let res = self.resolve_segments(q, module, kind, prefix, module_shadow, None, around);
             push(len - 1, res.resolved_def.types.and_then(|it| it.import), Namespace::Types);
@@ -276,6 +277,7 @@ impl DefMap {
         def: MacroDefId,
     ) -> Option<MacroId> {
         let is_def = |it: &&MacroId| it.definition(db) == def;
+        let name = &super::def_site::macro_def_name(db, def, *name);
         if let Some(found) = (self.module(db, module).legacy_macro_in_scope(db, name))
             .and_then(|all| all.iter().find(is_def))
         {

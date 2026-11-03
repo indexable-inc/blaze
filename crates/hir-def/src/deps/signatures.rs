@@ -33,7 +33,8 @@ use blaze_format::{
     ALIGN, FormatError, Part as SchemaPart, Persist, Record, SchemaHash, Slice, Writer, open_as,
 };
 use blaze_ids::ContentId;
-use hir_expand::{MacroCallId, name::Name};
+use hir_expand::{AstId, MacroCallId, name::Name};
+use syntax::ast;
 use thin_vec::ThinVec;
 use triomphe::Arc;
 
@@ -41,7 +42,7 @@ use self::{codes::Sig, key::Item, table::StoreBytes};
 use crate::{
     AdtId, AssocItemId, ConstId, EnumId, FunctionId, ImplId, ModuleDefId, StaticId, StructId,
     TraitId, TypeAliasId, UnionId, VariantId,
-    deps::{Part, serve::crate_name},
+    deps::Part,
     expr_store::ExpressionStore,
     hir::persist::{Column, Read, Relocation, Words, WordsRec, relocating},
     item_scope::ItemScope,
@@ -192,10 +193,8 @@ pub(super) fn scope_items(db: &Db, scope: &ItemScope, items: &mut Vec<Item>) {
             }
             ModuleDefId::ConstId(it) => items.push(Item::Const(it)),
             ModuleDefId::StaticId(it) => items.push(Item::Static(it)),
-            ModuleDefId::TraitId(it) => {
-                items.push(Item::Trait(it));
-                assoc(items, &TraitItems::query(db, it).items);
-            }
+            // With its items, below.
+            ModuleDefId::TraitId(_) => {}
             ModuleDefId::TypeAliasId(it) => items.push(Item::TypeAlias(it)),
             ModuleDefId::ModuleId(_)
             | ModuleDefId::EnumVariantId(_)
@@ -204,10 +203,47 @@ pub(super) fn scope_items(db: &Db, scope: &ItemScope, items: &mut Vec<Item>) {
         }
     }
     items.extend(scope.unnamed_consts().map(Item::Const));
-    for it in scope.impls() {
-        items.push(Item::Impl(it));
-        assoc(items, &ImplItems::of(db, it).0.items);
+    for owner in assoc_owners(db, scope) {
+        items.push(owner.item);
+        assoc(items, owner.items);
     }
+}
+
+/// Every macro call `scope` makes whose output its image holds: those of its items
+/// ([`ItemScope::all_macro_calls`]) and those at assoc-item position in its traits and impls
+/// (`impl S { #[attr] fn m() {} }`, `impl S { m!(); }`), whose items [`scope_items`] lists.
+/// The calls of an image's scopes ([`super::reads::image_calls`]) and of a check's
+/// (`filed::checked_reads`), so what an assoc-position proc macro or `include!` read is never
+/// left out of either.
+pub(super) fn scope_calls<'db>(
+    db: &'db Db,
+    scope: &'db ItemScope,
+) -> impl Iterator<Item = MacroCallId> + 'db {
+    let assoc = assoc_owners(db, scope).flat_map(|owner| owner.calls.iter().map(|&(_, call)| call));
+    scope.all_macro_calls().chain(assoc)
+}
+
+/// A trait or an impl of a scope, with its assoc items and the macro calls at assoc-item
+/// position some of them came from.
+struct AssocOwner<'db> {
+    item: Item,
+    items: &'db [(Name, AssocItemId)],
+    calls: &'db [(AstId<ast::Item>, MacroCallId)],
+}
+
+/// The traits `scope` declares, then its impls: one list for the assoc items [`scope_items`]
+/// images and the calls [`scope_calls`] walks.
+fn assoc_owners<'db>(db: &'db Db, scope: &'db ItemScope) -> impl Iterator<Item = AssocOwner<'db>> + 'db {
+    let traits = scope.declarations().filter_map(move |def| {
+        let ModuleDefId::TraitId(it) = def else { return None };
+        let assoc = TraitItems::query(db, it);
+        Some(AssocOwner { item: Item::Trait(it), items: &assoc.items, calls: &assoc.macro_calls })
+    });
+    let impls = scope.impls().map(move |it| {
+        let assoc = &ImplItems::of(db, it).0;
+        AssocOwner { item: Item::Impl(it), items: &assoc.items, calls: &assoc.macro_calls }
+    });
+    traits.chain(impls)
 }
 
 /// The store of the signature `item` asks for: `None` for [`Item::Variants`], which has none.
@@ -406,7 +442,7 @@ fn corrupt(db: &Db, krate: Crate, item: Item, why: &str) -> ! {
     panic!(
         "the image of crate {} is corrupt: the signature of {item:?}: {why}; its bytes were \
          checked against their key, so an encoding wrote what it does not read",
-        crate_name(db, krate)
+        krate.named(db)
     )
 }
 

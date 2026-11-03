@@ -214,9 +214,10 @@ pub fn read(bytes: &[u8], parts: &Parts) -> Result<TopSubtree, String> {
 /// reads, so a hit read from wherever the store has it takes no new memory for the copy.
 pub fn read_in(bytes: &[u8], parts: &Parts, room: &mut Vec<u8>) -> Result<TopSubtree, String> {
     let bytes = tt::aligned(bytes, room);
-    let (tree, used) = TopSubtree::read_wire(bytes, &mut |part| parts.named(part))
-        // alloc: the message of a tree refused.
-        .map_err(|e| e.to_string())?;
+    let (tree, used) =
+        TopSubtree::read_wire(bytes, tt::WireLimits::DEFAULT, &mut |part| parts.named(part))
+            // alloc: the message of a tree refused.
+            .map_err(|e| e.to_string())?;
     match bytes.len() - used {
         0 => Ok(tree),
         // alloc: the message of a tree refused.

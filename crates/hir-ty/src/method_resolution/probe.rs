@@ -9,7 +9,9 @@ use hir_def::{
     AssocItemId, AttrDefId, FunctionId, GenericParamId, HasModule, ImplId, ItemContainerId,
     TraitId,
     attrs::AttrFlags,
+    expr_store::HygieneId,
     hir::generics::GenericParams,
+    nameres::impl_item_name,
     signatures::{FunctionSignature, TraitFlags, TraitSignature},
     visibility::Visibility,
 };
@@ -34,7 +36,7 @@ use crate::{
     lower::GenericPredicates,
     method_resolution::{
         CandidateId, CandidateSource, InherentImpls, MethodError, MethodResolutionContext,
-        SelfTyKey, TraitValueItems, impl_value_item,
+        SelfTyKey, TraitValueItems, impl_value_item, inherent_value_item,
         pick_cache::{self, ProbeFacts},
         scope_sets::{ScopeItem, ScopeItems},
         simplified_type_module, with_incoherent_inherent_impls,
@@ -277,7 +279,22 @@ pub(super) struct MethodAutoderefBadTy<'db> {
 impl<'a, 'db> MethodResolutionContext<'a, 'db> {
     #[instrument(level = "debug", skip(self))]
     pub fn probe_for_name(&self, mode: Mode, item_name: Name, self_ty: Ty<'db>) -> PickResult<'db> {
-        self.probe_for_name_with(mode, item_name, self_ty, false)
+        self.probe_for_name_with(mode, item_name, HygieneId::ROOT, self_ty, false)
+    }
+
+    /// As `probe_for_name` for a method call whose name is written with `hygiene` (the
+    /// expression store's `member_hygiene`): an inherent impl's items are looked up by the
+    /// name keyed for the impl's scope ([`impl_item_name`]), so a method a `macro` names is
+    /// found only by the calls its expansion writes, as rustc's probe compares them with
+    /// `hygienic_eq`.
+    #[instrument(level = "debug", skip(self))]
+    pub fn probe_for_written_name(
+        &self,
+        item_name: Name,
+        hygiene: HygieneId,
+        self_ty: Ty<'db>,
+    ) -> PickResult<'db> {
+        self.probe_for_name_with(Mode::MethodCall, item_name, hygiene, self_ty, false)
     }
 
     /// As `probe_for_name`, for a path a desugaring wrote: the `new` of `format_args!` is behind
@@ -289,13 +306,14 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         item_name: Name,
         self_ty: Ty<'db>,
     ) -> PickResult<'db> {
-        self.probe_for_name_with(mode, item_name, self_ty, true)
+        self.probe_for_name_with(mode, item_name, HygieneId::ROOT, self_ty, true)
     }
 
     fn probe_for_name_with(
         &self,
         mode: Mode,
         item_name: Name,
+        item_hygiene: HygieneId,
         self_ty: Ty<'db>,
         allow_unstable: bool,
     ) -> PickResult<'db> {
@@ -304,12 +322,19 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         let choice = ProbeForNameChoice {
             private_candidate: None,
             item_name,
+            item_hygiene,
             stable_only: false,
             unstable_candidates: RefCell::default(),
             allow_unstable,
             trait_items: TraitValueItems::new_in(self.frame),
             scope_items,
         };
+        if item_hygiene != HygieneId::ROOT {
+            // A name a `macro` writes (lowering keeps no other context for a method call) is
+            // looked up by a key that depends on each impl's expansion, which the pick cache's
+            // key does not name: outside the cache's domain the probe is the one path.
+            return self.probe_op(mode, self_ty, choice, &mut ProbeFacts::default());
+        }
         pick_cache::pick(self, mode, item_name, self_ty, allow_unstable, scope_items, |facts| {
             self.probe_op(mode, self_ty, choice, facts)
         })
@@ -766,6 +791,11 @@ trait ProbeChoice<'db>: Sized {
 #[derive(Debug)]
 struct ProbeForNameChoice<'db, 'f> {
     item_name: Name,
+    /// The context `item_name` is written with in a method call, which an inherent impl's items
+    /// are looked up by ([`impl_item_name`], [`inherent_value_item`]); `HygieneId::ROOT` for
+    /// every other probe. A path's probe (`T::f`) still finds an inherent impl's item by its
+    /// text alone ([`impl_value_item`]).
+    item_hygiene: HygieneId,
 
     /// Some(candidate) if there is a private candidate
     private_candidate: Option<Pick<'db>>,
@@ -796,6 +826,9 @@ impl<'db, 'f> ProbeChoice<'db> for ProbeForNameChoice<'db, 'f> {
         let db = this.db();
         let name = this.choice.item_name;
         let item = match items {
+            ItemsOf::Impl(id) if this.mode == Mode::MethodCall => {
+                inherent_value_item(db, id, impl_item_name(db, id, name, this.choice.item_hygiene))
+            }
             ItemsOf::Impl(id) => impl_value_item(db, id, name),
             ItemsOf::Trait(id) => this.choice.trait_items.get(db, id, name),
         }

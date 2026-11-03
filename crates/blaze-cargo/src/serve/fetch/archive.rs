@@ -1,4 +1,5 @@
-//! A `.crate` unpacked in memory with cargo's checks (`sources/registry/mod.rs`'s `unpack`):
+//! A `.crate` unpacked in memory, each file's bytes [`Bytes::kept`] (they live as long as the VFS
+//! tree that holds them, past the fetch), with cargo's checks (`sources/registry/mod.rs`'s `unpack`):
 //! every entry under `<name>-<version>/`, files and directories only, no more bytes than cargo
 //! lets one unpack to; and what the VFS can't hold refused, naming the entry: a path that is not
 //! UTF-8, absolute, or has an empty, `.` or `..` part, a file twice, a file where a directory is.
@@ -7,7 +8,9 @@
 
 use std::io::Read as _;
 
+use blaze_vfs::Bytes;
 use blaze_hash::HashSet;
+use blaze_mem::Tag;
 use std::alloc::Global;
 use blaze_registry::download::{LimitErrorReader, is_windows_reserved_path};
 use blaze_vfs::Mode;
@@ -65,9 +68,14 @@ pub(super) fn unpack(tarball: &[u8], prefix: &str) -> Result<Vec<SourceFile>, St
             .header()
             .mode()
             .map_err(|e| format!("failed to unpack entry at `{shown}`: {e}"))?;
-        let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
+        // The entry's bytes in a block of their own, kept past the fetch with the VFS tree
+        // that holds them, read straight in: as many as its header says, which the archive's
+        // limit bounds (a header claiming more stops here, as the reader would at the limit).
+        let size = entry.size();
+        let size = usize::try_from(size).ok().filter(|_| size <= limit).ok_or_else(|| {
+            format!("failed to unpack entry at `{shown}`: maximum limit reached when reading")
+        })?;
+        let bytes = Bytes::kept(Tag::Vfs, size, |place| entry.read_exact(place))
             .map_err(|e| format!("failed to unpack entry at `{shown}`: {e}"))?;
         let mode = if bits & 0o111 != 0 { Mode::Executable } else { Mode::Regular };
         files.push(SourceFile { path: inside, bytes, mode });

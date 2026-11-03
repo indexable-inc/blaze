@@ -8,7 +8,7 @@ use std::any::TypeId;
 use base_db::{Db, FileId, all_crates};
 use blaze_hash::HashMap;
 use std::alloc::Global;
-use hir::{attach_db, view::Semantics};
+use hir::view::Semantics;
 use hir_expand::{
     fixture::{self, Fixture},
     proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind},
@@ -187,7 +187,7 @@ fn fixed_in(ports: &Ports<'_>, main: &str) -> Result<String, FixError> {
     (ports.give)(&mut fx);
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let krate = attach_db(&db, || {
+    let krate = blaze_query::db::attach(&db, || {
         hir::Crate::all(&db)
             .into_iter()
             .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))
@@ -201,7 +201,7 @@ fn fixed_in(ports: &Ports<'_>, main: &str) -> Result<String, FixError> {
     let made = fix(&mut db, krate, &setup, &name_of)?;
     let text = db.file_text(file).text(&db).to_string();
     assert!(made.files.iter().all(|(it, new)| *it == file && *new == text), "the fix names the file it changed");
-    attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut acc = Vec::new();
         for module in krate.modules(&db) {
             module.diagnostics(&db, &mut acc, false);
@@ -430,7 +430,7 @@ pub fn f(m: &Mutex<u8>) -> bool {
     let fx = fixture::db(&format!("{CRATES}{MAIN}{}", main.trim_start_matches('\n')));
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let krate = attach_db(&db, || {
+    let krate = blaze_query::db::attach(&db, || {
         hir::Crate::all(&db)
             .into_iter()
             .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))

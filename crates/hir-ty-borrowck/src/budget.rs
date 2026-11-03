@@ -138,7 +138,7 @@ fn allocates_its_result_alone(fixture: &str, first: &[&str], errors: bool) {
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut defs = functions(&db);
         assert!(defs.len() >= 3, "{}", defs.len());
         defs.sort_by_key(|(name, _)| first.iter().position(|it| it == name).unwrap_or(first.len()));
@@ -189,7 +189,7 @@ fn asking_again_allocates_nothing() {
         let fx = fixture::db(fixture);
         let _ = fx.only_file();
         let db = fx.into_db();
-        hir_ty::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             for (name, def) in functions(&db) {
                 let first: *const BorrowckResult = borrowck(&db, def);
                 let (again, used) = measure(|| borrowck(&db, def) as *const BorrowckResult);
@@ -217,7 +217,7 @@ pub fn elsewhere() -> u32 { 1 }
     let files = fx.files().to_vec();
     let mut db = fx.into_db();
     let other = files[1].file_id(&db);
-    let defs = hir_ty::attach_db(&db, || {
+    let defs = blaze_query::db::attach(&db, || {
         let defs: Vec<_> =
             // alloc: the test's setup, before anything is measured.
             functions(&db).into_iter().filter(|(name, _)| name != "elsewhere").collect();
@@ -227,7 +227,7 @@ pub fn elsewhere() -> u32 { 1 }
         defs
     });
     db.set_file_text(other, "pub fn elsewhere() -> u32 { 2 }\n");
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         for (name, def) in &defs {
             let (_, used) = measure(|| borrowck(&db, *def));
             assert_eq!(used.allocations, 0, "{name}");
@@ -240,7 +240,7 @@ fn a_passing_gate_allocates_nothing() {
     let fx = fixture::db(TYPICAL);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         for (name, def) in functions(&db) {
             assert!(crate::gate::checked(&db, def).is_ok(), "{name}: the typical fixture passes");
             let (passed, used) = measure(|| crate::gate::checked(&db, def).is_ok());

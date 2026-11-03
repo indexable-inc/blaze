@@ -156,7 +156,7 @@ impl Uring {
     pub(super) fn end(&mut self, id: Id) {
         let (hot, buf, cold) = self.ops.remove(id).expect("a request in flight");
         match hot.kind {
-            Kind::Read | Kind::Append | Kind::Sync | Kind::Truncate => {
+            Kind::Read | Kind::Append | Kind::Sync => {
                 unkeep(&mut self.kept, Handle::from_bits(hot.of));
             }
             Kind::Close => {}
@@ -351,7 +351,7 @@ impl Uring {
         if self.ring.unsubmitted > 0
             && let Err(error) = self.ring.enter(None)
         {
-            self.fail_unsubmitted(error);
+            self.fail_unsubmitted(&error);
         }
     }
 
@@ -377,7 +377,7 @@ impl Uring {
     /// The ring takes no more requests: every effect in flight fails. What the kernel may
     /// still hold of them stays in its slot, abandoned, never freed, and so do the watches,
     /// spawns' pipes and connections their buffers and files are.
-    pub(super) fn fail_unsubmitted(&mut self, error: io::Error) {
+    pub(super) fn fail_unsubmitted(&mut self, error: &io::Error) {
         // alloc: clone: the error path, once, when the ring dies.
         let why = format!("the ring failed: {error}");
         // clone: the error path, once per effect in flight.
@@ -519,7 +519,7 @@ impl Uring {
                 }
             }
             Kind::Sync if res < 0 => Step::Ends(failed(res)),
-            Kind::Sync => Step::Ends(Some(Done::Synced)),
+            Kind::Sync => Step::Ends(Some(self.synced(Handle::from_bits(hot.of)))),
             Kind::WriteAt
             | Kind::Write
             | Kind::Rename
@@ -531,7 +531,6 @@ impl Uring {
             | Kind::Map
             | Kind::Stat
             | Kind::Load => self.path_step(id, link, res),
-            Kind::Truncate => unreachable!("a truncate is done as it is prepared"),
             Kind::Watch => self.watched(hot, res),
             Kind::Exit => {
                 let spawn = Handle::from_bits(hot.of);

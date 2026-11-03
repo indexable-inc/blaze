@@ -42,7 +42,7 @@ const MACRO_FILE: u32 = 2;
 /// Where a store's columns went, in `StoreRoot`'s order.
 pub struct StoreCols {
     placed: Placed,
-    columns: [Col; 32],
+    columns: [Col; 34],
     side: u32,
     ty_side: u32,
     flags: u32,
@@ -93,8 +93,10 @@ pub fn store(build: &mut Build) -> StoreCols {
     let block_scopes = build.column::<u64>(&[1], true);
     let macro_calls = build.column::<u64>(&[], true);
     let ident_hygiene = build.column::<[u32; 2]>(&[[1, ctx], [PAT_BIT, ctx]], true);
+    let field_hygiene = build.column::<[u32; 2]>(&[], true);
     let block_editions = build.column::<[u32; 2]>(&[[3, Edition::CURRENT as u32]], true);
     let overflow_inheriting = build.column::<u32>(&[2], true);
+    let spec_clauses = build.column::<[u32; 2]>(&[], true);
     // The root, and where its expressions, patterns and bindings end.
     let expr_roots = build.column::<[u32; 4]>(&[[3, 4, 1, 0]], true);
     let type_hygiene = build.column::<[u32; 2]>(&[[0, ctx], [2, ctx]], true);
@@ -129,8 +131,10 @@ pub fn store(build: &mut Build) -> StoreCols {
             block_scopes,
             macro_calls,
             ident_hygiene,
+            field_hygiene,
             block_editions,
             overflow_inheriting,
+            spec_clauses,
             expr_roots,
             type_hygiene,
         ],

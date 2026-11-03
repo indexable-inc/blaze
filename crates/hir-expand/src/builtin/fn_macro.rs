@@ -77,7 +77,7 @@ impl BuiltinFnLikeExpander {
         tt: &tt::TopSubtree,
         span: Span,
     ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-        let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
+        let span = span_with_def_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
         self.expander()(db, frame, id, tt, span)
     }
 
@@ -95,7 +95,7 @@ impl EagerExpander {
         tt: &tt::TopSubtree,
         span: Span,
     ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-        let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
+        let span = span_with_def_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
         self.expander()(db, frame, id, tt, span)
     }
 
@@ -431,7 +431,7 @@ fn assert_expand<'f>(
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-    let call_site_span = span_with_call_site_ctxt(db, span, id.into(), Edition::CURRENT);
+    let call_site_span = span_with_call_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
 
     let mut iter = tt.iter();
 
@@ -763,7 +763,7 @@ fn panic_expand<'f>(
     span: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let dollar_crate = dollar_crate(span);
-    let call_site_span = span_with_call_site_ctxt(db, span, id.into(), Edition::CURRENT);
+    let call_site_span = span_with_call_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
 
     let mac = if use_panic_2021(db, span) { sym::panic_2021 } else { sym::panic_2015 };
 
@@ -791,7 +791,7 @@ fn unreachable_expand<'f>(
     span: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let dollar_crate = dollar_crate(span);
-    let call_site_span = span_with_call_site_ctxt(db, span, id.into(), Edition::CURRENT);
+    let call_site_span = span_with_call_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
 
     let mac = if use_panic_2021(db, span) { sym::unreachable_2021 } else { sym::unreachable_2015 };
 
@@ -1268,16 +1268,23 @@ fn included_bytes<'db>(
 ) -> Result<&'db [u8], ExpandError> {
     let anchor = call_id.loc(db).kind.file_id().original_file_respecting_includes(db).file_id(db);
     let path = AnchoredPath { anchor, path };
-    // A file of the VFS that is not UTF-8 is read from disk like one outside it.
-    if let Some(file) = db.resolve_path(path)
-        && db.has_file_text(file)
-    {
-        return Ok(db.file_text(file).text(db).as_bytes());
-    }
     let unloaded = || {
         // alloc: an error's message, on the error path
         ExpandError::other(path_span, format!("failed to load file `{}`", path.path))
     };
+    // A file of the VFS is read as the view loader gave it: its text, or the bytes of one that
+    // is not UTF-8. Only a file outside the VFS is read from disk.
+    if let Some(file) = db.resolve_path(path) {
+        if db.has_file_text(file) {
+            return Ok(db.file_text(file).text(db).as_bytes());
+        }
+        return match db.raw_file(file).map(|it| it.read(db)) {
+            Some(Ok(bytes)) => Ok(&bytes[..]),
+            // The loader sets bytes it read; a file of the VFS with neither text nor bytes (an
+            // alias) is not read from anywhere else.
+            Some(Err(_)) | None => Err(unloaded()),
+        };
+    }
     let file = db.included_file(call_id.loc(db).krate, path).ok_or_else(unloaded)?;
     match file.read(db) {
         Ok(bytes) => Ok(&bytes[..]),
@@ -1324,14 +1331,7 @@ fn include_str_expand<'f>(
 fn get_env_inner(db: &Db, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
     let krate = arg_id.loc(db).krate;
     db.env_is_read(krate, key.as_str());
-    // As rustc reads them: what cargo set for the crate, then the process the build is for.
-    // The standard library's crates read their own alone, as a std built elsewhere does: no
-    // workspace's environment is in their identity.
-    let own = krate.env(db).get(key.as_str());
-    match krate.data(db).origin.is_lang() {
-        true => own,
-        false => own.or_else(|| base_db::process_env_var(db, key.as_str())),
-    }
+    base_db::env_var(db, krate, key.as_str())
 }
 
 fn env_expand<'f>(

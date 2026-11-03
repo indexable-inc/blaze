@@ -60,7 +60,8 @@ use hir_ty::{
         TerminatorKind, is_by_move_coroutine,
     },
     next_solver::{
-        AliasConstKind, Allocation, Binder, BoundRegion, Clause, Const, ConstKind, DbInterner,
+        AliasConstKind, Allocation, AssocTyId, Binder, BoundRegion, Clause, Const, ConstKind,
+        DbInterner,
         FnSig, GenericArgs, ImplTraitIdx, OpaqueTyIdWrapper, Pattern, Region, StoredTy, Term,
         TermId, TraitRef, Ty, TyKind, ValTree, references_non_lt_error,
     },
@@ -971,10 +972,10 @@ impl<'db> Cx<'db> {
                 _ = write!(
                     said,
                     "`{}` loads proc macros with no expanders, whose calls expand to nothing: ",
-                    crate::hash::crate_name(db, krate)
+                    krate.named(db)
                 );
             }
-            _ = write!(said, "`{}` ({why})", crate::hash::crate_name(db, dep));
+            _ = write!(said, "`{}` ({why})", dep.named(db));
             wrote_macro = true;
         }
         (!said.is_empty()).then_some(said)
@@ -1861,6 +1862,10 @@ impl<'db> Cx<'db> {
                             match it.def_id.0 {
                                 TermId::TypeAliasId(alias) => g.item(ItemId::Alias(alias)),
                                 TermId::ConstId(konst) => g.item(ItemId::Const(konst)),
+                                TermId::RpititId(it) => {
+                                    g.item(ItemId::Function(it.function));
+                                    g.u32(it.idx.into_raw().into_u32());
+                                }
                             }
                             self.args(&mut g, it.args);
                             self.term(&mut g, it.term);
@@ -1917,7 +1922,7 @@ impl<'db> Cx<'db> {
                 match alias.kind {
                     AliasTyKind::Projection { def_id } => {
                         f.u8(0);
-                        f.item(ItemId::Alias(def_id.0));
+                        self.assoc_ty_at(f, def_id.0);
                     }
                     AliasTyKind::Inherent { def_id } => {
                         f.u8(1);
@@ -2016,6 +2021,22 @@ impl<'db> Cx<'db> {
             CallableDefId::EnumVariantId(it) => {
                 f.u8(2);
                 self.variant(f, it.into());
+            }
+        }
+    }
+
+    /// A trait's or impl's associated type: a type alias, or a method's `impl Trait` item by
+    /// its method and index.
+    fn assoc_ty_at(&self, f: &mut Form, def: AssocTyId) {
+        match def {
+            AssocTyId::TypeAliasId(it) => {
+                f.u8(0);
+                f.item(ItemId::Alias(it));
+            }
+            AssocTyId::RpititId(it) => {
+                f.u8(1);
+                f.item(ItemId::Function(it.function));
+                f.u32(it.idx.into_raw().into_u32());
             }
         }
     }
@@ -2452,6 +2473,9 @@ impl<'db> Cx<'db> {
                                 found.push(Named::Item(ItemId::Alias(alias)))
                             }
                             TermId::ConstId(konst) => found.push(Named::Item(ItemId::Const(konst))),
+                            TermId::RpititId(it) => {
+                                found.push(Named::Item(ItemId::Function(it.function)))
+                            }
                         },
                         ExistentialPredicate::AutoTrait(it) => {
                             found.push(Named::Item(ItemId::Trait(it.0)))
@@ -2460,9 +2484,11 @@ impl<'db> Cx<'db> {
                 }
             }
             TyKind::Alias(_, alias) => match alias.kind {
-                AliasTyKind::Projection { def_id } => {
-                    found.push(Named::Item(ItemId::Alias(def_id.0)))
-                }
+                AliasTyKind::Projection { def_id } => found.push(Named::Item(match def_id.0 {
+                    AssocTyId::TypeAliasId(it) => ItemId::Alias(it),
+                    // A trait method's `impl Trait` is named by its method.
+                    AssocTyId::RpititId(it) => ItemId::Function(it.function),
+                })),
                 AliasTyKind::Inherent { def_id } => {
                     found.push(Named::Item(ItemId::Alias(def_id.0)))
                 }
@@ -2533,7 +2559,7 @@ impl<'db> Cx<'db> {
                 match it.projection_term.kind {
                     AliasTermKind::ProjectionTy { def_id } => {
                         f.u8(0);
-                        f.item(ItemId::Alias(def_id.0));
+                        self.assoc_ty_at(f, def_id.0);
                     }
                     AliasTermKind::InherentTy { def_id } => {
                         f.u8(1);

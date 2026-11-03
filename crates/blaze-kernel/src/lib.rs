@@ -482,7 +482,7 @@ impl Kernel {
         let identity = self.identity::<S>(input)?;
         let key = whole::key(&identity);
         // alloc: the value, kept in the store
-        store.put(key, S::KIND, value.to_vec()).map_err(|it| conflict::<S>(input, &identity, key, &[], it))?;
+        store.put(key, S::KIND, value.to_vec()).map_err(|it| conflict::<S>(input, &identity, key, &[], &it))?;
         Ok(key)
     }
 }
@@ -496,7 +496,7 @@ fn conflict<S: Step>(
     identity: &Identity,
     key: Key,
     reads: &[String],
-    mismatch: blaze_cas::Mismatch,
+    mismatch: &blaze_cas::Mismatch,
 ) -> KernelError {
     // alloc: an error
     let reads = reads.to_vec();
@@ -604,7 +604,7 @@ fn keep<S: Compute, P: Put + ?Sized>(
     if let Err(mismatch) = store.put(key, S::KIND, bytes) {
         // alloc: an error
         let reads: Vec<String> = trace.iter().map(|(read, seen)| described(world, read, seen)).collect();
-        return Err(conflict::<S>(input, identity, key, &reads, mismatch));
+        return Err(conflict::<S>(input, identity, key, &reads, &mismatch));
     }
     if trace.is_empty() {
         return Ok(key);

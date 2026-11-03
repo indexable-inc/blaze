@@ -45,7 +45,7 @@ fn checking_an_item_allocates_its_diagnostics_alone() {
     let fx = fixture::db(FIXTURE);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let defs = items(&db);
         let mut reported = 0;
         for &def in &defs {
@@ -66,7 +66,7 @@ fn asking_again_allocates_nothing() {
     let fx = fixture::db(FIXTURE);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         for def in items(&db) {
             wfcheck(&db, def);
             let (_, used) = measure(|| wfcheck(&db, def));

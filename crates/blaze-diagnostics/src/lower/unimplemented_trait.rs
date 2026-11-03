@@ -1,7 +1,8 @@
 //! E0277: a trait bound that does not hold, in rustc's words: the message, label and notes of
 //! the trait's `#[rustc_on_unimplemented]` or `#[diagnostic::on_unimplemented]` (read from the
-//! trait's attributes, `{Self}`, `{This}` and the trait's generic names filled in), else "the
-//! trait bound `T: Trait` is not satisfied" and "the trait `Trait` is not implemented for `T`";
+//! trait's attributes, `{Self}`, `{this}` (`{this:resolved}`, `{this:path}`) and the trait's
+//! generic names filled in), else "the trait bound `T: Trait` is not satisfied" and "the trait
+//! `Trait` is not implemented for `T`";
 //! "consider annotating `S` with `#[derive(Debug)]`" for a local type and a derivable trait;
 //! "this trait has no implementations"; the "required for `X` to implement `Y`" chain of the
 //! impls that needed the bound, on a local impl's header with "unsatisfied trait bound
@@ -485,8 +486,13 @@ struct Args {
     /// What `Self = ".."` is compared with: the type with its whole path, its type's generic
     /// form, and its kind (`{union}`).
     self_matches: Vec<String>,
-    /// The trait's name, for `{This}`.
+    /// The trait's name, for `{this}` and `{this:name}`.
     this: String,
+    /// The trait with its arguments, `Fn(u8)` sugar for a parenthesized one, for
+    /// `{this:resolved}` (rustc's `this_resolved`, `print_trait_sugared`).
+    this_resolved: String,
+    /// The trait's whole path, for `{this:path}` (rustc's `this_path`, `def_path_str`).
+    this_path: String,
     trait_path: String,
     /// The trait's generic parameters and what they are, for `{T}` and `T = ".."`.
     generics: Vec<(String, String)>,
@@ -564,6 +570,10 @@ impl Args {
             self_matches,
             // alloc: the error's text, for an error hir found
             this: trait_.name(cx.db).as_str().to_owned(),
+            this_resolved: print::trait_path_sugared(cx, pred),
+            this_path: trait_full_path(cx, trait_)
+                // alloc: the error's text, for an error hir found
+                .unwrap_or_else(|| trait_.name(cx.db).as_str().to_owned()),
             trait_path: print::trait_path(cx, &tr),
             generics,
             crate_local,
@@ -597,9 +607,10 @@ impl Args {
         }
     }
 
-    /// rustc's `FormatString::format`: `{Self}`, `{This}`, `{Trait}` and the trait's generic
-    /// names filled in, `{{` and `}}` as braces; the kinds `Self = ".."` compares with
-    /// (`{union}`) are left as they are.
+    /// rustc's `FormatString::format`: `{Self}`, `{this}` (`{this:name}`), `{this:resolved}`,
+    /// `{this:path}`, `{Trait}` and the trait's generic names filled in, `{{` and `}}` as braces;
+    /// the kinds `Self = ".."` compares with (`{union}`) are left as they are. A format spec
+    /// after `:` is read only for `this`, as rustc's `parse_arg` does.
     fn format(&self, text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
@@ -621,10 +632,14 @@ impl Args {
                 rest = "";
                 break;
             };
-            let name = &tail[1..end];
+            let (name, spec) = tail[1..end].split_once(':').unwrap_or((&tail[1..end], ""));
             match name {
                 "Self" => out.push_str(&self.self_ty),
-                "This" => out.push_str(&self.this),
+                "this" => out.push_str(match spec {
+                    "resolved" => &self.this_resolved,
+                    "path" => &self.this_path,
+                    _ => &self.this,
+                }),
                 "Trait" => out.push_str(&self.trait_path),
                 _ => match self.generics.iter().find(|(param, _)| param == name) {
                     Some((_, arg)) => out.push_str(arg),
@@ -636,6 +651,15 @@ impl Args {
         out.push_str(rest);
         out
     }
+}
+
+/// A trait's path with its crate's name, as rustc's `def_path_str` prints it with no trimmed
+/// paths: `core::ops::Fn`.
+fn trait_full_path(cx: &Cx<'_, '_>, trait_: hir::Trait) -> Option<String> {
+    let krate = trait_.module(cx.db).krate(cx.db).display_name(cx.db)?;
+    let path = hir::ModuleDef::Trait(trait_).canonical_path(cx.db, cx.edition)?;
+    // alloc: the error's text, for an error hir found
+    Some(format!("{krate}::{path}"))
 }
 
 /// An ADT's path with its crate's name, as rustc prints it with no trimmed paths.

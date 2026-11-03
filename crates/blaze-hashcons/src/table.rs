@@ -161,12 +161,12 @@ impl<T: Consed> HashCons<T> {
         let key = Key::of(&content, self.mask);
         let shard = &self.shards[key.shard];
         if let Some(node) = shard.find(&key) {
-            return matched(node, &content, value);
+            return matched(node, &content, &value);
         }
         let held = shard.lock.lock();
         if let Some(node) = shard.find(&key) {
             drop(held);
-            return matched(node, &content, value);
+            return matched(node, &content, &value);
         }
         let node = self.append(shard, &key, content, value);
         drop(held);
@@ -251,7 +251,7 @@ impl<T: Consed> HashCons<T> {
 
 /// The handle of `node`, found for `value` by its fingerprint: the same value, or a collision
 /// that would alias two values in every memo that compares them by fingerprint.
-fn matched<'a, T: Consed>(node: &'a Node<T>, content: &ContentId, value: T) -> Interned<'a, T> {
+fn matched<'a, T: Consed>(node: &'a Node<T>, content: &ContentId, value: &T) -> Interned<'a, T> {
     if node.content != *content {
         panic!(
             "two values of {} share fingerprint {:?} (content IDs {:x} and {:x}): a 128-bit \
@@ -262,7 +262,7 @@ fn matched<'a, T: Consed>(node: &'a Node<T>, content: &ContentId, value: T) -> I
             content
         );
     }
-    if node.value != value {
+    if node.value != *value {
         panic!(
             "two unequal values of {} share content ID {:x}: its Consed::hash_content does not \
              feed everything its Eq compares",

@@ -496,6 +496,31 @@ fn a_run_is_refused_for_what_is_no_run() {
     assert!(built.lowered.macros(MACRO, Ok(Vec::new())).is_ok());
 }
 
+/// A member proc macro under `blaze check` is two units of one crate: its `Check` unit (the
+/// member checked) and its `Build` unit (the module `b` expands with). Only the `Build` unit
+/// gives the crate expanders: before, both did, and the `Check` unit, which links no module,
+/// gave "its link wrote no `.wasm` file", replacing the built expanders whenever it finished
+/// last, as it did once the build unit's record was kept (harness/editmacros.py, 2026-11-03:
+/// an edit, then a check on the same daemon, failed to expand `mac::Hello`).
+#[test]
+fn a_proc_macros_check_unit_never_gives_its_crate_expanders() {
+    let mut units = units();
+    let checked = units.graph.units.len();
+    // clone: a test's fixture.
+    let check = Unit { mode: Mode::Check, ..units.graph.units[MACRO].clone() };
+    units.graph.units.push(check);
+    units.plans.push(units.plans[MACRO].clone());
+    let mut built = lowered(&units).unwrap();
+    assert_eq!(krate(&built, checked), krate(&built, MACRO), "the check and the build of one proc macro are one crate");
+    let crates = built.lowered.crates();
+    assert!(crates.is_proc_macro(MACRO), "the build unit gives the crate its expanders");
+    assert!(!crates.is_proc_macro(checked), "the check unit links no module and gives none");
+    built.lowered.macros(MACRO, Ok(Vec::new())).unwrap();
+    let refused = built.lowered.macros(checked, Err(base_db::ProcMacroLoadingError::FailedToBuild));
+    assert!(refused.is_err(), "the check unit's load is refused");
+    assert!(super::macros_loaded(built.lowered.db(), krate(&built, BIN)), "`b` still expands with the built expanders");
+}
+
 /// [`units`] with a wasm proc macro beside the native one: `core` and the macro again, for
 /// wasm32-wasip1, as every build plans a proc macro (the native one is a test's, as a test
 /// that plans with `Spec::macro_wasm` off has it). Returns the units and the two new indexes.
@@ -1463,4 +1488,52 @@ fn a_kept_front_end_is_lowered_into_whatever_the_plan_alone_reads() {
     let mut now = kept.clone();
     now.host = format!("{HOST}-other");
     assert_eq!(crate::config_differs(&kept, &now).as_deref(), Some("its host"));
+}
+
+/// A file `include_bytes!` read from outside the VFS changes on disk with no move of the view:
+/// a refresh reads it again and sets it, in one pass, and sets no file that did not move; a
+/// file made unreadable is a moved read, its error.
+#[test]
+fn a_refresh_reads_again_an_included_file_that_moved_on_disk_and_only_it() {
+    use base_db::AbsPathBuf;
+    use blaze_query::db::Durability;
+
+    let units = units();
+    let mut built = lowered(&units).unwrap();
+    let dir = std::env::temp_dir().join(format!("blaze-lower-included-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = AbsPathBuf::assert_utf8(dir);
+    let (moving, still) = (dir.join("moving.bin"), dir.join("still.bin"));
+    std::fs::write(&moving, b"old").unwrap();
+    std::fs::write(&still, b"same").unwrap();
+    let bin = krate(&built, BIN);
+    let read = |built: &Built, path: &AbsPathBuf| {
+        let db = built.lowered.db();
+        let file = db.files().included_file(db, bin, path, Durability::LOW);
+        (file.read(db).clone().map(|it| it.to_vec()), file.content(db))
+    };
+    let (_, still_content) = read(&built, &still);
+    assert_eq!(read(&built, &moving).0, Ok(b"old".to_vec()));
+    let tree = MemTree::default();
+    let root = view(&tree);
+    let config = config(root, library(&tree));
+    let refresh = |built: &mut Built| {
+        let passes = built.lowered.db().maintain_passes();
+        let lower = Lower { units: &units, config: &config, files: &tree, root, host_cpu: None };
+        assert_eq!(built.lowered.refresh(lower, |_| Ok(())), Ok(true));
+        built.lowered.db().maintain_passes() - passes
+    };
+    let unmoved = refresh(&mut built);
+    assert_eq!(read(&built, &moving).0, Ok(b"old".to_vec()), "nothing moved");
+
+    std::fs::write(&moving, b"new").unwrap();
+    assert_eq!(refresh(&mut built), unmoved + 1, "one pass for the file that moved");
+    assert_eq!(read(&built, &moving).0, Ok(b"new".to_vec()), "the view did not move, the file did");
+    assert_eq!(read(&built, &still).1, still_content, "a file that did not move is not set");
+    assert_eq!(refresh(&mut built), unmoved, "read again, unmoved: nothing written");
+
+    std::fs::remove_file(&moving).unwrap();
+    assert_eq!(refresh(&mut built), unmoved + 1);
+    assert!(read(&built, &moving).0.is_err(), "a file gone is a moved read: its error");
+    let _ = std::fs::remove_dir_all(&dir);
 }

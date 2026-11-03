@@ -395,20 +395,29 @@ fn check(tokens: &[TokenTree], rng: &mut SplitMix64) -> TopSubtree {
         assert_eq!(TopSubtree::from_token_trees_in(delimiter, inner, frame).block(), tree.block());
         assert_eq!(TopSubtree::from_subtree_in(tree.view(), frame).block(), tree.block());
     });
-    // Damaging every byte costs a read a byte; a lexed file is checked whole only.
-    check_wire(&tree, tokens.len() <= DAMAGED_TREES_UP_TO);
+    check_wire(&tree);
     tree
 }
 
-const DAMAGED_TREES_UP_TO: usize = 300;
+/// The longest wire [`check_wire`] damages. Damaging every byte reads the tree once a byte, a
+/// read as long as the wire, and each flipped byte that still reads as a tree interns its
+/// symbols anew in the process's symbol table, which never shrinks (one refused interns
+/// nothing, [`refused_wire_bytes_intern_nothing`]): a byte flipped in a literal's 256 KiB
+/// suffix is another 256 KiB symbol, so damaging a tree of the longest suffixes took the test
+/// past 6 GB. Measured by bytes, not tokens: a few literals can make a
+/// long wire. Every random tree of up to about 300 tokens is shorter; a lexed file, and a tree
+/// of long literals, are read back whole only.
+const DAMAGED_WIRE_UP_TO: usize = 9 << 10;
 
-/// Writes `tree` to the wire and reads it back as the same tree; with `damage`, also reads every
-/// prefix of its bytes as an error, and each byte with a bit flipped as an error or as a tree
-/// that writes exactly those bytes, so a tree read is always the builder's.
-fn check_wire(tree: &TopSubtree, damage: bool) {
+/// Writes `tree` to the wire and reads it back as the same tree; for a wire of at most
+/// [`DAMAGED_WIRE_UP_TO`] bytes, also reads every prefix of its bytes as an error, and each byte
+/// with a bit flipped as an error or as a tree that writes exactly those bytes, so a tree read is
+/// always the builder's.
+fn check_wire(tree: &TopSubtree) {
     let mut bytes = Vec::new();
     tree.write_wire(&mut bytes);
     assert_eq!(bytes.len() % 4, 0);
+    let damage = bytes.len() <= DAMAGED_WIRE_UP_TO;
     let parts = wire::parts_of(tree);
     let mut resolve = |part: WirePart| {
         parts
@@ -417,7 +426,8 @@ fn check_wire(tree: &TopSubtree, damage: bool) {
             .map(|&(_, it)| it)
             .ok_or_else(|| "a part the tree didn't have".to_owned())
     };
-    let (read, used) = TopSubtree::read_wire(&bytes, &mut resolve).expect("a tree's own bytes");
+    let (read, used) = TopSubtree::read_wire(&bytes, WireLimits::DEFAULT, &mut resolve)
+        .expect("a tree's own bytes");
     assert_eq!(used, bytes.len());
     assert!(read == *tree, "read back");
     assert_eq!(flat(&read), flat(tree));
@@ -425,17 +435,159 @@ fn check_wire(tree: &TopSubtree, damage: bool) {
         return;
     }
     for len in 0..bytes.len() {
-        assert!(TopSubtree::read_wire(&bytes[..len], &mut resolve).is_err(), "a prefix of {len}");
+        let read = TopSubtree::read_wire(&bytes[..len], WireLimits::DEFAULT, &mut resolve);
+        assert!(read.is_err(), "a prefix of {len}");
     }
     for at in 0..bytes.len() {
         let mut damaged = bytes.clone();
         damaged[at] ^= 1 << (at % 8);
-        if let Ok((read, used)) = TopSubtree::read_wire(&damaged, &mut resolve) {
+        if let Ok((read, used)) = TopSubtree::read_wire(&damaged, WireLimits::DEFAULT, &mut resolve)
+        {
             let mut again = Vec::new();
             read.write_wire(&mut again);
             assert_eq!(again, damaged[..used], "byte {at} flipped");
         }
     }
+}
+
+/// Bytes refused for any reason intern none of their symbols: a macro's output comes from the
+/// sandbox, and the symbol table never shrinks (interning before the literal and canonical
+/// checks took a damage test past 44.9 GB). Seeded damage (a bit flipped, a word overwritten,
+/// a cut) of a tree whose symbols are new texts each round: no refusal leaves a new text in the
+/// table that wasn't there before, refusals that only the checks after the columns make are
+/// among them, and each read allocates at most a few times its bytes. A header over one of
+/// [`WireLimits`] is refused naming it, and the same bytes within the limits are read, which
+/// interns their texts (the probe sees interning).
+#[test]
+fn refused_wire_bytes_intern_nothing() {
+    const MARK: &str = "tq00000000";
+    const ROUNDS: u64 = 4000;
+    assert!(blaze_alloc_count::installed(), "the tests' counting allocator");
+    let tree = lex(
+        0,
+        concat!(
+            "tq00000000a(tq00000000b, tq00000000a. ",
+            "\"tq00000000c\"tq00000000d [1tq00000000e tq00000000b])",
+        ),
+    );
+    let marked: Vec<&str> = tree
+        .columns()
+        .symbols
+        .iter()
+        .map(|&id| symbol(id).as_str())
+        .filter(|it| it.contains(MARK))
+        .collect();
+    assert_eq!(marked.len(), 4, "the marked symbols: {marked:?}");
+    let mut wire = Vec::new();
+    tree.write_wire(&mut wire);
+    let marks: Vec<usize> = wire
+        .windows(MARK.len())
+        .enumerate()
+        .filter(|(_, it)| *it == MARK.as_bytes())
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(marks.len(), 5, "each mark in the wire's text once");
+    // The wire and texts of round `n`: every mark's digits `n`, texts no other test interns.
+    let round = |n: u64| {
+        let digits = format!("tq{n:08}");
+        let mut bytes = wire.clone();
+        for &at in &marks {
+            bytes[at..at + MARK.len()].copy_from_slice(digits.as_bytes());
+        }
+        let texts: Vec<String> = marked.iter().map(|it| it.replace(MARK, &digits)).collect();
+        (bytes, texts)
+    };
+    let interned = |texts: &[String]| texts.iter().find(|it| Symbol::find(it).is_some()).cloned();
+    let parts = wire::parts_of(&tree);
+    let mut resolve = |part: WirePart| {
+        parts
+            .iter()
+            .find(|(it, _)| *it == part)
+            .map(|&(_, it)| it)
+            .ok_or_else(|| "a part the tree didn't have".to_owned())
+    };
+
+    let mut rng = SplitMix64::new(0x77b0);
+    let (mut accepted, mut refused, mut late, mut taken) = (0, 0, 0, 0);
+    for n in 1..=ROUNDS {
+        let (mut bytes, texts) = round(n);
+        // A damaged text an earlier round read can be this round's (a bit flips '2' to '6'):
+        // only texts not yet interned show what this read does.
+        if interned(&texts).is_some() {
+            taken += 1;
+            continue;
+        }
+        match rng.below(3) {
+            0 => bytes[rng.index(wire.len())] ^= 1 << rng.below(8),
+            1 => {
+                let at = 4 * rng.index(wire.len() / 4);
+                bytes[at..at + 4].copy_from_slice(&rng.next_u32().to_le_bytes());
+            }
+            _ => bytes.truncate(rng.index(wire.len())),
+        }
+        let (read, used) = blaze_alloc_count::measure(|| {
+            TopSubtree::read_wire(&bytes, WireLimits::DEFAULT, &mut resolve)
+        });
+        assert!(used.bytes <= 4 * wire.len() as u64, "round {n}: a read allocated {used:?}");
+        match read {
+            Ok((read, len)) => {
+                accepted += 1;
+                let mut again = Vec::new();
+                read.write_wire(&mut again);
+                assert_eq!(again, bytes[..len], "round {n}: a tree read writes its bytes");
+            }
+            Err(error) => {
+                refused += 1;
+                let after_columns = match &error {
+                    WireError::NotCanonical { .. } => true,
+                    WireError::Malformed { what, .. } => what.starts_with("a literal's suffix"),
+                    _ => false,
+                };
+                late += usize::from(after_columns);
+                if let Some(text) = interned(&texts) {
+                    panic!("round {n}: refused ({error}), yet {text:?} was interned");
+                }
+            }
+        }
+    }
+    eprintln!(
+        "{accepted} damaged wires read, {refused} refused, {late} by the checks after the \
+         columns, {taken} rounds' texts taken by an earlier round"
+    );
+    assert!(late > 0, "no damage reached the literal or canonical checks: the test checks nothing");
+
+    // `tz`, three bits from `tq`: no text a damaged round read is one of these.
+    let (mut bytes, mut texts) = round(ROUNDS + 1);
+    for &at in &marks {
+        bytes[at + 1] = b'z';
+    }
+    for text in &mut texts {
+        *text = text.replace("tq", "tz");
+    }
+    assert_eq!(interned(&texts), None, "texts no read has interned");
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let exact = WireLimits { bytes: bytes.len(), nodes: word(4), symbol_bytes: word(20) };
+    for (limits, what, size) in [
+        (WireLimits { bytes: exact.bytes - 1, ..exact }, "bytes", exact.bytes),
+        (WireLimits { nodes: exact.nodes - 1, ..exact }, "nodes", exact.nodes),
+        (
+            WireLimits { symbol_bytes: exact.symbol_bytes - 1, ..exact },
+            "symbol bytes",
+            exact.symbol_bytes,
+        ),
+    ] {
+        let limit = size - 1;
+        assert_eq!(
+            TopSubtree::read_wire(&bytes, limits, &mut resolve).err(),
+            Some(WireError::OverLimit { what, size, limit }),
+        );
+        assert_eq!(interned(&texts), None, "over the {what} limit");
+    }
+    let (read, len) =
+        TopSubtree::read_wire(&bytes, exact, &mut resolve).expect("within the limits");
+    assert_eq!(len, bytes.len());
+    assert!(texts.iter().all(|it| Symbol::find(it).is_some()), "a tree read interns its texts");
+    assert_eq!(read.columns().symbols.len(), tree.columns().symbols.len());
 }
 
 /// The window as one compare numbers symbols as the scan of the last [`SYMBOL_WINDOW`] did,
@@ -553,15 +705,17 @@ fn spans_too_wide_to_pack_and_more_parts_than_fit() {
 fn a_literal_keeps_a_suffix_of_any_length_a_node_holds() {
     let ctx = SyntaxContext::root(Edition::Edition2021);
     let span = Span { range: TextRange::empty(TextSize::new(0)), anchor: anchor(0, 0), ctx };
-    let mut tokens = vec![TokenTree::Subtree(Subtree {
-        delimiter: Delimiter { open: span, close: span, kind: DelimiterKind::Invisible },
-        len: 4,
-    })];
+    let top = |len| {
+        TokenTree::Subtree(Subtree { delimiter: Delimiter { open: span, close: span, kind: DelimiterKind::Invisible }, len })
+    };
+    let mut tokens = vec![top(4)];
     for len in [255, 256, 70_000, MAX_SUFFIX as usize] {
         let suffix = "s".repeat(len);
         let literal = token_to_literal(&format!("1{suffix}"), span);
         assert_eq!((literal.text(), literal.suffix().len()), ("1", len));
         assert_eq!(Literal::new("ab", span, LitKind::Str, &suffix).suffix(), suffix);
+        // Alone in a tree too: the short suffixes' wires are short enough to be damaged.
+        check(&[top(1), TokenTree::Leaf(Leaf::Literal(literal.clone()))], &mut SplitMix64::new(9));
         tokens.push(TokenTree::Leaf(Leaf::Literal(literal)));
     }
     check(&tokens, &mut SplitMix64::new(9));
@@ -906,22 +1060,30 @@ fn walking_and_the_wire_allocate_the_same_for_any_size_of_tree() {
                 .map(|&(_, it)| it)
                 .ok_or_else(|| "a part the tree didn't have".to_owned())
         };
-        // The first read grows the nodes' check's stack and the canonical check's set of parts,
-        // both kept per thread; a warm read allocates the block alone, and none in a frame.
-        drop(TopSubtree::read_wire(&bytes, &mut resolve).expect("a tree's own bytes"));
+        // The first read grows the nodes' check's stack, the resolved parts, the symbols'
+        // hashes and the canonical check's set of parts, all kept per thread; a warm read
+        // allocates the block alone, and none in a frame.
+        drop(
+            TopSubtree::read_wire(&bytes, WireLimits::DEFAULT, &mut resolve)
+                .expect("a tree's own bytes"),
+        );
         let (read, _) = blaze_alloc_count::assert_at_most(1, "reading a tree", || {
-            TopSubtree::read_wire(&bytes, &mut resolve)
+            TopSubtree::read_wire(&bytes, WireLimits::DEFAULT, &mut resolve)
         })
         .expect("a tree's own bytes");
         assert!(read == *tree && read.keeps_words());
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-            drop(TopSubtree::read_wire_in(&bytes, &mut resolve, frame).expect("a tree's own bytes"))
+            drop(
+                TopSubtree::read_wire_in(&bytes, WireLimits::DEFAULT, &mut resolve, frame)
+                    .expect("a tree's own bytes"),
+            )
         });
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-            let (framed, _) = blaze_alloc_count::assert_at_most(0, "reading a tree in a frame", || {
-                TopSubtree::read_wire_in(&bytes, &mut resolve, frame)
-            })
-            .expect("a tree's own bytes");
+            let (framed, _) =
+                blaze_alloc_count::assert_at_most(0, "reading a tree in a frame", || {
+                    TopSubtree::read_wire_in(&bytes, WireLimits::DEFAULT, &mut resolve, frame)
+                })
+                .expect("a tree's own bytes");
             assert_eq!(framed.block(), read.block());
             assert!(framed == read && !framed.keeps_words());
         });
@@ -970,8 +1132,8 @@ fn a_tree_read_from_the_wire_has_the_built_block(tc: hegel::TestCase) {
             .map(|&(_, it)| it)
             .ok_or_else(|| "a part the tree didn't have".to_owned())
     };
-    let (read, used) =
-        TopSubtree::read_wire(&bytes, &mut resolve).expect("a tree's own bytes");
+    let (read, used) = TopSubtree::read_wire(&bytes, WireLimits::DEFAULT, &mut resolve)
+        .expect("a tree's own bytes");
     assert_eq!(used, bytes.len());
     assert_eq!(read.block(), tree.block());
     assert_eq!(read.layout, tree.layout);

@@ -35,7 +35,7 @@ pub use text_size::{TextRange, TextSize};
 pub use self::iter::{TtElement, TtIter};
 pub use self::storage::{
     IndexTable, SubtreeBuilderRestorePoint, TopSubtree, aligned, TopSubtreeBuilder, Tree, TreeWords, ViewWords,
-    WireError, WirePart,
+    WireError, WireLimits, WirePart,
 };
 
 pub const MAX_GLUED_PUNCT_LEN: usize = 3;

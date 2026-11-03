@@ -35,7 +35,7 @@ fn a_memo_hit_allocates_nothing() {
     let fx = fixture::db("const A: u8 = 1; const B: u8 = A + 2;");
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (_, control) = blaze_alloc_count::measure(|| std::hint::black_box(Box::new(1u64)));
         assert_eq!(control.allocations, 1, "the test binary counts allocations");
         let b = const_named(&db, file_id, "B");

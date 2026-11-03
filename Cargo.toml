@@ -23,6 +23,8 @@ exclude = [
     "vendor/hegeltest-macros",
     # Patched below; its own tests need dev-dependencies blaze has no use for.
     "vendor/sonic-rs",
+    # Patched below; its own tests and benches need dev-dependencies blaze has no use for.
+    "vendor/arrow-buffer",
     # Its own tests need dev-dependencies blaze has no use for (vendor/blake3-servil/SOURCE.md).
     "vendor/blake3-servil",
     # Patched below; its own tests need dev-dependencies blaze has no use for (vendor/wasmtime/SOURCE.md).
@@ -217,6 +219,8 @@ cranelift-object = { path = "vendor/cranelift-object" }
 cranelift-codegen = { path = "vendor/cranelift-codegen" }
 # A skipped string's `\u` takes four hex digits, as serde_json's (vendor/sonic-rs/SOURCE.md).
 sonic-rs = { path = "vendor/sonic-rs" }
+# `ALIGNMENT` on wasm64 too, for the wasm64 seed (vendor/arrow-buffer/SOURCE.md).
+arrow-buffer = { path = "vendor/arrow-buffer" }
 # The integer widths of `#![blaze::arbitrary_ints]` (vendor/rustc_ast_ir/SOURCE.md).
 ra-ap-rustc_ast_ir = { path = "vendor/rustc_ast_ir" }
 # The one zstd API: C zstd 1.5.7 on native targets; on wasm, where the seed has no C,

@@ -384,6 +384,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 Err(MirEvalError::Panic(format!("unknown-panic-payload: {:?}", arg.ty.kind())))
             }
             SliceLen => {
+                // core's `len` is `ptr::metadata(self)`: a call, which rustc's evaluation of its
+                // body counts as a step of `long_running_const_eval` (`ctfe_limit`). This
+                // answers it without the body, so it counts that step itself, and a loop over a
+                // slice's length spends what it spends under rustc.
+                if self.limits_frames {
+                    self.lint_step(locals.body.owner)?;
+                }
                 let arg = args.next().ok_or(MirEvalError::InternalError(
                     "argument of <[T]>::len() is not provided".into(),
                 ))?;
@@ -897,11 +904,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "type_name generic arg is not provided".into(),
                     ));
                 };
-                let Some(ty_name) = crate::mir::type_name::rustc_type_name(self.db, ty) else {
+                let ty_name = match crate::mir::type_name::rustc_type_name_or_refusal(self.db, ty) {
+                    Ok(it) => it,
                     // alloc: error path
-                    return Err(MirEvalError::NotSupported(format!(
-                        "`type_name::<{ty:?}>()`: the type has no path to print"
-                    )));
+                    Err(why) => {
+                        return Err(MirEvalError::NotSupported(format!(
+                            "`type_name::<{ty:?}>()`: rustc's spelling is not reproduced for {why}"
+                        )));
+                    }
                 };
                 let len = ty_name.len();
                 let addr = self.heap_allocate(len, 1)?;

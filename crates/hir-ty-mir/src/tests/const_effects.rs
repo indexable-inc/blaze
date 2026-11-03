@@ -20,7 +20,7 @@ fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected: &str) {
     let fx = fixture::db(ra_fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let target = DisplayTarget::from_crate(&db, module_id.krate(&db));

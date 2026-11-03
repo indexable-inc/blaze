@@ -1,5 +1,5 @@
-//! Model tests (docs/v2/plan/lanes/safety/model.md) of the slots, `enter`/`Guard`, `Grace` and
-//! `Limbo`, from 2 or 3 threads under every interleaving to the preemption bound and every
+//! Model tests (docs/v2/plan/lanes/safety/model.md) of the slots, `enter`/`Guard`, `Grace`,
+//! `Horizon` and `Limbo`, from 2 or 3 threads under every interleaving to the preemption bound and every
 //! value C11 lets a load read. A retired value holds a tracked cell its readers read and its
 //! drop writes, so a free not ordered after a read is a data race the checker reports. What
 //! reclaim promises is one-sided (a grace may pass later than it could, never earlier), so these
@@ -7,9 +7,9 @@
 
 use std::{ptr, sync::Arc};
 
-use blaze_check::{cell::UnsafeCell, hint, model, thread};
+use blaze_check::{cell::UnsafeCell, hint, model, sync::lot::Mutex, thread};
 
-use super::{LOCAL, Limbo, blocks, enter};
+use super::{Grace, Horizon, LOCAL, Limbo, blocks, enter};
 use crate::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 /// A value behind a shared pointer: readers read `n` in their tasks, its drop writes it.
@@ -142,5 +142,53 @@ fn model_threads_in_tasks_at_once_hold_different_slots() {
             .filter(|slot| slot.taken.load(Ordering::Acquire))
             .count();
         assert_eq!(taken, 0, "a slot is still taken after its thread ended");
+    });
+}
+
+/// What the writers of tls_cache's tables share: values each retired under the table's lock,
+/// with the grace it started there.
+type Retired = Mutex<Vec<(Grace, Box<Node>)>>;
+
+/// T4's fix (v2-spinstuck.md): a writer takes its `Horizon` before it locks the limbo, so the
+/// scan of every slot is out from under the lock, and frees by it under the lock what another
+/// writer retired there meanwhile. A grace that writer started after the horizon was taken must
+/// not count as passed: a reader may have entered after the scan, unseen by it, and loaded the
+/// value before the other writer unlinked it. Reader, unlinker and freer are three threads; a
+/// free not ordered after the reader's read is a race the checker reports.
+///
+/// Both halves of `Horizon::now` are load-bearing here: without the `min` with the epoch, a scan
+/// that found no thread in a task passes every grace; with the epoch loaded after the scan, a
+/// grace started between the two is passed although the scan never saw its reader.
+#[test]
+fn model_a_horizon_taken_before_a_lock_frees_nothing_retired_after_it() {
+    model(|| {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(AtomicPtr::new(Node::new(1, &drops)));
+        let retired: Arc<Retired> = Arc::new(Mutex::new(Vec::new()));
+        let reader = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || read(&shared))
+        };
+        let unlinker = {
+            let (shared, retired, drops) = (Arc::clone(&shared), Arc::clone(&retired), Arc::clone(&drops));
+            thread::spawn(move || {
+                let old = shared.swap(Node::new(2, &drops), Ordering::AcqRel);
+                let mut retired = retired.lock();
+                // SAFETY: the swap unlinked `old`, a `Box::into_raw` of `Node::new`; the list owns
+                // it now.
+                retired.push((Grace::start(), unsafe { Box::from_raw(old) }));
+            })
+        };
+        let horizon = Horizon::now();
+        retired.lock().retain(|&(grace, _)| !horizon.passed(grace));
+        let n = reader.join().unwrap();
+        assert!(n == 1 || n == 2, "a reader read {n}");
+        unlinker.join().unwrap();
+        // Every task has ended: what is left is freed, and so is the node still linked.
+        retired.lock().clear();
+        assert_eq!(drops.load(Ordering::Relaxed), 1, "the unlinked node was freed once");
+        // SAFETY: the reader has ended; the node still linked is owned here.
+        drop(unsafe { Box::from_raw(shared.load(Ordering::Acquire)) });
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
     });
 }

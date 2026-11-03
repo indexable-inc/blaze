@@ -60,7 +60,7 @@ use crate::{
         AliasConstKind, AliasTy, Allocation, Clause, ClauseKind, Const, ConstKind, DbInterner,
         ExistentialPredicate, FnSig, FreeConstAliasId, GenericArg, GenericArgKind, GenericArgs,
         InherentAssocConstId, ParamEnv, PolyFnSig, Region, Term, TermId, TermKind,
-        TraitAssocConstId, TraitClause, TraitRef, Ty, TyKind, TypingMode, Unnormalized, ValTree,
+        TraitAssocConstId, TraitAssocTyId, AssocTyId, TraitClause, TraitRef, Ty, TyKind, TypingMode, Unnormalized, ValTree,
         abi::Safety,
         infer::{DbInternerInferExt, traits::ObligationCause},
     },
@@ -110,8 +110,11 @@ pub struct HirFormatter<'a, 'db> {
     /// The database handle
     pub db: &'db Db,
     pub interner: DbInterner<'db>,
-    /// The text written so far; a `fmt::Formatter` gets it whole at the end.
-    out: &'a mut String,
+    /// Where the text goes: a `String`, or the `fmt::Formatter` of a `Display` straight, so
+    /// rendering a type allocates nothing of its own (a borrow check's message writes one
+    /// into its frame).
+    // dyn: one writer per rendering, called once per piece
+    out: &'a mut dyn fmt::Write,
     /// The size of what `write_fmt` has written.
     curr_size: usize,
     /// Size from which we should truncate the output.
@@ -170,8 +173,10 @@ impl<'db> HirFormatter<'_, 'db> {
                 Err(HirDisplayError::DisplaySourceCodeError(DisplaySourceCodeError::Cycle))
             } else {
                 match target.kind {
-                    AliasTyKind::Projection { def_id } => {
-                        let def_id = def_id.0;
+                    AliasTyKind::Projection {
+                        def_id: TraitAssocTyId(AssocTyId::RpititId(rpitit)),
+                    } => write!(self, "{}", rpitit.display(self.db)),
+                    AliasTyKind::Projection { def_id: TraitAssocTyId(AssocTyId::TypeAliasId(def_id)) } => {
                         let ItemContainerId::TraitId(trait_) = def_id.loc(self.db).container else {
                             panic!("expected an assoc type");
                         };
@@ -448,19 +453,28 @@ impl<'db> HirFormatter<'_, 'db> {
 
     /// This allows using the `write!` macro directly with a `HirFormatter`.
     pub fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> Result {
-        let start = self.out.len();
-        fmt::Write::write_fmt(&mut *self.out, args)?;
-        self.curr_size += self.out.len() - start;
+        /// Counts what `write_fmt` writes, the size truncation compares.
+        struct Counted<'w, 'o> {
+            out: &'w mut (dyn fmt::Write + 'o),
+            size: &'w mut usize,
+        }
+        impl fmt::Write for Counted<'_, '_> {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                *self.size += s.len();
+                self.out.write_str(s)
+            }
+        }
+        fmt::Write::write_fmt(&mut Counted { out: &mut *self.out, size: &mut self.curr_size }, args)?;
         Ok(())
     }
 
     pub fn write_str(&mut self, s: &str) -> Result {
-        self.out.push_str(s);
+        self.out.write_str(s)?;
         Ok(())
     }
 
     pub fn write_char(&mut self, c: char) -> Result {
-        self.out.push(c);
+        self.out.write_char(c)?;
         Ok(())
     }
 
@@ -579,7 +593,8 @@ pub enum ClosureStyle {
 }
 
 impl<'db, T: HirDisplay<'db>> HirDisplayWrapper<'_, 'db, T> {
-    pub fn write_to(&self, out: &mut String) -> Result {
+    // dyn: one writer per rendering
+    pub fn write_to(&self, out: &mut dyn fmt::Write) -> Result {
         let krate = self.display_target.krate;
         let interner = DbInterner::new_with(self.db, krate);
         self.t.hir_fmt(&mut HirFormatter {
@@ -622,10 +637,7 @@ where
     T: HirDisplay<'db>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut out = String::with_capacity(self.max_size.unwrap_or(20));
-        let written = self.write_to(&mut out);
-        f.write_str(&out)?;
-        match written {
+        match self.write_to(f) {
             Ok(()) => Ok(()),
             Err(HirDisplayError::FmtError) => Err(fmt::Error),
             Err(HirDisplayError::DisplaySourceCodeError(_)) => {
@@ -1480,10 +1492,32 @@ impl<'db> HirDisplay<'db> for Ty<'db> {
 
                 hir_fmt_generics(f, parameters.as_slice(), Some(def.def_id().into()), None)?;
             }
+            // A trait method's `impl Trait` reads as the bounds written on it: its item's
+            // arguments are its opaque type's.
             TyKind::Alias(
                 is_rigid,
-                alias_ty @ AliasTy { kind: AliasTyKind::Projection { def_id }, .. },
-            ) => write_projection(f, is_rigid, &alias_ty, trait_bounds_need_parens, def_id.0)?,
+                AliasTy {
+                    kind:
+                        AliasTyKind::Projection {
+                            def_id: TraitAssocTyId(AssocTyId::RpititId(rpitit)),
+                        },
+                    args,
+                    ..
+                },
+            ) => {
+                f.trait_bounds_need_parens = trait_bounds_need_parens;
+                Ty::new_opaque(interner, is_rigid, rpitit.opaque(db), args).hir_fmt(f)?
+            }
+            TyKind::Alias(
+                is_rigid,
+                alias_ty @ AliasTy {
+                    kind:
+                        AliasTyKind::Projection {
+                            def_id: TraitAssocTyId(AssocTyId::TypeAliasId(def_id)),
+                        },
+                    ..
+                },
+            ) => write_projection(f, is_rigid, &alias_ty, trait_bounds_need_parens, def_id)?,
             TyKind::Foreign(alias) => {
                 let type_alias = TypeAliasSignature::of(db, alias.0);
                 write!(f, "{}", type_alias.name.display(f.db, f.edition()))?;

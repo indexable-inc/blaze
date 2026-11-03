@@ -239,7 +239,7 @@ fn checked(fixture: &str, names: &[&str]) -> Vec<(String, BorrowckResult, Borrow
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let functions = budget::functions(&db);
         names
             .iter()
@@ -290,7 +290,7 @@ fn flow_cost_per_body() {
         let fx = fixture::db(fixture);
         let _ = fx.only_file();
         let db = fx.into_db();
-        hir_ty::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             let functions = budget::functions(&db);
             for &name in names {
                 let def: DefWithBodyId =

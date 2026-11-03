@@ -21,7 +21,7 @@ use std::{collections::VecDeque, marker::PhantomData, ptr};
 
 use blaze_ids::{ContentId, Fingerprint};
 use blaze_mem::{Region, Tag};
-use blaze_reclaim::{Grace, Guard};
+use blaze_reclaim::{Grace, Guard, Horizon};
 
 #[allow(clippy::disallowed_types)]
 use crate::sync::{Mutex, MutexGuard};
@@ -29,7 +29,7 @@ use crate::{
     Edge, QueryKey, QueryKind,
     sync::{
         OnceLock,
-        atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -390,15 +390,25 @@ impl Free {
         self.ready.push(row);
     }
 
-    /// Hands each retired row whose grace has passed to `drop` (which drops what it holds),
-    /// then readies it. Graces are started by whoever holds this (a shard's lock holder, or a
-    /// lane's one thread), so they come in order: when the newest has passed every one has,
-    /// and otherwise the oldest are checked
-    /// until one has not.
-    pub(crate) fn reclaim(&mut self, mut drop: impl FnMut(u32)) -> usize {
+    /// [`Free::reclaim_by`] a horizon taken now: one scan of every reclaim slot, when it holds
+    /// any. For an owner no other thread waits on (a lane's own rows); the holder of a lock
+    /// takes its horizon before it locks.
+    pub(crate) fn reclaim(&mut self, drop: impl FnMut(u32)) -> usize {
+        match self.retired.is_empty() {
+            true => 0,
+            false => self.reclaim_by(Horizon::now(), drop),
+        }
+    }
+
+    /// Hands each retired row whose grace `horizon` passed to `drop` (which drops what it
+    /// holds), then readies it. Graces are started by whoever holds this (a shard's lock
+    /// holder, or a lane's one thread), so they come in order: when the newest has passed every
+    /// one has, and otherwise the oldest are checked until one has not. A horizon taken before
+    /// a grace started never passes it, so one taken before the lock is safe under it.
+    pub(crate) fn reclaim_by(&mut self, horizon: Horizon, mut drop: impl FnMut(u32)) -> usize {
         let Some(&(newest, _)) = self.retired.back() else { return 0 };
         let before = self.retired.len();
-        if newest.passed() {
+        if horizon.passed(newest) {
             for (_, row) in self.retired.drain(..) {
                 drop(row);
                 self.ready.push(row);
@@ -406,7 +416,7 @@ impl Free {
             return before;
         }
         while let Some(&(grace, row)) = self.retired.front() {
-            if !grace.passed() {
+            if !horizon.passed(grace) {
                 break;
             }
             self.retired.pop_front();
@@ -620,10 +630,10 @@ impl Outgrown {
         self.held.push_back((grace, table));
     }
 
-    /// Keeps each table whose grace has passed as the one of its length (freeing the one it
-    /// displaces).
-    fn sweep(&mut self) {
-        while self.held.front().is_some_and(|(grace, _)| grace.passed()) {
+    /// Keeps each table whose grace `horizon` passed as the one of its length (freeing the one
+    /// it displaces).
+    fn sweep(&mut self, horizon: Horizon) {
+        while self.held.front().is_some_and(|&(grace, _)| horizon.passed(grace)) {
             let Some((_, table)) = self.held.pop_front() else { break };
             let (_, len) = table.0.untag();
             self.ready[len.trailing_zeros() as usize] = Some(table);
@@ -639,9 +649,12 @@ impl Outgrown {
         }
     }
 
-    /// An empty table of `len` places, if one is kept.
-    fn take(&mut self, len: usize) -> Option<Tagged> {
-        self.sweep();
+    /// An empty table of `len` places, if one is kept, after keeping those `horizon` passed;
+    /// with none, only one already kept.
+    fn take(&mut self, len: usize, horizon: Option<Horizon>) -> Option<Tagged> {
+        if let Some(horizon) = horizon {
+            self.sweep(horizon);
+        }
         let table = self.ready[len.trailing_zeros() as usize].take()?;
         let raw = std::mem::ManuallyDrop::new(table).0;
         // SAFETY: kept past its grace: no reader probes it, and this shard's lock holder owns it.
@@ -649,6 +662,11 @@ impl Outgrown {
             place.store(EMPTY, Ordering::Relaxed);
         }
         Some(raw)
+    }
+
+    /// Whether any outgrown table waits for its grace.
+    fn waiting(&self) -> bool {
+        !self.held.is_empty()
     }
 
     #[cfg(test)]
@@ -672,6 +690,12 @@ struct Writer {
 #[repr(align(128))]
 struct Shard {
     writer: ShortLock<Writer>,
+    /// Whether its next writer takes a [`Horizon`] before it locks: set by each writer, under
+    /// the lock, when the shard has [`COLLECT_AT`] rows retired or its next insert grows the
+    /// table while outgrown ones wait for their grace. A scan of every reclaim slot (a line per
+    /// thread and per parked task) is never made under the lock (T4, v2-spinstuck.md); a stale
+    /// mark costs a scan, or a reclaim put off to the next writer, never a free.
+    due: AtomicBool,
     /// Null until the first insert; see [`new_table`].
     table: Published,
 }
@@ -710,7 +734,7 @@ impl<V: Send + Sync + 'static> Map<V> {
         let count = blaze_ids::shard_count();
         Map {
             shards: (0..count)
-                .map(|_| Shard { writer: ShortLock::default(), table: Published::null() })
+                .map(|_| Shard { writer: ShortLock::default(), due: AtomicBool::new(false), table: Published::null() })
                 .collect(), // alloc: once a map
             ids: Ids::new(),
             rows,
@@ -813,11 +837,12 @@ impl<V: Send + Sync + 'static> Map<V> {
         }
     }
 
-    /// The shard's table, with a place for one more entry.
-    fn room<'s>(shard: &'s Shard, writer: &mut Writer) -> &'s [AtomicU64] {
+    /// The shard's table, with a place for one more entry. A table it outgrew is reused when
+    /// `horizon` (taken before the lock) passed its grace.
+    fn room<'s>(shard: &'s Shard, writer: &mut Writer, horizon: Option<Horizon>) -> &'s [AtomicU64] {
         let current = shard.table.load(Ordering::Acquire);
         if current.is_null() {
-            let table = writer.outgrown.take(FIRST_TABLE).unwrap_or_else(|| new_table(FIRST_TABLE));
+            let table = writer.outgrown.take(FIRST_TABLE, horizon).unwrap_or_else(|| new_table(FIRST_TABLE));
             shard.table.store(table, Ordering::Release);
             // SAFETY: just published; freed only once outgrown and past its grace, or by `&mut`.
             return unsafe { places(table) };
@@ -828,7 +853,7 @@ impl<V: Send + Sync + 'static> Map<V> {
             return old;
         }
         let len = ((writer.live + 1) * 4).next_power_of_two().max(FIRST_TABLE);
-        let table = writer.outgrown.take(len).unwrap_or_else(|| new_table(len));
+        let table = writer.outgrown.take(len, horizon).unwrap_or_else(|| new_table(len));
         // SAFETY: made just now and not yet published.
         let new = unsafe { places(table) };
         let mask = new.len() - 1;
@@ -851,18 +876,44 @@ impl<V: Send + Sync + 'static> Map<V> {
         new
     }
 
-    /// Frees the shard's retired rows whose grace has passed, once enough are waiting.
-    fn tidy(&self, writer: &mut Writer) {
-        if writer.free.retired() >= COLLECT_AT {
-            let rows = &self.rows;
-            // SAFETY: a retired row's grace has passed: no task that could reach it is left.
-            writer.free.reclaim(|row| unsafe { rows.drop_row(row) });
-        }
+    /// The horizon a writer of `shard` takes before it locks, if the last one marked it due.
+    fn horizon(shard: &Shard) -> Option<Horizon> {
+        shard.due.load(Ordering::Relaxed).then(Horizon::now)
     }
 
-    /// Publishes `key`'s entry under the shard's lock, retiring the one it replaces.
-    fn publish<'s>(&'s self, shard: &'s Shard, writer: &mut Writer, key: QueryKey, value: V) -> &'s Entry<V> {
-        let table = Self::room(shard, writer);
+    /// Frees the shard's retired rows whose grace `horizon` passed, once enough are waiting,
+    /// and marks whether the next writer should take a horizon. Under the shard's lock.
+    fn tidy(&self, shard: &Shard, writer: &mut Writer, horizon: Option<Horizon>) {
+        if writer.free.retired() >= COLLECT_AT
+            && let Some(horizon) = horizon
+        {
+            let rows = &self.rows;
+            // SAFETY: a retired row's grace has passed: no task that could reach it is left.
+            writer.free.reclaim_by(horizon, |row| unsafe { rows.drop_row(row) });
+        }
+        Self::mark_due(shard, writer);
+    }
+
+    /// Marks whether the next writer of `shard` takes a horizon before it locks
+    /// ([`Shard::due`]). Under the shard's lock.
+    fn mark_due(shard: &Shard, writer: &Writer) {
+        let current = shard.table.load(Ordering::Relaxed);
+        let len = if current.is_null() { 0 } else { current.untag().1 };
+        let grows = (writer.used + 1) * 2 > len && writer.outgrown.waiting();
+        shard.due.store(writer.free.retired() >= COLLECT_AT || grows, Ordering::Relaxed);
+    }
+
+    /// Publishes `key`'s entry under the shard's lock, retiring the one it replaces. `horizon`
+    /// is the writer's, taken before it locked ([`Map::horizon`]).
+    fn publish<'s>(
+        &'s self,
+        shard: &'s Shard,
+        writer: &mut Writer,
+        horizon: Option<Horizon>,
+        key: QueryKey,
+        value: V,
+    ) -> &'s Entry<V> {
+        let table = Self::room(shard, writer, horizon);
         let row = self.ids.claim(&mut writer.free);
         // SAFETY: claimed just now, under the lock, and not yet published.
         unsafe { self.rows.put(row, Entry { key, value }) };
@@ -882,7 +933,7 @@ impl<V: Send + Sync + 'static> Map<V> {
                 table[at].store(new, Ordering::Release);
             }
         }
-        self.tidy(writer);
+        self.tidy(shard, writer, horizon);
         // SAFETY: published in the current table; dropped only after it is retired and a grace
         // has passed.
         unsafe { self.rows.get(row) }
@@ -891,8 +942,9 @@ impl<V: Send + Sync + 'static> Map<V> {
     /// Sets `key`'s value; a reader still holding the old one keeps it until its task ends.
     pub(crate) fn insert<'g>(&'g self, _task: &'g Guard, key: QueryKey, value: V) -> &'g V {
         let shard = self.shard(&key);
+        let horizon = Self::horizon(shard);
         let mut writer = shard.writer.lock();
-        &self.publish(shard, &mut writer, key, value).value
+        &self.publish(shard, &mut writer, horizon, key, value).value
     }
 
     /// `key`'s value, or `make()`'s, made before the shard is locked: a racing writer's wins
@@ -908,11 +960,12 @@ impl<V: Send + Sync + 'static> Map<V> {
         }
         let value = make();
         let shard = self.shard(&key);
+        let horizon = Self::horizon(shard);
         let mut writer = shard.writer.lock();
         if let Some(found) = self.get(task, &key) {
             return found;
         }
-        &self.publish(shard, &mut writer, key, value).value
+        &self.publish(shard, &mut writer, horizon, key, value).value
     }
 
     /// Replaces `key`'s value with what `change` makes of it (`None`: leave it), made without
@@ -923,10 +976,11 @@ impl<V: Send + Sync + 'static> Map<V> {
         loop {
             let seen = self.get_entry(task, &key);
             let Some(value) = change(seen.map(|(_, entry)| &entry.value)) else { return };
+            let horizon = Self::horizon(shard);
             let mut writer = shard.writer.lock();
             let now = self.get_entry(task, &key).map(|(place, _)| place);
             if now == seen.map(|(place, _)| place) {
-                self.publish(shard, &mut writer, key, value);
+                self.publish(shard, &mut writer, horizon, key, value);
                 return;
             }
         }
@@ -1042,6 +1096,7 @@ impl<V: Send + Sync + 'static> Map<V> {
         if edits.is_empty() {
             return;
         }
+        let horizon = Self::horizon(shard);
         let mut writer = shard.writer.lock();
         gone.clear();
         for (seen, key, edit) in edits.drain(..) {
@@ -1078,7 +1133,7 @@ impl<V: Send + Sync + 'static> Map<V> {
             for row in gone.drain(..) {
                 writer.free.retire(grace, row);
             }
-            self.tidy(&mut writer);
+            self.tidy(shard, &mut writer, horizon);
         }
     }
 
@@ -1090,14 +1145,17 @@ impl<V: Send + Sync + 'static> Map<V> {
         self.edit_all(task, |key, value| if keep(key, value) { Edit::Keep } else { Edit::Remove });
     }
 
-    /// Frees what each shard retired whose grace has passed.
+    /// Frees what each shard retired whose grace has passed, by one horizon taken before any
+    /// shard is locked: one scan of the reclaim slots for every shard, under no lock.
     pub(crate) fn sweep(&self) {
+        let horizon = Horizon::now();
+        let rows = &self.rows;
         for shard in self.shards.iter() {
             let mut writer = shard.writer.lock();
-            let rows = &self.rows;
             // SAFETY: a retired row's grace has passed: no task that could reach it is left.
-            writer.free.reclaim(|row| unsafe { rows.drop_row(row) });
-            writer.outgrown.sweep();
+            writer.free.reclaim_by(horizon, |row| unsafe { rows.drop_row(row) });
+            writer.outgrown.sweep(horizon);
+            Self::mark_due(shard, &writer);
         }
     }
 
@@ -1170,7 +1228,9 @@ impl<V: Send + Sync + 'static> Map<V> {
             if live == 0 || !current.is_null() && current.untag().1 >= len {
                 continue;
             }
-            let table = writer.outgrown.take(len).unwrap_or_else(|| new_table(len));
+            // `&mut`: no reader probes any table it outgrew, so every one is kept by length.
+            writer.outgrown.settle();
+            let table = writer.outgrown.take(len, None).unwrap_or_else(|| new_table(len));
             if !current.is_null() {
                 // Empty, and `&mut` excludes every reader: kept as the shard's table of its
                 // length.

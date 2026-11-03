@@ -108,7 +108,7 @@ fn param_region_def_id_is_the_declaring_item() {
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
@@ -151,7 +151,7 @@ fn param_region_def_id_at_a_type_parameter_panics() {
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
@@ -187,7 +187,7 @@ fn h(_: N<{ 1 + 1 }>) {}
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
@@ -267,7 +267,7 @@ trait Tr<T> {
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
@@ -303,7 +303,7 @@ trait Tr<T> {
         assert!(!compatible(interner, inherent, &[s, statik]));
 
         // `<S as Tr<u8>>::Proj<'static>`: the trait's `Self` and `T`, then the item's `'x`.
-        let projection = AliasTermKind::ProjectionTy { def_id: TraitAssocTyId(proj) };
+        let projection = AliasTermKind::ProjectionTy { def_id: TraitAssocTyId::from(proj) };
         assert!(compatible(interner, projection, &[s, u8, statik]));
         assert!(!compatible(interner, projection, &[s, u8]));
         assert!(!compatible(interner, projection, &[s, statik]));
@@ -329,7 +329,7 @@ fn h(_: N<{ 1 + 1 }>) {}
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
@@ -387,7 +387,7 @@ impl Tr<Foreign> for S {}
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
 
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let dep_module = db.module_for_file(file_ids[0].file_id(&db));
         let main = db.module_for_file(file_ids[1].file_id(&db)).krate(&db);
         let def_map = dep_module.def_map(&db);

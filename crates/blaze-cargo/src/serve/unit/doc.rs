@@ -26,7 +26,8 @@ pub(super) fn doc(job: &Job, lowered: &mut Lowered, no_deps: bool, private: bool
     // a member's dev-dependencies is in the crate graph to leave out.
     let test_only = TestOnly::default();
     let db = lowered.served_db();
-    let crates = hir_ty::attach_db(db, || blaze_doc::crates_to_document(db, &asked, no_deps, &test_only));
+    let crates = blaze_query::db::attach(db, || blaze_doc::crates_to_document(db, &asked, no_deps, &test_only))
+        .map_err(|unnamed| ApiError::new(format!("{unnamed} has no name to file its pages under"), None))?;
     if crates.is_empty() {
         return Err(ApiError::new("nothing to document", None));
     }
@@ -51,7 +52,7 @@ pub(super) fn doc(job: &Job, lowered: &mut Lowered, no_deps: bool, private: bool
         .collect();
     blaze_doc::set_cfg_doc(db, &crates);
     let db = &*db;
-    let model = hir_ty::attach_db(db, || blaze_doc::model(db, crates, test_only));
+    let model = blaze_query::db::attach(db, || blaze_doc::model(db, crates, test_only));
     let Pages { files, written } = blaze_doc::html::pages(&model);
     let mut out = Vec::with_capacity(files.len() + model.warnings.len() + 2); // alloc: once per documentation
     out.push(Response::Documented(Documented {

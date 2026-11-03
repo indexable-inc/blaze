@@ -94,7 +94,7 @@ struct Bytes {
 
 fn frozen() -> Bytes {
     let db = fixture::db(FIXTURE).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let all = crates(&db);
         Bytes {
             def_maps: each(&db, &all, |it| frozen_def::encode(&db, it)),
@@ -132,7 +132,7 @@ fn with(mode: Mode, bytes: &Bytes, def_maps: bool) -> TestDB {
 
 /// The impls and lang items of every crate of `db`, written as they are now.
 fn written(db: &TestDB) -> Vec<(String, Vec<u8>, Vec<u8>)> {
-    crate::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         crates(db)
             .into_iter()
             .map(|it| {
@@ -189,7 +189,7 @@ fn read_back_writes_the_same_bytes() {
     for def_maps in [false, true] {
         let db = with(Mode::Verify, &bytes, def_maps);
         assert_eq!(written(&db), expected(&bytes), "def maps frozen: {def_maps}");
-        crate::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             for krate in crates(&db) {
                 frozen_impls::check(&db, krate);
                 frozen_def::check_lang_items(&db, krate);
@@ -229,7 +229,7 @@ pub use proc_macros::DeriveIdentity;
 fn def_maps_with_procedural_macros_read_back_as_resolved() {
     let _turn = TURN.lock();
     let db = fixture::db(PROC_MACROS).into_db();
-    let bytes: Vec<(String, Vec<u8>)> = crate::attach_db(&db, || {
+    let bytes: Vec<(String, Vec<u8>)> = blaze_query::db::attach(&db, || {
         let encoded =
             |it| frozen_def::encode(&db, it).map_err(|why| format!("{}: {why}", name(&db, it)));
         crates(&db)
@@ -243,7 +243,7 @@ fn def_maps_with_procedural_macros_read_back_as_resolved() {
         let mut db = fixture::db(PROC_MACROS).into_db();
         let maps = by_crate(&db, mode, &bytes);
         frozen_def::set(&mut db, maps);
-        crate::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             for krate in crates(&db) {
                 _ = hir_def::nameres::crate_def_map(&db, krate);
             }
@@ -258,7 +258,7 @@ fn checking_finds_a_difference() {
     let mut bytes = frozen();
     let check = |bytes: &Bytes| {
         let db = with(Mode::Check, bytes, false);
-        crate::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             for krate in crates(&db) {
                 assert!(!frozen_impls::served(&db, krate));
                 frozen_impls::check(&db, krate);

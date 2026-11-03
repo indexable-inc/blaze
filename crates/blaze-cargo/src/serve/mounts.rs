@@ -125,10 +125,9 @@ impl Mounts {
     /// so a fetch of the same source gives the same root.
     pub fn mount(&mut self, vfs: &mut Vfs, at: &str, source: Source) -> Result<(Mount, Ticket), String> {
         let Source { files, under } = source;
-        let ops: Vec<Op> =
-            files.into_iter().map(|file| Op::Write { path: file.path, bytes: file.bytes, mode: file.mode }).collect();
+        let files = files.into_iter().map(|file| (file.path, file.bytes, file.mode));
         let root = vfs
-            .apply_owned(vfs.empty(), ops)
+            .apply_files(vfs.empty(), files)
             .map_err(|error| format!("the files of the source for {at} don't make a tree: {}", op_error(&error)))?;
         let mount = Mount { at: at.to_owned(), origin: Origin::Root(root), under };
         let ticket = vfs.set_head(&head_of(&mount), root).map_err(|error| commit_error(at, &error))?;
@@ -218,7 +217,7 @@ mod tests {
         Source {
             files: files
                 .iter()
-                .map(|(path, bytes)| SourceFile { path: (*path).to_owned(), bytes: bytes.to_vec(), mode: Mode::Regular })
+                .map(|(path, bytes)| SourceFile { path: (*path).to_owned(), bytes: blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, bytes), mode: Mode::Regular })
                 .collect(),
             under: under.to_owned(),
         }

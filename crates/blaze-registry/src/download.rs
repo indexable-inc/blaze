@@ -124,8 +124,7 @@ impl Registry {
         let matches = |bytes: &[u8]| blaze_sha256::digest(bytes) == key;
         let keep = |bytes: &[u8]| -> anyhow::Result<()> {
             let Some(store) = store else { return Ok(()) };
-            // clone: a download kept, once a package
-            let put = store.put(crate_key(&key), blaze_cas::Kind::Output, bytes.to_vec());
+            let put = store.put(crate_key(&key), blaze_cas::Kind::Output, bytes);
             put.map(drop).map_err(|it| {
                 anyhow::anyhow!("the store keeps other bytes than `{package}`'s under its sha256 ({:x})", it.kept)
             })

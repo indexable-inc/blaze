@@ -2,8 +2,10 @@
 # pyright: basic
 """includes.py: a daemon follows edits to a file that only `include!` names.
 
-The file is not a `.rs` file, so nothing loads it until the macro is expanded. Each step edits
-it or the file that includes it, asks the daemon for the program by `blaze build` and holds it
+The file is not a `.rs` file, so nothing loads it until the macro is expanded. Two more files
+that `include_str!` and `include_bytes!` read sit outside the package, in no directory the
+build loads, so an edit of them moves nothing the daemon's view holds. Each step edits one of
+them or the file that includes it, asks the daemon for the program by `blaze build` and holds it
 to what a fresh build of the same source does (rebuild.py).
 
 usage: includes.py '{}'
@@ -52,10 +54,13 @@ MAIN_TEXT = """mod data {
 fn main() {
     println!("{} {} {:?}", data::pick(2), data::made(), data::TABLE);
     println!("{} {:?}", include_str!("label.txt"), include_bytes!("bytes.dat"));
+    println!("{} {:?}", include_str!("../../far/label.txt"), include_bytes!("../../far/bytes.dat"));
 }
 """
 DATA, MAIN = "src/table.rs.data", "src/main.rs"
 LABEL, BYTES = "src/label.txt", "src/bytes.dat"
+# Outside the package's directory (`ws`), beside it: read only through the macros.
+FAR_LABEL, FAR_BYTES = "../far/label.txt", "../far/bytes.dat"
 # (what the step is, [(file, old, new)], whether it does not build). An `old` of None makes the
 # file, a `new` of None removes it.
 STEPS = [
@@ -82,6 +87,10 @@ STEPS = [
     ("restore include_str input", [(LABEL, None, "new label")], False),
     ("remove include_bytes input", [(BYTES, "old bytes", None)], True),
     ("restore include_bytes input", [(BYTES, None, "new bytes")], False),
+    ("include_str input outside the package", [(FAR_LABEL, "far label", "far label edited")], False),
+    ("include_bytes input outside the package", [(FAR_BYTES, "far bytes", "far bytes edited")], False),
+    ("remove the outside include_bytes input", [(FAR_BYTES, "far bytes edited", None)], True),
+    ("restore the outside include_bytes input", [(FAR_BYTES, None, "far bytes back")], False),
 ]
 
 
@@ -91,8 +100,11 @@ def follow(files, steps):
     ws = os.path.join(work, "ws")
     os.makedirs(os.path.join(ws, "src"))
     for path, text in (("Cargo.toml", TOML), *files):
+        Path(ws, path).parent.mkdir(parents=True, exist_ok=True)
         Path(ws, path).write_text(text)
-    project = Project(ws, work)
+    # The directories outside the checkout that its files are in (`FAR_LABEL`, `FAR_BYTES`).
+    dirs = sorted({os.path.dirname(os.path.normpath(os.path.join(ws, path))) for path, _ in files})
+    project = Project(ws, work, outside=[it for it in dirs if it != ws and not it.startswith(ws + os.sep)])
     wrong = 0
     try:
         for what, edits, broken in steps:
@@ -112,7 +124,11 @@ def follow(files, steps):
             built = project.build("sinc")
             took = (time.time() - began) * 1000
             verdict, said = project.held(built, "sinc", broken=broken)
-            wrong += verdict in WRONG
+            if verdict == "refused" and not broken:
+                # Both builds refused a step written to build: a blaze that builds nothing
+                # would pass every step.
+                verdict = "BOTH REFUSED"
+            wrong += verdict in WRONG or verdict == "BOTH REFUSED"
             print(f"{what:40} {verdict:16} {took:6.0f} ms  {said.splitlines()[0][:90] if said else ''}", flush=True)
             if verdict == "DAEMON DIED":
                 raise SystemExit(f"the daemon died: its log is in {project.home}")
@@ -138,4 +154,14 @@ if __name__ == "__main__":
             parse(Input, text, SCRIPT)
         case _:
             fail(SCRIPT, f"usage: {SCRIPT} '{{}}' (see the top of the file)")
-    follow([(DATA, DATA_TEXT), (MAIN, MAIN_TEXT), (LABEL, "old label"), (BYTES, "old bytes")], STEPS)
+    follow(
+        [
+            (DATA, DATA_TEXT),
+            (MAIN, MAIN_TEXT),
+            (LABEL, "old label"),
+            (BYTES, "old bytes"),
+            (FAR_LABEL, "far label"),
+            (FAR_BYTES, "far bytes"),
+        ],
+        STEPS,
+    )

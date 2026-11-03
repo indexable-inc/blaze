@@ -956,8 +956,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Synced)
         }),
         Effect::Truncate { file, len, .. } => at(root, &file, |path| {
-            let open = || OpenOptions::new().write(true).create(true).truncate(false).open(path);
-            fs::making_parent(path, open)?.set_len(len)?;
+            fs::truncate(path, len)?;
             Ok(Done::Truncated)
         }),
         Effect::Write { file, bytes, .. } => at(root, &file, |path| {

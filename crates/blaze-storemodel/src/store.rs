@@ -210,7 +210,7 @@ pub fn fresh(ledger: &Ledger, model: &Model, bounds: &Bounds) -> Result<BTreeMap
     let mut fs = CrashFs::new(model.persist);
     let mut store = open(&mut fs, bounds, "a fresh build's open")?;
     for (key, (kind, bytes)) in &ledger.accepted {
-        if let Err(mismatch) = store.put(*key, *kind, bytes.clone()) {
+        if let Err(mismatch) = store.put(*key, *kind, bytes) {
             return Err(Failure::new(properties::REFUSED_NOT_OVERWRITTEN, format!("a fresh build refused {mismatch:?}")));
         }
     }
@@ -279,7 +279,7 @@ pub fn restore(disk: &Disk, ledger: &Ledger, survive: &BTreeSet<Key>, model: &Mo
     }
     extra(&store, disk, ledger, bounds)?;
     for (key, (kind, bytes)) in &ledger.accepted {
-        if let Err(mismatch) = store.put(*key, *kind, bytes.clone()) {
+        if let Err(mismatch) = store.put(*key, *kind, bytes) {
             return Err(Failure::new(
                 properties::RESTORE_EQUALS_FRESH,
                 format!("building again on the restore, the put under {} was refused: {mismatch:?}", short(key)),
@@ -580,7 +580,7 @@ fn writes(turn: &Turn, name: &str, mut writer: Writer, reader: &Reader, ledger: 
             Op::Put { key: k, value: v } => {
                 turn.pause(format!("put k{k} = v{v}"));
                 let bytes = value(v);
-                let result = writer.put(&guard, key(k), Kind::Query, bytes.clone());
+                let result = writer.put(&guard, key(k), Kind::Query, &bytes);
                 let checked = ledger.lock().put(name, key(k), Kind::Query, &bytes, &result);
                 if let Err(failure) = checked {
                     turn.fail(failure);

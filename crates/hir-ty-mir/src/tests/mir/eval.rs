@@ -35,7 +35,7 @@ pub(super) fn eval_main_at(
     file_id: EditionedFileId,
     level: MirOptLevel,
 ) -> Result<(String, String), MirEvalError<'_>> {
-    crate::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let module_id = db.module_for_file(file_id.file_id(db));
         let def_map = module_id.def_map(db);
         let scope = &def_map.module(db, module_id).scope(db);
@@ -111,7 +111,7 @@ fn check_pass_and_stdio_in(
     }
     // As a build does, for `Location::caller` and `file!()`.
     crate::mir::location::name_sources(&mut db, "fixture", |_, _| Some("main.rs".to_owned()));
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let x = eval_main(&db, file_id);
         match x {
@@ -159,7 +159,7 @@ fn check_panic(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected_panic: 
     let fx = fixture::db(ra_fixture);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let e = eval_main(&db, file_id).unwrap_err();
         assert_eq!(
@@ -176,7 +176,7 @@ pub(super) fn check_error_with(
     let fx = fixture::db(ra_fixture);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let e = eval_main(&db, file_id).unwrap_err();
         let shown = format!("{e:?}");
@@ -3223,7 +3223,7 @@ fn main() {}
     );
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module_id = db.module_for_file(file_ids[0].file_id(&db));
         let inc = module_id
             .def_map(&db)

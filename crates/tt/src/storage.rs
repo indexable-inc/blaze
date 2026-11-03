@@ -48,7 +48,12 @@ mod wire;
 
 pub use owned::{TopSubtree, Tree};
 
-pub use wire::{WireError, WirePart, aligned};
+/// The allocator of a kept tree ([`TopSubtreeBuilder::build`]): a query's result, which lives
+/// until the query's value is replaced or evicted and dies on its own, counted to
+/// [`blaze_mem::Tag::Expand`].
+pub const KEPT: blaze_mem::Kept = blaze_mem::Kept(blaze_mem::Tag::Expand);
+
+pub use wire::{WireError, WireLimits, WirePart, aligned};
 mod columns;
 use columns::{CompressedSpanPart, Node, PackedSpan, WideSpan};
 mod words;
@@ -1139,7 +1144,7 @@ impl TopSubtreeBuilder {
 
     /// Builds, and remove the top subtree if it has only one subtree child.
     pub fn build_skip_top_subtree(self) -> TopSubtree {
-        self.build_skip_top_subtree_keeping(true, Global)
+        self.build_skip_top_subtree_keeping(true, KEPT)
     }
 
     /// [`Self::build_skip_top_subtree`] in `alloc`: a task's temporary, which keeps no parser
@@ -1174,7 +1179,7 @@ impl TopSubtreeBuilder {
     }
 
     pub fn build(self) -> TopSubtree {
-        self.build_keeping(true, Global)
+        self.build_keeping(true, KEPT)
     }
 
     /// [`Self::build`] in `alloc`: a task's temporary, which keeps no parser words.
@@ -1184,7 +1189,7 @@ impl TopSubtreeBuilder {
 
     /// [`Self::build`] like `like`: in its allocator, keeping words when it does.
     pub(crate) fn build_like<A: Allocator + Clone>(self, like: &TopSubtree<A>) -> TopSubtree<A> {
-        // clone: the allocator handle, `Global` or a `&Frame`, not the tree.
+        // clone: the allocator handle, `Kept` or a `&Frame`, not the tree.
         self.build_keeping(like.keeps_words(), like.allocator().clone())
     }
 

@@ -15,10 +15,18 @@
 //! trees, so that a tree read compares and hashes as the same tree built. Then it writes the
 //! tree's block, its one allocation, no larger than the bytes it is read from, in the reader's
 //! allocator ([`TopSubtree::read_wire_in`]); the checks' own buffers are kept per thread.
+//!
+//! The bytes are untrusted: a macro's output comes from the sandbox, and the process's symbol
+//! table never shrinks. So the header is held to [`WireLimits`] before any column is read, and
+//! every check, the canonical ones too, runs on the symbols' text as the wire carries it. A
+//! symbol is interned only once the whole tree is accepted, as the read's last step, which
+//! can't fail: bytes refused for any reason leave nothing in the table and no block allocated,
+//! and bytes accepted add at most [`WireLimits::symbol_bytes`] to it.
 
 use std::{
     alloc::{Allocator, Global},
     cell::Cell,
+    thread::LocalKey,
 };
 
 use blaze_format::cursor::{Put as _, Reader};
@@ -75,6 +83,38 @@ pub enum WireError {
     Part { at: usize, part: WirePart, why: String },
     /// Well formed, but not the columns the builder makes for these token trees.
     NotCanonical { what: &'static str, at: usize },
+    /// The header asks for more than the reader's [`WireLimits`] allow: which limit, the size
+    /// the header gives and the limit.
+    OverLimit { what: &'static str, size: usize, limit: usize },
+}
+
+/// The most one token tree's wire may hold. [`TopSubtree::read_wire`] holds the header to them
+/// before it reads a column, so they bound what a read costs and what it can add to the
+/// process's symbol table, which never shrinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireLimits {
+    /// The most bytes the tree's wire takes, header to padding.
+    pub bytes: usize,
+    /// The most nodes: the top subtree and every token tree in it.
+    pub nodes: usize,
+    /// The most bytes of symbol text: the most one accepted read adds to the symbol table.
+    pub symbol_bytes: usize,
+}
+
+impl WireLimits {
+    /// What a macro's output and a kept expansion are read under: 2 GiB of wire, 64 Mi token
+    /// trees and 1 GiB of symbol text, each far past what the largest expansion seen writes
+    /// (a literal of an embedded file is one symbol), and each a bound a damaged or hostile
+    /// tree can't pass.
+    pub const DEFAULT: WireLimits =
+        WireLimits { bytes: 2 << 30, nodes: 64 << 20, symbol_bytes: 1 << 30 };
+
+    fn check(what: &'static str, size: usize, limit: usize) -> Result<(), WireError> {
+        if size > limit {
+            return Err(WireError::OverLimit { what, size, limit });
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for WireError {
@@ -90,6 +130,9 @@ impl std::fmt::Display for WireError {
             }
             WireError::NotCanonical { what, at } => {
                 write!(f, "token tree bytes: {what} at {at} is not what the builder makes")
+            }
+            WireError::OverLimit { what, size, limit } => {
+                write!(f, "token tree bytes: {what} {size}, over the reader's limit of {limit}")
             }
         }
     }
@@ -172,11 +215,14 @@ impl TopSubtree {
     /// it took. `part` turns each [`WirePart`] into the anchor and context it stands for here,
     /// or refuses it: the ids are the writer's, and only the reader knows which it may use.
     /// `bytes` start at a 4-byte boundary, as a heap buffer or a tree after another one does.
+    /// A header past `limits` is refused before any column is read, and no symbol is interned
+    /// unless the whole tree is accepted.
     pub fn read_wire(
         bytes: &[u8],
+        limits: WireLimits,
         part: &mut impl FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
     ) -> Result<(TopSubtree, usize), WireError> {
-        TopSubtree::read_wire_keeping(bytes, part, true, Global)
+        TopSubtree::read_wire_keeping(bytes, limits, part, true, super::KEPT)
     }
 }
 
@@ -185,14 +231,16 @@ impl<A: Allocator> TopSubtree<A> {
     /// parser words, as [`TopSubtreeBuilder::build_in`](super::TopSubtreeBuilder::build_in)'s.
     pub fn read_wire_in(
         bytes: &[u8],
+        limits: WireLimits,
         part: &mut impl FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
         alloc: A,
     ) -> Result<(TopSubtree<A>, usize), WireError> {
-        TopSubtree::read_wire_keeping(bytes, part, false, alloc)
+        TopSubtree::read_wire_keeping(bytes, limits, part, false, alloc)
     }
 
     fn read_wire_keeping(
         bytes: &[u8],
+        limits: WireLimits,
         part: &mut impl FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
         keeps_words: bool,
         alloc: A,
@@ -208,10 +256,30 @@ impl<A: Allocator> TopSubtree<A> {
         if nodes_len == 0 {
             return malformed("a tree without its top subtree", 0);
         }
-        // Every column is checked where it lies in the bytes, and the block written only once
-        // the whole tree is, so the block is at most the bytes given.
+        WireLimits::check("nodes", nodes_len, limits.nodes)?;
+        WireLimits::check("symbol bytes", symbol_bytes, limits.symbol_bytes)?;
+        // Each symbol is some ident's or literal's, and the top subtree is neither.
+        if symbols_len >= nodes_len {
+            return malformed("more symbols than token trees to use them", symbols_len);
+        }
+
+        // Phase one: every check, from the bytes where they lie and the symbols' text, with
+        // nothing interned and no block allocated.
         let node_words: &[u32] = words.column(nodes_len.saturating_mul(2))?;
         let subtrees = check_nodes(node_words.as_chunks::<2>().0, symbols_len)?;
+        let wire_words = [
+            HEADER_WORDS,
+            nodes_len.saturating_mul(2),
+            (nodes_len + subtrees).saturating_mul(2),
+            wide_len.saturating_add(parts_len).saturating_mul(3),
+            symbols_len,
+            10,
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add);
+        let wire_bytes =
+            wire_words.saturating_mul(4).saturating_add(symbol_bytes.next_multiple_of(4));
+        WireLimits::check("bytes", wire_bytes, limits.bytes)?;
         let span_words: &[u32] = words.column((nodes_len + subtrees).saturating_mul(2))?;
         let wide_words: &[u32] = words.column(wide_len.saturating_mul(3))?;
         for (at, &row) in wide_words.as_chunks::<3>().0.iter().enumerate() {
@@ -225,10 +293,9 @@ impl<A: Allocator> TopSubtree<A> {
         }
         check_spans(span_words.as_chunks::<2>().0, wide_len, parts_len)?;
         let wire_parts = words.rows::<3>(parts_len)?;
-        // Read twice from the bytes, checked now and used once the text is read.
-        let mut ends = Words { read: words.read };
+        let ends: &[u32] = words.column(symbols_len)?;
         let mut last = 0;
-        for (at, [end]) in words.rows::<1>(symbols_len)?.enumerate() {
+        for (at, &end) in ends.iter().enumerate() {
             let end = end as usize;
             if end < last || end > symbol_bytes {
                 return malformed("a symbol ending before the last or past the symbols' bytes", at);
@@ -244,9 +311,10 @@ impl<A: Allocator> TopSubtree<A> {
             what: "symbols that are not UTF-8",
             at: e.valid_up_to(),
         })?;
-        let ends = ends.rows::<1>(symbols_len)?;
+        if let Some(at) = ends.iter().position(|&end| !text.is_char_boundary(end as usize)) {
+            return malformed("a symbol ending inside a char", at);
+        }
         words.pad()?;
-
         let total = HEADER
             + 2 * (2 * nodes_len + subtrees)
             + 3 * (wide_len + parts_len)
@@ -254,42 +322,113 @@ impl<A: Allocator> TopSubtree<A> {
         if u32::try_from(total).is_err() {
             return malformed("a tree of 2^32 words or more", 0);
         }
-        let layout = Layout::new(nodes_len, nodes_len + subtrees, wide_len, parts_len, symbols_len);
-        // alloc: the tree, one block of its exact size, in `alloc`.
-        let mut block = Vec::with_capacity_in(layout.end as usize, alloc);
-        block.extend_from_slice(&layout.header());
-        block.extend_from_slice(node_words);
-        block.extend_from_slice(span_words);
-        block.extend_from_slice(wide_words);
-        for (at, [file_id, ast_id, ctx]) in wire_parts.enumerate() {
-            block.extend_from_slice(&resolve(part, WirePart { file_id, ast_id, ctx }, at)?.row());
-        }
-        let mut top = [None; 2];
-        for (at, [start, len, file_id, ast_id, ctx]) in tops.enumerate() {
-            let Some(end) = start.checked_add(len) else {
-                return malformed("a top span ending past 4 GiB", at);
-            };
-            let resolved = resolve(part, WirePart { file_id, ast_id, ctx }, parts_len + at)?;
-            let range = TextRange::new(TextSize::new(start), TextSize::new(end));
-            top[at] = Some(resolved.recombine(range));
-        }
-        let [Some(top_open), Some(top_close)] = top else { unreachable!("two top spans are read") };
-        let mut from = 0;
-        for (at, [end]) in ends.enumerate() {
-            let end = end as usize;
-            let Some(symbol) = text.get(from..end) else {
-                return malformed("a symbol ending inside a char", at);
-            };
-            block.push(Symbol::intern(symbol).id());
-            from = end;
-        }
-        debug_assert_eq!(block.len(), layout.end as usize, "the columns are the layout's");
-        let block = block.into_boxed_slice();
-        let tree = TopSubtree::from_block(block, layout, top_open, top_close, keeps_words);
-        let columns = tree.columns();
-        check_literals(columns)?;
-        check_canonical(columns)?;
-        Ok((tree, words.read.at()))
+
+        with_kept(&PARTS, |resolved| {
+            with_kept(&HASHES, |hashes| {
+                for (at, [file_id, ast_id, ctx]) in wire_parts.enumerate() {
+                    resolved.push(resolve(part, WirePart { file_id, ast_id, ctx }, at)?.row());
+                }
+                let mut top = [None; 2];
+                for (at, [start, len, file_id, ast_id, ctx]) in tops.enumerate() {
+                    let Some(end) = start.checked_add(len) else {
+                        return malformed("a top span ending past 4 GiB", at);
+                    };
+                    let here = resolve(part, WirePart { file_id, ast_id, ctx }, parts_len + at)?;
+                    let range = TextRange::new(TextSize::new(start), TextSize::new(end));
+                    top[at] = Some(here.recombine(range));
+                }
+                let [Some(top_open), Some(top_close)] = top else {
+                    unreachable!("two top spans are read")
+                };
+                let mut from = 0;
+                hashes.extend(ends.iter().map(|&end| {
+                    let symbol = &text.as_bytes()[from..end as usize];
+                    from = end as usize;
+                    blaze_phf::name_hash(symbol)
+                }));
+                let texts = Texts { text, ends, hashes };
+                let columns = Columns {
+                    nodes: node_words.as_chunks::<2>().0,
+                    spans: span_words.as_chunks::<2>().0,
+                    wide: wide_words.as_chunks::<3>().0,
+                    parts: &resolved[..],
+                    // Not interned yet: the checks read `texts`.
+                    symbols: &[],
+                };
+                check_literals(columns, &texts)?;
+                check_canonical(columns, &texts)?;
+
+                // Phase two, which can't fail: the block, then the symbols interned into it.
+                let layout =
+                    Layout::new(nodes_len, nodes_len + subtrees, wide_len, parts_len, symbols_len);
+                // alloc: the tree, one block of its exact size, in `alloc`.
+                let mut block = Vec::with_capacity_in(layout.end as usize, alloc);
+                block.extend_from_slice(&layout.header());
+                block.extend_from_slice(node_words);
+                block.extend_from_slice(span_words);
+                block.extend_from_slice(wide_words);
+                block.extend_from_slice(resolved.as_flattened());
+                block.extend(
+                    (0..symbols_len)
+                        .map(|at| Symbol::intern_hashed(texts.get(at), texts.hashes[at]).id()),
+                );
+                debug_assert_eq!(block.len(), layout.end as usize, "the columns are the layout's");
+                let block = block.into_boxed_slice();
+                let tree = TopSubtree::from_block(block, layout, top_open, top_close, keeps_words);
+                Ok((tree, words.read.at()))
+            })
+        })
+    }
+}
+
+thread_local! {
+    /// The parts a read resolved, kept for the next read: checked for duplicates before the
+    /// block they go in is allocated.
+    // alloc: one buffer per thread, grown to the most parts read.
+    static PARTS: Cell<Stack<[u32; 3]>> = const { Cell::new(Stack::new()) };
+    /// Each symbol's `name_hash` while a read checks them, kept for the next read; interning
+    /// takes it, so no symbol is hashed twice.
+    // alloc: one buffer per thread, grown to the most symbols read.
+    static HASHES: Cell<Stack<u64>> = const { Cell::new(Stack::new()) };
+}
+
+/// `f` with the thread's buffer of `key`, emptied; it goes back to the thread `f` ends on.
+fn with_kept<T: 'static, R>(
+    key: &'static LocalKey<Cell<Stack<T>>>,
+    f: impl FnOnce(&mut Vec<T>) -> R,
+) -> R {
+    let mut kept = key.replace(Stack::new());
+    let result = f(kept.take());
+    key.set(kept);
+    result
+}
+
+/// The symbols as the wire carries them, before any is interned: symbol `at` is the text up to
+/// `ends[at]` from the one before's end, and `hashes[at]` its `name_hash`.
+struct Texts<'a> {
+    text: &'a str,
+    ends: &'a [u32],
+    hashes: &'a [u64],
+}
+
+impl<'a> Texts<'a> {
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// Symbol `at`'s text: its ends were checked to be in order and on char boundaries.
+    fn get(&self, at: usize) -> &'a str {
+        let from = match at {
+            0 => 0,
+            _ => self.ends[at - 1] as usize,
+        };
+        &self.text[from..self.ends[at] as usize]
+    }
+
+    /// Whether symbols `a` and `b` are one text, as their interned ids would be one: the bytes
+    /// are compared only when the hashes are equal.
+    fn same(&self, a: usize, b: usize) -> bool {
+        self.hashes[a] == self.hashes[b] && self.get(a) == self.get(b)
     }
 }
 
@@ -308,10 +447,7 @@ fn resolve(
 /// and ordinals count the subtrees in order. Returns how many subtrees there are, the top's
 /// aside.
 fn check_nodes(nodes: &[[u32; 2]], symbols: usize) -> Result<usize, WireError> {
-    let mut stack = ENDS.replace(Stack::new());
-    let checked = check_nesting(nodes, symbols, stack.take());
-    ENDS.set(stack);
-    checked
+    with_kept(&ENDS, |ends| check_nesting(nodes, symbols, ends))
 }
 
 thread_local! {
@@ -408,13 +544,13 @@ fn check_spans(spans: &[[u32; 2]], wide: usize, parts: usize) -> Result<(), Wire
 }
 
 /// Checks each literal's suffix is a tail of its text, as a literal's methods slice it.
-fn check_literals(tree: Columns<'_>) -> Result<(), WireError> {
+fn check_literals(tree: Columns<'_>, symbols: &Texts<'_>) -> Result<(), WireError> {
     for (at, &row) in tree.nodes.iter().enumerate() {
         let node = Node::from_row(row);
         if node.tag() != LITERAL {
             continue;
         }
-        let text = tree.symbol(node.data).as_str();
+        let text = symbols.get(node.data as usize);
         let suffix = node.suffix_len() as usize;
         if suffix > text.len() || !text.is_char_boundary(text.len() - suffix) {
             return malformed("a literal's suffix longer than its text or inside a char", at);
@@ -423,12 +559,14 @@ fn check_literals(tree: Columns<'_>) -> Result<(), WireError> {
     Ok(())
 }
 
-/// Checks the columns are the builder's for these token trees, from indices alone, in the
-/// order the builder encodes (each node's span, then a subtree's closing one): each span uses a
-/// part already used or the next one, the parts are distinct, a span is wide exactly when it
-/// doesn't pack and the wide ones are in order, and each ident or literal has the index the
-/// builder's window gives its symbol. No span is unpacked and no part compared but once.
-fn check_canonical(tree: Columns<'_>) -> Result<(), WireError> {
+/// Checks the columns are the builder's for these token trees, from indices and the symbols'
+/// text, in the order the builder encodes (each node's span, then a subtree's closing one):
+/// each span uses a part already used or the next one, the parts are distinct, a span is wide
+/// exactly when it doesn't pack and the wide ones are in order, and each ident or literal has
+/// the index the builder's window gives its symbol. No span is unpacked and no part compared
+/// but once; a symbol's text is compared with the window's when it is new, its bytes only on
+/// an equal hash, so the compares cost at most a window's worth of each symbol's bytes.
+fn check_canonical(tree: Columns<'_>, texts: &Texts<'_>) -> Result<(), WireError> {
     let not = |what, at| Err(WireError::NotCanonical { what, at });
     let len = tree.nodes.len();
     let mut order = Order { parts: 0, wide: 0 };
@@ -445,17 +583,17 @@ fn check_canonical(tree: Columns<'_>) -> Result<(), WireError> {
             _ => {
                 let index = node.data as usize;
                 let from = symbols.saturating_sub(SYMBOL_WINDOW);
-                let symbol = tree.symbols[index];
                 if index == symbols {
-                    if tree.symbols[from..symbols].contains(&symbol) {
+                    if (from..symbols).any(|it| texts.same(it, index)) {
                         return not("a symbol again in its window", at);
                     }
                     symbols += 1;
-                } else if !(from..symbols).contains(&index)
-                    || tree.symbols[index + 1..symbols].contains(&symbol)
-                {
+                } else if !(from..symbols).contains(&index) {
                     return not("a symbol's index other than its latest in the window", at);
                 }
+                // An index in the window is its symbol's latest there with no compare: each
+                // symbol after it in the window had it in its own window when new, so none is
+                // the same text.
             }
         }
     }
@@ -465,7 +603,7 @@ fn check_canonical(tree: Columns<'_>) -> Result<(), WireError> {
     if order.wide != tree.wide.len() {
         return not("a wide span no span uses", order.wide);
     }
-    if symbols != tree.symbols.len() {
+    if symbols != texts.len() {
         return not("a symbol no node uses", symbols);
     }
     if has_duplicates(tree.parts) {

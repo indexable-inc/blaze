@@ -136,6 +136,8 @@ HARNESSES = [
     ("core", ["nativespans.py"], {}, on("linux", "macos"), 2),
     # A proc macro calls C its library's build script compiled, for wasm32 by Ubuntu's clang.
     ("core", ["wasmcmacro.py"], {}, on("linux"), 2),
+    # A proc macro's pair returns as WebAssembly, held to the MIR evaluator's and native code's.
+    ("core", ["wasmpairmacro.py"], {}, on("linux", "macos"), None),
     # A derive on what it cannot derive stops with the error the case names.
     ("core", ["deriveerrors.py"], {}, on("linux", "macos"), 2),
     ("core", ["worktrees.py"], {}, DAEMON, 2),
@@ -222,6 +224,8 @@ CORE = {
     "latelisted.py": 91,
     "tiers.py": 79,
     "coldbuild.py": 62,
+    # Not measured yet: two blaze builds of three small crates from nothing, as wasmcmacro.py.
+    "wasmpairmacro.py": 60,
     "doctestonce.py": 54,
     "testselect.py": 51,
     "fuzz/store.py": 240,

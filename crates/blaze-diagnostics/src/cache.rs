@@ -37,7 +37,7 @@ use std::sync::{Arc, OnceLock};
 use base_db::{Crate, Db};
 use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_ids::{ContentId, Hasher};
-use hir_def::deps::{Held, ImageBuf, ImageStore, absolute, crate_name};
+use hir_def::deps::{Held, ImageBuf, ImageStore, absolute};
 use hir_ty_borrowck::Mode;
 use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
@@ -53,14 +53,19 @@ mod tests;
 /// The domain of an outcome's key and of its encoding's version.
 pub const DOMAIN: &str = "blaze v2 dependency check outcome 1";
 
-/// The first bytes of an outcome: its encoding's name and version.
-const MAGIC: [u8; 4] = *b"BZC1";
+/// The first bytes of an outcome: its encoding's name and version. 2: [`ITEMS_BROKEN`] and
+/// [`ITEMS_SOUND`].
+const MAGIC: [u8; 4] = *b"BZC2";
 
-/// The header: [`MAGIC`], the flags (bit 0: the check failed), the count of diagnostics and the
-/// length of the body, each a `u32` LE.
+/// The header: [`MAGIC`], the flags (bit 0: the check failed; with it exactly one of bit 1, its
+/// items are broken, and bit 2, they are sound ([`crate::CrateCheck::items_broken`]); without
+/// it neither, so any one bit flipped is refused), the count of diagnostics and the length of
+/// the body, each a `u32` LE.
 const HEADER: usize = 16;
 
 const FAILED: u32 = 1;
+const ITEMS_BROKEN: u32 = 2;
+const ITEMS_SOUND: u32 = 4;
 
 /// What stands for the package directory and `OUT_DIR` in an outcome. No path or text the check
 /// writes holds a NUL ([`Refused::Nul`]).
@@ -143,16 +148,21 @@ pub fn image_key(db: &Db, krate: Crate) -> Option<ContentId> {
     hir_def::deps::image_of(db, krate).as_ref().map(|it| it.key())
 }
 
-/// A crate's check: its diagnostics in the order the check gives them, and whether it failed.
+/// A crate's check: its diagnostics in the order the check gives them, whether it failed, and
+/// whether its items are broken ([`crate::CrateCheck::items_broken`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outcome {
     pub failed: bool,
+    pub items_broken: bool,
     pub diags: Vec<Diag>,
 }
 
 impl Outcome {
-    pub fn new(diags: Vec<Diag>) -> Outcome {
-        Outcome { failed: diags.iter().any(Diag::is_error), diags }
+    /// The outcome of a check that gave `diags`, its items broken by an error outside every
+    /// body when `items_broken` (false unless something is an error).
+    pub fn new(diags: Vec<Diag>, items_broken: bool) -> Outcome {
+        let failed = diags.iter().any(Diag::is_error);
+        Outcome { failed, items_broken: failed && items_broken, diags }
     }
 }
 
@@ -399,9 +409,10 @@ fn walk_span<E>(span: &mut Span, f: &mut impl FnMut(Field, &mut String) -> Resul
     Ok(())
 }
 
-/// The outcome `diags` of a crate whose paths are `paths`, its spans' files named from `root`
+/// The outcome `diags` of a crate whose paths are `paths`, its items broken when
+/// `items_broken` ([`crate::CrateCheck::items_broken`]), its spans' files named from `root`
 /// ([`Files`]'s root), as the store keeps it.
-pub fn encode(diags: &[Diag], paths: &Paths, root: &str) -> Result<Vec<u8>, Refused> {
+pub fn encode(diags: &[Diag], items_broken: bool, paths: &Paths, root: &str) -> Result<Vec<u8>, Refused> {
     // clone: an outcome is written once per crate checked, its strings rewritten in a copy
     let mut portable: Vec<Diag> = diags.to_vec();
     for diag in &mut portable {
@@ -416,7 +427,11 @@ pub fn encode(diags: &[Diag], paths: &Paths, root: &str) -> Result<Vec<u8>, Refu
     let too_big = || Refused::Encode { why: "an outcome of 4 GiB or more".to_owned() };
     let count = u32::try_from(diags.len()).map_err(|_| too_big())?;
     let len = u32::try_from(body.len()).map_err(|_| too_big())?;
-    let flags = if diags.iter().any(Diag::is_error) { FAILED } else { 0 };
+    let flags = match diags.iter().any(Diag::is_error) {
+        true if items_broken => FAILED | ITEMS_BROKEN,
+        true => FAILED | ITEMS_SOUND,
+        false => 0,
+    };
     // alloc: as above
     let mut out = Vec::with_capacity(HEADER + body.len());
     out.put_bytes(&MAGIC);
@@ -427,9 +442,9 @@ pub fn encode(diags: &[Diag], paths: &Paths, root: &str) -> Result<Vec<u8>, Refu
     Ok(out)
 }
 
-/// The header of `bytes`: whether the check failed and how many diagnostics follow, its length
-/// checked against the bytes.
-fn header(bytes: &[u8]) -> Result<(bool, u32), &'static str> {
+/// The header of `bytes`: whether the check failed, whether its items are broken, and how many
+/// diagnostics follow, its length checked against the bytes.
+fn header(bytes: &[u8]) -> Result<(bool, bool, u32), &'static str> {
     let short = |_: cursor::Error| "shorter than its header";
     let mut read = Reader::new(bytes);
     if read.left() < HEADER {
@@ -439,8 +454,13 @@ fn header(bytes: &[u8]) -> Result<(bool, u32), &'static str> {
         return Err("not an outcome of this encoding");
     }
     let flags = read.u32().map_err(short)?;
-    if flags & !FAILED != 0 {
+    if flags & !(FAILED | ITEMS_BROKEN | ITEMS_SOUND) != 0 {
         return Err("flags it does not know");
+    }
+    match (flags & FAILED != 0, flags & (ITEMS_BROKEN | ITEMS_SOUND)) {
+        (true, ITEMS_BROKEN | ITEMS_SOUND) | (false, 0) => {}
+        (true, _) => return Err("a failed check that says not whether its items are broken, or says both"),
+        (false, _) => return Err("its items' state in a check that did not fail"),
     }
     let (count, len) = (read.u32().map_err(short)?, read.u32().map_err(short)?);
     if len as usize != read.left() {
@@ -450,7 +470,7 @@ fn header(bytes: &[u8]) -> Result<(bool, u32), &'static str> {
     if count > len {
         return Err("more diagnostics than bytes");
     }
-    Ok((flags & FAILED != 0, count))
+    Ok((flags & FAILED != 0, flags & ITEMS_BROKEN != 0, count))
 }
 
 /// The outcome in `bytes`, [`encode`]'s, its paths those `paths` gives (asked only when it has
@@ -458,7 +478,7 @@ fn header(bytes: &[u8]) -> Result<(bool, u32), &'static str> {
 /// only the bytes' hash.
 pub fn decode(bytes: &[u8], paths: impl FnOnce() -> Paths, root: &str) -> Result<Outcome, String> {
     // alloc: error text
-    let (failed, count) = header(bytes).map_err(str::to_owned)?;
+    let (failed, items_broken, count) = header(bytes).map_err(str::to_owned)?;
     if count == 0 {
         if failed {
             // alloc: error text
@@ -469,7 +489,7 @@ pub fn decode(bytes: &[u8], paths: impl FnOnce() -> Paths, root: &str) -> Result
             return Err("an outcome of no diagnostics whose body is not empty".to_owned());
         }
         // alloc: none, an empty `Vec` holds no buffer
-        return Ok(Outcome { failed, diags: Vec::new() });
+        return Ok(Outcome { failed, items_broken, diags: Vec::new() });
     }
     // alloc: an outcome with diagnostics, read once per crate per build
     let mut diags: Vec<Diag> = serde_json::from_slice(&bytes[HEADER..]).map_err(|why| format!("its body: {why}"))?;
@@ -488,7 +508,7 @@ pub fn decode(bytes: &[u8], paths: impl FnOnce() -> Paths, root: &str) -> Result
             Field::Text => paths.local_text(text),
         })?;
     }
-    Ok(Outcome { failed, diags })
+    Ok(Outcome { failed, items_broken, diags })
 }
 
 /// What [`serve`] found, over every call of a session: each adds to it.
@@ -661,7 +681,7 @@ pub fn serve(
         }
         for (&(krate, base), found) in asked.iter().zip(found) {
             let found = found.into_inner().unwrap_or_else(|| {
-                panic!("`ImageStore::for_each` did not run the task of crate {}", crate_name(db, krate))
+                panic!("`ImageStore::for_each` did not run the task of crate {}", krate.named(db))
             });
             served.outcomes.remove(&krate);
             let Some((check, part, outcome)) = found? else {
@@ -703,7 +723,7 @@ fn fetch(db: &Db, krate: Crate, base: ContentId, inputs: &Inputs<'_>, store: &dy
         store
             .get(&key)
             // alloc: error text
-            .map_err(|why| format!("reading the {what} of crate {} (key {key:?}): {why}", crate_name(db, krate)))
+            .map_err(|why| format!("reading the {what} of crate {} (key {key:?}): {why}", krate.named(db)))
     };
     let found = hir_def::deps::find_by_reads(db, krate, base, store, |at| {
         let Some(bytes) = get(at, "checked bodies")? else { return Ok(None) };
@@ -713,7 +733,7 @@ fn fetch(db: &Db, krate: Crate, base: ContentId, inputs: &Inputs<'_>, store: &dy
             Err(why) => Err(format!(
                 "the checked bodies of crate {} (key {at:?}) do not read: {why}; the store checked \
                  its bytes, so the key leaves out an input or the encoding wrote what it does not read",
-                crate_name(db, krate)
+                krate.named(db)
             )),
         }
     })?;
@@ -727,7 +747,7 @@ fn fetch(db: &Db, krate: Crate, base: ContentId, inputs: &Inputs<'_>, store: &dy
         return Err(format!(
             "the check outcome of crate {} (key {at:?}) does not read: {why}; the store checked \
              its bytes, so the key leaves out an input or the encoding wrote what it does not read",
-            crate_name(db, krate)
+            krate.named(db)
         ));
     }
     Ok(Some((check, part, outcome)))
@@ -741,7 +761,7 @@ pub fn read(db: &Db, served: &Served, krate: Crate, root: &str) -> Option<Result
         // alloc: error text
         format!(
             "the check outcome of crate {} (check key {:?}) does not read: {why}",
-            crate_name(db, krate),
+            krate.named(db),
             served.keys.get(&krate)
         )
     }))
@@ -757,6 +777,8 @@ pub struct Checked<'a> {
     pub inputs: Inputs<'a>,
     /// What the check gave, its spans' files named from [`store`]'s `root`.
     pub diags: &'a [Diag],
+    /// [`crate::CrateCheck::items_broken`].
+    pub items_broken: bool,
 }
 
 /// What [`store`] kept.
@@ -796,7 +818,7 @@ pub fn store(
     let (layers, left) = layers(db, by_crate.keys().copied(), &served.keys);
     for (krate, dep) in left {
         // alloc: why, once per crate refused
-        stored.refused.push((krate, Refused::Dependency { name: crate_name(db, dep) }));
+        stored.refused.push((krate, Refused::Dependency { name: dep.named(db).to_string() }));
     }
     // alloc: setup: once per session
     let mut keys = served.keys.clone();
@@ -810,7 +832,7 @@ pub fn store(
                     let dep = (krate.data(db).dependencies.iter())
                         .find(|dep| !keys.contains_key(&dep.crate_id))
                         // alloc: the refusal's crate name, on the refusal path
-                        .map_or_else(String::new, |dep| crate_name(db, dep.crate_id));
+                        .map_or_else(String::new, |dep| dep.crate_id.named(db).to_string());
                     stored.refused.push((krate, Refused::Dependency { name: dep }));
                 }
             }
@@ -823,7 +845,7 @@ pub fn store(
         });
         for ((check, _), made) in asked.iter().zip(made) {
             let made = made.into_inner().unwrap_or_else(|| {
-                panic!("`ImageStore::for_each` did not run the task of crate {}", crate_name(db, check.krate))
+                panic!("`ImageStore::for_each` did not run the task of crate {}", check.krate.named(db))
             });
             match made? {
                 Ok((key, outcome)) => {
@@ -848,7 +870,7 @@ fn keep(db: &Db, check: &Checked<'_>, deps: &[ContentId], root: &str, store: &dy
     let put = |at: ContentId, what: &str, bytes: Vec<u8>| {
         store.put(at, bytes).map_err(|why| {
             // alloc: error text
-            format!("keeping the {what} of crate {} (key {at:?}): {why}", crate_name(db, krate))
+            format!("keeping the {what} of crate {} (key {at:?}): {why}", krate.named(db))
         })
     };
     let reads = match hir_def::deps::checked_reads(db, krate) {
@@ -866,7 +888,7 @@ fn keep(db: &Db, check: &Checked<'_>, deps: &[ContentId], root: &str, store: &dy
         Err(why) => return Ok(Err(Refused::Reads(why))),
     };
     put(filed, "checked bodies", part)?;
-    let outcome = match encode(check.diags, &Paths::of(db, krate), root) {
+    let outcome = match encode(check.diags, check.items_broken, &Paths::of(db, krate), root) {
         Ok(bytes) => {
             put(key(filed, &check.inputs), "check outcome", bytes)?;
             None

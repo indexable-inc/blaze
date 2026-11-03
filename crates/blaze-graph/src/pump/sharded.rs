@@ -67,6 +67,11 @@ impl<V: Clone + Send + Sync + 'static> Sharded<V> {
 
     pub(super) fn get_or_run(&self, key: Key, run: impl FnOnce() -> Result<V, Cancelled>) -> Result<V, Cancelled> {
         sched::miss();
+        // As the table's: a task that gave way waits for that run first (`sched::before_claim`),
+        // so the oracle compares the two under one scheduler rule.
+        if let Err(stuck) = sched::before_claim() {
+            panic!("{stuck}; it asked for key {} next", hex(&key));
+        }
         let me = task(sched::job_here());
         loop {
             let waiter = Waiter { next: UnsafeCell::new(ptr::null()), value: UnsafeCell::new(None), state: AtomicU8::new(RUNNING) };
@@ -89,8 +94,11 @@ impl<V: Clone + Send + Sync + 'static> Sharded<V> {
                 entry.waiters.0 = ptr::from_ref(&waiter);
                 entry.flight
             };
-            let refused = waiter.state.load(Ordering::Acquire) == RUNNING && sched::wait(Wait::Key(flight(number))).is_err();
-            if refused {
+            if waiter.state.load(Ordering::Acquire) == RUNNING
+                && let Err(cycle) = sched::wait(Wait::Key(flight(number)))
+            {
+                // alloc: a give-way's record, rare
+                sched::gave_way_on(key, hex(&key).into_boxed_str(), flight(number), &cycle);
                 self.unlink(&key, &waiter);
                 return Err(give_way());
             }

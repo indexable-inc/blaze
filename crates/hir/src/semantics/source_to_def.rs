@@ -117,19 +117,29 @@ pub(super) struct SourceToDefCache<'db> {
     pub(super) within: Option<Arc<HashSet<Crate, Global>>>,
 }
 
-/// The crates `file` may be a module of: those `within` first, then the others. The file of a
-/// package is in the source root of each of its targets, and each would otherwise have its
-/// module tree built.
+/// The crates `file` may be a module of, asked in two rounds. `first`: each crate `within`, in
+/// the order of their IDs, whether or not the file is in its source root, as a `#[path]`
+/// module may be a file of another package's source root (`#[path = "../../b/tests/m.rs"]
+/// mod m;`), which [`relevant_crates`] (the crates of the file's own source root) leaves out.
+/// Then the crates of the file's source root not `within`: the file of a package is in the
+/// source root of each of its targets, and each would otherwise have its module tree built.
 fn crates_of<'a>(
     db: &'a Db,
     within: Option<&'a HashSet<Crate, Global>>,
     file: FileId,
     first: bool,
 ) -> impl Iterator<Item = Crate> + 'a {
-    relevant_crates(db, file)
-        .iter()
-        .copied()
-        .filter(move |it| within.is_some_and(|within| within.contains(it)) == first)
+    let mut chosen: SmallVec<[Crate; 2]> = SmallVec::new();
+    if first && let Some(within) = within {
+        chosen.extend(within.iter().copied());
+        chosen.sort_unstable();
+    }
+    let others = match first {
+        true => &[][..],
+        false => relevant_crates(db, file),
+    };
+    let others = others.iter().copied().filter(move |it| !within.is_some_and(|within| within.contains(it)));
+    chosen.into_iter().chain(others)
 }
 
 impl<'db> SourceToDefCache<'db> {
@@ -193,6 +203,16 @@ impl<'db> SourceToDefCtx<'db, '_> {
             self.cache.file_to_def_cache.insert(file, mods);
         }
         &self.cache.file_to_def_cache[&file]
+    }
+
+    /// Every crate `file` may be a module of, in the order [`Self::file_to_def`] asks them.
+    pub(super) fn crates_of(&self, file: FileId) -> SmallVec<[Crate; 4]> {
+        let within = self.cache.within.as_deref();
+        let mut crates = SmallVec::new();
+        for first in [true, false] {
+            crates.extend(crates_of(self.db, within, file, first));
+        }
+        crates
     }
 
     /// The first module of `file` in `krate`, whether or not `krate` is `within`.

@@ -23,6 +23,8 @@ blaze-source.workspace = true
 # The index's lines and `[source]` replacement, read as the load reads them.
 blaze-units.workspace = true
 parking_lot.workspace = true
+# `PackageCacheLock`'s file lock, let go of as it drops.
+stdx.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true

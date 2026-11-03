@@ -202,5 +202,6 @@ pub(super) fn def_variant(def: SolverDefId<'_>) -> u32 {
         SolverDefId::EnumVariantId(_) => 15,
         SolverDefId::Ctor(Ctor::Struct(_)) => 16,
         SolverDefId::Ctor(Ctor::Enum(_)) => 17,
+        SolverDefId::RpititId(_) => 18,
     }
 }

@@ -31,7 +31,7 @@ fn with_db<T>(fixture: &str, check: impl FnOnce(&TestDB) -> T) -> T {
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || check(&db))
+    blaze_query::db::attach(&db, || check(&db))
 }
 
 #[track_caller]

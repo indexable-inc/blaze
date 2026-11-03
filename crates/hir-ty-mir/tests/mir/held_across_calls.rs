@@ -32,7 +32,7 @@ fn a_call_holds_what_is_used_after_it_or_borrowed_before_it() {
     let fx = fixture::db(WORK);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let body = db.mir_body(function(&db, "work").into()).expect("the body");
         let calls: Vec<_> = (body.basic_blocks.iter())
             .filter(|(_, block)| {

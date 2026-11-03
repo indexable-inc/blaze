@@ -1637,7 +1637,7 @@ mod tests {
     }
 
     fn projection<'db>(is_rigid: IsRigid) -> Ty<'db> {
-        let def_id = TraitAssocTyId(id::<TypeAliasId>(1));
+        let def_id = TraitAssocTyId::from(id::<TypeAliasId>(1));
         let args = GenericArgs::new_from_slice(&[GenericArg::from(u8_ty())]);
         Ty::intern(TyKind::Alias(
             is_rigid,

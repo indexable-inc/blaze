@@ -125,6 +125,56 @@ pub fn db_with_proc_macros(
     build(fixture, extra)
 }
 
+/// Sets the file at `path` (absolute, as a fixture names its files) to `bytes`, as a checkout's
+/// loader sets a file of its view ([`Db::set_view_root`]), which a fixture's text cannot: bytes
+/// that are not UTF-8 are a file with no text whose bytes are its input. A file new to the
+/// view goes into the source root of the other files of its directory; every file of that
+/// directory is left as it is.
+#[track_caller]
+pub fn set_bytes(db: &mut Db, path: &str, bytes: &[u8]) -> FileId {
+    let path = AbsPathBuf::try_from(path).unwrap_or_else(|_| panic!("`{path}` is not absolute"));
+    let dir = path.parent().unwrap_or_else(|| panic!("`{path}` has no directory")).to_path_buf();
+    // Every file of the database under `dir`, with its bytes as the view has them now.
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut other = None;
+    let mut roots: Vec<SourceRootId> =
+        LocalRoots::get(&*db).roots(&*db).iter().chain(LibraryRoots::get(&*db).roots(&*db)).copied().collect();
+    roots.sort_unstable_by_key(|it| it.0);
+    for id in roots {
+        let set = db.source_root(id).source_root(&*db);
+        for file in set.iter() {
+            let Some(rel) = set.path_for_file(&file).and_then(|it| it.as_path()?.strip_prefix(&dir)) else {
+                continue;
+            };
+            let bytes = match (db.has_file_text(file), db.raw_file(file)) {
+                (true, _) => db.file_text(file).text(&*db).as_bytes().to_vec(),
+                (false, Some(raw)) => raw.bytes(&*db).expect("the loader sets the bytes it read").to_vec(),
+                (false, None) => continue,
+            };
+            other.get_or_insert(id);
+            files.push((rel.as_str().to_owned(), bytes));
+        }
+    }
+    let other = other.unwrap_or_else(|| panic!("no file of the fixture is in `{dir}`, so `{path}` has no source root"));
+    let name = path.file_name().expect("a file's path has a name").to_owned();
+    files.retain(|(rel, _)| *rel != name);
+    files.push((name, bytes.to_vec()));
+    let bytes: Vec<blaze_vfs::Bytes> =
+        files.iter().map(|(_, it)| blaze_vfs::Bytes::from(sync::Arc::<[u8]>::from(it.as_slice()))).collect();
+    let view: Vec<ViewFile<'_>> = files
+        .iter()
+        .zip(&bytes)
+        .map(|((rel, _), bytes)| ViewFile { path: rel, id: ContentId::of(blaze_vfs::FILE_DOMAIN, bytes), bytes })
+        .collect();
+    let partition = Default::default();
+    let change = db
+        .set_view_root(ViewRoot { base: &dir, built: &[], partition: &partition, other, files: &view })
+        .unwrap_or_else(|error| panic!("`{path}`: {error}"));
+    assert!(change.removed.is_empty(), "setting `{path}` removed {:?}", change.removed);
+    let set = db.source_root(other).source_root(&*db);
+    *set.file_for_path(&VfsPath::from(path.clone())).unwrap_or_else(|| panic!("`{path}` is in no source root"))
+}
+
 /// The crate a fixture is about: the first crate of the graph that is neither a language crate
 /// nor a dependency of another (`ra_test_fixture` for a fixture that names no crate). The graph
 /// lists a crate's dependencies before it, so the first that is not a language crate would be

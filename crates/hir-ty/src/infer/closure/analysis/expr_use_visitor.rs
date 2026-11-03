@@ -16,6 +16,7 @@ use hir_def::{
         PatId, RecordLitField, RecordSpread, Statement, UnsafeBinderCastKind,
     },
     resolver::ValueNs,
+    signatures::VariantFields,
     upvars::UpvarsRef,
 };
 use macros::{TypeFoldable, TypeVisitable};
@@ -1070,7 +1071,11 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
                 let adt_field_types = self.cx.db.field_types(adt.into());
                 // Consume those fields of the with expression that are needed.
                 for (f_index, with_field) in adt_fields.iter() {
-                    let is_mentioned = fields.iter().any(|f| f.name == with_field.name);
+                    let is_mentioned = fields.iter().any(|f| {
+                        let hygiene = self.cx.store.record_field_hygiene(f.expr);
+                        VariantFields::name_written(self.cx.db, adt.into(), f.name, hygiene)
+                            == with_field.name
+                    });
                     if !is_mentioned {
                         let field_place = self.cat_projection(
                             with_expr.into(),
@@ -1984,7 +1989,10 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
 
                 for fp in field_pats {
                     let field_ty = self.pat_ty_adjusted(fp.pat)?;
-                    let field_index = fields.field(&fp.name).ok_or(ErrorGuaranteed)?;
+                    let hygiene = self.cx.store.record_field_hygiene(fp.pat);
+                    let field_index = fields
+                        .field_written(self.cx.db, variant, &fp.name, hygiene)
+                        .ok_or(ErrorGuaranteed)?;
 
                     let field_place = self.cat_projection(
                         pat.into(),

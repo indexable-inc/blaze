@@ -981,6 +981,8 @@ struct Model {
     cancelled: HashSet<u32, Global>, // alloc: a test's model
     /// The requests idle now.
     idle: HashSet<u32, Global>, // alloc: a test's model
+    /// The requests that keep going past a failure.
+    keep_going: HashSet<u32, Global>, // alloc: a test's model
     /// The running tasks asked to give way, by the node they run as.
     yielding: HashSet<u32, Global>, // alloc: a test's model
     /// How many `Run`s each request was said, less those that gave way.
@@ -1015,8 +1017,14 @@ impl Model {
         priority
     }
 
-    fn done_well(&self, id: u32) -> bool {
-        matches!(self.states.get(&id), Some(NodeState::Built | NodeState::Cached { .. }))
+    /// Whether `dep` is done so that `of` may run: built or cached, or failed open
+    /// ([`Outcome::FailedOpen`], said as "open") with `of`'s request keeping going.
+    fn done_well(&self, dep: u32, of: u32) -> bool {
+        match self.states.get(&dep) {
+            Some(NodeState::Built | NodeState::Cached { .. }) => true,
+            Some(NodeState::Failed { why }) => why == "open" && self.keep_going.contains(&self.request_of[&of]),
+            _ => false,
+        }
     }
 
     /// Takes the outputs of one step, checking each; `holding` is the node the plane said held
@@ -1053,13 +1061,14 @@ impl Model {
                         if matches!(state, NodeState::Running | NodeState::Ready) {
                             for dep in &self.specs[id].deps {
                                 assert!(
-                                    self.done_well(dep.0),
+                                    self.done_well(dep.0, *id),
                                     "seed {seed}: #{id} {state:?} before #{dep} is done"
                                 );
                             }
                         }
                         if let NodeState::Failed { why } = state
                             && why != "boom"
+                            && why != "open"
                         {
                             let spec = &self.specs[id];
                             assert!(why.starts_with(&spec.name), "seed {seed}: {why}");
@@ -1107,7 +1116,7 @@ impl Model {
                         .unwrap_or(0);
                     assert_eq!(*critical, mine >= most, "seed {seed}: #{id} at {mine}, most {most}");
                     for dep in &spec.deps {
-                        assert!(self.done_well(dep.0), "seed {seed}: #{id} runs before #{dep}");
+                        assert!(self.done_well(dep.0, id.0), "seed {seed}: #{id} runs before #{dep}");
                     }
                     if let Some(key) = spec.key {
                         assert!(self.running_keys.insert(key), "seed {seed}: {key:?} runs twice");
@@ -1211,7 +1220,7 @@ impl Model {
         self.granted -= spec.memory;
         let key = spec.key?;
         self.running_keys.remove(&key);
-        (keep_failure || !matches!(outcome, Outcome::Failed { .. })).then(|| (key, outcome.clone()))
+        (keep_failure || !matches!(outcome, Outcome::Failed { .. } | Outcome::FailedOpen { .. })).then(|| (key, outcome.clone()))
     }
 
     /// A running task gave way: it holds nothing, runs no key, and was no start.
@@ -1451,6 +1460,9 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
                 if it.idle {
                     model.idle.insert(r as u32);
                 }
+                if it.keep_going {
+                    model.keep_going.insert(r as u32);
+                }
                 let outputs = driver.act(Act::Step(open), next_id);
                 if release {
                     assert!(driver.act(Act::Release(request), next_id).is_empty());
@@ -1493,6 +1505,7 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
                 let outcome = match random.below(10) {
                     0 => Outcome::Failed { why: "boom".to_owned() },
                     1 => Outcome::Cached { remote: random.one_in(2) },
+                    2 => Outcome::FailedOpen { why: "open".to_owned() },
                     _ => Outcome::Built,
                 };
                 let r = model.request_of[&id];
@@ -1720,6 +1733,8 @@ fn batches_in_any_order_and_refused_ones_match_the_reference() {
                 at += 1 + random.below(3);
                 let outcome = if random.one_in(8) {
                     Outcome::Failed { why: "no".to_owned() }
+                } else if random.one_in(8) {
+                    Outcome::FailedOpen { why: "open".to_owned() }
                 } else {
                     Outcome::Built
                 };
@@ -2014,4 +2029,31 @@ fn a_busy_idle_request_does_not_delay_the_foreground() {
         said
     };
     assert_eq!(said(&theirs), said(&mine));
+}
+
+/// A failure that leaves what waits for it to run: under keep-going its dependents run, one
+/// added after it settled included, and the request still fails; without keep-going it stops
+/// the request as any failure does.
+#[test]
+fn an_open_failure_runs_its_dependents_only_under_keep_going() {
+    let open_failure = || Outcome::FailedOpen { why: "bodies failed".to_owned() };
+    let mut plane = Plane::new(config(1, 1)).unwrap();
+    open(&mut plane, 1, 1, true);
+    assert_eq!(runs(&add(&mut plane, 1, vec![work(1, &[], 1), work(2, &[1], 1)])), [1]);
+    close(&mut plane, 1);
+    let out = plane.step(done(1, open_failure(), Vec::new())).unwrap();
+    assert_eq!(runs(&out), [2]);
+    assert_eq!(plane.state(NodeId(1)), Some(&NodeState::Failed { why: "bodies failed".to_owned() }));
+    let out = plane.step(done(2, Outcome::Built, vec![work(3, &[1], 1)])).unwrap();
+    assert_eq!(runs(&out), [3]);
+    assert_eq!(finished(&built(&mut plane, 3)), [(1, false)]);
+
+    let mut plane = Plane::new(config(1, 1)).unwrap();
+    open(&mut plane, 1, 1, false);
+    assert_eq!(runs(&add(&mut plane, 1, vec![work(1, &[], 1), work(2, &[1], 1)])), [1]);
+    close(&mut plane, 1);
+    let out = plane.step(done(1, open_failure(), Vec::new())).unwrap();
+    assert_eq!(runs(&out), Vec::<u32>::new());
+    assert_eq!(moves(&out)[1..], [(2, NodeState::Skipped { because: 1 })]);
+    assert_eq!(finished(&out), [(1, false)]);
 }

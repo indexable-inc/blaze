@@ -500,7 +500,7 @@ fn close_single(bytes: &[u8], i: usize) -> Option<usize> {
 fn clean_str(text: &str, mode: Mode) -> bool {
     let mut clean = true;
     let mut check = |error: Option<rustc_literal_escaper::EscapeError>| {
-        clean &= error.is_none_or(|e| err_to_msg(e, mode).is_empty());
+        clean &= error.is_none_or(|e| err_to_msg(&e, mode).is_empty());
     };
     match mode {
         Mode::ByteStr => unescape_byte_str(text, |_, it| check(it.err())),
@@ -542,7 +542,7 @@ fn lifetime_or_char(text: &str, at: usize, classes: &Classes<'_>) -> Option<(Syn
     let end = suffix_end(bytes, close + 1, classes)?;
     unescape_char(&text[at + 1..close])
         .err()
-        .is_none_or(|e| err_to_msg(e, Mode::Char).is_empty())
+        .is_none_or(|e| err_to_msg(&e, Mode::Char).is_empty())
         .then_some((SyntaxKind::CHAR, end - at))
 }
 
@@ -576,7 +576,7 @@ fn prefixed(text: &str, at: usize, classes: &Classes<'_>) -> Option<(SyntaxKind,
             let end = suffix_end(bytes, close + 1, classes)?;
             unescape_byte(&text[run + 1..close])
                 .err()
-                .is_none_or(|e| err_to_msg(e, Mode::Byte).is_empty())
+                .is_none_or(|e| err_to_msg(&e, Mode::Byte).is_empty())
                 .then_some((SyntaxKind::BYTE, end - at))
         }
         _ => None,

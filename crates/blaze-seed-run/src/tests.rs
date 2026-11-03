@@ -91,7 +91,7 @@ fn a_memory64_module_reaches_args_env_clock_stdout_and_files_through_the_64_bit_
 /// the whole: 50 blocks of 2 MiB, 20 GiB apart, every 4 KiB. Whole aligned 2 MiB blocks hold the
 /// same with transparent huge pages or without. Then it touches 64 MiB more at the end,
 /// decommits them through the runner, reads them back as zeros and decommits them again (the
-/// reads map zero pages, which count as resident). Last it decommits 8 unaligned bytes over a
+/// reads map zero pages, which count as held). Last it decommits 8 unaligned bytes over a
 /// word of 0xff inside the first block, checking only those went to zero.
 const TEBIBYTE: &str = r#"
 (module
@@ -136,13 +136,13 @@ const TEBIBYTE: &str = r#"
 fn a_seed_grown_to_a_tebibyte_that_touches_100_mib_holds_about_100_mib() {
     const MIB: u64 = 1 << 20;
     let exit = run(&wat::parse_str(TEBIBYTE).unwrap(), &config(&["seed"], &[])).unwrap();
-    let Exit { code, memory_bytes, resident_bytes } = exit;
+    let Exit { code, memory_bytes, held_bytes } = exit;
     assert_eq!(code, 0);
     assert_eq!(memory_bytes, ((1 << 24) + 1) * 65536);
     assert!(
-        (100 * MIB..=102 * MIB).contains(&resident_bytes),
-        "a 1 TiB memory with 100 MiB touched holds {resident_bytes} bytes ({} MiB)",
-        resident_bytes / MIB
+        (100 * MIB..=102 * MIB).contains(&held_bytes),
+        "a 1 TiB memory with 100 MiB touched holds {held_bytes} bytes ({} MiB)",
+        held_bytes / MIB
     );
 }
 
@@ -171,9 +171,9 @@ fn sparse_touches_hold_a_host_page_each_not_a_huge_page() {
     assert_eq!((exit.code, exit.memory_bytes), (0, 256 << 20));
     let touched = 4096 * page;
     assert!(
-        (touched..=touched + (1 << 20)).contains(&exit.resident_bytes),
+        (touched..=touched + (1 << 20)).contains(&exit.held_bytes),
         "4096 touches of {page}-byte pages hold {} bytes, not about {touched}",
-        exit.resident_bytes
+        exit.held_bytes
     );
 }
 

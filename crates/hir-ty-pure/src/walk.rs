@@ -575,7 +575,7 @@ struct Walk<'a, 'db> {
     trusted_calls: SmallVec<[FunctionId; 2]>,
     dropped: HashSet<Ty<'db>, Global>,
     statics: HashSet<StaticId, Global>,
-    code: HashMap<(Ty<'db>, bool), bool, Global>,
+    code: HashMap<(Ty<'db>, Reach), bool, Global>,
 }
 
 fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>) -> Summary {
@@ -941,7 +941,7 @@ pub(crate) fn fn_item_path(db: &Db, func: FunctionId) -> String {
     };
     let path = path.or_else(|| {
         let args = GenericArgs::identity_for_item(DbInterner::new_no_crate(db), func.into());
-        hir_ty::attach_db(db, || hir_ty_mir::mir::type_name::rustc_function_name(db, func, args.as_slice()))
+        blaze_query::db::attach(db, || hir_ty_mir::mir::type_name::rustc_function_name(db, func, args.as_slice()))
     });
     path.unwrap_or_else(|| name.to_owned()) // alloc: an impure script's reason
 }
@@ -1050,7 +1050,7 @@ impl<'a, 'db> Walk<'a, 'db> {
         if !script && self.kinds.full.has(rule) {
             return;
         }
-        let what = hir_ty::attach_db(self.cx.db, what);
+        let what = blaze_query::db::attach(self.cx.db, what);
         self.observe(EffectSet::one(rule), &what);
         if script {
             self.own = Some(what);
@@ -1520,13 +1520,27 @@ impl<'a, 'db> Walk<'a, 'db> {
     }
 
     /// A transmute that makes a function pointer or vtable of what is not one.
+    ///
+    /// Of a value with no pointer in it (a number), the pointers made have no provenance:
+    /// reading memory through one is undefined behavior (the pinned `mem::transmute`: "Doing
+    /// non-zero-sized memory accesses with a pointer constructed this way is currently
+    /// considered undefined behavior"), so no code is reached through them, and only a
+    /// function pointer or vtable in the result's own bytes is made of bytes. That is
+    /// `fmt::Arguments::from_str`, which every `unsafe` precondition check's message goes
+    /// through: it packs a `&'static str`'s length into its `NonNull<rt::Argument>`, a pointer
+    /// to arguments holding function pointers, and makes no code.
     fn transmute(&mut self, from: Ty<'db>, to: Ty<'db>) {
         let pointer = |ty: Ty<'db>| matches!(ty.kind(), TyKind::RawPtr(..) | TyKind::Ref(..) | TyKind::FnPtr(..));
         let number = |ty: Ty<'db>| matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_));
         if self.workspace && pointer(self.cx.normalize(from)) && number(self.cx.normalize(to)) {
             self.observe(EffectSet::one(Rule::Address), "transmutes a pointer to a number, which observes its address");
         }
-        if self.code(to, false) && !self.code(from, false) {
+        let made = if self.pointerless(from) {
+            self.code(to, Reach::Own)
+        } else {
+            self.code(to, Reach::Pointees) && !self.code(from, Reach::Pointees)
+        };
+        if made {
             let (from, to) = (self.cx.shown(from), self.cx.shown(to));
             self.refuse_with(Rule::Unchecked, || {
                 format!("transmutes `{from}` to `{to}`, a function pointer or vtable made of bytes") // alloc: an impure script's reason
@@ -1574,7 +1588,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             OperandKind::Static(id) => self.static_use(*id),
             OperandKind::Constant { konst, ty } => {
                 let (konst, ty) = (konst.as_ref(), ty.as_ref());
-                if matches!(konst.kind(), ConstKind::Alias(..)) && self.code(ty, true) {
+                if matches!(konst.kind(), ConstKind::Alias(..)) && self.code(ty, Reach::Raw) {
                     match evaluate(cx.db, &cx.infcx, cx.env, konst) {
                         Ok(value) => self.allocation(&value, ty),
                         Err(error) => self.refuse_with(Rule::Unchecked, || format!("uses a constant that holds pointers: {error}")), // alloc: an impure script's reason
@@ -1583,7 +1597,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             OperandKind::Allocation { allocation } => {
                 let value = allocation.as_ref();
-                if self.code(value.ty, true) {
+                if self.code(value.ty, Reach::Raw) {
                     self.allocation(&value, value.ty);
                 }
             }
@@ -1619,7 +1633,7 @@ impl<'a, 'db> Walk<'a, 'db> {
         if !is_freeze(&cx.infcx, ty, cx.env.param_env) {
             return self.refuse_with(Rule::MutableState, || format!("reads `{}`, a static with interior mutability", name())); // alloc: an impure script's reason
         }
-        if self.code(ty, true) {
+        if self.code(ty, Reach::Raw) {
             match db.const_eval_static(id) {
                 Ok(value) => self.allocation(&value, ty),
                 Err(error) => self.refuse_with(Rule::Unchecked, || format!("reads `{}`, whose value does not evaluate: {error:?}", name())), // alloc: an impure script's reason
@@ -1638,7 +1652,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             return;
         }
         let mut dyns: SmallVec<[Ty<'db>; 2]> = SmallVec::new();
-        self.scan(ty, true, &mut HashSet::new_in(Global), &mut dyns);
+        self.scan(ty, Reach::Raw, &mut HashSet::new_in(Global), &mut dyns);
         for (pointee, entry_dyn) in map.vtable.entries() {
             // A vtable's id names its `dyn` type, as rustc's `GlobalAlloc::VTable` does.
             if let Some(dyn_ty) = entry_dyn {
@@ -1701,21 +1715,20 @@ impl<'a, 'db> Walk<'a, 'db> {
         }
     }
 
-    /// Whether a value of `ty` may hold a function pointer or vtable; `raw`: or a raw pointer,
-    /// which may be one cast.
-    fn code(&mut self, ty: Ty<'db>, raw: bool) -> bool {
-        if let Some(&known) = self.code.get(&(ty, raw)) {
+    /// Whether a value of `ty` may hold a function pointer or vtable, where `reach` says.
+    fn code(&mut self, ty: Ty<'db>, reach: Reach) -> bool {
+        if let Some(&known) = self.code.get(&(ty, reach)) {
             return known;
         }
-        let holds = self.scan(ty, raw, &mut HashSet::new_in(Global), &mut SmallVec::new());
-        self.code.insert((ty, raw), holds);
+        let holds = self.scan(ty, reach, &mut HashSet::new_in(Global), &mut SmallVec::new());
+        self.code.insert((ty, reach), holds);
         holds
     }
 
     fn scan(
         &self,
         ty: Ty<'db>,
-        raw: bool,
+        reach: Reach,
         seen: &mut HashSet<Ty<'db>, Global>,
         dyns: &mut SmallVec<[Ty<'db>; 2]>,
     ) -> bool {
@@ -1730,21 +1743,26 @@ impl<'a, 'db> Walk<'a, 'db> {
                 dyns.push(ty);
                 true
             }
-            TyKind::RawPtr(pointee, _) => self.scan(pointee, raw, seen, dyns) | raw,
-            TyKind::Ref(_, pointee, _) | TyKind::Pat(pointee, _) => self.scan(pointee, raw, seen, dyns),
-            TyKind::Array(element, _) | TyKind::Slice(element) => self.scan(element, raw, seen, dyns),
+            TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) if reach == Reach::Own => {
+                self.vtable_metadata(pointee)
+            }
+            TyKind::RawPtr(pointee, _) => {
+                self.scan(pointee, reach, seen, dyns) | (reach == Reach::Raw)
+            }
+            TyKind::Ref(_, pointee, _) | TyKind::Pat(pointee, _) => self.scan(pointee, reach, seen, dyns),
+            TyKind::Array(element, _) | TyKind::Slice(element) => self.scan(element, reach, seen, dyns),
             TyKind::Tuple(fields) => {
-                fields.iter().fold(false, |any, it| self.scan(it, raw, seen, dyns) | any)
+                fields.iter().fold(false, |any, it| self.scan(it, reach, seen, dyns) | any)
             }
             TyKind::Closure(_, args) => {
-                self.scan(args.as_closure().tupled_upvars_ty(), raw, seen, dyns)
+                self.scan(args.as_closure().tupled_upvars_ty(), reach, seen, dyns)
             }
             TyKind::Adt(def, args) => {
                 let mut any = false;
                 for variant in variants(cx.db, def.def_id()) {
                     for (_, field) in cx.db.field_types(variant).iter() {
                         let field = field.ty().instantiate(cx.interner, args).skip_norm_wip();
-                        any |= self.scan(field, raw, seen, dyns);
+                        any |= self.scan(field, reach, seen, dyns);
                     }
                 }
                 any
@@ -1761,6 +1779,41 @@ impl<'a, 'db> Walk<'a, 'db> {
             _ => true,
         }
     }
+
+    /// Whether a pointer to `pointee` carries a vtable as its metadata: its unsized tail is a
+    /// `dyn`, or may be one (a parameter or alias not known to be sized). A tail is never
+    /// cyclic: an unsized struct holding itself would have no size.
+    fn vtable_metadata(&self, pointee: Ty<'db>) -> bool {
+        let cx = self.cx;
+        let pointee = cx.normalize(pointee);
+        if cx.infcx.type_is_sized_modulo_regions(cx.env.param_env, pointee) {
+            return false;
+        }
+        match pointee.kind() {
+            TyKind::Dynamic(..) => true,
+            TyKind::Slice(_) | TyKind::Str | TyKind::Foreign(_) => false,
+            TyKind::Tuple(fields) => fields.iter().last().is_some_and(|tail| self.vtable_metadata(tail)),
+            TyKind::Adt(def, args) => match def.def_id() {
+                AdtId::StructId(id) => cx.db.field_types(id.into()).iter().last().is_some_and(|(_, tail)| {
+                    self.vtable_metadata(tail.ty().instantiate(cx.interner, args).skip_norm_wip())
+                }),
+                AdtId::EnumId(_) | AdtId::UnionId(_) => false,
+            },
+            _ => true,
+        }
+    }
+}
+
+/// Where `Walk::code` looks for a function pointer or vtable in a value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Reach {
+    /// The value's own bytes only: a function pointer, or the vtable of a wide pointer. What a
+    /// pointer without provenance can give, since nothing is reached through it.
+    Own,
+    /// Its own bytes and what its references and raw pointers point to.
+    Pointees,
+    /// Those, and any raw pointer itself, which may be a function pointer cast.
+    Raw,
 }
 
 /// Whether an intrinsic other than `const_eval_select`, a transmute, `read_via_copy` and

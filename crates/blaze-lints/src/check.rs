@@ -74,7 +74,7 @@ pub type NameOf<'a> = &'a dyn Fn(base_db::FileId) -> Option<String>;
 /// crate, or of a span a lint gives, that `name_of` does not name is the error: its lints are
 /// never left out.
 pub fn check(db: &Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -> Result<Vec<Found>, diag::CheckError> {
-    hir::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let levels = Levels::new(&setup.command_line);
         let mut driver = Driver::new(db, krate, setup, name_of, lints::command_line_on(&levels));
         driver.run()?;

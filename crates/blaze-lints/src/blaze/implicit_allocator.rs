@@ -495,8 +495,9 @@ fn message(db: &Db, what: &Implicit, item: &str, verb: &str, shown: &str) -> Str
 fn note(what: &Implicit) -> String {
     let note = match what {
         Implicit::Default { .. } => {
-            "`blaze_mem::Frame` (a task's) and `blaze_mem::ArenaLocal` (a request's) implement \
-             `Allocator`: `Vec<T, &Frame>`, `Box<T, &Frame>`, and `blaze_mem::frame::collect(frame, iter)` \
+            "`blaze_mem::Frame` (a task's), `blaze_mem::ArenaLocal` (a request's) and `blaze_mem::Kept(tag)` \
+             (an image value that outlives requests and is freed on its own) implement `Allocator`: \
+             `Vec<T, &Frame>`, `Box<T, &Frame>`, `Arc<[u8], Kept>`, and `blaze_mem::frame::collect(frame, iter)` \
              for a `collect()`"
         }
         Implicit::Heap { heap: Heap::String, .. } => {

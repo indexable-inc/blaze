@@ -57,7 +57,7 @@ use hir_def::{
     GenericDefId, GenericParamId, HasModule, ItemContainerId, LocalFieldId, Lookup, TraitId,
     TupleFieldId, TupleId, VariantId,
     attrs::AttrFlags,
-    expr_store::{Body, ComptimeForm, ExpressionStore, HygieneId, body::Param, path::Path},
+    expr_store::{Body, ComptimeForm, ExpressionStore, body::Param, path::Path},
     hir::{
         BinaryOp, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked, LabelId, PatId, UnaryOp,
     },
@@ -210,9 +210,18 @@ pub(crate) fn infer_body_in<'db>(
         }
     }
 
-    ctx.infer_body(body.root_expr());
-
-    ctx.infer_mut_body(body.root_expr());
+    // rustc's `typeck` is never asked about a fn with no body (a required trait method, a
+    // foreign fn): its signature is all there is, and wfcheck checks that. Coercing the missing
+    // body to the return type would leave the return type's `impl Trait`s to infer from nothing
+    // (`fn d(self) -> Option<impl Sized>;` was E0282 at the item).
+    let has_body = match def {
+        DefWithBodyId::FunctionId(f) => FunctionSignature::of(db, f).has_body(),
+        _ => true,
+    };
+    if has_body {
+        ctx.infer_body(body.root_expr());
+        ctx.infer_mut_body(body.root_expr());
+    }
 
     infer_finalize(ctx)
 }
@@ -3212,8 +3221,16 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     /// is.
     pub(crate) fn make_path_as_const(&mut self, path: Path<'_>, site: TypeRefId) -> Const<'db> {
         let forbid_params_after = if self.allow_using_generic_params { None } else { Some(0) };
-        path_to_const(self.db, &self.resolver, &|| self.generics(), forbid_params_after, path)
-            .unwrap_or_else(|reason| self.invalid_const_arg(site.into(), reason))
+        let hygiene = self.store.type_path_hygiene(site);
+        path_to_const(
+            self.db,
+            &self.resolver,
+            &|| self.generics(),
+            forbid_params_after,
+            path,
+            hygiene,
+        )
+        .unwrap_or_else(|reason| self.invalid_const_arg(site.into(), reason))
     }
 
     /// The error const of a const argument at `site` that is none, reported for `reason`, as
@@ -3637,10 +3654,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             }
         }
 
-        let mut path_ctx = ctx.at_path(path, node);
+        // The path's own hygiene: a generic parameter it names is looked up by its macros 2.0
+        // key (`hir_def::nameres::param_name`).
+        let hygiene = self.store.expr_or_pat_path_hygiene(node.unpack());
+        let mut path_ctx = ctx.at_path(path, node).with_hygiene(hygiene);
         let interner = path_ctx.interner();
         let (resolution, unresolved) = if value_ns {
-            let Some(res) = path_ctx.resolve_path_in_value_ns(HygieneId::ROOT) else {
+            let Some(res) = path_ctx.resolve_path_in_value_ns(hygiene) else {
                 if let Some((ns, None, _)) = self.resolver.resolve_path_in_type_ns(self.db, path)
                     && let Some(def) = struct_path_def(ns)
                 {

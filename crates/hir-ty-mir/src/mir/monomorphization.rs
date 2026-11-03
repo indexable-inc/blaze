@@ -24,10 +24,8 @@ use crate::{
     traits::StoredParamEnvAndCrate,
 };
 use crate::{
-    db::{HirDatabase, InternedOpaqueTyId},
     next_solver::{
-        AliasTyKind, Binder, DbInterner, GenericArgs, ParamEnv, SolverDefId, Ty, TyKind,
-        TypingMode,
+        Binder, DbInterner, GenericArgs, ParamEnv, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
         references_non_lt_error,
@@ -112,7 +110,7 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                 if self.depth >= limit {
                     // A type's `Debug` reads the attached database. The alias is as deep as
                     // the limit, so only its start is kept.
-                    let mut shown = hir_ty::attach_db(self.infcx.interner.db, || {
+                    let mut shown = blaze_query::db::attach(self.infcx.interner.db, || {
                         format!("{:?} {ty:?}", alias.kind) // alloc: error path
                     });
                     if let Some((cut, _)) = shown.char_indices().nth(2000) {
@@ -167,11 +165,6 @@ impl<'db> Filler<'db> {
     /// normalized to normalized.
     fn normalize_alias(&mut self, ty: Ty<'db>) -> Result<Ty<'db>, MirLowerError<'db>> {
         let ty = ty.try_super_fold_with(self)?;
-        let ty = self.impl_opaque(ty);
-        if let Some(hidden) = self.hidden_with_opaques(ty) {
-            return self.try_fold_ty(hidden);
-        }
-
         let ty = self.normalized(ty)?;
         // Normalization could introduce infer vars (for example, if the alias cannot be normalized),
         // and we must not have infer vars in the body.
@@ -221,46 +214,6 @@ impl<'db> Filler<'db> {
             instantiating: false,
             replace: None,
         }
-    }
-
-    /// The `impl Trait` a trait method returns is the one of the impl's method once the
-    /// implementing type is known.
-    fn impl_opaque(&self, ty: Ty<'db>) -> Ty<'db> {
-        let TyKind::Alias(_, alias) = ty.kind() else { return ty };
-        let AliasTyKind::Opaque { def_id } = alias.kind else { return ty };
-        let SolverDefId::InternedOpaqueTyId(opaque) = def_id.into() else { return ty };
-        opaque_of_impl(self.infcx.interner.db, self.trait_env, opaque, alias.args).unwrap_or(ty)
-    }
-
-    /// The hidden type of the `impl Trait` a function returns, when another `impl Trait` is
-    /// in it. One of a trait method (`fn f<T: A>(t: T) -> impl X { t.f() }`, or the body of
-    /// `impl<T: A> B for T`) is the impl's once the types are known, which only
-    /// [`Self::impl_opaque`] finds: the solver reveals all of it at once and stops at the
-    /// trait method's, which has no code.
-    fn hidden_with_opaques(&self, ty: Ty<'db>) -> Option<Ty<'db>> {
-        let TyKind::Alias(_, alias) = ty.kind() else { return None };
-        let AliasTyKind::Opaque { def_id } = alias.kind else { return None };
-        let SolverDefId::InternedOpaqueTyId(opaque) = def_id.into() else { return None };
-        let db = self.infcx.interner.db;
-        let crate::ImplTraitId::ReturnTypeImplTrait(func, idx) = opaque.loc(db) else {
-            return None;
-        };
-        // A trait's own is the impl's, which `impl_opaque` has not found, except of a provided
-        // method the impl leaves as the trait has it: its body is the trait's, and the solver
-        // reveals nothing of the trait's.
-        let in_trait = matches!(
-            hir_def::Lookup::lookup(&func, db).container,
-            hir_def::ItemContainerId::TraitId(_)
-        );
-        if in_trait && !hir_def::signatures::FunctionSignature::of(db, func).has_body() {
-            return None;
-        }
-        if alias.args.has_type_flags(TypeFlags::HAS_PARAM) || references_non_lt_error(&alias.args) {
-            return None;
-        }
-        let hidden = crate::rpit_hidden_types(db, func).get(idx)?;
-        let hidden = hidden.get().instantiate(self.infcx.interner, alias.args).skip_norm_wip();
-        (in_trait || hidden.has_type_flags(TypeFlags::HAS_TY_OPAQUE)).then_some(hidden)
     }
 
     /// `t` with the arguments in place of its parameters and its aliases normalized: how every
@@ -530,108 +483,6 @@ pub fn monomorphized_args<'db>(
     trait_env: &StoredParamEnvAndCrate,
 ) -> Result<GenericArgs<'db>, MirLowerError<'db>> {
     Filler::new(db, trait_env.as_ref(db), subst.as_ref()).fill(args)
-}
-
-/// The type of the impl's method that `opaque`, the `impl Trait` a trait's method returns,
-/// is with `args`, once they name the impl: `None` for one of another function, or while they
-/// don't.
-pub fn opaque_of_impl<'db>(
-    db: &'db Db,
-    env: ParamEnvAndCrate<'db>,
-    opaque: InternedOpaqueTyId<'db>,
-    args: GenericArgs<'db>,
-) -> Option<Ty<'db>> {
-    let crate::ImplTraitId::ReturnTypeImplTrait(func, idx) = opaque.loc(db) else { return None };
-    if !matches!(hir_def::Lookup::lookup(&func, db).container, hir_def::ItemContainerId::TraitId(_))
-    {
-        return None;
-    }
-    // A lifetime nothing settled is an error one, and no code depends on it.
-    let unsettled = TypeFlags::HAS_PARAM | TypeFlags::HAS_TY_INFER | TypeFlags::HAS_CT_INFER;
-    if args.has_type_flags(unsettled) || references_non_lt_error(&args) {
-        return None;
-    }
-    let interner = DbInterner::new_with(db, env.krate);
-    // The arguments for the lifetimes the method's parameters leave out follow its own.
-    let elided = crate::elided_lifetimes(db, func).len() as usize;
-    let own = args.len().checked_sub(elided)?;
-    let args_for_bounds = args.as_slice();
-    let (own, _) = args_for_bounds.split_at(own);
-    // Which impl it is does not depend on lifetimes, and those of a solver's own are not ours.
-    let own = rustc_type_ir::fold_regions(interner, GenericArgs::new_from_slice(own), |_, _| {
-        Region::new_erased(interner)
-    });
-    let (either::Either::Left(implemented), args) = db.lookup_impl_method(env, func, own) else {
-        return None;
-    };
-    if implemented == func {
-        return None;
-    }
-    let output = |method: hir_def::FunctionId, args: GenericArgs<'db>| {
-        db.callable_item_signature(method.into())
-            .instantiate(interner, args)
-            .skip_norm_wip()
-            .skip_binder()
-            .output()
-    };
-    let declared = output(func, own);
-    let actual = rustc_type_ir::fold_regions(interner, output(implemented, args), |_, _| {
-        Region::new_erased(interner)
-    });
-    let opaque_id = |ty: Ty<'db>| {
-        let TyKind::Alias(_, alias) = ty.kind() else { return None };
-        let AliasTyKind::Opaque { def_id } = alias.kind else { return None };
-        let SolverDefId::InternedOpaqueTyId(id) = def_id.into() else { return None };
-        Some(id)
-    };
-    if opaque_id(declared) == Some(opaque) {
-        return Some(actual);
-    }
-    // Match the implementation's return type and associated type bindings with the
-    // trait's. Its concrete types need not declare any opaque types in the same positions.
-    let bounds = crate::SelfAndAssocBounds::return_type_impl_traits(db, func);
-    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
-    // alloc: once per opaque type of a trait method, not per body
-    let vars: Vec<_> = bounds.iter().map(|_| infcx.next_ty_var(crate::Span::Dummy)).collect();
-    let mut folder = crate::next_solver::util::BottomUpFolder {
-        interner,
-        ty_op: |ty| match opaque_id(ty).map(|id| id.loc(db)) {
-            Some(crate::ImplTraitId::ReturnTypeImplTrait(f, i)) if f == func => {
-                vars.get(i.into_raw().into_u32() as usize).copied().unwrap_or(ty)
-            }
-            _ => ty,
-        },
-        lt_op: |region| region,
-        ct_op: |ct| ct,
-    };
-    let mut ocx = ObligationCtxt::new(&infcx);
-    let cause = ObligationCause::dummy();
-    let declared =
-        rustc_type_ir::fold_regions(interner, declared, |_, _| Region::new_erased(interner));
-    ocx.eq(&cause, env.param_env, declared.fold_with(&mut folder), actual).ok()?;
-    for bound in bounds {
-        for clause in bound.self_bounds().iter_instantiated_copied(interner, args_for_bounds) {
-            if matches!(clause.kind().skip_binder(), rustc_type_ir::ClauseKind::Projection(_)) {
-                let clause =
-                    rustc_type_ir::fold_regions(interner, clause.skip_norm_wip(), |_, _| {
-                        Region::new_erased(interner)
-                    });
-                ocx.register_obligation(crate::next_solver::infer::traits::Obligation::new(
-                    interner,
-                    // clone: an obligation's cause, once per bound of an opaque type
-                    cause.clone(),
-                    env.param_env,
-                    clause.fold_with(&mut folder),
-                ));
-            }
-        }
-    }
-    if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
-        return None;
-    }
-    let ty = infcx.deeply_resolve_ignoring_regions(*vars.get(idx.into_raw().into_u32() as usize)?);
-    (!ty.has_infer() && !ty.has_escaping_bound_vars() && !references_non_lt_error(&ty))
-        .then_some(ty)
 }
 
 /// `ty` of a monomorphized body with its aliases normalized, as the body's own types are.

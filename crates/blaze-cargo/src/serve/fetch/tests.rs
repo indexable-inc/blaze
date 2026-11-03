@@ -112,7 +112,7 @@ fn fetch_crate(entries: &[Entry<'_>]) -> Result<Source, blaze_api::ApiError> {
 }
 
 fn file(path: &str, bytes: &[u8], mode: Mode) -> SourceFile {
-    SourceFile { path: path.to_owned(), bytes: bytes.to_vec(), mode }
+    SourceFile { path: path.to_owned(), bytes: blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, bytes), mode }
 }
 
 /// A fetched package is written on disk where it is mounted, whole, modes kept: a build script

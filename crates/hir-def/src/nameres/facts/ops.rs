@@ -54,16 +54,20 @@ pub(crate) struct ImportOp {
     /// The `use` item's visibility, one for all of its use trees.
     pub(crate) visibility: RawVisibility,
     pub(crate) source: ImportSource,
+    /// The context the name it binds is keyed by (`def_site::import_binding_key`): `None` but
+    /// for a `use` a `macro` wrote.
+    pub(crate) key: Option<SyntaxContext>,
 }
 
 impl ImportOp {
-    /// The name a plain import binds, if any (`as _` binds none).
+    /// The name a plain import binds, if any (`as _` binds none), keyed by [`Self::key`].
     pub(crate) fn bound_name(&self) -> Option<Name> {
-        match &self.alias {
-            Some(ImportAlias::Alias(name)) => Some(*name),
-            Some(ImportAlias::Underscore) => None,
-            None => self.path.segments().last().copied(),
-        }
+        let name = match &self.alias {
+            Some(ImportAlias::Alias(name)) => *name,
+            Some(ImportAlias::Underscore) => return None,
+            None => *self.path.segments().last()?,
+        };
+        Some(self.key.map_or(name, |key| name.keyed(key)))
     }
 }
 

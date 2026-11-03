@@ -72,7 +72,7 @@ fn erasing_and_anonymizing_is_what_both_folders_did() {
     let fx = fixture::db(TYPES);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_no_crate(&db);
         let func = function(&db, "types");
         let body = db.mir_body(func.into()).expect("the body");

@@ -57,7 +57,7 @@ pub fn impl_deserializable(_item: TokenStream) -> TokenStream {
         },
     )];
     let db = fixture::db_with_proc_macros(ra_fixture, proc_macros).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = *all_crates(&db)
             .iter()
             .find(|krate| {

@@ -317,18 +317,12 @@ impl std::fmt::Display for Claim {
     }
 }
 
-/// A claim on a history ([`claim`]): its [`OWNER`] file, locked until this drops.
+/// A claim on a history ([`claim`]): its [`OWNER`] file, locked until this drops, and let go
+/// of then though a child forked meanwhile still has it open ([`stdx::file_lock`]: a test's
+/// claim, dropped while another test spawned a process, was refused as still held by this pid).
 #[derive(Debug)]
-struct Owner(fs::File);
-
-impl Drop for Owner {
-    /// Unlocks the file before it closes. A `flock` lock belongs to the open file, which a child
-    /// forked meanwhile shares until it execs or exits: closing this copy alone would leave the
-    /// history held by that child (a test's claim, dropped while another test spawned a
-    /// process, was refused as still held by this pid). An unlock through any copy lets it go.
-    fn drop(&mut self) {
-        _ = self.0.unlock();
-    }
+struct Owner {
+    _lock: stdx::file_lock::Locked,
 }
 
 /// This process's claim on the history in `dir`, for as long as the [`Owner`] lives: an
@@ -341,27 +335,25 @@ fn claim(dir: &Path) -> Result<Owner, Claim> {
     };
     fs::create_dir_all(dir).map_err(io(dir, "making the profile history"))?;
     let path = dir.join(OWNER);
-    let mut file = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&path)
         .map_err(io(&path, "opening the profile history's owner file"))?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(fs::TryLockError::WouldBlock) => {
+    let mut file = match stdx::file_lock::Locked::try_lock(file) {
+        Ok(Ok(file)) => file,
+        Ok(Err(_held)) => {
             let holder = fs::read_to_string(&path).ok().and_then(|it| it.trim().parse().ok());
             return Err(Claim::Owned { dir: dir.to_path_buf(), holder });
         }
-        Err(fs::TryLockError::Error(error)) => {
-            return Err(io(&path, "locking the profile history's owner file")(error));
-        }
-    }
+        Err(error) => return Err(io(&path, "locking the profile history's owner file")(error)),
+    };
     use std::io::Write as _;
     file.set_len(0).map_err(io(&path, "writing the profile history's owner file"))?;
     write!(file, "{}", std::process::id()).map_err(io(&path, "writing the profile history's owner file"))?;
-    Ok(Owner(file))
+    Ok(Owner { _lock: file })
 }
 
 /// The history's loop: a drain of the rings every [`history::DRAIN`], a flush every

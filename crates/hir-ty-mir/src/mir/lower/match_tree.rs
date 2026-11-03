@@ -560,7 +560,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 let mut inside = Vec::new_in(frame);
                 for field in args.iter() {
                     let mut within = variant_place(variant, &place, frame);
-                    within.push(Step::Field(u32::from(fields.field(&field.name)?.into_raw())));
+                    let hygiene = self.store.record_field_hygiene(field.pat);
+                    let id = fields.field_written(self.db, variant, &field.name, hygiene)?;
+                    within.push(Step::Field(u32::from(id.into_raw())));
                     self.pairs_of(field.pat, within, &mut inside)?;
                 }
                 self.pairs_of_variant(variant, inside, place, pairs)

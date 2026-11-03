@@ -210,7 +210,7 @@ impl Get for Gated<'_> {
 impl Put for Gated<'_> {
     fn put(&mut self, key: Key, kind: Kind, bytes: Vec<u8>) -> Result<(), Mismatch> {
         self.turn.pause(format!("put {}", short(&key)));
-        let result = self.writer.put(self.guard, key, kind, bytes.clone());
+        let result = self.writer.put(self.guard, key, kind, &bytes);
         let checked = self.ledger.lock().put(self.who, key, kind, &bytes, &result);
         if let Err(failure) = checked {
             self.turn.fail(failure);

@@ -43,7 +43,7 @@ use super::{
 };
 use crate::cow::CowBytes;
 use crate::model::{
-    Class, Counts, Delta, Export, File, Function, Holds, Pages, Placed, Prot, Region, SymbolKind, View, WindowsUnwind, zeroed,
+    Class, Counts, Delta, Export, File, Function, Holds, Pages, Placed, Prot, Region, SymbolKind, View, WindowsUnwind, reserved, zeroed,
 };
 use crate::{LinkError, OutputKind};
 
@@ -1701,7 +1701,7 @@ fn default_prot(segment: Segment) -> Prot {
         Segment::Text => Prot::RX,
         Segment::Data | Segment::Tls => Prot::RW,
         Segment::Rdata | Segment::Pdata | Segment::Rsrc | Segment::Reloc => Prot::R,
-        Segment::Arena | Segment::Cells | Segment::Fixed => Prot::NONE,
+        Segment::Reserve(_) => Prot::NONE,
     }
 }
 
@@ -1753,7 +1753,7 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
                     region.class, region.addr, last.end
                 )));
             }
-            Some(_) if segment.reserve() => false,
+            Some(_) if reserved(&region.class) => false,
             Some(last) => last.prot == region.prot && (last_segment == Some(segment) || !aligned),
             None => false,
         };
@@ -1778,7 +1778,7 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
             file_end: if in_file { end } else { region.addr },
             prot: region.prot,
             discardable: segment == Segment::Reloc,
-            reserve: segment.reserve(),
+            reserve: reserved(&region.class),
         });
     }
     match sections.first() {

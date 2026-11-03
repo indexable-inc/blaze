@@ -77,7 +77,7 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
 
     // Once the loop has put them, they are read in place and not asked for again.
     for put in puts {
-        store.put(put.key, put.kind, put.bytes).unwrap();
+        store.put(put.key, put.kind, &put.bytes).unwrap();
     }
     let images = Images::new(reader, no_macros());
     let found = images.get(&key(1)).unwrap().expect("put by the loop");

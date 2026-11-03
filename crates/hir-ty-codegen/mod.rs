@@ -180,6 +180,9 @@ pub enum CodegenError {
     /// What blaze can't do and no other path may stand in for: the build stops with this
     /// error, naming what and where. Never left to rustc, never a build in full instead.
     Refused(String),
+    /// Cranelift's verifier refused the IR blaze made of the function ([`verified`]): a bug
+    /// of blaze's IR builder (`stage` "built") or of the passes after it ("settled").
+    InvalidIr { stage: &'static str, errors: String },
 }
 
 impl fmt::Display for CodegenError {
@@ -191,6 +194,11 @@ impl fmt::Display for CodegenError {
             #[cfg(feature = "llvm")]
             CodegenError::LlvmRefused(why) => write!(f, "LLVM has no code for the function: {why}"),
             CodegenError::Refused(it) => write!(f, "{it}"),
+            CodegenError::InvalidIr { stage, errors } => write!(
+                f,
+                "blaze made IR that Cranelift's verifier refuses (as {stage}), a bug of blaze's \
+                 code generator: {errors}"
+            ),
         }
     }
 }
@@ -1113,7 +1121,7 @@ fn linked_crates(db: &Db, krate: Crate) -> std::result::Result<HashSet<Crate, Gl
         return Ok(linked);
     }
     let strategy = panic_strategy(db, program)?;
-    let name = |it: Crate| fncache::crate_name(db, it);
+    let name = |it: Crate| it.named(db).to_string(); // alloc: a crate's name in the errors
     // The crate that named the runtime, for the errors: the one to edit.
     let mut named_by = None;
     let runtime = match named.as_slice() {
@@ -1122,14 +1130,14 @@ fn linked_crates(db: &Db, krate: Crate) -> std::result::Result<HashSet<Crate, Gl
                 PanicStrategy::Unwind => "panic_unwind",
                 PanicStrategy::Abort => "panic_abort",
             };
-            let Some(&runtime) = offered.iter().find(|&&it| fncache::crate_name(db, it) == wanted) else {
-                let mut names: Vec<String> = offered.iter().map(|&it| fncache::crate_name(db, it)).collect();
+            let Some(&runtime) = offered.iter().find(|&&it| it.rust_name(db).is_ok_and(|it| it.as_str() == wanted)) else {
+                let mut names: Vec<String> = offered.iter().map(|&it| name(it)).collect();
                 names.sort_unstable();
                 // alloc: the error's message
                 return Err(format!(
                     "the program of crate `{}` panics by `{strategy}`, and the standard library \
                      depends on no panic runtime `{wanted}` (only {names:?})",
-                    fncache::crate_name(db, program)
+                    program.named(db)
                 ));
             };
             runtime
@@ -1256,7 +1264,7 @@ fn panic_strategy(db: &Db, krate: Crate) -> std::result::Result<PanicStrategy, S
     Err(format!(
         "crate `{}` has a panic strategy that names no panic runtime: its cfg has neither \
          `panic = \"unwind\"` nor `panic = \"abort\"`",
-        fncache::crate_name(db, krate)
+        krate.named(db)
     ))
 }
 
@@ -2121,7 +2129,7 @@ pub(crate) fn unexpanded_derive(
     let derive = impl_.loc(db).trait_.name();
     let (derive, method) = (derive.as_str(), method.name());
     // A type's `Debug` reads its interned parts from the attached database.
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         // alloc: the error's message
         format!(
             "`{derive}::{}` of `{self_ty:?}`, which `#[derive({derive})]` implements: the database \
@@ -2161,7 +2169,7 @@ pub(crate) fn no_impl_method(
     };
     let (why, args) = (why.describe(), args.as_slice());
     // A type's `Debug` reads its interned parts from the attached database.
-    hir_ty::attach_db(db, || match trait_ {
+    blaze_query::db::attach(db, || match trait_ {
         // alloc: the error's message
         Some(trait_) => format!("trait {} method {method} for {args:?}: {why}", trait_.name.as_str()),
         // alloc: the error's message
@@ -2319,21 +2327,27 @@ const ALLOCATOR_ENTRIES: [(&str, &str, usize, bool); 4] = [
 
 /// The function of `krate` a builtin attribute's expansion exports as `exported`: the
 /// `#[global_allocator]`'s functions, the `#[alloc_error_handler]`'s `__rg_oom`.
+///
+/// The expansion writes the function at the attribute macro's def site, so its binding is
+/// hygienic: the module binds it under a [keyed](hir_expand::name::Name::keyed) name that no
+/// path can write, as rustc's does. Each module's values are matched by the name's text,
+/// whatever its key, and the function must still export `exported`.
 fn global_allocator_export(
     db: &Db,
     krate: Crate,
     exported: &str,
 ) -> Option<FunctionId> {
     let def_map = hir_def::nameres::crate_def_map(db, krate);
-    let name = hir_expand::name::Name::new_root(exported);
     def_map.modules(db).find_map(|(module_id, module)| {
-        let Some(hir_def::ModuleDefId::FunctionId(id)) = module.scope(db).get(&name).take_values()
-        else {
-            return None;
-        };
-        let exports =
-            AttrFlags::export_name(db, id.into()).is_some_and(|it| it.as_str() == exported);
-        (id.lookup(db).container == ItemContainerId::ModuleId(module_id) && exports).then_some(id)
+        module.scope(db).values().find_map(|(name, item)| {
+            let hir_def::ModuleDefId::FunctionId(id) = item.def else { return None };
+            if name.as_str() != exported || item.import.is_some() {
+                return None;
+            }
+            let exports =
+                AttrFlags::export_name(db, id.into()).is_some_and(|it| it.as_str() == exported);
+            (id.lookup(db).container == ItemContainerId::ModuleId(module_id) && exports).then_some(id)
+        })
     })
 }
 
@@ -2393,9 +2407,13 @@ fn compile_as<'db>(
     let mut cg = Recorder::new(db, isa, target, checked, unit);
     cg.inlining = inlining.take();
     let tally = backend::Tally::global();
-    let built = tally.step(Step::Translate, || {
-        let mut ctx = build(&mut cg, env, body, tracked, fill)?;
-        settle(&mut ctx, &cg)?;
+    let built = tally.step(Step::Translate, || build(&mut cg, env, body, tracked, fill));
+    // What the builder made is checked before the passes change it, and what they made of it
+    // after: a bad instruction of either is this function's error, never code made from it.
+    let built = built.and_then(|mut ctx| {
+        verified(&ctx.func, isa, "built")?;
+        tally.step(Step::Translate, || settle(&mut ctx, &cg))?;
+        verified(&ctx.func, isa, "settled")?;
         Result::Ok(ctx)
     });
     // Back to the caller before anything can return: nothing after the build reads it.
@@ -2467,6 +2485,60 @@ fn compile_as<'db>(
         variables,
         layouts,
     }))
+}
+
+/// Cranelift's verifier over the IR blaze made of a function, `stage` saying which: what the
+/// builder `built`, or what [`settle`] `settled` it to. Its errors are the function's
+/// [`CodegenError::InvalidIr`], which its caller names the function in: no backend (the
+/// stencils, LLVM, the wasm lowering) is handed IR whose types or flow are wrong, which none of
+/// them checks and each would make code of. The flags alone, not the ISA: a wasm function's
+/// IR is made under a native ISA's settings with the target's own addresses
+/// ([`Target::frontend_config`]), which the ISA's checks of pointer types would refuse.
+/// Every build runs it, release too: on a cold debug build of regex, serde and serde_json with
+/// std (2026-11-03), its two walks of each function were 0.76 to 0.79 s of 144 to 148 s of CPU.
+// dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private
+fn verified(func: &ir::Function, isa: &dyn isa::TargetIsa, stage: &'static str) -> Result<()> {
+    let errors = backend::Tally::global()
+        .step(Step::Verify, || cranelift_codegen::verify_function(func, isa.flags()));
+    let Err(errors) = errors else { return Ok(()) };
+    // alloc: the error's message
+    let refused: Vec<&cranelift_codegen::verifier::VerifierError> =
+        errors.0.iter().filter(|it| !only_cranelifts_backend(func, it)).collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    /// The most errors a message lists: the first is what went wrong, the rest its echoes.
+    const SHOWN: usize = 8;
+    // alloc: the error's message
+    let mut shown: Vec<String> = refused.iter().take(SHOWN).map(|it| it.to_string()).collect();
+    if refused.len() > SHOWN {
+        // alloc: the error's message
+        shown.push(format!("and {} more", refused.len() - SHOWN));
+    }
+    Err(CodegenError::InvalidIr { stage, errors: shown.join("; ") })
+}
+
+/// Whether the verifier's `error` is a limit of Cranelift's own code generator rather than of
+/// the IR: a `return_call` whose callee's calling convention is one Cranelift's machine
+/// backends can't tail call from. None of blaze's backends is Cranelift's (rule 8): the
+/// stencils lower a tail call under the platform's convention (blaze-stencil's
+/// `return_call_signature`) and LLVM makes it a `musttail` call; which targets take a tail call
+/// at all is [`refuse_tail_calls`]'s to say. The verifier's other rules for a tail call (the
+/// callee's convention and results match the caller's) still hold: only the error of that one
+/// rule, on such a call, is dropped.
+fn only_cranelifts_backend(func: &ir::Function, error: &cranelift_codegen::verifier::VerifierError) -> bool {
+    let ir::entities::AnyEntity::Inst(inst) = error.location else { return false };
+    let sig = match func.dfg.insts[inst] {
+        ir::InstructionData::Call { opcode: ir::Opcode::ReturnCall, func_ref, .. } => {
+            func.dfg.ext_funcs[func_ref].signature
+        }
+        ir::InstructionData::CallIndirect { opcode: ir::Opcode::ReturnCallIndirect, sig_ref, .. } => sig_ref,
+        _ => return false,
+    };
+    let convention = func.dfg.signatures[sig].call_conv;
+    // alloc: once per error, only when the verifier refused something
+    !convention.supports_tail_calls()
+        && error.message == format!("calling convention `{convention}` does not support tail calls")
 }
 
 /// What the IR `build` gives goes through before a backend compiles it: the bodies `cg` built
@@ -2665,7 +2737,7 @@ fn build<'db>(
         // alloc: error path
         CodegenError::Refused(format!(
             "crate `{}` has no target data layout to compile for: {error}",
-            fncache::crate_name(cg.db, env.krate)
+            env.krate.named(cg.db)
         ))
     })?;
     // The build's tables (its locals, blocks, layouts, drop glue, registers and the rest of
@@ -3771,7 +3843,7 @@ impl ConstOf<'_> {
             ConstOf::Item(GeneralConstId::AnonConstId(_)) => {
                 "an anonymous constant".to_owned() // alloc: an error's text
             }
-            ConstOf::Promoted(promoted) => hir_ty::attach_db(db, || {
+            ConstOf::Promoted(promoted) => blaze_query::db::attach(db, || {
                 // alloc: an error's text
                 format!("the promoted constant {:?} of {}", promoted.expr, body_path(db, promoted.owner))
             }),
@@ -3785,7 +3857,7 @@ impl ConstOf<'_> {
 /// The error of a promoted constant whose MIR does not build, naming it and the body it is of.
 pub(crate) fn no_promoted_mir(db: &Db, promoted: Promoted<'_>, error: impl std::fmt::Debug) -> CodegenError {
     // alloc: the error's message
-    CodegenError::Refused(hir_ty::attach_db(db, || {
+    CodegenError::Refused(blaze_query::db::attach(db, || {
         format!("{} has no MIR: {error:?}", ConstOf::Promoted(promoted).describe(db))
     }))
 }
@@ -4087,10 +4159,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             BackendRepr::Scalar(scalar) => PassMode::Direct(self.scalar(scalar)?),
             BackendRepr::ScalarPair { a, b, b_offset: offset } => {
                 let (a, b) = (self.scalar(a)?, self.scalar(b)?);
-                // LLVM has a WebAssembly function return one value: of a pair it makes a
-                // pointer to where the pair goes, the first parameter.
-                let one_result = cfg!(feature = "wasm");
-                if is_ret && (wide || one_result || a.ty == types::I128 || b.ty == types::I128) {
+                // A pair the Rust ABI returns is two values on every target, as rustc's
+                // `PassMode::Pair` is. On WebAssembly, where a function returns one value,
+                // the wasm lowering writes them through a pointer that is the first
+                // parameter, at the offsets of LLVM's struct of the two (`wasm::Returned`, the
+                // one home of LLVM's `canLowerReturn`), as LLVM demotes rustc's pair: the
+                // same for every blaze, whatever it was built with.
+                if is_ret && (wide || a.ty == types::I128 || b.ty == types::I128) {
                     // More than the two return registers hold, so LLVM returns it in memory.
                     PassMode::Indirect
                 } else {
@@ -10699,7 +10774,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// as rustc writes it.
     fn start_shim(&mut self, main: FunctionId) -> Result<()> {
         let Some(start) = self.interner.lang_items().Start else {
-            let krate = crate::fncache::crate_name(self.cg.db, main.krate(self.cg.db));
+            let krate = main.krate(self.cg.db).named(self.cg.db);
             unsupported!(
                 "the C `main` of crate `{krate}`: no `start` lang item (std's `lang_start`) in \
                  the crates `{krate}` loads, which its `main` is handed to"
@@ -16602,6 +16677,72 @@ mod tests {
         assert_eq!(accesses(&func), [&loads[..], &stores[..]].concat());
         let mut ctx = cranelift_codegen::Context::for_function(func);
         assert!(!super::emit(&mut ctx, super::Target::for_host()).unwrap().bytes.is_empty());
+    }
+
+    /// A wasm32 function's `memcpy` takes and gives the target's 32-bit addresses, not the
+    /// 64-bit ones of the native ISA its IR is made under: the call type-checks, and a small
+    /// copy lowers to loads and stores whose call result becomes the destination, of the same
+    /// type. With the ISA's own config the call took and gave `i64`s, and the lowering
+    /// aliased the `i64` result to the `i32` destination, which Cranelift's debug assertion
+    /// refused building a proc macro on aarch64 Linux ("Aliasing v462 to v458 would change
+    /// its type i64 to i32").
+    #[test]
+    fn a_wasm32_copys_memcpy_takes_and_gives_32_bit_addresses() {
+        for (triple, pointer) in [("wasm32-wasip1", types::I32), ("wasm64-blaze-wasip1", types::I64)] {
+            let target = super::Target::of(triple).unwrap();
+            let isa = &**super::isa_for(target).unwrap();
+            let config = target.frontend_config(isa);
+            assert_eq!(config.pointer_type(), pointer, "{triple}");
+            let mut sig = ir::Signature::new(config.default_call_conv);
+            sig.params.extend([AbiParam::new(pointer), AbiParam::new(pointer)]);
+            let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
+            let mut builder_ctx = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            let &[to, from] = builder.block_params(entry) else { unreachable!() };
+            let bytes = builder.ins().iconst(pointer, 24);
+            builder.call_memcpy(config, to, from, bytes);
+            builder.ins().return_(&[]);
+            builder.finalize(config);
+            cranelift_codegen::verify_function(&func, isa.flags()).unwrap_or_else(|e| panic!("{triple}: {e}"));
+            assert!(super::copies::lower_small(&mut func), "{triple}");
+            cranelift_codegen::verify_function(&func, isa.flags()).unwrap_or_else(|e| panic!("{triple}: {e}"));
+        }
+    }
+
+    /// IR the verifier refuses is the function's typed error, naming the stage it was refused
+    /// at and the instruction, before any backend or pass is given it: the IR of dfgalias's
+    /// bug, a wasm32 `memcpy` declared under the native ISA's own 64-bit addresses and called
+    /// with 32-bit ones, which only a debug assertion of the copy lowering caught after it, so
+    /// a release blaze kept it.
+    #[test]
+    fn ir_the_verifier_refuses_is_the_functions_error_before_any_pass() {
+        let target = super::Target::of("wasm32-wasip1").unwrap();
+        let isa = &**super::isa_for(target).unwrap();
+        let ill = isa.frontend_config();
+        assert_eq!(ill.pointer_type(), types::I64, "the premise: the native ISA's own addresses");
+        let mut sig = ir::Signature::new(ill.default_call_conv);
+        sig.params.extend([AbiParam::new(types::I32), AbiParam::new(types::I32)]);
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let &[to, from] = builder.block_params(entry) else { unreachable!() };
+        let bytes = builder.ins().iconst(types::I32, 24);
+        builder.call_memcpy(ill, to, from, bytes);
+        builder.ins().return_(&[]);
+        builder.finalize(target.frontend_config(isa));
+        let error = super::verified(&func, isa, "built").expect_err("ill-typed IR verified");
+        let super::CodegenError::InvalidIr { stage, ref errors } = error else { panic!("{error}") };
+        assert_eq!(stage, "built");
+        assert!(errors.contains("call"), "{errors}");
+        assert!(error.to_string().contains("Cranelift's verifier refuses (as built)"), "{error}");
     }
 
     /// One of more than 128 bytes stays a call, of `memcpy` named in place.

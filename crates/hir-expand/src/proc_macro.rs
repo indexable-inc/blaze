@@ -28,7 +28,7 @@ pub struct ProcMacroCall<'a> {
     pub subtree: &'a tt::TopSubtree,
     /// The attribute's own arguments, for [`ProcMacroKind::Attr`].
     pub attrs: Option<&'a tt::TopSubtree>,
-    /// The calling crate's environment variables.
+    /// The calling crate's environment variables (`base_db::macro_env`).
     pub env: &'a Env,
     pub def_site: Span,
     pub call_site: Span,
@@ -358,8 +358,7 @@ impl PartialEq for ProcMacro {
 /// what the call's error keeps, so it says the reason the expansion had even once the map
 /// changes. An unexpanded macro fails the build whatever the reason.
 fn missing(db: &Db, krate: Crate) -> ExpandErrorKind {
-    let name = krate.extra_data(db).display_name.as_ref().map(|it| it.canonical_name().as_str());
-    let name = name.unwrap_or("<unnamed>");
+    let name = krate.named(db);
     let why = match ProcMacros::get_for_crate(db, krate).map(|it| &it.0) {
         // alloc: an error's message, once per macro call that can't be expanded
         None => format!("the proc-macro crate `{name}` ({krate:?}) has no entry in the proc-macro map"),
@@ -485,11 +484,12 @@ impl CustomProcMacroExpander {
         call_site: Span,
         mixed_site: Span,
     ) -> ProcMacroCall<'a> {
-        // Proc macros have access to the environment variables of the invoking crate.
+        // Proc macros have access to the environment variables of the invoking crate, and
+        // `CARGO_PRIMARY_PACKAGE` when it is primary, as rustc's process has them.
         ProcMacroCall {
             subtree: tt,
             attrs: attr_arg,
-            env: calling_crate.env(db),
+            env: base_db::macro_env(db, calling_crate),
             def_site,
             call_site,
             mixed_site,

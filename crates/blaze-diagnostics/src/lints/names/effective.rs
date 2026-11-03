@@ -953,7 +953,9 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Names<'db> {
                 if self.skip_assoc || !self.seen.insert(ty) {
                     return;
                 }
-                if let ItemContainerId::TraitId(it) = def_id.0.lookup(self.db).container {
+                if let ItemContainerId::TraitId(it) =
+                    hir_ty::next_solver::TermId::from(def_id.0).container(self.db)
+                {
                     self.push(Def::Item(ModuleDef::Trait(it.into())));
                 }
             }

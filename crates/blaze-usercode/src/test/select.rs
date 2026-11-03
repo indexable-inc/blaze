@@ -47,7 +47,7 @@ impl Passes for Store {
     }
 
     fn put(&mut self, key: Key, bytes: Vec<u8>) -> Result<Ticket, Mismatch> {
-        Store::put(self, key, Kind::Run, bytes)
+        Store::put(self, key, Kind::Run, &bytes)
     }
 }
 

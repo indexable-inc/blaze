@@ -923,16 +923,40 @@ impl Code for Symbol {
     }
 }
 
+/// What a [keyed](Name::keyed) name is written as before its text and its key: a text no
+/// name has. The key is a context, written relocated as every context is, which the raw
+/// symbol of a keyed name (its context's number in its text) would not be.
+const KEYED_NAME: &str = "\0";
+
 impl Code for Name {
+    /// A name; a [keyed](Name::keyed) one (a field a `macro` names) as the mark
+    /// [`KEYED_NAME`], its text and its context, since the context id in its symbol is this
+    /// process's: the context is written as every context is, relocated.
     fn put(&self, w: &mut Words) {
-        w.symbol(self.symbol());
+        match self.key() {
+            None => w.symbol(self.symbol()),
+            Some(key) => {
+                w.symbol(&Symbol::intern(KEYED_NAME));
+                w.symbol(self.unkeyed().symbol());
+                key.put(w);
+            }
+        }
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
         let symbol = r.symbol()?;
-        match symbol.as_str().starts_with("r#") {
-            true => Err(r.invalid("a name written with its `r#`")),
-            false => Ok(Name::new_symbol_root(symbol)),
+        if symbol.as_str() == KEYED_NAME {
+            let name = Name::get(r)?;
+            let key = SyntaxContext::get(r)?;
+            return match name.key() {
+                Some(_) => Err(r.invalid("a keyed name whose text is keyed again")),
+                None => Ok(name.keyed(key)),
+            };
+        }
+        match symbol.as_str().as_bytes().first() {
+            Some(b'\0') => Err(r.invalid("a keyed name written as its raw symbol")),
+            _ if symbol.as_str().starts_with("r#") => Err(r.invalid("a name written with its `r#`")),
+            _ => Ok(Name::new_symbol_root(symbol)),
         }
     }
 }
@@ -965,16 +989,34 @@ impl Code for PathKind {
     }
 }
 
+/// The kind, the segments, then the segments' contexts ([`ModPath::contexts`]): a 0, or a 1
+/// and one context per segment.
 impl Code for ModPath {
     fn put(&self, w: &mut Words) {
         self.kind.put(w);
         w.seq(self.segments().iter());
+        match self.contexts() {
+            None => w.u32(0),
+            Some(contexts) => {
+                w.u32(1);
+                w.seq(contexts.iter());
+            }
+        }
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
         let kind = r.get()?;
-        let segments: Vec<Name> = r.seq::<Name, _>()?;
-        Ok(ModPath::from_segments(kind, segments))
+        let segments: Vec<Name> = r.seq::<Name, _>()?; // alloc: decode scratch, one path
+        match r.tag(2, "a path's contexts tag out of range")? {
+            0 => Ok(ModPath::from_segments(kind, segments)),
+            _ => {
+                let contexts: Vec<SyntaxContext> = r.seq::<SyntaxContext, _>()?; // alloc: decode scratch, one path
+                if contexts.len() != segments.len() {
+                    return Err(r.invalid("a path with a context count unlike its segment count"));
+                }
+                Ok(ModPath::from_segments_in(kind, segments.into_iter().zip(contexts)))
+            }
+        }
     }
 }
 
@@ -1306,6 +1348,42 @@ mod tests {
         round_trip(TextRange::new(3.into(), 9.into()));
         round_trip(SyntaxContext::root(Edition::Edition2021));
         round_trip(Edition::Edition2024);
+        // A field a `macro` names: its text and its context, not the process's id in its symbol.
+        round_trip(Name::new_symbol_root(Symbol::intern("x")).keyed(SyntaxContext::from_u32(5)));
+    }
+
+    /// A keyed name (a generic parameter or a lifetime a `macro` wrote) reads back with its key,
+    /// which a relocation writes as its index like every context: read in a process whose table
+    /// gives that index another context, the name is keyed by that one. A plain name of the
+    /// same text stays plain.
+    #[test]
+    fn a_keyed_name_reads_back_with_its_key_relocated() {
+        let plain = Name::new_root("T");
+        let keyed = plain.keyed(SyntaxContext::from_u32(5));
+        round_trip((keyed, plain));
+        let value = (keyed, (plain, keyed));
+        let mut table = Relocation::new();
+        let mut w = Words::new();
+        let first = w.at();
+        relocating(&mut table, || value.put(&mut w));
+        assert_eq!(table.entries(), [(Kind::Context, 5)], "the key is the one context written");
+        let mut out = Writer::new(SCHEMA);
+        let placed = w.place(&mut out);
+        let at = out.next::<Root>();
+        let root = out.push(&Root { words: placed.rec(at + offset_of!(Root, words) as u64), first });
+        let buffer = blaze_format::Aligned::copy_from(&out.finish(root));
+        let root = blaze_format::open::<Root>(&buffer).expect("a buffer just written");
+        let read = |entries: Vec<(Kind, u64)>| {
+            let mut reading = Relocation::of(entries);
+            relocating(&mut reading, || {
+                Read::new(&root.words, &buffer).from(root.first).get::<(Name, (Name, Name))>()
+            })
+            .expect("a value just written")
+        };
+        assert_eq!(read(vec![(Kind::Context, 5)]), value);
+        let moved = plain.keyed(SyntaxContext::from_u32(9));
+        assert_eq!(read(vec![(Kind::Context, 9)]), (moved, (plain, moved)));
+        assert_eq!(moved.as_str(), "T");
     }
 
     #[test]
@@ -1423,6 +1501,12 @@ mod tests {
         let back: (SyntaxContext, (span::EditionedFileId, SyntaxContext)) =
             read_back(&words, &mut reading).unwrap();
         assert_eq!(back, (context, (file, context)));
+
+        // A keyed name's context is relocated as every context is.
+        let mut table = Relocation::new();
+        let keyed = Name::new_symbol_root(Symbol::intern("x")).keyed(SyntaxContext::from_u32(5));
+        words_of(&keyed, Some(&mut table));
+        assert_eq!(table.entries(), [(Kind::Context, 5)]);
     }
 
     #[test]

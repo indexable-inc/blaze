@@ -619,11 +619,32 @@ impl Tree {
         for op in ops {
             self.stage(base, &mut pending, op)?;
         }
+        Ok(self.commit_pending(base, &pending))
+    }
+
+    /// The root `files` written over `base` make, each a whole file with its mode, or why they
+    /// can't: [`Tree::apply_all`] of writes whose bytes are already held (a fetched source's,
+    /// in the allocator of their lifetime), which become the files' with no copy.
+    pub(crate) fn apply_files(
+        &mut self,
+        base: NodeId,
+        files: impl IntoIterator<Item = (String, Bytes, Mode)>,
+    ) -> Result<NodeId, OpError> {
+        let mut pending = Pending::new();
+        for (path, bytes, mode) in files {
+            check(&path)?;
+            self.stage_write(base, &mut pending, Cow::Owned(path), bytes, mode)?;
+        }
+        Ok(self.commit_pending(base, &pending))
+    }
+
+    /// The root the staged changes make of `base`.
+    fn commit_pending(&mut self, base: NodeId, pending: &Pending) -> NodeId {
         // By component, so each directory's changes are one run, in its entries' order: every
         // path's components in one column, and each change its run of them.
         let mut parts: Vec<&str> = Vec::with_capacity(pending.len() * 4);
         let mut changes: Vec<Staged<'_>> = Vec::with_capacity(pending.len());
-        for (path, blob) in &pending {
+        for (path, blob) in pending {
             let start = parts.len();
             parts.extend(path.split('/'));
             changes.push((start, parts.len(), blob, NOT_HASHED));
@@ -647,7 +668,7 @@ impl Tree {
         let root = self.rebuild(Some(base), &parts, &changes, &hashed, 0, &mut stack);
         self.rebuilt = stack;
         self.hashed = hashed;
-        Ok(root.unwrap_or(self.empty))
+        root.unwrap_or(self.empty)
     }
 
     /// The file at `path` as the transaction sees it so far: `Err` for a directory.
@@ -734,6 +755,28 @@ impl Tree {
         found
     }
 
+    /// A whole file of `bytes` with `mode` at `path` (checked), staged: refused under a file or
+    /// over a directory.
+    fn stage_write(
+        &self,
+        base: NodeId,
+        pending: &mut Pending,
+        path: Cow<'_, str>,
+        bytes: Bytes,
+        mode: Mode,
+    ) -> Result<(), OpError> {
+        if ancestors(&path).any(|up| self.file_now(base, pending, up).is_some()) {
+            // alloc: the error's path
+            return Err(OpError::NotADirectory(path.into_owned()));
+        }
+        if self.current(base, pending, &path).is_err() {
+            // alloc: the error's path
+            return Err(OpError::IsADirectory(path.into_owned()));
+        }
+        put_owned(pending, path, Some(Blob::New(bytes, mode)));
+        Ok(())
+    }
+
     /// Checks `op` against `base` with the ops staged before it in `pending`, and stages it. A
     /// write's bytes are moved out of an owned op, copied once from a borrowed one.
     pub(crate) fn stage(
@@ -758,9 +801,7 @@ impl Tree {
             }
             Ok(())
         };
-        if let Op::Write { path, mode, .. } = &*op {
-            no_file_above(pending, path)?;
-            file_at(pending, path)?;
+        if let Op::Write { mode, .. } = &*op {
             let mode = *mode;
             let (path, bytes) = match op {
                 Cow::Owned(Op::Write { path, bytes, .. }) => (Cow::Owned(path), adopt(bytes)),
@@ -771,8 +812,7 @@ impl Tree {
                 }
                 _ => unreachable!("a write, matched above"),
             };
-            put_owned(pending, path, Some(Blob::New(bytes, mode)));
-            return Ok(());
+            return self.stage_write(base, pending, path, bytes, mode);
         }
         match &*op {
             Op::Write { .. } => unreachable!("staged above"),

@@ -33,7 +33,6 @@
 //! never waits for one.
 
 use std::{
-    fs::File,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -94,7 +93,7 @@ pub struct Gc {
     sizes: Option<Sizes>,
     /// Each area's collector lock, while this daemon holds it; the areas as the jobs see
     /// them, `""` for one another collector holds.
-    locks: Vec<Option<File>>,
+    locks: Vec<Option<stdx::file_lock::Locked>>,
     held_areas: Vec<String>,
     /// `blaze cache gc`s asked of this daemon while it holds the areas (review N14), each
     /// with its dry run, answered by the asked run of the same kind as it records.

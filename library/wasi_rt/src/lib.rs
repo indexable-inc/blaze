@@ -20,6 +20,8 @@
 //!   ...), descriptors (`read`/`write`/`pread`/`lseek`/`fcntl`/`isatty`, ...), clocks and sleep;
 //! - the pthread calls single-threaded std makes (keys, attributes; creating a thread is
 //!   `ENOTSUP`);
+//! - entropy for the `getrandom` crate's `custom` backend, which this target selects
+//!   ([`rt::random`]);
 //! - `memcpy`/`memmove`/`memset`/`memcmp`/`bcmp`/`strlen`, which compiler_builtins leaves to
 //!   libc on WASI, with compiler_builtins' own implementation.
 //!
@@ -46,6 +48,7 @@ mod rt {
     pub(crate) mod mem;
     pub(crate) mod path;
     pub(crate) mod pthread;
+    pub(crate) mod random;
     pub(crate) mod seed;
     pub(crate) mod start;
     pub(crate) mod time;

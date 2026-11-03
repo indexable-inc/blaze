@@ -102,7 +102,7 @@ fn span_with_ctxt_from_mark(
     }
 }
 
-pub(super) fn apply_mark(
+pub fn apply_mark(
     db: &Db,
     ctxt: span::SyntaxContext,
     call_id: span::MacroCallId,

@@ -127,7 +127,7 @@ fn a_for_const_body_is_checked_once_against_its_binders_bounds() {
         "//- minicore: sized, copy, clone\n#![feature(blaze_comptime, lang_items)]\n{REFLECT}{BODIES}"
     );
     let db = fixture::db(&fixture).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let bounded = function(&db, "bounded");
         let lowered =
             GenericPredicates::query_with_diagnostics(&db, GenericDefId::FunctionId(bounded));
@@ -180,7 +180,7 @@ fn a_for_const_body_is_checked_once_against_its_binders_bounds() {
 fn without_the_feature_inference_sees_no_comptime_loop() {
     let fixture = format!("//- minicore: sized, copy, clone\n{REFLECT}{BODIES}");
     let db = fixture::db(&fixture).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         for name in ["bounded", "unbounded"] {
             let func = function(&db, name);
             let result = infer(&db, func);
@@ -226,7 +226,7 @@ where
 "#
     );
     let db = fixture::db(&fixture).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let nested = function(&db, "nested");
         assert_env_has_no_error(&db, nested);
         let result = infer(&db, nested);
@@ -274,7 +274,7 @@ where
 "#
     );
     let db = fixture::db(&fixture).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let through = function(&db, "through");
         assert_env_has_no_error(&db, through);
         let result = infer(&db, through);
@@ -320,7 +320,7 @@ where
 "#
     );
     let db = fixture::db(&fixture).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let dependent = function(&db, "dependent");
         let lowered =
             GenericPredicates::query_with_diagnostics(&db, GenericDefId::FunctionId(dependent));

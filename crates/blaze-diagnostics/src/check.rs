@@ -44,6 +44,27 @@ pub struct Options {
     pub future_breakage_report: bool,
 }
 
+/// A crate's check as a build keeps it: its diagnostics, and whether its items are broken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrateCheck {
+    pub diags: Vec<Diag>,
+    /// An error that is not a lint's was found outside every body: in parsing, in resolving
+    /// names outside bodies, in an item's own check (a signature, an impl, a type's
+    /// well-formedness, an enum's discriminant). The crates that depend on `krate` read its
+    /// items, so with this false a failed check leaves them as sound as a clean one would: its
+    /// errors are all in bodies (inference, borrow, match and unsafety checks, what lowering
+    /// and expanding a body found, the items a body's blocks declare) or are lints denied.
+    /// Always false when nothing is an error.
+    pub items_broken: bool,
+}
+
+/// Whether `found`, found outside every body, breaks the crate's items ([`CrateCheck`]): an
+/// error that is not a lint's. A lint's level is decided later, and a lint denied changes no
+/// type.
+fn breaks_items(found: &Found) -> bool {
+    found.diag.is_error() && !found.diag.is_lint()
+}
+
 /// What rustc says compiling `krate`: its diagnostics in the order it writes them, then its
 /// closing ones ("aborting due to ...", "For more information about this error, ...").
 pub fn check_crate(
@@ -52,9 +73,9 @@ pub fn check_crate(
     files: Files<'_>,
     options: &Options,
 ) -> Vec<Diag> {
-    hir::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let plan = Plan::new(db, &[krate], &hir::check::every_body);
-        frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, &plan, frame))
+        frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, &plan, frame).diags)
     })
 }
 
@@ -67,8 +88,8 @@ pub fn check_planned(
     plan: &Plan<'_, impl Fn(hir::DefWithBody) -> bool + Sync + ?Sized>,
     files: Files<'_>,
     options: &Options,
-) -> Vec<Diag> {
-    hir::attach_db(db, || frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, plan, frame)))
+) -> CrateCheck {
+    blaze_query::db::attach(db, || frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, plan, frame)))
 }
 
 /// blaze: the check of a dependency of which nothing else is checked (only what the build's
@@ -82,7 +103,7 @@ pub fn check_planned(
 /// error. Empty for a crate
 /// whose expansion and lowering found nothing and with no sealed trait in its graph.
 pub fn check_reached_only(db: &Db, krate: hir::Crate, files: Files<'_>, options: &Options) -> Vec<Diag> {
-    hir::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let expanded = hir::check::check_expansions(db, krate);
         let sealed = hir::check::check_sealed(db, krate);
         if expanded.is_empty() && sealed.diagnostics.is_empty() && sealed.foreign_impls.is_empty() {
@@ -131,6 +152,46 @@ pub fn check_reached_only(db: &Db, krate: hir::Crate, files: Files<'_>, options:
     })
 }
 
+/// blaze: the front end's errors of the one body `def`, for a build that reached it and could
+/// not compile it in a crate no unit checks (the toolchain's: only a program's codegen reaches
+/// its bodies, where a failure is only "MIR that failed to lower"). What rustc's check of its
+/// crate says of that body: its expansion, inference, borrow, match and unsafety checks
+/// ([`hir::check::check_body`]), and a name defined twice in one of its blocks (E0428 and its
+/// kin). Errors only, its lints left out as a dependency's are, in rustc's order, each with a
+/// note naming the body; empty when the front end finds none, which leaves the failure blaze's.
+pub fn check_one_body(db: &Db, def: hir_def::DefWithBodyId, files: Files<'_>) -> Vec<Diag> {
+    blaze_query::db::attach(db, || {
+        let krate = hir::Crate::from(hir_def::HasModule::krate(&def, db));
+        let found = hir::check::check_body(db, def, false);
+        frame::task(Tag::Diagnostics, |frame| {
+            let cx = Cx::new(db, krate, files, frame);
+            let error = |it: &Found| it.diag.is_error() && !it.diag.is_lint();
+            // alloc: the error path, the few errors of one body that failed
+            let mut lowered: Vec<Found> = Vec::new();
+            for diagnostic in found {
+                lowered.extend(lower::lower(&cx, diagnostic).into_iter().filter(error));
+            }
+            lowered.extend(checks::block_conflicts(&cx, def).into_iter().filter(error));
+            if lowered.is_empty() {
+                return Vec::new(); // alloc: empty, allocates nothing
+            }
+            radix::sort_by_key(&mut lowered, |it| it.phase as u8);
+            // alloc: the error path, the body's path, once
+            let mut path = String::new();
+            hir_def::span_names::write_body_path(db, def, &mut path);
+            let diags = lowered
+                .into_iter()
+                .map(|mut it| {
+                    // alloc: the error path, the note naming the body
+                    it.diag.note(format!("in the body of `{path}`"));
+                    it.diag
+                })
+                .collect(); // alloc: the error path, as above
+            finish(diags, false)
+        })
+    })
+}
+
 /// The check of `krate`, its tables in `frame`, its bodies by `plan`.
 fn run(
     db: &Db,
@@ -139,40 +200,53 @@ fn run(
     options: &Options,
     plan: &Plan<'_, impl Fn(hir::DefWithBody) -> bool + Sync + ?Sized>,
     frame: &Frame,
-) -> Vec<Diag> {
+) -> CrateCheck {
     let cx = Cx::new(db, krate, files, frame).with_lints(&options.lints);
     let parsed = lower::parse::parsed(&cx);
     if parsed.fatal {
+        // A file that does not parse: no item of it is known.
         // alloc: a file that does not parse, the error path
-        return written(parsed.found.into_iter().map(|it| it.diag).collect(), options);
+        let diags = written(parsed.found.into_iter().map(|it| it.diag).collect(), options);
+        return CrateCheck { diags, items_broken: true };
     }
     let mut found: Vec<Found> = parsed.found;
-    let mut checked = plan.run(cx.db, false);
+    let mut items_broken = found.iter().any(breaks_items);
+    let mut checked = plan.run_marked(cx.db, false);
     assert_eq!(checked.len(), 1, "a plan of the one crate checked");
-    for diagnostic in checked.pop().expect("a plan of one crate") {
+    let checked = checked.pop().expect("a plan of one crate");
+    for (diagnostic, in_body) in checked.diagnostics.into_iter().zip(checked.in_body) {
+        let at = found.len();
         found.extend(lower::lower(&cx, diagnostic));
+        items_broken |= !in_body && found[at..].iter().any(breaks_items);
     }
+    let at = found.len();
     found.extend(checks::check(&cx));
     found.extend(lints::early(&cx, &options.lints));
+    items_broken |= found[at..].iter().any(breaks_items);
     radix::sort_by_key(&mut found, |it| it.phase as u8);
     if let Some(at) = found.iter().position(|it| it.diag.fatal) {
         found.truncate(at + 1);
         let mut diags = lints::decide(&cx, &options.lints, found, true);
         let stop = diags.iter().position(|it| it.fatal).expect("deciding levels keeps every error");
         diags.truncate(stop + 1);
-        return written(diags, options);
+        // rustc stops at a fatal error: what it did not check is not known to be sound.
+        return CrateCheck { diags: written(diags, options), items_broken: true };
     }
     let aborted = found.iter().any(stops_before_late);
     if !aborted {
         let mut late = lints::late(&cx);
         late.iter_mut().filter(|it| it.phase < Phase::Late).for_each(|it| it.phase = Phase::Late);
+        items_broken |= late.iter().any(breaks_items);
         found.extend(late);
     }
     let (stashed, found): (Vec<Found>, Vec<Found>) =
         found.into_iter().partition(|it| it.phase == Phase::Stashed);
     let mut diags = lints::decide(&cx, &options.lints, found, aborted);
     diags.extend(unstashed(stashed, &diags));
-    written(diags, options)
+    let diags = written(diags, options);
+    // Only a failed check leaves its items broken.
+    let items_broken = items_broken && diags.iter().any(Diag::is_error);
+    CrateCheck { diags, items_broken }
 }
 
 /// rustc's stashed warnings, written at the very end and only when nothing before them was an
@@ -412,16 +486,16 @@ mod tests {
             checked.messages()
         );
         let db = &checked.db;
-        let krate = hir::attach_db(db, || hir::check::workspace_crates(db))
+        let krate = blaze_query::db::attach(db, || hir::check::workspace_crates(db))
             .into_iter()
-            .find(|it| hir::attach_db(db, || it.display_name(db).is_some_and(|name| name.to_string() == "main")))
+            .find(|it| blaze_query::db::attach(db, || it.display_name(db).is_some_and(|name| name.to_string() == "main")))
             .expect("the fixture has a crate `main`");
         let every: fn(hir::DefWithBody) -> bool = hir::check::every_body;
         let diags = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     let plan = Plan::new(db, &[krate], &every);
-                    check_planned(db, krate, &plan, checked.files(), &Options::default())
+                    check_planned(db, krate, &plan, checked.files(), &Options::default()).diags
                 })
                 .join()
                 .expect("the check on a thread with no database attached")

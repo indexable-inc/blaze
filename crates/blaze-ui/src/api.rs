@@ -10,7 +10,7 @@ use std::fmt;
 
 use blaze_api::{
     Diagnostic, FetchVerb, Hot, HotFunction, HotSince, HotWaitKind, How, Level, LinkHow, LinkKind, Linked, NodeKind,
-    Ranked, Response, ServedCrate, TestOutcome, TestResult, Traced, Verb, Worked,
+    Ranked, Response, ServedCrate, TestOutcome, TestResult, Traced, Unchecked, Verb, Worked,
 };
 use blaze_ids::ContentId;
 use blaze_query::QueryKey;
@@ -69,6 +69,7 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             put!(out, "{} {what}\n", status(verb));
         }
         Response::BuildScript(_) | Response::UnitEnded(_) => {}
+        Response::Unchecked(unchecked) => unchecked_lines(out, unchecked, color),
         Response::Work(worked) => {
             let link = match worked.link {
                 LinkKind::Patched => "patched in place",
@@ -475,6 +476,7 @@ pub fn work_json(worked: &Worked) -> String {
         let (how, why) = match &it.how {
             LinkHow::First => ("first", &[][..]),
             LinkHow::Spliced => ("spliced", &[][..]),
+            LinkHow::Unchanged => ("unchanged", &[][..]),
             LinkHow::Full { why } => ("full", &why[..]),
         };
         put!(&mut out, ", \"how\": \"{how}\", \"why\": [");
@@ -499,6 +501,100 @@ pub fn work_json(worked: &Worked) -> String {
         placed.copied
     );
     out
+}
+
+/// The most units a line of [`unchecked_lines`] names; the JSON names every one.
+const NAMED: usize = 6;
+
+/// What a build left unchecked ([`Unchecked`]), as a short tree a person reads at the end of a
+/// failed build: each failure units were not checked behind, with how many and the first of
+/// them, then each unit that failed open and how many units were checked against its items.
+/// Empty when it names nothing.
+pub fn unchecked_lines(out: &mut String, unchecked: &Unchecked, color: bool) {
+    let note = Painted(CYAN, "note", color);
+    let skipped: usize = unchecked.behind.iter().map(|it| it.units.len()).sum();
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    if skipped > 0 {
+        match unchecked.stopped {
+            true => put!(
+                out,
+                "{note}: {skipped} unit{} not checked: the build stopped at its first failure (--keep-going checks what does not depend on it)\n",
+                plural(skipped)
+            ),
+            false => put!(out, "{note}: {skipped} unit{} not checked, behind what failed:\n", plural(skipped)),
+        }
+        for it in &unchecked.behind {
+            put!(out, "  behind {} ({}): {} unit{}\n", it.unit, it.why, it.units.len(), plural(it.units.len()));
+            named(out, &it.units);
+        }
+    }
+    // An open failure nothing depends on let nothing through: its own error says all.
+    for it in unchecked.open.iter().filter(|it| !it.checked.is_empty()) {
+        let (count, them) = match it.checked.len() {
+            1 => (1, "unit that depends on it was"),
+            n => (n, "units that depend on it were"),
+        };
+        put!(out, "{note}: {} failed only in its bodies or lints: {count} {them} checked against its items\n", it.unit);
+        named(out, &it.checked);
+    }
+}
+
+/// The first [`NAMED`] of `units` on one indented line, and how many more.
+fn named(out: &mut String, units: &[String]) {
+    if units.is_empty() {
+        return;
+    }
+    out.push_str("    ");
+    for (at, unit) in units.iter().take(NAMED).enumerate() {
+        if at > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(unit);
+    }
+    if units.len() > NAMED {
+        put!(out, ", and {} more", units.len() - NAMED);
+    }
+    out.push('\n');
+}
+
+/// [`Unchecked`] as one `blaze-unchecked` JSON line for an agent under
+/// `--message-format=json`, newline ended: every unit of it named, none left out.
+pub fn unchecked_json(unchecked: &Unchecked) -> String {
+    // alloc: the CLI's, once per failed build
+    let mut out = String::from("{\"reason\": \"blaze-unchecked\", \"stopped\": ");
+    out.push_str(if unchecked.stopped { "true" } else { "false" });
+    out.push_str(", \"behind\": [");
+    for (at, it) in unchecked.behind.iter().enumerate() {
+        out.push_str(if at == 0 { "{\"unit\": " } else { ", {\"unit\": " });
+        quoted(&mut out, &it.unit);
+        out.push_str(", \"why\": ");
+        quoted(&mut out, &it.why);
+        out.push_str(", \"units\": ");
+        quoted_list(&mut out, &it.units);
+        out.push('}');
+    }
+    out.push_str("], \"open\": [");
+    for (at, it) in unchecked.open.iter().enumerate() {
+        out.push_str(if at == 0 { "{\"unit\": " } else { ", {\"unit\": " });
+        quoted(&mut out, &it.unit);
+        out.push_str(", \"checked\": ");
+        quoted_list(&mut out, &it.checked);
+        out.push('}');
+    }
+    out.push_str("]}\n");
+    out
+}
+
+/// `items` as a JSON array of strings.
+fn quoted_list(out: &mut String, items: &[String]) {
+    out.push('[');
+    for (at, it) in items.iter().enumerate() {
+        if at > 0 {
+            out.push_str(", ");
+        }
+        quoted(out, it);
+    }
+    out.push(']');
 }
 
 /// One `link: <path> (<how>)` line an image the request linked, in its order: what

@@ -344,10 +344,18 @@ pub(crate) fn carried() -> blaze_graph::sched::Carried {
     blaze_graph::sched::Carried { take: local::take, put: local::put, end: local::end }
 }
 
-/// Puts `db`'s storage where [`with_attached`] finds it (a `Debug` impl's database) while `f`
-/// runs on this thread.
+/// Lends `db` to the `Debug` impls that read a database (the engine's own, through
+/// [`with_attached`], and a front end's, through [`with_attached_db`]) while `f` runs: the one
+/// way a database is attached. Every query's run has its own database attached; a driver
+/// attaches where it formats outside one. It is part of the task's stack, so a job that waits inside `f`
+/// and resumes on another thread still has it there, and the one attached before (another
+/// database, or none) is put back when `f` returns or unwinds.
+///
+/// Text a user reads is rendered with the database in hand; attaching is for `Debug`, and for
+/// an error's text made inside `f`, never a way to make a query's output depend on the thread
+/// that ran it.
 pub fn attach<D: Database, R>(db: &D, f: impl FnOnce() -> R) -> R {
-    struct Restore(*const Storage);
+    struct Restore(Option<local::Attached>);
 
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -356,15 +364,27 @@ pub fn attach<D: Database, R>(db: &D, f: impl FnOnce() -> R) -> R {
         }
     }
 
-    let storage: *const Storage = db.storage();
-    let _restore = Restore(local::with(|local| std::mem::replace(&mut local.attached, storage)));
+    let lent = local::Attached {
+        db: std::ptr::NonNull::from(db).cast(),
+        ty: std::any::TypeId::of::<D>(),
+        storage: std::ptr::NonNull::from(db.storage()),
+    };
+    let _restore = Restore(local::with(|local| local.attached.replace(lent)));
     f()
 }
 
-/// `f` with the storage [`attach`] put on this thread, if any.
+/// `f` with the storage of the database [`attach`] lent this task, if any.
 pub fn with_attached<R>(f: impl FnOnce(Option<&Storage>) -> R) -> R {
-    let storage = local::with(|local| local.attached);
+    let attached = local::with(|local| local.attached);
     // SAFETY: `attach` keeps the pointer only while its `&D` borrow (and so the storage) lives,
-    // on this thread, restoring the one before when it returns or unwinds.
-    f(unsafe { storage.as_ref() })
+    // in this task's stack, restoring the one before when it returns or unwinds.
+    f(attached.map(|it| unsafe { it.storage.as_ref() }))
+}
+
+/// `f` with the database [`attach`] lent this task, if one is attached and it is a `D`.
+pub fn with_attached_db<D: Database, R>(f: impl FnOnce(Option<&D>) -> R) -> R {
+    let attached = local::with(|local| local.attached);
+    let db = attached.filter(|it| it.ty == std::any::TypeId::of::<D>());
+    // SAFETY: as in `with_attached`; the type was `D` where `attach` erased it.
+    f(db.map(|it| unsafe { it.db.cast::<D>().as_ref() }))
 }

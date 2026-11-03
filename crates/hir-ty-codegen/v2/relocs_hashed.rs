@@ -555,7 +555,7 @@ fn every_vtable_and_function_a_value_relocates_to_is_hashed() {
         let db = fixture::db(&format!("//- minicore: {MINICORE}\n//- /src/lib.rs crate:kernel\n{PRELUDE}\n{text}\n")).into_db();
         let items = items(&db, case);
         assert!(!items.is_empty(), "{case}: no constant or static");
-        hir_ty::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             for item in &items {
                 check_item(&db, item, &mut found);
             }
@@ -1172,7 +1172,7 @@ fn sides(case: &str, text: &str) -> Vec<Side> {
     );
     let reads = read_consts(&db);
     assert_eq!(reads.len(), items.len(), "{case}: the readers' constants are not one per item");
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         (items.iter())
             .map(|item| {
                 let short = item.name.rsplit("::").next().expect("a name");

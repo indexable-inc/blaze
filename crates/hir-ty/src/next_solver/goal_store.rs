@@ -153,15 +153,11 @@ const SOLVER_DOMAIN: &str = "blaze v2 goal 1 solver";
 /// nightly, the vendored solver's patch series (each crate's series file and every patch), and
 /// the front end's code ([`install`]'s `build`). A patch added to a series is added here too;
 /// `the_solver_version_covers_every_patch` checks it.
-const SOLVER_FILES: [(&str, &[u8]); 23] = [
+const SOLVER_FILES: [(&str, &[u8]); 21] = [
     ("harness/toolchain", include_bytes!("../../../../harness/toolchain")),
     (
         "vendor/rustc_next_trait_solver/PATCHES.md",
         include_bytes!("../../../../vendor/rustc_next_trait_solver/PATCHES.md"),
-    ),
-    (
-        "vendor/rustc_next_trait_solver/patches/0001-opaque-of-impl.patch",
-        include_bytes!("../../../../vendor/rustc_next_trait_solver/patches/0001-opaque-of-impl.patch"),
     ),
     (
         "vendor/rustc_next_trait_solver/patches/0002-unsafe-code-policy.patch",
@@ -217,10 +213,6 @@ const SOLVER_FILES: [(&str, &[u8]); 23] = [
     (
         "vendor/rustc_type_ir/patches/0001-from-checked-parts.patch",
         include_bytes!("../../../../vendor/rustc_type_ir/patches/0001-from-checked-parts.patch"),
-    ),
-    (
-        "vendor/rustc_type_ir/patches/0002-opaque-of-impl.patch",
-        include_bytes!("../../../../vendor/rustc_type_ir/patches/0002-opaque-of-impl.patch"),
     ),
     (
         "vendor/rustc_type_ir/patches/0003-shared-solver-cache.patch",

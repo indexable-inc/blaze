@@ -200,7 +200,7 @@ fn an_edit_is_merged_into_the_program_by_key() {
     let names: Vec<_> = read(&world.snapshot(&program)).into_iter().map(|it| it.0).collect();
     assert_eq!(names, ["main"]);
     assert_eq!(program.told_count(), 1, "the last build's records, but its functions");
-    assert_eq!(records(program.told().to_vec()), [began(3, "/w")]);
+    assert_eq!(records(program.told()), [began(3, "/w")]);
 }
 
 #[test]
@@ -284,9 +284,9 @@ fn message(next: Next) -> Vec<u8> {
     }
 }
 
-fn gunzip(message: Vec<u8>) -> Vec<u8> {
+fn gunzip(message: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    flate2::read::GzDecoder::new(message.as_slice()).read_to_end(&mut out).unwrap();
+    flate2::read::GzDecoder::new(message).read_to_end(&mut out).unwrap();
     out
 }
 
@@ -300,8 +300,8 @@ fn a_page_is_sent_the_snapshot_then_each_record() {
     let cold = fns(0, true, vec![function(0, 10, "main", &[], How::Compiled { ns: 5 })]);
     graphs.record(Path::new("/w"), 1, cold.clone());
     let page = graphs.follow().unwrap();
-    assert_eq!(read(&gunzip(message(page.next(wait))))[0].0, "main");
-    assert_eq!(records(message(page.next(wait))), [began(1, "/w")]);
+    assert_eq!(read(&gunzip(&message(page.next(wait))))[0].0, "main");
+    assert_eq!(records(&message(page.next(wait))), [began(1, "/w")]);
     done();
     assert!(
         matches!(page.next(Duration::ZERO), Next::Nothing),
@@ -311,16 +311,16 @@ fn a_page_is_sent_the_snapshot_then_each_record() {
     // one's build begins, which sends its program, then the Began.
     let said = Record { at_ns: 2, event: Event::Unlisted { count: 3 } };
     graphs.record(Path::new("/w"), 1, said.clone());
-    assert_eq!(records(message(page.next(wait))), [said.clone()]);
+    assert_eq!(records(&message(page.next(wait))), [said.clone()]);
     graphs.record(Path::new("/v"), 2, said.clone());
     done();
     assert!(matches!(page.next(Duration::ZERO), Next::Nothing));
     graphs.record(Path::new("/v"), 3, began(3, "/v"));
-    assert!(read(&gunzip(message(page.next(wait)))).is_empty());
-    assert_eq!(records(message(page.next(wait))), [began(3, "/v")]);
+    assert!(read(&gunzip(&message(page.next(wait)))).is_empty());
+    assert_eq!(records(&message(page.next(wait))), [began(3, "/v")]);
     // A whole object of the workspace shown sends the program anew, with the record in it.
     graphs.record(Path::new("/v"), 3, cold);
-    assert_eq!(read(&gunzip(message(page.next(wait))))[0].0, "main");
+    assert_eq!(read(&gunzip(&message(page.next(wait))))[0].0, "main");
     done();
     assert!(
         matches!(page.next(Duration::ZERO), Next::Nothing),
@@ -369,7 +369,7 @@ fn until_a_page_is_asked_for_only_what_makes_the_program_is_kept() {
     assert_eq!(kept, made);
     let page = graphs.follow().unwrap();
     assert!(graphs.kept().is_empty());
-    let mut names: Vec<String> = read(&gunzip(message(page.next(Duration::from_secs(10)))))
+    let mut names: Vec<String> = read(&gunzip(&message(page.next(Duration::from_secs(10)))))
         .into_iter()
         .map(|it| it.0)
         .collect();
@@ -377,7 +377,7 @@ fn until_a_page_is_asked_for_only_what_makes_the_program_is_kept() {
     assert_eq!(names, ["anim::main", "anim::scene::render"]);
     let wait = Duration::from_secs(10);
     // The last build's records, encoded once as they came, in one frame.
-    assert_eq!(records(message(page.next(wait))), [began(4, "/w"), said]);
+    assert_eq!(records(&message(page.next(wait))), [began(4, "/w"), said]);
 }
 
 #[test]
@@ -391,7 +391,7 @@ fn the_flecs_rest_of_the_page_is_under_its_token() {
 }
 
 /// The records of a message: a CBOR sequence of them.
-fn records(message: Vec<u8>) -> Vec<Record> {
+fn records(message: &[u8]) -> Vec<Record> {
     let (mut out, mut at) = (Vec::new(), 0);
     while at < message.len() {
         let end = at + item_len(&message[at..]);
@@ -603,9 +603,9 @@ fn told(page: &Following) -> (Vec<Told>, usize) {
     while let Some(message) = page.ready() {
         messages += 1;
         if message.starts_with(&[0x1f, 0x8b]) {
-            out.push(Told::Snapshot(gunzip(message.to_vec())));
+            out.push(Told::Snapshot(gunzip(&message[..])));
         } else {
-            out.extend(records(message.to_vec()).into_iter().map(Told::Record));
+            out.extend(records(&message[..]).into_iter().map(Told::Record));
         }
     }
     (out, messages)
@@ -659,7 +659,7 @@ fn a_snapshot_is_made_again_once_its_program_changes() {
         {
             let cached = state.snapshot(shown).unwrap();
             let made = state.world.snapshot(&state.programs[shown]);
-            assert_eq!(gunzip(cached.to_vec()), made, "record {at}");
+            assert_eq!(gunzip(&cached[..]), made, "record {at}");
             assert!(Arc::ptr_eq(&cached, &state.snapshot(shown).unwrap()), "made once");
         }
     }

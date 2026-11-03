@@ -51,11 +51,27 @@ pub(crate) struct Sample {
     pub(crate) on_cpu: bool,
 }
 
+/// A ring of samples: the process's is [`SAMPLES`], which the sampler keeps into.
 struct Samples {
     ring: Vec<Sample>,
     next: u64,
     /// What the sampler is: on and how, or why it is off.
     state: String,
+}
+
+impl Samples {
+    /// Keeps `batch`, over the oldest once [`KEPT`] are.
+    fn keep(&mut self, batch: &[Sample]) {
+        for sample in batch {
+            if self.ring.len() < KEPT {
+                self.ring.push(*sample);
+            } else {
+                let at = (self.next % KEPT as u64) as usize;
+                self.ring[at] = *sample;
+            }
+            self.next += 1;
+        }
+    }
 }
 
 static SAMPLES: Mutex<Samples> =
@@ -66,18 +82,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock()
 }
 
-/// Keeps `batch`, over the oldest once [`KEPT`] are.
+/// Keeps `batch` in the process's ring, over the oldest once [`KEPT`] are.
 pub(crate) fn keep(batch: &[Sample]) {
-    let mut samples = lock(&SAMPLES);
-    for sample in batch {
-        if samples.ring.len() < KEPT {
-            samples.ring.push(*sample);
-        } else {
-            let at = (samples.next % KEPT as u64) as usize;
-            samples.ring[at] = *sample;
-        }
-        samples.next += 1;
-    }
+    lock(&SAMPLES).keep(batch);
 }
 
 /// The samples kept since sample number `next` (of every sample ever kept), into `into`; moves
@@ -232,8 +239,9 @@ mod tests {
         let at = Instant::now();
         let sample = |tid| Sample { at, tid, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu: true };
         let batch: Vec<Sample> = (0..KEPT as u64 + 10).map(sample).collect();
-        keep(&batch);
-        let samples = lock(&SAMPLES);
+        // A ring of its own: the process's is the sampler's, which another test runs.
+        let mut samples = Samples { ring: Vec::new(), next: 0, state: String::new() };
+        samples.keep(&batch);
         assert_eq!(samples.ring.len(), KEPT);
         let mut tids: Vec<u64> = samples.ring.iter().map(|it| it.tid).collect();
         tids.sort_unstable();

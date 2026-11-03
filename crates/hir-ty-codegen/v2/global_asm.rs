@@ -55,7 +55,7 @@ impl HirFrontend<'_> {
 }
 
 fn error(what: String) -> CodegenError {
-    CodegenError { unit: InstanceKey(ContentId::default()), item: ItemKey(ContentId::default()), what }
+    CodegenError { unit: InstanceKey(ContentId::default()), item: ItemKey(ContentId::default()), what, front: None }
 }
 
 /// What the link's ID of a crate's `global_asm!` object is derived under.
@@ -82,7 +82,7 @@ impl Block {
 }
 
 fn object(db: &Db, krate: Crate, triple: &str) -> Result<Option<GlobalAsmObject>, String> {
-    let crate_name = crate::fncache::crate_name(db, krate);
+    let crate_name = krate.named(db).to_string(); // alloc: the crate's name in the errors
     let target = Target::of(triple)?;
     let blocks = blocks(db, krate, &crate_name, target.arch)?;
     if blocks.is_empty() {

@@ -124,7 +124,7 @@ fn part(wire: WirePart) -> Result<(SpanAnchor, SyntaxContext), String> {
 
 fn read(bytes: &[u8]) -> Result<(TopSubtree, usize), WireError> {
     let mut resolve = part;
-    TopSubtree::read_wire(bytes, &mut resolve)
+    TopSubtree::read_wire(bytes, tt::WireLimits::DEFAULT, &mut resolve)
 }
 
 fn check(data: &[u8]) {

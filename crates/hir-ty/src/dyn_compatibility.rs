@@ -4,7 +4,7 @@ use std::ops::ControlFlow;
 
 use base_db::Db;
 use hir_def::{
-    AssocItemId, ConstId, FunctionId, GenericDefId, HasModule, ItemContainerId, Lookup, TraitId,
+    AssocItemId, ConstId, FunctionId, GenericDefId, HasModule, TraitId,
     TypeAliasId, TypeOrConstParamId, TypeParamId,
     hir::generics::{GenericParams, LocalTypeOrConstParamId},
     signatures::{FunctionSignature, TraitFlags, TraitSignature},
@@ -16,11 +16,12 @@ use rustc_type_ir::{
 };
 
 use crate::{
-    ImplTraitId, PredicateSource,
+    PredicateSource,
     db::HirDatabase,
     lower::{GenericPredicates, ImplTraitIdx},
     next_solver::{
-        AliasTy, Binder, Clause, Clauses, DbInterner, EarlyBinder, GenericArgs, ParamEnv, ParamTy,
+        AliasTy, AssocTyId, Binder, Clause, Clauses, DbInterner, EarlyBinder, GenericArgs, ParamEnv,
+        ParamTy, TraitAssocTyId,
         SolverDefId, TraitClause, TraitRef, Ty, TypingMode, Unnormalized,
         infer::{
             DbInternerInferExt,
@@ -274,7 +275,7 @@ fn method_site(
                 index: arg as u32 + 1,
             }),
         MethodViolationCode::ReferencesSelfOutput => ViolationSite::Output(function),
-        MethodViolationCode::ReferencesImplTraitInTrait => return_impl_trait(db, &sig)
+        MethodViolationCode::ReferencesImplTraitInTrait => return_impl_trait(&sig)
             .map_or(ViolationSite::Name(function.into()), |index| ViolationSite::Opaque {
                 function,
                 index,
@@ -405,6 +406,18 @@ fn contains_illegal_self_type_reference<'db, T: rustc_type_ir::TypeVisitable<DbI
             match ty.kind() {
                 rustc_type_ir::TyKind::Param(param) if param.index == 0 => ControlFlow::Break(()),
                 rustc_type_ir::TyKind::Param(_) => ControlFlow::Continue(()),
+                // rustc's `is_impl_trait_in_trait` skip: a trait's own `impl Trait` is
+                // `ReferencesImplTraitInTrait`, denied in its own pass.
+                rustc_type_ir::TyKind::Alias(
+                    _,
+                    AliasTy {
+                        kind:
+                            AliasTyKind::Projection {
+                                def_id: TraitAssocTyId(AssocTyId::RpititId(_)),
+                            },
+                        ..
+                    },
+                ) => ControlFlow::Continue(()),
                 rustc_type_ir::TyKind::Alias(
                     _,
                     proj @ AliasTy { kind: AliasTyKind::Projection { .. }, .. },
@@ -419,15 +432,6 @@ fn contains_illegal_self_type_reference<'db, T: rustc_type_ir::TypeVisitable<DbI
                     }
                     AllowSelfProjections::No => ty.super_visit_with(self),
                 },
-                // rustc's `is_impl_trait_in_trait` skip: a trait's own `impl Trait` is
-                // `ReferencesImplTraitInTrait`, denied in its own pass.
-                rustc_type_ir::TyKind::Alias(
-                    _,
-                    AliasTy { kind: AliasTyKind::Opaque { def_id }, .. },
-                ) if is_impl_trait_in_trait(self.db, def_id.0.loc(self.db)) =>
-                {
-                    ControlFlow::Continue(())
-                }
                 _ => ty.super_visit_with(self),
             }
         }
@@ -435,15 +439,6 @@ fn contains_illegal_self_type_reference<'db, T: rustc_type_ir::TypeVisitable<DbI
 
     let mut visitor = IllegalSelfTypeVisitor { db, trait_, allow_self_projection };
     t.visit_with(&mut visitor).is_break()
-}
-
-fn is_impl_trait_in_trait(db: &Db, id: ImplTraitId) -> bool {
-    match id {
-        ImplTraitId::ReturnTypeImplTrait(function, _) => {
-            matches!(function.lookup(db).container, ItemContainerId::TraitId(_))
-        }
-        ImplTraitId::TypeAliasImplTrait(..) => false,
-    }
 }
 
 fn dyn_compatibility_violation_for_assoc_item<'db, F>(
@@ -527,7 +522,7 @@ where
     }
 
     if !func_data.is_async()
-        && let Some(mvc) = contains_illegal_impl_trait_in_trait(db, &sig)
+        && let Some(mvc) = contains_illegal_impl_trait_in_trait(&sig)
     {
         cb(mvc)?;
     }
@@ -664,41 +659,32 @@ fn receiver_for_self_ty<'db>(
 }
 
 fn contains_illegal_impl_trait_in_trait<'db>(
-    db: &'db Db,
     sig: &EarlyBinder<'db, Binder<'db, rustc_type_ir::FnSig<DbInterner<'db>>>>,
 ) -> Option<MethodViolationCode> {
-    return_impl_trait(db, sig).map(|_| MethodViolationCode::ReferencesImplTraitInTrait)
+    return_impl_trait(sig).map(|_| MethodViolationCode::ReferencesImplTraitInTrait)
 }
 
 /// The first return-position `impl Trait` of `sig`'s return type, where rustc's
 /// `contains_illegal_impl_trait_in_trait` points.
 fn return_impl_trait<'db>(
-    db: &'db Db,
     sig: &EarlyBinder<'db, Binder<'db, rustc_type_ir::FnSig<DbInterner<'db>>>>,
 ) -> Option<ImplTraitIdx> {
-    struct ReturnTypeImplTrait<'db>(&'db Db);
+    struct ReturnTypeImplTrait;
 
-    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for ReturnTypeImplTrait<'db> {
+    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for ReturnTypeImplTrait {
         type Result = ControlFlow<ImplTraitIdx>;
 
         fn visit_ty(
             &mut self,
             ty: <DbInterner<'db> as rustc_type_ir::Interner>::Ty,
         ) -> Self::Result {
-            if let rustc_type_ir::TyKind::Alias(
-                _,
-                AliasTy { kind: AliasTyKind::Opaque { def_id }, .. },
-            ) = ty.kind()
-                && let ImplTraitId::ReturnTypeImplTrait(_, index) = def_id.0.loc(self.0)
-            {
-                return ControlFlow::Break(index);
+            if let Some((rpitit, _)) = crate::rpitit::as_rpitit(ty) {
+                return ControlFlow::Break(rpitit.idx);
             }
             ty.super_visit_with(self)
         }
     }
 
-    // Since we haven't implemented RPITIT in proper way like rustc yet,
-    // just check whether `ret` contains RPIT for now
     let ret = sig.skip_binder().output();
-    ret.visit_with(&mut ReturnTypeImplTrait(db)).break_value()
+    ret.visit_with(&mut ReturnTypeImplTrait).break_value()
 }

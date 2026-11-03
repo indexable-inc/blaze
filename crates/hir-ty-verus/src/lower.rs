@@ -407,7 +407,11 @@ impl<'db> Lower<'db> {
             TyKind::Uint(UintTy::U64) => IntRange::U(64),
             TyKind::Uint(UintTy::U128) => IntRange::U(128),
             TyKind::Uint(UintTy::Usize) => IntRange::USize,
-            _ => return Err(unsupported(&self.display, format!("a value of type `{ty:?}`"), at())),
+            _ => {
+                // `Debug` names the type only through the attached database.
+                let what = blaze_query::db::attach(self.db, || format!("a value of type `{ty:?}`")); // alloc: error message
+                return Err(unsupported(&self.display, what, at()));
+            }
         };
         Ok(Arc::new(TypX::Int(range)))
     }

@@ -84,7 +84,7 @@ pub(crate) struct Summary {
 /// the key never guesses the bit.
 pub fn code_id(db: &Db, root: &Instance, env: &StoredParamEnvAndCrate) -> Result<CodeId, Unidentified> {
     let Some(checked) = overflow::crate_checks_overflow(db, env.krate) else {
-        let krate = crate::crate_named(db, env.krate);
+        let krate = env.krate.named(db);
         return Err(Unidentified::of(
             db,
             root,
@@ -96,7 +96,7 @@ pub fn code_id(db: &Db, root: &Instance, env: &StoredParamEnvAndCrate) -> Result
         ));
     };
     // clone: the query's keys, reference counts; an error's text, once
-    hir_ty::attach_db(db, || code_id_of(db, root.clone(), env.clone(), checked).clone())
+    blaze_query::db::attach(db, || code_id_of(db, root.clone(), env.clone(), checked).clone())
 }
 
 /// [`code_id`] of the function item or closure type `callable`, as const eval answers
@@ -107,7 +107,7 @@ pub fn fn_code_id<'db>(
     callable: Ty<'db>,
     env: &StoredParamEnvAndCrate,
 ) -> Result<CodeId, Unidentified> {
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let cx = Cx::new(db, env);
         // alloc: error path
         let refuse = |what: String| Unidentified::named(format!("`{callable:?}`"), what);

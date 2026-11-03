@@ -52,7 +52,7 @@ impl<'db> Databases<'db> {
     /// Runs `work` with the database attached to its thread, which any formatted type or
     /// constant (an error's message, a panic's) needs, on whichever worker the task is.
     pub(crate) fn with<T>(&self, work: impl FnOnce(&Db) -> T) -> T {
-        hir_ty::attach_db(self.db, || work(self.db))
+        blaze_query::db::attach(self.db, || work(self.db))
     }
 }
 
@@ -414,7 +414,8 @@ impl<'db> HirFrontend<'db> {
             kind => item_of(db, kind).and_then(|item| hashes.item(db, item)),
         }
         .map_err(|what| undescribed(db, &super::Named(db, instance), None, what))?;
-        let fail = |what: String| undescribed(db, &super::Named(db, instance), Some(item), what);
+        // Each failure past here is the front end's of this instance: the error carries its item.
+        let fail = |what: String| super::failed_in_front(db, None, Some(item), instance, what);
         let generic = generic(&instance.0);
         let origin = match crate_of(db, &instance.0) {
             Some(krate) if !generic => self.origin(db, krate),
@@ -506,7 +507,7 @@ impl<'db> HirFrontend<'db> {
             Ok(identity) => Ok(Hasher::new(SHARED_ARGS_DOMAIN).id(&identity.0).finish()),
             Err(why) if per_instance(why) => args_of(db, &self.hashes, kind),
             // alloc: the error's message
-            Err(why) => Err(hir_ty::attach_db(db, || format!("no compile identity for {instance:?}: {why}"))),
+            Err(why) => Err(blaze_query::db::attach(db, || format!("no compile identity for {instance:?}: {why}"))),
         }
     }
 
@@ -529,7 +530,7 @@ impl<'db> HirFrontend<'db> {
                 Package::new(name.as_str())
             }
             CrateOrigin::Local { name: None, .. } | CrateOrigin::Rustc { .. } => {
-                Package::new(&fncache::crate_name(db, krate))
+                Package::new(&krate.named(db).to_string())
             }
         };
         if self.build_time.0 {
@@ -819,7 +820,7 @@ fn past_recursion_limit(
     limit_of: &HirInstance,
 ) -> CodegenError {
     let krate = match limit_crate(db, &limit_of.0) {
-        Some(krate) => fncache::crate_name(db, krate),
+        Some(krate) => krate.named(db).to_string(), // alloc: an error's text
         None => "<none>".to_owned(), // alloc: an error's text; a head of no crate has no limit
     };
     let (body, counted) = match &instance.0 {
@@ -844,6 +845,7 @@ fn past_recursion_limit(
             spelled(db, &instance.0),
             spelled(db, &head.0),
         ),
+        front: None,
     }
 }
 
@@ -1171,7 +1173,7 @@ fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String
     match instance.def {
         InstanceDef::Fn(func) => {
             let code = hashes.code(db, Body::Item(func.into()))?;
-            let written = hir_ty::attach_db(db, || fncache::written_code(db, func, instance, env));
+            let written = blaze_query::db::attach(db, || fncache::written_code(db, func, instance, env));
             let Some(written) = written else {
                 return Ok(code);
             };

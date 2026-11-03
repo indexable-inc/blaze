@@ -176,6 +176,17 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     /// [`check_module`](super::check_module) of each of their file modules gives, one after
     /// the other. A plan runs once.
     pub fn run<'db>(&self, db: &'db Db, style_lints: bool) -> Vec<Vec<AnyDiagnostic<'db>>> {
+        // alloc: once a check, a word per crate
+        self.run_marked(db, style_lints).into_iter().map(|it| it.diagnostics).collect()
+    }
+
+    /// [`Plan::run`], each crate's diagnostics marked by where they were found: in a body's
+    /// task (inside a body: its inference, borrow and match checks, its macro calls, and the
+    /// items its blocks declare) or not (the items' own checks: their signatures, impls,
+    /// well-formedness, an enum's discriminants). What depends on a crate reads its items,
+    /// never its bodies' errors, so a crate whose every error is in a body leaves its items
+    /// usable (blaze-cargo's open failure under `--keep-going`).
+    pub fn run_marked<'db>(&self, db: &'db Db, style_lints: bool) -> Vec<CrateFound<'db>> {
         assert!(!self.started.swap(true, Ordering::Relaxed), "a plan of a check runs once");
         #[expect(clippy::disallowed_types, reason = "diagnostics and marks, set once per module of the check: not global")]
         let modules: Vec<std::sync::OnceLock<Checked<'db>>> = self.modules.iter().map(|_| std::sync::OnceLock::new()).collect();
@@ -260,12 +271,14 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         &self,
         modules: Vec<std::sync::OnceLock<Checked<'db>>>,
         mut bodies: Vec<std::sync::OnceLock<Vec<AnyDiagnostic<'db>>>>,
-    ) -> Vec<Vec<AnyDiagnostic<'db>>> {
+    ) -> Vec<CrateFound<'db>> {
         let mut out = Vec::with_capacity(self.crate_ends.len());
         let mut modules = modules.into_iter().enumerate();
         let mut from = 0;
         for &end in &self.crate_ends {
             let mut found = Vec::new();
+            // alloc: once a crate checked, a flag per diagnostic; none for a clean crate
+            let mut in_body = Vec::new();
             for (at, slot) in modules.by_ref().take((end - from) as usize) {
                 let (own, marks) = slot.into_inner().expect("`run_all` returned before a task of the check ran");
                 let first = self.starts[at] as usize;
@@ -277,11 +290,14 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
                     let body = bodies[first + nth].take().unwrap_or_else(|| {
                         panic!("body {:?} of the check was never checked", self.bodies[first + nth].def)
                     });
+                    in_body.resize(found.len(), false);
                     found.extend(body);
+                    in_body.resize(found.len(), true);
                 }
                 found.extend(own);
             }
-            out.push(found);
+            in_body.resize(found.len(), false);
+            out.push(CrateFound { diagnostics: found, in_body });
             from = end;
         }
         out
@@ -298,6 +314,13 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     pub(crate) fn listed(&self) -> Vec<DefWithBodyId> {
         self.bodies.iter().map(|it| it.def).collect()
     }
+}
+
+/// One crate's diagnostics as [`Plan::run_marked`] gives them.
+pub struct CrateFound<'db> {
+    pub diagnostics: Vec<AnyDiagnostic<'db>>,
+    /// By diagnostic: whether a body's task found it ([`Plan::run_marked`]).
+    pub in_body: Vec<bool>,
 }
 
 /// A module's diagnostics, and the place in them of each of its listed bodies'.

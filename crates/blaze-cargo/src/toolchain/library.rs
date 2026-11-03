@@ -211,7 +211,9 @@ fn fetch_into(dir: &Path, from: &str, want: &str) -> anyhow::Result<Library> {
     let name = name.to_string_lossy();
     std::fs::create_dir_all(parent)?;
     let lock = std::fs::File::create(parent.join(format!(".{name}.lock")))?;
-    lock.lock()?;
+    // Held until the library is made, and let go of then even while a child spawned meanwhile
+    // still has the file open.
+    let _lock = stdx::file_lock::Locked::lock(lock)?;
     if let Some(there) = Library::at(dir.to_owned()).filter(|it| it.digest == want) {
         return Ok(there);
     }

@@ -136,6 +136,7 @@ where
                  {to}, which is the workspace's: the image would change with workspace code",
                 it.named,
             ),
+            front: None,
         });
     }
     owned

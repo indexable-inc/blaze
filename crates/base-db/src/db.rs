@@ -23,6 +23,7 @@ use std::{
 
 use crossbeam_queue::SegQueue;
 
+use blaze_ids::ContentId;
 use blaze_mem::{Tag, frame};
 use blaze_query::db::Durability;
 use span::{FileId, TextSize};
@@ -34,7 +35,7 @@ use crate::{
     LibraryRoots, LocalRoots, Nonce, SourceRoot, SourceRootId, SourceRootInput, ViewChange,
     ViewError, ViewRoot,
     editioned_file_id::Parses,
-    maintain::{Maintenance, Note},
+    maintain::{Maintenance, Note, Trigger},
     set_all_crates_with_durability,
 };
 
@@ -207,6 +208,18 @@ impl Db {
         self.files.has_file_text(file_id)
     }
 
+    /// [`Files::raw_file`]: the bytes of a file of the VFS that has no text.
+    #[inline]
+    pub fn raw_file(&self, file_id: FileId) -> Option<IncludedFile> {
+        self.files.raw_file(file_id)
+    }
+
+    /// [`Files::file_content`]: the content ID a file has in its source root, text or bytes.
+    #[inline]
+    pub fn file_content(&self, file_id: FileId) -> ContentId {
+        self.files.file_content(self, file_id)
+    }
+
     /// [`Files::new_file_id`]: where a caller that numbers its own files takes each new one.
     pub fn new_file_id(&mut self) -> Option<FileId> {
         self.files.new_file_id()
@@ -251,6 +264,44 @@ impl Db {
             }
             changed
         })
+    }
+
+    /// Reads again each file outside the VFS that `include_bytes!` or `include_str!` read,
+    /// through the one reader that read it first ([`Files::reload_included_file`]), and sets
+    /// those whose read moved in one batch named by `trigger`: so exactly their readers run
+    /// again. A read moves when the bytes do, or when a file becomes unreadable or readable
+    /// again, or fails another way: [`IncludedFile`] holds the `Result`, and the macro that
+    /// reads it reports the error naming the path, as rustc does. The paths set, sorted; when
+    /// none moved, nothing is written and no maintenance pass runs. O(the files' bytes), once
+    /// per call: for whoever owns the database across changes on disk (a daemon's kept front
+    /// end, each job), as a file outside the VFS can change with no change of the VFS.
+    pub fn reload_included_files(&mut self, trigger: Trigger<'_>) -> Vec<AbsPathBuf> {
+        let files = Arc::clone(&self.files);
+        let span = tracing::info_span!(
+            target: "blaze",
+            "included files read again",
+            files = tracing::field::Empty,
+            moved = tracing::field::Empty,
+        )
+        .entered();
+        let mut read = 0_u64;
+        let db: &Db = self;
+        let mut moved: Vec<AbsPathBuf> = files
+            .included_paths()
+            .inspect(|_| read += 1)
+            .filter(|path| !files.included_is_read(db, path))
+            .map(|path| path.to_path_buf()) // alloc: a path that moved, the result
+            .collect(); // alloc: none unless a file moved; the paths are the result
+        span.record("files", read);
+        if moved.is_empty() {
+            span.record("moved", 0_u64);
+            return moved;
+        }
+        moved.sort();
+        // Read once more as each is set: one changed back since is not set, nor listed.
+        self.batch(trigger, |db| moved.retain(|path| db.reload_included_file(path)));
+        span.record("moved", moved.len() as u64);
+        moved
     }
 
     pub fn set_file_source_root_with_durability(
@@ -493,7 +544,11 @@ impl Db {
                     let ran = panic::catch_unwind(panic::AssertUnwindSafe(|| run(item)));
                     if let Err(payload) = ran {
                         match payload.downcast_ref::<blaze_query::db::Cancelled>() {
-                            Some(blaze_query::db::Cancelled::WouldWaitOnItself { .. }) => again.push(at),
+                            Some(blaze_query::db::Cancelled::WouldWaitOnItself { .. }) => {
+                                again.push(at);
+                                // As the pool's loop: the next item is not the same ask again.
+                                blaze_graph::pump::rerun_later();
+                            }
                             _ => panic::resume_unwind(payload),
                         }
                     }

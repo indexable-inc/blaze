@@ -447,13 +447,12 @@ mod tests {
         let hash: u64 = tc.draw(gs::integers());
         const SLOTS: usize = 7;
         let groups = 1usize << log_groups;
-        let mut next = seed;
+        let mut rng = blaze_rng::SplitMix64::new(seed);
         let mut words = vec![0u64; groups];
         let mut keys = vec![u64::MAX; groups * SLOTS];
         let total = (groups * SLOTS) as u64 * fill / 8;
         for _ in 0..total {
-            next = next.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let key = next >> 60;
+            let key = rng.next_u64() >> 60;
             let key_hash = key.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (key << 57);
             let at = vacant::<SLOTS>(key_hash, groups, |g| Ctrl(words[g]));
             words[at.group] = at.tagged(tag(key_hash)).0;
@@ -549,10 +548,9 @@ mod tests {
             assert_eq!(index.capacity(), 0);
             let mut keys: Vec<u64> = Vec::new();
             let mut model: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
-            let mut next = seed;
+            let mut rng = blaze_rng::SplitMix64::new(seed);
             for step in 0..40_000 {
-                next = next.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let key = (next >> 33) % 9_000;
+                let key = rng.below(9_000);
                 let found = index.find(hash_of(key), |value| keys[value as usize] == key);
                 assert_eq!(found, model.get(&key).copied(), "seed {seed} step {step}");
                 if found.is_none() {

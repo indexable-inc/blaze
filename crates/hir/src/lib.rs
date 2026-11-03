@@ -227,7 +227,7 @@ pub use {
         tt,
     },
     hir_ty::{
-        CastError, EditionLint, PointerCast, ReceiverAdjustment, attach_db, attach_db_allow_change,
+        CastError, EditionLint, PointerCast, ReceiverAdjustment,
         consteval::ConstEvalError,
         display::{ClosureStyle, DisplayTarget, HirDisplay, HirDisplayError},
         drop::DropGlue,
@@ -3467,7 +3467,7 @@ impl<'db> GenericSubstitution<'db> {
         self.types_impl(db)
             .filter_map(|(ty, name)| {
                 Some((
-                    *name?.symbol(),
+                    *name?.unkeyed().symbol(),
                     Type { ty: EarlyBinder::bind(interner, ty), owner: self.owner },
                 ))
             })
@@ -4659,7 +4659,11 @@ impl<'db> PartialEq for Type<'db> {
         if self.ty != other.ty {
             return false;
         }
-        hir_ty::with_attached_db(|db| {
+        blaze_query::db::with_attached_db(|db: Option<&Db>| {
+            let db = db.expect(
+                "two `hir::Type`s of one type and different owners are compared through the database \
+                 `blaze_query::db::attach` lends, and none is attached",
+            );
             self.owner.can_rebase_into(db, other.owner, self.ty)
                 || other.owner.can_rebase_into(db, self.owner, other.ty)
         })
@@ -6093,7 +6097,7 @@ impl<'db> Type<'db> {
         else {
             return None;
         };
-        match def_id.0.loc(db).container {
+        match hir_ty::next_solver::TermId::from(def_id.0).container(db) {
             ItemContainerId::TraitId(id) => Some(Trait { id }),
             _ => None,
         }

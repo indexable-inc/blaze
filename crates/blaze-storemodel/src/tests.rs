@@ -109,7 +109,7 @@ fn stopped_cleanly() -> (Disk, BTreeSet<blaze_cas::Key>, crate::store::Ledger) {
     let mut ledger = crate::store::Ledger::default();
     for n in 1..=2 {
         let bytes = crate::store::value(n);
-        let result = store.put(key(n), blaze_cas::Kind::Query, bytes.clone());
+        let result = store.put(key(n), blaze_cas::Kind::Query, &bytes);
         ledger.put("w0", key(n), blaze_cas::Kind::Query, &bytes, &result).expect("a first value");
     }
     let mut effects = Vec::new();

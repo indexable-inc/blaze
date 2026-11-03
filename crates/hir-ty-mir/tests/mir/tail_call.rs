@@ -54,7 +54,7 @@ fn prints(fixture: &str, expected: &str) {
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    let (result, stdout) = hir_ty::attach_db(&db, || {
+    let (result, stdout) = blaze_query::db::attach(&db, || {
         let main = function(&db, "main");
         let (result, output, Plain) = run_function(&db, main, Plain);
         (result.map_err(|e| format!("{e:?}")), output.stdout().into_owned())

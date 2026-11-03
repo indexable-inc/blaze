@@ -31,7 +31,7 @@ impl Get for Store {
 
 impl Put for Store {
     fn put(&mut self, key: Key, kind: Kind, bytes: Vec<u8>) -> Result<(), Mismatch> {
-        Store::put(self, key, kind, bytes).map(drop)
+        Store::put(self, key, kind, &bytes).map(drop)
     }
 }
 
@@ -73,6 +73,6 @@ impl Get for Writing<'_> {
 
 impl Put for Writing<'_> {
     fn put(&mut self, key: Key, kind: Kind, bytes: Vec<u8>) -> Result<(), Mismatch> {
-        self.writer.put(self.guard, key, kind, bytes).map(drop)
+        self.writer.put(self.guard, key, kind, &bytes).map(drop)
     }
 }

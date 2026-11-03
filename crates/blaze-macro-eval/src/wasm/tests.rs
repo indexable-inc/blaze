@@ -632,7 +632,7 @@ fn counter_crate() -> (Db, base_db::Crate, hir_def::StaticId, [u8; 32]) {
     use hir_def::{ModuleDefId, test_items};
     let db = hir_expand::fixture::db("pub static mut COUNT: u32 = 0;").into_db();
     let krate = hir_expand::fixture::test_crate(&db);
-    let id = hir_ty::attach_db(&db, || {
+    let id = blaze_query::db::attach(&db, || {
         test_items::declarations(&db, krate)
             .into_iter()
             .find_map(|it| match it {

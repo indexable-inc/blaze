@@ -994,6 +994,7 @@ pub(crate) fn merge(
         item: first.item,
         // alloc: an error
         what: format!("folding {} functions into one body: {what}", group.members.len()),
+        front: None,
     };
     for (at, (unit, ..)) in members.iter().enumerate() {
         if group.members.get(at) != Some(&unit.instance.key()) {

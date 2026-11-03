@@ -150,7 +150,7 @@ fn traits_and_self_tys(db: &Db) -> Vec<(TraitId, Vec<SimplifiedType<'_>>)> {
 #[test]
 fn the_relevant_impls_are_those_the_table_walk_finds_in_its_order() {
     let db = fixture::db(FIXTURE).into_db();
-    crate::next_solver::attach_db(&db, || the_relevant_impls_in(&db));
+    blaze_query::db::attach(&db, || the_relevant_impls_in(&db));
 }
 
 fn the_relevant_impls_in(db: &Db) {

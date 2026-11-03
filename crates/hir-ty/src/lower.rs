@@ -21,7 +21,7 @@ use hir_def::{
     ItemContainerId, LifetimeParamId, LocalFieldId, Lookup, StaticId, StructId, TraitId,
     TypeAliasId, TypeOrConstParamId, TypeParamId, UnionId, VariantId,
     builtin_type::BuiltinType,
-    expr_store::{ExpressionStore, path::Path},
+    expr_store::{ExpressionStore, HygieneId, path::Path},
     hir::{
         ExprId, PatId,
         generics::{
@@ -70,7 +70,8 @@ use crate::{
     generics::{Generics, SingleGenerics, generics},
     infer::unify::InferenceTable,
     next_solver::{
-        AliasConstKind, AliasTy, AnonConstIdWrapper, Binder, BoundConst, BoundExistentialPredicates,
+        AliasConstKind, AliasTy, AnonConstIdWrapper, AssocTyId, Binder, BoundConst,
+        BoundExistentialPredicates,
         BoundTy, BoundVarKinds, BoundVariableKind, Clause, ClauseKind, Clauses, Const, ConstExt,
         ConstKind, DbInterner, DefaultAny, EarlyBinder, EarlyParamRegion, ErrorGuaranteed,
         FnSigKind, GenericArg, GenericArgKind, GenericArgs, IsRigid, ParamConst,
@@ -957,8 +958,16 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     /// `path`, written at `site` where a type or a const could stand, as the const argument it
     /// is.
     pub(crate) fn lower_path_as_const(&mut self, path: Path<'_>, site: TypeRefId) -> Const<'db> {
-        path_to_const(self.db, self.resolver, &|| self.generics(), self.forbid_params_after, path)
-            .unwrap_or_else(|reason| self.invalid_const_arg(site.into(), reason))
+        let hygiene = self.store.type_path_hygiene(site);
+        path_to_const(
+            self.db,
+            self.resolver,
+            &|| self.generics(),
+            self.forbid_params_after,
+            path,
+            hygiene,
+        )
+        .unwrap_or_else(|reason| self.invalid_const_arg(site.into(), reason))
     }
 
     /// The error const of a const argument at `site` that is none, reported for `reason`, as
@@ -1201,15 +1210,29 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                                 mk_param(interner, index - late_bound_index, param_id)
                             },
                         );
-                        Ty::new_alias(
-                            self.interner,
-                            IsRigid::No,
-                            AliasTy::new_from_args(
+                        // A trait method returns the trait's associated type for it, whose
+                        // arguments are its opaque type's; the opaque type is the value a
+                        // default body gives it (`crate::rpitit`).
+                        match origin {
+                            Either::Left(function)
+                                if crate::rpitit::is_trait_method(self.db, function) =>
+                            {
+                                crate::rpitit::rpitit_projection(
+                                    interner,
+                                    crate::rpitit::RpititId { function, idx },
+                                    args,
+                                )
+                            }
+                            _ => Ty::new_alias(
                                 self.interner,
-                                AliasTyKind::Opaque { def_id: opaque_ty_id.into() },
-                                args,
+                                IsRigid::No,
+                                AliasTy::new_from_args(
+                                    self.interner,
+                                    AliasTyKind::Opaque { def_id: opaque_ty_id.into() },
+                                    args,
+                                ),
                             ),
-                        )
+                        }
                     }
                     ImplTraitLoweringMode::Disallowed => {
                         self.push_diagnostic(TyLoweringDiagnostic::ImplTraitNotAllowed {
@@ -1339,8 +1362,8 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     /// This is only for [`resolve_type_param_assoc_type_shorthand`], where we can't just
     /// lower the self types of the predicates since that could lead to cycles.
     /// So we just check here if the `type_ref` resolves to a generic param, and which.
-    fn lower_ty_only_param(&self, type_ref: TypeRefId) -> Option<TypeOrConstParamId> {
-        let type_ref = self.store.type_ref(type_ref);
+    fn lower_ty_only_param(&self, type_ref_id: TypeRefId) -> Option<TypeOrConstParamId> {
+        let type_ref = self.store.type_ref(type_ref_id);
         let path = match type_ref {
             TypeRef::Path(path) => path,
             TypeRef::TypeParam(idx) => return Some(idx.into()),
@@ -1352,8 +1375,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         if path.segments().len() > 1 {
             return None;
         }
-        let resolution = match self.resolver.resolve_path_in_type_ns(self.db, path) {
-            Some((it, None, _)) => it,
+        let hygiene = self.store.type_path_hygiene(type_ref_id);
+        let resolution = match self.resolver.resolve_path_in_type_ns_hygienic(self.db, path, hygiene) {
+            Some((it, None, ..)) => it,
             _ => return None,
         };
         match resolution {
@@ -1813,6 +1837,11 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     let assoc = match term {
                         TermId::TypeAliasId(it) => AssocItemId::TypeAliasId(it),
                         TermId::ConstId(it) => AssocItemId::ConstId(it),
+                        // No source names an RPITIT, so a `dyn` type binds none of its own.
+                        TermId::RpititId(it) => unreachable!(
+                            "a `dyn` type's bounds bind {}, which no source names",
+                            it.display(self.db)
+                        ),
                     };
                     self.push_diagnostic(TyLoweringDiagnostic::ConflictingAssocTypeBindings {
                         source,
@@ -2290,7 +2319,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         }
         let segments = path.segments();
         let first = segments.first()?;
-        let (debruijn, var, reflected) = self.find_reflected_var(first.name)?;
+        // A binder's parameter, as each generic parameter, by its macros 2.0 key.
+        let hygiene = self.store.type_path_hygiene(source);
+        let name = hir_def::nameres::path_param_name(self.db, *first.name, hygiene);
+        let (debruijn, var, reflected) = self.find_reflected_var(&name)?;
         let refuse = |ctx: &mut Self| {
             ctx.push_diagnostic(TyLoweringDiagnostic::ComptimeBinderNotYetSupported { source });
             ctx.types.types.error
@@ -2517,7 +2549,7 @@ impl<'f, 'db, T> FrameLowered<'f, 'db, T> {
 /// The kind of the region a `for<'a>` binds for `'a`: its name as written, which rustc's
 /// `BoundRegionKind::Named` leads to through the parameter it names.
 fn for_lifetime_region_kind<'db>(name: &Name) -> BoundRegionKind<DbInterner<'db>> {
-    BoundRegionKind::NamedForPrinting(Symbol(*name.symbol()))
+    BoundRegionKind::NamedForPrinting(Symbol(*name.unkeyed().symbol()))
 }
 
 fn for_lifetime_kind<'db>(name: &Name) -> BoundVariableKind<'db> {
@@ -3833,7 +3865,7 @@ fn remap_gat_vars_and_recurse_into_nested_projections<'db>(
         ) = clause_ty.kind()
         {
             if alias_ty.trait_ref(interner) == item_trait_ref
-                && alias_ty_def_id.0 == assoc_item_def_id
+                && alias_ty_def_id.0 == AssocTyId::TypeAliasId(assoc_item_def_id)
             {
                 // We have found the GAT in question...
                 // Return the vars, since we may need to remap them.
@@ -4318,10 +4350,19 @@ pub(crate) fn param_env_from_predicates<'db>(
     interner: DbInterner<'db>,
     predicates: &'db GenericPredicates,
 ) -> ParamEnv<'db> {
-    let clauses = rustc_type_ir::elaborate::elaborate(
+    param_env_from_clauses(
         interner,
         predicates.all_predicates().iter_identity().map(Unnormalized::skip_norm_wip),
-    );
+    )
+}
+
+/// rustc's `param_env` of `clauses`: elaborated, then normalized as
+/// `normalize_param_env_or_error` does.
+pub(crate) fn param_env_from_clauses<'db>(
+    interner: DbInterner<'db>,
+    clauses: impl IntoIterator<Item = Clause<'db>>,
+) -> ParamEnv<'db> {
+    let clauses = rustc_type_ir::elaborate::elaborate(interner, clauses);
     let clauses = Clauses::new_from_iter(clauses);
     if !clauses.has_aliases() {
         return ParamEnv { clauses };
@@ -4463,7 +4504,23 @@ pub(crate) fn trait_environment<'db>(db: &'db Db, def: GenericDefId) -> ParamEnv
         let module = def.module(db);
         let interner = DbInterner::new_with(db, module.krate(db));
         let predicates = GenericPredicates::query(db, def);
-        param_env_from_predicates(interner, predicates).clauses.store()
+        let GenericDefId::FunctionId(function) = def else {
+            return param_env_from_predicates(interner, predicates).clauses.store();
+        };
+        // A trait method's default body sees its `impl Trait` as its own opaque types.
+        blaze_mem::frame::current(|frame| {
+            let default_body = crate::rpitit::default_body_clauses(interner, function, frame);
+            param_env_from_clauses(
+                interner,
+                predicates
+                    .all_predicates()
+                    .iter_identity()
+                    .map(Unnormalized::skip_norm_wip)
+                    .chain(default_body.iter().copied()),
+            )
+            .clauses
+            .store()
+        })
     }
 }
 
@@ -5223,9 +5280,7 @@ pub fn with_elided_regions<'db>(
         interner,
         ty_op: |ty: Ty<'db>| match ty.kind() {
             TyKind::Alias(is_rigid, alias)
-                if let AliasTyKind::Opaque { def_id: opaque } = alias.kind
-                    && let ImplTraitId::ReturnTypeImplTrait(owner, _) = opaque.0.loc(db)
-                    && owner == function
+                if crate::rpitit::returned_impl_trait_owner(db, alias) == Some(function)
                     && let Some(own) = alias.args.len().checked_sub(regions.len()) =>
             {
                 let args = alias.args.iter().enumerate().map(|(index, arg)| {
@@ -5463,7 +5518,10 @@ fn input_lifetimes(
         }
         TypeRef::Array(it) => input_lifetimes(db, resolver, store, it.ty, found, self_references),
         TypeRef::Never | TypeRef::TypeParam(_) => Some(()),
-        TypeRef::Path(path) => path_lifetimes(db, resolver, store, path, found, self_references),
+        TypeRef::Path(path) => {
+            let hygiene = store.type_path_hygiene(ty);
+            path_lifetimes(db, resolver, store, path, hygiene, found, self_references)
+        }
         // What the bounds write, not the object lifetime `dyn Trait` leaves out: that is its
         // default, which rustc's elision does not count.
         TypeRef::DynTrait(bounds) => {
@@ -5471,7 +5529,9 @@ fn input_lifetimes(
                 match bound {
                     TypeBound::Lifetime(it) => found.push(lifetime(Some(*it))?),
                     TypeBound::Path(path, _) => {
-                        path_lifetimes(db, resolver, store, store.path(*path), found, self_references)?
+                        let hygiene = store.type_path_hygiene(path.type_ref());
+                        let path = store.path(*path);
+                        path_lifetimes(db, resolver, store, path, hygiene, found, self_references)?
                     }
                     _ => return None,
                 }
@@ -5482,67 +5542,97 @@ fn input_lifetimes(
     }
 }
 
-/// [`input_lifetimes`] of the type or trait `path` names.
+/// [`input_lifetimes`] of the type or trait `path`, written with `hygiene`, names, by rustc's
+/// `resolve_elided_lifetimes_in_path`: the lifetimes a segment writes, `'_` among them, count
+/// where it writes them, and those a segment leaves out count only on the segment the path
+/// resolves to (a struct, enum, union, type alias or trait). The associated types past it, as in
+/// `I::Ty`, `Self::Item` or `<T as Trait<'_>>::Assoc`, are projections: they add only what they
+/// write (leaving out a lifetime of a generic associated type there is E0107, not elision). The
+/// type of `<T as Trait>` and the anchor of `<T>::Assoc` elide as the types they are, first, as
+/// they are the projection's first argument.
 fn path_lifetimes(
     db: &Db,
     resolver: &Resolver<'_>,
     store: &ExpressionStore,
     path: Path<'_>,
+    hygiene: HygieneId,
     found: &mut Vec<Option<LifetimeRefId>, &Frame>,
     self_references: &mut Vec<usize, &Frame>,
 ) -> Option<()> {
+    use hir_def::expr_store::path::{GenericArg, GenericArgs, GenericArgsParentheses};
     let lifetime = |it: Option<LifetimeRefId>| match it.map(|it| (it, &store[it])) {
         None | Some((_, LifetimeRef::Placeholder)) => Some(None),
         Some((_, LifetimeRef::Error)) => None,
         Some((it, _)) => Some(Some(it)),
     };
-    if path.type_anchor().is_some() {
-        return None;
-    }
-    let params = match resolver.resolve_path_in_type_ns_fully(db, path)? {
-        TypeNs::AdtId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
-        TypeNs::TypeAliasId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
-        TypeNs::TraitId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
-        TypeNs::BuiltinType(_)
-        | TypeNs::GenericParam(_)
-        | TypeNs::SelfType(_)
-        | TypeNs::AdtSelfType(_) => 0,
-        _ => return None,
+    let segments = path.segments().len();
+    // The segment the path resolves to and how many lifetime parameters its item has; none for
+    // `<T>::Assoc`, whose every segment is past its anchor.
+    let (resolved, params) = match path.type_anchor() {
+        Some(anchor) => {
+            input_lifetimes(db, resolver, store, anchor, found, self_references)?;
+            (None, 0)
+        }
+        None => {
+            let (resolution, remaining, ..) =
+                resolver.resolve_path_in_type_ns_hygienic(db, path, hygiene)?;
+            let params = match resolution {
+                TypeNs::AdtId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
+                TypeNs::TypeAliasId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
+                TypeNs::TraitId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
+                TypeNs::BuiltinType(_)
+                | TypeNs::GenericParam(_)
+                | TypeNs::SelfType(_)
+                | TypeNs::AdtSelfType(_) => 0,
+                _ => return None,
+            };
+            (Some(remaining.unwrap_or(segments).checked_sub(1)?), params)
+        }
     };
     // The lifetimes of `Fn(&A) -> &B` are the sugar's own, late-bound in its binder: rustc
     // resolves them apart and keeps them out of the function's elision (`resolve_fn_signature`
     // sets the outer candidates aside), so `&dyn Fn(usize)` leaves out one lifetime, the
     // reference's, and `fn(usize, &dyn Fn(usize))` is `for<'a> Fn(usize, &'a dyn Fn(usize))`.
-    let sugar = |it: &hir_def::expr_store::path::GenericArgs<'_>| {
-        matches!(it.parenthesized, hir_def::expr_store::path::GenericArgsParentheses::ParenSugar)
-    };
-    let segments = || path.generic_args().into_iter().flatten().flatten().filter(|it| !sugar(it));
-    if segments().any(|it| {
-        !it.bindings.is_empty()
-            || !matches!(it.parenthesized, hir_def::expr_store::path::GenericArgsParentheses::No)
-    }) {
-        return None;
-    }
-    let args = || segments().flat_map(|it| it.args.iter());
-    let mut written = args()
-        .filter_map(|it| match it {
-            hir_def::expr_store::path::GenericArg::Lifetime(it) => Some(*it),
-            _ => None,
-        })
-        .peekable();
-    if written.peek().is_none() {
-        found.extend(iter::repeat_n(None, params));
-    } else {
-        for it in written {
-            found.push(lifetime(Some(it))?);
+    let sugar = |it: &GenericArgs<'_>| matches!(it.parenthesized, GenericArgsParentheses::ParenSugar);
+    let generic_args = path.generic_args();
+    for index in 0..segments {
+        let implicit = if Some(index) == resolved { params } else { 0 };
+        let args = generic_args.and_then(|it| it.get(index)).flatten().filter(|it| !sugar(it));
+        let Some(args) = args else {
+            found.extend(iter::repeat_n(None, implicit));
+            continue;
+        };
+        if !args.bindings.is_empty() || !matches!(args.parenthesized, GenericArgsParentheses::No) {
+            return None;
         }
-    }
-    args().try_for_each(|it| match it {
-        hir_def::expr_store::path::GenericArg::Type(it) => {
-            input_lifetimes(db, resolver, store, *it, found, self_references)
+        let args = match (args.has_self_type, args.args) {
+            (true, [GenericArg::Type(self_ty), rest @ ..]) => {
+                input_lifetimes(db, resolver, store, *self_ty, found, self_references)?;
+                rest
+            }
+            (true, _) => return None,
+            (false, args) => args,
+        };
+        let mut written = args
+            .iter()
+            .filter_map(|it| match it {
+                GenericArg::Lifetime(it) => Some(*it),
+                _ => None,
+            })
+            .peekable();
+        if written.peek().is_none() {
+            found.extend(iter::repeat_n(None, implicit));
+        } else {
+            for it in written {
+                found.push(lifetime(Some(it))?);
+            }
         }
-        _ => Some(()),
-    })
+        args.iter().try_for_each(|it| match it {
+            GenericArg::Type(it) => input_lifetimes(db, resolver, store, *it, found, self_references),
+            _ => Some(()),
+        })?;
+    }
+    Some(())
 }
 
 /// The lifetime parameter of the `impl Trait` `function` returns for the `index`th lifetime its

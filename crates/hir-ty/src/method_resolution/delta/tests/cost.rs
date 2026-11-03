@@ -86,7 +86,7 @@ fn an_impl_of_one_trait_runs_no_table_of_another() {
     let (t, u) = (trait_named(&loaded.db, krate, "T"), trait_named(&loaded.db, krate, "U"));
     let read = |loaded: &Loaded| {
         let db = &loaded.db;
-        crate::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             (
                 TraitImpls::in_crate_for_trait(db, krate, t).len(),
                 TraitImpls::in_crate_for_trait(db, krate, u).len(),
@@ -111,7 +111,7 @@ fn read_every_table(loaded: &Loaded) -> Vec<String> {
     let (t, u) = (trait_named(db, krate, "T"), trait_named(db, krate, "U"));
     let r = root_struct(loaded);
     db.log_executed(|| {
-        crate::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             _ = TraitImpls::for_crate(db, krate);
             _ = InherentImpls::for_crate(db, krate);
             _ = TraitImpls::in_crate_for_trait(db, krate, t);

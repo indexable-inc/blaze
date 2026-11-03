@@ -844,7 +844,7 @@ impl FlatTree {
                 + lazy.parts.len() * std::mem::size_of::<OnceLock<Part>>()
                 + lazy.parts.iter().filter_map(|it| it.get()).map(Part::heap_size).sum::<usize>()
         });
-        self.block.size() + lazy
+        self.block.held() + lazy
     }
 
     #[inline]
@@ -1230,8 +1230,8 @@ impl FlatTree {
     pub(crate) fn subtree(&self, at: u32) -> FlatTree {
         let (lo, hi) = (at, self.end(at));
         let range = self.range(at);
-        // alloc: the copy's text
-        let source = Text::from(&self.source[range]);
+        // The copy's text, kept with the copy's tree under its tag.
+        let source = Text::copy_kept(budget::now(), &self.source[range]);
         let mut buffers = Buffers::take();
         let Buffers { packer, marks, kept, spare, .. } = &mut buffers;
         packer.words.extend_from_slice(&self.words[lo as usize..hi as usize]);
@@ -1301,8 +1301,8 @@ impl FlatTree {
             start = it.end();
         }
         text.push_str(&self.source[TextRange::new(start, range.end())]);
-        // alloc: the copy's text
-        let source = Text::from(text.as_str());
+        // The copy's text, kept with the copy's tree under its tag.
+        let source = Text::copy_kept(budget::now(), text.as_str());
 
         fn close(top: &Open, open: &mut [Open], packer: &mut Packer, kept: &mut Vec<(u32, u128)>, offset: u32) {
             let size = packer.words.len() as u32 - top.new;
@@ -2136,8 +2136,8 @@ impl FlatTreeBuilder {
                 );
                 source
             }
-            // alloc: the tree's own text, appended (one copy, as `Text::from(String)` makes)
-            None => Text::from(self.text.as_str()),
+            // The tree's own text, appended, kept with the tree under its tag (one copy).
+            None => Text::copy_kept(budget::now(), self.text.as_str()),
         };
         let lazy = match self.lazies.is_empty() {
             true => None,
@@ -2789,7 +2789,8 @@ mod tests {
         assert_eq!(tree.far.len(), 1, "only the last token is far from its parent");
         let (nodes, tokens) = (ROWS as usize + 1, tree.len() as usize - ROWS as usize - 1);
         let budget = tokens * 4 + nodes * 8 + tree.len() as usize * 3 / 4 + 64;
-        assert!(tree.heap_size() <= budget, "{} bytes, past the budget of {budget}", tree.heap_size());
+        // The block's own bytes: what the columns take, before its `Kept` class rounds it up.
+        assert!(tree.block.size() <= budget, "{} bytes, past the budget of {budget}", tree.block.size());
         for row in [0, 1, 7, 12_345, ROWS - 1] {
             let at = 1 + row * 100;
             assert_eq!((tree.kind(at), tree.end(at), tree.parent(at)), (SyntaxKind(101), at + 100, Some(0)));
@@ -3719,7 +3720,8 @@ mod tests {
     }
 
     /// With the thread's buffers warm, a build, a copy of a subtree, a splice and a token's
-    /// replacement each allocate the new tree's block alone (and a copy its text): small trees
+    /// replacement allocate nothing from the global heap (the new tree's block and a copy's
+    /// text are `Kept`): small trees
     /// and one with every side table and kept hashes, whose arrays are those of the trees made
     /// cold.
     #[test]
@@ -3739,20 +3741,20 @@ mod tests {
             };
             let cold = build();
             let (tree, used) = blaze_alloc_count::measure(build);
-            assert_eq!(used.allocations, 1, "seed {seed}: a warm build, {} bytes", used.bytes);
+            // The block is the tree, and it is `Kept`: not the global heap's.
+            assert_eq!(used.allocations, 0, "seed {seed}: a warm build, {} bytes", used.bytes);
             same_arrays(&tree, &cold, seed);
-            assert_eq!(tree.heap_size(), used.bytes as usize, "seed {seed}: the block is the tree");
 
             let at = (0..tree.len()).rev().find(|&it| !tree.is_token(it)).expect("a node");
             let copy = tree.subtree(at);
             let (again, used) = blaze_alloc_count::measure(|| tree.subtree(at));
-            assert_eq!(used.allocations, 2, "seed {seed}: a warm copy, its text and its block");
+            assert_eq!(used.allocations, 0, "seed {seed}: a warm copy (its block and text are `Kept`)");
             same_arrays(&again, &copy, seed);
 
             let spliced = tree.replace_subtree(at, &copy, source.clone());
             let (again, used) =
                 blaze_alloc_count::measure(|| tree.replace_subtree(at, &copy, source.clone()));
-            assert_eq!(used.allocations, 1, "seed {seed}: a warm splice, {} bytes", used.bytes);
+            assert_eq!(used.allocations, 0, "seed {seed}: a warm splice, {} bytes", used.bytes);
             same_arrays(&again, &spliced, seed);
             same_arrays(&again, &tree, seed);
 
@@ -3761,7 +3763,7 @@ mod tests {
                 let (again, used) = blaze_alloc_count::measure(|| {
                     tree.replace_token(token, tree.token_text(token), source.clone())
                 });
-                assert_eq!(used.allocations, 1, "seed {seed}: a warm token, {} bytes", used.bytes);
+                assert_eq!(used.allocations, 0, "seed {seed}: a warm token, {} bytes", used.bytes);
                 same_arrays(&again, &replaced, seed);
                 same_arrays(&again, &tree, seed);
             }

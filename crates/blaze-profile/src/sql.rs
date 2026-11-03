@@ -315,16 +315,19 @@ fn run_in(
     // To a file, not a pipe: the wait is for the exit or `stop`, so nothing drains a pipe meanwhile.
     let stderr_path = scratch.join("stderr");
     let stderr_file = fs::File::create(&stderr_path).map_err(io_error(&stderr_path, "making"))?;
-    let mut child = Command::new(duckdb)
+    let mut command = Command::new(duckdb);
+    command
         .arg("-batch")
         .arg("-bail")
         .arg("-init")
         .arg(&init)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .map_err(io_error(duckdb, "running"))?;
+        .stderr(Stdio::from(stderr_file));
+    // A DuckDB just written (a fresh download, a test's stand-in) can be busy for the moment a
+    // process another thread forked holds the writer's copy: its exec is made again, as every
+    // spawn of blaze's is.
+    let mut child = blaze_core::busy::while_busy(|| command.spawn()).map_err(io_error(duckdb, "running"))?;
     let Some(status) = ended_or_stopped(&mut child, stop).map_err(io_error(duckdb, "waiting for"))? else {
         return Err(SqlError::Stopped);
     };

@@ -50,7 +50,7 @@ pub const BOUND_DOMAIN: &str = "blaze v2 identity bound 1";
 /// The domain of an ADT's identity: its key, interface, layout and the drop impls it reaches.
 pub const ADT_DOMAIN: &str = "blaze v2 identity adt 1";
 
-/// The identity of `ty`. Call it with the database attached (`hir_ty::attach_db`).
+/// The identity of `ty`. Call it with the database attached (`blaze_query::db::attach`).
 pub fn ty<'db>(db: &'db Db, ty: Ty<'db>) -> Result<ContentId, Unshared> {
     let mut spell = Spell::new(db, TY_DOMAIN);
     spell.ty(ty)?;
@@ -295,6 +295,10 @@ impl<'db> Spell<'db> {
                             match it.def_id.0 {
                                 TermId::TypeAliasId(alias) => inner.item(ItemId::Alias(alias)),
                                 TermId::ConstId(konst) => inner.item(ItemId::Const(konst)),
+                                TermId::RpititId(it) => {
+                                    inner.item(ItemId::Function(it.function));
+                                    inner.u32(it.idx.into_raw().into_u32());
+                                }
                             }
                             inner.args(it.args)?;
                             match it.term.kind() {

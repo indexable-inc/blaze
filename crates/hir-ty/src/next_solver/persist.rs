@@ -532,6 +532,11 @@ pub(crate) fn put_def<'db>(sink: &mut impl Sink<'db>, def: SolverDefId<'db>) {
             sink.word(17);
             sink.id(id)
         }
+        SolverDefId::RpititId(id) => {
+            sink.word(18);
+            sink.id(id.function);
+            sink.word(id.idx.into_raw().into_u32())
+        }
     }
 }
 
@@ -556,6 +561,10 @@ pub(crate) fn get_def<'db, S: Source<'db>>(source: &mut S) -> Result<SolverDefId
         15 => SolverDefId::EnumVariantId(source.id()?),
         16 => SolverDefId::Ctor(Ctor::Struct(source.id()?)),
         17 => SolverDefId::Ctor(Ctor::Enum(source.id()?)),
+        18 => SolverDefId::RpititId(crate::rpitit::RpititId {
+            function: source.id()?,
+            idx: crate::lower::ImplTraitIdx::from_raw(la_arena::RawIdx::from_u32(source.word()?)),
+        }),
         _ => return Err(source.invalid("a definition")),
     })
 }
@@ -1796,7 +1805,8 @@ blaze_format::record! {
 /// The version of the words a table holds: of the codec, which follows the variant order of the
 /// kinds of the pinned `rustc_type_ir`. Changes with any change to a `Code` impl.
 /// 3: `BoundVariableKind::Reflected` (tag 3), blaze's field binders.
-pub const FORMAT_VERSION: u64 = 3;
+/// 4: `SolverDefId::RpititId` (tag 18), a trait method's `impl Trait` item.
+pub const FORMAT_VERSION: u64 = 4;
 
 /// The schema of a persisted type table, for the schema of a buffer that holds one: a table
 /// written by another codec reads as a schema mismatch, never as other values.
@@ -2280,11 +2290,11 @@ mod tests {
             TyKind::Tuple(Tys::empty()),
             TyKind::Alias(
                 IsRigid::No,
-                alias_ty(AliasTyKind::Projection { def_id: TraitAssocTyId(alias) }),
+                alias_ty(AliasTyKind::Projection { def_id: TraitAssocTyId::from(alias) }),
             ),
             TyKind::Alias(
                 IsRigid::Yes,
-                alias_ty(AliasTyKind::Projection { def_id: TraitAssocTyId(alias) }),
+                alias_ty(AliasTyKind::Projection { def_id: TraitAssocTyId::from(alias) }),
             ),
             TyKind::Alias(
                 IsRigid::No,
@@ -2387,7 +2397,7 @@ mod tests {
             clause(ClauseKind::RegionOutlives(rustc_type_ir::OutlivesClause(statik, statik))),
             clause(ClauseKind::TypeOutlives(rustc_type_ir::OutlivesClause(u8, statik))),
             clause(ClauseKind::Projection(ProjectionClause {
-                projection_term: alias_term(AliasTermKind::ProjectionTy { def_id: TraitAssocTyId(alias) }),
+                projection_term: alias_term(AliasTermKind::ProjectionTy { def_id: TraitAssocTyId::from(alias) }),
                 term: u8.into(),
             })),
             clause(ClauseKind::ConstArgHasType(seven, u8)),
@@ -2406,7 +2416,7 @@ mod tests {
             normalizes(AliasTermKind::InherentTy { def_id: InherentAssocTyId(alias) }, u8.into()),
             normalizes(AliasTermKind::OpaqueTy { def_id: OpaqueTyIdWrapper(id(10)) }, u8.into()),
             normalizes(AliasTermKind::FreeTy { def_id: FreeTyAliasId(alias) }, u8.into()),
-            normalizes(AliasTermKind::ProjectionTy { def_id: TraitAssocTyId(alias) }, u8.into()),
+            normalizes(AliasTermKind::ProjectionTy { def_id: TraitAssocTyId::from(alias) }, u8.into()),
             normalizes(AliasTermKind::AnonConst { def_id: anon }, seven.into()),
             normalizes(AliasTermKind::ProjectionConst { def_id: TraitAssocConstId(id(6)) }, seven.into()),
             normalizes(AliasTermKind::FreeConst { def_id: FreeConstAliasId(id(6)) }, seven.into()),

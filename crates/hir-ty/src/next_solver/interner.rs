@@ -6,12 +6,12 @@ use either::Either;
 use rustc_abi::ReprOptions;
 use rustc_ast_ir::{FloatTy, IntTy, UintTy};
 pub use tls_cache::clear_tls_solver_cache;
-pub use tls_db::{attach_db, attach_db_allow_change, fmt_with_attached_db, with_attached_db};
+pub use attached_db::fmt_with_attached_db;
 
 use base_db::{Crate, Db};
 use hir_def::{
     AdtId, CallableDefId, EnumId, GenericDefId, GenericParamId, HasModule, ItemContainerId,
-    StructId, TraitId, TypeAliasId, UnionId, VariantId,
+    StructId, TraitId, UnionId, VariantId,
     attrs::AttrFlags,
     expr_store::{ExpressionStore, StoreVisitor},
     hir::{ClosureKind as HirClosureKind, CoroutineKind as HirCoroutineKind, ExprId, PatId},
@@ -45,7 +45,7 @@ use crate::{
     lower::GenericPredicates,
     method_resolution::{SelfTyKey, TraitImpls},
     next_solver::{
-        AdtIdWrapper, AliasTermKind, AnonConstIdWrapper, AnyImplId, BoundConst, CallableIdWrapper,
+        AdtIdWrapper, AliasTermKind, AnonConstIdWrapper, AnyImplId, AssocTyId, BoundConst, CallableIdWrapper,
         CanonicalVarKind, ClosureIdWrapper, Consts, CoroutineClosureIdWrapper, CoroutineIdWrapper,
         Ctor, FnSig, FreeConstAliasId, FreeTermAliasId, FreeTyAliasId, FxIndexMap,
         ImplOrTraitAssocConstId, ImplOrTraitAssocTermId, ImplOrTraitAssocTyId,
@@ -1393,6 +1393,16 @@ impl<'db> Interner for DbInterner<'db> {
             SolverDefId::InternedOpaqueTyId(def_id) => {
                 return super::opaque_variances::variances_of_opaque(self, def_id);
             }
+            // rustc's `variances_of` of `ImplTraitInTraitData::Trait`: its opaque type's, whose
+            // generics it has. An impl's item has none, as rustc's.
+            SolverDefId::RpititId(rpitit) => {
+                return match rpitit.side(self.db) {
+                    crate::rpitit::RpititSide::Trait(_) => {
+                        super::opaque_variances::variances_of_opaque(self, rpitit.opaque(self.db))
+                    }
+                    crate::rpitit::RpititSide::Impl { .. } => VariancesOf::empty(),
+                };
+            }
             SolverDefId::AdtId(def_id) => def_id.into(),
             SolverDefId::FunctionId(def_id) => def_id.into(),
             SolverDefId::ConstId(_)
@@ -1429,6 +1439,7 @@ impl<'db> Interner for DbInterner<'db> {
                 self.type_of_opaque_hir_typeck(def_id.into())
             }
             SolverDefId::FunctionId(id) => self.db.value_ty(id.into()).unwrap(),
+            SolverDefId::RpititId(id) => crate::rpitit::type_of_rpitit(self, id),
             SolverDefId::Ctor(id) => {
                 let id = match id {
                     Ctor::Struct(id) => id.into(),
@@ -1549,10 +1560,7 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn projection_parent(self, def_id: Self::TraitAssocTermId) -> Self::TraitId {
-        let container = match def_id.0 {
-            TermId::TypeAliasId(def_id) => def_id.loc(self.db).container,
-            TermId::ConstId(def_id) => def_id.loc(self.db).container,
-        };
+        let container = def_id.0.container(self.db);
         let ItemContainerId::TraitId(trait_) = container else {
             panic!("a TraitAssocTermId can only come from a trait")
         };
@@ -1560,10 +1568,7 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn impl_or_trait_assoc_term_parent(self, def_id: Self::ImplOrTraitAssocTermId) -> Self::DefId {
-        let container = match def_id.0 {
-            TermId::TypeAliasId(def_id) => def_id.loc(self.db).container,
-            TermId::ConstId(def_id) => def_id.loc(self.db).container,
-        };
+        let container = def_id.0.container(self.db);
         match container {
             ItemContainerId::ImplId(impl_) => impl_.into(),
             ItemContainerId::TraitId(trait_) => trait_.into(),
@@ -1574,10 +1579,7 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn inherent_alias_term_parent(self, def_id: Self::InherentAssocTermId) -> Self::ImplId {
-        let container = match def_id.0 {
-            TermId::TypeAliasId(def_id) => def_id.loc(self.db).container,
-            TermId::ConstId(def_id) => def_id.loc(self.db).container,
-        };
+        let container = def_id.0.container(self.db);
         match container {
             ItemContainerId::ImplId(impl_) => impl_.into(),
             ItemContainerId::ExternBlockId(_)
@@ -1641,9 +1643,19 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn generics_require_sized_self(self, def_id: Self::DefId) -> bool {
-        match GenericDefId::try_from(def_id) {
-            Ok(def_id) => crate::dyn_compatibility::generics_require_sized_self(self.db, def_id),
-            Err(_) => false,
+        match def_id {
+            // rustc's RPITIT item has its method as parent, so the method's `where Self: Sized`
+            // is its own.
+            SolverDefId::RpititId(rpitit) => crate::dyn_compatibility::generics_require_sized_self(
+                self.db,
+                rpitit.function.into(),
+            ),
+            _ => match GenericDefId::try_from(def_id) {
+                Ok(def_id) => {
+                    crate::dyn_compatibility::generics_require_sized_self(self.db, def_id)
+                }
+                Err(_) => false,
+            },
         }
     }
 
@@ -1929,7 +1941,7 @@ impl<'db> Interner for DbInterner<'db> {
         def_id: Self::TraitAssocTyId,
     ) -> Option<SolverProjectionLangItem> {
         as_lang_item!(
-            SolverProjectionLangItem, self, def_id.0, TypeAliasId;
+            SolverProjectionLangItem, self, def_id.0, AssocTyId;
 
             Metadata,
             CoroutineReturn,
@@ -2043,7 +2055,20 @@ impl<'db> Interner for DbInterner<'db> {
         self,
         def_id: Self::TraitId,
     ) -> impl IntoIterator<Item = Self::DefId> {
-        def_id.0.trait_items(self.db()).associated_types().map(|id| id.into())
+        // The trait's RPITIT items follow its declared ones, as rustc's synthesized items
+        // follow their method in `associated_item_def_ids`.
+        let db = self.db();
+        let items = def_id.0.trait_items(db);
+        items.associated_types().map(SolverDefId::from).chain(
+            items
+                .items
+                .iter()
+                .filter_map(|(_, item)| match *item {
+                    hir_def::AssocItemId::FunctionId(f) => Some(f),
+                    _ => None,
+                })
+                .flat_map(move |f| crate::rpitit::rpitits_of(db, f).map(SolverDefId::from)),
+        )
     }
 
     fn for_each_relevant_impl<R: VisitorResult>(
@@ -2082,6 +2107,7 @@ impl<'db> Interner for DbInterner<'db> {
                     | SolverDefId::InternedClosureId(_)
                     | SolverDefId::InternedCoroutineId(_)
                     | SolverDefId::InternedCoroutineClosureId(_)
+                    | SolverDefId::RpititId(_)
                     | SolverDefId::InternedOpaqueTyId(_)
                     | SolverDefId::EnumVariantId(_)
                     | SolverDefId::AnonConstId(_)
@@ -2291,6 +2317,7 @@ impl<'db> Interner for DbInterner<'db> {
                 ItemContainerId::TraitId(_) => ConstSignature::of(db, id).has_body(),
                 _ => true,
             },
+            TermId::RpititId(id) => id.has_value(db),
         }
     }
 
@@ -2632,16 +2659,6 @@ impl<'db> Interner for DbInterner<'db> {
         super::opaque_variances::opt_alias_variances(self, kind.into())
     }
 
-    fn opaque_of_impl(
-        self,
-        param_env: Self::ParamEnv,
-        def_id: Self::OpaqueTyId,
-        args: Self::GenericArgs,
-    ) -> Option<Self::Ty> {
-        let env = crate::ParamEnvAndCrate { param_env, krate: self.krate? };
-        self.db.opaque_of_impl(env, def_id.0, args)
-    }
-
     fn type_of_opaque_hir_typeck(
         self,
         opaque: Self::LocalOpaqueTyId,
@@ -2768,7 +2785,8 @@ impl<'db> Interner for DbInterner<'db> {
             | SolverDefId::InternedClosureId(_)
             | SolverDefId::InternedCoroutineId(_)
             | SolverDefId::InternedCoroutineClosureId(_)
-            | SolverDefId::InternedOpaqueTyId(_) => None,
+            | SolverDefId::InternedOpaqueTyId(_)
+            | SolverDefId::RpititId(_) => None,
         };
         Symbol(name.unwrap_or(sym::tick_underscore))
     }
@@ -3087,7 +3105,16 @@ fn generic_predicates_of<'db>(
                 GenericPredicates::empty()
             }
         }
-        _ => GenericPredicates::query(db, def_id.try_into().unwrap()),
+        // rustc's `explicit_predicates_of` of an RPITIT: its method's, whose generics its own
+        // begin with (an impl's item takes its method's, which E0276 keeps no stronger than the
+        // trait's).
+        SolverDefId::RpititId(rpitit) => GenericPredicates::query(db, rpitit.function.into()),
+        _ => GenericPredicates::query(
+            db,
+            def_id
+                .try_into()
+                .unwrap_or_else(|()| panic!("`predicates_of` asked of {def_id:?}, which has none")),
+        ),
     }
 }
 
@@ -3165,167 +3192,44 @@ TrivialTypeTraversalImpls! {
     ScalarInt,
 }
 
-mod tls_db {
-    use std::{cell::Cell, ptr::NonNull};
-
+mod attached_db {
     use base_db::Db;
 
-    struct Attached {
-        database: Cell<Option<NonNull<Db>>>,
-    }
-
-    impl Attached {
-        /// Attaches `db` for `op`, unless it is attached already. The slot is looked up again
-        /// on return, never kept: a job that waits inside `op` may resume on another thread,
-        /// with its database carried there ([`carry_attached`]).
-        #[inline]
-        fn attach<R>(db: &Db, op: impl FnOnce() -> R) -> R {
-            struct DbGuard {
-                set: bool,
-            }
-
-            impl Drop for DbGuard {
-                #[inline]
-                fn drop(&mut self) {
-                    if self.set {
-                        replace_attached(None);
-                    }
-                }
-            }
-
-            let new_db = NonNull::from(db);
-            let set = match attached() {
-                Some(current_db) => {
-                    if !std::ptr::addr_eq(current_db.as_ptr(), new_db.as_ptr()) {
-                        panic!(
-                            "Cannot change attached database. This is likely a bug.\n\
-                            If this is not a bug, you can use `attach_db_allow_change()`."
-                        );
-                    }
-                    false
-                }
-                None => {
-                    replace_attached(Some(new_db));
-                    true
-                }
-            };
-            let _guard = DbGuard { set };
-            op()
-        }
-
-        /// Attaches `db` for `op` in place of the one attached, as [`Attached::attach`] does.
-        #[inline]
-        fn attach_allow_change<R>(db: &Db, op: impl FnOnce() -> R) -> R {
-            struct DbGuard {
-                prev: Option<NonNull<Db>>,
-            }
-
-            impl Drop for DbGuard {
-                #[inline]
-                fn drop(&mut self) {
-                    replace_attached(self.prev);
-                }
-            }
-
-            let _guard = DbGuard { prev: replace_attached(Some(NonNull::from(db))) };
-            op()
-        }
-
-        /// `op` with the attached database, or `None` with none attached.
-        #[inline]
-        fn try_with<R>(op: impl FnOnce(&Db) -> R) -> Option<R> {
-            let db = attached()?;
-            // SAFETY: as in `with`.
-            Some(op(unsafe { db.as_ref() }))
-        }
-
-        #[inline]
-        fn with<R>(op: impl FnOnce(&Db) -> R) -> R {
-            let db = attached().expect("Tried to use attached db, but no db is attached");
-
-            // SAFETY: `database` holds a pointer only while the `DbGuard` that set it is alive,
-            // which borrows the database for that long and puts back the pointer before it on
-            // drop, unwinding too; `op` runs within, and the reference it gets, of a lifetime
-            // of its own, cannot leave it.
-            op(unsafe { db.as_ref() })
-        }
-    }
-
-    thread_local! {
-        static GLOBAL_DB: Attached = const { Attached { database: Cell::new(None) } };
-    }
-
-    // Every access to `GLOBAL_DB` is one of these two, never inlined: a job that waits between
-    // two of them may resume on another thread, and an inlined access may reuse the address of
-    // the first thread's slot (docs/v2/plan/lanes/may-suspend.md).
-
-    /// The database attached on this thread.
-    #[inline(never)]
-    fn attached() -> Option<NonNull<Db>> {
-        GLOBAL_DB.try_with(|it| it.database.get()).ok().flatten()
-    }
-
-    /// Attaches `db` on this thread: the one attached before.
-    #[inline(never)]
-    fn replace_attached(db: Option<NonNull<Db>>) -> Option<NonNull<Db>> {
-        GLOBAL_DB.with(|it| it.database.replace(db))
-    }
-
-    /// Moves the switching job's attached database off this thread: a job that attached one
-    /// and waits on a query may resume on another thread, and reads it there.
-    fn take_attached() -> Option<std::num::NonZeroUsize> {
-        GLOBAL_DB
-            .try_with(|it| it.database.replace(None))
-            .ok()
-            .flatten()
-            .and_then(|db| std::num::NonZeroUsize::new(db.as_ptr().expose_provenance()))
-    }
-
-    /// Puts back what [`take_attached`] took, on a thread with no database attached.
-    fn put_attached(taken: std::num::NonZeroUsize) {
-        assert!(attached().is_none(), "a job's database put back on a thread with one attached");
-        replace_attached(NonNull::new(std::ptr::with_exposed_provenance_mut(taken.get())));
-    }
-
-    /// Carries the attached database with each job on a fiber ([`blaze_query::carry`]), from
-    /// the first attach on, before any job that attached one can wait.
-    #[inline]
-    fn carry_attached() {
-        static CARRIED: std::sync::Once = std::sync::Once::new();
-        // A borrowed database: ending it is forgetting it.
-        CARRIED.call_once(|| blaze_query::carry(blaze_query::Carried::word(take_attached, put_attached)));
-    }
-
-    #[inline]
-    pub fn attach_db<R>(db: &Db, op: impl FnOnce() -> R) -> R {
-        carry_attached();
-        Attached::attach(db, op)
-    }
-
-    #[inline]
-    pub fn attach_db_allow_change<R>(db: &Db, op: impl FnOnce() -> R) -> R {
-        carry_attached();
-        Attached::attach_allow_change(db, op)
-    }
-
-    #[inline]
-    pub fn with_attached_db<R>(op: impl FnOnce(&Db) -> R) -> R {
-        Attached::with(op)
-    }
-
-    /// Formats `what` with the attached database, or as `what` alone when none is attached:
-    /// a `Debug` that panics inside a panic's message or a drop while unwinding aborts the
-    /// process (rule 15), so formatting never needs one.
+    /// Formats `what` with the database `blaze_query::db::attach` lent the task.
+    ///
+    /// Text a user reads (a diagnostic, an error) is rendered with the database in hand
+    /// (`HirDisplay`, or inside `blaze_query::db::attach` where the text is made), never through
+    /// a `Debug` that reads the task's: a query's text must not depend on which thread ran it
+    /// (rule 17, rule 22). Every query's run has its database attached, so this reads none only
+    /// outside one, where a driver formats a value it holds. That is a bug at the caller, and it
+    /// panics naming `what`, in every build: a marker in the text would pass a broken message on
+    /// as if it were one (rule 3), and the panic fails only the job that formatted it (rule 17).
+    /// Inside a panic's message or a drop while unwinding it never panics, which would abort the
+    /// process: it writes a marker naming the bug, which can only reach text that is already a
+    /// failure's.
     pub fn fmt_with_attached_db(
         f: &mut std::fmt::Formatter<'_>,
         what: &str,
         op: impl FnOnce(&Db, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
     ) -> std::fmt::Result {
-        let written = Attached::try_with(|db| op(db, &mut *f));
-        match written {
-            Some(written) => written,
-            None => write!(f, "<{what}: no database attached>"),
-        }
+        blaze_query::db::with_attached_db(|db: Option<&Db>| match db {
+            Some(db) => op(db, f),
+            None if std::thread::panicking() => {
+                write!(f, "<{what} formatted with no database attached while unwinding: a blaze bug>")
+            }
+            None => detached(what),
+        })
+    }
+
+    /// The refusal of a value formatted with no database attached, out of line: the formatting
+    /// site's cold path.
+    #[cold]
+    #[inline(never)]
+    fn detached(what: &str) -> ! {
+        panic!(
+            "a `{what}` was formatted with no database attached: render text a user reads with the \
+             database in hand (`HirDisplay`), or inside `blaze_query::db::attach` where it is made"
+        )
     }
 
     #[cfg(test)]
@@ -3339,17 +3243,18 @@ mod tls_db {
         use hir_expand::fixture;
 
         fn attached_here() -> Option<usize> {
-            super::attached().map(|it| it.as_ptr().addr())
+            blaze_query::db::with_attached_db(|it: Option<&base_db::Db>| it.map(|it| std::ptr::from_ref(it).addr()))
         }
 
-        /// A `Debug` of an ADT with no database attached says so and never panics: one in a
-        /// panic's message, or in a drop while unwinding, would abort the process.
+        /// A `Debug` of an ADT with no database attached is a bug every build stops at (a
+        /// release run of this test checks that too), naming the ADT kind; inside a panic (its message, or a drop while unwinding) it
+        /// never panics, which would abort the process, and says the bug instead.
         #[test]
-        fn an_adt_formatted_with_no_database_attached_says_so() {
+        fn an_adt_formatted_with_no_database_attached_panics_outside_a_panic() {
             use hir_def::{AdtId, ModuleDefId, nameres::crate_def_map};
 
             let db = fixture::db("struct S;").into_db();
-            let adt = super::attach_db(&db, || {
+            let adt = blaze_query::db::attach(&db, || {
                 let mut found = None;
                 for &krate in base_db::all_crates(&db).iter() {
                     for (_, module) in crate_def_map(&db, krate).modules(&db) {
@@ -3368,11 +3273,32 @@ mod tls_db {
                 adt
             });
             assert_eq!(attached_here(), None);
-            assert_eq!(format!("{adt:?}"), "<AdtDef: no database attached>");
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| format!("{adt:?}"))).expect_err("formatted detached");
+            let message = refused
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| refused.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(message.contains("`AdtDef` was formatted with no database attached"), "{message}");
+
+            // In a drop while unwinding: the marker, and no abort.
+            struct FormatsOnDrop(super::super::AdtDef, std::sync::Arc<parking_lot::Mutex<String>>);
+            impl Drop for FormatsOnDrop {
+                fn drop(&mut self) {
+                    *self.1.lock() = format!("{:?}", self.0);
+                }
+            }
+            let seen = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+            let guard = FormatsOnDrop(adt, seen.clone());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _guard = guard;
+                panic!("unwinding");
+            }));
+            assert_eq!(*seen.lock(), "<AdtDef formatted with no database attached while unwinding: a blaze bug>");
         }
 
-        /// Two jobs on a pool of two workers each attach a database of their own (one with
-        /// `attach_db`, one with `attach_db_allow_change`) and wait for a key, parked where they
+        /// Two jobs on a pool of two workers each attach a database of their own (the first
+        /// over none, the second over one attached before it) and wait for a key, parked where they
         /// ran and resumed on whichever worker is free, so often on the one where the other
         /// attached its own. After the wait each sees its own; once it detached it, the worker
         /// it ended on has none, and so does every worker the jobs after them run on.
@@ -3388,7 +3314,7 @@ mod tls_db {
                 let (tx, rx) = crossbeam_channel::unbounded::<Result<(), String>>();
                 let held = flights.get_or_run(key, || {
                     for (at, db) in dbs.iter().enumerate() {
-                        let (db, flights) = (db.clone(), flights.clone());
+                        let (db, other, flights) = (db.clone(), dbs[1 - at].clone(), flights.clone());
                         let tx = tx.clone();
                         pool.submit(
                             None,
@@ -3400,9 +3326,9 @@ mod tls_db {
                                     assert_eq!(attached_here(), Some(mine), "a job resumed with another's database");
                                 };
                                 if at == 0 {
-                                    super::attach_db(&db, wait);
+                                    blaze_query::db::attach(&*db, wait);
                                 } else {
-                                    super::attach_db_allow_change(&db, wait);
+                                    blaze_query::db::attach(&*other, || blaze_query::db::attach(&*db, wait));
                                 }
                                 assert_eq!(attached_here(), None, "a worker kept a database its job detached");
                             },
@@ -3434,9 +3360,8 @@ mod tls_db {
             }
         }
 
-        /// On a pool of one worker, after a job ended holding a database (ended with it), two
-        /// jobs each attach a database of their own (one with `attach_db`, one with
-        /// `attach_db_allow_change`) and park, the first on one key and the second on another;
+        /// On a pool of one worker, two jobs each attach a database of their own (the second
+        /// over another attached before it) and park, the first on one key and the second on another;
         /// the keys end in the other order, so they resume on the one thread swapped. Each sees
         /// its own after its wait, and the jobs after them none.
         #[test]
@@ -3449,11 +3374,6 @@ mod tls_db {
                 pool.submit(None, f, move |it| _ = tx.send(it.map_err(|_| format!("{what} panicked"))));
                 rx.recv().unwrap().unwrap();
             };
-            super::carry_attached();
-            {
-                let left = std::num::NonZeroUsize::new(Arc::as_ptr(&dbs[2]).addr()).expect("a database's address");
-                run("the job ending with a database attached", Box::new(move || super::put_attached(left)));
-            }
             for round in 0..20u32 {
                 let [first, second] = [2 * round, 2 * round + 1].map(|at| {
                     let mut bytes = [0u8; 32];
@@ -3471,8 +3391,14 @@ mod tls_db {
                     run("the probe", Box::new(|| ()));
                 };
                 let job = |mine: u32, on: Key| {
-                    let (db, flights, waiting, order, tx) =
-                        (dbs[mine as usize].clone(), flights.clone(), waiting.clone(), order.clone(), tx.clone());
+                    let (db, other, flights, waiting, order, tx) = (
+                        dbs[mine as usize].clone(),
+                        dbs[2].clone(),
+                        flights.clone(),
+                        waiting.clone(),
+                        order.clone(),
+                        tx.clone(),
+                    );
                     pool.submit(
                         None,
                         move || {
@@ -3484,9 +3410,9 @@ mod tls_db {
                                 assert_eq!(attached_here(), Some(own), "a job resumed with another's database");
                             };
                             if mine == 0 {
-                                super::attach_db(&db, wait);
+                                blaze_query::db::attach(&*db, wait);
                             } else {
-                                super::attach_db_allow_change(&db, wait);
+                                blaze_query::db::attach(&*other, || blaze_query::db::attach(&*db, wait));
                             }
                             assert_eq!(attached_here(), None, "a job kept a database it detached");
                             order.lock().push(mine);
@@ -3519,30 +3445,6 @@ mod tls_db {
                     Box::new(|| assert_eq!(attached_here(), None, "a job came on to its worker's database")),
                 );
             }
-        }
-
-        /// A job that attached the database and switched out (its carried thread-locals taken,
-        /// as the scheduler takes them when it parks the job) sees it again on the thread it
-        /// resumes on, which had none; the thread it left has none meanwhile.
-        #[test]
-        fn the_attached_database_moves_with_a_job_to_another_thread() {
-            let db = fixture::db("fn f() {}").into_db();
-            let here = std::ptr::from_ref(&db).addr();
-            super::attach_db(&db, || {
-                let taken = super::take_attached().expect("the job attached a database");
-                assert_eq!(taken.get(), here);
-                assert!(super::attached().is_none(), "the thread it left has none");
-                let (seen, back) = std::thread::spawn(move || {
-                    super::put_attached(taken);
-                    let seen = super::with_attached_db(|it| std::ptr::from_ref(it).addr());
-                    (seen, super::take_attached().expect("the job's database moved with it"))
-                })
-                .join()
-                .unwrap();
-                assert_eq!(seen, here, "the job sees its database on the thread it resumed on");
-                super::put_attached(back);
-                assert_eq!(super::with_attached_db(|it| std::ptr::from_ref(it).addr()), here);
-            });
         }
     }
 }

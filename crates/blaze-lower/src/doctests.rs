@@ -10,8 +10,10 @@
 //! An example's file is named by the file its documentation is in (`src/lib.rs`), so its
 //! errors and panics point there, the program's lines being the documentation's
 //! (`blaze_doc::doctest::Program::source`). In the database its path is that path with the
-//! example's id after it, in a source root of the unit's own: one path is one file to
-//! base-db, and the library's file keeps its path.
+//! example's id after it, in a source root of the example's own: one path is one file to
+//! base-db, the library's file keeps its path, and what an example's crate is made of
+//! (its identity, its code identity) holds no other example's file, as rustdoc compiles each
+//! example alone.
 
 use base_db::{
     AbsPathBuf, BuiltCrateData, Crate, CrateDisplayName, CrateOrigin, ExtraCrateData, FileId, FileSet, SourceRoot,
@@ -37,8 +39,10 @@ pub struct DoctestProgram<'a> {
     /// `--test`: a test target's crate with `cfg(test)`, whose `main` is its harness's.
     pub test: bool,
     /// The module the compiler appends to its root, after `source` (a test's harness, which
-    /// the caller lists from the crate as first made): the compiler's own code, as a test
-    /// crate's appended harness is ([`Lowered::append_roots`]).
+    /// the caller lists from the crate as made): the compiler's own code, as a test crate's
+    /// appended harness is ([`Lowered::append_roots`]). A caller that has not listed it yet
+    /// gives the one the example's file was last written with ([`Lowered::doctest_harnesses`]),
+    /// so a harness that lists the same tests is written once.
     pub appended: Option<&'a Appended>,
 }
 
@@ -46,14 +50,17 @@ pub struct DoctestProgram<'a> {
 /// the same files and crates again rather than making new ones.
 pub(crate) struct OfUnit {
     unit: usize,
-    root: SourceRootId,
     made: Vec<Made>,
 }
 
 struct Made {
     id: String,
     file: FileId,
+    /// The source root of its file alone.
+    root: SourceRootId,
     krate: Crate,
+    /// What its root's text was written with after the program's source.
+    appended: Option<Appended>,
 }
 
 impl Lowered {
@@ -74,6 +81,15 @@ impl Lowered {
         let what = lowering.what.clone();
         let trigger = Trigger::of("a library's doctests made into crates", &what);
         self.batch(trigger, |this| this.doctest_writes(unit, programs))
+    }
+
+    /// The harness each example of `Doctest` unit `unit` was last written with
+    /// ([`DoctestProgram::appended`]), by its id, copied out for the caller to give back while
+    /// it writes: none before its first [`Lowered::doctests`].
+    pub fn doctest_harnesses(&self, unit: usize) -> Vec<(String, Appended)> {
+        let made = self.doctests.iter().find(|it| it.unit == unit).map_or(&[][..], |it| &it.made[..]);
+        // alloc: once per doctest unit made, its test examples' ids and harnesses
+        made.iter().filter_map(|it| Some((it.id.clone(), it.appended.clone()?))).collect()
     }
 
     fn doctest_writes(&mut self, unit: usize, programs: &[DoctestProgram<'_>]) -> Result<Vec<Crate>, LowerError> {
@@ -100,15 +116,15 @@ impl Lowered {
         let at = match self.doctests.iter().position(|it| it.unit == unit) {
             Some(at) => at,
             None => {
-                let taken = self.doctests.iter().map(|it| it.root.0).max();
-                let first = self.crates.sets as u32 + 1;
-                let root = SourceRootId(taken.map_or(first, |it| it + 1));
                 // alloc: once per doctest unit
-                self.doctests.push(OfUnit { unit, root, made: Vec::new() });
+                self.doctests.push(OfUnit { unit, made: Vec::new() });
                 self.doctests.len() - 1
             }
         };
-        let root = self.doctests[at].root;
+        // Each example's source root is its own, after the packages' and every one an example
+        // of any unit has.
+        let taken = self.doctests.iter().flat_map(|it| it.made.iter().map(|made| made.root.0)).max();
+        let mut next = taken.map_or(self.crates.sets as u32 + 1, |it| it + 1);
         let mut was = std::mem::take(&mut self.doctests[at].made);
         // alloc: once per doctest unit written, its programs' crates
         let mut made = Vec::with_capacity(programs.len());
@@ -118,12 +134,16 @@ impl Lowered {
             let path = AbsPathBuf::try_from(path.as_str())
                 .map_err(|_| LowerError::at(format!("the file of doctest `{}` is no absolute path", program.id), path.clone()))?;
             let reused = was.iter().position(|it| it.id == program.id).map(|at| was.swap_remove(at));
-            let file = match &reused {
-                Some(it) => it.file,
-                None => db.new_file_id().ok_or_else(|| {
-                    // alloc: an error
-                    LowerError::at(format!("base-db has no file ID left for doctest `{}`", program.id), what.clone())
-                })?,
+            let (file, root) = match &reused {
+                Some(it) => (it.file, it.root),
+                None => {
+                    let file = db.new_file_id().ok_or_else(|| {
+                        // alloc: an error
+                        LowerError::at(format!("base-db has no file ID left for doctest `{}`", program.id), what.clone())
+                    })?;
+                    next += 1;
+                    (file, SourceRootId(next - 1))
+                }
             };
             match program.appended {
                 Some(appended) => {
@@ -173,16 +193,28 @@ impl Lowered {
                 }
                 false => cfg.clone(), // clone: once per program made, its crate's
             };
-            made.push((program.id, path, file, reused.map(|it| it.krate), data, cfg));
+            // Its source root first, which a crate's root must be in when the crate is made: a
+            // kept example's is set again only when it no longer holds its file alone. The
+            // file's path is under its package's directory, and a view of the package's files
+            // (set on an edit) takes out of its source root every file there it lacks.
+            let path = VfsPath::from(path);
+            let holds = reused.is_some() && {
+                let set = db.source_root(root).source_root(&*db);
+                set.file_for_path(&path) == Some(&file) && set.iter().count() == 1
+            };
+            if !holds {
+                let mut files = FileSet::default();
+                files.insert(file, path);
+                db.set_source_root_with_durability(root, Arc::new(SourceRoot::new_local(files)), Durability::LOW);
+            }
+            made.push((program, file, root, reused.map(|it| it.krate), data, cfg));
         }
-        // The source root first, which a crate's root must be in when the crate is made.
-        let mut files = FileSet::default();
-        for (_, path, file, _, _, _) in &made {
-            files.insert(*file, VfsPath::from(path.clone()));
+        // An example no longer given leaves its source root empty.
+        for gone in &was {
+            db.set_source_root_with_durability(gone.root, Arc::new(SourceRoot::new_local(FileSet::default())), Durability::LOW);
         }
-        db.set_source_root_with_durability(root, Arc::new(SourceRoot::new_local(files)), Durability::LOW);
         let mut kept = Vec::with_capacity(made.len());
-        for (id, _, file, krate, data, cfg) in made {
+        for (program, file, root, krate, data, cfg) in made {
             let krate = match krate {
                 Some(krate) => {
                     if *krate.data(db) != data {
@@ -199,8 +231,8 @@ impl Lowered {
                 // clone: as `data`
                 None => Crate::create(db, data, extra.clone(), workspace.clone(), cfg, env.clone(), Durability::MEDIUM),
             };
-            // alloc: a program's id, once per program made
-            kept.push(Made { id: id.to_owned(), file, krate });
+            // alloc: a program's id, once per program made, and a test's harness (cloned)
+            kept.push(Made { id: program.id.to_owned(), file, root, krate, appended: program.appended.cloned() });
         }
         let paths = std::sync::Arc::make_mut(&mut self.paths);
         for gone in &was {
@@ -211,6 +243,13 @@ impl Lowered {
         }
         let crates: Vec<Crate> = kept.iter().map(|it| it.krate).collect();
         set_crate_graph(db, &was, &crates);
+        // An example sees `CARGO_PRIMARY_PACKAGE` as its library does: its variables are the
+        // library's, and that one is of the request ([`base_db::PRIMARY_PACKAGE`]).
+        if base_db::is_primary(db, library) {
+            // alloc: once per doctest unit written of a primary package, the primary crates
+            let primary: Vec<Crate> = base_db::primary_crates(db).iter().copied().chain(crates.iter().copied()).collect();
+            base_db::set_primary_crates(db, primary);
+        }
         self.doctests[at].made = kept;
         self.identities.clear();
         Ok(crates)

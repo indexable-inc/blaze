@@ -58,13 +58,21 @@ pub(crate) fn launch(job: &Job, unit: usize, runner: bool) -> Result<Launch, Str
 /// process, and while blaze can't, that is an error naming what it lacks: never a quiet start
 /// from a file.
 pub(crate) fn launch_of(profile: &str, target: &str, policy: &Policy) -> Result<Launch, String> {
-    // clone: once per process started, of a policy a few hundred bytes long.
-    let live = Policy { mode: BuildMode::Live, ..policy.clone() };
-    match blaze_lazy::allow(&Purpose { profile, policy: &live, output: None }) {
+    match allows_live(profile, policy) {
         Ok(()) => Err(format!("`{target}` runs under profile `{profile}`: {NOT_IN_PROCESS}")),
         Err(Refused::Release { .. }) => Ok(Launch::File),
         Err(refused) => Err(refused.to_string()),
     }
+}
+
+/// Whether `policy` under profile `profile` may build a live process, one the daemon runs and
+/// patches while it runs, writing no output: `blaze_lazy::allow` of it in [`BuildMode::Live`].
+/// The one question both a launch ([`launch_of`]) and a dev executable's link
+/// ([`inproc::runs_in_process`]) ask.
+pub(crate) fn allows_live(profile: &str, policy: &Policy) -> Result<(), Refused> {
+    // clone: once per process started or unit's policy, of a policy a few hundred bytes long.
+    let live = Policy { mode: BuildMode::Live, ..policy.clone() };
+    blaze_lazy::allow(&Purpose { profile, policy: &live, output: None })
 }
 
 /// The environment `artifact`'s program runs in: the job's, cargo's variables of it over it,

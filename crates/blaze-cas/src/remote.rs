@@ -1198,7 +1198,7 @@ mod tests {
         assert!(store.ready());
         store.watch_keys();
         for (name, kind, bytes) in values {
-            store.put(key(name), *kind, bytes.to_vec()).unwrap();
+            store.put(key(name), *kind, bytes).unwrap();
         }
         (sim, store)
     }
@@ -2101,7 +2101,7 @@ mod tests {
         let (mut deltas, mut fulls) = (false, false);
         for n in 0..40u64 {
             let name = format!("later {n}");
-            store.put(key(&name), Kind::Run, name.clone().into_bytes()).unwrap();
+            store.put(key(&name), Kind::Run, name.as_bytes()).unwrap();
             commit(&mut sim, &mut store);
             let before = net.client.filters.len();
             net.server.refresh(&mut store, &mut net.effects[S]);
@@ -2133,7 +2133,7 @@ mod tests {
         let batches: Vec<Vec<u16>> = tc.draw(gs::vecs(gs::vecs(gs::integers()).max_size(30)).max_size(24));
         let name = |n: u16| format!("model {n}");
         let put = |store: &mut Store, n: u16| {
-            store.put(key(&name(n)), Kind::Code, n.to_le_bytes().to_vec()).unwrap();
+            store.put(key(&name(n)), Kind::Code, &n.to_le_bytes()).unwrap();
         };
         let (mut sim, mut store) = opened(Sim::new(9, Faults::default()), &[]);
         for &n in &first {
@@ -2220,7 +2220,7 @@ mod tests {
         net.run(&store);
         assert_eq!(net.client.filters.len(), 1, "the full filter of the first peer");
 
-        store.put(key("fresh"), Kind::Code, b"fresh".to_vec()).unwrap();
+        store.put(key("fresh"), Kind::Code, b"fresh").unwrap();
         assert!(store.get(&key("fresh")).unwrap().is_some(), "readable before it is packed");
         assert!(store.unpacked_keys().contains(&key("fresh")));
         net.server.refresh(&mut store, &mut net.effects[S]);
@@ -2262,7 +2262,7 @@ mod tests {
             let n = (op / 4) % 300;
             match op % 4 {
                 0 => {
-                    store.put(key(&name(n)), Kind::Code, n.to_le_bytes().to_vec()).unwrap();
+                    store.put(key(&name(n)), Kind::Code, &n.to_le_bytes()).unwrap();
                     put.push(n);
                 }
                 1 => commit(&mut sim, &mut store),

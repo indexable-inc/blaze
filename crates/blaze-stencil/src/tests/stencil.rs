@@ -23,7 +23,7 @@ use super::{
 use crate::{
     Target,
     code::{Code, Name},
-    enc::Form,
+    enc::{Form, sign_extend},
     shape::{self, Disp, Dst, Isa, Op, Shape, Src, Ty},
     table::{
         Library, Variant,
@@ -62,14 +62,6 @@ impl Budget {
 
     /// The compile-only test's: one function per shape.
     const ONE: Budget = Budget { pairs: 0, random: 0, baked: 1, per_baked: 0 };
-}
-
-const fn sign_extend(value: i64, bits: u32) -> i64 {
-    if bits >= 64 {
-        return value;
-    }
-    let shift = 64 - bits;
-    (value << shift) >> shift
 }
 
 fn le_i64(bytes: &[u8]) -> i64 {

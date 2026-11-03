@@ -34,7 +34,7 @@ fn fixture(n: usize) -> String {
 fn with_cx(n: usize, check: impl FnOnce(&Cx<'_, '_>)) {
     let checked = crate::tests::checked(&fixture(n));
     let db = &checked.db;
-    hir::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let krate = hir::check::workspace_crates(db)[0];
         let frame = crate::tests::frame();
         let cx = Cx::new(db, krate, checked.files(), &frame);

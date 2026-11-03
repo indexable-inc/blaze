@@ -905,12 +905,9 @@ fn native_relocations() {
     assert_eq!(u16::from_le_bytes(bytes), (-0x1000i16) as u16);
 }
 
-/// A seeded Fisher-Yates shuffle.
-fn shuffled<T>(mut items: Vec<T>, mut seed: u64) -> Vec<T> {
-    for at in (1..items.len()).rev() {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        items.swap(at, (seed >> 33) as usize % (at + 1));
-    }
+/// `items` in a seeded order.
+fn shuffled<T>(mut items: Vec<T>, seed: u64) -> Vec<T> {
+    blaze_ids::rng::SplitMix64::new(seed).shuffle(&mut items);
     items
 }
 

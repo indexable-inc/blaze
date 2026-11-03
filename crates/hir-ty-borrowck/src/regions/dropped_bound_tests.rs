@@ -304,7 +304,7 @@ fn checked(fixture_text: &str, name: &str) -> [BorrowckResult; 3] {
     let fx = fixture::db(fixture_text);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let function = function(&db, name);
         [Mode::Nll, Mode::Polonius, Mode::PoloniusFlow]
             .map(|mode| borrowck_in_mode(&db, function.into(), mode))

@@ -1203,6 +1203,8 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         value_ns_ctor_vis: Option<Visibility>,
     ) {
         let module = self.module_id;
+        // A name a `macro` wrote binds a key of its own (`def_site`).
+        let name = super::super::def_site::def_binding_name(self.cx.db, def, name);
         self.sink.apply(DeclOp::Declare { module, def });
         self.sink.apply(DeclOp::Update {
             module,
@@ -1283,8 +1285,13 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                 self.sink.apply(DeclOp::DefineUseDecl { module: module_id, id });
                 let is_prelude = attrs.by_key(sym::prelude_import).exists();
                 let visibility = &item_tree[use_.visibility];
+                let in_macro_file = self.file_id().macro_file().is_some();
                 let sink = &mut *self.sink;
                 use_.expand(item_tree, |idx, path, kind, alias| {
+                    let key = match in_macro_file {
+                        true => super::super::import_binding_key(db, crate::item_scope::ImportId { use_: id, idx }),
+                        false => None,
+                    };
                     sink.apply(DeclOp::Import(ImportOp {
                         module: module_id,
                         path,
@@ -1293,6 +1300,7 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                         // clone: the log owns each use tree's visibility
                         visibility: visibility.clone(),
                         source: ImportSource { use_tree: idx, id, is_prelude, kind },
+                        key,
                     }));
                 })
             }
@@ -1321,6 +1329,8 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                     Some(ImportAlias::Underscore) => None,
                     None => Some(name),
                 };
+                // Keyed in the module's scope and in the extern prelude, as rustc's `IdentKey`.
+                let name = name.map(|it| super::super::def_site::extern_crate_binding_name(db, id, it));
 
                 let def_map = self.sink.def_map();
                 let is_crate_root = module_id == def_map.root && def_map.block.is_none();
@@ -1563,8 +1573,9 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
             }
             None => {
                 for (name, it) in root_scope.macros() {
+                    // The `macro_use` prelude is by text, as rustc's (a `Symbol`).
                     self.sink.apply(DeclOp::MacroUsePrelude {
-                        name: *name,
+                        name: name.unkeyed(),
                         mac: it.def,
                         extern_crate,
                     });
@@ -1717,8 +1728,9 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         mod_dir: ModDir,
     ) -> Option<(ModuleId, ChildMode)> {
         let db = self.cx.db;
-        // A module's id is its parent and name, so a second `mod` of a name (E0428) declares
-        // nothing: the first keeps the name, as in rustc's resolver.
+        let name = super::super::def_site::module_binding_name(db, self.tree_id.file_id(), declaration, name);
+        // A module's id is its parent and keyed name, so a second `mod` of a name and context
+        // (E0428) declares nothing: the first keeps the name, as in rustc's resolver.
         if self.sink.def_map().module(db, self.module_id).children(db).contains_key(&name) {
             return None;
         }
@@ -1868,6 +1880,8 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         macro_: MacroRulesId,
         export: bool,
     ) {
+        // Keyed as every item's name: the textual scope too (rustc's `MacroRulesDecl::ident`).
+        let name = super::super::def_site::def_binding_name(self.cx.db, ModuleDefId::MacroId(macro_.into()), name);
         // Textual scoping
         self.sink.apply(DeclOp::DefineLegacyMacro { module: module_id, name, mac: macro_.into() });
 
@@ -1897,6 +1911,7 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         macro_: Macro2Id,
         vis: &RawVisibility,
     ) {
+        let name = super::super::def_site::def_binding_name(self.cx.db, ModuleDefId::MacroId(macro_.into()), name);
         let vis = self.resolve_vis(vis);
         self.sink.apply(DeclOp::Declare { module: module_id, def: macro_.into() });
         self.sink.apply(DeclOp::Update {
@@ -2143,13 +2158,7 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
             self.cx.krate,
             self.macro_depth + 1,
             self.sink.def_map().recursion_limit(),
-            |path| {
-                // The call's own path carries its context; a path in its eager arguments is
-                // looked up where the call is.
-                let path_ctxt = match path == &ast_id.path {
-                    true => ctxt,
-                    false => SyntaxContext::root(Edition::Edition2015),
-                };
+            |path, path_ctxt| {
                 let def = this.case_one_macro_def(path, path_ctxt);
                 if let Some(def) = def
                     && path != &ast_id.path
@@ -2237,10 +2246,10 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                     Hygienic::Here => {}
                     Hygienic::Unknown => return None,
                     // In this def map, being collected: Case 2 resolves it once it is.
-                    Hygienic::At(at) if std::ptr::eq(def_map.map_for(db, at), def_map) => {
+                    Hygienic::At(at, _) if std::ptr::eq(def_map.map_for(db, at), def_map) => {
                         return None;
                     }
-                    origin @ Hygienic::At(_) => {
+                    origin @ Hygienic::At(..) => {
                         return def_map
                             .resolve_path_from(
                                 sink.local_def_map(),

@@ -56,7 +56,7 @@ struct Unknown<const X: Missing>;
 "#,
     )
     .into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         assert_eq!(
             refused(&db, struct_named(&db, "S")),
             [
@@ -88,7 +88,7 @@ struct S<const A: Good, const B: Bad>;
 "#,
     )
     .into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         assert_eq!(
             refused(&db, struct_named(&db, "S")),
             [("B".to_owned(), ConstParamTyReason::NotConstParamTy)]
@@ -106,7 +106,7 @@ struct S<const A: u8>;
 "#,
     )
     .into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         assert_eq!(
             refused(&db, struct_named(&db, "S")),
             [("A".to_owned(), ConstParamTyReason::MissingLangItem)]

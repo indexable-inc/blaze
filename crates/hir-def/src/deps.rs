@@ -44,7 +44,7 @@ pub use crate::deps::{
     image::{Held, IMAGE_SCHEMA, ImageBuf, ImageError, ImageRef, Part, PartBytes, write_image},
     key::{KEY_DOMAIN, KeyInputs, PRODUCER, absolute, eligible, key_inputs, keys},
     reads::{READS_DOMAIN, Reads, SLOTS, image_key, slot},
-    serve::{ImageStore, ReadThrough, Refused, Served, Stored, crate_name, serve, store},
+    serve::{ImageStore, ReadThrough, Refused, Served, Stored, serve, store},
 };
 pub use crate::nameres::frozen::Mode;
 

@@ -222,7 +222,9 @@ fn fetch_from(
     let name = name.to_string_lossy();
     std::fs::create_dir_all(parent).map_err(|e| failed(&e))?;
     let lock = File::create(parent.join(format!(".{name}.lock"))).map_err(|e| failed(&e))?;
-    lock.lock().map_err(|e| failed(&e))?;
+    // Held until the download is done, and let go of then even while a child spawned meanwhile
+    // still has the file open.
+    let _lock = stdx::file_lock::Locked::lock(lock).map_err(|e| failed(&e))?;
     if complete(release, dir) {
         return Ok(());
     }

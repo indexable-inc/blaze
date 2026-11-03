@@ -75,7 +75,7 @@ fn sizedness<'db>(
 #[test]
 fn implicit_sizedness_bounds_are_rustcs() {
     let db = fixture::db(FIXTURE).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let f = declarations(&db)
             .into_iter()
             .find_map(|def| match def {

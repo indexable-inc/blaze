@@ -253,8 +253,8 @@ expressions up, never out of a closure or loop) into an expression whose type im
 
 - a `{:?}` placeholder is a finding, whatever it formats;
 - a placeholder of any trait whose value needs the attached database is a finding, unless the
-  `format_args!` is inside a closure handed to `hir_ty::attach_db`, `attach_db_allow_change` or
-  `with_attached_db`. A value needs it when its type is an ADT of the crate `hir_ty` (its
+  `format_args!` is inside a closure handed to `blaze_query::db::attach` or
+  `blaze_query::db::with_attached_db`. A value needs it when its type is an ADT of the crate `hir_ty` (its
   `next_solver` types included), has one as a generic argument, or is an ADT outside the
   standard library with a field (three ADTs deep) that does; the note names the `hir_ty` type
   a holder holds.

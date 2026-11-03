@@ -33,7 +33,7 @@ use std::{
 
 use blaze_ids::bits::AtomicBitSlice;
 use blaze_mem::{MemError, Region, RegionVec, Tag};
-use blaze_reclaim::{Grace, Guard};
+use blaze_reclaim::{Grace, Guard, Horizon};
 
 use crate::{
     sync::{
@@ -120,11 +120,11 @@ impl<T> Values<T> {
 
     fn new(max: usize) -> Values<T> {
         let bytes = max.checked_mul(Self::SIZE).unwrap_or_else(|| {
-            stop(MemError::TooLarge { tag: Tag::Store, what: "a table's values", wanted: max })
+            stop(&MemError::TooLarge { tag: Tag::Store, what: "a table's values", wanted: max })
         });
         match Region::reserve_huge(bytes, Tag::Store) {
             Ok(region) => Values { region, carved: AtomicUsize::new(0), max, _owns: PhantomData },
-            Err(error) => stop(error),
+            Err(error) => stop(&error),
         }
     }
 
@@ -132,7 +132,7 @@ impl<T> Values<T> {
         // `index < max` in every build: then `index * SIZE < max * SIZE`, which `new` checked
         // does not overflow, so the offset cannot wrap past `Region::at`'s check.
         if index >= self.max {
-            stop(MemError::Exhausted {
+            stop(&MemError::Exhausted {
                 tag: Tag::Store,
                 reserved: self.region.reserved(),
                 wanted: index.saturating_add(1).saturating_mul(Self::SIZE),
@@ -153,14 +153,14 @@ impl<T> Values<T> {
         let index = self.carved.fetch_add(1, Ordering::Relaxed);
         if index >= self.max {
             self.carved.fetch_min(self.max, Ordering::Relaxed);
-            stop(MemError::Exhausted {
+            stop(&MemError::Exhausted {
                 tag: Tag::Store,
                 reserved: self.region.reserved(),
                 wanted: (index + 1) * Self::SIZE,
             });
         }
         if let Err(error) = self.region.ensure((index + 1) * Self::SIZE) {
-            stop(error)
+            stop(&error)
         }
         let slot = self.slot(index);
         // SAFETY: the slot is committed (just ensured), inside the reservation (`index < max`),
@@ -195,7 +195,7 @@ impl Owner {
             Ok((held, free)) => {
                 Owner { busy: AtomicBool::new(false), recycle: UnsafeCell::new(Recycle { held, head: 0, free }) }
             }
-            Err(error) => stop(error),
+            Err(error) => stop(&error),
         }
     }
 
@@ -303,7 +303,7 @@ impl<T: Keyed> Table<T> {
 
     fn level(&self, level: usize) -> &Level {
         if level >= self.most {
-            stop(MemError::Exhausted {
+            stop(&MemError::Exhausted {
                 tag: Tag::Store,
                 reserved: self.base(self.most) as usize * mem::size_of::<AtomicPtr<T>>(),
                 wanted: (self.base(level) as usize + self.cap(level)) * mem::size_of::<AtomicPtr<T>>(),
@@ -443,7 +443,9 @@ impl<T: Keyed> Table<T> {
     /// swaps; says how many. Only the store calls it, one call at a time.
     pub(crate) fn collect(&self) -> usize {
         self.owner.with(|recycle| {
-            let passed = recycle.held[recycle.head..].partition_point(|(grace, _)| grace.passed());
+            let horizon = Horizon::now();
+            let passed =
+                recycle.held[recycle.head..].partition_point(|&(grace, _)| horizon.passed(grace));
             for at in recycle.head..recycle.head + passed {
                 let index = recycle.held[at].1;
                 // SAFETY: the slot holds the value swapped out of it, which no reader can reach

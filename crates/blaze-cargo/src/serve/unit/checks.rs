@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use base_db::Db;
-use blaze_diagnostics::{Diag, Files, Options};
+use blaze_diagnostics::{CrateCheck, Diag, Files, Options};
 use hir::{
     DefWithBody,
     check::{bodies::Plan, every_body},
@@ -39,14 +39,14 @@ impl Checking {
         Checking { krate, plan: Plan::new(db, &[krate], &EVERY), failed: AtomicBool::new(false) }
     }
 
-    /// The check's diagnostics, once every body is checked; a codegen beside it is told, from
-    /// then, whether it failed.
-    pub(crate) fn check(&self, db: &Db, files: Files<'_>, options: &Options) -> Vec<Diag> {
-        let diags = blaze_diagnostics::check_planned(db, self.krate, &self.plan, files, options);
-        if failed(&diags) {
+    /// The check's diagnostics and whether they break its items ([`CrateCheck`]), once every
+    /// body is checked; a codegen beside it is told, from then, whether it failed.
+    pub(crate) fn check(&self, db: &Db, files: Files<'_>, options: &Options) -> CrateCheck {
+        let check = blaze_diagnostics::check_planned(db, self.krate, &self.plan, files, options);
+        if failed(&check.diags) {
             self.failed.store(true, Ordering::Release);
         }
-        diags
+        check
     }
 }
 

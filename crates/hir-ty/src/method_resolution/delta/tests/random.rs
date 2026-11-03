@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
+use blaze_ids::rng::SplitMix64;
 use std::alloc::Global;
 use hir_def::{ImplId, TraitId};
 use hir_expand::name::Name;
@@ -168,36 +169,36 @@ impl Model {
     }
 
     /// One random edit; what it was.
-    fn edit(&mut self, rng: &mut Rng) -> String {
-        match rng.below(12) {
+    fn edit(&mut self, rng: &mut SplitMix64) -> String {
+        match rng.index(12) {
             0 => {
                 let imp = self.random_impl(rng);
                 self.impls.push(imp);
                 format!("add {imp:?}")
             }
             1 if !self.impls.is_empty() => {
-                let at = rng.below(self.impls.len());
+                let at = rng.index(self.impls.len());
                 format!("remove {:?}", self.impls.remove(at))
             }
             2 if !self.impls.is_empty() => {
-                let at = rng.below(self.impls.len());
+                let at = rng.index(self.impls.len());
                 let trait_ = self.random_trait(rng, self.impls[at].module, self.impls[at].self_ty);
                 self.impls[at].trait_ = trait_;
                 format!("retarget {at} to {trait_:?}")
             }
             3 if !self.impls.is_empty() => {
-                let at = rng.below(self.impls.len());
+                let at = rng.index(self.impls.len());
                 let self_ty = self.random_self_ty(rng, self.impls[at].trait_);
                 self.impls[at].self_ty = self_ty;
                 format!("re-head {at} to {self_ty:?}")
             }
             4 => {
-                self.alias = rng.below(STRUCTS);
+                self.alias = rng.index(STRUCTS);
                 format!("A0 = S{}", self.alias)
             }
             5 => {
-                let t = rng.below(TRAITS.len());
-                let item = rng.below(ITEMS.len());
+                let t = rng.index(TRAITS.len());
+                let item = rng.index(ITEMS.len());
                 match self.items[t].iter().position(|&it| it == item) {
                     Some(at) => _ = self.items[t].remove(at),
                     None => self.items[t].push(item),
@@ -209,21 +210,21 @@ impl Model {
                 format!("Tr = {}", TRAITS[self.used])
             }
             7 => {
-                let s = rng.below(STRUCTS);
+                let s = rng.index(STRUCTS);
                 self.derived[s] = !self.derived[s];
                 format!("toggle the derive of S{s}")
             }
             8 => {
                 let imp = BodyImpl {
-                    module: rng.below(MODULES.len() + 1),
-                    trait_: [None, Some(0), Some(1)][rng.below(3)],
-                    self_ty: rng.below(STRUCTS),
+                    module: rng.index(MODULES.len() + 1),
+                    trait_: [None, Some(0), Some(1)][rng.index(3)],
+                    self_ty: rng.index(STRUCTS),
                 };
                 self.bodies.push(imp);
                 format!("add {imp:?} to a body")
             }
             9 if !self.bodies.is_empty() => {
-                let at = rng.below(self.bodies.len());
+                let at = rng.index(self.bodies.len());
                 format!("remove {:?} from a body", self.bodies.remove(at))
             }
             10 => {
@@ -231,28 +232,28 @@ impl Model {
                 format!("`mk!` writes an impl: {}", self.macro_writes)
             }
             _ => {
-                let to = rng.below(MODULES.len() + 2);
+                let to = rng.index(MODULES.len() + 2);
                 self.macro_call = (to <= MODULES.len()).then_some(to);
                 format!("`mk!()` called in {:?}", self.macro_call)
             }
         }
     }
 
-    fn random_impl(&self, rng: &mut Rng) -> Impl {
-        let module = rng.below(MODULES.len());
-        let self_ty = match rng.below(3) {
-            0 => SelfTy::Struct(rng.below(STRUCTS)),
-            1 => SelfTy::Alias(rng.below(2)),
+    fn random_impl(&self, rng: &mut SplitMix64) -> Impl {
+        let module = rng.index(MODULES.len());
+        let self_ty = match rng.index(3) {
+            0 => SelfTy::Struct(rng.index(STRUCTS)),
+            1 => SelfTy::Alias(rng.index(2)),
             _ => SelfTy::Blanket,
         };
         let trait_ = self.random_trait(rng, module, self_ty);
         Impl { module, trait_, self_ty }
     }
 
-    fn random_trait(&self, rng: &mut Rng, module: usize, self_ty: SelfTy) -> TraitRef {
+    fn random_trait(&self, rng: &mut SplitMix64, module: usize, self_ty: SelfTy) -> TraitRef {
         loop {
-            let trait_ = match rng.below(3) {
-                0 => TraitRef::Root(rng.below(TRAITS.len())),
+            let trait_ = match rng.index(3) {
+                0 => TraitRef::Root(rng.index(TRAITS.len())),
                 1 if module == 1 => TraitRef::Use,
                 1 => continue,
                 _ => TraitRef::Inherent,
@@ -264,11 +265,11 @@ impl Model {
         }
     }
 
-    fn random_self_ty(&self, rng: &mut Rng, trait_: TraitRef) -> SelfTy {
-        match rng.below(3) {
-            0 => SelfTy::Struct(rng.below(STRUCTS)),
-            1 => SelfTy::Alias(rng.below(2)),
-            _ if trait_ == TraitRef::Inherent => SelfTy::Struct(rng.below(STRUCTS)),
+    fn random_self_ty(&self, rng: &mut SplitMix64, trait_: TraitRef) -> SelfTy {
+        match rng.index(3) {
+            0 => SelfTy::Struct(rng.index(STRUCTS)),
+            1 => SelfTy::Alias(rng.index(2)),
+            _ if trait_ == TraitRef::Inherent => SelfTy::Struct(rng.index(STRUCTS)),
             _ => SelfTy::Blanket,
         }
     }
@@ -313,18 +314,6 @@ fn check_delta(
     }
     *keys = keys_now;
     *names = names_now;
-}
-
-/// xorshift64*: the scripts are the same on every run.
-struct Rng(u64);
-
-impl Rng {
-    fn below(&mut self, n: usize) -> usize {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        (self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33) as usize % n
-    }
 }
 
 /// Every hash `db` gives `krate`'s traits and item names, by the trait's name.
@@ -372,7 +361,7 @@ fn declarations(db: &Db, krate: Crate) -> Vec<String> {
 /// head, its derives, the body modules it lists, and the hash of their impls.
 fn slice_rows(db: &Db, krate: Crate) -> Vec<String> {
     // The rows' simplified types name solver ids, whose `Debug` reads the attached database.
-    crate::attach_db(db, || slice_rows_attached(db, krate))
+    blaze_query::db::attach(db, || slice_rows_attached(db, krate))
 }
 
 fn slice_rows_attached(db: &Db, krate: Crate) -> Vec<String> {
@@ -441,7 +430,7 @@ fn every_slice_and_reader_is_the_fresh_one_after_each_edit() {
         let mut loaded = Loaded::new(&model.fixture());
         let krate = loaded.krate();
         check(&loaded.db, krate, &format!("seed {seed}, start"), &mut failures);
-        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let mut rng = SplitMix64::new(seed);
         for step in 0..24 {
             let before = model.render();
             let what = model.edit(&mut rng);

@@ -16,16 +16,6 @@ upstream's changes, until `Cargo.toml` follows it.
 
 ## Series
 
-### 0001-opaque-of-impl
-
-What: revealing an opaque type in `Reflection`, `PostAnalysis` and `Codegen`
-(`project_goals/opaque_types.rs`) first asks `Interner::opaque_of_impl` (`rustc_type_ir` patch
-`0002`). It falls back to `type_of` of the opaque only when the hook says `None`, then normalizes
-either.
-
-Why: see that patch. hir-ty's trait-method opaque types, once their arguments name an impl,
-reveal to the impl method's opaque type.
-
 ### 0002-unsafe-code-policy
 
 What: `#![deny(unsafe_code)]` on the crate.

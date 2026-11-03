@@ -91,7 +91,7 @@ fn an_impls_associated_type_in_a_returned_reference_outlives_the_borrow() {
     let fx = fixture::db(FIXTURE);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         for name in ["index", "index_mut"] {
             let found = functions(&db, name);
             assert_eq!(found.len(), 2, "`{name}`: one in the impl for `[T]`, one for `Array`");

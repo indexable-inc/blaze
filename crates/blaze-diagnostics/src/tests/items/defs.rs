@@ -33,6 +33,26 @@ For more information about this error, try `rustc --explain E0428`.
 }
 
 #[test]
+fn two_expansions_of_a_macro_define_one_name_without_conflict() {
+    // std's `weak!` on macOS (`sys/pal/unix/weak/dlsym.rs`), called twice in one block by
+    // `get_posix_spawn_addchdir`: each expansion's `static DLSYM` is keyed by the `macro`'s
+    // context for that call, as rustc keys bindings, so there is no E0428 and each `&DLSYM`
+    // resolves (no E0425). rustc builds it and it prints `1 2`.
+    let source = r#"#![feature(decl_macro)]
+macro weak($name:ident = $v:expr) {
+    static DLSYM: u32 = $v;
+    let $name = &DLSYM;
+}
+fn main() {
+    weak!(a = 1);
+    weak!(b = 2);
+    let _ = (a, b);
+}
+"#;
+    assert_eq!(ui("weak.rs", "2024", source), "");
+}
+
+#[test]
 fn an_import_of_a_name_already_imported_suggests_renaming_it() {
     // tests/ui/error-codes/E0252.rs
     let source = r#"#![allow(non_camel_case_types)]
@@ -124,6 +144,212 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0403`.
 "#;
     assert_eq!(ui("E0403.rs", "2015", source), stderr);
+}
+
+#[test]
+fn generic_parameters_have_macros_2_0_hygiene() {
+    // tests/ui/hygiene/generic_params.rs (check-pass): an opaque `macro`'s own `T`, `'a` and
+    // `C` are parameters apart from the caller's `$T`, `$a` and `$C` (no E0403), and each
+    // type, lifetime and const names the one its hygiene says, so the bodies type-check and
+    // the lifetimes outlive as written; a semi-opaque or transparent one's are the caller's.
+    let source = r#"// Ensure that generic parameters always have modern hygiene.
+
+//@ check-pass
+
+#![feature(decl_macro, rustc_attrs)]
+
+mod type_params {
+    macro m($T:ident) {
+        fn f<$T: Clone, T: PartialEq>(t1: $T, t2: T) -> ($T, bool) {
+            (t1.clone(), t2 == t2)
+        }
+    }
+
+    #[rustc_macro_transparency = "semiopaque"]
+    macro n($T:ident) {
+        fn g<$T: Clone>(t1: $T, t2: T) -> (T, $T) {
+            (t1.clone(), t2.clone())
+        }
+        fn h<T: Clone>(t1: $T, t2: T) -> (T, $T) {
+            (t1.clone(), t2.clone())
+        }
+    }
+
+    #[rustc_macro_transparency = "transparent"]
+    macro p($T:ident) {
+        fn j<$T: Clone>(t1: $T, t2: T) -> (T, $T) {
+            (t1.clone(), t2.clone())
+        }
+        fn k<T: Clone>(t1: $T, t2: T) -> (T, $T) {
+            (t1.clone(), t2.clone())
+        }
+    }
+
+    m!(T);
+    n!(T);
+    p!(T);
+}
+
+mod lifetime_params {
+    macro m($a:lifetime) {
+        fn f<'b, 'c, $a: 'b, 'a: 'c>(t1: &$a(), t2: &'a ()) -> (&'b (), &'c ()) {
+            (t1, t2)
+        }
+    }
+
+    #[rustc_macro_transparency = "semiopaque"]
+    macro n($a:lifetime) {
+        fn g<$a>(t1: &$a(), t2: &'a ()) -> (&'a (), &$a ()) {
+            (t1, t2)
+        }
+        fn h<'a>(t1: &$a(), t2: &'a ()) -> (&'a (), &$a ()) {
+            (t1, t2)
+        }
+    }
+
+    #[rustc_macro_transparency = "transparent"]
+    macro p($a:lifetime) {
+        fn j<$a>(t1: &$a(), t2: &'a ()) -> (&'a (), &$a ()) {
+            (t1, t2)
+        }
+        fn k<'a>(t1: &$a(), t2: &'a ()) -> (&'a (), &$a ()) {
+            (t1, t2)
+        }
+    }
+
+    m!('a);
+    n!('a);
+    p!('a);
+}
+
+mod const_params {
+    macro m($C:ident) {
+        fn f<const $C: usize, const C: usize>(t1: [(); $C], t2: [(); C]) -> ([(); $C], [(); C]) {
+            (t1, t2)
+        }
+    }
+
+    #[rustc_macro_transparency = "semiopaque"]
+    macro n($C:ident) {
+        fn g<const $C: usize>(t1: [(); $C], t2: [(); C]) -> ([(); C], [(); $C]) {
+            (t1, t2)
+        }
+        fn h<const C: usize>(t1: [(); $C], t2: [(); C]) -> ([(); C], [(); $C]) {
+            (t1, t2)
+        }
+    }
+
+    #[rustc_macro_transparency = "transparent"]
+    macro p($C:ident) {
+        fn j<const $C: usize>(t1: [(); $C], t2: [(); C]) -> ([(); C], [(); $C]) {
+            (t1, t2)
+        }
+        fn k<const C: usize>(t1: [(); $C], t2: [(); C]) -> ([(); C], [(); $C]) {
+            (t1, t2)
+        }
+    }
+
+    m!(C);
+    n!(C);
+    p!(C);
+}
+
+fn main() {}
+"#;
+    assert_eq!(ui_core("generic_params.rs", "2015", "clone, eq", source), "");
+}
+
+#[test]
+fn a_lifetime_named_twice_through_a_semi_opaque_or_transparent_macro_is_e0403() {
+    // tests/ui/hygiene/duplicate_lifetimes.rs: the names are compared normalized to macros
+    // 2.0, so a semi-opaque or transparent `macro`'s `'a` is the caller's `$a`.
+    let source = r#"// Ensure that lifetime parameter names are modernized before we check for
+// duplicates.
+
+#![feature(decl_macro, rustc_attrs)]
+
+#[rustc_macro_transparency = "semiopaque"]
+macro m($a:lifetime) {
+    fn g<$a, 'a>() {} //~ ERROR the name `'a` is already used for a generic parameter
+}
+
+#[rustc_macro_transparency = "transparent"]
+macro n($a:lifetime) {
+    fn h<$a, 'a>() {} //~ ERROR the name `'a` is already used for a generic parameter
+}
+
+m!('a);
+n!('a);
+
+fn main() {}
+"#;
+    let stderr = ui("duplicate_lifetimes.rs", "2015", source);
+    assert_reports(&stderr, &[error(8, &["E0403", "`'a`"]), error(13, &["E0403", "`'a`"])]);
+}
+
+#[test]
+fn a_type_or_const_parameter_named_twice_through_a_semi_opaque_or_transparent_macro_is_e0403() {
+    // duplicate_lifetimes.rs's rule for type and const parameters, as rustc reports it: none
+    // for the opaque `m`, whose own `T` and `C` are keyed apart from the caller's.
+    let source = r#"#![feature(decl_macro, rustc_attrs)]
+
+macro m($T:ident, $C:ident) {
+    fn f<$T, T, const $C: usize, const C: usize>() {}
+}
+
+#[rustc_macro_transparency = "semiopaque"]
+macro n($T:ident, $C:ident) {
+    fn g<$T, T>() {}
+    fn h<const $C: usize, const C: usize>() {}
+}
+
+#[rustc_macro_transparency = "transparent"]
+macro p($T:ident, $C:ident) {
+    fn j<$T, T>() {}
+    fn k<const $C: usize, const C: usize>() {}
+}
+
+m!(T, C);
+n!(T, C);
+p!(T, C);
+
+fn main() {}
+"#;
+    let stderr = ui("duplicate_params.rs", "2015", source);
+    let expected = [
+        error(9, &["E0403", "`T`"]),
+        error(10, &["E0403", "`C`"]),
+        error(15, &["E0403", "`T`"]),
+        error(16, &["E0403", "`C`"]),
+    ];
+    assert_reports(&stderr, &expected);
+}
+
+#[test]
+fn an_opaque_macros_own_parameter_is_another_than_the_callers() {
+    // generic_params.rs's rule seen from the other side, as rustc reports it: in an opaque
+    // `macro` the caller's `$T`, `$a` and `$C` and the macro's own `T`, `'a` and `C` are two
+    // parameters each, so returning one as the other is E0308, or for lifetimes "lifetime may
+    // not live long enough".
+    let source = r#"#![feature(decl_macro)]
+
+macro m($T:ident, $a:lifetime, $C:ident) {
+    fn f<$T, T>(t: $T) -> T { t }
+    fn g<$a, 'a>(t: &$a ()) -> &'a () { t }
+    fn h<const $C: usize, const C: usize>(t: [(); $C]) -> [(); C] { t }
+}
+
+m!(T, 'a, C);
+
+fn main() {}
+"#;
+    let stderr = ui("two_params.rs", "2015", source);
+    let expected = [
+        error(4, &["E0308", "type parameter"]),
+        error(5, &["lifetime may not live long enough"]),
+        error(6, &["E0308"]),
+    ];
+    assert_reports(&stderr, &expected);
 }
 
 #[test]
@@ -356,6 +582,42 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0124`.
 "#;
     assert_eq!(ui("E0124.rs", "2015", source), stderr);
+}
+
+#[test]
+fn fields_a_macro_writes_are_keyed_by_its_context() {
+    // tests/ui/hygiene/fields-definition.rs: a struct a `macro` writes may have fields `a` and
+    // `$a` (the caller's `a`), two names; a `macro_rules!` writes one name twice.
+    let source = r#"#![feature(decl_macro)]
+
+macro modern($a: ident) {
+    struct Modern {
+        a: u8,
+        $a: u8, // OK
+    }
+}
+
+macro_rules! legacy {
+    ($a: ident) => {
+        struct Legacy {
+            a: u8,
+            $a: u8, //~ ERROR field `a` is already declared
+        }
+    }
+}
+
+modern!(a);
+legacy!(a);
+
+fn main() {}
+"#;
+    // rustc's one error, `Legacy`'s. Its primary span is checked by count and macro alone:
+    // rustc points at `$a: u8` in the `macro_rules!`, blaze at `legacy!(a)`, where the field's
+    // name was written (a span mapping of a node made of two files' tokens, not hygiene).
+    let stderr = ui("fields-definition.rs", "2015", source);
+    assert_eq!(stderr.matches("error[E0124]: field `a` is already declared").count(), 1, "{stderr}");
+    assert!(stderr.contains("`a` first declared here"), "{stderr}");
+    assert!(stderr.contains("this error originates in the macro `legacy`"), "{stderr}");
 }
 
 #[test]

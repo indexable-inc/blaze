@@ -75,6 +75,12 @@ struct ModuleItemMap<'db> {
     def_map: &'db DefMap,
     local_def_map: &'db LocalDefMap,
     module_id: ModuleId,
+    /// Whether a path not found in a block's scope goes on in the scopes around the block, as
+    /// rustc's lexical walk from a def site does (`hygienic_lexical_parent`): set for the scope
+    /// def-site hygiene names, which may be a block (a `macro` defined in a function body). The
+    /// resolver's own block scopes are walked one by one, interleaved with generic parameters,
+    /// so they don't.
+    around: bool,
 }
 
 impl fmt::Debug for ModuleItemMap<'_> {
@@ -286,9 +292,17 @@ impl<'db> Resolver<'db> {
         let first_name = path.segments().first()?;
         let hygienic = self.hygienic_items(db, path, Namespace::Types, hygiene);
         let skip_to_mod = path.kind != PathKind::Plain;
+        // Generic parameters have macros 2.0 hygiene ([`crate::nameres::param_name`]): the
+        // name they are looked up by, taken at the first generic parameters met.
+        let mut keyed = None;
+        let mut param_name =
+            || *keyed.get_or_insert_with(|| crate::nameres::path_param_name(db, *first_name, hygiene));
         if skip_to_mod {
             return match hygienic {
-                Some(items) => items?.resolve_path_in_type_ns(db, path),
+                Some(items) => {
+                    let (items, path) = items?;
+                    items.resolve_path_in_type_ns(db, &path)
+                }
                 None => self.skip_to_mod(|scope| scope.resolve_path_in_type_ns(db, path)),
             };
         }
@@ -322,7 +336,7 @@ impl<'db> Resolver<'db> {
                             Visibility::Public,
                         ));
                     }
-                    if let Some(id) = params.find_type_by_name(first_name, def) {
+                    if let Some(id) = params.find_type_by_name(&param_name(), def) {
                         return Some((
                             TypeNs::GenericParam(id),
                             remaining_idx(),
@@ -365,7 +379,10 @@ impl<'db> Resolver<'db> {
             }
         }
         match hygienic {
-            Some(items) => items?.resolve_path_in_type_ns(db, path),
+            Some(items) => {
+                let (items, path) = items?;
+                items.resolve_path_in_type_ns(db, &path)
+            }
             None => self.module_scope.resolve_path_in_type_ns(db, path),
         }
     }
@@ -481,6 +498,14 @@ impl<'db> Resolver<'db> {
         let n_segments = path.segments().len();
         let tmp = Name::new_symbol_root(sym::self_);
         let first_name = if path.is_self() { &tmp } else { path.segments().first()? };
+        // Generic parameters have macros 2.0 hygiene ([`crate::nameres::param_name`]): the
+        // name they are looked up by, of the path's own hygiene (not `hygiene_id` as a macro
+        // scope changes it), taken at the first generic parameters met.
+        let path_hygiene = hygiene_id;
+        let mut keyed = None;
+        let mut param_name = || {
+            *keyed.get_or_insert_with(|| crate::nameres::path_param_name(db, *first_name, path_hygiene))
+        };
         let skip_to_mod = path.kind != PathKind::Plain && !path.is_self();
         // Where the item scopes are for a path a `macro` wrote: its locals are told apart by
         // `hygiene_id` below, its items by def-site hygiene.
@@ -488,7 +513,10 @@ impl<'db> Resolver<'db> {
         let hygienic = self.hygienic_items(db, path, ns, hygiene_id);
         if skip_to_mod {
             return match hygienic {
-                Some(items) => items?.resolve_path_in_value_ns(db, path),
+                Some(items) => {
+                    let (items, path) = items?;
+                    items.resolve_path_in_value_ns(db, &path)
+                }
                 None => self.skip_to_mod(|scope| scope.resolve_path_in_value_ns(db, path)),
             };
         }
@@ -531,7 +559,7 @@ impl<'db> Resolver<'db> {
                                 Visibility::Public,
                             ));
                         }
-                        if let Some(id) = params.find_const_by_name(first_name, def) {
+                        if let Some(id) = params.find_const_by_name(&param_name(), def) {
                             let val = ValueNs::GenericParam(id);
                             return Some((
                                 ResolveValueResult::ValueNs(val),
@@ -573,7 +601,7 @@ impl<'db> Resolver<'db> {
                                 Visibility::Public,
                             ));
                         }
-                        if let Some(id) = params.find_type_by_name(first_name, def) {
+                        if let Some(id) = params.find_type_by_name(&param_name(), def) {
                             let ty = TypeNs::GenericParam(id);
                             return Some((
                                 ResolveValueResult::Partial(ty, 1),
@@ -596,9 +624,9 @@ impl<'db> Resolver<'db> {
 
         let items = match hygienic {
             Some(items) => items,
-            None => Some(self.module_scope),
+            None => Some((self.module_scope, *path)),
         };
-        if let Some(res) = items.and_then(|items| items.resolve_path_in_value_ns(db, path)) {
+        if let Some(res) = items.and_then(|(items, path)| items.resolve_path_in_value_ns(db, &path)) {
             return Some(res);
         }
 
@@ -712,10 +740,10 @@ impl<'db> Resolver<'db> {
         // The item scope the lookup answered from: where def-site hygiene says for a path a
         // `macro` wrote, else the innermost block that has the path, or the module.
         if let Some(items) = self.hygienic_items(db, mod_path, ns, hygiene) {
-            if let Some(items) = items
-                && items.answers(db, mod_path, ns)
+            if let Some((items, keyed)) = items
+                && items.answers(db, &keyed, ns)
             {
-                items.record_uses(db, mod_path, ns, out);
+                items.record_uses(db, &keyed, ns, out);
             }
             return;
         }
@@ -860,7 +888,7 @@ impl<'db> Resolver<'db> {
         for scope in self.scopes() {
             self.process_names(scope, &mut res, db);
         }
-        let ModuleItemMap { def_map, module_id, local_def_map } = self.module_scope;
+        let ModuleItemMap { def_map, module_id, local_def_map, around: _ } = self.module_scope;
         // FIXME: should we provide `self` here?
         def_map.module(db, module_id).scope(db).entries().for_each(|(name, def)| {
             res.add_per_ns(name, def);
@@ -1087,6 +1115,7 @@ impl<'db> Resolver<'db> {
         to_be_renamed: BindingId,
     ) -> Option<BindingId> {
         let mut hygiene_info = hygiene_info(db, hygiene_id);
+        let param_name = crate::nameres::path_param_name(db, *current_name, hygiene_id);
         let mut will_be_resolved_to = None;
         for scope in self.scopes() {
             match scope {
@@ -1110,7 +1139,7 @@ impl<'db> Resolver<'db> {
                     self.macro_def(store, scope_id),
                 ),
                 Scope::GenericParams { params, def } => {
-                    if params.find_const_by_name(current_name, def).is_some() {
+                    if params.find_const_by_name(&param_name, def).is_some() {
                         // It does not resolve to our renamed variable.
                         return None;
                     }
@@ -1139,6 +1168,7 @@ impl<'db> Resolver<'db> {
         to_be_renamed: BindingId,
     ) -> Option<BindingId> {
         let mut hygiene_info = hygiene_info(db, hygiene_id);
+        let param_name = crate::nameres::path_param_name(db, *name, hygiene_id);
         let mut will_resolve_to_renamed = false;
         for scope in self.scopes() {
             match scope {
@@ -1164,7 +1194,7 @@ impl<'db> Resolver<'db> {
                     self.macro_def(store, scope_id),
                 ),
                 Scope::GenericParams { params, def } => {
-                    if params.find_const_by_name(name, def).is_some() {
+                    if params.find_const_by_name(&param_name, def).is_some() {
                         // Here and below, it might actually resolve to our renamed variable - in which case it'll
                         // hide the generic parameter or some other thing (not a variable). We don't check for that
                         // because due to naming conventions, it is rare that variable will shadow a non-variable.
@@ -1319,19 +1349,21 @@ impl<'db> Resolver<'db> {
 
     /// The items of a module of a block's def map, which share the crate's local def map.
     fn block_items(&self, def_map: &'db DefMap, module_id: ModuleId) -> ModuleItemMap<'db> {
-        ModuleItemMap { def_map, local_def_map: self.module_scope.local_def_map, module_id }
+        ModuleItemMap { def_map, local_def_map: self.module_scope.local_def_map, module_id, around: false }
     }
 
     /// The item scope a path whose first segment has `hygiene` is looked up in, by a `macro`'s
     /// def-site hygiene ([`DefMap::hygienic_origin`]), `ns` the first segment's namespace:
     /// `None` where it is written (the blocks around it, then the module), `Some(None)` in none.
+    /// With the scope comes the path to look up there, its first segment keyed by the context
+    /// hygiene gave ([`hir_expand::name::Name::keyed`]).
     fn hygienic_items<'a>(
         &'a self,
         db: &'a Db,
         path: &ModPath,
         ns: Namespace,
         hygiene: HygieneId,
-    ) -> Option<Option<ModuleItemMap<'a>>> {
+    ) -> Option<Option<(ModuleItemMap<'a>, ModPath)>> {
         if hygiene.is_root() {
             return None;
         }
@@ -1346,11 +1378,15 @@ impl<'db> Resolver<'db> {
         match def_map.hygienic_origin(db, module_id, path, Some(ns), hygiene.syntax_context()) {
             Hygienic::Here => None,
             Hygienic::Unknown => Some(None),
-            Hygienic::At(at) => Some(Some(ModuleItemMap {
-                def_map: def_map.map_for(db, at),
-                local_def_map: def_map.local_for(db, at, local_def_map),
-                module_id: at,
-            })),
+            Hygienic::At(at, key) => Some(Some((
+                ModuleItemMap {
+                    def_map: def_map.map_for(db, at),
+                    local_def_map: def_map.local_for(db, at, local_def_map),
+                    module_id: at,
+                    around: true,
+                },
+                crate::nameres::def_site::keyed_path(path, key),
+            ))),
         }
     }
 
@@ -1513,18 +1549,32 @@ impl<'db> Resolver<'db> {
 }
 
 impl<'db> ModuleItemMap<'db> {
+    /// `path` in this scope and, when [`Self::around`], the scopes around its block.
+    fn resolve_locally(&self, db: &Db, path: &ModPath) -> (PerNs, Option<usize>, ResolvePathResultPrefixInfo) {
+        match self.around {
+            true => self.def_map.resolve_path_around(
+                self.local_def_map,
+                db,
+                self.module_id,
+                path,
+                BuiltinShadowMode::Other,
+            ),
+            false => self.def_map.resolve_path_locally(
+                self.local_def_map,
+                db,
+                self.module_id,
+                path,
+                BuiltinShadowMode::Other,
+            ),
+        }
+    }
+
     fn resolve_path_in_value_ns(
         &self,
         db: &'db Db,
         path: &ModPath,
     ) -> Option<(ResolveValueResult, ResolvePathResultPrefixInfo, Visibility)> {
-        let (module_def, unresolved_idx, prefix_info) = self.def_map.resolve_path_locally(
-            self.local_def_map,
-            db,
-            self.module_id,
-            path,
-            BuiltinShadowMode::Other,
-        );
+        let (module_def, unresolved_idx, prefix_info) = self.resolve_locally(db, path);
         match unresolved_idx {
             None => {
                 let (value, vis) = to_value_ns(module_def, self.def_map)?;
@@ -1561,13 +1611,7 @@ impl<'db> ModuleItemMap<'db> {
         ResolvePathResultPrefixInfo,
         Visibility,
     )> {
-        let (module_def, idx, prefix_info) = self.def_map.resolve_path_locally(
-            self.local_def_map,
-            db,
-            self.module_id,
-            path,
-            BuiltinShadowMode::Other,
-        );
+        let (module_def, idx, prefix_info) = self.resolve_locally(db, path);
         let (res, import, vis) = to_type_ns(module_def)?;
         Some((res, idx, import, prefix_info, vis))
     }
@@ -1588,7 +1632,7 @@ impl<'db> ModuleItemMap<'db> {
             path,
             ns,
             None,
-            false,
+            self.around,
             out,
         );
     }
@@ -1710,7 +1754,7 @@ impl HasResolver for ModuleId {
         Resolver {
             scopes,
             expr_stores: SmallVec::new(),
-            module_scope: ModuleItemMap { def_map, local_def_map, module_id },
+            module_scope: ModuleItemMap { def_map, local_def_map, module_id, around: false },
         }
     }
 }

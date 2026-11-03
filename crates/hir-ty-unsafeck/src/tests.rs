@@ -96,7 +96,7 @@ fn check(#[rust_analyzer::rust_fixture] fixture: &str) {
     let fx = fixture::db(fixture);
     let files = fx.files().to_vec();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let found = operations(&db);
         for file in files {
             let text = db.file_text(file.file_id(&db)).text(&db);
@@ -119,7 +119,7 @@ fn order(#[rust_analyzer::rust_fixture] fixture: &str) -> Vec<String> {
     let fx = fixture::db(fixture);
     let file = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let text = db.file_text(file.file_id(&db)).text(&db);
         operations(&db)
             .into_iter()
@@ -807,7 +807,7 @@ fn f() {
     );
     let file = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let text = db.file_text(file.file_id(&db)).text(&db);
         let named_f = |def: &DefWithBodyId| match *def {
             DefWithBodyId::FunctionId(it) => FunctionSignature::of(&db, it).name.as_str() == "f",

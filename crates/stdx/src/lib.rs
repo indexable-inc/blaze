@@ -9,6 +9,7 @@ mod macros;
 
 pub mod assert;
 pub mod edit_distance;
+pub mod file_lock;
 pub mod lend;
 pub mod list;
 pub mod panic_context;

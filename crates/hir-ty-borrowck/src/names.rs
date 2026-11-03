@@ -2,15 +2,16 @@
 
 use std::fmt::{self, Write as _};
 
-use hir_def::{VariantId, expr_store::Body, hir::BindingId};
+use hir_def::{AdtId, VariantId, expr_store::Body, hir::BindingId};
 use hir_expand::{MacroCallId, MacroCallKind};
 use rustc_type_ir::inherent::IntoKind;
 use syntax::view::{self as ast, AstNode as _, HasName as _};
 
 use hir_ty::{
     InferBodyId,
+    display::{DisplayTarget, HirDisplay as _, HirDisplayWrapper},
     mir::{ComptimeBinder, LocalId, MirBody, PlaceElem, PlaceTy, ProjectionElem},
-    next_solver::TyKind,
+    next_solver::{Ty, TyKind},
 };
 
 use super::Ctx;
@@ -56,7 +57,41 @@ impl fmt::Write for Text<'_> {
     }
 }
 
+/// `ty` as a message of the borrow check writes it, rustc's `Box<impl Fn() -> u32>`: rendered
+/// with `db` in hand, never through `Debug`, whose names read a database attached to the
+/// thread. The check runs on any worker, attached or not, and its result is cached, so text
+/// read from the thread would differ by where it ran (rule 17, rule 22). The one way the
+/// check's messages write a type.
+pub(crate) fn shown_ty<'a, 'db>(
+    db: &'db base_db::Db,
+    krate: base_db::Crate,
+    ty: &'a Ty<'db>,
+) -> HirDisplayWrapper<'a, 'db, Ty<'db>> {
+    ty.display(db, DisplayTarget::from_crate(db, krate))
+}
+
+/// The name of `adt` as a message of the borrow check writes it (rustc's `def_path_str` of
+/// an ADT, its name): read from `db`, as [`shown_ty`].
+pub(crate) fn shown_adt(db: &base_db::Db, adt: AdtId) -> &str {
+    use hir_def::signatures::{EnumSignature, StructSignature, UnionSignature};
+    match adt {
+        AdtId::StructId(it) => StructSignature::of(db, it).name.as_str(),
+        AdtId::UnionId(it) => UnionSignature::of(db, it).name.as_str(),
+        AdtId::EnumId(it) => EnumSignature::of(db, it).name.as_str(),
+    }
+}
+
 impl<'a, 'db> Ctx<'a, 'db> {
+    /// [`shown_ty`] in this body's crate.
+    pub(crate) fn shown_ty<'t>(&self, ty: &'t Ty<'db>) -> HirDisplayWrapper<'t, 'db, Ty<'db>> {
+        shown_ty(self.db, self.krate, ty)
+    }
+
+    /// [`shown_adt`].
+    pub(crate) fn shown_adt(&self, adt: AdtId) -> &'db str {
+        shown_adt(self.db, adt)
+    }
+
     /// The name of `local` as the source has it: the variable, or the variable a closure
     /// captured.
     pub(super) fn local_name(&self, local: LocalId) -> Option<&'a str> {

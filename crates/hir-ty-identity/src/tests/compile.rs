@@ -277,7 +277,7 @@ fn key_at(
     func: &str,
     args: &[Arg],
 ) -> Result<CompileIdentity, Unshared> {
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let instance = instance(db, func, args);
         instance_identity(db, &instance, &env(db), options).clone()
     })
@@ -441,7 +441,7 @@ fn an_associated_const_is_its_value() {
 #[test]
 fn an_inlined_callees_promoted_constant_is_its_value() {
     let db = fixture();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let owner = MirOwner::Body(InferBodyId::from(function(&db, "read_n")));
         let body = db
             .mir(owner, MirStage::compiled(owner, LANG))
@@ -505,7 +505,7 @@ fn a_closure_shares_with_its_parent() {
 #[test]
 fn two_closures_of_one_signature_are_two_callees() {
     let db = fixture();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let owner = DefWithBodyId::from(function(&db, "two"));
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(owner));
         let keys: Vec<CompileIdentity> = HirBody::of(&db, owner)
@@ -533,7 +533,7 @@ fn direct_recursion_shares_and_mutual_recursion_is_unshared() {
 #[test]
 fn a_shim_is_unshared() {
     let db = fixture();
-    let got = hir_ty::attach_db(&db, || {
+    let got = blaze_query::db::attach(&db, || {
         let args = instance(&db, "id", &[Ty("OwnD")]).args;
         let shim = Instance { subject: Subject::Shim(Shim::DropGlue), args };
         instance_identity(&db, &shim, &env(&db), RUNTIME).clone()
@@ -606,7 +606,7 @@ fn equal_keys_mean_one_monomorphized_body() {
 #[test]
 fn a_key_hit_allocates_nothing() {
     let db = fixture();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let instance = instance(&db, "outer", &[TyErased("RefP")]);
         let env = env(&db);
         instance_identity(&db, &instance, &env, RUNTIME).as_ref().expect("a key");
@@ -624,7 +624,7 @@ fn sites_are_filled_as_the_body_is() {
     let db = fixture();
     let pool = ["RefP", "RefQ", "RefD", "OwnP", "OwnD", "U32"];
     let bodies = ["id", "outer", "size", "nd", "hold", "counter", "with_closure", "rec"];
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         for body in bodies {
             let owner = hir_ty::InferBodyId::DefWithBodyId(function(&db, body).into());
             let generic = db.runtime_mir_body(owner).expect("a body");
@@ -649,7 +649,7 @@ fn sites_are_filled_as_the_body_is() {
 /// The monomorphized runtime body of `func` with the alias `arg`, printed as it is and with the
 /// name of the type `arg` points to or is replaced by `_`.
 fn printed(db: &TestDB, func: &str, arg: &'static str) -> (String, String) {
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let instance = instance(db, func, &[Ty(arg)]);
         let owner = hir_ty::InferBodyId::DefWithBodyId(function(db, func).into());
         let generic = db.runtime_mir_body(owner).expect("a body");
@@ -781,7 +781,7 @@ fn a_type_with_an_alias_at_the_bottom_normalizes_at_any_depth() {
         chain("D", ALIAS_DEPTH, "<X as Tr>::A", |it| format!("Option<{it}>"))
     );
     let db = crate_of(&source);
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let interner = DbInterner::new_with(&db, krate);
         let infcx = hir_ty::next_solver::infer::DbInternerInferExt::infer_ctxt(interner)
@@ -896,7 +896,7 @@ fn a_closure_s_lowering_error_is_its_own() {
         "#[rustc_intrinsic]\npub fn not_in_the_table<T>() -> u32;\n\
          pub fn f() -> u32 { let c = || not_in_the_table::<u8>(); c() }",
     );
-    let got = hir_ty::attach_db(&db, || {
+    let got = blaze_query::db::attach(&db, || {
         let owner = DefWithBodyId::from(function(&db, "f"));
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(owner));
         let (expr, _) = HirBody::of(&db, owner).exprs().find(|(_, expr)| matches!(expr, Expr::Closure { .. })).expect("a closure");
@@ -1204,7 +1204,7 @@ pub fn root_wide(word: &u16) -> u64 {
     let db = fixture::db(&format!("//- minicore: {MINICORE}, phantom_data, option, derive\n{source}\n")).into_db();
     // Each generic instance a root calls (`find_frames::<Slice>`, `skip_all_loads::<{the
     // opaque}>`), as the code generator asks them; their own callees are asked through them.
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let calls = |root: &str| -> Vec<(String, Instance)> {
             let owner = InferBodyId::DefWithBodyId(function(&db, root).into());
@@ -1517,7 +1517,7 @@ impl T2 for u32 {{ fn b(&self) -> u32 {{ 2 }} }}
 "
         ))
         .into_db();
-        hir_ty::attach_db(&db, || crate::code_id(&db, &instance(&db, "f", &[]), &env(&db)))
+        blaze_query::db::attach(&db, || crate::code_id(&db, &instance(&db, "f", &[]), &env(&db)))
             .unwrap_or_else(|why| panic!("`f` reading the vtable for `{tr}` has no code id: {why}"))
     };
     assert_eq!(step("T1"), step("T1"), "built twice");

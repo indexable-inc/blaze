@@ -68,7 +68,7 @@ fn check_closure_captures(#[rust_analyzer::rust_fixture] ra_fixture: &str, expec
     let fx = fixture::db(ra_fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let module = db.module_for_file(file_id.file_id(&db));
         let def_map = module.def_map(&db);
 

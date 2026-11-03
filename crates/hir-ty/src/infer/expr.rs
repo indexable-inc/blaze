@@ -1225,11 +1225,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let mut seen_fields =
             hashbrown::HashMap::with_capacity_and_hasher_in(hir_fields.len(), FixedState, self.frame);
 
-        // Type-check each field.
+        // Type-check each field, its name looked up hygienically among the variant's (rustc's
+        // `check_expr_struct_fields`).
         for field in hir_fields {
-            let name = &field.name;
+            let hygiene = self.store.record_field_hygiene(field.expr);
+            let name = &VariantFields::name_written(self.db, variant, field.name, hygiene);
             let field_type = if let Some(i) = remaining_fields.remove(name) {
-                seen_fields.insert(name, i);
+                seen_fields.insert(*name, i);
 
                 if !self.resolver.is_visible(self.db, variant_field_vis[i]) {
                     self.push_diagnostic(InferenceDiagnostic::NoSuchField {
@@ -1241,7 +1243,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
                 variant_field_tys[i].ty().instantiate(interner, args).skip_norm_wip()
             } else {
-                if let Some(field_idx) = seen_fields.get(&name) {
+                if let Some(field_idx) = seen_fields.get(name) {
                     self.push_diagnostic(InferenceDiagnostic::DuplicateField {
                         field: field.expr.into(),
                         variant,
@@ -1509,7 +1511,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
         let hygiene = self.store.expr_or_pat_path_hygiene(id.unpack());
         let names_something = self.resolver.resolve_path_in_value_ns(self.db, path, hygiene).is_some()
-            || self.resolver.resolve_path_in_type_ns(self.db, path).is_some();
+            || self.resolver.resolve_path_in_type_ns_hygienic(self.db, path, hygiene).is_some();
         (!names_something).then_some(last as u32)
     }
 
@@ -1875,6 +1877,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     ) -> Option<(Ty<'db>, Either<FieldId, TupleFieldId>, Vec<Adjustment, &'f Frame>, bool)> {
         let interner = self.interner();
         let frame = self.frame;
+        // The name is looked up hygienically among each ADT's fields (rustc's `check_field`).
+        let hygiene = self.store.member_hygiene(field_expr);
         let mut autoderef = self.table.autoderef_with_tracking(receiver_ty, field_expr.into());
         let mut private_field = None;
         let res = autoderef.by_ref().find_map(|(derefed_ty, _)| {
@@ -1894,12 +1898,14 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 }
                 TyKind::Adt(adt, parameters) => match adt.def_id() {
                     hir_def::AdtId::StructId(s) => {
-                        let local_id = s.fields(self.db).field(name)?;
+                        let local_id =
+                            s.fields(self.db).field_written(self.db, s.into(), name, hygiene)?;
                         let field = FieldId { parent: s.into(), local_id };
                         (field, parameters)
                     }
                     hir_def::AdtId::UnionId(u) => {
-                        let local_id = u.fields(self.db).field(name)?;
+                        let local_id =
+                            u.fields(self.db).field_written(self.db, u.into(), name, hygiene)?;
                         let field = FieldId { parent: u.into(), local_id };
                         (field, parameters)
                     }

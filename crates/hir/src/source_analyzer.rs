@@ -262,7 +262,7 @@ fn resolve_hir_path_<'db>(
             }),
             None => {
                 let (ty, remaining_idx, _, _, vis) =
-                    resolver.resolve_path_in_type_ns_with_prefix_info(db, path)?;
+                    resolver.resolve_path_in_type_ns_hygienic(db, path, hygiene)?;
                 match remaining_idx {
                     Some(remaining_idx) => {
                         if remaining_idx + 1 == path.segments().len() {
@@ -445,6 +445,7 @@ fn resolve_hir_path_qualifier<'db>(
     db: &'db Db,
     resolver: &Resolver<'db>,
     path: Path<'_>,
+    hygiene: HygieneId,
     store: Option<&ExpressionStore>,
 ) -> Option<PathResolution<'db>> {
     (|| {
@@ -470,7 +471,8 @@ fn resolve_hir_path_qualifier<'db>(
                 res.map(|ty_ns| (ty_ns, path.segments().first()))
             }),
             None => {
-                let (ty, remaining_idx, _) = resolver.resolve_path_in_type_ns(db, path)?;
+                let (ty, remaining_idx, ..) =
+                    resolver.resolve_path_in_type_ns_hygienic(db, path, hygiene)?;
                 match remaining_idx {
                     Some(remaining_idx) => {
                         if remaining_idx + 1 == path.segments().len() {

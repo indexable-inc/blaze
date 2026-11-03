@@ -1075,16 +1075,16 @@ fn header_schema(bytes: &[u8]) -> Option<SchemaHash> {
 }
 
 /// `encoded` behind the schema of the encodings that made it: a columns record's payload.
-fn columns_payload(columns: &Columns, encoded: Vec<u8>) -> Vec<u8> {
+fn columns_payload(columns: &Columns, encoded: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(SCHEMA_PREFIX + encoded.len());
     payload.extend_from_slice(&columns.schema().0.0);
-    payload.extend_from_slice(&encoded);
+    payload.extend_from_slice(encoded);
     payload
 }
 
 /// The cold columns payload of `hot`, decoded back and compared.
 fn cold_columns(columns: &Columns, hot: &[u8]) -> Result<Vec<u8>, String> {
-    let payload = columns_payload(columns, columns.cold(hot)?);
+    let payload = columns_payload(columns, &columns.cold(hot)?);
     if columns.hot_from_cold(&payload[SCHEMA_PREFIX..])? != hot {
         // alloc: the message of an encoding that does not decode back
         return Err(format!("the cold columns of schema {:x} do not decode to the value", columns.schema().0));
@@ -1097,7 +1097,7 @@ fn cold_columns(columns: &Columns, hot: &[u8]) -> Result<Vec<u8>, String> {
 fn colder_columns(columns: &Columns, loc: Loc, hot: &[u8]) -> Result<Option<(Form, Vec<u8>)>, String> {
     let saves = |payload: &[u8]| payload.len() as u64 + loc.stored / 8 <= loc.stored;
     if loc.form != Form::Warm {
-        let payload = columns_payload(columns, columns.warm(hot)?);
+        let payload = columns_payload(columns, &columns.warm(hot)?);
         if columns.hot_from_warm(&payload[SCHEMA_PREFIX..])? != hot {
             // alloc: the message of an encoding that does not decode back
             return Err(format!("the warm columns of schema {:x} do not decode to the value", columns.schema().0));
@@ -1344,7 +1344,7 @@ impl Store {
     }
 
     /// [`Store::put_in`] of [`Unit::SHARED`]: for values of no one crate version.
-    pub fn put(&mut self, key: Key, kind: Kind, bytes: Vec<u8>) -> Result<Ticket, Mismatch> {
+    pub fn put(&mut self, key: Key, kind: Kind, bytes: &[u8]) -> Result<Ticket, Mismatch> {
         self.put_in(Unit::SHARED, key, kind, bytes)
     }
 
@@ -1352,9 +1352,9 @@ impl Store {
     /// [`Store::complete`] says its ticket is. A second put of a key keeps the first value
     /// wherever it is, and a put whose bytes differ from the value kept is an error the caller
     /// sees (a key that misses an input).
-    pub fn put_in(&mut self, unit: Unit, key: Key, kind: Kind, bytes: Vec<u8>) -> Result<Ticket, Mismatch> {
-        let content = content_of(&bytes);
-        self.put_hashed(unit, key, kind, content, &bytes)
+    pub fn put_in(&mut self, unit: Unit, key: Key, kind: Kind, bytes: &[u8]) -> Result<Ticket, Mismatch> {
+        let content = content_of(bytes);
+        self.put_hashed(unit, key, kind, content, bytes)
     }
 
     /// [`Store::put_in`] of `bytes` whose hash the caller has: `content`.
@@ -1460,7 +1460,7 @@ impl Store {
             let mut batch = match cold::Batch::new(dictionary.as_deref()) {
                 Ok(batch) => batch,
                 Err(why) => {
-                    self.cannot_compress(kind, why);
+                    self.cannot_compress(kind, &why);
                     return settled;
                 }
             };
@@ -1491,7 +1491,7 @@ impl Store {
                 let stored = match stored {
                     Ok(stored) => stored,
                     Err(why) => {
-                        self.cannot_compress(kind, why);
+                        self.cannot_compress(kind, &why);
                         return settled;
                     }
                 };
@@ -2015,12 +2015,12 @@ impl Store {
     /// The look through `placed/` failed with `done`: asked again from the start, until it has
     /// failed [`FAILURES_MOST`] times (its own count, `look_tries`), which breaks the store
     /// naming the directory, what the look was for and the last error.
-    fn placed_look_failed(&mut self, done: Done, effects: &mut Vec<Effect>) {
+    fn placed_look_failed(&mut self, done: &Done, effects: &mut Vec<Effect>) {
         self.look_tries += 1;
         match self.look_tries < FAILURES_MOST {
             true => self.ask_placed(effects),
             // alloc: the error that breaks the store
-            false => self.placed_look_done(Some(format!("failed {FAILURES_MOST} times, the last: {}", describe(&done))), effects),
+            false => self.placed_look_done(Some(format!("failed {FAILURES_MOST} times, the last: {}", describe(done))), effects),
         }
     }
 
@@ -2037,7 +2037,7 @@ impl Store {
     /// for this ([`Store::place`]).
     fn placed_listed(&mut self, done: Done, effects: &mut Vec<Effect>) {
         let Done::Listed(found) = done else {
-            return self.placed_look_failed(done, effects);
+            return self.placed_look_failed(&done, effects);
         };
         for (file, meta) in found {
             if meta.dir {
@@ -2118,7 +2118,7 @@ impl Store {
     /// A clone from the whole file of `content` failed with `why`: when the file is gone (removed
     /// outside the daemon) or no regular file (a symbolic link, a FIFO), it is written again and
     /// `waiter` placed from it, once; when it is there, the clone's failure is the place's.
-    fn rechecked(&mut self, content: ContentId, waiter: Waiter, why: String, done: Done, effects: &mut Vec<Effect>) {
+    fn rechecked(&mut self, content: ContentId, waiter: Waiter, why: &str, done: &Done, effects: &mut Vec<Effect>) {
         let file = self.placed_file(&content);
         let link = why.contains(blaze_core::CLONE_THROUGH_A_LINK) || why.contains(blaze_core::CLONE_OF_NO_FILE);
         if !link && !matches!(done, Done::Stat(None)) {
@@ -2444,8 +2444,8 @@ impl Store {
                 Done::Read(bytes) => {
                     self.failures = 0;
                     match self.peers.is_some() {
-                        true => self.peer_head(tier, bytes, effects),
-                        false => self.read_head(tier, bytes, effects),
+                        true => self.peer_head(tier, &bytes, effects),
+                        false => self.read_head(tier, &bytes, effects),
                     }
                 }
                 done => {
@@ -2490,7 +2490,7 @@ impl Store {
                         let waiter = Waiter { asked, to, key, raw: bytes.cloned, retried: true };
                         let why = describe(&done);
                         if why.contains(blaze_core::CLONE_THROUGH_A_LINK) || why.contains(blaze_core::CLONE_OF_NO_FILE) {
-                            self.rechecked(content, waiter, why, done, effects);
+                            self.rechecked(content, waiter, &why, &done, effects);
                         } else {
                             let file = self.placed_file(&content);
                             let tag = self.tags.ask(Op::Recheck { content, waiter, why });
@@ -2503,7 +2503,7 @@ impl Store {
                     }
                 }
             }
-            Op::Recheck { content, waiter, why } => self.rechecked(content, waiter, why, done, effects),
+            Op::Recheck { content, waiter, why } => self.rechecked(content, waiter, &why, &done, effects),
             Op::LookPlaced => match done {
                 // None yet: nothing placed.
                 Done::Stat(None) => self.placed_look_done(None, effects),
@@ -2512,7 +2512,7 @@ impl Store {
                     effects.push(Effect::List { dir: self.placed_dir(), tag });
                 }
                 Done::Stat(Some(_)) => self.placed_look_done(Some("it is a file, not a directory".into()), effects),
-                done => self.placed_look_failed(done, effects),
+                done => self.placed_look_failed(&done, effects),
             },
             Op::ListPlaced => self.placed_listed(done, effects),
             Op::Swept { file } => {
@@ -2540,8 +2540,8 @@ impl Store {
                 }
             }
             Op::Peers => self.peers_listed(done, effects),
-            Op::Announce => self.announced(done, effects),
-            op => return self.step(op, done, effects),
+            Op::Announce => self.announced(&done, effects),
+            op => return self.step(&op, &done, effects),
         }
         self.peers_ask(effects);
         // alloc: empty, allocates nothing
@@ -2550,14 +2550,14 @@ impl Store {
 
     /// Takes a mapping it asked for. Separate from [`Store::complete`] for drivers that map
     /// by themselves at start.
-    pub fn mapped(&mut self, file: FileName, mapping: Mapping) {
+    pub fn mapped(&mut self, file: &FileName, mapping: Mapping) {
         self.tidy();
         let asked = self
             .tags
             .ops
             .iter()
             .filter_map(|(tag, op)| match op {
-                Op::Map { file: it, what, .. } if *it == file => Some((what.usable(), *tag)),
+                Op::Map { file: it, what, .. } if it == file => Some((what.usable(), *tag)),
                 _ => None,
             })
             .max();
@@ -3086,7 +3086,7 @@ impl Store {
 
     /// zstd refusing a value is a broken build of it (a missing feature), not something a
     /// value can cause: the store stops rather than keep the value another way.
-    fn cannot_compress(&mut self, kind: Kind, why: String) {
+    fn cannot_compress(&mut self, kind: Kind, why: &str) {
         // clone: the error that breaks the store
         let dir = self.tiers[0].dir.clone();
         // alloc: the error that breaks the store
@@ -3355,7 +3355,7 @@ impl Store {
         })
     }
 
-    fn step(&mut self, op: Op, done: Done, effects: &mut Vec<Effect>) -> Vec<Ticket> {
+    fn step(&mut self, op: &Op, done: &Done, effects: &mut Vec<Effect>) -> Vec<Ticket> {
         // alloc: empty, allocates nothing
         let Some(commit) = self.commit.as_mut() else { return Vec::new() };
         commit.steps -= 1;
@@ -3371,7 +3371,7 @@ impl Store {
             Op::WriteIndex => own.file(&disk::index_file(commit.index.map_or(0, |it| it.0))),
             _ => own.file(HEAD_FILE),
         };
-        match (&op, &done) {
+        match (op, done) {
             (Op::Truncate { pack }, Done::Truncated) => {
                 if commit.failed.is_none() {
                     let at = *pack;
@@ -3531,13 +3531,13 @@ impl Store {
         effects.push(Effect::Map { file, tag });
     }
 
-    fn read_head(&mut self, at: usize, bytes: Vec<u8>, effects: &mut Vec<Effect>) {
+    fn read_head(&mut self, at: usize, bytes: &[u8], effects: &mut Vec<Effect>) {
         let file = self.tiers[at].file(HEAD_FILE);
         let head = match (bytes.is_empty(), at) {
             (true, 0) => Head::default(),
             (true, at) if self.is_peer(at) => Head::default(),
             (true, _) => return self.fail(file, "it is not there: a layer is a store"),
-            (false, _) => match Head::decode(&bytes) {
+            (false, _) => match Head::decode(bytes) {
                 Ok(head) => head,
                 Err(why) => return self.fail(file, why),
             },

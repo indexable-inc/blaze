@@ -697,7 +697,8 @@ impl<'db> SourceAnalyzer<'db> {
         if let Some(use_tree) = parent.and_then(ast::UseTree::cast)
             && use_tree.coloncolon_token().is_some()
         {
-            return resolve_hir_path_qualifier(db, &self.resolver, hir_path, store)
+            // A use tree names no generic parameter, and its own hygiene is the use tree's.
+            return resolve_hir_path_qualifier(db, &self.resolver, hir_path, HygieneId::ROOT, store)
                 .map(|it| (it, None));
         }
 
@@ -724,7 +725,8 @@ impl<'db> SourceAnalyzer<'db> {
         // Case where path is a qualifier of another path, e.g. foo::bar::Baz where we are
         // trying to resolve foo::bar.
         if let Some(parent_hir_path) = parent_hir_path {
-            return match resolve_hir_path_qualifier(db, &self.resolver, hir_path, store) {
+            let hygiene = name_hygiene_view(db, InFile::new(self.file_id, path.syntax()));
+            return match resolve_hir_path_qualifier(db, &self.resolver, hir_path, hygiene, store) {
                 None if meta_path.is_some() => tool_module(),
                 // The type name conflicts with a module in scope (`use std::str;` then
                 // `str::from_utf8()`): the module when it has the next segment.
@@ -800,7 +802,9 @@ impl<'db> SourceAnalyzer<'db> {
         }
         if parent.is_some_and(|it| ast::Visibility::can_cast(it.kind())) {
             // Only modules can be inside visibilities, and those have no generics.
-            resolve_hir_path_qualifier(db, &self.resolver, hir_path, store).map(|it| (it, None))
+            let hygiene = HygieneId::ROOT;
+            resolve_hir_path_qualifier(db, &self.resolver, hir_path, hygiene, store)
+                .map(|it| (it, None))
         } else {
             let res = resolve_hir_path_(
                 db,
@@ -835,7 +839,11 @@ impl<'db> SourceAnalyzer<'db> {
                         _,
                         AliasTy { kind: AliasTyKind::Projection { def_id }, args, .. },
                     ) => {
-                        let assoc_id = def_id.0;
+                        // A trait method's `impl Trait` is no path's resolution.
+                        let hir_ty::next_solver::AssocTyId::TypeAliasId(assoc_id) = def_id.0
+                        else {
+                            return None;
+                        };
                         (
                             GenericSubstitution::new(assoc_id.into(), args, self.type_owner),
                             PathResolution::Def(ModuleDef::TypeAlias(assoc_id.into())),

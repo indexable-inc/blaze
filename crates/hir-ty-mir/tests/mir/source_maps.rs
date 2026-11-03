@@ -87,7 +87,7 @@ fn lowering_a_body_builds_no_source_map() {
     let fx = fixture::db(PLAIN);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let func = function(&db, "add");
         let executed = db.log_executed(|| {
             db.mir_body(func.into()).unwrap_or_else(|error| panic!("the MIR of `add`: {error:?}"));
@@ -104,7 +104,7 @@ fn evaluating_a_constant_without_location_macros_builds_no_source_map() {
     let fx = fixture::db(PLAIN);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let executed = db.log_executed(|| {
             assert_eq!(bytes(&db, "GOAL"), 6u32.to_le_bytes());
         });
@@ -117,7 +117,7 @@ fn evaluating_line_and_column_builds_no_source_map() {
     let fx = fixture::db(PLACED);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let executed = db.log_executed(|| {
             bytes(&db, "LINE");
             bytes(&db, "COLUMN");
@@ -137,7 +137,7 @@ fn location_macros_are_where_they_are_written() {
     let (_, column) = place_of(&source, "column!();");
     let (both_line, _) = place_of(&source, "concat!(line!()");
     let (_, both_column) = place_of(&source, "column!())");
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         assert_eq!(bytes(&db, "LINE"), line.to_le_bytes());
         assert_eq!(bytes(&db, "COLUMN"), column.to_le_bytes());
         assert_eq!(text(&db, "BOTH"), format!("{both_line}:{both_column}"));

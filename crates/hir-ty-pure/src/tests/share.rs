@@ -189,7 +189,7 @@ fn fn_named(db: &Db, krate: Crate, name: &str) -> FunctionId {
 fn two_scripts_share_the_summaries_of_what_both_reach() {
     let db = db();
     let (a, b) = (crate_named(&db, "script_a"), crate_named(&db, "script_b"));
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let (in_a, in_b) = (reached(&db, a), reached(&db, b));
         let mut shared = 0;
         for instance in in_a.iter().filter(|it| in_b.contains(it)) {
@@ -236,7 +236,7 @@ fn a_downstream_impl_keys_the_instance_by_the_crate_of_its_type() {
     let db = db();
     let (a, b) = (crate_named(&db, "script_a"), crate_named(&db, "script_b"));
     let shared = crate_named(&db, "shared");
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let in_b = reached(&db, b);
         let byte = named(&db, &in_b, "`shared::each`", Some("u8"));
         let local = named(&db, &in_b, "`shared::each`", Some("Local"));
@@ -260,7 +260,7 @@ fn a_script_that_solves_differently_keeps_its_own_summaries_of_generics() {
     let db = db();
     let (a, c) = (crate_named(&db, "script_a"), crate_named(&db, "script_c"));
     let shared = crate_named(&db, "shared");
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let in_c = reached(&db, c);
         // Not generic, `helper` is `shared`'s whoever asks, as the code generator compiles it
         // (`hir_ty_mir::mir::home::env_of`): one summary, the one of the body that runs.
@@ -308,7 +308,7 @@ fn a_specializing_dependency_of_the_script_alone_leaves_sharing() {
     let (a, s) = (crate_named(&db, "script_a"), crate_named(&db, "script_s"));
     let shared = crate_named(&db, "shared");
     let std = lang_crate(&db, LangCrateOrigin::Std);
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let in_s = reached(&db, s);
         let helper = named(&db, &in_s, "`shared::helper`", None);
         // `spec` may specialize, but `shared` and `std` do not depend on it, so by the orphan
@@ -383,7 +383,7 @@ fn a_missed_dependency_of_the_home(crates: &str) -> (Purity, bool) {
     blaze_item_hash::identity::set_build(&mut db, ContentId([7; 32]));
     let (k, dep, script) =
         (crate_named(&db, "k"), crate_named(&db, "dep"), crate_named(&db, "build_script"));
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         assert!(
             !loaded_crates(&db, k).contains(&dep),
             "the fixture's premise: `k` names `dep` only through a macro"
@@ -443,7 +443,7 @@ fn a_dependency_of_a_dependency_the_home_does_not_load_keeps_the_scripts_summary
 fn an_open_instance_or_a_generic_environment_has_no_home_and_a_non_generic_one_its_own() {
     let db = db();
     let (a, shared) = (crate_named(&db, "script_a"), crate_named(&db, "shared"));
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let each = fn_named(&db, shared, "each");
         let interner = DbInterner::new_with(&db, shared);
         let params = GenericArgs::identity_for_item(interner, each.into()).store();
@@ -558,7 +558,7 @@ fn main() {
     blaze_item_hash::identity::set_build(&mut db, ContentId([7; 32]));
     let (h, script) = (crate_named(&db, "h"), crate_named(&db, "build_script"));
     let alloc = lang_crate(&db, LangCrateOrigin::Alloc);
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         assert!(lang_items(&db, alloc).OwnedBox.is_some(), "the fixture's `Box` is `owned_box`");
         assert!(lang_items(&db, h).OwnedBox.is_none(), "`h` sees no `owned_box`");
         assert!(lang_items(&db, script).OwnedBox.is_some());
@@ -639,7 +639,7 @@ fn main() {
     let walk = |first: &str, second: &str| {
         let mut db = db_with(CYCLE);
         blaze_item_hash::identity::set_build(&mut db, ContentId([7; 32]));
-        hir_ty::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             let lib = crate_named(&db, "lib");
             let mut out = Vec::new();
             for script in [first, second] {

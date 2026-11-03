@@ -325,18 +325,19 @@ impl std::fmt::Display for StillRuns {
 impl std::error::Error for StillRuns {}
 
 /// The daemon's hold of its state, `serve.lock` in it, which names its pid: locked for the
-/// process's life (the kernel lets it go as the process ends, however it ends), so a daemon
+/// engine's life and let go of as it drops ([`stdx::file_lock::Locked`], so a child spawned
+/// meanwhile keeps nothing), or by the kernel as the process ends, however it ends, so a daemon
 /// started while the one before it still ends (writing its image, then letting its socket's
 /// name go) waits for it rather than takes its place. At most [`BEFORE_ENDS`]; after,
 /// [`StillRuns`].
 #[cfg(unix)]
-fn hold(state: &Path, ready: Option<&mut std::fs::File>) -> anyhow::Result<std::fs::File> {
+fn hold(state: &Path, ready: Option<&mut std::fs::File>) -> anyhow::Result<stdx::file_lock::Locked> {
     use std::{
         io::{Read as _, Seek as _, Write as _},
         os::unix::fs::OpenOptionsExt as _,
     };
     let lock = state.join("serve.lock");
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -344,10 +345,11 @@ fn hold(state: &Path, ready: Option<&mut std::fs::File>) -> anyhow::Result<std::
         .mode(0o600)
         .open(&lock)
         .with_context(|| format!("opening the daemon's lock {}", lock.display()))?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::Error(error)) => bail!("locking the daemon's state at {}: {error}", lock.display()),
-        Err(std::fs::TryLockError::WouldBlock) => {
+    let tried = stdx::file_lock::Locked::try_lock(file)
+        .with_context(|| format!("locking the daemon's state at {}", lock.display()))?;
+    let mut file = match tried {
+        Ok(file) => file,
+        Err(mut file) => {
             let mut written = String::new();
             // alloc: once a start that waits
             let pid = match file.rewind().and_then(|()| file.read_to_string(&mut written)) {
@@ -363,17 +365,16 @@ fn hold(state: &Path, ready: Option<&mut std::fs::File>) -> anyhow::Result<std::
                 BEFORE_ENDS.as_secs(),
                 lock.display()
             );
-            // A second descriptor of the same open file, whose lock is this one's: `lock` has no
-            // timed wait, so it waits on a thread of its own, and this one at most `BEFORE_ENDS`
-            // for its word. Past that this process ends, the thread with it.
-            let other = file.try_clone().with_context(|| format!("opening the daemon's lock {} again", lock.display()))?;
+            // `lock` has no timed wait, so the file waits on a thread of its own, and this one at
+            // most `BEFORE_ENDS` for it to come back locked. Past that this process ends, the
+            // thread with it.
             let (locked, word) = crossbeam_channel::bounded(1);
             std::thread::Builder::new()
                 .name("blaze-serve-lock".to_owned()) // alloc: once a start that waits
-                .spawn(move || drop(locked.send(other.lock())))
+                .spawn(move || drop(locked.send(stdx::file_lock::Locked::lock(file))))
                 .with_context(|| format!("starting the thread that waits on {}", lock.display()))?;
             match word.recv_timeout(BEFORE_ENDS) {
-                Ok(Ok(())) => {}
+                Ok(Ok(file)) => file,
                 Ok(Err(error)) => bail!("locking the daemon's state at {}: {error}", lock.display()),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => return Err(StillRuns { pid, lock }.into()),
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -381,7 +382,7 @@ fn hold(state: &Path, ready: Option<&mut std::fs::File>) -> anyhow::Result<std::
                 }
             }
         }
-    }
+    };
     file.set_len(0)
         .and_then(|()| file.rewind())
         .and_then(|()| write!(file, "{}", std::process::id()))
@@ -496,7 +497,7 @@ pub(crate) struct Engine {
 /// and the lease of the shared standard library's store.
 struct Held {
     #[cfg(unix)]
-    _lock: std::fs::File,
+    _lock: stdx::file_lock::Locked,
     _std_lease: blaze_gc::lease::Lease,
 }
 

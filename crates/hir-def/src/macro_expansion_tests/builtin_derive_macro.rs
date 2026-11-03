@@ -1065,10 +1065,11 @@ enum Foo<T> {
 }
 
 /// A field named by a word that is a keyword only in a later edition than the item's (`gen` in
-/// 2021, as streaming-iterator 0.1.9's `FromFn`) derives: the derive writes the field in its own
-/// context, whose edition is core's (2024), so it writes the name raw (`r#gen`), as rustc's
-/// `Ident::is_raw_guess` prints one, and the field's name in `Debug`'s output stays `gen`.
-/// Before, each derive's output failed to parse ("expected identifier") at `gen`.
+/// 2021, as streaming-iterator 0.1.9's `FromFn`) derives: the derive keeps the field's own span
+/// and syntax context, as rustc's derives keep `FieldDef::ident`, so the parser reads `gen` in
+/// its crate's edition and it stays `gen` with no `r#`; `Debug`'s output says `gen`. Each
+/// expansion is checked to parse (`check` refuses one with errors): before, each derive's output
+/// failed to parse ("expected identifier") at `gen`, read in the derive's 2024 context.
 #[test]
 fn a_field_named_by_a_later_editions_keyword_derives() {
     check(
@@ -1102,10 +1103,10 @@ pub struct P {
     fn clone(&self ) -> Self {
         match self {
             FromFn {
-                r#gen: gen_self, item: item_self,
+                gen: gen_self, item: item_self,
             }
             =>FromFn {
-                r#gen: $crate::clone::Clone::clone(gen_self), item: $crate::clone::Clone::clone(item_self),
+                gen: $crate::clone::Clone::clone(gen_self), item: $crate::clone::Clone::clone(item_self),
             }
             ,
         }
@@ -1115,7 +1116,7 @@ pub struct P {
     fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result {
         match self {
             FromFn {
-                r#gen: gen_self, item: item_self,
+                gen: gen_self, item: item_self,
             }
             => {
                 let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "FromFn");
@@ -1136,7 +1137,7 @@ pub struct P {
 #[automatically_derived] impl <> $crate::fmt::Debug for P< > where {
     fn fmt(&self , f: &mut $crate::fmt::Formatter) -> $crate::fmt::Result { {
             let gen_self = {
-                self .r#gen
+                self .gen
             }
             ; {
                 let mut ra_expand_builder = $crate::fmt::Formatter::debug_struct(f, "P");

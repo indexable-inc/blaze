@@ -553,6 +553,43 @@ fn bytes_that_are_not_utf8_are_a_file_without_text() {
     assert!(!db.has_file_text(data));
 }
 
+/// A file whose bytes are not UTF-8 has them as its input, set by the view loader alone: its
+/// content in its source root ([`Db::file_content`], which an image's key, a crate's facts and
+/// a macro's code hash) moves with its bytes and with nothing else, and is its text's once it
+/// has text. The same bytes give the same content, however the file got them.
+#[test]
+fn the_bytes_of_a_file_without_text_are_its_content() {
+    let mut db = Db::for_tests();
+    let (base, partition) = checkout(&mut db);
+    let root = |db: &Db| db.source_root(SourceRootId(0)).content(db);
+    let first: &[(&str, &[u8])] = &[("src/lib.rs", b"mod a;"), ("data.bin", &[0xff, 0xfe])];
+    set_view(&mut db, &base, &partition, first).unwrap();
+    let data = file_at(&db, &base, "data.bin").unwrap();
+    let raw = db.raw_file(data).expect("the loader keeps the bytes of a file without text");
+    assert_eq!(raw.bytes(&db).map(|it| &it[..]), Some(&[0xff, 0xfe][..]));
+    let (content, root_was) = (db.file_content(data), root(&db));
+    assert_eq!(content, crate::IncludedFile::content_of(Ok(&[0xff, 0xfe][..])));
+    assert_eq!(set_view(&mut db, &base, &partition, first).unwrap(), ViewChange::default(), "the same bytes write nothing");
+
+    let edited: &[(&str, &[u8])] = &[("src/lib.rs", b"mod a;"), ("data.bin", &[0xff, 0xfd])];
+    let change = set_view(&mut db, &base, &partition, edited).unwrap();
+    assert_eq!((change.set, change.no_text), (vec![data], vec![data]));
+    assert_eq!(db.raw_file(data), Some(raw), "one input, set again");
+    assert_eq!(raw.bytes(&db).map(|it| &it[..]), Some(&[0xff, 0xfd][..]));
+    assert_ne!(db.file_content(data), content);
+    assert_ne!(root(&db), root_was, "the source root's content moves with the bytes");
+
+    let text: &[(&str, &[u8])] = &[("src/lib.rs", b"mod a;"), ("data.bin", b"now text")];
+    set_view(&mut db, &base, &partition, text).unwrap();
+    assert_eq!(db.raw_file(data), None);
+    assert_eq!(db.file_content(data), db.file_text(data).content(&db));
+    assert_ne!(raw.bytes(&db).map(|it| &it[..]), Some(&[0xff, 0xfd][..]), "what read the bytes reruns");
+
+    set_view(&mut db, &base, &partition, first).unwrap();
+    assert_eq!(db.raw_file(data), Some(raw), "the input comes back");
+    assert_eq!((db.file_content(data), root(&db)), (content, root_was));
+}
+
 #[test]
 fn a_content_id_that_is_not_its_bytes_is_refused() {
     let mut db = Db::for_tests();
@@ -1018,12 +1055,9 @@ fn a_view_set_over_others_is_the_view_set_alone() {
             let id = id_of(&db, path).unwrap();
             let written = match old.get(path) {
                 Some(&was) if in_root.contains(path) => {
+                    // Bytes that are not text are an input too: a change of them is a set.
                     if was != bytes {
-                        let both_binary =
-                            std::str::from_utf8(was).is_err() && std::str::from_utf8(bytes).is_err();
-                        if !both_binary {
-                            set.push(id);
-                        }
+                        set.push(id);
                     }
                     was != bytes
                 }

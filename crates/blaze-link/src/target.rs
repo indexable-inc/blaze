@@ -124,7 +124,10 @@ const LINKED: &str = "x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, aarch
 static CACHE: Cache = Cache::new();
 
 /// How `triple` links: an executable, or the shared library `shared` names (its file name and
-/// exports) for a `cdylib` or proc macro. `incremental` keeps room to grow in the image.
+/// exports) for a `cdylib` or proc macro. `incremental` keeps room to grow in the image, where
+/// the format has room to keep: a wasm module (wasm32 and wasm64) is written whole by every
+/// link and its code reached by index, so it is never incremental, and each link of it is a
+/// whole layout (no patch is refused for want of room).
 pub fn output(
     triple: &str,
     shared: Option<(String, Vec<String>)>,
@@ -323,7 +326,10 @@ fn output_with<A: Ask>(
         kind,
         interpreter,
         platform,
-        incremental,
+        // A wasm module keeps no room ([`crate::model::Plan::indexed_code`]): its writer writes
+        // the whole module each link, so a layout that kept room would save no write, and one
+        // that kept none refused every added function.
+        incremental: incremental && target.format() != Format::Wasm,
         // A wasm module's debug info is its name section, which the writer always writes: its
         // functions are indices, not addresses, so DWARF line tables made for an image's
         // addresses would be wrong, and the writer refuses them. Every debug level of a wasm

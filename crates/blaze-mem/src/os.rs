@@ -530,12 +530,12 @@ pub(crate) unsafe fn commit_reserved(ptr: NonNull<u8>, bytes: usize, node: Optio
         )
     };
     if got == libc::MAP_FAILED {
-        return Err(on_reserved(bytes, "mapping", io::Error::last_os_error()));
+        return Err(on_reserved(bytes, "mapping", &io::Error::last_os_error()));
     }
     let made = (|| {
         // SAFETY: the range just mapped, ours alone; the advice changes what `fork` copies.
         if unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, libc::MADV_DONTFORK) } != 0 {
-            return Err(on_reserved(bytes, "excluding from fork", io::Error::last_os_error()));
+            return Err(on_reserved(bytes, "excluding from fork", &io::Error::last_os_error()));
         }
         if let Some(node) = node {
             // SAFETY: the range just mapped, holding no page yet; the fresh mapping has the
@@ -545,7 +545,7 @@ pub(crate) unsafe fn commit_reserved(ptr: NonNull<u8>, bytes: usize, node: Optio
         // SAFETY: the range just mapped, readable and writable; populating writes zero pages
         // that nothing has read.
         if unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, MADV_POPULATE_WRITE) } != 0 {
-            return Err(on_reserved(bytes, "making the pages of", io::Error::last_os_error()));
+            return Err(on_reserved(bytes, "making the pages of", &io::Error::last_os_error()));
         }
         Ok(())
     })();
@@ -561,7 +561,7 @@ pub(crate) unsafe fn commit_reserved(ptr: NonNull<u8>, bytes: usize, node: Optio
 /// Names a refused hugetlb step and what to do about it.
 #[cfg(target_os = "linux")]
 #[cold]
-fn on_reserved(bytes: usize, step: &str, why: io::Error) -> io::Error {
+fn on_reserved(bytes: usize, step: &str, why: &io::Error) -> io::Error {
     let hint = match why.raw_os_error() {
         Some(libc::EINVAL) if step.starts_with("making") => {
             "populating needs Linux 5.14 (`MADV_POPULATE_WRITE`)"
@@ -658,12 +658,17 @@ pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, _huge: bool) -> io
     Ok(())
 }
 
-/// Lets the kernel take the pages of `[ptr, ptr + bytes)` back while they stay committed: the
-/// next touch finds them zeroed (Linux) or unspecified (macOS, Windows).
+/// Lets the kernel take the pages of `[ptr, ptr + bytes)` back while they stay reserved: the
+/// next touch after [`reuse`] finds them zeroed (Linux) or unspecified (macOS, Windows). Linux
+/// drops them at once (`MADV_DONTNEED`), so the resident set falls now, not under pressure;
+/// macOS marks them reusable (`MADV_FREE_REUSABLE`), which takes them out of the process's
+/// footprint; Windows decommits them (`MEM_DECOMMIT`), which also gives back their charge
+/// against the commit limit.
 ///
 /// # Safety
 ///
-/// As for [`commit`], the range is committed, and nothing holds data in it.
+/// As for [`commit`], the range is committed, and nothing holds data in it or touches it
+/// before [`reuse`] is called over it.
 #[cfg(unix)]
 pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) {
     #[cfg(target_os = "macos")]
@@ -677,9 +682,12 @@ pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) {
 
 #[cfg(windows)]
 pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) {
-    use windows_sys::Win32::System::Memory::{MEM_RESET, PAGE_READWRITE, VirtualAlloc};
-    // SAFETY: the caller says the committed range holds nothing anyone reads.
-    let _ = unsafe { VirtualAlloc(ptr.as_ptr().cast(), bytes, MEM_RESET, PAGE_READWRITE) };
+    use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+    // A refusal leaves the pages committed, which costs memory and not correctness: `reuse`
+    // commits them either way.
+    // SAFETY: the caller says the committed range holds nothing anyone reads, and nothing
+    // touches it before `reuse` commits it again.
+    let _ = unsafe { VirtualFree(ptr.as_ptr().cast(), bytes, MEM_DECOMMIT) };
 }
 
 /// The pages go back through the runner, as for [`decommit`]; they read zeros after.
@@ -691,6 +699,35 @@ pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) {
 
 #[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
 pub(crate) unsafe fn purge(_ptr: NonNull<u8>, _bytes: usize) {}
+
+/// Makes the pages of `[ptr, ptr + bytes)`, some of which [`purge`] may have given back, the
+/// process's again before they are written: macOS counts pages marked reusable back into the
+/// footprint (`MADV_FREE_REUSE`, which leaves other pages as they are), Windows commits the
+/// decommitted ones (committing a committed page changes nothing). Linux and wasm fault them
+/// back in on the first touch, so there it does nothing.
+///
+/// # Safety
+///
+/// As for [`commit`]: the range is inside a live, committed reservation of ours.
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn reuse(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
+    // Advice: a refusal leaves the pages counted as reusable, which misstates the footprint
+    // and costs no correctness, as libmalloc treats it.
+    // SAFETY: the caller says the range is committed and ours.
+    let _ = unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, libc::MADV_FREE_REUSE) };
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) unsafe fn reuse(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
+    // SAFETY: as for `commit`: the range is inside a live reservation of ours.
+    unsafe { commit(ptr, bytes) }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(crate) unsafe fn reuse(_ptr: NonNull<u8>, _bytes: usize) -> io::Result<()> {
+    Ok(())
+}
 
 /// Releases a whole reservation.
 ///

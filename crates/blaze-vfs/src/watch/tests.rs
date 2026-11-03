@@ -187,7 +187,7 @@ impl<W: Watch> Run<W> {
         self.vfs.disks.encode(&mut bytes);
         let len = bytes.len();
         let section = Section::new(Mapping::copy(&bytes), 0..len).expect("a section");
-        self.vfs.disks = Disks::open(section).expect("the column reopens");
+        self.vfs.disks = Disks::open(&section).expect("the column reopens");
         self.watcher = W::new("disk", name("ws"), TAGS);
         (self.reads.clear(), self.stamped.clear(), self.out.clear());
         self.watcher.start(&self.vfs, &mut self.effects);

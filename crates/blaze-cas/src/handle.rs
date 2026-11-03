@@ -70,7 +70,7 @@ impl Handle {
     }
 
     /// Keeps `bytes` under `key`, as [`Writer::put`] does.
-    pub fn put(&self, key: Key, kind: Kind, bytes: Vec<u8>) -> Result<Ticket, Mismatch> {
+    pub fn put(&self, key: Key, kind: Kind, bytes: &[u8]) -> Result<Ticket, Mismatch> {
         let guard = enter();
         // A put that panicked left its segment whole: a writer publishes only whole records.
         let mut writer = self.writer.lock();

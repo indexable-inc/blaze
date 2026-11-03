@@ -25,7 +25,7 @@ fn fixture(n: usize) -> String {
 fn with_cx<R>(n: usize, check: impl FnOnce(&Cx<'_, '_>) -> R) -> R {
     let checked = crate::tests::checked(&fixture(n));
     let db = &checked.db;
-    hir::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let krate = hir::check::workspace_crates(db)
             .into_iter()
             .find(|it| it.display_name(db).is_some_and(|name| name.to_string() == "main"))

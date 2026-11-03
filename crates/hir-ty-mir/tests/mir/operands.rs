@@ -50,7 +50,7 @@ fn operands_is_the_code_generators_copy_plus_binary_op() {
     let fx = fixture::db(BODIES);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let reads: InferBodyId<'_> = function(&db, "reads").into();
         let mut binary = 0;
         for stage in [MirStage::Built, MirStage::Runtime] {

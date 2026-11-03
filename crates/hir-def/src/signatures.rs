@@ -29,7 +29,7 @@ use crate::{
     attrs::AttrFlags,
     expr_store::{
         body::{BodySyntax, body_syntax},
-        ExpressionStore, ExpressionStoreSourceMap, Move, MoveTo,
+        ExpressionStore, ExpressionStoreSourceMap, HygieneId, Move, MoveTo,
         lower::{
             BodyLowering, ExprCollector, ImplTraitLowering, lower_function,
             lower_generic_params_within, lower_impl, lower_trait, lower_type_alias, lower_type_ref,
@@ -37,6 +37,7 @@ use crate::{
     },
     hir::{ExprId, PatId, generics::GenericParams},
     item_tree::{FieldsShape, RawVisibility, visibility_from_ast},
+    nameres::def_site,
     src::HasSource,
     type_ref::{ConstRef, TraitRef, TypeBound, TypeRefId},
 };
@@ -1790,8 +1791,36 @@ impl VariantFields {
         &self.fields
     }
 
+    /// The field whose name, [keyed](Name::keyed) as it is bound, is `name`.
     pub fn field(&self, name: &Name) -> Option<LocalFieldId> {
         self.fields().iter().find_map(|(id, data)| if &data.name == name { Some(id) } else { None })
+    }
+
+    /// The field of these, the fields of `id`, that a name written `name` with `hygiene` names:
+    /// a field access's, a record expression's or a record pattern's field name
+    /// ([`ExpressionStore::member_hygiene`], [`ExpressionStore::record_field_hygiene`]). See
+    /// [`Self::name_written`].
+    pub fn field_written(
+        &self,
+        db: &Db,
+        id: VariantId,
+        name: &Name,
+        hygiene: HygieneId,
+    ) -> Option<LocalFieldId> {
+        self.field(&Self::name_written(db, id, *name, hygiene))
+    }
+
+    /// The name, [keyed](Name::keyed), that a field name written `name` with `hygiene` looks up
+    /// among the fields of `id` ([`def_site::name_in`] in the scope the ADT's expansion
+    /// made): a name a `macro` writes finds the field the same `macro` named, not one of the
+    /// same text its caller named (rustc's `check_field` and `check_expr_struct_fields`). Plain
+    /// equality of names wherever no `macro` (2.0) marks the name; a tuple index is looked up
+    /// as written, as positional fields take no key.
+    pub fn name_written(db: &Db, id: VariantId, name: Name, hygiene: HygieneId) -> Name {
+        if hygiene.is_root() || name.as_tuple_index().is_some() {
+            return name;
+        }
+        def_site::name_in(db, name, hygiene.syntax_context(), def_site::variant_expansion(db, id))
     }
 }
 
@@ -1811,7 +1840,10 @@ fn lower_field_list(
             module,
             fields.fields().count(),
             InFile::new(file_id, fields.fields().map(|field| (field.ty(), field))),
-            |_, field| as_name_opt(field.name()),
+            |_, field| {
+                let name = field.name();
+                (as_name_opt(name), name.map(|it| it.syntax().text_range()))
+            },
             |field| field.eq_token().and_then(|_| field.default_val()),
             override_visibility,
             maps,
@@ -1823,7 +1855,7 @@ fn lower_field_list(
             module,
             fields.fields().count(),
             InFile::new(file_id, fields.fields().map(|field| (field.ty(), field))),
-            |idx, _| Name::new_tuple_field(idx),
+            |idx, _| (Name::new_tuple_field(idx), None),
             |_| None,
             override_visibility,
             maps,
@@ -1834,13 +1866,21 @@ fn lower_field_list(
 }
 
 /// The `count` fields of a list, written with their types; `None` when it has none written,
-/// before anything is set up to lower them.
+/// before anything is set up to lower them. `field_name` gives each field's name and where it
+/// is written, if it is (a tuple struct's are not).
+///
+/// A field whose name a `macro` (2.0) or a def-site span writes binds its name
+/// [keyed](Name::keyed) by its context normalized to macros 2.0
+/// ([`def_site::key_of_context`]), as rustc compares `FieldDef::ident`s: a struct a `macro`
+/// writes may have a field `a` of its own and one `$a` its caller names, two fields (rustc's
+/// `fields-definition.rs`), and [`VariantFields::field_written`] finds each. Positional fields
+/// take no key (rustc's "FIXME(jseyfried): positional field hygiene").
 fn lower_fields<'t, Field: ast::HasAttrs<'t> + ast::HasVisibility<'t> + Copy>(
     db: &Db,
     module: ModuleId,
     count: usize,
     fields: InFile<impl Iterator<Item = (Option<ast::Type<'t>>, Field)>>,
-    mut field_name: impl FnMut(usize, &Field) -> Name,
+    mut field_name: impl FnMut(usize, &Field) -> (Name, Option<TextRange>),
     mut default_value: impl FnMut(&Field) -> Option<ast::ConstArg<'t>>,
     override_visibility: Option<Option<ast::Visibility<'_>>>,
     maps: Maps<'_>,
@@ -1881,7 +1921,17 @@ fn lower_fields<'t, Field: ast::HasAttrs<'t> + ast::HasVisibility<'t> + Copy>(
                     |it| RawVisibility::clone(it),
                 );
                 let [is_unsafe] = child_tokens(field.syntax(), [T![unsafe]]);
-                let name = field_name(idx, &field);
+                let (name, name_at) = field_name(idx, &field);
+                let name = match name_at {
+                    Some(range) if fields.file_id.macro_file().is_some() => {
+                        let ctxt = col.span_map().span_for_range(range).ctx;
+                        match def_site::key_of_context(db, ctxt) {
+                            Some(key) => name.keyed(key),
+                            None => name,
+                        }
+                    }
+                    _ => name,
+                };
                 let default_value = default_value(&field).map(|expr| col.lower_const_arg(expr));
 
                 lowered.push(FieldData { name, type_ref, visibility, is_unsafe, default_value });
@@ -2188,6 +2238,9 @@ mod tests {
         }
         if attrs.contains(AttrFlags::BLAZE_SPECIALIZATION_TRAIT) {
             flags |= TraitFlags::BLAZE_SPECIALIZATION_TRAIT;
+        }
+        if attrs.contains(AttrFlags::BLAZE_SEALED) {
+            flags |= TraitFlags::SEALED;
         }
         flags
     }

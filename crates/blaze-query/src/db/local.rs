@@ -12,7 +12,7 @@
 //! closure that never calls user code or [`with`] again (every caller below is a few loads and
 //! stores), so no two `&mut` of it are alive at once.
 
-use std::{cell::UnsafeCell, hash::BuildHasher, num::NonZeroUsize, ptr};
+use std::{any::TypeId, cell::UnsafeCell, hash::BuildHasher, num::NonZeroUsize, ptr, ptr::NonNull};
 
 use blaze_hash::FixedState;
 
@@ -156,13 +156,24 @@ pub(crate) struct Local {
     pub(crate) occurrences: hashbrown::HashMap<(u64, u32, u64), u32, FixedState>,
     /// The nodes [`Local::dedup_from`] has kept, empty between its calls.
     seen: hashbrown::HashSet<u32, FixedState>,
-    pub(crate) attached: *const Storage,
+    /// The database [`super::attach`] lent this task, carried with it across fibers as the
+    /// rest of its stack is.
+    pub(crate) attached: Option<Attached>,
     /// The task's bound on the rows it brings up to date ([`super::with_fuel`]), moved with it
     /// across fibers as the rest of its stack is.
     pub(crate) fuel: Option<Fuel>,
     /// The barriers on the stack that are not lifted: a job pumped above one is not the
     /// fueled task's, and is not charged.
     walls: u32,
+}
+
+/// A database [`super::attach`] lent: its address, its type (so [`super::with_attached_db`]
+/// hands it back only as what it is) and its storage (what the engine's own `Debug`s read).
+#[derive(Clone, Copy)]
+pub(crate) struct Attached {
+    pub(crate) db: NonNull<()>,
+    pub(crate) ty: TypeId,
+    pub(crate) storage: NonNull<Storage>,
 }
 
 /// [`Local::fuel`]: the steps given and left, and how many barriers stood when it was given.
@@ -187,7 +198,7 @@ impl Local {
             serial: 0,
             occurrences: hashbrown::HashMap::with_hasher(FixedState),
             seen: hashbrown::HashSet::with_hasher(FixedState),
-            attached: ptr::null(),
+            attached: None,
             fuel: None,
             walls: 0,
         }
@@ -204,7 +215,7 @@ impl Local {
             && self.pending.is_empty()
             && self.walk.is_empty()
             && self.occurrences.is_empty()
-            && self.attached.is_null()
+            && self.attached.is_none()
             && self.fuel.is_none()
             && self.walls == 0
     }
@@ -271,7 +282,7 @@ pub(crate) fn with<R>(f: impl FnOnce(&mut Local) -> R) -> R {
 /// out there.
 struct Spare(Box<Local>);
 
-// SAFETY: a spare is empty ([`Local::is_empty`], checked as it is kept: `attached` null and no
+// SAFETY: a spare is empty ([`Local::is_empty`], checked as it is kept: `attached` none and no
 // frame), so it points at no storage.
 unsafe impl Send for Spare {}
 

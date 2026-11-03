@@ -780,8 +780,9 @@ static CARRIED_LEN: AtomicUsize = AtomicUsize::new(0);
 /// (each job's limit is set at its start, in `body`), and the job's reclamation task
 /// (`blaze_reclaim`: a pool's job is one), which keeps what the job read valid while it waits,
 /// its task frame (`blaze_mem::frame`, which allocates into the job's own frame wherever it
-/// resumes), its innermost open scope ([`super::innermost_scope`]) and its give-ways
-/// (`crate::pump::gave_way`), which a loop compares across an item that may resume elsewhere.
+/// resumes), its innermost open scope ([`super::innermost_scope`]), its give-ways
+/// (`crate::pump::gave_way`), which a loop compares across an item that may resume elsewhere,
+/// and whether it has asked since it last gave way ([`super::before_claim`]).
 pub(super) fn carry_stack_limit() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -791,6 +792,7 @@ pub(super) fn carry_stack_limit() {
         carry(Carried::word(blaze_mem::frame::take_below, blaze_mem::frame::put_below));
         carry(Carried::word(blaze_mem::frame::take_cancelling, blaze_mem::frame::put_cancelling));
         carry(Carried::word(crate::pump::take_gave_ways, crate::pump::put_gave_ways));
+        carry(Carried::word(super::host::take_retry, super::host::put_retry));
         carry(Carried::word(
             || {
                 let limit = stdx::fiber_stack_limit();

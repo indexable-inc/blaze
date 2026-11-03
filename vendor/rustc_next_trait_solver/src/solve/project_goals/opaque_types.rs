@@ -145,10 +145,7 @@ where
             // FIXME(try_as_dyn): probably want to treat opaques opaquely and rigid
             TypingMode::Reflection | TypingMode::PostAnalysis | TypingMode::Codegen => {
                 // FIXME: Add an assertion that opaque type storage is empty.
-                let actual = match cx.opaque_of_impl(goal.param_env, def_id, opaque_ty.args) {
-                    Some(actual) => ty::Unnormalized::new(actual),
-                    None => cx.type_of(def_id.into()).instantiate(cx, opaque_ty.args),
-                };
+                let actual = cx.type_of(def_id.into()).instantiate(cx, opaque_ty.args);
                 let actual = self.normalize(goal.param_env, actual)?;
                 self.eq(goal.param_env, expected, actual)?;
                 self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)

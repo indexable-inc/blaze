@@ -82,10 +82,13 @@ def behaviour(executable, cwd, targets):
 class Project:
     """The checkout `ws`, built by a daemon in `home` (by default `<work>/home`) with `env` set
     for it, and from nothing in homes under `work`. With `serves`, another Project, it is built
-    by that one's daemon: one daemon of one home for several checkouts."""
+    by that one's daemon: one daemon of one home for several checkouts. `outside` names the
+    directories outside the checkout whose files the build reads (`include_bytes!("../../x")`):
+    they are of its source as the checkout's files are."""
 
-    def __init__(self, ws, work, *, env=None, home=None, name="warm", serves=None):
+    def __init__(self, ws, work, *, env=None, home=None, name="warm", serves=None, outside=()):
         self.ws, self.work, self.name, self.serves = ws, work, name, serves
+        self.outside = tuple(outside)
         self.env = dict(env or {})
         self.home = serves.home if serves else home or os.path.join(work, "home")
         self.target = os.path.join(ws, "target")
@@ -136,7 +139,8 @@ class Project:
         """What the program `blaze COMMAND ARGS` makes of the checkout as it is now, with `env`
         as it is now, does when built in an empty home: `behaviour`, or None when the build is
         refused."""
-        key = (program, command, args, tuple(sorted(self.env.items())), tree(self.ws))
+        source = (tree(self.ws), *(tree(it) for it in self.outside))
+        key = (program, command, args, tuple(sorted(self.env.items())), source)
         if key not in self.fresh_runs:
             self.fresh_count += 1
             at = os.path.join(self.work, f"fresh-{self.fresh_count}")

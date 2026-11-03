@@ -15,7 +15,7 @@ pub(crate) mod names;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use defs::head_range_view;
+pub(crate) use defs::{block_conflicts, head_range_view};
 
 use std::ops::ControlFlow;
 

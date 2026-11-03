@@ -91,6 +91,11 @@ struct Import {
 #[derive(Clone, Copy)]
 struct Binding {
     name: Name,
+    /// The context its name is keyed by in the front end's scope (`hir_def::nameres::
+    /// def_binding_key`): a name a `macro` wrote and one written elsewhere are two bindings,
+    /// as rustc keys them, so two expansions of one `macro` that each define `DLSYM` in one
+    /// block do not conflict.
+    key: Option<span::SyntaxContext>,
     ns: Ns,
     origin: Origin,
     /// What it resolves to, to tell two imports of one item.
@@ -241,7 +246,7 @@ impl ExternPrelude {
 }
 
 fn hash_of(scope: &Scope, binding: &Binding) -> u64 {
-    FixedState.hash_one((scope.name(binding.name), binding.ns))
+    FixedState.hash_one((scope.name(binding.name), binding.ns, binding.key.map(|it| it.into_u32())))
 }
 
 /// Each binding of `scope` in the order rustc plants them, each conflict reported as rustc
@@ -262,7 +267,7 @@ fn plant(
             let hash = hash_of(scope, binding);
             let same = |&at: &u32| {
                 let it = &scope.bindings[at as usize];
-                it.ns == binding.ns && scope.name(it.name) == name
+                it.ns == binding.ns && it.key == binding.key && scope.name(it.name) == name
             };
             let Some(&old) = planted.find(hash, same) else {
                 planted.insert_unique(hash, index as u32, |&at| hash_of(scope, &scope.bindings[at as usize]));
@@ -512,7 +517,7 @@ fn enum_scope(cx: &Cx<'_, '_>, scope: &mut Scope, module: hir::Module, enum_: hi
         let node = variant.syntax();
         let (range, head) = (source.with_value(item_range(node)), source.with_value(head_range(node)));
         for (ns, kind) in [(Ns::Type, "type"), (Ns::Value, "value")] {
-            scope.bindings.push(Binding { name, ns, origin: Origin::Def, res: None, kind, range, head, item });
+            scope.bindings.push(Binding { name, key: None, ns, origin: Origin::Def, res: None, kind, range, head, item });
         }
     }
 }
@@ -537,7 +542,7 @@ fn trait_scope(cx: &Cx<'_, '_>, scope: &mut Scope, module: hir::Module, trait_: 
         }
         let name = scope.intern(name.as_str());
         let kind = ns.descr();
-        scope.bindings.push(Binding { name, ns, origin: Origin::Def, res: None, kind, range, head, item });
+        scope.bindings.push(Binding { name, key: None, ns, origin: Origin::Def, res: None, kind, range, head, item });
     }
 }
 
@@ -577,9 +582,10 @@ fn item_bindings(cx: &Cx<'_, '_>, scope: &mut Scope, def: hir::ModuleDef) {
     };
     let item = item_id(db, def);
     let name = scope.intern(name.as_str());
+    let key = hir_def::ModuleDefId::try_from(def).ok().and_then(|it| hir_def::nameres::def_binding_key(db, it));
     for &ns in namespaces {
         let kind = kind_of(ns, def);
-        scope.bindings.push(Binding { name, ns, origin: Origin::Def, res: Some(def), kind, range, head, item });
+        scope.bindings.push(Binding { name, key, ns, origin: Origin::Def, res: Some(def), kind, range, head, item });
     }
 }
 
@@ -631,6 +637,7 @@ fn extern_crate_binding(cx: &Cx<'_, '_>, scope: &mut Scope, decl: hir::ExternCra
     let crate_name = scope.intern(decl.name(db).as_str());
     scope.bindings.push(Binding {
         name,
+        key: None,
         ns: Ns::Type,
         origin: Origin::ExternCrate(ExternCrate {
             source: crate_name,
@@ -688,17 +695,18 @@ fn import_bindings<'db>(cx: &Cx<'_, 'db>, scope: &mut Scope, uses: &mut UseTrees
         let Some(source) = source else { continue };
         let source_name = source.name_ref();
         let rename = tree.rename();
-        let name = match &rename {
+        let (name, written) = match &rename {
             Some(rename) if rename.underscore_token().is_some() => continue,
             Some(rename) => match rename.name() {
-                Some(it) => scope.intern(it.text()),
+                Some(it) => (scope.intern(it.text()), it.syntax().text_range()),
                 None => continue,
             },
             None => match &source_name {
-                Some(it) => scope.intern(it.text()),
+                Some(it) => (scope.intern(it.text()), it.syntax().text_range()),
                 None => continue,
             },
         };
+        let key = hir_def::nameres::binding_key_at(cx.db, item.file_id, written);
         let Some(resolved) = cx.vsema.resolve_path_per_ns(path) else { continue };
         let range = item.with_value(tree.syntax().text_range());
         let import = Import { source_end: source.syntax().text_range().end(), nested, ..site };
@@ -711,6 +719,7 @@ fn import_bindings<'db>(cx: &Cx<'_, 'db>, scope: &mut Scope, uses: &mut UseTrees
             let Some(PathResolution::Def(def)) = res else { continue };
             scope.bindings.push(Binding {
                 name,
+                key,
                 ns,
                 origin: Origin::Import(import),
                 res: Some(def),

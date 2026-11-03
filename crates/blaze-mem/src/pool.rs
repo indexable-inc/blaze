@@ -27,7 +27,7 @@ use std::{
     ptr::{self, NonNull},
 };
 
-use blaze_reclaim::Grace;
+use blaze_reclaim::{Grace, Horizon};
 
 use crate::{
     MemError, Region, RegionVec, Tag,
@@ -753,7 +753,9 @@ impl<'p, T> Limbo<'p, T> {
     /// Drops every object whose grace has passed and keeps its slot for the pool. Returns how
     /// many it freed.
     pub fn collect(&mut self) -> usize {
-        let passed = self.held[self.head..].partition_point(|retired| retired.grace.passed());
+        let horizon = Horizon::now();
+        let passed =
+            self.held[self.head..].partition_point(|retired| horizon.passed(retired.grace));
         for at in self.head..self.head + passed {
             let index = self.held[at].index;
             // SAFETY: the slot holds the value its `Pooled` owned when it was retired (the
@@ -766,14 +768,16 @@ impl<'p, T> Limbo<'p, T> {
         passed
     }
 
-    /// Takes out up to `N` of the objects whose grace has passed, oldest first, for the caller
-    /// to drop once it has let go of what guards this limbo ([`Passed`]). An object's drop takes
-    /// as long as the object is big (a trait solver's cache of a whole crate is hundreds of
-    /// megabytes of maps), so a limbo behind a lock other threads wait on
-    /// ([`crate::lock::SpinLock`]) never drops under it; [`Limbo::collect`] is for an owner no
-    /// other thread waits on.
-    pub fn take_passed<const N: usize>(&mut self) -> Passed<'p, T, N> {
-        let passed = self.held[self.head..].partition_point(|retired| retired.grace.passed()).min(N);
+    /// Takes out up to `N` of the objects whose grace had passed by `horizon`, oldest first, for
+    /// the caller to drop once it has let go of what guards this limbo ([`Passed`]). For a limbo
+    /// behind a lock other threads wait on, so it does neither slow step under it: an object's
+    /// drop takes as long as the object is big (a trait solver's cache of a whole crate is
+    /// hundreds of megabytes of maps), and the scan of every reclaim slot that says which graces
+    /// passed is the caller's, taken before it locks ([`Horizon::now`]); here it is a binary
+    /// search of the held graces. [`Limbo::collect`] is for an owner no other thread waits on.
+    pub fn take_passed<const N: usize>(&mut self, horizon: Horizon) -> Passed<'p, T, N> {
+        let passed =
+            self.held[self.head..].partition_point(|retired| horizon.passed(retired.grace)).min(N);
         let mut taken = Passed { pool: self.cache.pool, indices: [0; N], len: 0, dropped: 0 };
         for at in self.head..self.head + passed {
             taken.indices[taken.len] = self.held[at].index;

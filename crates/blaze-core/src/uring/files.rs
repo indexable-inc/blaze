@@ -8,7 +8,7 @@
 //! driver picks the slots, not the kernel (`IORING_FILE_INDEX_ALLOC`): a link after an open
 //! is written before the open runs, so it must name the slot before the kernel would say
 //! which. Each slot is emptied with `IORING_OP_CLOSE` once the request ends. A kept file is
-//! opened to a descriptor of its own (`ReadAll`'s `fstat` and `Truncate`'s `ftruncate` take
+//! opened to a descriptor of its own (`ReadAll`'s `fstat` takes
 //! one) and put in its slot with `IORING_OP_FILES_UPDATE`; the requests on it wait for that.
 //!
 //! Where an open (or a link, or a clone's target) finds a directory missing and the effect
@@ -530,10 +530,10 @@ impl Uring {
 
     /// Whether the request `id` on a kept file may be asked of the kernel: its file open, and a
     /// whole file's read sized. One that waits for its file is asked once it is open
-    /// ([`Uring::wake`]); a truncate is done here, on the open descriptor, and ends.
+    /// ([`Uring::wake`]).
     pub(super) fn prepared(&mut self, id: Id) -> bool {
         let hot = *self.ops.get(id).expect("a request in flight");
-        if !matches!(hot.kind, Kind::Read | Kind::Append | Kind::Sync | Kind::Truncate) {
+        if !matches!(hot.kind, Kind::Read | Kind::Append | Kind::Sync) {
             return true;
         }
         let kept = self.kept.get(Handle::from_bits(hot.of)).expect("held by its request");
@@ -544,17 +544,6 @@ impl Uring {
         }
         let fd = kept.fixed.fd();
         let done = match hot.kind {
-            // No io_uring op cuts a file below Linux 6.9 (`IORING_OP_FTRUNCATE`): one
-            // `ftruncate` of the descriptor already open, here.
-            Kind::Truncate => {
-                let len = self.ops.cold(id).at;
-                // SAFETY: an open descriptor; no pointers.
-                match unsafe { libc::ftruncate(fd, len as libc::off_t) } {
-                    0 => Done::Truncated,
-                    // alloc: an error.
-                    _ => Done::Failed(IoError(io::Error::last_os_error().to_string())),
-                }
-            }
             Kind::Read if hot.flags & WHOLE != 0 && hot.phase != SIZED => {
                 self.ops.get_mut(id).expect("in flight").phase = SIZED;
                 match size_of_file(fd) {

@@ -1055,16 +1055,17 @@ impl Config<Disk> {
         std::fs::create_dir_all(&self.home)
             .with_context(|| format!("failed to create directory `{}`", self.home.display()))?;
         let path = self.home.join(name);
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open: {}", path.display()))?;
-        file.lock().with_context(|| format!("failed to lock file: {}", path.display()))?;
+        let mut file = stdx::file_lock::Locked::lock(file)
+            .with_context(|| format!("failed to lock file: {}", path.display()))?;
         let mut contents = String::new();
-        std::io::Read::read_to_string(&mut file, &mut contents)
+        std::io::Read::read_to_string(&mut *file, &mut contents)
             .with_context(|| format!("failed to read configuration file `{}`", path.display()))?;
         let mut toml: toml::Table = contents.parse()?;
         if let Some(token) = toml.remove("token") {

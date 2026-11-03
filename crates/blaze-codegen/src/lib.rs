@@ -459,6 +459,22 @@ pub struct CodegenError {
     pub unit: InstanceKey,
     pub item: ItemKey,
     pub what: String,
+    /// The front end's item of the instance, when the front end failed on it (describing it,
+    /// building its body from its MIR): what the front end says of that body is the real
+    /// error, which a reader shows beside `what` ([`FrontItem`]). `None` for any other error.
+    pub front: Option<Box<FrontItem>>,
+}
+
+/// The front end's item an error is of, as [`CodegenError::front`] carries it: the error's
+/// `what` is `{named}: {why}`. Its id is of the build's database, read only with it.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub struct FrontItem {
+    pub id: blaze_items::ItemId,
+    /// The instance as the error names it: its path with its arguments, and the crate it is
+    /// compiled in.
+    pub named: String,
+    /// What failed, without the name.
+    pub why: String,
 }
 
 /// A backend: compiles one unit, given the MIR the front end built for it.

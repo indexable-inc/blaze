@@ -91,14 +91,14 @@ unsafe impl Sync for Chunk {}
 impl Chunk {
     fn new(cap: usize, start: u64) -> ChunkRef {
         let whole = cap.checked_add(HEAD).unwrap_or_else(|| {
-            stop(MemError::TooLarge { tag: Tag::Store, what: "a segment chunk", wanted: cap })
+            stop(&MemError::TooLarge { tag: Tag::Store, what: "a segment chunk", wanted: cap })
         });
         let region = match Region::reserve(whole, Tag::Store) {
             Ok(region) => region,
-            Err(error) => stop(error),
+            Err(error) => stop(&error),
         };
         if let Err(error) = region.ensure(whole) {
-            stop(error)
+            stop(&error)
         }
         let at = region.base().cast::<Chunk>();
         let bytes = region.at(HEAD);
@@ -325,7 +325,7 @@ pub struct Writer {
 
 impl Writer {
     /// [`Writer::put_in`] of [`Unit::SHARED`].
-    pub fn put(&mut self, guard: &Guard, key: Key, kind: Kind, bytes: Vec<u8>) -> Result<Ticket, Mismatch> {
+    pub fn put(&mut self, guard: &Guard, key: Key, kind: Kind, bytes: &[u8]) -> Result<Ticket, Mismatch> {
         self.put_in(guard, Unit::SHARED, key, kind, bytes)
     }
 
@@ -336,10 +336,10 @@ impl Writer {
         unit: Unit,
         key: Key,
         kind: Kind,
-        bytes: Vec<u8>,
+        bytes: &[u8],
     ) -> Result<Ticket, Mismatch> {
-        let content = content_of(&bytes);
-        self.own.put(Look::new(&self.shared, Held::task(guard)), unit, key, kind, content, &bytes)
+        let content = content_of(bytes);
+        self.own.put(Look::new(&self.shared, Held::task(guard)), unit, key, kind, content, bytes)
     }
 
     /// Whether the put that got `ticket` (from any writer of the store) is durable.
@@ -555,19 +555,19 @@ impl Own {
         } else if let Some(columns) = look.columns_of(bytes).filter(|_| kind.cold()) {
             match cold_columns(columns, bytes) {
                 Ok(payload) => self.claim(look, unit, record(Form::ColdColumns, 0, &payload), &payload, ticket),
-                Err(why) => return Ok(self.fail(kind, why)),
+                Err(why) => return Ok(self.fail(kind, &why)),
             }
         } else if kind.cold() && bytes.len() >= cold::LONG_FROM {
             match cold::compress_long(bytes) {
                 Ok(stored) => self.claim(look, unit, record(Form::Zstd, NO_DICTIONARY, &stored), &stored, ticket),
-                Err(why) => return Ok(self.fail(kind, why)),
+                Err(why) => return Ok(self.fail(kind, &why)),
             }
         } else if kind.cold()
             && let Some((number, dictionary)) = look.dictionary_of(kind)
         {
             match cold::compress(dictionary, bytes) {
                 Ok(stored) => self.claim(look, unit, record(Form::Zstd, number, &stored), &stored, ticket),
-                Err(why) => return Ok(self.fail(kind, why)),
+                Err(why) => return Ok(self.fail(kind, &why)),
             }
         } else {
             // A cold kind with no dictionary yet is kept raw and sampled, and its dictionary
@@ -587,7 +587,7 @@ impl Own {
 
     /// zstd refusing a value is a broken build of it (a missing feature), not something a
     /// value can cause: the store stops on it rather than keep the value another way.
-    fn fail(&mut self, kind: Kind, why: String) -> Ticket {
+    fn fail(&mut self, kind: Kind, why: &str) -> Ticket {
         // alloc: the store's failure, once: it stops on it
         self.stop(format!("compressing a {} value: {why}", kind.name()))
     }

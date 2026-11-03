@@ -119,7 +119,7 @@ enum Order {
 /// them, asked in `order`.
 fn identities(text: &str, order: Order) -> BTreeMap<&'static str, Ids> {
     let db = fixture::db(text).into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let env: StoredParamEnvAndCrate =
             ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: fixture::test_crate(&db) }.store();
         let instance = |name: &str| Instance {

@@ -26,6 +26,7 @@ use std::{
 };
 
 use blaze_mem::Tag;
+use crossbeam_queue::SegQueue;
 use parking_lot::Mutex;
 
 use super::{
@@ -107,6 +108,15 @@ pub(crate) struct FnTable<F: Function> {
     /// How many views asked for each key, made at the first sweep under a cap. Locked only to
     /// take it out and put it back: the sweep runs with `&mut` of the storage, so nothing waits.
     sketch: Mutex<Option<Sketch>>,
+    /// While capped, the keys that took a value since the last sweep ([`gained`]): with
+    /// [`FnTable::held`], all a sweep walks, so a sweep costs the values held, never the rows
+    /// made. A daemon's build opens thousands of views (each input write is one), and a walk of
+    /// every row of `parse_macro_expansion` at each was most of a self-build's time (sb3slow).
+    fresh: SegQueue<u32>,
+    /// The keys that held a value at the last sweep, sorted (a key whose value went since is
+    /// dropped at the next); `None` while the index is not kept (no cap), so the first sweep
+    /// under a cap walks every row once to make it.
+    held: Mutex<Option<Vec<u32>>>,
     _of: PhantomData<fn() -> F>,
 }
 
@@ -121,6 +131,10 @@ impl<F: Function> Table for FnTable<F> {
             values: AtomicUsize::new(0),
             cap: AtomicUsize::new(F::LRU),
             sketch: Mutex::new(None),
+            fresh: SegQueue::new(),
+            // A table made capped holds no value yet: its index is whole and empty.
+            // alloc: none until a value is held, then the capped function's index
+            held: Mutex::new((F::LRU != 0).then(Vec::new)),
             _of: PhantomData,
         }
     }
@@ -145,7 +159,7 @@ impl Vtable {
             memory: memory::<F>,
             verify: Some(verify_edge::<F> as unsafe fn(*const (), &Storage, Id) -> Verified),
             reset: Some(reset_row::<F> as unsafe fn(&Storage, u32, Id)),
-            sweep: if F::EVICTABLE { Some(sweep::<F> as fn(&mut Storage, u32)) } else { None },
+            sweep: if F::EVICTABLE { Some(sweep::<F> as fn(&mut Storage, u32) -> usize) } else { None },
             relocate: Some(relocate::<F> as fn(&mut Storage, u32, &mut Relocate)),
             restamp: Some(restamp::<F> as fn(&Storage, u32, &mut Restamp<'_>)),
             drop: drop_table::<F>,
@@ -781,11 +795,14 @@ fn run<F: Function>(
     storage.event(|| EventKind::WillExecute { database_key: DatabaseKeyIndex::new(index, id) });
     counts::count(index, counts::EXECUTED);
     loop {
-        let new = blaze_mem::frame::task(F::TAG, |_| F::execute(db, key));
+        // A run makes its text (an error's, a diagnostic's) with its own database lent to the
+        // `Debug`s that read one, whichever worker runs it: the text is the same on every thread
+        // (rules 17 and 22), and nothing inside a query formats with none attached.
+        let new = blaze_mem::frame::task(F::TAG, |_| super::attach(db, || F::execute(db, key)));
         crate::ran_one();
         let done = ran(at);
         if done.head == NONE {
-            finish::<F>(storage, row, &done, at, word, new, keep);
+            finish::<F>(storage, row, id, &done, at, word, new, keep);
             break;
         }
         if done.head < at {
@@ -837,6 +854,7 @@ fn summarize(storage: &Storage, node: u32, at: u32, untracked: bool) {
 fn finish<F: Function>(
     storage: &Storage,
     row: &RowOf<F>,
+    id: Id,
     done: &Ran,
     at: u32,
     word: u32,
@@ -869,7 +887,7 @@ fn finish<F: Function>(
         // provisional one of its own cycle that no frame reads any more (rules 1, 3, 4).
         unsafe { row.drop_value() };
     } else {
-        table.values.fetch_add(1, Ordering::Relaxed);
+        gained(table, id);
     }
     let meta = durability | if done.untracked { UNTRACKED } else { 0 };
     // SAFETY: the flight holder, `RUNNING` set; the value was dropped above (rule 1).
@@ -921,7 +939,7 @@ fn participate<F: Function>(
         // its own provisional one, which no frame reads any more (rules 1, 4).
         unsafe { row.drop_value() };
     } else {
-        table.values.fetch_add(1, Ordering::Relaxed);
+        gained(table, id);
     }
     // SAFETY: as above, the row holds no value now.
     unsafe { row.put(value) };
@@ -1147,7 +1165,7 @@ fn reenter<'db, F: Function>(
             // value of an earlier view: a cycle's values are never backdated (rules 1, 3).
             unsafe { row.drop_value() };
         } else {
-            table.values.fetch_add(1, Ordering::Relaxed);
+            gained(table, id);
         }
         // SAFETY: this task holds the row's flight with `RUNNING` set, and it holds no value.
         unsafe { row.put(initial) };
@@ -1162,6 +1180,16 @@ fn reenter<'db, F: Function>(
     read_provisional(storage, header, at);
     // SAFETY: the provisional value of this task's own cycle, between its writes (rule 4).
     unsafe { row.value() }
+}
+
+/// Counts a value `id`'s row took where it held none, and while the table is capped, notes the
+/// key for the next sweep's walk ([`FnTable::fresh`]): once a value is made, never on a hit.
+#[inline]
+fn gained<F: Function>(table: &FnTable<F>, id: Id) {
+    table.values.fetch_add(1, Ordering::Relaxed);
+    if table.cap.load(Ordering::Relaxed) != 0 {
+        table.fresh.push(id.as_u32());
+    }
 }
 
 fn table_of<F: Function>(storage: &Storage) -> &FnTable<F> {
@@ -1254,27 +1282,66 @@ pub fn evict_values_of<F: Function>(db: &mut F::Db, keys: &[F::Key]) -> usize {
     evicted
 }
 
-/// [`Vtable::sweep`] of `F`: past its cap, values go as the storage's [`Eviction`] picks.
-fn sweep<F: Function>(storage: &mut Storage, index: u32) {
-    let Some(table) = storage.table::<FnTable<F>>(index) else { return };
+/// [`Vtable::sweep`] of `F`: past its cap, values go as the storage's [`Eviction`] picks. It
+/// walks the keys that hold a value ([`held_keys`]), never every row; returns how many.
+fn sweep<F: Function>(storage: &mut Storage, index: u32) -> usize {
+    let Some(table) = storage.table::<FnTable<F>>(index) else { return 0 };
     let cap = table.cap.load(Ordering::Relaxed);
     if cap == 0 {
-        return;
+        return 0;
     }
+    let (mut keys, read) = held_keys::<F>(storage, table);
     match storage.eviction() {
-        Eviction::Frequency => sweep_by_frequency::<F>(storage, table, index, cap),
-        Eviction::Recency => sweep_by_recency::<F>(storage, table, index, cap),
+        Eviction::Frequency => sweep_by_frequency::<F>(storage, table, index, cap, &keys),
+        Eviction::Recency => sweep_by_recency::<F>(storage, table, index, cap, &keys),
     }
+    keys.retain(|&key| holds_value(table, key));
+    *table.held.lock() = Some(keys);
+    read
+}
+
+/// The keys of `F` whose rows held a value at the last sweep or took one since, sorted, each
+/// once: the index and the fresh keys merged, or, where no index is kept yet (the cap was set
+/// after values were made), every row's key that holds a value, walked once. A key here may
+/// have lost its value since (an explicit eviction, a cycle's reset): the walk reads each
+/// row's word. Also returns how many rows the sweep reads: the keys, or every row made.
+fn held_keys<F: Function>(storage: &Storage, table: &FnTable<F>) -> (Vec<u32>, usize) {
+    let indexed = table.held.lock().take();
+    let mut read = 0;
+    let mut keys = match indexed {
+        Some(keys) => keys,
+        None => rows::<F>(storage, table)
+            .inspect(|_| read += 1)
+            .filter(|(_, row)| row.header.verified.load(Ordering::Relaxed) & VALUE != 0)
+            .map(|(id, _)| id.as_u32())
+            .collect(), // alloc: the index, once a cap is set on a function that held values
+    };
+    while let Some(key) = table.fresh.pop() {
+        keys.push(key); // alloc: the index grows to what one view made, then is cut to the cap
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    let read = read.max(keys.len());
+    (keys, read)
+}
+
+/// Whether row `key` of `F` holds a value (a provisional one too).
+fn holds_value<F: Function>(table: &FnTable<F>, key: u32) -> bool {
+    table
+        .pages
+        .row::<RowOf<F>>(Id::from_u32(key))
+        .is_some_and(|row| row.header.verified.load(Ordering::Relaxed) & VALUE != 0)
 }
 
 /// W-TinyLFU: adds a view to the sketch for each value the view that just ended asked for,
 /// ages it, and past the cap evicts what [`admission::plan`] does not keep. Every view, a walk
-/// of the rows under a cap.
+/// of the values held (`keys`).
 fn sweep_by_frequency<F: Function>(
     storage: &Storage,
     table: &FnTable<F>,
     index: u32,
     cap: usize,
+    keys: &[u32],
 ) {
     let held = table.values.load(Ordering::Relaxed);
     let over = held > cap;
@@ -1289,12 +1356,12 @@ fn sweep_by_frequency<F: Function>(
         .unwrap_or_else(|| Sketch::new(cap, admission::SEED));
     sketch.set_cap(cap);
     let mut values: Vec<Held> = Vec::new(); // alloc: a sweep past the cap, at a view boundary
-    for (id, row) in rows::<F>(storage, table) {
+    for &key in keys {
+        let Some(row) = table.pages.row::<RowOf<F>>(Id::from_u32(key)) else { continue };
         let word = row.header.verified.load(Ordering::Relaxed);
         if word & VALUE == 0 || word & PROVISIONAL != 0 {
             continue;
         }
-        let key = id.as_u32();
         if word & VIEW_MASK == ended {
             sketch.increment(u64::from(key));
         }
@@ -1352,15 +1419,25 @@ fn evict_held<F: Function>(storage: &Storage, index: u32, gone: &[Held]) -> usiz
     evicted.into_inner()
 }
 
-/// [`Eviction::Recency`]: past the cap, the values verified longest ago go.
-fn sweep_by_recency<F: Function>(storage: &Storage, table: &FnTable<F>, index: u32, cap: usize) {
+/// [`Eviction::Recency`]: past the cap, the values verified longest ago go, of those held
+/// (`keys`).
+fn sweep_by_recency<F: Function>(
+    storage: &Storage,
+    table: &FnTable<F>,
+    index: u32,
+    cap: usize,
+    keys: &[u32],
+) {
+    let _ = storage;
     let held = table.values.load(Ordering::Relaxed);
     if held <= cap {
         return;
     }
-    let mut ages: Vec<(u32, Id)> = rows::<F>(storage, table) // alloc: a sweep past the cap, at a view boundary
-        .filter_map(|(id, row)| {
-            let word = row.header.verified.load(Ordering::Relaxed);
+    let mut ages: Vec<(u32, Id)> = keys // alloc: a sweep past the cap, at a view boundary
+        .iter()
+        .filter_map(|&key| {
+            let id = Id::from_u32(key);
+            let word = table.pages.row::<RowOf<F>>(id)?.header.verified.load(Ordering::Relaxed);
             (word & VALUE != 0 && word & PROVISIONAL == 0).then_some((word & VIEW_MASK, id))
         })
         .collect(); // alloc: as above
@@ -1391,7 +1468,13 @@ fn sweep_by_recency<F: Function>(storage: &Storage, table: &FnTable<F>, index: u
 pub fn set_lru_capacity<F: Function>(db: &mut F::Db, capacity: usize) {
     assert!(F::EVICTABLE, "{} has no `lru`: its cap can't be set", F::NAME);
     let (table, _) = db.storage_mut().table_or_make::<FnTable<F>>(F::ingredient());
-    table.cap.store(capacity, Ordering::Relaxed);
+    let was = table.cap.swap(capacity, Ordering::Relaxed);
+    if (was == 0) != (capacity == 0) {
+        // Values made while uncapped were noted nowhere: the next capped sweep walks every row
+        // once. Uncapped, no index is kept.
+        while table.fresh.pop().is_some() {}
+        *table.held.lock() = None;
+    }
 }
 
 /// [`Vtable::restamp`] of `F`: each row's verified view and `changed`.

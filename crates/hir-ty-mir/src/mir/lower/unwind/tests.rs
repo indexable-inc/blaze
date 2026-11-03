@@ -9,6 +9,7 @@
 use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
 use blaze_mem::{Frame, Tag, frame};
+use blaze_rng::SplitMix64;
 use la_arena::{Idx, RawIdx};
 
 use super::*;
@@ -219,26 +220,6 @@ impl<'f> New<'f> {
     }
 }
 
-/// xorshift64*: the same sequence on every machine.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    fn chance(&mut self, percent: u64) -> bool {
-        self.next() % 100 < percent
-    }
-}
-
 /// Both worlds, driven by the same operations; every answer and every log is compared.
 struct Both<'f> {
     old: Old<'f>,
@@ -288,11 +269,11 @@ impl<'f> Both<'f> {
     }
 
     /// A new local, or one declared before, scheduled in the scope at `depth`.
-    fn schedule(&mut self, rng: &mut Rng, depth: usize) {
-        let local = if self.locals > 0 && rng.chance(10) {
-            local(rng.below(self.locals))
+    fn schedule(&mut self, rng: &mut SplitMix64, depth: usize) {
+        let local = if self.locals > 0 && rng.chance(0.1) {
+            local(rng.index(self.locals))
         } else {
-            let copy = rng.chance(40);
+            let copy = rng.chance(0.4);
             self.old.tree.copy.push(copy);
             self.new.tree.copy.push(copy);
             self.locals += 1;
@@ -353,10 +334,10 @@ impl<'f> Both<'f> {
 
     /// What a guard bound after `bound`, in the innermost scope, is dropped where the guard
     /// failed, as `guard_failed` does.
-    fn guard_failed(&mut self, rng: &mut Rng) {
+    fn guard_failed(&mut self, rng: &mut SplitMix64) {
         let depth = self.depth() - 1;
         let len = self.old.scopes[depth].locals.len();
-        let bound = rng.below(len + 1);
+        let bound = rng.index(len + 1);
         let old_locals = self.old.scopes[depth].locals[bound..].to_vec();
         let by_guard = ScopeLocals::from_slice_in(&self.new.scopes[depth][bound..], self.new.frame);
         let mut new_locals = Vec::new_in(self.new.frame);
@@ -394,23 +375,23 @@ impl<'f> Both<'f> {
         }
     }
 
-    fn step(&mut self, rng: &mut Rng) {
+    fn step(&mut self, rng: &mut SplitMix64) {
         let depth = self.depth();
-        match rng.below(20) {
+        match rng.index(20) {
             0..=3 => self.schedule(rng, depth - 1),
             4 => {
-                let to = rng.below(depth);
+                let to = rng.index(depth);
                 self.schedule(rng, to)
             }
             5 if depth < 8 => self.push_scope(),
             6 if depth > 1 => self.pop_scope(),
             7 if self.locals > 0 => {
-                let local = local(rng.below(self.locals));
+                let local = local(rng.index(self.locals));
                 self.old.operands.insert(local);
                 self.new.unwinds.mark_operand(&mut self.new.scopes[..], &mut self.new.operands, local);
             }
             8 if self.locals > 0 => {
-                let local = local(rng.below(self.locals));
+                let local = local(rng.index(self.locals));
                 if !self.writing.contains(&local) {
                     self.writing.push(local);
                     self.old.tree.unscheduled.insert(local);
@@ -436,7 +417,7 @@ impl<'f> Both<'f> {
                 // `declare_last`: a temporary is dropped before those made while computing it.
                 let old = &mut self.old.scopes[depth - 1].locals;
                 if !old.is_empty() {
-                    let local = old[rng.below(old.len())];
+                    let local = old[rng.index(old.len())];
                     old.retain(|&it| it != local);
                     old.push(local);
                     let new = self.new.scopes[depth - 1].edit();
@@ -454,7 +435,7 @@ impl<'f> Both<'f> {
             13 => {
                 // `declare_operands_last`: the operands since `declared` go last.
                 let len = self.old.scopes[depth - 1].locals.len();
-                let declared = rng.below(len + 1);
+                let declared = rng.index(len + 1);
                 let operands = &self.old.operands;
                 let old = &mut self.old.scopes[depth - 1].locals;
                 let (moved, kept): (Vec<LocalId>, Vec<LocalId>) =
@@ -474,8 +455,8 @@ impl<'f> Both<'f> {
                 let new = self.new.here();
                 self.check("a statement that may panic", old, new);
             }
-            17 => self.drop_until(rng.below(depth)),
-            18 => self.exit(rng.below(depth)),
+            17 => self.drop_until(rng.index(depth)),
+            18 => self.exit(rng.index(depth)),
             19 => self.guard_failed(rng),
             _ => {
                 let old = self.old.here();
@@ -495,8 +476,8 @@ impl<'f> Both<'f> {
 fn the_cached_folds_are_the_folds_over_everything() {
     for seed in 1..=400u64 {
         frame::task(Tag::Mir, |frame| {
-            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-            let storage = rng.chance(30);
+            let mut rng = SplitMix64::new(seed);
+            let storage = rng.chance(0.3);
             let mut both = Both::new(frame, storage);
             for _ in 0..300 {
                 both.step(&mut rng);
@@ -512,7 +493,7 @@ fn the_cached_folds_are_the_folds_over_everything() {
 #[test]
 fn storage_changing_midway_folds_everything_again() {
     frame::task(Tag::Mir, |frame| {
-        let mut rng = Rng(7);
+        let mut rng = SplitMix64::new(7);
         let mut both = Both::new(frame, false);
         for round in 0..400 {
             if round % 100 == 50 {

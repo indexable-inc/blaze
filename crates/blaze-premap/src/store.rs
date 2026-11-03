@@ -35,7 +35,7 @@ impl Shelf for Store {
     }
 
     fn put_image(&mut self, key: &ImageKey, bytes: Vec<u8>) -> Result<(), PremapError> {
-        self.put(store_key(key), Kind::Output, bytes).map(|_| ()).map_err(|it| {
+        self.put(store_key(key), Kind::Output, &bytes).map(|_| ()).map_err(|it| {
             PremapError::of(format_args!(
                 "the store keeps other bytes under the dependency image {:?} ({:?}, given {:?}): its key \
                  misses an input",

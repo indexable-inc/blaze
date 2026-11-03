@@ -76,6 +76,8 @@ pub(crate) struct Later {
     pub(crate) krate: Crate,
     pub(crate) flags: Vec<String>,
     pub(crate) diags: Vec<Diag>,
+    /// Its errors break its items ([`blaze_diagnostics::CrateCheck::items_broken`]).
+    pub(crate) items_broken: bool,
     /// Why its outcome can't be stored ([`cache::encode`]'s refusal), if it can't.
     pub(crate) refused: Option<String>,
 }
@@ -456,7 +458,7 @@ pub(crate) fn store(
     for put in images.take_puts() {
         let what = match filed.get(&put.key.0) {
             // alloc: once per image put
-            Some(krate) => Arc::from(format!("the def-map image of dependency crate {}", hir_def::deps::crate_name(db, *krate))),
+            Some(krate) => Arc::from(format!("the def-map image of dependency crate {}", krate.named(db))),
             None => Arc::clone(&filing),
         };
         puts.push(KeptPut { put, what });
@@ -471,7 +473,7 @@ pub(crate) fn store(
         .filter_map(|it| {
             // None: its image was refused, and its outcome is for the same reason.
             let image = cache::image_key(db, it.krate).or_else(|| stored.as_ref()?.filed.get(&it.krate).copied())?;
-            Some(cache::Checked { krate: it.krate, image, inputs: cache::Inputs::of(db, &it.flags, &options), diags: &it.diags })
+            Some(cache::Checked { krate: it.krate, image, inputs: cache::Inputs::of(db, &it.flags, &options), diags: &it.diags, items_broken: it.items_broken })
         })
         .collect(); // alloc: once per front end stored, one per crate checked
     let error = |why: String| ApiError::new(why, Some(root.to_owned())); // alloc: error path

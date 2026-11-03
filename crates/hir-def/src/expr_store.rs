@@ -15,6 +15,7 @@ use std::{borrow::Borrow, cell::RefCell, mem, ops::Index};
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
+use blaze_mem::Kept;
 use std::alloc::Global;
 use blaze_ids::radix;
 use cfg::CfgExpr;
@@ -149,12 +150,22 @@ struct ExpressionOnlyStore {
     /// Block expressions in this store that may contain inner items.
     block_scopes: Col<BlockId>,
 
-    /// The hygiene of variable usages whose hygiene is not the root's, by expression or pattern
-    /// in increasing order.
+    /// The hygiene of the name an expression or pattern writes, where it is not the root's, by
+    /// expression or pattern in increasing order: a path's (the variable usages), and the field
+    /// or method name of a field access or method call that a `macro` (2.0) or a def-site span
+    /// marks ([`ExpressionStore::member_hygiene`]).
     ///
     /// Expressions (and destructuring patterns) that can be recorded here are single segment path, although not all single segments path refer
     /// to variables and have hygiene (some refer to items, we don't know at this stage).
     ident_hygiene: Col<(ExprOrPatIdPacked, HygieneId)>,
+
+    /// The hygiene of the field names of record expressions (by the field's expression) and
+    /// record patterns (by the field's pattern) that a `macro` (2.0) or a def-site span marks,
+    /// in increasing order: what each name is looked up by among the fields of its ADT
+    /// ([`crate::signatures::VariantFields::field_written`]). Only names whose context,
+    /// normalized to macros 2.0, is not the root's are here; every other one is looked up as
+    /// written.
+    field_hygiene: Col<(ExprOrPatIdPacked, HygieneId)>,
 
     /// The edition of each block that a macro wrote, by block in increasing order: it is the
     /// macro's, not the one of the crate that uses the macro.
@@ -195,6 +206,15 @@ struct ExpressionOnlyStore {
     expr_roots: SmallVec<[ExprRoot; 1]>,
 }
 
+impl ExpressionOnlyStore {
+    /// `self` in a box of its own, kept as long as its store, which a query keeps past any
+    /// request and drops on its own: a [`Kept`] block, counted to the tag of the task that
+    /// lowered or decoded it.
+    fn kept(self) -> Box<ExpressionOnlyStore, Kept> {
+        Box::new_in(self, Kept::here(blaze_mem::Tag::Nameres))
+    }
+}
+
 /// The owner in [`ExpressionOnlyStore::binding_owners`] of a binding the top level owns.
 const NO_OWNER: u32 = u32::MAX;
 
@@ -208,7 +228,7 @@ fn kinds_of(expr_kind: &[u8]) -> u64 {
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ExpressionStore {
-    expr_only: Option<Box<ExpressionOnlyStore>>,
+    expr_only: Option<Box<ExpressionOnlyStore, Kept>>,
     /// The type refs ([`ExpressionStore::type_ref`]).
     pub(crate) types: TypeColumns<Frozen>,
     pub lifetimes: Arena<LifetimeRef>,
@@ -234,6 +254,7 @@ pub struct ExpressionStoreBuilder {
     pub binding_owners: HashMap<BindingId, ExprId, Global>,
     block_scopes: Vec<BlockId>,
     ident_hygiene: HashMap<ExprOrPatIdPacked, HygieneId, Global>,
+    field_hygiene: HashMap<ExprOrPatIdPacked, HygieneId, Global>,
     pub(crate) type_hygiene: Vec<(TypeRefId, HygieneId)>,
     block_editions: HashMap<ExprId, Edition, Global>,
 
@@ -642,6 +663,7 @@ struct Scratch {
     binding_owners: HashMap<BindingId, ExprId, Global>,
     block_scopes: Vec<BlockId>,
     ident_hygiene: HashMap<ExprOrPatIdPacked, HygieneId, Global>,
+    field_hygiene: HashMap<ExprOrPatIdPacked, HygieneId, Global>,
     type_hygiene: Vec<(TypeRefId, HygieneId)>,
     block_editions: HashMap<ExprId, Edition, Global>,
     overflow_inheriting: HashSet<ExprId, Global>,
@@ -673,6 +695,7 @@ struct Scratch {
 struct Packing {
     owners: Vec<u32>,
     hygiene: Vec<(ExprOrPatIdPacked, HygieneId)>,
+    field_hygiene: Vec<(ExprOrPatIdPacked, HygieneId)>,
     editions: Vec<(ExprId, Edition)>,
     inheriting: Vec<ExprId>,
     /// The radix sorts' buffers.
@@ -682,10 +705,18 @@ struct Packing {
 
 impl Packing {
     fn clear(&mut self) {
-        let Packing { owners, hygiene, editions, inheriting, editions_sort, inheriting_sort } =
-            self;
+        let Packing {
+            owners,
+            hygiene,
+            field_hygiene,
+            editions,
+            inheriting,
+            editions_sort,
+            inheriting_sort,
+        } = self;
         owners.clear();
         hygiene.clear();
+        field_hygiene.clear();
         editions.clear();
         inheriting.clear();
         editions_sort.clear();
@@ -695,6 +726,7 @@ impl Packing {
     fn capacity(&self) -> usize {
         self.owners.capacity()
             + self.hygiene.capacity()
+            + self.field_hygiene.capacity()
             + self.editions.capacity()
             + self.inheriting.capacity()
             + self.editions_sort.capacity()
@@ -755,6 +787,7 @@ impl Scratch {
             binding_owners,
             block_scopes,
             ident_hygiene,
+            field_hygiene,
             type_hygiene,
             block_editions,
             overflow_inheriting,
@@ -786,6 +819,7 @@ impl Scratch {
         binding_owners.clear();
         block_scopes.clear();
         ident_hygiene.clear();
+        field_hygiene.clear();
         type_hygiene.clear();
         block_editions.clear();
         overflow_inheriting.clear();
@@ -819,6 +853,7 @@ impl Scratch {
             + self.binding_owners.capacity()
             + self.block_scopes.capacity()
             + self.ident_hygiene.capacity()
+            + self.field_hygiene.capacity()
             + self.type_hygiene.capacity()
             + self.block_editions.capacity()
             + self.overflow_inheriting.capacity()
@@ -856,6 +891,7 @@ impl ExpressionStoreBuilder {
             binding_owners,
             block_scopes,
             ident_hygiene,
+            field_hygiene,
             type_hygiene,
             block_editions,
             overflow_inheriting,
@@ -888,6 +924,7 @@ impl ExpressionStoreBuilder {
             binding_owners,
             block_scopes,
             ident_hygiene,
+            field_hygiene,
             type_hygiene,
             block_editions,
             overflow_inheriting,
@@ -930,6 +967,7 @@ impl ExpressionStoreBuilder {
             binding_owners: mem::take(&mut self.binding_owners),
             block_scopes: mem::take(&mut self.block_scopes),
             ident_hygiene: mem::take(&mut self.ident_hygiene),
+            field_hygiene: mem::take(&mut self.field_hygiene),
             type_hygiene: mem::take(&mut self.type_hygiene),
             block_editions: mem::take(&mut self.block_editions),
             overflow_inheriting: mem::take(&mut self.overflow_inheriting),
@@ -1311,6 +1349,7 @@ impl ExpressionStoreBuilder {
                     binding_owners,
                     block_scopes,
                     ident_hygiene,
+                    field_hygiene,
                     block_editions,
                     overflow_inheriting,
                     spec_clauses,
@@ -1326,6 +1365,8 @@ impl ExpressionStoreBuilder {
                 }
                 packing.hygiene.extend(ident_hygiene.iter().map(|(&id, &hygiene)| (id, hygiene)));
                 packing.hygiene.sort_unstable_by_key(|&(id, _)| id);
+                packing.field_hygiene.extend(field_hygiene.iter().map(|(&id, &hygiene)| (id, hygiene)));
+                packing.field_hygiene.sort_unstable_by_key(|&(id, _)| id);
                 packing.editions.extend(block_editions.iter().map(|(&id, &edition)| (id, edition)));
                 radix::sort_copy_by_key_in(
                     &mut packing.editions,
@@ -1342,6 +1383,7 @@ impl ExpressionStoreBuilder {
                 let mut layout = SlabLayout::default();
                 layout.add::<BlockId>(block_scopes.len());
                 layout.add::<(ExprOrPatIdPacked, HygieneId)>(packing.hygiene.len());
+                layout.add::<(ExprOrPatIdPacked, HygieneId)>(packing.field_hygiene.len());
                 layout.add::<(ExprId, Edition)>(packing.editions.len());
                 layout.add::<u32>(packing.owners.len());
                 layout.add::<ExprId>(packing.inheriting.len());
@@ -1351,12 +1393,13 @@ impl ExpressionStoreBuilder {
                 let mut slab = SlabWriter::new(layout);
                 let block_scopes = slab.copy(&block_scopes[..]);
                 let ident_hygiene = slab.copy(&packing.hygiene[..]);
+                let field_hygiene = slab.copy(&packing.field_hygiene[..]);
                 let block_editions = slab.copy(&packing.editions[..]);
                 let binding_owners = slab.copy(&packing.owners[..]);
                 let overflow_inheriting = slab.copy(&packing.inheriting[..]);
                 let spec_clauses = slab.copy(&spec_clauses[..]);
-                // alloc: once per store, keeps signature-only stores small.
-                Some(Box::new(ExpressionOnlyStore {
+                // Once per store, boxed to keep signature-only stores small.
+                Some(ExpressionOnlyStore::kept(ExpressionOnlyStore {
                     kinds: kinds_of(&columns.expr_kind),
                     columns,
                     bindings: exact_arena(bindings),
@@ -1364,6 +1407,7 @@ impl ExpressionStoreBuilder {
                     binding_owners,
                     block_scopes,
                     ident_hygiene,
+                    field_hygiene,
                     block_editions,
                     overflow_inheriting,
                     spec_clauses,
@@ -1910,6 +1954,26 @@ impl ExpressionStore {
         self.ident_hygiene(expr.into())
     }
 
+    /// The hygiene of the field or method name of `expr`, an [`Expr::Field`] or
+    /// [`Expr::MethodCall`]: [`HygieneId::ROOT`] unless a `macro` (2.0) or a def-site span marks
+    /// it. What the name is looked up by among a struct's fields
+    /// ([`crate::signatures::VariantFields::field_written`]) or an impl's items.
+    pub fn member_hygiene(&self, expr: ExprId) -> HygieneId {
+        self.ident_hygiene(expr.into())
+    }
+
+    /// The hygiene of the field name of the record expression field whose expression is
+    /// `field`, or of the record pattern field whose pattern is `field`: as
+    /// [`Self::member_hygiene`].
+    pub fn record_field_hygiene(&self, field: impl Into<ExprOrPatIdPacked>) -> HygieneId {
+        let Some(only) = self.expr_only.as_deref() else { return HygieneId::ROOT };
+        let id = field.into();
+        match only.field_hygiene.binary_search_by_key(&id, |&(id, _)| id) {
+            Ok(index) => only.field_hygiene[index].1,
+            Err(_) => HygieneId::ROOT,
+        }
+    }
+
     pub fn pat_path_hygiene(&self, pat: PatId) -> HygieneId {
         self.ident_hygiene(pat.into())
     }
@@ -2283,6 +2347,7 @@ mod scratch_tests {
         let lifetime = builder.lifetimes.alloc(LifetimeRef::Static);
         builder.binding_owners.insert(binding, matched);
         builder.ident_hygiene.insert(missing.into(), HygieneId::ROOT);
+        builder.field_hygiene.insert(missing.into(), HygieneId::ROOT);
         builder.block_editions.insert(matched, Edition::Edition2021);
         builder.overflow_inheriting.insert(matched);
         let unit = builder.alloc_type_ref(TypeRef::UNIT);
@@ -2324,8 +2389,8 @@ mod scratch_tests {
     }
 
     /// Without a source map, a warm lowering and `finish` allocate exactly the finished store's
-    /// blocks: the expression box, the column slab, the side-column slab, the three arenas,
-    /// the type slab and the type hygiene.
+    /// blocks: from the global heap the three arenas and the type hygiene; the expression box,
+    /// the column slab, the side-column slab and the type slab are `Kept`.
     #[test]
     fn a_warm_store_is_its_blocks_and_nothing_else() {
         empty_pool();
@@ -2337,7 +2402,7 @@ mod scratch_tests {
         };
         drop(lowered());
         let ((store, _), used) = measure(lowered);
-        assert_eq!(used.allocations, 8, "a store of 8 blocks");
+        assert_eq!(used.allocations, 4, "a store of 4 blocks from the global heap, the rest `Kept`");
         let only = store.expr_only.as_deref().expect("a store with expressions");
         assert!(only.columns.arms.in_slab(), "match arms are in the column slab");
         assert!(only.block_editions.in_slab() && only.binding_owners.in_slab());

@@ -11,7 +11,12 @@
 //!   Either way a page costs memory only when the seed first writes it.
 //! - **Decommit** ([`decommit`]): the seed gives pages back (blaze-mem's `os.rs` on wasm), and
 //!   they read as zeros after.
-//! - **Resident** ([`resident`]): how much of the memory is in RAM, from `mincore`.
+//! - **Held** ([`held`]): how much of the memory the seed holds, from `mincore`: pages in RAM,
+//!   and on macOS also pages the kernel paged out (into its compressor or to swap). A page the
+//!   seed wrote leaves RAM only that way, so without them a machine short of memory would read
+//!   as a seed holding less than it touched (55 MiB of 100 MiB under the runner's load).
+//!   Linux's `mincore` does not say which pages went to swap; there a swapped page reads as
+//!   not held.
 //!
 //! Windows has no runner: the seed bootstraps on Linux and macOS. `lib.rs` refuses it.
 
@@ -233,18 +238,27 @@ pub(crate) unsafe fn decommit(at: *mut u8, len: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// How many bytes of `[at, at + len)`, page-aligned at `at`, are resident, from `mincore`, a
-/// GiB at a time.
+/// The `mincore` bits of a page the process holds. macOS says which pages it paged out (to its
+/// compressor or swap), and a page the seed wrote is in one place or the other.
+/// `MINCORE_PAGED_OUT` is `0x20` in xnu's `sys/mman.h`; the libc crate has no name for it.
+#[cfg(target_os = "macos")]
+const HELD: u8 = libc::MINCORE_INCORE as u8 | 0x20;
+/// The `mincore` bit of a page in RAM: Linux says nothing of swap.
+#[cfg(not(target_os = "macos"))]
+const HELD: u8 = 1;
+
+/// How many bytes of `[at, at + len)`, page-aligned at `at`, the process holds, from
+/// `mincore`, a GiB at a time: in RAM, or on macOS paged out ([`HELD`]).
 ///
 /// # Safety
 ///
 /// The range is mapped.
-pub(crate) unsafe fn resident(at: *const u8, len: usize) -> io::Result<u64> {
+pub(crate) unsafe fn held(at: *const u8, len: usize) -> io::Result<u64> {
     const WINDOW: usize = 1 << 30;
     let page = page();
     // alloc: one per measurement, a byte per page of a window
     let mut pages = vec![0u8; WINDOW / page];
-    let mut resident = 0u64;
+    let mut held = 0u64;
     let mut done = 0;
     while done < len {
         let take = (len - done).min(WINDOW);
@@ -260,8 +274,8 @@ pub(crate) unsafe fn resident(at: *const u8, len: usize) -> io::Result<u64> {
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-        resident += pages[..n].iter().filter(|&&p| p & 1 != 0).count() as u64 * page as u64;
+        held += pages[..n].iter().filter(|&&p| p & HELD != 0).count() as u64 * page as u64;
         done += take;
     }
-    Ok(resident)
+    Ok(held)
 }

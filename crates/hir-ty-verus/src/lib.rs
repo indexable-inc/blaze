@@ -278,7 +278,7 @@ pub struct ProofKey(pub ContentId);
 
 /// Proves `func`'s clauses with `config`.
 pub fn verify_function(db: &Db, func: FunctionId, config: &Config) -> Verdict {
-    let lowered = match hir_ty::attach_db(db, || lower::lower_function(db, func)) {
+    let lowered = match blaze_query::db::attach(db, || lower::lower_function(db, func)) {
         Ok(it) => it,
         Err(lower::Refused::Unsupported(it)) => {
             return Verdict {

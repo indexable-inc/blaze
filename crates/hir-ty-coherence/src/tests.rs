@@ -57,7 +57,7 @@ fn check3(up: &str, l: &str, main: &str) -> (Report, Report) {
 /// What the checks say about the items of the fixture `text`'s crate `name`.
 fn check_crate(text: &str, name: &str) -> Report {
     let db: Db = fixture::db(text).into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let main = crate_named(&db, name);
         let target = DisplayTarget::from_crate(&db, main);
         let mut report = Report::default();

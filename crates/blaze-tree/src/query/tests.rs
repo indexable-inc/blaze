@@ -120,7 +120,7 @@ fn a_registry_dependency_is_fetched_first() {
             what: "crates.io index".to_owned(),
             url: "https://index.crates.io/se/rd/serde".to_owned(),
             kind: FetchKind::IndexFile,
-            at: "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde".to_owned(),
+            at: "/s/sources/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde".to_owned(),
         }])
     );
 }

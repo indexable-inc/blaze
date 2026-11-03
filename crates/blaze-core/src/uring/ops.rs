@@ -68,8 +68,6 @@ pub(super) enum Kind {
     Map,
     /// The `statx` of the name first, into the arena after its names.
     Stat,
-    /// Its kept file ([`Hot::of`]) cut to [`Cold::at`] bytes once it is open.
-    Truncate,
     /// A read of a watch's events; [`Hot::of`] its watching.
     Watch,
     /// Stops the request whose `user_data` is [`Hot::of`]; its own completion is nobody's.

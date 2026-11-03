@@ -158,7 +158,7 @@ fn plain() {
 #[test]
 fn an_elided_impl_header_lifetime_holds_for_every_lifetime() {
     let db = fixture::db(FIXTURE).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut funcs = Vec::new();
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
             let scope = module.scope(&db);
@@ -303,7 +303,7 @@ pub fn run_client<A: for<'a, 's> Decode<'a, 's, ()>>(
 #[test]
 fn the_bridges_decode_impls_resolve_for_run_client() {
     let db = fixture::db(BRIDGE).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut funcs = Vec::new();
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
             let scope = module.scope(&db);

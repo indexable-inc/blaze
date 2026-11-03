@@ -76,8 +76,8 @@ use serde::{Deserialize, Serialize};
 /// executable while the rest of the build goes on. 26: [`Request::Rebuilt`] and
 /// [`Response::Rebuilt`] (`blaze why`), grouped on the daemon. 27: [`Worked::placed`]. 28:
 /// [`Request::Launch`] and [`Response::Launched`]. 29: [`Response::Stopping`]. 30:
-/// [`UnitOf::doctest`].
-pub const SCHEMA: u32 = 30;
+/// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`].
+pub const SCHEMA: u32 = 32;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -575,6 +575,9 @@ pub enum Response {
     BuildScript(BuildScriptRan),
     /// What a build, test or run did, before its [`Response::Done`].
     Work(Worked),
+    /// What a build that failed left unchecked behind its failures, and what it checked
+    /// against a unit that failed only in its bodies or lints, before its [`Response::Built`].
+    Unchecked(Unchecked),
     TestResult(TestResult),
     Ran {
         code: Option<i32>,
@@ -889,7 +892,8 @@ pub struct UnitProfile {
 /// What a build did: the counts the oracle's over-invalidation and the budgets read.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Worked {
-    /// [`LinkKind::Placed`] when any of [`Worked::links`] is not [`LinkHow::Spliced`].
+    /// [`LinkKind::Placed`] when any of [`Worked::links`] laid its image out whole: one that is
+    /// neither [`LinkHow::Spliced`] nor [`LinkHow::Unchanged`].
     pub link: LinkKind,
     /// Functions found in the store.
     pub found: u64,
@@ -911,6 +915,41 @@ pub struct Worked {
     pub steps_us: Vec<(NodeKind, u64)>,
     /// The plane's critical path of the request.
     pub critical_path_us: u64,
+}
+
+/// What a build left unchecked ([`Response::Unchecked`]): said once a unit failed and any
+/// unit was skipped for it, or checked against a unit that failed open. Each list in the
+/// plan's order of its units, every unit named as blaze's spans name it:
+/// `libc v0.2.155 (build script run)`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Unchecked {
+    /// Each unit that failed only in its bodies or lints, its items sound: under
+    /// `--keep-going` what depends on it was checked against its items, while it stays failed.
+    pub open: Vec<OpenFailure>,
+    /// Each failure units were not checked behind.
+    pub behind: Vec<Behind>,
+    /// The build stopped at its first failure (no `--keep-going`): the units [`Unchecked::behind`]
+    /// names under it were skipped for that, whether or not they depend on it.
+    pub stopped: bool,
+}
+
+/// A failure of [`Unchecked::behind`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Behind {
+    /// Why it failed, as its node says: `the build script failed`, `errors in its items`.
+    pub why: String,
+    /// The unit that failed.
+    pub unit: String,
+    /// Each unit not checked behind it.
+    pub units: Vec<String>,
+}
+
+/// A unit of [`Unchecked::open`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct OpenFailure {
+    pub unit: String,
+    /// Each unit that was checked with it among its dependencies.
+    pub checked: Vec<String>,
 }
 
 /// How a build put its outputs' files into its build dir, in bytes (docs/cargo.md, "Where a
@@ -982,18 +1021,23 @@ pub enum LinkHow {
     First,
     /// What changed was placed into the room the kept image keeps.
     Spliced,
+    /// Nothing it is given changed since the kept image's last link (a doctest example beside
+    /// an edited one): nothing was compiled, staged or written, and the file is the kept
+    /// image's, byte for byte.
+    Unchanged,
     /// Laid out whole although an image was kept: the names of the output's fields that differ
     /// from the kept image's (`exports`, `debug`), or `not incremental` for an output that keeps
     /// no room.
     Full { why: Vec<String> },
 }
 
-/// The `link:` line's words: `first link`, `spliced`, `not spliced: <why>, <why>`.
+/// The `link:` line's words: `first link`, `spliced`, `unchanged`, `not spliced: <why>, <why>`.
 impl std::fmt::Display for LinkHow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LinkHow::First => f.write_str("first link"),
             LinkHow::Spliced => f.write_str("spliced"),
+            LinkHow::Unchanged => f.write_str("unchanged"),
             LinkHow::Full { why } => {
                 f.write_str("not spliced: ")?;
                 for (at, it) in why.iter().enumerate() {

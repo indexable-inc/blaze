@@ -34,7 +34,7 @@ struct V<T: Tr> {
 
 fn diagnostics() -> Vec<TyLoweringDiagnostic> {
     let db = fixture::db(FIXTURE).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let v = crate_def_map(&db, fixture::test_crate(&db))
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())

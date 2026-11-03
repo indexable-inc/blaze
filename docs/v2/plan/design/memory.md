@@ -19,6 +19,7 @@ All of it lives in `crates/blaze-mem`.
 | a view's revision | **revision arenas**, double-buffered: the next revision builds while the current one is read | when no reader holds the old revision (task boundaries, [concurrency.md](concurrency.md)) |
 | the image (results, interners, tables) | **mapped regions** in the store's packs ([restore.md](restore.md)) | by GC, by moving live data |
 | fixed-size objects that come and go (plane tasks, I/O operations, timers, watch slots) | **pools**: per-type slabs with free lists, per worker, refilled in batches | back to the pool, never to the OS in the warm loop |
+| image values of any size that outlive requests and die one by one (syntax-tree blocks, token trees, crate sources' bytes) | **kept blocks**, `blaze_mem::Kept(tag)`: an `Allocator` over `blaze_mem::blocks`' size classes (four per doubling, 64 B to the largest class), one reserved region per class, no header (the class comes from the layout), bytes counted to the tag | one by one, onto its class's free list for the next value of that size; never to the general-purpose allocator. A class of blocks of 256 KiB or more gives a block's pages back to the OS as it is freed; a smaller class, once its free bytes pass 2 MiB, gives back the whole pages its free blocks cover until 1 MiB is left. The address range stays reserved, so a block keeps its address and the free list stays lock-free |
 
 Owned text names its allocator too (`blaze_mem::text`). std's `String`, `OsString` and
 `PathBuf` take none, so blaze_mem has its own, each a `Vec<u8, A>` with no default `A`:
@@ -44,6 +45,28 @@ they are long-lived by design, so `blaze::implicit_allocator` leaves them alone.
 
 The general-purpose allocator (mimalloc, with huge pages) serves only startup, configuration
 and rare large one-offs. The allocation-budget tests hold the warm loop to zero calls into it.
+
+Which general-purpose allocator matters less than what is left on it. Measured 2026-11-03 on
+`blaze build -p blaze-engine --no-default-features --features seed` with one worker, Linux
+aarch64, THP `always`, eight runs started together and stopped at 900 s, each having built the
+same 79 units (lane heap2, /tmp/blaze-lanes/v2-heap2.md): peak RSS was 13.6 to 14.7 GiB in every
+configuration. mimalloc peaked 0.2 to 0.6 GiB above glibc, `MALLOC_ARENA_MAX=2` 0.1 GiB below
+it, and huge pages only where advised (`prctl(PR_SET_THP_DISABLE, 1,
+PR_THP_DISABLE_EXCEPT_ADVISED)`, Linux 6.18 and later) cut huge pages from 11 to 7 GiB but RSS
+by only 0.25 GiB (0.5 GiB with both). So the process keeps the allocator it ships with, and
+memory work goes to the bytes on the global heap (5.5 GiB at that peak) and to blaze-mem's own
+tags (query 4.4 GiB). Moving syntax-tree blocks, token trees and crate sources to `Kept` took the
+global heap from 8.0 to 5.5 GiB and left peak RSS the same: the bytes are live either way, and a
+size class keeps the blocks it had at its most (the `chunks` tag, 0.24 to 2.35 GiB committed).
+Counting each class (lane heap3, /tmp/blaze-lanes/v2-heap3.md, the same build, three runs of
+each binary alternated in one VM) showed that gap was not free blocks: the classes' blocks
+were 2.8 to 3.0 GiB live of 3.08 GiB carved, and their free blocks held 0.14 to 0.45 GiB over
+the run (`committed` also counts pages committed ahead and never touched). Giving free pages
+back (0.85 GiB over the run, free blocks 0.01 to 0.1 GiB) and moving trees' text, expression
+stores and `hir_def` column slabs to `Kept` (global heap 6.4 to 5.2 GiB) moved peak RSS from
+13.61 to 14.01 GiB to 13.47 to 13.91 GiB: within the runs' spread. The peak is live bytes:
+the query tag (4.4 to 5.0 GiB), kept values (3.0) and what the global heap still holds.
+macOS was not measured.
 
 ## Techniques
 

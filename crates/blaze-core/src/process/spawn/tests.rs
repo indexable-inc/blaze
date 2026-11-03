@@ -1,4 +1,4 @@
-use super::busy;
+use crate::busy;
 use crate::sim::Rng;
 
 /// [`busy::next`] as a loop: the wait doubled once per try, held at the cap, cut at the bound.

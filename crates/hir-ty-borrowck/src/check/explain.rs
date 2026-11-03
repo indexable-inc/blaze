@@ -199,11 +199,11 @@ impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
                     TyKind::Adt(def, _)
                         if !def.is_box() && self.ctx.has_destructor(def.def_id()) =>
                     {
-                        ("`Drop` code", text!(self, "type `{def:?}`"))
+                        ("`Drop` code", text!(self, "type `{}`", self.ctx.shown_adt(def.def_id())))
                     }
                     TyKind::Closure(..) => ("destructor", "closure"),
                     TyKind::Coroutine(..) => ("destructor", "coroutine"),
-                    _ => ("destructor", text!(self, "type `{ty:?}`")),
+                    _ => ("destructor", text!(self, "type `{}`", self.ctx.shown_ty(&ty))),
                 };
                 match self.ctx.local_name(dropped) {
                     Some(name) => {

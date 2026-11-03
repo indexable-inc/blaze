@@ -681,7 +681,8 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
                     let fields = self.variant_fields(variant);
                     if has_unsafe_field(fields) {
                         for arg in args {
-                            let field = fields.field(&arg.name);
+                            let hygiene = self.store.record_field_hygiene(arg.pat);
+                            let field = fields.field_written(self.db, variant, &arg.name, hygiene);
                             if field.is_some_and(|it| fields.fields()[it].is_unsafe) {
                                 self.requires_unsafe(arg.pat, UnsafetyReason::UseOfUnsafeField);
                             }

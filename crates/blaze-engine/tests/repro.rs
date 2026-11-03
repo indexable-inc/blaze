@@ -349,6 +349,18 @@ fn a_build_script_prints_a_debug_list() {
     assert_eq!(case.ok(&["run"]), "[\"default\"] (\"neon\",)\n");
 }
 
+/// A build script that declares the cfgs it sets (`cargo::rustc-check-cfg=cfg(from_build)`, as
+/// every crate whose build script probes the compiler does): the check was given only the
+/// plan's `--check-cfg`s, never the run's, so each `#[cfg(from_build)]` warned
+/// "unexpected `cfg` condition name: `from_build`" (harness/editmacros.py, 2026-11-02).
+#[test]
+fn a_cfg_its_build_script_declares_is_expected() {
+    let case = Case::new("a_cfg_its_build_script_declares_is_expected");
+    let out = case.ok_in("", &["run"]);
+    assert_eq!(out.stdout, "declared\n");
+    assert!(!out.stderr.contains("unexpected `cfg`"), "a cfg the build script declares warned:\n{}", out.stderr);
+}
+
 /// `str::split_ascii_whitespace` (cc's build-time flag parsing, so every build script using cc):
 /// core's `impl_fn_for_zst!` writes `impl Fn<(&u8,)> for IsAsciiWhitespace` with an elided
 /// lifetime in its header, and `SplitAsciiWhitespace::next`, `size_hint` and

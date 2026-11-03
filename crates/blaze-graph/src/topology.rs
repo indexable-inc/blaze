@@ -241,8 +241,15 @@ fn detect() -> io::Result<Topology> {
     Ok(topology)
 }
 
+/// A target without threads (the wasm64 seed) runs on its one thread: one worker, driven by it
+/// ([`crate::pool::Pool::driven`]).
+#[cfg(all(target_family = "wasm", not(target_feature = "atomics")))]
+fn detect() -> io::Result<Topology> {
+    Ok(Topology::flat(1))
+}
+
 /// Where the OS says no more than a count, the pool's threads are not bound ([`crate::pool`]).
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", all(target_family = "wasm", not(target_feature = "atomics")))))]
 fn detect() -> io::Result<Topology> {
     std::thread::available_parallelism().map(|it| Topology::flat(it.get()))
 }

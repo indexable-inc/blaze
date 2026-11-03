@@ -14,6 +14,7 @@
 use std::ops::Range;
 
 use base_db::{Crate, Db};
+use blaze_format::leb;
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, ItemKey, key::Resolved};
@@ -41,20 +42,6 @@ fn word(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(*bytes.get(at..at + 4)?.first_chunk()?))
 }
 
-/// The unsigned LEB128 at `*at` of `bytes`, of at most 32 bits, `*at` moved past it.
-fn uleb(bytes: &[u8], at: &mut usize) -> Option<u32> {
-    let mut value = 0u64;
-    for shift in (0..35).step_by(7) {
-        let byte = *bytes.get(*at)?;
-        *at += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return u32::try_from(value).ok();
-        }
-    }
-    None
-}
-
 impl List {
     /// The list in the module `module`, or why there is none: a module the link wrote always
     /// has one, since std's statics are in every proc macro's module.
@@ -66,8 +53,9 @@ impl List {
         while at < module.len() {
             let id = module[at];
             at += 1;
-            let Some(len) = uleb(module, &mut at) else {
-                return Err(format!("has a section at {at} whose size can't be read")); // alloc: error path
+            let len = match leb::read_u32(module, &mut at) {
+                Ok(len) => len,
+                Err(error) => return Err(format!("has a section at {at} whose size can't be read: {error}")), // alloc: error path
             };
             let Some(payload) = module.get(at..at + len as usize) else {
                 return Err(format!("has a section at {at} of {len} bytes, past its end")); // alloc: error path
@@ -77,7 +65,7 @@ impl List {
                 continue;
             }
             let mut name_at = 0;
-            let name = uleb(payload, &mut name_at).and_then(|n| payload.get(name_at..name_at + n as usize));
+            let name = leb::read_u32(payload, &mut name_at).ok().and_then(|n| payload.get(name_at..name_at + n as usize));
             if name != Some(SECTION.as_bytes()) {
                 continue;
             }
@@ -175,8 +163,8 @@ impl Statics {
                     // alloc: error path
                     return Err(format!(
                         "reaches the crates `{}` and `{}`, whose keys begin alike: their items can't be told apart",
-                        name(db, other),
-                        name(db, it)
+                        other.named(db),
+                        it.named(db)
                     ));
                 }
                 Some(_) => continue,
@@ -190,7 +178,7 @@ impl Statics {
                 // alloc: error path
                 return Err(format!(
                     "lists the static {item:?}, of no crate `{}` reaches: its state can't be named",
-                    name(db, krate)
+                    krate.named(db)
                 ));
             };
             if matches!(of.data(db).origin, base_db::CrateOrigin::Lang(_)) {
@@ -202,7 +190,7 @@ impl Statics {
                     // alloc: error path
                     return Err(format!(
                         "lists the static {item:?} of `{}`, which names {}",
-                        name(db, of),
+                        of.named(db),
                         match found {
                             Some(_) => "something else there",
                             None => "nothing there",
@@ -276,14 +264,6 @@ impl Statics {
                 (addr, part)
             })
         })
-    }
-}
-
-/// The name of `krate` as an error says it.
-fn name(db: &Db, krate: Crate) -> String {
-    match &krate.extra_data(db).display_name {
-        Some(name) => name.to_string(), // alloc: error path
-        None => "<unnamed>".to_owned(), // alloc: error path
     }
 }
 

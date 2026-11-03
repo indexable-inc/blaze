@@ -80,6 +80,12 @@ pub struct Files {
     /// Each file's text, while it has one. A file whose bytes are not UTF-8 has none here; its
     /// input waits in [`Writer::parked`].
     text: Column<FileText>,
+    /// Each file of the VFS whose bytes are not UTF-8, while it has no text: its bytes as the
+    /// view loader gave them ([`Files::write_bytes`]), the one input every reader of them reads
+    /// (`include_bytes!` and `include_str!`, a dependency image's key, its source root's
+    /// content: [`Files::file_content`]). Set only by the loader, so no read writes anything. The
+    /// input of a file that got text again waits in [`Writer::raw_parked`].
+    raw: Column<IncludedFile>,
     pub(crate) file_source_roots: Column<FileSourceRootInput>,
     source_roots: Column<SourceRootInput>,
     /// What only the setters read and write. Every setter runs on `&mut` of the database and
@@ -130,6 +136,9 @@ pub(crate) struct Writer {
     /// The inputs of files that had text and lost it (bytes that are not UTF-8), kept so that
     /// what read them reruns if they get text again.
     pub(crate) parked: HashMap<FileId, FileText, Global>,
+    /// The bytes inputs ([`Files::raw`]) of files that had no text and got it again, kept so
+    /// that what read their bytes reruns if they lose it again.
+    pub(crate) raw_parked: HashMap<FileId, IncludedFile, Global>,
     /// The content IDs of each source root's files, from which its own is kept.
     pub(crate) root_contents: HashMap<SourceRootId, RootContent, Global>,
     /// The source roots whose [`RootContent`] has each file.
@@ -255,6 +264,7 @@ impl Default for Files {
     fn default() -> Files {
         Files {
             text: Column::new(),
+            raw: Column::new(),
             file_source_roots: Column::new(),
             source_roots: Column::new(),
             writer: Mutex::default(),
@@ -300,6 +310,25 @@ impl Files {
     /// no text.
     pub fn has_file_text(&self, file_id: FileId) -> bool {
         self.text.get(file_id.index()).is_some()
+    }
+
+    /// The bytes of a file of the VFS that has no text (they are not UTF-8), as the view loader
+    /// gave them: what `include_bytes!` and `include_str!` read of it. `None` for a file with
+    /// text, and for one with neither (an alias of a file without text).
+    pub fn raw_file(&self, file_id: FileId) -> Option<IncludedFile> {
+        self.raw.get(file_id.index())
+    }
+
+    /// The content ID `file` has in its source root, the one every reader that hashes a file
+    /// takes: its text's ([`FileText::content`]); for a file with no text, its bytes'
+    /// ([`IncludedFile::content`] of [`Files::raw_file`]); for one with neither,
+    /// [`FileText::no_text`].
+    pub fn file_content(&self, db: &Db, file: FileId) -> ContentId {
+        match (self.text.get(file.index()), self.raw.get(file.index())) {
+            (Some(input), _) => input.content(db),
+            (None, Some(raw)) => raw.content(db),
+            (None, None) => FileText::no_text(),
+        }
     }
 
     pub fn set_file_text(&self, db: &mut Db, file_id: FileId, text: &str) {
@@ -570,17 +599,10 @@ impl Files {
         durability: Option<Durability>,
     ) -> ContentId {
         let raw = file_id.index();
+        // Text, or neither text nor bytes: what read its bytes reruns.
+        self.park_raw(writer, db, file_id, durability);
         let Some((text, file, content)) = text else {
-            if let Some(input) = self.text.get(raw) {
-                // Nothing reads the text left behind: `file_text` no longer has the file.
-                self.text.set(raw, None);
-                let empty = syntax::Text::from_static("");
-                let reparse = Reparse::new(&empty, ContentId::of(blaze_vfs::FILE_DOMAIN, b""));
-                set(input.set_reparse_field(db), durability, reparse);
-                set(input.set_text_field(db), durability, empty);
-                set(input.set_content_field(db), durability, InputId(FileText::no_text()));
-                writer.parked.insert(file_id, input);
-            }
+            self.park_text(writer, db, file_id, durability);
             return FileText::no_text();
         };
         let existing = match self.text.get(raw) {
@@ -610,13 +632,81 @@ impl Files {
         content
     }
 
-    /// The content ID `file` has in a source root.
-    pub(crate) fn entry_content(&self, db: &Db, file: FileId) -> ContentId {
-        match self.text.get(file.index()) {
-            Some(input) => input.content(db),
-            None => FileText::no_text(),
+    /// Sets `file_id` to a file with no text whose bytes (not UTF-8) are `bytes`, and returns
+    /// its content ID in a source root ([`Files::file_content`]): the view loader's write of such a
+    /// file. The source roots that have the file are left to the caller.
+    pub(crate) fn write_bytes(
+        &self,
+        writer: &mut Writer,
+        db: &mut Db,
+        file_id: FileId,
+        bytes: &blaze_vfs::Bytes,
+        durability: Option<Durability>,
+    ) -> ContentId {
+        debug_assert!(std::str::from_utf8(&bytes[..]).is_err(), "{file_id:?}: bytes that are text are its text");
+        self.park_text(writer, db, file_id, durability);
+        let content = IncludedFile::content_of(Ok(&bytes[..]));
+        let existing = match self.raw.get(file_id.index()) {
+            Some(input) => Some(input),
+            None => writer.raw_parked.remove(&file_id),
+        };
+        let read = || -> Result<std::sync::Arc<[u8]>, ReadError> {
+            // clone: a count when the view's bytes are shared
+            let shared = bytes.shared().cloned();
+            // alloc: a copy of a mapped image's range, once per write of a file that is not text
+            Ok(shared.unwrap_or_else(|| std::sync::Arc::from(&bytes[..])))
+        };
+        let input = match existing {
+            Some(input) => {
+                if input.content(&*db) != content {
+                    set(input.set_read_field(db), durability, read());
+                    set(input.set_content_field(db), durability, InputId(content));
+                }
+                input
+            }
+            None => {
+                let builder = IncludedFile::builder(read(), InputId(content));
+                let builder = match durability {
+                    Some(durability) => builder.durability(durability),
+                    None => builder,
+                };
+                builder.new(&*db)
+            }
+        };
+        self.raw.set(file_id.index(), Some(input));
+        content
+    }
+
+    /// Takes `file_id`'s text away, keeping its input in [`Writer::parked`].
+    fn park_text(&self, writer: &mut Writer, db: &mut Db, file_id: FileId, durability: Option<Durability>) {
+        let raw = file_id.index();
+        if let Some(input) = self.text.get(raw) {
+            // Nothing reads the text left behind: `file_text` no longer has the file.
+            self.text.set(raw, None);
+            let empty = syntax::Text::from_static("");
+            let reparse = Reparse::new(&empty, ContentId::of(blaze_vfs::FILE_DOMAIN, b""));
+            set(input.set_reparse_field(db), durability, reparse);
+            set(input.set_text_field(db), durability, empty);
+            set(input.set_content_field(db), durability, InputId(FileText::no_text()));
+            writer.parked.insert(file_id, input);
         }
     }
+
+    /// Takes `file_id`'s bytes away (it has text now, or neither), keeping their input in
+    /// [`Writer::raw_parked`]. The input is set to no bytes, which a file without text never
+    /// has (no bytes are UTF-8), so what read them reruns and finds the file as it is now.
+    fn park_raw(&self, writer: &mut Writer, db: &mut Db, file_id: FileId, durability: Option<Durability>) {
+        let raw = file_id.index();
+        if let Some(input) = self.raw.get(raw) {
+            self.raw.set(raw, None);
+            let none: &[u8] = &[];
+            let empty = std::sync::Arc::from(none); // alloc: none to speak of, once per file that gets text back
+            set(input.set_read_field(db), durability, Ok(empty));
+            set(input.set_content_field(db), durability, InputId(IncludedFile::content_of(Ok(none))));
+            writer.raw_parked.insert(file_id, input);
+        }
+    }
+
 
     /// Brings the content IDs of `roots` up to date and writes those that changed.
     pub(crate) fn write_root_contents(
@@ -672,7 +762,7 @@ impl Files {
             if !roots.contains(&id) {
                 roots.push(id);
             }
-            files.push((file, content::path_key(path), self.entry_content(db, file)));
+            files.push((file, content::path_key(path), self.file_content(db, file)));
         }
         // Every file whose path names it back, and as many paths as files.
         let one_to_one = files.len() == ids && ids == root.len();
@@ -1029,6 +1119,8 @@ impl Files {
     pub(crate) fn is_used(&self, writer: &Writer, id: FileId) -> bool {
         self.text.get(id.index()).is_some()
             || writer.parked.contains_key(&id)
+            || self.raw.get(id.index()).is_some()
+            || writer.raw_parked.contains_key(&id)
             || self.file_source_roots.get(id.index()).is_some()
             || writer.in_roots.contains_key(id)
             || writer.view_ids.contains_key(id)

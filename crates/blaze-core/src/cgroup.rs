@@ -85,16 +85,16 @@ impl Cgroup {
         if let Err(error) = std::fs::create_dir(at) {
             if error.kind() != io::ErrorKind::AlreadyExists {
                 return Err(named(
-                    error,
+                    &error,
                     // alloc: an error's message, made as it fails.
-                    format!("making {} (is {} delegated to this process?)", at.display(), parent.display()),
+                    &format!("making {} (is {} delegated to this process?)", at.display(), parent.display()),
                 ));
             }
             // Left by a process of this pid that is gone; it holds nothing once it is empty.
             std::fs::remove_dir(at)
                 .and_then(|()| std::fs::create_dir(at))
                 // alloc: an error's message, made as it fails.
-                .map_err(|error| named(error, format!("making {} again", at.display())))?;
+                .map_err(|error| named(&error, &format!("making {} again", at.display())))?;
         }
         let cgroup = Cgroup { path, dir };
         cgroup.hold(limit)?;
@@ -149,7 +149,7 @@ impl Cgroup {
                     ),
                 )),
                 // alloc: an error's message, made as it fails.
-                Err(error) => Err(named(error, format!("reading {}", path.display()))),
+                Err(error) => Err(named(&error, &format!("reading {}", path.display()))),
             }
         })
     }
@@ -313,9 +313,9 @@ fn ready(own: &Path) -> io::Result<()> {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(named(
-                    error,
+                    &error,
                     // alloc: an error's message, made as it fails.
-                    format!(
+                    &format!(
                         "making {} to move this process into (is {} delegated to it?)",
                         leaf.display(),
                         own.display()
@@ -443,7 +443,7 @@ pub(crate) fn kernel() -> String {
 
 fn read(path: &Path) -> io::Result<String> {
     // alloc: once per process, finding and readying the parent cgroup.
-    std::fs::read_to_string(path).map_err(|error| named(error, format!("reading {}", path.display())))
+    std::fs::read_to_string(path).map_err(|error| named(&error, &format!("reading {}", path.display())))
 }
 
 /// `value` written to a file of the cgroup file system, which is never made: a file that is
@@ -451,7 +451,7 @@ fn read(path: &Path) -> io::Result<String> {
 fn write(path: &Path, value: &[u8]) -> io::Result<()> {
     OpenOptions::new().write(true).open(path).and_then(|mut file| file.write_all(value)).map_err(|error| {
         // alloc: an error's message, made as it fails.
-        named(error, format!("writing {:?} to {}", String::from_utf8_lossy(value), path.display()))
+        named(&error, &format!("writing {:?} to {}", String::from_utf8_lossy(value), path.display()))
     })
 }
 
@@ -469,7 +469,7 @@ fn read_into<'a>(path: &Path, bytes: &'a mut [u8]) -> io::Result<&'a [u8]> {
     Err(io::Error::new(io::ErrorKind::InvalidData, format!("more than {n} bytes")))
 }
 
-fn named(error: io::Error, what: String) -> io::Error {
+fn named(error: &io::Error, what: &str) -> io::Error {
     // alloc: an error's message, made as it fails.
     io::Error::new(error.kind(), format!("{what}: {error}"))
 }

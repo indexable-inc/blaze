@@ -270,7 +270,27 @@ impl Backends<'_> {
         // tables, the shape's tables) is in a frame of the worker's, reset when it returns;
         // what it keeps (the IR, its places, spans, variables and scopes) is the heap's.
         blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
-            let function = built_function(db, hashes, unit, spec, (instance, walking), refs, frame)?;
+            // A panic building one function (an assertion of Cranelift's on the IR, one of
+            // ours) fails that function with an error naming it and its crate, and through it
+            // the unit, never the worker (AGENTS.md rule 17). Only a panic with a message is a
+            // failure: a typed payload (a cancel, name resolution's typed stops) is control
+            // flow its catcher reads further up, and keeps unwinding.
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                built_function(db, hashes, unit, spec, (instance, walking), refs, frame)
+            }));
+            let function = match built {
+                Ok(built) => built?,
+                Err(payload) => match stdx::panic_text(&*payload) {
+                    // The code generator's fault, not the front end's: no front item, so no
+                    // reader looks for the body's diagnostics.
+                    Some(message) => {
+                        let named = super::Named(db, instance);
+                        // alloc: an error
+                        return Err(failed(unit, format!("{named}: blaze panicked building its code: {message}")));
+                    }
+                    None => std::panic::resume_unwind(payload),
+                },
+            };
             let shape = shape::of(unit, &function, frame)
                 // alloc: an error
                 .map_err(|what| failed(unit, format!("{}: {what}", super::Named(db, instance))))?;
@@ -356,7 +376,9 @@ pub(super) fn built_function(
             )));
         }
     }
-    let mut code = built(db, instance, target, spec.overflow_checks, build).map_err(fail)?;
+    // Its body built from its MIR: a failure is the front end's, which the error carries.
+    let mut code = built(db, instance, target, spec.overflow_checks, build)
+        .map_err(|why| super::failed_in_front(db, Some(unit), None, instance, why))?;
     let (places, source, variables) = match &mut code {
         Built::Ir(pending) => {
             let requests = &mut pending.wants.requests;
@@ -1313,15 +1335,12 @@ impl<'db> Prepare for Backends<'db> {
                 unit: group.key(),
                 item: ItemKey(ContentId::default()),
                 what: "a fold of no functions".to_owned(), // alloc: the error's message
+                front: None,
             });
         };
-        // On wasm32 the ISA is one whose settings the IR is made under, with its 64-bit
-        // pointers; the IR's are 32-bit.
-        let pointer = match first.arch {
-            Arch::Wasm32 => ir::types::I32,
-            Arch::Wasm64 => ir::types::I64,
-            Arch::X86_64 | Arch::Aarch64 => isa(first, unit_target(first, first_spec)?)?.pointer_type(),
-        };
+        // The target's addresses, never the ISA's: on wasm the ISA is a native one whose
+        // settings the IR is made under, with 64-bit pointers.
+        let pointer = unit_target(first, first_spec)?.pointer();
         super::fold::merge(group, &members, pointer, |unit, _, function, ir, refs| {
             emit_ir(unit, function, ir, refs)
         })

@@ -76,7 +76,7 @@ fn safe() {}
 #[test]
 fn a_type_s_bounds_are_its_own_elaborated_without_sized() {
     let db = fixture::db(TYPES).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let [t, u] = <[Type<'_>; 2]>::try_from(params(&db, "bounds")).unwrap();
         let named = |ty: &Type<'_>| {
             let mut names: Vec<(String, Vec<String>)> = ty
@@ -109,7 +109,7 @@ fn a_type_s_bounds_are_its_own_elaborated_without_sized() {
 #[test]
 fn a_reference_to_a_type_has_its_environment() {
     let db = fixture::db(TYPES).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let [t, u] = <[Type<'_>; 2]>::try_from(params(&db, "bounds")).unwrap();
         let shared = t.ref_to(&db, Mutability::Shared);
         assert!(shared.is_reference() && !shared.is_mutable_reference());
@@ -131,7 +131,7 @@ fn a_reference_to_a_type_has_its_environment() {
 #[test]
 fn a_reference_with_an_error_region_is_solved_modulo_regions() {
     let db = fixture::db(TYPES).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let [t, _] = <[Type<'_>; 2]>::try_from(params(&db, "bounds")).unwrap();
         let errored = t.add_reference(&db, Mutability::Shared);
         let u8_arg = params(&db, "adts")[0].fields(&db).remove(0).1;
@@ -147,7 +147,7 @@ fn a_reference_with_an_error_region_is_solved_modulo_regions() {
 #[test]
 fn sized_is_the_solver_s_answer_in_the_environment() {
     let db = fixture::db(TYPES).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let [t, s, m] = <[Type<'_>; 3]>::try_from(params(&db, "others")).unwrap();
         assert!(t.is_sized(&db), "`&T`");
         assert!(!t.as_reference_inner().unwrap().is_sized(&db), "`T: ?Sized`");
@@ -161,7 +161,7 @@ fn sized_is_the_solver_s_answer_in_the_environment() {
 #[test]
 fn copy_is_allowed_of_an_adt_without_drop_unsafe_fields_or_a_field_not_copy() {
     let db = fixture::db(TYPES).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let adts = params(&db, "adts");
         let allowed: Vec<bool> = adts.iter().map(|it| it.may_implement_copy(&db)).collect();
         assert_eq!(
@@ -183,7 +183,7 @@ fn copy_is_allowed_of_an_adt_without_drop_unsafe_fields_or_a_field_not_copy() {
 #[test]
 fn a_trait_with_fresh_arguments_holds_for_some_impl() {
     let db = fixture::db(TYPES).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let any = trait_(&db, "Any");
         let adts = params(&db, "adts");
         let (plain, holds) = (&adts[0], &adts[1]);
@@ -199,7 +199,7 @@ fn a_trait_with_fresh_arguments_holds_for_some_impl() {
 #[test]
 fn a_callable_s_safety_is_its_signature_s() {
     let db = fixture::db(TYPES).into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let safety = |ty: &Type<'_>| ty.as_callable(&db).expect("a callable type").safety();
         let [f, g, h] = <[Type<'_>; 3]>::try_from(params(&db, "callees")).unwrap();
         assert_eq!(safety(&f), Safety::Unsafe, "`unsafe fn()`");

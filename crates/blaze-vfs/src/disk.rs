@@ -300,7 +300,7 @@ impl Disks {
     /// The disks of an image's section, read in place: every length, end and name is checked
     /// once here (bounds, order, UTF-8), so reads after never fail. The error is what is wrong
     /// with the section.
-    pub(crate) fn open(section: Section) -> Result<Disks, &'static str> {
+    pub(crate) fn open(section: &Section) -> Result<Disks, &'static str> {
         fn cut(_: cursor::Error) -> &'static str {
             "cut short"
         }
@@ -374,7 +374,7 @@ mod tests {
         disks.encode(&mut bytes);
         let len = bytes.len();
         let map = blaze_core::Mapping::copy(&bytes);
-        Disks::open(Section::new(map, 0..len).unwrap()).unwrap()
+        Disks::open(&Section::new(map, 0..len).unwrap()).unwrap()
     }
 
     fn all(disk: &Disk, under: &str) -> Vec<(String, u64)> {
@@ -495,7 +495,7 @@ mod tests {
         disks.encode(&mut bytes);
         for cut in 0..bytes.len() {
             let map = blaze_core::Mapping::copy(&bytes[..cut]);
-            assert!(Disks::open(Section::new(map, 0..cut).unwrap()).is_err(), "cut at {cut}");
+            assert!(Disks::open(&Section::new(map, 0..cut).unwrap()).is_err(), "cut at {cut}");
         }
     }
 }

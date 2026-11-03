@@ -94,7 +94,7 @@ impl Hashes for ItemHashes {
     }
 
     fn code(&self, db: &Db, body: Body) -> Result<CodeHash, String> {
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let (code, store) = match body {
                 Body::Item(def) => (code::of_item(db, def), ExpressionStoreOwnerId::Body(def)),
                 Body::Closure(id) => {
@@ -122,12 +122,12 @@ impl Hashes for ItemHashes {
 
     fn ty<'db>(&self, db: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
         // alloc: the error's message
-        hir_ty::attach_db(db, || identity::ty(db, ty).map_err(|why| why.to_string()))
+        blaze_query::db::attach(db, || identity::ty(db, ty).map_err(|why| why.to_string()))
     }
 
     fn konst<'db>(&self, db: &'db Db, konst: Const<'db>) -> Result<ContentId, String> {
         // alloc: the error's message
-        hir_ty::attach_db(db, || identity::konst(db, konst).map_err(|why| why.to_string()))
+        blaze_query::db::attach(db, || identity::konst(db, konst).map_err(|why| why.to_string()))
     }
 
     fn span(

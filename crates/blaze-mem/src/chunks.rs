@@ -168,14 +168,21 @@ impl Chunk {
 }
 
 /// Takes a chunk for `owner`, in the calling thread's place: a warm one if any was given back
-/// there, else a purged one, else a new one carved from the place's space.
+/// there, else a purged one (its pages made the process's again: [`Region::reuse`]), else a
+/// new one carved from the place's space.
 pub(crate) fn take(owner: Tag) -> Result<Chunk, MemError> {
     let place = usize::from(PLACE.try_with(Cell::get).unwrap_or(0));
     let space = space(place)?;
     let local = match space.warm.pop(&space.links) {
         Some(local) => local,
         None => match space.cold.pop(&space.links) {
-            Some(local) => local,
+            Some(local) => {
+                if let Err(error) = space.region.reuse(local as usize * CHUNK, CHUNK) {
+                    space.cold.push(local, &space.links);
+                    return Err(error);
+                }
+                local
+            }
             None => carve(space)?,
         },
     };

@@ -198,13 +198,8 @@ fn an_fde_written_alone_is_the_one_written_after_the_isas_cie() {
     let bytes = written.0.slice();
     let (code_align, data_align) = (u32::from(bytes[10]), i32::from((bytes[11] as i8) << 1 >> 1));
     assert!(bytes[10] < 0x80 && bytes[11] < 0x80);
-    let mut state = 0x2545_f491_4f6c_dd1d_u64;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_f491_4f6c_dd1d);
+    let mut next = move || rng.next_u64();
     let (mut out, mut direct) = (Vec::new(), Vec::new());
     for _ in 0..500 {
         let mut fde = FrameDescriptionEntry::new(Address::Constant(0), 1 << 20);

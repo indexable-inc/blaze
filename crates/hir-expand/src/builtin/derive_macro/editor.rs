@@ -611,14 +611,12 @@ fn push_fields(
     tm: &ExpansionSpanMap,
     list: Option<FieldList>,
 ) -> Result<FieldsKind, ExpandError> {
-    let at_field = |span: Span| Span { ctx: call_site.ctx, ..span };
     Ok(match list {
         None => FieldsKind::Unit,
         Some(FieldList::RecordFieldList(it)) => {
             fields.reserve(it.fields().count());
             for field in it.fields() {
-                let name = name_to_token(call_site, tm, field.name())?;
-                fields.push(super::field_name_in_derive(name, call_site));
+                fields.push(name_to_token(call_site, tm, field.name())?);
             }
             FieldsKind::Record
         }
@@ -630,7 +628,7 @@ fn push_fields(
                     .map_or_else(|| field.syntax().text_range(), |ty| ty.syntax().text_range());
                 fields.push(tt::Ident {
                     sym: tuple_field_symbol(i),
-                    span: at_field(tm.span_at(at.start())),
+                    span: tm.span_at(at.start()),
                     is_raw: tt::IdentIsRaw::No,
                 });
             }

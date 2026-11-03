@@ -22,7 +22,7 @@ use hir_expand::{
     name::Name,
 };
 use intern::Symbol;
-use span::Edition;
+use span::{Edition, SyntaxContext};
 
 use crate::{
     AdtId, EnumId, Lookup, ModuleDefId, ModuleId,
@@ -118,6 +118,56 @@ impl ResolvePathResult {
     }
 }
 
+/// The segments of a path a lookup reads, with the context each is written with
+/// ([`ModPath::contexts`]): a segment after those the path's kind and first segment resolve is
+/// looked up in the module the path reached so far by its name keyed as def-site hygiene says
+/// ([`super::def_site::key_in`] that module's expansion).
+#[derive(Clone, Copy)]
+pub(super) struct Segments<'a> {
+    pub(super) names: &'a [Name],
+    contexts: Option<&'a [SyntaxContext]>,
+}
+
+impl<'a> Segments<'a> {
+    pub(super) fn of(path: &'a ModPath) -> Self {
+        Segments { names: path.segments(), contexts: path.contexts() }
+    }
+
+    /// Segments written with no context: a path no expansion wrote.
+    pub(super) fn plain(names: &'a [Name]) -> Self {
+        Segments { names, contexts: None }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub(super) fn first(&self) -> Option<&'a Name> {
+        self.names.first()
+    }
+
+    /// The segments from `i` on.
+    pub(super) fn from(self, i: usize) -> Self {
+        Segments { names: &self.names[i..], contexts: self.contexts.map(|it| &it[i..]) }
+    }
+
+    /// The first `len` segments.
+    pub(super) fn prefix(self, len: usize) -> Self {
+        Segments { names: &self.names[..len], contexts: self.contexts.map(|it| &it[..len]) }
+    }
+
+    /// The `i`th segment's name as the scope of `module` binds it: keyed by its context
+    /// adjusted to the module's expansion (rustc's `normalize_to_macros_2_0_and_adjust`).
+    fn keyed_in(&self, db: &Db, map: &DefMap, module: ModuleId, i: usize) -> Name {
+        let name = self.names[i];
+        let Some(ctxt) = self.contexts.map(|it| it[i]) else { return name };
+        match super::def_site::key_in(db, ctxt, map.module_expansion(db, module)) {
+            Some(key) => name.keyed(key),
+            None => name,
+        }
+    }
+}
+
 /// The arguments every step of one lookup shares, passed by value (32 bytes).
 #[derive(Clone, Copy)]
 struct PathQuery<'a> {
@@ -145,14 +195,14 @@ static CONTRACT_TEST: std::sync::LazyLock<[Name; 3]> = std::sync::LazyLock::new(
 /// `::core::blaze::contract_test` (docs/v2/plan/lanes/contracts.md, part 2) in every crate,
 /// whatever else `blaze` names there, as `blaze::pure` and the other inert `blaze::` attributes
 /// are (`DefMap::is_builtin_or_registered_attr`). Every other path is itself.
-fn attr_path_alias(path: &ModPath, expected: Option<MacroSubNs>) -> (PathKind, &[Name]) {
+fn attr_path_alias(path: &ModPath, expected: Option<MacroSubNs>) -> (PathKind, Segments<'_>) {
     match (expected, path.kind, path.segments()) {
         (Some(MacroSubNs::Attr), PathKind::Plain, [first, second])
             if first.symbol().as_str() == "blaze" && *second.symbol() == intern::sym::contract_test =>
         {
-            (PathKind::Abs, &CONTRACT_TEST[..])
+            (PathKind::Abs, Segments::plain(&CONTRACT_TEST[..]))
         }
-        (_, kind, segments) => (kind, segments),
+        (_, kind, _) => (kind, Segments::of(path)),
     }
 }
 
@@ -277,7 +327,7 @@ impl DefMap {
         expected_macro_subns: Option<MacroSubNs>,
     ) -> ResolvePathResult {
         let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
-        self.resolve_single(q, original_module, path.kind, path.segments(), &mut |_| {})
+        self.resolve_single(q, original_module, path.kind, Segments::of(path), &mut |_| {})
     }
 
     /// `segments` of a path of `kind`, as [`Self::resolve_path_fp_with_macro`] resolves them
@@ -289,7 +339,7 @@ impl DefMap {
         q: (&LocalDefMap, &Db, ResolveMode),
         original_module: ModuleId,
         kind: PathKind,
-        segments: &[Name],
+        segments: Segments<'_>,
         shadow: BuiltinShadowMode,
         expected_macro_subns: Option<MacroSubNs>,
         around: bool,
@@ -309,7 +359,7 @@ impl DefMap {
         q: PathQuery<'_>,
         mut original_module: ModuleId,
         kind: PathKind,
-        segments: &[Name],
+        segments: Segments<'_>,
         reads: &mut R,
     ) -> ResolvePathResult {
         let mut result = self.resolve_single(q, original_module, kind, segments, reads);
@@ -359,7 +409,7 @@ impl DefMap {
         q: PathQuery<'_>,
         original_module: ModuleId,
         kind: PathKind,
-        segments: &[Name],
+        segments: Segments<'_>,
         reads: &mut R,
     ) -> ResolvePathResult {
         let db = q.db;
@@ -479,7 +529,7 @@ impl DefMap {
         q: PathQuery<'_>,
         original_module: ModuleId,
         kind: PathKind,
-        segments: &[Name],
+        segments: Segments<'_>,
         reads: &mut R,
     ) -> ResolvePathResult {
         let types_only = segments.len() > 1;
@@ -593,14 +643,14 @@ impl DefMap {
     fn resolve_remaining_segments<R: FnMut(PathRead)>(
         &self,
         q: PathQuery<'_>,
-        segments: &[Name],
+        segments: Segments<'_>,
         resolved: usize,
         mut curr_per_ns: PerNs,
         original_module: ModuleId,
         reads: &mut R,
     ) -> ResolvePathResult {
         let db = q.db;
-        for (i, segment) in segments.iter().enumerate().skip(resolved) {
+        for (i, segment) in segments.names.iter().enumerate().skip(resolved) {
             let Some(curr) = curr_per_ns.take_types_full() else {
                 // we still have path segments left, but the path so far
                 // didn't resolve in the types namespace => no resolution
@@ -626,7 +676,7 @@ impl DefMap {
                             ..q
                         };
                         let resolution =
-                            def_map.resolve_fp(q, module, PathKind::SELF, &segments[i..], reads);
+                            def_map.resolve_fp(q, module, PathKind::SELF, segments.from(i), reads);
                         // That resolves from the other crate's root. What a crate of procedural
                         // macros has besides its macros is its own, its proc-macro functions too.
                         let resolved_def = match def_map.data.proc_macro {
@@ -653,14 +703,15 @@ impl DefMap {
                     };
 
                     // Since it is a qualified path here, it should not contains legacy macros
-                    reads(PathRead::Slot(module, *segment));
-                    def_map.name_in_module(db, module, segment)
+                    let segment = segments.keyed_in(db, def_map, module, i);
+                    reads(PathRead::Slot(module, segment));
+                    def_map.name_in_module(db, module, &segment)
                 }
                 ModuleDefId::AdtId(AdtId::EnumId(e)) => {
                     // enum variant
                     cov_mark::hit!(can_import_enum_variant);
 
-                    let named = i.checked_sub(1).map(|prev| &segments[prev]);
+                    let named = i.checked_sub(1).map(|prev| &segments.names[prev]);
                     let vis =
                         self.declared_enum_visibility(db, e, curr, named, reads).unwrap_or(curr.vis);
                     // A variant is no binding of the enum's module: a write touching the enum
@@ -780,17 +831,22 @@ impl DefMap {
         //  - extern prelude / macro_use prelude
         //  - std prelude
         // A module declared in a block is in the textual scope of the macros before the block.
+        // `name` may be keyed by a `macro`'s context (`def_site`): the module's scope is keyed
+        // by it, and the textual scope too, and the preludes and builtin types take the name
+        // alone.
+        let keyed = name;
+        let name = &name.unkeyed();
         let from_legacy_macro = match types_only {
             true => PerNs::none(),
             false => {
-                reads(PathRead::LegacyMacro(module, *name));
-                self.legacy_macro_in_textual_scope(db, module, name)
+                reads(PathRead::LegacyMacro(module, *keyed));
+                self.legacy_macro_in_textual_scope(db, module, keyed)
                     .filter(|&id| sub_namespace_match(db, id, expected_macro_subns))
                     .map_or_else(PerNs::none, |m| PerNs::macros(m, Visibility::Public, None))
             }
         };
-        reads(PathRead::Slot(module, *name));
-        let from_scope = self.name_in_module(db, module, name);
+        reads(PathRead::Slot(module, *keyed));
+        let from_scope = self.name_in_module(db, module, keyed);
         let from_scope = match types_only {
             true => from_scope,
             false => from_scope.filter_macro(db, expected_macro_subns),

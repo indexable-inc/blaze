@@ -197,7 +197,7 @@ fn devirtualized_in<T>(
     check: impl FnOnce(&TestDB, &MirBody<'_>, &Object, &[String]) -> T,
 ) -> T {
     let db = fixture::db(text).into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let held = world(&db, text, objects);
         let options = against(&held);
         let func = function(&db, name);
@@ -320,7 +320,7 @@ fn a_track_caller_method_behind_a_plain_declaration_stays_virtual() {
 fn a_dyn_call_of_a_track_caller_method_reports_its_definition() {
     let mut db = fixture::db(TRACKED).into_db();
     name_sources(&mut db, "fixture", |_, _| Some("main.rs".to_owned()));
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let held = world(&db, TRACKED, &[("Lines", &["Mine"], Made::Closed)]);
         let run = function(&db, "run");
         let env = ParamEnvAndCrate { param_env: db.trait_environment(run.into()), krate: run.krate(&db) }.store();

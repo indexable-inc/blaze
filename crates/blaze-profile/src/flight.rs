@@ -61,7 +61,6 @@ const SEQ_MASK: u64 = (1 << SEQ_BITS) - 1;
 /// Rings a process may have: one per thread alive at once. Numbers run from 1; the highest
 /// number the bits hold is left out, so no span's id is [`UNRECORDED`].
 const RINGS_MAX: usize = (1 << RING_BITS) - 2;
-const RING_MASK: u64 = (1 << RING_BITS) - 1;
 /// The id of a span that is not recorded: past the callsite table, or past [`SLOTS_OPEN`].
 pub(crate) const UNRECORDED: u64 = u64::MAX;
 
@@ -1019,12 +1018,16 @@ const SPAN_COPIED_ROW: u64 = 0xfe;
 /// said its typed columns ([`span::TYPED_COLUMNS`]): up to [`COL_WORDS`] values a row, each
 /// plus one, at the words `COL_WORDS` names, and the span's id at word 3. Word 4's bytes 1..6
 /// say whose value each word holds: a typed column's index, [`CPU_COL`] for the span's self
-/// CPU, [`NO_COL`] for none.
+/// CPU, [`THREAD_COL`] for the thread that made a span another closed, [`NO_COL`] for none.
 const SPAN_COLS_ROW: u64 = 0xfa;
 const COL_WORDS: [usize; 5] = [1, 2, 5, 6, 7];
+/// The thread that made a span closed by another (on another ring, or on its ring after the
+/// ring passed to the next thread), as [`Ring::current`] said it when the span began: its tid
+/// << 32 | its name. The ring's rows name the thread that closed it.
+const THREAD_COL: u64 = 0xfd;
 const CPU_COL: u64 = 0xfe;
 const NO_COL: u64 = 0xff;
-const _: () = assert!(TYPED < CPU_COL as usize, "a typed column's index is a byte of its own");
+const _: () = assert!(TYPED < THREAD_COL as usize, "a typed column's index is a byte of its own");
 const UNCOUNTED: u64 = 1;
 
 const _: () = {
@@ -1069,6 +1072,9 @@ struct Slot {
     frame_bytes: AtomicU64,
     /// The ring's [`Ring::lease`] when the span began: which thread's counts it began with.
     lease: AtomicU64,
+    /// The thread that made it, as [`Ring::current`] said it then: the thread a row of it
+    /// names when another thread closes it, by when the ring may have passed to the next.
+    thread: AtomicU64,
     /// The words of its typed columns, as a span kind said them (0: not said).
     typed: [AtomicU64; TYPED],
     /// Its job's CPU clock when it began ([`job_cpu`]): the clock, and the reading plus one
@@ -1094,6 +1100,7 @@ impl Slot {
         frame_copies: AtomicU64::new(0),
         frame_bytes: AtomicU64::new(0),
         lease: AtomicU64::new(0),
+        thread: AtomicU64::new(0),
         typed: [const { AtomicU64::new(0) }; TYPED],
         cpu_clock: AtomicU64::new(0),
         cpu: AtomicU64::new(0),
@@ -1115,6 +1122,7 @@ struct Opened {
     alloc: Allocated,
     copied: FrameCopied,
     lease: u64,
+    thread: u64,
     typed: [u64; TYPED],
     cpu_clock: u64,
     cpu: u64,
@@ -1302,6 +1310,7 @@ impl Ring {
                 bytes: slot.frame_bytes.load(Ordering::Relaxed),
             },
             lease: slot.lease.load(Ordering::Relaxed),
+            thread: slot.thread.load(Ordering::Relaxed),
             typed: std::array::from_fn(|it| slot.typed[it].load(Ordering::Relaxed)),
             cpu_clock: slot.cpu_clock.load(Ordering::Relaxed),
             cpu: slot.cpu.load(Ordering::Relaxed),
@@ -1558,6 +1567,8 @@ fn began(site: u16, parent: Option<u64>, said: &Said) -> u64 {
     slot.frame_copies.store(copied.copies, Ordering::Relaxed);
     slot.frame_bytes.store(copied.bytes, Ordering::Relaxed);
     slot.lease.store(ring.lease.load(Ordering::Relaxed), Ordering::Relaxed);
+    // Written by `claim` on this thread before it made any span.
+    slot.thread.store(ring.current.load(Ordering::Relaxed), Ordering::Relaxed);
     slot.refs.store(1, Ordering::Relaxed);
     slot.id.store(id, Ordering::Release);
     id
@@ -1724,14 +1735,17 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
         | allocs;
     let build_unit = u64::from(opened.build) << 32 | opened.unit;
     let ring = ring()?;
+    // Closed by another thread than made it: its own ring, but leased again since, is another
+    // thread's too.
+    let moved = ring.number != made_by.number || ring.lease.load(Ordering::Relaxed) != opened.lease;
     ring.put([now, opened.start, id, opened.parent, what, opened.of, build_unit, bytes]);
     let key = crate::hot::record::key(opened.site, opened.of as u32);
     let waits_on = opened.typed[<span::col::WaitsOn as span::Column>::AT - span::GENERIC];
     crate::hot::record::closed(&ring.hot, key, now.wrapping_sub(opened.start), waits_on);
-    put_cols(ring, now, id, self_cpu(&opened), &opened.typed);
+    put_cols(ring, now, id, self_cpu(&opened), moved.then_some(opened.thread), &opened.typed);
     if FRAME_COPIED.get().is_some() {
         let copied = frame_copied();
-        let row = if ring.number != made_by.number || ring.lease.load(Ordering::Relaxed) != opened.lease {
+        let row = if moved {
             Some([0, 0, UNCOUNTED])
         } else if copied.copies != opened.copied.copies {
             Some([copied.copies - opened.copied.copies, copied.bytes - opened.copied.bytes, 0])
@@ -1747,11 +1761,16 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
 }
 
 /// Writes the [`SPAN_COLS_ROW`]s of the span `id`, closing now: its self CPU (`cpu`, plus one;
-/// 0: not counted) and each typed column said, [`COL_WORDS`] a row.
+/// 0: not counted), the thread that made it when another closes it (`made_by`) and each typed
+/// column said, [`COL_WORDS`] a row.
 #[inline]
-fn put_cols(ring: &Ring, now: u64, id: u64, cpu: u64, typed: &[u64; TYPED]) {
+fn put_cols(ring: &Ring, now: u64, id: u64, cpu: u64, made_by: Option<u64>, typed: &[u64; TYPED]) {
     let said = (cpu != 0).then_some((CPU_COL, cpu));
-    let mut values = said.into_iter().chain((0..TYPED).filter(|&it| typed[it] != 0).map(|it| (it as u64, typed[it])));
+    let made_by = made_by.map(|it| (THREAD_COL, it));
+    let mut values = said
+        .into_iter()
+        .chain(made_by)
+        .chain((0..TYPED).filter(|&it| typed[it] != 0).map(|it| (it as u64, typed[it])));
     loop {
         let mut row = [now, 0, 0, id, 0, 0, 0, 0];
         let mut whose = 0;
@@ -2011,19 +2030,13 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
             let Some(by) = Ring::owner(&owners, i) else { continue };
             match row[4] >> 62 {
                 KIND_SPAN => {
-                    let made_on = (row[4] >> ALLOCS_BITS & RING_MASK) as usize;
-                    let (thread, thread_name) = if made_on == usize::from(ring.number) {
-                        (by.tid, by.name)
-                    } else {
-                        // Closed on another thread than the one that made it: that thread is
-                        // the one its ring holds now, or held last.
-                        by_number(made_on).map_or((by.tid, by.name), Ring::current)
-                    };
                     let allocs = row[4] & ALLOCS_MAX;
                     into.spans.push(SpanRow {
                         build: (row[6] >> 32) as u32,
-                        thread,
-                        thread_name,
+                        // The thread that closed it, until a `THREAD_COL` names the one that
+                        // made it.
+                        thread: by.tid,
+                        thread_name: by.name,
                         span_id: row[2],
                         parent: row[3],
                         depth: (row[4] >> (62 - SITE_BITS - DEPTH_BITS) & ((1 << DEPTH_BITS) - 1)) as u16,
@@ -2085,6 +2098,10 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                         for (place, &word) in COL_WORDS.iter().enumerate() {
                             match row[4] >> (8 * (place + 1)) & 0xff {
                                 CPU_COL => span.self_cpu_ns = row[word].checked_sub(1),
+                                THREAD_COL => {
+                                    span.thread = (row[word] >> 32) as u32;
+                                    span.thread_name = row[word] as Sym;
+                                }
                                 col => {
                                     if let Some(typed) = usize::try_from(col).ok().and_then(|it| span.typed.get_mut(it)) {
                                         *typed = row[word];
@@ -2406,19 +2423,20 @@ mod tests {
 
     #[test]
     fn a_thread_that_ended_lets_its_ring_go_to_the_next() {
-        let (first, tid, lease) = std::thread::spawn(|| {
+        let (first, lease) = std::thread::spawn(|| {
             let ring = ring().unwrap();
-            (ring.number, crate::sampler::os_tid() as u32, ring.lease.load(Ordering::Relaxed))
+            (ring.number, ring.lease.load(Ordering::Relaxed))
         })
         .join()
         .unwrap();
         let ring = by_number(usize::from(first)).unwrap();
         // Other tests' threads take and leave rings meanwhile, the lowest free first, so the
-        // ring is free or has passed to another thread, with a new lease.
-        let passed = || {
-            ring.lease.load(Ordering::Relaxed) != lease && lock(&ring.owners).last().is_some_and(|it| it.tid != tid)
-        };
-        assert!(!ring.live.load(Ordering::Acquire) || passed(), "the ended thread let its ring go");
+        // ring is free or has passed to another thread, with a new lease. A thread taking it
+        // marks it live before it bumps the lease, so a ring seen live under the old lease is
+        // one being taken, or one the ended thread still holds: the bound says which.
+        blaze_graph::spin::SpinWait::within("the ended thread to have let its ring go", Duration::from_secs(10), || {
+            !ring.live.load(Ordering::Acquire) || ring.lease.load(Ordering::Relaxed) != lease
+        });
     }
 
     #[test]
@@ -2520,6 +2538,27 @@ mod tests {
         assert_eq!(row("flight never named").function, 0);
     }
 
+    /// The waits of `thread` in `read` for a key, refusing any other wait but one for the
+    /// scheduler's lock. A test's threads share the process's scheduler with every other test's
+    /// pools and drivers, so a thread that asks for a key may also wait for the scheduler's lock
+    /// while another test holds it: a real wait, spanned as every wait is, but not the one a test
+    /// of key waits is about.
+    fn key_waits(read: &Read, thread: u32) -> Vec<&SpanRow> {
+        use blaze_graph::wait::WaitKind;
+        // alloc: a test's rows
+        let mut keys = Vec::new();
+        for row in read.spans.iter().filter(|it| it.thread == thread) {
+            let Some(wait) = span::read::<span::Wait>(row).unwrap() else { continue };
+            let awaits = wait.fields.awaits.text();
+            match wait.fields.on {
+                WaitKind::Key => keys.push(row),
+                WaitKind::Lock if awaits.as_deref() == Some("lock the scheduler") => {}
+                other => panic!("thread {thread} waited on {other:?} {awaits:?}: neither a key nor the scheduler's lock"),
+            }
+        }
+        keys
+    }
+
     #[test]
     fn a_thread_waiting_on_a_query_another_runs_spans_the_wait_naming_it() {
         use std::time::Duration;
@@ -2559,7 +2598,7 @@ mod tests {
                 .filter(|it| it.thread == thread && meta(it.site).map(|it| it.name()) == Some(name))
                 .collect::<Vec<_>>()
         };
-        let [wait] = named_on(asker, "wait")[..] else { panic!("the asker waited once") };
+        let [wait] = key_waits(&read, asker)[..] else { panic!("the asker waited once for a key") };
         let [asking] = named_on(asker, "flight asking")[..] else { panic!("the asking span is a row") };
         assert_eq!(asking.span_id, asking_id);
         assert_eq!(self::name(wait.function).as_deref(), Some("slow_query(of_square)"));
@@ -2570,9 +2609,10 @@ mod tests {
         assert_eq!(asking.get::<span::col::Awaits>(), None, "a span that waits on nothing awaits nothing");
         assert_eq!((wait.parent, wait.depth), (asking_id, 1));
         assert!(wait.dur_ns >= 100_000_000, "the wait lasted while the run slept: {} ns", wait.dur_ns);
-        let asking_self = asking.dur_ns - wait.dur_ns;
-        assert!(asking_self < wait.dur_ns / 4, "the asker's own time leaves out the wait: {asking_self} ns");
-        assert!(named_on(runner, "wait").is_empty(), "the run's own thread waited for nothing");
+        let waited: i64 = named_on(asker, "wait").iter().filter(|it| it.parent == asking_id).map(|it| it.dur_ns).sum();
+        let asking_self = asking.dur_ns - waited;
+        assert!(asking_self < wait.dur_ns / 4, "the asker's own time leaves out its waits: {asking_self} ns");
+        assert!(key_waits(&read, runner).is_empty(), "the run's own thread waited for no key");
     }
 
     #[test]
@@ -2609,7 +2649,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let [hold] = named_on(holder, "hold")[..] else { panic!("the holder's hold is one span") };
-        let [wait] = named_on(waiter, "wait")[..] else { panic!("the waiter waited once") };
+        let [wait] = key_waits(&read, waiter)[..] else { panic!("the waiter waited once for a key") };
         assert_eq!(self::name(hold.function).as_deref(), Some("codegen round 3 of app"));
         let holder_of = span::read::<span::Hold>(hold).unwrap().expect("the hold is a `hold`").fields.holder;
         assert_eq!(wait.get::<span::col::Owner>(), Some(holder_of), "the wait names the hold's holder as whose it waits on");
@@ -2632,8 +2672,78 @@ mod tests {
         let row = read.spans.iter().find(|it| it.span_id == id).expect("the span is a row");
         assert_eq!(meta(row.site).map(|it| it.name()), Some("flight moved"));
         assert!(row.dur_ns >= 0);
-        // Its thread ended, so the ring that made it names that thread or the next to take it.
-        assert!(row.thread == tid || row.thread != 0);
+        assert_eq!(row.thread, tid, "a span another thread closed names the thread that made it");
+    }
+
+    /// Spans made on a thread that ended, closed after its ring passed to the next thread (one
+    /// by that thread, one by another), name the thread that made them, never the one holding
+    /// the ring when they are read: a wait a pool worker began and another thread ended once
+    /// read as a wait of whichever test's thread took the worker's ring next.
+    #[test]
+    fn spans_whose_thread_ended_name_it_after_its_ring_passed_on() {
+        crate::install();
+        // Named, so a row names the maker by its name as well as its tid.
+        const MAKER: &str = "flight maker of spans another closes";
+        let (by_taker, by_other, maker, ring_of_maker, lease) = std::thread::Builder::new()
+            .name(MAKER.to_owned())
+            .spawn(|| {
+                let by_taker = tracing::info_span!(target: "blaze", "flight outlived, closed by the taker");
+                let by_other = tracing::info_span!(target: "blaze", "flight outlived, closed by another");
+                let ring = ring().unwrap();
+                (by_taker, by_other, crate::sampler::os_tid() as u32, ring.number, ring.lease.load(Ordering::Relaxed))
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        let ids = [&by_taker, &by_other].map(|it| it.id().unwrap().into_u64());
+        let left = by_number(usize::from(ring_of_maker)).unwrap();
+        let passed = || left.lease.load(Ordering::Relaxed) != lease;
+        // Threads take the lowest free ring: start them, each holding its ring, until the ring
+        // the maker left is held by another thread (one of these, or another test's).
+        let (took, taken) = crossbeam_channel::unbounded::<u16>();
+        // alloc: a test's threads
+        let mut holders = Vec::new();
+        let mut taker = None;
+        for _ in 0..256 {
+            if passed() {
+                break;
+            }
+            let took = took.clone();
+            let (to_close, close) = crossbeam_channel::bounded::<Option<tracing::Span>>(1);
+            holders.push((
+                to_close,
+                std::thread::spawn(move || {
+                    took.send(ring().unwrap().number).unwrap();
+                    // The span to close here, or none.
+                    drop(close.recv().unwrap());
+                }),
+            ));
+            if taken.recv().unwrap() == ring_of_maker {
+                taker = Some(holders.len() - 1);
+            }
+        }
+        assert!(passed(), "another thread took the ring the maker left, within 256 threads");
+        let holder = left.current().0;
+        // Closed by another thread while the ring is another's, then by the thread holding the
+        // ring under a new lease when it is one of these.
+        std::thread::spawn(move || drop(by_other)).join().unwrap();
+        let mut by_taker = Some(by_taker);
+        for (i, (to_close, thread)) in holders.into_iter().enumerate() {
+            to_close.send(if taker == Some(i) { by_taker.take() } else { None }).unwrap();
+            thread.join().unwrap();
+        }
+        drop(by_taker);
+        let mut read = Read::default();
+        window(Duration::from_secs(60), &mut read);
+        for id in ids {
+            let row = read.spans.iter().find(|it| it.span_id == id).expect("the span is a row");
+            assert_eq!(
+                (row.thread, name(row.thread_name).as_deref()),
+                (maker, Some(MAKER)),
+                "`{:?}` names the thread that made it, not {holder}, which took its ring",
+                meta(row.site).map(|it| it.name())
+            );
+        }
     }
 
     thread_local! {

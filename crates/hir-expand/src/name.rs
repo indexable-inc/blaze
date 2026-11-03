@@ -18,7 +18,11 @@ use syntax::{ast, format_smolstr, view};
 /// crate is in edition 2024 and wrote `r#gen`, and the opposite holds as well.
 ///
 /// 4 bytes, `Copy`: the interned symbol's id. Equality and hashing are one `u32`; ordering
-/// compares text (ids differ between runs), equal ids first.
+/// compares text (ids differ between runs), equal ids first. A keyed name (see [`Name::keyed`])
+/// orders by its written text, then by its key's context id, which is this process's: `Ord`
+/// keeps maps and sets apart, and nothing written out may follow it between two keyed names of
+/// one text. Output orders by [`Name::cmp_written`] and, among those, by construction (a
+/// scope's order of binding, `ItemScope::entries`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Name {
@@ -43,7 +47,15 @@ impl fmt::Debug for Name {
 impl Ord for Name {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.symbol.cmp_order(&other.symbol)
+        let keyed = |name: &Name| name.symbol.as_str().as_bytes().first() == Some(&KEY_MARK);
+        if !keyed(self) && !keyed(other) {
+            return self.symbol.cmp_order(&other.symbol);
+        }
+        // A keyed name sorts by the name it is written as, beside its unkeyed twin, then by
+        // its key (unkeyed first).
+        self.as_str().cmp(other.as_str()).then_with(|| {
+            self.key().map(SyntaxContext::into_u32).cmp(&other.key().map(SyntaxContext::into_u32))
+        })
     }
 }
 
@@ -173,16 +185,73 @@ impl Name {
     /// Whether this name needs to be escaped in the given edition via `r#`.
     #[inline]
     pub fn needs_escape(&self, edition: Edition) -> bool {
-        is_raw_identifier(self.symbol.as_str(), edition)
+        is_raw_identifier(self.as_str(), edition)
     }
 
-    /// Returns the text this name represents if it isn't a tuple field.
+    /// Returns the text this name represents if it isn't a tuple field: of a
+    /// [keyed](Self::keyed) name, the name without its key.
     ///
     /// Do not use this for user-facing text, use `display` instead to handle editions properly.
     // FIXME: This should take a database argument to hide the interning
     #[inline]
     pub fn as_str(&self) -> &str {
-        self.symbol.as_str()
+        let text = self.symbol.as_str();
+        match text.as_bytes().first() {
+            Some(&KEY_MARK) => split_key(text).1,
+            _ => text,
+        }
+    }
+
+    /// The name a binding written with syntax context `ctxt` has as the key of a scope:
+    /// rustc's `BindingKey`, an identifier with its context normalized to macros 2.0
+    /// (`ctxt`, normalized by the caller). A root context keys nothing, so every name not
+    /// written by a `macro` (or a def-site span) is itself. Two expansions of one `macro` that
+    /// each define `DLSYM` in one block bind two keys, and a path finds the one written with
+    /// its own context ([`crate::hygiene`]; hir-def's `nameres::def_site` is where the keys are
+    /// given and looked up).
+    ///
+    /// The key is in the interned symbol (`"\0{ctxt}\0{name}"`), so a key stays a 4-byte
+    /// `Name` and every map keyed by names keys by it with no change. [`Self::as_str`] and
+    /// [`Self::display`] show the name alone. The context's id is this process's: whatever
+    /// persists a keyed name writes [`Self::key`] itself (hir-def's `frozen`).
+    pub fn keyed(self, ctxt: SyntaxContext) -> Name {
+        let name = self.unkeyed();
+        if ctxt.is_root() {
+            return name;
+        }
+        let text = format_smolstr!("\0{}\0{}", ctxt.into_u32(), name.as_str());
+        Name { symbol: Symbol::intern(&text), ctx: () }
+    }
+
+    /// The context a [keyed](Self::keyed) name is keyed by: `None` for a name with no key.
+    pub fn key(&self) -> Option<SyntaxContext> {
+        let text = self.symbol.as_str();
+        if text.as_bytes().first() != Some(&KEY_MARK) {
+            return None;
+        }
+        let (ctxt, _) = split_key(text);
+        Some(SyntaxContext::from_u32(ctxt))
+    }
+
+    /// The order output lists names in: by the text they are written as, a name with no key
+    /// before the [keyed](Self::keyed) ones of its text. Two keyed names of one text are
+    /// `Equal` here, whatever their keys: their contexts' ids are this process's, so whoever
+    /// lists them orders them by construction (a stable sort over the order they were bound
+    /// in), never by key.
+    pub fn cmp_written(&self, other: &Name) -> std::cmp::Ordering {
+        let keyed = |name: &Name| name.symbol.as_str().as_bytes().first() == Some(&KEY_MARK);
+        if !keyed(self) && !keyed(other) {
+            return self.symbol.cmp_order(&other.symbol);
+        }
+        self.as_str().cmp(other.as_str()).then_with(|| keyed(self).cmp(&keyed(other)))
+    }
+
+    /// The name without its key.
+    pub fn unkeyed(self) -> Name {
+        match self.symbol.as_str().as_bytes().first() {
+            Some(&KEY_MARK) => Name::new_text(self.as_str()),
+            _ => self,
+        }
     }
 
     #[inline]
@@ -213,6 +282,21 @@ impl Name {
     }
 }
 
+/// The first byte of a [keyed](Name::keyed) name's symbol, which no identifier, lifetime or
+/// tuple index starts with.
+const KEY_MARK: u8 = 0;
+
+/// A keyed symbol's context id and name: `"\0{ctxt}\0{name}"`, which only [`Name::keyed`]
+/// writes.
+fn split_key(text: &str) -> (u32, &str) {
+    let rest = &text[1..];
+    let Some((ctxt, name)) = rest.split_once('\0') else {
+        panic!("keyed name {text:?} with no name after its context");
+    };
+    let Ok(ctxt) = ctxt.parse() else { panic!("keyed name {text:?} with no context id") };
+    (ctxt, name)
+}
+
 #[inline]
 pub fn is_generated(name: &str) -> bool {
     name.starts_with("<ra@gennew>")
@@ -225,7 +309,7 @@ struct Display<'a> {
 
 impl fmt::Display for Display<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut symbol = self.name.symbol.as_str();
+        let mut symbol = self.name.as_str();
 
         if symbol == "'static" {
             // FIXME: '`static` can also be a label, and there it does need escaping.

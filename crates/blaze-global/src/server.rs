@@ -485,7 +485,7 @@ fn publish(
         // alloc: an error's message, made only when it fails.
         let checked = trust.verify(&signed).map_err(|refused| refused.to_string());
         let value = window.read(&mut reader, signed.record.len, checked.is_ok()).map_err(bad)?;
-        let status = checked.and_then(|()| keep(store, &signed, value.expect("a value whose record is checked is kept"), &mut tickets));
+        let status = checked.and_then(|()| keep(store, &signed, &value.expect("a value whose record is checked is kept"), &mut tickets));
         statuses.push((signed.record.key, status));
     }
     reader.end("a publish").map_err(bad)?;
@@ -499,9 +499,9 @@ fn publish(
 }
 
 /// Puts a value whose record is checked: the value, then its record.
-fn keep(store: &mut Store, signed: &Signed, bytes: Vec<u8>, tickets: &mut Vec<Ticket>) -> Result<(), String> {
+fn keep(store: &mut Store, signed: &Signed, bytes: &[u8], tickets: &mut Vec<Ticket>) -> Result<(), String> {
     let record = signed.record;
-    let found = blaze_cas::content_of(&bytes);
+    let found = blaze_cas::content_of(bytes);
     if found != record.content {
         // alloc: an error's message, made only when it fails.
         return Err(format!(
@@ -514,7 +514,7 @@ fn keep(store: &mut Store, signed: &Signed, bytes: Vec<u8>, tickets: &mut Vec<Ti
         format!("the global cache keeps another value of {:x}: {:x}, not {:x}", record.key.0, mismatch.kept, mismatch.given)
     })?;
     // alloc: an error's message, made only when it fails.
-    let kept = store.put(record_key(&record.key), Kind::Query, signed.encode().to_vec()).map_err(|_| {
+    let kept = store.put(record_key(&record.key), Kind::Query, &signed.encode()).map_err(|_| {
         // alloc: an error's message, made only when it fails.
         format!("the global cache keeps another signed record of {:x} (another publisher's)", record.key.0)
     })?;
@@ -582,7 +582,7 @@ fn bundle_publish(body: &[u8], store: &mut Store, trust: &Trust, effects: &mut V
         let mut bytes = Vec::new();
         manifest.encode(&mut bytes);
         let ticket = store
-            .put(manifest.id.manifest_key(), Kind::Output, bytes)
+            .put(manifest.id.manifest_key(), Kind::Output, &bytes)
             // alloc: an error's message, made only when it fails.
             .map_err(|_| format!("the cache keeps another manifest of {:x}", key.0))?;
         tickets.push(ticket);

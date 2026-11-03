@@ -15,7 +15,7 @@ use super::describe;
 fn a_call_with_no_function_names_its_callee_its_function_and_why() {
     let db = fixture::db("pub fn outer() -> i32 {\n    let f = || missing(1);\n    f()\n}\n").into_db();
     let krate = fixture::test_crate(&db);
-    let text = hir_ty::attach_db(&db, || {
+    let text = blaze_query::db::attach(&db, || {
         let outer = test_items::function(&db, krate, "outer");
         let owner: InferBodyId<'_> = outer.into();
         let store = ExpressionStore::of(&db, ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(outer)));
@@ -46,7 +46,7 @@ fn a_call_with_no_function_names_its_callee_its_function_and_why() {
 fn the_frames_are_named_by_path_innermost_first() {
     let db = fixture::db("pub fn inner() {}\npub fn outer() {\n    inner();\n}\n").into_db();
     let krate = fixture::test_crate(&db);
-    let text = hir_ty::attach_db(&db, || {
+    let text = blaze_query::db::attach(&db, || {
         let (inner, outer) = (test_items::function(&db, krate, "inner"), test_items::function(&db, krate, "outer"));
         let store = ExpressionStore::of(&db, ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(outer)));
         let call = store
@@ -72,7 +72,7 @@ fn the_frames_are_named_by_path_innermost_first() {
 fn a_loop_stops_at_its_steps_naming_them_and_where() {
     let db = fixture::db("pub fn spin() -> i32 {\n    let mut n = 0;\n    loop {\n        n += 1;\n    }\n}\n").into_db();
     let krate = fixture::test_crate(&db);
-    let text = hir_ty::attach_db(&db, || {
+    let text = blaze_query::db::attach(&db, || {
         let spin = test_items::function(&db, krate, "spin");
         let env = hir_ty::ParamEnvAndCrate { param_env: db.trait_environment(spin.into()), krate };
         let mut eval = hir_ty_mir::mir::Evaluator::new(&db, spin.into(), Some(env)).expect("an evaluator");
@@ -93,7 +93,7 @@ fn a_loop_stops_at_its_steps_naming_them_and_where() {
 fn memory_past_its_bound_stops_saying_so() {
     let db = fixture::db("pub fn deep(n: u64) -> u64 {\n    let a = [n; 1024];\n    deep(a[0] + 1)\n}\n").into_db();
     let krate = fixture::test_crate(&db);
-    let text = hir_ty::attach_db(&db, || {
+    let text = blaze_query::db::attach(&db, || {
         let deep = test_items::function(&db, krate, "deep");
         let env = hir_ty::ParamEnvAndCrate { param_env: db.trait_environment(deep.into()), krate };
         let mut eval = hir_ty_mir::mir::Evaluator::new(&db, deep.into(), Some(env)).expect("an evaluator");

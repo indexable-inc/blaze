@@ -25,6 +25,7 @@ hir-def.workspace = true
 hir-ty.workspace = true
 
 [dev-dependencies]
+blaze-query.workspace = true
 # The tests' database links hir-ty-mir for the MIR providers.
 hir-ty-mir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }

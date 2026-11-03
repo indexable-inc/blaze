@@ -375,6 +375,17 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                 self.to(false)?;
                 summary(&mut self.line, &self.units[at], &self.names, &self.counted[at], self.shown);
             }
+            // What a failed build left unchecked: the tree to stderr in every format, so a
+            // person sees how much the errors above do not cover; under JSON one line an agent
+            // reads too.
+            ResponseRef::Unchecked(unchecked) => {
+                if self.shown.format.json() {
+                    self.to(true)?;
+                    self.line.push_str(&blaze_ui::api::unchecked_json(&unchecked));
+                }
+                self.to(false)?;
+                blaze_ui::api::unchecked_lines(&mut self.line, &unchecked, self.shown.color);
+            }
             // blaze's own, for the proof harness: what the request did, then what became of each
             // dependency crate's check.
             // How each image was linked goes to stderr in every format: a link that was not

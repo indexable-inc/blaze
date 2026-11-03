@@ -426,7 +426,7 @@ fn instance_path(db: &Db, instance: &Instance) -> Box<str> {
 
 /// `func` by path, crate first, with `args` where its symbol has them.
 fn fn_path<'db>(db: &'db Db, func: FunctionId, args: &[hir_ty::next_solver::GenericArg<'db>]) -> Box<str> {
-    let spelled = hir_ty::attach_db(db, || rustc_function_name(db, func, args));
+    let spelled = blaze_query::db::attach(db, || rustc_function_name(db, func, args));
     match spelled {
         Some(path) => path.into(),
         None => FunctionSignature::of(db, func).name.as_str().into(),
@@ -481,7 +481,7 @@ struct Params<'a, 'db> {
 impl<'db> Params<'_, 'db> {
     fn refuse(&mut self, rule: Rule, what: impl FnOnce() -> String) {
         if self.trouble.is_none() && self.refuses.has(rule) {
-            self.trouble = Some((rule, hir_ty::attach_db(self.cx.db, what)));
+            self.trouble = Some((rule, blaze_query::db::attach(self.cx.db, what)));
         }
     }
 

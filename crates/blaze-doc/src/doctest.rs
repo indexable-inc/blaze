@@ -567,13 +567,14 @@ pub struct OfLibrary {
 }
 
 impl OfLibrary {
-    pub fn read(db: &Db, krate: hir::Crate) -> OfLibrary {
+    /// Refuses a crate with no name: its examples name it by it (`use app::f;`).
+    pub fn read(db: &Db, krate: hir::Crate) -> Result<OfLibrary, base_db::UnnamedCrate> {
         let root = db.file_text(krate.root_file(db));
-        OfLibrary {
-            name: crate::crate_name(db, krate),
+        Ok(OfLibrary {
+            name: crate::crate_name(db, krate)?,
             edition: krate.edition(db),
             of_the_crate: OfTheCrate::read(root.text(db)),
-        }
+        })
     }
 }
 
@@ -1203,7 +1204,7 @@ pub mod inner {
 }
 "#;
         let db = hir_expand::fixture::db(text).into_db();
-        let krate = hir::Crate::all(&db).into_iter().find(|it| crate::crate_name(&db, *it) == "app").unwrap();
+        let krate = hir::Crate::all(&db).into_iter().find(|it| it.base().rust_name(&db).is_ok_and(|it| it.as_str() == "app")).unwrap();
         let found = examples(&db, krate);
         let found: Vec<_> =
             found.iter().map(|it| (it.item.as_str(), it.line, it.code.as_str(), it.lang.no_run, it.lang.ignore)).collect();
@@ -1258,7 +1259,7 @@ pub fn wide() {}
 pub fn narrow() {}
 "#;
         let db = hir_expand::fixture::db(text).into_db();
-        let krate = hir::Crate::all(&db).into_iter().find(|it| crate::crate_name(&db, *it) == "app").unwrap();
+        let krate = hir::Crate::all(&db).into_iter().find(|it| it.base().rust_name(&db).is_ok_and(|it| it.as_str() == "app")).unwrap();
         let found = examples(&db, krate);
         let found: Vec<_> = found.iter().map(|it| (it.code.as_str(), it.attrs.join(" "))).collect();
         let found: Vec<_> = found.iter().map(|(code, attrs)| (*code, attrs.as_str())).collect();

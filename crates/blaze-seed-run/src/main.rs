@@ -39,8 +39,8 @@ fn main() -> ExitCode {
     match blaze_seed_run::run(&bytes, &config) {
         Ok(exit) => {
             eprintln!(
-                "blaze-seed-run: exit {}, memory {} bytes, {} resident",
-                exit.code, exit.memory_bytes, exit.resident_bytes
+                "blaze-seed-run: exit {}, memory {} bytes, {} held",
+                exit.code, exit.memory_bytes, exit.held_bytes
             );
             ExitCode::from(u8::try_from(exit.code).unwrap_or(u8::MAX))
         }

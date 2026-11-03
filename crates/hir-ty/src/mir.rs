@@ -2669,7 +2669,8 @@ pub enum MirEvalError<'db> {
         at: Option<(InferBodyId<'db>, MirSpan)>,
     },
     /// rustc's `long_running_const_eval` at an error level: a constant's or static's evaluation
-    /// ran 2,000,000 blocks (rustc's `LINT_TERMINATOR_LIMIT`), at `at`.
+    /// ran 2,000,000 steps (rustc's `LINT_TERMINATOR_LIMIT`), at `at`. A step is a run of a block
+    /// that ends in a call or closes a loop, as rustc's `CtfeLimit` pass counts them.
     LongRunning {
         at: Option<(InferBodyId<'db>, MirSpan)>,
     },
@@ -2856,6 +2857,8 @@ pub enum MirLowerError<'db> {
         owner: ExpressionStoreOwnerId,
         /// `None` for a lang item path.
         path: Option<ModPath>,
+        /// The expression or pattern the path is, in `owner`'s store: where the error is.
+        at: hir_def::hir::ExprOrPatId,
     },
     RecordLiteralWithoutPath,
     UnresolvedMethod(String),

@@ -17,7 +17,7 @@ const GOAL: &str = file!();
 /// `GOAL`'s value: an address and a length, the bytes behind them in the memory map.
 #[track_caller]
 fn goal(db: &TestDB) -> String {
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let value = db
             .const_eval(constant(db, "GOAL"), GenericArgs::empty(), None)
             .unwrap_or_else(|error| panic!("evaluating `GOAL`: {error:?}"));
@@ -36,7 +36,7 @@ fn file_follows_the_names_the_build_gives() {
     let _ = fx.only_file();
     let mut db = fx.into_db();
     // Before the build names files, the evaluator refuses: no placeholder for a path.
-    let unnamed = hir_ty::attach_db(&db, || {
+    let unnamed = blaze_query::db::attach(&db, || {
         db.const_eval(constant(&db, "GOAL"), GenericArgs::empty(), None)
             .map(|_| ())
             .map_err(|error| format!("{error:?}"))

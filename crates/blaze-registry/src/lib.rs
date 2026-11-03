@@ -114,7 +114,8 @@ pub fn cargo_home() -> Option<PathBuf> {
 /// `CacheLockMode::DownloadExclusive`), held while the index cache, `.crate` files and
 /// unpacked sources are written, so that cargo and blaze do not write them at once.
 pub struct PackageCacheLock {
-    _file: File,
+    // Let go of as this drops, even while a child spawned meanwhile still has the file open.
+    _file: stdx::file_lock::Locked,
 }
 
 impl PackageCacheLock {
@@ -130,10 +131,15 @@ impl PackageCacheLock {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open `{}`", path.display()))?;
-        if file.try_lock().is_err() {
-            eprintln!("    Blocking waiting for file lock on package cache");
-            file.lock().with_context(|| format!("failed to lock `{}`", path.display()))?;
-        }
+        let locked = stdx::file_lock::Locked::try_lock(file)
+            .with_context(|| format!("failed to lock `{}`", path.display()))?;
+        let file = match locked {
+            Ok(file) => file,
+            Err(file) => {
+                eprintln!("    Blocking waiting for file lock on package cache");
+                stdx::file_lock::Locked::lock(file).with_context(|| format!("failed to lock `{}`", path.display()))?
+            }
+        };
         Ok(PackageCacheLock { _file: file })
     }
 }

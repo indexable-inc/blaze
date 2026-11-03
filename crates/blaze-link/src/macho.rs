@@ -283,16 +283,22 @@ enum Segment {
     Text,
     DataConst,
     Data,
-    /// A dev run's reservations ([`Reserve`]), after every segment with bytes and before
-    /// `__DWARF` and `__LINKEDIT`: no access, no file bytes and no sections, as `__PAGEZERO`.
-    Arena,
-    Cells,
-    Fixed,
+    /// A dev run's reservations, one segment each in [`Reserve`]'s order, after every segment
+    /// with bytes and before `__DWARF` and `__LINKEDIT`: no access, no file bytes and no
+    /// sections, as `__PAGEZERO`.
+    Reserve(Reserve),
 }
 
 impl Segment {
-    fn reserves(self) -> bool {
-        matches!(self, Segment::Arena | Segment::Cells | Segment::Fixed)
+    /// The segment's place in address order: the declaration order, each reservation in
+    /// [`Reserve`]'s order.
+    const fn order(self) -> u8 {
+        match self {
+            Segment::Text => 0,
+            Segment::DataConst => 1,
+            Segment::Data => 2,
+            Segment::Reserve(reserve) => 3 + reserve as u8,
+        }
     }
 
     fn of(name: &str) -> Option<Segment> {
@@ -309,9 +315,9 @@ impl Segment {
             Segment::Text => "__TEXT",
             Segment::DataConst => "__DATA_CONST",
             Segment::Data => "__DATA",
-            Segment::Arena => "__BLAZE_ARENA",
-            Segment::Cells => "__BLAZE_CELLS",
-            Segment::Fixed => "__BLAZE_FIXED",
+            Segment::Reserve(Reserve::Arena) => "__BLAZE_ARENA",
+            Segment::Reserve(Reserve::Cells) => "__BLAZE_CELLS",
+            Segment::Reserve(Reserve::Fixed) => "__BLAZE_FIXED",
         }
     }
 
@@ -321,7 +327,7 @@ impl Segment {
             // Written only by the loader, before the program runs.
             Segment::DataConst => Prot::R,
             Segment::Data => Prot::RW,
-            Segment::Arena | Segment::Cells | Segment::Fixed => Prot::NONE,
+            Segment::Reserve(_) => Prot::NONE,
         }
     }
 
@@ -332,7 +338,7 @@ impl Segment {
             // `__DATA_CONST` is written by the loader, which makes it read-only after.
             Segment::DataConst | Segment::Data => macho::VM_PROT_READ.0 | macho::VM_PROT_WRITE.0,
             // The start hook maps over them with `VM_FLAGS_OVERWRITE`, which no `maxprot` limits.
-            Segment::Arena | Segment::Cells | Segment::Fixed => 0,
+            Segment::Reserve(_) => 0,
         }
     }
 }
@@ -349,7 +355,7 @@ fn place(class: &Class) -> (Segment, u8) {
             Some(Segment::Text) => (Segment::Text, 5),
             Some(Segment::DataConst) => (Segment::DataConst, 4),
             Some(Segment::Data) | None => (Segment::Data, 3),
-            Some(reserve @ (Segment::Arena | Segment::Cells | Segment::Fixed)) => (reserve, 0),
+            Some(reserve @ Segment::Reserve(_)) => (reserve, 0),
         },
         Class::Rodata => (Segment::Text, 6),
         Class::Synthetic(_) => (Segment::Text, 7),
@@ -367,9 +373,7 @@ fn place(class: &Class) -> (Segment, u8) {
         Class::Tdata => (Segment::Data, 5),
         Class::Tbss => (Segment::Data, 6),
         Class::Bss => (Segment::Data, 7),
-        Class::Reserve(Reserve::Arena) => (Segment::Arena, 0),
-        Class::Reserve(Reserve::Cells) => (Segment::Cells, 0),
-        Class::Reserve(Reserve::Fixed) => (Segment::Fixed, 0),
+        Class::Reserve(reserve) => (Segment::Reserve(*reserve), 0),
     }
 }
 
@@ -905,7 +909,7 @@ fn page_up(value: u64, page: u64) -> u64 {
 /// [`Segment`] order: where its first region starts, or the page after its last region's room.
 /// A segment with no regions is empty, both where it would start.
 fn segment_bound<const SEGMENT: u8, const END: bool, const PAGE: u64>(regions: &[Region]) -> u64 {
-    let order = |it: &&Region| place(&it.class).0 as u8;
+    let order = |it: &&Region| place(&it.class).0.order();
     let end_of = |it: &Region| page_up(it.addr + it.capacity, PAGE);
     let mine = || regions.iter().filter(|it| order(it) == SEGMENT);
     match (mine().map(|it| it.addr).min(), mine().map(end_of).max()) {
@@ -979,9 +983,8 @@ impl MachO {
             });
         }
         let mut has_tlv = false;
-        for segment in
-            [Segment::Text, Segment::DataConst, Segment::Data, Segment::Arena, Segment::Cells, Segment::Fixed]
-        {
+        let reserves = Reserve::ALL.map(Segment::Reserve);
+        for segment in [Segment::Text, Segment::DataConst, Segment::Data].into_iter().chain(reserves) {
             let regions =
                 || (placed.regions.iter().enumerate()).filter(move |(_, it)| place(&it.class).0 == segment);
             let first = regions().next();
@@ -1006,7 +1009,7 @@ impl MachO {
             };
             let (mut vmend, mut filend) = (start, start);
             let mut zero_seen = None;
-            let mut sections = Vec::with_capacity(if segment.reserves() { 0 } else { regions().count() });
+            let mut sections = Vec::with_capacity(if matches!(segment, Segment::Reserve(_)) { 0 } else { regions().count() });
             for (index, region) in regions() {
                 let end = region.addr + region.capacity;
                 if region.addr < start {
@@ -1057,7 +1060,7 @@ impl MachO {
                     }
                     filend = filend.max(end);
                 }
-                if segment.reserves() {
+                if matches!(segment, Segment::Reserve(_)) {
                     continue;
                 }
                 let offset = match zeroed(&region.class) {
@@ -1086,7 +1089,7 @@ impl MachO {
                 vmsize: vmend - vmaddr,
                 // A segment without file bytes at offset 0, as `__PAGEZERO`: its address less
                 // the base is past the file's end, which dyld refuses.
-                fileoff: if segment.reserves() { 0 } else { vmaddr - base },
+                fileoff: if matches!(segment, Segment::Reserve(_)) { 0 } else { vmaddr - base },
                 filesize,
                 prot: segment.vm_prot(),
                 flags: if segment == Segment::DataConst { macho::SG_READ_ONLY.0 } else { 0 },
@@ -1771,7 +1774,7 @@ impl MachO {
             )));
         }
         let asked = self.output.dev_run.map_or([0; 3], |it| [it.arena, it.cells, it.fixed]);
-        for (reserve, asked) in [Reserve::Arena, Reserve::Cells, Reserve::Fixed].into_iter().zip(asked) {
+        for (reserve, asked) in Reserve::ALL.into_iter().zip(asked) {
             let class = Class::Reserve(reserve);
             let room = (placed.regions.iter())
                 .filter(|it| it.class == class)

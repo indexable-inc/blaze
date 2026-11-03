@@ -218,6 +218,9 @@ struct CrateRun {
     scratch: Scratch,
     work: Work,
     ran: Option<Ran>,
+    /// Of a crate served after a crate graph change: its decoded map's items ([`served_delta`]),
+    /// read by its job for the apply to hand over.
+    served_delta: Option<CrateDelta>,
 }
 
 /// What a crate's job ran: its state, the delta it read, and the cutoff of its region.
@@ -261,6 +264,7 @@ impl CrateRun {
             scratch: state.pass.scratch.pop().unwrap_or_default(),
             work: Work::default(),
             ran: None,
+            served_delta: None,
         }
     }
 }
@@ -268,6 +272,10 @@ impl CrateRun {
 /// A crate's job: its round-0 logs read, and its region run to the cutoff.
 fn read_crate(db: &Db, written: &Written<'_>, run: &mut CrateRun) {
     if run.served {
+        // Read here, not in the apply: the decoded map is a query the apply may not run.
+        if written.crates {
+            run.served_delta = Some(served_delta(db, run.krate));
+        }
         return;
     }
     let krate = run.krate;
@@ -345,14 +353,16 @@ fn finish_crate(
     written: &Written<'_>,
     run: CrateRun,
 ) {
-    let CrateRun { krate, served, old, work, ran, scratch, .. } = run;
+    let CrateRun { krate, served, old, work, ran, scratch, served_delta: run_served, .. } = run;
     state.pass.scratch.push(scratch);
     if served {
         if old.is_some() {
             publish::enter(db, krate, None);
         }
         if written.crates {
-            last.push(served_delta(db, krate));
+            let delta = run_served
+                .unwrap_or_else(|| panic!("nameres delta: crate {krate:?}'s served delta was not read"));
+            last.push(delta);
         }
         return;
     }

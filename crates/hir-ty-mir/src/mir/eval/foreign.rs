@@ -166,7 +166,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     pub fn set_budget(&mut self, budget: ConstEvalBudget) {
         self.budget = budget;
         self.steps_left = budget.steps;
-        self.lint_mark = super::lint_mark(self.limits_frames, budget.steps);
+        self.lint_steps = 0;
     }
 
     /// The steps (basic blocks run) spent of the budget since it was last set.

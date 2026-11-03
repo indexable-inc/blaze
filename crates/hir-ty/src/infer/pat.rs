@@ -1245,9 +1245,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             hashbrown::HashMap::with_capacity_and_hasher_in(fields.len(), FixedState, self.frame);
 
         let mut inexistent_fields = Vec::new_in(self.frame);
-        // Typecheck each field.
+        // Typecheck each field, its name looked up hygienically among the variant's (rustc's
+        // `check_struct_pat_fields`).
         for (field_idx, field) in fields.iter().enumerate() {
-            match used_fields.entry(&field.name) {
+            let hygiene = self.store.record_field_hygiene(field.pat);
+            let name = VariantFields::name_written(self.db, variant, field.name, hygiene);
+            match used_fields.entry(name) {
                 Occupied(_occupied) => {
                     self.push_diagnostic(InferenceDiagnostic::DuplicateField {
                         field: field.pat.into(),
@@ -1258,7 +1261,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     vacant.insert(field_idx);
                 }
             };
-            let field_idx = field_map.get(&field.name).copied();
+            let field_idx = field_map.get(&name).copied();
             let field_ty = match field_idx {
                 Some(field_idx) => {
                     if !self.resolver.is_visible(self.db, variant_fields_vis[field_idx]) {

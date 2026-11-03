@@ -66,7 +66,7 @@ fn a_correct_function_is_proved() {
 
     // The key is the proof's identity: the same function proves to the same key, and lane
     // contracts reads exactly that.
-    let args = hir_ty::attach_db(&db, || GenericArgs::new_from_slice(&[]).store());
+    let args = blaze_query::db::attach(&db, || GenericArgs::new_from_slice(&[]).store());
     assert_eq!(proved(&db, func, args.clone(), Clause::Ensures), Some(key));
     assert_eq!(proved(&db, func, args, Clause::Requires), None, "no call site is lowered yet");
 
@@ -91,7 +91,7 @@ fn a_wrong_ensures_is_refuted_naming_the_clause_and_a_counterexample() {
     // `r == n` always, so every `n` refutes `r == n + 1`: the model names one.
     assert!(matches!(value, Value::Is(_)), "{verdict:?}");
     assert!(verdict.key.is_some(), "a refutation is keyed too, for its cache");
-    let args = hir_ty::attach_db(&db, || GenericArgs::new_from_slice(&[]).store());
+    let args = blaze_query::db::attach(&db, || GenericArgs::new_from_slice(&[]).store());
     assert_eq!(proved(&db, sum_to(&db), args, Clause::Ensures), None);
 }
 

@@ -13,16 +13,16 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use super::{decode, encode, encode_into};
 use crate::{
-    ApiError, Applicability, Artifact, ArtifactKind, Basis, BuildScriptRan, Cached, Cargo,
+    ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope, FactRead, FetchVerb, How, Level,
-    LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch, NodeKind, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, Span,
+    LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch, NodeKind, OpenFailure, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, Span,
     ServedCrate, ServedPart, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
     TestResult, Traced, Ub,
-    UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
+    Unchecked, UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
 };
 
 const REQUESTS: usize = 33;
-const RESPONSES: usize = 41;
+const RESPONSES: usize = 42;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -516,9 +516,10 @@ impl Gen {
                 found: self.wide(),
                 green: self.wide(),
                 links: self.many(depth, |g| Linked {
-                    how: match g.below(3) {
+                    how: match g.below(4) {
                         0 => LinkHow::First,
                         1 => LinkHow::Spliced,
+                        2 => LinkHow::Unchanged,
                         _ => LinkHow::Full { why: g.texts(depth) },
                     },
                     path: g.text(),
@@ -688,6 +689,11 @@ impl Gen {
             37 => Response::Rebuilt(self.rebuilt(depth)),
             38 => Response::Launched { live: self.yes(), env: self.many(depth, |g| (g.text(), g.text())) },
             39 => Response::Stopping { doing: self.text() },
+            40 => Response::Unchecked(Unchecked {
+                open: self.many(depth, |g| OpenFailure { unit: g.text(), checked: g.texts(depth + 1) }),
+                behind: self.many(depth, |g| Behind { why: g.text(), unit: g.text(), units: g.texts(depth + 1) }),
+                stopped: self.yes(),
+            }),
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }  // alloc: test and fuzz reference only
             }
@@ -867,7 +873,8 @@ fn response_index(response: &Response) -> usize {
         Response::Rebuilt(_) => 37,
         Response::Launched { .. } => 38,
         Response::Stopping { .. } => 39,
-        Response::Of { .. } => 40,
+        Response::Unchecked(_) => 40,
+        Response::Of { .. } => 41,
     }
 }
 

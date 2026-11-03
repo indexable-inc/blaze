@@ -272,7 +272,7 @@ fn of_constants(differences: Vec<String>) -> Vec<String> {
 fn a_hit_allocates_only_its_result() {
     let store = Arc::new(Memory::default());
     let (db, _, seven) = kept(&store, Some(BASE), Mode::Serve);
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let item = hir_def::deps::const_key(&db, seven).unwrap();
         store.keep(key(BASE, item), u32_value(8));
         let empty = GenericArgs::empty();
@@ -287,7 +287,7 @@ fn a_hit_allocates_only_its_result() {
 fn what_is_not_kept_is_not_asked() {
     let store = Arc::new(Memory::default());
     let (db, lib, seven) = kept(&store, Some(BASE), Mode::Serve);
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mine = const_named(&db, crate_named(&db, "main"), "MINE");
         assert!(site(&db, mine, GenericArgs::empty()).is_none(), "a workspace member's");
         let args = GenericArgs::new_from_slice(&[default_types().types.u8.into()]);
@@ -301,7 +301,7 @@ fn what_is_not_kept_is_not_asked() {
 fn an_unreadable_kept_value_is_an_error_naming_it() {
     let store = Arc::new(Memory::default());
     let (db, _, seven) = kept(&store, Some(BASE), Mode::Serve);
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let key = key(BASE, hir_def::deps::const_key(&db, seven).unwrap());
         let body = codec::encode(u32_value(7)).unwrap();
         store.put(key, codec::file(ContentId([1; 32]), &body)).unwrap();
@@ -318,7 +318,7 @@ fn an_unreadable_kept_value_is_an_error_naming_it() {
 fn a_recorded_value_is_drained_under_its_key() {
     let store = Arc::new(Memory::default());
     let (db, lib, seven) = kept(&store, None, Mode::Serve);
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let empty = GenericArgs::empty();
         assert_eq!(cached(&db, seven, empty), Ok(None), "a crate checked now has no base yet");
         for _ in 0..3 {
@@ -346,7 +346,7 @@ fn a_recorded_value_is_drained_under_its_key() {
 fn check_mode_records_a_difference_and_verify_serves() {
     let store = Arc::new(Memory::default());
     let (db, _, seven) = kept(&store, Some(BASE), Mode::Check);
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         _ = frozen::differences();
         let key = key(BASE, hir_def::deps::const_key(&db, seven).unwrap());
         store.keep(key, u32_value(8));
@@ -360,7 +360,7 @@ fn check_mode_records_a_difference_and_verify_serves() {
         assert_eq!(drain(&db, &HashMap::new_in(Global)), Ok(Drained::default()), "nothing to keep");
     });
     let (db, _, seven) = kept(&store, Some(BASE), Mode::Verify);
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         assert_eq!(cached(&db, seven, GenericArgs::empty()), Ok(Some(u32_value(8))));
         assert_eq!(of_constants(frozen::differences()), Vec::<String>::new(), "it writes back");
     });

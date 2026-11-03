@@ -158,12 +158,25 @@ pub(crate) enum Segment {
     Rsrc,
     Reloc,
     /// A dev run's reservations, one section each, in [`Reserve`]'s order.
-    Arena,
-    Cells,
-    Fixed,
+    Reserve(Reserve),
 }
 
 impl Segment {
+    /// The section's place in address order: the declaration order, each reservation in
+    /// [`Reserve`]'s order.
+    const fn order(self) -> u8 {
+        match self {
+            Segment::Text => 0,
+            Segment::Rdata => 1,
+            Segment::Data => 2,
+            Segment::Pdata => 3,
+            Segment::Tls => 4,
+            Segment::Rsrc => 5,
+            Segment::Reloc => 6,
+            Segment::Reserve(reserve) => 7 + reserve as u8,
+        }
+    }
+
     pub(crate) fn name(self) -> &'static [u8] {
         match self {
             Segment::Text => b".text",
@@ -173,14 +186,10 @@ impl Segment {
             Segment::Tls => b".tls",
             Segment::Rsrc => b".rsrc",
             Segment::Reloc => b".reloc",
-            Segment::Arena => b".barena",
-            Segment::Cells => b".bcells",
-            Segment::Fixed => b".bfixed",
+            Segment::Reserve(Reserve::Arena) => b".barena",
+            Segment::Reserve(Reserve::Cells) => b".bcells",
+            Segment::Reserve(Reserve::Fixed) => b".bfixed",
         }
-    }
-
-    pub(crate) fn reserve(self) -> bool {
-        matches!(self, Segment::Arena | Segment::Cells | Segment::Fixed)
     }
 }
 
@@ -223,9 +232,7 @@ pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
         Class::Tbss => (Segment::Tls, 1, ""),
         Class::Synthetic(RELOC) => (Segment::Reloc, 0, ""),
         Class::Synthetic(name) => (Segment::Rdata, 8, name),
-        Class::Reserve(Reserve::Arena) => (Segment::Arena, 0, ""),
-        Class::Reserve(Reserve::Cells) => (Segment::Cells, 0, ""),
-        Class::Reserve(Reserve::Fixed) => (Segment::Fixed, 0, ""),
+        Class::Reserve(reserve) => (Segment::Reserve(*reserve), 0, ""),
     }
 }
 
@@ -270,7 +277,7 @@ impl Writer for Pe {
     fn order(&self, classes: &mut Vec<Class>) {
         let rank = |class: &Class| {
             let (segment, rank, _) = place(class);
-            radix::pack_32(segment as u32, u32::from(rank))
+            radix::pack_32(u32::from(segment.order()), u32::from(rank))
         };
         radix::sort_by_key(classes, rank);
         for run in classes.chunk_by_mut(|a, b| rank(a) == rank(b)) {
@@ -287,7 +294,7 @@ impl Writer for Pe {
             Segment::Text => Prot::RX,
             Segment::Data | Segment::Tls => Prot::RW,
             Segment::Rdata | Segment::Pdata | Segment::Rsrc | Segment::Reloc => Prot::R,
-            Segment::Arena | Segment::Cells | Segment::Fixed => Prot::NONE,
+            Segment::Reserve(_) => Prot::NONE,
         }
     }
 

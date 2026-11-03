@@ -1411,20 +1411,27 @@ mod tests {
         {
             let _outer =
                 tracing::info_span!(target: "blaze", "outer", subject = "app::main").entered();
-            let spin = |ms| {
-                let until = Instant::now() + Duration::from_millis(ms);
-                while Instant::now() < until {}
+            // CPU time, not the wall clock's: the phases count CPU, and a loaded machine gives a
+            // thread spinning 2 ms of the wall clock a fraction of that.
+            let spin = |ms: u64| {
+                let until = thread_cpu().expect("the thread's CPU clock reads") + ms * 1_000_000;
+                while thread_cpu().expect("the thread's CPU clock reads") < until {}
             };
             spin(2);
             let _inner = tracing::info_span!(target: "blaze", "inner").entered();
             spin(8);
         }
+        // The wall clock's time of both passes, as this thread saw it: a pass's row is its time
+        // less the passes under it, so the two rows add up to no more than this. A loaded machine
+        // can stretch either spin past the other, so their order is no test of it.
+        let both = Instant::now();
         {
             let _whole = pass("compile");
             blaze_graph::spin::busy(Duration::from_millis(2));
             let _part = pass("regalloc");
             blaze_graph::spin::busy(Duration::from_millis(8));
         }
+        let both_ms = both.elapsed().as_secs_f64() * 1e3;
         step(None);
         write_part();
         let said = put_together(&dir, &[], 0, 1).unwrap();
@@ -1443,7 +1450,8 @@ mod tests {
             let row = passes.lines().find(|it| it.starts_with(&format!("{name}\t"))).unwrap();
             row.split('\t').nth(2).unwrap().parse().unwrap()
         };
-        assert!(ms("compile") >= 1.5 && ms("compile") < ms("regalloc"), "{passes}");
+        assert!(ms("compile") >= 1.5 && ms("regalloc") >= 7.5, "{passes}");
+        assert!(ms("compile") + ms("regalloc") <= both_ms + 0.01, "the passes took {both_ms} ms: {passes}");
         let trace: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("trace.json")).unwrap()).unwrap();
         let names: Vec<&str> = trace["traceEvents"]

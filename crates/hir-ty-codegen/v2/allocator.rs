@@ -59,7 +59,7 @@ pub(super) fn shim(
         let to = match allocator {
             Some(allocator) => {
                 let Some(func) = global_allocator_export(db, allocator, ours) else {
-                    let name = crate::fncache::crate_name(db, allocator);
+                    let name = allocator.named(db);
                     // alloc: the error's message
                     return Err(format!("`#[global_allocator]` of crate `{name}` exports no `{ours}`"));
                 };
@@ -96,7 +96,7 @@ fn forward(forward: Forward) -> HirInstance {
 /// The error of a program with two `#[global_allocator]`s, `a`'s and `b`'s, which names their
 /// crates in order of name: the same message whichever order the crate graph lists them in.
 fn two_allocators(db: &Db, a: Crate, b: Crate) -> String {
-    let mut names = [crate::fncache::crate_name(db, a), crate::fncache::crate_name(db, b)];
+    let mut names = [a.named(db).to_string(), b.named(db).to_string()]; // alloc: the error's names
     names.sort_unstable();
     let [first, second] = names;
     // alloc: the error's message
@@ -114,7 +114,7 @@ fn alloc_error_handler_export(db: &Db, krate: Crate) -> Option<hir_def::Function
 /// `#[alloc_error_handler]` in {} conflicts with allocation error handler in: {}"), naming
 /// their crates in order of name.
 fn two_alloc_error_handlers(db: &Db, a: Crate, b: Crate) -> String {
-    let mut names = [crate::fncache::crate_name(db, a), crate::fncache::crate_name(db, b)];
+    let mut names = [a.named(db).to_string(), b.named(db).to_string()]; // alloc: the error's names
     names.sort_unstable();
     let [first, second] = names;
     // alloc: the error's message
@@ -141,7 +141,7 @@ pub fn allocations_unobserved(db: &Db, krate: Crate) -> Result<bool, String> {
         return Err(two_allocators(db, allocator, other));
     }
     let kept = |what: &str| {
-        let name = crate::fncache::crate_name(db, allocator);
+        let name = allocator.named(db);
         tracing::info!(
             target: "blaze",
             "heap_to_stack: every allocation is kept: the `#[global_allocator]` of crate `{name}` {what}"

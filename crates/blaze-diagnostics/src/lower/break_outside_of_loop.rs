@@ -691,7 +691,7 @@ pub(crate) mod tests {
     pub(crate) fn with_file(source: &str, check: impl for<'db> FnOnce(&Cx<'_, 'db>, InFile<ast::Node<'db>>)) {
         let checked = crate::tests::checked(&format!("//- /main.rs crate:main\n{source}"));
         let db = &checked.db;
-        hir::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let krate = hir::check::workspace_crates(db)[0];
             let frame = crate::tests::frame();
             let cx = Cx::new(db, krate, checked.files(), &frame);

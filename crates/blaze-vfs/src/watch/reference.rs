@@ -249,7 +249,7 @@ impl Watcher {
         effects.push(Effect::Journal { dir: self.dir.clone(), since, tag: Tag(self.tags) });
         if since == Cursor::None {
             // clone: once per watch.
-            self.rescan(vfs, self.dir.clone(), effects);
+            self.rescan(vfs, &self.dir.clone(), effects);
         }
     }
 
@@ -339,7 +339,7 @@ impl Watcher {
         let pending = self.take(completion.tag);
         match (pending, completion.done) {
             (Pending::Stamp(number), Done::Stamped(stamps)) => {
-                self.stamped(vfs, number, stamps, effects, &mut out);
+                self.stamped(vfs, number, &stamps, effects, &mut out);
             }
             (Pending::Entries(number, dir), Done::Entries(entries)) => {
                 self.listed(vfs, number, &dir, entries, effects);
@@ -420,7 +420,7 @@ impl Watcher {
             out.push(Watched::Lost { path, why });
             match why {
                 Lost::Unnamed => self.relist(vfs, under, effects),
-                _ => self.rescan(vfs, under, effects),
+                _ => self.rescan(vfs, &under, effects),
             }
         }
         let was = self.caught_up;
@@ -462,8 +462,8 @@ impl Watcher {
     /// stamped, and the directories whose stamp moved are listed. The column's names are swept
     /// as they are ([`Batch::names`]); of the head, only what changed since the column held all
     /// of it is added (all of it when the column never did).
-    pub fn rescan(&mut self, vfs: &Vfs, under: FileName, effects: &mut Vec<Effect>) {
-        let Some(root) = self.rel(&under).map(str::to_owned) else { return };
+    pub fn rescan(&mut self, vfs: &Vfs, under: &FileName, effects: &mut Vec<Effect>) {
+        let Some(root) = self.rel(under).map(str::to_owned) else { return };
         let head = self.head_root(vfs);
         let disk = self.disk(vfs);
         // clone: once per rescan.
@@ -593,7 +593,7 @@ impl Watcher {
         &mut self,
         vfs: &Vfs,
         number: u64,
-        stamps: Vec<Stamp>,
+        stamps: &[Stamp],
         effects: &mut Vec<Effect>,
         out: &mut Vec<Watched>,
     ) {
@@ -785,7 +785,7 @@ impl Watcher {
             }
         }
         for under in rescans {
-            self.rescan(vfs, under, effects);
+            self.rescan(vfs, &under, effects);
         }
     }
 
@@ -808,7 +808,7 @@ impl Watcher {
                 // alloc: per changed path, beside its read and hash.
                 let path = self.rel(&file).expect("a slot's name is under the directory").to_owned();
                 out.push(Watched::Lost { path, why: Lost::Rescan });
-                self.rescan(vfs, file, effects);
+                self.rescan(vfs, &file, effects);
             }
         }
         if self.batches.is_empty() {

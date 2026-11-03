@@ -125,7 +125,7 @@ impl<'db> Expander<'db> {
             );
             let path = macro_call.value.path().and_then(|path| {
                 let range = path.syntax().text_range();
-                let mod_path = ModPath::from_src_view(db, path, &mut |range| {
+                let mod_path = ModPath::from_src_view_with_contexts(db, path, &mut |range| {
                     this.span_map.span_for_range(range).ctx
                 })?;
                 let call_site = this.span_map.span_for_range(range);
@@ -148,7 +148,7 @@ impl<'db> Expander<'db> {
                 krate,
                 this.macro_depth + 1,
                 this.recursion_limit,
-                |path| resolver(path, call_site.ctx).map(|it| it.definition(db)),
+                |path, ctxt| resolver(path, ctxt).map(|it| it.definition(db)),
                 eager_calls,
             ) {
                 Ok(call_id) => call_id,

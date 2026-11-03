@@ -96,7 +96,7 @@ pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: Conf
             if defs.is_empty() && !entry.allow_invalid {
                 let found = resolve(db, krate, &entry.path);
                 errors.push(match found.first() {
-                    None => format!("`{}` of `{}` does not refer to an item `{}` can name", entry.path, kind.key(), crate_name(db, krate)),
+                    None => format!("`{}` of `{}` does not refer to an item `{}` can name", entry.path, kind.key(), krate.base().named(db)),
                     Some(_) => format!("`{}` of `{}` is not a {}", entry.path, kind.key(), kind_name(kind)),
                 });
             }
@@ -144,10 +144,6 @@ pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: Conf
     resolved.entries = entries.into_boxed_slice();
     resolved.errors = errors.into_boxed_slice();
     resolved
-}
-
-fn crate_name(db: &base_db::Db, krate: hir::Crate) -> String {
-    krate.display_name(db).map_or_else(|| "the crate".to_owned(), |it| it.to_string())
 }
 
 const fn kind_name(kind: Kind) -> &'static str {
@@ -372,7 +368,7 @@ fn unfixable(cx: &Cx<'_, '_>, entry: &Entry) -> Option<String> {
     }
     if entry.replacement.is_none() {
         let first = replacement.split("::").next().unwrap_or(replacement);
-        let krate = crate_name(cx.db(), cx.krate());
+        let krate = cx.krate().base().named(cx.db());
         return Some(format!(
             "`{replacement}` does not refer to an item `{krate}` can name: add `{first}` to its `[dependencies]`, and `blaze check --fix` makes this"
         ));

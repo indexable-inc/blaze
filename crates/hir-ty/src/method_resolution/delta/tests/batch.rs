@@ -175,7 +175,7 @@ fn a_sweep_of_a_diamond_reads_each_crate_after_all_it_depends_on() {
         let first = |krate| read.iter().position(|&it| it == crate_def_map(db, krate).root_module_id());
         let mut failures = String::new();
         for &krate in crates.iter() {
-            let name = hir_def::span_names::crate_name(db, krate);
+            let name = krate.named(db);
             let Some(at) = first(krate) else { panic!("{order:?}: crate {name}'s parts are never read: {read:?}") };
             for dep in &krate.data(db).dependencies {
                 let dep_at = first(dep.crate_id).unwrap_or(usize::MAX);
@@ -369,7 +369,7 @@ fn a_batched_crates_elided_header_lifetimes_lower_once_a_write() {
     let db = &loaded.db;
     let krate = *all_crates(db).iter().find(|it| it.data(db).root_file_id == dep).expect("the library");
     let mut failures = String::new();
-    crate::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let interner = crate::next_solver::DbInterner::new_no_crate(db);
         for (_, module) in crate_def_map(db, krate).modules(db) {
             for imp in module.scope(db).impls() {

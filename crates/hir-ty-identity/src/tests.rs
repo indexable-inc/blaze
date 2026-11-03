@@ -84,14 +84,14 @@ fn instance(db: &Db, name: &str) -> Instance {
 }
 
 fn identity(db: &Db, name: &str, compiled: Compiled) -> CompileIdentity {
-    hir_ty::attach_db(db, || match instance_identity(db, &instance(db, name), &env(db), compiled) {
+    blaze_query::db::attach(db, || match instance_identity(db, &instance(db, name), &env(db), compiled) {
         Ok(it) => *it,
         Err(error) => panic!("`{name}` has no identity: {error}"),
     })
 }
 
 fn step(db: &Db, name: &str) -> CodeId {
-    hir_ty::attach_db(db, || match code_id(db, &instance(db, name), &env(db)) {
+    blaze_query::db::attach(db, || match code_id(db, &instance(db, name), &env(db)) {
         Ok(it) => it,
         Err(error) => panic!("`{name}` has no CodeId: {error}"),
     })
@@ -169,7 +169,7 @@ fn a_field_added_to_a_struct_whose_size_is_read_changes_the_identity() {
 
 /// Whether a release unit's MIR of the function `name` has a callee inlined into it.
 fn inlines(db: &Db, name: &str) -> bool {
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let owner = MirOwner::Body(function(db, name).into());
         let body = monomorphized_mir_at(
             db,
@@ -298,7 +298,7 @@ fn a_for_const_instance_is_keyed_by_its_fields_names() {
     let named_a = program("/src/lib.rs", &text("a"));
     let named_b = program("/src/lib.rs", &text("b"));
     let keyed = |db: &Db| {
-        hir_ty::attach_db(db, || {
+        blaze_query::db::attach(db, || {
             let s = struct_ty(db, "S");
             let instance = Instance {
                 subject: Subject::Body(Body::Fn(function(db, "debug"))),
@@ -637,7 +637,7 @@ struct Evaluated {
 fn evaluated(db: &Db, name: &str) -> Evaluated {
     use hir_ty::db::HirDatabase as _;
     let id = impl_const(db, name);
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let value = db.const_eval(id, GenericArgs::empty(), None).unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
         let map = &value.memory_map;
         let (pieces, statics) = match map {
@@ -759,7 +759,7 @@ pub fn run(x: u32) -> u32 {{ walk(&F(x)) }}
 
 /// Every identity of `walk::<F>` in a program of [`rpitit`]'s.
 fn walk_of_f(db: &Db) -> (CompileIdentity, CompileIdentity, CodeId) {
-    hir_ty::attach_db(db, || {
+    blaze_query::db::attach(db, || {
         let instance = Instance {
             subject: Subject::Body(Body::Fn(function(db, "walk"))),
             args: GenericArgs::new_from_slice(&[struct_ty(db, "F").into()]).store(),
@@ -793,4 +793,80 @@ fn an_impls_hidden_type_for_a_trait_methods_impl_trait_is_in_its_callers_identit
         assert_ne!(code, walk.2, "{other}: behaviour identity of `walk::<F>`");
         assert_ne!(step(&db, "run"), run, "{other}: behaviour identity of `run`");
     }
+}
+
+/// A trait method's `impl Trait` inside a tuple, an enum or a reference is the impl's once
+/// the implementing type is known, and that one's hidden type is revealed: `walk::<F>` has an
+/// identity, and the impl's hidden type is in it.
+#[test]
+fn an_impls_impl_trait_nested_in_a_trait_methods_return_type_is_revealed() {
+    let nested = |hidden: &str| {
+        program(
+            "/src/lib.rs",
+            &format!(
+                "pub enum Opt<T> {{ Some(T), None }}
+pub trait Gen {{ fn get(&mut self) -> u32; }}
+pub struct Small(u32);
+impl Gen for Small {{ fn get(&mut self) -> u32 {{ self.0 }} }}
+pub struct Wide(u64, u64);
+impl Gen for Wide {{ fn get(&mut self) -> u32 {{ self.1 as u32 }} }}
+pub trait G {{
+    fn roots(&self) -> (u8, impl Gen);
+    fn maybe(&self) -> Opt<impl Gen>;
+    fn held(&self) -> &impl Sized;
+}}
+pub struct F(u32);
+impl G for F {{
+    fn roots(&self) -> (u8, impl Gen) {{ (1, {hidden}) }}
+    fn maybe(&self) -> Opt<impl Gen> {{ Opt::Some({hidden}) }}
+    fn held(&self) -> &impl Sized {{ &self.0 }}
+}}
+fn walk<T: G>(g: &T) -> u32 {{
+    let (_, mut it) = g.roots();
+    let _m = g.maybe();
+    let _h = g.held();
+    it.get()
+}}
+pub fn run(x: u32) -> u32 {{ walk(&F(x)) }}
+"
+            ),
+        )
+    };
+    let small = walk_of_f(&nested("Small(self.0)"));
+    let wide = walk_of_f(&nested("Wide(1, self.0 as u64)"));
+    assert_ne!(small.0, wide.0, "debug identity covers the impl's hidden type");
+    assert_ne!(small.2, wide.2, "CodeId covers the impl's hidden type");
+}
+
+/// An `impl Trait` in the bounds of another (`impl Src<Out = impl Gen>`, rustc's
+/// `nested-rpitit.rs`): a generic caller reaches it only through the outer one's bounds, and
+/// once the implementing type is known it is the type the impl's outer type gives it there
+/// (`hir_ty::rpitit::impl_rpitit_tys`), so `walk::<F>` has an identity and it covers that type.
+#[test]
+fn an_impl_trait_in_the_bounds_of_another_is_revealed_through_them() {
+    let nested = |ty: &str, value: &str| {
+        program(
+            "/src/lib.rs",
+            &format!(
+                "pub trait Gen {{ fn get(&mut self) -> u32; }}
+pub struct Small(u32);
+impl Gen for Small {{ fn get(&mut self) -> u32 {{ self.0 }} }}
+pub struct Wide(u64, u64);
+impl Gen for Wide {{ fn get(&mut self) -> u32 {{ self.1 as u32 }} }}
+pub trait Src {{ type Out; fn take(self) -> Self::Out; }}
+pub struct One<T>(T);
+impl<T> Src for One<T> {{ type Out = T; fn take(self) -> T {{ self.0 }} }}
+pub trait G {{ fn items(&self) -> impl Src<Out = impl Gen>; }}
+pub struct F(u32);
+impl G for F {{ fn items(&self) -> One<{ty}> {{ One({value}) }} }}
+fn walk<T: G>(g: &T) -> u32 {{ let mut x = g.items().take(); x.get() }}
+pub fn run(x: u32) -> u32 {{ walk(&F(x)) }}
+"
+            ),
+        )
+    };
+    let small = walk_of_f(&nested("Small", "Small(self.0)"));
+    let wide = walk_of_f(&nested("Wide", "Wide(1, self.0 as u64)"));
+    assert_ne!(small.0, wide.0, "debug identity covers the nested `impl Trait`'s type");
+    assert_ne!(small.2, wide.2, "CodeId covers the nested `impl Trait`'s type");
 }

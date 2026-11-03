@@ -131,7 +131,7 @@ pub(crate) fn slot_name(db: &Db, krate: Crate) -> SlotName {
         maintainer: super::state::NAME,
         what: "the impl directory",
         // alloc: a crate's slot's name, once per crate first maintained
-        of: format!("crate {}", hir_def::span_names::crate_name(db, krate)).into_boxed_str(),
+        of: format!("crate {}", krate.named(db)).into_boxed_str(),
     }
 }
 

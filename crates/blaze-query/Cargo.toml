@@ -27,6 +27,7 @@ blaze-query-macros.workspace = true
 blaze-reclaim.workspace = true
 blaze-serde.workspace = true
 blaze-vfs.workspace = true
+crossbeam-queue.workspace = true
 either.workspace = true
 hashbrown.workspace = true
 indexmap.workspace = true

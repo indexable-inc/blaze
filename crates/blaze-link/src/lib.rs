@@ -309,6 +309,14 @@ impl Image {
             // alloc: error path
             return Err(fail(format!("live patching of {:?} images", output.format)));
         }
+        if output.incremental && plan.indexed_code {
+            // alloc: error path
+            return Err(fail(format!(
+                "{to}: an incremental {:?} image: its code is reached by index and its file written whole, so it \
+                 keeps no room and is laid out whole each link (`target::output` makes it so)",
+                output.format
+            )));
+        }
         if let Some(dev_run) = &output.dev_run {
             dev_run_fits(&output, dev_run, &plan, &writer).map_err(fail)?;
         }

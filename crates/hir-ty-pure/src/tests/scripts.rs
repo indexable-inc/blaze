@@ -24,7 +24,7 @@ fn script(crates: &str) -> (Db, FunctionId) {
 #[track_caller]
 fn purity_of(crates: &str) -> Purity {
     let (db, main) = script(crates);
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         // Every fixture is a test of the summaries' keys: through its home or in the script,
         // each instance's summary is the same (hir_ty_mir::mir::home).
         super::share::keys_agree(&db, crate_named(&db, "build_script"));
@@ -473,7 +473,7 @@ fn main() {
 fn same_parts(a: &str, b: &str, how: &str) {
     let parts = |crates: &str| {
         let (db, main) = script(crates);
-        hir_ty::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             let main_body = blaze_item_hash::identity::identity_parts(&db, main.into());
             (main_body, crate::walk::identity_parts(&db, main))
         })

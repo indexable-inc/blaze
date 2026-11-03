@@ -192,6 +192,58 @@ fn type_name() {
     );
 }
 
+/// An item written in a body is named after what the body is of, as rustc's `type_name` writes
+/// it: the function with none of its own generic arguments, the `impl` it is in with its own
+/// parameters, each `_`, a `const _` as `_`, and every closure on the way `{{closure}}`. serde's
+/// derives write `__Field` so, in a generic `fn deserialize` of an `impl` in a `const _`. Each
+/// expected name is what nightly-2026-10-27 prints for the same program.
+#[test]
+fn type_name_of_an_item_in_a_body_of_a_trait_impl_in_const_underscore() {
+    const ITEMS: &str = r#"
+        //- minicore: fn
+        #[rustc_intrinsic]
+        pub fn type_name<T: ?Sized>() -> &'static str;
+
+        pub trait De<'de>: Sized { fn de<D>(d: D) -> &'static str; fn lt<D>(d: D) -> &'static str; }
+        pub trait Tr {
+            fn names() -> &'static str;
+            fn provided() -> &'static str { struct P; type_name::<P>() }
+        }
+        pub struct Foo;
+        pub struct G<T>(T);
+        const _: () = {
+            impl<'de> De<'de> for Foo {
+                fn de<D>(_d: D) -> &'static str {
+                    enum __Field { A }
+                    type_name::<__Field>()
+                }
+                fn lt<D>(_d: D) -> &'static str {
+                    struct __Visitor<'de> { de: &'de () }
+                    let c = || { struct InClosure; type_name::<(InClosure, __Visitor<'de>)>() };
+                    c()
+                }
+            }
+        };
+        impl<T> Tr for G<T> { fn names() -> &'static str { struct S<U>(U); type_name::<S<u8>>() } }
+    "#;
+    let impl_ = "ra_test_fixture::_::<impl ra_test_fixture::De<'_> for ra_test_fixture::Foo>";
+    let cases = [
+        ("<Foo as De<'static>>::de(0u8)", format!("{impl_}::de::__Field")),
+        (
+            "<Foo as De<'static>>::lt(0u8)",
+            format!("({impl_}::lt::{{{{closure}}}}::InClosure, {impl_}::lt::__Visitor<'_>)"),
+        ),
+        (
+            "<G<u8> as Tr>::names()",
+            "<ra_test_fixture::G<_> as ra_test_fixture::Tr>::names::S<u8>".to_owned(),
+        ),
+        ("<G<u8> as Tr>::provided()", "ra_test_fixture::Tr::provided::P".to_owned()),
+    ];
+    for (goal, name) in cases {
+        check_str(&format!("{}\n        const GOAL: &str = {goal};\n", ITEMS.trim_end()), &name);
+    }
+}
+
 const TYPE_INFO: &str = r#"
     //- minicore: option, send, slice, matches, phantom_data
     #![feature(lang_items)]

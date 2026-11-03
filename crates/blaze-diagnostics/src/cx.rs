@@ -272,12 +272,13 @@ impl<'a, 'db> Cx<'a, 'db> {
         self.db.file_text(file).text(self.db)
     }
 
-    /// rustc's `tcx.crate_name`: the crate's name (`--crate-name`), else its root file's stem
-    /// with `-` as `_`.
+    /// rustc's `tcx.crate_name`: the crate's name (`--crate-name`, [`base_db::Crate::rust_name`]),
+    /// else, as rustc names a crate built with none, its root file's stem with `-` as `_`. Not
+    /// [`base_db::Crate::named`]: a diagnostic says what rustc says of the file it was given.
     pub(crate) fn crate_name(&self, krate: hir::Crate) -> String {
-        match krate.display_name(self.db) {
-            Some(name) => name.crate_name().to_string(), // alloc: the error's text, for an error hir found
-            None => {
+        match krate.base().rust_name(self.db) {
+            Ok(name) => name.as_str().to_owned(), // alloc: the error's text, for an error hir found
+            Err(_) => {
                 let path = self.file_name(krate.root_file(self.db));
                 let stem = path.rsplit('/').next().unwrap_or(&path);
                 stem.strip_suffix(".rs").unwrap_or(stem).replace('-', "_")

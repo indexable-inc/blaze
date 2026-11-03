@@ -58,7 +58,7 @@ fn reference(store: &ExpressionStore, pat: PatId, mode: impl Fn(PatId) -> Option
 #[test]
 fn a_pattern_binds_by_ref_mut_as_both_old_copies_said() {
     let db = fixture::db(FIXTURE).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let def = DefWithBodyId::FunctionId(function(&db, "f"));
         let body = Body::of(&db, def);
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));

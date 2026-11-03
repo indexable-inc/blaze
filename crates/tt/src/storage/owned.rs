@@ -2,8 +2,9 @@
 //! allocator is, so that a view ([`crate::TokenTreesView`]) stays one non-generic pointer.
 #![allow(unsafe_code)]
 
+use blaze_mem::Kept;
 use std::{
-    alloc::{Allocator, Global},
+    alloc::Allocator,
     mem::ManuallyDrop,
     ops::Deref,
     ptr::NonNull,
@@ -54,9 +55,10 @@ impl Tree {
     }
 }
 
-/// A token tree: its block in `A` (the global allocator for a tree that is kept, a task's
-/// `Frame` for one that is a temporary of the task), read through [`Tree`].
-pub struct TopSubtree<A: Allocator = Global> {
+/// A token tree: its block in `A` ([`Kept`] under [`blaze_mem::Tag::Expand`] for a tree that is
+/// kept, a query's result that dies when it is replaced or evicted; a task's `Frame` for one
+/// that is a temporary of the task), read through [`Tree`].
+pub struct TopSubtree<A: Allocator = Kept> {
     tree: Tree,
     alloc: ManuallyDrop<A>,
 }

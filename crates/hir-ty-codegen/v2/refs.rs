@@ -202,7 +202,7 @@ fn memo<'db>(
     match walked {
         Ok(walked) => Ok(Some(walked)),
         // alloc: the error's message
-        Err(what) => Err(hir_ty::attach_db(db, || format!("the references of {}: {what}", super::Named(db, instance)))),
+        Err(what) => Err(blaze_query::db::attach(db, || format!("the references of {}: {what}", super::Named(db, instance)))),
     }
 }
 
@@ -1800,7 +1800,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     fn start_shim(&mut self, main: FunctionId) -> Result<(), String> {
         let interner = self.fx.interner;
         let Some(start) = interner.lang_items().Start else {
-            let krate = crate::fncache::crate_name(self.db(), main.krate(self.db()));
+            let krate = main.krate(self.db()).named(self.db());
             // alloc: the error's message
             return Err(format!(
                 "the C `main` of crate `{krate}`: no `start` lang item (std's `lang_start`) in \

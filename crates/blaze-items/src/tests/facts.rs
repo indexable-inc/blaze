@@ -400,7 +400,7 @@ fn a_type_and_a_const_of_one_name_are_one_run() {
     let t = item_key(&db, ItemId::Trait(trait_(&db, "T")));
     let at = |name: &str| {
         let key = ScopeIndexKey { scope: t, name: key::name_hash(name) };
-        hir_ty::attach_db(&db, || scope(&db, key)).unwrap()
+        blaze_query::db::attach(&db, || scope(&db, key)).unwrap()
     };
     let ScopeEntry::Assoc(items) = at("X") else { panic!("`X` is not an associated item") };
     assert_eq!(items.len(), 2);

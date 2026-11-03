@@ -424,7 +424,7 @@ fn run(program: &str, name: &str) -> Run {
     let fx = fixture::db(&fixture(program));
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let func = function(&db, name);
         let (plain, plain_out, _) = run_function(&db, func, Plain);
         let (recorded, recorded_out, recorder) = run_function(&db, func, Recorder::default());

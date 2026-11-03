@@ -104,6 +104,84 @@ unsafe fn parked(_: NonNull<Header>) {
     unreachable!("a parked job resumes through its pool's host");
 }
 
+/// What a turn of a driven worker ([`Driven::turn`]) came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Turn {
+    /// It ran a job, to its end or its park.
+    Ran,
+    /// It found nothing to run and sleeps, marked so as a parked worker is: the pool's own
+    /// queueing of a job wakes it, to search at its next turn.
+    Idle,
+    /// Its loop returned: the pool stopped and every job was run.
+    Ended,
+}
+
+/// A pool worker with no thread of its own (todo/bootstrap/plan.md, "One thread"): the pool's
+/// one worker loop ([`crate::pool`]'s `work`) on a fiber of this layer, which the thread that
+/// made the pool resumes as it waits ([`Driven::turn`]), and which switches back to it after
+/// each job it ran and wherever a worker with a thread would park. So a target without threads
+/// runs the same loop, queues, fibers and waits as every other; only who runs the loop differs.
+///
+/// Rule 24 holds by construction: a driven worker and every job it runs are on the one thread
+/// that drives it, which is the thread that made the pool ([`crate::pool::Pool::driven`]). Once
+/// the seed has threads (`blaze_seed.thread_spawn`, plan.md "Next: a multi-threaded seed"), its
+/// pools start a thread per worker as on native, and a thread's thread-locals are its own: a
+/// parked job's carried values move with it ([`super::fiber::carry`]) and nothing else of a
+/// thread is held across a wait, so a job resumed on another worker's thread finds that thread's
+/// own, as on native.
+pub(crate) struct Driven {
+    fiber: Stackful<(), Turn>,
+    number: u32,
+    ended: bool,
+}
+
+/// A driven worker's handle on its own fiber, given to its loop: [`Turns::give`] switches back
+/// to the thread that drives it.
+pub(crate) struct Turns<'a>(&'a Yielder<(), Turn>);
+
+impl Turns<'_> {
+    /// Gives the turn back with `turn`; returns at the worker's next turn.
+    pub(crate) fn give(&self, turn: Turn) {
+        debug_assert!(turn != Turn::Ended, "a driven worker ends by returning");
+        self.0.suspend(turn);
+    }
+}
+
+impl Driven {
+    /// A worker whose loop is `work`, started at its first [`Driven::turn`].
+    ///
+    /// # Panics
+    ///
+    /// Where no fiber's stack can be had, naming its size.
+    pub(crate) fn new(work: impl FnOnce(&Turns<'_>) + 'static) -> Driven {
+        let stack = Stack::new(FIBER_STACK)
+            .unwrap_or_else(|why| panic!("a driven pool worker's fiber stack of {FIBER_STACK} bytes: {why}"));
+        let number = super::fiber::next_fiber();
+        let fiber = Stackful::new(stack, number, move |yielder: &Yielder<(), Turn>, ()| work(&Turns(yielder)));
+        Driven { fiber, number, ended: false }
+    }
+
+    /// Runs the worker until it ran a job, found nothing, or its loop returned.
+    ///
+    /// # Panics
+    ///
+    /// For a worker whose loop returned, naming its fiber.
+    pub(crate) fn turn(&mut self) -> Turn {
+        assert!(!self.ended, "driven worker on fiber {} was given a turn after its loop returned", self.number);
+        match self.fiber.resume(()) {
+            Resumed::Yield(turn) => turn,
+            Resumed::Return => {
+                self.ended = true;
+                Turn::Ended
+            }
+        }
+    }
+
+    pub(crate) fn ended(&self) -> bool {
+        self.ended
+    }
+}
+
 /// A pool joins the scheduler: a member of its own placement, whose woken jobs `wake(ctx,
 /// token)` takes back, `token` the address of the job's header (a [`Job`] to queue). `wake` is
 /// called under the scheduler's lock: it must not call into the scheduler.
@@ -117,9 +195,9 @@ pub(crate) fn join_pool(wake: fn(usize, usize), idle: fn(usize) -> bool, ctx: us
     member
 }
 
-/// Jobs a stall woke that were not told yet ([`World::stall`]): while 0, a wait that ends
-/// asks nothing more.
-static STALLED: crate::sync::atomic::AtomicUsize = crate::sync::atomic::AtomicUsize::new(0);
+/// Jobs a stall ([`World::stall`]) or a pool's stop ([`World::stop_own`]) woke to fail that
+/// were not told yet: while 0, a wait that ends asks nothing more.
+static FAILING: crate::sync::atomic::AtomicUsize = crate::sync::atomic::AtomicUsize::new(0);
 
 /// A pool's last awake worker found it idle a while with jobs parked: if every pool is idle
 /// and no wait in the graph can end ([`World::stall`]), every waiting job wakes to fail with
@@ -127,14 +205,17 @@ static STALLED: crate::sync::atomic::AtomicUsize = crate::sync::atomic::AtomicUs
 ///
 /// The threads on no fiber (the clients) may end what they claimed at any time, so a wait on
 /// one of those is no stall here; [`stall_while_quiet`] is the check for once they are still.
-pub(crate) fn check_stall() {
+///
+/// Whether it woke any: a driven pool's thread ([`crate::pool::block_until`]) runs them next.
+pub(crate) fn check_stall() -> bool {
     let mut g = global();
     if !pools_idle(&g) {
-        return;
+        return false;
     }
     let clients = g.clients;
     let woke = g.world.stall(clients, false);
-    woke_stalled(&mut g, woke);
+    woke_failing(&mut g, woke);
+    woke != 0
 }
 
 /// Whether every pool's workers sleep with nothing queued, under the scheduler's lock.
@@ -142,10 +223,38 @@ fn pools_idle(g: &Global) -> bool {
     g.own.iter().flatten().all(|io| io.idle.is_none_or(|idle| idle(io.ctx)))
 }
 
-fn woke_stalled(g: &mut Global, woke: usize) {
+fn woke_failing(g: &mut Global, woke: usize) {
     if woke != 0 {
-        STALLED.fetch_add(woke, crate::sync::atomic::Ordering::Release);
+        FAILING.fetch_add(woke, crate::sync::atomic::Ordering::Release);
         dispatch_global(g, None);
+    }
+}
+
+/// The pool of `member` stops, and wakes its parked jobs that can never wake now, each to fail
+/// with a [`super::Stopped`] naming its wait, as [`World::stop_own`] says which: their pool
+/// queues them, and its workers run them to their failure. How many woke.
+pub(crate) fn stop_pool(member: u32, reason: super::StopReason) -> usize {
+    let mut g = global();
+    let woke = g.world.stop_own(member, reason);
+    woke_failing(&mut g, woke);
+    woke
+}
+
+/// The jobs of the pool of `member` that wait in the graph now, and what on.
+pub(crate) fn waits_of(member: u32) -> super::Waits {
+    global().world.waits_of(member)
+}
+
+/// The job this thread runs in the wait graph, if it joined it: its fiber's job, or the
+/// thread's own as a client. Never joins it: a thread that never claimed or waited holds
+/// nothing a wait could lead to. Not inlined: it reads thread-locals (rule 24).
+#[inline(never)]
+pub(crate) fn job_in_graph() -> Option<JobId> {
+    match HERE.get() {
+        Some(here) => (here.job != UNREGISTERED).then_some(here.job),
+        // A thread whose locals are going (a pool dropped as its thread ends) is in the graph
+        // no more: its client left it as it went.
+        None => CLIENT.try_with(|client| client.job.get()).ok().filter(|&job| job != UNREGISTERED),
     }
 }
 
@@ -174,7 +283,7 @@ pub fn stall_while_quiet() -> Option<super::Waits> {
     }
     // alloc: a stall's report, once
     let waits = super::Waits(g.world.stuck_waits().to_vec());
-    woke_stalled(&mut g, woke);
+    woke_failing(&mut g, woke);
     Some(waits)
 }
 
@@ -184,17 +293,18 @@ pub fn waits_now() -> super::Waits {
     global().world.waits()
 }
 
-/// A wait of `job` ended: if a stall ended it, the job fails with the stall, here.
+/// A wait of `job` ended: if a stall or its pool's stop ended it, the job fails with that,
+/// here.
 #[inline(never)]
 fn fail_if_stalled(job: JobId) {
-    if STALLED.load(crate::sync::atomic::Ordering::Acquire) == 0 {
+    if FAILING.load(crate::sync::atomic::Ordering::Acquire) == 0 {
         return;
     }
-    let stalled = global().world.take_stall(job);
-    if let Some((stalled, scope)) = stalled {
-        STALLED.fetch_sub(1, crate::sync::atomic::Ordering::AcqRel);
+    let failed = global().world.take_failed(job);
+    if let Some((failed, scope)) = failed {
+        FAILING.fetch_sub(1, crate::sync::atomic::Ordering::AcqRel);
         with_scope(|it| it.set(scope.map_or(super::NONE, |it| it.0)));
-        panic!("{stalled}");
+        panic!("{failed}");
     }
 }
 
@@ -256,6 +366,13 @@ fn core() -> u32 {
     CORE.get()
 }
 
+/// Makes `core` the pool worker this thread is, giving back the one it was: a driven worker
+/// ([`Driven`]) is its thread's worker only during its turn.
+#[inline(never)]
+pub(crate) fn swap_core(core: u32) -> u32 {
+    CORE.replace(core)
+}
+
 /// A pool job begins on this thread's fiber, given to the pool as `given` says
 /// ([`super::fiber::spawner`]): its lifetime starts here, not at the claim or wait that joins
 /// it to the graph later, if ever. Nothing on a thread that is no pool worker's fiber, or for a
@@ -280,7 +397,7 @@ pub(crate) fn idle(began: bool) {
 /// life, as its switches name it. Takes the scheduler's lock: for a profiler naming a job it
 /// does not run (a wait's owner), not for every switch.
 pub fn observed(job: JobId) -> u64 {
-    u64::from(global().world.generation(job)) << 32 | u64::from(job.0)
+    global().world.observed(job)
 }
 
 /// A pool worker's fibers: the jobs it takes run on them.
@@ -684,9 +801,8 @@ fn client_wait(on: Wait) -> Result<(), Cycle> {
             }
             job
         };
-        while !client.woken.load(Ordering::Acquire) {
-            thread::park();
-        }
+        // The thread runs the jobs of the pools it drives meanwhile, else parks.
+        crate::pool::block_until(&|| client.woken.load(Ordering::Acquire));
         fail_if_stalled(job);
         Ok(())
     })
@@ -712,6 +828,81 @@ pub fn wait(on: Wait) -> Result<(), Cycle> {
         Some(here) => unsafe { (here.wait)(here.cx, on) },
         None => client_wait(on),
     }
+}
+
+/// This thread's job gave way: its wait for `flight`, the scheduler's flight of the run of
+/// `asked` (which the caller names `named`), closed `cycle` (whose first job is this one, and
+/// second the run's). Its next [`before_claim`] waits for that run to end ([`super::giveway`]).
+pub(crate) fn gave_way_on(asked: Key, named: Box<str>, flight: Key, cycle: &Cycle) {
+    let Some(&job) = cycle.jobs.first() else { return };
+    let to = cycle.jobs.get(1).copied().unwrap_or(job);
+    global().world.gave_way(job, asked, named, flight, to);
+    set_retry(true);
+}
+
+/// A loop caught this thread's job's give-way to run its item again later, and goes on to
+/// another item: that give-way is taken back from its streak ([`super::GaveWay::set_aside`]).
+/// Not inlined: the thread-local is read anew at each call (rule 24).
+#[inline(never)]
+pub(crate) fn set_give_way_aside() {
+    // Only a give-way this job's record counted since its last ask: a give-way that made no
+    // record (a slot's, `pump::give_way`) takes nothing off an older one.
+    if !RETRY.with(Cell::get) {
+        return;
+    }
+    let job = job_here();
+    global().world.set_give_way_aside(job);
+}
+
+/// Before this thread's job claims a run ([`crate::pump::Flights::get_or_run`]): if it gave
+/// way and has not asked since, it first waits for the run it gave way to to end, so it never
+/// takes back what it let go of before the job it gave way to had its turn
+/// ([`super::giveway`]). A thread-local read when it did not.
+///
+/// # Errors
+///
+/// [`NoProgress`](super::NoProgress) when the wait would close a cycle and this was the
+/// bound's give-way in a row to that run: asking again can never end.
+pub(crate) fn before_claim() -> Result<(), super::NoProgress> {
+    if !set_retry(false) {
+        return Ok(());
+    }
+    let job = job_here();
+    // alloc: a retry after a give-way, rare: the record, kept across the wait unlocked
+    let Some(gave_way) = global().world.give_way_of(job).cloned() else { return Ok(()) };
+    let waiting =
+        crate::pump::Waiting::begin(crate::wait::WaitKind::Key, &mut |it| gave_way.name_wait(it), || Some(gave_way.owner));
+    let waited = wait(Wait::Key(gave_way.flight));
+    drop(waiting);
+    let mut g = global();
+    match waited {
+        Ok(()) => {
+            g.world.forget_give_way(job);
+            Ok(())
+        }
+        Err(_) => g.world.give_way_of(job).map_or(Ok(()), super::GaveWay::refused),
+    }
+}
+
+thread_local! {
+    /// Whether this thread's job gave way and has not asked since: [`before_claim`]'s one read
+    /// when it did not. Carried with the job.
+    static RETRY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Sets [`RETRY`], saying what it was. Not inlined: read anew at each call, never kept across a
+/// wait that may resume the job on another thread (rule 24).
+#[inline(never)]
+fn set_retry(to: bool) -> bool {
+    RETRY.with(|it| it.replace(to))
+}
+
+pub(super) fn take_retry() -> Option<std::num::NonZeroUsize> {
+    set_retry(false).then_some(std::num::NonZeroUsize::MIN)
+}
+
+pub(super) fn put_retry(_: std::num::NonZeroUsize) {
+    set_retry(true);
 }
 
 /// This thread's job makes `key`: `false` when the key has a flight already (wait for it).

@@ -30,44 +30,10 @@ use std::{
     ptr,
 };
 
-use crate::busy;
+use crate::busy::while_busy;
 
 #[cfg(test)]
 mod tests;
-
-/// `start` made again for as long as its exec fails with `ETXTBSY`, waiting as [`busy::next`]
-/// says. In the parent, never in a child: each try is a new child, whose descriptors are
-/// copied from the parent's as they are then. A Linux child that retried its own `execve`
-/// would keep the copy of the writer's descriptor it was made with, and never run. The
-/// calling thread waits, as it waits for the spawn anyway: at most [`busy::MOST_NS`] in all,
-/// and only while the file is busy.
-fn while_busy<T>(mut start: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    let (mut tried, mut waited) = (0, 0);
-    loop {
-        let error = match start() {
-            Ok(it) => return Ok(it),
-            Err(error) => error,
-        };
-        // Of every system call a spawn makes, only exec says `ETXTBSY`; by kind, since the
-        // Linux spawn names the step that failed.
-        if error.kind() != io::ErrorKind::ExecutableFileBusy {
-            return Err(error);
-        }
-        let Some(wait) = busy::next(tried, waited) else {
-            return Err(io::Error::new(
-                error.kind(),
-                // alloc: an error path.
-                format!(
-                    "still open for writing after {} ms of tries: {error}",
-                    busy::MOST_NS / 1_000_000
-                ),
-            ));
-        };
-        busy::wait(wait);
-        tried += 1;
-        waited += wait;
-    }
-}
 
 /// What to start, borrowed: a command's own program, arguments, environment and directory, or
 /// those its sandbox made, so a spawn copies none of them.

@@ -96,7 +96,7 @@ fn function(db: &Db, name: &str) -> FunctionId {
 #[test]
 fn a_type_relative_value_path_records_its_qualifier() {
     let db = fixture::db(FIXTURE).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let cases = [
             ("adt", Expected::Adt("S")),
             ("param", Expected::Param),

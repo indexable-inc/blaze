@@ -1067,7 +1067,6 @@ mod tests {
         Tys, ValTree, ValTreeKind,
     };
 
-    /// A deterministic stream of choices: xorshift64.
     /// Field layouts of every shape the calculator treats apart: niches (`bool`, `char`, a
     /// reference), plain integers, a zero-sized and an uninhabited field, an array, a wide
     /// pointer.
@@ -1234,7 +1233,7 @@ mod tests {
         ty(TyKind::Alias(
             IsRigid::No,
             rustc_type_ir::AliasTy::from_checked_parts(
-                AliasTyKind::Projection { def_id: TraitAssocTyId(alias) },
+                AliasTyKind::Projection { def_id: TraitAssocTyId::from(alias) },
                 args,
             ),
         ))

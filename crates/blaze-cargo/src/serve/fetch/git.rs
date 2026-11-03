@@ -26,6 +26,7 @@ use blaze_vfs::Mode;
 
 use super::{Fetcher, failed};
 use crate::serve::work::{Source, SourceFile};
+use blaze_vfs::Bytes;
 
 pub(super) fn tree<H: Http + 'static>(fetcher: &Fetcher<H>, fetch: &Fetch, commit: &str) -> Result<Source, ApiError> {
     let commit = commit.to_ascii_lowercase();
@@ -135,12 +136,13 @@ fn read_tree(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
             } else if kind.is_symlink() {
                 let target = std::fs::read_link(&at)
                     .with_context(|| format!("failed to read `{}`", at.display()))?;
-                files.push(SourceFile { path, bytes: link_bytes(target, &at)?, mode: Mode::Symlink });
+                let bytes = Bytes::copy_kept(blaze_mem::Tag::Vfs, &link_bytes(target, &at)?);
+                files.push(SourceFile { path, bytes, mode: Mode::Symlink });
             } else if kind.is_file() {
-                let bytes =
-                    std::fs::read(&at).with_context(|| format!("failed to read `{}`", at.display()))?;
                 let metadata =
                     entry.metadata().with_context(|| format!("failed to read `{}`", at.display()))?;
+                let bytes = SourceFile::read(&at, metadata.len())
+                    .with_context(|| format!("failed to read `{}`", at.display()))?;
                 let mode = if is_executable(&metadata) { Mode::Executable } else { Mode::Regular };
                 files.push(SourceFile { path, bytes, mode });
             } else {

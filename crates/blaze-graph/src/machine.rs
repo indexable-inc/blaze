@@ -65,6 +65,27 @@ pub enum Outcome {
     Built,
     Cached { remote: bool },
     Failed { why: String },
+    /// Failed, but what the nodes that wait for it read of it is sound: under keep-going they
+    /// run as after [`Outcome::Built`] (a check that failed only in its bodies or lints, whose
+    /// dependents read only its items), while it stays failed and so does its request. Without
+    /// keep-going it stops the request as any failure does.
+    FailedOpen { why: String },
+}
+
+impl Outcome {
+    /// The state a node of this outcome settles in, and whether its failure leaves what waits
+    /// for it to run ([`Outcome::FailedOpen`]). `settled` for a node whose task ran, a memo's
+    /// for one whose outcome was remembered.
+    pub(crate) fn state(self, ran: bool) -> (blaze_protocol::events::NodeState, bool) {
+        use blaze_protocol::events::NodeState;
+        match self {
+            Outcome::Built if ran => (NodeState::Built, false),
+            Outcome::Built => (NodeState::Cached { remote: false }, false),
+            Outcome::Cached { remote } => (NodeState::Cached { remote }, false),
+            Outcome::Failed { why } => (NodeState::Failed { why }, false),
+            Outcome::FailedOpen { why } => (NodeState::Failed { why }, true),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] // clone: only into a trace the caller asked for, and tests

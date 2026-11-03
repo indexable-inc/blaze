@@ -108,6 +108,7 @@ fn claim() -> &'static Slot {
 
 /// The oldest epoch a thread in a task began at; `u64::MAX` when none is in a task.
 fn oldest() -> u64 {
+    SCANS.with(|scans| scans.set(scans.get() + 1));
     fence(Ordering::SeqCst);
     let mut oldest = u64::MAX;
     for block in blocks() {
@@ -137,6 +138,17 @@ impl Drop for Local {
 
 thread_local! {
     static LOCAL: Local = const { Local { slot: Cell::new(None), depth: Cell::new(0) } };
+    /// How many scans of every slot this thread has made ([`scans`]).
+    static SCANS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many times this thread has scanned every thread's slot (each [`Grace::passed`],
+/// [`Horizon::now`] and [`Limbo::collect`] that held anything): a scan reads a line per thread
+/// and per parked task, so a lock other threads wait on must not cover one (its holder takes
+/// a [`Horizon`] before it locks), and a debug build of a hot lock's holder checks the count
+/// did not move while it held it (hir-ty's solver cache table).
+pub fn scans() -> u64 {
+    SCANS.with(Cell::get)
 }
 
 /// This thread is in a task: what it reads from a shared table stays valid until the
@@ -263,8 +275,35 @@ impl Grace {
         Grace(EPOCH.fetch_add(1, Ordering::SeqCst))
     }
 
+    /// Whether it has passed: one scan of every thread's slot. To ask of many graces, take one
+    /// [`Horizon`] and ask it.
     pub fn passed(self) -> bool {
         oldest() > self.0
+    }
+}
+
+/// Which graces had passed when it was taken, from one scan of every thread's slot: a grace
+/// passed by then is passed for good, so it answers for any number of graces with no further
+/// scan. A scan reads a line per slot, and there is a slot per thread and per parked task (a
+/// fiber waiting on a key carries its own), so a writer takes one before it locks what its
+/// limbo sits behind and asks it there, never scanning under the lock.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Horizon(u64);
+
+impl Horizon {
+    /// The graces passed now. A grace started after this call is never among them.
+    pub fn now() -> Horizon {
+        // The epoch first: a grace started after this load has its own number or a later
+        // one, at least this, so it is never counted passed below. A grace numbered below it
+        // started before the scan, which `oldest` orders after the load (its fence), so the
+        // scan judges it as `Grace::passed` called then would.
+        let next = EPOCH.load(Ordering::SeqCst);
+        Horizon(next.min(oldest()))
+    }
+
+    /// Whether `grace` had passed when this was taken.
+    pub fn passed(self, grace: Grace) -> bool {
+        grace.0 < self.0
     }
 }
 

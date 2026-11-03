@@ -576,6 +576,9 @@ fn split<St>(len: usize, again: bool, init: impl Fn() -> St + Sync, run: impl Fn
                 // The unwound item may have left the state half used.
                 state = None;
                 gave.push(at);
+                // This job goes on to its next item, not the same ask: the give-way counts toward
+                // no bound, however many items give way to one run.
+                pump::rerun_later();
             }
         }
     };
@@ -1039,6 +1042,209 @@ mod tests {
         let (again, runs) = rx.recv_timeout(LONG).expect("the batch ends rather than run its give-ways again");
         assert_eq!(again, [0, 3, 6, 9]);
         assert_eq!(runs, [1; 12]);
+    }
+
+    /// A loop of 200 items inside the run of K, each asking Q, which another job runs while it
+    /// waits for K. Every item gives way to the same run of Q, far more than the bound of give-ways
+    /// in a row (`sched::GIVE_WAYS_WITHOUT_PROGRESS`) on one job; the loop's first pass still runs
+    /// every item once, as each give-way it sets aside for a rerun starts no streak
+    /// ([`crate::pump::rerun_later`]). The reruns after it meet the keys' own cycle and may fail.
+    #[test]
+    fn a_loop_whose_items_each_give_way_to_one_run_runs_every_item() {
+        const ITEMS: usize = 200;
+        const _: () = assert!(ITEMS > 2 * crate::sched::GIVE_WAYS_WITHOUT_PROGRESS as usize);
+        let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
+        let flights = Arc::new(Flights::<usize>::new());
+        let (k, q) = (Key([21; 32]), Key([22; 32]));
+        let c_runs_k = Arc::new(AtomicBool::new(false));
+        let runs: Arc<Vec<AtomicUsize>> = Arc::new((0..ITEMS).map(|_| AtomicUsize::new(0)).collect());
+        let (tx, rx) = unbounded::<(char, String)>();
+        {
+            let (flights, c_runs_k, runs, tx) = (Arc::clone(&flights), Arc::clone(&c_runs_k), Arc::clone(&runs), tx.clone());
+            pool.submit(
+                None,
+                move || {
+                    flights.get_or_run(k, || {
+                        c_runs_k.store(true, Ordering::Release);
+                        crate::spin::SpinWait::within("T to wait on K", LONG, || flights.waiters(k) == 1);
+                        let made = super::map(0..ITEMS, |at| {
+                            runs[at].fetch_add(1, Ordering::Relaxed);
+                            if flights.get_or_run(q, || Ok(0)).is_err() {
+                                std::panic::resume_unwind(Box::new("gave way"));
+                            }
+                            at
+                        });
+                        Ok(made.len())
+                    })
+                },
+                move |ran| {
+                    let said = match ran {
+                        Ok(it) => format!("ok {it:?}"),
+                        Err(panic) => panic
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| panic.downcast_ref::<&str>().map(|it| (*it).to_owned()))
+                            .unwrap_or_default(),
+                    };
+                    _ = tx.send(('c', said));
+                },
+            );
+        }
+        {
+            let (flights, c_runs_k, tx) = (Arc::clone(&flights), Arc::clone(&c_runs_k), tx.clone());
+            pool.submit(
+                None,
+                move || {
+                    flights.get_or_run(q, || {
+                        crate::spin::SpinWait::within("C to run K", LONG, || c_runs_k.load(Ordering::Acquire));
+                        flights.get_or_run(k, || Ok(5))
+                    })
+                },
+                move |ran| _ = tx.send(('t', format!("{:?}", ran.map_err(|_| "panicked")))),
+            );
+        }
+        let mut heard = Vec::new();
+        for _ in 0..2 {
+            heard.push(rx.recv_timeout(LONG).expect("both jobs end"));
+        }
+        let runs: Vec<usize> = runs.iter().map(|it| it.load(Ordering::Relaxed)).collect();
+        let never: Vec<usize> = (0..ITEMS).filter(|&at| runs[at] == 0).collect();
+        assert!(never.is_empty(), "items never run in the loop's first pass: {} of {ITEMS}; heard {heard:?}", never.len());
+    }
+
+    /// An immediate-retry loop around a one-item loop, on a job that runs K, which the run of Q
+    /// waits for. Each pass's item gives way to Q and is set aside, which takes back only that
+    /// give-way; its rerun gives way again and unwinds to the retry loop, so each pass counts
+    /// one, and the bound (`sched::GIVE_WAYS_WITHOUT_PROGRESS`) ends it with `NoProgress`.
+    #[test]
+    fn a_retry_loop_around_a_loop_whose_item_gives_way_reaches_the_bound() {
+        const PASSES: usize = 1000;
+        let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
+        let flights = Arc::new(Flights::<usize>::new());
+        let (k, q) = (Key([31; 32]), Key([32; 32]));
+        let c_runs_k = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = unbounded::<(char, String)>();
+        {
+            let (flights, c_runs_k, tx) = (Arc::clone(&flights), Arc::clone(&c_runs_k), tx.clone());
+            pool.submit(
+                None,
+                move || {
+                    let mut said = String::new();
+                    let ran = flights.get_or_run(k, || {
+                        c_runs_k.store(true, Ordering::Release);
+                        crate::spin::SpinWait::within("T to wait on K", LONG, || flights.waiters(k) == 1);
+                        for pass in 0..PASSES {
+                            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                super::map(0..1, |at| {
+                                    if flights.get_or_run(q, || Ok(0)).is_err() {
+                                        std::panic::resume_unwind(Box::new("gave way"));
+                                    }
+                                    at
+                                })
+                            }));
+                            match ran {
+                                Ok(_) => {
+                                    said = format!("ended at pass {pass}");
+                                    return Ok(0);
+                                }
+                                Err(p) => {
+                                    if let Some(s) = p.downcast_ref::<String>() {
+                                        said = format!("pass {pass}: {s}");
+                                        return Ok(0);
+                                    }
+                                }
+                            }
+                        }
+                        said = format!("no bound: {PASSES} passes, each giving way");
+                        Ok(0)
+                    });
+                    format!("{said} ({ran:?})")
+                },
+                move |ran| _ = tx.send(('c', ran.unwrap_or_else(|_| "panicked".to_owned()))),
+            );
+        }
+        {
+            let (flights, c_runs_k, tx) = (Arc::clone(&flights), Arc::clone(&c_runs_k), tx.clone());
+            pool.submit(
+                None,
+                move || {
+                    flights.get_or_run(q, || {
+                        crate::spin::SpinWait::within("C to run K", LONG, || c_runs_k.load(Ordering::Acquire));
+                        flights.get_or_run(k, || Ok(5))
+                    })
+                },
+                move |ran| _ = tx.send(('t', format!("{:?}", ran.map_err(|_| "panicked")))),
+            );
+        }
+        let mut heard = Vec::new();
+        for _ in 0..2 {
+            heard.push(rx.recv_timeout(LONG).expect("both jobs end"));
+        }
+        let c = heard.iter().find(|(who, _)| *who == 'c').expect("c said");
+        assert!(c.1.contains("gave way 64 times"), "heard {heard:?}");
+    }
+
+    /// A job that runs K asks Q1 then Q2 at once, again and again; T1 runs Q1 and T2 runs Q2,
+    /// each waiting for K. Every ask gives way, alternating between two runs, and each retry's
+    /// wait is refused: the streak is the job's, whatever run it gave way to, so the bound ends
+    /// it with `NoProgress`.
+    #[test]
+    fn give_ways_alternating_between_two_runs_reach_the_bound() {
+        const ASKS: usize = 1000;
+        let pool = Arc::new(Pool::new(&Topology::flat(3), false).unwrap());
+        let flights = Arc::new(Flights::<usize>::new());
+        let (k, q1, q2) = (Key([41; 32]), Key([42; 32]), Key([43; 32]));
+        let c_runs_k = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = unbounded::<(char, String)>();
+        {
+            let (flights, c_runs_k, tx) = (Arc::clone(&flights), Arc::clone(&c_runs_k), tx.clone());
+            pool.submit(
+                None,
+                move || {
+                    let mut said = String::new();
+                    let ran = flights.get_or_run(k, || {
+                        c_runs_k.store(true, Ordering::Release);
+                        crate::spin::SpinWait::within("T1 and T2 to wait on K", LONG, || flights.waiters(k) == 2);
+                        for ask in 0..ASKS {
+                            let got = flights.get_or_run(q1, || Ok(0)).or_else(|_| flights.get_or_run(q2, || Ok(0)));
+                            if got.is_ok() {
+                                said = format!("ended at ask {ask}");
+                                return Ok(0);
+                            }
+                        }
+                        said = format!("no bound: {ASKS} rounds, each giving way twice");
+                        Ok(0)
+                    });
+                    format!("{said} ({ran:?})")
+                },
+                move |ran| {
+                    let said = match ran {
+                        Ok(it) => it,
+                        Err(panic) => panic.downcast_ref::<String>().cloned().unwrap_or_default(),
+                    };
+                    _ = tx.send(('c', said));
+                },
+            );
+        }
+        for (who, q) in [('1', q1), ('2', q2)] {
+            let (flights, c_runs_k, tx) = (Arc::clone(&flights), Arc::clone(&c_runs_k), tx.clone());
+            pool.submit(
+                None,
+                move || {
+                    flights.get_or_run(q, || {
+                        crate::spin::SpinWait::within("C to run K", LONG, || c_runs_k.load(Ordering::Acquire));
+                        flights.get_or_run(k, || Ok(5))
+                    })
+                },
+                move |ran| _ = tx.send((who, format!("{:?}", ran.map_err(|_| "panicked")))),
+            );
+        }
+        let mut heard = Vec::new();
+        for _ in 0..3 {
+            heard.push(rx.recv_timeout(LONG).expect("every job ends"));
+        }
+        let c = heard.iter().find(|(who, _)| *who == 'c').expect("c said");
+        assert!(c.1.contains("gave way 64 times"), "heard {heard:?}");
     }
 
     /// Any other panic of a task reaches the caller once every task has run.

@@ -11,7 +11,7 @@ use hir_expand::{
     name::{AsName, Name},
     span_map::SpanMap,
 };
-use span::AstIdMap;
+use span::{AstIdMap, SyntaxContext};
 use syntax::{
     ast,
     view::{self, AstNode, HasModuleItem, HasName},
@@ -24,10 +24,11 @@ use crate::{
     item_tree::AttrsOrCfg,
     macro_call_as_call_id,
     nameres::{
-        DefMap, LocalDefMap, MacroSubNs,
+        DefMap, Hygienic, LocalDefMap, MacroSubNs,
         attr_resolution::ResolvedAttr,
         diagnostics::{DefDiagnostic, DefDiagnostics},
     },
+    per_ns::Namespace,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,8 +301,17 @@ impl<'db> AssocItemCollector<'db> {
                 };
                 let ctxt = self.span_map.span_for_range(range).ctx;
 
-                let resolver = |path: &ModPath| {
-                    let before = path.as_ident().and_then(|name| {
+                // A path a `macro` wrote is looked up where its def-site hygiene says
+                // ([`DefMap::hygienic_origin`]), textual scopes included.
+                let resolver = |path: &ModPath, ctxt: SyntaxContext| {
+                    let origin = self.def_map.hygienic_origin(
+                        self.db,
+                        self.module_id,
+                        path,
+                        Some(Namespace::Macros),
+                        ctxt,
+                    );
+                    let before = path.as_ident().filter(|_| origin == Hygienic::Here).and_then(|name| {
                         let call = ast_id.erase();
                         self.def_map.legacy_macro_before(self.db, self.module_id, name, call)
                     });
@@ -309,13 +319,14 @@ impl<'db> AssocItemCollector<'db> {
                         return Some(before.definition(self.db));
                     }
                     self.def_map
-                        .resolve_path(
+                        .resolve_path_from(
                             self.local_def_map,
                             self.db,
                             self.module_id,
                             path,
                             crate::item_scope::BuiltinShadowMode::Other,
                             Some(MacroSubNs::Bang),
+                            origin,
                         )
                         .0
                         .take_macros()

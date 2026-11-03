@@ -258,7 +258,8 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
                 if let Some(variant) = self.infer.variant_resolution_for_pat(pat) {
                     for arg in args {
                         if !matches!(store.pat(arg.pat), Pat::Wild)
-                            && let Some(field) = self.field(variant, &arg.name)
+                            && let Some(field) =
+                                self.field(variant, &arg.name, self.store.record_field_hygiene(arg.pat))
                         {
                             self.m.insert_def_id(field);
                         }
@@ -313,9 +314,10 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
         Some(def)
     }
 
-    /// A field of `variant` by name, if it is the crate's.
-    fn field(&self, variant: VariantId, name: &Name) -> Option<DefIdx> {
-        let local_id = variant.fields(self.m.k.cx.db).field(name)?;
+    /// A field of `variant` by the name it is written with, if it is the crate's.
+    fn field(&self, variant: VariantId, name: &Name, hygiene: HygieneId) -> Option<DefIdx> {
+        let db = self.m.k.cx.db;
+        let local_id = variant.fields(db).field_written(db, variant, name, hygiene)?;
         self.m.k.defs.get(Id::Field(FieldId { parent: variant, local_id }))
     }
 
@@ -494,7 +496,8 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
             return;
         }
         for field in fields {
-            if let Some(field) = self.field(variant, &field.name) {
+            let hygiene = self.store.record_field_hygiene(field.expr);
+            if let Some(field) = self.field(variant, &field.name, hygiene) {
                 self.m.insert_def_id(field);
             }
         }

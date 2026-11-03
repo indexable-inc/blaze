@@ -264,6 +264,10 @@ impl World {
     }
 
     /// Takes the program out of the world.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "forgetting takes the program, so nothing can use its entity once it is deleted"
+    )]
     pub fn forget(&mut self, program: Program) {
         // Its children go with the workspace.
         self.flecs.delete(program.entity);

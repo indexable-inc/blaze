@@ -38,7 +38,7 @@ fn lowered(fixture_text: &str, name: &str, check: impl FnOnce(&MirBody<'_>)) {
     let fx = fixture::db(fixture_text);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    crate::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);

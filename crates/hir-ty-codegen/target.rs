@@ -358,7 +358,8 @@ impl Target {
         Ok(table.iter().find(|(it, _)| *it == name).map(|&(_, setting)| (setting, on)))
     }
 
-    /// The triple of what the daemon itself runs on.
+    /// The triple of what the daemon itself runs on: of the program blaze is, never of a unit
+    /// it compiles, which names its own ([`Target::of`]).
     pub fn host() -> &'static str {
         // The wasm backend writes its own code from Cranelift's IR and only borrows the
         // settings of an ISA Cranelift has, whatever the compiler itself runs on.
@@ -450,17 +451,43 @@ impl Target {
         self.is_wasm() && self.calls() == Calls::Direct
     }
 
-    /// How wasm code calls: through the table where functions are replaced in a page.
+    /// How wasm code calls: through the table where functions are replaced in a page. This
+    /// is how the program blaze is links what it compiles, not a property of the code's
+    /// target: the playground (`crates/blaze-wasm`, the `wasm` feature) links every function
+    /// into the page's table itself, and every other blaze hands relocatable objects to a
+    /// linker. The calling convention, the ABI and the addresses are the same either way, and
+    /// the toolchain's id has the feature (`v2::toolchain`), so no code of one is taken for
+    /// the other's.
     pub fn calls(&self) -> Calls {
         if cfg!(feature = "wasm") { Calls::Table } else { Calls::Direct }
     }
 
     /// The integer an address is.
     pub(super) fn pointer(&self) -> Type {
-        match self.arch {
-            Arch::X86_64 | Arch::Aarch64 | Arch::Wasm64 => types::I64,
-            Arch::Wasm32 => types::I32,
+        match self.pointer_width() {
+            target_lexicon::PointerWidth::U16 => types::I16,
+            target_lexicon::PointerWidth::U32 => types::I32,
+            target_lexicon::PointerWidth::U64 => types::I64,
         }
+    }
+
+    /// How wide an address is: the one place a target's address width is decided.
+    pub(super) fn pointer_width(&self) -> target_lexicon::PointerWidth {
+        match self.arch {
+            Arch::X86_64 | Arch::Aarch64 | Arch::Wasm64 => target_lexicon::PointerWidth::U64,
+            Arch::Wasm32 => target_lexicon::PointerWidth::U32,
+        }
+    }
+
+    /// What IR for it is built under (`FunctionBuilder::finalize`, and the signatures
+    /// `call_memcpy`, `call_memmove` and `call_memset` declare): `isa`'s calling convention
+    /// with the target's own addresses. On wasm `isa` is a native ISA whose settings the IR is
+    /// made under, with 64-bit addresses, so its own config would declare wasm32's `memcpy`
+    /// as taking and giving an `i64` where every address is an `i32`. This is decided by the
+    /// target the function is compiled for, never by how blaze itself was built.
+    // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private
+    pub(super) fn frontend_config(&self, isa: &dyn isa::TargetIsa) -> isa::TargetFrontendConfig {
+        isa::TargetFrontendConfig { pointer_width: self.pointer_width(), ..isa.frontend_config() }
     }
 
     /// How many bytes an address takes.
@@ -595,12 +622,10 @@ impl Target {
             OptLevel::SpeedAndSize => "speed_and_size",
         };
         flags.set("opt_level", opt).map_err(message)?;
-        // Cranelift checks the IR of every function it is given unless told not to: a walk of
-        // all of it, with its dominator tree, before any code is made. Tests check it, and
-        // `BLAZE_VERIFY=1` asks for it elsewhere; the code made is the same either way.
-        let verify = cfg!(test) || std::env::var_os("BLAZE_VERIFY").is_some_and(|it| it == "1");
-        let verify = if verify { "true" } else { "false" };
-        flags.set("enable_verifier", verify).map_err(message)?;
+        // Off: every build checks the IR blaze makes itself, before any backend or pass is given
+        // it (`crate::verified`). Cranelift's own check would walk it again in `Context::compile`
+        // and in passes such as `eliminate_unreachable_code` (`tier::fold_known_branches`).
+        flags.set("enable_verifier", "false").map_err(message)?;
         flags.set("enable_llvm_abi_extensions", "true").map_err(message)?;
         flags.set("regalloc_algorithm", regalloc).map_err(message)?;
         // Cranelift has no ISA for WebAssembly: its code is written from the IR, and the
@@ -869,11 +894,43 @@ mod tests {
         assert_eq!(Target::of("wasm32-wasip1").expect("a target").stencil(), None);
     }
 
+    /// blaze's own `wasm` feature (the playground's build, `crates/blaze-wasm`) decides only
+    /// what is about the program blaze is: where it runs ([`Target::host`]) and how it links
+    /// what it compiles ([`Target::calls`]), both in the toolchain's id. A target's ABI,
+    /// address width or anything else of its code is the [`Target`]'s, decided by the unit's
+    /// triple: a `cfg!` of the feature that decided the address width of wasm32's IR
+    /// (dfgalias) and how a pair is returned (wasmabi) made a normal blaze's wasm32 code
+    /// differ from the playground's. Every use of the feature is counted here, by file.
     #[test]
-    fn tests_verify_what_cranelift_is_given() {
+    fn blazes_wasm_feature_decides_nothing_of_a_targets_code() {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, uses: &mut Vec<(String, usize)>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().map(|it| it.unwrap().path()).collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, root, uses);
+                } else if path.extension().is_some_and(|it| it == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let count = text.matches(concat!("feature = ", "\"wasm\"")).count();
+                    if count != 0 {
+                        let name = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+                        uses.push((name, count));
+                    }
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut uses = Vec::new();
+        walk(root, root, &mut uses);
+        let expected = [("target.rs".to_owned(), 2), ("v2/toolchain.rs".to_owned(), 1)];
+        assert_eq!(uses, expected, "where hir-ty-codegen reads its `wasm` feature: `host`, `calls` and the toolchain's id");
+    }
+
+    #[test]
+    fn cranelift_checks_nothing_blazes_verifier_checked() {
         let target = Target::of("x86_64-unknown-linux-gnu").expect("a target");
         let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
-        assert!(isa.flags().enable_verifier());
+        assert!(!isa.flags().enable_verifier());
         assert_eq!(isa.flags().opt_level(), OptLevel::None);
         let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::Speed).expect("the ISA");
         assert_eq!(isa.flags().opt_level(), OptLevel::Speed);

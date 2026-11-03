@@ -189,7 +189,7 @@ pub(crate) fn replace(
                     return Err(fail(format!(
                         "a file of crate `{}`, which can name `{}`, holds `{name}` and is outside the \
                          view (a `#[path]` or `include!` out of the checkout): the replace can't edit it",
-                        name_of(db, krate),
+                        krate.base().named(db),
                         pair.from
                     )));
                 }
@@ -348,7 +348,7 @@ fn def_of(db: &Db, view: &[Crate], path: &str) -> Result<Def, String> {
         ));
     }
     let named: Vec<Crate> =
-        Crate::all(db).into_iter().filter(|it| name_of(db, *it) == first).collect(); // alloc: the crates by one name, once a replace
+        Crate::all(db).into_iter().filter(|it| it.base().rust_name(db).is_ok_and(|it| it.as_str() == first)).collect(); // alloc: the crates by one name, once a replace
     let depended = |krate: Crate| {
         view.contains(&krate)
             || view.iter().any(|it| it.dependencies_iter(db).any(|dep| dep.krate == krate))
@@ -409,14 +409,6 @@ fn def_of(db: &Db, view: &[Crate], path: &str) -> Result<Def, String> {
         return Err(format!("`{path}` names nothing in crate `{first}`"));
     }
     Ok(Def { krate, rest, names })
-}
-
-/// A crate's name as a path writes it: its `[lib]` name.
-fn name_of(db: &Db, krate: Crate) -> String {
-    match krate.display_name(db) {
-        Some(name) => name.crate_name().symbol().as_str().to_owned(),
-        None => String::new(),
-    }
 }
 
 /// The names a reference to `old` goes by, longest first: its own, the last segment of `from`,
@@ -500,8 +492,8 @@ fn spelled(db: &Db, new: &Def, to: &str, krate: Crate) -> Result<String, String>
             None => {
                 return Err(format!(
                     "crate `{}` has no dependency on `{}`, which `{to}` is in: add it to the crate's manifest first",
-                    name_of(db, krate),
-                    name_of(db, new.krate)
+                    krate.base().named(db),
+                    new.krate.base().named(db)
                 ));
             }
         }
@@ -522,7 +514,7 @@ fn spelled(db: &Db, new: &Def, to: &str, krate: Crate) -> Result<String, String>
         })
         .collect(); // alloc: the few items one path names
     if new.names.iter().flatten().any(|it| !found.contains(it)) {
-        return Err(format!("`{text}` does not name `{to}` in crate `{}`", name_of(db, krate)));
+        return Err(format!("`{text}` does not name `{to}` in crate `{}`", krate.base().named(db)));
     }
     Ok(text)
 }

@@ -231,6 +231,35 @@ impl ops::Deref for CrateName {
     }
 }
 
+/// A crate set up with no name where its name is needed ([`Crate::rust_name`]): in a path, a
+/// symbol, a key or a lookup by name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct UnnamedCrate {
+    /// The crate's content ID ([`Crate::content`]), which tells it from every other crate.
+    pub content: ContentId,
+}
+
+impl fmt::Display for UnnamedCrate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{{unnamed crate {}}}", self.content)
+    }
+}
+
+impl Error for UnnamedCrate {}
+
+/// A crate as [`Crate::named`] says it: its name, or the [`UnnamedCrate`] it is.
+#[derive(Clone, Copy, Debug)]
+pub struct CrateNamed<'db>(Result<&'db Symbol, UnnamedCrate>);
+
+impl fmt::Display for CrateNamed<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Ok(name) => f.write_str(name.as_str()),
+            Err(unnamed) => unnamed.fmt(f),
+        }
+    }
+}
+
 /// Origin of the crates.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: setup: the crate graph, once per load
 pub enum CrateOrigin {
@@ -826,6 +855,33 @@ impl Crate {
 
     pub fn lint_options<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db LintOptions {
         self.lint_options_field(db)
+    }
+
+    /// The crate's name as Rust code and rustc know it: its `--crate-name`, the manifest's
+    /// target name with `-` written `_`. Paths, symbols and keys write a crate by it, a lookup
+    /// of a crate by name compares it, and a message names a crate by it ([`Crate::named`]).
+    /// The package's name as its manifest spells it, `-` and all, is
+    /// [`CrateDisplayName::canonical_name`], which only keys hash.
+    ///
+    /// A crate set up with no name (a test fixture's, a detached file's) is an
+    /// [`UnnamedCrate`]: what needs its name refuses, naming the crate and what needed it,
+    /// never writes a stand-in (`std`, `?`, `{crate}`), which names another crate or none.
+    pub fn rust_name<'db, Db: ?Sized + blaze_query::db::Database>(
+        self,
+        db: &'db Db,
+    ) -> Result<&'db Symbol, UnnamedCrate> {
+        match &self.extra_data(db).display_name {
+            Some(name) => Ok(name.crate_name().symbol()),
+            None => Err(UnnamedCrate { content: self.content(db) }),
+        }
+    }
+
+    /// The crate as a message, a trace or a span names it to a person: its
+    /// [`rust_name`](Crate::rust_name), or for a crate with none the [`UnnamedCrate`] it is,
+    /// by its content ID. Never the database's id, a number of one process, which would put
+    /// that process into the keys and binaries a message is written into.
+    pub fn named<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> CrateNamed<'db> {
+        CrateNamed(self.rust_name(db))
     }
 
     /// A crate outside a [`CrateGraphBuilder`], all its fields with `durability`. Its root

@@ -150,6 +150,11 @@ fn error_of(
 }
 
 /// What `rest` asks of the one error the function `name` of `fixture` gives.
+///
+/// Checked with no database attached to the thread, as a pool worker runs the check: a text
+/// that names a type through `Debug` (which reads the attached database) instead of with the
+/// database in hand panics outside a query's run (`fmt_with_attached_db` in hir-ty), so each test
+/// here fails on a message rendered detached.
 fn error_in(
     fixture: &str,
     name: &str,
@@ -158,14 +163,89 @@ fn error_in(
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
-        let def = function(&db, name);
-        let (_, source_map) = Body::with_source_map(&db, def);
-        let result = crate::borrowck(&db, def);
-        let errors: Vec<&BorrowckDiagnostic> =
-            result.diagnostics.iter().filter(|it| it.code.starts_with('E')).collect();
-        let &[error] = &errors[..] else { panic!("`{name}`: {errors:?}") };
-        rest(&db, &source_map, error);
+    let def = function(&db, name);
+    let (_, source_map) = Body::with_source_map(&db, def);
+    let result = crate::borrowck(&db, def);
+    let errors: Vec<&BorrowckDiagnostic> =
+        result.diagnostics.iter().filter(|it| it.code.starts_with('E')).collect();
+    let &[error] = &errors[..] else { panic!("`{name}`: {errors:?}") };
+    rest(&db, &source_map, error);
+}
+
+/// A value dropped while a move needs its place: a trait method's `impl Fn` (sb-rpitit's
+/// case), an ADT with `Drop`, and a tuple holding one.
+const DROPPED_LATER: &str = r#"
+//- minicore: sized, fn, drop
+struct Value {}
+struct Guard<'a>(&'a Value);
+impl Drop for Guard<'_> { fn drop(&mut self) {} }
+fn eat<T>(_: T) {}
+trait D { fn b(&self) -> impl Fn() -> u32; }
+
+fn opaque<T: D>(t: T) {
+    let f = t.b();
+    eat(t);
+}
+
+fn adt() {
+    let x = Value {};
+    let g = Guard(&x);
+    eat(x);
+}
+
+fn tuple() {
+    let x = Value {};
+    let g = (Guard(&x), 1u8);
+    eat(x);
+}
+
+fn moved_twice() {
+    let x = Value {};
+    eat(x);
+    eat(x);
+}
+"#;
+
+/// The label of the drop that uses the borrow, of the one error of `name`.
+fn drop_label(name: &str) -> String {
+    let mut found = None;
+    error_in(DROPPED_LATER, name, |_, _, error| {
+        assert_eq!(error.code, "E0505", "`{name}`: {error:?}");
+        found = error.labels.iter().find(|(_, text)| text.contains("is dropped")).map(|(_, text)| text.clone());
+        assert!(found.is_some(), "`{name}`: no drop label: {error:?}");
+    });
+    found.expect("checked above")
+}
+
+/// E0505's drop label names the dropped value's type as the source writes it, rendered while
+/// the check had the database, never `<AdtDef: no database attached>` (sb-rpitit, a check on
+/// a worker with none attached).
+#[test]
+fn e0505_names_the_dropped_type_with_no_database_attached() {
+    assert_eq!(
+        drop_label("opaque"),
+        "borrow might be used here, when `f` is dropped and runs the destructor for type `impl Fn() -> u32`"
+    );
+    assert_eq!(
+        drop_label("adt"),
+        "borrow might be used here, when `g` is dropped and runs the `Drop` code for type `Guard`"
+    );
+    assert_eq!(
+        drop_label("tuple"),
+        "borrow might be used here, when `g` is dropped and runs the destructor for type `(Guard<'_>, u8)`"
+    );
+}
+
+/// E0382's `Copy` label names the type, with no database attached.
+#[test]
+fn e0382_names_the_moved_type_with_no_database_attached() {
+    error_in(DROPPED_LATER, "moved_twice", |_, _, error| {
+        assert_eq!(error.code, "E0382", "{error:?}");
+        assert!(
+            error.labels.iter().any(|(_, text)| text
+                == "move occurs because `x` has type `Value`, which does not implement the `Copy` trait"),
+            "{error:?}"
+        );
     });
 }
 
@@ -442,7 +522,7 @@ fn a_body_with_no_error_takes_nothing_from_the_global_allocator() {
     let fx = fixture::db(CLEAN);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut bodies = 0;
         for &krate in all_crates(&db).iter() {
             let def_map = crate_def_map(&db, krate);

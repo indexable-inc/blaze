@@ -283,7 +283,10 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                 let arity = variant_fields.fields().len();
                 let mut fields = Vec::with_capacity(args.len());
                 for field in args {
-                    let fid = variant_fields.field(&field.name).ok_or(LowerError::Failed)?;
+                    let hygiene = self.body.record_field_hygiene(field.pat);
+                    let fid = variant_fields
+                        .field_written(db, variant, &field.name, hygiene)
+                        .ok_or(LowerError::Failed)?;
                     let idx = u32::from(fid.into_raw()) as usize;
                     fields.push(self.lower(field.pat)?.at_index(idx));
                 }

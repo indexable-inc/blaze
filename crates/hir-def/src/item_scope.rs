@@ -1229,9 +1229,12 @@ impl ItemScope {
     }
 
     /// Sorts `all` by name and moves the first position of each name to the front, returning how
-    /// many names there are.
+    /// many names there are. Names of one text that are keyed apart (`Name::keyed`, hygienic
+    /// bindings of `macro` expansions) go in the order the scope bound them, the first position
+    /// each has in its columns: by construction, never by their keys' context ids, which a
+    /// second run or a restored image numbers differently.
     fn by_name(&self, all: &mut [u32]) -> usize {
-        all.sort_unstable_by(|&a, &b| self.sorted_name(a).cmp(self.sorted_name(b)));
+        all.sort_unstable_by(|&a, &b| self.in_written_order(a, b));
         let mut kept = 0;
         for at in 0..all.len() {
             if kept == 0 || self.sorted_name(all[kept - 1]) != self.sorted_name(all[at]) {
@@ -1240,6 +1243,32 @@ impl ItemScope {
             }
         }
         kept
+    }
+
+    /// [`Self::by_name`]'s order of the names at `a` and `b`: [`Name::cmp_written`], then, for
+    /// two names of one text keyed apart, the first position each has in the scope.
+    fn in_written_order(&self, a: u32, b: u32) -> std::cmp::Ordering {
+        let (x, y) = (self.sorted_name(a), self.sorted_name(b));
+        if x == y {
+            return std::cmp::Ordering::Equal;
+        }
+        x.cmp_written(y).then_with(|| self.first_position(x).cmp(&self.first_position(y)))
+    }
+
+    /// The first place `name` was bound in this scope, as `namespace << 30 | position`: in
+    /// `types`, then `values`, then `macros`, then `unresolved`. Distinct names have distinct
+    /// first places, since a place holds one name.
+    fn first_position(&self, name: &Name) -> u32 {
+        let found = self.positions(name);
+        for (ns, pos) in [TYPES, VALUES, MACROS].into_iter().zip(found) {
+            if pos != NONE {
+                return ns << 30 | pos;
+            }
+        }
+        match self.unresolved.iter().position(|it| it == name) {
+            Some(pos) => UNRESOLVED << 30 | pos as u32,
+            None => NONE,
+        }
     }
 
     /// Builds the tables a settled scope is read by when it has more than [`LINEAR`] names, and
@@ -2058,8 +2087,10 @@ impl ItemScope {
 
     pub(crate) fn dump(&self, db: &Db, buf: &mut String) {
         // alloc: a debug dump (the edge)
+        // `resolutions` lists the names in `entries`' order, by text and, among names of one
+        // text keyed apart, by construction; the unnamed trait imports go first.
         let mut entries: Vec<_> = self.resolutions().collect();
-        entries.sort_by_key(|(name, _)| *name);
+        entries.sort_by_key(|(name, _)| name.is_some());
 
         let print_macro_sub_ns = |buf: &mut String, macro_id: MacroId| {
             let styles = crate::nameres::macro_styles_from_id(db, macro_id);
@@ -2117,7 +2148,7 @@ impl ItemScope {
         // are _not_ visible at the cursor position.
         // alloc: a debug dump (the edge)
         let mut legacy_macros = self.legacy_macros().collect::<Vec<_>>();
-        legacy_macros.sort_by(|(a, _), (b, _)| Ord::cmp(a, b));
+        legacy_macros.sort_by(|(a, _), (b, _)| a.cmp_written(b));
         for (name, macros) in legacy_macros {
             format_to!(buf, "- (legacy) {} :", name.display(db, Edition::LATEST));
             for &macro_id in macros {

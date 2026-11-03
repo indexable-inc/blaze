@@ -37,7 +37,7 @@ impl<'a> Each for Borrows<'a> { type Item = Square; }
 /// Whether `method` of `Each` is impossible through the impl for the struct `self_ty`.
 fn impossible(method: &str, self_ty: &str) -> bool {
     let db = fixture::db(FIXTURE).into_db();
-    crate::next_solver::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let def_map = crate_def_map(&db, krate);
         let scope = def_map.modules(&db).next().expect("the root module").1.scope(&db);

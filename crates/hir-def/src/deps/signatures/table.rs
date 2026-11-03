@@ -253,7 +253,11 @@ fn sites(buffer: &[u8]) -> Result<Sites, FormatError> {
             sites.blocks.push(place(&low[0], buffer));
         }
     }
-    for pairs in [root.ident_hygiene.follow(buffer)?, root.type_hygiene.follow(buffer)?] {
+    for pairs in [
+        root.ident_hygiene.follow(buffer)?,
+        root.field_hygiene.follow(buffer)?,
+        root.type_hygiene.follow(buffer)?,
+    ] {
         sites.contexts.extend(pairs.iter().map(|it| place(&it.b, buffer)));
     }
     Ok(sites)

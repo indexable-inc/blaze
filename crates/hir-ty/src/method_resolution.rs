@@ -253,6 +253,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         Ok((result.callee, is_visible))
     }
 
+    /// The probe for the method `call_expr` names `method_name`, with the context the name is
+    /// written with (`member_hygiene`), which an inherent impl's items are looked up by.
     #[instrument(level = "debug", skip(self))]
     pub(crate) fn lookup_probe(
         &self,
@@ -261,9 +263,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         method_name: Name,
         self_ty: Ty<'db>,
     ) -> probe::PickResult<'db> {
+        let hygiene = self.store.member_hygiene(call_expr);
         self.with_method_resolution(call_expr.into(), receiver.into(), |ctx| {
-            let pick = ctx.probe_for_name(probe::Mode::MethodCall, method_name, self_ty)?;
-            Ok(pick)
+            ctx.probe_for_written_name(method_name, hygiene, self_ty)
         })
     }
 
@@ -665,6 +667,25 @@ fn provided<'db>(
 #[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn impl_value_item(db: &Db, impl_: ImplId, name: Name) -> Option<CandidateId> {
     value_item_named(&impl_.impl_items(db).items, &name)
+}
+
+/// The function or constant of the inherent impl `impl_` that a method call looks up as `name`
+/// (the name as written, [keyed](Name::keyed) for the impl's scope by
+/// [`hir_def::nameres::impl_item_name`]), the first if there are more: an item of the same text
+/// whose own key is the name's ([`hir_def::nameres::assoc_item_is`], rustc's
+/// `find_by_ident_and_namespace`), so a method a `macro` names is found only by the calls that
+/// expansion writes. As [`impl_value_item`] where no item and no call is keyed.
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+pub fn inherent_value_item(db: &Db, impl_: ImplId, name: Name) -> Option<CandidateId> {
+    impl_.impl_items(db).items.iter().find_map(|&(item_name, item)| match item {
+        AssocItemId::FunctionId(it) if hir_def::nameres::assoc_item_is(db, item_name, item, name) => {
+            Some(it.into())
+        }
+        AssocItemId::ConstId(it) if hir_def::nameres::assoc_item_is(db, item_name, item, name) => {
+            Some(it.into())
+        }
+        _ => None,
+    })
 }
 
 /// As [`impl_value_item`], of a trait.
@@ -1286,7 +1307,7 @@ pub(crate) fn tracing_holders(db: &Db) -> bool {
 pub(crate) fn trace_holders(db: &Db, module: ModuleId, holders: &[DefWithBodyId]) {
     use std::io::Write as _;
     let krate = module.krate(db);
-    let crate_name = crate_name(db, krate);
+    let crate_name = krate.named(db);
     let mut out = String::new();
     for holder in holders {
         let (kind, (place, reason)) = match *holder {
@@ -1301,12 +1322,6 @@ pub(crate) fn trace_holders(db: &Db, module: ModuleId, holders: &[DefWithBodyId]
     }
     // A failed write to stderr loses a trace line and nothing else.
     _ = std::io::stderr().lock().write_all(out.as_bytes());
-}
-
-fn crate_name(db: &Db, krate: Crate) -> String {
-    let name = krate.extra_data(db).display_name.as_ref();
-    // alloc: a trace line's crate, only under BLAZE_TRACE_HOLDERS
-    name.map_or_else(|| format!("{krate:?}"), |it| it.to_string())
 }
 
 /// Where the item of `id` is (`path@offset`) and the first mark in its text that made
@@ -1378,7 +1393,7 @@ fn macro_resolution(db: &Db, krate: Crate, name: &Symbol) -> String {
                 for (macro_name, item) in module.scope(db).macros() {
                     if macro_name.symbol() == name && matches!(item.def, MacroId::ProcMacroId(_)) {
                         // alloc: as above
-                        found.push(format!("{}:proc_macro", crate_name(db, at)));
+                        found.push(format!("{}:proc_macro", at.named(db)));
                     }
                 }
             }
@@ -1399,7 +1414,7 @@ fn macro_resolution(db: &Db, krate: Crate, name: &Symbol) -> String {
                 if defined == name {
                     let how = if direct { "" } else { "(calls)" };
                     // alloc: as above
-                    found.push(format!("{}:macro_rules{how}", crate_name(db, at)));
+                    found.push(format!("{}:macro_rules{how}", at.named(db)));
                 }
             }
         }

@@ -129,12 +129,10 @@ impl Unchecked {
 
 /// `krate` as an error names it: its name and, when it has one, its version.
 fn crate_said(db: &Db, krate: Crate) -> String {
-    let extra = krate.extra_data(db);
-    let name = extra.display_name.as_ref().map(|it| it.crate_name().as_str());
-    match (name, &extra.version) {
-        (Some(name), Some(version)) => format!("`{name}` {version}"), // alloc: an error's name, once
-        (Some(name), None) => format!("`{name}`"),                    // alloc: as above
-        (None, _) => format!("the unnamed crate {krate:?}"),          // alloc: as above
+    let name = krate.named(db);
+    match &krate.extra_data(db).version {
+        Some(version) => format!("`{name}` {version}"), // alloc: an error's name, once
+        None => format!("`{name}`"),                    // alloc: as above
     }
 }
 

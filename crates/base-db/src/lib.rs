@@ -44,10 +44,10 @@ pub use crate::{
     files::{AliasError, ExpansionRead, Files, ReadBy},
     input::{
         BuiltCrateData, BuiltDependency, BuiltFor, Crate, CrateBuilder, CrateBuilderId, CrateDataBuilder,
-        CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateType, CrateTypes,
+        CrateDisplayName, CrateGraphBuilder, CrateName, CrateNamed, CrateOrigin, CrateType, CrateTypes,
         CratesIdMap, CratesMap, DependencyBuilder, Env, ExtraCrateData, LangCrateOrigin,
         ProcMacroLoadingError, ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId,
-        TargetKind, UniqueCrateData,
+        TargetKind, UniqueCrateData, UnnamedCrate,
     },
     maintain::{Maintained, Maintainer, Reads, Trigger, Written},
     named::NAMED_PATHS_DOMAIN,
@@ -147,14 +147,116 @@ pub fn process_env_var(db: &Db, key: &str) -> Option<String> {
 /// What of the process's variables the database's crates read: each `env!` or `option_env!`
 /// the `env!` log has ([`Files::env_read`]) that read the process's variable, by crate and
 /// name, sorted. A read by a crate of the standard library, which reads its own variables
-/// alone, or of a variable the crate has of its own, read none of the process's
-/// (`hir_expand`'s `get_env_inner`). The log is never cleared, so it holds every read any value
-/// of the database was made from, and a few more: what a front end kept from one build to the
-/// next is keyed by in the process's environment.
+/// alone, or of a variable the crate has of its own ([`own_env_var`]), read none of the
+/// process's ([`env_var`]). The log is never cleared, so it holds every read any value of the
+/// database was made from, and a few more: what a front end kept from one build to the next is
+/// keyed by in the process's environment.
 pub fn process_env_reads(db: &Db) -> Vec<(Crate, String)> {
     let mut read = db.files().env_read();
-    read.retain(|(krate, name)| !krate.data(db).origin.is_lang() && krate.env(db).get(name).is_none());
+    read.retain(|(krate, name)| !krate.data(db).origin.is_lang() && own_env_var(db, *krate, name).is_none());
     read
+}
+
+/// `CARGO_PRIMARY_PACKAGE`, which cargo sets to `1` for the crates of the packages a build was
+/// asked for (`is_primary_package`). It is of the request, not of the crate: never among a
+/// crate's variables ([`Crate::env`]), so no crate's content, identity or image key holds it.
+/// A crate sees it through [`own_env_var`], and whatever is keyed by what a crate made covers
+/// it through the `env!` log, as the crate's read of it with its value then
+/// ([`PrimaryCrates`]).
+pub const PRIMARY_PACKAGE: &str = "CARGO_PRIMARY_PACKAGE";
+
+/// The crates of the request's primary packages ([`PRIMARY_PACKAGE`]), sorted. None of the
+/// standard library's: it reads its own variables alone, as a std built elsewhere does.
+#[blaze_query::input(singleton, debug)]
+pub struct PrimaryCrates {
+    #[returns(clone)]
+    crates: std::sync::Arc<[Crate]>,
+}
+
+/// The crates of the primary packages ([`PrimaryCrates`]), sorted.
+pub fn primary_crates(db: &Db) -> std::sync::Arc<[Crate]> {
+    PrimaryCrates::try_get(db).map_or(std::sync::Arc::default(), |it| it.crates(db))
+}
+
+/// Whether `krate` is of a primary package of the build ([`PrimaryCrates`]).
+pub fn is_primary(db: &Db, krate: Crate) -> bool {
+    !krate.data(db).origin.is_lang()
+        && PrimaryCrates::try_get(db).is_some_and(|it| it.crates(db).binary_search(&krate).is_ok())
+}
+
+/// Has builds from here on take `crates` as those of the primary packages ([`PrimaryCrates`]).
+/// The maintainers run again only when a crate that read [`PRIMARY_PACKAGE`] became primary or
+/// stopped being so, as [`set_process_env`] does for the process's variables.
+pub fn set_primary_crates(db: &mut Db, mut crates: Vec<Crate>) {
+    crates.sort_unstable();
+    crates.dedup();
+    let crates: std::sync::Arc<[Crate]> = crates.into();
+    let read: Vec<Crate> =
+        db.files().env_read().into_iter().filter(|(_, name)| name == PRIMARY_PACKAGE).map(|(krate, _)| krate).collect();
+    db.write("set_primary_crates", |db| match PrimaryCrates::try_get(&*db) {
+        Some(primary) => {
+            let was = primary.crates(&*db);
+            if was == crates {
+                return;
+            }
+            let moved = read.iter().any(|it| was.binary_search(it).is_ok() != crates.binary_search(it).is_ok());
+            primary.set_crates(db).to(crates);
+            if moved {
+                db.note(maintain::Note::Crates);
+            }
+        }
+        None => {
+            PrimaryCrates::new(db, crates);
+            db.note(maintain::Note::Crates);
+        }
+    })
+}
+
+/// The variable `name` as `krate` has it of its own: its variables ([`Crate::env`]), then
+/// [`PRIMARY_PACKAGE`] when it is primary ([`is_primary`]).
+pub fn own_env_var(db: &Db, krate: Crate, name: &str) -> Option<String> {
+    krate.env(db).get(name).or_else(|| (name == PRIMARY_PACKAGE && is_primary(db, krate)).then(|| "1".to_owned()))
+}
+
+/// The variable `name` as `env!` and `option_env!` in `krate` read it, as rustc reads them:
+/// what cargo set for the crate ([`own_env_var`]), then the process the build is for. The
+/// standard library's crates read their own alone, as a std built elsewhere does: no
+/// workspace's environment is in their identity.
+pub fn env_var(db: &Db, krate: Crate, name: &str) -> Option<String> {
+    let own = own_env_var(db, krate, name);
+    match krate.data(db).origin.is_lang() {
+        true => own,
+        false => own.or_else(|| process_env_var(db, name)),
+    }
+}
+
+/// The variables a proc macro called from a crate with the variables `env` is given, as rustc
+/// gives them: the crate's, and [`PRIMARY_PACKAGE`] when it is `primary`. One rule for the
+/// front end ([`macro_env`]) and for whoever works an expansion's reads out again with no
+/// database (a unit record's lookup).
+pub fn given_macro_env(env: &Env, primary: bool) -> std::borrow::Cow<'_, Env> {
+    match primary {
+        false => std::borrow::Cow::Borrowed(env),
+        true => {
+            let mut given = env.clone(); // clone: a primary crate's variables, once per crate
+            given.set(PRIMARY_PACKAGE, "1");
+            std::borrow::Cow::Owned(given)
+        }
+    }
+}
+
+/// [`given_macro_env`] of `krate` in `db`: what its proc-macro calls are given.
+pub fn macro_env(db: &Db, krate: Crate) -> &Env {
+    match is_primary(db, krate) {
+        false => krate.env(db),
+        true => primary_macro_env(db, krate),
+    }
+}
+
+/// [`macro_env`] of a primary crate, made once per crate.
+#[blaze_query::tracked(returns(ref))]
+fn primary_macro_env(db: &Db, krate: Crate) -> Env {
+    given_macro_env(krate.env(db), true).into_owned()
 }
 
 /// Has builds from here on be for a process with the variables `vars`. The maintainers run
@@ -221,8 +323,10 @@ impl FileText {
     /// view's file, whose vfs ID is given and checked, is hashed once. The file's ID and path
     /// are not in it.
     pub const DOMAIN: &'static str = "blaze v2 file text 2";
-    /// The content ID a file of a source root has when it has no text (bytes that are not
-    /// UTF-8, or none loaded): what the front end sees of it is that it has none.
+    /// The content ID a file of a source root has when it has neither text nor bytes (an alias
+    /// of a file whose bytes are not UTF-8). A file of the VFS whose bytes are not UTF-8 has
+    /// the content ID of its bytes instead ([`Files::file_content`]), which `include_bytes!`
+    /// and `include_str!` read.
     pub const NO_TEXT_DOMAIN: &'static str = "blaze v2 file without text 1";
 
     pub fn content_of(text: &str, appended_root_module: Option<&str>) -> ContentId {
@@ -431,11 +535,13 @@ pub struct CrateWorkspaceData {
 /// ```
 ///
 /// rustc's evaluation has no limit of its own past its `long_running_const_eval` lint (at 2
-/// million steps, allowed away by `#[allow]`), so the default is far beyond what code rustc
-/// takes without that `#[allow]` ever spends: it is there to end a loop that never would.
+/// million steps, allowed away by `#[allow]`; a step there is a call or a loop's back edge, not
+/// a block), so the default is far beyond what code rustc takes without that `#[allow]` ever
+/// spends: it is there to end a loop that never would.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct ConstEvalBudget {
-    /// Basic blocks run, as rustc counts the terminators it evaluates.
+    /// Basic blocks run, every one: a bound on any run, loops or not. rustc's lint counts
+    /// fewer, only the blocks that end in a call or close a loop.
     pub steps: u64,
     /// Bytes of the evaluation's stack and heap together.
     pub memory: u64,

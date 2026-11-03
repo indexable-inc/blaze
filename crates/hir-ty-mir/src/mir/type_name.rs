@@ -35,9 +35,19 @@ use crate::{
 
 /// `None` is a type whose rustc spelling this does not reproduce.
 pub fn rustc_type_name<'db>(db: &'db Db, ty: Ty<'db>) -> Option<String> {
+    rustc_type_name_or_refusal(db, ty).ok()
+}
+
+/// [`rustc_type_name`], or the rule of rustc's `type_name` that is not reproduced for the part
+/// of `ty` that stopped it.
+pub fn rustc_type_name_or_refusal<'db>(db: &'db Db, ty: Ty<'db>) -> Result<String, &'static str> {
     let mut out = Spelled::new(Spelling::TypeName);
-    write_ty(db, &mut out, ty)?;
-    Some(out.into_name())
+    match write_ty(db, &mut out, ty) {
+        Some(()) => Ok(out.into_name()),
+        None => Err(out.refused.unwrap_or(
+            "a part of it whose path, constant or generic argument could not be looked up",
+        )),
+    }
 }
 
 /// What the symbol of `func` with `args` demangles to, which is how a backtrace names it.
@@ -59,7 +69,7 @@ pub fn rustc_closure_name<'db>(
     expr: ExprId,
 ) -> Option<String> {
     let mut out = Spelled::new(Spelling::Symbol);
-    write_closure(db, &mut out, func, args, expr, Named::Code)?;
+    write_closure(db, &mut out, func.into(), args, expr, Named::Code)?;
     Some(out.into_name())
 }
 
@@ -96,7 +106,7 @@ pub fn rustc_debug_closure<'db>(
     expr: ExprId,
 ) -> Option<String> {
     let mut out = Spelled::new(Spelling::Debug);
-    write_closure(db, &mut out, func, args, expr, Named::Code)?;
+    write_closure(db, &mut out, func.into(), args, expr, Named::Code)?;
     Some(out.into_name())
 }
 
@@ -224,11 +234,9 @@ pub fn is_outside_closures<'db>(
     owner: DefWithBodyId,
     block: hir_def::BlockIdLt<'db>,
 ) -> bool {
-    let body = Body::of(db, owner);
-    let at = body
-        .exprs()
-        .find(|(_, expr)| matches!(expr, Expr::Block { id: Some(id), .. } if *id == block));
-    at.and_then(|(at, _)| closures_around(db, owner, at)).is_some_and(|it| it.is_empty())
+    block_expr(Body::of(db, owner), block)
+        .and_then(|at| closures_around(db, owner, at))
+        .is_some_and(|it| it.is_empty())
 }
 
 /// Which of rustc's ways to write a name is wanted.
@@ -247,11 +255,40 @@ enum Spelling {
 struct Spelled {
     text: blaze_mem::scratch::Lent<String>,
     spelling: Spelling,
+    /// The first rule found not reproduced, when writing stopped.
+    refused: Option<&'static str>,
+    /// Whether a type parameter is written `_`: `type_name` writes it so in the path of what a
+    /// body's item is written in, whose `impl` it writes with its own parameters.
+    params_as_holes: bool,
 }
 
 impl Spelled {
     fn new(spelling: Spelling) -> Self {
-        Self { text: blaze_mem::scratch::lend_string(), spelling }
+        Self {
+            text: blaze_mem::scratch::lend_string(),
+            spelling,
+            refused: None,
+            params_as_holes: false,
+        }
+    }
+
+    /// Stops writing: `why` names the rule of rustc's that is not reproduced.
+    fn refuse<T>(&mut self, why: &'static str) -> Option<T> {
+        self.refused.get_or_insert(why);
+        None
+    }
+
+    /// Stops writing because writing `part` of the name stopped, for its reason.
+    fn refuse_for<T>(&mut self, part: &Spelled) -> Option<T> {
+        if let Some(why) = part.refused {
+            self.refused.get_or_insert(why);
+        }
+        None
+    }
+
+    /// A part of the name, written apart from it in the same spelling.
+    fn part(&self) -> Spelled {
+        Spelled { params_as_holes: self.params_as_holes, ..Spelled::new(self.spelling) }
     }
 
     /// The name written, allocated once at its length.
@@ -329,11 +366,11 @@ fn write_module<'db>(
     if module.is_block_module(db) {
         let block = module.block(db)?;
         let (owner, around) = block_owner(db, block)?;
-        let body = Body::of(db, owner);
-        let (at, _) = body
-            .exprs()
-            .find(|(_, expr)| matches!(expr, Expr::Block { id: Some(id), .. } if *id == block))?;
+        let at = block_expr(Body::of(db, owner), block)?;
         match owner {
+            // rustc's `type_name` gives the path of what the item is written in no generic
+            // arguments: the item has no parent's.
+            _ if out.spelling == Spelling::TypeName => write_body_owner(db, out, owner, &[])?,
             DefWithBodyId::FunctionId(func) => match func.lookup(db).container {
                 ItemContainerId::ModuleId(_) => {
                     write_module(db, out, around)?;
@@ -377,6 +414,154 @@ fn write_module<'db>(
             out.push_str(name.crate_name().as_str());
             Some(())
         }
+    }
+}
+
+/// The expression that is `block` in `body`.
+fn block_expr(body: &Body, block: hir_def::BlockIdLt<'_>) -> Option<ExprId> {
+    let (at, _) = body
+        .exprs()
+        .find(|(_, expr)| matches!(expr, Expr::Block { id: Some(id), .. } if *id == block))?;
+    Some(at)
+}
+
+/// What rustc's `type_name` writes for the item a body is of, ahead of something written in
+/// that body (rustc's `default_print_def_path`): its path, the `impl` or trait it is in written
+/// for `parent_args`, and none of the item's own generic arguments. An item written in a body
+/// has no parent's arguments, so it gives none, and the `impl` is written with its own
+/// parameters, each `_`.
+fn write_body_owner<'db>(
+    db: &'db Db,
+    out: &mut Spelled,
+    owner: DefWithBodyId,
+    parent_args: &[GenericArg<'db>],
+) -> Option<()> {
+    let (container, name) = match owner {
+        DefWithBodyId::FunctionId(it) => {
+            (it.lookup(db).container, Some(&FunctionSignature::of(db, it).name))
+        }
+        DefWithBodyId::ConstId(it) => {
+            (it.lookup(db).container, ConstSignature::of(db, it).name.as_ref())
+        }
+        DefWithBodyId::StaticId(it) => {
+            (it.lookup(db).container, Some(&StaticSignature::of(db, it).name))
+        }
+        DefWithBodyId::VariantId(_) => {
+            return out.refuse(
+                "an item or closure in an enum discriminant's expression: rustc names it after \
+                 the discriminant's `{constant#n}`, which is not numbered here",
+            );
+        }
+    };
+    match container {
+        ItemContainerId::ModuleId(module) => write_module(db, out, module)?,
+        ItemContainerId::ImplId(impl_) => write_impl_type_name(db, out, impl_, parent_args)?,
+        // rustc qualifies the trait only with its arguments, `<T as Trait>::f`.
+        ItemContainerId::TraitId(trait_) => {
+            let self_ty = parent_args.first().and_then(|it| it.ty());
+            if let Some(self_ty) = self_ty {
+                out.push('<');
+                write_ty(db, out, self_ty)?;
+                out.push_str(" as ");
+            }
+            write_module(db, out, trait_.module(db))?;
+            write!(out, "::{}", TraitSignature::of(db, trait_).name.as_str()).ok()?;
+            if self_ty.is_some() {
+                write_args(db, out, without_defaults(db, trait_.into(), parent_args).get(1..)?)?;
+                out.push('>');
+            }
+        }
+        ItemContainerId::ExternBlockId(_) => {
+            return out.refuse("a body in an `extern` block, which rustc has no path through");
+        }
+    }
+    write!(out, "::{}", name.map_or("_", |it| it.as_str())).ok()
+}
+
+/// What rustc's `type_name` writes for an `impl` ahead of an item of it (its
+/// `default_print_impl_path`): `<T as path::Trait>`, the type alone when it is a path or a
+/// scalar and `<T>` when not, or `path::<impl path::Trait for T>` when the `impl` is written
+/// beside neither the type nor the trait. With fewer `args` than the `impl` has parameters, it
+/// is written with its own parameters, each `_`, as rustc writes what a body of it holds.
+fn write_impl_type_name<'db>(
+    db: &'db Db,
+    out: &mut Spelled,
+    impl_: hir_def::ImplId,
+    args: &[GenericArg<'db>],
+) -> Option<()> {
+    let interner = DbInterner::new_no_crate(db);
+    let identity = GenericArgs::identity_for_item(interner, impl_.into());
+    let holes = args.len() < identity.len();
+    let args = if holes { identity.as_slice() } else { args };
+    let was = out.params_as_holes;
+    out.params_as_holes = was || holes;
+    let written = (|| {
+        let self_ty = db.impl_self_ty(impl_).instantiate(interner, args).skip_norm_wip();
+        let trait_ref =
+            db.impl_trait(impl_).map(|it| it.instantiate(interner, args).skip_norm_wip());
+        let module = impl_.lookup(db).container;
+        let in_self_module =
+            characteristic_module(db, self_ty).is_some_and(|it| same_def_parent(db, it, module));
+        let in_trait_module =
+            trait_ref.is_some_and(|it| same_def_parent(db, it.def_id.0.module(db), module));
+        if !in_self_module && !in_trait_module {
+            write_module(db, out, module)?;
+            out.push_str("::<impl ");
+            if let Some(trait_ref) = trait_ref {
+                write_trait(db, out, trait_ref)?;
+                out.push_str(" for ");
+            }
+            write_ty(db, out, self_ty)?;
+            out.push('>');
+        } else if let Some(trait_ref) = trait_ref {
+            out.push('<');
+            write_ty(db, out, self_ty)?;
+            out.push_str(" as ");
+            write_trait(db, out, trait_ref)?;
+            out.push('>');
+        } else if matches!(
+            self_ty.kind(),
+            TyKind::Adt(..)
+                | TyKind::Bool
+                | TyKind::Char
+                | TyKind::Str
+                | TyKind::Int(_)
+                | TyKind::Uint(_)
+                | TyKind::Float(_)
+        ) {
+            write_ty(db, out, self_ty)?;
+        } else {
+            out.push('<');
+            write_ty(db, out, self_ty)?;
+            out.push('>');
+        }
+        Some(())
+    })();
+    out.params_as_holes = was;
+    written
+}
+
+/// Whether rustc takes what is written in `a` and what is written in `b` to have one parent: a
+/// module, or a body (blocks of one body are not parents of their own) outside its closures or
+/// in the same closure of it.
+fn same_def_parent<'db>(db: &'db Db, a: ModuleIdLt<'db>, b: ModuleIdLt<'db>) -> bool {
+    if a == b {
+        return true;
+    }
+    let in_body = |module: ModuleIdLt<'db>| {
+        let block = module.block(db)?;
+        let (owner, _) = block_owner(db, block)?;
+        let at = block_expr(Body::of(db, owner), block)?;
+        Some((owner, closures_around(db, owner, at)?))
+    };
+    if !a.is_block_module(db) || !b.is_block_module(db) {
+        return false;
+    }
+    match (in_body(a), in_body(b)) {
+        (Some((a, in_a)), Some((b, in_b))) => {
+            a == b && in_a.iter().map(|it| it.0).eq(in_b.iter().map(|it| it.0))
+        }
+        _ => false,
     }
 }
 
@@ -474,34 +659,49 @@ fn write_ty<'db>(db: &'db Db, out: &mut Spelled, ty: Ty<'db>) -> Option<()> {
             }
         }
         TyKind::Closure(id, args) => {
-            let func = written_in(id.0.loc(db))?;
-            write_closure(db, out, func.0, args.as_closure().parent_args(), func.1, Named::Kept)?;
+            let (owner, at) = written_in(out, id.0.loc(db))?;
+            write_closure(db, out, owner, args.as_closure().parent_args(), at, Named::Kept)?;
         }
         TyKind::Coroutine(id, args) => {
-            let func = written_in(id.0.loc(db))?;
-            // The future of an `async` closure is named after how the closure was called.
-            let is_block = matches!(
-                Body::of(db, func.0.into()).expr(func.1),
+            let (owner, at) = written_in(out, id.0.loc(db))?;
+            // The future of an `async` closure is named after how the closure was called:
+            // called by value, rustc's is a body of its own, `{{closure}}::{{call_once}}`.
+            let of_closure = matches!(
+                Body::of(db, owner).expr(at),
                 Expr::Closure {
-                    closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Block, .. },
+                    closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Closure, .. },
                     ..
                 }
             );
-            if out.spelling == Spelling::TypeName && !is_block {
-                return None;
+            if out.spelling == Spelling::TypeName && of_closure {
+                return out.refuse(
+                    "the future of an `async` closure: rustc's `type_name` adds `{{call_once}}` \
+                     when the closure was called by value, which this coroutine does not say",
+                );
             }
-            write_closure(db, out, func.0, args.as_coroutine().parent_args(), func.1, Named::Kept)?;
+            write_closure(db, out, owner, args.as_coroutine().parent_args(), at, Named::Kept)?;
         }
-        TyKind::CoroutineClosure(id, args) if out.spelling != Spelling::TypeName => {
-            let func = written_in(id.0.loc(db))?;
-            write_closure(
-                db,
-                out,
-                func.0,
-                args.as_coroutine_closure().parent_args(),
-                func.1,
-                Named::Kept,
-            )?;
+        TyKind::CoroutineClosure(id, args) => {
+            let (owner, at) = written_in(out, id.0.loc(db))?;
+            let parent_args = args.as_coroutine_closure().parent_args();
+            write_closure(db, out, owner, parent_args, at, Named::Kept)?;
+        }
+        // `type_name` writes a type parameter of the `impl` of what a body's item is written in
+        // `_`, as it does every type that is not one yet.
+        TyKind::Param(_)
+        | TyKind::Bound(..)
+        | TyKind::Placeholder(_)
+        | TyKind::Infer(_)
+        | TyKind::Error(_)
+            if out.params_as_holes =>
+        {
+            out.push('_');
+        }
+        // An extern type is written after its `extern` block, `path::{{extern}}::Opaque`.
+        TyKind::Foreign(alias) if out.spelling == Spelling::TypeName => {
+            write_module(db, out, alias.0.module(db))?;
+            let name = TypeAliasSignature::of(db, alias.0).name.as_str();
+            write!(out, "::{{{{extern}}}}::{name}").ok()?;
         }
         TyKind::FnPtr(sig, header) => {
             let sig = sig.skip_binder();
@@ -522,7 +722,15 @@ fn write_ty<'db>(db: &'db Db, out: &mut Spelled, ty: Ty<'db>) -> Option<()> {
                 write_ty(db, out, sig.output())?;
             }
         }
-        _ => return None,
+        TyKind::Param(_) => {
+            return out.refuse("a type parameter, which only an instance's own types replace");
+        }
+        _ => {
+            return out.refuse(
+                "a type of a kind this does not spell (an alias, a pattern type, an unsafe \
+                 binder, or in a symbol or debug info an extern type)",
+            );
+        }
     }
     Some(())
 }
@@ -537,18 +745,22 @@ fn write_dyn<'db>(
     // alloc: a trait object's parts, sorted as rustc sorts them; only on `dyn` types
     let mut parts = Vec::new();
     if let Some(principal) = bounds.principal() {
-        let mut part = Spelled::new(out.spelling);
+        let mut part = out.part();
         let projections: Vec<_> =
             // alloc: a trait object's projections; only on `dyn` types
             bounds.projection_bounds().into_iter().map(|it| it.skip_binder()).collect();
-        write_principal(db, &mut part, principal.skip_binder(), &projections)?;
+        if write_principal(db, &mut part, principal.skip_binder(), &projections).is_none() {
+            return out.refuse_for(&part);
+        }
         parts.push(part.into_name());
     }
     // alloc: a trait object's parts, sorted as rustc sorts them; only on `dyn` types
     let mut autos = Vec::new();
     for auto in bounds.auto_traits() {
-        let mut part = Spelled::new(out.spelling);
-        write_module(db, &mut part, auto.0.module(db))?;
+        let mut part = out.part();
+        if write_module(db, &mut part, auto.0.module(db)).is_none() {
+            return out.refuse_for(&part);
+        }
         write!(part, "::{}", TraitSignature::of(db, auto.0).name.as_str()).ok()?;
         autos.push(part.into_name());
     }
@@ -590,8 +802,10 @@ fn write_principal<'db>(
         }
         (false, args, []) => write_args(db, out, args)?,
         (false, args, [projection]) => {
-            let mut inner = Spelled::new(out.spelling);
-            write_args(db, &mut inner, args)?;
+            let mut inner = out.part();
+            if write_args(db, &mut inner, args).is_none() {
+                return out.refuse_for(&inner);
+            }
             let before =
                 // alloc: the text `type_name` returns is the result
                 inner.text.strip_suffix('>').map_or("<".to_owned(), |it| format!("{it}, "));
@@ -601,17 +815,24 @@ fn write_principal<'db>(
             out.push('>');
         }
         // FIXME: rustc writes several associated types in an order that is not known here.
-        _ => return None,
+        _ => {
+            return out.refuse(
+                "a trait object with several associated types, or an `Fn` trait not written \
+                 `Fn(A) -> B`: rustc's order of them is not reproduced",
+            );
+        }
     }
     Some(())
 }
 
-/// The function a closure is written in and the expression that is the closure.
-fn written_in(closure: InternedClosure<'_>) -> Option<(FunctionId, ExprId)> {
+/// The body a closure is written in and the expression that is the closure.
+fn written_in(out: &mut Spelled, closure: InternedClosure<'_>) -> Option<(DefWithBodyId, ExprId)> {
     match closure.owner {
-        InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => Some((func, closure.expr)),
-        // FIXME: one of a constant or a static is named after that.
-        _ => None,
+        InferBodyId::DefWithBodyId(owner) => Some((owner, closure.expr)),
+        InferBodyId::AnonConstId(_) => out.refuse(
+            "a closure in an anonymous constant: rustc names it after the constant's \
+             `{constant#n}`, which is not numbered here",
+        ),
     }
 }
 
@@ -698,21 +919,37 @@ fn type_name_value(konst: Const<'_>) -> Option<String> {
     }
 }
 
-/// The closure or `async` block written at `expr` of `func`.
+/// The closure or `async` block written at `expr` of `owner`, `args` the generic arguments of
+/// `owner`.
 fn write_closure<'db>(
     db: &'db Db,
     out: &mut Spelled,
-    func: FunctionId,
+    owner: DefWithBodyId,
     args: &[GenericArg<'db>],
     expr: ExprId,
     named: Named,
 ) -> Option<()> {
-    let around = closures_around(db, func.into(), expr)?;
-    if out.spelling != Spelling::Debug {
-        write_function(db, out, func, args)?;
-        out.closures(&around);
-        return Some(());
+    let around = closures_around(db, owner, expr)?;
+    match (owner, out.spelling) {
+        (DefWithBodyId::FunctionId(func), Spelling::TypeName | Spelling::Symbol) => {
+            write_function(db, out, func, args)?;
+            out.closures(&around);
+            return Some(());
+        }
+        // A constant or a static has no arguments of its own: what it is in has them all.
+        (_, Spelling::TypeName) => {
+            write_body_owner(db, out, owner, args)?;
+            out.closures(&around);
+            return Some(());
+        }
+        (DefWithBodyId::FunctionId(_), Spelling::Debug) => {}
+        _ => {
+            return out.refuse(
+                "a closure of a constant, a static or a discriminant in a symbol or debug info",
+            );
+        }
     }
+    let DefWithBodyId::FunctionId(func) = owner else { return None };
     // A debugger is told of what the function is written in by its place there, then of the
     // closure, and last of what the function is generic over.
     match func.lookup(db).container {
@@ -859,7 +1096,10 @@ fn write_function<'db>(
     let (parent_args, own_args) = args.split_at_checked(generics(db, func.into()).len_parent())?;
     // A lifetime of a function is mostly late bound, and then no argument to rustc.
     if out.spelling == Spelling::TypeName && own_args.iter().any(|arg| arg.region().is_some()) {
-        return None;
+        return out.refuse(
+            "a function generic over a lifetime: rustc's `type_name` writes an early bound one \
+             `'_` and a late bound one not at all, which is not told apart here",
+        );
     }
     match func.lookup(db).container {
         ItemContainerId::ModuleId(module) => write_module(db, out, module)?,
@@ -874,59 +1114,31 @@ fn write_function<'db>(
             }
             out.push('>');
         }
-        ItemContainerId::TraitId(trait_) if out.spelling == Spelling::Symbol => {
-            let self_ty = parent_args.first()?;
+        // rustc qualifies a trait's function, a provided one, with the type it is of.
+        ItemContainerId::TraitId(trait_) if out.spelling != Spelling::Debug => {
+            let Some(self_ty) = parent_args.first().and_then(|it| it.ty()) else {
+                return out.refuse("a trait's function given no `Self` type");
+            };
             out.push('<');
-            write_ty(db, out, self_ty.ty()?)?;
+            write_ty(db, out, self_ty)?;
             out.push_str(" as ");
             write_module(db, out, trait_.module(db))?;
             write!(out, "::{}", TraitSignature::of(db, trait_).name.as_str()).ok()?;
             write_args(db, out, without_defaults(db, trait_.into(), parent_args).get(1..)?)?;
             out.push('>');
         }
-        ItemContainerId::ImplId(impl_) => {
-            let interner = DbInterner::new_no_crate(db);
-            let self_ty = db.impl_self_ty(impl_).instantiate(interner, parent_args).skip_norm_wip();
-            let trait_ref = db
-                .impl_trait(impl_)
-                .map(|it| it.instantiate(interner, parent_args).skip_norm_wip());
-            let module = impl_.lookup(db).container;
-            let in_self_module = characteristic_module(db, self_ty) == Some(module);
-            let in_trait_module = trait_ref.is_some_and(|it| it.def_id.0.module(db) == module);
-            if !in_self_module && !in_trait_module {
-                write_module(db, out, module)?;
-                out.push_str("::<impl ");
-                if let Some(trait_ref) = trait_ref {
-                    write_trait(db, out, trait_ref)?;
-                    out.push_str(" for ");
-                }
-                write_ty(db, out, self_ty)?;
-                out.push('>');
-            } else if let Some(trait_ref) = trait_ref {
-                out.push('<');
-                write_ty(db, out, self_ty)?;
-                out.push_str(" as ");
-                write_trait(db, out, trait_ref)?;
-                out.push('>');
-            } else if matches!(
-                self_ty.kind(),
-                TyKind::Adt(..)
-                    | TyKind::Bool
-                    | TyKind::Char
-                    | TyKind::Str
-                    | TyKind::Int(_)
-                    | TyKind::Uint(_)
-                    | TyKind::Float(_)
-            ) {
-                write_ty(db, out, self_ty)?;
-            } else {
-                out.push('<');
-                write_ty(db, out, self_ty)?;
-                out.push('>');
-            }
+        ItemContainerId::ImplId(impl_) => write_impl_type_name(db, out, impl_, parent_args)?,
+        // `type_name` writes a function of an `extern` block after the block, as an extern type.
+        ItemContainerId::ExternBlockId(block) if out.spelling == Spelling::TypeName => {
+            write_module(db, out, block.module(db))?;
+            out.push_str("::{{extern}}");
         }
-        // FIXME: a provided method is `<T as Trait>::f`.
-        ItemContainerId::TraitId(_) | ItemContainerId::ExternBlockId(_) => return None,
+        ItemContainerId::TraitId(_) | ItemContainerId::ExternBlockId(_) => {
+            return out.refuse(
+                "a provided trait function in debug info, or a function of an `extern` block \
+                 in a symbol or debug info",
+            );
+        }
     }
     write!(out, "::{}", FunctionSignature::of(db, func).name.as_str()).ok()?;
     if out.spelling == Spelling::Symbol && own_args.iter().any(|arg| arg.region().is_none()) {

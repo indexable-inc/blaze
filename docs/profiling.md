@@ -646,7 +646,11 @@ callsite, depth, the ring that made the span and its allocation count, the inter
 function, the build and unit, and the bytes allocated. A ring holds 16384 rows (1 MiB). A span's
 open state lives from its start to its close in a slot of the ring of the thread that made it.
 Its id names that ring, slot and a sequence number, so a span closed on another thread still
-finds where it began. A thread has 16,384 slots, allocated 256 at a time as its open spans reach
+finds where it began. Its row names the thread that made it: the slot keeps the maker's tid and
+name, and a span closed by another thread (or on its own ring after the ring passed to the next
+thread) carries them in a column row written as it closes. Until 2026-11-02 the reader named such
+a span by whichever thread held the maker's ring when it read, so a pool worker's wait read as the
+wait of the next thread to take the worker's ring. A thread has 16,384 slots, allocated 256 at a time as its open spans reach
 them: a fiber parked with its enter stack keeps its spans open in the ring of the thread that made
 them, so one worker holds the open spans of hundreds of parked jobs. Until 2026-11-02 it had 64,
 and most workers of a self-build used every one, losing the spans past them (the waits of the

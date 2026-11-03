@@ -45,14 +45,14 @@ fn kind_of(n: u64) -> Kind {
     [Kind::Query, Kind::Code, Kind::Debug, Kind::Run, Kind::Output][n as usize % 5]
 }
 
-fn reads_back_what_a_map_holds(tc: TestCase) {
+fn reads_back_what_a_map_holds(tc: &TestCase) {
     let ops = tc.draw(gs::vecs(op()).min_size(1).max_size(40));
     let mut sim = Sim::new(tc.draw(gs::integers()), quiet());
     let mut store = open(&mut sim, "store");
     let mut model: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     for op in ops {
         match op {
-            Op::Put(n, bytes) => match (store.put(key(n), kind_of(n), bytes.clone()), model.get(&n)) {
+            Op::Put(n, bytes) => match (store.put(key(n), kind_of(n), &bytes), model.get(&n)) {
                 (Ok(_), None) => {
                     model.insert(n, bytes);
                 }
@@ -103,5 +103,5 @@ fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
 /// `HEGEL_TEST_CASES=<n>` runs it longer.
 #[test]
 fn the_store_reads_back_what_a_map_holds() {
-    run_cases(48, reads_back_what_a_map_holds);
+    run_cases(48, |tc| reads_back_what_a_map_holds(&tc));
 }

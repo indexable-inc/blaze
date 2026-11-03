@@ -254,6 +254,7 @@ pub struct S {}
                 "MacroCallId::parse_macro_expansion",
                 "HirFileId::ast_id_map",
                 "file_item_tree_query",
+                "expanded_item_key",
             ]
         "#]],
     );
@@ -299,6 +300,7 @@ fn f() { foo }
                 "MacroCallId::proc_macro_expansion",
                 "HirFileId::ast_id_map",
                 "file_item_tree_query",
+                "expanded_item_key",
             ]
         "#]],
     );

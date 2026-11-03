@@ -18,6 +18,11 @@ pub(in crate::serve::unit) fn no_expansion(_: &base_db::Env, _: &[u8]) -> Result
     Err("a test with no proc-macro expansion asked for one's reads".to_owned())
 }
 
+/// A `primary` for a request that makes no package primary.
+pub(in crate::serve::unit) fn no_primary(_: &str) -> bool {
+    false
+}
+
 /// A store of slots and records, as a map.
 #[derive(Default)]
 pub(in crate::serve::unit) struct Store(pub(in crate::serve::unit) HashMap<Key, Vec<u8>, Global>);
@@ -26,7 +31,18 @@ impl Store {
     /// The record of base key `base` that `reads` made under `env`, filed as [`file`] says,
     /// with its slot kept.
     pub(in crate::serve::unit) fn keep(&mut self, base: Key, reads: &Reads, env: &[(String, String)]) -> Key {
-        let Filing { key, slot } = file(base, reads, env, |at| self.0.get(at).map(Vec::as_slice)).unwrap().unwrap();
+        self.keep_for(base, reads, env, &no_primary)
+    }
+
+    /// [`Store::keep`] for a request whose primary packages `primary` says.
+    pub(in crate::serve::unit) fn keep_for(
+        &mut self,
+        base: Key,
+        reads: &Reads,
+        env: &[(String, String)],
+        primary: &dyn Fn(&str) -> bool,
+    ) -> Key {
+        let Filing { key, slot } = file(base, reads, env, primary, |at| self.0.get(at).map(Vec::as_slice)).unwrap().unwrap();
         if let Some((at, bytes)) = slot {
             self.0.insert(at, bytes);
         }
@@ -42,11 +58,21 @@ impl Store {
         env: &[(String, String)],
         now: impl FnMut(&base_db::Env, &[u8]) -> Result<ContentId, String>,
     ) -> Option<Found> {
-        find(base, env, now, |at| self.0.get(at).map(Vec::as_slice), |key| self.0.contains_key(key)).unwrap()
+        find(base, env, &no_primary, now, |at| self.0.get(at).map(Vec::as_slice), |key| self.0.contains_key(key)).unwrap()
     }
 
     pub(in crate::serve::unit) fn find(&self, base: Key, env: &[(String, String)]) -> Option<Found> {
         self.find_now(base, env, no_expansion)
+    }
+
+    /// [`Store::find`] for a request whose primary packages `primary` says.
+    pub(in crate::serve::unit) fn find_for(
+        &self,
+        base: Key,
+        env: &[(String, String)],
+        primary: &dyn Fn(&str) -> bool,
+    ) -> Option<Found> {
+        find(base, env, primary, no_expansion, |at| self.0.get(at).map(Vec::as_slice), |key| self.0.contains_key(key)).unwrap()
     }
 }
 
@@ -86,13 +112,13 @@ fn each_set_of_names_has_a_slot_until_they_run_out() {
     store.keep(base(), &Reads::named(&["A"]), &a);
     store.keep(base(), &Reads::named(&["B"]), &a);
     assert!(store.0.contains_key(&slot(base(), 0)) && store.0.contains_key(&slot(base(), 1)));
-    let again = file(base(), &Reads::named(&["A"]), &env(&[("A", "9")]), |at| store.0.get(at).map(Vec::as_slice));
+    let again = file(base(), &Reads::named(&["A"]), &env(&[("A", "9")]), &no_primary, |at| store.0.get(at).map(Vec::as_slice));
     assert!(again.unwrap().is_some_and(|it| it.slot.is_none()), "the same names reuse their slot");
     for n in 2..SLOTS {
         store.0.insert(slot(base(), n), Reads::named(&[format!("N{n}").as_str()]).encode());
     }
-    assert_eq!(file(base(), &Reads::named(&["C"]), &a, |at| store.0.get(at).map(Vec::as_slice)), Ok(None));
-    let nothing = file(base(), &Reads::default(), &a, |at| store.0.get(at).map(Vec::as_slice));
+    assert_eq!(file(base(), &Reads::named(&["C"]), &a, &no_primary, |at| store.0.get(at).map(Vec::as_slice)), Ok(None));
+    let nothing = file(base(), &Reads::default(), &a, &no_primary, |at| store.0.get(at).map(Vec::as_slice));
     assert_eq!(nothing.map(|it| it.map(|it| it.key)), Ok(Some(base())), "a record that read nothing needs no slot");
 }
 
@@ -117,6 +143,33 @@ fn a_slot_that_does_not_decode_is_an_error_naming_it() {
 
     let mut store = Store::default();
     store.0.insert(slot(base(), 0), swapped);
-    let error = find(base(), &[], no_expansion, |at| store.0.get(at).map(Vec::as_slice), |key| store.0.contains_key(key)).unwrap_err();
+    let error = find(base(), &[], &no_primary, no_expansion, |at| store.0.get(at).map(Vec::as_slice), |key| store.0.contains_key(key)).unwrap_err();
     assert!(error.starts_with("slot 0 of record key"), "{error}");
+}
+
+/// A record whose closure read `CARGO_PRIMARY_PACKAGE` is filed by whether the request made its
+/// package primary, and by nothing else of the request: found while that is as it was, missed
+/// once it moves (rule 18). When not primary, the process's variable is what `env!` read, so it
+/// is filed by the value read, not by how the value came.
+#[test]
+fn a_record_that_read_primary_package_is_filed_by_it() {
+    const MANIFEST: &str = "/w/s/Cargo.toml";
+    let mut store = Store::default();
+    let reads = Reads::primary(MANIFEST);
+    let primary = |manifest: &str| manifest == MANIFEST;
+    let others = |manifest: &str| manifest == "/w/b/Cargo.toml";
+    let key = store.keep_for(base(), &reads, &env(&[]), &primary);
+    assert_ne!(key, base(), "a record that read it is filed by it");
+    assert_eq!(store.find_for(base(), &env(&[("OLDPWD", "/b")]), &primary).map(|it| it.key), Some(key));
+    assert_eq!(store.find_for(base(), &env(&[]), &others), None, "its package no longer primary");
+    assert_eq!(store.find_for(base(), &env(&[]), &no_primary), None, "no package primary");
+    let not = store.keep_for(base(), &reads, &env(&[]), &others);
+    assert_ne!(not, key);
+    assert_eq!(store.find_for(base(), &env(&[]), &no_primary).map(|it| it.key), Some(not), "another package's primary-ness is nothing it read");
+    let process = env(&[("CARGO_PRIMARY_PACKAGE", "1")]);
+    assert_eq!(store.find_for(base(), &process, &no_primary).map(|it| it.key), Some(key), "the process's variable, which `env!` reads when not primary, read as primary does");
+    assert_eq!(store.find_for(base(), &env(&[("CARGO_PRIMARY_PACKAGE", "0")]), &no_primary), None, "another value of it");
+    assert_eq!(store.find_for(base(), &env(&[]), &primary).map(|it| it.key), Some(key), "primary again");
+    let decoded = Reads::decode(&reads.encode()).unwrap();
+    assert_eq!(decoded, reads, "its slot keeps the manifest");
 }

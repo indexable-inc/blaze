@@ -3,7 +3,8 @@
 use base_db::{Crate, Db};
 use hir_def::{
     AdtId, AttrDefId, BuiltinDeriveImplId, CallableDefId, ConstId, DefWithBodyId, EnumId,
-    EnumVariantId, ExpressionStoreOwnerId, FunctionId, GenericDefId, ImplId, StaticId, StructId,
+    EnumVariantId, ExpressionStoreOwnerId, FunctionId, GenericDefId, ImplId, ItemContainerId,
+    StaticId, StructId,
     HasModule, TraitId, TypeAliasId, UnionId, VariantId,
     signatures::{
         ConstSignature, EnumSignature, FunctionSignature, StaticSignature, StructSignature,
@@ -15,6 +16,7 @@ use stdx::impl_from;
 
 use crate::{
     InferBodyId,
+    rpitit::RpititId,
     db::{
         AnonConstId, GeneralConstId, HirDatabase, InternedClosureId, InternedCoroutineClosureId,
         InternedCoroutineId, InternedOpaqueTyId,
@@ -44,6 +46,9 @@ pub enum SolverDefId<'db> {
     InternedCoroutineId(InternedCoroutineId<'db>),
     InternedCoroutineClosureId(InternedCoroutineClosureId<'db>),
     InternedOpaqueTyId(InternedOpaqueTyId<'db>),
+    /// The associated type a trait method's return-position `impl Trait` is, the trait's or an
+    /// impl's (rustc's synthesized `ImplTraitInTraitData` item).
+    RpititId(RpititId),
     EnumVariantId(EnumVariantId),
     Ctor(Ctor),
 }
@@ -102,6 +107,14 @@ impl SolverDefId<'_> {
             SolverDefId::InternedOpaqueTyId(id) => {
                 f.debug_tuple("InternedOpaqueTyId").field(&id).finish()
             }
+            SolverDefId::RpititId(id) => f
+                .debug_tuple("RpititId")
+                .field(&format_args!(
+                    "{{impl Trait#{} of {}}}",
+                    id.idx.into_raw().into_u32(),
+                    FunctionSignature::of(db, id.function).name.as_str()
+                ))
+                .finish(),
             SolverDefId::EnumVariantId(id) => {
                 let parent_enum = id.loc(db).parent;
                 f.debug_tuple("EnumVariantId")
@@ -145,6 +158,7 @@ impl_from!(
     InternedCoroutineId<'db>,
     InternedCoroutineClosureId<'db>,
     InternedOpaqueTyId<'db>,
+    RpititId,
     EnumVariantId,
     Ctor
     for SolverDefId<'db>
@@ -242,6 +256,7 @@ impl TryFrom<SolverDefId<'_>> for AttrDefId {
             | SolverDefId::InternedCoroutineId(_)
             | SolverDefId::InternedCoroutineClosureId(_)
             | SolverDefId::InternedOpaqueTyId(_)
+            | SolverDefId::RpititId(_)
             | SolverDefId::AnonConstId(_) => Err(()),
         }
     }
@@ -258,6 +273,7 @@ impl TryFrom<SolverDefId<'_>> for DefWithBodyId {
             SolverDefId::StaticId(id) => id.into(),
             SolverDefId::EnumVariantId(id) | SolverDefId::Ctor(Ctor::Enum(id)) => id.into(),
             SolverDefId::InternedOpaqueTyId(_)
+            | SolverDefId::RpititId(_)
             | SolverDefId::TraitId(_)
             | SolverDefId::TypeAliasId(_)
             | SolverDefId::ImplId(_)
@@ -285,6 +301,7 @@ impl<'db> TryFrom<SolverDefId<'db>> for InferBodyId<'db> {
             SolverDefId::EnumVariantId(id) | SolverDefId::Ctor(Ctor::Enum(id)) => id.into(),
             SolverDefId::AnonConstId(id) => id.into(),
             SolverDefId::InternedOpaqueTyId(_)
+            | SolverDefId::RpititId(_)
             | SolverDefId::TraitId(_)
             | SolverDefId::TypeAliasId(_)
             | SolverDefId::ImplId(_)
@@ -315,6 +332,7 @@ impl TryFrom<SolverDefId<'_>> for GenericDefId {
             | SolverDefId::InternedCoroutineId(_)
             | SolverDefId::InternedCoroutineClosureId(_)
             | SolverDefId::InternedOpaqueTyId(_)
+            | SolverDefId::RpititId(_)
             | SolverDefId::EnumVariantId(_)
             | SolverDefId::BuiltinDeriveImplId(_)
             | SolverDefId::AnonConstId(_)
@@ -343,6 +361,7 @@ impl<'db> SolverDefId<'db> {
                 crate::ImplTraitId::ReturnTypeImplTrait(func, _) => func.krate(db),
                 crate::ImplTraitId::TypeAliasImplTrait(alias, _) => alias.krate(db),
             },
+            SolverDefId::RpititId(id) => id.function.krate(db),
             SolverDefId::EnumVariantId(id) => id.krate(db),
             SolverDefId::Ctor(Ctor::Struct(id)) => id.krate(db),
             SolverDefId::Ctor(Ctor::Enum(id)) => id.krate(db),
@@ -502,11 +521,57 @@ declare_id_wrapper!(AdtIdWrapper, AdtId);
 declare_id_wrapper_with_lt!(OpaqueTyIdWrapper, InternedOpaqueTyId, OpaqueTyIdWrapper<'db>);
 declare_id_wrapper_with_lt!(AnonConstIdWrapper, AnonConstId);
 
+/// A trait's or an impl's associated type: one written (`type Item;`), or one a trait method's
+/// return-position `impl Trait` is (rustc's `ImplTraitInTraitData` items, [`RpititId`]). A free
+/// or inherent alias is only ever written, so only the projection ids carry this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AssocTyId {
+    TypeAliasId(TypeAliasId),
+    RpititId(RpititId),
+}
+impl_from!(TypeAliasId, RpititId for AssocTyId);
+
+impl<'db> From<AssocTyId> for SolverDefId<'db> {
+    #[inline]
+    fn from(value: AssocTyId) -> Self {
+        match value {
+            AssocTyId::TypeAliasId(id) => id.into(),
+            AssocTyId::RpititId(id) => id.into(),
+        }
+    }
+}
+
+impl TryFrom<SolverDefId<'_>> for AssocTyId {
+    type Error = ();
+
+    #[inline]
+    fn try_from(value: SolverDefId<'_>) -> Result<Self, Self::Error> {
+        match value {
+            SolverDefId::TypeAliasId(it) => Ok(AssocTyId::TypeAliasId(it)),
+            SolverDefId::RpititId(it) => Ok(AssocTyId::RpititId(it)),
+            _ => Err(()),
+        }
+    }
+}
+
+impl AssocTyId {
+    /// The written associated type, `None` for a trait method's `impl Trait`.
+    #[inline]
+    pub fn as_type_alias(self) -> Option<TypeAliasId> {
+        match self {
+            AssocTyId::TypeAliasId(id) => Some(id),
+            AssocTyId::RpititId(_) => None,
+        }
+    }
+}
+
+/// The ids of one kind of alias: its type, its constant and either. `$ty_wraps` is
+/// [`AssocTyId`] for the projections a trait method's `impl Trait` can be, `TypeAliasId` for
+/// the free and inherent ones, which are only ever written.
 macro_rules! declare_ty_const_pair {
-    ( $ty_id_name:ident, $const_id_name:ident, $term_id_name:ident ) => {
+    ( $ty_id_name:ident, $const_id_name:ident, $term_id_name:ident, TypeAliasId ) => {
         declare_id_wrapper!($ty_id_name, TypeAliasId);
-        declare_id_wrapper!($const_id_name, ConstId);
-        declare_id_wrapper!($term_id_name, TermId, SolverDefId<'db>, no_try_from);
+        declare_ty_const_pair!(@common $ty_id_name, $const_id_name, $term_id_name);
 
         impl TryFrom<SolverDefId<'_>> for $term_id_name {
             type Error = ();
@@ -527,9 +592,65 @@ macro_rules! declare_ty_const_pair {
             }
         }
 
-        impl From<$const_id_name> for $term_id_name {
-            fn from(value: $const_id_name) -> Self {
-                $term_id_name(TermId::ConstId(value.0))
+        impl TryFrom<$term_id_name> for $ty_id_name {
+            type Error = ();
+
+            fn try_from(value: $term_id_name) -> Result<Self, Self::Error> {
+                match value.0 {
+                    TermId::TypeAliasId(id) => Ok($ty_id_name(id)),
+                    TermId::ConstId(_) | TermId::RpititId(_) => Err(()),
+                }
+            }
+        }
+    };
+
+    ( $ty_id_name:ident, $const_id_name:ident, $term_id_name:ident, AssocTyId ) => {
+        declare_id_wrapper!($ty_id_name, AssocTyId, SolverDefId<'db>, no_try_from);
+        declare_ty_const_pair!(@common $ty_id_name, $const_id_name, $term_id_name);
+
+        impl TryFrom<SolverDefId<'_>> for $ty_id_name {
+            type Error = ();
+
+            #[inline]
+            fn try_from(value: SolverDefId<'_>) -> Result<Self, Self::Error> {
+                AssocTyId::try_from(value).map(Self)
+            }
+        }
+
+        impl From<TypeAliasId> for $ty_id_name {
+            #[inline]
+            fn from(value: TypeAliasId) -> Self {
+                Self(AssocTyId::TypeAliasId(value))
+            }
+        }
+
+        impl From<RpititId> for $ty_id_name {
+            #[inline]
+            fn from(value: RpititId) -> Self {
+                Self(AssocTyId::RpititId(value))
+            }
+        }
+
+        impl TryFrom<SolverDefId<'_>> for $term_id_name {
+            type Error = ();
+
+            #[inline]
+            fn try_from(value: SolverDefId<'_>) -> Result<Self, Self::Error> {
+                match value {
+                    SolverDefId::TypeAliasId(it) => Ok(Self(TermId::TypeAliasId(it))),
+                    SolverDefId::RpititId(it) => Ok(Self(TermId::RpititId(it))),
+                    SolverDefId::ConstId(it) => Ok(Self(TermId::ConstId(it))),
+                    _ => Err(()),
+                }
+            }
+        }
+
+        impl From<$ty_id_name> for $term_id_name {
+            fn from(value: $ty_id_name) -> Self {
+                $term_id_name(match value.0 {
+                    AssocTyId::TypeAliasId(id) => TermId::TypeAliasId(id),
+                    AssocTyId::RpititId(id) => TermId::RpititId(id),
+                })
             }
         }
 
@@ -538,9 +659,21 @@ macro_rules! declare_ty_const_pair {
 
             fn try_from(value: $term_id_name) -> Result<Self, Self::Error> {
                 match value.0 {
-                    TermId::TypeAliasId(id) => Ok($ty_id_name(id)),
+                    TermId::TypeAliasId(id) => Ok($ty_id_name(AssocTyId::TypeAliasId(id))),
+                    TermId::RpititId(id) => Ok($ty_id_name(AssocTyId::RpititId(id))),
                     TermId::ConstId(_) => Err(()),
                 }
+            }
+        }
+    };
+
+    ( @common $ty_id_name:ident, $const_id_name:ident, $term_id_name:ident ) => {
+        declare_id_wrapper!($const_id_name, ConstId);
+        declare_id_wrapper!($term_id_name, TermId, SolverDefId<'db>, no_try_from);
+
+        impl From<$const_id_name> for $term_id_name {
+            fn from(value: $const_id_name) -> Self {
+                $term_id_name(TermId::ConstId(value.0))
             }
         }
 
@@ -550,30 +683,70 @@ macro_rules! declare_ty_const_pair {
             fn try_from(value: $term_id_name) -> Result<Self, Self::Error> {
                 match value.0 {
                     TermId::ConstId(id) => Ok($const_id_name(id)),
-                    TermId::TypeAliasId(_) => Err(()),
+                    TermId::TypeAliasId(_) | TermId::RpititId(_) => Err(()),
                 }
             }
         }
     };
 }
 
-declare_ty_const_pair!(TraitAssocTyId, TraitAssocConstId, TraitAssocTermId);
-declare_ty_const_pair!(ImplOrTraitAssocTyId, ImplOrTraitAssocConstId, ImplOrTraitAssocTermId);
-declare_ty_const_pair!(FreeTyAliasId, FreeConstAliasId, FreeTermAliasId);
-declare_ty_const_pair!(InherentAssocTyId, InherentAssocConstId, InherentAssocTermId);
+declare_ty_const_pair!(TraitAssocTyId, TraitAssocConstId, TraitAssocTermId, AssocTyId);
+declare_ty_const_pair!(
+    ImplOrTraitAssocTyId,
+    ImplOrTraitAssocConstId,
+    ImplOrTraitAssocTermId,
+    AssocTyId
+);
+declare_ty_const_pair!(FreeTyAliasId, FreeConstAliasId, FreeTermAliasId, TypeAliasId);
+declare_ty_const_pair!(InherentAssocTyId, InherentAssocConstId, InherentAssocTermId, TypeAliasId);
 
+/// An alias's item: a type alias, a constant, or a trait method's `impl Trait` ([`RpititId`]),
+/// which only a projection's can be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TermId {
     TypeAliasId(TypeAliasId),
     ConstId(ConstId),
+    RpititId(RpititId),
 }
-impl_from!(TypeAliasId, ConstId for TermId);
+impl_from!(TypeAliasId, ConstId, RpititId for TermId);
+
+impl AssocTyId {
+    /// The item whose where clauses the associated type has: the alias itself, or for an
+    /// RPITIT its method, whose where clauses rustc's synthesized item takes as its own.
+    pub fn predicates_owner(self) -> GenericDefId {
+        match self {
+            AssocTyId::TypeAliasId(id) => id.into(),
+            AssocTyId::RpititId(id) => id.function.into(),
+        }
+    }
+}
+
+impl From<AssocTyId> for TermId {
+    fn from(value: AssocTyId) -> Self {
+        match value {
+            AssocTyId::TypeAliasId(id) => TermId::TypeAliasId(id),
+            AssocTyId::RpititId(id) => TermId::RpititId(id),
+        }
+    }
+}
+
+impl TermId {
+    /// The trait or impl the item is in; an RPITIT's is its method's.
+    pub fn container(self, db: &Db) -> ItemContainerId {
+        match self {
+            TermId::TypeAliasId(id) => id.loc(db).container,
+            TermId::ConstId(id) => id.loc(db).container,
+            TermId::RpititId(id) => id.function.loc(db).container,
+        }
+    }
+}
 
 impl<'db> From<TermId> for SolverDefId<'db> {
     fn from(value: TermId) -> Self {
         match value {
             TermId::TypeAliasId(id) => id.into(),
             TermId::ConstId(id) => id.into(),
+            TermId::RpititId(id) => id.into(),
         }
     }
 }

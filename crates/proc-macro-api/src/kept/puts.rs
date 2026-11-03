@@ -150,9 +150,9 @@ pub(crate) fn publish(store: &mut Store, puts: Vec<Put>) -> Published {
         let mut tickets = Vec::with_capacity(2); // alloc: a put's two tickets, value and shape
         let kept = match keep {
             Keep::Run { run, traced } | Keep::Durable { run, traced } => {
-                index::keep_into(store, Unit::SHARED, &run, &traced, value, &mut tickets)
+                index::keep_into(store, Unit::SHARED, &run, &traced, &value, &mut tickets)
             }
-            Keep::Machine(key) => store.put(key, Kind::Machine, value).map(|ticket| tickets.push(ticket)).map_err(KeepError::Mismatch),
+            Keep::Machine(key) => store.put(key, Kind::Machine, &value).map(|ticket| tickets.push(ticket)).map_err(KeepError::Mismatch),
         };
         if durable {
             for ticket in &tickets {

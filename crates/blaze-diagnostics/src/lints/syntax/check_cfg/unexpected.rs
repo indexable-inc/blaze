@@ -1040,7 +1040,7 @@ mod tests {
             }
             let checked = crate::tests::checked(&fixture);
             let db = &checked.db;
-            hir::attach_db(db, || {
+            blaze_query::db::attach(db, || {
                 let krate = hir::check::workspace_crates(db)[0];
                 let frame = crate::tests::frame();
                 let cx = Cx::new(db, krate, checked.files(), &frame);

@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: "Doctests built and run by blaze with its own front end, never rustdoc: rustdoc's rules for finding examples, writing their programs (line-aligned to the docs) and judging them, ported; each example is its own unit (its own crate, binary and process, patched on an edit like any blaze test), never merged, in any edition; what is built (2026-11-02, lanes doctest to doctest4: `blaze test --doc` builds each example as its own crate in parallel, relinks only an edited one, builds `test_harness` examples as tests, and runs each in its own process) and what is left."
+summary: "Doctests built and run by blaze with its own front end, never rustdoc: rustdoc's rules for finding examples, writing their programs (line-aligned to the docs) and judging them, ported; each example is its own unit (its own crate, binary and process, patched on an edit like any blaze test), never merged, in any edition; what is built (2026-11-02, lanes doctest to doctest5: `blaze test --doc` builds each example as its own crate in parallel, builds and links only an edited one while every other is found unchanged by one store lookup, builds `test_harness` examples as tests, and runs each in its own process) and what is left."
 date: 2026-11-02
 ---
 # Doctests without rustdoc
@@ -193,20 +193,52 @@ tests run, and the run fails, naming the unit; without it the run stops, naming 
     blaze-lower `DoctestProgram` has `test` and `appended`.
   - The proof is in `/tmp/blaze-lanes/v2-doctest4.md`.
 
+- Lane doctest5 (2026-11-02): an example nothing it is made of changed costs one lookup.
+  - Each image (an example's, the runner's) is keyed before it is checked or built
+    (`compile/doctest.rs` `base_key`): the unit's record inputs without its crate identity
+    (profile, platform, flags, toolchain, blaze; `unit_part`), the example's crate's code
+    identity and its id. Its record (`ImageRecord`: a unit record's header naming the output
+    and the native inputs the link read) is filed as a unit record is, under what its code
+    read (`reads::file`), and found the same way (`filed_in`, the header's check that the
+    output is in the store and each native input is as it was). A found image is not
+    checked, compiled or linked: its output is placed from the store (`Written::Kept`) and it
+    is reported `unchanged`, under one span "doctest image key".
+  - The code identity (blaze-lower `code.rs` `code_identity`) is the crate identity with each
+    comment of a workspace file that no macro can see replaced by its shape (its line count,
+    and a block comment's last line's bytes and characters), so an edit of one example's doc
+    text leaves the library's code identity, and every other example's key, as they were. A
+    doc comment a macro is given keeps its text: inside a token tree or macro definition, or
+    on or under an item given to an attribute macro or a derive that is not one of the
+    standard derives; `derive(Debug)` and the like, `test` and `bench` count as macros where a
+    file could shadow them. A crate whose code may read a file's bytes as text that could be
+    Rust (`include_str!`/`include_bytes!` not of one non-`.rs` literal), or gives an
+    out-of-line module to an attribute, keeps its whole text. Unit tests: `code/tests.rs`.
+  - Each example's crate has a source root of its own (blaze-lower `doctests.rs`), so an
+    example's crate holds no other example's file; the root is set again when a view of the
+    package's files (set on an edit) took its file out, as it takes out every file under the
+    package's directory it lacks.
+  - blaze-api schema 31: `LinkHow::Unchanged`, shown as `link: <path> (unchanged)`; a link
+    staged with nothing to stage (`codegen.rs` `Laid::Nothing`, span "link unchanged") is
+    reported so too, not as spliced. `harness/bench.py` counts it as spliced.
+  - A `test_harness` example's file is written once in `expand`: again (span "doctest
+    harnesses written again") only when the harness made from the plain crate differs.
+  - Proof (VM doctest5, smallvec 1.13.2, `from_buf`'s example edited at line 857): on the edit
+    build the 12 other examples and the runner are `unchanged`, each 2.1 to 2.3 ms in all
+    (one "doctest image key" span, no check, codegen or link span), against about 850 ms of
+    check and codegen and 220 ms of link each before; the edited example is spliced and 13/13
+    pass. Numbers and the mutation check are in `/tmp/blaze-lanes/v2-doctest5.md`.
+
 ## What is left, in order
 
-1. Each unedited example still costs real CPU on an edit: about 320 ms in `codegen::generate`
-   with every function loaded from the memo or the store (no span names a finer part yet), and
-   about 195 ms building the link's inputs (`generated.side()`, span "link inputs"). Name the
-   first with spans, then cut both (an example whose crate's inputs are unchanged needs
-   neither).
-2. A `test_harness` example's file is written twice in `expand` (once plain, then with the
-   harness, since the harness is made from the plain crate's def map).
-3. A link that changes nothing is reported as spliced; blaze-api has no "unchanged" outcome.
-4. Extraction details: items under `#[cfg(doctest)]` (rustdoc builds the library with
+1. The edited example's own codegen takes about 1.1 s of wall time with 82 ms of its own CPU
+   (span "doctest example codegen"): a wait no finer span names yet. The same build reruns
+   unit bodies (442 ms) and unit codegen (467 ms) spans, most likely the library's, whose
+   text the doc edit changed though its code identity did not. Name the wait, then key the
+   library's work by its code identity too.
+2. Extraction details: items under `#[cfg(doctest)]` (rustdoc builds the library with
    `cfg(doctest)` when collecting), docs from `#[doc = include_str!(..)]` (the line is the fence
    line in the included file), `#[doc(hidden)]` items (rustdoc still tests them), re-exports
    (rustdoc tests an item where it is defined, once), and `#[doc(test(attr))]` on fields of
    extern blocks and items inside function bodies, which the walk does not visit.
-5. The outcome comparison on more crates with many doctests (`itertools`, `regex-syntax`,
+3. The outcome comparison on more crates with many doctests (`itertools`, `regex-syntax`,
    `blaze-hash`), each example's outcome against `cargo test --doc` at the pinned nightly.

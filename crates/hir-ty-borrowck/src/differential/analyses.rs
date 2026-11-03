@@ -248,7 +248,7 @@ fn compare_fixture(fixture: &str) -> Vec<Compared> {
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    hir_ty::attach_db(&db, || {
+    blaze_query::db::attach(&db, || {
         let mut compared = Vec::new();
         for (name, def) in budget::functions(&db) {
             let checked = borrowck_in_mode(&db, def, Mode::Nll);
@@ -640,7 +640,7 @@ fn borrowck_reports_rustcs_codes_at_rustcs_spans_in_both_modes() {
         let fx = fixture::db(fixture);
         let _ = fx.only_file();
         let db = fx.into_db();
-        hir_ty::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             for (name, def) in budget::functions(&db) {
                 let declared = |after: char| fixture.contains(&format!("fn {name}{after}"));
                 if !declared('(') && !declared('<') {
@@ -688,7 +688,7 @@ fn polonius_flow_accepts_more_never_less() {
         let fx = fixture::db(fixture);
         let _ = fx.only_file();
         let db = fx.into_db();
-        hir_ty::attach_db(&db, || {
+        blaze_query::db::attach(&db, || {
             for (name, def) in budget::functions(&db) {
                 let alpha = borrowck_in_mode(&db, def, Mode::Polonius);
                 let flow = borrowck_in_mode(&db, def, Mode::PoloniusFlow);
