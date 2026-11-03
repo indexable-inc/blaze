@@ -7,4 +7,4 @@ Plans for work not started yet. Each plan has the same front matter as `docs/` (
   - [gpu/raytracing.md](gpu/raytracing.md): inline ray query, typed pipelines, acceleration structures with lifetimes.
 - [autodiff/plan.md](autodiff/plan.md): automatic differentiation on MIR, symbolic derivatives of pure functions, e-graph simplification.
 - [capabilities/plan.md](capabilities/plan.md): edition `blaze-2026.11`, where std has no ambient authority, `main` receives `Io`, code is safe Rust, and signatures are permissions.
-- [bootstrap/plan.md](bootstrap/plan.md): bootstrap blaze from a wasm seed (its source plus itself compiled to wasm), so no rustc is needed to build blaze from nothing.
+- [bootstrap/plan.md](bootstrap/plan.md): bootstrap blaze from a wasm seed (its source plus itself compiled to wasm), so only the seed and blaze ever build blaze, and its source may use blaze-only Rust.
