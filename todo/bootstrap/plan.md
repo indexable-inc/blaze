@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Bootstrap blaze from a wasm seed (blaze's own source plus blaze compiled to core WebAssembly), so no rustc, cargo or older blaze is ever needed to build blaze from nothing.
+summary: Bootstrap blaze from a wasm seed (blaze's own source plus blaze compiled to core WebAssembly), so blaze is built only by its seed and by blaze, never rustc or cargo, and its source may use blaze-only Rust.
 date: 2026-11-02
 ---
 # Bootstrap: blaze from a wasm seed
@@ -17,6 +17,19 @@ A small wasm runtime runs the seed, the seed builds blaze from the source for th
 result rebuilds the seed byte for byte. Any version of blaze bootstraps in constant time from its
 own seed, with no chain of older compilers. Nothing here is built.
 
+## Only blaze builds blaze
+
+The seed and the blaze toolchain are the only ways blaze gets built. Real rustc and cargo are not
+part of the bootstrap and are not kept working for blaze's own source:
+
+- **Seed N is made by blaze.** It is source N compiled to wasm by blaze N-1, or by blaze N itself
+  as a fixed point. No rustc is involved.
+- **blaze's source may use blaze-only Rust.** Extensions (`superset-of-rust`), `blaze::` attributes,
+  blaze's own std (`library/`) and its pinned nightly features can all appear in blaze's own crates.
+  Only the seed and blaze have to read that source, so it never has to build under rustc.
+- **The first seed** is made once, by the blaze that exists when this lands. After that, every seed
+  comes from the one before it, and today's cargo-built stage 0 is deleted.
+
 ## Prior art
 
 - **Zig** has bootstrapped this way since 0.11 (2022). `zig1.wasm` is committed, `wasm2c` turns it
@@ -24,10 +37,10 @@ own seed, with no chain of older compilers. Nothing here is built.
   stage 1 is deleted.
 - **OCaml** commits a bytecode compiler (`boot/ocamlc`) that its own bytecode interpreter runs.
 - **Pascal's p-code** is the original version of the idea.
-- **rustc as wasm**: rustc has been built for `wasm32-wasip1-threads` and run in a browser
+- **A Rust compiler in wasm** has been done: rustc built for `wasm32-wasip1-threads`
   ([Mearman/wasm-rustc](https://github.com/Mearman/wasm-rustc),
-  [oligamiq/rubrc](https://github.com/oligamiq/rubrc)). A Rust compiler fits in wasm. The hard
-  part is a compiler's dependencies, not its language.
+  [oligamiq/rubrc](https://github.com/oligamiq/rubrc)). That only shows a Rust compiler fits in
+  wasm; blaze's seed is blaze, not rustc. The hard part is the dependencies, not the language.
 
 ## Why it fits blaze
 
@@ -57,8 +70,7 @@ wasm too, and the rule stays one rule.
 
 ## Steps
 
-1. **Native blaze builds blaze** (`blaze-builds-blaze`). Stage 0 is still cargo; the runner gates
-   move to blaze.
+1. **Native blaze builds blaze** (`blaze-builds-blaze`). The runner gates move to blaze.
 2. **blaze builds its workspace for `wasm32-wasip1`.** This is `superset-of-rust` for wasm targets.
    Every crate that can't is a named blocker.
 3. **A `seed` profile**: front end, stencil backend, in-process linker, Pulley for macros, no LLVM,
@@ -66,17 +78,19 @@ wasm too, and the rule stays one rule.
 4. **Bootstrap without rustc**: run `blaze-seed.wasm` under a runtime to build a native blaze from
    source, then have that blaze build the seed again. The two seeds must be byte-identical. This
    becomes a harness check.
-5. **Diverse double-compiling**: rebuild the seed with a different compiler path (stage 1 built
-   by cargo, for example). Building the source with that seed must give the committed seed byte
-   for byte. This doesn't prevent a trusting-trust attack but can detect one, as matklad notes.
+5. **Cross-version check**: seed N-1 builds source N into a blaze that builds seed N, and that
+   seed must equal the one blaze N makes of itself, byte for byte. Two seeds of different versions
+   agreeing is the only second opinion; there is no rustc path to compare against.
 6. **Ship the seed per release**: `blaze-seed.wasm`, compressed, kept outside the git history or
    in LFS, with its content hash in the source tree.
-7. **Stage 0 is the seed**: CI, the runner and `docs/contributing.md` bootstrap from it. The last
-   `cargo +nightly` in blaze's own build goes away, and `no-rustc` holds from nothing.
+7. **Stage 0 is the seed**: CI, the runner and `docs/contributing.md` bootstrap from it. The cargo
+   stage 0 is deleted, nothing keeps blaze's source rustc-compatible, and `no-rustc` holds from
+   nothing.
 
 ## Rule changes when adopted
 
-- **`no-rustc`**: add "stage 0 comes from the seed, never from rustc or cargo".
+- **`no-rustc`**: add "stage 0 comes from the seed, never from rustc or cargo; blaze's own source
+  need not build under rustc".
 - **`proc-macros-on-wasm`**: in the seed profile Wasmtime runs macros on Pulley, since Cranelift
   can't JIT inside wasm. Native blaze keeps Cranelift-in-Wasmtime.
 - **`proc-macros-on-wasm`, macro cfg**: proc-macro crates are planned with the host's cfg and built
