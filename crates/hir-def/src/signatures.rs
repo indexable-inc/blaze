@@ -2239,6 +2239,9 @@ mod tests {
         if attrs.contains(AttrFlags::BLAZE_SPECIALIZATION_TRAIT) {
             flags |= TraitFlags::BLAZE_SPECIALIZATION_TRAIT;
         }
+        if attrs.contains(AttrFlags::BLAZE_SEALED) {
+            flags |= TraitFlags::SEALED;
+        }
         flags
     }
 

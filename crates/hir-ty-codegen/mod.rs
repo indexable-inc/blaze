@@ -2327,21 +2327,27 @@ const ALLOCATOR_ENTRIES: [(&str, &str, usize, bool); 4] = [
 
 /// The function of `krate` a builtin attribute's expansion exports as `exported`: the
 /// `#[global_allocator]`'s functions, the `#[alloc_error_handler]`'s `__rg_oom`.
+///
+/// The expansion writes the function at the attribute macro's def site, so its binding is
+/// hygienic: the module binds it under a [keyed](hir_expand::name::Name::keyed) name that no
+/// path can write, as rustc's does. Each module's values are matched by the name's text,
+/// whatever its key, and the function must still export `exported`.
 fn global_allocator_export(
     db: &Db,
     krate: Crate,
     exported: &str,
 ) -> Option<FunctionId> {
     let def_map = hir_def::nameres::crate_def_map(db, krate);
-    let name = hir_expand::name::Name::new_root(exported);
     def_map.modules(db).find_map(|(module_id, module)| {
-        let Some(hir_def::ModuleDefId::FunctionId(id)) = module.scope(db).get(&name).take_values()
-        else {
-            return None;
-        };
-        let exports =
-            AttrFlags::export_name(db, id.into()).is_some_and(|it| it.as_str() == exported);
-        (id.lookup(db).container == ItemContainerId::ModuleId(module_id) && exports).then_some(id)
+        module.scope(db).values().find_map(|(name, item)| {
+            let hir_def::ModuleDefId::FunctionId(id) = item.def else { return None };
+            if name.as_str() != exported || item.import.is_some() {
+                return None;
+            }
+            let exports =
+                AttrFlags::export_name(db, id.into()).is_some_and(|it| it.as_str() == exported);
+            (id.lookup(db).container == ItemContainerId::ModuleId(module_id) && exports).then_some(id)
+        })
     })
 }
 

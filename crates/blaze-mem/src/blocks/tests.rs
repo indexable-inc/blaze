@@ -299,7 +299,11 @@ fn a_small_class_past_its_keep_gives_whole_pages_back() {
     assert_eq!(trimmed.warm + trimmed.cold, (count * size) as u64, "every block is free: {trimmed:?}");
     let page = crate::os::page_size() as u64;
     assert_eq!(trimmed.given_back % page, 0, "whole pages");
-    assert!(trimmed.given_back >= trimmed.cold - 2 * page * (trimmed.trims * TRIM_FUEL as u64), "{trimmed:?}");
+    // A run's blocks go cold whole but only the pages it covers whole go back: at most two
+    // pages short per run. Added, not subtracted from `cold`: with 16 KiB pages (macOS arm64)
+    // the slack is 2 MiB a trim, more than `cold` holds.
+    let slack = 2 * page * (trimmed.trims * TRIM_FUEL as u64);
+    assert!(trimmed.given_back + slack >= trimmed.cold, "{trimmed:?}");
     #[cfg(target_os = "linux")]
     {
         let len = count * size / page as usize * page as usize;
