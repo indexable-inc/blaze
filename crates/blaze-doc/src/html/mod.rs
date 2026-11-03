@@ -96,7 +96,7 @@ pub fn pages(model: &Model) -> Pages {
     let items: Vec<Vec<Page>> = par::map(&jobs, |&(k, i)| {
         let krate = &model.crates[k];
         let item = &krate.items[i];
-        let writer = Writer::new(model, &names, &statics, k, page_dir(krate, item));
+        let writer = Writer::new(model, &names, &statics, k, page_dir(krate, item).len());
         let mut out = vec![page(page_path(krate, item), writer.item_page(i))];
         if item.kind == Kind::Module {
             let path = format!("{}/sidebar-items.js", module_dir(krate, item));
@@ -115,16 +115,15 @@ pub fn pages(model: &Model) -> Pages {
     let source_files: Vec<Page> = par::map(&sources, |&(k, f)| {
         let krate = &model.crates[k];
         let file = &krate.sources[f];
-        let mut dir = vec!["src".to_owned(), krate.name.clone()];
-        dir.extend(file.path.split('/').map(str::to_owned));
-        dir.pop();
-        let writer = Writer::new(model, &names, &statics, k, dir);
+        // `src/<crate>/`, then the directories of the file's path.
+        let depth = 1 + file.path.split('/').count();
+        let writer = Writer::new(model, &names, &statics, k, depth);
         page(format!("src/{}/{}.html", krate.name, file.path), writer.source_page(f))
     });
     let source_pages = source_files.len();
     files.extend(source_files);
     let per_crate: Vec<[Page; 2]> = par::map(par::enumerate(&model.crates), |(k, krate)| {
-        let writer = Writer::new(model, &names, &statics, k, vec![krate.name.clone()]);
+        let writer = Writer::new(model, &names, &statics, k, 1);
         [
             page(format!("{}/all.html", krate.name), writer.all_items()),
             page(format!("search-index/{}.js", krate.name), search_index(krate)),
@@ -284,14 +283,15 @@ pub(crate) struct Writer<'a> {
 }
 
 impl<'a> Writer<'a> {
+    /// The writer of a page `depth` directories below the documentation root.
     fn new(
         model: &'a Model,
         names: &'a HashSet<&'a str, Global>,
         statics: &'a Statics,
         k: usize,
-        dir: Vec<String>,
+        depth: usize,
     ) -> Self {
-        let root = "../".repeat(dir.len());
+        let root = "../".repeat(depth);
         let mut ids = Ids::default();
         for reserved in [
             "main-content",

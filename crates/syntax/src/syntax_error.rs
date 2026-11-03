@@ -17,6 +17,11 @@ impl SyntaxError {
         Self(message.into(), TextRange::empty(offset))
     }
 
+    /// The heap the error holds, in bytes: its message.
+    pub fn heap_bytes(&self) -> usize {
+        self.0.capacity()
+    }
+
     pub fn range(&self) -> TextRange {
         self.1
     }

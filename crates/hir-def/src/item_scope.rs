@@ -399,7 +399,7 @@ fn unpack_bits(tag: u8, id: blaze_query::db::Id) -> BuiltinType {
 }
 
 #[inline]
-fn raw(it: impl AsId) -> Option<blaze_query::db::Id> {
+fn raw(it: impl AsId + Copy) -> Option<blaze_query::db::Id> {
     Some(it.as_id())
 }
 

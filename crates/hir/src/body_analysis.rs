@@ -111,7 +111,8 @@ impl<'db> BodyAnalysis<'db> {
         let ((body, source_map), file_id) = match syntax {
             Some(syntax) => {
                 let relative = Body::relative(db, def).as_ref();
-                (relative.expect("a body with its syntax has a relative map"), syntax.file_id)
+                let map = relative.expect("a body with its syntax has a relative map");
+                ((Body::of(db, def), map), syntax.file_id)
             }
             None => (Body::with_source_map(db, def), def.erased_ast_id(db).file_id),
         };
@@ -221,10 +222,16 @@ impl<'db> BodyAnalysis<'db> {
     }
 
     /// `Semantics::resolve_path`, in the scope of the block the path is in.
-    pub fn resolve_path(&self, path: InFile<AstPtr<tag::Path>>) -> Option<PathResolution<'db>> {
-        let node = self.node(path.map(|it| it.syntax_node_ptr()))?;
-        let analyzer = self.analyzer(path.file_id, node, true)?;
-        analyzer.resolve_path_view(self.db, ast::Path::cast(node)?).map(|(it, _)| it)
+    /// What `path` resolves to; an error naming the item when its resolution looks one up that
+    /// the ast id map of this analysis' tree does not hold.
+    pub fn resolve_path(
+        &self,
+        path: InFile<AstPtr<tag::Path>>,
+    ) -> Result<Option<PathResolution<'db>>, crate::NotInAstIdMap> {
+        let Some(node) = self.node(path.map(|it| it.syntax_node_ptr())) else { return Ok(None) };
+        let Some(analyzer) = self.analyzer(path.file_id, node, true) else { return Ok(None) };
+        let Some(path) = ast::Path::cast(node) else { return Ok(None) };
+        Ok(analyzer.resolve_path_view(self.db, path)?.map(|(it, _)| it))
     }
 
     pub fn binding(&self, pat: InFile<AstPtr<tag::IdentPat>>) -> Option<Local<'db>> {

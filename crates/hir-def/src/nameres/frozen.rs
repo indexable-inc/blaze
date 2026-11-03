@@ -3,7 +3,8 @@
 //! [`Enc`] and [`Dec`] write and read other values that name items, as `hir_ty` does impls.
 //!
 //! The bytes name nothing by a query database id: a file is the crate it belongs to and its path from
-//! that crate's root directory, a module is its crate and its index in that crate's `DefMap`, a
+//! that crate's root directory (an alias, a crate root with a module appended, is [`ROOT`]) and
+//! the content ID it had, a module is its crate and its index in that crate's `DefMap`, a
 //! crate is its index in the frozen crate's dependency closure, and every interned id is
 //! written as the location it interns. Reading interns those locations again, so the ids it
 //! makes are the running process's own. A macro call and a syntax context are written once and
@@ -82,7 +83,7 @@ const KEYED_NAME: &str = "\0";
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 18";
+pub const ENCODING: &str = "blaze frozen def map 20";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -223,14 +224,17 @@ fn frozen_def_map(db: &Db, krate: Crate) -> Option<Frozen> {
 }
 
 /// What [`super::crate_local_def_map`] serves for `krate` instead of resolving it, when its
-/// `DefMap` is frozen.
+/// `DefMap` is frozen. Bytes that do not read stop the query with [`Unreadable`], failing the
+/// job that asked: never a panic of the daemon, and never a crate resolved instead.
 pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
     let frozen = frozen_def_map(db, krate)?;
     if frozen.mode == Mode::Check {
         return None;
     }
-    let (def_map, local) = decode(db, krate, &frozen.bytes)
-        .unwrap_or_else(|why| panic!("a frozen def map does not read: {why}"));
+    let (def_map, local) = match decode(db, krate, &frozen.bytes) {
+        Ok(it) => it,
+        Err(why) => Unreadable::of(db, krate, "def map", why).throw(),
+    };
     if frozen.mode == Mode::Verify {
         match encode_maps(db, krate, &def_map, &local) {
             Ok(written) if *written == *frozen.bytes => {}
@@ -331,8 +335,59 @@ pub(crate) fn served_lang_items(
         dec.finish()?;
         Ok::<_, String>(items)
     };
-    Some(read().unwrap_or_else(|why| panic!("frozen lang items do not read: {why}")))
+    match read() {
+        Ok(items) => Some(items),
+        Err(why) => Unreadable::of(db, krate, "lang items", why).throw(),
+    }
 }
+
+/// Frozen bytes of a crate that do not read in this database: a file they name has other
+/// content than the image was made from, or they do not decode. The image's key covers every
+/// input, and the write that moves one withdraws the image in the same write (`deps`'
+/// implied write), so this is a bug in the key or in that withdrawal. Nothing is resolved in
+/// its place. It unwinds out of the query that asked, with this as its payload, as
+/// [`super::Unmaintained`] does, and the driver that catches it fails that one job with it as
+/// the error (rule 17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    pub krate: Crate,
+    /// Its display name, if it has one.
+    pub name: Option<String>,
+    /// What was frozen: `"def map"` or `"lang items"`.
+    pub kind: &'static str,
+    /// Why the bytes do not read, naming the file where it is one.
+    pub why: String,
+}
+
+impl Unreadable {
+    fn of(db: &Db, krate: Crate, kind: &'static str, why: String) -> Unreadable {
+        // alloc: an error's crate name, once
+        let name = krate.extra_data(db).display_name.as_ref().map(|it| it.crate_name().to_string());
+        Unreadable { krate, name, kind, why }
+    }
+
+    /// Unwinds with `self` as the payload, logged first, as [`super::Unmaintained::throw`] is.
+    pub fn throw(self) -> ! {
+        tracing::error!(target: "blaze", "{self}");
+        std::panic::panic_any(self)
+    }
+
+    /// The `Unreadable` a caught panic's payload is, if it is one.
+    // dyn: a caught panic's payload, read once
+    pub fn of_payload(payload: &(dyn std::any::Any + Send)) -> Option<&Unreadable> {
+        payload.downcast_ref::<Unreadable>()
+    }
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "name resolution: the frozen {} of crate ", self.kind)?;
+        super::write_crate(f, self.krate, self.name.as_deref())?;
+        write!(f, " is refused, as it does not read: {}", self.why)
+    }
+}
+
+impl std::error::Error for Unreadable {}
 
 /// The bytes of the lang items of `krate` as they are now: found, or read in [`Mode::Serve`]
 /// and [`Mode::Verify`].
@@ -420,6 +475,13 @@ fn vfs_path(real: bool, text: String) -> VfsPath {
 /// the same in every checkout. No path or literal holds a NUL.
 const OUT: &str = "\0OUT_DIR";
 
+/// What stands for a crate root that is an alias ([`base_db::Files::alias_of`]: its file's path
+/// and text with a module appended, as `Lowered::append_roots` makes for a test harness or a
+/// proc macro's wasm glue) in the name of a file, after the index of the crate it is the root
+/// of. Its path is its file's and reads back as that file, whose syntax lacks the appended
+/// module's items. No path holds a NUL.
+const ROOT: &str = "\0ROOT";
+
 fn out_dir(db: &Db, krate: Crate) -> Option<String> {
     let out = krate.env(db).get("OUT_DIR")?;
     let out = out.trim_end_matches('/');
@@ -468,7 +530,7 @@ fn joined(from: &str, relative: &str) -> String {
     format!("/{}", parts.join("/"))
 }
 
-fn position<T: PartialEq>(all: &[T], it: T) -> u32 {
+fn position<T: PartialEq + Copy>(all: &[T], it: T) -> u32 {
     all.iter().position(|x| *x == it).unwrap() as u32
 }
 
@@ -585,10 +647,13 @@ impl<'a> Enc<'a> {
             // clone: encoding, once per crate per image write (not on a build's path)
             let (owner, path) = self.file_names[&file].clone();
             self.u32(owner);
-            // No text: every file is of its owner's source root ([`Enc::file_name`]), whose
-            // texts the owner's image key covers, and the crate's key covers that key.
             self.str(&path)?;
-            if !path.starts_with(OUT) {
+            // The content ID it has: the owner's image key covers every file of its source root
+            // and the text of its root, and the crate's key covers that key, so [`Dec::files`]
+            // finding another one is a key that left an input out, refused there.
+            let content = self.db.file_content(file);
+            self.out.extend_from_slice(&content.0);
+            if !path.starts_with(OUT) && path != ROOT {
                 let full = joined(&self.dirs[&owner], &path);
                 if let Some(place) = places.iter().find(|it| full.starts_with(it.as_str())) {
                     // alloc: error path
@@ -718,6 +783,19 @@ impl Enc<'_> {
                 self.owners.entry(root).or_default().push(index as u32);
                 self.dirs.insert(index as u32, dir);
             }
+        }
+        if db.files().alias_of(file).is_some() {
+            let root = self.closure.iter().position(|&it| it.data(db).root_file_id == file);
+            let owner = root.ok_or_else(|| {
+                let krate = self.closure[0].named(db);
+                // alloc: error path
+                format!("{krate} names an alias of {path} that is the root of no crate it depends on")
+            })?;
+            // alloc: encoding, once per crate per image write (not on a build's path)
+            let name = (owner as u32, ROOT.to_owned());
+            // clone: encoding, once per crate per image write (not on a build's path)
+            self.file_names.insert(file, name.clone());
+            return Ok(name);
         }
         let candidates = self
             .owners
@@ -2316,10 +2394,11 @@ impl Dec<'_> {
     }
 
     /// The files the bytes name, as named in the header, each looked up in its owner's source
-    /// root: the first that is not there is an error. Their texts are the image key's, which
-    /// covers every file of that source root, so they are not checked here again. Each that is
-    /// not loaded is noted as an `include!` that found nothing is, for whoever owns the VFS to
-    /// load.
+    /// root ([`ROOT`]: the owner's root file): the first that is not there is an error. One
+    /// found with another content ID than the header's is an error naming it: the image key
+    /// covers every file's text, so that is a key that left an input out, and the image is
+    /// refused rather than read against syntax it was not made from. Each that is not loaded
+    /// is noted as an `include!` that found nothing is, for whoever owns the VFS to load.
     fn files(&mut self) -> R {
         let n = self.len()?;
         let mut not_loaded = None;
@@ -2327,12 +2406,23 @@ impl Dec<'_> {
             let owner = self.u32()?;
             // alloc: the decoded map's own storage, once per crate served
             let path = self.str()?.to_owned();
+            let content = blaze_ids::ContentId(self.r.take(32)?.try_into().map_err(|_| "a content ID")?);
+            let krate = *self.closure.get(owner as usize).ok_or("a file's crate")?;
+            if path == ROOT {
+                let root = krate.data(self.db).root_file_id;
+                if self.db.files().alias_of(root).is_none() {
+                    // alloc: error path
+                    return Err(format!("the root of {} is no alias, as the image's was", krate.named(self.db)));
+                }
+                self.checked(krate, root, &path, content)?;
+                self.files.push(root);
+                continue;
+            }
             if !self.paths.contains_key(&owner) {
                 let krate = *self.closure.get(owner as usize).ok_or("a file's crate")?;
                 self.paths.insert(owner, root_dir(self.db, krate)?);
             }
             let (dir, real, source_root) = &self.paths[&owner];
-            let krate = self.closure[owner as usize];
             let full = match path.strip_prefix(OUT) {
                 Some(rest) => {
                     // alloc: error path
@@ -2351,9 +2441,22 @@ impl Dec<'_> {
                 not_loaded.get_or_insert_with(|| format!("{full} is not loaded"));
                 continue;
             };
+            self.checked(krate, found, &full, content)?;
             self.files.push(found);
         }
         not_loaded.map_or(Ok(()), Err)
+    }
+
+    /// `file`, of `krate`, as named `name`, has the content ID the image was made from.
+    fn checked(&self, krate: Crate, file: FileId, name: &str, made: blaze_ids::ContentId) -> R {
+        let now = self.db.file_content(file);
+        if now == made {
+            return Ok(());
+        }
+        let name = if name == ROOT { "its root" } else { name };
+        let krate = krate.named(self.db);
+        // alloc: error path
+        Err(format!("{name} of {krate} has content {now:?}, the image was made from {made:?}"))
     }
 
     pub(crate) fn file(&mut self) -> R<base_db::EditionedFileId> {
@@ -3830,7 +3933,8 @@ macro_rules! unroll { () => { pub fn made() {} } }
     #[test]
     fn a_file_a_build_script_wrote_is_named_from_out_dir() {
         // As two checkouts build one registry crate: its build script writes the same file
-        // below the target directory of each, and the crate includes it from there.
+        // below the target directory of each, and the crate includes it from there, by its
+        // `OUT_DIR`, so its text is the same in both, as the header's content IDs check.
         // A crate that depends on it names its macro calls, so the dependency's OUT_DIR too.
         const WROTE: &str = r#"
 //- /main.rs crate:main deps:lib
@@ -3839,7 +3943,11 @@ pub use lib::inside::f;
 //- /registry/lib/src/lib.rs crate:lib env:OUT_DIR=/first/target/out
 #[rustc_builtin_macro]
 macro_rules! include { () => {} }
-include!("../../../first/target/out/made.rs");
+#[rustc_builtin_macro]
+macro_rules! concat { () => {} }
+#[rustc_builtin_macro]
+macro_rules! env { () => {} }
+include!(concat!(env!("OUT_DIR"), "/made.rs"));
 //- /first/target/out/made.rs
 #[macro_export]
 macro_rules! unroll { () => { pub fn made() {} } }

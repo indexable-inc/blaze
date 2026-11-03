@@ -248,6 +248,7 @@ pub fn instance_identity<'db>(
 }
 
 #[blaze_query::tracked(returns(ref), cycle_result = identity_cycle)]
+#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
 fn identity_of(
     db: &Db,
     instance: Instance,
@@ -1129,7 +1130,7 @@ impl<'a, 'db> Walk<'a, 'db> {
                     None => self.owner,
                 };
                 let error = runtime_promoted_mir_body_query(self.db(), owner, *expr).err();
-                return Err(no_promoted_mir(self.db(), owner, *expr, error));
+                return Err(no_promoted_mir(self.db(), owner, *expr, error.as_ref()));
             }
             Op::Cast { kind, from, to } => {
                 let from = self.ty_of(from)?;
@@ -1223,7 +1224,7 @@ impl<'a, 'db> Walk<'a, 'db> {
         // clone: the query's key, a reference count
         let body = monomorphized_promoted_mir_body_query(db, owner, expr, args, self.cx.stored.clone())
             // The code generator refuses it too (`no_promoted_mir`).
-            .map_err(|error| no_promoted_mir(db, owner, expr, Some(error)))?;
+            .map_err(|error| no_promoted_mir(db, owner, expr, Some(&error)))?;
         let evaluated = db.interpret_mir(body, Some(self.cx.env)).ok();
         match evaluated {
             Some(allocation) => {
@@ -1644,7 +1645,7 @@ pub(crate) fn mir_owner<'db>(_: &'db Db, body: Body) -> MirOwner<'db> {
 
 /// The error of a promoted constant whose MIR does not build, naming it and the body it is of,
 /// as the code generator's `no_promoted_mir` does.
-fn no_promoted_mir<E: std::fmt::Debug>(db: &Db, owner: InferBodyId<'_>, expr: ExprId, error: Option<E>) -> Unshared {
+fn no_promoted_mir<E: std::fmt::Debug>(db: &Db, owner: InferBodyId<'_>, expr: ExprId, error: Option<&E>) -> Unshared {
     let owner = match owner {
         InferBodyId::DefWithBodyId(def) => format!("`{}`", key::path(db, ItemId::of_body(db, def))), // alloc: error path
         InferBodyId::AnonConstId(_) => "an anonymous constant".to_owned(), // alloc: error path

@@ -78,8 +78,78 @@ pub fn chosen() -> io::Result<Pages> {
         return Ok(pages);
     }
     let pages = choose(std::env::var_os(VAR).as_deref())?;
+    // Before the choice is published: a reservation that sees it sees the process policy set.
+    // Two threads choosing at once both set the same flag.
+    THP.store(crate::os::opt_out_unadvised(pages) as u8, Ordering::Relaxed);
     CHOSEN.store(pages as u8, Ordering::Relaxed);
     Ok(pages)
+}
+
+/// What the process told Linux about transparent huge pages for memory no region of ours
+/// advised, set once with the pages [`chosen`] (`PR_SET_THP_DISABLE`). Every region of ours is
+/// advised one way or the other whatever this is: huge regions `MADV_HUGEPAGE`, base ones
+/// `MADV_NOHUGEPAGE`, so the host's `transparent_hugepage/enabled` (`always` on an ix VM)
+/// cannot put a sparsely touched reservation on 2 MiB pages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Thp {
+    /// Not chosen yet ([`chosen`] not called).
+    #[default]
+    Unset = 0,
+    /// Huge pages only where advised, as under the host setting `madvise` (Linux 6.18's
+    /// `PR_THP_DISABLE_EXCEPT_ADVISED`): the pages chosen are [`Pages::Transparent`].
+    AdvisedOnly = 1,
+    /// No transparent huge pages in the process: the pages chosen are base or hugetlb ones.
+    Off = 2,
+    /// The kernel refused the setting (older than 6.18 for [`Thp::AdvisedOnly`]): unadvised
+    /// memory follows the host setting; our regions are still advised one by one.
+    Unavailable = 3,
+    /// Not Linux: no transparent huge pages to opt out of.
+    NotLinux = 4,
+}
+
+impl Thp {
+    fn from_u8(byte: u8) -> Thp {
+        match byte {
+            1 => Thp::AdvisedOnly,
+            2 => Thp::Off,
+            3 => Thp::Unavailable,
+            4 => Thp::NotLinux,
+            _ => Thp::Unset,
+        }
+    }
+}
+
+impl std::fmt::Display for Thp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Thp::Unset => "unset",
+            Thp::AdvisedOnly => "advised only",
+            Thp::Off => "off",
+            Thp::Unavailable => "host setting (kernel refused the opt-out)",
+            Thp::NotLinux => "none (not Linux)",
+        })
+    }
+}
+
+/// [`Thp`] as set by [`chosen`]; 0 before.
+static THP: AtomicU8 = AtomicU8::new(0);
+
+/// What the process told Linux about transparent huge pages outside our regions.
+pub fn thp() -> Thp {
+    Thp::from_u8(THP.load(Ordering::Relaxed))
+}
+
+/// Keeps `[ptr, ptr + bytes)`, a mapping made outside any [`Region`](crate::Region) (a
+/// fiber's stack, touched only at its top), on base pages whatever the host's transparent
+/// huge page setting. Advice: nothing on a system without transparent huge pages.
+///
+/// # Safety
+///
+/// The range is a live mapping the caller owns.
+pub unsafe fn keep_base_pages(ptr: std::ptr::NonNull<u8>, bytes: usize) {
+    // SAFETY: the caller's contract.
+    unsafe { crate::os::keep_base_pages(ptr, bytes) };
 }
 
 /// The pages `value` of `BLAZE_HUGE_PAGES` chooses on this system.

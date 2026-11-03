@@ -1264,7 +1264,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             let field_idx = field_map.get(&name).copied();
             let field_ty = match field_idx {
                 Some(field_idx) => {
-                    if !self.resolver.is_visible(self.db, variant_fields_vis[field_idx]) {
+                    let vis = variant_fields_vis[field_idx];
+                    let expn = hir_def::nameres::variant_expansion(self.db, variant);
+                    if !self.resolver.is_visible_written(self.db, vis, hygiene, expn) {
                         self.push_diagnostic(InferenceDiagnostic::NoSuchField {
                             field: field.pat.into(),
                             private: Some(field_idx),

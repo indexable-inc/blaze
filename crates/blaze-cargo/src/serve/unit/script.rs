@@ -403,7 +403,7 @@ pub(crate) fn judge(
     env: &[(OsString, OsString)],
     value: &Value,
     checked: Option<&[PathBuf]>,
-    of: Option<UnitOf>,
+    of: Option<&UnitOf>,
     color: bool,
 ) -> Judged {
     let cx = Context { nightly_features_allowed: true, ..Context::of(unit, env) };
@@ -412,7 +412,7 @@ pub(crate) fn judge(
             Severity::Error => Level::Error,
             Severity::Warning => Level::Warning,
         };
-        say::cargo(level, format!("{}@{}: {message}", unit.package.name, unit.package.version), of.clone(), color)
+        say::cargo(level, format!("{}@{}: {message}", unit.package.name, unit.package.version), of.cloned(), color)
     };
     let failure = |error: String| {
         let what = match error.starts_with("failed to run custom build command") {
@@ -423,7 +423,7 @@ pub(crate) fn judge(
                 error.lines().collect::<Vec<_>>().join("\n  ")
             ),
         };
-        say::cargo(Level::Error, what, of.clone(), color)
+        say::cargo(Level::Error, what, of.cloned(), color)
     };
     let status = blaze_build_script::run::Ended { code: value.code, signal: value.signal };
     match blaze_build_script::run::judge(unit, &cx, status, &value.stdout, &value.stderr) {
@@ -433,7 +433,7 @@ pub(crate) fn judge(
             if let Some(link_dirs) = checked
                 && let Some(why) = refused(unit, &value.stdout, link_dirs)
             {
-                diagnostics.push(say::refused(why, of.clone(), color));
+                diagnostics.push(say::refused(why, of.cloned(), color));
                 return Judged { output: None, diagnostics };
             }
             Judged { output: Some(output), diagnostics }
@@ -939,7 +939,7 @@ impl ScriptRun {
     /// of it written ([`Writing`]). It ends once they are.
     fn finish(
         &mut self,
-        start: Box<Start>,
+        start: &Start,
         value: Value,
         began: SystemTime,
         writer: Option<&mut UnitWriter>,
@@ -966,7 +966,8 @@ impl ScriptRun {
             How::Outside(_) => None,
             _ => Some(link_dirs.as_slice()),
         };
-        let judged = judge(&start.unit, &start.env, &value, checked, self.of(), job.input.color);
+        let of = self.of();
+        let judged = judge(&start.unit, &start.env, &value, checked, of.as_ref(), job.input.color);
         out.extend(judged.diagnostics.into_iter().map(Response::Diagnostic));
         let Some(output) = judged.output else {
             self.state = State::Done;
@@ -1148,7 +1149,7 @@ impl ScriptRun {
                     let what = format!("the build script of `{}`: its OUT_DIR: {what}", start.unit.package.descr());
                     return self.error(what, out);
                 }
-                self.finish(start, value, began, writer, effects, out)
+                self.finish(&start, value, began, writer, effects, out)
             }
             How::Outside(command) => {
                 let miss = run_miss(&self.job, self.unit, |subject, item| blaze_kernel::Miss {
@@ -1178,7 +1179,7 @@ impl ScriptRun {
                 };
                 let begun = Run::begin(spec, store, &mut start.disk, self.tag, effects);
                 match begun {
-                    Ok(Begun::Reused(value)) => self.finish(start, value, began, writer, effects, out),
+                    Ok(Begun::Reused(value)) => self.finish(&start, value, began, writer, effects, out),
                     Ok(Begun::Running(run)) => {
                         let miss = run_missed(&self.job, self.unit, prepared);
                         self.puts.misses.push(miss);
@@ -1335,7 +1336,7 @@ impl ScriptRun {
                 other => return self.error(format!("the build script's spawn ended as {other:?}"), out),
             },
         };
-        self.finish(start, value, began, writer, effects, out)
+        self.finish(&start, value, began, writer, effects, out)
     }
 
     /// [`Runs::cancel`]'s step.

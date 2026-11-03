@@ -81,7 +81,7 @@ enum Tree {
 #[inline]
 fn attrs_from_ast_id_loc<'db, N: AstIdNode + Typed + Into<syntax::ast::AnyHasAttrs>>(
     db: &'db Db,
-    lookup: impl Lookup<Data = impl AstIdLoc<Ast = N> + HasModule>,
+    lookup: impl Lookup<Data = impl AstIdLoc<Ast = N> + HasModule> + Copy,
     tree: Tree,
 ) -> (InFile<ast::AnyHasAttrs<'db>>, Crate) {
     let loc = lookup.lookup(db);
@@ -232,7 +232,7 @@ fn column_flags<'db>(
     #[inline]
     fn of<'db, N: AstIdNode>(
         db: &'db Db,
-        lookup: impl Lookup<Data = impl AstIdLoc<Ast = N> + HasModule>,
+        lookup: impl Lookup<Data = impl AstIdLoc<Ast = N> + HasModule> + Copy,
         column: &mut impl FnMut(EditionedFileId, Crate) -> &'db FileAttrFlags,
     ) -> Option<AttrFlags> {
         let loc = lookup.lookup(db);
@@ -1809,6 +1809,15 @@ fn extract_cfgs(
     ControlFlow::Continue(())
 }
 
+/// What dropping an [`AttrFlags::docs`] value frees: the box and the docs' heap.
+fn docs_bytes(docs: &Option<Box<Docs>>) -> usize {
+    docs.as_deref().map_or(0, |it| size_of::<Docs>() + it.heap_bytes())
+}
+
+/// What dropping an [`AttrFlags::fields_docs`] value frees: the map's slots and each field's docs.
+fn fields_docs_bytes(docs: &ArenaMap<LocalFieldId, Option<Box<Docs>>>) -> usize {
+    crate::heap::arena_map_bytes(docs, docs_bytes)
+}
 
 #[blaze_query::tracked]
 impl AttrFlags {
@@ -2580,7 +2589,7 @@ impl AttrFlags {
         };
 
         // We LRU this query because it is only used by IDE.
-        #[blaze_query::tracked(returns(ref), lru = 250, mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(ref), lru, weigh = cfgs_bytes, mem_tag = Nameres)]
         fn cfgs(db: &Db, owner: AttrDefId) -> Option<CfgExpr> {
             blaze_mem::frame::current(|frame| {
                 let mut result = Vec::new_in(frame);
@@ -2594,8 +2603,13 @@ impl AttrFlags {
             })
         }
 
+        /// What dropping a `cfgs` value frees: the expression's heap.
+        fn cfgs_bytes(cfg: &Option<CfgExpr>) -> usize {
+            cfg.as_ref().map_or(0, CfgExpr::heap_bytes)
+        }
+
         // We LRU this query because it is only used by IDE.
-        #[blaze_query::tracked(returns(ref), lru = 50, mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(ref), lru, weigh = fields_cfgs_bytes, mem_tag = Nameres)]
         fn fields_cfgs(
             db: &Db,
             variant: VariantId,
@@ -2616,6 +2630,11 @@ impl AttrFlags {
                     }
                 })
             })
+        }
+
+        /// What dropping a `fields_cfgs` value frees: the map's slots and each field's cfgs.
+        fn fields_cfgs_bytes(cfgs: &ArenaMap<LocalFieldId, Option<CfgExpr>>) -> usize {
+            crate::heap::arena_map_bytes(cfgs, cfgs_bytes)
         }
     }
 
@@ -2647,7 +2666,7 @@ impl AttrFlags {
     }
 
     // We LRU this query because it is only used by IDE.
-    #[blaze_query::tracked(returns(as_deref), lru = 250, mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(as_deref), lru, weigh = docs_bytes, mem_tag = Nameres)]
     pub fn docs(db: &Db, owner: AttrDefId) -> Option<Box<Docs>> {
         let (source, outer_mod_decl, _crate_attrs, krate) = attrs_source(db, owner, Tree::Live);
         let inner_attrs_node = docs::inner_docs_node(source.value);
@@ -2671,7 +2690,7 @@ impl AttrFlags {
     }
 
     // We LRU this query because it is only used by IDE.
-    #[blaze_query::tracked(returns(ref), lru = 50, mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(ref), lru, weigh = fields_docs_bytes, mem_tag = Nameres)]
     pub fn fields_docs(
         db: &Db,
         variant: VariantId,

@@ -162,6 +162,8 @@ fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
     if got == libc::KERN_SUCCESS {
         walk(&state, thread.low, thread.high, &mut sample);
         sample.span = ring.innermost();
+        // A span a sample names is written whole, never folded.
+        crate::flight::keep(sample.span);
         sample.build = crate::flight::build_of(sample.span);
     }
     // SAFETY: the thread suspended above, resumed once.

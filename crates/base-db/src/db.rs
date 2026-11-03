@@ -55,7 +55,7 @@ pub struct Db {
     log: Option<std::sync::Arc<EventLog>>,
     /// The maintainers' state and the writes they have yet to see ([`crate::maintain`]).
     pub(crate) maintenance: Maintenance,
-    /// What the files' parses are kept by and read from.
+    /// What the files' parses are read from besides parsing.
     pub(crate) parses: Parses,
 }
 
@@ -196,6 +196,14 @@ impl Db {
         &self.files
     }
 
+    /// [`Db::files`] to keep past a borrow of the database: the one table every clone of it
+    /// shares, so a file it gains later is there too (the code generator names the files
+    /// `include!` reads outside the VFS through it while their bodies are lowered).
+    #[inline]
+    pub fn shared_files(&self) -> Arc<Files> {
+        Arc::clone(&self.files)
+    }
+
     /// Text of the file.
     #[inline]
     pub fn file_text(&self, file_id: FileId) -> FileText {
@@ -261,6 +269,10 @@ impl Db {
             let changed = files.reload_included_file(db, path);
             if changed && let Some(file) = files.find_included(path) {
                 db.note(Note::Included(file));
+                // The text `include!` parses of it changed with it: a file no module is in.
+                if let Some(source) = files.included_source_file(path) {
+                    db.note(Note::Set(source));
+                }
             }
             changed
         })
@@ -441,6 +453,24 @@ impl Db {
         Some(self.files.included_file(self, krate, &path, durability))
     }
 
+    /// The file outside the VFS that `path` names relative to its anchor, as `include!` in
+    /// `krate` parses it ([`Files::included_source`]), with the read it is made from: `None`
+    /// when the anchor has no path on disk to be relative to. rustc's `resolve_path`: a
+    /// relative path is joined to the directory of the file the call is in, an absolute one is
+    /// taken as it is; blaze names the file by that path normalized, as the VFS names its own.
+    pub fn included_source(
+        &self,
+        krate: Crate,
+        path: AnchoredPath<'_>,
+    ) -> Option<(IncludedFile, Result<FileId, FileId>)> {
+        let root = self.source_root(self.file_source_root(path.anchor).source_root_id(self));
+        let root = root.source_root_ref(self);
+        let anchor = root.path_for_file(&path.anchor)?.as_path()?;
+        let durability = if root.is_library { Durability::HIGH } else { Durability::LOW };
+        let path = anchor.parent()?.absolutize(path.path);
+        Some(self.files.included_source(self, krate, &path, durability, root.is_library))
+    }
+
     /// The path [`Db::included_file`] reads, as rustc writes it in an error: the anchor's
     /// directory joined with `path`, not normalized.
     pub fn included_path(&self, path: AnchoredPath<'_>) -> Option<AbsPathBuf> {
@@ -450,9 +480,9 @@ impl Db {
         Some(anchor.parent()?.join(path.path))
     }
 
-    /// Notes that `include!` or a module declaration in `krate` names a file
-    /// [`Db::resolve_path`] has nothing for: one that is not source by its extension, or one
-    /// outside its package, which the VFS does not load until it is asked to. An anchor with no
+    /// Notes that a module declaration in `krate` names a file [`Db::resolve_path`] has
+    /// nothing for: one outside its package, which the VFS does not load until it is asked to
+    /// (`include!` reads such a file itself: [`Db::included_source`]). An anchor with no
     /// path on disk has no file next to it to load, so nothing is noted.
     pub fn include_source(&self, path: AnchoredPath<'_>, krate: Crate) {
         let root_id = self.file_source_root(path.anchor).source_root_id(self);
@@ -590,10 +620,12 @@ impl Db {
             all.record("function", site.as_str());
         }
         let _all = all.entered();
+        // Each task with its database attached, as a query's run is: it runs between queries,
+        // on whichever worker, and formats against the database it was given.
         let run = |db: &Db, at: usize| {
             let span = tracing::info_span!(target: "blaze", "run_all task", function = site.as_deref());
             let _span = span.entered();
-            task(db, at)
+            blaze_query::db::attach(db, || task(db, at))
         };
         match self.run {
             Run::Pool => blaze_query::db::par_for_each(count, |at| run(self, at)),

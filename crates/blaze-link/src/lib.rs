@@ -45,6 +45,7 @@ mod state;
 mod symbols;
 mod table;
 pub mod target;
+mod thunk;
 mod unwind;
 mod wasm;
 mod write;
@@ -492,6 +493,9 @@ impl Image {
             frames_end: None,
             lazy: self.lazy.as_ref(),
             layout: layout::Pass::new(change.heat, &change.cold),
+            thunked: false,
+            island: None,
+            text: None,
         };
         stage.inputs(&change)?;
         stage.apply(&change)?;
@@ -509,7 +513,8 @@ impl Image {
         stage.asan_globals(&change)?;
         stage.dangling()?;
         // Each round places what the last made; GOT cells and PLT stubs need nothing past the
-        // next, so a stage that still makes pieces after `ROUNDS` would write them unplaced.
+        // next, and thunks (`thunk`) only what islands' bytes moved out of reach, so a stage
+        // that still makes pieces after `ROUNDS` would write them unplaced.
         const ROUNDS: usize = 8;
         let mut settled = false;
         for _ in 0..ROUNDS {
@@ -517,7 +522,8 @@ impl Image {
             stage.referrers();
             let before = stage.fresh.len();
             stage.needs()?;
-            if stage.fresh.len() == before {
+            let thunked = stage.thunks()?;
+            if stage.fresh.len() == before && !thunked {
                 settled = true;
                 break;
             }
@@ -525,7 +531,11 @@ impl Image {
         if !settled {
             return Err(stage::error(
                 None,
-                format!("the GOT cells and PLT stubs the image needs were still growing after {ROUNDS} placements"),
+                format!(
+                    "the GOT cells, PLT stubs and thunks the image needs were still growing after {ROUNDS} \
+                     placements ({} thunk islands)",
+                    stage.new.islands
+                ),
             ));
         }
         stage.coverage_moved();
@@ -741,6 +751,29 @@ impl Image {
     /// (`blaze_api::Response::Tables`): `relocation` and the rest.
     pub fn tables(&self) -> Vec<(&'static str, u64, u64)> {
         self.state.tables()
+    }
+
+    /// The bytes the image holds while it is kept between links, for a cache of kept images to
+    /// weigh it by: its symbol tables' regions and its stage scratch as committed (exact), its
+    /// state's tables as [`Image::tables`] counts their bytes and its native inputs' bytes, and its
+    /// objects' map and key scratch by capacity. The undo states of its history share their
+    /// columns' chunks with the state (copy on write) and are not counted again; what an
+    /// object read keeps behind its `Arc` is not counted.
+    pub fn held(&self) -> u64 {
+        let state = self.state.held();
+        let inputs = self.state.inputs.iter().map(|it| it.bytes.len() as u64).sum::<u64>();
+        let objects = (self.objects.capacity() * (size_of::<Obj>() + size_of::<native::Read>())) as u64;
+        self.symbols.held() + self.arena.committed() as u64 + state + inputs + objects + self.scratch.capacity() as u64
+    }
+
+    /// Gives back what the image keeps only for its next stage to start warm: its stage
+    /// scratch's blocks, to the kernel. Nothing a stage made outlives it in the scratch (each
+    /// stage resets it as it begins, and what a stage returns borrows none of it), so this
+    /// changes nothing the next link reads; that link commits its scratch again as it goes.
+    /// For an image kept idle between builds, where many kept images' warm scratch adds up.
+    pub fn rest(&mut self) {
+        self.arena.reset();
+        self.arena.trim(0);
     }
 
     /// How many jump-table slots the image has given out: every [`Image::slot`] index is below it.

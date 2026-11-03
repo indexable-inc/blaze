@@ -29,7 +29,8 @@ struct Waiter<V> {
 
 struct Waiters<V>(*const Waiter<V>);
 
-// SAFETY: as the replaced design's: reached only under the shard's lock or by the runner.
+// SAFETY: the waiter list is reached only under its shard's lock, or by the runner that took it
+// out, which hands each waiter a `V` once (hence `V: Send`).
 unsafe impl<V: Send> Send for Waiters<V> {}
 
 struct InFlight<V> {

@@ -584,7 +584,7 @@ impl<'db> Lower<'db> {
                         let Some(binding) = self.place_local(lhs) else {
                             return Err(self.unsupported("an assignment to something other than a local", expr));
                         };
-                        self.assign(expr, span, binding, rhs, op)
+                        self.assign(expr, &span, binding, rhs, op)
                     }
                     h::BinaryOp::LogicOp(op) => {
                         let (l, r) = (self.expr(lhs)?, self.expr(rhs)?);
@@ -635,7 +635,7 @@ impl<'db> Lower<'db> {
                 let Some(binding) = self.assigned_local(expr, target) else {
                     return Err(self.unsupported("an assignment to something other than a local", expr));
                 };
-                self.assign(expr, span, binding, value, None)
+                self.assign(expr, &span, binding, value, None)
             }
             h::Expr::If { condition, then_branch, else_branch } => {
                 if matches!(store.expr(condition), h::Expr::Let { .. }) {
@@ -763,7 +763,7 @@ impl<'db> Lower<'db> {
     fn assign(
         &mut self,
         expr: ExprId,
-        span: Span,
+        span: &Span,
         binding: BindingId,
         value: ExprId,
         op: Option<h::ArithOp>,
@@ -777,8 +777,8 @@ impl<'db> Lower<'db> {
             Some(op) => Some(self.arith(op, &typ, expr)?.0),
             None => None,
         };
-        let place = v::SpannedTyped::new(&span, &typ, PlaceX::Local(self.var(binding)));
-        Ok(self.mk(&span, &unit_typ(), ExprX::Assign { place, rhs, op, typ, resolve: false }))
+        let place = v::SpannedTyped::new(span, &typ, PlaceX::Local(self.var(binding)));
+        Ok(self.mk(span, &unit_typ(), ExprX::Assign { place, rhs, op, typ, resolve: false }))
     }
 
     /// `let x = init;` (`StmtX::Decl` with the initializer as a temporary place).

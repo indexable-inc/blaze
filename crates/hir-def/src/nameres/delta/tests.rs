@@ -29,7 +29,7 @@ use crate::{
         diagnostics::DefDiagnosticKind,
         facts::tests::{
             Exempt, compare, differential::ORDER_DEPENDENT, extra_proc_macros,
-            new_crate_local_def_map, project,
+            facts_crate_local_def_map, project,
         },
         frozen,
     },
@@ -106,7 +106,7 @@ pub(super) fn module_at(db: &Db, krate: Crate, path: &[&str]) -> ModuleId {
 }
 
 /// `crate::a::b` for a module of a crate's map.
-pub(super) fn module_path(db: &Db, module: ModuleId) -> String {
+pub(in crate::nameres) fn module_path(db: &Db, module: ModuleId) -> String {
     let mut names = Vec::new();
     let mut at = module;
     while let Some(parent) = at.containing_module_inside_def_map(db) {
@@ -165,9 +165,10 @@ pub(super) fn assert_published(db: &Db, def_map: &DefMap, what: &str) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// §6: where the maintained map may differ from `facts`'. §6 names them against `facts/` and the
-// old collector; `facts/` now has rustc's rule for 2 (glob ties by position) and 3 (an import
-// through a glob waits for its module's expansions), so there the maintained map equals it.
+// §6: where the maintained map may differ from `facts`'. §6 names them against `facts/` and
+// rust-analyzer's `DefCollector` (since deleted); `facts/` now has rustc's rule for 2 (glob ties
+// by position) and 3 (an import through a glob waits for its module's expansions), so there the
+// maintained map equals it.
 
 /// One of design §6's differences from `facts/`.
 pub(super) struct Difference {
@@ -227,7 +228,7 @@ mod user { pub use crate::late::L; pub use crate::*; }
         name: ORDER_DEPENDENT[3].name,
         rustc: ORDER_DEPENDENT[3].rustc,
         fixture: ORDER_DEPENDENT[3].fixture,
-        exempt: ORDER_DEPENDENT[3].exempt,
+        exempt: Exempt { names: &[], unresolved_imports: true },
     },
 ];
 
@@ -249,7 +250,7 @@ fn unresolved_attribute(db: &Db, def_map: &DefMap) -> bool {
 /// map has an [`unresolved_attribute`]: for a program an edit script made, where no fixture
 /// says), appending each difference to `out` under `what`. A crate served by a frozen image is
 /// not maintained and is skipped.
-pub(super) fn check_db(db: &Db, what: &str, exempt: &Exempt, rejected: bool, out: &mut String) {
+pub(in crate::nameres) fn check_db(db: &Db, what: &str, exempt: &Exempt, rejected: bool, out: &mut String) {
     for &krate in all_crates(db).iter() {
         let pair = crate_local_def_map(db, krate);
         let maintained = pair.def_map(db);
@@ -276,7 +277,7 @@ pub(super) fn check_db(db: &Db, what: &str, exempt: &Exempt, rejected: bool, out
             );
         }
 
-        let facts = new_crate_local_def_map(db, krate);
+        let facts = facts_crate_local_def_map(db, krate);
         let mut exempt = *exempt;
         if rejected {
             exempt.unresolved_imports |=

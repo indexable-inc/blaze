@@ -6,7 +6,8 @@ use either::Either;
 use rustc_abi::ReprOptions;
 use rustc_ast_ir::{FloatTy, IntTy, UintTy};
 pub use tls_cache::clear_tls_solver_cache;
-pub use attached_db::fmt_with_attached_db;
+pub(crate) use tls_cache::drop_shared_solver_caches;
+pub use attached_db::{DETACHED, fmt_with_attached_db};
 
 use base_db::{Crate, Db};
 use hir_def::{
@@ -1357,6 +1358,23 @@ impl<'db> Interner for DbInterner<'db> {
         }
     }
 
+    fn with_global_cache_to_read<R>(
+        self,
+        scope: rustc_type_ir::search_graph::CacheScope,
+        f: impl FnOnce(&rustc_type_ir::search_graph::GlobalCache<Self>) -> Option<R>,
+    ) -> Option<R> {
+        match scope {
+            rustc_type_ir::search_graph::CacheScope::Shared => {
+                tls_cache::shared(self.db, self.krate, self.regions, f)
+            }
+            // A lookup makes no cache for this interner: most interners never write one, and
+            // each one made retires another's (see `tls_cache::of_query_to_read`).
+            rustc_type_ir::search_graph::CacheScope::Query => {
+                tls_cache::of_query_to_read(self.db, self.solved, f)
+            }
+        }
+    }
+
     fn with_canonical_param_env_cache<R>(
         self,
         f: impl FnOnce(&mut CanonicalParamEnvCache<Self>) -> R,
@@ -1780,6 +1798,9 @@ impl<'db> Interner for DbInterner<'db> {
             SolverDefId::ImplId(it) => of(it.into()),
             SolverDefId::TraitId(it) => of(it.into()),
             SolverDefId::TypeAliasId(it) => of(it.into()),
+            // rustc's `const_conditions` of an RPITIT: its method's ("RPITITs inherit const
+            // conditions of their parent fn"), whose generics the item's begin with.
+            SolverDefId::RpititId(rpitit) => of(rpitit.function.into()),
             SolverDefId::InternedClosureId(closure)
                 if crate::effects::closure_is_const(db, closure) =>
             {
@@ -2606,6 +2627,16 @@ impl<'db> Interner for DbInterner<'db> {
                 }
                 crate::ImplTraitId::TypeAliasImplTrait(..) => false,
             },
+            // An RPITIT is an associated type of the trait, or of the impl, whose method's
+            // `impl Trait` it is: conditionally const when that trait or impl is.
+            SolverDefId::RpititId(rpitit) => match rpitit.side(self.db) {
+                crate::rpitit::RpititSide::Trait(trait_) => {
+                    crate::effects::is_conditionally_const(self.db, trait_.into())
+                }
+                crate::rpitit::RpititSide::Impl { impl_, .. } => {
+                    crate::effects::is_conditionally_const(self.db, impl_.into())
+                }
+            },
             _ => false,
         }
     }
@@ -2617,6 +2648,11 @@ impl<'db> Interner for DbInterner<'db> {
         Self,
         impl IntoIterator<Item = rustc_type_ir::Binder<Self, rustc_type_ir::TraitRef<Self>>>,
     > {
+        // An RPITIT of the trait has the `[const]` bounds of its opaque type with that type
+        // (and each other `impl Trait` of the method) the trait's item, as its item bounds are
+        // (rustc's `explicit_item_bounds_with_filter(.., ConstIfConst)` of the item); an impl's
+        // has no bounds of its own.
+        let mut rpitit_fn = None;
         let (conditions, trait_) = match def_id {
             SolverDefId::TraitId(trait_) => {
                 (crate::lower::const_conditions(self.db(), trait_.into()).skip_binder(), Some(trait_))
@@ -2627,17 +2663,30 @@ impl<'db> Interner for DbInterner<'db> {
             SolverDefId::InternedOpaqueTyId(opaque) => {
                 (crate::lower::implied_const_bounds(self.db(), opaque.into()).skip_binder(), None)
             }
+            SolverDefId::RpititId(rpitit) => match rpitit.side(self.db) {
+                crate::rpitit::RpititSide::Trait(_) => {
+                    rpitit_fn = Some(rpitit.function);
+                    let opaque = rpitit.opaque(self.db);
+                    (crate::lower::implied_const_bounds(self.db(), opaque.into()).skip_binder(), None)
+                }
+                crate::rpitit::RpititSide::Impl { .. } => (&[][..], None),
+            },
             _ => (&[][..], None),
         };
         // A trait's `[const]` supertraits are its conditions on `Self`; an alias's bounds keep
         // their own self type, the projection or opaque. Read out of a stored binder, which holds
         // no rigid alias.
         EarlyBinder::bind_unchecked(
-            crate::effects::effect_trait_refs(conditions.iter().copied()).filter(move |it| {
-                trait_.is_none_or(|trait_| {
-                    it.skip_binder().def_id.0 != trait_ && is_ty_self(it.skip_binder().self_ty())
+            crate::effects::effect_trait_refs(conditions.iter().copied())
+                .filter(move |it| {
+                    trait_.is_none_or(|trait_| {
+                        it.skip_binder().def_id.0 != trait_ && is_ty_self(it.skip_binder().self_ty())
+                    })
                 })
-            }),
+                .map(move |it| match rpitit_fn {
+                    Some(trait_fn) => crate::rpitit::opaques_to_rpitits(self, trait_fn, it),
+                    None => it,
+                }),
         )
     }
 
@@ -3105,10 +3154,16 @@ fn generic_predicates_of<'db>(
                 GenericPredicates::empty()
             }
         }
-        // rustc's `explicit_predicates_of` of an RPITIT: its method's, whose generics its own
-        // begin with (an impl's item takes its method's, which E0276 keeps no stronger than the
-        // trait's).
-        SolverDefId::RpititId(rpitit) => GenericPredicates::query(db, rpitit.function.into()),
+        // rustc's `explicit_predicates_of` of an RPITIT. The trait's item has its method's,
+        // whose generics its own begin with. An impl's has the trait item's rebased onto the
+        // impl (`gather_explicit_predicates_of`, `ImplTraitInTraitData::Impl`), not the impl
+        // method's own: the impl's predicates and the trait method's own for the impl.
+        SolverDefId::RpititId(rpitit) => match rpitit.side(db) {
+            crate::rpitit::RpititSide::Trait(_) => GenericPredicates::query(db, rpitit.function.into()),
+            crate::rpitit::RpititSide::Impl { .. } => {
+                crate::rpitit::impl_method_hybrid_predicates(db, rpitit.function)
+            }
+        },
         _ => GenericPredicates::query(
             db,
             def_id
@@ -3195,41 +3250,55 @@ TrivialTypeTraversalImpls! {
 mod attached_db {
     use base_db::Db;
 
+    /// What a value formatted with no database attached is reported as
+    /// (`stdx::assert::reported`), after the value kind.
+    pub const DETACHED: &str = "formatted with no database attached";
+
     /// Formats `what` with the database `blaze_query::db::attach` lent the task.
     ///
     /// Text a user reads (a diagnostic, an error) is rendered with the database in hand
     /// (`HirDisplay`, or inside `blaze_query::db::attach` where the text is made), never through
     /// a `Debug` that reads the task's: a query's text must not depend on which thread ran it
     /// (rule 17, rule 22). Every query's run has its database attached, so this reads none only
-    /// outside one, where a driver formats a value it holds. That is a bug at the caller, and it
-    /// panics naming `what`, in every build: a marker in the text would pass a broken message on
-    /// as if it were one (rule 3), and the panic fails only the job that formatted it (rule 17).
-    /// Inside a panic's message or a drop while unwinding it never panics, which would abort the
-    /// process: it writes a marker naming the bug, which can only reach text that is already a
-    /// failure's.
+    /// outside one, where a driver formats a value it holds: a bug at the caller.
+    ///
+    /// In a debug build (every test) that panics naming `what`, so the test that formats
+    /// detached fails at the place. Otherwise it never panics, since formatting must not
+    /// (rule 17), and a panic here would end a daemon's driver outside any job: it writes a
+    /// marker naming `what` as a blaze bug and reports the bug (`stdx::assert::reported`),
+    /// which the daemon says in `blaze status` and the profile, and which fails a test
+    /// process at its exit. So does a debug build inside a panic's message or a drop while
+    /// unwinding, where a panic would abort the process.
+    #[track_caller]
     pub fn fmt_with_attached_db(
         f: &mut std::fmt::Formatter<'_>,
-        what: &str,
+        what: &'static str,
         op: impl FnOnce(&Db, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
     ) -> std::fmt::Result {
+        let at = std::panic::Location::caller();
         blaze_query::db::with_attached_db(|db: Option<&Db>| match db {
             Some(db) => op(db, f),
-            None if std::thread::panicking() => {
-                write!(f, "<{what} formatted with no database attached while unwinding: a blaze bug>")
-            }
-            None => detached(what),
+            None => detached(f, what, at),
         })
     }
 
-    /// The refusal of a value formatted with no database attached, out of line: the formatting
-    /// site's cold path.
+    /// A value formatted with no database attached, out of line: the formatting site's cold
+    /// path. See [`fmt_with_attached_db`].
     #[cold]
     #[inline(never)]
-    fn detached(what: &str) -> ! {
-        panic!(
-            "a `{what}` was formatted with no database attached: render text a user reads with the \
-             database in hand (`HirDisplay`), or inside `blaze_query::db::attach` where it is made"
-        )
+    fn detached(
+        f: &mut std::fmt::Formatter<'_>,
+        what: &'static str,
+        at: &'static std::panic::Location<'static>,
+    ) -> std::fmt::Result {
+        if cfg!(debug_assertions) && !std::thread::panicking() {
+            panic!(
+                "a `{what}` was formatted with no database attached: render text a user reads with the \
+                 database in hand (`HirDisplay`), or inside `blaze_query::db::attach` where it is made"
+            );
+        }
+        stdx::assert::reported::report_at(what, DETACHED, at);
+        write!(f, "<a blaze bug: {what} {DETACHED}>")
     }
 
     #[cfg(test)]
@@ -3246,19 +3315,15 @@ mod attached_db {
             blaze_query::db::with_attached_db(|it: Option<&base_db::Db>| it.map(|it| std::ptr::from_ref(it).addr()))
         }
 
-        /// A `Debug` of an ADT with no database attached is a bug every build stops at (a
-        /// release run of this test checks that too), naming the ADT kind; inside a panic (its message, or a drop while unwinding) it
-        /// never panics, which would abort the process, and says the bug instead.
-        #[test]
-        fn an_adt_formatted_with_no_database_attached_panics_outside_a_panic() {
+        /// An ADT of a fixture's `struct S`, made with its database attached.
+        fn adt_of_s(db: &base_db::Db) -> super::super::AdtDef {
             use hir_def::{AdtId, ModuleDefId, nameres::crate_def_map};
 
-            let db = fixture::db("struct S;").into_db();
-            let adt = blaze_query::db::attach(&db, || {
+            blaze_query::db::attach(db, || {
                 let mut found = None;
-                for &krate in base_db::all_crates(&db).iter() {
-                    for (_, module) in crate_def_map(&db, krate).modules(&db) {
-                        for (name, per_ns) in module.scope(&db).entries() {
+                for &krate in base_db::all_crates(db).iter() {
+                    for (_, module) in crate_def_map(db, krate).modules(db) {
+                        for (name, per_ns) in module.scope(db).entries() {
                             if name.as_str() == "S"
                                 && let Some(ModuleDefId::AdtId(AdtId::StructId(it))) = per_ns.take_types()
                             {
@@ -3268,33 +3333,102 @@ mod attached_db {
                     }
                 }
                 let id = found.expect("struct `S`");
-                let adt = super::super::AdtDef::new(id.into(), super::super::DbInterner::new_no_crate(&db));
+                let adt = super::super::AdtDef::new(id.into(), super::super::DbInterner::new_no_crate(db));
                 assert_eq!(format!("{adt:?}"), "S", "named with a database attached");
                 adt
-            });
-            assert_eq!(attached_here(), None);
-            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| format!("{adt:?}"))).expect_err("formatted detached");
-            let message = refused
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| refused.downcast_ref::<&str>().copied())
-                .unwrap_or("");
-            assert!(message.contains("`AdtDef` was formatted with no database attached"), "{message}");
+            })
+        }
 
-            // In a drop while unwinding: the marker, and no abort.
+        /// A `Debug` of an ADT with no database attached, as a driver outside any query
+        /// formats a value it holds, is a bug. A debug build stops at it, naming the ADT kind;
+        /// a release build (a release run of this test checks that) never panics: it writes a
+        /// marker naming the kind as a blaze bug and reports it, once a format.
+        #[test]
+        fn an_adt_formatted_with_no_database_attached_is_a_reported_bug() {
+            let db = fixture::db("struct S;").into_db();
+            let adt = adt_of_s(&db);
+            assert_eq!(attached_here(), None);
+            if cfg!(debug_assertions) {
+                let refused =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| format!("{adt:?}"))).expect_err("formatted detached");
+                let message = stdx::panic_text(&*refused).unwrap_or("");
+                assert!(message.contains("`AdtDef` was formatted with no database attached"), "{message}");
+                return;
+            }
+            let (text, reported) = stdx::assert::reported::expecting("AdtDef", || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| format!("{adt:?} and {adt:?}")))
+                    .expect("a release build never panics formatting detached")
+            });
+            assert_eq!(
+                text,
+                "<a blaze bug: AdtDef formatted with no database attached> and \
+                 <a blaze bug: AdtDef formatted with no database attached>"
+            );
+            assert_eq!(reported, 2);
+        }
+
+        /// Run alone by [`a_driver_formatting_detached_fails_its_process_not_its_thread`]: a
+        /// driver's thread, outside any query and any `attach`, formats an ADT it holds.
+        #[test]
+        #[ignore = "run in a process of its own by a_driver_formatting_detached_fails_its_process_not_its_thread"]
+        fn a_driver_formats_an_adt_detached() {
+            let db = fixture::db("struct S;").into_db();
+            let adt = adt_of_s(&db);
+            let driver = std::thread::Builder::new().name("driver".to_owned());
+            let text = driver.spawn(move || format!("{adt:?}")).unwrap().join().expect("the driver's thread ended");
+            assert_eq!(text, "<a blaze bug: AdtDef formatted with no database attached>");
+            assert_eq!(stdx::assert::reported::total(), 1);
+            let sites = stdx::assert::reported::sites();
+            let [site] = &sites[..] else { panic!("one site: {sites:?}") };
+            assert_eq!((site.kind, site.what), ("AdtDef", super::DETACHED));
+            assert!(site.at.file().ends_with("next_solver/interner.rs"), "{}", site.at);
+            assert_eq!(site.thread.as_deref(), Some("driver"));
+        }
+
+        /// A driver that formats a solver value detached: in a release build its thread goes on
+        /// with the marker and the process counts the bug, then fails at exit naming the value
+        /// kind, the `Debug` impl and the thread; a debug build fails the test at the format.
+        #[test]
+        fn a_driver_formatting_detached_fails_its_process_not_its_thread() {
+            let name = "next_solver::interner::attached_db::tests::a_driver_formats_an_adt_detached";
+            let exe = std::env::current_exe().expect("the test binary's path");
+            let out = std::process::Command::new(exe).args(["--exact", name, "--ignored"]).output().expect("running it");
+            let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert_eq!(out.status.code(), Some(101), "stdout: {stdout}\nstderr: {stderr}");
+            if cfg!(debug_assertions) {
+                let said = format!("{stdout}{stderr}");
+                assert!(said.contains("`AdtDef` was formatted with no database attached"), "{said}");
+                return;
+            }
+            assert!(stdout.contains("1 passed"), "the driver went on\nstdout: {stdout}\nstderr: {stderr}");
+            assert!(stderr.contains("this process reported 1 blaze bug(s)"), "{stderr}");
+            assert!(stderr.contains("a blaze bug: `AdtDef` formatted with no database attached at "), "{stderr}");
+            assert!(stderr.contains("next_solver/interner.rs:"), "{stderr}");
+            assert!(stderr.contains("first on thread `driver`"), "{stderr}");
+        }
+
+        /// In a drop while unwinding, every build writes the marker and reports the bug, and
+        /// never panics, which would abort the process.
+        #[test]
+        fn an_adt_formatted_detached_while_unwinding_is_a_reported_bug() {
             struct FormatsOnDrop(super::super::AdtDef, std::sync::Arc<parking_lot::Mutex<String>>);
             impl Drop for FormatsOnDrop {
                 fn drop(&mut self) {
                     *self.1.lock() = format!("{:?}", self.0);
                 }
             }
+            let db = fixture::db("struct S;").into_db();
+            let adt = adt_of_s(&db);
             let seen = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
             let guard = FormatsOnDrop(adt, seen.clone());
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                let _guard = guard;
-                panic!("unwinding");
-            }));
-            assert_eq!(*seen.lock(), "<AdtDef formatted with no database attached while unwinding: a blaze bug>");
+            let ((), reported) = stdx::assert::reported::expecting("AdtDef", || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let _guard = guard;
+                    panic!("unwinding");
+                }));
+            });
+            assert_eq!(*seen.lock(), "<a blaze bug: AdtDef formatted with no database attached>");
+            assert_eq!(reported, 1);
         }
 
         /// Two jobs on a pool of two workers each attach a database of their own (the first
@@ -3472,8 +3606,9 @@ mod tls_cache;
 ///
     /// - a column of `OnceLock<T>` segments: a state word per value (a type row's 4-byte flags
     ///   and binder take 8 each) and a state check on every read of every column;
-/// - an index whose grown tables are reference counted rather than leaked: a shared counter
-///   written on every hit, which every core then contends on.
+/// - an index whose grown tables are reference counted rather than retired through an epoch
+///   ([`blaze_reclaim`]): a shared counter written on every hit, which every core then contends
+///   on, where entering a task is a count in the reader's own thread.
 ///
 /// The safe reference version of each table is in the tests, which check both give the same
 /// rows and values.
@@ -3485,12 +3620,34 @@ pub(crate) mod table {
         mem::ManuallyDrop,
         num::NonZeroU32,
         ptr,
-        sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
+        sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
     };
 
-    use blaze_hash::FixedState;
+    use blaze_hash::{FixedState, SipKey, adaptive};
+    use blaze_reclaim::{Horizon, Limbo};
     use parking_lot::{Mutex, MutexGuard};
     use rustc_type_ir::{DebruijnIndex, TypeFlags};
+
+    /// A count of the slots the indexes look at, kept only under `cfg(test)`: what the test
+    /// that bounds a lookup's probes reads. A no-op in every other build.
+    mod probes {
+        #[cfg(test)]
+        thread_local! {
+            static PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+
+        #[inline(always)]
+        pub(super) fn count() {
+            #[cfg(test)]
+            PROBES.with(|it| it.set(it.get() + 1));
+        }
+
+        /// The slots this thread looked at since the last take.
+        #[cfg(test)]
+        pub(super) fn take() -> u64 {
+            PROBES.with(|it| it.replace(0))
+        }
+    }
 
     /// A type a table holds under its `'static` name: a table is a `static`, and every value in
     /// it lives as long.
@@ -3611,6 +3768,16 @@ pub(crate) mod table {
     /// so a reference into one lives as long as the column (a `static`). Each position is
     /// written once, by the thread that claimed it, before anything naming it is published by
     /// a release store that the reader's acquire load pairs with.
+    ///
+    /// What the memory line's `intern heap` counts of a column is its segments' whole size, as
+    /// the global allocator handed each out, not the positions written: the last segment is one
+    /// claimed position up to wholly used, so a column of `n` values holds up to twice `n`
+    /// (about 1.4 times on average over table sizes). The tail no position reached yet is
+    /// memory the allocator took fresh from the system, which the system maps only on first
+    /// touch, so the line runs ahead of what the process has resident by up to that tail. That
+    /// is the count every heap line keeps (bytes handed out), and it is not changed here; a
+    /// shard's slot tables, unlike it, are written all over as they fill, so what they count is
+    /// resident.
     struct Column<T> {
         segments: [AtomicPtr<T>; SEGMENTS],
         /// Whether segments start zeroed: a column of atomics that are read before they are
@@ -3650,12 +3817,12 @@ pub(crate) mod table {
             let layout = Layout::array::<T>(segment_len(segment) as usize)
                 .expect("a column segment fits in memory");
             assert!(layout.size() > 0, "a column of zero-sized values");
-            let fresh = match self.zeroed {
+            let fresh = for_the_tables(|| match self.zeroed {
                 // SAFETY: `layout` is not zero-sized (asserted above).
                 true => unsafe { alloc::alloc_zeroed(layout) },
                 // SAFETY: as above.
                 false => unsafe { alloc::alloc(layout) },
-            }
+            })
             .cast::<T>();
             if fresh.is_null() {
                 alloc::handle_alloc_error(layout);
@@ -3804,16 +3971,6 @@ pub(crate) mod table {
         }
     }
 
-    /// The hash a value is found by: its hash, mixed (murmur's finalizer) so that its top
-    /// bits pick a shard and its low half a slot.
-    #[inline]
-    fn hash_of<T: Hash + ?Sized>(value: &T) -> u64 {
-        let hash = FixedState.hash_one(value);
-        let hash = (hash ^ (hash >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
-        let hash = (hash ^ (hash >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        hash ^ (hash >> 33)
-    }
-
     const SHARD_BITS: u32 = 6;
     const SHARDS: usize = 1 << SHARD_BITS;
     const FIRST_SLOTS: usize = 16;
@@ -3822,13 +3979,93 @@ pub(crate) mod table {
     /// probing, at most half full) of `u64` slots, each the low half of a hash and a row (0 for
     /// an empty slot, as rows start at 1). A hit is loads alone; an insert takes the shard's
     /// lock, looks again and publishes the row with a release store. A table that grows is
-    /// copied and the old one leaked, as a reader may still be probing it.
+    /// copied into one twice its length, and the old one is retired to the tables' [`RETIRED`],
+    /// as a reader may still be probing it: it is freed once every thread that was in a task
+    /// ([`blaze_reclaim::pinned`]) when it was replaced has left that task, and a lock-free
+    /// lookup probes only inside a task it enters before it loads the shard's word. Leaked
+    /// instead, the old tables of a shard add up to its live table less its first (`len / 2 +
+    /// len / 4 + ... + 16` slots), so they doubled what the index held (B5, memcap6).
     ///
     /// A hit is three dependent loads: the shard's word, the slot, and the row's kind for the
     /// equality check. The shard's word holds the table's address and the log2 of its length
-    /// together, so there is no header between the shard and the slot.
+    /// together, so there is no header between the shard and the slot. Entering the task is a
+    /// count in a thread-local on a thread already in one (every job of a pool is), and on one
+    /// that is not, a store to its own slot and a fence.
+    ///
+    /// The index's own bytes: at most half full and grown by doubling, a shard holds between 2
+    /// and 4 slots of 8 bytes a row, about 2.9 (23 bytes) on average over sizes. A table kept
+    /// at most 7/8 full (SwissTable's bound), still doubling, would hold 8/7 to 16/7 slots a row,
+    /// about 1.65 (13 bytes): some 10 bytes a row less, 43% of the index. Not done here, as
+    /// linear probing's walks grow fast past half full; it wants a probing scheme of its own.
+    ///
+    /// A value is placed adaptively (`blaze_hash::adaptive`). First by [`fixed_hash`], whose
+    /// seed is a constant LLVM folds into the code, in the `fixed` shards. A kind holds what a
+    /// source picks (an array's length, a literal, a valtree's bytes), and the fixed hash is
+    /// public: foldhash's fixed seed, whose multiply a word cancelling a seed word zeroes, lets a
+    /// source pick thousands of kinds with one hash, each insert then walking past all of them
+    /// under one shard's lock. So a walk under the fixed hash that steps past
+    /// [`adaptive::refused_run`] full slots, a run no honest set of kinds makes (odds under 2^-40
+    /// a size), stops, and the index switches ([`Index::switch`]): every row is placed again,
+    /// in the `secret` shards, by SipHash-1-3 under a key drawn then and never shown, and every
+    /// lookup after uses them. Once, for the life of the process. The hash's top bits pick a
+    /// shard, its low half a slot.
+    ///
+    /// Cost (`interning_cost`): under the fixed hash a hit costs what it did before any key (9.0
+    /// ns in cache and 26 out of it, 2026-11-03) plus one relaxed load of `keyed`, in the
+    /// index's first line (`repr(C)`, `keyed` first); a switched index pays SipHash (15.7 and 45 then) and a call. foldhash
+    /// under a key drawn at run time cost more than SipHash (17 and 54), as no secret key can be
+    /// folded into the code. These were measured before a lookup entered a task, which adds
+    /// the thread-local count above (not measured yet).
+    ///
+    /// Readers take no lock, so the switch never changes what a set of shards holds under the
+    /// hash that placed it: it fills the empty `secret` shards while holding every `fixed`
+    /// shard's lock, sets `keyed`, and leaves `fixed` as it was, frozen. A lock-free lookup that
+    /// read `keyed` before the switch walks `fixed` and finds every row interned before it; one
+    /// it misses is a hint only, settled under a shard's lock ([`Index::lock`]), where `keyed` is
+    /// read again. Rows are numbered by the table's counter, never by where they land, so which
+    /// hash an index uses changes no output (AGENTS.md rule 22).
+    #[repr(C)]
     struct Index {
-        shards: [Shard; SHARDS],
+        /// Whether values are placed in `secret` by SipHash under `key` rather than in `fixed` by
+        /// [`fixed_hash`]. Set once, by [`Index::switch`] with every `fixed` shard's lock held,
+        /// and never cleared. First, beside the key and the first `fixed` shard, which a
+        /// switched index no longer writes, rather than beside a `secret` shard, which it does.
+        keyed: AtomicBool,
+        /// `secret`'s key, its two words stored before `keyed` is set (release): read only
+        /// after an acquire load of `keyed` saw it set ([`Index::key`]).
+        key: [AtomicU64; 2],
+        /// The shards under the fixed hash; frozen once `keyed` is set.
+        fixed: [Shard; SHARDS],
+        /// The shards under the key: empty until the switch fills them.
+        secret: [Shard; SHARDS],
+        /// How many times the index switched: what the tests that it switches once read.
+        #[cfg(test)]
+        switches: AtomicU32,
+        /// How many of its tables are retired and not freed yet: what the test that they are
+        /// freed after their grace reads.
+        #[cfg(test)]
+        retired: AtomicU32,
+    }
+
+    /// The shards' tables grown ones replaced, of every index (each [`Rows`], [`Lists`] and
+    /// [`Values`], both sets of shards), each held until no lookup that may have loaded it can
+    /// still be probing it ([`Vacant::retire`]). One limbo for all, so a release lets go of
+    /// every one past its grace at once ([`collect`]); only an insert that grows a table takes
+    /// its lock, after letting go of its shard's, and it holds it for a push and a walk of the
+    /// held graces, never a scan of the reclaim slots nor a free.
+    static RETIRED: Mutex<Limbo> = Mutex::new(Limbo::new());
+
+    /// Frees every retired table of every index whose grace has passed: what a front end
+    /// release calls ([`crate::evict::free_retired_intern_tables`]), as otherwise a table is
+    /// freed only when some index grows again, and the last round of doublings (about half of
+    /// what the indexes' live tables hold) would stay to the process's end. How many it freed.
+    pub(crate) fn collect() -> usize {
+        // The scan before the lock, as `Vacant::retire`.
+        let horizon = Horizon::now();
+        let passed = RETIRED.lock().collect_passed(horizon);
+        let freed = passed.len();
+        drop(passed);
+        freed
     }
 
     struct Shard {
@@ -3844,23 +4081,42 @@ pub(crate) mod table {
     const SLOTS_ALIGN: usize = 64;
     const LOG_LEN_MASK: usize = SLOTS_ALIGN - 1;
 
-    /// A shard's table, as its word names it: `len` zeroed `AtomicU64`s in one allocation that
-    /// is never freed.
+    /// A shard's table, as its word names it: `len` zeroed `AtomicU64`s in one allocation, freed
+    /// only as a [`Retired`] table once a grown one replaced it and its grace has passed. So a
+    /// `Slots` is read only by the holder of its shard's lock, which alone replaces it, or
+    /// inside a task entered before its shard's word was loaded.
     #[derive(Clone, Copy)]
     struct Slots {
         words: *mut AtomicU64,
         mask: usize,
     }
 
+    /// Runs `f`, an allocation of the tables' own (a column's segment, a shard's slots), as a task
+    /// of [`blaze_mem::Tag::Intern`], so the global heap charges it to `intern` and not to the
+    /// task that happened to intern a value when the table grew: the tables live for the process
+    /// and no task's end or release frees them. coord-108 (B5): monomorphizing and lowering MIR
+    /// grow them, so they counted as `mir` heap (4.5 GiB that dropping 150,000 MIR bodies did not
+    /// lower) and made releases due for MIR past its share, which no release could free. Cold: a
+    /// table grows by doubling.
+    #[cold]
+    fn for_the_tables<R>(f: impl FnOnce() -> R) -> R {
+        blaze_mem::frame::task(blaze_mem::Tag::Intern, |_| f())
+    }
+
     impl Slots {
+        /// The layout of a table of `len` slots: what it is allocated and freed with.
+        fn layout(len: usize) -> Layout {
+            Layout::array::<AtomicU64>(len)
+                .and_then(|layout| layout.align_to(SLOTS_ALIGN))
+                .expect("a shard's slots fit in memory")
+        }
+
         /// A zeroed table of `len` slots, a power of two of at least [`FIRST_SLOTS`].
         fn allocate(len: usize) -> Slots {
             assert!(len.is_power_of_two() && len >= FIRST_SLOTS);
-            let layout = Layout::array::<AtomicU64>(len)
-                .and_then(|layout| layout.align_to(SLOTS_ALIGN))
-                .expect("a shard's slots fit in memory");
+            let layout = Slots::layout(len);
             // SAFETY: `layout` is not zero-sized: `len` is at least `FIRST_SLOTS`.
-            let words = unsafe { alloc::alloc_zeroed(layout) }.cast::<AtomicU64>();
+            let words = for_the_tables(|| unsafe { alloc::alloc_zeroed(layout) }).cast::<AtomicU64>();
             if words.is_null() {
                 alloc::handle_alloc_error(layout);
             }
@@ -3889,23 +4145,42 @@ pub(crate) mod table {
         }
 
         #[inline]
-        fn word(self, at: usize) -> &'static AtomicU64 {
-            // SAFETY: `at & mask` is below the table's length, its allocation is never freed,
-            // and it was zeroed, which is a valid `AtomicU64`.
+        fn word(&self, at: usize) -> &AtomicU64 {
+            // SAFETY: `at & mask` is below the table's length, and it was zeroed, which is a
+            // valid `AtomicU64`. The allocation is live: a table is freed only once retired and
+            // past its grace, and its reader holds its shard's lock or is in a task entered
+            // before it loaded the shard's word (`Slots`).
             unsafe { &*self.words.add(at & self.mask) }
         }
 
+        /// Walks from `hash`'s slot to the row `same` accepts or to an empty slot. `bounded`, as
+        /// under the fixed hash, it gives up as [`Probe::Flooded`] once it has stepped past
+        /// [`adaptive::refused_run`] full slots: past the shortest bound of any size first, so a
+        /// short walk pays one compare with a constant a step.
         #[inline]
-        fn find(self, hash: u32, mut same: impl FnMut(NonZeroU32) -> bool) -> Option<NonZeroU32> {
+        fn find(self, hash: u32, bounded: bool, mut same: impl FnMut(NonZeroU32) -> bool) -> Probe {
             let mut at = hash as usize;
+            let mut walked = 0;
             loop {
+                probes::count();
                 let word = self.word(at).load(Ordering::Acquire);
-                let row = NonZeroU32::new(word as u32)?;
+                let Some(row) = NonZeroU32::new(word as u32) else {
+                    return Probe::Miss;
+                };
                 if (word >> 32) as u32 == hash && same(row) {
-                    return Some(row);
+                    return Probe::Hit(row);
                 }
                 at += 1;
+                walked += 1;
+                if bounded && walked >= SHORTEST_REFUSED && walked >= self.refused_run() {
+                    return Probe::Flooded;
+                }
             }
+        }
+
+        /// The walk under the fixed hash this table refuses as a flood.
+        fn refused_run(self) -> usize {
+            adaptive::refused_run(self.len().trailing_zeros())
         }
 
         /// Puts `word` in the first empty slot from its hash's. Only the holder of the shard's
@@ -3913,10 +4188,52 @@ pub(crate) mod table {
         fn put(self, word: u64) {
             let mut at = (word >> 32) as usize;
             while self.word(at).load(Ordering::Relaxed) != 0 {
+                probes::count();
                 at += 1;
             }
             self.word(at).store(word, Ordering::Release);
         }
+    }
+
+    /// A shard's table a grown one replaced, which the shard no longer names: freed when
+    /// [`RETIRED`] lets it go, once every thread that was in a task when it was replaced has
+    /// left that task. From any thread; the free goes to the heap that holds the block, so it is
+    /// taken off `intern`, which [`for_the_tables`] charged it to.
+    struct Retired {
+        slots: Slots,
+        /// Its index's count of tables retired and not freed ([`Index::retired`]), which lives
+        /// as long: every index a test grows is in a `static`.
+        #[cfg(test)]
+        live: *const AtomicU32,
+    }
+
+    // SAFETY: a retired table is owned by the limbo alone (no shard names it), which only drops
+    // it; a shared `Retired` gives no access to its slots.
+    unsafe impl Send for Retired {}
+    // SAFETY: as above.
+    unsafe impl Sync for Retired {}
+
+    impl Drop for Retired {
+        fn drop(&mut self) {
+            // SAFETY: `Slots::allocate` made the table with `Slots::layout` of its length, and
+            // its grace has passed, so no reader can still reach it.
+            unsafe { alloc::dealloc(self.slots.words.cast(), Slots::layout(self.slots.len())) };
+            // SAFETY: `live` is a field of the table's index, a `static` in every test.
+            #[cfg(test)]
+            unsafe { &*self.live }.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The walk under the fixed hash a table of any size refuses: its smallest table's, as the
+    /// bound grows with the table.
+    const SHORTEST_REFUSED: usize = adaptive::refused_run(FIRST_SLOTS.trailing_zeros());
+
+    /// What a walk of a shard's table found.
+    enum Probe {
+        Hit(NonZeroU32),
+        Miss,
+        /// A run of full slots under the fixed hash no honest set of values makes.
+        Flooded,
     }
 
     enum Entry<'a> {
@@ -3924,57 +4241,237 @@ pub(crate) mod table {
         Vacant(Vacant<'a>),
     }
 
+    /// The hash [`Index`] places a value by until it switches: foldhash's fixed seed, mixed by
+    /// murmur's finalizer so that its top bits can pick a shard and its low half a slot.
+    #[inline]
+    fn fixed_hash<T: Hash + ?Sized>(value: &T) -> u64 {
+        let hash = FixedState.hash_one(value);
+        let hash = (hash ^ (hash >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        let hash = (hash ^ (hash >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        hash ^ (hash >> 33)
+    }
+
     /// A hash not in the index, with its shard's lock held until a row is inserted for it.
     struct Vacant<'a> {
         shard: &'a Shard,
         len: MutexGuard<'a, usize>,
         hash: u32,
+        /// The index's count of retired tables, for the test that they are freed.
+        #[cfg(test)]
+        retired: &'a AtomicU32,
     }
 
     impl Index {
         const fn new() -> Index {
+            const fn empty() -> [Shard; SHARDS] {
+                [const { Shard { slots: AtomicPtr::new(ptr::null_mut()), len: Mutex::new(0) } }; SHARDS]
+            }
             Index {
-                shards: [const {
-                    Shard { slots: AtomicPtr::new(ptr::null_mut()), len: Mutex::new(0) }
-                }; SHARDS],
+                keyed: AtomicBool::new(false),
+                key: [AtomicU64::new(0), AtomicU64::new(0)],
+                fixed: empty(),
+                secret: empty(),
+                #[cfg(test)]
+                switches: AtomicU32::new(0),
+                #[cfg(test)]
+                retired: AtomicU32::new(0),
             }
         }
 
-        #[inline]
-        fn shard(&self, hash: u64) -> &Shard {
-            &self.shards[(hash >> (64 - SHARD_BITS)) as usize]
+        /// `secret`'s key. Only after an acquire load of `keyed` saw it set, which pairs with
+        /// the switch's release store after it stored the key's words.
+        fn key(&self) -> SipKey {
+            SipKey::new(self.key[0].load(Ordering::Relaxed), self.key[1].load(Ordering::Relaxed))
         }
 
-        /// The row of hash `hash` that `same` accepts.
         #[inline]
-        fn find(
+        fn shard(shards: &[Shard; SHARDS], hash: u64) -> &Shard {
+            &shards[(hash >> (64 - SHARD_BITS)) as usize]
+        }
+
+        /// The row of `value` that `same` accepts, looked for with no lock. `None` is a hint
+        /// that [`Index::lock`] settles: the value is not there, or the walk met a flood, or it
+        /// raced the switch.
+        #[inline]
+        fn find<T: Hash + ?Sized>(
             &self,
-            hash: u64,
+            value: &T,
             same: impl FnMut(NonZeroU32) -> bool,
         ) -> Option<NonZeroU32> {
-            // The acquire load pairs with `Vacant::insert`'s release store of a grown table, so
-            // its copied slots read as written.
-            Slots::unpack(self.shard(hash).slots.load(Ordering::Acquire))?.find(hash as u32, same)
+            // Relaxed: either set of shards answers rightly for what it holds, and a stale
+            // `false` walks `fixed`, which holds every row interned before the switch.
+            if self.keyed.load(Ordering::Relaxed) {
+                return self.find_keyed(value, same);
+            }
+            let hash = fixed_hash(value);
+            // In a task from before the shard's word is loaded until the walk ends, so the
+            // table it names, if a grown one replaces it meanwhile, is not freed under it. The
+            // walk never waits (`same` compares kinds), which a debug build checks.
+            blaze_reclaim::pinned(|| -> Option<NonZeroU32> {
+                #[cfg(debug_assertions)]
+                let _walk = blaze_graph::sched::NoWait::new();
+                // The acquire load pairs with `Vacant::insert`'s release store of a grown table,
+                // so its copied slots read as written.
+                let slots = Slots::unpack(Self::shard(&self.fixed, hash).slots.load(Ordering::Acquire))?;
+                match slots.find(hash as u32, true, same) {
+                    Probe::Hit(row) => Some(row),
+                    Probe::Miss | Probe::Flooded => None,
+                }
+            })
         }
 
-        /// The row of hash `hash` that `same` accepts, looked for again under its shard's lock,
-        /// or the lock to insert one.
-        fn lock(&self, hash: u64, same: impl FnMut(NonZeroU32) -> bool) -> Entry<'_> {
-            let shard = self.shard(hash);
-            let len = shard.len.lock();
-            match self.find(hash, same) {
-                Some(row) => Entry::Found(row),
-                None => Entry::Vacant(Vacant { shard, len, hash: hash as u32 }),
+        /// [`Index::find`] in a switched index. Out of line, so the fixed hash's path that
+        /// every honest process takes stays small where it is inlined; a flooded process pays
+        /// a call on top of SipHash.
+        #[cold]
+        #[inline(never)]
+        fn find_keyed<T: Hash + ?Sized>(
+            &self,
+            value: &T,
+            same: impl FnMut(NonZeroU32) -> bool,
+        ) -> Option<NonZeroU32> {
+            // Acquire, as `find`'s relaxed load may not order the key's words before this read.
+            if !self.keyed.load(Ordering::Acquire) {
+                return None;
             }
+            let hash = self.key().hash_one(value);
+            // As in `find`.
+            blaze_reclaim::pinned(|| -> Option<NonZeroU32> {
+                #[cfg(debug_assertions)]
+                let _walk = blaze_graph::sched::NoWait::new();
+                let slots = Slots::unpack(Self::shard(&self.secret, hash).slots.load(Ordering::Acquire))?;
+                match slots.find(hash as u32, false, same) {
+                    Probe::Hit(row) => Some(row),
+                    Probe::Miss | Probe::Flooded => None,
+                }
+            })
+        }
+
+        /// The row of `value` that `same` accepts, looked for again under its shard's lock, or
+        /// the lock to insert one. A walk under the fixed hash that meets a flood switches the
+        /// index (`rehash` is SipHash under a key of a row's value) and looks again under the
+        /// key.
+        fn lock<T: Hash + ?Sized>(
+            &self,
+            value: &T,
+            same: impl Fn(NonZeroU32) -> bool,
+            rehash: impl Fn(SipKey, NonZeroU32) -> u64,
+        ) -> Entry<'_> {
+            loop {
+                // Acquire: pairs with the switch's release store, so the key and what it put in
+                // `secret`'s locks read as written.
+                let keyed = self.keyed.load(Ordering::Acquire);
+                let (shards, hash) = match keyed {
+                    false => (&self.fixed, fixed_hash(value)),
+                    true => (&self.secret, self.key().hash_one(value)),
+                };
+                let shard = Self::shard(shards, hash);
+                let len = shard.len.lock();
+                // A switch sets `keyed` holding every `fixed` shard's lock, so under this one the
+                // load sees a switch that happened, and none can happen until it is let go.
+                if !keyed && self.keyed.load(Ordering::Relaxed) {
+                    continue;
+                }
+                // Inserts into this shard hold its lock, held here.
+                let probe = match Slots::unpack(shard.slots.load(Ordering::Acquire)) {
+                    Some(slots) => slots.find(hash as u32, !keyed, &same),
+                    None => Probe::Miss,
+                };
+                match probe {
+                    Probe::Hit(row) => return Entry::Found(row),
+                    Probe::Miss => {
+                        return Entry::Vacant(Vacant {
+                            shard,
+                            len,
+                            hash: hash as u32,
+                            #[cfg(test)]
+                            retired: &self.retired,
+                        });
+                    }
+                    Probe::Flooded => {
+                        drop(len);
+                        self.switch(&rehash);
+                    }
+                }
+            }
+        }
+
+        /// Places every row again, in the `secret` shards, by SipHash under a key drawn now
+        /// (`rehash` of the key and a row is the hash of the row's value), and sets `keyed`.
+        /// Once in the index's life: whichever walk meets a flood first switches it, and one
+        /// that comes after finds it done.
+        ///
+        /// It holds every `fixed` shard's lock, taken in shard order (nothing else holds two,
+        /// so no thread waits on it while holding one it waits for): no row can be added to
+        /// `fixed` while it copies them, and a writer that waited reads `keyed` again under the
+        /// lock it gets. `rehash` runs under these locks, so a value's `Hash` must not intern
+        /// into the same table, as its `Eq` already must not. Inserts into the table wait for
+        /// the whole copy, about 10 to 50 ns a row (some 100 ms at 10^7 rows), once in its life;
+        /// lookups never wait.
+        #[cold]
+        #[inline(never)]
+        fn switch(&self, rehash: &impl Fn(SipKey, NonZeroU32) -> u64) {
+            let held: [MutexGuard<'_, usize>; SHARDS] =
+                std::array::from_fn(|at| self.fixed[at].len.lock());
+            if self.keyed.load(Ordering::Relaxed) {
+                return;
+            }
+            let key = adaptive::switch_key();
+            let [k0, k1] = key.words();
+            self.key[0].store(k0, Ordering::Relaxed);
+            self.key[1].store(k1, Ordering::Relaxed);
+            for shard in &self.fixed {
+                let Some(slots) = Slots::unpack(shard.slots.load(Ordering::Relaxed)) else {
+                    continue;
+                };
+                for at in 0..slots.len() {
+                    // Relaxed: every insert into this shard held its lock, held here, so the
+                    // slot and the row it names read as written.
+                    let word = slots.word(at).load(Ordering::Relaxed);
+                    let Some(row) = NonZeroU32::new(word as u32) else {
+                        continue;
+                    };
+                    let hash = rehash(key, row);
+                    let into = Self::shard(&self.secret, hash);
+                    // Uncontended: no writer locks a `secret` shard before `keyed` is set.
+                    Vacant {
+                        shard: into,
+                        len: into.len.lock(),
+                        hash: hash as u32,
+                        #[cfg(test)]
+                        retired: &self.retired,
+                    }
+                    .insert(row);
+                }
+            }
+            #[cfg(test)]
+            self.switches.fetch_add(1, Ordering::Relaxed);
+            self.keyed.store(true, Ordering::Release);
+            drop(held);
+        }
+
+        /// Whether the index has switched to its key.
+        #[cfg(test)]
+        fn keyed(&self) -> bool {
+            self.keyed.load(Ordering::Acquire)
         }
     }
 
     impl Vacant<'_> {
-        /// Publishes `row`, written in full, for the hash, and releases the shard's lock.
-        fn insert(mut self, row: NonZeroU32) {
-            let len = *self.len + 1;
-            let mut slots = Slots::unpack(self.shard.slots.load(Ordering::Relaxed));
+        /// Publishes `row`, written in full, for the hash, and releases the shard's lock. A table
+        /// it outgrows is retired, after the lock is let go.
+        fn insert(self, row: NonZeroU32) {
+            let Vacant {
+                shard,
+                len: mut held,
+                hash,
+                #[cfg(test)]
+                retired,
+            } = self;
+            let len = *held + 1;
+            let mut slots = Slots::unpack(shard.slots.load(Ordering::Relaxed));
             let capacity = slots.map_or(0, Slots::len);
+            let mut replaced = None;
             if len * 2 > capacity {
                 let grown = Slots::allocate((capacity * 2).max(FIRST_SLOTS));
                 if let Some(old) = slots {
@@ -3985,12 +4482,45 @@ pub(crate) mod table {
                         }
                     }
                 }
-                self.shard.slots.store(grown.packed(), Ordering::Release);
+                shard.slots.store(grown.packed(), Ordering::Release);
+                replaced = slots;
                 slots = Some(grown);
             }
             let slots = slots.expect("a shard has a table once it grew");
-            slots.put((u64::from(self.hash) << 32) | u64::from(row.get()));
-            *self.len = len;
+            slots.put((u64::from(hash) << 32) | u64::from(row.get()));
+            *held = len;
+            drop(held);
+            if let Some(old) = replaced {
+                #[cfg(test)]
+                retired.fetch_add(1, Ordering::Relaxed);
+                Vacant::retire(Retired {
+                    slots: old,
+                    #[cfg(test)]
+                    live: retired,
+                });
+            }
+        }
+
+        /// Holds `old`, a table the release store of a grown one unlinked, in [`RETIRED`] until
+        /// its grace has passed, and frees the tables whose grace has, after letting go of the
+        /// limbo's lock: the scan of every thread's slot that says which passed is taken before
+        /// it locks, so the lock covers a push and a walk of the held graces (`blaze_reclaim`'s
+        /// `scans`). Under no shard's lock (but in a switch, which holds every `fixed` shard's
+        /// lock once in the index's life). Should the box or the list fail to allocate, `old`
+        /// is leaked, not freed under its readers (`Limbo::hold`).
+        #[cold]
+        fn retire(old: Retired) {
+            let horizon = Horizon::now();
+            let passed = {
+                let mut limbo = RETIRED.lock();
+                // alloc: the limbo's box of the table, its list and the list of those passed,
+                // charged to `intern` as the tables it holds are
+                for_the_tables(|| {
+                    limbo.retire(old);
+                    limbo.collect_passed(horizon)
+                })
+            };
+            drop(passed);
         }
     }
 
@@ -4059,11 +4589,15 @@ pub(crate) mod table {
             info: impl FnOnce() -> RowInfo,
         ) -> NonZeroU32 {
             let kind = to_static(kind);
-            let hash = hash_of(&kind);
-            match self.index.find(hash, |row| self.indexed(row) == kind) {
+            match self.index.find(&kind, |row| self.indexed(row) == kind) {
                 Some(row) => row,
-                None => self.add(hash, kind, info),
+                None => self.add(kind, info),
             }
+        }
+
+        /// SipHash under a key of a row's kind: what a switched index places it by.
+        fn rehash(&self) -> impl Fn(SipKey, NonZeroU32) -> u64 + '_ {
+            |key, row| key.hash_one(&self.indexed(row))
         }
 
         /// The kind of a row the index names.
@@ -4075,10 +4609,10 @@ pub(crate) mod table {
         }
 
         #[cold]
-        fn add(&self, hash: u64, kind: K, info: impl FnOnce() -> RowInfo) -> NonZeroU32 {
+        fn add(&self, kind: K, info: impl FnOnce() -> RowInfo) -> NonZeroU32 {
             let info = info();
             assert!(info.tag < u8::MAX, "a {} tag of {}", self.what, info.tag);
-            let vacant = match self.index.lock(hash, |row| self.indexed(row) == kind) {
+            let vacant = match self.index.lock(&kind, |row| self.indexed(row) == kind, self.rehash()) {
                 Entry::Found(row) => return row,
                 Entry::Vacant(vacant) => vacant,
             };
@@ -4225,23 +4759,21 @@ pub(crate) mod table {
             items: &[T],
             info: impl FnOnce() -> Option<(TypeFlags, DebruijnIndex)>,
         ) -> NonZeroU32 {
-            let hash = hash_of(items);
-            match self.index.find(hash, |row| self.items(row) == items) {
+            match self.index.find(items, |row| self.items(row) == items) {
                 Some(row) => row,
-                None => self.add(hash, items, info),
+                None => self.add(items, info),
             }
         }
 
         #[cold]
         fn add(
             &self,
-            hash: u64,
             items: &[T],
             info: impl FnOnce() -> Option<(TypeFlags, DebruijnIndex)>,
         ) -> NonZeroU32 {
             let info = info();
             assert_eq!(info.is_some(), self.flagged, "the flags of a list of {}", self.what);
-            let vacant = match self.index.lock(hash, |row| self.items(row) == items) {
+            let vacant = match self.index.lock(items, |row| self.items(row) == items, self.rehash()) {
                 Entry::Found(row) => return row,
                 Entry::Vacant(vacant) => vacant,
             };
@@ -4293,6 +4825,11 @@ pub(crate) mod table {
                 0 => never_written(self.what, row),
                 len => len as usize - 1,
             }
+        }
+
+        /// SipHash under a key of a row's items: what a switched index places it by.
+        fn rehash(&self) -> impl Fn(SipKey, NonZeroU32) -> u64 + '_ {
+            |key, row| key.hash_one(self.items(row))
         }
 
         #[inline]
@@ -4364,11 +4901,11 @@ pub(crate) mod table {
         /// The row of `value`, added if it is not there.
         pub(crate) fn intern<V: Erase<Static = T>>(&self, value: V) -> NonZeroU32 {
             let value = to_static(value);
-            let hash = hash_of(&value);
-            if let Some(row) = self.index.find(hash, |row| self.indexed(row) == &value) {
+            let same = |row| self.indexed(row) == &value;
+            if let Some(row) = self.index.find(&value, same) {
                 return row;
             }
-            let vacant = match self.index.lock(hash, |row| self.indexed(row) == &value) {
+            let vacant = match self.index.lock(&value, same, self.rehash()) {
                 Entry::Found(row) => return row,
                 Entry::Vacant(vacant) => vacant,
             };
@@ -4383,6 +4920,11 @@ pub(crate) mod table {
             let row = NonZeroU32::new(row as u32).expect("rows start at 1");
             vacant.insert(row);
             row
+        }
+
+        /// SipHash under a key of a row's value: what a switched index places it by.
+        fn rehash(&self) -> impl Fn(SipKey, NonZeroU32) -> u64 + '_ {
+            |key, row| key.hash_one(self.indexed(row))
         }
 
         /// The value of a row the index names.
@@ -4420,8 +4962,8 @@ pub(crate) mod table {
         use rustc_type_ir::{DebruijnIndex, INNERMOST, TypeFlags};
 
         use super::{
-            Erase, FIRST_BITS, FIRST_SLOTS, Lists, RowInfo, Rows, SEGMENTS, Slots, Values, fit,
-            locate, segment_len, segment_start,
+            Erase, FIRST_BITS, FIRST_SLOTS, Lists, RowInfo, Rows, SEGMENTS, Slots, Values, collect,
+            fit, locate, segment_len, segment_start,
         };
 
         macro_rules! erase_static {
@@ -4434,8 +4976,12 @@ pub(crate) mod table {
         }
         erase_static!(u32, u64, (u32, u64), [u32; 3], String);
 
+        /// A row's info of tag `tag`, which must be one a row may have (under `u8::MAX`, which
+        /// `Rows::add` refuses): never cut to a byte, which turns 255 into the refused tag.
         fn tagged(tag: u32) -> impl FnOnce() -> RowInfo {
-            move || RowInfo { tag: tag as u8, flags: TypeFlags::empty(), binder: INNERMOST }
+            let fits = u8::try_from(tag).ok().filter(|&it| it < u8::MAX);
+            let tag = fits.unwrap_or_else(|| panic!("a test tag of {tag}, not a row's (0 to 254)"));
+            move || RowInfo { tag, flags: TypeFlags::empty(), binder: INNERMOST }
         }
 
         /// The safe reference version of a table: a map from value to row under one lock, rows
@@ -4627,6 +5173,152 @@ pub(crate) mod table {
                 assert_eq!(ROWS.intern(value, tagged(0)), row);
                 assert_eq!(ROWS.kind::<u32>(row), value);
             }
+            assert!(!ROWS.index.keyed(), "5000 honest values switched the index to its key");
+        }
+
+        /// A shard's table a grown one replaced is held while a task that began before it was
+        /// replaced runs, and freed once that task ends, by the release's [`collect`] with no
+        /// index growing again: one retired table per doubling of each shard, none freed under
+        /// the pinned reader, every one freed after.
+        #[test]
+        fn a_grown_shard_frees_its_old_table_after_the_grace() {
+            static ROWS: Rows<u32> = Rows::new("retiring", 1 << 20);
+            let reader = blaze_reclaim::enter();
+            let rows: Vec<_> = (0u32..1 << 14).map(|value| ROWS.intern(value, tagged(0))).collect();
+            // Each shard's table began at `FIRST_SLOTS` and doubled to its length now, retiring
+            // one table a doubling: (its length - FIRST_SLOTS) * 8 bytes of them in all.
+            let doublings: usize = ROWS
+                .index
+                .fixed
+                .iter()
+                .filter_map(|shard| Slots::unpack(shard.slots.load(Ordering::Acquire)))
+                .map(|slots| (slots.len().trailing_zeros() - FIRST_SLOTS.trailing_zeros()) as usize)
+                .sum();
+            // 2^14 rows over 64 shards, about 256 a shard in a table of 512 or more: 5 doublings.
+            assert!(doublings >= 64 * 3, "2^14 rows doubled the shards' tables {doublings} times");
+            assert_eq!(
+                ROWS.index.retired.load(Ordering::Relaxed) as usize,
+                doublings,
+                "a task that began before the tables were replaced still holds every one of them"
+            );
+            for (value, &row) in (0u32..1 << 14).zip(&rows) {
+                assert_eq!(ROWS.intern(value, tagged(0)), row, "the grown tables keep every row");
+            }
+            drop(reader);
+            // Another test's thread may be in a task that began before a table was replaced; the
+            // grace passes once it ends.
+            blaze_graph::spin::SpinWait::within(
+                "the retired tables to be freed after their grace",
+                std::time::Duration::from_secs(60),
+                || {
+                    collect();
+                    ROWS.index.retired.load(Ordering::Relaxed) == 0
+                },
+            );
+        }
+
+        /// A quarter million honest kinds of the shapes the solver makes (small tags with
+        /// sequential, strided and multiplied payloads) never walk a run the index refuses,
+        /// under the real [`super::fixed_hash`] and its shard split: no switch without a flood.
+        #[test]
+        fn honest_kinds_keep_the_fixed_hash() {
+            static ROWS: Rows<(u32, u64)> = Rows::new("honest rows", 1 << 20);
+            for i in 0..1u64 << 16 {
+                let multiplied = i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                for kind in [(0, i), ((i % 7) as u32, i << 32), (i as u32, 0), (3, multiplied)] {
+                    // The tag is not what this checks, and `i as u32` runs past a row's tags.
+                    ROWS.intern(kind, tagged(0));
+                }
+            }
+            assert!(!ROWS.index.keyed(), "honest kinds switched the index to its key");
+        }
+
+        /// The kinds of [`kinds_with_one_fixed_hash_take_bounded_probes`]: `n` kinds with one
+        /// hash under foldhash's public fixed seed (the first word, a `u32` and a `u64`'s low
+        /// half, equal to the seed's accumulator, so the folded multiply is of 0 whatever the
+        /// `u64`'s high half), so one [`super::fixed_hash`] too.
+        fn one_fixed_hash(n: u64) -> Vec<(u32, u64)> {
+            /// foldhash 0.2's fixed per-hasher seed (`ARBITRARY3`), what `FixedState` starts from.
+            const SEED: u64 = 0x082e_fa98_ec4e_6c89;
+            let kinds: Vec<(u32, u64)> = (0..n).map(|i| (SEED as u32, (SEED >> 32) | (i << 32))).collect();
+            let one = super::fixed_hash(&kinds[0]);
+            assert!(kinds.iter().all(|it| super::fixed_hash(it) == one), "one fixed hash");
+            kinds
+        }
+
+        /// Eight threads interning the same flood, each in an order of its own, along with honest
+        /// kinds: the index switches once, whichever walk meets the flood first, and every
+        /// thread gets one row per kind, whether it interned the kind before, during or after the
+        /// switch.
+        #[test]
+        fn a_flood_from_eight_threads_switches_the_index_once() {
+            static ROWS: Rows<(u32, u64)> = Rows::new("racing colliding rows", 1 << 20);
+            const THREADS: u64 = 8;
+            let flood = one_fixed_hash(4000);
+            let honest: Vec<(u32, u64)> = (0..4000u64).map(|i| (7, i * 0x9e37_79b9)).collect();
+            let kinds: Vec<(u32, u64)> = flood.iter().zip(&honest).flat_map(|(&a, &b)| [a, b]).collect();
+            let barrier = Barrier::new(THREADS as usize);
+            let seen: Vec<Vec<NonZeroU32>> = std::thread::scope(|scope| {
+                let threads: Vec<_> = (0..THREADS)
+                    .map(|thread| {
+                        let (barrier, kinds) = (&barrier, &kinds);
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let n = kinds.len() as u64;
+                            let mut rows = vec![None; kinds.len()];
+                            for i in 0..n {
+                                let at = ((i * 7919 + thread * 104_729) % n) as usize;
+                                rows[at] = Some(ROWS.intern(kinds[at], tagged(0)));
+                            }
+                            rows.into_iter().map(|it| it.expect("every kind interned")).collect()
+                        })
+                    })
+                    .collect();
+                threads.into_iter().map(|thread| thread.join().unwrap()).collect()
+            });
+            assert!(ROWS.index.keyed(), "the flood did not switch the index");
+            assert_eq!(ROWS.index.switches.load(Ordering::Relaxed), 1, "the index switched more than once");
+            assert!(seen.iter().all(|rows| *rows == seen[0]), "two threads got different rows for one kind");
+            assert_eq!(seen[0].iter().collect::<HashSet<_>>().len(), kinds.len(), "two kinds got one row");
+            for (&kind, &row) in kinds.iter().zip(&seen[0]) {
+                assert_eq!(ROWS.kind::<(u32, u64)>(row), kind);
+                assert_eq!(ROWS.intern(kind, || panic!("a kind interned was added again")), row);
+            }
+        }
+
+        /// Each kind of table switched by hand finds every row it had, adds none for them, and
+        /// goes on adding new ones: the rehash of each places a row where a lookup of its value
+        /// under the key looks.
+        #[test]
+        fn a_switched_table_finds_every_row_it_had() {
+            static ROWS: Rows<(u32, u64)> = Rows::new("switched rows", 1 << 16);
+            static LISTS: Lists<u32> = Lists::new("switched lists");
+            static VALUES: Values<String> = Values::new("switched values");
+            let kinds: Vec<(u32, u64)> = (0..3000u64).map(|i| ((i % 5) as u32, i << 17)).collect();
+            let lists: Vec<Vec<u32>> = (0..3000u32).map(|i| (0..i % 9).map(|j| i ^ j).collect()).collect();
+            let values: Vec<String> = (0..3000).map(|i| format!("value {i}")).collect();
+            let rows: Vec<_> = kinds.iter().map(|&kind| ROWS.intern(kind, tagged(kind.0))).collect();
+            let list_rows: Vec<_> = lists.iter().map(|items| LISTS.intern(&items[..])).collect();
+            let value_rows: Vec<_> = values.iter().map(|value| VALUES.intern(value.clone())).collect();
+            let next = [&ROWS.next, &LISTS.next, &VALUES.next].map(|it| it.load(Ordering::Relaxed));
+            ROWS.index.switch(&ROWS.rehash());
+            LISTS.index.switch(&LISTS.rehash());
+            VALUES.index.switch(&VALUES.rehash());
+            assert!(ROWS.index.keyed() && LISTS.index.keyed() && VALUES.index.keyed());
+            for (&kind, &row) in kinds.iter().zip(&rows) {
+                assert_eq!(ROWS.intern(kind, || panic!("a kind interned was added again")), row);
+            }
+            for (items, &row) in lists.iter().zip(&list_rows) {
+                assert_eq!(LISTS.intern(&items[..]), row);
+            }
+            for (value, &row) in values.iter().zip(&value_rows) {
+                assert_eq!(VALUES.intern(value.clone()), row);
+            }
+            assert_eq!(next, [&ROWS.next, &LISTS.next, &VALUES.next].map(|it| it.load(Ordering::Relaxed)), "a switched table added a row it had");
+            let row = ROWS.intern((9, 9), tagged(9));
+            assert_eq!(ROWS.intern((9, 9), tagged(9)), row);
+            assert_eq!(ROWS.kind::<(u32, u64)>(row), (9, 9));
+            assert_eq!(ROWS.index.switches.load(Ordering::Relaxed), 1);
         }
 
         #[test]
@@ -4654,6 +5346,98 @@ pub(crate) mod table {
             assert_ne!(a, b);
             assert_eq!(VALUES.intern("a".to_owned()), a);
             assert_eq!(VALUES.get::<String>(a), "a");
+        }
+
+        /// Kinds a source picked to share one hash under foldhash's public fixed seed
+        /// ([`one_fixed_hash`]): interning and finding each looks at a bounded number of slots,
+        /// not at every kind before it, as the walk that meets the flood switches the index to
+        /// its key, once.
+        #[test]
+        fn kinds_with_one_fixed_hash_take_bounded_probes() {
+            static ROWS: Rows<(u32, u64)> = Rows::new("colliding rows", 1 << 20);
+            let kinds = one_fixed_hash(10_000);
+            super::probes::take();
+            let start = std::time::Instant::now();
+            let rows: Vec<NonZeroU32> = kinds.iter().map(|&kind| ROWS.intern(kind, tagged(0))).collect();
+            let interned = super::probes::take();
+            eprintln!("flood: interning {} kinds with one fixed hash: {:?}, {interned} slots", kinds.len(), start.elapsed());
+            for (&kind, &row) in kinds.iter().zip(&rows) {
+                assert_eq!(ROWS.intern(kind, tagged(0)), row);
+                assert_eq!(ROWS.kind::<(u32, u64)>(row), kind);
+            }
+            let found = super::probes::take();
+            assert!(ROWS.index.keyed(), "the flood did not switch the index to its key");
+            assert_eq!(ROWS.index.switches.load(Ordering::Relaxed), 1, "the index switched more than once");
+            let bound = 16 * kinds.len() as u64;
+            assert!(interned <= bound, "interning {} kinds with one fixed hash looked at {interned} slots, over {bound}", kinds.len());
+            assert!(found <= bound, "finding {} kinds with one fixed hash looked at {found} slots, over {bound}", kinds.len());
+        }
+
+        /// What an intern costs, new and found again, for kinds shaped as the solver's are
+        /// (a discriminant and two or three handles), under the fixed hash every index starts
+        /// with and under the key a flood switches it to: the numbers adaptive placement was
+        /// chosen by (2026-11-03, before it: fixed 9.0 ns a hit in cache and 26 out of it,
+        /// SipHash 15.7 and 45).
+        /// 2^20 kinds outgrow the caches, so their hits time the memory as much as the hash
+        /// (and move by 2x between builds that differ in nothing on the path); 2^12 kinds stay
+        /// in L1 and L2, so their hits time the hash and the probe. Each intern is a call, as
+        /// the solver's are, so a build that inlines it into the loop doesn't win by that alone.
+        #[test]
+        #[ignore = "a bench: cargo test -p hir-ty --release --lib -- --ignored --nocapture interning_cost"]
+        fn interning_cost() {
+            use std::{hint::black_box, time::Instant};
+            #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+            enum Kind {
+                Adt(u32, u32),
+                Ref(u32, u32, u8),
+                Int(u8),
+                Array(u32, u32),
+            }
+            erase_static!(Kind);
+            static BIG: Rows<Kind> = Rows::new("bench rows", 1 << 22);
+            static SMALL: Rows<Kind> = Rows::new("small bench rows", 1 << 14);
+            static BIG_KEYED: Rows<Kind> = Rows::new("keyed bench rows", 1 << 22);
+            static SMALL_KEYED: Rows<Kind> = Rows::new("small keyed bench rows", 1 << 14);
+            #[inline(never)]
+            fn intern(rows: &'static Rows<Kind>, kind: Kind) -> NonZeroU32 {
+                rows.intern(kind, tagged(1))
+            }
+            for (hash, rows, n, rounds) in [
+                ("fixed", &BIG, 1u32 << 20, 7),
+                ("fixed", &SMALL, 1 << 12, 2001),
+                ("keyed", &BIG_KEYED, 1 << 20, 7),
+                ("keyed", &SMALL_KEYED, 1 << 12, 2001),
+            ] {
+                if hash == "keyed" {
+                    rows.index.switch(&rows.rehash());
+                }
+                let kinds: Vec<Kind> = (0..n)
+                    .map(|i| match i % 4 {
+                        0 => Kind::Adt(i, i / 3),
+                        1 => Kind::Ref(i / 5, i, (i % 2) as u8),
+                        2 if i < 256 => Kind::Int(i as u8),
+                        _ => Kind::Array(i.wrapping_mul(2_654_435_761), i),
+                    })
+                    .collect();
+                let start = Instant::now();
+                for &kind in &kinds {
+                    black_box(intern(rows, kind));
+                }
+                let new = start.elapsed().as_nanos() as f64 / f64::from(n);
+                let mut found = f64::MAX;
+                super::probes::take();
+                for _ in 0..rounds {
+                    let start = Instant::now();
+                    for &kind in &kinds {
+                        black_box(intern(rows, black_box(kind)));
+                    }
+                    found = found.min(start.elapsed().as_nanos() as f64 / f64::from(n));
+                }
+                // Slots looked at a hit: 0 in a build that counts nothing (outside `cfg(test)`).
+                let probes = super::probes::take() as f64 / (f64::from(rounds) * f64::from(n));
+                assert_eq!(rows.index.keyed(), hash == "keyed", "the {hash} bench table's index");
+                println!("interning_cost {hash}: {n} kinds, new {new:.1} ns each, found again {found:.1} ns each (best of {rounds}), {probes:.2} slots a hit");
+            }
         }
 
         #[test]

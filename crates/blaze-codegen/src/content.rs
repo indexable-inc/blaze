@@ -25,9 +25,11 @@ impl Data {
         Data { id: data_id(align, &bytes, &relocs), align, bytes, relocs, writable: false }
     }
 
-    /// The `index`th writable object the static `owner` (its item key) points to: one object
-    /// whatever another static's holds, so two statics' equal bytes are two addresses, and
-    /// another object once its bytes change.
+    /// The `index`th writable object of `owner`: a static's (its item key) nested mutable
+    /// allocation, or a function instance's (its instance key) promoted temporary that its
+    /// code writes each call (`promoted_slot` in hir-ty-codegen). One object whatever another
+    /// owner's holds, so two owners' equal bytes are two addresses, and another object once its
+    /// bytes change.
     pub fn owned(owner: &ContentId, index: u32, align: u32, bytes: Vec<u8>, relocs: Relocs) -> Data {
         let mut hasher = Hasher::new(OWNED_DATA_DOMAIN);
         hasher.id(owner).update(&index.to_le_bytes()).id(&data_id(align, &bytes, &relocs));

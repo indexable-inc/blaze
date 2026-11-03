@@ -1252,17 +1252,7 @@ impl<'db> ExprCollector<'db> {
                 self.alloc_type_ref(TypeRef::PatternType(ty, pat), ptr)
             }
             ast::Type::UnsafeBinderType(inner) => {
-                let lifetimes = match inner.generic_param_list() {
-                    Some(params) => {
-                        let names = params
-                            .lifetime_params()
-                            .flat_map(|lp| lp.lifetime().map(|lt| self.binder_lifetime_name(lt)));
-                        // alloc: inline up to 4, a binder's lifetimes before they are pushed
-                        let names: SmallVec<[Name; 4]> = names.collect();
-                        self.store.paths_mut().push_names(names)
-                    }
-                    None => Names::EMPTY,
-                };
+                let lifetimes = self.push_binder_names(inner.generic_param_list());
                 let ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
                 self.alloc_type_ref(TypeRef::UnsafeBinder { lifetimes, ty }, ptr)
             }
@@ -1371,11 +1361,11 @@ impl<'db> ExprCollector<'db> {
     /// the path is found as a view under its own tree, so both give the same path.
     pub fn lower_path(
         &mut self,
-        path: tag::Path,
+        path: &tag::Path,
         impl_trait_lower_fn: &mut ImplTraitLowering<'_>,
     ) -> Option<PathIdx> {
-        let top = top_of(&path);
-        self.lower_path_view(view_of(&path, &top), impl_trait_lower_fn)
+        let top = top_of(path);
+        self.lower_path_view(view_of(path, &top), impl_trait_lower_fn)
     }
 
     pub fn lower_path_view(
@@ -1569,6 +1559,7 @@ impl<'db> ExprCollector<'db> {
             body: block,
             closure_kind: ClosureKind::Coroutine { kind, source },
             capture_by,
+            binder: Names::EMPTY,
         }
     }
 
@@ -1648,6 +1639,18 @@ impl<'db> ExprCollector<'db> {
     ) -> Option<PathIdx> {
         let path = self.lower_path_view(path_type.path()?, impl_trait_lower_fn)?;
         Some(path)
+    }
+
+    /// The lifetimes of an `unsafe<..>` type's or a closure's `for<..>` binder, `params`, as a
+    /// run of the store's names; [`Names::EMPTY`] without one.
+    fn push_binder_names(&mut self, params: Option<ast::GenericParamList<'_>>) -> Names {
+        let Some(params) = params else { return Names::EMPTY };
+        let names = params
+            .lifetime_params()
+            .flat_map(|lp| lp.lifetime().map(|lt| self.binder_lifetime_name(lt)));
+        // alloc: inline up to 4, a binder's lifetimes before they are pushed
+        let names: SmallVec<[Name; 4]> = names.collect();
+        self.store.paths_mut().push_names(names)
     }
 
     fn lower_for_binder_opt(&mut self, binder: Option<ForBinder<'_>>) -> ThinVec<Name> {
@@ -1964,12 +1967,14 @@ impl<'db> ExprCollector<'db> {
                 self.alloc_expr(Expr::Yeet { expr }, syntax_ptr)
             }
             ast::Expr::RecordExpr(e) => {
+                let written = e.path().map(|it| it.syntax().text_range());
                 let path = e
                     .path()
                     .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
                 let Some(path) = path else {
                     return Some(self.missing_expr());
                 };
+                let hygiene = self.struct_path_hygiene(path, written);
                 let mark = self.store.list_mark();
                 let spread = if let Some(nfl) = e.record_expr_field_list() {
                     for field in nfl.fields() {
@@ -2008,7 +2013,11 @@ impl<'db> ExprCollector<'db> {
                 let id = self.with_lists(mark, |this, lists| {
                     this.store.alloc_record_lit(path, lists.record_fields_since(mark), spread)
                 });
-                self.map_expr(id, syntax_ptr)
+                let id = self.map_expr(id, syntax_ptr);
+                if !hygiene.is_root() {
+                    self.store.ident_hygiene.insert(id.into(), hygiene);
+                }
+                id
             }
             ast::Expr::FieldExpr(e) => {
                 let expr = self.collect_expr_opt(e.expr());
@@ -2016,13 +2025,15 @@ impl<'db> ExprCollector<'db> {
                     Some(kind) => kind.as_name(),
                     _ => Name::missing(),
                 };
-                // A tuple index takes no key, as no positional field does.
-                let hygiene = match e.name_ref() {
-                    Some(it) if name.as_tuple_index().is_none() => {
-                        self.member_hygiene_for(it.syntax().text_range())
-                    }
-                    _ => None,
-                };
+                // A tuple index takes no key, as no positional field does, but keeps its
+                // context: its privacy is checked from its def site, as a named field's.
+                let hygiene = e.field_access().and_then(|it| {
+                    let range = match it {
+                        ast::FieldKind::Name(it) => it.syntax().text_range(),
+                        ast::FieldKind::Index(it) => it.text_range(),
+                    };
+                    self.member_hygiene_for(range)
+                });
                 let id = self.alloc_expr(Expr::Field { expr, name: &name }, syntax_ptr);
                 if let Some(hygiene) = hygiene {
                     self.store.ident_hygiene.insert(id.into(), hygiene);
@@ -2071,6 +2082,11 @@ impl<'db> ExprCollector<'db> {
                 // The params (pats) and their types (opt types) above `mark` stay on the stacks
                 // until the coroutine closure's params are given their owner below.
                 let mark = this.store.list_mark();
+                // `for<'a> |x: &'a u8| ..` (rustc's `ClosureBinder::For`): its lifetimes are the
+                // signature's late-bound ones, which hir-ty lowers the parameters and return
+                // type under.
+                let binder =
+                    this.push_binder_names(e.for_binder().and_then(|it| it.generic_param_list()));
                 let closure = this.with_binding_owner_and_return(|this| {
                     // For coroutine closures, the body, aka. the coroutine is the bindings owner, and not the closure.
                     if let Some(pl) = e.param_list() {
@@ -2162,6 +2178,7 @@ impl<'db> ExprCollector<'db> {
                                 body,
                                 closure_kind,
                                 capture_by,
+                                binder,
                             },
                             syntax_ptr,
                         )
@@ -2304,7 +2321,10 @@ impl<'db> ExprCollector<'db> {
                 // A float token is two tuple indices: `0.1`.
                 // alloc: the stored field list, once per `offset_of!`.
                 let mut fields = Vec::new();
+                // alloc: each field's context, once per `offset_of!`.
+                let mut hygiene = Vec::new();
                 for it in e.fields() {
+                    let written = self.member_hygiene_for(it.syntax().text_range());
                     match it.syntax().first_token() {
                         Some(token) if token.kind() == syntax::SyntaxKind::FLOAT_NUMBER => fields
                             .extend(
@@ -2316,9 +2336,16 @@ impl<'db> ExprCollector<'db> {
                             ),
                         _ => fields.push(it.as_name()),
                     }
+                    hygiene.resize(fields.len(), written.unwrap_or(HygieneId::ROOT));
+                }
+                // Kept only where a `macro` marks a field, as the expression store's other
+                // hygiene tables are.
+                if hygiene.iter().all(|it| it.is_root()) {
+                    hygiene.clear();
                 }
                 let fields = fields.into_boxed_slice();
-                let id = self.store.alloc_offset_of_expr(OffsetOf { container, fields });
+                let hygiene = hygiene.into_boxed_slice();
+                let id = self.store.alloc_offset_of_expr(OffsetOf { container, fields, hygiene });
                 self.map_expr(id, syntax_ptr)
             }
             ast::Expr::FormatArgsExpr(f) => self.collect_format_args(f, syntax_ptr),
@@ -3443,7 +3470,7 @@ impl<'db> ExprCollector<'db> {
             }
             // The id goes only into this lowering query's result (`block_scopes`, the block's
             // `Expr::Block`) and the source map of the same body, invalidated with it.
-            Some(BlockIdLt::new(self.db, ast_id, self.module, self.block_owner, token).to_static())
+            Some(BlockIdLt::new(self.db, ast_id, self.module, self.block_owner, &token).to_static())
         })();
 
         let (module, def_map) =
@@ -3590,12 +3617,14 @@ impl<'db> ExprCollector<'db> {
                 return pat;
             }
             ast::Pat::TupleStructPat(p) => {
+                let written = p.path().map(|it| it.syntax().text_range());
                 let path = p
                     .path()
                     .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
                 let Some(path) = path else {
                     return self.missing_pat();
                 };
+                let hygiene = self.struct_path_hygiene(path, written);
                 let (mark, ellipsis) = self.collect_tuple_pat(
                     p.fields(),
                     comma_follows_token(p.l_paren_token()),
@@ -3604,7 +3633,7 @@ impl<'db> ExprCollector<'db> {
                 let id = self.with_lists(mark, |this, lists| {
                     this.store.alloc_tuple_struct_pat(path, lists.pats_since(mark), ellipsis)
                 });
-                return self.map_pat(id, ptr);
+                return self.map_path_pat(id, ptr, hygiene);
             }
             ast::Pat::RefPat(p) => {
                 let pat = self.collect_pat_opt(p.pat(), binding_list);
@@ -3612,14 +3641,17 @@ impl<'db> ExprCollector<'db> {
                 Pat::Ref { pat, mutability }
             }
             ast::Pat::PathPat(p) => {
+                let written = p.path().map(|it| it.syntax().text_range());
                 let path = p
                     .path()
                     .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
-                let id = match path {
-                    Some(path) => self.store.alloc_path_pat(path),
-                    None => self.store.alloc_pat(Pat::Missing),
+                let (id, hygiene) = match path {
+                    Some(path) => {
+                        (self.store.alloc_path_pat(path), self.struct_path_hygiene(path, written))
+                    }
+                    None => (self.store.alloc_pat(Pat::Missing), HygieneId::ROOT),
                 };
-                return self.map_pat(id, ptr);
+                return self.map_path_pat(id, ptr, hygiene);
             }
             ast::Pat::OrPat(p) => {
                 let prev_is_used = mem::take(&mut binding_list.is_used);
@@ -3678,12 +3710,14 @@ impl<'db> ExprCollector<'db> {
             }
             ast::Pat::WildcardPat(_) => Pat::Wild,
             ast::Pat::RecordPat(p) => {
+                let written = p.path().map(|it| it.syntax().text_range());
                 let path = p
                     .path()
                     .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
                 let Some(path) = path else {
                     return self.missing_pat();
                 };
+                let hygiene = self.struct_path_hygiene(path, written);
                 let record_pat_field_list =
                     p.record_pat_field_list().expect("every struct should have a field list");
                 let mark = self.store.list_mark();
@@ -3712,7 +3746,7 @@ impl<'db> ExprCollector<'db> {
                 let id = self.with_lists(mark, |this, lists| {
                     this.store.alloc_record_pat(path, lists.field_pats_since(mark), ellipsis)
                 });
-                return self.map_pat(id, ptr);
+                return self.map_path_pat(id, ptr, hygiene);
             }
             ast::Pat::SlicePat(p) => {
                 let SlicePatComponents { prefix, slice, suffix } = p.components();
@@ -4439,6 +4473,14 @@ impl<'db> ExprCollector<'db> {
         }
         id
     }
+    /// [`Self::map_pat`] for a pattern with a path, recording the path's hygiene.
+    fn map_path_pat(&mut self, id: PatId, ptr: PatPtr, hygiene: HygieneId) -> PatId {
+        let id = self.map_pat(id, ptr);
+        if !hygiene.is_root() {
+            self.store.ident_hygiene.insert(id.into(), hygiene);
+        }
+        id
+    }
     // FIXME: desugared pats don't have ptr, that's wrong and should be fixed somehow.
     fn alloc_pat_desugared(&mut self, pat: Pat<'_>) -> PatId {
         self.store.alloc_pat(pat)
@@ -4480,6 +4522,18 @@ impl<'db> ExprCollector<'db> {
         self.expander.hygiene_for_range(self.db, range)
     }
 
+    /// The hygiene of a record literal's or a pattern's path written at `range`, as
+    /// `collect_expr_path` takes a path expression's: the items a `macro` names where it is
+    /// defined (an enum it writes, before `::V`) are found by it.
+    fn struct_path_hygiene(&self, path: PathIdx, range: Option<TextRange>) -> HygieneId {
+        match range {
+            Some(range) if self.store.path_at(path).mod_path().is_some() => {
+                self.hygiene_id_for(range)
+            }
+            _ => HygieneId::ROOT,
+        }
+    }
+
     /// The hygiene of a field's or a method's name written at `range`, where it matters: the
     /// name's context marks it as a `macro` (2.0)'s or a def-site span's (its normalization to
     /// macros 2.0 is not the root). `None` for every name a real file or a `macro_rules!`
@@ -4499,6 +4553,21 @@ impl<'db> ExprCollector<'db> {
     /// `name`, a generic parameter or a lifetime written at `range`, as its generics bind it and
     /// a lifetime names it: keyed by its context normalized to macros 2.0
     /// ([`crate::nameres::param_name`]). As it is in a real file, where no name has a key.
+    /// The name an associated type binding (`Trait<Assoc = ..>`) written as `name` over `range`
+    /// looks its item up by: [`crate::nameres::written_name`] of its context, which each trait
+    /// it is looked up in adjusts to its expansion (rustc's `lower_assoc_item_constraint`, whose
+    /// `find_by_ident_and_kind` compares with `hygienic_eq`). A real file's name stays as it is.
+    pub(in crate::expr_store) fn assoc_binding_name(&self, name: Name, range: TextRange) -> Name {
+        match self.span_map() {
+            SpanMap::RealSpanMap(_) => name,
+            SpanMap::ExpansionSpanMap(_) => crate::nameres::written_name(
+                self.db,
+                name,
+                HygieneId::new(self.expander.ctx_for_range(range)),
+            ),
+        }
+    }
+
     pub(in crate::expr_store) fn param_name(&self, name: Name, range: TextRange) -> Name {
         match self.span_map() {
             SpanMap::RealSpanMap(_) => name,

@@ -25,7 +25,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MalformedDerive) -> Vec<Found> {
     let root = cx.root(file);
     let Some(attr) = root.covering_element(d.range.value).ancestors().find_map(ast::Attr::cast) else {
         // alloc: the error's parts, for an error hir found
-        return vec![malformed(cx.span(d.range), "")];
+        return vec![malformed(&cx.span(d.range), "")];
     };
     let inner = if attr.excl_token().is_some() { "!" } else { "" };
     let meta = attr
@@ -36,7 +36,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MalformedDerive) -> Vec<Found> {
             it => it,
         });
     // alloc: the error's parts, for an error hir found
-    let Some(meta) = meta else { return vec![malformed(cx.span(d.range), inner)] };
+    let Some(meta) = meta else { return vec![malformed(&cx.span(d.range), inner)] };
     // An attribute of a `cfg_attr` is spanned by its own meta item once rustc expands it.
     let span = match meta.syntax().parent().is_some_and(|it| ast::Attr::can_cast(it.kind())) {
         true => cx.span(InFile::new(file, attr.syntax().text_range())),
@@ -67,11 +67,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MalformedDerive) -> Vec<Found> {
         return vec![Found::new(diag, Phase::Expand)];
     }
     // alloc: the error's parts, for an error hir found
-    vec![malformed(span, inner)]
+    vec![malformed(&span, inner)]
 }
 
 /// rustc's `emit_malformed_attribute` of `derive`, whose one form is a list.
-fn malformed(span: Span, inner: &str) -> Found {
+fn malformed(span: &Span, inner: &str) -> Found {
     // clone: on the error path, for an error hir found
     let mut diag = Diag::error(None, "malformed `derive` attribute input", span.clone());
     diag.suggestions(

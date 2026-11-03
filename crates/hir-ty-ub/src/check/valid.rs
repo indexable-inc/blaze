@@ -712,7 +712,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
         let cells = std::mem::take(&mut self.plans.cell_buf);
         let perm = NewPermission::new(kind, mode, info.freeze, info.unpin, &cells);
         let site = self.parts.site;
-        let retagged = self.parts.borrows.retag(palloc, parent, perm, Span::new(poff, size), site);
+        let retagged = self.parts.borrows.retag(palloc, parent, &perm, Span::new(poff, size), site);
         let result = match retagged {
             Ok(Some(tag)) => {
                 // tb_reborrow: the race detector sees the retag's implicit accesses.
@@ -1679,7 +1679,7 @@ pub(crate) fn type_name<'db>(db: &'db Db, ty: Ty<'db>) -> String {
     // alloc: error path: the message of a failure.
     // `Debug` names a type only through the attached database: attach it here, where the
     // text is made, on whatever worker the check runs.
-    hir_ty_mir::mir::type_name::rustc_type_name(db, ty).unwrap_or_else(|| blaze_query::db::attach(db, || format!("{ty:?}")))
+    hir_ty_print::rustc_type_name(db, ty).unwrap_or_else(|| blaze_query::db::attach(db, || format!("{ty:?}")))
 }
 
 fn variant_name(db: &Db, v: EnumVariantId) -> String {

@@ -55,12 +55,12 @@ fn retag_accesses() {
     let write = NewPermission::new(PtrKind::Mut, RetagMode::FnEntry, true, true, &[]).with_implicit_writes(true);
     assert!(write.writes());
     s.call();
-    s.retag_with(x, write, 8).unwrap();
+    s.retag_with(x, &write, 8).unwrap();
     assert_eq!(s.b.retag_accesses(), &[(Span::new(0, 8), AccessKind::Write)]);
     s.ret().unwrap();
     let default = NewPermission::new(PtrKind::Mut, RetagMode::Default, true, true, &[]).with_implicit_writes(true);
     assert!(!default.writes());
-    s.retag_with(x, default, 8).unwrap();
+    s.retag_with(x, &default, 8).unwrap();
     assert_eq!(s.b.retag_accesses(), &[read(0, 8)]);
     // A no-op retag clears the last one's accesses.
     s.retag(x, PtrKind::Mut, RetagMode::Raw, true, true, &[], 8).unwrap();
@@ -624,7 +624,7 @@ fn history_sites_are_the_callers() {
     let root = b.new_alloc(alloc, 1, SiteId(100));
     let root_prov = crate::ids::Prov::Concrete { alloc, tag: root };
     let new = NewPermission::new(PtrKind::Shared, RetagMode::Default, true, true, &[]);
-    let r = b.retag(alloc, root_prov, new, Span::new(0, 1), SiteId(200)).unwrap().unwrap();
+    let r = b.retag(alloc, root_prov, &new, Span::new(0, 1), SiteId(200)).unwrap().unwrap();
     let prov = crate::ids::Prov::Concrete { alloc, tag: r };
     let e = b.access(alloc, prov, AccessKind::Write, Span::new(0, 1), SiteId(300)).unwrap_err();
     assert_eq!(e.history()[0].site, Some(SiteId(200)));

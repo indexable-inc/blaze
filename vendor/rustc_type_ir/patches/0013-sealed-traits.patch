@@ -1,7 +1,8 @@
-diff -ruN a/src/interner.rs b/src/interner.rs
+diff --git a/src/interner.rs b/src/interner.rs
+index 5d29585..dd50172 100644
 --- a/src/interner.rs
 +++ b/src/interner.rs
-@@ -569,6 +569,13 @@
+@@ -519,6 +519,13 @@ pub trait Interner:
  
      fn trait_is_fundamental(self, def_id: Self::TraitId) -> bool;
  

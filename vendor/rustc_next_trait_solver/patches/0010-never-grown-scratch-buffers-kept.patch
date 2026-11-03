@@ -1,7 +1,8 @@
-diff -ruN a/src/solve/scratch.rs b/src/solve/scratch.rs
+diff --git a/src/solve/scratch.rs b/src/solve/scratch.rs
+index f383eeb..54e6c35 100644
 --- a/src/solve/scratch.rs
 +++ b/src/solve/scratch.rs
-@@ -41,14 +41,16 @@
+@@ -41,14 +41,16 @@ macro_rules! pool {
  
          /// Takes back a buffer, emptied and grown to the largest its pool holds: the pool hands
          /// buffers out last in, first out, so without it a goal may get one smaller than a
@@ -24,7 +25,7 @@ diff -ruN a/src/solve/scratch.rs b/src/solve/scratch.rs
                  self.$field.push(buffer);
              }
          }
-@@ -180,7 +182,31 @@
+@@ -180,6 +182,30 @@ mod tests {
          });
      }
  
@@ -41,7 +42,7 @@ diff -ruN a/src/solve/scratch.rs b/src/solve/scratch.rs
 +        pool.give(outer);
 +    }
 +
-     #[test]
++    #[test]
 +    fn lists_swapped_between_levels_are_warm_after_one_run() {
 +        let mut pool = Pool::default();
 +        swapped_run(&mut pool);
@@ -52,7 +53,6 @@ diff -ruN a/src/solve/scratch.rs b/src/solve/scratch.rs
 +        assert_eq!(pool.buffers.len(), 3);
 +    }
 +
-+    #[test]
+     #[test]
      fn held_counts_slots_and_room() {
          let pool = vec![Vec::<u64>::with_capacity(10), Vec::with_capacity(6)];
-         let room: usize = pool.iter().map(Vec::capacity).sum();

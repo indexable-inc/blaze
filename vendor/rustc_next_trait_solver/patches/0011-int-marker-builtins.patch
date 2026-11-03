@@ -1,7 +1,8 @@
-diff -ruN a/src/solve/assembly/mod.rs b/src/solve/assembly/mod.rs
+diff --git a/src/solve/assembly/mod.rs b/src/solve/assembly/mod.rs
+index f577fe0..edcc79c 100644
 --- a/src/solve/assembly/mod.rs
 +++ b/src/solve/assembly/mod.rs
-@@ -23,7 +23,7 @@
+@@ -23,7 +23,7 @@ use tracing::{debug, instrument};
  use super::trait_goals::TraitGoalProvenVia;
  use super::{has_only_region_constraints, inspect};
  use crate::delegate::SolverDelegate;
@@ -10,7 +11,7 @@ diff -ruN a/src/solve/assembly/mod.rs b/src/solve/assembly/mod.rs
  use crate::solve::inspect::ProbeKind;
  use crate::solve::{
      BuiltinImplSource, CandidateSource, CanonicalResponse, Certainty, EvalCtxt, Goal, GoalSource,
-@@ -428,6 +428,15 @@
+@@ -428,6 +428,15 @@ where
          ecx: &mut EvalCtxt<'_, D>,
          goal: Goal<I, Self>,
      ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased>;
@@ -26,7 +27,7 @@ diff -ruN a/src/solve/assembly/mod.rs b/src/solve/assembly/mod.rs
  }
  
  /// Allows callers of `assemble_and_evaluate_candidates` to choose whether to limit
-@@ -716,6 +725,18 @@
+@@ -716,6 +725,18 @@ where
                      G::consider_builtin_try_as_dyn_candidate(self, goal)
                  }
                  Some(SolverTraitLangItem::Field) => G::consider_builtin_field_candidate(self, goal),
@@ -45,10 +46,11 @@ diff -ruN a/src/solve/assembly/mod.rs b/src/solve/assembly/mod.rs
                  _ => Err(NoSolution.into()),
              }
          };
-diff -ruN a/src/solve/assembly/structural_traits.rs b/src/solve/assembly/structural_traits.rs
+diff --git a/src/solve/assembly/structural_traits.rs b/src/solve/assembly/structural_traits.rs
+index a7e02f0..936bbdd 100644
 --- a/src/solve/assembly/structural_traits.rs
 +++ b/src/solve/assembly/structural_traits.rs
-@@ -19,6 +19,83 @@
+@@ -19,6 +19,83 @@ use crate::solve::{
      AdtDestructorKind, EvalCtxt, Goal, NoSolution, NoSolutionOrRerunNonErased, RerunNonErased,
  };
  
@@ -132,10 +134,11 @@ diff -ruN a/src/solve/assembly/structural_traits.rs b/src/solve/assembly/structu
  // Calculates the constituent types of a type for `auto trait` purposes.
  #[instrument(level = "trace", skip(ecx), ret)]
  pub(in crate::solve) fn instantiate_constituent_tys_for_auto_trait<D, I>(
-diff -ruN a/src/solve/effect_goals.rs b/src/solve/effect_goals.rs
+diff --git a/src/solve/effect_goals.rs b/src/solve/effect_goals.rs
+index 2676816..b89f949 100644
 --- a/src/solve/effect_goals.rs
 +++ b/src/solve/effect_goals.rs
-@@ -473,6 +473,29 @@
+@@ -473,6 +473,29 @@ where
      ) -> Result<Candidate<<D as SolverDelegate>::Interner>, NoSolutionOrRerunNonErased> {
          unreachable!("Field is not const")
      }
@@ -165,10 +168,11 @@ diff -ruN a/src/solve/effect_goals.rs b/src/solve/effect_goals.rs
  }
  
  impl<D, I> EvalCtxt<'_, D>
-diff -ruN a/src/solve/normalizes_to.rs b/src/solve/normalizes_to.rs
+diff --git a/src/solve/normalizes_to.rs b/src/solve/normalizes_to.rs
+index 75654a8..2073e36 100644
 --- a/src/solve/normalizes_to.rs
 +++ b/src/solve/normalizes_to.rs
-@@ -1107,6 +1107,17 @@
+@@ -1107,6 +1107,17 @@ where
      ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
          unreachable!("try_as_dyn helper trait doesn't have assoc types")
      }
@@ -186,10 +190,11 @@ diff -ruN a/src/solve/normalizes_to.rs b/src/solve/normalizes_to.rs
  }
  
  impl<D, I> EvalCtxt<'_, D>
-diff -ruN a/src/solve/trait_goals.rs b/src/solve/trait_goals.rs
+diff --git a/src/solve/trait_goals.rs b/src/solve/trait_goals.rs
+index e7d67b6..70ac842 100644
 --- a/src/solve/trait_goals.rs
 +++ b/src/solve/trait_goals.rs
-@@ -317,6 +317,22 @@
+@@ -317,6 +317,22 @@ where
              return cand;
          }
  
@@ -212,12 +217,10 @@ diff -ruN a/src/solve/trait_goals.rs b/src/solve/trait_goals.rs
          ecx.probe_and_evaluate_goal_for_constituent_tys(
              CandidateSource::BuiltinImpl(BuiltinImplSource::Misc),
              goal,
-@@ -916,6 +932,52 @@
-                 _ => Err(NoSolution.into()),
-             }
+@@ -918,6 +934,52 @@ where
          })
-+    }
-+
+     }
+ 
 +    /// blaze: a marker of `#[blaze::arbitrary_ints]`. Its self type is never a type variable
 +    /// here (the goal is ambiguous before builtins are asked); a type variable as the source of
 +    /// `IntFrom` or `IntTryFrom` is ambiguous. Every goal of a type that is not an integer is
@@ -262,6 +265,8 @@ diff -ruN a/src/solve/trait_goals.rs b/src/solve/trait_goals.rs
 +                })
 +            }
 +        }
-     }
- 
++    }
++
      fn consider_builtin_field_candidate(
+         ecx: &mut EvalCtxt<'_, D>,
+         goal: Goal<I, Self>,

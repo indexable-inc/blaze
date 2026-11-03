@@ -742,8 +742,8 @@ mod tests {
     fn check_search(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
         crate_name: &str,
-        query: Query,
-        expect: Expect,
+        query: &Query,
+        expect: &Expect,
     ) {
         let db = fixture::db(ra_fixture).into_db();
         let all_crates = all_crates(&db);
@@ -759,7 +759,7 @@ mod tests {
             })
             .expect("could not find crate");
 
-        let actual = search_dependencies(&db, krate, &query)
+        let actual = search_dependencies(&db, krate, query)
             .into_iter()
             .filter_map(|(dependency, _)| {
                 let dependency_krate = dependency.krate(&db)?;
@@ -824,7 +824,7 @@ mod tests {
         ))
     }
 
-    fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+    fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
         let db = fixture::db(ra_fixture).into_db();
         let all_crates = all_crates(&db);
 
@@ -889,7 +889,7 @@ mod tests {
             pub struct Pub2; // t + v
             struct Priv;
         ",
-            expect![[r#"
+            &expect![[r#"
                 lib:
                 - Pub (t)
                 - Pub2 (t)
@@ -918,7 +918,7 @@ mod tests {
                 pub use super::sub::subsub::Def;
             }
         ",
-            expect![[r#"
+            &expect![[r#"
                 main:
                 - sub (t)
                 - sub::Def (t)
@@ -941,7 +941,7 @@ mod tests {
             //- /lib.rs crate:lib
             pub struct S;
         ",
-            expect![[r#"
+            &expect![[r#"
                 lib:
                 - S (t)
                 - S (v)
@@ -967,7 +967,7 @@ mod tests {
                 () => {};
             }
         ",
-            expect![[r#"
+            &expect![[r#"
                 lib:
                 - pub_macro (m)
                 main:
@@ -990,7 +990,7 @@ mod tests {
                 pub struct S;
             }
         ",
-            expect![[r#"
+            &expect![[r#"
                 lib:
                 - module (t)
                 - module::S (t)
@@ -1018,7 +1018,7 @@ mod tests {
                 pub use super::module;
             }
         ",
-            expect![[r#"
+            &expect![[r#"
                 lib:
                 - module (t)
                 - module::S (t)
@@ -1039,7 +1039,7 @@ mod tests {
                 () => {};
             }
         ",
-            expect![[r#"
+            &expect![[r#"
                 lib:
 
             "#]],
@@ -1057,7 +1057,7 @@ mod tests {
                 () => {};
             }
         ",
-            expect![[r#"
+            &expect![[r#"
                 lib:
                 - Thing (m)
                 - Thing (t)
@@ -1074,7 +1074,7 @@ mod tests {
                 () => {};
             }
         ",
-            expect![[r#"
+            &expect![[r#"
                 lib:
                 - Thing (m)
                 - Thing (t)
@@ -1102,8 +1102,8 @@ mod tests {
         check_search(
             ra_fixture,
             "main",
-            Query::new("fmt".to_owned()).fuzzy(),
-            expect![[r#"
+            &Query::new("fmt".to_owned()).fuzzy(),
+            &expect![[r#"
                 dep::fmt (t)
                 dep::fmt::Display::FMT_CONST (a)
                 dep::fmt::Display::format_function (a)
@@ -1131,8 +1131,8 @@ mod tests {
         check_search(
             ra_fixture,
             "main",
-            Query::new("fmt".to_owned()).fuzzy().assoc_search_mode(AssocSearchMode::AssocItemsOnly),
-            expect![[r#"
+            &Query::new("fmt".to_owned()).fuzzy().assoc_search_mode(AssocSearchMode::AssocItemsOnly),
+            &expect![[r#"
                 dep::fmt::Display::FMT_CONST (a)
                 dep::fmt::Display::format_function (a)
                 dep::fmt::Display::format_method (a)
@@ -1142,8 +1142,8 @@ mod tests {
         check_search(
             ra_fixture,
             "main",
-            Query::new("fmt".to_owned()).fuzzy().assoc_search_mode(AssocSearchMode::Exclude),
-            expect![[r#"
+            &Query::new("fmt".to_owned()).fuzzy().assoc_search_mode(AssocSearchMode::Exclude),
+            &expect![[r#"
                 dep::fmt (t)
             "#]],
         );
@@ -1178,8 +1178,8 @@ pub mod fmt {
         check_search(
             ra_fixture,
             "main",
-            Query::new("fmt".to_owned()).fuzzy(),
-            expect![[r#"
+            &Query::new("fmt".to_owned()).fuzzy(),
+            &expect![[r#"
                 dep::Fmt (m)
                 dep::Fmt (t)
                 dep::Fmt (v)
@@ -1192,8 +1192,8 @@ pub mod fmt {
         check_search(
             ra_fixture,
             "main",
-            Query::new("fmt".to_owned()),
-            expect![[r#"
+            &Query::new("fmt".to_owned()),
+            &expect![[r#"
                 dep::Fmt (m)
                 dep::Fmt (t)
                 dep::Fmt (v)
@@ -1232,8 +1232,8 @@ pub mod fmt {
         check_search(
             ra_fixture,
             "main",
-            Query::new("fmt".to_owned()),
-            expect![[r#"
+            &Query::new("fmt".to_owned()),
+            &expect![[r#"
                 dep::Fmt (m)
                 dep::Fmt (t)
                 dep::Fmt (v)
@@ -1256,8 +1256,8 @@ pub mod fmt {
         check_search(
             ra_fixture,
             "main",
-            Query::new("FMT".to_owned()),
-            expect![[r#"
+            &Query::new("FMT".to_owned()),
+            &expect![[r#"
                 dep::FMT (t)
                 dep::FMT (v)
                 dep::fmt (t)
@@ -1268,8 +1268,8 @@ pub mod fmt {
         check_search(
             ra_fixture,
             "main",
-            Query::new("FMT".to_owned()).case_sensitive(),
-            expect![[r#"
+            &Query::new("FMT".to_owned()).case_sensitive(),
+            &expect![[r#"
                 dep::FMT (t)
                 dep::FMT (v)
             "#]],
@@ -1287,8 +1287,8 @@ pub mod fmt {
         check_search(
             ra_fixture,
             "main",
-            Query::new("あ".to_owned()).fuzzy(),
-            expect![[r#"
+            &Query::new("あ".to_owned()).fuzzy(),
+            &expect![[r#"
             dep::あい (f)
         "#]],
         );

@@ -72,7 +72,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use blaze_core::{Untraceable, utf8::push_lossy};
+use blaze_core::{Untraceable, exit::Exit, utf8::push_lossy};
 use blaze_hash::HashMap;
 use std::alloc::Global;
 
@@ -406,14 +406,14 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
         Some(_) => None,
         None => namespaces().err(),
     };
-    run_as(spec, program, unshared, also)
+    run_as(spec, program, unshared.as_deref(), also)
 }
 
 /// [`run`], in namespaces or, with why they can't be made, [`confined`].
 pub(super) fn run_as(
     spec: &Spec,
     program: Option<&[OsString]>,
-    unshared: Option<String>,
+    unshared: Option<&str>,
     also: Also<'_>,
 ) -> Result<i32, String> {
     // The interposer is seen where it is, read-only, and is no input of what runs.
@@ -636,7 +636,7 @@ fn run_in(
             Ok(code) => code,
             Err(error) => {
                 eprintln!("blaze: the sandbox could not be made: {error}");
-                super::COULD_NOT
+                Exit::CouldNot.code()
             }
         };
         raw::exit(code);
@@ -833,7 +833,7 @@ fn sandbox(
             Ok(code) => code,
             Err(error) => {
                 eprintln!("blaze: the sandbox could not be made: {error}");
-                super::COULD_NOT
+                Exit::CouldNot.code()
             }
         };
         raw::exit(code);
@@ -899,7 +899,7 @@ fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result
         raw::die_with_parent();
         let error = exec(made);
         eprintln!("blaze: could not run {}: {error}", made.argv[0].to_string_lossy());
-        raw::exit(127);
+        raw::exit(Exit::ExecFailed.code());
     }
     // SAFETY: `made.socket` is the child's end of the supervisor's pair, owned by no
     // `OwnedFd`; this process never uses it after, and the program's process has its own copy.
@@ -1846,7 +1846,7 @@ fn first_process(cwd: &CString, made: &Made<'_>, probe: bool) -> Result<i32, Str
     if program == 0 {
         let error = exec(made);
         eprintln!("blaze: could not run {}: {error}", made.argv[0].to_string_lossy());
-        raw::exit(127);
+        raw::exit(Exit::ExecFailed.code());
     }
     // SAFETY: `made.socket` is the child's end of the supervisor's pair, owned by no
     // `OwnedFd`; this process never uses it after, and the program's process has its own copy.
@@ -3316,7 +3316,7 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
         assert_eq!(code, Ok(3), "{said}");
         let most = std::time::Duration::from_nanos(blaze_core::busy::MOST_NS);
         let (sh, (code, said)) = run("sh-held", most + most / 2);
-        assert_eq!(code, Ok(127), "{said}");
+        assert_eq!(code, Ok(blaze_core::exit::Exit::ExecFailed.code()), "{said}");
         assert!(said.contains(&sh.display().to_string()) && said.contains("still open for writing"), "{said}");
         _ = std::fs::remove_dir_all(&dir);
     }

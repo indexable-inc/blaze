@@ -1105,7 +1105,7 @@ union U { a: u8, b: u16 }
 
     fn piece<'db>(at: usize, bytes: &[u8]) -> MemoryMap<'db> {
         let mut map = ComplexMemoryMap::default();
-        map.insert(at, Box::from(bytes));
+        map.insert(at, bytes);
         MemoryMap::Complex(Box::new(map))
     }
 
@@ -1140,7 +1140,7 @@ union U { a: u8, b: u16 }
         // The same word when the evaluation wrote a pointer there.
         let with_provenance = |at| {
             let mut map = ComplexMemoryMap::default();
-            map.insert(0x1000, Box::from(&[7u8][..]));
+            map.insert(0x1000, &[7u8]);
             map.note_pointer(at);
             MemoryMap::Complex(Box::new(map))
         };
@@ -1156,7 +1156,7 @@ union U { a: u8, b: u16 }
         // Behind a reference, the word's address is.
         let reference = Ty::new_imm_ref(interner, interner.default_types().regions.statik, ty);
         let mut map = ComplexMemoryMap::default();
-        map.insert(0x2000, Box::from(&fixture.words(&[0x1000])[..]));
+        map.insert(0x2000, &fixture.words(&[0x1000]));
         map.note_pointer(PointerAt::Memory(0x2000));
         let map = MemoryMap::Complex(Box::new(map));
         assert_eq!(fixture.convert(reference, &fixture.words(&[0x2000]), &map), unsupported);

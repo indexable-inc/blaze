@@ -13,7 +13,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use super::{decode, encode, encode_into};
 use crate::{
-    ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, BuildScriptRan, Cached, Cargo,
+    ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, Unbuilt, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope, FactRead, FetchVerb, How, Level,
     LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch, NodeKind, OpenFailure, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, Span,
     ServedCrate, ServedPart, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
@@ -574,6 +574,13 @@ impl Gen {
                     id: self.id(),
                     exe: crate::Executable { path: self.text(), len: self.wide(), modified_ns: self.wide(), inode: self.wide() },
                 },
+                bugs: self.many(depth, |g| crate::Bug {
+                    kind: g.text(),
+                    what: g.text(),
+                    at: g.text(),
+                    count: g.wide(),
+                    thread: g.maybe(Gen::text),
+                }),
             }),
             13 => Response::Done { ok: self.yes() },
             14 => Response::Error(ApiError { at: self.maybe(Gen::text), what: self.text() }),
@@ -692,6 +699,7 @@ impl Gen {
             40 => Response::Unchecked(Unchecked {
                 open: self.many(depth, |g| OpenFailure { unit: g.text(), checked: g.texts(depth + 1) }),
                 behind: self.many(depth, |g| Behind { why: g.text(), unit: g.text(), units: g.texts(depth + 1) }),
+                tests: self.many(depth, |g| Unbuilt { unit: g.text(), behind: g.text(), why: g.text() }),
                 stopped: self.yes(),
             }),
             _ => {

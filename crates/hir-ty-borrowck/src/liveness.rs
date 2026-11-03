@@ -794,14 +794,15 @@ fn live_regions_of<'db>(
                     }
                     None => (),
                 }
-                // What an `impl Trait` does not capture need not be live.
-                if let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind
-                    && let Some(captured) = super::regions::opaque_captures(
-                        self.ctx.frame,
-                        self.ctx.db,
-                        def_id,
-                        alias.args.len(),
-                    )
+                // What an `impl Trait` (an opaque type, or a trait method's RPITIT projection)
+                // does not capture need not be live, as rustc's liveness skips what
+                // `opt_alias_variances` makes bivariant.
+                if let Some(captured) = super::regions::alias_captures(
+                    self.ctx.frame,
+                    self.ctx.db,
+                    alias.kind,
+                    alias.args.len(),
+                )
                 {
                     for (arg, captured) in alias.args.iter().zip(captured) {
                         if captured {

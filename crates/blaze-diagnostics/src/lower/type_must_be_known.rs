@@ -854,6 +854,7 @@ fn bounds<'t>(
 
 /// A `let` with no type whose pattern's type is not decided: rustc's `InferSourceKind::
 /// LetBinding`.
+#[derive(Clone, Copy)]
 struct LetSource<'db> {
     pat: InFile<ast::Pat<'db>>,
     ty: hir::Type<'db>,

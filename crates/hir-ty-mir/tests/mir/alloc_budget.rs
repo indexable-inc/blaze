@@ -15,8 +15,8 @@ use hir_ty_mir::mir::{
     FrameStorage,
     budget::{self, OPTIMIZATIONS, Pass},
     monomorphized,
-    type_name::rustc_type_name,
 };
+use hir_ty_print::rustc_type_name;
 use hir_expand::fixture;
 
 use crate::{constant, db::TestDB, function};

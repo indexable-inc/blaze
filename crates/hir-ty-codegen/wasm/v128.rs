@@ -202,7 +202,7 @@ impl Lower<'_> {
         for &arg in args {
             self.get(arg)?;
         }
-        self.i(instruction.encoded());
+        self.i(&instruction.encoded());
         match results {
             [] => Ok(()),
             &[result] => self.set(result),
@@ -221,7 +221,7 @@ impl Lower<'_> {
     ) -> Result<(), String> {
         let offset = self.pointer(base, offset)?;
         let at = mem(offset);
-        self.i(match opcode {
+        self.i(&match opcode {
             Opcode::Uload8x8 => I::V128Load8x8U(at),
             Opcode::Sload8x8 => I::V128Load8x8S(at),
             Opcode::Uload16x4 => I::V128Load16x4U(at),
@@ -241,7 +241,7 @@ impl Lower<'_> {
         let lanes = self.lanes(arg)?;
         self.get(arg)?;
         // A narrow integer is held zero-extended.
-        self.i(match lanes {
+        self.i(&match lanes {
             Lanes::I8 => I::I8x16ExtractLaneU(lane),
             Lanes::I16 => I::I16x8ExtractLaneU(lane),
             Lanes::I32 => I::I32x4ExtractLane(lane),
@@ -267,7 +267,7 @@ impl Lower<'_> {
     }
 
     fn replace_lane(&mut self, lanes: Lanes, lane: u8) {
-        self.i(match lanes {
+        self.i(&match lanes {
             Lanes::I8 => I::I8x16ReplaceLane(lane),
             Lanes::I16 => I::I16x8ReplaceLane(lane),
             Lanes::I32 => I::I32x4ReplaceLane(lane),
@@ -289,7 +289,7 @@ impl Lower<'_> {
         if opcode == Opcode::Splat {
             let lanes = Lanes::of(to)?;
             self.get(arg)?;
-            self.i(match lanes {
+            self.i(&match lanes {
                 Lanes::I8 => I::I8x16Splat,
                 Lanes::I16 => I::I16x8Splat,
                 Lanes::I32 => I::I32x4Splat,
@@ -300,7 +300,7 @@ impl Lower<'_> {
             return self.set(result);
         }
         if opcode == Opcode::ScalarToVector {
-            self.i(I::V128Const(0));
+            self.i(&I::V128Const(0));
             self.get(arg)?;
             self.replace_lane(Lanes::of(to)?, 0);
             return self.set(result);
@@ -420,9 +420,9 @@ impl Lower<'_> {
                     ],
                     &what,
                 )?;
-                self.i(bitmask);
+                self.i(&bitmask);
                 match self.class(result)? {
-                    Class::Long => self.i(I::I64ExtendI32U),
+                    Class::Long => self.i(&I::I64ExtendI32U),
                     class @ Class::Word(_) => self.mask_for(class),
                     // alloc: the error's message
                     class => return Err(format!("wasm: vhigh_bits to {class:?}")),
@@ -432,7 +432,7 @@ impl Lower<'_> {
             // alloc: the error's message
             _ => return Err(format!("wasm: {opcode} of {} to {to}", from.name())),
         };
-        self.i(instruction);
+        self.i(&instruction);
         self.set(result)
     }
 
@@ -473,18 +473,18 @@ impl Lower<'_> {
                         Some(I::I64x2ShrS),
                     ),
                 };
-                self.i(lanes.pick(of, &what)?);
+                self.i(&lanes.pick(of, &what)?);
                 return self.set(result);
             }
             Opcode::Imul if lanes == Lanes::I8 => {
                 // The low byte of each product of the bytes widened, both halves.
                 self.get(a)?;
                 self.get(b)?;
-                self.i(I::I16x8ExtMulLowI8x16U);
+                self.i(&I::I16x8ExtMulLowI8x16U);
                 self.get(a)?;
                 self.get(b)?;
-                self.i(I::I16x8ExtMulHighI8x16U);
-                self.i(I::I8x16Shuffle(pairs(1, false)));
+                self.i(&I::I16x8ExtMulHighI8x16U);
+                self.i(&I::I8x16Shuffle(pairs(1, false)));
                 return self.set(result);
             }
             Opcode::Umin | Opcode::Umax | Opcode::Smin | Opcode::Smax if lanes == Lanes::I64 => {
@@ -497,7 +497,7 @@ impl Lower<'_> {
                 self.get(a)?;
                 self.get(b)?;
                 self.wide_lanes_compare(cond, a, b)?;
-                self.i(I::V128Bitselect);
+                self.i(&I::V128Bitselect);
                 return self.set(result);
             }
             Opcode::IaddPairwise => {
@@ -506,7 +506,7 @@ impl Lower<'_> {
                 for odd in [false, true] {
                     self.get(a)?;
                     self.get(b)?;
-                    self.i(I::I8x16Shuffle(pairs(bytes, odd)));
+                    self.i(&I::I8x16Shuffle(pairs(bytes, odd)));
                 }
                 let add = ints(
                     Some(I::I8x16Add),
@@ -514,7 +514,7 @@ impl Lower<'_> {
                     Some(I::I32x4Add),
                     Some(I::I64x2Add),
                 );
-                self.i(lanes.pick(add, &what)?);
+                self.i(&lanes.pick(add, &what)?);
                 return self.set(result);
             }
             Opcode::Fcopysign => {
@@ -526,8 +526,8 @@ impl Lower<'_> {
                 };
                 self.get(b)?;
                 self.get(a)?;
-                self.i(I::V128Const(sign));
-                self.i(I::V128Bitselect);
+                self.i(&I::V128Const(sign));
+                self.i(&I::V128Bitselect);
                 return self.set(result);
             }
             _ => {}
@@ -602,7 +602,7 @@ impl Lower<'_> {
         };
         self.get(a)?;
         self.get(b)?;
-        self.i(instruction);
+        self.i(&instruction);
         self.set(result)
     }
 
@@ -624,11 +624,11 @@ impl Lower<'_> {
         for value in [a, b] {
             self.get(value)?;
             if flip {
-                self.i(I::V128Const(TOP_BITS));
-                self.i(I::V128Xor);
+                self.i(&I::V128Const(TOP_BITS));
+                self.i(&I::V128Xor);
             }
         }
-        self.i(signed);
+        self.i(&signed);
         Ok(())
     }
 
@@ -661,7 +661,7 @@ impl Lower<'_> {
         let instruction = lanes.pick(instructions, format_args!("icmp {cond}"))?;
         self.get(a)?;
         self.get(b)?;
-        self.i(instruction);
+        self.i(&instruction);
         self.set(result)
     }
 
@@ -701,11 +701,11 @@ impl Lower<'_> {
                 for value in [a, b] {
                     self.get(value)?;
                     self.get(value)?;
-                    self.i(pick(I::F32x4Eq, I::F64x2Eq));
+                    self.i(&pick(I::F32x4Eq, I::F64x2Eq));
                 }
-                self.i(I::V128And);
+                self.i(&I::V128And);
                 if cond == FloatCC::Unordered {
-                    self.i(I::V128Not);
+                    self.i(&I::V128Not);
                 }
                 return self.set(result);
             }
@@ -713,20 +713,20 @@ impl Lower<'_> {
                 for instruction in [lt, gt] {
                     self.get(a)?;
                     self.get(b)?;
-                    self.i(instruction);
+                    self.i(&instruction);
                 }
-                self.i(I::V128Or);
+                self.i(&I::V128Or);
                 if cond == FloatCC::UnorderedOrEqual {
-                    self.i(I::V128Not);
+                    self.i(&I::V128Not);
                 }
                 return self.set(result);
             }
         };
         self.get(a)?;
         self.get(b)?;
-        self.i(first);
+        self.i(&first);
         if negate {
-            self.i(I::V128Not);
+            self.i(&I::V128Not);
         }
         self.set(result)
     }

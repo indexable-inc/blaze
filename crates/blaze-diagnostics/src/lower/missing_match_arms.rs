@@ -158,7 +158,7 @@ fn not_covered<'db>(cx: &Cx<'_, 'db>, d: &hir::MissingMatchArms<'db>, sp: &Span,
         // alloc: the error's text, for an error hir found
         false => "_ => todo!()".to_owned(),
     };
-    let suggestion = arm_suggestion(cx, sp, &arms, &suggested_arm);
+    let suggestion = arm_suggestion(cx, sp, arms, &suggested_arm);
     // alloc: the error's text, for an error hir found
     let message = format!(
         "ensure that all possible cases are being handled by adding a match arm with a wildcard pattern{}{}",
@@ -217,14 +217,13 @@ fn special_ty_notes<'db>(cx: &Cx<'_, 'db>, diag: &mut Diag, special_tys: &[(Type
 
 /// Where rustc suggests the missing arm, and its code: in the braces of an empty match, after
 /// its only arm, or after its last when it is laid out as the one before it.
-fn arm_suggestion(cx: &Cx<'_, '_>, sp: &Span, arms: &Arms<'_>, suggested_arm: &str) -> Option<(Span, String)> {
+fn arm_suggestion(cx: &Cx<'_, '_>, sp: &Span, arms: Arms<'_>, suggested_arm: &str) -> Option<(Span, String)> {
     let arm_span = |arm: &ast::MatchArm<'_>| cx.span(InFile::new(arms.file, arm_range(*arm)));
     // rustc asks whether the body is a block to leave the comma out, which never holds: THIR
     // wraps every arm's body in a scope.
     match arms.arms {
         [] => {
-            // clone: the error's parts, for an error hir found
-            let braces = arms.braces.clone()?;
+            let braces = arms.braces?;
             let code = match arms.text.map(|it| indentation_before(it, sp.lo)) {
                 // alloc: the error's text, for an error hir found
                 Some(indent) => format!(" {{\n{indent}    {suggested_arm},\n{indent}}}"),

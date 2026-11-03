@@ -391,8 +391,8 @@ impl<'a> Stage<'a> {
     }
 
     /// The class and rank the writer gives the core's pieces of `class`.
-    fn core_class(&mut self, class: Class) -> (ClassId, u32) {
-        let (class, rank) = self.writer.own(&class);
+    fn core_class(&mut self, class: &Class) -> (ClassId, u32) {
+        let (class, rank) = self.writer.own(class);
         (self.new.class_id(&class), rank)
     }
 
@@ -452,7 +452,7 @@ impl<'a> Stage<'a> {
             let sym = self.synthetic(OPTION, name.as_bytes());
             if self.new.home(sym).is_none() {
                 let bytes: &'a [u8] = self.arena.alloc_slice_copy(&value.to_le_bytes());
-                let (class, rank) = self.core_class(Class::Rodata);
+                let (class, rank) = self.core_class(&Class::Rodata);
                 let piece = NewPiece { rank, ..piece_of(sym, class, 4, 4, &[]) };
                 self.make(&piece, Content::Bytes(bytes));
             }
@@ -556,7 +556,7 @@ impl<'a> Stage<'a> {
     /// A piece of `stub`'s code, its fields of `targets`, the names among them seen.
     fn code(&mut self, sym: Sym, stub: Stub, targets: &[Sym]) {
         let fixups = collect_in(stub.fields.iter().map(|it| fixup(it, targets, 0)), self.arena).leak();
-        let (class, rank) = self.core_class(Class::Text);
+        let (class, rank) = self.core_class(&Class::Text);
         let piece = NewPiece { rank, ..piece_of(sym, class, 16, stub.code.len() as u64, fixups) };
         self.make(&piece, Content::Bytes(stub.code));
         for target in targets {
@@ -705,7 +705,7 @@ impl<'a> Stage<'a> {
             fixups.extend(calls.fields.iter().map(|it| fixup(it, &targets, at as u64)));
             at += calls.call.len();
         }
-        let (class, rank) = self.core_class(Class::Text);
+        let (class, rank) = self.core_class(&Class::Text);
         let piece = NewPiece { rank, ..piece_of(code, class, 16, len as u64, fixups.leak()) };
         self.make(&piece, Content::Bytes(bytes));
         self.constructor(b"sancov", code, SANCOV_PRIORITY, false)?;
@@ -845,7 +845,7 @@ impl<'a> Stage<'a> {
                 fixups.push(Fixup { at: at + field, apply: Apply::Abs64, target, addend: 0, minus: None });
             }
         }
-        let (class, rank) = self.core_class(Class::Data);
+        let (class, rank) = self.core_class(&Class::Data);
         let piece = NewPiece { rank, ..piece_of(descriptor, class, 8, size, fixups.leak()) };
         self.make(&piece, Content::Bytes(bytes));
         Ok(())
@@ -893,13 +893,13 @@ impl<'a> Stage<'a> {
                 bytes[prefix.len() + 2 * at] = HEX[usize::from(byte >> 4)];
                 bytes[prefix.len() + 2 * at + 1] = HEX[usize::from(byte & 15)];
             }
-            let (class, rank) = self.core_class(Class::Rodata);
+            let (class, rank) = self.core_class(&Class::Rodata);
             let piece = NewPiece { rank, ..piece_of(name, class, 1, bytes.len() as u64, &[]) };
             self.make(&piece, Content::Bytes(bytes));
         }
         let odr = self.synthetic(ODR, key);
         if self.new.home(odr).is_none() {
-            let (class, rank) = self.core_class(Class::Data);
+            let (class, rank) = self.core_class(&Class::Data);
             let piece = NewPiece { rank, ..piece_of(odr, class, 1, 1, &[]) };
             self.make(&piece, Content::Zero);
         }
@@ -913,7 +913,7 @@ impl<'a> Stage<'a> {
             let name = self.name.as_bytes();
             let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(name.len() + 1, |_| 0);
             bytes[..name.len()].copy_from_slice(name);
-            let (class, rank) = self.core_class(Class::Rodata);
+            let (class, rank) = self.core_class(&Class::Rodata);
             let piece = NewPiece { rank, ..piece_of(sym, class, 1, bytes.len() as u64, &[]) };
             self.make(&piece, Content::Bytes(bytes));
         }

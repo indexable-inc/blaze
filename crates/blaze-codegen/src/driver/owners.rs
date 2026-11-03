@@ -65,7 +65,7 @@ pub(super) struct Owned {
 /// `errors` one error for each of the dependency's functions and statics that refers to the
 /// workspace's, naming the first such reference, functions first and each in key order. The
 /// references are checked on every core: a lookup each, about 1 M for 100 000 functions.
-pub(super) fn owners<'a, F, S>(functions: F, statics: S, errors: &mut Vec<CodegenError>) -> Owned
+pub(super) fn owners<'a, F, S>(functions: &F, statics: &S, errors: &mut Vec<CodegenError>) -> Owned
 where
     F: Iterator<Item = Function<'a>> + Clone,
     S: Iterator<Item = StaticOf<'a>> + Clone,

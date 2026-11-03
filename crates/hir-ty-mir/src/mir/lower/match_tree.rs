@@ -109,7 +109,7 @@ impl<'t> Tree<'t, '_> {
             match first.pairs.first() {
                 None => {
                     let first = candidates.pop().expect("the first candidate");
-                    start = self.matched(start, first);
+                    start = self.matched(start, &first);
                 }
                 Some(_) if ors.is_some_and(|it| it < candidates.len()) => {
                     start = self.expand(start, &mut candidates)
@@ -121,8 +121,8 @@ impl<'t> Tree<'t, '_> {
 
     /// A candidate with nothing left to test. Says whether the candidates after it can
     /// still be reached: only through a guard.
-    fn matched(&mut self, start: bool, candidate: Candidate<'t>) -> bool {
-        let Candidate { arm, guarded, then, .. } = candidate;
+    fn matched(&mut self, start: bool, candidate: &Candidate<'t>) -> bool {
+        let Candidate { arm, guarded, then, .. } = *candidate;
         let Some(then) = then else {
             if start {
                 self.reached.insert(arm);

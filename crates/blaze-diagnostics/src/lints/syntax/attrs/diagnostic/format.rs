@@ -43,7 +43,8 @@ impl Argument<'_> {
 }
 
 enum Piece<'a> {
-    Lit,
+    /// Text outside the braces, `{{` and `}}` as one brace each.
+    Lit(&'a str),
     Arg(Argument<'a>),
 }
 
@@ -124,8 +125,7 @@ impl<'a> Parser<'a> {
                 self.index += 1;
                 if let Some((_, i, '{')) = self.peek() {
                     self.index += 1;
-                    self.string(i);
-                    Some(Piece::Lit)
+                    Some(Piece::Lit(self.string(i)))
                 } else {
                     let arg = self.argument();
                     self.ws();
@@ -139,8 +139,7 @@ impl<'a> Parser<'a> {
                 self.index += 1;
                 if let Some((_, i, '}')) = self.peek() {
                     self.index += 1;
-                    self.string(i);
-                    Some(Piece::Lit)
+                    Some(Piece::Lit(self.string(i)))
                 } else {
                     self.errors.push(ParseError {
                         // alloc: an error's text, as is each `ParseError`'s below
@@ -153,8 +152,7 @@ impl<'a> Parser<'a> {
                 }
             }
             _ => {
-                self.string(idx);
-                Some(Piece::Lit)
+                Some(Piece::Lit(self.string(idx)))
             }
         }
     }
@@ -519,8 +517,8 @@ pub(super) fn parse(input: &str, snippet: &str, literal: TextRange, mode: Mode) 
 pub(super) fn filter_params(input: &str, params: &mut Vec<String>) {
     let mut parser = Parser::new(input, None);
     while let Some(piece) = parser.next_piece() {
-        if let Piece::Arg(Argument { position: Position::Named(name), .. }) = piece
-            && !matches!(name, "integer" | "integral" | "float" | "union" | "enum" | "struct")
+        if let Piece::Arg(arg) = piece
+            && let Some(name) = filter_arg(&arg)
         {
             // alloc: a parameter an `on(..)` filter names (`directive::filter`)
             params.push(name.to_owned());
@@ -528,35 +526,113 @@ pub(super) fn filter_params(input: &str, params: &mut Vec<String>) {
     }
 }
 
-/// rustc's `parse_arg`: what `arg` is under `mode`, the warnings it gives.
-fn parse_arg(arg: &Argument<'_>, mode: Mode, parsed: &mut Parsed, literal: TextRange, is_source_literal: bool) {
-    // clone: a range, two integers copied
-    let span = slice(literal, arg.position_span.clone(), is_source_literal);
-    let mut check_format = true;
-    match arg.position {
-        Position::Named(name) => match (mode, name) {
-            (Mode::RustcOnUnimplemented, "ItemContext") => {}
-            (Mode::RustcOnUnimplemented, "This") => {
-                if matches!(arg.ty, "resolved" | "path") {
-                    check_format = false;
+/// rustc's `parse_filter_format` and `FilterFormatString::format`: an `on`-clause's value
+/// `input` (`T = "&[{A}]"`) with each generic parameter it names filled in from `generic_args`
+/// (`Self` among them), any other name printed back as `{name}`; the kinds it is compared with
+/// (`{integral}`, `{union}`) are left as they are.
+pub(crate) fn format_filter(input: &str, generic_args: &[(String, String)]) -> String {
+    let mut parser = Parser::new(input, None);
+    // alloc: one value of an `on(..)` filter, for an error being reported
+    let mut out = String::with_capacity(input.len());
+    while let Some(piece) = parser.next_piece() {
+        match piece {
+            Piece::Lit(lit) => out.push_str(lit),
+            Piece::Arg(arg) => match (filter_arg(&arg), arg.position) {
+                (Some(name), _) => match generic_args.iter().find(|(param, _)| param == name) {
+                    Some((_, value)) => out.push_str(value),
+                    None => push_braced(&mut out, name),
+                },
+                (None, Position::Named(name)) => push_braced(&mut out, name),
+                (None, Position::Index(index)) => {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "{{{index}}}");
                 }
-            }
-            (Mode::DiagnosticOnTypeError, "Found" | "Expected") => {}
-            (Mode::DiagnosticOnUnknown, "Unresolved") => {}
+                (None, Position::Implicit) => out.push_str("{}"),
+            },
+        }
+    }
+    out
+}
+
+/// The generic parameter an argument of an `on`-clause's value names: not one of the kinds a
+/// self type is compared as, nor `{}` or `{1}`.
+fn filter_arg<'a>(arg: &Argument<'a>) -> Option<&'a str> {
+    match arg.position {
+        Position::Named("integer" | "integral" | "float" | "union" | "enum" | "struct") => None,
+        Position::Named(name) => Some(name),
+        Position::Index(_) | Position::Implicit => None,
+    }
+}
+
+/// What an argument of a format string stands for under an attribute: rustc's `FormatArg`.
+/// [`FormatArg::of`] is the one table of which names each attribute fills in; the lints of the
+/// attribute and the error that fills it in (E0277's `on_unimplemented`) both read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FormatArg<'a> {
+    /// `{T}`: a generic parameter of the item, or, when it has none of that name, printed back
+    /// as `{T}` (its format spec, if any, dropped).
+    GenericParam(&'a str),
+    /// `{Self}`: the self type.
+    SelfUpper,
+    /// `{this}` and `{this:name}`: the item the attribute is on.
+    This,
+    /// `{this:resolved}`: the trait with its arguments, `Fn(u8)` sugar for a parenthesized one
+    /// (`#[rustc_on_unimplemented]` only).
+    ThisResolved,
+    /// `{this:path}`: the trait's path (`#[rustc_on_unimplemented]` only).
+    ThisPath,
+    /// `{item_context}`: what the code is in, "a function", "an async block"
+    /// (`#[rustc_on_unimplemented]` only).
+    ItemContext,
+    /// `{found}` of `#[diagnostic::on_type_error]`.
+    Found,
+    /// `{expected}` of `#[diagnostic::on_type_error]`.
+    Expected,
+    /// `{unresolved}` of `#[diagnostic::on_unknown]`.
+    Unresolved,
+    /// A name the attribute does not take, printed back as `{name}`.
+    Disallowed(&'a str),
+    /// `{1}`, printed back as written.
+    Indexed(usize),
+    /// `{}`, printed back as written.
+    Positional,
+}
+
+impl<'a> FormatArg<'a> {
+    /// rustc's `parse_arg`: what `arg` stands for under `mode`, and whether its format spec is
+    /// one the argument takes (`{this:resolved}`, `{this:path}`), not to be warned of.
+    fn of(arg: &Argument<'a>, mode: Mode) -> (FormatArg<'a>, bool) {
+        let name = match arg.position {
+            Position::Named(name) => name,
+            Position::Index(index) => return (FormatArg::Indexed(index), false),
+            Position::Implicit => return (FormatArg::Positional, false),
+        };
+        let it = match (mode, name) {
+            (Mode::RustcOnUnimplemented, "item_context") => FormatArg::ItemContext,
+            (Mode::RustcOnUnimplemented, "this") => match arg.ty {
+                "resolved" => return (FormatArg::ThisResolved, true),
+                "path" => return (FormatArg::ThisPath, true),
+                _ => FormatArg::This,
+            },
+            (Mode::DiagnosticOnTypeError, "found") => FormatArg::Found,
+            (Mode::DiagnosticOnTypeError, "expected") => FormatArg::Expected,
+            (Mode::DiagnosticOnUnknown, "unresolved") => FormatArg::Unresolved,
+            // `diagnostic::on_unimplemented` does not take `{this}`: it is a generic name
+            // there, as rustc's FIXME(mejrs) says.
             (
                 Mode::DiagnosticOnUnknown
                 | Mode::DiagnosticOnMove
                 | Mode::DiagnosticOnUnmatchedArgs
                 | Mode::DiagnosticOnTypeError,
-                "This",
-            ) => {}
+                "this",
+            ) => FormatArg::This,
             (
                 Mode::RustcOnUnimplemented
                 | Mode::DiagnosticOnUnimplemented
                 | Mode::DiagnosticOnMove
                 | Mode::DiagnosticOnConst,
                 "Self",
-            ) => {}
+            ) => FormatArg::SelfUpper,
             (
                 Mode::RustcOnUnimplemented
                 | Mode::DiagnosticOnUnimplemented
@@ -564,16 +640,107 @@ fn parse_arg(arg: &Argument<'_>, mode: Mode, parsed: &mut Parsed, literal: TextR
                 | Mode::DiagnosticOnConst
                 | Mode::DiagnosticOnTypeError,
                 param,
-                // alloc: a generic parameter a diagnostic attribute's format string names
-            ) => parsed.params.push((param.to_owned(), span)),
-            (Mode::DiagnosticOnUnknown | Mode::DiagnosticOnUnmatchedArgs, _) => {
-                parsed.warnings.push(Warning::Disallowed(span));
-            }
-        },
-        Position::Index(_) => parsed.warnings.push(Warning::Indexed(span)),
-        Position::Implicit => parsed.warnings.push(Warning::Positional(span)),
+            ) => FormatArg::GenericParam(param),
+            (Mode::DiagnosticOnUnknown | Mode::DiagnosticOnUnmatchedArgs, name) => FormatArg::Disallowed(name),
+        };
+        (it, false)
     }
-    if check_format && let Some(ty_span) = &arg.ty_span {
+}
+
+/// What a format string's arguments are filled in with: rustc's `FormatArgs`. A field an
+/// attribute does not take is never read for it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FormatArgs<'a> {
+    /// The item the attribute is on, for `{this}`.
+    pub(crate) this: &'a str,
+    pub(crate) this_resolved: &'a str,
+    pub(crate) this_path: &'a str,
+    pub(crate) found: &'a str,
+    pub(crate) expected: &'a str,
+    pub(crate) unresolved: &'a str,
+    pub(crate) item_context: &'a str,
+    /// The item's generic parameters (`Self` among them) and what each is.
+    pub(crate) generic_args: &'a [(String, String)],
+}
+
+impl FormatArgs<'_> {
+    /// What the generic parameter `name` is.
+    fn generic(&self, name: &str) -> Option<&str> {
+        self.generic_args.iter().find(|(param, _)| param == name).map(|(_, value)| value.as_str())
+    }
+
+    /// rustc's `parse_format_string` and `FormatString::format`: `input`, a format string of
+    /// `mode`'s attribute, with each argument filled in. A string that does not parse (the
+    /// lint reports it) is used as it is written, as rustc does.
+    pub(crate) fn format(&self, input: &str, mode: Mode) -> String {
+        let mut parser = Parser::new(input, None);
+        // alloc: one format string of an error's custom message, label or note
+        let mut out = String::with_capacity(input.len());
+        while let Some(piece) = parser.next_piece() {
+            let arg = match piece {
+                Piece::Lit(lit) => {
+                    out.push_str(lit);
+                    continue;
+                }
+                Piece::Arg(arg) => FormatArg::of(&arg, mode).0,
+            };
+            match arg {
+                FormatArg::GenericParam(name) => match self.generic(name) {
+                    Some(value) => out.push_str(value),
+                    None => push_braced(&mut out, name),
+                },
+                FormatArg::SelfUpper => out.push_str(self.generic("Self").unwrap_or("Self")),
+                FormatArg::This => out.push_str(self.this),
+                FormatArg::ThisResolved => out.push_str(self.this_resolved),
+                FormatArg::ThisPath => out.push_str(self.this_path),
+                FormatArg::ItemContext => out.push_str(self.item_context),
+                FormatArg::Found => out.push_str(self.found),
+                FormatArg::Expected => out.push_str(self.expected),
+                FormatArg::Unresolved => out.push_str(self.unresolved),
+                FormatArg::Disallowed(name) => push_braced(&mut out, name),
+                FormatArg::Indexed(index) => {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "{{{index}}}");
+                }
+                FormatArg::Positional => out.push_str("{}"),
+            }
+        }
+        if parser.errors.is_empty() {
+            out
+        } else {
+            // alloc: as above, the string as written
+            input.to_owned()
+        }
+    }
+}
+
+fn push_braced(out: &mut String, name: &str) {
+    out.push('{');
+    out.push_str(name);
+    out.push('}');
+}
+
+/// rustc's `parse_arg`: what `arg` is under `mode` ([`FormatArg::of`]), the warnings it gives.
+fn parse_arg(arg: &Argument<'_>, mode: Mode, parsed: &mut Parsed, literal: TextRange, is_source_literal: bool) {
+    // clone: a range, two integers copied
+    let span = slice(literal, arg.position_span.clone(), is_source_literal);
+    let (it, takes_spec) = FormatArg::of(arg, mode);
+    match it {
+        // alloc: a generic parameter a diagnostic attribute's format string names
+        FormatArg::GenericParam(param) => parsed.params.push((param.to_owned(), span)),
+        FormatArg::Disallowed(_) => parsed.warnings.push(Warning::Disallowed(span)),
+        FormatArg::Indexed(_) => parsed.warnings.push(Warning::Indexed(span)),
+        FormatArg::Positional => parsed.warnings.push(Warning::Positional(span)),
+        FormatArg::SelfUpper
+        | FormatArg::This
+        | FormatArg::ThisResolved
+        | FormatArg::ThisPath
+        | FormatArg::ItemContext
+        | FormatArg::Found
+        | FormatArg::Expected
+        | FormatArg::Unresolved => {}
+    }
+    if !takes_spec && let Some(ty_span) = &arg.ty_span {
         // clone: a range, two integers copied
         parsed.warnings.push(Warning::Specifier(slice(literal, ty_span.clone(), is_source_literal)));
     }
@@ -648,11 +815,42 @@ mod tests {
 
     #[test]
     fn modes_differ_in_what_names_they_take() {
-        let it = parsed("{This} {T}", "\"{This} {T}\"", Mode::DiagnosticOnUnmatchedArgs).unwrap();
+        let it = parsed("{this} {T}", "\"{this} {T}\"", Mode::DiagnosticOnUnmatchedArgs).unwrap();
         assert_eq!(it.warnings, [Warning::Disallowed(at(9, 10))]);
-        let it = parsed("{This:resolved}", "\"{This:resolved}\"", Mode::RustcOnUnimplemented).unwrap();
+        let it = parsed("{this:resolved}", "\"{this:resolved}\"", Mode::RustcOnUnimplemented).unwrap();
         assert!(it.warnings.is_empty() && it.params.is_empty());
-        let it = parsed("{Expected}", "\"{Expected}\"", Mode::DiagnosticOnMove).unwrap();
-        assert_eq!(it.params, [("Expected".to_owned(), at(2, 10))]);
+        let it = parsed("{this:resolved}", "\"{this:resolved}\"", Mode::DiagnosticOnUnimplemented).unwrap();
+        assert_eq!(it.params, [("this".to_owned(), at(2, 6))]);
+        assert_eq!(it.warnings, [Warning::Specifier(at(6, 15))]);
+        let it = parsed("{expected}", "\"{expected}\"", Mode::DiagnosticOnMove).unwrap();
+        assert_eq!(it.params, [("expected".to_owned(), at(2, 10))]);
+    }
+
+    #[test]
+    fn rustc_on_unimplemented_fills_every_placeholder_it_takes_and_prints_back_the_rest() {
+        // alloc: a test's parameters
+        let generic_args = [("Self".to_owned(), "fn(u16)".to_owned()), ("Args".to_owned(), "(u8,)".to_owned())];
+        let args = FormatArgs {
+            this: "Fn",
+            this_resolved: "Fn(u8)",
+            this_path: "Fn<Args>",
+            item_context: "a closure",
+            generic_args: &generic_args,
+            ..FormatArgs::default()
+        };
+        let input = "expected `{this:resolved}` signature, found `{Self}`; {this} {this:name} {this:path} \
+                     in {item_context}, {Args} {X} {X:spec} {{}} {} {1}";
+        assert_eq!(
+            args.format(input, Mode::RustcOnUnimplemented),
+            "expected `Fn(u8)` signature, found `fn(u16)`; Fn Fn Fn<Args> in a closure, (u8,) {X} {X} {} {} {1}"
+        );
+        // `diagnostic::on_unimplemented` takes none of `this`'s forms nor `item_context`: they
+        // are generic names, printed back without their spec.
+        assert_eq!(
+            args.format("{this} {this:resolved} {item_context} {Self}", Mode::DiagnosticOnUnimplemented),
+            "{this} {this} {item_context} fn(u16)"
+        );
+        // A string that does not parse is used as written.
+        assert_eq!(args.format("{Self", Mode::RustcOnUnimplemented), "{Self");
     }
 }

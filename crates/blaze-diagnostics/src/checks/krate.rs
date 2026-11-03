@@ -96,6 +96,7 @@ fn entry(cx: &Cx<'_, '_>) -> Vec<Diag> {
 }
 
 /// What `crate::main` names in the value namespace (rustc's `MainDefinition`).
+#[derive(Clone, Copy)]
 enum MainDef {
     Function(hir::Function),
     /// Something else, with rustc's span of its binding: the item, or the `use` that brings it.

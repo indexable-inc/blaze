@@ -863,7 +863,7 @@ span_kinds! {
         Owner = "owner" (U64): u64,
             "who runs what a `wait` waits for (for a key, the job running it, as `switches.job` names it; null when not known), or the job that holds a `hold`";
         Steps = "steps" (U64): u64,
-            "the basic blocks a `macro expand` ran on the evaluator; null for a compiled run, a run that did not end, and any other span";
+            "the basic blocks a `macro expand` ran on the evaluator, or the instances a `build script proof` walked (the same on a cold, warm or busy daemon: the margin under its bound); null for a compiled run, a run or proof that did not end, and any other span";
         PeakBytes = "peak_bytes" (U64): u64,
             "the most stack and heap a `macro expand`'s evaluator held at once; null as `steps` is";
         Outcome = "outcome" (Dict): Outcome,
@@ -876,6 +876,8 @@ span_kinds! {
             "where a `macro module` got its wasm module's machine code: memo (the process had it), store (loaded from the daemon's own store) or compiled; null for one that did not end and any other span";
         CodeBytes = "code_bytes" (U64): u64,
             "the bytes of a `macro module`'s machine code: read from the store, or made by its compile and kept; null for a memo hit, a compile with no store to keep it in, and any other span";
+        Creator = "creator" (U64): u64,
+            "the span open on the thread that gave a `job` span's job to the pool, as `span_id` numbers it in the same process: what the job stands on when no job gave it (the daemon's loop on no fiber), which the critical path crosses into; null when the giver was inside no span, and for any other span";
     }
     kinds {
         /// A unit's names phase: its crate's names resolved, or its record replayed.
@@ -900,8 +902,9 @@ span_kinds! {
         /// A job a pool runs, `kind` the type of its closure (or of the plane's runner), from
         /// its start to its end or its fiber's park, and again from each resume: every job's
         /// time is inside one (`blaze_graph::pool::span_jobs`). `job` names the job, so a span
-        /// is laid on the job it ran in by its row, never by when it began.
-        Job = "job" { kind: Name => Function, job: u64 => OfJob }
+        /// is laid on the job it ran in by its row, never by when it began; `creator` the span
+        /// its giver was inside as it gave it to the pool.
+        Job = "job" { kind: Name => Function, job: u64 => OfJob, creator: Option<u64> => Creator }
         /// A pool worker's own work between jobs, `doing` it (also its `function`): `search`
         /// for a job, `idle` with none, or the fiber driver's `switch` between two
         /// (`blaze_graph::pool::Driving`). With the `job` spans, a worker's every moment is
@@ -912,6 +915,11 @@ span_kinds! {
         /// the store (its lookup and `Module::deserialize`), or a compile.
         MacroModule = "macro module" { module: Name => Function }
             => MacroModuleLoaded { from: ModuleFrom => ModuleFrom, code_bytes: Option<u64> => CodeBytes }
+        /// A build script's purity proof (`hir_ty_pure::script_proof` of its `main`), `unit`
+        /// its compile unit (`serde v1.0.219 (build script)`), `krate` its target
+        /// (`build-script-build`): as it ends, `steps`, the instances its walk took.
+        ScriptProof = "build script proof" { krate: Name => Crate, unit: Name => Unit }
+            => ScriptProved { steps: u64 => Steps }
     }
 }
 

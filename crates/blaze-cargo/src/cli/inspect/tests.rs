@@ -91,11 +91,11 @@ fn a_failed_or_empty_answer_fails() {
         Response::Error(blaze_api::ApiError { at: None, what: "no build of /w yet".to_owned() }),
         Response::Done { ok: false },
     ];
-    assert_eq!(answer(&mut Answering(refused), Inspected::Tables, tables(), None, &mut out, &mut err, false).unwrap(), FAILED);
+    assert_eq!(answer(&mut Answering(refused), Inspected::Tables, tables(), None, &mut out, &mut err, false).unwrap(), Exit::Failed.code());
     assert_eq!(String::from_utf8(std::mem::take(&mut err)).unwrap(), "error: no build of /w yet\n");
 
     let nothing = vec![Response::Done { ok: true }];
-    assert_eq!(answer(&mut Answering(nothing), Inspected::Tables, tables(), None, &mut out, &mut err, false).unwrap(), FAILED);
+    assert_eq!(answer(&mut Answering(nothing), Inspected::Tables, tables(), None, &mut out, &mut err, false).unwrap(), Exit::Failed.code());
     assert!(String::from_utf8(err).unwrap().contains("no answer of it"));
     assert!(out.is_empty());
 }
@@ -158,6 +158,6 @@ fn the_pack_is_written_where_it_was_asked_and_its_checks_diagnostics_said() {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let none = vec![Response::Done { ok: true }];
     let code = answer(&mut Answering(none), Inspected::Pack, pack_request(), Some(&to), &mut out, &mut err, false);
-    assert_eq!(code.unwrap(), FAILED);
+    assert_eq!(code.unwrap(), Exit::Failed.code());
     assert!(String::from_utf8(err).unwrap().contains("no pack"));
 }

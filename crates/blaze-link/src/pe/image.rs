@@ -1267,7 +1267,9 @@ fn build_relocations(
         Cow::Owned(sorted)
     };
     let (mut slots, mut starts) = match index {
-        Some(RelocIndex { slots, blocks }) => {
+        // The table's own borrow, moved out: what it fills lives as long as the call.
+        Some(index) => {
+            let RelocIndex { slots, blocks } = index;
             blocks.clear();
             match &rebase {
                 Cow::Borrowed(_) => {

@@ -41,8 +41,12 @@ pub(crate) const ALLOC: &str = "blaze_proc_macro_alloc";
 /// `input`. 0 once it called `output`; 1 for no such macro; [`UNENTERED`] when it could not
 /// enter the directory `current_dir` named.
 pub(crate) const EXPAND: &str = "blaze_proc_macro_expand";
-/// [`EXPAND`]'s status when the glue could not enter the working directory the host named.
+/// [`EXPAND`]'s status when the glue could not enter the working directory the host named, in
+/// its low byte ([`STATUS`]); the bits above are the `errno` `set_current_dir` failed with
+/// (WASI's number, as wasi-libc's `errno` is), 0 when there is none.
 pub(crate) const UNENTERED: u32 = 2;
+/// The bits of [`EXPAND`]'s status that say what it is; the rest is what goes with it.
+pub(crate) const STATUS: u32 = 0xFF;
 /// A WASI reactor's constructors, run once per instance before anything else.
 pub(crate) const INITIALIZE: &str = "_initialize";
 

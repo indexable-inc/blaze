@@ -44,7 +44,7 @@ pub(crate) fn run(socket: PathBuf, commands: crossbeam_channel::Receiver<Command
                     ViewRef::Root(View { root }) => Some(*root),
                     _ => None,
                 };
-                let result = pins.open(view);
+                let result = pins.open(&view);
                 match (reply, pinned, result) {
                     (Some(reply), _, result) => {
                         let _ = reply.send(result);
@@ -63,7 +63,7 @@ pub(crate) fn run(socket: PathBuf, commands: crossbeam_channel::Receiver<Command
 }
 
 impl Pins {
-    fn open(&mut self, view: ViewRef) -> Result<ContentId, String> {
+    fn open(&mut self, view: &ViewRef) -> Result<ContentId, String> {
         for attempt in 0..2 {
             let client = self.connect()?;
             match open(client, view.clone()) { // clone: once per pin; a root's view owns nothing

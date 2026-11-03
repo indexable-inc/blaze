@@ -1,9 +1,12 @@
 //! The history: what the flight recorder holds, flushed to Parquet files that the pinned DuckDB
 //! (`blaze debug sql`, never linked into blaze) reads through the views of `sql/views.sql`.
 //!
-//! A flush takes what is new in the rings since the last ([`flight::read`] from the history's
-//! [`Cursor`]) and writes one file a table it has rows of, `<dir>/<build>-<seq>.<table>.parquet`:
-//! `build` the build the flush is for (0 for the timer's flushes, which hold whatever ran), and
+//! A thread of the history's own, `blaze-drain`, takes what is new in the rings every [`DRAIN`]
+//! ([`flight::read`] from the history's [`Cursor`]), whatever the writer is doing; a flush
+//! takes what it drained and writes one file a table it has rows of, `<dir>/<build>-<seq>.<table>.parquet`:
+//! `build` the highest build any of its rows is of, never below the build the flush is for (0
+//! for a timer's flush of rows of no build), so a daemon numbers its builds past every build the
+//! directory holds rows of ([`History::next_build`]), and
 //! `seq` the flush's number, which only grows in a directory. A Parquet file holds one schema,
 //! so a table a file keeps each file self-describing, and the views glob `*.<table>.parquet`.
 //! Beside them, `schema.<table>.parquet` holds no rows and every column of each table, so each
@@ -12,14 +15,24 @@
 //! Each file is made in memory, in a buffer kept across flushes, and written with one `write`
 //! to a hidden name, then renamed, so DuckDB never reads half a file. Past [`CAP_BYTES`] (or the
 //! cap the history is opened with), the oldest files are deleted first.
+//!
+//! What a daemon that dies leaves readable: a build's `builds` row as it starts (outcome
+//! `running`, [`History::build_started`]), and with each flush that wrote rows the spans every
+//! thread was inside then (the `open` table). A build whose last row is its start, of a process
+//! that no longer writes the history ([`writes`]), ended by its daemon's death; `blaze slow`
+//! reports it so, with what was open at the last flush.
 
 use std::{
     collections::VecDeque,
     fmt, fs, io,
     path::{Path, PathBuf},
     sync::Arc,
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
+
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use parking_lot::Mutex;
 
 use arrow_array::{
     Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
@@ -46,18 +59,30 @@ use crate::{
     symbols,
 };
 
-/// What the history keeps by default: 1 GiB, about 50 million spans at the ~20 bytes a span
-/// takes compressed, days of a busy daemon.
-pub const CAP_BYTES: u64 = 1 << 30;
+/// What the history keeps by default: 4 GiB, about 400 million rows at the ~10 bytes a row
+/// takes compressed. A self-build's `check` and `build` wrote about 1 GiB together with every
+/// span a row, which a 1 GiB cap trimmed from under the build it was asked about (profrows).
+pub const CAP_BYTES: u64 = 4 << 30;
 
 /// How often the daemon flushes while a session runs.
 pub const EVERY: Duration = Duration::from_secs(5);
 
-/// How often the daemon drains the rings into the next flush ([`History::drain`]). A thread's
-/// ring holds [`flight::CAP`] rows, so only a thread writing more than `CAP * 4` rows a second
-/// loses the oldest, counted in [`Flushed::skipped`] and the `profile rows skipped` counter: at
-/// one read a flush, a self-build's busiest workers filled their rings (spans37).
-pub const DRAIN: Duration = Duration::from_millis(250);
+/// How often the history's drain thread reads the rings into the next flush, on a thread of its
+/// own so a flush that takes seconds stops no drain. A thread's ring holds [`flight::CAP`]
+/// rows, so only a thread writing more than `CAP * 20` rows a second (655 k) loses the oldest,
+/// counted in [`Flushed::skipped`] and the `profile rows skipped` counter. With the drain on
+/// the writer's thread every 250 ms, a 102 s self-build step lost 42 M rows while flushes of
+/// seconds stopped it (profrows).
+pub const DRAIN: Duration = Duration::from_millis(50);
+
+/// Rows drained that make the history flush before [`EVERY`] is up ([`History::full`]): about
+/// four row groups, so a busy build's rows are written as they come, not held for seconds.
+pub const FLUSH_ROWS: usize = 1 << 19;
+
+/// Rows drained and not yet written past which the drain thread stops reading until the writer
+/// takes them: the memory a writer that falls behind may hold (about 200 bytes a row). What
+/// the rings write over meanwhile is counted apart, as `profile rows skipped behind`.
+pub const BACKLOG_ROWS: usize = 4 * FLUSH_ROWS;
 
 /// Rows a row group holds at most: DuckDB's own row group size, the unit its scans split
 /// across threads.
@@ -66,6 +91,56 @@ pub const ROW_GROUP_ROWS: usize = 122_880;
 /// Where the daemon's history goes: `profile/` in its state directory.
 pub fn dir_in(state: &Path) -> PathBuf {
     state.join("profile")
+}
+
+/// The file in a history's directory whose lock says which daemon writes it, and whose text
+/// is that daemon's pid (blaze-cargo's `serve::observe` claims it).
+pub const OWNER: &str = "owner.lock";
+
+/// Whether the process `pid` still writes the history `dir`: its [`OWNER`] file names it, the
+/// process is alive, and the file's lock is held (a pid the system gave again to another process
+/// holds no lock). A build of a process that does not, whose last row is its start, ended by
+/// that process's death.
+pub fn writes(dir: &Path, pid: u32) -> bool {
+    let path = dir.join(OWNER);
+    let named = fs::read_to_string(&path).ok().and_then(|it| it.trim().parse::<u32>().ok());
+    if named != Some(pid) || !alive(pid) {
+        return false;
+    }
+    // A shared lock taken is one no owner holds; let go of when the file drops. An error other
+    // than "held" says nothing of the owner, and the live pid the file names is taken as it.
+    match fs::File::open(&path).map(|file| file.try_lock_shared()) {
+        Ok(Ok(())) => false,
+        Ok(Err(fs::TryLockError::WouldBlock)) | Ok(Err(fs::TryLockError::Error(_))) | Err(_) => true,
+    }
+}
+
+/// Whether a process `pid` is alive: one this user may not signal is, one that is gone is not.
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
+    // SAFETY: signal 0 sends nothing: the kernel only checks that `pid` names a process.
+    let sent = unsafe { libc::kill(pid, 0) };
+    sent == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn alive(_pid: u32) -> bool {
+    true
+}
+
+/// Whether the threads `now` are inside the spans `written` were, how long each has run aside.
+fn same_open(now: &[flight::ThreadNow], written: &[flight::ThreadNow]) -> bool {
+    now.len() == written.len()
+        && now.iter().zip(written).all(|(a, b)| {
+            a.tid == b.tid
+                && a.deeper == b.deeper
+                && a.open.len() == b.open.len()
+                && a.open.iter().zip(&b.open).all(|(a, b)| {
+                    (a.name, a.target, &a.krate, &a.function, &a.unit, &a.awaits, a.owner)
+                        == (b.name, b.target, &b.krate, &b.function, &b.unit, &b.awaits, b.owner)
+                })
+        })
 }
 
 /// How a build request ended (`builds.outcome`).
@@ -121,6 +196,9 @@ pub struct BuildRow {
 pub struct Flushed {
     /// The flush's number, in its files' names.
     pub seq: u64,
+    /// The build its files are named for, `<build>-<seq>.<table>.parquet`: the highest build
+    /// any of its rows is of, never below the build it was for ([`History::flush`]).
+    pub build: u64,
     pub spans: usize,
     pub counters: usize,
     pub builds: usize,
@@ -132,6 +210,9 @@ pub struct Flushed {
     pub crate_deps: usize,
     pub query_counts: usize,
     pub misses: usize,
+    /// Spans the threads were inside as the flush read them.
+    pub open: usize,
+    pub folded: usize,
     pub files: u32,
     pub bytes: u64,
     /// Rows the rings wrote over before this flush read them, CPU samples included.
@@ -341,8 +422,8 @@ fn column(array: impl Array + 'static) -> ArrayRef {
     Arc::new(array)
 }
 
-/// The `builds` rows of `rows`.
-pub fn builds(rows: &[BuildRow]) -> Result<RecordBatch, ArrowError> {
+/// The `builds` rows of `rows`, all of the process `pid`.
+pub fn builds(rows: &[BuildRow], pid: u32) -> Result<RecordBatch, ArrowError> {
     let outcomes = column(StringArray::from_iter_values(Outcome::ALL.iter().map(|it| it.name())));
     let outcome = UInt32Array::from_iter_values(rows.iter().map(|it| it.outcome as u32));
     // alloc: a batch's columns, once a flush
@@ -360,6 +441,7 @@ pub fn builds(rows: &[BuildRow]) -> Result<RecordBatch, ArrowError> {
         column(UInt64Array::from_iter(rows.iter().map(|it| it.joined))),
         column(StringArray::from_iter(rows.iter().map(|it| it.tree.as_deref()))),
         column(StringArray::from_iter(rows.iter().map(|it| it.blaze.as_deref()))),
+        column(UInt32Array::from_value(pid, rows.len())),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::BUILDS), columns)
 }
@@ -384,20 +466,26 @@ fn named(name: &str) -> Option<(u64, u64)> {
 pub struct History {
     dir: PathBuf,
     cap: u64,
-    cursor: Cursor,
-    /// The rows drained since the last flush: what the next one writes.
+    /// What the drain thread drained since the last flush took it.
+    drained: Arc<Drained>,
+    /// The drain thread: told to end by dropping `stop`, joined as the history drops.
+    drainer: Option<(Sender<()>, JoinHandle<()>)>,
+    /// A message each time the drained rows pass [`FLUSH_ROWS`].
+    full: Receiver<()>,
+    /// The rows a flush took from the drain: what it writes.
     read: Read,
-    /// Rows the rings wrote over before a drain read them, so far.
-    skipped: u64,
-    /// The spans lost and rows skipped the last flush wrote as counters.
-    told: (u64, u64),
+    /// The spans lost, rows skipped and rows skipped behind the last flush wrote as counters.
+    told: (u64, u64, u64),
+    /// The reported bugs the last flush wrote: the process's total, and each site's count in
+    /// `stdx::assert::reported::sites`'s order, which only grows.
+    bugs_told: (u64, Vec<u64>),
     /// A flush's spans of other builds than the one it is for.
     others: Vec<SpanRow>,
     writer: Writer,
     process: Process<'static>,
     /// The next flush's number.
     seq: u64,
-    /// Builds that ended since the last flush: written by the next.
+    /// Builds that started (outcome running) or ended since the last flush: written by the next.
     ended: Vec<BuildRow>,
     /// Errors builds said since the last flush: written by the next.
     errors: Vec<ErrorRow>,
@@ -421,6 +509,8 @@ pub struct History {
     /// A build's identity that could not be told since the last flush: the next flush writes
     /// its row without it, then answers this.
     unidentified: Option<HistoryError>,
+    /// The threads' open spans the last flush wrote, their times left out ([`same_open`]).
+    open_written: Vec<flight::ThreadNow>,
 }
 
 impl History {
@@ -457,14 +547,25 @@ impl History {
             path: std::env::current_exe().unwrap_or_default(),
             error,
         })?;
+        let drained = Arc::new(Drained::default()); // alloc: once a history
+        let (full_to, full) = crossbeam_channel::bounded(1);
+        let (stop, stopped) = crossbeam_channel::bounded::<()>(0);
+        let draining = Arc::clone(&drained);
+        let drainer = std::thread::Builder::new()
+            .name("blaze-drain".to_owned()) // alloc: once a history
+            .spawn(move || drain(&draining, &stopped, &full_to))
+            .map_err(io_error(dir, "starting the drain thread (`blaze-drain`) of the history in"))?;
         let mut history = History {
             // alloc: once a history
             dir: dir.to_owned(),
             cap,
-            cursor: Cursor::default(),
+            drained,
+            drainer: Some((stop, drainer)),
+            full,
             read: Read::default(),
-            skipped: 0,
-            told: (0, 0),
+            told: (0, 0, 0),
+            // alloc: once a history; a site a bug reported in the process
+            bugs_told: (0, Vec::new()),
             // alloc: once a history
             others: Vec::new(),
             writer,
@@ -490,6 +591,8 @@ impl History {
             samples: Vec::new(),
             blaze,
             unidentified: None,
+            // alloc: once a history
+            open_written: Vec::new(),
         };
         history.trim()?;
         Ok(history)
@@ -504,6 +607,17 @@ impl History {
     /// recorder takes for "no build".
     pub fn next_build(&self) -> u32 {
         u32::try_from(self.last_build + 1).unwrap_or(u32::MAX)
+    }
+
+    /// Notes a build that started, `row` its row with outcome running and no duration, for the
+    /// next flush to write: a build its daemon never ends (a kill, a crash) is then one row in
+    /// the history, which a reader tells from one still running by its process ([`writes`]).
+    pub fn build_started(&mut self, mut row: BuildRow) {
+        if row.blaze.is_none() {
+            // clone: a hash, once a build
+            row.blaze = Some(self.blaze.clone());
+        }
+        self.ended.push(row);
     }
 
     /// Notes a build that ended, for the next flush to write; the flush for its build
@@ -561,40 +675,99 @@ impl History {
     }
 
     /// Writes what the rings hold that is new since the last flush, and the builds that ended
-    /// since, one file a table with rows, named for `build` (`None`: the timer's flush, named
-    /// 0). Then deletes the oldest files past the cap. A failed write is an error naming the
+    /// since, one file a table with rows, named for the highest build any of its rows is of and
+    /// never below `build` (`None`: the timer's flush, named 0 when it holds no build's rows).
+    /// Then deletes the oldest files past the cap. A failed write is an error naming the
     /// file; the rows it held are not written again.
     pub fn flush(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
-        self.drain();
+        let (late, behind) = self.drained.take(&mut self.read);
         // The flight recorder's own losses, as counters: a query sees whether a stretch with
         // no span is one the recorder dropped. Written with each build's flush and whenever
         // they grew, so an idle daemon's timer writes no file for them.
-        self.skipped += self.read.skipped;
         // Counted since the process began; the row of a build's flush carries the build.
-        let (t_ns, now) = (self.read.at_ns, (self.read.lost, self.skipped));
+        let (t_ns, now) = (self.read.at_ns, (self.read.lost, late + behind, behind));
         if build.is_some() || now != self.told {
             self.told = now;
             let build = build.and_then(|it| u32::try_from(it).ok()).unwrap_or(0);
-            self.read.counters.extend([(Plot::ProfileSpansLost, now.0), (Plot::ProfileRowsSkipped, now.1)].map(
-                |(plot, value)| CounterRow { build, plot, t_ns, value, fiber: None },
-            ));
+            self.read.counters.extend(
+                [(Plot::ProfileSpansLost, now.0), (Plot::ProfileRowsSkipped, now.1), (Plot::ProfileRowsBehind, now.2)]
+                    .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber: None }),
+            );
         }
+        self.told_bugs(build, t_ns, stdx::assert::reported::total(), stdx::assert::reported::sites);
         let written = self.write(build);
         // Written or not, the rows drained are this flush's: none goes to the next.
         self.read.clear();
         written
     }
 
-    /// Takes what the rings hold that is new since the last drain into the next flush, so a
-    /// ring that wraps between two flushes loses nothing ([`DRAIN`]).
-    pub fn drain(&mut self) {
-        flight::read(&mut self.cursor, &mut self.read);
+    /// The bugs the process reported and went on past (`stdx::assert::reported`), for the
+    /// flush of `build` at `t_ns`: the [`Plot::BlazeBugs`] counter, with each build's flush and
+    /// whenever it grew, and an `errors` row of kind `blaze-bug` for each site that reported
+    /// since the last flush, naming its value kind, its site and how many more times.
+    /// `total` and `sites` are `stdx::assert::reported`'s; `sites` is read only when `total`
+    /// grew.
+    fn told_bugs(
+        &mut self,
+        build: Option<u64>,
+        t_ns: i64,
+        total: u64,
+        sites: impl FnOnce() -> Vec<stdx::assert::reported::Site>,
+    ) {
+        let grew = total != self.bugs_told.0;
+        let build32 = build.and_then(|it| u32::try_from(it).ok()).unwrap_or(0);
+        if build.is_some() || grew {
+            self.read.counters.push(CounterRow { build: build32, plot: Plot::BlazeBugs, t_ns, value: total, fiber: None });
+        }
+        if !grew {
+            return;
+        }
+        self.bugs_told.0 = total;
+        for (at, site) in sites().into_iter().enumerate() {
+            if at == self.bugs_told.1.len() {
+                self.bugs_told.1.push(0);
+            }
+            let more = site.count - self.bugs_told.1[at];
+            if more == 0 {
+                continue;
+            }
+            self.bugs_told.1[at] = site.count;
+            let detail = match (&site.thread, &site.backtrace) {
+                // alloc: a row a site of a bug, once a flush it grew in
+                (thread, Some(stack)) => format!("first on thread `{}`:\n{stack}", thread.as_deref().unwrap_or("unnamed")),
+                // alloc: as above
+                (thread, None) => format!("first on thread `{}`", thread.as_deref().unwrap_or("unnamed")),
+            };
+            self.errors.push(ErrorRow {
+                build_id: build.unwrap_or(0),
+                t_ns: Some(t_ns),
+                krate: None,
+                unit: None,
+                // alloc: as above
+                kind: errors::Kind::BlazeBug.name().to_owned(),
+                // alloc: as above
+                function: Some(site.kind.to_owned()),
+                // alloc: as above
+                message: format!("a blaze bug: `{}` {}, {more} more time{}", site.kind, site.what, if more == 1 { "" } else { "s" }),
+                detail: Some(detail),
+                // alloc: as above
+                file: Some(site.at.file().to_owned()),
+                line: Some(site.at.line()),
+            });
+        }
+    }
+
+    /// A message each time the rows drained since the last flush pass [`FLUSH_ROWS`]: the
+    /// history's keeper flushes then, before [`EVERY`] is up.
+    pub fn full(&self) -> &Receiver<()> {
+        &self.full
     }
 
     /// [`History::flush`] of the rows drained.
     fn write(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
         let seq = self.seq;
         self.seq += 1;
+        let named = self.named_for(build);
         // The spans of `build` are given its commit; the rest (other builds', and none's) none.
         let commit = build
             .and_then(|build| self.ended.iter().find(|it| it.build_id == build))
@@ -617,7 +790,7 @@ impl History {
         ];
         let counters =
             [batches::counters(&self.read.counters, self.process).map_err(arrow_error(&schema::COUNTERS))?];
-        let builds = [builds(&self.ended).map_err(arrow_error(&schema::BUILDS))?];
+        let builds = [builds(&self.ended, self.process.pid).map_err(arrow_error(&schema::BUILDS))?];
         let errors = [errors::batch(&self.errors).map_err(arrow_error(&schema::ERRORS))?];
         let links = [facts::links(&self.links).map_err(arrow_error(&schema::LINKS))?];
         let crate_deps = [facts::crate_deps(&self.crate_deps).map_err(arrow_error(&schema::CRATE_DEPS))?];
@@ -627,10 +800,24 @@ impl History {
         let switches =
             [batches::switches(&self.read.switches, self.process).map_err(arrow_error(&schema::SWITCHES))?];
         let events = [batches::events(&self.read.events, self.process).map_err(arrow_error(&schema::EVENTS))?];
+        let folded = [batches::folded(&self.read.folds, self.process).map_err(arrow_error(&schema::FOLDED))?];
         self.samples.clear();
         let samples_skipped = sampler::since(&mut self.sampled, &mut self.samples);
         let samples = [self.samples_batch().map_err(arrow_error(&schema::SAMPLES))?];
         let rows = |parts: &[RecordBatch]| parts.iter().map(RecordBatch::num_rows).sum::<usize>();
+        // What every thread is inside, with each flush where that changed: the last reading is
+        // what a daemon that died was doing, which no `spans` row holds (they are written as
+        // they close), and a deadlocked one's stays its last. An idle daemon's flushes write none.
+        let now = flight::threads_now();
+        let open = match same_open(&now, &self.open_written) {
+            false => {
+                let batch = batches::open(&now, clock::mono_ns(), self.process).map_err(arrow_error(&schema::OPEN))?;
+                self.open_written = now;
+                batch
+            }
+            true => RecordBatch::new_empty(batches::schema_of(&schema::OPEN)),
+        };
+        let open = [open];
         let mut flushed = Flushed {
             seq,
             spans: rows(&spans),
@@ -644,12 +831,15 @@ impl History {
             crate_deps: rows(&crate_deps),
             query_counts: rows(&query_counts),
             misses: rows(&misses),
+            open: rows(&open),
+            folded: rows(&folded),
             skipped: self.read.skipped + samples_skipped,
             ..Flushed::default()
         };
-        let build = build.unwrap_or(0);
+        let build = named;
+        flushed.build = build;
         self.last_build = self.last_build.max(build);
-        let tables: [(&'static Table, &[RecordBatch]); 11] = [
+        let tables: [(&'static Table, &[RecordBatch]); 13] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
@@ -661,6 +851,8 @@ impl History {
             (&schema::CRATE_DEPS, &crate_deps),
             (&schema::QUERY_COUNTS, &query_counts),
             (&schema::MISSES, &misses),
+            (&schema::OPEN, &open),
+            (&schema::FOLDED, &folded),
         ];
         for (table, parts) in tables {
             if rows(parts) == 0 {
@@ -685,6 +877,24 @@ impl History {
             Some(error) => Err(error),
             None => Ok(flushed),
         }
+    }
+
+    /// The build a flush's files are named for: the highest build any of its rows is of, and
+    /// never below `build`, the build it is for. [`History::next_build`] numbers the next
+    /// daemon's builds past every name, so a build whose rows only a timer's flush wrote (its
+    /// daemon killed, or stopped on a stall, before its end was flushed) keeps its number. Until
+    /// 2026-11-03 a timer's flush was named 0, and four daemons in one home each numbered a
+    /// build 1, which `blaze slow` read as one build of 72 workers lasting 2296 s.
+    fn named_for(&self, build: Option<u64>) -> u64 {
+        let facts = [
+            self.ended.iter().map(|it| it.build_id).max(),
+            self.errors.iter().map(|it| it.build_id).max(),
+            self.links.iter().map(|it| it.build_id).max(),
+            self.crate_deps.iter().map(|it| it.build_id).max(),
+            self.query_counts.iter().map(|it| it.build_id).max(),
+            self.misses.iter().map(|it| it.build_id).max(),
+        ];
+        facts.into_iter().flatten().fold(build.unwrap_or(0).max(self.read.highest_build()), u64::max)
     }
 
     /// The flush's CPU samples as a `samples` batch, their frames named.
@@ -725,6 +935,92 @@ impl History {
             deleted += 1;
         }
         Ok(deleted)
+    }
+}
+
+impl Drop for History {
+    /// Ends the drain thread and waits for it: it holds no rows of its own past a drain.
+    fn drop(&mut self) {
+        if let Some((stop, drainer)) = self.drainer.take() {
+            drop(stop);
+            if drainer.join().is_err() {
+                tracing::error!(target: "blaze", "the profile history's drain thread (`blaze-drain`) of {} panicked", self.dir.display());
+            }
+        }
+    }
+}
+
+/// What the drain thread drained and the history has not flushed yet, and where it is in the
+/// rings: one reader, so the drain thread and a flush take turns under one lock, held for a
+/// read of the rings or a swap of the rows, never for a write.
+#[derive(Default)]
+struct Drained(Mutex<Draining>);
+
+#[derive(Default)]
+struct Draining {
+    cursor: Cursor,
+    read: Read,
+    /// Rows the rings wrote over before a read took them, since the history opened: with the
+    /// drain running (`late`, a thread outran [`DRAIN`]) and after a drain the backlog stopped
+    /// (`behind`, the recorder outran the writer).
+    late: u64,
+    behind: u64,
+    /// The last drain was stopped by a full backlog: what the next read finds written over is
+    /// the writer's.
+    stopped: bool,
+}
+
+impl Draining {
+    /// Reads what is new in the rings into `read`, counting what was written over by why.
+    fn read_now(&mut self) {
+        let before = self.read.skipped;
+        flight::read(&mut self.cursor, &mut self.read);
+        let skipped = self.read.skipped - before;
+        if std::mem::take(&mut self.stopped) {
+            self.behind += skipped;
+        } else {
+            self.late += skipped;
+        }
+    }
+}
+
+impl Drained {
+    /// Reads the rings up to now and swaps what was drained into `into` (which is clear):
+    /// the rows skipped so far, late and behind.
+    fn take(&self, into: &mut Read) -> (u64, u64) {
+        let mut at = self.0.lock();
+        at.read_now();
+        std::mem::swap(&mut at.read, into);
+        (at.late, at.behind)
+    }
+}
+
+/// The drain thread: a read of the rings every [`DRAIN`] until `stop` is dropped, telling
+/// `full` each time the rows not yet flushed pass [`FLUSH_ROWS`]. Past [`BACKLOG_ROWS`] it
+/// reads nothing until a flush takes them, and what the rings write over meanwhile is counted
+/// as behind.
+fn drain(drained: &Drained, stop: &Receiver<()>, full: &Sender<()>) {
+    // Each read is due a [`DRAIN`] after the last began, not after it ended: a read of busy
+    // rings takes a while, and the rings fill meanwhile.
+    let mut due = Instant::now() + DRAIN;
+    loop {
+        match stop.recv_deadline(due) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+        }
+        due = Instant::now() + DRAIN;
+        let _span = tracing::info_span!(target: "blaze", "profile drain").entered();
+        let mut at = drained.0.lock();
+        if at.read.rows() >= BACKLOG_ROWS {
+            at.stopped = true;
+        } else {
+            at.read_now();
+        }
+        let rows = at.read.rows();
+        drop(at);
+        if rows >= FLUSH_ROWS {
+            _ = full.try_send(());
+        }
     }
 }
 
@@ -853,7 +1149,7 @@ mod tests {
             })
             .collect();
         let counters = batches::counters(&counters, process).unwrap();
-        let builds = builds(&[row(1, Outcome::Ok), row(2, Outcome::Stalled)]).unwrap();
+        let builds = builds(&[row(1, Outcome::Ok), row(2, Outcome::Stalled)], 7).unwrap();
 
         let mut writer = Writer::new();
         for (table, batch) in [(&schema::SPANS, &spans), (&schema::COUNTERS, &counters), (&schema::BUILDS, &builds)] {
@@ -873,6 +1169,60 @@ mod tests {
         assert!(fs::read_dir(&dir).unwrap().all(|it| !it.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
     }
 
+    /// Each flush says the process's reported bugs: the counter with each build's flush and
+    /// whenever it grew, and a `blaze-bug` row for each site that reported since the last,
+    /// naming the value kind, the site and how many more times.
+    #[test]
+    fn a_flush_says_each_site_that_reported_a_bug_since_the_last() {
+        use stdx::assert::reported::Site;
+        let dir = scratch("bugs");
+        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        let at = std::panic::Location::caller();
+        let site = |count| Site {
+            kind: "AdtDef",
+            what: "formatted with no database attached",
+            at,
+            count,
+            thread: Some(Arc::from("driver")),
+            backtrace: None,
+        };
+        let said = |history: &mut History| {
+            let counters: Vec<(u32, u64)> = history
+                .read
+                .counters
+                .drain(..)
+                .filter(|it| it.plot == Plot::BlazeBugs)
+                .map(|it| (it.build, it.value))
+                .collect();
+            let errors: Vec<ErrorRow> = history.errors.drain(..).collect();
+            (counters, errors)
+        };
+        history.told_bugs(Some(3), 10, 0, Vec::new);
+        assert_eq!(said(&mut history), (vec![(3, 0)], Vec::new()), "a build's flush says 0");
+        history.told_bugs(None, 20, 2, || vec![site(2)]);
+        let (counters, errors) = said(&mut history);
+        assert_eq!(counters, [(0, 2)]);
+        let [row] = &errors[..] else { panic!("one row: {errors:?}") };
+        assert_eq!(
+            (row.kind.as_str(), row.function.as_deref(), row.message.as_str(), row.detail.as_deref()),
+            (
+                "blaze-bug",
+                Some("AdtDef"),
+                "a blaze bug: `AdtDef` formatted with no database attached, 2 more times",
+                Some("first on thread `driver`")
+            )
+        );
+        assert_eq!((row.file.as_deref(), row.line, row.t_ns), (Some(at.file()), Some(at.line()), Some(20)));
+        history.told_bugs(None, 30, 2, || panic!("the sites are read only when the total grew"));
+        assert_eq!(said(&mut history), (Vec::new(), Vec::new()), "a timer's flush with nothing new says nothing");
+        history.told_bugs(None, 40, 3, || vec![site(3)]);
+        let (counters, errors) = said(&mut history);
+        assert_eq!(counters, [(0, 3)]);
+        assert_eq!(errors.iter().map(|it| it.message.as_str()).collect::<Vec<_>>(), [
+            "a blaze bug: `AdtDef` formatted with no database attached, 1 more time"
+        ]);
+    }
+
     #[test]
     fn a_builds_row_names_the_tree_it_built_and_the_blaze_that_ran_it() {
         let dir = scratch("identity");
@@ -889,7 +1239,7 @@ mod tests {
             };
             history.build_ended(row);
             let flushed = history.flush(Some(build_id)).unwrap();
-            let read = read_back(&dir.join(format!("profile/{build_id}-{:08}.builds.parquet", flushed.seq)));
+            let read = read_back(&dir.join(format!("profile/{}-{:08}.builds.parquet", flushed.build, flushed.seq)));
             let string = |name: &str| {
                 read[0].column(schema::BUILDS.column(name).unwrap()).as_string::<i32>().value(0).to_owned()
             };
@@ -924,10 +1274,10 @@ mod tests {
         ]);
         let flushed = history.flush(Some(61)).unwrap();
         assert_eq!((flushed.links, flushed.crate_deps), (1, 2));
-        let links = read_back(&dir.join(format!("61-{:08}.links.parquet", flushed.seq)));
+        let links = read_back(&dir.join(format!("{}-{:08}.links.parquet", flushed.build, flushed.seq)));
         let image = links[0].column(schema::LINKS.column("image").unwrap()).as_string::<i32>().value(0);
         assert_eq!(image, "app (bin)");
-        let deps = read_back(&dir.join(format!("61-{:08}.crate_deps.parquet", flushed.seq)));
+        let deps = read_back(&dir.join(format!("{}-{:08}.crate_deps.parquet", flushed.build, flushed.seq)));
         assert_eq!(deps.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
 
         let again = history.flush(Some(62)).unwrap();
@@ -950,13 +1300,12 @@ mod tests {
             reran: 2,
             evicted_asked: 3,
             evicted: 4,
-            refused: 5,
-            dropped: 6,
+            dropped: 5,
         };
         history.query_counted([mir, QueryCountRow { query: "infer_body_query", executed: 7566, ..mir }]);
         let flushed = history.flush(Some(63)).unwrap();
         assert_eq!(flushed.query_counts, 2);
-        let read = read_back(&dir.join(format!("63-{:08}.query_counts.parquet", flushed.seq)));
+        let read = read_back(&dir.join(format!("{}-{:08}.query_counts.parquet", flushed.build, flushed.seq)));
         let batch = &read[0];
         let count = |name: &str, row: usize| {
             batch.column(schema::QUERY_COUNTS.column(name).unwrap()).as_primitive::<UInt64Type>().value(row)
@@ -965,9 +1314,9 @@ mod tests {
         let names = query.values().as_string::<i32>();
         assert_eq!(names.value(query.keys().value(1) as usize), "infer_body_query");
         assert_eq!(
-            ["build_id", "executed", "verified", "reran", "evicted_asked", "evicted", "refused", "dropped"]
+            ["build_id", "executed", "verified", "reran", "evicted_asked", "evicted", "dropped"]
                 .map(|it| count(it, 0)),
-            [63, 6384, 10, 2, 3, 4, 5, 6],
+            [63, 6384, 10, 2, 3, 4, 5],
             "each count in its own column"
         );
         assert_eq!(count("executed", 1), 7566);
@@ -996,7 +1345,7 @@ mod tests {
         history.build_ended(row(41, Outcome::Ok));
         let flushed = history.flush(Some(41)).unwrap();
         assert!(flushed.spans >= 1 && flushed.builds == 1 && flushed.files >= 2, "{flushed:?}");
-        let path = dir.join(format!("41-{:08}.spans.parquet", flushed.seq));
+        let path = dir.join(format!("{}-{:08}.spans.parquet", flushed.build, flushed.seq));
         let spans = read_back(&path);
         let found = spans.iter().any(|batch| {
             let names = batch.column(schema::SPANS.column("name").unwrap()).as_dictionary::<UInt32Type>();
@@ -1008,12 +1357,53 @@ mod tests {
             })
         });
         assert!(found, "the span is in the build's file, with the build's commit");
-        let builds = read_back(&dir.join(format!("41-{:08}.builds.parquet", flushed.seq)));
+        let builds = read_back(&dir.join(format!("{}-{:08}.builds.parquet", flushed.build, flushed.seq)));
         assert_eq!(builds[0].num_rows(), 1);
 
         let again = history.flush(None).unwrap();
         assert_eq!(again.builds, 0, "a build's row is written once");
         assert!(again.seq > flushed.seq);
+    }
+
+    /// A thread writes three rings' worth of rows between two flushes, a burst a drain: the
+    /// history's own drain thread reads them as they come, so the flush has every one and
+    /// skipped none of them (before 2026-11-02 the rings were read only by the loop that
+    /// flushed, and a self-build skipped 42 M rows while it flushed).
+    #[test]
+    fn rows_written_between_flushes_past_a_rings_size_are_all_flushed() {
+        crate::install();
+        let dir = scratch("drained");
+        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        let bursts = 24;
+        let burst = flight::CAP / 8;
+        let tid = std::thread::spawn(move || {
+            let _build = flight::building(43);
+            for _ in 0..bursts {
+                for _ in 0..burst {
+                    let _span = tracing::info_span!(target: "blaze", "history drained").entered();
+                }
+                std::thread::sleep(3 * DRAIN);
+            }
+            crate::sampler::os_tid() as u32
+        })
+        .join()
+        .unwrap();
+        history.build_ended(row(43, Outcome::Ok));
+        let flushed = history.flush(Some(43)).unwrap();
+        let spans = read_back(&dir.join(format!("{}-{:08}.spans.parquet", flushed.build, flushed.seq)));
+        let ours: usize = spans
+            .iter()
+            .map(|batch| {
+                let names = batch.column(schema::SPANS.column("name").unwrap()).as_dictionary::<UInt32Type>();
+                let threads = batch.column(schema::SPANS.column("thread").unwrap()).as_primitive::<UInt32Type>();
+                (0..batch.num_rows())
+                    .filter(|&row| {
+                        threads.value(row) == tid && names.values().as_string::<i32>().value(names.keys().value(row) as usize) == "history drained"
+                    })
+                    .count()
+            })
+            .sum();
+        assert_eq!(ours, bursts * burst, "{} rows written, {} rows a ring", bursts * burst, flight::CAP);
     }
 
     #[test]
@@ -1026,29 +1416,62 @@ mod tests {
         fs::write(dir.join(".1-00000099.spans.parquet.tmp"), b"half").unwrap();
         let mut history = History::open(&dir, CAP_BYTES).unwrap();
         assert!(!dir.join(".1-00000099.spans.parquet.tmp").exists(), "a half-written file is deleted");
-        assert_eq!(history.next_build(), 2, "a restarted daemon numbers its builds past the history's");
-        history.build_ended(row(2, Outcome::Ok));
-        let second = history.flush(Some(2)).unwrap();
+        // The first flush takes what the rings hold, other tests' builds' rows among them.
+        assert!(first.build >= 1, "{first:?}");
+        assert_eq!(u64::from(history.next_build()), first.build + 1, "a restarted daemon numbers its builds past the history's");
+        let next = u64::from(history.next_build());
+        history.build_ended(row(next, Outcome::Ok));
+        let second = history.flush(Some(next)).unwrap();
         assert!(second.seq > first.seq, "{first:?} then {second:?}");
-        assert!(dir.join(format!("1-{:08}.builds.parquet", first.seq)).exists());
-        assert!(dir.join(format!("2-{:08}.builds.parquet", second.seq)).exists());
+        assert!(dir.join(format!("{}-{:08}.builds.parquet", first.build, first.seq)).exists());
+        assert!(dir.join(format!("{}-{:08}.builds.parquet", second.build, second.seq)).exists());
+    }
+
+    /// Two daemons in one home, one after the other: the first is stopped while its build runs,
+    /// so only the timer's flush wrote that build's rows. The second numbers its builds past
+    /// it, so the two daemons' builds never share a number (before 2026-11-03 that flush was
+    /// named 0, the second daemon numbered its first build as the first's, and `blaze slow`
+    /// merged them into one build of both daemons' workers).
+    #[test]
+    fn a_build_only_a_timers_flush_wrote_is_numbered_past_by_the_next_daemon() {
+        crate::install();
+        // Past any build another test of this process writes rows of.
+        const KILLED: u32 = 7_000_001;
+        let dir = scratch("killed-mid-build");
+        let mut first = History::open(&dir, CAP_BYTES).unwrap();
+        std::thread::spawn(|| {
+            let _build = flight::building(KILLED);
+            let _span = tracing::info_span!(target: "blaze", "history killed mid-build").entered();
+        })
+        .join()
+        .unwrap();
+        let timer = first.flush(None).unwrap();
+        assert!(timer.spans >= 1, "{timer:?}");
+        assert!(timer.build >= u64::from(KILLED), "the timer's flush is named for the build its rows are of: {timer:?}");
+        drop(first);
+        let second = History::open(&dir, CAP_BYTES).unwrap();
+        assert!(
+            second.next_build() > KILLED,
+            "the next daemon's first build is {}, a number the stopped daemon's rows already hold",
+            second.next_build()
+        );
+        _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn past_the_cap_the_oldest_files_go_first() {
         let dir = scratch("cap");
         let mut history = History::open(&dir, 1).unwrap();
-        let mut seqs = Vec::new();
+        let mut flushes = Vec::new();
         for build in 1..=3 {
             history.build_ended(row(build, Outcome::Ok));
-            let flushed = history.flush(Some(build)).unwrap();
-            seqs.push(flushed.seq);
+            flushes.push(history.flush(Some(build)).unwrap());
         }
-        let name = |build: u64, seq: u64| dir.join(format!("{build}-{seq:08}.builds.parquet"));
-        assert!(!name(1, seqs[0]).exists() && !name(2, seqs[1]).exists(), "the older builds' files are deleted");
-        assert!(name(3, seqs[2]).exists(), "the newest flush's files stay, though they are past the cap alone");
+        let name = |it: &Flushed| dir.join(format!("{}-{:08}.builds.parquet", it.build, it.seq));
+        assert!(!name(&flushes[0]).exists() && !name(&flushes[1]).exists(), "the older builds' files are deleted");
+        assert!(name(&flushes[2]).exists(), "the newest flush's files stay, though they are past the cap alone");
         assert!(dir.join("schema.spans.parquet").exists(), "the schema files are not the cap's");
-        assert!(history.kept.iter().all(|it| it.seq == seqs[2]), "only the newest flush is kept");
+        assert!(history.kept.iter().all(|it| it.seq == flushes[2].seq), "only the newest flush is kept");
     }
 
     /// The flush's cost a span, in release: what docs/v2/plan/lanes/observe/history.md bounds.

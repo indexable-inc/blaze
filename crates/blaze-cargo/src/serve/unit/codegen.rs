@@ -824,9 +824,16 @@ pub(crate) fn frontend_over<'db>(
     mounted: &Arc<Mounted>,
     build_time: BuildTime,
 ) -> HirFrontend<'db> {
+    // A file of the view by the job's paths; one `include!` parses from outside every source
+    // root by its path outside, which a body lowered during the build may read first.
     let names = {
-        let (mounted, paths) = (Arc::clone(mounted), Arc::clone(paths));
-        move |file: base_db::FileId| -> Option<String> { paths.get(&file).map(|path| mounted.name(path)) }
+        let (mounted, paths, files) = (Arc::clone(mounted), Arc::clone(paths), db.shared_files());
+        move |file: base_db::FileId| -> Option<String> {
+            match paths.get(&file) {
+                Some(path) => Some(mounted.name(path)),
+                None => files.included_source_path(file).map(|path| mounted.name(path.as_str())),
+            }
+        }
     };
     HirFrontend::new(Databases::new(db), HashSource::Items(ItemHashes::new(Box::new(names))), build_time)
 }
@@ -1080,28 +1087,17 @@ fn refused(reader: &UnitReader, root: &str, errors: Vec<blaze_codegen::CodegenEr
 }
 
 /// The text of each file `diags` point into, by its name in them (relative to `root`), as the
-/// database has it: the text their spans were made against. A name the database has no file of
-/// is left out, for the mounts to read ([`Mounted::add_sources`]).
+/// database has it ([`UnitReader::files_named`]): the text their spans were made against. A name
+/// the database has no file of is left out, for the mounts to read ([`Mounted::add_sources`]).
 fn texts(reader: &UnitReader, root: &str, diags: &[blaze_diagnostics::Diag]) -> Vec<(String, String)> {
     if diags.is_empty() {
         return Vec::new(); // alloc: empty, allocates nothing
     }
     let db = reader.db();
     let names = blaze_diagnostics::emit::Sources::default().unread(diags);
-    let mut found: Vec<(&str, base_db::FileId)> = reader
-        .paths()
-        .iter()
-        .filter(|&(&file, _)| db.has_file_text(file))
-        .map(|(&file, path)| (blaze_diagnostics::Files::relative(path, root), file))
-        .filter(|(name, _)| names.contains(name))
-        .collect(); // alloc: the error path, the few files of a failed body's errors
-    // The first file of a name by ID, whatever order the map is in.
-    found.sort_by_key(|&(name, file)| (name, file.index()));
-    found.dedup_by(|a, b| a.0 == b.0);
-    found
-        .into_iter()
+    (reader.files_named(root, &names).into_iter())
         // alloc: the error path, a file's text, once per file of a failed body's errors
-        .map(|(name, file)| (name.to_owned(), db.file_text(file).text(db).to_string()))
+        .map(|(name, file)| (name, db.file_text(file).text(db).to_string()))
         .collect()
 }
 
@@ -1137,6 +1133,35 @@ impl Linked {
     /// ([`blaze_api::Response::Tables`]): `relocation` and the rest.
     pub(crate) fn tables(&self) -> Vec<(&'static str, u64, u64)> {
         self.image.tables()
+    }
+
+    /// The bytes it holds kept: the image's ([`Image::held`]) and its rows' by capacity. A dev
+    /// executable's code memory is its program's ([`super::run::inproc::DevRuns`]), which
+    /// outlives the image, and is not counted.
+    pub(crate) fn held(&self) -> u64 {
+        fn rows<T>(column: &Vec<T>) -> u64 {
+            (column.capacity() * size_of::<T>()) as u64
+        }
+        let names = self.names.iter().map(|it| it.capacity() as u64).sum::<u64>();
+        self.image.held()
+            + rows(&self.functions)
+            + rows(&self.statics)
+            + rows(&self.natives)
+            + rows(&self.names)
+            + names
+            + rows(&self.slotted)
+            + rows(&self.assumed)
+    }
+
+    /// Whether a run maps it now: a dev executable one of whose runs or test processes is
+    /// still attached to its code memory.
+    pub(crate) fn live(&self) -> bool {
+        self.loaded.as_ref().is_some_and(|it| it.running())
+    }
+
+    /// Kept idle until its next link: the image's stage scratch given back ([`Image::rest`]).
+    pub(crate) fn rest(&mut self) {
+        self.image.rest();
     }
 }
 
@@ -1399,8 +1424,11 @@ pub(crate) fn link(
     generated: &Generated<'_>,
     images: &mut Vec<KeptImage>,
 ) -> Result<LinkMade, LinkFailed> {
-    // alloc: error path
-    link_at(job, unit, krate, path, makes, generated, images).map_err(|cause| LinkFailed { image: path.to_owned(), cause })
+    // In a task of the link's tag, so the image and the staging a link keeps are named on the
+    // daemon's memory line.
+    blaze_mem::frame::task(blaze_mem::Tag::Link, |_| link_at(job, unit, krate, path, makes, generated, images))
+        // alloc: error path
+        .map_err(|cause| LinkFailed { image: path.to_owned(), cause })
 }
 
 fn link_at(

@@ -106,7 +106,9 @@ checker; another key; a call between the test and the lookup).
 
 ## Baseline
 
-A new lint starts with its count on blaze's tree recorded:
-`blaze check --new-baseline blaze::borrow_workaround,blaze::nll_workaround`, which writes
+A new lint starts with its count on blaze's tree recorded: `blaze check --workspace --target
+aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines --new-baseline
+blaze::borrow_workaround,blaze::nll_workaround` writes
 `crates/blaze-lints/baselines/blaze.borrow_workaround.txt` and `blaze.nll_workaround.txt`
-(`path<TAB>count`). They may only shrink.
+(`crate<TAB>count`), which may only shrink. Neither is made yet, as no baseline is
+([lints.md](../lints.md#baselines) says why).

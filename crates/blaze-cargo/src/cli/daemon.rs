@@ -118,7 +118,7 @@ impl std::fmt::Display for DaemonError {
             }
             DaemonError::Exited { socket, log, pid, phase, ended } => {
                 let how = match ended {
-                    Reaped::Code(code) => format!("with exit code {code}"), // alloc: an error's text
+                    Reaped::Code(code) => format!("with exit code {}", blaze_core::exit::said(*code)), // alloc: an error's text
                     Reaped::Signal(signal) => format!("by signal {signal}"), // alloc: as above
                 };
                 write!(
@@ -181,7 +181,19 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     let heard = heard(&ready, STARTING).context("waiting for the daemon it started to say it listens")?;
     match heard {
         Heard::Listening => match Client::unix(&socket) {
-            Ok(client) => Ok(Some(client)),
+            Ok(client) => {
+                // Why this daemon starts cold, said where the person who waits sees it: the
+                // daemon writes it to its log alone.
+                match tail(&log) {
+                    Ok(bytes) => {
+                        for said in start_said(&String::from_utf8_lossy(&bytes), pid) {
+                            eprintln!("blaze: the daemon it started (pid {pid}) {said}");
+                        }
+                    }
+                    Err(error) => eprintln!("blaze: how the daemon it started (pid {pid}) started is unread: {}: {error}", log.display()),
+                }
+                Ok(Some(client))
+            }
             Err(error) => Err(DaemonError::Connect { socket, error }.into()),
         },
         Heard::Ended { phase } => {
@@ -489,7 +501,14 @@ pub struct Died {
     pub ended: Option<(u32, Ended)>,
     /// The log's lines since that start that are not blank, the last [`TAIL`].
     pub said: Vec<String>,
+    /// What its threads were inside at its profile history's last reading of them
+    /// ([`blaze_profile::reading::last`]), for a daemon that is gone: `Ok(None)` where the
+    /// history holds none, the error where it could not be read.
+    pub inside: Result<Option<blaze_profile::reading::Reading>, String>,
 }
+
+/// How many threads of a dead daemon's last reading the CLI names.
+const INSIDE_THREADS: usize = 16;
 
 impl std::fmt::Display for Died {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -501,7 +520,7 @@ impl std::fmt::Display for Died {
                 blaze_core::signal::described(signal)
             )?,
             Some((pid, Ended::Reaped(Reaped::Code(code)))) => {
-                write!(f, "the daemon (`blaze serve`, pid {pid}) exited with code {code}")?;
+                write!(f, "the daemon (`blaze serve`, pid {pid}) exited with code {}", blaze_core::exit::said(code))?;
             }
             Some((pid, Ended::Gone)) => write!(f, "the daemon (`blaze serve`, pid {pid}) is gone")?,
             Some((pid, Ended::Running)) => {
@@ -518,11 +537,28 @@ impl std::fmt::Display for Died {
                      overflow ends it so)",
                 )?;
             }
+        } else {
+            write!(f, "; its log {} ends:", self.log.display())?;
+            for line in &self.said {
+                write!(f, "\n  {line}")?;
+            }
+        }
+        if matches!(self.ended, Some((_, Ended::Running)) | None) {
             return Ok(());
         }
-        write!(f, "; its log {} ends:", self.log.display())?;
-        for line in &self.said {
-            write!(f, "\n  {line}")?;
+        match &self.inside {
+            Ok(Some(reading)) => {
+                write!(f, "\nwhat its threads were inside at its profile's last reading of them (`blaze slow` reports its build):")?;
+                for thread in reading.threads.iter().take(INSIDE_THREADS) {
+                    write!(f, "\n  {}", blaze_profile::slow::thread_line(thread))?;
+                }
+                let more = reading.threads.len().saturating_sub(INSIDE_THREADS);
+                if more > 0 {
+                    write!(f, "\n  ({more} more threads)")?;
+                }
+            }
+            Ok(None) => f.write_str("\nits profile history holds no reading of what its threads were inside")?,
+            Err(why) => write!(f, "\nwhat its threads were inside is unread: {why}")?,
         }
         Ok(())
     }
@@ -552,23 +588,13 @@ fn listening_pid(line: &str) -> Option<u32> {
 /// since, and how its process ended, given [`ENDING`] to.
 #[cfg(all(unix, feature = "daemon"))]
 pub fn died() -> anyhow::Result<Died> {
-    use std::io::{Read as _, Seek as _};
-
     use anyhow::Context as _;
     let log = crate::serve::state()?.join("serve.log");
-    let read = |log: &Path| -> io::Result<Vec<u8>> {
-        let mut file = std::fs::File::open(log)?;
-        let len = file.metadata()?.len();
-        file.seek(io::SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))?;
-        let mut bytes = Vec::new(); // alloc: an error path, once a command
-        file.read_to_end(&mut bytes)?;
-        Ok(bytes)
-    };
     // alloc: an error path, once a command
-    let bytes = read(&log).with_context(|| format!("reading the end of the daemon's log {}", log.display()))?;
+    let bytes = tail(&log).with_context(|| format!("reading the end of the daemon's log {}", log.display()))?;
     let text = String::from_utf8_lossy(&bytes); // alloc: as above, where the log is not UTF-8
     let Some((pid, said)) = last_start(&text) else {
-        return Ok(Died { log, ended: None, said: Vec::new() }); // alloc: none, empty
+        return Ok(Died { log, ended: None, said: Vec::new(), inside: Ok(None) }); // alloc: none, empty
     };
     let said = said.into_iter().map(str::to_owned).collect(); // alloc: as above
     let ended = crate::raw::process::ended_within(pid, ENDING)
@@ -578,7 +604,41 @@ pub fn died() -> anyhow::Result<Died> {
         (true, None) => Ended::Gone,
         (false, None) => Ended::Running,
     };
-    Ok(Died { log, ended: Some((pid, ended)), said })
+    let inside = match ended {
+        Ended::Running => Ok(None),
+        _ => {
+            let history = blaze_profile::history::dir_in(&crate::serve::state()?);
+            blaze_profile::reading::last(&history, pid).map_err(|why| why.to_string())
+        }
+    };
+    Ok(Died { log, ended: Some((pid, ended)), said, inside })
+}
+
+/// The last [`TAIL_BYTES`] of the daemon's log.
+#[cfg(all(unix, feature = "daemon"))]
+fn tail(log: &Path) -> io::Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _};
+    let mut file = std::fs::File::open(log)?;
+    let len = file.metadata()?.len();
+    file.seek(io::SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))?;
+    let mut bytes = Vec::new(); // alloc: once a command
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// What the daemon `pid` said in `log` of how it started, before it listened: its lines after
+/// `blaze serve: ` that begin [`crate::serve::STARTED`] (why its warm state is gone, how the
+/// daemon before it ended).
+#[cfg(feature = "daemon")]
+pub fn start_said(log: &str, pid: u32) -> Vec<&str> {
+    // alloc: once a start
+    let lines: Vec<&str> = log.lines().collect();
+    let Some(at) = lines.iter().rposition(|line| listening_pid(line) == Some(pid)) else { return Vec::new() }; // alloc: none, empty
+    let from = lines[..at].iter().rposition(|line| listening_pid(line).is_some()).map_or(0, |it| it + 1);
+    lines[from..at]
+        .iter()
+        .filter_map(|line| line.strip_prefix("blaze serve: ").filter(|it| it.starts_with(crate::serve::STARTED)))
+        .collect()
 }
 
 #[cfg(all(not(unix), feature = "daemon"))]
@@ -632,7 +692,7 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
         err.write_all(super::say::error(&what, color).as_bytes())?;
     }
     if !ok {
-        return Ok(super::FAILED);
+        return Ok(super::Exit::Failed.code());
     }
     let socket = crate::serve::socket()?;
     // The daemon stops listening, says each step of its stop, then hangs up its connection
@@ -641,13 +701,13 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     if let Err(error) = client.until_hung_up(PATIENCE) {
         let what = format!("the daemon at {} was told to stop: {error}", socket.display());
         err.write_all(super::say::error(&what, color).as_bytes())?;
-        return Ok(super::FAILED);
+        return Ok(super::Exit::Failed.code());
     }
     #[cfg(unix)]
     if activation(&socket)? != Installed::Yes && answers(&socket)? {
         let what = format!("the daemon at {} was told to stop, hung up, and still answers", socket.display());
         err.write_all(super::say::error(&what, color).as_bytes())?;
-        return Ok(super::FAILED);
+        return Ok(super::Exit::Failed.code());
     }
     Ok(0)
 }
@@ -686,7 +746,7 @@ pub fn status(out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, color:
     if let Some(status) = status {
         out.write_all(status_lines(&status).as_bytes())?;
     }
-    Ok(if ok { 0 } else { super::FAILED })
+    Ok(if ok { 0 } else { super::Exit::Failed.code() })
 }
 
 /// `blaze daemon install`: a running daemon stopped, then the launchd agent or systemd units
@@ -778,6 +838,12 @@ pub fn status_lines(status: &Status) -> String {
     if let Some(why) = &status.history {
         lines.push_str(&format!("history: {why}\n"));
     }
+    // The bugs the daemon went on past, always said, so 0 is read as checked.
+    let bugs: u64 = status.bugs.iter().map(|it| it.count).sum();
+    lines.push_str(&format!("bugs: {bugs}\n"));
+    for bug in &status.bugs {
+        lines.push_str(&format!("  {bug}\n"));
+    }
     lines
 }
 
@@ -834,7 +900,8 @@ mod refusals {
             .to_string();
         assert!(
             said.contains(
-                "ended with exit code 101 while installing its store and the toolchain's proc macros, before it \
+                "ended with exit code 101 (FAILED: a build or test failed, or blaze met an error of its own) while \
+                 installing its store and the toolchain's proc macros, before it \
                  listened at /run/blaze/v2.sock"
             ),
             "{said}"
@@ -940,6 +1007,31 @@ mod refusals {
         assert_eq!((said.len(), said[0]), (TAIL, "line 5"));
     }
 
+    #[test]
+    fn a_start_says_why_it_is_cold_and_how_the_daemon_before_it_ended() {
+        let log = "blaze serve: started: an older start\n\
+            blaze serve: listening on /b/v2.sock (pid 41)\n\
+            blaze serve: pid 41 asked to stop by SIGTERM\n\
+            blaze serve: restored the daemon image x\n\
+            blaze serve: started: the database starts empty: there is no daemon image; the daemon before it on this state (pid 41) ended\n\
+            blaze serve: listening on /b/v2.sock (pid 42)\n";
+        assert_eq!(
+            start_said(log, 42),
+            ["started: the database starts empty: there is no daemon image; the daemon before it on this state (pid 41) ended"]
+        );
+        assert_eq!(start_said(log, 41), ["started: an older start"]);
+        assert!(start_said(log, 7).is_empty());
+    }
+
+    #[test]
+    fn a_lock_says_how_its_daemon_ended() {
+        use crate::serve::Before;
+        assert_eq!(Before::of("41 stopped"), Before::Stopped(41));
+        assert_eq!(Before::of("41\n"), Before::Ended(41));
+        assert_eq!(Before::of(""), Before::None);
+        assert!(Before::Ended(41).to_string().contains("(pid 41) ended without finishing its stop"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_daemon_that_died_says_how_and_quotes_its_log() {
@@ -947,7 +1039,7 @@ mod refusals {
         let log = PathBuf::from("/b/v2/serve.log");
         let (pid, said) = last_start(OVERFLOWED).unwrap();
         let said: Vec<String> = said.into_iter().map(str::to_owned).collect();
-        let died = Died { log: log.clone(), ended: Some((pid, Ended::Reaped(Reaped::Signal(libc::SIGABRT)))), said };
+        let died = Died { log: log.clone(), ended: Some((pid, Ended::Reaped(Reaped::Signal(libc::SIGABRT)))), said, inside: Ok(None) };
         let text = died.to_string();
         assert!(
             text.starts_with(&format!(
@@ -957,11 +1049,29 @@ mod refusals {
             )),
             "{text}"
         );
-        assert!(text.ends_with("\n  blaze serve: pid 4242 ended by signal 6, SIGABRT: process abort signal"), "{text}");
-        let killed = Died { log: log.clone(), ended: Some((7, Ended::Gone)), said: Vec::new() }.to_string();
+        assert!(
+            text.ends_with("\n  blaze serve: pid 4242 ended by signal 6, SIGABRT: process abort signal\nits profile history holds no reading of what its threads were inside"),
+            "{text}"
+        );
+        let inside = blaze_profile::reading::Reading {
+            read_ns: 0,
+            threads: vec![blaze_profile::slow::DiedThread {
+                thread: 9,
+                name: Some("blaze-work-3".to_owned()),
+                spans: vec![blaze_profile::slow::DiedSpan {
+                    name: "wait".to_owned(),
+                    function: None,
+                    awaits: Some("the macro server".to_owned()),
+                    owner: Some(12),
+                    for_ns: 3_000_000_000,
+                }],
+            }],
+        };
+        let killed = Died { log: log.clone(), ended: Some((7, Ended::Gone)), said: Vec::new(), inside: Ok(Some(inside)) }.to_string();
+        assert!(killed.contains("\n  blaze-work-3 (tid 9): wait, awaiting the macro server, run by task 12 (3.0 s)"), "{killed}");
         assert!(killed.starts_with("the daemon (`blaze serve`, pid 7) is gone; its log /b/v2/serve.log says nothing"), "{killed}");
         assert!(killed.contains("SIGKILL"), "{killed}");
-        let running = Died { log, ended: Some((7, Ended::Running)), said: Vec::new() }.to_string();
+        let running = Died { log, ended: Some((7, Ended::Running)), said: Vec::new(), inside: Ok(None) }.to_string();
         assert!(running.contains("still runs: it hung up on this request alone") && !running.contains("SIGKILL"), "{running}");
     }
 }

@@ -271,7 +271,7 @@ impl Files {
                     writer.views.insert(base.to_path_buf(), index);
                 }
             }
-            Ok(self.write_view(&mut writer, db, &view, plan?, frame))
+            Ok(self.write_view(&mut writer, db, &view, &plan?, frame))
         })
     }
 
@@ -377,7 +377,7 @@ impl Files {
         writer: &mut Writer,
         db: &mut Db,
         view: &ViewRoot<'_>,
-        plan: Plan<'_>,
+        plan: &Plan<'_>,
         frame: &Frame,
     ) -> ViewChange {
         let mut texts: Vec<Option<syntax::Text>, &Frame> =
@@ -450,7 +450,7 @@ impl Files {
         roots.extend(plan.added.iter().map(|it| it.1).chain(plan.removed.iter().map(|it| it.0)));
         sort_roots(&mut roots);
         roots.dedup();
-        self.write_root_files(writer, db, &plan, &roots, &mut changed_roots, frame);
+        self.write_root_files(writer, db, plan, &roots, &mut changed_roots, frame);
         let gone = plan.removed.iter().map(|&(_, id)| id);
         self.drop_orphan_aliases(writer, db, gone, |alias| removed.push(alias));
         self.write_root_contents(writer, db, &changed_roots, frame);

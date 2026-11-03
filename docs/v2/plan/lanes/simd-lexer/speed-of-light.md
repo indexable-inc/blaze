@@ -153,7 +153,11 @@ each identifier, `_` and strict keyword, of the name without `r#`. The bridge ha
   (keywords, comments and strings left out) that were not already among them and do not
   shadow a name `symbols.rs` binds. Interning one is that
   lookup, a compare of the bytes and `Symbol::from_index`, with no probe of the interner's
-  table. Any other name probes the table once under the hash it was handed.
+  table. Any other name probes the table once under the hash it was handed. (2026-11-03,
+  lane symhash: no longer. `name_hash` keys only the perfect hash now. The table places names
+  by SipHash-1-3 under its own keys, so a name that is not compiled in is hashed a second
+  time, about 15 ns for a 16-byte name. A fixed, invertible hash let a source make thousands
+  of names with one hash, which is review finding S5.)
 - **Tests.** `differential.rs` lexes every text the differential tests lex (the corpus, the
   parser's files, random and mutated texts) with `new_hashed` too: the tokens and errors are
   `new`'s, and each hash is `name_hash` of the name read back from the text. A warm hashed lex

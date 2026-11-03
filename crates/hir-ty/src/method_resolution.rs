@@ -265,7 +265,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     ) -> probe::PickResult<'db> {
         let hygiene = self.store.member_hygiene(call_expr);
         self.with_method_resolution(call_expr.into(), receiver.into(), |ctx| {
-            ctx.probe_for_written_name(method_name, hygiene, self_ty)
+            ctx.probe_for_written_name(Mode::MethodCall, method_name, hygiene, self_ty)
         })
     }
 
@@ -313,7 +313,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 /// We only want to treat opaque types as rigid if we need to eagerly choose
 /// between multiple candidates. We otherwise treat them as ordinary inference
 /// variable to avoid rejecting otherwise correct code.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(super) enum TreatNotYetDefinedOpaques {
     AsInfer,
     AsRigid,
@@ -465,12 +465,12 @@ pub fn lookup_impl_const<'db>(
     let trait_ref = TraitRef::new_from_args(interner, trait_id.into(), subs);
 
     let const_signature = ConstSignature::of(db, const_id);
-    let name = match const_signature.name.as_ref() {
-        Some(name) => name,
+    let name = match const_signature.name {
+        Some(name) => hir_def::nameres::assoc_item_binding_name(db, const_id.into(), name),
         None => return (const_id, subs),
     };
 
-    match lookup_impl_assoc_item_for_trait_ref(infcx, trait_ref, env, name) {
+    match lookup_impl_assoc_item_for_trait_ref(infcx, trait_ref, env, &name) {
         Ok((Either::Left(AssocItemId::ConstId(id)), s)) => (id, s),
         _ => (const_id, subs),
     }
@@ -566,9 +566,13 @@ pub(crate) fn lookup_impl_method_query<'db>(
         GenericArgs::new_from_slice(&fn_subst[..trait_params]),
     );
 
-    let name = &FunctionSignature::of(db, func).name;
+    let name = hir_def::nameres::assoc_item_binding_name(
+        db,
+        func.into(),
+        FunctionSignature::of(db, func).name,
+    );
     let (assoc, impl_subst) =
-        lookup_impl_assoc_item_for_trait_ref(&infcx, trait_ref, env.param_env, name)?;
+        lookup_impl_assoc_item_for_trait_ref(&infcx, trait_ref, env.param_env, &name)?;
     let impl_fn = match assoc {
         Either::Left(AssocItemId::FunctionId(id)) => Either::Left(id),
         Either::Right(it) => Either::Right(it),
@@ -581,6 +585,9 @@ pub(crate) fn lookup_impl_method_query<'db>(
     ))
 }
 
+/// The item that runs for the trait's item whose binding name is `name`
+/// ([`hir_def::nameres::assoc_item_binding_name`]) with `trait_ref`: the matching impl's item
+/// that implements it ([`impl_value_item`]), a specialized impl's, or the trait's default.
 fn lookup_impl_assoc_item_for_trait_ref<'db>(
     infcx: &InferCtxt<'db>,
     trait_ref: TraitRef<'db>,
@@ -595,6 +602,7 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
         AnyImplId::ImplId(it) => it,
         AnyImplId::BuiltinDeriveImplId(impl_) => {
             // A derive writes the methods it must; `PartialEq::ne` and the like are the trait's.
+            // Its traits are core's, whose items have no key.
             return match impl_.loc(infcx.interner.db).trait_.get_method(name.symbol()) {
                 Some(method) => Ok((Either::Right((impl_, method)), impl_subst)),
                 None => provided(infcx.interner.db, trait_ref, name),
@@ -637,9 +645,10 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
     Ok((Either::Left(item_of(parent).ok_or(NoImplMethod::NoItem)?), parent_args))
 }
 
-/// The trait's own item named `name`, with the trait ref's arguments, where it has a default:
-/// a provided method's body or an associated constant's value. What an impl that leaves the
-/// item out runs, `Write::write_fmt` of `Stderr`.
+/// The trait's own item whose binding name is `name`, with the trait ref's arguments, where it
+/// has a default:
+/// a provided method's body or an associated constant's value. What an impl that leaves the item
+/// out runs, `Write::write_fmt` of `Stderr`.
 fn provided<'db>(
     db: &'db Db,
     trait_ref: TraitRef<'db>,
@@ -661,20 +670,41 @@ fn provided<'db>(
     Ok((Either::Left(item), trait_ref.args))
 }
 
-/// The function or constant of `impl_` named `name`, the first if there are more: all that a
-/// lookup of `name` reads of the impl, so an item of another name added to it leaves the
-/// lookup as it was.
+/// The function or constant of the trait impl `impl_` that implements the trait's item whose
+/// binding name is `name` ([`hir_def::nameres::assoc_item_binding_name`]), the first if there
+/// are more: one of the same text whose name, adjusted to the trait's scope, is `name`
+/// ([`hir_def::nameres::implemented_name`], rustc's `check_trait_item`). So an impl a `macro`
+/// writes for a trait of a real file implements its items by text, and a trait a `macro` writes
+/// only by the items written with its own items' context. All that a lookup of `name` reads of
+/// the impl, so an item of another name added to it leaves the lookup as it was; the impl's
+/// trait is read only for an item that has a key.
 #[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn impl_value_item(db: &Db, impl_: ImplId, name: Name) -> Option<CandidateId> {
-    value_item_named(&impl_.impl_items(db).items, &name)
+    let text = name.unkeyed();
+    let mut trait_ = None;
+    impl_.impl_items(db).items.iter().find_map(|&(item_name, item)| {
+        let found = match item {
+            AssocItemId::FunctionId(it) => CandidateId::from(it),
+            AssocItemId::ConstId(it) => CandidateId::from(it),
+            AssocItemId::TypeAliasId(_) => return None,
+        };
+        if item_name.unkeyed() != text {
+            return None;
+        }
+        let of_impl = || {
+            *trait_.get_or_insert_with(|| db.impl_trait(impl_).map(|it| it.skip_binder().def_id.0))
+        };
+        let implemented = hir_def::nameres::implemented_name(db, of_impl, item, item_name)?;
+        (implemented == name).then_some(found)
+    })
 }
 
-/// The function or constant of the inherent impl `impl_` that a method call looks up as `name`
-/// (the name as written, [keyed](Name::keyed) for the impl's scope by
+/// The function or constant of the inherent impl `impl_` that a method call or a path (`T::f`)
+/// looks up as `name` (the name as written, [keyed](Name::keyed) for the impl's scope by
 /// [`hir_def::nameres::impl_item_name`]), the first if there are more: an item of the same text
 /// whose own key is the name's ([`hir_def::nameres::assoc_item_is`], rustc's
-/// `find_by_ident_and_namespace`), so a method a `macro` names is found only by the calls that
-/// expansion writes. As [`impl_value_item`] where no item and no call is keyed.
+/// `find_by_ident_and_namespace`), so an item a `macro` names is found only by the names that
+/// expansion writes. Plain name equality where no item and no name is keyed.
 #[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn inherent_value_item(db: &Db, impl_: ImplId, name: Name) -> Option<CandidateId> {
     impl_.impl_items(db).items.iter().find_map(|&(item_name, item)| match item {
@@ -688,35 +718,50 @@ pub fn inherent_value_item(db: &Db, impl_: ImplId, name: Name) -> Option<Candida
     })
 }
 
-/// As [`impl_value_item`], of a trait.
+/// The function or constant of `trait_` that `name` looks up (the name as written,
+/// [keyed](Name::keyed) for the trait's scope by [`hir_def::nameres::trait_item_name`]), the
+/// first if there are more: an item of the same text whose own key is the name's
+/// ([`hir_def::nameres::assoc_item_is`], rustc's `find_by_ident_and_namespace`), so a trait a
+/// `macro` writes may have methods `f` and `$f`, and each call finds the one its context names.
 #[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn trait_value_item(
     db: &Db,
     trait_: TraitId,
     name: Name,
 ) -> Option<CandidateId> {
-    value_item_named(&trait_.trait_items(db).items, &name)
+    trait_.trait_items(db).items.iter().find_map(|&(item_name, item)| match item {
+        AssocItemId::FunctionId(it) if hir_def::nameres::assoc_item_is(db, item_name, item, name) => {
+            Some(it.into())
+        }
+        AssocItemId::ConstId(it) if hir_def::nameres::assoc_item_is(db, item_name, item, name) => {
+            Some(it.into())
+        }
+        _ => None,
+    })
 }
 
 /// For every trait declared in a module of a frozen `krate` (not in a block), what
-/// [`trait_value_item`] answers for each name its items have, sorted by name and then trait.
-/// A maintained crate's are its candidate slices ([`delta::candidate_traits`]).
+/// [`trait_value_item`] answers for each name its items bind
+/// ([`hir_def::nameres::assoc_item_binding_name`], keyed as an item a `macro` names is), sorted
+/// by name and then trait. A maintained crate's are its candidate slices
+/// ([`delta::candidate_traits`]).
 #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 fn trait_value_items(db: &Db, krate: Crate) -> Box<[(Name, TraitId, CandidateId)]> {
     blaze_mem::frame::current(|frame| {
         // Each with where it was found: of a trait's items of one name the first stays first,
-        // as `value_item_named` takes it.
+        // as `trait_value_item` takes it.
         let mut items: Vec<(Name, TraitId, usize, CandidateId), &Frame> = Vec::new_in(frame);
         for (_, module) in crate_def_map(db, krate).modules(db) {
             for def in module.scope(db).declarations() {
                 let ModuleDefId::TraitId(trait_) = def else { continue };
-                for &(name, item) in trait_.trait_items(db).items.iter() {
-                    let item = match item {
+                for &(name, assoc) in trait_.trait_items(db).items.iter() {
+                    let item = match assoc {
                         AssocItemId::FunctionId(it) => CandidateId::from(it),
                         AssocItemId::ConstId(it) => CandidateId::from(it),
                         AssocItemId::TypeAliasId(_) => continue,
                     };
                     let at = items.len();
+                    let name = hir_def::nameres::assoc_item_binding_name(db, assoc, name);
                     items.push((name, trait_, at, item));
                 }
             }
@@ -728,10 +773,11 @@ fn trait_value_items(db: &Db, krate: Crate) -> Box<[(Name, TraitId, CandidateId)
     })
 }
 
-/// What [`trait_value_item`] answers for `name` for each trait declared in a module of `krate`
-/// (not in a block), sorted by trait: the traits of the name's candidate slice, so an item of
-/// another name added to a trait of `krate` leaves it as it was. A frozen crate's are the run
-/// of [`trait_value_items`] named `name`.
+/// What [`trait_value_item`] answers for `name` (a name as [`hir_def::nameres::trait_item_name`]
+/// gives it) for each trait declared in a module of `krate` (not in a block), sorted by trait:
+/// the traits of the candidate slice of its text, so an item of another name added to a trait of
+/// `krate` leaves it as it was. A frozen crate's are the run of [`trait_value_items`] named
+/// `name`.
 #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 pub fn in_crate_trait_value_items(
     db: &Db,
@@ -739,7 +785,7 @@ pub fn in_crate_trait_value_items(
     name: Name,
 ) -> Box<[(TraitId, CandidateId)]> {
     if !frozen::served(db, krate) {
-        let traits = delta::candidate_traits(db, krate, name);
+        let traits = delta::candidate_traits(db, krate, name.unkeyed());
         return traits
             .iter()
             .filter_map(|&trait_| Some((trait_, trait_value_item(db, trait_, name)?)))
@@ -754,11 +800,12 @@ pub fn in_crate_trait_value_items(
 }
 
 /// [`trait_value_item`] for each trait a probe asks of, through one
-/// [`in_crate_trait_value_items`] per crate and a binary search per trait. A trait in a block is
-/// asked of alone.
+/// [`in_crate_trait_value_items`] per crate and name and a binary search per trait. A trait in
+/// a block is asked of alone. A probe asks of one name, unless it is written with a context a
+/// `macro` gives: then of each trait's [`hir_def::nameres::trait_item_name`].
 #[derive(Debug)]
 pub struct TraitValueItems<'db, 'f> {
-    runs: Vec<(Crate, &'db [(TraitId, CandidateId)]), &'f Frame>,
+    runs: Vec<(Crate, Name, &'db [(TraitId, CandidateId)]), &'f Frame>,
 }
 
 impl<'db, 'f> TraitValueItems<'db, 'f> {
@@ -777,24 +824,16 @@ impl<'db, 'f> TraitValueItems<'db, 'f> {
             return trait_value_item(db, trait_, name);
         }
         let krate = module.krate(db);
-        let run = match self.runs.iter().find(|&&(it, _)| it == krate) {
-            Some(&(_, run)) => run,
+        let run = match self.runs.iter().find(|&&(it, of, _)| it == krate && of == name) {
+            Some(&(_, _, run)) => run,
             None => {
                 let run = in_crate_trait_value_items(db, krate, name);
-                self.runs.push((krate, run));
+                self.runs.push((krate, name, run));
                 run
             }
         };
         run.binary_search_by_key(&trait_, |&(it, _)| it).ok().map(|i| run[i].1)
     }
-}
-
-fn value_item_named(items: &[(Name, AssocItemId)], name: &Name) -> Option<CandidateId> {
-    items.iter().find_map(|(item_name, item)| match *item {
-        AssocItemId::FunctionId(it) if item_name == name => Some(it.into()),
-        AssocItemId::ConstId(it) if item_name == name => Some(it.into()),
-        _ => None,
-    })
 }
 
 /// Why a trait method's call names no impl's method ([`HirDatabase::lookup_impl_method_or_why`]):

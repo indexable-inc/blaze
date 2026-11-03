@@ -54,6 +54,7 @@ use std::{
 };
 
 use blaze_api::{Cargo, Request, ResponseRef, TestResult, Ub, ViewRef};
+use blaze_core::exit::Exit;
 
 use self::{
     args::{Asked, Command, Invocation},
@@ -62,11 +63,6 @@ use self::{
     print::{Printer, Shown},
     test::{Programs, Speaking},
 };
-
-/// cargo's code for a build or test that failed, and for any error of its own.
-pub const FAILED: i32 = 101;
-/// clap's code for a command line it refuses.
-pub const USAGE: i32 = 1;
 
 const HELP: &str = "\
 blaze: Rust's cargo, built by blaze's daemon
@@ -133,10 +129,14 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
         #[cfg(not(feature = "daemon"))]
         {
             eprint!("{}", say::error(&format!("blaze serve: {}", daemon::NO_DAEMON), auto_color()));
-            return ExitCode::from(101); // FAILED
+            return ended(Exit::Failed.code());
         }
     }
-    let code = command(words);
+    ended(command(words))
+}
+
+/// The process's end with `code`: as `main`'s `ExitCode` where it fits in one, else at once.
+fn ended(code: i32) -> ExitCode {
     match u8::try_from(code) {
         Ok(code) => ExitCode::from(code),
         Err(_) => std::process::exit(code),
@@ -163,14 +163,14 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Ok(asked) => asked,
         Err(usage) => {
             eprint!("{}", args::refusal(&usage, auto_color()));
-            return USAGE;
+            return Exit::Usage.code();
         }
     };
     let said = |result: anyhow::Result<i32>| match result {
         Ok(code) => code,
         Err(error) => {
             eprint!("{}", say::error(&format!("{error:#}"), auto_color()));
-            FAILED
+            Exit::Failed.code()
         }
     };
     match asked {
@@ -193,7 +193,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
                  explain, why, reach and slow"
             );
             eprint!("{}", say::error(&what, auto_color()));
-            FAILED
+            Exit::Failed.code()
         }
         Asked::Stop => said(daemon::stop(&mut io::stderr().lock(), auto_color())),
         Asked::Status => said(daemon::status(&mut io::stdout().lock(), &mut io::stderr().lock(), auto_color())),
@@ -204,7 +204,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
             }
             Err(what) => {
                 eprint!("{}", say::error(&what, auto_color()));
-                FAILED
+                Exit::Failed.code()
             }
         },
         Asked::Daemon(verb) => said(daemon::units(verb, &mut io::stderr().lock(), auto_color())),
@@ -223,7 +223,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
         ))),
         Asked::Perf(words) => perf::main(words, auto_color()),
         Asked::Clean(words) => clean::main(words, auto_color()),
-        Asked::Cache(words) => cache::main(words, auto_color()),
+        Asked::Cache(words) => cache::main(&words, auto_color()),
         Asked::Cargo(asked) => cargo(&asked),
     }
 }
@@ -288,7 +288,7 @@ fn cargo(asked: &Invocation) -> i32 {
     let started = Instant::now();
     let refused = |what: &str, color: bool| {
         eprint!("{}", say::error(what, color));
-        FAILED
+        Exit::Failed.code()
     };
     // cargo's `cli::main`, then `GlobalContext::configure`, before the shell has its color.
     if let Some(directory) = &asked.directory {
@@ -298,7 +298,7 @@ fn cargo(asked: &Invocation) -> i32 {
         }
         if let Err(error) = std::env::set_current_dir(directory) {
             eprint!("{}", run::caused("could not change to requested directory", &[error.to_string()], auto_color()));
-            return FAILED;
+            return Exit::Failed.code();
         }
     }
     if asked.flags.verbose > 0 && asked.flags.quiet {
@@ -371,7 +371,7 @@ fn cargo(asked: &Invocation) -> i32 {
     }
     if let Err(error) = closed {
         let _ = err.write_all(say::error(&format!("closing the connection to the build engine: {error}"), color).as_bytes());
-        return FAILED;
+        return Exit::Failed.code();
     }
     match then {
         Ok(Then::Exit(code)) => code,
@@ -393,16 +393,16 @@ fn cargo(asked: &Invocation) -> i32 {
                         let left = format!("{} suggestion(s) are not machine-applicable, or are outside the checkout", fixed.left);
                         let _ = err.write_all(say::status("Left", &left, color).as_bytes());
                     }
-                    if fixed.errors == 0 { 0 } else { FAILED }
+                    if fixed.errors == 0 { 0 } else { Exit::Failed.code() }
                 }
                 Err(what) => {
                     let _ = err.write_all(say::error(&what, color).as_bytes());
-                    FAILED
+                    Exit::Failed.code()
                 }
             }
         }
         // stdout or stderr closed under it: nothing more can be said.
-        Err(_) => FAILED,
+        Err(_) => Exit::Failed.code(),
     }
 }
 
@@ -420,7 +420,7 @@ fn replaced(place: &Place, pairs: &[String], color: bool) -> i32 {
         }
         Err(what) => {
             eprint!("{}", say::error(&what, color));
-            FAILED
+            Exit::Failed.code()
         }
     }
 }
@@ -506,7 +506,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
                 None => error.to_string(),
             };
             printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
-            return Ok(Then::Exit(FAILED));
+            return Ok(Then::Exit(Exit::Failed.code()));
         }
     };
     // The pages are written before cargo's `Finished`, and a page not written fails the command.
@@ -516,7 +516,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             Err(what) => {
                 printer.finish(false, started.elapsed())?;
                 printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
-                return Ok(Then::Exit(FAILED));
+                return Ok(Then::Exit(Exit::Failed.code()));
             }
         },
         _ => None,
@@ -529,21 +529,24 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     {
         return Ok(Then::Fix(found));
     }
-    // Under `--keep-going` the tests of every unit that built still run when another failed
+    // Unless `--fail-fast`, the tests of every unit that built still run when another failed
     // (each failure was said, naming its unit), and the run then fails.
-    let tests_past_failure = asked.flags.keep_going && matches!(asked.command(), Command::Test | Command::Bench);
+    let tests_past_failure = !asked.flags.fail_fast && matches!(asked.command(), Command::Test | Command::Bench);
     if !ok && !tests_past_failure {
-        return Ok(Then::Exit(FAILED));
+        return Ok(Then::Exit(Exit::Failed.code()));
     }
     let speaking =
         Speaking { cwd: &place.cwd, color: shown.color, quiet: shown.quiet, verbose: shown.verbose, json: shown.format.json() };
     let artifacts = printer.take_artifacts();
+    let unbuilt = printer.take_unbuilt();
     let members = printer.members();
     match asked.command() {
         Command::Build => Ok(Then::Exit(0)),
         Command::Check => {
             let (Some(counted), Some(dir)) = (counted, &asked.flags.baselines) else { return Ok(Then::Exit(0)) };
-            match counted.finish(&place.root, dir, asked.flags.bless_baselines, &asked.flags.new_baselines) {
+            // args.rs refuses `--baselines` without exactly one `--target`.
+            let target = asked.flags.targets.first().map_or("", String::as_str);
+            match counted.finish(&place.root, dir, target, asked.flags.bless_baselines, &asked.flags.new_baselines) {
                 Ok(said) => {
                     for line in said {
                         printer.err().write_all(say::status("Baseline", &line, shown.color).as_bytes())?;
@@ -552,7 +555,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
                 }
                 Err(what) => {
                     printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
-                    Ok(Then::Exit(FAILED))
+                    Ok(Then::Exit(Exit::Failed.code()))
                 }
             }
         }
@@ -578,18 +581,18 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
                 }
                 Err(what) => {
                     printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
-                    Ok(Then::Exit(FAILED))
+                    Ok(Then::Exit(Exit::Failed.code()))
                 }
             }
         }
         Command::Test | Command::Bench if in_daemon(asked) => {
             let (out, err) = printer.streams();
             let passed = test::reached(&results, speaking, out, err)?;
-            Ok(Then::Exit(if passed && ok { 0 } else { FAILED }))
+            Ok(Then::Exit(if passed && ok { 0 } else { Exit::Failed.code() }))
         }
         Command::Test | Command::Bench => {
-            let code = test::run(asked, &artifacts, members, speaking, printer.err(), programs)?;
-            Ok(Then::Exit(if ok { code } else { code.max(FAILED) }))
+            let code = test::run(asked, &artifacts, &unbuilt, members, speaking, printer.err(), programs)?;
+            Ok(Then::Exit(if ok { code } else { code.max(Exit::Failed.code()) }))
         }
     }
 }

@@ -46,10 +46,11 @@ anyhow.workspace = true
 # The host's target triple, which names the release archive a pin fetches (`versions.rs`).
 hir-ty-codegen.workspace = true
 blaze-graph.workspace = true
-mimalloc = { workspace = true, optional = true }
-# mimalloc on the huge pages `blaze-mem` chose (`huge.rs`).
+# mimalloc, a heap per blaze-mem tag (`heaps.rs`), on the huge pages `blaze-mem` chose (`huge.rs`).
 libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
 blaze-mem.workspace = true
+# Reported bugs leave the binary's exit status alone (`program.rs`): its daemon says them.
+stdx.workspace = true
 # `IX_PROF=<dir>` samples blaze itself (`program.rs`): the profile a build of blaze is laid out by
 # (docs/v2/plan/lanes/layout/layout.md).
 ix-prof = { workspace = true, features = ["sampler"] }
@@ -102,7 +103,7 @@ net = ["blaze-cargo/net", "blaze-registry/net"]
 # `blaze explore` (Flecs, wtransport on ring).
 explore = ["blaze-cargo/explore"]
 # mimalloc as the general allocator; without it, std's.
-mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys", "blaze-cargo/mimalloc"]
+mimalloc = ["dep:libmimalloc-sys", "blaze-cargo/mimalloc"]
 # `blaze test`'s live view on a terminal, through crossterm, which has no wasm32.
 tui = ["blaze-cargo/tui"]
 # `blaze serve` and the CLI's client of it; without it (the seed) each command builds in its own
@@ -115,6 +116,10 @@ pprof = ["blaze-cargo/pprof"]
 # network; rsasm as the assembler, which has no LLVM. Native builds keep the defaults above.
 seed = ["blaze-ids/wasm32-simd", "blaze-codegen-code/wasm32-simd", "hir-ty-codegen/rsasm"]
 
+# The global allocator's fast paths, in tasks and out (`benches/global_alloc.rs`).
+[[bench]]
+name = "global_alloc"
+harness = false
 
 [lints]
 workspace = true

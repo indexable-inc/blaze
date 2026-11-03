@@ -53,7 +53,7 @@ fn all(len: u64) -> [Span; 1] {
 /// The function-entry retag of an argument, with implicit writes `implicit_writes`.
 fn entry(s: &mut Sim, kind: PtrKind, freeze: bool, cells: &[Span], implicit_writes: bool, p: Ptr, len: u64) -> R<Ptr> {
     let new = NewPermission::new(kind, RetagMode::FnEntry, freeze, true, cells).with_implicit_writes(implicit_writes);
-    s.retag_with(p, new, len)
+    s.retag_with(p, &new, len)
 }
 
 /// The argument `&mut T`, `T: Freeze`.

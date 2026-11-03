@@ -45,6 +45,7 @@ use std::{
 
 use blaze_bytes::Bytes;
 use blaze_core::Mapping;
+use blaze_hash::SipKey;
 use blaze_ids::ContentId;
 use blaze_image::{Corrupt, Image, Section};
 use blaze_reclaim::{Guard, Limbo};
@@ -316,33 +317,23 @@ impl Entries<'_> {
     }
 }
 
-/// The hash a name is found by, in the tree's index of names and in the image's: FxHash's
-/// multiply and rotate over little-endian words, then the high bits folded down, since a
-/// place is the low bits. Fixed here, not taken from a crate, as the image keeps its places.
-pub(crate) fn name_hash(bytes: &[u8]) -> u64 {
-    const K: u64 = 0xf135_7aea_2e62_a9c5;
-    let mut hash = bytes.len() as u64;
-    let mut words = bytes.chunks_exact(8);
-    for word in &mut words {
-        let word = u64::from_le_bytes(word.try_into().expect("8 bytes"));
-        hash = (hash.rotate_left(26) ^ word).wrapping_mul(K);
-    }
-    let rest = words.remainder();
-    if !rest.is_empty() {
-        let mut word = [0; 8];
-        word[..rest.len()].copy_from_slice(rest);
-        hash = (hash.rotate_left(26) ^ u64::from_le_bytes(word)).wrapping_mul(K);
-    }
-    hash ^ (hash >> 32)
-}
+/// The domain of the key an image's index of names is laid out by ([`blaze_ids::index_key`]
+/// of its names in number order). The names are a checkout's file names, which whoever writes
+/// the repository picks, so no index of them is placed by a fixed hash: a hash anyone can
+/// compute lets them pick thousands of names with one hash, each then probing past all the
+/// others. The tree's own index of names after the base's ([`crate::tree::Tree`]) is keyed at
+/// random instead, as nothing persists it.
+pub(crate) const NAME_INDEX_KEY: &str = "blaze v2 vfs name index key";
 
 /// Every name, interned once: a span of one byte column each, after the base's.
 pub(crate) struct Names {
-    /// The base's spans, bytes and index of names (by [`name_hash`], a name plus one a place,
-    /// 0 empty): the image's, borrowed for as long as the table holding these names holds it.
+    /// The base's spans, bytes and index of names (a name plus one a place, 0 empty, placed by
+    /// [`SipKey::hash`] under `base_key`): the image's, borrowed for as long as the table
+    /// holding these names holds it.
     base_spans: &'static [[u32; 2]],
     base_bytes: &'static [u8],
     base_index: &'static [u32],
+    base_key: SipKey,
     spans: Column<Span>,
     bytes: Column<u8>,
 }
@@ -363,6 +354,7 @@ impl Names {
             base_spans: &[],
             base_bytes: &[],
             base_index: &[],
+            base_key: SipKey::new(0, 0),
             spans: Column::new(),
             bytes: Column::new(),
         }
@@ -401,12 +393,13 @@ impl Names {
         unsafe { std::str::from_utf8_unchecked(bytes) }
     }
 
-    /// The base's name whose bytes are `name` and whose [`name_hash`] is `hash`.
-    pub(crate) fn find_base(&self, hash: u64, name: &[u8]) -> Option<u32> {
+    /// The base's name whose bytes are `name`.
+    pub(crate) fn find_base(&self, name: &[u8]) -> Option<u32> {
         let places = self.base_index;
         let mask = places.len().checked_sub(1)?;
-        let mut at = hash as usize & mask;
+        let mut at = self.base_key.hash(name) as usize & mask;
         for _ in 0..places.len() {
+            crate::probes::count();
             match places[at] {
                 0 => return None,
                 plus_one if self.get(plus_one - 1) == name => return Some(plus_one - 1),
@@ -437,6 +430,7 @@ impl Names {
             base_spans: self.base_spans,
             base_bytes: self.base_bytes,
             base_index: self.base_index,
+            base_key: self.base_key,
             ..Names::new()
         };
         for at in 0..self.spans.len() {
@@ -485,7 +479,8 @@ impl Mapped {
 /// directory's entries are `[start, start + len)` of the entry columns, a file is `files[start]`
 /// (where its bytes are in the blobs section, and how many). `index` holds a node plus one at
 /// the place its ID's [`home`] probes to, linearly; `name_index` a name plus one by
-/// [`name_hash`]; both are a power of two long and at most half full.
+/// [`SipKey::hash`] under `name_key` (the image's [`NAME_INDEX_KEY`] of its names); both are a
+/// power of two long and at most half full.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Base<'a> {
     pub(crate) ids: &'a [ContentId],
@@ -498,6 +493,8 @@ pub(crate) struct Base<'a> {
     pub(crate) spans: &'a [[u32; 2]],
     pub(crate) name_bytes: &'a [u8],
     pub(crate) name_index: &'a [u32],
+    /// The two words of the [`SipKey`] `name_index` is placed by.
+    pub(crate) name_key: [u64; 2],
 }
 
 impl Base<'_> {
@@ -1075,6 +1072,7 @@ impl Writer {
             base_spans: base.spans,
             base_bytes: base.name_bytes,
             base_index: base.name_index,
+            base_key: SipKey::new(base.name_key[0], base.name_key[1]),
             ..Names::new()
         };
         let table = Table { base, names, mapped: Some(mapped), ..Table::new(0) };

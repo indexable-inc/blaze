@@ -212,13 +212,10 @@ struct Veneer {
 
 impl Veneer {
     const NONE: u64 = u64::MAX;
-    /// `adrp x16, 0; add x16, x16, 0; br x16`.
-    const CODE: [u32; 3] = [0x9000_0010, 0x9100_0210, 0xd61f_0200];
-    const LEN: u64 = 12;
+    /// The image's thunks' code ([`crate::thunk::CODE`]): one encoding for both.
+    const CODE: [u32; 3] = crate::thunk::CODE;
+    const LEN: u64 = crate::thunk::LEN;
 }
-
-/// How far an AArch64 `b` or `bl` reaches either way.
-const A64_BRANCH_REACH: i64 = 1 << 27;
 
 /// A relocation target, resolved once per target of a table.
 #[derive(Clone, Copy, Debug)]
@@ -625,7 +622,7 @@ impl Veneers<'_> {
             return Ok(None);
         };
         let to = ctx.s.wrapping_add(ctx.a as u64);
-        if (-A64_BRANCH_REACH..A64_BRANCH_REACH).contains(&(to.wrapping_sub(ctx.p) as i64)) {
+        if crate::thunk::reaches(ctx.p, to, crate::thunk::REACH) {
             return Ok(None);
         }
         match veneer.to {

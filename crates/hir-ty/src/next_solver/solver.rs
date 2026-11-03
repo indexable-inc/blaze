@@ -7,6 +7,7 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 use hir_def::{
     AssocItemId,
+    nameres::implements,
     signatures::{ConstSignature, TypeAliasSignature},
 };
 use rustc_next_trait_solver::{delegate::SolverDelegate, solve::SearchStorage};
@@ -589,7 +590,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
 
     fn fetch_eligible_assoc_item(
         &self,
-        _goal_trait_ref: rustc_type_ir::TraitRef<Self::Interner>,
+        goal_trait_ref: rustc_type_ir::TraitRef<Self::Interner>,
         trait_assoc_def_id: TraitAssocTermId,
         impl_id: AnyImplId,
     ) -> FetchEligibleAssocItemResponse<Self::Interner> {
@@ -599,12 +600,26 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         };
         let db = self.0.interner.db;
         let impl_items = impl_id.impl_items(db);
+        // rustc finds the impl's item whose `trait_item_def_id` is the trait's, which
+        // `check_trait_item` matched by hygienic name: `implements`.
+        let trait_ = goal_trait_ref.def_id.0;
         let id = match trait_assoc_def_id.0 {
             TermId::TypeAliasId(trait_assoc_id) => {
                 let trait_assoc_data = TypeAliasSignature::of(db, trait_assoc_id);
                 let type_of = |impl_id: hir_def::ImplId| {
-                    impl_id.impl_items(db).items.iter().find_map(|(name, id)| match *id {
-                        AssocItemId::TypeAliasId(id) if *name == trait_assoc_data.name => Some(id),
+                    impl_id.impl_items(db).items.iter().find_map(|&(name, id)| match id {
+                        AssocItemId::TypeAliasId(alias)
+                            if implements(
+                                db,
+                                trait_,
+                                id,
+                                name,
+                                trait_assoc_id.into(),
+                                trait_assoc_data.name,
+                            ) =>
+                        {
+                            Some(alias)
+                        }
                         _ => None,
                     })
                 };
@@ -634,11 +649,18 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                     .as_ref()
                     .expect("unnamed consts should not get passed to the solver");
                 let in_impl =
-                    impl_items.items.iter().find_map(|(impl_assoc_name, impl_assoc_id)| {
-                        if let AssocItemId::ConstId(impl_assoc_id) = *impl_assoc_id
-                            && impl_assoc_name == trait_assoc_name
+                    impl_items.items.iter().find_map(|&(impl_assoc_name, impl_assoc_id)| {
+                        if let AssocItemId::ConstId(impl_const) = impl_assoc_id
+                            && implements(
+                                db,
+                                trait_,
+                                impl_assoc_id,
+                                impl_assoc_name,
+                                trait_assoc_id.into(),
+                                *trait_assoc_name,
+                            )
                         {
-                            Some(impl_assoc_id)
+                            Some(impl_const)
                         } else {
                             None
                         }

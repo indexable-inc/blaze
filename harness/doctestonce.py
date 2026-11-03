@@ -6,7 +6,8 @@ where it runs and the variables as it does under rustdoc.
     BLAZE_BIN=../target/release/blaze-engine python3 doctestonce.py
 
 The steps: every example passes; an example of the first two libraries fails, and the run stops
-after the first; the same with `--no-fail-fast`; one of the first fails, with `--no-fail-fast`.
+after the first, under `--fail-fast`; the same by default and with `--no-fail-fast`, which
+run them all; one of the first fails, with `--no-fail-fast`.
 Each step is held to what its examples say (`STEPS`): the exit status, the libraries in turn
 (`Doc-tests` lines), how many examples of each passed and which items' examples failed, and the
 packages the run names as failed. Every example has to be blaze's (on macOS std's writable
@@ -52,10 +53,13 @@ WORKSPACE = {
 ALL_PASS = [("alpha", 3, []), ("beta", 2, []), ("gamma", 1, [])]
 # Each step: its name, the arguments, the variables, the exit status, each library run in turn
 # with how many of its examples pass and the items whose examples fail, and the packages named
-# as failed. Without `--no-fail-fast` the run stops after the first library that fails.
+# as failed. Under `--fail-fast` the run stops after the first library that fails; without it
+# (the default) every library runs, and `--no-fail-fast` is the same.
 STEPS = [
     ("every example passes", [], {}, 0, ALL_PASS, []),
-    ("examples fail", [], {"DOCTEST_FAIL": "1"}, 101, [("alpha", 2, ["double"])], ["alpha"]),
+    ("examples fail, --fail-fast", ["--fail-fast"], {"DOCTEST_FAIL": "1"}, 101, [("alpha", 2, ["double"])], ["alpha"]),
+    ("examples fail", [], {"DOCTEST_FAIL": "1"}, 101,
+     [("alpha", 2, ["double"]), ("beta", 1, ["quadruple"]), ("gamma", 1, [])], ["alpha", "beta"]),
     ("examples fail, --no-fail-fast", ["--no-fail-fast"], {"DOCTEST_FAIL": "1"}, 101,
      [("alpha", 2, ["double"]), ("beta", 1, ["quadruple"]), ("gamma", 1, [])], ["alpha", "beta"]),
     ("one fails, --no-fail-fast", ["--no-fail-fast"], {"DOCTEST_FAIL_FIRST": "1"}, 101,

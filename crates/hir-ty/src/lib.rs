@@ -132,7 +132,7 @@ pub use lower::{
         Batch, CrateFieldTypes, CrateImplPredicates, CrateImplSelfTys, CrateImplTraits, SideTable,
     },
     diagnostics::*,
-    elided_groups, elided_lifetimes, hir_mutability, lower_mutability,
+    elided_groups, elided_lifetimes, hir_mutability, hybrid_param_env, lower_mutability,
     persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
     predicate_sources, supertraits_cycle, with_elided_regions,
 };
@@ -478,8 +478,8 @@ unsafe impl<V> rustc_type_ir::GenericTypeVisitable<V> for MemoryPieces {
 }
 
 impl ComplexMemoryMap<'_> {
-    pub fn insert(&mut self, addr: usize, val: Box<[u8]>) {
-        self.memory.insert(addr, &val);
+    pub fn insert(&mut self, addr: usize, val: &[u8]) {
+        self.memory.insert(addr, val);
     }
 
     pub fn note_align(&mut self, addr: usize, align: usize) {
@@ -738,9 +738,9 @@ mod memory_map_tests {
     #[test]
     fn memory_at_finds_the_piece_at_an_address_or_the_lowest_holding_it() {
         let mut map = ComplexMemoryMap::default();
-        map.insert(104, Box::new([7u8; 4]));
-        map.insert(100, Box::new([6u8; 16]));
-        map.insert(200, Box::new([0u8; 0]));
+        map.insert(104, &[7u8; 4]);
+        map.insert(100, &[6u8; 16]);
+        map.insert(200, &[0u8; 0]);
         let map = MemoryMap::Complex(Box::new(map));
         assert_eq!(map.memory_at(104), Some((104, &[7; 4][..])));
         assert_eq!(map.memory_at(106), Some((100, &[6; 16][..])));
@@ -756,10 +756,10 @@ mod memory_map_tests {
     #[test]
     fn an_empty_piece_inside_memory_is_passed_over_for_that_memory() {
         let mut map = ComplexMemoryMap::default();
-        map.insert(100, Box::new([6u8; 3]));
-        map.insert(101, Box::new([0u8; 0]));
-        map.insert(103, Box::new([0u8; 0]));
-        map.insert(200, Box::new([0u8; 0]));
+        map.insert(100, &[6u8; 3]);
+        map.insert(101, &[0u8; 0]);
+        map.insert(103, &[0u8; 0]);
+        map.insert(200, &[0u8; 0]);
         let map = MemoryMap::Complex(Box::new(map));
         assert_eq!(map.memory_at(101), Some((101, &[][..])));
         assert_eq!(map.kept_around(101), Some((100, &[6; 3][..])));
@@ -771,14 +771,14 @@ mod memory_map_tests {
     #[test]
     fn alignments_are_kept_by_address_and_overwritten() {
         let mut map = ComplexMemoryMap::default();
-        map.insert(64, Box::new([0u8; 8]));
+        map.insert(64, &[0u8; 8]);
         map.note_align(64, 4);
         map.note_align(8, 2);
         map.note_align(64, 8);
         let mut other = ComplexMemoryMap::default();
         other.note_align(8, 2);
         other.note_align(64, 8);
-        other.insert(64, Box::new([0u8; 8]));
+        other.insert(64, &[0u8; 8]);
         let (map, other) = (MemoryMap::Complex(Box::new(map)), MemoryMap::Complex(Box::new(other)));
         assert_eq!(map.align_at(64), Some(8));
         assert_eq!(map.align_at(8), Some(2));

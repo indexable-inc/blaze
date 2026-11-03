@@ -100,7 +100,7 @@ impl Segment {
         match class {
             Class::Synthetic(DYNAMIC) => Segment::Relro,
             Class::Synthetic(_) | Class::Rodata | Class::EhFrame => Segment::Read,
-            Class::Text | Class::Patch | Class::Stubs | Class::Plt | Class::Veneers => Segment::Code,
+            Class::Text | Class::Patch | Class::Stubs | Class::Plt => Segment::Code,
             Class::RelRo | Class::PreinitArray | Class::InitArray | Class::FiniArray | Class::Got => Segment::Relro,
             Class::Table
             | Class::Data
@@ -172,7 +172,6 @@ fn order_key(class: &Class) -> (Segment, u32, &str) {
         (Segment::Code, Class::Patch) => 2,
         (Segment::Code, Class::Stubs) => 3,
         (Segment::Code, Class::Plt) => 4,
-        (Segment::Code, Class::Veneers) => 5,
         (Segment::Code, _) => 1,
 
         (Segment::Relro, Class::RelRo) => 0,

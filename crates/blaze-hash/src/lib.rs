@@ -18,22 +18,41 @@
 //!   entries are taken by value stays a locked [`HashMap`]. These name no allocator: papaya
 //!   takes none, and a shared table is long-lived (a daemon's, a view's), so the global heap is
 //!   its lifetime's allocator; `blaze::implicit_allocator` leaves them alone for that reason.
+//! - Keys an attacker may pick (a source's names and literals, a tree's file names, a path a
+//!   build script reads, a symbol's name) in a table that grows with them (an interner, an
+//!   index, a linker's symbols): [`SipKey`], SipHash-1-3 under a key drawn at random for a
+//!   table nothing persists ([`SipKey::random`], or a [`LazyKey`] for a table in a `static`),
+//!   or derived from the table's content with BLAKE3 for one an image lays out
+//!   (`blaze_ids::index_key`). A byte string is [`SipKey::hash`]ed; any other value through its
+//!   `Hash` by [`SipHasher`] ([`SipKey::hash_one`], or `SipKey` as a table's `BuildHasher`). A
+//!   fixed-seed hash there lets whoever picks the keys pick many with one hash, and each insert
+//!   then walks them all (HashDoS): foldhash's fixed seed is public, and a word that cancels a
+//!   seed word zeroes its multiply, whatever the rest. foldhash under a key drawn at run time
+//!   is no cheaper than SipHash, as the fixed seed's lead is LLVM folding it into the code
+//!   (`interning_cost` in hir-ty, 2026-11-03). So the hottest of these tables (hir-ty's
+//!   interned kinds, the watcher's names) are [`adaptive`]: the fixed hash until a lookup walks
+//!   a run no honest set of keys makes, then SipHash under a key drawn then, for good.
 //! - Hashes that are persisted or compared across runs are BLAKE3, never these: a content ID
 //!   is `blaze_ids::Hasher`, and a value's `Hash` is fed to it through [`Blake3Hasher`]. This
 //!   crate depends on nothing of blaze's, so every crate can use it.
 
 #![feature(allocator_api)]
+#![cfg_attr(test, feature(hashmap_internals))]
+#![cfg_attr(test, allow(internal_features, reason = "std's SipHasher13, the reference `sip`'s tests check against"))]
 
 use std::hash::{BuildHasher, Hasher};
 
+pub mod adaptive;
 mod blake3;
 mod key;
+mod sip;
 pub mod table;
 #[cfg(test)]
 mod tests;
 
 pub use blake3::{Blake3, Blake3Hasher};
 pub use key::{BuildKeyHasher, ByHash, ByHashSet, KeyHasher};
+pub use sip::{LazyKey, SipHasher, SipKey};
 pub use table::{Map, Set};
 
 /// The entry and iterator types of [`HashMap`] and [`ByHash`]: hashbrown's

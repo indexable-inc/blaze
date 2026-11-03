@@ -435,7 +435,7 @@ fn a_path_is_placed_once_every_effect_placing_it_has_ended() {
 
 #[test]
 fn an_output_path_is_interned_once_and_found_among_its_units_outputs() {
-    let mut paths = Paths::<Real>::new();
+    let mut paths = Paths::<Real>::new(u64::MAX);
     let a = paths.intern("/w/target/debug/a");
     let b = paths.intern("/w/target/debug/b");
     assert_eq!(paths.intern("/w/target/debug/a"), a);
@@ -445,6 +445,36 @@ fn an_output_path_is_interned_once_and_found_among_its_units_outputs() {
     let c = paths.find(&[b], "/w/target/debug/c");
     assert_eq!(&*paths.names[c as usize], "/w/target/debug/c");
     assert!(paths.take_images(&[a, b, c]).is_empty());
+}
+
+/// memcap3 review K1: a link takes its images before the eviction that the images of compiles
+/// that gave way (put back first) may call for, so the budget never lets go of the image the
+/// link is about to patch. Path `a` is the least recently linked, so an eviction that ran
+/// before the take would let it go first and the link would find none kept.
+#[test]
+fn a_link_takes_its_kept_image_before_the_budget_evicts() {
+    use crate::serve::tests::{Fake, FakeImage};
+    let image = |path: &str, held: u64| Image::<Fake> { path: path.into(), kept: FakeImage { held, live: false } };
+    let mut paths = Paths::<Fake>::new(u64::MAX);
+    paths.keep_one(&[], image("/w/target/debug/a", 60), true);
+    paths.keep_one(&[], image("/w/target/debug/b", 30), true);
+    paths.keep_one(&[], image("/w/target/debug/c", 40), true);
+    let [a, b, c] = ["a", "b", "c"].map(|it| paths.intern(&format!("/w/target/debug/{it}")));
+    // A compile takes `c` and gives way: its image comes back through `back`, as it was taken.
+    let taken = paths.take_images_under(&[c], 50);
+    assert_eq!(taken.len(), 1);
+    for image in taken {
+        paths.back.push(image);
+    }
+    assert_eq!(paths.weights.held(), 90);
+    // The link of `a`: `c` is kept again (130 held), `a` taken (70), then past 50 `b` goes,
+    // the least recently linked left.
+    let got = paths.take_images_under(&[a], 50);
+    let got: Vec<&str> = got.iter().map(|it| it.path.as_str()).collect(); // alloc: a test's one
+    assert_eq!(got, ["/w/target/debug/a"], "the link gets the image it patches");
+    assert!(paths.images[b as usize].is_none(), "past the budget, the least recently linked image left is let go");
+    assert!(paths.images[c as usize].is_some(), "the rest fit");
+    assert_eq!((paths.kept, paths.weights.held()), (1, 40));
 }
 
 /// A job that ends while its request is open cancels it when not ok and closes it when ok

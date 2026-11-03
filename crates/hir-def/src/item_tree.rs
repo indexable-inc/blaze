@@ -919,8 +919,10 @@ impl FieldsShape {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RawVisibility {
     /// `pub(in module)`, `pub(crate)` or `pub(super)`. Also private, which is
-    /// equivalent to `pub(self)`.
-    Module(ModPath, VisibilityExplicitness),
+    /// equivalent to `pub(self)`. The context is the path's first token's, normalized to macros
+    /// 2.0, which def-site hygiene starts the path by (`nameres::def_site`); a root context in a
+    /// real file.
+    Module(ModPath, VisibilityExplicitness, SyntaxContext),
     /// `pub(self)`.
     PubSelf(VisibilityExplicitness),
     /// `pub(crate)`.

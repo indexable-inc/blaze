@@ -1,7 +1,8 @@
-diff -ruN a/src/infer_ctxt.rs b/src/infer_ctxt.rs
+diff --git a/src/infer_ctxt.rs b/src/infer_ctxt.rs
+index d6d4d27..3b748b1 100644
 --- a/src/infer_ctxt.rs
 +++ b/src/infer_ctxt.rs
-@@ -556,6 +556,15 @@
+@@ -556,6 +556,15 @@ pub trait InferCtxtLike: Sized {
          &self,
          prev_entries: Self::OpaqueTypeStorageEntries,
      ) -> Vec<(ty::OpaqueTypeKey<Self::Interner>, <Self::Interner as Interner>::Ty)>;
@@ -17,10 +18,11 @@ diff -ruN a/src/infer_ctxt.rs b/src/infer_ctxt.rs
      fn opaques_with_sub_unified_hidden_type(
          &self,
          ty: TyVid,
-diff -ruN a/src/interner.rs b/src/interner.rs
+diff --git a/src/interner.rs b/src/interner.rs
+index 942f822..5d29585 100644
 --- a/src/interner.rs
 +++ b/src/interner.rs
-@@ -161,6 +161,15 @@
+@@ -161,6 +161,15 @@ pub trait Interner:
          data: ExternalConstraintsData<Self>,
      ) -> Self::ExternalConstraints;
  
@@ -36,7 +38,8 @@ diff -ruN a/src/interner.rs b/src/interner.rs
      type DepNodeIndex;
      type Tracked<T: Debug + Clone>: Debug;
      fn mk_tracked<T: Debug + Clone>(
-diff -ruN a/src/lib.rs b/src/lib.rs
+diff --git a/src/lib.rs b/src/lib.rs
+index 35b8f23..3ed78b0 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -41,6 +41,10 @@
@@ -50,7 +53,8 @@ diff -ruN a/src/lib.rs b/src/lib.rs
  use std::fmt;
  use std::hash::Hash;
  
-diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
+diff --git a/src/search_graph/mod.rs b/src/search_graph/mod.rs
+index 78a6bbe..c4ec589 100644
 --- a/src/search_graph/mod.rs
 +++ b/src/search_graph/mod.rs
 @@ -13,17 +13,17 @@
@@ -73,7 +77,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
  use tracing::{debug, instrument, trace};
  
  mod stack;
-@@ -76,6 +76,8 @@
+@@ -76,6 +76,8 @@ pub enum CacheScope {
  
  pub trait Delegate: Sized {
      type Cx: Cx;
@@ -82,7 +86,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
      /// Whether to use the provisional cache. Set to `false` by a fuzzer when
      /// validating the search graph.
      const ENABLE_PROVISIONAL_CACHE: bool;
-@@ -252,26 +254,29 @@
+@@ -252,26 +254,29 @@ impl HeadUsages {
  
  #[derive(Debug, Default)]
  pub struct CandidateHeadUsages {
@@ -129,7 +133,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
          }
      }
  }
-@@ -355,13 +360,14 @@
+@@ -355,13 +360,14 @@ struct CycleHead {
      usages: HeadUsages,
  }
  
@@ -146,7 +150,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
  }
  
  impl CycleHeads {
-@@ -370,7 +376,7 @@
+@@ -370,7 +376,7 @@ impl CycleHeads {
      }
  
      fn highest_cycle_head(&self) -> (StackDepth, CycleHead) {
@@ -155,7 +159,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
      }
  
      fn highest_cycle_head_index(&self) -> StackDepth {
-@@ -378,16 +384,15 @@
+@@ -378,16 +384,15 @@ impl CycleHeads {
      }
  
      fn opt_highest_cycle_head_index(&self) -> Option<StackDepth> {
@@ -175,7 +179,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
      }
  
      fn insert(
-@@ -396,24 +401,26 @@
+@@ -396,24 +401,26 @@ impl CycleHeads {
          path_from_entry: impl Into<PathsToNested> + Copy,
          usages: HeadUsages,
      ) {
@@ -210,7 +214,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
      }
  }
  
-@@ -643,10 +650,52 @@
+@@ -643,10 +650,52 @@ pub struct SearchGraph<D: Delegate<Cx = X>, X: Cx = <D as Delegate>::Cx> {
      /// global cache and track them locally instead. A provisional cache entry
      /// is only valid until the result of one of its cycle heads changes.
      provisional_cache: HashMap<X::Input, Vec<ProvisionalCacheEntry<X>>>,
@@ -263,7 +267,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
  /// While [`SearchGraph::update_parent_goal`] can be mostly shared between
  /// ordinary nested goals/global cache hits and provisional cache hits,
  /// using the provisional cache should not add any nested goals.
-@@ -664,14 +713,45 @@
+@@ -664,14 +713,45 @@ enum UpdateParentGoalCtxt<'a, X: Cx> {
  
  impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
      pub fn new(root_depth: usize) -> SearchGraph<D> {
@@ -311,7 +315,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
      /// Lazily update the stack entry for the parent goal.
      /// This behavior is shared between actually evaluating goals
      /// and using existing global cache entries to make sure they
-@@ -691,12 +771,7 @@
+@@ -691,12 +771,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
  
              for (head_index, head) in heads {
                  if let Some(candidate_usages) = &mut parent.candidate_usages {
@@ -325,7 +329,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
                  }
                  match head_index.cmp(&parent_index) {
                      Ordering::Less => parent.heads.insert(
-@@ -772,17 +847,17 @@
+@@ -772,17 +847,17 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
      }
  
      pub fn ignore_candidate_head_usages(&mut self, usages: CandidateHeadUsages) {
@@ -354,7 +358,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
              }
          }
      }
-@@ -925,7 +1000,11 @@
+@@ -925,7 +1000,11 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
              }
          } else if D::ENABLE_PROVISIONAL_CACHE {
              debug_assert!(validate_cache.is_none(), "unexpected non-root: {input:?}");
@@ -367,7 +371,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
              let EvaluationResult {
                  encountered_overflow,
                  required_depth: _,
-@@ -976,13 +1055,18 @@
+@@ -976,13 +1055,18 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
          let rerun_index = self.stack.next_index();
          // Each cached entry is filtered independently based on whether it depends on
          // `rerun_index`, so bucket traversal order does not matter.
@@ -387,7 +391,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
          });
      }
  }
-@@ -1032,6 +1116,7 @@
+@@ -1032,6 +1116,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
          rebase_reason: RebaseReason<X>,
      ) {
          let popped_head_index = self.stack.next_index();
@@ -395,7 +399,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
          // Rebasing decisions depend only on each provisional entry and the current stack state,
          // so traversing the cache in hash order cannot change the final cache contents.
          #[allow(rustc::potential_query_instability)]
-@@ -1143,7 +1228,11 @@
+@@ -1143,7 +1228,11 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
  
                  true
              });
@@ -408,12 +412,10 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
          });
      }
  
-@@ -1515,5 +1604,218 @@
-         debug!(?evaluation_result, "insert global cache");
-         let scope = cx.cache_scope(&dep_node);
+@@ -1517,3 +1606,216 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
          cx.with_global_cache(scope, |cache| cache.insert(cx, input, evaluation_result, dep_node))
-+    }
-+}
+     }
+ }
 +
 +#[cfg(test)]
 +mod tests {
@@ -625,12 +627,13 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
 +            assert_eq!(solve(&mut graph, 4), 0);
 +        });
 +        assert!(graph.is_empty());
-     }
- }
-diff -ruN a/src/search_graph/stack.rs b/src/search_graph/stack.rs
++    }
++}
+diff --git a/src/search_graph/stack.rs b/src/search_graph/stack.rs
+index 5a93b94..576a7ea 100644
 --- a/src/search_graph/stack.rs
 +++ b/src/search_graph/stack.rs
-@@ -85,6 +85,14 @@
+@@ -85,6 +85,14 @@ impl<X: Cx> Stack<X> {
          self.entries.len()
      }
  

@@ -34,6 +34,7 @@
 
 #![forbid(unsafe_code)]
 
+mod kept;
 mod slab;
 #[cfg(test)]
 mod tests;
@@ -48,6 +49,9 @@ thread_local! {
     pub(super) static HELD_RUNS: std::cell::RefCell<Vec<NodeId>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
     /// Each held run [`end_held_runs`] ended, and the reason it gave the plane.
     pub(super) static ENDED_HELD: std::cell::RefCell<Vec<(NodeId, String)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+    /// Of each job's tests or run as it starts ([`Jobs::release_runs`]), how many of its job's
+    /// placements were still in flight: none, or the program it runs may not be there yet.
+    pub(super) static RUNS_STARTED_PLACING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
     /// Each unit whose task or build script run a broken write refused ([`Refused`]), and the
     /// reason it gave the plane: what a test sees of a refused dependent, which no response
     /// says on its own.
@@ -65,7 +69,7 @@ use std::{
 use blaze_api::{
     ApiError, Artifact, ArtifactKind, Behind, Diagnostic, Edit, FetchVerb, Level, LinkKind, Mismatch,
     OpenFailure, Response, ServedCrate, ServedPart, Targets, TestOutcome, TestResult, Traced, Ub,
-    Unchecked, UnitOf, UnitStarted, Verb, Worked,
+    Unbuilt, Unchecked, UnitOf, UnitStarted, Verb, Worked,
     build::{Builder, JobId, Opened, Work},
 };
 use blaze_cas::{Placed, Store};
@@ -878,10 +882,17 @@ struct Paths<S: Steps> {
     /// file is still so is not placed again.
     placed: Vec<Option<Placement>>,
     /// The image kept linked there: moved into the compile that relinks it and back once it
-    /// ends ([`Image`]).
+    /// ends ([`Image`]), unless the kept images' budget lets it go ([`kept`]).
     images: Vec<Option<Image<S>>>,
     /// How many of `images` are some.
     kept: u32,
+    /// What each of `images` weighs and when it was linked, for the budget.
+    weights: kept::KeptImages,
+    /// The memory the kept images' budget is a part of when the daemon was given no limit
+    /// ([`blaze_graph::admission::limit`] is `u64::MAX`): the machine's, read once as the
+    /// daemon reads its own ([`blaze_graph::arena::machine_budget`]); else the limit as the
+    /// jobs were made, which [`Paths::budget`] reads again at each keep.
+    machine: u64,
     /// The images a unit links beside its planned outputs (a library's doctests, each its own
     /// program, under its runner's `.doctests` directory), by the unit's first output: taken
     /// with that output's, so an edit relinks the one example it changed.
@@ -892,7 +903,7 @@ struct Paths<S: Steps> {
 }
 
 impl<S: Steps> Paths<S> {
-    fn new() -> Paths<S> {
+    fn new(machine: u64) -> Paths<S> {
         Paths {
             ids: HashMap::new_in(Global),
             names: Vec::new(),  // alloc: none until the first path
@@ -900,9 +911,22 @@ impl<S: Steps> Paths<S> {
             placed: Vec::new(), // alloc: none until the first path
             images: Vec::new(), // alloc: none until the first path
             kept: 0,
+            weights: kept::KeptImages::new(),
+            machine,
             extras: HashMap::new_in(Global),
             back: Arc::new(SegQueue::new()), // alloc: once for the daemon's life
         }
+    }
+
+    /// What the kept images may hold together: [`kept::budget`] of the limit the daemon runs
+    /// under, or of the machine's memory when it was given no limit. Read at each keep, so it
+    /// follows the limit as [`blaze_graph::admission::set_budgets`] last set it.
+    fn budget(&self) -> u64 {
+        let limit = match blaze_graph::admission::limit() {
+            u64::MAX => self.machine,
+            limit => limit,
+        };
+        kept::budget(limit)
     }
 
     fn intern(&mut self, path: &str) -> u32 {
@@ -916,6 +940,7 @@ impl<S: Steps> Paths<S> {
         self.files.push(FileName::new(path.trim_start_matches('/')));
         self.placed.push(None);
         self.images.push(None);
+        self.weights.path();
         id
     }
 
@@ -938,34 +963,63 @@ impl<S: Steps> Paths<S> {
         Outputs { units: units.clone(), starts, ids } // clone: a refcount, once per new units
     }
 
-    /// The images kept at `ids`, moved out for a compile.
+    /// The images kept at `ids`, moved out for a compile. A path whose image the budget let go is said here, as its link is posted: that link
+    /// finds none kept and lays the image out whole ([`super::work::Linking::First`]).
     fn take_images(&mut self, ids: &[u32]) -> Vec<Image<S>> {
+        let budget = self.budget();
+        self.take_images_under(ids, budget)
+    }
+
+    /// As [`Paths::take_images`], the kept images held to `budget` once these are taken.
+    /// memcap3 review K1: the images of compiles that gave way come back first, and the
+    /// eviction they may call for runs only after `ids`' images are out, so it never lets go
+    /// of the image this link is about to patch (which would lay it out whole for nothing).
+    fn take_images_under(&mut self, ids: &[u32], budget: u64) -> Vec<Image<S>> {
+        let mut back = false;
         while let Some(image) = self.back.pop() {
-            self.keep_one(&[], image);
+            self.keep_one(&[], image, false);
+            back = true;
         }
         let mut images = Vec::new(); // alloc: none unless an image is kept at an output
-        if self.kept == 0 {
-            return images;
-        }
         let extras = ids.first().and_then(|first| self.extras.get(first));
         for &id in ids.iter().chain(extras.into_iter().flatten()) {
+            if self.weights.take(id) {
+                tracing::info!(
+                    target: "blaze",
+                    path = &*self.names[id as usize],
+                    budget,
+                    "link of a path whose kept image was let go past the kept link images' budget: none is kept, \
+                     so it is laid out whole"
+                );
+            }
             if let Some(image) = self.images[id as usize].take() {
                 self.kept -= 1;
                 images.push(image);
             }
         }
+        if back {
+            self.evict_to(budget);
+        }
         images
     }
 
-    /// Images a compile gave back, kept at their paths, `ids` the unit's outputs.
+    /// Images a compile gave back after linking them, kept at their paths, `ids` the unit's
+    /// outputs; then the kept images held to their budget.
     fn keep(&mut self, ids: &[u32], images: Vec<Image<S>>) {
         for image in images {
-            self.keep_one(ids, image);
+            self.keep_one(ids, image, true);
         }
+        let budget = self.budget();
+        self.evict_to(budget);
     }
 
-    fn keep_one(&mut self, ids: &[u32], image: Image<S>) {
+    /// `image` kept at its path, rested and weighed ([`Kept::rest`], [`Kept::held`]):
+    /// `relinked` when a compile linked it, else as a compile that gave way took it.
+    fn keep_one(&mut self, ids: &[u32], mut image: Image<S>, relinked: bool) {
+        image.kept.rest();
+        let bytes = image.kept.held();
         let id = self.find(ids, &image.path);
+        self.weights.keep(id, bytes, relinked);
         if let Some(&first) = ids.first()
             && !ids.contains(&id)
         {
@@ -978,6 +1032,47 @@ impl<S: Steps> Paths<S> {
         let id = id as usize;
         if self.images[id].replace(image).is_none() {
             self.kept += 1;
+        }
+    }
+
+    /// Lets go of kept images, least recently linked first and never a live one, until the
+    /// rest fit `budget` ([`Paths::budget`], [`kept::evictions`]). Each one let go is dropped
+    /// here, its regions given back to the kernel and its heap freed: nothing else holds a kept
+    /// image.
+    fn evict_to(&mut self, budget: u64) {
+        if self.weights.held() <= budget {
+            return;
+        }
+        let _span = tracing::info_span!(target: "blaze", "kept link images evict", held = self.weights.held(), budget, kept = self.kept)
+            .entered();
+        // alloc: once per pass past the budget, a row per kept image
+        let mut rows: Vec<kept::Row> = (self.images.iter().enumerate())
+            .filter_map(|(id, image)| Some(self.weights.row(id as u32, image.as_ref()?.kept.live())))
+            .collect();
+        let evicted = kept::evictions(&mut rows, budget);
+        for &id in &evicted.ids {
+            let bytes = self.weights.let_go(id);
+            // Dropped here: its regions decommitted and released, its heap freed.
+            if self.images[id as usize].take().is_some() {
+                self.kept -= 1;
+            }
+            tracing::info!(
+                target: "blaze",
+                path = &*self.names[id as usize],
+                bytes,
+                budget,
+                kept = self.kept,
+                "kept link image let go past the kept link images' budget: the next link of it lays it out whole"
+            );
+        }
+        if evicted.held > budget {
+            tracing::info!(
+                target: "blaze",
+                held = evicted.held,
+                budget,
+                kept = self.kept,
+                "the kept link images are over their budget with every image no run maps let go: the rest are live"
+            );
         }
     }
 }
@@ -1243,6 +1338,25 @@ impl<S: Steps> Build<S> {
                 group.units.push(unit);
             }
         }
+        // Each test executable or doc test that never built, and the failure that held it back.
+        let why_of = |at: usize| match self.verdicts.get(at) {
+            Some(Verdict::Failed { why, .. }) => why.clone(), // clone: a failure, once in the report
+            _ => "it failed".to_owned(),                      // alloc: as above
+        };
+        let mut tests = Vec::new(); // alloc: none until a test unit did not build
+        for (at, verdict) in self.verdicts.iter().enumerate() {
+            let Some(unit) = graph.get(at) else { continue };
+            if !matches!(unit.mode, blaze_units::schema::Mode::Test | blaze_units::schema::Mode::Doctest) {
+                continue;
+            }
+            let root = match verdict {
+                Verdict::Failed { .. } => at,
+                Verdict::Skipped { because } => self.unit(*because).unwrap_or(usize::MAX),
+                Verdict::Unsettled | Verdict::Done => continue,
+            };
+            let behind = name(root).unwrap_or_else(|| "a step of the build that is no unit".to_owned()); // alloc: as above
+            tests.push(Unbuilt { unit: super::unit::span_unit(unit), behind, why: why_of(root) });
+        }
         let mut open = Vec::new(); // alloc: none until a unit failed open
         if self.verdicts.iter().any(|it| matches!(it, Verdict::Failed { open: true, .. })) {
             // Each unit's dependents in the plan, to walk what was checked against a unit.
@@ -1272,7 +1386,7 @@ impl<S: Steps> Build<S> {
                 }
             }
         }
-        (!behind.is_empty() || !open.is_empty()).then_some(Unchecked { open, behind, stopped })
+        (!behind.is_empty() || !open.is_empty() || !tests.is_empty()).then_some(Unchecked { open, behind, tests, stopped })
     }
 
     /// Whether `node` is its unit's first: the one whose start is the unit's.
@@ -1777,7 +1891,12 @@ impl<S: Steps> Job<S> {
             workspace,
             command: command_line(&self.work),
             started_ns: self.opened_ns,
-            dur_ns: Some(blaze_profile::clock::mono_ns() - self.opened_ns),
+            // A running build's row is its start, written as it opens: the row a build has if
+            // its daemon dies before it ends.
+            dur_ns: match outcome {
+                profile_history::Outcome::Running => None,
+                _ => Some(blaze_profile::clock::mono_ns() - self.opened_ns),
+            },
             started_unix_ns: self.opened_unix_ns,
             outcome,
             hits: stats.map(|it| it.cached),
@@ -1875,6 +1994,7 @@ enum Asked {
 }
 
 /// An effect of the loop's own, by the slot its tag carries.
+#[derive(Clone, Copy)]
 enum Own {
     /// A lock file written for the job.
     Write { job: JobId, path: u32 },
@@ -1903,16 +2023,19 @@ struct Run<S: Steps> {
     runs: Option<Box<S::Runs>>,
     /// Asked to end early: a run is killed once.
     killed: bool,
+    /// Made and not started: a job's tests or run, which waits until every output of its
+    /// job is placed ([`Jobs::release_runs`]), so the program it runs is all there.
+    held: bool,
 }
 
 const _: () = assert!(std::mem::size_of::<JobId>() == 8);
 const _: () = assert!(std::mem::size_of::<Own>() <= 52);
 const _: () = assert!(std::mem::size_of::<Placing>() == 48);
-// The job, the node and `killed` (17 bytes) and a box, padded to its alignment: 32 bytes on a
-// 64-bit target.
+// The job, the node, `killed` and `held` (18 bytes) and a box, padded to its alignment: 32
+// bytes on a 64-bit target.
 const _: () = assert!(
     std::mem::size_of::<Run<super::unit::Real>>()
-        == (17 + size_of::<usize>()).next_multiple_of(align_of::<Run<super::unit::Real>>())
+        == (18 + size_of::<usize>()).next_multiple_of(align_of::<Run<super::unit::Real>>())
 );
 
 /// Whose each batch of nodes is, sorted by first id, a column each: the search reads `firsts`
@@ -2006,6 +2129,9 @@ pub struct Jobs<S: Steps> {
     /// The plane requests that ended, as the profile history's rows, for the daemon to hand
     /// to its history.
     pub rows: Vec<Ended>,
+    /// The plane requests that opened, as their rows of outcome running ([`Job::row`]), for the
+    /// daemon to hand to its history at once.
+    pub started: Vec<BuildRow>,
     /// The build dir leases of jobs dropped while their tasks may still write (a stall): each
     /// held until the last task lets go of the job's cancel flag ([`Jobs::release_leases`]).
     held_leases: Vec<(JobId, Arc<AtomicBool>, Arc<Mutex<Leases>>)>,
@@ -2044,14 +2170,51 @@ impl<S: Steps> Builder for Jobs<S> {
     }
 }
 
+/// Why [`Jobs::new`] could not make the jobs.
+#[derive(Debug)]
+pub enum JobsFailed {
+    /// Reserving the tables of effects or runs.
+    Tables(MemError),
+    /// Reading the machine's memory, which the kept link images' budget is a part of when the
+    /// daemon was given no limit.
+    Machine(std::io::Error),
+}
+
+impl From<MemError> for JobsFailed {
+    fn from(error: MemError) -> JobsFailed {
+        JobsFailed::Tables(error)
+    }
+}
+
+impl std::fmt::Display for JobsFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The daemon names the tables: "the jobs' tables: <error>".
+            JobsFailed::Tables(error) => write!(f, "{error}"),
+            JobsFailed::Machine(error) => write!(
+                f,
+                "reading the machine's memory, which the kept link images' budget is a part of when the daemon \
+                 is given no limit: {error}"
+            ),
+        }
+    }
+}
+
 impl<S: Steps> Jobs<S> {
-    /// The jobs, their tables of effects and runs reserved, committing nothing.
-    pub fn new(setup: Setup) -> Result<Jobs<S>, MemError> {
+    /// The jobs, their tables of effects and runs reserved, committing nothing. When the
+    /// daemon was given no limit ([`blaze_graph::admission::limit`]), the machine's memory is
+    /// read for the kept link images' budget ([`Paths::budget`]).
+    pub fn new(setup: Setup) -> Result<Jobs<S>, JobsFailed> {
         let numbers = setup.runs_end.saturating_sub(setup.runs) / RUN_TAGS;
         let bits = numbers.checked_ilog2().unwrap_or(0);
         let run_slots = bits.min(RUN_SLOT_BITS);
         let own = Tagged::new(OWN_SLOT_BITS, OWN_GENERATION_BITS, MemTag::Io)?;
         let runs = Tagged::new(run_slots, bits - run_slots, MemTag::Usercode)?;
+        let machine = match blaze_graph::admission::limit() {
+            // The margin the daemon leaves the machine when it reads its own budget.
+            u64::MAX => blaze_graph::arena::machine_budget(1 << 30, None).map_err(JobsFailed::Machine)?.bytes,
+            limit => limit,
+        };
         Ok(Jobs {
             setup,
             asked: Vec::new(), // alloc: none until the session asks
@@ -2062,7 +2225,7 @@ impl<S: Steps> Jobs<S> {
             library_failed: None,
             fetch_failed: HashMap::new_in(Global),
             placing: HashMap::new_in(Global),
-            paths: Paths::new(),
+            paths: Paths::new(machine),
             own,
             runs,
             put: blaze_cas::Tickets::default(),
@@ -2074,6 +2237,7 @@ impl<S: Steps> Jobs<S> {
             cold: false,
             ended: false,
             rows: Vec::new(), // alloc: none until a build ends, then reused
+            started: Vec::new(), // alloc: none until a build opens, then reused
             held_leases: Vec::new(), // alloc: none until a stall
             lowering: Vec::new(),    // alloc: none until a job lowers while its root's front end is stored
             store_requests: HashSet::new_in(Global),
@@ -2240,6 +2404,7 @@ impl<S: Steps> Jobs<S> {
         if let Some(job) = self.jobs.get_mut(key_of(id)) {
             job.request = Some(request);
             job.opening();
+            self.started.push(job.row(request, None, profile_history::Outcome::Running));
         }
         self.prepare(w, id);
     }
@@ -2476,7 +2641,7 @@ impl<S: Steps> Jobs<S> {
                     why
                 }
                 (Ok(_), Some(broke)) if !keeps_going(&job.work) => {
-                    format!("{broke}, and the build fails fast without --keep-going") // alloc: an error, once
+                    format!("{broke}, and the build fails fast under --fail-fast") // alloc: an error, once
                 }
                 (Ok(true), _) => {
                     posts.append(&mut build.held);
@@ -3444,6 +3609,7 @@ impl<S: Steps> Jobs<S> {
         if !build.begins(node) {
             return;
         }
+        build.writer.began(at);
         let fresh = build.is_fresh(at);
         match fresh {
             true => job.fresh += 1,
@@ -3477,7 +3643,7 @@ impl<S: Steps> Jobs<S> {
 
     /// A new run of the job's user code, and its first tag.
     fn run_tags(&mut self, id: JobId, node: Option<NodeId>) -> Result<(Handle<Run<S>>, u64), ApiError> {
-        let (run, packed) = match self.runs.insert(Run { job: id, node, runs: None, killed: false }) {
+        let (run, packed) = match self.runs.insert(Run { job: id, node, runs: None, killed: false, held: false }) {
             Ok(it) => it,
             // alloc: an error, once
             Err(error) => return Err(ApiError::new(format!("no room for another run of user code: {error}"), None)),
@@ -3624,6 +3790,9 @@ impl<S: Steps> Jobs<S> {
         let Some(id) = self.batches.job_of(node) else { return };
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         let streams = streams_units(&job.work);
+        if let Stage::Units(build) = &mut job.stage {
+            build.writer.compiled(unit);
+        }
         let mut compiled = match result {
             Ok(compiled) => compiled,
             Err(error) => {
@@ -4183,7 +4352,7 @@ impl<S: Steps> Jobs<S> {
             _ => Err(ApiError::new("only a test or a run runs once built", None)),
         };
         w.said.push(Said::Report(id, Response::Built { members, profile, artifacts }));
-        let mut runs = match started {
+        let runs = match started {
             Ok(runs) => runs,
             Err(error) => {
                 self.run_over(run);
@@ -4192,6 +4361,61 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         };
+        if let Some(job) = self.jobs.get_mut(key_of(id)) {
+            job.stage = Stage::Runs(run);
+        }
+        // The plane finishes once the last unit's node ends, before the loop has placed what
+        // it made: a test binary or program linked last may not be at its path yet (a first
+        // link's file not there at all, B2: every test's exec failed "No such file or
+        // directory"). The run waits until its job has no placement in flight, as a build
+        // script's run waits for its program ([`Jobs::release_held`]) and a streamed test
+        // binary for its unit's outputs ([`Jobs::release_ready`]).
+        if let Some(it) = self.runs.get_mut(run) {
+            it.runs = Some(Box::new(runs)); // alloc: once per test or run of a job
+            it.held = true;
+        }
+        self.release_runs(w);
+    }
+
+    /// Each job's tests or run [`Jobs::plane_finished`] held, asked again: one whose job has no
+    /// placement in flight starts, everything the build placed all there; the rest wait on. One
+    /// whose job ended meanwhile (a placement failed, or it was cancelled) ends unstarted, not
+    /// ok, its job's error the answer.
+    fn release_runs(&mut self, w: &mut World<'_, S>) {
+        let jobs = &self.jobs;
+        let ready = |it: &Run<S>| {
+            it.held && jobs.get(key_of(it.job)).is_none_or(|job| job.placing == 0 || job.over.is_some())
+        };
+        if !self.runs.iter().any(|(_, it)| ready(it)) {
+            return;
+        }
+        // alloc: once per job's tests or run, as it is let go
+        let ready: Vec<Handle<Run<S>>> = self.runs.iter().filter_map(|(run, it)| ready(it).then_some(run)).collect();
+        for run in ready {
+            self.start_run(w, run);
+        }
+    }
+
+    /// Held run `run` started, or ended unstarted when its job is over or gone.
+    fn start_run(&mut self, w: &mut World<'_, S>, run: Handle<Run<S>>) {
+        let Some(it) = self.runs.get_mut(run) else { return };
+        it.held = false;
+        let (id, runs) = (it.job, it.runs.take());
+        let Some(mut runs) = runs else {
+            self.run_over(run);
+            return;
+        };
+        let Some(job) = self.jobs.get(key_of(id)) else {
+            self.run_over(run);
+            return;
+        };
+        if job.over.is_some() || job.cancelled.load(Ordering::Acquire) {
+            self.run_over(run);
+            self.run_ended(w, id, None, false);
+            return;
+        }
+        #[cfg(test)]
+        RUNS_STARTED_PLACING.with_borrow_mut(|it| it.push(job.placing));
         let mut out = std::mem::take(&mut self.out);
         let ended = runs.start(w.store, None, w.effects, &mut out);
         let puts = runs.take_puts();
@@ -4200,9 +4424,6 @@ impl<S: Steps> Jobs<S> {
             w.said.push(Said::Report(id, response));
         }
         self.out = out;
-        if let Some(job) = self.jobs.get_mut(key_of(id)) {
-            job.stage = Stage::Runs(run);
-        }
         match ended {
             Some(ok) => {
                 self.run_over(run);
@@ -4210,7 +4431,7 @@ impl<S: Steps> Jobs<S> {
             }
             None => {
                 if let Some(it) = self.runs.get_mut(run) {
-                    it.runs = Some(Box::new(runs)); // alloc: once per run of user code that waits on its effects
+                    it.runs = Some(runs);
                 }
             }
         }
@@ -4293,8 +4514,10 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         };
-        job.request = Some(w.plane.open(w.now, false, job.idle));
+        let request = w.plane.open(w.now, false, job.idle);
+        job.request = Some(request);
         job.opening();
+        self.started.push(job.row(request, None, profile_history::Outcome::Running));
         job.finished = false;
         job.closed = false;
         let what = match job.work {
@@ -4509,6 +4732,12 @@ impl<S: Steps> Jobs<S> {
                 continue;
             }
             it.killed = true;
+            // Held for its job's placements, it never started: nothing of it runs to kill.
+            if it.held {
+                it.held = false;
+                ended.push((run, it.node, false));
+                continue;
+            }
             if let Some(runs) = &mut it.runs
                 && let Some(ok) = runs.cancel(w.effects)
             {
@@ -4569,6 +4798,7 @@ impl<S: Steps> Jobs<S> {
     fn wind_up_judging(&mut self, w: &mut World<'_, S>, judge: bool) {
         self.release_held(w);
         self.release_ready(w);
+        self.release_runs(w);
         self.apply_writes(w);
         let mut over = std::mem::take(&mut self.over);
         let mut heard = self.store_heard;
@@ -4897,11 +5127,13 @@ fn run_named<S: Steps>(job: &Job<S>, node: NodeId) -> String {
     format!("the build script run of `{package}` (unit {at}, node {node})") // alloc: an error, once
 }
 
-/// Whether a job's work keeps going past a failure (cargo's `--keep-going`): the plane builds
-/// every unit no failure reaches, and a broken write fails only what depends on it. Without
-/// it the job fails fast.
+/// Whether a job's work keeps going past a failure: the plane builds every unit no failure
+/// reaches, and a broken write fails only what depends on it. It does unless the request says
+/// `--fail-fast` (the CLI's `Flags::fail_fast`), so one run shows every error; `--keep-going`
+/// and `--no-fail-fast` are accepted and change nothing. A request with no cargo arguments
+/// keeps going too.
 fn keeps_going(work: &Work) -> bool {
-    targets_of(work).and_then(|it| it.cargo.as_ref()).is_some_and(|cargo| cargo.args.iter().any(|arg| arg == "--keep-going"))
+    !targets_of(work).and_then(|it| it.cargo.as_ref()).is_some_and(|cargo| cargo.args.iter().any(|arg| arg == "--fail-fast"))
 }
 
 /// A job's stage, as a stall or an error names it.

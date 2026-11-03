@@ -132,17 +132,17 @@ fn item_name(db: &TestDB, item: crate::AstId<ast::Item>) -> String {
     name.text().to_owned()
 }
 
-fn check_used(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check_used(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let db = fixture::db(ra_fixture).into_db();
     expect.assert_eq(&render_used(&db, db.fetch_test_crate()));
 }
 
-fn check_used_in(name: &str, #[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check_used_in(name: &str, #[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let db = fixture::db(ra_fixture).into_db();
     expect.assert_eq(&render_used(&db, crate_named(&db, name)));
 }
 
-fn check_records_in(name: &str, #[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check_records_in(name: &str, #[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let db = fixture::db(ra_fixture).into_db();
     let def_map = crate_def_map(&db, crate_named(&db, name));
     expect.assert_eq(&render_records(&db, def_map));
@@ -156,7 +156,7 @@ mod a { pub struct S; pub struct T; }
 use a::*;
 fn f(_: S) {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             a::* Scope [S]
         "#]],
     );
@@ -173,7 +173,7 @@ fn f() { x(); }
 "#;
     check_used(
         fixture,
-        expect![[r#"
+        &expect![[r#"
             a::* Scope [x]
             ambiguous x Values through a::*
         "#]],
@@ -221,7 +221,7 @@ use m::T as A;
 use self::m::T as B;
 fn f(_: n::S, _: A, _: self::B) {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             m::T as A Scope
             m::n Scope
             self::m::T as B Other
@@ -238,7 +238,7 @@ mod b { pub use super::a::*; }
 use b::*;
 fn f(_: S) {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             b::* Scope [S]
             super::a::* Other [S]
         "#]],
@@ -254,7 +254,7 @@ mod b { pub use super::a::S; }
 use b::S;
 fn f(_: S) {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             b::S Scope
             super::a::S Other
         "#]],
@@ -269,7 +269,7 @@ mod a { pub struct S; pub struct T; }
 use a::{S, T};
 fn f(_: S) {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             S Scope
         "#]],
     );
@@ -281,7 +281,7 @@ fn an_unresolved_import_counts_as_used() {
         r#"
 use missing::thing;
 "#,
-        expect![[r#"
+        &expect![[r#"
             missing::thing Other
         "#]],
     );
@@ -299,7 +299,7 @@ fn f(_: dep::S, _: renamed::S, _: crate::dep::S) {}
 //- /dep.rs crate:dep
 pub struct S;
 "#,
-        expect![[r#"
+        &expect![[r#"
             extern crate dep as renamed; Scope
             extern crate dep; Other
         "#]],
@@ -320,7 +320,7 @@ macro_rules! made { () => {} }
     check_used_in(
         "main",
         fixture,
-        expect![[r#"
+        &expect![[r#"
             macro_use #[macro_use]
             extern crate dep; Scope
         "#]],
@@ -346,7 +346,7 @@ crate::there!();
 "#;
     check_used(
         fixture,
-        expect![[r#"
+        &expect![[r#"
             crate::there as again Scope
         "#]],
     );
@@ -410,7 +410,7 @@ made!();
 #[macro_export]
 macro_rules! made { () => {} }
 "#,
-        expect![[r#"
+        &expect![[r#"
             use S Types Other super::a::*
             use S Values Other super::a::*
             use made Macros Scope #[macro_use]
@@ -497,7 +497,7 @@ fn check_trait_used(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
     trait_path: &[&str],
     trait_name: &str,
-    expect: Expect,
+    expect: &Expect,
 ) {
     let db = fixture::db(ra_fixture).into_db();
     let krate = db.fetch_test_crate();
@@ -516,7 +516,7 @@ fn f() { ().go(); }
 "#,
         &["m"],
         "Tr",
-        expect![[r#"
+        &expect![[r#"
             m::Tr Other
         "#]],
     );
@@ -530,12 +530,12 @@ mod p { pub use super::m::Tr as _; }
 use p::*;
 fn f() { ().go(); }
 "#;
-    check_used(fixture, expect![[""]]);
+    check_used(fixture, &expect![[""]]);
     check_trait_used(
         fixture,
         &["m"],
         "Tr",
-        expect![[r#"
+        &expect![[r#"
             p::* Other [_]
             super::m::Tr as _ Other
         "#]],
@@ -563,7 +563,7 @@ fn f() { ().go(); }
 "#,
         &["m"],
         "Tr",
-        expect![[r#"
+        &expect![[r#"
             p::* Other [Tr]
             super::m::* Other [Tr]
         "#]],
@@ -582,7 +582,7 @@ fn f() { ().go(); }
 "#,
         &["m"],
         "Tr",
-        expect![[r#"
+        &expect![[r#"
             b::* Other [_]
             super::a::* Other [_]
             super::m::Tr as _ Other
@@ -602,7 +602,7 @@ fn f() { ().go(); }
 "#,
         &[],
         "Tr",
-        expect![[""]],
+        &expect![[""]],
     );
 }
 

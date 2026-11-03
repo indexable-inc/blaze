@@ -152,6 +152,11 @@ impl Scale {
         (ticks as f64 * self.ns_per_tick) as u64
     }
 
+    /// The ticks `ns` nanoseconds last, rounded up: at least one for any time at all.
+    pub fn ticks_in(&self, ns: u64) -> u64 {
+        (ns as f64 / self.ns_per_tick).ceil() as u64
+    }
+
     /// The instant the counter read `ticks`, which was no later than [`Scale::now`].
     pub fn instant(&self, ticks: u64) -> Instant {
         let ago = self.ns(self.ticks.wrapping_sub(ticks));

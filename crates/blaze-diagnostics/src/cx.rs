@@ -250,11 +250,19 @@ impl<'a, 'db> Cx<'a, 'db> {
 
     /// The name rustc shows `file` by. A crate attribute's file has no path: it is
     /// [`base_db::CRATE_ATTR_FILE_NAME`] with the file's text, which tells the attributes apart
-    /// and is their source to the emitter ([`crate::emit::name_with_text`]).
+    /// and is their source to the emitter ([`crate::emit::name_with_text`]). A file `include!`
+    /// read from outside every source root has no path of the front end's: it is named by its
+    /// path there ([`base_db::Files::included_source_path`]).
     pub fn file_name(&self, file: FileId) -> String {
-        let name = match self.files.paths.contains_key(&file) || base_db::crate_attr_owner(self.db, file).is_none() {
+        let outside = || self.db.files().included_source_path(file);
+        let name = match self.files.paths.contains_key(&file) {
             true => self.files.name(file),
-            false => crate::emit::name_with_text(base_db::CRATE_ATTR_FILE_NAME, self.file_text(file)),
+            // alloc: a span's file name, made only as a diagnostic is built
+            false => match outside() {
+                Some(path) => Files::relative(path.as_str(), self.files.root).to_owned(),
+                None if base_db::crate_attr_owner(self.db, file).is_none() => self.files.name(file),
+                None => crate::emit::name_with_text(base_db::CRATE_ATTR_FILE_NAME, self.file_text(file)),
+            },
         };
         let mut named = self.named.borrow_mut();
         if !named.contains_key(name.as_str()) {
@@ -477,12 +485,17 @@ impl<'a, 'db> Cx<'a, 'db> {
                     (MacroKind::Derive, String::new(), at?)
                 }
             }
-            MacroCallKind::Attr { .. } => {
-                let item = view::Item::cast(node.value)?;
-                let attr = item.attrs().next()?;
-                let path = attr.path()?;
+            MacroCallKind::Attr { ast_id, censored_attr_ids, .. } => {
+                // The attribute that invoked the macro, not the item's first: a `#[cfg(test)]`
+                // before `#[global_allocator]` is a `cfg` meta, with no path to name a macro by.
+                let (attr, meta) = censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id);
+                let path = meta.path()?;
                 let name = if named { fast_print_path(path)? } else { String::new() };
-                (MacroKind::Attr, name, attr.syntax().text_range())
+                // rustc's span of the attribute: all of it as written, or what a `cfg_attr`
+                // holds of it.
+                let written = attr.meta().is_some_and(|it| it.syntax() == meta.syntax());
+                let range = if written { attr.syntax().text_range() } else { meta.syntax().text_range() };
+                (MacroKind::Attr, name, range)
             }
         };
         Some((kind, name, node.with_value(range)))

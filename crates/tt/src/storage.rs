@@ -1090,6 +1090,7 @@ impl TopSubtreeBuilder {
         }
     }
 
+    #[expect(clippy::needless_pass_by_value, reason = "the builder takes the leaf it appends, as `Vec::push` does: its symbol and span move into the tree's columns (both `Copy`, so clippy sees no move)")]
     pub fn push(&mut self, leaf: Leaf) {
         let (node, span) = match leaf {
             Leaf::Punct(Punct { char, spacing, span }) => (Node::punct(char, spacing), span),

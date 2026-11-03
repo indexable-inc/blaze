@@ -274,7 +274,7 @@ fn idx<T>(raw: u32) -> Idx<T> {
     Idx::from_raw(RawIdx::from_u32(raw))
 }
 
-fn bits(id: impl AsId) -> u64 {
+fn bits(id: impl AsId + Copy) -> u64 {
     u64::from(id.as_id().as_u32())
 }
 
@@ -1619,7 +1619,12 @@ impl Persist for ExpressionStore {
         // 10: `for const` and `x.[f]` (`Expr::ComptimeFor`, `Expr::ReflectedField`).
         // 11: blaze_verify's clause groups (`ExpressionStore::spec_clauses`).
         // 12: a keyed name and a path's segment contexts (`ModPath::contexts`) are written.
-        Part::U64(12),
+        // 13: a record literal's path has its hygiene (`ident_hygiene`), as an expression path;
+        // an associated type binding a `macro` writes (`Trait<Assoc = ..>`) keeps its key; an
+        // `offset_of!`'s field contexts (`OffsetOf::hygiene`), and a tuple index's context in
+        // `ident_hygiene`, which def-site privacy reads.
+        // 14: a closure's `for<..>` binder (`Expr::Closure::binder`), two more words of it.
+        Part::U64(14),
         Part::Schema(<StoreRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreRef<'a>;
@@ -1696,7 +1701,12 @@ impl Persist for Body {
         // 10: `for const` and `x.[f]` (`Expr::ComptimeFor`, `Expr::ReflectedField`).
         // 11: blaze_verify's clause groups (`ExpressionStore::spec_clauses`).
         // 12: a keyed name and a path's segment contexts (`ModPath::contexts`) are written.
-        Part::U64(12),
+        // 13: a record literal's path has its hygiene (`ident_hygiene`), as an expression path;
+        // an associated type binding a `macro` writes (`Trait<Assoc = ..>`) keeps its key; an
+        // `offset_of!`'s field contexts (`OffsetOf::hygiene`), and a tuple index's context in
+        // `ident_hygiene`, which def-site privacy reads.
+        // 14: a closure's `for<..>` binder (`Expr::Closure::binder`), two more words of it.
+        Part::U64(14),
         Part::Schema(<BodyRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodyRef<'a>;
@@ -2269,13 +2279,19 @@ impl Code for Literal {
 
 impl Code for OffsetOf {
     fn put(&self, w: &mut Words) {
-        let OffsetOf { container, fields } = self;
+        let OffsetOf { container, fields, hygiene } = self;
         container.put(w);
         fields.put(w);
+        hygiene.put(w);
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(OffsetOf { container: r.get()?, fields: r.get()? })
+        let (container, fields): (_, Box<[Name]>) = (r.get()?, r.get()?);
+        let hygiene: Box<[HygieneId]> = r.get()?;
+        if !hygiene.is_empty() && hygiene.len() != fields.len() {
+            return Err(r.invalid("an offset_of! whose contexts are not one per field"));
+        }
+        Ok(OffsetOf { container, fields, hygiene })
     }
 }
 
@@ -2739,7 +2755,7 @@ mod tests {
         for &def in &defs {
             let (body, source_map) = Body::with_source_map(&db, def);
             assert_round_trip(body, source_map);
-            if let Some((body, source_map)) = Body::relative(&db, def) {
+            if let Some(source_map) = Body::relative(&db, def) {
                 assert_round_trip(body, source_map);
             }
             if let DefWithBodyId::FunctionId(function) = def {
@@ -2977,6 +2993,44 @@ fn main() { let _ = m!(x); }
         // `x: 1`, `x: b`, and `s.f()` with `s.x`.
         assert_eq!(marked(&body), (1, 1, 2));
         assert_eq!(marked(&decoded), (1, 1, 2));
+    }
+
+    /// An associated type binding a `macro` (2.0) writes (`dyn Tr<A = .., $b = ..>`) reads back
+    /// with its name keyed by its context; the caller's `$b` has no key.
+    #[test]
+    fn assoc_binding_hygiene_round_trips() {
+        let (db, defs) = bodies(
+            r#"
+#![feature(decl_macro)]
+trait Tr { type A; type B; }
+macro m($b:ident) {{
+    let _: Option<&dyn Tr<A = u8, $b = u16>> = None;
+}}
+fn main() { m!(B); }
+"#,
+        );
+        let body = Body::of(&db, defs[0]);
+        let buffer = Aligned::copy_from(&blaze_format::to_bytes(&*body));
+        let decoded = Body::read(&buffer).expect("a body just written").decode().expect("decoded");
+        let keys = |body: &Body| {
+            let mut keys = Vec::new(); // alloc: a test's list
+            for (_, ty) in body.type_refs() {
+                let TypeRef::DynTrait(bounds) = ty else { continue };
+                for bound in bounds {
+                    let crate::type_ref::TypeBound::Path(path, _) = *bound else { continue };
+                    for segment in body.path(path).segments().iter() {
+                        let bindings = segment.args_and_bindings.map(|it| it.bindings);
+                        for binding in bindings.iter().flat_map(|it| it.iter()) {
+                            // alloc: a test's list
+                            keys.push((binding.name.as_str().to_owned(), binding.name.key().is_some()));
+                        }
+                    }
+                }
+            }
+            keys
+        };
+        assert_eq!(keys(&body), [("A".to_owned(), true), ("B".to_owned(), false)]);
+        assert_eq!(keys(&decoded), keys(&body));
     }
 
     /// `bytes` with the word at `at` replaced by `word`.
@@ -3248,5 +3302,45 @@ fn f() -> u32 {
         let root = blaze_alloc_count::assert_at_most(0, "a warm encode", || body.write(&mut out));
         assert_eq!(out.finish(root), reference, "the same bytes on reused scratch");
         assert_eq!(ENCODE.with(|it| it.borrow().capacity()), held, "a buffer grew on a warm encode");
+    }
+
+    /// The contexts of an `offset_of!`'s field names (`OffsetOf::hygiene`) read back as
+    /// written: the `x` a `macro` (2.0) writes has one, the caller's `$x` none, so its
+    /// `offset_of!` keeps an empty list. A tuple index the macro writes keeps its context too.
+    #[test]
+    fn offset_of_contexts_round_trip() {
+        let (db, defs) = bodies(
+            r#"
+#![feature(decl_macro)]
+macro m($x:ident) {{
+    struct K { $x: u8, x: u32 }
+    let t = (1, 2);
+    (builtin # offset_of(K, x), builtin # offset_of(K, $x), t.0)
+}}
+fn main() { let _ = m!(x); }
+"#,
+        );
+        let body = Body::of(&db, defs[0]);
+        let buffer = Aligned::copy_from(&blaze_format::to_bytes(&*body));
+        let decoded = Body::read(&buffer).expect("a body just written").decode().expect("decoded");
+        let marked = |body: &Body| {
+            // alloc: a test's list of what it compares
+            let offsets: Vec<Vec<bool>> = body
+                .exprs()
+                .filter_map(|(_, expr)| match expr {
+                    Expr::OffsetOf(it) => Some(it.hygiene.iter().map(|it| it.is_root()).collect()),
+                    _ => None,
+                })
+                .collect();
+            let indices = body
+                .exprs()
+                .filter(|(id, expr)| matches!(expr, Expr::Field { .. }) && !body.member_hygiene(*id).is_root())
+                .count();
+            (offsets, indices)
+        };
+        // `offset_of!(K, x)`'s one context, `offset_of!(K, $x)`'s none, and `t.0`.
+        let expected = (vec![vec![false], vec![]], 1);
+        assert_eq!(marked(&body), expected);
+        assert_eq!(marked(&decoded), expected);
     }
 }

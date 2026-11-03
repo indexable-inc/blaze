@@ -18,7 +18,7 @@ fn check_(
     decl: &str,
     arg: &str,
     render_debug: bool,
-    expect: expect_test::Expect,
+    expect: &expect_test::Expect,
     parse: parser::TopEntryPoint,
 ) {
     let db = base_db::Db::for_tests();
@@ -92,7 +92,7 @@ fn check(
     call_edition: Edition,
     decl: &str,
     arg: &str,
-    expect: expect_test::Expect,
+    expect: &expect_test::Expect,
 ) {
     check_(
         def_edition,
@@ -115,7 +115,7 @@ fn unbalanced_brace() {
 () => { { }
 "#,
         r#""#,
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..0#ROOT2024 1:Root[0000, 0]@0..0#ROOT2024
               SUBTREE {} 0:Root[0000, 0]@9..10#ROOT2024 0:Root[0000, 0]@11..12#ROOT2024
 
@@ -138,7 +138,7 @@ fn token_mapping_smoke_test() {
         r#"
 struct MyTraitMap2
 "#,
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..20#ROOT2024 1:Root[0000, 0]@0..20#ROOT2024
               IDENT   struct 0:Root[0000, 0]@34..40#ROOT2024
               IDENT   MyTraitMap2 1:Root[0000, 0]@8..19#ROOT2024
@@ -185,7 +185,7 @@ fn main() {
     let x = 1;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..63#ROOT2024 1:Root[0000, 0]@0..63#ROOT2024
               IDENT   fn 1:Root[0000, 0]@1..3#ROOT2024
               IDENT   main 1:Root[0000, 0]@4..8#ROOT2024
@@ -232,7 +232,7 @@ fn expr_2021() {
     _,
     const { 1 },
 "#,
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..25#ROOT2024 1:Root[0000, 0]@0..25#ROOT2024
               SUBTREE $$ 0:Root[0000, 0]@34..35#ROOT2024 0:Root[0000, 0]@34..35#ROOT2024
                 IDENT   _ 1:Root[0000, 0]@5..6#ROOT2024
@@ -260,7 +260,7 @@ fn expr_2021() {
         r#"
     _,
 "#,
-        expect![[r#"
+        &expect![[r#"
             ExpandError {
                 inner: (
                     1:Root[0000, 0]@5..6#ROOT2024,
@@ -293,7 +293,7 @@ fn expr_2021() {
         r#"
     const { 1 },
 "#,
-        expect![[r#"
+        &expect![[r#"
             ExpandError {
                 inner: (
                     1:Root[0000, 0]@5..10#ROOT2024,
@@ -330,7 +330,7 @@ fn expr_2021() {
     future.await,
     break 'foo bar,
 "#,
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..76#ROOT2024 1:Root[0000, 0]@0..76#ROOT2024
               SUBTREE $$ 0:Root[0000, 0]@39..40#ROOT2024 0:Root[0000, 0]@39..40#ROOT2024
                 LITERAL Integer 4 1:Root[0000, 0]@5..6#ROOT2024
@@ -374,7 +374,7 @@ fn expr_2021() {
         r#"
     _,
 "#,
-        expect![[r#"
+        &expect![[r#"
             ExpandError {
                 inner: (
                     1:Root[0000, 0]@5..6#ROOT2024,
@@ -409,7 +409,7 @@ fn minus_belongs_to_literal() {
     let check = |args, expect| check(Edition::CURRENT, Edition::CURRENT, decl, args, expect);
     check(
         "-1",
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..2#ROOT2024 1:Root[0000, 0]@0..2#ROOT2024
               PUNCH   - [alone] 0:Root[0000, 0]@10..11#ROOT2024
               LITERAL Integer 1 0:Root[0000, 0]@11..12#ROOT2024
@@ -418,7 +418,7 @@ fn minus_belongs_to_literal() {
     );
     check(
         "- 1",
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..3#ROOT2024 1:Root[0000, 0]@0..3#ROOT2024
               PUNCH   - [alone] 0:Root[0000, 0]@10..11#ROOT2024
               LITERAL Integer 1 0:Root[0000, 0]@11..12#ROOT2024
@@ -427,7 +427,7 @@ fn minus_belongs_to_literal() {
     );
     check(
         "-2",
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..2#ROOT2024 1:Root[0000, 0]@0..2#ROOT2024
               PUNCH   - [alone] 0:Root[0000, 0]@25..26#ROOT2024
               LITERAL Integer 2 0:Root[0000, 0]@27..28#ROOT2024
@@ -436,7 +436,7 @@ fn minus_belongs_to_literal() {
     );
     check(
         "- 2",
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..3#ROOT2024 1:Root[0000, 0]@0..3#ROOT2024
               PUNCH   - [alone] 0:Root[0000, 0]@25..26#ROOT2024
               LITERAL Integer 2 0:Root[0000, 0]@27..28#ROOT2024
@@ -445,7 +445,7 @@ fn minus_belongs_to_literal() {
     );
     check(
         "-3.0",
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..4#ROOT2024 1:Root[0000, 0]@0..4#ROOT2024
               PUNCH   - [alone] 0:Root[0000, 0]@43..44#ROOT2024
               LITERAL Float 3.0 0:Root[0000, 0]@45..48#ROOT2024
@@ -454,7 +454,7 @@ fn minus_belongs_to_literal() {
     );
     check(
         "- 3.0",
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..5#ROOT2024 1:Root[0000, 0]@0..5#ROOT2024
               PUNCH   - [alone] 0:Root[0000, 0]@43..44#ROOT2024
               LITERAL Float 3.0 0:Root[0000, 0]@45..48#ROOT2024
@@ -463,7 +463,7 @@ fn minus_belongs_to_literal() {
     );
     check(
         "@1",
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..2#ROOT2024 1:Root[0000, 0]@0..2#ROOT2024
               LITERAL Integer 1 1:Root[0000, 0]@1..2#ROOT2024
 
@@ -471,7 +471,7 @@ fn minus_belongs_to_literal() {
     );
     check(
         "@-1",
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..3#ROOT2024 1:Root[0000, 0]@0..3#ROOT2024
               PUNCH   - [alone] 1:Root[0000, 0]@1..2#ROOT2024
               LITERAL Integer 1 1:Root[0000, 0]@2..3#ROOT2024
@@ -480,7 +480,7 @@ fn minus_belongs_to_literal() {
     );
     check(
         "@1.0",
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..4#ROOT2024 1:Root[0000, 0]@0..4#ROOT2024
               LITERAL Float 1.0 1:Root[0000, 0]@1..4#ROOT2024
 
@@ -488,7 +488,7 @@ fn minus_belongs_to_literal() {
     );
     check(
         "@-1.0",
-        expect![[r#"
+        &expect![[r#"
             SUBTREE $$ 1:Root[0000, 0]@0..5#ROOT2024 1:Root[0000, 0]@0..5#ROOT2024
               PUNCH   - [alone] 1:Root[0000, 0]@1..2#ROOT2024
               LITERAL Float 1.0 1:Root[0000, 0]@2..5#ROOT2024
@@ -497,7 +497,7 @@ fn minus_belongs_to_literal() {
     );
     check(
         "@--1.0",
-        expect![[r#"
+        &expect![[r#"
             ExpandError {
                 inner: (
                     1:Root[0000, 0]@1..2#ROOT2024,

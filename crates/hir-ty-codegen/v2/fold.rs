@@ -87,7 +87,7 @@ const FOLD_DATA_DOMAIN: &str = "blaze v2 fold data 1";
 pub(crate) fn name(
     function: &Function,
     refs: &Refs,
-    name: ir::UserExternalName,
+    name: &ir::UserExternalName,
 ) -> Option<Name> {
     let index = name.index as usize;
     match name.namespace {
@@ -106,11 +106,11 @@ pub(crate) fn name(
 pub(crate) enum Names<'a> {
     Of(&'a Function, &'a Refs),
     #[cfg(test)]
-    Plain(fn(ir::UserExternalName) -> Option<Name>),
+    Plain(fn(&ir::UserExternalName) -> Option<Name>),
 }
 
 impl Names<'_> {
-    pub(crate) fn of(self, it: ir::UserExternalName) -> Option<Name> {
+    pub(crate) fn of(self, it: &ir::UserExternalName) -> Option<Name> {
         match self {
             Names::Of(function, refs) => name(function, refs, it),
             #[cfg(test)]
@@ -666,8 +666,7 @@ impl Canon<'_> {
             self.plain(name);
             return Some(false);
         };
-        // clone: two `u32`s; cranelift's `UserExternalName` is not `Copy`
-        let constant = match self.names.of(self.func.params.user_named_funcs()[*user].clone())? {
+        let constant = match self.names.of(&self.func.params.user_named_funcs()[*user])? {
             Name::Place(place) => Constant::Place(place),
             Name::Data(id) => Constant::Data(id),
         };
@@ -1046,7 +1045,7 @@ mod tests {
 
     /// Namespace 0 are the places among the references, namespace 1 a data object of
     /// content `[index; 32]`.
-    fn names(name: ir::UserExternalName) -> Option<Name> {
+    fn names(name: &ir::UserExternalName) -> Option<Name> {
         match name.namespace {
             0 => Some(Name::Place(name.index)),
             1 => Some(Name::Data(ContentId([name.index as u8; 32]))),
@@ -1060,7 +1059,7 @@ mod tests {
     fn plain_names_are_what_their_rule_says() {
         for (namespace, index) in [(0, 3), (1, 5), (2, 0)] {
             let name = ir::UserExternalName::new(namespace, index);
-            assert_eq!(PLAIN.of(name.clone()), names(name));
+            assert_eq!(PLAIN.of(&name), names(&name));
         }
     }
 
@@ -1216,7 +1215,7 @@ mod tests {
 
         struct Canon<'a> {
             func: &'a ir::Function,
-            names: &'a dyn Fn(ir::UserExternalName) -> Option<Name>,
+            names: &'a dyn Fn(&ir::UserExternalName) -> Option<Name>,
             text: String,
             numbers: HashMap<(Kind, u32), u32>,
             counts: HashMap<Kind, u32>,
@@ -1226,7 +1225,7 @@ mod tests {
 
         pub(super) fn masked(
             func: &ir::Function,
-            names: &dyn Fn(ir::UserExternalName) -> Option<Name>,
+            names: &dyn Fn(&ir::UserExternalName) -> Option<Name>,
         ) -> Option<(String, Vec<Constant>)> {
             func.layout.entry_block()?;
             if !func.dynamic_stack_slots.is_empty() {
@@ -1396,7 +1395,7 @@ mod tests {
                     self.text.push_str(&name.display(None).to_string());
                     return false;
                 };
-                let constant = match (self.names)(self.func.params.user_named_funcs()[*user].clone()) {
+                let constant = match (self.names)(&self.func.params.user_named_funcs()[*user]) {
                     Some(Name::Place(place)) => Constant::Place(place),
                     Some(Name::Data(id)) => Constant::Data(id),
                     None => {

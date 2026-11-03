@@ -70,7 +70,7 @@ fn body() -> Valid {
     expr::store_root(&mut root, &store);
     root.slice(params);
     root.slice(self_param);
-    build.finish(root)
+    build.finish(&root)
 }
 
 /// The empty body, through the crate's own writer, and [`body`].

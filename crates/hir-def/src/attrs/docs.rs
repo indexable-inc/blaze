@@ -130,6 +130,14 @@ impl IsInnerDoc {
 }
 
 impl Docs {
+    /// The heap the docs own, in bytes: the text's, the source map's and the macro calls'
+    /// buffers.
+    pub fn heap_bytes(&self) -> usize {
+        self.docs.capacity()
+            + crate::heap::vec_bytes(&self.docs_source_map)
+            + crate::heap::thin_vec_bytes(&self.macro_calls)
+    }
+
     #[inline]
     pub fn docs(&self) -> &str {
         &self.docs
@@ -1265,7 +1273,7 @@ mod tests {
     #[test]
     fn block_doc_comment_stars() {
         #[track_caller]
-        fn check(source: &str, expect: expect_test::Expect) {
+        fn check(source: &str, expect: &expect_test::Expect) {
             expect.assert_eq(&comment_docs(source).docs);
         }
 
@@ -1276,7 +1284,7 @@ mod tests {
         // aren't re-indented.
         check(
             "/**\n * foo\n *\n *   * bullet\n *bar\n */",
-            expect![[r#"
+            &expect![[r#"
                  foo
 
                    * bullet
@@ -1284,11 +1292,11 @@ mod tests {
             "#]],
         );
         // Single-line block doc comments are left alone, like rustdoc does.
-        check("/** * item */", expect!["* item"]);
+        check("/** * item */", &expect!["* item"]);
         // So are blocks without a consistent star column.
         check(
             "/**\n * foo\n   * bar\n */",
-            expect![[r#"
+            &expect![[r#"
                 * foo
                   * bar
             "#]],

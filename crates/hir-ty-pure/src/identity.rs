@@ -72,6 +72,7 @@ pub(crate) fn content(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) 
 
 /// [`content`] in `env`, the instance's home.
 #[blaze_query::tracked(returns(ref))]
+#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
 pub(crate) fn content_in(
     db: &Db,
     env: StoredParamEnvAndCrate,

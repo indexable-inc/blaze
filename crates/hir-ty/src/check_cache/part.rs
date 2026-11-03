@@ -101,6 +101,7 @@ const BODY_SCHEMA: SchemaHash = schema_of(&[
     SchemaPart::Schema(<BodyRoot as Record>::SCHEMA),
 ]);
 
+#[expect(clippy::needless_pass_by_value, reason = "the `map_err` callback of every read, which hands it the error by value")]
 fn format_error(error: FormatError) -> String {
     // alloc: the reason of a refusal or a panic
     error.to_string()

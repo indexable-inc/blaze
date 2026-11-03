@@ -258,7 +258,7 @@ pub mod needles { pub struct Inner; }
             .find(|it| it.display_name(&db).is_some_and(|it| it.crate_name().as_str() == "main"))
             .expect("the crate `main`");
         let search = |query: hir_def::import_map::Query| {
-            main.query_external_importables(&db, query).count()
+            main.query_external_importables(&db, &query).count()
         };
         let first = search(hir_def::import_map::Query::new("needle".to_owned()));
         assert!(first >= 2, "`Needle` and `needle_fn` are found");
@@ -269,7 +269,7 @@ pub mod needles { pub struct Inner; }
         assert_eq!(again, first);
         // The same items in the same order on every search.
         let order = |db: &TestDB| {
-            main.query_external_importables(db, hir_def::import_map::Query::new("needle".to_owned()))
+            main.query_external_importables(db, &hir_def::import_map::Query::new("needle".to_owned()))
                 .map(|(item, _)| item)
                 .collect::<Vec<_>>()
         };

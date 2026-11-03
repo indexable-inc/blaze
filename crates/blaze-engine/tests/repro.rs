@@ -371,6 +371,18 @@ fn a_program_splitting_on_ascii_whitespace_builds() {
     assert_eq!(case.ok(&["run"]), "[\"-O2\", \"-g\", \"-Wall\"]\n");
 }
 
+/// A promoted temporary with its place in the source inside it, as expect-test's
+/// `expect![..].assert_eq(..)` and `&expect![..]` make one: `&Here { file: file!(), line: line!() }`.
+/// Its line is read where the code runs, so the function writes it into writable data of its
+/// own each call (`promoted_slot`), which v2 refused: "data a function writes to, which is no
+/// constant (`promoted_slot`)" for parser's and blaze-graph's expect tests (B6). The one `here`
+/// returns outlives its call, and is read after `main` has called on.
+#[test]
+fn a_promoted_temporary_with_its_place_in_it_runs() {
+    let case = Case::new("a_promoted_temporary_with_its_place_in_it_runs");
+    assert_eq!(case.ok(&["run"]), "main.rs:16\nmain.rs:11\n");
+}
+
 /// object's `ImageSymbol::name`, a provided trait method generic over its reader, reached
 /// through `CoffFile` (psm's build script, through ar_archive_writer): its references held a
 /// call of a trait method `distance` resolved to no impl, so the function was refused.

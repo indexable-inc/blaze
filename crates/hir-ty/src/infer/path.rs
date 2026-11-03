@@ -1,14 +1,16 @@
 //! Path expression resolution.
 
 use hir_def::{
-    AdtId, AssocItemId, GenericDefId, ItemContainerId, Lookup,
-    expr_store::path::{Path, PathSegment},
+    AdtId, GenericDefId, ItemContainerId, Lookup,
+    expr_store::{HygieneId, path::Path},
     hir::{ExprOrPatId, ExprOrPatIdPacked},
     item_tree::FieldsShape,
+    nameres::trait_item_name,
     resolver::{ResolveValueResult, TypeNs, ValueNs},
-    signatures::{ConstSignature, FunctionSignature, StructSignature},
+    signatures::{EnumVariants, StructSignature},
 };
 use hir_expand::name::Name;
+use span::SyntaxContext;
 use rustc_type_ir::inherent::{SliceLike, Ty as _};
 
 use crate::{
@@ -212,7 +214,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             let (ty, _) = path_ctx.lower_ty_relative_path(ty, orig_ns, true, id.into());
             drop_ctx(ctx, no_diagnostics);
             let ty = self.table.process_user_written_ty(ty);
-            self.resolve_ty_assoc_item(ty, last.name, id, false)
+            let hygiene = path.segment_hygiene(path.segments().len() - 1);
+            self.resolve_ty_assoc_item(ty, last.name, hygiene, id, false)
                 .map(|(it, substs)| (it, Some(substs)))?
         } else {
             let hygiene = self.store.expr_or_pat_path_hygiene(id.unpack());
@@ -261,6 +264,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     let last_segment = remaining_segments
                         .last()
                         .expect("there should be at least one segment here");
+                    // The context the last segment's name is written with, which the trait's or
+                    // the type's items are looked up by.
+                    let last_hygiene = path.segment_hygiene(path.segments().len() - 1);
 
                     let (resolution, substs) = match (def, is_before_last) {
                         (TypeNs::TraitId(trait_), true) => {
@@ -272,7 +278,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                                 id.into(),
                             );
                             drop_ctx(ctx, no_diagnostics);
-                            self.resolve_trait_assoc_item(trait_ref, last_segment, id)
+                            self.resolve_trait_assoc_item(
+                                trait_ref,
+                                last_segment.name,
+                                last_hygiene,
+                                id,
+                            )
                         }
                         (def, _) => {
                             // Either we already have a type (e.g. `Vec::new`), or we have a
@@ -289,7 +300,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                             let ty = self.process_user_written_ty(ty);
 
                             let desugared = matches!(path, Path::LangItem(..));
-                            self.resolve_ty_assoc_item(ty, last_segment.name, id, desugared)
+                            self.resolve_ty_assoc_item(
+                                ty,
+                                last_segment.name,
+                                last_hygiene,
+                                id,
+                                desugared,
+                            )
                         }
                     }?;
                     (resolution, Some(substs))
@@ -346,34 +363,19 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         );
     }
 
+    /// The function or constant of `trait_ref`'s trait that `Trait::name` names, `name` written
+    /// with `hygiene`: looked up by the name keyed for the trait's scope
+    /// ([`trait_item_name`], rustc's `find_by_ident_and_namespace`).
     fn resolve_trait_assoc_item(
         &mut self,
         trait_ref: TraitRef<'db>,
-        segment: PathSegment<'_>,
+        name: &Name,
+        hygiene: HygieneId,
         id: ExprOrPatIdPacked,
     ) -> Option<(ValueNs, GenericArgs<'db>)> {
         let trait_ = trait_ref.def_id.0;
-        let item =
-            trait_.trait_items(self.db).items.iter().map(|(_name, id)| *id).find_map(|item| {
-                match item {
-                    AssocItemId::FunctionId(func) => {
-                        if segment.name == &FunctionSignature::of(self.db, func).name {
-                            Some(CandidateId::FunctionId(func))
-                        } else {
-                            None
-                        }
-                    }
-
-                    AssocItemId::ConstId(konst) => {
-                        if ConstSignature::of(self.db, konst).name.as_ref() == Some(segment.name) {
-                            Some(CandidateId::ConstId(konst))
-                        } else {
-                            None
-                        }
-                    }
-                    AssocItemId::TypeAliasId(_) => None,
-                }
-            })?;
+        let name = trait_item_name(self.db, trait_, *name, hygiene);
+        let item = method_resolution::trait_value_item(self.db, trait_, name)?;
         let def = match item {
             CandidateId::FunctionId(f) => ValueNs::FunctionId(f),
             CandidateId::ConstId(c) => ValueNs::ConstId(c),
@@ -383,10 +385,15 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         Some((def, trait_ref.args))
     }
 
+    /// The item `<ty>::name` names, `name` written with `hygiene`: an enum's variant
+    /// ([`EnumVariants::variant_written`]), or what a path's probe finds among the type's impls
+    /// and the traits in scope, each looked up by the name keyed for its scope
+    /// (`probe_for_written_name`).
     fn resolve_ty_assoc_item(
         &mut self,
         ty: Ty<'db>,
         name: &Name,
+        hygiene: HygieneId,
         id: ExprOrPatIdPacked,
         desugared: bool,
     ) -> Option<(ValueNs, GenericArgs<'db>)> {
@@ -395,7 +402,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
         let ty = self.table.resolve_projections_within(ty);
 
-        if let Some(result) = self.resolve_enum_variant_on_ty(ty, name, id) {
+        if let Some(result) = self.resolve_enum_variant_on_ty(ty, name, hygiene.syntax_context(), id) {
             return Some(result);
         }
 
@@ -405,7 +412,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             if desugared {
                 ctx.probe_for_desugared_name(mode, name, ty)
             } else {
-                ctx.probe_for_name(mode, name, ty)
+                ctx.probe_for_written_name(mode, name, hygiene, ty)
             }
         });
         let (item, visible) = match res {
@@ -472,10 +479,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         Some((def, substs))
     }
 
+    /// The variant `name`, written with `ctxt`, of `ty` when it is an enum: rustc's
+    /// `resolve_fully_qualified_call` comparing `hygienic_eq` with the enum's expansion.
     fn resolve_enum_variant_on_ty(
         &mut self,
         ty: Ty<'db>,
         name: &Name,
+        ctxt: SyntaxContext,
         id: ExprOrPatIdPacked,
     ) -> Option<(ValueNs, GenericArgs<'db>)> {
         let ty = self.table.try_structurally_resolve_type(id.into(), ty);
@@ -483,8 +493,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             Some((AdtId::EnumId(e), subst)) => (e, subst),
             _ => return None,
         };
-        let enum_data = enum_id.enum_variants(self.db);
-        let variant = enum_data.variant(name)?;
+        let variant = EnumVariants::variant_written(self.db, enum_id, name, ctxt)?;
         self.write_variant_resolution(id, variant.into());
         Some((ValueNs::EnumVariantId(variant), subst))
     }

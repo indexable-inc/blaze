@@ -76,7 +76,7 @@ fn check(src: &str) -> Vec<(String, String)> {
         let text = db.file_text(file.file_id(&db)).text(&db).to_owned();
         let mut found = Vec::new();
         for def in functions(&db) {
-            let (_, map) = Body::with_source_map(&db, def);
+            let map = Body::source_map(&db, def);
             let at = |span: MirSpan| {
                 let range = match span {
                     MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => {

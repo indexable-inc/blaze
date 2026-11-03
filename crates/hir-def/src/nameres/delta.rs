@@ -34,7 +34,7 @@ pub(in crate::nameres) mod reads;
 mod run;
 mod state;
 #[cfg(test)]
-mod tests;
+pub(in crate::nameres) mod tests;
 
 use base_db::{Crate, Db, Reads, Written};
 use blaze_dbsp::{Pos, ReadIndex, Weight, Work};

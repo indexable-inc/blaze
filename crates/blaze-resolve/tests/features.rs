@@ -314,7 +314,7 @@ fn other_member_from_current() {
 #[test]
 fn virtual_features() {
     // --features in root of virtual workspace.
-    let mut ws = Ws::new(vec![features("a", &["f1"]), pkg("b")], vec![], ResolveBehavior::V1);
+    let mut ws = Ws::new(vec![features("a", &["f1"]), pkg(&"b")], vec![], ResolveBehavior::V1);
     ws.current = None;
     assert_eq!(ws.build("-p a -p b --features f1", HasDevUnits::No).unwrap(), "a: f1\nb: \n");
 }
@@ -348,7 +348,7 @@ fn virtual_typo_member_feature() {
 fn non_member() {
     // -p for a non-member
     let foo = pkg_dep_with(&"foo", vec![dep("dep")], &[("f1", &[])]);
-    let ws = Ws::new(vec![foo], vec![pkg("dep")], ResolveBehavior::V2);
+    let ws = Ws::new(vec![foo], vec![pkg(&"dep")], ResolveBehavior::V2);
     for args in ["-p dep --features f1", "-p dep --all-features", "-p dep --no-default-features"] {
         assert_eq!(
             ws.build(args, HasDevUnits::No).unwrap_err().to_string(),
@@ -363,7 +363,7 @@ fn non_member() {
 fn resolver1_member_features() {
     // --features member-name/feature-name with resolver="1"
     let mut ws = Ws::new(
-        vec![features("member1", &["m1-feature"]), pkg("member2")],
+        vec![features("member1", &["m1-feature"]), pkg(&"member2")],
         vec![],
         ResolveBehavior::V1,
     );

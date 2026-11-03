@@ -49,8 +49,9 @@ fn the_status_for_people() {
         memory_bytes: 3 << 29,
         budget_bytes: 8 << 30,
         build: blaze_api::Build::default(),
+        bugs: Vec::new(),
     };
-    assert_eq!(status_lines(&status), "pid: 41\nrequests: 2 (3, 7)\nviews: 2\nmemory: 1.5 GiB of 8.0 GiB\n");
+    assert_eq!(status_lines(&status), "pid: 41\nrequests: 2 (3, 7)\nviews: 2\nmemory: 1.5 GiB of 8.0 GiB\nbugs: 0\n");
     let idle = Status {
         pid: 7,
         requests: Vec::new(),
@@ -59,10 +60,30 @@ fn the_status_for_people() {
         memory_bytes: 512,
         budget_bytes: 1536,
         build: blaze_api::Build::default(),
+        bugs: Vec::new(),
     };
-    assert_eq!(status_lines(&idle), "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B of 1.5 KiB\n");
-    let failed = Status { history: Some("the profile history: writing /h/0-00000003.spans.parquet: disk full".to_owned()), ..idle };
-    assert!(status_lines(&failed).ends_with("history: the profile history: writing /h/0-00000003.spans.parquet: disk full\n"));
+    assert_eq!(status_lines(&idle), "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B of 1.5 KiB\nbugs: 0\n");
+    let failed =
+        Status { history: Some("the profile history: writing /h/0-00000003.spans.parquet: disk full".to_owned()), ..idle.clone() };
+    assert!(status_lines(&failed).ends_with("history: the profile history: writing /h/0-00000003.spans.parquet: disk full\nbugs: 0\n"));
+    let bug = |count, thread: Option<&str>| blaze_api::Bug {
+        kind: "AdtDef".to_owned(),
+        what: "formatted with no database attached".to_owned(),
+        at: "crates/hir-ty/src/next_solver/interner.rs:951:9".to_owned(),
+        count,
+        thread: thread.map(str::to_owned),
+    };
+    let buggy = Status { bugs: vec![bug(2, Some("blaze-worker-3")), bug(1, None)], ..idle };
+    assert!(
+        status_lines(&buggy).ends_with(
+            "bugs: 3\n  a blaze bug: `AdtDef` formatted with no database attached at \
+             crates/hir-ty/src/next_solver/interner.rs:951:9, 2 times, first on thread `blaze-worker-3`\n  \
+             a blaze bug: `AdtDef` formatted with no database attached at \
+             crates/hir-ty/src/next_solver/interner.rs:951:9, 1 time\n"
+        ),
+        "{}",
+        status_lines(&buggy)
+    );
 }
 
 /// A daemon of one build: its Status says `build`; every request it is sent is kept, and each
@@ -84,6 +105,7 @@ impl Api for OfBuild {
                     memory_bytes: 0,
                     budget_bytes: 0,
                     build: self.build.clone(),
+                    bugs: Vec::new(),
                 }),
                 Response::Done { ok: true },
             ],

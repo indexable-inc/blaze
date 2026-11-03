@@ -124,7 +124,9 @@ def root_of(step: str, out: str) -> str:
 
 
 async def run(config: Config) -> None:
-    work = Path(tempfile.mkdtemp(prefix="reach-macros-", dir="/tmp" if os.name != "nt" else None))
+    # macOS: under /tmp, as a daemon's socket is under its home and macOS allows 104 bytes.
+    # Elsewhere $TMPDIR: /tmp may be a tmpfs, which can't share blocks with blaze's cache.
+    work = Path(tempfile.mkdtemp(prefix="reach-macros-", dir="/tmp" if sys.platform == "darwin" else None))
     print(f"work: {work}", flush=True)
     at, home = work / "workspace", work / "home"
     env = base_env(str(home))

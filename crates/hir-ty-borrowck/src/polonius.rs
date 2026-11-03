@@ -280,21 +280,18 @@ fn record_variances<'db>(
             }
         }
         TyKind::Alias(_, alias) => {
-            let variances = match alias.kind {
-                rustc_type_ir::AliasTyKind::Opaque { def_id } => {
-                    super::regions::opaque_captures(ctx.frame, ctx.db, def_id, alias.args.len())
-                        .map(|it| {
-                            crate::mem::collect(
-                                ctx.frame,
-                                it.into_iter().map(|captured| match captured {
-                                    true => Variance::Invariant,
-                                    false => Variance::Bivariant,
-                                }),
-                            )
-                        })
-                }
-                _ => None,
-            };
+            // An `impl Trait`'s arguments by its variances (`opt_alias_variances`).
+            let variances =
+                super::regions::alias_captures(ctx.frame, ctx.db, alias.kind, alias.args.len())
+                    .map(|it| {
+                        crate::mem::collect(
+                            ctx.frame,
+                            it.into_iter().map(|captured| match captured {
+                                true => Variance::Invariant,
+                                false => Variance::Bivariant,
+                            }),
+                        )
+                    });
             record_args(
                 ctx,
                 alias.args,

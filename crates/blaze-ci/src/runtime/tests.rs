@@ -194,10 +194,10 @@ impl Write for Wire<'_> {
 fn a_warm_webhook_delivery_allocates_only_the_event_it_hands_on() {
     let path = temp("webhook-budget-secret");
     std::fs::write(&path, "It's a Secret to Everybody\n").unwrap();
-    let secret = Arc::new(Secret::read(&path).unwrap());
+    let secret = Secret::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
     let (service, inputs) = crossbeam_channel::unbounded();
-    let shared = Listener::remembering(secret.clone(), "o/r".to_owned(), service, 4);
+    let shared = Listener::remembering(&secret, "o/r".to_owned(), service, 4);
     let mut parser = http::RequestParser::new(crate::webhook::MOST_PAYLOAD);
     let mut answer = listen::Answer::default();
     let mut written = Vec::with_capacity(4096);
@@ -343,12 +343,12 @@ fn run_check() -> CheckRun {
 #[test]
 fn github_errors_are_retried_five_times() {
     for (failing, created) in [(0, true), (5, true), (6, false)] {
-        let github = Arc::new(Mutex::new(Flaky { failing, calls: 0 }));
+        let github = Mutex::new(Flaky { failing, calls: 0 });
         let (posts, receive) = crossbeam_channel::unbounded();
         let (service, inputs) = crossbeam_channel::unbounded();
         posts.send(Post::Create { run: RunId(3), check: run_check() }).unwrap();
         drop(posts);
-        post(github.clone(), receive, service, Duration::ZERO);
+        post(&github, &receive, &service, Duration::ZERO);
         let Ok(Input::Created { run, result }) = inputs.recv() else { panic!("nothing created") };
         assert_eq!(run, RunId(3));
         assert_eq!(result.is_ok(), created, "{failing}: {result:?}");
@@ -384,7 +384,7 @@ fn update(run: u64, id: u64, status: CheckStatus) -> Post {
 
 #[test]
 fn an_update_with_a_later_one_of_its_run_waiting_is_never_sent() {
-    let github = Arc::new(Mutex::new(Recorded::default()));
+    let github = Mutex::new(Recorded::default());
     let (posts, receive) = crossbeam_channel::unbounded();
     let (service, inputs) = crossbeam_channel::unbounded();
     posts.send(update(1, 11, CheckStatus::Queued)).unwrap();
@@ -393,7 +393,7 @@ fn an_update_with_a_later_one_of_its_run_waiting_is_never_sent() {
     posts.send(update(3, 33, CheckStatus::InProgress)).unwrap();
     posts.send(update(1, 11, CheckStatus::Success)).unwrap();
     drop(posts);
-    post(github.clone(), receive, service, Duration::ZERO);
+    post(&github, &receive, &service, Duration::ZERO);
     let recorded = github.lock();
     assert_eq!(recorded.created, ["blaze/check"]);
     assert_eq!(recorded.updated, [(33, CheckStatus::InProgress), (11, CheckStatus::Success)]);
@@ -402,14 +402,14 @@ fn an_update_with_a_later_one_of_its_run_waiting_is_never_sent() {
 
 #[test]
 fn updates_of_different_runs_are_all_sent_in_order() {
-    let github = Arc::new(Mutex::new(Recorded::default()));
+    let github = Mutex::new(Recorded::default());
     let (posts, receive) = crossbeam_channel::unbounded();
     let (service, _inputs) = crossbeam_channel::unbounded();
     for id in [5, 4, 6] {
         posts.send(update(id, id, CheckStatus::Failure)).unwrap();
     }
     drop(posts);
-    post(github.clone(), receive, service, Duration::ZERO);
+    post(&github, &receive, &service, Duration::ZERO);
     let statuses = [(5, CheckStatus::Failure), (4, CheckStatus::Failure), (6, CheckStatus::Failure)];
     assert_eq!(github.lock().updated, statuses);
 }
@@ -450,7 +450,7 @@ fn slow_lanes(wait: Duration) -> (Posts, Arc<std::sync::atomic::AtomicUsize>, Ar
         let (to_lane, posts) = crossbeam_channel::unbounded();
         let fake = Slow { wait, in_flight: in_flight.clone(), most: most.clone(), calls: calls.clone() };
         let service = service.clone();
-        thread::spawn(move || post(Arc::new(Mutex::new(fake)), posts, service, Duration::ZERO));
+        thread::spawn(move || post(&Mutex::new(fake), &posts, &service, Duration::ZERO));
         lanes.push(to_lane);
     }
     (Posts { lanes }, most, calls, inputs)
@@ -526,13 +526,13 @@ fn deliver(at: std::net::SocketAddr, id: &str, signature: &str, body: &[u8]) -> 
 fn needs_loopback_a_delivery_is_checked_answered_and_handed_on_once() {
     let path = temp("webhook-secret");
     std::fs::write(&path, "It's a Secret to Everybody\n").unwrap();
-    let secret = Arc::new(Secret::read(&path).unwrap());
+    let secret = Secret::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let at = listener.local_addr().unwrap();
     let (service, inputs) = crossbeam_channel::unbounded();
-    let shared = Arc::new(Listener::new(secret.clone(), "o/r".to_owned(), service));
-    thread::spawn(move || listen::serve(listener, shared));
+    let shared = Arc::new(Listener::new(&secret, "o/r".to_owned(), service));
+    thread::spawn(move || listen::serve(&listener, &shared));
 
     let commit = "0123456789abcdef0123456789abcdef01234567";
     let body = format!(
@@ -566,9 +566,9 @@ fn loopback_listener() -> (std::net::SocketAddr, Arc<Secret>, crossbeam_channel:
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let at = listener.local_addr().unwrap();
     let (service, inputs) = crossbeam_channel::unbounded();
-    let shared = Arc::new(Listener::new(secret.clone(), "o/r".to_owned(), service));
+    let shared = Arc::new(Listener::new(&secret, "o/r".to_owned(), service));
     let serving = Arc::clone(&shared);
-    thread::spawn(move || listen::serve(listener, serving));
+    thread::spawn(move || listen::serve(&listener, &serving));
     (at, secret, inputs, shared)
 }
 

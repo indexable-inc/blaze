@@ -32,9 +32,10 @@ use crate::model::{
 };
 use crate::place::Totals;
 use crate::reloc::{self, Bad, Ctx, GotKind};
-use crate::stage::{Content, Stage, error, function_of};
+use crate::stage::{Content, Stage, error, function_of, named_in};
 use crate::state::{self, Def, PieceId, PieceRef, Space, State, What};
 use crate::symbols::{IdNo, SymKey, Symbols};
+use crate::thunk;
 use crate::{Debug, Format, LinkError, OutputKind};
 
 /// What a symbol is worth to a fixup.
@@ -54,7 +55,7 @@ pub(crate) enum Value {
 
 /// Why a symbol has no value; made into words only when an error is reported.
 #[derive(Debug)]
-enum Why {
+pub(crate) enum Why {
     Undefined(Sym),
     Removed,
     Alias(Sym),
@@ -63,12 +64,18 @@ enum Why {
 
 impl Why {
     fn say(&self, symbols: &Symbols) -> String {
+        self.say_with(&|sym| symbols.describe(sym))
+    }
+
+    /// [`Why::say`] with each symbol named by `describe` ([`named_in`] where the writer has
+    /// the state and the readers).
+    fn say_with(&self, describe: &dyn Fn(Sym) -> String) -> String {
         match self {
             // alloc: error path
-            Why::Undefined(sym) => format!("{} is not defined", symbols.describe(*sym)),
+            Why::Undefined(sym) => format!("{} is not defined", describe(*sym)),
             Why::Removed => "a symbol in a removed piece".into(),
             // alloc: error path
-            Why::Alias(sym) => format!("{} is an alias of itself", symbols.describe(*sym)),
+            Why::Alias(sym) => format!("{} is an alias of itself", describe(*sym)),
             // clone: error path
             Why::Special(what) => what.clone(),
         }
@@ -115,7 +122,7 @@ impl Resolver<'_> {
         }
     }
 
-    fn value(&self, mut sym: Sym) -> Result<Value, Why> {
+    pub(crate) fn value(&self, mut sym: Sym) -> Result<Value, Why> {
         for _ in 0..64 {
             return Ok(match self.state.def(sym) {
                 Def::Piece { piece, offset } => Value::Image(self.state.piece(piece).ok_or(Why::Removed)?.addr + offset),
@@ -369,11 +376,11 @@ impl Column {
         matches!(self.whys.get(at as usize), Some(Why::Removed))
     }
 
-    fn why(&self, symbols: &Symbols, sym: Sym, at: u32) -> String {
+    fn why(&self, describe: &dyn Fn(Sym) -> String, sym: Sym, at: u32) -> String {
         match self.whys.get(at as usize) {
-            Some(why) => why.say(symbols),
+            Some(why) => why.say_with(describe),
             // alloc: error path
-            None => format!("{} was not resolved before relocation", symbols.describe(sym)),
+            None => format!("{} was not resolved before relocation", describe(sym)),
         }
     }
 }
@@ -512,11 +519,12 @@ impl Reloc<'_> {
         let abs = fixups.iter().filter(|it| it.apply == Apply::Abs64).count();
         out.rebase.reserve(abs);
         out.binds.reserve(abs);
+        let describe = |sym: Sym| named_in(symbols, &[self.state], self.writer, sym);
         let fail = |fixup: &Fixup, what: String| {
             error(
                 function_of(piece),
                 // alloc: error path
-                format!("{:?} at {:#x} in {}: {what}", fixup.apply, fixup.at, symbols.describe(piece.sym)),
+                format!("{:?} at {:#x} in {}: {what}", fixup.apply, fixup.at, describe(piece.sym)),
             )
         };
         for fixup in fixups {
@@ -531,7 +539,7 @@ impl Reloc<'_> {
                     place[..width].fill(0);
                     continue;
                 }
-                Err(at) => return Err(fail(fixup, self.column.why(symbols, fixup.target, at))),
+                Err(at) => return Err(fail(fixup, self.column.why(&describe, fixup.target, at))),
             };
             let s = match value {
                 Value::Image(s) | Value::Absolute(s) => s,
@@ -566,7 +574,7 @@ impl Reloc<'_> {
                     Ok(Value::Tls(offset)) => tls_base + offset,
                     Ok(Value::TpOff(_)) => return Err(fail(fixup, "the difference of another image's thread-local".into())),
                     Ok(Value::Import(_)) => return Err(fail(fixup, "the difference of an import".into())),
-                    Err(at) => return Err(fail(fixup, self.column.why(symbols, minus, at))),
+                    Err(at) => return Err(fail(fixup, self.column.why(&describe, minus, at))),
                 },
                 None => 0,
             };
@@ -671,9 +679,11 @@ impl Reloc<'_> {
                 None => 0,
             };
             let mut slid = matches!(value, Value::Image(_));
+            let mut plt = false;
             let s = match value {
                 Value::Import(at) if through_plt(fixup.apply, self.got_by_library, self.imports, at) => {
                     slid = true;
+                    plt = true;
                     match self.column.cells(fixup.target).plt {
                         // alloc: error path
                         NONE => return Err(fail(fixup, format!("no PLT stub of {}", symbols.describe(fixup.target)))),
@@ -717,11 +727,36 @@ impl Reloc<'_> {
             if fixup.apply == Apply::Abs64 && slid {
                 out.rebase.push(fixup.at);
             }
-            let ctx = Ctx { arch: self.arch, format: self.format, s, a: fixup.addend, p, g, m, base: self.base, tls: self.tls, tp };
+            let (s, a) = if slid && thunk::extends(fixup.apply) && !thunk::reaches(p, s.wrapping_add(fixup.addend as u64), thunk::REACH) {
+                self.thunk(fixup, plt, p, s).map_err(|it| fail(fixup, it))?
+            } else {
+                (s, fixup.addend)
+            };
+            let ctx = Ctx { arch: self.arch, format: self.format, s, a, p, g, m, base: self.base, tls: self.tls, tp };
             // alloc: error path
             reloc::apply(fixup.apply, &ctx, place).map_err(|it| fail(fixup, it.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Where a branch at `p` out of reach of its target (at `s`, its PLT stub when `plt`) goes
+    /// instead: the nearest thunk of it in reach ([`thunk::through`]), with no addend. An error
+    /// naming the target when there is none.
+    fn thunk(&self, fixup: &Fixup, plt: bool, p: u64, s: u64) -> Result<(u64, i64), String> {
+        let target = if plt { self.symbols.find(SymKey::Plt(fixup.target)) } else { Some(fixup.target) };
+        if let Some(at) = target.and_then(|it| thunk::through(self.symbols, self.state, it, fixup.addend, p)) {
+            return Ok((at, 0));
+        }
+        let to = s.wrapping_add(fixup.addend as u64);
+        // alloc: error path
+        Err(format!(
+            "a branch to {}{} at {to:#x}, {:#x} bytes away: past its 128 MiB reach, and no thunk of it is in reach \
+             (the image has {} thunk islands)",
+            named_in(self.symbols, &[self.state], self.writer, fixup.target),
+            if plt { " through its PLT stub" } else { "" },
+            to.wrapping_sub(p) as i64,
+            self.state.islands,
+        ))
     }
 
     /// The jump table's cells in a full link: each filled slot's body's address, rebased.
@@ -743,6 +778,47 @@ impl Reloc<'_> {
         }
         Ok(())
     }
+}
+
+/// The most regions [`write_order`] has room for: the region index gets 31 bits.
+const MAX_REGIONS: usize = 1 << 31;
+
+/// The order a full link writes pieces in: by region, then address; at one address the
+/// zero-sized pieces first, then by piece. [`Stage::put`] lays a piece with no bytes at the
+/// address the next one starts at, and piece IDs follow creation, not layout: written after
+/// its neighbour, an empty piece's offset is below what the neighbour took and reads as an
+/// overlap. With the empty pieces first every piece starts at or past the end of the one
+/// written before it, and a real overlap is still one. Unique, so the order is one whatever
+/// the input's.
+fn write_order(region: u32, addr: u64, filled: bool, id: PieceId) -> u128 {
+    debug_assert!((region as usize) < MAX_REGIONS);
+    (u128::from(region) << 97) | (u128::from(addr) << 33) | (u128::from(filled) << 32) | u128::from(id)
+}
+
+/// A full link's piece that starts before the end of the one written before it in its
+/// region: both named, with their sizes, alignments and offsets in the region.
+#[cold]
+fn overlap(symbols: &Symbols, state: &State, space: &Space, piece: PieceRef<'_>, last: Option<PieceId>) -> LinkError {
+    let class = &space.region.class;
+    let at = |it: PieceRef<'_>| {
+        let start = it.addr - space.region.addr;
+        // alloc: error path
+        format!(
+            "{} ({} bytes, align {}) at [{class:?}+{start:#x}, {class:?}+{:#x})",
+            symbols.describe(it.sym),
+            it.size,
+            it.align(),
+            start + it.size
+        )
+    };
+    let before = last.and_then(|it| state.piece(it));
+    let what = match before {
+        // alloc: error path
+        Some(it) => format!("{} overlaps the piece before it, {}", at(piece), at(it)),
+        // alloc: error path
+        None => format!("{} overlaps the piece before it, though nothing was written before it", at(piece)),
+    };
+    error(function_of(piece).or_else(|| before.and_then(function_of)), what)
 }
 
 /// Where a piece goes when its region has bytes: not a zeroed or a synthetic region.
@@ -797,11 +873,13 @@ impl<'a> Stage<'a> {
             }
         }
         let arena = self.arena;
-        let mut ids: FrameVec<'a, (u32, u64, PieceId)> = Vec::with_capacity_in(self.write.len(), arena);
-        ids.extend(self.write.iter().filter_map(|id| self.new.piece(id).map(|it| (it.region, it.addr, id))));
-        radix::sort_copy_by_key(&mut ids, |&(region, addr, id)| {
-            (u128::from(region) << 96) | (u128::from(addr) << 32) | u128::from(id)
-        });
+        let mut ids: FrameVec<'a, (u32, u64, bool, PieceId)> = Vec::with_capacity_in(self.write.len(), arena);
+        ids.extend(self.write.iter().filter_map(|id| self.new.piece(id).map(|it| (it.region, it.addr, it.size != 0, id))));
+        if self.new.spaces.len() > MAX_REGIONS {
+            // alloc: error path
+            return Err(error(None, format!("{} regions, past the writer's {MAX_REGIONS}", self.new.spaces.len())));
+        }
+        radix::sort_copy_by_key(&mut ids, |&(region, addr, filled, id)| write_order(region, addr, filled, id));
         let regions = self.new.regions();
         let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(if full { self.new.spaces.len() } else { 0 });
         if full {
@@ -821,7 +899,7 @@ impl<'a> Stage<'a> {
             let got_by_library = self.plan.got_by_library;
             let grain = ids.len().div_ceil(par::threads() * 8).max(1);
             let wants = par::map(par::chunks(&ids, grain), |ids| {
-                ids.iter().fold(Wants::default(), |mut wants, &(_, _, id)| {
+                ids.iter().fold(Wants::default(), |mut wants, &(_, _, _, id)| {
                     let piece = state.piece(id).expect("live");
                     let fixups = piece.fixups();
                     // At most a target, a minus and a GOT target each: one growth per piece at
@@ -857,7 +935,7 @@ impl<'a> Stage<'a> {
                 let len: u64 = ids
                     .iter()
                     .filter_map(|it| {
-                        let piece = state.piece(it.2)?;
+                        let piece = state.piece(it.3)?;
                         let space = state.spaces.get(piece.region as usize)?;
                         (has_bytes(space) && piece.what() != What::Cells).then_some(piece.size)
                     })
@@ -866,10 +944,12 @@ impl<'a> Stage<'a> {
             }
             let mut rest = collect_in(buffers.iter_mut().map(Vec::as_mut_slice), arena);
             let taken = arena.alloc_slice_fill_with(state.spaces.len(), |_| 0u64);
+            // The piece written last in each region: what an overlap names.
+            let written = arena.alloc_slice_fill_with(state.spaces.len(), |_| None::<PieceId>);
             let mut free: &mut [u8] = &mut *scratch;
             let mut used = 0usize;
             let mut jobs: Vec<Job<'_, '_>> = Vec::with_capacity(ids.len());
-            for &(region, _, id) in ids.iter() {
+            for &(region, _, _, id) in ids.iter() {
                 let piece = state.piece(id).expect("live");
                 let Some(space) = state.spaces.get(region as usize) else {
                     // alloc: error path
@@ -892,12 +972,9 @@ impl<'a> Stage<'a> {
                 let offset = piece.addr - space.region.addr;
                 let field: &mut [u8] = if full {
                     let Some(skip) = offset.checked_sub(taken[region as usize]) else {
-                        return Err(error(
-                            function_of(piece),
-                            // alloc: error path
-                            format!("{} overlaps the piece before it", symbols.describe(piece.sym)),
-                        ));
+                        return Err(overlap(symbols, state, space, piece, written[region as usize]));
                     };
+                    written[region as usize] = Some(id);
                     let buffer = std::mem::take(&mut rest[region as usize]);
                     let (_, tail) = buffer.split_at_mut(skip as usize);
                     let (mine, after) = tail.split_at_mut(piece.size as usize);

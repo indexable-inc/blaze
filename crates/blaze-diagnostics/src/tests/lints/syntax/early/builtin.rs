@@ -1,7 +1,7 @@
 //! The lints of rustc's `BuiltinCombinedEarlyLintPass` written in `rustc_lint/src/builtin.rs`,
 //! `redundant_semicolon.rs` and `precedence.rs`, against rustc's UI tests.
 
-use super::{ui_core, ui_std};
+use super::{stderr, ui_core, ui_std};
 use crate::tests::{assert_reports, ui, warning};
 
 #[test]
@@ -374,4 +374,38 @@ static ALLOC: Bump = Bump;
 fn main() {}
 "#;
     assert_reports(&ui_core("global-allocator-unsafe-code.rs", "2024", "global_allocator", source), &[]);
+}
+
+#[test]
+fn a_global_allocator_after_a_cfg_attribute_is_still_the_macros_own_code() {
+    // syntax's lib test: `#![deny(unsafe_code)]`, then `#[cfg(test)] #[global_allocator] static
+    // ALLOC: ..`. rustc gives no `unsafe_code` for what the attribute macro writes, whatever
+    // attribute comes before it; a hand-written `unsafe {}` in the same crate is still linted.
+    let source = r#"#![deny(unsafe_code)]
+
+use core::alloc::{GlobalAlloc, Layout};
+
+struct Bump;
+
+#[allow(unsafe_code)]
+unsafe impl GlobalAlloc for Bump {
+    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+        0 as *mut u8
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: Bump = Bump;
+
+pub fn f() {
+    unsafe {}
+}
+"#;
+    let found = stderr(&format!(
+        "//- minicore: global_allocator\n//- /global-allocator-cfg.rs crate:other:main edition:2024 cfg:test\n{source}"
+    ));
+    assert!(found.contains("error: aborting due to 1 previous error"), "{found}");
+    assert!(found.contains("error: usage of an `unsafe` block\n  --> $DIR/global-allocator-cfg.rs:20:5\n"), "{found}");
 }

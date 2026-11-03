@@ -20,7 +20,7 @@ use blaze_codegen::InstanceKey;
 use blaze_format::SpanRef;
 use blaze_format::cursor::Put;
 use blaze_graph::par;
-use blaze_hash::FixedHasher;
+use blaze_hash::{FixedHasher, LazyKey};
 use blaze_ids::{ContentId, radix};
 use blaze_items::ItemKey;
 use blaze_mem::MemError;
@@ -124,6 +124,9 @@ pub(crate) enum SymKey {
     /// A wasm static's entry in its module's `blaze.statics` list (`crate::wasm::STATICS`): its
     /// item and its instance, as [`SymKey::Static`]'s.
     StaticList(IdNo, IdNo),
+    /// An AArch64 range-extension thunk ([`crate::thunk`]): its target (a PLT stub for an
+    /// import), its island, and the addend of the branches it serves.
+    Thunk(Sym, u32, i32),
 }
 
 const _: () = assert!(size_of::<SymKey>() == 20);
@@ -164,6 +167,7 @@ impl SymKey {
             LazyStubs => [27, 0, 0, 0, 0],
             LazyEntry(a) => [28, a.0, 0, 0, 0],
             StaticList(a, b) => [29, a.0, b.0, 0, 0],
+            Thunk(target, island, addend) => [30, target.0, island, addend as u32, 0],
         }
     }
 }
@@ -202,12 +206,33 @@ pub(crate) fn hash_key(key: SymKey) -> u64 {
     fold(fold(a ^ K0, b ^ K1) ^ u64::from(w[4]), K2)
 }
 
+/// What a name's place in its shard is keyed by, drawn at random on first use. Names are what
+/// a program picks (`export_name`, `link_section`, a mangled path, a C object's symbols), so a
+/// hash anyone can compute would let it pick thousands that land in one place of a shard, each
+/// insert then probing past all of them.
+static NAME_KEY: LazyKey = LazyKey::new();
+
+/// A name's hash: bits 32..38 (its shard) from foldhash's fixed hasher, so a name's
+/// [`NameId`] is the same in every process (the ids are output); the rest, which place it in
+/// the shard and tag it there, SipHash-1-3 under [`NAME_KEY`]. A program that picks names
+/// with one fixed hash only crowds one shard, whose probes stay short.
 #[inline]
 pub(crate) fn hash_name(name: &str) -> u64 {
-    let mut hasher = FixedHasher::default();
-    hasher.write(name.as_bytes());
-    fold(hasher.finish() ^ name.len() as u64, K0)
+    let mut fixed = FixedHasher::default();
+    fixed.write(name.as_bytes());
+    let shard = fold(fixed.finish() ^ name.len() as u64, K0) & SHARD_BITS;
+    (keyed_name_hash(name) & !SHARD_BITS) | shard
 }
+
+/// SipHash-1-3 of `name` under [`NAME_KEY`]: what every table of names a program picks is
+/// placed by, here and in [`crate::native`]'s tables of an object's symbols and sections.
+#[inline]
+pub(crate) fn keyed_name_hash(name: &str) -> u64 {
+    NAME_KEY.get().hash(name.as_bytes())
+}
+
+/// The bits of a hash [`shard_of`] reads.
+const SHARD_BITS: u64 = ((SHARDS - 1) as u64) << 32;
 
 /// A content id is a BLAKE3 hash: its first eight bytes are its hash.
 #[inline]
@@ -289,6 +314,13 @@ impl Symbols {
     /// three allocations (the lists of shards).
     pub fn new() -> Result<Symbols, MemError> {
         Ok(Symbols { keys: shards(KeyShard::new)?, names: shards(NameShard::new)?, ids: shards(IdShard::new)? })
+    }
+
+    /// The bytes its shards' regions have committed ([`crate::Image::held`]).
+    pub fn held(&self) -> u64 {
+        self.keys.iter().map(KeyShard::held).sum::<u64>()
+            + self.names.iter().map(NameShard::held).sum::<u64>()
+            + self.ids.iter().map(IdShard::held).sum::<u64>()
     }
 }
 
@@ -494,6 +526,7 @@ impl Symbols {
             (Frame(x, s, i), Frame(y, t, j)) => obj(x, y).then(s.cmp(&t)).then(i.cmp(&j)),
             (Got(k, x), Got(l, y)) => k.cmp(&l).then_with(|| self.cmp(x, y)),
             (Plt(x), Plt(y)) => self.cmp(x, y),
+            (Thunk(x, i, m), Thunk(y, j, n)) => self.cmp(x, y).then(i.cmp(&j)).then(m.cmp(&n)),
             (StartHook, StartHook) => Ordering::Equal,
             (StartHook, _) => Ordering::Less,
             (_, StartHook) => Ordering::Greater,
@@ -582,6 +615,11 @@ impl Symbols {
             SymKey::Counters => write!(out, "Counters"),
             SymKey::LazyStubs => write!(out, "LazyStubs"),
             SymKey::LazyEntry(it) => write!(out, "LazyEntry({:?})", self.instance(it)),
+            SymKey::Thunk(target, island, addend) => {
+                out.push_str("Thunk(");
+                self.write_debug(self.key(target), out)?;
+                write!(out, ", island {island}, addend {addend})")
+            }
         }
     }
 
@@ -628,6 +666,11 @@ impl Symbols {
                 self.write_key(target, out);
             }
             SymKey::Plt(target) => self.write_key(target, out),
+            SymKey::Thunk(target, island, addend) => {
+                self.write_key(target, out);
+                out.put_u32(island);
+                out.put_u32(addend as u32);
+            }
             SymKey::Generation
             | SymKey::Cells
             | SymKey::Stubs

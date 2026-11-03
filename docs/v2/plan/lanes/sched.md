@@ -315,3 +315,29 @@ owner, is [sched/io.md](sched/io.md). In short:
 
 The rest of the front end and the store read mapped memory, so a cold page is a fault, not a
 request. Build-script, test and run starts do their file work on the loop, not in a job.
+
+### A scheduler per pool (2026-11-03)
+
+Built (`crates/blaze-graph/src/sched/domain.rs`, `sched/ids.rs`). The process no longer has
+one scheduler. Each pool, fiber driver, client thread and `Event` holds a `Scheduler` value:
+a wait graph and its members' wakers behind a lock of its own.
+- **Joins.** Two schedulers whose jobs meet join for good. They meet through a wait on a key,
+  counter or job of the other, a count towards the other's counter, a claim for the other's
+  job, a scope opened on the other's pool, or a stop by the other's job. The smaller world
+  moves into the bigger, and the smaller points at the bigger from then on (union-find by
+  rank, never split). So a wait is still checked against every wait it could close a cycle
+  with, and woken by whatever ends it. A stall is found per scheduler.
+- **Ids stay process-wide.** Job, counter and member ids, plus a job's or counter's
+  scheduler, sit in id tables read with no lock. Free ids go on 64 sharded lists, so a spawn
+  or an end shares no lock across pools and a warm one allocates nothing. Scheduler ids are
+  reused once their scheduler drops. A stale lookup can only find a newer scheduler, and
+  joining it only makes the union coarser.
+- **The key index** maps each key in flight to its scheduler: 128 mutex shards. It is not
+  lock-free, because papaya's epoch thread-locals can be gone before a client thread's
+  scheduler drops.
+- **Lock order.** A scheduler's lock comes first, then a fiber driver's own. Two schedulers'
+  locks are held only while joining, in id order.
+- **The cost.** Pools that interacted once share one lock forever; splitting a quiet union
+  is a follow-up. Pairs of threads that each wait on their partner's runs now scale with the
+  pairs (`benches/flights.rs`, pairs column). One process-wide lock held them at 0.40 Mops/s
+  from 8 threads up. The layouts with no waits did not change.

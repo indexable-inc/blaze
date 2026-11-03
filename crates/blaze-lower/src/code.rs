@@ -93,7 +93,12 @@ pub fn code_identity(db: &Db, krate: Crate) -> ContentId {
 /// path, edition, cfg, env, dependencies and the rest), then its source root's files as
 /// [`code_text`] has them, each by its path, sorted, with the module the compiler appended to
 /// it. A library source root, or a crate any file of which keeps its whole text, is its root's
-/// text and its source root's content, as its identity has them.
+/// content and its source root's content, as its identity has them.
+///
+/// A file of the source root that has no text (bytes that are not UTF-8: an object file or
+/// archive a build script left in `OUT_DIR`, which [`crate::Lowered::ran`] puts in its
+/// package's source root) is its bytes' content ([`Db::file_content`], what `include_bytes!`
+/// reads), never its text: `file_text` has none for it.
 #[blaze_query::tracked(returns(copy))]
 fn own_code(db: &Db, krate: Crate) -> ContentId {
     let data = krate.data(db);
@@ -102,7 +107,7 @@ fn own_code(db: &Db, krate: Crate) -> ContentId {
     let mut hasher = Hasher::new(OWN_CODE);
     hasher.id(&krate.content(db));
     let whole = |hasher: &mut Hasher| {
-        hasher.update(&[0]).id(&db.file_text(root_file).content(db)).id(&root.content(db));
+        hasher.update(&[0]).id(&db.file_content(root_file)).id(&root.content(db));
         hasher.finish()
     };
     let set = root.source_root_ref(db);
@@ -115,7 +120,10 @@ fn own_code(db: &Db, krate: Crate) -> ContentId {
         let Some(path) = set.path_for_file(&file).and_then(|it| it.as_path()).map(|it| it.as_str()) else {
             return whole(&mut hasher);
         };
-        let code = path.ends_with(".rs").then(|| code_text(db, EditionedFileId::new(db, file, data.edition)));
+        let code = match path.ends_with(".rs") {
+            true => code_text(db, EditionedFileId::new(db, file, data.edition)),
+            false => None,
+        };
         files.push((path, file, code));
     }
     if files.iter().any(|it| it.2.is_some_and(|code| code.whole)) {
@@ -127,22 +135,36 @@ fn own_code(db: &Db, krate: Crate) -> ContentId {
     hasher.opt_part(set.path_for_file(&root_file).and_then(|it| it.as_path()).map(|it| it.as_str()));
     hasher.update(&(files.len() as u64).to_le_bytes());
     for (path, file, code) in &files {
-        let text = db.file_text(*file);
-        hasher.part(path.as_bytes()).opt_part(text.appended_root_module(db));
+        let appended = match db.has_file_text(*file) {
+            true => db.file_text(*file).appended_root_module(db),
+            false => None,
+        };
+        hasher.part(path.as_bytes()).opt_part(appended);
         match code {
             Some(code) => hasher.update(&[1]).id(if strict { &code.strict } else { &code.inert }),
-            None => hasher.update(&[0]).id(&text.content(db)),
+            None => hasher.update(&[0]).id(&db.file_content(*file)),
         };
     }
     hasher.finish()
 }
 
-/// [`code_text_of`] of `file`'s parse.
+/// [`code_text_of`] of `file`'s parse; none for a file with no text (bytes that are not
+/// UTF-8), which [`own_code`] takes by its bytes' content and the compiler refuses to parse.
+///
+/// The text is read before the parse: a file that loses its text then reruns this from its
+/// first input, and its parse, which would read the text it no longer has, is not checked.
 #[blaze_query::tracked(returns(copy))]
-fn code_text(db: &Db, file: EditionedFileId) -> CodeText {
+fn code_text(db: &Db, file: EditionedFileId) -> Option<CodeText> {
+    let id = file.file_id(db);
+    if !db.has_file_text(id) {
+        // Its bytes, read so that it getting text again reruns this.
+        _ = db.file_content(id);
+        return None;
+    }
+    let text = db.file_text(id);
+    let text = text.text(db);
     let parse = file.parse(db);
-    let text = db.file_text(file.file_id(db));
-    code_text_of(&parse.syntax_node(), text.text(db))
+    Some(code_text_of(&parse.syntax_node(), text))
 }
 
 /// What of a file of text `text`, parsed as `root`, its crate's code can observe (the module's

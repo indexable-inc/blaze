@@ -56,6 +56,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blaze_core::exit::Exit;
 use blaze_hash::HashSet;
 use std::alloc::Global;
 use blaze_usercode::trace::Seen;
@@ -548,7 +549,7 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
         raw::setsid();
         if let Err(why) = raw::sandbox_init(&profile, &param_ptrs) {
             eprintln!("blaze: the sandbox could not be made: Seatbelt refused the profile: {why}");
-            raw::exit(super::COULD_NOT);
+            raw::exit(Exit::CouldNot.code());
         }
         if program.is_none() {
             raw::exit(0);
@@ -557,7 +558,7 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             // alloc: the error, once, and the program does not run.
             let error = os(&format!("the working directory {}", spec.cwd.display()));
             eprintln!("blaze: the sandbox could not be made: {error}");
-            raw::exit(super::COULD_NOT);
+            raw::exit(Exit::CouldNot.code());
         }
         // The program is often the file blaze just wrote: an exec that meets a writer's
         // descriptor not yet closed (`ETXTBSY`) is made again on blaze-core's schedule.
@@ -581,7 +582,7 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             waited += wait;
         };
         eprintln!("blaze: could not run {}: {said}", argv[0].to_string_lossy());
-        raw::exit(127);
+        raw::exit(Exit::ExecFailed.code());
     }
     super::pass_signals_to(child);
     // Waited for, not reaped yet, so that its group's id is no other's when what it left

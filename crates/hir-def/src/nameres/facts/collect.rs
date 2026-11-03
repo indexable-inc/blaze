@@ -1288,9 +1288,13 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                 let in_macro_file = self.file_id().macro_file().is_some();
                 let sink = &mut *self.sink;
                 use_.expand(item_tree, |idx, path, kind, alias| {
-                    let key = match in_macro_file {
-                        true => super::super::import_binding_key(db, crate::item_scope::ImportId { use_: id, idx }),
-                        false => None,
+                    let import = crate::item_scope::ImportId { use_: id, idx };
+                    let (key, ctxt) = match in_macro_file {
+                        true => (
+                            super::super::import_binding_key(db, import),
+                            super::super::def_site::use_path_context(db, import),
+                        ),
+                        false => (None, SyntaxContext::root(Edition::Edition2015)),
                     };
                     sink.apply(DeclOp::Import(ImportOp {
                         module: module_id,
@@ -1301,6 +1305,7 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                         visibility: visibility.clone(),
                         source: ImportSource { use_tree: idx, id, is_prelude, kind },
                         key,
+                        ctxt,
                     }));
                 })
             }

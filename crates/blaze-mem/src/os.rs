@@ -83,13 +83,8 @@ pub(crate) fn reserve(bytes: usize, huge: bool) -> io::Result<NonNull<u8>> {
 /// virtual memory it is [`reserve`], which reads zeros already.
 #[cfg(unix)]
 pub(crate) fn reserve_sparse(bytes: usize) -> io::Result<NonNull<u8>> {
-    let base = reserve_with(bytes, false, libc::PROT_READ | libc::PROT_WRITE)?;
-    #[cfg(target_os = "linux")]
-    // Advice only: with transparent huge pages off the kernel says EINVAL, which is what is
-    // asked anyway.
-    // SAFETY: `[base, base + bytes)` is the reservation just made.
-    let _ = unsafe { libc::madvise(base.as_ptr().cast(), bytes, libc::MADV_NOHUGEPAGE) };
-    Ok(base)
+    // Base pages, advised so by `reserve_with` (`advise_pages`).
+    reserve_with(bytes, false, libc::PROT_READ | libc::PROT_WRITE)
 }
 
 #[cfg(windows)]
@@ -140,15 +135,79 @@ fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNu
         let _ = unsafe { libc::munmap(aligned.wrapping_add(bytes).cast(), tail) };
     }
     #[cfg(target_os = "linux")]
-    if huge {
-        // Advice only: with transparent huge pages off the kernel says EINVAL and the region
-        // is made of base pages, which is what the machine offers.
-        // SAFETY: `[aligned, aligned + bytes)` is the reservation just made.
-        let _ = unsafe { libc::madvise(aligned.cast(), bytes, libc::MADV_HUGEPAGE) };
-    }
+    advise_pages(aligned, bytes, huge);
     #[cfg(not(target_os = "linux"))]
     let _ = huge;
     NonNull::new(aligned).ok_or_else(|| io::Error::other("mmap returned null"))
+}
+
+/// Tells Linux which pages `[ptr, ptr + bytes)` is made of: with `huge`, transparent huge
+/// pages (`MADV_HUGEPAGE`); without, base pages only (`MADV_NOHUGEPAGE`), whatever the host's
+/// `transparent_hugepage/enabled` says. A base-page region is touched sparsely (a table's
+/// first entries, a stack's top, a bump arena's head), and under `always` the kernel would
+/// back each first touch with 2 MiB, and khugepaged would collapse any 2 MiB with one page in
+/// it (`max_ptes_none` is 511 by default): an ix VM's daemon reached 60 GiB that way, against
+/// 25 GiB under `madvise`. Advice only: a kernel without transparent huge pages says EINVAL,
+/// and has the base pages asked for.
+///
+/// A fresh mapping over part of a range (a decommit's `MAP_FIXED`) loses the advice, so each
+/// such mapping is advised again.
+#[cfg(target_os = "linux")]
+fn advise_pages(ptr: *mut u8, bytes: usize, huge: bool) {
+    let advice = if huge { libc::MADV_HUGEPAGE } else { libc::MADV_NOHUGEPAGE };
+    // SAFETY: the caller's range is a mapping of its own; advice changes no contents.
+    let _ = unsafe { libc::madvise(ptr.cast(), bytes, advice) };
+}
+
+/// Keeps `[ptr, ptr + bytes)`, a mapping its caller made outside a region (a fiber's stack),
+/// on base pages whatever the host's transparent huge page setting: see [`advise_pages`].
+/// Nothing elsewhere.
+///
+/// # Safety
+///
+/// The range is a live mapping the caller owns.
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn keep_base_pages(ptr: NonNull<u8>, bytes: usize) {
+    advise_pages(ptr.as_ptr(), bytes, false);
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) unsafe fn keep_base_pages(_ptr: NonNull<u8>, _bytes: usize) {}
+
+/// What the process tells Linux about transparent huge pages in memory nothing advised (the
+/// global allocator's when it is not on huge pages, thread stacks, libc's own mappings),
+/// given the pages its huge regions are made of ([`crate::huge::Thp`]).
+///
+/// - `Pages::Transparent`: only advised memory gets them, as under the
+///   host setting `madvise` (`PR_SET_THP_DISABLE` with `PR_THP_DISABLE_EXCEPT_ADVISED`, Linux
+///   6.18). An older kernel refuses the flag; then every region of ours is still advised one
+///   by one ([`advise_pages`]) and the rest follows the host, which [`Thp::Unavailable`]
+///   says in the memory profile.
+/// - `Pages::Base` and `Pages::Reserved` (hugetlb, which this does not touch): none at all
+///   (`PR_SET_THP_DISABLE`, Linux 3.15).
+///
+/// Linux keeps the setting across `fork` and `execve`, so a child process (rustc, the linker)
+/// runs under it too.
+///
+/// [`Thp::Unavailable`]: crate::huge::Thp::Unavailable
+#[cfg(target_os = "linux")]
+pub(crate) fn opt_out_unadvised(pages: crate::huge::Pages) -> crate::huge::Thp {
+    use crate::huge::{Pages, Thp};
+    /// `prctl.h`'s `PR_THP_DISABLE_EXCEPT_ADVISED` (Linux 6.18).
+    const PR_THP_DISABLE_EXCEPT_ADVISED: libc::c_ulong = 1 << 1;
+    let (flags, then) = match pages {
+        Pages::Transparent => (PR_THP_DISABLE_EXCEPT_ADVISED, Thp::AdvisedOnly),
+        Pages::Base | Pages::Reserved => (0, Thp::Off),
+    };
+    let (on, unused): (libc::c_ulong, libc::c_ulong) = (1, 0);
+    // SAFETY: sets one flag of this process's memory descriptor; reads and writes no memory.
+    let set = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, on, flags, unused, unused) };
+    if set == 0 { then } else { Thp::Unavailable }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn opt_out_unadvised(_pages: crate::huge::Pages) -> crate::huge::Thp {
+    crate::huge::Thp::NotLinux
 }
 
 #[cfg(windows)]
@@ -622,11 +681,9 @@ pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, huge: bool) -> io:
     if got == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
+    // The same range, mapped afresh just now: the new mapping lost the advice.
     #[cfg(target_os = "linux")]
-    if huge {
-        // SAFETY: the same range, mapped afresh just now; the new mapping lost the advice.
-        let _ = unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, libc::MADV_HUGEPAGE) };
-    }
+    advise_pages(ptr.as_ptr(), bytes, huge);
     #[cfg(not(target_os = "linux"))]
     let _ = huge;
     Ok(())
@@ -663,42 +720,46 @@ pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, _huge: bool) -> io
 /// drops them at once (`MADV_DONTNEED`), so the resident set falls now, not under pressure;
 /// macOS marks them reusable (`MADV_FREE_REUSABLE`), which takes them out of the process's
 /// footprint; Windows decommits them (`MEM_DECOMMIT`), which also gives back their charge
-/// against the commit limit.
+/// against the commit limit. Says whether the pages went: a refusal leaves them resident,
+/// which costs memory and not correctness, and the caller must not count them as given back.
 ///
 /// # Safety
 ///
 /// As for [`commit`], the range is committed, and nothing holds data in it or touches it
 /// before [`reuse`] is called over it.
 #[cfg(unix)]
-pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) {
+pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) -> bool {
     #[cfg(target_os = "macos")]
     let advice = libc::MADV_FREE_REUSABLE;
     #[cfg(not(target_os = "macos"))]
     let advice = libc::MADV_DONTNEED;
-    // Advice: a refusal leaves the pages resident, which costs memory and not correctness.
     // SAFETY: the caller says the committed range holds nothing anyone reads.
-    let _ = unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, advice) };
+    unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, advice) == 0 }
 }
 
 #[cfg(windows)]
-pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) {
+pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
     // A refusal leaves the pages committed, which costs memory and not correctness: `reuse`
     // commits them either way.
     // SAFETY: the caller says the committed range holds nothing anyone reads, and nothing
     // touches it before `reuse` commits it again.
-    let _ = unsafe { VirtualFree(ptr.as_ptr().cast(), bytes, MEM_DECOMMIT) };
+    unsafe { VirtualFree(ptr.as_ptr().cast(), bytes, MEM_DECOMMIT) != 0 }
 }
 
 /// The pages go back through the runner, as for [`decommit`]; they read zeros after.
 #[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
-pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) {
+pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) -> bool {
     // SAFETY: the caller says the committed range holds nothing anyone reads.
     unsafe { runner::decommit(ptr.as_ptr(), bytes) };
+    true
 }
 
+/// Nothing here gives pages back: the memory stays the process's, so none counts as given.
 #[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
-pub(crate) unsafe fn purge(_ptr: NonNull<u8>, _bytes: usize) {}
+pub(crate) unsafe fn purge(_ptr: NonNull<u8>, _bytes: usize) -> bool {
+    false
+}
 
 /// Makes the pages of `[ptr, ptr + bytes)`, some of which [`purge`] may have given back, the
 /// process's again before they are written: macOS counts pages marked reusable back into the

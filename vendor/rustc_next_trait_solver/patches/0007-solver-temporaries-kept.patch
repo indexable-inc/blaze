@@ -1,7 +1,8 @@
-diff -ruN a/src/canonical/canonicalizer.rs b/src/canonical/canonicalizer.rs
+diff --git a/src/canonical/canonicalizer.rs b/src/canonical/canonicalizer.rs
+index a457c0d..fca0536 100644
 --- a/src/canonical/canonicalizer.rs
 +++ b/src/canonical/canonicalizer.rs
-@@ -176,7 +176,10 @@
+@@ -176,7 +176,10 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
                          delegate,
                          CanonicalizeMode::Input(CanonicalizeInputKind::Predicate),
                      );
@@ -13,10 +14,11 @@ diff -ruN a/src/canonical/canonicalizer.rs b/src/canonical/canonicalizer.rs
                      rest_canonicalizer.state.var_kinds.clone_from(&e.var_kinds);
                      rest_canonicalizer
                          .state
-diff -ruN a/src/placeholder.rs b/src/placeholder.rs
+diff --git a/src/placeholder.rs b/src/placeholder.rs
+index fdf7022..ab9575b 100644
 --- a/src/placeholder.rs
 +++ b/src/placeholder.rs
-@@ -48,7 +48,8 @@
+@@ -48,7 +48,8 @@ where
          IndexMap<ty::PlaceholderType<I>, ty::BoundTy<I>>,
          IndexMap<ty::PlaceholderConst<I>, ty::BoundConst<I>>,
      ) {
@@ -26,7 +28,7 @@ diff -ruN a/src/placeholder.rs b/src/placeholder.rs
          let mut replacer = BoundVarReplacer {
              infcx,
              mapped_regions: Default::default(),
-@@ -68,7 +69,7 @@
+@@ -68,7 +69,7 @@ where
              current_index: _,
          } = replacer;
  
@@ -35,10 +37,11 @@ diff -ruN a/src/placeholder.rs b/src/placeholder.rs
              for (old, new) in old_universes.into_iter().zip(universe_indices.iter()) {
                  if let (None, Some(new)) = (old, new) {
                      // FIXME(-Zassumptions-on-binders): `replace_bound_vars` does not have enough
-diff -ruN a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
+diff --git a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
+index 72a4003..50bccbe 100644
 --- a/src/solve/eval_ctxt/mod.rs
 +++ b/src/solve/eval_ctxt/mod.rs
-@@ -14,7 +14,7 @@
+@@ -14,7 +14,7 @@ use rustc_type_ir::search_graph::{
  use rustc_type_ir::solve::{
      AccessedOpaques, ExternalRegionConstraints, FastPathDepth, FetchEligibleAssocItemResponse,
      MaybeInfo, NoSolutionOrRerunNonErased, OpaqueTypesJank, QueryResultOrRerunNonErased, RerunCondition,
@@ -47,7 +50,7 @@ diff -ruN a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
  };
  use rustc_type_ir::transmute::Answer;
  use rustc_type_ir::{
-@@ -22,7 +22,6 @@
+@@ -22,7 +22,6 @@ use rustc_type_ir::{
      PredicateKind, PredicateProxy, Region, RegionVid, TypeFoldable, TypeSuperVisitable,
      TypeVisitable, TypeVisitableExt, TypeVisitor, TypingMode, max_universe,
  };
@@ -55,7 +58,7 @@ diff -ruN a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
  use tracing::{Level, debug, instrument, trace, warn};
  
  use super::has_only_region_constraints;
-@@ -972,7 +971,7 @@
+@@ -972,7 +971,7 @@ where
          previously_succeeded_in_erased: SucceededInErased<I>,
      ) -> GoalStalledOn<I> {
          // Remove the canonicalized universal vars, since we only care about stalled existentials.

@@ -80,12 +80,15 @@ pub const fn name_hash_finish(mut h: u64) -> u64 {
     h ^ (h >> 33)
 }
 
-/// The hash `intern`'s tables key a value's bytes by, and a [`Phf`] made with
-/// [`name_phf_table!`](crate::name_phf_table) its keys by: FxHash's multiply-rotate over 8-byte
-/// words, the length first, then [`name_hash_finish`]. An image's symbol index is laid out by
-/// it, so it never changes. It is here, where both reach it, so that one hash of a name finds it
-/// in a compiled-in set and, if it is not there, in the interner's table. A name of 1 to 8
-/// bytes is one word: `name_hash_finish(name_hash_word(name_hash_start(len), word))`.
+/// The hash a [`Phf`] made with [`name_phf_table!`](crate::name_phf_table) keys its names by,
+/// which the lexer computes while a name's bytes are in registers: FxHash's multiply-rotate over
+/// 8-byte words, the length first, then [`name_hash_finish`]. A name of 1 to 8 bytes is one
+/// word: `name_hash_finish(name_hash_word(name_hash_start(len), word))`.
+///
+/// Fixed and unseeded, and every step inverts, so anyone can make thousands of names with one
+/// hash (review finding S5). A perfect hash of a fixed set costs one compare whatever the
+/// collisions, so that is all it may key: a table that grows with the names a source picks
+/// (`intern`'s) is placed by a keyed hash, `blaze_hash::SipKey`.
 #[inline]
 pub const fn name_hash(bytes: &[u8]) -> u64 {
     let mut h = name_hash_start(bytes.len());

@@ -462,4 +462,34 @@ impl Reads {
         reads.macros.sort_unstable();
         reads
     }
+
+    /// These reads with `deps` as what the crates of the closure read ([`Reads::deps`]) and
+    /// `primary` as the crates that read `CARGO_PRIMARY_PACKAGE` ([`Reads::primary`]), each
+    /// given in order.
+    pub(super) fn with_deps_for_tests(
+        mut self,
+        deps: &[(u32, &[&[u8]])],
+        primary: &[u32],
+    ) -> Reads {
+        self.deps = deps
+            .iter()
+            .map(|&(at, shapes)| (at, shapes.iter().map(|&shape| (shape.into(), None)).collect()))
+            .collect();
+        self.primary = primary.to_vec();
+        self
+    }
+
+    /// Every part of the reads, their values left out: the variables, the expansions' names,
+    /// each dependency's by its index ([`Reads::deps`]), and [`Reads::primary`].
+    pub(super) fn parts_for_tests(&self) -> super::tests::ReadsParts {
+        let shapes = |shapes: &[(Arc<[u8]>, Option<ContentId>)]| -> Vec<Box<[u8]>> {
+            shapes.iter().map(|(shape, _)| Box::<[u8]>::from(&**shape)).collect()
+        };
+        (
+            self.env.clone(),
+            shapes(&self.macros),
+            self.deps.iter().map(|(at, deps)| (*at, shapes(deps))).collect(),
+            self.primary.clone(),
+        )
+    }
 }

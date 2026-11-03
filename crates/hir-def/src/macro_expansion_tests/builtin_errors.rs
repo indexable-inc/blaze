@@ -57,7 +57,7 @@ pub(super) fn macro_calls(db: &TestDB) -> Vec<MacroCallId> {
 
 /// The error of each macro call of `ra_fixture` that has one, in the order of their spans.
 #[track_caller]
-fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(false);
     let db = fixture::db(ra_fixture).into_db();
     let mut errors: Vec<(TextSize, String)> = Vec::new();
@@ -118,7 +118,7 @@ fn main() {
     include_bytes!(invalid);
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
 builtin-macro-error: argument must be a string literal
   at `invalid`
 builtin-macro-error: expected string literal
@@ -159,7 +159,7 @@ fn main() {
     include_str!("a", "b");
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
 builtin-macro-error: environment variable `CARGO_PKG_VERSOIN` not defined at compile time
   at `env!("CARGO_PKG_VERSOIN")`
   = help: there is a similar Cargo environment variable: `CARGO_PKG_VERSION`
@@ -196,7 +196,7 @@ fn main() {
     column!(x);
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
 builtin-macro-error: line! takes no arguments
   at `line!(1)`
 builtin-macro-error: column! takes no arguments
@@ -218,7 +218,7 @@ fn main() {
     concat!(x, 1, y);
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
 builtin-macro-error: cannot concatenate a byte string literal
   at `b'b'`
 builtin-macro-error: cannot concatenate a C string literal
@@ -248,7 +248,7 @@ fn main() {
     concat_bytes!(x);
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
 builtin-macro-error: cannot concatenate string literals
   at `"a"`
 builtin-macro-error: cannot concatenate doubly nested array
@@ -306,7 +306,7 @@ fn main() {
     let y = m!();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
 builtin-macro-error: macro expansion ignores `;` and any tokens following
   at `;`
   = note: the usage of `proc_macros::mirror!` is likely invalid in expression context
@@ -395,6 +395,48 @@ fn main() {{
     assert_eq!(
         errors,
         [(format!("`{path}` wasn't a utf-8 file"), format!("include_str!({path:?})"))]
+    );
+}
+
+/// rustc's `expand_include` refuses a file outside the VFS that can't be read, or isn't UTF-8,
+/// with its loader's "couldn't read" at the call.
+#[test]
+fn include_of_an_outside_file_that_cannot_be_read_is_rustc_s_error() {
+    let dir = std::env::temp_dir().join(format!("blaze-include-unread-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("the temporary directory");
+    let (missing, binary) = (dir.join("missing.rs"), dir.join("binary.rs"));
+    std::fs::write(&binary, [b'a', 0xff, 0xfe]).expect("the temporary file");
+    let (missing, binary) = (missing.to_str().expect("UTF-8"), binary.to_str().expect("UTF-8"));
+    let text = format!(
+        r#"
+#[rustc_builtin_macro]
+macro_rules! include {{() => {{}}}}
+
+fn main() {{
+    include!({missing:?});
+    include!({binary:?});
+}}
+"#
+    );
+    let db = fixture::db(&text).into_db();
+    let errors: Vec<_> = macro_calls(&db)
+        .into_iter()
+        .filter_map(|call| call.parse_macro_expansion(&db).err.clone())
+        .map(|err| (err.render_to_string(&db).message, text_at(&db, err.span())))
+        .collect();
+    std::fs::remove_dir_all(&dir).expect("the temporary directory");
+    assert_eq!(
+        errors,
+        [
+            (
+                format!("couldn't read `{missing}`: No such file or directory (os error 2)"),
+                format!("include!({missing:?})")
+            ),
+            (
+                format!("couldn't read `{binary}`: stream did not contain valid UTF-8"),
+                format!("include!({binary:?})")
+            ),
+        ]
     );
 }
 
@@ -519,7 +561,7 @@ enum Either { A(u8) }
 #[derive(From)]
 struct Two(u8, u8);
 "#,
-        expect![[r#"
+        &expect![[r#"
 builtin-derive-error: `#[derive(From)]` used on an enum
   at `From`
   at `Either`
@@ -553,7 +595,7 @@ struct NotMaybe<T>(T);
 #[derive(CoercePointee)]
 struct NotTransparent<T: ?Sized>(T);
 "#,
-        expect![[r#"
+        &expect![[r#"
 builtin-derive-error[E0802]: `CoercePointee` can only be derived on `struct`s with `#[repr(transparent)]`
   at `CoercePointee`
 builtin-derive-error[E0802]: only one type parameter can be marked as `#[pointee]` when deriving `CoercePointee` traits

@@ -16,8 +16,17 @@ pub struct Stack {
 }
 
 impl Stack {
+    /// The stack is kept on base pages: a fiber touches its top few pages, and under the host
+    /// setting `transparent_hugepage=always` each fiber would otherwise hold 2 MiB from its
+    /// first call.
     pub fn new(bytes: usize) -> io::Result<Stack> {
-        Ok(Stack { stack: DefaultStack::new(bytes)?, bytes })
+        let stack = Stack { stack: DefaultStack::new(bytes)?, bytes };
+        let limit = std::ptr::NonNull::new(std::ptr::without_provenance_mut::<u8>(stack.limit()))
+            .ok_or_else(|| io::Error::other("corosensei gave a stack at address 0"))?;
+        // SAFETY: `[limit, base)` is the stack's usable range, mapped by `DefaultStack` and
+        // owned by it, alive while `stack` is; advice changes no contents.
+        unsafe { blaze_mem::huge::keep_base_pages(limit, bytes) };
+        Ok(stack)
     }
 
     /// The lowest usable address: the stack has at least `bytes` above its guard page, which

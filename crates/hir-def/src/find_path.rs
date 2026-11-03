@@ -847,7 +847,7 @@ pub(crate) mod tests {
         prefer_absolute: bool,
         prefer_no_std: bool,
         allow_unstable: bool,
-        expect: Expect,
+        expect: &Expect,
     ) {
         let fx = fixture::db(ra_fixture);
         let pos = fx.position();
@@ -911,7 +911,7 @@ pub(crate) mod tests {
     fn check_found_path(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
         path: &str,
-        expect: Expect,
+        expect: &Expect,
     ) {
         check_found_path_(ra_fixture, path, false, false, false, false, expect);
     }
@@ -919,7 +919,7 @@ pub(crate) mod tests {
     fn check_found_path_prelude(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
         path: &str,
-        expect: Expect,
+        expect: &Expect,
     ) {
         check_found_path_(ra_fixture, path, true, false, false, false, expect);
     }
@@ -927,7 +927,7 @@ pub(crate) mod tests {
     fn check_found_path_absolute(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
         path: &str,
-        expect: Expect,
+        expect: &Expect,
     ) {
         check_found_path_(ra_fixture, path, false, true, false, false, expect);
     }
@@ -935,7 +935,7 @@ pub(crate) mod tests {
     fn check_found_path_prefer_no_std(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
         path: &str,
-        expect: Expect,
+        expect: &Expect,
     ) {
         check_found_path_(ra_fixture, path, false, false, true, false, expect);
     }
@@ -943,7 +943,7 @@ pub(crate) mod tests {
     fn check_found_path_prefer_no_std_allow_unstable(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
         path: &str,
-        expect: Expect,
+        expect: &Expect,
     ) {
         check_found_path_(ra_fixture, path, false, false, true, true, expect);
     }
@@ -956,7 +956,7 @@ struct S;
 $0
         "#,
             "S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): S
                 Plain  (imports ✖): S
                 ByCrate(imports ✔): crate::S
@@ -975,7 +975,7 @@ enum E { A }
 $0
         "#,
             "E::A",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): E::A
                 Plain  (imports ✖): E::A
                 ByCrate(imports ✔): crate::E::A
@@ -996,7 +996,7 @@ mod foo {
 $0
         "#,
             "foo::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): foo::S
                 Plain  (imports ✖): foo::S
                 ByCrate(imports ✔): crate::foo::S
@@ -1020,7 +1020,7 @@ struct S;
 $0
         "#,
             "super::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): super::S
                 Plain  (imports ✖): super::S
                 ByCrate(imports ✔): crate::foo::S
@@ -1041,7 +1041,7 @@ mod foo;
 $0
         "#,
             "self",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): self
                 Plain  (imports ✖): self
                 ByCrate(imports ✔): crate::foo
@@ -1062,7 +1062,7 @@ mod foo;
 $0
         "#,
             "crate",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): crate
                 Plain  (imports ✖): crate
                 ByCrate(imports ✔): crate
@@ -1084,7 +1084,7 @@ struct S;
 $0
         "#,
             "crate::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): crate::S
                 Plain  (imports ✖): crate::S
                 ByCrate(imports ✔): crate::S
@@ -1105,7 +1105,7 @@ $0
 pub struct S;
         "#,
             "std::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): std::S
                 Plain  (imports ✖): std::S
                 ByCrate(imports ✔): std::S
@@ -1127,7 +1127,7 @@ $0
 pub struct S;
         "#,
             "std_renamed::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): std_renamed::S
                 Plain  (imports ✖): std_renamed::S
                 ByCrate(imports ✔): std_renamed::S
@@ -1158,7 +1158,7 @@ pub mod ast {
 }
         "#,
             "syntax::ast::ModuleItem",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): ast::ModuleItem
                 Plain  (imports ✖): syntax::ast::ModuleItem
                 ByCrate(imports ✔): crate::ast::ModuleItem
@@ -1181,7 +1181,7 @@ pub mod ast {
 }
         "#,
             "syntax::ast::ModuleItem",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): syntax::ast::ModuleItem
                 Plain  (imports ✖): syntax::ast::ModuleItem
                 ByCrate(imports ✔): syntax::ast::ModuleItem
@@ -1214,7 +1214,7 @@ pub mod ast {
 }
         "#,
             "syntax::ast::ModuleItem",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): ast::ModuleItem
                 Plain  (imports ✖): ::syntax::ast::ModuleItem
                 ByCrate(imports ✔): crate::ast::ModuleItem
@@ -1236,7 +1236,7 @@ mod bar {
 $0
         "#,
             "bar::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): bar::S
                 Plain  (imports ✖): bar::S
                 ByCrate(imports ✔): crate::bar::S
@@ -1258,7 +1258,7 @@ mod bar {
 $0
         "#,
             "bar::U",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): bar::U
                 Plain  (imports ✖): bar::U
                 ByCrate(imports ✔): crate::bar::U
@@ -1281,7 +1281,7 @@ pub use core::S;
 pub struct S;
         "#,
             "std::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): std::S
                 Plain  (imports ✖): std::S
                 ByCrate(imports ✔): std::S
@@ -1306,7 +1306,7 @@ pub mod prelude {
 }
         "#,
             "S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): S
                 Plain  (imports ✖): S
                 ByCrate(imports ✔): S
@@ -1332,7 +1332,7 @@ pub mod prelude {
 }
 "#,
             "std::prelude::rust_2018::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): std::prelude::rust_2018::S
                 Plain  (imports ✖): std::prelude::rust_2018::S
                 ByCrate(imports ✔): std::prelude::rust_2018::S
@@ -1358,7 +1358,7 @@ pub mod prelude {
 }
 "#,
             "S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): S
                 Plain  (imports ✖): S
                 ByCrate(imports ✔): crate::S
@@ -1385,7 +1385,7 @@ pub mod prelude {
         check_found_path(
             code,
             "None",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): None
                 Plain  (imports ✖): None
                 ByCrate(imports ✔): None
@@ -1397,7 +1397,7 @@ pub mod prelude {
         check_found_path(
             code,
             "Some",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): Some
                 Plain  (imports ✖): Some
                 ByCrate(imports ✔): Some
@@ -1423,7 +1423,7 @@ pub mod bar { pub struct S; }
 pub use crate::foo::bar::S;
         "#,
             "baz::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): baz::S
                 Plain  (imports ✖): baz::S
                 ByCrate(imports ✔): crate::baz::S
@@ -1448,7 +1448,7 @@ $0
         "#,
             // crate::S would be shorter, but using private imports seems wrong
             "crate::bar::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): crate::bar::S
                 Plain  (imports ✖): crate::bar::S
                 ByCrate(imports ✔): crate::bar::S
@@ -1471,7 +1471,7 @@ pub(crate) use bar::S;
 $0
         "#,
             "crate::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): crate::S
                 Plain  (imports ✖): crate::S
                 ByCrate(imports ✔): crate::S
@@ -1498,7 +1498,7 @@ pub mod bar {
 $0
         "#,
             "super::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): super::S
                 Plain  (imports ✖): super::S
                 ByCrate(imports ✔): crate::bar::S
@@ -1526,7 +1526,7 @@ pub struct S;
 pub use super::foo;
         "#,
             "crate::foo::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): crate::foo::S
                 Plain  (imports ✖): crate::foo::S
                 ByCrate(imports ✔): crate::foo::S
@@ -1555,7 +1555,7 @@ pub mod sync {
 }
         "#,
             "std::sync::Arc",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): std::sync::Arc
                 Plain  (imports ✖): std::sync::Arc
                 ByCrate(imports ✔): std::sync::Arc
@@ -1584,7 +1584,7 @@ pub mod pin {
 }
             "#,
             "std::pin::Pin",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): core::pin::Pin
                 Plain  (imports ✖): core::pin::Pin
                 ByCrate(imports ✔): core::pin::Pin
@@ -1616,7 +1616,7 @@ pub mod fmt {
 }
         "#,
             "core::fmt::Error",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): core::fmt::Error
                 Plain  (imports ✖): core::fmt::Error
                 ByCrate(imports ✔): core::fmt::Error
@@ -1645,7 +1645,7 @@ pub mod fmt {
 }
         "#,
             "core::fmt::Error",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): core::fmt::Error
                 Plain  (imports ✖): core::fmt::Error
                 ByCrate(imports ✔): core::fmt::Error
@@ -1676,7 +1676,7 @@ pub mod fmt {
 }
         "#,
             "core::fmt::Error",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): core::fmt::Error
                 Plain  (imports ✖): core::fmt::Error
                 ByCrate(imports ✔): core::fmt::Error
@@ -1707,7 +1707,7 @@ pub mod fmt {
 }
         "#,
             "core::fmt::Error",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): core::fmt::Error
                 Plain  (imports ✖): core::fmt::Error
                 ByCrate(imports ✔): core::fmt::Error
@@ -1742,7 +1742,7 @@ pub mod sync {
 }
             "#,
             "alloc::sync::Arc",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): alloc::sync::Arc
                 Plain  (imports ✖): alloc::sync::Arc
                 ByCrate(imports ✔): alloc::sync::Arc
@@ -1779,7 +1779,7 @@ pub mod sync {
 }
             "#,
             "alloc::sync::Arc",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): alloc::sync::Arc
                 Plain  (imports ✖): alloc::sync::Arc
                 ByCrate(imports ✔): alloc::sync::Arc
@@ -1806,7 +1806,7 @@ pub mod sync {
 pub struct Arc;
             "#,
             "megaalloc::Arc",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): megaalloc::Arc
                 Plain  (imports ✖): megaalloc::Arc
                 ByCrate(imports ✔): megaalloc::Arc
@@ -1829,7 +1829,7 @@ pub mod primitive {
         check_found_path(
             code,
             "u8",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): u8
                 Plain  (imports ✖): u8
                 ByCrate(imports ✔): u8
@@ -1841,7 +1841,7 @@ pub mod primitive {
         check_found_path(
             code,
             "u16",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): u16
                 Plain  (imports ✖): u16
                 ByCrate(imports ✔): u16
@@ -1862,7 +1862,7 @@ fn main() {
 }
         "#,
             "Inner",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): Inner
                 Plain  (imports ✖): Inner
                 ByCrate(imports ✔): Inner
@@ -1885,7 +1885,7 @@ fn main() {
 }
         "#,
             "Struct",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): Struct
                 Plain  (imports ✖): Struct
                 ByCrate(imports ✔): Struct
@@ -1910,7 +1910,7 @@ fn main() {
 }
         "#,
             "module::Struct",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): module::Struct
                 Plain  (imports ✖): module::Struct
                 ByCrate(imports ✔): module::Struct
@@ -1935,7 +1935,7 @@ fn main() {
 }
             "#,
             "module::CompleteMe",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): module::CompleteMe
                 Plain  (imports ✖): module::CompleteMe
                 ByCrate(imports ✔): crate::module::CompleteMe
@@ -1961,7 +1961,7 @@ mod bar {
 }
             "#,
             "crate::baz::Foo",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): crate::baz::Foo
                 Plain  (imports ✖): crate::baz::Foo
                 ByCrate(imports ✔): crate::baz::Foo
@@ -1990,7 +1990,7 @@ mod qux {
 
             "#,
             "crate::qux::baz::Foo",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): super::baz::Foo
                 Plain  (imports ✖): super::baz::Foo
                 ByCrate(imports ✔): crate::qux::baz::Foo
@@ -2017,7 +2017,7 @@ mod bar {
 }
             "#,
             "crate::baz::Foo",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): crate::baz::Foo
                 Plain  (imports ✖): crate::baz::Foo
                 ByCrate(imports ✔): crate::baz::Foo
@@ -2049,7 +2049,7 @@ pub mod name {
 }
 "#,
             "name::AsName",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): name::AsName
                 Plain  (imports ✖): name::AsName
                 ByCrate(imports ✔): crate::name::AsName
@@ -2069,7 +2069,7 @@ $0
 //- /dep.rs crate:dep
 "#,
             "dep",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): dep
                 Plain  (imports ✖): dep
                 ByCrate(imports ✔): dep
@@ -2089,7 +2089,7 @@ fn f() {
 //- /dep.rs crate:dep
 "#,
             "dep",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): dep
                 Plain  (imports ✖): dep
                 ByCrate(imports ✔): dep
@@ -2118,7 +2118,7 @@ pub mod prelude {
 }
         "#,
             "None",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): None
                 Plain  (imports ✖): None
                 ByCrate(imports ✔): None
@@ -2141,7 +2141,7 @@ pub extern crate std as std_renamed;
 pub struct S;
     "#,
             "intermediate::std_renamed::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): intermediate::std_renamed::S
                 Plain  (imports ✖): intermediate::std_renamed::S
                 ByCrate(imports ✔): intermediate::std_renamed::S
@@ -2166,7 +2166,7 @@ pub extern crate std as longer;
 pub struct S;
     "#,
             "intermediate::longer::S",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): intermediate::longer::S
                 Plain  (imports ✖): intermediate::longer::S
                 ByCrate(imports ✔): intermediate::longer::S
@@ -2194,7 +2194,7 @@ pub mod ops {
 }
     "#,
             "std::ops::Deref",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): std::ops::Deref
                 Plain  (imports ✖): std::ops::Deref
                 ByCrate(imports ✔): std::ops::Deref
@@ -2223,7 +2223,7 @@ pub mod error {
 }
 "#,
             "std::error::Error",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): std::error::Error
                 Plain  (imports ✖): std::error::Error
                 ByCrate(imports ✔): std::error::Error
@@ -2251,7 +2251,7 @@ pub mod foo {
         check_found_path(
             ra_fixture,
             "krate::foo::Foo",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): krate::foo::Foo
                 Plain  (imports ✖): krate::foo::Foo
                 ByCrate(imports ✔): krate::foo::Foo
@@ -2263,7 +2263,7 @@ pub mod foo {
         check_found_path_prelude(
             ra_fixture,
             "krate::prelude::Foo",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): krate::prelude::Foo
                 Plain  (imports ✖): krate::prelude::Foo
                 ByCrate(imports ✔): krate::prelude::Foo
@@ -2294,7 +2294,7 @@ pub mod module {
         check_found_path(
             ra_fixture,
             "krate::module::sub::Foo",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): krate::module::sub::Foo
                 Plain  (imports ✖): krate::module::sub::Foo
                 ByCrate(imports ✔): krate::module::sub::Foo
@@ -2307,7 +2307,7 @@ pub mod module {
         check_found_path_prelude(
             ra_fixture,
             "krate::prelude::Foo",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): krate::prelude::Foo
                 Plain  (imports ✖): krate::prelude::Foo
                 ByCrate(imports ✔): krate::prelude::Foo
@@ -2331,7 +2331,7 @@ pub mod foo {
         check_found_path(
             ra_fixture,
             "krate::foo::Foo",
-            expect![[r#"
+            &expect![[r#"
             Plain  (imports ✔): krate::foo::Foo
             Plain  (imports ✖): krate::foo::Foo
             ByCrate(imports ✔): krate::foo::Foo
@@ -2344,7 +2344,7 @@ pub mod foo {
         check_found_path_absolute(
             ra_fixture,
             "krate::foo::Foo",
-            expect![[r#"
+            &expect![[r#"
             Plain  (imports ✔): ::krate::foo::Foo
             Plain  (imports ✖): ::krate::foo::Foo
             ByCrate(imports ✔): ::krate::foo::Foo
@@ -2383,7 +2383,7 @@ pub mod prelude {
 }
 "#,
             "petgraph::graph::NodeIndex",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): petgraph::graph::NodeIndex
                 Plain  (imports ✖): petgraph::graph::NodeIndex
                 ByCrate(imports ✔): petgraph::graph::NodeIndex
@@ -2409,7 +2409,7 @@ pub fn b() {$0}
 pub fn c() {}
 "#,
             "bar::c",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): bar::c
                 Plain  (imports ✖): bar::c
                 ByCrate(imports ✔): crate::foo::bar::c
@@ -2439,7 +2439,7 @@ pub mod future {
 }
 "#,
             "core::future::Future",
-            expect![[r#"
+            &expect![[r#"
                 Plain  (imports ✔): std::future::Future
                 Plain  (imports ✖): std::future::Future
                 ByCrate(imports ✔): std::future::Future

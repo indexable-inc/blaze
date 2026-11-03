@@ -323,7 +323,7 @@ impl<'db> ExprValidator<'db> {
                     && last_then_expr_ty.is_never()
                 {
                     // Only look at sources if the then branch diverges and we have an else branch.
-                    let source_map = &Body::with_source_map(self.db(), self.owner).1;
+                    let source_map = Body::source_map(self.db(), self.owner);
                     let Ok(source_ptr) = source_map.expr_syntax(id) else {
                         return;
                     };

@@ -145,6 +145,12 @@ pub enum Fill {
 
 struct Class {
     size: usize,
+    /// The tag its committed bytes count to while no owner holds them: its free blocks, warm
+    /// and cold, and what its region committed past its last carved block ([`Tag::Chunks`]; a
+    /// test's own class, a tag of the test's). A block taken moves from it to its owner's tag,
+    /// at the carve or at the class's fold of its free counts ([`Class::fold`]), so a block's
+    /// bytes count once: to its owner while it lives, to this after.
+    free: Tag,
     region: Region,
     links: LinkTable,
     max: u32,
@@ -240,13 +246,15 @@ static CLASS: [OnceLock<Result<Class, String>>; CLASSES] = [const { OnceLock::ne
 
 impl Class {
     /// A class of `size`-byte blocks over `space` bytes of address space, at `slot` of
-    /// [`CLASS`] (`None` for one of its own).
-    fn new(size: usize, space: usize, slot: Option<usize>) -> Result<Class, MemError> {
+    /// [`CLASS`] (`None` for one of its own), its committed bytes held by no owner counted to
+    /// `free`.
+    fn new(size: usize, space: usize, slot: Option<usize>, free: Tag) -> Result<Class, MemError> {
         let max = (space / size).max(1) as u32;
         Ok(Class {
             size,
-            region: Region::reserve(max as usize * size, Tag::Chunks)?,
-            links: LinkTable::new(max, Tag::Chunks)?,
+            free,
+            region: Region::reserve(max as usize * size, free)?,
+            links: LinkTable::new(max, free)?,
             max,
             slot,
             gather: (GATHER / size).max(1) as u32,
@@ -256,7 +264,7 @@ impl Class {
             cold: Stack::new(),
             counts: Counts::new(),
             scratch: {
-                let scratch = Region::reserve(TRIM_MOST * size_of::<u32>(), Tag::Chunks)?;
+                let scratch = Region::reserve(TRIM_MOST * size_of::<u32>(), free)?;
                 scratch.ensure(TRIM_MOST * size_of::<u32>())?;
                 scratch
             },
@@ -328,6 +336,8 @@ impl Class {
         self.region.ensure(end)?;
         // SAFETY: `index` came from the `fetch_add` just now: no other thread has it.
         unsafe { self.links.init(index) }?;
+        // Committed (counted to `free` by the region), now its taker's: the taker counts it.
+        tag::sub(self.free, self.size);
         Ok(self.region.at(index as usize * self.size))
     }
 
@@ -387,8 +397,14 @@ impl Class {
         now
     }
 
-    /// Adds `blocks` to the class's count of the `free` stack; past [`Counts::trim_at`] warm
-    /// bytes, and when `may_trim`, trims.
+    /// Adds `blocks` to the class's count of the `free` stack, and their bytes to its free tag
+    /// ([`Class::free`]: given, they are held by no owner; taken, by their taker, who counted
+    /// them); past [`Counts::trim_at`] warm bytes, and when `may_trim`, trims. A trim moves
+    /// blocks from warm to cold, held by no owner either way, so the free tag stays.
+    ///
+    /// Threads fold their gathered blocks up to [`GATHER`] a class late, so the free tag may
+    /// read low (a block given on one thread, not folded yet, taken on another, folded) by that
+    /// much a thread a class; its reads clamp at 0 ([`tag::snapshot`]).
     #[cold]
     #[inline(never)]
     fn fold(&self, free: Free, blocks: i32, may_trim: bool) {
@@ -396,6 +412,10 @@ impl Class {
             return;
         }
         let bytes = i64::from(blocks) * self.size as i64;
+        match usize::try_from(bytes) {
+            Ok(given) => tag::add(self.free, given),
+            Err(_) => tag::sub(self.free, bytes.unsigned_abs() as usize),
+        }
         match free {
             Free::Cold => {
                 self.counts.cold.fetch_add(bytes, Ordering::Relaxed);
@@ -631,7 +651,7 @@ fn class_of(bytes: usize, align: usize, tag: Tag) -> Result<usize, MemError> {
 fn class(index: usize) -> Result<&'static Class, MemError> {
     let class = CLASS[index].get_or_init(|| {
         // alloc: once, when a class cannot be reserved
-        Class::new(class_size(index), CLASS_BYTES, Some(index)).map_err(|error| error.to_string())
+        Class::new(class_size(index), CLASS_BYTES, Some(index), Tag::Chunks).map_err(|error| error.to_string())
     });
     match class {
         Ok(class) => Ok(class),

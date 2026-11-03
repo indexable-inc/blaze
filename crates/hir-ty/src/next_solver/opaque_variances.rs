@@ -7,8 +7,8 @@
 //! invariant where rustc captures it and bivariant where rustc does not; type and const
 //! parameters are invariant. What rustc captures:
 //!
-//! - an `impl Trait` with `use<..>`, the lifetimes it lists, and in a trait or a trait impl the
-//!   trait's or impl's own too;
+//! - an `impl Trait` with `use<..>`, the lifetimes it lists, and in a trait the trait's own too
+//!   (an impl's lifetimes only as it lists them, as `refine-captures.rs` has it);
 //! - one in a trait or a trait impl, in edition 2024, or the future of an `async fn`, all of
 //!   them;
 //! - a type alias's (TAIT, ATPIT), all of them;
@@ -18,8 +18,9 @@
 //! projection and host-effect bounds, and through an `impl Trait` nested in the bounds counts
 //! only what that one captures.
 //!
-//! blaze has no impl-trait-in-trait projection: an `impl Trait` a trait method returns is an
-//! opaque of that method, so a projection's variances are `None`, as rustc's for any other.
+//! An `impl Trait` a trait method returns is the projection of the trait's item for it
+//! (`crate::rpitit`), whose variances are its opaque type's: rustc's `opt_alias_variances` gives
+//! them for that projection, and `None` for any other.
 
 use base_db::Db;
 use hir_def::{
@@ -43,7 +44,7 @@ use crate::{
 };
 
 use super::{
-    AliasTermKind, ClauseKind, DbInterner, GenericArgs, ImplTraitIdx, Region, RegionKind,
+    AliasTermKind, AssocTyId, ClauseKind, TraitAssocTyId, DbInterner, GenericArgs, ImplTraitIdx, Region, RegionKind,
     StoredVariancesOf, Ty, TyKind, VariancesOf,
     generics::{Generics, generics},
 };
@@ -56,14 +57,19 @@ pub(crate) fn variances_of_opaque<'db>(
     opaque_variances_query(interner.db, opaque).as_ref()
 }
 
-/// rustc's `TyCtxt::opt_alias_variances`: an opaque type's variances, `None` for any other
-/// alias, whose arguments are related invariantly.
+/// rustc's `TyCtxt::opt_alias_variances`: an opaque type's variances, and a trait method's
+/// `impl Trait` item's (an RPITIT projection, whose variances are its opaque type's, `variances_of`
+/// of `SolverDefId::RpititId`); `None` for any other alias, whose arguments are related
+/// invariantly.
 pub(crate) fn opt_alias_variances<'db>(
     interner: DbInterner<'db>,
     kind: AliasTermKind<'db>,
 ) -> Option<VariancesOf<'db>> {
     match kind {
         AliasTermKind::OpaqueTy { def_id } => Some(variances_of_opaque(interner, def_id.0)),
+        AliasTermKind::ProjectionTy { def_id: TraitAssocTyId(AssocTyId::RpititId(rpitit)) } => {
+            Some(rustc_type_ir::Interner::variances_of(interner, super::SolverDefId::RpititId(rpitit)))
+        }
         AliasTermKind::ProjectionTy { .. }
         | AliasTermKind::InherentTy { .. }
         | AliasTermKind::FreeTy { .. }
@@ -122,6 +128,9 @@ fn capture_return_position(
         ItemContainerId::ImplId(it) => db.impl_trait(it).is_some(),
         ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => false,
     };
+    // rustc's `ForceCaptureTraitArgs`: a trait's `impl Trait` captures the trait's parameters
+    // whatever its `use<..>` lists; an impl's captures only what it lists.
+    let of_trait = matches!(loc.container, ItemContainerId::TraitId(_));
     let signature = FunctionSignature::of(db, function);
     let index = index.into_raw().into_u32();
     let mut nth = index as usize;
@@ -161,7 +170,7 @@ fn capture_return_position(
         let GenericParamId::LifetimeParamId(param) = param else { continue };
         let captured = match data {
             Some(data) => {
-                (in_trait && param.parent != function.into())
+                (of_trait && param.parent != function.into())
                     || matches!(output, Some(ElidedOutput::Written(it))
                         if names(&signature.store[LifetimeRefId::from_raw(
                             la_arena::RawIdx::from_u32(it),
@@ -418,7 +427,7 @@ fn nested<'a, 'b>(x: &'a u8, _: &'b u8) -> impl Iterator<Item = impl Sized + 'a>
     core::iter::once(x)
 }
 fn listed<'a, 'b>(x: &'a u8, _: &'b u8) -> impl Sized + use<'a> { x }
-trait Tr { type A; }
+trait Tr { type A; fn r<'a, 'b>(&self, x: &'a u8, _: &'b u8) -> impl Sized + use<'a, Self>; }
 "#;
 
     #[test]
@@ -475,6 +484,30 @@ fn none<'a, 'b>(_: &'a u8, _: &'b u8) -> impl Sized + use<> {}
         let none = variances(&db, krate, opaque(&db, function(&db, krate, "none"), 0));
         assert_eq!(lifetime(&none, "'a"), Variance::Bivariant);
         assert_eq!(lifetime(&none, "'b"), Variance::Bivariant);
+    }
+
+    /// rustc's `opt_alias_variances` of an RPITIT projection is its item's variances, the
+    /// opaque type's: a lifetime its `use<..>` leaves out is bivariant, not related (or kept
+    /// live) as a plain projection's arguments are.
+    #[test]
+    fn opt_alias_variances_of_an_rpitit_is_its_opaques() {
+        let (db, krate) = fixture(EDITION_2021);
+        let interner = DbInterner::new_with(&db, krate);
+        let ModuleDefId::TraitId(tr) = item(&db, krate, "Tr") else { panic!("`Tr` is a trait") };
+        let r = tr.trait_items(&db).method_by_name(&Name::new_root("r")).expect("`Tr` has `r`");
+        let idx = ImplTraitIdx::from_raw(la_arena::RawIdx::from_u32(0));
+        let rpitit = crate::rpitit::RpititId::new_in_trait(&db, r, idx);
+        let of_rpitit = opt_alias_variances(
+            interner,
+            AliasTermKind::ProjectionTy {
+                def_id: TraitAssocTyId(crate::next_solver::AssocTyId::RpititId(rpitit)),
+            },
+        );
+        let opaque = opaque(&db, r, 0);
+        assert_eq!(of_rpitit, Some(variances_of_opaque(interner, opaque)));
+        let of = variances(&db, krate, opaque);
+        assert_eq!(lifetime(&of, "'a"), Variance::Invariant);
+        assert_eq!(lifetime(&of, "'b"), Variance::Bivariant);
     }
 
     #[test]

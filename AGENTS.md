@@ -8,8 +8,12 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
 1. **no-rustc**: blaze never runs rustc: no function, crate, std, build script, proc macro, test or
    link step goes to rustc, rustdoc or a cargo that runs them. Each place that still does is a bug
    with a `no-rustc` issue, to be removed, never extended. See [docs/no-rustc.md](docs/no-rustc.md).
-2. **blaze-builds-blaze**: Build and test blaze with blaze (`blaze build`, `blaze test`), never `cargo
-   build`/`cargo test` or sccache. Where blaze can't build itself yet, fix that. See
+2. **blaze-builds-blaze**: Build, check and test blaze with blaze (`blaze build`, `blaze check`, `blaze
+   test`), never `cargo build`/`cargo test` or sccache. cargo only bootstraps: it builds the `blaze`
+   binary, and every check, test and verdict after that comes from blaze. When blaze fails on blaze
+   (a compile error, a link error, a panic, a hang, a wrong result, too slow, too much memory), that
+   failure is the work: fix blaze, never route around it through cargo. A crate blaze can't check or
+   test yet is a ranked, owned blocker, not a reason to keep using cargo for it. See
    [docs/contributing.md](docs/contributing.md).
 3. **no-fallback**: No fallback, ever. When blaze can't do something it stops with an error naming what
    and where, never quietly takes another path (rustc, a full link or rebuild instead of a patch, a
@@ -111,8 +115,8 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
     function and which template.
 17. **panics-fail-one-job**: A panic inside a job (a query, a codegen unit, a proc-macro evaluation)
     fails that job's units with a typed error naming the panic and the job; the daemon keeps serving
-    and `--keep-going` keeps building the rest. Formatting an error must not panic: render what
-    needs the database while the database is attached.
+    and keep-going (the default; `--fail-fast` opts out) keeps building the rest. Formatting an
+    error must not panic: render what needs the database while the database is attached.
 18. **keys-cover-every-input**: A query key, store key, fold key or template key covers every input its
     value depends on, including the data a constant points to and the identity of a closure callee.
     Two different values under one key is a refusal with a typed error, never an overwrite, and the
@@ -129,8 +133,13 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
     the batch over. A half-ported tree blocks every lane's run.
 22. **deterministic-output**: No output (an object, a diagnostic's order, a store key, a profile row's
     identity) depends on hash-map iteration order, thread timing, addresses or the wall clock.
-    Hashers have fixed seeds; anything iterated into output is sorted or ordered by construction; a
-    test builds twice and compares bytes.
+    Hashers have fixed seeds, except a table whose keys an attacker may pick (names, paths,
+    literals), which is keyed by a `blaze_hash::SipKey`: random when nothing persists its layout and
+    nothing output depends on where a key lands, or `blaze_ids::index_key` of its content when an
+    image lays it out; a hot one may instead be adaptive (`blaze_hash::adaptive`): the fixed hash
+    until a lookup walks a run no honest keys make, then a random `SipKey` for good. Anything
+    iterated into output is sorted or ordered by construction; a test builds twice and compares
+    bytes.
 23. **persisted-state-round-trips**: Anything blaze persists (the daemon image, the store, the plane's
     history) has a test that restores it and checks the result equals a fresh build byte for byte,
     and a budget for restart to first answer. A restore that silently starts empty is a failure the
@@ -158,30 +167,37 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
 28. **no-mcp**: No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in
     deterministic CBOR; the CLI is a client of the same API. See
     [docs/roadmap.md#8-the-agent-api](docs/roadmap.md#8-the-agent-api).
-29. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run in an ix VM, one per lane (`ix
-    new`, `ix shell`, `ix rm`), never on the Mac or AWS. Where an ix VM can't do it, stop and say
-    what is missing. See
-    [docs/contributing.md#working-in-parallel](docs/contributing.md#working-in-parallel).
-30. **worktree-per-lane**: One uniquely named worktree per lane; its build directory is its own under
+29. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM (`ix
+    new`, `ix shell`, `ix rm`), never on AWS. Where neither can do it, stop and say what is missing.
+    See [docs/contributing.md#working-in-parallel](docs/contributing.md#working-in-parallel).
+30. **fan-out-write-only**: Fan out code, not builds. Subagents only read and write code, including the
+    tests for it. They never run a build, check, test, clippy, benchmark or any other expensive
+    step, and never start a daemon or a VM. The main agent waits until every subagent has finished
+    writing, applies all their changes to one tree, and then runs it once: `blaze check` and `blaze
+    test` (the central loop), with keep-going. It hands each failure back to a fresh subagent for
+    the code that broke, with the exact tree, the command and the error, and runs again. Checks that
+    need a variant tree, such as reverting a fix to show its test fails (test-the-cause), are also
+    run by the main agent, as patches.
+31. **worktree-per-lane**: One uniquely named worktree per lane; its build directory is its own under
     blaze's root, never in the checkout, so it needs no `CARGO_TARGET_DIR`; never `git stash`.
-31. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
+32. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
     "what the branch does"` opens it, turns on auto-merge and waits for the merge gate (`--wait`
     resumes). Harnesses run after merge in the release train. Never push to main. See
     [docs/contributing.md#landing-a-change](docs/contributing.md#landing-a-change).
-32. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
+33. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
     conflicts, fix its gate, finish a draft) rather than hand it back; tell the owning lane what
     changed. Close one only when it is wrong, saying why.
-33. **clean-up-lane**: When a lane is done, delete its build directory (`blaze clean`), worktree, ix VM
+34. **clean-up-lane**: When a lane is done, delete its build directory (`blaze clean`), worktree, ix VM
     and merged branch.
-34. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
+35. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
     `Co-authored-by: Name <id+login@users.noreply.github.com>` trailer for each of them and says
     where it came from. See [docs/contributing.md#credit](docs/contributing.md#credit).
-35. **docs-say-what-they-are**: Every doc under `docs/` has front matter: `current` (kept true), `plan`,
+36. **docs-say-what-they-are**: Every doc under `docs/` has front matter: `current` (kept true), `plan`,
     `record` (dated history) or `superseded` (naming its replacement). Trust current docs; read
     plans and records as of their date. A change that makes a current doc untrue fixes it or marks
     it superseded in the same change; `python3 tools/docs.py check` holds them to the tree. See
     [docs/contributing.md#documents](docs/contributing.md#documents).
-36. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
+37. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
     into a frozen dataclass that refuses unknown fields, not a set of flags or hidden environment
     variables. An existing script moves to this when next changed.
 

@@ -93,7 +93,7 @@ pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Emitted> {
     }
     if gathered {
         gallery.add_proc_macro_idents(cx, walk, &sources);
-        emitted.extend(idents::lints(cx, gallery.sorted(), krate));
+        emitted.extend(idents::lints(cx, &gallery.sorted(), krate));
     }
     emitted
 }

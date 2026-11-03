@@ -6,7 +6,7 @@ use super::{
     fns::fn_named,
 };
 use crate::{
-    check_generic,
+    PURE, check_generic,
     effect_attrs::{NOALLOC, NONBLOCKING},
 };
 
@@ -73,5 +73,51 @@ pub fn jump(at: usize) -> fn() {
             let said = refusal.said();
             assert!(said.contains("transmutes `usize`") && said.contains("a function pointer or vtable made of bytes"), "{said}");
         }
+    });
+}
+
+/// At the pin a `Vec`'s buffer is a `NonNull<u8>`, whose field is the pattern type
+/// `pattern_type!(*const u8 is !null)`: a raw pointer in a toolchain type's field, looked
+/// through as the toolchain's own, not one the function takes (blaze checking blaze, E4:
+/// every `Compute::compute`, which takes `&mut Reads` and its `Vec<u8>`, was refused). A raw
+/// pointer of the crate's own is still refused.
+#[test]
+fn a_raw_pointer_in_a_toolchain_pattern_type_is_the_toolchains() {
+    let db = hir_expand::fixture::db(
+        r#"
+//- minicore: sized, copy, non_null
+//- /lib.rs crate:kernel
+pub struct Keys {
+    buf: core::ptr::NonNull<u8>,
+    len: usize,
+}
+
+pub struct Raw {
+    buf: *const u8,
+}
+
+pub fn keys(keys: &mut Keys, input: &u8) -> u8 {
+    let _ = keys;
+    *input
+}
+
+pub fn raw(raw: &mut Raw, input: &u8) -> u8 {
+    let _ = raw;
+    *input
+}
+"#,
+    )
+    .into_db();
+    let krate = crate_named(&db, "kernel");
+    let (keys, raw) = (fn_named(&db, krate, "keys"), fn_named(&db, krate, "raw"));
+    blaze_query::db::attach(&db, || {
+        if let Err(refusal) = check_generic(&db, keys, &PURE) {
+            panic!("`keys` takes a `NonNull` of the toolchain, so it should be pure, but {}", refusal.said());
+        }
+        let Err(refusal) = check_generic(&db, raw, &PURE) else {
+            panic!("`raw` takes a raw pointer of its own, so it is not pure");
+        };
+        let said = refusal.said();
+        assert!(said.contains("takes the raw pointer `*const u8`"), "{said}");
     });
 }

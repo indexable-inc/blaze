@@ -463,8 +463,7 @@ fn private_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: hir::Var
         }
         many => {
             diag.suggestions(
-                // clone: the error's parts, for an error hir found
-                tail.clone(),
+                &tail,
                 "you might have meant to use an associated function to build this type",
                 many.iter().map(|(_, name, args)| call(name, *args)),
                 Applicability::MaybeIncorrect,

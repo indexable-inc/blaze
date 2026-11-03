@@ -508,7 +508,7 @@ fn refused_wire_bytes_intern_nothing() {
     };
 
     let mut rng = SplitMix64::new(0x77b0);
-    let (mut accepted, mut refused, mut late, mut taken) = (0, 0, 0, 0);
+    let (mut accepted, mut refused, mut late, mut canonical, mut taken) = (0, 0, 0, 0, 0);
     for n in 1..=ROUNDS {
         let (mut bytes, texts) = round(n);
         // A damaged text an earlier round read can be this round's (a bit flips '2' to '6'):
@@ -544,6 +544,7 @@ fn refused_wire_bytes_intern_nothing() {
                     _ => false,
                 };
                 late += usize::from(after_columns);
+                canonical += usize::from(matches!(error, WireError::NotCanonical { .. }));
                 if let Some(text) = interned(&texts) {
                     panic!("round {n}: refused ({error}), yet {text:?} was interned");
                 }
@@ -552,9 +553,10 @@ fn refused_wire_bytes_intern_nothing() {
     }
     eprintln!(
         "{accepted} damaged wires read, {refused} refused, {late} by the checks after the \
-         columns, {taken} rounds' texts taken by an earlier round"
+         columns ({canonical} canonical), {taken} rounds' texts taken by an earlier round"
     );
-    assert!(late > 0, "no damage reached the literal or canonical checks: the test checks nothing");
+    assert!(late > canonical, "no damage reached the literal check: the test checks it nothing");
+    assert!(canonical > 0, "no damage reached the canonical check: the test checks it nothing");
 
     // `tz`, three bits from `tq`: no text a damaged round read is one of these.
     let (mut bytes, mut texts) = round(ROUNDS + 1);
@@ -566,13 +568,19 @@ fn refused_wire_bytes_intern_nothing() {
     }
     assert_eq!(interned(&texts), None, "texts no read has interned");
     let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-    let exact = WireLimits { bytes: bytes.len(), nodes: word(4), symbol_bytes: word(20) };
+    let exact = WireLimits {
+        bytes: bytes.len(),
+        nodes: word(4),
+        symbols: word(16),
+        symbol_bytes: word(20),
+    };
     for (limits, what, size) in [
-        (WireLimits { bytes: exact.bytes - 1, ..exact }, "bytes", exact.bytes),
-        (WireLimits { nodes: exact.nodes - 1, ..exact }, "nodes", exact.nodes),
+        (WireLimits { bytes: exact.bytes - 1, ..exact }, "bytes of wire", exact.bytes),
+        (WireLimits { nodes: exact.nodes - 1, ..exact }, "nodes (token trees)", exact.nodes),
+        (WireLimits { symbols: exact.symbols - 1, ..exact }, "symbols", exact.symbols),
         (
             WireLimits { symbol_bytes: exact.symbol_bytes - 1, ..exact },
-            "symbol bytes",
+            "bytes of symbol text",
             exact.symbol_bytes,
         ),
     ] {
@@ -588,6 +596,62 @@ fn refused_wire_bytes_intern_nothing() {
     assert_eq!(len, bytes.len());
     assert!(texts.iter().all(|it| Symbol::find(it).is_some()), "a tree read interns its texts");
     assert_eq!(read.columns().symbols.len(), tree.columns().symbols.len());
+}
+
+/// The wire's window check compares symbols by text, as interned IDs would: two symbols of one
+/// text in one window are refused, and two texts with one `name_hash` (a full 64-bit collision,
+/// built by solving the last word) are two symbols, read back as written.
+#[test]
+fn the_wire_window_compares_text_not_hashes() {
+    const SAME: [&str; 2] = ["tw_same_aa", "tw_same_bb"];
+    const COLLIDING: [&str; 2] = ["yoitbbzkfzeuddnu)S;!hq[k", "hxafhnvrfhaujnhd<qC4B>A,"];
+    let names = |texts: [&str; 2]| {
+        let at = |start| Span {
+            range: TextRange::at(TextSize::new(start), TextSize::new(1)),
+            anchor: anchor(0, 0),
+            ctx: SyntaxContext::root(Edition::CURRENT),
+        };
+        let mut builder = TopSubtreeBuilder::new(Delimiter::invisible_spanned(at(0)));
+        for (n, text) in texts.into_iter().enumerate() {
+            builder.push(Ident::new(text, at(1 + n as u32)).into());
+        }
+        builder.build()
+    };
+    let wire_of = |tree: &TopSubtree| {
+        let mut bytes = Vec::new();
+        tree.write_wire(&mut bytes);
+        bytes
+    };
+
+    let tree = names(SAME);
+    let parts = wire::parts_of(&tree);
+    let mut resolve = |part: WirePart| {
+        parts
+            .iter()
+            .find(|(it, _)| *it == part)
+            .map(|&(_, it)| it)
+            .ok_or_else(|| "a part the tree didn't have".to_owned())
+    };
+    let mut bytes = wire_of(&tree);
+    let second = bytes
+        .windows(SAME[1].len())
+        .position(|it| it == SAME[1].as_bytes())
+        .expect("the second text in the wire");
+    bytes[second..second + SAME[0].len()].copy_from_slice(SAME[0].as_bytes());
+    assert_eq!(
+        TopSubtree::read_wire(&bytes, WireLimits::DEFAULT, &mut resolve).err(),
+        Some(WireError::NotCanonical { what: "a symbol again in its window", at: 2 }),
+    );
+
+    let [a, b] = COLLIDING.map(str::as_bytes);
+    assert_eq!(blaze_phf::name_hash(a), blaze_phf::name_hash(b), "the texts collide");
+    let tree = names(COLLIDING);
+    let bytes = wire_of(&tree);
+    let (read, used) = TopSubtree::read_wire(&bytes, WireLimits::DEFAULT, &mut resolve)
+        .expect("two texts of one hash are two symbols");
+    assert_eq!(used, bytes.len());
+    assert!(read == tree, "read back");
+    assert_eq!(read.columns().symbols.len(), 2);
 }
 
 /// The window as one compare numbers symbols as the scan of the last [`SYMBOL_WINDOW`] did,

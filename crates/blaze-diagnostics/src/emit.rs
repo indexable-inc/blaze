@@ -634,7 +634,7 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
             short: style.short,
             pad_last: diag.children.first().is_some_and(|it| it.span.is_empty()),
         };
-        group = snippets(group, &diag.span, extra, placed, &mut report, unshown);
+        group = snippets(group, &diag.span, extra, placed, &mut report, &unshown);
     }
 
     for child in &diag.children {
@@ -649,7 +649,7 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
             let mut extra: Labels<'a> = SmallVec::new();
             macro_labels(&child.span, &mut extra);
             let unshown = Unshown { level: sublevel_of(child.level), short: style.short, pad_last: false };
-            group = snippets(group, &child.span, extra, placed, &mut report, unshown);
+            group = snippets(group, &child.span, extra, placed, &mut report, &unshown);
         }
     }
     if let Some(note) = diag.origin_note()
@@ -786,7 +786,7 @@ fn snippets<'a>(
     extra: Labels<'a>,
     placed: &Placed<'a>,
     report: &mut Vec<Group<'a>>,
-    unshown: Unshown,
+    unshown: &Unshown,
 ) -> Group<'a> {
     let mut files = collect_annotations(span, extra, placed);
     // As rustc finds it: by a binary search of the files in the order they were met.

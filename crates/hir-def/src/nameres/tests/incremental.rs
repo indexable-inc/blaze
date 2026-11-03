@@ -10,8 +10,8 @@ use crate::{
 fn check_def_map_is_not_recomputed(
     #[rust_analyzer::rust_fixture] ra_fixture_initial: &str,
     #[rust_analyzer::rust_fixture] ra_fixture_change: &str,
-    expecta: Expect,
-    expectb: Expect,
+    expecta: &Expect,
+    expectb: &Expect,
 ) {
     let fx = fixture::db(ra_fixture_initial);
     let pos = fx.position();
@@ -189,22 +189,23 @@ fn foo() -> i32 { 92 }
 #[cfg(never)]
 fn no() {}
 ",
-        expect![[r#"
+        &expect![[r#"
             [
                 "crate_local_def_map",
                 "resolution_of",
             ]
         "#]],
         // `use E::*` binds `E`'s variants, which no round-0 log holds: the maintainer reads
-        // them again (`variants_syntax`) to see whether the glob must run again.
-        expect![[r#"
+        // them again (`variants_syntax`, which reads the enum's `signature_syntax`) to see
+        // whether the glob must run again.
+        &expect![[r#"
             [
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
                 "HirFileId::ast_id_map",
                 "real_span_map",
                 "file_outline",
-                "variants_syntax",
+                "signature_syntax",
             ]
         "#]],
     );
@@ -238,13 +239,13 @@ m!(Y);
 
 pub struct S {}
 ",
-        expect![[r#"
+        &expect![[r#"
             [
                 "crate_local_def_map",
                 "resolution_of",
             ]
         "#]],
-        expect![[r#"
+        &expect![[r#"
             [
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
@@ -280,13 +281,13 @@ fn f() {}
 #[proc_macros::identity]
 fn f() { foo }
 ",
-        expect![[r#"
+        &expect![[r#"
             [
                 "crate_local_def_map",
                 "resolution_of",
             ]
         "#]],
-        expect![[r#"
+        &expect![[r#"
             [
                 "resolution_of",
                 "EditionedFileId::parse_",
@@ -384,13 +385,13 @@ m2!(X);
 #[derive(proc_macros::DeriveIdentity)]
 pub struct S {}
 ",
-        expect![[r#"
+        &expect![[r#"
             [
                 "crate_local_def_map",
                 "resolution_of",
             ]
         "#]],
-        expect![[r#"
+        &expect![[r#"
             [
                 "resolution_of",
                 "EditionedFileId::parse_",
@@ -474,7 +475,7 @@ m!(Z);
         // The fixture's write made the six item trees and the three expansions; the module is
         // read from the published resolution for the first time.
         &[("file_item_tree_query", 0), ("parse_macro_expansion", 0)],
-        expect![[r#"
+        &expect![[r#"
             [
                 "crate_local_def_map",
                 "resolution_of",
@@ -501,7 +502,7 @@ m!(Z);
             assert_eq!(module_data.scope(db).resolutions().count(), 4);
         },
         &[("file_item_tree_query", 1), ("parse_macro_expansion", 0)],
-        expect![[r#"
+        &expect![[r#"
             [
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
@@ -542,7 +543,7 @@ pub type Ty = ();
         },
         // The fixture's write made the tree, resolving the crate.
         &[("file_item_tree_query", 0), ("parse", 0)],
-        expect![[r#"
+        &expect![[r#"
             []
         "#]],
     );
@@ -557,7 +558,7 @@ pub type Ty = ();
             file_item_tree(db, pos.file_id.into(), fixture::test_crate(db));
         },
         &[("file_item_tree_query", 1), ("parse", 1)],
-        expect![[r#"
+        &expect![[r#"
             [
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
@@ -572,7 +573,7 @@ fn execute_assert_events(
     db: &TestDB,
     f: impl FnOnce(),
     required: &[(&str, usize)],
-    expect: Expect,
+    expect: &Expect,
 ) {
     let events = db.executed_in_read_order(f);
     assert_events(&events, required, expect);
@@ -584,13 +585,13 @@ fn execute_assert_write(
     db: &mut TestDB,
     f: impl FnOnce(&mut TestDB),
     required: &[(&str, usize)],
-    expect: Expect,
+    expect: &Expect,
 ) {
     let events = db.executed_in_write(f);
     assert_events(&events, required, expect);
 }
 
-fn assert_events(events: &[String], required: &[(&str, usize)], expect: Expect) {
+fn assert_events(events: &[String], required: &[(&str, usize)], expect: &Expect) {
     for (event, count) in required {
         let n = events.iter().filter(|it| it.contains(event)).count();
         assert_eq!(n, *count, "Expected {event} to be executed {count} times, but got {n}: {events:#?}");

@@ -126,6 +126,7 @@ fn check_attr<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, attr: ast::Attr<'t>)
 
 /// A span or event the recorder drops, as written: the target it names, none when it leaves
 /// the target to its module's path.
+#[derive(Clone, Copy)]
 struct Dropped<'t> {
     target: Option<ast::Token<'t>>,
     /// `span` or `event`, as the message says it.

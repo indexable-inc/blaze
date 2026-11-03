@@ -76,7 +76,7 @@ impl HygieneId {
         Self(ctx)
     }
 
-    pub(crate) fn syntax_context(self) -> SyntaxContext {
+    pub fn syntax_context(self) -> SyntaxContext {
         self.0
     }
 
@@ -1439,7 +1439,55 @@ impl Drop for ExpressionStoreBuilder {
     }
 }
 
+impl ExpressionOnlyStore {
+    /// The heap it owns, in bytes: its columns and tables, not each entry's own heap.
+    fn heap_bytes(&self) -> usize {
+        let ExpressionOnlyStore {
+            columns,
+            kinds: _,
+            bindings,
+            labels,
+            binding_owners,
+            block_scopes,
+            ident_hygiene,
+            field_hygiene,
+            block_editions,
+            overflow_inheriting,
+            spec_clauses,
+            expr_roots,
+        } = self;
+        let roots = match expr_roots.spilled() {
+            true => expr_roots.capacity() * size_of::<ExprRoot>(),
+            false => 0,
+        };
+        columns.heap_bytes()
+            + crate::heap::arena_bytes(bindings)
+            + crate::heap::arena_bytes(labels)
+            + binding_owners.heap_bytes()
+            + block_scopes.heap_bytes()
+            + ident_hygiene.heap_bytes()
+            + field_hygiene.heap_bytes()
+            + block_editions.heap_bytes()
+            + overflow_inheriting.heap_bytes()
+            + spec_clauses.heap_bytes()
+            + roots
+    }
+}
+
 impl ExpressionStore {
+    /// The heap the store owns, in bytes: its columns and tables, not the side tables' entries'
+    /// own heap (byte strings, `asm!` operands, a fn type's parameters).
+    pub fn heap_bytes(&self) -> usize {
+        let ExpressionStore { expr_only, types, lifetimes, type_hygiene, macro_calls } = self;
+        let expr_only =
+            expr_only.as_deref().map_or(0, |it| size_of::<ExpressionOnlyStore>() + it.heap_bytes());
+        expr_only
+            + types.heap_bytes()
+            + crate::heap::arena_bytes(lifetimes)
+            + type_hygiene.as_deref().map_or(0, size_of_val)
+            + crate::heap::thin_vec_bytes(macro_calls)
+    }
+
     /// The store with nothing in it. A `static` rather than a `const`: boxed columns can't be
     /// made in a `const`. Empty columns allocate nothing.
     #[inline]
@@ -1683,7 +1731,7 @@ impl ExpressionStore {
         // Do not use `..` patterns or field accesses here, only destructuring, to ensure we cover all cases
         // (we've had multiple bugs with this in the past).
         match self.expr(expr_id) {
-            Expr::OffsetOf(OffsetOf { container, fields: _ }) => visitor.on_type(*container),
+            Expr::OffsetOf(OffsetOf { container, fields: _, hygiene: _ }) => visitor.on_type(*container),
             Expr::Path(path) => visitor.on_path(path),
             Expr::Continue { label: _ } | Expr::Missing | Expr::Literal(_) | Expr::Underscore => {}
             Expr::InlineAsm(InlineAsm { operands, .. }) => {
@@ -1759,7 +1807,15 @@ impl ExpressionStore {
                 }
                 visitor.on_path(path);
             }
-            Expr::Closure { body, args, arg_types, ret_type, capture_by: _, closure_kind: _ } => {
+            Expr::Closure {
+                body,
+                args,
+                arg_types,
+                ret_type,
+                capture_by: _,
+                closure_kind: _,
+                binder: _,
+            } => {
                 visitor.on_expr(body);
                 visitor.on_pats(args);
                 arg_types.iter().for_each(|arg_type| visitor.on_type_opt(*arg_type));

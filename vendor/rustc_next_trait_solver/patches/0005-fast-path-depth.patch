@@ -1,7 +1,8 @@
-diff -ruN a/src/delegate.rs b/src/delegate.rs
+diff --git a/src/delegate.rs b/src/delegate.rs
+index 6001115..f23f477 100644
 --- a/src/delegate.rs
 +++ b/src/delegate.rs
-@@ -2,7 +2,7 @@
+@@ -2,7 +2,7 @@ use std::fmt::Debug;
  use std::ops::Deref;
  
  use rustc_type_ir::solve::{
@@ -10,7 +11,7 @@ diff -ruN a/src/delegate.rs b/src/delegate.rs
      VisibleForLeakCheck,
  };
  use rustc_type_ir::transmute::Answer;
-@@ -46,6 +46,7 @@
+@@ -46,6 +46,7 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
          &self,
          goal: Goal<Self::Interner, <Self::Interner as Interner>::Predicate>,
          span: <Self::Interner as Interner>::Span,
@@ -18,7 +19,8 @@ diff -ruN a/src/delegate.rs b/src/delegate.rs
      ) -> ComputeGoalFastPathOutcome<Self::Interner>;
  
      fn fresh_var_for_kind(
-diff -ruN a/src/solve/eval_ctxt/fast_path.rs b/src/solve/eval_ctxt/fast_path.rs
+diff --git a/src/solve/eval_ctxt/fast_path.rs b/src/solve/eval_ctxt/fast_path.rs
+index 988850b..0b0d819 100644
 --- a/src/solve/eval_ctxt/fast_path.rs
 +++ b/src/solve/eval_ctxt/fast_path.rs
 @@ -7,8 +7,8 @@
@@ -32,7 +34,7 @@ diff -ruN a/src/solve/eval_ctxt/fast_path.rs b/src/solve/eval_ctxt/fast_path.rs
  };
  use rustc_type_ir::{InferCtxtLike, Interner};
  
-@@ -134,21 +134,25 @@
+@@ -134,21 +134,25 @@ pub(super) fn compute_goal_fast_path_cold<D, I>(
      delegate: &D,
      goal: Goal<I, I::Predicate>,
      origin_span: I::Span,
@@ -62,7 +64,7 @@ diff -ruN a/src/solve/eval_ctxt/fast_path.rs b/src/solve/eval_ctxt/fast_path.rs
  where
      D: SolverDelegate<Interner = I>,
      I: Interner,
-@@ -157,19 +161,36 @@
+@@ -157,19 +161,36 @@ where
          return None;
      }
  
@@ -112,10 +114,11 @@ diff -ruN a/src/solve/eval_ctxt/fast_path.rs b/src/solve/eval_ctxt/fast_path.rs
 +        }
      }
  }
-diff -ruN a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
+diff --git a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
+index 68b4de4..72a4003 100644
 --- a/src/solve/eval_ctxt/mod.rs
 +++ b/src/solve/eval_ctxt/mod.rs
-@@ -12,8 +12,8 @@
+@@ -12,8 +12,8 @@ use rustc_type_ir::search_graph::{
      CandidateHeadUsages, LowerAvailableDepth, PathKind, RequiredDepth,
  };
  use rustc_type_ir::solve::{
@@ -126,7 +129,7 @@ diff -ruN a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
      RerunNonErased, RerunReason, RerunResultExt, SmallCopySet, TyOrConstInferVar,
  };
  use rustc_type_ir::transmute::Answer;
-@@ -252,7 +252,12 @@
+@@ -252,7 +252,12 @@ where
          // immediately when adding new goals. If we didn't check `stalled_on` here we'd be trying
          // the fast path twice for some goals.
          if stalled_on.is_some()
@@ -140,7 +143,7 @@ diff -ruN a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
          {
              return Ok(res);
          }
-@@ -611,12 +616,25 @@
+@@ -611,12 +616,25 @@ where
              });
          }
  
@@ -171,7 +174,7 @@ diff -ruN a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
              return Ok(res);
          }
  
-@@ -636,105 +654,110 @@
+@@ -636,105 +654,110 @@ where
          Ok(goal_evaluation)
      }
  
@@ -375,7 +378,7 @@ diff -ruN a/src/solve/eval_ctxt/mod.rs b/src/solve/eval_ctxt/mod.rs
          self.search_graph.evaluate_goal(
              self.cx(),
              canonical_goal,
-@@ -1134,8 +1157,8 @@
+@@ -1134,8 +1157,8 @@ where
              self.normalize(goal.param_env, ty::Unnormalized::new_wip(goal.predicate))?;
          self.inspect.add_goal(self.delegate, self.max_input_universe, source, goal);
  

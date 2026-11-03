@@ -18,6 +18,7 @@ use std::{
     },
 };
 
+use blaze_hash::SipKey;
 use blaze_mem::{AppendVec, Tag};
 use blaze_query::db::{AsId, FromId, Id};
 use intern::swiss::Index;
@@ -107,12 +108,17 @@ impl<T> Log<T> {
     }
 }
 
-/// Values found by a 64-bit hash of their key (computed once by the caller), each kept once.
+/// Values found by a 64-bit hash of their key ([`Table::hash`], computed once by the caller),
+/// each kept once. The hash is SipHash-1-3 under the table's own key, drawn at random: the keys
+/// are `include!` paths and `env!` names a crate's source picks, so a hash anyone can compute
+/// would let it pick thousands with one hash, each insert then probing past all of them.
 ///
 /// 6.7 to 13.3 bytes of index a value, plus the value and its hash in a [`Log`]. A lookup is
 /// one shard pick, a control word and a slot and a key compare per entry whose hash
 /// matches; nothing is written.
 pub(crate) struct Table<T> {
+    /// What [`Table::hash`] is keyed by.
+    key: SipKey,
     values: Log<(u64, T)>,
     /// Made on its first insert: a table costs 16 bytes a shard until then.
     shards: Box<[OnceLock<Box<Shard>>]>,
@@ -132,11 +138,19 @@ impl<T> Table<T> {
     pub(crate) fn new(max: usize) -> Table<T> {
         let shards = blaze_ids::shard_count();
         Table {
+            key: SipKey::random(),
             values: Log::new(max),
             // alloc: once per table: 16 bytes a shard.
             shards: (0..shards).map(|_| OnceLock::new()).collect(),
             shift: u64::BITS - shards.trailing_zeros(),
         }
+    }
+
+    /// The hash `key` is found by in this table, the one [`Table::find`] and [`Table::insert`]
+    /// are given.
+    #[inline]
+    pub(crate) fn hash(&self, key: impl std::hash::Hash) -> u64 {
+        self.key.hash_one(&key)
     }
 
     fn shard(&self, hash: u64) -> &OnceLock<Box<Shard>> {
@@ -189,18 +203,16 @@ impl<T> Table<T> {
         &self.values.get(raw).expect("an index this table did not hand out").1
     }
 
+    /// The value at `raw`, `None` for an index this table has not handed out.
+    #[inline]
+    pub(crate) fn try_get(&self, raw: u32) -> Option<&T> {
+        Some(&self.values.get(raw)?.1)
+    }
+
     /// Every value, in the order they were inserted (which threads decide: sort what leaves).
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> + '_ {
         self.values.iter().map(|(_, value)| value)
     }
-}
-
-/// The hash a [`Table`] is keyed by: `blaze_hash::FixedState`, as every key is the build's own (paths and names
-/// its sources wrote), never an attacker's.
-#[inline]
-pub(crate) fn hash_of(key: impl std::hash::Hash) -> u64 {
-    use std::hash::BuildHasher;
-    blaze_hash::FixedState.hash_one(key)
 }
 
 /// What a shard's [`Index`] is keyed by: the shard is the hash's top bits, so the index's tag

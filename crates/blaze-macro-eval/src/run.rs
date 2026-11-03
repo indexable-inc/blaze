@@ -237,25 +237,25 @@ struct Memory<'a, 'db> {
 
 /// `error` as the expansion's error. Its types print through the attached database, so it is
 /// rendered with `db` attached: the caller may run outside any attach (the daemon's loop).
-pub(crate) fn stop_of(db: &Db, error: MirEvalError<'_>) -> Stop {
-    blaze_query::db::attach(db, || Stop(describe::describe(db, &error)))
+pub(crate) fn stop_of(db: &Db, error: &MirEvalError<'_>) -> Stop {
+    blaze_query::db::attach(db, || Stop(describe::describe(db, error)))
 }
 
 impl Guest for Memory<'_, '_> {
     fn read(&self, addr: u64, len: usize) -> Result<&[u8], Stop> {
-        self.eval.read_bytes(addr, len).map_err(|e| stop_of(self.db, e))
+        self.eval.read_bytes(addr, len).map_err(|e| stop_of(self.db, &e))
     }
 
     fn write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), Stop> {
-        self.eval.write_bytes(addr, bytes).map_err(|e| stop_of(self.db, e))
+        self.eval.write_bytes(addr, bytes).map_err(|e| stop_of(self.db, &e))
     }
 
     fn set_errno(&mut self, code: i32) -> Result<(), Stop> {
-        self.eval.set_errno(code).map_err(|e| stop_of(self.db, e))
+        self.eval.set_errno(code).map_err(|e| stop_of(self.db, &e))
     }
 
     fn alloc(&mut self, bytes: &[u8], align: usize) -> Result<u64, Stop> {
-        self.eval.alloc_bytes(bytes, align).map_err(|e| stop_of(self.db, e))
+        self.eval.alloc_bytes(bytes, align).map_err(|e| stop_of(self.db, &e))
     }
 }
 
@@ -281,11 +281,11 @@ fn fill(db: &Db, eval: &mut Evaluator<'_>, buffer: &mut Vec<u8>, word: usize, by
     if (word_at(buffer, word, 2)? as usize) < bytes.len() {
         let reserve = buffer[3 * word..4 * word].to_vec(); // alloc: a growth, once per buffer too small
         let additional = (bytes.len() as u64).to_le_bytes();
-        *buffer = eval.call_pointer(&reserve, &[buffer, &additional[..word]]).map_err(|e| stop_of(db, e))?;
+        *buffer = eval.call_pointer(&reserve, &[buffer, &additional[..word]]).map_err(|e| stop_of(db, &e))?;
     }
     let data = word_at(buffer, word, 0)?;
     if !bytes.is_empty() {
-        eval.write_bytes(data, bytes).map_err(|e| stop_of(db, e))?;
+        eval.write_bytes(data, bytes).map_err(|e| stop_of(db, &e))?;
     }
     set_word(buffer, word, 1, bytes.len() as u64);
     Ok(())
@@ -305,7 +305,7 @@ impl<'r, 'e> Host<'r, 'e> {
             let word = state.word;
             let (data, len) = (word_at(buffer, word, 0)?, word_at(buffer, word, 1)?);
             let len = usize::try_from(len).map_err(|_| Stop("sent a request longer than memory".to_owned()))?; // alloc: error path
-            let request = eval.read_bytes(data, len).map_err(|e| stop_of(self.db, e))?;
+            let request = eval.read_bytes(data, len).map_err(|e| stop_of(self.db, &e))?;
             let mut reply = std::mem::take(&mut state.reply);
             let answered = state.server.dispatch(self.db, request, &mut reply);
             (word, reply, answered)
@@ -423,9 +423,13 @@ fn evaluate(
         word: 8,
     });
     // The evaluator's error borrows the state; made a `Stop` before the state is taken back.
-    let output = on_evaluator(db, what, bridge, &state, preset, expansions, spent).map_err(|e| {
-        spent.over = over_budget(&e);
-        stop_of(db, e)
+    // Attached, as a query's run is: a run ahead (`speculate`) is on a pool task outside any
+    // query, and the evaluator's errors and logs format the types they name.
+    let output = blaze_query::db::attach(db, || {
+        on_evaluator(db, what, bridge, &state, preset, expansions, spent).map_err(|e| {
+            spent.over = over_budget(&e);
+            stop_of(db, &e)
+        })
     });
     let state = state.into_inner();
     let (output, statics) = match (output, state.stop) {

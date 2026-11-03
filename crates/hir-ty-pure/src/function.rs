@@ -32,7 +32,6 @@ use hir_ty_mir::mir::{
     checks::source_span,
     dispatch::{Body, variants},
     location::{source_file_range, source_location_in_file, source_path},
-    type_name::rustc_function_name,
 };
 use intern::Symbol;
 use rustc_type_ir::{
@@ -401,7 +400,7 @@ fn place(cx: &Cx<'_>, instance: &Instance, span: MirSpan) -> Option<Place> {
         InferBodyId::DefWithBodyId(owner) => owner,
         InferBodyId::AnonConstId(_) => return None,
     };
-    let (file, line, column) = source_location_in_file(db, owner, span).as_ref().copied()?;
+    let (file, line, column) = source_location_in_file(db, owner, span)?;
     let (_, range) = source_file_range(db, owner, span)?;
     let path = source_path(db, file).unwrap_or_default().into();
     Some(Place { file, path, line, column, range })
@@ -426,7 +425,7 @@ fn instance_path(db: &Db, instance: &Instance) -> Box<str> {
 
 /// `func` by path, crate first, with `args` where its symbol has them.
 fn fn_path<'db>(db: &'db Db, func: FunctionId, args: &[hir_ty::next_solver::GenericArg<'db>]) -> Box<str> {
-    let spelled = blaze_query::db::attach(db, || rustc_function_name(db, func, args));
+    let spelled = blaze_query::db::attach(db, || hir_ty_print::rustc_function_name(db, func, args));
     match spelled {
         Some(path) => path.into(),
         None => FunctionSignature::of(db, func).name.as_str().into(),
@@ -571,9 +570,11 @@ impl<'db> Params<'_, 'db> {
                     }
                 }
             }
-            TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => {
-                self.ty(element, shared, false)
-            }
+            TyKind::Array(element, _) | TyKind::Slice(element) => self.ty(element, shared, false),
+            // A pattern type is its base type narrowed, in the same place: core's `NonNull<T>`
+            // holds `pattern_type!(*const T is !null)`, a raw pointer in a toolchain type's field
+            // (a `Vec`'s buffer), not one the function takes of its own.
+            TyKind::Pat(base, _) => self.ty(base, shared, toolchain),
             TyKind::Tuple(fields) => {
                 for field in fields.iter() {
                     self.ty(field, shared, false);

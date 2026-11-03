@@ -92,6 +92,18 @@ impl From<CfgAtom> for CfgExpr {
 }
 
 impl CfgExpr {
+    /// The heap the expression owns, in bytes: its nested boxes and slices (symbols are interned).
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            CfgExpr::Invalid | CfgExpr::Atom(_) => 0,
+            CfgExpr::All(exprs) | CfgExpr::Any(exprs) => {
+                let nested: usize = exprs.iter().map(CfgExpr::heap_bytes).sum();
+                size_of_val::<[CfgExpr]>(exprs) + nested
+            }
+            CfgExpr::Not(expr) => size_of::<CfgExpr>() + expr.heap_bytes(),
+        }
+    }
+
     // FIXME: Parsing from `tt` is only used in a handful of places, reconsider
     // if we should switch them to AST.
     #[cfg(feature = "tt")]

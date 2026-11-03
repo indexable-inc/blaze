@@ -2,11 +2,15 @@
 # pyright: basic
 """includes.py: a daemon follows edits to a file that only `include!` names.
 
-The file is not a `.rs` file, so nothing loads it until the macro is expanded. Two more files
-that `include_str!` and `include_bytes!` read sit outside the package, in no directory the
-build loads, so an edit of them moves nothing the daemon's view holds. Each step edits one of
-them or the file that includes it, asks the daemon for the program by `blaze build` and holds it
-to what a fresh build of the same source does (rebuild.py).
+The file is not a `.rs` file, so nothing loads it until the macro is expanded. Three more files
+that `include!`, `include_str!` and `include_bytes!` read sit outside the package, in no
+directory the build loads, so an edit of them moves nothing the daemon's view holds (#1638:
+`include!` of such a file). Each step edits one of them or the file that includes it, asks the
+daemon for the program by `blaze build` and holds it to what a fresh build of the same source
+does (rebuild.py). A step may also say whether the program's unit is to be kept from the build
+before (`"fresh"` in its `compiler-artifact` message): a build that edits nothing reuses the
+unit's record, filed by what its crate read outside every source root, and one that edits such
+a file compiles it again.
 
 usage: includes.py '{}'
 
@@ -16,6 +20,7 @@ for standard input): any field is refused. Run it in the repository's Python wor
 steps of their own.
 """
 
+import json
 import os
 import shutil
 import sys
@@ -55,14 +60,20 @@ fn main() {
     println!("{} {} {:?}", data::pick(2), data::made(), data::TABLE);
     println!("{} {:?}", include_str!("label.txt"), include_bytes!("bytes.dat"));
     println!("{} {:?}", include_str!("../../far/label.txt"), include_bytes!("../../far/bytes.dat"));
+    println!("{}", far::code());
+}
+
+mod far {
+    include!("../../far/code.rs");
 }
 """
 DATA, MAIN = "src/table.rs.data", "src/main.rs"
 LABEL, BYTES = "src/label.txt", "src/bytes.dat"
 # Outside the package's directory (`ws`), beside it: read only through the macros.
-FAR_LABEL, FAR_BYTES = "../far/label.txt", "../far/bytes.dat"
-# (what the step is, [(file, old, new)], whether it does not build). An `old` of None makes the
-# file, a `new` of None removes it.
+FAR_LABEL, FAR_BYTES, FAR_CODE = "../far/label.txt", "../far/bytes.dat", "../far/code.rs"
+FAR_CODE_TEXT = "pub fn code() -> u32 {\n    40\n}\n"
+# (what the step is, [(file, old, new)], whether it does not build[, whether the program's unit
+# is kept from the build before]). An `old` of None makes the file, a `new` of None removes it.
 STEPS = [
     ("nothing edited", [], False),
     ("a body in the included file", [(DATA, "* 2", "* 7")], False),
@@ -91,7 +102,33 @@ STEPS = [
     ("include_bytes input outside the package", [(FAR_BYTES, "far bytes", "far bytes edited")], False),
     ("remove the outside include_bytes input", [(FAR_BYTES, "far bytes edited", None)], True),
     ("restore the outside include_bytes input", [(FAR_BYTES, None, "far bytes back")], False),
+    ("nothing edited: the unit is kept", [], False, True),
+    ("include! input outside every root", [(FAR_CODE, "40", "41")], False, False),
+    ("nothing edited after it", [], False, True),
+    ("the outside include! input broken", [(FAR_CODE, "41", '"x"')], True),
+    ("mended", [(FAR_CODE, '"x"', "42")], False),
+    ("a function added to it", [(FAR_CODE, "\n}\n", "\n}\npub fn more() -> u32 {\n    1\n}\n")], False),
+    ("used from the including file", [(MAIN, "far::code());", "far::code() + far::more());")], False),
+    ("remove the outside include! input", [(FAR_CODE, None, None)], True),
+    ("restore it", [(FAR_CODE, None, "pub fn code() -> u32 {\n    43\n}\npub fn more() -> u32 {\n    2\n}\n")], False),
+    ("nothing edited at the end", [], False, True),
 ]
+
+
+def kept(said, program):
+    """Whether the build that said `said` kept `program`'s unit from the build before: the
+    `fresh` of its `compiler-artifact` message, None with no such message."""
+    found = None
+    for line in said.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("reason") == "compiler-artifact" and message.get("target", {}).get("name") == program:
+            found = message.get("fresh")
+    return found
 
 
 def follow(files, steps):
@@ -107,10 +144,13 @@ def follow(files, steps):
     project = Project(ws, work, outside=[it for it in dirs if it != ws and not it.startswith(ws + os.sep)])
     wrong = 0
     try:
-        for what, edits, broken in steps:
+        for what, edits, broken, *fresh in steps:
             for path, old, new in edits:
                 path = os.path.join(ws, path)
-                if old is None:
+                if old is None and new is None:
+                    # Removed, whatever it holds.
+                    os.unlink(path)
+                elif old is None:
                     assert not os.path.exists(path), (what, path)
                     Path(path).write_text(new)
                 elif new is None:
@@ -128,7 +168,10 @@ def follow(files, steps):
                 # Both builds refused a step written to build: a blaze that builds nothing
                 # would pass every step.
                 verdict = "BOTH REFUSED"
-            wrong += verdict in WRONG or verdict == "BOTH REFUSED"
+            if fresh and verdict == "same" and kept(built.said, "sinc") is not fresh[0]:
+                verdict = "RECOMPILED" if fresh[0] else "NOT REBUILT"
+                said = f"unit kept: {kept(built.said, 'sinc')}, expected {fresh[0]}"
+            wrong += verdict in WRONG or verdict in ("BOTH REFUSED", "RECOMPILED", "NOT REBUILT")
             print(f"{what:40} {verdict:16} {took:6.0f} ms  {said.splitlines()[0][:90] if said else ''}", flush=True)
             if verdict == "DAEMON DIED":
                 raise SystemExit(f"the daemon died: its log is in {project.home}")
@@ -162,6 +205,7 @@ if __name__ == "__main__":
             (BYTES, "old bytes"),
             (FAR_LABEL, "far label"),
             (FAR_BYTES, "far bytes"),
+            (FAR_CODE, FAR_CODE_TEXT),
         ],
         STEPS,
     )

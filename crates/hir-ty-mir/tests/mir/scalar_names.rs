@@ -1,10 +1,10 @@
-//! `type_name::scalar_name` against the arms each spelling of a type had for the scalars.
+//! `hir_ty_print::scalar_name` against the arms each spelling of a type had for the scalars.
 
 use hir_ty::{
     next_solver::{DbInterner, Ty, TyKind},
     primitive::{FloatTy, IntTy, UintTy},
 };
-use hir_ty_mir::mir::type_name::{rustc_symbol_type, rustc_type_name, scalar_name};
+use hir_ty_print::{rustc_symbol_type, rustc_type_name, scalar_name};
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use hir_expand::fixture;
 

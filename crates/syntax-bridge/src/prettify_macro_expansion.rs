@@ -199,7 +199,7 @@ mod tests {
     use super::*;
     use expect_test::{Expect, expect};
 
-    fn check_pretty(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+    fn check_pretty(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
         let ra_fixture = stdx::trim_indent(ra_fixture);
         let source_file = syntax::ast::SourceFile::parse(&ra_fixture, span::Edition::CURRENT);
         let syn = remove_whitespaces(&source_file.syntax_node());
@@ -273,7 +273,7 @@ mod tests {
                 };
             }
             "#,
-            expect![[r#"
+            &expect![[r#"
                 const X: i32 = x::y::z;
                 macro_rules! foo {
                     () => {
@@ -297,7 +297,7 @@ mod tests {
                 }
             };
             "#,
-            expect![[r#"
+            &expect![[r#"
                 const _: () = {
                     {
                         2;
@@ -323,7 +323,7 @@ mod tests {
                 match () {}
             };
             "#,
-            expect![[r#"
+            &expect![[r#"
                 const _: () = {
                     let x = 2;
                     let mut y = 3;
@@ -353,7 +353,7 @@ mod tests {
                 {}
             };
             "#,
-            expect![[r#"
+            &expect![[r#"
                 #[attr1]
                 #[attr2]
                 const _: () = {};
@@ -388,7 +388,7 @@ mod tests {
             use b::{c, d};
             macro_rules! foo { () => {}; }
             "#,
-            expect![[r#"
+            &expect![[r#"
                 fn foo(){}
                 struct Foo {}
                 struct Foo;
@@ -442,7 +442,7 @@ mod tests {
                 }
             };
             "#,
-            expect![[r#"
+            &expect![[r#"
                 const _: () = {
                     let _ = 1+2;
                     let _ = !true&&false;
@@ -480,7 +480,7 @@ mod tests {
                 };
             };
             "#,
-            expect![[r#"
+            &expect![[r#"
                 const _: () = {
                     match 2 {
                         tmp => foo!(),
@@ -497,7 +497,7 @@ mod tests {
                 };
             };
             "#,
-            expect![[r#"
+            &expect![[r#"
                 const _: () = {
                     match 2 {
                         tmp => {}
@@ -516,7 +516,7 @@ mod tests {
                 };
             };
             "#,
-            expect![[r#"
+            &expect![[r#"
                 const _: () = {
                     match 2 {
                         1 => {}

@@ -164,7 +164,7 @@ fn error_in(
     let _ = fx.only_file();
     let db = fx.into_db();
     let def = function(&db, name);
-    let (_, source_map) = Body::with_source_map(&db, def);
+    let source_map = Body::source_map(&db, def);
     let result = crate::borrowck(&db, def);
     let errors: Vec<&BorrowckDiagnostic> =
         result.diagnostics.iter().filter(|it| it.code.starts_with('E')).collect();

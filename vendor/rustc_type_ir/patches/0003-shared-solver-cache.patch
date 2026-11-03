@@ -1,7 +1,8 @@
-diff -ruN a/src/interner.rs b/src/interner.rs
+diff --git a/src/interner.rs b/src/interner.rs
+index 159c293..942f822 100644
 --- a/src/interner.rs
 +++ b/src/interner.rs
-@@ -259,8 +259,17 @@
+@@ -259,7 +259,16 @@ pub trait Interner:
      type Clause: Clause<Self>;
      type Clauses: Clauses<Self>;
  
@@ -13,14 +14,13 @@ diff -ruN a/src/interner.rs b/src/interner.rs
 +        scope: search_graph::CacheScope,
 +        f: impl FnOnce(&search_graph::GlobalCache<Self>) -> R,
 +    ) -> R;
- 
++
 +    /// See [`search_graph::Cx::cache_scope`].
 +    fn cache_scope(self, dep_node: &Self::DepNodeIndex) -> search_graph::CacheScope;
-+
+ 
      fn with_canonical_param_env_cache<R>(
          self,
-         f: impl FnOnce(&mut CanonicalParamEnvCache<Self>) -> R,
-@@ -777,8 +786,15 @@
+@@ -767,8 +776,15 @@ impl<I: Interner> search_graph::Cx for I {
      fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, I::DepNodeIndex) {
          I::with_cached_task(self, task)
      }
@@ -38,10 +38,11 @@ diff -ruN a/src/interner.rs b/src/interner.rs
      }
      fn assert_evaluation_is_concurrent(&self) {
          self.assert_evaluation_is_concurrent()
-diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
+diff --git a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
+index 200ded3..0eac64f 100644
 --- a/src/search_graph/global_cache.rs
 +++ b/src/search_graph/global_cache.rs
-@@ -1,31 +1,29 @@
+@@ -1,29 +1,27 @@
 +use std::hash::{BuildHasher, Hash};
 +use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 +use std::sync::{Mutex, OnceLock, PoisonError};
@@ -57,6 +58,22 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
 -    required_depth: RequiredDepth,
 -    nested_goals: NestedGoals<X>,
 -    result: X::Tracked<X::Result>,
+-}
+-
+-struct WithOverflow<X: Cx> {
+-    nested_goals: NestedGoals<X>,
+-    result: X::Tracked<X::Result>,
+-}
+-
+-/// The cache entry for a given input.
+-///
+-/// This contains results whose computation never hit the
+-/// recursion limit in `success`, and all results which hit
+-/// the recursion limit in `with_overflow`.
+-#[derive_where(Default; X: Cx)]
+-struct CacheEntry<X: Cx> {
+-    success: Option<Success<X>>,
+-    with_overflow: HashMap<RequiredDepth, WithOverflow<X>>,
 +/// One published result of a goal. Never changed once published: a later result of the same
 +/// goal is a new row the goal's column points at instead.
 +struct Row<X: Cx> {
@@ -72,26 +89,8 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
 +    next: u32,
  }
  
--struct WithOverflow<X: Cx> {
--    nested_goals: NestedGoals<X>,
--    result: X::Tracked<X::Result>,
--}
--
--/// The cache entry for a given input.
--///
--/// This contains results whose computation never hit the
--/// recursion limit in `success`, and all results which hit
--/// the recursion limit in `with_overflow`.
--#[derive_where(Default; X: Cx)]
--struct CacheEntry<X: Cx> {
--    success: Option<Success<X>>,
--    with_overflow: HashMap<RequiredDepth, WithOverflow<X>>,
--}
--
  #[derive_where(Debug; X: Cx)]
- pub(super) struct CacheData<'a, X: Cx> {
-     pub(super) result: X::Result,
-@@ -33,20 +31,79 @@
+@@ -33,20 +31,79 @@ pub(super) struct CacheData<'a, X: Cx> {
      pub(super) encountered_overflow: bool,
      pub(super) nested_goals: &'a NestedGoals<X>,
  }
@@ -142,14 +141,14 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
 +    writers: OnceLock<Box<[Writer]>>,
 +    /// What a row without nested goals has.
 +    no_nested_goals: NestedGoals<X>,
- }
- 
++}
++
 +impl<X: Cx> Default for GlobalCache<X> {
 +    fn default() -> Self {
 +        GlobalCache::new()
 +    }
-+}
-+
+ }
+ 
  impl<X: Cx> GlobalCache<X> {
      #[inline]
      pub const fn new() -> Self {
@@ -175,7 +174,7 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
          cx: X,
          input: X::Input,
          evaluation_result: EvaluationResult<X>,
-@@ -55,22 +112,48 @@
+@@ -55,22 +112,48 @@ impl<X: Cx> GlobalCache<X> {
          let EvaluationResult { encountered_overflow, required_depth, heads, nested_goals, result } =
              evaluation_result;
          debug_assert!(heads.is_empty());
@@ -187,6 +186,13 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
 -            if let Some(prev) = &prev {
 -                cx.assert_evaluation_is_concurrent();
 -                assert_eq!(cx.get_tracked(&prev.result), evaluation_result.result);
+-            }
+-        } else {
+-            let prev = entry.success.replace(Success { required_depth, nested_goals, result });
+-            if let Some(prev) = &prev {
+-                cx.assert_evaluation_is_concurrent();
+-                assert_eq!(cx.get_tracked(&prev.result), evaluation_result.result, "{input:?}");
+-            }
 +        let goal = self.goals.intern(input);
 +        let index = self.results.intern(result);
 +        let depth = u32::try_from(required_depth.0).expect("a solver depth past `u32::MAX`");
@@ -207,7 +213,7 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
 +            // By value: two threads interning one result at once may get two indices.
 +            let prev = *self.results.get(cx.get_tracked(&prev.result));
 +            assert_eq!(prev, result, "{input:?}");
-+        }
+         }
 +        let nested_goals = match nested_goals.is_empty() {
 +            true => 0,
 +            false => {
@@ -216,13 +222,7 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
 +                    unreachable!("nested goals {raw} handed out twice");
 +                }
 +                raw + 1
-             }
--        } else {
--            let prev = entry.success.replace(Success { required_depth, nested_goals, result });
--            if let Some(prev) = &prev {
--                cx.assert_evaluation_is_concurrent();
--                assert_eq!(cx.get_tracked(&prev.result), evaluation_result.result, "{input:?}");
--            }
++            }
 +        };
 +        let row = Row {
 +            result: cx.mk_tracked(index, dep_node),
@@ -233,12 +233,12 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
 +        let raw = claimed.rows.take(&self.next_row);
 +        if self.rows.get_or_init(raw, OnceLock::new).set(row).is_err() {
 +            unreachable!("row {raw} handed out twice");
-         }
++        }
 +        head.store(raw + 1, Ordering::Release);
      }
  
      /// Try to fetch a cached result, checking the recursion limit
-@@ -84,32 +167,376 @@
+@@ -84,32 +167,376 @@ impl<X: Cx> GlobalCache<X> {
          available_depth: AvailableDepth,
          mut candidate_is_applicable: impl FnMut(&NestedGoals<X>) -> bool,
      ) -> Option<CacheData<'a, X>> {
@@ -294,7 +294,7 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
          }
  
          None
-+    }
+     }
 +
 +    /// The row `plus_one` names, `None` for 0.
 +    fn row(&self, plus_one: u32) -> Option<&Row<X>> {
@@ -632,12 +632,13 @@ diff -ruN a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
 +            let index = interned.find(&value).expect("interned by some thread");
 +            assert_eq!(*interned.get(index), value);
 +        }
-     }
++    }
  }
-diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
+diff --git a/src/search_graph/mod.rs b/src/search_graph/mod.rs
+index e427cdc..78a6bbe 100644
 --- a/src/search_graph/mod.rs
 +++ b/src/search_graph/mod.rs
-@@ -53,11 +53,27 @@
+@@ -53,11 +53,27 @@ pub trait Cx: Copy {
      fn get_tracked<T: Debug + Clone>(self, tracked: &Self::Tracked<T>) -> T;
      fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, Self::DepNodeIndex);
  
@@ -645,12 +646,12 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
 +    /// Runs `f` on the cache of `scope`. A lookup reads [`CacheScope::Shared`], then
 +    /// [`CacheScope::Query`]; a result goes where [`Cx::cache_scope`] says.
 +    fn with_global_cache<R>(self, scope: CacheScope, f: impl FnOnce(&GlobalCache<Self>) -> R) -> R;
- 
++
 +    /// Where a goal solved under `dep_node` may be cached: [`CacheScope::Shared`] only when
 +    /// `dep_node` holds every read the result depends on, so another query reusing it takes
 +    /// them.
 +    fn cache_scope(self, dep_node: &Self::DepNodeIndex) -> CacheScope;
-+
+ 
      fn assert_evaluation_is_concurrent(&self);
  }
  
@@ -666,7 +667,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
  pub trait Delegate: Sized {
      type Cx: Cx;
      /// Whether to use the provisional cache. Set to `false` by a fuzzer when
-@@ -1263,12 +1279,14 @@
+@@ -1263,12 +1279,14 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
          step_kind_from_parent: PathKind,
          available_depth: AvailableDepth,
      ) -> Option<X::Result> {
@@ -687,7 +688,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
          })
      }
  
-@@ -1282,26 +1300,28 @@
+@@ -1282,26 +1300,28 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
          step_kind_from_parent: PathKind,
          available_depth: AvailableDepth,
      ) -> Option<X::Result> {
@@ -734,7 +735,7 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
          })
      }
  
-@@ -1493,6 +1513,7 @@
+@@ -1493,6 +1513,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
          dep_node: X::DepNodeIndex,
      ) {
          debug!(?evaluation_result, "insert global cache");

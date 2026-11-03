@@ -183,11 +183,17 @@ impl fmt::Display for Running {
 /// Each thread on a line of its own: its spans outermost first, each with what it is of.
 fn threads(f: &mut fmt::Formatter<'_>, threads: &[ThreadNow]) -> fmt::Result {
     for thread in threads {
-        write!(f, "\n  {} (tid {}):", thread.name, thread.tid)?;
-        for (i, span) in thread.open.iter().enumerate() {
-            f.write_str(if i == 0 { " " } else { " > " })?;
-            open_span(f, span)?;
-        }
+        f.write_str("\n  ")?;
+        let spans = thread.open.iter().map(|span| SpanSaid {
+            name: span.name,
+            function: span.function.as_deref(),
+            krate: span.krate.as_deref(),
+            unit: span.unit.as_deref(),
+            awaits: span.awaits.as_deref(),
+            owner: span.owner,
+            for_ns: i64::try_from(span.for_ns).unwrap_or(i64::MAX),
+        });
+        thread_said(f, &thread.name, thread.tid, spans)?;
         if thread.deeper > 0 {
             write!(f, " > {} more", thread.deeper)?;
         }
@@ -198,23 +204,61 @@ fn threads(f: &mut fmt::Formatter<'_>, threads: &[ThreadNow]) -> fmt::Result {
 /// `name `function` of crate, unit u, awaiting what, run by owner (12.3 s)`, each part only when
 /// the span has it.
 pub fn open_span(f: &mut impl fmt::Write, span: &OpenSpan) -> fmt::Result {
-    f.write_str(span.name)?;
-    if let Some(function) = &span.function {
-        write!(f, " `{function}`")?;
+    let said = SpanSaid {
+        name: span.name,
+        function: span.function.as_deref(),
+        krate: span.krate.as_deref(),
+        unit: span.unit.as_deref(),
+        awaits: span.awaits.as_deref(),
+        owner: span.owner,
+        for_ns: i64::try_from(span.for_ns).unwrap_or(i64::MAX),
+    };
+    write!(f, "{said}")
+}
+
+/// An open span as it is said ([`open_span`]), from a live thread or from a history's
+/// reading of a daemon that died (`slow::thread_line`): one form for both.
+#[derive(Clone, Copy, Debug)]
+pub struct SpanSaid<'a> {
+    pub name: &'a str,
+    pub function: Option<&'a str>,
+    pub krate: Option<&'a str>,
+    pub unit: Option<&'a str>,
+    pub awaits: Option<&'a str>,
+    pub owner: Option<u64>,
+    pub for_ns: i64,
+}
+
+impl fmt::Display for SpanSaid<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name)?;
+        if let Some(function) = self.function {
+            write!(f, " `{function}`")?;
+        }
+        if let Some(krate) = self.krate {
+            write!(f, " of {krate}")?;
+        }
+        if let Some(unit) = self.unit {
+            write!(f, ", unit {unit}")?;
+        }
+        if let Some(awaits) = self.awaits {
+            write!(f, ", awaiting {awaits}")?;
+        }
+        if let Some(owner) = self.owner {
+            write!(f, ", run by task {owner}")?;
+        }
+        write!(f, " ({:.1} s)", self.for_ns as f64 / 1e9)
     }
-    if let Some(krate) = &span.krate {
-        write!(f, " of {krate}")?;
+}
+
+/// A thread's line ([`threads`]): `name (tid 7): a > b`, of any spans said as [`SpanSaid`].
+pub fn thread_said<'a>(f: &mut impl fmt::Write, name: &str, tid: u64, spans: impl IntoIterator<Item = SpanSaid<'a>>) -> fmt::Result {
+    write!(f, "{name} (tid {tid}):")?;
+    for (i, span) in spans.into_iter().enumerate() {
+        f.write_str(if i == 0 { " " } else { " > " })?;
+        write!(f, "{span}")?;
     }
-    if let Some(unit) = &span.unit {
-        write!(f, ", unit {unit}")?;
-    }
-    if let Some(awaits) = &span.awaits {
-        write!(f, ", awaiting {awaits}")?;
-    }
-    if let Some(owner) = span.owner {
-        write!(f, ", run by task {owner}")?;
-    }
-    write!(f, " ({:.1} s)", span.for_ns as f64 / 1e9)
+    Ok(())
 }
 
 impl fmt::Debug for Stall {

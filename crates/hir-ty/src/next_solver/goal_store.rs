@@ -147,116 +147,18 @@ fn offer_goal<'db>(
     with_store(interner.db, |store| store.offer(interner, goal, answer, reads));
 }
 
-const SOLVER_DOMAIN: &str = "blaze v2 goal 1 solver";
+const SOLVER_DOMAIN: &str = "blaze v2 goal 3 solver";
 
-/// What the solver's answers are a function of besides the goal and the facts: the pinned
-/// nightly, the vendored solver's patch series (each crate's series file and every patch), and
-/// the front end's code ([`install`]'s `build`). A patch added to a series is added here too;
-/// `the_solver_version_covers_every_patch` checks it.
-const SOLVER_FILES: [(&str, &[u8]); 21] = [
-    ("harness/toolchain", include_bytes!("../../../../harness/toolchain")),
-    (
-        "vendor/rustc_next_trait_solver/PATCHES.md",
-        include_bytes!("../../../../vendor/rustc_next_trait_solver/PATCHES.md"),
-    ),
-    (
-        "vendor/rustc_next_trait_solver/patches/0002-unsafe-code-policy.patch",
-        include_bytes!(
-            "../../../../vendor/rustc_next_trait_solver/patches/0002-unsafe-code-policy.patch"
-        ),
-    ),
-    (
-        "vendor/rustc_next_trait_solver/patches/0003-rustc-rules-at-unimplemented-sites.patch",
-        include_bytes!(
-            "../../../../vendor/rustc_next_trait_solver/patches/0003-rustc-rules-at-unimplemented-sites.patch"
-        ),
-    ),
-    (
-        "vendor/rustc_next_trait_solver/patches/0004-solver-temporaries-recycled.patch",
-        include_bytes!(
-            "../../../../vendor/rustc_next_trait_solver/patches/0004-solver-temporaries-recycled.patch"
-        ),
-    ),
-    (
-        "vendor/rustc_next_trait_solver/patches/0005-fast-path-depth.patch",
-        include_bytes!("../../../../vendor/rustc_next_trait_solver/patches/0005-fast-path-depth.patch"),
-    ),
-    (
-        "vendor/rustc_next_trait_solver/patches/0006-def-id-is-local.patch",
-        include_bytes!("../../../../vendor/rustc_next_trait_solver/patches/0006-def-id-is-local.patch"),
-    ),
-    (
-        "vendor/rustc_next_trait_solver/patches/0007-solver-temporaries-kept.patch",
-        include_bytes!(
-            "../../../../vendor/rustc_next_trait_solver/patches/0007-solver-temporaries-kept.patch"
-        ),
-    ),
-    (
-        "vendor/rustc_next_trait_solver/patches/0008-scratch-buffers-raised.patch",
-        include_bytes!(
-            "../../../../vendor/rustc_next_trait_solver/patches/0008-scratch-buffers-raised.patch"
-        ),
-    ),
-    (
-        "vendor/rustc_next_trait_solver/patches/0009-bailed-probes-give-back-their-goals.patch",
-        include_bytes!(
-            "../../../../vendor/rustc_next_trait_solver/patches/0009-bailed-probes-give-back-their-goals.patch"
-        ),
-    ),
-    (
-        "vendor/rustc_next_trait_solver/patches/0010-never-grown-scratch-buffers-kept.patch",
-        include_bytes!(
-            "../../../../vendor/rustc_next_trait_solver/patches/0010-never-grown-scratch-buffers-kept.patch"
-        ),
-    ),
-    ("vendor/rustc_type_ir/PATCHES.md", include_bytes!("../../../../vendor/rustc_type_ir/PATCHES.md")),
-    (
-        "vendor/rustc_type_ir/patches/0001-from-checked-parts.patch",
-        include_bytes!("../../../../vendor/rustc_type_ir/patches/0001-from-checked-parts.patch"),
-    ),
-    (
-        "vendor/rustc_type_ir/patches/0003-shared-solver-cache.patch",
-        include_bytes!("../../../../vendor/rustc_type_ir/patches/0003-shared-solver-cache.patch"),
-    ),
-    (
-        "vendor/rustc_type_ir/patches/0004-unsafe-code-policy.patch",
-        include_bytes!("../../../../vendor/rustc_type_ir/patches/0004-unsafe-code-policy.patch"),
-    ),
-    (
-        "vendor/rustc_type_ir/patches/0005-simplified-type-ord.patch",
-        include_bytes!("../../../../vendor/rustc_type_ir/patches/0005-simplified-type-ord.patch"),
-    ),
-    (
-        "vendor/rustc_type_ir/patches/0006-solver-storage-recycled.patch",
-        include_bytes!("../../../../vendor/rustc_type_ir/patches/0006-solver-storage-recycled.patch"),
-    ),
-    (
-        "vendor/rustc_type_ir/patches/0007-fast-path-depth.patch",
-        include_bytes!("../../../../vendor/rustc_type_ir/patches/0007-fast-path-depth.patch"),
-    ),
-    (
-        "vendor/rustc_type_ir/patches/0008-def-id-is-local.patch",
-        include_bytes!("../../../../vendor/rustc_type_ir/patches/0008-def-id-is-local.patch"),
-    ),
-    (
-        "vendor/rustc_type_ir/patches/0009-small-sets-and-stalled-lists-inline.patch",
-        include_bytes!(
-            "../../../../vendor/rustc_type_ir/patches/0009-small-sets-and-stalled-lists-inline.patch"
-        ),
-    ),
-    (
-        "vendor/rustc_type_ir/patches/0010-solver-cache-in-blocks.patch",
-        include_bytes!("../../../../vendor/rustc_type_ir/patches/0010-solver-cache-in-blocks.patch"),
-    ),
-];
-
-/// The solver version of a front end whose code is `build`.
+/// The solver version of a front end whose code is `build` ([`install`]'s `build`): what every
+/// stored answer's key starts from. `build` is the content identity of the front end's code and
+/// of how it was built (blaze-cargo `serve/unit/deps.rs`, `front_end`;
+/// `blaze_codegen_code::FRONT_END`), whose closure has hir-ty and every vendored solver crate in
+/// it, with their `src/`, manifests, `PATCHES.md` and patches, and the pinned nightly; so a
+/// solver change, in a patch or straight in `src/`, is another version, with no list of the
+/// solver's files to keep and no build script in hir-ty. The domain alone is added: the item
+/// store keys its records by the same build under a domain of its own.
 pub fn solver_version(build: &ContentId) -> ContentId {
-    let mut h = Hasher::new(SOLVER_DOMAIN);
-    for (name, bytes) in SOLVER_FILES {
-        h.part(name.as_bytes()).part(bytes);
-    }
-    h.id(build).finish()
+    Hasher::new(SOLVER_DOMAIN).id(build).finish()
 }
 
 /// The goal store of one database.
@@ -553,6 +455,12 @@ fn with_store<R>(db: &Db, f: impl FnOnce(&Store) -> R) -> Option<R> {
 /// facts, and `build`, the content ID of the front end's code (what `hir_def::deps::serve` is
 /// given). Until the guard is dropped, every lookup and offer of `db` goes to it; what was
 /// offered and not flushed is dropped with it.
+///
+/// `build` must be the identity of all of the front end's code and of how it was built, as the
+/// driver's is (blaze-cargo `serve/unit/deps.rs`, `front_end`: the identity blaze-engine's build
+/// script works out, `blaze_codegen_code::FRONT_END`, with its how-built inputs: features, cfg,
+/// `RUSTFLAGS`, the compiler). The store is sound only because of that: nothing else in a key
+/// names the solver's or hir-ty's code.
 pub fn install(
     db: &Db,
     // dyn: the driver's store, kept by the goal store (see `Store::images`)

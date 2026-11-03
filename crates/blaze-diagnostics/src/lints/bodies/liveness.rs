@@ -146,6 +146,7 @@ enum Key {
 }
 
 /// The assignments of one checked place at one [`Key`]: rustc's `Access`.
+#[derive(Clone, Copy)]
 struct Assignment<'m> {
     key: Key,
     kind: Access,
@@ -649,10 +650,11 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
         let b = self.b;
         let name = var.name.as_str();
         // alloc: the lint's message, for an unused variable found
-        let mut diag = Diag::lint("unused_variables", format!("unused variable: `{name}`"), spans[0].clone());
-        for span in &spans[1..] {
-            // clone: a lint's span, for an unused variable found
-            diag.primary(span.clone());
+        let mut spans = spans.into_iter();
+        let first = spans.next().expect("an unused variable is introduced somewhere");
+        let mut diag = Diag::lint("unused_variables", format!("unused variable: `{name}`"), first);
+        for span in spans {
+            diag.primary(span);
         }
         // alloc: the lint's search text, for an unused variable found
         let brace_name = format!("{{{name}");

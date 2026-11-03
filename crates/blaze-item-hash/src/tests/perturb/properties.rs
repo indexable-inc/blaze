@@ -126,30 +126,30 @@ fn edit_a_literal(tc: &TestCase, item: &mut [Tok]) -> bool {
 }
 
 /// Each case builds four databases.
-fn keeps_and_loses_its_identity(tc: TestCase) {
-    let mut items = program(&tc);
+fn keeps_and_loses_its_identity(tc: &TestCase) {
+    let mut items = program(tc);
     let mut order: Vec<usize> = (0..items.len()).collect();
     let base = plain(&items, &order);
     for at in (1..order.len()).rev() {
         order.swap(at, tc.draw(gs::integers().max_value(at)));
     }
-    same(&base, &laid_out(&tc, &items, &order));
+    same(&base, &laid_out(tc, &items, &order));
     if items.len() > 1 {
         let other: usize = tc.draw(gs::integers().min_value(1).max_value(items.len() - 1));
         let mut edited = items.clone();
-        if edit_a_literal(&tc, &mut edited[other]) {
+        if edit_a_literal(tc, &mut edited[other]) {
             same(&base, &plain(&edited, &order));
         }
     }
-    if edit_a_literal(&tc, &mut items[0]) {
+    if edit_a_literal(tc, &mut items[0]) {
         differ(&base, &plain(&items, &order));
     }
 }
 
 /// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
+fn run_cases(cases: u64, mut property: impl FnMut(&TestCase)) {
     let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
+    Hegel::new(move |tc: TestCase| property(&tc)).settings(Settings::new().test_cases(cases).database(None)).run();
 }
 
 /// `HEGEL_TEST_CASES=<n>` runs it longer.

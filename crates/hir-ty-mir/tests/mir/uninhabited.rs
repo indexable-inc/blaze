@@ -37,7 +37,7 @@ fn entries(src: &str, name: &str) -> Vec<(String, String, &'static str)> {
         let func = function(&db, name);
         let body =
             db.mir_body(func.into()).unwrap_or_else(|error| panic!("the MIR of `{name}`: {error:?}"));
-        let (_, map) = Body::with_source_map(&db, DefWithBodyId::from(func));
+        let map = Body::source_map(&db, DefWithBodyId::from(func));
         let at = |span: MirSpan| {
             let source = match span {
                 MirSpan::ExprId(expr) => map.expr_syntax(expr),

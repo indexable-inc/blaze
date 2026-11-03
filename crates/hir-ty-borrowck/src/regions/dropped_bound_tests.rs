@@ -465,3 +465,285 @@ fn a_placeholder_with_two_bounds_is_answered_by_the_bound_in_its_position() {
         accepted_in(REVIEW, name);
     }
 }
+
+/// blaze-units' `in_workspace` (blaze checking blaze, E3): a closure or function whose
+/// signature is the target's own implies no bound the target does not, so it loses none.
+/// `Workspace<'a, S>`'s inferred `S: 'a` gives `Snap<'r, 'db>: 'a`, which blaze once tested
+/// whole and matched against the target's by exact type, each side naming `'r` and `'db` by
+/// variables of its own: six false refusals. `filter_prov` is hir-ty-mir's
+/// `prov.filter(|_| M::CHECKS)`, the same for an associated type.
+const SAME_SIGNATURE: &str = r#"
+//- minicore: sized, copy, fn
+pub struct Reader<'db>(&'db u8);
+
+pub struct Snap<'r, 'db>(&'r Reader<'db>);
+
+pub struct Context<S>(S);
+
+pub struct Workspace<'a, S>(&'a Context<S>);
+
+fn in_workspace<'db, R>(
+    reader: &Reader<'db>,
+    then: impl for<'r, 'a> FnOnce(&'a Context<Snap<'r, 'db>>, &'a Workspace<'a, Snap<'r, 'db>>) -> R,
+) -> R {
+    let ctx = Context(Snap(reader));
+    let ws = Workspace(&ctx);
+    then(&ctx, &ws)
+}
+
+fn load<'db>(reader: &Reader<'db>) -> u8 {
+    in_workspace(reader, |ctx, ws| {
+        let _ = (ctx, ws);
+        0
+    })
+}
+
+fn both<'r, 'a, 'db>(_: &'a Context<Snap<'r, 'db>>, _: &'a Workspace<'a, Snap<'r, 'db>>) {}
+
+fn reify<'db>() {
+    let f: for<'r, 'a> fn(&'a Context<Snap<'r, 'db>>, &'a Workspace<'a, Snap<'r, 'db>>) = both;
+    let g: for<'r, 'a> fn(&'a Context<Snap<'r, 'db>>, &'a Workspace<'a, Snap<'r, 'db>>) = f;
+    let _ = g;
+}
+
+pub trait Machine<'db> {
+    type Prov;
+}
+
+fn keep<T>(x: T, f: impl FnOnce(&T) -> bool) -> bool {
+    f(&x)
+}
+
+fn filter_prov<'db, M: Machine<'db>>(prov: M::Prov) -> bool {
+    keep(prov, |_| true)
+}
+
+pub struct Holder<'b, T>(&'b T);
+
+fn helper<'a, 'b, T>(_: &'a Workspace<'a, Holder<'b, T>>, v: &'b T) -> &'a T {
+    v
+}
+
+fn expand<'b, T>() {
+    let f: for<'x> fn(&'static Workspace<'static, Holder<'static, T>>, &'x T) -> &'b T = helper;
+    let _ = f;
+}
+"#;
+
+#[test]
+fn a_closure_or_function_related_with_its_own_signature_keeps_every_bound() {
+    for name in ["load", "reify", "filter_prov"] {
+        accepted_in(SAME_SIGNATURE, name);
+    }
+}
+
+#[test]
+fn a_bound_implied_through_a_types_inferred_outlives_is_still_kept() {
+    // cve-rs's `expand` with `'b: 'a` implied by `Workspace<'a, Holder<'b, T>>`'s inferred
+    // `Holder<'b, T>: 'a`: the target implies nothing of `'x`, so the coercion turns any
+    // lifetime into `'b`.
+    for result in checked(SAME_SIGNATURE, "expand") {
+        assert_eq!(result.not_checked, None, "`expand`");
+        assert!(
+            result.diagnostics.iter().any(|it| it.message.contains("rust-lang/rust#25860")),
+            "`expand`: {:?}",
+            result.diagnostics
+        );
+    }
+}
+
+/// The review of E3's probes (v2-blazeerrs-e3-review.md): P1 is `FIXTURE`'s `expand`, P2
+/// `SAME_SIGNATURE`'s `expand`, P5 `REVIEW`'s `extend`, P6 `SAME_SIGNATURE`'s `load`, `reify` and
+/// `filter_prov`. These are P3, P4 and P9.
+const PROBES: &str = r#"
+//- minicore: sized, copy, fn
+pub struct Context<S>(S);
+
+pub struct Workspace<'a, S>(&'a Context<S>);
+
+pub struct Holder<'b, T>(&'b T);
+
+pub struct Pair<'a, 'b, T>(Workspace<'a, Holder<'b, T>>);
+
+fn helper_pair<'a, 'b, T>(_: &'a Pair<'a, 'b, T>, v: &'b T) -> &'a T {
+    v
+}
+
+fn expand_pair<'b, T>() {
+    let f: for<'x> fn(&'static Pair<'static, 'static, T>, &'x T) -> &'b T = helper_pair;
+    let _ = f;
+}
+
+pub trait Tr {
+    type Out;
+}
+
+impl<X> Tr for X {
+    type Out = ();
+}
+
+fn helper_proj<'a, 'b, T>(_: <&'a &'b () as Tr>::Out, v: &'b T) -> &'a T {
+    v
+}
+
+fn expand_proj<'b, T>() {
+    let f: for<'x> fn((), &'x T) -> &'b T = helper_proj;
+    let _ = f;
+}
+
+pub trait Machine<'db> {
+    type Prov;
+}
+
+fn src<'x, 'a, 'b, M: Machine<'a> + Machine<'b>>(
+    _: &'x <M as Machine<'a>>::Prov,
+    _: &'x <M as Machine<'b>>::Prov,
+) -> &'x () {
+    &()
+}
+
+fn take<P, Q>(_: for<'y> fn(&'static P, &'y Q) -> &'y ()) {}
+
+fn distinct_locals<M: for<'l> Machine<'l>>() {
+    take(src::<M>);
+}
+"#;
+
+/// P7: P1 with a closure for the function, its lifetimes named by a binder so that its
+/// signature implies `'c: 'a`. rustc's verdicts (nightly-2026-10-25, 2026-11-03):
+/// - `expand_later` is accepted (rust-lang/rust#25860). The closure has no expected type
+///   where it is written, so its signature is the one written, binder and all.
+/// - `expand_closure` is refused in the closure: "lifetime may not live long enough". The
+///   fn pointer it is written for is its expected type, and an expected signature wins over
+///   the written one (`sig_of_closure_with_expectation`, which has no case for a binder). The
+///   written one then has to equal it, which makes `v`'s lifetime `'static`.
+/// - `binder_body` is accepted: in the body `'c: 'a` holds, which the signature implies.
+/// - `binder_body_unrelated` is refused: "returning data with lifetime `'c`".
+const CLOSURE_BINDER: &str = r#"
+//- minicore: sized, copy, fn
+#![feature(closure_lifetime_binder)]
+static UNIT: &'static &'static () = &&();
+
+fn expand_closure<'b, T>(x: &T) -> &'b T {
+    let f: for<'x> fn(&'static &'static (), &'x T) -> &'b T =
+        for<'a, 'c> |_: &'a &'c (), v: &'c T| -> &'a T { v };
+    f(UNIT, x)
+}
+
+fn expand_later<'b, T>(x: &T) -> &'b T {
+    let c = for<'a, 'c> |_: &'a &'c (), v: &'c T| -> &'a T { v };
+    let f: for<'x> fn(&'static &'static (), &'x T) -> &'b T = c;
+    f(UNIT, x)
+}
+
+fn binder_body<T>() {
+    let _c = for<'a, 'c> |_: &'a &'c (), v: &'c T| -> &'a T { v };
+}
+
+fn binder_body_unrelated<T>() {
+    let _c = for<'a, 'c> |_: &'a (), v: &'c T| -> &'a T { v };
+}
+"#;
+
+/// P8 (review F1): `holds`' signature implies `C: 'a`, which the coercion makes `C: 'static`.
+/// `C` is a closure that captures `<M as Machine<'db>>::Prov`, which is not `'static`. An
+/// `async` closure's captures are its upvars as a closure's are (`alias_components`).
+const ASYNC_CAPTURE: &str = r#"
+//- minicore: sized, copy, fn, future, async_fn
+//- /main.rs edition:2024
+pub trait Machine<'db> {
+    type Prov;
+}
+
+pub struct Context<S>(S);
+
+pub struct Workspace<'a, S>(&'a Context<S>);
+
+fn holds<'a, C>(_: &'a Workspace<'a, C>, _: C) -> &'a () {
+    &()
+}
+
+fn use_with<C>(_: fn(&'static Workspace<'static, C>, C) -> &'static (), _: C) {}
+
+fn keep_async<'db, M: Machine<'db>>(prov: M::Prov) {
+    use_with(holds, async move || {
+        let _p = &prov;
+    });
+}
+
+fn keep_closure<'db, M: Machine<'db>>(prov: M::Prov) {
+    use_with(holds, move || {
+        let _p = &prov;
+    });
+}
+"#;
+
+/// `name` is refused, and an error cites rust-lang/rust#25860.
+fn refused_citing_25860(fixture_text: &str, name: &str) {
+    for result in checked(fixture_text, name) {
+        assert_eq!(result.not_checked, None, "`{name}`");
+        assert!(
+            result.diagnostics.iter().any(|it| it.message.contains("rust-lang/rust#25860")),
+            "`{name}`: {:?}",
+            result.diagnostics
+        );
+    }
+}
+
+/// P3. rustc accepts (rust-lang/rust#25860). `Pair<'a, 'b, T>`'s inferred `'b: 'a` comes through
+/// `Workspace<'a, Holder<'b, T>>`'s own inferred outlives.
+#[test]
+fn a_bound_implied_through_two_nested_structs_inferred_outlives_is_kept() {
+    refused_citing_25860(PROBES, "expand_pair");
+}
+
+/// P4. rustc accepts (rust-lang/rust#25860), per the review: its implied bounds of
+/// `helper_proj` include the unnormalized input's `&'a &'b ()`, so `'b: 'a`. Worth one rustc
+/// run, as this verdict comes from the review's table and was not run here. If blaze does not
+/// imply `'b: 'a` from a projection's arguments, `helper_proj` is refused instead and
+/// `expand_proj` proves nothing; this test fails in that case.
+#[test]
+fn a_bound_implied_through_a_projections_arguments_is_kept() {
+    refused_citing_25860(PROBES, "expand_proj");
+}
+
+/// P7. rustc accepts `expand_later` (rust-lang/rust#25860): a closure with a `for<..>` binder
+/// and no expected type has its signature as written, and the coercion to the fn pointer
+/// relates the two higher-ranked. `expand_closure`, the closure written where the fn pointer
+/// is expected, rustc refuses in the closure (see [`CLOSURE_BINDER`]); blaze refuses it too.
+#[test]
+fn a_closure_with_a_lifetime_binder_coerced_to_a_fn_pointer_keeps_its_implied_bound() {
+    refused_citing_25860(CLOSURE_BINDER, "expand_later");
+    refused_at_all(CLOSURE_BINDER, "expand_closure");
+}
+
+/// A closure's `for<'a, 'c>` binder names the lifetimes of its signature, so its body has
+/// what `&'a &'c ()` implies, `'c: 'a`, and no more.
+#[test]
+fn a_closures_lifetime_binder_gives_its_body_the_bounds_its_signature_implies() {
+    accepted_in(CLOSURE_BINDER, "binder_body");
+    refused_at_all(CLOSURE_BINDER, "binder_body_unrelated");
+}
+
+/// P8 (review F1). rustc's verdict is UNVERIFIED. rustc either accepts (rust-lang/rust#25860)
+/// or refuses `&'static Workspace<'static, C>` as ill-formed. Either way blaze refuses: the
+/// captured `<M as Machine<'db>>::Prov: 'static` is not proven. `keep_closure` is the same
+/// with a closure that is not `async`, and is refused without F1 too.
+#[test]
+fn an_async_closures_captured_associated_type_is_proven_at_the_coercion() {
+    refused_at_all(ASYNC_CAPTURE, "keep_async");
+    refused_at_all(ASYNC_CAPTURE, "keep_closure");
+}
+
+/// P9 (review F5). rustc's verdict is UNVERIFIED (expected: accepts, since rustc checks no
+/// implied bound at the coercion; if it refuses `take` because `&'static P` is ill-formed,
+/// this probe has to change shape). `src`'s `<M as Machine<'a>>::Prov: 'x`, with `'x` the
+/// placeholder `'y`, holds by the target's `<M as Machine<'1>>::Prov: 'static` of
+/// `&'static P`. `'a` and `'1` are two body regions that the relate makes one: one
+/// component, but not one variable. Matched by exact type, the bound is missed. Matched by
+/// "neither outlives a universal region", it would also match `Q`'s `'2`, a region the
+/// relate does not equate with `'a`.
+#[test]
+fn a_target_type_bound_on_an_alias_matches_up_to_equal_body_regions() {
+    accepted_in(PROBES, "distinct_locals");
+}

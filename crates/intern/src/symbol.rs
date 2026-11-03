@@ -66,7 +66,7 @@ mod text {
     use blaze_image::{Image, SectionId, SectionWriter, Stable};
 
     use super::{order_key, symbols, symbols_schema};
-    use crate::table::{Jobs, Live, RestoreError, Shape, Table};
+    use crate::table::{Jobs, Live, Overlay, RestoreError, Shape, Table};
 
     static TABLE: OnceLock<Table> = OnceLock::new();
 
@@ -79,6 +79,7 @@ mod text {
             align: 1,
             size: 1,
             text: true,
+            overlay: Overlay::Secret,
         }
     }
 
@@ -87,12 +88,12 @@ mod text {
         TABLE.get_or_init(|| Table::new(shape()))
     }
 
-    pub(super) fn intern_hashed(s: &str, hash: u64) -> u32 {
-        table().intern_hashed(hash, s.as_bytes())
+    pub(super) fn intern(s: &str) -> u32 {
+        table().intern(s.as_bytes())
     }
 
-    pub(super) fn find_hashed(s: &str, hash: u64) -> Option<u32> {
-        table().find_hashed(hash, s.as_bytes())
+    pub(super) fn find(s: &str) -> Option<u32> {
+        table().find(s.as_bytes())
     }
 
     /// Whether `id` names a symbol of this process.
@@ -215,14 +216,16 @@ impl Symbol {
     /// [`Symbol::intern`] of `s` whose [`blaze_phf::name_hash`] is `hash`, from a caller that
     /// hashed it while its bytes were in registers. A compiled-in text ([`symbols::TEXTS`]: the
     /// declared symbols, the common names among them, each list's) is its fixed symbol from
-    /// [`symbols::COMPILED`], one lookup with no probe of the table; any other is one probe of
-    /// the table under `hash`. Neither hashes `s` again.
+    /// [`symbols::COMPILED`], one lookup under `hash` with no probe of the table and no hash
+    /// of `s`. Any other is looked up in the table, which places values by SipHash under keys
+    /// of its own, never by `name_hash`: that hash is fixed and inverts step by step, so a source
+    /// could pick thousands of names with one (`crate::table`'s doc).
     #[inline]
     pub fn intern_hashed(s: &str, hash: u64) -> Self {
         debug_assert_eq!(hash, blaze_phf::name_hash(s.as_bytes()), "{s:?}: a hash not its name_hash");
         match symbols::COMPILED.index_by_name_hash(hash, s.as_bytes()) {
             Some(index) => Symbol::from_index(index),
-            None => Symbol::from_table(text::intern_hashed(s, hash)),
+            None => Symbol::from_table(text::intern(s)),
         }
     }
 
@@ -239,7 +242,7 @@ impl Symbol {
         debug_assert_eq!(hash, blaze_phf::name_hash(s.as_bytes()), "{s:?}: a hash not its name_hash");
         match symbols::COMPILED.index_by_name_hash(hash, s.as_bytes()) {
             Some(index) => Some(Symbol::from_index(index)),
-            None => text::find_hashed(s, hash).map(Symbol::from_table),
+            None => text::find(s).map(Symbol::from_table),
         }
     }
 

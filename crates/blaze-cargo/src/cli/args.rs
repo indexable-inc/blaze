@@ -189,9 +189,12 @@ const PACKAGES: &[Flag] = &[
 /// `run`'s `-p`, one package (`optional_opt`, not `optional_multi_opt`).
 const PACKAGE: &[Flag] = &[Flag::new("package", Some('p'), Takes::Optional, "SPEC")];
 const JOBS: &[Flag] = &[Flag { hyphen: true, ..Flag::new("jobs", Some('j'), Takes::Value, "N") }];
-/// cargo refuses it on `test` and `bench`; blaze takes it there too (`useful-not-parity`): a unit
-/// that fails to build fails alone, and the tests of every unit that built still run.
-const KEEP_GOING: &[Flag] = &[Flag::switch("keep-going")];
+/// blaze keeps going by default (`useful-not-parity`): a unit that fails to build fails alone,
+/// the tests of every unit that built still run, a test executable that fails stops none of
+/// the others, and the end lists every failure. `--fail-fast` stops at the first failure, as
+/// cargo does ([`Flags::fail_fast`]). `--keep-going` (and `test`'s `--no-fail-fast`) are
+/// accepted and change nothing.
+const KEEP_GOING: &[Flag] = &[Flag::switch("keep-going"), Flag::switch("fail-fast")];
 const FUTURE: &[Flag] = &[Flag::switch("future-incompat-report")];
 const TARGETS: &[Flag] = &[
     Flag::switch("lib"),
@@ -302,6 +305,7 @@ fn blaze_only(flag: &Flag) -> bool {
         )
     )
 }
+/// `--no-fail-fast` is the default, accepted and changing nothing ([`Flags::fail_fast`]).
 const RUNNING: &[Flag] = &[Flag::switch("no-run"), Flag::switch("no-fail-fast")];
 
 /// The flags clap's `conflicts_with` keeps apart (`arg_release`).
@@ -443,6 +447,14 @@ pub fn refused(asked: &Invocation) -> Option<String> {
         Command::Check if flags.baselines.is_none() && (flags.bless_baselines || !flags.new_baselines.is_empty()) => {
             Some("`--bless-baselines` and `--new-baseline` write the baselines `--baselines DIR` names".to_owned())
         }
+        Command::Check if flags.baselines.is_some() && !(flags.workspace && !flags.targeted && flags.targets.len() == 1) => {
+            Some(
+                "`--baselines` counts every crate's findings for one target's cfg, so a crate or target the run did \
+                 not check would read as at zero: give `--workspace` and one `--target`, and no target selection \
+                 (`--lib`, `--tests`, `--all-targets`, ...)"
+                    .to_owned(),
+            )
+        }
         _ => None,
     }
 }
@@ -477,9 +489,12 @@ pub struct Flags {
     pub no_deps: bool,
     pub private: bool,
     pub no_run: bool,
-    pub no_fail_fast: bool,
-    /// `--keep-going`: also passed on to the daemon, which builds past a failed unit.
-    pub keep_going: bool,
+    /// `--fail-fast`: stop at the first failure, the unit that failed to build or the test
+    /// executable that failed. Without it (the default, `useful-not-parity`) the daemon builds
+    /// past a failed unit, every test executable and doc test that built runs, and the end
+    /// lists what failed and what each failure left unbuilt. Passed on to the daemon.
+    /// `--keep-going` and `--no-fail-fast` are accepted and change nothing.
+    pub fail_fast: bool,
     pub reached: bool,
     /// `--ub`, or either of its values, which imply it.
     pub ub: bool,
@@ -536,8 +551,8 @@ impl Flags {
             "no-deps" => self.no_deps = true,
             "document-private-items" => self.private = true,
             "no-run" => self.no_run = true,
-            "no-fail-fast" => self.no_fail_fast = true,
-            "keep-going" => self.keep_going = true,
+            "fail-fast" => self.fail_fast = true,
+            "no-fail-fast" | "keep-going" => {}
             "reached" => self.reached = true,
             "ub" => self.ub = true,
             name @ ("unit-graph" | "timings") => self.reports.push(name),

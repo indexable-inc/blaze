@@ -33,6 +33,7 @@ macro_rules! not_supported {
     };
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum AdtPatternShape<'a> {
     Tuple { args: &'a [PatId], ellipsis: Option<u32> },
     Record { args: &'a [RecordFieldPat] },

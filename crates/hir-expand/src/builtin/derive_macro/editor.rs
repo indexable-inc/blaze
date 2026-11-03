@@ -185,7 +185,7 @@ pub(super) fn coerce_pointee_derive<'f>(
     {
         let mut pointee_has_maybe_sized_bound = false;
         if let Some(bounds) = pointee_param.type_bound_list() {
-            pointee_has_maybe_sized_bound |= bounds.bounds().any(is_maybe_sized_bound);
+            pointee_has_maybe_sized_bound |= bounds.bounds().any(|it| is_maybe_sized_bound(&it));
         }
         if let Some(where_clause) = strukt.where_clause() {
             pointee_has_maybe_sized_bound |= where_clause.predicates().any(|pred| {
@@ -200,7 +200,7 @@ pub(super) fn coerce_pointee_derive<'f>(
                     return false;
                 }
                 pred.type_bound_list()
-                    .is_some_and(|bounds| bounds.bounds().any(is_maybe_sized_bound))
+                    .is_some_and(|bounds| bounds.bounds().any(|it| is_maybe_sized_bound(&it)))
             })
         }
         if !pointee_has_maybe_sized_bound {
@@ -268,7 +268,7 @@ pub(super) fn coerce_pointee_derive<'f>(
                 let is_pointee = param_name.text() == pointee_param_name.text();
                 let new_bounds = bounds.bounds().filter_map(|bound| {
                     let new_bound = substitute_type_bound(
-                        bound.clone(), // clone: `CoercePointee` only, rare: node handles and its edit's lists
+                        &bound,
                         pointee_param_name.text(),
                         ADDED_PARAM,
                     );
@@ -330,7 +330,7 @@ pub(super) fn coerce_pointee_derive<'f>(
                 new_predicates.push(predicate_with_substituted_target);
             } else if let Some(bounds) = predicate.type_bound_list() {
                 let new_bounds = bounds.bounds().filter_map(|bound| {
-                    substitute_type_bound(bound, pointee_param_name.text(), ADDED_PARAM)
+                    substitute_type_bound(&bound, pointee_param_name.text(), ADDED_PARAM)
                 });
                 new_predicates.push(make.where_pred(Either::Right(pred_target), new_bounds));
             }
@@ -430,7 +430,7 @@ pub(super) fn coerce_pointee_derive<'f>(
 
     return ExpandResult::ok(write_coerce_pointee_impls(frame, span, &info, &self_for_traits));
 
-    fn is_maybe_sized_bound(bound: ast::TypeBound) -> bool {
+    fn is_maybe_sized_bound(bound: &ast::TypeBound) -> bool {
         if bound.question_mark_token().is_none() {
             return false;
         }
@@ -455,11 +455,11 @@ pub(super) fn coerce_pointee_derive<'f>(
 
     /// Returns true if any substitution was performed.
     fn substitute_type_bound(
-        bound: ast::TypeBound,
+        bound: &ast::TypeBound,
         param_name: &str,
         replacement: &str,
     ) -> Option<ast::TypeBound> {
-        let (editor, bound) = SyntaxEditor::with_ast_node(&bound);
+        let (editor, bound) = SyntaxEditor::with_ast_node(bound);
         let substituted = bound
             .ty()
             .is_some_and(|ty| substitute_type_in_bound(&editor, ty, param_name, replacement));

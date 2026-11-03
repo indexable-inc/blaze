@@ -31,6 +31,12 @@ impl LinkTable {
         unsafe { link.write(AtomicU32::new(NONE)) };
         Ok(())
     }
+
+    /// The bytes its region committed, counted to its tag.
+    #[cfg(test)]
+    pub(crate) fn committed(&self) -> usize {
+        self.region.committed()
+    }
 }
 
 impl Links for LinkTable {

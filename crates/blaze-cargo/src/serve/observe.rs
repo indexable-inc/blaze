@@ -28,7 +28,7 @@ use blaze_api::{ApiError, LiveFrame, Reply, RequestRef, Response};
 use blaze_core::Conn;
 use blaze_profile::{
     facts::{CrateDepRow, LinkRow, QueryCountRow},
-    history::{self, BuildRow, History},
+    history::{self, BuildRow, History, OWNER},
     live::{self, Feed, Frame},
     sql,
 };
@@ -114,6 +114,24 @@ pub fn hot(top: u32, since: blaze_api::HotSince) -> Result<blaze_api::Hot, ApiEr
     })
 }
 
+/// The bugs the daemon reported and went on past so far, one a site, for `blaze status`
+/// ([`blaze_api::Status::bugs`]), ordered by site and kind, not by which thread reported first:
+/// none allocates nothing.
+pub fn bugs() -> Vec<blaze_api::Bug> {
+    let mut sites = stdx::assert::reported::sites();
+    sites.sort_unstable_by_key(|it| (it.at.file(), it.at.line(), it.at.column(), it.kind, it.what));
+    sites
+        .into_iter()
+        .map(|it| blaze_api::Bug {
+            kind: it.kind.to_owned(),  // alloc: the answer's copy, once a Status a site
+            what: it.what.to_owned(),  // alloc: as above
+            at: it.at.to_string(),  // alloc: as above
+            count: it.count,
+            thread: it.thread.as_deref().map(str::to_owned),  // alloc: as above
+        })
+        .collect()  // alloc: the answer's rows; none for none
+}
+
 /// The profile history and the DuckDB that queries it, as `blaze serve` gives them to its
 /// daemon.
 pub struct Profiling {
@@ -124,7 +142,7 @@ pub struct Profiling {
     /// The number of the daemon's first build: past every build the history names, so a build
     /// stays one id across the daemon's restarts ([`History::next_build`]). Never 0.
     pub first_build: u32,
-    ended: Sender<Finished>,
+    ended: Sender<ToHistory>,
     failed: Receiver<String>,
     /// What the history's thread tells the loop of `blaze why`'s ledger: its restore, and each
     /// build's answer.
@@ -154,7 +172,8 @@ enum Step {
     Appending = 4,
     Flushing = 5,
     Closing = 6,
-    Draining = 7,
+    /// Flushing the rows the history's drain thread took past [`history::FLUSH_ROWS`].
+    FlushingFull = 7,
 }
 
 impl Doing {
@@ -177,7 +196,7 @@ impl Doing {
             Step::Appending,
             Step::Flushing,
             Step::Closing,
-            Step::Draining,
+            Step::FlushingFull,
         ]
             .into_iter()
             .find(|step| *step as u64 == it >> 56);
@@ -190,7 +209,9 @@ impl Doing {
             Some(Step::Flushing) if build == 0 => "flushing the profile history on its timer".to_owned(),
             Some(Step::Flushing) => format!("flushing the profile history for build {build}"),
             Some(Step::Closing) => "writing blaze why's ledger whole as the daemon stops".to_owned(),
-            Some(Step::Draining) => "draining the flight recorder's rings into the next flush".to_owned(),
+            Some(Step::FlushingFull) => {
+                format!("flushing the profile history: its drain took over {} rows", history::FLUSH_ROWS)
+            }
             None => format!("in step {}, which this blaze does not know", it >> 56),
         }
     }
@@ -215,6 +236,14 @@ pub struct Ended {
     pub misses: Vec<blaze_kernel::Miss>,
 }
 
+/// What the loop gives the `blaze-history` thread: a build as it starts, and as it ends.
+enum ToHistory {
+    /// Its row with outcome running and no end, written at once: the row a build has if its
+    /// daemon dies before it ends ([`history::writes`]).
+    Started(BuildRow),
+    Ended(Finished),
+}
+
 /// What the `blaze-history` thread writes of a build that ended: its rows (with its misses,
 /// which it explains against `blaze why`'s ledger) and what the query engine counted by its end.
 struct Finished {
@@ -232,8 +261,8 @@ fn query_counts(build: u64) -> Vec<QueryCountRow> {
 }
 
 fn query_count_row(build_id: u64, query: &'static str, counts: blaze_query::db::Counts) -> QueryCountRow {
-    let blaze_query::db::Counts { executed, verified, reran, evicted_asked, refused, evicted, dropped } = counts;
-    QueryCountRow { build_id, query, executed, verified, reran, evicted_asked, evicted, refused, dropped }
+    let blaze_query::db::Counts { executed, verified, reran, evicted_asked, evicted, dropped } = counts;
+    QueryCountRow { build_id, query, executed, verified, reran, evicted_asked, evicted, dropped }
 }
 
 /// The `blaze-history` thread: it ends with a last flush once the daemon (its [`Profiling`])
@@ -288,10 +317,6 @@ pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling,
     };
     Ok((Profiling { dir, duckdb, first_build, ended, failed, told, doing }, Keeper(thread)))
 }
-
-/// The file in a history's directory whose lock says which daemon writes it, and whose text
-/// is that daemon's pid.
-const OWNER: &str = "owner.lock";
 
 /// A history another process writes: build ids are numbered from what a history holds, so a
 /// second writer would give its builds the first one's ids.
@@ -356,16 +381,38 @@ fn claim(dir: &Path) -> Result<Owner, Claim> {
     Ok(Owner { _lock: file })
 }
 
-/// The history's loop: a drain of the rings every [`history::DRAIN`], a flush every
-/// [`history::EVERY`], and one for each build as it ends, which writes its row and gives its
-/// spans its commit. A flush that fails is logged and told to the daemon, for `blaze daemon
-/// status`; the next one goes on.
-fn keep(mut history: History, why: &mut File, rows: &Receiver<Finished>, failed: &Sender<String>, told: &Sender<Told>, doing: &Doing) {
+/// The history's loop: a flush every [`history::EVERY`], one each time the history's drain
+/// thread took [`history::FLUSH_ROWS`] (it drains the rings every [`history::DRAIN`] while this
+/// thread writes), and one for each build as it ends, which writes its row and gives its spans
+/// its commit. A flush that fails is logged and told to the daemon, for `blaze daemon status`;
+/// the next one goes on.
+fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed: &Sender<String>, told: &Sender<Told>, doing: &Doing) {
     let mut flushed_at = Instant::now();
     loop {
         doing.set(Step::Waiting, 0);
-        let (flushed, last) = match rows.recv_timeout(history::DRAIN) {
-            Ok(Finished { ended: Ended { mut row, links, crate_deps, misses }, query_counts }) => {
+        let due = history::EVERY.saturating_sub(flushed_at.elapsed());
+        let next = crossbeam_channel::select! {
+            recv(rows) -> it => it.map_err(|_| RecvTimeoutError::Disconnected),
+            recv(history.full()) -> _ => {
+                doing.set(Step::FlushingFull, 0);
+                if let Err(error) = blaze_mem::frame::task(blaze_mem::Tag::Profile, |_| history.flush(None)) {
+                    tracing::error!("{error}");
+                    _ = failed.send(error.to_string());  // alloc: error path, a flush that failed
+                }
+                flushed_at = Instant::now();
+                continue;
+            }
+            default(due) => Err(RecvTimeoutError::Timeout),
+        };
+        // In a task of the profile's tag, so what a flush reads and keeps (the rings' rows,
+        // the history's buffers) is named on the daemon's memory line.
+        let (flushed, last) = blaze_mem::frame::task(blaze_mem::Tag::Profile, |_| match next {
+            Ok(ToHistory::Started(row)) => {
+                doing.set(Step::Flushing, row.build_id);
+                history.build_started(row);
+                (history.flush(None), false)
+            }
+            Ok(ToHistory::Ended(Finished { ended: Ended { mut row, links, crate_deps, misses }, query_counts })) => {
                 let build = row.build_id;
                 let ended_well = matches!(row.outcome, history::Outcome::Ok);
                 doing.set(Step::Explaining, build);
@@ -391,11 +438,6 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<Finished>, failed:
                 doing.set(Step::Flushing, build);
                 (history.flush(Some(build)), false)
             }
-            Err(RecvTimeoutError::Timeout) if flushed_at.elapsed() < history::EVERY => {
-                doing.set(Step::Draining, 0);
-                history.drain();
-                continue;
-            }
             Err(RecvTimeoutError::Timeout) => {
                 doing.set(Step::Flushing, 0);
                 (history.flush(None), false)
@@ -408,7 +450,7 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<Finished>, failed:
                 }
                 (history.flush(None), true)
             }
-        };
+        });
         flushed_at = Instant::now();
         if let Err(error) = flushed {
             tracing::error!("{error}");
@@ -545,6 +587,15 @@ impl Observe {
         self.history_error.as_deref()
     }
 
+    /// A build that started, its row of outcome running with no end, for the history to write
+    /// at once; dropped by a daemon that keeps none.
+    pub fn started(&mut self, row: BuildRow) {
+        let Some(profiling) = &self.profiling else { return };
+        if profiling.ended.send(ToHistory::Started(row)).is_err() {
+            self.history_error = Some("the profile history's thread (`blaze-history`) is gone: no build is written".to_owned()); // alloc: error path
+        }
+    }
+
     /// A build that ended, for the history to write with what the query engine counted by
     /// now; dropped by a daemon that keeps none, which takes no counts.
     pub fn ended(&mut self, mut ended: Ended) {
@@ -561,7 +612,7 @@ impl Observe {
             return;
         };
         let query_counts = query_counts(build);
-        let sent = profiling.ended.send(Finished { ended, query_counts });
+        let sent = profiling.ended.send(ToHistory::Ended(Finished { ended, query_counts }));
         // Counted whether or not it reached the history's thread: one that never did is never
         // explained, and `blaze why` says so rather than answer with an older build's reasons
         // (rule 3).
@@ -654,7 +705,7 @@ impl Observe {
         let window = Duration::from_secs(u64::from(last_s));
         let spawned = std::thread::Builder::new().name("blaze-sql".to_owned()).spawn(move || {  // alloc: once a query
             let query = sql::Query { duckdb: &duckdb, history: &dir, sql: &sql };
-            let answer = sql::run_live_with(&query, window, &stopped).map_err(sql_error).and_then(|batches| ipc(&batches));
+            let answer = sql::run_live_with(&query, window, &stopped).map_err(|error| sql_error(&error)).and_then(|batches| ipc(&batches));
             _ = answered.send(Answered { to, answer });
         });
         match spawned {
@@ -829,7 +880,7 @@ fn fail(out: &mut Vec<Reply>, to: RequestRef, error: ApiError) {
 }
 
 /// A query's error as the API says it, its kind ([`sql::SqlError::kind`]) where it failed.
-fn sql_error(error: sql::SqlError) -> ApiError {
+fn sql_error(error: &sql::SqlError) -> ApiError {
     ApiError::new(error.to_string(), Some(error.kind().to_owned()))  // alloc: error path
 }
 
@@ -928,14 +979,13 @@ mod tests {
             verified: 1,
             reran: 2,
             evicted_asked: 3,
-            refused: 4,
-            evicted: 5,
-            dropped: 6,
+            evicted: 4,
+            dropped: 5,
         };
         let row = query_count_row(71, "mir_body_query", counts);
         assert_eq!(
-            [row.executed, row.verified, row.reran, row.evicted_asked, row.refused, row.evicted, row.dropped],
-            [6384, 1, 2, 3, 4, 5, 6]
+            [row.executed, row.verified, row.reran, row.evicted_asked, row.evicted, row.dropped],
+            [6384, 1, 2, 3, 4, 5]
         );
         let ended = Ended {
             row: BuildRow {
@@ -959,7 +1009,7 @@ mod tests {
         };
         let (to, rows) = crossbeam_channel::unbounded();
         let (failed_to, failed) = crossbeam_channel::unbounded();
-        to.send(Finished { ended, query_counts: vec![row] }).unwrap();
+        to.send(ToHistory::Ended(Finished { ended, query_counts: vec![row] })).unwrap();
         drop(to);
         let (mut why, _) = File::restore(dir.path());
         let (told_to, told) = crossbeam_channel::unbounded();

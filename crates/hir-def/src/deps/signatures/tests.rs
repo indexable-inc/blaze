@@ -629,3 +629,54 @@ fn a_key_names_one_item_and_is_the_same_in_every_database() {
     assert_eq!(keys.len(), items, "one key per item");
     assert_eq!(keys_of(&fixture::db(FIXTURE).into_db()).0, keys);
 }
+
+/// rustc's tests/ui/hygiene/auxiliary/variants.rs, its enum: a `macro` writes an enum with a
+/// variant it names and one it is handed of the same text, two variants whose names differ by
+/// their keys, and the crate globs and imports them (the frozen def map's variant ids).
+const KEYED_VARIANTS: &str = r#"
+//- /main.rs crate:main deps:lib new_source_root:local
+fn main() {}
+
+//- /lib.rs crate:lib new_source_root:library
+#![feature(decl_macro)]
+macro x($E:ident, $V:ident) {
+    #[repr(u8)]
+    pub enum $E {
+        V = 0,
+        $V = 1,
+    }
+}
+x!(MyEnum, V);
+pub use MyEnum::*;
+pub use MyEnum::V as Handed;
+"#;
+
+#[test]
+fn variants_keyed_by_a_macro_read_back() {
+    let _turn = turn();
+    let memory = stored(KEYED_VARIANTS);
+    for mode in [Mode::Serve, Mode::Verify, Mode::Check] {
+        let db = served_db(KEYED_VARIANTS, &memory, mode);
+        let krate = crate_named(&db, "lib");
+        let items = items(&db, krate);
+        for &item in &items {
+            assert_served(&db, krate, item, mode == Mode::Serve);
+        }
+        assert_eq!(frozen::differences(), Vec::<String>::new(), "{mode:?}");
+        let e = items
+            .iter()
+            .find_map(|it| match it {
+                Item::Variants(it) => Some(*it),
+                _ => None,
+            })
+            .expect("the fixture's enum");
+        // Both variants, the `macro`'s own keyed, the one it was handed not; each variant's id
+        // holds the name it is bound under.
+        let variants = &EnumVariants::of(&db, e).0.variants;
+        let keyed: Vec<bool> = variants.keys().map(|it| it.key().is_some()).collect();
+        assert_eq!(keyed, [true, false], "{mode:?}");
+        for (name, &(id, _)) in variants {
+            assert_eq!(crate::Lookup::lookup(&id, &db).name, *name, "{mode:?}");
+        }
+    }
+}

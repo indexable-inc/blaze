@@ -6,21 +6,33 @@
 //! The process's memory is held by the system where a limit is asked for: a cgroup of its own
 //! on Linux, which it joins before it runs its program, and on macOS a watch of its footprint.
 //! Where none can be made, it is not started.
+//!
+//! Every child [`start`] made is listed ([`unreaped`]) from its start until [`reap`], the one
+//! place a child is reaped, takes it out: so a child is reaped once, and one nothing reaps (its
+//! driver's loop stuck in a turn, as the daemon's was inside a maintain pass on 72e9a0dd; or its
+//! [`Finish`] dropped unreaped) is named, with what waits for its exit, by whoever asks.
 
 #[allow(unsafe_code, reason = "fork, exec and the calls the child makes before exec, which std cannot make")]
 mod spawn;
 
+#[cfg(test)]
+mod tests;
+
 use std::{
-    io,
+    fmt, io,
     os::fd::OwnedFd,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    thread::ThreadId,
+    time::{Duration, Instant},
 };
 
-use crate::{Command, Confine, Confined, Exit, Sandbox};
+use parking_lot::Mutex;
+
+use crate::{Command, Confine, Confined, Exit, Sandbox, Tag};
 
 static RUNS: AtomicU64 = AtomicU64::new(0);
 
@@ -44,6 +56,144 @@ pub(crate) struct Finish {
     confine: Option<Arc<dyn Confine>>,
     scratch: Option<PathBuf>,
     limit: Limit,
+    /// Its place in [`CHILDREN`] until it is reaped.
+    listed: Listed,
+}
+
+/// The children [`start`] made that [`reap`] has not reaped, in the order they started: a few
+/// hundred at most (the spawns in flight), each a field update under the lock, which no wait
+/// is made under.
+static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+
+/// A child as [`CHILDREN`] lists it.
+struct Child {
+    pid: libc::pid_t,
+    /// Its start's number ([`RUNS`]): a pid is reused once reaped, a run never is.
+    run: u64,
+    program: PathBuf,
+    waiter: Waiter,
+    started: Instant,
+}
+
+/// What waits for a child's exit, and so reaps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Waiter {
+    /// The thread that started it, which waits for it in place (the threads driver's errand).
+    Starter(ThreadId),
+    /// A driver's spawn effect of this tag: its loop reaps the child as it polls, and the
+    /// asker of the effect waits for the completion.
+    Effect(Tag),
+    /// No one: its driver dropped its [`Finish`] without reaping it.
+    Abandoned,
+}
+
+impl fmt::Display for Waiter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Waiter::Starter(thread) => write!(f, "the thread that started it ({thread:?}), which reaps it in place"),
+            Waiter::Effect(tag) => write!(
+                f,
+                "the spawn effect tagged {:#x}, reaped only as its driver's loop polls; its asker waits for the completion",
+                tag.0
+            ),
+            Waiter::Abandoned => f.write_str("no one: its driver let go of it unreaped"),
+        }
+    }
+}
+
+/// Where a listed child stands, as the system says it now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Running,
+    /// It exited and is a zombie until it is reaped.
+    Exited,
+    /// Reaped between the listing and the look, or no child of this process.
+    Gone,
+    /// The look failed, with this `errno`.
+    Unknown(i32),
+}
+
+/// A child started and not reaped, as [`unreaped`] says it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unreaped {
+    pub pid: libc::pid_t,
+    pub program: PathBuf,
+    pub waiter: Waiter,
+    /// How long ago it started.
+    pub age: Duration,
+    pub state: State,
+}
+
+impl fmt::Display for Unreaped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = match self.state {
+            State::Running => "running",
+            State::Exited => "exited and not reaped",
+            State::Gone => "reaped as it was looked at",
+            State::Unknown(_) => "in a state its look could not read",
+        };
+        write!(f, "pid {} ({}), {state}, started {} s ago, waited for by {}", self.pid, self.program.display(), self.age.as_secs(), self.waiter)?;
+        if let State::Unknown(errno) = self.state {
+            write!(f, " ({})", io::Error::from_raw_os_error(errno))?;
+        }
+        Ok(())
+    }
+}
+
+/// Every child started and not yet reaped, oldest first, each with what waits for it and
+/// whether it already exited: a zombie whose waiter is an effect says its driver's loop
+/// stopped polling. Reads each child's state without reaping it.
+pub fn unreaped() -> Vec<Unreaped> {
+    let now = Instant::now();
+    let listed: Vec<(libc::pid_t, PathBuf, Waiter, Duration)> = (CHILDREN.lock().iter())
+        .map(|it| (it.pid, it.program.clone(), it.waiter, now.saturating_duration_since(it.started))) // clone: the program's path, out of the lock, once per report
+        .collect(); // alloc: a stall report's list, once per report
+    listed
+        .into_iter()
+        .map(|(pid, program, waiter, age)| {
+            let state = match crate::raw::has_exited(pid) {
+                Ok(true) => State::Exited,
+                Ok(false) => State::Running,
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => State::Gone,
+                Err(error) => State::Unknown(error.raw_os_error().unwrap_or(0)),
+            };
+            Unreaped { pid, program, waiter, age, state }
+        })
+        .collect() // alloc: as above
+}
+
+/// A child's place in [`CHILDREN`], held by its [`Finish`]: dropped once [`reap`] took the
+/// child out, it does nothing; dropped with the child still listed, the child stays listed as
+/// [`Waiter::Abandoned`], a zombie or a running process no one will reap.
+struct Listed {
+    pid: libc::pid_t,
+    run: u64,
+}
+
+impl Listed {
+    fn new(pid: libc::pid_t, run: u64, program: &Path) -> Listed {
+        let program = program.to_path_buf(); // alloc: the program's path, once per spawn, what a stall report names it by
+        let child = Child { pid, run, program, waiter: Waiter::Starter(std::thread::current().id()), started: Instant::now() };
+        CHILDREN.lock().push(child); // alloc: the list grows to the most children in flight at once
+        Listed { pid, run }
+    }
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        // By run, not pid: reaped, its pid may already be a later child's.
+        if let Some(child) = CHILDREN.lock().iter_mut().find(|it| it.run == self.run) {
+            child.waiter = Waiter::Abandoned;
+        }
+    }
+}
+
+/// Takes `pid` out of [`CHILDREN`]: reaped, so its pid may be another's from now on.
+fn unlist(pid: libc::pid_t) {
+    let mut children = CHILDREN.lock();
+    if let Some(at) = children.iter().position(|it| it.pid == pid) {
+        children.remove(at);
+    }
 }
 
 enum Limit {
@@ -158,6 +308,7 @@ pub(crate) fn start(
     };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let limit = Limit::None;
+    let listed = Listed::new(pid, n, &command.program);
     Ok(Started {
         pid,
         #[cfg(target_os = "linux")]
@@ -165,11 +316,19 @@ pub(crate) fn start(
         stdin: spawned.stdin,
         stdout: spawned.stdout,
         stderr: spawned.stderr,
-        finish: Finish { command, confine, scratch, limit },
+        finish: Finish { command, confine, scratch, limit, listed },
     })
 }
 
 impl Finish {
+    /// What waits for the child's exit from now on: the driver's spawn effect `tag`, whose
+    /// loop reaps it ([`unreaped`] names it so).
+    pub(crate) fn waited_by(&self, tag: Tag) {
+        if let Some(child) = CHILDREN.lock().iter_mut().find(|it| it.run == self.listed.run) {
+            child.waiter = Waiter::Effect(tag);
+        }
+    }
+
     /// Reaps `pid`, which has exited (a zombie, so its pid is no one else's), and says how it
     /// ended from what `wait4` said of it and what it wrote. Asks its sandbox what it read,
     /// and removes what was made for it.
@@ -179,6 +338,7 @@ impl Finish {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     ) -> io::Result<Exit> {
+        debug_assert_eq!(pid, self.listed.pid, "a child's `Finish` reaps that child");
         // Before the reap: the footprint watch signals the pid, which a reap frees for reuse.
         let limited = match self.limit {
             Limit::None => Ok(0),
@@ -227,14 +387,29 @@ impl Finish {
     }
 }
 
-/// Reaps `pid`, waiting until it has exited: its status and what it used.
+/// Reaps `pid`, waiting until it has exited: its status and what it used. The one reap of a
+/// child [`start`] made: it leaves [`unreaped`]'s list here, reaped, or found reaped already
+/// (`ECHILD`, which names the second reap as the error it is).
 pub(crate) fn reap(pid: libc::pid_t) -> io::Result<(libc::c_int, libc::rusage)> {
-    loop {
+    let reaped = loop {
         match crate::raw::wait4(pid) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            reaped => return reaped,
+            reaped => break reaped,
         }
+    };
+    match &reaped {
+        Ok(_) => unlist(pid),
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+            unlist(pid);
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                // alloc: an error path.
+                format!("reaping process {pid}: it is no child of this process, or was reaped already ({error})"),
+            ));
+        }
+        Err(_) => {}
     }
+    reaped
 }
 
 /// Waits until `pid` has exited without reaping it, so its pid is not another's until it is.

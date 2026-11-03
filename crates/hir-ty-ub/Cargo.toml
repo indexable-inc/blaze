@@ -25,6 +25,7 @@ blaze-ids.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
+hir-ty-print.workspace = true
 hir-ty-mir.workspace = true
 intern.workspace = true
 span.workspace = true

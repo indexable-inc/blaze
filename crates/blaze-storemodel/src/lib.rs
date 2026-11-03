@@ -19,6 +19,9 @@
 //!
 //! Each property is a test named for it in `tests.rs`.
 
+#![feature(register_tool)]
+#![register_tool(blaze)]
+
 pub mod actors;
 pub mod explore;
 pub mod fs;

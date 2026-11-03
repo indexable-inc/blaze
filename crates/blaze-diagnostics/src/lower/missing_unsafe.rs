@@ -407,11 +407,11 @@ fn deprecated_safe(cx: &Cx<'_, '_>, function: hir::Function, audit: ast::String<
     let path = untrimmed_path(cx, function);
     // alloc: the diagnostic's text, for an operation hir found unsafe
     let message = format!("call to deprecated safe function `{path}` is unsafe and requires unsafe block");
+    let (line_start, indent) = line_of(cx, &span);
+    let (lo, hi) = (span.shrink_to_lo(), span.shrink_to_hi());
     // clone: a handle, on the error path, for an operation hir found unsafe
     let mut diag = Diag::lint("deprecated_safe_2024", message, span.clone());
-    // clone: a handle, on the error path, for an operation hir found unsafe
-    diag.span_label(span.clone(), "call to unsafe function");
-    let (line_start, indent) = line_of(cx, &span);
+    diag.span_label(span, "call to unsafe function");
     diag.multipart_suggestion(
         // alloc: the diagnostic's text, for an operation hir found unsafe
         format!("you can wrap the call in an `unsafe` block if you can guarantee that {audit}"),
@@ -420,9 +420,9 @@ fn deprecated_safe(cx: &Cx<'_, '_>, function: hir::Function, audit: ast::String<
             // alloc: the diagnostic's text, for an operation hir found unsafe
             (line_start, format!("{indent}// FIXME: Audit that {audit}.\n")),
             // alloc: the diagnostic's text, for an operation hir found unsafe
-            (span.shrink_to_lo(), "unsafe { ".to_owned()),
+            (lo, "unsafe { ".to_owned()),
             // alloc: the diagnostic's text, for an operation hir found unsafe
-            (span.shrink_to_hi(), " }".to_owned()),
+            (hi, " }".to_owned()),
         ],
         Applicability::MachineApplicable,
     );

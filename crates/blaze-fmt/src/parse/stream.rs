@@ -112,10 +112,10 @@ pub(crate) struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub(crate) fn new(psess: &'a ParseSess, stream: TokenStream) -> Parser<'a> {
+    pub(crate) fn new(psess: &'a ParseSess, stream: &TokenStream) -> Parser<'a> {
         let mut tokens = Vec::new();
-        flatten(&stream, &mut tokens);
-        let delims = Rc::new(DelimIndex::new(&stream));
+        flatten(stream, &mut tokens);
+        let delims = Rc::new(DelimIndex::new(stream));
         let dummy = Token::new(TokenKind::Eof, Span::default());
         let mut parser = Parser {
             psess,

@@ -74,7 +74,7 @@ fn overflows(fixture: &str) -> (Vec<String>, Vec<u32>) {
     let db = fx.into_db();
     blaze_query::db::attach(&db, || {
         let def = function(&db, "caller");
-        let (_, source_map) = Body::with_source_map(&db, def);
+        let source_map = Body::source_map(&db, def);
         let result = crate::borrowck(&db, def);
         let errors: Vec<&BorrowckDiagnostic> =
             result.diagnostics.iter().filter(|it| it.code.starts_with('E')).collect();

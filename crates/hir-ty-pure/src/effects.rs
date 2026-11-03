@@ -285,6 +285,7 @@ pub(crate) fn deterministic_foreign(symbol: &str) -> bool {
 /// A toolchain function a call of which counts as `kinds` at the call. Its body is still walked
 /// (for build scripts, memory and the kinds it does not cover): at the call, each effect counts
 /// `kinds`, and what the callee's summary has outside `covers`.
+#[derive(Clone, Copy)]
 pub(crate) struct Modeled {
     pub(crate) home: Home,
     /// The path as said to a person: `std::time::Instant::now`.

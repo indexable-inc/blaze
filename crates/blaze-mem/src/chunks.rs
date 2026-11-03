@@ -4,8 +4,11 @@
 //!
 //! A space is reserved once ([`SPACE_BYTES`] of address space, nothing committed) and carved
 //! in order; a chunk given back goes on its space's lock-free stack and is the next one taken
-//! there, warm in cache and already backed by pages. [`trim`] lets the kernel take the pages of
-//! cached chunks (they stay committed and come back zeroed), for after a burst. Each chunk is
+//! there, warm in cache and already backed by pages. A space keeps a burst's chunks warm up to
+//! [`WARM_MOST`]; the give that passes it lets the kernel take the pages of the cache's chunks
+//! past [`WARM_KEEP`] (they stay committed and come back zeroed), so a burst's peak is not kept
+//! resident for the process's life, and a working set under [`WARM_MOST`] never pays for a
+//! purge. [`trim`] does that to every cached chunk, for after a burst. Each chunk is
 //! aligned to a huge page, and on Linux the space is advised to use them.
 //!
 //! There is a space per place: one whose pages the kernel places as it likes (first touch), and
@@ -46,6 +49,17 @@ pub const MAX_NODES: u32 = 16;
 
 const COUNT: u32 = (SPACE_BYTES / CHUNK) as u32;
 
+/// The warm chunks a space keeps after its cache passed [`WARM_MOST`]: 512 MiB a place, 16 for
+/// each of 16 workers (a worker's frames shelve 8 of their own, `frame::SHELF`, before they
+/// give to the space). coord-102 (B5): with no bound, 3.3 GiB of the 4.72 GiB of frames a
+/// build's peak held stayed resident as warm chunks to the end, with nothing to take them.
+pub const WARM_KEEP: u32 = 256;
+
+/// The warm chunks past which a give trims the space's cache down to [`WARM_KEEP`]: twice it,
+/// so a trim purges at least [`WARM_KEEP`] chunks at once, and a working set that swings under
+/// this purges none.
+pub const WARM_MOST: u32 = 2 * WARM_KEEP;
+
 /// Bits of a chunk's index that number it within its space; the bits above name the place.
 const SHIFT: u32 = 17;
 
@@ -59,10 +73,21 @@ struct Space {
     region: Region,
     links: LinkTable,
     carved: AtomicU32,
-    /// Chunks given back, their pages resident.
+    /// Chunks given back, their pages resident: at most `most`, about.
     warm: Stack,
-    /// Chunks [`trim`] purged: committed, their pages given to the kernel.
+    /// How many chunks are on `warm`, or about to be: counted up before a push and down after a
+    /// pop, so never less than what the stack holds.
+    warm_count: AtomicU32,
+    /// The warm chunks kept after a trim ([`WARM_KEEP`]), and past which a give trims
+    /// ([`WARM_MOST`]); a test's own space, smaller.
+    keep: u32,
+    most: u32,
+    /// Chunks [`trim`] purged: committed, their pages given to the kernel. Only a chunk whose
+    /// purge gave its pages back is here; one the kernel kept stays on `warm`.
     cold: Stack,
+    /// How many chunks are on `cold`, or about to be: counted up before a push and down after a
+    /// pop, as `warm_count` is. Their bytes are committed but not resident ([`cached`]).
+    cold_count: AtomicU32,
 }
 
 static SPACES: [OnceLock<Result<Space, String>>; PLACES] = [const { OnceLock::new() }; PLACES];
@@ -111,7 +136,11 @@ fn space(place: usize) -> Result<&'static Space, MemError> {
                 links: LinkTable::new(COUNT, Tag::Chunks)?,
                 carved: AtomicU32::new(0),
                 warm: Stack::new(),
+                warm_count: AtomicU32::new(0),
+                keep: WARM_KEEP,
+                most: WARM_MOST,
                 cold: Stack::new(),
+                cold_count: AtomicU32::new(0),
             })
         });
         made.map_err(|error| error.to_string()) // alloc: once, when a space cannot be reserved
@@ -172,20 +201,7 @@ impl Chunk {
 /// new one carved from the place's space.
 pub(crate) fn take(owner: Tag) -> Result<Chunk, MemError> {
     let place = usize::from(PLACE.try_with(Cell::get).unwrap_or(0));
-    let space = space(place)?;
-    let local = match space.warm.pop(&space.links) {
-        Some(local) => local,
-        None => match space.cold.pop(&space.links) {
-            Some(local) => {
-                if let Err(error) = space.region.reuse(local as usize * CHUNK, CHUNK) {
-                    space.cold.push(local, &space.links);
-                    return Err(error);
-                }
-                local
-            }
-            None => carve(space)?,
-        },
-    };
+    let local = space(place)?.take()?;
     tag::transfer(Tag::Chunks, owner, CHUNK);
     Ok(Chunk(index(place, local)))
 }
@@ -216,7 +232,7 @@ pub(crate) fn give(chunk: Chunk, owner: Tag) {
     let Chunk(chunk) = chunk;
     let space = made(place_of(chunk));
     tag::transfer(owner, Tag::Chunks, CHUNK);
-    space.warm.push(local_of(chunk), &space.links);
+    space.give(&[local_of(chunk)]);
 }
 
 /// Chunks [`give_all`] moves to a space at once.
@@ -238,7 +254,7 @@ pub(crate) fn give_all(chunks: &[u32], owner: Tag) {
         }
         let space = made(place);
         tag::transfer(owner, Tag::Chunks, run * CHUNK);
-        space.warm.push_all(&locals[..run], &space.links);
+        space.give(&locals[..run]);
     }
 }
 
@@ -251,10 +267,8 @@ pub(crate) fn give_all(chunks: &[u32], owner: Tag) {
 pub(crate) fn give_cold(chunk: Chunk, owner: Tag) {
     let Chunk(chunk) = chunk;
     let space = made(place_of(chunk));
-    // SAFETY: the owner gives the chunk up, so no one reads its contents before writing them.
-    unsafe { space.region.purge(local_of(chunk) as usize * CHUNK, CHUNK) };
     tag::transfer(owner, Tag::Chunks, CHUNK);
-    space.cold.push(local_of(chunk), &space.links);
+    space.purge_cold(local_of(chunk));
 }
 
 /// The link of a held chunk, for its owner's list of the chunks it holds (a chunk is on one
@@ -267,17 +281,24 @@ pub(crate) fn link(chunk: u32) -> &'static AtomicU32 {
 /// committed and come back zeroed. Returns how many it purged. For after a burst, never in
 /// the warm loop.
 pub fn trim() -> usize {
-    let mut purged = 0;
-    for space in SPACES.iter().filter_map(|space| space.get()?.as_ref().ok()) {
-        while let Some(local) = space.warm.pop(&space.links) {
-            // SAFETY: the chunk was popped off the cache, so no owner holds it and no one reads
-            // its contents before writing them.
-            unsafe { space.region.purge(local as usize * CHUNK, CHUNK) };
-            space.cold.push(local, &space.links);
-            purged += 1;
-        }
-    }
-    purged
+    SPACES.iter().filter_map(|space| space.get()?.as_ref().ok()).map(|space| space.trim_to(0)).sum()
+}
+
+/// The chunks no owner holds, over every place, in bytes: `warm` ones keep their pages (resident,
+/// free), `cold` ones were purged (committed, counted to [`Tag::Chunks`], but their pages are the
+/// kernel's: not resident, out of the process's footprint). What the memory line says of
+/// [`Tag::Chunks`], and what [`crate::tag::Snapshot::purged`] takes off committed memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cached {
+    pub warm: u64,
+    pub cold: u64,
+}
+
+/// [`Cached`] now: two loads a place made.
+pub fn cached() -> Cached {
+    SPACES.iter().filter_map(|space| space.get()?.as_ref().ok()).map(Space::cached).fold(Cached::default(), |sum, it| {
+        Cached { warm: sum.warm + it.warm, cold: sum.cold + it.cold }
+    })
 }
 
 /// Bytes of chunks carved so far (held or cached), over every place.
@@ -298,5 +319,175 @@ pub fn carved_on(node: Option<u32>) -> usize {
 impl Space {
     fn carved_bytes(&self) -> usize {
         self.carved.load(Ordering::Relaxed).min(COUNT) as usize * CHUNK
+    }
+
+    /// This space's part of [`cached`].
+    fn cached(&self) -> Cached {
+        Cached {
+            warm: u64::from(self.warm_count.load(Ordering::Relaxed)) * CHUNK as u64,
+            cold: u64::from(self.cold_count.load(Ordering::Relaxed)) * CHUNK as u64,
+        }
+    }
+
+    /// A chunk of the space: a warm one, else a cold one made the process's again
+    /// ([`Region::reuse`]), else one carved.
+    fn take(&self) -> Result<u32, MemError> {
+        if let Some(local) = self.warm.pop(&self.links) {
+            self.warm_count.fetch_sub(1, Ordering::Relaxed);
+            return Ok(local);
+        }
+        match self.cold.pop(&self.links) {
+            Some(local) => {
+                if let Err(error) = self.region.reuse(local as usize * CHUNK, CHUNK) {
+                    self.cold.push(local, &self.links);
+                    return Err(error);
+                }
+                self.cold_count.fetch_sub(1, Ordering::Relaxed);
+                Ok(local)
+            }
+            None => carve(self),
+        }
+    }
+
+    /// Caches `locals`, chunks no owner holds, warm (one compare-and-swap); past `most` warm,
+    /// trims the cache down to `keep`.
+    fn give(&self, locals: &[u32]) {
+        let given = locals.len() as u32;
+        let now = self.warm_count.fetch_add(given, Ordering::Relaxed) + given;
+        self.warm.push_all(locals, &self.links);
+        self.trim_past_most(now);
+    }
+
+    /// After a give left `now` warm: past `most`, the cache trimmed down to `keep`.
+    fn trim_past_most(&self, now: u32) {
+        if now > self.most {
+            self.trim_to(self.keep);
+        }
+    }
+
+    /// Purges warm chunks to the cold stack until `keep` are left (or the stack is empty, or
+    /// the kernel keeps a chunk's pages: then it would keep the next one's too); says how many
+    /// it purged.
+    fn trim_to(&self, keep: u32) -> usize {
+        let mut purged = 0;
+        while self.warm_count.load(Ordering::Relaxed) > keep {
+            let Some(local) = self.warm.pop(&self.links) else { break };
+            self.warm_count.fetch_sub(1, Ordering::Relaxed);
+            if !self.purge_cold(local) {
+                break;
+            }
+            purged += 1;
+        }
+        purged
+    }
+
+    /// Gives the pages of a chunk no owner holds back to the kernel and caches it cold; says
+    /// whether they went ([`Space::cache_purged`]).
+    fn purge_cold(&self, local: u32) -> bool {
+        // SAFETY: the chunk was given up (by its owner, or popped off the warm cache), so no one
+        // holds it or reads its contents before writing them; it is touched again only through
+        // a take, which `reuse`s a cold chunk first.
+        let given = unsafe { self.region.purge(local as usize * CHUNK, CHUNK) };
+        self.cache_purged(local, given)
+    }
+
+    /// Caches chunk `local` after a purge gave `given` of its bytes back: cold when it gave
+    /// any, else warm. memcap3 review F1: a purge that gave nothing (hugetlb pool pages under
+    /// [`crate::huge::Pages::Reserved`], a refused advice, a target with no purge) leaves the pages
+    /// resident, and a chunk counted cold is taken off the footprint ([`cached`],
+    /// [`crate::tag::Snapshot::footprint`]), so counting it cold would leave out resident
+    /// memory. Says whether it went cold.
+    fn cache_purged(&self, local: u32, given: usize) -> bool {
+        // A chunk is aligned to a huge page and committed whole, so a purge gives back all of it
+        // or none. A part given back would still go cold, never warm: a warm take skips `reuse`,
+        // which the given pages need (Windows decommitted them).
+        debug_assert!(given == 0 || given == CHUNK, "a purge of a {CHUNK}-byte chunk gave back {given} bytes");
+        if given == 0 {
+            self.warm_count.fetch_add(1, Ordering::Relaxed);
+            self.warm.push(local, &self.links);
+            return false;
+        }
+        self.cold_count.fetch_add(1, Ordering::Relaxed);
+        self.cold.push(local, &self.links);
+        true
+    }
+}
+
+#[cfg(all(test, not(blaze_check)))]
+mod tests {
+    use super::*;
+
+    /// coord-102 (B5): the warm chunk cache had no bound, so the frames of a build's peak (4.72
+    /// GiB) stayed resident as warm chunks (3.3 GiB) to the end. A space's cache grows to its
+    /// `most` and the give that passes it trims to its `keep`, through one chunk at a time and
+    /// through runs, and the chunks purged are taken again, not carved. On a space of the test's
+    /// own, so no other test's chunks or `trim` reach it.
+    #[test]
+    fn a_space_trims_its_warm_chunks_to_keep_once_they_pass_most() {
+        const CHUNKS: u32 = 8;
+        let space = Space {
+            region: Region::reserve_huge(CHUNKS as usize * CHUNK, Tag::Solver).expect("a test's space"),
+            links: LinkTable::new(CHUNKS, Tag::Solver).expect("its links"),
+            carved: AtomicU32::new(0),
+            warm: Stack::new(),
+            warm_count: AtomicU32::new(0),
+            keep: 2,
+            most: 4,
+            cold: Stack::new(),
+            cold_count: AtomicU32::new(0),
+        };
+        let warm = || space.warm_count.load(Ordering::Relaxed);
+        let taken: Vec<u32> = (0..CHUNKS).map(|_| space.take().expect("a chunk")).collect();
+        let mut seen = Vec::new();
+        for &local in &taken {
+            space.give(&[local]);
+            seen.push(warm());
+        }
+        assert_eq!(seen, [1, 2, 3, 4, 2, 3, 4, 2], "one at a time: up to most, then trimmed to keep");
+        let cold = || space.cold_count.load(Ordering::Relaxed);
+        assert_eq!(cold(), 6, "each purged chunk counts cold, so the memory line can say it is not resident");
+        let again: Vec<u32> = (0..CHUNKS).map(|_| space.take().expect("a chunk")).collect();
+        assert_eq!(space.carved.load(Ordering::Relaxed), CHUNKS, "the purged chunks are taken again, none carved");
+        assert_eq!(warm(), 0);
+        assert_eq!(cold(), 0, "a cold chunk taken again counts cold no more");
+        space.give(&again);
+        assert_eq!(warm(), 2, "a run past most is trimmed to keep");
+        assert_eq!(space.trim_to(0), 2);
+        assert_eq!(warm(), 0);
+    }
+
+    /// memcap3 review F1: a chunk whose purge gave nothing back (hugetlb pool pages under
+    /// `Pages::Reserved`, a refused advice, a target with no purge) keeps its pages resident,
+    /// so it is cached warm and stays in the footprint: none of its bytes count as purged
+    /// (`cached().cold`, what `Snapshot::footprint` takes off committed memory). A chunk whose
+    /// purge gave its bytes back goes cold. On a space of the test's own, as above.
+    #[test]
+    fn a_chunk_whose_purge_gave_nothing_back_stays_warm_and_in_the_footprint() {
+        const CHUNKS: u32 = 4;
+        let space = Space {
+            region: Region::reserve_huge(CHUNKS as usize * CHUNK, Tag::Solver).expect("a test's space"),
+            links: LinkTable::new(CHUNKS, Tag::Solver).expect("its links"),
+            carved: AtomicU32::new(0),
+            warm: Stack::new(),
+            warm_count: AtomicU32::new(0),
+            keep: 0,
+            most: CHUNKS,
+            cold: Stack::new(),
+            cold_count: AtomicU32::new(0),
+        };
+        let kept = space.take().expect("a chunk");
+        let given = space.take().expect("a chunk");
+        assert!(!space.cache_purged(kept, 0), "a purge that gave nothing back leaves the chunk warm");
+        assert_eq!(
+            space.cached(),
+            Cached { warm: CHUNK as u64, cold: 0 },
+            "its pages are resident: none of its bytes come off the footprint"
+        );
+        assert!(space.cache_purged(given, CHUNK), "a purge that gave the chunk back makes it cold");
+        assert_eq!(space.cached(), Cached { warm: CHUNK as u64, cold: CHUNK as u64 });
+        assert_eq!(space.take().expect("a chunk"), kept, "the warm chunk is taken first, with no reuse");
+        assert_eq!(space.take().expect("a chunk"), given, "then the cold one, made the process's again");
+        assert_eq!(space.cached(), Cached::default());
+        assert_eq!(space.carved.load(Ordering::Relaxed), 2, "both were taken again, none carved");
     }
 }

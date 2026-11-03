@@ -630,12 +630,19 @@ impl MacroCallId {
     }
 }
 
+/// What [`MacroCallId::parse_macro_expansion`]'s value holds on the heap: the expansion's tree
+/// with the text it owns, and its span map.
+fn expansion_bytes(expansion: &ExpandResult<(Parse<view::Untyped>, ExpansionSpanMap)>) -> usize {
+    let (parse, map) = &expansion.value;
+    parse.heap_bytes() + parse.source_bytes() + map.heap_bytes()
+}
+
 #[blaze_query::tracked]
 impl MacroCallId {
     /// Implementation of [`HirFileId::parse_or_expand`] for the macro case.
     // FIXME: We should verify that the parsed node is one of the many macro node variants we expect
     // instead of having it be untyped
-    #[blaze_query::tracked(returns(ref), lru = 512, mem_tag = Expand)]
+    #[blaze_query::tracked(returns(ref), lru, weigh = expansion_bytes, mem_tag = Expand)]
     pub fn parse_macro_expansion(
         self,
         db: &Db,
@@ -2024,7 +2031,7 @@ impl HirFileId {
 
 #[blaze_query::tracked]
 impl HirFileId {
-    #[blaze_query::tracked(lru = 1024, returns(ref), mem_tag = Expand)]
+    #[blaze_query::tracked(lru, weigh = AstIdMap::heap_bytes, returns(ref), mem_tag = Expand)]
     pub fn ast_id_map(self, db: &Db) -> AstIdMap {
         AstIdMap::from_view(self.root(db))
     }

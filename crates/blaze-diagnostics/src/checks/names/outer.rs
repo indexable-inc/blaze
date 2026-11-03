@@ -90,6 +90,7 @@ fn is_module(node: ast::Node<'_>) -> bool {
 
 /// An item around that gives `Self`: an impl (rustc's `SelfTyAlias`) or a trait
 /// (`SelfTyParam`).
+#[derive(Clone, Copy)]
 enum SelfGiver<'t> {
     Impl(ast::Impl<'t>),
     Trait,

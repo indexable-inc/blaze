@@ -10,12 +10,12 @@
 
 use std::{
     fmt::{self, Debug},
-    hash::{BuildHasher, Hash, Hasher},
+    hash::{Hash, Hasher},
     marker::PhantomData,
     ops::Deref,
 };
 
-use blaze_hash::FixedState;
+use blaze_hash::LazyKey;
 
 use crate::{
     sync::OnceLock,
@@ -56,8 +56,9 @@ impl<T: SliceInternable> InternedSlice<T> {
         header: T::Header,
         slice: &[T::SliceType],
     ) -> InternedSliceRef<'a, T> {
-        let hash = FixedState.hash_one((&header, slice));
-        let ptr = T::storage().get().intern(hash, header, slice);
+        let storage = T::storage();
+        let hash = storage.key.get().hash_one(&(&header, slice));
+        let ptr = storage.get().intern(hash, header, slice);
         InternedSliceRef { ptr, _marker: PhantomData }
     }
 
@@ -187,6 +188,9 @@ where
 
 pub struct InternSliceStorage<T: SliceInternable> {
     store: OnceLock<Slices<T::Header, T::SliceType>>,
+    /// The key each value is placed by, drawn at random on first use, as
+    /// [`crate::InternStorage`]'s is.
+    key: LazyKey,
 }
 
 #[allow(
@@ -195,7 +199,7 @@ pub struct InternSliceStorage<T: SliceInternable> {
 )]
 impl<T: SliceInternable> InternSliceStorage<T> {
     pub const fn new() -> Self {
-        Self { store: OnceLock::new() }
+        Self { store: OnceLock::new(), key: LazyKey::new() }
     }
 }
 

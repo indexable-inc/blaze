@@ -153,8 +153,6 @@ pub(crate) enum Class {
     Stubs,
     /// Stubs that jump through a GOT cell to an imported function.
     Plt,
-    /// Range-extension veneers for AArch64 branches that can't reach their target.
-    Veneers,
     Rodata,
     /// Read-only once the loader has relocated it: constant data holding addresses (vtables,
     /// panic locations, constant statics with pointers), ELF's `.data.rel.ro`, Mach-O's

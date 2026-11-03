@@ -38,7 +38,7 @@ const BOTH: &str = concat!(line!(), \":\",\tcolumn!());
 ";
 
 /// The queries that build a body's source map.
-const MAP_QUERIES: [&str; 2] = ["Body::relative", "Body::with_source_map"];
+const MAP_QUERIES: [&str; 2] = ["Body::relative", "Body::source_map"];
 
 #[track_caller]
 fn assert_no_map(executed: &[String]) {

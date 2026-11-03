@@ -272,7 +272,7 @@ impl BasicAdtInfo {
         &self,
         span: Span,
         arms: Vec<(tt::TopSubtree, tt::TopSubtree, tt::TopSubtree)>,
-        fallback: tt::TopSubtree,
+        fallback: &tt::TopSubtree,
     ) -> tt::TopSubtree {
         if let (Some(lets), Some(other_lets)) =
             (self.packed_lets(span, "self"), self.packed_lets(span, "other"))
@@ -504,7 +504,7 @@ pub(super) fn expand_simple_derive(
     db: &ItemSource<'_>,
     invoc_span: Span,
     tt: &tt::TopSubtree,
-    trait_path: tt::TopSubtree,
+    trait_path: &tt::TopSubtree,
     allow_unions: bool,
     copy_if_packed: bool,
     make_trait_body: impl FnOnce(&BasicAdtInfo) -> tt::TopSubtree,
@@ -541,17 +541,17 @@ pub(super) fn expand_simple_derive(
         trait_path,
         make_trait_body,
         true,
-        tt::TopSubtree::empty(tt::DelimSpan::from_single(invoc_span)),
+        &tt::TopSubtree::empty(tt::DelimSpan::from_single(invoc_span)),
     ))
 }
 
 pub(super) fn expand_simple_derive_with_parsed(
     invoc_span: Span,
     info: BasicAdtInfo,
-    trait_path: tt::TopSubtree,
+    trait_path: &tt::TopSubtree,
     make_trait_body: impl FnOnce(&BasicAdtInfo) -> tt::TopSubtree,
     constrain_to_trait: bool,
-    extra_impl_params: tt::TopSubtree,
+    extra_impl_params: &tt::TopSubtree,
 ) -> tt::TopSubtree {
     let trait_body = make_trait_body(&info);
     let mut where_block: Vec<_> =
@@ -610,7 +610,7 @@ pub(super) fn copy_expand(
         db,
         span,
         tt,
-        quote! {span => #krate::marker::Copy },
+        &quote! {span => #krate::marker::Copy },
         true,
         false,
         |_| quote! {span =>},
@@ -629,7 +629,7 @@ pub(super) fn const_param_ty_expand(
         db,
         span,
         tt,
-        quote! {span => #krate::marker::ConstParamTy_ },
+        &quote! {span => #krate::marker::ConstParamTy_ },
         true,
         false,
         |_| quote! {span =>},
@@ -645,7 +645,7 @@ pub(super) fn reborrow_expand(
         db,
         span,
         tt,
-        quote! {span => #krate::marker::Reborrow },
+        &quote! {span => #krate::marker::Reborrow },
         "Reborrow",
     )
 }
@@ -653,7 +653,7 @@ pub(super) fn expand_reborrow_marker_derive(
     db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
-    trait_path: tt::TopSubtree,
+    trait_path: &tt::TopSubtree,
     trait_name: &'static str,
 ) -> ExpandResult<tt::TopSubtree> {
     let info = match parse_adt(db, tt, span) {
@@ -678,7 +678,7 @@ pub(super) fn expand_reborrow_marker_derive(
         trait_path,
         |_| quote! {span => },
         false,
-        tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+        &tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
     ))
 }
 pub(super) fn clone_expand(
@@ -698,7 +698,7 @@ pub(super) fn clone_expand_with(
     copy: bool,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::clone::Clone }, true, true, |adt| {
+    expand_simple_derive(db, span, tt, &quote! {span => #krate::clone::Clone }, true, true, |adt| {
         let copy = copy && adt.param_types.iter().all(|param| param.const_ty.is_some());
         if copy || matches!(adt.shape, AdtShape::Union) {
             let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
@@ -810,7 +810,7 @@ pub(super) fn default_expand(
     ExpandResult::ok(expand_simple_derive_with_parsed(
         span,
         adt,
-        quote! {span => #krate::default::Default },
+        &quote! {span => #krate::default::Default },
         |_adt| {
             quote! {span =>
                 fn default() -> Self {
@@ -819,7 +819,7 @@ pub(super) fn default_expand(
             }
         },
         constrain_to_trait,
-        tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+        &tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
     ))
 }
 
@@ -829,7 +829,7 @@ pub(super) fn debug_expand(
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::fmt::Debug }, false, true, |adt| {
+    expand_simple_derive(db, span, tt, &quote! {span => #krate::fmt::Debug }, false, true, |adt| {
         let for_variant = |name: String, v: &VariantShape| match v {
             VariantShape::Struct(fields) => {
                 // Spelled out in full, as rustc does: a method of the same name on some other
@@ -918,7 +918,7 @@ pub(super) fn hash_expand(
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::hash::Hash }, false, true, |adt| {
+    expand_simple_derive(db, span, tt, &quote! {span => #krate::hash::Hash }, false, true, |adt| {
         if matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.is_empty()) {
             let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
             return quote! {span =>
@@ -973,7 +973,7 @@ pub(super) fn eq_expand(
         db,
         span,
         tt,
-        quote! {span => #krate::cmp::Eq },
+        &quote! {span => #krate::cmp::Eq },
         true,
         true,
         |_| quote! {span =>},
@@ -993,10 +993,10 @@ pub(super) fn partial_eq_expand(
     let structural = expand_simple_derive_with_parsed(
         span,
         info,
-        quote! {span => #krate::marker::StructuralPartialEq },
+        &quote! {span => #krate::marker::StructuralPartialEq },
         |_| quote! {span =>},
         false,
-        tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+        &tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
     );
     let ExpandResult { value, err } = partial_eq;
     let partial_eq = value.token_trees();
@@ -1013,7 +1013,7 @@ fn partial_eq_impl_expand(
         db,
         span,
         tt,
-        quote! {span => #krate::cmp::PartialEq },
+        &quote! {span => #krate::cmp::PartialEq },
         false,
         true,
         |adt| {
@@ -1037,7 +1037,7 @@ fn partial_eq_impl_expand(
                 let and_and = and_and(span);
                 let fields = match fielded {
                     true => {
-                        let fields = adt.match_both(span, arms, quote! {span => true });
+                        let fields = adt.match_both(span, arms, &quote! {span => true });
                         quote! {span => #and_and #fields }
                     }
                     false => quote! {span =>},
@@ -1055,7 +1055,7 @@ fn partial_eq_impl_expand(
                 .into_iter()
                 .map(|(pat1, pat2, names)| (pat1, pat2, fields_eq(krate, &names, span)))
                 .collect();
-            let body = adt.match_both(span, arms, quote! {span => false });
+            let body = adt.match_both(span, arms, &quote! {span => false });
             quote! {span =>
                 fn eq(&self, other: &Self) -> bool {
                     #body
@@ -1113,12 +1113,12 @@ pub(super) fn ord_expand(
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::cmp::Ord }, false, true, |adt| {
+    expand_simple_derive(db, span, tt, &quote! {span => #krate::cmp::Ord }, false, true, |adt| {
         fn compare(
             krate: &tt::Ident,
-            left: tt::TopSubtree,
-            right: tt::TopSubtree,
-            rest: tt::TopSubtree,
+            left: &tt::TopSubtree,
+            right: &tt::TopSubtree,
+            rest: &tt::TopSubtree,
             span: Span,
         ) -> tt::TopSubtree {
             let fat_arrow1 = fat_arrow(span);
@@ -1144,17 +1144,17 @@ pub(super) fn ord_expand(
                 for f in fields.into_iter().rev() {
                     let t1 = tt::Ident::new(&format!("{}_self", f.sym), f.span);
                     let t2 = tt::Ident::new(&format!("{}_other", f.sym), f.span);
-                    body = compare(krate, quote!(span =>#t1), quote!(span =>#t2), body, span);
+                    body = compare(krate, &quote!(span =>#t1), &quote!(span =>#t2), &body, span);
                 }
                 (pat1, pat2, body)
             },
         );
         let mut body =
-            adt.match_both(span, arms.collect(), quote! {span => #krate::cmp::Ordering::Equal });
+            adt.match_both(span, arms.collect(), &quote! {span => #krate::cmp::Ordering::Equal });
         if discriminants {
             let left = quote!(span =>#krate::intrinsics::discriminant_value(self));
             let right = quote!(span =>#krate::intrinsics::discriminant_value(other));
-            body = compare(krate, left, right, body, span);
+            body = compare(krate, &left, &right, &body, span);
         }
         quote! {span =>
             fn cmp(&self, other: &Self) -> #krate::cmp::Ordering {
@@ -1174,15 +1174,15 @@ pub(super) fn partial_ord_expand(
         db,
         span,
         tt,
-        quote! {span => #krate::cmp::PartialOrd },
+        &quote! {span => #krate::cmp::PartialOrd },
         false,
         true,
         |adt| {
             fn compare(
                 krate: &tt::Ident,
-                left: tt::TopSubtree,
-                right: tt::TopSubtree,
-                rest: tt::TopSubtree,
+                left: &tt::TopSubtree,
+                right: &tt::TopSubtree,
+                rest: &tt::TopSubtree,
                 span: Span,
             ) -> tt::TopSubtree {
                 let fat_arrow1 = fat_arrow(span);
@@ -1212,16 +1212,16 @@ pub(super) fn partial_ord_expand(
                     for f in fields.into_iter().rev() {
                         let t1 = tt::Ident::new(&format!("{}_self", f.sym), f.span);
                         let t2 = tt::Ident::new(&format!("{}_other", f.sym), f.span);
-                        body = compare(krate, quote!(span =>#t1), quote!(span =>#t2), body, span);
+                        body = compare(krate, &quote!(span =>#t1), &quote!(span =>#t2), &body, span);
                     }
                     (pat1, pat2, body)
                 },
             );
             let equal =
                 quote! {span => #krate::option::Option::Some(#krate::cmp::Ordering::Equal) };
-            let matched = adt.match_both(span, arms.collect(), equal);
+            let matched = adt.match_both(span, arms.collect(), &equal);
             let body = match discriminants {
-                true => compare(krate, left, right, matched, span),
+                true => compare(krate, &left, &right, &matched, span),
                 false => matched,
             };
             quote! {span =>

@@ -52,9 +52,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blaze_core::exit::Exit;
 use blaze_manifest::{Config, Context, Workspace, metadata::root_manifest};
 
-use super::{FAILED, USAGE, say};
+use super::say;
 
 const USAGE_TEXT: &str = "blaze clean [--dry-run] [--force] [--manifest-path PATH] [--target-dir DIR] | blaze clean --list | blaze clean --all [--dry-run]";
 
@@ -122,7 +123,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
     };
     let asked = match parse(words) {
         Ok(asked) => asked,
-        Err(what) => return refused(&what, USAGE),
+        Err(what) => return refused(&what, Exit::Usage.code()),
     };
     let done = match (asked.list, asked.all) {
         (true, _) => list(),
@@ -131,7 +132,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
     };
     match done {
         Ok(()) => 0,
-        Err(what) => refused(&what, FAILED),
+        Err(what) => refused(&what, Exit::Failed.code()),
     }
 }
 

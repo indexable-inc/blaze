@@ -122,7 +122,7 @@ pub(crate) fn unbuilt(job: &Job, reader: &UnitReader, unit: usize) -> Result<boo
         let krate = u.target.name.as_str();
         let _span =
             tracing::info_span!(target: "blaze", "build script purity", krate, unit = name.as_str()).entered();
-        let worked = work_out(job, reader, unit)?;
+        let worked = work_out(job, reader, unit, krate, &name)?;
         let _ = slot.set(worked);
     }
     Ok(!verify && of(job, unit).is_some_and(Pure::all_hit))
@@ -134,40 +134,65 @@ pub(crate) fn built_nothing(job: &Job, unit: usize) -> bool {
     !verifies(job).unwrap_or(true) && !super::rechecks(job).unwrap_or(true) && of(job, unit).is_some_and(Pure::all_hit)
 }
 
-/// The most rows of the front end a build script's purity proof brings up to date (each run or
-/// verified, each time it is reached) before it stops with an error naming the script: what
-/// bounds a proof whose verification would not end (rule 15). How many a proof spent is the
-/// `steps` field of its `build script proof` span: the margin under this bound is read from
-/// the profiles (no real proof's count is quoted here yet). Only rows this task brings up to
-/// date count, so a cold database or less concurrency spends more.
-const PROOF_FUEL: u64 = 1 << 25;
+/// The most instances a build script's purity proof may walk before it stops with an error
+/// naming the script: the bound on the walk (rule 15). A step is a body instance the walk
+/// reaches, each once ([`hir_ty_pure::ScriptProof::steps`]), whatever the daemon had cached
+/// and whichever task ran what, so a script is proved or refused alike on a cold, warm or busy
+/// daemon. How many a proof took is the `steps` of its `build script proof` span: the margin
+/// under this bound is read from the profiles. No real proof's count is quoted here yet;
+/// calibrate it from the largest (cranelift-codegen's and wasmtime's among them).
+const PROOF_STEPS: u64 = 1 << 20;
 
-fn work_out(job: &Job, reader: &UnitReader, compile: usize) -> Result<Purity, ApiError> {
+/// The most rows of the front end a purity proof may bring up to date (each run or verified,
+/// each time it is reached): a bound on the query engine under the proof, not on the script,
+/// so an engine that would not end the proof stops with an error that says so (rule 15).
+/// Unlike [`PROOF_STEPS`] it counts what was not cached, so it sits far above any proof's
+/// real work: a verify checks each row of a cycle once (`blaze_query`'s pending rows), and a
+/// cold proof of cranelift-codegen's build script brought fewer than 2^25 up to date.
+const ENGINE_FUEL: u64 = 1 << 28;
+
+/// What the pure path finds of the script compiled by unit `compile`, its target `target`
+/// (`build-script-build`) and `unit` its name (`serde v1.0.219 (build script)`), which the
+/// proof's span carries.
+fn work_out(job: &Job, reader: &UnitReader, compile: usize, target: &str, unit: &str) -> Result<Purity, ApiError> {
     let db = reader.db();
     let krate = job.crates.krate(compile).ok_or(UnitError::NoCrate { unit: compile })?;
     // Not proved, so built and run in the sandbox as any script: the proof is asked of a free
     // `main` only.
     let Some(main) = hir_ty_pure::main_of(db, krate) else { return Ok(Purity::Unproved) };
-    let purity = {
+    let proof = {
         // The walk from `main` over every instance it reaches: the part of the span above
         // that is not the store's lookups below.
-        let span = tracing::info_span!(target: "blaze", "build script proof", steps = tracing::field::Empty).entered();
-        let proof = blaze_query::db::with_fuel(PROOF_FUEL, || blaze_query::db::attach(db, || hir_ty_pure::script_purity(db, main)));
-        let proof = proof.map(|(purity, steps)| {
-            span.record("steps", steps);
-            purity
+        let span = blaze_profile::span::ScriptProof {
+            krate: blaze_profile::span::Name::of(target),
+            unit: blaze_profile::span::Name::of(unit),
+        }
+        .open();
+        let proved = blaze_query::db::with_fuel(ENGINE_FUEL, || {
+            blaze_query::db::with_steps(PROOF_STEPS, || {
+                blaze_query::db::attach(db, || hir_ty_pure::script_proof(db, main))
+            })
         });
-        proof.map_err(|out| {
-            let unit = job.unit(compile);
-            let script = unit.as_ref().map_or_else(|it| it.what.clone(), |it| format!("`{}` of `{}`", it.target.name, it.pkg_id)); // alloc: an error, once
-            let what = format!(
-                "the purity proof of the build script {script} (`script_purity` of its `main`) did not end: it {out}, \
-                 past the bound of {PROOF_FUEL} rows a proof may bring up to date (rule 15)"
-            ); // alloc: an error, once
-            ApiError::new(what, unit.ok().map(|it| it.pkg_id.clone())) // clone: an error, once
-        })?
+        match proved {
+            // A proof kept from a walk with no bound on it is held to the bound as well.
+            Ok((Ok((proof, _)), _)) if u64::from(proof.steps) <= PROOF_STEPS => {
+                span.ended(blaze_profile::span::ScriptProved { steps: u64::from(proof.steps) });
+                proof
+            }
+            // alloc: an error, once
+            Ok((Ok((proof, _)), _)) => return Err(refused(job, compile, format!("it walked {}", proof.steps))),
+            Ok((Err(out), _)) => return Err(refused(job, compile, format!("it {out}"))), // alloc: an error, once
+            Err(out) => {
+                let what = format!(
+                    "did not end: the query engine under it {out}, past the {ENGINE_FUEL} rows a proof may bring up to \
+                     date (rule 15). The walk itself is bounded by the instances it reaches, so this is the engine \
+                     not ending, a blaze bug, not the script"
+                ); // alloc: an error, once
+                return Err(proof_error(job, compile, &what));
+            }
+        }
     };
-    let proved = match purity {
+    let proved = match &proof.purity {
         hir_ty_pure::Purity::Pure(proved) => proved,
         // alloc: once per impure script: what the build's report says of it
         hir_ty_pure::Purity::Impure(impure) => return Ok(Purity::Impure(impure.said())),
@@ -197,6 +222,23 @@ fn work_out(job: &Job, reader: &UnitReader, compile: usize) -> Result<Purity, Ap
         runs.push((run, found));
     }
     Ok(Purity::Pure(Pure { proof, runs }))
+}
+
+/// The error of the purity proof of the script compiled by unit `compile`, which walked more
+/// instances than [`PROOF_STEPS`]: `how` says how far it got.
+fn refused(job: &Job, compile: usize, how: String) -> ApiError {
+    // alloc: an error, once
+    let what = format!("walks more than the {PROOF_STEPS} instances a proof's walk may reach (rule 15): {how}");
+    proof_error(job, compile, &what)
+}
+
+/// The error of the purity proof of the script compiled by unit `compile`, naming the script;
+/// `what` says what the proof did.
+fn proof_error(job: &Job, compile: usize, what: &str) -> ApiError {
+    let unit = job.unit(compile);
+    let script = unit.as_ref().map_or_else(|it| it.what.clone(), |it| format!("`{}` of `{}`", it.target.name, it.pkg_id)); // alloc: an error, once
+    let what = format!("the purity proof of the build script {script} (`script_proof` of its `main`) {what}"); // alloc: an error, once
+    ApiError::new(what, unit.ok().map(|it| it.pkg_id.clone())) // clone: an error, once
 }
 
 /// Run unit `run` as `blaze_build_script` describes it, and the environment it is started in:

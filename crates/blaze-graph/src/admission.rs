@@ -22,7 +22,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_hash::HashMap;
@@ -111,6 +114,19 @@ pub const fn tag_of(kind: TaskKind) -> Tag {
     }
 }
 
+/// Runs `f` as a task of `kind`: in a [`blaze_mem::frame::task`] of [`tag_of`]`(kind)`, so
+/// what it allocates from the global heap is charged to that subsystem's line and not to the
+/// heap outside any task, and says the most it held: its global allocations
+/// ([`crate::arena::measure`]) and its frames' together, the peak [`Estimates`] learn from.
+/// Every runner of tasks (the exec scheduler's, the daemon's plane) runs a task's work through
+/// this, so a task's memory has one home whoever runs it.
+pub fn run_as<R>(kind: TaskKind, f: impl FnOnce() -> R) -> (R, u64) {
+    let tag = tag_of(kind);
+    let ((out, bytes), frames) =
+        blaze_mem::frame::measure(|| crate::arena::measure(|| blaze_mem::frame::task(tag, |_| f())));
+    (out, bytes + frames as u64)
+}
+
 /// Each subsystem's budget as a share of the machine's, in 64ths. The shares sum past 64 on
 /// purpose: a build's phases peak at different times (names before bodies, bodies before
 /// code, code before the link), so each subsystem may take a large part of the machine while
@@ -121,17 +137,142 @@ pub const fn share(tag: Tag) -> u64 {
     match tag {
         Tag::Infer | Tag::Codegen | Tag::Link | Tag::Frames => 32,
         Tag::Mir | Tag::Query => 24,
-        Tag::Nameres | Tag::Intern | Tag::Diagnostics => 16,
+        Tag::Nameres | Tag::Intern | Tag::Diagnostics | Tag::Solver => 16,
         Tag::Parse | Tag::Expand | Tag::Store | Tag::Vfs | Tag::Chunks | Tag::Fuzz => 8,
         Tag::Usercode | Tag::Other => 4,
-        Tag::Plane | Tag::Io | Tag::Api => 2,
+        Tag::Plane | Tag::Io | Tag::Api | Tag::Profile => 2,
     }
 }
 
-/// Sets each subsystem's budget ([`tag::set_budget`]) to its [`share`] of `machine` bytes.
+/// The memory the daemon may hold in all, as [`set_budgets`] was last given it: `u64::MAX`
+/// until then, which no [`Pressure`] reaches.
+static LIMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Sets each subsystem's budget ([`tag::set_budget`]) to its [`share`] of `machine` bytes, the
+/// memory the daemon runs under (`blaze_graph::arena::machine_budget`: the least of the
+/// machine's, its cgroup's and the limit it was started with), and keeps `machine` as the
+/// [`limit`] a build's [`Squeeze`] is decided against. One number, so every budget, the frames'
+/// cap and the front end's sweep (`blaze_query::db::budget`, which reads each tag's budget)
+/// follow the same limit.
 pub fn set_budgets(machine: u64) {
+    LIMIT.store(machine, Ordering::Relaxed);
     for tag in Tag::ALL {
         tag::set_budget(tag, machine / 64 * share(tag));
+    }
+}
+
+/// [`set_budgets`]' `machine`: the memory the daemon may hold in all; `u64::MAX` before.
+pub fn limit() -> u64 {
+    LIMIT.load(Ordering::Relaxed)
+}
+
+/// Every subsystem's [`share`] summed, in 64ths: over 64, as [`share`] says why.
+pub const SHARES: u64 = {
+    let mut sum = 0;
+    let mut at = 0;
+    while at < Tag::COUNT {
+        sum += share(Tag::ALL[at]);
+        at += 1;
+    }
+    sum
+};
+
+/// `tag`'s part of `limit` when every subsystem must fit in it at once: its [`share`] of
+/// [`SHARES`], so the parts of all of them sum to at most `limit`. What a [`Squeeze`] past its
+/// line holds each subsystem's values to ([`Squeeze::caps`]), where a budget alone lets one
+/// take up to half of the limit.
+pub const fn fair_share(tag: Tag, limit: u64) -> u64 {
+    limit / SHARES * share(tag)
+}
+
+/// The subsystems a build's release lowers (`blaze-cargo`'s `unit::release`): what the front
+/// end's database keeps by bytes and its sweep lets go (parses, expansions, item signatures,
+/// inference) and the MIR the release drops. One of them past its [`fair_share`] makes a
+/// [`Squeeze`] due.
+pub const RELEASED: [Tag; 5] = [Tag::Parse, Tag::Nameres, Tag::Expand, Tag::Infer, Tag::Mir];
+
+/// A [`Squeeze`] past its line is due once blaze holds more than the limit less this part of
+/// it: an eighth, so the release comes before the limit, not at it.
+pub const LINE: u64 = 8;
+
+/// After a release, the next is due only once blaze holds this part of the limit more than it
+/// did as that release ended: a sixteenth. What a release can't let go (another job's front
+/// end, the store, a unit still compiling) stays over the line, and this keeps it from
+/// stopping the build at every unit; at most [`STEP`] stops fit between none held and the limit.
+pub const STEP: u64 = 16;
+
+/// What a release is decided on, read at one moment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Pressure {
+    /// The process's footprint as the system counts it (`blaze_mem::tag::resident`: what the
+    /// limit is on and the watchdog reads), or, where the system does not say, what blaze itself
+    /// takes of it at most (`blaze_mem::tag::Snapshot::footprint`). coord-108 (B5): counting the
+    /// purged chunks (10 GiB after a burst of frames), a release said "blaze held 48.74 GiB" with
+    /// the process at 43.8. coord-111 (memcap5): counting what mimalloc ever committed, which a
+    /// purge never lowers, every one of 29 releases said "0.00 freed" and "blaze held 59.21 GiB"
+    /// with the process at 47.28.
+    pub held: u64,
+    /// [`limit`].
+    pub limit: u64,
+    /// The first of [`RELEASED`] that holds more than its [`fair_share`] of the limit, in its
+    /// regions and the global heap together: MIR and inference live in the heap, so a budget
+    /// read against regions alone (`blaze_mem::tag::over_budget`) never sees them, and a
+    /// budget (up to half the limit each) is passed only once the whole is too late to save.
+    pub over: Option<Tag>,
+}
+
+impl Pressure {
+    /// Now: one snapshot of the tags, and one read of the process's footprint.
+    pub fn now() -> Pressure {
+        let snapshot = tag::snapshot();
+        let limit = limit();
+        let over = RELEASED.into_iter().find(|&tag| {
+            let it = snapshot.get(tag);
+            it.live.saturating_add(it.heap) > fair_share(tag, limit)
+        });
+        Pressure { held: crate::arena::own_of(&snapshot), limit, over }
+    }
+
+    /// Whether blaze holds more than the limit less its [`LINE`]th.
+    pub const fn squeezed(&self) -> bool {
+        self.limit != u64::MAX && self.held >= self.limit - self.limit / LINE
+    }
+}
+
+/// When a build stops its readers to let go of what its front end keeps for no task to come
+/// (`blaze-cargo`'s `unit::release`): sans IO, decided on [`Pressure`]s it is given. A release
+/// is due when blaze is past the limit's line or a subsystem it lowers is past its share, and
+/// blaze has grown by a [`STEP`]th of the limit since the last release ended. Without a limit
+/// none is ever due.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Squeeze {
+    /// What blaze held as the last release ended, and a [`STEP`]th of the limit.
+    after: u64,
+}
+
+impl Squeeze {
+    /// Whether a release is due at `now`.
+    pub const fn due(&self, now: Pressure) -> bool {
+        now.limit != u64::MAX && (now.squeezed() || now.over.is_some()) && now.held >= self.after
+    }
+
+    /// A release ended, leaving `now`: the next is due only past a [`STEP`]th more.
+    pub fn released(&mut self, now: Pressure) {
+        self.after = now.held.saturating_add(now.limit / STEP);
+    }
+
+    /// What each subsystem's values may weigh in the sweep of a release that was due at `now`
+    /// (`blaze_query::db::Storage::sweep_values`): each of [`RELEASED`] its [`fair_share`] of the
+    /// limit, what made the release due; past the line every subsystem its own, so together they
+    /// fit in the limit. No cap but its budget for any other.
+    pub fn caps(now: Pressure) -> [u64; Tag::COUNT] {
+        let mut caps = [u64::MAX; Tag::COUNT];
+        for tag in Tag::ALL {
+            if now.squeezed() || RELEASED.contains(&tag) {
+                caps[tag.index()] = fair_share(tag, now.limit);
+            }
+        }
+        caps
     }
 }
 
@@ -722,6 +863,52 @@ mod tests {
         }
         assert_eq!(tag::budget(Tag::Infer), 32 << 30);
         assert_eq!(tag::budget(Tag::Plane), 2 << 30);
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    fn at(held: u64, over: Option<Tag>) -> Pressure {
+        Pressure { held, limit: 48 * GIB, over }
+    }
+
+    /// A release is due past the limit's line or with a released subsystem past its share, and
+    /// then not again until blaze grew by a sixteenth of the limit since it ended; with no limit
+    /// never. Pure: the pressures are given, no global is read.
+    #[test]
+    fn a_squeeze_is_due_past_the_line_and_again_only_a_step_later() {
+        let mut squeeze = Squeeze::default();
+        assert!(!squeeze.due(at(41 * GIB, None)), "under 48 less an eighth (42)");
+        assert!(squeeze.due(at(42 * GIB, None)), "at the line");
+        assert!(squeeze.due(at(10 * GIB, Some(Tag::Mir))), "a released subsystem past its share");
+        squeeze.released(at(40 * GIB, None));
+        assert!(!squeeze.due(at(42 * GIB, None)), "past the line, but under 40 + 3 since the release");
+        assert!(!squeeze.due(at(42 * GIB, Some(Tag::Infer))), "past a share, still under the step");
+        assert!(squeeze.due(at(43 * GIB, None)), "a sixteenth (3 GiB) past what the release left");
+        squeeze.released(at(20 * GIB, None));
+        assert!(squeeze.due(at(23 * GIB, Some(Tag::Infer))), "a release that freed much lowers the step's floor");
+        let unlimited = Pressure { held: u64::MAX - 1, limit: u64::MAX, over: Some(Tag::Mir) };
+        assert!(!Squeeze::default().due(unlimited), "no limit: never due");
+    }
+
+    /// A due release caps each released subsystem at its share of the shares' sum; past the
+    /// line every subsystem, so the caps fit in the limit together.
+    #[test]
+    fn a_squeeze_past_the_line_caps_every_subsystem_to_fit_the_limit_together() {
+        const { assert!(SHARES > 64, "the budgets overlap on purpose") };
+        let caps = Squeeze::caps(at(30 * GIB, Some(Tag::Mir)));
+        for tag in Tag::ALL {
+            let fair = match RELEASED.contains(&tag) {
+                true => 48 * GIB / SHARES * share(tag),
+                false => u64::MAX,
+            };
+            assert_eq!(caps[tag.index()], fair, "under the line: {tag}");
+        }
+        let caps = Squeeze::caps(at(46 * GIB, None));
+        assert!(caps.iter().sum::<u64>() <= 48 * GIB, "{caps:?}");
+        for tag in Tag::ALL {
+            assert_eq!(caps[tag.index()], 48 * GIB / SHARES * share(tag), "{tag}");
+        }
+        assert!(caps[Tag::Infer.index()] < 48 * GIB / 64 * share(Tag::Infer), "tighter than the budget");
     }
 
     /// The plane predicts every node it admits and observes every task that ends: once each

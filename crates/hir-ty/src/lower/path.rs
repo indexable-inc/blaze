@@ -6,6 +6,7 @@ use either::Either;
 use hir_def::{
     AdtId, AssocItemId, GenericDefId, GenericParamId, HasModule, ImplId, Lookup, TraitId,
     TypeAliasId, TypeParamId,
+    nameres::{assoc_item_binding_name, impl_item_name, trait_item_name, written_name},
     expr_store::{
         ExpressionStore, HygieneId,
         path::{
@@ -119,6 +120,13 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         self.current_segment_idx as u32
     }
 
+    /// The context the current (or previous) segment is written with
+    /// ([`Path::segment_hygiene`]): what an associated item it names is looked up by.
+    #[inline]
+    fn current_segment_hygiene(&self) -> HygieneId {
+        self.path.segment_hygiene(self.current_segment_idx.min(self.segments.len().saturating_sub(1)))
+    }
+
     #[inline]
     fn skip_resolved_segment(&mut self) {
         if !matches!(self.path, Path::LangItem(..)) {
@@ -200,11 +208,11 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
 
     /// The associated type the shorthand `resolution` of the current segment in `qself`'s
     /// bounds gives, or the error type it is reported as.
-    fn resolved_shorthand(
+    fn resolved_shorthand<'r>(
         &mut self,
         qself: AssocTypeQself,
-        resolution: AssocTypeShorthandResolution,
-    ) -> Result<StoredEarlyBinder<(TypeAliasId, StoredGenericArgs)>, Ty<'db>> {
+        resolution: &'r AssocTypeShorthandResolution,
+    ) -> Result<&'r StoredEarlyBinder<(TypeAliasId, StoredGenericArgs)>, Ty<'db>> {
         let failure = match resolution {
             AssocTypeShorthandResolution::Resolved(it) => return Ok(it),
             AssocTypeShorthandResolution::NotFound => AssocTypeFailure::NotFound,
@@ -238,8 +246,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         self.skip_resolved_segment();
                         let segment = self.current_or_prev_segment;
                         let trait_id = trait_ref.def_id.0;
-                        let found =
-                            trait_id.trait_items(self.ctx.db).associated_type_by_name(segment.name);
+                        let db = self.ctx.db;
+                        let name =
+                            trait_item_name(db, trait_id, *segment.name, self.current_segment_hygiene());
+                        let found = trait_id.trait_items(db).associated_type_named(db, name);
 
                         tracing::debug!(?found);
                         match found {
@@ -537,6 +547,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         let def = self.ctx.generic_def;
         let segment = self.current_or_prev_segment;
         let assoc_name = segment.name;
+        let hygiene = self.current_segment_hygiene();
         let inherent = match res {
             Some(TypeNs::SelfType(impl_)) => db.impl_trait(impl_).is_none(),
             Some(TypeNs::AdtId(_) | TypeNs::AdtSelfType(_) | TypeNs::TypeAliasId(_)) => true,
@@ -545,7 +556,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         // An associated type of a type that is itself an error is not reported, as rustc's
         // `lower_assoc_path`.
         if inherent {
-            return match self.inherent_associated_type(ty, assoc_name) {
+            return match self.inherent_associated_type(ty, assoc_name, hygiene) {
                 Some(ty) => ty,
                 None if ty.references_error() => self.ctx.types.types.error,
                 None => self.ambiguous_assoc_type(self.current_segment_u32()),
@@ -553,9 +564,13 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         }
         let (assoc_type, trait_args) = match res {
             Some(TypeNs::GenericParam(param)) => {
-                let resolution =
-                    super::resolve_type_param_assoc_type_shorthand(db, def, param, *assoc_name);
-                let assoc_type = match self.resolved_shorthand(AssocTypeQself::Param(param), resolution.clone()) {
+                let resolution = super::resolve_type_param_assoc_type_shorthand(
+                    db,
+                    def,
+                    param,
+                    written_name(db, *assoc_name, hygiene),
+                );
+                let assoc_type = match self.resolved_shorthand(AssocTypeQself::Param(param), resolution) {
                     Ok(it) => it,
                     Err(error) => return error,
                 };
@@ -574,10 +589,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                     db,
                     impl_trait.def_id.0.into(),
                     self_param,
-                    *assoc_name,
+                    written_name(db, *assoc_name, hygiene),
                 );
                 let assoc_type =
-                    match self.resolved_shorthand(AssocTypeQself::Param(self_param), resolution.clone()) {
+                    match self.resolved_shorthand(AssocTypeQself::Param(self_param), resolution) {
                         Ok(it) => it,
                         Err(error) => return error,
                     };
@@ -585,7 +600,12 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                     .get_with(|(assoc_type, trait_args)| (*assoc_type, trait_args.as_ref()))
                     .skip_binder();
                 if let Some((AdtId::EnumId(enum_), _)) = ty.as_adt()
-                    && let Some(variant) = enum_.enum_variants(db).variant(assoc_name)
+                    && let Some(variant) = hir_def::signatures::EnumVariants::variant_written(
+                        db,
+                        enum_,
+                        assoc_name,
+                        self.path.segment_hygiene(self.current_segment_idx).syntax_context(),
+                    )
                 {
                     let segment = self.current_segment_u32();
                     self.on_diagnostic(PathLoweringDiagnostic::AmbiguousAssociatedItem {
@@ -625,10 +645,14 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
     /// parameters as `ty`'s arguments give them. An impl of `ty` itself is matched, or one of
     /// its type with the impl's parameters in their order (`impl<T> Foo<T>`); an alias with
     /// parameters of its own is not.
-    fn inherent_associated_type(&self, ty: Ty<'db>, name: &Name) -> Option<Ty<'db>> {
+    fn inherent_associated_type(&self, ty: Ty<'db>, name: &Name, hygiene: HygieneId) -> Option<Ty<'db>> {
         let (db, interner) = (self.ctx.db, self.ctx.interner);
         let (adt, args) = ty.as_adt()?;
-        let named = inherent_assoc_types(db, adt).iter().filter(|(it, _, _)| it == name);
+        // `name` keyed for each impl's items (rustc's `adjust_ident_and_get_scope` in
+        // `probe_inherent_assoc_item`), compared with each alias's binding name.
+        let named = inherent_assoc_types(db, adt).iter().filter(|(it, _, impl_)| {
+            it.unkeyed() == name.unkeyed() && *it == impl_item_name(db, *impl_, *name, hygiene)
+        });
         for &(_, alias, impl_) in named {
             let own = GenericArgs::identity_for_item(interner, impl_.into());
             let impl_args = match db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip() {
@@ -1626,8 +1650,10 @@ fn type_looks_like_const(
 
 /// The associated type aliases of the inherent impls of `adt`, for
 /// [`PathLoweringContext::inherent_associated_type`]: in the order of its crate's modules and
-/// their impls, and only each impl's first alias of a name. One read per ADT, so a lowering that
-/// looks a name up depends on this list, not on every module scope of the crate.
+/// their impls, and only each impl's first alias of a name. Each name is the alias's binding
+/// name ([`assoc_item_binding_name`]), so a `macro`'s alias and its caller's of one text are
+/// two. One read per ADT, so a lowering that looks a name up depends on this list, not on every
+/// module scope of the crate.
 #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub(crate) fn inherent_assoc_types(db: &Db, adt: AdtId) -> Box<[(Name, TypeAliasId, ImplId)]> {
     let def_map = hir_def::nameres::crate_def_map(db, adt.module(db).krate(db));
@@ -1639,11 +1665,11 @@ pub(crate) fn inherent_assoc_types(db: &Db, adt: AdtId) -> Box<[(Name, TypeAlias
                 continue;
             }
             let start = found.len();
-            for (name, item) in impl_.impl_items(db).items.iter() {
-                if let AssocItemId::TypeAliasId(alias) = *item
-                    && !found[start..].iter().any(|(it, _, _)| it == name)
-                {
-                    found.push((*name, alias, impl_));
+            for &(name, item) in impl_.impl_items(db).items.iter() {
+                let AssocItemId::TypeAliasId(alias) = item else { continue };
+                let name = assoc_item_binding_name(db, item, name);
+                if !found[start..].iter().any(|(it, _, _)| *it == name) {
+                    found.push((name, alias, impl_));
                 }
             }
         }

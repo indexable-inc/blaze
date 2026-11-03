@@ -25,19 +25,19 @@ use crate::{
 /// edits, which may renumber their ids.
 type Named = (ContentId, Vec<String>, Option<Missed>);
 
-fn named(db: &TestDB, sub: Sub) -> Named {
+fn named(db: &TestDB, sub: &Sub) -> Named {
     (sub.digest, sub.refs.iter().map(|&it| key::path(db, it)).collect(), sub.missed)
 }
 
 fn interface(db: &TestDB, path: &str) -> Named {
-    named(db, Cx::new(db).interface(item(db, path)))
+    named(db, &Cx::new(db).interface(item(db, path)))
 }
 
 #[track_caller]
 fn body(db: &TestDB, path: &str) -> Named {
     let id = item(db, path);
     let code = Cx::new(db).body(id).unwrap_or_else(|| panic!("`{path}` has no body"));
-    named(db, code.sub)
+    named(db, &code.sub)
 }
 
 fn closures(db: &TestDB, f: ItemId) -> Vec<InternedClosureId<'_>> {

@@ -523,6 +523,8 @@ fn the_free_wait_suspends_the_running_job() {
 
 /// Jobs on fibers asking one key of `pump::Flights`: one runs it, the others suspend on its
 /// flight (on one core, so a waiter that held its thread would hang) and get its value.
+const ONE_KEY_ASKERS: usize = 6;
+
 struct OneKey {
     flights: crate::pump::Flights<u32>,
     runs: AtomicU32,
@@ -547,8 +549,11 @@ impl Work for &'static OneKey {
             OneKeyJob::Ask => {
                 let value = self.flights.get_or_run(key(1), || {
                     self.runs.fetch_add(1, Ordering::Relaxed);
-                    let at = cx.now() + 1_000_000;
-                    cx.wait(Wait::Until(at)).expect("a timed wait closes no cycle");
+                    // Until every other asker waits: a fixed while would let a slow (loaded)
+                    // driver run an asker only after the run ended, to run the key again.
+                    while self.flights.waiters(key(1)) < ONE_KEY_ASKERS - 1 {
+                        cx.wait(Wait::Until(cx.now() + 100_000)).expect("a timed wait closes no cycle");
+                    }
                     Ok(5)
                 });
                 self.got.lock().push(value.expect("the run is not cancelled"));
@@ -566,10 +571,10 @@ fn a_key_asked_on_fibers_runs_once_and_its_waiters_suspend() {
         got: Mutex::new(Vec::new()),
     });
     let driver = start(Cores::flat(1).unwrap(), work);
-    driver.spawn(OneKeyJob::Root(6), Spawn::root());
+    driver.spawn(OneKeyJob::Root(ONE_KEY_ASKERS as u32), Spawn::root());
     driver.join().unwrap();
     assert_eq!(work.runs.load(Ordering::Relaxed), 1, "one run of the key");
-    assert_eq!(*work.got.lock(), vec![5; 6], "every asker got its value");
+    assert_eq!(*work.got.lock(), vec![5; ONE_KEY_ASKERS], "every asker got its value");
     assert_eq!(work.flights.running(), 0);
 }
 

@@ -19,8 +19,9 @@
 //!   own lane, and its time is the overlap of its open stretch with its lane's intervals. A
 //!   span's uncovered time is its running time under no child span; it is a column, never
 //!   folded into another.
-//! - A job's spawner is the job its `started` or `ran` row's `by` names: the critical path
-//!   crosses from a job's start to it.
+//! - A job's spawner is the job its `started` or `ran` row's `by` names, else the lane of the
+//!   span its `job` span names as its `creator` (a job given by a thread on no fiber, the
+//!   daemon's loop): the critical path crosses from a job's start to it.
 
 pub mod html;
 pub mod load;
@@ -174,6 +175,9 @@ pub struct SpanIn {
     /// For a `job` span: the job it is of, as a switch's `job` (or a `started` row's
     /// `began_as`) names it.
     pub job: Option<u64>,
+    /// For a `job` span: the span its giver was inside as it gave the job to the pool, as
+    /// `span_id` names it in the same process ([`crate::span::col::Creator`]).
+    pub creator: Option<u64>,
     pub start_ns: i64,
     pub dur_ns: i64,
     /// `spans.self_cpu_ns`: its job's CPU while it was open, less the spans under it; `None`
@@ -285,6 +289,7 @@ impl Input {
                 awaits: it.get::<col::Awaits>().and_then(|it| it.text()).map(|it| it.to_string()),
                 owner: it.get::<col::Owner>(),
                 job: it.get::<col::OfJob>(),
+                creator: it.get::<col::Creator>(),
                 start_ns: it.start_ns,
                 dur_ns: it.dur_ns,
                 self_cpu_ns: it.self_cpu_ns.and_then(|it| i64::try_from(it).ok()),
@@ -316,7 +321,7 @@ impl Input {
 
 #[derive(Debug)]
 pub enum TimeError {
-    /// The history has no build that ended.
+    /// The history has no build that ended or whose daemon died.
     NoBuild,
     /// The build has no switch and no span.
     Empty { build: u64 },
@@ -331,12 +336,24 @@ pub enum TimeError {
     /// A derived table could not be written into the history.
     History(crate::history::HistoryError),
     Io { path: std::path::PathBuf, doing: &'static str, error: std::io::Error },
+    /// The rows of build `build` come from more than one process: each daemon numbered a build
+    /// so in one history. Read as one build, their workers and windows would be summed.
+    ManyProcesses { build: u64, processes: Vec<OfProcess> },
+}
+
+/// A process's rows of a build ([`TimeError::ManyProcesses`]): how many, and from when to when.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OfProcess {
+    pub process: u32,
+    pub rows: u64,
+    pub from_ns: i64,
+    pub to_ns: i64,
 }
 
 impl fmt::Display for TimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TimeError::NoBuild => f.write_str("the history has no build that ended: name one with --build"),
+            TimeError::NoBuild => f.write_str("the history has no build that ended or whose daemon died: name one with --build"),
             TimeError::Empty { build } => write!(f, "build {build} has no switch and no span in the history"),
             TimeError::BadSwitch { event, why } => write!(f, "a switches row of event `{event}` can't be read: {why}"),
             TimeError::BadColumn { table, column, why } => write!(f, "the column {table}.{column} {why}"),
@@ -344,6 +361,20 @@ impl fmt::Display for TimeError {
             TimeError::Arrow { table, error } => write!(f, "making the rows of the derived table {table}: {error}"),
             TimeError::History(error) => write!(f, "writing a derived table into the history: {error}"),
             TimeError::Io { path, doing, error } => write!(f, "{doing} {}: {error}", path.display()),
+            TimeError::ManyProcesses { build, processes } => {
+                write!(f, "build {build}'s rows come from {} processes, so they are no one build:", processes.len())?;
+                for (i, it) in processes.iter().enumerate() {
+                    let secs = |ns: i64| ns as f64 / 1e9;
+                    let sep = if i == 0 { " " } else { "; " };
+                    write!(f, "{sep}pid {} wrote {} rows from {:.1} s to {:.1} s", it.process, it.rows, secs(it.from_ns), secs(it.to_ns))?;
+                }
+                write!(
+                    f,
+                    ". Each was a daemon that numbered a build {build} in this history (a blaze before 2026-11-03 named a \
+                     timer's flush of a build that never ended 0, so the next daemon took its number again); a build's number \
+                     is its identity (rule 18), so this one is refused rather than read as one build of all their workers"
+                )
+            }
         }
     }
 }
@@ -566,8 +597,12 @@ pub struct Lane {
     pub begin: Begin,
     pub end: End,
     /// The lane of the job that gave it to the pool, when its `started` or `ran` row names one
-    /// the model has.
+    /// the model has; else the lane of its `creator` span.
     pub spawner: Option<usize>,
+    /// The span it was given inside, when no job gave it and its `job` span names one the
+    /// model has ([`SpanIn::creator`]): its giver's work stood on the path until that span's
+    /// end.
+    pub creator: Option<usize>,
     /// How long it waited for a core before it began, from its pool's submit: its `started` or
     /// `ran` row's `queued_ns`. `None` when the row does not say.
     pub queued_ns: Option<i64>,
@@ -725,6 +760,10 @@ pub struct Anomalies {
     pub runs_cut: u64,
     /// A `job` span naming a job with no lane: laid on its thread's lane.
     pub spans_of_no_lane: u64,
+    /// A job given by no job whose `job` span names a creator span that is not among the
+    /// rows (one that began before the build, or was lost): the critical path ends at its
+    /// start.
+    pub creators_unread: u64,
 }
 
 /// A pool worker: a thread whose switches put a job on it or say it idled.
@@ -823,6 +862,7 @@ impl Model {
             model.lanes[lane].spawner = model.job_lane(process, by).filter(|&it| it != lane);
         }
         model.lay_spans();
+        model.link_creators();
         model.resolve_waits(&ready_by);
         model.time_spans();
         events.sort_by_key(|it| (it.process, it.t_ns, it.thread));
@@ -1184,7 +1224,8 @@ impl Builder {
         }
         let fiber = rows.iter().find(|it| matches!(it.event, Event::Started | Event::Resumed | Event::Ran)).map(|it| it.fiber);
         // alloc: a lane's sums, once a lane a model
-        let mut lane = Lane { id, fiber, begin, end, spawner: None, queued_ns, intervals, spans: Vec::new(), before: Vec::new() };
+        let mut lane =
+            Lane { id, fiber, begin, end, spawner: None, creator: None, queued_ns, intervals, spans: Vec::new(), before: Vec::new() };
         lane.sum();
         self.lanes.push(lane);
     }
@@ -1299,6 +1340,40 @@ impl Model {
         }
     }
 
+    /// Gives each job lane no job gave (its `started` or `ran` row names no spawner the model
+    /// has) the lane of the span its `job` span names as its creator: a job the daemon's loop
+    /// gave, on no fiber, stands on the loop's work, which the critical path crosses into.
+    fn link_creators(&mut self) {
+        let wanted = |lane: &Lane| lane.spawner.is_none() && matches!(lane.id, LaneId::Job { .. });
+        if !self.lanes.iter().any(wanted) {
+            return;
+        }
+        // alloc: once a model
+        let mut index: HashMap<(u32, u64), usize, Global> = HashMap::new_in(Global);
+        for (i, it) in self.spans.iter().enumerate() {
+            index.insert((it.process, it.span_id), i);
+        }
+        for l in 0..self.lanes.len() {
+            if !wanted(&self.lanes[l]) {
+                continue;
+            }
+            let named = self.lanes[l].spans.iter().find_map(|&i| {
+                let span = &self.spans[i];
+                // Its own `job` span, not that of a job run inside it.
+                span.job.filter(|&job| self.job_lane(span.process, job) == Some(l))?;
+                span.creator.map(|creator| (span.process, creator))
+            });
+            let Some(named) = named else { continue };
+            let Some(&creator) = index.get(&named) else {
+                self.anomalies.creators_unread += 1;
+                continue;
+            };
+            let Some(lane) = self.span_time[creator].lane.filter(|&it| it != l) else { continue };
+            self.lanes[l].spawner = Some(lane);
+            self.lanes[l].creator = Some(creator);
+        }
+    }
+
     /// The lane of a thread no switch puts a job on: running while any of its spans is open,
     /// parked-or-queued inside its outermost `wait` spans, unrecorded between its spans.
     fn thread_lane(&mut self, process: u32, thread: u32, spans: Vec<usize>) {
@@ -1359,7 +1434,7 @@ impl Model {
         }
         let id = LaneId::Thread { process, thread };
         let mut lane =
-            Lane { id, fiber: None, begin: Begin::FirstSpan, end: End::LastSpan, spawner: None, queued_ns: None, intervals, spans, before: Vec::new() };
+            Lane { id, fiber: None, begin: Begin::FirstSpan, end: End::LastSpan, spawner: None, creator: None, queued_ns: None, intervals, spans, before: Vec::new() };
         lane.sum();
         self.lanes.push(lane);
     }
@@ -1437,11 +1512,17 @@ impl Model {
 }
 
 /// Marks each of `lane`'s intervals with the innermost of its spans open just before it ended.
+/// Linear in its spans: a span that closed leaves the stack of open ones as it reaches the top.
+/// (Until 2026-11-03 each close searched the stack and removed from its middle: a thread lane
+/// with millions of spans in one running stretch held them all open at once, and `blaze slow`
+/// ran for more than ten minutes on a self-build whose recorder lost no rows.)
 fn mark_inside(lane: &mut Lane, spans: &[SpanIn]) {
-    // alloc: a lane's spans by end, once a lane a model
-    let mut by_end = lane.spans.clone();
-    by_end.sort_by_key(|&i| spans[i].end_ns());
-    // alloc: a lane's open spans, once a lane a model
+    // alloc: a lane's spans' places by end, once a lane a model
+    let mut by_end: Vec<usize> = (0..lane.spans.len()).collect();
+    by_end.sort_by_key(|&at| spans[lane.spans[at]].end_ns());
+    // alloc: whether each of a lane's spans closed, once a lane a model
+    let mut ended = vec![false; lane.spans.len()];
+    // alloc: a lane's open spans' places, once a lane a model
     let mut open: Vec<usize> = Vec::new();
     let (mut opened, mut closed) = (0, 0);
     for interval in &mut lane.intervals {
@@ -1449,17 +1530,18 @@ fn mark_inside(lane: &mut Lane, spans: &[SpanIn]) {
         while let Some(&i) = lane.spans.get(opened)
             && spans[i].start_ns < end
         {
-            open.push(i);
+            open.push(opened);
             opened += 1;
         }
-        while let Some(&i) = by_end.get(closed)
-            && spans[i].end_ns() < end
+        while let Some(&at) = by_end.get(closed)
+            && spans[lane.spans[at]].end_ns() < end
         {
-            if let Some(at) = open.iter().rposition(|&it| it == i) {
-                open.remove(at);
-            }
+            ended[at] = true;
             closed += 1;
         }
-        interval.inside = open.last().copied();
+        while open.last().is_some_and(|&at| ended[at]) {
+            open.pop();
+        }
+        interval.inside = open.last().map(|&at| lane.spans[at]);
     }
 }

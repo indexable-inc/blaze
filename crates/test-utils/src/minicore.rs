@@ -551,6 +551,7 @@ pub mod mem {
     // endregion:discriminant
 
     // region:offset_of
+    #[allow_internal_unstable(builtin_syntax, core_intrinsics)]
     pub macro offset_of($Container:ty, $($fields:expr)+ $(,)?) {
         // The `{}` is for better error messages
         {builtin # offset_of($Container, $($fields)+)}

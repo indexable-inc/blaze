@@ -27,7 +27,7 @@ use super::super::super::*;
 
 /// Every function of the crate, in its modules and in the blocks of their bodies, and for each
 /// path of its body what it resolves to in the value namespace.
-fn check_resolutions(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check_resolutions(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let db = fixture::db(ra_fixture).into_db();
     let krate = db.fetch_test_crate();
     let mut functions = Vec::new();
@@ -114,7 +114,7 @@ fn main() {
     (a, b);
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn main -> ():
                 DLSYM -> static = 1
                 DLSYM -> static = 2
@@ -159,7 +159,7 @@ fn main() {
     opaque;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn main -> ():
                 Transparent -> struct Transparent
                 SemiOpaque -> struct SemiOpaque
@@ -196,7 +196,7 @@ fn main() {
     bar::m!(f);
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn main -> ():
                 baz::f -> fn f -> ()
                 f -> fn f -> i32
@@ -224,7 +224,7 @@ mod user {
     fn h() -> () { f(); }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn h -> ():
                 f -> fn f -> u32
             fn g -> bool:
@@ -265,7 +265,7 @@ mod use_site {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn test -> ():
                 g -> fn g -> u16
                 f -> fn f -> u8
@@ -289,7 +289,7 @@ fn main() {
     x::g();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn main -> ():
                 x -> local x
                 x::g -> fn g -> usize
@@ -408,7 +408,7 @@ fn main() {
     let _: i64 = foo::f();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn main -> ():
                 foo::f -> fn f -> u32
                 foo::f -> fn f -> u64
@@ -445,7 +445,7 @@ fn main() {
     let _ = caller!();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn main -> ():
                 own -> fn own -> u8
                 handed -> fn handed -> u16
@@ -480,7 +480,7 @@ fn main() {
 //- /dep.rs crate:dep
 pub fn f() -> u8 { 0 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn in_m -> ():
                 own::f -> fn f -> u8
                 handed::f -> fn f -> u8
@@ -520,7 +520,7 @@ fn main() {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn main -> ():
                 g -> fn g -> ()
                 f -> unresolved
@@ -532,11 +532,11 @@ fn main() {
 
 /// rustc's tests/ui/hygiene/globs.rs, its second part: `use super::*` in modules that nested
 /// `macro`s write imports the names of the module around them as each `macro`'s own names see
-/// them, and a name handed in from outside a glob's expansion is not imported for it. rustc's
-/// `mod test2` part, which calls the nested `macro`s from a child module, is left out: its
-/// `use super::*` reaches `foo` only through rustc's hygienic `super` (`resolve_self`, which
-/// walks to the module the `macro` was defined in), and blaze resolves `super` from the module
-/// the path sits in.
+/// them, and a name handed in from outside a glob's expansion is not imported for it. In `mod
+/// test2`, which calls the nested `macro`s from a child module, `use super::*` and `super::$j`
+/// reach `foo` by hygienic `super` (rustc's `resolve_self`: `test2`'s `mod` is not written by
+/// the `macro`, so the walk goes on to the module defining it), as `globs.stderr` has it: only
+/// the `f` handed in at `test2` (its 66:17) is not found.
 #[test]
 fn globs_in_modules_nested_macros_write() {
     check_resolutions(
@@ -580,13 +580,29 @@ macro n($i:ident) {
 
         n!(f);
         n_with_super!(f);
+        mod test2 {
+            super::n! {
+                f
+            }
+            super::n_with_super! {
+                f
+            }
+        }
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn g -> ():
                 f -> fn f -> u32
                 f -> fn f -> ()
+            fn g -> ():
+                f -> fn f -> u32
+                f -> fn f -> ()
+                f -> unresolved
+            fn g -> ():
+                f -> fn f -> u32
+                f -> fn f -> ()
+                super::f -> fn f -> ()
             fn g -> ():
                 f -> fn f -> u32
                 f -> fn f -> ()
@@ -603,7 +619,7 @@ macro n($i:ident) {
 /// const its signature writes, the parameter it names. A parameter is `name#index` in its list
 /// (lifetimes and type or const parameters counted apart), `name*#index` when its name is keyed
 /// ([`crate::nameres::param_name`]: an opaque `macro` wrote it).
-fn check_generic_params(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check_generic_params(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     use crate::{
         GenericDefId, LifetimeParamId, TypeOrConstParamId,
         hir::{
@@ -844,7 +860,7 @@ mod const_params {
 
 fn main() {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             main: <>() -> ()
             f: <T#0, T*#1>(T#0, T*#1) -> (T#0, bool)
                 T#0: Clone
@@ -888,9 +904,78 @@ macro_rules! m {
 m!(T);
 fn g<'a, T, const N: usize>(t: &'a [T; N]) -> &'a T { &t[0] }
 "#,
-        expect![[r#"
+        &expect![[r#"
             f: <T#0>(T#0) -> T#0
             g: <'a#0, T#0, const N#1>(&'a#0 [T#0; N#1]) -> &'a#0 T#0
+        "#]],
+    );
+}
+
+#[test]
+fn a_crate_root_a_macro_writes_is_its_crates() {
+    // rustc's `resolve_crate_root`: the `crate` of an import a `macro` of another crate writes,
+    // and in 2015 its `::` and the `{{root}}` a plain import path gets, name the root of the
+    // crate defining the `macro` (the last mark `adjust` removes), not the call site's. Each
+    // `y` is `foo`'s `fn x`, not `main`'s module or `inner`'s unit struct; `e::z` is `main`'s
+    // module `x`, though `d`, the module defining `m2`, is not around `e`. The pinned rustc
+    // compiles this program.
+    check_resolutions(
+        r#"
+//- /main.rs crate:main edition:2015 deps:foo
+#![feature(decl_macro)]
+pub mod x { pub fn here() {} }
+foo::inner::m!(y1, y2, y3);
+pub mod d {
+    pub macro m2($g:ident) { pub use x as $g; }
+}
+pub mod e { crate::d::m2!(z); }
+fn main() { y1(); y2(); y3(); e::z::here(); }
+
+//- /lib.rs crate:foo edition:2015
+#![feature(decl_macro)]
+pub fn x() {}
+pub mod inner {
+    pub struct x;
+    pub macro m($a:ident, $b:ident, $c:ident) {
+        pub use crate::x as $a;
+        pub use ::x as $b;
+        pub use x as $c;
+    }
+}
+"#,
+        &expect![[r#"
+            fn main -> ():
+                y1 -> fn x -> ()
+                y2 -> fn x -> ()
+                y3 -> fn x -> ()
+                e::z::here -> fn here -> ()
+        "#]],
+    );
+}
+
+#[test]
+fn each_later_super_a_macro_writes_starts_from_its_own_context() {
+    // rustc's `resolve_path` of each `super`: the first shares the context `resolve_self`
+    // moved (here past the crate root, to `d`, the module defining `m`, with its mark removed),
+    // and each later one starts again from its own keyword's context, so its `resolve_self`
+    // from the crate root goes past it to `d` again. `g` is `d`'s struct `f`, not the root's
+    // `fn f`. The pinned rustc compiles this program.
+    check_resolutions(
+        r#"
+#![feature(decl_macro)]
+pub mod a {
+    pub mod d {
+        pub struct f;
+        pub macro m($g:ident) { pub use super::super::f as $g; }
+        pub mod e { super::m!(g); }
+    }
+}
+pub fn f() {}
+fn main() { let _: a::d::f = a::d::e::g; }
+"#,
+        &expect![[r#"
+            fn main -> ():
+                a::d::e::g -> struct f
         "#]],
     );
 }

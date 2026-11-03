@@ -178,3 +178,37 @@ fn a_reformat_changes_a_table_and_not_its_anchor() {
     assert_ne!(before.rows, after.rows, "each two lines on");
     assert!(before.rows.iter().zip(&after.rows).all(|(was, now)| now.1 == was.1 + 2));
 }
+
+/// A body's positions are found by plain functions over its memos: each span's is the one
+/// found from where the body is in its file, and placing them makes no memo per span.
+#[test]
+fn positions_are_placed_without_a_memo_per_span() {
+    let fx = fixture::db(SPANNED);
+    let _ = fx.only_file();
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let owner = DefWithBodyId::FunctionId(function(&db, "f"));
+        let mut found = None;
+        let executed = db.log_executed(|| found = Some(positions(&db, owner).clone().unwrap()));
+        let found = found.expect("the positions");
+        assert!(executed.iter().any(|it| it == "positions"), "the log sees queries: {executed:#?}");
+        for per_span in ["source_place", "row_place", "source_location_in_file", "row_location_in_file"] {
+            assert!(!executed.iter().any(|it| it == per_span), "a memo of {per_span}: {executed:#?}");
+        }
+
+        let table = |t: usize| &found.rows[found.starts[t] as usize..found.starts[t + 1] as usize];
+        let store = BodyStore::of(&db, owner);
+        let in_file = |span: MirSpan| hir_ty_mir::mir::location::source_location_in_file(&db, owner, span);
+        let exprs: Vec<MirSpan> = store.expr_ids().map(MirSpan::ExprId).collect();
+        let pats: Vec<MirSpan> = store.pat_ids().map(MirSpan::PatId).collect();
+        for (spans, rows) in [(exprs, table(code::EXPRS)), (pats, table(code::PATS))] {
+            assert_eq!(spans.len(), rows.len());
+            for (span, row) in spans.into_iter().zip(rows) {
+                assert_eq!(Some(*row), in_file(span), "{span:?}");
+            }
+        }
+        let root = store.expr_ids().position(|it| it == store.root_expr()).expect("the root");
+        // The body's block, on the first line, from its 25th column.
+        assert_eq!((table(code::EXPRS)[root].1, table(code::EXPRS)[root].2), (1, 25));
+    });
+}

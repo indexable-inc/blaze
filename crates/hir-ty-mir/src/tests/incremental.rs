@@ -30,7 +30,7 @@ fn foo() -> i32 {
             });
         },
         &[("infer_body_query", 1)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             [
                 "source_root_crates",
                 "infer_body_query",
@@ -80,7 +80,7 @@ fn foo() -> i32 {
             });
         },
         &[("infer_body_query", 0)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             [
                 "file_outline",
                 "signature_syntax",
@@ -121,7 +121,7 @@ fn baz() -> i32 {
             });
         },
         &[("infer_body_query", 3)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             [
                 "source_root_crates",
                 "infer_body_query",
@@ -200,7 +200,7 @@ fn baz() -> i32 {
             });
         },
         &[("infer_body_query", 1)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             [
                 "file_outline",
                 "signature_syntax",
@@ -241,7 +241,7 @@ $0",
             TraitImpls::for_crate(&db, module.krate(&db));
         },
         &[("TraitImpls::for_crate", 1)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             [
                 "source_root_crates",
                 "TraitImpls::for_crate",
@@ -273,7 +273,7 @@ pub struct NewStruct {
             TraitImpls::for_crate(&db, module.krate(&db));
         },
         &[("TraitImpls::for_crate", 0), ("trait_bodies", 0)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             []
         "#]],
     );
@@ -303,7 +303,7 @@ $0",
             TraitImpls::for_crate(&db, module.krate(&db));
         },
         &[("TraitImpls::for_crate", 1)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             [
                 "source_root_crates",
                 "TraitImpls::for_crate",
@@ -336,7 +336,7 @@ pub enum SomeEnum {
             TraitImpls::for_crate(&db, module.krate(&db));
         },
         &[("TraitImpls::for_crate", 0), ("trait_bodies", 0)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             []
         "#]],
     );
@@ -366,7 +366,7 @@ $0",
             TraitImpls::for_crate(&db, module.krate(&db));
         },
         &[("TraitImpls::for_crate", 1)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             [
                 "source_root_crates",
                 "TraitImpls::for_crate",
@@ -396,7 +396,7 @@ fn bar() -> f32 {
             TraitImpls::for_crate(&db, module.krate(&db));
         },
         &[("TraitImpls::for_crate", 0), ("trait_bodies", 0)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             []
         "#]],
     );
@@ -430,7 +430,7 @@ $0",
             TraitImpls::for_crate(&db, module.krate(&db));
         },
         &[("TraitImpls::for_crate", 1)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             [
                 "source_root_crates",
                 "TraitImpls::for_crate",
@@ -468,7 +468,7 @@ impl SomeStruct {
             TraitImpls::for_crate(&db, module.krate(&db));
         },
         &[("TraitImpls::for_crate", 0), ("trait_bodies", 0)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             []
         "#]],
     );
@@ -519,7 +519,7 @@ fn main() {
         },
         // FIXME: What does this test check for now? trait_solve_shim is no longer a query
         &[("trait_solve_shim", 0)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             [
                 "source_root_crates",
                 "Body::of",
@@ -612,7 +612,7 @@ fn main() {
             }
         },
         &[("trait_solve_shim", 0)],
-        expect_test::expect![[r#"
+        &expect_test::expect![[r#"
             [
                 "file_body_syntax",
                 "Body::of",
@@ -637,7 +637,7 @@ fn execute_assert_events(
     db: &TestDB,
     f: impl FnOnce(),
     required: &[(&str, usize)],
-    expect: Expect,
+    expect: &Expect,
 ) {
     blaze_query::db::attach(db, || {
         let events = db.log(f);

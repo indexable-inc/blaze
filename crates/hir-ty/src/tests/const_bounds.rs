@@ -106,3 +106,47 @@ fn an_associated_type_and_an_opaque_imply_their_const_bounds() {
         assert!(!has_host_effect(opaque.loc(&db).bounds(&db).all_bounds().skip_binder()));
     });
 }
+
+const RPITIT_FIXTURE: &str = r#"
+//- minicore: sized
+#![feature(const_trait_impl)]
+const trait Bar {}
+const trait Foo {
+    fn method(self) -> impl [const] Bar;
+}
+"#;
+
+/// rustc's `is_conditionally_const` and `explicit_implied_const_bounds` of a const trait's
+/// RPITIT (`const-cond-for-rpitit.rs`): conditionally const, as an associated type of the
+/// trait is, with the `[const] Bar` written on its `impl Trait`, so under `T: [const] Foo` the
+/// value of `T::method` is `[const] Bar`.
+#[test]
+fn a_const_traits_impl_trait_implies_its_const_bounds() {
+    use rustc_type_ir::Interner as _;
+    let db = fixture::db(RPITIT_FIXTURE).into_db();
+    blaze_query::db::attach(&db, || {
+        let bar = trait_named(&db, "Bar");
+        let method = trait_named(&db, "Foo")
+            .trait_items(&db)
+            .items
+            .iter()
+            .find_map(|(_, item)| match *item {
+                hir_def::AssocItemId::FunctionId(it) => Some(it),
+                _ => None,
+            })
+            .expect("`Foo` has `method`");
+        let interner = crate::next_solver::DbInterner::new_no_crate(&db);
+        let item = crate::next_solver::SolverDefId::RpititId(crate::rpitit::RpititId {
+            function: method,
+            idx: ImplTraitIdx::from_raw(la_arena::RawIdx::from_u32(0)),
+        });
+        assert!(interner.alias_has_const_conditions(item), "the item of a const trait is");
+        let implied: Vec<TraitId> = interner // alloc: test
+            .explicit_implied_const_bounds(item)
+            .skip_binder()
+            .into_iter()
+            .map(|it| it.skip_binder().def_id.0)
+            .collect();
+        assert_eq!(implied, [bar], "`impl [const] Bar` implies `[const] Bar`");
+    });
+}

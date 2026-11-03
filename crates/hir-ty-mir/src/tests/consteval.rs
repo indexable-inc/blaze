@@ -2912,6 +2912,7 @@ fn discriminants_count_in_signed_and_unsigned_reprs() {
 #[test]
 fn implicit_discriminant_past_the_repr_type_is_an_error() {
     // rustc's E0370, which blaze-diagnostics reports: `B` is not silently 256.
+    #[expect(clippy::needless_pass_by_value, reason = "a `check_fail` callback, which `check_fail` hands the error by value")]
     fn overflowed(e: ConstEvalError<'_>) -> bool {
         matches!(e, ConstEvalError::MirLowerError(MirLowerError::HasErrors))
     }

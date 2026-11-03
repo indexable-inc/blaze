@@ -50,6 +50,10 @@ pub(crate) struct Lints {
     /// crate's graph ([`hir_ty_suspend::Unchecked`], said), which the driver refuses the crate's
     /// check with: a lint that reads an empty walk would find nothing, silently.
     pub(crate) unchecked: Option<String>,
+    /// The first path whose resolution looked up an item the analysis' ast id map does not
+    /// hold ([`hir::NotInAstIdMap`], said), which the driver refuses the crate's check with:
+    /// a bug in the analysis, never a path resolved to nothing.
+    pub(crate) not_in_map: Option<String>,
 }
 
 pub(crate) type BodyLints = Lints;

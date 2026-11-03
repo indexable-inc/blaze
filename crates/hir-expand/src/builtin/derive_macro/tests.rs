@@ -407,7 +407,7 @@ fn reference_from(
     ExpandResult::ok(reference::expand_simple_derive_with_parsed(
         span,
         info,
-        trait_path,
+        &trait_path,
         |_| {
             let value = value();
             quote! {span =>
@@ -416,7 +416,7 @@ fn reference_from(
             }
         },
         false,
-        tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+        &tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
     ))
 }
 
@@ -447,10 +447,10 @@ fn coerce_pointee_impls_match_nested_quotes() {
         reference::expand_simple_derive_with_parsed(
             span,
             reference::parse_adt_from_syntax(&adt, &map, span).expect("an item"),
-            trait_path,
+            &trait_path,
             |_| quote! {span => },
             false,
-            quote! {span => __S },
+            &quote! {span => __S },
         )
     };
     let dispatch_from_dyn =
@@ -680,7 +680,7 @@ impl Copied<'_> {
             "{what}: the copied `#` keeps the item's edition"
         );
 
-        let as_const = super::as_const_impls(frame, with);
+        let as_const = super::as_const_impls(frame, &with);
         assert_eq!(
             written(&as_const).matches(&format!("{copied}constimpl")).count(),
             consts,
@@ -1026,10 +1026,10 @@ fn derived_impls_start_with_automatically_derived() {
         let (_, plain) = derive(frame, &source, adt_view(&parse), span);
         let (_, again) = derive(frame, &source, adt_view(&parse), span);
         assert_eq!(plain.err, None, "{name}");
-        let marked = super::with_automatically_derived(frame, span, again.value);
+        let marked = super::with_automatically_derived(frame, span, &again.value);
         check(name, &plain.value, &marked);
         let impls = written(&plain.value).matches("impl").count();
-        let full = super::as_const_impls(frame, super::with_item_attrs(frame, &input, marked));
+        let full = super::as_const_impls(frame, &super::with_item_attrs(frame, &input, marked));
         assert_eq!(
             written(&full).matches(&format!("{marker}#[allow(dead_code)]")).count(),
             impls,
@@ -1050,7 +1050,7 @@ fn derived_impls_start_with_automatically_derived() {
     let plain = super::from_derive(frame, span, adt_view(&parse), &map);
     let again = super::from_derive(frame, span, adt_view(&parse), &map);
     assert_eq!(plain.err, None, "From");
-    check("From", &plain.value, &super::with_automatically_derived(frame, span, again.value));
+    check("From", &plain.value, &super::with_automatically_derived(frame, span, &again.value));
 
     let plain = super::coerce_pointee_derive(frame, span, adt_view(&parse), &map);
     let again = super::coerce_pointee_derive(frame, span, adt_view(&parse), &map);
@@ -1059,6 +1059,6 @@ fn derived_impls_start_with_automatically_derived() {
     check(
         "CoercePointee",
         &plain.value,
-        &super::with_automatically_derived(frame, span, again.value),
+        &super::with_automatically_derived(frame, span, &again.value),
     );
 }

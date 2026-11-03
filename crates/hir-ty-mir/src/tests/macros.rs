@@ -62,7 +62,7 @@ fn infer_macros_expanded() {
             let x = foo!(1,2);
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..17 '{Foo(v...,2,])}': Foo
             !1..4 'Foo': fn Foo({unknown}) -> Foo
             !1..16 'Foo(vec![1,2,])': Foo
@@ -95,7 +95,7 @@ fn infer_legacy_textual_scoped_macros_expanded() {
             let y = crate::foo!(1,2);
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..17 '{Foo(v...,2,])}': Foo
             !1..4 'Foo': fn Foo({unknown}) -> Foo
             !1..16 'Foo(vec![1,2,])': Foo
@@ -126,7 +126,7 @@ fn infer_path_qualified_macros_expanded() {
             let y = m::bar!();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..5 '42i32': i32
             !0..5 '42i32': i32
             110..163 '{     ...!(); }': ()
@@ -168,7 +168,7 @@ fn expr_macro_def_expanded_in_various_places() {
             spam!() + spam!();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..6 '1isize': isize
             !0..6 '1isize': isize
             !0..6 '1isize': isize
@@ -262,7 +262,7 @@ fn expr_macro_rules_expanded_in_various_places() {
             spam!() + spam!();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..6 '1isize': isize
             !0..6 '1isize': isize
             !0..6 '1isize': isize
@@ -333,7 +333,7 @@ fn expr_macro_expanded_in_stmts() {
             id! { let a = (); }
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !3..4 'a': ()
             !5..7 '()': ()
             57..84 '{     ...); } }': ()
@@ -360,7 +360,7 @@ fn recursive_macro_expanded_in_stmts() {
             let b = a;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !3..4 'a': i32
             !5..6 '3': i32
             196..237 '{     ...= a; }': ()
@@ -383,7 +383,7 @@ fn recursive_inner_item_macro_rules() {
             let a = blub!();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..1 '1': i32
             107..143 '{     ...!(); }': ()
             129..130 'a': i32
@@ -405,7 +405,7 @@ fn infer_macro_defining_block_with_items() {
             let _a = foo!();
         }
     "#,
-        expect![[r#"
+        &expect![[r#"
             !15..18 '{0}': usize
             !16..17 '0': usize
             !0..24 '{fnbar...bar()}': usize
@@ -439,7 +439,7 @@ fn infer_type_value_macro_having_same_name() {
             let foo = foo::foo!(42i32);
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..5 '42i32': i32
             170..205 '{     ...32); }': ()
             180..183 'foo': i32
@@ -619,7 +619,7 @@ fn infer_type_value_non_legacy_macro_use_as() {
             let _a  = f();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             158..163 '{ 0 }': u64
             160..161 '0': u64
             174..196 '{     ...f(); }': ()
@@ -641,7 +641,7 @@ fn infer_local_macro() {
             let _a  = foo!();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..6 '1usize': usize
             10..89 '{     ...!(); }': ()
             74..76 '_a': usize
@@ -685,7 +685,7 @@ fn infer_builtin_macros_line() {
             let x = line!();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..4 '5u32': u32
             63..87 '{     ...!(); }': ()
             73..74 'x': u32
@@ -704,7 +704,7 @@ fn infer_builtin_macros_file() {
             let x = file!();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..6 '"file"': &'static str
             63..87 '{     ...!(); }': ()
             73..74 'x': &'? str
@@ -723,7 +723,7 @@ fn infer_builtin_macros_column() {
             let x = column!();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..5 '13u32': u32
             65..91 '{     ...!(); }': ()
             75..76 'x': u32
@@ -742,7 +742,7 @@ fn infer_builtin_macros_concat() {
             let x = concat!("hello", concat!("world", "!"));
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..13 '"helloworld!"': &'static str
             65..121 '{     ...")); }': ()
             75..76 'x': &'? str
@@ -961,7 +961,7 @@ fn infer_builtin_macros_concat_with_lazy() {
             let x = concat!(hello!(), concat!("world", "!"));
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..13 '"helloworld!"': &'static str
             103..160 '{     ...")); }': ()
             113..114 'x': &'? str
@@ -1079,7 +1079,7 @@ fn macro_in_arm() {
             };
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             !0..2 '()': ()
             51..110 '{     ...  }; }': ()
             61..62 'x': u32
@@ -1113,7 +1113,7 @@ fn macro_in_type_alias_position() {
             let b: TayTo;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             147..196 '{     ...yTo; }': ()
             157..158 'a': u32
             185..186 'b': u32
@@ -1152,7 +1152,7 @@ fn nested_macro_in_type_alias_position() {
             let b: TayTo;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             259..308 '{     ...yTo; }': ()
             269..270 'a': u32
             297..298 'b': u32
@@ -1189,7 +1189,7 @@ fn macros_in_type_alias_position_generics() {
             let b: TayTo;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             228..277 '{     ...yTo; }': ()
             238..239 'a': Foo<u32, u32>
             266..267 'b': Foo<u32, u32>
@@ -1215,7 +1215,7 @@ fn macros_in_type_position() {
             let a: Bar!();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             133..155 '{     ...!(); }': ()
             143..144 'a': Foo<u32, u32>
         "#]],
@@ -1251,7 +1251,7 @@ fn macros_in_type_generics() {
             let b: TayTo;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             254..303 '{     ...yTo; }': ()
             264..265 'a': Foo<Foo<u32, u32>, Foo<u32, u32>>
             292..293 'b': Foo<Foo<u32, u32>, u32>
@@ -1281,7 +1281,7 @@ fn infinitely_recursive_macro_type() {
             let b: B;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             166..197 '{     ...: B; }': ()
             176..177 'a': {unknown}
             190..191 'b': Bar<{unknown}, u32>
@@ -1305,7 +1305,7 @@ impl S {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             34..37 'bar': u32
             52..170 '{     ...     }': S
             62..106 '#[cfg(... { } }': S
@@ -1488,7 +1488,7 @@ fn main() {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             !0..122 'builti...muto,)': ()
             !0..136 'builti...tack))': ()
             !0..449 'builti...urn),)': !

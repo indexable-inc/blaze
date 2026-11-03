@@ -789,6 +789,53 @@ fn data_only_the_old_body_reached_goes_with_it() {
     assert_eq!(image.generation(), generation, "a refused stage leaves the image as it was");
 }
 
+/// A data object with no bytes (an empty `""` or `&[]` constant, `data_id(1, b"")`) is laid
+/// out at the address the next piece starts at. Made after that neighbour, it has the higher
+/// piece ID, and a full link that wrote by address then piece ID wrote the neighbour first and
+/// read the empty one as overlapping it ("the data 22bc3285866f overlaps the piece before it":
+/// serde_derive's and time-macros' proc-macro links, selfbuild5). A piece with no bytes
+/// overlaps nothing, so the link writes both, each where the layout put it.
+#[test]
+fn a_zero_sized_piece_shares_its_address_with_the_next() {
+    use crate::symbols::SymKey;
+    // IDs picked, not hashed, so the layout's order (by data ID) is known: the empty object
+    // sorts before its neighbour, and the function lists the neighbour first, so the
+    // neighbour's piece is made first.
+    let data = |n: u8, bytes: Vec<u8>| Data { id: id(n), align: 1, bytes, relocs: Relocs::new(), writable: false };
+    let (filled, empty) = (data(0x20, vec![0x5a; 8]), data(0x10, Vec::new()));
+    // `lea rax, [rip + filled]; lea rcx, [rip + empty]; ret`
+    let code = [0x48, 0x8d, 0x05, 0, 0, 0, 0, 0x48, 0x8d, 0x0d, 0, 0, 0, 0, 0xc3];
+    let lea = |at: u32, data: &Data| rel32(at, Target::Data(data.id));
+    let start = CompiledFunction {
+        data: vec![filled.clone(), empty.clone()],
+        ..function(1, &code, vec![lea(3, &filled), lea(10, &empty)])
+    };
+    let mut image = Image::new(name(TO), output(false)).unwrap();
+    let mut disk = Disk::default();
+    let change = Change {
+        added: vec![&start],
+        names: vec![("_start".into(), Target::Direct(key(1)))],
+        debug_names: vec![(key(1), "start".into())],
+        ..Change::default()
+    };
+    disk.link(&mut image, change).expect("an empty data object overlaps nothing");
+
+    let piece = |data: &Data| {
+        let sym = image.symbols.find_id(&data.id).and_then(|it| image.symbols.find(SymKey::Data(it))).expect("its symbol");
+        let (piece, offset) = image.state.home(sym).expect("placed");
+        assert_eq!(offset, 0);
+        (piece, image.state.piece(piece).expect("live").addr)
+    };
+    let ((filled_piece, filled_at), (empty_piece, empty_at)) = (piece(&filled), piece(&empty));
+    assert!(empty_piece > filled_piece, "the empty object's piece is made after its neighbour's");
+    assert_eq!(empty_at, filled_at, "the empty object is at the address its neighbour starts at");
+
+    let linked = Linked::of(disk.file(TO));
+    let s = linked.symbol("start");
+    assert_eq!((linked.rel32(s + 3), linked.rel32(s + 10)), (filled_at, empty_at));
+    assert_eq!(linked.at(filled_at, 8), [0x5a; 8], "the neighbour's bytes, written whole");
+}
+
 /// An import's PLT stub and GOT cell go with the import. An edit that takes away the last
 /// call to `memcmp` (smallvec's `from_buf` doctest, which compares slices no more) leaves the
 /// name undefined, and its stub and cell, the linker's, made for the calls through them, go
@@ -1768,6 +1815,8 @@ mod dev_run;
 
 mod natives;
 
+mod macho_unwind;
+
 mod premap;
 
 mod sanitize;
@@ -1777,6 +1826,8 @@ mod splice;
 mod icf;
 
 mod layout;
+
+mod thunks;
 
 /// The state's columns, read and written as a stage does.
 mod columns {

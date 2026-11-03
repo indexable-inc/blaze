@@ -25,8 +25,7 @@ fn parse_cfg_if_inner<'a>(
     psess: &'a ParseSess,
     mac: &'a ast::MacCall,
 ) -> Result<Vec<ast::Item>, &'static str> {
-    let ts = mac.args.tokens.clone();
-    let mut parser = build_stream_parser(psess, ts);
+    let mut parser = build_stream_parser(psess, &mac.args.tokens);
 
     let mut items = vec![];
     let mut process_if_cfg = true;

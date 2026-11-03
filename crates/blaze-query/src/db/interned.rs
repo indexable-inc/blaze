@@ -5,13 +5,13 @@
 
 use std::{
     cell::UnsafeCell,
-    hash::{BuildHasher, Hash},
+    hash::Hash,
     marker::PhantomData,
     mem::MaybeUninit,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
-use blaze_hash::FixedState;
+use blaze_hash::LazyKey;
 use blaze_mem::{Tag, swiss};
 use parking_lot::Mutex;
 
@@ -104,20 +104,28 @@ impl Vtable {
             ids_of: Some(ids_of::<I> as fn(&Storage, u32, Id, &mut Vec<Id>)),
             made: Some(made::<I> as fn(&Storage, u32, Id) -> bool),
             memory: memory::<I>,
+            used: None,
             verify: None,
             reset: None,
-            sweep: None,
+            weighed: None,
             relocate: None,
             restamp: None,
+            write_key: None,
             drop: drop_table::<I>,
         }
     }
 }
 
+/// What every interned value's hash is keyed by, drawn at random on first use: an interned
+/// struct's fields hold what a source picks (names, paths, literals), so a hash anyone can
+/// compute would let a source pick thousands with one hash, each intern then probing past
+/// all of them under the shard's lock. Never persisted: a row's hash lives in this process.
+static KEY: LazyKey = LazyKey::new();
+
 /// The hash every interned value is keyed by: what [`intern_by`]'s `Q` must hash like.
 #[inline]
 pub(crate) fn hash_of<Q: Hash + ?Sized>(value: &Q) -> u64 {
-    FixedState.hash_one(value)
+    KEY.get().hash_one(value)
 }
 
 #[inline]
@@ -290,12 +298,9 @@ pub(crate) fn memory_of<F: Send + Sync + 'static>(
     name: &'static str,
 ) -> MemoryUsage {
     let rows = storage.table::<InternTable<F>>(index).map_or(0, |table| u64::from(table.ids.len()));
-    MemoryUsage {
-        name,
-        rows,
-        row_bytes: rows * size_of::<InternRow<F>>() as u64,
-        value_bytes: rows * size_of::<F>() as u64,
-    }
+    // The fields are in place in the rows; what they hold beside is not counted.
+    let row_bytes = rows * size_of::<InternRow<F>>() as u64;
+    MemoryUsage { name, rows, used: rows, row_bytes, value_bytes: 0 }
 }
 
 pub(crate) fn drop_rows<F: Send + Sync + 'static>(storage: &mut Storage, index: u32) {

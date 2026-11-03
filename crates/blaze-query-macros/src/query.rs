@@ -205,7 +205,7 @@ impl Query<'_> {
         let checks = value::check(&value_check, db_lt, &checked);
 
         let options = self.options;
-        let lru = options.lru.as_ref().map_or(0, |(_, cap)| *cap);
+        let budgeted = matches!(options.lru, Some((_, crate::options::Lru::Budgeted)));
         let evictable = options.lru.is_some();
         let no_eq = options.no_eq.is_some();
         let tag = match &options.mem_tag {
@@ -283,6 +283,17 @@ impl Query<'_> {
             })
         };
 
+        let weigh = match &options.weigh {
+            Some(weigh) => quote!((#weigh)(value)),
+            None => {
+                let message = "{} has no `lru`: its values are never weighed";
+                quote!({
+                    let _ = value;
+                    ::core::unreachable!(#message, <Self as #plumbing::Function>::NAME)
+                })
+            }
+        };
+
         let loaded = output.load_ref(&quote!(value));
         let output_db = &output.db;
         let fetch = quote! {
@@ -327,10 +338,6 @@ impl Query<'_> {
                 }
                 #evict_of
 
-                /// Replaces the query's value cap (0: none) from the next view.
-                #vis fn set_lru_capacity(db: &mut #db_ty, capacity: usize) {
-                    #plumbing::set_lru_capacity::<#config>(db, capacity)
-                }
             }
         } else {
             TokenStream::new()
@@ -392,7 +399,7 @@ impl Query<'_> {
                     type Value = #stored_output;
                     const NAME: &'static str = #query_name;
                     const FILE: &'static str = ::core::file!();
-                    const LRU: usize = #lru;
+                    const BUDGETED: bool = #budgeted;
                     const EVICTABLE: bool = #evictable;
                     const NO_EQ: bool = #no_eq;
                     const CYCLE: #plumbing::CycleKind = #plumbing::CycleKind::#kind;
@@ -442,6 +449,10 @@ impl Query<'_> {
 
                     fn hash(value: &Self::Value) -> u64 {
                         #hash
+                    }
+
+                    fn weigh(value: &Self::Value) -> usize {
+                        #weigh
                     }
 
                     fn write_key(

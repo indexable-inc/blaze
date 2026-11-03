@@ -579,6 +579,35 @@ fn a_library_only_on_a_path_the_c_driver_passes_its_linker_is_found() {
     assert!(error.what.contains(DRIVER) && error.what.contains("neither CC_aarch64_apple_darwin nor CC"), "{}", error.what);
 }
 
+/// An environment that keeps `NIX_LDFLAGS` but lost nix's role marker (blaze-on-blaze B3: a
+/// dev shell's env copied without its names with lowercase letters): the C driver passes none
+/// of its `-L`s, so libiconv is not found, as rustc's link through `cc` would not find it, and
+/// the error names the directory that has it and why it was left out.
+#[test]
+fn a_library_only_on_a_nix_ldflags_path_the_c_driver_left_out_is_not_found_and_says_why() {
+    let sdk = temp("sdk-unpassed");
+    touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
+    touch(&sdk.join("usr/lib/libSystem.tbd"), &stub("/usr/lib/libSystem.B.dylib", &[]));
+    let (nix, passed) = (temp("nix-libiconv-unpassed"), temp("nix-libsystem"));
+    touch(&nix.join("libiconv.tbd"), &stub("/nix/libiconv.dylib", &[]));
+    let flags = format!("-L{} -L {} -Lrelative", passed.display(), nix.display());
+    let answers = Answers::new()
+        .var("SDKROOT", sdk.display().to_string())
+        .var("NIX_LDFLAGS", flags)
+        .answer(DRIVER, jobs(&[&passed]));
+    let cache = Cache::new();
+    let output = executable(&cache, &answers, "aarch64-apple-darwin").unwrap();
+    let error = locate_plain(&cache, &answers, &output, &[dylib("iconv")], &[]).unwrap_err();
+    let found = error.not_found().expect("a typed not-found");
+    assert!(!found.searched.iter().any(|it| it.0 == nix), "a directory the driver left out is not searched");
+    let said = format!("{} is there, in a directory NIX_LDFLAGS names", nix.join("libiconv.tbd").display());
+    assert!(error.what.contains(&said), "{}", error.what);
+    assert!(error.what.contains("NIX_CC_WRAPPER_TARGET_HOST_<target>"), "{}", error.what);
+
+    let error = locate_plain(&cache, &answers, &output, &[dylib("nope")], &[]).unwrap_err();
+    assert!(!error.what.contains("NIX_LDFLAGS"), "only a library that is there is said to be: {}", error.what);
+}
+
 /// nix's libiconv re-exports libcharset by its absolute install name, which no `-L` names:
 /// ld64 loads it with libiconv, so the line has it after libiconv, needed when imported from.
 #[test]

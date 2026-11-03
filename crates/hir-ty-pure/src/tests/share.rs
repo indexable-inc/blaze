@@ -89,7 +89,7 @@ fn db() -> Db {
 }
 
 /// The home of `instance` asked from `asker` (`hir_ty_mir::mir::home::home`).
-fn home_of(db: &Db, asker: Crate, instance: Instance) -> Option<Crate> {
+fn home_of(db: &Db, asker: Crate, instance: &Instance) -> Option<Crate> {
     hir_ty_mir::mir::home::home(
         db,
         asker,
@@ -140,7 +140,7 @@ pub(super) fn keys_agree_from(db: &Db, asker: Crate, root: Instance) {
     let env = env(asker);
     for instance in reached_from(db, asker, root) {
         let at = || {
-            format!("{} (home {:?})", name_of(db, &instance), home_of(db, asker, instance.clone()))
+            format!("{} (home {:?})", name_of(db, &instance), home_of(db, asker, &instance))
         };
         let (through, own) = (
             summary(db, env.clone(), instance.clone()),
@@ -213,9 +213,9 @@ fn two_scripts_share_the_summaries_of_what_both_reach() {
         // toolchain's printing under them are both scripts'.
         assert!(shared >= 4, "only {shared} instances are reached by both scripts");
         let helper = named(&db, &in_a, "`shared::helper`", None);
-        assert_eq!(home_of(&db, a, helper.clone()), Some(crate_named(&db, "shared")));
+        assert_eq!(home_of(&db, a, helper), Some(crate_named(&db, "shared")));
         let toolchain = in_a.iter().filter(|it| {
-            home_of(&db, a, (*it).clone())
+            home_of(&db, a, it)
                 .is_some_and(|home| matches!(home.data(&db).origin, CrateOrigin::Lang(_)))
         });
         assert!(toolchain.count() > 0, "no toolchain function is keyed by a toolchain crate");
@@ -242,13 +242,13 @@ fn a_downstream_impl_keys_the_instance_by_the_crate_of_its_type() {
         let local = named(&db, &in_b, "`shared::each`", Some("Local"));
         // `script_b`'s impl of `Show` for `Local` is what `each::<Local>` runs: it is keyed by
         // `script_b`, the crate that sees the impl, and reads `HOME` there.
-        assert_eq!(home_of(&db, b, local.clone()), Some(b));
+        assert_eq!(home_of(&db, b, local), Some(b));
         assert!(
             summary(&db, env(b), local.clone()).impure.is_some(),
             "`each::<Local>` reads `HOME`"
         );
         // `each::<u8>` names no crate of a script: one summary, `shared`'s, pure.
-        assert_eq!(home_of(&db, b, byte.clone()), Some(shared));
+        assert_eq!(home_of(&db, b, byte), Some(shared));
         let from_b = summary(&db, env(b), byte.clone());
         assert!(from_b.impure.is_none(), "`each::<u8>` only prints");
         assert!(std::ptr::eq(from_b, summary(&db, env(a), byte.clone())));
@@ -265,7 +265,7 @@ fn a_script_that_solves_differently_keeps_its_own_summaries_of_generics() {
         // Not generic, `helper` is `shared`'s whoever asks, as the code generator compiles it
         // (`hir_ty_mir::mir::home::env_of`): one summary, the one of the body that runs.
         let helper = named(&db, &in_c, "`shared::helper`", None);
-        assert_eq!(home_of(&db, c, helper.clone()), Some(shared));
+        assert_eq!(home_of(&db, c, helper), Some(shared));
         assert_eq!(home_env(&db, &env(c), helper), env(shared));
         let helper_a = named(&db, &reached(&db, a), "`shared::helper`", None).clone();
         assert!(std::ptr::eq(summary(&db, env(c), helper.clone()), summary(&db, env(a), helper_a)));
@@ -279,10 +279,10 @@ fn a_script_that_solves_differently_keeps_its_own_summaries_of_generics() {
             !stands_for(&db, shared, c)
                 && !stands_for(&db, lang_crate(&db, LangCrateOrigin::Std), c)
         );
-        assert_eq!(home_of(&db, c, byte.clone()), None);
+        assert_eq!(home_of(&db, c, byte), None);
         assert_eq!(home_env(&db, &env(c), byte), env(c));
         let byte_a = named(&db, &reached(&db, a), "`shared::each`", Some("u8")).clone();
-        assert_eq!(home_of(&db, a, byte_a.clone()), Some(shared));
+        assert_eq!(home_of(&db, a, &byte_a), Some(shared));
         assert!(!std::ptr::eq(summary(&db, env(c), byte.clone()), summary(&db, env(a), byte_a)));
         // Every other instance it reaches in the toolchain is not generic (the walk stops at the
         // modelled `io::_print`) and so is its own crate's; a generic one would be `script_c`'s.
@@ -292,7 +292,7 @@ fn a_script_that_solves_differently_keeps_its_own_summaries_of_generics() {
         {
             let want = (!is_generic(instance.args.as_ref())).then(|| def_crate(&db, instance.def));
             assert_eq!(
-                home_of(&db, c, instance.clone()),
+                home_of(&db, c, instance),
                 want,
                 "the home of {}",
                 name_of(&db, instance)
@@ -315,7 +315,7 @@ fn a_specializing_dependency_of_the_script_alone_leaves_sharing() {
         // rule it holds no impl their walks could match: both still stand for `script_s`.
         assert!(stands_for(&db, shared, s));
         assert!(stands_for(&db, std, s));
-        assert_eq!(home_of(&db, s, helper.clone()), Some(shared));
+        assert_eq!(home_of(&db, s, helper), Some(shared));
         let in_a = reached(&db, a);
         let helper_a = named(&db, &in_a, "`shared::helper`", None);
         assert!(std::ptr::eq(
@@ -395,7 +395,7 @@ fn a_missed_dependency_of_the_home(crates: &str) -> (Purity, bool) {
         assert!(!stands_for(&db, k, script));
         let in_script = reached(&db, script);
         let run = named(&db, &in_script, "`k::run`", None);
-        assert_eq!(home_of(&db, script, run.clone()), None);
+        assert_eq!(home_of(&db, script, run), None);
         let reads_env = summary(&db, env(script), main_instance(&db, script)).kinds.has(Rule::Env);
         (script_purity(&db, main_of(&db, script).unwrap()).clone(), reads_env) // clone: a test's answer
     })
@@ -448,7 +448,7 @@ fn an_open_instance_or_a_generic_environment_has_no_home_and_a_non_generic_one_i
         let interner = DbInterner::new_with(&db, shared);
         let params = GenericArgs::identity_for_item(interner, each.into()).store();
         let open = Instance { def: Def::Body(Body::Fn(each)), args: params };
-        assert_eq!(home_of(&db, a, open.clone()), None, "`each::<T>` holds a parameter");
+        assert_eq!(home_of(&db, a, &open), None, "`each::<T>` holds a parameter");
         let generic =
             ParamEnvAndCrate { param_env: db.trait_environment(each.into()), krate: a }.store();
         let closed = Instance {
@@ -571,7 +571,7 @@ fn main() {
         assert!(!stands_for(&db, h, script), "their lang items differ");
         let in_script = reached(&db, script);
         let consume = named(&db, &in_script, "`h::consume`", None);
-        assert_ne!(home_of(&db, script, consume.clone()), Some(h));
+        assert_ne!(home_of(&db, script, consume), Some(h));
         // A `core` home has no `owned_box` either: what names only `core` is worked out in
         // `std`, which loads it and sees the script's lang items.
         let core = lang_crate(&db, LangCrateOrigin::Core);
@@ -648,7 +648,7 @@ fn main() {
                     .iter()
                     .filter(|it| ["`lib::ping`", "`lib::pong`"].contains(&&*name_of(&db, it)))
                 {
-                    assert_eq!(home_of(&db, script, it.clone()), Some(lib), "the cycle is shared");
+                    assert_eq!(home_of(&db, script, it), Some(lib), "the cycle is shared");
                 }
                 let purity = script_purity(&db, main_of(&db, script).unwrap()).clone();
                 let mut summaries: Vec<_> = reached(&db, script)

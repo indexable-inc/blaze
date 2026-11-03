@@ -423,7 +423,7 @@ impl Tree {
                 "This allocation does not contain named tags. Use `miri_print_borrow_state(_, true)` to also print unnamed tags.\n",
             );
         }
-        DisplayRepr::print(&main_tree, &wildcard_subtrees, &DEFAULT_FORMATTER, ranges, !show_unnamed, &mut out);
+        DisplayRepr::print(&main_tree, &wildcard_subtrees, &DEFAULT_FORMATTER, &ranges, !show_unnamed, &mut out);
         out
     }
 }
@@ -554,7 +554,7 @@ impl DisplayRepr {
         main_root: &Option<DisplayRepr>,
         wildcard_subtrees: &[DisplayRepr],
         fmt: &DisplayFmt,
-        ranges: Vec<Range<u64>>,
+        ranges: &[Range<u64>],
         print_warning: bool,
         out: &mut String,
     ) {

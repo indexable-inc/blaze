@@ -10,7 +10,6 @@ mod primitive_shadow;
 mod stale_ids;
 mod trait_imports;
 mod uses;
-mod worklist;
 mod batch_order;
 mod views;
 
@@ -37,7 +36,7 @@ fn render_crate_def_map(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> Stri
     crate_def_map(&db, krate).dump(&db)
 }
 
-fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let actual = render_crate_def_map(ra_fixture);
     expect.assert_eq(&actual);
 }
@@ -68,7 +67,7 @@ extern {
     fn ext();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - E : _
             - S : type value
@@ -150,7 +149,7 @@ mod a {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - a : type
 
@@ -178,7 +177,7 @@ mod m {
     pub fn z() {}
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - m : type
 
@@ -204,7 +203,7 @@ use self;
 use super;
 use crate;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - S : type value
             - foo : type
@@ -225,7 +224,7 @@ use crate::foo::Baz as Foo;
 //- /foo/mod.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Foo : type (import) value (import)
             - foo : type
@@ -251,7 +250,7 @@ pub mod bar;
 pub struct Baz;
 pub enum Quux {};
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : type (import) value (import)
             - Quux : type (import)
@@ -282,7 +281,7 @@ pub use self::bar::Baz;
 //- /foo/bar.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : type (import) value (import)
             - foo : type
@@ -314,7 +313,7 @@ pub mod prelude;
 //- /prelude.rs
 pub enum Foo { Bar, Baz }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (glob) value (glob)
             - Baz : type (glob) value (glob)
@@ -330,7 +329,7 @@ fn can_import_enum_variant() {
 enum E { V }
 use self::E::V;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - E : type
             - V : type (import) value (import)
@@ -356,7 +355,7 @@ use other_crate::FromLib;
 //- /lib.rs crate:other_crate edition:2018
 pub struct FromLib;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - bar : type
             - foo : type
@@ -385,7 +384,7 @@ pub mod bar;
 //- /foo/bar.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : type (import)
             - foo : type
@@ -409,7 +408,7 @@ use test_crate::Baz;
 //- /lib.rs crate:test_crate
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : type (import) value (import)
         "#]],
@@ -431,7 +430,7 @@ use alloc_crate::Arc;
 //- /lib.rs crate:alloc
 pub struct Arc;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - alloc : type
             - alloc_crate : type (extern)
@@ -479,7 +478,7 @@ pub struct Exported;
 //- /extern_crate2.rs crate:extern_crate2
 pub struct NotExported;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Exported : type (glob) value (glob)
             - PublicItem : type (glob) value (glob)
@@ -506,7 +505,7 @@ use alloc_crate::Arc;
 //- /lib.rs crate:alloc
 pub struct Arc;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - alloc : type
             - alloc_crate : type (extern)
@@ -528,7 +527,7 @@ fn macro_use_extern_crate_self() {
 #[macro_use]
 extern crate self as bla;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - bla : type (extern)
         "#]],
@@ -549,7 +548,7 @@ mod foo;
 //- /foo.rs
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Baz : type (import) value (import)
         "#]],
@@ -567,7 +566,7 @@ use foo::Bar;
 //- /foo/lib.rs crate:foo
 pub struct Bar;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (import) value (import)
             - foo : value
@@ -595,7 +594,7 @@ fn no_std_prelude() {
             }
         }
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Rust : type (import) value (import)
         "#]],
@@ -619,7 +618,7 @@ fn edition_specific_preludes() {
             }
         }
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Rust2018 : type (import) value (import)
         "#]],
@@ -636,7 +635,7 @@ fn edition_specific_preludes() {
             }
         }
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Rust2021 : type (import) value (import)
         "#]],
@@ -665,7 +664,7 @@ pub mod prelude {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (import) value (import)
             - Foo : type (import) value (import)
@@ -692,7 +691,7 @@ pub mod prelude {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (import) value (import)
             - Baz : _
@@ -720,7 +719,7 @@ pub mod prelude {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : _
             - Baz : type (import) value (import)
@@ -745,7 +744,7 @@ mod b {
     pub const T: () = ();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - T : type (import) value (import)
             - a : type
@@ -773,7 +772,7 @@ mod tr {
     pub trait Tr2 {}
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - _ : type (import)
             - _ : type (import)
@@ -801,7 +800,7 @@ mod reex {
 }
 use crate::reex::*;
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - _ : type (glob)
             - reex : type
@@ -834,7 +833,7 @@ mod tr {
     pub trait Tr {}
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - _ : type (glob)
         "#]],
@@ -853,7 +852,7 @@ mod m {
 }
 use crate::m::{Struct as _, Enum as _, CONST as _};
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - m : type
 
@@ -878,7 +877,7 @@ mod tr {
     pub trait Tr {}
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - _ : type (import)
             - Tr : type value
@@ -901,7 +900,7 @@ pub struct S;
 pub enum E {}
 pub fn f() {}
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
         "#]],
     );
@@ -957,7 +956,7 @@ use foo::bar as baz;
 
 fn bar() {}
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - bar : value
             - baz : value (import)
@@ -978,7 +977,7 @@ mod m {
 
 use self::m::S::{self};
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - S : type (import)
             - m : type
@@ -1002,7 +1001,7 @@ pub struct Settings;
 mod settings {}
 pub const settings: () = ();
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Settings : type (import) value (import)
             - settings : value (import)
@@ -1019,7 +1018,7 @@ use dep::Struct;
 //- /dep.rs crate:dep
 pub struct Struct;
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Struct : _
         "#]],
@@ -1032,7 +1031,7 @@ use dep::Struct;
 //- /dep.rs crate:dep
 pub struct Struct;
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Struct : type (import) value (import)
             - dep : type (extern)
@@ -1057,7 +1056,7 @@ mod other_module {
 
 use some_module::unknown_func;
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - other_module : type
             - some_module : type

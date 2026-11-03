@@ -501,8 +501,8 @@ pub fn prelink_placed(request: &Request<'_>) -> Result<Placed, LinkError> {
         names: names(state, symbols).into_iter().map(|(name, def)| PlacedName { name, def }).collect(),
         binds,
         libraries: libraries(state),
-        init: init_entries(state, symbols, Class::InitArray),
-        fini: init_entries(state, symbols, Class::FiniArray),
+        init: init_entries(state, symbols, &Class::InitArray),
+        fini: init_entries(state, symbols, &Class::FiniArray),
         tls: tls(state),
         unwind: regions_of(state, |it| *it == Class::EhFrame),
         thread_vars,
@@ -517,8 +517,8 @@ pub fn layout(image: &Image) -> WorkspaceLayout {
     let bias = image.place.map_or(0, |it| it.tls_bias);
     WorkspaceLayout {
         names: names(state, &image.symbols),
-        init: init_entries(state, &image.symbols, Class::InitArray),
-        fini: init_entries(state, &image.symbols, Class::FiniArray),
+        init: init_entries(state, &image.symbols, &Class::InitArray),
+        fini: init_entries(state, &image.symbols, &Class::FiniArray),
         tls: tls(state),
         tls_offset: state.tls.and(state.tls_at).map(|at| at.wrapping_sub(bias) as u64),
         thread_vars: regions_of(state, |it| *it == Class::ThreadVars),
@@ -733,10 +733,10 @@ fn libraries(state: &State) -> Vec<Library> {
 }
 
 /// The pieces of the init or fini arrays (`class`), in address order.
-fn init_entries(state: &State, symbols: &Symbols, class: Class) -> Vec<InitEntry> {
+fn init_entries(state: &State, symbols: &Symbols, class: &Class) -> Vec<InitEntry> {
     let mut out: Vec<InitEntry> = state
         .live_pieces()
-        .filter(|it| it.size >= 8 && state.spaces.get(it.region as usize).is_some_and(|space| space.region.class == class))
+        .filter(|it| it.size >= 8 && state.spaces.get(it.region as usize).is_some_and(|space| space.region.class == *class))
         .map(|piece| {
             let tie = match (piece.what(), symbols.key(piece.sym)) {
                 (What::Static { .. }, SymKey::Static(item, instance)) => tie_of(symbols, item, instance),

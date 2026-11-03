@@ -518,7 +518,7 @@ impl<'a> Walker<'a> {
             reexports: vec![],
             via: None,
         });
-        self.module(root, 0, vec![], true);
+        self.module(root, 0, &[], true);
         self.out
     }
 
@@ -556,7 +556,7 @@ impl<'a> Walker<'a> {
 
     /// Lists the items of `module` under the placement `at`. `local` is false inside a module
     /// of another crate that is inlined, whose public items all are.
-    fn module(&mut self, module: Module, at: usize, path: Vec<String>, local: bool) {
+    fn module(&mut self, module: Module, at: usize, path: &[String], local: bool) {
         if !self.walking.insert(module) {
             return;
         }
@@ -597,7 +597,7 @@ impl<'a> Walker<'a> {
                 if !done.insert(def) {
                     continue;
                 }
-                self.entry(module, at, &path, local, &name, def, import, public, &mut seen_globs);
+                self.entry(module, at, path, local, &name, def, import, public, &mut seen_globs);
             }
         }
         self.walking.remove(&module);
@@ -803,7 +803,7 @@ impl<'a> Walker<'a> {
         if let ModuleDef::Module(module) = def {
             let mut inner = path.to_vec();
             inner.push(name);
-            self.module(module, index, inner, local);
+            self.module(module, index, &inner, local);
         }
     }
 }

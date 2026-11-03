@@ -22,8 +22,10 @@
 //!   built into (`ProcMacroExpander::code`): what its expansions are a function of besides
 //!   their call. A proc-macro crate whose library is not known is not [`eligible`], nor is any
 //!   crate that depends on it.
-//! - `build`, which names the blaze that reads and writes the image (its front end decides
-//!   what a crate resolves to), and [`PRODUCER`], the version of each encoding in the image.
+//! - `build`, which names the front end that reads and writes the image (it decides what a
+//!   crate resolves to): blaze hands over the content identity of the front end's code and of
+//!   how it was built (`blaze_codegen_code::FRONT_END`), never its executable's bytes; and
+//!   [`PRODUCER`], the version of each encoding in the image.
 //!
 //! **Paths.** A path is written relative to the crate's package directory
 //! (`CARGO_MANIFEST_DIR`, else the directory of its root file) and its `OUT_DIR`: each of
@@ -85,7 +87,7 @@ pub fn eligible(db: &Db, krate: Crate) -> bool {
     walk(db, krate, &mut |_, _| ContentId::default(), &mut memo).is_some()
 }
 
-/// The key of each of `crates` that is [`eligible`], by `build`, the blaze that reads and
+/// The key of each of `crates` that is [`eligible`], by `build`, the front end that reads and
 /// writes the images. A crate's key covers its dependencies' keys, so they are made too.
 ///
 /// One walk of the crate graph: each crate is visited once, whether eligible and its key
@@ -220,6 +222,10 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, memo: &Memo, hasher: &mut Ha
             hasher.update(&[0xff]);
         }
     }
+    // The root's own content ID: the root may be an alias ([`base_db::Files::alias_of`]), its
+    // file's path and text with a module appended (a test harness, a proc macro's wasm glue),
+    // which [`files`] does not list, since a source root lists only the file it aliases.
+    hasher.id(&db.file_content(*root_file_id));
     hasher.update(&(edition.number() as u64).to_le_bytes());
     hasher.update(&(dependencies.len() as u64).to_le_bytes());
     for dep in dependencies {

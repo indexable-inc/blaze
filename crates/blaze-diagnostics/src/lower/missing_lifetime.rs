@@ -585,7 +585,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingLifetime) -> Vec<Found> {
     };
 
     let rib_at = sig.map_or(seg.node, Sig::syntax);
-    let mut diag = report(cx, seg.file, rib_at, &refs, params);
+    let mut diag = report(cx, seg.file, rib_at, &refs, params.as_ref());
     generics_fact(cx, &mut diag, d.def);
     site_fact(cx, &mut diag, InFile::new(seg.file, seg.node));
     // alloc: the error's parts, for an error hir found
@@ -600,7 +600,7 @@ pub(crate) fn report<'db>(
     file: HirFileId,
     rib_at: ast::Node<'db>,
     refs: &[Missing],
-    params: Option<(Vec<Missing>, Vec<FnParam>)>,
+    params: Option<&(Vec<Missing>, Vec<FnParam>)>,
 ) -> Diag {
     let span = |range: TextRange| cx.span(InFile::new(file, range));
     let total: usize = refs.iter().map(|it| it.count).sum();
@@ -634,7 +634,7 @@ pub(crate) fn report<'db>(
     }
 
     let mut maybe_static = false;
-    if let Some((param_lifetimes, params)) = &params {
+    if let Some((param_lifetimes, params)) = params {
         let elided_len = param_lifetimes.len();
         let num_params = params.len();
         // alloc: the error's text, for an error hir found
@@ -698,7 +698,7 @@ pub(crate) fn report<'db>(
         refs.iter().map(|lt| build_sugg(lt, existing)).collect();
     match in_scope.len() {
         0 => {
-            if let Some((param_lifetimes, _)) = &params {
+            if let Some((param_lifetimes, _)) = params {
                 spans_suggs.extend(param_lifetimes.iter().map(|lt| build_sugg(lt, existing)));
             }
             for rib in &ribs {

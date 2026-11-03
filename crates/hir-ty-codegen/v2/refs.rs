@@ -355,6 +355,7 @@ fn pass<'db>(
     done.expect("the walk ran")
 }
 
+#[expect(clippy::needless_pass_by_value, reason = "the `map_err` callback of the walk's every step, which hands it the error by value")]
 fn told(error: CodegenError) -> String {
     // alloc: the error's message
     error.to_string()

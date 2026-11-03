@@ -12,6 +12,7 @@ use std::{ffi::OsString, fmt::Write as _, io::Write as _, path::PathBuf, time::D
 
 use arrow_array::{Array, RecordBatch, cast::AsArray, types};
 use blaze_api::{Request, ResponseRef};
+use blaze_core::exit::Exit;
 use blaze_profile::{
     history, live, slow, sql,
     time::{load, report::By},
@@ -20,7 +21,6 @@ use blaze_profile::{
 use serde_json::{Map, Value};
 
 use super::{
-    FAILED, USAGE,
     daemon::{self, Api, Start},
     say,
 };
@@ -43,7 +43,7 @@ pub fn explore(words: Vec<OsString>, color: bool) -> i32 {
         match word.to_str() {
             Some("--dev") => dev = true,
             Some("--print") => print = true,
-            _ => return refused(&format!("{EXPLORE_USAGE}, not `{}`", word.to_string_lossy()), USAGE, color),
+            _ => return refused(&format!("{EXPLORE_USAGE}, not `{}`", word.to_string_lossy()), Exit::Usage.code(), color),
         }
     }
     let mut link = None;
@@ -54,9 +54,9 @@ pub fn explore(words: Vec<OsString>, color: bool) -> i32 {
         Ok(())
     });
     if let Err(what) = asked {
-        return refused(&what, FAILED, color);
+        return refused(&what, Exit::Failed.code(), color);
     }
-    let Some(link) = link else { return refused("the daemon answered `blaze explore` with no link", FAILED, color) };
+    let Some(link) = link else { return refused("the daemon answered `blaze explore` with no link", Exit::Failed.code(), color) };
     println!("{link}");
     if !print && let Err(why) = open(&link) {
         eprint!("{}", say::warning(&format!("the link was not opened ({why}): open it in a browser"), color));
@@ -253,8 +253,8 @@ enum Refusal {
 fn said(result: Result<(), Refusal>, color: bool) -> i32 {
     match result {
         Ok(()) => 0,
-        Err(Refusal::Usage(what)) => refused(&what, USAGE, color),
-        Err(Refusal::Failed(what)) => refused(&what, FAILED, color),
+        Err(Refusal::Usage(what)) => refused(&what, Exit::Usage.code(), color),
+        Err(Refusal::Failed(what)) => refused(&what, Exit::Failed.code(), color),
     }
 }
 

@@ -206,7 +206,7 @@ pub const ALLOC_ERROR_HANDLER_EXPORT: &str = "__rg_oom";
 /// expansion adds
 ///
 /// ```ignore
-/// unsafe extern "C" fn __rg_oom(size: usize, align: usize) -> ! {
+/// unsafe fn __rg_oom(size: usize, align: usize) -> ! {
 ///     handler(unsafe { $crate::alloc::Layout::from_size_align_unchecked(size, align) })
 /// }
 /// ```
@@ -215,7 +215,9 @@ pub const ALLOC_ERROR_HANDLER_EXPORT: &str = "__rg_oom";
 /// handler, as rustc's shim calls its `__rg_oom`. The call type checks the handler's signature
 /// as rustc's does. rustc wraps the function in a `const _: () = { .. };` and marks it
 /// `#[rustc_std_internal_symbol]`; blaze's is a module item exported as `__rg_oom`, which is
-/// how the shim finds it, as it finds the `#[global_allocator]`'s. Its code is spanned in the
+/// how the shim finds it, as it finds the `#[global_allocator]`'s. It is of the Rust ABI, as
+/// rustc's: a handler may panic (std's hook may have it panic, failing one job and not the
+/// process), and a C function's unwind aborts. Its code is spanned in the
 /// expansion's def-site context, as rustc's (`with_def_site_ctxt(item.span)`), so its `unsafe`
 /// is the macro's and no lint of the crate is given for it.
 fn alloc_error_handler_expand<'f>(
@@ -247,7 +249,7 @@ fn alloc_error_handler_expand<'f>(
     let result = quote::quote_in! { frame, span=>
         #tt
         #[unsafe(export_name = "__rg_oom")]
-        unsafe extern "C" fn __rg_oom(size: usize, align: usize) -> ! {
+        unsafe fn __rg_oom(size: usize, align: usize) -> ! {
             #name(unsafe { #krate::alloc::Layout::from_size_align_unchecked(size, align) })
         }
     };

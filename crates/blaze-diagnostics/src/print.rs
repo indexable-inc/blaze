@@ -7,13 +7,13 @@
 //! `compiler/rustc_middle/src/ty/error.rs` and the type mismatch label of
 //! `compiler/rustc_trait_selection/src/error_reporting/infer/mod.rs` (MIT or Apache-2.0).
 //!
-//! The printer writes into one `String` and keeps its binder names in a stack of small
-//! vectors; the per-crate tables of `paths` are built once and read without locks.
+//! The printer is `hir_ty_print`'s, the one of every spelling (rule 26), spelled for a
+//! diagnostic: the check is its [`DiagnosticHost`](hir_ty_print::DiagnosticHost) (`host`),
+//! and the per-crate tables of `paths` are built once and read without locks.
 
-mod consts;
 mod erase;
+mod host;
 pub(crate) mod paths;
-mod printer;
 mod types;
 
 use hir::AsAssocItem as _;
@@ -24,8 +24,7 @@ use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
 pub(crate) use paths::Paths;
 
 use crate::cx::Cx;
-use paths::Def;
-use printer::{Mode, Printer};
+use hir_ty_print::{Def, Mode, Printer};
 
 /// A type as rustc prints it in a message: `{ty}` of a `Ty`.
 pub fn ty(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> String {
@@ -36,6 +35,18 @@ pub fn ty(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> String {
 /// which a `hir::Type` can't.
 pub(crate) fn solver_ty(cx: &Cx<'_, '_>, ty: Ty<'_>) -> String {
     ty_in(cx, ty, Mode::NORMAL)
+}
+
+/// [`solver_ty`] with no path trimmed: rustc's `with_no_trimmed_paths!`.
+pub(crate) fn solver_ty_untrimmed(cx: &Cx<'_, '_>, ty: Ty<'_>) -> String {
+    ty_in(cx, ty, Mode::UNTRIMMED)
+}
+
+/// Generic arguments as rustc's `Itertools::join(", ")` of each prints them: `'a, T, 3`.
+pub(crate) fn solver_args<'db>(cx: &Cx<'_, 'db>, args: &[hir_ty::next_solver::GenericArg<'db>]) -> String {
+    let mut p = Printer::diagnostic(cx.db, cx, Mode::NORMAL, false);
+    p.comma_sep_args(args);
+    p.finish()
 }
 
 /// rustc's `TyCtxt::short_string` at its default diagnostic width (140): the type whole if it
@@ -81,7 +92,7 @@ pub fn let_placeholders<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>) -> usize {
 }
 
 fn ty_in(cx: &Cx<'_, '_>, ty: Ty<'_>, mode: Mode) -> String {
-    let mut p = Printer::new(cx, mode, false);
+    let mut p = Printer::diagnostic(cx.db, cx, mode, false);
     p.print_type(ty);
     p.finish()
 }
@@ -104,7 +115,7 @@ fn def_path_in(cx: &Cx<'_, '_>, def: hir::ModuleDef, mode: Mode) -> String {
     }
     match ModuleDefId::try_from(def).ok().and_then(Def::of) {
         Some(def) => {
-            let mut p = Printer::new(cx, mode, def.is_value());
+            let mut p = Printer::diagnostic(cx.db, cx, mode, def.is_value());
             p.print_def_path(def, &[]);
             p.finish()
         }
@@ -124,7 +135,7 @@ fn builtin_derive_method(cx: &Cx<'_, '_>, def: hir::ModuleDef, mode: Mode) -> St
         unreachable!("a built-in derive's method is in its impl")
     };
     let trait_ = imp.trait_(db).expect("a built-in derive's impl is of its trait");
-    let mut p = Printer::new(cx, mode, false);
+    let mut p = Printer::diagnostic(cx.db, cx, mode, false);
     p.write_str("<");
     p.print_type(imp.self_ty(db).to_next_solver());
     p.write_str(" as ");
@@ -134,10 +145,17 @@ fn builtin_derive_method(cx: &Cx<'_, '_>, def: hir::ModuleDef, mode: Mode) -> St
     p.finish()
 }
 
+/// rustc's `FnSig` printing: `fn(&'a T) -> U`, `unsafe extern "C" fn(u8)`.
+pub fn fn_sig<'db>(cx: &Cx<'_, 'db>, sig: &hir::FnSignature<'db>) -> String {
+    let mut p = Printer::diagnostic(cx.db, cx, Mode::NORMAL, false);
+    p.print_fn_sig(sig.to_next_solver());
+    p.finish()
+}
+
 /// rustc's `TraitRef` printing: `<T as Trait<U>>`.
 pub fn trait_ref<'db>(cx: &Cx<'_, 'db>, tr: &hir::TraitRef<'db>) -> String {
     let tr = tr.to_next_solver();
-    let mut p = Printer::new(cx, Mode::NORMAL, false);
+    let mut p = Printer::diagnostic(cx.db, cx, Mode::NORMAL, false);
     p.write_str("<");
     p.print_type(tr.self_ty());
     p.write_str(" as ");
@@ -148,7 +166,7 @@ pub fn trait_ref<'db>(cx: &Cx<'_, 'db>, tr: &hir::TraitRef<'db>) -> String {
 
 /// rustc's `print_only_trait_path`: `Trait<U>`, its own arguments without their defaults.
 pub fn trait_path<'db>(cx: &Cx<'_, 'db>, tr: &hir::TraitRef<'db>) -> String {
-    let mut p = Printer::new(cx, Mode::NORMAL, false);
+    let mut p = Printer::diagnostic(cx.db, cx, Mode::NORMAL, false);
     p.print_trait_path(tr.to_next_solver());
     p.finish()
 }
@@ -157,7 +175,7 @@ pub fn trait_path<'db>(cx: &Cx<'_, 'db>, tr: &hir::TraitRef<'db>) -> String {
 /// `Fn(u8)` sugar for a parenthesized trait (`TraitRefPrintSugared`).
 pub fn trait_path_sugared<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>) -> String {
     let pred = pred.to_next_solver();
-    let mut p = Printer::new(cx, Mode::NORMAL, false);
+    let mut p = Printer::diagnostic(cx.db, cx, Mode::NORMAL, false);
     if pred.polarity == rustc_type_ir::ClausePolarity::Negative {
         p.write_str("!");
     }
@@ -168,7 +186,7 @@ pub fn trait_path_sugared<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>) -
 /// rustc's `TraitPredicate` printing: `T: Trait<U>`, `T: !Trait`, `F: Fn(u8)`.
 pub fn predicate<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>) -> String {
     let pred = pred.to_next_solver();
-    let mut p = Printer::new(cx, Mode::NORMAL, false);
+    let mut p = Printer::diagnostic(cx.db, cx, Mode::NORMAL, false);
     p.print_trait_predicate(pred);
     p.finish()
 }
@@ -176,7 +194,7 @@ pub fn predicate<'db>(cx: &Cx<'_, 'db>, pred: &hir::TraitClause<'db>) -> String 
 /// rustc's `HostEffectPredicate` printing: `T: [const] Trait` (`maybe_const`), `T: const Trait`.
 pub fn host_effect<'db>(cx: &Cx<'_, 'db>, tr: &hir::TraitRef<'db>, maybe_const: bool) -> String {
     let tr = tr.to_next_solver();
-    let mut p = Printer::new(cx, Mode::NORMAL, false);
+    let mut p = Printer::diagnostic(cx.db, cx, Mode::NORMAL, false);
     p.print_type(tr.self_ty());
     p.write_str(if maybe_const { ": [const] " } else { ": const " });
     p.print_trait_sugared(tr);
@@ -186,7 +204,7 @@ pub fn host_effect<'db>(cx: &Cx<'_, 'db>, tr: &hir::TraitRef<'db>, maybe_const: 
 /// rustc's `print_trait_sugared` of a trait reference: `Fn(u8)` for a parenthesized trait,
 /// else `Trait<U>`.
 pub fn trait_ref_sugared<'db>(cx: &Cx<'_, 'db>, tr: &hir::TraitRef<'db>) -> String {
-    let mut p = Printer::new(cx, Mode::NORMAL, false);
+    let mut p = Printer::diagnostic(cx.db, cx, Mode::NORMAL, false);
     p.print_trait_sugared(tr.to_next_solver());
     p.finish()
 }

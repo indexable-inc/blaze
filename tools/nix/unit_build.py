@@ -152,7 +152,10 @@ def run_script(spec: dict) -> None:
             flags["env"][k] = v
         elif key == "rustc-flags":
             flags["extra_flags"] += val.split()
-        elif key in ("rerun-if-changed", "rerun-if-env-changed", "warning", "rustc-check-cfg", "rustc-cdylib-link-arg", "rustc-link-arg", "rustc-link-arg-bins", "error"):
+        elif key == "error":
+            # As cargo: a build script's `cargo::error=` fails its build, naming the package.
+            raise SystemExit(f"error: the build script of {spec['pkg']} failed: {val}")
+        elif key in ("rerun-if-changed", "rerun-if-env-changed", "warning", "rustc-check-cfg", "rustc-cdylib-link-arg", "rustc-link-arg", "rustc-link-arg-bins"):
             if key.startswith("rustc-link-arg"):
                 flags.setdefault("link_args", []).append(val)
         elif key == "metadata":

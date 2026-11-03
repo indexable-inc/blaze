@@ -156,7 +156,7 @@ fn custom(name: &str) -> Class {
 
 fn is_code(class: &Class) -> bool {
     match class {
-        Class::Plt | Class::Text | Class::Patch | Class::Stubs | Class::Veneers => true,
+        Class::Plt | Class::Text | Class::Patch | Class::Stubs => true,
         Class::Synthetic(name) => *name == FUNCTIONS,
         _ => false,
     }
@@ -180,7 +180,6 @@ fn place(class: &Class) -> u8 {
         Class::Text => 2,
         Class::Patch => 3,
         Class::Stubs => 4,
-        Class::Veneers => 5,
         Class::Rodata => 10,
         Class::RelRo => 11,
         Class::Data => 12,

@@ -74,7 +74,7 @@ impl Drop for Sampler {
         if let Some(thread) = self.thread.take() {
             // The loop parks between ticks; this ends the park now rather than at the tick.
             thread.thread().unpark();
-            let _wait = tracing::info_span!(target: "ix_prof", "join", wait = "thread", on = "ix-prof-sampler").entered();
+            let _wait = tracing::info_span!(target: "blaze::ix_prof", "join", wait = "thread", on = "ix-prof-sampler").entered();
             // A panic in the sampler thread was already printed by the panic hook; the
             // profile is written with the samples that reached the sink.
             let _ = thread.join();

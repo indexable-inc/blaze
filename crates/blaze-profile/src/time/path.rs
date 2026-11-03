@@ -1,6 +1,7 @@
 //! A build's critical path: from the run that ended last, back in time through each lane's
 //! intervals, crossing from a wait to the job that woke it, and from a job's start to the job
-//! that gave it to the pool, when the record names that job. The links are contiguous, so their
+//! that gave it to the pool (or, given by a thread on no fiber, the lane of the span it was
+//! given inside), when the record names it. The links are contiguous, so their
 //! durations add up to the path's length.
 
 use std::alloc::Global;
@@ -19,8 +20,8 @@ pub enum LinkKind {
     Waited,
     /// From the waker's last run to the resume: the wake's latency, queueing included.
     Wake,
-    /// From the spawner's end to the job's start: queued for a core after the job that gave it
-    /// to the pool ended.
+    /// From the spawner's end (or the end of the span it was given inside) to the job's
+    /// start: queued for a core after what gave it to the pool ended.
     Spawned,
     Unrecorded,
 }
@@ -65,7 +66,7 @@ impl Link {
 pub enum Reached {
     BuildStart,
     /// The start of a lane the record names no spawner of: a job given to the pool by a thread
-    /// on no fiber, or one whose spawner has no lane.
+    /// on no fiber inside no span the model has, or one whose spawner has no lane.
     LaneStart { lane: usize },
     /// Its bound of steps, [`fuel`] of the model.
     Fuel { steps: usize },
@@ -123,15 +124,20 @@ pub fn critical(model: &Model) -> Path {
             break;
         }
         let Some(i) = model.lanes[lane].at_or_before(t) else {
-            // A job's start stands on its spawner's work up to it; from the spawner's end, if
-            // it ended first, the job waited for a core.
+            // A job's start stands on its spawner's work up to it; from the spawner's end (or
+            // the end of the span it was given inside), if it ended first, the job waited for a
+            // core.
             let spawner = model.lanes[lane].spawner.filter(|&it| {
                 let it = &model.lanes[it];
                 !it.intervals.is_empty() && it.begin_ns() < t
             });
             match spawner {
                 Some(spawner) if crossed_at != Some(t) => {
-                    let spawner_end = model.lanes[spawner].end_ns().max(start);
+                    let gave_until = match model.lanes[lane].creator {
+                        Some(span) => model.spans[span].end_ns(),
+                        None => model.lanes[spawner].end_ns(),
+                    };
+                    let spawner_end = gave_until.max(start);
                     if spawner_end < t {
                         links.push(Link {
                             kind: LinkKind::Spawned,

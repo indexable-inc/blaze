@@ -60,11 +60,13 @@ impl Vtable {
             ids_of: None,
             made: None,
             memory: memory::<T>,
+            used: None,
             verify: None,
             reset: None,
-            sweep: None,
+            weighed: None,
             relocate: None,
             restamp: None,
+            write_key: None,
             drop: drop_table::<T>,
         }
     }
@@ -159,7 +161,9 @@ pub fn tracked_fields<'s, T: Tracked>(storage: &'s Storage, id: Id, field: u32) 
     let node = row.first + field;
     let seen = storage.color_of(node);
     let durability = ((seen >> 32) as u32 & !FIELD) as u8;
-    local::with(|local| local.read(storage, node, durability, seen as u32));
+    if local::with(|local| local.read(storage, node, durability, seen as u32)) {
+        super::runaway_reads(storage);
+    }
     // SAFETY: the reader reached `id` through its creator, current in this view (the module's
     // read-order rule): its run will not rewrite the fields while `'s` lives.
     unsafe { &*row.fields.get() }

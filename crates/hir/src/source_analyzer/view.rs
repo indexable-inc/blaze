@@ -41,11 +41,11 @@ use rustc_type_ir::{
 use stdx::never;
 use syntax::{
     ast as tag,
-    view::{self as ast, AstNode, Node},
+    view::{self as ast, AstNode, HasName as _, Node},
 };
 
 use super::{
-    BodyOrSig, SourceAnalyzer, resolve_hir_path_, resolve_hir_path_as_attr_macro,
+    BodyOrSig, NotInAstIdMap, SourceAnalyzer, resolve_hir_path_, resolve_hir_path_as_attr_macro,
     resolve_hir_path_qualifier, resolve_hir_value_path,
 };
 use crate::{
@@ -545,10 +545,26 @@ impl<'db> SourceAnalyzer<'db> {
     }
 
     /// What `path` resolves to, with the generic arguments it was given.
+    /// What `path` resolves to, and with what generic arguments; an error when an item its
+    /// resolution looks up is not in the ast id map the analysis reads ([`NotInAstIdMap`]).
     pub(crate) fn resolve_path_view(
         &self,
         db: &'db Db,
         path: ast::Path<'_>,
+    ) -> Result<Option<(PathResolution<'db>, Option<GenericSubstitution<'db>>)>, NotInAstIdMap> {
+        let mut missed = None;
+        let resolved = self.resolve_path_view_noting(db, path, &mut missed);
+        match missed {
+            Some(it) => Err(it),
+            None => Ok(resolved),
+        }
+    }
+
+    fn resolve_path_view_noting(
+        &self,
+        db: &'db Db,
+        path: ast::Path<'_>,
+        missed: &mut Option<NotInAstIdMap>,
     ) -> Option<(PathResolution<'db>, Option<GenericSubstitution<'db>>)> {
         let parent = path.syntax().parent();
 
@@ -769,7 +785,28 @@ impl<'db> SourceAnalyzer<'db> {
                             },
                         );
                     if let Some(adt) = adt {
-                        let ast_id = self.file_id.ast_id_map(db).ast_id_of_view::<tag::Adt>(adt);
+                        // A node of a body's anchor tree ([`Self::maps`]) has ranges from the
+                        // anchor, so its id is read from the anchor's map, never the file's.
+                        let found = match self.maps {
+                            Some((_, ids)) => ids.try_ast_id_of_view::<tag::Adt>(adt),
+                            None => self.file_id.ast_id_map(db).try_ast_id_of_view::<tag::Adt>(adt),
+                        };
+                        let Some(ast_id) = found else {
+                            let (kind, name) = match adt {
+                                ast::Adt::Struct(it) => ("struct", it.name()),
+                                ast::Adt::Enum(it) => ("enum", it.name()),
+                                ast::Adt::Union(it) => ("union", it.name()),
+                            };
+                            let name = name.map_or_else(|| "_".to_owned(), |it| it.text().to_string());
+                            *missed = Some(NotInAstIdMap {
+                                // alloc: error path
+                                item: format!("{kind} {name}"),
+                                file: self.file_id,
+                                node: ast::ptr(adt.syntax()),
+                                anchored: self.maps.is_some(),
+                            });
+                            return None;
+                        };
                         if let Some(helpers) = self
                             .resolver
                             .def_map()

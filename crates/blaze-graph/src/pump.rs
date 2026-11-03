@@ -514,7 +514,7 @@ mod tests {
     use crate::{
         Cancelled, Key,
         pool::Pool,
-        sched::fiber::GLOBAL_TAKEN,
+        sched::LOCKS_TAKEN as GLOBAL_TAKEN,
         topology::{Cpu, Topology},
     };
 
@@ -665,14 +665,24 @@ mod tests {
         assert_eq!(flights.running(), 0);
     }
 
-    /// Key 1 run on one thread while another waits for it: what each allocates, and what the
-    /// waiter got. Each thread is a job of the scheduler before it is measured.
+    /// Key 1 run on one thread while another waits for it: what each allocates the last of
+    /// `WARM + 1` times, and what the waiter got. The two threads met before they are measured:
+    /// a thread's first wait on another's run joins their schedulers, once
+    /// ([`crate::sched::Scheduler`]).
     fn miss_then_hit<V: Clone + Send + Sync + 'static>(flights: &Flights<V>, value: V) -> (Used, Used, V) {
+        const WARM: usize = 2;
         let at = key(1);
         let linked = || flights.runs.waiters(&at) > 0;
         std::thread::scope(|scope| {
             let runner = scope.spawn(move || {
-                _ = crate::sched::job_here();
+                for _ in 0..WARM {
+                    let warm = value.clone(); // clone: a warm round's, unmeasured
+                    let ran = flights.get_or_run(at, move || {
+                        until("the waiter to link itself", linked);
+                        Ok(warm)
+                    });
+                    assert!(ran.is_ok());
+                }
                 measure(move || {
                     flights.get_or_run(at, move || {
                         until("the waiter to link itself", linked);
@@ -681,9 +691,13 @@ mod tests {
                 })
             });
             let waiter = scope.spawn(move || {
-                _ = crate::sched::job_here();
+                let ask = || flights.get_or_run(at, || panic!("the waiter ran the key"));
+                for _ in 0..WARM {
+                    until("the run to begin", || flights.running() == 1);
+                    assert!(ask().is_ok(), "a warm round's wait was cancelled");
+                }
                 until("the run to begin", || flights.running() == 1);
-                measure(|| flights.get_or_run(at, || panic!("the waiter ran the key")))
+                measure(ask)
             });
             let (ran, by_runner) = runner.join().unwrap();
             let (got, by_waiter) = waiter.join().unwrap();

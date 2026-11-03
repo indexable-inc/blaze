@@ -449,7 +449,7 @@ pub(crate) fn create_anon_const<'a, 'db: 'a>(
                     ty: StoredEarlyBinder::bind(interner, expected_ty.store()),
                     allow_using_generic_params: allow_anon_const_using_generic_params,
                 },
-                token,
+                &token,
             );
             let args = if allow_anon_const_using_generic_params {
                 GenericArgs::identity_for_item(interner, owner.generic_def(interner.db).into())
@@ -960,11 +960,11 @@ mod tests {
 
     fn complex() -> ComplexMemoryMap<'static> {
         let mut map = ComplexMemoryMap::default();
-        map.insert(0x2000, Box::new([1u8, 2, 3, 4, 5, 6, 7, 8]));
-        map.insert(0x1000, Box::new([9u8; 3]));
-        map.insert(0x1000, Box::new([10u8; 5]));
-        map.insert(0x2004, Box::new([5u8, 6]));
-        map.insert(0x3000, Box::new([0u8; 0]));
+        map.insert(0x2000, &[1u8, 2, 3, 4, 5, 6, 7, 8]);
+        map.insert(0x1000, &[9u8; 3]);
+        map.insert(0x1000, &[10u8; 5]);
+        map.insert(0x2004, &[5u8, 6]);
+        map.insert(0x3000, &[0u8; 0]);
         map.note_align(0x2000, 8);
         map.note_align(0x1000, 1);
         map.statics.push(StaticMemory {
@@ -995,11 +995,11 @@ mod tests {
     fn equal_maps_are_equal_bytes() {
         let mut other = ComplexMemoryMap::default();
         other.note_align(0x1000, 1);
-        other.insert(0x3000, Box::new([0u8; 0]));
-        other.insert(0x2004, Box::new([5u8, 6]));
-        other.insert(0x1000, Box::new([10u8; 5]));
+        other.insert(0x3000, &[0u8; 0]);
+        other.insert(0x2004, &[5u8, 6]);
+        other.insert(0x1000, &[10u8; 5]);
         other.note_align(0x2000, 8);
-        other.insert(0x2000, Box::new([1u8, 2, 3, 4, 5, 6, 7, 8]));
+        other.insert(0x2000, &[1u8, 2, 3, 4, 5, 6, 7, 8]);
         other.statics = complex().statics;
         other.note_pointer(crate::PointerAt::Value(0));
         other.note_pointer(crate::PointerAt::Memory(0x2000));

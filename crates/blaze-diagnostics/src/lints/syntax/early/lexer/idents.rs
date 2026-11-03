@@ -36,8 +36,8 @@ use stdx::list::Join;
 
 /// The lints of `check_crate` over `symbols`, sorted by where each was first seen, at the
 /// crate root `krate`.
-pub(super) fn lints(cx: &Cx<'_, '_>, symbols: Vec<Symbol<'_>>, krate: InFile<SyntaxNodePtr>) -> Vec<Emitted> {
-    diags(cx, &symbols)
+pub(super) fn lints(cx: &Cx<'_, '_>, symbols: &[Symbol<'_>], krate: InFile<SyntaxNodePtr>) -> Vec<Emitted> {
+    diags(cx, symbols)
         .into_iter()
         .map(|mut diag| {
             source_fact(cx, &mut diag, krate);

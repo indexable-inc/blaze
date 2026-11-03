@@ -92,7 +92,7 @@ pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<I
 
 /// The units [`write`] refused, each with why, as one error naming every one: what a write
 /// with no unit to charge a refusal to (the lowering's) fails with.
-pub(super) fn refused(refused: Vec<(usize, ApiError)>) -> ApiError {
+pub(super) fn refused(refused: &[(usize, ApiError)]) -> ApiError {
     let at = refused.first().and_then(|(_, error)| error.at.clone()); // clone: an error, once
     let each = refused
         .iter()

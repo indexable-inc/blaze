@@ -310,7 +310,7 @@ impl Service {
             Input::Created { run, result } => self.created(run, result, out),
             Input::Unpinned { root, why } => self.unpinned(root, &why, out),
             Input::Snapshotted(result) => self.snapshotted(result, out),
-            Input::Removed { id, result } => self.removed(id, result, out),
+            Input::Removed { id, result } => self.removed(&id, result, out),
         }
     }
 
@@ -325,7 +325,7 @@ impl Service {
                 // alloc: once per event, the new job's ref
                 self.arrive(format!("pr/{number}"), head, JobKind::Pull { number, base }, out);
             }
-            Event::Tag { name, commit } => self.tag(name, commit, out),
+            Event::Tag { name, commit } => self.tag(&name, commit, out),
         }
     }
 
@@ -341,11 +341,11 @@ impl Service {
         self.try_start(job, out);
     }
 
-    fn tag(&mut self, name: String, commit: String, out: &mut Vec<Output>) {
-        // alloc: clone: once per tag, the job's ref and its kind's name
-        let job = self.new_job(format!("tag/{name}"), commit, JobKind::Tag { name: name.clone() }, true, out);
+    fn tag(&mut self, name: &str, commit: String, out: &mut Vec<Output>) {
+        // alloc: once per tag, the job's ref and its kind's name
+        let job = self.new_job(format!("tag/{name}"), commit, JobKind::Tag { name: name.to_owned() }, true, out);
         let idle = self.train.running.is_none();
-        let replaced = self.train.arrive(name.clone()); // clone: once per tag, the train's
+        let replaced = self.train.arrive(name.to_owned()); // alloc: once per tag, the train's
         if idle {
             self.release_running = Some(job);
             self.try_start(job, out);
@@ -821,8 +821,8 @@ impl Service {
         }
     }
 
-    fn removed(&mut self, id: String, result: Result<(), String>, out: &mut Vec<Output>) {
-        self.removing.remove(&id);
+    fn removed(&mut self, id: &str, result: Result<(), String>, out: &mut Vec<Output>) {
+        self.removing.remove(id);
         match result {
             Ok(()) => {
                 self.state.snapshots.retain(|it| it.id != id);

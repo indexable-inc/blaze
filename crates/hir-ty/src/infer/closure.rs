@@ -6,9 +6,10 @@ use std::{iter, mem, ops::ControlFlow};
 
 use hir_def::{
     AdtId, TraitId,
-    hir::{ClosureKind, CoroutineKind, CoroutineSource, ExprId, PatId},
+    hir::{ClosureKind, CoroutineKind, CoroutineSource, Expr, ExprId, PatId},
     type_ref::TypeRefId,
 };
+use hir_expand::name::Name;
 use rustc_abi::ExternAbi;
 use rustc_type_ir::{
     AliasTyKind, ClosureArgs, ClosureArgsParts, CoroutineArgs, CoroutineArgsParts,
@@ -989,6 +990,17 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         closure_kind: ClosureKind,
     ) -> PolyFnSig<'db> {
         let interner = self.interner();
+        let store = self.store;
+        if let Expr::Closure { binder, .. } = store.expr(closure_expr)
+            && !binder.is_empty()
+        {
+            return self.supplied_sig_of_closure_under_binder(
+                closure_expr,
+                store.names(binder),
+                decl_inputs,
+                decl_output,
+            );
+        }
 
         let supplied_return = match decl_output {
             Some(output) => self.make_ty(output),
@@ -1031,12 +1043,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let mut supplied = Vec::with_capacity_in(decl_inputs.len(), self.frame);
         let bound_vars =
             self.with_ty_lowering(|ctx| ctx.lower_closure_params(decl_inputs, &mut supplied));
-        let supplied_arguments = supplied.into_iter().map(|input| match input {
-            // The solver takes no type with a lifetime bound outside it.
-            Some(ty) if ty.has_escaping_bound_vars() => self.table.insert_type_vars(ty),
-            Some(ty) => self.process_user_written_ty(ty),
-            None => self.table.next_ty_var(closure_expr.into()),
-        });
+        let supplied_arguments =
+            supplied.into_iter().map(|input| self.supplied_ty(closure_expr, input));
 
         Binder::bind_with_vars(
             interner.mk_fn_sig(
@@ -1048,6 +1056,50 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             ),
             bound_vars,
         )
+    }
+
+    /// The signature a closure with a `for<'a, ..>` binder is written with (rustc's
+    /// `ClosureBinder::For`, `#![feature(closure_lifetime_binder)]`): its late-bound lifetimes
+    /// are the binder's, which its parameters and return type name, and no others. rustc
+    /// takes it as it takes any closure's written signature, so an expected one still wins
+    /// (`sig_of_closure_with_expectation`); without one this is the closure's, and its body
+    /// has what it implies (`for<'a, 'c> |_: &'a &'c (), v: &'c u8| -> &'a u8 { v }`). rustc
+    /// requires the return type written (`ClosureImplicitHrtb`); one left out is a variable.
+    fn supplied_sig_of_closure_under_binder(
+        &mut self,
+        closure_expr: ExprId,
+        binder: &[Name],
+        decl_inputs: &[Option<TypeRefId>],
+        decl_output: Option<TypeRefId>,
+    ) -> PolyFnSig<'db> {
+        let mut supplied = Vec::with_capacity_in(decl_inputs.len(), self.frame);
+        let (output, bound_vars) = self.with_ty_lowering(|ctx| {
+            ctx.lower_closure_signature_under_binder(binder, decl_inputs, decl_output, &mut supplied)
+        });
+        let interner = self.interner();
+        let supplied_return = self.supplied_ty(closure_expr, output);
+        let supplied_arguments =
+            supplied.into_iter().map(|input| self.supplied_ty(closure_expr, input));
+        Binder::bind_with_vars(
+            interner.mk_fn_sig(
+                supplied_arguments,
+                supplied_return,
+                false,
+                Safety::Safe,
+                ExternAbi::RustCall,
+            ),
+            bound_vars,
+        )
+    }
+
+    /// A type of a closure's written signature, lowered: a variable where none is written.
+    fn supplied_ty(&mut self, closure_expr: ExprId, ty: Option<Ty<'db>>) -> Ty<'db> {
+        match ty {
+            // The solver takes no type with a lifetime bound outside it.
+            Some(ty) if ty.has_escaping_bound_vars() => self.table.insert_type_vars(ty),
+            Some(ty) => self.process_user_written_ty(ty),
+            None => self.table.next_ty_var(closure_expr.into()),
+        }
     }
 
     /// Invoked when we are translating the coroutine that results

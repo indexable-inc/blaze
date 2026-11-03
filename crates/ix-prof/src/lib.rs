@@ -453,7 +453,7 @@ fn halt(session: &Session) {
     let ticking = session.ticker.lock().take();
     if let Some(ticking) = ticking {
         ticking.thread().unpark();
-        let _wait = tracing::info_span!(target: "ix_prof", "join", wait = "thread", on = "ix-prof-ticker").entered();
+        let _wait = tracing::info_span!(target: "blaze::ix_prof", "join", wait = "thread", on = "ix-prof-ticker").entered();
         let _ = ticking.join();
     }
     #[cfg(all(feature = "http", unix))]

@@ -109,6 +109,22 @@ mod unix {
         checked(waited).map(drop)
     }
 
+    /// One `waitid(WEXITED | WNOHANG | WNOWAIT)` of `pid`: whether it has exited, leaving it
+    /// unreaped either way. `ECHILD` (no child `pid`: reaped already) is the caller's to read.
+    pub(crate) fn has_exited(pid: libc::pid_t) -> io::Result<bool> {
+        // SAFETY: as in `wait_exited`: all-zero bytes is a valid `siginfo_t`.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live local the call writes and does not keep.
+        let waited = unsafe {
+            libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
+        };
+        checked(waited)?;
+        // With `WNOHANG` a child that has not exited leaves `info` as it was: its pid 0.
+        // SAFETY: `info` is whole and initialized (zeroed, then written by the call); `si_pid`
+        // reads the field of a `SIGCHLD`'s record, which is what `waitid` fills.
+        Ok(unsafe { info.si_pid() } != 0)
+    }
+
     /// `O_NONBLOCK` added to `fd`'s status flags.
     pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
         // SAFETY: `fd` is borrowed open for the call; `F_GETFL` takes no pointer.

@@ -17,7 +17,7 @@
 //! prefetch together), written only by its thread: entering and leaving a task writes no line
 //! another core writes.
 
-use std::{cell::Cell, marker::PhantomData, num::NonZeroUsize, ptr};
+use std::{cell::Cell, marker::PhantomData, mem::ManuallyDrop, num::NonZeroUsize, ptr};
 
 use crate::sync::{
     atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence},
@@ -160,29 +160,72 @@ pub struct Guard {
 
 /// Begins a task on this thread, or nests in the one it is in. The outermost call writes the
 /// thread's own slot once; a nested one touches only thread-local counts.
+///
+/// Out of line, as is the guard's drop: a guard is held across waits (a job's whole task), and
+/// a fiber that waits may resume on another thread, so the thread-local this reads must not be
+/// inlined into a caller that could keep its address across the wait (AGENTS.md rule 24). A
+/// hot reader that never waits inside its read takes [`pinned`] instead.
+#[inline(never)]
 pub fn enter() -> Guard {
     LOCAL.with(|local| {
         let depth = local.depth.get();
         if depth == 0 {
-            let slot = match local.slot.get() {
-                Some(slot) => slot,
-                None => {
-                    let slot = claim();
-                    local.slot.set(Some(slot));
-                    slot
-                }
-            };
-            // Acquire: an epoch after a grace's start comes with everything unlinked before it.
-            // Release: this store replaces the `OUT` the thread's last task ended with, so a
-            // writer that reads it must still be ordered after that task's reads.
-            slot.since.store(EPOCH.load(Ordering::Acquire), Ordering::Release);
-            // Against `Grace::start`'s fence: either the writer's scan sees this slot, or the
-            // loads this task does next see what the writer unlinked.
-            fence(Ordering::SeqCst);
+            begin(local);
         }
         local.depth.set(depth + 1);
     });
     Guard { _thread: PhantomData }
+}
+
+/// Runs `f` in a task: in the one this thread is in, nested, or in one begun for it and ended
+/// as it returns (or unwinds). What `f` reads from a shared table stays valid until it returns,
+/// and nothing of it after. One thread-local access, which spans `f`, so `f` must never wait: a
+/// fiber that waits may resume on another thread, and this would then end the task of the
+/// thread it left (AGENTS.md rule 24). This crate is below the scheduler, so it cannot check
+/// that; a caller that can marks `f` a `NoWait` region (blaze-graph). For a lookup of a hot
+/// table that probes it and returns (hir-ty's interner index), where [`enter`]'s guard costs
+/// two out-of-line calls.
+#[inline(never)]
+pub fn pinned<R>(f: impl FnOnce() -> R) -> R {
+    /// Ends the task of [`pinned`] as a guard's drop does, on return or unwind.
+    struct Leave<'a>(&'a Local);
+
+    impl Drop for Leave<'_> {
+        fn drop(&mut self) {
+            leave(self.0);
+        }
+    }
+
+    LOCAL.with(|local| {
+        let depth = local.depth.get();
+        if depth == 0 {
+            begin(local);
+        }
+        local.depth.set(depth + 1);
+        let _leave = Leave(local);
+        f()
+    })
+}
+
+/// The outermost [`enter`]: writes the thread's slot.
+#[cold]
+#[inline(never)]
+fn begin(local: &Local) {
+    let slot = match local.slot.get() {
+        Some(slot) => slot,
+        None => {
+            let slot = claim();
+            local.slot.set(Some(slot));
+            slot
+        }
+    };
+    // Acquire: an epoch after a grace's start comes with everything unlinked before it.
+    // Release: this store replaces the `OUT` the thread's last task ended with, so a writer that
+    // reads it must still be ordered after that task's reads.
+    slot.since.store(EPOCH.load(Ordering::Acquire), Ordering::Release);
+    // Against `Grace::start`'s fence: either the writer's scan sees this slot, or the loads this
+    // task does next see what the writer unlinked.
+    fence(Ordering::SeqCst);
 }
 
 /// Moves the task this thread is in off it, for a job that parks on a fiber and resumes on
@@ -248,18 +291,23 @@ pub fn in_task() -> bool {
 }
 
 impl Drop for Guard {
+    /// Out of line, as [`enter`] is.
+    #[inline(never)]
     fn drop(&mut self) {
-        LOCAL.with(|local| {
-            let depth = local.depth.get() - 1;
-            local.depth.set(depth);
-            if depth == 0
-                && let Some(slot) = local.slot.get()
-            {
-                // Release: every read of the task happens before a writer that sees it out
-                // frees what was read.
-                slot.since.store(OUT, Ordering::Release);
-            }
-        });
+        LOCAL.with(leave);
+    }
+}
+
+/// Leaves one level of this thread's task; the outermost ends it ([`Guard`]'s drop, [`pinned`]).
+fn leave(local: &Local) {
+    let depth = local.depth.get() - 1;
+    local.depth.set(depth);
+    if depth == 0
+        && let Some(slot) = local.slot.get()
+    {
+        // Release: every read of the task happens before a writer that sees it out frees what
+        // was read.
+        slot.since.store(OUT, Ordering::Release);
     }
 }
 
@@ -319,14 +367,28 @@ pub struct Limbo {
 }
 
 impl Limbo {
-    pub fn new() -> Limbo {
-        Limbo::default()
+    /// An empty limbo; `const`, so a table in a `static` keeps one (hir-ty's interner index).
+    pub const fn new() -> Limbo {
+        Limbo { held: Vec::new() }
     }
 
     /// Holds `value`, unlinked before `grace` started, until `grace` has passed. One grace may
     /// cover any number of values unlinked before it.
-    pub fn hold(&mut self, grace: Grace, value: impl Send + Sync + 'static) {
-        self.held.push((grace, Box::new(value)));
+    ///
+    /// A reader may still be in `value`, so it is never dropped here: an allocation that fails
+    /// (the box, or the list's room for it; in the daemon a failed allocation panics) unwinds
+    /// with `value` leaked, never freed under its readers.
+    pub fn hold<T: Send + Sync + 'static>(&mut self, grace: Grace, value: T) {
+        let value = ManuallyDrop::new(value);
+        // alloc: the list's room for one more, the owner's (charged to the tag its caller runs
+        // under), before the box, so the push below cannot fail
+        self.held.reserve(1);
+        // alloc: the value's box, as above
+        let boxed = Box::into_raw(Box::new(value));
+        // SAFETY: `ManuallyDrop<T>` is `repr(transparent)` over `T`, so the box's allocation and
+        // layout are a `Box<T>`'s; from here the limbo owns the value and drops it once passed.
+        let boxed: Box<T> = unsafe { Box::from_raw(boxed.cast::<T>()) };
+        self.held.push((grace, boxed));
     }
 
     /// Holds `value`, unlinked just now, under a grace of its own.
@@ -345,6 +407,22 @@ impl Limbo {
         before - self.held.len()
     }
 
+    /// Takes out what had passed its grace by `horizon`, for the caller to drop once it has let
+    /// go of what guards this limbo ([`Passed`]). For a limbo behind a lock other threads wait
+    /// on: the scan of every thread's slot that says which graces passed is the caller's,
+    /// taken before it locks ([`Horizon::now`], as [`scans`] asks), and a value's drop (a free
+    /// of a table, as big as the table) runs after the lock is let go. Here it is a walk of the
+    /// held graces. [`Limbo::collect`] is for an owner no other thread waits on.
+    pub fn collect_passed(&mut self, horizon: Horizon) -> Passed {
+        if !self.held.iter().any(|(grace, _)| horizon.passed(*grace)) {
+            return Passed(Vec::new());
+        }
+        // alloc: the passed values' list, dropped by the caller with its lock let go; charged to
+        // the tag it runs under, as the limbo's own list is
+        let passed = self.held.extract_if(.., |(grace, _)| horizon.passed(*grace));
+        Passed(passed.map(|(_, value)| value).collect())
+    }
+
     /// How many values it holds.
     pub fn len(&self) -> usize {
         self.held.len()
@@ -352,6 +430,22 @@ impl Limbo {
 
     pub fn is_empty(&self) -> bool {
         self.held.is_empty()
+    }
+}
+
+/// Values a [`Limbo`] let go of, each past its grace ([`Limbo::collect_passed`]): dropped when
+/// this drops, which its taker does once it has let go of the lock its limbo sits behind.
+#[must_use = "dropping it drops the values: drop it once the limbo's lock is let go"]
+pub struct Passed(Vec<Box<dyn Send + Sync>>);
+
+impl Passed {
+    /// How many values it holds.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 

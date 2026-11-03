@@ -1,7 +1,7 @@
 //! The dense query engine: queries keyed by [`Id`], memos in place in pages by ID, a warm hit of
 //! four dependent loads, durability kinds, early cutoff by `==`, single flight through
-//! `blaze_graph`'s plane, fixpoint cycles, captured reads, capped values evicted by W-TinyLFU
-//! admission (`admission`), and provenance. What the front end
+//! `blaze_graph`'s plane, fixpoint cycles, captured reads, values kept by their bytes under
+//! their memory tag's budget (`budget`), and provenance. What the front end
 //! runs on (`#[blaze_query::tracked]` and the rest generate against it, see `plumbing`); the
 //! content-keyed engine of the crate root is a separate thing.
 //!
@@ -14,7 +14,7 @@
 
 use std::{fmt, panic::UnwindSafe};
 
-mod admission;
+mod budget;
 mod capture;
 mod counts;
 mod dense;
@@ -34,7 +34,6 @@ mod tracked;
 mod value;
 mod verify;
 
-pub use admission::Eviction;
 pub use capture::{
     Read, ReadKind, Reads, capture_reads, for_span_text, replay_reads, unshareable_reads,
 };
@@ -55,7 +54,7 @@ pub mod plumbing {
 
     pub use super::{
         function::{
-            CycleKind, Function, MAX_ROUNDS, evict_values, evict_values_of, fetch, set_lru_capacity,
+            CycleKind, Function, MAX_ROUNDS, evict_values, evict_values_of, fetch,
         },
         ingredient::{Ingredient, Kind, Vtable},
         input::{
@@ -72,13 +71,30 @@ pub mod plumbing {
     };
 }
 
-/// What [`Storage::memory_usage`] reports of one ingredient.
-#[derive(Clone, Copy, Debug)]
+/// What [`Storage::memory_usage`] reports of one ingredient, or of one of the dependency
+/// graph's columns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MemoryUsage {
     pub name: &'static str,
+    /// Rows made: a function's are its pages times 1024 rows, one page per ID page of
+    /// its keys that it has any key in, so a function keyed by an ID of a sparse page has most
+    /// of its rows empty.
     pub rows: u64,
+    /// Rows in use: a function's that ran (each holds a node), every row of another
+    /// ingredient. What `rows` holds past this is pages made for keys never run.
+    pub used: u64,
+    /// The bytes of every row made, a value kept in place in its row included.
     pub row_bytes: u64,
+    /// What values hold beside their rows: a budgeted (`lru`) function's weight, what its
+    /// `weigh` counts; 0 for anything else, whose values' own heap is not counted.
     pub value_bytes: u64,
+}
+
+impl MemoryUsage {
+    /// What it holds: its rows' bytes and what its values hold beside them.
+    pub fn held(&self) -> u64 {
+        self.row_bytes + self.value_bytes
+    }
 }
 
 /// A row of an ingredient: what events and reads name.
@@ -132,7 +148,9 @@ pub enum Cancelled {
     /// Waiting for a key another task runs would have closed a cycle of tasks: this one gives
     /// way, and meets the cycle on its own stack when it runs again.
     WouldWaitOnItself {
-        /// The key whose wait was refused; `None` only from a test that gives way by hand.
+        /// The key whose wait was refused; `None` for a wait on what no query key names: a
+        /// proc macro's session's turn (`blaze-macro-eval`'s `turn`), or a test that gives way
+        /// by hand.
         asked: Option<DatabaseKeyIndex>,
     },
     /// A host rethrew a job's panic.
@@ -219,6 +237,76 @@ pub fn with_fuel<R>(steps: u64, f: impl FnOnce() -> R) -> Result<(R, u64), OutOf
     }
 }
 
+/// Why [`with_steps`]'s walk stopped: it had taken `steps` distinct steps, all it was given,
+/// and was taking another, `at`, as the walk named it ([`step`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct OutOfSteps {
+    pub steps: u64,
+    pub at: String,
+}
+
+impl fmt::Display for OutOfSteps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let OutOfSteps { steps, at } = self;
+        write!(f, "took {steps} distinct steps, all it was given, and was taking another: {at}")
+    }
+}
+
+impl std::error::Error for OutOfSteps {}
+
+/// Runs `f`, a walk that may take at most `steps` distinct steps on this task, each a key it
+/// gives [`step`]: what bounds a walk by a measure of the walk itself (rule 15), where
+/// [`with_fuel`] bounds the engine's work under it. A step is taken once however often it is
+/// given, whether the rows it stands for were run, verified or already up to date, so a walk
+/// that gives a step for each thing it reaches takes the same steps on a cold database, a warm
+/// one and a busy one: its count, and whether it ran out, depend only on what it walks.
+/// Out of steps, the step being given unwinds, as a panic there does (the rows open under it
+/// are left empty, and a later call runs them again), and `f` gives way with [`OutOfSteps`].
+/// Ended, it gives what `f` gave and the steps it took. Nested, the inner bound is at most what
+/// the outer has left, and its steps are the outer's too.
+///
+/// Only this task is bounded, as with [`with_fuel`]: a job pumped onto its thread while it
+/// waits, or one it hands to the pool, gives its steps to no one's bound but its own.
+pub fn with_steps<R>(steps: u64, f: impl FnOnce() -> R) -> Result<(R, u64), OutOfSteps> {
+    let outer = local::with(|local| local.steps(steps));
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    let taken = local::with(|local| local.unsteps(outer));
+    match ran {
+        Ok(value) => Ok((value, taken)),
+        Err(payload) => match payload.downcast::<OutOfSteps>() {
+            Ok(out) => Err(*out),
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
+/// The step `key` of the walk [`with_steps`] bounds on this task; nothing outside one, where
+/// `key` is never made (a walk gives a step on its hot path, bounded or not). A key already
+/// taken costs nothing. With none left, unwinds with [`OutOfSteps`], `at` saying what
+/// the step was: `at` runs only then, with the bound set aside, so a `Debug` that reads a row
+/// or gives a step can't run out again there, and a panic in it leaves the step unnamed.
+#[inline]
+pub fn step(key: impl FnOnce() -> u128, at: impl FnOnce() -> String) {
+    if !local::with(|local| local.stepping()) {
+        return;
+    }
+    let key = key();
+    if let Some(steps) = local::with(|local| local.step(key)) {
+        out_of_steps(steps, key, at);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn out_of_steps(steps: u64, key: u128, at: impl FnOnce() -> String) -> ! {
+    let bound = local::with(|local| local.steps.take());
+    let named = std::panic::catch_unwind(std::panic::AssertUnwindSafe(at));
+    local::with(|local| local.steps = bound);
+    // alloc: an error's text, once per bound that trips
+    let at = named.unwrap_or_else(|_| format!("the step {key:#x} (its name panicked)"));
+    std::panic::resume_unwind(Box::new(OutOfSteps { steps, at })) // alloc: an unwind's payload
+}
+
 /// Unwinds the task out of fuel ([`with_fuel`]), at `F`'s row of `key`, which it names as
 /// [`function::Function::write_key`] shows it with `db` attached. The bound is set aside while
 /// the key is written, so a `Debug` that reads a row is not charged and can't run out again
@@ -240,6 +328,246 @@ pub(crate) fn out_of_fuel<F: function::Function>(db: &F::Db, steps: u64, index: 
     };
     let out = OutOfFuel { steps, query: ingredient::name(index), key: id, value, depth };
     std::panic::resume_unwind(Box::new(out)) // alloc: an unwind's payload
+}
+
+/// What a [`Runaway`] held past its bound.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Over {
+    /// One run's reads on its thread's edge stack (`local::RUN_READS`).
+    Reads,
+    /// The rows a verify proved on its assumption and holds pending (`local::PENDING_FLOOR`
+    /// past the storage's node count).
+    Pending,
+    /// The rounds one refresh of a row went without the row coming up to date.
+    Rounds,
+}
+
+/// Why a query unwound instead of growing its task's query stack without end (rule 15): it
+/// held `held` of what [`Over`] names, past the `bound` it may hold. `query` and `key` name it,
+/// with `value` the key as its type shows it (read while the database was attached). It is
+/// the `depth`-th of the `frames` queries running or verifying on its task's stack (outermost
+/// 1), and `most` is what it held most often, most first, with how many times (each read's
+/// query or input field and key, counted over its last [`Runaway::WINDOW`] entries): the loop's
+/// body. The query and every query under it on the task's stack fail, their rows left empty to
+/// run again, as a panic in them would (rule 17), and a host reports this text
+/// ([`unwind_text`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Runaway {
+    pub over: Over,
+    pub query: &'static str,
+    pub key: Id,
+    pub value: String,
+    pub depth: usize,
+    pub frames: usize,
+    pub held: u64,
+    pub bound: u64,
+    pub most: Vec<(String, u64)>,
+}
+
+impl Runaway {
+    /// The entries at the top of the stack that `most` is counted over.
+    pub const WINDOW: usize = 1 << 20;
+    /// The most dependencies `most` names.
+    pub const MOST: usize = 8;
+}
+
+impl fmt::Display for Runaway {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Runaway { over, query, key, value, depth, frames, held, bound, most } = self;
+        match over {
+            Over::Reads => write!(
+                f,
+                "`{query}` of {value} ({key:?}) held {held} reads in one run, past the {bound} a \
+                 run may hold on its query stack (rule 15): it keeps reading"
+            )?,
+            Over::Pending => write!(
+                f,
+                "the verify of `{query}` of {value} ({key:?}) held {held} rows proved on its \
+                 assumption pending, past its bound of {bound} (the storage's rows and a margin, \
+                 rule 15): rows proved again and again while it is open"
+            )?,
+            Over::Rounds => write!(
+                f,
+                "`{query}` of {value} ({key:?}) went round its refresh {held} times without coming \
+                 up to date, past the bound of {bound} (rule 15)"
+            )?,
+        }
+        write!(f, "; it is query {depth} of the {frames} on its task's query stack")?;
+        for (at, (what, count)) in most.iter().enumerate() {
+            f.write_str(if at == 0 { "; what it held most: " } else { ", " })?;
+            write!(f, "{what} {count} times")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Runaway {}
+
+/// The text of an unwind the engine raised ([`Runaway`], [`OutOfFuel`], [`OutOfSteps`],
+/// [`Cancelled`]), for a host reporting a job's panic; `None` for any other payload (a
+/// `panic!`'s text is `stdx::panic_text`'s).
+// dyn: a panic's payload, read once per panicked job
+pub fn unwind_text(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    // alloc: an error's text, once per panicked job
+    if let Some(it) = payload.downcast_ref::<Runaway>() {
+        Some(it.to_string())
+    } else if let Some(it) = payload.downcast_ref::<OutOfFuel>() {
+        Some(it.to_string())
+    } else if let Some(it) = payload.downcast_ref::<OutOfSteps>() {
+        Some(it.to_string())
+    } else {
+        payload.downcast_ref::<Cancelled>().map(Cancelled::to_string)
+    }
+}
+
+/// What a task past a bound held, read off its stack: the frame of the query that fails, and
+/// the node keys it held most.
+struct Stuck {
+    over: Over,
+    ingredient: u32,
+    id: Id,
+    depth: usize,
+    frames: usize,
+    held: u64,
+    bound: u64,
+    most: Vec<(u64, u64)>,
+}
+
+/// The `Runaway::MOST` nodes `nodes` holds most often, most first (ties by node, so the order
+/// is the same on every run), as their keys, with their counts.
+fn most_held(storage: &Storage, nodes: impl Iterator<Item = u32>) -> Vec<(u64, u64)> {
+    // alloc: an error's counts, once per bound that trips
+    let mut counts =
+        hashbrown::HashMap::<u32, u64, blaze_hash::FixedState>::with_hasher(blaze_hash::FixedState);
+    for node in nodes {
+        *counts.entry(node).or_insert(0) += 1;
+    }
+    let mut most: Vec<(u32, u64)> = counts.into_iter().collect(); // alloc: as above
+    most.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    most.truncate(Runaway::MOST);
+    // alloc: as above
+    most.into_iter().map(|(node, count)| (storage.key_of(node), count)).collect()
+}
+
+/// Fails the run on top of the task's stack, which holds more reads than it may
+/// (`Local::read`, `Local::replay`, which said so): unwinds with [`Runaway`] naming it and
+/// what it read most.
+#[cold]
+#[inline(never)]
+pub(crate) fn runaway_reads(storage: &Storage) -> ! {
+    let stuck = local::with(|local| {
+        let at = local.frames.len() - 1;
+        let frame = &local.frames[at];
+        let start = frame.edges_start as usize;
+        let (depth, frames) = local.task_depth(at);
+        let reads = &local.edges[start..];
+        let window = &reads[reads.len().saturating_sub(Runaway::WINDOW)..];
+        Stuck {
+            over: Over::Reads,
+            ingredient: frame.ingredient,
+            id: Id::from_u32(frame.id),
+            depth,
+            frames,
+            held: reads.len() as u64,
+            bound: local.bounds.run_reads,
+            most: most_held(storage, window.iter().copied()),
+        }
+    });
+    unwind_runaway(storage, stuck)
+}
+
+/// Fails the verify at stack index `head`, whose pending list is past its bound for a storage
+/// of `rows` nodes (`Local::push_pending` said so): unwinds with [`Runaway`] naming it and the
+/// rows pending most often.
+#[cold]
+#[inline(never)]
+pub(crate) fn runaway_pending(storage: &Storage, head: u32, rows: u64) -> ! {
+    let stuck = local::with(|local| {
+        let frame = &local.frames[head as usize];
+        let (depth, frames) = local.task_depth(head as usize);
+        let pending = &local.pending[local.pending.len().saturating_sub(Runaway::WINDOW)..];
+        Stuck {
+            over: Over::Pending,
+            ingredient: frame.ingredient,
+            id: Id::from_u32(frame.id),
+            depth,
+            frames,
+            held: local.pending.len() as u64,
+            bound: local.pending_bound(rows),
+            most: most_held(storage, pending.iter().map(|it| it.node)),
+        }
+    });
+    unwind_runaway(storage, stuck)
+}
+
+/// Fails the refresh of row `id` of `index`, which went round `rounds` times, past `bound`,
+/// without coming up to date: unwinds with [`Runaway`] naming it.
+#[cold]
+#[inline(never)]
+pub(crate) fn runaway_rounds(storage: &Storage, index: u32, id: Id, rounds: u64, bound: u64) -> ! {
+    let frames = local::with(|local| local.task_frames()) + 1;
+    let stuck = Stuck {
+        over: Over::Rounds,
+        ingredient: index,
+        id,
+        depth: frames,
+        frames,
+        held: rounds,
+        bound,
+        most: Vec::new(), // alloc: none, empty
+    };
+    unwind_runaway(storage, stuck)
+}
+
+/// Names what `stuck` read off the stack and unwinds with it. The names are written with a
+/// barrier on top of the task's stack: what a key's `Debug` reads is recorded into no run (the
+/// failing run's stack is at its bound), meets no frame below it as a cycle, and is charged to
+/// no fuel or step bound; a `Debug` that panics or gives way leaves its key named by its ID.
+#[cold]
+#[inline(never)]
+fn unwind_runaway(storage: &Storage, stuck: Stuck) -> ! {
+    let Stuck { over, ingredient, id, depth, frames, held, bound, most } = stuck;
+    let barrier = local::barrier();
+    let value = key_text(storage, ingredient, id);
+    // alloc: an error's names, once per bound that trips
+    let most = most.into_iter().map(|(key, count)| (node_text(storage, key), count)).collect();
+    drop(barrier);
+    let query = ingredient::name(ingredient);
+    let out = Runaway { over, query, key: id, value, depth, frames, held, bound, most };
+    tracing::error!(target: "blaze", runaway = %out, "a query held past its bound and fails");
+    std::panic::resume_unwind(Box::new(out)) // alloc: an unwind's payload
+}
+
+/// Row `id` of ingredient `index`'s key as its type shows it ([`ingredient::Vtable`]'s
+/// `write_key`), or its ID.
+fn key_text(storage: &Storage, index: u32, id: Id) -> String {
+    let write = ingredient::vtable(index).and_then(|it| it.write_key);
+    let written = write.map(|write| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut out = String::new(); // alloc: an error's text, once per bound that trips
+            write(storage, id, &mut out);
+            out
+        }))
+    });
+    match written {
+        Some(Ok(text)) => text,
+        Some(Err(_)) => format!("{id:?} (its key's `Debug` failed)"), // alloc: as above
+        None => format!("{id:?}"),                                     // alloc: as above
+    }
+}
+
+/// The dependency a node key names: a query's row (`` `query`(key) ``) or an input's or
+/// tracked struct's field (`` `Input.field`(Id) ``).
+fn node_text(storage: &Storage, key: u64) -> String {
+    let (index, id, field) = storage::key_parts(key);
+    let name = ingredient::name(index);
+    match ingredient::vtable(index).map(|it| (it.kind, it.fields)) {
+        Some((ingredient::Kind::Input | ingredient::Kind::Tracked, fields)) => {
+            let field = fields.get(field as usize).copied().unwrap_or("?");
+            format!("`{name}.{field}`({id:?})") // alloc: an error's text, once per bound that trips
+        }
+        _ => format!("`{name}`({})", key_text(storage, index, id)), // alloc: as above
+    }
 }
 
 /// What a fixpoint's `cycle_fn` is told of the round.
@@ -301,8 +629,8 @@ pub fn pump_barrier<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// `task(at)` for each `at` in `0..count`, each a job of its own on the pool this thread's
-/// loops run on, inside a [`pump_barrier`]. A task that gave way
+/// `task(at)` for each `at` in `0..count`, each run in a job on the pool this thread's loops
+/// run on (at most [`blaze_graph::par::WINDOW`] per worker at once), inside a [`pump_barrier`]. A task that gave way
 /// ([`Cancelled::WouldWaitOnItself`]: its wait would have closed a cycle of tasks) runs again
 /// here once the others ended, on this thread and outside the barrier, where it meets the
 /// cycle on its own stack: never in another round on the pool, which would meet the same cycle
@@ -314,6 +642,10 @@ pub fn pump_barrier<R>(f: impl FnOnce() -> R) -> R {
 /// left a job some other way would reach a caller with no query below it as a panic with no
 /// message.
 pub fn par_for_each(count: usize, task: impl Fn(usize) + Sync) {
+    // The caller's attached database (or none), lent to each task too: a task formats what
+    // its caller would, on whichever worker it runs, not whatever that worker had.
+    let lent = Lent(local::with(|local| local.attached));
+    let task = |at: usize| lent.within(|| task(at));
     let again = pump_barrier(|| {
         blaze_graph::par::for_each_giving_way(count, &task, |panic| {
             matches!(panic.downcast_ref::<Cancelled>(), Some(Cancelled::WouldWaitOnItself { .. }))
@@ -347,7 +679,8 @@ pub(crate) fn carried() -> blaze_graph::sched::Carried {
 /// Lends `db` to the `Debug` impls that read a database (the engine's own, through
 /// [`with_attached`], and a front end's, through [`with_attached_db`]) while `f` runs: the one
 /// way a database is attached. Every query's run has its own database attached; a driver
-/// attaches where it formats outside one. It is part of the task's stack, so a job that waits inside `f`
+/// attaches where it formats outside one, and a loop's tasks ([`par_for_each`], [`par_map`])
+/// have their caller's. It is part of the task's stack, so a job that waits inside `f`
 /// and resumes on another thread still has it there, and the one attached before (another
 /// database, or none) is put back when `f` returns or unwinds.
 ///
@@ -355,22 +688,43 @@ pub(crate) fn carried() -> blaze_graph::sched::Carried {
 /// an error's text made inside `f`, never a way to make a query's output depend on the thread
 /// that ran it.
 pub fn attach<D: Database, R>(db: &D, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<local::Attached>);
-
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let before = self.0;
-            local::with(|local| local.attached = before);
-        }
-    }
-
     let lent = local::Attached {
         db: std::ptr::NonNull::from(db).cast(),
         ty: std::any::TypeId::of::<D>(),
         storage: std::ptr::NonNull::from(db.storage()),
     };
-    let _restore = Restore(local::with(|local| local.attached.replace(lent)));
-    f()
+    Lent(Some(lent)).within(f)
+}
+
+/// A database [`attach`] lent (or none), to lend again: the one place a task's attached
+/// database is set and put back.
+#[derive(Clone, Copy)]
+struct Lent(Option<local::Attached>);
+
+// SAFETY: a `Lent` is made from a borrow (`attach`'s `&D`, or the caller's own attached one in
+// `par_for_each`) that outlives every task it is lent to, since `par_for_each` returns only
+// once each has ended; and a database is shared by the pool's workers as it is, so reading it
+// from another thread is what its queries already do.
+unsafe impl Send for Lent {}
+// SAFETY: as above.
+unsafe impl Sync for Lent {}
+
+impl Lent {
+    /// `f` with this attached (or none), the one attached before put back when `f` returns or
+    /// unwinds.
+    fn within<R>(self, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<local::Attached>);
+
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let before = self.0;
+                local::with(|local| local.attached = before);
+            }
+        }
+
+        let _restore = Restore(local::with(|local| std::mem::replace(&mut local.attached, self.0)));
+        f()
+    }
 }
 
 /// `f` with the storage of the database [`attach`] lent this task, if any.

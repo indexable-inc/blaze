@@ -60,6 +60,23 @@ pub struct SpanMap<A: Allocator + Clone = Global> {
     fragment_spans: Vec<(TextRange, Span), A>,
 }
 
+impl<A: Allocator + Clone> SpanMap<A> {
+    /// The heap the map holds, in bytes: its arrays by capacity and the index made by a first
+    /// map down, for a query that keeps maps by their bytes.
+    pub fn heap_bytes(&self) -> usize {
+        fn of<T, A: Allocator>(vec: &Vec<T, A>) -> usize {
+            vec.capacity() * size_of::<T>()
+        }
+        of(&self.ends)
+            + of(&self.spans)
+            + self.by_anchor.get().map_or(0, |it| size_of_val(&**it))
+            + size_of_val(&*self.made_idents)
+            + of(&self.fragment_starts)
+            + of(&self.fragment_ends)
+            + of(&self.fragment_spans)
+    }
+}
+
 thread_local! {
     /// The scratch of the radix sorts of a map's fragment offsets, kept by the worker.
     static OFFSET_SORT: RefCell<Scratch<TextSize>> = const { RefCell::new(Scratch::new()) };

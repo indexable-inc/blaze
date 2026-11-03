@@ -799,7 +799,7 @@ impl Queue {
             if let Some(whole) = &self.bins[b].whole {
                 effects.push(Effect::Kill { tag: whole.spawn });
             }
-            self.kill_server(b, "the run was cancelled".to_owned(), effects); // alloc: error path
+            self.kill_server(b, "the run was cancelled", effects);
         }
         self.let_go(effects);
         self.flush(effects);
@@ -845,7 +845,7 @@ impl Queue {
                     ),
                     other => (format!("its spawn completed as {other:?}"), Vec::new()), // alloc: error path
                 };
-                self.server_ended(b, why, output, effects);
+                self.server_ended(b, &why, &output, effects);
             }
             For::Recv(b, r) => self.received(b as usize, r, completion.done, effects),
             For::Send(b, r) => match completion.done {
@@ -859,7 +859,7 @@ impl Queue {
                     }
                 }
                 Done::Broken { error, .. } | Done::Failed(error) => {
-                    self.lose(b as usize, r, format!("could not be sent to: {error}"), effects); // alloc: error path
+                    self.lose(b as usize, r, &format!("could not be sent to: {error}"), effects); // alloc: error path
                 }
                 _ => {}
             },
@@ -906,7 +906,7 @@ impl Queue {
         self.bins[b].server.as_mut().expect("a binary run as a process per test has a server")
     }
 
-    fn file(&self, name: String) -> FileName {
+    fn file(&self, name: &str) -> FileName {
         FileName::new(&format!("{}/{name}", self.config.dir)).expect("a name under the request's directory") // alloc: setup, once per server
     }
 
@@ -1000,7 +1000,7 @@ impl Queue {
                         "{} did not end {:?} after it was killed, so its fork server was killed",
                         self.bins[b].plan.jobs[j].name, self.config.kill_grace
                     );
-                    self.kill_server(b, why, effects);
+                    self.kill_server(b, &why, effects);
                 }
                 Due::Whole(b) => {
                     if let Some(whole) = &mut self.bins[b as usize].whole
@@ -1044,8 +1044,8 @@ impl Queue {
     }
 
     fn start_server(&mut self, b: usize, effects: &mut Vec<Effect>) {
-        let socket = self.file(format!("t{b}")); // alloc: setup, once per server
-        let record = self.file(format!("r{b}")); // alloc: setup, once per server
+        let socket = self.file(&format!("t{b}")); // alloc: setup, once per server
+        let record = self.file(&format!("r{b}")); // alloc: setup, once per server
         let socket_path = self.path(&socket).to_string_lossy().into_owned();
         let record_path = self.path(&record).to_string_lossy().into_owned();
         let mut names = Names::new();
@@ -1097,7 +1097,7 @@ impl Queue {
         if let Done::Failed(error) = done {
             let why = format!("making the record of its sandbox, {}: {error}", self.server(b).record); // alloc: setup, once per server: the driver's command owns its parts
             self.server(b).phase = Phase::Ended;
-            self.server_ended(b, why, Vec::new(), effects); // alloc: empty, allocates nothing
+            self.server_ended(b, &why, &[], effects);
             return;
         }
         self.spawn_server(b, effects);
@@ -1141,7 +1141,7 @@ impl Queue {
                 Err(error) => {
                     let why = format!("{} could not be made ready to start: {error}", plan.program.display()); // alloc: error path
                     self.server(b).phase = Phase::Ended;
-                    self.server_ended(b, why, Vec::new(), effects); // alloc: empty, allocates nothing
+                    self.server_ended(b, &why, &[], effects);
                     return;
                 }
             },
@@ -1180,7 +1180,7 @@ impl Queue {
                 self.server(b).listen = None;
                 if self.server(b).replicas.is_empty() {
                     let socket = self.server(b).socket.clone(); // clone: error path
-                    self.kill_server(b, format!("listening on {socket}: {error}"), effects); // alloc: error path
+                    self.kill_server(b, &format!("listening on {socket}: {error}"), effects); // alloc: error path
                 }
             }
             _ => {}
@@ -1209,14 +1209,14 @@ impl Queue {
         let bytes = match done {
             Done::Read(bytes) => bytes,
             Done::Broken { error, .. } | Done::Failed(error) => {
-                self.lose(b, r, format!("could not be read from: {error}"), effects); // alloc: error path
+                self.lose(b, r, &format!("could not be read from: {error}"), effects); // alloc: error path
                 return;
             }
             _ => return,
         };
         if bytes.is_empty() {
             self.replica(b, r).hung_up = true;
-            self.lose(b, r, "closed its socket".to_owned(), effects); // alloc: error path
+            self.lose(b, r, "closed its socket", effects);
             return;
         }
         self.replica(b, r).frames.push_owned(bytes);
@@ -1225,12 +1225,12 @@ impl Queue {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(why) => {
-                    self.lose(b, r, format!("broke the protocol: {why}"), effects); // alloc: error path
+                    self.lose(b, r, &format!("broke the protocol: {why}"), effects); // alloc: error path
                     return;
                 }
             };
             if let Err(why) = self.frame(b, r, frame, effects) {
-                self.lose(b, r, format!("broke the protocol: {why}"), effects); // alloc: error path
+                self.lose(b, r, &format!("broke the protocol: {why}"), effects); // alloc: error path
                 return;
             }
         }
@@ -1246,7 +1246,7 @@ impl Queue {
     /// Replica `r` of `b`'s server closed, failed or broke the protocol (`what`): it is hung up
     /// and the tests it runs are lost with why, the others carrying on. With no replica left
     /// the server is killed. Nothing is lost of a server told to quit, which runs nothing.
-    fn lose(&mut self, b: usize, r: u32, what: String, effects: &mut Vec<Effect>) {
+    fn lose(&mut self, b: usize, r: u32, what: &str, effects: &mut Vec<Effect>) {
         let server = self.server(b);
         let phase = server.phase;
         let replica = &mut server.replicas[r as usize];
@@ -1294,7 +1294,7 @@ impl Queue {
             }
         }
         if self.server(b).replicas.iter().all(|it| it.ended) {
-            self.kill_server(b, who, effects);
+            self.kill_server(b, &who, effects);
             return;
         }
         self.refresh(b);
@@ -1740,25 +1740,25 @@ impl Queue {
     }
 
     /// Kills the server, so its tests are lost with `why` once its spawn ends.
-    fn kill_server(&mut self, b: usize, why: String, effects: &mut Vec<Effect>) {
+    fn kill_server(&mut self, b: usize, why: &str, effects: &mut Vec<Effect>) {
         let Some(server) = &mut self.bins[b].server else { return };
         if server.phase == Phase::Ended {
             return;
         }
-        server.lost.get_or_insert(why.clone()); // clone: error path
+        server.lost.get_or_insert_with(|| why.to_owned()); // alloc: error path
         match server.spawn {
             Some(spawn) => effects.push(Effect::Kill { tag: spawn }),
             // Its record is still being made: nothing was started.
             None => {
                 server.phase = Phase::Ended;
-                self.server_ended(b, why, Vec::new(), effects); // alloc: error path
+                self.server_ended(b, why, &[], effects);
             }
         }
     }
 
     /// The server's process ended (or never started): what it ran and what was left for it
     /// are lost with `why`.
-    fn server_ended(&mut self, b: usize, why: String, output: Vec<u8>, effects: &mut Vec<Effect>) {
+    fn server_ended(&mut self, b: usize, why: &str, output: &[u8], effects: &mut Vec<Effect>) {
         // What was said to it goes before the hang-up, as it was said.
         self.flush_server(b, effects);
         let server = self.server(b);
@@ -1784,7 +1784,7 @@ impl Queue {
         for id in running {
             self.busy -= 1;
             let Some(at) = self.attempt(id) else { continue };
-            self.lose_attempt(at, &why, &output);
+            self.lose_attempt(at, &why, output);
         }
         for rank in self.pending_of(b) {
             let unit = self.order[rank as usize];
@@ -1792,7 +1792,7 @@ impl Queue {
             self.ready.clear(rank);
             self.tries[unit as usize] = 0;
             let earlier = std::mem::take(&mut self.tries_output[unit as usize]);
-            self.finish(unit, Went::lost(why.clone(), [earlier, output.clone()].concat())); // alloc: error path
+            self.finish(unit, Went::lost(why.clone(), [&earlier[..], output].concat())); // alloc: error path
         }
     }
 

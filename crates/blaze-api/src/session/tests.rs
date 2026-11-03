@@ -80,6 +80,7 @@ impl World {
             profile: dumped,
             hot: hotted,
             history: None,
+            bugs: Vec::new,
         };
         f(&mut self.session, &mut cx, &mut out);
         out
@@ -464,7 +465,7 @@ fn status_lists_every_connections_requests_sorted() {
     world.request(1, 5, Request::Check { view: head("main"), targets: targets() });
     world.request(1, 1, Request::Open { view: head("main") });
     let status =
-        Status { pid: 30, requests: vec![5, 8], views: 3, history: None, memory_bytes: 10, budget_bytes: 20, build: BUILD.clone() };
+        Status { pid: 30, requests: vec![5, 8], views: 3, history: None, memory_bytes: 10, budget_bytes: 20, build: BUILD.clone(), bugs: Vec::new() };
     assert_eq!(world.request(3, 1, Request::Status), [reply(3, 1, Response::Status(status)), done(3, 1, true)]);
 }
 
@@ -491,6 +492,7 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             profile: dumped,
             hot: hotted,
             history: None,
+            bugs: Vec::new,
         };
         let from = to(2, id);
         let arrived = Arrived::Request { from, request: Request::Status };
@@ -505,6 +507,7 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             memory_bytes: 10,
             budget_bytes: 20,
             build: BUILD.clone(),
+            bugs: Vec::new(),
         };
         assert_eq!(out, [reply(2, id, Response::Status(status)), done(2, id, true)]);
     }
@@ -573,11 +576,26 @@ fn counters() -> Snapshot {
             reserved: 0,
             reserved_high_water: 0,
             regions: 0,
+            heap: 0,
+            heap_high_water: 0,
         };
     }
     tags[Tag::Infer.index()].budget = 4096;
     tags[Tag::Parse.index()].allocated = 3_000_000 * reads;
-    Snapshot { tags, committed: 1 << 20, committed_high_water: 1 << 21, reserved: 0, reserved_high_water: 0 }
+    Snapshot {
+        tags,
+        committed: 1 << 20,
+        committed_high_water: 1 << 21,
+        reserved: 0,
+        reserved_high_water: 0,
+        base_pages: 0,
+        base_pages_high_water: 0,
+        thp: blaze_mem::huge::Thp::Unset,
+        heap_outside: 0,
+        heap_by_tag: false,
+        purged: 0,
+        heap_committed: None,
+    }
 }
 
 /// A profile request is answered with the daemon's dump of the seconds it asks for; the
@@ -883,6 +901,7 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             profile: dumped,
             hot: hotted,
             history: None,
+            bugs: Vec::new,
         };
         let arrived = Arrived::Request { from: to(1, id), request: Request::Snapshot };
         blaze_alloc_count::assert_at_most(0, "a warm start of a job", || {
@@ -901,6 +920,7 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             profile: dumped,
             hot: hotted,
             history: None,
+            bugs: Vec::new,
         };
         blaze_alloc_count::assert_at_most(0, "a warm finish of a job", || {
             session.finish(&mut cx, job, true, None, &mut out)

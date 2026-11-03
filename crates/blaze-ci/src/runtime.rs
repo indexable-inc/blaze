@@ -90,11 +90,11 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
     let mut lanes = Vec::with_capacity(POST_LANES);
     for lane in 0..POST_LANES {
         let (to_lane, posts) = crossbeam_channel::unbounded();
-        // alloc: clone: a lane's client and sender, once at start
-        let (client, service) = (Arc::new(Mutex::new(github.lane())), to_service.clone());
+        // clone: a lane's client and sender, once at start
+        let (client, service) = (Mutex::new(github.lane()), to_service.clone());
         thread::Builder::new()
             .name(format!("blaze-ci github {lane}")) // alloc: once per lane, at start
-            .spawn(move || post(client, posts, service, Duration::from_secs(1)))
+            .spawn(move || post(&client, &posts, &service, Duration::from_secs(1)))
             // alloc: a failed start
             .map_err(|error| format!("GitHub thread {lane} did not start: {error}"))?;
         lanes.push(to_lane);
@@ -123,8 +123,7 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
         let repo = config.repo.clone(); // clone: once, at start, the webhook's repo
         thread::Builder::new()
             .name("blaze-ci webhook".to_owned()) // alloc: once, at start, the thread's name
-            // alloc: once, at start, the secret the webhook keeps
-            .spawn(move || listen::run(listener, Arc::new(secret), repo, service))
+            .spawn(move || listen::run(&listener, &secret, repo, service))
             // alloc: error path
             .map_err(|error| format!("the webhook thread did not start: {error}"))?;
     }
@@ -295,9 +294,9 @@ fn take_snapshot(socket: &Path, config: &SnapshotConfig, name: &str) -> Result<s
 /// all of it. A run that goes queued, in progress and done while an earlier post is retried, or
 /// while its creation is answered, costs one request, not three.
 pub(crate) fn post(
-    github: Arc<Mutex<impl Checks>>,
-    posts: crossbeam_channel::Receiver<Post>,
-    service: crossbeam_channel::Sender<Input>,
+    github: &Mutex<impl Checks>,
+    posts: &crossbeam_channel::Receiver<Post>,
+    service: &crossbeam_channel::Sender<Input>,
     backoff: Duration,
 ) {
     let mut waiting: Vec<Post> = Vec::new(); // alloc: once per lane, reused for every post
@@ -317,7 +316,7 @@ pub(crate) fn post(
             {
                 continue;
             }
-            send(&*github, post, &service, backoff);
+            send(github, post, service, backoff);
         }
     }
 }

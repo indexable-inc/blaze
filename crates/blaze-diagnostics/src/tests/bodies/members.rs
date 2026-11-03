@@ -1464,3 +1464,87 @@ For more information about this error, try `rustc --explain E0063`.
 "#
     );
 }
+
+#[test]
+fn an_offset_of_field_is_named_and_checked_from_its_def_site() {
+    // Our own: no rustc UI test writes `offset_of!` in a `macro`. rustc's `check_expr_offset_of`
+    // looks each field up hygienically and checks its privacy from the def site of its name
+    // (`adjust_ident_and_get_scope`): `foo::b!` reads `S`'s private `b`, `main` may not; `keyed!`'s
+    // own `x` is the `u32` at 4, the caller's `$x` the `u8` at 0. The expected stderr is rustc
+    // 2026-10-26's, `-Z ui-testing`.
+    let source = r#"#![feature(decl_macro)]
+use core::mem::offset_of;
+
+mod foo {
+    #[repr(C)]
+    pub struct S { pub a: u8, b: u32 }
+    pub macro b() { ::core::mem::offset_of!(S, b) }
+}
+
+macro keyed($x:ident, $ours:ident, $theirs:ident) {
+    #[repr(C)]
+    pub struct K { pub $x: u8, pub x: u32 }
+    pub const $ours: usize = offset_of!(K, x);
+    pub const $theirs: usize = offset_of!(K, $x);
+}
+keyed!(x, OURS, THEIRS);
+
+const _: [(); 4] = [(); OURS];
+const _: [(); 0] = [(); THEIRS];
+
+fn main() {
+    let _ = offset_of!(foo::S, b); //~ ERROR field `b` of struct `S` is private
+    let _ = foo::b!(); // ok
+}
+"#;
+    let fixture = format!(
+        "//- minicore: sized, offset_of\n//- /offset-of-hygiene.rs crate:other:main edition:2021\n{source}"
+    );
+    assert_eq!(
+        ui_fixture(&fixture),
+        r#"error[E0616]: field `b` of struct `S` is private
+  --> $DIR/offset-of-hygiene.rs:22:32
+   |
+LL |     let _ = offset_of!(foo::S, b);
+   |                                ^ private field
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0616`.
+"#
+    );
+}
+
+#[test]
+fn a_private_offset_of_field_is_reported_at_the_name_inference_found() {
+    // Our own: of `b.b`, only `B`'s `b` is private, and the error points at the second name, as
+    // rustc 2026-10-26 gives it (`-Z ui-testing`). Finding the name by its text would take the
+    // first `b`; inference hands the position over (`PrivateField::at`).
+    let source = r#"use core::mem::offset_of;
+
+mod foo {
+    pub struct A { pub b: B }
+    pub struct B { b: u8 }
+}
+
+fn main() {
+    let _ = offset_of!(foo::A, b.b);
+}
+"#;
+    let fixture = format!(
+        "//- minicore: sized, offset_of\n//- /offset-of-nested.rs crate:other:main edition:2021\n{source}"
+    );
+    assert_eq!(
+        ui_fixture(&fixture),
+        r#"error[E0616]: field `b` of struct `B` is private
+  --> $DIR/offset-of-nested.rs:9:34
+   |
+LL |     let _ = offset_of!(foo::A, b.b);
+   |                                  ^ private field
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0616`.
+"#
+    );
+}

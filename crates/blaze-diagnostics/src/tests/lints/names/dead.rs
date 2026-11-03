@@ -12,6 +12,7 @@ use crate::{
 
 /// A UI test: what its crate is built with (minicore's flags for core, std's prelude beyond
 /// core's and its items) and how compiletest runs it.
+#[derive(Clone, Copy)]
 struct Ui<'a> {
     name: &'a str,
     edition: &'a str,

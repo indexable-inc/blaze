@@ -273,6 +273,7 @@ fn with_record_inputs<T>(
     then: impl FnOnce(&RecordInputs<'_>) -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
     let u = job.unit(unit)?;
+    // The whole executable ([`super::deps::build`]): a record is made by blaze-cargo itself.
     let blaze = super::deps::build()?;
     let runs = runs(job, unit);
     // An inert script's compile makes nothing, unless `BLAZE_ELIDE=verify` builds it to run it.
@@ -759,7 +760,8 @@ fn store_named(job: &Job, std: bool) -> String {
 
 /// The record of base key `base` in `store`, filed under `base` or under what its code read
 /// with the values it has now ([`reads::find`]): a variable's in the job's environment, a
-/// proc-macro expansion's worked out again from its names. With where it was found and where
+/// file's outside every source root as it is on disk, a proc-macro expansion's worked out
+/// again from its names. With where it was found and where
 /// its CBOR body starts. An error names the slot that does not decode or whose reads can't be
 /// worked out, or the key and the store (`std`: the shared std store) a read of failed: a store
 /// that can't be read is never a record not kept (rule 3).
@@ -783,6 +785,7 @@ fn filed_in<'g>(
         &job.input.config.invocation.env,
         &|manifest| job.units().is_primary_manifest(manifest),
         |env, shape| job.input.macros.keeps().reads_now(env, shape),
+        |path| base_db::IncludedFile::content_now(std::path::Path::new(path)),
         |slot| match store.get(guard, slot) {
             Ok(it) => it.map(|it| it.bytes),
             Err(error) => {
@@ -1197,7 +1200,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> R
     let krate = crate_of(job, unit, u)?;
     let db = reader.db();
     macros_built(db, krate, u)?;
-    options(job, unit, u)?;
+    options(job, db, unit, u)?;
     {
         let _span = tracing::info_span!("unit def map").entered();
         let _ = hir_def::nameres::crate_def_map(db, krate);
@@ -1234,7 +1237,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> R
         // errors are not told apart: any of them breaks its items.
         None if reached => {
             let files = blaze_diagnostics::Files::new(reader.paths(), job.mounted.root());
-            (None, Some(reached_only_diags(db, krate, files, || Ok(options(job, unit, u)?.1))?), true)
+            (None, Some(reached_only_diags(db, krate, files, || Ok(options(job, db, unit, u)?.1))?), true)
         }
         // alloc: once per unit checked, shared by its check and its codegen
         None => (Some(Arc::new(Checking::new(db, hir::Crate::from(krate)))), None, false),
@@ -1247,13 +1250,14 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> R
 }
 
 /// The text of each file `diags` point into that no mount of the build holds (a build script's
-/// output under `OUT_DIR`, read by an `include!`), as the database has it: the text their spans
-/// were made against, which [`assemble`], with no database, can't read through `mounted`. Held
-/// is a mount's file there, not a path under a mount's directory: `target/` is under the
-/// workspace's, and the view has none of its outputs. A file the database has no text of is
-/// left out, and [`assemble`] names it as unread.
+/// output under `OUT_DIR`, read by an `include!`, a file outside every source root an
+/// `include!` read), as the database has it: the text their spans were made against, which
+/// [`assemble`], with no database, can't read through `mounted`. Held is a mount's file there,
+/// not a path under a mount's directory: `target/` is under the workspace's, and the view has
+/// none of its outputs. A file the database has no text of is left out, and [`assemble`] names
+/// it as unread.
 fn unmounted(reader: &UnitReader, mounted: &Mounted, diags: &[Diag]) -> Vec<(String, String)> {
-    let (db, paths) = (reader.db(), reader.paths());
+    let db = reader.db();
     let names: Vec<&str> = blaze_diagnostics::emit::Sources::default()
         .unread(diags)
         .into_iter()
@@ -1263,16 +1267,8 @@ fn unmounted(reader: &UnitReader, mounted: &Mounted, diags: &[Diag]) -> Vec<(Str
     if names.is_empty() {
         return Vec::new(); // alloc: empty, allocates nothing
     }
-    let mut found: Vec<(String, base_db::FileId)> = paths
-        .iter()
-        .filter(|&(&file, _)| db.has_file_text(file))
-        .map(|(&file, path)| (mounted.name(path), file))
-        .filter(|(name, _)| names.contains(&name.as_str()))
-        .collect(); // alloc: as above
-    // The first file of a name by ID, whatever order the map is in.
-    found.sort_by_key(|(name, file)| (name.clone(), file.index())); // clone: a few names, sorted once
-    found.dedup_by(|a, b| a.0 == b.0);
-    found
+    reader
+        .files_named(mounted.root(), &names)
         .into_iter()
         // alloc: a file's text, once per file of a unit's diagnostics no mount holds
         .map(|(name, file)| (name, db.file_text(file).text(db).to_string()))
@@ -1286,8 +1282,8 @@ fn bodies(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> 
     let Some(checking) = lock(slot).checking.clone() else { return Ok(()) };
     let u = job.unit(unit)?;
     let krate = crate_of(job, unit, u)?;
-    let (flags, options) = options(job, unit, u)?;
     let db = reader.db();
+    let (flags, options) = options(job, db, unit, u)?;
     let files = blaze_diagnostics::Files::new(reader.paths(), job.mounted.root());
     let blaze_diagnostics::CrateCheck { diags, items_broken } = checking.check(db, files, &options);
     if hir_def::deps::eligible(db, krate) {
@@ -1336,7 +1332,11 @@ fn linted(
     conf.profile = profile;
     let paths = reader.paths();
     // alloc: a file's name, once per file of the crate and per span that leaves its file
-    let name_of = |file: base_db::FileId| paths.get(&file).map(|path| blaze_diagnostics::Files::relative(path, root).to_owned());
+    let name_of = |file: base_db::FileId| match paths.get(&file) {
+        Some(path) => Some(blaze_diagnostics::Files::relative(path, root).to_owned()),
+        // A file `include!` read from outside every source root, by its path there.
+        None => db.files().included_source_path(file).map(|path| blaze_diagnostics::Files::relative(path.as_str(), root).to_owned()),
+    };
     let setup = blaze_lints::Setup { command_line, conf };
     let found = blaze_lints::check(db, hir::Crate::from(krate), &setup, &name_of)
         .map_err(|why| ApiError::new(why.to_string(), at()))?;
@@ -1491,6 +1491,12 @@ fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases, images
         }
     }
     phases.linked = Some(Linked::Made(Box::new(making)));
+    // What codegen made is linked (a unit links once a job, and [`store`] reads only
+    // `linked`): every compiled function's code, relocations and line rows, its symbols and
+    // test listing go now, not as the job ends. Held to the end, the code of each test binary,
+    // with the std code each reaches copied into every one, was the 8 GiB codegen heap of a
+    // `blaze test` of 21 small crates (B5, coord-105).
+    phases.generated = None;
     Ok(())
 }
 
@@ -1664,6 +1670,7 @@ fn store(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases) -> Re
 }
 
 /// Where a proc macro built for wasm has its module, as its link phase finds it.
+#[derive(Clone, Copy)]
 enum Module<'a> {
     /// The files its link just wrote: (path, what it holds, executable).
     Linked(&'a [(String, Written, bool)]),
@@ -1814,9 +1821,10 @@ fn macros(job: &Job, reader: &UnitReader, unit: usize, ok: bool, module: Module<
     let Some(krate) = job.crates.krate(unit) else {
         return failed(format!("proc macro `{name}` has no crate in the front end"));
     };
-    // What its expansions are kept under: the whole blaze, whose macro server and bridge run
-    // them ([`super::deps::build`]), past the code generator that compiled the macro.
-    let toolchain = match super::deps::build() {
+    // What its expansions are kept under: the front end's code, whose closure holds the macro
+    // server and bridge that run them ([`super::deps::front_end`]), as the daemon's own
+    // expansions are.
+    let toolchain = match super::deps::front_end() {
         Ok(it) => it,
         Err(why) => return failed(format!("proc macro `{name}`: {}", why.what)),
     };
@@ -1892,15 +1900,15 @@ fn crate_of(job: &Job, unit: usize, u: &Unit) -> Result<base_db::Crate, ApiError
     })
 }
 
-/// The lint flags of `unit`'s check, and the options they give it: an error for flags that
-/// name no lint blaze has, whether or not a check runs.
-fn options(job: &Job, unit: usize, u: &Unit) -> Result<(Vec<String>, Options), ApiError> {
+/// The lint flags of `unit`'s check, and the options they give it in `db`
+/// ([`blaze_diagnostics::cache::Inputs::options`], the same a kept outcome of it is keyed by):
+/// an error for flags that name no lint blaze has, whether or not a check runs.
+fn options(job: &Job, db: &base_db::Db, unit: usize, u: &Unit) -> Result<(Vec<String>, Options), ApiError> {
     let flags = unit_lint_flags(job, unit)?;
-    let mut lints = CommandLine::parse(&flags)
+    let options = blaze_diagnostics::cache::Inputs::of(db, &flags)
+        .options()
         .map_err(|why| ApiError::new(why, Some(format!("the lint flags of `{}`", u.target.name))))?;
-    // Every crate blaze builds is built as cargo builds it, with `CARGO_CRATE_NAME` set.
-    lints.check_cfg.cargo = true;
-    Ok((flags, Options { lints, ..Options::default() }))
+    Ok((flags, options))
 }
 
 /// [`Phase::Link`]'s making of the unit, from what its phases before left in `phases`, which
@@ -1982,6 +1990,13 @@ fn assemble(job: &Job, reader: &UnitReader, unit: usize, phases: &Phases, images
         return Ok(nothing(diagnostics, true, made));
     }
     match &phases.generated {
+        // [`generate`] leaves none only for a unit that builds no code; one that does and has
+        // none had it taken by its link ([`link`] lets it go once linked), so a second link
+        // would write records in place of its code: refused, named, never written.
+        None if matches!(phases.does, Some(Does { builds_code: true, .. })) => {
+            // alloc: error path
+            return Err(ApiError::new(format!("unit {unit} ({}) is linked twice in one job: its generated code went with its first link", span_unit(u)), None).into());
+        }
         None => {
             for path in artifact::made(plan) {
                 files.push((path.to_owned(), Written::Bytes(crate_record(u, identity, &[])), false));

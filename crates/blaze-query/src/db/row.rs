@@ -29,7 +29,7 @@ use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     ptr::NonNull,
-    sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use blaze_mem::Tag;
@@ -163,11 +163,22 @@ impl<V> Row<V> {
 pub(crate) struct Pages {
     dir: Whole<AtomicPtr<u8>, MAX_PAGES>,
     grow: Mutex<()>,
+    /// Pages made: what the memory report counts without reading the directory.
+    count: AtomicUsize,
 }
 
 impl Pages {
     pub(crate) fn new(tag: Tag) -> Pages {
-        Pages { dir: Whole::sparse(tag, "an ingredient's row page directory"), grow: Mutex::new(()) }
+        Pages {
+            dir: Whole::sparse(tag, "an ingredient's row page directory"),
+            grow: Mutex::new(()),
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    /// How many pages were made.
+    pub(crate) fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
     }
 
     /// The directory's first entry, for a hit path that indexes from it: the directory is a
@@ -209,6 +220,7 @@ impl Pages {
         // Release: a reader that loads the page sees its zeroes, and whatever the maker
         // writes into its rows before publishing them on its own.
         self.dir.get_to_write(page).store(at.as_ptr(), Ordering::Release);
+        self.count.fetch_add(1, Ordering::Relaxed);
         at
     }
 
@@ -225,10 +237,12 @@ impl Pages {
     }
 
     /// Every made page's index and base, in ID-page order: for sweeps, compaction and drop,
-    /// under `&mut` of the storage. Past the directory's committed prefix nothing was stored.
+    /// under `&mut` of the storage, and the memory report's walk under `&` (acquire: a page
+    /// seen is seen with its zeroes, as by [`Pages::page`]). Past the directory's committed
+    /// prefix nothing was stored.
     pub(crate) fn made(&self, pages: usize) -> impl Iterator<Item = (usize, NonNull<u8>)> + '_ {
         (0..pages.min(self.dir.len())).filter_map(|page| {
-            NonNull::new(self.dir.get(page).load(Ordering::Relaxed)).map(|at| (page, at))
+            NonNull::new(self.dir.get(page).load(Ordering::Acquire)).map(|at| (page, at))
         })
     }
 }

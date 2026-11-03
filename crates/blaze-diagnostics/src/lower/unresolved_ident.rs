@@ -546,7 +546,7 @@ pub(crate) fn show_imports(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module
             Some((span, found_use)) => {
                 let newline = if found_use { "" } else { "\n" };
                 diag.suggestions(
-                    span,
+                    &span,
                     msg,
                     // alloc: the error's text, for an error hir found
                     accessible.iter().map(|it| format!("use {};\n{newline}", it.path)),

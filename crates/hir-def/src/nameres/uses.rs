@@ -546,7 +546,7 @@ impl<'db> Walk<'db> {
                 ModuleDefId::TraitId(it) => {
                     self.signature(it.into());
                     let items = TraitItems::query(db, it);
-                    self.assoc(&items.items, &items.macro_calls, it.resolver(db));
+                    self.assoc(&items.items, &items.macro_calls, &it.resolver(db));
                 }
                 ModuleDefId::ModuleId(_)
                 | ModuleDefId::EnumVariantId(_)
@@ -560,7 +560,7 @@ impl<'db> Walk<'db> {
         for it in scope.impls() {
             self.signature(it.into());
             let items = &ImplItems::of(db, it).0;
-            self.assoc(&items.items, &items.macro_calls, it.resolver(db));
+            self.assoc(&items.items, &items.macro_calls, &it.resolver(db));
         }
     }
 
@@ -568,7 +568,7 @@ impl<'db> Walk<'db> {
         &mut self,
         items: &[(Name, AssocItemId)],
         macro_calls: &[(AstId<ast::Item>, MacroCallId)],
-        resolver: Resolver<'db>,
+        resolver: &Resolver<'db>,
     ) {
         for &(_, item) in items {
             match item {
@@ -579,7 +579,7 @@ impl<'db> Walk<'db> {
         }
         for &(ast_id, call) in macro_calls {
             let view::Item::MacroCall(node) = ast_id.to_view(self.db) else { continue };
-            self.macro_call(&resolver, ast_id.file_id, node, call);
+            self.macro_call(resolver, ast_id.file_id, node, call);
         }
     }
 

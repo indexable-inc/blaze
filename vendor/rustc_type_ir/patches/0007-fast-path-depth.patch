@@ -1,12 +1,11 @@
-diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
+diff --git a/src/search_graph/mod.rs b/src/search_graph/mod.rs
+index c4ec589..13959fe 100644
 --- a/src/search_graph/mod.rs
 +++ b/src/search_graph/mod.rs
-@@ -885,6 +885,34 @@
-         });
-         let evaluation_result = this.evaluate_goal_in_task(cx, input, inspect);
+@@ -887,6 +887,34 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
          (evaluation_result.result, evaluation_result.required_depth)
-+    }
-+
+     }
+ 
 +    /// The depth a nested goal evaluated now is evaluated with, or `None` when evaluating it
 +    /// overflows: what `evaluate_goal` computes first.
 +    pub fn nested_available_depth(
@@ -33,13 +32,16 @@ diff -ruN a/src/search_graph/mod.rs b/src/search_graph/mod.rs
 +            UpdateParentGoalCtxt::Ordinary { nested_goals: &NestedGoals::default() },
 +            AvailableDepth(available_depth) - RequiredDepth(required_depth),
 +        );
-     }
- 
++    }
++
      /// Probably the most involved method of the whole solver.
-diff -ruN a/src/solve/mod.rs b/src/solve/mod.rs
+     ///
+     /// While goals get computed via `D::compute_goal`, this function handles
+diff --git a/src/solve/mod.rs b/src/solve/mod.rs
+index 55fb628..9f4907c 100644
 --- a/src/solve/mod.rs
 +++ b/src/solve/mod.rs
-@@ -1057,6 +1057,40 @@
+@@ -1057,6 +1057,40 @@ pub struct GoalStalledOn<I: Interner> {
      pub opaques: GoalStalledOnOpaques<I>,
  }
  
@@ -80,7 +82,7 @@ diff -ruN a/src/solve/mod.rs b/src/solve/mod.rs
  /// For some goals we can trivially answer some questions without going through
  /// canonicalization. There are three options:
  #[derive(Clone, Debug)]
-@@ -1065,6 +1099,11 @@
+@@ -1065,6 +1099,11 @@ pub enum ComputeGoalFastPathOutcome<I: Interner> {
      NoFastPath,
      /// The goal trivially holds, immediately produce a result with [`Certainty::Yes`]
      TriviallyHolds,

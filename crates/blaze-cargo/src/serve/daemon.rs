@@ -54,6 +54,7 @@ use super::{
     mounts::Mounts,
     observe::{Observe, Profiling},
     plane::{Happened, Plane, Runner, ns},
+    pulse::Pulse,
     still::{Facts, STILL_FOR, Stillness, Turn, Why},
     work::Steps,
 };
@@ -99,6 +100,11 @@ pub(super) const LAST_EFFECTS: Duration = Duration::from_secs(2);
 const PLOT_EVERY: Duration = Duration::from_millis(10);
 /// How often the memory by tag goes to the log while the daemon works, at most.
 const MEMORY_LOG_EVERY: Duration = Duration::from_secs(30);
+/// How often, at most, the daemon past its limit's line asks every thread to give back the free
+/// pages its heaps keep (`blaze_mem::tag::give_back_heap`), between releases or with none due
+/// (a check's build releases nothing): a forced collect of each thread's heaps costs it a walk
+/// of their pages, so not at every plot.
+const GIVE_BACK_EVERY: Duration = Duration::from_secs(1);
 /// How long one unit's step runs, while no other ends, before what every thread is inside is
 /// written to the log ([`Daemon::watch`]): a warning, never a failure.
 const LONG_STEP: Duration = Duration::from_secs(300);
@@ -265,6 +271,7 @@ macro_rules! cx {
             profile: blaze_profile::flight::dump,
             hot: crate::serve::observe::hot,
             history: $daemon.observe.history_error(),
+            bugs: crate::serve::observe::bugs,
         }
     };
 }
@@ -357,6 +364,38 @@ enum Stopping {
     Over,
 }
 
+/// What ends the loop's wait for its driver between turns, besides the driver's own completions
+/// (a client's connection or request, a file, a child, a watch): the timer the loop set, and
+/// why. Named by the wait's span, so the loop's time between turns says what it waited on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Woken {
+    /// Thread tasks run: their ends come back on the plane's channel, which the loop reads
+    /// each turn, so it waits at most a millisecond.
+    PlaneTasks,
+    /// Nothing runs: the idle tick.
+    Idle,
+    /// An intent's deadline in the session.
+    Session,
+    /// A job's deadline for the store to make its puts durable.
+    Durable,
+    /// A live feed's next frame, or the deadline of a `blaze why` waiting on the history.
+    Observe,
+}
+
+impl Woken {
+    /// What the loop's wait waits on, as its span's `awaits` says it.
+    fn on(self) -> blaze_graph::wait::WaitOn<'static> {
+        use blaze_graph::wait::WaitOn;
+        match self {
+            Woken::PlaneTasks => WaitOn::Channel("daemon loop: a plane task's end (read every 1 ms) or the driver's io"),
+            Woken::Idle => WaitOn::Io("daemon loop: a client's connection or request, a file, a child or a watch, or the 50 ms idle tick"),
+            Woken::Session => WaitOn::Io("daemon loop: the driver's io, or an intent's deadline in the session"),
+            Woken::Durable => WaitOn::Io("daemon loop: the driver's io, or a job's deadline for the store's puts to be durable"),
+            Woken::Observe => WaitOn::Io("daemon loop: the driver's io, or a live feed's frame or a `blaze why`'s deadline"),
+        }
+    }
+}
+
 /// The daemon on driver `D`, building with `S`: `blaze serve`'s is `Daemon<Native, Real>`, the
 /// simulation's `Daemon<Sim, Fake>`.
 pub struct Daemon<D: Driver, S: Steps> {
@@ -432,10 +471,20 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// The watchdog's looks that found a worker inside a job's code or a run of user code
     /// alive: work under way though nothing ended, as one long compile or test is.
     working: u64,
+    /// The loop's progress as another thread reads it ([`Daemon::pulse`]): `completions`,
+    /// `settled` and `job_effects`, and the turns it finished. The stop's guard reads it while
+    /// the loop may be stuck inside the stop, or inside any turn.
+    pulse: Arc<Pulse>,
+    /// The effects that end on their own that ended ([`ends_alone`]: writes, reads and runs,
+    /// never a client's connect or request, which a stuck daemon still takes).
+    completions: u64,
     /// When the plots were last written, on the driver's clock.
     plotted: Duration,
     /// When the memory by tag was last logged, on the driver's clock.
     memory_logged: Duration,
+    /// When the daemon past its limit's line last asked for the heaps' free pages back
+    /// ([`GIVE_BACK_EVERY`]), on the driver's clock.
+    given_back: Duration,
     /// The collector of what blaze keeps on disk ([`super::gc`]): `blaze serve`'s daemon's
     /// alone ([`Daemon::collect`]), as a test's daemons share no disk of their own.
     gc: Option<super::gc::Gc>,
@@ -542,14 +591,21 @@ impl fmt::Display for Restored {
 }
 
 /// The daemon's memory by tag, for the log: the process's resident set and how much of it
-/// lies outside blaze-mem (the global heap, code, stacks), what the global allocator holds,
-/// what blaze-mem has committed and reserved, then each tag holding at least
-/// [`MemoryLine::SHOWN`] or reserving at least [`MemoryLine::SHOWN_RESERVED`], largest first,
-/// with its high-water mark and its regions' reservation. Committed bytes past the tags' sum are held by no tag.
+/// lies outside both blaze-mem and the global heap (code, stacks), what the global allocator
+/// holds live and how much of that was allocated outside any task (so is named by no tag), what
+/// it has committed and so keeps freed but not given back, what blaze-mem has committed, how much
+/// of that is purged (free chunks whose pages the kernel took: not resident) and reserved, then
+/// each tag holding at least [`MemoryLine::SHOWN`] in blaze-mem or in the global heap, or
+/// reserving at least [`MemoryLine::SHOWN_RESERVED`], most held first, with its high-water
+/// marks, its regions' reservation and its global-heap bytes
+/// (`blaze_mem::tag::Counters::heap`). Committed bytes past the tags' sum are held by no tag.
 /// Then the size classes of `blaze_mem::blocks` (kept values: trees, token trees, sources):
 /// what their blocks hold live, what the classes keep warm and have given back cold, and each
 /// class carving at least [`MemoryLine::SHOWN`], most carved first, so the gap between what is
-/// live and what the classes hold is named by class.
+/// live and what the classes hold is named by class. Last, the free chunks: warm (resident, kept
+/// for the next frame or arena) and cold (purged). So memory that was freed but is kept (by the
+/// allocator, by the chunk cache, by a block class) reads apart from memory something holds
+/// (coord-108, B5: "chunks 11.69" was 10 GiB of purged chunks after a burst of frames).
 pub struct MemoryLine<'a> {
     pub memory: &'a blaze_mem::tag::Snapshot,
     pub blocks: &'a blaze_mem::blocks::Snapshot,
@@ -558,6 +614,8 @@ pub struct MemoryLine<'a> {
     /// What the process holds through the global allocator ([`blaze_graph::arena::held`]); 0
     /// where the counting allocator is not installed, and not shown.
     pub heap: u64,
+    /// The chunks no owner holds ([`blaze_mem::chunks::cached`]).
+    pub chunks: blaze_mem::chunks::Cached,
 }
 
 impl MemoryLine<'_> {
@@ -594,29 +652,69 @@ impl fmt::Display for MemoryLine<'_> {
         if let Some(resident) = self.resident {
             write!(
                 f,
-                "resident {:.2} GiB, {:.2} outside blaze-mem; ",
+                "resident {:.2} GiB, {:.2} outside blaze-mem and the global heap; ",
                 gib(resident),
-                gib(resident.saturating_sub(memory.committed)),
+                gib(resident.saturating_sub(memory.footprint(self.heap))),
             )?;
         }
         if self.heap != 0 {
-            write!(f, "global heap {:.2} GiB; ", gib(self.heap))?;
+            match memory.heap_by_tag {
+                true => write!(
+                    f,
+                    "global heap {:.2} GiB live, {:.2} of it outside any task",
+                    gib(self.heap),
+                    gib(memory.heap_outside),
+                )?,
+                false => write!(f, "global heap {:.2} GiB live, not kept by tag", gib(self.heap))?,
+            }
+            if let Some(committed) = memory.heap_committed {
+                write!(
+                    f,
+                    ", in {:.2} its allocator committed ({:.2} freed: kept, or purged and still counted)",
+                    gib(committed),
+                    gib(committed.saturating_sub(self.heap)),
+                )?;
+            }
+            // What the heap can hold resident beyond its live blocks, at most: the process's
+            // footprint less blaze-mem's committed pages and the live heap. mimalloc's count above
+            // never drops on a purge, so it alone can't say what a give-back left (memcap5).
+            if let Some(resident) = self.resident {
+                write!(
+                    f,
+                    ", at most {:.2} of it freed and resident",
+                    gib(resident.saturating_sub(memory.resident_committed()).saturating_sub(self.heap)),
+                )?;
+            }
+            f.write_str("; ")?;
         }
         write!(
             f,
-            "committed {:.2} GiB (most {:.2}), {:.2} GiB in tags, reserved {:.0} GiB in {} regions (most {:.0})",
+            "committed {:.2} GiB (most {:.2}), {:.2} of it purged (not resident), {:.2} GiB in tags, reserved {:.0} GiB in {} regions (most {:.0})",
             gib(memory.committed),
             gib(memory.committed_high_water),
+            gib(memory.purged),
             gib(memory.live()),
             gib(memory.reserved),
             memory.regions(),
             gib(memory.reserved_high_water),
         )?;
+        if memory.base_pages != 0 {
+            write!(
+                f,
+                ", {:.0} GiB of it off huge pages (most {:.0}), unadvised memory's THP {}",
+                gib(memory.base_pages),
+                gib(memory.base_pages_high_water),
+                memory.thp,
+            )?;
+        }
         let mut tags = blaze_mem::Tag::ALL;
-        tags.sort_by_key(|&tag| std::cmp::Reverse(memory.get(tag).live));
+        tags.sort_by_key(|&tag| {
+            let counters = memory.get(tag);
+            std::cmp::Reverse(counters.live.saturating_add(counters.heap))
+        });
         for tag in tags {
             let counters = memory.get(tag);
-            if counters.live < Self::SHOWN && counters.reserved < Self::SHOWN_RESERVED {
+            if counters.live < Self::SHOWN && counters.heap < Self::SHOWN && counters.reserved < Self::SHOWN_RESERVED {
                 continue;
             }
             write!(
@@ -626,6 +724,17 @@ impl fmt::Display for MemoryLine<'_> {
                 gib(counters.high_water),
                 gib(counters.reserved),
                 counters.regions,
+            )?;
+            if counters.heap >= Self::SHOWN {
+                write!(f, " + heap {:.2} (most {:.2})", gib(counters.heap), gib(counters.heap_high_water))?;
+            }
+        }
+        if self.chunks != blaze_mem::chunks::Cached::default() {
+            write!(
+                f,
+                "; free chunks warm {:.2} (resident), cold {:.2} (purged)",
+                gib(self.chunks.warm),
+                gib(self.chunks.cold),
             )?;
         }
         let total = self.blocks.total();
@@ -668,7 +777,8 @@ fn log_memory(memory: &blaze_mem::tag::Snapshot) {
     let resident = None;
     let heap = blaze_graph::arena::held();
     let blocks = blaze_mem::blocks::snapshot();
-    let said = MemoryLine { memory, blocks: &blocks, resident, heap }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
+    let chunks = blaze_mem::chunks::cached();
+    let said = MemoryLine { memory, blocks: &blocks, resident, heap, chunks }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
     eprintln!("blaze serve: {said}");
     tracing::info!("{said}");
 }
@@ -901,7 +1011,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// Recovers the VFS from its journal and the database from its image, opens the store,
     /// and listens. Fails naming what could not be read, when the image is damaged, or when
     /// another daemon listens; what of the image it did not use by a rule is [`Daemon::started`].
-    pub fn start(mut driver: D, options: Options, steps: Arc<S>, runner: Runner<Step<S>>) -> Result<Daemon<D, S>, StartError> {
+    ///
+    /// What the start allocates from the global heap outside a task (the journal's tree, the
+    /// image's tables) counts to the loop's tag ([`blaze_mem::frame::heap_of`],
+    /// [`blaze_mem::Tag::Plane`]), not to the heap outside any task.
+    pub fn start(driver: D, options: Options, steps: Arc<S>, runner: Runner<Step<S>>) -> Result<Daemon<D, S>, StartError> {
+        blaze_mem::frame::heap_of(blaze_mem::Tag::Plane, || Self::start_untagged(driver, options, steps, runner))
+    }
+
+    fn start_untagged(mut driver: D, options: Options, steps: Arc<S>, runner: Runner<Step<S>>) -> Result<Daemon<D, S>, StartError> {
         // Restart to first answer is budgeted (harness/v2/budgets.py `restart-first-answer-*`):
         // each phase of the start is a span of its own, so a slow start names its phase.
         let _start = tracing::info_span!(target: "blaze", "daemon start").entered();
@@ -1080,6 +1198,19 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 Err(why) => started.trees = Some(why),
             }
         }
+        // The limit the daemon runs under (`blaze serve --memory-gb`, `BLAZE_DAEMON_MEMORY_GB`, or
+        // the machine's) made every subsystem's budget and the limit a build's release is decided
+        // against (`admission::Squeeze`), before any job. The plane only carries the budget: a
+        // daemon that set nothing here ran with no limit, so no release was ever due and the
+        // front end's sweep weighed against no budget (B5, coord-105). The frames' cap stays the
+        // exec scheduler's: the plane does not run again a task the cap cancels.
+        // Releases and the plane's admission weigh the process's footprint as the system counts
+        // it, what the limit is on and the watchdog reads, not the allocators' counts, which a
+        // purge never lowers (memcap5, coord-111: "blaze held 59.21 GiB" at a footprint of 47.28).
+        blaze_mem::tag::resident_by(crate::raw::memory::own_footprint);
+        if let Some(budget) = &options.budget {
+            blaze_graph::admission::set_budgets(budget.bytes);
+        }
         let plane_config = PlaneConfig { io: options.io, work: options.threads.max(1), budget: options.budget, starve_after: 8 };
         let observe = Observe::new(options.profiling);
         let mut plane = Plane::new(plane_config, history, runner).map_err(|error| format!("the plane: {error}"))?;
@@ -1176,8 +1307,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             settled: 0,
             job_effects: 0,
             working: 0,
+            pulse: Arc::default(), // alloc: once a daemon
+            completions: 0,
             plotted: Duration::ZERO,
             memory_logged: Duration::ZERO,
+            given_back: Duration::ZERO,
             gc: None,
             held: Vec::new(), // alloc: none until a build runs out of space
         })
@@ -1233,6 +1367,17 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 
     /// Why it stopped when it was not asked to.
+    /// The bound of its stall watchdog ([`Options::stall`]): a build, or its stop
+    /// (`serve::stop`), in which nothing moves for this long has stalled.
+    pub fn stall_bound(&self) -> Duration {
+        self.watchdog.bound()
+    }
+
+    /// Whether it was asked to stop: by a signal, a client's Stop, or its own end.
+    pub fn stopping(&self) -> bool {
+        self.stopping.is_some()
+    }
+
     pub fn failed(&self) -> Option<&Failed> {
         self.failed.as_ref()
     }
@@ -1354,6 +1499,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if self.stopping.is_some() {
             return;
         }
+        // Before anything the stop does that may hang: `blaze serve`'s stop guard (`serve::stop`)
+        // bounds it from here, though a client's Stop asked it inside a turn.
+        #[cfg(unix)]
+        super::signals::stop_begun();
         // The memory by tag as the work ends, its high-water marks the run's.
         log_memory(&blaze_mem::tag::snapshot());
         self.stopping = Some(Stopping::Image);
@@ -1382,26 +1531,46 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
 
     /// One turn of the loop: what is asked submitted, what completed taken, the plane and the
     /// jobs stepped. `false` once it has stopped.
+    ///
+    /// What the loop allocates from the global heap outside a task counts to its tag
+    /// ([`blaze_mem::frame::heap_of`], [`blaze_mem::Tag::Plane`]); a plane task it runs inline
+    /// counts to its own kind's (`plane::run_measured`).
     pub fn turn(&mut self) -> bool {
+        blaze_mem::frame::heap_of(blaze_mem::Tag::Plane, || self.turn_untagged())
+    }
+
+    fn turn_untagged(&mut self) -> bool {
         if matches!(self.stopping, Some(Stopping::Over)) {
             return false;
         }
-        let wait = if !self.effects.is_empty() || self.plane.ready() {
-            Duration::ZERO
+        let mut wait = if !self.effects.is_empty() || self.plane.ready() {
+            (Duration::ZERO, Woken::Idle)
         } else if self.plane.running() > 0 {
-            Duration::from_millis(1)
+            (Duration::from_millis(1), Woken::PlaneTasks)
         } else {
-            Duration::from_millis(50)
+            (Duration::from_millis(50), Woken::Idle)
         };
-        let until = self.session.deadline().map(|at| Duration::from_nanos(at.saturating_sub(ns(self.driver.now()))));
-        let wait = until.map_or(wait, |until| wait.min(until));
+        let mut sooner = |until: Option<Duration>, woken: Woken| {
+            if let Some(until) = until
+                && until < wait.0
+            {
+                wait = (until, woken);
+            }
+        };
+        sooner(self.session.deadline().map(|at| Duration::from_nanos(at.saturating_sub(ns(self.driver.now())))), Woken::Session);
         // A job's wait for the store to make its puts durable has a deadline of its own.
-        let jobs_until = self.jobs.next_deadline().map(|at| at.saturating_sub(self.driver.now()));
-        let wait = jobs_until.map_or(wait, |until| wait.min(until));
-        let wait = self.observe.wait(self.driver.now()).map_or(wait, |until| wait.min(until));
+        sooner(self.jobs.next_deadline().map(|at| at.saturating_sub(self.driver.now())), Woken::Durable);
+        sooner(self.observe.wait(self.driver.now()), Woken::Observe);
         self.submit();
         let mut done = std::mem::take(&mut self.done);
-        self.driver.poll(&mut done, wait);
+        let (wait, woken) = wait;
+        if wait.is_zero() {
+            self.driver.poll(&mut done, wait);
+        } else {
+            // The loop's time between its turns, said as a wait on what ends it (rule 13).
+            let driver = &mut self.driver;
+            blaze_graph::wait::wait(woken.on(), None, || driver.poll(&mut done, wait));
+        }
         for completion in &done {
             self.ended(completion);
         }
@@ -1453,7 +1622,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         self.stepping_stop();
         self.submit();
+        self.pulse.turned(self.completions + self.settled + self.job_effects);
         !matches!(self.stopping, Some(Stopping::Over))
+    }
+
+    /// The loop's pulse, for a thread that watches the loop from outside it (the stop's guard,
+    /// `serve::stop`): its progress (effects that ended on their own, the plane's nodes settled
+    /// and the jobs' effects ended, never its idle turns or a client's requests) and its turns.
+    pub fn pulse(&self) -> Arc<Pulse> {
+        Arc::clone(&self.pulse) // clone: a handle, once a daemon
     }
 
     /// The loop's effects to the driver, those that end on their own counted in `ending`.
@@ -1474,6 +1651,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             return;
         }
         if let Some(count) = self.ending.get_mut(&completion.tag) {
+            self.completions += 1;
             *count -= 1;
             if *count == 0 {
                 self.ending.remove(&completion.tag);
@@ -1489,9 +1667,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let mut replies = std::mem::take(&mut self.replies);
         self.observe.tick(now, |conn| server.waiting(conn), &mut replies);
         for reply in replies.drain(..) {
-            self.server.reply(reply, &mut self.effects);
+            self.server.reply(&reply, &mut self.effects);
         }
         self.replies = replies;
+        for row in self.jobs.started.drain(..) {
+            self.observe.started(row);
+        }
         for row in self.jobs.rows.drain(..) {
             self.observe.ended(row);
         }
@@ -1660,6 +1841,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(bytes) = crate::raw::memory::footprint(std::process::id()) {
             blaze_profile::plot(Plot::Footprint, bytes);
+            let limit = blaze_graph::admission::limit();
+            let pressure = blaze_graph::admission::Pressure { held: bytes, limit, over: None };
+            if pressure.squeezed() && now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY {
+                self.given_back = now;
+                blaze_mem::tag::give_back_heap();
+            }
         }
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);
         blaze_profile::plot(Plot::ReservedBytes, memory.reserved);
@@ -1820,8 +2007,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                             None => "this daemon runs no collector (only `blaze serve`'s does)",
                         };
                         let error = ApiError::new(what, Some("blaze cache gc".to_owned())); // alloc: error path
-                        self.server.reply(Reply { to: from, response: blaze_api::Response::Error(error) }, &mut self.effects);
-                        self.server.reply(Reply { to: from, response: blaze_api::Response::Done { ok: false } }, &mut self.effects);
+                        self.server.reply(&Reply { to: from, response: blaze_api::Response::Error(error) }, &mut self.effects);
+                        self.server.reply(&Reply { to: from, response: blaze_api::Response::Done { ok: false } }, &mut self.effects);
                     }
                 },
                 // `blaze run` of a dev executable: the programs are the steps' (review: the
@@ -1833,8 +2020,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                         Ok(None) => (blaze_api::Response::Launched { live: false, env: Vec::new() }, true),
                         Err(error) => (blaze_api::Response::Error(error), false),
                     };
-                    self.server.reply(Reply { to: from, response }, &mut self.effects);
-                    self.server.reply(Reply { to: from, response: blaze_api::Response::Done { ok } }, &mut self.effects);
+                    self.server.reply(&Reply { to: from, response }, &mut self.effects);
+                    self.server.reply(&Reply { to: from, response: blaze_api::Response::Done { ok } }, &mut self.effects);
                 }
                 Out::Pass(Arrived::Request { from, request: Request::Sql { sql, last_s } }) => {
                     let mut replies = std::mem::take(&mut self.replies);
@@ -1859,7 +2046,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     self.replies = replies;
                     self.after_session();
                 }
-                Out::Answer(reply) => self.server.reply(reply, &mut self.effects),
+                Out::Answer(reply) => self.server.reply(&reply, &mut self.effects),
                 Out::Moved { head, root } => {
                     self.session.head_moved(&mut cx!(self), &head, root);
                     self.after_session();
@@ -1875,7 +2062,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// `replies` sent, and given back as the loop's buffer.
     fn send(&mut self, mut replies: Vec<Reply>) {
         for reply in replies.drain(..) {
-            self.server.reply(reply, &mut self.effects);
+            self.server.reply(&reply, &mut self.effects);
         }
         self.replies = replies;
     }
@@ -1899,7 +2086,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.said(said);
         let mut replies = std::mem::take(&mut self.replies);
         for reply in replies.drain(..) {
-            self.server.reply(reply, &mut self.effects);
+            self.server.reply(&reply, &mut self.effects);
         }
         self.replies = replies;
     }
@@ -2221,7 +2408,9 @@ mod tests {
     fn the_memory_line_names_the_tags_holding_the_most_largest_first() {
         use blaze_mem::{Tag as MemTag, tag::Counters, tag::Snapshot};
         let mut tags = [Counters::default(); MemTag::COUNT];
-        tags[MemTag::Infer.index()] = Counters { live: 1 << 30, high_water: 2 << 30, ..Counters::default() };
+        // Little in blaze-mem, much in the global heap: first, for what it holds in all.
+        tags[MemTag::Infer.index()] =
+            Counters { live: 1 << 30, high_water: 2 << 30, heap: 4 << 30, heap_high_water: 5 << 30, ..Counters::default() };
         tags[MemTag::Query.index()] = Counters {
             live: 3 << 30,
             high_water: 3 << 30,
@@ -2238,6 +2427,13 @@ mod tests {
             committed_high_water: 6 << 30,
             reserved: 1700 << 30,
             reserved_high_water: 1800 << 30,
+            base_pages: 0,
+            base_pages_high_water: 0,
+            thp: blaze_mem::huge::Thp::Unset,
+            heap_outside: 1 << 30,
+            heap_by_tag: true,
+            purged: 1 << 30,
+            heap_committed: Some(7 << 30),
         };
         let mut blocks = blaze_mem::blocks::Snapshot::default();
         blocks.classes[3] = blaze_mem::blocks::ClassCounters {
@@ -2250,30 +2446,44 @@ mod tests {
             trims: 9,
         };
         blocks.classes[10] = blaze_mem::blocks::ClassCounters { size: 5 << 10, carved: 1 << 20, ..Default::default() };
-        let said = MemoryLine { memory: &memory, blocks: &blocks, resident: Some(12 << 30), heap: 6 << 30 }.to_string();
-        let query = said.find(&format!("; {} 3.00 (most 3.00, reserved 900 in 400)", MemTag::Query)).expect(&said);
-        let infer = said.find(&format!("; {} 1.00 (most 2.00, reserved 0 in 0)", MemTag::Infer)).expect(&said);
-        let link = said.find(&format!("; {} 0.00 (most 0.00, reserved 800 in 7000)", MemTag::Link)).expect(&said);
-        assert!(query < infer && infer < link, "{said}");
+        let chunks = blaze_mem::chunks::Cached { warm: 1 << 29, cold: 1 << 30 };
+        let said = MemoryLine { memory: &memory, blocks: &blocks, resident: Some(12 << 30), heap: 6 << 30, chunks }.to_string();
+        let infer = said
+            .find(&format!("; {} 1.00 (most 2.00, reserved 0 in 0) + heap 4.00 (most 5.00)", MemTag::Infer))
+            .expect(&said);
+        let query = said.find(&format!("; {} 3.00 (most 3.00, reserved 900 in 400);", MemTag::Query)).expect(&said);
+        let link = said.find(&format!("; {} 0.00 (most 0.00, reserved 800 in 7000);", MemTag::Link)).expect(&said);
+        assert!(infer < query && query < link, "{said}");
         assert!(
             said.starts_with(
-                "memory: resident 12.00 GiB, 7.00 outside blaze-mem; global heap 6.00 GiB; committed 5.00 GiB (most 6.00), \
+                "memory: resident 12.00 GiB, 1.00 outside blaze-mem and the global heap; \
+                 global heap 6.00 GiB live, 1.00 of it outside any task, in 7.00 its allocator committed \
+                 (1.00 freed: kept, or purged and still counted), at most 2.00 of it freed and resident; \
+                 committed 5.00 GiB (most 6.00), 1.00 of it purged (not resident), \
                  4.00 GiB in tags, reserved 1700 GiB in 7400 regions (most 1800)"
             ),
             "{said}"
         );
+        // An allocator that keeps no tags says so, rather than show every tag holding none.
+        let untagged = Snapshot { heap_by_tag: false, ..memory };
+        let said_untagged = MemoryLine { memory: &untagged, blocks: &blocks, resident: None, heap: 6 << 30, chunks }.to_string();
+        assert!(said_untagged.starts_with("memory: global heap 6.00 GiB live, not kept by tag, in 7.00 "), "{said_untagged}");
         assert!(!said.contains(&format!("; {} ", MemTag::Parse)), "{said}");
         // The classes: live is carved less warm and cold; a class carving little is not shown.
         assert!(
             said.ends_with(
-                "; blocks live 0.75 GiB, warm 0.50, cold 0.25 (0.25 given back in 9 trims), carved 1.50, committed 2.00\
+                "; free chunks warm 0.50 (resident), cold 1.00 (purged)\
+                 ; blocks live 0.75 GiB, warm 0.50, cold 0.25 (0.25 given back in 9 trims), carved 1.50, committed 2.00\
                  ; 112 B blocks live 0.75, warm 0.50, cold 0.25, carved 1.50"
             ),
             "{said}"
         );
         let none = blaze_mem::blocks::Snapshot::default();
-        let unknown = MemoryLine { memory: &memory, blocks: &none, resident: None, heap: 0 }.to_string();
+        let unknown =
+            MemoryLine { memory: &memory, blocks: &none, resident: None, heap: 0, chunks: blaze_mem::chunks::Cached::default() }
+                .to_string();
         assert!(unknown.starts_with("memory: committed 5.00 GiB"), "{unknown}");
         assert!(!unknown.contains("blocks"), "{unknown}");
+        assert!(!unknown.contains("free chunks"), "{unknown}");
     }
 }

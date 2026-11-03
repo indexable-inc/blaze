@@ -94,7 +94,7 @@ fn check_lower_path_twin(text: &str) {
             file_id.into(),
             crate::LoweringMode::Analysis,
         );
-        let lowered = ctx.lower_path(handle, &mut ImplTraitLowering::Opaque);
+        let lowered = ctx.lower_path(&handle, &mut ImplTraitLowering::Opaque);
         let (store, _) = ctx.store.finish();
         (db, store, lowered)
     };
@@ -216,7 +216,7 @@ fn keywords_in_middle_fail_lowering3() {
 }
 
 #[track_caller]
-fn check_path_lowering(text: &str, expected: Expect) {
+fn check_path_lowering(text: &str, expected: &Expect) {
     let (db, store, lowered_path) = with_path(text, lower_path);
     let lowered_path = lowered_path.expect("failed to lower path");
     let buf = pretty::print_path(&db, &store, store.path_at(lowered_path), Edition::CURRENT);
@@ -225,6 +225,6 @@ fn check_path_lowering(text: &str, expected: Expect) {
 
 #[test]
 fn fn_like_path_with_coloncolon() {
-    check_path_lowering("Fn::(A, B) -> C", expect![[r#"Fn::<(A, B), Output = C>"#]]);
-    check_path_lowering("Fn::(A, B)", expect![[r#"Fn::<(A, B), Output = ()>"#]]);
+    check_path_lowering("Fn::(A, B) -> C", &expect![[r#"Fn::<(A, B), Output = C>"#]]);
+    check_path_lowering("Fn::(A, B)", &expect![[r#"Fn::<(A, B), Output = ()>"#]]);
 }

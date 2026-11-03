@@ -485,11 +485,12 @@ fn rewrite<'db>(
     let typed = body.locals.alloc(Local { ty: typed_ty.store() });
     let to_typed = Rvalue::Cast(CastKind::PtrToPtr, move_of(raw), typed_ty.store());
     let to_box = Rvalue::Cast(CastKind::Transmute, move_of(typed), box_ty.store());
-    let allocate = |target: BasicBlockId, cleanup: Option<BasicBlockId>| Terminator {
+    // Each arm below calls it once, so it moves `layout` into the call.
+    let allocate = move |target: BasicBlockId, cleanup: Option<BasicBlockId>| Terminator {
         span,
         kind: TerminatorKind::Call {
             func: std.func.clone(), // clone: the function's constant, a refcount
-            args: Box::new([layout.clone()]), // alloc: a call's arguments, kept in the body; clone: a refcount
+            args: Box::new([layout]), // alloc: a call's arguments, kept in the body
             destination: Place::from(raw).store(),
             target: Some(target),
             cleanup,

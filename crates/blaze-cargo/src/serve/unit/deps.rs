@@ -29,7 +29,7 @@ use std::sync::Arc;
 use base_db::{Crate, Db, Env};
 use blaze_api::{ApiError, Diagnostic, Level, ServedCrate, ServedPart};
 use blaze_cas::{Key, Kind};
-use blaze_diagnostics::{Diag, Options, cache};
+use blaze_diagnostics::{Diag, cache};
 use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
 use blaze_ids::ContentId;
@@ -102,7 +102,7 @@ pub(crate) fn serve(
     kept: &mut Option<Kept>,
 ) -> Result<(), ApiError> {
     let mode = mode_in(&mut session.env, &job.input.config.invocation.env)?;
-    let build = build()?;
+    let build = front_end()?;
     // alloc: once per serve, one entry per unit's crate
     let crates: Vec<Crate> = units.iter().filter_map(|&unit| job.crates.krate(unit as usize)).collect();
     let Some(served) = images(lowered, &crates, build, session, mode)? else { return Ok(()) };
@@ -115,9 +115,8 @@ pub(crate) fn serve(
     };
     let db = lowered.db();
     let flags = imaged(job, units.iter().map(|&unit| unit as usize), &session.keyed)?;
-    let options = Options::default();
     let asked: Vec<(Crate, cache::Inputs<'_>)> =
-        flags.iter().map(|(krate, flags)| (*krate, cache::Inputs::of(db, flags, &options))).collect(); // alloc: once per serve
+        flags.iter().map(|(krate, flags)| (*krate, cache::Inputs::of(db, flags))).collect(); // alloc: once per serve
     cache::serve(lowered.served_db(), &asked, &*session.images, checks).map_err(|why| ApiError::new(why, None))?;
     let db = lowered.db();
     let consts = (0..job.graph.len())
@@ -329,7 +328,7 @@ pub(crate) fn session(
     let adapter: Arc<dyn ImageStore + Send + Sync> = images.clone(); // clone: an `Arc`, once per database
     // dyn: hir-ty's goal store takes its facts as `dyn` (blaze-items depends on hir-ty, which can't name `Goals`); made once per database
     let facts: Arc<dyn goal_store::GoalFacts> = Arc::new(blaze_items::goals::Goals); // alloc: setup, once per database
-    let installed = goal_store::install(lowered.db(), adapter, facts, build()?)
+    let installed = goal_store::install(lowered.db(), adapter, facts, front_end()?)
         .map_err(|why| ApiError::new(format!("the persistent goal cache: {why}"), None))?; // alloc: error path
     let items = match items_mode {
         None => None,
@@ -338,7 +337,7 @@ pub(crate) fn session(
             let adapter: Arc<dyn ImageStore + Send + Sync> = images.clone(); // clone: an `Arc`, once per database
             // dyn: hir-ty's item store takes its facts as `dyn` (blaze-item-hash depends on hir-ty); made once per database
             let facts: Arc<dyn body_store::BodyFacts> = Arc::new(blaze_item_hash::Bodies); // alloc: setup, once per database
-            Some(body_store::install(lowered.db(), adapter, facts, build()?, mode).map_err(|why| {
+            Some(body_store::install(lowered.db(), adapter, facts, front_end()?, mode).map_err(|why| {
                 ApiError::new(format!("the item store: {why}"), None) // alloc: error path
             })?)
         }
@@ -436,13 +435,13 @@ pub(crate) fn differences(kept: &Kept) -> Result<(), ApiError> {
 /// durable before the build that kept it answers.
 pub(crate) fn store(
     lowered: &Lowered,
-    kept: Option<Kept>,
+    kept: Option<&Kept>,
     session: &mut Session,
     later: &[Later],
     root: &str,
 ) -> Result<(Vec<KeptPut>, Flushes), ApiError> {
     let images = &*session.images;
-    let stored = match &kept {
+    let stored = match kept {
         Some(kept) => Some(lowered.store_deps(&kept.served, images).map_err(super::lower_error)?),
         None => None,
     };
@@ -467,13 +466,12 @@ pub(crate) fn store(
         let what: Arc<str> = Arc::from(what);
         puts.extend(images.take_puts().into_iter().map(|put| KeptPut { put, what: Arc::clone(&what) }));
     };
-    let options = Options::default();
     let checked: Vec<cache::Checked<'_>> = later
         .iter()
         .filter_map(|it| {
             // None: its image was refused, and its outcome is for the same reason.
             let image = cache::image_key(db, it.krate).or_else(|| stored.as_ref()?.filed.get(&it.krate).copied())?;
-            Some(cache::Checked { krate: it.krate, image, inputs: cache::Inputs::of(db, &it.flags, &options), diags: &it.diags, items_broken: it.items_broken })
+            Some(cache::Checked { krate: it.krate, image, inputs: cache::Inputs::of(db, &it.flags), diags: &it.diags, items_broken: it.items_broken })
         })
         .collect(); // alloc: once per front end stored, one per crate checked
     let error = |why: String| ApiError::new(why, Some(root.to_owned())); // alloc: error path
@@ -673,14 +671,26 @@ pub(crate) fn served(db: &Db, job: &Job, session: &Session) -> Result<Vec<Served
     Ok(lines)
 }
 
-/// The identity of the blaze reading and writing images, the goal and item stores, kept
-/// proc-macro expansions and unit records: the hash of its whole executable
-/// ([`crate::serve::build_id`]), which decides what a crate resolves to, what a macro expands
-/// to and what a unit's record holds. Never a constant: a fixed name-resolution bug must not
-/// go on serving the def maps the bug made. Not the code generator's code identity
-/// (`Toolchain::id`), which covers only the code generator's packages: these values are made
-/// by code past them too (blaze-item-hash, blaze-macro-eval, blaze-cargo itself), so each keeps
-/// every byte of blaze in its key until it has a content identity of the code that makes it.
+/// What images, the check outcomes, bodies and constants served beside them, and the goal and
+/// item stores are keyed by: the content identity of the code that computes them and of how it
+/// was built ([`crate::serve::front_end_code`], `blaze_codegen_code::FRONT_END`), which decides
+/// what a crate resolves to, what a goal answers and what a body holds. Never a constant: a
+/// fixed name-resolution bug must not go on serving the def maps the bug made; and never the
+/// executable's bytes, so that an edit to the code generator or the CLI keeps them. The goal
+/// and item stores' solver version is of this identity alone: hir-ty and the vendored trait
+/// solver are in its closure, so a solver edit (in `src/` or a patch) misses both stores.
+pub(crate) fn front_end() -> Result<ContentId, ApiError> {
+    crate::serve::front_end_code().map(|it| it.0).map_err(|why| ApiError::new(why, None))
+}
+
+/// The identity of the blaze writing unit records: the hash of its whole executable
+/// ([`crate::serve::build_id`]). A record is made by blaze-cargo itself (its plan, its flags,
+/// the code generator's and the front end's outputs), and blaze-cargo's closure is every
+/// package of the program but blaze-engine, which installs hooks into it; so a content identity
+/// of the code making a record would move on the same edits as the bytes do, past those to
+/// blaze-engine alone. A record miss reruns the unit's check or compile against the images and
+/// stores, which [`front_end`] keeps. The standard library's shared directory is keyed by it
+/// too, as it holds std units' records and outputs alone.
 pub(crate) fn build() -> Result<ContentId, ApiError> {
     #[expect(
         clippy::disallowed_types,

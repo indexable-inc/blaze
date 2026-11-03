@@ -203,7 +203,7 @@ impl<'d> World<'d> {
             });
             to_all.push(to);
             heard.push(said);
-            jobs.push(job.recv_timeout(LONG).unwrap_or_else(|_| hung(format!("{name} actor {actor} never began"))));
+            jobs.push(job.recv_timeout(LONG).unwrap_or_else(|_| hung(&format!("{name} actor {actor} never began"))));
         }
         World { name, design, to: to_all, heard, told: Cell::new([None; ACTORS]), asked: Cell::new([None; ACTORS]), jobs }
     }
@@ -222,7 +222,7 @@ impl<'d> World<'d> {
 
     fn hear(&self, actor: usize) -> Heard {
         self.heard[actor].recv_timeout(LONG).unwrap_or_else(|_| {
-            hung(format!(
+            hung(&format!(
                 "{} actor {actor} said nothing in {LONG:?}; last told {:?}, its last ask {:?}",
                 self.name,
                 self.told.get()[actor],
@@ -231,18 +231,23 @@ impl<'d> World<'d> {
         })
     }
 
-    /// Waits until `count` waiters are linked to `at`'s run, or `actor` said something.
+    /// Waits until `count` waiters are linked to `at`'s run and `actor`'s job waits in the
+    /// scheduler, or `actor` said something. Linked is not enough: an ask links itself to the
+    /// run and only then waits in the scheduler, and a step told meanwhile would find no wait to
+    /// close a cycle with, so the ask that gives way would be another than the one the steps say
+    /// (and the case would hang on a hold no step lets go).
     fn linked_or_heard(&self, at: usize, count: usize, actor: usize) -> Option<Heard> {
         let until = Instant::now() + LONG;
+        let job = self.jobs[actor];
         loop {
             if let Ok(heard) = self.heard[actor].try_recv() {
                 return Some(heard);
             }
-            if self.design.waiters(key(at)) == count {
+            if self.design.waiters(key(at)) == count && crate::sched::waits_now().0.iter().any(|(it, _)| *it == job) {
                 return None;
             }
             if Instant::now() >= until {
-                hung(format!("{} actor {actor}'s ask of key {at} neither linked nor ended in {LONG:?}", self.name));
+                hung(&format!("{} actor {actor}'s ask of key {at} neither linked nor ended in {LONG:?}", self.name));
             }
             std::thread::yield_now();
         }
@@ -271,7 +276,7 @@ impl<'d> World<'d> {
                 return;
             }
             if Instant::now() >= until {
-                hung(format!("{} actor {actor}'s retry never waited for the run it gave way to in {LONG:?}", self.name));
+                hung(&format!("{} actor {actor}'s retry never waited for the run it gave way to in {LONG:?}", self.name));
             }
             std::thread::yield_now();
         }
@@ -467,11 +472,11 @@ static HUNG: parking_lot::Mutex<Option<String>> = parking_lot::const_mutex(None)
 
 /// A bounded wait of the case timed out: said on stderr at once (hegel keeps a case's panic
 /// until it ends shrinking) and kept as the run's first hang, then the case fails with it.
-fn hung(why: String) -> ! {
+fn hung(why: &str) -> ! {
     let mut first = HUNG.lock();
     if first.is_none() {
         _ = writeln!(std::io::stderr(), "the oracle hung: {why}");
-        *first = Some(why.clone());
+        *first = Some(why.to_owned());
     }
     drop(first);
     panic!("{why}")

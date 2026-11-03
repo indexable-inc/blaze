@@ -11,7 +11,14 @@
 //!   [`Records`]' lock-free index, and a column from ID to record.
 //!
 //! A lookup probes the mapped index (SwissTable groups of eight tag bytes beside eight IDs,
-//! read only), then the overlay's. A new value takes an ID the image's GC freed first, then the
+//! read only), then the overlay's. Each is placed by SipHash-1-3 of the bytes under its own
+//! key ([`blaze_hash::SipKey`]), never by a fixed hash: the values are names a source file, a
+//! macro or a stored tree picks, and a hash anyone can compute lets them pick thousands with
+//! one hash, each insert then probing past all the others under the shard's lock (review
+//! finding S5: `blaze_phf::name_hash` inverts step by step). The overlay's key is drawn at
+//! random when the table is made and never leaves the process; the mapped index's is in the
+//! image's [`Root`], BLAKE3 of the values it keeps, so the image's bytes are a function of its
+//! values (AGENTS.md rule 22) and no value can be picked to collide before the key exists. A new value takes an ID the image's GC freed first, then the
 //! next: no ID of a live value is ever given to another, and nothing is renumbered.
 //!
 //! GC is [`Table::write`]: the image keeps the values whose IDs the owners of the other
@@ -34,6 +41,7 @@
 use std::fmt;
 
 use blaze_format::SchemaHash;
+use blaze_hash::SipKey;
 use blaze_ids::bits::{BitSet, BitSlice};
 use blaze_image::{Corrupt, Image, Refused, Section, SectionId, SectionWriter, Stable};
 
@@ -57,6 +65,40 @@ pub(crate) struct Shape {
     pub(crate) size: usize,
     /// Whether every value is UTF-8, checked when an image is restored.
     pub(crate) text: bool,
+    /// Where the key the overlay places values by comes from.
+    pub(crate) overlay: Overlay,
+}
+
+/// How a table draws the key its overlay places values by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Overlay {
+    /// From the operating system for each table, never shown: a table whose values a source
+    /// file, a macro or a stored tree picks, as every table a process interns into is. Under
+    /// the model checker (`cfg(blaze_check)`) the fixed key instead: the checker runs a model
+    /// many times and needs each run to read the same, and a placement that moved from run to
+    /// run would move which shard, group and control word the racing threads touch.
+    Secret,
+    /// The fixed key: a table only a fuzz target's hooks fill (`crate::fuzz`), where one input
+    /// must place its values the same way in every run for its coverage to mean anything.
+    /// Chosen by the shape, never by a feature: a fuzz build turns on the `fuzz` feature of
+    /// every crate in it, and that must leave every `Secret` table secret.
+    #[cfg_attr(
+        not(any(all(test, not(blaze_check)), feature = "fuzz")),
+        expect(dead_code, reason = "made by the fuzz hooks' shape and the unit tests alone")
+    )]
+    Fixed,
+}
+
+/// [`Overlay::Fixed`]'s key, and [`Overlay::Secret`]'s under the model checker.
+const FIXED_OVERLAY: SipKey = SipKey::new(0x6f76_6572_6c61_7930, 0x6f76_6572_6c61_7931);
+
+impl Overlay {
+    fn key(self) -> SipKey {
+        match self {
+            Overlay::Secret if !cfg!(blaze_check) => SipKey::random(),
+            Overlay::Secret | Overlay::Fixed => FIXED_OVERLAY,
+        }
+    }
 }
 
 pub(crate) const MAX_ALIGN: usize = 16;
@@ -64,22 +106,17 @@ pub(crate) const MAX_ALIGN: usize = 16;
 /// Slots in a group of the mapped index: tag bytes 0 to 7 of its control word.
 const GROUP: usize = 8;
 
-/// The hash of a value's bytes, in every table, mapped or not: [`blaze_phf::name_hash`],
-/// fixed so an image's index means the same to every blaze that opens it. FxHash's
-/// multiply-rotate over 8-byte words, the length first, then murmur3's 64-bit finalizer so the
-/// tag (the top 7 bits) and the home group (the low ones) are both well mixed. It is
-/// `blaze_phf`'s so the compiled-in symbols' perfect hash is keyed by it too, and a caller that
-/// hashed a name already (the lexer) hands the hash over ([`Table::intern_hashed`]).
-#[inline]
-pub(crate) fn value_hash(bytes: &[u8]) -> u64 {
-    blaze_phf::name_hash(bytes)
+/// The key of the mapped index of an image keeping `values`, in ID order
+/// ([`blaze_ids::index_key`] in this table's domain).
+pub(crate) fn index_key<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> SipKey {
+    blaze_ids::index_key("blaze intern index key", values)
 }
 
 blaze_format::record! {
     /// What the image holds of one table, at its section's start: where each column is in the
     /// section, and the counts.
     #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-    struct Root: 1 {
+    struct Root: 2 {
         /// `count + 1` `u32`s: value `i`'s bytes are `starts[i]..starts[i + 1]` of `bytes`.
         starts: u64,
         /// `count` `u64` order keys.
@@ -94,6 +131,9 @@ blaze_format::record! {
         free: u64,
         bytes: u64,
         bytes_len: u64,
+        /// The index's [`SipKey`]: [`index_key`] of the kept values.
+        key0: u64,
+        key1: u64,
         first: u32,
         count: u32,
         groups: u32,
@@ -103,17 +143,18 @@ blaze_format::record! {
     }
 }
 
-/// What a table's section means beyond [`Root`]: the columns, the index and [`value_hash`].
+/// What a table's section means beyond [`Root`]: the columns, the index and its hash.
 /// A change to any of them changes this text, and so every table's schema.
-pub(crate) const LAYOUT: &str = "intern table 1: Root at 0; starts u32, keys u64, live u64 bits, \
+pub(crate) const LAYOUT: &str = "intern table 2: Root at 0; starts u32, keys u64, live u64 bits, \
      ctrl u64 groups of 8 tags (0x80 | hash >> 57) probed linearly from hash & mask, ids u32, \
-     free u32 ascending, bytes; value_hash multiply-rotate with murmur3 finalizer";
+     free u32 ascending, bytes; hash SipHash-1-3 of the bytes keyed by Root key0 key1, the \
+     first 16 bytes of BLAKE3 'blaze intern index key' over each kept value's u64 LE length \
+     and bytes in ID order";
 
 /// [`Root`]'s record schema.
 pub(crate) const ROOT: SchemaHash = <Root as blaze_format::Record>::SCHEMA;
 
 /// The table's part in the image this process restored, read in place; empty for a fresh one.
-#[derive(Default)]
 struct Base {
     /// One past the last ID the image holds.
     end: u32,
@@ -124,6 +165,25 @@ struct Base {
     ids: &'static [u32],
     free: &'static [u32],
     bytes: &'static [u8],
+    /// What `ctrl` and `ids` are placed by; unused while they are empty.
+    key: SipKey,
+}
+
+impl Default for Base {
+    /// A fresh table's: no ID restored, an empty index.
+    fn default() -> Base {
+        Base {
+            end: 0,
+            starts: &[],
+            keys: &[],
+            live: BitSlice::default(),
+            ctrl: &[],
+            ids: &[],
+            free: &[],
+            bytes: &[],
+            key: SipKey::new(0, 0),
+        }
+    }
 }
 
 impl Base {
@@ -209,6 +269,29 @@ const CHUNK_GROUPS: usize = 16;
 /// Entries of a column one job of a restore validates: about 16k values at about 25
 /// instructions each, near 40 µs, so a million symbols are 64 jobs, enough to fill a socket.
 const CHUNK: usize = 1 << 14;
+/// Values one job of a restore looks up in the index: about 1k at about 50 ns each, near the
+/// 40 µs of the other jobs.
+const LOOKUPS: usize = 1 << 10;
+
+/// The shortest run of consecutive full groups (no empty slot) [`Table::validate`] refuses in
+/// an index of `groups`, at most half full: a run that a writer placing by a keyed hash makes
+/// with odds under 2^-64, so a crafted image costs a lookup that misses at most this many
+/// control words, where half full alone allowed `groups / 2`.
+///
+/// A run of `k` full groups is the end of `m >= k` groups whose `8m` slots hold only values
+/// homed in them (the group before them has an empty slot, which no probe passes). At most
+/// half full, `m` groups are home to `4m` values on average, so that needs twice the mean,
+/// which by Chernoff's bound has odds under `e^(-r m)` with `r = GROUP (ln 2 - 1/2)`, about
+/// 1.55: `GROUP (α - 1 - ln α)` at the load α = 1/2. Summed over every `m >= k` (under twice
+/// the first term) and every first group, the odds are under `2 groups e^(-r k)`, at most
+/// 2^-64 once `r k >= ln 2 (log2 groups + 65)`. For 2^18 groups (a million values) that is
+/// 38 groups.
+fn refused_run(groups: usize) -> usize {
+    const RATE: f64 = GROUP as f64 * (std::f64::consts::LN_2 - 0.5);
+    debug_assert!(groups.is_power_of_two());
+    let bits = f64::from(groups.trailing_zeros() + 65);
+    (bits * std::f64::consts::LN_2 / RATE).ceil() as usize
+}
 
 /// `check` over `0..total` in chunks of `chunk`, run by `jobs`. The error is the first chunk's
 /// that failed, so the same bytes give the same error however many workers ran.
@@ -249,6 +332,9 @@ pub(crate) struct Table {
     reused: AtomicUsize,
     /// The values this process made, and their ID column.
     records: Records,
+    /// What `records` places values by: [`Shape::overlay`]'s key, for a process's tables drawn
+    /// at random for each and never shown.
+    overlay: SipKey,
 }
 
 impl Table {
@@ -261,12 +347,13 @@ impl Table {
             next: AtomicU32::new(first),
             reused: AtomicUsize::new(0),
             records: Records::new(first),
+            overlay: shape.overlay.key(),
             shape,
         };
         for id in 1..first {
             let bytes = (table.shape.static_bytes)(id);
             // A value compiled in twice is the first.
-            table.records.intern(value_hash(bytes), bytes, || (id, (table.shape.key)(bytes)));
+            table.records.intern(table.overlay.hash(bytes), bytes, || (id, (table.shape.key)(bytes)));
         }
         table
     }
@@ -303,6 +390,7 @@ impl Table {
             ids: image.slice::<u32>(section, root.ids, groups * GROUP as u64)?,
             free: image.slice::<u32>(section, root.free, u64::from(root.frees))?,
             bytes: image.range(section, root.bytes, root.bytes_len)?,
+            key: SipKey::new(root.key0, root.key1),
         };
         let table = Table {
             first: root.first,
@@ -310,6 +398,7 @@ impl Table {
             next: AtomicU32::new(end),
             reused: AtomicUsize::new(0),
             records: Records::new(root.first),
+            overlay: shape.overlay.key(),
             shape,
         };
         table.validate(&root, jobs).map_err(invalid)?;
@@ -335,12 +424,14 @@ impl Table {
         cell.set(table).map_err(|_| started)
     }
 
-    /// The checks that make every read of the restored columns in bounds, in O(IDs + slots)
-    /// with no value hashed, each column split into chunks run by `jobs`. That the index
-    /// reaches every live value under its own hash is the section's CRC's to guard: a slot that
-    /// does not costs a second ID for that value, never a wrong value. An error is what failed
-    /// and the byte of the section it failed at (`root`'s column offsets, bounds-checked by the
-    /// views that read them).
+    /// The checks that make every read of the restored columns in bounds and every lookup
+    /// short, in O(IDs + slots), each column split into chunks run by `jobs`: no run of full
+    /// groups longer than [`refused_run`], and the index placed by its key, checked by finding
+    /// the compiled-in values under it (in a table with none, every kept value). A key the
+    /// layout was not placed by misses almost all of them, where each miss would give a value a
+    /// second ID; that one slot reaches its value is the section's CRC's to guard. An error is
+    /// what failed and the byte of the section it failed at (`root`'s column offsets,
+    /// bounds-checked by the views that read them, or the key's in the root).
     fn validate(&self, root: &Root, jobs: Jobs<'_>) -> Result<(), (&'static str, u64)> {
         let base = &self.base;
         let count = (base.end - self.first) as usize;
@@ -391,11 +482,29 @@ impl Table {
             }
             Ok(())
         })?;
-        let full = std::sync::atomic::AtomicUsize::new(0);
-        in_chunks(jobs, base.ctrl.len(), CHUNK / GROUP, |groups| {
+        // std's atomics, not the model checker's: a restore is one thread's, before any race.
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let full = AtomicUsize::new(0);
+        let (groups, chunk) = (base.ctrl.len(), CHUNK / GROUP);
+        let refused = refused_run(groups);
+        let too_long = |first: usize| ("a run of full index groups longer than half full allows", root.ctrl + 8 * first as u64);
+        // Each chunk's full groups at its start and at its end, for the runs across chunks.
+        // alloc: two words a chunk of the index, once a restore
+        let edges: Vec<[AtomicUsize; 2]> = (0..groups.div_ceil(chunk)).map(|_| Default::default()).collect();
+        in_chunks(jobs, groups, chunk, |range| {
             let mut here = 0;
-            for group in groups {
+            let (mut run, mut lead) = (0, None);
+            for group in range.clone() {
                 let word = base.ctrl[group];
+                if Ctrl::<GROUP>(word).empty().any() {
+                    lead.get_or_insert(run);
+                    run = 0;
+                } else {
+                    run += 1;
+                    if run >= refused {
+                        return Err(too_long(group + 1 - run));
+                    }
+                }
                 for byte in 0..GROUP {
                     let tag = (word >> (byte * 8)) & 0xff;
                     if tag == 0 {
@@ -411,39 +520,65 @@ impl Table {
                     here += 1;
                 }
             }
-            full.fetch_add(here, std::sync::atomic::Ordering::Relaxed);
+            full.fetch_add(here, Relaxed);
+            let [first, last] = &edges[range.start / chunk];
+            first.store(lead.unwrap_or(run), Relaxed);
+            last.store(run, Relaxed);
             Ok(())
         })?;
         let full = full.into_inner();
         if full * 2 > base.ids.len() || (self.first > 1 && full == 0) {
             return Err(("an index more than half full, or without the compiled-in values", root.ctrl));
         }
+        // The runs across chunks, walked twice round so the one through the last group into the
+        // first is whole: at most half full, some group has an empty slot and ends every run.
+        let (mut run, mut first) = (0, 0);
+        for at in 0..2 * edges.len() {
+            let start = at % edges.len() * chunk;
+            let len = chunk.min(groups - start);
+            let [lead, trail] = edges[at % edges.len()].each_ref().map(|it| it.load(Relaxed));
+            if run == 0 {
+                first = start;
+            }
+            run += lead;
+            if run >= refused {
+                return Err(too_long(first));
+            }
+            if lead < len {
+                (run, first) = (trail, start + len - trail);
+            }
+        }
+        // The index is placed by its key: a key it was not placed by finds almost none of these.
+        let misplaced = || ("an index whose key does not find its values", std::mem::offset_of!(Root, key0) as u64);
+        if self.first > 1 {
+            let statics = (self.first - 1) as usize;
+            in_chunks(jobs, statics, LOOKUPS, |ids| {
+                let found = ids.into_iter().all(|at| self.base_find((self.shape.static_bytes)(at as u32 + 1)).is_some());
+                found.then_some(()).ok_or_else(misplaced)
+            })?;
+        } else {
+            in_chunks(jobs, count, LOOKUPS, |indices| {
+                let found = indices
+                    .filter(|&index| base.is_live(index))
+                    .all(|index| self.base_find(&base.bytes[base.starts[index] as usize..base.starts[index + 1] as usize]).is_some());
+                found.then_some(()).ok_or_else(misplaced)
+            })?;
+        }
         Ok(())
     }
 
     /// The ID of `bytes`, made if it has none.
     pub(crate) fn intern(&self, bytes: &[u8]) -> u32 {
-        self.intern_hashed(value_hash(bytes), bytes)
-    }
-
-    /// [`Table::intern`] of `bytes` whose [`value_hash`] is `hash`.
-    pub(crate) fn intern_hashed(&self, hash: u64, bytes: &[u8]) -> u32 {
-        debug_assert_eq!(hash, value_hash(bytes), "the hash given is not the bytes' value_hash");
-        if let Some(id) = self.base_find(hash, bytes) {
+        if let Some(id) = self.base_find(bytes) {
             return id;
         }
+        let hash = self.overlay.hash(bytes);
         self.records.intern(hash, bytes, || (self.take_id(), (self.shape.key)(bytes))).id()
     }
 
     /// The ID of `bytes`, if it has one.
     pub(crate) fn find(&self, bytes: &[u8]) -> Option<u32> {
-        self.find_hashed(value_hash(bytes), bytes)
-    }
-
-    /// [`Table::find`] of `bytes` whose [`value_hash`] is `hash`.
-    pub(crate) fn find_hashed(&self, hash: u64, bytes: &[u8]) -> Option<u32> {
-        debug_assert_eq!(hash, value_hash(bytes), "the hash given is not the bytes' value_hash");
-        self.base_find(hash, bytes).or_else(|| self.records.find(hash, bytes).map(Record::id))
+        self.base_find(bytes).or_else(|| self.records.find(self.overlay.hash(bytes), bytes).map(Record::id))
     }
 
     fn take_id(&self) -> u32 {
@@ -459,12 +594,17 @@ impl Table {
         id
     }
 
-    fn base_find(&self, hash: u64, bytes: &[u8]) -> Option<u32> {
+    fn base_find(&self, bytes: &[u8]) -> Option<u32> {
         let ctrl = self.base.ctrl;
         if ctrl.is_empty() {
             return None;
         }
-        swiss::find(hash, swiss::tag(hash), ctrl.len(), |at| Ctrl::<GROUP>(ctrl[at]), |at| {
+        let hash = self.base.key.hash(bytes);
+        let word = |at: usize| {
+            probes::count();
+            Ctrl::<GROUP>(ctrl[at])
+        };
+        swiss::find(hash, swiss::tag(hash), ctrl.len(), word, |at| {
             let id = self.base.ids[at.index()];
             (self.get(id) == Some(bytes)).then_some(id)
         })
@@ -551,6 +691,7 @@ impl Table {
             starts.push(u32::try_from(bytes.len()).expect("a table of 4 GiB of values or more"));
         }
 
+        let key = index_key(kept.iter().map(|&id| self.bytes(id)));
         let slots = (self.first as usize - 1 + kept.len()) * 2;
         let groups = slots.div_ceil(GROUP).next_power_of_two().max(1);
         // alloc: `Table::write`'s index, once an image written
@@ -558,13 +699,19 @@ impl Table {
         // alloc: as the index
         let mut ids = vec![0u32; groups * GROUP];
         let mut put = |id: u32, value: &[u8], dedupe: bool| {
-            let hash = value_hash(value);
+            let hash = key.hash(value);
             let tag = swiss::tag(hash);
-            let word = |at: usize| Ctrl::<GROUP>(ctrl[at]);
+            let word = |at: usize| {
+                probes::count();
+                Ctrl::<GROUP>(ctrl[at])
+            };
             if dedupe && swiss::find(hash, tag, groups, word, |at| (self.get(ids[at.index()]) == Some(value)).then_some(())).is_some() {
                 return;
             }
-            let at = swiss::vacant(hash, groups, |at| Ctrl::<GROUP>(ctrl[at]));
+            let at = swiss::vacant(hash, groups, |at| {
+                probes::count();
+                Ctrl::<GROUP>(ctrl[at])
+            });
             ctrl[at.group] = at.tagged(tag).0;
             ids[at.index()] = id;
         };
@@ -587,6 +734,8 @@ impl Table {
             free: out.slice(&free),
             bytes: out.align(MAX_ALIGN.max(self.shape.align)),
             bytes_len: bytes.len() as u64,
+            key0: key.words()[0],
+            key1: key.words()[1],
             first: self.first,
             count: count as u32,
             groups: groups as u32,
@@ -596,6 +745,27 @@ impl Table {
         };
         out.bytes(&bytes);
         out.patch_value(root, &at);
+    }
+}
+
+/// The control words the tables' probes load on this thread, counted in tests so a test can
+/// bound the work of interning values made to collide; nothing in other builds.
+pub(crate) mod probes {
+    #[cfg(test)]
+    thread_local! {
+        static LOADED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    #[inline(always)]
+    pub(crate) fn count() {
+        #[cfg(test)]
+        LOADED.with(|it| it.set(it.get() + 1));
+    }
+
+    /// The control words loaded since the last call.
+    #[cfg(all(test, not(blaze_check)))]
+    pub(crate) fn take() -> u64 {
+        LOADED.with(|it| it.replace(0))
     }
 }
 

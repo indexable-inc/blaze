@@ -24,6 +24,7 @@ use super::super::{block_id, block_index, local_index, map_place, successors_mut
 use super::operand_ty;
 
 /// What [`inline_call`] needs of the call besides the bodies.
+#[derive(Clone, Copy)]
 pub(super) struct Site<'a> {
     pub(super) block: BasicBlockId,
     /// The call passes a closure's arguments as a tuple, which the closure's body takes one

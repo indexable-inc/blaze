@@ -1,6 +1,8 @@
 //! `test` and `bench` after the build, as cargo's `ops::run_tests` and `run_benches` run them
 //! (`ops/cargo_test.rs`): each test executable in cargo's order, then the doc tests, stopping
-//! at the first that fails unless `--no-fail-fast`; `--no-run` lists them. And blaze's
+//! every one by default, the failures listed at the end with each test executable that never
+//! built and the failure that held it back; `--fail-fast` stops at the first that fails, as
+//! cargo does; `--no-run` lists them. And blaze's
 //! `--reached` (an extension, opt-in): the daemon's [`TestResult`]s in libtest's format.
 
 use std::{
@@ -10,10 +12,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use blaze_api::{Artifact, ArtifactKind, TargetKind, TestOutcome, TestResult};
+use blaze_api::{Artifact, ArtifactKind, TargetKind, TestOutcome, TestResult, Unbuilt};
+use blaze_core::exit::Exit;
 
 use super::{
-    FAILED,
     args::{Command, Invocation},
     run::{Exec, caused},
     say,
@@ -181,11 +183,12 @@ pub fn needs_spec_flag(asked: &Invocation, members: u32) -> bool {
     !asked.flags.packages.is_empty() || !asked.flags.excludes.is_empty() || members > 1
 }
 
-/// `test` or `bench` once the build placed `artifacts`, of a workspace of `members`: cargo's
-/// exit code.
+/// `test` or `bench` once the build placed `artifacts`, of a workspace of `members`, with the
+/// test units the build left `unbuilt`: cargo's exit code.
 pub fn run(
     asked: &Invocation,
     artifacts: &[Artifact],
+    unbuilt: &[Unbuilt],
     members: u32,
     speaking: Speaking<'_>,
     err: &mut dyn Write, // dyn: the CLI's output writer, a few writes per test executable run.
@@ -212,8 +215,8 @@ pub fn run(
         speaking.running(err, "Running", test, unit_kind, &shown)?;
         if let Some(failure) = ran(test, unit_kind, &exec, &shown, asked, spec_flag, speaking, err, programs)? {
             failed.push(failure);
-            if !asked.flags.no_fail_fast {
-                return Ok(failed[0].code.unwrap_or(FAILED));
+            if asked.flags.fail_fast {
+                return Ok(failed[0].code.unwrap_or(Exit::Failed.code()));
             }
         }
     }
@@ -227,28 +230,52 @@ pub fn run(
             }
             if let Some(failure) = ran(doc, Kind::Doctest, &exec, &shown, asked, spec_flag, speaking, err, programs)? {
                 failed.push(failure);
-                if !asked.flags.no_fail_fast {
-                    return Ok(failed[0].code.unwrap_or(FAILED));
+                if asked.flags.fail_fast {
+                    return Ok(failed[0].code.unwrap_or(Exit::Failed.code()));
                 }
             }
         }
     }
-    // cargo's `no_fail_fast_err`: under `--no-fail-fast` any failure is its own error, code 101.
-    if failed.is_empty() {
+    // cargo's `no_fail_fast_err`: without `--fail-fast` any failure is its own error, code 101.
+    if failed.is_empty() && unbuilt.is_empty() {
         return Ok(0);
     }
-    let mut said = String::new();
-    let _ = match failed.len() {
-        1 => write!(said, "1 target failed:"),
-        n => write!(said, "{n} targets failed:"),
-    };
-    for failure in &failed {
-        said.push_str("\n    `");
-        said.push_str(&failure.rerun);
-        said.push('`');
-    }
+    let said = failed_summary(&failed, unbuilt);
     err.write_all(say::error(&said, speaking.color).as_bytes())?;
-    Ok(FAILED)
+    Ok(Exit::Failed.code())
+}
+
+/// The end of a run that failed: each target that failed, with what reruns it, then each test
+/// executable that never built, with the failure that held it back.
+fn failed_summary(failed: &[Failed], unbuilt: &[Unbuilt]) -> String {
+    let mut said = String::new(); // alloc: once a failed run
+    if !failed.is_empty() {
+        let _ = match failed.len() {
+            1 => write!(said, "1 target failed:"),
+            n => write!(said, "{n} targets failed:"),
+        };
+        for failure in failed {
+            said.push_str("\n    `");
+            said.push_str(&failure.rerun);
+            said.push('`');
+        }
+    }
+    if !unbuilt.is_empty() {
+        if !said.is_empty() {
+            said.push('\n');
+        }
+        let _ = match unbuilt.len() {
+            1 => write!(said, "1 test target never built, so never ran:"),
+            n => write!(said, "{n} test targets never built, so never ran:"),
+        };
+        for it in unbuilt {
+            let _ = match it.behind == it.unit {
+                true => write!(said, "\n    {}: {}", it.unit, it.why),
+                false => write!(said, "\n    {}: behind {} ({})", it.unit, it.behind, it.why),
+            };
+        }
+    }
+    said
 }
 
 /// A test executable as cargo runs it: in its package's directory, with the filter and what
@@ -290,7 +317,7 @@ fn ran(
         say::Ended::Code(code) => Some(code),
         say::Ended::Signal(_) => None,
     };
-    if code == Some(FAILED) {
+    if code == Some(Exit::Failed.code()) {
         err.write_all(say::error(&what, speaking.color).as_bytes())?;
         return Ok(Some(Failed { rerun, code }));
     }

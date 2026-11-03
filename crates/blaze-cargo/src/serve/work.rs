@@ -33,7 +33,9 @@
 //! database's proc macros, once its check's own plane request is over.
 //!
 //! A build script's output ([`Writer::ran`]) and a proc macro's load ([`Writer::macros`]) are
-//! writes. Each is checked as it is asked for and applied by [`Writer::apply`], on the loop,
+//! writes, and so is letting go of what a unit that compiled leaves in the front end for no task
+//! to come ([`Writer::compiled`]; the daemon's `unit::release`), which waits only when memory is
+//! short or no unit is open. Each is checked as it is asked for and applied by [`Writer::apply`], on the loop,
 //! once no reader is alive: every reader is one of a task posted before the write was asked
 //! for, and from then until it is applied the loop posts no reading task of that job, but
 //! holds it and posts it after, with a reader of what the write made. That wait is the stop.
@@ -318,7 +320,9 @@ impl Phase {
 /// the bench fails an edit by.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Linking {
-    /// The image's first link: none was kept at its path, so there was nothing to patch.
+    /// None was kept at its path, so there was nothing to patch: the image's first link, or
+    /// the first since the kept link images' budget let its image go, which the loop says as
+    /// it posts the link (`job::Paths::take_images`).
     First,
     /// What changed was placed into the room the kept image keeps.
     Spliced,
@@ -609,6 +613,14 @@ pub trait KeptDb: Send + 'static {
 pub trait Kept: Send + 'static {
     /// Its tables as the linker counts them: name, elements, bytes ([`Response::Tables`]).
     fn tables(&self) -> Vec<(&'static str, u64, u64)>;
+    /// The bytes it holds while kept between links: what the kept images' budget weighs it
+    /// by ([`super::job`]'s `KeptImages`).
+    fn held(&self) -> u64;
+    /// Whether a run of user code maps it now (a dev executable's running program): such an
+    /// image is never let go, or the next link could not patch what runs.
+    fn live(&self) -> bool;
+    /// Lets go of what it keeps only to start its next link warm, as it is kept idle.
+    fn rest(&mut self);
 }
 
 /// What of a job's front end only the loop writes. Its writes are asked for, then applied
@@ -624,8 +636,20 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// Asks for proc-macro unit `unit`'s expanders set (`blaze_lower::Lowered::macros`):
     /// checked now, applied by [`Writer::apply`].
     fn macros(&mut self, unit: usize, macros: blaze_lower::ProcMacroLoadResult) -> Result<(), ApiError>;
-    /// Whether a write was asked for and is not applied yet.
+    /// Whether a write was asked for and is not applied yet, or the front end asks to let go
+    /// of what nothing still to compile reads (the daemon's `unit::release`): either way the
+    /// loop posts no reading task of the job until [`Writer::apply`] applied it.
     fn waiting(&self) -> bool;
+    /// On the loop, as unit `unit`'s first task starts: it is open until [`Writer::compiled`].
+    fn began(&mut self, unit: usize) {
+        let _ = unit;
+    }
+    /// On the loop, as unit `unit`'s compile ended (its last phase gave its outcome, ok or
+    /// not): nothing of this build compiles it again, and what its front end keeps for it
+    /// alone may be let go, by a write [`Writer::waiting`] asks for.
+    fn compiled(&mut self, unit: usize) {
+        let _ = unit;
+    }
     /// Every write asked for, applied as one, in the order asked, if no reader is alive:
     /// `Ok(true)` once applied (or none waited), `Ok(false)` while a reader is, asking again
     /// costing one load. A write that fails (its error, or a panic, a maintainer's included,
@@ -706,10 +730,16 @@ impl Broke {
 }
 
 /// `write`, the write `what` for unit `unit`, applied on the loop: its panic as a [`Broke`]
-/// instead of unwinding the loop, which would end every request the daemon serves.
+/// instead of unwinding the loop, which would end every request the daemon serves. One of name
+/// resolution's typed stops ([`hir_def::nameres::stopped`]), raised by a query the write's
+/// maintenance pass asked, is the write's error, named, not a panic with no message.
 pub fn applying<T>(unit: usize, what: &'static str, write: impl FnOnce() -> T) -> Result<T, Broke> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(write))
-        .map_err(|payload| Broke { unit, what, how: Broken::Panicked(super::plane::panicked(&*payload)), itself: false })
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(write)).map_err(|payload| {
+        match hir_def::nameres::stopped(&*payload) {
+            Some(stop) => Broke::failed(unit, what, ApiError::new(stop, None)),
+            None => Broke { unit, what, how: Broken::Panicked(super::plane::panicked(&*payload)), itself: false },
+        }
+    })
 }
 
 /// `write`, the write `what` for unit `unit`, applied on the loop: its error or its panic as a
@@ -854,9 +884,10 @@ impl RunPuts {
         }
     }
 
-    /// What `other` put, too.
+    /// What `other` put, too, and its misses.
     pub fn extend(&mut self, other: RunPuts) {
         self.tickets.extend(&other.tickets);
         self.retracted |= other.retracted;
+        self.misses.extend(other.misses);
     }
 }

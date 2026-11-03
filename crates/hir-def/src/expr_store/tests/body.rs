@@ -45,15 +45,15 @@ fn round_trip(db: &TestDB, def: DefWithBodyId) {
     assert_eq!(in_store, in_map, "{def:?}: the store's macro calls are the source map's");
     assert_eq!(Body::of(db, def).store.macro_calls(), body.store.macro_calls());
     let of = Body::of(db, def);
-    assert_eq!(*of, **body, "{def:?}: `of` and `with_source_map`");
+    assert_eq!(*of, *body, "{def:?}: `of` and `with_source_map`");
     assert!(std::ptr::eq(of, Body::of(db, def)), "{def:?}: `of` lends the memo's own body");
     crate::expr_store::persist::assert_round_trip(body, source_map);
-    if let Some((body, source_map)) = Body::relative(db, def) {
-        crate::expr_store::persist::assert_round_trip(body, source_map);
+    if let Some(source_map) = Body::relative(db, def) {
+        crate::expr_store::persist::assert_round_trip(of, source_map);
     }
 }
 
-fn pretty_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn pretty_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let db = fixture::db(ra_fixture).into_db();
 
     let krate = db.fetch_test_crate();
@@ -82,7 +82,7 @@ fn def_map_at(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {
     blaze_query::db::attach(&db, || module.def_map(&db).dump(&db))
 }
 
-fn check_block_scopes_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check_block_scopes_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let fx = fixture::db(ra_fixture);
     let position = fx.position();
     let db = fx.into_db();
@@ -92,7 +92,7 @@ fn check_block_scopes_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect
     expect.assert_eq(&actual);
 }
 
-fn check_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let actual = def_map_at(ra_fixture);
     expect.assert_eq(&actual);
 }
@@ -177,7 +177,7 @@ fn main(x: i32, s: S, v: &[i32], r: &mut i32) {
 fn every_variant_pretty_prints() {
     pretty_print(
         EVERY_VARIANT,
-        expect![[r#"
+        &expect![[r#"
             fn main(x, s, v, r) {
                 let _ = const { /* Idx::<Expr<'_>>(1) */ };
                 let _ = ("s", "ab", "c\0", 'c', 97u8, true, 3, 1i64, 2u8, 16, 1.5, 2.5f32, 2f64, );
@@ -615,7 +615,7 @@ fn main() -> u8 {
     nothing_of_this_name!()
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn main() {
                 �
             }"#]],
@@ -634,7 +634,7 @@ fn main() {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn main() {
                 match builtin#lang(into_iter)(
                     builtin#lang(Range){
@@ -695,7 +695,7 @@ fn main() {
     builtin#format_args("hello world", orphan = ());
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
         fn main() {
             let are = "are";
             let count = 10;
@@ -763,7 +763,7 @@ impl SsrError {
     }
 }
 "##,
-        expect![[r#"
+        &expect![[r#"
         fn main() {
             _ = ra_test_fixture::error::SsrError::new(
                 {
@@ -804,7 +804,7 @@ fn f(a: i32, b: u32) -> String {
     m!();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn f(a, b) {
                 {
                     core::panicking::panic_fmt(
@@ -835,7 +835,7 @@ fn foo() {
     m!()() = Bar();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
         fn foo() {
             Bar() = Bar();
         }"#]],
@@ -900,7 +900,7 @@ fn foo() {
     let v @ u = 123;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
         fn foo() {
             let v @ u = 123;
         }"#]],
@@ -916,7 +916,7 @@ async fn foo(a: (), b: i32) -> u32 {
     0 + 1 + b()
 }
 "#,
-        expect!["fn foo(�, �) �"],
+        &expect!["fn foo(�, �) �"],
     );
 }
 
@@ -1001,7 +1001,7 @@ fn main() {
     let _ = &mut (*r as i32)
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
         fn main() {
             _ = &((1 - (2 - 3)) + (4 * 5) * (6 + 7));
             _ = 1 + 2 < 3 && true && 4 < 5 && (a || b || c) || d && e;
@@ -1019,7 +1019,7 @@ fn async_fn_weird_param_patterns() {
         r#"
 async fn main(&self, param1: i32, ref mut param2: i32, _: i32, param4 @ _: i32, 123: i32) {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             fn main(self, mut param1, mut param2, mut <ra@gennew>0, mut param4, mut <ra@gennew>1) async {
                 let self = self;
                 let param1 = param1;
@@ -1048,7 +1048,7 @@ fn foo() {
     ];
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
         fn foo() {
             [
                 (),
@@ -1076,7 +1076,7 @@ fn foo() -> i64 {
     foo!()
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             fn foo() {
                 {
                     5
@@ -1100,7 +1100,7 @@ fn foo() -> i64 {
     }
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             fn foo() {
                 {
                     5
@@ -1121,7 +1121,7 @@ fn foo() -> i64 {
     m! {}
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             fn foo() {
                 {
                     5
@@ -1159,7 +1159,7 @@ fn foo() {
     );
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             fn foo() {
                 foo();
                 ();
@@ -1325,11 +1325,49 @@ m!();
 
 /// hir's `body_maps` before it called [`Body::unmoved`].
 fn body_maps_reference(db: &TestDB, def: DefWithBodyId) -> (&Body, &BodySourceMap) {
-    let (body, source_map) = match Body::relative(db, def) {
-        Some(it) => it,
+    match Body::relative(db, def) {
+        Some(source_map) => (Body::of(db, def), source_map),
         None => Body::with_source_map(db, def),
-    };
-    (&**body, source_map)
+    }
+}
+
+/// A body is kept once: what is read with a source map, moved to its file or not, is
+/// [`Body::of`]'s own body, not a copy lowered again with the map, for a body written in a
+/// file and for one a macro writes.
+#[test]
+fn a_body_read_with_its_source_map_is_body_of() {
+    let db = fixture::db(
+        r#"
+fn f(x: u8) -> u8 { let y = x + 1; y }
+const C: u8 = { 1 + 2 };
+static S: u8 = 0;
+macro_rules! m { () => { fn g() -> u8 { 3 } }; }
+m!();
+"#,
+    )
+    .into_db();
+    let def_map = crate_def_map(&db, db.fetch_test_crate());
+    let mut defs: Vec<DefWithBodyId> = Vec::new();
+    for (_, module) in def_map.modules(&db) {
+        for decl in module.scope(&db).declarations() {
+            match decl {
+                ModuleDefId::FunctionId(it) => defs.push(it.into()),
+                ModuleDefId::ConstId(it) => defs.push(it.into()),
+                ModuleDefId::StaticId(it) => defs.push(it.into()),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(defs.len(), 4, "{defs:?}");
+    assert!(defs.iter().any(|it| it.erased_ast_id(&db).file_id.macro_file().is_some()));
+    for def in defs {
+        let of = Body::of(&db, def);
+        let (with_map, _) = Body::with_source_map(&db, def);
+        let with_map: &Body = with_map;
+        assert!(std::ptr::eq(with_map, of), "{def:?}: `with_source_map` holds a second body");
+        let (unmoved, _) = Body::unmoved(&db, def);
+        assert!(std::ptr::eq(unmoved, of), "{def:?}: `unmoved` holds a second body");
+    }
 }
 
 #[test]
@@ -1346,7 +1384,7 @@ fn f() {
 }
 "#,
     );
-    let (_, source_map) = Body::with_source_map(&db, def);
+    let source_map = Body::source_map(&db, def);
     let too_large: Vec<_> = source_map
         .diagnostics()
         .iter()
@@ -1614,4 +1652,33 @@ trait Registry {
     };
     assert_eq!(coroutines("query"), 0, "a required `async fn` has no body to wrap");
     assert_eq!(coroutines("provided"), 1, "a provided `async fn` is its coroutine");
+}
+
+/// A closure's `for<..>` binder (`#![feature(closure_lifetime_binder)]`, rustc's
+/// `ClosureBinder::For`) is lowered with it, in order, kept through the store's encoding
+/// (`lower` round-trips the body) and printed back. A closure without one has none.
+#[test]
+fn a_closures_lifetime_binder_is_lowered_with_it() {
+    let (db, def) = lower(
+        r#"
+fn main() {
+    let _ = for<'a, 'c> |_: &'a &'c (), v: &'c u8| -> &'a u8 { v };
+    let _ = |y: &u8| y;
+}
+"#,
+    );
+    let body = Body::of(&db, def);
+    let binders: Vec<Vec<String>> = body
+        .exprs()
+        .filter_map(|(_, expr)| match expr {
+            Expr::Closure { binder, .. } => {
+                Some(body.names(binder).iter().map(|it| it.as_str().to_owned()).collect())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(binders, [vec!["'a".to_owned(), "'c".to_owned()], vec![]]);
+    let printed = body.pretty_print(&db, def, Edition::CURRENT);
+    assert!(printed.contains("let _ = for<'a, 'c> |"), "{printed}");
+    assert_eq!(printed.matches("for<").count(), 1, "{printed}");
 }

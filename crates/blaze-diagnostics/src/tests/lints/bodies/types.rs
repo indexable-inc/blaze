@@ -12,6 +12,7 @@ use crate::{Options, emit::Style, lints::CommandLine};
 
 /// A UI test: its file's name and edition, what its crate is built with, and its source byte
 /// for byte, so that the lines and columns are its `.stderr`'s.
+#[derive(Clone, Copy)]
 pub(crate) struct Ui<'a> {
     pub(crate) name: &'a str,
     pub(crate) edition: &'a str,

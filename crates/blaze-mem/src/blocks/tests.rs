@@ -7,7 +7,7 @@ use super::*;
 
 /// A class of its own, so what a test takes and gives is not shared with tests running at once.
 fn own_class(size: usize, space: usize) -> &'static Class {
-    Box::leak(Box::new(Class::new(size, space, None).expect("a test's class")))
+    Box::leak(Box::new(Class::new(size, space, None, Tag::Chunks).expect("a test's class")))
 }
 
 fn bytes_of(block: &Owned) -> &[u8] {
@@ -422,4 +422,36 @@ fn the_snapshot_counts_a_class_by_its_blocks() {
     })
     .join()
     .expect("the thread ran");
+}
+
+/// coord-102 (B5): a block a class handed out counted twice, to [`Tag::Chunks`] (its region's
+/// commit) and to its owner's tag (the take), so the tags summed past what was committed (28.38
+/// GiB of tags against 21.36 committed, the 7 GiB of the classes' live blocks) and "chunks",
+/// 11.04 GiB, was mostly live values. A block counts once: to its owner while it lives, to its
+/// class's free tag (here [`Tag::Usercode`], which no other test of this crate counts to) once
+/// given back, warm or cold, and the free tag plus the owners' is what the class committed.
+#[test]
+fn a_block_counts_to_its_owner_while_it_lives_and_to_the_free_tag_after_never_both() {
+    let size = 4096;
+    let (free, owner) = (Tag::Usercode, Tag::Profile);
+    let live = |tag: Tag| crate::tag::snapshot().get(tag).live as i64;
+    let class: &'static Class = Box::leak(Box::new(Class::new(size, 1 << 20, None, free).expect("a test's class")));
+    // What the class committed for its blocks and their links, both counted to `free`.
+    let committed = || (class.region.committed() + class.links.committed()) as i64;
+    let (free_at, owner_at, committed_at) = (live(free), live(owner), committed());
+    let owned = 8 * size as i64;
+    let taken: Vec<Owned> = (0..8).map(|_| class.take(Fill::Any, owner).expect("a block")).collect();
+    let made = committed() - committed_at;
+    assert!(made >= owned, "the class committed {made} bytes for {owned} carved");
+    assert_eq!(live(owner) - owner_at, owned, "the owner counts what it took");
+    assert_eq!(live(free) - free_at, made - owned, "the free tag counts what was committed past the blocks taken");
+    drop(taken);
+    assert_eq!(live(owner) - owner_at, 0, "the owner counts nothing once its blocks are given back");
+    assert_eq!(live(free) - free_at, made, "the free tag counts every block given back");
+    let again: Vec<Owned> = (0..8).map(|_| class.take(Fill::Any, owner).expect("a block")).collect();
+    assert_eq!(committed() - committed_at, made, "the blocks given back are taken again, nothing more committed");
+    assert_eq!(live(owner) - owner_at, owned);
+    assert_eq!(live(free) - free_at, made - owned, "a block taken again counts to its owner alone");
+    drop(again);
+    assert_eq!((live(owner) - owner_at, live(free) - free_at), (0, made));
 }

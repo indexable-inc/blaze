@@ -387,7 +387,8 @@ fn write_proc_macros(db: &Db, h: &mut Hasher, krate: base_db::Crate) {
 }
 
 /// What the macros of `krate` and its dependencies read that no database input of theirs
-/// holds: the files outside the VFS that `include_bytes!` and `include_str!` read, and the
+/// holds: the files outside the VFS that `include!`, `include_bytes!` and `include_str!` read
+/// (by the content ID of what was read, of its bytes or of why it could not be read), and the
 /// process variables `env!` and `option_env!` read, with their values now. The database notes
 /// each as it is read and these are not tracked, so they are never memoized: a read noted
 /// after a value was taken gives another value, a miss, never a stale hit.
@@ -401,12 +402,9 @@ fn write_noted_reads(db: &Db, h: &mut Hasher, krate: base_db::Crate) {
         // alloc: as above, empty (no allocation) for a crate that included no such file
         let included = files.included_by(db, it);
         h.update(&(included.len() as u64).to_le_bytes());
-        for (path, bytes) in &included {
-            h.part(path.as_str().as_bytes());
-            match bytes {
-                Some(bytes) => h.update(&[1]).part(bytes),
-                None => h.update(&[0]),
-            };
+        for (path, content) in &included {
+            // Of the bytes, or of why the file could not be read (`IncludedFile::content`).
+            h.part(path.as_str().as_bytes()).id(content);
         }
         let names = || env_read.iter().filter(move |(by, _)| *by == it).map(|(_, name)| name);
         h.update(&(names().count() as u64).to_le_bytes());

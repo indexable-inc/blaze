@@ -157,7 +157,7 @@ impl Cmp {
         }
     }
 
-    fn is_valid<T: PartialOrd>(self, v: T, min: T, max: T) -> bool {
+    fn is_valid<T: PartialOrd + Copy>(self, v: T, min: T, max: T) -> bool {
         match self {
             Cmp::Lt => v > min && v <= max,
             Cmp::Le => v >= min && v < max,

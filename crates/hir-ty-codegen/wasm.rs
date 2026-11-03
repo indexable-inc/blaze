@@ -620,9 +620,9 @@ impl<'a> Lower<'a> {
             let class = self.class(param)?;
             if let Some(bits) = class.narrow() {
                 // Whoever calls from outside may leave anything in the upper bits.
-                self.i(I::LocalGet(local));
+                self.i(&I::LocalGet(local));
                 self.mask(bits);
-                self.i(I::LocalSet(local));
+                self.i(&I::LocalSet(local));
             }
             local += if class == Class::Pair { 2 } else { 1 };
         }
@@ -633,8 +633,8 @@ impl<'a> Lower<'a> {
         if let Some((frame, size)) = self.frame {
             self.stack_pointer(false);
             self.address_const(size as i64);
-            self.i(if self.address.is_64() { I::I64Sub } else { I::I32Sub });
-            self.i(I::LocalTee(frame));
+            self.i(&if self.address.is_64() { I::I64Sub } else { I::I32Sub });
+            self.i(&I::LocalTee(frame));
             self.stack_pointer(true);
         }
 
@@ -654,19 +654,19 @@ impl<'a> Lower<'a> {
         });
         if backwards {
             self.next_block = Some(self.temp(ValType::I32));
-            self.i(I::Loop(BlockType::Empty));
+            self.i(&I::Loop(BlockType::Empty));
         }
         for _ in 0..self.block_count {
-            self.i(I::Block(BlockType::Empty));
+            self.i(&I::Block(BlockType::Empty));
         }
         if let Some(next) = self.next_block {
-            self.i(I::LocalGet(next));
+            self.i(&I::LocalGet(next));
             InstructionSink::new(&mut self.code).br_table(0..self.block_count, 0);
         }
         for block in func.layout.blocks() {
-            self.i(I::End);
+            self.i(&I::End);
             if !self.reachable[block] {
-                self.i(I::Unreachable);
+                self.i(&I::Unreachable);
                 continue;
             }
             for inst in func.layout.block_insts(block) {
@@ -674,10 +674,10 @@ impl<'a> Lower<'a> {
             }
         }
         if backwards {
-            self.i(I::End);
+            self.i(&I::End);
         }
-        self.i(I::Unreachable);
-        self.i(I::End);
+        self.i(&I::Unreachable);
+        self.i(&I::End);
 
         // Runs of the same type, as the format wants them.
         let mut runs: SmallVec<[(u32, ValType); 8]> = SmallVec::new();
@@ -741,7 +741,7 @@ impl<'a> Lower<'a> {
         reachable
     }
 
-    fn i(&mut self, instruction: I<'_>) {
+    fn i(&mut self, instruction: &I<'_>) {
         instruction.encode(&mut self.code);
     }
 
@@ -765,7 +765,7 @@ impl<'a> Lower<'a> {
 
     /// Adds the two addresses (or address and offset) on the stack.
     fn address_add(&mut self) {
-        self.i(if self.address.is_64() { I::I64Add } else { I::I32Add });
+        self.i(&if self.address.is_64() { I::I64Add } else { I::I32Add });
     }
 
     /// A fresh local that holds an address.
@@ -804,9 +804,9 @@ impl<'a> Lower<'a> {
     /// Pushes a value: both halves of a wide integer, the low one first.
     fn get(&mut self, value: Value) -> Result<(), String> {
         let local = self.local(value)?;
-        self.i(I::LocalGet(local));
+        self.i(&I::LocalGet(local));
         if self.class(value)? == Class::Pair {
-            self.i(I::LocalGet(local + 1));
+            self.i(&I::LocalGet(local + 1));
         }
         Ok(())
     }
@@ -815,21 +815,21 @@ impl<'a> Lower<'a> {
     fn set(&mut self, value: Value) -> Result<(), String> {
         let local = self.local(value)?;
         if self.class(value)? == Class::Pair {
-            self.i(I::LocalSet(local + 1));
+            self.i(&I::LocalSet(local + 1));
         }
-        self.i(I::LocalSet(local));
+        self.i(&I::LocalSet(local));
         Ok(())
     }
 
     fn get_low(&mut self, value: Value) -> Result<(), String> {
         let local = self.local(value)?;
-        self.i(I::LocalGet(local));
+        self.i(&I::LocalGet(local));
         Ok(())
     }
 
     fn get_high(&mut self, value: Value) -> Result<(), String> {
         let local = self.local(value)? + 1;
-        self.i(I::LocalGet(local));
+        self.i(&I::LocalGet(local));
         Ok(())
     }
 
@@ -837,8 +837,8 @@ impl<'a> Lower<'a> {
     fn get_signed(&mut self, value: Value) -> Result<(), String> {
         self.get(value)?;
         match self.class(value)?.narrow() {
-            Some(8) => self.i(I::I32Extend8S),
-            Some(_) => self.i(I::I32Extend16S),
+            Some(8) => self.i(&I::I32Extend8S),
+            Some(_) => self.i(&I::I32Extend16S),
             None => {}
         }
         Ok(())
@@ -850,8 +850,8 @@ impl<'a> Lower<'a> {
 
     /// Clears the bits of the `i32` on the stack that a narrow integer has no use for.
     fn mask(&mut self, bits: u8) {
-        self.i(I::I32Const(((1u32 << bits) - 1) as i32));
-        self.i(I::I32And);
+        self.i(&I::I32Const(((1u32 << bits) - 1) as i32));
+        self.i(&I::I32And);
     }
 
     fn mask_for(&mut self, class: Class) {
@@ -861,14 +861,14 @@ impl<'a> Lower<'a> {
     }
 
     fn op(&mut self, op: Op, long: bool) {
-        self.i(op.instruction(long));
+        self.i(&op.instruction(long));
     }
 
     fn constant(&mut self, value: i64, long: bool) {
         if long {
-            self.i(I::I64Const(value));
+            self.i(&I::I64Const(value));
         } else {
-            self.i(I::I32Const(value as i32));
+            self.i(&I::I32Const(value as i32));
         }
     }
 
@@ -878,14 +878,14 @@ impl<'a> Lower<'a> {
             Class::Word(_) => self.get(value)?,
             Class::Long => {
                 self.get(value)?;
-                self.i(I::I64Const(0));
-                self.i(I::I64Ne);
+                self.i(&I::I64Const(0));
+                self.i(&I::I64Ne);
             }
             Class::Pair => {
                 self.get(value)?;
-                self.i(I::I64Or);
-                self.i(I::I64Const(0));
-                self.i(I::I64Ne);
+                self.i(&I::I64Or);
+                self.i(&I::I64Const(0));
+                self.i(&I::I64Ne);
             }
             // alloc: the error's message
             Class::F32 | Class::F64 => return Err("wasm: float as a condition".to_owned()),
@@ -901,16 +901,16 @@ impl<'a> Lower<'a> {
             (Class::Word(_), false) | (Class::Long, true) => self.get(value)?,
             (Class::Word(_), true) => {
                 self.get(value)?;
-                self.i(I::I64ExtendI32U);
+                self.i(&I::I64ExtendI32U);
             }
             (Class::Long, false) => {
                 self.get(value)?;
-                self.i(I::I32WrapI64);
+                self.i(&I::I32WrapI64);
             }
             (Class::Pair, _) => {
                 self.get_low(value)?;
                 if !long {
-                    self.i(I::I32WrapI64);
+                    self.i(&I::I32WrapI64);
                 }
             }
             // alloc: the error's message
@@ -976,7 +976,7 @@ impl<'a> Lower<'a> {
     fn call_slot(&mut self, signature: &Signature) -> Result<(), String> {
         let signature = WasmSignature::of(signature, self.address)?;
         if self.address.is_64() {
-            self.i(I::I32WrapI64);
+            self.i(&I::I32WrapI64);
         }
         let index = match self.types.iter().position(|it| *it == signature) {
             Some(index) => index,
@@ -999,7 +999,7 @@ impl<'a> Lower<'a> {
             return Err("wasm: stack slot without a frame".to_owned());
         };
         let offset = self.slot_offsets[slot.index()] as i64 + offset;
-        self.i(I::LocalGet(frame));
+        self.i(&I::LocalGet(frame));
         if offset != 0 {
             self.address_const(offset);
             self.address_add();
@@ -1022,7 +1022,7 @@ impl<'a> Lower<'a> {
     /// Loads `bits` of an integer held as `class` from the address on the stack.
     fn load_int(&mut self, class: Class, bits: u8, signed: bool, offset: u64) {
         let at = mem(offset);
-        self.i(match (class.is_long() || class == Class::Pair, bits, signed) {
+        self.i(&match (class.is_long() || class == Class::Pair, bits, signed) {
             (false, 8, false) => I::I32Load8U(at),
             (false, 8, true) => I::I32Load8S(at),
             (false, 16, false) => I::I32Load16U(at),
@@ -1042,7 +1042,7 @@ impl<'a> Lower<'a> {
     /// under it.
     fn store_int(&mut self, class: Class, bits: u8, offset: u64) {
         let at = mem(offset);
-        self.i(match (class.is_long() || class == Class::Pair, bits) {
+        self.i(&match (class.is_long() || class == Class::Pair, bits) {
             (false, 8) => I::I32Store8(at),
             (false, 16) => I::I32Store16(at),
             (false, _) => I::I32Store(at),
@@ -1060,13 +1060,13 @@ impl<'a> Lower<'a> {
             Class::Word(bits) => self.load_int(class, bits, false, offset),
             Class::Long => self.load_int(class, 64, false, offset),
             Class::Pair => {
-                self.i(I::I64Load(mem(offset)));
+                self.i(&I::I64Load(mem(offset)));
                 self.get(base)?;
-                self.i(I::I64Load(mem(offset + 8)));
+                self.i(&I::I64Load(mem(offset + 8)));
             }
-            Class::F32 => self.i(I::F32Load(mem(offset))),
-            Class::F64 => self.i(I::F64Load(mem(offset))),
-            Class::V128 => self.i(I::V128Load(mem(offset))),
+            Class::F32 => self.i(&I::F32Load(mem(offset))),
+            Class::F64 => self.i(&I::F64Load(mem(offset))),
+            Class::V128 => self.i(&I::V128Load(mem(offset))),
         }
         self.set(result)
     }
@@ -1081,26 +1081,26 @@ impl<'a> Lower<'a> {
             }
             Class::Long => {
                 self.get(value)?;
-                self.i(I::I64Store(mem(offset)));
+                self.i(&I::I64Store(mem(offset)));
             }
             Class::Pair => {
                 self.get_low(value)?;
-                self.i(I::I64Store(mem(offset)));
+                self.i(&I::I64Store(mem(offset)));
                 self.get(base)?;
                 self.get_high(value)?;
-                self.i(I::I64Store(mem(offset + 8)));
+                self.i(&I::I64Store(mem(offset + 8)));
             }
             Class::F32 => {
                 self.get(value)?;
-                self.i(I::F32Store(mem(offset)));
+                self.i(&I::F32Store(mem(offset)));
             }
             Class::F64 => {
                 self.get(value)?;
-                self.i(I::F64Store(mem(offset)));
+                self.i(&I::F64Store(mem(offset)));
             }
             Class::V128 => {
                 self.get(value)?;
-                self.i(I::V128Store(mem(offset)));
+                self.i(&I::V128Store(mem(offset)));
             }
         }
         Ok(())
@@ -1124,9 +1124,9 @@ impl<'a> Lower<'a> {
                 BlockArg::Value(value) => self.get(value)?,
                 BlockArg::TryCallRet(index) => {
                     let local = *returned.get(index as usize).ok_or("wasm: no such result")?;
-                    self.i(I::LocalGet(local));
+                    self.i(&I::LocalGet(local));
                     if self.class(param)? == Class::Pair {
-                        self.i(I::LocalGet(local + 1));
+                        self.i(&I::LocalGet(local + 1));
                     }
                 }
                 // alloc: the error's message
@@ -1141,16 +1141,16 @@ impl<'a> Lower<'a> {
         }
         let (from, target) = (self.order[from] - 1, self.order[target] - 1);
         if target > from {
-            self.i(I::Br(target - from - 1 + depth));
+            self.i(&I::Br(target - from - 1 + depth));
             return Ok(());
         }
         let Some(next) = self.next_block else {
             // alloc: the error's message
             return Err("wasm: jump backwards without a loop".to_owned());
         };
-        self.i(I::I32Const(target as i32));
-        self.i(I::LocalSet(next));
-        self.i(I::Br(self.block_count - 1 - from + depth));
+        self.i(&I::I32Const(target as i32));
+        self.i(&I::LocalSet(next));
+        self.i(&I::Br(self.block_count - 1 - from + depth));
         Ok(())
     }
 
@@ -1160,12 +1160,12 @@ impl<'a> Lower<'a> {
         self.returned = returned;
         stored?;
         if let Some((frame, size)) = self.frame {
-            self.i(I::LocalGet(frame));
+            self.i(&I::LocalGet(frame));
             self.address_const(size as i64);
             self.address_add();
             self.stack_pointer(true);
         }
-        self.i(I::Return);
+        self.i(&I::Return);
         Ok(())
     }
 
@@ -1184,7 +1184,7 @@ impl<'a> Lower<'a> {
             }
             Returned::Through(places) => {
                 for (&value, &(at, class)) in values.iter().zip(places) {
-                    self.i(I::LocalGet(0));
+                    self.i(&I::LocalGet(0));
                     self.get(value)?;
                     self.store_class(class, at);
                 }
@@ -1197,22 +1197,22 @@ impl<'a> Lower<'a> {
     fn store_class(&mut self, class: Class, offset: u64) {
         match class {
             Class::Word(bits) => self.store_int(class, bits, offset),
-            Class::Long => self.i(I::I64Store(mem(offset))),
-            Class::F32 => self.i(I::F32Store(mem(offset))),
-            Class::F64 => self.i(I::F64Store(mem(offset))),
-            Class::V128 => self.i(I::V128Store(mem(offset))),
+            Class::Long => self.i(&I::I64Store(mem(offset))),
+            Class::F32 => self.i(&I::F32Store(mem(offset))),
+            Class::F64 => self.i(&I::F64Store(mem(offset))),
+            Class::V128 => self.i(&I::V128Store(mem(offset))),
             Class::Pair => {
                 let high = self.temp(ValType::I64);
                 let low = self.temp(ValType::I64);
                 let address = self.address_temp();
-                self.i(I::LocalSet(high));
-                self.i(I::LocalSet(low));
-                self.i(I::LocalTee(address));
-                self.i(I::LocalGet(low));
-                self.i(I::I64Store(mem(offset)));
-                self.i(I::LocalGet(address));
-                self.i(I::LocalGet(high));
-                self.i(I::I64Store(mem(offset + 8)));
+                self.i(&I::LocalSet(high));
+                self.i(&I::LocalSet(low));
+                self.i(&I::LocalTee(address));
+                self.i(&I::LocalGet(low));
+                self.i(&I::I64Store(mem(offset)));
+                self.i(&I::LocalGet(address));
+                self.i(&I::LocalGet(high));
+                self.i(&I::I64Store(mem(offset + 8)));
             }
         }
     }
@@ -1221,16 +1221,16 @@ impl<'a> Lower<'a> {
     fn load_class(&mut self, class: Class, offset: u64) {
         match class {
             Class::Word(bits) => self.load_int(class, bits, false, offset),
-            Class::Long => self.i(I::I64Load(mem(offset))),
-            Class::F32 => self.i(I::F32Load(mem(offset))),
-            Class::F64 => self.i(I::F64Load(mem(offset))),
-            Class::V128 => self.i(I::V128Load(mem(offset))),
+            Class::Long => self.i(&I::I64Load(mem(offset))),
+            Class::F32 => self.i(&I::F32Load(mem(offset))),
+            Class::F64 => self.i(&I::F64Load(mem(offset))),
+            Class::V128 => self.i(&I::V128Load(mem(offset))),
             Class::Pair => {
                 let address = self.address_temp();
-                self.i(I::LocalTee(address));
-                self.i(I::I64Load(mem(offset)));
-                self.i(I::LocalGet(address));
-                self.i(I::I64Load(mem(offset + 8)));
+                self.i(&I::LocalTee(address));
+                self.i(&I::I64Load(mem(offset)));
+                self.i(&I::LocalGet(address));
+                self.i(&I::I64Load(mem(offset + 8)));
             }
         }
     }
@@ -1244,7 +1244,7 @@ impl<'a> Lower<'a> {
                 return Err("wasm: no room for what a call returns".to_owned());
             };
             let (frame, _) = self.frame.ok_or("wasm: no frame for what a call returns")?;
-            self.i(I::LocalGet(frame));
+            self.i(&I::LocalGet(frame));
             self.address_const(at as i64);
             self.address_add();
         }
@@ -1277,7 +1277,7 @@ impl<'a> Lower<'a> {
             Returned::Value(class) => {
                 let local = local_of(self, class);
                 self.mask_for(class);
-                self.i(I::LocalSet(local));
+                self.i(&I::LocalSet(local));
                 let mut locals = Returns::new();
                 locals.push(local);
                 Ok(locals)
@@ -1288,13 +1288,13 @@ impl<'a> Lower<'a> {
                 let mut locals = Returns::new();
                 for (at, class) in places {
                     let local = local_of(self, class);
-                    self.i(I::LocalGet(frame));
+                    self.i(&I::LocalGet(frame));
                     self.load_class(class, base + at);
                     if class == Class::Pair {
-                        self.i(I::LocalSet(local + 1));
+                        self.i(&I::LocalSet(local + 1));
                     }
                     self.mask_for(class);
-                    self.i(I::LocalSet(local));
+                    self.i(&I::LocalSet(local));
                     locals.push(local);
                 }
                 Ok(locals)
@@ -1321,9 +1321,9 @@ impl<'a> Lower<'a> {
         }
         let returned = self.call_returning(callee, signature, args)?;
         for (&result, local) in results.iter().zip(returned) {
-            self.i(I::LocalGet(local));
+            self.i(&I::LocalGet(local));
             if self.class(result)? == Class::Pair {
-                self.i(I::LocalGet(local + 1));
+                self.i(&I::LocalGet(local + 1));
             }
             self.set(result)?;
         }
@@ -1362,13 +1362,13 @@ impl<'a> Lower<'a> {
                 self.get(to)?;
                 self.get(from)?;
                 self.get(len)?;
-                self.i(I::MemoryCopy { src_mem: MEMORY, dst_mem: MEMORY });
+                self.i(&I::MemoryCopy { src_mem: MEMORY, dst_mem: MEMORY });
             }
             (LibCall::Memset, &[to, byte, len]) => {
                 self.get(to)?;
                 self.get(byte)?;
                 self.get(len)?;
-                self.i(I::MemoryFill(MEMORY));
+                self.i(&I::MemoryFill(MEMORY));
             }
             // alloc: the error's message
             _ => return Err(format!("wasm: libcall {libcall}")),
@@ -1378,8 +1378,8 @@ impl<'a> Lower<'a> {
             // Cranelift's frontend types what the routine returns as an address of the
             // machine it has a backend for, which a wasm32 address is narrower than.
             match (self.ty(to) == types::I64, self.func.dfg.value_type(result) == types::I64) {
-                (false, true) => self.i(I::I64ExtendI32U),
-                (true, false) => self.i(I::I32WrapI64),
+                (false, true) => self.i(&I::I64ExtendI32U),
+                (true, false) => self.i(&I::I32WrapI64),
                 _ => {}
             }
             self.set(result)?;
@@ -1410,11 +1410,11 @@ impl<'a> Lower<'a> {
                 let to = *args.first().ok_or("wasm: a memory routine of no address")?;
                 self.get(to)?;
                 match (self.ty(to) == types::I64, wide) {
-                    (false, true) => self.i(I::I64ExtendI32U),
-                    (true, false) => self.i(I::I32WrapI64),
+                    (false, true) => self.i(&I::I64ExtendI32U),
+                    (true, false) => self.i(&I::I32WrapI64),
                     _ => {}
                 }
-                self.i(I::LocalSet(local));
+                self.i(&I::LocalSet(local));
                 returned.push(local);
             }
             return self.jump(block, *table.normal_return(), 0, &returned);
@@ -1433,9 +1433,9 @@ impl<'a> Lower<'a> {
             InstructionData::Jump { destination, .. } => self.jump(block, destination, 0, &[]),
             InstructionData::Brif { arg, blocks: [then, otherwise], .. } => {
                 self.truthy(arg)?;
-                self.i(I::If(BlockType::Empty));
+                self.i(&I::If(BlockType::Empty));
                 self.jump(block, then, 1, &[])?;
-                self.i(I::End);
+                self.i(&I::End);
                 self.jump(block, otherwise, 0, &[])
             }
             InstructionData::BranchTable { arg, table, .. } => {
@@ -1444,7 +1444,7 @@ impl<'a> Lower<'a> {
                 // One wasm block per case to land in, where the jump proper is: a case
                 // passes arguments of its own.
                 for _ in 0..=cases.len() {
-                    self.i(I::Block(BlockType::Empty));
+                    self.i(&I::Block(BlockType::Empty));
                 }
                 match self.class(arg)? {
                     Class::Word(_) => self.get(arg)?,
@@ -1452,13 +1452,13 @@ impl<'a> Lower<'a> {
                         // An index that does not fit goes to the default like any other
                         // that is out of range.
                         let count = cases.len() as i32;
-                        self.i(I::I32Const(count));
+                        self.i(&I::I32Const(count));
                         self.get(arg)?;
-                        self.i(I::I32WrapI64);
+                        self.i(&I::I32WrapI64);
                         self.get(arg)?;
-                        self.i(I::I64Const(i64::from(count)));
-                        self.i(I::I64GeU);
-                        self.i(I::Select);
+                        self.i(&I::I64Const(i64::from(count)));
+                        self.i(&I::I64GeU);
+                        self.i(&I::Select);
                     }
                     // alloc: the error's message
                     _ => return Err("wasm: br_table on a wide value".to_owned()),
@@ -1466,10 +1466,10 @@ impl<'a> Lower<'a> {
                 let count = cases.len() as u32;
                 InstructionSink::new(&mut self.code).br_table(0..count, count);
                 for (at, &case) in cases.iter().enumerate() {
-                    self.i(I::End);
+                    self.i(&I::End);
                     self.jump(block, case, count - at as u32, &[])?;
                 }
-                self.i(I::End);
+                self.i(&I::End);
                 self.jump(block, table.default_block(), 0, &[])
             }
             InstructionData::MultiAry { opcode: Opcode::Return, args } => {
@@ -1477,17 +1477,17 @@ impl<'a> Lower<'a> {
                 self.return_(args)
             }
             InstructionData::Trap { .. } => {
-                self.i(I::Unreachable);
+                self.i(&I::Unreachable);
                 Ok(())
             }
             InstructionData::CondTrap { arg, .. } => {
                 self.truthy(arg)?;
                 if opcode == Opcode::Trapz {
-                    self.i(I::I32Eqz);
+                    self.i(&I::I32Eqz);
                 }
-                self.i(I::If(BlockType::Empty));
-                self.i(I::Unreachable);
-                self.i(I::End);
+                self.i(&I::If(BlockType::Empty));
+                self.i(&I::Unreachable);
+                self.i(&I::End);
                 Ok(())
             }
             InstructionData::Call { args, func_ref, .. } => {
@@ -1532,13 +1532,13 @@ impl<'a> Lower<'a> {
                 match class {
                     Class::Word(bits) => {
                         let mask = if bits == 32 { u32::MAX } else { (1 << bits) - 1 };
-                        self.i(I::I32Const((imm.bits() as u32 & mask) as i32));
+                        self.i(&I::I32Const((imm.bits() as u32 & mask) as i32));
                     }
-                    Class::Long => self.i(I::I64Const(imm.bits())),
+                    Class::Long => self.i(&I::I64Const(imm.bits())),
                     // The immediate is the low half, zero-extended as Cranelift's backends do.
                     Class::Pair => {
-                        self.i(I::I64Const(imm.bits()));
-                        self.i(I::I64Const(0));
+                        self.i(&I::I64Const(imm.bits()));
+                        self.i(&I::I64Const(0));
                     }
                     // alloc: the error's message
                     _ => return Err(format!("wasm: iconst of {class:?}")),
@@ -1546,11 +1546,11 @@ impl<'a> Lower<'a> {
                 self.set(results[0])
             }
             InstructionData::UnaryIeee32 { imm, .. } => {
-                self.i(I::F32Const(f32::from_bits(imm.bits()).into()));
+                self.i(&I::F32Const(f32::from_bits(imm.bits()).into()));
                 self.set(results[0])
             }
             InstructionData::UnaryIeee64 { imm, .. } => {
-                self.i(I::F64Const(f64::from_bits(imm.bits()).into()));
+                self.i(&I::F64Const(f64::from_bits(imm.bits()).into()));
                 self.set(results[0])
             }
             InstructionData::Load { arg, offset, .. } => match opcode {
@@ -1618,19 +1618,19 @@ impl<'a> Lower<'a> {
                     Class::Word(_) => {
                         self.get(old)?;
                         self.get(expected)?;
-                        self.i(I::I32Eq);
+                        self.i(&I::I32Eq);
                     }
                     Class::Long => {
                         self.get(old)?;
                         self.get(expected)?;
-                        self.i(I::I64Eq);
+                        self.i(&I::I64Eq);
                     }
                     // alloc: the error's message
                     _ => return Err("wasm: atomic_cas of a wide type".to_owned()),
                 }
-                self.i(I::If(BlockType::Empty));
+                self.i(&I::If(BlockType::Empty));
                 self.store(replacement, base, 0)?;
-                self.i(I::End);
+                self.i(&I::End);
                 Ok(())
             }
             InstructionData::IntCompare { args: [a, b], cond, .. } => {
@@ -1651,7 +1651,7 @@ impl<'a> Lower<'a> {
                 let bytes = func.dfg.constants.get(constant_handle).as_slice();
                 let bytes: [u8; 16] =
                     bytes.try_into().map_err(|_| "wasm: vconst of other than 16 bytes")?;
-                self.i(I::V128Const(i128::from_le_bytes(bytes)));
+                self.i(&I::V128Const(i128::from_le_bytes(bytes)));
                 self.set(results[0])
             }
             InstructionData::Shuffle { args: [a, b], imm, .. } => {
@@ -1666,7 +1666,7 @@ impl<'a> Lower<'a> {
                 }
                 self.get(a)?;
                 self.get(b)?;
-                self.i(I::I8x16Shuffle(lanes));
+                self.i(&I::I8x16Shuffle(lanes));
                 self.set(results[0])
             }
             InstructionData::BinaryImm8 { opcode: Opcode::Extractlane, arg, imm } => {
@@ -1683,23 +1683,23 @@ impl<'a> Lower<'a> {
                     self.get(b)?;
                     self.get(c)?;
                     self.get(a)?;
-                    self.i(I::V128Bitselect);
+                    self.i(&I::V128Bitselect);
                     self.set(results[0])
                 }
                 Opcode::Bitselect if self.class(b)? == Class::Pair => {
                     let local = self.local(results[0])?;
                     for half in [0, 1] {
                         let (b, c, a) = (self.local(b)?, self.local(c)?, self.local(a)?);
-                        self.i(I::LocalGet(b + half));
-                        self.i(I::LocalGet(a + half));
-                        self.i(I::I64And);
-                        self.i(I::LocalGet(c + half));
-                        self.i(I::LocalGet(a + half));
-                        self.i(I::I64Const(-1));
-                        self.i(I::I64Xor);
-                        self.i(I::I64And);
-                        self.i(I::I64Or);
-                        self.i(I::LocalSet(local + half));
+                        self.i(&I::LocalGet(b + half));
+                        self.i(&I::LocalGet(a + half));
+                        self.i(&I::I64And);
+                        self.i(&I::LocalGet(c + half));
+                        self.i(&I::LocalGet(a + half));
+                        self.i(&I::I64Const(-1));
+                        self.i(&I::I64Xor);
+                        self.i(&I::I64And);
+                        self.i(&I::I64Or);
+                        self.i(&I::LocalSet(local + half));
                     }
                     Ok(())
                 }
@@ -1748,7 +1748,7 @@ impl<'a> Lower<'a> {
             self.get(then)?;
             self.get(otherwise)?;
             self.truthy(cond)?;
-            self.i(I::TypedSelect(ValType::V128));
+            self.i(&I::TypedSelect(ValType::V128));
             return self.set(result);
         }
         if self.class(then)? == Class::Pair {
@@ -1756,19 +1756,19 @@ impl<'a> Lower<'a> {
             self.get_low(then)?;
             self.get_low(otherwise)?;
             self.truthy(cond)?;
-            self.i(I::Select);
+            self.i(&I::Select);
             self.get_high(then)?;
             self.get_high(otherwise)?;
             self.truthy(cond)?;
-            self.i(I::Select);
-            self.i(I::LocalSet(local + 1));
-            self.i(I::LocalSet(local));
+            self.i(&I::Select);
+            self.i(&I::LocalSet(local + 1));
+            self.i(&I::LocalSet(local));
             return Ok(());
         }
         self.get(then)?;
         self.get(otherwise)?;
         self.truthy(cond)?;
-        self.i(I::Select);
+        self.i(&I::Select);
         self.set(result)
     }
 
@@ -1784,14 +1784,14 @@ impl<'a> Lower<'a> {
                 Op::Eq | Op::Ne => {
                     self.get_low(a)?;
                     self.get_low(b)?;
-                    self.i(I::I64Xor);
+                    self.i(&I::I64Xor);
                     self.get_high(a)?;
                     self.get_high(b)?;
-                    self.i(I::I64Xor);
-                    self.i(I::I64Or);
-                    self.i(I::I64Eqz);
+                    self.i(&I::I64Xor);
+                    self.i(&I::I64Or);
+                    self.i(&I::I64Eqz);
                     if matches!(op, Op::Ne) {
-                        self.i(I::I32Eqz);
+                        self.i(&I::I32Eqz);
                     }
                 }
                 _ => {
@@ -1812,8 +1812,8 @@ impl<'a> Lower<'a> {
                     self.op(op.strict(), true);
                     self.get_high(a)?;
                     self.get_high(b)?;
-                    self.i(I::I64Eq);
-                    self.i(I::Select);
+                    self.i(&I::I64Eq);
+                    self.i(&I::Select);
                 }
             },
             // alloc: the error's message
@@ -1847,35 +1847,35 @@ impl<'a> Lower<'a> {
             FloatCC::Ordered | FloatCC::Unordered => {
                 self.get(a)?;
                 self.get(a)?;
-                self.i(pick(single, I::F32Eq, I::F64Eq));
+                self.i(&pick(single, I::F32Eq, I::F64Eq));
                 self.get(b)?;
                 self.get(b)?;
-                self.i(eq);
-                self.i(I::I32And);
+                self.i(&eq);
+                self.i(&I::I32And);
                 if cond == FloatCC::Unordered {
-                    self.i(I::I32Eqz);
+                    self.i(&I::I32Eqz);
                 }
                 return Ok(());
             }
             FloatCC::OrderedNotEqual | FloatCC::UnorderedOrEqual => {
                 self.get(a)?;
                 self.get(b)?;
-                self.i(lt);
+                self.i(&lt);
                 self.get(a)?;
                 self.get(b)?;
-                self.i(gt);
-                self.i(I::I32Or);
+                self.i(&gt);
+                self.i(&I::I32Or);
                 if cond == FloatCC::UnorderedOrEqual {
-                    self.i(I::I32Eqz);
+                    self.i(&I::I32Eqz);
                 }
                 return Ok(());
             }
         };
         self.get(a)?;
         self.get(b)?;
-        self.i(first);
+        self.i(&first);
         if negate {
-            self.i(I::I32Eqz);
+            self.i(&I::I32Eqz);
         }
         Ok(())
     }
@@ -1884,17 +1884,17 @@ impl<'a> Lower<'a> {
         match (self.class(arg)?, self.class(result)?) {
             (Class::Pair, Class::V128) => {
                 self.get_low(arg)?;
-                self.i(I::I64x2Splat);
+                self.i(&I::I64x2Splat);
                 self.get_high(arg)?;
-                self.i(I::I64x2ReplaceLane(1));
+                self.i(&I::I64x2ReplaceLane(1));
                 return self.set(result);
             }
             (Class::V128, Class::Pair) => {
                 let local = self.local(result)?;
                 for half in [0, 1] {
                     self.get(arg)?;
-                    self.i(I::I64x2ExtractLane(half as u8));
-                    self.i(I::LocalSet(local + half));
+                    self.i(&I::I64x2ExtractLane(half as u8));
+                    self.i(&I::LocalSet(local + half));
                 }
                 return Ok(());
             }
@@ -1902,10 +1902,10 @@ impl<'a> Lower<'a> {
         }
         self.get(arg)?;
         match (self.class(arg)?, self.class(result)?) {
-            (Class::Word(32), Class::F32) => self.i(I::F32ReinterpretI32),
-            (Class::F32, Class::Word(32)) => self.i(I::I32ReinterpretF32),
-            (Class::Long, Class::F64) => self.i(I::F64ReinterpretI64),
-            (Class::F64, Class::Long) => self.i(I::I64ReinterpretF64),
+            (Class::Word(32), Class::F32) => self.i(&I::F32ReinterpretI32),
+            (Class::F32, Class::Word(32)) => self.i(&I::I32ReinterpretF32),
+            (Class::Long, Class::F64) => self.i(&I::F64ReinterpretI64),
+            (Class::F64, Class::Long) => self.i(&I::I64ReinterpretF64),
             (from, to) if from == to => {}
             // alloc: the error's message
             (from, to) => return Err(format!("wasm: bitcast from {from:?} to {to:?}")),
@@ -1966,13 +1966,13 @@ impl<'a> Lower<'a> {
                 self.get(old)?;
                 self.get(value)?;
                 self.compare(pick, old, value)?;
-                self.i(I::Select);
+                self.i(&I::Select);
             }
         }
         // The store keeps the low bits alone, so nothing has to be cleared.
         match class {
             Class::Word(bits) => self.store_int(class, bits, 0),
-            _ => self.i(I::I64Store(mem(0))),
+            _ => self.i(&I::I64Store(mem(0))),
         }
         Ok(())
     }
@@ -2002,7 +2002,7 @@ impl<'a> Lower<'a> {
                     }
                     (Class::Word(_), Class::Long | Class::Pair) => {
                         self.get_for(arg, signed)?;
-                        self.i(if signed { I::I64ExtendI32S } else { I::I64ExtendI32U });
+                        self.i(&if signed { I::I64ExtendI32S } else { I::I64ExtendI32U });
                     }
                     (Class::Long, Class::Pair) => self.get(arg)?,
                     // alloc: the error's message
@@ -2011,21 +2011,21 @@ impl<'a> Lower<'a> {
                 if to == Class::Pair {
                     // The low half is on the stack; the high one is its sign, or nothing.
                     let local = self.local(result)?;
-                    self.i(I::LocalTee(local));
-                    self.i(I::I64Const(if signed { 63 } else { 64 }));
-                    self.i(if signed { I::I64ShrS } else { I::I64ShrU });
+                    self.i(&I::LocalTee(local));
+                    self.i(&I::I64Const(if signed { 63 } else { 64 }));
+                    self.i(&if signed { I::I64ShrS } else { I::I64ShrU });
                     if !signed {
-                        self.i(I::Drop);
-                        self.i(I::I64Const(0));
+                        self.i(&I::Drop);
+                        self.i(&I::I64Const(0));
                     }
-                    self.i(I::LocalSet(local + 1));
+                    self.i(&I::LocalSet(local + 1));
                     return Ok(());
                 }
             }
             Opcode::Ireduce => {
                 self.get_low(arg)?;
                 if matches!(from, Class::Long | Class::Pair) && matches!(to, Class::Word(_)) {
-                    self.i(I::I32WrapI64);
+                    self.i(&I::I32WrapI64);
                 }
                 self.mask_for(to);
             }
@@ -2038,17 +2038,17 @@ impl<'a> Lower<'a> {
                 }
                 Class::Pair => {
                     // Nothing minus each half, the high one borrowing when the low is not zero.
-                    self.i(I::I64Const(0));
+                    self.i(&I::I64Const(0));
                     self.get_low(arg)?;
-                    self.i(I::I64Sub);
-                    self.i(I::I64Const(0));
+                    self.i(&I::I64Sub);
+                    self.i(&I::I64Const(0));
                     self.get_high(arg)?;
-                    self.i(I::I64Sub);
+                    self.i(&I::I64Sub);
                     self.get_low(arg)?;
-                    self.i(I::I64Const(0));
-                    self.i(I::I64Ne);
-                    self.i(I::I64ExtendI32U);
-                    self.i(I::I64Sub);
+                    self.i(&I::I64Const(0));
+                    self.i(&I::I64Ne);
+                    self.i(&I::I64ExtendI32U);
+                    self.i(&I::I64Sub);
                 }
                 // alloc: the error's message
                 _ => return Err("wasm: ineg of a float".to_owned()),
@@ -2062,11 +2062,11 @@ impl<'a> Lower<'a> {
                 }
                 Class::Pair => {
                     self.get_low(arg)?;
-                    self.i(I::I64Const(-1));
-                    self.i(I::I64Xor);
+                    self.i(&I::I64Const(-1));
+                    self.i(&I::I64Xor);
                     self.get_high(arg)?;
-                    self.i(I::I64Const(-1));
-                    self.i(I::I64Xor);
+                    self.i(&I::I64Const(-1));
+                    self.i(&I::I64Xor);
                 }
                 // alloc: the error's message
                 _ => return Err("wasm: bnot of a float".to_owned()),
@@ -2078,11 +2078,11 @@ impl<'a> Lower<'a> {
                 }
                 Class::Pair => {
                     self.get_low(arg)?;
-                    self.i(I::I64Popcnt);
+                    self.i(&I::I64Popcnt);
                     self.get_high(arg)?;
-                    self.i(I::I64Popcnt);
-                    self.i(I::I64Add);
-                    self.i(I::I64Const(0));
+                    self.i(&I::I64Popcnt);
+                    self.i(&I::I64Add);
+                    self.i(&I::I64Const(0));
                 }
                 // alloc: the error's message
                 _ => return Err("wasm: popcnt of a float".to_owned()),
@@ -2090,28 +2090,28 @@ impl<'a> Lower<'a> {
             Opcode::Clz => match to {
                 Class::Word(bits) => {
                     self.get(arg)?;
-                    self.i(I::I32Clz);
+                    self.i(&I::I32Clz);
                     if bits < 32 {
-                        self.i(I::I32Const(32 - i32::from(bits)));
-                        self.i(I::I32Sub);
+                        self.i(&I::I32Const(32 - i32::from(bits)));
+                        self.i(&I::I32Sub);
                     }
                 }
                 Class::Long => {
                     self.get(arg)?;
-                    self.i(I::I64Clz);
+                    self.i(&I::I64Clz);
                 }
                 Class::Pair => {
                     self.get_high(arg)?;
-                    self.i(I::I64Clz);
+                    self.i(&I::I64Clz);
                     self.get_low(arg)?;
-                    self.i(I::I64Clz);
-                    self.i(I::I64Const(64));
-                    self.i(I::I64Add);
+                    self.i(&I::I64Clz);
+                    self.i(&I::I64Const(64));
+                    self.i(&I::I64Add);
                     self.get_high(arg)?;
-                    self.i(I::I64Const(0));
-                    self.i(I::I64Ne);
-                    self.i(I::Select);
-                    self.i(I::I64Const(0));
+                    self.i(&I::I64Const(0));
+                    self.i(&I::I64Ne);
+                    self.i(&I::Select);
+                    self.i(&I::I64Const(0));
                 }
                 // alloc: the error's message
                 _ => return Err("wasm: clz of a float".to_owned()),
@@ -2121,27 +2121,27 @@ impl<'a> Lower<'a> {
                     self.get(arg)?;
                     if bits < 32 {
                         // A bit past the end stops the count there.
-                        self.i(I::I32Const(1 << bits));
-                        self.i(I::I32Or);
+                        self.i(&I::I32Const(1 << bits));
+                        self.i(&I::I32Or);
                     }
-                    self.i(I::I32Ctz);
+                    self.i(&I::I32Ctz);
                 }
                 Class::Long => {
                     self.get(arg)?;
-                    self.i(I::I64Ctz);
+                    self.i(&I::I64Ctz);
                 }
                 Class::Pair => {
                     self.get_low(arg)?;
-                    self.i(I::I64Ctz);
+                    self.i(&I::I64Ctz);
                     self.get_high(arg)?;
-                    self.i(I::I64Ctz);
-                    self.i(I::I64Const(64));
-                    self.i(I::I64Add);
+                    self.i(&I::I64Ctz);
+                    self.i(&I::I64Const(64));
+                    self.i(&I::I64Add);
                     self.get_low(arg)?;
-                    self.i(I::I64Const(0));
-                    self.i(I::I64Ne);
-                    self.i(I::Select);
-                    self.i(I::I64Const(0));
+                    self.i(&I::I64Const(0));
+                    self.i(&I::I64Ne);
+                    self.i(&I::Select);
+                    self.i(&I::I64Const(0));
                 }
                 // alloc: the error's message
                 _ => return Err("wasm: ctz of a float".to_owned()),
@@ -2188,44 +2188,44 @@ impl<'a> Lower<'a> {
             },
             Opcode::Fneg => {
                 self.get(arg)?;
-                self.i(float(single, I::F32Neg, I::F64Neg));
+                self.i(&float(single, I::F32Neg, I::F64Neg));
             }
             Opcode::Fabs => {
                 self.get(arg)?;
-                self.i(float(single, I::F32Abs, I::F64Abs));
+                self.i(&float(single, I::F32Abs, I::F64Abs));
             }
             Opcode::Sqrt => {
                 self.get(arg)?;
-                self.i(float(single, I::F32Sqrt, I::F64Sqrt));
+                self.i(&float(single, I::F32Sqrt, I::F64Sqrt));
             }
             Opcode::Ceil => {
                 self.get(arg)?;
-                self.i(float(single, I::F32Ceil, I::F64Ceil));
+                self.i(&float(single, I::F32Ceil, I::F64Ceil));
             }
             Opcode::Floor => {
                 self.get(arg)?;
-                self.i(float(single, I::F32Floor, I::F64Floor));
+                self.i(&float(single, I::F32Floor, I::F64Floor));
             }
             Opcode::Trunc => {
                 self.get(arg)?;
-                self.i(float(single, I::F32Trunc, I::F64Trunc));
+                self.i(&float(single, I::F32Trunc, I::F64Trunc));
             }
             Opcode::Nearest => {
                 self.get(arg)?;
-                self.i(float(single, I::F32Nearest, I::F64Nearest));
+                self.i(&float(single, I::F32Nearest, I::F64Nearest));
             }
             Opcode::Fpromote => {
                 self.get(arg)?;
-                self.i(I::F64PromoteF32);
+                self.i(&I::F64PromoteF32);
             }
             Opcode::Fdemote => {
                 self.get(arg)?;
-                self.i(I::F32DemoteF64);
+                self.i(&I::F32DemoteF64);
             }
             Opcode::FcvtFromUint | Opcode::FcvtFromSint => {
                 let signed = opcode == Opcode::FcvtFromSint;
                 self.get_for(arg, signed)?;
-                self.i(match (from, to, signed) {
+                self.i(&match (from, to, signed) {
                     (Class::Word(_), Class::F32, false) => I::F32ConvertI32U,
                     (Class::Word(_), Class::F32, true) => I::F32ConvertI32S,
                     (Class::Word(_), Class::F64, false) => I::F64ConvertI32U,
@@ -2241,7 +2241,7 @@ impl<'a> Lower<'a> {
             Opcode::FcvtToUintSat | Opcode::FcvtToSintSat => {
                 let signed = opcode == Opcode::FcvtToSintSat;
                 self.get(arg)?;
-                self.i(match (single, to, signed) {
+                self.i(&match (single, to, signed) {
                     (true, Class::Word(_), false) => I::I32TruncSatF32U,
                     (true, Class::Word(_), true) => I::I32TruncSatF32S,
                     (false, Class::Word(_), false) => I::I32TruncSatF64U,
@@ -2262,12 +2262,12 @@ impl<'a> Lower<'a> {
                     let value = self.temp(ValType::I32);
                     for (bound, keep) in [(high, Op::LtS), (low, Op::GtS)] {
                         let keep = if signed { keep } else { keep.strict_unsigned() };
-                        self.i(I::LocalTee(value));
-                        self.i(I::I32Const(bound));
-                        self.i(I::LocalGet(value));
-                        self.i(I::I32Const(bound));
+                        self.i(&I::LocalTee(value));
+                        self.i(&I::I32Const(bound));
+                        self.i(&I::LocalGet(value));
+                        self.i(&I::I32Const(bound));
                         self.op(keep, false);
-                        self.i(I::Select);
+                        self.i(&I::Select);
                     }
                     self.mask(bits);
                 }
@@ -2309,12 +2309,12 @@ impl<'a> Lower<'a> {
     /// the lower group of each pair set.
     fn swap_groups(&mut self, value: u32, long: bool, steps: &[(i64, u64)]) {
         for &(shift, mask) in steps {
-            self.i(I::LocalTee(value));
+            self.i(&I::LocalTee(value));
             self.constant(mask as i64, long);
             self.op(Op::And, long);
             self.constant(shift, long);
             self.op(Op::Shl, long);
-            self.i(I::LocalGet(value));
+            self.i(&I::LocalGet(value));
             self.constant(shift, long);
             self.op(Op::ShrU, long);
             self.constant(mask as i64, long);
@@ -2357,7 +2357,7 @@ impl<'a> Lower<'a> {
                 };
                 self.get(a)?;
                 self.get(b)?;
-                self.i(instruction);
+                self.i(&instruction);
                 self.set(result)
             }
         }
@@ -2408,8 +2408,8 @@ impl<'a> Lower<'a> {
                 self.amount(b, long)?;
                 if bits < 32 {
                     // Wasm takes the amount modulo 32, the narrow type modulo its width.
-                    self.i(I::I32Const(i32::from(bits) - 1));
-                    self.i(I::I32And);
+                    self.i(&I::I32Const(i32::from(bits) - 1));
+                    self.i(&I::I32And);
                 }
                 self.op(op, long);
                 self.mask_for(class);
@@ -2426,20 +2426,20 @@ impl<'a> Lower<'a> {
                     let (there, back) =
                         if left { (Op::Shl, Op::ShrU) } else { (Op::ShrU, Op::Shl) };
                     self.amount(b, false)?;
-                    self.i(I::I32Const(i32::from(bits) - 1));
-                    self.i(I::I32And);
-                    self.i(I::LocalSet(amount));
+                    self.i(&I::I32Const(i32::from(bits) - 1));
+                    self.i(&I::I32And);
+                    self.i(&I::LocalSet(amount));
                     self.get(a)?;
-                    self.i(I::LocalGet(amount));
+                    self.i(&I::LocalGet(amount));
                     self.op(there, false);
                     self.get(a)?;
-                    self.i(I::I32Const(i32::from(bits)));
-                    self.i(I::LocalGet(amount));
-                    self.i(I::I32Sub);
-                    self.i(I::I32Const(i32::from(bits) - 1));
-                    self.i(I::I32And);
+                    self.i(&I::I32Const(i32::from(bits)));
+                    self.i(&I::LocalGet(amount));
+                    self.i(&I::I32Sub);
+                    self.i(&I::I32Const(i32::from(bits) - 1));
+                    self.i(&I::I32And);
                     self.op(back, false);
-                    self.i(I::I32Or);
+                    self.i(&I::I32Or);
                     self.mask(bits);
                 }
             }
@@ -2453,7 +2453,7 @@ impl<'a> Lower<'a> {
                 self.get(a)?;
                 self.get(b)?;
                 self.compare(pick, a, b)?;
-                self.i(I::Select);
+                self.i(&I::Select);
             }
             Opcode::Umulhi | Opcode::Smulhi if long => {
                 let (x, y) = (self.local(a)?, self.local(b)?);
@@ -2483,13 +2483,13 @@ impl<'a> Lower<'a> {
                 // difference when the operands differ and the result is not on `a`'s side.
                 self.get(a)?;
                 self.get(if add { result } else { b })?;
-                self.i(I::I64Xor);
+                self.i(&I::I64Xor);
                 self.get(if add { b } else { a })?;
                 self.get(result)?;
-                self.i(I::I64Xor);
-                self.i(I::I64And);
-                self.i(I::I64Const(0));
-                self.i(I::I64LtS);
+                self.i(&I::I64Xor);
+                self.i(&I::I64And);
+                self.i(&I::I64Const(0));
+                self.i(&I::I64LtS);
                 return self.set(results[1]);
             }
             Opcode::SaddOverflow | Opcode::SsubOverflow | Opcode::SmulOverflow if !long => {
@@ -2498,43 +2498,43 @@ impl<'a> Lower<'a> {
                 let exact = self.temp(ValType::I64);
                 for value in [a, b] {
                     self.get_signed(value)?;
-                    self.i(I::I64ExtendI32S);
+                    self.i(&I::I64ExtendI32S);
                 }
-                self.i(match opcode {
+                self.i(&match opcode {
                     Opcode::SaddOverflow => I::I64Add,
                     Opcode::SsubOverflow => I::I64Sub,
                     _ => I::I64Mul,
                 });
-                self.i(I::LocalTee(exact));
-                self.i(I::I32WrapI64);
+                self.i(&I::LocalTee(exact));
+                self.i(&I::I32WrapI64);
                 self.mask_for(class);
                 self.set(result)?;
-                self.i(I::LocalGet(exact));
-                self.i(I::LocalGet(exact));
-                self.i(match bits {
+                self.i(&I::LocalGet(exact));
+                self.i(&I::LocalGet(exact));
+                self.i(&match bits {
                     8 => I::I64Extend8S,
                     16 => I::I64Extend16S,
                     _ => I::I64Extend32S,
                 });
-                self.i(I::I64Ne);
+                self.i(&I::I64Ne);
                 return self.set(results[1]);
             }
             Opcode::UmulOverflow if !long => {
                 let exact = self.temp(ValType::I64);
                 for value in [a, b] {
                     self.get(value)?;
-                    self.i(I::I64ExtendI32U);
+                    self.i(&I::I64ExtendI32U);
                 }
-                self.i(I::I64Mul);
-                self.i(I::LocalTee(exact));
-                self.i(I::I32WrapI64);
+                self.i(&I::I64Mul);
+                self.i(&I::LocalTee(exact));
+                self.i(&I::I32WrapI64);
                 self.mask_for(class);
                 self.set(result)?;
-                self.i(I::LocalGet(exact));
-                self.i(I::I64Const(i64::from(bits)));
-                self.i(I::I64ShrU);
-                self.i(I::I64Const(0));
-                self.i(I::I64Ne);
+                self.i(&I::LocalGet(exact));
+                self.i(&I::I64Const(i64::from(bits)));
+                self.i(&I::I64ShrU);
+                self.i(&I::I64Const(0));
+                self.i(&I::I64Ne);
                 return self.set(results[1]);
             }
             Opcode::UmulOverflow | Opcode::SmulOverflow => {
@@ -2542,19 +2542,19 @@ impl<'a> Lower<'a> {
                 let (x, y) = (self.local(a)?, self.local(b)?);
                 self.get(a)?;
                 self.get(b)?;
-                self.i(I::I64Mul);
+                self.i(&I::I64Mul);
                 self.set(result)?;
                 // The upper half of the full product has to be nothing but the sign of the
                 // lower one.
                 self.multiply_high(x, y, signed);
                 if signed {
                     self.get(result)?;
-                    self.i(I::I64Const(63));
-                    self.i(I::I64ShrS);
+                    self.i(&I::I64Const(63));
+                    self.i(&I::I64ShrS);
                 } else {
-                    self.i(I::I64Const(0));
+                    self.i(&I::I64Const(0));
                 }
-                self.i(I::I64Ne);
+                self.i(&I::I64Ne);
                 return self.set(results[1]);
             }
             // alloc: the error's message
@@ -2567,49 +2567,49 @@ impl<'a> Lower<'a> {
     fn multiply_high(&mut self, a: u32, b: u32, signed: bool) {
         let [low, cross] = [(); 2].map(|()| self.temp(ValType::I64));
         let half = |this: &mut Self, local: u32, upper: bool| {
-            this.i(I::LocalGet(local));
+            this.i(&I::LocalGet(local));
             if upper {
-                this.i(I::I64Const(32));
-                this.i(I::I64ShrU);
+                this.i(&I::I64Const(32));
+                this.i(&I::I64ShrU);
             } else {
-                this.i(I::I64Const(0xffff_ffff));
-                this.i(I::I64And);
+                this.i(&I::I64Const(0xffff_ffff));
+                this.i(&I::I64And);
             }
         };
         // Schoolbook multiplication on 32-bit halves, carrying through the middle.
         half(self, a, true);
         half(self, b, false);
-        self.i(I::I64Mul);
+        self.i(&I::I64Mul);
         half(self, a, false);
         half(self, b, false);
-        self.i(I::I64Mul);
-        self.i(I::I64Const(32));
-        self.i(I::I64ShrU);
-        self.i(I::I64Add);
-        self.i(I::LocalSet(cross));
+        self.i(&I::I64Mul);
+        self.i(&I::I64Const(32));
+        self.i(&I::I64ShrU);
+        self.i(&I::I64Add);
+        self.i(&I::LocalSet(cross));
         half(self, a, false);
         half(self, b, true);
-        self.i(I::I64Mul);
+        self.i(&I::I64Mul);
         half(self, cross, false);
-        self.i(I::I64Add);
-        self.i(I::LocalSet(low));
+        self.i(&I::I64Add);
+        self.i(&I::LocalSet(low));
         half(self, a, true);
         half(self, b, true);
-        self.i(I::I64Mul);
+        self.i(&I::I64Mul);
         half(self, cross, true);
-        self.i(I::I64Add);
+        self.i(&I::I64Add);
         half(self, low, true);
-        self.i(I::I64Add);
+        self.i(&I::I64Add);
         if signed {
             // A negative operand counted as 2^64 more than it is, times the other.
             for (negative, other) in [(a, b), (b, a)] {
-                self.i(I::LocalGet(other));
-                self.i(I::I64Const(0));
-                self.i(I::LocalGet(negative));
-                self.i(I::I64Const(0));
-                self.i(I::I64LtS);
-                self.i(I::Select);
-                self.i(I::I64Sub);
+                self.i(&I::LocalGet(other));
+                self.i(&I::I64Const(0));
+                self.i(&I::LocalGet(negative));
+                self.i(&I::I64Const(0));
+                self.i(&I::I64LtS);
+                self.i(&I::Select);
+                self.i(&I::I64Sub);
             }
         }
     }
@@ -2654,14 +2654,14 @@ impl<'a> Lower<'a> {
                 };
                 let first = self.temp(ValType::I32);
                 self.compare(pick, a, b)?;
-                self.i(I::LocalSet(first));
+                self.i(&I::LocalSet(first));
                 for half in [0, 1] {
                     let (x, y) = (self.local(a)? + half, self.local(b)? + half);
-                    self.i(I::LocalGet(x));
-                    self.i(I::LocalGet(y));
-                    self.i(I::LocalGet(first));
-                    self.i(I::Select);
-                    self.i(I::LocalSet(out + half));
+                    self.i(&I::LocalGet(x));
+                    self.i(&I::LocalGet(y));
+                    self.i(&I::LocalGet(first));
+                    self.i(&I::Select);
+                    self.i(&I::LocalSet(out + half));
                 }
                 Ok(())
             }
@@ -2670,41 +2670,41 @@ impl<'a> Lower<'a> {
                 let amount = self.temp(ValType::I64);
                 let [low, high] = [(); 2].map(|()| self.temp(ValType::I64));
                 if opcode == Opcode::Rotr {
-                    self.i(I::I64Const(0));
+                    self.i(&I::I64Const(0));
                 }
                 self.amount(b, true)?;
                 if opcode == Opcode::Rotr {
-                    self.i(I::I64Sub);
+                    self.i(&I::I64Sub);
                 }
-                self.i(I::I64Const(127));
-                self.i(I::I64And);
-                self.i(I::LocalSet(amount));
+                self.i(&I::I64Const(127));
+                self.i(&I::I64And);
+                self.i(&I::LocalSet(amount));
                 // Past 64 the halves change places first.
                 let x = self.local(a)?;
                 for (local, (far, near)) in [(low, (x + 1, x)), (high, (x, x + 1))] {
-                    self.i(I::LocalGet(far));
-                    self.i(I::LocalGet(near));
-                    self.i(I::LocalGet(amount));
-                    self.i(I::I64Const(64));
-                    self.i(I::I64GeU);
-                    self.i(I::Select);
-                    self.i(I::LocalSet(local));
+                    self.i(&I::LocalGet(far));
+                    self.i(&I::LocalGet(near));
+                    self.i(&I::LocalGet(amount));
+                    self.i(&I::I64Const(64));
+                    self.i(&I::I64GeU);
+                    self.i(&I::Select);
+                    self.i(&I::LocalSet(local));
                 }
                 // Each half takes what leaves the other, in two steps so that an amount of
                 // zero brings nothing over.
                 for (into, (this, other)) in [(out, (low, high)), (out + 1, (high, low))] {
-                    self.i(I::LocalGet(this));
-                    self.i(I::LocalGet(amount));
-                    self.i(I::I64Shl);
-                    self.i(I::LocalGet(other));
-                    self.i(I::I64Const(1));
-                    self.i(I::I64ShrU);
-                    self.i(I::I64Const(63));
-                    self.i(I::LocalGet(amount));
-                    self.i(I::I64Sub);
-                    self.i(I::I64ShrU);
-                    self.i(I::I64Or);
-                    self.i(I::LocalSet(into));
+                    self.i(&I::LocalGet(this));
+                    self.i(&I::LocalGet(amount));
+                    self.i(&I::I64Shl);
+                    self.i(&I::LocalGet(other));
+                    self.i(&I::I64Const(1));
+                    self.i(&I::I64ShrU);
+                    self.i(&I::I64Const(63));
+                    self.i(&I::LocalGet(amount));
+                    self.i(&I::I64Sub);
+                    self.i(&I::I64ShrU);
+                    self.i(&I::I64Or);
+                    self.i(&I::LocalSet(into));
                 }
                 Ok(())
             }
@@ -2721,37 +2721,37 @@ impl<'a> Lower<'a> {
                 self.get_low(a)?;
                 self.get_low(b)?;
                 self.op(op, true);
-                self.i(I::LocalSet(low));
+                self.i(&I::LocalSet(low));
                 self.get_high(a)?;
                 self.get_high(b)?;
                 self.op(op, true);
                 // What the low halves carry or borrow.
                 if add {
-                    self.i(I::LocalGet(low));
+                    self.i(&I::LocalGet(low));
                     self.get_low(a)?;
                 } else {
                     self.get_low(a)?;
                     self.get_low(b)?;
                 }
-                self.i(I::I64LtU);
-                self.i(I::I64ExtendI32U);
+                self.i(&I::I64LtU);
+                self.i(&I::I64ExtendI32U);
                 self.op(op, true);
-                self.i(I::LocalSet(high));
+                self.i(&I::LocalSet(high));
                 match opcode {
                     Opcode::UaddOverflow | Opcode::UsubOverflow => {
                         // As for one word, over both: the high halves decide unless equal.
                         let (x_low, x_high, y) = if add { (low, high, a) } else { (0, 0, b) };
                         if add {
-                            self.i(I::LocalGet(x_low));
+                            self.i(&I::LocalGet(x_low));
                             self.get_low(y)?;
-                            self.i(I::I64LtU);
-                            self.i(I::LocalGet(x_high));
+                            self.i(&I::I64LtU);
+                            self.i(&I::LocalGet(x_high));
                             self.get_high(y)?;
-                            self.i(I::I64LtU);
-                            self.i(I::LocalGet(x_high));
+                            self.i(&I::I64LtU);
+                            self.i(&I::LocalGet(x_high));
                             self.get_high(y)?;
-                            self.i(I::I64Eq);
-                            self.i(I::Select);
+                            self.i(&I::I64Eq);
+                            self.i(&I::Select);
                         } else {
                             self.compare(Op::LtU, a, y)?;
                         }
@@ -2760,52 +2760,52 @@ impl<'a> Lower<'a> {
                     Opcode::SaddOverflow | Opcode::SsubOverflow => {
                         self.get_high(a)?;
                         if add {
-                            self.i(I::LocalGet(high));
+                            self.i(&I::LocalGet(high));
                         } else {
                             self.get_high(b)?;
                         }
-                        self.i(I::I64Xor);
+                        self.i(&I::I64Xor);
                         if add {
                             self.get_high(b)?;
                         } else {
                             self.get_high(a)?;
                         }
-                        self.i(I::LocalGet(high));
-                        self.i(I::I64Xor);
-                        self.i(I::I64And);
-                        self.i(I::I64Const(0));
-                        self.i(I::I64LtS);
+                        self.i(&I::LocalGet(high));
+                        self.i(&I::I64Xor);
+                        self.i(&I::I64And);
+                        self.i(&I::I64Const(0));
+                        self.i(&I::I64LtS);
                         self.set(results[1])?;
                     }
                     _ => {}
                 }
-                self.i(I::LocalGet(low));
-                self.i(I::LocalSet(out));
-                self.i(I::LocalGet(high));
-                self.i(I::LocalSet(out + 1));
+                self.i(&I::LocalGet(low));
+                self.i(&I::LocalSet(out));
+                self.i(&I::LocalGet(high));
+                self.i(&I::LocalSet(out + 1));
                 Ok(())
             }
             Opcode::Imul => {
                 let (x, y) = (self.local(a)?, self.local(b)?);
                 let [low, high] = [(); 2].map(|()| self.temp(ValType::I64));
-                self.i(I::LocalGet(x));
-                self.i(I::LocalGet(y));
-                self.i(I::I64Mul);
-                self.i(I::LocalSet(low));
+                self.i(&I::LocalGet(x));
+                self.i(&I::LocalGet(y));
+                self.i(&I::I64Mul);
+                self.i(&I::LocalSet(low));
                 self.multiply_high(x, y, false);
-                self.i(I::LocalGet(x));
-                self.i(I::LocalGet(y + 1));
-                self.i(I::I64Mul);
-                self.i(I::I64Add);
-                self.i(I::LocalGet(x + 1));
-                self.i(I::LocalGet(y));
-                self.i(I::I64Mul);
-                self.i(I::I64Add);
-                self.i(I::LocalSet(high));
-                self.i(I::LocalGet(low));
-                self.i(I::LocalSet(out));
-                self.i(I::LocalGet(high));
-                self.i(I::LocalSet(out + 1));
+                self.i(&I::LocalGet(x));
+                self.i(&I::LocalGet(y + 1));
+                self.i(&I::I64Mul);
+                self.i(&I::I64Add);
+                self.i(&I::LocalGet(x + 1));
+                self.i(&I::LocalGet(y));
+                self.i(&I::I64Mul);
+                self.i(&I::I64Add);
+                self.i(&I::LocalSet(high));
+                self.i(&I::LocalGet(low));
+                self.i(&I::LocalSet(out));
+                self.i(&I::LocalGet(high));
+                self.i(&I::LocalSet(out + 1));
                 Ok(())
             }
             Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => {
@@ -2813,9 +2813,9 @@ impl<'a> Lower<'a> {
                 let amount = self.temp(ValType::I64);
                 let [low, high] = [(); 2].map(|()| self.temp(ValType::I64));
                 self.amount(b, true)?;
-                self.i(I::I64Const(127));
-                self.i(I::I64And);
-                self.i(I::LocalSet(amount));
+                self.i(&I::I64Const(127));
+                self.i(&I::I64And);
+                self.i(&I::LocalSet(amount));
                 // `near` is the half the bits leave and `far` the one they arrive in.
                 let left = opcode == Opcode::Ishl;
                 let signed = opcode == Opcode::Sshr;
@@ -2823,51 +2823,51 @@ impl<'a> Lower<'a> {
                     if left { (x, x + 1, low, high) } else { (x + 1, x, high, low) };
                 let (there, back) = if left { (Op::Shl, Op::ShrU) } else { (Op::ShrU, Op::Shl) };
                 let near_shift = if signed { Op::ShrS } else { there };
-                self.i(I::LocalGet(amount));
-                self.i(I::I64Const(64));
-                self.i(I::I64GeU);
-                self.i(I::If(BlockType::Empty));
+                self.i(&I::LocalGet(amount));
+                self.i(&I::I64Const(64));
+                self.i(&I::I64GeU);
+                self.i(&I::If(BlockType::Empty));
                 {
                     // Everything crosses over: wasm takes the amount modulo 64 itself.
-                    self.i(I::LocalGet(near));
-                    self.i(I::LocalGet(amount));
+                    self.i(&I::LocalGet(near));
+                    self.i(&I::LocalGet(amount));
                     self.op(near_shift, true);
-                    self.i(I::LocalSet(far_out));
+                    self.i(&I::LocalSet(far_out));
                     if signed {
-                        self.i(I::LocalGet(near));
-                        self.i(I::I64Const(63));
-                        self.i(I::I64ShrS);
+                        self.i(&I::LocalGet(near));
+                        self.i(&I::I64Const(63));
+                        self.i(&I::I64ShrS);
                     } else {
-                        self.i(I::I64Const(0));
+                        self.i(&I::I64Const(0));
                     }
-                    self.i(I::LocalSet(near_out));
+                    self.i(&I::LocalSet(near_out));
                 }
-                self.i(I::Else);
+                self.i(&I::Else);
                 {
-                    self.i(I::LocalGet(near));
-                    self.i(I::LocalGet(amount));
+                    self.i(&I::LocalGet(near));
+                    self.i(&I::LocalGet(amount));
                     self.op(near_shift, true);
-                    self.i(I::LocalSet(near_out));
-                    self.i(I::LocalGet(far));
-                    self.i(I::LocalGet(amount));
+                    self.i(&I::LocalSet(near_out));
+                    self.i(&I::LocalGet(far));
+                    self.i(&I::LocalGet(amount));
                     self.op(there, true);
                     // What crosses over, in two steps so that an amount of zero moves
                     // nothing rather than everything.
-                    self.i(I::LocalGet(near));
-                    self.i(I::I64Const(1));
+                    self.i(&I::LocalGet(near));
+                    self.i(&I::I64Const(1));
                     self.op(back, true);
-                    self.i(I::I64Const(63));
-                    self.i(I::LocalGet(amount));
-                    self.i(I::I64Sub);
+                    self.i(&I::I64Const(63));
+                    self.i(&I::LocalGet(amount));
+                    self.i(&I::I64Sub);
                     self.op(back, true);
-                    self.i(I::I64Or);
-                    self.i(I::LocalSet(far_out));
+                    self.i(&I::I64Or);
+                    self.i(&I::LocalSet(far_out));
                 }
-                self.i(I::End);
-                self.i(I::LocalGet(low));
-                self.i(I::LocalSet(out));
-                self.i(I::LocalGet(high));
-                self.i(I::LocalSet(out + 1));
+                self.i(&I::End);
+                self.i(&I::LocalGet(low));
+                self.i(&I::LocalSet(out));
+                self.i(&I::LocalGet(high));
+                self.i(&I::LocalSet(out + 1));
                 Ok(())
             }
             // alloc: the error's message

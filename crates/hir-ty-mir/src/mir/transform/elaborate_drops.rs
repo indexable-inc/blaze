@@ -703,7 +703,7 @@ impl<'c, 'f, 'db> Elaborator<'_, 'c, 'f, 'db> {
                 Ok(self.drop_ladder(fields, path, succ, unwind)?.0)
             }
             TyKind::Adt(adt, _) if adt.is_box() => {
-                self.open_drop_for_box(place, path, ty, succ, unwind)
+                self.open_drop_for_box(&place, path, ty, succ, unwind)
             }
             TyKind::Adt(adt, _) if adt.is_enum() => {
                 let hir_def::AdtId::EnumId(id) = adt.def_id() else { unreachable!() };
@@ -717,7 +717,7 @@ impl<'c, 'f, 'db> Elaborator<'_, 'c, 'f, 'db> {
                 Ok(self.drop_ladder(fields, path, succ, unwind)?.0)
             }
             TyKind::Array(_, len) => match try_const_usize(self.ctx.db, len) {
-                Some(len) => self.open_drop_for_array(place, path, len as u64, succ, unwind),
+                Some(len) => self.open_drop_for_array(&place, path, len as u64, succ, unwind),
                 None => Ok(self.complete_drop(place, path, succ, unwind)),
             },
             _ => Ok(self.complete_drop(place, path, succ, unwind)),
@@ -729,20 +729,20 @@ impl<'c, 'f, 'db> Elaborator<'_, 'c, 'f, 'db> {
     /// its contents are.
     fn open_drop_for_box(
         &mut self,
-        place: StoredPlace,
+        place: &StoredPlace,
         path: PathId,
         ty: Ty<'db>,
         succ: BasicBlockId,
         unwind: Unwind,
     ) -> Result<BasicBlockId, MirLowerError<'db>> {
-        let free = self.box_free_block(&place, path, ty, succ, unwind)?;
+        let free = self.box_free_block(place, path, ty, succ, unwind)?;
         let free_unwind = match unwind {
             Unwind::To(target) => {
-                Unwind::To(self.box_free_block(&place, path, ty, target, Unwind::InCleanup)?)
+                Unwind::To(self.box_free_block(place, path, ty, target, Unwind::InCleanup)?)
             }
             Unwind::InCleanup => Unwind::InCleanup,
         };
-        let contents = Self::project(&place, ProjectionElem::Deref);
+        let contents = Self::project(place, ProjectionElem::Deref);
         let contents_path = self.data.find_child(path, Step::BoxContents);
         self.drop_subpath(contents, contents_path, path, free, free_unwind)
     }
@@ -908,7 +908,7 @@ impl<'c, 'f, 'db> Elaborator<'_, 'c, 'f, 'db> {
     /// as one array, from the back.
     fn open_drop_for_array(
         &mut self,
-        place: StoredPlace,
+        place: &StoredPlace,
         path: PathId,
         len: u64,
         succ: BasicBlockId,
@@ -946,14 +946,14 @@ impl<'c, 'f, 'db> Elaborator<'_, 'c, 'f, 'db> {
                 .map(|part| match *part {
                     Part::Run(start, end) => (
                         Self::project(
-                            &place,
+                            place,
                             ProjectionElem::Subslice { from: start, to: len - end },
                         ),
                         None,
                     ),
                     Part::Element(at, element) => (
                         Self::project(
-                            &place,
+                            place,
                             ProjectionElem::ConstantIndex {
                                 offset: at,
                                 min_length: at + 1,

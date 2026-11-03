@@ -32,7 +32,7 @@ fn check(
     let db = fx.into_db();
     blaze_query::db::attach(&db, || {
         let def = pick(&db);
-        let (_, map) = Body::with_source_map(&db, def);
+        let map = Body::source_map(&db, def);
         let at = |span: MirSpan| {
             let source = match span {
                 MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => map.expr_syntax(expr),

@@ -266,7 +266,7 @@ impl AttrItem {
     pub fn meta_item_list(&self) -> Option<ThinVec<MetaItemInner>> {
         match &self.args {
             AttrArgs::Delimited(args) if args.delim == Delimiter::Parenthesis => {
-                MetaItemKind::list_from_tokens(args.tokens.clone())
+                MetaItemKind::list_from_tokens(&args.tokens)
             }
             AttrArgs::Delimited(_) | AttrArgs::Eq { .. } | AttrArgs::Empty => None,
         }
@@ -499,7 +499,7 @@ impl MetaItem {
 
 impl MetaItemKind {
     // public because it can be called in the hir
-    pub fn list_from_tokens(tokens: TokenStream) -> Option<ThinVec<MetaItemInner>> {
+    pub fn list_from_tokens(tokens: &TokenStream) -> Option<ThinVec<MetaItemInner>> {
         let mut iter = tokens.iter();
         let mut result = ThinVec::new();
         while iter.peek().is_some() {
@@ -534,7 +534,6 @@ impl MetaItemKind {
     fn from_tokens(iter: &mut TokenStreamIter<'_>) -> Option<MetaItemKind> {
         match iter.peek() {
             Some(TokenTree::Delimited(.., Delimiter::Parenthesis, inner_tokens)) => {
-                let inner_tokens = inner_tokens.clone();
                 iter.next();
                 MetaItemKind::list_from_tokens(inner_tokens).map(MetaItemKind::List)
             }
@@ -559,7 +558,7 @@ impl MetaItemKind {
                 dspan: _,
                 delim: Delimiter::Parenthesis,
                 tokens,
-            }) => MetaItemKind::list_from_tokens(tokens.clone()).map(MetaItemKind::List),
+            }) => MetaItemKind::list_from_tokens(tokens).map(MetaItemKind::List),
             AttrArgs::Delimited(..) => None,
             AttrArgs::Eq { expr, .. } => match expr.kind {
                 ExprKind::Lit(token_lit) => {

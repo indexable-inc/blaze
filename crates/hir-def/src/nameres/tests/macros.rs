@@ -22,7 +22,7 @@ mod nested;
 //- /nested.rs
 structs!(Bar, Baz);
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Foo : type
             - nested : type
@@ -54,7 +54,7 @@ struct X;
 //- /m/n3.rs
 struct Y;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - m : type
             - n1 : type
@@ -98,7 +98,7 @@ macro_rules! structs {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type
             - Foo : type
@@ -137,7 +137,7 @@ macro_rules! define {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - bar : type
             - baz : type
@@ -176,7 +176,7 @@ macro_rules! structs {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type
             - Foo : type
@@ -215,7 +215,7 @@ macro_rules! inner {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type
             - Foo : type
@@ -257,7 +257,7 @@ macro_rules! bar {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Foo : type
             - bar : macro! (import)
@@ -304,7 +304,7 @@ mod priv_mod {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type value
             - Foo : type value
@@ -368,7 +368,7 @@ macro_rules! baz2 { () => { struct OkBaz2; } }
 #[macro_export]
 macro_rules! baz3 { () => { struct OkBaz3; } }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - OkBar1 : type value
             - OkBar2 : type value
@@ -405,7 +405,7 @@ macro_rules! structs_outside {
     ($i:ident) => { struct $i; }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Foo : type value
         "#]],
@@ -427,7 +427,7 @@ mod prelude {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - prelude : type
 
@@ -449,7 +449,7 @@ macro_rules! m {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - S : type value
             - (legacy) m : macro!
@@ -530,7 +530,7 @@ macro_rules! baz {
 
 
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - NotFoundBefore : type value
             - Ok : type value
@@ -601,7 +601,7 @@ use foo as bar;
 use self::foo as baz;
 fn baz() {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - bar : type (import) macro! (import)
             - baz : type (import) value macro! (import)
@@ -632,7 +632,7 @@ mod m {
     }
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Alias : type value
             - Direct : type value
@@ -670,7 +670,7 @@ mod m {
     pub use self::bar as not_found;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - OkAliasCrate : type value
             - OkAliasPlain : type value
@@ -736,7 +736,7 @@ macro_rules! not_current2 {
 pub struct Bar;
 pub struct Baz;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Bar : type (import) value (import)
             - Baz : type (import) value (import)
@@ -780,7 +780,7 @@ macro_rules! foo {
 
 pub struct bar;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - bar : type (import) value (import)
         "#]],
@@ -845,7 +845,7 @@ pub macro Clone {}
 
 pub trait Clone {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Clone : type (glob) macro# (glob)
         "#]],
@@ -893,7 +893,7 @@ fn unresolved_attributes_fall_back_track_per_file_moditems() {
         #[unresolved]
         struct Bar;
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Foo : type value
             - submod : type
@@ -915,7 +915,7 @@ extern "C" {
     fn f();
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - f : value
         "#]],
@@ -934,7 +934,7 @@ extern {
     m!();
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - S : value
             - (legacy) m : macro!
@@ -961,7 +961,7 @@ struct S;
 #[proc_macro_derive(Derive, attributes(helper))]
 fn derive() {}
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - S : type value
             - derive : macro#
@@ -984,7 +984,7 @@ enum E {
     B,
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - E : type
         "#]],
@@ -999,7 +999,7 @@ fn unresolved_attr_with_cfg_attr_hang() {
 #[cfg_attr(not(off), unresolved, unresolved)]
 struct S;
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - S : type value
         "#]],
@@ -1027,7 +1027,7 @@ macro_rules! b {
 
 b! { static = #[] ();}
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - (legacy) a : macro!
             - (legacy) b : macro!
@@ -1075,7 +1075,7 @@ item! {
 
 indirect_macro!();
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - S : type
             - (legacy) indirect_macro : macro!
@@ -1111,7 +1111,7 @@ pub fn derive_macro_2(_item: TokenStream) -> TokenStream {
     TokenStream
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - AnotherTrait : macro#
             - DummyTrait : macro#
@@ -1157,7 +1157,7 @@ macro_rules! mbe {
     () => {};
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - DummyTrait : macro# (glob)
             - attribute_macro : macro# (glob)
@@ -1202,7 +1202,7 @@ pub macro structs($($i:ident),*) {
 }
 structs!(Foo);
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Foo : type
             - structs : macro!
@@ -1226,7 +1226,7 @@ pub mod prelude {
     }
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - S : type value
         "#]],
@@ -1244,7 +1244,7 @@ macro_rules! m {
 }
 m!(
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - (legacy) m : macro!
         "#]],
@@ -1278,7 +1278,7 @@ struct A;
 //- /inc_b.rs
 struct B;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - A : type value
             - B : type value
@@ -1314,7 +1314,7 @@ m!();
 //- /inc.rs
 struct A;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - A : type value
             - inner : macro!
@@ -1346,7 +1346,7 @@ include!(n!());
 //- /inc.rs
 struct A;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - A : type value
             - inner : macro!
@@ -1385,7 +1385,7 @@ pub mod ip_address {
 }
 
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - company_name : type
 
@@ -1422,7 +1422,7 @@ pub struct FromOut;
 //- /bindings/x86_64.rs
 pub struct JSValue;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - After : type value
             - FromOut : type value
@@ -1458,7 +1458,7 @@ export_token_macro! {[await]}
 //- /op.rs
 Token![+];
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Token : macro!
             - op : type
@@ -1504,7 +1504,7 @@ pub mod ip_address {
 }
 
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - company_name : type
 
@@ -1558,7 +1558,7 @@ pub mod network;
 pub struct Url {}
 
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - nested : type
             - (legacy) include : macro!
@@ -1675,7 +1675,7 @@ pub mod prelude {
     }
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Ok : type value
             - bar : macro!
@@ -1708,7 +1708,7 @@ macro_rules! mk_foo {
     }
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - a : type
             - lib : type (extern)
@@ -1765,7 +1765,7 @@ pub mod prelude {
     }
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - Ok : type value
             - bar : macro# (import)
@@ -1788,7 +1788,7 @@ macro_rules! foo {
 
 use foo;
 "#,
-        expect![[r#"
+        &expect![[r#"
     crate
     - foo : macro!# (import)
     - (legacy) foo : macro!#
@@ -1809,7 +1809,7 @@ macro foo {
 
 use foo;
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - foo : macro!#
         "#]],
@@ -1829,7 +1829,7 @@ macro_rules! my_attr {
 enum MyEnum {}
 
 "#,
-        expect![[r#"
+        &expect![[r#"
     crate
     - attr_fn : value
     - (legacy) my_attr : macro#
@@ -1850,7 +1850,7 @@ macro my_attr {
 enum MyEnum {}
 
 "#,
-        expect![[r#"
+        &expect![[r#"
     crate
     - attr_fn : value
     - my_attr : macro#
@@ -1872,7 +1872,7 @@ macro_rules! MyDerive {
 enum MyEnum {}
 
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - MyEnum : type
             - derived_fn : value
@@ -1895,7 +1895,7 @@ macro MyDerive {
 enum MyEnum {}
 
 "#,
-        expect![[r#"
+        &expect![[r#"
             crate
             - MyDerive : macro#
             - MyEnum : type
@@ -1980,4 +1980,52 @@ extern "C" {}
     let def_map = crate_def_map(&db, krate);
     let scope = def_map.module(&db, def_map.root).scope(&db);
     assert!(scope.entries().any(|(name, _)| name.as_str() == "Big"));
+}
+
+/// rustc's `resolve_path` for `include!` (#1638): a file outside every source root is read
+/// from disk, by an absolute path as by a relative one, its items are the crate's, an
+/// `include!` in it resolves from its own directory, and an edit read again
+/// (`Db::reload_included_file`) moves them.
+#[test]
+fn include_of_a_file_outside_every_source_root_is_read_from_disk() {
+    let dir = std::env::temp_dir().join(format!("blaze-include-outside-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("the temporary directory");
+    let code = dir.join("code.rs");
+    std::fs::write(&code, "pub fn far() {}\npub mod inner { include!(\"nested.rs\"); }\n").expect("code.rs");
+    std::fs::write(dir.join("nested.rs"), "pub struct Nested;\n").expect("nested.rs");
+    let path = code.to_str().expect("a UTF-8 temporary path");
+    let text = format!(
+        r#"
+//- minicore: include
+//- /lib.rs
+include!({path:?});
+"#
+    );
+    let mut db = fixture::db(&text).into_db();
+    let krate = db.fetch_test_crate();
+    expect![[r#"
+        crate
+        - far : value
+        - inner : type
+
+        crate::inner
+        - Nested : type value
+    "#]]
+    .assert_eq(&crate_def_map(&db, krate).dump(&db));
+    // Each file it parsed is named by its path outside, as the code generator names it.
+    let at = base_db::AbsPathBuf::assert_utf8(code.clone());
+    for named in [at.clone(), base_db::AbsPathBuf::assert_utf8(dir.join("nested.rs"))] {
+        let file = db.files().included_source_file(&named).expect("a file `include!` parsed");
+        assert_eq!(db.files().included_source_path(file), Some(named.as_path()));
+    }
+
+    std::fs::write(&code, "pub fn moved() {}\n").expect("code.rs");
+    assert!(db.reload_included_file(&at), "the file changed on disk");
+    let dump = crate_def_map(&db, krate).dump(&db);
+    std::fs::remove_dir_all(&dir).expect("the temporary directory");
+    expect![[r#"
+        crate
+        - moved : value
+    "#]]
+    .assert_eq(&dump);
 }

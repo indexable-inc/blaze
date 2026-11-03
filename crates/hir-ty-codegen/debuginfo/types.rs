@@ -48,7 +48,8 @@ use hir_ty::{
     },
     traits::StoredParamEnvAndCrate,
 };
-use hir_ty_mir::mir::{normalize_or_keep, type_name::rustc_debug_name};
+use hir_ty_mir::mir::normalize_or_keep;
+use hir_ty_print::rustc_debug_name;
 
 /// A type of the program, and how many more pointers are followed from it.
 pub(crate) type Key = (StoredTy, u32);
@@ -487,7 +488,7 @@ impl<'db> Types<'db> {
                         // alloc: the pointer's name, a `String` of `DebugType`'s
                         let name = format!("*const {}", self.name(to)?);
                         let whole = DebugType::Pointer { name, to: self.followed(to, pointers) };
-                        self.unnamed(whole)
+                        self.unnamed(&whole)
                     }
                     false => self.ty(Ty::new_imm_ptr(self.interner, first), pointers)?,
                 };
@@ -515,11 +516,11 @@ impl<'db> Types<'db> {
                 };
                 let len = (HEADER + slots) as u64;
                 let table = DebugType::Array { of: self.ty(usize, pointers)?, len };
-                let table = self.unnamed(table);
+                let table = self.unnamed(&table);
                 // alloc: the pointer's name, a `String` of `DebugType`'s
                 let name = format!("&[usize; {len}]");
                 let table = DebugType::Pointer { name, to: Some(table) };
-                (["pointer", "vtable"], self.unnamed(value), self.unnamed(table))
+                (["pointer", "vtable"], self.unnamed(&value), self.unnamed(&table))
             }
             _ => return Some(DebugType::Struct(of)),
         };
@@ -538,8 +539,8 @@ impl<'db> Types<'db> {
     }
 
     /// A type that is part of the one being told of and is no type of the program's.
-    fn unnamed(&mut self, ty: DebugType) -> TypeIndex {
-        let own = self.owned(&ty);
+    fn unnamed(&mut self, ty: &DebugType) -> TypeIndex {
+        let own = self.owned(ty);
         // alloc: kept in the `Own` of the type it is part of; a wide pointer's halves only
         self.part(Made::Inline(Box::new(own)))
     }

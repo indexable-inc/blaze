@@ -1,7 +1,8 @@
-diff -ruN a/src/lib.rs b/src/lib.rs
+diff --git a/src/lib.rs b/src/lib.rs
+index 8a437c4..bf6f62d 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -426,7 +426,7 @@
+@@ -426,7 +426,7 @@ fn customizable_type_visitable_derive(
          s.add_where_predicate(wc);
      }
  
@@ -10,7 +11,7 @@ diff -ruN a/src/lib.rs b/src/lib.rs
          quote!(::rustc_type_ir::GenericTypeVisitable<__V>),
          quote! {
              fn generic_visit_with(
-@@ -436,7 +436,13 @@
+@@ -436,7 +436,13 @@ fn customizable_type_visitable_derive(
                  match *self { #body_visit }
              }
          },

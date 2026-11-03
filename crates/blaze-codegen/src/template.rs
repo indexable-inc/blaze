@@ -225,7 +225,7 @@ impl TemplateView<'_> {
             return Err(TemplateError::Refs { made: self.refs, given: refs_len(refs) });
         }
         frame::task(Tag::Codegen, |frame| {
-            let data = instantiate_data(self.data, refs, self.externs, None, frame)?;
+            let data = instantiate_data(self.data, refs, self.externs, &key.0, frame)?;
             Ok(CompiledFunction {
                 key,
                 arch: self.arch,
@@ -320,8 +320,6 @@ pub enum TemplateError {
     ProfileCounters,
     /// Data or a static names a function's own code ([`Ref::Own`]), which only its code can.
     Own,
-    /// A function's data object (its index) is writable, which only a static's can be.
-    Writable(u32),
 }
 
 impl std::fmt::Display for TemplateError {
@@ -362,9 +360,6 @@ impl std::fmt::Display for TemplateError {
             ),
             TemplateError::Own => {
                 write!(f, "data or a static names a function's own code, which only that code can")
-            }
-            TemplateError::Writable(at) => {
-                write!(f, "a function's data object {at} is writable, which only a static's own data can be")
             }
         }
     }
@@ -490,12 +485,13 @@ fn template_data(
 }
 
 /// The data of a template with `refs` in its places, each with its content ID; a writable
-/// object's is the static `owner`'s ([`Data::owned`]), which a function's data has none of.
+/// object's is `owner`'s ([`Data::owned`]): the static's item key, or the function's instance
+/// key, so each instance of one template writes to objects of its own.
 fn instantiate_data<E: AsRef<str>>(
     data: &[DataView<'_>],
     refs: &Refs,
     externs: &[E],
-    owner: Option<&ContentId>,
+    owner: &ContentId,
     frame: &Frame,
 ) -> Result<Vec<Data>, TemplateError> {
     let mut made: Vec<Data> = Vec::with_capacity(data.len());
@@ -503,10 +499,9 @@ fn instantiate_data<E: AsRef<str>>(
         let relocs = instantiate_relocs(it.relocs, refs, externs, &made, Some(at as u32), None, frame)?;
         // alloc: the instance's data, kept by the build
         let bytes = it.bytes.to_vec();
-        made.push(match (it.writable, owner) {
-            (false, _) => Data::new(it.align, bytes, relocs),
-            (true, Some(owner)) => Data::owned(owner, at as u32, it.align, bytes, relocs),
-            (true, None) => return Err(TemplateError::Writable(at as u32)),
+        made.push(match it.writable {
+            false => Data::new(it.align, bytes, relocs),
+            true => Data::owned(owner, at as u32, it.align, bytes, relocs),
         });
     }
     Ok(made)
@@ -784,7 +779,7 @@ impl StaticTemplate {
         }
         let (data, init) = frame::task(Tag::Codegen, |frame| {
             let views = frame.alloc_slice_fill_with(self.data.len(), |at| self.data[at].view());
-            let data = instantiate_data(views, refs, NO_EXTERNS, Some(&item.0), frame)?;
+            let data = instantiate_data(views, refs, NO_EXTERNS, &item.0, frame)?;
             let init = match &self.init {
                 TemplateInit::Bytes { bytes, relocs } => Init::Bytes {
                     // clone: a static's value, kept by the build
@@ -1322,7 +1317,7 @@ mod tests {
     }
 
     /// A static's writable object is its own after a template, its ID its static's; another
-    /// static of the same template has another, and a function's data cannot be writable.
+    /// static of the same template has another.
     #[test]
     fn a_static_keeps_its_writable_data_its_own() {
         let item = ItemKey(ContentId([3; 32]));
@@ -1358,10 +1353,38 @@ mod tests {
             }]
             .into(),
         });
+    }
 
-        let (function, refs) = reserve(key(1), key(2), item);
-        let mut function = Template::of(&function, &refs, &[]).unwrap();
-        function.data[0].writable = true;
-        assert_eq!(function.instantiate(key(1), &refs).unwrap_err(), TemplateError::Writable(0));
+    /// A function's writable object (a promoted temporary its code writes each call) is its
+    /// instance's after a template, as a static's is its static's: the instance it was made
+    /// for gets the function back, and another instance of the template another object, so
+    /// two instances never write to one.
+    #[test]
+    fn a_function_keeps_its_writable_data_its_instances() {
+        let made = |own: InstanceKey| {
+            let slot = Data::owned(&own.0, 0, 8, vec![0; 16], Relocs::new());
+            CompiledFunction {
+                key: own,
+                arch: Arch::X86_64,
+                align: 16,
+                code: vec![0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3],
+                relocs: vec![Relocation { at: 3, kind: RelocKind::PcRel32, target: Target::Data(slot.id), addend: -4 }]
+                    .into(),
+                data: vec![slot],
+                inlined: Vec::new(),
+                side: None,
+                unwind: None,
+                lines: Vec::new(),
+                coverage: None,
+                profile: None,
+            }
+        };
+        let function = made(key(1));
+        let template = Template::of(&function, &[], &[]).unwrap();
+        assert!(template.data[0].writable);
+        assert_eq!(template.instantiate(key(1), &[]).unwrap(), function);
+        let other = template.instantiate(key(2), &[]).unwrap();
+        assert_eq!(other, made(key(2)));
+        assert_ne!(other.data[0].id, function.data[0].id, "two instances' writable objects are two");
     }
 }

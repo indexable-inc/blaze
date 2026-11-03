@@ -1,7 +1,8 @@
-diff -ruN a/src/solve/scratch.rs b/src/solve/scratch.rs
+diff --git a/src/solve/scratch.rs b/src/solve/scratch.rs
+index f021dc6..f383eeb 100644
 --- a/src/solve/scratch.rs
 +++ b/src/solve/scratch.rs
-@@ -39,10 +39,16 @@
+@@ -39,10 +39,16 @@ macro_rules! pool {
              self.$field.pop().unwrap_or_default()
          }
  
@@ -19,13 +20,10 @@ diff -ruN a/src/solve/scratch.rs b/src/solve/scratch.rs
                  self.$field.push(buffer);
              }
          }
-@@ -149,6 +155,28 @@
-                 buffer.extend(0..64);
-                 pool.give(buffer);
-             }
-+        });
-+    }
-+
+@@ -152,6 +158,28 @@ mod tests {
+         });
+     }
+ 
 +    /// Two buffers of different sizes, taken in either order once warm, never grow: each given
 +    /// back is raised to the larger.
 +    #[test]
@@ -45,6 +43,9 @@ diff -ruN a/src/solve/scratch.rs b/src/solve/scratch.rs
 +            second.extend(0..100);
 +            pool.give(second);
 +            pool.give(first);
-         });
-     }
- 
++        });
++    }
++
+     #[test]
+     fn held_counts_slots_and_room() {
+         let pool = vec![Vec::<u64>::with_capacity(10), Vec::with_capacity(6)];

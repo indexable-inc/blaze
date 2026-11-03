@@ -1,6 +1,6 @@
 //! What several lints ask of the code, as clippy's `clippy_utils` answers it.
 
-use hir::PathResolution;
+use hir::{AsAssocItem as _, PathResolution};
 use syntax::{NodeOrToken, SyntaxKind, TextRange, TextSize, view as ast};
 
 use ast::{AstNode, HasArgList as _, HasName as _};
@@ -278,4 +278,36 @@ pub(crate) fn indentation(text: &str, range: TextRange) -> &str {
     let line = &text[line_start..];
     let end = line.find(|it: char| !it.is_whitespace() || it == '\n').unwrap_or(line.len());
     &line[..end]
+}
+
+/// Where a function, constant or type alias is, as clippy's `check_fn`, `check_item`,
+/// `check_impl_item` and `check_trait_item` tell them apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Owner {
+    /// A free item, of a module or a block.
+    Item,
+    /// An item of an inherent impl.
+    Inherent,
+    /// An item of a trait, provided or required.
+    Trait,
+    /// An item of a trait's impl, whose signature the trait decides.
+    TraitImpl,
+}
+
+/// Where the function, constant or type alias `node` is, read from what it is defined as, not
+/// from its syntax: a body is linted in its own anchor's tree, where a method or an associated
+/// constant can be the root, with no `impl` or `trait` above it to read. `None` when `node` is
+/// none of these the front end knows of.
+pub(crate) fn owner<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> Option<Owner> {
+    let db = cx.db();
+    let def = cx.def(node)?;
+    if !matches!(def, hir::ModuleDef::Function(_) | hir::ModuleDef::Const(_) | hir::ModuleDef::TypeAlias(_)) {
+        return None;
+    }
+    Some(match def.as_assoc_item(db).map(|it| it.container(db)) {
+        None => Owner::Item,
+        Some(hir::AssocItemContainer::Trait(_)) => Owner::Trait,
+        Some(hir::AssocItemContainer::Impl(imp)) if imp.trait_(db).is_some() => Owner::TraitImpl,
+        Some(hir::AssocItemContainer::Impl(_)) => Owner::Inherent,
+    })
 }

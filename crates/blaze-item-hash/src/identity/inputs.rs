@@ -15,8 +15,9 @@ use super::item::{Part, item_part, variant_part};
 const CRATE_INPUTS_DOMAIN: &str = "blaze v2 item identity crate inputs 1";
 const LANG_ITEMS_DOMAIN: &str = "blaze v2 item identity lang items 1";
 
-/// The build of the front end that computes identities: the toolchain and blaze's own code.
-/// The driver tells it ([`set_build`]); with none told, every identity is `Err`.
+/// The build of the front end that computes identities: the content identity of the front
+/// end's code and of how it was built (`blaze_codegen_code::FRONT_END`), as the goal store is
+/// keyed. The driver tells it ([`set_build`]); with none told, every identity is `Err`.
 #[blaze_query::input(singleton, debug)]
 pub struct FrontEnd {
     #[returns(copy)]

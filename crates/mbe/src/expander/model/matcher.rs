@@ -369,7 +369,7 @@ struct MatchState<'t> {
 #[inline]
 fn match_loop_inner<'t>(
     db: &Db,
-    src: TtIter<'t>,
+    src: &TtIter<'t>,
     stack: &[TtIter<'t>],
     res: &mut Match<'t>,
     bindings_builder: &mut BindingsBuilder<'t>,
@@ -665,7 +665,7 @@ fn match_loop<'t>(
 
         match_loop_inner(
             db,
-            src.clone(),
+            &src,
             &stack,
             &mut res,
             &mut bindings_builder,

@@ -200,7 +200,6 @@ pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
         Class::Patch => (Segment::Text, 1, ""),
         Class::Stubs => (Segment::Text, 2, ""),
         Class::Plt => (Segment::Text, 3, ""),
-        Class::Veneers => (Segment::Text, 4, ""),
         Class::Named { name, exec: true, .. } => (Segment::Text, 5, name),
         Class::Rodata => (Segment::Rdata, 0, ""),
         // The loader applies base relocations to read-only pages too: link.exe's `.rdata`

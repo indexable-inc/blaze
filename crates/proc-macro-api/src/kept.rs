@@ -664,8 +664,9 @@ pub fn read(bytes: &[u8], spans: &Spans) -> Result<tt::TopSubtree, String> {
 /// refused what it kept): what is said of it.
 static SERVER_FAILED: OnceLock<String> = OnceLock::new();
 
-fn system(said: String) {
-    if SERVER_FAILED.set(said.clone()).is_ok() { // clone: error path, said once and kept
+fn system(said: &str) {
+    // alloc: error path, said once and kept
+    if SERVER_FAILED.get().is_none() && SERVER_FAILED.set(said.to_owned()).is_ok() {
         eprintln!("proc macros: {said}");
     }
 }

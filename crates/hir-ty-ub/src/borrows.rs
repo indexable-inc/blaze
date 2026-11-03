@@ -318,7 +318,7 @@ impl Borrows {
         &mut self,
         alloc: AllocId,
         parent: Prov,
-        new: NewPermission,
+        new: &NewPermission,
         range: Span,
         site: SiteId,
     ) -> Result<Option<BorTag>, AliasError> {

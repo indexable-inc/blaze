@@ -141,19 +141,23 @@ pub(crate) fn outlived_as<'db>(db: &'db Db, ty: Ty<'db>) -> Ty<'db> {
     ty.fold_with(&mut Fold { db, depth: 0 })
 }
 
+/// A region of a function body, which only the borrow checker reasons about: inference
+/// writes its region variables back as error regions, and anything that is not a
+/// parameter's, a binder's or `'static` is one.
+fn is_body(region: Region<'_>) -> bool {
+    !matches!(
+        region.kind(),
+        RegionKind::ReEarlyParam(_)
+            | RegionKind::ReLateParam(_)
+            | RegionKind::ReBound(..)
+            | RegionKind::ReStatic
+    )
+}
+
 /// `ty` without the regions of a function body, which only the borrow checker reasons
 /// about: a type with such a region of its own, as `&'r T`, is left out, what it needs
 /// following from the borrow checker's `'r`, and any other such region is erased.
 pub(crate) fn without_body_regions<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
-    fn is_body(region: Region<'_>) -> bool {
-        !matches!(
-            region.kind(),
-            RegionKind::ReEarlyParam(_)
-                | RegionKind::ReLateParam(_)
-                | RegionKind::ReBound(..)
-                | RegionKind::ReStatic
-        )
-    }
     struct Fold<'db>(DbInterner<'db>);
     impl<'db> TypeFolder<DbInterner<'db>> for Fold<'db> {
         fn cx(&self) -> DbInterner<'db> {
@@ -451,6 +455,9 @@ pub(crate) struct Wfcx<'f, 'db> {
     frame: &'f Frame,
     db: &'db Db,
     def: hir_def::GenericDefId,
+    /// The environment, when it is not `def`'s own (`trait_environment`): that of an item with
+    /// no `GenericDefId`, as an impl's item for a trait method's `impl Trait`.
+    env: Option<ParamEnv<'db>>,
     interner: DbInterner<'db>,
     /// Built by the first normalization or proof: an item whose types have no alias and no
     /// trait predicate to prove never needs one.
@@ -461,7 +468,21 @@ impl<'f, 'db> Wfcx<'f, 'db> {
     pub(crate) fn new(frame: &'f Frame, db: &'db Db, def: hir_def::GenericDefId) -> Self {
         use hir_def::HasModule as _;
         let interner = DbInterner::new_with(db, def.module(db).krate(db)).with_regions();
-        Wfcx { frame, db, def, interner, solver: std::cell::OnceCell::new() }
+        Wfcx { frame, db, def, env: None, interner, solver: std::cell::OnceCell::new() }
+    }
+
+    /// A context in the environment `env`, in the crate of `def`.
+    pub(crate) fn with_env(
+        frame: &'f Frame,
+        db: &'db Db,
+        def: hir_def::GenericDefId,
+        env: ParamEnv<'db>,
+    ) -> Self {
+        Wfcx { env: Some(env), ..Wfcx::new(frame, db, def) }
+    }
+
+    pub(crate) fn interner(&self) -> DbInterner<'db> {
+        self.interner
     }
 
     fn infcx(&self) -> &InferCtxt<'db> {
@@ -476,7 +497,7 @@ impl<'f, 'db> Wfcx<'f, 'db> {
         use hir_ty::next_solver::{TypingMode, infer::DbInternerInferExt as _};
         self.solver.get_or_init(|| {
             let infcx = self.interner.infer_ctxt().build(TypingMode::non_body_analysis());
-            (infcx, self.db.trait_environment(self.def))
+            (infcx, self.env.unwrap_or_else(|| self.db.trait_environment(self.def)))
         })
     }
 
@@ -624,6 +645,39 @@ fn prove_needs<'db, A: Allocator>(
         }
     }
     wfcx.needs_since((obligations_before, constraints_before), out);
+}
+
+/// Proves each of `predicates` with the trait solver, given the where clauses of the item
+/// `wfcx` checks, each in a fulfillment context of its own, as rustc proves an item's bounds
+/// (`check_type_bounds`): the index of each that fails or stays ambiguous, or, when all hold,
+/// none, and what their proofs need of what outlives what goes to `out`.
+pub(crate) fn prove_each<'db, 'f, A: Allocator>(
+    wfcx: &Wfcx<'f, 'db>,
+    predicates: &[hir_ty::next_solver::Predicate<'db>],
+    out: &mut Vec<Needs<'db>, A>,
+) -> FVec<'f, usize> {
+    use hir_ty::next_solver::{
+        infer::traits::{Obligation, ObligationCause},
+        obligation_ctxt::ObligationCtxt,
+    };
+    let mut failed = Vec::new_in(wfcx.frame);
+    if predicates.is_empty() {
+        return failed;
+    }
+    let (interner, infcx, env) = (wfcx.interner, wfcx.infcx(), wfcx.env());
+    let mark = wfcx.mark();
+    for (index, &predicate) in predicates.iter().enumerate() {
+        let mut ocx = ObligationCtxt::new(infcx);
+        let cause = ObligationCause::dummy();
+        ocx.register_obligation(Obligation::new(interner, cause, env, predicate));
+        if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
+            failed.push(index);
+        }
+    }
+    if failed.is_empty() {
+        wfcx.needs_since(mark, out);
+    }
+    failed
 }
 
 /// [`prove_needs`] as it was: every predicate proven in a fulfillment context of its own.
@@ -1006,6 +1060,131 @@ impl<'f, 'db> Known<'f, 'db> {
             }),
             GenericArgKind::Const(_) => true,
         })
+    }
+
+    /// `ty` with each `impl Trait` in it replaced by what must outlive `region` for it to,
+    /// as rustc's `alias_ty_must_outlive` of an opaque type: nothing when an outlives bound it
+    /// declares is known to outlive `region`; otherwise each argument it captures (its
+    /// variances leave out the others, `use<..>`), a lifetime as `&'r ()`, so a lifetime that
+    /// fails is the type's own (E0477) and a type parameter that fails is named (E0309,
+    /// E0310). `impl Get` of `fn mks<'a>(&self, x: &'a u8)` captures `'a` and the lifetime of
+    /// `&self`, so it outlives `'static` only if they do.
+    pub(crate) fn opaques_as_captures(
+        &self,
+        db: &'db Db,
+        ty: Ty<'db>,
+        region: Region<'db>,
+    ) -> Ty<'db> {
+        self.opaques_as_captures_with(db, ty, region, false)
+    }
+
+    /// [`Self::opaques_as_captures`] of `ty`, the type a returned `impl Trait` hides, where
+    /// an `impl Trait` in it whose outlives bound is a region of the body counts as
+    /// outliving `region`: rustc's `alias_ty_must_outlive` relates a unique declared bound
+    /// alone (`'?b: 'r`) and never its captured types, and that edge is the borrow checker's
+    /// (`hidden_aliases_outlive`), as the body region is. `inner_t(x, t)` of `-> impl Plain +
+    /// 'a`, `inner_t<'b, U>` returning `impl Plain + 'b`, needs nothing of `T` here. A bound
+    /// that is itself an error region, a `+ '_` lowering could not name, still proves nothing.
+    pub(crate) fn hidden_opaques_as_captures(
+        &self,
+        db: &'db Db,
+        ty: Ty<'db>,
+        region: Region<'db>,
+    ) -> Ty<'db> {
+        self.opaques_as_captures_with(db, ty, region, true)
+    }
+
+    fn opaques_as_captures_with(
+        &self,
+        db: &'db Db,
+        ty: Ty<'db>,
+        region: Region<'db>,
+        body_bounds_outlive: bool,
+    ) -> Ty<'db> {
+        struct Fold<'k, 'f, 'db> {
+            known: &'k Known<'f, 'db>,
+            interner: DbInterner<'db>,
+            region: Region<'db>,
+            body_bounds_outlive: bool,
+            depth: usize,
+        }
+        impl<'db> TypeFolder<DbInterner<'db>> for Fold<'_, '_, 'db> {
+            fn cx(&self) -> DbInterner<'db> {
+                self.interner
+            }
+            fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+                use rustc_type_ir::Interner as _;
+                let TyKind::Alias(_, alias) = ty.kind() else { return ty.super_fold_with(self) };
+                let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind else {
+                    return ty.super_fold_with(self);
+                };
+                if self.depth > 16 {
+                    return ty;
+                }
+                let interner = self.interner;
+                // The bounds as declared, beside the same bounds instantiated, in one order.
+                let instantiated = interner
+                    .item_bounds(def_id.into())
+                    .iter_instantiated(interner, alias.args.as_slice());
+                let declared = interner
+                    .item_bounds(def_id.into())
+                    .skip_binder()
+                    .into_iter()
+                    .zip(instantiated)
+                    .any(|(as_declared, clause)| {
+                        let ClauseKind::TypeOutlives(OutlivesClause(bounded, bound)) =
+                            clause.kind().skip_binder()
+                        else {
+                            return false;
+                        };
+                        // A `+ '_` lowering could not name proves nothing.
+                        let unnamed = match as_declared.kind().skip_binder() {
+                            ClauseKind::TypeOutlives(OutlivesClause(_, it)) => it.is_error(),
+                            _ => true,
+                        };
+                        // The opaque type itself, rigid or not.
+                        let own = matches!(bounded.kind(), TyKind::Alias(_, it)
+                            if it.kind == alias.kind && it.args == alias.args)
+                            && !bound.has_escaping_bound_vars()
+                            && !unnamed;
+                        own && ((self.body_bounds_outlive && is_body(bound))
+                            || (!bound.is_error()
+                                && self.known.region_outlives(bound, self.region)))
+                    });
+                if declared {
+                    return Ty::new_unit(interner);
+                }
+                let variances = interner.variances_of(def_id.into());
+                let captured = |at: usize| {
+                    let variance = variances.as_slice().get(at);
+                    variance.is_none_or(|it| *it != rustc_type_ir::Variance::Bivariant)
+                };
+                self.depth += 1;
+                let mut parts = SmallVec::<[Ty<'db>; 8]>::new();
+                for (at, arg) in alias.args.iter().enumerate() {
+                    if !captured(at) {
+                        continue;
+                    }
+                    match arg.kind() {
+                        GenericArgKind::Type(it) => parts.push(it.fold_with(self)),
+                        GenericArgKind::Lifetime(it) => parts.push(Ty::new_ref(
+                            interner,
+                            it,
+                            Ty::new_unit(interner),
+                            rustc_type_ir::Mutability::Not,
+                        )),
+                        GenericArgKind::Const(_) => (),
+                    }
+                }
+                self.depth -= 1;
+                Ty::new_tup(interner, &parts)
+            }
+        }
+        if !ty.has_opaque_types() {
+            return ty;
+        }
+        let interner = DbInterner::new_no_crate(db);
+        ty.fold_with(&mut Fold { known: self, interner, region, body_bounds_outlive, depth: 0 })
     }
 
     /// The type parameters in `ty` not known to outlive `region`. Associated types count as

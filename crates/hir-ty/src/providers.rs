@@ -90,29 +90,6 @@ fn one<T: inventory::Collect>(by: &str) -> &'static T {
     first
 }
 
-/// How many of the lowered bodies the query engine keeps the value of once a view is over; 0 keeps
-/// every one.
-pub fn set_mir_capacity(db: &mut Db, capacity: usize) {
-    mir_body_query::set_lru_capacity(db, capacity);
-    mir_body_for_closure_query::set_lru_capacity(db, capacity);
-    mir_body_for_coroutine_query::set_lru_capacity(db, capacity);
-    mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
-}
-
-/// How many of the runtime bodies (and their monomorphized copies) the query engine keeps the
-/// value of once a view is over; 0 keeps every one. A body let go is lowered again when it is next asked
-/// for, and what depends on it cannot be backdated then.
-pub fn set_runtime_mir_capacity(db: &mut Db, capacity: usize) {
-    runtime_mir_body_query::set_lru_capacity(db, capacity);
-    runtime_mir_body_for_closure_query::set_lru_capacity(db, capacity);
-    runtime_mir_body_for_coroutine_query::set_lru_capacity(db, capacity);
-    runtime_mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
-    monomorphized_runtime_mir_body_query::set_lru_capacity(db, capacity);
-    monomorphized_runtime_mir_body_for_closure_query::set_lru_capacity(db, capacity);
-    monomorphized_runtime_mir_body_for_coroutine_query::set_lru_capacity(db, capacity);
-    monomorphized_runtime_mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
-}
-
 /// `owner`'s body at `stage`, from the memo of the query that keeps it.
 pub fn mir_at<'db>(db: &'db Db, owner: MirOwner<'db>, stage: MirStage) -> Kept<'db> {
     use MirOwner as O;

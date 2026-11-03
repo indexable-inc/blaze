@@ -340,7 +340,7 @@ impl ProbeFiles {
         }
     }
 
-    fn fail(&self, path: &Path, error: std::io::Error) {
+    fn fail(&self, path: &Path, error: &std::io::Error) {
         let mut failed = self.failed.lock();
         failed.get_or_insert_with(|| format!("reading {}: {error}", path.display()));
     }
@@ -362,7 +362,7 @@ impl ProbeFiles {
             Ok(meta) => meta,
             Err(error) if gone(&error) => return None,
             Err(error) => {
-                self.fail(&at, error);
+                self.fail(&at, &error);
                 return None;
             }
         };
@@ -370,7 +370,7 @@ impl ProbeFiles {
             match std::fs::read_link(&at) {
                 Ok(to) => (Mode::Symlink, to.to_string_lossy().into_owned().into_bytes()),
                 Err(error) => {
-                    self.fail(&at, error);
+                    self.fail(&at, &error);
                     return None;
                 }
             }
@@ -378,7 +378,7 @@ impl ProbeFiles {
             match std::fs::read(&at) {
                 Ok(bytes) => (if executable(&meta) { Mode::Executable } else { Mode::Regular }, bytes),
                 Err(error) => {
-                    self.fail(&at, error);
+                    self.fail(&at, &error);
                     return None;
                 }
             }
@@ -395,7 +395,7 @@ impl ProbeFiles {
             Ok(entries) => entries,
             Err(error) if gone(&error) => return None,
             Err(error) => {
-                self.fail(&at, error);
+                self.fail(&at, &error);
                 return None;
             }
         };
@@ -404,7 +404,7 @@ impl ProbeFiles {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    self.fail(&at, error);
+                    self.fail(&at, &error);
                     return None;
                 }
             };
@@ -412,7 +412,7 @@ impl ProbeFiles {
                 Ok(name) => name,
                 Err(_) => {
                     let error = std::io::Error::new(std::io::ErrorKind::InvalidData, "a name that is not UTF-8");
-                    self.fail(&entry.path(), error);
+                    self.fail(&entry.path(), &error);
                     return None;
                 }
             };
@@ -422,7 +422,7 @@ impl ProbeFiles {
             let dir = match std::fs::metadata(entry.path()) {
                 Ok(meta) => meta.is_dir(),
                 Err(error) => {
-                    self.fail(&entry.path(), error);
+                    self.fail(&entry.path(), &error);
                     return None;
                 }
             };

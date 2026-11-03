@@ -41,6 +41,27 @@ fn main() {}
     assert_eq!(undeclared.len(), 1, "only `outside`'s `'de` is undeclared: {messages:?}");
 }
 
+#[test]
+fn a_closures_binder_lifetime_named_by_an_item_inside_it_is_from_an_outer_item() {
+    // Our own, after rustc nightly-2026-10-25: a closure's `for<'a>` is a rib around the
+    // closure, so `inner`'s `'a` is E0401 "can't use generic parameters from outer item", with
+    // the label "lifetime parameter from outer item" at the binder's `'a`, not E0261.
+    let fixture = r#"//- minicore: sized
+//- /main.rs crate:other:main edition:2021
+#![feature(closure_lifetime_binder)]
+fn main() {
+    let _c = for<'a> |x: &'a u8| -> &'a u8 {
+        fn inner(_: &'a u8) {}
+        x
+    };
+}
+"#;
+    let messages = crate::tests::checked(fixture).messages();
+    let outer: Vec<&String> = messages.iter().filter(|it| it.starts_with("E0401")).collect();
+    assert_eq!(outer.len(), 1, "`inner`'s `'a` is the closure's: {messages:?}");
+    assert!(!messages.iter().any(|it| it.starts_with("E0261")), "{messages:?}");
+}
+
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`), as
 /// compiletest runs a test of `mode`.
 fn ui_core(mode: Mode, name: &str, flags: &str, source: &str) -> String {
@@ -412,4 +433,39 @@ error: aborting due to 1 previous error
 
 "#;
     assert_eq!(ui("enum-variant-priority-lint-ambiguous_associated_items.rs", "2015", source), stderr);
+}
+
+#[test]
+fn a_lifetime_a_macro_writes_is_declared_only_by_a_binder_it_writes() {
+    // Our own: lifetimes have macros 2.0 hygiene (rustc's `resolve_lifetime` looks up
+    // `ident.normalize_to_macros_2_0()`), so an opaque `macro`'s `'a` and the `'a` its caller
+    // hands in are two names. rustc 2026-10-26 gives E0261 at `theirs!`'s `$a` (the call's `'a`,
+    // line 6) and at `ours!`'s own `'a` (line 9), and none for `both!`. Its labels ("missing in
+    // item created through this procedural macro") are not checked.
+    let source = r#"#![feature(decl_macro)]
+
+macro theirs($a:lifetime) {
+    fn f<'a>(_: &$a ()) {} //~ ERROR use of undeclared lifetime name `'a`
+}
+theirs!('a);
+
+macro ours($a:lifetime) {
+    fn g<$a>(_: &'a ()) {} //~ ERROR use of undeclared lifetime name `'a`
+}
+ours!('a);
+
+macro both($a:lifetime) {
+    fn h<$a, 'a>(_: &$a (), _: &'a ()) {}
+}
+both!('a);
+
+fn main() {}
+"#;
+    let fixture = format!("//- minicore: sized\n//- /lifetime-hygiene.rs crate:other:main edition:2021\n{source}");
+    let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
+    let stderr = normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }));
+    let errors: Vec<&str> = stderr.lines().filter(|it| it.starts_with("error[")).collect();
+    assert_eq!(errors, ["error[E0261]: use of undeclared lifetime name `'a`"; 2], "{stderr}");
+    assert!(stderr.contains("--> $DIR/lifetime-hygiene.rs:6:9"), "{stderr}");
+    assert!(stderr.contains("--> $DIR/lifetime-hygiene.rs:9:18"), "{stderr}");
 }

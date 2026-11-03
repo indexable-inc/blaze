@@ -129,15 +129,16 @@ master of 2026-11-02 (the pinned nightly's line; `harness/toolchain`).
    checks each example, since a phase can't write the database) and, for `run`, starts
    `doctests/<id>` in its own process and judges its exit. No example is merged with another.
 
-A unit blaze can't build fails alone: under `--keep-going` every other unit builds and its
-tests run, and the run fails, naming the unit; without it the run stops, naming the unit.
+A unit blaze can't build fails alone: by default every other unit builds and its tests run,
+and the run fails, naming the unit and the tests it held back; under `--fail-fast` the run
+stops, naming the unit.
 
 ## What is built (2026-11-02)
 
 - The up-front refusal is gone: `CompileMode::of` plans `Mode::Doctest`
   (`crates/blaze-units/src/load/plan/hash.rs`), with a program's outputs
   (`load/plan/outputs.rs`), no package lints and the target's runner (`load/plan.rs`).
-- `blaze test` and `blaze bench` take `--keep-going` (cargo refuses it there): the tests of
+- `blaze test` and `blaze bench` keep going by default (`--fail-fast` opts out): the tests of
   every unit that built run past a failed unit, then the run exits 101
   (`crates/blaze-cargo/src/cli/args.rs`, `cli.rs`).
 - `crates/blaze-doc/src/doctest.rs`: every rule in the table above, with unit tests of each

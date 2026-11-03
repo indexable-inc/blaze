@@ -10,36 +10,10 @@
 
 use syntax::view::{self as ast, AstNode as _, HasAttrs as _, HasName as _};
 
+use super::utils::{Owner, owner};
 use crate::{check::Cx, diag::Applicability};
 
 const LINT: super::Implemented = super::Implemented::LargeTypesPassedByValue;
-
-/// Where a function is, as clippy's `check_fn` and `check_trait_item` tell them apart.
-#[derive(PartialEq, Eq)]
-pub(super) enum Owner {
-    /// A free function, of a module or a block.
-    Item,
-    /// A method of an inherent impl.
-    Inherent,
-    /// A method of a trait, provided or required.
-    Trait,
-    /// A method of a trait's impl, whose signature the trait decides.
-    TraitImpl,
-}
-
-pub(super) fn owner(function: ast::Fn<'_>) -> Owner {
-    let Some(list) = function.syntax().parent().and_then(ast::AssocItemList::cast) else {
-        return Owner::Item;
-    };
-    match list.syntax().parent() {
-        Some(parent) if ast::Trait::can_cast(parent.kind()) => Owner::Trait,
-        Some(parent) => match ast::Impl::cast(parent) {
-            Some(imp) if imp.trait_().is_some() => Owner::TraitImpl,
-            _ => Owner::Inherent,
-        },
-        None => Owner::Item,
-    }
-}
 
 /// The ABI check of clippy's `check_fn` for a free function: an `extern` ABI other than
 /// `"Rust"` (`extern fn` is `"C"`).
@@ -97,7 +71,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if !cx.is_written(node) || cx.range(node).is_none() {
         return;
     }
-    let owner = owner(function);
+    let Some(owner) = owner(cx, node) else { return };
     match owner {
         Owner::TraitImpl => return,
         Owner::Item if skipped_item_fn(function) => return,

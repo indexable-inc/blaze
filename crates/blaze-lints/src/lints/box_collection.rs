@@ -15,7 +15,11 @@
 use hir::PathResolution;
 use syntax::view::{self as ast, AstNode as _, HasGenericArgs as _, HasTypeBounds as _};
 
-use super::{Implemented, rc_buffer, vec_box};
+use super::{
+    Implemented, rc_buffer,
+    utils::{Owner, owner},
+    vec_box,
+};
 use crate::check::Cx;
 
 const LINT: Implemented = Implemented::BoxCollection;
@@ -189,25 +193,9 @@ fn signature_types<'t>(
     node: ast::Node<'t>,
     types: &mut Vec<ast::Type<'t>>,
 ) -> Option<Context> {
-    let in_trait = |node: ast::Node<'t>| {
-        node.parent()
-            .and_then(ast::AssocItemList::cast)
-            .and_then(|it| it.syntax().parent())
-            .is_some_and(|it| ast::Trait::can_cast(it.kind()))
-    };
-    let in_trait_impl = |node: ast::Node<'t>| {
-        node.parent()
-            .and_then(ast::AssocItemList::cast)
-            .and_then(|it| it.syntax().parent())
-            .and_then(ast::Impl::cast)
-            .is_some_and(|it| it.trait_().is_some())
-    };
-    let in_impl = |node: ast::Node<'t>| {
-        node.parent()
-            .and_then(ast::AssocItemList::cast)
-            .and_then(|it| it.syntax().parent())
-            .is_some_and(|it| ast::Impl::can_cast(it.kind()))
-    };
+    // What the item is in, read from its definition: a body's tree can have the item at its
+    // root, with no `impl` or `trait` above it.
+    let owner = || owner(cx, node);
     let foreign = |node: ast::Node<'t>| {
         node.parent().is_some_and(|it| ast::ExternItemList::can_cast(it.kind()))
     };
@@ -219,7 +207,7 @@ fn signature_types<'t>(
             return None;
         }
         // A method of a trait's impl is checked by nothing: its signature is the trait's.
-        let is_in_trait_impl = in_trait_impl(node);
+        let is_in_trait_impl = owner()? == Owner::TraitImpl;
         let params = function.param_list()?;
         if let Some(it) = params.self_param().and_then(|it| it.ty()) {
             types.push(it);
@@ -237,10 +225,11 @@ fn signature_types<'t>(
         types.extend(field.ty());
     } else if let Some(konst) = ast::Const::cast(node) {
         types.extend(konst.ty());
-        if in_impl(node) {
+        let owner = owner()?;
+        if matches!(owner, Owner::Inherent | Owner::TraitImpl) {
             // `check_impl_item`: the context has no `is_exported`.
             return (!types.is_empty())
-                .then(|| Context { is_in_trait_impl: in_trait_impl(node), ..Context::default() });
+                .then(|| Context { is_in_trait_impl: owner == Owner::TraitImpl, ..Context::default() });
         }
     } else if let Some(statik) = ast::Static::cast(node) {
         if foreign(node) {
@@ -249,7 +238,7 @@ fn signature_types<'t>(
         types.extend(statik.ty());
     } else if let Some(alias) = ast::TypeAlias::cast(node) {
         // Only a trait's associated type with a default is checked.
-        if !in_trait(node) {
+        if owner()? != Owner::Trait {
             return None;
         }
         types.extend(alias.ty());

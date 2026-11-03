@@ -64,7 +64,7 @@ use hir_def::{
     lang_item::LangItems,
     layout::Integer,
     resolver::{HasResolver, ResolveValueResult, Resolver, TypeNs, ValueNs},
-    signatures::{EnumSignature, FunctionSignature},
+    signatures::{EnumSignature, EnumVariants, FunctionSignature},
     type_ref::{LifetimeRefId, TypeRefId},
     unstable_features::UnstableFeatures,
 };
@@ -392,6 +392,10 @@ pub enum InferenceDiagnostic {
         expr: ExprId,
         #[type_visitable(ignore)]
         field: FieldId,
+        /// For an `offset_of!`'s field, its position among the fields the call names (`None`
+        /// for a field access `expr.field`): which written name the error points at.
+        #[type_visitable(ignore)]
+        at: Option<u32>,
     },
     PrivateAssocItem {
         #[type_visitable(ignore)]
@@ -974,7 +978,7 @@ pub enum ReturnKind {
     BecomeExpr,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum ExplicitDropMethodUseKind {
     MethodCall(ExprId),
     Path(ExprOrPatIdPacked),
@@ -1363,6 +1367,81 @@ pub struct InferenceResult<'db> {
     pub(crate) defined_anon_consts: Box<[AnonConstId<'db>]>,
 }
 
+impl InferenceResult<'_> {
+    /// The heap bytes dropping the result frees, not its own size: every column's buffers by
+    /// their length, the boxed lists of unstable candidates, and each closure's captures and
+    /// fake reads. Interned and shared values (types, generic arguments, predicates, symbols)
+    /// count as their pointer only, since dropping the result does not free them, and what a
+    /// diagnostic, a named type or a captured place owns is left out. It reads lengths only,
+    /// never hashing or walking interned data.
+    pub fn heap_bytes(&self) -> usize {
+        let Self {
+            method_resolutions,
+            field_resolutions,
+            variant_resolutions,
+            value_resolutions,
+            qualifier_resolutions,
+            unstable_candidates,
+            assoc_resolutions,
+            tuple_field_access_types,
+            type_of_expr,
+            type_of_pat,
+            type_of_binding,
+            type_of_type_placeholder,
+            type_of_opaque,
+            has_errors: _,
+            diagnostics,
+            unreachable,
+            traits_in_scope_used,
+            coroutine_stalled_predicates,
+            named_pat_types,
+            nodes_with_type_mismatches,
+            error_ty: _,
+            expr_adjustments,
+            assignment_coercions,
+            pat_adjustments,
+            binding_modes,
+            skipped_ref_pats,
+            coercion_casts,
+            closures_without_expectation,
+            asm_sym_tys,
+            comptime_loops,
+            closures_data,
+            defined_anon_consts,
+        } = self;
+        method_resolutions.heap_bytes(|_| 0)
+            + field_resolutions.heap_bytes()
+            + variant_resolutions.heap_bytes(|_| 0)
+            + value_resolutions.heap_bytes(|_| 0)
+            + qualifier_resolutions.heap_bytes(|_| 0)
+            + unstable_candidates.heap_bytes(|candidates| size_of_val(&**candidates))
+            + assoc_resolutions.heap_bytes(|_| 0)
+            + size_of_val(&**tuple_field_access_types)
+            + type_of_expr.heap_bytes()
+            + type_of_pat.heap_bytes()
+            + type_of_binding.heap_bytes()
+            + type_of_type_placeholder.heap_bytes()
+            + type_of_opaque.heap_bytes(|_| 0)
+            + size_of_val(&**diagnostics)
+            + size_of_val(&**unreachable)
+            + size_of_val(&**traits_in_scope_used)
+            + size_of_val(&**coroutine_stalled_predicates)
+            + size_of_val(&**named_pat_types)
+            + nodes_with_type_mismatches.heap_bytes()
+            + expr_adjustments.heap_bytes()
+            + assignment_coercions.heap_bytes()
+            + pat_adjustments.heap_bytes()
+            + binding_modes.heap_bytes()
+            + skipped_ref_pats.heap_bytes()
+            + coercion_casts.heap_bytes()
+            + closures_without_expectation.heap_bytes()
+            + asm_sym_tys.heap_bytes(|_| 0)
+            + comptime_loops.heap_bytes(|_| 0)
+            + closures_data.heap_bytes(ClosureData::heap_bytes)
+            + size_of_val(&**defined_anon_consts)
+    }
+}
+
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(size_of::<Adjust>() <= 4);
@@ -1719,6 +1798,15 @@ pub struct ClosureData {
     pub kind_origin: Option<(ExprOrPatIdPacked, Place)>,
 }
 
+impl ClosureData {
+    /// The heap its captures and fake reads hold, with each fake read's source stack.
+    fn heap_bytes(&self) -> usize {
+        self.min_captures.heap_bytes()
+            + size_of_val(&*self.fake_reads)
+            + self.fake_reads.iter().map(|(_, _, stack)| size_of_val(&**stack)).sum::<usize>()
+    }
+}
+
 /// A closure's minimum captures by root variable, in the order each variable was first
 /// captured: every root's captures in one block, and where each root's captures end.
 #[derive(Clone, PartialEq, Eq, Debug, Default, Hash)]
@@ -1728,6 +1816,11 @@ pub struct MinCaptures {
 }
 
 impl MinCaptures {
+    /// The heap its roots and captures hold, not what a captured place owns.
+    fn heap_bytes(&self) -> usize {
+        size_of_val(&*self.roots) + size_of_val(&*self.captures)
+    }
+
     /// `roots` are the root variables in order, each with the end of its captures in
     /// `captures`.
     pub(crate) fn from_parts(
@@ -1995,9 +2088,21 @@ impl PartialOrd for UpvarCapture {
     }
 }
 
+/// What an inference result weighs for the byte budget of [`infer_body_query`] and
+/// [`infer_anon_const_body_query`]: [`InferenceResult::heap_bytes`].
+fn inference_bytes(value: &InferenceResult<'_>) -> usize {
+    value.heap_bytes()
+}
+
 /// The inference of a body. Free functions rather than methods of a tracked impl, so that
 /// [`crate::evict`] can name them to drop their values.
-#[blaze_query::tracked(returns(ref), cycle_result = infer_cycle_result, lru = 0, mem_tag = Infer)]
+#[blaze_query::tracked(
+    returns(ref),
+    cycle_result = infer_cycle_result,
+    lru,
+    weigh = inference_bytes,
+    mem_tag = Infer
+)]
 pub(crate) fn infer_body_query<'db>(
     db: &'db Db,
     def: DefWithBodyId,
@@ -2016,7 +2121,8 @@ pub(crate) fn infer_body_query<'db>(
 #[blaze_query::tracked(
     returns(ref),
     cycle_result = infer_anon_const_cycle_result,
-    lru = 0,
+    lru,
+    weigh = inference_bytes,
     mem_tag = Infer
 )]
 pub(crate) fn infer_anon_const_body_query<'db>(
@@ -3589,8 +3695,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 Some((AdtId::UnionId(id), _)) => id.into(),
                 Some((AdtId::EnumId(id), _)) => {
                     if let Some(segment) = segments.first()
-                        && let enum_data = id.enum_variants(self.db)
-                        && let Some(variant) = enum_data.variant(segment.name)
+                        && let Some(variant) = EnumVariants::variant_written(
+                            self.db,
+                            id,
+                            segment.name,
+                            path.segment_hygiene(written - segments.len()).syntax_context(),
+                        )
                     {
                         let segment = written - segments.len();
                         Self::forbid_type_relative_variant_args(
@@ -3805,8 +3915,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     if let TyKind::Adt(adt_def, _) = ty_resolved.kind()
                         && let AdtId::EnumId(id) = adt_def.def_id()
                     {
-                        let enum_data = id.enum_variants(self.db);
-                        if let Some(variant) = enum_data.variant(current_segment.name) {
+                        let at = path.segments().len() - remaining_segments.len();
+                        let ctxt = path.segment_hygiene(at).syntax_context();
+                        if let Some(variant) =
+                            EnumVariants::variant_written(self.db, id, current_segment.name, ctxt)
+                        {
                             return if remaining_segments.len() == 1 {
                                 let segment = path.segments().len() - 1;
                                 Self::forbid_type_relative_variant_args(
@@ -3892,8 +4005,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 if let Some(segment) = remaining_segments.get(1)
                     && let Some((AdtId::EnumId(id), _)) = ty.as_adt()
                 {
-                    let enum_data = id.enum_variants(self.db);
-                    if let Some(variant) = enum_data.variant(segment.name) {
+                    let ctxt = path.segment_hygiene(remaining_idx + 1).syntax_context();
+                    if let Some(variant) = EnumVariants::variant_written(self.db, id, segment.name, ctxt) {
                         return if remaining_segments.len() == 2 {
                             let segment = remaining_idx + 1;
                             Self::forbid_type_relative_variant_args(
@@ -3963,7 +4076,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 if remaining_segments.len() == 2
                     && let Some(segment) = remaining_segments.get(1)
                     && let Some((AdtId::EnumId(id), _)) = ty.as_adt()
-                    && let Some(variant) = id.enum_variants(self.db).variant(segment.name)
+                    && let Some(variant) = EnumVariants::variant_written(
+                        self.db,
+                        id,
+                        segment.name,
+                        path.segment_hygiene(remaining_idx + 1).syntax_context(),
+                    )
                 {
                     Self::forbid_type_relative_variant_args(
                         &self.diagnostics,
@@ -4144,7 +4262,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let segments = mod_path.segments();
         // this could be an enum variant or associated type
         if let Some((AdtId::EnumId(enum_id), _)) = ty.as_adt()
-            && let Some(variant) = enum_id.enum_variants(self.db).variant(&segments[first])
+            && let Some(variant) =
+                EnumVariants::variant_written(self.db, enum_id, &segments[first], path.segment_hygiene(first).syntax_context())
         {
             if remaining == 1 {
                 Self::forbid_type_relative_variant_args(

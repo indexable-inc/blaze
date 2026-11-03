@@ -1,13 +1,15 @@
-diff -ruN a/src/data_structures/mod.rs b/src/data_structures/mod.rs
+diff --git a/src/data_structures/mod.rs b/src/data_structures/mod.rs
+index 6ffcead..4cb91e0 100644
 --- a/src/data_structures/mod.rs
 +++ b/src/data_structures/mod.rs
-@@ -13,8 +13,13 @@
+@@ -12,9 +12,14 @@ mod impl_ {
+     pub use rustc_data_structures::sso::{SsoHashMap, SsoHashSet};
  }
  
- #[cfg(not(feature = "nightly"))]
++#[cfg(not(feature = "nightly"))]
 +mod sso;
 +
-+#[cfg(not(feature = "nightly"))]
+ #[cfg(not(feature = "nightly"))]
  mod impl_ {
 -    pub use std::collections::{HashMap as SsoHashMap, HashSet as SsoHashSet};
 +    pub use std::collections::HashMap as SsoHashMap;
@@ -16,7 +18,9 @@ diff -ruN a/src/data_structures/mod.rs b/src/data_structures/mod.rs
  }
  
  pub use delayed_map::{DelayedMap, DelayedSet};
-diff -ruN a/src/data_structures/sso.rs b/src/data_structures/sso.rs
+diff --git b/src/data_structures/sso.rs b/src/data_structures/sso.rs
+new file mode 100644
+index 0000000..befdba4
 --- /dev/null
 +++ b/src/data_structures/sso.rs
 @@ -0,0 +1,115 @@
@@ -135,10 +139,11 @@ diff -ruN a/src/data_structures/sso.rs b/src/data_structures/sso.rs
 +        assert!(matches!(set, SsoHashSet::Array(_)));
 +    }
 +}
-diff -ruN a/src/solve/mod.rs b/src/solve/mod.rs
+diff --git a/src/solve/mod.rs b/src/solve/mod.rs
+index 9f4907c..d631997 100644
 --- a/src/solve/mod.rs
 +++ b/src/solve/mod.rs
-@@ -10,7 +10,7 @@
+@@ -10,7 +10,7 @@ use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash, StableH
  use rustc_type_ir_macros::{
      GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
  };
@@ -147,7 +152,7 @@ diff -ruN a/src/solve/mod.rs b/src/solve/mod.rs
  use tracing::debug;
  
  use crate::inherent::*;
-@@ -1044,13 +1044,18 @@
+@@ -1044,13 +1044,18 @@ pub enum GoalStalledOnOpaques<I: Interner> {
      },
  }
  
@@ -170,7 +175,8 @@ diff -ruN a/src/solve/mod.rs b/src/solve/mod.rs
      /// The `MaybeInfo` that will be returned on subsequent evaluations if this
      /// goal remains stalled.
      pub stalled_maybe_info: MaybeInfo,
-diff -ruN a/src/universe.rs b/src/universe.rs
+diff --git a/src/universe.rs b/src/universe.rs
+index 34210a0..d9d1096 100644
 --- a/src/universe.rs
 +++ b/src/universe.rs
 @@ -1,6 +1,6 @@
@@ -181,7 +187,7 @@ diff -ruN a/src/universe.rs b/src/universe.rs
  use crate::inherent::*;
  use crate::visit::TypeVisitableExt;
  use crate::{
-@@ -71,7 +71,7 @@
+@@ -71,7 +71,7 @@ struct MaxUniverse<
  > {
      max_universe: UniverseIndex,
      infcx: &'a Infcx,

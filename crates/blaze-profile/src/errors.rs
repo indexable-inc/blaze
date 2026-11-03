@@ -40,12 +40,15 @@ pub enum Kind {
     Refused,
     /// The daemon panicked.
     DaemonPanic,
+    /// A bug the daemon found in itself and went on past (`stdx::assert::reported`): one row
+    /// a site whose count grew since the last flush, written by the history itself.
+    BlazeBug,
     /// An error none of these is.
     Uncoded,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 10] = [
+    pub const ALL: [Kind; 11] = [
         Kind::DerivePanic,
         Kind::AttrPanic,
         Kind::MacroPanic,
@@ -55,6 +58,7 @@ impl Kind {
         Kind::TemplateRefs,
         Kind::Refused,
         Kind::DaemonPanic,
+        Kind::BlazeBug,
         Kind::Uncoded,
     ];
 
@@ -69,6 +73,7 @@ impl Kind {
             Kind::TemplateRefs => "template-refs",
             Kind::Refused => "refused",
             Kind::DaemonPanic => "daemon-panic",
+            Kind::BlazeBug => "blaze-bug",
             Kind::Uncoded => "uncoded",
         }
     }

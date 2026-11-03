@@ -36,7 +36,7 @@
 //! | `BinaryOp` | e | `[lhs, rhs, op]`, op as [`binary_op_word`] gives it |
 //! | `Assignment` | e | `[target, value]` |
 //! | `Index` | e | `[base, index]` |
-//! | `Closure` | e | `[args start, args len (pat_lists), arg_types start, arg_types len (type_lists), ret_type+1, body, kinds]`, kinds as [`closure_word`] gives them |
+//! | `Closure` | e | `[args start, args len (pat_lists), arg_types start, arg_types len (type_lists), ret_type+1, body, kinds, binder start, binder len]`, kinds as [`closure_word`] gives them, the binder a run of the paths' names |
 //! | `Tuple` | e | `[exprs start, exprs len]` |
 //! | `Array` | e | `[0, elements start, elements len]` or `[1, initializer, repeat]` |
 //! | `Literal` | `literals` t | |
@@ -85,7 +85,7 @@ use blaze_query::db::{AsId, FromId};
 
 use crate::{
     BlockId,
-    expr_store::path::{GenericArgsIdx, PathColumns, PathIdx, slot},
+    expr_store::path::{GenericArgsIdx, Names, PathColumns, PathIdx, slot},
     hir::{
         Array, AsmOperand, BindingId, CaptureBy, ClosureKind, CoroutineKind, CoroutineSource, Expr,
         ExprId, InlineAsm, Item, LabelId, Literal, LoopSource, MatchArm, Movability, OffsetOf,
@@ -385,7 +385,7 @@ impl PatKind {
 
 /// The `extra` words of each expression kind, by kind.
 pub(crate) const EXPR_WORDS: [u8; ExprKind::ALL.len()] = [
-    0, 0, 3, 2, 6, 0, 2, 3, 5, 3, 0, 2, 0, 0, 0, 0, 4, 2, 0, 2, 2, 2, 3, 2, 2, 7, 2, 3, 0, 0, 0, 0,
+    0, 0, 3, 2, 6, 0, 2, 3, 5, 3, 0, 2, 0, 0, 0, 0, 4, 2, 0, 2, 2, 2, 3, 2, 2, 9, 2, 3, 0, 0, 0, 0,
     0, 2, 4, 2,
 ];
 
@@ -397,7 +397,7 @@ const _: () = {
     let mut i = 0;
     while i < ExprKind::ALL.len() {
         assert!(ExprKind::ALL[i] as usize == i);
-        assert!(EXPR_WORDS[i] <= 7);
+        assert!(EXPR_WORDS[i] <= 9);
         i += 1;
     }
     let mut i = 0;
@@ -893,8 +893,8 @@ impl<V: ColumnVec> HirColumns<V> {
                 Expr::Index { base: idx(base), index: idx(index) }
             }
             ExprKind::Closure => {
-                let [args, args_len, types, types_len, ret_type, body, kinds] =
-                    self.node::<7>(d)?;
+                let [args, args_len, types, types_len, ret_type, body, kinds, start, len] =
+                    self.node::<9>(d)?;
                 let (closure_kind, capture_by) = closure(kinds)?;
                 Expr::Closure {
                     args: list(&self.pat_lists, args, args_len, PAT_LIST)?,
@@ -903,6 +903,7 @@ impl<V: ColumnVec> HirColumns<V> {
                     body: idx(body),
                     closure_kind,
                     capture_by,
+                    binder: Names { start, len },
                 }
             }
             ExprKind::Tuple => {
@@ -1520,12 +1521,17 @@ impl HirColumns<Growing> {
             }
             Expr::Assignment { target, value } => self.words(old, [raw(target), raw(value)]),
             Expr::Index { base, index } => self.words(old, [raw(base), raw(index)]),
-            Expr::Closure { args, arg_types, ret_type, body, closure_kind, capture_by } => {
+            Expr::Closure { args, arg_types, ret_type, body, closure_kind, capture_by, binder } => {
                 let (old_args, old_types) = (self.old_list(old, 0), self.old_list(old, 2));
                 let (args, args_len) = put_list(&mut self.pat_lists, args, old_args);
                 let (types, types_len) = put_list(&mut self.type_lists, arg_types, old_types);
                 let kinds = closure_word(closure_kind, capture_by);
-                self.words(old, [args, args_len, types, types_len, opt(ret_type), raw(body), kinds])
+                let (ret_type, body) = (opt(ret_type), raw(body));
+                let (start, len) = (binder.start, binder.len);
+                self.words(
+                    old,
+                    [args, args_len, types, types_len, ret_type, body, kinds, start, len],
+                )
             }
             Expr::Tuple { exprs } => {
                 let old_exprs = self.old_list(old, 0);
@@ -1745,6 +1751,7 @@ impl Bounds {
                 self.expr(body)?;
                 self.label_opt(label)
             }
+            // Its binder's run of names is the encoding's to check (`check_expr_paths`).
             Expr::Closure {
                 args,
                 arg_types,
@@ -1752,6 +1759,7 @@ impl Bounds {
                 body,
                 closure_kind: _,
                 capture_by: _,
+                binder: _,
             } => {
                 self.pats(args)?;
                 arg_types.iter().try_for_each(|&type_ref| self.type_opt(type_ref))?;
@@ -1765,7 +1773,7 @@ impl Bounds {
                 self.expr(initializer)?;
                 self.expr(repeat)
             }
-            Expr::OffsetOf(OffsetOf { container, fields: _ }) => self.type_ref(*container),
+            Expr::OffsetOf(OffsetOf { container, fields: _, hygiene: _ }) => self.type_ref(*container),
             Expr::InlineAsm(asm) => asm.operands.iter().try_for_each(|(_, operand)| match *operand {
                 AsmOperand::In { expr, reg: _ }
                 | AsmOperand::InOut { expr, late: _, reg: _ }
@@ -1825,6 +1833,48 @@ impl Bounds {
 }
 
 impl HirColumns<Frozen> {
+    /// The bytes of its columns ([`Col::heap_bytes`]), not the side tables' entries' own heap.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let HirColumns {
+            expr_kind,
+            expr_data,
+            pat_kind,
+            pat_data,
+            extra,
+            expr_lists,
+            pat_lists,
+            stmt_kind,
+            stmt_data,
+            arms,
+            record_fields,
+            field_pats,
+            type_lists,
+            names,
+            literals,
+            offset_ofs,
+            asms,
+            macro_defs,
+        } = self;
+        expr_kind.heap_bytes()
+            + expr_data.heap_bytes()
+            + pat_kind.heap_bytes()
+            + pat_data.heap_bytes()
+            + extra.heap_bytes()
+            + expr_lists.heap_bytes()
+            + pat_lists.heap_bytes()
+            + stmt_kind.heap_bytes()
+            + stmt_data.heap_bytes()
+            + arms.heap_bytes()
+            + record_fields.heap_bytes()
+            + field_pats.heap_bytes()
+            + type_lists.heap_bytes()
+            + names.heap_bytes()
+            + literals.heap_bytes()
+            + offset_ofs.heap_bytes()
+            + asms.heap_bytes()
+            + macro_defs.heap_bytes()
+    }
+
     /// Every kind in range, every id, list range and side-table index in bounds, and every
     /// path and slot word (an `asm!` `sym` operand's too) naming a row of `paths`, the store's,
     /// whose own rows [`crate::hir::type_ref::TypeColumns::check`] checks first. The encoding
@@ -1882,14 +1932,19 @@ impl HirColumns<Frozen> {
     }
 
     /// The path or slot word of expression `at` in range of `paths`, before the node is
-    /// decoded (which refuses them too, with its own errors). `at` is below the expression
-    /// count; a kind out of range is the decoder's to refuse.
+    /// decoded (which refuses them too, with its own errors), and a closure's binder a run of
+    /// `paths`' names. `at` is below the expression count; a kind out of range is the
+    /// decoder's to refuse.
     fn check_expr_paths(&self, paths: &PathColumns, at: u32) -> Checked {
         let d = self.expr_data[at as usize];
         match ExprKind::ALL.get(self.expr_kind[at as usize] as usize).copied() {
             Some(ExprKind::Path) => paths.check_path_word(d),
             Some(ExprKind::RecordLit) => paths.check_path_word(self.node::<4>(d)?[0]),
             Some(ExprKind::MethodCall) => paths.check_slot_word(self.node::<5>(d)?[4]),
+            Some(ExprKind::Closure) => {
+                let [.., start, len] = self.node::<9>(d)?;
+                paths.check_names(Names { start, len })
+            }
             _ => Ok(()),
         }
     }
@@ -2041,7 +2096,11 @@ mod tests {
             ],
             fields: vec![RecordLitField { name: name("f"), expr: E0 }],
             field_pats: vec![RecordFieldPat { name: name("g"), pat: P0 }],
-            offset_of: OffsetOf { container: idx(0), fields: Box::new([name("h")]) },
+            offset_of: OffsetOf {
+                container: idx(0),
+                fields: Box::new([name("h")]),
+                hygiene: Box::new([]),
+            },
             asm: InlineAsm {
                 operands: Box::new([
                     (None, AsmOperand::In { reg: InlineAsmRegOrRegClass::Reg(Symbol::intern("x0")), expr: E0 }),
@@ -2066,6 +2125,16 @@ mod tests {
 
     fn block_id(bits: u32) -> BlockId {
         BlockId::from_id(blaze_query::db::Id::from_u32(bits))
+    }
+
+    /// A closure's `for<'a, 'b>`: the first two names of the paths [`paths_with_binder`] makes.
+    const BINDER: Names = Names { start: 0, len: 2 };
+
+    /// Paths whose names start with [`BINDER`]'s.
+    fn paths_with_binder() -> PathColumns {
+        let mut paths = PathColumns::default();
+        assert_eq!(paths.push_names([name("'a"), name("'b")]), BINDER);
+        paths
     }
 
     /// Every variant of [`Expr`], with every optional field both set and not, every packed enum
@@ -2160,6 +2229,7 @@ mod tests {
                 body: E0,
                 closure_kind: ClosureKind::Closure,
                 capture_by: CaptureBy::Ref,
+                binder: BINDER,
             },
             Expr::Tuple { exprs: &[E0, E0, E0] },
             Expr::Tuple { exprs: &[] },
@@ -2186,6 +2256,7 @@ mod tests {
             body: E0,
             closure_kind,
             capture_by: CaptureBy::Value,
+            binder: Names::EMPTY,
         }));
         exprs
     }
@@ -2267,7 +2338,7 @@ mod tests {
         let kinds: std::collections::HashSet<_> = pats.iter().map(PatKind::of).collect();
         assert_eq!(kinds.len(), PatKind::ALL.len(), "every pattern kind is tested");
 
-        let mut paths = PathColumns::default();
+        let mut paths = paths_with_binder();
         let columns = columns_of(&mut paths, &exprs, &pats);
         for (at, &expr) in exprs.iter().enumerate() {
             assert_eq!(columns.expr(&paths, e(at as u32)), expr);
@@ -2279,7 +2350,7 @@ mod tests {
         assert_eq!(columns.pats(&paths).map(|(_, pat)| pat).collect::<Vec<_>>(), pats);
         assert_eq!(paths.check(1, 1, 1, |_| Ok(())), Ok(()), "the copied paths are whole");
 
-        let mut again_paths = PathColumns::default();
+        let mut again_paths = paths_with_binder();
         let again = columns_of(&mut again_paths, &exprs, &pats).freeze();
         let frozen = columns.freeze();
         assert_eq!(frozen, again, "the same nodes make the same columns");
@@ -2393,10 +2464,17 @@ mod tests {
             body: E0,
             closure_kind: ClosureKind::Closure,
             capture_by: CaptureBy::Ref,
+            binder: Names::EMPTY,
         };
         let mut columns = columns_of(&mut paths, &[closure], &[]).freeze();
         columns.extra[6] |= 1 << 7;
         assert_eq!(columns.check(0, 0, 0, &paths), Err("a closure kind out of range"));
+
+        // A `for<..>` binder whose run of names is not in the paths' table.
+        let mut columns = columns_of(&mut paths, &[closure], &[]).freeze();
+        columns.extra[7] = 1 << 20;
+        columns.extra[8] = 1;
+        assert_eq!(columns.check(0, 0, 0, &paths), Err("a name run past its table"));
     }
 
     #[test]

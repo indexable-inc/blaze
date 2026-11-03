@@ -582,6 +582,7 @@ fn fake_variadic(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>) {
 }
 
 /// The one type argument of a path type's last segment; `Fn(A, B)`'s inputs as a tuple.
+#[derive(Clone, Copy)]
 enum OneArg<'t> {
     Ty(ast::Type<'t>),
     Inputs(usize),

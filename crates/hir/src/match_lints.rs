@@ -183,7 +183,7 @@ impl DefWithBody {
         if check.lints.is_empty() {
             return Vec::new(); // alloc: empty.
         }
-        let (_, source_map) = Body::with_source_map(db, def);
+        let source_map = Body::source_map(db, def);
         let syntax = Syntax { db, source_map };
         // alloc: once per body with a lint, one entry per lint.
         check.lints.iter().filter_map(|lint| syntax.lint(def, lint)).collect()

@@ -80,7 +80,7 @@ fn infer_associated_method_struct() {
             a.x;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             48..74 '{     ...     }': A
             58..68 'A { x: 0 }': A
             65..66 '0': u32
@@ -110,7 +110,7 @@ fn infer_associated_method_struct_in_local_scope() {
             let _a = A::from(1, 2);
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             14..146 '{     ... 2); }': ()
             125..127 '_a': A
             130..137 'A::from': fn from(i32, i32) -> A
@@ -146,7 +146,7 @@ fn infer_associated_method_enum() {
             c;
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             46..66 '{     ...     }': A
             56..60 'A::B': A
             87..107 '{     ...     }': A
@@ -190,7 +190,7 @@ fn infer_associated_method_with_modules() {
             let z = c::C::thing();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             59..67 '{ A {} }': A
             61..65 'A {}': A
             133..139 '{ 99 }': u32
@@ -229,7 +229,7 @@ fn infer_associated_method_generics() {
             let a = Gen::make(0u32);
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             63..66 'val': T
             81..108 '{     ...     }': Gen<T>
             91..102 'Gen { val }': Gen<T>
@@ -261,7 +261,7 @@ fn infer_associated_method_generics_without_args() {
             let a = Gen::<u32>::make();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             75..99 '{     ...     }': Gen<T>
             85..93 'loop { }': !
             90..93 '{ }': ()
@@ -292,7 +292,7 @@ fn infer_associated_method_generics_2_type_params_without_args() {
             let a = Gen::<u32, u64>::make();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             101..125 '{     ...     }': Gen<u32, T>
             111..119 'loop { }': !
             116..119 '{ }': ()
@@ -486,7 +486,7 @@ fn infer_trait_assoc_method() {
             let s3 = <S as Default>::default();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             86..192 '{     ...t(); }': ()
             96..98 's1': S
             104..120 'Defaul...efault': fn default<S>() -> S
@@ -518,7 +518,7 @@ fn infer_trait_assoc_method_generics_1() {
             let c: f64 = G::make();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             126..210 '{     ...e(); }': ()
             136..137 'a': u32
             140..147 'S::make': fn make<S, u32>() -> u32
@@ -552,7 +552,7 @@ fn infer_trait_assoc_method_generics_2() {
             let e: (u32, i64) = G::make();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             134..312 '{     ...e(); }': ()
             144..145 'a': (u32, i64)
             148..162 'S::make::<i64>': fn make<S, u32, i64>() -> (u32, i64)
@@ -586,7 +586,7 @@ fn infer_trait_assoc_method_generics_3() {
             let a = S::make();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             103..129 '{     ...e(); }': ()
             113..114 'a': (S<i32>, i64)
             117..124 'S::make': fn make<S<i32>, i64>() -> (S<i32>, i64)
@@ -610,7 +610,7 @@ fn infer_trait_assoc_method_generics_4() {
             let b: (_, i32) = S::make();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             133..205 '{     ...e(); }': ()
             143..144 'a': (S<u64>, i64)
             160..167 'S::make': fn make<S<u64>, i64>() -> (S<u64>, i64)
@@ -636,7 +636,7 @@ fn infer_trait_assoc_method_generics_5() {
             let b: (S<u64>, _, _) = Trait::<i64>::make::<u8>();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             109..213 '{     ...>(); }': ()
             119..120 'a': (S<u64>, i64, u8)
             123..152 '<S as ...::<u8>': fn make<S<u64>, i64, u8>() -> (S<u64>, i64, u8)
@@ -659,7 +659,7 @@ fn infer_call_trait_method_on_generic_param_1() {
             t.method();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             63..64 't': T
             69..88 '{     ...d(); }': ()
             75..76 't': T
@@ -679,7 +679,7 @@ fn infer_call_trait_method_on_generic_param_2() {
             t.method();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             70..71 't': T
             76..95 '{     ...d(); }': ()
             82..83 't': T
@@ -704,7 +704,7 @@ fn infer_with_multiple_trait_impls() {
             let z = Into::<u64>::into(S);
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             110..201 '{     ...(S); }': ()
             120..121 'x': u32
             129..130 'S': S
@@ -1037,7 +1037,7 @@ fn super_trait_impl_return_trait_method_resolution() {
             super2.foo();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             90..101 '{ loop {} }': !
             92..99 'loop {}': !
             97..99 '{}': ()
@@ -1150,7 +1150,7 @@ fn dyn_trait_super_trait_not_in_scope() {
             d.foo();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             51..55 'self': &'? Self
             64..69 '{ 0 }': u32
             66..67 '0': u32
@@ -1182,7 +1182,7 @@ fn test() {
     s.foo();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             75..79 'self': &'? S
             89..109 '{     ...     }': bool
             99..103 'true': bool
@@ -1773,7 +1773,7 @@ fn f<S: Sized, T, U: ?Sized>() {
     <[u32]>::foo;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             89..160 '{     ...foo; }': ()
             95..103 'u32::foo': fn foo<u32>() -> u8
             109..115 'S::foo': fn foo<S>() -> u8

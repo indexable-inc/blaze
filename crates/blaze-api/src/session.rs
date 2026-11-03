@@ -63,6 +63,9 @@ pub struct Daemon<'a> {
     pub hot: fn(u32, crate::HotSince) -> Result<crate::Hot, ApiError>,
     /// The profile history's last error, for [`Status::history`].
     pub history: Option<&'a str>,
+    /// The bugs reported so far, for [`Status::bugs`]: the daemon's reading of
+    /// `stdx::assert::reported::sites`, which allocates nothing when there are none.
+    pub bugs: fn() -> Vec<crate::Bug>,
 }
 
 /// The requests under way, the views each connection holds, and the jobs of the build.
@@ -736,6 +739,7 @@ impl Session {
                     history: cx.history.map(str::to_owned),
                     memory_bytes: cx.memory_bytes,
                     budget_bytes: cx.budget_bytes,
+                    bugs: (cx.bugs)(),
                 };
                 answer(out, req, Response::Status(status));
             }

@@ -221,7 +221,7 @@ fn block_at_position<'db>(
     // Find the innermost block expression that has a `DefMap`.
     let (def_with_body, file_id) = fn_def?;
     let def_with_body = def_with_body.into();
-    let source_map = &Body::with_source_map(db, def_with_body).1;
+    let source_map = Body::source_map(db, def_with_body);
     let scopes = ExprScopes::body_expr_scopes(db, def_with_body);
 
     let root = file_id.parse(db).root();

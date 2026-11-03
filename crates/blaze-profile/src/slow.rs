@@ -38,12 +38,13 @@ use crate::time::{
     report,
 };
 
-pub use render::text;
+pub use render::{text, thread_line};
 
 /// The version of the report's JSON: bumped when a field changes meaning or goes away. 2: an
 /// unnamed wait's `hidden_ns` is the wall its waits cover, not their parked time summed, and
-/// waits the record never ends are their own blind spot (`unended_wait`).
-pub const VERSION: u32 = 2;
+/// waits the record never ends are their own blind spot (`unended_wait`). 3: a build whose
+/// daemon died is reported, to that daemon's last row, with `build.died`.
+pub const VERSION: u32 = 3;
 
 /// The build the report is of, as its `builds` row says.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -58,6 +59,44 @@ pub struct BuildFacts {
     pub hits: Option<u64>,
     /// Nodes that ran their task, as the build counted them.
     pub misses: Option<u64>,
+    /// How its daemon died during it: it has no end row, and is reported to that daemon's last.
+    pub died: Option<Died>,
+}
+
+/// The death of a build's daemon ([`BuildFacts::died`]), and what it was running then.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Died {
+    pub process: u32,
+    /// Its last row (a span's end, a switch, a counter, an event), from the build's start: it
+    /// died within one flush ([`crate::history::EVERY`]) of it.
+    pub last_row_ns: i64,
+    /// When the spans in `threads` were read, from the build's start; `None` when no reading
+    /// was written in the build.
+    pub read_ns: Option<i64>,
+    /// The threads that were inside spans at that reading, in the order they were read.
+    pub threads: Vec<DiedThread>,
+}
+
+/// A thread of a daemon that died, and the spans it was inside, outermost first.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct DiedThread {
+    pub thread: u32,
+    pub name: Option<String>,
+    pub spans: Vec<DiedSpan>,
+}
+
+/// A span a thread was inside when its daemon was last read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct DiedSpan {
+    pub name: String,
+    /// The query key or function it is of.
+    pub function: Option<String>,
+    /// What a wait waited for, and the job that ran it.
+    pub awaits: Option<String>,
+    pub owner: Option<u64>,
+    /// How long it had run: by the daemon's last row in `blaze slow`, by the reading in
+    /// [`crate::reading::Reading`].
+    pub for_ns: i64,
 }
 
 /// What the report reads beside the time model.
@@ -75,13 +114,26 @@ pub struct Facts {
     pub recorder: Recorder,
 }
 
-/// What the flight recorder itself dropped over the build's window, from its own counters
-/// (`profile spans lost`, `profile rows skipped`); `None` where the record has none (a blaze
-/// before them).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// What the flight recorder itself dropped or summed over the build's window, from its own
+/// counters (`profile spans lost`, `profile rows skipped`, `profile rows skipped behind`) and the
+/// `folded` table; `None` where the record has none (a blaze before them).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Recorder {
     pub spans_lost: Option<i64>,
+    /// Rows a thread's ring wrote over before the history read them, all told.
     pub rows_skipped: Option<i64>,
+    /// Of `rows_skipped`, those skipped while the history's backlog was full (its writer behind).
+    pub rows_behind: Option<i64>,
+    /// Short spans summed into `folded` rows instead of a row each, and their time.
+    pub folded_spans: Option<i64>,
+    pub folded_ns: Option<i64>,
+}
+
+impl Recorder {
+    /// Rows lost, all told: spans the recorder could not open and rows rings wrote over.
+    pub fn lost(&self) -> i64 {
+        self.spans_lost.unwrap_or(0) + self.rows_skipped.unwrap_or(0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,7 +176,6 @@ pub struct QueryCount {
     pub reran: u64,
     pub evicted_asked: u64,
     pub evicted: u64,
-    pub refused: u64,
     pub dropped: u64,
 }
 
@@ -174,6 +225,8 @@ pub struct Summary {
     /// Findings left out for saving less than [`Summary::cut_ns`].
     pub smaller: u32,
     pub cut_ns: i64,
+    /// What the flight recorder dropped and summed in the build's window.
+    pub recorder: Recorder,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -303,6 +356,8 @@ pub enum BlindKind {
     Misaligned,
     /// The critical path's walk stopped short of the build's start.
     PathCut,
+    /// Rows the flight recorder lost: spans it could not open, rows a ring wrote over.
+    RowsLost,
 }
 
 /// The least saving a finding needs to be listed: 1% of the wall time, and at least this.
@@ -929,8 +984,8 @@ impl<'a> Ctx<'a> {
                     owner: Some("blaze_query".to_owned()),
                     evidence: vec![
                         format!(
-                            "{} runs, {} verified; {} values swept past the cap, {} of them admissions the frequency rule refused, {} dropped",
-                            it.executed, it.verified, it.evicted, it.refused, it.dropped
+                            "{} runs, {} verified; {} values let go under their tag's budget, {} dropped",
+                            it.executed, it.verified, it.evicted, it.dropped
                         ),
                         // clone: a line of evidence, also the next finding's
                         per.clone(),
@@ -1118,15 +1173,39 @@ impl<'a> Ctx<'a> {
                 fix: "give every node that ran its task a misses row with its cause, or define builds.misses as what the table counts".to_owned(),
             });
         }
+        let r = self.facts.recorder;
+        if r.lost() > 0 {
+            let (skipped, behind) = (r.rows_skipped.unwrap_or(0), r.rows_behind.unwrap_or(0));
+            out.push(BlindSpot {
+                kind: BlindKind::RowsLost,
+                hidden_ns: 0,
+                subject: "recorder".to_owned(),
+                title: format!("the recorder lost {} rows in the build's window: every total here is short", r.lost()),
+                evidence: vec![
+                    format!(
+                        "{behind} rows skipped while the history's writer was behind (`profile rows skipped behind`): its backlog of {} rows was full",
+                        crate::history::BACKLOG_ROWS
+                    ),
+                    format!(
+                        "{} rows a thread's ring of {} wrote over between the drain's reads every {:?} (`profile rows skipped`)",
+                        skipped - behind,
+                        crate::flight::CAP,
+                        crate::history::DRAIN
+                    ),
+                    format!("{} spans the recorder had no slot to open (`profile spans lost`)", r.spans_lost.unwrap_or(0)),
+                ],
+                fix: "behind: make the history's flush faster or its backlog larger; wrapped: a bigger `flight::CAP` or a shorter drain; spans: find what held its open slots".to_owned(),
+            });
+        }
         let a = model.anomalies;
-        if a.orphans + a.runs_cut + a.spans_of_no_lane + a.misnested > 0 {
+        if a.orphans + a.runs_cut + a.spans_of_no_lane + a.misnested + a.creators_unread > 0 {
             out.push(BlindSpot {
                 kind: BlindKind::Misaligned,
                 hidden_ns: 0,
                 subject: "rows".to_owned(),
                 title: format!(
-                    "rows that did not line up: {} spans with no parent row, {} past their parent, {} runs cut, {} job spans of no job",
-                    a.orphans, a.misnested, a.runs_cut, a.spans_of_no_lane
+                    "rows that did not line up: {} spans with no parent row, {} past their parent, {} runs cut, {} job spans of no job, {} jobs whose creator span has no row",
+                    a.orphans, a.misnested, a.runs_cut, a.spans_of_no_lane, a.creators_unread
                 ),
                 evidence: Vec::new(),
                 fix: "the recorder's rings wrote over rows before they were flushed: flush sooner or keep more".to_owned(),
@@ -1193,6 +1272,7 @@ impl<'a> Ctx<'a> {
             path_by_phase,
             smaller,
             cut_ns,
+            recorder: self.facts.recorder,
         }
     }
 }

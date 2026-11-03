@@ -564,7 +564,7 @@ fn index_item(items: &mut PortableIds, kind: IdKind, bits: u64) -> R<u32> {
 
 /// The bits of the item `index` names in `items` as a `kind`, `None` when it names another.
 pub(crate) fn item_bits(items: &PortableIds, kind: IdKind, index: u32) -> Option<u64> {
-    fn bits(id: impl AsId) -> u64 {
+    fn bits(id: impl AsId + Copy) -> u64 {
         u64::from(id.as_id().as_u32())
     }
     match kind {
@@ -824,7 +824,7 @@ pub(crate) fn read<'db>(
                 let token = LoweringMode::Analysis
                     .allow_tracked_structs()
                     .expect("analysis lowering may make tracked structs");
-                AnonConstId::new(db, loc, token).as_id().as_u32()
+                AnonConstId::new(db, loc, &token).as_id().as_u32()
             }
             _ => continue,
         };

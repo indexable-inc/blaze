@@ -675,7 +675,7 @@ impl<M: Memory> Switch<M> {
 
     /// [`Switch::take`] of an owned message, as the linker writes it.
     #[cfg(test)]
-    pub(crate) fn handle(&mut self, message: crate::patch::Message) -> (Outcome, Option<Answer>) {
+    pub(crate) fn handle(&mut self, message: &crate::patch::Message) -> (Outcome, Option<Answer>) {
         let bytes = message.encode();
         let view = crate::patch::Message::view(&bytes).expect("an encoded message reads back");
         self.take(&view)

@@ -14,6 +14,8 @@ use base_db::Db;
 use blaze_mem::Frame;
 use hir_def::{
     GenericDefId, ModuleId, TraitId,
+    expr_store::HygieneId,
+    nameres::{for_each_hygienic_trait_in_scope, trait_item_name, written_key},
     resolver::{HasResolver, Resolver},
 };
 use hir_expand::name::Name;
@@ -93,12 +95,19 @@ impl ScopeItems {
         ScopeItems(SCOPE_ITEMS.intern::<ScopeItem>(items))
     }
 
-    /// The items of `traits` (sorted, deduplicated) named `name`.
-    fn of_traits(db: &Db, traits: &[TraitId], name: Name, frame: &Frame) -> ScopeItems {
+    /// The items of `traits` (sorted, deduplicated) named `name`, written with `hygiene`: each
+    /// trait's of its [`trait_item_name`].
+    fn of_traits(
+        db: &Db,
+        traits: &[TraitId],
+        name: Name,
+        hygiene: HygieneId,
+        frame: &Frame,
+    ) -> ScopeItems {
         let mut values = TraitValueItems::new_in(frame);
         let mut items: SmallVec<[ScopeItem; 8]> = SmallVec::new();
         for &trait_ in traits {
-            if let Some(item) = values.get(db, trait_, name) {
+            if let Some(item) = values.get(db, trait_, trait_item_name(db, trait_, name, hygiene)) {
                 // alloc: only past eight traits with an item of one name, on a miss of the query
                 // or for a caller's own set.
                 items.push(ScopeItem { trait_, item });
@@ -162,17 +171,32 @@ impl TraitsInScope {
         TraitsInScope::Scope { module: resolver.module(), impl_trait }
     }
 
-    /// The traits of `name` among these: the extension candidates of a probe for it.
-    pub fn named(self, db: &Db, name: Name, frame: &Frame) -> ScopeItems {
-        match self {
-            TraitsInScope::Scope { module, impl_trait } => {
+    /// The traits of `name`, written with `hygiene`, among these, and their items of it: the
+    /// extension candidates of a probe for it. A name a `macro` writes (its context keeps an
+    /// opaque mark, [`written_key`]) is looked up among the traits of rustc's hygienic walk
+    /// ([`for_each_hygienic_trait_in_scope`]) by each trait's [`trait_item_name`], outside the
+    /// per-module memo, which is of plain names.
+    pub fn named(self, db: &Db, name: Name, hygiene: HygieneId, frame: &Frame) -> ScopeItems {
+        match (self, written_key(db, hygiene)) {
+            (TraitsInScope::Scope { module, impl_trait }, None) => {
                 let items = module_items_named(db, module, name);
                 match impl_trait {
                     Some(trait_) => items.with_trait(db, trait_, name),
                     None => items,
                 }
             }
-            TraitsInScope::Set(set) => ScopeItems::of_traits(db, set.traits(), name, frame),
+            (TraitsInScope::Scope { module, impl_trait }, Some(ctxt)) => {
+                // alloc: in the probe's frame, once per probe of a name a `macro` writes
+                let mut traits: Vec<TraitId, &Frame> = Vec::new_in(frame);
+                traits.extend(impl_trait);
+                for_each_hygienic_trait_in_scope(db, module, ctxt, |it| traits.push(it));
+                traits.sort_unstable();
+                traits.dedup();
+                ScopeItems::of_traits(db, &traits, name, hygiene, frame)
+            }
+            (TraitsInScope::Set(set), _) => {
+                ScopeItems::of_traits(db, set.traits(), name, hygiene, frame)
+            }
         }
     }
 
@@ -204,6 +228,6 @@ pub fn module_trait_set(db: &Db, module: ModuleId) -> TraitSet {
 #[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn module_items_named(db: &Db, module: ModuleId, name: Name) -> ScopeItems {
     blaze_mem::frame::current(|frame| {
-        ScopeItems::of_traits(db, module_trait_set(db, module).traits(), name, frame)
+        ScopeItems::of_traits(db, module_trait_set(db, module).traits(), name, HygieneId::ROOT, frame)
     })
 }

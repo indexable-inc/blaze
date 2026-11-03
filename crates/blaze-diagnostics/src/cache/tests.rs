@@ -27,6 +27,25 @@ fn inputs(flags: &[String]) -> Inputs<'_> {
     Inputs { lint_flags: flags, keep_duplicates: false, borrowck: Mode::Polonius }
 }
 
+/// C2 of the fekey review: the options a kept check runs with are made of its key's inputs, in
+/// the front end's code, so no caller can give the check options its key does not say: the lint
+/// flags parsed as cargo runs rustc (`CARGO_CRATE_NAME` set, which `unexpected_cfgs`' help reads),
+/// and `keep_duplicates` as the inputs say it.
+#[test]
+fn a_kept_checks_options_are_made_of_its_keys_inputs() {
+    let given = flags(&["--cap-lints", "allow", "--check-cfg", "cfg(feature, values(\"a\"))"]);
+    let options = inputs(&given).options().unwrap();
+    let mut parsed = CommandLine::parse(&given).unwrap();
+    assert!(!parsed.check_cfg.cargo, "parsing alone says nothing of cargo");
+    parsed.check_cfg.cargo = true;
+    assert_eq!(options.lints, parsed, "the flags, parsed as cargo runs rustc");
+    assert!(!options.keep_duplicates && !options.future_breakage_report);
+    let duplicates = Inputs { keep_duplicates: true, ..inputs(&given) }.options().unwrap();
+    assert!(duplicates.keep_duplicates, "keep_duplicates as the inputs say it");
+    let unknown = flags(&["--check-cfg", "cfg("]);
+    assert!(inputs(&unknown).options().is_err(), "flags the check can't read are an error");
+}
+
 #[test]
 fn the_key_changes_with_each_input() {
     let image = ContentId([1; 32]);

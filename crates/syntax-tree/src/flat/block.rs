@@ -22,7 +22,7 @@
 //! index into it is bounds-checked as a `Box<[T]>`'s is.
 
 use std::{
-    alloc::{self, Allocator as _, Layout},
+    alloc::{Allocator as _, Layout},
     fmt,
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -138,9 +138,17 @@ impl Block {
         }
         let layout =
             Layout::from_size_align(size, ALIGN).expect("a block of under isize::MAX bytes");
+        // A panic, not `handle_alloc_error`, whose default aborts the process: a block blaze-mem
+        // cannot give (its size class's region used up, as in coord-98, or the system out of
+        // memory) fails the job parsing this tree, and the daemon goes on serving the rest
+        // (`panics-fail-one-job`).
         let ptr = match Kept(tag).allocate(layout) {
             Ok(ptr) => ptr.cast::<u8>(),
-            Err(_) => alloc::handle_alloc_error(layout),
+            Err(_) => panic!(
+                "a parsed tree's block of {size} bytes ({tag}): blaze-mem had no block of {} \
+                 bytes to give (its size class's region is used up, or the system refused memory)",
+                Kept::held(layout).unwrap_or(size)
+            ),
         };
         Block { ptr, size, filled: 0, tag, held: None }
     }

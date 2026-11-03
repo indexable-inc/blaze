@@ -16,11 +16,10 @@
 
 use std::{io::Write as _, time::Duration};
 
-use blaze_core::Answer;
+use blaze_core::{Answer, exit::Exit};
 use blaze_usercode::confine;
 
 use super::{Given, end_every_run};
-use crate::sandbox::COULD_NOT;
 
 /// How long a launcher that ends waits for its runs to take their grants back.
 const STOPPING: Duration = Duration::from_secs(4);
@@ -47,7 +46,7 @@ pub fn serve() -> ! {
             Ok(Some(run)) => run,
             // The driver is gone, or done: nobody hears of a run in flight any more.
             Ok(None) => stop(0, None),
-            Err(why) => stop(COULD_NOT, Some(&why)),
+            Err(why) => stop(Exit::CouldNot.code(), Some(&why)),
         };
         // SAFETY: the driver duplicated each handle `handed` names into this process for this
         // run alone (`blaze_core::Handed`), and each frame is read once, so each is adopted once.
@@ -62,7 +61,7 @@ pub fn serve() -> ! {
             });
         if let Err(error) = thread {
             // alloc: the fault, once, and the launcher ends.
-            stop(COULD_NOT, Some(&format!("starting the thread of run {}: {error}", handed.run)));
+            stop(Exit::CouldNot.code(), Some(&format!("starting the thread of run {}: {error}", handed.run)));
         }
     }
 }
@@ -73,7 +72,7 @@ fn answer(answer: Answer) {
     if let Err(error) = out.write_all(&answer.to_bytes()).and_then(|()| out.flush()) {
         drop(out);
         // alloc: the fault, once, and the launcher ends.
-        stop(COULD_NOT, Some(&format!("writing the answer of run {}: {error}", answer.run)));
+        stop(Exit::CouldNot.code(), Some(&format!("writing the answer of run {}: {error}", answer.run)));
     }
 }
 

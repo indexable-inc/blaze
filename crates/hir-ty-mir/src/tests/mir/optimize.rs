@@ -47,7 +47,7 @@ fn check_mir(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
     name: &str,
     level: MirOptLevel,
-    expect: Expect,
+    expect: &Expect,
 ) {
     let _tracing = setup_tracing();
     let fx = fixture::db(ra_fixture);
@@ -286,7 +286,7 @@ fn copies(a: u32) -> u32 {
 "#,
         "copies",
         MirOptLevel::Debug,
-        expect![[r#"
+        &expect![[r#"
             fn copies(_1: u32) -> u32 {
                 debug a => _1;
                 debug b => _1;
@@ -313,7 +313,7 @@ fn folded() -> u32 {
 "#,
         "folded",
         MirOptLevel::Debug,
-        expect![[r#"
+        &expect![[r#"
             fn folded() -> u32 {
                 let mut _0: u32;
 
@@ -337,7 +337,7 @@ fn dead(a: u32) -> u32 {
 "#,
         "dead",
         MirOptLevel::Release,
-        expect![[r#"
+        &expect![[r#"
             fn dead(_1: u32) -> u32 {
                 debug a => _1;
                 let mut _0: u32;

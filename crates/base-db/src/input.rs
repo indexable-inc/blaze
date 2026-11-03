@@ -1729,8 +1729,8 @@ impl CrateGraphBuilder {
         self.arena[krate].cfg_options.insert_atom(flag);
     }
 
-    pub fn insert_cfg(&mut self, krate: CrateBuilderId, cfg: cfg::CfgAtom) {
-        match cfg {
+    pub fn insert_cfg(&mut self, krate: CrateBuilderId, cfg: &cfg::CfgAtom) {
+        match *cfg {
             cfg::CfgAtom::Flag(flag) => self.arena[krate].cfg_options.insert_atom(flag),
             cfg::CfgAtom::KeyValue { key, value } => {
                 self.arena[krate].cfg_options.insert_key_value(key, value)

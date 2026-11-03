@@ -138,6 +138,27 @@ impl<T> Parse<T> {
         self.tree.as_ref().unwrap().root()
     }
 
+    /// The heap this parse holds, in bytes, for a query that keeps parses by their bytes: its
+    /// share of the tree (the tree's arrays and the lazy parts walked so far, over the counts
+    /// of it, so the values sharing a tree count it once between them) and its errors. Not the
+    /// source text the tree indexes, which a file's text holds; a tree built by appending text
+    /// (a macro expansion) owns its text, [`Parse::source_bytes`].
+    pub fn heap_bytes(&self) -> usize {
+        let tree = self.tree.as_ref().map_or(0, |tree| {
+            let flat = tree.flat();
+            flat.heap_size() / std::sync::Arc::strong_count(flat)
+        });
+        let errors = self.errors.as_deref().map_or(0, |errors| {
+            size_of_val(errors) + errors.iter().map(SyntaxError::heap_bytes).sum::<usize>()
+        });
+        tree + errors
+    }
+
+    /// The length of the text the tree indexes, in bytes.
+    pub fn source_bytes(&self) -> usize {
+        self.tree.as_ref().map_or(0, |tree| tree.flat().source().len())
+    }
+
     pub fn downgrade(&self) -> WeakParse<T> {
         WeakParse {
             tree: std::sync::Arc::downgrade(self.tree.as_ref().unwrap().flat()),

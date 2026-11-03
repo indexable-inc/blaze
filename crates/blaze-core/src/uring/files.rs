@@ -477,8 +477,13 @@ impl Uring {
             // sizes the read of the file it replaced. No ring op `fstat`s a descriptor at 6.0.
             if whole {
                 match size_of_file(fd.as_raw_fd()) {
-                    // alloc: the read's result, handed to its asker.
-                    Ok(size) => *self.ops.buf_mut(id) = Vec::with_capacity(size as usize),
+                    Ok(size) => {
+                        // A file's bytes: made in a task of the VFS's tag, which the memory
+                        // line names.
+                        // alloc: the read's result, handed to its asker.
+                        let bytes = blaze_mem::frame::task(blaze_mem::Tag::Vfs, |_| Vec::with_capacity(size as usize));
+                        *self.ops.buf_mut(id) = bytes;
+                    }
                     Err(error) => return Step::Ends(Some(Done::Failed(IoError(error.to_string())))), // alloc: an error.
                 }
             }

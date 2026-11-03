@@ -291,6 +291,10 @@ Now:
 - Each name is interned once as it comes in, as a 4-byte `PathId` into one per-watcher table
   (`paths.rs`: one buffer of text, end offsets, a `HashTable` by `name_hash`). Slots, looks
   in flight, the commit's lists and `ours` hold IDs.
+  (2026-11-03, lane flood2: `name_hash` is gone. The table is placed by SipHash-1-3 under a
+  random key, as is the tree's index of names; the image's index of names by a key that is
+  `blaze_ids::index_key` of its names, kept in the tree header (`vfs tree 2`). Names made to
+  share the old hash made each intern walk all of them.)
 - Text is read only where a name leaves: an effect's `FileName`, an `Op`'s path, a
   `Watched`'s, each marked `// alloc:`.
 - The table clears whenever nothing is in flight, keeping room for 4 096 names. Committed

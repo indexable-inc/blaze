@@ -1,13 +1,18 @@
 //! The checks of an impl's items that hir does not make: an item of a trait impl given twice
 //! (E0201, the resolver's), an item of an inherent impl given twice (E0592), and each item of a
 //! trait impl against the trait's: `self` in one and not the other (E0185, E0186), another
-//! number of type or const parameters (E0049) or of parameters (E0050).
+//! number of type or const parameters (E0049) or of parameters (E0050), then what the front end
+//! finds: a return type with no type where the trait's has an `impl Trait` (E0053 "incompatible
+//! return type"), a type for one that captures a lifetime the trait's does not, or that can't be
+//! worked out (`hir::Function::impl_trait_in_trait_error`; its unmet bounds, E0277 and E0271,
+//! are the front end's solver errors), and the types of the signatures (E0053,
+//! `hir::Function::impl_signature_mismatch`).
 //!
-//! What needs the front end's trait solving or region resolution is asked of it
-//! (`v2/requests/diagnostics.md`, `diagnostics-items-impls`): parameters of other kinds at the
-//! same places (E0053 of `compare_generic_param_kinds`), argument-position `impl Trait`
-//! against a named parameter (E0643), lifetime parameters early bound in one and late bound in
-//! the other (E0195), and the types of the signatures (E0053). Where the trait is another
+//! What needs the front end's trait solving or region resolution and is not given yet is asked
+//! of it (`v2/requests/diagnostics.md`, `diagnostics-items-impls`): parameters of other kinds at
+//! the same places (E0053 of `compare_generic_param_kinds`), argument-position `impl Trait`
+//! against a named parameter (E0643), and lifetime parameters early bound in one and late bound
+//! in the other (E0195). Where the trait is another
 //! crate's, rustc writes the trait item's signature in a note (`note_trait_signature`), which
 //! needs rustc's printing of a signature (`For the parent` in the report).
 //!
@@ -16,7 +21,8 @@
 //! (`check_for_duplicate_items_in_impl`) and `compiler/rustc_hir_analysis/src/check/
 //! compare_impl_item.rs` (`compare_impl_item`, `check_method_is_structurally_compatible`,
 //! `compare_self_type`, `get_self_string`, `compare_number_of_generics`,
-//! `compare_number_of_method_arguments`) (MIT or Apache-2.0).
+//! `compare_number_of_method_arguments`, `collect_return_position_impl_trait_in_trait_tys`,
+//! `report_trait_method_mismatch`, `extract_spans_for_error_reporting`) (MIT or Apache-2.0).
 
 use blaze_items::{Fact, ItemId};
 use syntax::{
@@ -45,10 +51,12 @@ pub(super) fn check(cx: &Cx<'_, '_>, at: &ImplAt<'_>) -> Vec<Found> {
     let mut pairs: Vec<(hir::AssocItem, hir::AssocItem), _> = Vec::new_in(cx.frame());
     for &item in &items {
         let Some(name) = item.name(db) else { continue };
+        // The trait's item this one implements: rustc's `check_trait_item`, which compares the
+        // names hygienically, so two items a `macro` and its caller write may implement one.
         let Some(trait_item) = trait_items
             .iter()
             .copied()
-            .find(|it| same_kind(*it, item) && it.name(db).as_ref() == Some(&name))
+            .find(|&it| same_kind(it, item) && item.implements(db, trait_, it))
         else {
             continue;
         };
@@ -103,14 +111,16 @@ fn duplicate(
 }
 
 /// `check_for_duplicate_items_in_impl`: E0592 of a second item of an inherent impl named as
-/// one before it.
+/// one before it, by the name each binds ([`hir::AssocItem::binding_name`]: rustc compares
+/// `normalize_to_macros_2_0` idents), so a `macro`'s `fn foo` beside its caller's is no
+/// duplicate.
 fn inherent_duplicates(cx: &Cx<'_, '_>, at: &ImplAt<'_>, items: &[hir::AssocItem]) -> Vec<Found> {
     let db = cx.db;
     let mut seen: Vec<(hir::Name, hir::AssocItem), _> = Vec::new_in(cx.frame());
     // alloc: empty until an error is found, allocates nothing
     let mut found = Vec::new();
     for &item in items {
-        let Some(name) = item.name(db) else { continue };
+        let Some(name) = item.binding_name(db) else { continue };
         if let Some(&(_, former)) = seen.iter().find(|(it, _)| *it == name) {
             let Some(span) = assoc_def_span(cx, item) else { continue };
             let ident = name.as_str();
@@ -154,6 +164,21 @@ fn compare(
     }
     if let (hir::AssocItem::Function(f), hir::AssocItem::Function(tf)) = (item, trait_item) {
         found.extend(number_of_arguments(cx, trait_, f, tf));
+        // `collect_return_position_impl_trait_in_trait_tys`, then
+        // `compare_method_predicate_entailment`: while the impl gives no type for one of the
+        // trait's `impl Trait`s, the signatures are not compared.
+        if found.is_empty() {
+            found.extend(impl_trait_in_trait(cx, f, tf));
+        }
+        if found.is_empty() {
+            found.extend(signature(cx, at, f, tf));
+        }
+    }
+    // `refining_impl_trait`, which rustc checks only once the method compares with no error.
+    if let (true, hir::AssocItem::Function(f), hir::AssocItem::Function(tf)) =
+        (found.is_empty(), item, trait_item)
+    {
+        found.extend(super::refine::check(cx, at, f, tf));
     }
     for it in &mut found {
         if let Some(id) = item_id(trait_item) {
@@ -472,4 +497,243 @@ fn number_of_arguments(cx: &Cx<'_, '_>, trait_: hir::Trait, f: hir::Function, tf
     diag.span_label(impl_span, format!("expected {}, found {impl_count}", parameters(trait_count)));
     // alloc: on the error path, once the items differ
     vec![Found::new(diag, Phase::Items)]
+}
+
+/// The span of `f`'s written return type, or of its signature where it writes none.
+fn return_span(cx: &Cx<'_, '_>, f: hir::Function) -> Option<Span> {
+    let source = cx.vsema.source(f)?;
+    Some(match source.value.ret_type().and_then(|it| it.ty()) {
+        Some(ty) => cx.span(source.with_value(ty.syntax().text_range())),
+        None => cx.span(source.map(signature_range)),
+    })
+}
+
+/// The span of a local trait method's written return type.
+fn trait_return_span(cx: &Cx<'_, '_>, tf: hir::Function) -> Option<Span> {
+    if tf.module(cx.db).krate(cx.db) != cx.krate {
+        return None;
+    }
+    let source = cx.vsema.source(tf)?;
+    let ty = source.value.ret_type()?.ty()?;
+    Some(cx.span(source.with_value(ty.syntax().text_range())))
+}
+
+/// The `index`th `impl Trait` of a local trait method's return type, counted as lowering
+/// counts them (each before the ones in its bounds).
+fn trait_impl_trait_span(cx: &Cx<'_, '_>, tf: hir::Function, index: u32) -> Option<Span> {
+    if tf.module(cx.db).krate(cx.db) != cx.krate {
+        return None;
+    }
+    let source = cx.vsema.source(tf)?;
+    let ty = source.value.ret_type()?.ty()?;
+    let it = ty.syntax().descendants().filter_map(ast::ImplTraitType::cast).nth(index as usize)?;
+    Some(cx.span(source.with_value(it.syntax().text_range())))
+}
+
+/// rustc's errors of `collect_return_position_impl_trait_in_trait_tys` that the comparison
+/// reports: E0053 of a return type with no type where the trait's has an `impl Trait`, a type
+/// that captures a lifetime the trait's `impl Trait` does not, and one that can't be worked
+/// out. Its unmet bounds (E0277, E0271) are the front end's solver errors.
+fn impl_trait_in_trait<'db>(cx: &Cx<'_, 'db>, f: hir::Function, tf: hir::Function) -> Vec<Found> {
+    let db = cx.db;
+    // alloc: empty, allocates nothing
+    let Some(error) = f.impl_trait_in_trait_error(db) else { return Vec::new() };
+    // alloc: empty, allocates nothing
+    let Some(span) = return_span(cx, f) else { return Vec::new() };
+    let name = tf.name(db);
+    let name = name.as_str();
+    let item = |index: u32| {
+        // alloc: on the error path, once the items differ
+        format!("{}::{{anon_assoc#{index}}}", cx.def_path(hir::ModuleDef::Function(tf)))
+    };
+    let diag = match error {
+        hir::ImplTraitInTraitError::Unsatisfied { .. } => return Vec::new(), // alloc: empty
+        hir::ImplTraitInTraitError::ReturnType { expected, found, .. } => {
+            let mut diag = Diag::error(
+                Some("E0053"),
+                // alloc: on the error path, once the items differ
+                format!("method `{name}` has an incompatible return type for trait"),
+                // clone: the error's span
+                span.clone(),
+            );
+            diag.span_label(span, crate::print::sorts(cx, &expected, &found));
+            if let Some(trait_span) = trait_return_span(cx, tf) {
+                diag.span_label(trait_span, "return type in trait");
+            }
+            crate::lower::type_mismatch::note_expected_found(cx, &expected, &found, None, &mut diag);
+            diag
+        }
+        hir::ImplTraitInTraitError::UncapturedLifetime { impl_trait, lifetime, hidden, .. } => {
+            let mut diag =
+                Diag::error(None, "return type captures more lifetimes than trait definition", span.clone());
+            // alloc: on the error path, once the items differ
+            diag.span_label(span, format!("this lifetime `{lifetime}` was captured"));
+            let message = "hidden type must only reference lifetimes captured by this impl trait";
+            match trait_impl_trait_span(cx, tf, impl_trait) {
+                Some(at) => diag.span_note(at, message),
+                // alloc: on the error path, once the items differ
+                None => diag.note(format!("{message} (`{}`)", item(impl_trait))),
+            };
+            // alloc: on the error path, once the items differ
+            diag.note(format!("hidden type inferred to be `{}`", cx.ty(&hidden)));
+            diag
+        }
+        hir::ImplTraitInTraitError::Unsolved { impl_trait, .. } => {
+            let mut diag = Diag::error(
+                Some("E0283"),
+                // alloc: on the error path, once the items differ
+                format!(
+                    "type annotations needed: the type `{name}` returns for `{}` can't be worked out from the bounds it is in",
+                    item(impl_trait),
+                ),
+                // clone: the error's span
+                span.clone(),
+            );
+            diag.span_label(span, "the bounds of the trait's `impl Trait` stay ambiguous with this type");
+            diag
+        }
+    };
+    // alloc: on the error path, once the items differ
+    vec![Found::new(diag, Phase::Items)]
+}
+
+/// The place of the parameter `index` (`self` included) of a function, as rustc's
+/// `extract_spans_for_error_reporting` takes it: its type, or an implicit `self` whole.
+fn input_span(cx: &Cx<'_, '_>, f: hir::Function, index: u32) -> Option<Span> {
+    let source = cx.vsema.source(f)?;
+    let range = *input_ranges(source.value).get(index as usize)?;
+    Some(cx.span(source.with_value(range)))
+}
+
+/// `compare_method_predicate_entailment`'s E0053 (`report_trait_method_mismatch`): the impl
+/// method's signature is not a subtype of the trait's with the impl's arguments, at the first
+/// place they differ, with the trait's type there, both signatures, and a suggestion to write
+/// the trait's type.
+fn signature<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'_>, f: hir::Function, tf: hir::Function) -> Vec<Found> {
+    let db = cx.db;
+    // alloc: empty, allocates nothing
+    let Some(mismatch) = f.impl_signature_mismatch(db) else { return Vec::new() };
+    // alloc: empty, allocates nothing
+    let Some(source) = cx.vsema.source(f) else { return Vec::new() };
+    let local_trait = tf.module(db).krate(db) == cx.krate;
+    let (impl_span, trait_span) = match mismatch.at {
+        hir::SignatureMismatchAt::Param(i) | hir::SignatureMismatchAt::ParamMutability(i) => (
+            input_span(cx, f, i),
+            local_trait.then(|| input_span(cx, tf, i)).flatten(),
+        ),
+        hir::SignatureMismatchAt::Return | hir::SignatureMismatchAt::ReturnMutability => {
+            (return_span(cx, f), trait_return_span(cx, tf))
+        }
+        hir::SignatureMismatchAt::ParamCount | hir::SignatureMismatchAt::Signature => (None, None),
+    };
+    let impl_span = impl_span.unwrap_or_else(|| cx.span(source.map(signature_range)));
+    let name = tf.name(db);
+    let name = name.as_str();
+    let mut diag = Diag::error(
+        Some("E0053"),
+        // alloc: on the error path, once the items differ
+        format!("method `{name}` has an incompatible type for trait"),
+        // clone: the error's span
+        impl_span.clone(),
+    );
+    match (&mismatch.types, mismatch.at) {
+        (_, hir::SignatureMismatchAt::ParamMutability(_) | hir::SignatureMismatchAt::ReturnMutability) => {
+            // clone: the error's span
+            diag.span_label(impl_span.clone(), "types differ in mutability");
+        }
+        (Some((expected, found)), _) => {
+            // clone: the error's span
+            diag.span_label(impl_span.clone(), crate::print::sorts(cx, expected, found));
+        }
+        (None, _) => {}
+    }
+    if let Some(trait_span) = trait_span {
+        diag.span_note(trait_span, "type in trait");
+    }
+    let (expected, found) =
+        (crate::print::fn_sig(cx, &mismatch.expected), crate::print::fn_sig(cx, &mismatch.found));
+    // alloc: on the error path, once the items differ
+    diag.note(format!("expected signature `{expected}`\n   found signature `{found}`"));
+    suggest_trait_type(cx, at, &mut diag, f, tf, &mismatch, impl_span);
+    // alloc: on the error path, once the items differ
+    vec![Found::new(diag, Phase::Items)]
+}
+
+/// `report_trait_method_mismatch`'s suggestions: the trait's `self`, parameter type or return
+/// type in place of the impl's.
+fn suggest_trait_type<'db>(
+    cx: &Cx<'_, 'db>,
+    at: &ImplAt<'_>,
+    diag: &mut Diag,
+    f: hir::Function,
+    tf: hir::Function,
+    mismatch: &hir::ImplSignatureMismatch<'db>,
+    impl_span: Span,
+) {
+    let db = cx.db;
+    let Some(source) = cx.vsema.source(f) else { return };
+    let applicability = crate::model::Applicability::MachineApplicable;
+    match mismatch.at {
+        hir::SignatureMismatchAt::Param(0) | hir::SignatureMismatchAt::ParamMutability(0)
+            if tf.has_self_param(db) && f.has_self_param(db) =>
+        {
+            let impl_self = cx.ty(&at.impl_.self_ty(db));
+            let Some(expected) = mismatch.expected.params(db).into_iter().next() else { return };
+            let sugg = self_receiver(cx, &expected, &impl_self);
+            let Some(param) = source.value.param_list().and_then(|it| it.self_param()) else { return };
+            let span = cx.span(source.with_value(param.syntax().text_range()));
+            diag.suggestion_verbose(span, "change the self-receiver type to match the trait", sugg, applicability);
+        }
+        hir::SignatureMismatchAt::Param(i) | hir::SignatureMismatchAt::ParamMutability(i) => {
+            let Some(expected) = mismatch.expected.params(db).into_iter().nth(i as usize) else { return };
+            diag.suggestion_verbose(
+                impl_span,
+                "change the parameter type to match the trait",
+                cx.ty(&expected),
+                applicability,
+            );
+        }
+        hir::SignatureMismatchAt::Return | hir::SignatureMismatchAt::ReturnMutability => {
+            // rustc does not suggest an `async fn`'s output.
+            if source.value.async_token().is_some() {
+                return;
+            }
+            let expected = cx.ty(&mismatch.expected.ret(db));
+            let msg = "change the output type to match the trait";
+            match source.value.ret_type().and_then(|it| it.ty()) {
+                Some(ty) => {
+                    let span = cx.span(source.with_value(ty.syntax().text_range()));
+                    diag.suggestion_verbose(span, msg, expected, applicability);
+                }
+                None => {
+                    let Some(params) = source.value.param_list() else { return };
+                    let end = params.syntax().text_range().end();
+                    let span = cx.span(source.with_value(TextRange::empty(end)));
+                    // alloc: on the error path, once the items differ
+                    diag.suggestion_verbose(span, msg, format!(" -> {expected}"), applicability);
+                }
+            }
+        }
+        hir::SignatureMismatchAt::ParamCount | hir::SignatureMismatchAt::Signature => {}
+    }
+}
+
+/// rustc's `get_self_string` of the trait's `self` type `ty`, against the impl's self type.
+fn self_receiver<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>, impl_self: &str) -> String {
+    if cx.ty(ty) == impl_self {
+        // alloc: on the error path, once the items differ
+        return "self".to_owned();
+    }
+    if let Some((inner, mutability)) = ty.as_reference()
+        && cx.ty(&inner) == impl_self
+    {
+        return match mutability {
+            // alloc: on the error path, once the items differ
+            hir::Mutability::Shared => "&self".to_owned(),
+            // alloc: on the error path, once the items differ
+            hir::Mutability::Mut => "&mut self".to_owned(),
+        };
+    }
+    // alloc: on the error path, once the items differ
+    format!("self: {}", cx.ty(ty))
 }

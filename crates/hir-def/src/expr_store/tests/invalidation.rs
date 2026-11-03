@@ -5,7 +5,6 @@
 
 use base_db::Db;
 use hir_expand::fixture;
-use triomphe::Arc;
 
 use crate::{
     AssocItemId, DefWithBodyId, GenericDefId, ModuleDefId,
@@ -95,9 +94,11 @@ fn function_named(db: &TestDB, name: &str) -> DefWithBodyId {
     *bodies.iter().find(|it| named(it)).unwrap_or_else(|| panic!("no fn `{name}`"))
 }
 
-/// The body of `def` lowered from its own text, as the query keeps it.
-fn relative_body(db: &TestDB, def: DefWithBodyId) -> Arc<Body> {
-    Body::relative(db, def).as_ref().expect("a body written in a file").0.clone()
+/// The bytes of the body of `def`, lowered from its own text, as [`Body::of`] keeps it: what
+/// outlives an edit of the database, which the body lent by reference does not.
+fn body_bytes(db: &TestDB, def: DefWithBodyId) -> Vec<u8> {
+    assert!(Body::relative(db, def).is_some(), "{def:?}: a body written in a file");
+    blaze_format::to_bytes(Body::of(db, def))
 }
 
 fn count(log: &[String], query: &str) -> usize {
@@ -113,15 +114,13 @@ fn check_store_unchanged_by(edited: &str) {
     let file = fx.only_file();
     let mut db = fx.into_db();
     let def = function_named(&db, "first");
-    let before = relative_body(&db, def);
-    let bytes = blaze_format::to_bytes(&*before);
-    let map = blaze_format::to_bytes(&Body::with_source_map(&db, def).1);
+    let bytes = body_bytes(&db, def);
+    let map = blaze_format::to_bytes(Body::source_map(&db, def));
 
     db.set_file_text(file.file_id(&db), edited);
     let after = Body::of(&db, def);
-    assert_eq!(*before, *after, "the store changed for:\n{edited}");
-    assert_eq!(bytes, blaze_format::to_bytes(after), "the store's bytes changed for:\n{edited}");
-    let moved = blaze_format::to_bytes(&Body::with_source_map(&db, def).1);
+    assert_eq!(bytes, blaze_format::to_bytes(after), "the store changed for:\n{edited}");
+    let moved = blaze_format::to_bytes(Body::source_map(&db, def));
     assert_ne!(map, moved, "the source map did not move for:\n{edited}");
 }
 
@@ -282,25 +281,22 @@ fn a_body_lowered_again_on_a_reused_scratch_is_the_same() {
     let mut db = fx.into_db();
     let add = function_named(&db, "add");
     let first = function_named(&db, "first");
-    let before = relative_body(&db, add);
+    let before = body_bytes(&db, add);
 
     // `add` and then `first`, both bigger, so the scratch holds more than `add` needs.
     let bigger = CODE
         .replace("c * 2", "{ let d = [c; 4]; d[0] * 2 }")
         .replace("let y = x + 1;", "let y = (x + 1, x * 3, [x; 2]).0;");
     db.set_file_text(file.file_id(&db), &bigger);
-    assert_ne!(*before, *relative_body(&db, add), "the edit changed nothing of `add`");
-    relative_body(&db, first);
+    assert_ne!(before, body_bytes(&db, add), "the edit changed nothing of `add`");
+    body_bytes(&db, first);
 
     db.set_file_text(file.file_id(&db), CODE);
     let log = db.executed_in_read_order(|| {
-        relative_body(&db, add);
+        Body::of(&db, add);
     });
-    assert_eq!(count(&log, "Body::relative"), 1, "`add` was not lowered again: {log:#?}");
-    let again = relative_body(&db, add);
-    assert!(!Arc::ptr_eq(&before, &again), "`add` was not lowered again");
-    assert_eq!(*before, *again);
-    assert_eq!(blaze_format::to_bytes(&*before), blaze_format::to_bytes(&*again));
+    assert_eq!(count(&log, "Body::of"), 1, "`add` was not lowered again: {log:#?}");
+    assert_eq!(before, body_bytes(&db, add));
 }
 
 /// An item's visibility is read off its file's outline, which an edit of a body leaves the

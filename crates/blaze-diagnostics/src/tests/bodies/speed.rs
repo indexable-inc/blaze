@@ -4,8 +4,9 @@
 
 use blaze_alloc_count::{assert_at_most, measure};
 use hir_def::ModuleDefId;
+use hir_ty_print::Def;
 
-use crate::{cx::Cx, lower::parse, print::paths::Def};
+use crate::{cx::Cx, lower::parse};
 
 /// A crate of `n` modules, each a file, and a dependency that re-exports a type.
 fn fixture(n: usize) -> String {

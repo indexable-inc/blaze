@@ -7,7 +7,7 @@ use blaze_ids::ContentId;
 use hir_def::FunctionId;
 
 use super::fixture::{crate_named, db_with};
-use crate::{Effects, Proof, Purity, main_of, script_purity};
+use crate::{Effects, Proof, Purity, ScriptProof, main_of, script_proof, script_purity};
 
 /// The `main` of the build script crate `build_script` of a fixture of the toolchain and
 /// `crates` (`//- /build.rs crate:build_script deps:std` first, then its crates).
@@ -64,6 +64,125 @@ fn identity(crates: &str) -> ContentId {
         Purity::Pure(proof) => proof.identity,
         Purity::Impure(why) => panic!("the script should be pure, but {}", why.said()),
     }
+}
+
+/// A script whose walk has a cycle (a recursive function), generic instances and a function
+/// given to one, so its summaries iterate to a fixpoint and are reached along several paths.
+const RECURSIVE: &str = r#"
+//- /build.rs crate:build_script deps:std
+fn depth(n: u32) -> u32 {
+    if n == 0 { 0 } else { 1 + depth(n - 1) }
+}
+fn twice<T: Copy>(x: T, f: impl Fn(T) -> T) -> T {
+    f(f(x))
+}
+fn main() {
+    let deep = twice(3u32, depth) > twice(1u32, |n| n + 1);
+    if deep {
+        println!("cargo:rustc-cfg=deep");
+    }
+}
+"#;
+
+/// The proof of the script `main` in `db` under a bound of `steps`: what it found and the
+/// steps the bound counted, or how it ran out.
+fn bounded(db: &Db, main: FunctionId, steps: u64) -> Result<(ScriptProof, u64), blaze_query::db::OutOfSteps> {
+    // clone: a test's answer
+    blaze_query::db::attach(db, || blaze_query::db::with_steps(steps, || script_proof(db, main).clone()))
+}
+
+/// The script in `crates` with every summary its walk reaches made first, under no bound: what
+/// a warm daemon has, or a busy one whose other tasks ran them.
+fn warmed(crates: &str) -> (Db, FunctionId) {
+    let (db, main) = script(crates);
+    blaze_query::db::attach(&db, || crate::walk::identity_parts(&db, main));
+    (db, main)
+}
+
+/// A build script's purity verdict and its steps are its walk's: the same on a cold database as
+/// on one whose summaries were all made before, and a bound one step short stops both. They
+/// once counted the rows the proof brought up to date, which depends on what was cached:
+/// cranelift-codegen's build script was proved on a cold daemon and refused on a warm one
+/// (selfbuild5).
+#[test]
+fn a_build_scripts_purity_verdict_does_not_depend_on_what_is_cached() {
+    let (db, main) = script(RECURSIVE);
+    let (cold, cold_taken) = bounded(&db, main, 1 << 20).expect("cold, far within the bound");
+    assert!(cold.steps > 2, "the walk reached past `main`: {cold:?}");
+    assert_eq!(u64::from(cold.steps), cold_taken, "the bound counted the walk's instances, each once");
+    let (db, main) = warmed(RECURSIVE);
+    let (warm, warm_taken) = bounded(&db, main, 1 << 20).expect("warm, far within the bound");
+    assert_eq!((&warm, warm_taken), (&cold, cold_taken), "the same verdict and steps, cold or warm");
+
+    let short = u64::from(cold.steps) - 1;
+    let (db, main) = script(RECURSIVE);
+    let cold = bounded(&db, main, short).expect_err("cold, one step short");
+    let (db, main) = warmed(RECURSIVE);
+    let warm = bounded(&db, main, short).expect_err("warm, one step short");
+    assert_eq!((cold.steps, warm.steps), (short, short), "both took all they were given: {cold}; {warm}");
+}
+
+/// Generics whose home depends on who asks (`hir_ty_mir::mir::home`). `mid::outer` is not
+/// generic, so it is worked out in `mid`, which solves with a recursion limit of its own: no
+/// crate stands for `mid`, so `base::inner::<LThing>`, asked from there, stays in `mid`, while
+/// asked from the script it is `base`'s. `extra` implements `base::Show` for `base::LThing`,
+/// which coherence would not let it, but the solver takes it: the simplest way to have the two
+/// homes see different impls. In `mid`, which loads `extra`, `inner` calls `extra`'s `show` and
+/// through it `shown`; in `base`, which does not, it has no impl to call. A cold proof runs
+/// `inner` as `mid` asks it and reaches `shown`; asking every summary from the script, as the
+/// step walk once did, never does.
+const ACROSS: &str = r#"
+//- /build.rs crate:build_script deps:std,mid
+fn main() {
+    mid::outer();
+}
+//- /base.rs crate:base deps:std
+pub trait Show {
+    fn show(&self);
+}
+pub struct LThing;
+pub fn inner<T: Show>(it: &T) {
+    it.show();
+}
+//- /extra.rs crate:extra deps:std,base
+impl base::Show for base::LThing {
+    fn show(&self) {
+        shown();
+    }
+}
+pub fn shown() {}
+pub fn touch() {}
+//- /mid.rs crate:mid deps:std,base,extra
+#![recursion_limit = "256"]
+pub fn outer() {
+    extra::touch();
+    base::inner(&base::LThing);
+}
+"#;
+
+/// A build script's steps follow each summary from the environment that asks for it, as a cold
+/// proof runs them, so they do not depend on what is cached where its generics' homes depend
+/// on who asks ([`ACROSS`]): cold, the summaries' runs reach `shown` through `mid`'s home of
+/// `base::inner`; warm, only the step walk asks, and it must reach it too.
+#[test]
+fn a_build_scripts_steps_follow_each_generic_from_the_crate_that_asks_for_it() {
+    let (db, main) = script(ACROSS);
+    let (cold, cold_taken) = bounded(&db, main, 1 << 20).expect("cold, far within the bound");
+    assert_eq!(
+        u64::from(cold.steps),
+        cold_taken,
+        "the steps the proof keeps are the ones the bound counted"
+    );
+    let (db, main) = warmed(ACROSS);
+    let (warm, warm_taken) = bounded(&db, main, 1 << 20).expect("warm, far within the bound");
+    assert_eq!((&warm, warm_taken), (&cold, cold_taken), "the same verdict and steps, cold or warm");
+
+    let short = u64::from(cold.steps) - 1;
+    let (db, main) = script(ACROSS);
+    let cold = bounded(&db, main, short).expect_err("cold, one step short");
+    let (db, main) = warmed(ACROSS);
+    let warm = bounded(&db, main, short).expect_err("warm, one step short");
+    assert_eq!((cold.steps, warm.steps), (short, short), "both took all they were given: {cold}; {warm}");
 }
 
 #[test]

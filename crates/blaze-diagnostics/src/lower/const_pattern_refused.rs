@@ -44,7 +44,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ConstPatternRefused<'db>) ->
             refused(span, message, format!("{prefix} can't be used in patterns")) // alloc: its label
         }
         ConstPatternError::NotStructural { ty, inapplicable_structural } => {
-            not_structural(cx, d.pat, span, ty, *inapplicable_structural)
+            not_structural(cx, d.pat, &span, ty, *inapplicable_structural)
         }
         ConstPatternError::NotPartialEq { ty, local_manual, local_without, manual, without } => {
             let message = format!("constant of non-structural type `{}` in a pattern", cx.ty(ty)); // alloc: the error's message, the edge
@@ -116,7 +116,7 @@ fn refused(span: Span, message: impl Into<String>, label: impl Into<String>) -> 
 fn not_structural<'db>(
     cx: &Cx<'_, 'db>,
     pat: InFile<AstPtr<tag::Pat>>,
-    span: Span,
+    span: &Span,
     ty: &Type<'db>,
     inapplicable_structural: bool,
 ) -> Diag {
@@ -142,10 +142,10 @@ fn not_structural<'db>(
         };
     }
     if (is_local || !inapplicable_structural)
-        && let Some(name) = cx.snippet(&span)
+        && let Some(name) = cx.snippet(span)
     {
         let manual = !inapplicable_structural;
-        suggest_eq(cx, &mut diag, pat, &span, name, (!manual).then_some(printed.as_str()));
+        suggest_eq(cx, &mut diag, pat, span, name, (!manual).then_some(printed.as_str()));
     }
     diag
 }

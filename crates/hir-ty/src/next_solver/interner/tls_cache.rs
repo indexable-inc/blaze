@@ -7,12 +7,22 @@
 //!   `get_tracked` do.
 //! - [`of_query`]: a goal no other query may take on (its capture is `None`), one cache for
 //!   each interner, in a table every thread shares, so a query that moves to another thread
-//!   keeps what it solved.
+//!   keeps what it solved. Made by the interner's first write, never by a lookup
+//!   ([`of_query_to_read`]), with one shard ([`Sharing::One`]).
 //!
 //! Both are the one [`Shared`] table: a lookup is a few loads under the task's
 //! `blaze_reclaim` guard, with no lock and no write but a use mark set once per sweep. A
 //! shared cache is replaced by the first use in a later revision (a query's never sees one),
 //! and a cache given away is freed once no task can still hold it.
+//!
+//! What a cache given away holds waits in its table's limbo until every job running when it was
+//! given away has ended, and a job is a whole unit's work, so the limbo holds every cache given
+//! away while the longest job runs. So what one costs matters: in coord-98 every interner's
+//! first lookup made a query cache with a table of a shard per core (144 KiB), each made
+//! cache gave another away, and those waiting filled blaze-mem's 160 KiB class (16 GiB) within
+//! one 21-crate test run. Now an interner that only looks up makes nothing, and a query cache
+//! written holds a few kilobytes. Every block and generation is counted to [`Tag::Solver`], the
+//! `solver` row of the daemon's memory lines.
 
 
 use super::DbInterner;
@@ -22,7 +32,7 @@ use blaze_mem::{Cache, Pool, Pooled, Tag, pool::Limbo};
 use blaze_query::db::View;
 use blaze_reclaim::Horizon;
 use parking_lot::Mutex;
-use rustc_type_ir::search_graph::GlobalCache;
+use rustc_type_ir::search_graph::{GlobalCache, Sharing};
 use std::{
     cell::Cell,
     hash::BuildHasher,
@@ -130,9 +140,9 @@ struct Slots<'p, G> {
 /// their grace (see `pool`).
 const POOLED: u32 = 1 << 20;
 
-/// The generations of a table, tagged `Infer`; reserved, none committed until made.
+/// The generations of a table, tagged `Solver`; reserved, none committed until made.
 fn pool<G>() -> Pool<G> {
-    Pool::new(POOLED, Tag::Infer)
+    Pool::new(POOLED, Tag::Solver)
         .unwrap_or_else(|error| panic!("the trait solver's cache: {error}"))
 }
 
@@ -284,6 +294,27 @@ where
         }
     }
 
+    /// The value of `key` in `state` if a thread made it, marked used; never makes one, nor
+    /// gives a slot away. For a reader that has nothing to read where there is no value: a
+    /// value made for it would only be empty, and would give another key's away. A value made
+    /// and not yet published may be missed, which costs a lookup, never an answer.
+    fn made<'g>(&'g self, _task: &'g blaze_reclaim::Guard, key: K, state: S) -> Option<&'g T> {
+        let hint = key.hint();
+        for at in window(hint, self.generations.len()) {
+            if self.hints[at].load(Ordering::Acquire) != hint {
+                continue;
+            }
+            let Some(generation) = self.get(self.generations[at].load(Ordering::Acquire)) else {
+                continue;
+            };
+            if generation.key == key && generation.state == state {
+                generation.touch();
+                return Some(&generation.value);
+            }
+        }
+        None
+    }
+
     /// The generation `held` points to, if any. Called only by `of` and what it calls (and the
     /// tests, under a guard of their own), on a pointer loaded under its guard, and good while
     /// that guard is.
@@ -405,13 +436,32 @@ where
     /// Unlinks every generation, and drops those past their grace with the lock let go, as
     /// `replace` does.
     fn clear(&self) {
+        self.retire(|_| true);
+    }
+
+    /// Unlinks every generation whose key `gone` names, and drops those past their grace with
+    /// the lock let go, as `replace` does: how many it unlinked. A task that loaded one before
+    /// keeps reading it until it ends (the limbo's grace), and the next use of its key makes a
+    /// new one, which costs only the solves again.
+    fn retire(&self, gone: impl Fn(&K) -> bool) -> usize {
+        let mut retired = 0;
         let mut slots = blaze_graph::wait::lock(&self.slots, LOCK);
         for (hint, slot) in self.hints.iter().zip(&self.generations) {
-            hint.store(EMPTY, Ordering::Release);
-            if let Some(held) = NonNull::new(slot.swap(ptr::null_mut(), Ordering::AcqRel)) {
-                // SAFETY: as in `replace`: the swap unlinked it, and only one swap can.
-                slots.limbo.retire(unsafe { Pooled::from_raw(self.pool, held) });
+            let Some(held) = NonNull::new(slot.load(Ordering::Acquire)) else { continue };
+            // SAFETY: a slot changes only under the lock, held here (`replace` swaps under it),
+            // and a generation goes to the limbo only once a swap under it unlinked it: one in a
+            // slot is alive while the lock is held.
+            if !gone(unsafe { &held.as_ref().key }) {
+                continue;
             }
+            hint.store(EMPTY, Ordering::Release);
+            slot.store(ptr::null_mut(), Ordering::Release);
+            // SAFETY: as in `replace`: every generation in a slot was published from `into_raw`
+            // of this table's pool, and the store above, under the lock, unlinked `held`; a
+            // generation is unlinked once, under the lock, so this is the one place that takes
+            // it back.
+            slots.limbo.retire(unsafe { Pooled::from_raw(self.pool, held) });
+            retired += 1;
         }
         drop(slots);
         // Each batch taken moves the limbo's head past it, so this ends once the limbo holds
@@ -425,6 +475,7 @@ where
             }
             drop(passed);
         }
+        retired
     }
 }
 
@@ -487,12 +538,22 @@ const SLOT_BITS: u32 = 9;
 /// for as long as it is used: a `Solved` is made with its interner and used only through it,
 /// and the interner's `&'db` borrow of the database keeps the revision from advancing
 /// (a new view takes `&mut Storage`). So a lookup reads neither; debug builds check.
-#[derive(Default)]
 struct OfQuery {
     #[cfg(debug_assertions)]
     #[expect(clippy::disallowed_types, reason = "the database and revision, set once per interner cache: not global")]
     state: std::sync::OnceLock<(Nonce, View)>,
     cache: Erased,
+}
+
+impl Default for OfQuery {
+    /// One query's interner writes its cache, from one thread at a time: one shard.
+    fn default() -> OfQuery {
+        OfQuery {
+            #[cfg(debug_assertions)]
+            state: Default::default(),
+            cache: GlobalCache::new(Sharing::One),
+        }
+    }
 }
 
 #[expect(clippy::disallowed_types, reason = "the process's one query solver generation pool: the query table allocates all its generations here")]
@@ -531,6 +592,53 @@ pub(super) fn of_query<'db, R>(
     f(unerase(&of_query.cache))
 }
 
+/// Runs `f` on the cache of the interner `solved` to look a goal up in it, if the interner
+/// made one: `None` without running `f` where it has none, as a lookup there would find
+/// nothing. Only a write makes an interner's cache ([`of_query`]), so an interner that only
+/// looks up (most do: their goals' reads are captured, so they go to the shared cache) costs no
+/// generation and gives no other interner's away.
+#[inline]
+pub(super) fn of_query_to_read<'db, R>(
+    db: &'db Db,
+    solved: Solved,
+    f: impl FnOnce(&GlobalCache<DbInterner<'db>>) -> Option<R>,
+) -> Option<R> {
+    let task = blaze_reclaim::enter();
+    let of_query = OF_QUERY.made(&task, solved, ())?;
+    #[cfg(debug_assertions)]
+    if let Some(&state) = of_query.state.get() {
+        assert!(
+            state == db.nonce_and_revision(),
+            "an interner's solver cache was used in another database or revision"
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = db;
+    f(unerase(&of_query.cache))
+}
+
+/// Lets go of the shared caches of `db` (both scopes, with and without regions) of the crates
+/// `crates` names, or with `all` of every crate's and of none's: how many it let go. For a build
+/// that compiled every unit of those crates (`hir::evict::drop_crates_after_store`): no query
+/// still to run checks their bodies, a dependent's goals are in its own crate's cache, and a
+/// cache let go is only solved again if one does. A cache is the search graph's and the
+/// global-goal table's of one revision, up to a hundred megabytes for a crate the size of
+/// `core`, so a build of many crates otherwise holds one for each until the next revision
+/// replaces it (memcap6, B5). A task reading one keeps it until it ends (the table's limbo);
+/// what is past its grace by then is dropped here, the rest by a later replace or release.
+pub(crate) fn drop_shared_solver_caches(db: &Db, crates: &[Crate], all: bool) -> usize {
+    let (nonce, _) = db.nonce_and_revision();
+    SHARED.retire(|scope| scope.retired_by(nonce, crates, all))
+}
+
+impl Scope {
+    /// Whether a release of `crates` in the database of `nonce` (with `all`, of every crate
+    /// there) lets go of this scope ([`drop_shared_solver_caches`]).
+    fn retired_by(&self, nonce: Nonce, crates: &[Crate], all: bool) -> bool {
+        self.nonce == nonce && (all || self.krate.is_some_and(|krate| crates.contains(&krate)))
+    }
+}
+
 /// Clears the trait solver's caches, of every query and thread.
 ///
 /// Should be called before getting memory usage estimations, as the solver cache
@@ -553,7 +661,10 @@ mod tests {
 
     use parking_lot::Mutex;
 
-    use super::{EMPTY, Key, SOLVED_BLOCK, Shared, Solved, pool};
+    use base_db::{Crate, Nonce};
+    use blaze_query::db::{FromId, Id};
+
+    use super::{EMPTY, Key, SOLVED_BLOCK, Scope, Shared, Solved, pool};
 
     type Goals = HashMap<u32, u32>;
 
@@ -657,6 +768,56 @@ mod tests {
             }
         });
         assert_eq!(holding(&table, query), 1);
+    }
+
+    /// coord-98: every interner's first lookup made its query cache, and with the table full
+    /// each one made gave another away to the limbo, where it waited for the longest job then
+    /// running to end. Interners that only look up (most do) make none and give none away,
+    /// however many there are and in whatever state (view).
+    #[test]
+    fn interners_that_only_look_up_make_no_cache_and_give_none_away() {
+        let table = table::<SharedGoals>(4);
+        let written: Vec<Solved> = (0..16).map(|_| key()).collect();
+        {
+            let task = blaze_reclaim::enter();
+            for &query in &written {
+                table.of(&task, query, 0).lock().insert(7, 1);
+            }
+        }
+        let carved = table.pool.carved();
+        thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for state in 0..4 {
+                        for _ in 0..25_000 {
+                            let task = blaze_reclaim::enter();
+                            assert!(table.made(&task, key(), state).is_none());
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(table.pool.carved(), carved, "a lookup made a generation");
+        let task = blaze_reclaim::enter();
+        for &query in &written {
+            assert_eq!(holding(&table, query), 1, "a lookup gave a written cache away");
+            assert_eq!(table.made(&task, query, 0).and_then(|it| it.lock().get(&7).copied()), Some(1));
+            // A later state's reader is not handed the old state's value, nor makes its own.
+            assert!(table.made(&task, query, 1).is_none());
+            assert_eq!(holding(&table, query), 1);
+        }
+    }
+
+    /// A query's cache is made for one writer and holds nothing until written; a crate's shared
+    /// cache is made for every thread.
+    #[test]
+    fn a_query_cache_has_one_shard_and_holds_nothing_until_written() {
+        let of_query = super::OfQuery::default();
+        assert_eq!(of_query.cache.sharing(), rustc_type_ir::search_graph::Sharing::One);
+        assert_eq!(of_query.cache.held(), 0);
+        let shared = super::SharedCaches::default();
+        assert_eq!(shared.search.sharing(), rustc_type_ir::search_graph::Sharing::Many);
+        assert_eq!(shared.search.held(), 0);
     }
 
     #[test]
@@ -1102,5 +1263,41 @@ mod tests {
             }
         });
         assert!(shared_hits.into_inner() > 0, "the table never answered from its cache");
+    }
+
+    /// A release of crate A lets go of both of A's scopes (with and without regions) in its
+    /// database, and keeps crate B's, A's scope in another database and the scope of no crate;
+    /// with `all` it lets go of every scope of its database and of no other's.
+    #[test]
+    fn a_release_of_a_crate_retires_its_scopes_and_keeps_every_other() {
+        // alloc: a test's pool, once a test.
+        let table: Shared<'static, Scope, u32, SharedGoals> = Shared::new(6, Box::leak(Box::new(pool())));
+        let krate = |bits| Crate::from_id(Id::from_u32(bits));
+        let (a, b) = (krate(1), krate(2));
+        let (ours, theirs) = (Nonce::new(), Nonce::new());
+        let scope = |nonce, krate, regions| Scope { nonce, krate, regions };
+        let gone = [scope(ours, Some(a), false), scope(ours, Some(a), true)];
+        let ours_kept = [scope(ours, Some(b), false), scope(ours, Some(b), true), scope(ours, None, false)];
+        let theirs_kept = scope(theirs, Some(a), false);
+        {
+            let task = blaze_reclaim::enter();
+            for &key in gone.iter().chain(&ours_kept).chain([&theirs_kept]) {
+                table.of(&task, key, 0).lock().insert(1, 1);
+            }
+        }
+        assert_eq!(table.retire(|it| it.retired_by(ours, &[a], false)), 2, "a's two scopes");
+        {
+            let task = blaze_reclaim::enter();
+            for key in gone {
+                assert!(table.made(&task, key, 0).is_none(), "{key:?} is let go");
+            }
+            for key in ours_kept.into_iter().chain([theirs_kept]) {
+                let kept = table.made(&task, key, 0).is_some_and(|it| it.lock().contains_key(&1));
+                assert!(kept, "{key:?} is kept, with what it holds");
+            }
+        }
+        assert_eq!(table.retire(|it| it.retired_by(ours, &[], true)), 3, "b's two and none's");
+        let task = blaze_reclaim::enter();
+        assert!(table.made(&task, theirs_kept, 0).is_some(), "another database's scope stays");
     }
 }

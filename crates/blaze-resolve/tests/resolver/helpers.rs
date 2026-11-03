@@ -113,8 +113,8 @@ fn registry_loc() -> SourceId {
     SourceId::for_registry(&"https://example.com".into_url().unwrap()).unwrap()
 }
 
-pub(crate) fn pkg<T: ToPkgId>(name: T) -> Summary {
-    pkg_dep(&name, Vec::new())
+pub(crate) fn pkg<T: ToPkgId>(name: &T) -> Summary {
+    pkg_dep(name, Vec::new())
 }
 
 pub(crate) fn pkg_dep<T: ToPkgId>(name: &T, dep: Vec<Dependency>) -> Summary {

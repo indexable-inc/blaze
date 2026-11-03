@@ -41,12 +41,13 @@ use crate::{
     nameres::{
         BuildingScope, BuiltinShadowMode, DefMap, DiagnosticsByModule, LocalDefMap, ModuleData,
         ModuleOrigin, ModuleScope, ModulesMap, ModulesSlot, ResolveMode, ScopeSlot, def_site,
+        def_site::Hygienic,
         diagnostics::DefDiagnostic,
         path_resolution::{PathRead, ReachedFixedPoint, ResolvePathResult},
         trait_items::trait_item_per_ns,
         uses,
     },
-    per_ns::{Item, PerNs},
+    per_ns::{Item, Namespace, PerNs},
     visibility::{RawVisibility, Visibility, VisibilityError, visibility_path},
 };
 
@@ -145,6 +146,23 @@ impl ReadCheck<'_> {
     fn may_read(&self, module: ModuleId) -> bool {
         self.partition.may_read(self.component, self.partition.of(self.at(module)))
     }
+}
+
+/// Whether `module` is `importer` or a module around it in `def_map`, its def map: where def-site
+/// hygiene may start a path of `importer` that the import graph puts upstream of it (a hygienic
+/// path's first step in `nameres-graph.md`). A path hygiene starts in another module of the def
+/// map (the module defining a `macro` imported into a module around the path) is left
+/// unresolved, as the graph does not order the two: rustc resolves it.
+fn around(db: &Db, def_map: &DefMap, importer: ModuleId, module: ModuleId) -> bool {
+    let mut at = Some(importer);
+    // Each turn moves to a parent, ending at the def map's root.
+    while let Some(here) = at {
+        if here == module {
+            return true;
+        }
+        at = def_map.module(db, here).parent;
+    }
+    false
 }
 
 /// Whether `module`, a module of the unit's own map, is one the unit holds. A read of any other
@@ -261,7 +279,6 @@ fn glob_position(db: &Db, glob: GlobId) -> (span::TextSize, span::TextSize, u32)
 /// Whether `glob`, giving a name at `vis` the item another glob (`prev`, at `prev_vis`)
 /// already gave it, is the one the name is bound through: the wider, and of two as wide the
 /// first in the source ([`glob_position`]), so the binding is the same whichever arrives first.
-/// Both collectors ask it.
 pub(in crate::nameres) fn glob_takes_over(
     db: &Db,
     def_map: &DefMap,
@@ -290,7 +307,7 @@ pub(in crate::nameres) fn recorded_ambiguity(
 /// The visibility to record a glob giving a name an item at `vis` where an earlier record of
 /// the same glob and item has `earlier` ([`recorded_ambiguity`]): the wider, as rustc keeps the
 /// more visible of a glob's two bindings of one item, so the record is the same whichever of
-/// the glob's deliveries arrives last. Both collectors ask it.
+/// the glob's deliveries arrives last.
 pub(in crate::nameres) fn widest_ambiguity(
     db: &Db,
     def_map: &DefMap,
@@ -770,13 +787,35 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             PathRead::Unscoped => *keys_any = true,
             PathRead::Slot(..) | PathRead::LegacyMacro(..) | PathRead::ExternPrelude(_) => {}
         };
+        // Where a `macro`'s def-site hygiene starts the path (rustc's `resolve_path` with each
+        // segment's span): as written, or a scope the expansion's names or its def site have.
+        let mut strayed = false;
+        let origin = def_map.import_origin(db, importer, path, directive.op.ctxt, &mut |read| {
+            match read {
+                PathRead::Slot(at, _) | PathRead::LegacyMacro(at, _)
+                    if local_to(at) && !around(db, &*def_map, importer, at) =>
+                {
+                    strayed = true;
+                }
+                read => reads(read),
+            }
+        });
+        let (map, from, path) = match origin {
+            _ if strayed => return PartialResolvedImport::Unresolved,
+            Hygienic::At(at, _) if local_to(at) && !around(db, &*def_map, importer, at) => {
+                return PartialResolvedImport::Unresolved;
+            }
+            Hygienic::Here => (&*def_map, importer, *path),
+            Hygienic::At(at, key) => (def_map.map_for(db, at), at, def_site::keyed_path(path, key)),
+            Hygienic::Unknown => return PartialResolvedImport::Unresolved,
+        };
         let ResolvePathResult { resolved_def, segment_index, reached_fixedpoint, prefix_info } =
-            def_map.resolve_path_fp_recording(
-                local.get(),
+            map.resolve_path_fp_recording(
+                def_map.local_for(db, from, local.get()),
                 db,
                 ResolveMode::Import,
-                importer,
-                path,
+                from,
+                &path,
                 BuiltinShadowMode::Module,
                 None, // An import may resolve to any kind of macro.
                 &mut reads,
@@ -789,15 +828,20 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             return PartialResolvedImport::Unresolved;
         }
 
+        // A path def-site hygiene moved stays open: a name the expansion writes later, where
+        // the walk found none, would move it back.
+        let moved = origin != Hygienic::Here;
         if prefix_info.differing_crate {
-            return PartialResolvedImport::Resolved(
-                resolved_def.filter_visibility(|v| matches!(v, Visibility::Public)),
-            );
+            let public = resolved_def.filter_visibility(|v| matches!(v, Visibility::Public));
+            return match moved {
+                true => PartialResolvedImport::Indeterminate(public),
+                false => PartialResolvedImport::Resolved(public),
+            };
         }
 
         // Check whether all namespaces are resolved.
         if resolved_def.is_full() {
-            match unexpanded && through_glob_of(db, krate, &resolved_def) {
+            match moved || (unexpanded && through_glob_of(db, krate, &resolved_def)) {
                 true => PartialResolvedImport::Indeterminate(resolved_def),
                 false => PartialResolvedImport::Resolved(resolved_def),
             }
@@ -816,25 +860,48 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     ) -> Result<Visibility, VisibilityError> {
         let db = self.db;
         let vis = match visibility {
-            RawVisibility::Module(path, explicitness) => {
+            RawVisibility::Module(path, explicitness, ctxt) => {
                 let Unit { def_map, local, state, check, .. } = self;
                 let path = &visibility_path(path, def_map.data.edition)?;
                 let upstream = &mut state.upstream;
                 let (krate, block) = (def_map.krate, def_map.block_id());
+                let local_to = |at: ModuleId| at.krate(db) == krate && at.block(db) == block;
                 let mut reads = |read: PathRead| {
                     if let PathRead::Slot(at, _) = read
-                        && at.krate(db) == krate
-                        && at.block(db) == block
+                        && local_to(at)
                     {
                         held(db, check, upstream, at, import, module);
                     }
                 };
-                let result = def_map.resolve_path_fp_recording(
-                    local.get(),
+                // rustc's `resolve_visibility` resolves the path with its spans: its first
+                // segment by def-site hygiene, as an import's (`resolve_import`).
+                let mut strayed = false;
+                let types = Some(Namespace::Types);
+                let origin = def_map.hygienic_origin_reading(db, module, path, types, *ctxt, &mut |read| {
+                    match read {
+                        PathRead::Slot(at, _) | PathRead::LegacyMacro(at, _)
+                            if local_to(at) && !around(db, &*def_map, module, at) =>
+                        {
+                            strayed = true;
+                        }
+                        read => reads(read),
+                    }
+                });
+                let (map, from, path) = match origin {
+                    _ if strayed => return Err(VisibilityError::Unresolved),
+                    Hygienic::At(at, _) if local_to(at) && !around(db, &*def_map, module, at) => {
+                        return Err(VisibilityError::Unresolved);
+                    }
+                    Hygienic::Here => (&*def_map, module, *path),
+                    Hygienic::At(at, key) => (def_map.map_for(db, at), at, def_site::keyed_path(path, key)),
+                    Hygienic::Unknown => return Err(VisibilityError::Unresolved),
+                };
+                let result = map.resolve_path_fp_recording(
+                    def_map.local_for(db, from, local.get()),
                     db,
                     ResolveMode::Other,
-                    module,
-                    path,
+                    from,
+                    &path,
                     BuiltinShadowMode::Module,
                     None,
                     &mut reads,
@@ -1023,17 +1090,23 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                             crate::Lookup::lookup(&e, self.db).container,
                             Some(crate::nameres::delta::reads::enum_glob()),
                         );
-                        // glob import from enum => just import all the variants
+                        // glob import from enum => just import all the variants, each as the
+                        // glob binds it (`def_site::glob_imported_name`, adjusted from the scope
+                        // the enum's expansion made), as a module's names.
+                        let db = self.db;
+                        let expn = def_site::enum_expansion(db, e);
+                        let glob_ctxt = def_site::glob_context(db, glob);
                         let start = self.held.len();
-                        self.held.extend(e.enum_variants(self.db).variants.iter().map(
+                        self.held.extend(e.enum_variants(db).variants.iter().filter_map(
                             |(name, &(variant, shape))| {
+                                let name = def_site::glob_imported_name(db, *name, expn, glob_ctxt)?;
                                 // We don't need to reduce the visibility, since enum variants and their fields do not have visibility on their own.
                                 let res = if shape.has_value_ns_ctor() {
                                     PerNs::both(variant.into(), variant.into(), vis, None)
                                 } else {
                                     PerNs::types(variant.into(), vis, None)
                                 };
-                                (Some(*name), res)
+                                Some((Some(name), res))
                             },
                         ));
                         self.update_held(module_id, start, vis, Some(ImportOrExternCrate::Glob(glob)));

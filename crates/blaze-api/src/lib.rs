@@ -76,8 +76,9 @@ use serde::{Deserialize, Serialize};
 /// executable while the rest of the build goes on. 26: [`Request::Rebuilt`] and
 /// [`Response::Rebuilt`] (`blaze why`), grouped on the daemon. 27: [`Worked::placed`]. 28:
 /// [`Request::Launch`] and [`Response::Launched`]. 29: [`Response::Stopping`]. 30:
-/// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`].
-pub const SCHEMA: u32 = 32;
+/// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`]. 33:
+/// [`Status::bugs`].
+pub const SCHEMA: u32 = 33;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -924,13 +925,28 @@ pub struct Worked {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Unchecked {
     /// Each unit that failed only in its bodies or lints, its items sound: under
-    /// `--keep-going` what depends on it was checked against its items, while it stays failed.
+    /// keep-going (the default) what depends on it was checked against its items, while it stays failed.
     pub open: Vec<OpenFailure>,
     /// Each failure units were not checked behind.
     pub behind: Vec<Behind>,
-    /// The build stopped at its first failure (no `--keep-going`): the units [`Unchecked::behind`]
+    /// Each test executable or doc test unit that never built, with the failure that held it
+    /// back (its own, or the unit it was skipped behind), in the plan's order: what the end of
+    /// `blaze test` lists as never run.
+    pub tests: Vec<Unbuilt>,
+    /// The build stopped at its first failure (`--fail-fast`): the units [`Unchecked::behind`]
     /// names under it were skipped for that, whether or not they depend on it.
     pub stopped: bool,
+}
+
+/// A test unit of [`Unchecked::tests`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Unbuilt {
+    /// The test unit, as blaze's spans name it: `calc v0.1.0 (test "it")`.
+    pub unit: String,
+    /// The unit whose failure held it back: itself when its own compile failed.
+    pub behind: String,
+    /// Why that one failed, as its node says.
+    pub why: String,
 }
 
 /// A failure of [`Unchecked::behind`].
@@ -1281,6 +1297,9 @@ pub enum TestOutcome {
 pub struct Status {
     /// The daemon's process: what `kill` and the restart budgets name.
     pub pid: u32,
+    /// The bugs the daemon found in itself and went on past so far, one a site
+    /// (`stdx::assert::reported`): empty in a healthy daemon.
+    pub bugs: Vec<Bug>,
     /// Which blaze the daemon is: a client of another build never sends it a request of one.
     pub build: Build,
     pub views: u32,
@@ -1290,6 +1309,35 @@ pub struct Status {
     pub requests: Vec<u64>,
     pub budget_bytes: u64,
     pub memory_bytes: u64,
+}
+
+/// One site's bugs the daemon reported and went on past ([`Status::bugs`]): a value formatted
+/// with no database attached, a `never!` that failed. Its fields are declared in the order
+/// CBOR writes a map's keys: shorter first, then bytewise.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Bug {
+    /// The site that reported it: `file:line:column`.
+    pub at: String,
+    /// The kind of value or check it is of: `AdtDef`, `assertion` (a `never!` or `always!`).
+    pub kind: String,
+    /// What went wrong: "formatted with no database attached".
+    pub what: String,
+    pub count: u64,
+    /// The thread of its first report, as named.
+    pub thread: Option<String>,
+}
+
+/// "a blaze bug: `AdtDef` formatted with no database attached at <file:line:col>, 2 times,
+/// first on thread `blaze-worker-3`", as `stdx::assert::reported::Site` says it.
+impl std::fmt::Display for Bug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Bug { kind, what, at, count, thread } = self;
+        write!(f, "a blaze bug: `{kind}` {what} at {at}, {count} time{}", if *count == 1 { "" } else { "s" })?;
+        match thread {
+            Some(thread) => write!(f, ", first on thread `{thread}`"),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Which blaze a daemon is ([`Status::build`]).

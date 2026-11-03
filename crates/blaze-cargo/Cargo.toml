@@ -132,6 +132,8 @@ tikv-jemalloc-sys = { workspace = true, optional = true }
 [dev-dependencies]
 # Counts allocations for the budget tests (`serve/unit/test/tests.rs` installs it).
 blaze-alloc-count.workspace = true
+# The front end's code identity held to what building it read (`tests/front_end_identity.rs`).
+blaze-codegen-code.workspace = true
 # `Writer::hold_put`, for the gate's tests of a put counted and not yet published.
 blaze-cas = { workspace = true, features = ["test-hooks"] }
 tokio = { workspace = true, features = ["net"] }

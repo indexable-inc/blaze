@@ -1009,7 +1009,8 @@ impl Persist for InferenceRecord {
         // 24: `InferenceDiagnostic::ComptimeNotYetSupported`.
         // 25: `comptime_loops`, after the named pattern types in the side table words.
         // 26: `SolverDiagnosticKind::ReflectedMemberUnmet` (solver kind 9).
-        Part::U64(26),
+        // 27: `InferenceDiagnostic::PrivateField::at`, an `offset_of!` field's position.
+        Part::U64(27),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -2123,10 +2124,11 @@ impl Sink {
                 self.node(*field);
                 self.variant(*variant);
             }
-            D::PrivateField { expr, field } => {
+            D::PrivateField { expr, field, at } => {
                 self.words.extend([6, local(*expr)]);
                 self.variant(field.parent);
                 self.local(field.local_id);
+                self.word(at.map_or(0, |it| it + 1));
             }
             D::PrivateAssocItem { id, item } => {
                 self.word(7);
@@ -3169,6 +3171,7 @@ impl Source<'_> {
             6 => D::PrivateField {
                 expr: self.local()?,
                 field: FieldId { parent: self.variant()?, local_id: self.local()? },
+                at: self.word()?.checked_sub(1),
             },
             7 => {
                 let id = self.node()?;
@@ -3839,7 +3842,8 @@ mod tests {
                 rhs: Some((Ty::new_without_interner(TyKind::Infer(InferTy::FreshIntTy(0))).store(), false)),
             },
             D::DuplicateField { field: pat(5).into(), variant },
-            D::PrivateField { expr: expr(2), field: FieldId { parent: enum_variant, local_id: local_of(7) } },
+            D::PrivateField { expr: expr(2), field: FieldId { parent: enum_variant, local_id: local_of(7) }, at: None },
+            D::PrivateField { expr: expr(3), field: FieldId { parent: enum_variant, local_id: local_of(7) }, at: Some(2) },
             D::PrivateAssocItem { id: expr(3).into(), item: AssocItemId::TypeAliasId(TypeAliasId::from_id(id(6))) },
             D::UnresolvedField {
                 expr: expr(4),

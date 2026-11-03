@@ -34,7 +34,6 @@ mod providers;
 pub mod purity;
 mod storage;
 mod transform;
-pub mod type_name;
 
 pub use eval::{
     Evaluator, MirOutput, foreign, interpret_mir,
@@ -73,8 +72,7 @@ pub use hir_ty::providers::{
     optimized_mir_body_for_closure_query, optimized_mir_body_for_coroutine_by_move_query,
     optimized_mir_body_for_coroutine_query, optimized_mir_body_query,
     runtime_mir_body_for_closure_query, runtime_mir_body_for_coroutine_by_move_query,
-    runtime_mir_body_for_coroutine_query, runtime_mir_body_query, set_mir_capacity,
-    set_runtime_mir_capacity,
+    runtime_mir_body_for_coroutine_query, runtime_mir_body_query,
 };
 pub use lower::is_builtin_index;
 pub use lower::{

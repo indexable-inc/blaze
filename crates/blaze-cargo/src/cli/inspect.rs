@@ -15,9 +15,9 @@ use std::{
 };
 
 use blaze_api::{Request, Response, ResponseRef, Table, ViewRef};
+use blaze_core::exit::Exit;
 
 use super::{
-    FAILED, USAGE,
     args::{self, Command},
     daemon::{self, Api, Start},
     json, place, say,
@@ -129,7 +129,7 @@ pub fn main(what: Inspected, words: Vec<OsString>, color: bool) -> i32 {
     };
     let own = match own(what, words) {
         Ok(own) => own,
-        Err(what) => return refused(&what, USAGE),
+        Err(what) => return refused(&what, Exit::Usage.code()),
     };
     let mut words = own.build;
     let command = match what {
@@ -143,16 +143,16 @@ pub fn main(what: Inspected, words: Vec<OsString>, color: bool) -> i32 {
         Ok(build) => build,
         Err(usage) => {
             eprint!("{}", args::refusal(&usage, color));
-            return USAGE;
+            return Exit::Usage.code();
         }
     };
     let (place, cargo) = match super::prepared_cargo(&build, color) {
         Ok(prepared) => prepared,
-        Err(what) => return refused(&what, FAILED),
+        Err(what) => return refused(&what, Exit::Failed.code()),
     };
     let view = ViewRef::Head(cargo.root.clone());
     // alloc: error path, the refusal said once.
-    let targets = |cargo| place::targets(&build, cargo).map_err(|it| refused(&it.to_string(), FAILED));
+    let targets = |cargo| place::targets(&build, cargo).map_err(|it| refused(&it.to_string(), Exit::Failed.code()));
     let request = match what {
         Inspected::CodegenInputs => match targets(cargo) {
             Ok(targets) => Request::CodegenInputs { view, targets },
@@ -165,7 +165,7 @@ pub fn main(what: Inspected, words: Vec<OsString>, color: bool) -> i32 {
         Inspected::Tables => Request::Tables { view },
         Inspected::Pack => {
             let [program] = &build.flags.packages[..] else {
-                return refused("`blaze pack` packs one program: name its package with `-p PACKAGE`", USAGE);
+                return refused("`blaze pack` packs one program: name its package with `-p PACKAGE`", Exit::Usage.code());
             };
             let program = program.clone(); // clone: the request owns it, once
             match targets(cargo) {
@@ -176,12 +176,12 @@ pub fn main(what: Inspected, words: Vec<OsString>, color: bool) -> i32 {
     };
     let mut client = match daemon::connect(Start::IfMissing) {
         Ok(Some(client)) => client,
-        Ok(None) => return refused("no daemon answers, and none could be started", FAILED),
-        Err(error) => return refused(&format!("{error:#}"), FAILED),
+        Ok(None) => return refused("no daemon answers, and none could be started", Exit::Failed.code()),
+        Err(error) => return refused(&format!("{error:#}"), Exit::Failed.code()),
     };
     let out = own.out.map(|out| place.cwd.join(out));
     let (mut stdout, mut stderr) = (io::stdout().lock(), io::stderr().lock());
-    answer(&mut client, what, request, out.as_deref(), &mut stdout, &mut stderr, color).unwrap_or(FAILED)
+    answer(&mut client, what, request, out.as_deref(), &mut stdout, &mut stderr, color).unwrap_or(Exit::Failed.code())
 }
 
 /// `request` sent and its answer printed on `out` (or, for `trace` and `pack`, written to `to`):
@@ -218,11 +218,11 @@ pub fn answer<A: Api>(
     // dyn: the CLI's output writer, written once per error said.
     let failed = |err: &mut dyn Write, what: &str| -> io::Result<i32> {
         err.write_all(say::error(what, color).as_bytes())?;
-        Ok(FAILED)
+        Ok(Exit::Failed.code())
     };
     match called {
         Ok(true) => {}
-        Ok(false) => return Ok(FAILED),
+        Ok(false) => return Ok(Exit::Failed.code()),
         Err(error) => return failed(err, &error.to_string()),
     }
     match (what, answered) {

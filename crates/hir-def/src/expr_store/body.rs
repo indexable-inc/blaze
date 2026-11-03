@@ -94,22 +94,19 @@ impl ops::Deref for BodySourceMap {
 
 #[blaze_query::tracked]
 impl Body {
-    /// The body with where each part of it is written. For a body written in a file, this is
-    /// [`Body::relative`] with its source map moved to where the body is in the file: the map
-    /// is made once, and an edit elsewhere in the file only moves it. The body is equal to
-    /// [`Body::of`], with the same ids, but lowered again with the map.
-    #[blaze_query::tracked(lru = 512, returns(ref))]
-    pub fn with_source_map(
-        db: &Db,
-        def: DefWithBodyId,
-    ) -> (Arc<Body>, BodySourceMap) {
-        let _p = crate::body_span!(db, def, "body_with_source_map_query").entered();
-        let Some((body, source_map)) = Self::relative(db, def) else {
+    /// Where each part of the body is written. For a body written in a file, this is
+    /// [`Body::relative`] moved to where the body is in the file: the map is made once, and an
+    /// edit elsewhere in the file only moves it. The body it maps is [`Body::of`]: lowering
+    /// again for the map makes the body too, with the same ids, which is checked equal to it
+    /// (the map's ids are `Body::of`'s only by that check) and dropped, so that a body is kept once.
+    #[blaze_query::tracked(lru, weigh = source_map_bytes, returns(ref), mem_tag = Nameres)]
+    pub fn source_map(db: &Db, def: DefWithBodyId) -> BodySourceMap {
+        let _p = crate::body_span!(db, def, "body_source_map_query").entered();
+        let Some(source_map) = Self::relative(db, def) else {
             let of = Self::of(db, def);
             let (body, source_map) = lower_in_file(db, def, of.lowering_with_source_map());
             assert_eq!(body, *of, "{def:?}: the body lowered with its source map");
-            // alloc: the query's value, one per lowered body
-            return (Arc::new(body), source_map);
+            return source_map;
         };
         let syntax = body_syntax(db, def).as_ref().expect("lowered without its syntax");
         let item = def_syntax(db, def).value;
@@ -131,42 +128,39 @@ impl Body {
             store: source_map.store.moved(&mv),
         };
         if check_relative(db) {
-            let lowering = Self::of(db, def).lowering_with_source_map();
-            let (whole, in_file) = lower_in_file(db, def, lowering);
+            let of = Self::of(db, def);
+            let (whole, in_file) = lower_in_file(db, def, of.lowering_with_source_map());
             assert_eq!(in_file, source_map, "{def:?}: the source map lowered alone, moved");
-            assert_eq!(whole.params.len(), body.params.len());
+            assert_eq!(whole.params.len(), of.params.len());
         }
-        // clone: an `Arc`, shared with `Body::relative`'s value
-        (body.clone(), source_map)
+        source_map
     }
 
-    /// The body lowered from [`body_syntax`] rather than from the whole file: what it is made of
-    /// stays the same while edits elsewhere in the file move it, so it is lowered again only
-    /// when its own text changes. The source map is of [`BodySyntax::tree`]. `None`
+    /// The source map of the body lowered from [`body_syntax`] rather than from the whole file:
+    /// what it is made of stays the same while edits elsewhere in the file move it, so it is
+    /// lowered again only when its own text changes. The map is of [`BodySyntax::tree`]. `None`
     /// when the body is not written in a file, but by a macro. Kept for more bodies than
-    /// [`Body::with_source_map`] is: what is lowered again after it is let go of has changed
-    /// to all that reads it. The body is [`Body::of`] lowered again for its map, with the same
-    /// blocks, and checked equal to it.
-    #[blaze_query::tracked(lru = 4096, returns(ref))]
-    pub fn relative(
-        db: &Db,
-        def: DefWithBodyId,
-    ) -> Option<(Arc<Body>, BodySourceMap)> {
+    /// [`Body::source_map`] is: what is lowered again after it is let go of has changed to all
+    /// that reads it. The body it maps is [`Body::of`]: lowered again with the map, with the
+    /// same blocks, it is checked equal to it (the map's ids are
+    /// `Body::of`'s only by that check) and dropped.
+    #[blaze_query::tracked(lru, weigh = relative_bytes, returns(ref), mem_tag = Nameres)]
+    pub fn relative(db: &Db, def: DefWithBodyId) -> Option<BodySourceMap> {
         let _p = crate::body_span!(db, def, "body_relative_query").entered();
         body_syntax(db, def).as_ref()?;
         let of = Self::of(db, def);
         let (body, source_map) = lower_relative(db, def, of.lowering_with_source_map())?;
         assert_eq!(body, *of, "{def:?}: the body lowered with its source map");
-        // alloc: the query's value, one per lowered body
-        Some((Arc::new(body), source_map))
+        Some(source_map)
     }
 
     /// The body without its source map: lowered as [`Body::relative`] is, or from its file for
     /// a body a macro writes, recording no map. Most bodies a build lowers never show where a
     /// part of them is written, so their maps are built only when read: [`Body::relative`] and
-    /// [`Body::with_source_map`] lower the body again, with the map and this body's blocks.
-    /// The body is the memo's own value, lent by reference: no `Arc` and no count to write.
-    #[blaze_query::tracked(returns(ref))]
+    /// [`Body::source_map`] lower the body again for the map, with this body's blocks, and keep
+    /// only the map. The body is the memo's own value, lent by reference: no `Arc` and no count
+    /// to write, and the one copy of it the database keeps.
+    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
     pub fn of(db: &Db, def: DefWithBodyId) -> Body {
         let _p = crate::body_span!(db, def, "body_query").entered();
         match lower_relative(db, def, BodyLowering::Body) {
@@ -187,7 +181,23 @@ impl Body {
     }
 }
 
+/// What dropping a [`Body::source_map`] value frees: the map, the whole value.
+fn source_map_bytes(map: &BodySourceMap) -> usize {
+    map.heap_bytes()
+}
+
+/// What dropping a [`Body::relative`] value frees: its map, the whole value.
+fn relative_bytes(value: &Option<BodySourceMap>) -> usize {
+    value.as_ref().map_or(0, BodySourceMap::heap_bytes)
+}
+
 impl Body {
+    /// The body ([`Body::of`]) with where each part of it is written in its file
+    /// ([`Body::source_map`]).
+    pub fn with_source_map(db: &Db, def: DefWithBodyId) -> (&Body, &BodySourceMap) {
+        (Self::of(db, def), Self::source_map(db, def))
+    }
+
     /// How to lower this body again for its source map: with its blocks.
     fn lowering_with_source_map(&self) -> BodyLowering<'_> {
         BodyLowering::SourceMap { blocks: self.store.block_scopes() }
@@ -200,21 +210,20 @@ impl Body {
         Some(def_syntax(db, def).value.text_range().start() - syntax.item.text_range().start())
     }
 
-    /// The source map of [`Body::relative`] when there is one, and of
-    /// [`Body::with_source_map`] when there is not: for what needs of it only the file or the
-    /// expansion each part is written in, and the macro calls, and not where in the file.
-    /// It stays the same while edits elsewhere in the file move the body.
+    /// The source map of [`Body::relative`] when there is one, and of [`Body::source_map`]
+    /// when there is not: for what needs of it only the file or the expansion each part is
+    /// written in, and the macro calls, and not where in the file. It stays the same while
+    /// edits elsewhere in the file move the body.
     pub fn unmoved_source_map(db: &Db, def: DefWithBodyId) -> &BodySourceMap {
-        Self::unmoved(db, def).1
+        match Self::relative(db, def) {
+            Some(it) => it,
+            None => Self::source_map(db, def),
+        }
     }
 
-    /// [`Body::unmoved_source_map`] with the body it maps.
+    /// [`Body::unmoved_source_map`] with the body it maps, [`Body::of`].
     pub fn unmoved(db: &Db, def: DefWithBodyId) -> (&Body, &BodySourceMap) {
-        let (body, source_map) = match Self::relative(db, def) {
-            Some(it) => it,
-            None => Self::with_source_map(db, def),
-        };
-        (&**body, source_map)
+        (Self::of(db, def), Self::unmoved_source_map(db, def))
     }
 }
 
@@ -324,7 +333,7 @@ fn lower_in_file(
     )
 }
 
-/// Whether [`Body::with_source_map`] checks the source map of each body lowered alone, moved,
+/// Whether [`Body::source_map`] checks the source map of each body lowered alone, moved,
 /// against that of the same body lowered in its file, and [`BodySyntax::tree`] parses every
 /// anchor again and prints the ones that parse differently alone (`RA_CHECK_RELATIVE_BODIES`,
 /// [`base_db::FrontSettings::check_relative_bodies`]).
@@ -741,6 +750,13 @@ fn anchored_body_syntax(
 }
 
 impl Body {
+    /// The heap the body owns, in bytes: its store's ([`ExpressionStore::heap_bytes`]) and its
+    /// parameters.
+    pub fn heap_bytes(&self) -> usize {
+        let Body { store, params, self_param: _ } = self;
+        store.heap_bytes() + size_of_val::<[Param<PatId>]>(params)
+    }
+
     pub fn root_expr(&self) -> ExprId {
         // A `Body` can also contain root expressions that aren't the body (in the param patterns),
         // but the body always come last.
@@ -787,6 +803,13 @@ impl Body {
 }
 
 impl BodySourceMap {
+    /// The heap the map owns, in bytes: its store's map's
+    /// ([`ExpressionStoreSourceMap::heap_bytes`]).
+    pub fn heap_bytes(&self) -> usize {
+        let BodySourceMap { self_param: _, store } = self;
+        store.heap_bytes()
+    }
+
     pub fn self_param_syntax(&self) -> Option<InFile<SelfParamPtr>> {
         self.self_param
     }

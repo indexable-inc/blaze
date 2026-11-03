@@ -313,8 +313,9 @@ class Scratch(Side):
     @contextlib.contextmanager
     def session(self):
         self.count += 1
-        # Under /tmp, short: a daemon's socket is under its home, and macOS allows 104 bytes.
-        home = tempfile.mkdtemp(prefix="bz-scratch-", dir="/tmp" if not WINDOWS else None)
+        # macOS: under /tmp, as a daemon's socket is under its home and macOS allows 104 bytes.
+        # Elsewhere $TMPDIR: /tmp may be a tmpfs, which can't share blocks with blaze's cache.
+        home = tempfile.mkdtemp(prefix="bz-scratch-", dir="/tmp" if sys.platform == "darwin" else None)
         target = os.path.join(self.ws, "target-scratch")
         shutil.rmtree(target, ignore_errors=True)
         fresh = dict(base_env(home), **{k: v for k, v in self.env.items() if k != "BLAZE_HOME"})

@@ -2460,7 +2460,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         self.push_assignment(current, base.into(), null.into(), span);
         let mut place = Place::from(base).project(ProjectionElem::Deref);
         let mut variant = None;
-        for name in &offset.fields {
+        for (index, name) in offset.fields.iter().enumerate() {
             let no_field = MirLowerError::TypeError("no such field in offset_of");
             let (field, field_ty) = match ty.kind() {
                 TyKind::Tuple(tys) => {
@@ -2471,7 +2471,10 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     let of = match (adt.def_id(), variant.take()) {
                         (_, Some(variant)) => VariantId::EnumVariantId(variant),
                         (AdtId::EnumId(it), None) => {
-                            let id = it.enum_variants(self.db).variant(name).ok_or(no_field)?;
+                            // Looked up hygienically, as inference does (`variant_written`).
+                            let ctxt = offset.field_hygiene(index).syntax_context();
+                            let id = hir_def::signatures::EnumVariants::variant_written(self.db, it, name, ctxt)
+                                .ok_or(no_field)?;
                             place = place.project(ProjectionElem::Downcast(id.into()));
                             variant = Some(id);
                             continue;
@@ -2479,7 +2482,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         (AdtId::StructId(it), None) => it.into(),
                         (AdtId::UnionId(it), None) => it.into(),
                     };
-                    let field = of.fields(self.db).field(name).ok_or(no_field)?;
+                    // Looked up hygienically, as a field access is (rustc's
+                    // `check_expr_offset_of`); positional fields by their index alone.
+                    let hygiene = offset.field_hygiene(index);
+                    let field =
+                        of.fields(self.db).field_written(self.db, of, name, hygiene).ok_or(no_field)?;
                     let field_ty = self.db.field_types(of)[field]
                         .ty()
                         .instantiate(interner, args)
@@ -4851,7 +4858,7 @@ pub fn inline_const_at<'db>(
             ty: StoredEarlyBinder::bind(DbInterner::new_no_crate(db), ty.store()),
             allow_using_generic_params: true,
         },
-        token,
+        &token,
     ))
 }
 
@@ -5440,7 +5447,7 @@ pub(crate) fn lower_body<'db>(db: &'db Db, def: InferBodyId<'db>) -> Result<'db,
 }
 
 /// The body of the constant behind a promoted `&expr` of `def`, which evaluates `expr` alone.
-#[blaze_query::tracked(returns(as_ref), lru = 0)]
+#[blaze_query::tracked(returns(as_ref), lru = 0, mem_tag = Mir)]
 pub fn promoted_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,

@@ -17,10 +17,10 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind as _},
 };
 use hir_ty::{
-    GenericPredicates, Span,
+    Span,
     db::HirDatabase as _,
     next_solver::{
-        Clauses, DbInterner, FnSig, GenericArgKind, GenericArgs, ParamEnv, Region,
+        DbInterner, FnSig, GenericArgKind, GenericArgs, ParamEnv, Region,
         RegionExt as _, RegionKind, SolverDefId, Ty, TypingMode, references_non_lt_error,
         infer::{BoundRegionConversionTime, DbInternerInferExt as _, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
@@ -197,18 +197,9 @@ pub fn compare_impl_method_signature<'db>(
         return None;
     }
 
-    // The impl's where clauses, and the trait method's own instantiated for the impl's.
-    let hybrid = GenericPredicates::query_all(db, impl_.into())
-        .iter_identity()
-        .map(|it| it.skip_norm_wip())
-        .chain(
-            GenericPredicates::query_own_explicit(db, trait_method.into())
-                .iter_instantiated(interner, trait_to_impl_args.as_slice())
-                .map(|it| it.skip_norm_wip()),
-        );
-    let param_env = ParamEnv::new(Clauses::new_from_iter(rustc_type_ir::elaborate::elaborate(
-        interner, hybrid,
-    )));
+    // rustc's hybrid environment: the impl's where clauses, and the trait method's own
+    // instantiated for the impl's, normalized.
+    let param_env = hir_ty::hybrid_param_env(interner, impl_, trait_method, trait_to_impl_args);
 
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
     let mut ocx = ObligationCtxt::new(&infcx);
@@ -219,9 +210,15 @@ pub fn compare_impl_method_signature<'db>(
         impl_poly_sig,
     );
     // rustc's solver normalizes eagerly: a projection that normalizes to the other's type
-    // agrees with it. One that can't be normalized is compared as written.
-    let impl_sig = ocx.deeply_normalize(&cause, param_env, impl_sig).unwrap_or(impl_sig);
-    let trait_sig = ocx.deeply_normalize(&cause, param_env, trait_sig).unwrap_or(trait_sig);
+    // agrees with it. A signature that does not normalize is not compared: rustc reports the
+    // normalization's failure (E0277), not E0053, and `impl_rpitit_tys` gives its RPITITs
+    // no type (`RpititError::Unnormalized`).
+    let (Ok(impl_sig), Ok(trait_sig)) = (
+        ocx.deeply_normalize(&cause, param_env, impl_sig),
+        ocx.deeply_normalize(&cause, param_env, trait_sig),
+    ) else {
+        return None;
+    };
 
     let error = ocx.sup(&cause, param_env, trait_sig, impl_sig).err()?;
     let at = SignatureMismatchAt::of(&error, trait_sig.inputs().len());

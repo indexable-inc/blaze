@@ -1,7 +1,8 @@
-diff -ruN a/src/canonical/canonicalizer.rs b/src/canonical/canonicalizer.rs
+diff --git a/src/canonical/canonicalizer.rs b/src/canonical/canonicalizer.rs
+index fca0536..20f9c61 100644
 --- a/src/canonical/canonicalizer.rs
 +++ b/src/canonical/canonicalizer.rs
-@@ -410,7 +410,8 @@
+@@ -410,7 +410,8 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
              | ty::Alias(_, _)
              | ty::Bound(_, _)
              | ty::Error(_) => {
@@ -11,10 +12,11 @@ diff -ruN a/src/canonical/canonicalizer.rs b/src/canonical/canonicalizer.rs
              }
          };
  
-diff -ruN a/src/normalize.rs b/src/normalize.rs
+diff --git a/src/normalize.rs b/src/normalize.rs
+index c7d8d29..d633c67 100644
 --- a/src/normalize.rs
 +++ b/src/normalize.rs
-@@ -106,7 +106,8 @@
+@@ -106,7 +106,8 @@ where
  
          // With eager normalization, we should normalize the args of alias before
          // normalizing the alias itself.
@@ -24,7 +26,7 @@ diff -ruN a/src/normalize.rs b/src/normalize.rs
          let ty::Alias(orig_is_rigid, alias_ty) = ty.kind() else { return Ok(ty) };
          // We support ambiguous aliases inside rigid alias. So we still recognize
          // the rigidness of the outer alias.
-@@ -157,7 +158,8 @@
+@@ -157,7 +158,8 @@ where
  
          // With eager normalization, we should normalize the args of alias before
          // normalizing the alias itself.

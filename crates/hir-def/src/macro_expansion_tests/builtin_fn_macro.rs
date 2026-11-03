@@ -130,7 +130,7 @@ fn main() {
         ModuleDefId::FunctionId(it) => Some(it),
         _ => None,
     });
-    let (_, source_map) = Body::with_source_map(&db, main.unwrap().into());
+    let source_map = Body::source_map(&db, main.unwrap().into());
     let mut placed = source_map
         .macro_calls()
         .map(|(_, call)| {
@@ -801,7 +801,7 @@ fn on_oom(_: alloc::Layout) -> ! { loop {} }
 fn on_oom(_: alloc::Layout) -> ! {
     loop {}
 }
-#[unsafe (export_name = "__rg_oom")] unsafe extern "C" fn __rg_oom(size: usize, align: usize) -> ! {
+#[unsafe (export_name = "__rg_oom")] unsafe fn __rg_oom(size: usize, align: usize) -> ! {
     on_oom(unsafe {
         $crate::alloc::Layout::from_size_align_unchecked(size, align)
     }

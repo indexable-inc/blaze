@@ -124,7 +124,7 @@ fn infer_defs<'db>(
 
         defs.push((
             InferBodyId::DefWithBodyId(def_with_body),
-            &***body,
+            &**body,
             &**source_map,
             root_expr,
             body.self_param.map(|param| (param.formal, source_map.self_param_syntax())),
@@ -606,13 +606,13 @@ fn ellipsize(mut text: String, max_len: usize) -> String {
     text
 }
 
-fn check_infer(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check_infer(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let mut actual = infer(ra_fixture);
     actual.push('\n');
     expect.assert_eq(&actual);
 }
 
-fn check_infer_with_mismatches(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check_infer_with_mismatches(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let mut actual = infer_with_mismatches(ra_fixture, true);
     actual.push('\n');
     expect.assert_eq(&actual);

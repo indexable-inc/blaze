@@ -904,7 +904,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "type_name generic arg is not provided".into(),
                     ));
                 };
-                let ty_name = match crate::mir::type_name::rustc_type_name_or_refusal(self.db, ty) {
+                let ty_name = match hir_ty_print::rustc_type_name_or_refusal(self.db, ty) {
                     Ok(it) => it,
                     // alloc: error path
                     Err(why) => {
@@ -2247,7 +2247,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let InferBodyId::DefWithBodyId(body) = owner else {
             not_supported!("the caller's location in an anonymous constant");
         };
-        let Some((file, line, col)) = *source_location_in_file(self.db, body, span) else {
+        let Some((file, line, col)) = source_location_in_file(self.db, body, span) else {
             not_supported!("the caller's location: no place for {span:?}");
         };
         let Some(name) = source_path(self.db, file) else {

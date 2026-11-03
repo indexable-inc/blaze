@@ -251,7 +251,7 @@ impl Fake {
         self.complete(tag, Done::Read(bytes));
     }
 
-    fn say(&mut self, conn: Conn, frame: Frame) {
+    fn say(&mut self, conn: Conn, frame: &Frame) {
         self.say_bytes(conn, frame.to_bytes());
     }
 
@@ -270,7 +270,7 @@ impl Fake {
 
     fn say_hello(&mut self, conn: Conn, tests: &[&str], fork: u64, pid: u32) {
         let tests = tests.iter().map(|it| (*it).to_owned()).collect();
-        self.say(conn, Frame::Hello { version: wire::VERSION, pid, fork, tests });
+        self.say(conn, &Frame::Hello { version: wire::VERSION, pid, fork, tests });
     }
 
     /// How many replicas `conn` was asked for since the last call; the rest of what it was
@@ -288,7 +288,7 @@ impl Fake {
     }
 
     fn end_with(&mut self, conn: Conn, id: u64, end: End, output: &[u8], executed: Executed) {
-        self.say(conn, Frame::Ended { id, end, output: output.to_vec(), executed });
+        self.say(conn, &Frame::Ended { id, end, output: output.to_vec(), executed });
     }
 
     /// The frames sent to `conn` since the last call.
@@ -731,7 +731,7 @@ fn a_server_that_breaks_the_protocol_or_hangs_up_is_killed() {
                 "broke the protocol"
             }
             1 => {
-                fake.say(conn, Frame::Run { id: 0, index: 0 });
+                fake.say(conn, &Frame::Run { id: 0, index: 0 });
                 "broke the protocol"
             }
             _ => {

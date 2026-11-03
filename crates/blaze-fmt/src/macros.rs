@@ -217,7 +217,7 @@ fn rewrite_macro_inner(
         original_style
     };
 
-    let ts = mac.args.tokens.clone();
+    let ts = &mac.args.tokens;
     let has_comment = contains_comment(context.snippet(mac.span()));
     if ts.is_empty() && !has_comment {
         return match style {
@@ -237,7 +237,7 @@ fn rewrite_macro_inner(
             && macro_name == "lazy_static::lazy_static!"))
         && !has_comment
     {
-        match format_lazy_static(context, shape, ts.clone(), mac.span(), &macro_name) {
+        match format_lazy_static(context, shape, ts, mac.span(), &macro_name) {
             Ok(rw) => return Ok(rw),
             Err(err) => match err {
                 // We will move on to parsing macro args just like other macros
@@ -251,7 +251,7 @@ fn rewrite_macro_inner(
     }
 
     if is_nightly_channel!() && macro_name.ends_with("cfg_select!") {
-        match format_cfg_select(context, shape, mac.span(), &macro_name, style, ts.clone()) {
+        match format_cfg_select(context, shape, mac.span(), &macro_name, style, ts) {
             Ok(rw) => return Ok(rw),
             Err(err) => match err {
                 // We will move on to parsing macro args just like other macros
@@ -303,7 +303,7 @@ fn rewrite_macro_inner(
         Delimiter::Parenthesis => {
             // Handle special case: `vec!(expr; expr)`
             if vec_with_semi {
-                handle_vec_semi(context, shape, arg_vec, macro_name, style, mac.span())
+                handle_vec_semi(context, shape, &arg_vec, &macro_name, style, mac.span())
             } else {
                 // Format macro invocation as function call, preserve the trailing
                 // comma because not all macros support them.
@@ -329,7 +329,7 @@ fn rewrite_macro_inner(
         Delimiter::Bracket => {
             // Handle special case: `vec![expr; expr]`
             if vec_with_semi {
-                handle_vec_semi(context, shape, arg_vec, macro_name, style, mac.span())
+                handle_vec_semi(context, shape, &arg_vec, &macro_name, style, mac.span())
             } else {
                 // If we are rewriting `vec!` macro or other special macros,
                 // then we can rewrite this as a usual array literal.
@@ -379,8 +379,8 @@ fn rewrite_macro_inner(
 fn handle_vec_semi(
     context: &RewriteContext<'_>,
     shape: Shape,
-    arg_vec: Vec<MacroArg>,
-    macro_name: String,
+    arg_vec: &[MacroArg],
+    macro_name: &str,
     delim_token: Delimiter,
     span: Span,
 ) -> RewriteResult {
@@ -938,7 +938,7 @@ impl MacroArgParser {
     }
 
     /// Returns a collection of parsed macro def's arguments.
-    fn parse(mut self, tokens: TokenStream) -> Option<Vec<ParsedMacroArg>> {
+    fn parse(mut self, tokens: &TokenStream) -> Option<Vec<ParsedMacroArg>> {
         let mut iter = tokens.iter();
 
         while let Some(tok) = iter.next() {
@@ -983,7 +983,7 @@ impl MacroArgParser {
 
                     // Parse the stuff inside delimiters.
                     let parser = MacroArgParser::new();
-                    let delimited_arg = parser.parse(tts.clone())?;
+                    let delimited_arg = parser.parse(tts)?;
 
                     if self.is_meta_var {
                         self.add_repeat(delimited_arg, delimited, &mut iter)?;
@@ -1059,10 +1059,10 @@ fn wrap_macro_args_inner(
 // and `(`/`)` have special meaning.
 fn format_macro_args(
     context: &RewriteContext<'_>,
-    token_stream: TokenStream,
+    token_stream: &TokenStream,
     shape: Shape,
 ) -> RewriteResult {
-    let span = span_for_token_stream(&token_stream);
+    let span = span_for_token_stream(token_stream);
     if !context.config.format_macro_matchers() {
         return Ok(match span {
             Some(span) => context.snippet(span).to_owned(),
@@ -1184,11 +1184,9 @@ pub(crate) fn convert_try_mac(
 ) -> Option<ast::Expr> {
     let path = &pprust::path_to_string(&mac.path);
     if path == "try" || path == "r#try" {
-        let ts = mac.args.tokens.clone();
-
         Some(ast::Expr {
             id: ast::NodeId::root(), // dummy value
-            kind: ast::ExprKind::Try(parse_expr(context, ts)?),
+            kind: ast::ExprKind::Try(parse_expr(context, &mac.args.tokens)?),
             span: mac.span(), // incorrect span, but shouldn't matter too much
             attrs: ast::AttrVec::new(),
             tokens: None,
@@ -1330,7 +1328,7 @@ impl MacroBranch {
         }
         let mut result = format_macro_args(
             context,
-            self.args.clone(),
+            &self.args,
             shape.sub_width(prefix_width, self.span)?,
         )?;
 
@@ -1462,7 +1460,7 @@ impl MacroBranch {
 fn format_lazy_static(
     context: &RewriteContext<'_>,
     shape: Shape,
-    ts: TokenStream,
+    ts: &TokenStream,
     span: Span,
     macro_name: &str,
 ) -> RewriteResult {
@@ -1565,7 +1563,7 @@ fn format_cfg_select(
     span: Span,
     name: &str,
     delim_token: Delimiter,
-    ts: TokenStream,
+    ts: &TokenStream,
 ) -> RewriteResult {
     let mut rewrite = String::with_capacity((span.hi() - span.lo()).to_usize() * 2);
     rewrite.push_str(name);

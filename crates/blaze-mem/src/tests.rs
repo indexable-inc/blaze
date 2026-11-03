@@ -272,6 +272,88 @@ fn anon_huge_kib(addr: usize) -> u64 {
     0
 }
 
+/// Writes one byte at the start of every 2 MiB of `[base, base + bytes)`: the touch pattern of
+/// a sparse table, which under `transparent_hugepage=always` costs 2 MiB per byte unless the
+/// range is opted out.
+#[cfg(target_os = "linux")]
+fn touch_sparsely(base: *mut u8, bytes: usize) {
+    for at in (0..bytes).step_by(2 << 20) {
+        // SAFETY: the caller's range is committed and its own.
+        unsafe { base.wrapping_add(at).write_volatile(1) };
+    }
+}
+
+/// The host's `transparent_hugepage/enabled` is `always`: the setting under which an
+/// unadvised range gets huge pages, so the only one that tells an opt-out from none.
+#[cfg(target_os = "linux")]
+fn thp_always() -> bool {
+    std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").is_ok_and(|it| it.contains("[always]"))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_base_page_region_touched_sparsely_has_no_huge_pages_on_linux() {
+    let mut region = Region::reserve_pages(64 << 20, Pages::Base, Tag::Other).expect("reserve");
+    region.ensure(64 << 20).expect("commit");
+    touch_sparsely(region.base().as_ptr(), 64 << 20);
+    let kib = anon_huge_kib(region.base().as_ptr().addr());
+    assert_eq!(
+        kib, 0,
+        "a base-page region touched once per 2 MiB has {kib} KiB on huge pages (host THP \
+         `always`: {}): it is not advised MADV_NOHUGEPAGE",
+        thp_always()
+    );
+    // Decommitting maps the tail afresh, which loses advice; touched again it stays base.
+    region.decommit_after(4 << 20).expect("decommit");
+    region.ensure(64 << 20).expect("commit again");
+    touch_sparsely(region.base().as_ptr(), 64 << 20);
+    let kib = anon_huge_kib(region.at(32 << 20).as_ptr().addr());
+    assert_eq!(kib, 0, "a decommitted and recommitted base-page tail has {kib} KiB on huge pages");
+    let snapshot = crate::tag::snapshot();
+    assert!(
+        snapshot.base_pages >= 64 << 20 && snapshot.base_pages <= snapshot.reserved,
+        "the profile counts the region as opted out: {} of {} reserved",
+        snapshot.base_pages,
+        snapshot.reserved
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_sparse_region_touched_sparsely_has_no_huge_pages_on_linux() {
+    let region = Region::reserve_sparse(64 << 20, Tag::Other).expect("reserve");
+    touch_sparsely(region.base().as_ptr(), 64 << 20);
+    let kib = anon_huge_kib(region.base().as_ptr().addr());
+    assert_eq!(kib, 0, "a sparse region touched once per 2 MiB has {kib} KiB on huge pages");
+}
+
+/// Memory no region of ours advised (an anonymous mapping, as libc or a thread stack makes)
+/// follows the process policy set with the pages chosen: none under `always` once opted out.
+#[cfg(target_os = "linux")]
+#[test]
+fn unadvised_memory_follows_the_process_opt_out_on_linux() {
+    huge::chosen().expect("BLAZE_HUGE_PAGES is readable");
+    let thp = huge::thp();
+    assert_ne!(thp, huge::Thp::Unset, "choosing the pages sets the process policy");
+    assert_eq!(crate::tag::snapshot().thp, thp, "the profile says the policy");
+    if thp == huge::Thp::Unavailable {
+        // A kernel before 6.18 under the default transparent setting: only our regions are
+        // opted out, which the tests above hold.
+        return;
+    }
+    let bytes = 64 << 20;
+    // SAFETY: a fresh anonymous mapping, unmapped below.
+    let base = unsafe {
+        libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+    };
+    assert_ne!(base, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
+    touch_sparsely(base.cast(), bytes);
+    let kib = anon_huge_kib(base.addr());
+    // SAFETY: the mapping made above, no longer used.
+    unsafe { libc::munmap(base, bytes) };
+    assert_eq!(kib, 0, "an unadvised mapping has {kib} KiB on huge pages under the process policy {thp}");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn a_transparent_region_is_made_of_huge_pages_on_linux() {
@@ -1559,6 +1641,22 @@ fn arena_gives_chunks_back_and_takes_them_again_warm() {
     assert!(values.iter().enumerate().all(|(i, &&v)| v == i as u64));
     assert_eq!(second.held(), held, "the same work holds the same chunks");
     assert!(chunks::carved_bytes() >= held);
+}
+
+/// coord-102 (B5): the daemon's loop opens no task, so what it allocated counted to no tag.
+/// Inside `heap_of` the global heap outside any task counts to its tag, and nothing else that
+/// asks for the running task changes: the thread is in no task, and a task opened inside counts
+/// to its own tag.
+#[test]
+fn heap_of_names_the_heap_outside_any_task_and_opens_no_task() {
+    assert_eq!(frame::running_tag(), None);
+    frame::heap_of(Tag::Plane, || {
+        assert_eq!(frame::running_tag(), Some(Tag::Plane));
+        assert!(!frame::in_task(), "heap_of opens no frame");
+        frame::task(Tag::Nameres, |_| assert_eq!(frame::running_tag(), Some(Tag::Nameres)));
+        assert_eq!(frame::running_tag(), Some(Tag::Plane));
+    });
+    assert_eq!(frame::running_tag(), None, "the holder ends with heap_of");
 }
 
 /// A reset gives back more chunks than one `give_all` run moves: every one leaves the arena's

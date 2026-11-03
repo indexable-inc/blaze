@@ -125,6 +125,8 @@ pub(crate) enum What {
     Common,
     Got { kind: GotKind, target: Sym },
     Plt { target: Sym },
+    /// An AArch64 range-extension thunk to `target` in island `island` ([`crate::thunk`]).
+    Thunk { target: Sym, island: u32 },
     Fde,
     WinInfo,
     /// A Mach-O TLV descriptor of a thread-local static.
@@ -139,8 +141,9 @@ pub(crate) enum What {
 }
 
 impl What {
-    /// Whether the piece is a GOT cell or PLT stub: the linker's own, made for the fixups that
-    /// reach their target through it (`Stage::needs`), and gone with its target
+    /// Whether the piece is a GOT cell, PLT stub or thunk: the linker's own, made for the
+    /// fixups that reach their target through it (`Stage::needs`, `Stage::thunks`), and gone
+    /// with its target
     /// (`Stage::cells_of_removed`). It is no user of its target: each fixup it was made for
     /// refers to the target itself. Counted, a cell would keep alive the data it holds the
     /// address of after the last code reading it went (a vtable naming a function the same
@@ -148,7 +151,7 @@ impl What {
     /// of shared pieces ([`State::users`]) nor native collection counts it.
     #[inline]
     pub fn is_linkers_cell(self) -> bool {
-        matches!(self, What::Got { .. } | What::Plt { .. })
+        matches!(self, What::Got { .. } | What::Plt { .. } | What::Thunk { .. })
     }
 }
 
@@ -498,6 +501,9 @@ pub(crate) struct State {
     /// What the image is across its generations: its first full link's.
     pub lineage: [u8; 16],
     pub laid_out: bool,
+    /// One past the last thunk island index given ([`crate::thunk`]): a full link's segments,
+    /// then one per incremental stage whose new code needed a thunk.
+    pub islands: u32,
 
     hot: CowVec<Hot>,
     what: CowVec<What>,
@@ -558,6 +564,7 @@ impl State {
             encoded: Arc::default(),
             lineage: [0; 16],
             laid_out: false,
+            islands: 0,
             hot: CowVec::default(),
             what: CowVec::default(),
             sort: CowVec::default(),
@@ -734,13 +741,36 @@ impl State {
     /// what is live, bytes what is held, garbage and removed pieces included, without the
     /// chunk tables or the room left in a last chunk.
     pub fn tables(&self) -> Vec<(&'static str, u64, u64)> {
+        let [pieces, relocations, symbol_bytes, loader, functions, lines, slots, file] = self.table_bytes();
+        let live = self.hot.iter().filter(|it| it.live()).count() as u64;
+        let symbols = self.defs.iter().map(|it| it.len() as u64).sum::<u64>();
+        // alloc: a report of eight rows, off any link's path
+        vec![
+            ("link-piece", live, pieces),
+            ("relocation", self.fixups.live() as u64, relocations),
+            ("link-symbol", symbols, symbol_bytes),
+            ("link-loader", (self.rebase.live() + self.binds.live()) as u64, loader),
+            ("link-function", self.functions.len() as u64, functions),
+            ("link-line", self.lines.live() as u64, lines),
+            ("link-slot", u64::from(self.slots), slots),
+            ("link-file-part", self.parts.len() as u64, file),
+        ]
+    }
+
+    /// The bytes of [`State::tables`]' rows together, without walking any column: what a
+    /// kept image's weight counts of its state ([`crate::Image::held`]).
+    pub fn held(&self) -> u64 {
+        self.table_bytes().iter().sum()
+    }
+
+    /// The bytes of each of [`State::tables`]' rows, in its order.
+    fn table_bytes(&self) -> [u64; 8] {
         fn vec<T: crate::cow::Chunked>(column: &CowVec<T>) -> u64 {
             (column.len() * size_of::<T>()) as u64
         }
         fn list<T: crate::cow::Chunked>(lists: &CowList<T>) -> u64 {
             ((lists.live() + lists.garbage()) * size_of::<T>()) as u64
         }
-        let live = self.hot.iter().filter(|it| it.live()).count() as u64;
         let pieces = vec(&self.hot)
             + vec(&self.what)
             + vec(&self.sort)
@@ -748,7 +778,6 @@ impl State {
             + vec(&self.users)
             + vec(&self.removals)
             + (self.classes.len() * size_of::<Class>()) as u64;
-        let symbols = self.defs.iter().map(|it| it.len() as u64).sum::<u64>();
         let symbol_bytes = self.defs.iter().map(vec).sum::<u64>()
             + self.cold.iter().map(vec).sum::<u64>()
             + self.ids.iter().map(vec).sum::<u64>()
@@ -760,17 +789,7 @@ impl State {
         let loader = vec(&self.loader) + list(&self.rebase) + list(&self.binds);
         let slots = vec(&self.slot_syms) + vec(&self.cells) + vec(&self.slot_next);
         let file = self.parts.iter().map(|(_, bytes)| bytes.len() as u64).sum::<u64>();
-        // alloc: a report of eight rows, off any link's path
-        vec![
-            ("link-piece", live, pieces),
-            ("relocation", self.fixups.live() as u64, list(&self.fixups)),
-            ("link-symbol", symbols, symbol_bytes),
-            ("link-loader", (self.rebase.live() + self.binds.live()) as u64, loader),
-            ("link-function", self.functions.len() as u64, vec(&self.functions)),
-            ("link-line", self.lines.live() as u64, list(&self.lines)),
-            ("link-slot", u64::from(self.slots), slots),
-            ("link-file-part", self.parts.len() as u64, file),
-        ]
+        [pieces, list(&self.fixups), symbol_bytes, loader, vec(&self.functions), list(&self.lines), slots, file]
     }
 
     /// A live piece.

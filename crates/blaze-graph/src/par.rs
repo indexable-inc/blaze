@@ -247,7 +247,8 @@ unsafe impl<A: Source, B: Source> Source for Zip<A, B> {
 /// A source's items with their indices.
 pub struct Enumerate<S>(S);
 
-// SAFETY: as `S`'s.
+// SAFETY: each item is `S`'s item at the same index, read once as `S`'s contract asks, with that
+// index beside it.
 unsafe impl<S: Source> Source for Enumerate<S> {
     type Item = (usize, S::Item);
 
@@ -486,15 +487,29 @@ pub fn join<A: Send, B>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B) -> 
     }
 }
 
-/// `task(at)` for each `at` in `0..count`, each once, as a job of its own on the pool a loop
-/// called here runs on: the tasks whose run unwound with a payload `gave_way` accepts (a wait
-/// that would close a cycle gave way), in order, for the caller to run again on its own thread,
-/// where it meets the cycle on its own stack. Never again here: another round on the pool
-/// would meet the same cycle, held by this caller (or a task below it) until it returns. The
-/// first other panic is raised once every task has run.
+/// Items of a [`for_each_giving_way`] loop started and not yet ended at once, per worker of its
+/// pool: four, as [`crate::sched::fiber::Config::for_cores`] keeps four fibers per core. An item
+/// that waits parks its job's fiber, and its worker starts the next job; with every item a job
+/// of its own, nothing bounded the items parked at once. coord-108's `blaze test` over 21
+/// crates had 5369 `run_all task`s parked on 17 workers, each in a task frame of at least one
+/// 2 MiB chunk plus a fiber stack: frames went from 2 GiB to 12.46 GiB in 0.3 s.
+pub const WINDOW: usize = 4;
+
+/// `task(at)` for each `at` in `0..count`, each once, as a job on the pool a loop called here
+/// runs on: the tasks whose run unwound with a payload `gave_way` accepts (a wait that would
+/// close a cycle gave way), in order, for the caller to run again on its own thread, where it
+/// meets the cycle on its own stack. Never again here: another round on the pool would meet
+/// the same cycle, held by this caller (or a task below it) until it returns. The first other
+/// panic is raised once every task has run.
 ///
-/// Each task is a job, never a call on this thread in the caller's task, so a task that asks
-/// for a key the caller runs gives way rather than being taken for the caller's own ask.
+/// Each task runs in a job, never as a call on this thread in the caller's task, so a task
+/// that asks for a key the caller runs gives way rather than being taken for the caller's own
+/// ask. At most [`WINDOW`] per worker are started and not ended at once: that many jobs (or
+/// `count`, if fewer) each claim the next task and run it, then the next, so a task that waits
+/// holds its job, and the loop's tasks parked at once stay within the window. So a task must
+/// never wait for a later task of its loop to start: it may wait for a key's run or a slot's
+/// filler, which is a task that began (or it runs the key itself), never for one not yet
+/// claimed.
 pub fn for_each_giving_way(
     count: usize,
     task: impl Fn(usize) + Sync,
@@ -504,25 +519,42 @@ pub fn for_each_giving_way(
     let again: SegQueue<usize> = SegQueue::new();
     // dyn: as above
     let other: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
+    let next = AtomicUsize::new(0);
     let near = pool::group();
-    let (task, gave_way, again, other) = (&task, &gave_way, &again, &other);
+    let jobs = count.min(pool::threads_here() * WINDOW);
+    let claim = || {
+        loop {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            if at >= count {
+                break;
+            }
+            let Err(panic) = catch_unwind(AssertUnwindSafe(|| task(at))) else { continue };
+            if gave_way(&*panic) {
+                again.push(at);
+                // This job goes on to its next task, not the same ask: the give-way counts
+                // toward no bound, however many tasks give way to one run.
+                pump::rerun_later();
+            } else {
+                other.lock_said("a loop's first panic").get_or_insert(panic);
+            }
+        }
+    };
+    // A job's own unwind (not a task's: each is caught above) is a panic of the loop too.
+    let caught = |ran: thread::Result<()>| {
+        if let Err(panic) = ran {
+            other.lock_said("a loop's first panic").get_or_insert(panic);
+        }
+    };
     pool::scope_here(|scope| {
-        for at in 0..count {
-            scope.submit(near, move || task(at), move |ran| {
-                let Err(panic) = ran else { return };
-                if gave_way(&*panic) {
-                    again.push(at);
-                } else {
-                    other.lock_said("a loop's first panic").get_or_insert(panic);
-                }
-            });
+        for _ in 0..jobs {
+            scope.submit(near, &claim, &caught);
         }
     });
-    if let Some(panic) = other.lock_said("a loop's first panic").take() {
+    if let Some(panic) = other.into_inner() {
         resume_unwind(panic);
     }
     // alloc: the tasks that gave way, few, once per batch
-    let mut again: Vec<usize> = std::iter::from_fn(|| again.pop()).collect();
+    let mut again: Vec<usize> = again.into_iter().collect();
     again.sort_unstable();
     again
 }
@@ -792,6 +824,16 @@ mod tests {
     use parking_lot::Mutex;
 
     use crate::{Cancelled, Key, pool::Pool, pump::Flights, topology::Topology};
+
+    /// How many jobs wait in the scheduler for a run of this thread's job. A test whose next ask
+    /// must close a cycle through them waits for this, not for them to be linked to the run
+    /// (`Flights::waiters`): an ask links itself first and waits in the scheduler after, so an
+    /// ask made in between finds no cycle, and the other job's wait is the one refused.
+    fn waiting_on_me() -> usize {
+        let me = crate::sched::job_here();
+        let waits = crate::sched::waits_now().0;
+        waits.iter().filter(|(_, on)| matches!(on, crate::sched::StallWait::Key { claimer: Some(it), .. } if *it == me)).count()
+    }
 
     const LONG: Duration = Duration::from_secs(60);
 
@@ -1066,7 +1108,7 @@ mod tests {
                 move || {
                     flights.get_or_run(k, || {
                         c_runs_k.store(true, Ordering::Release);
-                        crate::spin::SpinWait::within("T to wait on K", LONG, || flights.waiters(k) == 1);
+                        crate::spin::SpinWait::within("T to wait on K", LONG, || flights.waiters(k) == 1 && waiting_on_me() == 1);
                         let made = super::map(0..ITEMS, |at| {
                             runs[at].fetch_add(1, Ordering::Relaxed);
                             if flights.get_or_run(q, || Ok(0)).is_err() {
@@ -1132,7 +1174,7 @@ mod tests {
                     let mut said = String::new();
                     let ran = flights.get_or_run(k, || {
                         c_runs_k.store(true, Ordering::Release);
-                        crate::spin::SpinWait::within("T to wait on K", LONG, || flights.waiters(k) == 1);
+                        crate::spin::SpinWait::within("T to wait on K", LONG, || flights.waiters(k) == 1 && waiting_on_me() == 1);
                         for pass in 0..PASSES {
                             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 super::map(0..1, |at| {
@@ -1204,7 +1246,7 @@ mod tests {
                     let mut said = String::new();
                     let ran = flights.get_or_run(k, || {
                         c_runs_k.store(true, Ordering::Release);
-                        crate::spin::SpinWait::within("T1 and T2 to wait on K", LONG, || flights.waiters(k) == 2);
+                        crate::spin::SpinWait::within("T1 and T2 to wait on K", LONG, || flights.waiters(k) == 2 && waiting_on_me() == 2);
                         for ask in 0..ASKS {
                             let got = flights.get_or_run(q1, || Ok(0)).or_else(|_| flights.get_or_run(q2, || Ok(0)));
                             if got.is_ok() {
@@ -1268,6 +1310,93 @@ mod tests {
         }));
         assert_eq!(caught.unwrap_err().downcast_ref::<&str>(), Some(&"task 2 failed"));
         assert_eq!(ran.load(Ordering::Relaxed), 4);
+    }
+
+    /// coord-108's 12.46 GiB of frames: a giving-way loop whose items wait keeps at most its
+    /// window ([`super::WINDOW`] per worker) of them started and not ended at once, rather than
+    /// a job per item each parked with its frame and fiber. Item `at` waits on the key of round
+    /// `at / window`, which a holder job holds until a whole window waits on it, rounds ending
+    /// in order: every round ends under the bound, and every item runs once. With a job per
+    /// item, items of later rounds start and park beside the first round's.
+    #[test]
+    fn a_giving_way_loop_holds_at_most_its_window_of_items_started_at_once() {
+        const WORKERS: usize = 2;
+        const WINDOW: usize = WORKERS * super::WINDOW;
+        const ROUNDS: usize = 125;
+        const ITEMS: usize = ROUNDS * WINDOW;
+
+        fn round_key(round: usize) -> Key {
+            let mut key = [0x51; 32];
+            key[..8].copy_from_slice(&(round as u64).to_le_bytes());
+            Key(key)
+        }
+
+        /// Holds the keys of rounds `0..rounds`, the first innermost, and says so once all are
+        /// held; then ends each round once a window of items waits on it, the first first.
+        fn hold(flights: &Flights<()>, rounds: usize, held: &AtomicBool) {
+            let Some(round) = rounds.checked_sub(1) else {
+                held.store(true, Ordering::Release);
+                return;
+            };
+            let key = round_key(round);
+            let ran = flights.get_or_run(key, || {
+                hold(flights, round, held);
+                crate::spin::SpinWait::within("a window of items to wait on its round's key", LONG, || {
+                    flights.waiters(key) >= WINDOW
+                });
+                Ok(())
+            });
+            assert_eq!(ran, Ok(()), "the holder's run of round {round}");
+        }
+
+        let pool = Arc::new(Pool::new(&Topology::flat(WORKERS), false).unwrap());
+        let flights = Arc::new(Flights::<()>::new());
+        let held = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = unbounded::<(char, String)>();
+        {
+            let (flights, held, tx) = (Arc::clone(&flights), Arc::clone(&held), tx.clone());
+            pool.submit(None, move || hold(&flights, ROUNDS, &held), move |ran| {
+                _ = tx.send(('h', format!("{:?}", ran.map_err(|_| "panicked"))));
+            });
+        }
+        {
+            let (flights, held, tx) = (Arc::clone(&flights), Arc::clone(&held), tx.clone());
+            pool.submit(
+                None,
+                move || {
+                    crate::spin::SpinWait::within("the holder to hold every round's key", LONG, || held.load(Ordering::Acquire));
+                    assert_eq!(super::threads(), WORKERS);
+                    let live = AtomicUsize::new(0);
+                    let most = AtomicUsize::new(0);
+                    let runs: Vec<AtomicUsize> = (0..ITEMS).map(|_| AtomicUsize::new(0)).collect();
+                    let again = super::for_each_giving_way(
+                        ITEMS,
+                        |at| {
+                            runs[at].fetch_add(1, Ordering::Relaxed);
+                            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                            most.fetch_max(now, Ordering::SeqCst);
+                            let got = flights.get_or_run(round_key(at / WINDOW), || Ok(()));
+                            live.fetch_sub(1, Ordering::SeqCst);
+                            assert_eq!(got, Ok(()), "item {at}'s wait on round {}", at / WINDOW);
+                        },
+                        |_| false,
+                    );
+                    let runs: Vec<usize> = runs.iter().map(|it| it.load(Ordering::Relaxed)).collect();
+                    let never: Vec<usize> = (0..ITEMS).filter(|&at| runs[at] != 1).collect();
+                    format!("again {again:?}, most {}, not run once {never:?}", most.load(Ordering::SeqCst))
+                },
+                move |ran| _ = tx.send(('l', ran.unwrap_or_else(|_| "panicked".to_owned()))),
+            );
+        }
+        let mut heard = Vec::new();
+        for _ in 0..2 {
+            heard.push(rx.recv_timeout(LONG).expect("the holder and the loop end"));
+        }
+        let holder = heard.iter().find(|(who, _)| *who == 'h').expect("the holder said");
+        assert_eq!(holder.1, "Ok(())", "heard {heard:?}");
+        let looped = heard.iter().find(|(who, _)| *who == 'l').expect("the loop said");
+        let want = format!("again [], most {WINDOW}, not run once []");
+        assert_eq!(looped.1, want, "at most a window of {WINDOW} items started at once, each run once; heard {heard:?}");
     }
 
     /// Seeded loops of every shape against the same loops run in order, on pools of one to

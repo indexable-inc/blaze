@@ -121,7 +121,7 @@ fn poll(primary: SocketAddr, token: &str, within: Duration) -> Result<(), String
     // alloc: once per poll, every few seconds, the token its thread owns
     let token = token.to_owned();
     thread::spawn(move || {
-        let result = Client::http(primary, token)
+        let result = Client::http(primary, &token)
             .and_then(|mut client| {
                 let mut status = false;
                 let ok = client.call(Request::Status, |response| {

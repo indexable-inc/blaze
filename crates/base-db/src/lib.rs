@@ -49,7 +49,7 @@ pub use crate::{
         ProcMacroLoadingError, ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId,
         TargetKind, UniqueCrateData, UnnamedCrate,
     },
-    maintain::{Maintained, Maintainer, Reads, Trigger, Written},
+    maintain::{Implied, Maintained, Maintainer, Reads, Trigger, Written},
     named::NAMED_PATHS_DOMAIN,
     reparse::Reparse,
     settings::{BorrowckMode, FrontSettings},
@@ -434,6 +434,18 @@ impl IncludedFile {
             Ok(bytes) => hasher.update(&[1]).part(bytes),
         };
         hasher.finish()
+    }
+
+    /// The file at `path` read from disk now, as the front end reads a file outside the VFS
+    /// ([`Files::included_file`] reads the path its view has it at).
+    pub fn read_now(path: &std::path::Path) -> Result<std::sync::Arc<[u8]>, ReadError> {
+        std::fs::read(path).map(Into::into).map_err(|it| ReadError::of(&it))
+    }
+
+    /// [`IncludedFile::content`] of the file at `path` as it is on disk now
+    /// ([`IncludedFile::read_now`]): what a unit record that read it is filed by.
+    pub fn content_now(path: &std::path::Path) -> ContentId {
+        IncludedFile::content_of(IncludedFile::read_now(path).as_deref())
     }
 
     pub fn read<'db, Db: ?Sized + blaze_query::db::Database>(

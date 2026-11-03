@@ -41,6 +41,33 @@ fn main() {}
 }
 
 #[test]
+fn a_binding_named_as_a_variant_a_macro_writes() {
+    // The variant a `macro` writes is keyed by its context, but rustc's
+    // `bindings_with_variant_name` compares the names as written. Checked against the pinned
+    // rustc.
+    let source = r##"#![feature(decl_macro)]
+#![allow(unused_variables, non_snake_case, dead_code)]
+
+macro m() {
+    pub enum E {
+        V,
+    }
+
+    pub fn key(e: E) -> u8 {
+        match e {
+            V => 0,
+        }
+    }
+}
+
+m!();
+
+fn main() {}
+"##;
+    assert_reports(&ui("variant-binding.rs", "2021", source), &[error(11, &["`V`", "`E`"])]);
+}
+
+#[test]
 fn a_string_literal_matched_twice() {
     // tests/ui/pattern/usefulness/issue-30240-b.rs
     let source = r##"#![deny(unreachable_patterns)]

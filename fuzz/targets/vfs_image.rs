@@ -8,8 +8,8 @@
 //! are written again into a new image (`Builder::add`, every section of the old one in its
 //! order and schema), whose CRCs are good; the tree header keeps the name the journal's base
 //! names unless the damage reaches it. The tree section's layout (the header's words, the
-//! columns' order and element sizes) is `image.rs`'s, copied here because the crate keeps it
-//! to itself; the round trip checks the copy.
+//! columns' order and element sizes) is read from `blaze_vfs::tree_layout`, its one home, so a
+//! format bump there moves this target with it; the round trip checks the header's magic.
 //!
 //! The input, read front to back (past its end every number is zero):
 //! - one byte, the number of ops (`& 15`); each op a kind byte (`& 3`: a regular file, an
@@ -17,9 +17,9 @@
 //!   (`& 63`) and the file's bytes (a symlink's target). Each is committed to `main` alone; one
 //!   the VFS refuses (a path that is not UTF-8 or not a path, a file in the way) is left out;
 //! - then up to 32 damages of 12 bytes: a kind byte, a place byte, a little-endian `u16` offset
-//!   and a `u64` value. Kind `& 3`: 0, header word `place % 28` becomes the value (a column's
+//!   and a `u64` value. Kind `& 3`: 0, header word `place % WORDS` becomes the value (a column's
 //!   count or place, a count of the image, its name); 1, the bytes at `offset` of column
-//!   `place % 10` (ids, shapes, entry names, entry nodes, entry modes, files, index, spans, name
+//!   `place % COLUMNS` (ids, shapes, entry names, entry nodes, entry modes, files, index, spans, name
 //!   bytes, name index); 2, the bytes at `offset` of the disks section; 3, the bytes at
 //!   `offset` anywhere in the tree section. For 1 to 3, `((kind >> 2) & 7) + 1` of the value's
 //!   low bytes are written, cut at the end of what they land in. The blobs are never damaged.
@@ -45,14 +45,20 @@ use blaze_core::{Completion, Done, Effect, FileName, Mapping};
 use blaze_fuzzer::Target;
 use blaze_ids::ContentId;
 use blaze_image::{Builder, Cause, Image, MIN_GROUP_SHIFT, Section, SectionId};
-use blaze_vfs::{ImageMark, ImageUse, Mode, Op, OpError, View, Vfs};
+use blaze_vfs::{
+    ImageMark, ImageUse, Mode, Op, OpError, View, Vfs,
+    tree_layout::{
+        C_NAME_BYTES, C_SHAPES, COLUMNS, LAYOUT, MAGIC, MAGIC_BYTES, W_COLUMNS, W_ENTRIES, W_MAGIC,
+        W_NODES, WORDS,
+    },
+};
 
 const TARGET: Target = Target {
     name: "vfs_image",
     check,
     seeds,
     dictionary: &[
-        b"BZVFSTR1",
+        &MAGIC_BYTES,
         b"/",
         b".",
         b"..",
@@ -73,35 +79,6 @@ const WALK: usize = 1 << 10;
 
 /// The most damages one input makes.
 const DAMAGES: usize = 32;
-
-const MAGIC: u64 = u64::from_le_bytes(*b"BZVFSTR1");
-const WORDS: usize = 28;
-const W_MAGIC: usize = 0;
-const W_NODES: usize = 1;
-const W_ENTRIES: usize = 2;
-const W_FILES: usize = 3;
-const W_NAMES: usize = 4;
-const W_NAME_BYTES: usize = 5;
-const W_INDEX: usize = 6;
-const W_NAME_INDEX: usize = 7;
-const W_COLUMNS: usize = 9;
-const COLUMNS: usize = 10;
-const C_SHAPES: usize = 1;
-const C_NAME_BYTES: usize = 8;
-
-/// Each column's count (the header word that holds it) and element size, in the header's order.
-const LAYOUT: [(usize, usize); COLUMNS] = [
-    (W_NODES, 32),
-    (W_NODES, 8),
-    (W_ENTRIES, 4),
-    (W_ENTRIES, 4),
-    (W_ENTRIES, 1),
-    (W_FILES, 16),
-    (W_INDEX, 4),
-    (W_NAMES, 8),
-    (W_NAME_BYTES, 1),
-    (W_NAME_INDEX, 4),
-];
 
 fn check(data: &[u8]) {
     let mut input = Input(data);

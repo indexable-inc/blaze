@@ -629,6 +629,22 @@ impl TypeColumns<Growing> {
 }
 
 impl TypeColumns<Frozen> {
+    /// The bytes of its columns and its paths', not the side tables' entries' own heap.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let TypeColumns { kind, data, extra, lists, bounds, paths, refs, arrays, fns, type_params } =
+            self;
+        kind.heap_bytes()
+            + data.heap_bytes()
+            + extra.heap_bytes()
+            + lists.heap_bytes()
+            + bounds.heap_bytes()
+            + paths.heap_bytes()
+            + refs.heap_bytes()
+            + arrays.heap_bytes()
+            + fns.heap_bytes()
+            + type_params.heap_bytes()
+    }
+
     /// Every kind in range, every id, list range and side-table index in bounds, every
     /// [`PathId`] of a bound naming a `Path`, and the paths' columns ([`PathColumns::check`]:
     /// their rows, runs and the ids inside them). The encoding calls it after reading a buffer

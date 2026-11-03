@@ -126,23 +126,23 @@ fn check(
     object: &Object,
     input: &[u8],
     section: &Section,
-    what: SectionKind,
+    what: &SectionKind,
     align: u64,
-    data: Data,
-    fixups: Vec<NativeFixup>,
+    data: &Data,
+    fixups: &[NativeFixup],
     retain: bool,
 ) {
     let name = object.name(section.name);
-    assert_eq!(section.what, what, "{name}");
+    assert_eq!(section.what, *what, "{name}");
     assert_eq!(section.align, align, "{name}");
-    match &data {
+    match data {
         Data::Bytes(bytes) => {
             assert!(matches!(section.data, Data::Input(_)), "{name}: {:?} is a copy", section.data);
             assert_eq!(section.data.bytes(input), Ok(Some(&bytes[..])), "{name}");
         }
-        _ => assert_eq!(section.data, data, "{name}"),
+        _ => assert_eq!(section.data, *data, "{name}"),
     }
-    assert_eq!(object.section_fixups(section), &fixups[..], "{name}");
+    assert_eq!(object.section_fixups(section), fixups, "{name}");
     assert_eq!(section.retain, retain, "{name}");
 }
 
@@ -349,10 +349,10 @@ fn reads_an_x86_64_object() {
         &object,
         &bytes,
         text_section,
-        alloc(".text", false, true, false),
+        &alloc(".text", false, true, false),
         16,
-        Data::Bytes(vec![0x90; 64]),
-        vec![
+        &Data::Bytes(vec![0x90; 64]),
+        &[
             fixup(1, Apply::X86Branch32, ext, -4),
             fixup(6, Apply::X86GotPcRel32, ext, -4),
             fixup(11, Apply::Rel32, g, -4),
@@ -373,10 +373,10 @@ fn reads_an_x86_64_object() {
         &object,
         &bytes,
         data_section,
-        alloc(".data", true, false, false),
+        &alloc(".data", true, false, false),
         8,
-        Data::Bytes(vec![0; 16]),
-        vec![fixup(0, Apply::Abs64, f, 8), NativeFixup {
+        &Data::Bytes(vec![0; 16]),
+        &[fixup(0, Apply::Abs64, f, 8), NativeFixup {
             at: 8,
             apply: Apply::Delta64,
             symbol: g,
@@ -389,40 +389,40 @@ fn reads_an_x86_64_object() {
         &object,
         &bytes,
         tbss_section,
-        alloc(".tbss", true, false, true),
+        &alloc(".tbss", true, false, true),
         8,
-        Data::Zero(8),
-        Vec::new(),
+        &Data::Zero(8),
+        &[],
         false,
     );
     check(
         &object,
         &bytes,
         inline_section,
-        alloc(".text.inl", false, true, false),
+        &alloc(".text.inl", false, true, false),
         1,
-        Data::Bytes(vec![0xc3]),
-        Vec::new(),
+        &Data::Bytes(vec![0xc3]),
+        &[],
         false,
     );
     check(
         &object,
         &bytes,
         keep_section,
-        alloc(".data.keep", true, false, false),
+        &alloc(".data.keep", true, false, false),
         4,
-        Data::Bytes(vec![1, 2, 3, 4]),
-        Vec::new(),
+        &Data::Bytes(vec![1, 2, 3, 4]),
+        &[],
         true,
     );
     check(
         &object,
         &bytes,
         eh_frame_section,
-        SectionKind::EhFrame,
+        &SectionKind::EhFrame,
         8,
-        Data::Bytes(vec![0; 24]),
-        vec![fixup(8, Apply::Rel32, text_symbol, 0)],
+        &Data::Bytes(vec![0; 24]),
+        &[fixup(8, Apply::Rel32, text_symbol, 0)],
         false,
     );
     let loaded = [".text", ".data", ".tbss", ".text.inl", ".data.keep", ".eh_frame"];
@@ -526,10 +526,10 @@ fn reads_an_aarch64_object() {
         &object,
         &bytes,
         text_section,
-        alloc(".text", false, true, false),
+        &alloc(".text", false, true, false),
         4,
-        Data::Bytes(vec![0; 80]),
-        vec![
+        &Data::Bytes(vec![0; 80]),
+        &[
             fixup(0, Apply::A64Call26, ext, 1),
             fixup(4, Apply::A64Jump26, ext, 1),
             fixup(8, Apply::A64Page21, var, 1),
@@ -556,10 +556,10 @@ fn reads_an_aarch64_object() {
         &object,
         &bytes,
         section(&object, ".data").1,
-        alloc(".data", true, false, false),
+        &alloc(".data", true, false, false),
         8,
-        Data::Bytes(vec![0; 8]),
-        vec![fixup(0, Apply::Abs64, f, 4)],
+        &Data::Bytes(vec![0; 8]),
+        &[fixup(0, Apply::Abs64, f, 4)],
         false,
     );
     let text_symbol = object
@@ -575,10 +575,10 @@ fn reads_an_aarch64_object() {
         &object,
         &bytes,
         section(&object, ".eh_frame").1,
-        SectionKind::EhFrame,
+        &SectionKind::EhFrame,
         8,
-        Data::Bytes(vec![0; 16]),
-        vec![fixup(8, Apply::Rel32, text_symbol, 0)],
+        &Data::Bytes(vec![0; 16]),
+        &[fixup(8, Apply::Rel32, text_symbol, 0)],
         false,
     );
     assert_eq!(

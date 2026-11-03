@@ -69,7 +69,7 @@ fn every_lookup_view_is_its_handle() {
     let bodies = bodies(&db);
     assert_eq!(bodies.len(), 3);
     for (def, file_id) in bodies {
-        let (_, source_map) = Body::with_source_map(&db, def);
+        let source_map = Body::source_map(&db, def);
         // The body's file and those of the macro calls in it: a format string is in its
         // `format_args!`'s expansion.
         let expansions = source_map.macro_calls().map(|(_, call)| hir_expand::HirFileId::from(call));

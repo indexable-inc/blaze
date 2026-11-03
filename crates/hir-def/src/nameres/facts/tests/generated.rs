@@ -1,4 +1,4 @@
-//! The per-module resolver against the old collector on generated crates: module trees of
+//! The crate maps agree ([`super::compare_db`]) on generated crates: module trees of
 //! inline and file modules, items, plain and glob imports with cycles, shadowing (glob against
 //! explicit, two globs), `pub(crate)`, `pub(super)`, `pub(in path)`, `macro_rules!` with
 //! `#[macro_use]` and `#[macro_export]`, `$crate`, `extern crate self as`, cfg'd items, and
@@ -362,7 +362,7 @@ impl Model {
     }
 }
 
-/// The differences between the old and the new def map of `fixture`, or the panic.
+/// The differences between the def maps of `fixture` ([`compare_fixture`]), or the panic.
 fn differences(fixture: &str) -> String {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut out = String::new();
@@ -411,7 +411,7 @@ fn generated_crates_agree() {
         }
         let (model, diff) = shrink(model);
         panic!(
-            "case {case} (seed {seed:#x}): old and new def maps differ; shrunk to\n{}\n{diff}",
+            "case {case} (seed {seed:#x}): the def maps differ; shrunk to\n{}\n{diff}",
             model.render()
         );
     }

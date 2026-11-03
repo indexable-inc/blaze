@@ -16,12 +16,19 @@
 //! tree's block, its one allocation, no larger than the bytes it is read from, in the reader's
 //! allocator ([`TopSubtree::read_wire_in`]); the checks' own buffers are kept per thread.
 //!
-//! The bytes are untrusted: a macro's output comes from the sandbox, and the process's symbol
-//! table never shrinks. So the header is held to [`WireLimits`] before any column is read, and
-//! every check, the canonical ones too, runs on the symbols' text as the wire carries it. A
-//! symbol is interned only once the whole tree is accepted, as the read's last step, which
-//! can't fail: bytes refused for any reason leave nothing in the table and no block allocated,
-//! and bytes accepted add at most [`WireLimits::symbol_bytes`] to it.
+//! What reads the bytes is `proc_macro_api::kept::read`: a kept expansion from the store, which
+//! may have come from the store's remote (a macro's own output is built as a tree, never read
+//! from bytes). Whoever can write there can already swap in any valid tree, so the checks and
+//! [`WireLimits`] are bounds on damage and corruption, not a security boundary; they still hold
+//! for bytes from anywhere, because the process's symbol table never shrinks. The header's
+//! counts are held to the limits before any column is read (the wire's length, which needs the
+//! subtree count, right after the nodes column), and every check, the canonical ones too, runs
+//! on the symbols' text as the wire carries it. A symbol is interned only once the whole tree is
+//! accepted, as the read's last step, which can't fail: bytes refused for any reason leave
+//! nothing in the table and no block allocated, and the buffers the checks keep per thread go
+//! back to a bounded size after each read. Bytes accepted add to the table at most
+//! [`WireLimits::symbol_bytes`] of text and, for each of at most [`WireLimits::symbols`] new
+//! symbols, the table's record and slots ([`WireLimits::DEFAULT`] says how much).
 
 use std::{
     alloc::{Allocator, Global},
@@ -36,7 +43,7 @@ use span::{SpanAnchor, SyntaxContext, TextRange, TextSize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::{
-    Columns, CompressedSpanPart, HEADER, IDENT, LITERAL, Layout, NARROW_LIMIT, Node, PUNCT,
+    Columns, CompressedSpanPart, HEADER, IDENT, KEEP, LITERAL, Layout, NARROW_LIMIT, Node, PUNCT,
     PackedSpan, SUBTREE, SYMBOL_WINDOW, TopSubtree, Tree, WIDE, WideSpan, has_duplicates, symbol,
 };
 
@@ -83,31 +90,38 @@ pub enum WireError {
     Part { at: usize, part: WirePart, why: String },
     /// Well formed, but not the columns the builder makes for these token trees.
     NotCanonical { what: &'static str, at: usize },
-    /// The header asks for more than the reader's [`WireLimits`] allow: which limit, the size
-    /// the header gives and the limit.
+    /// The header asks for more than the reader's [`WireLimits`] allow: what is counted (its
+    /// unit), the size the header gives and the limit.
     OverLimit { what: &'static str, size: usize, limit: usize },
 }
 
-/// The most one token tree's wire may hold. [`TopSubtree::read_wire`] holds the header to them
-/// before it reads a column, so they bound what a read costs and what it can add to the
-/// process's symbol table, which never shrinks.
+/// The most one token tree's wire may hold. [`TopSubtree::read_wire`] holds the header's counts
+/// to them before it reads a column, and the wire's length to [`WireLimits::bytes`] once the
+/// nodes column gives the subtree count, so they bound what a read costs and what it can add to
+/// the process's symbol table, which never shrinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireLimits {
-    /// The most bytes the tree's wire takes, header to padding.
+    /// The most bytes the tree's wire takes, header to padding. Checked after the nodes column
+    /// is read, so it bounds the bytes a read accepts, not what it reads first: every column is
+    /// read in place from bytes the caller already holds.
     pub bytes: usize,
     /// The most nodes: the top subtree and every token tree in it.
     pub nodes: usize,
-    /// The most bytes of symbol text: the most one accepted read adds to the symbol table.
+    /// The most symbols: each new one costs the table a record and slots past its text.
+    pub symbols: usize,
+    /// The most bytes of symbol text.
     pub symbol_bytes: usize,
 }
 
 impl WireLimits {
-    /// What a macro's output and a kept expansion are read under: 2 GiB of wire, 64 Mi token
-    /// trees and 1 GiB of symbol text, each far past what the largest expansion seen writes
-    /// (a literal of an embedded file is one symbol), and each a bound a damaged or hostile
-    /// tree can't pass.
+    /// What a kept expansion is read under: 2 GiB of wire, 64 Mi token trees, 16 Mi symbols and
+    /// 1 GiB of symbol text, each far past what the largest expansion seen writes (a literal of
+    /// an embedded file is one symbol), and each a bound damaged bytes can't pass. One accepted
+    /// read then adds to the symbol table at most 1 GiB of text and, per new symbol, a 16-byte
+    /// record header, the text's padding to the record's alignment and an index and an ID slot:
+    /// under 64 bytes each, so about 2 GiB in all.
     pub const DEFAULT: WireLimits =
-        WireLimits { bytes: 2 << 30, nodes: 64 << 20, symbol_bytes: 1 << 30 };
+        WireLimits { bytes: 2 << 30, nodes: 64 << 20, symbols: 16 << 20, symbol_bytes: 1 << 30 };
 
     fn check(what: &'static str, size: usize, limit: usize) -> Result<(), WireError> {
         if size > limit {
@@ -132,7 +146,7 @@ impl std::fmt::Display for WireError {
                 write!(f, "token tree bytes: {what} at {at} is not what the builder makes")
             }
             WireError::OverLimit { what, size, limit } => {
-                write!(f, "token tree bytes: {what} {size}, over the reader's limit of {limit}")
+                write!(f, "token tree bytes: {size} {what}, over the reader's limit of {limit}")
             }
         }
     }
@@ -215,8 +229,9 @@ impl TopSubtree {
     /// it took. `part` turns each [`WirePart`] into the anchor and context it stands for here,
     /// or refuses it: the ids are the writer's, and only the reader knows which it may use.
     /// `bytes` start at a 4-byte boundary, as a heap buffer or a tree after another one does.
-    /// A header past `limits` is refused before any column is read, and no symbol is interned
-    /// unless the whole tree is accepted.
+    /// A header past `limits` is refused (its counts before any column is read, its length
+    /// once the nodes are), and no symbol is interned unless the whole tree is accepted. `part`
+    /// runs in the middle of the read and must not wait (rule 24): it is a lookup.
     pub fn read_wire(
         bytes: &[u8],
         limits: WireLimits,
@@ -256,8 +271,9 @@ impl<A: Allocator> TopSubtree<A> {
         if nodes_len == 0 {
             return malformed("a tree without its top subtree", 0);
         }
-        WireLimits::check("nodes", nodes_len, limits.nodes)?;
-        WireLimits::check("symbol bytes", symbol_bytes, limits.symbol_bytes)?;
+        WireLimits::check("nodes (token trees)", nodes_len, limits.nodes)?;
+        WireLimits::check("symbols", symbols_len, limits.symbols)?;
+        WireLimits::check("bytes of symbol text", symbol_bytes, limits.symbol_bytes)?;
         // Each symbol is some ident's or literal's, and the top subtree is neither.
         if symbols_len >= nodes_len {
             return malformed("more symbols than token trees to use them", symbols_len);
@@ -279,7 +295,7 @@ impl<A: Allocator> TopSubtree<A> {
         .fold(0usize, usize::saturating_add);
         let wire_bytes =
             wire_words.saturating_mul(4).saturating_add(symbol_bytes.next_multiple_of(4));
-        WireLimits::check("bytes", wire_bytes, limits.bytes)?;
+        WireLimits::check("bytes of wire", wire_bytes, limits.bytes)?;
         let span_words: &[u32] = words.column((nodes_len + subtrees).saturating_mul(2))?;
         let wide_words: &[u32] = words.column(wide_len.saturating_mul(3))?;
         for (at, &row) in wide_words.as_chunks::<3>().0.iter().enumerate() {
@@ -384,23 +400,40 @@ impl<A: Allocator> TopSubtree<A> {
 thread_local! {
     /// The parts a read resolved, kept for the next read: checked for duplicates before the
     /// block they go in is allocated.
-    // alloc: one buffer per thread, grown to the most parts read.
+    // alloc: one buffer per thread, kept at most [`KEEP`] parts between reads.
     static PARTS: Cell<Stack<[u32; 3]>> = const { Cell::new(Stack::new()) };
     /// Each symbol's `name_hash` while a read checks them, kept for the next read; interning
     /// takes it, so no symbol is hashed twice.
-    // alloc: one buffer per thread, grown to the most symbols read.
+    // alloc: one buffer per thread, kept at most [`KEEP`] hashes between reads.
     static HASHES: Cell<Stack<u64>> = const { Cell::new(Stack::new()) };
 }
 
-/// `f` with the thread's buffer of `key`, emptied; it goes back to the thread `f` ends on.
+/// `f` with the thread's buffer of `key`, emptied; it goes back to the thread `f` ends on, cut
+/// back to [`KEEP`] items when a read grew it past them, so bytes refused after filling it (a
+/// part repeated millions of times, nesting millions deep) leave no memory held on the worker.
+/// The buffer is moved out and back in by two calls that each find the thread's slot afresh,
+/// so `f` may resume on another thread without writing this one's (rule 24).
 fn with_kept<T: 'static, R>(
     key: &'static LocalKey<Cell<Stack<T>>>,
     f: impl FnOnce(&mut Vec<T>) -> R,
 ) -> R {
-    let mut kept = key.replace(Stack::new());
+    let mut kept = take_kept(key);
     let result = f(kept.take());
-    key.set(kept);
+    if kept.high_water() > KEEP {
+        kept.shrink(KEEP);
+    }
+    give_kept(key, kept);
     result
+}
+
+#[inline(never)]
+fn take_kept<T: 'static>(key: &'static LocalKey<Cell<Stack<T>>>) -> Stack<T> {
+    key.replace(Stack::new())
+}
+
+#[inline(never)]
+fn give_kept<T: 'static>(key: &'static LocalKey<Cell<Stack<T>>>, kept: Stack<T>) {
+    key.set(kept);
 }
 
 /// The symbols as the wire carries them, before any is interned: symbol `at` is the text up to
@@ -452,7 +485,7 @@ fn check_nodes(nodes: &[[u32; 2]], symbols: usize) -> Result<usize, WireError> {
 
 thread_local! {
     /// [`check_nodes`]' stack of where each open subtree ends, kept for the next read.
-    // alloc: one buffer per thread, grown to the deepest nesting read.
+    // alloc: one buffer per thread, kept at most [`KEEP`] deep between reads.
     static ENDS: Cell<Stack<usize>> = const { Cell::new(Stack::new()) };
 }
 

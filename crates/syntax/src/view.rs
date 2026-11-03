@@ -48,7 +48,8 @@ pub type Preorder<'t> = syntax_tree::view::Preorder<'t, RustLanguage>;
 pub type PreorderWithTokens<'t> = syntax_tree::view::PreorderWithTokens<'t, RustLanguage>;
 
 /// A typed view of a node: a node of the kinds it can cast from, borrowed from its tree.
-pub trait AstNode<'t> {
+/// `Copy`, like every view: generic code takes one by value.
+pub trait AstNode<'t>: Copy {
     /// This panics if the `SyntaxKind` is not statically known.
     fn kind() -> SyntaxKind
     where

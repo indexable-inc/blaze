@@ -82,6 +82,19 @@ impl TraitItems {
         })
     }
 
+    /// The associated type a name looks up among these items, keyed for this trait
+    /// ([`crate::nameres::trait_item_name`], [`crate::nameres::trait_item_written`]): the one
+    /// [`crate::nameres::assoc_item_is`] holds of, rustc's `find_by_ident_and_kind` with
+    /// `AssocTag::Type`. [`TraitItems::associated_type_by_name`] compares text alone.
+    pub fn associated_type_named(&self, db: &Db, name: Name) -> Option<TypeAliasId> {
+        self.items.iter().find_map(|&(item_name, item)| match item {
+            AssocItemId::TypeAliasId(t) if crate::nameres::assoc_item_is(db, item_name, item, name) => {
+                Some(t)
+            }
+            _ => None,
+        })
+    }
+
     pub fn method_by_name(&self, name: &Name) -> Option<FunctionId> {
         self.items.iter().find_map(|(item_name, item)| match item {
             AssocItemId::FunctionId(t) if item_name == name => Some(*t),
@@ -213,7 +226,7 @@ impl<'db> AssocItemCollector<'db> {
                 self.local_def_map,
                 self.db,
                 self.module_id,
-                ast_id_with_path,
+                &ast_id_with_path,
                 attr,
                 attr_id,
                 self.macro_depth + 1,

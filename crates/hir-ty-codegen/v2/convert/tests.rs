@@ -19,12 +19,12 @@ fn blob(bytes: &[u8], relocs: Vec<(u32, DataId, i64)>, fn_relocs: Vec<(u32, Func
     ConstBlob { bytes: bytes.to_vec(), relocs, fn_relocs, align: 8, type_ids: Vec::new() }
 }
 
-fn code(relocs: Vec<ModuleReloc>, lines: Vec<LineRow>) -> Code {
+fn code(relocs: &[ModuleReloc], lines: Vec<LineRow>) -> Code {
     Code {
         signature: sig(),
         bytes: vec![0x90; 32],
         align: 16,
-        relocs: Relocs::of_module(&relocs, &[]).unwrap(),
+        relocs: Relocs::of_module(relocs, &[]).unwrap(),
         unwind: None,
         lines,
         slots: SlotPlaces::default(),
@@ -92,7 +92,7 @@ fn convert(code: Code, requests: &Requests) -> Result<blaze_codegen::CompiledFun
 fn a_warm_conversion_allocates_only_what_it_keeps() {
     let make = || {
         code(
-            vec![reloc(1, binemit::Reloc::X86CallPLTRel4, 0, 0)],
+            &[reloc(1, binemit::Reloc::X86CallPLTRel4, 0, 0)],
             vec![LineRow { offset: 0, span: 0 }, LineRow { offset: 4, span: 1 }],
         )
     };
@@ -111,7 +111,7 @@ fn a_warm_conversion_allocates_only_what_it_keeps() {
 #[test]
 fn relocations_point_at_their_targets() {
     let code = code(
-        vec![
+        &[
             reloc(1, binemit::Reloc::X86CallPLTRel4, 0, 0),
             reloc(8, binemit::Reloc::X86PCRel4, 1, 1),
             reloc(16, binemit::Reloc::X86PCRel4, 1, 2),
@@ -132,8 +132,8 @@ fn loading(datas: &[u32]) -> Code {
         .iter()
         .enumerate()
         .map(|(at, &data)| reloc(4 * at as u32, binemit::Reloc::X86PCRel4, 1, data))
-        .collect();
-    code(relocs, Vec::new())
+        .collect::<Vec<_>>();
+    code(&relocs, Vec::new())
 }
 
 #[test]
@@ -184,30 +184,44 @@ fn a_thunk_calls_the_body() {
         name: ModuleRelocTarget::User { namespace: crate::v2::fold::BODY, index: 0 },
         addend: -4,
     };
-    let compiled = convert(code(vec![call], Vec::new()), &requests()).expect("converted");
+    let compiled = convert(code(&[call], Vec::new()), &requests()).expect("converted");
     assert_eq!(compiled.relocs.targets(), [Target::Extern("body".to_owned())]);
 }
 
 #[test]
 fn line_rows_take_their_spans() {
     let lines = vec![LineRow { offset: 0, span: 1 }, LineRow { offset: 4, span: 0 }];
-    let compiled = convert(code(Vec::new(), lines), &requests()).expect("converted");
+    let compiled = convert(code(&[], lines), &requests()).expect("converted");
     let lines: Vec<_> = compiled.lines.iter().map(|it| (it.at, it.span)).collect();
     assert_eq!(lines, vec![(0, span(1)), (4, span(0))]);
     let past = vec![LineRow { offset: 0, span: 2 }];
-    assert!(convert(code(Vec::new(), past), &requests()).is_err());
+    assert!(convert(code(&[], past), &requests()).is_err());
 }
 
 #[test]
 fn what_v2_has_no_target_for_is_an_error() {
     let inlined = reloc(1, binemit::Reloc::X86CallPCRel4, crate::fragment::INLINED, 0);
-    assert!(convert(code(vec![inlined], Vec::new()), &requests()).is_err());
+    assert!(convert(code(&[inlined], Vec::new()), &requests()).is_err());
+}
+
+/// A function's writable object (a promoted temporary its code writes each call, as a
+/// `&S { f: file!(), l: line!() }` is: `promoted_slot`) is its instance's own: writable, its ID
+/// `Data::owned` of the function's key, never the read-only object of the same bytes. Two
+/// instances' are two objects (`a_function_keeps_its_writable_data_its_instances` in
+/// blaze-codegen's templates).
+#[test]
+fn a_functions_writable_data_is_its_instances_own() {
+    let bytes = b"slot\0\0\0\0";
     let mut writable = requests();
-    writable.datas[0] = DataRequest::Blob {
-        blob: blob(b"x", Vec::new(), Vec::new()),
-        identity: DataIdentity::Writable,
-    };
-    assert!(convert(loading(&[0]), &writable).is_err());
+    writable.datas[0] =
+        DataRequest::Blob { blob: blob(bytes, Vec::new(), Vec::new()), identity: DataIdentity::Writable };
+    let compiled = convert(loading(&[0]), &writable).expect("converted");
+    let slot = &compiled.data[0];
+    let owned = blaze_codegen::Data::owned(&key().0, 0, 8, bytes.to_vec(), blaze_codegen::Relocs::new());
+    assert!(slot.writable);
+    assert_eq!(*slot, owned);
+    assert_ne!(slot.id, blaze_codegen::Data::new(8, bytes.to_vec(), blaze_codegen::Relocs::new()).id);
+    assert_eq!(compiled.relocs.targets(), [Target::Data(slot.id)]);
 }
 
 /// A static's value that points at a writable object and at an equal read-only one: the
@@ -251,13 +265,13 @@ fn a_statics_writable_data_is_its_own() {
 fn a_coverage_relocation_is_at_the_functions_own_array() {
     let namespace = crate::llvm::sanitize::COVERAGE;
     let at = |array| reloc(1 + 8 * array, binemit::Reloc::X86PCRel4, namespace, array);
-    let compiled = convert(code((0..3).map(at).collect(), Vec::new()), &requests()).expect("converted");
+    let compiled = convert(code(&(0..3).map(at).collect::<Vec<_>>(), Vec::new()), &requests()).expect("converted");
     let targets: Vec<_> = compiled.relocs.iter().map(|it| (it.target.clone(), it.addend)).collect();
     let own = |array| (Target::Coverage(array), -4);
     assert_eq!(targets, vec![own(0), own(1), own(2)]);
     assert_eq!(compiled.coverage, None);
     let past = reloc(1, binemit::Reloc::X86PCRel4, namespace, 3);
-    assert!(convert(code(vec![past], Vec::new()), &requests()).is_err());
+    assert!(convert(code(&[past], Vec::new()), &requests()).is_err());
 }
 
 /// A relocation at the tier counter cells is at the instance's own (`Target::Counter` of its
@@ -269,11 +283,11 @@ fn a_counter_relocation_is_at_the_instances_own_cells() {
     calls.addend = -5;
     let mut back_edges = reloc(11, binemit::Reloc::X86PCRel4, namespace, 0);
     back_edges.addend = 3;
-    let compiled = convert(code(vec![calls, back_edges], Vec::new()), &requests()).expect("converted");
+    let compiled = convert(code(&[calls, back_edges], Vec::new()), &requests()).expect("converted");
     let targets: Vec<_> = compiled.relocs.iter().map(|it| (it.target.clone(), it.addend)).collect();
     assert_eq!(targets, vec![(Target::Counter(key()), -5), (Target::Counter(key()), 3)]);
     let other = reloc(3, binemit::Reloc::X86PCRel4, namespace, 1);
-    assert!(convert(code(vec![other], Vec::new()), &requests()).is_err());
+    assert!(convert(code(&[other], Vec::new()), &requests()).is_err());
 }
 
 /// A relocation into the function's own code (stencil code's `Name::Own`, Cranelift's
@@ -287,14 +301,14 @@ fn a_relocation_into_its_own_code_is_at_the_instance() {
         name: ModuleRelocTarget::FunctionOffset(FuncId::from_u32(0), offset),
         addend,
     };
-    let relocs = vec![into(1, 8, -4), into(9, 0, -4), into(17, 32, 0)];
-    let compiled = convert(code(relocs, Vec::new()), &requests()).expect("converted");
+    let relocs = [into(1, 8, -4), into(9, 0, -4), into(17, 32, 0)];
+    let compiled = convert(code(&relocs, Vec::new()), &requests()).expect("converted");
     let targets: Vec<_> = compiled.relocs.iter().map(|it| (it.target.clone(), it.addend)).collect();
     let own = |addend| (Target::Direct(key()), addend);
     assert_eq!(targets, vec![own(4), own(-4), own(32)]);
     assert_eq!(compiled.relocs.targets(), [Target::Direct(key())]);
-    assert!(convert(code(vec![into(1, 33, 0)], Vec::new()), &requests()).is_err());
-    assert!(convert(code(vec![into(1, 8, i64::MAX)], Vec::new()), &requests()).is_err());
+    assert!(convert(code(&[into(1, 33, 0)], Vec::new()), &requests()).is_err());
+    assert!(convert(code(&[into(1, 8, i64::MAX)], Vec::new()), &requests()).is_err());
 }
 
 /// An instrumented function's PGO counters are its own, the counter by the addend.
@@ -304,12 +318,12 @@ fn a_pgo_counter_relocation_is_at_the_functions_own_counters() {
     let namespace = crate::llvm::pgo::COUNTER_RELOCS;
     let mut second = reloc(3, binemit::Reloc::X86PCRel4, namespace, 0);
     second.addend = 4;
-    let compiled = convert(code(vec![second], Vec::new()), &requests()).expect("converted");
+    let compiled = convert(code(&[second], Vec::new()), &requests()).expect("converted");
     let targets: Vec<_> = compiled.relocs.iter().map(|it| (it.target.clone(), it.addend)).collect();
     assert_eq!(targets, vec![(Target::ProfileCounters, 4)]);
     assert_eq!(compiled.profile, None);
     let other = reloc(3, binemit::Reloc::X86PCRel4, namespace, 1);
-    assert!(convert(code(vec![other], Vec::new()), &requests()).is_err());
+    assert!(convert(code(&[other], Vec::new()), &requests()).is_err());
 }
 
 #[test]

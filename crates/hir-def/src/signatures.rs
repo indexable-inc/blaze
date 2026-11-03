@@ -140,6 +140,12 @@ impl<T: PartialEq + std::fmt::Debug> Kept<T> {
     }
 }
 
+/// What dropping a `with_source_map` value frees: its map. The value's `Arc` is `relative`'s
+/// for one written in a file; one a macro writes owns its own, which goes uncounted.
+fn with_source_map_bytes<T>((_, map): &(Arc<T>, ExpressionStoreSourceMap)) -> usize {
+    map.heap_bytes()
+}
+
 /// The queries of the signature `$Sig` of an `$Id`, which `$Sig::lower` lowers and
 /// `deps::signatures::$served` reads from its crate's image: `of` reads the signature, lowered
 /// without its source map; `relative` and `with_source_map` lower it again with the map.
@@ -154,7 +160,12 @@ macro_rules! signature_queries {
             }
 
             /// The signature with where each part of it is written in its file.
-            #[blaze_query::tracked(returns(ref), lru = 1024, mem_tag = Nameres)]
+            #[blaze_query::tracked(
+                returns(ref),
+                lru,
+                weigh = with_source_map_bytes,
+                mem_tag = Nameres
+            )]
             pub fn with_source_map(db: &Db, id: $Id) -> (Arc<$Sig>, ExpressionStoreSourceMap) {
                 match Self::relative(db, id) {
                     Some((it, map)) => {
@@ -171,11 +182,11 @@ macro_rules! signature_queries {
                 }
             }
 
-            /// The signature lowered again from its [`signature_syntax`], with the source map
+            /// The signature lowered again from its [`signature_syntax_of`], with the source map
             /// of that tree; `None` for one a macro writes.
             #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
             pub fn relative(db: &Db, id: $Id) -> Option<(Arc<$Sig>, ExpressionStoreSourceMap)> {
-                let syntax = signature_syntax(db, id.into()).as_ref()?;
+                let syntax = signature_syntax_of(db, id.into())?;
                 let kept = Self::kept(db, id);
                 let lowering = kept.lowering(&kept.store);
                 let (it, map) = Self::lower(db, id, syntax.node(), Some(syntax.maps()), lowering);
@@ -184,7 +195,7 @@ macro_rules! signature_queries {
         }
 
         impl $Sig {
-            /// The signature: its crate's image's, or lowered from its [`signature_syntax`] (its
+            /// The signature: its crate's image's, or lowered from its [`signature_syntax_of`] (its
             /// file for one a macro writes) with no source map. A read of it builds no map.
             #[inline]
             pub fn of(db: &Db, id: $Id) -> &$Sig {
@@ -195,7 +206,7 @@ macro_rules! signature_queries {
             /// of its own: what [`Self::of`] keeps when no image serves it, and what checking an
             /// image records.
             pub(crate) fn lower_alone(db: &Db, id: $Id) -> $Sig {
-                let (source, maps) = match signature_syntax(db, id.into()) {
+                let (source, maps) = match signature_syntax_of(db, id.into()) {
                     Some(syntax) => (syntax.node(), Some(syntax.maps())),
                     None => (id.lookup(db).source_view(db), None),
                 };
@@ -208,7 +219,7 @@ macro_rules! signature_queries {
 /// What a signature is lowered from: its item written in a file, as a tree of its own whose
 /// text starts at the item, with what no signature reads replaced by an empty node of its kind
 /// (the body of a fn, const or static, the items of an impl or trait, and for
-/// [`signature_syntax`] the variants of an enum), and the span and ast id maps of that tree.
+/// [`signature_syntax_of`] the variants of an enum), and the span and ast id maps of that tree.
 /// It is compared by that text, so it stays the same while an edit elsewhere in the file moves
 /// the item, or one inside what is left out: a signature is lowered again only when it
 /// changes, as a body is from its `BodySyntax`. It is read off the file's [`FileOutline`], so
@@ -217,29 +228,34 @@ macro_rules! signature_queries {
 /// An item whose spans are counted from an item around it ([`RealSpanMap::anchor_at`]: an item
 /// in a body, or in an `impl`, trait or module that has attributes) is lowered from that whole
 /// item instead, less the bodies the outline leaves out of it, so any other edit inside that
-/// one lowers it again. One in a body the outline leaves out is read off the file.
+/// one lowers it again. That tree is the anchor's, made once ([`anchor_syntax`],
+/// [`body_anchor_syntax`]) and shared by every item anchored at it: the 75 methods of a trait
+/// with attributes hold one copy of the trait, not 75. One in a body the outline leaves out is
+/// read off the file.
+///
+/// It is kept by where it is written, not by its def ([`signature_syntax`] is keyed by its file
+/// and ast id), so every crate built from one file (a library and its tests, a crate built for
+/// two targets) holds one.
+#[derive(Clone)]
 pub struct SignatureSyntax {
     pub file_id: HirFileId,
-    /// Compared by its content, not a hash of it: the query database compares a new value with the old one
-    /// only when the query runs again, and a compare of the columns reads each byte once where
-    /// hashing them costs more and can collide.
-    tree: std::sync::Arc<FlatTree>,
+    /// The tree the item is a node of and its maps: the item's own when it is its own anchor,
+    /// else its anchor's, shared.
+    tree: Arc<SignatureTree>,
     /// The item in the tree.
     item: SyntaxNodePtr,
     /// The empty node in place of what is left out, when something is.
     elided: Option<SyntaxNodePtr>,
-    ast_id_map: AstIdMap,
-    span_map: RealSpanMap,
 }
 
 impl PartialEq for SignatureSyntax {
     fn eq(&self, other: &Self) -> bool {
+        // The trees compare by pointer first (`triomphe::Arc`'s `eq`): an item read again from
+        // an anchor that didn't change shares its tree, and compares no byte of it.
         self.file_id == other.file_id
             && self.item == other.item
             && self.elided == other.elided
-            && self.span_map == other.span_map
-            && self.ast_id_map == other.ast_id_map
-            && *self.tree == *other.tree
+            && self.tree == other.tree
     }
 }
 
@@ -255,76 +271,148 @@ impl std::fmt::Debug for SignatureSyntax {
     }
 }
 
+/// A tree a [`SignatureSyntax`] points into, a copy of a subtree of a file or a body, and its
+/// span and ast id maps: an item's own, or the whole of an anchor that every item anchored at
+/// it shares.
+struct SignatureTree {
+    /// Compared by its content, not a hash of it: the query database compares a new value with
+    /// the old one only when the query runs again, and a compare of the columns reads each byte
+    /// once where hashing them costs more and can collide.
+    tree: std::sync::Arc<FlatTree>,
+    ast_id_map: AstIdMap,
+    span_map: RealSpanMap,
+}
+
+impl PartialEq for SignatureTree {
+    fn eq(&self, other: &Self) -> bool {
+        self.span_map == other.span_map
+            && self.ast_id_map == other.ast_id_map
+            && *self.tree == *other.tree
+    }
+}
+
+impl Eq for SignatureTree {}
+
+impl std::fmt::Debug for SignatureTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignatureTree").finish_non_exhaustive()
+    }
+}
+
+impl SignatureTree {
+    /// A copy of `node`, a node of `source`'s tree, with `elided` (under it, in order) each an
+    /// empty node of its kind, and its maps: the spans those of `node`'s text up to `spans_end`.
+    fn copy(
+        source: Source<'_>,
+        node: ast::Node<'_>,
+        elided: &[ast::Node<'_>],
+        spans_end: TextSize,
+        frame: &Frame,
+    ) -> SignatureTree {
+        let tree = copy_without(node, elided, None);
+        let ptrs = frame.alloc_slice_from_iter(elided.iter().map(|&it| ast::ptr(it)));
+        let ast_id_map =
+            source.ast_id_map.relative_without_view(node, ast::Node::root(&tree), ptrs);
+        let span_map = source.span_map.within(TextRange::new(node.text_range().start(), spans_end));
+        SignatureTree { tree, ast_id_map, span_map }
+    }
+
+    /// The whole of `anchor`, a span anchor of `source`'s tree, less the bodies `source` left
+    /// out of it: what every item anchored at it is lowered from.
+    fn anchor(source: Source<'_>, anchor: ast::Node<'_>, frame: &Frame) -> SignatureTree {
+        // The ast id map walks an empty fn body it is not told is left out as a body it has,
+        // so each of the outline's empty bodies in the anchor is left out too. They hold
+        // nothing: none moves what an item in the anchor has.
+        let mut elided = Vec::new_in(frame);
+        bodies_under(anchor, |body| {
+            let ptr = ast::ptr(body);
+            let start = ptr.text_range().start();
+            let at = source.cuts.partition_point(|it| it.text_range().start() < start);
+            if source.cuts.get(at) == Some(&ptr) {
+                elided.push(body);
+            }
+        });
+        SignatureTree::copy(source, anchor, &elided, anchor.text_range().end(), frame)
+    }
+}
+
+/// Where the items anchored at an item around them share that anchor's [`SignatureTree`]: in
+/// their file's [`FileOutline`] ([`anchor_syntax`]), or in the body that holds them
+/// ([`body_anchor_syntax`]). An item read off its file makes the tree itself.
+#[derive(Clone, Copy)]
+enum Shared {
+    Outline(EditionedFileId),
+    Body(DefWithBodyId),
+    Not,
+}
+
 impl SignatureSyntax {
     /// The syntax of `item`, a node of `source`'s tree, with `elide`'s node of it left out when
-    /// the item is its own anchor. An item anchored at one around it is that whole one, less
-    /// the bodies `source` already left out of it.
+    /// the item is its own anchor. An item anchored at one around it points into that whole
+    /// one, less the bodies `source` already left out of it, as `shared` keeps it.
     fn new(
+        db: &Db,
         source: Source<'_>,
+        shared: Shared,
         item: ast::Node<'_>,
         elide: Elide,
         frame: &Frame,
     ) -> Option<SignatureSyntax> {
-        let Source { file_id, span_map, ast_id_map, cuts } = source;
+        let file_id = source.file_id;
         let item_range = item.text_range();
-        let (_, anchor) = span_map.anchor_at(item_range.start());
-        let anchor = match anchor == ROOT_ERASED_FILE_AST_ID {
+        let (_, anchor_id) = source.span_map.anchor_at(item_range.start());
+        let anchor = match anchor_id == ROOT_ERASED_FILE_AST_ID {
             true => item.ancestors().last()?,
             false => {
-                let ptr = ast_id_map.get_erased(anchor);
+                let ptr = source.ast_id_map.get_erased(anchor_id);
                 item.ancestors().find(|&it| ast::ptr(it) == ptr)?
             }
         };
         let anchor_range = anchor.text_range();
-        let own = anchor_range == item_range && anchor.kind() == item.kind();
-        // The ast id map walks an empty fn body it is not told is left out as a body it has,
-        // so each of the outline's empty bodies in an anchor around the item is left out too.
-        // They hold nothing and all come after the item: none moves what the item has.
-        let mut elided = Vec::with_capacity_in(1, frame);
-        match own {
-            true => elided.extend(elide(item)),
-            false => bodies_under(anchor, |body| {
-                let ptr = ast::ptr(body);
-                let start = ptr.text_range().start();
-                let at = cuts.partition_point(|it| it.text_range().start() < start);
-                if cuts.get(at) == Some(&ptr) {
-                    elided.push(body);
-                }
-            }),
-        }
         let base = anchor_range.start();
-        let tree = copy_without(anchor, &elided, None);
-        let (placeholder, removed, spans_end) = match (own, elided.first()) {
-            (true, Some(node)) => {
+        let own = anchor_range == item_range && anchor.kind() == item.kind();
+        if !own {
+            let tree = match shared {
+                // clone: an `Arc` count of the anchor's tree, once per item anchored at it
+                Shared::Outline(file) => anchor_syntax(db, file, anchor_id).clone(),
+                // clone: an `Arc` count of the anchor's tree, once per item anchored at it
+                Shared::Body(owner) => body_anchor_syntax(db, owner, anchor_id).clone(),
+                // alloc: the anchor's tree, for an item the outline doesn't have, read off its file
+                Shared::Not => Arc::new(SignatureTree::anchor(source, anchor, frame)),
+            };
+            let range = TextRange::new(item_range.start() - base, item_range.end() - base);
+            let item = SyntaxNodePtr::from_parts(item.kind(), range);
+            return Some(SignatureSyntax { file_id, tree, item, elided: None });
+        }
+        let elided = elide.node(item);
+        let (placeholder, removed, spans_end) = match elided {
+            Some(node) => {
                 let range = node.text_range();
                 let placeholder =
                     SyntaxNodePtr::from_parts(node.kind(), TextRange::empty(range.start() - base));
                 (Some(placeholder), range.len(), range.start())
             }
-            _ => (None, TextSize::new(0), anchor_range.end()),
+            None => (None, TextSize::new(0), anchor_range.end()),
         };
         let item_ptr = SyntaxNodePtr::from_parts(
             item.kind(),
             TextRange::new(item_range.start() - base, item_range.end() - base - removed),
         );
-        let ptrs = frame.alloc_slice_from_iter(elided.iter().map(|&it| ast::ptr(it)));
-        let ast_id_map = ast_id_map.relative_without_view(anchor, ast::Node::root(&tree), ptrs);
-        Some(SignatureSyntax {
-            file_id,
-            tree,
-            item: item_ptr,
-            elided: placeholder,
-            ast_id_map,
-            span_map: span_map.within(TextRange::new(base, spans_end)),
-        })
+        let elided: &[ast::Node<'_>] = match &elided {
+            Some(node) => std::slice::from_ref(node),
+            None => &[],
+        };
+        // alloc: the item's own tree, once per item that is its own anchor
+        let tree = Arc::new(SignatureTree::copy(source, anchor, elided, spans_end, frame));
+        Some(SignatureSyntax { file_id, tree, item: item_ptr, elided: placeholder })
     }
 
     fn root(&self) -> ast::Node<'_> {
-        ast::Node::root(&self.tree)
+        ast::Node::root(&self.tree.tree)
     }
 
     fn maps(&self) -> (&RealSpanMap, &AstIdMap) {
-        (&self.span_map, &self.ast_id_map)
+        (&self.tree.span_map, &self.tree.ast_id_map)
     }
 
     /// The item, in the tree.
@@ -350,11 +438,35 @@ impl SignatureSyntax {
     }
 }
 
-/// What [`SignatureSyntax::new`] leaves out of an item: the child of it that no signature reads.
-type Elide = for<'t> fn(ast::Node<'t>) -> Option<ast::Node<'t>>;
+/// What [`SignatureSyntax::new`] leaves out of an item that is its own anchor: the child of it
+/// that no signature reads. A value, not a function, so that it is part of a query's key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Elide {
+    /// Nothing: a struct, union or type alias, and an enum with its variants.
+    Nothing,
+    /// The items of an impl or trait.
+    Items,
+    /// The variants of an enum.
+    Variants,
+    /// The body of a fn, const or static ([`left_out`]).
+    LeftOut,
+}
+
+impl Elide {
+    /// The child of `item` this leaves out, when it has one.
+    fn node(self, item: ast::Node<'_>) -> Option<ast::Node<'_>> {
+        match self {
+            Elide::Nothing => None,
+            Elide::Items => item.child_where(|kind| kind == SyntaxKind::ASSOC_ITEM_LIST),
+            Elide::Variants => item.child_where(|kind| kind == SyntaxKind::VARIANT_LIST),
+            Elide::LeftOut => left_out(item),
+        }
+    }
+}
 
 /// What a [`SignatureSyntax`] is read from: its file's [`FileOutline`], or the file itself for
 /// an item in a body the outline leaves out. The maps are of the tree the item is a node of.
+#[derive(Clone, Copy)]
 struct Source<'a> {
     file_id: HirFileId,
     span_map: &'a RealSpanMap,
@@ -473,6 +585,11 @@ impl FileOutline {
     fn root(&self) -> ast::Node<'_> {
         ast::Node::root(&self.tree)
     }
+
+    /// What an item of the outline is read from: its tree's maps and cuts, in `file_id`.
+    fn source(&self, file_id: HirFileId) -> Source<'_> {
+        Source { file_id, span_map: &self.span_map, ast_id_map: &self.ast_id_map, cuts: &self.cuts }
+    }
 }
 
 #[cfg(test)]
@@ -530,37 +647,146 @@ pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
     })
 }
 
-/// The [`SignatureSyntax`] of the item at `id`, `elide`'s node of it left out when it is its
-/// own anchor: read off its file's [`FileOutline`], and so the same after any edit of a body
-/// left out of it. An item in such a body is not in the outline and is read off its file, as
-/// the body it is in is. `None` for an item a macro writes.
-fn item_syntax<N: AstIdNode>(
-    db: &Db,
+/// The [`SignatureSyntax`] of the item at `id` of `module`, `elide`'s node of it left out when
+/// it is its own anchor: [`body_signature_syntax`] for an item of a block that a body's own
+/// syntax made ([`owning_body`]), [`signature_syntax`] for any other. A lookup of the value
+/// kept where the item is written, no query of its own. `None` for an item a macro writes.
+fn item_syntax<'db, N: AstIdNode>(
+    db: &'db Db,
     id: AstId<N>,
     module: ModuleId,
     elide: Elide,
-    frame: &Frame,
-) -> Option<SignatureSyntax> {
+) -> Option<&'db SignatureSyntax> {
     let HirFileId::FileId(file) = id.file_id else { return None };
-    let outline = file_outline(db, file);
-    if let Some(ptr) = outline.ast_id_map.try_get_erased(id.value.erase()) {
-        let source = Source {
-            file_id: id.file_id,
-            span_map: &outline.span_map,
-            ast_id_map: &outline.ast_id_map,
-            cuts: &outline.cuts,
-        };
-        return SignatureSyntax::new(source, ast::to_node(ptr, outline.root()), elide, frame);
+    let item = id.value.erase();
+    let owner = match item.in_body() {
+        true => module.block(db).and_then(|block| block.owner(db)),
+        false => None,
+    };
+    match owner {
+        Some(owner) => body_signature_syntax(db, owner, file, item, elide).as_ref(),
+        None => signature_syntax(db, file, item, elide).as_ref(),
     }
-    if let Some((body, tree, ptr)) = owning_body(db, id.file_id, id.value.erase(), module) {
-        let source = Source { file_id: id.file_id, span_map: &body.span_map, ast_id_map: &body.ast_id_map, cuts: &[] };
-        return SignatureSyntax::new(source, ast::to_node(ptr, ast::Node::root(tree)), elide, frame);
+}
+
+/// The [`SignatureSyntax`] of the item at `item` in `file`, `elide`'s node of it left out when
+/// it is its own anchor: read off the file's [`FileOutline`], and so the same after any edit of
+/// a body left out of it. An item the outline doesn't have (in a body it leaves out that no
+/// body's own syntax holds) is read off the file, as the body it is in is.
+///
+/// Keyed by where the item is written, not by its def: every crate built from `file` reads
+/// this one value.
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+fn signature_syntax(
+    db: &Db,
+    file: EditionedFileId,
+    item: span::ErasedFileAstId,
+    elide: Elide,
+) -> Option<SignatureSyntax> {
+    blaze_mem::frame::current(|frame| {
+        let file_id = HirFileId::from(file);
+        let outline = file_outline(db, file);
+        if let Some(ptr) = outline.ast_id_map.try_get_erased(item) {
+            let node = ast::to_node(ptr, outline.root());
+            let source = outline.source(file_id);
+            return SignatureSyntax::new(db, source, Shared::Outline(file), node, elide, frame);
+        }
+        let SpanMap::RealSpanMap(span_map) = file_id.span_map(db) else { return None };
+        let ast_id_map = file_id.ast_id_map(db);
+        let node = ast::to_node(ast_id_map.get_erased(item), file_id.root(db));
+        let source = Source { file_id, span_map, ast_id_map, cuts: &[] };
+        SignatureSyntax::new(db, source, Shared::Not, node, elide, frame)
+    })
+}
+
+/// [`signature_syntax`] of the item at `item`, written in a body of `owner` in `file`: read off
+/// the body's own syntax ([`owning_body`]), so an edit elsewhere in the file leaves it the
+/// same. The outline's when the outline has the item (the body is one it keeps), and the
+/// file's when the body is not `file`'s or doesn't have it.
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+fn body_signature_syntax(
+    db: &Db,
+    owner: DefWithBodyId,
+    file: EditionedFileId,
+    item: span::ErasedFileAstId,
+    elide: Elide,
+) -> Option<SignatureSyntax> {
+    let file_id = HirFileId::from(file);
+    let in_outline = file_outline(db, file).ast_id_map.try_get_erased(item).is_some();
+    let in_body = match in_outline {
+        true => None,
+        false => body_of(db, owner, file_id, item),
+    };
+    let Some((body, tree, ptr)) = in_body else {
+        // clone: an `Arc` count of the file's value, the same item's
+        return signature_syntax(db, file, item, elide).clone();
+    };
+    blaze_mem::frame::current(|frame| {
+        let source = body_source(body);
+        let node = ast::to_node(ptr, ast::Node::root(tree));
+        SignatureSyntax::new(db, source, Shared::Body(owner), node, elide, frame)
+    })
+}
+
+/// The node of `anchor`, a span anchor of `source`'s span map, in `source`'s tree, whose root
+/// is `root`.
+fn anchor_node<'t>(
+    source: Source<'_>,
+    root: ast::Node<'t>,
+    anchor: span::ErasedFileAstId,
+) -> ast::Node<'t> {
+    match anchor == ROOT_ERASED_FILE_AST_ID {
+        true => root,
+        false => ast::to_node(source.ast_id_map.get_erased(anchor), root),
     }
-    let SpanMap::RealSpanMap(span_map) = id.file_id.span_map(db) else { return None };
-    let ast_id_map = id.file_id.ast_id_map(db);
-    let item = ast::to_node(ast_id_map.get_erased(id.value.erase()), id.file_id.root(db));
-    let source = Source { file_id: id.file_id, span_map, ast_id_map, cuts: &[] };
-    SignatureSyntax::new(source, item, elide, frame)
+}
+
+/// The [`SignatureTree`] of `anchor` in `file`'s [`FileOutline`]: the whole anchor, less the
+/// bodies the outline leaves out of it, made once for every item anchored at it, and for every
+/// crate built from the file.
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+fn anchor_syntax(
+    db: &Db,
+    file: EditionedFileId,
+    anchor: span::ErasedFileAstId,
+) -> Arc<SignatureTree> {
+    blaze_mem::frame::current(|frame| {
+        let outline = file_outline(db, file);
+        let source = outline.source(HirFileId::from(file));
+        let anchor = anchor_node(source, outline.root(), anchor);
+        // alloc: the anchor's tree, one per anchor that has an item anchored at it
+        Arc::new(SignatureTree::anchor(source, anchor, frame))
+    })
+}
+
+/// The [`SignatureTree`] of `anchor` in the own syntax of `owner`'s body: made once for every
+/// item of the body anchored at it.
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+fn body_anchor_syntax(
+    db: &Db,
+    owner: DefWithBodyId,
+    anchor: span::ErasedFileAstId,
+) -> Arc<SignatureTree> {
+    let body = body_syntax(db, owner).as_ref();
+    let body = body.unwrap_or_else(|| {
+        panic!("{owner:?}: an item anchored at {anchor:?} in its body, which has no syntax")
+    });
+    let tree = body_tree(db, owner)
+        .as_ref()
+        .unwrap_or_else(|| panic!("{owner:?}: its body's syntax has no tree, for an item anchored at {anchor:?}"));
+    blaze_mem::frame::current(|frame| {
+        let source = body_source(body);
+        let anchor = anchor_node(source, ast::Node::root(tree), anchor);
+        // alloc: the anchor's tree, one per anchor in a body that has an item anchored at it
+        Arc::new(SignatureTree::anchor(source, anchor, frame))
+    })
+}
+
+/// What an item in `body`'s own syntax is read from: the body's tree and maps, no cuts.
+fn body_source(body: &BodySyntax) -> Source<'_> {
+    let span_map: &RealSpanMap = &body.span_map;
+    let ast_id_map: &AstIdMap = &body.ast_id_map;
+    Source { file_id: body.file_id, span_map, ast_id_map, cuts: &[] }
 }
 
 /// The tree of `owner`'s [`BodySyntax`], kept as a query's value so that what is read off it
@@ -582,7 +808,17 @@ fn owning_body<'db>(
     if !id.in_body() {
         return None;
     }
-    let owner = module.block(db)?.owner(db)?;
+    body_of(db, module.block(db)?.owner(db)?, file_id, id)
+}
+
+/// `owner`'s [`BodySyntax`] when it is written in `file_id` and has the item at `id`, its tree
+/// and the item's node there.
+fn body_of(
+    db: &Db,
+    owner: DefWithBodyId,
+    file_id: HirFileId,
+    id: span::ErasedFileAstId,
+) -> Option<(&BodySyntax, &std::sync::Arc<FlatTree>, SyntaxNodePtr)> {
     let syntax = body_syntax(db, owner).as_ref().filter(|it| it.file_id == file_id)?;
     let tree = body_tree(db, owner).as_ref()?;
     Some((syntax, tree, syntax.ast_id_map.try_get_erased(id)?))
@@ -658,40 +894,44 @@ pub(crate) fn outline_with_ids(
     (syntax::view::Node::root(&outline.tree), &outline.ast_id_map)
 }
 
-/// The [`SignatureSyntax`] of `def`'s signature, `None` for an item a macro writes.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-pub fn signature_syntax(db: &Db, def: GenericDefId) -> Option<SignatureSyntax> {
-    let nothing: Elide = |_| None;
-    let items: Elide = |it| it.child_where(|kind| kind == SyntaxKind::ASSOC_ITEM_LIST);
-    let variants: Elide = |it| it.child_where(|kind| kind == SyntaxKind::VARIANT_LIST);
-    blaze_mem::frame::current(|frame| match def {
+/// The [`SignatureSyntax`] of `def`'s signature, `None` for an item a macro writes: the value
+/// kept where `def` is written ([`item_syntax`]), shared by every crate built from its file.
+pub fn signature_syntax_of(db: &Db, def: GenericDefId) -> Option<&SignatureSyntax> {
+    match def {
         GenericDefId::AdtId(AdtId::StructId(it)) => {
-            item_syntax(db, it.lookup(db).id, it.module(db), nothing, frame)
+            item_syntax(db, it.lookup(db).id, it.module(db), Elide::Nothing)
         }
         GenericDefId::AdtId(AdtId::UnionId(it)) => {
-            item_syntax(db, it.lookup(db).id, it.module(db), nothing, frame)
+            item_syntax(db, it.lookup(db).id, it.module(db), Elide::Nothing)
         }
         GenericDefId::AdtId(AdtId::EnumId(it)) => {
-            item_syntax(db, it.lookup(db).id, it.module(db), variants, frame)
+            item_syntax(db, it.lookup(db).id, it.module(db), Elide::Variants)
         }
-        GenericDefId::FunctionId(it) => item_syntax(db, it.lookup(db).id, it.module(db), left_out, frame),
-        GenericDefId::ConstId(it) => item_syntax(db, it.lookup(db).id, it.module(db), left_out, frame),
-        GenericDefId::StaticId(it) => item_syntax(db, it.lookup(db).id, it.module(db), left_out, frame),
-        GenericDefId::ImplId(it) => item_syntax(db, it.lookup(db).id, it.module(db), items, frame),
-        GenericDefId::TraitId(it) => item_syntax(db, it.lookup(db).id, it.module(db), items, frame),
-        GenericDefId::TypeAliasId(it) => item_syntax(db, it.lookup(db).id, it.module(db), nothing, frame),
-    })
+        GenericDefId::FunctionId(it) => {
+            item_syntax(db, it.lookup(db).id, it.module(db), Elide::LeftOut)
+        }
+        GenericDefId::ConstId(it) => {
+            item_syntax(db, it.lookup(db).id, it.module(db), Elide::LeftOut)
+        }
+        GenericDefId::StaticId(it) => {
+            item_syntax(db, it.lookup(db).id, it.module(db), Elide::LeftOut)
+        }
+        GenericDefId::ImplId(it) => item_syntax(db, it.lookup(db).id, it.module(db), Elide::Items),
+        GenericDefId::TraitId(it) => item_syntax(db, it.lookup(db).id, it.module(db), Elide::Items),
+        GenericDefId::TypeAliasId(it) => {
+            item_syntax(db, it.lookup(db).id, it.module(db), Elide::Nothing)
+        }
+    }
 }
 
 /// The [`SignatureSyntax`] of an enum with its variants, nothing left out: what its
 /// [`EnumVariants`] and the [`VariantFields`] of its variants are lowered from. `None` for an
 /// enum a macro writes.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-pub fn variants_syntax(db: &Db, def: EnumId) -> Option<SignatureSyntax> {
-    blaze_mem::frame::current(|frame| item_syntax(db, def.lookup(db).id, def.module(db), |_| None, frame))
+pub fn variants_syntax(db: &Db, def: EnumId) -> Option<&SignatureSyntax> {
+    item_syntax(db, def.lookup(db).id, def.module(db), Elide::Nothing)
 }
 
-/// `source_map`, of `def`'s signature lowered from its [`signature_syntax`], moved to `item`,
+/// `source_map`, of `def`'s signature lowered from its [`signature_syntax_of`], moved to `item`,
 /// where `def` is in its file.
 fn moved_to_file<N: AstIdNode>(
     db: &Db,
@@ -699,7 +939,7 @@ fn moved_to_file<N: AstIdNode>(
     item: AstId<N>,
     source_map: &ExpressionStoreSourceMap,
 ) -> ExpressionStoreSourceMap {
-    let syntax = signature_syntax(db, def).as_ref();
+    let syntax = signature_syntax_of(db, def);
     syntax.expect("a signature lowered from no syntax").moved(file_range(db, item), source_map)
 }
 
@@ -983,7 +1223,7 @@ pub struct EnumSignature {
 signature_queries!(EnumSignature, EnumId, served_enum);
 
 impl EnumSignature {
-    /// Lowered from its [`signature_syntax`], its variants left out.
+    /// Lowered from its [`signature_syntax_of`], its variants left out.
     fn lower(
         db: &Db,
         id: EnumId,
@@ -1032,7 +1272,7 @@ fn has_unsafe_field(fields: Option<ast::FieldList<'_>>, cfg_options: &CfgOptions
 }
 
 /// Whether a field of a variant of `id` that its crate's cfg keeps is written `unsafe`. It
-/// reads the variants, which the enum's [`signature_syntax`] leaves out, so it is a query of
+/// reads the variants, which the enum's [`signature_syntax_of`] leaves out, so it is a query of
 /// its own: a variant edit runs it again, and the signature only when the answer changes.
 #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
 fn enum_has_unsafe_fields(db: &Db, id: EnumId) -> bool {
@@ -1091,7 +1331,7 @@ pub struct ConstSignature {
 signature_queries!(ConstSignature, ConstId, served_const);
 
 impl ConstSignature {
-    /// Lowered from its [`signature_syntax`], its body left out.
+    /// Lowered from its [`signature_syntax_of`], its body left out.
     fn lower(
         db: &Db,
         id: ConstId,
@@ -1154,7 +1394,7 @@ pub struct StaticSignature {
 signature_queries!(StaticSignature, StaticId, served_static);
 
 impl StaticSignature {
-    /// Lowered from its [`signature_syntax`], its body left out.
+    /// Lowered from its [`signature_syntax_of`], its body left out.
     fn lower(
         db: &Db,
         id: StaticId,
@@ -1208,7 +1448,7 @@ pub struct ImplSignature {
 signature_queries!(ImplSignature, ImplId, served_impl);
 
 impl ImplSignature {
-    /// Lowered from its [`signature_syntax`], its items left out.
+    /// Lowered from its [`signature_syntax_of`], its items left out.
     fn lower(
         db: &Db,
         id: ImplId,
@@ -1314,7 +1554,7 @@ pub struct TraitSignature {
 signature_queries!(TraitSignature, TraitId, served_trait);
 
 impl TraitSignature {
-    /// Lowered from its [`signature_syntax`], its items left out.
+    /// Lowered from its [`signature_syntax_of`], its items left out.
     fn lower(
         db: &Db,
         id: TraitId,
@@ -1405,7 +1645,7 @@ pub struct FunctionSignature {
 signature_queries!(FunctionSignature, FunctionId, served_function);
 
 impl FunctionSignature {
-    /// Lowered from its [`signature_syntax`], its body left out.
+    /// Lowered from its [`signature_syntax_of`], its body left out.
     fn lower(
         db: &Db,
         id: FunctionId,
@@ -1624,12 +1864,12 @@ const _: () = assert!(
 );
 
 /// What the fields of `id` are lowered from: the [`variants_syntax`] of an enum variant's
-/// enum, the [`signature_syntax`] of a struct or union. `None` for one a macro writes.
+/// enum, the [`signature_syntax_of`] of a struct or union. `None` for one a macro writes.
 fn variant_syntax(db: &Db, id: VariantId) -> Option<&SignatureSyntax> {
     match id {
-        VariantId::EnumVariantId(it) => variants_syntax(db, it.lookup(db).parent).as_ref(),
-        VariantId::StructId(it) => signature_syntax(db, it.into()).as_ref(),
-        VariantId::UnionId(it) => signature_syntax(db, it.into()).as_ref(),
+        VariantId::EnumVariantId(it) => variants_syntax(db, it.lookup(db).parent),
+        VariantId::StructId(it) => signature_syntax_of(db, it.into()),
+        VariantId::UnionId(it) => signature_syntax_of(db, it.into()),
     }
 }
 
@@ -1644,7 +1884,7 @@ impl VariantFields {
     }
 
     /// The fields with where each part of them is written in their file.
-    #[blaze_query::tracked(returns(ref), lru = 1024, mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(ref), lru, weigh = with_source_map_bytes, mem_tag = Nameres)]
     pub fn with_source_map(
         db: &Db,
         id: VariantId,
@@ -1711,7 +1951,7 @@ impl VariantFields {
                 let parent = loc.parent.lookup(db);
                 let source = match syntax {
                     Some(syntax) => {
-                        let variant = syntax.ast_id_map.get(loc.id.value).to_view(syntax.root());
+                        let variant = syntax.tree.ast_id_map.get(loc.id.value).to_view(syntax.root());
                         InFile::new(syntax.file_id, variant)
                     }
                     None => loc.source_view(db),
@@ -2015,8 +2255,8 @@ impl EnumVariants {
             let loc = e.lookup(db);
             // The relative tree's ast ids are the file's: what a variant is interned by.
             let syntax = variants_syntax(db, e);
-            let (source, ast_id_map) = match &syntax {
-                Some(syntax) => (syntax.node::<ast::Enum<'_>>(), &syntax.ast_id_map),
+            let (source, ast_id_map) = match syntax {
+                Some(syntax) => (syntax.node::<ast::Enum<'_>>(), &syntax.tree.ast_id_map),
                 None => {
                     let source = loc.source_view(db);
                     let ast_id_map = source.file_id.ast_id_map(db);
@@ -2037,7 +2277,9 @@ impl EnumVariants {
                 let ast_id = ast_id_map.ast_id_of_view::<syntax::ast::Variant>(variant);
                 match AttrFlags::is_cfg_enabled_for(variant, cfg_options) {
                     Ok(()) => {
-                        let name = as_name_opt(variant.name());
+                        // Keyed by the context it is written with ([`def_site::variant_name`]):
+                        // an enum a `macro` writes may have `V` and a `$v` it is handed as `V`.
+                        let name = def_site::variant_name(db, source.file_id, variant.name());
                         let id = source.with_value(ast_id);
                         // clone: a `Symbol` count: the loc and the map each keep the name
                         let loc_name = name.clone();
@@ -2110,15 +2352,30 @@ impl EnumVariants {
             .map(|(index, &(id, shape))| (id, shape, self.explicit_discriminant.contains(index)))
     }
 
+    /// The variant bound under `name` exactly: a [keyed](Name::keyed) name finds only the
+    /// variant a `macro` named with that key. A name a path writes is looked up by
+    /// [`EnumVariants::variant_written`].
     pub fn variant(&self, name: &Name) -> Option<EnumVariantId> {
         self.variants.get(name).map(|&(id, _)| id)
     }
 
+    /// The variant of `e` that a path segment `name`, written with `ctxt`, names (`E::V`,
+    /// `<E>::V`, `Self::V`, `use E::V`): `name` looked up by [`def_site::name_in`] the scope the
+    /// enum's expansion made, as rustc's `resolve_ident_in_module` of the enum's module and
+    /// `hygienic_eq` of `lower_type_relative_path` and `resolve_fully_qualified_call` do. A
+    /// name with no macros 2.0 mark is looked up as written.
+    pub fn variant_written(db: &Db, e: EnumId, name: &Name, ctxt: span::SyntaxContext) -> Option<EnumVariantId> {
+        let name = def_site::name_in(db, *name, ctxt, def_site::enum_expansion(db, e));
+        e.enum_variants(db).variant(&name)
+    }
+
+    /// The name `variant_id` is written with, its key dropped: what a message or a printed
+    /// path shows.
     pub fn variant_name_by_id(&self, variant_id: EnumVariantId) -> Option<Name> {
         self.variants
             .iter()
             // clone: a `Symbol` count, the name the caller asked for
-            .find_map(|(name, (id, _))| if *id == variant_id { Some(name.clone()) } else { None })
+            .find_map(|(name, (id, _))| if *id == variant_id { Some(name.clone().unkeyed()) } else { None })
     }
 
     // [Adopted from rustc](https://github.com/rust-lang/rust/blob/bd53aa3bf7a24a70d763182303bd75e5fc51a9af/compiler/rustc_middle/src/ty/adt.rs#L446-L448)
@@ -2850,7 +3107,6 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
                 .find(|it| it.name().is_some_and(|it| it.text() == name))
                 .unwrap_or_else(|| panic!("no struct {name}"))
         };
-        let nothing: Elide = |_| None;
         let krate = crate::test_db::TestDBExt::fetch_test_crate(&db);
         let root_module = crate::nameres::crate_def_map(&db, krate).root;
         for (name, text) in [
@@ -2862,15 +3118,43 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
                 file_id,
                 file_id.ast_id_map(&db).ast_id_of_view::<syntax::ast::Struct>(item),
             );
-            let syntax = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
-                item_syntax(&db, id, root_module, nothing, frame)
-            })
-            .unwrap_or_else(|| panic!("{name}"));
+            let syntax = item_syntax(&db, id, root_module, Elide::Nothing)
+                .unwrap_or_else(|| panic!("{name}"));
             assert_eq!(syntax.root().text(), text, "{name}");
             assert_eq!(syntax.node::<ast::Struct<'_>>().value.syntax().text(), item.syntax().text());
-            assert_eq!(syntax.ast_id_map.get_erased(id.value.erase()), syntax.item, "{name}");
+            assert_eq!(syntax.tree.ast_id_map.get_erased(id.value.erase()), syntax.item, "{name}");
             assert_eq!(syntax.elided, None, "{name}");
         }
+    }
+
+    /// The items of an `impl` with attributes are anchored at it, and each is lowered from the
+    /// whole `impl`: they point into one copy of it, made once, not a copy each.
+    #[test]
+    fn items_of_an_attributed_impl_share_its_tree() {
+        const IMPL: &str = r#"
+pub struct S;
+#[cfg(all())]
+impl S {
+    pub fn a(&self) -> u8 { 1 }
+    pub fn b(&self) -> u16 { 2 }
+}
+"#;
+        let fx = fixture::db(IMPL);
+        let _ = fx.only_file();
+        let db = fx.into_db();
+        let (signatures, _) = defs(&db);
+        let methods: Vec<&SignatureSyntax> = (signatures.iter())
+            .filter(|it| matches!(it, GenericDefId::FunctionId(_)))
+            .map(|&def| signature_syntax_of(&db, def).unwrap_or_else(|| panic!("{def:?} has no syntax")))
+            .collect();
+        let &[a, b] = methods.as_slice() else { panic!("two methods, not {}", methods.len()) };
+        let text =
+            |it: &SignatureSyntax| it.node::<ast::Fn<'_>>().value.syntax().text().to_string();
+        let mut texts = [text(a), text(b)];
+        texts.sort();
+        assert_eq!(texts, ["pub fn a(&self) -> u8 { 1 }", "pub fn b(&self) -> u16 { 2 }"]);
+        assert!(a.root().text().to_string().starts_with("#[cfg(all())]"), "the tree is the impl");
+        assert!(Arc::ptr_eq(&a.tree, &b.tree), "each method holds a copy of the impl of its own");
     }
 
     /// Allocation budget: the outline's walks on views, `bodies_under` over a file and
@@ -2903,7 +3187,7 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
     /// and flag read off what they hold.
     fn read(db: &TestDB, def: GenericDefId) {
         use std::hint::black_box;
-        black_box(signature_syntax(db, def));
+        black_box(signature_syntax_of(db, def));
         match def {
             GenericDefId::AdtId(AdtId::StructId(it)) => {
                 black_box(StructSignature::of(db, it));
@@ -3008,7 +3292,7 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
             db.set_file_text(file.file_id(&db), &text);
             let (signatures, variants) = defs(&db);
             for def in signatures {
-                assert!(signature_syntax(&db, def).is_some(), "{def:?} has no syntax of its own");
+                assert!(signature_syntax_of(&db, def).is_some(), "{def:?} has no syntax of its own");
                 match def {
                     GenericDefId::AdtId(AdtId::StructId(it)) => check!(db, StructSignature, it),
                     GenericDefId::AdtId(AdtId::UnionId(it)) => check!(db, UnionSignature, it),

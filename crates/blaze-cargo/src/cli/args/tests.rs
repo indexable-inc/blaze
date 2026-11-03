@@ -19,17 +19,22 @@ fn refused(words: &[&str]) -> String {
 
 #[test]
 fn check_reads_its_fix_replace_and_baseline_flags_and_keeps_them_from_the_load() {
-    let asked = cargo(&["check", "--workspace", "--baselines", "b"]);
+    let asked = cargo(&["check", "--workspace", "--target", "x86_64-unknown-linux-gnu", "--baselines", "b"]);
     assert_eq!(asked.command, Some(Command::Check));
     assert!(asked.flags.workspace);
     assert_eq!(asked.flags.baselines.as_deref(), Some("b"));
-    assert_eq!(asked.args, ["--workspace"], "blaze's own flags stay with the client");
+    assert_eq!(asked.args, ["--workspace", "--target", "x86_64-unknown-linux-gnu"], "blaze's own flags stay with the client");
     assert!(refused(&["check", "--no-deps"]).starts_with("error: unexpected argument '--no-deps' found"));
     assert!(refused(&["check", "--allow-dirty"]).starts_with("error: unexpected argument '--allow-dirty' found"));
     assert!(refused(&["check", "--", "-D", "warnings"]).starts_with("error: unexpected argument '-D' found"));
     let unhonored = |words: &[&str]| super::refused(&cargo(words));
     assert_eq!(unhonored(&["check", "--fix"]), None);
     assert!(unhonored(&["check", "--fix", "--baselines", "b"]).is_some(), "a fix changes what the baselines count");
+    let t = "--target=x86_64-unknown-linux-gnu";
+    assert_eq!(unhonored(&["check", "--workspace", t, "--baselines", "b"]), None);
+    assert!(unhonored(&["check", "--workspace", "--baselines", "b"]).is_some(), "counts are of one named target");
+    assert!(unhonored(&["check", "--workspace", t, "--tests", "--baselines", "b"]).is_some(), "the default targets only");
+    assert!(unhonored(&["check", "-p", "a", t, "--baselines", "b"]).is_some(), "another crate reads as at zero");
     let fix = cargo(&["check", "--fix", "--lint", "clippy::disallowed_types", "--lint=unused_imports", "-p", "a"]);
     assert!(fix.flags.fix);
     assert_eq!(fix.flags.lints, ["clippy::disallowed_types", "unused_imports"]);
@@ -40,7 +45,8 @@ fn check_reads_its_fix_replace_and_baseline_flags_and_keeps_them_from_the_load()
     assert!(replace.args.is_empty(), "`--replace` stays with the client");
     assert!(unhonored(&["check", "--replace", "a::B=c::D", "--fix"]).is_some(), "a replace checks nothing");
     assert!(unhonored(&["check", "--bless-baselines"]).is_some(), "no directory to bless");
-    assert_eq!(unhonored(&["check", "--baselines", "b", "--bless-baselines", "--new-baseline", "clippy::x"]), None);
+    let whole = |words: &[&str]| unhonored(&[&["check", "--workspace", t], words].concat());
+    assert_eq!(whole(&["--baselines", "b", "--bless-baselines", "--new-baseline", "clippy::x"]), None);
     let many = cargo(&["check", "--baselines", "b", "--new-baseline", "clippy::a,blaze::b", "--new-baseline=clippy::c"]);
     assert_eq!(many.flags.new_baselines, ["clippy::a", "blaze::b", "clippy::c"]);
 }
@@ -152,7 +158,8 @@ fn test_names_its_filter_and_the_harness_args() {
     assert_eq!(asked.args, ["parse", "--no-fail-fast"]);
     assert_eq!(asked.program, os(&["--exact", "--nocapture"]));
     assert_eq!(asked.test_args(), os(&["parse", "--exact", "--nocapture"]));
-    assert!(asked.flags.no_fail_fast);
+    assert!(!asked.flags.fail_fast, "`--no-fail-fast` is the default, a no-op");
+    assert!(cargo(&["test", "--fail-fast"]).flags.fail_fast);
     assert_eq!(asked.profile(), "test");
 
     let bench = cargo(&["bench", "fast"]);
@@ -289,7 +296,7 @@ fn hidden_flags_that_point_elsewhere() {
     // cargo refuses `--keep-going` on `test` and `bench`; blaze takes it and passes it on.
     for command in ["test", "bench"] {
         let asked = cargo(&[command, "--keep-going"]);
-        assert!(asked.flags.keep_going && asked.args == ["--keep-going"], "{command}");
+        assert!(!asked.flags.fail_fast && asked.args == ["--keep-going"], "{command}");
     }
     // `test`'s `-q` is its own, and it has no `-s`; `check` has no `--debug`.
     assert!(refused(&["test", "-s"]).starts_with("error: unexpected argument '-s' found\n\n  tip: to pass '-s'"));

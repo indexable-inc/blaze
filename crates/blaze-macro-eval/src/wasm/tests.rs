@@ -16,6 +16,7 @@ use intern::Symbol;
 
 use super::{Given, Library, LoadError, Loads, Modules, abi::Mismatch};
 use crate::{
+    expander::Engine,
     keep::Calling,
     run::Spent,
     stream::{IdentKind, Spacing, Stream, Tree},
@@ -214,6 +215,24 @@ fn a_member_modules_relative_path_starts_at_the_workspaces_root_and_only_the_roo
     assert!(stop.contains(&format!("(which is `{}`)", ws.path("secret.txt"))), "{stop}");
 }
 
+/// A module whose glue could not enter its working directory (status `UNENTERED` with
+/// `ENOENT`, 44, above its low byte) stops naming the directory and why, never expanding.
+#[test]
+fn a_module_that_cannot_enter_its_directory_stops_naming_it_and_its_errno() {
+    let ws = Workspace::new("unentered");
+    let status = super::abi::UNENTERED | 44 << 8;
+    let text = ECHO.replacen(
+        "(if (i32.ne (local.get $index)",
+        &format!("(return (i32.const {status}))\n    (if (i32.ne (local.get $index)"),
+        1,
+    );
+    let (library, _) = Library::load_with(&modules(), &binary(&text), None, WHAT).unwrap();
+    let (output, _) = expand_in(&library, ws.env(), ws.path("pkg"));
+    let stop = output.unwrap_err();
+    assert!(stop.contains(&format!("could not enter `{}`", ws.path("pkg"))), "{stop}");
+    assert!(stop.contains("failed with ENOENT (WASI errno 44)"), "{stop}");
+}
+
 fn at(start: u32, end: u32) -> Span {
     let file_id = EditionedFileId::new(span::FileId::from_raw(3), Edition::CURRENT);
     Span {
@@ -368,6 +387,26 @@ fn a_module_without_initialize_is_refused() {
 fn bytes_that_are_no_module_are_refused_as_not_compiling() {
     let error = Library::load_with(&modules(), b"\0asm\x01\0\0\0\xff", None, WHAT).unwrap_err();
     assert!(matches!(error, LoadError::Compile(_)), "{error:?}");
+}
+
+/// C1 of the fekey review: what a crate's macros run in a module is of the module too, so the
+/// key of a crate that calls them ([`crate::expander`]'s `ProcMacroExpander::code`) moves when
+/// the code generator makes another module of the same source, which the front end's code
+/// identity does not cover.
+#[test]
+fn another_module_of_the_same_crate_runs_other_code() {
+    let modules = modules();
+    let code = blaze_ids::ContentId([9; 32]);
+    let (one, _) = Library::load_with(&modules, &echo(), None, WHAT).unwrap();
+    let (again, _) = Library::load_with(&modules, &echo(), None, WHAT).unwrap();
+    let rebuilt = binary(&ECHO.replacen("(func (export \"_initialize\"))", "(func (export \"_initialize\") nop)", 1));
+    let (other, _) = Library::load_with(&modules, &rebuilt, None, WHAT).unwrap();
+    assert_ne!(one.id(), other.id(), "the rebuilt module is other bytes");
+    let (one, again, other) = (Engine::Wasm(one), Engine::Wasm(again), Engine::Wasm(other));
+    assert_eq!(one.runs(code), again.runs(code), "one module of one crate runs one code");
+    assert_ne!(one.runs(code), other.runs(code), "another module of the same crate runs other code");
+    assert_ne!(one.runs(code), code, "a module's code is not the crate's alone");
+    assert_ne!(one.runs(code), one.runs(blaze_ids::ContentId([10; 32])), "nor the module's alone");
 }
 
 #[test]

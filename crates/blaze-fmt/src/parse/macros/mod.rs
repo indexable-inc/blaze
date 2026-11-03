@@ -14,11 +14,11 @@ pub(crate) mod cfg_if;
 pub(crate) mod cfg_select;
 pub(crate) mod lazy_static;
 
-fn build_stream_parser<'a>(psess: &'a ParseSess, tokens: TokenStream) -> Parser<'a> {
+fn build_stream_parser<'a>(psess: &'a ParseSess, tokens: &TokenStream) -> Parser<'a> {
     Parser::new(psess, tokens)
 }
 
-fn build_parser<'a>(context: &RewriteContext<'a>, tokens: TokenStream) -> Parser<'a> {
+fn build_parser<'a>(context: &RewriteContext<'a>, tokens: &TokenStream) -> Parser<'a> {
     build_stream_parser(context.psess, tokens)
 }
 
@@ -100,7 +100,7 @@ fn check_keyword<'a, 'b: 'a>(parser: &'a mut Parser<'b>) -> Option<MacroArg> {
 
 pub(crate) fn parse_macro_args(
     context: &RewriteContext<'_>,
-    tokens: TokenStream,
+    tokens: &TokenStream,
     style: Delimiter,
     forced_bracket: bool,
 ) -> Option<ParsedMacroArgs> {
@@ -166,7 +166,7 @@ pub(crate) fn parse_macro_args(
 
 pub(crate) fn parse_expr(
     context: &RewriteContext<'_>,
-    tokens: TokenStream,
+    tokens: &TokenStream,
 ) -> Option<Box<ast::Expr>> {
     let mut parser = build_parser(context, tokens);
     parser.parse_expr().ok()

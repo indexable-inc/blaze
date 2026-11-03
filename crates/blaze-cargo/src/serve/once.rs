@@ -19,6 +19,7 @@ pub(crate) fn connect() -> anyhow::Result<Client> {
         #[cfg(unix)]
         activated: None,
         stall: None,
+        memory: None,
     };
     let engine = engine(serving, None)?;
     let mut running = start(engine, "blaze", None)?;
@@ -92,10 +93,14 @@ impl Local for Once {
         running.daemon.stop();
         while running.daemon.turn() {}
         let failed = running.daemon.failed().map(|why| format!("the build engine in this process failed as it stopped: {why}"));
+        let marked = match failed {
+            None => running.stopped().map_err(|why| io::Error::other(format!("{why:#}"))),
+            Some(_) => Ok(()),
+        };
         let ended = running.end().map_err(|why| io::Error::other(format!("ending the build engine in this process: {why:#}")));
         match failed {
             Some(why) => Err(io::Error::other(why)),
-            None => ended,
+            None => ended.and(marked),
         }
     }
 }

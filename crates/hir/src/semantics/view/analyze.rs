@@ -213,7 +213,11 @@ impl<'db> Semantics<'db> {
         &self,
         path: ast::Path<'db>,
     ) -> Option<(PathResolution<'db>, Option<GenericSubstitution<'db>>)> {
-        self.analyze(path.syntax())?.resolve_path_view(self.db, path)
+        // The file's own tree and maps: an item missing from them is a bug in the analysis,
+        // which fails the job naming it.
+        self.analyze(path.syntax())?
+            .resolve_path_view(self.db, path)
+            .unwrap_or_else(|it| panic!("resolving `{}`: {it}", path.syntax().text()))
     }
 
     pub fn resolve_path_per_ns(&self, path: ast::Path<'db>) -> Option<PathResolutionPerNs<'db>> {

@@ -44,6 +44,7 @@ use std::alloc::Global;
 
 use crate::{
     Files, Options,
+    lints::CommandLine,
     model::{Diag, MultiSpan, Span},
 };
 
@@ -84,7 +85,10 @@ pub fn producer() -> ContentId {
     hasher.finish()
 }
 
-/// What a crate's check reads beyond its image: the outcome's key holds each.
+/// What a crate's check reads beyond its image: the outcome's key holds each, and the options
+/// the check runs with are made of them alone ([`Inputs::options`]), so nothing outside the
+/// front end's code (blaze-cargo, which runs the check) can give a check other options than its
+/// key says.
 #[derive(Clone, Copy, Debug)]
 pub struct Inputs<'a> {
     /// The lint flags rustc is given, in order: cargo's `[lints]`, those of `RUSTFLAGS`,
@@ -98,9 +102,20 @@ pub struct Inputs<'a> {
 }
 
 impl<'a> Inputs<'a> {
-    /// The inputs of a check run in `db` with `options`, parsed from `lint_flags`.
-    pub fn of(db: &Db, lint_flags: &'a [String], options: &Options) -> Inputs<'a> {
-        Inputs { lint_flags, keep_duplicates: options.keep_duplicates, borrowck: hir_ty_borrowck::mode(db) }
+    /// The inputs of the check of a crate cargo builds, run in `db` with the lint flags
+    /// `lint_flags`.
+    pub fn of(db: &Db, lint_flags: &'a [String]) -> Inputs<'a> {
+        Inputs { lint_flags, keep_duplicates: false, borrowck: hir_ty_borrowck::mode(db) }
+    }
+
+    /// The options the check runs with, made of these inputs and of this function, which is
+    /// the front end's code (the image key's `build`): the lint flags parsed, as cargo runs
+    /// rustc (every crate blaze builds is built as cargo builds it, with `CARGO_CRATE_NAME`
+    /// set), and no future-incompatibility report. An error for flags that name no lint.
+    pub fn options(&self) -> Result<Options, String> {
+        let mut lints = CommandLine::parse(self.lint_flags)?;
+        lints.check_cfg.cargo = true;
+        Ok(Options { lints, keep_duplicates: self.keep_duplicates, future_breakage_report: false })
     }
 }
 

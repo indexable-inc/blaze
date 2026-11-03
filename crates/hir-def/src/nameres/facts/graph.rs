@@ -44,13 +44,17 @@ pub(crate) struct ImportShape {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShapeModule {
     pub(crate) parent: Option<u32>,
+    /// Its `mod` is written by a `macro` (2.0): it has a key (`DefMap::module_key`), so a
+    /// `self` or `super` path in it or under it may start at another module around it, whatever
+    /// context the keyword has (`def_site::DefMap::resolve_self`).
+    pub(crate) opaque: bool,
     /// Names that denote a local module in this module's type namespace by declaration:
     /// `mod` children (expansions' too) and `extern crate self as n`, with the module.
     pub(crate) local_names: Box<[(Name, u32)]>,
     pub(crate) imports: Box<[ShapeImport]>,
     /// Other paths this module's import resolution reads: the `pub(in path)` visibilities of
-    /// its `use` items.
-    pub(crate) other_paths: Box<[ModPath]>,
+    /// its `use` items, each with whether it is hygienic (as [`ShapeImport::hygienic`]).
+    pub(crate) other_paths: Box<[(ModPath, bool)]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +65,10 @@ pub(crate) struct ShapeImport {
     pub(crate) is_glob: bool,
     /// The crate's `#[prelude_import]`: every module reads its targets.
     pub(crate) is_prelude: bool,
+    /// The path's first token is written with a macros 2.0 context (`ImportOp::ctxt` is not a
+    /// root): def-site hygiene may start a `self`, `super` or plain path in any module around
+    /// this one (`def_site::DefMap::resolve_self`, a name the expansion wrote there).
+    pub(crate) hygienic: bool,
 }
 
 /// The strongly connected components of a round's import graph, in reverse topological
@@ -396,7 +404,7 @@ impl<'a, 'f> Solver<'a, 'f> {
                 levels += import.path.segments().len() + 1;
                 preludes += usize::from(import.is_prelude);
             }
-            for path in &module.other_paths {
+            for (path, _) in &module.other_paths {
                 levels += path.segments().len() + 1;
             }
         }
@@ -450,7 +458,8 @@ impl<'a, 'f> Solver<'a, 'f> {
             for import in &module.imports {
                 let binds = if import.is_glob { None } else { import.binds };
                 let glob = import.is_glob && !import.is_prelude;
-                self.add_path(x, &import.path, ResolveMode::Import, binds, glob, import.is_prelude);
+                let path = &import.path;
+                self.add_path(x, path, ResolveMode::Import, binds, glob, import.is_prelude, import.hygienic);
                 // Which module the prelude is, every module learns from this import's
                 // resolution, so each comes after the module that has it.
                 if import.is_prelude {
@@ -459,14 +468,15 @@ impl<'a, 'f> Solver<'a, 'f> {
                     }
                 }
             }
-            for path in &module.other_paths {
-                self.add_path(x, path, ResolveMode::Other, None, false, false);
+            for (path, hygienic) in &module.other_paths {
+                self.add_path(x, path, ResolveMode::Other, None, false, false, *hygienic);
             }
         }
     }
 
     /// Adds a path of `module` and its first step, by kind as `DefMap::resolve_single` takes
-    /// it: where the first segment is looked up, and what the extern prelude adds.
+    /// it: where the first segment is looked up, and what the extern prelude adds. A hygienic
+    /// `self`, `super` or 2018 plain path may also start in any module around `module`.
     fn add_path(
         &mut self,
         module: u32,
@@ -475,6 +485,7 @@ impl<'a, 'f> Solver<'a, 'f> {
         binds: Option<Name>,
         glob: bool,
         prelude: bool,
+        hygienic: bool,
     ) {
         let shape = self.shape;
         let segments = path.segments();
@@ -484,6 +495,24 @@ impl<'a, 'f> Solver<'a, 'f> {
         self.paths.push(PathRow { module, first_level, segments, binds, glob, prelude });
         let extern_prelude_root =
             segments.first().is_some_and(|first| shape.extern_prelude_self.contains(first));
+        let plain_2015 = shape.edition == Edition::Edition2015
+            && (path.kind == PathKind::Abs || mode == ResolveMode::Import);
+        // Def-site hygiene moves such a path to a module around it: `resolve_self` walks out
+        // (past each module a `macro` wrote, whatever context the keyword has), and the walk of
+        // a plain name finds it where the expansion wrote it. A def site that is not around the
+        // path leaves it unresolved (`facts::unit`), so it is not read.
+        let moved = match path.kind {
+            PathKind::Super(_) => hygienic || self.opaque_around(module),
+            PathKind::Plain => hygienic && !plain_2015,
+            PathKind::Crate | PathKind::Abs | PathKind::DollarCrate(_) => false,
+        };
+        if moved && !segments.is_empty() {
+            let mut at = shape.modules[module as usize].parent;
+            while let Some(ancestor) = at {
+                self.push(Fact::Reach { level: first_level, module: ancestor });
+                at = shape.modules[ancestor as usize].parent;
+            }
+        }
         match path.kind {
             PathKind::DollarCrate(krate) => {
                 if krate == shape.krate {
@@ -501,10 +530,7 @@ impl<'a, 'f> Solver<'a, 'f> {
                 }
             }
             // The crate root, then the extern prelude (`::*` alone names the root).
-            PathKind::Plain | PathKind::Abs
-                if shape.edition == Edition::Edition2015
-                    && (path.kind == PathKind::Abs || mode == ResolveMode::Import) =>
-            {
+            PathKind::Plain | PathKind::Abs if plain_2015 => {
                 self.push(Fact::Reach { level: first_level, module: ROOT });
                 if extern_prelude_root {
                     self.push(Fact::Reach { level: first_level + 1, module: ROOT });
@@ -527,6 +553,19 @@ impl<'a, 'f> Solver<'a, 'f> {
                 }
             }
         }
+    }
+
+    /// Whether `module` or a module around it is [`ShapeModule::opaque`].
+    fn opaque_around(&self, module: u32) -> bool {
+        let mut at = Some(module);
+        // Each turn moves to a parent, ending at the root.
+        while let Some(here) = at {
+            if self.shape.modules[here as usize].opaque {
+                return true;
+            }
+            at = self.shape.modules[here as usize].parent;
+        }
+        false
     }
 
     /// The interned pair `(module, name)`. A new one takes, through the module's globs, the

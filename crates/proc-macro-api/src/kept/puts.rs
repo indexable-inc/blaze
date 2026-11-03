@@ -164,7 +164,7 @@ pub(crate) fn publish(store: &mut Store, puts: Vec<Put>) -> Published {
             Ok(()) => {}
             Err(error) => {
                 let said = refused(&what, &error);
-                super::system(said.clone()); // clone: error path, a refused put, said and kept
+                super::system(&said);
                 published.refused.push(said);
             }
         }

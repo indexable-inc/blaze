@@ -1,0 +1,414 @@
+diff --git a/src/interner.rs b/src/interner.rs
+index 306f884..0f6a1d6 100644
+--- a/src/interner.rs
++++ b/src/interner.rs
+@@ -276,6 +276,17 @@ pub trait Interner:
+         f: impl FnOnce(&search_graph::GlobalCache<Self>) -> R,
+     ) -> R;
+ 
++    /// The solver cache of `scope`, to look a goal up in: see
++    /// [`search_graph::Cx::with_global_cache_to_read`]. By default,
++    /// [`Interner::with_global_cache`].
++    fn with_global_cache_to_read<R>(
++        self,
++        scope: search_graph::CacheScope,
++        f: impl FnOnce(&search_graph::GlobalCache<Self>) -> Option<R>,
++    ) -> Option<R> {
++        <Self as Interner>::with_global_cache(self, scope, f)
++    }
++
+     /// See [`search_graph::Cx::cache_scope`].
+     fn cache_scope(self, dep_node: &Self::DepNodeIndex) -> search_graph::CacheScope;
+ 
+@@ -839,6 +850,13 @@ impl<I: Interner> search_graph::Cx for I {
+     ) -> R {
+         I::with_global_cache(self, scope, f)
+     }
++    fn with_global_cache_to_read<R>(
++        self,
++        scope: search_graph::CacheScope,
++        f: impl FnOnce(&search_graph::GlobalCache<Self>) -> Option<R>,
++    ) -> Option<R> {
++        I::with_global_cache_to_read(self, scope, f)
++    }
+     fn cache_scope(self, dep_node: &I::DepNodeIndex) -> search_graph::CacheScope {
+         I::cache_scope(self, dep_node)
+     }
+diff --git a/src/search_graph/global_cache.rs b/src/search_graph/global_cache.rs
+index 89f560f..3f2bd8e 100644
+--- a/src/search_graph/global_cache.rs
++++ b/src/search_graph/global_cache.rs
+@@ -43,9 +43,16 @@ pub(super) struct CacheData<'a, X: Cx> {
+ /// level and values never move, so a reader never waits on a writer. Writers to one goal take
+ /// one of `writers`, by goal, only to publish its row.
+ ///
+-/// Its tables are blocks of `blaze_mem` ([`table`]), and its locks never allocate: a cache made
+-/// per interner costs the global allocator nothing, and the blocks of one dropped (its
+-/// interner's generation evicted) are the next one's.
++/// Its tables are blocks of `blaze_mem` ([`table`]), counted to [`Tag::Solver`], and its locks
++/// never allocate: a cache made per interner costs the global allocator nothing, and the blocks
++/// of one dropped (its interner's generation evicted) are the next one's.
++///
++/// A cache costs nothing until it is written: a lookup in an empty one finds nothing without
++/// making a table. The cache of one query's interner ([`Sharing::One`]) has one shard and one
++/// writer lock, so a written one holds a few kilobytes; the cache every query of a crate shares
++/// ([`Sharing::Many`]) has four per core. In coord-98 every interner's first lookup made a
++/// table of 128 shards (144 KiB), and the retired caches holding them filled blaze-mem's
++/// 160 KiB class (16 GiB) in one 21-crate test run.
+ ///
+ /// `success` holds a goal's latest result whose computation never hit the recursion limit;
+ /// `with_overflow` the results which hit it, newest first, each with the depth it was computed
+@@ -66,6 +73,8 @@ pub(super) struct CacheData<'a, X: Cx> {
+ /// it hashes the input once for lookup and insert together. The search graph solves between
+ /// the two, so no entry can be held across, and this hashes the input again on insert.
+ pub struct GlobalCache<X: Cx> {
++    /// How many threads write it at once, which sizes `writers` and the interned tables.
++    sharing: Sharing,
+     goals: Interned<X::Input>,
+     results: Interned<X::Result>,
+     /// By goal: its latest success row, plus one; 0 for none.
+@@ -85,18 +94,40 @@ pub struct GlobalCache<X: Cx> {
+     no_nested_goals: NestedGoals<X>,
+ }
+ 
++/// How many threads write a cache at once: what its writer locks and its interned tables'
++/// shards are sized for.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Sharing {
++    /// Any number: a cache every query of a crate shares. Four shards per core.
++    Many,
++    /// One at a time: the cache of one query's interner, which moves between threads but never
++    /// runs on two at once. One shard.
++    One,
++}
++
++impl Sharing {
++    /// Shards (and writer locks) a table of this sharing has: a power of two.
++    fn shards(self) -> usize {
++        match self {
++            Sharing::Many => shard_count(),
++            Sharing::One => 1,
++        }
++    }
++}
++
+ impl<X: Cx> Default for GlobalCache<X> {
+     fn default() -> Self {
+-        GlobalCache::new()
++        GlobalCache::new(Sharing::Many)
+     }
+ }
+ 
+ impl<X: Cx> GlobalCache<X> {
+     #[inline]
+-    pub const fn new() -> Self {
++    pub const fn new(sharing: Sharing) -> Self {
+         GlobalCache {
+-            goals: Interned::new(),
+-            results: Interned::new(),
++            sharing,
++            goals: Interned::new(sharing),
++            results: Interned::new(sharing),
+             success: Chunked::new(),
+             with_overflow: Chunked::new(),
+             rows: Chunked::new(),
+@@ -122,7 +153,8 @@ impl<X: Cx> GlobalCache<X> {
+         let goal = self.goals.intern(input);
+         let index = self.results.intern(result);
+         let depth = u32::try_from(required_depth.0).expect("a solver depth past `u32::MAX`");
+-        let writers = self.writers.get_or_init(|| table(shard_count(), |_| Writer::new()));
++        let writers =
++            self.writers.get_or_init(|| table("writer locks", self.sharing.shards(), |_| Writer::new()));
+         let mut claimed = blaze_graph::wait::lock(&writers[goal as usize & (writers.len() - 1)].0, WRITER);
+         let column = if encountered_overflow { &self.with_overflow } else { &self.success };
+         let head = column.get_or_init(goal, || AtomicU32::new(0));
+@@ -206,6 +238,24 @@ impl<X: Cx> GlobalCache<X> {
+         None
+     }
+ 
++    /// How many threads it was made for.
++    pub fn sharing(&self) -> Sharing {
++        self.sharing
++    }
++
++    /// The bytes it asked for: every table, chunk and lock it made, as lengths times sizes, which
++    /// it gives back when it drops. The blocks under them are those rounded up to their size
++    /// class. 0 for a cache never written.
++    pub fn held(&self) -> usize {
++        self.goals.held()
++            + self.results.held()
++            + self.success.held()
++            + self.with_overflow.held()
++            + self.rows.held()
++            + self.nested_goals.held()
++            + self.writers.get().map_or(0, |it| it.len() * size_of::<Writer>())
++    }
++
+     /// The row `plus_one` names, `None` for 0.
+     fn row(&self, plus_one: u32) -> Option<&Row<X>> {
+         let raw = plus_one.checked_sub(1)?;
+@@ -244,11 +294,16 @@ struct Chunked<T> {
+     chunks: [OnceLock<Slice<T>>; CHUNKS],
+ }
+ 
+-/// `len` values, the one at `at` made by `make(at)`, in a block of `blaze_mem` given back when
+-/// it drops. Memory the system will not give stops the solver with what it wanted.
+-fn table<T>(len: usize, make: impl FnMut(usize) -> T) -> Slice<T> {
+-    Slice::new_with(len, Tag::Infer, make)
+-        .unwrap_or_else(|error| panic!("the trait solver's cache: {error}"))
++/// `len` values, the one at `at` made by `make(at)`, in a block of `blaze_mem` counted to
++/// [`Tag::Solver`] and given back when it drops. Memory blaze-mem will not give stops the solver
++/// (a panic, which fails the job that asked) naming the table and what it wanted.
++fn table<T>(what: &str, len: usize, make: impl FnMut(usize) -> T) -> Slice<T> {
++    Slice::new_with(len, Tag::Solver, make).unwrap_or_else(|error| {
++        panic!(
++            "the trait solver's cache: its {what} of {len} entries ({} bytes): {error}",
++            len * size_of::<T>()
++        )
++    })
+ }
+ 
+ fn chunk_of(raw: u32) -> (usize, usize) {
+@@ -271,7 +326,12 @@ impl<T> Chunked<T> {
+     /// Makes `raw`'s chunk, every entry `empty()`, if it has none.
+     fn get_or_init(&self, raw: u32, empty: impl Fn() -> T) -> &T {
+         let (chunk, at) = chunk_of(raw);
+-        &self.chunks[chunk].get_or_init(|| table(FIRST << chunk, |_| empty()))[at]
++        &self.chunks[chunk].get_or_init(|| table("chunk", FIRST << chunk, |_| empty()))[at]
++    }
++
++    /// The bytes of the chunks made.
++    fn held(&self) -> usize {
++        self.chunks.iter().filter_map(OnceLock::get).map(|it| it.len() * size_of::<T>()).sum()
+     }
+ }
+ 
+@@ -347,6 +407,8 @@ const TABLES: usize = 28;
+ /// twice the last. A value two threads intern at once while its shard grows may get two
+ /// indices; callers compare values, not indices.
+ struct Interned<T> {
++    /// How many shards it has, made on the first write.
++    sharing: Sharing,
+     values: Chunked<OnceLock<(u64, T)>>,
+     /// The first index no shard has claimed.
+     next: AtomicU64,
+@@ -378,8 +440,18 @@ impl Shard {
+     }
+ 
+     fn table(&self, level: usize) -> &[AtomicU32] {
+-        self.tables[level].get_or_init(|| table(TABLE << level, |_| AtomicU32::new(0)))
++        self.tables[level].get_or_init(|| table("probe table", TABLE << level, |_| AtomicU32::new(0)))
+     }
++
++    /// The bytes of its probe tables.
++    fn held(&self) -> usize {
++        self.tables.iter().filter_map(OnceLock::get).map(|it| it.len() * size_of::<AtomicU32>()).sum()
++    }
++}
++
++/// The shard of `hash` among `len`, a power of two: its top bits.
++fn shard_of(hash: u64, len: usize) -> usize {
++    (hash >> 48) as usize & (len - 1)
+ }
+ 
+ /// Where a hash's probe starts; bits the shard was not picked by.
+@@ -387,19 +459,34 @@ fn home(hash: u64) -> usize {
+     (hash >> 20) as usize
+ }
+ 
+-impl<T: Hash + Eq> Interned<T> {
+-    const fn new() -> Self {
+-        Interned { values: Chunked::new(), next: AtomicU64::new(0), shards: OnceLock::new() }
++impl<T> Interned<T> {
++    const fn new(sharing: Sharing) -> Self {
++        Interned { sharing, values: Chunked::new(), next: AtomicU64::new(0), shards: OnceLock::new() }
+     }
+ 
++    /// The bytes of its values' chunks, its shards and their probe tables.
++    fn held(&self) -> usize {
++        self.values.held()
++            + self.shards.get().map_or(0, |shards| {
++                shards.len() * size_of::<Shard>() + shards.iter().map(Shard::held).sum::<usize>()
++            })
++    }
++}
++
++impl<T: Hash + Eq> Interned<T> {
+     fn get(&self, index: u32) -> &T {
+         &self.slot(index).expect("an index this table did not hand out").1
+     }
+ 
++    /// The index of `value`, if it was interned. Makes nothing: a table never written has no
++    /// shards and a shard never written no probe table, and either finds nothing. (`grow`
++    /// makes a level before it publishes it, so the level a reader loads has its table.)
+     fn find(&self, value: &T) -> Option<u32> {
+         let hash = hash_of(value);
+-        let shard = self.shard(hash);
+-        self.probe(shard.table(shard.level.load(Ordering::Acquire)), hash, value).ok()
++        let shards = self.shards.get()?;
++        let shard = &shards[shard_of(hash, shards.len())];
++        let table = shard.tables[shard.level.load(Ordering::Acquire)].get()?;
++        self.probe(table, hash, value).ok()
+     }
+ 
+     fn intern(&self, value: T) -> u32 {
+@@ -433,8 +520,8 @@ impl<T: Hash + Eq> Interned<T> {
+     }
+ 
+     fn shard(&self, hash: u64) -> &Shard {
+-        let shards = self.shards.get_or_init(|| table(shard_count(), |_| Shard::new()));
+-        &shards[(hash >> 48) as usize & (shards.len() - 1)]
++        let shards = self.shards.get_or_init(|| table("shards", self.sharing.shards(), |_| Shard::new()));
++        &shards[shard_of(hash, shards.len())]
+     }
+ 
+     fn probe(&self, table: &[AtomicU32], hash: u64, value: &T) -> Result<u32, usize> {
+@@ -494,11 +581,14 @@ fn hash_of<T: Hash>(value: &T) -> u64 {
+ mod tests {
+     use std::sync::Barrier;
+ 
+-    use super::{Chunked, Interned, chunk_of};
++    use std::sync::OnceLock;
++    use std::sync::atomic::AtomicU32;
++
++    use super::{Chunked, FIRST, Interned, Shard, Sharing, TABLE, chunk_of, shard_count};
+ 
+     #[test]
+     fn a_value_interned_twice_has_one_index() {
+-        let interned = Interned::<u64>::new();
++        let interned = Interned::<u64>::new(Sharing::Many);
+         let indices: Vec<u32> = (0..5000u64).map(|it| interned.intern(it * 7919)).collect();
+         for (it, &index) in indices.iter().enumerate() {
+             assert_eq!(interned.intern(it as u64 * 7919), index);
+@@ -518,7 +608,7 @@ mod tests {
+     #[test]
+     fn a_fresh_table_after_a_dropped_one_allocates_nothing() {
+         let fill = || {
+-            let interned = Interned::<u64>::new();
++            let interned = Interned::<u64>::new(Sharing::Many);
+             for it in 0..3000u64 {
+                 interned.intern(it * 31);
+             }
+@@ -528,9 +618,54 @@ mod tests {
+         blaze_alloc_count::assert_at_most(0, "a fresh solver cache table", fill);
+     }
+ 
++    /// coord-98: every interner's first lookup in its query's cache made a table of
++    /// `shard_count()` shards (144 KiB on 18 cores) to find nothing in, and the retired caches
++    /// holding them used up blaze-mem's 160 KiB class, 16 GiB, in one test run. A lookup in a
++    /// table never written makes nothing, however many there are.
++    #[test]
++    fn a_lookup_in_a_table_never_written_holds_no_memory() {
++        for sharing in [Sharing::Many, Sharing::One] {
++            let interned = Interned::<u64>::new(sharing);
++            for value in 0..10_000u64 {
++                assert_eq!(interned.find(&value), None);
++            }
++            assert_eq!(interned.held(), 0, "{sharing:?}");
++        }
++        // A written shard's neighbours have no probe table either: a lookup there makes none.
++        let interned = Interned::<u64>::new(Sharing::Many);
++        interned.intern(7);
++        let held = interned.held();
++        for value in 0..10_000u64 {
++            assert_eq!(interned.find(&value).is_some(), value == 7);
++        }
++        assert_eq!(interned.held(), held, "a lookup made a table");
++    }
++
++    /// The cache of one query's interner holds one shard whatever the machine's cores: one goal
++    /// in it costs its chunk of values, one shard and one probe table, not a shard per core.
++    #[test]
++    fn a_table_of_one_writer_holds_one_shard_whatever_the_cores() {
++        let one = Interned::<u64>::new(Sharing::One);
++        let many = Interned::<u64>::new(Sharing::Many);
++        one.intern(7);
++        many.intern(7);
++        let chunk = FIRST * size_of::<OnceLock<(u64, u64)>>();
++        let probe = TABLE * size_of::<AtomicU32>();
++        assert_eq!(one.held(), chunk + size_of::<Shard>() + probe);
++        assert_eq!(many.held(), chunk + shard_count() * size_of::<Shard>() + probe);
++        assert!(one.held() < 4 << 10, "one goal in a query's cache holds {} bytes", one.held());
++        // It still holds many values, through growth.
++        for value in 0..5000u64 {
++            one.intern(value * 31);
++        }
++        for value in 0..5000u64 {
++            assert_eq!(one.find(&(value * 31)).map(|index| *one.get(index)), Some(value * 31));
++        }
++    }
++
+     #[test]
+     fn an_empty_table_finds_nothing() {
+-        assert_eq!(Interned::<u64>::new().find(&0), None);
++        assert_eq!(Interned::<u64>::new(Sharing::Many).find(&0), None);
+         assert!(Chunked::<u32>::new().get(0).is_none());
+     }
+ 
+@@ -550,7 +685,7 @@ mod tests {
+     /// at an index whose value is it.
+     #[test]
+     fn threads_interning_at_once_agree_on_values() {
+-        let interned = Interned::<u64>::new();
++        let interned = Interned::<u64>::new(Sharing::Many);
+         let threads = 8;
+         let barrier = Barrier::new(threads);
+         std::thread::scope(|scope| {
+diff --git a/src/search_graph/mod.rs b/src/search_graph/mod.rs
+index 13959fe..7896028 100644
+--- a/src/search_graph/mod.rs
++++ b/src/search_graph/mod.rs
+@@ -30,7 +30,7 @@ mod stack;
+ use stack::{Stack, StackDepth, StackEntry};
+ mod global_cache;
+ use global_cache::CacheData;
+-pub use global_cache::GlobalCache;
++pub use global_cache::{GlobalCache, Sharing};
+ 
+ /// The search graph does not simply use `Interner` directly
+ /// to enable its fuzzing without having to stub the rest of
+@@ -57,6 +57,17 @@ pub trait Cx: Copy {
+     /// [`CacheScope::Query`]; a result goes where [`Cx::cache_scope`] says.
+     fn with_global_cache<R>(self, scope: CacheScope, f: impl FnOnce(&GlobalCache<Self>) -> R) -> R;
+ 
++    /// Runs `f` on the cache of `scope` to look a goal up in it: `None`, without running `f`,
++    /// where the scope has no cache yet, as a lookup there finds nothing and needs none made.
++    /// By default, [`Cx::with_global_cache`].
++    fn with_global_cache_to_read<R>(
++        self,
++        scope: CacheScope,
++        f: impl FnOnce(&GlobalCache<Self>) -> Option<R>,
++    ) -> Option<R> {
++        <Self as Cx>::with_global_cache(self, scope, f)
++    }
++
+     /// Where a goal solved under `dep_node` may be cached: [`CacheScope::Shared`] only when
+     /// `dep_node` holds every read the result depends on, so another query reusing it takes
+     /// them.
+@@ -1397,7 +1408,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
+         available_depth: AvailableDepth,
+     ) -> Option<X::Result> {
+         [CacheScope::Shared, CacheScope::Query].into_iter().find_map(|scope| {
+-            cx.with_global_cache(scope, |cache| {
++            cx.with_global_cache_to_read(scope, |cache| {
+                 cache
+                     .get(cx, input, available_depth, |nested_goals| {
+                         self.candidate_is_applicable(step_kind_from_parent, nested_goals)
+@@ -1418,7 +1429,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
+         available_depth: AvailableDepth,
+     ) -> Option<X::Result> {
+         [CacheScope::Shared, CacheScope::Query].into_iter().find_map(|scope| {
+-            cx.with_global_cache(scope, |cache| {
++            cx.with_global_cache_to_read(scope, |cache| {
+                 let CacheData { result, required_depth, encountered_overflow, nested_goals } =
+                     cache.get(cx, input, available_depth, |nested_goals| {
+                         self.candidate_is_applicable(step_kind_from_parent, nested_goals)
+@@ -1713,7 +1724,7 @@ mod tests {
+     struct TestCx;
+ 
+     thread_local! {
+-        static CACHE: GlobalCache<TestCx> = const { GlobalCache::new() };
++        static CACHE: GlobalCache<TestCx> = const { GlobalCache::new(Sharing::Many) };
+     }
+ 
+     impl Cx for TestCx {

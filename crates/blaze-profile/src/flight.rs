@@ -37,9 +37,12 @@ use crate::{
     span::{self, Said, TYPED},
 };
 
-/// Rows a thread keeps: [`WORDS`] words, 64 bytes, each, so 1 MiB a thread, committed as rows
-/// reach it.
-pub const CAP: usize = 1 << 14;
+/// Rows a thread keeps: [`WORDS`] words, 64 bytes, each, so 2 MiB a thread, committed as rows
+/// reach it. A self-build's busiest worker wrote about 110 k rows a second before short spans
+/// were folded ([`fold_below`]), so 16 k rows wrapped in 150 ms while the history's one thread
+/// both drained and wrote (profrows): 32 k rows and a drain thread of its own every
+/// [`crate::history::DRAIN`] keep many times that rate.
+pub const CAP: usize = 1 << 15;
 const WORDS: usize = 8;
 /// Spans a thread is inside that are named (the enter stack); deeper ones are counted.
 const OPEN_MAX: usize = 32;
@@ -336,10 +339,19 @@ pub enum Plot {
     CommittedBytes,
     /// Bytes of address space every live `blaze_mem` region reserves.
     ReservedBytes,
+    /// Of [`Plot::ProfileRowsSkipped`], those written over while the history's drain had
+    /// stopped because its writer was behind (`history::BACKLOG_ROWS` drained and not yet
+    /// written); the rest wrapped a ring between two drains.
+    ProfileRowsBehind,
+    /// Bugs the process found in itself and went on past, so far
+    /// (`stdx::assert::reported::total`): a value formatted with no database attached, a
+    /// `never!` that failed. Written by the history with each build's flush and whenever it
+    /// grew; each site that reported is also a row of `errors` of kind `blaze-bug`.
+    BlazeBugs,
 }
 
 impl Plot {
-    pub const ALL: [Plot; 19] = [
+    pub const ALL: [Plot; 21] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -359,6 +371,8 @@ impl Plot {
         Plot::ProfileRowsSkipped,
         Plot::CommittedBytes,
         Plot::ReservedBytes,
+        Plot::ProfileRowsBehind,
+        Plot::BlazeBugs,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -382,6 +396,8 @@ impl Plot {
             Plot::ProfileRowsSkipped => "profile rows skipped",
             Plot::CommittedBytes => "committed bytes",
             Plot::ReservedBytes => "reserved bytes",
+            Plot::ProfileRowsBehind => "profile rows skipped behind",
+            Plot::BlazeBugs => "blaze bugs",
         }
     }
 
@@ -752,6 +768,9 @@ struct Begun {
     spawner: u64,
     /// When it was given to the pool, in ticks; 0 when not said.
     given: u64,
+    /// The span open where it was given ([`giving_span`]), 0 for none: its `job` span's
+    /// `creator`.
+    creator: u64,
     /// The build the thread worked for before the job began: what it works for again once a
     /// job that never joined the graph ran ([`Switched::Ran`]).
     outer: u32,
@@ -783,16 +802,33 @@ pub fn current_build() -> u32 {
     }
 }
 
-/// A pool job given to the pool by `spawner` at `given` (ticks, 0 for not said) begins on this
-/// thread, working for `build`, the giver's ([`current_build`]): its spans and switches are the
-/// build's, wherever it runs, until it ends (a parked job carries it, [`take_open`]). No row:
-/// its `started` or `ran` row says when (`since`) and how long it waited for a core (`queued`),
-/// so a job's life costs no row more than its switches.
-pub fn job_begins(spawner: u64, given: u64, build: u32) {
+/// A pool job given to the pool by `spawner` at `given` (ticks, 0 for not said), inside the
+/// span `creator` (0 for none), begins on this thread, working for `build`, the giver's
+/// ([`current_build`]): its spans and switches are the build's, wherever it runs, until it
+/// ends (a parked job carries it, [`take_open`]). No row: its `started` or `ran` row says when
+/// (`since`) and how long it waited for a core (`queued`), and its `job` span its `creator`
+/// ([`begun_creator`]), so a job's life costs no row more than its switches.
+pub fn job_begins(spawner: u64, given: u64, build: u32, creator: u64) {
     let unjoined = UNJOINED.fetch_add(1, Ordering::Relaxed) << 32 | UNJOINED_SLOT;
     let outer = BUILD.with(|it| it.replace(build));
-    BEGUN.with(|it| it.set(Some(Begun { ticks: clock::ticks(), unjoined, spawner, given, outer })));
+    BEGUN.with(|it| it.set(Some(Begun { ticks: clock::ticks(), unjoined, spawner, given, creator, outer })));
     RUNNING.with(|it| it.set(OnThread { job: unjoined, build }));
+}
+
+/// The span the pool job beginning on this thread was given inside ([`job_begins`]): what its
+/// `job` span names as its `creator`. `None` for a job with no such span, or none beginning.
+pub fn begun_creator() -> Option<u64> {
+    BEGUN.with(Cell::get).map(|it| it.creator).filter(|&it| it != 0 && it != UNRECORDED)
+}
+
+/// The span this thread is inside as it gives a pool job to the pool, 0 for none: the job's
+/// creator ([`job_begins`]). Kept: a span a job names is written whole, never folded
+/// ([`fold_below`]).
+pub fn giving_span() -> u64 {
+    let Some(ring) = MINE.with(Cell::get) else { return 0 };
+    let id = ring.innermost();
+    keep(id);
+    id
 }
 
 /// The bits of a switch row's word 4 above its kind, wait and event bytes, and of its word 6
@@ -877,6 +913,7 @@ pub(crate) fn evented(event: &tracing::Event<'_>, site: u16) {
         ring.entered[..depth].last().map_or(0, |it| it.load(Ordering::Relaxed))
     };
     let span = if span == UNRECORDED { 0 } else { span };
+    keep(span);
     let message = TEXT
         .try_with(|text| {
             // A field's `Debug` that itself logs finds the text taken: that event has none.
@@ -1031,7 +1068,7 @@ const _: () = assert!(TYPED < THREAD_COL as usize, "a typed column's index is a 
 const UNCOUNTED: u64 = 1;
 
 const _: () = {
-    let bytes = [FIBER_STACK_ROW, SPAN_COPIED_ROW, SWITCH_ROW, SPAN_COLS_ROW];
+    let bytes = [FIBER_STACK_ROW, SPAN_COPIED_ROW, SWITCH_ROW, EVENT_ROW, SPAN_COLS_ROW, FOLD_ROW];
     let mut i = 0;
     while i < bytes.len() {
         assert!(bytes[i] as usize >= Plot::ALL.len(), "a row's plot byte is no plot's");
@@ -1084,7 +1121,14 @@ struct Slot {
     cpu_under: AtomicU64,
     /// A held span's job CPU reading when it was last entered, plus one (0: not entered).
     cpu_entered: AtomicU64,
+    /// Its children open (the low half) and the rows that name it (the high half, a
+    /// [`NAMED_ONE`] each: a child written whole, an event, a sample, a pool job it gave):
+    /// a span with either is written whole as it closes, never folded ([`fold_below`]).
+    kids: AtomicU64,
 }
+
+/// A row naming a span, in [`Slot::kids`].
+const NAMED_ONE: u64 = 1 << 32;
 
 impl Slot {
     const FREE: Slot = Slot {
@@ -1106,6 +1150,7 @@ impl Slot {
         cpu: AtomicU64::new(0),
         cpu_under: AtomicU64::new(0),
         cpu_entered: AtomicU64::new(0),
+        kids: AtomicU64::new(0),
     };
 }
 
@@ -1128,6 +1173,8 @@ struct Opened {
     cpu: u64,
     cpu_under: u64,
     held: bool,
+    /// [`Slot::kids`] as it closed.
+    kids: u64,
 }
 
 impl Opened {
@@ -1316,6 +1363,7 @@ impl Ring {
             cpu: slot.cpu.load(Ordering::Relaxed),
             cpu_under: slot.cpu_under.load(Ordering::Relaxed),
             held: what & HELD_BIT != 0,
+            kids: slot.kids.load(Ordering::Relaxed),
         };
         fence(Ordering::Acquire);
         (slot.id.load(Ordering::Relaxed) == id).then_some(opened)
@@ -1376,6 +1424,7 @@ impl Drop for Held {
     fn drop(&mut self) {
         _ = MINE.try_with(|it| it.set(None));
         if let Some(ring) = self.0.take() {
+            put_folds(ring);
             let mut sampled = lock(&ring.sampled);
             sampled.leave();
             ring.depth.store(0, Ordering::Relaxed);
@@ -1562,6 +1611,7 @@ fn began(site: u16, parent: Option<u64>, said: &Said) -> u64 {
     slot.cpu.store(cpu, Ordering::Relaxed);
     slot.cpu_under.store(0, Ordering::Relaxed);
     slot.cpu_entered.store(0, Ordering::Relaxed);
+    slot.kids.store(0, Ordering::Relaxed);
     slot.alloc_bytes.store(alloc.bytes, Ordering::Relaxed);
     slot.allocs.store(alloc.count, Ordering::Relaxed);
     slot.frame_copies.store(copied.copies, Ordering::Relaxed);
@@ -1571,7 +1621,29 @@ fn began(site: u16, parent: Option<u64>, said: &Said) -> u64 {
     slot.thread.store(ring.current.load(Ordering::Relaxed), Ordering::Relaxed);
     slot.refs.store(1, Ordering::Relaxed);
     slot.id.store(id, Ordering::Release);
+    if let Some(parent) = open_slot(parent) {
+        parent.kids.fetch_add(1, Ordering::Relaxed);
+    }
     id
+}
+
+/// The slot of the span `id` while it is open there.
+#[inline]
+fn open_slot(id: u64) -> Option<&'static Slot> {
+    if id == 0 || id == UNRECORDED {
+        return None;
+    }
+    by_number(ring_of(id)).and_then(|it| it.slot_of(id)).filter(|it| it.id.load(Ordering::Acquire) == id)
+}
+
+/// Notes that a row names the open span `id` (an event, a sample, a pool job it gave): it is
+/// written whole as it closes, never folded ([`fold_below`]). Nothing for a span closed
+/// already, which was written whole or folded by then.
+#[inline]
+pub(crate) fn keep(id: u64) {
+    if let Some(slot) = open_slot(id) {
+        slot.kids.fetch_add(NAMED_ONE, Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -1738,26 +1810,232 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
     // Closed by another thread than made it: its own ring, but leased again since, is another
     // thread's too.
     let moved = ring.number != made_by.number || ring.lease.load(Ordering::Relaxed) != opened.lease;
-    ring.put([now, opened.start, id, opened.parent, what, opened.of, build_unit, bytes]);
+    let ticks = now.wrapping_sub(opened.start);
+    let cpu = self_cpu(&opened);
+    let copied = FRAME_COPIED.get().is_some().then(frame_copied);
+    // Noise, folded into its site's sum on this thread: short, named by no row (no child
+    // written whole, no event, sample or job), saying no typed column (a `job`, `wait`, `hold`
+    // and every other kind that says one is the model's), on the thread it began on, and
+    // copying no frame.
+    let fold = ticks < fold_ticks()
+        && opened.kids == 0
+        && !opened.held
+        && !moved
+        && opened.typed == [0; TYPED]
+        && copied.is_none_or(|it| it.copies == opened.copied.copies);
+    // Its parent is named by this row when it is written whole, and has one child less open.
+    if let Some(parent) = open_slot(opened.parent) {
+        parent.kids.fetch_add(if fold { u64::MAX } else { NAMED_ONE - 1 }, Ordering::Relaxed);
+    }
     let key = crate::hot::record::key(opened.site, opened.of as u32);
     let waits_on = opened.typed[<span::col::WaitsOn as span::Column>::AT - span::GENERIC];
-    crate::hot::record::closed(&ring.hot, key, now.wrapping_sub(opened.start), waits_on);
-    put_cols(ring, now, id, self_cpu(&opened), moved.then_some(opened.thread), &opened.typed);
-    if FRAME_COPIED.get().is_some() {
-        let copied = frame_copied();
-        let row = if moved {
-            Some([0, 0, UNCOUNTED])
-        } else if copied.copies != opened.copied.copies {
-            Some([copied.copies - opened.copied.copies, copied.bytes - opened.copied.bytes, 0])
-        } else {
-            None
-        };
-        if let Some([copies, bytes, flags]) = row {
-            ring.put([now, copies, bytes, id, KIND_PLOT << 62 | SPAN_COPIED_ROW, flags, 0, 0]);
+    crate::hot::record::closed(&ring.hot, key, ticks, waits_on);
+    if fold {
+        folded(ring, &opened, now, cpu, allocs, bytes);
+    } else {
+        ring.put([now, opened.start, id, opened.parent, what, opened.of, build_unit, bytes]);
+        put_cols(ring, now, id, cpu, moved.then_some(opened.thread), &opened.typed);
+        if let Some(copied) = copied {
+            let row = if moved {
+                Some([0, 0, UNCOUNTED])
+            } else if copied.copies != opened.copied.copies {
+                Some([copied.copies - opened.copied.copies, copied.bytes - opened.copied.bytes, 0])
+            } else {
+                None
+            };
+            if let Some([copies, bytes, flags]) = row {
+                ring.put([now, copies, bytes, id, KIND_PLOT << 62 | SPAN_COPIED_ROW, flags, 0, 0]);
+            }
         }
     }
+    fold_aged(ring, now);
     ring.spans.store(ring.spans.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-    Some(now.wrapping_sub(opened.start))
+    Some(ticks)
+}
+
+// --- Folding short spans ------------------------------------------------------------------
+
+/// Spans shorter than this, of a process that folds them ([`fold_below`]). On a self-build
+/// (profrows, 2026-11-02) 64% of 30 M spans were under 2 us (a worker's search and switch
+/// between jobs, name resolution's updates, a parse); with those folded the rings still
+/// wrapped, as `find_container` and `Semantics::analyze_impl` (about 3 us each, with a CPU
+/// column row each) came 360 k a second on a worker, more rows a drain than a ring holds.
+pub const FOLD_BELOW: Duration = Duration::from_micros(5);
+
+/// How long a thread holds a site's folded spans before it writes their row: about a drain
+/// ([`crate::history::DRAIN`]), so a flush finds what the threads that keep working folded.
+/// A pool worker writes its own as it goes idle, any thread as it ends.
+pub const FOLD_AGE: Duration = Duration::from_millis(50);
+
+/// [`FOLD_BELOW`] and [`FOLD_AGE`] in ticks, once [`fold_below`] set them: 0 folds nothing.
+static FOLD_TICKS: AtomicU64 = AtomicU64::new(0);
+static FOLD_AGE_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Has this process fold each span shorter than `below` into a sum a site, a thread and a
+/// build (the `folded` table's rows) instead of writing its row, unless a row names it or it
+/// says a typed column ([`closed`]); a site's sum is written at least every [`FOLD_AGE`]. A
+/// driver (blaze's CLI) sets it once; a process that never does records every span.
+pub fn fold_below(below: Duration) {
+    let scale = clock::Scale::now();
+    FOLD_AGE_TICKS.store(scale.ticks_in(FOLD_AGE.as_nanos() as u64), Ordering::Relaxed);
+    FOLD_TICKS.store(scale.ticks_in(below.as_nanos() as u64), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own [`fold_below`] and [`FOLD_AGE`] in ticks, on its thread alone, so the
+    /// tests beside it running in the process record every span.
+    static FOLD_HERE: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
+}
+
+/// Has this thread alone fold spans shorter than `below`, writing their sums after `age`.
+#[cfg(test)]
+pub(crate) fn fold_here(below: Duration, age: Duration) {
+    let scale = clock::Scale::now();
+    FOLD_HERE.with(|it| it.set(Some((scale.ticks_in(below.as_nanos() as u64), scale.ticks_in(age.as_nanos() as u64)))));
+}
+
+#[inline]
+fn fold_ticks() -> u64 {
+    #[cfg(test)]
+    if let Some((below, _)) = FOLD_HERE.with(Cell::get) {
+        return below;
+    }
+    FOLD_TICKS.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn fold_age_ticks() -> u64 {
+    #[cfg(test)]
+    if let Some((_, age)) = FOLD_HERE.with(Cell::get) {
+        return age;
+    }
+    FOLD_AGE_TICKS.load(Ordering::Relaxed)
+}
+
+/// The plot byte of a [`Fold`]'s row. Word 4 above it: the site (bits 8..20), whether its
+/// spans were roots (depth 0, as `uncovered_per_worker` counts them; 20), whether their CPU (21) and allocations (22) were counted, and how
+/// many spans (24..56).
+const FOLD_ROW: u64 = 0xf9;
+const FOLD_ROOT: u64 = 1 << 20;
+const FOLD_CPU: u64 = 1 << 21;
+const FOLD_ALLOCS: u64 = 1 << 22;
+const FOLD_SPANS_SHIFT: u32 = 24;
+const FOLD_SPANS_MAX: u64 = (1 << 32) - 1;
+const _: () = assert!(SITE_BITS == 12, "a fold row's site is bits 8..20");
+
+/// A thread's sums of short spans a site, root or not, and build: written as one row.
+#[derive(Clone, Copy)]
+struct Fold {
+    /// [`fold_key`]; 0 for an empty slot.
+    key: u64,
+    first: u64,
+    last: u64,
+    spans: u64,
+    ticks: u64,
+    max: u64,
+    /// Self CPU (ns) and allocations summed over the spans that counted them.
+    cpu: Option<u64>,
+    allocs: Option<(u64, u64)>,
+}
+
+const NO_FOLD: Fold = Fold { key: 0, first: 0, last: 0, spans: 0, ticks: 0, max: 0, cpu: None, allocs: None };
+
+/// Slots a thread folds into, by key: a key that finds its slot taken writes the other's row.
+const FOLD_SLOTS: usize = 64;
+
+struct Folds {
+    slots: [Fold; FOLD_SLOTS],
+    /// The earliest start any slot holds, in ticks; `u64::MAX` for none.
+    oldest: u64,
+}
+
+thread_local! {
+    /// No destructor, so a span closing as the thread ends still folds; the ring's
+    /// [`Held`] writes what is left as it gives the ring back.
+    static FOLDS: RefCell<Folds> = const { RefCell::new(Folds { slots: [NO_FOLD; FOLD_SLOTS], oldest: u64::MAX }) };
+}
+
+fn fold_key(site: u16, root: bool, build: u32) -> u64 {
+    u64::from(build) << 32 | u64::from(root) << 16 | 1 << 15 | u64::from(site)
+}
+
+/// Adds the span `opened`, closing now, to its sum on this thread; `cpu` and `allocs` as its
+/// row would have them, plus one (0: not counted).
+fn folded(ring: &Ring, opened: &Opened, now: u64, cpu: u64, allocs: u64, bytes: u64) {
+    let key = fold_key(opened.site, opened.depth == 0, opened.build);
+    let at = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % FOLD_SLOTS;
+    _ = FOLDS.try_with(|folds| {
+        let Ok(mut folds) = folds.try_borrow_mut() else { return };
+        let slot = &mut folds.slots[at];
+        if slot.key != key && slot.key != 0 {
+            put_fold(ring, slot);
+        }
+        if slot.key != key {
+            *slot = Fold { key, first: opened.start, last: now, ..NO_FOLD };
+        }
+        let ticks = now.wrapping_sub(opened.start);
+        slot.first = slot.first.min(opened.start);
+        slot.last = slot.last.max(now);
+        slot.spans += 1;
+        slot.ticks += ticks;
+        slot.max = slot.max.max(ticks);
+        if let Some(cpu) = cpu.checked_sub(1) {
+            slot.cpu = Some(slot.cpu.unwrap_or(0) + cpu);
+        }
+        if let Some(count) = allocs.checked_sub(1) {
+            let (had, had_bytes) = slot.allocs.unwrap_or((0, 0));
+            slot.allocs = Some((had + count, had_bytes + bytes));
+        }
+        let first = slot.first;
+        if slot.spans >= FOLD_SPANS_MAX {
+            put_fold(ring, slot);
+        }
+        folds.oldest = folds.oldest.min(first);
+    });
+}
+
+/// Writes `fold`'s row to `ring` and empties it.
+fn put_fold(ring: &Ring, fold: &mut Fold) {
+    let Fold { key, first, last, spans, ticks, max, cpu, allocs } = std::mem::replace(fold, NO_FOLD);
+    if key == 0 {
+        return;
+    }
+    let site = key & ((1 << SITE_BITS) - 1);
+    let root = if key >> 16 & 1 == 1 { FOLD_ROOT } else { 0 };
+    let counted = if cpu.is_some() { FOLD_CPU } else { 0 } | if allocs.is_some() { FOLD_ALLOCS } else { 0 };
+    let what = KIND_PLOT << 62 | spans.min(FOLD_SPANS_MAX) << FOLD_SPANS_SHIFT | counted | root | site << 8 | FOLD_ROW;
+    let (count, bytes) = allocs.unwrap_or((0, 0));
+    let build = key >> 32;
+    ring.put([last, first, ticks, max, what, cpu.unwrap_or(0), build << 32 | count.min(u64::from(u32::MAX)), bytes]);
+}
+
+/// Writes this thread's folded sums once the oldest is [`FOLD_AGE`] old.
+#[inline]
+fn fold_aged(ring: &Ring, now: u64) {
+    let oldest = FOLDS.try_with(|it| it.try_borrow().map_or(u64::MAX, |it| it.oldest)).unwrap_or(u64::MAX);
+    if oldest != u64::MAX && now.wrapping_sub(oldest) >= fold_age_ticks() {
+        put_folds(ring);
+    }
+}
+
+/// Writes every sum this thread folded into `ring`.
+fn put_folds(ring: &Ring) {
+    _ = FOLDS.try_with(|folds| {
+        let Ok(mut folds) = folds.try_borrow_mut() else { return };
+        for slot in &mut folds.slots {
+            put_fold(ring, slot);
+        }
+        folds.oldest = u64::MAX;
+    });
+}
+
+/// Writes the sums of the spans this thread folded ([`fold_below`]): as a pool worker goes
+/// idle and a build ends, so a flush has them.
+pub fn flush_folds() {
+    if let Some(ring) = MINE.with(Cell::get) {
+        put_folds(ring);
+    }
 }
 
 /// Writes the [`SPAN_COLS_ROW`]s of the span `id`, closing now: its self CPU (`cpu`, plus one;
@@ -1936,6 +2214,29 @@ pub struct EventRow {
     pub message: Sym,
 }
 
+/// A row of the schema's `folded` table: the spans of a site shorter than [`fold_below`]'s
+/// threshold that a thread closed in a stretch, summed ([`closed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FoldRow {
+    pub build: u32,
+    pub thread: u32,
+    pub thread_name: Sym,
+    pub site: u16,
+    /// Its spans were roots (depth 0): a worker's own work between jobs, which the gate counts
+    /// as covered.
+    pub root: bool,
+    /// The first one's start and the last one's end.
+    pub from_ns: i64,
+    pub to_ns: i64,
+    pub spans: u64,
+    /// Their durations summed, and the longest.
+    pub dur_ns: i64,
+    pub max_dur_ns: i64,
+    /// Their self CPU summed: `None` when not counted.
+    pub self_cpu_ns: Option<u64>,
+    pub alloc: Option<Allocated>,
+}
+
 /// A build's end, as [`crate::built`] noted it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuildEnd {
@@ -1951,6 +2252,7 @@ pub struct Read {
     pub counters: Vec<CounterRow>,
     pub switches: Vec<SwitchRow>,
     pub events: Vec<EventRow>,
+    pub folds: Vec<FoldRow>,
     pub ends: Vec<BuildEnd>,
     /// Rows written over before this reader read them: it fell behind by that many.
     pub skipped: u64,
@@ -1971,8 +2273,27 @@ impl Read {
         self.counters.clear();
         self.switches.clear();
         self.events.clear();
+        self.folds.clear();
         self.ends.clear();
         self.skipped = 0;
+    }
+
+    /// The rows it holds, of every table.
+    pub fn rows(&self) -> usize {
+        self.spans.len() + self.counters.len() + self.switches.len() + self.events.len() + self.folds.len() + self.ends.len()
+    }
+
+    /// The highest build any of its rows is of; 0 when none is of a build.
+    pub fn highest_build(&self) -> u64 {
+        let rows = [
+            self.spans.iter().map(|it| it.build).max(),
+            self.counters.iter().map(|it| it.build).max(),
+            self.switches.iter().map(|it| it.build).max(),
+            self.events.iter().map(|it| it.build).max(),
+            self.folds.iter().map(|it| it.build).max(),
+        ];
+        let ends = self.ends.iter().map(|it| it.build).max().unwrap_or(0);
+        rows.into_iter().flatten().map(u64::from).max().unwrap_or(0).max(ends)
     }
 }
 
@@ -2010,6 +2331,7 @@ pub fn window(window: Duration, into: &mut Read) {
     into.counters.retain(|it| it.t_ns >= since);
     into.switches.retain(|it| it.t_ns >= since);
     into.events.retain(|it| it.t_ns >= since);
+    into.folds.retain(|it| it.to_ns >= since);
     into.ends.retain(|it| it.t_ns >= since);
 }
 
@@ -2111,6 +2433,20 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                         }
                     }
                 }
+                KIND_PLOT if row[4] & 0xff == FOLD_ROW => into.folds.push(FoldRow {
+                    build: (row[6] >> 32) as u32,
+                    thread: by.tid,
+                    thread_name: by.name,
+                    site: (row[4] >> 8 & ((1 << SITE_BITS) - 1)) as u16,
+                    root: row[4] & FOLD_ROOT != 0,
+                    from_ns: scale.mono(row[1]),
+                    to_ns: scale.mono(row[0]),
+                    spans: row[4] >> FOLD_SPANS_SHIFT & FOLD_SPANS_MAX,
+                    dur_ns: scale.ns(row[2]) as i64,
+                    max_dur_ns: scale.ns(row[3]) as i64,
+                    self_cpu_ns: (row[4] & FOLD_CPU != 0).then_some(row[5]),
+                    alloc: (row[4] & FOLD_ALLOCS != 0).then(|| Allocated { bytes: row[7], count: row[6] & 0xffff_ffff }),
+                }),
                 KIND_PLOT if row[4] & 0xff == FIBER_STACK_ROW => {
                     let fiber = Some(((row[4] >> 8) as u32, row[7]));
                     let (build, t_ns) = (row[6] as u32, scale.mono(row[0]));
@@ -2538,11 +2874,10 @@ mod tests {
         assert_eq!(row("flight never named").function, 0);
     }
 
-    /// The waits of `thread` in `read` for a key, refusing any other wait but one for the
-    /// scheduler's lock. A test's threads share the process's scheduler with every other test's
-    /// pools and drivers, so a thread that asks for a key may also wait for the scheduler's lock
-    /// while another test holds it: a real wait, spanned as every wait is, but not the one a test
-    /// of key waits is about.
+    /// The waits of `thread` in `read` for a key, refusing any other. A test's threads are in a
+    /// scheduler of their own, which no other test's pools or drivers lock, and the tests order
+    /// their threads' ends so that neither waits on the other's lock: a wait for the scheduler's
+    /// lock here would be one the test made.
     fn key_waits(read: &Read, thread: u32) -> Vec<&SpanRow> {
         use blaze_graph::wait::WaitKind;
         // alloc: a test's rows
@@ -2552,8 +2887,7 @@ mod tests {
             let awaits = wait.fields.awaits.text();
             match wait.fields.on {
                 WaitKind::Key => keys.push(row),
-                WaitKind::Lock if awaits.as_deref() == Some("lock the scheduler") => {}
-                other => panic!("thread {thread} waited on {other:?} {awaits:?}: neither a key nor the scheduler's lock"),
+                other => panic!("thread {thread} waited on {other:?} {awaits:?}, not a key"),
             }
         }
         keys
@@ -2570,12 +2904,19 @@ mod tests {
         let key = Key([0x5a; 32]);
         let named = |it: &mut String| it.push_str("slow_query(of_square)");
         let (started, has_started) = crossbeam_channel::unbounded();
+        // The two threads' ends each lock the scheduler their wait joined: the asker ends once
+        // the run's end let go of it, and the runner once the asker ended, so neither waits on
+        // the other's lock.
+        let (ran_out, has_ran_out) = crossbeam_channel::unbounded();
+        let (asked_out, has_asked_out) = crossbeam_channel::unbounded::<()>();
         let runner = std::thread::spawn(move || {
             let got = flights.get_or_run_named(key, named, || {
                 started.send(()).unwrap();
                 blaze_graph::spin::busy(Duration::from_millis(300));
                 Ok(5)
             });
+            ran_out.send(()).unwrap();
+            _ = has_asked_out.recv();
             (crate::sampler::os_tid() as u32, got)
         });
         has_started.recv().unwrap();
@@ -2584,9 +2925,11 @@ mod tests {
             let asking_id = asking.id().unwrap().into_u64();
             let got = flights.get_or_run_named(key, named, || Ok(0));
             drop(asking);
+            has_ran_out.recv().unwrap();
             (crate::sampler::os_tid() as u32, asking_id, got)
         });
         let (asker, asking_id, asked) = asker.join().unwrap();
+        drop(asked_out);
         let (runner, ran) = runner.join().unwrap();
         assert_eq!((ran, asked), (Ok(5), Ok(5)), "the second thread waited for the first's run");
         let mut cursor = Cursor::default();
@@ -2625,19 +2968,27 @@ mod tests {
         let flights: &'static Flights<u32> = Box::leak(Box::new(Flights::new()));
         let key = Key([0x6b; 32]);
         let (held, has_held) = crossbeam_channel::unbounded();
+        // As in the test above: the waiter ends once the hold's end let go of the scheduler
+        // their wait joined, and the holder once the waiter ended.
+        let (ended, has_ended) = crossbeam_channel::unbounded();
+        let (waited, has_waited) = crossbeam_channel::unbounded::<()>();
         let holder = std::thread::spawn(move || {
             let hold = flights.hold_named(key, |it| it.push_str("codegen round 3 of app")).expect("no one holds it");
             held.send(()).unwrap();
             blaze_graph::spin::busy(Duration::from_millis(200));
             hold.end(&9);
+            ended.send(()).unwrap();
+            _ = has_waited.recv();
             crate::sampler::os_tid() as u32
         });
         has_held.recv().unwrap();
         let waiter = std::thread::spawn(move || {
             let got = flights.get_or_run_named(key, |it| it.push_str("codegen round 3"), || Ok(0));
+            has_ended.recv().unwrap();
             (crate::sampler::os_tid() as u32, got)
         });
         let (waiter, got) = waiter.join().unwrap();
+        drop(waited);
         let holder = holder.join().unwrap();
         assert_eq!(got, Ok(9), "the waiter took the hold's value");
         let mut read = Read::default();
@@ -3000,6 +3351,82 @@ mod tests {
                 "no job span stays open across a park: {jobs:?}"
             );
         }
+    }
+
+    /// The folded rows and span rows of `tid` from `cursor` on, by name.
+    fn mine(cursor: &mut Cursor, tid: u32) -> (Vec<FoldRow>, Vec<String>) {
+        let mut read = Read::default();
+        self::read(cursor, &mut read);
+        let folds = read.folds.iter().filter(|it| it.thread == tid).cloned().collect();
+        let spans = read.spans.iter().filter(|it| it.thread == tid).filter_map(|it| meta(it.site)).map(|it| it.name().to_owned()).collect();
+        (folds, spans)
+    }
+
+    #[test]
+    fn short_spans_no_row_names_are_one_folded_row_and_a_span_a_row_names_stays_a_row() {
+        crate::install();
+        let thread = std::thread::spawn(|| {
+            let tid = crate::sampler::os_tid() as u32;
+            let mut cursor = Cursor::default();
+            _ = mine(&mut cursor, tid);
+            fold_here(Duration::from_secs(5), Duration::from_secs(600));
+            let _build = building(23);
+            for _ in 0..100 {
+                let _short = tracing::info_span!(target: "blaze", "fold short").entered();
+            }
+            {
+                let _parent = tracing::info_span!(target: "blaze", "fold parent").entered();
+                let _named = tracing::info_span!(target: "blaze", "fold named").entered();
+                tracing::info!(target: "blaze", "fold names its span");
+            }
+            let typed = span::open_raw(span::Job { kind: span::Name::kept("fold typed"), job: 9, creator: None });
+            span::close_raw(typed);
+            let (folds, spans) = mine(&mut cursor, tid);
+            assert!(folds.is_empty(), "a sum younger than its age is held: {folds:?}");
+            assert!(!spans.iter().any(|it| it == "fold short"), "a short span named by no row is no row: {spans:?}");
+            for kept in ["fold parent", "fold named", <span::Job as span::Span>::NAME] {
+                assert!(spans.iter().any(|it| it == kept), "{kept} is a row: one an event names, its parent, a typed span: {spans:?}");
+            }
+            flush_folds();
+            let (folds, _) = mine(&mut cursor, tid);
+            let [fold] = folds.as_slice() else { panic!("one sum of the site: {folds:?}") };
+            assert_eq!(meta(fold.site).map(|it| it.name()), Some("fold short"));
+            assert_eq!((fold.spans, fold.root, fold.build), (100, true, 23));
+            assert!(fold.dur_ns >= fold.max_dur_ns && fold.to_ns >= fold.from_ns && fold.max_dur_ns > 0, "{fold:?}");
+            for _ in 0..10 {
+                let _short = tracing::info_span!(target: "blaze", "fold at the end").entered();
+            }
+            (tid, cursor)
+        });
+        let (tid, mut cursor) = thread.join().unwrap();
+        let (folds, _) = mine(&mut cursor, tid);
+        let ended: Vec<_> = folds.iter().filter(|it| meta(it.site).map(|it| it.name()) == Some("fold at the end")).collect();
+        assert!(matches!(ended.as_slice(), [it] if it.spans == 10), "a thread that ends writes its sums as its ring passes on: {folds:?}");
+    }
+
+    #[test]
+    fn a_job_given_to_the_pool_inside_a_span_names_it_as_its_creator() {
+        use blaze_graph::{pool::Pool, topology::Topology};
+
+        crate::install();
+        let pool = Pool::new(&Topology::flat(1), false).expect("the pool starts");
+        let (done, ran) = crossbeam_channel::bounded(1);
+        let giver = tracing::info_span!(target: "blaze", "creator test giver").entered();
+        let creator = giver.id().unwrap().into_u64();
+        pool.submit(None, tid, move |on| done.send(on.unwrap()).unwrap());
+        drop(giver);
+        let on = ran.recv().unwrap();
+        drop(pool);
+        let mut read = Read::default();
+        window(Duration::from_secs(60), &mut read);
+        let named: Vec<Option<u64>> = read
+            .spans
+            .iter()
+            .filter(|it| it.thread == on)
+            .filter_map(|it| span::read::<span::Job>(it).ok().flatten())
+            .map(|it| it.fields.creator)
+            .collect();
+        assert!(named.contains(&Some(creator)), "the job's span names the span it was given in, {creator}: {named:?}");
     }
 
     /// A job tree a pool runs: job 0 is given to the pool from the test's thread, each other

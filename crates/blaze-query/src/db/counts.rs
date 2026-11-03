@@ -1,8 +1,7 @@
 //! Re-execution counts, per ingredient: how many of its rows ran, how many were proved
 //! unchanged without running, how many ran again in a view they had already run in, how many
 //! ran because their value was evicted and asked for again (in any view), and how many values
-//! the admission rule let go that recency alone would have kept, and how many values a cap's
-//! sweep and an explicit drop let go. Process-wide, as ingredient numbers are.
+//! a budget's pass and an explicit drop let go. Process-wide, as ingredient numbers are.
 //!
 //! Each thread counts into a block of its own with a load and a store (no read-modify-write,
 //! no cache line two threads write), found through one thread-local read on the run and
@@ -30,14 +29,11 @@ pub(crate) const RERAN: usize = 2;
 ///
 /// [`Cause::Evicted`]: super::Cause::Evicted
 pub(crate) const EVICTED_ASKED: usize = 3;
-/// A sweep evicted a value [`super::Eviction::Recency`] would have kept: an admission the
-/// frequency rule refused.
-pub(crate) const REFUSED: usize = 4;
-/// A sweep evicted a value past the ingredient's cap.
-pub(crate) const EVICTED: usize = 5;
+/// A pass let a value go to keep its tag's values under their budget (`super::budget`).
+pub(crate) const EVICTED: usize = 4;
 /// `evict_values` or `evict_values_of` dropped a value.
-pub(crate) const DROPPED: usize = 6;
-const KINDS: usize = 7;
+pub(crate) const DROPPED: usize = 5;
+const KINDS: usize = 6;
 
 /// What one ingredient's rows did since the last [`take`].
 ///
@@ -53,9 +49,7 @@ pub struct Counts {
     pub reran: u64,
     /// Runs for a value evicted earlier and asked for again: the time eviction cost.
     pub evicted_asked: u64,
-    /// Values a sweep evicted that recency alone would have kept.
-    pub refused: u64,
-    /// Values a sweep evicted past the cap.
+    /// Values a pass let go to keep their tag's values under its budget.
     pub evicted: u64,
     /// Values `evict_values` or `evict_values_of` dropped.
     pub dropped: u64,
@@ -63,8 +57,8 @@ pub struct Counts {
 
 impl Counts {
     fn of(gained: [u64; KINDS]) -> Counts {
-        let [executed, verified, reran, evicted_asked, refused, evicted, dropped] = gained;
-        Counts { executed, verified, reran, evicted_asked, refused, evicted, dropped }
+        let [executed, verified, reran, evicted_asked, evicted, dropped] = gained;
+        Counts { executed, verified, reran, evicted_asked, evicted, dropped }
     }
 }
 

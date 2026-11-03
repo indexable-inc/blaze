@@ -307,7 +307,7 @@ fn argument(command: Command, name: &str) -> Option<Takes> {
         })),
         "ignore-rust-version" => Some(Takes::Flag(|a| a.ignore_rust_version = true)),
         // What changes only what is printed or how the build runs, not what is built: the CLI's.
-        "verbose" | "quiet" | "keep-going" | "future-incompat-report" | "unit-graph" => {
+        "verbose" | "quiet" | "keep-going" | "fail-fast" | "future-incompat-report" | "unit-graph" => {
             Some(Takes::Flag(|_| {}))
         }
         "color" | "message-format" | "lockfile-path" | "artifact-dir" => Some(Takes::Value(|_, _| Ok(()))),

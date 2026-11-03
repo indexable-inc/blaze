@@ -78,15 +78,16 @@ outermost first. `?` marks a nullable column.
 | frame_copied_bytes | u64? | bytes those moves copied |
 | awaits | utf8? | what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it |
 | owner | u64? | who runs what a `wait` waits for (for a key, the job running it, as `switches.job` names it; null when not known), or the job that holds a `hold`. A `hold` span (a key held across a suspension, such as a codegen round) names its holder here, so its waiters' `owner` matches it |
-| steps | u64? | the basic blocks a `macro expand` ran on the evaluator; null for a compiled run, a run that did not end, and any other span |
+| steps | u64? | the basic blocks a `macro expand` ran on the evaluator, or the instances a `build script proof` walked (`hir_ty_pure::ScriptProof::steps`: the same on a cold, warm or busy daemon, and the margin under the proof's bound); null for a compiled run, a run or proof that did not end, and any other span |
 | peak_bytes | u64? | the most stack and heap a `macro expand`'s evaluator held at once; null as `steps` is |
 | outcome | dict? | how a `macro expand` ended: ok, panic, step limit, memory limit or error; null for one that did not end (an unwind) |
 | waits_on | dict? | the kind of thing a `wait` waits on: key, lock, channel, io, child or scope |
 | job | u64? | the pool job a `job` span is of, as `switches.job` names it (or `switches.began_as`, for a job that joined the graph after the span opened); the spans under it are its job's too |
+| creator | u64? | the span (`span_id`) that was open on the thread that gave a `job` span's job to the pool, as it gave it; null for a job given outside any span. A job given by a thread that is no pool job (the daemon's main loop, a build's driver) has no `by_job`, so the critical path crosses from the job to its giver through this span: its lane, and its end as when the job was given (`time::Model::link_creators`) |
 | module_from | dict? | where a `macro module` got its wasm module's machine code: memo (this process had it), store (the daemon's own store) or compiled; null for a load that did not end (refused or failed) |
 | code_bytes | u64? | the bytes of a `macro module`'s machine code, as the store keeps it; null for one from the memo |
 
-The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`), `hold` (`what`, `holder`), `job` (`kind`, `job`), `worker` (`doing` in `function`: a pool worker's `search`, `idle` or `switch` between jobs) and `macro module` (`module` in `function`, and as it ends `module_from`, `code_bytes`). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
+The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`), `hold` (`what`, `holder`), `job` (`kind`, `job`, `creator`), `worker` (`doing` in `function`: a pool worker's `search`, `idle` or `switch` between jobs), `macro module` (`module` in `function`, and as it ends `module_from`, `code_bytes`) and `build script proof` (`krate`, `unit`, and as it ends `steps`). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
 
 A `macro expand` span is one run of a proc macro: `function` is the macro's path (`serde_derive::Serialize`), `crate` the crate the call is in. A unit's phase spans (`unit names`, `unit bodies`, `unit codegen`, `unit link`, `unit store`) carry the unit in `unit` as `serde v1.0.219 (build script)`; their `crate` is the target's name, `build-script-build` for every build script. A `scope` wait names the span its caller opened the scope in: `scope 13 of unit codegen serde v1.0.219 (build script)`.
 
@@ -145,7 +146,7 @@ noted only when the span closes on the thread it began on.
 |---|---|---|
 | build_id | u64? | the build, or null |
 | process | u32 | the process id |
-| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, `footprint bytes` (the process's physical footprint, all the OS counts against it; `footprint_per_build` gives each build's peak), `committed bytes` and `reserved bytes` (what every `blaze_mem` region has committed and reserves; footprint less committed is what the process holds outside `blaze_mem`, its global heap), `macro modules from memo`, `macro modules from store` and `macro modules compiled` (each a daemon's running total of its wasm module loads), `profile spans lost` and `profile rows skipped` (the process's running totals of spans the recorder could not record and rows its rings wrote over before the history drained them, written by the history with each build's flush and whenever they grow), and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes) |
+| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, `footprint bytes` (the process's physical footprint, all the OS counts against it; `footprint_per_build` gives each build's peak), `committed bytes` and `reserved bytes` (what every `blaze_mem` region has committed and reserves; footprint less committed is what the process holds outside `blaze_mem`, its global heap), `macro modules from memo`, `macro modules from store` and `macro modules compiled` (each a daemon's running total of its wasm module loads), `blaze bugs` (the process's running total of bugs it found in itself and went on past, `stdx::assert::reported`; each site is an `errors` row of kind `blaze-bug`), `profile spans lost`, `profile rows skipped` and `profile rows skipped behind` (the process's running totals of spans the recorder could not record, rows its rings wrote over before the history drained them, and of those the rows skipped while the history's backlog was full, written by the history with each build's flush and whenever they grow; `blaze slow` says them on its third line), and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes) |
 | t_ns | i64 | when |
 | value | f64 | the value then |
 | fiber | u32? | the fiber a `fiber stack` counter is of, or null |
@@ -212,7 +213,7 @@ rests on these numbers.
 
 | column | type | |
 |---|---|---|
-| build_id | u64 | the build's number, unique in the daemon's store |
+| build_id | u64 | the build's number, unique in the history: a daemon numbers its builds past every build its files hold rows of |
 | commit | utf8? | the workspace's commit, when it is a git checkout |
 | workspace | utf8 | the workspace's root |
 | command | utf8 | what was asked: build, test, run, check, with the arguments |
@@ -225,6 +226,13 @@ rests on these numbers.
 | joined | u64? | nodes that took a task another node ran |
 | tree | utf8? | the digest of the workspace's source tree when the build ended, as `blaze-v2-proof tree <dir>` prints it with `target` and `.git` skipped; null for a build of no directory. Compare it with the same digest of a checkout to tell which tree a build tested: `commit` is null for a snapshot that is not a git checkout |
 | blaze | utf8? | the BLAKE3 hash of the blaze executable that ran the build |
+| process | u32? | the daemon's process id; null in rows of a blaze before it |
+
+A build has two rows: one of outcome `running` and null `dur_ns`, written as it starts (the
+history flushes at once), and one as it ends, with the same `started_ns`. The `builds` view keeps
+the end row where there is one. A build whose only row is its start, and whose `process` no
+longer writes the history (`owner.lock` does not name it, or its lock is not held), ended by
+its daemon's death: `blaze slow` reports it to that process's last row.
 
 ### `samples`: one row a CPU sample of a running thread
 
@@ -319,6 +327,35 @@ next job inside no span. Three views read it:
 - `job_spans`: `spans` plus the `job` running on the span's thread when it began.
 - `job_tiles`, below, is built from `job_spans`.
 
+### `folded`: one row a sum of short spans of one site, on one thread, over a stretch
+
+A span the recorder closes in under `flight::FOLD_BELOW` (5 us) is summed instead of written when
+no row could name it: it has no child written and none open, no event or sample happened in it,
+no job was given in it, it fills no typed column, it was never held across a wait or moved to
+another thread, and it made no frame copies. A `job`, `wait` or `hold` span is never folded. A
+thread sums by site, depth 0 or not, and build, in 64 slots, and writes a sum as a row when its
+slot is needed for another, when it has been open `flight::FOLD_AGE` (50 ms), when the worker goes
+idle, when its ring passes to another thread, and when a build ends. Only blaze's CLI and daemon
+turn folding on (`flight::fold_below`); a test records every span unless it asks.
+
+| column | type | |
+|---|---|---|
+| build_id | u64? | the build its spans were of |
+| process | u32 | the process id |
+| thread | u32 | the thread that closed them |
+| thread_name | dict | its name |
+| name | dict | their callsite's name, as `spans.name` |
+| target | dict | their callsite's target, as `spans.target` |
+| root | u32 | 1 when they were roots (depth 0: a worker's own work between jobs), else 0 |
+| from_ns | i64 | when the first of them began |
+| to_ns | i64 | when the last of them closed |
+| spans | u64 | how many |
+| dur_ns | i64 | their durations, added |
+| max_dur_ns | i64 | the longest |
+| self_cpu_ns | i64? | their own CPU, added, where the thread counts CPU |
+| alloc_bytes | u64? | the bytes they allocated, added |
+| allocs | u64? | the allocations they made, added |
+
 ### `events`: one row a `tracing` event the recorder keeps, on the thread it happened on
 
 | column | type | |
@@ -352,7 +389,7 @@ build's first 500.
 | t_ns | i64? | when the daemon said it |
 | crate | dict? | the package of the unit it is of |
 | unit | utf8? | the unit as cargo names it: `serde (build script)` |
-| kind | dict | a stable code: rustc's (E0277) or a deny lint's name, else blaze's: derive-panic, attr-panic, macro-panic, expand-failed, link-native-missing, link-failed, template-refs, refused, daemon-panic, uncoded |
+| kind | dict | a stable code: rustc's (E0277) or a deny lint's name, else blaze's: derive-panic, attr-panic, macro-panic, expand-failed, link-native-missing, link-failed, template-refs, refused, daemon-panic, blaze-bug (a site of a bug the daemon went on past: `function` its value kind, `message` what and how often, `detail` the first report's thread and stack), uncoded |
 | function | utf8? | the function or instance it is of: a refused instance, a panicking proc macro |
 | message | utf8 | its first line |
 | detail | utf8? | why: its first help or note, or a refused function's reason |
@@ -438,13 +475,18 @@ The daemon gives both to `History::linked` and `History::crate_graph` (`crates/b
 history's cap never deletes), and `blaze perf diff` compares two runs function by function, joined by
 `identity`, with a noise bound and a cause class: docs/v2/plan/lanes/perf-history.md.
 
-### `open`: a result, not stored
+### `open`: the spans live threads are inside
 
-The spans each live thread is inside now, which are not `spans` rows until they close: what the
-live feed sends beside the rows that closed. Its columns are `process u32, thread u32,
-thread_name dict, depth u16 (0 outermost), name dict, target dict, start_ns i64`, then what each
-span is of, as in `spans`: `crate dict?, function utf8?, unit utf8?, awaits utf8?, owner u64?`.
-So a stuck worker names the query key it is inside, not only the query's kind.
+The spans each live thread is inside when the threads were read, which are not `spans` rows
+until they close: what the live feed sends beside the rows that closed, and what each flush of
+the history writes when it differs from the last one written (an idle daemon writes none, a
+deadlocked one keeps its last). Its columns are `process u32, thread u32, thread_name dict,
+depth u16 (0 outermost), name dict, target dict, start_ns i64`, then what each span is of, as in
+`spans`: `crate dict?, function utf8?, unit utf8?, awaits utf8?, owner u64?`, then `read_ns i64`,
+when the threads were read (one value a reading). So a stuck worker names the query key it is
+inside, not only the query's kind, and the history of a daemon that died says what it was
+inside at most one flush (5 s) before its end: `blaze slow` reads it for the build the death
+ended, and the CLI a dead daemon hung up on quotes it.
 
 ## Utilization: where a build's wall time goes
 
@@ -503,8 +545,16 @@ hf's profile from that day the view below gives 1.1% mean and 3.2% at most for b
 for b5. What is left is stretches with neither a switch row nor a span. On a busy worker they
 recurred every flush (`history::EVERY`, 5 s): a self-build's busiest threads wrote 16,379 rows
 in one 5 s stretch, a whole ring (`flight::CAP`). Since 2026-11-02 the history drains the rings
-every `history::DRAIN` (250 ms) into the next flush, and counts what was still written over in
-the `profile rows skipped` counter. It also fails on every perf sample blocked in a mutex, condition
+into the next flush, and counts what was still written over in the `profile rows skipped` counter.
+Until the evening of 2026-11-02 the drain ran on the history's own thread every 250 ms and read
+nothing while that thread flushed, and a flush of a busy build took 2 to 10 s: a self-build's
+102 s build step skipped about 42 million rows. Now a thread of its own (`blaze-drain`) reads the
+rings every `history::DRAIN` (50 ms), whatever the flush is doing, and asks for a flush once it
+holds `history::FLUSH_ROWS` rows; past `history::BACKLOG_ROWS` it stops reading and counts what is
+written over as `profile rows skipped behind`. Spans under `flight::FOLD_BELOW` (5 us) that no
+row names are summed into `folded` rows (below) instead of a row each; on that self-build 64% of
+the spans were under 2 us, and `find_container` and `Semantics::analyze_impl` (about 3 us) came
+360,000 a second on a worker, more than a ring holds between two reads. The gate counts the folded roots' time as covered. It also fails on every perf sample blocked in a mutex, condition
 variable, `kevent` or `read` while no wait span is open on its thread (`raw_blocks`, which names
 the stack), and on every `wait` span without `awaits`. Its verdict names the build's `tree` and `blaze`, the exact tree and
 binary measured, and a history with no such build is an error naming it. Its test runs on a
@@ -544,7 +594,11 @@ The build's top-level phases each have a span:
   cutoff) and `nameres records`, each with `crate`;
 - release codegen: `release summarize`, `release emit` and `llvm compile`, beside the existing
   per-function `mir`, `translate` and `monomorphize`;
-- the daemon loop's `loop turn`, opened only for a turn with completions or ready work.
+- the daemon loop's `loop turn`, opened only for a turn with completions or ready work, and
+  between turns its `wait` on the driver, whose `awaits` names what ends it: a plane task's
+  end (the loop reads them every 1 ms while tasks run), a client's connection or request, a
+  file, a child or a watch, the 50 ms idle tick, or the session's, store's or live feed's
+  deadline.
 
 - a build script's run: `build script run`, a root span open from the run's start on the daemon's
   loop to its end (its program's whole time, which no daemon thread spends), with the package
@@ -562,11 +616,23 @@ The build's top-level phases each have a span:
 ## What made a build slow: `blaze slow`
 
 `blaze slow [--build N] [--top N] [--json]` reads one build's profile (the last build that
-ended, unless `--build` says otherwise) and ranks what made it slow by the wall time each fix
+ended or whose daemon died, unless `--build` says otherwise) and ranks what made it slow by the wall time each fix
 would save. A build of 30 s or more ends with a note pointing at it. `blaze debug time` stays
 the raw table; `blaze slow` is the verdict. It is a top-level command beside `blaze why`: `why`
 says what a build computed again, `slow` says where its time went. It is not `blaze profile`,
 because cargo's `--profile` means something else.
+
+A build whose daemon died (killed, as an out-of-memory kill does, crashed, or ended by its
+stop's bound) has no end row; its report runs to the daemon's last row, says "ended by the
+daemon's death" with the pid, and names what each thread was inside at the daemon's last reading
+of its open spans: each span, what a wait awaited and the job that ran it (`build.died` in the
+JSON, report version 3).
+
+A build is its number: its rows are the rows tagged with it, and the rows of no build in its
+`builds` row's window from the same process. When rows of one number come from more than one
+process (daemons of a blaze before 2026-11-03, which could each number a build 1 in one home),
+`blaze slow` and `blaze debug time` refuse the build, naming each process with its rows and
+time, rather than read them as one build of all their workers.
 
 Each finding has these fields:
 - a kind;
@@ -613,7 +679,13 @@ What the profile could not see is listed after the findings, as blind spots, nev
 - no `ready` rows;
 - `builds.misses` over the number of misses rows;
 - rows that didn't line up;
-- a critical path that stops short of the build's start.
+- a critical path that stops short of the build's start;
+- rows the recorder lost (`rows_lost`): spans it had no slot for, rows a ring wrote over between
+  drains, and of those the rows skipped while the history's writer was behind, each counted.
+
+Its header says the recorder's loss on a line of its own, even when it lost nothing
+(`recorder: lost no rows; summed N spans under 5us into folded (S)`), and `--json` has it as
+`summary.recorder`. A total in a report whose recorder lost rows is short by what they held.
 
 The analysis is `blaze_profile::slow::analyse`. It is a pure function over the time model
 (`time::Model`), its critical path (`time::path::critical`) and `slow::Facts` (the builds row,
@@ -643,7 +715,7 @@ through `perf_event_open`. Frames are named only when they are written out.
 
 Each row is 64 bytes (8 words): close and start ticks, span id, parent, a word packing the kind,
 callsite, depth, the ring that made the span and its allocation count, the interned crate and
-function, the build and unit, and the bytes allocated. A ring holds 16384 rows (1 MiB). A span's
+function, the build and unit, and the bytes allocated. A ring holds 32,768 rows (2 MiB). A span's
 open state lives from its start to its close in a slot of the ring of the thread that made it.
 Its id names that ring, slot and a sequence number, so a span closed on another thread still
 finds where it began. Its row names the thread that made it: the slot keeps the maker's tid and

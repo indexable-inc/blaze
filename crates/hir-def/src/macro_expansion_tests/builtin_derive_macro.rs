@@ -790,7 +790,7 @@ struct Struct9<T>(T);
 #[repr(transparent)]
 struct Struct9<#[pointee] T, U>(T) where T: ?Sized;
 "#,
-        expect![[r#"
+        &expect![[r#"
             35..72: `CoercePointee` can only be derived on `struct`s with `#[repr(transparent)]`
             74..114: `CoercePointee` can only be derived on `struct`s with at least one field
             116..158: `CoercePointee` can only be derived on `struct`s with at least one field
@@ -949,7 +949,7 @@ enum Either { A(u8) }
 #[derive(From)]
 union Bits { a: u8 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             24..53: `#[derive(From)]` used on a struct with no fields
             55..90: `#[derive(From)]` used on a struct with multiple fields
             92..129: `#[derive(From)]` used on an enum
@@ -977,7 +977,7 @@ struct Duplicate<'a>(&'a mut ());
 #[coerce_shared(Target<'a>, Other<'a>)]
 struct Malformed<'a>(&'a mut ());
 "#,
-        expect![[r#"
+        &expect![[r#"
             34..89: `derive(CoerceShared)` requires exactly one `#[coerce_shared(Target)]` attribute
             91..206: `derive(CoerceShared)` requires exactly one `#[coerce_shared(Target)]` attribute
             208..305: `derive(CoerceShared)` requires exactly one `#[coerce_shared(Target)]` attribute"#]],
@@ -1009,7 +1009,7 @@ union Foo8 { _v: () }
 #[derive(PartialEq)]
 union Foo9 { _v: () }
     "#,
-        expect![[r#"
+        &expect![[r#"
             78..118: this trait cannot be derived for unions
             119..157: this trait cannot be derived for unions
             158..195: this trait cannot be derived for unions
@@ -1030,7 +1030,7 @@ enum Foo {
     Bar,
 }
     "#,
-        expect!["1..41: `#[derive(Default)]` on enum with no `#[default]`"],
+        &expect!["1..41: `#[derive(Default)]` on enum with no `#[default]`"],
     );
 }
 

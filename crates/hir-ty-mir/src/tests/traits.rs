@@ -538,7 +538,7 @@ fn infer_const_body() {
 const A: u32 = 1 + 1;
 static B: u64 = { let x = 1; x };
 "#,
-        expect![[r#"
+        &expect![[r#"
             15..16 '1': u32
             15..20 '1 + 1': u32
             19..20 '1': u32
@@ -560,7 +560,7 @@ fn test() -> u64 {
     let b = a.0;
     a.1
 }"#,
-        expect![[r#"
+        &expect![[r#"
             37..86 '{     ... a.1 }': u64
             47..48 'a': S
             51..52 'S': fn S(i32, u64) -> S
@@ -586,7 +586,7 @@ fn test() -> u64 {
     let b = a.0(4);
     a.0(2)
 }"#,
-        expect![[r#"
+        &expect![[r#"
             43..108 '{     ...0(2) }': u64
             53..54 'a': S
             57..58 'S': fn S(fn(u32) -> u64) -> S
@@ -614,7 +614,7 @@ fn test() -> u64 {
 fn indexing_arrays() {
     check_infer(
         "fn main() { &mut [9][2]; }",
-        expect![[r#"
+        &expect![[r#"
             10..26 '{ &mut...[2]; }': ()
             12..23 '&mut [9][2]': &'? mut {unknown}
             17..20 '[9]': [i32; 1]
@@ -1058,7 +1058,7 @@ fn test(x: impl Trait<u64>, y: &impl Trait<u32>) {
     y.foo2();
     z.foo2();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             77..78 'x': impl Trait<u16>
             97..99 '{}': ()
             154..155 'x': impl Trait<u64>
@@ -1117,7 +1117,7 @@ fn test() {
     foo::<u32>(S);
     foo::<u32, i32>(S); // we should ignore the extraneous i32
 }"#,
-        expect![[r#"
+        &expect![[r#"
             155..156 'x': impl Trait
             175..186 '{ loop {} }': T
             177..184 'loop {}': !
@@ -1176,7 +1176,7 @@ fn test() {
     F::<u32>(PhantomData).foo::<i32>(S);
     F::<u32>(PhantomData).foo::<i32, u32>(S); // extraneous argument should be ignored
 }"#,
-        expect![[r#"
+        &expect![[r#"
             135..139 'self': F<T>
             141..142 'x': impl Trait
             166..177 '{ loop {} }': (T, U)
@@ -1220,7 +1220,7 @@ impl Trait for S {}
 fn test() {
     let f: fn(S) -> () = foo;
 }"#,
-        expect![[r#"
+        &expect![[r#"
             22..23 'x': impl Trait
             37..48 '{ loop {} }': ()
             39..46 'loop {}': !
@@ -1254,7 +1254,7 @@ fn test(x: impl Trait<u64>, y: &impl Trait<u64>) {
     y.foo2();
     z.foo2();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             98..100 '{}': ()
             110..111 'x': impl Trait<u64>
             130..131 'y': &'? impl Trait<u64>
@@ -1307,7 +1307,7 @@ fn bar() {
     let a = foo([R::A(()), R::B(7)]);
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             153..154 'x': impl X<Item = R<impl Y + ?Sized, T>> + ?Sized
             190..201 '{ loop {} }': T
             192..199 'loop {}': !
@@ -1350,7 +1350,7 @@ fn main() {
     foo(2);
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             85..88 'baz': T
             93..96 '{ }': ()
             182..197 '{     foo(2); }': ()
@@ -1376,7 +1376,7 @@ fn test() {
     let a = bar();
     a.foo();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             71..82 '{ loop {} }': !
             73..80 'loop {}': !
             78..80 '{}': ()
@@ -1413,7 +1413,7 @@ fn test() {
     c.next().foo();
     d.foo();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             184..195 '{ loop {} }': ({unknown}, {unknown})
             186..193 'loop {}': !
             191..193 '{}': ()
@@ -1459,7 +1459,7 @@ fn foo<const C: u8, T>() -> (impl FnOnce(&str, T), impl Trait<u8>) {
     (|input, t| {}, Bar(C))
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             134..165 '{     ...(C)) }': (impl FnOnce(&'?0.0 str, T), impl Trait<u8>)
             140..163 '(|inpu...ar(C))': (impl FnOnce(&'?0.0 str, T), Bar<u8>)
             141..154 '|input, t| {}': impl FnOnce(&'?0.0 str, T)
@@ -1517,7 +1517,7 @@ fn test(x: Box<dyn Trait<u64>>, y: &dyn Trait<u64>) {
     y.foo2();
     z.foo2();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             206..208 '{}': Box<dyn Trait<u64> + '?>
             218..219 'x': Box<dyn Trait<u64> + 'static>
             242..243 'y': &'? (dyn Trait<u64> + 'static)
@@ -1563,7 +1563,7 @@ impl<T, U> Trait2<T, U> for dyn Trait<T, U> { }
 fn test(s: S<u32, i32>) {
     s.bar().baz();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             106..110 'self': &'? S<T, U>
             132..143 '{ loop {} }': &'? (dyn Trait<T, U> + 'static)
             134..141 'loop {}': !
@@ -1595,7 +1595,7 @@ fn test(x: Trait, y: &Trait) -> u64 {
     y.foo();
     z.foo();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             60..62 '{}': dyn Trait + '?
             72..73 'x': dyn Trait + 'static
             82..83 'y': &'? (dyn Trait + 'static)
@@ -1626,7 +1626,7 @@ fn main() {
     f(&|number| number.foo());
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             31..35 'self': &'? S
             37..39 '{}': ()
             47..48 '_': &'? (dyn Fn(S) + 'static)
@@ -1658,7 +1658,7 @@ fn test<'lifetime>(
     f: impl Trait + ?Sized
 ) {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             39..40 'a': impl Trait + 'lifetime
             70..71 'b': impl 'lifetime
             93..94 'c': impl Trait
@@ -1682,7 +1682,7 @@ fn test<'a, 'b: 'a>(it: impl Trait<'a>){
     it.f();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             38..42 'self': &'a Self
             44..46 '{}': ()
             69..71 'it': impl Trait<'a>
@@ -1735,7 +1735,7 @@ fn test<T: Trait<Type = u32>>(x: T, y: impl Trait<Type = i64>) {
     get2(set(S(PhantomData)));
     get2(S::<usize>(PhantomData));
 }"#,
-        expect![[r#"
+        &expect![[r#"
             81..82 't': T
             109..111 '{}': {unknown}
             143..144 't': T
@@ -1824,7 +1824,7 @@ impl<T, U> Trait2<T> for U where U: Trait1<Type = T> {}
 fn test<T: Trait1<Type = u32>>(x: T) {
     x.foo();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             163..164 'x': T
             169..185 '{     ...o(); }': ()
             175..176 'x': T
@@ -1866,7 +1866,7 @@ fn test<T: Trait1, U: Trait2>(x: T, y: U) {
     x.foo();
     y.foo();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             53..57 'self': &'? Self
             66..68 '{}': u32
             185..186 'x': T
@@ -1895,7 +1895,7 @@ trait Trait1: foo::SuperTrait {}
 fn test(x: &impl Trait1) {
     x.foo();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             53..57 'self': &'? Self
             66..68 '{}': u32
             119..120 'x': &'? impl Trait1
@@ -1918,7 +1918,7 @@ fn super_trait_cycle() {
             x.foo();
         }
         "#,
-        expect![[r#"
+        &expect![[r#"
             43..44 'x': T
             49..65 '{     ...o(); }': ()
             55..56 'x': T
@@ -1947,7 +1947,7 @@ impl<T> Trait for S<T> {}
 fn test() {
     get2(set(S(PhantomData)));
 }"#,
-        expect![[r#"
+        &expect![[r#"
             134..135 't': T
             145..147 '{}': U
             177..178 't': T
@@ -1974,7 +1974,7 @@ fn fn_trait() {
 fn test<F: FnOnce(u32, u64) -> u128>(f: F) {
     f.call_once((1, 2));
 }"#,
-        expect![[r#"
+        &expect![[r#"
             38..39 'f': F
             44..72 '{     ...2)); }': ()
             50..51 'f': F
@@ -2015,7 +2015,7 @@ fn test() {
     let f: fn(u8) -> u32;
     opt.map(f);
 }"#,
-        expect![[r#"
+        &expect![[r#"
             132..136 'self': &'? Bar<F>
             149..160 '{ loop {} }': (A1, R)
             151..158 'loop {}': !
@@ -2068,7 +2068,7 @@ fn make_foo_fn() -> Foo {}
     let lazy2: Lazy<Foo, _> = Lazy::new(make_foo_fn_ptr);
     let r2 = lazy2.foo();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             36..40 'self': &'? Foo
             51..53 '{}': usize
             134..135 'f': F
@@ -2112,7 +2112,7 @@ fn test() {
     x.map(|_v| 1u64);
     let y: Option<i64> = x.map(|_v| 1);
 }"#,
-        expect![[r#"
+        &expect![[r#"
             86..90 'self': Option<T>
             92..93 'f': F
             111..122 '{ loop {} }': Option<U>
@@ -2198,7 +2198,7 @@ fn test() {
     let x3 = S.foo1(S, |s| s.method());
     let x4 = S.foo2(|s| s.method(), S);
 }"#,
-        expect![[r#"
+        &expect![[r#"
             33..34 'x': T
             39..40 'f': F
             50..61 '{ loop {} }': U
@@ -2375,7 +2375,7 @@ impl Trait for S2 {
     type Item = i32;
     fn f(&self, x: <Self>::Item) { let y = x; }
 }"#,
-        expect![[r#"
+        &expect![[r#"
             126..130 'self': &'? S
             132..133 'x': u32
             147..161 '{ let y = x; }': ()
@@ -2743,7 +2743,7 @@ impl TokenStream for RustAnalyzer {
         make()
     }
 }"#,
-        expect![[r#"
+        &expect![[r#"
             1075..1086 '{ loop {} }': T
             1077..1084 'loop {}': !
             1082..1084 '{}': ()
@@ -2778,7 +2778,7 @@ fn test() -> impl Trait<i32> {
     let x: i32 = bar(S(default()));
     S(default())
 }"#,
-        expect![[r#"
+        &expect![[r#"
             26..27 'x': impl Trait<u32>
             46..57 '{ loop {} }': ()
             48..55 'loop {}': !
@@ -2836,7 +2836,7 @@ where
 fn main() {
     f::<(), _>(|z| { z; });
 }"#,
-        expect![[r#"
+        &expect![[r#"
             72..74 '_v': F
             117..120 '{ }': ()
             132..163 '{     ... }); }': ()
@@ -3005,7 +3005,7 @@ fn main() {
     .filter_map(|x| if x > 0 { Some(x as u32) } else { None })
     .for_each(|y| { y; });
 }"#,
-        expect![[r#"
+        &expect![[r#"
             61..65 'self': Self
             67..68 'f': F
             152..163 '{ loop {} }': FilterMap<Self, F>
@@ -3092,7 +3092,7 @@ fn foo(x: &dyn Foo) {}
 fn test(x: &dyn Foo) {
     foo(x);
 }"#,
-        expect![[r#"
+        &expect![[r#"
             21..22 'x': &'? (dyn Foo + 'static)
             34..36 '{}': ()
             46..47 'x': &'? (dyn Foo + 'static)
@@ -3122,7 +3122,7 @@ fn test() {
     (IsCopy, IsCopy).test();
     (IsCopy, NotCopy).test();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             134..235 '{     ...t(); }': ()
             140..146 'IsCopy': IsCopy
             140..153 'IsCopy.test()': bool
@@ -3159,7 +3159,7 @@ fn test() {
     Struct.test();
     Enum::Variant.test();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             9..11 '{}': ()
             28..29 'T': {unknown}
             36..38 '{}': T
@@ -3190,7 +3190,7 @@ fn test(f1: fn(), f2: fn(usize) -> u8, f3: fn(u8, u8) -> &u8) {
     f2.test();
     f3.test();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             76..78 'f1': fn()
             86..88 'f2': fn(usize) -> u8
             107..109 'f3': fn(u8, u8) -> &'? u8
@@ -3219,7 +3219,7 @@ fn test() {
     (1u8, 1u8).test();
     (1u8, *"foo").test(); // not Sized
 }"#,
-        expect![[r#"
+        &expect![[r#"
             79..194 '{     ...ized }': ()
             85..88 '1u8': u8
             85..95 '1u8.test()': bool
@@ -3269,7 +3269,7 @@ fn foo() {
     let f = |x: Option<i32>| {};
     (&f)(s)
 }"#,
-        expect![[r#"
+        &expect![[r#"
             52..126 '{     ...)(s) }': ()
             62..63 's': Option<i32>
             66..78 'Option::None': Option<i32>
@@ -3317,7 +3317,7 @@ where
     f(s)
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             13..14 'f': F
             59..89 '{     ...f(s) }': T
             69..70 's': Option<i32>
@@ -3353,7 +3353,7 @@ fn foo() {
     let f: Box<dyn FnOnce(&Option<i32>)> = Box { inner: &mut (|ps| {}) };
     f(&s);
 }"#,
-        expect![[r#"
+        &expect![[r#"
             154..158 'self': &'? Box<T>
             166..205 '{     ...     }': &'? T
             176..199 'unsafe...nner }': &'? T
@@ -3503,7 +3503,7 @@ fn f() {
       //^^^^^^^^^^^ u8
     }
 }"#,
-        expect![[r#"
+        &expect![[r#"
             46..50 'self': &'? Self
             58..63 '{ 0 }': u8
             60..61 '0': u8
@@ -3557,7 +3557,7 @@ fn f() {
         let s = inner();
     }
 }"#,
-        expect![[r#"
+        &expect![[r#"
             17..73 '{     ...   } }': ()
             39..71 '{     ...     }': S
             53..54 's': S
@@ -3592,7 +3592,7 @@ fn test() {
     let y = A;
     let r = x.do_op(y);
 }"#,
-        expect![[r#"
+        &expect![[r#"
             153..157 'self': A
             159..162 'rhs': A
             186..206 '{     ...     }': bool
@@ -3639,7 +3639,7 @@ fn foo() {
     use foo::Bar;
     let x = <F as Bar>::boo();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             132..163 '{     ...     }': <Self as Bar>::Output
             146..153 'loop {}': !
             151..153 '{}': ()
@@ -3734,7 +3734,7 @@ fn main(){
     let res = wrapped + num;
 
 }"#,
-        expect![[r#"
+        &expect![[r#"
             95..99 'self': Wrapper
             101..104 'rhs': u32
             122..150 '{     ...     }': Wrapper
@@ -3865,7 +3865,7 @@ fn main() {
     let v4 = v3.do_thing();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             133..137 'self': &'? [u8; 4]
             155..172 '{     ...     }': usize
             165..166 '2': usize
@@ -3912,7 +3912,7 @@ fn main() {
     let v2 = v.do_thing();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             151..155 'self': &'? [u8; L]
             173..194 '{     ...     }': [u8; L]
             183..188 '*self': [u8; L]
@@ -3937,7 +3937,7 @@ fn fn_returning_unit() {
 fn test<F: FnOnce()>(f: F) {
     let _: () = f();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             21..22 'f': F
             27..51 '{     ...f(); }': ()
             37..38 '_': ()
@@ -3963,7 +3963,7 @@ impl foo::Foo for u32 {
     }
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             67..71 'self': Self
             82..87 '{ 0 }': usize
             84..85 '0': usize
@@ -4148,7 +4148,7 @@ fn f<F: Foo>() {
     F::Relaxed::IS_SIZED;
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             104..107 'Yes': Yes
             212..295 '{     ...ZED; }': ()
             218..239 'F::Exp..._SIZED': Yes
@@ -4234,7 +4234,7 @@ fn g(t: &(dyn Sync + T2 + T1 + Send)) {
     f(t);
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             68..69 't': &'? {unknown}
             101..103 '{}': ()
             109..110 't': &'? {unknown}
@@ -4399,7 +4399,7 @@ fn f<'a>(v: &dyn Trait<Assoc<i32> = &'a i32>) {
     v.get::<i32>().deref();
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             127..128 'v': &'? (dyn Trait<Assoc<i32> = &'_ i32> + 'static)
             164..195 '{     ...f(); }': ()
             170..171 'v': &'? (dyn Trait<Assoc<i32> = &'_ i32> + 'static)
@@ -4936,7 +4936,7 @@ fn allowed2<'a>(baz: impl Baz<Assoc = &'a (impl Foo + 'a)>) {}
 
 fn allowed3(baz: impl Baz<Assoc = Qux<impl Foo>>) {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             139..140 'f': impl Fn({unknown})
             161..193 '{     ...oo); }': ()
             171..174 'foo': S
@@ -4994,7 +4994,7 @@ fn bar(v: *const ()) {
     let _ = v as *const WeirdFoo;
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             62..63 'v': *const ()
             76..113 '{     ...Foo; }': ()
             86..87 '_': *const WeirdFoo
@@ -5022,7 +5022,7 @@ async fn baz<T: AsyncFnOnce(u32) -> i32>(c: T) {
     fut3.await;
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             37..38 'a': T
             37..38 'a': T
             43..83 '{     ...ait; }': ()
@@ -5064,7 +5064,7 @@ fn main() {
     let a: i32 = default();
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             47..78 '{     ...t(); }': ()
             57..58 'a': i32
             66..73 'default': fn default<i32>() -> i32
@@ -5086,7 +5086,7 @@ fn main() {
     foo(async move || ());
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             29..30 '_': F
             40..55 '{     loop {} }': R
             46..53 'loop {}': !
@@ -5116,7 +5116,7 @@ where
 {
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             84..86 'de': D
             135..138 '{ }': {unknown}
         "#]],
@@ -5150,7 +5150,7 @@ fn main() {
     e.downcast::<()>();
 }
 "#,
-        expect![[r#"
+        &expect![[r#"
             147..151 'self': &'? AnyhowError
             170..181 '{ loop {} }': &'? (dyn Error + Send + Sync + 'static)
             172..179 'loop {}': !
@@ -5182,7 +5182,7 @@ fn main() {
     let iter: Box<dyn Iterator<Item = &[u8]> + 'static> = loop {};
     let _ = iter.into_iter();
 }"#,
-        expect![[r#"
+        &expect![[r#"
             10..313 '{     ...r(); }': !
             223..227 'iter': Box<dyn Iterator<Item = &'? [u8]> + 'static>
             273..280 'loop {}': !
@@ -5311,7 +5311,7 @@ fn foo() {
     let <E as Trait>::Assoc::ET(a) = <E as Trait>::Assoc::ET(0) else { loop {} };
 }
     "#,
-        expect![[r#"
+        &expect![[r#"
             137..202 '{     ...     }': ()
             151..170 '<Self>... { a }': S
             167..168 'a': u32
@@ -5435,7 +5435,7 @@ impl<'a> Trait<'a> for Bot {}
 
 fn impl_fn(val: impl for<'a> Trait<'a>) {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             75..78 'val': impl Trait<'?0.0> + ?Sized
             104..106 '{}': ()
         "#]],
@@ -5454,7 +5454,7 @@ impl<'a, 'b> Trait<'a, 'b> for Foo {}
 
 fn run_dyn<'b>(val: &dyn for<'a> Trait<'a, 'b>) {}
 "#,
-        expect![[r#"
+        &expect![[r#"
             91..94 'val': &'? (dyn Trait<'?0.0, '_> + 'static)
             124..126 '{}': ()
         "#]],

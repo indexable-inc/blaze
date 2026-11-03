@@ -6,7 +6,7 @@
 //!
 //! The analyses keep their old results but read today's [`Ctx`], [`regions`] and region
 //! values, which both sides share: `MoveData::trackable` is `old_trackable` (an inherent method
-//! of `Ctx` either way), `regions_of` and `opaque_captures` fill the old vectors, `Regions` and
+//! of `Ctx` either way), `regions_of` and `alias_captures` fill the old vectors, `Regions` and
 //! `RegionValues` have their frame's lifetime, and the Polonius scopes take today's live loans.
 //! `maybe_initialized_at_drops` and what it returns are visible to the comparison.
 

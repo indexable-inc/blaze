@@ -719,7 +719,7 @@ fn main() {
         "UnorderedCollection",
     ];
     diag.suggestions(
-        at,
+        &at,
         "there is an enum variant `AffixHeart::Set` and 7 others; try using the variant's enum",
         enums.iter().map(|it| (*it).to_owned()),
         Applicability::MaybeIncorrect,

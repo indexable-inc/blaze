@@ -280,11 +280,10 @@ fn confined_offsets(shape: Shape) -> Option<Vec<i64>> {
 }
 
 fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
-    panic
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| panic.downcast_ref::<&str>().map(|it| (*it).to_owned()))
-        .unwrap_or_else(|| "a panic".to_owned())
+    match panic.downcast::<String>() {
+        Ok(text) => *text,
+        Err(panic) => panic.downcast_ref::<&str>().map_or_else(|| "a panic".to_owned(), |it| (*it).to_owned()),
+    }
 }
 
 /// [`crate::compile`], with a panic as its error.
@@ -325,7 +324,7 @@ fn selected(code: &Code, library: &Library, shape: Shape) -> Result<(), String> 
     }
 }
 
-fn fail_with(failures: Vec<String>, what: &str) {
+fn fail_with(failures: &[String], what: &str) {
     if !failures.is_empty() {
         panic!("{} {what}:\n\n{}", failures.len(), failures.join("\n\n"));
     }
@@ -393,7 +392,7 @@ fn compiles_where_cranelift_does(target: Target) {
             (Err(_), Err(_)) => {}
         }
     }
-    fail_with(failures, &format!("shapes compile differently from Cranelift for {}", host::triple(&target)));
+    fail_with(&failures, &format!("shapes compile differently from Cranelift for {}", host::triple(&target)));
 }
 
 #[test]
@@ -576,7 +575,7 @@ fn every_library_has_exactly_the_set() {
             }
         }
     }
-    fail_with(failures, "problems with the stencil libraries");
+    fail_with(&failures, "problems with the stencil libraries");
 }
 
 /// The tests that run code: each shape of the host's variant, three ways.
@@ -817,7 +816,7 @@ mod run {
                 failures.push(failure);
             }
         }
-        fail_with(failures, &format!("stencils (shard {k} of {SHARDS}) differ from Cranelift or the interpreter"));
+        fail_with(&failures, &format!("stencils (shard {k} of {SHARDS}) differ from Cranelift or the interpreter"));
     }
 
     #[test]
@@ -920,5 +919,5 @@ fn every_shape_has_a_function() {
             Err(why) => failures.push(format!("{shape}: {why}")),
         }
     });
-    fail_with(failures, "shapes have no valid function");
+    fail_with(&failures, "shapes have no valid function");
 }

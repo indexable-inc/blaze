@@ -90,8 +90,12 @@ impl Pending {
             return;
         }
         let bytes = &mut shard.bytes;
-        // alloc: the shard's buffer, at most `SHARD_BYTES`, kept from flush to flush
-        bytes.reserve(entry_len);
+        if bytes.capacity() - bytes.len() < entry_len {
+            // alloc: the shard's buffer, at most `SHARD_BYTES`, kept from flush to flush: grown
+            // in a task of the store's tag, as body_store's buffers are, so it counts to `store`
+            // and not to the task whose offer found it full
+            blaze_mem::frame::task(blaze_mem::Tag::Store, |_| bytes.reserve(entry_len));
+        }
         bytes.extend_from_slice(&(entry_len as u32).to_le_bytes());
         bytes.push(match answer {
             Answer::Fails => 0,

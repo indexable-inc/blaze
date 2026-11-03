@@ -90,7 +90,7 @@ pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shap
                         // alloc: the error's message
                         other => return Err(format!("a name in the unknown namespace {other}")),
                     };
-                    out.name(canonical);
+                    out.name(&canonical);
                 }
                 out.u8(part::NAMED);
                 out.u32(pending.named.len() as u32);
@@ -115,9 +115,9 @@ pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shap
                     match reloc.name {
                         RelocName::Func(index) => {
                             let at = place(places, index)?;
-                            out.name(UserExternalName::new(namespace::PLACE, at));
+                            out.name(&UserExternalName::new(namespace::PLACE, at));
                         }
-                        RelocName::Data(index) => out.name(data.name(index)?),
+                        RelocName::Data(index) => out.name(&data.name(index)?),
                         // alloc: the error's message
                         other => return Err(format!("assembly naming {other:?}")),
                     }
@@ -241,7 +241,7 @@ impl Out<'_> {
         self.0.put_bytes_u64(bytes);
     }
 
-    fn name(&mut self, name: UserExternalName) {
+    fn name(&mut self, name: &UserExternalName) {
         self.u32(name.namespace);
         self.u32(name.index);
     }
@@ -340,7 +340,7 @@ impl<'f> Data<'f> {
         out.u32(blob.relocs.len() as u32);
         for &(at, data, addend) in &blob.relocs {
             out.u32(at);
-            out.name(self.name(data.as_u32())?);
+            out.name(&self.name(data.as_u32())?);
             out.u64(addend as u64);
         }
         out.u32(blob.fn_relocs.len() as u32);

@@ -2,9 +2,10 @@
 //! inferred, an anonymous constant by its source, a named one by its path, and values by
 //! rustc's `pretty_print_const_valtree`: byte strings, strings, arrays, tuples, ADTs in
 //! construction syntax, integers as `ConstInt` prints them (`u8::MAX`), `{0x10 as *const T}`
-//! for pointers and `{transmute(..): T}` for the rest. Ported from
-//! `compiler/rustc_middle/src/ty/print/pretty.rs` and `compiler/rustc_middle/src/ty/consts/int.rs`
-//! (MIT or Apache-2.0).
+//! for pointers and `{transmute(..): T}` for the rest. `type_name` prints a `bool`, `char` or
+//! integer value so, and every other spelling a constant as the number it evaluates to.
+//! Ported from `compiler/rustc_middle/src/ty/print/pretty.rs` and
+//! `compiler/rustc_middle/src/ty/consts/int.rs` (MIT or Apache-2.0).
 
 use hir_def::{
     AdtId, VariantId,
@@ -21,11 +22,20 @@ use rustc_apfloat::{
 };
 use rustc_type_ir::{FloatTy, IntTy, UintTy, inherent::IntoKind as _};
 
-use super::{paths::Def, printer::Printer};
+use crate::{
+    def::Def,
+    printer::{NOT_LOOKED_UP, Printer, Spelling},
+};
 
-impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
+impl<'h, 't> Printer<'h, 't> {
     /// rustc's `pretty_print_const`, without the type.
-    pub(crate) fn print_const(&mut self, c: Const<'t>) {
+    pub fn print_const(&mut self, c: Const<'t>) {
+        if self.refused.is_some() {
+            return;
+        }
+        if self.spelling() != Spelling::Diagnostic {
+            return self.print_spelled_const(c);
+        }
         match c.kind() {
             ConstKind::Alias(_, alias) => match alias.kind {
                 AliasConstKind::Projection { def_id: TraitAssocConstId(it) }
@@ -36,11 +46,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 }
                 AliasConstKind::Anon { def_id: AnonConstIdWrapper(it) } => {
                     let loc = it.loc(self.db);
-                    let (_, map) = hir_def::expr_store::ExpressionStore::with_source_map(self.db, loc.owner);
-                    let src = map.expr_syntax(loc.expr).expect("an anonymous constant is written");
-                    let span = self.cx.span(src.map(|it| it.text_range()));
-                    let snippet = self.cx.snippet(&span).expect("a span the context made is in its file");
-                    self.write_str(snippet);
+                    self.host().anon_const_text(loc.owner, loc.expr, &mut *self.out);
                 }
             },
             ConstKind::Infer(_) => self.write_str("_"),
@@ -66,14 +72,29 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
         }
     }
 
+    /// A constant argument outside a diagnostic: to `type_name` a `bool`, `char` or integer
+    /// value as a diagnostic prints it (`true`, `'a'`, `i8::MIN`), else the number the
+    /// constant evaluates to.
+    fn print_spelled_const(&mut self, c: Const<'t>) {
+        if self.spelling() == Spelling::TypeName
+            && let ConstKind::Value(value) = c.kind()
+            && let ValTreeKind::Leaf(leaf) = value.value.inner()
+            && matches!(value.ty.kind(), TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_))
+        {
+            return self.print_scalar_int(*leaf, value.ty);
+        }
+        match hir_ty::consteval::try_const_usize(self.db, c) {
+            Some(value) => self.write_fmt(format_args!("{value}")),
+            None => self.refuse(NOT_LOOKED_UP),
+        }
+    }
+
     /// rustc's `pretty_print_const_valtree`.
     fn print_valtree(&mut self, value: ValueConst<'t>) {
         let ty = value.ty;
         match (value.value.inner(), ty.kind()) {
             (ValTreeKind::Branch(consts), TyKind::Ref(_, inner, _)) => match inner.kind() {
-                TyKind::Slice(elem) if matches!(elem.kind(), TyKind::Uint(UintTy::U8)) => {
-                    self.print_byte_str(*consts)
-                }
+                TyKind::Slice(elem) if matches!(elem.kind(), TyKind::Uint(UintTy::U8)) => self.print_byte_str(*consts),
                 TyKind::Str => {
                     // alloc: a string constant printed, the edge
                     let bytes: Vec<u8> = bytes(*consts).collect();
@@ -85,9 +106,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                     self.print_valtree(ValueConst { ty: inner, value: value.value });
                 }
             },
-            (ValTreeKind::Branch(consts), TyKind::Array(elem, _))
-                if matches!(elem.kind(), TyKind::Uint(UintTy::U8)) =>
-            {
+            (ValTreeKind::Branch(consts), TyKind::Array(elem, _)) if matches!(elem.kind(), TyKind::Uint(UintTy::U8)) => {
                 self.write_str("*");
                 self.print_byte_str(*consts);
             }
@@ -188,7 +207,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
         self.write_str("b\"");
         for byte in bytes(consts) {
             for escaped in std::ascii::escape_default(byte) {
-                self.out_push(escaped as char);
+                self.out.push(escaped as char);
             }
         }
         self.write_str("\"");
@@ -207,8 +226,8 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                     FloatTy::F128 => float(self, Quad::from_bits(bits), "f128"),
                 }
             }
-            TyKind::Int(it) => self.write_str(&const_int(int, true, it == IntTy::Isize)),
-            TyKind::Uint(it) => self.write_str(&const_int(int, false, it == UintTy::Usize)),
+            TyKind::Int(it) => self.write_int(int, Int::Signed(it)),
+            TyKind::Uint(it) => self.write_int(int, Int::Unsigned(it)),
             TyKind::Char if let Ok(c) = char::try_from(int) => self.write_fmt(format_args!("{c:?}")),
             TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::FnPtr(..) => {
                 self.write_fmt(format_args!("{{0x{:x} as ", int.to_bits_unchecked()));
@@ -231,14 +250,18 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
         }
     }
 
-    fn out_push(&mut self, c: char) {
-        let mut buf = [0; 4];
-        self.write_str(c.encode_utf8(&mut buf));
+    fn write_int(&mut self, int: ScalarInt, ty: Int) {
+        match const_int(int, ty) {
+            ConstInt::Min(name) => self.write_fmt(format_args!("{name}::MIN")),
+            ConstInt::Max(name) => self.write_fmt(format_args!("{name}::MAX")),
+            ConstInt::Signed(value) => self.write_fmt(format_args!("{value}")),
+            ConstInt::Unsigned(value) => self.write_fmt(format_args!("{value}")),
+        }
     }
 }
 
 /// `{value}{suffix}`, `_` between for one that is not finite: rustc's float printing.
-fn float<'db: 't, 't, F: rustc_apfloat::Float + std::fmt::Display>(p: &mut Printer<'_, '_, 'db, 't>, value: F, suffix: &str) {
+fn float<F: rustc_apfloat::Float + std::fmt::Display>(p: &mut Printer<'_, '_>, value: F, suffix: &str) {
     let sep = if value.is_finite() { "" } else { "_" };
     p.write_fmt(format_args!("{value}{sep}{suffix}"));
 }
@@ -254,32 +277,42 @@ fn bytes(consts: Consts<'_>) -> impl Iterator<Item = u8> + '_ {
     })
 }
 
-/// rustc's `ConstInt` `Debug`, without the suffix: `i8::MIN`, `usize::MAX`, else the number.
-fn const_int(int: ScalarInt, signed: bool, ptr_sized: bool) -> String {
-    let size = int.size().bytes();
-    let raw = int.to_bits_unchecked();
-    let bits = size * 8;
-    let name = |prefix: char| {
-        // alloc: an integer constant printed, the edge
-        if ptr_sized { format!("{prefix}size") } else { format!("{prefix}{bits}") }
-    };
-    if signed {
-        let min = 1u128 << (bits - 1);
-        let max = min - 1;
-        if raw == min {
-            return format!("{}::MIN", name('i')); // alloc: an integer constant printed, the edge
+/// An integer type, signed or not.
+#[derive(Clone, Copy)]
+enum Int {
+    Signed(IntTy),
+    Unsigned(UintTy),
+}
+
+/// What rustc's `ConstInt` `Debug` prints, without the suffix.
+#[derive(Debug, PartialEq, Eq)]
+enum ConstInt {
+    Min(&'static str),
+    Max(&'static str),
+    Signed(i128),
+    Unsigned(u128),
+}
+
+/// rustc's `ConstInt` `Debug`: `i8::MIN`, `usize::MAX`, else the number. An arbitrary width's
+/// value is sign-extended to its storage: `i3::MIN` is -4.
+fn const_int(int: ScalarInt, ty: Int) -> ConstInt {
+    let storage = int.size().bits();
+    match ty {
+        Int::Signed(it) => {
+            let unused = 128 - it.arbitrary_width().map_or(storage, |it| u64::from(it.bits()));
+            match int.to_int_unchecked() {
+                v if v == i128::MIN >> unused => ConstInt::Min(it.name_str()),
+                v if v == i128::MAX >> unused => ConstInt::Max(it.name_str()),
+                v => ConstInt::Signed(v),
+            }
         }
-        if raw == max {
-            return format!("{}::MAX", name('i')); // alloc: an integer constant printed, the edge
+        Int::Unsigned(it) => {
+            let unused = 128 - it.arbitrary_width().map_or(storage, |it| u64::from(it.bits()));
+            match int.to_uint_unchecked() {
+                v if v == u128::MAX >> unused => ConstInt::Max(it.name_str()),
+                v => ConstInt::Unsigned(v),
+            }
         }
-        let shift = 128 - bits;
-        (((raw << shift) as i128) >> shift).to_string() // alloc: an integer constant printed, the edge
-    } else {
-        let max = if bits == 128 { u128::MAX } else { (1u128 << bits) - 1 };
-        if raw == max {
-            return format!("{}::MAX", name('u')); // alloc: an integer constant printed, the edge
-        }
-        raw.to_string() // alloc: an integer constant printed, the edge
     }
 }
 
@@ -287,17 +320,20 @@ fn const_int(int: ScalarInt, signed: bool, ptr_sized: bool) -> String {
 mod tests {
     use hir_ty::next_solver::ScalarInt;
     use rustc_abi::Size;
+    use rustc_type_ir::{IntTy, UintTy};
 
-    use super::const_int;
+    use super::{ConstInt, Int, const_int};
 
     #[test]
     fn integers_print_as_const_int_does() {
         let size = |n: u64| Size::from_bytes(n);
-        assert_eq!(const_int(ScalarInt::try_from_uint(255u8, size(1)).unwrap(), false, false), "u8::MAX");
-        assert_eq!(const_int(ScalarInt::try_from_uint(7u8, size(1)).unwrap(), false, false), "7");
-        assert_eq!(const_int(ScalarInt::try_from_int(-128i8, size(1)).unwrap(), true, false), "i8::MIN");
-        assert_eq!(const_int(ScalarInt::try_from_int(-3i64, size(8)).unwrap(), true, true), "-3");
-        assert_eq!(const_int(ScalarInt::try_from_int(i64::MAX, size(8)).unwrap(), true, true), "isize::MAX");
-        assert_eq!(const_int(ScalarInt::try_from_uint(u128::MAX, size(16)).unwrap(), false, false), "u128::MAX");
+        let u = |v: u128, n: u64, ty: UintTy| const_int(ScalarInt::try_from_uint(v, size(n)).unwrap(), Int::Unsigned(ty));
+        let i = |v: i128, n: u64, ty: IntTy| const_int(ScalarInt::try_from_int(v, size(n)).unwrap(), Int::Signed(ty));
+        assert_eq!(u(255, 1, UintTy::U8), ConstInt::Max("u8"));
+        assert_eq!(u(7, 1, UintTy::U8), ConstInt::Unsigned(7));
+        assert_eq!(i(-128, 1, IntTy::I8), ConstInt::Min("i8"));
+        assert_eq!(i(-3, 8, IntTy::Isize), ConstInt::Signed(-3));
+        assert_eq!(i(i64::MAX.into(), 8, IntTy::Isize), ConstInt::Max("isize"));
+        assert_eq!(u(u128::MAX, 16, UintTy::U128), ConstInt::Max("u128"));
     }
 }

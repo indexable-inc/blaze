@@ -1,9 +1,6 @@
 //! The identity on the made-up workspace of [`crate::fixture`].
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, path::Path};
 
 use super::*;
 use crate::fixture::{Workspace, env, write};
@@ -109,7 +106,13 @@ fn the_code_is_of_the_contents_alone() {
     let b = Workspace::new("two", true).work_out().unwrap();
     assert_eq!(a.code, b.code);
     assert_eq!(a.listing(), b.listing());
-    assert_eq!(a.crates, ["blaze_item_hash", "front", "hir_ty_codegen", "reg"].into_iter().map(str::to_owned).collect());
+    assert_eq!(
+        a.crates,
+        ["blaze_codegen_code", "blaze_item_hash", "blaze_macro_eval", "front", "hir_def", "hir_ty", "hir_ty_codegen", "reg"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
 }
 
 #[test]
@@ -352,94 +355,191 @@ fn cargo_configuration_above_the_workspace_and_in_cargo_home_is_an_input() {
     assert!(worked.files.contains(&home.join("config.toml")));
 }
 
-/// The trait an `impl` line implements, by its last path segment: `impl<T> a::Hook<T> for X {`
-/// is `Hook`.
-fn implemented(line: &str) -> Option<&str> {
-    let line = line.trim_start();
-    let rest = line.strip_prefix("unsafe ").unwrap_or(line).strip_prefix("impl")?;
-    let (head, _) = rest.split_once(" for ")?;
-    let mut head = head.trim_start();
-    if head.starts_with('<') {
-        let mut depth = 0i32;
-        let end = head.char_indices().find_map(|(at, c)| {
-            depth += i32::from(c == '<') - i32::from(c == '>');
-            (depth == 0).then_some(at)
-        })?;
-        head = &head[end + 1..];
-    }
-    let path = head.split('<').next()?.trim();
-    Some(path.rsplit("::").next().unwrap_or(path))
+fn front_end_after(edit: impl FnOnce(&Path)) -> [u8; 32] {
+    let workspace = Workspace::new("front-end", false);
+    edit(workspace.root());
+    workspace.code_of(&FRONT_END)
 }
 
-/// Test code (a `tests` directory, `tests.rs`, `*_tests.rs`): no part of a program.
-fn is_test(path: &Path) -> bool {
-    path.components().any(|it| it.as_os_str() == "tests")
-        || path.file_name().and_then(|it| it.to_str()).is_some_and(|it| it == "tests.rs" || it.ends_with("_tests.rs"))
-}
-
-/// The `.rs` files of the package at `dir`, but those of packages inside it.
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|it| it.path()).collect();
-    entries.sort();
-    for path in entries {
-        if path.is_dir() {
-            if path.file_name() != Some("target".as_ref()) && !path.join("Cargo.toml").is_file() {
-                rust_files(&path, out);
-            }
-        } else if path.extension() == Some("rs".as_ref()) {
-            out.push(path);
-        }
-    }
-}
-
-/// C1 of the review, held on blaze's own tree: every implementation in the checkout, past its
-/// tests, of a hook the front end or code generator calls through `dyn` is of a package of the
-/// code generator's closure (so an input of its code) or listed, reviewed, in
-/// [`REVIEWED_HOOKS`]; and every listed one of the checkout is still there.
+/// The front end's identity is of the packages the front end is built from, and of how they are
+/// built: an edit of the code generator (`hir-ty-codegen`, its build dependency `reg`) or of
+/// the program keeps it; one of `hir-def`, of what it is built from or of a hook keeps nothing.
 #[test]
-fn every_hook_implemented_past_the_closure_is_reviewed() {
-    let engine = Path::new(env!("CARGO_MANIFEST_DIR")).join("../blaze-engine");
-    let workspace = crate::Workspace::read(&engine).unwrap();
-    let closure = workspace.closure_names().unwrap();
-    assert!(closure.contains("blaze-item-hash"), "blaze-item-hash, installed as `BodyFacts`, is in the closure");
-    let checkout = workspace.checkout();
-    let mut found = BTreeSet::new();
-    let mut unreviewed = Vec::new();
-    for (package, dir) in &checkout {
-        if closure.contains(*package) {
-            continue;
-        }
-        let mut files = Vec::new();
-        rust_files(dir, &mut files);
-        for path in files.iter().filter(|it| !is_test(it.strip_prefix(dir).unwrap())) {
-            let text = std::fs::read_to_string(path).unwrap_or_default();
-            for (at, line) in text.lines().enumerate() {
-                let Some(hook) = implemented(line).and_then(|it| HOOK_TRAITS.iter().find(|hook| **hook == it)) else { continue };
-                found.insert((*package, *hook));
-                if !REVIEWED_HOOKS.iter().any(|it| it.package == *package && it.hook == *hook) {
-                    unreviewed.push(format!("{}:{}: {package} implements `{hook}`", path.display(), at + 1));
-                }
-            }
-        }
+fn the_front_end_is_keyed_by_its_own_code_alone() {
+    let code = front_end_after(|_| {});
+    let kept: [(&str, Box<dyn FnOnce(&Path)>); 3] = [
+        ("the code generator", Box::new(|root| write(root, "crates/hir-ty-codegen/src/lib.rs", "pub fn compile() { }\n"))),
+        ("the code generator's build dependency", Box::new(|root| relock(root, "checksum = \"aa\"", "checksum = \"bb\""))),
+        ("the program's source", Box::new(|root| write(root, "crates/cli/src/main.rs", "fn main() { println!(\"hi\") }\n"))),
+    ];
+    for (what, edit) in kept {
+        assert_eq!(front_end_after(edit), code, "{what} is no input of the front end's code");
     }
-    assert!(
-        unreviewed.is_empty(),
-        "code past the code generator's closure is installed into it: add its package to ROOTS, or review \
-         it into REVIEWED_HOOKS:\n{}",
-        unreviewed.join("\n")
+    let changed: [(&str, Box<dyn FnOnce(&Path)>); 4] = [
+        ("hir-def", Box::new(|root| write(root, "crates/hir-def/src/lib.rs", "pub fn resolve() { }\n"))),
+        ("a package a hook is built from", Box::new(|root| write(root, "crates/front/src/lib.rs", "pub fn lower() { }\n"))),
+        ("a hook (`BodyFacts`)", Box::new(|root| write(root, "crates/blaze-item-hash/src/lib.rs", "pub fn facts() { }\n"))),
+        ("the pinned nightly", Box::new(|root| write(root, "harness/toolchain", "nightly-2026-11-02\n"))),
+    ];
+    for (what, edit) in changed {
+        assert_ne!(front_end_after(edit), code, "{what} is an input of the front end's code");
+    }
+    let workspace = Workspace::new("front-end-built", false);
+    let read = workspace.read().unwrap();
+    let worked = work_out_of(&read, &FRONT_END, &env()).unwrap();
+    assert_eq!(
+        worked.packages,
+        ["blaze-codegen-code", "blaze-item-hash", "blaze-macro-eval", "front", "hir-def", "hir-ty"].into_iter().map(str::to_owned).collect()
     );
-    let stale: Vec<&Hook> = REVIEWED_HOOKS
-        .iter()
-        .filter(|it| checkout.iter().any(|(package, _)| *package == it.package) && !found.contains(&(it.package, it.hook)))
-        .collect();
-    assert!(stale.is_empty(), "reviewed hooks no longer implemented: {stale:?}");
+    let mut other = env();
+    other.vars.insert("CARGO_ENCODED_RUSTFLAGS".to_owned(), Some("-Copt-level=1".to_owned()));
+    assert_ne!(work_out_of(&read, &FRONT_END, &other).unwrap().code, worked.code, "how blaze is built is an input (rule 18)");
+    assert_ne!(worked.code, work_out(&read, &env()).unwrap().code, "each identity is of its own domain");
 }
 
+/// C3 of the fekey review: cargo unifies features across the packages it builds together, so a
+/// package outside an identity's closure that depends on one of it can turn on a feature of it:
+/// `feat`, a registry package only the program uses, depends on `reg`, the code generator's build
+/// dependency; `outside`, a package of the checkout that is no member, on `hir-def`. Its checksum,
+/// or its manifest, is an input of each identity whose closure it reaches, and of none other.
 #[test]
-fn an_impl_line_names_its_trait() {
-    assert_eq!(implemented("impl BodyFacts for Bodies {"), Some("BodyFacts"));
-    assert_eq!(implemented("    impl blaze_codegen::driver::Lookup for Reading<'_> {"), Some("Lookup"));
-    assert_eq!(implemented("impl<'db, T: Into<U>> Prepare<T> for Backends<'db> {"), Some("Prepare"));
-    assert_eq!(implemented("unsafe impl Send for X {}"), Some("Send"));
-    assert_eq!(implemented("impl Bodies {"), None);
+fn a_package_that_can_turn_on_a_feature_of_the_closure_is_an_input() {
+    let (codegen, front_end) = (base(), front_end_after(|_| {}));
+    let feat = |root: &Path| relock(root, &format!("checksum = \"{}\"", fixture::FEAT_CHECKSUM), "checksum = \"ef\"");
+    assert_ne!(code_after(feat), codegen, "`feat` can turn on a feature of `reg`, of the code generator's closure");
+    assert_eq!(front_end_after(feat), front_end, "`feat` reaches nothing of the front end's closure");
+    let outside = |root: &Path| {
+        let features = "[dependencies]\nhir-def = { path = \"../../crates/hir-def\", features = [\"x\"] }\n";
+        write(root, fixture::OUTSIDE_MANIFEST, &fixture::manifest("outside", features));
+    };
+    assert_ne!(front_end_after(outside), front_end, "`outside` can turn on a feature of `hir-def`");
+    assert_ne!(code_after(outside), codegen, "and `hir-def` is of the code generator's closure too");
+    assert_eq!(
+        code_after(|root| write(root, "vendor/outside/src/lib.rs", "pub fn outside() { }\n")),
+        codegen,
+        "what a dependent's code is turns on no feature"
+    );
+    let worked = Workspace::new("dependents", false).work_out().unwrap();
+    assert!(of_kind(&worked, "dependent").keys().any(|it| it.starts_with("feat 1.0.0")), "{}", worked.listing());
+    assert!(of_kind(&worked, "manifest").contains_key(fixture::OUTSIDE_MANIFEST), "{}", worked.listing());
+    assert!(!worked.packages.contains("feat") && !worked.packages.contains("outside"), "a dependent is no package of the closure");
 }
+
+/// C4 of the fekey review: a file outside every package whose reader is not in the closure is an
+/// error naming it, never left out: the identity names it wrongly.
+#[test]
+fn an_extra_whose_reader_is_outside_the_closure_is_an_error() {
+    let wrong = Identity { extra: &[("nowhere", "../../harness/toolchain")], ..FRONT_END };
+    let workspace = Workspace::new("extra-reader", false);
+    let read = workspace.read().unwrap();
+    let why = work_out_of(&read, &wrong, &env()).unwrap_err();
+    assert!(why.contains("`nowhere`") && why.contains("harness/toolchain"), "{why}");
+}
+
+/// M2 of the fekey review: a link to a directory under a directory an identity reads outside
+/// every package is refused, naming it; followed, a link to a directory above it never ends.
+#[cfg(unix)]
+#[test]
+fn a_link_to_a_directory_in_an_extra_is_refused() {
+    let workspace = Workspace::new("extra-link", false);
+    let bridge = workspace.root().join("library/proc_macro/src/bridge");
+    std::os::unix::fs::symlink(&bridge, bridge.join("again")).unwrap();
+    let why = workspace.read().and_then(|read| work_out_of(&read, &FRONT_END, &env())).unwrap_err();
+    assert!(why.contains("again") && why.contains("a link to a directory"), "{why}");
+}
+
+/// One walk for several identities hashes each package once and works out what a walk of each
+/// alone does.
+#[test]
+fn one_walk_for_two_identities_is_each_walk_alone() {
+    let workspace = Workspace::new("walk", false);
+    let read = workspace.read().unwrap();
+    let mut walk = Walk::default();
+    let codegen = walk.work_out(&read, &CODEGEN, &env()).unwrap();
+    let front_end = walk.work_out(&read, &FRONT_END, &env()).unwrap();
+    for (shared, alone) in [(&codegen, work_out(&read, &env()).unwrap()), (&front_end, work_out_of(&read, &FRONT_END, &env()).unwrap())] {
+        assert_eq!(shared.code, alone.code);
+        assert_eq!(shared.listing(), alone.listing());
+        assert_eq!(shared.files, alone.files);
+        assert_eq!(shared.watched, alone.watched);
+    }
+}
+
+/// A package cut from the checkout (published, a Nix unit's source) carries the tree of each
+/// identity ([`ship`]), and its build script works the identity out of it with how it is built:
+/// the identity, inputs and all, a build of the checkout has in the same environment, with the
+/// shipped file the one thing of the tree it reruns on, and nothing of the checkout read again.
+#[test]
+fn a_shipped_tree_works_out_the_identity_the_checkout_does() {
+    let llvm = Workspace::with_llvm("ship-codegen");
+    let solver = Workspace::with_solver("ship-front-end");
+    for (workspace, identity) in [(&llvm, &CODEGEN), (&solver, &FRONT_END)] {
+        let home = workspace.above().join("home");
+        write(&home, "config.toml", "[build]\nrustflags = [\"-Copt-level=1\"]\n");
+        let mut built = env();
+        built.cargo_home = Some(home);
+        let read = workspace.read().unwrap();
+        let checkout = work_out_of(&read, identity, &built).unwrap();
+        let package = workspace.above().join("package");
+        write(&package, identity.shipped, &ship(&read, identity).unwrap());
+        let shipped = package.join(identity.shipped);
+        let from_package = work_out_shipped(&shipped, identity, &built).unwrap();
+        assert_eq!(from_package.listing(), checkout.listing(), "{}: the same inputs", identity.what);
+        assert_eq!(from_package.code, checkout.code, "{}: the same identity", identity.what);
+        assert!(from_package.watched.contains(&shipped), "{:?}", from_package.watched);
+        assert!(!from_package.watched.iter().any(|it| it.starts_with(workspace.root())), "{:?}", from_package.watched);
+        let (here, lock) = work_out_here(&package, &[identity], &built).unwrap();
+        assert_eq!((here[0].code, lock), (checkout.code, None), "{}: the shipped tree, and no lock to rerun on", identity.what);
+        let (here, lock) = work_out_here(&workspace.root().join("crates/cli"), &[identity], &built).unwrap();
+        assert_eq!((here[0].code, lock), (checkout.code, Some(read.lock_path.clone())), "{}: the checkout", identity.what);
+        workspace.write("crates/hir-def/src/lib.rs", "pub fn resolve() { /* edited after shipping */ }\n");
+        assert_eq!(work_out_shipped(&shipped, identity, &built).unwrap().code, checkout.code, "{}: of the tree shipped", identity.what);
+        assert_ne!(work_out_of(&workspace.read().unwrap(), identity, &built).unwrap().code, checkout.code);
+    }
+    let other = Workspace::new("ship-other", false);
+    let read = other.read().unwrap();
+    let wrong = other.above().join(FRONT_END.shipped);
+    write(other.above(), FRONT_END.shipped, &ship(&read, &CODEGEN).unwrap());
+    let refused = work_out_shipped(&wrong, &FRONT_END, &env()).unwrap_err();
+    assert!(refused.contains(CODEGEN.domain) && refused.contains(FRONT_END.domain), "{refused}");
+}
+
+/// A program with neither a checkout nor a shipped tree is refused, naming both: no identity
+/// stands in for one (AGENTS.md rule 3).
+#[test]
+fn no_checkout_and_no_shipped_tree_is_refused_naming_both() {
+    let workspace = Workspace::new("nothing", false);
+    let alone = workspace.above().join("alone");
+    write(&alone, "Cargo.toml", "[package]\nname = \"alone\"\nversion = \"0.1.0\"\n");
+    let refused = work_out_here(&alone, &[&CODEGEN, &FRONT_END], &env()).unwrap_err();
+    assert!(refused.contains("no checkout"), "{refused}");
+    assert!(refused.contains(CODEGEN.shipped), "{refused}");
+}
+
+/// The trait solver is of the front end's identity: an edit of its source, its patch series or a
+/// patch is another identity (every stored answer misses), one of its tests keeps it.
+#[test]
+fn the_vendored_solver_is_of_the_front_ends_identity() {
+    let after = |edit: &dyn Fn(&Workspace)| {
+        let workspace = Workspace::with_solver("solver");
+        edit(&workspace);
+        workspace.code_of(&FRONT_END)
+    };
+    let code = after(&|_| {});
+    let (source, text) = fixture::SOLVER_SOURCE;
+    let changed: [(&str, &dyn Fn(&Workspace)); 3] = [
+        ("its source", &|it| it.write(source, &format!("{text}// another rule\n"))),
+        ("its patch series", &|it| it.write("vendor/rustc_next_trait_solver/PATCHES.md", "# Patches\n")),
+        ("a patch", &|it| it.write("vendor/rustc_next_trait_solver/patches/0001-one.patch", "--- a\n+++ c\n")),
+    ];
+    for (what, edit) in changed {
+        assert_ne!(after(edit), code, "the solver's {what} is an input of the front end's code");
+    }
+    assert_eq!(after(&|it| it.write("vendor/rustc_next_trait_solver/tests/it.rs", "#[test] fn other() {}\n")), code);
+    let workspace = Workspace::with_solver("solver-files");
+    let worked = work_out_of(&workspace.read().unwrap(), &FRONT_END, &env()).unwrap();
+    assert!(worked.packages.contains("rustc_next_trait_solver"), "{:?}", worked.packages);
+    assert!(worked.files.contains(&workspace.root().join(source).canonicalize().unwrap()), "{:?}", worked.files);
+}
+
+mod hooks;

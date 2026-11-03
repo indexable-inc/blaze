@@ -555,6 +555,11 @@ pub fn offer_passed(db: &Db, def: DefWithBodyId, checker: &'static str, reads: O
 /// identities and facts, `build`, the content ID of the front end's code (what the goal store is
 /// given), and what a hit does. Until the guard is dropped, every lookup and offer of `db` goes
 /// to it; what was offered and not flushed is dropped with it.
+///
+/// `build` must be the identity of all of the front end's code and of how it was built, as the
+/// driver's is (blaze-cargo `serve/unit/deps.rs`, `front_end`, `blaze_codegen_code::FRONT_END`):
+/// inference, MIR and borrow check results are a function of hir-ty, the vendored solver and
+/// how they are built, all of which that identity is of, and nothing else in a key names them.
 pub fn install(
     db: &Db,
     // dyn: the driver's store, kept by the item store (see `Store::images`)

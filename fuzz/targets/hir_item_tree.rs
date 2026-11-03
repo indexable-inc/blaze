@@ -200,7 +200,7 @@ fn tree(words: &Words, tables: [u32; 5], c: &Columns) -> Valid {
     columns.into_iter().for_each(|column| root.slice(column));
     root.words(&placed);
     tables.into_iter().for_each(|at| root.u32(at));
-    build.finish(root)
+    build.finish(&root)
 }
 
 fn ctx() -> u32 {

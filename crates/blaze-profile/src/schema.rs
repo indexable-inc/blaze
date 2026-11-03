@@ -249,12 +249,37 @@ pub const EVENTS: Table = Table {
     ],
 };
 
+/// One row a sum of short spans: those of a site, root or not, that a thread closed in a stretch
+/// of up to `flight::FOLD_AGE`, each shorter than `flight::FOLD_BELOW`, named by no other row
+/// and saying no typed column, folded instead of written one row each (`flight::fold_below`).
+pub const FOLDED: Table = Table {
+    name: "folded",
+    doc: "one row a sum of a site's short spans (under 5 us, named by no row) a thread closed in a stretch, kept as a sum instead of a row each",
+    columns: &[
+        BUILD_ID,
+        PROCESS,
+        THREAD,
+        THREAD_NAME,
+        col("name", Type::Dict, "the spans' name, as `spans.name`"),
+        col("target", Type::Dict, "their tracing target, as `spans.target`"),
+        col("root", Type::U32, "1 when they were roots (depth 0: a worker's own work between jobs, which `uncovered_per_worker` counts as covered), else 0"),
+        col("from_ns", Type::I64, "when the first began"),
+        col("to_ns", Type::I64, "when the last closed"),
+        col("spans", Type::U64, "how many were folded"),
+        col("dur_ns", Type::I64, "their durations summed"),
+        col("max_dur_ns", Type::I64, "the longest"),
+        opt("self_cpu_ns", Type::I64, "their self CPU summed, as `spans.self_cpu_ns`; null when not counted"),
+        opt("alloc_bytes", Type::U64, "bytes their thread allocated while they were open, summed"),
+        opt("allocs", Type::U64, "allocations made while they were open, summed"),
+    ],
+};
+
 /// One row a build request.
 pub const BUILDS: Table = Table {
     name: "builds",
     doc: "one row a build request the daemon ran",
     columns: &[
-        col("build_id", Type::U64, "the build's number, unique in the daemon's store"),
+        col("build_id", Type::U64, "the build's number, unique in the history: a daemon numbers its builds past every build its files hold rows of"),
         opt("commit", Type::Utf8, "the workspace's commit, when it is a git checkout"),
         col("workspace", Type::Utf8, "the workspace's root"),
         col("command", Type::Utf8, "what was asked: build, test, run, check, with the arguments"),
@@ -271,6 +296,11 @@ pub const BUILDS: Table = Table {
             "the digest of the workspace's source tree when the build ended, as `blaze-v2-proof tree` makes it (target/ and .git/ left out); null for a build of no directory",
         ),
         opt("blaze", Type::Utf8, "the BLAKE3 hash of the blaze executable that ran it"),
+        opt(
+            "process",
+            Type::U32,
+            "the daemon's process id: a build's row with outcome running and no row after it is one its daemon never ended, which died if that process no longer writes the history; null in rows of a blaze before it",
+        ),
     ],
 };
 
@@ -384,10 +414,11 @@ pub const JOB_TILES: Table = Table {
 };
 
 /// The spans each thread is inside now, not yet rows of `spans`: what the live feed sends
-/// beside the rows that closed.
+/// beside the rows that closed, and what each flush of the history that wrote rows also writes,
+/// so the history of a daemon that died says what it was inside at its last flush.
 pub const OPEN: Table = Table {
     name: "open",
-    doc: "one row a span a live thread is inside now, outermost first",
+    doc: "one row a span a live thread was inside when the threads were read (`read_ns`), outermost first",
     columns: &[
         PROCESS,
         THREAD,
@@ -401,6 +432,7 @@ pub const OPEN: Table = Table {
         opt("unit", Type::Utf8, "the codegen unit it is of, as in `spans`"),
         opt("awaits", Type::Utf8, "what a wait waits for, as in `spans`"),
         opt("owner", Type::U64, "who runs what it waits for, as in `spans`"),
+        col("read_ns", Type::I64, "when the threads were read: one value a reading"),
     ],
 };
 
@@ -417,7 +449,7 @@ pub const ERRORS: Table = Table {
         col(
             "kind",
             Type::Dict,
-            "a stable code: rustc's (E0277) or a deny lint's name, else blaze's: derive-panic, attr-panic, macro-panic, expand-failed, link-native-missing, link-failed, template-refs, refused, daemon-panic, uncoded",
+            "a stable code: rustc's (E0277) or a deny lint's name, else blaze's: derive-panic, attr-panic, macro-panic, expand-failed, link-native-missing, link-failed, template-refs, refused, daemon-panic, blaze-bug (a site of a bug the daemon went on past: `function` its value kind, `message` what and how often, `detail` the first report's thread and stack), uncoded",
         ),
         opt("function", Type::Utf8, "the function or instance it is of: a refused instance, a panicking proc macro"),
         col("message", Type::Utf8, "its first line"),
@@ -465,8 +497,7 @@ pub const QUERY_COUNTS: Table = Table {
         col("verified", Type::U64, "its rows proved unchanged without running"),
         col("reran", Type::U64, "of its runs, those in a view the row had already run in"),
         col("evicted_asked", Type::U64, "of its runs, those for a value evicted earlier and asked for again: what eviction cost"),
-        col("evicted", Type::U64, "its values a sweep let go past its cap"),
-        col("refused", Type::U64, "of those, the ones recency alone would have kept: admissions the frequency rule refused"),
+        col("evicted", Type::U64, "its values a pass let go to keep its tag's values under their budget"),
         col("dropped", Type::U64, "its values an explicit `evict_values` or `evict_values_of` let go"),
     ],
 };
@@ -659,7 +690,7 @@ pub const PERF_FUNCTIONS: Table = Table {
 };
 
 /// Every table the history and the live feed hold.
-pub const TABLES: [&Table; 21] = [
+pub const TABLES: [&Table; 23] = [
     &SPANS,
     &COUNTERS,
     &EVENTS,
@@ -681,10 +712,12 @@ pub const TABLES: [&Table; 21] = [
     &MISSES,
     &PERF_RUNS,
     &PERF_FUNCTIONS,
+    &OPEN,
+    &FOLDED,
 ];
 
 /// The tables that are results, made on request and not kept.
-pub const RESULTS: [&Table; 3] = [&TILES, &JOB_TILES, &OPEN];
+pub const RESULTS: [&Table; 2] = [&TILES, &JOB_TILES];
 
 #[cfg(test)]
 mod tests {

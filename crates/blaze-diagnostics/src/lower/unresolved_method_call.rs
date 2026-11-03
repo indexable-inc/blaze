@@ -890,8 +890,7 @@ pub(crate) fn valid_traits(
     let for_access = |diag: &mut Diag, mut message: String, suggs: Vec<String>| {
         // alloc: the error's text, for an error hir found
         message += &format!("; perhaps you want to import {}", if suggs.len() == 1 { "it" } else { "one of them" });
-        // clone: on the error path, for an error hir found
-        diag.suggestions(span.clone(), message, suggs, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
+        diag.suggestions(&span, message, suggs, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
     };
     let for_privacy = |diag: &mut Diag, suggs: Vec<String>| {
         let this_trait_is = match suggs.as_slice() {
@@ -905,8 +904,7 @@ pub(crate) fn valid_traits(
         if suggs.len() == 1 {
             diag.help(message);
         } else {
-            // clone: on the error path, for an error hir found
-            diag.suggestions(span.clone(), message, suggs, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
+            diag.suggestions(&span, message, suggs, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
         }
     };
     if accessible.is_empty() {

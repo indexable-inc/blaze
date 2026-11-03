@@ -96,14 +96,14 @@ fn mutate(tc: &TestCase, bytes: &mut Vec<u8>) {
     }
 }
 
-fn writes_and_reads_as_the_reference_does(tc: TestCase) {
-    let shape = shape(&tc, 4);
+fn writes_and_reads_as_the_reference_does(tc: &TestCase) {
+    let shape = shape(tc, 4);
     let new = to_vec(&shape);
     assert_eq!(new, reference::to_vec(&shape), "{shape:?}");
     if let Ok(mut bytes) = new {
         check(&bytes).unwrap();
         same_reading(&bytes);
-        mutate(&tc, &mut bytes);
+        mutate(tc, &mut bytes);
         same_reading(&bytes);
     }
 }
@@ -117,5 +117,5 @@ fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
 /// `HEGEL_TEST_CASES=<n>` runs it longer.
 #[test]
 fn every_shape_writes_and_reads_as_the_reference_does() {
-    run_cases(500, writes_and_reads_as_the_reference_does);
+    run_cases(500, |tc| writes_and_reads_as_the_reference_does(&tc));
 }

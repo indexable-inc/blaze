@@ -71,6 +71,9 @@ thin-vec.workspace = true
 blaze-check.workspace = true
 
 [dev-dependencies]
+# The stores' key tests work out the front end's identity of a fixture before and after a solver
+# source edit (`blaze_codegen_code::fixture`).
+blaze-codegen-code.workspace = true
 blaze-alloc-count.workspace = true
 crossbeam-channel.workspace = true
 expect-test.workspace = true

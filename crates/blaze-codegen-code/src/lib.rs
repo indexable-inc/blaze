@@ -5,6 +5,26 @@
 //! An edit outside the code generator's packages (the CLI, the daemon, the lints) keeps it, so a
 //! rebuilt blaze reads the templates the last one kept.
 //!
+//! The same walk works out the front end's code identity ([`FRONT_END`]), which blaze-engine's
+//! build script sets as `BLAZE_FRONT_END_CODE` beside it ([`emit_all`], one walk for both) and
+//! what the front end computes once for everyone is stored by: dependency crates' images, their
+//! check outcomes, checked bodies and constants, the goal and item stores, and kept proc-macro
+//! expansions (blaze-cargo's `serve::unit::deps::front_end`). An edit outside the front end's
+//! packages (the code generator, the CLI, the daemon, the lints) keeps it, so a rebuilt blaze
+//! serves the front end the last one stored. The trait solver is of it (hir-ty is built from the
+//! vendored `rustc_next_trait_solver`, `rustc_type_ir` and `rustc_type_ir_macros`, their
+//! `PATCHES.md` and patches among their files), so a solver edit misses every stored answer. Each
+//! is an [`Identity`]; [`emit_of`], [`emit_all`] and [`work_out_of`] take them. Only the program's
+//! build script works one out: no library of the front end has one, so an edit of the lock or of a
+//! vendored file reruns no build script but the program's, and recompiles the program alone.
+//!
+//! A package cut from the checkout (published, or a Nix unit's source) has no checkout to work an
+//! identity out of. The checkout ships what of it the checkout alone decides with the package
+//! ([`Tree`], [`Identity::shipped`], written by the `ship-code-identity` tool), and the program's
+//! build script finishes it with how it is built ([`work_out_shipped`]): the identity a build of
+//! the checkout in that environment has. With neither a checkout nor a shipped tree the build is
+//! refused, naming both ([`work_out_here`]).
+//!
 //! It is of every input the code generator's code is built from ([`Worked::inputs`] lists each):
 //!
 //! 1. Every package the [`ROOTS`] the program links are built from: their normal and build
@@ -20,9 +40,13 @@
 //! 2. Every manifest of the workspace's members, the root's and that of each workspace a package
 //!    of the checkout inherits from: features one package turns on in another, profiles,
 //!    patches; and cargo's configuration files (`.cargo/config.toml`, or `.cargo/config`) in the
-//!    workspace's root and every directory above it, and in `$CARGO_HOME`. Not seen: `--config`
-//!    on cargo's command line, and a configuration file made later where there was none (a build
-//!    script is rerun only on files that exist).
+//!    workspace's root and every directory above it, and in `$CARGO_HOME`. And every package
+//!    outside the closure that depends on one of it by any edge of the lock, at any depth: cargo
+//!    unifies features across the packages it builds together, so each can turn on a feature of
+//!    the closure's; a registry one by its checksum, one of the checkout by its manifest. Not
+//!    seen: `--config` on cargo's command line, which packages one cargo command builds together
+//!    (`-p`, `--workspace`, `--features a/b`), and a configuration file made later where there was
+//!    none (a build script is rerun only on files that exist).
 //! 3. The files outside every package that the packages read ([`EXTRA`]) and the variables
 //!    they or their build scripts read ([`READ_ENV`]).
 //! 4. The stencil libraries, when blaze-stencil is a package of the closure: each by the id its
@@ -51,14 +75,18 @@
 //! built with ([`unkeyed_env`]).
 //!
 //! An input that can't be read stops the build with an error naming it, never a coarser key
-//! (AGENTS.md rule 3). hir-ty-codegen's test `the_code_identity_hashes_every_input_the_code_generator_read`
-//! holds the list to what rustc says each package read (its dep-info) and to what each package's
-//! build script said it reads (`rerun-if-env-changed`, `rerun-if-changed`).
+//! (AGENTS.md rule 3). [`coverage::hold`] holds the list to what rustc says each package read
+//! (its dep-info) and to what each package's build script said it reads
+//! (`rerun-if-env-changed`, `rerun-if-changed`): hir-ty-codegen's test
+//! `the_code_identity_hashes_every_input_the_code_generator_read` for [`CODEGEN`], blaze-cargo's
+//! `the_front_end_identity_hashes_every_input_the_front_end_read` for [`FRONT_END`].
 //!
-//! Code outside the closure that the code generator or front end runs through `dyn` hooks: what
-//! shapes the code generator's output is a root ([`ROOTS`]); the rest is listed in
-//! [`REVIEWED_HOOKS`], each with why it can't change the bytes made, and a test holds every
-//! implementation of a hook trait in the checkout to one or the other.
+//! Code outside the closure that the code generator or front end runs through hooks: what
+//! shapes the identity's values is a root ([`Identity::roots`]); the rest is listed in
+//! [`Identity::reviewed`], each with why it can't change them, and a test holds every
+//! implementation, in a package the program links, of a hook trait to one or the other: the
+//! traits [`Identity::hooks`] lists, and every trait of the closure's packages that they name
+//! `dyn`.
 //!
 //! The window it leaves, accepted (AGENTS.md rule 19): the build script hashes the tree once,
 //! and cargo compiles the closure's crates before or after it. A file saved in the live tree
@@ -69,11 +97,22 @@
 //! edited is open; working the identity out again over the exact tree a checkpoint or landing
 //! built and comparing it with the binary's closes that (indexable-inc/blaze#1619).
 //!
+//! What a build script reruns on is exactly what is hashed ([`Worked::watched`]), so an edit of a
+//! package's `tests/`, `benches/`, `examples/` or a dotfile reruns nothing (cargo has no early
+//! cutoff: a rerun recompiles the package and everything after it). cargo watches a directory
+//! only whole, so a directory holding a skipped entry (a package's root, which mostly holds
+//! `tests/`) is watched by its files and its whole subdirectories, and a file newly made right in
+//! it is hashed only when something else reruns the script; the same comparison over the exact
+//! tree closes that. Code reaches a new file only through an edit of one already watched, but
+//! for a `build.rs` cargo finds by itself. The lock is watched whole: cargo can't watch the lines
+//! of the closure's packages alone.
+//!
 //! TEMPORARY in its granularity: a whole package is one input, so an edit anywhere in a package
 //! of the code generator misses every template. It is replaced by the code generator's
 //! behaviour identity, `core::reflect::fn_info(<codegen entry>).code_id`, once const eval
 //! answers `fn_info` (docs/v2/plan/design/code-identity.md, "Toolchain::id").
 
+pub mod coverage;
 pub mod fixture;
 #[cfg(test)]
 mod tests;
@@ -113,6 +152,203 @@ pub const ROOTS: &[Root] = &[
     },
 ];
 
+/// One content identity a build script works out over a closure of packages ([`work_out_of`],
+/// [`emit_of`]): the code generator's ([`CODEGEN`]) or the front end's ([`FRONT_END`]). One
+/// formula and one walk of the checkout for both, so what a package's files are, how a registry
+/// package is keyed and which saves are refused are the same rule everywhere.
+#[derive(Debug)]
+pub struct Identity {
+    /// What it is, for errors: "the code generator's code identity".
+    pub what: &'static str,
+    /// The domain of the identity; another formula is another domain.
+    pub domain: &'static str,
+    /// The variable the build script sets to the identity's hex.
+    pub env: &'static str,
+    /// The packages whose closure it is of, when the program links them.
+    pub roots: &'static [Root],
+    /// The root the program must link: without it there is nothing to identify.
+    pub required: &'static str,
+    /// Files outside every package that the closure reads: the package that reads it and the
+    /// path relative to that package's directory. A directory is every file under it, but those
+    /// of a dot name, so a file added to it is an input with no list to keep.
+    pub extra: &'static [(&'static str, &'static str)],
+    /// Whether how the program is built is an input too: the workspace's manifests and cargo's
+    /// configuration, the stencil libraries, LLVM, the build's variables and the compiler
+    /// (steps 2, 4, 5 and 6 of the crate doc). Without them the identity is of the closure's
+    /// sources alone, and a test can work it out again over the tree with nothing but the tree.
+    pub how_built: bool,
+    /// The file in `OUT_DIR` [`emit_of`] lists the inputs in.
+    pub listing: &'static str,
+    /// The file a package cut from the checkout carries its [`Tree`] in, beside its manifest
+    /// ([`ship`], [`work_out_here`]).
+    pub shipped: &'static str,
+    /// The hook traits defined in the closure whose implementations past it the test checks,
+    /// besides every trait of the closure it names `dyn`, which the test finds itself: each
+    /// implementation in a package the program links is in the closure, or in `reviewed`.
+    pub hooks: &'static [&'static str],
+    /// Implementations of a hook past the closure, reviewed: none changes the identity's values.
+    pub reviewed: &'static [Hook],
+}
+
+/// The code generator's code identity: what stored templates are keyed by.
+pub const CODEGEN: Identity = Identity {
+    what: "the code generator's code identity",
+    domain: DOMAIN,
+    env: ENV,
+    roots: ROOTS,
+    required: CODE_GENERATOR,
+    extra: EXTRA,
+    how_built: true,
+    listing: "codegen-code-inputs.txt",
+    shipped: "shipped-codegen-code.txt",
+    hooks: HOOK_TRAITS,
+    reviewed: REVIEWED_HOOKS,
+};
+
+/// The packages whose code computes what the front end stores for everyone, when the program
+/// links them, and so every package they are built from: hir-expand, hir-ty-mir and the borrow
+/// checker, base-db, the trait solver, proc-macro-api's server and Wasmtime among them.
+///
+/// Not a root: blaze-lints, whose clippy lints run on a checked crate after its check outcome is
+/// kept (blaze-cargo's `compile::bodies` keeps it before `linted`), so what they find is in the
+/// unit's record alone, which is keyed by the whole executable; the code generator; and
+/// blaze-cargo, which drives the front end and keeps what it made by the keys it made.
+pub const FRONT_END_ROOTS: &[Root] = &[
+    Root {
+        package: "hir-def",
+        why: "resolves every crate: its def map, lang items and signatures are the dependency \
+              images (`hir_def::deps`), and through hir-expand it expands every macro",
+    },
+    Root {
+        package: "hir-ty",
+        why: "type checks and infers: the checked bodies (`body_store`), constants \
+              (`consteval::deps`) and trait goals' answers (`next_solver::goal_store`) are its",
+    },
+    Root {
+        package: "blaze-diagnostics",
+        why: "checks a crate (`check_planned`): its diagnostics are the check outcome kept for a \
+              dependency crate (`blaze_diagnostics::cache`)",
+    },
+    Root {
+        package: "blaze-items",
+        why: "`goals::Goals` is installed as `hir_ty::next_solver::goal_store::GoalFacts` (blaze-cargo \
+              serve/unit/deps.rs): the facts every kept answer is checked against",
+    },
+    Root {
+        package: "blaze-item-hash",
+        why: "`Bodies` is installed as `hir_ty::body_store::BodyFacts` (blaze-cargo \
+              serve/unit/deps.rs): its identities and facts choose the bodies the item store keeps",
+    },
+    Root {
+        package: "blaze-lower",
+        why: "lowers cargo's units into the front end's database: the crates, files, cfgs and \
+              variables every image is resolved from, and `serve_deps` and `store_deps` (hir-def's \
+              serve and store)",
+    },
+    Root {
+        package: "blaze-macro-eval",
+        why: "runs proc macros (`Evaluated`, installed as hir-expand's `ProcMacroExpander`): \
+              what a macro expands to is in every image of a crate that calls it, and is the \
+              kept expansion itself (`proc_macro_api::kept`)",
+    },
+];
+
+/// Every identity a build script of the checkout works out: what the `ship-code-identity` tool
+/// ships with a package cut from it.
+pub const IDENTITIES: &[&Identity] = &[&CODEGEN, &FRONT_END];
+
+/// The front end's code identity: what the values the front end computes once for everyone are
+/// stored by (blaze-cargo's `serve::unit::deps::front_end`): dependency crates' images, their
+/// check outcomes, checked bodies and constants, trait goals' answers, the item store and kept
+/// proc-macro expansions. Of every package [`FRONT_END_ROOTS`] are built from and how blaze is
+/// built (`how_built`), as [`CODEGEN`] is, so an edit of the code generator, the CLI, the daemon
+/// or the lints keeps every value stored.
+///
+/// Finer for images alone is not clean: what a crate resolves to is a function of what its
+/// macros expand to, and the proc-macro engine (blaze-macro-eval) is built from hir-ty and
+/// blaze-lower, so the closure of hir-def's and the engine's packages leaves out only
+/// blaze-diagnostics and blaze-item-hash, and the check outcomes stored under the images' keys
+/// would then need this identity in a key of their own.
+pub const FRONT_END: Identity = Identity {
+    what: "the front end's code identity",
+    domain: "blaze v2 front end code 1",
+    env: "BLAZE_FRONT_END_CODE",
+    roots: FRONT_END_ROOTS,
+    required: "hir-def",
+    extra: FRONT_END_EXTRA,
+    how_built: true,
+    listing: "front-end-code-inputs.txt",
+    shipped: "shipped-front-end-code.txt",
+    hooks: FRONT_END_HOOKS,
+    reviewed: FRONT_END_REVIEWED,
+};
+
+/// Files outside every package that the front end's closure reads (dep-info says so,
+/// `blaze_cargo`'s `front_end_identity` test), and the pinned nightly: the nightly the vendored
+/// trait solver is synced from (vendor/rustc_next_trait_solver/PATCHES.md), so a toolchain bump
+/// is another solver even before its sources are synced; and the pinned nightly's proc-macro
+/// bridge, which blaze-macro-eval serves, by its directory.
+pub const FRONT_END_EXTRA: &[(&str, &str)] = &[
+    ("hir-ty", "../../harness/toolchain"),
+    ("blaze-macro-eval", "../../library/proc_macro/src/bridge"),
+];
+
+/// The front end's hook traits past [`FRONT_END`]'s closure: every trait of the closure it names
+/// `dyn` (the test finds them: `ImageStore`, `Held`, `ProcMacroExpander`, `BodyFacts`,
+/// `GoalFacts`, `Tree`, ...), and the MIR evaluator's machine, generic, which constants are
+/// evaluated through.
+pub const FRONT_END_HOOKS: &[&str] = &["Machine", "Foreign"];
+
+/// Implementations of the front end's hooks past its closure, reviewed: none changes a value
+/// the front end stores.
+pub const FRONT_END_REVIEWED: &[Hook] = &[
+    Hook {
+        package: "blaze-cargo",
+        hook: "ImageStore",
+        why: "`Images` gets and puts, by key, the images and other values the front end makes, \
+              and works out again what a kept expansion read (`reads_now`) for hir-def to check an \
+              image still holds: a store, which makes no value",
+    },
+    Hook { package: "blaze-cargo", hook: "Held", why: "`InStore` holds the bytes of an image read from the store" },
+    Hook {
+        package: "blaze-cargo",
+        hook: "Builder",
+        why: "`Jobs` builds what a session of blaze-api asks for: the front end runs no session \
+              (blaze-diagnostics is built from blaze-api for its `Diagnostic` alone)",
+    },
+    Hook {
+        package: "blaze-cargo",
+        hook: "Local",
+        why: "`Once` carries the one-shot build's frames to the daemon in its own process: the \
+              front end sends none",
+    },
+    Hook {
+        package: "blaze-engine",
+        hook: "Tree",
+        why: "`ProbeFiles` gives a `rustc` probe's files by their content: an image is keyed by \
+              its crate's files' content (`hir_def::deps::key`)",
+    },
+    Hook {
+        package: "blaze-wasm-pack",
+        hook: "ProcMacroExpander",
+        why: "`Recorder` gives what the expander it wraps gives, unchanged, keeping a copy; \
+              `Replay` is made only by `Pack::project`, for blaze-wasm, which stores no front-end \
+              value",
+    },
+    Hook {
+        package: "hir-ty-codegen",
+        hook: "Profiler",
+        why: "`Untimed` is Cranelift's profiler of a thread that reads no clock: it times passes \
+              and makes nothing",
+    },
+    Hook {
+        package: "hir-ty-ub",
+        hook: "Machine",
+        why: "`Checker` runs `blaze test --ub`'s tests: what it finds is the test run's outcome, \
+              in the unit's record; no constant the front end stores is evaluated with it",
+    },
+];
+
 /// A `dyn` hook of the front end or code generator, implemented past the closure by code that
 /// can't change the bytes the code generator makes.
 #[derive(Debug)]
@@ -138,6 +374,7 @@ pub const HOOK_TRAITS: &[&str] = &[
     "Prepare",
     "Hashes",
     "SymbolResolver",
+    "Machine",
 ];
 
 /// Implementations of [`HOOK_TRAITS`] past the closure, reviewed: none changes the bytes made.
@@ -173,6 +410,30 @@ pub const REVIEWED_HOOKS: &[Hook] = &[
               the instance key hashes",
     },
     Hook { package: "blaze-wasm", hook: "Lookup", why: "`Stored` reads templates by key from its own store" },
+    Hook {
+        package: "blaze-macro-eval",
+        hook: "Foreign",
+        why: "`Host` answers the bridge calls of a proc macro the MIR evaluator runs: what the \
+              macro expands to is source of the HIR, which the instance key hashes",
+    },
+    Hook {
+        package: "blaze-engine",
+        hook: "Tree",
+        why: "`ProbeFiles` gives a `rustc` probe's files by their content: what the code \
+              generator compiles of them is keyed by the HIR made of it",
+    },
+    Hook {
+        package: "blaze-usercode",
+        hook: "Confine",
+        why: "`Launcher` starts a user program (a build script, a test) in blaze's sandbox: the \
+              code generator starts none",
+    },
+    Hook {
+        package: "hir-ty-ub",
+        hook: "Machine",
+        why: "`Checker` runs `blaze test --ub`'s tests: no constant the code generator compiles \
+              is evaluated with it",
+    },
 ];
 
 /// The variable the build script sets to the identity's hex.
@@ -261,7 +522,8 @@ pub fn unkeyed_env(name: &str) -> Option<&'static str> {
 /// One input of the identity.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Input {
-    /// What it is: `package`, `manifest`, `file`, `stencils`, `llvm`, `env`, `compiler`.
+    /// What it is: `package`, `dependent`, `manifest`, `file`, `stencils`, `llvm`, `env`,
+    /// `compiler`.
     pub kind: &'static str,
     /// Which: a package's `name version source`, a path relative to the workspace, a stencil
     /// library's file, a library's name, a variable's name.
@@ -280,7 +542,8 @@ pub struct Stamp {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Worked {
     pub code: [u8; 32],
-    /// In the order hashed: packages, manifests, files, stencils, LLVM, variables, the compiler.
+    /// In the order hashed: packages, dependents, manifests, files, stencils, LLVM, variables,
+    /// the compiler.
     pub inputs: Vec<Input>,
     /// Every file hashed, by its absolute path: what the coverage check holds rustc's reads to.
     pub files: BTreeSet<PathBuf>,
@@ -289,6 +552,12 @@ pub struct Worked {
     pub stamps: BTreeMap<PathBuf, Stamp>,
     /// The directories of the packages of the checkout that are inputs.
     pub dirs: Vec<PathBuf>,
+    /// What a build script reruns on besides the lock ([`emit_of`]): exactly what is hashed. Of
+    /// a package of the checkout, each directory all of whose files, at any depth, are hashed,
+    /// whole, and each other file hashed by itself, so an edit of a skipped `tests/`, `benches/`,
+    /// `examples/` or dotfile reruns nothing; each directory [`Identity::extra`] names, whole; and
+    /// every other file hashed outside the packages.
+    pub watched: Vec<PathBuf>,
     /// The registry packages that are inputs (by their checksum), by name and version.
     pub registry: Vec<(String, String)>,
     /// Every package that is an input, by name.
@@ -319,8 +588,13 @@ impl Worked {
     /// The files hashed or parsed and the directories listed that are not now what they were
     /// when read (or are gone): saved while the identity was worked out, so it is of no one tree.
     pub fn changed(&self) -> Vec<PathBuf> {
-        self.stamps.iter().filter(|(path, was)| stamp(path).ok() != Some(**was)).map(|(path, _)| path.clone()).collect()
+        changed(&self.stamps)
     }
+}
+
+/// The paths of `stamps` that are not now what they were (or are gone).
+fn changed(stamps: &BTreeMap<PathBuf, Stamp>) -> Vec<PathBuf> {
+    stamps.iter().filter(|(path, was)| stamp(path).ok() != Some(**was)).map(|(path, _)| path.clone()).collect()
 }
 
 /// The hex of `bytes`, lowercase.
@@ -333,28 +607,48 @@ pub fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// What a build script does: works the identity out for the package being built
-/// (`CARGO_MANIFEST_DIR`, the program) in its workspace, prints
-/// `cargo:rustc-env=BLAZE_CODEGEN_CODE=<hex>` and what to rerun on, and writes the listing of its
-/// inputs to `OUT_DIR/codegen-code-inputs.txt`. An input that can't be had, or a file that
-/// changed while it was hashed, is one `cargo::error` naming it, and the build stops.
+/// What a build script does: works the code generator's identity out ([`CODEGEN`], [`emit_of`]).
 pub fn emit() {
-    match emitted() {
-        Ok(()) => {}
-        Err(why) => {
-            println!("cargo::error=the code generator's code identity ({ENV}): {}", why.replace('\n', " "));
-        }
+    emit_of(&CODEGEN);
+}
+
+/// What a build script does: works `identity` out for the package being built
+/// (`CARGO_MANIFEST_DIR`, the program) in its workspace, prints
+/// `cargo:rustc-env=<identity.env>=<hex>` and what to rerun on, and writes the listing of its
+/// inputs to `OUT_DIR/<identity.listing>`. An input that can't be had, or a file that changed
+/// while it was hashed, is one `cargo::error` naming it, and the build stops.
+pub fn emit_of(identity: &Identity) {
+    emit_all(&[identity]);
+}
+
+/// [`emit_of`] for each of `identities`, over one walk of the checkout ([`Walk`]): a package of
+/// several closures is listed and read once, the compiler asked once, and every file read checked
+/// once, after the last identity, to be what it was when read.
+pub fn emit_all(identities: &[&Identity]) {
+    if let Err(why) = emitted(identities) {
+        let named: Vec<String> = identities.iter().map(|it| format!("{} ({})", it.what, it.env)).collect();
+        println!("cargo::error={}: {}", named.join(" and "), why.replace('\n', " "));
     }
 }
 
-fn emitted() -> Result<(), String> {
+fn emitted(identities: &[&Identity]) -> Result<(), String> {
     let manifest_dir = var("CARGO_MANIFEST_DIR")?;
-    let workspace = Workspace::read(Path::new(&manifest_dir))?;
-    let env: BTreeMap<String, String> = std::env::vars().collect();
-    let mut build = BuildEnv::of(&env);
-    build.compiler = Some(compiler(&var("RUSTC")?)?);
-    let worked = work_out(&workspace, &build)?;
-    let changed = worked.changed();
+    let build = if identities.iter().any(|it| it.how_built) {
+        let env: BTreeMap<String, String> = std::env::vars().collect();
+        let mut build = BuildEnv::of(&env);
+        build.compiler = Some(compiler(&var("RUSTC")?)?);
+        build
+    } else {
+        BuildEnv::default()
+    };
+    let (all, lock) = work_out_here(Path::new(&manifest_dir), identities, &build)?;
+    let mut stamps = BTreeMap::new();
+    for worked in &all {
+        for (path, was) in &worked.stamps {
+            stamps.entry(path.clone()).or_insert(*was);
+        }
+    }
+    let changed = changed(&stamps);
     if !changed.is_empty() {
         let named: Vec<String> = changed.iter().take(8).map(|it| it.display().to_string()).collect();
         return Err(format!(
@@ -364,22 +658,73 @@ fn emitted() -> Result<(), String> {
             named.join(", ")
         ));
     }
-    for dir in &worked.dirs {
-        println!("cargo:rerun-if-changed={}", dir.display());
+    let watched: BTreeSet<&PathBuf> = all.iter().flat_map(|it| &it.watched).collect();
+    for path in watched {
+        println!("cargo:rerun-if-changed={path}", path = path.display());
     }
-    for file in &worked.files {
-        if !worked.dirs.iter().any(|dir| file.starts_with(dir)) {
-            println!("cargo:rerun-if-changed={}", file.display());
-        }
+    // The registry packages' checksums and the closure are read from the lock. cargo watches a
+    // file whole, so any change to the lock reruns this; a registry package's new version
+    // changes nothing else this watches. Only the program has this script, so that rerun
+    // recompiles the program alone. A shipped tree has no lock: it is what the lock said.
+    if let Some(lock) = lock {
+        println!("cargo:rerun-if-changed={}", lock.display());
     }
-    println!("cargo:rerun-if-changed={}", workspace.lock_path.display());
-    for name in &worked.rerun_env {
+    let rerun_env: BTreeSet<&String> = all.iter().flat_map(|it| &it.rerun_env).collect();
+    for name in rerun_env {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    let out = Path::new(&var("OUT_DIR")?).join("codegen-code-inputs.txt");
-    std::fs::write(&out, worked.listing()).map_err(|why| format!("writing {}: {why}", out.display()))?;
-    println!("cargo:rustc-env={ENV}={}", hex(&worked.code));
+    for (identity, worked) in identities.iter().zip(&all) {
+        let out = Path::new(&var("OUT_DIR")?).join(identity.listing);
+        std::fs::write(&out, worked.listing()).map_err(|why| format!("writing {}: {why}", out.display()))?;
+        println!("cargo:rustc-env={}={}", identity.env, hex(&worked.code));
+    }
     Ok(())
+}
+
+/// Each of `identities` of the program at `program_dir`, built in `env`, and the lock to rerun on
+/// when the checkout was read: an identity whose tree the program's package carries
+/// ([`Identity::shipped`]) from it, which is a package cut from a checkout, whose surroundings
+/// (a staging workspace, a Nix source, a vendor directory) are no checkout of its own; else from
+/// its checkout, the workspace at or above it, in one walk ([`Walk`]). With neither it is refused,
+/// naming both: there is nothing to work it out from, and no identity stands in for one
+/// (AGENTS.md rule 3).
+pub fn work_out_here(
+    program_dir: &Path,
+    identities: &[&Identity],
+    env: &BuildEnv,
+) -> Result<(Vec<Worked>, Option<PathBuf>), String> {
+    let mut checkout: Option<(Workspace, Walk)> = None;
+    let mut all = Vec::new();
+    for identity in identities {
+        let shipped = program_dir.join(identity.shipped);
+        let worked = if shipped.is_file() {
+            work_out_shipped(&shipped, identity, env)
+        } else {
+            if checkout.is_none() {
+                if checkout_of(program_dir)?.is_none() {
+                    return Err(format!(
+                        "{} has no checkout (no Cargo.toml at or above it has a `[workspace]` table) and \
+                         no shipped tree of {} ({}, which the `ship-code-identity` tool of \
+                         crates/blaze-codegen-code writes from the checkout, as \
+                         .github/scripts/publish_crates.py does into the package it publishes)",
+                        program_dir.display(),
+                        identity.what,
+                        shipped.display()
+                    ));
+                }
+                checkout = Some((Workspace::read(program_dir)?, Walk::default()));
+            }
+            let (workspace, walk) = checkout.as_mut().ok_or("the checkout was read just above")?;
+            walk.work_out(workspace, identity, env)
+        };
+        all.push(worked.map_err(|why| format!("{}: {why}", identity.what))?);
+    }
+    Ok((all, checkout.map(|(workspace, _)| workspace.lock_path)))
+}
+
+/// The manifest of the workspace `dir` is in, if any: its checkout.
+pub fn checkout_of(dir: &Path) -> Result<Option<PathBuf>, String> {
+    workspace_of(&canonical(dir)?, &mut BTreeMap::new(), &mut BTreeMap::new())
 }
 
 fn var(name: &str) -> Result<String, String> {
@@ -793,7 +1138,34 @@ impl Workspace {
 
     /// The packages of the code generator's closure, by name.
     pub fn closure_names(&self) -> Result<BTreeSet<String>, String> {
-        Ok(self.closure()?.into_iter().map(|at| self.lock[at].name.clone()).collect())
+        self.closure_names_of(&CODEGEN)
+    }
+
+    /// The packages of `identity`'s closure, by name.
+    pub fn closure_names_of(&self, identity: &Identity) -> Result<BTreeSet<String>, String> {
+        Ok(self.closure(identity)?.into_iter().map(|at| self.lock[at].name.clone()).collect())
+    }
+
+    /// The packages the program is built from, itself among them, by name.
+    pub fn linked_names(&self) -> Result<BTreeSet<String>, String> {
+        Ok(self.reach(&[self.program_at()?])?.into_iter().map(|at| self.lock[at].name.clone()).collect())
+    }
+
+    /// The packages the package of the checkout `name` is built from, itself among them, by name.
+    pub fn built_from_names(&self, name: &str) -> Result<BTreeSet<String>, String> {
+        let found: Vec<usize> =
+            (0..self.lock.len()).filter(|at| self.lock[*at].source.is_none() && self.lock[*at].name == name).collect();
+        match found[..] {
+            [one] => Ok(self.reach(&[one])?.into_iter().map(|at| self.lock[at].name.clone()).collect()),
+            _ => Err(format!("{} packages of the checkout in {} are named `{name}`, not one", found.len(), self.lock_path.display())),
+        }
+    }
+
+    /// The program's package in the lock.
+    fn program_at(&self) -> Result<usize, String> {
+        (0..self.lock.len())
+            .find(|at| self.lock[*at].source.is_none() && self.lock[*at].name == self.program)
+            .ok_or_else(|| format!("the program `{}` is no package of {}", self.program, self.lock_path.display()))
     }
 
     /// The packages of the checkout, by name, with their directories.
@@ -801,21 +1173,43 @@ impl Workspace {
         self.locals.iter().map(|it| (it.name.as_str(), it.dir.as_path())).collect()
     }
 
-    /// Every package of the lock the [`ROOTS`] the program links are built from.
-    fn closure(&self) -> Result<BTreeSet<usize>, String> {
-        let program = (0..self.lock.len())
-            .find(|at| self.lock[*at].source.is_none() && self.lock[*at].name == self.program)
-            .ok_or_else(|| format!("the program `{}` is no package of {}", self.program, self.lock_path.display()))?;
-        let linked = self.reach(&[program])?;
+    /// Every package of the lock outside `closure` that depends on one of it, at any depth, by
+    /// any dependency the lock lists (normal, build, dev, optional, any platform's): what can
+    /// turn on a feature of a package of `closure`.
+    fn dependents(&self, closure: &BTreeSet<usize>) -> Result<BTreeSet<usize>, String> {
+        let mut depended_on_by: Vec<Vec<usize>> = vec![Vec::new(); self.lock.len()];
+        for (at, locked) in self.lock.iter().enumerate() {
+            for entry in &locked.dependencies {
+                depended_on_by[self.resolve(locked, entry)?].push(at);
+            }
+        }
+        let mut seen = closure.clone();
+        let mut stack: Vec<usize> = closure.iter().copied().collect();
+        while let Some(at) = stack.pop() {
+            for &by in &depended_on_by[at] {
+                if seen.insert(by) {
+                    stack.push(by);
+                }
+            }
+        }
+        Ok(seen.difference(closure).copied().collect())
+    }
+
+    /// Every package of the lock the roots of `identity` the program links are built from.
+    fn closure(&self, identity: &Identity) -> Result<BTreeSet<usize>, String> {
+        let linked = self.reach(&[self.program_at()?])?;
         let mut roots = Vec::new();
-        for root in ROOTS {
+        for root in identity.roots {
             // `blaze-hir-ty-codegen` is the name .github/scripts/publish_crates.py publishes it under.
             let published = format!("blaze-{}", root.package);
             let found: Vec<usize> =
                 linked.iter().copied().filter(|at| self.lock[*at].name == root.package || self.lock[*at].name == published).collect();
             match found[..] {
-                [] if root.package == CODE_GENERATOR => {
-                    return Err(format!("the program `{}` does not link the code generator `{CODE_GENERATOR}`", self.program));
+                [] if root.package == identity.required => {
+                    return Err(format!(
+                        "the program `{}` does not link `{}`, the root of {}",
+                        self.program, identity.required, identity.what
+                    ));
                 }
                 [] => {}
                 [one] => roots.push(one),
@@ -887,138 +1281,381 @@ fn read_stamped(path: &Path, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<Ve
     Ok(bytes)
 }
 
-/// The identity of the code generator `workspace`'s program runs, built in `env`.
+/// The identity of the code generator `workspace`'s program runs, built in `env` ([`CODEGEN`]).
 pub fn work_out(workspace: &Workspace, env: &BuildEnv) -> Result<Worked, String> {
-    let root = workspace.root.as_path();
-    let closure = workspace.closure()?;
+    work_out_of(workspace, &CODEGEN, env)
+}
 
-    let mut inputs = Vec::new();
-    let mut files = BTreeSet::new();
-    let mut stamps = workspace.stamps.clone();
-    let mut dirs = Vec::new();
-    let mut registry = Vec::new();
-    let mut packages = BTreeSet::new();
-    let mut crates = BTreeSet::new();
-    let mut inherited = BTreeSet::new();
-    let mut links_llvm = false;
+/// `identity` of `workspace`'s program, built in `env` (which is read only when
+/// `identity.how_built`).
+pub fn work_out_of(workspace: &Workspace, identity: &Identity, env: &BuildEnv) -> Result<Worked, String> {
+    Walk::default().work_out(workspace, identity, env)
+}
 
-    // 1. The packages, by name, version and source.
-    let mut chosen: Vec<&Locked> = closure.iter().map(|at| &workspace.lock[*at]).collect();
-    chosen.sort_by(|a, b| (&a.name, &a.version, &a.source).cmp(&(&b.name, &b.version, &b.source)));
-    for package in chosen {
-        links_llvm |= package.name == LLVM_PACKAGE;
-        packages.insert(package.name.clone());
-        let name = format!("{} {} {}", package.name, package.version, package.source.as_deref().unwrap_or("checkout"));
-        let digest = match package.source.as_deref() {
-            Some(source) if source.starts_with("registry+") || source.starts_with("sparse+") => {
-                let checksum = package.checksum.as_deref().ok_or_else(|| {
-                    format!(
-                        "{name} has no checksum in {}: a registry package is an input by its checksum",
-                        workspace.lock_path.display()
-                    )
-                })?;
-                registry.push((package.name.clone(), package.version.clone()));
-                crates.insert(package.name.replace('-', "_"));
-                digest_of("package registry", &[checksum.as_bytes()])
+/// What a walk of the checkout hashed of its packages, kept for every identity worked out over
+/// the same tree ([`emit_all`]): each package of the checkout is listed and read once, whichever
+/// closures it is in, so a second identity reads only the packages the first had not.
+#[derive(Default)]
+pub struct Walk {
+    /// Each package of the checkout hashed, by its directory.
+    hashed: BTreeMap<PathBuf, Hashed>,
+}
+
+/// A package of the checkout, hashed: its digest, its files, what a build script watches for
+/// them, and what each file and directory was just before it was read.
+struct Hashed {
+    digest: [u8; 32],
+    files: Vec<PathBuf>,
+    watch: Vec<PathBuf>,
+    stamps: BTreeMap<PathBuf, Stamp>,
+}
+
+impl Walk {
+    /// The package of the checkout `local`, hashed by every file of it ([`package_files`]),
+    /// once.
+    fn package(&mut self, local: &Local) -> Result<&Hashed, String> {
+        if !self.hashed.contains_key(&local.dir) {
+            let mut stamps = BTreeMap::new();
+            let mut files = Vec::new();
+            let mut hasher = hasher("package checkout");
+            let listed = package_files(local, &mut stamps)?;
+            for (relative, path) in listed.files {
+                let bytes = read_stamped(&path, &mut stamps)?;
+                hasher.update(&(relative.len() as u64).to_le_bytes()).update(relative.as_bytes());
+                hasher.update(&(bytes.len() as u64).to_le_bytes()).update(&bytes);
+                files.push(path);
             }
-            Some(source) if source.starts_with("git+") => {
-                return Err(format!(
-                    "{} {} comes from git ({source}), and the code identity keys a package by its lock \
-                     checksum or, in the checkout, by its files: a git package has neither (vendor it \
-                     under the checkout, or key git sources by their commit in blaze-codegen-code)",
-                    package.name, package.version
-                ));
-            }
-            Some(source) => return Err(format!("{name}: the code identity knows no source `{source}`")),
-            None => {
-                let local = workspace.local(package)?;
-                crates.insert(lib_name(local));
-                let mut hasher = hasher("package checkout");
-                for (relative, path) in package_files(local, &mut stamps)? {
-                    let bytes = read_stamped(&path, &mut stamps)?;
-                    hasher.update(&(relative.len() as u64).to_le_bytes()).update(relative.as_bytes());
-                    hasher.update(&(bytes.len() as u64).to_le_bytes()).update(&bytes);
-                    files.insert(path);
-                }
-                dirs.push(local.dir.clone());
-                if let Some(manifest) = &local.workspace
-                    && manifest.parent() != Some(root)
-                {
-                    inherited.insert(manifest.clone());
-                }
-                *hasher.finalize().as_bytes()
-            }
-        };
-        inputs.push(Input { kind: "package", name, digest });
+            let hashed = Hashed { digest: *hasher.finalize().as_bytes(), files, watch: listed.watch, stamps };
+            self.hashed.insert(local.dir.clone(), hashed);
+        }
+        Ok(&self.hashed[&local.dir])
     }
 
-    // 2. The manifests of the workspace and of the workspaces packages inherit from.
-    let mut manifests = BTreeSet::new();
-    manifests.insert(root.join("Cargo.toml"));
-    manifests.extend(workspace.members.iter().cloned());
-    manifests.extend(inherited);
-    // Cargo's configuration: the root's and every directory's above it, as cargo run in the
-    // workspace reads them, and `$CARGO_HOME`'s.
-    for dir in root.ancestors() {
-        for config in [".cargo/config.toml", ".cargo/config"] {
-            let path = dir.join(config);
-            if path.is_file() {
-                manifests.insert(path);
+    /// [`work_out_of`], reading each package of the checkout this walk has not yet.
+    pub fn work_out(&mut self, workspace: &Workspace, identity: &Identity, env: &BuildEnv) -> Result<Worked, String> {
+        let (tree, seen) = self.tree(workspace, identity)?;
+        finish(identity, &tree, env, seen)
+    }
+
+    /// The tree of `identity` of `workspace`'s program ([`Tree`]), and what working it out saw.
+    fn tree(&mut self, workspace: &Workspace, identity: &Identity) -> Result<(Tree, Seen), String> {
+        let root = workspace.root.as_path();
+        let closure = workspace.closure(identity)?;
+
+        let mut inputs = Vec::new();
+        let mut seen = Seen { stamps: workspace.stamps.clone(), ..Seen::default() };
+        let mut inherited = BTreeSet::new();
+        let mut links_llvm = false;
+
+        // 1. The packages, by name, version and source.
+        let mut chosen: Vec<&Locked> = closure.iter().map(|at| &workspace.lock[*at]).collect();
+        chosen.sort_by(|a, b| (&a.name, &a.version, &a.source).cmp(&(&b.name, &b.version, &b.source)));
+        for package in chosen {
+            links_llvm |= package.name == LLVM_PACKAGE;
+            seen.packages.insert(package.name.clone());
+            let name = locked_name(package);
+            let digest = match package.source.as_deref() {
+                Some(_) => {
+                    let digest = registry_digest(workspace, package)?;
+                    seen.registry.push((package.name.clone(), package.version.clone()));
+                    seen.crates.insert(package.name.replace('-', "_"));
+                    digest
+                }
+                None => {
+                    let local = workspace.local(package)?;
+                    seen.crates.insert(lib_name(local));
+                    let hashed = self.package(local)?;
+                    // A file read before (a manifest the closure was read from) keeps its first stamp.
+                    for (path, was) in &hashed.stamps {
+                        seen.stamps.entry(path.clone()).or_insert(*was);
+                    }
+                    seen.files.extend(hashed.files.iter().cloned());
+                    seen.watched.extend(hashed.watch.iter().cloned());
+                    seen.dirs.push(local.dir.clone());
+                    if let Some(manifest) = &local.workspace
+                        && manifest.parent() != Some(root)
+                    {
+                        inherited.insert(manifest.clone());
+                    }
+                    hashed.digest
+                }
+            };
+            inputs.push(Input { kind: "package", name, digest });
+        }
+        // What the packages' watches cover; every file hashed past them is watched by itself, but
+        // those under a directory of `extra`, watched whole.
+        seen.package_files = seen.files.clone();
+
+        // 2. The manifests of the workspace and of the workspaces packages inherit from, every
+        // package that can turn on a feature of one of the closure's, and cargo's configuration
+        // in the workspace's root and every directory above it, as cargo run in the workspace
+        // reads them (`$CARGO_HOME`'s is the build's, [`finish`]).
+        if identity.how_built {
+            let mut manifests = BTreeSet::new();
+            manifests.insert(root.join("Cargo.toml"));
+            manifests.extend(workspace.members.iter().cloned());
+            manifests.extend(inherited);
+            // cargo unifies features across every package it builds together, so a package
+            // outside the closure that depends on one of it (at any depth, by any edge the lock
+            // lists: build, dev, optional, any platform's) can turn on a feature of it: a
+            // registry one by its checksum, which is its manifest; one of the checkout by its
+            // manifest and the workspace's it inherits from.
+            for at in workspace.dependents(&closure)? {
+                let package = &workspace.lock[at];
+                match package.source {
+                    Some(_) => {
+                        let digest = registry_digest(workspace, package)?;
+                        inputs.push(Input { kind: "dependent", name: locked_name(package), digest });
+                    }
+                    None => {
+                        let local = workspace.local(package)?;
+                        manifests.insert(local.dir.join("Cargo.toml"));
+                        manifests.extend(local.workspace.iter().cloned());
+                    }
+                }
+            }
+            for dir in root.ancestors() {
+                for config in [".cargo/config.toml", ".cargo/config"] {
+                    let path = dir.join(config);
+                    if path.is_file() {
+                        manifests.insert(path);
+                    }
+                }
+            }
+            for path in manifests {
+                let bytes = read_stamped(&path, &mut seen.stamps)?;
+                inputs.push(Input { kind: "manifest", name: relative_name(&path, root), digest: digest_of("manifest", &[&bytes]) });
+                seen.files.insert(path);
             }
         }
-    }
-    let mut configs = Vec::new();
-    for config in ["config.toml", "config"] {
-        if let Some(path) = env.cargo_home.as_ref().map(|it| it.join(config))
-            && path.is_file()
-            && !manifests.contains(&path)
-        {
-            configs.push((format!("$CARGO_HOME/{config}"), path));
-        }
-    }
-    let manifests = manifests.into_iter().map(|path| (relative_name(&path, root), path));
-    for (name, path) in manifests.chain(configs) {
-        let bytes = read_stamped(&path, &mut stamps)?;
-        inputs.push(Input { kind: "manifest", name, digest: digest_of("manifest", &[&bytes]) });
-        files.insert(path);
-    }
 
-    // 3. Files outside the packages, and the variables they read.
-    for (reader, extra) in EXTRA {
-        let local = closure
+        // 3. Files outside the packages, and the variables they read. Every reader is in the
+        // closure: the identity's required root is linked (`closure` refuses a program that does
+        // not link it), and a reader outside the closure, or renamed away, is an extra the
+        // identity names wrongly, never one to leave out.
+        for (reader, extra) in identity.extra {
+            let local = closure
+                .iter()
+                .map(|at| &workspace.lock[*at])
+                .find(|it| it.source.is_none() && it.name == *reader)
+                .map(|it| workspace.local(it))
+                .transpose()?
+                .ok_or_else(|| format!("`{reader}`, which reads {extra}, is no package of the checkout in the closure"))?;
+            let path = local.dir.join(extra);
+            let path = canonical(&path).map_err(|why| format!("{extra}, which `{reader}` reads: {why}"))?;
+            for file in extra_files(&path, &mut seen.stamps)? {
+                let bytes = read_stamped(&file, &mut seen.stamps)?;
+                inputs.push(Input { kind: "file", name: relative_name(&file, root), digest: digest_of("file", &[&bytes]) });
+                seen.files.insert(file);
+            }
+            if path.is_dir() {
+                seen.extra_dirs.push(path);
+            }
+        }
+
+        // 4. The stencil libraries, by their pin.
+        let stencils = closure
             .iter()
             .map(|at| &workspace.lock[*at])
-            .find(|it| it.source.is_none() && it.name == *reader)
-            .map(|it| workspace.local(it))
-            .transpose()?
-            .ok_or_else(|| format!("`{reader}`, which reads {extra}, is no package of the checkout in the closure"))?;
-        let path = local.dir.join(extra);
-        let path = canonical(&path).map_err(|why| format!("{extra}, which `{reader}` reads: {why}"))?;
-        let bytes = read_stamped(&path, &mut stamps)?;
-        inputs.push(Input { kind: "file", name: relative_name(&path, root), digest: digest_of("file", &[&bytes]) });
-        files.insert(path);
+            .find(|it| identity.how_built && it.source.is_none() && it.name == STENCIL_PACKAGE);
+        if let Some(stencils) = stencils {
+            let path = workspace.local(stencils)?.dir.join(stencil_pin::PIN_FILE);
+            let text =
+                String::from_utf8(read_stamped(&path, &mut seen.stamps)?).map_err(|_| format!("{} is not UTF-8", path.display()))?;
+            let pinned = stencil_pin::pin_parse(&text).map_err(|why| format!("the stencil libraries' pin {}: {why}", path.display()))?;
+            for (name, id) in pinned {
+                inputs.push(Input { kind: "stencils", name, digest: id });
+            }
+            seen.files.insert(path);
+        }
+
+        // 5's pin: read here, used by the build ([`finish`]) unless it is the seed's.
+        let llvm_pin = if identity.how_built && links_llvm {
+            let (path, json) = llvm_pin(workspace, &closure, &mut seen.stamps)?;
+            seen.llvm_pin = Some(path);
+            Some(json)
+        } else {
+            None
+        };
+        Ok((Tree { domain: identity.domain.to_owned(), inputs, llvm_pin }, seen))
+    }
+}
+
+/// What of an identity the checkout alone decides: steps 1 to 4 of the crate doc (the packages,
+/// the checkout's manifests and cargo configuration, the files outside the packages, the stencil
+/// pin) and the text of the LLVM pin step 5 reads for the build's `TARGET` and `HOST`. The rest
+/// (`$CARGO_HOME`'s configuration, the pinned LLVM's prefix, the build's variables and its
+/// compiler) is the build's, so a build worked out from a shipped tree ([`Tree::shipped`]) has the
+/// identity a build of the checkout it was cut from has in the same environment.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Tree {
+    /// The identity's domain: which identity, by which formula.
+    pub domain: String,
+    /// Steps 1 to 4, in the order hashed: `package`, `dependent`, `manifest`, `file` and
+    /// `stencils` inputs.
+    pub inputs: Vec<Input>,
+    /// The LLVM pin's text (crates/hir-ty-codegen/llvm.json), when `llvm-sys` is a package of the
+    /// closure and how blaze is built is an input.
+    pub llvm_pin: Option<String>,
+}
+
+/// The first line of a shipped tree: what it is and the format's version.
+const SHIPPED_HEADER: &str = "blaze shipped code identity 1";
+/// The kinds of input a tree holds.
+const TREE_KINDS: [&str; 5] = ["package", "dependent", "manifest", "file", "stencils"];
+
+impl Tree {
+    /// The tree as a package carries it ([`Identity::shipped`]): a header, its domain, then one
+    /// line per input (kind, name and digest in hex, tab-separated) and the LLVM pin's text in hex.
+    pub fn shipped(&self) -> Result<String, String> {
+        let mut out = format!("{SHIPPED_HEADER}\ndomain\t{}\n", self.domain);
+        for input in &self.inputs {
+            if input.name.contains(['\t', '\n']) {
+                return Err(format!("the input `{}` has a tab or a line break in its name, which a shipped tree can't hold", input.name));
+            }
+            out.push_str(&format!("{}\t{}\t{}\n", input.kind, input.name, hex(&input.digest)));
+        }
+        if let Some(pin) = &self.llvm_pin {
+            out.push_str(&format!("llvm-pin\t{}\n", hex(pin.as_bytes())));
+        }
+        Ok(out)
     }
 
-    // 4. The stencil libraries, by their pin.
-    let stencils = closure.iter().map(|at| &workspace.lock[*at]).find(|it| it.source.is_none() && it.name == STENCIL_PACKAGE);
-    if let Some(stencils) = stencils {
-        let path = workspace.local(stencils)?.dir.join(stencil_pin::PIN_FILE);
-        let text = String::from_utf8(read_stamped(&path, &mut stamps)?).map_err(|_| format!("{} is not UTF-8", path.display()))?;
-        let pinned = stencil_pin::pin_parse(&text).map_err(|why| format!("the stencil libraries' pin {}: {why}", path.display()))?;
-        for (name, id) in pinned {
-            inputs.push(Input { kind: "stencils", name, digest: id });
+    /// A shipped tree of `identity`, read from `from` (named in every error).
+    pub fn parse(text: &str, identity: &Identity, from: &Path) -> Result<Tree, String> {
+        let refused = |line: usize, why: String| format!("{}, line {}: {why}", from.display(), line + 1);
+        let mut lines = text.lines().enumerate();
+        match lines.next() {
+            Some((_, SHIPPED_HEADER)) => {}
+            other => {
+                return Err(refused(0, format!("starts `{}`, not `{SHIPPED_HEADER}`", other.map_or("", |(_, it)| it))));
+            }
         }
-        files.insert(path);
+        let domain = match lines.next() {
+            Some((_, line)) if line.strip_prefix("domain\t") == Some(identity.domain) => identity.domain.to_owned(),
+            Some((at, line)) => {
+                return Err(refused(
+                    at,
+                    format!("`{line}` names another identity or formula than {}'s `{}`", identity.what, identity.domain),
+                ));
+            }
+            None => return Err(refused(1, "it ends before its domain".to_owned())),
+        };
+        let mut inputs = Vec::new();
+        let mut llvm_pin = None;
+        for (at, line) in lines {
+            let fields: Vec<&str> = line.split('\t').collect();
+            match fields[..] {
+                ["llvm-pin", text] if llvm_pin.is_none() => {
+                    let bytes = unhex(text).ok_or_else(|| refused(at, "the LLVM pin is not hex".to_owned()))?;
+                    llvm_pin = Some(String::from_utf8(bytes).map_err(|_| refused(at, "the LLVM pin is not UTF-8".to_owned()))?);
+                }
+                [kind, name, digest] => {
+                    let kind = TREE_KINDS
+                        .into_iter()
+                        .find(|it| *it == kind)
+                        .ok_or_else(|| refused(at, format!("`{kind}` is no kind of input a tree holds")))?;
+                    let digest: [u8; 32] = unhex(digest)
+                        .and_then(|it| it.try_into().ok())
+                        .ok_or_else(|| refused(at, format!("the digest of `{name}` is not 64 hex digits")))?;
+                    inputs.push(Input { kind, name: name.to_owned(), digest });
+                }
+                _ => return Err(refused(at, format!("`{line}` is no input of a shipped tree"))),
+            }
+        }
+        Ok(Tree { domain, inputs, llvm_pin })
+    }
+}
+
+/// The bytes of `text`, two lowercase hex digits each.
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 || !text.bytes().all(|it| matches!(it, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok()).collect()
+}
+
+/// What working a tree out of the checkout saw besides the tree: what [`Worked`] says of the
+/// checkout's files and packages.
+#[derive(Default)]
+struct Seen {
+    files: BTreeSet<PathBuf>,
+    stamps: BTreeMap<PathBuf, Stamp>,
+    dirs: Vec<PathBuf>,
+    watched: Vec<PathBuf>,
+    registry: Vec<(String, String)>,
+    packages: BTreeSet<String>,
+    crates: BTreeSet<String>,
+    /// The files hashed as files of packages, which the packages' watches cover.
+    package_files: BTreeSet<PathBuf>,
+    /// The directories of [`Identity::extra`], watched whole.
+    extra_dirs: Vec<PathBuf>,
+    /// Where the LLVM pin was read, when it was.
+    llvm_pin: Option<PathBuf>,
+}
+
+/// `identity` of a package cut from a checkout, from the tree the checkout shipped with it
+/// (`shipped`, [`Identity::shipped`]), built in `env`.
+pub fn work_out_shipped(shipped: &Path, identity: &Identity, env: &BuildEnv) -> Result<Worked, String> {
+    let mut seen = Seen::default();
+    let bytes = read_stamped(shipped, &mut seen.stamps)?;
+    let text = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", shipped.display()))?;
+    let tree = Tree::parse(&text, identity, shipped)?;
+    seen.files.insert(shipped.to_path_buf());
+    finish(identity, &tree, env, seen)
+}
+
+/// `identity` from `tree` (and, from a checkout, what working the tree out saw), built in `env`:
+/// the build's part of step 2 (`$CARGO_HOME`'s configuration), steps 5 and 6, then the hash.
+fn finish(identity: &Identity, tree: &Tree, env: &BuildEnv, seen: Seen) -> Result<Worked, String> {
+    // Of the sources alone: no variable, profile, compiler or configuration is an input.
+    let sources_only = BuildEnv::default();
+    let env = if identity.how_built { env } else { &sources_only };
+    let Seen {
+        mut files,
+        mut stamps,
+        dirs,
+        mut watched,
+        registry,
+        packages,
+        crates,
+        package_files,
+        extra_dirs,
+        llvm_pin: llvm_pin_path,
+    } = seen;
+    let mut inputs = tree.inputs.clone();
+
+    // 2. `$CARGO_HOME`'s configuration, after the checkout's (one already read as the checkout's
+    // is not read twice).
+    if identity.how_built {
+        let at = inputs.iter().position(|it| matches!(it.kind, "file" | "stencils")).unwrap_or(inputs.len());
+        let mut configs = Vec::new();
+        for config in ["config.toml", "config"] {
+            if let Some(path) = env.cargo_home.as_ref().map(|it| it.join(config))
+                && path.is_file()
+                && !files.contains(&path)
+            {
+                let bytes = read_stamped(&path, &mut stamps)?;
+                configs.push(Input { kind: "manifest", name: format!("$CARGO_HOME/{config}"), digest: digest_of("manifest", &[&bytes]) });
+                files.insert(path);
+            }
+        }
+        inputs.splice(at..at, configs);
     }
     let seed = env.seed();
 
     // 5. LLVM: the pin, and the prefix checked to be it; none in the seed, which links no LLVM
     // and makes no stencils with it.
-    let mut rerun_env: Vec<String> = READ_ENV.iter().map(|it| (*it).to_owned()).collect();
+    let mut rerun_env: Vec<String> =
+        if identity.how_built { READ_ENV.iter().map(|it| (*it).to_owned()).collect() } else { Vec::new() };
     let mut llvm_prefix = None;
-    if links_llvm && !seed {
+    if let Some(json) = tree.llvm_pin.as_deref().filter(|_| identity.how_built && !seed) {
         rerun_env.push(LLVM_PREFIX.to_owned());
-        let (pinned, json) = llvm_pin(workspace, &closure, &mut stamps, &mut files)?;
+        let from = llvm_pin_path.as_ref().map_or_else(|| "the shipped tree's".to_owned(), |it| it.display().to_string());
+        let pinned = pin::Pin::parse(json).map_err(|why| format!("blaze's LLVM pin `{from}` can't be read: {why}"))?;
+        if let Some(path) = llvm_pin_path {
+            files.insert(path);
+        }
         let mut built_for = BTreeSet::new();
         for name in ["TARGET", "HOST"] {
             let tuple = env.vars.get(name).cloned().flatten().ok_or_else(|| {
@@ -1027,7 +1664,7 @@ pub fn work_out(workspace: &Workspace, env: &BuildEnv) -> Result<Worked, String>
             built_for.insert(tuple);
         }
         for tuple in built_for {
-            let sha = pin::pin_sha256(&json, &tuple).map_err(|why| format!("blaze's LLVM pin: {why}"))?;
+            let sha = pin::pin_sha256(json, &tuple).map_err(|why| format!("blaze's LLVM pin: {why}"))?;
             let released = sha.as_deref().map_or(&b"none"[..], str::as_bytes);
             let digest = digest_of("llvm pin", &[pinned.version.as_bytes(), pinned.commit.as_bytes(), tuple.as_bytes(), released]);
             inputs.push(Input { kind: "llvm", name: format!("pin {tuple}"), digest });
@@ -1065,7 +1702,13 @@ pub fn work_out(workspace: &Workspace, env: &BuildEnv) -> Result<Worked, String>
         inputs.push(Input { kind: "compiler", name: "rustc -vV".to_owned(), digest: digest_of("compiler", &[compiler.as_bytes()]) });
     }
 
-    let mut hasher = hasher_of(DOMAIN);
+    let past_packages = files.difference(&package_files);
+    watched.extend(past_packages.filter(|file| !extra_dirs.iter().any(|dir| file.starts_with(dir))).cloned());
+    watched.extend(extra_dirs);
+    watched.sort();
+    watched.dedup();
+
+    let mut hasher = hasher_of(&tree.domain);
     hasher.update(&(inputs.len() as u64).to_le_bytes());
     for input in &inputs {
         hasher.update(&(input.kind.len() as u64).to_le_bytes()).update(input.kind.as_bytes());
@@ -1078,6 +1721,7 @@ pub fn work_out(workspace: &Workspace, env: &BuildEnv) -> Result<Worked, String>
         files,
         stamps,
         dirs,
+        watched,
         registry,
         packages,
         crates,
@@ -1086,14 +1730,54 @@ pub fn work_out(workspace: &Workspace, env: &BuildEnv) -> Result<Worked, String>
     })
 }
 
-/// The pin llvm-sys checks LLVM against, as pin.rs reads it from llvm-sys's directory, and
-/// llvm.json's text.
-fn llvm_pin(
-    workspace: &Workspace,
-    closure: &BTreeSet<usize>,
-    stamps: &mut BTreeMap<PathBuf, Stamp>,
-    files: &mut BTreeSet<PathBuf>,
-) -> Result<(pin::Pin, String), String> {
+/// What a checkout ships with a package cut from it for `identity` of `workspace`'s program
+/// ([`Tree::shipped`]); refused, naming them, when files it was worked out from changed while it
+/// was.
+pub fn ship(workspace: &Workspace, identity: &Identity) -> Result<String, String> {
+    let (tree, seen) = Walk::default().tree(workspace, identity)?;
+    let changed = changed(&seen.stamps);
+    if !changed.is_empty() {
+        let named: Vec<String> = changed.iter().map(|it| it.display().to_string()).collect();
+        return Err(format!(
+            "{} file(s) changed while {} was worked out, so it is of no one tree: {}",
+            changed.len(),
+            identity.what,
+            named.join(", ")
+        ));
+    }
+    tree.shipped()
+}
+
+/// A package of the lock as an input names it: name, version and source.
+fn locked_name(package: &Locked) -> String {
+    format!("{} {} {}", package.name, package.version, package.source.as_deref().unwrap_or("checkout"))
+}
+
+/// The digest of `package`, a package of the lock from outside the checkout: a registry package
+/// by its checksum. A git package, or another source, is refused, naming it.
+fn registry_digest(workspace: &Workspace, package: &Locked) -> Result<[u8; 32], String> {
+    let name = locked_name(package);
+    match package.source.as_deref() {
+        Some(source) if source.starts_with("registry+") || source.starts_with("sparse+") => {
+            let checksum = package.checksum.as_deref().ok_or_else(|| {
+                format!("{name} has no checksum in {}: a registry package is an input by its checksum", workspace.lock_path.display())
+            })?;
+            Ok(digest_of("package registry", &[checksum.as_bytes()]))
+        }
+        Some(source) if source.starts_with("git+") => Err(format!(
+            "{} {} comes from git ({source}), and the code identity keys a package by its lock \
+             checksum or, in the checkout, by its files: a git package has neither (vendor it \
+             under the checkout, or key git sources by their commit in blaze-codegen-code)",
+            package.name, package.version
+        )),
+        Some(source) => Err(format!("{name}: the code identity knows no source `{source}`")),
+        None => Err(format!("{name} is a package of the checkout, keyed by its files")),
+    }
+}
+
+/// Where the pin llvm-sys checks LLVM against is, as pin.rs reads it from llvm-sys's directory,
+/// and its text, checked to be a pin.
+fn llvm_pin(workspace: &Workspace, closure: &BTreeSet<usize>, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<(PathBuf, String), String> {
     let sys = closure
         .iter()
         .map(|at| &workspace.lock[*at])
@@ -1108,9 +1792,8 @@ fn llvm_pin(
     let path = workspace.local(sys)?.dir.join(pin::PIN_JSON);
     let path = canonical(&path).map_err(|why| format!("blaze's LLVM pin: {why}"))?;
     let json = String::from_utf8(read_stamped(&path, stamps)?).map_err(|_| format!("{} is not UTF-8", path.display()))?;
-    files.insert(path.clone());
-    let pinned = pin::Pin::parse(&json).map_err(|why| format!("blaze's LLVM pin `{}` can't be read: {why}", path.display()))?;
-    Ok((pinned, json))
+    pin::Pin::parse(&json).map_err(|why| format!("blaze's LLVM pin `{}` can't be read: {why}", path.display()))?;
+    Ok((path, json))
 }
 
 /// The name rustc gives the library of `local`: its `[lib] name`, else its package name.
@@ -1179,48 +1862,129 @@ fn slashed(path: &Path) -> String {
     path.components().map(|it| it.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
 }
 
-/// Every file of a package of the checkout, sorted by its path relative to the package's
-/// directory, with `/`.
-/// Each directory listed is stamped, so a file added or removed while it works is seen.
-fn package_files(local: &Local, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<Vec<(String, PathBuf)>, String> {
-    let built = built_dirs(local);
+/// The files of an extra input at `path`: the file itself, or every file under the directory
+/// but those of a dot name, sorted. Each directory listed is stamped, so a file added or
+/// removed while it works is seen. A link to a file is the file; a link to a directory is
+/// refused, as in a package ([`walk`]): followed, a link to a directory above it never ends.
+fn extra_files(path: &Path, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<Vec<PathBuf>, String> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
     let mut out = Vec::new();
-    let mut stack = vec![local.dir.clone()];
+    let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
         stamps.entry(dir.clone()).or_insert(stamp(&dir)?);
         let entries = std::fs::read_dir(&dir).map_err(|why| format!("listing {}: {why}", dir.display()))?;
         for entry in entries {
             let entry = entry.map_err(|why| format!("listing {}: {why}", dir.display()))?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') {
+            if entry.file_name().to_string_lossy().starts_with('.') {
                 continue;
             }
             let path = entry.path();
             let kind = entry.file_type().map_err(|why| format!("{}: {why}", path.display()))?;
-            let at_root = dir == local.dir;
             if kind.is_symlink() {
                 let meta = std::fs::metadata(&path).map_err(|why| format!("{}: {why}", path.display()))?;
                 if meta.is_dir() {
-                    return Err(format!(
-                        "{} of package {} is a link to a directory: its files are not hashed",
-                        path.display(),
-                        local.name
-                    ));
+                    return Err(format!("{} is a link to a directory: its files are not hashed", path.display()));
                 }
+                out.push(path);
             } else if kind.is_dir() {
-                let skipped = at_root
-                    && (name == "target"
-                        || (matches!(&*name, "tests" | "benches" | "examples") && !built.iter().any(|it| it.starts_with(&path))));
-                if !skipped {
-                    stack.push(path);
-                }
-                continue;
+                stack.push(path);
+            } else {
+                out.push(path);
             }
-            let relative = path.strip_prefix(&local.dir).map_err(|_| format!("{} is outside its package", path.display()))?;
-            out.push((slashed(relative), path));
         }
     }
     out.sort();
     Ok(out)
+}
+
+/// What [`package_files`] found of a package of the checkout.
+struct Listed {
+    /// Every file hashed, sorted by its path relative to the package's directory, with `/`.
+    files: Vec<(String, PathBuf)>,
+    /// What a build script watches for them: each directory every entry under which, at any
+    /// depth, is hashed, whole (a file added or removed in it changes its mtime, which cargo's
+    /// watch of a directory counts); and each other file hashed, by itself.
+    watch: Vec<PathBuf>,
+}
+
+/// How [`walk`] found a directory.
+enum Walked {
+    /// Every entry under it, at any depth, is hashed: watched whole.
+    Whole,
+    /// It holds a skipped entry: watched by these paths, its files and its subdirectories that are whole.
+    Parts(Vec<PathBuf>),
+}
+
+/// Every file of a package of the checkout, and what to watch for them: every file under its
+/// directory but a name starting with `.` and, at its root, `target` and the `tests`, `benches`
+/// and `examples` directories when none of its library, binaries or build script is in them.
+/// Each directory listed is stamped, so a file added or removed while it works is seen.
+fn package_files(local: &Local, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<Listed, String> {
+    let built = built_dirs(local);
+    let mut files = Vec::new();
+    let watch = match walk(local, &built, &local.dir, stamps, &mut files)? {
+        Walked::Whole => vec![local.dir.clone()],
+        Walked::Parts(parts) => parts,
+    };
+    files.sort();
+    Ok(Listed { files, watch })
+}
+
+/// Lists `dir`, a directory of `local` whose library, binaries and build script are in `built`,
+/// into `files`, and says what watches it.
+fn walk(
+    local: &Local,
+    built: &[PathBuf],
+    dir: &Path,
+    stamps: &mut BTreeMap<PathBuf, Stamp>,
+    files: &mut Vec<(String, PathBuf)>,
+) -> Result<Walked, String> {
+    stamps.entry(dir.to_path_buf()).or_insert(stamp(dir)?);
+    let entries = std::fs::read_dir(dir).map_err(|why| format!("listing {}: {why}", dir.display()))?;
+    let at_root = dir == local.dir;
+    let mut whole = true;
+    let mut parts = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|why| format!("listing {}: {why}", dir.display()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') {
+            whole = false;
+            continue;
+        }
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|why| format!("{}: {why}", path.display()))?;
+        if kind.is_symlink() {
+            let meta = std::fs::metadata(&path).map_err(|why| format!("{}: {why}", path.display()))?;
+            if meta.is_dir() {
+                return Err(format!(
+                    "{} of package {} is a link to a directory: its files are not hashed",
+                    path.display(),
+                    local.name
+                ));
+            }
+        } else if kind.is_dir() {
+            let skipped = at_root
+                && (name == "target"
+                    || (matches!(&*name, "tests" | "benches" | "examples") && !built.iter().any(|it| it.starts_with(&path))));
+            if skipped {
+                whole = false;
+                continue;
+            }
+            match walk(local, built, &path, stamps, files)? {
+                Walked::Whole => parts.push(path),
+                Walked::Parts(below) => {
+                    whole = false;
+                    parts.extend(below);
+                }
+            }
+            continue;
+        }
+        let relative = path.strip_prefix(&local.dir).map_err(|_| format!("{} is outside its package", path.display()))?;
+        files.push((slashed(relative), path.clone()));
+        parts.push(path);
+    }
+    Ok(if whole { Walked::Whole } else { Walked::Parts(parts) })
 }

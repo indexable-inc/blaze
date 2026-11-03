@@ -64,9 +64,10 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
     /// What any call gives is what it gives in order: a run ahead only saves time.
     fn speculate(&self, _db: &Db, _calling_crate: Crate, _call: ProcMacroCall<'_>) {}
 
-    /// The content ID of the library the macro is code of: what the key of a crate that
-    /// uses it covers (`hir_def::deps`). `None` when it is not known, which keeps the crates
-    /// that use the macro out of dependency images.
+    /// The content ID of the code the macro runs: its library's, and the compiled module it
+    /// runs in when it runs in one, which the front end's code identity does not cover. What
+    /// the key of a crate that uses it covers (`hir_def::deps`, the goal store's facts). `None`
+    /// when it is not known, which keeps the crates that use the macro out of dependency images.
     fn code(&self) -> Option<base_db::ContentId> {
         None
     }

@@ -328,7 +328,9 @@ pub struct Data {
     /// Written while the program runs: memory a static's value points to that is mutable,
     /// as rustc interns it (behind a `&mut` in a `static mut`, or interior mutability behind a
     /// `&`). rustc emits it as a global of its own, writable and never merged with another;
-    /// so is this, its ID its static's and not its content's alone.
+    /// so is this, its ID its static's and not its content's alone. Or a function's promoted
+    /// temporary its code writes each call (`promoted_slot` in hir-ty-codegen), its ID the
+    /// function instance's.
     pub writable: bool,
 }
 

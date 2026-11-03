@@ -10,7 +10,7 @@ use crate::{
     test_db::TestDB,
 };
 
-fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let fx = fixture::db(ra_fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
@@ -58,7 +58,7 @@ use crate::{A, B};
 
 use a::{c, d::{e}};
         "#,
-        expect![[r#"
+        &expect![[r#"
             #![no_std]
 
             // AstId: ExternCrate[3133, 0]
@@ -98,7 +98,7 @@ extern "C" {
     fn ex_fn();
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             #![feature(no_core)]
             #![no_core]
 
@@ -151,7 +151,7 @@ enum E {
     }
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             #![feature(no_core)]
             #![no_core]
 
@@ -192,7 +192,7 @@ trait Tr: SuperTrait + 'lifetime {
     fn method(&self);
 }
         "#,
-        expect![[r#"
+        &expect![[r#"
             #![feature(no_core)]
             #![no_core]
 
@@ -228,7 +228,7 @@ mod inline {
 
 mod outline;
         "#,
-        expect![[r##"
+        &expect![[r##"
             #![feature(no_core)]
             #![no_core]
 
@@ -259,7 +259,7 @@ pub macro m2() {}
 
 m!();
         "#,
-        expect![[r#"
+        &expect![[r#"
             #![feature(no_core)]
             #![no_core]
 
@@ -281,7 +281,7 @@ fn pub_self() {
         r#"
 pub(self) struct S;
         "#,
-        expect![[r#"
+        &expect![[r#"
             #![feature(no_core)]
             #![no_core]
 
@@ -297,7 +297,7 @@ fn crate_attrs_should_preserve_order() {
         r#"
 //- /main.rs crate:foo crate-attr:no_std crate-attr:features(f16) crate-attr:crate_type="bin"
         "#,
-        expect![[r##"
+        &expect![[r##"
             #![no_std]
             #![features(f16)]
             #![crate_type = "bin"]
@@ -311,7 +311,7 @@ fn crate_attrs_with_disabled_cfg_injected() {
         r#"
 //- /main.rs crate:foo crate-attr:no_std crate-attr:cfg(false) crate-attr:features(f16,f128) crate-attr:crate_type="bin"
         "#,
-        expect![[r#"
+        &expect![[r#"
             #![no_std]
             #![cfg(false)]
         "#]],
@@ -327,7 +327,7 @@ fn crate_attrs_with_disabled_cfg_in_source() {
 #![no_core]
         "#,
         // rustc appends `-Zcrate-attr`s to the source's and stops at the first false `cfg`.
-        expect![[r#"
+        &expect![[r#"
             #![cfg(false)]
         "#]],
     );
@@ -519,7 +519,7 @@ fn constructor_visibilities_keep_the_order_of_their_fields() {
     };
     let paths: Vec<String> = (all.iter())
         .map(|vis| match &tree[*vis] {
-            RawVisibility::Module(path, _) => path.display(&db, Edition::CURRENT).to_string(),
+            RawVisibility::Module(path, ..) => path.display(&db, Edition::CURRENT).to_string(),
             other => panic!("{other:?}"),
         })
         .collect();
@@ -595,7 +595,7 @@ pub fn f() {}
 /// each a `Vec` of its names (`Code for ModPath` in `crate::hir::persist`).
 fn decoded_paths(tree: &ItemTree) -> u64 {
     let vis = tree.vis().iter().filter_map(|vis| match vis {
-        RawVisibility::Module(path, _) => Some(path),
+        RawVisibility::Module(path, ..) => Some(path),
         _ => None,
     });
     let attrs = tree.attr_list().iter().map(|attr| &attr.path);

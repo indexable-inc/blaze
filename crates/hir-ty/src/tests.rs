@@ -2,6 +2,7 @@
 
 mod adjusted_ty;
 mod budget;
+mod closure_binder;
 mod coercion_lub;
 mod comptime_infer;
 mod comptime_solver;
@@ -28,5 +29,6 @@ mod ref_mut_bindings;
 mod impl_rpitit_tys;
 mod rpitit_nested;
 mod sizedness;
+mod variant_hygiene;
 mod struct_paths;
 mod trait_item_imports;

@@ -7,7 +7,9 @@
 //! header's types imply, and the impl must satisfy the outlives bounds of the trait, as
 //! `trait Foo: 'static`. The where clauses of an ADT, impl, trait or function must be
 //! well-formed given its bounds and what the types it assumes well-formed imply (a
-//! function's signature, an impl's header). Each item is a query of its own, as the borrow checker's bodies are;
+//! function's signature, an impl's header). The types a trait impl gives the trait's
+//! associated types and its methods' `impl Trait`s satisfy the bounds the trait declares of
+//! them (rustc's `check_type_bounds`, E0277 and E0477). Each item is a query of its own, as the borrow checker's bodies are;
 //! `docs/borrowck.md` in the repository describes what is checked.
 
 #![forbid(unsafe_code)]
@@ -20,6 +22,8 @@ mod compare;
 pub mod mem;
 mod outlives;
 mod persist;
+mod refine;
+mod type_bounds;
 
 #[cfg(test)]
 mod budget;
@@ -60,6 +64,7 @@ pub use compare::{
     compare_impl_method_signature, compare_proc_macro_signature, trait_signature_in_impl,
 };
 pub use outlives::Inferred;
+pub use refine::{ImplTraitRefinement, RefinementKind, Undercapture, impl_trait_refinement};
 pub use persist::{WfDiagnosticRef, WfResultRef, WfRow};
 use outlives::{Known, Needs, Wfcx};
 
@@ -216,7 +221,12 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
 
     /// What an item knows: its where clauses and what the types it assumes well-formed imply.
     fn known(&mut self, def: GenericDefId, assumed: &[Ty<'db>]) -> Known<'f, 'db> {
-        let mut known = Known::new(self.frame, self.clauses(def));
+        self.known_in(self.clauses(def), assumed)
+    }
+
+    /// What an item with the where clauses `clauses` knows, assuming `assumed` well-formed.
+    fn known_in(&mut self, clauses: &[Clause<'db>], assumed: &[Ty<'db>]) -> Known<'f, 'db> {
+        let mut known = Known::new(self.frame, clauses);
         let mut implied = Vec::new_in(self.frame);
         for &ty in assumed {
             outlives::wf(self.db, &mut self.inferred, ty, &mut implied);
@@ -227,6 +237,8 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
 
     fn impl_(&mut self, impl_: ImplId) {
         let db = self.db;
+        // The types it gives the trait's items satisfy their bounds (E0277, E0477).
+        self.type_bounds(impl_);
         let Some(header) = self.plain_header(impl_) else { return };
         let known = self.known(impl_.into(), &header);
         let mut needs = self.where_needs(impl_.into());
@@ -427,6 +439,7 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
             if ty.references_error() || ty.has_non_region_infer() {
                 continue;
             }
+            let hides = ty;
             let ty = outlives::without_body_regions(interner, outlives::outlived_as(db, ty));
             let site = Site::Opaque(function, index.into_raw().into_u32());
             found.clear();
@@ -446,6 +459,21 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
                         },
                         _ => region,
                     };
+                    // Each `impl Trait` in the hidden type outlives `region` by an outlives
+                    // bound of its own or by every argument it captures, as rustc's
+                    // `alias_ty_must_outlive`: `plain_t(t)` of `-> impl Plain + 'static`,
+                    // `plain_t<U>` returning an unbounded `impl Plain` that captures `U`,
+                    // needs `T: 'static`. The hidden type's regions are all erased
+                    // (`consider_opaque_type_use`), so an inner `impl Trait` with an outlives
+                    // bound is one of the body's, which the borrow checker proves
+                    // (`hidden_aliases_outlive`), as it does every lifetime captured here.
+                    let ty = outlives::without_body_regions(
+                        interner,
+                        outlives::outlived_as(
+                            db,
+                            known.hidden_opaques_as_captures(db, hides, region),
+                        ),
+                    );
                     found.push(Needs::Type(ty, region));
                 }
             }

@@ -87,6 +87,14 @@ impl<T> Col<T> {
         Col { ptr, len, owner: None, of: PhantomData }
     }
 
+    /// The bytes of its elements, not their own heap; none for an image's, which the image holds.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match &self.owner {
+            Some(Owner::Image(_)) => 0,
+            None | Some(Owner::Slab(_)) => size_of_val::<[T]>(self),
+        }
+    }
+
     /// Whether this column shares its allocation with others (for the allocation tests).
     #[cfg(test)]
     pub(crate) fn in_slab(&self) -> bool {

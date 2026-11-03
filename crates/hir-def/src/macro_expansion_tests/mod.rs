@@ -56,7 +56,7 @@ use crate::{
 };
 
 #[track_caller]
-fn check_errors(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+fn check_errors(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(false);
 
     let db = fixture::db(ra_fixture).into_db();
