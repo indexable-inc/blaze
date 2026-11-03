@@ -356,6 +356,29 @@ type), why it is tied, and the path of calls to the fiber's switch (`` `variance
 `get_or_run` → `suspend` ``). A generic body is checked as its own crate instantiates it; an
 instance only another crate makes is the may-suspend check's to report.
 
+## `thread_local_in_waiting_fn`
+
+Warn (`blaze::internal`). AGENTS.md rule 24: LLVM treats a thread-local's address as constant
+inside one function, so a function that reads a thread-local and also waits takes the address
+once and keeps using it after the fiber resumed on another worker (the 2026-11-02 "RefCell
+already borrowed" in `blaze_graph`'s pool: `CACHES.with` and `LOCAL.get()` inlined into
+`blaze_codegen::driver::Build::walk` across `sched::host::wait`). A read is a call of
+`LocalKey::{with, try_with, with_borrow, with_borrow_mut, get, set, take, replace}`, resolved by
+inference. A body may park when the may-suspend check (`hir_ty_suspend::suspend_points`) has a
+point in it. In such a body the lint finds:
+
+- each read in the body itself, closures included, `#[inline(never)]` or not (its own wait
+  splits it the same way);
+- each call of a function that reads a thread-local in its own body and can be inlined there:
+  not `#[inline(never)]`, and of the same crate, `#[inline]`, or generic. std's, core's and
+  alloc's functions are not followed.
+
+The finding names the thread-local (its `static`'s or `const`'s path, or the field holding it),
+the function, the reader for a call, and the path to the fiber's switch. The fix is the pattern
+of `pool::with_caches`, `pool::local` and `sched::host::job_begins`: a small `#[inline(never)]`
+reader that does not wait. Not seen: a read two calls down, a trait method called through a type
+parameter, and inlining across crates by LTO.
+
 ## `lock_across_query`
 
 Deny. AGENTS.md rule 9: a lock is held only for a field update, never across a query call. A

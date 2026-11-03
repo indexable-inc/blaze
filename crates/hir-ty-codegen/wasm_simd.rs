@@ -308,7 +308,7 @@ impl<'db> FunctionCx<'_, 'db> {
     /// The vector instructions this function's `simd_*` intrinsics may be given.
     fn vectors(&self) -> Option<Vectors> {
         match self.cg.target.arch {
-            Arch::Wasm32 => self.simd128().then_some(Vectors::Wasm),
+            Arch::Wasm32 | Arch::Wasm64 => self.simd128().then_some(Vectors::Wasm),
             Arch::Aarch64 => Some(Vectors::Neon),
             Arch::X86_64 => Some(Vectors::Sse2),
         }
@@ -1038,14 +1038,28 @@ impl<'db> FunctionCx<'_, 'db> {
         if !self.cg.target.is_wasm() {
             return Ok(false);
         }
-        let (scalars, instruction) = match name {
-            "wasm.memory.size.i32" => (1, Instruction::MemorySize),
-            "wasm.memory.grow.i32" => (1, Instruction::MemoryGrow),
-            "wasm.memory.atomic.wait32" => (0, Instruction::MemoryAtomicWait32),
-            "wasm.memory.atomic.wait64" => (0, Instruction::MemoryAtomicWait64),
-            "wasm.memory.atomic.notify" => (0, Instruction::MemoryAtomicNotify),
+        // `memory.size` and `memory.grow` count pages in the memory's own width: an `i32` of a
+        // 32-bit memory, an `i64` of a 64-bit one (`core::arch::wasm32::memory_size` names the
+        // `.i32` or `.i64` intrinsic by the pointer width).
+        let (scalars, instruction, result) = match name {
+            "wasm.memory.size.i32" => (1, Instruction::MemorySize, types::I32),
+            "wasm.memory.grow.i32" => (1, Instruction::MemoryGrow, types::I32),
+            "wasm.memory.size.i64" => (1, Instruction::MemorySize, types::I64),
+            "wasm.memory.grow.i64" => (1, Instruction::MemoryGrow, types::I64),
+            "wasm.memory.atomic.wait32" => (0, Instruction::MemoryAtomicWait32, types::I32),
+            "wasm.memory.atomic.wait64" => (0, Instruction::MemoryAtomicWait64, types::I32),
+            "wasm.memory.atomic.notify" => (0, Instruction::MemoryAtomicNotify, types::I32),
             _ => return self.wasm_llvm_vector(name, args, dst),
         };
+        if matches!(instruction, Instruction::MemorySize | Instruction::MemoryGrow)
+            && (result == types::I64) != self.cg.target.memory64()
+        {
+            unsupported!(
+                "`llvm.{name}` in code for {}, whose memory's addresses are {}",
+                self.cg.target.triple(),
+                if self.cg.target.memory64() { "64-bit" } else { "32-bit" }
+            );
+        }
         // The memory instructions name the first memory, the only one there is.
         let (memory, args) = args.split_at(scalars);
         if let [memory] = memory
@@ -1055,7 +1069,7 @@ impl<'db> FunctionCx<'_, 'db> {
         }
         let operands =
             args.iter().map(|it| Ok(self.load_scalar(it)?.0)).collect::<Result<Vec<_>>>()?;
-        let value = self.wasm_instruction(instruction, &operands, Some(types::I32));
+        let value = self.wasm_instruction(instruction, &operands, Some(result));
         self.builder.ins().store(MEM, value.expect("a result"), dst, 0);
         Ok(true)
     }

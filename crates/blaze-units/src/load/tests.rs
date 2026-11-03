@@ -22,8 +22,10 @@ pub(crate) const STD: &str = "/home/u/.cache/blaze/std/0b";
 /// Where the daemon places build directories nothing names ([`crate::query::BuildConfig::builds`]).
 pub(crate) const BUILDS: &str = "/home/u/.cache/blaze/build";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
-const CRATES_IO_SRC: &str = "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f";
-const CRATES_IO_INDEX: &str = "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f";
+/// Where the daemon keeps fetched packages: blaze's, never `$CARGO_HOME`.
+pub(crate) const SOURCES: &str = "/home/u/.cache/blaze/sources";
+const CRATES_IO_SRC: &str = "/home/u/.cache/blaze/sources/registry/src/index.crates.io-1949cf8c6b5b557f";
+const CRATES_IO_INDEX: &str = "/home/u/.cache/blaze/sources/registry/index/index.crates.io-1949cf8c6b5b557f";
 const SERDE_SHA256: &str = "5f0e2c6ed6606019b4e29e69dbaba95b11854410e5347d525002456dbbb786b6";
 /// serde 1.0.219's line of `https://index.crates.io/se/rd/serde`.
 const SERDE_LINE: &str = r#"{"name":"serde","vers":"1.0.219","deps":[],"cksum":"5f0e2c6ed6606019b4e29e69dbaba95b11854410e5347d525002456dbbb786b6","features":{"default":["std"],"std":[]},"yanked":false,"rust_version":"1.31"}"#;
@@ -165,6 +167,7 @@ impl Fixture {
             library: library_at(COMMIT),
             std: STD.to_owned(),
             builds: BUILDS.to_owned(),
+            sources: SOURCES.to_owned(),
         };
         self.db.open_with(View { root: self.tree.root(&files) }, &config.encode())
     }
@@ -536,6 +539,47 @@ fn a_virtual_workspace_builds_its_glob_members() {
     let only_b = Ask { args: &["-p", "b"], ..ask(&files) };
     let units = ready(fixture.plan(fixture.open(&only_b)));
     assert_eq!(roots_named(&units), ["b lib"]);
+}
+
+/// `-p` of a package the workspace reaches only as a build dependency: cargo panics
+/// (rust-lang/cargo#11105); blaze builds it for the host with the features its build-script
+/// user gives it, the unit that build script links. One reached only as a dev-dependency of a
+/// build without dev units is refused, naming the package and the rule.
+#[test]
+fn a_package_only_a_build_dependency_reaches_is_built_for_the_host_with_its_host_features() {
+    let fixture = Fixture::new();
+    let a = "[workspace]\nresolver = \"2\"\nexclude = [\"vendor\"]\n\n\
+             [package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [build-dependencies]\nb = { path = \"vendor/b\", features = [\"x\"] }\n\n\
+             [dev-dependencies]\nc = { path = \"vendor/c\" }\n";
+    let b = "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\nx = []\n";
+    let c = "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    let files = [
+        ("ws/Cargo.toml", a),
+        ("ws/build.rs", "fn main() {}\n"),
+        ("ws/src/lib.rs", ""),
+        ("ws/vendor/b/Cargo.toml", b),
+        ("ws/vendor/b/src/lib.rs", ""),
+        ("ws/vendor/c/Cargo.toml", c),
+        ("ws/vendor/c/src/lib.rs", ""),
+    ];
+    // `--target` the host's triple, so a unit built for the target says so in its platform.
+    let only_b = Ask { args: &["-p", "b", "--target", HOST], ..ask(&files) };
+    let units = ready(fixture.plan(fixture.open(&only_b)));
+    assert_eq!(roots_named(&units), ["b lib"]);
+    let (_, lib, _) = lib_of(&units, "b");
+    assert_eq!(lib.features, ["x"], "b's host features, as a's build script uses it");
+    assert_eq!(lib.platform, None, "built for the host, as a build dependency is");
+
+    let whole = units_of(&ready(fixture.plan(fixture.open(&ask(&files)))), "b").len();
+    assert_eq!(whole, 1, "the workspace's build has b once, for the host");
+
+    let only_c = Ask { args: &["-p", "c"], ..ask(&files) };
+    let error = failed(fixture.plan(fixture.open(&only_c)));
+    assert!(error.contains("`c v0.1.0") && error.contains("dev-dependency"), "{error}");
+    let tested = Ask { command: Command::Test, args: &["-p", "c"], ..ask(&files) };
+    let roots = roots_named(&ready(fixture.plan(fixture.open(&tested))));
+    assert!(!roots.is_empty() && roots.iter().all(|it| it == "c lib"), "{roots:?}");
 }
 
 #[test]

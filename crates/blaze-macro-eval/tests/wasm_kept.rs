@@ -66,7 +66,7 @@ fn a_modules_expansion_and_machine_code_are_found_by_the_next_build() {
     let mut store = kept_in(&mut sim);
     let keeping = kept::Keeping::new(Expansions { store: store.reader(), toolchain, environment: Arc::new(Environment::default()) })
         .unwrap_or_else(|why| panic!("{why}"));
-    let macros = blaze_macro_eval::Macros::new(kept::Keeps::In(keeping));
+    let macros = blaze_macro_eval::Macros::new(kept::Keeps::In(keeping), None);
 
     let modules = blaze_macro_eval::Modules::new().unwrap_or_else(|why| panic!("{why}"));
     let first = build(&config, &macros, &modules, &module);

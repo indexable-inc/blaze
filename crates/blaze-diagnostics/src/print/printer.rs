@@ -505,10 +505,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
             return self.print_impl_path(it, args);
         }
         let Some(parent) = paths::parent(self.cx, def) else {
-            let Def::Module(module) = def else {
-                unreachable!("only a crate root has no parent: {def:?}")
-            };
-            return self.print_crate_name(module.krate(self.db));
+            return self.print_unparented(def);
         };
         let mut parent_args = args;
         let mut qualify = false;
@@ -536,8 +533,30 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
             }
             parent => self.print_parent(&parent, parent_args),
         }
-        let name = def.name(self.cx).expect("a definition other than an impl or crate root is named");
-        self.path_segment(&name);
+        // None only for a block module (a crate root has no parent, an impl was printed
+        // above): rustc has no definition for a block, its items sit under the body's owner,
+        // which is the parent just printed.
+        if let Some(name) = def.segment(self.cx) {
+            self.path_segment(&name);
+        }
+    }
+
+    /// A definition `paths::parent` gives no parent: a crate root, by its crate's name, or
+    /// one written in a block whose body owner isn't found (a block in an array length, a
+    /// discriminant or a const argument, rustc's `{constant#N}`), under the module the block
+    /// is written in. A diagnostic about it still prints (rule panics-fail-one-job).
+    fn print_unparented(&mut self, def: Def) {
+        let Def::Module(module) = def else {
+            self.print_unparented(Def::Module(def.module(self.cx)));
+            if let Some(name) = def.segment(self.cx) {
+                self.path_segment(&name);
+            }
+            return;
+        };
+        match module.containing_module(self.db) {
+            Some(outer) if module.is_block_module(self.db) => self.print_def_path(Def::Module(outer.to_static()), &[]),
+            _ => self.print_crate_name(module.krate(self.db)),
+        }
     }
 
     /// The path an item is printed under: its parent definition's, or its body owner's and

@@ -3273,18 +3273,18 @@ mod tls_db {
 
     /// Moves the switching job's attached database off this thread: a job that attached one
     /// and waits on a query may resume on another thread, and reads it there.
-    fn take_attached() -> usize {
+    fn take_attached() -> Option<std::num::NonZeroUsize> {
         GLOBAL_DB
             .try_with(|it| it.database.replace(None))
             .ok()
             .flatten()
-            .map_or(0, |db| db.as_ptr().expose_provenance())
+            .and_then(|db| std::num::NonZeroUsize::new(db.as_ptr().expose_provenance()))
     }
 
     /// Puts back what [`take_attached`] took, on a thread with no database attached.
-    fn put_attached(taken: usize) {
+    fn put_attached(taken: std::num::NonZeroUsize) {
         assert!(attached().is_none(), "a job's database put back on a thread with one attached");
-        replace_attached(NonNull::new(std::ptr::with_exposed_provenance_mut(taken)));
+        replace_attached(NonNull::new(std::ptr::with_exposed_provenance_mut(taken.get())));
     }
 
     /// Carries the attached database with each job on a fiber ([`blaze_query::carry`]), from
@@ -3292,7 +3292,8 @@ mod tls_db {
     #[inline]
     fn carry_attached() {
         static CARRIED: std::sync::Once = std::sync::Once::new();
-        CARRIED.call_once(|| blaze_query::carry(blaze_query::Carried { take: take_attached, put: put_attached }));
+        // A borrowed database: ending it is forgetting it.
+        CARRIED.call_once(|| blaze_query::carry(blaze_query::Carried::word(take_attached, put_attached)));
     }
 
     #[inline]
@@ -3433,7 +3434,7 @@ mod tls_db {
             }
         }
 
-        /// On a pool of one worker, whose own slot a job that ended left holding a database, two
+        /// On a pool of one worker, after a job ended holding a database (ended with it), two
         /// jobs each attach a database of their own (one with `attach_db`, one with
         /// `attach_db_allow_change`) and park, the first on one key and the second on another;
         /// the keys end in the other order, so they resume on the one thread swapped. Each sees
@@ -3450,8 +3451,8 @@ mod tls_db {
             };
             super::carry_attached();
             {
-                let left = Arc::as_ptr(&dbs[2]).addr();
-                run("the job leaving its worker a database", Box::new(move || super::put_attached(left)));
+                let left = std::num::NonZeroUsize::new(Arc::as_ptr(&dbs[2]).addr()).expect("a database's address");
+                run("the job ending with a database attached", Box::new(move || super::put_attached(left)));
             }
             for round in 0..20u32 {
                 let [first, second] = [2 * round, 2 * round + 1].map(|at| {
@@ -3528,13 +3529,13 @@ mod tls_db {
             let db = fixture::db("fn f() {}").into_db();
             let here = std::ptr::from_ref(&db).addr();
             super::attach_db(&db, || {
-                let taken = super::take_attached();
-                assert_eq!(taken, here);
+                let taken = super::take_attached().expect("the job attached a database");
+                assert_eq!(taken.get(), here);
                 assert!(super::attached().is_none(), "the thread it left has none");
                 let (seen, back) = std::thread::spawn(move || {
                     super::put_attached(taken);
                     let seen = super::with_attached_db(|it| std::ptr::from_ref(it).addr());
-                    (seen, super::take_attached())
+                    (seen, super::take_attached().expect("the job's database moved with it"))
                 })
                 .join()
                 .unwrap();

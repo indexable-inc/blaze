@@ -204,7 +204,7 @@ fn resolve(db: &base_db::Db, krate: hir::Crate, path: &str) -> Vec<ModuleDef> {
                     }
                 }
                 ModuleDef::Adt(adt) => {
-                    for impl_ in hir::Impl::all_for_type(db, adt.ty(db)) {
+                    for impl_ in hir::Impl::all_for_type(db, krate, adt.ty(db)) {
                         if impl_.trait_(db).is_some() {
                             continue;
                         }

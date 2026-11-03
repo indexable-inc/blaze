@@ -226,18 +226,18 @@ fn answering() -> usize {
 }
 
 #[inline(never)]
-fn take_answering() -> usize {
-    ANSWERING.replace(0)
+fn take_answering() -> Option<std::num::NonZeroUsize> {
+    std::num::NonZeroUsize::new(ANSWERING.replace(0))
 }
 
 #[inline(never)]
-fn put_answering(taken: usize) {
-    ANSWERING.set(taken);
+fn put_answering(taken: std::num::NonZeroUsize) {
+    ANSWERING.set(taken.get());
 }
 
 fn carry_answering() {
     static CARRIED: std::sync::Once = std::sync::Once::new();
-    CARRIED.call_once(|| blaze_query::carry(blaze_query::Carried { take: take_answering, put: put_answering }));
+    CARRIED.call_once(|| blaze_query::carry(blaze_query::Carried::word(take_answering, put_answering)));
 }
 
 /// The job answers an expansion's question while it is held; ended on unwinding too.

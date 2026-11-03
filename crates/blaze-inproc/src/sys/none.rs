@@ -96,6 +96,8 @@ impl Exec {
         match *self {}
     }
 
+    pub(crate) fn after_fork() {}
+
     pub(crate) fn data(&mut self) -> &mut [u8] {
         match *self {}
     }

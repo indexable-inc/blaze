@@ -68,8 +68,8 @@ use crate::{
     item_scope::BuiltinShadowMode,
     item_tree::FieldsShape,
     lang_item::{LangItemTarget, LangItems},
-    nameres::{DefMap, LocalDefMap, MacroSubNs, block_def_map},
-    resolver::{HasResolver, macro_def_site},
+    nameres::{DefMap, Hygienic, LocalDefMap, MacroSubNs, block_def_map},
+    per_ns::Namespace,
     signatures::{StructSignature, TypeAliasSignature},
     type_ref::{
         ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId, Rawness,
@@ -1578,9 +1578,14 @@ impl<'db> ExprCollector<'db> {
         is_fn: bool,
     ) -> ExprId {
         self.awaitable_context.replace(awaitable);
+        // rustc's `lower_maybe_coroutine_body` wraps a body that is written: a required trait
+        // method (`TraitFn::Required`), a foreign fn or a free fn refused for having none
+        // makes no coroutine, so there is no `async` block of a missing body to infer, lower to
+        // MIR or hash. Its `impl Future` is a signature only, defined by each impl.
+        let has_body = expr.is_some();
         self.with_label_rib(RibKind::Closure, |this| {
             let body = if is_fn { this.collect_fn_body(expr) } else { this.collect_expr_opt(expr) };
-            if is_async_fn || is_gen_fn {
+            if (is_async_fn || is_gen_fn) && has_body {
                 let kind = match (is_async_fn, is_gen_fn) {
                     (true, true) => CoroutineKind::AsyncGen,
                     (true, false) => CoroutineKind::Async,
@@ -3087,40 +3092,41 @@ impl<'db> ExprCollector<'db> {
             Some(call) => Ok(self.expander.enter_expand_id(self.db, call)),
             None => {
                 let resolver = |path: &ModPath, ctx: SyntaxContext| {
+                    // Where a `macro`'s def-site hygiene says the path is looked up.
+                    let origin = self.def_map.hygienic_origin(
+                        self.db,
+                        self.module,
+                        path,
+                        Some(Namespace::Macros),
+                        ctx,
+                    );
                     // The latest `macro_rules!` of that name before the call, which is not
                     // the last one of the block when a later statement defines it again.
-                    let shadowing = path.as_ident().and_then(|name| {
-                        let seen = *self.current_block_legacy_macro_defs_count.get(name)?;
-                        let defs = self
-                            .def_map
-                            .module(self.db, self.def_map.root)
-                            .legacy_macro_in_scope(self.db, name)?;
-                        defs.get(seen.checked_sub(1)?).copied()
-                    });
+                    let shadowing = path.as_ident().filter(|_| origin == Hygienic::Here).and_then(
+                        |name| {
+                            let seen = *self.current_block_legacy_macro_defs_count.get(name)?;
+                            let defs = self
+                                .def_map
+                                .module(self.db, self.def_map.root)
+                                .legacy_macro_in_scope(self.db, name)?;
+                            defs.get(seen.checked_sub(1)?).copied()
+                        },
+                    );
                     if shadowing.is_some() {
                         return shadowing;
                     }
                     self.def_map
-                        .resolve_path(
+                        .resolve_path_from(
                             self.local_def_map,
                             self.db,
                             self.module,
                             path,
                             crate::item_scope::BuiltinShadowMode::Other,
                             Some(MacroSubNs::Bang),
+                            origin,
                         )
                         .0
                         .take_macros()
-                        .or_else(|| {
-                            let module = macro_def_site(self.db, HygieneId::new(ctx))?;
-                            let resolver = module.resolver(self.db);
-                            let found = resolver.resolve_path_as_macro(
-                                self.db,
-                                path,
-                                Some(MacroSubNs::Bang),
-                            )?;
-                            Some(found.def)
-                        })
                 };
                 // alloc: none unless the call is eager and its input holds macro calls
                 let mut eager_calls = Vec::new();

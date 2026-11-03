@@ -54,6 +54,7 @@ rustc_type_ir.workspace = true
 span.workspace = true
 stdx.workspace = true
 syntax.workspace = true
+tt.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

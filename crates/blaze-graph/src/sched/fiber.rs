@@ -1,5 +1,5 @@
 //! The fibers driver of the scheduler (docs/v2/plan/lanes/sched.md, phase 2): one worker thread per
-//! core of the shape, each running jobs on stackful fibers (corosensei). A job that waits switches
+//! core of the shape, each running jobs on stackful fibers ([`super::stack`]). A job that waits switches
 //! back to its worker, which tells the scheduler and runs whatever it decides next; the waiting job
 //! holds no thread, and resumes, on whichever core the scheduler says, when what it waits for is
 //! done.
@@ -30,7 +30,8 @@ use std::{
     any::Any,
     cell::Cell,
     fmt, io,
-    mem::{self, ManuallyDrop},
+    mem,
+    num::NonZeroUsize,
     ops::{Deref, DerefMut},
     panic::{self, AssertUnwindSafe},
     ptr,
@@ -42,13 +43,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use corosensei::{
-    Coroutine, CoroutineResult, Yielder,
-    stack::{DefaultStack, Stack},
-};
 use parking_lot::{Mutex, MutexGuard};
 
-use super::{CoreId, CounterId, Cores, Cycle, JobId, OWN, Spawn, Stats, Suspend, Wait, World, Yielded};
+use super::{
+    CoreId, CounterId, Cores, Cycle, JobId, OWN, Spawn, Stats, Suspend, Wait, World, Yielded,
+    stack::{FIBER_STACK, Resumed, Stack, Stackful, Yielder},
+};
 use crate::Key;
 
 /// What the driver runs: each job's payload, and how to run one.
@@ -72,10 +72,10 @@ pub struct Config {
 }
 
 impl Config {
-    /// Four fibers per core, 16 MiB stacks (the front end's deepest recursion runs on them),
-    /// and a few microseconds of spinning.
+    /// Four fibers per core, stacks of the target's [`FIBER_STACK`] (the front end's deepest
+    /// recursion runs on them), and a few microseconds of spinning.
     pub fn for_cores(cores: usize) -> Config {
-        Config { fibers: cores * 4, stack: 16 << 20, spin: 1 << 10 }
+        Config { fibers: cores * 4, stack: FIBER_STACK, spin: 1 << 10 }
     }
 }
 
@@ -142,33 +142,8 @@ enum Want {
 }
 
 /// A fiber: a coroutine that runs job after job, never ending until told to, and its number
-/// ([`Switch::fiber`]).
+/// ([`Switch::fiber`]). Never dropped suspended mid-job ([`Stackful`]).
 struct Fiber<J>(Stackful<In<J>, Out>, u32);
-
-/// A coroutine that is never dropped suspended mid-job: such a one is leaked, stack and all.
-/// Dropping it would force-unwind the job, whose own `catch_unwind` swallows corosensei's
-/// unwind and goes on into code that panics, and corosensei aborts the process on that panic.
-pub(super) struct Stackful<I, O>(ManuallyDrop<Coroutine<I, O, (), DefaultStack>>);
-
-impl<I, O> Stackful<I, O> {
-    pub(super) fn new(coroutine: Coroutine<I, O, (), DefaultStack>) -> Stackful<I, O> {
-        Stackful(ManuallyDrop::new(coroutine))
-    }
-
-    pub(super) fn resume(&mut self, input: I) -> CoroutineResult<O, ()> {
-        self.0.resume(input)
-    }
-}
-
-impl<I, O> Drop for Stackful<I, O> {
-    #[allow(unsafe_code)]
-    fn drop(&mut self) {
-        if !self.0.started() || self.0.done() {
-            // SAFETY: dropped once, here, and never used after.
-            unsafe { ManuallyDrop::drop(&mut self.0) };
-        }
-    }
-}
 
 /// Fibers made in the process: the next one's number.
 static FIBERS: AtomicU32 = AtomicU32::new(0);
@@ -392,6 +367,10 @@ struct Shared<W: Work> {
     start: Instant,
     go: AtomicBool,
     stop: AtomicBool,
+    /// Set by [`Driver::fail_new_fibers`]: the next fiber made fails as an unmapped stack
+    /// would, so a test reaches the failed-driver path.
+    #[cfg(test)]
+    fail_fibers: AtomicBool,
 }
 
 impl<W: Work> Shared<W> {
@@ -443,12 +422,15 @@ impl<W: Work> Shared<W> {
 
 fn new_fiber<W: Work>(shared: &Arc<Shared<W>>) -> Result<Fiber<W::Job>, DriverError> {
     let bytes = shared.config.stack;
-    let stack = DefaultStack::new(bytes).map_err(|why| DriverError::Stack { bytes, why })?;
-    // The stack has at least `bytes` above its guard page, which `Stack::limit` counts in.
-    let limit = stack.base().get() - bytes;
+    #[cfg(test)]
+    if shared.fail_fibers.load(Ordering::Acquire) {
+        return Err(DriverError::Stack { bytes, why: io::Error::other("a test failed the driver's next fiber") });
+    }
+    let stack = Stack::new(bytes).map_err(|why| DriverError::Stack { bytes, why })?;
+    let limit = stack.limit();
     let shared = Arc::clone(shared); // clone: one per fiber made, held for its life
     let number = FIBERS.fetch_add(1, Ordering::Relaxed);
-    Ok(Fiber(Stackful::new(Coroutine::with_stack(stack, move |yielder, first| body(&shared, limit, yielder, first))), number))
+    Ok(Fiber(Stackful::new(stack, number, move |yielder, first| body(&shared, limit, yielder, first)), number))
 }
 
 /// A fiber's life: run each job it is started with, report its end, and wait for the next.
@@ -749,14 +731,43 @@ pub fn miss() {
 /// A thread-local that a job's code keeps across a wait (the query engine's active frames):
 /// when the job parks (it waits, or moves, and its core runs something else), `take` moves its
 /// value off the thread, leaving the thread's empty, and `put` moves it onto whichever thread
-/// resumes the job. A wait that comes back at once moves nothing. Both run on the worker's
-/// stack under the driver's lock: they must not call into the driver. Registered once, with
-/// [`carry`], before any driver runs.
+/// resumes the job. A wait that comes back at once moves nothing. `take` and `put` run on the
+/// worker's stack, under the fiber driver's lock; `end` runs as a job ends (on its worker,
+/// under that lock too, or outside the global lock on a host's thread) or, for a failed
+/// driver's parked jobs, on the thread that joins it, after its lock is let go. None of them
+/// may call into the driver. Registered once, with [`carry`], before any driver runs.
+///
+/// A value `take` gave is owned by exactly one place until it is put back or ended: a parked
+/// job's [`Taken`], or the thread it was put on. Nothing drops one silently: as a job ends, each
+/// value it still holds is ended through `end`, and the thread gets back exactly what it held
+/// before the job came on ([`go_off_ended`]); a parked job's record dropped without resuming
+/// ends its values too ([`Taken`]'s `Drop`). So a carried value cannot leak by construction:
+/// one whose `take` gives a value for an empty state (a box made for nothing, as the query
+/// stack's once did, 5.2 GiB building blaze's tree with one worker) costs a box per switch,
+/// freed by its `end`, never one per job lost.
 #[derive(Clone, Copy)]
 pub struct Carried {
-    pub take: fn() -> usize,
-    pub put: fn(usize),
+    /// Moves this thread's value off it, leaving the default; `None` when the thread holds the
+    /// default, so there is nothing to carry and nothing moves.
+    pub take: fn() -> Option<NonZeroUsize>,
+    /// Puts a value `take` gave onto this thread, which holds the default.
+    pub put: fn(NonZeroUsize),
+    /// Ends a value `take` gave that no thread takes back: its job ended holding it, or its
+    /// parked record was dropped. Frees what the value owns (a box, a slot); a word that owns
+    /// nothing ([`Carried::word`]) is forgotten.
+    pub end: fn(NonZeroUsize),
 }
+
+impl Carried {
+    /// A carried word that owns nothing (a count, a flag, an id, a borrowed address): ending it
+    /// is forgetting it.
+    pub const fn word(take: fn() -> Option<NonZeroUsize>, put: fn(NonZeroUsize)) -> Carried {
+        Carried { take, put, end: forget }
+    }
+}
+
+/// The `end` of a [`Carried::word`].
+fn forget(_: NonZeroUsize) {}
 
 /// The most thread-locals carried with a job.
 pub const MAX_CARRIED: usize = 32;
@@ -774,20 +785,20 @@ static CARRIED_LEN: AtomicUsize = AtomicUsize::new(0);
 pub(super) fn carry_stack_limit() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        carry(Carried { take: blaze_reclaim::park, put: blaze_reclaim::unpark });
-        carry(Carried { take: super::host::take_scope, put: super::host::put_scope });
-        carry(Carried { take: blaze_mem::frame::take_current, put: blaze_mem::frame::put_current });
-        carry(Carried { take: blaze_mem::frame::take_below, put: blaze_mem::frame::put_below });
-        carry(Carried { take: blaze_mem::frame::take_cancelling, put: blaze_mem::frame::put_cancelling });
-        carry(Carried { take: crate::pump::take_gave_ways, put: crate::pump::put_gave_ways });
-        carry(Carried {
-            take: || {
+        carry(Carried { take: blaze_reclaim::park, put: blaze_reclaim::unpark, end: blaze_reclaim::end_parked });
+        carry(Carried::word(super::host::take_scope, super::host::put_scope));
+        carry(Carried::word(blaze_mem::frame::take_current, blaze_mem::frame::put_current));
+        carry(Carried::word(blaze_mem::frame::take_below, blaze_mem::frame::put_below));
+        carry(Carried::word(blaze_mem::frame::take_cancelling, blaze_mem::frame::put_cancelling));
+        carry(Carried::word(crate::pump::take_gave_ways, crate::pump::put_gave_ways));
+        carry(Carried::word(
+            || {
                 let limit = stdx::fiber_stack_limit();
                 stdx::set_fiber_stack_limit(0);
-                limit
+                NonZeroUsize::new(limit)
             },
-            put: stdx::set_fiber_stack_limit,
-        });
+            |limit| stdx::set_fiber_stack_limit(limit.get()),
+        ));
     });
 }
 
@@ -802,21 +813,49 @@ pub fn carry(carried: Carried) {
     let _ = CARRIED[at].set(carried);
 }
 
-/// What a switching job takes off its thread: each carried thread-local's value, `None` for
-/// one not registered yet when it switched out (so it is not put back either).
-pub(super) type Taken = [Option<usize>; MAX_CARRIED];
+/// What a switching job took off its thread: each carried thread-local's value, `None` where
+/// the thread held the default (or the thread-local was not registered yet). It owns what it
+/// holds until [`put_carried`] moves it onto a thread or [`end_carried`] ends it; dropped
+/// holding any, it ends them, so no path loses one.
+pub(super) struct Taken([Option<NonZeroUsize>; MAX_CARRIED]);
 
-/// Takes each carried thread-local off this thread into `taken`, leaving each at its default:
-/// every one, even past one whose take panics, so none is left behind; the first panic.
+impl Taken {
+    pub(super) const EMPTY: Taken = Taken([None; MAX_CARRIED]);
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(Option::is_none)
+    }
+}
+
+impl Drop for Taken {
+    /// A parked job dropped without resuming (its driver or pool gone first): its values are
+    /// ended, as at a job's end. A panic of an `end` goes on unwinding unless the thread
+    /// already does, which keeps its first panic.
+    fn drop(&mut self) {
+        if let Some(panic) = end_carried(self)
+            && !thread::panicking()
+        {
+            panic::resume_unwind(panic);
+        }
+    }
+}
+
+/// Takes each carried thread-local off this thread into `taken`, which holds nothing, leaving
+/// each at its default: every one, even past one whose take panics, so none is left behind;
+/// the first panic.
+///
+/// # Panics
+///
+/// Where `taken` holds a value: writing over it would lose it.
 #[inline(never)]
 fn take_carried(taken: &mut Taken) -> Option<Panic> {
-    *taken = [None; MAX_CARRIED];
+    assert!(taken.is_empty(), "carried thread-locals taken into a record that holds another job's");
     let len = CARRIED_LEN.load(Ordering::Acquire).min(MAX_CARRIED);
     let mut failed = None;
-    for (slot, carried) in taken.iter_mut().zip(&CARRIED[..len]) {
+    for (slot, carried) in taken.0.iter_mut().zip(&CARRIED[..len]) {
         if let Some(carried) = carried.get() {
             match panic::catch_unwind(carried.take) {
-                Ok(value) => *slot = Some(value),
+                Ok(value) => *slot = value,
                 Err(panic) => _ = failed.get_or_insert(panic),
             }
         }
@@ -824,15 +863,32 @@ fn take_carried(taken: &mut Taken) -> Option<Panic> {
     failed
 }
 
-/// Puts what [`take_carried`] took onto this thread, whose carried thread-locals are each at
-/// their default: every one, even past one whose put panics; the first panic.
+/// Moves what [`take_carried`] took onto this thread, whose carried thread-locals are each at
+/// their default, leaving `taken` empty: every one, even past one whose put panics; the first
+/// panic. A value whose put panicked is the put's: it was handed over.
 #[inline(never)]
-fn put_carried(taken: &Taken) -> Option<Panic> {
+fn put_carried(taken: &mut Taken) -> Option<Panic> {
     let mut failed = None;
-    for (value, carried) in taken.iter().zip(&CARRIED) {
-        if let (Some(value), Some(carried)) = (value, carried.get()) {
-            let value = *value;
+    for (value, carried) in taken.0.iter_mut().zip(&CARRIED) {
+        if let Some(value) = value.take() {
+            let carried = carried.get().expect("a carried value of a thread-local that was never registered");
             if let Err(panic) = panic::catch_unwind(move || (carried.put)(value)) {
+                failed.get_or_insert(panic);
+            }
+        }
+    }
+    failed
+}
+
+/// Ends each value `taken` holds through its thread-local's `end`, leaving `taken` empty:
+/// every one, even past one whose end panics; the first panic.
+#[inline(never)]
+fn end_carried(taken: &mut Taken) -> Option<Panic> {
+    let mut failed = None;
+    for (value, carried) in taken.0.iter_mut().zip(&CARRIED) {
+        if let Some(value) = value.take() {
+            let carried = carried.get().expect("a carried value of a thread-local that was never registered");
+            if let Err(panic) = panic::catch_unwind(move || (carried.end)(value)) {
                 failed.get_or_insert(panic);
             }
         }
@@ -845,11 +901,12 @@ fn put_carried(taken: &Taken) -> Option<Panic> {
 // it goes off (parks or ends) the thread gets that back. So each job runs with its own values
 // only, whatever another job or the worker itself left on the thread.
 
-/// A job comes on this thread: what it holds is taken into `worker`, and the job's (`job`, of
-/// a job that resumes; none for one that starts) put in its place. What the job is resumed
-/// with: the first panic of the swap or `failed` (of its take as it parked), for it to raise.
+/// A job comes on this thread: what it holds is taken into `worker` (empty), and the job's
+/// (`job`, of a job that resumes, left empty; none for one that starts) put in its place. What
+/// the job is resumed with: the first panic of the swap or `failed` (of its take as it parked),
+/// for it to raise.
 #[inline(never)]
-pub(super) fn come_on(worker: &mut Taken, job: Option<&Taken>, failed: Option<Panic>) -> Answer {
+pub(super) fn come_on(worker: &mut Taken, job: Option<&mut Taken>, failed: Option<Panic>) -> Answer {
     let mut failed = failed;
     if let Some(panic) = take_carried(worker) {
         failed.get_or_insert(panic);
@@ -860,10 +917,10 @@ pub(super) fn come_on(worker: &mut Taken, job: Option<&Taken>, failed: Option<Pa
     failed.map_or(Answer::Ready, Answer::Raise)
 }
 
-/// A job parks: its values are taken into `job`, and the thread gets `worker` back. The first
-/// panic, for the job to raise when it resumes.
+/// A job parks: its values are taken into `job` (empty), and the thread gets `worker` back,
+/// which is left empty. The first panic, for the job to raise when it resumes.
 #[inline(never)]
-pub(super) fn go_off(job: &mut Taken, worker: &Taken) -> Option<Panic> {
+pub(super) fn go_off(job: &mut Taken, worker: &mut Taken) -> Option<Panic> {
     let mut failed = take_carried(job);
     if let Some(panic) = put_carried(worker) {
         failed.get_or_insert(panic);
@@ -871,21 +928,17 @@ pub(super) fn go_off(job: &mut Taken, worker: &Taken) -> Option<Panic> {
     failed
 }
 
-/// A job ended: the thread gets `worker` back. A value the job left set stays on the thread
-/// where the worker held none, as the worker's own, which no job sees (each comes on with the
-/// worker's set aside); where the worker held one too, the job's is leaked. The first panic.
+/// A job ended: each value it still holds is ended through its `end`, and the thread gets
+/// exactly `worker`'s back (left empty). No value of the job outlives it, and none is dropped
+/// unended. The first panic.
 #[inline(never)]
-pub(super) fn go_off_ended(worker: &Taken) -> Option<Panic> {
-    let mut left = [None; MAX_CARRIED];
+pub(super) fn go_off_ended(worker: &mut Taken) -> Option<Panic> {
+    let mut left = Taken::EMPTY;
     let mut failed = take_carried(&mut left);
-    for (left, worker) in left.iter_mut().zip(worker) {
-        if let Some(held) = *worker
-            && held != 0
-        {
-            *left = Some(held);
-        }
+    if let Some(panic) = end_carried(&mut left) {
+        failed.get_or_insert(panic);
     }
-    if let Some(panic) = put_carried(&left) {
+    if let Some(panic) = put_carried(worker) {
         failed.get_or_insert(panic);
     }
     failed
@@ -980,6 +1033,10 @@ pub struct Given {
     pub spawner: u64,
     /// When, on the observer's clock; 0 when not said.
     pub at: u64,
+    /// The build the giver worked for, as the observer numbers builds; 0 for none. The job
+    /// works for it too, so its spans and switches are the build's (a job given by a build's
+    /// task is that build's work, on whichever thread it runs).
+    pub build: u32,
 }
 
 #[expect(clippy::disallowed_types, reason = "the process's one profiler hook, set once, read with no lock at every pool submit")]
@@ -1117,6 +1174,8 @@ impl<W: Work> Driver<W> {
             start: Instant::now(),
             go: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_fibers: AtomicBool::new(false),
         });
         let mut fibers = Vec::with_capacity(config.fibers);
         for _ in 0..config.fibers {
@@ -1196,6 +1255,13 @@ impl<W: Work> Driver<W> {
         }
     }
 
+    /// Makes every fiber this driver makes from now on fail as an unmapped stack would: the
+    /// failed-driver path, for a test.
+    #[cfg(test)]
+    pub(super) fn fail_new_fibers(&self) {
+        self.shared.fail_fibers.store(true, Ordering::Release);
+    }
+
     /// A job of the driver's (no parent).
     ///
     /// # Panics
@@ -1264,20 +1330,31 @@ impl<W: Work> Driver<W> {
         let mut st = self.shared.lock();
         for mut fiber in st.idle.drain(..) {
             match fiber.0.resume(In::Exit) {
-                CoroutineResult::Return(()) => {}
-                CoroutineResult::Yield(_) => unreachable!("an idle fiber told to exit ends"),
+                Resumed::Return => {}
+                Resumed::Yield(_) => unreachable!("an idle fiber told to exit ends"),
             }
         }
-        // Fibers of jobs that never ended (the driver failed): their stacks hold frames that
-        // may hold locks, so they are not unwound; dropped, they stay mapped until the process
-        // ends (`Stackful`).
-        for slot in &mut st.slots {
-            *slot = Slot::Free;
-        }
+        // Jobs that never ended (the driver failed): taken out under the lock, ended after it.
+        let slots = mem::take(&mut st.slots);
         let member = self.shared.member;
         let stats = st.world().leave(member).map(|place| place.stats()).unwrap_or_default();
         st.global.io[member as usize] = None;
-        (stats, st.failed.take(), st.panic.take())
+        let (failed, mut panicked) = (st.failed.take(), st.panic.take());
+        drop(st);
+        // Outside the driver's lock, and after the member left the world, so a panicking `end`
+        // leaves no member behind and runs no foreign code under the lock. Their fibers' stacks
+        // hold frames that may hold locks, so they are not unwound; dropped, they stay mapped
+        // until the process ends (`Stackful`). The values the jobs carried are ended here,
+        // every one even past a panicking `end`, whose panic the joiner raises.
+        for slot in slots {
+            if let Slot::Parked(fiber, mut taken, _) = slot {
+                drop(fiber);
+                if let Some(panic) = end_carried(&mut taken) {
+                    panicked.get_or_insert(panic);
+                }
+            }
+        }
+        (stats, failed, panicked)
     }
 }
 
@@ -1354,9 +1431,9 @@ fn idle<W: Work>(shared: &Shared<W>, slot: &CoreSlot, deadline: Option<u64>) {
 /// parks, and gives the thread `worker`'s back ([`go_off`]): before the job is visible as
 /// parked, so no core resumes it first. Only a job that really waits or moves pays for it; a
 /// wait that comes back at once leaves them where they are.
-fn park_carried<W: Work, J>(st: &mut State<W>, fiber: Fiber<J>, worker: &Taken) -> Slot<J> {
+fn park_carried<W: Work, J>(st: &mut State<W>, fiber: Fiber<J>, worker: &mut Taken) -> Slot<J> {
     // alloc: a box once per job parked at once, then kept in `spare_taken`.
-    let mut taken = st.spare_taken.pop().unwrap_or_else(|| Box::new([None; MAX_CARRIED]));
+    let mut taken = st.spare_taken.pop().unwrap_or_else(|| Box::new(Taken::EMPTY));
     let failed = go_off(&mut taken, worker);
     Slot::Parked(fiber, taken, failed)
 }
@@ -1372,7 +1449,7 @@ fn run<'a, W: Work>(
     let member = shared.member;
     let j = local as usize;
     let job = st.world().place(member).global(local);
-    let mut worker = [None; MAX_CARRIED];
+    let mut worker = Taken::EMPTY;
     let (mut fiber, mut input) = match mem::replace(&mut st.slots[j], Slot::Running) {
         Slot::Fresh(payload) => {
             let fiber = match st.idle.pop() {
@@ -1392,8 +1469,8 @@ fn run<'a, W: Work>(
             switched(&st.global.world, SwitchEvent::Started, job, fiber.1, me);
             (fiber, In::Start(job, payload))
         }
-        Slot::Parked(fiber, taken, failed) => {
-            let answer = come_on(&mut worker, Some(&taken), failed);
+        Slot::Parked(fiber, mut taken, failed) => {
+            let answer = come_on(&mut worker, Some(&mut *taken), failed);
             st.spare_taken.push(taken);
             switched(&st.global.world, SwitchEvent::Resumed, job, fiber.1, me);
             (fiber, In::Go(answer))
@@ -1405,8 +1482,8 @@ fn run<'a, W: Work>(
     shared.cores[me as usize].moving.store(false, Ordering::Relaxed);
     loop {
         let out = match fiber.0.resume(input) {
-            CoroutineResult::Yield(out) => out,
-            CoroutineResult::Return(()) => unreachable!("a fiber ends only when told to exit"),
+            Resumed::Yield(out) => out,
+            Resumed::Return => unreachable!("a fiber ends only when told to exit"),
         };
         clear();
         let mut st = shared.lock();
@@ -1426,7 +1503,7 @@ fn run<'a, W: Work>(
                     Some(Err(cycle)) => In::Go(Answer::Cycle(cycle)),
                     Some(Ok(Suspend::Waiting)) => {
                         switched(&st.global.world, SwitchEvent::Parked(on), job, fiber.1, me);
-                        st.slots[j] = park_carried(&mut st, fiber, &worker);
+                        st.slots[j] = park_carried(&mut st, fiber, &mut worker);
                         let next = shared.dispatch(&mut st, Some(me));
                         return (st, next);
                     }
@@ -1436,14 +1513,16 @@ fn run<'a, W: Work>(
                 Yielded::Stay => In::Go(Answer::Ready),
                 Yielded::Moved => {
                     switched(&st.global.world, SwitchEvent::Parked(None), job, fiber.1, me);
-                    st.slots[j] = park_carried(&mut st, fiber, &worker);
+                    st.slots[j] = park_carried(&mut st, fiber, &mut worker);
                     let next = shared.dispatch(&mut st, Some(me));
                     return (st, next);
                 }
             },
             Out::Done(panicked) => {
-                let left = go_off_ended(&worker);
+                // The observer is told first, while the thread still holds the job's own
+                // values (its build in the profiler's state), which `go_off_ended` ends.
                 switched(&st.global.world, SwitchEvent::Ended, job, fiber.1, me);
+                let left = go_off_ended(&mut worker);
                 st.world().done(member, job);
                 st.slots[j] = Slot::Free;
                 st.free.push(local);

@@ -724,7 +724,7 @@ fn push_fields(
             fields.reserve(it.fields().count());
             for field in it.fields() {
                 let name = name_to_token(call_site, tm, field.name())?;
-                fields.push(tt::Ident { span: at_field(name.span), ..name });
+                fields.push(field_name_in_derive(name, call_site));
             }
             FieldsKind::Record
         }
@@ -743,6 +743,24 @@ fn push_fields(
             FieldsKind::Tuple
         }
     })
+}
+
+/// A record field's `name` as the derive writes it: where the item wrote it, in the derive's
+/// context (`call_site`'s), and raw where a keyword could be read in its place.
+///
+/// The derive's context has the edition of the crate that defines the derive (core's), which
+/// may reserve a word the item's edition left free: `gen` written in 2021 (streaming-iterator
+/// 0.1.9's `FromFn`), `async` in 2015. rustc's derives never read their output back, and print
+/// such a name raw by `Ident::is_raw_guess` (reserved in the name's edition); here the output is
+/// parsed, each identifier in its context's edition, so the name is raw wherever any edition
+/// reserves it, which reads as the same field in every edition. A path keyword (`self`,
+/// `crate`, ...) has no raw form (`Symbol::can_be_raw`) and is no field's name.
+fn field_name_in_derive(name: tt::Ident, call_site: Span) -> tt::Ident {
+    let text = name.sym.as_str();
+    let reserved = SyntaxKind::from_keyword(text, Edition::LATEST).is_some()
+        && !matches!(text, "self" | "Self" | "super" | "crate" | "_");
+    let is_raw = if reserved { tt::IdentIsRaw::Yes } else { name.is_raw };
+    tt::Ident { span: Span { ctx: call_site.ctx, ..name.span }, is_raw, ..name }
 }
 
 fn len_u32(len: usize) -> u32 {
@@ -1573,12 +1591,14 @@ fn hash_derive<'f>(
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let krate = &dollar_crate(span);
     let trait_path = group(span, |b| quote_into!(b, span => #krate::hash::Hash));
+    // The hasher is `__H`, as rustc's, so a type with a parameter `H` of its own derives it
+    // (no E0403).
     expand_simple_derive(frame, span, info, &trait_path, false, true, |b, adt| {
         if adt.is_empty_enum() {
             let star = punct('*', tt::Spacing::Alone, span);
             return in_group(b, span, |b| {
                 quote_into!(b, span =>
-                    fn hash<H: #krate::hash::Hasher>(&self, ra_expand_state: &mut H) {
+                    fn hash<__H: #krate::hash::Hasher>(&self, ra_expand_state: &mut __H) {
                         match #star self {}
                     }
                 )
@@ -1586,7 +1606,7 @@ fn hash_derive<'f>(
         }
         let selfs = adt.bindings("_self");
         in_group(b, span, |b| {
-            quote_into!(b, span => fn hash<H: #krate::hash::Hasher>(&self, ra_expand_state: &mut H));
+            quote_into!(b, span => fn hash<__H: #krate::hash::Hasher>(&self, ra_expand_state: &mut __H));
             delimited(b, tt::DelimiterKind::Brace, span, |b| {
                 // rustc leaves the discriminant out when there is only one variant.
                 in_group(b, span, |b| {

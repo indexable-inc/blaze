@@ -40,6 +40,53 @@ pub use self::storage::{
 
 pub const MAX_GLUED_PUNCT_LEN: usize = 3;
 
+/// rustc's `Token::glue` of punctuation, the one copy of it: the token that `left` (one
+/// punctuation token, as text) and the character `right` written right after it lex as, if
+/// they make one. rustc's lexer gives one token per character and glues each joint one onto
+/// the token before it, left to right, so folding the characters of `..=` through this gives
+/// `..`, then `..=`; no glued token is longer than [`MAX_GLUED_PUNCT_LEN`].
+pub fn glue(left: &str, right: char) -> Option<&'static str> {
+    Some(match (left, right) {
+        ("=", '=') => "==",
+        ("=", '>') => "=>",
+        ("<", '=') => "<=",
+        ("<", '<') => "<<",
+        ("<", '-') => "<-",
+        ("<<", '=') => "<<=",
+        (">", '=') => ">=",
+        (">", '>') => ">>",
+        (">>", '=') => ">>=",
+        ("!", '=') => "!=",
+        ("+", '=') => "+=",
+        ("-", '=') => "-=",
+        ("-", '>') => "->",
+        ("*", '=') => "*=",
+        ("/", '=') => "/=",
+        ("%", '=') => "%=",
+        ("^", '=') => "^=",
+        ("&", '=') => "&=",
+        ("&", '&') => "&&",
+        ("|", '=') => "|=",
+        ("|", '|') => "||",
+        (".", '.') => "..",
+        ("..", '.') => "...",
+        ("..", '=') => "..=",
+        (":", ':') => "::",
+        _ => return None,
+    })
+}
+
+/// [`glue`] over every character of `right`: the token `left` and `right` written together lex
+/// as, if they make one.
+pub fn glue_str(left: &str, right: &str) -> Option<&'static str> {
+    let mut chars = right.chars();
+    let mut glued = glue(left, chars.next()?)?;
+    for char in chars {
+        glued = glue(glued, char)?;
+    }
+    Some(glued)
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Lit {
     pub kind: LitKind,
@@ -185,7 +232,8 @@ pub struct TokenTreesView<'a> {
     end: u32,
 }
 
-const _: () = assert!(size_of::<TokenTreesView<'_>>() == 16);
+// A reference and two `u32`s: 16 bytes on a 64-bit target.
+const _: () = assert!(size_of::<TokenTreesView<'_>>() == size_of::<usize>() + 8);
 
 impl<'a> TokenTreesView<'a> {
     #[inline]
@@ -902,12 +950,6 @@ pub fn stringify<F: Fn(Span, &str) -> Option<bool> + ?Sized>(
         }
     }
 
-    /// The operators that are one token to rustc and several here.
-    const OPERATORS: &[&str] = &[
-        "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "..", "...", "..=", "<<", ">>",
-        "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<-",
-    ];
-
     const KEYWORDS: &[&str] = &[
         "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "for",
         "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "ref", "return", "self",
@@ -956,12 +998,9 @@ pub fn stringify<F: Fn(Span, &str) -> Option<bool> + ?Sized>(
                 // A token of a macro's body is `Alone` to rustc.
                 return matches!(it.spacing, Spacing::Joint)
                     && operator.is_some_and(|operator| {
-                        punct(next).is_some_and(|next| {
-                            OPERATORS.iter().any(|it| {
-                                it.strip_prefix(operator)
-                                    .is_some_and(|rest| rest.starts_with(next))
-                            })
-                        })
+                        // Every prefix of a glued token is one too, so this is whether some
+                        // operator goes on with `next`.
+                        punct(next).is_some_and(|next| crate::glue(operator, next).is_some())
                     });
             }
             TtElement::Leaf(leaf) if !leaf.span().ctx.is_root() => return false,

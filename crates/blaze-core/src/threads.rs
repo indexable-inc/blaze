@@ -1,7 +1,9 @@
 //! A [`Driver`] on the real file system: a few threads run blocking calls, and the thread that
 //! polls keeps the timers. Portable: the reference the other drivers are tested against. Two
 //! appends to one file in flight at once may land in either order, as with any asynchronous
-//! driver; a state machine that needs their order waits for the first.
+//! driver; a state machine that needs their order waits for the first. On WASI (the
+//! wasm32-wasip1 seed, todo/bootstrap/plan.md), which has no threads, it starts none: each file
+//! call is made as it is submitted, and a poll waits only for a timer.
 //!
 //! What may wait on a peer for as long as the peer likes (a process, a listen, a receive, a
 //! send, a connect, a watch on Linux) is an errand, run by a pool of threads that grows to the
@@ -51,13 +53,19 @@ const SPARE: usize = 16;
 const CONNECTIONS: u32 = 1 << 20;
 
 /// Why a process or a socket fails here.
-#[cfg(not(unix))]
+#[cfg(windows)]
 const UNIX_ONLY: &str =
     "processes and sockets are built on Unix only; Windows' are lane usercode's (AppContainer and job objects)";
+/// Why a process or a socket fails here.
+#[cfg(target_os = "wasi")]
+const UNIX_ONLY: &str = "a process spawn, a kill, a listen, a connect, a receive, a send and a hangup are refused on \
+     WASI (the wasm32-wasip1 seed): it has no processes and no sockets; the seed runs build \
+     scripts and proc macros as wasm modules of its own (todo/bootstrap/plan.md)";
 
 /// Values in slots of their own, each named by a [`Tag`] and by a generational handle: what a
 /// driver keeps of the spawns, watches and listens in flight. A handle of one removed, or
 /// replaced by another of its tag, names nothing.
+#[cfg_attr(target_os = "wasi", allow(dead_code, reason = "WASI keeps no spawns, watches or listens"))]
 pub(crate) mod tagged {
     use blaze_hash::HashMap;
     use std::alloc::Global;
@@ -267,6 +275,7 @@ impl<T> Mailbox<T> {
     }
 
     /// The next item, waiting for one; `None` once it is closed and empty.
+    #[cfg_attr(target_os = "wasi", allow(dead_code, reason = "WASI has no IO threads to take file effects"))]
     fn pop(&self) -> Option<T> {
         let mut state = lock(&self.state);
         loop {
@@ -390,6 +399,8 @@ pub struct Threads {
     workers: Vec<JoinHandle<()>>,
     /// By ticks since `start`.
     timers: Wheel<Tag>,
+    /// None on WASI, which watches nothing.
+    #[cfg(not(target_os = "wasi"))]
     watches: Tagged<Watching>,
     /// Stopped watches kept for the next.
     #[cfg(target_os = "linux")]
@@ -401,6 +412,10 @@ pub struct Threads {
     untold: Vec<Tag>,
     // dyn: the platform's sandbox, given by whoever owns it; called once per spawn.
     confine: Option<Arc<dyn Confine>>,
+    /// Where each sandboxed spawn gets a directory of its own: the root, or the directory
+    /// [`Threads::scratch`] made.
+    #[cfg_attr(target_os = "wasi", allow(dead_code, reason = "WASI refuses every spawn"))]
+    spawn_dirs: Arc<Path>,
     #[cfg(unix)]
     spawns: Tagged<Arc<Life>>,
     #[cfg(unix)]
@@ -427,6 +442,9 @@ impl Threads {
             #[cfg(test)]
             off: OffThread::default(),
         });
+        // alloc: once per driver, shared with each spawn's errand.
+        let spawn_dirs: Arc<Path> = Arc::from(shared.root.as_path());
+        #[cfg(not(target_os = "wasi"))]
         let workers = (0..threads.max(1))
             .map(|n| {
                 let shared = Arc::clone(&shared); // clone: once per worker, the state it shares.
@@ -438,6 +456,14 @@ impl Threads {
             })
             // alloc: once per driver.
             .collect();
+        // WASI (the wasm32-wasip1 seed) starts no thread: each file effect is made as it is
+        // submitted (`Driver::submit`).
+        #[cfg(target_os = "wasi")]
+        let workers = {
+            _ = threads;
+            // alloc: none, an empty list.
+            Vec::new()
+        };
         Threads {
             start: Instant::now(),
             shared,
@@ -448,6 +474,7 @@ impl Threads {
             ready_ends: 0,
             workers,
             timers: Wheel::new(),
+            #[cfg(not(target_os = "wasi"))]
             watches: Tagged::new(RESERVE),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             // alloc: once per driver.
@@ -456,6 +483,7 @@ impl Threads {
             // alloc: once per driver.
             untold: Vec::with_capacity(4),
             confine: None,
+            spawn_dirs,
             #[cfg(unix)]
             spawns: Tagged::new(RESERVE),
             #[cfg(unix)]
@@ -475,6 +503,17 @@ impl Threads {
     pub fn confined(mut self, confine: Arc<dyn Confine>) -> Threads {
         self.confine = Some(confine);
         self
+    }
+
+    /// The same driver, making each sandboxed spawn's own directory under `dir`, made here,
+    /// as [`crate::Native`]'s other drivers do. On WASI, which refuses every spawn, the
+    /// directory is made and nothing is put in it.
+    pub fn scratch(mut self, dir: impl Into<PathBuf>) -> io::Result<Threads> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        // alloc: once per driver.
+        self.spawn_dirs = Arc::from(dir);
+        Ok(self)
     }
 
     /// The address the TCP listen `listen` was given (its port, where it asked for port 0);
@@ -511,6 +550,20 @@ impl Threads {
             ready.push(Completion { tag, done: Done::Fired });
             *ends += 1;
         });
+    }
+
+    /// What was told, taken from the mailbox; with nothing told, `wait` waited out where a
+    /// timer is due by then. On WASI nothing completes while the driver waits: each file effect
+    /// was told as it was submitted, and there are no threads, watches, processes or sockets.
+    /// So with no timer there is nothing to wait for, and a wait never blocks on the mailbox.
+    /// `wait` is already cut to the next timer's deadline by `poll`.
+    #[cfg(target_os = "wasi")]
+    #[allow(clippy::disallowed_methods, reason = "the driver's own timer: WASI's one wait is a sleep on its clock")]
+    fn take_done(&mut self, wait: Duration) {
+        self.shared.done.take_all(&mut self.inbox, Duration::ZERO);
+        if self.inbox.is_empty() && !wait.is_zero() && self.timers.next_deadline().is_some() {
+            std::thread::sleep(wait);
+        }
     }
 
     /// Takes in what the threads told.
@@ -836,17 +889,24 @@ impl Drop for Threads {
 }
 
 /// Runs the file effects this thread takes off the driver's queue until it is closed.
+#[cfg(not(target_os = "wasi"))]
 fn work_on(shared: &Shared) {
     while let Some(effect) = shared.files.pop() {
-        let tag = effect.tag();
-        let done = shared.counted(|| {
-            // alloc: an error's message.
-            run(&shared.root, effect).unwrap_or_else(|error| Done::Failed(IoError(error.to_string())))
-        });
-        if shared.done.push(Told::Done(Completion { tag, done })).is_err() {
+        if !work(shared, effect) {
             return;
         }
     }
+}
+
+/// Runs one file effect and tells the driver how it went: on an IO thread, or on WASI, which
+/// has none, on the thread that submits it. `false` once the driver's mailbox is closed.
+fn work(shared: &Shared, effect: Effect) -> bool {
+    let tag = effect.tag();
+    let done = shared.counted(|| {
+        // alloc: an error's message.
+        run(&shared.root, effect).unwrap_or_else(|error| Done::Failed(IoError(error.to_string())))
+    });
+    shared.done.push(Told::Done(Completion { tag, done })).is_ok()
 }
 
 /// `f` of `file` under `root`, joined in the thread's path buffer.
@@ -935,9 +995,9 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         }),
         Effect::Stat { file, .. } => Ok(Done::Stat(at(root, &file, |path| fs::stat(path, true))?)),
         Effect::Lstat { file, .. } => Ok(Done::Stat(at(root, &file, |path| fs::stat(path, false))?)),
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "wasi"))]
         Effect::Stamp { files, .. } => Ok(Done::Stamped(fs::stamps(root, &files)?)),
-        #[cfg(unix)]
+        #[cfg(any(unix, target_os = "wasi"))]
         Effect::Entries { dir, .. } => Ok(Done::Entries(at(root, &dir, |path| fs::entries(path, &dir))?)),
         #[cfg(windows)]
         Effect::Stamp { files, .. } => Ok(Done::Stamped(crate::iocp::stamps(root, &files)?)),
@@ -1002,6 +1062,17 @@ fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
 #[cfg(windows)]
 fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
     std::os::windows::fs::FileExt::seek_read(file, buffer, at)
+}
+
+#[cfg(target_os = "wasi")]
+fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::wasi::fs::FileExt::read_at(file, buffer, at)
+}
+
+/// The bytes of the symbolic link `file`'s `target`, as [`Effect::ReadLink`] gives them.
+#[cfg(target_os = "wasi")]
+fn link_bytes(_: &crate::FileName, target: std::path::PathBuf) -> io::Result<Vec<u8>> {
+    Ok(std::os::wasi::ffi::OsStringExt::into_vec(target.into_os_string()))
 }
 
 /// A connection: its socket, shared with the errands reading and writing it.
@@ -1089,6 +1160,8 @@ enum Errand {
         command: Box<crate::Command>,
         // dyn: as `Threads::confine`.
         confine: Option<Arc<dyn Confine>>,
+        /// [`Threads::spawn_dirs`].
+        dirs: Arc<Path>,
         life: Arc<Life>,
         spawn: Id<Arc<Life>>,
         tag: Tag,
@@ -1248,8 +1321,8 @@ impl Errand {
             Told::Done(Completion { tag, done: Done::Failed(IoError(error.to_string())) })
         };
         match self {
-            Errand::Spawn { command, confine, life, spawn, tag } => {
-                let done = match run_process(&shared.root, command, confine.as_ref(), &life) {
+            Errand::Spawn { command, confine, dirs, life, spawn, tag } => {
+                let done = match run_process(&dirs, command, confine.as_ref(), &life) {
                     // alloc: the exit's payload.
                     Ok(exit) => Done::Exited(Box::new(exit)),
                     // alloc: an error path.
@@ -1607,7 +1680,7 @@ impl crate::fsevents::Tell for Sink {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "wasi")))]
 enum Watching {}
 
 /// Why a flush of a watch not in flight fails.
@@ -1667,7 +1740,9 @@ impl Driver for Threads {
                     let (spawn, _) = self.spawns.insert(tag, Arc::clone(&life));
                     // clone: the driver's sandbox maker, for the spawn.
                     let confine = self.confine.clone();
-                    self.dispatch(Errand::Spawn { command, confine, life, spawn, tag });
+                    // clone: a count of where spawns get their directories, for the errand.
+                    let dirs = Arc::clone(&self.spawn_dirs);
+                    self.dispatch(Errand::Spawn { command, confine, dirs, life, spawn, tag });
                 }
                 #[cfg(unix)]
                 Effect::Kill { tag } => {
@@ -1741,10 +1816,20 @@ impl Driver for Threads {
                     // alloc: an error path.
                     self.tell(effect.tag(), Done::Failed(IoError(UNIX_ONLY.into())))
                 }
+                #[cfg(not(target_os = "wasi"))]
                 effect => {
                     self.in_flight += 1;
                     if self.shared.files.push(effect).is_err() {
                         unreachable!("the IO threads' queue is closed only as the driver is dropped");
+                    }
+                }
+                // WASI has no threads: the file call is made here, on the thread that submits
+                // it, and told as an IO thread tells it, for the next poll.
+                #[cfg(target_os = "wasi")]
+                effect => {
+                    self.in_flight += 1;
+                    if !work(&self.shared, effect) {
+                        unreachable!("the driver's mailbox is closed only as the driver is dropped");
                     }
                 }
             }
@@ -1763,7 +1848,10 @@ impl Driver for Threads {
             }
             false => Duration::ZERO,
         };
+        #[cfg(not(target_os = "wasi"))]
         self.shared.done.take_all(&mut self.inbox, wait);
+        #[cfg(target_os = "wasi")]
+        self.take_done(wait);
         self.take_told();
         self.fire_timers();
         self.in_flight -= self.ready_ends;

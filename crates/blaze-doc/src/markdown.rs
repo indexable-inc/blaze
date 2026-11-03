@@ -296,7 +296,7 @@ pub(crate) fn slug(text: &str) -> String {
 }
 
 /// What a code block's info string says.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LangString {
     pub(crate) rust: bool,
     pub(crate) ignore: bool,
@@ -307,19 +307,33 @@ pub(crate) struct LangString {
     pub(crate) ignore_on: Vec<String>,
     /// The year of an `edition2021`.
     pub(crate) edition: Option<String>,
+    /// `test_harness`: the example's own `#[test]`s are run in a harness.
+    pub(crate) test_harness: bool,
+    /// `standalone_crate`: the example is never merged with others.
+    pub(crate) standalone_crate: bool,
+    /// The error codes a `compile_fail` example must fail with, like `E0308`.
+    pub(crate) error_codes: Vec<String>,
     pub(crate) unknown: Vec<String>,
     pub(crate) classes: Vec<String>,
 }
 
 impl LangString {
+    /// rustdoc's `LangString::parse` with error codes read (a nightly's rustdoc reads them):
+    /// the info string split by its `TagIterator` ([`tokens`]), each word as rustdoc takes it.
+    /// An info string that does not parse is no Rust, as rustdoc has it.
     pub(crate) fn parse(info: &str) -> LangString {
         let mut out = LangString { rust: true, ..LangString::default() };
-        let mut seen_rust = false;
-        let mut seen_other = false;
-        let mut seen_custom = false;
-        for token in info.split(|c: char| c == ',' || c.is_whitespace()).filter(|it| !it.is_empty())
-        {
-            let token = token.trim_matches(|c| c == '{' || c == '}');
+        let (mut seen_rust, mut seen_other, mut seen_custom) = (false, false, false);
+        let (tokens, error) = tokens(info);
+        for token in tokens {
+            let token = match token {
+                Token::Lang(it) => it,
+                Token::Class(it) | Token::KeyValue("class", it) => {
+                    out.classes.push(it.to_owned());
+                    continue;
+                }
+                Token::KeyValue(..) => continue,
+            };
             match token {
                 "should_panic" => {
                     out.should_panic = true;
@@ -337,11 +351,10 @@ impl LangString {
                     out.ignore_on.push(x["ignore-".len()..].to_owned());
                     seen_rust = !seen_other;
                 }
-                "rust" => {
-                    seen_rust = true;
-                }
+                "rust" => seen_rust = true,
                 "custom" => seen_custom = true,
-                "test_harness" | "standalone_crate" => {
+                "test_harness" => {
+                    out.test_harness = true;
                     seen_rust = !seen_other || seen_rust;
                 }
                 "compile_fail" => {
@@ -349,16 +362,25 @@ impl LangString {
                     out.no_run = true;
                     seen_rust = !seen_other || seen_rust;
                 }
+                "standalone_crate" => {
+                    out.standalone_crate = true;
+                    seen_rust = !seen_other || seen_rust;
+                }
+                // An edition rustc does not know is none; either way the word says nothing of
+                // whether the block is Rust.
                 x if x.starts_with("edition") => {
-                    out.edition = Some(x["edition".len()..].to_owned());
-                    seen_rust = !seen_other || seen_rust;
+                    let year = &x["edition".len()..];
+                    out.edition = matches!(year, "2015" | "2018" | "2021" | "2024" | "future").then(|| year.to_owned());
                 }
-                x if x.starts_with('E') && x.len() == 5 && x[1..].parse::<u32>().is_ok() => {
-                    seen_rust = !seen_other || seen_rust;
-                }
-                x if x.starts_with('.') => out.classes.push(x[1..].to_owned()),
-                x if x.starts_with("class=") => {
-                    out.classes.push(x["class=".len()..].trim_matches('"').to_owned())
+                // `E` and four characters: an error code when they are a number (`u32`'s
+                // parse, which takes a leading `+`), else a word of another language.
+                x if x.starts_with('E') && x.len() == 5 => {
+                    if x[1..].parse::<u32>().is_ok() {
+                        out.error_codes.push(x.to_owned());
+                        seen_rust = !seen_other || seen_rust;
+                    } else {
+                        seen_other = true;
+                    }
                 }
                 other => {
                     seen_other = true;
@@ -366,8 +388,231 @@ impl LangString {
                 }
             }
         }
-        out.rust &= !seen_custom && (!seen_other || seen_rust);
+        // `ignore-foo` overrides `ignore`.
+        if !out.ignore_on.is_empty() {
+            out.ignore = false;
+        }
+        out.rust &= !seen_custom && (!seen_other || seen_rust) && !error;
         out
+    }
+}
+
+/// A token of a code block's info string (rustdoc's `LangStringToken`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Token<'a> {
+    Lang(&'a str),
+    /// `.class` in a `{ }` block.
+    Class(&'a str),
+    /// `key=value` in a `{ }` block.
+    KeyValue(&'a str, &'a str),
+}
+
+fn is_leading_char(c: char) -> bool {
+    c == '_' || c == '-' || c == ':' || c.is_ascii_alphabetic() || c.is_ascii_digit()
+}
+
+fn is_bareword_char(c: char) -> bool {
+    is_leading_char(c) || ".!#$%&*+/;<>?@^|~".contains(c)
+}
+
+fn is_separator(c: char) -> bool {
+    c == ' ' || c == ',' || c == '\t'
+}
+
+/// rustdoc's `TagIterator` over `data`: its tokens up to the first error, and whether there
+/// was one. Words are separated by spaces, commas and tabs; a `"quoted"` word may hold any
+/// other character; `{ .class key=value }` is a block of attributes; `(...)` is a comment.
+fn tokens(data: &str) -> (Vec<Token<'_>>, bool) {
+    let mut tags = Tags { inner: data.char_indices().peekable(), data, in_block: false, error: false };
+    // alloc: once per code block, its few words
+    let mut out = Vec::new();
+    while let Some(token) = tags.next() {
+        out.push(token);
+    }
+    (out, tags.error)
+}
+
+struct Tags<'a> {
+    inner: std::iter::Peekable<std::str::CharIndices<'a>>,
+    data: &'a str,
+    in_block: bool,
+    error: bool,
+}
+
+impl<'a> Tags<'a> {
+    fn skip_separators(&mut self) -> Option<usize> {
+        while let Some(&(pos, c)) = self.inner.peek() {
+            if !is_separator(c) {
+                return Some(pos);
+            }
+            self.inner.next();
+        }
+        None
+    }
+
+    /// From after the opening quote at `start`: the text up to the closing one.
+    fn string(&mut self, start: usize) -> Option<(usize, usize)> {
+        for (pos, c) in self.inner.by_ref() {
+            if c == '"' {
+                return Some((start + 1, pos));
+            }
+        }
+        self.error = true;
+        None
+    }
+
+    fn class(&mut self, start: usize) -> Option<Token<'a>> {
+        while let Some(&(pos, c)) = self.inner.peek() {
+            if is_bareword_char(c) {
+                self.inner.next();
+                continue;
+            }
+            let class = &self.data[start + 1..pos];
+            if class.is_empty() {
+                self.error = true;
+                return None;
+            }
+            return self.after_token().then_some(Token::Class(class));
+        }
+        let class = &self.data[start + 1..];
+        if class.is_empty() {
+            self.error = true;
+            return None;
+        }
+        self.after_token().then_some(Token::Class(class))
+    }
+
+    fn word(&mut self, start: usize) -> Option<(usize, usize)> {
+        while let Some(&(pos, c)) = self.inner.peek() {
+            if !is_bareword_char(c) {
+                return Some((start, pos));
+            }
+            self.inner.next();
+        }
+        self.error = true;
+        None
+    }
+
+    fn key_value(&mut self, c: char, start: usize) -> Option<Token<'a>> {
+        let key = if c == '"' { self.string(start)? } else { self.word(start)? };
+        if key.0 == key.1 {
+            self.error = true;
+            return None;
+        }
+        if self.inner.next().map(|it| it.1) != Some('=') {
+            self.error = true;
+            return None;
+        }
+        let value = match self.inner.next() {
+            Some((pos, '"')) => self.string(pos)?,
+            Some((pos, c)) if is_bareword_char(c) => self.word(pos)?,
+            _ => {
+                self.error = true;
+                return None;
+            }
+        };
+        if value.0 == value.1 {
+            self.error = true;
+            return None;
+        }
+        self.after_token().then(|| Token::KeyValue(&self.data[key.0..key.1], &self.data[value.0..value.1]))
+    }
+
+    /// Whether what follows a token may: a `}`, a separator, a comment or the end.
+    fn after_token(&mut self) -> bool {
+        match self.inner.peek() {
+            Some(&(_, c)) if c == '}' || is_separator(c) || c == '(' => true,
+            Some(_) => {
+                self.error = true;
+                false
+            }
+            None => true,
+        }
+    }
+
+    fn in_block(&mut self) -> Option<Token<'a>> {
+        match self.inner.next() {
+            Some((_, '}')) => {
+                self.in_block = false;
+                self.next()
+            }
+            Some((pos, '.')) => self.class(pos),
+            Some((pos, c)) if c == '"' || is_leading_char(c) => self.key_value(c, pos),
+            _ => {
+                self.error = true;
+                None
+            }
+        }
+    }
+
+    fn skip_comment(&mut self) -> bool {
+        for (_, c) in self.inner.by_ref() {
+            if c == ')' {
+                return true;
+            }
+        }
+        self.error = true;
+        false
+    }
+
+    fn outside_block(&mut self, start: usize) -> Option<Token<'a>> {
+        while let Some((pos, c)) = self.inner.next() {
+            if c == '"' {
+                if pos != start {
+                    self.error = true;
+                    return None;
+                }
+                let (from, to) = self.string(pos)?;
+                if let Some(&(_, c)) = self.inner.peek()
+                    && c != '{'
+                    && !is_separator(c)
+                    && c != '('
+                {
+                    self.error = true;
+                    return None;
+                }
+                return Some(Token::Lang(&self.data[from..to]));
+            } else if c == '{' {
+                self.in_block = true;
+                return self.next();
+            } else if is_separator(c) {
+                if pos != start {
+                    return Some(Token::Lang(&self.data[start..pos]));
+                }
+                return self.next();
+            } else if c == '(' {
+                if !self.skip_comment() {
+                    return None;
+                }
+                if pos != start {
+                    return Some(Token::Lang(&self.data[start..pos]));
+                }
+                return self.next();
+            } else if (pos == start && is_leading_char(c)) || (pos != start && is_bareword_char(c)) {
+                continue;
+            } else {
+                self.error = true;
+                return None;
+            }
+        }
+        let token = &self.data[start..];
+        (!token.is_empty()).then_some(Token::Lang(token))
+    }
+
+    fn next(&mut self) -> Option<Token<'a>> {
+        if self.error {
+            return None;
+        }
+        let Some(start) = self.skip_separators() else {
+            if self.in_block {
+                self.error = true;
+            }
+            return None;
+        };
+        match self.in_block {
+            true => self.in_block(),
+            false => self.outside_block(start),
+        }
     }
 }
 
@@ -381,6 +626,21 @@ fn shown_line(line: &str) -> Option<std::borrow::Cow<'_, str>> {
         None
     } else {
         Some(std::borrow::Cow::Borrowed(line))
+    }
+}
+
+/// A doctest line as it is compiled: a hidden `# ` line and a lone `#` are code without the
+/// mark (rustdoc's `map_line`), and `##` is a line that starts with `#`.
+pub(crate) fn tested_line(line: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("##") {
+        std::borrow::Cow::Owned(line.replacen("##", "#", 1))
+    } else if let Some(hidden) = trimmed.strip_prefix("# ") {
+        std::borrow::Cow::Borrowed(hidden)
+    } else if trimmed == "#" {
+        std::borrow::Cow::Borrowed("")
+    } else {
+        std::borrow::Cow::Borrowed(line)
     }
 }
 
@@ -440,6 +700,22 @@ mod tests {
         assert!(LangString::parse("compile_fail,E0277").rust);
         assert!(LangString::parse("text,ignore").ignore);
         assert!(!LangString::parse("text,ignore").rust);
+        // rustdoc's `TagIterator`: attribute blocks, comments, quotes, and an error is no Rust.
+        let it = LangString::parse("rust {.foo class=bar} (a comment, here) \"no_run\"");
+        assert!(it.rust && it.no_run && it.classes == ["foo", "bar"] && it.unknown.is_empty());
+        assert!(!LangString::parse("rust{").rust);
+        assert!(!LangString::parse("rust,no_run=").rust);
+        // An edition is no word of Rust; an unknown one is none.
+        assert!(!LangString::parse("edition2018,sh").rust);
+        assert_eq!(LangString::parse("edition2018").edition.as_deref(), Some("2018"));
+        assert_eq!(LangString::parse("edition2077").edition, None);
+        // `E` and four characters that are no number is another language's word, not unknown.
+        let it = LangString::parse("compile_fail,E0308,Eabcd");
+        assert!(it.error_codes == ["E0308"] && it.unknown.is_empty());
+        assert!(!LangString::parse("Eabcd").rust);
+        // `ignore-foo` overrides `ignore`.
+        let it = LangString::parse("ignore,ignore-windows");
+        assert!(!it.ignore && it.ignore_on == ["windows"]);
     }
 
     #[test]

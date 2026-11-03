@@ -115,7 +115,7 @@ fn header<'data>(
     let (machine, label) = match arch {
         Arch::X86_64 => (elf::EM_X86_64, "x86-64"),
         Arch::Aarch64 => (elf::EM_AARCH64, "AArch64"),
-        Arch::Wasm32 => return Err(format!("{name}: an ELF input to a wasm32 link")), // alloc: error path
+        Arch::Wasm32 | Arch::Wasm64 => return Err(format!("{name}: an ELF input to a {arch:?} link")), // alloc: error path
     };
     let found = header.e_machine(ENDIAN);
     if found != machine {
@@ -512,7 +512,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
             let how = match arch {
                 Arch::X86_64 => x86_64(r_type),
                 Arch::Aarch64 => aarch64(r_type),
-                Arch::Wasm32 => Err("an ELF relocation in a wasm32 link"),
+                Arch::Wasm32 | Arch::Wasm64 => Err("an ELF relocation in a wasm link"),
             }
             // alloc: error path
             .map_err(|why| format!("{}: {why}", place(&object)))?;
@@ -916,7 +916,7 @@ fn relocation_name(arch: Arch, r_type: elf::RelocationType) -> &'static str {
     let names: &[(elf::RelocationType, &'static str)] = match arch {
         Arch::X86_64 => X86_64_NAMES,
         Arch::Aarch64 => AARCH64_NAMES,
-        Arch::Wasm32 => &[],
+        Arch::Wasm32 | Arch::Wasm64 => &[],
     };
     names.iter().find(|&&(number, _)| number == r_type).map_or("an unknown type", |&(_, name)| name)
 }

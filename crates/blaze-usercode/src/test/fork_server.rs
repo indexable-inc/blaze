@@ -4,7 +4,9 @@
 // `super::test` is libtest, followed by the module `exec` of `fork_server/recorded.rs` or
 // `fork_server/unrecorded.rs` (whether the binary has jump-table slots). Never a module of
 // blaze-usercode. It is compiled in the tested crate's edition, so it names everything from
-// `::std` and `::core`.
+// `std` and `::core`: `std` is the harness module's own `extern crate std`, which each module
+// here imports (`use super::std`), so the harness of a `#![no_std]` crate, whose extern prelude
+// has no `std`, reaches it as rustc's does (flecs-c's tests).
 //
 // What happens once per binary happens before the first test: the names of the hello, the
 // child-exit queue, the slot count, the measure of one fork. A test costs one socket pair, one
@@ -16,7 +18,7 @@
 /// Serves `tests` to blaze over the socket at `socket` (the value of [`SOCKET`]), then exits:
 /// what the harness's `main` calls when the variable is set.
 #[cfg(unix)]
-pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: ::std::ffi::OsString) -> ! {
+pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: std::ffi::OsString) -> ! {
     let code = match unix::serve(tests, &socket) {
         Ok(()) => 0,
         Err(why) => {
@@ -24,26 +26,33 @@ pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: ::st
             101
         }
     };
-    ::std::process::exit(code)
+    std::process::exit(code)
 }
 
 #[cfg(not(unix))]
-pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: ::std::ffi::OsString) -> ! {
+pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: std::ffi::OsString) -> ! {
     let _ = (tests, socket);
     eprintln!("blaze's fork server: this platform has no fork; the package must run its tests as libtest's threads");
-    ::std::process::exit(101)
+    std::process::exit(101)
 }
 
 #[cfg(unix)]
 mod unix {
+    // std, its prelude and the macros of it this server names, here and in each module below:
+    // a `#![no_std]` crate's harness has core's prelude alone (flecs-c's tests).
+    use super::std;
+    #[allow(unused_imports)]
+    use self::std::prelude::rust_2021::*;
+    #[allow(unused_imports)]
+    use self::std::{eprintln, format, vec};
     use super::super::test;
     use super::exec::{Exec, Region};
     use super::{
         End, EndView, ExecView, Frames, Hits, LONGEST_OUTPUT, MARK, SOCKET, VERSION, View, encode_ended, encode_hello,
     };
-    use ::std::io::{Read, Write};
-    use ::std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-    use ::std::os::unix::net::UnixStream;
+    use self::std::io::{Read, Write};
+    use self::std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    use self::std::os::unix::net::UnixStream;
 
     type Int = ::core::ffi::c_int;
     #[cfg(target_os = "linux")]
@@ -94,6 +103,11 @@ mod unix {
     // per child on Linux, one kqueue for all of them on Apple's systems.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     mod exits {
+        use super::std;
+        #[allow(unused_imports)]
+        use self::std::prelude::rust_2021::*;
+        #[allow(unused_imports)]
+        use self::std::{eprintln, format, vec};
         use super::{FromRawFd, Int, OwnedFd};
 
         unsafe extern "C" {
@@ -115,7 +129,7 @@ mod unix {
             // A wrong number would run another syscall, which is why `PIDFD_OPEN` is pinned.
             let fd = unsafe { syscall(PIDFD_OPEN, pid as ::core::ffi::c_long, 0 as ::core::ffi::c_long) };
             if fd < 0 {
-                return Err(format!("pidfd_open: {}", ::std::io::Error::last_os_error())); // alloc: error path
+                return Err(format!("pidfd_open: {}", std::io::Error::last_os_error())); // alloc: error path
             }
             // SAFETY: `fd` is >= 0, so `pidfd_open` just made it, and no other owner of it
             // exists; were there one, the two would close it twice.
@@ -132,6 +146,11 @@ mod unix {
 
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))]
     mod exits {
+        use super::std;
+        #[allow(unused_imports)]
+        use self::std::prelude::rust_2021::*;
+        #[allow(unused_imports)]
+        use self::std::{eprintln, format, vec};
         use super::{AsRawFd, FromRawFd, Int, OwnedFd};
 
         #[repr(C)]
@@ -173,7 +192,7 @@ mod unix {
             // SAFETY: `kqueue` takes no arguments and touches no memory of ours.
             let fd = unsafe { kqueue() };
             if fd < 0 {
-                return Err(format!("kqueue: {}", ::std::io::Error::last_os_error())); // alloc: error path
+                return Err(format!("kqueue: {}", std::io::Error::last_os_error())); // alloc: error path
             }
             // SAFETY: `fd` is >= 0, so `kqueue` just made it, and no other owner of it
             // exists; were there one, the two would close it twice.
@@ -197,7 +216,7 @@ mod unix {
             // with room 0, so nothing is written, and the null timeout is allowed.
             let done = unsafe { kevent(queue.as_raw_fd(), &change, 1, ::core::ptr::null_mut(), 0, ::core::ptr::null()) };
             if done < 0 {
-                let error = ::std::io::Error::last_os_error();
+                let error = std::io::Error::last_os_error();
                 if error.raw_os_error() == Some(ESRCH) {
                     return Ok((None, true));
                 }
@@ -248,6 +267,11 @@ mod unix {
         target_os = "visionos"
     )))]
     mod exits {
+        use super::std;
+        #[allow(unused_imports)]
+        use self::std::prelude::rust_2021::*;
+        #[allow(unused_imports)]
+        use self::std::{eprintln, format, vec};
         use super::{Int, OwnedFd};
 
         pub fn queue() -> Result<Option<OwnedFd>, String> {
@@ -272,6 +296,11 @@ mod unix {
     // usually one, where a `close` per descriptor costs two per test in flight.
     #[cfg(target_os = "linux")]
     mod fds {
+        use super::std;
+        #[allow(unused_imports)]
+        use self::std::prelude::rust_2021::*;
+        #[allow(unused_imports)]
+        use self::std::{eprintln, format, vec};
         use super::super::closed_ranges;
         use super::{Int, dup2};
 
@@ -298,10 +327,10 @@ mod unix {
                     syscall(CLOSE_RANGE, u32::MAX as ::core::ffi::c_long, u32::MAX as ::core::ffi::c_long, 0 as ::core::ffi::c_long)
                 };
                 if asked != 0 {
-                    return Err(format!("close_range: {} (blaze's fork server needs Linux 5.9 or later)", ::std::io::Error::last_os_error())); // alloc: error path
+                    return Err(format!("close_range: {} (blaze's fork server needs Linux 5.9 or later)", std::io::Error::last_os_error())); // alloc: error path
                 }
                 let mut open: Vec<u32> = Vec::new(); // alloc: setup, once per server
-                let listing = ::std::fs::read_dir("/proc/self/fd").map_err(|error| format!("listing /proc/self/fd: {}", error))?; // alloc: error path
+                let listing = std::fs::read_dir("/proc/self/fd").map_err(|error| format!("listing /proc/self/fd: {}", error))?; // alloc: error path
                 for entry in listing {
                     let entry = entry.map_err(|error| format!("listing /proc/self/fd: {}", error))?; // alloc: error path
                     if let Some(fd) = entry.file_name().to_str().and_then(|it| it.parse::<u32>().ok()) {
@@ -337,6 +366,11 @@ mod unix {
 
     #[cfg(not(target_os = "linux"))]
     mod fds {
+        use super::std;
+        #[allow(unused_imports)]
+        use self::std::prelude::rust_2021::*;
+        #[allow(unused_imports)]
+        use self::std::{eprintln, format, vec};
         use super::{Int, close, dup2};
 
         /// Nothing: the other platforms close the server's descriptors one by one.
@@ -368,13 +402,13 @@ mod unix {
         }
     }
 
-    pub fn serve(tests: &'static [&'static test::TestDescAndFn], socket: &::std::ffi::OsStr) -> Result<(), String> {
+    pub fn serve(tests: &'static [&'static test::TestDescAndFn], socket: &std::ffi::OsStr) -> Result<(), String> {
         // Taken out before any test runs, so a test that runs its own binary gets libtest.
         // SAFETY: the harness's `main` calls this before it starts any thread, and the server
         // never starts one (a test's thread runs in a forked child), so no other thread reads
         // the environment as it changes. A thread here would make this a data race.
         unsafe {
-            ::std::env::remove_var(SOCKET);
+            std::env::remove_var(SOCKET);
         }
         let kept = fds::Kept::now()?;
         let fork = fork_cost()?;
@@ -423,8 +457,8 @@ mod unix {
             // SAFETY: `fds` holds `fds.len()` entries for the length of the call.
             let ready = unsafe { poll(fds.as_mut_ptr(), fds.len() as Nfds, timeout) };
             if ready < 0 {
-                let error = ::std::io::Error::last_os_error();
-                if error.kind() == ::std::io::ErrorKind::Interrupted {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
                 kill_all(&mut children);
@@ -438,7 +472,7 @@ mod unix {
                         return Ok(());
                     }
                     Ok(n) => frames.push(&buffer[..n]),
-                    Err(ref error) if error.kind() == ::std::io::ErrorKind::Interrupted => {}
+                    Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(error) => {
                         kill_all(&mut children);
                         return Err(format!("reading the socket: {}", error)); // alloc: error path
@@ -556,7 +590,7 @@ mod unix {
     /// The most bytes a buffer of output or of frames keeps between uses.
     const KEPT: usize = 1 << 20;
 
-    fn connect(socket: &::std::ffi::OsStr) -> Result<UnixStream, String> {
+    fn connect(socket: &std::ffi::OsStr) -> Result<UnixStream, String> {
         // blaze listens as it starts the binary; the listen may be made a moment after.
         let mut tries = 0;
         loop {
@@ -564,11 +598,11 @@ mod unix {
                 Ok(stream) => return Ok(stream),
                 Err(ref error)
                     if tries < 400
-                        && (error.kind() == ::std::io::ErrorKind::NotFound
-                            || error.kind() == ::std::io::ErrorKind::ConnectionRefused) =>
+                        && (error.kind() == std::io::ErrorKind::NotFound
+                            || error.kind() == std::io::ErrorKind::ConnectionRefused) =>
                 {
                     tries += 1;
-                    ::std::thread::sleep(::std::time::Duration::from_millis(25));
+                    std::thread::sleep(std::time::Duration::from_millis(25));
                 }
                 Err(error) => return Err(format!("connecting to {:?}: {}", socket, error)), // alloc: error path
             }
@@ -583,7 +617,7 @@ mod unix {
         fork: u64,
     ) -> Result<(), String> {
         out.clear();
-        encode_hello(out, VERSION, ::std::process::id(), fork, tests.iter().map(|it| it.desc.name.as_slice()));
+        encode_hello(out, VERSION, std::process::id(), fork, tests.iter().map(|it| it.desc.name.as_slice()));
         let sent = stream.write_all(&out[..]).map_err(|error| format!("writing to the socket: {}", error)); // alloc: error path
         out.clear();
         sent
@@ -595,14 +629,14 @@ mod unix {
     fn fork_cost() -> Result<u64, String> {
         let mut least = u64::MAX;
         for _ in 0..3 {
-            let start = ::std::time::Instant::now();
+            let start = std::time::Instant::now();
             // SAFETY: the server has one thread (see `serve`), so the child is a whole copy of
             // it; the child does nothing but `_exit`, which is async-signal-safe and runs no
             // destructor and no `atexit` handler, so nothing of the server's is used or freed
             // twice.
             let pid = unsafe { fork() };
             if pid < 0 {
-                return Err(format!("fork: {}", ::std::io::Error::last_os_error())); // alloc: error path
+                return Err(format!("fork: {}", std::io::Error::last_os_error())); // alloc: error path
             }
             if pid == 0 {
                 // SAFETY: as above.
@@ -633,7 +667,7 @@ mod unix {
             // the server; its socket to blaze is the server's until it connects its own.
             let pid = unsafe { fork() };
             if pid < 0 {
-                return Err(format!("forking a replica: {}", ::std::io::Error::last_os_error())); // alloc: error path
+                return Err(format!("forking a replica: {}", std::io::Error::last_os_error())); // alloc: error path
             }
             if pid == 0 {
                 left = given;
@@ -670,7 +704,7 @@ mod unix {
         // the test (which allocates and may start threads) and leaves by `_exit`.
         let pid = unsafe { fork() };
         if pid < 0 {
-            return Err(format!("fork: {}", ::std::io::Error::last_os_error())); // alloc: error path
+            return Err(format!("fork: {}", std::io::Error::last_os_error())); // alloc: error path
         }
         if pid == 0 {
             // The child closes the server's descriptors under the owners that hold them: it
@@ -690,8 +724,8 @@ mod unix {
                 eprintln!("blaze's fork server: the runtime did not arm the execution record ({}); what this test executed is not known", armed);
             }
             let code = run(test);
-            let _ = ::std::io::stdout().flush();
-            let _ = ::std::io::stderr().flush();
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
             // SAFETY: `_exit` ends the process at once and returns to nothing; the child's
             // copies of the server's owners are never dropped, which is what the closes above
             // rely on, and the server's `atexit` handlers don't run a second time here.
@@ -718,8 +752,8 @@ mod unix {
                     }
                     child.bytes.extend_from_slice(&buffer[..n.min(room)]);
                 }
-                Err(ref error) if error.kind() == ::std::io::ErrorKind::WouldBlock => break,
-                Err(ref error) if error.kind() == ::std::io::ErrorKind::Interrupted => {}
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => child.open = false,
             }
         }
@@ -808,7 +842,7 @@ mod unix {
     }
 
     // dyn: a panic's payload, read once per test that panicked.
-    fn payload_str(payload: &(dyn ::std::any::Any + Send)) -> Option<&str> {
+    fn payload_str(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
         if let Some(text) = payload.downcast_ref::<String>() {
             return Some(text.as_str());
         }
@@ -879,15 +913,15 @@ mod unix {
         if cfg!(panic = "abort") {
             // No unwinding to catch: the first panic is judged where it happens.
             let judged = panics;
-            let default = ::std::panic::take_hook();
-            ::std::panic::set_hook(Box::new(move |info| { // alloc: in the test's child, after its fork: libtest's own hook and thread, nothing of the server's
+            let default = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| { // alloc: in the test's child, after its fork: libtest's own hook and thread, nothing of the server's
                 default(info);
                 let code = judge(Ran::Panicked(payload_str(info.payload())), &judged);
-                let _ = ::std::io::stderr().flush();
+                let _ = std::io::stderr().flush();
                 exit_now(code);
             }));
         }
-        let thread = ::std::thread::Builder::new().name(name.to_owned()).spawn(move || match body { // alloc: in the test's child, after its fork: libtest's own hook and thread, nothing of the server's
+        let thread = std::thread::Builder::new().name(name.to_owned()).spawn(move || match body { // alloc: in the test's child, after its fork: libtest's own hook and thread, nothing of the server's
             Body::Test(f) => f(),
             Body::Bench(f) => test::bench::run_once(f),
         });

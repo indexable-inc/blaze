@@ -89,6 +89,8 @@ pub(crate) trait Source<'db> {
     /// How many of something follow, each of at least one word.
     fn count(&mut self) -> Result<usize, Self::Error>;
     fn invalid(&self, what: &'static str) -> Self::Error;
+    /// A value `found` past its bound `bound`, `what` naming the field and the bound.
+    fn past(&self, what: &'static str, found: u64, bound: u64) -> Self::Error;
     /// A definition, as [`Sink::def`] wrote it.
     fn def(&mut self) -> Result<SolverDefId<'db>, Self::Error>
     where
@@ -225,6 +227,10 @@ impl<'db> Source<'db> for Row<'_> {
 
     fn invalid(&self, what: &'static str) -> Infallible {
         panic!("a row that is not {what}")
+    }
+
+    fn past(&self, what: &'static str, found: u64, bound: u64) -> Infallible {
+        panic!("a row of {what} {found}, past its bound {bound}")
     }
 }
 
@@ -418,6 +424,9 @@ fn put_id<'db>(sink: &mut impl Sink<'db>, id: blaze_query::db::Id) {
     sink.word(0);
 }
 
+/// What a nonzero generation word after an id's index is refused as: query IDs have none.
+const GENERATION: &str = "an id's generation word, which is always 0 (query ids have no generation)";
+
 fn get_id<'db, S: Source<'db>>(source: &mut S) -> Result<blaze_query::db::Id, S::Error> {
     let index = source.word()?;
     let generation = source.word()?;
@@ -425,9 +434,15 @@ fn get_id<'db, S: Source<'db>>(source: &mut S) -> Result<blaze_query::db::Id, S:
         return Err(source.invalid("an id of index 0"));
     }
     if generation != 0 {
-        return Err(source.invalid("an id of a generation"));
+        return Err(source.past(GENERATION, u64::from(generation), 0));
     }
-    Ok(blaze_query::db::Id::from_u32(index))
+    blaze_query::db::Id::new(index).ok_or_else(|| {
+        source.past(
+            "an id's index (past `Id::MAX_U32`, which no query storage gives)",
+            u64::from(index),
+            u64::from(blaze_query::db::Id::MAX_U32),
+        )
+    })
 }
 
 impl<'db> Code<'db> for SolverDefId<'db> {
@@ -2074,8 +2089,12 @@ impl<'db, A: Fn(AdtId) -> AdtDef> Source<'db> for Reading<'_, A> {
     fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
         let index = self.word()?;
         let generation = self.word()?;
-        crate::check_cache::id_of(u64::from(index) | (u64::from(generation) << 32))
-            .ok_or_else(|| self.invalid("an id of index 0 or not in the table"))
+        // The generation word is refused on its own (as `get_id` does), so a corrupt one is not
+        // folded into the id's bits and reported as a huge table index or id.
+        if generation != 0 {
+            return Err(self.past(GENERATION, u64::from(generation), 0));
+        }
+        crate::check_cache::id_of(u64::from(index)).map_err(|refused| refused.at(self.at))
     }
 
     fn count(&mut self) -> Result<usize, FormatError> {
@@ -2088,6 +2107,10 @@ impl<'db, A: Fn(AdtId) -> AdtDef> Source<'db> for Reading<'_, A> {
 
     fn invalid(&self, what: &'static str) -> FormatError {
         FormatError::Invalid { at: self.at, what }
+    }
+
+    fn past(&self, what: &'static str, found: u64, bound: u64) -> FormatError {
+        FormatError::Bound { at: self.at, what, found, bound }
     }
 }
 

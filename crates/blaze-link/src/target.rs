@@ -26,6 +26,10 @@
 //! - wasm32-wasip1: wasi-libc's `crt1-command.o` (`crt1-reactor.o` for a [`reactor`]) and
 //!   `libc.a`, in blaze's toolchain's self-contained directory (the `sysroot` [`locate`] is
 //!   given).
+//! - wasm64-blaze-wasip1 (blaze's own memory64 target, the bootstrap seed's): no C runtime
+//!   files. Its C runtime (`_start`, `malloc`, the libc functions std calls) is a Rust crate of
+//!   blaze's `library/`, linked as any other crate of the program, so the `c` the `libc` crate
+//!   asks for is provided by it, never searched for ([`Target::provided_by_rust`]).
 //!
 //! What the toolchain says is asked once per process for each triple and each value of the
 //! environment variables read, and kept. Each file found is still hashed by the caller, so a
@@ -84,6 +88,12 @@ pub struct Located {
 /// and wasm-ld's `-z stack-size` as rustc passes it.
 const STACK: u64 = 1 << 20;
 
+/// The main thread's stack on `wasm64-blaze-wasip1`, the seed's target: 64 MiB of linear memory
+/// for `__stack_pointer`, room for the front end's deepest recursion with margin
+/// (todo/bootstrap/plan.md, "Stack in the seed"). A property of the target, so every program
+/// built for it, the seed among them, links with it and no flag is needed.
+const SEED_STACK: u64 = 64 << 20;
+
 /// `LC_BUILD_VERSION`'s platform of macOS.
 const MACOS: u32 = 1;
 
@@ -107,7 +117,8 @@ const REEXPORTED_AARCH64: &str = "blaze v2 link target re-exported libraries aar
 const REEXPORTED_X86_64: &str = "blaze v2 link target re-exported libraries x86_64";
 
 const LINKED: &str = "x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, aarch64-apple-darwin, \
-                      x86_64-pc-windows-msvc, wasm32-wasip1 and wasm32-unknown-unknown";
+                      x86_64-pc-windows-msvc, wasm32-wasip1, wasm32-unknown-unknown and \
+                      wasm64-blaze-wasip1";
 
 /// The process's answers of the machine's toolchains.
 static CACHE: Cache = Cache::new();
@@ -189,7 +200,7 @@ fn runtimes(target: Target, output: &Output, sysroot: &Path) -> Result<SmallVec<
     let triple = target.triple();
     for &(sanitizer, name, what) in named {
         match target {
-            Target::Wasip1 | Target::WasmUnknown => {
+            Target::Wasip1 | Target::WasmUnknown | Target::Wasm64Wasip1 => {
                 // alloc: error path
                 return Err(fail(format!("{what} on {triple}: rustc has no sanitizer runtime for wasm")));
             }
@@ -313,7 +324,14 @@ fn output_with<A: Ask>(
         interpreter,
         platform,
         incremental,
-        debug,
+        // A wasm module's debug info is its name section, which the writer always writes: its
+        // functions are indices, not addresses, so DWARF line tables made for an image's
+        // addresses would be wrong, and the writer refuses them. Every debug level of a wasm
+        // target is that name section.
+        debug: match target.format() {
+            Format::Wasm => Debug::None,
+            Format::Elf | Format::MachO | Format::Pe => debug,
+        },
         live: None,
         tags: 0,
         stack: target.stack(),
@@ -361,6 +379,9 @@ fn locate_with<A: Ask>(
         line.push(path, kind)?;
     }
     for lib in libs {
+        if !lib.verbatim && target.provided_by_rust(&lib.name) {
+            continue;
+        }
         line.library(&lib.name, lib.kind, lib.verbatim)?;
     }
     for &(name, kind) in target.late() {
@@ -384,6 +405,8 @@ enum Target {
     Msvc,
     Wasip1,
     WasmUnknown,
+    /// wasm64-blaze-wasip1: memory64, WASI preview 1 with 64-bit pointers, no threads.
+    Wasm64Wasip1,
 }
 
 impl Target {
@@ -395,6 +418,7 @@ impl Target {
             "x86_64-pc-windows-msvc" => Target::Msvc,
             "wasm32-wasip1" => Target::Wasip1,
             "wasm32-unknown-unknown" => Target::WasmUnknown,
+            "wasm64-blaze-wasip1" => Target::Wasm64Wasip1,
             "wasm32-wasip2" => {
                 return Err(fail(
                     "wasm32-wasip2: rustc links a component for it (wasm-component-ld), and \
@@ -416,6 +440,7 @@ impl Target {
             Target::Msvc => "x86_64-pc-windows-msvc",
             Target::Wasip1 => "wasm32-wasip1",
             Target::WasmUnknown => "wasm32-unknown-unknown",
+            Target::Wasm64Wasip1 => "wasm64-blaze-wasip1",
         }
     }
 
@@ -424,7 +449,7 @@ impl Target {
             Target::LinuxX86_64 | Target::LinuxAarch64 => Format::Elf,
             Target::MacOs => Format::MachO,
             Target::Msvc => Format::Pe,
-            Target::Wasip1 | Target::WasmUnknown => Format::Wasm,
+            Target::Wasip1 | Target::WasmUnknown | Target::Wasm64Wasip1 => Format::Wasm,
         }
     }
 
@@ -433,11 +458,13 @@ impl Target {
             Target::LinuxX86_64 | Target::Msvc => Arch::X86_64,
             Target::LinuxAarch64 | Target::MacOs => Arch::Aarch64,
             Target::Wasip1 | Target::WasmUnknown => Arch::Wasm32,
+            Target::Wasm64Wasip1 => Arch::Wasm64,
         }
     }
 
     /// The executable's entry: the C runtime's `_start` (`Scrt1.o`, wasi-libc's
-    /// `crt1-command.o`), dyld's `main` (the writer adds Mach-O's `_`), the MSVC CRT's
+    /// `crt1-command.o`, wasm64-blaze-wasip1's Rust runtime crate, which calls Rust's
+    /// `__main_void`), dyld's `main` (the writer adds Mach-O's `_`), the MSVC CRT's
     /// `mainCRTStartup`.
     fn entry(self) -> &'static str {
         match self.format() {
@@ -448,6 +475,9 @@ impl Target {
     }
 
     fn stack(self) -> Option<u64> {
+        if self == Target::Wasm64Wasip1 {
+            return Some(SEED_STACK);
+        }
         match self.format() {
             Format::Pe | Format::Wasm => Some(STACK),
             Format::Elf | Format::MachO => None,
@@ -465,7 +495,7 @@ impl Target {
                 &["SDKROOT", "DEVELOPER_DIR", "PATH", "CC_aarch64_apple_darwin", "CC", "LIBRARY_PATH", "NIX_LDFLAGS"]
             }
             Target::Msvc => &["LIB", "ProgramFiles(x86)", "PATH"],
-            Target::Wasip1 | Target::WasmUnknown => &[],
+            Target::Wasip1 | Target::WasmUnknown | Target::Wasm64Wasip1 => &[],
         }
     }
 
@@ -515,8 +545,17 @@ impl Target {
             }
             Target::MacOs => &[("System", NativeLibKind::Dylib)],
             Target::Wasip1 => &[("c", STATIC)],
-            Target::Msvc | Target::WasmUnknown => &[],
+            Target::Msvc | Target::WasmUnknown | Target::Wasm64Wasip1 => &[],
         }
+    }
+
+    /// Whether a library the crates ask for is provided by a Rust crate of the program on this
+    /// target, and so never searched for: wasm64-blaze-wasip1 has no wasi-libc, and its C
+    /// runtime is a crate of blaze's `library/`, which defines what the `libc` crate's
+    /// `#[link(name = "c")]` names. Every other library is searched for, and one not found is
+    /// an error.
+    fn provided_by_rust(self, name: &str) -> bool {
+        matches!((self, name), (Target::Wasm64Wasip1, "c"))
     }
 }
 
@@ -822,7 +861,8 @@ fn query<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
         Target::MacOs => apple(ask, key),
         Target::Msvc => msvc(ask, key),
         Target::Wasip1 => wasi(key),
-        Target::WasmUnknown => Ok(Found::default()),
+        // Nothing to find: no C runtime files ([`Target::provided_by_rust`]).
+        Target::WasmUnknown | Target::Wasm64Wasip1 => Ok(Found::default()),
     }
 }
 

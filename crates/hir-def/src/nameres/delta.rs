@@ -271,7 +271,12 @@ fn read_crate(db: &Db, written: &Written<'_>, run: &mut CrateRun) {
         return;
     }
     let krate = run.krate;
-    let _span = tracing::info_span!(target: "blaze", "nameres crate", krate = crate::span_names::crate_name(db, krate)).entered();
+    let _span = crate::span_names::with_crate(
+        db,
+        krate,
+        tracing::info_span!(target: "blaze", "nameres crate", krate = tracing::field::Empty),
+    )
+    .entered();
     carry_maintaining();
     let _maintaining = Maintaining { before: replace_maintaining(Some(krate)) };
     let root = queries::crate_root(db, krate);
@@ -377,6 +382,7 @@ fn carry_maintaining() {
         blaze_query::carry(blaze_query::Carried {
             take: || stdx::lend::take_carried_cell(&MAINTAINING, Option::is_none),
             put: |it| stdx::lend::put_carried_cell(&MAINTAINING, Option::is_none, it),
+            end: |it| stdx::lend::end_carried_cell(&MAINTAINING, it),
         });
     });
 }
@@ -834,7 +840,12 @@ fn read_records(db: &Db, _: &Written<'_>, scoped: &mut Scoped) {
     let Scoped { krate, cs, ran, rows_changed, records_changed, data_changed, env_changed, proc_macro, assembled, .. } =
         scoped;
     let krate = *krate;
-    let _span = tracing::info_span!(target: "blaze", "nameres records", krate = crate::span_names::crate_name(db, krate)).entered();
+    let _span = crate::span_names::with_crate(
+        db,
+        krate,
+        tracing::info_span!(target: "blaze", "nameres records", krate = tracing::field::Empty),
+    )
+    .entered();
     carry_maintaining();
     let _maintaining = Maintaining { before: replace_maintaining(Some(krate)) };
     if let Some((ran, run_reads)) = ran {

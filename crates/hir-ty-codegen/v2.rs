@@ -8,7 +8,7 @@
 //! ([`shape`]), and compiles it with Cranelift or LLVM ([`release`]), the code by place and
 //! data by content ([`convert`]).
 
-use base_db::{Db, Crate};
+use base_db::Db;
 use blaze_codegen::{CodegenError, InstanceKey, Unit};
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
@@ -340,9 +340,14 @@ pub(crate) enum DataPlace {
     Nowhere,
 }
 
-/// A crate the build compiles for its build scripts and proc macros, not for the program.
-#[derive(Default, Debug)]
-pub struct BuildTime(pub blaze_hash::HashSet<Crate, std::alloc::Global>);
+/// Whether the build compiles code that runs at build time: a build script, a proc macro, or a
+/// crate one of them depends on, rather than the program. A property of the build, never of a
+/// crate: one crate of the front end can be both, as blaze-lower makes one crate of a host
+/// unit and a program unit that lower alike (an `equivalent` both a build script and the
+/// program depend on). Its code is the program's in the program's build: a dependency's,
+/// compiled with the program's settings and in its dependency image.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BuildTime(pub bool);
 
 /// The error of `unit`, saying `what`.
 pub(crate) fn failed(unit: &Unit, what: impl std::fmt::Display) -> CodegenError {

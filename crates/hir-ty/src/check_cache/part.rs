@@ -23,7 +23,7 @@ use hir_def::{
 use super::ids::{self, IdKind, Items, Table};
 use crate::{
     InferenceResult,
-    infer::persist::InferenceRecord,
+    infer::persist::{InferenceRecord, Nodes},
     next_solver::{
         DbInterner,
         persist::{TABLE_SCHEMA, TyTableWriter},
@@ -390,18 +390,20 @@ impl BodyRef<'_> {
     }
 
     /// The body's inference result, made in this database: its ids first, against `items`
-    /// ([`PartRef::items`]), then its record, read through them.
+    /// ([`PartRef::items`]), then its record, read through them, its nodes checked against
+    /// `nodes`, the counts of the body's store.
     pub(crate) fn inference<'db>(
         &self,
         db: &'db Db,
         krate: Crate,
         items: &[(IdKind, u64)],
+        nodes: Nodes,
     ) -> R<InferenceResult<'db>> {
         let words = self.root.ids.follow(self.bytes).map_err(format_error)?;
         let record = self.root.record.follow(self.bytes).map_err(format_error)?;
         let interner = DbInterner::new_with(db, krate);
         let mut table = ids::read(db, interner, items, words, self.bytes, self.root.locs)?;
-        ids::relocating(&mut table, || InferenceRecord::read(record)?.to_result(interner))
+        ids::relocating(&mut table, || InferenceRecord::read(record)?.to_result(interner, nodes))
             .map_err(format_error)
     }
 }

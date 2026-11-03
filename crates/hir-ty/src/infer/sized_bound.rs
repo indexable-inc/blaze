@@ -1,9 +1,9 @@
 //! What rustc's `lookup_method` (`compiler/rustc_hir_typeck/src/method/mod.rs` at 16d1ffac)
 //! gathers for `MethodError::IllegalSizedBound`, a method with a `Self: Sized` bound called on
 //! a trait object: whether the receiver of the other mutability picks another method
-//! (`needs_mut`), and the traits a probe over the traits of every crate picks from instead.
+//! (`needs_mut`), and the traits a probe over the traits of every crate the body's crate loads
+//! picks from instead.
 
-use base_db::all_crates;
 use hir_def::{
     FunctionId, GenericDefId, ItemContainerId, Lookup, TraitId, hir::ExprId,
     signatures::FunctionSignature,
@@ -17,7 +17,7 @@ use crate::{
     infer::InferenceContext,
     method_resolution::{
         CandidateId, CandidateSource, MethodError, MethodResolutionContext, Mode, Pick,
-        TraitSet, TraitsInScope, in_crate_trait_value_items,
+        TraitSet, TraitsInScope, in_crate_trait_value_items, loaded_crates,
     },
     next_solver::{AnyImplId, Ty, TyKind},
 };
@@ -93,8 +93,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         });
     }
 
-    /// rustc's probe with `ProbeScope::AllTraits`: the traits in scope and every trait of every
-    /// crate declared in a module that has a value item named `name`.
+    /// rustc's probe with `ProbeScope::AllTraits`: the traits in scope and every trait declared
+    /// in a module that has a value item named `name`, of every crate rustc's `all_traits` sees,
+    /// which are the crates its crate store holds: the body's crate and those it loads
+    /// ([`loaded_crates`]). A crate of the graph it does not load (another member, a sibling test
+    /// target, one whose proc macros are not built yet and whose items are half expanded) is
+    /// none of them, so its traits never reach this body's diagnostics.
     fn probe_all_traits(
         &self,
         call_expr: ExprId,
@@ -106,7 +110,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let in_scope = TraitsInScope::of_resolver(db, &self.resolver);
         // alloc: the error path's set of every trait with an item of the name, interned once.
         let mut traits: Vec<TraitId> = in_scope.all(db).collect();
-        for &krate in all_crates(db).iter() {
+        for &krate in loaded_crates(db, self.krate()) {
             // clone: an interned name (a refcount), the query's key.
             let items = in_crate_trait_value_items(db, krate, name.clone());
             traits.extend(items.iter().map(|&(it, _)| it));

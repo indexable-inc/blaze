@@ -56,8 +56,9 @@ pub fn machine_bytes() -> Option<u64> {
 }
 
 /// Gives the system back the pages of what was freed, which the allocator keeps to reuse
-/// otherwise.
-#[cfg(not(feature = "heap-profile"))]
+/// otherwise. Only where blaze names its allocator: mimalloc (`mimalloc`) or jemalloc
+/// (`heap-profile`); the seed profile runs on std's, which has no such call.
+#[cfg(all(feature = "mimalloc", not(feature = "heap-profile")))]
 pub fn purge_freed_pages() {
     // SAFETY: `mi_collect` reads and writes no memory of the caller's, and may be called from
     // any thread at any time.
@@ -123,6 +124,7 @@ mod tests {
         assert!(super::machine_bytes().is_some_and(|it| it > held.unwrap()));
     }
 
+    #[cfg(any(feature = "mimalloc", feature = "heap-profile"))]
     #[test]
     fn a_purge_leaves_what_is_live() {
         let kept = vec![7u8; 1 << 20];

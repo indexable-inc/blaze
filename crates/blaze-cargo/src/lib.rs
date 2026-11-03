@@ -29,6 +29,8 @@ pub mod sandbox;
 /// the store in one loop (docs/v2/plan/lanes/cargo/notes.md section 6).
 #[allow(unsafe_code, reason = "the daemon's own signal and process calls")]
 pub mod serve;
+/// The daemon's sockets: not in the seed, which runs no daemon (the `daemon` feature).
+#[cfg(feature = "daemon")]
 pub mod socket;
 pub mod toolchain;
 pub mod unstable;
@@ -39,7 +41,9 @@ pub const REFUSED_SHOWN: u32 = 16;
 /// What the first line of [`refused_error`] says, which the daemon's client finds it by.
 pub const REFUSED_SAYS: &str = "blaze could not compile";
 
-/// Why a program with nothing of rustc's is not built: the functions it reaches that blaze
+/// Why a program with nothing of rustc's is not built: `program` names its unit by package,
+/// version and target (`psm v0.1.32 (build script)`: every build script's target is
+/// `build-script-build`), then the functions it reaches that blaze
 /// could not compile, `reached` of them, each `name: why`, the first `shown` named (every one
 /// with `None`). Nothing else compiles them (AGENTS.md, no fallback), and a link without them
 /// would fail on what they leave undefined or keep a stand-in that aborts.

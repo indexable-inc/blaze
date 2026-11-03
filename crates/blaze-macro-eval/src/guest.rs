@@ -2,18 +2,10 @@
 //! the evaluator checks every access, and the running thread's `errno`. A shim stops the
 //! expansion with a [`Stop`] when the macro does what it may not.
 
-use std::fmt;
-
 /// Why an expansion stopped that is not the macro's own panic: what it hit, said so that the
-/// error names the macro after it ("the proc macro `x` <what>").
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) struct Stop(pub(crate) String);
-
-impl fmt::Display for Stop {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+/// error names the macro after it ("the proc macro `x` <what>"). `blaze_wasi`'s, which its WASI
+/// calls stop a module with.
+pub(crate) use blaze_wasi::Stop;
 
 /// The evaluator's memory and thread, as a shim reaches them (`run.rs` implements it over the
 /// evaluator; a test, over a buffer).

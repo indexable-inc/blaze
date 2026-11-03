@@ -176,6 +176,7 @@ fn policy(arch: Arch) -> Policy {
             panic: Panic::Unwind,
             packages: BTreeMap::new(),
             build_override: Override::default(),
+            stencils: false,
         },
         mode: Mode::Live,
         fold: false,

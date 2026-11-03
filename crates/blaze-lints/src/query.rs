@@ -46,6 +46,10 @@ pub(crate) struct Lints {
     /// The first path of `core`, `alloc` or `std` a lint looked up that `famous::KNOWN` does not
     /// list (`core::iter::Foo`), which the driver refuses the crate's check with.
     pub(crate) not_known: Option<String>,
+    /// Why the may-suspend check, which a fiber lint run here reads, checks nothing in the
+    /// crate's graph ([`hir_ty_suspend::Unchecked`], said), which the driver refuses the crate's
+    /// check with: a lint that reads an empty walk would find nothing, silently.
+    pub(crate) unchecked: Option<String>,
 }
 
 pub(crate) type BodyLints = Lints;

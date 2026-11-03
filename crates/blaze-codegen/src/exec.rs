@@ -43,7 +43,7 @@ pub const BOUND_DOMAIN: &str = "blaze v2 exec bound 1";
 /// name. The positions, coverage, counters and PGO counters a function names are its own;
 /// where the positions are, and the values of the statics, are known only at the link, which
 /// [`ExecTable::new`] adds.
-pub(crate) fn bound(
+pub fn bound(
     described: &Result<ContentId, String>,
     refs: &[Target],
     item_of: impl Fn(&InstanceKey) -> Option<ItemKey>,
@@ -587,34 +587,66 @@ pub enum ExecError {
     Unwalked { functions: usize, inputs: usize },
 }
 
-impl fmt::Display for ExecError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl ExecError {
+    /// The error as a link stops with it: each function it names by its path and type
+    /// arguments as `built` calls it ([`Built::debug_names`]), beside its key.
+    pub fn describe(&self, built: &Built) -> String {
+        let names = &built.debug_names;
+        // alloc: an error's message, written once at the edge
+        let mut said = String::new();
+        self.render(&mut said, |key| names.binary_search_by_key(key, |it| it.0).ok().map(|at| names[at].1.as_str()))
+            .expect("writing to a string cannot fail");
+        said
+    }
+
+    fn render<'a>(&self, f: &mut impl fmt::Write, name: impl Fn(&InstanceKey) -> Option<&'a str>) -> fmt::Result {
+        let named = |key: &InstanceKey| Named(*key, name(key));
         match self {
             ExecError::Unbound { function, why } => {
-                write!(f, "{function:?} has no bound code, which test selection keys it by: {why}")
+                write!(f, "{} has no bound code, which test selection keys it by: {why}", named(function))
             }
             ExecError::Twice { function, other } => {
-                write!(f, "{function:?} and {other:?} are one function across versions")
+                write!(f, "{} and {} are one function across versions", named(function), named(other))
             }
             ExecError::PastTable { function, slot, slots } => {
-                write!(f, "{function:?} is in slot {slot} of a jump table of {slots}")
+                write!(f, "{} is in slot {slot} of a jump table of {slots}", named(function))
             }
             ExecError::TwoInSlot { slot, function, other } => {
-                write!(f, "slot {slot} is named for both {function:?} and {other:?}")
+                write!(f, "slot {slot} is named for both {} and {}", named(function), named(other))
             }
             ExecError::NoRoot { test, root } => {
                 write!(f, "the test `{test}` is at root {root}, which the build does not have")
             }
             ExecError::NotCompiled { function } => {
-                write!(f, "{function:?} has no code in the build, so what positions and statics it names is not known")
+                write!(f, "{} has no code in the build, so what positions and statics it names is not known", named(function))
             }
             ExecError::NoSpans { function, anchor } => {
-                write!(f, "{function:?} names the span table {anchor:?}, which the link was not given")
+                write!(f, "{} names the span table {anchor:?}, which the link was not given", named(function))
             }
             ExecError::Unwalked { functions, inputs } => {
                 write!(f, "the build's reference graph has {functions} functions for {inputs} instances, so its tests' reach can't be walked")
             }
         }
+    }
+}
+
+/// A function of an error: `` `path` (InstanceKey(..)) ``, or its key alone where no name is
+/// given.
+struct Named<'a>(InstanceKey, Option<&'a str>);
+
+impl fmt::Display for Named<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.1 {
+            Some(name) => write!(f, "`{name}` ({:?})", self.0),
+            None => write!(f, "{:?}", self.0),
+        }
+    }
+}
+
+/// Each function by its key alone: [`ExecError::describe`] names them.
+impl fmt::Display for ExecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.render(f, |_| None)
     }
 }
 

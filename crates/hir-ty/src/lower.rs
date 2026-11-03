@@ -2356,7 +2356,8 @@ pub struct TyLoweringResult<'db, T> {
     anon_consts: ThinVec<AnonConstId<'db>>,
 }
 
-const _: () = assert!(size_of::<TyLoweringResult<'static, ()>>() == 16);
+// Two `ThinVec`s, a word each: 16 bytes on a 64-bit target.
+const _: () = assert!(size_of::<TyLoweringResult<'static, ()>>() == 2 * size_of::<usize>());
 
 /// A lowered signature as read: from a query of its own item ([`TyLoweringResult`]), or from a
 /// row of a crate's batch (`lower::batch`), whose diagnostics sit in a side table.
@@ -2374,7 +2375,8 @@ impl<T: ?Sized> Clone for Lowered<'_, T> {
 
 impl<T: ?Sized> Copy for Lowered<'_, T> {}
 
-const _: () = assert!(size_of::<Lowered<'static, ()>>() == 8 + 2 * 16);
+// A thin reference and two slices: 40 bytes on a 64-bit target.
+const _: () = assert!(size_of::<Lowered<'static, ()>>() == size_of::<&()>() + 2 * size_of::<&[u8]>());
 
 impl<'db, T: ?Sized> Lowered<'db, T> {
     pub(crate) fn new(
@@ -5507,7 +5509,14 @@ fn path_lifetimes(
         | TypeNs::AdtSelfType(_) => 0,
         _ => return None,
     };
-    let segments = || path.generic_args().into_iter().flatten().flatten();
+    // The lifetimes of `Fn(&A) -> &B` are the sugar's own, late-bound in its binder: rustc
+    // resolves them apart and keeps them out of the function's elision (`resolve_fn_signature`
+    // sets the outer candidates aside), so `&dyn Fn(usize)` leaves out one lifetime, the
+    // reference's, and `fn(usize, &dyn Fn(usize))` is `for<'a> Fn(usize, &'a dyn Fn(usize))`.
+    let sugar = |it: &hir_def::expr_store::path::GenericArgs<'_>| {
+        matches!(it.parenthesized, hir_def::expr_store::path::GenericArgsParentheses::ParenSugar)
+    };
+    let segments = || path.generic_args().into_iter().flatten().flatten().filter(|it| !sugar(it));
     if segments().any(|it| {
         !it.bindings.is_empty()
             || !matches!(it.parenthesized, hir_def::expr_store::path::GenericArgsParentheses::No)

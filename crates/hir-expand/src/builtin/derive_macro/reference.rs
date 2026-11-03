@@ -120,7 +120,7 @@ impl VariantShape {
                     .map(|it| it.name())
                     .map(|it| {
                         name_to_token(call_site, tm, it)
-                            .map(|it| tt::Ident { span: at_field(it.span), ..it })
+                            .map(|it| super::field_name_in_derive(it, call_site))
                     })
                     .collect::<Result<_, _>>()?,
             ),
@@ -925,7 +925,7 @@ pub(super) fn hash_expand(
         if matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.is_empty()) {
             let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
             return quote! {span =>
-                fn hash<H: #krate::hash::Hasher>(&self, ra_expand_state: &mut H) {
+                fn hash<__H: #krate::hash::Hasher>(&self, ra_expand_state: &mut __H) {
                     match #star self {}
                 }
             };
@@ -958,7 +958,7 @@ pub(super) fn hash_expand(
             quote! {span =>}
         };
         quote! {span =>
-            fn hash<H: #krate::hash::Hasher>(&self, ra_expand_state: &mut H) {
+            fn hash<__H: #krate::hash::Hasher>(&self, ra_expand_state: &mut __H) {
                 #check_discriminant
                 #body
             }

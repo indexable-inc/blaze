@@ -204,3 +204,44 @@ fn main() {
 "#;
     assert_reports(&ui("issue-68092-unicode-ident-after-incomplete-expr.rs", "2015", source), &[error(8, &[])]);
 }
+
+/// rustc's lexer glues joint punctuation, so `::`, `=>`, `..=`, `->` and `+=` are one separator
+/// each, and the operator after a separator is one `*`, `+` or `?`. The fixture has no `core`,
+/// so it names nothing from it.
+#[test]
+fn a_repetitions_separator_is_one_glued_token() {
+    let source = r#"#![crate_type = "lib"]
+
+macro_rules! path {
+    ($($segment:ident)::+) => { $($segment)::+ };
+}
+macro_rules! arrows {
+    ($($a:ident)=>*) => { [$($a),*] };
+}
+macro_rules! ranges {
+    ($($a:literal)..=+) => { 0 };
+}
+macro_rules! returns {
+    ($($a:ident)->*) => { 0 };
+}
+macro_rules! assigns {
+    ($($a:ident)+=*) => { 0 };
+}
+
+pub mod m {
+    pub mod n {
+        pub const MAX: usize = 1;
+    }
+}
+
+pub fn f() -> usize {
+    let (a, b, c) = (1usize, 2usize, 3usize);
+    let _ = arrows!(a => b => c);
+    let _: usize = ranges!(1 ..= 2);
+    let _: usize = returns!(a -> b);
+    let _: usize = assigns!(a += b);
+    path!(m::n::MAX)
+}
+"#;
+    assert_eq!(ui("separator.rs", "2021", source), "");
+}

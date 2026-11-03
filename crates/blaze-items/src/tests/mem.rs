@@ -105,7 +105,7 @@ fn hash_columns_answer_as_a_map_of_their_rows() {
     let model: HashMap<ItemKey, ItemHashes> = rows.iter().copied().collect();
     let item = items(&single("struct S;").0)[0];
     let mut missing: Vec<(ItemKey, Unhashable)> =
-        unhashable.iter().map(|&key| (key, Unhashable { item, what: "a test's" })).collect();
+        unhashable.iter().map(|&key| (key, Unhashable::of(item, "a test's"))).collect();
     let columns = HashColumns::new(&mut rows, &mut missing);
     assert_eq!(columns.len(), model.len());
     assert!(columns.keys().windows(2).all(|it| it[0] < it[1]));
@@ -225,7 +225,7 @@ pub const C: u32 = 1;
     for &id in &ids {
         let _ = (hashes(&db, id), signature_hash(&db, id));
     }
-    let warm: Vec<_> = refs.iter().map(|&fact| Goals.value(&db, fact)).collect();
+    let warm: Vec<_> = refs.iter().map(|&fact| Goals.value(&db, Some(krate), fact)).collect();
     assert!(warm.iter().any(Option::is_some));
 
     assert_at_most(0, "a warm crate's hash columns", || {
@@ -238,7 +238,7 @@ pub const C: u32 = 1;
     });
     assert_at_most(0, "warm fact values", || {
         for &fact in &refs {
-            std::hint::black_box(Goals.value(&db, fact));
+            std::hint::black_box(Goals.value(&db, Some(krate), fact));
         }
     });
 }

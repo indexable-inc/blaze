@@ -14,7 +14,9 @@ repository.workspace = true
 doctest = false
 
 [features]
-default = ["daemon"]
+default = ["daemon", "llvm-stencils"]
+# blaze-stencil's stencils made by LLVM at build time; off in the seed profile.
+llvm-stencils = ["daemon", "blaze-stencil/llvm-stencils"]
 # The daemon's side: plans, stubs, the fetcher and its runner. A lazy run's image links the
 # crate without it, for the hook its stubs call and the frames it sends.
 daemon = ["dep:blaze-codegen", "dep:blaze-ids", "dep:blaze-items", "dep:blaze-mem", "dep:blaze-stencil", "dep:blaze-hash", "dep:crossbeam-queue"]

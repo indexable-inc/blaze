@@ -455,14 +455,7 @@ fn assoc_definition<'db>(cx: &Cx<'_, 'db>, projection: &Projection<'db>, impl_: 
 fn recursion_limit_help(cx: &Cx<'_, '_>) -> String {
     let limit = hir_def::nameres::crate_def_map(cx.db, cx.krate.into()).recursion_limit();
     let suggested = if limit == 0 { 2 } else { limit * 2 };
-    let crate_name = match cx.krate.display_name(cx.db) {
-        Some(name) => name.crate_name().to_string(), // alloc: the error's text, for an error hir found
-        None => {
-            let path = cx.file_name(cx.krate.root_file(cx.db));
-            let stem = path.rsplit('/').next().unwrap_or(&path);
-            stem.strip_suffix(".rs").unwrap_or(stem).replace('-', "_")
-        }
-    };
+    let crate_name = cx.crate_name(cx.krate);
     // alloc: the error's text, for an error hir found
     format!(
         "consider increasing the recursion limit by adding a `#![recursion_limit = \"{suggested}\"]` attribute to your crate (`{crate_name}`)"

@@ -17,7 +17,7 @@ doctest = false
 anyhow.workspace = true
 blaze-hash.workspace = true
 blaze-manifest.workspace = true
-blaze-registry.workspace = true
+blaze-registry = { workspace = true, features = ["net"] }
 blaze-resolve.workspace = true
 blaze-serde.workspace = true
 blaze-units.workspace = true

@@ -169,6 +169,26 @@ impl Def {
         }
     }
 
+    /// The segment rustc's `def_path_str` prints for the definition: its name, or `_` for an
+    /// unnamed one (`const _`, `extern crate krate as _`; rustc's `DefPathData::ValueNs(_)` and
+    /// `TypeNs(_)`). None only for a crate root, an impl and a block module, which have no
+    /// segment of their own: an item in a block is printed under the body's owner.
+    pub(crate) fn segment(self, cx: &Cx<'_, '_>) -> Option<Name> {
+        match self {
+            Def::Module(_) | Def::Impl(_) => self.name(cx),
+            Def::Const(_) | Def::ExternCrate(_) => {
+                Some(self.name(cx).unwrap_or_else(|| Name::new_symbol_root(sym::underscore)))
+            }
+            Def::Adt(_)
+            | Def::Variant(_)
+            | Def::Function(_)
+            | Def::Static(_)
+            | Def::Trait(_)
+            | Def::TypeAlias(_)
+            | Def::Macro(_) => self.name(cx),
+        }
+    }
+
     /// The container of an associated item, of a function or constant written in a trait or
     /// an impl.
     pub(crate) fn container(self, cx: &Cx<'_, '_>) -> Option<ItemContainerId> {

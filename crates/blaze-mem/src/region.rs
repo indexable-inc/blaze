@@ -49,6 +49,9 @@ pub struct Region {
     pages: Pages,
     /// The NUMA node its pages are preferred on, once placed ([`Region::bind_node`]).
     node: Option<u32>,
+    /// Made by [`Region::reserve_sparse`]: every byte readable and writable from the start, and
+    /// `committed` the prefix its owner said it uses.
+    sparse: bool,
     tag: Tag,
 }
 
@@ -92,6 +95,37 @@ impl Region {
         Region::placed(bytes, Region::chosen(bytes, tag)?, Some(node), tag)
     }
 
+    /// A sparse region: every byte of `bytes` (rounded up to whole granules) readable and
+    /// writable from the start, reading zeros until written, and only the pages touched ever
+    /// backed by memory (Linux and macOS; base pages, never huge ones). [`Region::ensure`] does
+    /// no system call here: it counts the prefix the owner says it writes as committed, so
+    /// the tag holds what the table uses, not what it could reach. For a table read at any
+    /// index but written in a few (the query database's page directories): a read past the
+    /// committed prefix is valid and finds zero. Windows commits it whole, and counts it so.
+    /// Never decommitted ([`Region::decommit_after`] refuses).
+    pub fn reserve_sparse(bytes: usize, tag: Tag) -> Result<Region, MemError> {
+        let granule = os::page_size().max(64 << 10);
+        let reserved = crate::align::checked_align_up(bytes.max(1), granule).ok_or(
+            MemError::TooLarge { tag, what: "a reservation", wanted: bytes },
+        )?;
+        let base = os::reserve_sparse(reserved).map_err(|os| MemError::Reserve { tag, bytes: reserved, os })?;
+        tag::reserved(tag, reserved);
+        let region = Region {
+            base,
+            reserved,
+            committed: AtomicUsize::new(0),
+            granule,
+            pages: Pages::Base,
+            node: None,
+            sparse: true,
+            tag,
+        };
+        if cfg!(windows) {
+            region.publish(reserved);
+        }
+        Ok(region)
+    }
+
     fn chosen(bytes: usize, tag: Tag) -> Result<Pages, MemError> {
         crate::huge::chosen().map_err(|os| MemError::Reserve { tag, bytes, os })
     }
@@ -108,7 +142,8 @@ impl Region {
             None => os::reserve(reserved, transparent),
         }
         .map_err(|os| MemError::Reserve { tag, bytes: reserved, os })?;
-        Ok(Region { base, reserved, committed: AtomicUsize::new(0), granule, pages, node, tag })
+        tag::reserved(tag, reserved);
+        Ok(Region { base, reserved, committed: AtomicUsize::new(0), granule, pages, node, sparse: false, tag })
     }
 
     /// The unit a commit or decommit ending at `len` is rounded to: whole huge pages past the
@@ -154,20 +189,55 @@ impl Region {
         self.base
     }
 
-    /// The address `offset` bytes into the reservation (`offset <= reserved`).
+    /// The address `offset` bytes into the reservation.
+    ///
+    /// # Panics
+    ///
+    /// When `offset > reserved`, naming both and the region's tag. The check runs in every
+    /// build: this is a safe fn, and past the reservation `base + offset` could wrap to null.
     #[inline]
+    #[track_caller]
     pub fn at(&self, offset: usize) -> NonNull<u8> {
-        debug_assert!(offset <= self.reserved);
-        // SAFETY: `base` is not null and `base + offset` stays inside the reservation, which
-        // the kernel gave whole, so it does not wrap around the address space.
+        if offset > self.reserved {
+            self.past_reservation(offset);
+        }
+        // SAFETY: `base` is not null and `base + offset` stays inside the reservation (checked
+        // just above), which the kernel gave whole, so it does not wrap around the address
+        // space.
         unsafe { NonNull::new_unchecked(self.base.as_ptr().wrapping_add(offset)) }
+    }
+
+    /// [`Region::at`] without its check, for a caller whose own bound already implies it, on a
+    /// path where the compare shows: the query database's `Dense::place`, `Dense::get_mut` and
+    /// `Dense::slice`, whose indexes are below a length it reserved for.
+    ///
+    /// # Safety
+    ///
+    /// `offset <= self.reserved()`.
+    #[inline(always)]
+    pub unsafe fn at_unchecked(&self, offset: usize) -> NonNull<u8> {
+        debug_assert!(offset <= self.reserved);
+        // SAFETY: `base` is not null and `base + offset` stays inside the reservation (the
+        // caller's contract), which the kernel gave whole, so it does not wrap around.
+        unsafe { NonNull::new_unchecked(self.base.as_ptr().wrapping_add(offset)) }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[track_caller]
+    fn past_reservation(&self, offset: usize) -> ! {
+        panic!(
+            "byte {offset} of a {:?} region of {} reserved bytes: past its reservation",
+            self.tag, self.reserved,
+        )
     }
 
     pub fn reserved(&self) -> usize {
         self.reserved
     }
 
-    /// Bytes from the base that are readable and writable now.
+    /// Bytes from the base that are committed: readable and writable now (of a sparse region,
+    /// [`Region::reserve_sparse`], the prefix its owner uses; every byte of one is readable).
     pub fn committed(&self) -> usize {
         self.committed.load(Ordering::Acquire)
     }
@@ -223,6 +293,11 @@ impl Region {
         let from = self.committed.load(Ordering::Acquire);
         let target = self.committed_after(len)?;
         if target <= from {
+            return Ok(());
+        }
+        if self.sparse {
+            // Readable and writable already: only the count moves.
+            self.publish(target);
             return Ok(());
         }
         let start = crate::align::align_down(from, self.granule);
@@ -306,7 +381,19 @@ impl Region {
     /// Gives every page past the first `keep` bytes (rounded up to a granule, or to a huge page
     /// past the first on huge pages) back to the kernel: what a frame or table does after a
     /// burst, so resident memory returns to the working set.
+    ///
+    /// # Errors
+    ///
+    /// On a sparse region ([`Region::reserve_sparse`]), whose bytes must stay readable: its
+    /// owner reads past the committed prefix.
     pub fn decommit_after(&mut self, keep: usize) -> io::Result<()> {
+        if self.sparse {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                // alloc: the error of a refused decommit, once
+                format!("a sparse {:?} region of {} bytes is never decommitted: its owner reads past what it committed", self.tag, self.reserved),
+            ));
+        }
         let keep = crate::align::checked_align_up(keep, self.unit(keep))
             .unwrap_or(self.reserved)
             .min(self.reserved);
@@ -361,6 +448,7 @@ impl Drop for Region {
         // SAFETY: `base` and `reserved` are this reservation's own, and the region is gone, so
         // nothing reaches its memory.
         unsafe { os::release(self.base, self.reserved) };
+        tag::released(self.tag, self.reserved);
     }
 }
 
@@ -372,6 +460,7 @@ impl std::fmt::Debug for Region {
             .field("committed", &self.committed())
             .field("pages", &self.pages)
             .field("node", &self.node)
+            .field("sparse", &self.sparse)
             .finish()
     }
 }

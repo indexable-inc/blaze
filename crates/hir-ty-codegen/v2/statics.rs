@@ -36,6 +36,29 @@ pub(crate) struct Value {
     places: Places,
 }
 
+/// Where the value of a static the walk reaches ([`FrontRef::Static`]) comes from.
+pub(crate) enum Source<'db> {
+    /// An `extern_weak` static of an `extern` block: blaze's own static holding the address of
+    /// this symbol, 0 when nothing defines it. Its value is no Rust code's, so it makes no
+    /// vtable and calls nothing.
+    Weak(String),
+    /// Any other: its initializer, evaluated and compiled.
+    Compiled(&'db CompiledStatic),
+}
+
+/// Where the value of the static `id` comes from. Every reader of a reached static's value
+/// asks here, never `compiled_static` itself, which has no value for one of an `extern` block.
+pub(crate) fn source(db: &Db, id: StaticId) -> Result<Source<'_>, String> {
+    if let Some(symbol) = weak_symbol(db, id)? {
+        return Ok(Source::Weak(symbol));
+    }
+    match compiled_static(db, id) {
+        Ok(it) => Ok(Source::Compiled(it)),
+        // alloc: the error's message
+        Err(e) => Err(format!("the static `{}`: {e}", blaze_items::key::path(db, ItemId::Static(id)))),
+    }
+}
+
 /// What the static `id` holds, evaluated.
 pub(crate) fn value(
     db: &Db,
@@ -47,9 +70,9 @@ pub(crate) fn value(
     // alloc: only a static with `#[link_section]`, whose `Static::section` owns its name
     let section = AttrFlags::link_section(db, id.into()).map(|it| it.as_str().to_owned());
     let mut placer = Placer::open();
-    let (blob, mut requests, mutable) = match weak_symbol(db, id)? {
+    let (blob, mut requests, mutable) = match source(db, id)? {
         // What code reads of it is the address of the symbol.
-        Some(symbol) => {
+        Source::Weak(symbol) => {
             placer.place(FrontRef::Weak(symbol))?;
             let word = target.word();
             let blob = ConstBlob {
@@ -61,10 +84,7 @@ pub(crate) fn value(
             };
             (blob, Requests::default(), false)
         }
-        None => {
-            let CompiledStatic { requests, blob, writable } =
-                // alloc: the error's message
-                compiled_static(db, id).as_ref().map_err(|e| e.to_string())?;
+        Source::Compiled(CompiledStatic { requests, blob, writable }) => {
             // clone: the memo's, which `place_requests` rewrites in place
             let requests = Requests { funcs: requests.funcs.clone(), datas: requests.datas.clone() };
             // clone: the memo's, which `fill_type_ids` rewrites in place
@@ -135,7 +155,7 @@ pub(crate) fn compile(
     let item: ItemKey = hashes.item(db, ItemId::Static(id))?;
     // The static's value is laid out for its crate's target, so `arch` has to be its.
     let target = crate::target_of_crate(db, id.krate(db)).map_err(|e| e.to_string())?;
-    if (arch == Arch::Wasm32) != target.is_wasm() {
+    if arch.is_wasm() != target.is_wasm() {
         // alloc: an error
         return Err(format!(
             "the static `{}` compiled for {arch:?} while its crate's target is {:?}",

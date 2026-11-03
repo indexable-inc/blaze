@@ -75,7 +75,7 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
         Arch::Aarch64 => macho::CPU_TYPE_ARM64,
         Arch::X86_64 => macho::CPU_TYPE_X86_64,
         // alloc: error path
-        Arch::Wasm32 => return Err("a Mach-O library in a wasm32 link".to_owned()),
+        Arch::Wasm32 | Arch::Wasm64 => return Err(format!("a Mach-O library in a {arch:?} link")),
     };
     let cpu = header.cputype(endian);
     if cpu != want {

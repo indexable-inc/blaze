@@ -155,6 +155,7 @@ pub fn toolchain_for(
         crate::Arch::X86_64 => Arch::X86_64,
         crate::Arch::Aarch64 => Arch::Aarch64,
         crate::Arch::Wasm32 => Arch::Wasm32,
+        crate::Arch::Wasm64 => Arch::Wasm64,
     };
     let baseline = baseline(&emitted);
     let (cpu, mut on) = match flags.cpu.as_deref() {
@@ -378,7 +379,7 @@ pub(super) fn baseline(target: &Target) -> &'static [&'static str] {
         (crate::Arch::X86_64, _) => X86_64,
         (crate::Arch::Aarch64, "apple-m1") => APPLE_M1,
         (crate::Arch::Aarch64, _) => AARCH64,
-        (crate::Arch::Wasm32, _) => &[],
+        (crate::Arch::Wasm32 | crate::Arch::Wasm64, _) => &[],
     }
 }
 
@@ -437,7 +438,7 @@ fn host_features(target: &Target) -> Vec<&'static str> {
     let host = match target.arch {
         crate::Arch::X86_64 => cfg!(target_arch = "x86_64"),
         crate::Arch::Aarch64 => cfg!(target_arch = "aarch64"),
-        crate::Arch::Wasm32 => false,
+        crate::Arch::Wasm32 | crate::Arch::Wasm64 => false,
     };
     if !host {
         // alloc: none, an empty `Vec`
@@ -478,7 +479,7 @@ fn implications(target: &Target) -> &'static [(&'static str, &'static [&'static 
     match target.arch {
         crate::Arch::X86_64 => X86_IMPLIES,
         crate::Arch::Aarch64 => AARCH64_IMPLIES,
-        crate::Arch::Wasm32 => &[],
+        crate::Arch::Wasm32 | crate::Arch::Wasm64 => &[],
     }
 }
 

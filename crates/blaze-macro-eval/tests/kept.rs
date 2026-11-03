@@ -172,7 +172,7 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     let mut store = kept_in(&mut sim);
     let keeping = kept::Keeping::new(Expansions { store: store.reader(), toolchain, environment: Arc::new(Environment::default()) })
         .unwrap_or_else(|why| panic!("{why}"));
-    let macros = blaze_macro_eval::Macros::new(kept::Keeps::In(keeping));
+    let macros = blaze_macro_eval::Macros::new(kept::Keeps::In(keeping), None);
 
     // A first build runs every macro and keeps what each stateless one made.
     let records = Records::default();

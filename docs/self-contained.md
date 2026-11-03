@@ -121,9 +121,10 @@ differential harness and never as a step of a build.
 - **`crates/blaze-registry`**: the crates.io sparse index (and other sparse registries, and
   git indexes), with cargo's cache rules; `.crate` files downloaded and checked against the
   index's or the lock file's sha256, kept in blaze's content-addressed store by that hash, and
-  unpacked where cargo unpacks them (`$CARGO_HOME/registry/src/<registry>-<hash>/<name>-<version>`),
-  so that paths in panics and `file!()` are cargo's and cargo and blaze share them; git
-  dependencies checked out at cargo's paths; vendored directories, local registries and
+  unpacked in blaze's own `<root>/sources`, laid out as cargo's home is
+  (`registry/src/<registry>-<hash>/<name>-<version>`; superseded 2026-11-02: blaze no longer
+  shares `$CARGO_HOME` with cargo, see docs/cargo.md "Where a build writes"); git
+  dependencies checked out at cargo's layout there; vendored directories, local registries and
   offline mode.
 - **`crates/blaze-resolve`**: the resolver. `Cargo.lock` (versions 1 to 4) honoured exactly
   when it is there and up to date, and written as cargo writes it; otherwise versions chosen

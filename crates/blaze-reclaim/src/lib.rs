@@ -17,7 +17,7 @@
 //! prefetch together), written only by its thread: entering and leaving a task writes no line
 //! another core writes.
 
-use std::{cell::Cell, marker::PhantomData, ptr};
+use std::{cell::Cell, marker::PhantomData, num::NonZeroUsize, ptr};
 
 use crate::sync::{
     atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence},
@@ -176,16 +176,17 @@ pub fn enter() -> Guard {
 /// Moves the task this thread is in off it, for a job that parks on a fiber and resumes on
 /// another thread: its slot goes with it, still pinning the epoch the task began at, so what
 /// the job read before it parked stays valid until it ends; the thread takes a fresh slot at
-/// its next task. A word for [`unpark`]; 0 when the thread is in no task.
-pub fn park() -> usize {
+/// its next task. A word for [`unpark`] (or [`end_parked`]); `None` when the thread is in no
+/// task.
+pub fn park() -> Option<NonZeroUsize> {
     LOCAL.with(|local| {
         let depth = local.depth.replace(0);
         if depth == 0 {
-            return 0;
+            return None;
         }
         let slot = local.slot.take().expect("a thread in a task has a slot");
         slot.parked.store(depth, Ordering::Relaxed);
-        ptr::from_ref(slot).expose_provenance()
+        NonZeroUsize::new(ptr::from_ref(slot).expose_provenance())
     })
 }
 
@@ -193,23 +194,40 @@ pub fn park() -> usize {
 ///
 /// # Panics
 ///
-/// Where this thread is in a task.
-pub fn unpark(parked: usize) {
-    if parked == 0 {
-        return;
-    }
+/// Where this thread is in a task. The parked task is ended first ([`end_parked`]), so its
+/// slot does not go on pinning its epoch.
+pub fn unpark(parked: NonZeroUsize) {
     LOCAL.with(|local| {
-        assert_eq!(local.depth.get(), 0, "a parked task put on a thread in a task");
+        let depth = local.depth.get();
+        if depth != 0 {
+            end_parked(parked);
+            panic!("a parked task put on a thread in a task {depth} deep");
+        }
         if let Some(spare) = local.slot.get() {
             spare.since.store(OUT, Ordering::Release);
             spare.taken.store(false, Ordering::Release);
         }
-        // SAFETY: `parked` is the address of a slot `park` gave, and slots are never freed
-        // (their blocks are leaked); it was taken off its thread, so it is this task's alone.
-        let slot: &'static Slot = unsafe { &*ptr::with_exposed_provenance::<Slot>(parked) };
+        let slot = parked_slot(parked);
         local.slot.set(Some(slot));
         local.depth.set(slot.parked.swap(0, Ordering::Relaxed));
     });
+}
+
+/// Ends a task [`park`] moved off a thread whose job ended without putting it back (a guard it
+/// forgot): its slot leaves the task, so it pins no epoch, and goes back for any thread to
+/// claim, as a thread's slot does when the thread ends.
+pub fn end_parked(parked: NonZeroUsize) {
+    let slot = parked_slot(parked);
+    slot.parked.store(0, Ordering::Relaxed);
+    slot.since.store(OUT, Ordering::Release);
+    slot.taken.store(false, Ordering::Release);
+}
+
+/// The slot a [`park`] word names.
+fn parked_slot(parked: NonZeroUsize) -> &'static Slot {
+    // SAFETY: `parked` is the address of a slot `park` gave, and slots are never freed (their
+    // blocks are leaked); it was taken off its thread, so it is this task's alone.
+    unsafe { &*ptr::with_exposed_provenance::<Slot>(parked.get()) }
 }
 
 /// Whether this thread is in a task.

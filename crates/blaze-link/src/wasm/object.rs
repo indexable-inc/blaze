@@ -71,11 +71,13 @@ const COMDAT_DATA: u8 = 0;
 const COMDAT_FUNCTION: u8 = 1;
 const COMDAT_SECTION: u8 = 5;
 
-pub(super) fn read(name: &str, bytes: &[u8], kind: &NativeKind) -> Result<NativeFile, String> {
+/// Reads a file of a link whose module is memory64 (wasm64) or not: an object whose memory is
+/// the other width is refused.
+pub(super) fn read(name: &str, bytes: &[u8], kind: &NativeKind, memory64: bool) -> Result<NativeFile, String> {
     match kind {
         NativeKind::Object => {
             // alloc: error path
-            object(bytes).map(NativeFile::Object).map_err(|e| format!("{name}: {e}"))
+            object(bytes, memory64).map(NativeFile::Object).map_err(|e| format!("{name}: {e}"))
         }
         NativeKind::Archive { whole } => {
             // alloc: error path
@@ -216,6 +218,8 @@ struct Parsed<'a> {
     customs: Vec<Custom<'a>>,
     linking: Option<&'a [u8]>,
     relocs: Vec<(&'a str, &'a [u8])>,
+    /// Whether the memory it imports has 64-bit limits (memory64); `None` when it imports none.
+    memory64: Option<bool>,
 }
 
 fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
@@ -265,7 +269,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                                 limits(&mut r)?;
                                 parsed.imported_tables.push(field);
                             }
-                            2 => limits(&mut r)?,
+                            2 => parsed.memory64 = Some(limits(&mut r)? & MEMORY64 != 0),
                             3 => {
                                 r.u8()?;
                                 r.u8()?;
@@ -341,7 +345,22 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                             // alloc: error path
                             flags => return Err(format!("a data segment of flags {flags}")),
                         }
-                        r.i32_const()?;
+                        // `i32.const`, or memory64's `i64.const`; the module's width is checked
+                        // against the link's in `object`.
+                        match (r.u8()?, parsed.memory64) {
+                            (0x41, Some(false) | None) => {
+                                r.sleb32()?;
+                            }
+                            (0x42, Some(true)) => {
+                                r.sleb()?;
+                            }
+                            // alloc: error path
+                            (other, _) => return Err(format!("a data segment's offset of opcode {other:#04x} for its memory")),
+                        }
+                        if r.u8()? != 0x0b {
+                            // alloc: error path
+                            return Err("a data segment's offset longer than a constant".to_owned());
+                        }
                         let len = r.uleb32()? as usize;
                         let start = at + r.at();
                         r.take(len)?;
@@ -406,7 +425,11 @@ fn signature<'a>(r: &mut Reader<'a>, contents: &'a [u8]) -> Result<Sig<'a>, Stri
     }
 }
 
-fn limits(r: &mut Reader<'_>) -> Result<(), String> {
+/// The limits' flags flag of 64-bit limits (memory64, table64).
+const MEMORY64: u8 = 0x4;
+
+/// Reads limits, and gives their flags.
+fn limits(r: &mut Reader<'_>) -> Result<u8, String> {
     let flags = r.u8()?;
     if flags > 7 {
         // alloc: error path
@@ -416,7 +439,7 @@ fn limits(r: &mut Reader<'_>) -> Result<(), String> {
     if flags & 1 != 0 {
         r.uleb()?;
     }
-    Ok(())
+    Ok(flags)
 }
 
 struct WasmSymbol<'a> {
@@ -627,12 +650,21 @@ fn width(r_type: u32) -> usize {
         | reloc::FUNCTION_INDEX_I32
         | reloc::FUNCTION_OFFSET_I32
         | reloc::SECTION_OFFSET_I32 => 4,
+        reloc::TABLE_INDEX_I64 | reloc::MEMORY_ADDR_I64 => 8,
+        reloc::MEMORY_ADDR_LEB64 | reloc::MEMORY_ADDR_SLEB64 | reloc::MEMORY_ADDR_REL_SLEB64 | reloc::TABLE_INDEX_SLEB64 => {
+            super::leb::PADDED64
+        }
         _ => super::leb::PADDED,
     }
 }
 
-fn object(bytes: &[u8]) -> Result<Object, String> {
+fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
     let parsed = parse(bytes)?;
+    match parsed.memory64 {
+        Some(true) if !memory64 => return Err("a memory64 (wasm64) object in a wasm32 link".to_owned()), // alloc: error path
+        Some(false) if memory64 => return Err("a wasm32 object, its memory 32-bit, in a memory64 (wasm64) link".to_owned()), // alloc: error path
+        _ => {}
+    }
     let linking = linking(parsed.linking.ok_or(
         "no linking section: not a relocatable object (a linked module can't be linked again)",
     )?)?;
@@ -1112,9 +1144,11 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             let _ = write!(scratch, ".init_array.{priority}");
         }
         let run = fixups.len() as u32;
+        // A function pointer: four bytes, or eight in a memory64 module.
+        let (apply, slot) = if memory64 { (reloc::TABLE_INDEX_I64, 8) } else { (reloc::TABLE_INDEX_I32, 4) };
         fixups.push(NativeFixup {
             at: 0,
-            apply: Apply::Native(reloc::TABLE_INDEX_I32),
+            apply: Apply::Native(apply),
             symbol,
             addend: 0,
             minus: None,
@@ -1122,10 +1156,10 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
         sections.push(Section {
             name: names.push(&scratch)?,
             what: SectionKind::Alloc(Class::InitArray, priority),
-            align: 4,
+            align: slot,
             // The slot the core fills (it writes a zeroed piece's fixups too): no bytes of the
             // input, and none made.
-            data: Data::Zero(4),
+            data: Data::Zero(slot),
             fixups: run..fixups.len() as u32,
             retain: false,
         });
@@ -1353,7 +1387,7 @@ mod tests {
     }
 
     fn read_object(bytes: &[u8]) -> Result<Object, String> {
-        match read("crt1.o", bytes, &NativeKind::Object)? {
+        match read("crt1.o", bytes, &NativeKind::Object, false)? {
             NativeFile::Object(object) => Ok(object),
             _ => panic!("not an object"),
         }
@@ -1572,7 +1606,11 @@ mod tests {
         let error = read_object(&linked).unwrap_err();
         assert!(error.contains("no linking section"), "{error}");
 
-        assert!(read("libc.so", &linked, &NativeKind::Shared { as_needed: true }).is_err());
+        assert!(read("libc.so", &linked, &NativeKind::Shared { as_needed: true }, false).is_err());
+
+        // An object's memory is the link's width: a wasm32 object in a wasm64 link is refused.
+        let error = read("crt1.o", &object_bytes(&code_relocs(), None), &NativeKind::Object, true).err().unwrap();
+        assert!(error.contains("memory64"), "{error}");
     }
 
     fn header(name: &str, size: usize) -> Vec<u8> {
@@ -1607,7 +1645,7 @@ mod tests {
     fn reads_an_archive() {
         let bytes = archive_bytes(true);
         let NativeFile::Archive(archive) =
-            read("libc.a", &bytes, &NativeKind::Archive { whole: false }).unwrap()
+            read("libc.a", &bytes, &NativeKind::Archive { whole: false }, false).unwrap()
         else {
             panic!("not an archive")
         };
@@ -1621,9 +1659,9 @@ mod tests {
     #[test]
     fn an_archive_without_an_index() {
         let bytes = archive_bytes(false);
-        let error = read("libx.a", &bytes, &NativeKind::Archive { whole: false }).err().unwrap();
+        let error = read("libx.a", &bytes, &NativeKind::Archive { whole: false }, false).err().unwrap();
         assert!(error.contains("libx.a") && error.contains("index"), "{error}");
-        assert!(read("libx.a", &bytes, &NativeKind::Archive { whole: true }).is_ok());
+        assert!(read("libx.a", &bytes, &NativeKind::Archive { whole: true }, false).is_ok());
     }
 
     #[test]
@@ -1631,7 +1669,7 @@ mod tests {
         // One header of a 100-byte member, and no bytes after it.
         let mut bytes = b"!<arch>\n".to_vec();
         bytes.extend(header("a.o/", 100));
-        let error = read("liba.a", &bytes, &NativeKind::Archive { whole: true }).err().unwrap();
+        let error = read("liba.a", &bytes, &NativeKind::Archive { whole: true }, false).err().unwrap();
         assert!(error.contains("`a.o`") && error.contains("past the archive"), "{error}");
     }
 
@@ -1670,7 +1708,7 @@ mod tests {
         bsd_member(&mut bytes, "a.o", reader::MAGIC);
 
         let NativeFile::Archive(archive) =
-            read("libb.a", &bytes, &NativeKind::Archive { whole: false }).unwrap()
+            read("libb.a", &bytes, &NativeKind::Archive { whole: false }, false).unwrap()
         else {
             panic!("not an archive")
         };

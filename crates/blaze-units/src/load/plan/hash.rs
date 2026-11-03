@@ -65,14 +65,18 @@ pub(super) enum CompileMode {
 }
 
 impl CompileMode {
-    /// The unit's mode; the modes that run rustdoc are refused, blaze never running it.
+    /// The unit's mode. A library's doctests are planned as cargo plans them: blaze builds
+    /// them itself (docs/v2/plan/doctests.md), never through rustdoc. The two modes only
+    /// rustdoc has, documenting (`blaze doc` plans checks) and scraping examples, are
+    /// refused: no graph blaze makes has them.
     pub fn of(unit: &Unit) -> Result<CompileMode, LoadError> {
         match unit.mode {
             Mode::Test => Ok(CompileMode::Test),
             Mode::Build => Ok(CompileMode::Build),
             Mode::Check => Ok(CompileMode::Check { test: unit.checked_as_test }),
             Mode::RunCustomBuild => Ok(CompileMode::RunCustomBuild),
-            Mode::Doc | Mode::Doctest | Mode::Docscrape => Err(error(format!(
+            Mode::Doctest => Ok(CompileMode::Doctest),
+            Mode::Doc | Mode::Docscrape => Err(error(format!(
                 "blaze does not run rustdoc: the `{:?}` unit of `{}`'s target `{}` has no plan",
                 unit.mode, unit.pkg_id, unit.target.name
             ))),

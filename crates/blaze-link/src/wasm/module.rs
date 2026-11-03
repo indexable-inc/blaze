@@ -24,7 +24,7 @@ use std::alloc::Global;
 use super::code::{Header, NOTHING, Sig};
 use super::leb::{self, PADDED, padded_uleb};
 use super::reader::{MAGIC, Reader, Wasm as _};
-use super::{FUNCTIONS, HEAP, MEMORY_BASE, STACK_POINTER, Wasm, heap_base, in_memory, initial_pages};
+use super::{FUNCTIONS, HEAP, MEMORY_BASE, STACK_POINTER, TABLE, Wasm, heap_base, in_memory, initial_pages};
 use crate::model::{Class, Placed, Region, SymbolKind, View};
 use crate::output::OutputKind;
 
@@ -43,7 +43,11 @@ mod id {
 
 const FUNCREF: u8 = 0x70;
 const I32: u8 = 0x7f;
+const I64: u8 = 0x7e;
+/// The memory type's flag of 64-bit limits (memory64).
+const MEMORY64: u8 = 0x04;
 const EXPORT_FUNCTION: u8 = 0;
+const EXPORT_TABLE: u8 = 1;
 const EXPORT_MEMORY: u8 = 2;
 const EXPORT_GLOBAL: u8 = 3;
 /// The bytes one parallel copy takes at most: a large data segment is copied by many threads.
@@ -61,24 +65,36 @@ struct Unit<'a> {
 const _: () = assert!(size_of::<Unit<'static>>() <= 72);
 
 /// The functions `__wasm_call_ctors` calls, in order: the slots in the init array, each a
-/// function's index + 1.
-pub(super) fn init_functions(placed: &Placed<'_>) -> Result<Vec<u32>, String> {
+/// function's index + 1, four bytes (a memory64 module's function pointers: eight).
+pub(super) fn init_functions(placed: &Placed<'_>, memory64: bool) -> Result<Vec<u32>, String> {
     let arrays = || {
         let regions = placed.regions.iter().enumerate();
         regions.filter(|(_, it)| it.class == Class::InitArray).map(|(index, _)| placed.view(index))
     };
-    let mut functions = Vec::with_capacity(arrays().map(|it| it.len() / 4).sum());
+    let width = if memory64 { 8 } else { 4 };
+    let mut functions = Vec::with_capacity(arrays().map(|it| it.len() / width).sum());
     for bytes in arrays() {
-        if bytes.len() % 4 != 0 {
+        if bytes.len() % width != 0 {
             // alloc: error path
-            return Err(format!("an init array of {} bytes, not of 4-byte slots", bytes.len()));
+            return Err(format!("an init array of {} bytes, not of {width}-byte slots", bytes.len()));
         }
-        for slot in bytes.arrays::<4>(0, bytes.len()) {
-            let slot = u32::from_le_bytes(slot);
+        let mut push = |slot: u64| -> Result<(), String> {
             let function = slot
                 .checked_sub(1)
                 .ok_or("an init function that is an undefined weak function")?;
+            // alloc: error path
+            let function = u32::try_from(function).map_err(|_| format!("the init array's slot {slot}, past the table"))?;
             functions.push(function);
+            Ok(())
+        };
+        if memory64 {
+            for slot in bytes.arrays::<8>(0, bytes.len()) {
+                push(u64::from_le_bytes(slot))?;
+            }
+        } else {
+            for slot in bytes.arrays::<4>(0, bytes.len()) {
+                push(u32::from_le_bytes(slot).into())?;
+            }
         }
     }
     Ok(functions)
@@ -760,11 +776,11 @@ fn ulebs_into(place: &mut [u8], values: impl Iterator<Item = u64>) {
 
 /// `__wasm_call_ctors`' body, when the image has one: a call of each init function, each of
 /// which must be `fn()`.
-fn ctors(placed: &Placed<'_>, units: &[Unit<'_>], imports: &[Imported<'_>]) -> Result<Vec<u8>, String> {
+fn ctors(placed: &Placed<'_>, memory64: bool, units: &[Unit<'_>], imports: &[Imported<'_>]) -> Result<Vec<u8>, String> {
     if !placed.regions.iter().any(|it| it.class == Class::Synthetic(FUNCTIONS)) {
         return Ok(ctors_body(&[]));
     }
-    let ctors = init_functions(placed)?;
+    let ctors = init_functions(placed, memory64)?;
     for &function in &ctors {
         let ty = match (function as usize).checked_sub(imports.len()) {
             None => imports.get(function as usize).map(|it| it.ty),
@@ -855,7 +871,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     }
 
     // `__wasm_call_ctors`: what it calls must be `fn()`. Its error is the bodies' after.
-    let ctors = ctors(placed, &units, &imports);
+    let ctors = ctors(placed, wasm.memory64, &units, &imports);
 
     // Types and the columns of the function bodies: each piece's on its own thread, then the
     // pieces' types interned in order after the imports', so each type's index is where one
@@ -888,13 +904,13 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         return Err("no heap region: the writer's synthetic regions were not placed".to_owned());
     }
     let heap = heap_base(placed.regions);
-    if heap > 1 << 32 {
+    if !wasm.memory64 && heap > 1 << 32 {
         // alloc: error path
         return Err(format!("data up to {heap:#x}, past 32-bit memory"));
     }
     // As many as `__heap_end` says.
     let pages = initial_pages(placed.regions);
-    let mut segments: Vec<(&str, u32, View<'_>)> = Vec::with_capacity(placed.regions.len());
+    let mut segments: Vec<(&str, u64, View<'_>)> = Vec::with_capacity(placed.regions.len());
     for (index, region) in placed.regions.iter().enumerate() {
         if !in_memory(&region.class) {
             continue;
@@ -919,18 +935,25 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
             return Err(format!("the {:?} region has more bytes than its size", region.class));
         }
         if !bytes.is_empty() {
-            segments.push((segment_name(&region.class), region.addr as u32, bytes));
+            segments.push((segment_name(&region.class), region.addr, bytes));
         }
     }
 
-    // Globals and exports.
-    let mut globals: Vec<(&str, bool, u32)> = Vec::with_capacity(2 + placed.exports.len());
-    globals.push(("__stack_pointer", true, wasm.stack as u32));
+    // Globals and exports: each an address, an `i64` in a memory64 module.
+    let mut globals: Vec<(&str, bool, u64)> = Vec::with_capacity(2 + placed.exports.len());
+    globals.push(("__stack_pointer", true, wasm.stack));
     globals.push(("__memory_base", false, 0));
     debug_assert_eq!((globals[STACK_POINTER as usize].0, globals[MEMORY_BASE as usize].0), ("__stack_pointer", "__memory_base"));
     let mut exports: Vec<(&str, u8, u32)> = Vec::with_capacity(2 + placed.exports.len());
     let mut named = HashMap::with_capacity_in(2 + placed.exports.len(), Global);
     export(&mut named, &mut exports, "memory", EXPORT_MEMORY, 0, false)?;
+    if wasm.memory64 {
+        // The seed's runner switches `__stack_pointer` with each fiber and finds a fiber's
+        // entry by its slot in the table (blaze-wasi's `seed`, `blaze_seed.fiber_*`), as
+        // wasm-ld's `--export=__stack_pointer --export-table` would give them.
+        export(&mut named, &mut exports, "__stack_pointer", EXPORT_GLOBAL, STACK_POINTER, false)?;
+        export(&mut named, &mut exports, "__indirect_function_table", EXPORT_TABLE, TABLE, false)?;
+    }
     if let OutputKind::Executable { entry } = &wasm.kind {
         // alloc: error path
         let addr = placed.entry.ok_or_else(|| format!("the entry `{entry}` is not defined"))?;
@@ -946,12 +969,13 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
                 export(&mut named, &mut exports, &it.name, EXPORT_FUNCTION, function, true)?;
             }
             SymbolKind::Data | SymbolKind::Other => {
-                let value = u32::try_from(it.addr)
+                if !wasm.memory64 && it.addr > u64::from(u32::MAX) {
                     // alloc: error path
-                    .map_err(|_| format!("`{}` at {:#x}, past 32-bit memory", it.name, it.addr))?;
+                    return Err(format!("`{}` at {:#x}, past 32-bit memory", it.name, it.addr));
+                }
                 let global = globals.len() as u32;
                 export(&mut named, &mut exports, &it.name, EXPORT_GLOBAL, global, false)?;
-                globals.push((it.name.as_str(), false, value));
+                globals.push((it.name.as_str(), false, it.addr));
             }
             SymbolKind::Tls | SymbolKind::Section => {
                 // alloc: error path
@@ -994,12 +1018,13 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     // The sizes of the big sections, known before anything is written.
     let code_bytes: usize = pieces.iter().map(|it| it.code_bytes).sum();
     let function_bytes: usize = pieces.iter().map(|it| it.function_bytes).sum();
-    // Each segment's header: flags 0, `i32.const addr; end`, the size.
-    let mut segment_headers: Vec<([u8; 16], usize)> = Vec::with_capacity(segments.len());
+    // Each segment's header: flags 0, `i32.const addr; end` (memory64: `i64.const`), the size.
+    let mut segment_headers: Vec<([u8; 24], usize)> = Vec::with_capacity(segments.len());
     segment_headers.extend(segments.iter().map(|&(_, addr, bytes)| {
-        let mut header = [0; 16];
-        header[1] = 0x41;
-        let mut len = 2 + leb::sleb_into(&mut header[2..], (addr as i32).into());
+        let mut header = [0; 24];
+        let (opcode, offset) = if wasm.memory64 { (0x42, addr as i64) } else { (0x41, (addr as u32 as i32).into()) };
+        header[1] = opcode;
+        let mut len = 2 + leb::sleb_into(&mut header[2..], offset);
         header[len] = 0x0b;
         len += 1 + leb::uleb_into(&mut header[len + 1..], bytes.len() as u64);
         (header, len)
@@ -1042,7 +1067,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
                 + arena.len()
                 + 64 * imports.len()
                 + 64 * exports.len()
-                + 16 * (globals.len() + segments.len() + groups.len())
+                + 16 * (globals.len() + groups.len())
+                + 24 * segments.len()
                 + 32 * pieces.len()
                 + 64 * placed.imports.len()
                 + merged_sections.iter().map(|it| 32 + it.1.len()).sum::<usize>(),
@@ -1085,19 +1111,25 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     }
     let out = &mut layout.head;
 
-    // One table of funcrefs, its minimum and maximum the slots; one memory of `pages`.
+    // One table of funcrefs, its minimum and maximum the slots (a 32-bit table in a memory64
+    // module too); one memory of `pages`, with 64-bit limits in a memory64 module.
     section(out, id::TABLE, 3 + 2 * leb::uleb_len(count + 1));
     out.extend([1, FUNCREF, 1]);
     leb::uleb(out, count + 1);
     leb::uleb(out, count + 1);
     section(out, id::MEMORY, 2 + leb::uleb_len(pages));
-    out.extend([1, 0]);
+    out.extend([1, if wasm.memory64 { MEMORY64 } else { 0 }]);
     leb::uleb(out, pages);
     contents.clear();
     leb::uleb(&mut contents, globals.len() as u64);
     for &(_, mutable, value) in &globals {
-        contents.extend([I32, u8::from(mutable)]);
-        leb::i32_const(&mut contents, value as i32);
+        if wasm.memory64 {
+            contents.extend([I64, u8::from(mutable)]);
+            leb::i64_const(&mut contents, value as i64);
+        } else {
+            contents.extend([I32, u8::from(mutable)]);
+            leb::i32_const(&mut contents, value as u32 as i32);
+        }
     }
     leb::section(out, id::GLOBAL, &contents);
     contents.clear();
@@ -1575,6 +1607,58 @@ mod tests {
         assert_eq!(r.name().unwrap(), "processed-by");
         assert_eq!(r.count().unwrap(), 1);
         assert_eq!((r.name().unwrap(), r.name().unwrap()), ("clang", "19"));
+        assert!(r.is_done());
+    }
+
+    #[test]
+    fn a_memory64_command() {
+        let mut image = command();
+        image.output.arch = blaze_codegen::Arch::Wasm64;
+        image.output.triple = "wasm64-blaze-wasip1".into();
+        // The init array's slot is eight bytes (a memory64 function pointer); what follows it moves up.
+        let at = image.regions.iter().position(|it| it.class == Class::InitArray).unwrap();
+        (image.regions[at].size, image.regions[at].capacity) = (8, 8);
+        image.contents[at] = vec![3, 0, 0, 0, 0, 0, 0, 0];
+        for region in &mut image.regions[at + 1..] {
+            region.addr += 4;
+        }
+        let module = image.module().unwrap();
+        let sections = sections(&module);
+        // 64-bit limits, the same 17 pages; the table stays a 32-bit table of funcrefs.
+        assert_eq!(find(&sections, 5, ""), [1, MEMORY64, 17]);
+        assert_eq!(find(&sections, 4, ""), [1, FUNCREF, 1, 5, 5]);
+        // `__stack_pointer` and `__memory_base` are `i64`s.
+        let mut global = vec![2, I64, 1];
+        leb::i64_const(&mut global, STACK as i64);
+        global.extend([I64, 0]);
+        leb::i64_const(&mut global, 0);
+        assert_eq!(find(&sections, 6, ""), global);
+        // The seed's runner's exports: `__stack_pointer` and the table, after the memory.
+        let mut r = Reader::new(find(&sections, 7, ""));
+        assert_eq!(r.count().unwrap(), 4);
+        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()), ("memory", EXPORT_MEMORY, 0));
+        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()), ("__stack_pointer", EXPORT_GLOBAL, STACK_POINTER));
+        assert_eq!(
+            (r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()),
+            ("__indirect_function_table", EXPORT_TABLE, TABLE)
+        );
+        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.uleb32().unwrap()), ("_start", EXPORT_FUNCTION, 3));
+        assert!(r.is_done());
+        // The element segment's offset is the 32-bit table's: `i32.const 1`.
+        let mut element = vec![1, 0];
+        leb::i32_const(&mut element, 1);
+        element.extend([4, 0, 1, 2, 3]);
+        assert_eq!(find(&sections, 9, ""), element);
+        // Each data segment at an `i64.const`.
+        let mut r = Reader::new(find(&sections, 11, ""));
+        assert_eq!(r.count().unwrap(), 2);
+        for (addr, bytes) in [(DATA, &b"hello"[..]), (DATA + 8, &[3, 0, 0, 0][..])] {
+            assert_eq!((r.uleb32().unwrap(), r.u8().unwrap()), (0, 0x42));
+            assert_eq!(r.sleb().unwrap(), addr as i64);
+            assert_eq!(r.u8().unwrap(), 0x0b);
+            let len = r.uleb32().unwrap() as usize;
+            assert_eq!(r.take(len).unwrap(), bytes);
+        }
         assert!(r.is_done());
     }
 

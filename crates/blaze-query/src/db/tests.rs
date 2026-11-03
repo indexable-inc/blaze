@@ -15,6 +15,7 @@ use std::{
     },
 };
 
+use blaze_format::FormatError;
 use hegel::{TestCase, generators as gs};
 use parking_lot::Mutex;
 
@@ -469,6 +470,61 @@ fn a_walk_refreshes_the_summary_with_a_dependencys_new_reads() {
     assert_eq!((db.runs("Grows"), db.runs("GrowsReader")), (3, 2));
 }
 
+query!(Link, u64, |db, key| {
+    let at = db.cells.lock().iter().position(|it| *it == key.0).expect("a cell of the chain");
+    let below = (at > 0).then(|| db.cells.lock()[at - 1]);
+    below.map_or(0, |it| *get::<Link>(db, Cell(it))) + key.a(db)
+});
+
+/// A walk is bounded (rule 15): past its fuel it unwinds with [`super::OutOfFuel`] naming the
+/// query, how far it got and how deep, the rows it left are run again by a later call, and no
+/// bound outlives the call.
+#[test]
+fn a_walk_past_its_fuel_stops_naming_where_and_a_later_call_with_enough_ends() {
+    let mut db = TestDb::new();
+    let chain: Vec<Cell> = (0..64).map(|at| Cell::new(&db, at, 0)).collect();
+    db.cells.lock().extend(chain.iter().map(|it| it.0));
+    let top = chain[63];
+    assert_eq!(super::with_fuel(1 << 10, || *get::<Link>(&db, top)).map(|it| it.0), Ok((0..64).sum()));
+    chain[0].set_a(&mut db, 100);
+    let out = super::with_fuel(10, || *get::<Link>(&db, top)).expect_err("64 rows to run again on 10 steps");
+    assert_eq!((out.steps, out.query), (10, "Link"), "{out}");
+    assert!((1..=64).contains(&out.depth), "{out}");
+    assert!(out.to_string().contains("`Link`"), "{out}");
+    let (value, spent) = super::with_fuel(1 << 10, || *get::<Link>(&db, top)).expect("enough fuel");
+    assert_eq!(value, 100 + (1..64).sum::<u64>());
+    assert!((1..=1 << 10).contains(&spent), "it says what it spent: {spent}");
+    assert!(super::local::with(|local| local.fuel.is_none()), "the bound ended with its call");
+    chain[1].set_a(&mut db, 0);
+    assert_eq!(*get::<Link>(&db, top), 100 + (2..64).sum::<u64>(), "unbounded outside `with_fuel`");
+}
+
+/// A job pumped onto a fueled task's thread while it waits (above an unlifted barrier) is
+/// another task: a bound it sets is its own, not what the waiting task has left, and what it
+/// spends is not charged to the waiting task. Without that, the pumped job's bound would be the
+/// waiter's 5 steps, it would run out on a 64-row walk, and the waiter's fuel would shrink by
+/// work that is not its own, each as thread timing has it.
+#[test]
+fn a_bound_set_by_a_job_pumped_under_a_fueled_wait_is_its_own_and_charges_the_waiter_nothing() {
+    let mut db = TestDb::new();
+    let chain: Vec<Cell> = (0..64).map(|at| Cell::new(&db, at, 0)).collect();
+    db.cells.lock().extend(chain.iter().map(|it| it.0));
+    let top = chain[63];
+    assert_eq!(*get::<Link>(&db, top), (0..64).sum::<u64>());
+    chain[0].set_a(&mut db, 100);
+    let left = || super::local::with(|local| local.fuel.map(|it| it.left));
+    let ((pumped, waiter_left), waiter_spent) = super::with_fuel(5, || {
+        let pumped = super::pump_barrier(|| super::with_fuel(1 << 10, || *get::<Link>(&db, top)));
+        (pumped, left())
+    })
+    .expect("the waiter spent nothing of its own");
+    let (value, spent) = pumped.expect("the pumped job's own bound, not the waiter's 5 steps");
+    assert_eq!(value, 100 + (1..64).sum::<u64>());
+    assert!(spent > 5, "the pumped job spent past what the waiter had: {spent}");
+    assert_eq!(waiter_left, Some(5), "nothing the pumped job spent was charged to the waiter");
+    assert_eq!(waiter_spent, 0);
+}
+
 #[test]
 fn an_untracked_read_reruns_in_every_view() {
     let mut db = TestDb::new();
@@ -643,7 +699,7 @@ fn a_key_the_database_never_gave_is_refused_naming_the_query_and_the_database_st
     let db = TestDb::new();
     let cell = Cell::new(&db, 3, 0);
     assert_eq!(*get::<Double>(&db, cell), 6);
-    for forged in [Id::from_u32(5), Id::from_u32(Id::MAX_U32), Id::from_u32(u32::MAX)] {
+    for forged in [Id::from_u32(5), Id::from_u32(Id::MAX_U32)] {
         let payload = catch_unwind(AssertUnwindSafe(|| *get::<Double>(&db, Cell(forged))))
             .expect_err("a key of no owned page");
         let message = message(&*payload);
@@ -651,6 +707,43 @@ fn a_key_the_database_never_gave_is_refused_naming_the_query_and_the_database_st
     }
     assert_eq!(*get::<Double>(&db, cell), 6);
     drop(db);
+}
+
+/// No `Id` lies past the last ID page: `fetch`'s hit path indexes the page directory by an
+/// ID's page with no bounds load, so a key above [`Id::MAX_U32`] (here `u32::MAX`, page
+/// 2^22 - 1 of a directory of 2^20) read past it and crashed (SIGSEGV, or a misaligned
+/// pointer abort) instead of being refused. It is refused where it is made.
+#[test]
+fn an_id_past_the_last_page_is_refused_where_it_is_made_naming_its_bits() {
+    for bits in [Id::MAX_U32 + 1, u32::MAX] {
+        let payload = catch_unwind(|| Id::from_u32(bits)).expect_err("an `Id` past every page");
+        let message = message(&*payload);
+        assert!(message.contains(&bits.to_string()) && message.contains("MAX_U32"), "{message}");
+    }
+    let payload = catch_unwind(|| Id::from_u32(0)).expect_err("an `Id` of 0");
+    assert!(message(&*payload).contains("of 0"), "{}", message(&*payload));
+    assert_eq!(Id::from_u32(Id::MAX_U32).as_u32(), Id::MAX_U32, "the last ID of the last page");
+}
+
+/// What a reader of persisted or foreign bits goes through: `Id::new` refuses what
+/// `Id::from_u32` panics on, and `Id::decode` makes it the record's typed error naming the word.
+#[test]
+fn a_word_that_is_no_id_is_refused_by_the_checked_constructors_naming_it() {
+    for bits in [0, Id::MAX_U32 + 1, u32::MAX] {
+        assert_eq!(Id::new(bits), None, "{bits}");
+    }
+    assert_eq!(Id::new(Id::MAX_U32).map(Id::as_u32), Some(Id::MAX_U32));
+    let max = u64::from(Id::MAX_U32);
+    for word in [max + 1, u64::from(u32::MAX), 1 << 32, u64::MAX] {
+        assert_eq!(
+            Id::decode(word, 40, "a test's id"),
+            Err(FormatError::Bound { at: 40, what: "a test's id", found: word, bound: max }),
+        );
+    }
+    let zero = Id::decode(0, 40, "a test's id");
+    assert_eq!(zero, Err(FormatError::Zero { at: 40, what: "a test's id" }));
+    assert!(zero.unwrap_err().to_string().contains("a test's id"), "names the field");
+    assert_eq!(Id::decode(7, 40, "a test's id").map(Id::as_u32), Ok(7));
 }
 
 #[test]

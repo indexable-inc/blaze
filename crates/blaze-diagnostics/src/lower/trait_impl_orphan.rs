@@ -21,7 +21,7 @@ use syntax::view::{self as ast, AstNode as _, HasName as _};
 
 use crate::{
     cx::Cx,
-    lower::{Found, Phase, incoherent_impl::{ImplAt, unresolved}, type_must_be_known::crate_name},
+    lower::{Found, Phase, incoherent_impl::{ImplAt, unresolved}},
     model::{Applicability, Diag, Span},
     print,
 };
@@ -239,7 +239,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplOrphan) -> Vec<Found> {
 
 /// blaze: rustc's orphan check of an impl of another crate's trait in a crate whose graph has a
 /// `#[blaze::sealed]` trait and of which nothing else is checked (only what the build's programs
-/// reach of it, [`crate::check_sealed`]). The knowability rule and the expansion argument of
+/// reach of it, [`crate::check_reached_only`]). The knowability rule and the expansion argument of
 /// sealing assume every crate that can name a sealed trait obeys rustc's orphan rule, and a
 /// registry crate that depends on a blaze-only one was never checked by rustc
 /// (docs/v2/plan/lanes/frontend/sealed-orphan.md, "Where the checks run"). Only what rustc
@@ -272,14 +272,14 @@ pub(crate) fn in_sealed_graph(cx: &Cx<'_, '_>, d: &hir::diagnostics::ForeignTrai
         Some(trait_) => format!(
             "`{}` of crate `{}`",
             cx.def_path(hir::ModuleDef::Trait(trait_)),
-            crate_name(cx, trait_.module(db).krate(db)),
+            cx.crate_name(trait_.module(db).krate(db)),
         ),
         // alloc: the error's text, as above
         None => "its trait".to_owned(),
     };
     let sealing = match sealing_crate(cx) {
         // alloc: the error's text, as above
-        Some(krate) => format!("crate `{}` seals a trait", crate_name(cx, krate)),
+        Some(krate) => format!("crate `{}` seals a trait", cx.crate_name(krate)),
         // alloc: the error's text, as above
         None => "a crate of its graph seals a trait".to_owned(),
     };

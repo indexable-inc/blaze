@@ -20,6 +20,17 @@
 //! | the target's data layout | `Target(crate)` |
 //! | a dependency's batches, whether one impl specializes another | `Crate(crate)` |
 //!
+//! A value is asked by a crate, `seen_by`: the crate of the goal or body that read the fact.
+//! The facts about which impls and traits exist (`Implements`, `Method`, `Vtable`) cover the
+//! crates it sees (`hir_ty::method_resolution::loaded_crates`: itself and those rustc loads to
+//! compile it), the only ones its goals search and the only ones a build has finished, proc
+//! macros included, when a job of it runs; they are its own ([`asker`]), and refuse while a
+//! proc macro any of those crates can expand is not built (`Missed::MacroPending`), as an impl
+//! a derive writes would be missing. Every other fact is the same whoever asks: `Coherence` and
+//! `Specializes` are the impl's own crate's view, where rustc checks them. No value reads a
+//! crate outside that, so none depends on which other units a build has reached: a sibling's
+//! unbuilt proc macro can't leave an error type or a missing impl in it.
+//!
 //! A value names an item by its signature hash, never its interface hash: values are computed
 //! inside a body's inference (the goal store asks them there), and an interface hash holds what
 //! bodies leak, so it would infer bodies, that one among them. What a body leaks is a fact of
@@ -27,7 +38,7 @@
 
 use std::{alloc::Allocator, fmt::Write as _};
 
-use base_db::{Db, ProcessEnv};
+use base_db::{Crate, Db, ProcessEnv};
 use blaze_ids::{ContentId, Fingerprint, Hasher, radix};
 use blaze_mem::{Frame, Tag, frame, scratch};
 use either::Either;
@@ -62,8 +73,8 @@ use crate::{
     Fact, ItemId, ItemKey, NameHash, ScopeIndexKey, SignatureHash, SimplifiedType,
     hash::{self, Unhashable},
     index::{
-        AnyImpl, ScopeEntry, all_impls_value, entry, impl_self_ty, impl_signature,
-        implements_value, inherent_impls_of, name_hashes, resolve_trait, scope, traits_with,
+        AnyImpl, ScopeEntry, entry, impl_self_ty, impl_signature, implements_value,
+        inherent_impls_of, name_hashes, resolve_trait, scope, seen_impls_value, traits_with,
     },
     key::{self, Resolved},
 };
@@ -71,18 +82,18 @@ use crate::{
 const SIGNATURE: &str = "blaze v2 fact signature 2";
 const LAYOUT: &str = "blaze v2 fact layout 1";
 const FIELD: &str = "blaze v2 fact field 1";
-const METHOD: &str = "blaze v2 fact method 2";
-const IMPLEMENTS: &str = "blaze v2 fact implements 2";
+const METHOD: &str = "blaze v2 fact method 3";
+const IMPLEMENTS: &str = "blaze v2 fact implements 3";
 const RESOLVES: &str = "blaze v2 fact resolves 1";
 const CODE: &str = "blaze v2 fact code 1";
 const CONST_VALUE: &str = "blaze v2 fact const value 2";
 const NAME: &str = "blaze v2 fact name 1";
 const CAPTURES: &str = "blaze v2 fact captures 1";
 const AUTO_TRAITS: &str = "blaze v2 fact auto traits 2";
-const COHERENCE: &str = "blaze v2 fact coherence 2";
-const SPECIALIZES: &str = "blaze v2 fact specializes 3";
+const COHERENCE: &str = "blaze v2 fact coherence 3";
+const SPECIALIZES: &str = "blaze v2 fact specializes 4";
 const DROP_CHECK: &str = "blaze v2 fact drop check 2";
-const VTABLE: &str = "blaze v2 fact vtable 2";
+const VTABLE: &str = "blaze v2 fact vtable 3";
 const DERIVE: &str = "blaze v2 fact derive 2";
 const TARGET: &str = "blaze v2 fact target 1";
 const CRATE: &str = "blaze v2 fact crate 1";
@@ -113,12 +124,44 @@ fn domain(fact: &Fact) -> &'static str {
     }
 }
 
-/// What `fact` stands for in the current database (see the module doc).
-pub fn value(db: &Db, fact: &Fact) -> Result<ContentId, Unhashable> {
-    hir_ty::attach_db(db, || value_in(db, fact))
+/// What `fact` stands for in the current database, as `seen_by` sees it (see the module doc).
+pub fn value(db: &Db, seen_by: Crate, fact: &Fact) -> Result<ContentId, Unhashable> {
+    value_as(db, asker(seen_by, fact.kind()), fact)
 }
 
-fn value_in(db: &Db, fact: &Fact) -> Result<ContentId, Unhashable> {
+/// Whether a value of a fact of `kind` depends on the crate that asks it: the facts of which
+/// impls and traits exist (`Implements`, `Method`, `Vtable`) cover the crates it sees. Every
+/// other fact's value is the same whoever asks.
+pub fn asked_by_crate(kind: blaze_query::QueryKind) -> bool {
+    kind == crate::kinds::IMPLEMENTS || kind == crate::kinds::METHOD || kind == crate::kinds::VTABLE
+}
+
+/// `seen_by` where a fact of `kind` depends on its asker ([`asked_by_crate`]), else `None`: what
+/// a value is keyed by, so a fact no asker changes has one value for every crate that asks it.
+pub fn asker(seen_by: Crate, kind: blaze_query::QueryKind) -> Option<Crate> {
+    asked_by_crate(kind).then_some(seen_by)
+}
+
+/// [`value`] with its asker as [`asker`] keeps it: `Some` exactly for a fact asked by a crate.
+pub(crate) fn value_as(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, Unhashable> {
+    hir_ty::attach_db(db, || value_in(db, seen_by, fact))
+}
+
+fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, Unhashable> {
+    // Which impls and traits a crate sees holds what any crate it loads expands: none of it is
+    // read while one of their proc macros is pending, as an impl a derive writes would be
+    // missing from it.
+    let seen_by = match (seen_by, asked_by_crate(fact.kind())) {
+        (Some(krate), true) => {
+            hash::macros_built_for(db, krate, hash::Unhashed::Crate(krate))?;
+            Some(krate)
+        }
+        (None, true) => unreachable!(
+            "blaze-items: {fact:?} is asked by a crate, and `facts::asker` keeps the asker of every such fact"
+        ),
+        (_, false) => None,
+    };
+    let seen = || seen_by.unwrap_or_else(|| unreachable!("checked above: {fact:?} is asked by a crate"));
     let domain = domain(fact);
     let absent = || Ok(Hasher::new(domain).part(b"absent").finish());
     let mut h = Hasher::new(domain);
@@ -150,10 +193,10 @@ fn value_in(db: &Db, fact: &Fact) -> Result<ContentId, Unhashable> {
             h.id(&hash::filled(db, domain, &sub, ItemId::Adt(adt))?);
             field_offset(db, &mut h, adt, variant, local)?;
         }
-        Fact::Method { self_ty, name } => write_method(db, &mut h, self_ty, name)?,
+        Fact::Method { self_ty, name } => write_method(db, &mut h, seen(), self_ty, name)?,
         Fact::Implements { trait_, self_ty } => {
             let Some(trait_) = resolve_trait(db, trait_) else { return absent() };
-            h.id(&implements_value(db, IMPLEMENTS, trait_, self_ty)?);
+            h.id(&implements_value(db, IMPLEMENTS, seen(), trait_, self_ty)?);
         }
         Fact::Resolves { scope: at, name } => match scope(db, ScopeIndexKey { scope: at, name })? {
             ScopeEntry::ScopeAbsent => return absent(),
@@ -250,7 +293,7 @@ fn value_in(db: &Db, fact: &Fact) -> Result<ContentId, Unhashable> {
             h.update(&(supers.len() as u64).to_le_bytes());
             for &it in supers {
                 h.id(&hash::signature_hash(db, ItemId::Trait(it))?.0)
-                    .id(&implements_value(db, IMPLEMENTS, it, self_ty)?);
+                    .id(&implements_value(db, IMPLEMENTS, seen(), it, self_ty)?);
                 // A vtable's slots are its methods in declaration order, which the trait's
                 // signature hash leaves out.
                 let items = &it.trait_items(db).items;
@@ -379,8 +422,8 @@ fn write_noted_reads(db: &Db, h: &mut Hasher, krate: base_db::Crate) {
 }
 
 /// The first 128 bits of [`value`]: what a dependency edge records.
-pub fn fingerprint(db: &Db, fact: &Fact) -> Result<Fingerprint, Unhashable> {
-    Ok(value(db, fact)?.fingerprint())
+pub fn fingerprint(db: &Db, seen_by: Crate, fact: &Fact) -> Result<Fingerprint, Unhashable> {
+    Ok(value(db, seen_by, fact)?.fingerprint())
 }
 
 pub fn signature(db: &Db, f: FunctionId) -> Fact {
@@ -580,16 +623,18 @@ fn named<'f>(
 }
 
 /// The inherent impls for the type with an item of the name, and the traits with an item of
-/// the name with whether the type implements them: every candidate method probing may find.
+/// the name with whether the type implements them, in the crates `seen_by` sees: every
+/// candidate method probing in it may find.
 fn write_method(
     db: &Db,
     h: &mut Hasher,
+    seen_by: Crate,
     self_ty: SimplifiedType,
     name: NameHash,
 ) -> Result<(), Unhashable> {
     frame::task(Tag::Other, |frame| -> Result<(), Unhashable> {
         let mut inherent: Vec<_, &Frame> = Vec::new_in(frame);
-        for (_, imp) in inherent_impls_of(db, self_ty, ()).iter() {
+        for (_, imp) in inherent_impls_of(db, seen_by, self_ty).iter() {
             let items = named(db, &imp.impl_items(db).items, name, frame)?;
             if !items.is_empty() {
                 inherent.push((hash::signature_hash(db, ItemId::Impl(imp))?.0, items));
@@ -597,9 +642,9 @@ fn write_method(
         }
         inherent.sort_unstable();
         let mut traits: Vec<_, &Frame> = Vec::new_in(frame);
-        for (_, trait_) in traits_with(db, name, ()).iter() {
+        for (_, trait_) in traits_with(db, seen_by, name).iter() {
             let items = named(db, &trait_.trait_items(db).items, name, frame)?;
-            traits.push((items, implements_value(db, IMPLEMENTS, trait_, self_ty)?));
+            traits.push((items, implements_value(db, IMPLEMENTS, seen_by, trait_, self_ty)?));
         }
         traits.sort_unstable();
         h.part(b"inherent").update(&(inherent.len() as u64).to_le_bytes());
@@ -827,8 +872,11 @@ fn infer_owner_item(db: &Db, owner: InferBodyId<'_>) -> ItemId {
 
 /// The orphan and coherence checks' results for `imp`, and every impl it could overlap: those
 /// of its trait for its simplified self type and the blanket ones, all of the trait's for a
-/// blanket impl, or the inherent impls for its self type.
+/// blanket impl, or the inherent impls for its self type. All as `imp`'s crate sees them, where
+/// rustc checks it: an impl of a crate downstream of it, or of a sibling, is checked against
+/// `imp` in that crate, by that impl's own fact.
 fn write_coherence(db: &Db, h: &mut Hasher, imp: ImplId) -> Result<(), Unhashable> {
+    let krate = imp.krate(db);
     let self_ty = impl_self_ty(db, imp);
     match db.impl_trait(imp) {
         Some(trait_ref) => {
@@ -836,8 +884,8 @@ fn write_coherence(db: &Db, h: &mut Hasher, imp: ImplId) -> Result<(), Unhashabl
             h.part(b"trait").update(&[check_orphan_rules(db, imp) as u8]);
             let has_self_ty = self_ty.is_some();
             match self_ty {
-                Some(self_ty) => h.id(&implements_value(db, IMPLEMENTS, trait_, self_ty)?),
-                None => h.part(b"blanket").id(&all_impls_value(db, trait_)?),
+                Some(self_ty) => h.id(&implements_value(db, IMPLEMENTS, krate, trait_, self_ty)?),
+                None => h.part(b"blanket").id(&seen_impls_value(db, krate, trait_)?),
             };
             // blaze's `#[blaze::sealed]` (hir-ty-coherence): whether the trait is sealed, and
             // for an impl over a sealed bound, every impl of the bound's trait (its closure,
@@ -852,11 +900,11 @@ fn write_coherence(db: &Db, h: &mut Hasher, imp: ImplId) -> Result<(), Unhashabl
             }
             let mut relaxed = false;
             for (_, sealed) in sealed_bounds(db, imp) {
-                h.part(b"sealed bound").id(&all_impls_value(db, sealed)?);
+                h.part(b"sealed bound").id(&seen_impls_value(db, krate, sealed)?);
                 relaxed = true;
             }
             if relaxed && has_self_ty {
-                h.part(b"relaxed").id(&all_impls_value(db, trait_)?);
+                h.part(b"relaxed").id(&seen_impls_value(db, krate, trait_)?);
             }
         }
         None => {
@@ -864,7 +912,7 @@ fn write_coherence(db: &Db, h: &mut Hasher, imp: ImplId) -> Result<(), Unhashabl
             h.part(b"inherent").update(&[is_inherent_impl_coherent(db, def_map, imp) as u8]);
             match self_ty {
                 Some(self_ty) => {
-                    let all = inherent_impls_of(db, self_ty, ())
+                    let all = inherent_impls_of(db, krate, self_ty)
                         .iter()
                         .map(|(key, it)| (key, AnyImpl::Impl(it)));
                     h.update(&[1]).id(&entry(db, all)?.value())

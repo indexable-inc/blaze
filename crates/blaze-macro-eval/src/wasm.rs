@@ -28,6 +28,9 @@ mod glue;
 mod host;
 mod statics;
 mod thread;
+// Wasmtime's embedder-provided TLS, where it uses `sys::custom` (the wasm seed).
+#[cfg(not(any(unix, windows)))]
+mod tls;
 mod wasi;
 
 #[cfg(test)]

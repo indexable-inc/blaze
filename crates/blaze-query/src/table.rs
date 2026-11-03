@@ -79,7 +79,14 @@ impl<T: Default> Default for ShortLock<T> {
 
 /// The address space one [`Rows`] reserves: 2^30 rows of 64 bytes. Reserving takes no
 /// memory; pages are committed as rows are written.
+#[cfg(target_pointer_width = "64")]
 const ROWS_RESERVED: usize = 64 << 30;
+
+/// The same on a 32-bit target (wasm32): 2^20 rows of 64 bytes. There a reservation is memory
+/// taken whole and the whole address space is 4 GB, so this is a budget; a column that
+/// outgrows it stops with the error naming it.
+#[cfg(not(target_pointer_width = "64"))]
+const ROWS_RESERVED: usize = 64 << 20;
 
 /// How many rows a [`Free`] claims at a time: a line of live flags, so writers claiming in
 /// different shards rarely write one line.
@@ -300,9 +307,19 @@ pub(crate) struct Generations {
     words: Region,
 }
 
+/// The rows a [`Generations`] covers: every row a place can name.
+#[cfg(target_pointer_width = "64")]
+const GENERATION_ROWS: usize = ROW_END as usize;
+
+/// On a 32-bit target, where [`ROW_END`] words would be 16 GB: every row of [`ROWS_RESERVED`]
+/// at 32 bytes or more (a value row is 52). A row past it stops [`Generations::bump`] with the
+/// error naming the generations.
+#[cfg(not(target_pointer_width = "64"))]
+const GENERATION_ROWS: usize = ROWS_RESERVED / 32;
+
 impl Generations {
     pub(crate) fn new() -> Generations {
-        Generations { words: reserve(ROW_END as usize * size_of::<PlainWord>(), false, "generations") }
+        Generations { words: reserve(GENERATION_ROWS * size_of::<PlainWord>(), false, "generations") }
     }
 
     /// The row's next generation: called once each time the row is claimed, by its claimer,
@@ -449,24 +466,101 @@ fn tag(key: &QueryKey) -> u32 {
 }
 
 /// A shard's table is its places alone, 8 bytes each, at most half full with live entries and
-/// tombs; the top bits of the pointer published in the shard are log2 of its length, so a find
-/// goes from that one load straight to the place (no header to load first): one acquire load
-/// a place probed (about 1.5 at that load) and one row read on a tag match.
+/// tombs; the word published in the shard ([`Tagged`]) holds its address and log2 of its
+/// length, so a find goes from that one load straight to the place (no header to load first):
+/// one acquire load a place probed (about 1.5 at that load) and one row read on a tag match.
+///
+/// On a 64-bit target the word is the pointer, with the log2 in its top 6 bits (user space
+/// ends below 2^57). On a 32-bit target (wasm32) a pointer has no spare bits, so the word is a
+/// `u64`: the address in its low half, the log2 in its high half.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct Tagged(Word);
+
+#[cfg(target_pointer_width = "64")]
+type Word = *mut AtomicU64;
+#[cfg(target_pointer_width = "64")]
+type AtomicWord = AtomicPtr<AtomicU64>;
+#[cfg(target_pointer_width = "64")]
 const LEN_SHIFT: u32 = usize::BITS - 6;
 
-const _: () = assert!(usize::BITS == 64, "a table's length is kept in its pointer's top bits");
+#[cfg(not(target_pointer_width = "64"))]
+type Word = u64;
+#[cfg(not(target_pointer_width = "64"))]
+type AtomicWord = AtomicU64;
 
-fn new_table(len: usize) -> *mut AtomicU64 {
+impl Tagged {
+    #[cfg(target_pointer_width = "64")]
+    const NULL: Tagged = Tagged(ptr::null_mut());
+    #[cfg(not(target_pointer_width = "64"))]
+    const NULL: Tagged = Tagged(0);
+
+    /// `len` (a power of two) places at `at`.
+    #[cfg(target_pointer_width = "64")]
+    fn new(at: *mut AtomicU64, len: usize) -> Tagged {
+        assert!(at.addr() >> LEN_SHIFT == 0, "a table mapped above 2^58");
+        Tagged(at.map_addr(|addr| addr | (len.trailing_zeros() as usize) << LEN_SHIFT))
+    }
+
+    #[cfg(not(target_pointer_width = "64"))]
+    fn new(at: *mut AtomicU64, len: usize) -> Tagged {
+        Tagged(at.expose_provenance() as u64 | u64::from(len.trailing_zeros()) << 32)
+    }
+
+    fn is_null(self) -> bool {
+        #[cfg(target_pointer_width = "64")]
+        return self.0.is_null();
+        #[cfg(not(target_pointer_width = "64"))]
+        return self.0 == 0;
+    }
+
+    /// The places' address and their count.
+    #[cfg(target_pointer_width = "64")]
+    fn untag(self) -> (*mut AtomicU64, usize) {
+        (self.0.map_addr(|addr| addr & ((1 << LEN_SHIFT) - 1)), 1 << (self.0.addr() >> LEN_SHIFT))
+    }
+
+    #[cfg(not(target_pointer_width = "64"))]
+    fn untag(self) -> (*mut AtomicU64, usize) {
+        // The address was exposed by `Tagged::new` when the table was made.
+        (ptr::with_exposed_provenance_mut(self.0 as u32 as usize), 1 << (self.0 >> 32))
+    }
+}
+
+/// A shard's published [`Tagged`] word.
+#[repr(transparent)]
+struct Published(AtomicWord);
+
+impl Published {
+    fn null() -> Published {
+        Published(AtomicWord::new(Tagged::NULL.0))
+    }
+
+    #[inline(always)]
+    fn load(&self, order: Ordering) -> Tagged {
+        Tagged(self.0.load(order))
+    }
+
+    fn store(&self, table: Tagged, order: Ordering) {
+        self.0.store(table.0, order);
+    }
+
+    /// The current table, by `&mut`.
+    fn get(&mut self) -> Tagged {
+        Tagged(*self.0.get_mut())
+    }
+
+    /// Sets the current table by `&mut`.
+    fn set(&mut self, table: Tagged) {
+        *self.0.get_mut() = table.0;
+    }
+}
+
+fn new_table(len: usize) -> Tagged {
     debug_assert!(len.is_power_of_two());
     // alloc: once a table: on a shard's first insert, and each time it doubles.
     let places: Box<[AtomicU64]> = (0..len).map(|_| AtomicU64::new(EMPTY)).collect();
-    let raw = Box::into_raw(places).cast::<AtomicU64>();
-    assert!(raw.addr() >> LEN_SHIFT == 0, "a table mapped above 2^58");
-    raw.map_addr(|addr| addr | (len.trailing_zeros() as usize) << LEN_SHIFT)
-}
-
-fn untag(table: *mut AtomicU64) -> (*mut AtomicU64, usize) {
-    (table.map_addr(|addr| addr & ((1 << LEN_SHIFT) - 1)), 1 << (table.addr() >> LEN_SHIFT))
+    Tagged::new(Box::into_raw(places).cast::<AtomicU64>(), len)
 }
 
 /// The places of a table [`new_table`] made.
@@ -474,8 +568,8 @@ fn untag(table: *mut AtomicU64) -> (*mut AtomicU64, usize) {
 /// # Safety
 ///
 /// `table` is not freed while `'a` lives.
-unsafe fn places<'a>(table: *mut AtomicU64) -> &'a [AtomicU64] {
-    let (at, len) = untag(table);
+unsafe fn places<'a>(table: Tagged) -> &'a [AtomicU64] {
+    let (at, len) = table.untag();
     // SAFETY: `new_table` allocated `len` places at `at`; alive by the caller's contract.
     unsafe { std::slice::from_raw_parts(at, len) }
 }
@@ -485,14 +579,14 @@ unsafe fn places<'a>(table: *mut AtomicU64) -> &'a [AtomicU64] {
 /// # Safety
 ///
 /// `table` came from [`new_table`], is unlinked, and is taken back once.
-unsafe fn table_box(table: *mut AtomicU64) -> Box<[AtomicU64]> {
-    let (at, len) = untag(table);
+unsafe fn table_box(table: Tagged) -> Box<[AtomicU64]> {
+    let (at, len) = table.untag();
     // SAFETY: the box `new_table` leaked, of `len` places at `at`.
     unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(at, len)) }
 }
 
 /// A table [`new_table`] made, owned: freed when dropped.
-struct Table(*mut AtomicU64);
+struct Table(Tagged);
 
 // SAFETY: a table is its places alone, atomics any thread may touch; the owner frees it once.
 unsafe impl Send for Table {}
@@ -531,7 +625,7 @@ impl Outgrown {
     fn sweep(&mut self) {
         while self.held.front().is_some_and(|(grace, _)| grace.passed()) {
             let Some((_, table)) = self.held.pop_front() else { break };
-            let (_, len) = untag(table.0);
+            let (_, len) = table.0.untag();
             self.ready[len.trailing_zeros() as usize] = Some(table);
         }
     }
@@ -540,13 +634,13 @@ impl Outgrown {
     /// `&mut`, which no reader can be in.
     fn settle(&mut self) {
         while let Some((_, table)) = self.held.pop_front() {
-            let (_, len) = untag(table.0);
+            let (_, len) = table.0.untag();
             self.ready[len.trailing_zeros() as usize] = Some(table);
         }
     }
 
     /// An empty table of `len` places, if one is kept.
-    fn take(&mut self, len: usize) -> Option<*mut AtomicU64> {
+    fn take(&mut self, len: usize) -> Option<Tagged> {
         self.sweep();
         let table = self.ready[len.trailing_zeros() as usize].take()?;
         let raw = std::mem::ManuallyDrop::new(table).0;
@@ -579,7 +673,7 @@ struct Writer {
 struct Shard {
     writer: ShortLock<Writer>,
     /// Null until the first insert; see [`new_table`].
-    table: AtomicPtr<AtomicU64>,
+    table: Published,
 }
 
 /// What [`Map::edit_all`] does to one entry.
@@ -616,7 +710,7 @@ impl<V: Send + Sync + 'static> Map<V> {
         let count = blaze_ids::shard_count();
         Map {
             shards: (0..count)
-                .map(|_| Shard { writer: ShortLock::default(), table: AtomicPtr::new(ptr::null_mut()) })
+                .map(|_| Shard { writer: ShortLock::default(), table: Published::null() })
                 .collect(), // alloc: once a map
             ids: Ids::new(),
             rows,
@@ -1041,7 +1135,7 @@ impl<V: Send + Sync + 'static> Map<V> {
     pub(crate) fn reset(&mut self) {
         let rows = &self.rows;
         for shard in self.shards.iter_mut() {
-            let table = *shard.table.get_mut();
+            let table = shard.table.get();
             let writer = shard.writer.get_mut();
             // SAFETY: `&mut` excludes every reader.
             writer.free.reclaim_all(|row| unsafe { rows.drop_row(row) });
@@ -1070,10 +1164,10 @@ impl<V: Send + Sync + 'static> Map<V> {
             let live = other.writer.lock().live;
             // Grows at the insert that would leave it more than half used (`room`).
             let len = (live * 2).next_power_of_two().max(FIRST_TABLE);
-            let current = *shard.table.get_mut();
+            let current = shard.table.get();
             let writer = shard.writer.get_mut();
             assert!(writer.used == 0, "a map sized like another once it had entries");
-            if live == 0 || !current.is_null() && untag(current).1 >= len {
+            if live == 0 || !current.is_null() && current.untag().1 >= len {
                 continue;
             }
             let table = writer.outgrown.take(len).unwrap_or_else(|| new_table(len));
@@ -1083,7 +1177,7 @@ impl<V: Send + Sync + 'static> Map<V> {
                 writer.outgrown.hold(Grace::start(), Table(current));
                 writer.outgrown.settle();
             }
-            *shard.table.get_mut() = table;
+            shard.table.set(table);
         }
     }
 }
@@ -1100,7 +1194,7 @@ impl<V: Send + Sync + Clone + 'static> Map<V> {
 impl<V> Drop for Map<V> {
     fn drop(&mut self) {
         for shard in self.shards.iter_mut() {
-            let table = *shard.table.get_mut();
+            let table = shard.table.get();
             if !table.is_null() {
                 // SAFETY: the current table, owned by the map; `&mut` excludes every reader.
                 // The rows it names are dropped with `rows`.

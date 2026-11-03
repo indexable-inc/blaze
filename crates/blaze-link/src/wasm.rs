@@ -1,6 +1,13 @@
 //! The wasm format: modules for wasm32-wasip1 and wasm32-unknown-unknown, as wasm-ld makes
 //! them when rustc drives it (`-z stack-size=1048576`, `--stack-first`, `--gc-sections`,
-//! `--allow-undefined`, no `--export-dynamic`).
+//! `--allow-undefined`, no `--export-dynamic`), and memory64 modules for blaze's own
+//! `wasm64-blaze-wasip1`, laid out the same way as wasm-ld's `-mwasm64` makes them: the memory
+//! has 64-bit limits, `__stack_pointer`, `__memory_base` and an exported address are `i64`
+//! globals, a data segment's offset is an `i64.const`, and an address or a function pointer is
+//! an `i64.const` operand in code (a padded LEB of ten bytes) and eight bytes in data. The
+//! table stays a 32-bit table of funcrefs: code wraps a slot to `i32` before `call_indirect`. A
+//! memory64 module also exports `__stack_pointer` and the table (`__indirect_function_table`):
+//! the seed's runner switches the one with each fiber and starts a fiber at a slot of the other.
 //!
 //! Code is reached by index, not address ([`Plan::indexed_code`]): the core places code (the
 //! writer's `__wasm_call_ctors`, then the code pieces) in a space of its own, apart from
@@ -77,26 +84,31 @@ pub(crate) fn writer(output: &Output) -> Result<Wasm, LinkError> {
         // alloc: error path
         return Err(error(format!("the wasm writer for an output of {:?}", output.format)));
     }
-    if output.arch != Arch::Wasm32 {
-        // alloc: error path
-        return Err(error(format!(
-            "wasm: an output for {:?}; a wasm module is wasm32 (wasm32-wasip1, \
-             wasm32-unknown-unknown)",
-            output.arch
-        )));
-    }
+    let memory64 = match output.arch {
+        Arch::Wasm32 => false,
+        Arch::Wasm64 => true,
+        Arch::X86_64 | Arch::Aarch64 => {
+            // alloc: error path
+            return Err(error(format!(
+                "wasm: an output for {:?}; a wasm module is wasm32 (wasm32-wasip1, \
+                 wasm32-unknown-unknown) or wasm64 (wasm64-blaze-wasip1)",
+                output.arch
+            )));
+        }
+    };
     let stack = output.stack.unwrap_or(STACK);
     let stack = stack
         .checked_next_multiple_of(STACK_ALIGN)
-        .filter(|&it| it < 1 << 32)
+        .filter(|&it| memory64 || it < 1 << 32)
         // alloc: error path
-        .ok_or_else(|| error(format!("wasm: a stack of {stack} bytes, past 32-bit memory")))?;
-    Ok(Wasm { kind: output.kind.clone(), stack }) // clone: once per link, kept by it
+        .ok_or_else(|| error(format!("wasm: a stack of {stack} bytes, past {:?}'s memory", output.arch)))?;
+    Ok(Wasm { kind: output.kind.clone(), stack, memory64 }) // clone: once per link, kept by it
 }
 
 /// How the core maps a codegen relocation of wasm code (`in_code`) or data to the one the
-/// writer applies: in code, a `call`'s index and an `i32.const`'s address or slot; in data,
-/// 4 bytes.
+/// writer applies: in code, a `call`'s index and an `i32.const`'s (wasm64: `i64.const`'s)
+/// address or slot; in data, 4 bytes (wasm64: 8). Which kinds a module's memory takes is the
+/// writer's check ([`reloc::fits_memory`]).
 pub(crate) fn codegen_apply(kind: RelocKind, in_code: bool) -> Result<Apply, String> {
     let r_type = match (kind, in_code) {
         (RelocKind::WasmFunction, true) => reloc::FUNCTION_INDEX_LEB,
@@ -105,11 +117,15 @@ pub(crate) fn codegen_apply(kind: RelocKind, in_code: bool) -> Result<Apply, Str
         (RelocKind::WasmTable, false) => reloc::TABLE_INDEX_I32,
         (RelocKind::WasmMemory, true) => reloc::MEMORY_ADDR_SLEB,
         (RelocKind::WasmMemory, false) => reloc::MEMORY_ADDR_I32,
+        (RelocKind::WasmTable64, true) => reloc::TABLE_INDEX_SLEB64,
+        (RelocKind::WasmTable64, false) => reloc::TABLE_INDEX_I64,
+        (RelocKind::WasmMemory64, true) => reloc::MEMORY_ADDR_SLEB64,
+        (RelocKind::WasmMemory64, false) => reloc::MEMORY_ADDR_I64,
         (kind, _) => {
             // alloc: error path
             return Err(format!(
-                "wasm: a {kind:?} relocation, where wasm code has only WasmFunction, WasmTable \
-                 and WasmMemory"
+                "wasm: a {kind:?} relocation, where wasm code has only WasmFunction, WasmTable, \
+                 WasmMemory, WasmTable64 and WasmMemory64"
             ));
         }
     };
@@ -124,6 +140,8 @@ pub(crate) struct Wasm {
     kind: OutputKind,
     /// The stack's size, a multiple of 16: data starts there.
     stack: u64,
+    /// A memory64 module (wasm64): 64-bit addresses, `i64` address globals and offsets.
+    memory64: bool,
 }
 
 /// A data segment of this name, which `__start_`/`__stop_` name when it is a C identifier.
@@ -245,7 +263,7 @@ impl Writer for Wasm {
     }
 
     fn arch(&self) -> Arch {
-        Arch::Wasm32
+        if self.memory64 { Arch::Wasm64 } else { Arch::Wasm32 }
     }
 
     fn plan(&self) -> Plan {
@@ -337,7 +355,7 @@ impl Writer for Wasm {
     }
 
     fn read(&self, name: &str, bytes: &[u8], kind: &NativeKind) -> Result<NativeFile, String> {
-        object::read(name, bytes, kind)
+        object::read(name, bytes, kind, self.memory64)
     }
 
     /// `__wasm_call_ctors` takes one unit of the code space, the heap's start none.
@@ -354,6 +372,7 @@ impl Writer for Wasm {
         s: u64,
         addend: i64,
     ) -> Result<(), String> {
+        reloc::fits_memory(r_type, self.memory64)?;
         reloc::apply(r_type, bytes, s, addend)
     }
 
@@ -361,7 +380,7 @@ impl Writer for Wasm {
     /// as it is then: its region holds one unit, which the code space counts it by.
     fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, CowBytes)>, LinkError> {
         // alloc: error path
-        module::init_functions(placed).map_err(|e| error(format!("wasm: {e}")))?;
+        module::init_functions(placed, self.memory64).map_err(|e| error(format!("wasm: {e}")))?;
         // wasm keeps no table across links: each region's bytes are wrapped once.
         // alloc: once per link, the regions' bytes `Writer::synthesize` returns, and their `Arc`s
         let (functions, heap) = (CowBytes::from_vec(vec![0]), CowBytes::from_vec(Vec::new()));
@@ -418,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn only_wasm32() {
+    fn only_wasm() {
         let error = writer(&output(Arch::X86_64, command(), None)).err().unwrap();
         assert!(error.what.contains("X86_64"), "{}", error.what);
         assert!(writer(&output(Arch::Aarch64, command(), None)).is_err());
@@ -426,6 +445,10 @@ mod tests {
         elf.format = Format::Elf;
         assert!(writer(&elf).is_err());
         assert!(writer(&output(Arch::Wasm32, command(), Some(1 << 33))).is_err());
+        // A memory64 module's stack may pass 4 GiB.
+        let wasm64 = writer(&output(Arch::Wasm64, command(), Some(1 << 33))).unwrap();
+        assert_eq!((wasm64.arch(), wasm64.plan().headers), (Arch::Wasm64, 1 << 33));
+        assert!(writer(&output(Arch::Wasm64, command(), Some(u64::MAX))).is_err());
     }
 
     #[test]
@@ -561,6 +584,10 @@ mod tests {
         assert_eq!(codegen_apply(RelocKind::WasmTable, false), native(reloc::TABLE_INDEX_I32));
         assert_eq!(codegen_apply(RelocKind::WasmMemory, true), native(reloc::MEMORY_ADDR_SLEB));
         assert_eq!(codegen_apply(RelocKind::WasmMemory, false), native(reloc::MEMORY_ADDR_I32));
+        assert_eq!(codegen_apply(RelocKind::WasmTable64, true), native(reloc::TABLE_INDEX_SLEB64));
+        assert_eq!(codegen_apply(RelocKind::WasmTable64, false), native(reloc::TABLE_INDEX_I64));
+        assert_eq!(codegen_apply(RelocKind::WasmMemory64, true), native(reloc::MEMORY_ADDR_SLEB64));
+        assert_eq!(codegen_apply(RelocKind::WasmMemory64, false), native(reloc::MEMORY_ADDR_I64));
         assert!(codegen_apply(RelocKind::Abs64, false).is_err());
         assert!(codegen_apply(RelocKind::TlsOffset, true).is_err());
     }
@@ -572,5 +599,13 @@ mod tests {
         wasm.apply(reloc::FUNCTION_INDEX_LEB, &mut bytes, 0, 3, 0).unwrap();
         assert_eq!(bytes, leb::padded_uleb(3));
         assert!(wasm.apply(77, &mut bytes, 0, 3, 0).is_err());
+        // Each module takes only its memory's width of address.
+        let mut wide = [0; 10];
+        assert!(wasm.apply(reloc::MEMORY_ADDR_SLEB64, &mut wide, 0, 3, 0).is_err());
+        let wasm64 = writer(&output(Arch::Wasm64, command(), None)).unwrap();
+        wasm64.apply(reloc::MEMORY_ADDR_SLEB64, &mut wide, 0, 3, 0).unwrap();
+        assert_eq!(wide, leb::padded_sleb64(3));
+        assert!(wasm64.apply(reloc::MEMORY_ADDR_SLEB, &mut bytes, 0, 3, 0).is_err());
+        wasm64.apply(reloc::FUNCTION_INDEX_LEB, &mut bytes, 0, 3, 0).unwrap();
     }
 }

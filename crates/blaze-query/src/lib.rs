@@ -63,6 +63,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
     fmt,
+    num::NonZeroUsize,
     sync::{Arc, OnceLock},
 };
 
@@ -509,6 +510,12 @@ struct Stacks {
     edges: Vec<EdgeRecord>,
 }
 
+impl Stacks {
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.edges.is_empty()
+    }
+}
+
 thread_local! {
     /// Whether this thread's task runs a query. Carried with a job on a fiber: another job
     /// the thread runs while it waits is a task of its own, free to ask the database.
@@ -618,20 +625,24 @@ pub fn carry_with_fiber_jobs() {
     static CARRIED: std::sync::Once = std::sync::Once::new();
     CARRIED.call_once(|| {
         carry(db::carried());
-        carry(Carried { take: take_stacks, put: put_stacks });
-        carry(Carried { take: take_inside, put: put_inside });
-        carry(Carried { take: take_unreadable, put: put_unreadable });
+        carry(Carried { take: take_stacks, put: put_stacks, end: end_stacks });
+        carry(Carried::word(take_inside, put_inside));
+        carry(Carried { take: take_unreadable, put: put_unreadable, end: end_unreadable });
     });
 }
 
-/// Moves the switching job's [`STACKS`] off this thread, leaving empty ones.
+/// Moves the switching job's [`STACKS`] off this thread, leaving empty ones; `None` when they
+/// are empty, and the thread keeps them with their buffers (as `db::local::take` does).
 #[inline(never)]
-fn take_stacks() -> usize {
+fn take_stacks() -> Option<NonZeroUsize> {
+    if with_stacks(|stacks| stacks.borrow().is_empty()) {
+        return None;
+    }
     let spare = SPARE_STACKS.lock().pop();
-    // alloc: stacks once per job switched out at once, then kept in `SPARE_STACKS`.
+    // alloc: stacks once per job switched out at once inside a run, then kept in `SPARE_STACKS`.
     let mut moved = spare.unwrap_or_else(|| Box::new(Stacks { keys: Vec::new(), edges: Vec::new() }));
-    STACKS.with(|stacks| std::mem::swap(&mut *stacks.borrow_mut(), &mut *moved));
-    Box::into_raw(moved).expose_provenance()
+    with_stacks(|stacks| std::mem::swap(&mut *stacks.borrow_mut(), &mut *moved));
+    NonZeroUsize::new(Box::into_raw(moved).expose_provenance())
 }
 
 /// Puts the stacks [`take_stacks`] moved off back, on the thread the job resumes on.
@@ -640,47 +651,55 @@ fn take_stacks() -> usize {
 ///
 /// If the thread's own stacks are not empty: a job left keys or edges when it ended.
 #[inline(never)]
-fn put_stacks(taken: usize) {
+fn put_stacks(taken: NonZeroUsize) {
     // SAFETY: `taken` is the box `take_stacks` gave up for this job, which the driver puts back
     // once.
-    let mut left = unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Stacks>(taken)) };
-    STACKS.with(|stacks| std::mem::swap(&mut *stacks.borrow_mut(), &mut *left));
-    assert!(
-        left.keys.is_empty() && left.edges.is_empty(),
-        "a job resumed on a thread that still runs {} keys",
-        left.keys.len()
-    );
+    let mut left = unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Stacks>(taken.get())) };
+    with_stacks(|stacks| std::mem::swap(&mut *stacks.borrow_mut(), &mut *left));
+    assert!(left.is_empty(), "a job resumed on a thread that still runs {} keys", left.keys.len());
     // alloc: none once warm: `SPARE_STACKS` grows to its high-water mark.
     SPARE_STACKS.lock().push(left);
 }
 
-/// The switching job's [`INSIDE`]: 1 when it runs a query.
+/// Frees the stacks [`take_stacks`] moved off a job that ended holding them.
 #[inline(never)]
-fn take_inside() -> usize {
-    usize::from(INSIDE.with(Cell::take))
+fn end_stacks(taken: NonZeroUsize) {
+    // SAFETY: `taken` is the box `take_stacks` gave up for this job, which the driver ends once.
+    drop(unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Stacks>(taken.get())) });
+}
+
+/// The switching job's [`INSIDE`]: `Some` when it runs a query.
+#[inline(never)]
+fn take_inside() -> Option<NonZeroUsize> {
+    INSIDE.with(Cell::take).then_some(NonZeroUsize::MIN)
 }
 
 #[inline(never)]
-fn put_inside(taken: usize) {
-    INSIDE.with(|it| it.set(taken != 0));
+fn put_inside(_: NonZeroUsize) {
+    INSIDE.with(|it| it.set(true));
 }
 
-/// The switching job's [`UNREADABLE`]: 0 for none, else a box of it.
+/// The switching job's [`UNREADABLE`]: `None` for none, else a box of it.
 #[inline(never)]
-fn take_unreadable() -> usize {
+fn take_unreadable() -> Option<NonZeroUsize> {
     // A run stopped on a file it could not read, switching out before its request fails with it.
     // alloc: only on that error path.
-    UNREADABLE.with(Cell::take).map_or(0, |corrupt| Box::into_raw(Box::new(corrupt)).expose_provenance())
+    UNREADABLE.with(Cell::take).and_then(|corrupt| NonZeroUsize::new(Box::into_raw(Box::new(corrupt)).expose_provenance()))
 }
 
 #[inline(never)]
-fn put_unreadable(taken: usize) {
-    let corrupt = (taken != 0).then(|| {
-        // SAFETY: a nonzero `taken` is the box `take_unreadable` made for this job, which the
-        // driver puts back once.
-        *unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Corrupt>(taken)) }
-    });
-    UNREADABLE.with(|it| it.set(corrupt));
+fn put_unreadable(taken: NonZeroUsize) {
+    // SAFETY: `taken` is the box `take_unreadable` made for this job, which the driver puts
+    // back once.
+    let corrupt = *unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Corrupt>(taken.get())) };
+    UNREADABLE.with(|it| it.set(Some(corrupt)));
+}
+
+/// Frees what [`take_unreadable`] boxed for a job that ended holding it.
+#[inline(never)]
+fn end_unreadable(taken: NonZeroUsize) {
+    // SAFETY: as in `put_unreadable`, ended once instead.
+    drop(unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Corrupt>(taken.get())) });
 }
 
 /// One request's root and everything it runs inline, on one task: the keys of this thread's

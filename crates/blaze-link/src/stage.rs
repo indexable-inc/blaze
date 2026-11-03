@@ -1004,7 +1004,7 @@ impl<'a> Stage<'a> {
         piece.rank = rank;
         piece.weak = weak;
         let made = self.make(&piece, Content::Bytes(&function.code));
-        if self.arch() == Arch::Wasm32 && wasm_imports_in(&function.code).map_err(|it| error(key, it))? {
+        if self.arch().is_wasm() && wasm_imports_in(&function.code).map_err(|it| error(key, it))? {
             let (code, _) = blaze_codegen::wasm::Code::decode(&function.code)
                 // alloc: error path
                 .map_err(|it| error(key, format!("its wasm header: {it}")))?;
@@ -1160,19 +1160,20 @@ impl<'a> Stage<'a> {
         let (fixups, weak) = self.fixups(relocs, syms, None, false, None)?;
         // alloc: error path
         let static_error = |what: String| error(None, format!("the static {:?}: {what}", it.item));
-        // wasm32 without shared memory has one thread, so a `#[thread_local]` static is plain
+        // wasm without shared memory (wasm32, and wasm64-blaze-wasip1, which has no threads) has
+        // one thread, so a `#[thread_local]` static is plain
         // data, as LLVM's wasm backend strips thread-locals without the atomics feature: wasm
         // codegen reaches it by its address in linear memory. That holds only for a module of
         // one thread: a `-threads` target is refused here, and an object built with `atomics`
         // or `shared-mem` where the module's target features are merged (`wasm/module.rs`).
-        if it.thread_local && self.arch() == Arch::Wasm32 && self.output.triple.split('-').any(|it| it == "threads") {
+        if it.thread_local && self.arch().is_wasm() && self.output.triple.split('-').any(|it| it == "threads") {
             return Err(static_error(format!(
-                "a `#[thread_local]` static on {}, a wasm32 target of threads: blaze links wasm32 \
+                "a `#[thread_local]` static on {}, a wasm target of threads: blaze links wasm \
                  modules of one thread with no shared memory, where a thread-local is plain data",
                 self.output.triple
             )));
         }
-        let thread_local = it.thread_local && self.arch() != Arch::Wasm32;
+        let thread_local = it.thread_local && !self.arch().is_wasm();
         let (class, rank) = match &it.section {
             Some(name) => {
                 let (class, rank) = self
@@ -1190,7 +1191,7 @@ impl<'a> Stage<'a> {
                 (false, false, _, false) => Class::RelRo,
             }),
         };
-        let zeroed = crate::state::zeroed(self.new.class(class));
+        let zeroed = crate::model::zeroed(self.new.class(class));
         let content = match (zero, zeroed) {
             (false, true) => {
                 let class = self.new.class(class);
@@ -1206,7 +1207,7 @@ impl<'a> Stage<'a> {
         piece.zero = zeroed;
         piece.weak = weak;
         let made = self.make(&piece, content);
-        if self.arch() == Arch::Wasm32 {
+        if self.arch().is_wasm() {
             self.declare_wasm(made, None, &it.imports)?;
             self.list_wasm_static(it, (item, instance), sym, class)?;
         }
@@ -1309,7 +1310,7 @@ impl<'a> Stage<'a> {
                 };
                 let (bytes, file) = self.location(anchor, index)?;
                 let fixups = [Fixup { at: 0, apply: self.location_layout().2, target: file, addend: 0, minus: None }];
-                self.retarget(id, &fixups);
+                self.retarget(id, &fixups)?;
                 self.contents.insert(id, Content::Bytes(bytes));
                 self.write.insert(id);
             }
@@ -1319,20 +1320,47 @@ impl<'a> Stage<'a> {
 
     /// Replaces the fixups of a piece that was there before the stage, counting the shared
     /// pieces it stops and starts referring to.
-    fn retarget(&mut self, id: PieceId, fixups: &[Fixup]) {
+    fn retarget(&mut self, id: PieceId, fixups: &[Fixup]) -> Result<(), LinkError> {
         let before = State::targets(self.new.piece(id).expect("a live piece"));
         self.new.set_fixups(id, fixups);
         let after = State::targets(self.new.piece(id).expect("a live piece"));
         for target in before.iter().filter(|it| !after.contains(it)) {
             if let Some(shared) = self.shared(*target) {
-                let users = self.new.users_mut(shared);
-                *users = users.saturating_sub(1);
+                self.uncount(shared, id)?;
                 self.touched.push(shared);
             }
         }
         for target in after.iter().filter(|it| !before.contains(it)) {
             self.counted.push(*target);
         }
+        Ok(())
+    }
+
+    /// Takes the piece `referrer`, which stops referring to it, off the users of the shared
+    /// piece `shared`. A count already at zero is a counting bug, and the error names both,
+    /// rather than leave the piece counted as used by none while something reads it.
+    fn uncount(&mut self, shared: PieceId, referrer: PieceId) -> Result<(), LinkError> {
+        let users = self.new.users_mut(shared);
+        if let Some(less) = users.checked_sub(1) {
+            *users = less;
+            return Ok(());
+        }
+        let data = match self.new.any(shared) {
+            Some(it) => self.named(it.sym),
+            // alloc: error path
+            None => format!("the shared piece {shared}"),
+        };
+        let by = self.new.any(referrer).expect("a referrer's piece");
+        Err(error(
+            function_of(by),
+            // alloc: error path
+            format!(
+                "{} in the image `{}` stops referring to {data}, which no piece is counted as using: \
+                 the count of a shared piece's users missed a referrer",
+                self.piece_referrer(by),
+                self.name,
+            ),
+        ))
     }
 
     /// A span's `Location` record and the symbol of its file name, made when missing.
@@ -1352,7 +1380,8 @@ impl<'a> Stage<'a> {
         let name = table.file(at.file);
         let record: &'a [u8] = match self.arch() {
             Arch::Wasm32 => arena.alloc_slice_copy(&position::wasm32_location(name.len(), at)),
-            Arch::X86_64 | Arch::Aarch64 => arena.alloc_slice_copy(&position::location(name.len(), at)),
+            // wasm64's is the native 64-bit layout, its pointer an address in linear memory.
+            Arch::X86_64 | Arch::Aarch64 | Arch::Wasm64 => arena.alloc_slice_copy(&position::location(name.len(), at)),
         };
         let file_name = self.symbols.name(name);
         let file = self.symbols.intern(SymKey::FileName(file_name));
@@ -1369,14 +1398,19 @@ impl<'a> Stage<'a> {
     }
 
     /// A `Location` record as the image's arch lays it out: its size, its alignment and how its
-    /// pointer to the file name is written (on wasm32 a four-byte address in linear memory,
-    /// which nothing slides).
+    /// pointer to the file name is written (on wasm32 a four-byte address in linear memory, on
+    /// wasm64 an eight-byte one, which nothing slides).
     fn location_layout(&self) -> (u64, u64, Apply) {
         match self.arch() {
             Arch::Wasm32 => (
                 position::WASM32_LOCATION_SIZE,
                 position::WASM32_LOCATION_ALIGN,
                 crate::wasm::codegen_apply(RelocKind::WasmMemory, false).expect("wasm data has 4-byte addresses"),
+            ),
+            Arch::Wasm64 => (
+                position::LOCATION_SIZE,
+                position::LOCATION_ALIGN,
+                crate::wasm::codegen_apply(RelocKind::WasmMemory64, false).expect("wasm64 data has 8-byte addresses"),
             ),
             Arch::X86_64 | Arch::Aarch64 => (position::LOCATION_SIZE, position::LOCATION_ALIGN, Apply::Abs64),
         }
@@ -1410,8 +1444,12 @@ impl<'a> Stage<'a> {
     }
 
     /// Counts the fixups to shared pieces that this stage added and removed, and removes the
-    /// shared pieces nothing refers to any more.
-    pub fn sweep(&mut self) {
+    /// shared pieces nothing refers to any more, in one pass: a piece it removes uncounts
+    /// what it referred to in turn, so data that only removed code reached goes with that
+    /// code, however deep, and leaves nothing pointing at what the change removes. A GOT
+    /// cell or PLT stub is no user ([`What::is_linkers_cell`]): it goes with its target
+    /// ([`Stage::cells_of_removed`]).
+    pub fn sweep(&mut self) -> Result<(), LinkError> {
         let arena = self.arena;
         let mut touched = std::mem::replace(&mut self.touched, Vec::new_in(arena));
         let mut fresh = collect_in(self.fresh.iter(), arena);
@@ -1419,7 +1457,9 @@ impl<'a> Stage<'a> {
         let mut targets = std::mem::replace(&mut self.counted, Vec::new_in(arena));
         for id in fresh.iter() {
             let piece = self.new.piece(*id).expect("a fresh piece");
-            targets.extend(State::targets(piece));
+            if !piece.what().is_linkers_cell() {
+                targets.extend(State::targets(piece));
+            }
             if matches!(piece.what(), What::Shared) {
                 touched.push(*id);
             }
@@ -1437,12 +1477,14 @@ impl<'a> Stage<'a> {
                 if self.old.piece(id).is_none() && fresh.binary_search(&id).is_err() {
                     continue;
                 }
-                let targets = State::targets(self.new.any(id).expect("a removed piece"));
-                for target in targets {
+                let piece = self.new.any(id).expect("a removed piece");
+                if piece.what().is_linkers_cell() {
+                    continue;
+                }
+                for target in State::targets(piece) {
                     if let Some(shared) = self.shared(target).or_else(|| self.old_shared(target)) {
                         if shared < self.new.piece_count() {
-                            let users = self.new.users_mut(shared);
-                            *users = users.saturating_sub(1);
+                            self.uncount(shared, id)?;
                         }
                         touched.push(shared);
                     }
@@ -1457,6 +1499,7 @@ impl<'a> Stage<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     /// The shared piece a symbol is at the start of, in the new state.
@@ -1729,6 +1772,41 @@ impl<'a> Stage<'a> {
         }
     }
 
+    /// Adds to `out` the pieces that read the GOT cell of `kind` of `target`: those with a
+    /// fixup that reaches `target` through a cell of `kind` (its PLT stub among them; for a
+    /// Mach-O TLV descriptor's cell, the code reading its static), and those referring to the
+    /// cell by its name (PE's `__imp_X`, [`Writer::got_prefix`]). A reader refers to the
+    /// target or the name, never to the cell's own symbol, so a cell that moves
+    /// (`Stage::relay`) is not among its readers' references: this finds them. Costs the
+    /// target's referrers' fixups.
+    pub fn cell_readers(&self, kind: GotKind, target: Sym, out: &mut FrameVec<'a, PieceId>) {
+        let of_static = match self.symbols.key(target) {
+            SymKey::Tlv(item, instance) => self.symbols.find(SymKey::Static(item, instance)),
+            _ => None,
+        };
+        for sym in std::iter::once(target).chain(of_static) {
+            for id in self.new.refs(sym) {
+                let Some(piece) = self.new.piece(id) else { continue };
+                let through =
+                    |it: &Fixup| reloc::got_kind(it.apply) == Some(kind) && self.got_target(it) == target;
+                if piece.fixups().iter().any(through) {
+                    out.push(id);
+                }
+            }
+        }
+        if kind != GotKind::Address {
+            return;
+        }
+        let (Some(prefix), Some(name)) = (self.writer.got_prefix(), self.symbols.name_of(target)) else { return };
+        let mut named = Vec::with_capacity_in(prefix.len() + name.len(), self.arena);
+        named.extend_from_slice(prefix.as_bytes());
+        named.extend_from_slice(name.as_bytes());
+        let named = std::str::from_utf8(&named).expect("two strings joined are one");
+        if let Some(sym) = self.symbols.find_sym_name(named) {
+            out.extend(self.new.refs(sym));
+        }
+    }
+
     /// Rewrites every piece referring to a symbol whose definition changed, and every cell
     /// running a body that moved. Costs the changed symbols' referrers.
     pub fn referrers(&mut self) {
@@ -1747,24 +1825,26 @@ impl<'a> Stage<'a> {
         }
     }
 
-    /// Removes the GOT cells and PLT stubs of what this stage removed and did not put back.
-    /// A cell is the linker's own, made for the fixups that reach its target through it
-    /// ([`Stage::needs`]), and owned by no function or unit: nothing else removes it, so the
-    /// cell of a removed function (the old key of a function filled anew) would outlive it
-    /// and keep referring to it. What still reaches the target itself, through a cell or
-    /// directly, is [`Stage::dangling`]'s to name.
+    /// Removes the GOT cells and PLT stubs of what this stage left undefined: a piece it
+    /// removed and did not put back (swept data too), or a name its resolution no longer
+    /// defines (an import whose last caller went). A cell is the linker's own, made for the
+    /// fixups that reach its target through it ([`Stage::needs`]), and owned by no function
+    /// or unit: nothing else removes it, so the cell of a removed function (the old key of a
+    /// function filled anew), or the PLT stub of an import no longer loaded, would outlive
+    /// its target and keep referring to it. What still reaches the target itself, through a
+    /// cell or directly, is [`Stage::dangling`]'s to name, or the relocation's. Walks the
+    /// symbols whose definition changed, which hold every one this stage undefined, and finds
+    /// their cells by key: an import's cell holds no fixup to it, so is not among its referrers.
     pub fn cells_of_removed(&mut self) {
         let mut cells: FrameVec<'a, PieceId> = Vec::new_in(self.arena);
-        for id in self.removed.iter() {
-            let piece = self.new.any(*id).expect("a removed piece");
-            for sym in std::iter::once(piece.sym).chain(piece.defines().iter().copied()) {
-                if self.new.home(sym).is_some() || !matches!(self.new.def(sym), Def::None) {
-                    continue;
-                }
-                for user in self.new.refs(sym).filter_map(|it| self.new.piece(it)) {
-                    if matches!(user.what(), What::Got { target, .. } | What::Plt { target } if target == sym) {
-                        cells.push(user.id);
-                    }
+        for sym in self.changed.iter() {
+            if self.new.home(sym).is_some() || !matches!(self.new.def(sym), Def::None) {
+                continue;
+            }
+            let keys = GotKind::ALL.map(|kind| SymKey::Got(kind, sym));
+            for key in keys.into_iter().chain([SymKey::Plt(sym)]) {
+                if let Some(Def::Piece { piece, .. }) = self.symbols.find(key).map(|it| self.new.def(it)) {
+                    cells.push(piece);
                 }
             }
         }

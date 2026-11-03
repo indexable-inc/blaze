@@ -100,7 +100,12 @@ is `blaze build`. In a flake, take the package from the input:
 }
 ```
 
-Nix compiles blaze from source; there is no binary cache yet.
+Nix compiles blaze from source; there is no binary cache yet. Such a build, like one from
+`cargo install --git` or `--path`, is a build of blaze's tree (`blaze 0.0.0-dev`), not a
+release: in a project that pins a release of blaze (`[workspace.metadata.blaze] version`) it
+runs that release, fetched once, saying so in one line on stderr, as a release does;
+`blaze --ignore-pin <command>` runs the build itself there
+([cargo.md](cargo.md#pinning-a-release-of-blaze)).
 
 ## The old names
 

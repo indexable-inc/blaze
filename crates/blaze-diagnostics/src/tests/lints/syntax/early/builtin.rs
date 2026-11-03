@@ -346,3 +346,32 @@ error: aborting due to 1 previous error
 "#;
     assert_eq!(ui("unsafe-extern-blocks.rs", "2015", source), stderr);
 }
+
+#[test]
+fn the_code_global_allocator_adds_is_not_the_crates_unsafe_code() {
+    // blaze-check's tests (edition 2024, `#![deny(unsafe_code)]`) and blaze-alloc-count's: what
+    // `#[global_allocator]` expands to is the macro's own code (rustc's expansion is in the
+    // def-site context of an attribute macro, `Span::in_external_macro`), so neither its
+    // `unsafe fn`s and blocks nor its exports are the crate's `unsafe_code`, and its exports need
+    // no `unsafe(..)` from the crate. rustc accepts this.
+    let source = r#"#![deny(unsafe_code)]
+
+use core::alloc::{GlobalAlloc, Layout};
+
+struct Bump;
+
+#[allow(unsafe_code)]
+unsafe impl GlobalAlloc for Bump {
+    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+        0 as *mut u8
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+#[global_allocator]
+static ALLOC: Bump = Bump;
+
+fn main() {}
+"#;
+    assert_reports(&ui_core("global-allocator-unsafe-code.rs", "2024", "global_allocator", source), &[]);
+}

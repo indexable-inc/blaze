@@ -185,6 +185,7 @@ pub fn arch_tag(arch: Arch) -> u8 {
         Arch::X86_64 => 0,
         Arch::Aarch64 => 1,
         Arch::Wasm32 => 2,
+        Arch::Wasm64 => 3,
     }
 }
 
@@ -194,12 +195,13 @@ pub fn arch_of(tag: u8) -> Option<Arch> {
         0 => Arch::X86_64,
         1 => Arch::Aarch64,
         2 => Arch::Wasm32,
+        3 => Arch::Wasm64,
         _ => return None,
     })
 }
 
 /// Every kind, by its tag ([`kind_tag`]); a new kind goes at the end.
-const KINDS: [RelocKind; 26] = [
+const KINDS: [RelocKind; 28] = [
     RelocKind::Abs64,
     RelocKind::PcRel32,
     RelocKind::GotPcRel32,
@@ -226,6 +228,8 @@ const KINDS: [RelocKind; 26] = [
     RelocKind::TpHi12,
     RelocKind::TpLo12,
     RelocKind::SectionRel32,
+    RelocKind::WasmTable64,
+    RelocKind::WasmMemory64,
 ];
 
 /// The byte a [`RelocKind`] hashes as in a content key, and in blaze-premap's.
@@ -257,6 +261,8 @@ pub fn kind_tag(kind: RelocKind) -> u8 {
         RelocKind::TpHi12 => 23,
         RelocKind::TpLo12 => 24,
         RelocKind::SectionRel32 => 25,
+        RelocKind::WasmTable64 => 26,
+        RelocKind::WasmMemory64 => 27,
     }
 }
 

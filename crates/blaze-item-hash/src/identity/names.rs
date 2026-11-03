@@ -463,8 +463,8 @@ impl Out<'_, '_> {
         }
     }
 
-    /// What `path` resolves to at `at`; with `def_site`, also at the definition site of the
-    /// macro that wrote it.
+    /// What `path` resolves to at `at`; with `def_site`, its type-namespace lookup applies a
+    /// `macro`'s def-site hygiene to it, as type lowering does.
     fn resolutions(
         &mut self,
         at: &Resolver<'_>,
@@ -474,7 +474,8 @@ impl Out<'_, '_> {
     ) -> R {
         let db = self.db;
         let segments = mod_path_of(path).map_or(0, |it| it.segments().len());
-        match at.resolve_path_in_type_ns_with_prefix_info(db, path) {
+        let type_hygiene = if def_site { hygiene } else { HygieneId::ROOT };
+        match at.resolve_path_in_type_ns_hygienic(db, path, type_hygiene) {
             Some((ty, remaining, _, prefix, visibility)) => {
                 self.resolved(remaining.unwrap_or(segments));
                 self.tag(1);
@@ -484,22 +485,6 @@ impl Out<'_, '_> {
                 self.visibility(visibility);
             }
             None => self.tag(0),
-        }
-        if def_site && hygiene != HygieneId::ROOT {
-            match Resolver::def_site(db, hygiene) {
-                Some(site) => match site.resolve_path_in_type_ns_with_prefix_info(db, path) {
-                    Some((ty, remaining, _, prefix, visibility)) => {
-                        self.resolved(remaining.unwrap_or(segments));
-                        self.tag(2);
-                        self.type_ns(ty)?;
-                        self.u64(remaining.map_or(u64::MAX, |it| it as u64));
-                        self.prefix(prefix);
-                        self.visibility(visibility);
-                    }
-                    None => self.tag(1),
-                },
-                None => self.tag(0),
-            }
         }
         match at.resolve_path_in_value_ns_with_prefix_info(db, path, hygiene) {
             Some((value, prefix, visibility)) => {

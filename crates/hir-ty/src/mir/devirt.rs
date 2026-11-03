@@ -93,6 +93,7 @@ pub struct World {
 }
 
 pub const OBJECT_DOMAIN: &str = "blaze v2 devirt object 1";
+pub const SITE_DOMAIN: &str = "blaze v2 devirt site 1";
 pub const WORLD_DOMAIN: &str = "blaze v2 devirt world 1";
 /// What a body records for a site whose object the program never makes: no vtable of it
 /// exists, so no call through it can run, and the call is left as it is.
@@ -117,6 +118,15 @@ pub fn object_digest(
         };
     }
     hasher.opt_part(open);
+    hasher.finish()
+}
+
+/// The digest of a site that read `object`'s facts and found its targets as `found` says,
+/// one byte a target in the object's order (`hir-ty-mir`'s `Found`): what the body's crate
+/// sees of each target's impl, which a body's code hash does not cover (rule 18).
+pub fn site_digest(object: &ContentId, found: &[u8]) -> ContentId {
+    let mut hasher = Hasher::new(SITE_DOMAIN);
+    hasher.id(object).part(found);
     hasher.finish()
 }
 
@@ -175,16 +185,43 @@ impl Held {
 }
 
 /// Makes `world` what [`given`] answers for its ID. A world given again (another build of the
-/// same program) is the one held already: equal IDs are equal facts.
-pub fn give(world: World) -> Held {
-    let mut given = GIVEN.lock();
-    given.retain(|(_, it)| it.strong_count() > 0);
-    if let Some(held) = given.iter().find(|(id, _)| *id == world.id).and_then(|(_, it)| it.upgrade()) {
-        return Held(held);
+/// same program) is the one held already: equal IDs are equal facts. The ID is of the facts'
+/// content, while a world holds them as one database's interned rows (its keys' traits, its
+/// targets' types): a world of the same ID whose rows differ (a second database that interned
+/// the same program otherwise) is refused, naming the program and the first object that
+/// differs, never handed the other's rows (rule 18).
+pub fn give(world: World) -> Result<Held, String> {
+    let held = {
+        let mut given = GIVEN.lock();
+        given.retain(|(_, it)| it.strong_count() > 0);
+        match given.iter().find(|(id, _)| *id == world.id).and_then(|(_, it)| it.upgrade()) {
+            Some(held) => held,
+            None => {
+                let held = Arc::new(world);
+                given.push((held.id, Arc::downgrade(&held)));
+                return Ok(Held(held));
+            }
+        }
+    };
+    let same = |a: &Object, b: &Object| {
+        a.key == b.key
+            && a.targets.len() == b.targets.len()
+            && a.targets.iter().zip(&b.targets).all(|(a, b)| a.ty == b.ty)
+    };
+    let differs = if held.objects.len() != world.objects.len() {
+        Some("another number of objects")
+    } else {
+        held.objects.iter().zip(&world.objects).find(|(a, b)| !same(a, b)).map(|(_, it)| &*it.name)
+    };
+    match differs {
+        None => Ok(Held(held)),
+        // alloc: the error's message
+        Some(what) => Err(format!(
+            "the dyn facts {:?} of {} are given again with other interned rows behind the same \
+             content (first at {what}): a world's ID must cover what it holds",
+            world.id, world.program,
+        )),
     }
-    let held = Arc::new(world);
-    given.push((held.id, Arc::downgrade(&held)));
-    Held(held)
 }
 
 /// The world of `id`, while something holds it. `None` is an error of the asker: an options

@@ -69,14 +69,22 @@ pub trait GoalFacts: Send + Sync + 'static {
     fn crate_key(&self, db: &Db, krate: Option<Crate>) -> ContentId;
 
     /// The fact a read of the query or input `read` (named `name`, its ingredient's debug name)
-    /// stands for, if one does: one whose value changes whenever what that read returned does.
-    /// `None` keeps the goal out of the store.
-    fn fact_of(&self, db: &Db, read: blaze_query::db::DatabaseKeyIndex, name: &'static str)
-    -> Option<FactRef>;
+    /// made by a goal of `krate`'s interner stands for, if one does: one whose value, as `krate`
+    /// sees it, changes whenever what that read returned does. `None` keeps the goal out of the
+    /// store.
+    fn fact_of(
+        &self,
+        db: &Db,
+        krate: Option<Crate>,
+        read: blaze_query::db::DatabaseKeyIndex,
+        name: &'static str,
+    ) -> Option<FactRef>;
 
-    /// The value of `fact` in `db` now (`blaze_items::facts::value`), read by the active query;
-    /// `None` when it cannot be hashed now (`blaze_items::Unhashable`).
-    fn value(&self, db: &Db, fact: FactRef) -> Option<ContentId>;
+    /// The value of `fact` in `db` now as `krate` sees it (`blaze_items::facts::value`): a fact
+    /// about impls covers only the crates `krate` loads, the ones its goals search, and never
+    /// one a build may not have finished (its proc macros unbuilt) when a job of `krate` runs.
+    /// Read by the active query; `None` when it cannot be hashed now (`blaze_items::Unhashable`).
+    fn value(&self, db: &Db, krate: Option<Crate>, fact: FactRef) -> Option<ContentId>;
 }
 
 /// A fact of lane items (`blaze_items::Fact`) as hir-ty keeps it without naming it: its kind
@@ -327,7 +335,7 @@ impl Store {
                     return None;
                 }
             };
-            let Some(answer_key) = self.answer_key_now(db, &at, &shape) else { continue };
+            let Some(answer_key) = self.answer_key_now(db, interner.krate(), &at, &shape) else { continue };
             match self.images.get(&answer_key) {
                 Ok(Some(found)) => match record::open_answer(found.bytes(), &answer_key) {
                     Ok(answer) => return Some(answer),
@@ -350,10 +358,16 @@ impl Store {
 
     /// The key the answer of the shape at `shape_key` has under its facts' values now; `None`
     /// when one of them cannot be hashed now.
-    fn answer_key_now(&self, db: &Db, shape_key: &ContentId, shape: &ShapeRef<'_>) -> Option<ContentId> {
+    fn answer_key_now(
+        &self,
+        db: &Db,
+        krate: Option<Crate>,
+        shape_key: &ContentId,
+        shape: &ShapeRef<'_>,
+    ) -> Option<ContentId> {
         let mut key = AnswerKey::new(shape_key);
         for fact in shape.facts() {
-            key.value(&self.facts.value(db, fact)?);
+            key.value(&self.facts.value(db, krate, fact)?);
         }
         Some(key.finish())
     }
@@ -379,6 +393,7 @@ impl Store {
         scratch: &mut Scratch,
     ) -> Result<(), Refusal> {
         let db = interner.db;
+        let krate = interner.krate();
         let mut refused = None;
         let facts = &mut scratch.facts;
         let storage = blaze_query::db::Database::storage(db);
@@ -387,7 +402,7 @@ impl Store {
                 return ControlFlow::Continue(());
             }
             let name = storage.read_name(read, kind);
-            match self.facts.fact_of(db, read, name) {
+            match self.facts.fact_of(db, krate, read, name) {
                 Some(fact) => {
                     facts.push(fact);
                     ControlFlow::Continue(())
@@ -404,9 +419,9 @@ impl Store {
         scratch.facts.sort_unstable();
         scratch.facts.dedup();
         for &fact in &scratch.facts {
-            scratch.values.push(self.facts.value(db, fact).ok_or(Refusal::Unhashable)?);
+            scratch.values.push(self.facts.value(db, krate, fact).ok_or(Refusal::Unhashable)?);
         }
-        let crate_key = self.facts.crate_key(db, interner.krate());
+        let crate_key = self.facts.crate_key(db, krate);
         if !stable::goal_words(interner, &*self.facts, goal, &mut scratch.words) {
             return Err(Refusal::TooLong);
         }

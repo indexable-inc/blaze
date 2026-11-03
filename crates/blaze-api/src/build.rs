@@ -60,7 +60,8 @@ pub enum Work {
     /// Then [`crate::Response::Ran`] and [`crate::Response::Work`].
     Run { targets: Targets, bin: Option<String>, args: Vec<String> },
     /// What the job's view's change from `from` reaches ([`crate::Response::Reached`]),
-    /// building nothing. `changes` is the VFS's diff of the two.
+    /// building only each view's proc macros and build scripts' runs, which its front end
+    /// applies before it is read. `changes` is the VFS's diff of the two.
     Reach { from: Opened, changes: Vec<Change>, targets: Targets },
     /// The view built again in a database of its own from nothing and every result compared
     /// with the daemon's ([`crate::Response::Verified`]): the oracle, on a sampled view.
@@ -82,12 +83,13 @@ pub enum Work {
     Doc { targets: Targets, no_deps: bool, private: bool },
     /// The edits applied to the view in the front end (`blaze_intent::apply`), reported as
     /// [`crate::Response::Edited`] before an `ok` finish; the session commits its ops. The
-    /// trees the edits left are the front end's parses of the files they wrote.
+    /// trees the edits left are the front end's parses of the files they wrote. Builds only
+    /// the view's proc macros and build scripts' runs, applied before the edits read it.
     Edit(Vec<Edit>),
     /// Built ahead for [`crate::Request::WillTest`]: the test units holding a test `filter`
     /// selects, and the functions those tests reached when they last ran first
-    /// (`blaze_intent::ahead::plan`). Runs no test. Started only through
-    /// [`Builder::speculate`].
+    /// (`blaze_intent::ahead::plan`), chosen once the view's proc macros and build scripts'
+    /// runs are built and applied. Runs no test. Started only through [`Builder::speculate`].
     Ahead { targets: Targets, filter: Vec<String> },
 }
 

@@ -45,39 +45,59 @@ impl GoalFacts for Goals {
         }
     }
 
+    /// An interner of no crate can't solve (`DbInterner::new_no_crate`), so it has no goal to
+    /// store: `None`.
     fn fact_of(
         &self,
         db: &Db,
+        krate: Option<Crate>,
         read: blaze_query::db::DatabaseKeyIndex,
         name: &'static str,
     ) -> Option<FactRef> {
-        Some(table::fact_ref(&fact_of_read(db, name, read.key_index())?))
+        Some(table::fact_ref(&fact_of_read(db, krate?, name, read.key_index())?))
     }
 
-    fn value(&self, db: &Db, fact: FactRef) -> Option<ContentId> {
-        fact_value(db, FactRefKey::new(db, fact))
+    fn value(&self, db: &Db, krate: Option<Crate>, fact: FactRef) -> Option<ContentId> {
+        fact_value(db, fact_ref_key(db, krate?, fact))
     }
 }
 
-/// A fact as the goal store keeps it, interned: the key of [`fact_value`].
+/// A fact as the goal store keeps it, with the crate that asks it where its value depends on
+/// the asker (`facts::asker`), interned: the key of [`fact_value`]. Made by [`fact_ref_key`].
 #[blaze_query::interned(debug)]
 pub struct FactRefKey<'db> {
+    /// The asking crate for a fact of which impls and traits it sees (`Implements`, `Method`,
+    /// `Vtable`); `None` for every other fact, whose value is one for every asker.
+    #[returns(copy)]
+    pub seen_by: Option<Crate>,
     #[returns(copy)]
     pub fact: FactRef,
 }
 
-/// The value of a fact now, `None` for parts that are no fact or a fact that cannot be hashed.
-/// One query, so that a body step that asks a value reads `fact_value` of that fact, never the
-/// queries the value is computed from: a reader of the step's reads names the fact exactly.
+/// The key of `fact` asked by `krate`: the asker kept only where the value depends on it, so a
+/// fact like a signature or a layout is one memo, not one per crate that asks it.
+pub fn fact_ref_key(db: &Db, krate: Crate, fact: FactRef) -> FactRefKey<'_> {
+    FactRefKey::new(db, facts::asker(krate, fact.kind), fact)
+}
+
+/// The value of a fact now as `key.seen_by` sees it (`facts::value`), `None` for parts that are
+/// no fact or a fact that cannot be hashed. One query, so that a body step that asks a value
+/// reads `fact_value` of that fact, never the queries the value is computed from: a reader of
+/// the step's reads names the fact and its asker exactly.
 #[blaze_query::tracked(returns(copy))]
 pub fn fact_value<'db>(db: &'db Db, key: FactRefKey<'db>) -> Option<ContentId> {
-    facts::value(db, &table::fact_of_ref(key.fact(db))?).ok()
+    let fact = table::fact_of_ref(key.fact(db))?;
+    // A key made other than by `fact_ref_key` (a fact asked by a crate with none) is no fact.
+    if key.seen_by(db).is_some() != facts::asked_by_crate(fact.kind()) {
+        return None;
+    }
+    facts::value_as(db, key.seen_by(db), &fact).ok()
 }
 
 /// A crate's identity and its lang items by item key: what an interner of it reads when it
 /// is made, outside a goal's evaluation. Then the crates it loads, in order, by crate key:
-/// which crates' impls a `relevant_impls` read of it searches, which its `Implements` fact,
-/// covering every crate that can implement the trait, leaves out.
+/// which crates' impls a `relevant_impls` read of it searches, the same ones its `Implements`
+/// facts cover (`facts::value` as it sees them).
 #[blaze_query::tracked(returns(copy))]
 fn goal_crate_key(db: &Db, krate: Crate) -> ContentId {
     let lang_items = lang_items(db, krate);
@@ -95,7 +115,8 @@ fn goal_crate_key(db: &Db, krate: Crate) -> ContentId {
     h.finish()
 }
 
-/// The fact a read of the query `name` (its ingredient's debug name) of `key` stands for. Each
+/// The fact a read of the query `name` (its ingredient's debug name) of `key`, made by a goal of
+/// `krate`, stands for, its value asked as `krate` sees it. Each
 /// query here is keyed by one interned or input struct, taken for one only when the key's page
 /// holds that struct, and returns part of an item's interface (its signature, bounds, fields, items,
 /// variances, attribute flags: `crate::form`'s signature form), the hidden types of an item's
@@ -107,7 +128,7 @@ fn goal_crate_key(db: &Db, krate: Crate) -> ContentId {
 /// finds the impl item of a trait item (`fetch_eligible_assoc_item`): the impl's signature form
 /// writes, for each trait item in order, the impl item that name finds, so a rename that
 /// changes what it finds changes the impl's signature.
-pub(crate) fn fact_of_read(db: &Db, name: &str, key: Id) -> Option<Fact> {
+pub(crate) fn fact_of_read(db: &Db, krate: Crate, name: &str, key: Id) -> Option<Fact> {
     let signature = |id: ItemId| Some(Fact::Signature(key::item_key(db, id)));
     match name {
         "ImplSignature::kept"
@@ -148,6 +169,13 @@ pub(crate) fn fact_of_read(db: &Db, name: &str, key: Id) -> Option<Fact> {
         | "crate_impl_predicates" => Some(facts::whole_crate(db, arg(db, key)?)),
         "relevant_impls" => {
             let read: RelevantImplsKey<'_> = arg(db, key)?;
+            // A search of a crate `krate` loads (an impl's own crate, where `specialized_ancestor`
+            // looks for the impl it specializes) covers crates `krate` loads too, as the loaded
+            // set is closed: `krate`'s fact covers it, more widely. Another crate's search may
+            // cover crates `krate` never loads: no fact.
+            if read.krate(db) != krate && !loaded_crates(db, krate).contains(&read.krate(db)) {
+                return None;
+            }
             let trait_ = read.trait_(db);
             Some(match read.self_ty(db) {
                 Some(SelfTyKey(self_ty)) => facts::implements(db, trait_, &self_ty),

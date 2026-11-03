@@ -88,15 +88,23 @@ impl Query<'_> {
         // alloc: expansion time, once per annotated item; no query runs this
         let stored_tys: Vec<&Type> = args.iter().map(|it| &it.ty.stored).collect();
 
-        // The key type, how a key is made of the arguments in `fetch`, and how `execute` and
-        // the cycle functions get the arguments back from `key`.
-        let (key_ty, key_items, make_key, unpack) = if self.direct_key() {
+        // How `write_key` shows a key ([`Function::write_key`]): each argument's `Debug`, its
+        // ID, or `_`, the first that applies to its type.
+        let key_text = quote!(use #plumbing::{KeyTextDebug as _, KeyTextId as _, KeyTextOther as _};);
+
+        // The key type, how a key is made of the arguments in `fetch`, how `execute` and the
+        // cycle functions get the arguments back from `key`, and how `write_key` shows it.
+        let (key_ty, key_items, make_key, unpack, write_key) = if self.direct_key() {
             let arg = &args[0];
             let ident = &arg.ident;
             let stored = &arg.ty.stored;
             let store = arg.ty.store(&quote!(#ident));
             let load = arg.ty.load(&quote!(key));
-            (quote!(#stored), TokenStream::new(), store, quote!(let #ident = #load;))
+            let write = quote! {
+                #key_text
+                (&&&#plumbing::KeyText(&key)).write_key(out)
+            };
+            (quote!(#stored), TokenStream::new(), store, quote!(let #ident = #load;), write)
         } else {
             let stores = args.iter().map(|it| {
                 let ident = &it.ident;
@@ -163,7 +171,30 @@ impl Query<'_> {
                     (#(#stores,)*),
                 ))
             };
-            (quote!(#key_struct), items, make, unpack)
+            let writes = (0..args.len()).map(|index| {
+                let comma = (index > 0).then(|| quote!(out.write_str(", ")?;));
+                let index = syn::Index::from(index);
+                quote! {
+                    #comma
+                    (&&&#plumbing::KeyText(&fields.#index)).write_key(out)?;
+                }
+            });
+            let write = quote! {
+                #key_text
+                let id = #db::AsId::as_id(&key);
+                #db::with_attached(|storage| match storage {
+                    ::core::option::Option::Some(storage)
+                        if #plumbing::owner_is(storage, id, &#key_ingredient) =>
+                    {
+                        let fields = #plumbing::interned_fields::<#key_struct>(storage, id);
+                        out.write_str("(")?;
+                        #(#writes)*
+                        out.write_str(")")
+                    }
+                    _ => ::core::write!(out, "{:?}", id),
+                })
+            };
+            (quote!(#key_struct), items, make, unpack, write)
         };
 
         // alloc: expansion time, once per annotated item; no query runs this
@@ -411,6 +442,13 @@ impl Query<'_> {
 
                     fn hash(value: &Self::Value) -> u64 {
                         #hash
+                    }
+
+                    fn write_key(
+                        key: Self::Key,
+                        out: &mut dyn ::core::fmt::Write,
+                    ) -> ::core::fmt::Result {
+                        #write_key
                     }
                 }
 

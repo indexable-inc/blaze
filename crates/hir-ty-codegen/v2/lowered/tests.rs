@@ -60,6 +60,7 @@ fn spec() -> Spec {
         crate::Arch::X86_64 => blaze_codegen::Arch::X86_64,
         crate::Arch::Aarch64 => blaze_codegen::Arch::Aarch64,
         crate::Arch::Wasm32 => blaze_codegen::Arch::Wasm32,
+        crate::Arch::Wasm64 => blaze_codegen::Arch::Wasm64,
     };
     let stencils = target.stencil().expect("a target with stencils");
     let library = blaze_stencil::library_id(&stencils).expect("the stencil library");
@@ -136,6 +137,7 @@ fn policy() -> Policy {
             panic: Panic::Unwind,
             packages: Default::default(),
             build_override: Override::default(),
+            stencils: false,
         },
         mode: Mode::Output,
         fold: false,
@@ -155,7 +157,7 @@ fn frontend() -> (&'static TestDB, HirFrontend<'static>) {
 
 fn frontend_of(program: &str) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(fixture::db(program).into_db()));
-    let build_time = std::sync::Arc::new(BuildTime(Default::default()));
+    let build_time = BuildTime::default();
     let frontend = HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time);
     (db, frontend.with_policy(&policy()))
 }

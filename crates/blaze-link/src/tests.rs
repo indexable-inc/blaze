@@ -699,6 +699,286 @@ fn a_removed_functions_got_cell_goes_with_it() {
     assert_eq!(b.u64_at(b.rel32(b.symbol("start2") + 3)), b.symbol("g2"), "the new cell holds the new `g`");
 }
 
+/// A vtable reached only through a GOT cell from code that goes, and naming a function that
+/// goes with that code (smallvec's `from_buf` doctest edited from comparing slices to
+/// comparing lengths: `<&i32 as Debug>::fmt` and the vtable that names it are dead with the
+/// old body). The cell is the linker's, made for the fixups that read the vtable through it,
+/// and is not a user of it: the vtable goes with the last code that read it, its cell goes
+/// with the vtable, and the relink takes the change. Data a live function still reads keeps
+/// the function it names, and removing that function is refused, naming the data.
+#[test]
+fn data_only_the_old_body_reached_goes_with_it() {
+    use crate::reloc::GotKind;
+    use crate::symbols::SymKey;
+    // `mov rax, [rip + vtable@GOTPCREL]; ret`
+    let reads = |n: u8, data: &Data| {
+        let reloc = blaze_codegen::Relocation { at: 3, kind: RelocKind::GotPcRel32, target: Target::Data(data.id), addend: -4 };
+        CompiledFunction { data: vec![data.clone()], ..function(n, &[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3], vec![reloc]) }
+    };
+    let vtable = || {
+        let fmt = blaze_codegen::Relocation { at: 8, kind: RelocKind::Abs64, target: Target::Direct(key(3)), addend: 0 };
+        Data::new(8, vec![0x5a; 16], vec![fmt].into())
+    };
+    let live = |image: &Image, data: &Data| {
+        let sym = image.symbols.find_id(&data.id).and_then(|it| image.symbols.find(SymKey::Data(it)));
+        let cell = sym.and_then(|it| image.symbols.find(SymKey::Got(GotKind::Address, it)));
+        (sym.and_then(|it| image.state.home(it)).is_some(), cell.and_then(|it| image.state.home(it)).is_some())
+    };
+    let calls = |n: u8, callee: u8| function(n, &CALLER, vec![rel32(1, Target::Direct(key(callee)))]);
+    let names = || vec![("_start".to_string(), Target::Direct(key(1)))];
+
+    // start (1) calls check (2), which reads the vtable; fmt (3) is what the vtable names.
+    let (start, check, fmt, data) = (calls(1, 2), reads(2, &vtable()), function(3, &returns(1), Vec::new()), vtable());
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    let mut disk = Disk::default();
+    let added = vec![&start, &check, &fmt];
+    let debug_names = vec![(key(1), "start".into()), (key(2), "check".into()), (key(3), "<&i32 as Debug>::fmt".into())];
+    disk.link(&mut image, Change { added, names: names(), debug_names, ..Change::default() }).unwrap();
+    let a = Linked::of(disk.file(TO));
+    let cell = a.rel32(a.symbol("check") + 3);
+    assert_eq!(a.u64_at(a.u64_at(cell) + 8), a.symbol("<&i32 as Debug>::fmt"), "the vtable names fmt");
+    assert_eq!(live(&image, &data), (true, true));
+
+    // The edit: start refilled under its own key to call check2 (4), which reads nothing;
+    // check and fmt go.
+    let (start2, check2) = (calls(1, 4), function(4, &returns(5), Vec::new()));
+    let edit = Change {
+        added: vec![&start2, &check2],
+        removed: vec![key(1), key(2), key(3)],
+        names: names(),
+        debug_names: vec![(key(4), "check2".into())],
+        ..Change::default()
+    };
+    disk.link(&mut image, edit).expect("the vtable only the old body read goes with it");
+    assert_eq!(live(&image, &data), (false, false), "the vtable and its cell are gone");
+    let b = Linked::of(disk.file(TO));
+    assert_eq!(b.rel32(b.symbol("start") + 1), b.symbol("check2"));
+
+    // The vtable comes back with two readers, check (2) and other (5). The first goes, and the
+    // second keeps the vtable, its cell and the function it names, each where it was.
+    let (check, fmt, other) = (reads(2, &vtable()), function(3, &returns(1), Vec::new()), reads(5, &vtable()));
+    let again = Change {
+        added: vec![&start, &check, &fmt, &other],
+        removed: vec![key(1), key(4)],
+        names: names(),
+        debug_names: vec![(key(5), "other".into())],
+        ..Change::default()
+    };
+    disk.link(&mut image, again).unwrap();
+    assert_eq!(live(&image, &data), (true, true));
+    let c = Linked::of(disk.file(TO));
+    let held = c.u64_at(c.rel32(c.symbol("other") + 3));
+    let start3 = calls(1, 5);
+    let one_goes = Change { added: vec![&start3], removed: vec![key(1), key(2)], names: names(), ..Change::default() };
+    disk.link(&mut image, one_goes).expect("one of two readers goes");
+    assert_eq!(live(&image, &data), (true, true), "the other reader keeps the vtable and its cell");
+    let d = Linked::of(disk.file(TO));
+    let vtable_at = {
+        let sym = image.symbols.find_id(&data.id).and_then(|it| image.symbols.find(SymKey::Data(it))).expect("the vtable");
+        let (piece, offset) = image.state.home(sym).expect("placed");
+        image.state.piece(piece).expect("live").addr + offset
+    };
+    let cell = d.rel32(d.symbol("other") + 3);
+    assert_eq!((d.u64_at(cell), held), (vtable_at, vtable_at), "other's cell holds the vtable, which stayed");
+    assert_eq!(d.u64_at(vtable_at + 8), d.symbol("<&i32 as Debug>::fmt"), "the vtable still names fmt");
+    assert_eq!(d.at(vtable_at, 8), [0x5a; 8], "the vtable's own bytes");
+    assert_eq!(d.rel32(d.symbol("start") + 1), d.symbol("other"));
+
+    // Removing fmt, which the vtable other reads still names, is refused, naming the vtable.
+    let generation = image.generation();
+    let error = image.stage(Change { removed: vec![key(3)], ..Change::default() }).unwrap_err();
+    assert!(
+        error.what.contains("`<&i32 as Debug>::fmt`") && error.what.contains("is removed") && error.what.contains("the data"),
+        "{error}"
+    );
+    assert_eq!(image.generation(), generation, "a refused stage leaves the image as it was");
+}
+
+/// An import's PLT stub and GOT cell go with the import. An edit that takes away the last
+/// call to `memcmp` (smallvec's `from_buf` doctest, which compares slices no more) leaves the
+/// name undefined, and its stub and cell, the linker's, made for the calls through them, go
+/// with it rather than relocate against a name nothing defines. A call put back makes them
+/// again.
+#[test]
+fn an_imports_stub_goes_with_its_last_caller() {
+    use crate::reloc::GotKind;
+    use crate::symbols::SymKey;
+    // `libc.so`, exporting `memcmp`, linked by the linker itself.
+    let memcmp = function(9, &returns(0), Vec::new());
+    let library = Output {
+        kind: OutputKind::Shared { name: "libc.so".into(), exports: vec!["memcmp".into()] },
+        interpreter: None,
+        ..output(false)
+    };
+    let mut lib = Image::new(name("out/libc.so"), library).unwrap();
+    let mut disk = Disk::default();
+    let names = vec![("memcmp".into(), Target::Direct(key(9)))];
+    disk.link(&mut lib, Change { added: vec![&memcmp], names, ..Change::default() }).unwrap();
+    let so: std::sync::Arc<[u8]> = contents(disk.file("out/libc.so")).into();
+
+    let live = |image: &Image| {
+        let name = image.symbols.find_name("memcmp").and_then(|it| image.symbols.find(SymKey::Name(it))).expect("memcmp named");
+        let home = |key| image.symbols.find(key).and_then(|it| image.state.home(it)).is_some();
+        (home(SymKey::Plt(name)), home(SymKey::Got(GotKind::Address, name)))
+    };
+    let calls = |n: u8, callee: Target| function(n, &CALLER, vec![rel32(1, callee)]);
+    let entry = || vec![("_start".to_string(), Target::Direct(key(1)))];
+    // start (1) calls check (2), which calls memcmp.
+    let (start, check) = (calls(1, Target::Direct(key(2))), calls(2, Target::Extern("memcmp".into())));
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    let native = Native { id: id(60), name: "libc.so", bytes: &so, kind: NativeKind::Shared { as_needed: true }, order: 0 };
+    let first = Change {
+        added: vec![&start, &check],
+        names: entry(),
+        debug_names: vec![(key(1), "start".into()), (key(2), "check".into())],
+        natives: vec![native],
+        ..Change::default()
+    };
+    disk.link(&mut image, first).unwrap();
+    assert_eq!(live(&image), (true, true), "a call to an import goes through its stub");
+
+    // start refilled to call check2 (4), which calls nothing; check goes.
+    let (start2, check2) = (calls(1, Target::Direct(key(4))), function(4, &returns(5), Vec::new()));
+    let edit = Change {
+        added: vec![&start2, &check2],
+        removed: vec![key(1), key(2)],
+        names: entry(),
+        debug_names: vec![(key(4), "check2".into())],
+        ..Change::default()
+    };
+    disk.link(&mut image, edit).expect("memcmp's stub goes with its last caller");
+    assert_eq!(live(&image), (false, false), "the stub and its cell are gone");
+    let b = Linked::of(disk.file(TO));
+    assert_eq!(b.rel32(b.symbol("start") + 1), b.symbol("check2"));
+
+    let again = Change { added: vec![&start, &check], removed: vec![key(1), key(4)], names: entry(), ..Change::default() };
+    disk.link(&mut image, again).expect("a call put back");
+    assert_eq!(live(&image), (true, true), "the stub is made again");
+    // The call reaches the new stub, which jumps through the new cell, the one the loader
+    // binds to `memcmp`.
+    let c = Linked::of(disk.file(TO));
+    let memcmp = image.symbols.find_name("memcmp").and_then(|it| image.symbols.find(SymKey::Name(it))).expect("memcmp named");
+    let at = |key: SymKey| {
+        let (piece, offset) = image.symbols.find(key).and_then(|it| image.state.home(it)).expect("placed");
+        image.state.piece(piece).expect("live").addr + offset
+    };
+    let (stub, cell) = (at(SymKey::Plt(memcmp)), at(SymKey::Got(GotKind::Address, memcmp)));
+    assert_eq!(c.rel32(c.symbol("check") + 1), stub, "check calls the new stub");
+    assert_eq!(c.at(stub, 2), [0xff, 0x25], "jmp [rip + cell]");
+    assert_eq!(c.rel32(stub + 2), cell, "the stub reads the new cell");
+    let elf = c.elf();
+    let bound: Vec<u64> = elf
+        .dynamic_relocations()
+        .expect("dynamic relocations")
+        .filter(|(_, it)| match it.target() {
+            object::RelocationTarget::Symbol(index) => {
+                use object::ObjectSymbolTable as _;
+                elf.dynamic_symbol_table().and_then(|it| it.symbol_by_index(index).ok()).and_then(|it| it.name().ok())
+                    == Some("memcmp")
+            }
+            _ => false,
+        })
+        .map(|(offset, _)| offset)
+        .collect();
+    assert_eq!(bound, [cell], "the loader binds `memcmp` in the new cell");
+}
+
+/// A thread-local static read through GOT cells of every thread-local kind goes with its last
+/// reader, and each of its cells goes with it: the initial-exec offset and the general-dynamic
+/// pair on x86-64, the initial-exec offset and the TLS descriptor on AArch64. A TLS
+/// descriptor's cell holds no fixup to the static, so only its key finds it.
+#[test]
+fn a_thread_locals_cells_of_every_kind_go_with_it() {
+    use crate::reloc::GotKind;
+    use crate::symbols::SymKey;
+    let (item, instance) = (ItemKey(id(10)), id(110));
+    let tls = Static {
+        item,
+        instance,
+        align: 8,
+        init: Init::Bytes { bytes: vec![7; 8], relocs: Vec::new().into() },
+        data: Vec::new(),
+        mutable: false,
+        thread_local: true,
+        section: None,
+        imports: Vec::new(),
+    };
+    let target = Target::Static { item, instance };
+    let at = |at: u32, kind: RelocKind, addend: i64| blaze_codegen::Relocation { at, kind, target: target.clone(), addend };
+    // `mov rax, [rip + tls@GOTTPOFF]; lea rdi, [rip + tls@TLSGD]; ret`
+    let x86 = (
+        output(true),
+        function(2, &[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0xc3], vec![
+            at(3, RelocKind::TlsGotTpOff32, -4),
+            at(10, RelocKind::TlsGd32, -4),
+        ]),
+        [GotKind::TpOff, GotKind::TlsGd],
+    );
+    // `adrp x0, :gottprel:tls; ldr x0, [x0, :gottprel_lo12:tls]; adrp x0, :tlsdesc:tls;
+    // ldr x1, [x0, :tlsdesc_lo12:tls]; add x0, x0, :tlsdesc_lo12:tls; blr x1; ret`
+    let words: [u32; 7] = [0x9000_0000, 0xf940_0000, 0x9000_0000, 0xf940_0001, 0x9100_0000, 0xd63f_0020, 0xd65f_03c0];
+    let a64 = (
+        Output {
+            arch: Arch::Aarch64,
+            interpreter: Some("/lib/ld-linux-aarch64.so.1".into()),
+            triple: "aarch64-unknown-linux-gnu".into(),
+            ..output(true)
+        },
+        CompiledFunction {
+            arch: Arch::Aarch64,
+            ..function(2, &words.iter().flat_map(|it| it.to_le_bytes()).collect::<Vec<u8>>(), vec![
+                at(0, RelocKind::TlsIePage21, 0),
+                at(4, RelocKind::TlsIeLo12, 0),
+                at(8, RelocKind::TlsDescPage21, 0),
+                at(12, RelocKind::TlsDescLd64Lo12, 0),
+                at(16, RelocKind::TlsDescAddLo12, 0),
+                at(20, RelocKind::TlsDescCall, 0),
+            ])
+        },
+        [GotKind::TpOff, GotKind::TlsDesc],
+    );
+    for (output, reader, kinds) in [x86, a64] {
+        let arch = output.arch;
+        // start (1) calls the reader (2); start2 (1, again) calls nothing.
+        let (start, start2) = match arch {
+            Arch::Aarch64 => {
+                let call = blaze_codegen::Relocation { at: 0, kind: RelocKind::Call26, target: Target::Direct(key(2)), addend: 0 };
+                let bl = [0x94, 0, 0, 0, 0xc0, 0x03, 0x5f, 0xd6];
+                let a = CompiledFunction { arch, ..function(1, &bl, vec![call]) };
+                let b = CompiledFunction { arch, key: key(3), ..function(1, &[0xc0, 0x03, 0x5f, 0xd6], Vec::new()) };
+                (a, b)
+            }
+            _ => (function(1, &CALLER, vec![rel32(1, Target::Direct(key(2)))]), function(3, &returns(0), Vec::new())),
+        };
+        let cells = |image: &Image| {
+            let sym = image.symbols.find_id(&item.0).zip(image.symbols.find_id(&instance));
+            let sym = sym.and_then(|(item, instance)| image.symbols.find(SymKey::Static(item, instance))).expect("the static");
+            GotKind::ALL
+                .into_iter()
+                .filter(|kind| image.symbols.find(SymKey::Got(*kind, sym)).and_then(|it| image.state.home(it)).is_some())
+                .collect::<Vec<_>>()
+        };
+        let mut image = Image::new(name(TO), output).unwrap();
+        let mut disk = Disk::default();
+        let names = || vec![("_start".to_string(), Target::Direct(key(1)))];
+        let change = Change { added: vec![&start, &reader], statics: vec![&tls], names: names(), ..Change::default() };
+        disk.link(&mut image, change).unwrap_or_else(|it| panic!("{arch:?}: {it}"));
+        assert_eq!(cells(&image), kinds, "{arch:?}: a cell of each kind read");
+        let edit = Change {
+            added: vec![&start2],
+            removed: vec![key(1), key(2)],
+            removed_statics: vec![(item, instance)],
+            names: vec![("_start".to_string(), Target::Direct(key(3)))],
+            ..Change::default()
+        };
+        disk.link(&mut image, edit).unwrap_or_else(|it| panic!("{arch:?}: the static goes with its last reader: {it}"));
+        let gone = image.symbols.find_id(&item.0).zip(image.symbols.find_id(&instance));
+        let gone = gone.and_then(|(item, instance)| image.symbols.find(SymKey::Static(item, instance)));
+        assert!(gone.is_none_or(|it| image.state.home(it).is_none()), "{arch:?}: the static is gone");
+        assert_eq!(cells(&image), [], "{arch:?}: every cell of it is gone");
+    }
+}
+
 #[test]
 fn slots_need_a_jump_table() {
     let (start, g) = program(Target::Direct);

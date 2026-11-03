@@ -67,7 +67,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
     if fields.is_empty() {
         return;
     }
-    let impls = hir::Impl::all_for_type(db, adt.ty(db));
+    let impls = hir::Impl::all_for_type(db, cx.krate(), adt.ty(db));
     let local_trait = impls
         .iter()
         .any(|imp| imp.trait_(db).is_some_and(|it| it.module(db).krate(db).origin(db).is_local()));

@@ -510,6 +510,18 @@ impl Exec {
         Ok(exec)
     }
 
+    /// Makes the calling thread's `MAP_JIT` pages executable, as [`JitWritable`] leaves them.
+    /// A child just forked can't count on having its parent thread's state: the kernel copies
+    /// the state it saved for that thread, which may be from inside a [`JitWritable`] that
+    /// has since ended, and then the child's first instruction fetch from these pages is a
+    /// permission fault (`SIGBUS`, ESR `0x8200000f`), seen in `blaze-stencil`'s forked runs.
+    pub(crate) fn after_fork() {
+        // SAFETY: changes only this thread's view of `MAP_JIT` pages, to executable and not
+        // writable, the state every thread runs `Exec` code in; it takes no lock and allocates
+        // nothing, so a child forked from a process of many threads may call it.
+        unsafe { libc::pthread_jit_write_protect_np(1) };
+    }
+
     pub(crate) fn code_address(&self) -> u64 {
         self.code as u64
     }

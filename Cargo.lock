@@ -601,7 +601,6 @@ dependencies = [
  "url",
  "windows-sys 0.61.2",
  "zip",
- "zstd",
 ]
 
 [[package]]
@@ -773,6 +772,7 @@ dependencies = [
  "span",
  "stdx",
  "syntax",
+ "tt",
  "unicode-ident",
  "unicode-normalization",
  "unicode-security",
@@ -816,6 +816,7 @@ dependencies = [
  "blaze-mem",
  "blaze-query",
  "blaze-registry",
+ "blaze-sha256",
  "blaze-units",
  "blaze-vfs",
  "cfg",
@@ -1170,6 +1171,7 @@ dependencies = [
  "span",
  "stdx",
  "syntax",
+ "tracing",
 ]
 
 [[package]]
@@ -1311,6 +1313,7 @@ dependencies = [
  "intern",
  "proc-macro-api",
  "span",
+ "syntax",
  "toml",
  "triomphe",
 ]
@@ -1335,6 +1338,7 @@ dependencies = [
  "blaze-units",
  "blaze-usercode",
  "blaze-vfs",
+ "blaze-wasi",
  "cfg",
  "either",
  "hir-def",
@@ -1573,6 +1577,7 @@ dependencies = [
  "blaze-units",
  "filetime",
  "flate2",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -1619,6 +1624,16 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "hegeltest",
+]
+
+[[package]]
+name = "blaze-seed-run"
+version = "0.0.0"
+dependencies = [
+ "blaze-wasi",
+ "libc",
+ "wasmtime",
+ "wat",
 ]
 
 [[package]]
@@ -1866,6 +1881,13 @@ dependencies = [
  "parking_lot",
  "serde",
  "smallvec",
+]
+
+[[package]]
+name = "blaze-wasi"
+version = "0.0.0"
+dependencies = [
+ "wasmtime",
 ]
 
 [[package]]
@@ -3456,6 +3478,7 @@ dependencies = [
  "postcard",
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
+ "rsasm",
  "rustc-demangle",
  "rustc-stable-hash",
  "rustc_abi",
@@ -4008,6 +4031,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "id-arena"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
+
+[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4328,6 +4357,13 @@ checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
 dependencies = [
  "cc",
  "cty",
+]
+
+[[package]]
+name = "libzstd-rs-sys"
+version = "0.0.1-prerelease.2"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -5390,6 +5426,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsasm"
+version = "0.1.3"
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6181,7 +6221,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6340,7 +6380,6 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
- "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -6857,6 +6896,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-metadata"
+version = "0.261.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b88de21560ecd49deb8d8f1616b9b695f66fc312c5eca503f43accdc5795339e"
+dependencies = [
+ "anyhow",
+ "indexmap",
+ "wasm-encoder 0.261.0",
+ "wasmparser 0.261.0",
+]
+
+[[package]]
 name = "wasmparser"
 version = "0.261.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6894,8 +6945,6 @@ dependencies = [
 [[package]]
 name = "wasmtime"
 version = "50.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdfacce893df54d319b29720e79edb001cd1b48faaf78fdb3b9c608eaeeea29f"
 dependencies = [
  "addr2line",
  "async-trait",
@@ -6918,6 +6967,7 @@ dependencies = [
  "target-lexicon",
  "wasmparser 0.261.0",
  "wasmtime-environ",
+ "wasmtime-internal-component-macro",
  "wasmtime-internal-core",
  "wasmtime-internal-cranelift",
  "wasmtime-internal-fiber",
@@ -6957,6 +7007,21 @@ dependencies = [
  "wasmprinter",
  "wasmtime-internal-component-util",
  "wasmtime-internal-core",
+]
+
+[[package]]
+name = "wasmtime-internal-component-macro"
+version = "50.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61479c89e12c716cc7a962e68574c01f3cf8bfd27fbeb6fc477b27b5096b8350"
+dependencies = [
+ "anyhow",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+ "wasmtime-internal-component-util",
+ "wasmtime-internal-wit-bindgen",
+ "wit-parser",
 ]
 
 [[package]]
@@ -7058,6 +7123,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "wasmtime-internal-wit-bindgen"
+version = "50.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6df6397ebf5957c9d9c6001b7d9cd1586113f3556e7d1f9e0457c7166cf0a1da"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.2",
+ "heck",
+ "indexmap",
+ "wit-component",
+ "wit-parser",
 ]
 
 [[package]]
@@ -7299,6 +7378,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "wit-component"
+version = "0.261.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2818766842bd2321074c348fb5c15d8fdb105a9eb78374e6d77c7d4127e1f2f9"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.2",
+ "indexmap",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "wasm-encoder 0.261.0",
+ "wasm-metadata",
+ "wasmparser 0.261.0",
+ "wit-parser",
+]
+
+[[package]]
+name = "wit-parser"
+version = "0.261.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "962e43c4db2da607b50839a531e5b63473268b40efdf8028d5c54b572ca4f6f6"
+dependencies = [
+ "anyhow",
+ "hashbrown 0.17.1",
+ "id-arena",
+ "indexmap",
+ "log",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "unicode-ident",
+ "wasmparser 0.261.0",
+]
+
+[[package]]
 name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7530,9 +7647,8 @@ dependencies = [
 [[package]]
 name = "zstd-sys"
 version = "2.1.2+zstd.1.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
+ "libzstd-rs-sys",
  "pkg-config",
 ]

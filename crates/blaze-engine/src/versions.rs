@@ -1,8 +1,10 @@
 //! The releases of blaze a workspace pins (`pin.rs`), fetched once into
 //! `~/.blaze/versions/<version>`: the release's archive for this host from its GitHub release,
-//! checked against the release's `B3SUMS` (BLAKE3, as `b3sum` writes it), unpacked there. The launcher asks this only when
-//! the pinned release is not there, so a pinned build reaches the network once per release.
-//! A release that can't be fetched is an error: no other blaze builds in its place.
+//! checked against every list of sums the release publishes ([`SUMS`]: `B3SUMS` and
+//! `SHA256SUMS`, as `b3sum` and `sha256sum` write them), unpacked there. The launcher asks this
+//! only when the pinned release is not there, so a pinned build reaches the network once per
+//! release. A release that can't be fetched or checked is an error: no other blaze builds in
+//! its place.
 
 use std::{
     path::{Path, PathBuf},
@@ -10,21 +12,23 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
-use blaze_registry::http::{Http as _, HttpNotSuccessful, HyperHttp, Retry};
+use blaze_registry::http::{Bounds, HttpNotSuccessful, HyperHttp, Retry};
 
 use crate::pin;
 
 /// Where the releases are: `<this>/v<version>/<asset>`.
 const RELEASES: &str = "https://github.com/indexable-inc/blaze/releases/download";
 
-/// The variable that names another place the releases are: an address laid out as
-/// [`RELEASES`], or a directory with a `v<version>` directory of each release's assets.
+/// The variable that names another place the releases are: an `https://` address laid out as
+/// [`RELEASES`], or a directory with a `v<version>` directory of each release's assets. A
+/// plain-HTTP one is refused ([`FetchError::NotHttps`]), as is a redirect to one: the sums come
+/// from the same place as the archive, so anyone on the path could change both.
 const RELEASES_FROM: &str = "BLAZE_RELEASES";
 
 /// How long one answer may take.
 const PATIENCE: Duration = Duration::from_secs(120);
 
-/// The most an archive of a release may be.
+/// The most an asset of a release may be, as sent and once decoded: reading stops there.
 const MOST: u64 = 1 << 30;
 
 /// `blaze version-fetch <version>`: has the release `version` in `~/.blaze/versions`.
@@ -45,21 +49,85 @@ pub(crate) fn fetch(version: &str) -> anyhow::Result<PathBuf> {
         return Ok(exe);
     }
     let host = hir_ty_codegen::Target::host();
-    let archive = format!("blaze-v{version}-{host}.tar.gz");
     eprintln!("blaze: fetching blaze {version} for {host}, which this workspace pins");
-    let sums = read(version, "B3SUMS")?;
-    let sums = String::from_utf8_lossy(&sums);
-    let wanted = sums.lines().find_map(|line| {
-        let (hash, name) = line.split_once(char::is_whitespace)?;
-        (name.trim_start().trim_start_matches('*') == archive).then(|| hash.to_owned())
-    });
-    let wanted = wanted.with_context(|| {
-        format!("blaze {version} has no build for {host}: its B3SUMS names no {archive}")
-    })?;
-    let bytes = read(version, &archive)?;
-    let got = blaze_format::hex::encode(&blaze_ids::b3::hash(&bytes));
-    if got != wanted {
-        bail!("{archive} of blaze {version} has BLAKE3 hash {got}, and its B3SUMS says {wanted}");
+    fetched(version, host, &exe, |name| read_at(&format!("v{version}"), name))?;
+    Ok(exe)
+}
+
+/// The lists of sums a release may publish, each a line of hex digest and archive name per
+/// archive, and the hash each is of. Every release publishes `SHA256SUMS` (what install.sh
+/// checks); those dated [`B3SUMS_SINCE`] on publish `B3SUMS` too (release.yaml). A fetch checks
+/// the archive against each one the release has, so an older release is checked by its
+/// `SHA256SUMS` and a newer one by both, and needs one at least: none is no release.
+const SUMS: [(&str, &str, fn(&[u8]) -> [u8; 32]); 2] =
+    [("B3SUMS", "BLAKE3", blaze_ids::b3::hash), ("SHA256SUMS", "SHA-256", blaze_sha256::digest)];
+
+/// The first date (`YYYYMMDD`, a version's middle number) of releases that all publish
+/// `B3SUMS`: one dated this or later without it is refused, not checked by `SHA256SUMS` alone.
+/// release.yaml publishes it since f1dbbc5ffc, on main from c0ecb0b8d5 (2026-11-01 03:56 UTC),
+/// and every tag (train_release.py, canary.yaml) is on main's head of its UTC day. No release
+/// is dated 2026-10-31 or 2026-11-01 (the newest before is 0.20261030.1), so from 20261031 on
+/// every release has it.
+const B3SUMS_SINCE: u32 = 20261031;
+
+/// Whether the release `version` (`0.YYYYMMDD.N`, which [`pin::is_version`] holds every
+/// version to, so the date is always there) is dated [`B3SUMS_SINCE`] or later.
+fn has_b3sums(version: &str) -> bool {
+    let date = version.split('.').nth(1).and_then(|it| it.parse::<u32>().ok());
+    date.is_some_and(|it| it >= B3SUMS_SINCE)
+}
+
+/// Has the release `version`'s archive for `host` unpacked where `exe` is, its assets read
+/// with `read` (`None` for one the release does not have), checked against every list of
+/// [`SUMS`] the release publishes.
+fn fetched(
+    version: &str,
+    host: &str,
+    exe: &Path,
+    read: impl Fn(&str) -> anyhow::Result<Option<Vec<u8>>>,
+) -> anyhow::Result<()> {
+    let archive = format!("blaze-v{version}-{host}.tar.gz");
+    let mut published = Vec::new(); // alloc: at most two lists, once per fetched release
+    for (list, hash, of) in SUMS {
+        let Some(text) = read(list)? else { continue };
+        let text = String::from_utf8_lossy(&text);
+        let wanted = text.lines().find_map(|line| {
+            let (digest, name) = line.split_once(char::is_whitespace)?;
+            (name.trim_start().trim_start_matches('*') == archive).then(|| digest.to_owned())
+        });
+        published.push((list, hash, of, wanted));
+    }
+    let lists = || published.iter().map(|(list, ..)| *list).collect::<Vec<_>>().join(" and "); // alloc: an error's text
+    if published.is_empty() {
+        let names = SUMS.map(|(list, ..)| list).join(" or ");
+        bail!("blaze {version} has no {names}: is {version} a release of blaze?");
+    }
+    if has_b3sums(version) && !published.iter().any(|(list, ..)| *list == "B3SUMS") {
+        bail!(
+            "blaze {version} has no B3SUMS, which every release dated {B3SUMS_SINCE} or later \
+             publishes (release.yaml): it is not checked by its {} alone",
+            lists()
+        );
+    }
+    if published.iter().all(|(.., wanted)| wanted.is_none()) {
+        bail!("blaze {version} has no build for {host}: its {} name no {archive}", lists());
+    }
+    if let Some((list, ..)) = published.iter().find(|(.., wanted)| wanted.is_none()) {
+        bail!(
+            "blaze {version}'s {} disagree: {list} names no {archive}, which the others name",
+            lists()
+        );
+    }
+    let bytes = read(&archive)?
+        .with_context(|| format!("blaze {version} has no {archive}, which its {} name", lists()))?;
+    for (list, hash, of, wanted) in &published {
+        let wanted = wanted.as_deref().unwrap_or_default();
+        let got = blaze_format::hex::encode(&of(&bytes));
+        if !got.eq_ignore_ascii_case(wanted) {
+            bail!(
+                "{archive} of blaze {version} has {hash} hash {got}, and its {list} says {wanted}"
+            );
+        }
     }
     let dir = exe.parent().context("a release in no directory")?;
     unpacked(&bytes, dir, &format!("blaze-v{version}-{host}"))
@@ -67,7 +135,7 @@ pub(crate) fn fetch(version: &str) -> anyhow::Result<PathBuf> {
     if !exe.is_file() {
         bail!("{archive} of blaze {version} has no `blaze`");
     }
-    Ok(exe)
+    Ok(())
 }
 
 /// `blaze pin`: this blaze's version under `[workspace.metadata.blaze]` in the workspace's
@@ -117,13 +185,11 @@ fn pinned_in(doc: &mut toml_edit::DocumentMut, version: &str) -> anyhow::Result<
     Ok(())
 }
 
-/// For `blaze --version`: which blaze this is, and why it is the one that runs.
-pub(crate) fn why_this_one() -> String {
+/// For `blaze --version`: which blaze this is, and why it is the one that runs (`given`:
+/// [`pin::IGNORE_PIN`] was given here; [`pin::ignores`]).
+pub(crate) fn why_this_one(given: bool) -> String {
     let this = std::env::current_exe()
         .map_or_else(|_| "this blaze".to_owned(), |it| it.display().to_string());
-    if let Some(by) = std::env::var_os(pin::PINNED_BY) {
-        return format!("{this}, as {} pins it", Path::new(&by).display());
-    }
     let ours = pin::OURS;
     let found = std::env::current_dir()
         .map_err(pin::PinError::NoWorkingDirectory)
@@ -134,10 +200,28 @@ pub(crate) fn why_this_one() -> String {
         Err(why) => return format!("{this}: {why}"),
     };
     let shown = manifest.display();
+    if pin::names(std::env::var_os(pin::PINNED_BY).as_deref(), &manifest) {
+        return format!("{this}, as {shown} pins it");
+    }
+    let ignore = pin::ignores(given, &manifest);
     match pin::pinned(&manifest) {
-        Ok(Some(wanted)) if wanted == ours => format!("{this}, as {shown} pins it"),
         Ok(Some(wanted)) => {
-            format!("{this}, run itself: {shown} pins blaze {wanted}, which `blaze` runs there")
+            let pinned = pin::pinned_text(&wanted);
+            match pin::choose(ours, &manifest, &wanted, ignore) {
+                Ok(pin::Choice::Pinned) => format!("{this}, as {shown} pins it"),
+                Ok(pin::Choice::Ignored) => format!(
+                    "{this}, as `{}` says, in place of {pinned}, which {shown} pins",
+                    pin::IGNORE_PIN
+                ),
+                Ok(pin::Choice::OwnTree) => format!(
+                    "{this}, a build of blaze's source tree, which builds blaze's tree in place \
+                     of {pinned}, which {shown} pins"
+                ),
+                Ok(pin::Choice::Release | pin::Choice::ReleaseForTree) => {
+                    format!("{this}, run itself: {shown} pins {pinned}, which `blaze` runs there")
+                }
+                Err(why) => format!("{this}: {why}"),
+            }
         }
         Ok(None) => format!(
             "{this}, as {shown} pins none (`[workspace.metadata.blaze] version`, which \
@@ -147,12 +231,6 @@ pub(crate) fn why_this_one() -> String {
     }
 }
 
-/// The asset `name` of the release `version`.
-fn read(version: &str, name: &str) -> anyhow::Result<Vec<u8>> {
-    let read = read_at(&format!("v{version}"), name)?;
-    read.with_context(|| format!("blaze {version} has no {name}: is {version} a release of blaze?"))
-}
-
 /// The asset `name` of the release tagged `tag`, `None` when it has none.
 fn read_at(tag: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
     let given = match std::env::var(RELEASES_FROM) {
@@ -160,6 +238,11 @@ fn read_at(tag: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
         Err(std::env::VarError::NotPresent) => None,
         Err(std::env::VarError::NotUnicode(value)) => return Err(FetchError::ReleasesNotText(value).into()),
     };
+    if let Some(given) =
+        given.as_ref().filter(|it| it.contains("://") && !it.starts_with("https://"))
+    {
+        return Err(FetchError::NotHttps(given.clone()).into());
+    }
     if let Some(dir) = given.as_ref().filter(|it| !it.contains("://")) {
         let file = Path::new(dir).join(tag).join(name);
         return match std::fs::read(&file) {
@@ -171,12 +254,10 @@ fn read_at(tag: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
     let base = given.unwrap_or_else(|| RELEASES.to_owned());
     let address = url::Url::parse(&format!("{}/{tag}/", base.trim_end_matches('/')))?.join(name)?;
     let http = HyperHttp::new(PATIENCE)?;
-    let answer = Retry::default().run(|| http.get(address.as_str(), &[]))?;
+    let bounds = Bounds { most: MOST, https_only: true };
+    let answer = Retry::default().run(|| http.get_bounded(address.as_str(), &[], bounds))?;
     match answer.status {
         404 => Ok(None),
-        200..300 if answer.body.len() as u64 > MOST => {
-            bail!("{address} is {} bytes, more than the {MOST} a release's asset may be", answer.body.len())
-        }
         200..300 => Ok(Some(answer.body)),
         _ => Err(HttpNotSuccessful::new(address.as_str(), &answer).into()),
     }
@@ -222,6 +303,8 @@ pub(crate) fn resolve(channel: &str) -> anyhow::Result<String> {
 enum FetchError {
     /// [`RELEASES_FROM`] is set to what is not text.
     ReleasesNotText(std::ffi::OsString),
+    /// [`RELEASES_FROM`] is set to an address that is not `https://`.
+    NotHttps(String),
     /// No home directory, where blaze keeps releases and what a channel named.
     NoHome,
     /// What a channel names can't be kept where the launcher reads it.
@@ -236,6 +319,11 @@ impl std::fmt::Display for FetchError {
             FetchError::ReleasesNotText(value) => {
                 write!(f, "`{RELEASES_FROM}` is {value:?}, which is not text: it names an address or a directory")
             }
+            FetchError::NotHttps(given) => write!(
+                f,
+                "`{RELEASES_FROM}` is {given}, which is not an https:// address or a directory: \
+                 a release and its sums come from there together, so they are fetched over HTTPS only"
+            ),
             FetchError::NoHome => f.write_str(
                 "blaze keeps releases and what a channel names in .blaze in your home directory, \
                  and there is none (`BLAZE_HOME` names where)",
@@ -299,6 +387,83 @@ mod tests {
             doc.to_string(),
             "[package]\nname = \"a\"\n\n[workspace.metadata.blaze]\nversion = \"0.1.0\"\n"
         );
+    }
+
+    /// A pinned release is checked by every list of sums it publishes: one from before
+    /// `B3SUMS` by its `SHA256SUMS`, a newer one by both; a wrong hash in either, a list that
+    /// leaves the archive out, or no list at all is refused and nothing is unpacked.
+    #[test]
+    fn a_pinned_release_is_checked_by_every_sum_it_publishes() {
+        let root = std::env::temp_dir().join(format!("blaze-versions-sums-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let host = "x86_64-unknown-linux-gnu";
+        let top = format!("blaze-v0.1.0-{host}");
+        let archive = format!("{top}.tar.gz");
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(3);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar.append_data(&mut header, format!("{top}/blaze"), &b"run"[..]).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &tar.into_inner().unwrap()).unwrap();
+        let bytes = gz.finish().unwrap();
+        let sha = blaze_format::hex::encode(&blaze_sha256::digest(&bytes));
+        let b3 = blaze_format::hex::encode(&blaze_ids::b3::hash(&bytes));
+        let wrong = "0".repeat(64);
+        let line =
+            |digest: &str| Some(format!("{digest}  {archive}\nffff  blaze-v0.1.0-other.tar.gz\n"));
+        let run = |case: &str, b3sums: Option<String>, sha256sums: Option<String>| {
+            let exe = root.join(case).join("versions/0.1.0/blaze");
+            let got = fetched("0.1.0", host, &exe, |name| {
+                Ok(match name {
+                    "B3SUMS" => b3sums.clone().map(String::into_bytes),
+                    "SHA256SUMS" => sha256sums.clone().map(String::into_bytes),
+                    it if it == archive => Some(bytes.clone()),
+                    _ => None,
+                })
+            });
+            (got.map_err(|error| format!("{error:#}")), exe.is_file())
+        };
+        // A release from before B3SUMS: its SHA256SUMS checks it.
+        assert_eq!(run("sha-only", None, line(&sha)), (Ok(()), true));
+        let (got, unpacked) = run("sha-wrong", None, line(&wrong));
+        assert!(got.unwrap_err().contains("SHA-256 hash") && !unpacked);
+        // A newer release: both are checked, each on its own.
+        assert_eq!(run("both", line(&b3), line(&sha)), (Ok(()), true));
+        let (got, unpacked) = run("both-sha-wrong", line(&b3), line(&wrong));
+        assert!(got.unwrap_err().contains("its SHA256SUMS says") && !unpacked);
+        let (got, unpacked) = run("both-b3-wrong", line(&wrong), line(&sha));
+        assert!(got.unwrap_err().contains("its B3SUMS says") && !unpacked);
+        let (got, unpacked) = run("b3-leaves-it-out", Some(String::new()), line(&sha));
+        assert!(got.unwrap_err().contains("B3SUMS names no") && !unpacked);
+        let (got, unpacked) = run("none", None, None);
+        assert!(got.unwrap_err().contains("has no B3SUMS or SHA256SUMS") && !unpacked);
+        let (got, _) = run("no-host", Some(String::new()), Some(String::new()));
+        assert!(got.unwrap_err().contains("has no build for x86_64-unknown-linux-gnu"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A release dated after `B3SUMS` began that lacks it is refused, naming it, rather than
+    /// checked by `SHA256SUMS` alone; one from before is checked by what it has.
+    #[test]
+    fn a_release_dated_after_b3sums_began_needs_them() {
+        assert!(
+            !has_b3sums("0.20261030.1") && has_b3sums("0.20261031.0") && has_b3sums("0.20270101.3")
+        );
+        let exe = std::env::temp_dir()
+            .join(format!("blaze-versions-b3-{}", std::process::id()))
+            .join("versions/0.20261102.0/blaze");
+        let got = fetched("0.20261102.0", "x86_64-unknown-linux-gnu", &exe, |name| {
+            Ok((name == "SHA256SUMS")
+                .then(|| b"00  blaze-v0.20261102.0-x86_64-unknown-linux-gnu.tar.gz\n".to_vec()))
+        });
+        let said = format!("{:#}", got.unwrap_err());
+        assert!(
+            said.contains("blaze 0.20261102.0 has no B3SUMS") && said.contains("20261031"),
+            "{said}"
+        );
+        assert!(!exe.exists());
     }
 
     #[test]

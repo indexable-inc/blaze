@@ -802,7 +802,7 @@ pub(super) struct Pointee {
     pub(super) align: u64,
 }
 
-/// The value of a static rustc exports no symbol for.
+/// The value of a static with an initializer (`compiled_static`).
 #[derive(PartialEq, Hash)]
 pub struct CompiledStatic {
     pub(super) requests: Requests,
@@ -833,7 +833,8 @@ pub(super) struct Inlinable {
     pub(super) pointees: Vec<(u32, Pointee)>,
     /// The bodies of what it calls that LLVM is shown, as [`Recorder::seen`].
     pub(super) seen: Vec<Seen>,
-    /// The instances whose bodies it has in it, as [`Recorder::built_in`].
+    /// The instances whose bodies it has in it: as [`Recorder::built_in`], and those the MIR
+    /// inliner put in its body (`built_in_body`).
     pub(super) built_in: Vec<Instance>,
 }
 
@@ -909,6 +910,11 @@ pub(super) struct Recorder<'db> {
     /// its `-C debug-assertions` and panic strategy in place of the crate's, and no callee's
     /// body built in, which the unit's key would not name. `None` outside a v2 unit.
     pub(super) unit: Option<super::v2::build::Build>,
+    /// What the compile it is built for may build in and has built in so far
+    /// ([`super::tier::Inlining`]): its own, moved in by `compile_as` and into the `Recorder`
+    /// of each body it builds in, and back out. `None` for a compile that builds nothing in,
+    /// and for every query's, whose result must not depend on what a compile builds in.
+    pub(super) inlining: Option<super::tier::Inlining>,
     /// What it asks for, which is all a producer of its code needs of this.
     pub(super) wants: Wants,
     /// The places in `wants.requests.datas` of the vtables, by the hash of their key
@@ -1484,6 +1490,7 @@ impl<'db> Recorder<'db> {
             target,
             checked,
             unit,
+            inlining: None,
             wants: Wants::new(target, isa),
             vtables: HashTable::new(),
             statics: HashMap::new_in(Global),

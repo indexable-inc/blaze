@@ -36,7 +36,7 @@ use blaze_mem::Tag;
 use parking_lot::Mutex;
 
 use super::{
-    dense::{Dense, Heap, MAX_ALIGN},
+    dense::{Heap, MAX_ALIGN, Whole},
     id::{Id, MAX_PAGES, PAGE_LEN},
 };
 
@@ -158,18 +158,25 @@ impl<V> Row<V> {
 }
 
 /// An ingredient's rows: one page of [`PAGE_LEN`] rows of `size` bytes per ID page that has
-/// any, found through a directory committed whole (one load, no bounds load).
+/// any, found through a directory readable at every ID page (one load, no bounds load), of
+/// which only the entries written are committed.
 pub(crate) struct Pages {
-    dir: Dense<AtomicPtr<u8>>,
+    dir: Whole<AtomicPtr<u8>, MAX_PAGES>,
     grow: Mutex<()>,
 }
 
 impl Pages {
     pub(crate) fn new(tag: Tag) -> Pages {
-        Pages { dir: Dense::committed(MAX_PAGES, tag), grow: Mutex::new(()) }
+        Pages { dir: Whole::sparse(tag, "an ingredient's row page directory"), grow: Mutex::new(()) }
     }
 
-    /// The directory's first entry, for a hit path that indexes from it.
+    /// The directory's first entry, for a hit path that indexes from it: the directory is a
+    /// [`Whole`] column of `MAX_PAGES` entries, a sparse reservation readable and writable whole
+    /// from [`Pages::new`] until the `Pages` is dropped (`Dense::sparse`'s invariant), so
+    /// `dir.add(i)` is a valid entry for every `i < MAX_PAGES`, such as any `Id`'s `page()`
+    /// (masked below `MAX_PAGES`): null until [`Pages::page_or_make`] commits and stores it.
+    /// The unchecked reads in `function::fetch`, `function::member_header` and
+    /// `verify::function_header` rest on this.
     #[inline(always)]
     pub(crate) fn dir(&self) -> NonNull<AtomicPtr<u8>> {
         self.dir.base()
@@ -201,7 +208,7 @@ impl Pages {
         let at = heap.alloc(PAGE_LEN * size, align.max(8));
         // Release: a reader that loads the page sees its zeroes, and whatever the maker
         // writes into its rows before publishing them on its own.
-        self.dir.get(page).store(at.as_ptr(), Ordering::Release);
+        self.dir.get_to_write(page).store(at.as_ptr(), Ordering::Release);
         at
     }
 
@@ -218,7 +225,7 @@ impl Pages {
     }
 
     /// Every made page's index and base, in ID-page order: for sweeps, compaction and drop,
-    /// under `&mut` of the storage.
+    /// under `&mut` of the storage. Past the directory's committed prefix nothing was stored.
     pub(crate) fn made(&self, pages: usize) -> impl Iterator<Item = (usize, NonNull<u8>)> + '_ {
         (0..pages.min(self.dir.len())).filter_map(|page| {
             NonNull::new(self.dir.get(page).load(Ordering::Relaxed)).map(|at| (page, at))
@@ -259,4 +266,4 @@ pub(crate) unsafe fn header_at<'a>(page: NonNull<u8>, slot: usize, size: usize) 
 }
 
 /// A column of one `AtomicU32` per ID page: the ingredient owning it (0 for none).
-pub(crate) type Owners = Dense<AtomicU32>;
+pub(crate) type Owners = Whole<AtomicU32, MAX_PAGES>;

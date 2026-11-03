@@ -175,45 +175,43 @@ fn encode_site(site: Site) -> (u8, u8, u64, u32) {
 fn decode<'a>(row: &'a WfRow, buffer: &'a [u8]) -> Result<WfDiagnosticRef<'a>, FormatError> {
     let at = (row as *const WfRow as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
     let invalid = |what| FormatError::Invalid { at, what };
-    if row.id == 0 || row.id > u64::from(u32::MAX) {
-        return Err(invalid("an id of 0 or wider than 32 bits"));
-    }
-    fn id<T: FromId>(bits: u64) -> T {
-        T::from_id(blaze_query::db::Id::from_u32(bits as u32))
+    let query_id = blaze_query::db::Id::decode(row.id, at, "a well-formedness site's id")?;
+    fn id<T: FromId>(id: blaze_query::db::Id) -> T {
+        T::from_id(id)
     }
     let (site, def, code) = (row.kind & 0xff, (row.kind >> 8) & 0xff, row.kind >> 16);
     let bad_def = || invalid("a well-formedness site of an unknown definition kind");
     let site = match site {
         0 => {
             let variant = match def {
-                0 => VariantId::EnumVariantId(id::<EnumVariantId>(row.id)),
-                1 => VariantId::StructId(id::<StructId>(row.id)),
-                2 => VariantId::UnionId(id::<UnionId>(row.id)),
+                0 => VariantId::EnumVariantId(id::<EnumVariantId>(query_id)),
+                1 => VariantId::StructId(id::<StructId>(query_id)),
+                2 => VariantId::UnionId(id::<UnionId>(query_id)),
                 _ => return Err(bad_def()),
             };
             Site::Field(variant, Idx::from_raw(RawIdx::from(row.index)))
         }
-        1 => Site::AssocType(id::<TypeAliasId>(row.id)),
-        2 => Site::ImplTrait(id::<ImplId>(row.id)),
+        1 => Site::AssocType(id::<TypeAliasId>(query_id)),
+        2 => Site::ImplTrait(id::<ImplId>(query_id)),
         3 => {
             let def = match def {
-                0 => GenericDefId::AdtId(AdtId::StructId(id::<StructId>(row.id))),
-                1 => GenericDefId::AdtId(AdtId::UnionId(id::<UnionId>(row.id))),
-                2 => GenericDefId::AdtId(AdtId::EnumId(id::<EnumId>(row.id))),
-                3 => GenericDefId::ConstId(id::<ConstId>(row.id)),
-                4 => GenericDefId::FunctionId(id::<FunctionId>(row.id)),
-                5 => GenericDefId::ImplId(id::<ImplId>(row.id)),
-                6 => GenericDefId::StaticId(id::<StaticId>(row.id)),
-                7 => GenericDefId::TraitId(id::<TraitId>(row.id)),
-                8 => GenericDefId::TypeAliasId(id::<TypeAliasId>(row.id)),
+                0 => GenericDefId::AdtId(AdtId::StructId(id::<StructId>(query_id))),
+                1 => GenericDefId::AdtId(AdtId::UnionId(id::<UnionId>(query_id))),
+                2 => GenericDefId::AdtId(AdtId::EnumId(id::<EnumId>(query_id))),
+                3 => GenericDefId::ConstId(id::<ConstId>(query_id)),
+                4 => GenericDefId::FunctionId(id::<FunctionId>(query_id)),
+                5 => GenericDefId::ImplId(id::<ImplId>(query_id)),
+                6 => GenericDefId::StaticId(id::<StaticId>(query_id)),
+                7 => GenericDefId::TraitId(id::<TraitId>(query_id)),
+                8 => GenericDefId::TypeAliasId(id::<TypeAliasId>(query_id)),
                 _ => return Err(bad_def()),
             };
             Site::Bound(def, row.index)
         }
-        4 => Site::Opaque(id::<FunctionId>(row.id), row.index),
-        5 => Site::Param(id::<FunctionId>(row.id), row.index),
-        6 => Site::Output(id::<FunctionId>(row.id)),
-        7 => Site::SelfTy(id::<ImplId>(row.id)),
+        4 => Site::Opaque(id::<FunctionId>(query_id), row.index),
+        5 => Site::Param(id::<FunctionId>(query_id), row.index),
+        6 => Site::Output(id::<FunctionId>(query_id)),
+        7 => Site::SelfTy(id::<ImplId>(query_id)),
         _ => return Err(invalid("a well-formedness site of an unknown variant")),
     };
     let code =
@@ -290,6 +288,49 @@ mod tests {
             diagnostics: vec![WfDiagnostic { code: "E0310", message: "m".to_owned(), site }],
         };
         assert_eq!(to_bytes(&result), to_bytes(&result.clone()));
+    }
+
+    /// rule 23: a restored row whose id word is corrupt (0, past `Id::MAX_U32`, past 32 bits)
+    /// is the row's typed error naming the byte and the word, never a panic in `Id::from_u32`.
+    #[test]
+    fn a_corrupt_persisted_id_is_a_typed_error_naming_its_bits() {
+        use blaze_format::FormatError;
+        use blaze_query::db::Id;
+
+        let function: FunctionId = id(5);
+        let site = Site::Output(function);
+        let result = WfResult {
+            diagnostics: vec![WfDiagnostic { code: "E0310", message: "m".to_owned(), site }],
+        };
+        let written = to_bytes(&result);
+        let word = u64::from(blaze_query::db::AsId::as_id(&function).as_u32()).to_ne_bytes();
+        // alloc: a test's list of matches
+        let places: Vec<usize> =
+            written.windows(8).enumerate().filter(|(_, it)| *it == word).map(|(at, _)| at).collect();
+        let [place] = places[..] else { panic!("the id's word is in the buffer once: {places:?}") };
+        // The error names the row's byte, the id's word being its field.
+        let at = place - std::mem::offset_of!(super::WfRow, id);
+        let max = u64::from(Id::MAX_U32);
+        for bad in [max + 1, u64::from(u32::MAX), 1 << 32, u64::MAX, 0] {
+            let mut bytes = written.clone();
+            bytes[place..place + 8].copy_from_slice(&bad.to_ne_bytes());
+            let bytes = Aligned::copy_from(&bytes);
+            let read = WfResult::read(&bytes).expect("only the row is corrupt");
+            let error = read.to_result().expect_err("a corrupt id");
+            let want = match bad {
+                0 => FormatError::Zero { at: at as u64, what: "a well-formedness site's id" },
+                _ => FormatError::Bound {
+                    at: at as u64,
+                    what: "a well-formedness site's id",
+                    found: bad,
+                    bound: max,
+                },
+            };
+            assert_eq!(error, want, "the word {bad}");
+            if bad != 0 {
+                assert!(error.to_string().contains(&bad.to_string()), "names the word: {error}");
+            }
+        }
     }
 
     #[test]

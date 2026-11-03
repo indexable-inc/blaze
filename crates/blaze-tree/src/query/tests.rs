@@ -53,6 +53,7 @@ fn open(db: &Database, tree: &MemTree, files: &[(&str, &str)]) -> ViewId {
         library: "/rustc/0/library".to_owned(),
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
+        sources: "/s/sources".to_owned(),
     };
     db.open_with(View { root: tree.root(&files) }, &config.encode())
 }

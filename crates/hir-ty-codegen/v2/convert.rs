@@ -90,7 +90,7 @@ pub(crate) fn function(
     side: Option<ContentId>,
     wasm: &super::wasm::Header,
 ) -> Result<CompiledFunction, String> {
-    let is_wasm = arch == Arch::Wasm32;
+    let is_wasm = arch.is_wasm();
     let moved = if is_wasm {
         let (bytes, moved) = super::wasm::with_header(std::mem::take(&mut code.bytes), wasm)?;
         code.bytes = bytes;
@@ -201,6 +201,13 @@ pub(crate) fn names(
             names.push(None);
             continue;
         }
+        // A wasm instruction Cranelift has no opcode for (`memory.grow` of an `i64`, a vector
+        // instruction): wasm's lowering turns each call of it into the instruction, so it is
+        // no target of the build. On any other arch it is refused by `reloc_target`.
+        if name.namespace == crate::wasm::INSTRUCTION && arch.is_wasm() {
+            names.push(None);
+            continue;
+        }
         let name = RelocName::user(name.namespace, name.index);
         names.push(Some(reloc_target(key, name, requests, &datas, resolve)?));
     }
@@ -267,6 +274,7 @@ pub(crate) fn word(arch: Arch) -> Word {
     match arch {
         Arch::X86_64 | Arch::Aarch64 => Word { size: 8, data: RelocKind::Abs64, func: RelocKind::Abs64 },
         Arch::Wasm32 => Word { size: 4, data: RelocKind::WasmMemory, func: RelocKind::WasmTable },
+        Arch::Wasm64 => Word { size: 8, data: RelocKind::WasmMemory64, func: RelocKind::WasmTable64 },
     }
 }
 

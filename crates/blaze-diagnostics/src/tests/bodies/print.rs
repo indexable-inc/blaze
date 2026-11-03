@@ -252,3 +252,40 @@ fn main() {
         ["closure", "fn item", "struct constructor", "fn pointer", "type"]
     );
 }
+
+fn printed_untrimmed(fixture: &str) -> Vec<String> {
+    each_let(fixture, |cx, ty| print::ty_untrimmed(cx, ty))
+}
+
+#[test]
+fn an_item_in_an_unnamed_const_is_printed_under_an_underscore() {
+    // synstructure wraps every impl it writes in `const _: () = { .. };` (rustc_type_ir's and
+    // vir's derives): rustc's path segment of an unnamed const is `_` (`DefPathData::ValueNs`),
+    // and printing a path through it panicked.
+    let fixture = "//- /main.rs crate:other:main edition:2021
+struct S;
+const _: () = {
+    impl S { fn m(&self) {} }
+    struct In;
+    fn f() { let i = In; }
+};
+
+fn main() {
+    let c = S::m;
+}
+";
+    assert_eq!(printed_untrimmed(fixture), ["_::In", "fn(&S) {_::<impl S>::m}"]);
+}
+
+#[test]
+fn an_item_in_a_block_with_no_body_owner_still_prints() {
+    // A block in a struct's array length has no function, const or static around it (rustc's
+    // `{constant#N}`); printing an item in it panicked as a definition with no parent.
+    let fixture = "//- /main.rs crate:other:main edition:2021
+struct A([u8; { struct I; let i = I; 1 }]);
+fn main() {}
+";
+    let printed = printed_untrimmed(fixture);
+    assert_eq!(printed.len(), 1);
+    assert!(printed[0].ends_with('I'), "{printed:?}");
+}

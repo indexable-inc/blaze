@@ -1572,3 +1572,45 @@ fn f(x: u32) -> (r: u32) requires x < 10 ensures r > x { x + 1 }
     assert!(printed.contains("r > x"), "the ensures is checked: {printed}");
     assert!(printed.contains("f("), "`f` is called: {printed}");
 }
+
+/// rustc's `lower_maybe_coroutine_body` wraps only a body that is written: a required `async fn`
+/// of a trait (`TraitFn::Required`) makes no `async` block around a missing body, so nothing
+/// infers, lowers to MIR or hashes one. It did, and the build of `blaze-resolve` stopped at
+/// `Registry::query` ("MIR that failed to lower"): the block's MIR asks for the trait method's
+/// body. A provided `async fn` still is its coroutine.
+#[test]
+fn a_required_async_trait_method_makes_no_coroutine() {
+    let db = fixture::db(
+        r#"
+//- /main.rs edition:2024
+trait Registry {
+    async fn query(&self, x: u32, f: &mut impl FnMut(u32)) -> Result<(), ()>;
+    async fn provided(&self, x: u32) -> u32 { x }
+}
+"#,
+    )
+    .into_db();
+    let def_map = crate_def_map(&db, db.fetch_test_crate());
+    let module = def_map.modules(&db).next().expect("the crate root").1;
+    let trait_ = module
+        .scope(&db)
+        .declarations()
+        .find_map(|decl| match decl {
+            ModuleDefId::TraitId(it) => Some(it),
+            _ => None,
+        })
+        .expect("`Registry`");
+    let coroutines = |name: &str| {
+        let method = Name::new_symbol_root(intern::Symbol::intern(name));
+        let func = trait_.trait_items(&db).method_by_name(&method).expect(name);
+        round_trip(&db, func.into());
+        let body = Body::of(&db, func.into());
+        body.exprs()
+            .filter(|(_, expr)| {
+                matches!(expr, Expr::Closure { closure_kind: crate::hir::ClosureKind::Coroutine { .. }, .. })
+            })
+            .count()
+    };
+    assert_eq!(coroutines("query"), 0, "a required `async fn` has no body to wrap");
+    assert_eq!(coroutines("provided"), 1, "a provided `async fn` is its coroutine");
+}

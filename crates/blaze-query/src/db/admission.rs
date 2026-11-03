@@ -166,18 +166,16 @@ pub(crate) fn window(cap: usize) -> usize {
 /// `cap` [`Eviction::Recency`] would have kept (admissions the frequency rule refused). The
 /// window keeps the most recent; the rest of the cap goes by frequency, the older winning a
 /// tie, so a candidate replaces a victim only when asked for in more views. The result depends
-/// only on the set of values, never on their order coming in.
+/// only on the set of values, never on their order coming in, at or under the cap too: every
+/// call orders them, so no order coming in leaks out.
 pub(crate) fn plan(values: &mut [Held], cap: usize) -> usize {
-    if values.len() <= cap {
-        return 0;
-    }
     values.sort_unstable_by_key(|it| (Reverse(it.view), it.key));
     for (at, value) in values.iter_mut().enumerate() {
         value.recent = at < cap;
     }
-    let window = window(cap);
+    let window = window(cap).min(values.len());
     values[window..].sort_unstable_by_key(|it| (Reverse(it.frequency), it.view, it.key));
-    values[cap..].iter().filter(|it| it.recent).count()
+    values.get(cap..).unwrap_or_default().iter().filter(|it| it.recent).count()
 }
 
 #[cfg(test)]
@@ -301,6 +299,17 @@ mod tests {
         assert!(sketch.age_if_due(), "10 000 increments age a sketch of cap 1000");
         assert!(sketch.estimate(7) >= MAX_COUNT / 2);
         assert!(!sketch.age_if_due());
+    }
+
+    #[test]
+    fn a_plan_at_the_cap_orders_the_values_whatever_their_order_coming_in() {
+        let forward = [Held::new(1, 0, 0), Held::new(1, 1, 0), Held::new(2, 2, 3)];
+        let mut backward = forward;
+        backward.reverse();
+        let mut forward = forward;
+        assert_eq!(plan(&mut forward, 3), 0);
+        assert_eq!(plan(&mut backward, 3), 0);
+        assert_eq!(forward, backward, "the order coming in does not leak out at the cap");
     }
 
     #[test]

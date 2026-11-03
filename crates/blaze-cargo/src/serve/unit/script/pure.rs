@@ -134,6 +134,14 @@ pub(crate) fn built_nothing(job: &Job, unit: usize) -> bool {
     !verifies(job).unwrap_or(true) && !super::rechecks(job).unwrap_or(true) && of(job, unit).is_some_and(Pure::all_hit)
 }
 
+/// The most rows of the front end a build script's purity proof brings up to date (each run or
+/// verified, each time it is reached) before it stops with an error naming the script: what
+/// bounds a proof whose verification would not end (rule 15). How many a proof spent is the
+/// `steps` field of its `build script proof` span: the margin under this bound is read from
+/// the profiles (no real proof's count is quoted here yet). Only rows this task brings up to
+/// date count, so a cold database or less concurrency spends more.
+const PROOF_FUEL: u64 = 1 << 25;
+
 fn work_out(job: &Job, reader: &UnitReader, compile: usize) -> Result<Purity, ApiError> {
     let db = reader.db();
     let krate = job.crates.krate(compile).ok_or(UnitError::NoCrate { unit: compile })?;
@@ -143,8 +151,21 @@ fn work_out(job: &Job, reader: &UnitReader, compile: usize) -> Result<Purity, Ap
     let purity = {
         // The walk from `main` over every instance it reaches: the part of the span above
         // that is not the store's lookups below.
-        let _span = tracing::info_span!(target: "blaze", "build script proof").entered();
-        hir_ty::attach_db(db, || hir_ty_pure::script_purity(db, main))
+        let span = tracing::info_span!(target: "blaze", "build script proof", steps = tracing::field::Empty).entered();
+        let proof = blaze_query::db::with_fuel(PROOF_FUEL, || hir_ty::attach_db(db, || hir_ty_pure::script_purity(db, main)));
+        let proof = proof.map(|(purity, steps)| {
+            span.record("steps", steps);
+            purity
+        });
+        proof.map_err(|out| {
+            let unit = job.unit(compile);
+            let script = unit.as_ref().map_or_else(|it| it.what.clone(), |it| format!("`{}` of `{}`", it.target.name, it.pkg_id)); // alloc: an error, once
+            let what = format!(
+                "the purity proof of the build script {script} (`script_purity` of its `main`) did not end: it {out}, \
+                 past the bound of {PROOF_FUEL} rows a proof may bring up to date (rule 15)"
+            ); // alloc: an error, once
+            ApiError::new(what, unit.ok().map(|it| it.pkg_id.clone())) // clone: an error, once
+        })?
     };
     let proved = match purity {
         hir_ty_pure::Purity::Pure(proved) => proved,

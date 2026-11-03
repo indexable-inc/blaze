@@ -383,24 +383,6 @@ pub(crate) struct Judged {
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
-/// A process's end as an `ExitStatus`, for cargo's text of it.
-fn status(code: Option<i32>, signal: Option<i32>) -> std::process::ExitStatus {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        match (code, signal) {
-            (_, Some(signal)) => std::process::ExitStatus::from_raw(signal & 0x7f),
-            (Some(code), None) => std::process::ExitStatus::from_raw((code & 0xff) << 8),
-            (None, None) => std::process::ExitStatus::from_raw(0x7f),
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(code.unwrap_or(1) as u32)
-    }
-}
-
 /// What a sandboxed script may print, checked before cargo reads it
 /// ([`crate::directives`]); `None` when it may print it all.
 pub(crate) fn refused(unit: &bs::Unit, stdout: &[u8], link_dirs: &[PathBuf]) -> Option<String> {
@@ -443,7 +425,7 @@ pub(crate) fn judge(
         };
         say::cargo(Level::Error, what, of.clone(), color)
     };
-    let status = status(value.code, value.signal);
+    let status = blaze_build_script::run::Ended { code: value.code, signal: value.signal };
     match blaze_build_script::run::judge(unit, &cx, status, &value.stdout, &value.stderr) {
         Ok(output) => {
             let mut diagnostics: Vec<Diagnostic> =
@@ -582,17 +564,17 @@ pub(crate) fn named_program(units: &Units, compile: usize) -> Result<PathBuf, Ap
 /// ([`blaze_usercode::roots`]): the target directory, the workspace, blaze's tools and its
 /// launcher. What its key and what it read are written against, so the same script in another
 /// checkout, or another workspace on this machine, is found once a second checkout verified it
-/// ([`blaze_usercode::roots::verify`]). The cargo home's registry and git checkouts, where every
-/// registry and git package is, are machine-wide: a run that read there outside its own package
-/// can still be shared with another checkout.
+/// ([`blaze_usercode::roots::verify`]). blaze's own sources directory
+/// ([`blaze_units::query::BuildConfig::sources`]), where every registry and git package is
+/// kept, is machine-wide: a run that read there outside its own package can still be shared
+/// with another checkout. Never `$CARGO_HOME`: a build reads nothing of cargo's.
 pub(crate) fn build_roots(job: &Job) -> RootMap {
-    let env = &job.input.config.invocation.env;
     RootMap::default()
         .with(Role::Target, Path::new(&job.units().target_dir))
         .with(Role::Workspace, Path::new(&job.input.config.invocation.root))
         .with(Role::Tools, &job.shared.tools)
         .with(Role::Launcher, &job.shared.launcher)
-        .with_cargo_home(|name| env.iter().find(|it| it.0 == name).map(|it| it.1.as_str()))
+        .with_sources(Path::new(&job.input.config.sources))
 }
 
 /// [`build_roots`] with `unit`'s own: what [`script::prepare`] gives its run.
@@ -674,6 +656,11 @@ pub(crate) struct ScriptRun {
     /// The ticket of a record its run put that a value depends on where its roots are
     /// ([`blaze_usercode::roots::verify::retraction`]): durable before its job is done.
     puts: RunPuts,
+    /// `build script run`, open from the run's start to its end, so its whole time (the
+    /// program's, which no thread of the daemon spends) is a row naming the package and
+    /// version. Held ([`blaze_profile::flight::HELD_FIELD`]): entered only while the loop does a step
+    /// of it, so its `self_cpu_ns` is the daemon's work for this run alone.
+    span: tracing::Span,
 }
 
 enum State {
@@ -872,10 +859,44 @@ pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<ScriptRun,
             }
         },
     };
-    Ok(ScriptRun { job: job.clone(), unit, tag: Tag(tags), state: State::Ready(Box::new(start)), puts: RunPuts::default() })
+    Ok(ScriptRun {
+        job: job.clone(),
+        unit,
+        tag: Tag(tags),
+        state: State::Ready(Box::new(start)),
+        puts: RunPuts::default(),
+        span: tracing::Span::none(),
+    })
 }
 
 impl ScriptRun {
+    /// The run's span, opened as it starts ([`ScriptRun::span`]): a root, as no step of the
+    /// loop is all of it.
+    fn open_span(&self) -> tracing::Span {
+        let Ok(u) = self.job.unit(self.unit) else { return tracing::Span::none() };
+        // alloc: once per build script run, the name its span carries
+        let unit = super::compile::span_unit(u);
+        tracing::info_span!(
+            target: "blaze",
+            parent: None,
+            "build script run",
+            krate = u.target.name.as_str(),
+            unit = unit.as_str(),
+            held = true
+        )
+    }
+
+    /// Runs one step of the run inside its span; the span closes with the step that ends it.
+    fn step(&mut self, step: impl FnOnce(&mut ScriptRun) -> Option<bool>) -> Option<bool> {
+        // clone: a refcount, the handle the step is entered by
+        let span = self.span.clone();
+        let ended = span.in_scope(|| step(self));
+        if ended.is_some() {
+            self.span = tracing::Span::none();
+        }
+        ended
+    }
+
     fn of(&self) -> Option<UnitOf> {
         self.job.unit_of(self.unit).ok()
     }
@@ -1071,6 +1092,45 @@ impl Runs<Real> for ScriptRun {
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
+        if matches!(self.state, State::Ready(_)) {
+            self.span = self.open_span();
+        }
+        self.step(|run| run.begin(store, writer, effects, out))
+    }
+
+    fn take_puts(&mut self) -> RunPuts {
+        std::mem::take(&mut self.puts)
+    }
+
+    fn owns(&self, tag: Tag) -> bool {
+        tag.0 >= self.tag.0 && tag.0 - self.tag.0 < 1 << 32
+    }
+
+    fn complete(
+        &mut self,
+        completion: Completion,
+        store: &mut Store,
+        writer: Option<&mut UnitWriter>,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
+        self.step(|run| run.completed(completion, store, writer, effects, out))
+    }
+
+    fn cancel(&mut self, effects: &mut Vec<Effect>) -> Option<bool> {
+        self.step(|run| run.cancelled(effects))
+    }
+}
+
+impl ScriptRun {
+    /// [`Runs::start`]'s step.
+    fn begin(
+        &mut self,
+        store: &Store,
+        writer: Option<&mut UnitWriter>,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
         let State::Ready(mut start) = std::mem::replace(&mut self.state, State::Done) else { return None };
         // cargo's start of a run: `OUT_DIR` made, `invoked.timestamp` written, and the time it
         // began, which its `output` is given.
@@ -1135,15 +1195,8 @@ impl Runs<Real> for ScriptRun {
         }
     }
 
-    fn take_puts(&mut self) -> RunPuts {
-        std::mem::take(&mut self.puts)
-    }
-
-    fn owns(&self, tag: Tag) -> bool {
-        tag.0 >= self.tag.0 && tag.0 - self.tag.0 < 1 << 32
-    }
-
-    fn complete(
+    /// [`Runs::complete`]'s step.
+    fn completed(
         &mut self,
         completion: Completion,
         store: &mut Store,
@@ -1285,7 +1338,8 @@ impl Runs<Real> for ScriptRun {
         self.finish(start, value, began, writer, effects, out)
     }
 
-    fn cancel(&mut self, effects: &mut Vec<Effect>) -> Option<bool> {
+    /// [`Runs::cancel`]'s step.
+    fn cancelled(&mut self, effects: &mut Vec<Effect>) -> Option<bool> {
         match &mut self.state {
             State::Running { cancelled, .. } => {
                 *cancelled = true;

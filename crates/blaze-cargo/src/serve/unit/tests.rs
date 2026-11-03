@@ -202,6 +202,16 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
     assert_eq!(p.tools.rustc, tools.join(format!("rustc{}", std::env::consts::EXE_SUFFIX)));
 }
 
+/// cc prints `cargo:rustc-link-search=native=OUT_DIR` (blake3's `blake3_neon`, tree-sitter's
+/// `tree-sitter`): the link looks in `OUT_DIR`, never in a directory named `native=OUT_DIR`,
+/// whether it links a dependent's program or its build script.
+#[test]
+fn a_kinded_link_search_reaches_the_link_as_its_directory() {
+    let search = ["native=/o/lib", "crate=/c", "dependency=/d", "/plain", "all=/a", "framework=/f"].map(PathBuf::from);
+    let dirs = codegen::search_dirs(&search);
+    assert_eq!(dirs, ["/o/lib", "/plain", "/a", "/f"].map(PathBuf::from));
+}
+
 #[test]
 fn a_directive_the_sandbox_refuses_fails_the_build() {
     let dir = tempfile::tempdir().unwrap();
@@ -873,7 +883,7 @@ fn a_units_key_is_the_same_wherever_the_graph_puts_its_dependencies() {
 #[test]
 fn a_build_scripts_record_is_keyed_alike_under_every_goal() {
     use crate::serve::work::Goal;
-    let goals = [Goal::Check, Goal::Build, Goal::Test, Goal::Run, Goal::Reach];
+    let goals = [Goal::Check, Goal::Build, Goal::Test, Goal::Run];
     let script = unit("p", target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]);
     let keyed: Vec<u8> = goals.iter().map(|goal| compile::keyed_goal(*goal, &script)).collect();
     assert!(keyed.iter().all(|it| *it == keyed[0]), "{keyed:?}");
@@ -968,6 +978,7 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         library: "/rustc/abc/library".to_owned(),
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
+        sources: "/s/sources".to_owned(),
     };
     blaze_lower::lower(blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None }).unwrap()
 }
@@ -1084,6 +1095,21 @@ fn a_units_phase_spans_name_its_package_version_and_target() {
     assert_eq!(compile::span_unit(&unit(api, tests, Mode::Test, &[])), "blaze-api v0.1.0 (test \"e2e\")");
 }
 
+/// A library's doctests are named as cargo names the unit, and each example's program and
+/// the verdicts are kept beside the runner, in its `.doctests` directory only
+/// (docs/v2/plan/doctests.md).
+#[test]
+fn doctests_are_named_and_kept_beside_their_runner() {
+    let lib = target("blaze_api", "lib", "src/lib.rs");
+    let doctests = unit("path+file:///w/crates/blaze-api#0.1.0", lib, Mode::Doctest, &[]);
+    assert_eq!(compile::span_unit(&doctests), "blaze-api v0.1.0 (lib doctest)");
+    let main = "/t/debug/deps/blaze_api-0123";
+    assert!(compile::doctest::beside(main, "/t/debug/deps/blaze_api-0123.doctests/src_lib_rs_3_0"));
+    assert!(compile::doctest::beside(main, "/t/debug/deps/blaze_api-0123.doctests/verdicts"));
+    assert!(!compile::doctest::beside(main, "/t/debug/deps/blaze_api-0123.doctestsx/verdicts"));
+    assert!(!compile::doctest::beside(main, "/t/debug/deps/blaze_api-0123.d"));
+}
+
 /// A build script that reads `FOO` of the process through `option_env!` and nothing else.
 const SCRIPT: &[u8] = b"#[rustc_builtin_macro]\nmacro_rules! option_env { () => {} }\n\n\
 fn main() { let _ = option_env!(\"FOO\"); }\n";
@@ -1178,6 +1204,7 @@ fn script_front(text: &'static [u8], on_core: bool, env: &[(&str, &str)]) -> Scr
         library: "/rustc/abc/library".to_owned(),
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
+        sources: "/s/sources".to_owned(),
     };
     let lower = blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None };
     let mut lowered = blaze_lower::lower(lower).unwrap();
@@ -1341,13 +1368,18 @@ const D_OUT: &str = "/w/target/debug/build/d-0001/out";
 /// `d`, a registry dependency whose build script (units 0 and 1) decides by its run's cfg
 /// which of `fast` and `slow` its library (unit 2) has, lowered over files in memory.
 fn script_cfg_front() -> blaze_lower::Lowered {
+    script_lib_front(b"#[cfg(fast)]\npub fn fast() {}\n#[cfg(not(fast))]\npub fn slow() {}\n")
+}
+
+/// `d` as [`script_cfg_front`] has it, with `lib` as its library's root.
+fn script_lib_front(lib: &[u8]) -> blaze_lower::Lowered {
     use blaze_units::query::{BuildConfig, Command, Invocation, Mount, Origin};
     const D: &str = "registry+https://github.com/rust-lang/crates.io-index#d@0.1.0";
     let tree = blaze_query::MemTree::default();
     let registry = tree.root(&[
         ("d/Cargo.toml", b"[package]\nname = \"d\"\nbuild = \"build.rs\"\n"),
         ("d/build.rs", b"fn main() {}\n"),
-        ("d/src/lib.rs", b"#[cfg(fast)]\npub fn fast() {}\n#[cfg(not(fast))]\npub fn slow() {}\n"),
+        ("d/src/lib.rs", lib),
     ]);
     let view = tree.root(&[]);
     let units = Units {
@@ -1395,6 +1427,7 @@ fn script_cfg_front() -> blaze_lower::Lowered {
         library: "/rustc/abc/library".to_owned(),
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
+        sources: "/s/sources".to_owned(),
     };
     blaze_lower::lower(blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None }).unwrap()
 }
@@ -1499,6 +1532,7 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
         library: "/rustc/abc/library".to_owned(),
         std: "/s/std".to_owned(),
         builds: "/s/build".to_owned(),
+        sources: "/s/sources".to_owned(),
     };
     let lowered =
         blaze_lower::lower(blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None }).unwrap();
@@ -1570,6 +1604,41 @@ fn a_reached_only_crate_that_implements_a_trait_sealed_upstream_is_refused() {
     let (in_graph, plain) = diags(2);
     assert!(!in_graph, "no crate of `plain`'s graph seals a trait");
     assert!(plain.is_empty(), "{plain:#?}");
+}
+
+/// `bad`'s source: a body nothing reaches whose macro call no rule of `m` matches (line 3).
+const BAD_EXPANSION: &str = "macro_rules! m { (a) => { 1 }; }\npub fn fine() -> i32 { m!(a) }\npub fn unreached() -> i32 { m!(b) }\n";
+
+/// A dependency whose body has a macro call that fails to expand fails its own unit, though
+/// only what programs reach of it is type-checked (`BLAZE_DEPS` unset): rustc expands every
+/// call of every crate it compiles. The error names the call where it is written (`bad`'s
+/// line 3) and the body it is in. Before, `bad` was built, and the error surfaced only in a
+/// crate that reached the body, as "MIR that failed to lower (HasErrors)" with no call in it
+/// (darling_core's `Initializer::to_tokens`, seen from darling_macro). `user`, which depends on
+/// `bad` and expands fine, gets nothing.
+#[test]
+fn a_dependency_whose_macro_call_fails_to_expand_fails_its_own_unit_naming_the_call() {
+    let front = front_of(&[
+        MemPkg { name: "bad", path: false, lib: BAD_EXPANSION, deps: &[] },
+        MemPkg { name: "user", path: false, lib: "pub fn two() -> i32 { dep::fine() + 1 }\n", deps: &[(0, "dep")] },
+    ]);
+    let (_, bad) = sealed_diags(&front.lowered, 0);
+    let shown: Vec<&blaze_diagnostics::Diag> =
+        bad.iter().filter(|it| it.is_error() && !compile::cargo_hides(&it.message)).collect();
+    let [error] = shown[..] else { panic!("one error of `bad`'s own, its unit failed: {bad:#?}") };
+    let at = error.span.primary.first().unwrap_or_else(|| panic!("the error is placed: {error:#?}"));
+    assert!(at.file.ends_with("bad/src/lib.rs"), "{error:#?}");
+    let line = BAD_EXPANSION[..at.lo as usize].matches('\n').count() + 1;
+    assert_eq!(line, 3, "on the line of the call: {error:#?}");
+    let call = BAD_EXPANSION.find("m!(b)").unwrap();
+    let within = call as u32..=(call + "m!(b)".len()) as u32;
+    assert!(within.contains(&at.lo) && within.contains(&at.hi), "in the call `m!(b)`: {error:#?}");
+    assert!(
+        error.children.iter().any(|it| it.message == "in the body of `bad::unreached`"),
+        "names the body: {error:#?}"
+    );
+    let (_, user) = sealed_diags(&front.lowered, 1);
+    assert!(user.is_empty(), "{user:#?}");
 }
 
 /// `up`'s source: a foreign trait with an associated type, a generic one, and a two-argument
@@ -1789,6 +1858,111 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
         assert_eq!(served.hits, [d], "{cfgs:?}");
         assert_eq!(root_values(&kept, d), values, "{cfgs:?}");
     }
+}
+
+/// A serve at the view the last serve left walks no key: what that serve wrote is no input of
+/// a key, so each crate's key is the one the session holds (the no-op rebuild's 2 or 3 walks
+/// per build, spans36). One write in between (the script's run applied again with another
+/// cfg) brings the walk back, and a serve that walked and moved nothing is skipped after too.
+/// Without the skip in `deps::images`, each of those serves walks again.
+#[test]
+fn a_serve_at_the_view_the_last_serve_left_walks_no_key_and_a_write_brings_the_walk_back() {
+    let mut sim = blaze_core::sim::Sim::new(1, blaze_core::sim::Faults::default());
+    let store = super::deps::tests::opened(&mut sim);
+    let reader = store.reader();
+    let macros = super::deps::tests::no_macros();
+    let build = ContentId::of("blaze v2 cargo test build", b"a serve at the view the last one left");
+    let mode = hir_def::deps::Mode::Serve;
+
+    let mut front = script_cfg_front();
+    front.ran(1, &d_ran(&[])).unwrap();
+    let d = front.krate(2).unwrap();
+    let mut session = super::deps::session(&front, &reader, &macros, &[]).unwrap();
+    assert!(super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_some(), "`d` is keyed");
+    assert_eq!(session.walks(), 1);
+    // As `deps::serve` ends once it served.
+    super::deps::stamp(&front, build, &mut session);
+    assert!(super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_none(), "no key moved");
+    assert_eq!(session.walks(), 1, "no write since the serve that keyed `d`: no walk");
+
+    front.ran(1, &d_ran(&["fast"])).unwrap();
+    assert!(super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_some(), "`d`'s key moved");
+    assert_eq!(session.walks(), 2, "a write: the walk runs again");
+    super::deps::stamp(&front, build, &mut session);
+
+    // Writes that leave every key as it was: walked once, then skipped at that view.
+    front.ran(1, &d_ran(&["fast", "other"])).unwrap();
+    front.ran(1, &d_ran(&["fast"])).unwrap();
+    assert!(super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_none(), "the cfg is back");
+    assert_eq!(session.walks(), 3, "writes came between: walked once");
+    assert!(super::deps::images(&mut front, &[d], build, &mut session, mode).unwrap().is_none());
+    assert_eq!(session.walks(), 3, "the walk that moved nothing stands at its view");
+}
+
+/// `d`'s library, whose items are a file its build script writes to `OUT_DIR`.
+const D_INCLUDES: &[u8] = b"#[rustc_builtin_macro]\nmacro_rules! include { () => {} }\n\
+#[rustc_builtin_macro]\nmacro_rules! concat { () => {} }\n\
+#[rustc_builtin_macro]\nmacro_rules! env { () => {} }\n\
+include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n";
+
+/// `d`'s build script's run, with the same cfg and variables each time, leaving `generated` as
+/// `OUT_DIR/gen.rs`.
+fn d_generated(generated: &str) -> blaze_lower::Ran {
+    blaze_lower::Ran {
+        cfgs: Vec::new(),
+        env: Vec::new(),
+        out_dir: D_OUT.to_owned(),
+        files: vec![("gen.rs".to_owned(), generated.as_bytes().to_vec())],
+    }
+}
+
+/// A dependency read from its image whose build script runs again with the same cfg and
+/// variables and changes only a file in `OUT_DIR` that the crate `include!`s is served again
+/// under a new key, never left on its image of the old file (rule 18): a run's files are put
+/// in its package's source root (`blaze_lower`'s `apply_run`), each of whose files' text the
+/// key covers (`hir_def::deps::key`'s `files`), so the file is in the key, not only checked
+/// when the image is fetched.
+#[test]
+fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale() {
+    let mut sim = blaze_core::sim::Sim::new(1, blaze_core::sim::Faults::default());
+    let mut store = super::deps::tests::opened(&mut sim);
+    let reader = store.reader();
+    let macros = super::deps::tests::no_macros();
+    let build = ContentId::of("blaze v2 cargo test build", b"a served dependency's OUT_DIR file moves");
+    let mode = hir_def::deps::Mode::Serve;
+
+    // One daemon resolves `d` with its first `gen.rs`, and images it.
+    let mut first = script_lib_front(D_INCLUDES);
+    first.ran(1, &d_generated("pub fn one() {}\n")).unwrap();
+    let d = first.krate(2).unwrap();
+    let mut session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
+    let served = super::deps::images(&mut first, &[d], build, &mut session, mode).unwrap().expect("`d` is keyed");
+    assert_eq!(root_values(&first, d), ["one"]);
+    let kept = super::deps::Kept { served, mode };
+    let (puts, _) = super::deps::store(&first, Some(kept), &mut session, &[], "/w").unwrap();
+    for it in puts {
+        store.put(it.put.key, it.put.kind, it.put.bytes).unwrap();
+    }
+    drop((session, first));
+
+    // The next reads `d` from that image.
+    let mut kept = script_lib_front(D_INCLUDES);
+    kept.ran(1, &d_generated("pub fn one() {}\n")).unwrap();
+    let d = kept.krate(2).unwrap();
+    let mut session = super::deps::session(&kept, &reader, &macros, &[]).unwrap();
+    let served = super::deps::images(&mut kept, &[d], build, &mut session, mode).unwrap().expect("`d` is keyed");
+    assert_eq!(served.hits, [d], "`d` is read from its image");
+    assert_eq!(root_values(&kept, d), ["one"]);
+    super::deps::stamp(&kept, build, &mut session);
+
+    // Its script runs again with the same cfg and variables, and writes another `gen.rs`.
+    kept.ran(1, &d_generated("pub fn two() {}\n")).unwrap();
+    let served = super::deps::images(&mut kept, &[d], build, &mut session, mode)
+        .unwrap()
+        .expect("`d`'s key moved with its `OUT_DIR` file");
+    assert_eq!(served.hits, Vec::new(), "no image of `d` with this `gen.rs`");
+    assert!(hir_def::deps::image_of(kept.db(), d).is_none(), "`d` lost the image of the old `gen.rs`");
+    assert_eq!(root_values(&kept, d), ["two"], "`d` resolves with the file its run left now");
 }
 
 /// A proc macro can read a file outside the source tree (a schema or a `.proto` beside the

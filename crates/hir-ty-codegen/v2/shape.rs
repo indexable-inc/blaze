@@ -38,6 +38,9 @@ mod namespace {
     /// A function of the fuel runtime a metered function calls (`blaze_stencil::fuel`), by
     /// its index there. Only metered functions name one, so no other shape changes.
     pub(super) const FUEL: u32 = 6;
+    /// A wasm instruction Cranelift has no opcode for (`crate::wasm::Instruction`), by its
+    /// index: the name stands for the instruction itself, the same in every function.
+    pub(super) const WASM_INSTRUCTION: u32 = 7;
 }
 
 /// The parts of a shape, each once, in this order.
@@ -83,6 +86,7 @@ pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shap
                         1 => data.name(name.index)?,
                         fragment::INLINED => UserExternalName::new(namespace::BUILT_IN, 0),
                         blaze_stencil::fuel::NAMESPACE => UserExternalName::new(namespace::FUEL, name.index),
+                        crate::wasm::INSTRUCTION => UserExternalName::new(namespace::WASM_INSTRUCTION, name.index),
                         // alloc: the error's message
                         other => return Err(format!("a name in the unknown namespace {other}")),
                     };

@@ -123,7 +123,24 @@ pub(crate) fn checked_appending(fixture: &str, module: &'static str) -> Checked 
     checked_as(fixture, "", &Options::default(), false, Some(module))
 }
 
+/// [`checked`] with `extra` beside the test proc macros, each with the source of its
+/// declaration (`fixture::db_with_proc_macros`).
+pub(crate) fn checked_with_proc_macros(fixture: &str, extra: Vec<(String, hir_expand::proc_macro::ProcMacro)>) -> Checked {
+    checked_from(fixture::db_with_proc_macros(fixture, extra), fixture, "", &Options::default(), false, None)
+}
+
 fn checked_as(fixture: &str, prefix: &str, options: &Options, expand_derives: bool, appended: Option<&'static str>) -> Checked {
+    checked_from(fixture::db(fixture), fixture, prefix, options, expand_derives, appended)
+}
+
+fn checked_from(
+    fx: fixture::Fixture,
+    fixture: &str,
+    prefix: &str,
+    options: &Options,
+    expand_derives: bool,
+    appended: Option<&'static str>,
+) -> Checked {
     // compiletest's `should_emit_metadata`: a `check-pass` or `check-fail` UI test is given
     // `--emit=metadata`.
     let checks_only = fixture.lines().any(|it| matches!(it.trim(), "//@ check-pass" | "//@ check-fail"));
@@ -131,7 +148,6 @@ fn checked_as(fixture: &str, prefix: &str, options: &Options, expand_derives: bo
         lints: crate::lints::CommandLine { codegen: options.lints.codegen && !checks_only, ..options.lints.clone() },
         ..options.clone()
     };
-    let fx = fixture::db(fixture);
     let files = fx.files().to_vec();
     let sysroot = fx.sysroot_files().to_vec();
     let mut db = fx.into_db();

@@ -148,3 +148,33 @@ fn a_daemon_of_another_schema_is_refused_naming_both() {
     let schemas = format!("speaks API schema {}, this blaze {}", blaze_api::SCHEMA - 1, blaze_api::SCHEMA);
     assert!(why.contains(SOCKET) && why.contains(&schemas), "{why}");
 }
+
+/// The daemon answers Stop's Done at once and says each step of its stop on the same request
+/// right after, so one read often holds the Done and a step: `blaze stop` (and the replacing of
+/// another build's daemon) takes them as the steps of the wait, never as a protocol error.
+#[cfg(unix)]
+#[test]
+fn a_stops_steps_read_with_its_done_are_the_waits() {
+    use std::io::{Read as _, Write as _};
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("s");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let daemon = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 64];
+            _ = stream.read(&mut request).unwrap();
+            let mut burst = blaze_api::frames::encode(&blaze_api::Envelope::new(1, Response::Done { ok: true })).unwrap();
+            let step = Response::Stopping { doing: "writing the daemon image".to_owned() };
+            burst.extend(blaze_api::frames::encode(&blaze_api::Envelope::new(1, step)).unwrap());
+            stream.write_all(&burst).unwrap();
+        }
+    });
+    let mut client = Client::unix(&socket).unwrap();
+    assert!(told_to_stop(&mut client, |_, _| {}).unwrap());
+    client.until_hung_up(std::time::Duration::from_secs(10)).unwrap();
+    // What `Api::call` makes of the same burst: the error `blaze stop` failed with at random.
+    let mut client = Client::unix(&socket).unwrap();
+    assert!(Api::call(&mut client, Request::Stop, |_, _| {}).is_err());
+    daemon.join().unwrap();
+}

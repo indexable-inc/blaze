@@ -1,0 +1,1372 @@
+//! This file declares `VMContext` and several related structs which contain
+//! fields that compiled wasm code accesses directly.
+
+mod vm_host_func_context;
+
+pub use self::vm_host_func_context::VMArrayCallHostFuncContext;
+use crate::prelude::*;
+use crate::runtime::vm::{InterpreterRef, VMGcRef, VmPtr, VmSafe, f32x4, f64x2, i8x16};
+use crate::store::StoreOpaque;
+use crate::vm::stack_switching::{VMContinuationStack, VMStackChain, VMStackState};
+use core::cell::UnsafeCell;
+use core::ffi::c_void;
+use core::fmt;
+use core::marker::{self, PhantomPinned};
+use core::mem::{self, MaybeUninit};
+#[cfg(feature = "gc-null")]
+use core::num::NonZeroU32;
+use core::ops::Range;
+use core::ptr::{self, NonNull};
+use core::sync::atomic::{AtomicUsize, Ordering};
+use wasmtime_environ::{
+    BuiltinFunctionIndex, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex,
+    DefinedTagIndex, NUM_COMPONENT_CONTEXT_SLOTS, VMCONTEXT_MAGIC, VMSharedTypeIndex,
+};
+
+/// A function pointer that exposes the array calling convention.
+///
+/// Regardless of the underlying Wasm function type, all functions using the
+/// array calling convention have the same Rust signature.
+///
+/// Arguments:
+///
+/// * Callee `vmctx` for the function itself.
+///
+/// * Caller's `vmctx` (so that host functions can access the linear memory of
+///   their Wasm callers).
+///
+/// * A pointer to a buffer of `ValRaw`s where both arguments are passed into
+///   this function, and where results are returned from this function.
+///
+/// * The capacity of the `ValRaw` buffer. Must always be at least
+///   `max(len(wasm_params), len(wasm_results))`.
+///
+/// Return value:
+///
+/// * `true` if this call succeeded.
+/// * `false` if this call failed and a trap was recorded in TLS.
+pub type VMArrayCallNative = unsafe extern "C" fn(
+    NonNull<VMOpaqueContext>,
+    NonNull<VMContext>,
+    NonNull<ValRaw>,
+    usize,
+) -> bool;
+
+/// An opaque function pointer which might be `VMArrayCallNative` or it might be
+/// pulley bytecode. Requires external knowledge to determine what kind of
+/// function pointer this is.
+#[repr(transparent)]
+pub struct VMArrayCallFunction(VMFunctionBody);
+
+/// A function pointer that exposes the Wasm calling convention.
+///
+/// In practice, different Wasm function types end up mapping to different Rust
+/// function types, so this isn't simply a type alias the way that
+/// `VMArrayCallFunction` is. However, the exact details of the calling
+/// convention are left to the Wasm compiler (e.g. Cranelift or Winch). Runtime
+/// code never does anything with these function pointers except shuffle them
+/// around and pass them back to Wasm.
+#[repr(transparent)]
+pub struct VMWasmCallFunction(VMFunctionBody);
+
+// SAFETY: `VMFunctionImport` is generated with `#[repr(C)]` and only contains
+// `VmSafe` fields.
+unsafe impl VmSafe for VMFunctionImport {}
+
+impl VMFunctionImport {
+    /// Convert `&VMFunctionImport` into `&VMFuncRef`.
+    pub fn as_func_ref(&self) -> &VMFuncRef {
+        // Safety: `VMFunctionImport` and `VMFuncRef` have the same
+        // representation.
+        unsafe { Self::as_non_null_func_ref(NonNull::from(self)).as_ref() }
+    }
+
+    /// Convert `NonNull<VMFunctionImport>` into `NonNull<VMFuncRef>`.
+    pub fn as_non_null_func_ref(p: NonNull<VMFunctionImport>) -> NonNull<VMFuncRef> {
+        p.cast()
+    }
+
+    /// Convert `*mut VMFunctionImport` into `*mut VMFuncRef`.
+    pub fn as_func_ref_ptr(p: *mut VMFunctionImport) -> *mut VMFuncRef {
+        p.cast()
+    }
+}
+
+#[cfg(test)]
+mod test_vmfunction_import {
+    use super::{VMFuncRef, VMFunctionImport};
+    use core::mem::offset_of;
+    use std::mem::size_of;
+
+    #[test]
+    fn vmfunction_import_and_vmfunc_ref_have_same_layout() {
+        assert_eq!(size_of::<VMFunctionImport>(), size_of::<VMFuncRef>());
+        assert_eq!(
+            offset_of!(VMFunctionImport, array_call),
+            offset_of!(VMFuncRef, array_call),
+        );
+        assert_eq!(
+            offset_of!(VMFunctionImport, wasm_call),
+            offset_of!(VMFuncRef, wasm_call),
+        );
+        assert_eq!(
+            offset_of!(VMFunctionImport, type_index),
+            offset_of!(VMFuncRef, type_index),
+        );
+        assert_eq!(
+            offset_of!(VMFunctionImport, vmctx),
+            offset_of!(VMFuncRef, vmctx),
+        );
+    }
+}
+
+/// A placeholder byte-sized type which is just used to provide some amount of type
+/// safety when dealing with pointers to JIT-compiled function bodies. Note that it's
+/// deliberately not Copy, as we shouldn't be carelessly copying function body bytes
+/// around.
+#[repr(C)]
+pub struct VMFunctionBody(u8);
+
+// SAFETY: this structure is never read and is safe to pass to jit code.
+unsafe impl VmSafe for VMFunctionBody {}
+
+#[cfg(test)]
+mod test_vmfunction_body {
+    use super::VMFunctionBody;
+    use std::mem::size_of;
+
+    #[test]
+    fn check_vmfunction_body_offsets() {
+        assert_eq!(size_of::<VMFunctionBody>(), 1);
+    }
+}
+
+// SAFETY: `VMTableImport` is generated with `#[repr(C)]` and only contains
+// `VmSafe` fields.
+unsafe impl VmSafe for VMTableImport {}
+
+#[cfg(test)]
+mod test_vmtable {
+    use wasmtime_environ::component::{Component, VMComponentOffsets};
+    use wasmtime_environ::{HostPtr, Module, PtrSize, StaticModuleIndex, VMOffsets};
+
+    #[test]
+    fn ensure_sizes_match() {
+        // Because we use `VMTableImport` for recording tables used by components, we
+        // want to make sure that the size calculations between `VMOffsets` and
+        // `VMComponentOffsets` stay the same.
+        let module = Module::new(StaticModuleIndex::from_u32(0));
+        let vm_offsets = VMOffsets::new(HostPtr, &module);
+        let component = Component::default();
+        let vm_component_offsets = VMComponentOffsets::new(HostPtr, &component);
+        assert_eq!(
+            vm_offsets.ptr.vm_table_import().size(),
+            vm_component_offsets.ptr.vm_table_import().size()
+        );
+    }
+}
+
+// SAFETY: `VMMemoryImport` is generated with `#[repr(C)]` and only contains
+// `VmSafe` fields.
+unsafe impl VmSafe for VMMemoryImport {}
+
+// SAFETY: `VMGlobalImport` is generated with `#[repr(C)]` and only contains
+// `VmSafe` fields.
+unsafe impl VmSafe for VMGlobalImport {}
+
+/// The kinds of globals that Wasmtime has.
+#[derive(Debug, Copy, Clone)]
+#[repr(C, u32)]
+pub enum VMGlobalKind {
+    /// Host globals, stored in a `StoreOpaque`.
+    Host(DefinedGlobalIndex),
+    /// Instance globals, stored in `VMContext`s
+    Instance(DefinedGlobalIndex),
+    /// Flags for a component instance, stored in `VMComponentContext`.
+    #[cfg(feature = "component-model")]
+    ComponentFlags(wasmtime_environ::component::RuntimeComponentInstanceIndex),
+}
+
+// SAFETY: the above enum is repr(C) and stores nothing else
+unsafe impl VmSafe for VMGlobalKind {}
+
+// SAFETY: `VMTagImport` is generated with `#[repr(C)]` and only contains
+// `VmSafe` fields.
+unsafe impl VmSafe for VMTagImport {}
+
+/// Define the runtime definitions of the shared `VM*` types.
+#[cfg_attr(
+    not(test),
+    allow(
+        unused_macro_rules,
+        reason = "the `@test` arms are only expanded inside the `#[cfg(test)]` \
+                  layout-test module"
+    )
+)]
+macro_rules! define_vm_types {
+    (@test [ $($cfg:tt)* ] $Name:ident $snake:ident [ $($fname:ident)* ]) => {
+        $($cfg)*
+        #[test]
+        fn $snake() {
+            use super::$Name;
+
+            let host = HostPtr;
+            let offsets = host.$snake();
+
+            let expected = usize::from(offsets.size());
+            let actual = size_of::<$Name>();
+            assert_eq!(
+                expected,
+                actual,
+                "size of {} failed: {expected} (expected) != {actual} (actual)",
+                stringify!($Name),
+            );
+
+            let expected = usize::from(offsets.align());
+            let actual = align_of::<$Name>();
+            assert_eq!(
+                expected,
+                actual,
+                "alignment of {} failed: {expected} (expected) != {actual} (actual)",
+                stringify!($Name),
+            );
+
+            $(
+                let expected = usize::from(offsets.$fname());
+                let actual = offset_of!($Name, $fname);
+                assert_eq!(
+                    expected,
+                    actual,
+                    "offset of {}::{} failed: {expected} (expected) != {actual} (actual)",
+                    stringify!($Name),
+                    stringify!($fname),
+                );
+            )*
+        }
+    };
+
+    ( $(
+        $(#[doc = $sdoc:literal])*
+        $(#[cfg($($scfg:tt)*)])?
+        $(#[derive($($d:ident),*)])?
+        #[repr($($repr:tt)*)]
+        #[snake_name = $snake:ident]
+        $svis:vis struct $Name:ident {
+            $(
+                $(#[doc = $fdoc:literal])*
+                $(#[aggregate])?
+                $(#[indexed])?
+                $(#[readonly])?
+                $(#[can_move])?
+                // Unlike the offsets and alias-region consumers, this one only
+                // ever re-emits a field's type verbatim, so it can capture the
+                // whole type as one fragment instead of taking it apart.
+                $fvis:vis $fname:ident : $fty:ty ,
+            )*
+        }
+    )* ) => {
+        $(
+            $(#[doc = $sdoc])*
+            $(#[cfg($($scfg)*)])?
+            $(#[derive($($d),*)])?
+            #[repr($($repr)*)]
+            $svis struct $Name {
+                $(
+                    $(#[doc = $fdoc])*
+                    $fvis $fname: $fty,
+                )*
+            }
+        )*
+
+        #[cfg(test)]
+        mod test_vm_type_layouts {
+            use core::mem::{align_of, offset_of, size_of};
+            use wasmtime_environ::{HostPtr, PtrSize};
+
+            $(
+                define_vm_types!(
+                    @test
+                    [ $(#[cfg($($scfg)*)])? ]
+                    $Name $snake
+                    [ $($fname)* ]
+                );
+            )*
+        }
+    };
+}
+wasmtime_environ::for_each_vm_type!(define_vm_types);
+
+// SAFETY: `VMMemoryDefinition` is generated with `#[repr(C)]` and each field
+// individually implements `VmSafe`, which satisfies the requirements of this
+// trait.
+unsafe impl VmSafe for VMMemoryDefinition {}
+
+impl VMMemoryDefinition {
+    /// Return the current length (in bytes) of the [`VMMemoryDefinition`] by
+    /// performing a relaxed load; do not use this function for situations in
+    /// which a precise length is needed. Owned memories (i.e., non-shared) will
+    /// always return a precise result (since no concurrent modification is
+    /// possible) but shared memories may see an imprecise value--a
+    /// `current_length` potentially smaller than what some other thread
+    /// observes. Since Wasm memory only grows, this under-estimation may be
+    /// acceptable in certain cases.
+    #[inline]
+    pub fn current_length(&self) -> usize {
+        self.current_length.load(Ordering::Relaxed)
+    }
+
+    /// Return a copy of the [`VMMemoryDefinition`] using the relaxed value of
+    /// `current_length`; see [`VMMemoryDefinition::current_length()`].
+    #[inline]
+    pub unsafe fn load(ptr: *mut Self) -> Self {
+        let other = unsafe { &*ptr };
+        VMMemoryDefinition {
+            base: other.base,
+            current_length: other.current_length().into(),
+        }
+    }
+}
+
+// SAFETY: `VMTableDefinition` is generated with `#[repr(C)]` and only contains
+// `VmSafe` fields.
+unsafe impl VmSafe for VMTableDefinition {}
+
+// SAFETY: `VMGlobalDefinition` is generated with `#[repr(C)]` and only contains
+// `VmSafe` fields.
+unsafe impl VmSafe for VMGlobalDefinition {}
+
+#[cfg(test)]
+mod test_vmglobal_definition {
+    use super::VMGlobalDefinition;
+    use std::mem::{align_of, size_of};
+    use wasmtime_environ::{HostPtr, Module, StaticModuleIndex, VMOffsets};
+
+    #[test]
+    fn check_vmglobal_definition_alignment() {
+        assert!(align_of::<VMGlobalDefinition>() >= align_of::<i32>());
+        assert!(align_of::<VMGlobalDefinition>() >= align_of::<i64>());
+        assert!(align_of::<VMGlobalDefinition>() >= align_of::<f32>());
+        assert!(align_of::<VMGlobalDefinition>() >= align_of::<f64>());
+        assert!(align_of::<VMGlobalDefinition>() >= align_of::<[u8; 16]>());
+        assert!(align_of::<VMGlobalDefinition>() >= align_of::<[f32; 4]>());
+        assert!(align_of::<VMGlobalDefinition>() >= align_of::<[f64; 2]>());
+    }
+
+    #[test]
+    fn check_vmglobal_begins_aligned() {
+        let module = Module::new(StaticModuleIndex::from_u32(0));
+        let offsets = VMOffsets::new(HostPtr, &module);
+        assert_eq!(offsets.globals().begin() % 16, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "gc")]
+    fn check_vmglobal_can_contain_gc_ref() {
+        assert!(size_of::<crate::runtime::vm::VMGcRef>() <= size_of::<VMGlobalDefinition>());
+    }
+}
+
+impl VMGlobalDefinition {
+    /// Construct a `VMGlobalDefinition`.
+    pub fn new() -> Self {
+        Self { storage: [0; 16] }
+    }
+
+    /// Return a reference to the value as an i32.
+    pub unsafe fn as_i32(&self) -> &i32 {
+        unsafe { &*(self.storage.as_ref().as_ptr().cast::<i32>()) }
+    }
+
+    /// Return a mutable reference to the value as an i32.
+    pub unsafe fn as_i32_mut(&mut self) -> &mut i32 {
+        unsafe { &mut *(self.storage.as_mut().as_mut_ptr().cast::<i32>()) }
+    }
+
+    /// Return a reference to the value as a u32.
+    pub unsafe fn as_u32(&self) -> &u32 {
+        unsafe { &*(self.storage.as_ref().as_ptr().cast::<u32>()) }
+    }
+
+    /// Return a mutable reference to the value as an u32.
+    pub unsafe fn as_u32_mut(&mut self) -> &mut u32 {
+        unsafe { &mut *(self.storage.as_mut().as_mut_ptr().cast::<u32>()) }
+    }
+
+    /// Return a reference to the value as an i64.
+    pub unsafe fn as_i64(&self) -> &i64 {
+        unsafe { &*(self.storage.as_ref().as_ptr().cast::<i64>()) }
+    }
+
+    /// Return a mutable reference to the value as an i64.
+    pub unsafe fn as_i64_mut(&mut self) -> &mut i64 {
+        unsafe { &mut *(self.storage.as_mut().as_mut_ptr().cast::<i64>()) }
+    }
+
+    /// Return a reference to the value as an u64.
+    pub unsafe fn as_u64(&self) -> &u64 {
+        unsafe { &*(self.storage.as_ref().as_ptr().cast::<u64>()) }
+    }
+
+    /// Return a mutable reference to the value as an u64.
+    pub unsafe fn as_u64_mut(&mut self) -> &mut u64 {
+        unsafe { &mut *(self.storage.as_mut().as_mut_ptr().cast::<u64>()) }
+    }
+
+    /// Return a reference to the value as an f32.
+    pub unsafe fn as_f32(&self) -> &f32 {
+        unsafe { &*(self.storage.as_ref().as_ptr().cast::<f32>()) }
+    }
+
+    /// Return a mutable reference to the value as an f32.
+    pub unsafe fn as_f32_mut(&mut self) -> &mut f32 {
+        unsafe { &mut *(self.storage.as_mut().as_mut_ptr().cast::<f32>()) }
+    }
+
+    /// Return a reference to the value as f32 bits.
+    pub unsafe fn as_f32_bits(&self) -> &u32 {
+        unsafe { &*(self.storage.as_ref().as_ptr().cast::<u32>()) }
+    }
+
+    /// Return a mutable reference to the value as f32 bits.
+    pub unsafe fn as_f32_bits_mut(&mut self) -> &mut u32 {
+        unsafe { &mut *(self.storage.as_mut().as_mut_ptr().cast::<u32>()) }
+    }
+
+    /// Return a reference to the value as an f64.
+    pub unsafe fn as_f64(&self) -> &f64 {
+        unsafe { &*(self.storage.as_ref().as_ptr().cast::<f64>()) }
+    }
+
+    /// Return a mutable reference to the value as an f64.
+    pub unsafe fn as_f64_mut(&mut self) -> &mut f64 {
+        unsafe { &mut *(self.storage.as_mut().as_mut_ptr().cast::<f64>()) }
+    }
+
+    /// Return a reference to the value as f64 bits.
+    pub unsafe fn as_f64_bits(&self) -> &u64 {
+        unsafe { &*(self.storage.as_ref().as_ptr().cast::<u64>()) }
+    }
+
+    /// Return a mutable reference to the value as f64 bits.
+    pub unsafe fn as_f64_bits_mut(&mut self) -> &mut u64 {
+        unsafe { &mut *(self.storage.as_mut().as_mut_ptr().cast::<u64>()) }
+    }
+
+    /// Gets the underlying 128-bit vector value.
+    //
+    // Note that vectors are stored in little-endian format while other types
+    // are stored in native-endian format.
+    pub unsafe fn get_u128(&self) -> u128 {
+        unsafe { u128::from_le(*(self.storage.as_ref().as_ptr().cast::<u128>())) }
+    }
+
+    /// Sets the 128-bit vector values.
+    //
+    // Note that vectors are stored in little-endian format while other types
+    // are stored in native-endian format.
+    pub unsafe fn set_u128(&mut self, val: u128) {
+        unsafe {
+            *self.storage.as_mut().as_mut_ptr().cast::<u128>() = val.to_le();
+        }
+    }
+
+    /// Return a reference to the value as u128 bits.
+    pub unsafe fn as_u128_bits(&self) -> &[u8; 16] {
+        unsafe { &*(self.storage.as_ref().as_ptr().cast::<[u8; 16]>()) }
+    }
+
+    /// Return a mutable reference to the value as u128 bits.
+    pub unsafe fn as_u128_bits_mut(&mut self) -> &mut [u8; 16] {
+        unsafe { &mut *(self.storage.as_mut().as_mut_ptr().cast::<[u8; 16]>()) }
+    }
+
+    /// Return a reference to the global value as a borrowed GC reference.
+    pub unsafe fn as_gc_ref(&self) -> Option<&VMGcRef> {
+        let raw_ptr = self.storage.as_ref().as_ptr().cast::<Option<VMGcRef>>();
+        let ret = unsafe { (*raw_ptr).as_ref() };
+        assert!(cfg!(feature = "gc") || ret.is_none());
+        ret
+    }
+
+    /// Return a reference to the global value as a borrowed GC reference.
+    pub unsafe fn as_gc_ref_mut(&mut self) -> Option<&mut VMGcRef> {
+        let raw_ptr = self.storage.as_mut().as_mut_ptr().cast::<Option<VMGcRef>>();
+        let ret = unsafe { (*raw_ptr).as_mut() };
+        assert!(cfg!(feature = "gc") || ret.is_none());
+        ret
+    }
+
+    /// Initialize a global to the given GC reference.
+    pub unsafe fn init_gc_ref(
+        &mut self,
+        store: &mut StoreOpaque,
+        gc_ref: Option<&VMGcRef>,
+    ) -> Result<()> {
+        let dest = unsafe {
+            &mut *(self
+                .storage
+                .as_mut()
+                .as_mut_ptr()
+                .cast::<MaybeUninit<Option<VMGcRef>>>())
+        };
+
+        store.init_gc_ref(dest, gc_ref)
+    }
+
+    /// Write a GC reference into this global value.
+    pub unsafe fn write_gc_ref(
+        &mut self,
+        store: &mut StoreOpaque,
+        gc_ref: Option<&VMGcRef>,
+    ) -> Result<()> {
+        let dest = unsafe { &mut *(self.storage.as_mut().as_mut_ptr().cast::<Option<VMGcRef>>()) };
+        store.write_gc_ref(dest, gc_ref)
+    }
+
+    /// Return a reference to the value as a `VMFuncRef`.
+    pub unsafe fn as_func_ref(&self) -> *mut VMFuncRef {
+        unsafe { *(self.storage.as_ref().as_ptr().cast::<*mut VMFuncRef>()) }
+    }
+
+    /// Return a mutable reference to the value as a `VMFuncRef`.
+    pub unsafe fn as_func_ref_mut(&mut self) -> &mut *mut VMFuncRef {
+        unsafe { &mut *(self.storage.as_mut().as_mut_ptr().cast::<*mut VMFuncRef>()) }
+    }
+}
+
+#[cfg(test)]
+mod test_vmshared_type_index {
+    use super::VMSharedTypeIndex;
+    use std::mem::size_of;
+    use wasmtime_environ::{HostPtr, Module, StaticModuleIndex, VMOffsets};
+
+    #[test]
+    fn check_vmshared_type_index() {
+        let module = Module::new(StaticModuleIndex::from_u32(0));
+        let offsets = VMOffsets::new(HostPtr, &module);
+        assert_eq!(
+            size_of::<VMSharedTypeIndex>(),
+            usize::from(offsets.size_of_vmshared_type_index())
+        );
+    }
+}
+
+impl VMTagDefinition {
+    pub fn new(type_index: VMSharedTypeIndex) -> Self {
+        Self { type_index }
+    }
+}
+
+// SAFETY: `VMTagDefinition` is generated with `#[repr(C)]` and only contains
+// `VmSafe` fields.
+unsafe impl VmSafe for VMTagDefinition {}
+
+#[cfg(test)]
+mod test_vmtag_definition {
+    use wasmtime_environ::{HostPtr, Module, StaticModuleIndex, VMOffsets};
+
+    #[test]
+    fn check_vmtag_begins_aligned() {
+        let module = Module::new(StaticModuleIndex::from_u32(0));
+        let offsets = VMOffsets::new(HostPtr, &module);
+        assert_eq!(offsets.tags().begin() % 16, 0);
+    }
+}
+
+// SAFETY: `VMFuncRef` is generated with `#[repr(C)]` and only contains
+// `VmSafe` fields.
+unsafe impl VmSafe for VMFuncRef {}
+
+impl VMFuncRef {
+    /// Invokes the `array_call` field of this `VMFuncRef` with the supplied
+    /// arguments.
+    ///
+    /// This will invoke the function pointer in the `array_call` field with:
+    ///
+    /// * the `callee` vmctx as `self.vmctx`
+    /// * the `caller` as `caller` specified here
+    /// * the args pointer as `args_and_results`
+    /// * the args length as `args_and_results`
+    ///
+    /// The `args_and_results` area must be large enough to both load all
+    /// arguments from and store all results to.
+    ///
+    /// Returns whether a trap was recorded in TLS for raising.
+    ///
+    /// # Unsafety
+    ///
+    /// This method is unsafe because it can be called with any pointers. They
+    /// must all be valid for this wasm function call to proceed. For example
+    /// the `caller` must be valid machine code if `pulley` is `None` or it must
+    /// be valid bytecode if `pulley` is `Some`. Additionally `args_and_results`
+    /// must be large enough to handle all the arguments/results for this call.
+    ///
+    /// Note that the unsafety invariants to maintain here are not currently
+    /// exhaustively documented.
+    #[inline]
+    pub unsafe fn array_call(
+        me: NonNull<VMFuncRef>,
+        pulley: Option<InterpreterRef<'_>>,
+        caller: NonNull<VMContext>,
+        args_and_results: NonNull<[ValRaw]>,
+    ) -> bool {
+        match pulley {
+            Some(vm) => unsafe { Self::array_call_interpreted(me, vm, caller, args_and_results) },
+            None => unsafe { Self::array_call_native(me, caller, args_and_results) },
+        }
+    }
+
+    unsafe fn array_call_interpreted(
+        me: NonNull<VMFuncRef>,
+        vm: InterpreterRef<'_>,
+        caller: NonNull<VMContext>,
+        args_and_results: NonNull<[ValRaw]>,
+    ) -> bool {
+        // If `caller` is actually a `VMArrayCallHostFuncContext` then skip the
+        // interpreter, even though it's available, as `array_call` will be
+        // native code.
+        unsafe {
+            if me.as_ref().vmctx.as_non_null().as_ref().magic
+                == wasmtime_environ::VM_ARRAY_CALL_HOST_FUNC_MAGIC
+            {
+                return Self::array_call_native(me, caller, args_and_results);
+            }
+            vm.call(
+                me.as_ref().array_call.as_non_null().cast(),
+                me.as_ref().vmctx.as_non_null(),
+                caller,
+                args_and_results,
+            )
+        }
+    }
+
+    #[inline]
+    unsafe fn array_call_native(
+        me: NonNull<VMFuncRef>,
+        caller: NonNull<VMContext>,
+        args_and_results: NonNull<[ValRaw]>,
+    ) -> bool {
+        unsafe {
+            union GetNativePointer {
+                native: VMArrayCallNative,
+                ptr: NonNull<VMArrayCallFunction>,
+            }
+            let native = GetNativePointer {
+                ptr: me.as_ref().array_call.as_non_null(),
+            }
+            .native;
+            native(
+                me.as_ref().vmctx.as_non_null(),
+                caller,
+                args_and_results.cast(),
+                args_and_results.len(),
+            )
+        }
+    }
+
+    pub(crate) fn as_vm_function_import(&self) -> Option<&VMFunctionImport> {
+        if self.wasm_call.is_some() {
+            // Safety: `VMFuncRef` and `VMFunctionImport` have the same layout
+            // and `wasm_call` is non-null.
+            Some(unsafe { NonNull::from(self).cast::<VMFunctionImport>().as_ref() })
+        } else {
+            None
+        }
+    }
+}
+
+macro_rules! define_builtin_array {
+    (
+        $(
+            $( #[$attr:meta] )*
+            $name:ident( $( $pname:ident: $param:ident ),* ) $( -> $result:ident )?;
+        )*
+    ) => {
+        /// An array that stores addresses of builtin functions. We translate code
+        /// to use indirect calls. This way, we don't have to patch the code.
+        #[repr(C)]
+        #[allow(improper_ctypes_definitions, reason = "__m128i known not FFI-safe")]
+        pub struct VMBuiltinFunctionsArray {
+            $(
+                $name: unsafe extern "C" fn(
+                    $(define_builtin_array!(@ty $param)),*
+                ) $( -> define_builtin_array!(@ty $result))?,
+            )*
+        }
+
+        impl VMBuiltinFunctionsArray {
+            pub const INIT: VMBuiltinFunctionsArray = VMBuiltinFunctionsArray {
+                $(
+                    $name: crate::runtime::vm::libcalls::raw::$name,
+                )*
+            };
+
+            /// Helper to call `expose_provenance()` on all contained pointers.
+            ///
+            /// This is required to be called at least once before entering wasm
+            /// to inform the compiler that these function pointers may all be
+            /// loaded/stored and used on the "other end" to reacquire
+            /// provenance in Pulley. Pulley models hostcalls with a host
+            /// pointer as the first parameter that's a function pointer under
+            /// the hood, and this call ensures that the use of the function
+            /// pointer is considered valid.
+            pub fn expose_provenance(&self) -> NonNull<Self>{
+                $(
+                    (self.$name as *mut u8).expose_provenance();
+                )*
+                NonNull::from(self)
+            }
+        }
+    };
+
+    (@ty u32) => (u32);
+    (@ty u64) => (u64);
+    (@ty f32) => (f32);
+    (@ty f64) => (f64);
+    (@ty u8) => (u8);
+    (@ty i8x16) => (i8x16);
+    (@ty f32x4) => (f32x4);
+    (@ty f64x2) => (f64x2);
+    (@ty bool) => (bool);
+    (@ty pointer) => (*mut u8);
+    (@ty size) => (usize);
+    (@ty vmctx) => (NonNull<VMContext>);
+}
+
+// SAFETY: the above structure is repr(C) and only contains `VmSafe` fields.
+unsafe impl VmSafe for VMBuiltinFunctionsArray {}
+
+wasmtime_environ::foreach_builtin_function!(define_builtin_array);
+
+const _: () = {
+    assert!(
+        mem::size_of::<VMBuiltinFunctionsArray>()
+            == mem::size_of::<usize>() * (BuiltinFunctionIndex::len() as usize)
+    )
+};
+
+impl VMStoreContext {
+    /// From the current saved trampoline FP, get the FP of the last
+    /// Wasm frame. If the current saved trampoline FP is null, return
+    /// null.
+    ///
+    /// We store only the trampoline FP, because (i) we need the
+    /// trampoline FP, so we know the size (bottom) of the last Wasm
+    /// frame; and (ii) the last Wasm frame, just above the trampoline
+    /// frame, can be recovered via the FP chain.
+    ///
+    /// # Safety
+    ///
+    /// This function requires that the `last_wasm_exit_trampoline_fp`
+    /// field either points to an active trampoline frame or is a null
+    /// pointer.
+    pub(crate) unsafe fn last_wasm_exit_fp(&self) -> usize {
+        // SAFETY: the unsafe cell is safe to load (no other threads
+        // will be writing our store when we have control), and the
+        // helper function's safety condition is the same as ours.
+        unsafe {
+            let trampoline_fp = *self.last_wasm_exit_trampoline_fp.get();
+            Self::wasm_exit_fp_from_trampoline_fp(trampoline_fp)
+        }
+    }
+
+    /// From any saved trampoline FP, get the FP of the last Wasm
+    /// frame. If the given trampoline FP is null, return null.
+    ///
+    /// This differs from `last_wasm_exit_fp()` above in that it
+    /// allows accessing activations further up the stack as well,
+    /// e.g. via `CallThreadState::old_state`.
+    ///
+    /// # Safety
+    ///
+    /// This function requires that the provided FP value is valid,
+    /// and points to an active trampoline frame, or is null.
+    ///
+    /// This function depends on the invariant that on all supported
+    /// architectures, we store the previous FP value under the
+    /// current FP. This is a property of our ABI that we control and
+    /// ensure.
+    pub(crate) unsafe fn wasm_exit_fp_from_trampoline_fp(trampoline_fp: usize) -> usize {
+        if trampoline_fp != 0 {
+            // SAFETY: We require that trampoline_fp points to a valid
+            // frame, which will (by definition) contain an old FP value
+            // that we can load.
+            unsafe { *(trampoline_fp as *const usize) }
+        } else {
+            0
+        }
+    }
+
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn component_context_mut(&mut self) -> &mut [u32; NUM_COMPONENT_CONTEXT_SLOTS] {
+        self.component_context.get_mut()
+    }
+
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn current_thread_mut(&mut self) -> &mut VMLazyThread {
+        self.current_thread.get_mut()
+    }
+}
+
+// The `VMStoreContext` type is a pod-type with no destructor, and we don't
+// access any fields from other threads, so add in these trait impls which are
+// otherwise not available due to the `fuel_consumed` and `epoch_deadline`
+// variables in `VMStoreContext`.
+unsafe impl Send for VMStoreContext {}
+unsafe impl Sync for VMStoreContext {}
+
+// SAFETY: the above structure is repr(C) and only contains `VmSafe` fields.
+unsafe impl VmSafe for VMStoreContext {}
+
+impl Default for VMStoreContext {
+    fn default() -> VMStoreContext {
+        VMStoreContext {
+            fuel_consumed: UnsafeCell::new(0),
+            epoch_deadline: UnsafeCell::new(0),
+            execution_version: 0,
+            stack_limit: UnsafeCell::new(usize::MAX),
+            gc_heap: UnsafeCell::new(VMMemoryDefinition {
+                base: NonNull::dangling().into(),
+                current_length: AtomicUsize::new(0),
+            }),
+            last_wasm_exit_trampoline_fp: UnsafeCell::new(0),
+            last_wasm_exit_pc: UnsafeCell::new(0),
+            last_wasm_entry_fp: UnsafeCell::new(0),
+            last_wasm_entry_sp: UnsafeCell::new(0),
+            last_wasm_entry_trap_handler: UnsafeCell::new(0),
+            stack_chain: UnsafeCell::new(VMStackChain::Absent),
+            async_guard_range: ptr::null_mut()..ptr::null_mut(),
+            store_data: VmPtr::dangling(),
+            component_context: UnsafeCell::new([0; NUM_COMPONENT_CONTEXT_SLOTS]),
+            current_thread: UnsafeCell::new(VMLazyThread::none()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_vmstore_context {
+    use super::{VMMemoryDefinition, VMStoreContext};
+    use core::mem::offset_of;
+    use wasmtime_environ::{HostPtr, Module, PtrSize, StaticModuleIndex, VMOffsets};
+
+    /// Check the `VMStoreContext` offsets that `for_each_vm_type!` does *not*
+    /// generate: the offsets reaching into the inlined `gc_heap`.
+    ///
+    /// Every field offset, plus the size and alignment of the type, is already
+    /// checked by the generated `test_vm_type_layouts::vm_store_context`.
+    #[test]
+    fn derived_field_offsets() {
+        let module = Module::new(StaticModuleIndex::from_u32(0));
+        let offsets = VMOffsets::new(HostPtr, &module);
+        assert_eq!(
+            offset_of!(VMStoreContext, gc_heap) + offset_of!(VMMemoryDefinition, base),
+            usize::from(offsets.ptr.vm_store_context().gc_heap_base())
+        );
+        assert_eq!(
+            offset_of!(VMStoreContext, gc_heap) + offset_of!(VMMemoryDefinition, current_length),
+            usize::from(offsets.ptr.vm_store_context().gc_heap_current_length())
+        );
+    }
+}
+
+#[cfg(test)]
+mod test_vm_cont_ref {
+    use wasmtime_environ::PtrSize;
+
+    /// Check the one `VMContRef` property that `for_each_vm_type!` does *not*
+    /// generate an assertion for: that `revision` lands at an eight-aligned
+    /// offset for every target pointer width, not just the host's.
+    ///
+    /// Some 32-bit platforms need it to be 8-byte aligned and some don't, so we
+    /// make sure that it always is, without padding to get there.
+    ///
+    /// Every field offset, plus the size and alignment of the type, is already
+    /// checked by the generated `test_vm_type_layouts::vm_cont_ref`.
+    #[test]
+    fn revision_is_eight_aligned() {
+        assert_eq!(4u8.vm_cont_ref().revision() % 8, 0);
+        assert_eq!(8u8.vm_cont_ref().revision() % 8, 0);
+    }
+}
+
+impl VMLazyThread {
+    const _ASSERT_SIZE: () = assert!(
+        core::mem::size_of::<VMLazyThread>() == core::mem::size_of::<*mut VMDeferredThread>()
+    );
+    const _ASSERT_ALIGN: () = assert!(
+        core::mem::align_of::<VMLazyThread>() == core::mem::align_of::<*mut VMDeferredThread>()
+    );
+
+    const FORCED: VmPtr<VMDeferredThread> = VmPtr::<u8>::dangling().cast();
+
+    /// There is no current thread.
+    pub const fn none() -> Self {
+        Self { thread: None }
+    }
+
+    /// A lazy thread that has already been promoted.
+    pub const fn forced() -> Self {
+        Self {
+            thread: Some(Self::FORCED),
+        }
+    }
+
+    /// A deferred thread referencing the given on-stack [`VMDeferredThread`].
+    pub fn deferred(ptr: NonNull<VMDeferredThread>) -> Self {
+        debug_assert_eq!(ptr.addr().get() & Self::FORCED.addr().get(), 0);
+        Self {
+            thread: Some(ptr.into()),
+        }
+    }
+
+    /// Returns `true` if there is no current thread.
+    pub fn is_none(self) -> bool {
+        self.thread.is_none()
+    }
+
+    /// Returns `true` if a deferred thread has been forced/promoted.
+    pub fn is_forced(self) -> bool {
+        self.thread.is_some_and(|p| p == Self::FORCED)
+    }
+
+    /// Returns `true` if this is a deferred thread (i.e. neither `None` nor
+    /// forced).
+    pub fn is_deferred(self) -> bool {
+        self.thread.is_some_and(|p| p != Self::FORCED)
+    }
+
+    /// Returns the deferred [`VMDeferredThread`] pointer if this is a deferred
+    /// thread.
+    pub fn as_deferred(self) -> Option<VmPtr<VMDeferredThread>> {
+        self.thread
+            .and_then(|p| if p == Self::FORCED { None } else { Some(p) })
+    }
+}
+
+#[cfg(test)]
+mod test_vmlazy_thread {
+    use super::*;
+
+    #[test]
+    fn vmlazy_thread_forced() {
+        assert_eq!(
+            VMLazyThread::forced().thread.unwrap().addr().get(),
+            usize::try_from(wasmtime_environ::VM_LAZY_THREAD_FORCED).unwrap()
+        );
+    }
+}
+
+/// The VM "context", which is pointed to by the `vmctx` arg in Cranelift.
+/// This has information about globals, memories, tables, and other runtime
+/// state associated with the current instance.
+///
+/// The struct here is empty, as the sizes of these fields are dynamic, and
+/// we can't describe them in Rust's type system. Sufficient memory is
+/// allocated at runtime.
+#[derive(Debug)]
+#[repr(C, align(16))] // align 16 since globals are aligned to that and contained inside
+pub struct VMContext {
+    _magic: u32,
+}
+
+impl VMContext {
+    /// Helper function to cast between context types using a debug assertion to
+    /// protect against some mistakes.
+    #[inline]
+    pub unsafe fn from_opaque(opaque: NonNull<VMOpaqueContext>) -> NonNull<VMContext> {
+        // Note that in general the offset of the "magic" field is stored in
+        // `VMContext::magic`. Given though that this is a sanity check
+        // about converting this pointer to another type we ideally don't want
+        // to read the offset from potentially corrupt memory. Instead it would
+        // be better to catch errors here as soon as possible.
+        //
+        // To accomplish this the `VMContext` structure is laid out with the
+        // magic field at a statically known offset (here it's 0 for now). This
+        // static offset is asserted in `VMOffsets::from` and needs to be kept
+        // in sync with this line for this debug assertion to work.
+        //
+        // Also note that this magic is only ever invalid in the presence of
+        // bugs, meaning we don't actually read the magic and act differently
+        // at runtime depending what it is, so this is a debug assertion as
+        // opposed to a regular assertion.
+        unsafe {
+            debug_assert_eq!(opaque.as_ref().magic, VMCONTEXT_MAGIC);
+        }
+        opaque.cast()
+    }
+}
+
+/// A "raw" and unsafe representation of a WebAssembly value.
+///
+/// This is provided for use with the `Func::new_unchecked` and
+/// `Func::call_unchecked` APIs. In general it's unlikely you should be using
+/// this from Rust, rather using APIs like `Func::wrap` and `TypedFunc::call`.
+///
+/// This is notably an "unsafe" way to work with `Val` and it's recommended to
+/// instead use `Val` where possible. An important note about this union is that
+/// fields are all stored in little-endian format, regardless of the endianness
+/// of the host system.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union ValRaw {
+    /// A WebAssembly `i32` value.
+    ///
+    /// Note that the payload here is a Rust `i32` but the WebAssembly `i32`
+    /// type does not assign an interpretation of the upper bit as either signed
+    /// or unsigned. The Rust type `i32` is simply chosen for convenience.
+    ///
+    /// This value is always stored in a little-endian format.
+    i32: i32,
+
+    /// A WebAssembly `i64` value.
+    ///
+    /// Note that the payload here is a Rust `i64` but the WebAssembly `i64`
+    /// type does not assign an interpretation of the upper bit as either signed
+    /// or unsigned. The Rust type `i64` is simply chosen for convenience.
+    ///
+    /// This value is always stored in a little-endian format.
+    i64: i64,
+
+    /// A WebAssembly `f32` value.
+    ///
+    /// Note that the payload here is a Rust `u32`. This is to allow passing any
+    /// representation of NaN into WebAssembly without risk of changing NaN
+    /// payload bits as its gets passed around the system. Otherwise though this
+    /// `u32` value is the return value of `f32::to_bits` in Rust.
+    ///
+    /// This value is always stored in a little-endian format.
+    f32: u32,
+
+    /// A WebAssembly `f64` value.
+    ///
+    /// Note that the payload here is a Rust `u64`. This is to allow passing any
+    /// representation of NaN into WebAssembly without risk of changing NaN
+    /// payload bits as its gets passed around the system. Otherwise though this
+    /// `u64` value is the return value of `f64::to_bits` in Rust.
+    ///
+    /// This value is always stored in a little-endian format.
+    f64: u64,
+
+    /// A WebAssembly `v128` value.
+    ///
+    /// The payload here is a Rust `[u8; 16]` which has the same number of bits
+    /// but note that `v128` in WebAssembly is often considered a vector type
+    /// such as `i32x4` or `f64x2`. This means that the actual interpretation
+    /// of the underlying bits is left up to the instructions which consume
+    /// this value.
+    ///
+    /// This value is always stored in a little-endian format.
+    v128: [u8; 16],
+
+    /// A WebAssembly `funcref` value (or one of its subtypes).
+    ///
+    /// The payload here is a pointer which is runtime-defined. This is one of
+    /// the main points of unsafety about the `ValRaw` type as the validity of
+    /// the pointer here is not easily verified and must be preserved by
+    /// carefully calling the correct functions throughout the runtime.
+    ///
+    /// This value is always stored in a little-endian format.
+    funcref: *mut c_void,
+
+    /// A WebAssembly `externref` value (or one of its subtypes).
+    ///
+    /// The payload here is a compressed pointer value which is
+    /// runtime-defined. This is one of the main points of unsafety about the
+    /// `ValRaw` type as the validity of the pointer here is not easily verified
+    /// and must be preserved by carefully calling the correct functions
+    /// throughout the runtime.
+    ///
+    /// This value is always stored in a little-endian format.
+    externref: u32,
+
+    /// A WebAssembly `anyref` value (or one of its subtypes).
+    ///
+    /// The payload here is a compressed pointer value which is
+    /// runtime-defined. This is one of the main points of unsafety about the
+    /// `ValRaw` type as the validity of the pointer here is not easily verified
+    /// and must be preserved by carefully calling the correct functions
+    /// throughout the runtime.
+    ///
+    /// This value is always stored in a little-endian format.
+    anyref: u32,
+
+    /// A WebAssembly `exnref` value (or one of its subtypes).
+    ///
+    /// The payload here is a compressed pointer value which is
+    /// runtime-defined. This is one of the main points of unsafety about the
+    /// `ValRaw` type as the validity of the pointer here is not easily verified
+    /// and must be preserved by carefully calling the correct functions
+    /// throughout the runtime.
+    ///
+    /// This value is always stored in a little-endian format.
+    exnref: u32,
+}
+
+// The `ValRaw` type is matched as `wasmtime_val_raw_t` in the C API so these
+// are some simple assertions about the shape of the type which are additionally
+// matched in C.
+const _: () = {
+    assert!(mem::size_of::<ValRaw>() == 16);
+    assert!(mem::align_of::<ValRaw>() == mem::align_of::<u64>());
+};
+
+// This type is just a bag-of-bits so it's up to the caller to figure out how
+// to safely deal with threading concerns and safely access interior bits.
+unsafe impl Send for ValRaw {}
+unsafe impl Sync for ValRaw {}
+
+impl fmt::Debug for ValRaw {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Hex<T>(T);
+        impl<T: fmt::LowerHex> fmt::Debug for Hex<T> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let bytes = mem::size_of::<T>();
+                let hex_digits_per_byte = 2;
+                let hex_digits = bytes * hex_digits_per_byte;
+                write!(f, "0x{:0width$x}", self.0, width = hex_digits)
+            }
+        }
+
+        unsafe {
+            f.debug_struct("ValRaw")
+                .field("i32", &Hex(self.i32))
+                .field("i64", &Hex(self.i64))
+                .field("f32", &Hex(self.f32))
+                .field("f64", &Hex(self.f64))
+                .field("v128", &Hex(u128::from_le_bytes(self.v128)))
+                .field("funcref", &self.funcref)
+                .field("externref", &Hex(self.externref))
+                .field("anyref", &Hex(self.anyref))
+                .field("exnref", &Hex(self.exnref))
+                .finish()
+        }
+    }
+}
+
+impl ValRaw {
+    /// Create a null reference that is compatible with any of
+    /// `{any,extern,func,exn}ref`.
+    pub fn null() -> ValRaw {
+        unsafe {
+            let raw = mem::MaybeUninit::<Self>::zeroed().assume_init();
+            debug_assert_eq!(raw.get_anyref(), 0);
+            debug_assert_eq!(raw.get_exnref(), 0);
+            debug_assert_eq!(raw.get_externref(), 0);
+            debug_assert_eq!(raw.get_funcref(), ptr::null_mut());
+            raw
+        }
+    }
+
+    /// Creates a WebAssembly `i32` value
+    #[inline]
+    pub fn i32(i: i32) -> ValRaw {
+        // Note that this is intentionally not setting the `i32` field, instead
+        // setting the `i64` field with a zero-extended version of `i`. For more
+        // information on this see the comments on `Lower for Result` in the
+        // `wasmtime` crate. Otherwise though all `ValRaw` constructors are
+        // otherwise constrained to guarantee that the initial 64-bits are
+        // always initialized.
+        ValRaw::u64(i.cast_unsigned().into())
+    }
+
+    /// Creates a WebAssembly `i64` value
+    #[inline]
+    pub fn i64(i: i64) -> ValRaw {
+        ValRaw { i64: i.to_le() }
+    }
+
+    /// Creates a WebAssembly `i32` value
+    #[inline]
+    pub fn u32(i: u32) -> ValRaw {
+        // See comments in `ValRaw::i32` for why this is setting the upper
+        // 32-bits as well.
+        ValRaw::u64(i.into())
+    }
+
+    /// Creates a WebAssembly `i64` value
+    #[inline]
+    pub fn u64(i: u64) -> ValRaw {
+        ValRaw::i64(i as i64)
+    }
+
+    /// Creates a WebAssembly `f32` value
+    #[inline]
+    pub fn f32(i: u32) -> ValRaw {
+        // See comments in `ValRaw::i32` for why this is setting the upper
+        // 32-bits as well.
+        ValRaw::u64(i.into())
+    }
+
+    /// Creates a WebAssembly `f64` value
+    #[inline]
+    pub fn f64(i: u64) -> ValRaw {
+        ValRaw { f64: i.to_le() }
+    }
+
+    /// Creates a WebAssembly `v128` value
+    #[inline]
+    pub fn v128(i: u128) -> ValRaw {
+        ValRaw {
+            v128: i.to_le_bytes(),
+        }
+    }
+
+    /// Creates a WebAssembly `funcref` value
+    #[inline]
+    pub fn funcref(i: *mut c_void) -> ValRaw {
+        ValRaw {
+            funcref: i.map_addr(|i| i.to_le()),
+        }
+    }
+
+    /// Creates a WebAssembly `externref` value
+    #[inline]
+    pub fn externref(e: u32) -> ValRaw {
+        assert!(cfg!(feature = "gc") || e == 0);
+        ValRaw {
+            externref: e.to_le(),
+        }
+    }
+
+    /// Creates a WebAssembly `anyref` value
+    #[inline]
+    pub fn anyref(r: u32) -> ValRaw {
+        assert!(cfg!(feature = "gc") || r == 0);
+        ValRaw { anyref: r.to_le() }
+    }
+
+    /// Creates a WebAssembly `exnref` value
+    #[inline]
+    pub fn exnref(r: u32) -> ValRaw {
+        assert!(cfg!(feature = "gc") || r == 0);
+        ValRaw { exnref: r.to_le() }
+    }
+
+    #[inline]
+    pub(crate) fn vmgcref(r: Option<VMGcRef>) -> ValRaw {
+        let raw = r.map_or(0, |r| r.as_raw_u32());
+
+        // NB: All `VMGcRef`-based `ValRaw`s are the same.
+        debug_assert_eq!(raw, ValRaw::anyref(raw).get_exnref());
+        debug_assert_eq!(raw, ValRaw::exnref(raw).get_externref());
+        debug_assert_eq!(raw, ValRaw::externref(raw).get_anyref());
+
+        ValRaw::anyref(raw)
+    }
+
+    /// Gets the WebAssembly `i32` value
+    #[inline]
+    pub fn get_i32(&self) -> i32 {
+        unsafe { i32::from_le(self.i32) }
+    }
+
+    /// Gets the WebAssembly `i64` value
+    #[inline]
+    pub fn get_i64(&self) -> i64 {
+        unsafe { i64::from_le(self.i64) }
+    }
+
+    /// Gets the WebAssembly `i32` value
+    #[inline]
+    pub fn get_u32(&self) -> u32 {
+        self.get_i32().cast_unsigned()
+    }
+
+    /// Gets the WebAssembly `i64` value
+    #[inline]
+    pub fn get_u64(&self) -> u64 {
+        self.get_i64().cast_unsigned()
+    }
+
+    /// Gets the WebAssembly `f32` value
+    #[inline]
+    pub fn get_f32(&self) -> u32 {
+        unsafe { u32::from_le(self.f32) }
+    }
+
+    /// Gets the WebAssembly `f64` value
+    #[inline]
+    pub fn get_f64(&self) -> u64 {
+        unsafe { u64::from_le(self.f64) }
+    }
+
+    /// Gets the WebAssembly `v128` value
+    #[inline]
+    pub fn get_v128(&self) -> u128 {
+        unsafe { u128::from_le_bytes(self.v128) }
+    }
+
+    /// Gets the WebAssembly `funcref` value
+    #[inline]
+    pub fn get_funcref(&self) -> *mut c_void {
+        let addr = unsafe { usize::from_le(self.funcref.addr()) };
+        core::ptr::with_exposed_provenance_mut(addr)
+    }
+
+    /// Gets the WebAssembly `externref` value
+    #[inline]
+    pub fn get_externref(&self) -> u32 {
+        let externref = u32::from_le(unsafe { self.externref });
+        assert!(cfg!(feature = "gc") || externref == 0);
+        externref
+    }
+
+    /// Gets the WebAssembly `anyref` value
+    #[inline]
+    pub fn get_anyref(&self) -> u32 {
+        let anyref = u32::from_le(unsafe { self.anyref });
+        assert!(cfg!(feature = "gc") || anyref == 0);
+        anyref
+    }
+
+    /// Gets the WebAssembly `exnref` value
+    #[inline]
+    pub fn get_exnref(&self) -> u32 {
+        let exnref = u32::from_le(unsafe { self.exnref });
+        assert!(cfg!(feature = "gc") || exnref == 0);
+        exnref
+    }
+
+    /// Get the inner `VMGcRef`.
+    pub(crate) fn get_vmgcref(&self) -> Option<crate::vm::VMGcRef> {
+        debug_assert_eq!(self.get_anyref(), self.get_exnref());
+        debug_assert_eq!(self.get_anyref(), self.get_externref());
+        VMGcRef::from_raw_u32(self.get_anyref())
+    }
+}
+
+/// An "opaque" version of `VMContext` which must be explicitly casted to a
+/// target context.
+///
+/// This context is used to represent that contexts specified in
+/// `VMFuncRef` can have any type and don't have an implicit
+/// structure. Neither wasmtime nor cranelift-generated code can rely on the
+/// structure of an opaque context in general and only the code which configured
+/// the context is able to rely on a particular structure. This is because the
+/// context pointer configured for `VMFuncRef` is guaranteed to be
+/// the first parameter passed.
+///
+/// Note that Wasmtime currently has a layout where all contexts that are casted
+/// to an opaque context start with a 32-bit "magic" which can be used in debug
+/// mode to debug-assert that the casts here are correct and have at least a
+/// little protection against incorrect casts.
+pub struct VMOpaqueContext {
+    pub(crate) magic: u32,
+    _marker: marker::PhantomPinned,
+}
+
+impl VMOpaqueContext {
+    /// Helper function to clearly indicate that casts are desired.
+    #[inline]
+    pub fn from_vmcontext(ptr: NonNull<VMContext>) -> NonNull<VMOpaqueContext> {
+        ptr.cast()
+    }
+
+    /// Helper function to clearly indicate that casts are desired.
+    #[inline]
+    pub fn from_vm_array_call_host_func_context(
+        ptr: NonNull<VMArrayCallHostFuncContext>,
+    ) -> NonNull<VMOpaqueContext> {
+        ptr.cast()
+    }
+}

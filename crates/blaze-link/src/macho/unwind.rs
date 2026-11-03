@@ -193,7 +193,7 @@ fn dwarf_mode(arch: Arch) -> Result<u32, LinkError> {
         Arch::Aarch64 => Ok(ARM64_MODE_DWARF),
         Arch::X86_64 => Ok(X86_64_MODE_DWARF),
         // alloc: error path
-        Arch::Wasm32 => Err(error("__unwind_info: wasm32 has no compact unwind encoding".into())),
+        Arch::Wasm32 | Arch::Wasm64 => Err(error(format!("__unwind_info: {arch:?} has no compact unwind encoding"))),
     }
 }
 
@@ -2877,7 +2877,7 @@ mod tests {
         let dwarf_mode = match arch {
             Arch::Aarch64 => ARM64_MODE_DWARF,
             Arch::X86_64 => X86_64_MODE_DWARF,
-            Arch::Wasm32 => return Err(error("wasm32".into())),
+            Arch::Wasm32 | Arch::Wasm64 => return Err(error(format!("{arch:?}"))),
         };
         let base = placed.plan.base;
         let fdes = gimli_fdes(placed)?;

@@ -20,7 +20,7 @@ use super::{
         CYCLE, DURABILITY, Header, PROVISIONAL, RUNNING, UNTRACKED, VALUE, VIEW_MASK, header_at,
         span,
     },
-    storage::{FIELD, Storage, color, key_parts, or},
+    storage::{FIELD, NodeRow, Storage, color, key_parts, or},
 };
 
 /// Edges ahead of the one checked whose colors are prefetched.
@@ -40,10 +40,12 @@ pub(crate) fn unclaimed(storage: &Storage, header: &Header, word: u32, node: u32
     {
         return false;
     }
-    if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK)
-        || storage.inputs_unchanged(node, word & VIEW_MASK)
-    {
-        return mark(storage, header, word, node);
+    if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK) {
+        return mark(storage, header, word, storage.node(node));
+    }
+    let row = storage.node(node);
+    if storage.inputs_unchanged(row, word & VIEW_MASK) {
+        return mark(storage, header, word, row);
     }
     local::with(|local| {
         let base = local.walk.len();
@@ -86,9 +88,10 @@ fn walk(
             // SAFETY: the header is in a row page of `storage` (pushed from one), which lives
             // as long as the storage, borrowed for this walk.
             let header = unsafe { &*done.header };
+            let row = storage.node(done.node);
             // The summary goes in before the mark publishes the row in this view.
-            storage.grow_summary(done.node, done.summary);
-            if !mark(storage, header, done.word, done.node) {
+            row.grow_summary(done.summary);
+            if !mark(storage, header, done.word, row) {
                 return false;
             }
             stack.pop();
@@ -99,7 +102,7 @@ fn walk(
             if header.changed.load(Ordering::Relaxed) > parent.verified {
                 return false;
             }
-            parent.summary = or(parent.summary, storage.summary_of(done.node));
+            parent.summary = or(parent.summary, row.summary());
             continue;
         }
         let at = top.next;
@@ -107,16 +110,16 @@ fn walk(
         let verified = top.verified;
         if at + AHEAD < top.end {
             let ahead = storage.edge(at + AHEAD) as usize;
-            prefetch::read(storage.colors.get(ahead));
-            prefetch::read(storage.summaries.get(ahead));
+            storage.nodes.prefetch(ahead);
         }
         let dep = storage.edge(at);
-        let seen = storage.color_of(dep);
+        let row = storage.node(dep);
+        let seen = row.color();
         let painted = (seen >> 32) as u32;
         let proved = if painted >= FIELD || painted == view {
             seen as u32 <= verified
         } else {
-            let Some(header) = function_header(storage, dep) else { return false };
+            let Some(header) = function_header(storage, row) else { return false };
             let word = header.verified.load(Ordering::Acquire);
             let meta = header.meta.load(Ordering::Relaxed);
             if word & (RUNNING | PROVISIONAL) != 0
@@ -128,9 +131,9 @@ fn walk(
             if word & VIEW_MASK == view {
                 header.changed.load(Ordering::Relaxed) <= verified
             } else if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK)
-                || storage.inputs_unchanged(dep, word & VIEW_MASK)
+                || storage.inputs_unchanged(row, word & VIEW_MASK)
             {
-                mark(storage, header, word, dep)
+                mark(storage, header, word, row)
                     && header.changed.load(Ordering::Relaxed) <= verified
             } else {
                 if stack.len() - base > depth {
@@ -145,13 +148,13 @@ fn walk(
             return false;
         }
         let top = stack.last_mut().expect("the walked row");
-        top.summary = or(top.summary, storage.summary_of(dep));
+        top.summary = or(top.summary, row.summary());
     }
 }
 
 /// The header of the function row whose node is `node`, if its page was made.
-fn function_header(storage: &Storage, node: u32) -> Option<&Header> {
-    let (index, id, _) = key_parts(storage.key_of(node));
+fn function_header<'s>(storage: &'s Storage, node: &NodeRow) -> Option<&'s Header> {
+    let (index, id, _) = key_parts(node.key());
     let vtable = ingredient::vtable(index)?;
     if vtable.kind != Kind::Function {
         return None;
@@ -160,8 +163,8 @@ fn function_header(storage: &Storage, node: u32) -> Option<&Header> {
     if dir.is_null() {
         return None;
     }
-    // SAFETY: a published directory is committed whole for `MAX_PAGES` entries, and
-    // `id.page() < MAX_PAGES`.
+    // SAFETY: a published directory is readable whole for `MAX_PAGES` entries
+    // (`Pages::dir`), and `id.page() < MAX_PAGES` (masked, `Id::page`).
     let page = NonNull::new(unsafe { &*dir.add(id.page()) }.load(Ordering::Acquire))?;
     // SAFETY: the page is the function's, made with rows of its vtable's `row_size`; the
     // header lives as long as `storage`.
@@ -170,37 +173,15 @@ fn function_header(storage: &Storage, node: u32) -> Option<&Header> {
 
 /// Marks a row verified in this view, keeping whether it has its value: `false` when another
 /// task changed its word meanwhile.
-fn mark(storage: &Storage, header: &Header, word: u32, node: u32) -> bool {
+fn mark(storage: &Storage, header: &Header, word: u32, node: &NodeRow) -> bool {
     let view = storage.view_bits();
     let to = view | (word & VALUE);
     match header.verified.compare_exchange(word, to, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {
-            storage.paint(node, color(view, header.changed.load(Ordering::Relaxed)));
-            counts::count(key_parts(storage.key_of(node)).0, counts::VERIFIED);
+            node.paint(color(view, header.changed.load(Ordering::Relaxed)));
+            counts::count(key_parts(node.key()).0, counts::VERIFIED);
             true
         }
         Err(now) => now == to,
-    }
-}
-
-/// A prefetch hint for a color the walk reads soon. The one unsafe concern: the instruction.
-mod prefetch {
-    #[inline(always)]
-    pub(super) fn read<T>(at: &T) {
-        let at = std::ptr::from_ref(at);
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: `prefetcht0` is a hint: it never faults, writes nothing, and `at` is a
-        // valid reference besides.
-        unsafe {
-            std::arch::asm!("prefetcht0 [{at}]", at = in(reg) at, options(nostack, preserves_flags, readonly));
-        }
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: `prfm pldl1keep` is a hint: it never faults, writes nothing, and `at` is a
-        // valid reference besides.
-        unsafe {
-            std::arch::asm!("prfm pldl1keep, [{at}]", at = in(reg) at, options(nostack, preserves_flags, readonly));
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let _ = at;
     }
 }

@@ -1209,7 +1209,7 @@ pub struct Prestat {
 /// The size of the array should match that returned by `args_sizes_get`.
 /// Each argument is expected to be `\0` terminated.
 pub unsafe fn args_get(argv: *mut *mut u8, argv_buf: *mut u8) -> Result<(), Errno> {
-    let ret = wasi_snapshot_preview1::args_get(argv as i32, argv_buf as i32);
+    let ret = wasi_snapshot_preview1::args_get(argv as usize, argv_buf as usize);
     match ret {
         0 => Ok(()),
         _ => Err(Errno(ret as u16)),
@@ -1226,11 +1226,11 @@ pub unsafe fn args_sizes_get() -> Result<(Size, Size), Errno> {
     let mut rp0 = MaybeUninit::<Size>::uninit();
     let mut rp1 = MaybeUninit::<Size>::uninit();
     let ret =
-        wasi_snapshot_preview1::args_sizes_get(rp0.as_mut_ptr() as i32, rp1.as_mut_ptr() as i32);
+        wasi_snapshot_preview1::args_sizes_get(rp0.as_mut_ptr() as usize, rp1.as_mut_ptr() as usize);
     match ret {
         0 => Ok((
-            core::ptr::read(rp0.as_mut_ptr() as i32 as *const Size),
-            core::ptr::read(rp1.as_mut_ptr() as i32 as *const Size),
+            core::ptr::read(rp0.as_mut_ptr() as *const Size),
+            core::ptr::read(rp1.as_mut_ptr() as *const Size),
         )),
         _ => Err(Errno(ret as u16)),
     }
@@ -1240,7 +1240,7 @@ pub unsafe fn args_sizes_get() -> Result<(Size, Size), Errno> {
 /// The sizes of the buffers should match that returned by `environ_sizes_get`.
 /// Key/value pairs are expected to be joined with `=`s, and terminated with `\0`s.
 pub unsafe fn environ_get(environ: *mut *mut u8, environ_buf: *mut u8) -> Result<(), Errno> {
-    let ret = wasi_snapshot_preview1::environ_get(environ as i32, environ_buf as i32);
+    let ret = wasi_snapshot_preview1::environ_get(environ as usize, environ_buf as usize);
     match ret {
         0 => Ok(()),
         _ => Err(Errno(ret as u16)),
@@ -1257,11 +1257,11 @@ pub unsafe fn environ_sizes_get() -> Result<(Size, Size), Errno> {
     let mut rp0 = MaybeUninit::<Size>::uninit();
     let mut rp1 = MaybeUninit::<Size>::uninit();
     let ret =
-        wasi_snapshot_preview1::environ_sizes_get(rp0.as_mut_ptr() as i32, rp1.as_mut_ptr() as i32);
+        wasi_snapshot_preview1::environ_sizes_get(rp0.as_mut_ptr() as usize, rp1.as_mut_ptr() as usize);
     match ret {
         0 => Ok((
-            core::ptr::read(rp0.as_mut_ptr() as i32 as *const Size),
-            core::ptr::read(rp1.as_mut_ptr() as i32 as *const Size),
+            core::ptr::read(rp0.as_mut_ptr() as *const Size),
+            core::ptr::read(rp1.as_mut_ptr() as *const Size),
         )),
         _ => Err(Errno(ret as u16)),
     }
@@ -1281,9 +1281,9 @@ pub unsafe fn environ_sizes_get() -> Result<(Size, Size), Errno> {
 /// The resolution of the clock, or an error if one happened.
 pub unsafe fn clock_res_get(id: Clockid) -> Result<Timestamp, Errno> {
     let mut rp0 = MaybeUninit::<Timestamp>::uninit();
-    let ret = wasi_snapshot_preview1::clock_res_get(id.0 as i32, rp0.as_mut_ptr() as i32);
+    let ret = wasi_snapshot_preview1::clock_res_get(id.0 as i32, rp0.as_mut_ptr() as usize);
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Timestamp)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Timestamp)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1304,10 +1304,10 @@ pub unsafe fn clock_time_get(id: Clockid, precision: Timestamp) -> Result<Timest
     let ret = wasi_snapshot_preview1::clock_time_get(
         id.0 as i32,
         precision as i64,
-        rp0.as_mut_ptr() as i32,
+        rp0.as_mut_ptr() as usize,
     );
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Timestamp)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Timestamp)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1377,9 +1377,9 @@ pub unsafe fn fd_datasync(fd: Fd) -> Result<(), Errno> {
 /// The buffer where the file descriptor's attributes are stored.
 pub unsafe fn fd_fdstat_get(fd: Fd) -> Result<Fdstat, Errno> {
     let mut rp0 = MaybeUninit::<Fdstat>::uninit();
-    let ret = wasi_snapshot_preview1::fd_fdstat_get(fd as i32, rp0.as_mut_ptr() as i32);
+    let ret = wasi_snapshot_preview1::fd_fdstat_get(fd as i32, rp0.as_mut_ptr() as usize);
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Fdstat)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Fdstat)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1427,9 +1427,9 @@ pub unsafe fn fd_fdstat_set_rights(
 /// The buffer where the file's attributes are stored.
 pub unsafe fn fd_filestat_get(fd: Fd) -> Result<Filestat, Errno> {
     let mut rp0 = MaybeUninit::<Filestat>::uninit();
-    let ret = wasi_snapshot_preview1::fd_filestat_get(fd as i32, rp0.as_mut_ptr() as i32);
+    let ret = wasi_snapshot_preview1::fd_filestat_get(fd as i32, rp0.as_mut_ptr() as usize);
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Filestat)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Filestat)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1489,13 +1489,13 @@ pub unsafe fn fd_pread(fd: Fd, iovs: IovecArray<'_>, offset: Filesize) -> Result
     let mut rp0 = MaybeUninit::<Size>::uninit();
     let ret = wasi_snapshot_preview1::fd_pread(
         fd as i32,
-        iovs.as_ptr() as i32,
-        iovs.len() as i32,
+        iovs.as_ptr() as usize,
+        iovs.len(),
         offset as i64,
-        rp0.as_mut_ptr() as i32,
+        rp0.as_mut_ptr() as usize,
     );
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Size)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Size)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1507,9 +1507,9 @@ pub unsafe fn fd_pread(fd: Fd, iovs: IovecArray<'_>, offset: Filesize) -> Result
 /// The buffer where the description is stored.
 pub unsafe fn fd_prestat_get(fd: Fd) -> Result<Prestat, Errno> {
     let mut rp0 = MaybeUninit::<Prestat>::uninit();
-    let ret = wasi_snapshot_preview1::fd_prestat_get(fd as i32, rp0.as_mut_ptr() as i32);
+    let ret = wasi_snapshot_preview1::fd_prestat_get(fd as i32, rp0.as_mut_ptr() as usize);
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Prestat)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Prestat)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1520,7 +1520,7 @@ pub unsafe fn fd_prestat_get(fd: Fd) -> Result<Prestat, Errno> {
 ///
 /// * `path` - A buffer into which to write the preopened directory name.
 pub unsafe fn fd_prestat_dir_name(fd: Fd, path: *mut u8, path_len: Size) -> Result<(), Errno> {
-    let ret = wasi_snapshot_preview1::fd_prestat_dir_name(fd as i32, path as i32, path_len as i32);
+    let ret = wasi_snapshot_preview1::fd_prestat_dir_name(fd as i32, path as usize, path_len);
     match ret {
         0 => Ok(()),
         _ => Err(Errno(ret as u16)),
@@ -1542,13 +1542,13 @@ pub unsafe fn fd_pwrite(fd: Fd, iovs: CiovecArray<'_>, offset: Filesize) -> Resu
     let mut rp0 = MaybeUninit::<Size>::uninit();
     let ret = wasi_snapshot_preview1::fd_pwrite(
         fd as i32,
-        iovs.as_ptr() as i32,
-        iovs.len() as i32,
+        iovs.as_ptr() as usize,
+        iovs.len(),
         offset as i64,
-        rp0.as_mut_ptr() as i32,
+        rp0.as_mut_ptr() as usize,
     );
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Size)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Size)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1567,12 +1567,12 @@ pub unsafe fn fd_read(fd: Fd, iovs: IovecArray<'_>) -> Result<Size, Errno> {
     let mut rp0 = MaybeUninit::<Size>::uninit();
     let ret = wasi_snapshot_preview1::fd_read(
         fd as i32,
-        iovs.as_ptr() as i32,
-        iovs.len() as i32,
-        rp0.as_mut_ptr() as i32,
+        iovs.as_ptr() as usize,
+        iovs.len(),
+        rp0.as_mut_ptr() as usize,
     );
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Size)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Size)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1604,13 +1604,13 @@ pub unsafe fn fd_readdir(
     let mut rp0 = MaybeUninit::<Size>::uninit();
     let ret = wasi_snapshot_preview1::fd_readdir(
         fd as i32,
-        buf as i32,
-        buf_len as i32,
+        buf as usize,
+        buf_len,
         cookie as i64,
-        rp0.as_mut_ptr() as i32,
+        rp0.as_mut_ptr() as usize,
     );
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Size)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Size)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1652,10 +1652,10 @@ pub unsafe fn fd_seek(fd: Fd, offset: Filedelta, whence: Whence) -> Result<Files
         fd as i32,
         offset,
         whence.0 as i32,
-        rp0.as_mut_ptr() as i32,
+        rp0.as_mut_ptr() as usize,
     );
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Filesize)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Filesize)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1678,9 +1678,9 @@ pub unsafe fn fd_sync(fd: Fd) -> Result<(), Errno> {
 /// The current offset of the file descriptor, relative to the start of the file.
 pub unsafe fn fd_tell(fd: Fd) -> Result<Filesize, Errno> {
     let mut rp0 = MaybeUninit::<Filesize>::uninit();
-    let ret = wasi_snapshot_preview1::fd_tell(fd as i32, rp0.as_mut_ptr() as i32);
+    let ret = wasi_snapshot_preview1::fd_tell(fd as i32, rp0.as_mut_ptr() as usize);
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Filesize)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Filesize)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1695,12 +1695,12 @@ pub unsafe fn fd_write(fd: Fd, iovs: CiovecArray<'_>) -> Result<Size, Errno> {
     let mut rp0 = MaybeUninit::<Size>::uninit();
     let ret = wasi_snapshot_preview1::fd_write(
         fd as i32,
-        iovs.as_ptr() as i32,
-        iovs.len() as i32,
-        rp0.as_mut_ptr() as i32,
+        iovs.as_ptr() as usize,
+        iovs.len(),
+        rp0.as_mut_ptr() as usize,
     );
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Size)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Size)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1714,8 +1714,8 @@ pub unsafe fn fd_write(fd: Fd, iovs: CiovecArray<'_>) -> Result<Size, Errno> {
 pub unsafe fn path_create_directory(fd: Fd, path: &str) -> Result<(), Errno> {
     let ret = wasi_snapshot_preview1::path_create_directory(
         fd as i32,
-        path.as_ptr() as i32,
-        path.len() as i32,
+        path.as_ptr() as usize,
+        path.len(),
     );
     match ret {
         0 => Ok(()),
@@ -1739,12 +1739,12 @@ pub unsafe fn path_filestat_get(fd: Fd, flags: Lookupflags, path: &str) -> Resul
     let ret = wasi_snapshot_preview1::path_filestat_get(
         fd as i32,
         flags as i32,
-        path.as_ptr() as i32,
-        path.len() as i32,
-        rp0.as_mut_ptr() as i32,
+        path.as_ptr() as usize,
+        path.len(),
+        rp0.as_mut_ptr() as usize,
     );
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Filestat)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Filestat)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1770,8 +1770,8 @@ pub unsafe fn path_filestat_set_times(
     let ret = wasi_snapshot_preview1::path_filestat_set_times(
         fd as i32,
         flags as i32,
-        path.as_ptr() as i32,
-        path.len() as i32,
+        path.as_ptr() as usize,
+        path.len(),
         atim as i64,
         mtim as i64,
         fst_flags as i32,
@@ -1801,11 +1801,11 @@ pub unsafe fn path_link(
     let ret = wasi_snapshot_preview1::path_link(
         old_fd as i32,
         old_flags as i32,
-        old_path.as_ptr() as i32,
-        old_path.len() as i32,
+        old_path.as_ptr() as usize,
+        old_path.len(),
         new_fd as i32,
-        new_path.as_ptr() as i32,
-        new_path.len() as i32,
+        new_path.as_ptr() as usize,
+        new_path.len(),
     );
     match ret {
         0 => Ok(()),
@@ -1851,16 +1851,16 @@ pub unsafe fn path_open(
     let ret = wasi_snapshot_preview1::path_open(
         fd as i32,
         dirflags as i32,
-        path.as_ptr() as i32,
-        path.len() as i32,
+        path.as_ptr() as usize,
+        path.len(),
         oflags as i32,
         fs_rights_base as i64,
         fs_rights_inheriting as i64,
         fdflags as i32,
-        rp0.as_mut_ptr() as i32,
+        rp0.as_mut_ptr() as usize,
     );
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Fd)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Fd)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1885,14 +1885,14 @@ pub unsafe fn path_readlink(
     let mut rp0 = MaybeUninit::<Size>::uninit();
     let ret = wasi_snapshot_preview1::path_readlink(
         fd as i32,
-        path.as_ptr() as i32,
-        path.len() as i32,
-        buf as i32,
-        buf_len as i32,
-        rp0.as_mut_ptr() as i32,
+        path.as_ptr() as usize,
+        path.len(),
+        buf as usize,
+        buf_len,
+        rp0.as_mut_ptr() as usize,
     );
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Size)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Size)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -1907,8 +1907,8 @@ pub unsafe fn path_readlink(
 pub unsafe fn path_remove_directory(fd: Fd, path: &str) -> Result<(), Errno> {
     let ret = wasi_snapshot_preview1::path_remove_directory(
         fd as i32,
-        path.as_ptr() as i32,
-        path.len() as i32,
+        path.as_ptr() as usize,
+        path.len(),
     );
     match ret {
         0 => Ok(()),
@@ -1927,11 +1927,11 @@ pub unsafe fn path_remove_directory(fd: Fd, path: &str) -> Result<(), Errno> {
 pub unsafe fn path_rename(fd: Fd, old_path: &str, new_fd: Fd, new_path: &str) -> Result<(), Errno> {
     let ret = wasi_snapshot_preview1::path_rename(
         fd as i32,
-        old_path.as_ptr() as i32,
-        old_path.len() as i32,
+        old_path.as_ptr() as usize,
+        old_path.len(),
         new_fd as i32,
-        new_path.as_ptr() as i32,
-        new_path.len() as i32,
+        new_path.as_ptr() as usize,
+        new_path.len(),
     );
     match ret {
         0 => Ok(()),
@@ -1948,11 +1948,11 @@ pub unsafe fn path_rename(fd: Fd, old_path: &str, new_fd: Fd, new_path: &str) ->
 /// * `new_path` - The destination path at which to create the symbolic link.
 pub unsafe fn path_symlink(old_path: &str, fd: Fd, new_path: &str) -> Result<(), Errno> {
     let ret = wasi_snapshot_preview1::path_symlink(
-        old_path.as_ptr() as i32,
-        old_path.len() as i32,
+        old_path.as_ptr() as usize,
+        old_path.len(),
         fd as i32,
-        new_path.as_ptr() as i32,
-        new_path.len() as i32,
+        new_path.as_ptr() as usize,
+        new_path.len(),
     );
     match ret {
         0 => Ok(()),
@@ -1970,8 +1970,8 @@ pub unsafe fn path_symlink(old_path: &str, fd: Fd, new_path: &str) -> Result<(),
 pub unsafe fn path_unlink_file(fd: Fd, path: &str) -> Result<(), Errno> {
     let ret = wasi_snapshot_preview1::path_unlink_file(
         fd as i32,
-        path.as_ptr() as i32,
-        path.len() as i32,
+        path.as_ptr() as usize,
+        path.len(),
     );
     match ret {
         0 => Ok(()),
@@ -1997,13 +1997,13 @@ pub unsafe fn poll_oneoff(
 ) -> Result<Size, Errno> {
     let mut rp0 = MaybeUninit::<Size>::uninit();
     let ret = wasi_snapshot_preview1::poll_oneoff(
-        in_ as i32,
-        out as i32,
-        nsubscriptions as i32,
-        rp0.as_mut_ptr() as i32,
+        in_ as usize,
+        out as usize,
+        nsubscriptions,
+        rp0.as_mut_ptr() as usize,
     );
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Size)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Size)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -2054,7 +2054,7 @@ pub unsafe fn sched_yield() -> Result<(), Errno> {
 ///
 /// * `buf` - The buffer to fill with random data.
 pub unsafe fn random_get(buf: *mut u8, buf_len: Size) -> Result<(), Errno> {
-    let ret = wasi_snapshot_preview1::random_get(buf as i32, buf_len as i32);
+    let ret = wasi_snapshot_preview1::random_get(buf as usize, buf_len);
     match ret {
         0 => Ok(()),
         _ => Err(Errno(ret as u16)),
@@ -2074,9 +2074,9 @@ pub unsafe fn random_get(buf: *mut u8, buf_len: Size) -> Result<(), Errno> {
 /// New socket connection
 pub unsafe fn sock_accept(fd: Fd, flags: Fdflags) -> Result<Fd, Errno> {
     let mut rp0 = MaybeUninit::<Fd>::uninit();
-    let ret = wasi_snapshot_preview1::sock_accept(fd as i32, flags as i32, rp0.as_mut_ptr() as i32);
+    let ret = wasi_snapshot_preview1::sock_accept(fd as i32, flags as i32, rp0.as_mut_ptr() as usize);
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Fd)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Fd)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -2102,16 +2102,16 @@ pub unsafe fn sock_recv(
     let mut rp1 = MaybeUninit::<Roflags>::uninit();
     let ret = wasi_snapshot_preview1::sock_recv(
         fd as i32,
-        ri_data.as_ptr() as i32,
-        ri_data.len() as i32,
+        ri_data.as_ptr() as usize,
+        ri_data.len(),
         ri_flags as i32,
-        rp0.as_mut_ptr() as i32,
-        rp1.as_mut_ptr() as i32,
+        rp0.as_mut_ptr() as usize,
+        rp1.as_mut_ptr() as usize,
     );
     match ret {
         0 => Ok((
-            core::ptr::read(rp0.as_mut_ptr() as i32 as *const Size),
-            core::ptr::read(rp1.as_mut_ptr() as i32 as *const Roflags),
+            core::ptr::read(rp0.as_mut_ptr() as *const Size),
+            core::ptr::read(rp1.as_mut_ptr() as *const Roflags),
         )),
         _ => Err(Errno(ret as u16)),
     }
@@ -2137,13 +2137,13 @@ pub unsafe fn sock_send(
     let mut rp0 = MaybeUninit::<Size>::uninit();
     let ret = wasi_snapshot_preview1::sock_send(
         fd as i32,
-        si_data.as_ptr() as i32,
-        si_data.len() as i32,
+        si_data.as_ptr() as usize,
+        si_data.len(),
         si_flags as i32,
-        rp0.as_mut_ptr() as i32,
+        rp0.as_mut_ptr() as usize,
     );
     match ret {
-        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as i32 as *const Size)),
+        0 => Ok(core::ptr::read(rp0.as_mut_ptr() as *const Size)),
         _ => Err(Errno(ret as u16)),
     }
 }
@@ -2162,29 +2162,53 @@ pub unsafe fn sock_shutdown(fd: Fd, how: Sdflags) -> Result<(), Errno> {
     }
 }
 
+/// The raw imports. Every argument that is a pointer or a witx `size` (the `(ptr, len)` pair of
+/// a string or list included) is a `usize` here, every other one keeps its wasip1 type.
+///
+/// The import module is the one place its name is defined (blaze's change, library/UPSTREAM):
+///
+/// - `wasi_snapshot_preview1` on a 32-bit target (wasm32-wasip1), as upstream.
+/// - `wasi_snapshot_preview1_64` on a 64-bit one (blaze's `wasm64-blaze-wasip1`, memory64). Its
+///   ABI is wasip1's witx with pointer and `size` 64 bits wide: the same functions, names and
+///   semantics as `wasi_snapshot_preview1`, but every parameter that is a pointer or a `size`
+///   (the `(ptr, len)` pairs of strings and lists included) is an i64; every other parameter
+///   keeps its wasip1 type (`fd` i32, flags, `filesize` and `timestamp` i64); results stay an
+///   `errno` i32. In memory, `size` and pointer fields are 8 bytes aligned to 8: `iovec` and
+///   `ciovec` are 16 bytes, `prestat_dir.pr_name_len` is a u64, and `args_sizes_get` and
+///   `environ_sizes_get` (and every other `size` result) write u64s; everything else (`fdstat`,
+///   `filestat`, `dirent`, `event`, `subscription`) is laid out as in wasip1. A host that only
+///   has `wasi_snapshot_preview1` refuses such a module at instantiation, naming the imports it
+///   lacks, rather than running it with 32-bit pointers.
 pub mod wasi_snapshot_preview1 {
-    #[link(wasm_import_module = "wasi_snapshot_preview1")]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        link(wasm_import_module = "wasi_snapshot_preview1")
+    )]
+    #[cfg_attr(
+        target_pointer_width = "64",
+        link(wasm_import_module = "wasi_snapshot_preview1_64")
+    )]
     extern "C" {
         /// Read command-line argument data.
         /// The size of the array should match that returned by `args_sizes_get`.
         /// Each argument is expected to be `\0` terminated.
-        pub fn args_get(arg0: i32, arg1: i32) -> i32;
+        pub fn args_get(arg0: usize, arg1: usize) -> i32;
         /// Return command-line argument data sizes.
-        pub fn args_sizes_get(arg0: i32, arg1: i32) -> i32;
+        pub fn args_sizes_get(arg0: usize, arg1: usize) -> i32;
         /// Read environment variable data.
         /// The sizes of the buffers should match that returned by `environ_sizes_get`.
         /// Key/value pairs are expected to be joined with `=`s, and terminated with `\0`s.
-        pub fn environ_get(arg0: i32, arg1: i32) -> i32;
+        pub fn environ_get(arg0: usize, arg1: usize) -> i32;
         /// Return environment variable data sizes.
-        pub fn environ_sizes_get(arg0: i32, arg1: i32) -> i32;
+        pub fn environ_sizes_get(arg0: usize, arg1: usize) -> i32;
         /// Return the resolution of a clock.
         /// Implementations are required to provide a non-zero value for supported clocks. For unsupported clocks,
         /// return `errno::inval`.
         /// Note: This is similar to `clock_getres` in POSIX.
-        pub fn clock_res_get(arg0: i32, arg1: i32) -> i32;
+        pub fn clock_res_get(arg0: i32, arg1: usize) -> i32;
         /// Return the time value of a clock.
         /// Note: This is similar to `clock_gettime` in POSIX.
-        pub fn clock_time_get(arg0: i32, arg1: i64, arg2: i32) -> i32;
+        pub fn clock_time_get(arg0: i32, arg1: i64, arg2: usize) -> i32;
         /// Provide file advisory information on a file descriptor.
         /// Note: This is similar to `posix_fadvise` in POSIX.
         pub fn fd_advise(arg0: i32, arg1: i64, arg2: i64, arg3: i32) -> i32;
@@ -2199,7 +2223,7 @@ pub mod wasi_snapshot_preview1 {
         pub fn fd_datasync(arg0: i32) -> i32;
         /// Get the attributes of a file descriptor.
         /// Note: This returns similar flags to `fsync(fd, F_GETFL)` in POSIX, as well as additional fields.
-        pub fn fd_fdstat_get(arg0: i32, arg1: i32) -> i32;
+        pub fn fd_fdstat_get(arg0: i32, arg1: usize) -> i32;
         /// Adjust the flags associated with a file descriptor.
         /// Note: This is similar to `fcntl(fd, F_SETFL, flags)` in POSIX.
         pub fn fd_fdstat_set_flags(arg0: i32, arg1: i32) -> i32;
@@ -2207,7 +2231,7 @@ pub mod wasi_snapshot_preview1 {
         /// This can only be used to remove rights, and returns `errno::notcapable` if called in a way that would attempt to add rights
         pub fn fd_fdstat_set_rights(arg0: i32, arg1: i64, arg2: i64) -> i32;
         /// Return the attributes of an open file.
-        pub fn fd_filestat_get(arg0: i32, arg1: i32) -> i32;
+        pub fn fd_filestat_get(arg0: i32, arg1: usize) -> i32;
         /// Adjust the size of an open file. If this increases the file's size, the extra bytes are filled with zeros.
         /// Note: This is similar to `ftruncate` in POSIX.
         pub fn fd_filestat_set_size(arg0: i32, arg1: i64) -> i32;
@@ -2216,17 +2240,17 @@ pub mod wasi_snapshot_preview1 {
         pub fn fd_filestat_set_times(arg0: i32, arg1: i64, arg2: i64, arg3: i32) -> i32;
         /// Read from a file descriptor, without using and updating the file descriptor's offset.
         /// Note: This is similar to `preadv` in POSIX.
-        pub fn fd_pread(arg0: i32, arg1: i32, arg2: i32, arg3: i64, arg4: i32) -> i32;
+        pub fn fd_pread(arg0: i32, arg1: usize, arg2: usize, arg3: i64, arg4: usize) -> i32;
         /// Return a description of the given preopened file descriptor.
-        pub fn fd_prestat_get(arg0: i32, arg1: i32) -> i32;
+        pub fn fd_prestat_get(arg0: i32, arg1: usize) -> i32;
         /// Return a description of the given preopened file descriptor.
-        pub fn fd_prestat_dir_name(arg0: i32, arg1: i32, arg2: i32) -> i32;
+        pub fn fd_prestat_dir_name(arg0: i32, arg1: usize, arg2: usize) -> i32;
         /// Write to a file descriptor, without using and updating the file descriptor's offset.
         /// Note: This is similar to `pwritev` in POSIX.
-        pub fn fd_pwrite(arg0: i32, arg1: i32, arg2: i32, arg3: i64, arg4: i32) -> i32;
+        pub fn fd_pwrite(arg0: i32, arg1: usize, arg2: usize, arg3: i64, arg4: usize) -> i32;
         /// Read from a file descriptor.
         /// Note: This is similar to `readv` in POSIX.
-        pub fn fd_read(arg0: i32, arg1: i32, arg2: i32, arg3: i32) -> i32;
+        pub fn fd_read(arg0: i32, arg1: usize, arg2: usize, arg3: usize) -> i32;
         /// Read directory entries from a directory.
         /// When successful, the contents of the output buffer consist of a sequence of
         /// directory entries. Each directory entry consists of a `dirent` object,
@@ -2236,7 +2260,7 @@ pub mod wasi_snapshot_preview1 {
         /// truncating the last directory entry. This allows the caller to grow its
         /// read buffer size in case it's too small to fit a single large directory
         /// entry, or skip the oversized directory entry.
-        pub fn fd_readdir(arg0: i32, arg1: i32, arg2: i32, arg3: i64, arg4: i32) -> i32;
+        pub fn fd_readdir(arg0: i32, arg1: usize, arg2: usize, arg3: i64, arg4: usize) -> i32;
         /// Atomically replace a file descriptor by renumbering another file descriptor.
         /// Due to the strong focus on thread safety, this environment does not provide
         /// a mechanism to duplicate or renumber a file descriptor to an arbitrary
@@ -2248,29 +2272,29 @@ pub mod wasi_snapshot_preview1 {
         pub fn fd_renumber(arg0: i32, arg1: i32) -> i32;
         /// Move the offset of a file descriptor.
         /// Note: This is similar to `lseek` in POSIX.
-        pub fn fd_seek(arg0: i32, arg1: i64, arg2: i32, arg3: i32) -> i32;
+        pub fn fd_seek(arg0: i32, arg1: i64, arg2: i32, arg3: usize) -> i32;
         /// Synchronize the data and metadata of a file to disk.
         /// Note: This is similar to `fsync` in POSIX.
         pub fn fd_sync(arg0: i32) -> i32;
         /// Return the current offset of a file descriptor.
         /// Note: This is similar to `lseek(fd, 0, SEEK_CUR)` in POSIX.
-        pub fn fd_tell(arg0: i32, arg1: i32) -> i32;
+        pub fn fd_tell(arg0: i32, arg1: usize) -> i32;
         /// Write to a file descriptor.
         /// Note: This is similar to `writev` in POSIX.
-        pub fn fd_write(arg0: i32, arg1: i32, arg2: i32, arg3: i32) -> i32;
+        pub fn fd_write(arg0: i32, arg1: usize, arg2: usize, arg3: usize) -> i32;
         /// Create a directory.
         /// Note: This is similar to `mkdirat` in POSIX.
-        pub fn path_create_directory(arg0: i32, arg1: i32, arg2: i32) -> i32;
+        pub fn path_create_directory(arg0: i32, arg1: usize, arg2: usize) -> i32;
         /// Return the attributes of a file or directory.
         /// Note: This is similar to `stat` in POSIX.
-        pub fn path_filestat_get(arg0: i32, arg1: i32, arg2: i32, arg3: i32, arg4: i32) -> i32;
+        pub fn path_filestat_get(arg0: i32, arg1: i32, arg2: usize, arg3: usize, arg4: usize) -> i32;
         /// Adjust the timestamps of a file or directory.
         /// Note: This is similar to `utimensat` in POSIX.
         pub fn path_filestat_set_times(
             arg0: i32,
             arg1: i32,
-            arg2: i32,
-            arg3: i32,
+            arg2: usize,
+            arg3: usize,
             arg4: i64,
             arg5: i64,
             arg6: i32,
@@ -2280,11 +2304,11 @@ pub mod wasi_snapshot_preview1 {
         pub fn path_link(
             arg0: i32,
             arg1: i32,
-            arg2: i32,
-            arg3: i32,
+            arg2: usize,
+            arg3: usize,
             arg4: i32,
-            arg5: i32,
-            arg6: i32,
+            arg5: usize,
+            arg6: usize,
         ) -> i32;
         /// Open a file or directory.
         /// The returned file descriptor is not guaranteed to be the lowest-numbered
@@ -2296,41 +2320,41 @@ pub mod wasi_snapshot_preview1 {
         pub fn path_open(
             arg0: i32,
             arg1: i32,
-            arg2: i32,
-            arg3: i32,
+            arg2: usize,
+            arg3: usize,
             arg4: i32,
             arg5: i64,
             arg6: i64,
             arg7: i32,
-            arg8: i32,
+            arg8: usize,
         ) -> i32;
         /// Read the contents of a symbolic link.
         /// Note: This is similar to `readlinkat` in POSIX.
         pub fn path_readlink(
             arg0: i32,
-            arg1: i32,
-            arg2: i32,
-            arg3: i32,
-            arg4: i32,
-            arg5: i32,
+            arg1: usize,
+            arg2: usize,
+            arg3: usize,
+            arg4: usize,
+            arg5: usize,
         ) -> i32;
         /// Remove a directory.
         /// Return `errno::notempty` if the directory is not empty.
         /// Note: This is similar to `unlinkat(fd, path, AT_REMOVEDIR)` in POSIX.
-        pub fn path_remove_directory(arg0: i32, arg1: i32, arg2: i32) -> i32;
+        pub fn path_remove_directory(arg0: i32, arg1: usize, arg2: usize) -> i32;
         /// Rename a file or directory.
         /// Note: This is similar to `renameat` in POSIX.
-        pub fn path_rename(arg0: i32, arg1: i32, arg2: i32, arg3: i32, arg4: i32, arg5: i32)
+        pub fn path_rename(arg0: i32, arg1: usize, arg2: usize, arg3: i32, arg4: usize, arg5: usize)
             -> i32;
         /// Create a symbolic link.
         /// Note: This is similar to `symlinkat` in POSIX.
-        pub fn path_symlink(arg0: i32, arg1: i32, arg2: i32, arg3: i32, arg4: i32) -> i32;
+        pub fn path_symlink(arg0: usize, arg1: usize, arg2: i32, arg3: usize, arg4: usize) -> i32;
         /// Unlink a file.
         /// Return `errno::isdir` if the path refers to a directory.
         /// Note: This is similar to `unlinkat(fd, path, 0)` in POSIX.
-        pub fn path_unlink_file(arg0: i32, arg1: i32, arg2: i32) -> i32;
+        pub fn path_unlink_file(arg0: i32, arg1: usize, arg2: usize) -> i32;
         /// Concurrently poll for the occurrence of a set of events.
-        pub fn poll_oneoff(arg0: i32, arg1: i32, arg2: i32, arg3: i32) -> i32;
+        pub fn poll_oneoff(arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> i32;
         /// Terminate the process normally. An exit code of 0 indicates successful
         /// termination of the program. The meanings of other values is dependent on
         /// the environment.
@@ -2347,18 +2371,18 @@ pub mod wasi_snapshot_preview1 {
         /// This function may execute slowly, so when large mounts of random data are
         /// required, it's advisable to use this function to seed a pseudo-random
         /// number generator, rather than to provide the random data directly.
-        pub fn random_get(arg0: i32, arg1: i32) -> i32;
+        pub fn random_get(arg0: usize, arg1: usize) -> i32;
         /// Accept a new incoming connection.
         /// Note: This is similar to `accept` in POSIX.
-        pub fn sock_accept(arg0: i32, arg1: i32, arg2: i32) -> i32;
+        pub fn sock_accept(arg0: i32, arg1: i32, arg2: usize) -> i32;
         /// Receive a message from a socket.
         /// Note: This is similar to `recv` in POSIX, though it also supports reading
         /// the data into multiple buffers in the manner of `readv`.
-        pub fn sock_recv(arg0: i32, arg1: i32, arg2: i32, arg3: i32, arg4: i32, arg5: i32) -> i32;
+        pub fn sock_recv(arg0: i32, arg1: usize, arg2: usize, arg3: i32, arg4: usize, arg5: usize) -> i32;
         /// Send a message on a socket.
         /// Note: This is similar to `send` in POSIX, though it also supports writing
         /// the data from multiple buffers in the manner of `writev`.
-        pub fn sock_send(arg0: i32, arg1: i32, arg2: i32, arg3: i32, arg4: i32) -> i32;
+        pub fn sock_send(arg0: i32, arg1: usize, arg2: usize, arg3: i32, arg4: usize) -> i32;
         /// Shut down socket send and receive channels.
         /// Note: This is similar to `shutdown` in POSIX.
         pub fn sock_shutdown(arg0: i32, arg1: i32) -> i32;

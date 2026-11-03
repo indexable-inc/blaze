@@ -255,12 +255,34 @@ fn a_failed_build_runs_nothing() {
 }
 
 #[test]
+fn under_keep_going_the_tests_that_built_run_past_a_failed_unit() {
+    // A unit failed (the daemon said which, by name) and the rest built: their tests still run,
+    // and the run fails.
+    let failed = |it: Vec<Response>| {
+        it.into_iter().map(|it| if matches!(it, Response::Done { .. }) { Response::Done { ok: false } } else { it }).collect()
+    };
+    let mut api = FakeApi::answering(failed(tests_built()));
+    let mut programs = Fake::default();
+    let (then, _, err) = driven(&mut api, &["blaze", "test", "--keep-going"], &mut programs);
+    assert_eq!(then, Then::Exit(101));
+    assert_eq!(programs.ran.len(), 4, "{err}");
+    assert!(err.contains("     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)"), "{err}");
+
+    // Without it nothing runs.
+    let mut api = FakeApi::answering(failed(tests_built()));
+    let mut programs = Fake::default();
+    let (then, _, _) = driven(&mut api, &["blaze", "test"], &mut programs);
+    assert_eq!(then, Then::Exit(101));
+    assert!(programs.ran.is_empty());
+}
+
+#[test]
 fn run_becomes_its_program() {
     let foo = crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo"));
     let built = Response::Built { members: 1, artifacts: vec![foo], profile: "`dev` profile [unoptimized + debuginfo]".to_owned() };
     let mut api = FakeApi::answering(vec![built, Response::Done { ok: true }]);
     let (then, _, err) = driven(&mut api, &["blaze", "run", "--release", "a", "--", "b"], &mut Fake::default());
-    let Then::Exec(exec) = then else { panic!("{then:?}") };
+    let Then::Exec(exec) = then else { panic!("{then:?}: {err}") };
     assert_eq!(exec.program, PathBuf::from("target/debug/foo"));
     assert_eq!(exec.args, [OsString::from("a"), OsString::from("b")]);
     assert_eq!(exec.cwd, PathBuf::from("/w"));

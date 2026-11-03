@@ -897,6 +897,7 @@ fn a_crate_with_no_outside_input_is_not_refused() {
     let db = fixture::db(FIXTURE).into_db();
     for name in ["core", "lib"] {
         assert_eq!(serve::refusal(&db, crate_named(&db, name)), None, "{name}");
+        assert_eq!(serve::include_refusal(&db, crate_named(&db, name), &[]), None, "{name}");
     }
 }
 
@@ -1186,4 +1187,117 @@ fn key_inputs_are_what_the_key_was_made_from() {
     assert_eq!(inputs[&lib].closure.len(), 3, "core, a dependency of two, is in it once");
     assert_eq!(inputs[&lib].out_dirs, ["/out/lib", "/out/core"]);
     assert_eq!(inputs[&mid].out_dirs, ["/out/core"]);
+}
+
+/// A dependency whose `#[path]` module is in another directory of its package.
+const PATH_ELSEWHERE: &str = r#"
+//- /registry/lib/src/lib.rs crate:lib new_source_root:library
+#[path = "../shared/m.rs"]
+pub mod m;
+pub use m::f;
+//- /registry/lib/shared/m.rs
+pub fn f() {}
+"#;
+
+/// The key covers a `#[path]` module's file wherever in its package it is: an edit of that file
+/// alone gives the crate another key, so the image written for the old text is never served
+/// for the new one, and the image is written (the file is not refused as outside).
+#[test]
+fn a_path_module_in_another_directory_gives_a_new_key_when_its_file_changes() {
+    let _turn = TURN.lock();
+    let key = key_of(PATH_ELSEWHERE, "lib", BUILD);
+    let edited = PATH_ELSEWHERE.replace("pub fn f() {}", "pub fn f() {}\npub fn g() {}");
+    assert_ne!(key_of(&edited, "lib", BUILD), key, "an edit of the `#[path]` file moves the key");
+    let (_, stored) = stored(PATH_ELSEWHERE);
+    assert_eq!(stored.refused, Vec::new());
+    assert_eq!(stored.written.len(), 1);
+}
+
+/// A `#[path]` module in another package's source root (a registry crate's into a member's
+/// files) is known only once the crate is resolved, so no key made before can cover it: the
+/// crate is refused an image, never given one that stays served after that file is edited.
+#[test]
+fn a_path_module_in_another_source_root_is_refused_an_image() {
+    let _turn = TURN.lock();
+    const INTO_MEMBER: &str = r#"
+//- /registry/lib/src/lib.rs crate:lib new_source_root:library
+#[path = "../../../ws/member/src/shared.rs"]
+pub mod m;
+//- /ws/member/src/lib.rs crate:member new_source_root:local
+pub mod shared;
+//- /ws/member/src/shared.rs
+pub fn f() {}
+"#;
+    let key = key_of(INTO_MEMBER, "lib", BUILD);
+    let edited = INTO_MEMBER.replace("pub fn f() {}", "pub fn g() {}");
+    assert_eq!(key_of(&edited, "lib", BUILD), key, "premise: the member's file is not in the key");
+    let (_, stored) = stored(INTO_MEMBER);
+    assert_eq!(stored.written, Vec::new());
+    assert!(
+        matches!(&stored.refused[..], [(_, Refused::OutsideSourceRoot { what })]
+            if what.contains("module `crate::m`") && what.contains("/ws/member/src/shared.rs")),
+        "{:?}",
+        stored.refused
+    );
+}
+
+/// A crate that includes what its build script wrote, through `concat!` and `env!`.
+const OUT_DIR_INCLUDE: &str = r#"
+//- /registry/lib/src/lib.rs crate:lib new_source_root:library env:OUT_DIR=/registry/lib/out
+#[rustc_builtin_macro]
+macro_rules! include { () => {} }
+#[rustc_builtin_macro]
+macro_rules! concat { () => {} }
+#[rustc_builtin_macro]
+macro_rules! env { () => {} }
+include!(concat!(env!("OUT_DIR"), "/made.rs"));
+//- /registry/lib/out/made.rs
+pub fn made() {}
+"#;
+
+/// The calls in an `include!`'s argument (`concat!`, `env!`) are expanded as calls of the
+/// argument's own: the walk climbs through it without taking it for an include whose file is
+/// not known, so the crate is imaged.
+#[test]
+fn an_include_of_out_dir_through_concat_and_env_is_imaged() {
+    let _turn = TURN.lock();
+    let (_, stored) = stored(OUT_DIR_INCLUDE);
+    assert_eq!(stored.refused, Vec::new());
+    assert_eq!(stored.written.len(), 1);
+}
+
+/// A build script's file is in its package's source root, so the key covers it: a run that
+/// changes only that file gives the crate another key.
+#[test]
+fn an_edit_of_an_out_dir_file_alone_gives_a_new_key() {
+    let key = key_of(OUT_DIR_INCLUDE, "lib", BUILD);
+    let edited = OUT_DIR_INCLUDE.replace("pub fn made() {}", "pub fn made() {}\npub fn more() {}");
+    assert_ne!(key_of(&edited, "lib", BUILD), key);
+}
+
+/// An `include_bytes!` in a signature (an array's length) of a file of another package's
+/// source root, which the crate's key does not cover: the crate is refused, the refusal naming
+/// the macro, where it is and the file. Its call is one the signatures name, not a module's.
+#[test]
+fn an_include_bytes_in_a_signature_of_a_file_outside_the_root_is_refused() {
+    let _turn = TURN.lock();
+    const IN_SIGNATURE: &str = r#"
+//- /registry/lib/src/lib.rs crate:lib new_source_root:library
+#[rustc_builtin_macro]
+macro_rules! include_bytes { () => {} }
+pub struct Blob(pub [u8; include_bytes!("../../other/blob.txt").len()]);
+//- /registry/other/lib.rs crate:other new_source_root:library
+//- /registry/other/blob.txt
+blob
+"#;
+    let (_, stored) = stored(IN_SIGNATURE);
+    assert_eq!(stored.written.len(), 1, "`other` alone is imaged");
+    assert!(
+        matches!(&stored.refused[..], [(_, Refused::OutsideSourceRoot { what })]
+            if what.contains("`include_bytes!`")
+                && what.contains("/registry/lib/src/lib.rs:3")
+                && what.contains("/registry/other/blob.txt")),
+        "{:?}",
+        stored.refused
+    );
 }

@@ -300,6 +300,143 @@ fn a_new_thread_local_in_an_incremental_pe_link_is_before_the_tls_end() {
     check(&image, 2, "a thread-local added");
 }
 
+/// `X.dll`'s import library: `A`, then `B`, each with its `__imp_` name.
+fn two_imports() -> Arc<[u8]> {
+    use object::pe::{IMPORT_OBJECT_CODE, IMPORT_OBJECT_NAME};
+    use crate::pe::tests::{archive, short_import};
+    let member = |name: &str, hint| short_import(name, "X.dll", hint, IMPORT_OBJECT_CODE.0, IMPORT_OBJECT_NAME.0);
+    archive(&[("x.dll", member("A", 1), &["A", "__imp_A"]), ("x.dll", member("B", 2), &["B", "__imp_B"])]).into()
+}
+
+/// A PE file read back: the bytes at an address, and each import's import address table cell.
+struct PeRead<'a>(object::read::pe::PeFile64<'a>);
+
+impl<'a> PeRead<'a> {
+    fn at(&self, addr: u64, len: usize) -> &'a [u8] {
+        use object::{Object as _, ObjectSection as _};
+        let found = self.0.sections().find(|it| (it.address()..it.address() + it.size()).contains(&addr));
+        let section = found.unwrap_or_else(|| panic!("no section at {addr:#x}"));
+        &section.data().unwrap()[(addr - section.address()) as usize..][..len]
+    }
+
+    /// What the 32-bit field at `field`, relative to its end, points at.
+    fn rel32(&self, field: u64) -> u64 {
+        let value = i32::from_le_bytes(self.at(field, 4).try_into().unwrap());
+        (field as i64 + 4 + i64::from(value)) as u64
+    }
+
+    /// Each DLL's imports, by name, with the address of the cell the loader binds.
+    fn imports(&self) -> Vec<(String, String, u64)> {
+        use object::LittleEndian as LE;
+        use object::Object as _;
+        use object::pe::ImageNtHeaders64;
+        use object::read::pe::Import;
+        let base = self.0.relative_address_base();
+        let table = self.0.import_table().unwrap().expect("an import directory");
+        let mut descriptors = table.descriptors().unwrap();
+        let mut out = Vec::new();
+        while let Some(descriptor) = descriptors.next().unwrap() {
+            let dll = String::from_utf8_lossy(table.name(descriptor.name.get(LE)).unwrap()).into_owned();
+            let mut thunks = table.thunks(descriptor.original_first_thunk.get(LE)).unwrap();
+            let mut cell = base + u64::from(descriptor.first_thunk.get(LE));
+            while let Some(thunk) = thunks.next::<ImageNtHeaders64>().unwrap() {
+                let Import::Name(_, name) = table.import::<ImageNtHeaders64>(thunk).unwrap() else { panic!("by ordinal") };
+                out.push((dll.clone(), String::from_utf8_lossy(name).into_owned(), cell));
+                cell += 8;
+            }
+        }
+        out
+    }
+}
+
+/// Where a symbol of the image is, by its key.
+fn placed(image: &Image, key: crate::symbols::SymKey) -> Option<u64> {
+    let (piece, offset) = image.state.home(image.symbols.find(key)?)?;
+    Some(image.state.piece(piece)?.addr + offset)
+}
+
+/// On PE the GOT is the import address table, each DLL's cells in a run. When the last call to
+/// `A`, the first of `X.dll`'s two imports, goes, `A`'s cell goes and `B`'s moves down into
+/// its place. `B`'s readers refer to `B` or `__imp_B`, never to the cell, and are written again
+/// all the same: `B`'s thunk and a `call [rip + __imp_B]` read `B`'s new cell, the one the
+/// import directory says the loader binds to `B`. A program running the image can't take it:
+/// its loader bound the cells where they were, so the patch is a restart naming `B`.
+#[test]
+fn a_moved_import_address_table_cell_is_read_where_it_went() {
+    use crate::reloc::GotKind;
+    use crate::symbols::SymKey;
+    let lib = two_imports();
+    // start (1) calls ca (2), which calls A, and cb (3): `call B; call [rip + __imp_B]; ret`.
+    let two_calls = |n: u8, callees: [u8; 2]| {
+        let relocs = callees.iter().zip([1, 6]).map(|(it, at)| rel32(at, Target::Direct(key(*it)))).collect();
+        function(n, &[0xe8, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0, 0xc3], relocs)
+    };
+    let start = two_calls(1, [2, 3]);
+    let ca = function(2, &CALLER, vec![rel32(1, Target::Extern("A".into()))]);
+    let cb = function(3, &[0xe8, 0, 0, 0, 0, 0xff, 0x15, 0, 0, 0, 0, 0xc3], vec![
+        rel32(1, Target::Extern("B".into())),
+        rel32(7, Target::Extern("__imp_B".into())),
+    ]);
+    // start refilled to call ca2 (4), which calls nothing, and cb; ca goes.
+    let (start2, ca2) = (two_calls(1, [4, 3]), function(4, &returns(5), Vec::new()));
+    let entry = || vec![("mainCRTStartup".to_string(), Target::Direct(key(1)))];
+    let first = || Change {
+        added: vec![&start, &ca, &cb],
+        names: entry(),
+        natives: vec![Native { id: id(100), name: "x.lib", bytes: &lib, kind: SHARED, order: 0 }],
+        ..Change::default()
+    };
+    let edit = || Change { added: vec![&start2, &ca2], removed: vec![key(1), key(2)], names: entry(), ..Change::default() };
+    let name = |image: &Image, it: &str| image.symbols.find_name(it).and_then(|it| image.symbols.find(SymKey::Name(it))).expect(it);
+    let body = |image: &Image, n: u8| placed(image, SymKey::Body(image.symbols.find_id(&id(n)).unwrap())).unwrap();
+
+    let mut image = Image::new(super::name(super::TO), Output { incremental: true, ..windows() }).unwrap();
+    let mut disk = Disk::default();
+    disk.link(&mut image, first()).unwrap();
+    let bytes = super::contents(disk.file(super::TO));
+    let a = PeRead(object::read::pe::PeFile64::parse(&bytes[..]).unwrap());
+    let iat = a.imports();
+    let names: Vec<&str> = iat.iter().map(|it| it.1.as_str()).collect();
+    assert_eq!(names, ["A", "B"], "{iat:x?}");
+    let (cell_a, cell_b) = (iat[0].2, iat[1].2);
+    assert_eq!(cell_b, cell_a + 8, "one DLL's cells in a run");
+    let (b, thunk) = (name(&image, "B"), placed(&image, SymKey::Plt(name(&image, "B"))).expect("B's thunk"));
+    assert_eq!(placed(&image, SymKey::Got(GotKind::Address, b)), Some(cell_b));
+    assert_eq!((a.at(thunk, 2), a.rel32(thunk + 2)), (&[0xff, 0x25][..], cell_b), "B's thunk: jmp [rip + B's cell]");
+    let cb_at = body(&image, 3);
+    assert_eq!(a.rel32(cb_at + 1), thunk, "cb calls B's thunk");
+    assert_eq!((a.at(cb_at + 5, 2), a.rel32(cb_at + 7)), (&[0xff, 0x15][..], cell_b), "call [rip + __imp_B]");
+
+    disk.link(&mut image, edit()).expect("A's last call goes");
+    let bytes = super::contents(disk.file(super::TO));
+    let c = PeRead(object::read::pe::PeFile64::parse(&bytes[..]).unwrap());
+    let iat = c.imports();
+    assert_eq!(iat.len(), 1, "only B is imported: {iat:x?}");
+    let ((dll, imported, moved), a_sym) = (iat[0].clone(), name(&image, "A"));
+    assert_eq!((dll.as_str(), imported.as_str()), ("X.dll", "B"));
+    assert_ne!(moved, cell_b, "B's cell moved into A's place");
+    assert_eq!(placed(&image, SymKey::Plt(a_sym)), None, "A's thunk is gone");
+    assert_eq!(placed(&image, SymKey::Got(GotKind::Address, a_sym)), None, "A's cell is gone");
+    assert_eq!(placed(&image, SymKey::Got(GotKind::Address, b)), Some(moved));
+    assert_eq!(placed(&image, SymKey::Plt(b)), Some(thunk), "B's thunk stays");
+    assert_eq!((c.at(thunk, 2), c.rel32(thunk + 2)), (&[0xff, 0x25][..], moved), "B's thunk reads B's new cell");
+    assert_eq!(body(&image, 3), cb_at, "cb stays");
+    assert_eq!(c.rel32(cb_at + 1), thunk, "cb still calls B's thunk");
+    assert_eq!((c.at(cb_at + 5, 2), c.rel32(cb_at + 7)), (&[0xff, 0x15][..], moved), "cb's __imp_B reads B's new cell");
+
+    // A live image: the running program's loader bound B where its cell was.
+    let live = Output { incremental: true, live: Some(crate::Live), ..windows() };
+    let mut image = Image::new(super::name(super::TO), live).unwrap();
+    let mut disk = Disk::default();
+    disk.link(&mut image, first()).unwrap();
+    let staged = image.stage(edit()).unwrap();
+    let message = staged.writes.message.as_deref().expect("a message for programs running 1");
+    let Ok(blaze_live::patch::MessageView::Restart { why, .. }) = blaze_live::patch::Message::view(message) else {
+        panic!("not a restart: {:?}", blaze_live::patch::Message::decode(message))
+    };
+    assert!(why.contains("the GOT cell of the import `B` moved"), "{why}");
+}
+
 fn macos() -> Output {
     Output {
         format: Format::MachO,

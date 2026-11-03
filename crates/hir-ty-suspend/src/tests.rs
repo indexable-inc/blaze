@@ -1,36 +1,44 @@
-//! The check over tiny crates: a stand-in `corosensei` whose `Yielder::suspend` is the root, an
-//! engine whose query (`variance` → `fetch` → `get_or_run` → `suspend`) parks the fiber, and a
-//! crate `x` that calls it, each test's own.
+//! The check over tiny crates: a stand-in `blaze_graph` whose `sched::stack::Yielder::suspend`
+//! is the root, an engine whose query (`variance` → `fetch` → `get_or_run` → `suspend`) parks
+//! the fiber, and a crate `x` that calls it, each test's own.
 
 use base_db::{Crate, Db, all_crates};
 use hir_def::{AdtId, FunctionId, expr_store::Body, signatures::FunctionSignature};
 use hir_expand::fixture;
 use hir_ty_mir::mir::MirSpan;
 
-use crate::{Found, Held, Promise, Site, Why, may_suspend_at, on_fiber, root::roots, suspend_check, suspend_points};
+use crate::{
+    Found, Held, Promise, Site, Unchecked, Why, may_suspend_at, on_fiber,
+    root::{Roots, roots},
+    suspend_check, suspend_points, unchecked,
+};
 
-/// minicore, `corosensei` and the engine. A test appends `//- /x.rs crate:x deps:engine`.
+/// minicore, `blaze_graph` and the engine. A test appends `//- /x.rs crate:x deps:engine`.
 const ENGINE: &str = r#"
 //- minicore: sized, copy, clone, drop, deref, fn, unsize, coerce_unsized, dispatch_from_dyn, send, sync, option, builtin_impls
-//- /corosensei.rs crate:corosensei
-pub struct Yielder {
-    stack: *mut u8,
-}
+//- /blaze_graph.rs crate:blaze_graph
+pub mod sched {
+    pub mod stack {
+        pub struct Yielder {
+            stack: *mut u8,
+        }
 
-impl Yielder {
-    pub fn suspend(&self, value: u32) -> u32 {
-        let _ = self.stack;
-        value
+        impl Yielder {
+            pub fn suspend(&self, value: u32) -> u32 {
+                let _ = self.stack;
+                value
+            }
+        }
     }
 }
 
-//- /engine.rs crate:engine deps:corosensei
+//- /engine.rs crate:engine deps:blaze_graph
 #![feature(register_tool, must_not_suspend)]
 #![register_tool(blaze)]
 
 pub mod fiber {
     pub struct Db {
-        yielder: *const corosensei::Yielder,
+        yielder: *const blaze_graph::sched::stack::Yielder,
     }
 
     unsafe impl Send for Db {}
@@ -483,7 +491,7 @@ pub fn held(db: &Db) -> u32 {
 }
 
 #[test]
-fn no_corosensei_no_walk() {
+fn no_blaze_graph_no_walk() {
     // alloc: a test's fixture text
     let db = fixture::db(
         r#"
@@ -507,8 +515,128 @@ pub fn f() -> u32 {
     let db = &db;
     hir_ty::attach_db(db, || {
         let krate = crate_named(db, "x");
-        assert!(roots(db, krate).is_empty(), "no root without `corosensei`");
+        assert_eq!(*roots(db, krate), Roots::default(), "no root and no error without `blaze_graph`");
         nothing(suspend_check(db, krate));
+    });
+}
+
+#[test]
+fn a_blaze_graph_without_its_root_is_an_error() {
+    // alloc: a test's fixture text
+    let db = fixture::db(
+        r#"
+//- minicore: sized, copy, clone, drop, send, sync
+//- /blaze_graph.rs crate:blaze_graph
+pub mod sched {
+    pub mod fiber {}
+}
+
+//- /x.rs crate:x deps:blaze_graph
+pub fn f() -> u32 {
+    0
+}
+"#,
+    )
+    .into_db();
+    let db = &db;
+    hir_ty::attach_db(db, || {
+        let krate = crate_named(db, "x");
+        let found = suspend_check(db, krate);
+        let Some(Unchecked::MissingRoot(missing)) = found.unchecked else {
+            panic!("a `blaze_graph` with no `sched::stack` is an error, not {:?}", found.unchecked)
+        };
+        assert_eq!((missing.krate, missing.missing), (crate_named(db, "blaze_graph"), "stack"));
+        assert_eq!(unchecked(db, krate), found.unchecked, "the lints' reading is the check's");
+        let said = Unchecked::MissingRoot(missing).said(db, krate);
+        assert!(said.contains("no `blaze_graph::sched::stack::Yielder::suspend` (no `stack` there)"), "{said}");
+        assert!(said.contains("that `blaze_graph` is of no version at `/blaze_graph.rs`"), "names which one: {said}");
+        assert!(said.ends_with("the check of `x` stops"), "names the crate checked: {said}");
+        assert!(found.held.is_empty() && found.broken.is_empty(), "nothing is checked without the root");
+    });
+}
+
+#[test]
+fn the_root_resolves_through_the_stack_layers_cfg_gated_reexport() {
+    // The real tree's shape: `Yielder` is declared in `stack::native` or `stack::wasm`, one per
+    // target, and brought into `sched::stack` by a `pub(super) use` under the same cfg; the
+    // driver is a module of `blaze_graph` itself.
+    // alloc: a test's fixture text
+    let db = fixture::db(
+        r#"
+//- minicore: sized, copy, clone, drop, send, sync
+//- /blaze_graph.rs crate:blaze_graph
+pub mod sched {
+    mod stack {
+        #[cfg(not(target_family = "wasm"))]
+        mod native {
+            pub struct Yielder<I, O> {
+                stack: *mut (I, O),
+            }
+
+            impl<I, O> Yielder<I, O> {
+                pub fn suspend(&self, out: O) -> I {
+                    let _ = self.stack;
+                    loop {}
+                }
+            }
+        }
+        #[cfg(target_family = "wasm")]
+        mod wasm {
+            pub struct Yielder<I, O> {
+                save: *mut (I, O),
+            }
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        pub(super) use native::Yielder;
+        #[cfg(target_family = "wasm")]
+        pub(super) use wasm::Yielder;
+    }
+
+    pub mod fiber {
+        pub struct Db {
+            yielder: *const super::stack::Yielder<u32, u32>,
+        }
+
+        unsafe impl Send for Db {}
+        unsafe impl Sync for Db {}
+
+        pub fn get_or_run(db: &Db, key: u32) -> u32 {
+            unsafe { (*db.yielder).suspend(key) }
+        }
+    }
+}
+
+//- /x.rs crate:x deps:blaze_graph
+use blaze_graph::sched::fiber::{Db, get_or_run};
+
+/// `!Send`, as `Rc` is.
+pub struct Rc {
+    ptr: *const u32,
+}
+
+impl Drop for Rc {
+    fn drop(&mut self) {}
+}
+
+pub fn counted(db: &Db) -> u32 {
+    let count = Rc { ptr: 0 as *const u32 };
+    get_or_run(db, 1)
+}
+"#,
+    )
+    .into_db();
+    let db = &db;
+    hir_ty::attach_db(db, || {
+        let krate = crate_named(db, "x");
+        let roots = roots(db, krate);
+        assert_eq!(roots.missing, None, "the root is found through the re-export");
+        let [root] = &*roots.found else { panic!("one root, not {:?}", roots.found) };
+        assert_eq!(fn_named(db, *root), "suspend");
+        let found = suspend_check(db, krate);
+        let held = one_held(found);
+        assert_eq!((binding_name(db, held), held.why), ("count".to_owned(), Why::NotSend));
+        assert_eq!(held.path_said(), "`get_or_run` → `suspend`");
     });
 }
 

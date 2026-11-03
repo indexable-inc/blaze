@@ -1,10 +1,12 @@
 //! A git package's tree at its locked commit, through blaze-registry's `git::fetch`: cargo's
-//! database and checkout (`git/db/<ident>`, `git/checkouts/<ident>/<short id>`), fetched with
+//! database and checkout (`git/db/<ident>`, `git/checkouts/<ident>/<short id>`, the load's
+//! `at` naming the whole commit), fetched with
 //! the `git` command as cargo runs it under `net.git-fetch-with-cli`, with the submodules cargo
 //! checks out. It is cloned into a `$CARGO_HOME` of its own under the fetcher's scratch
 //! directory, read whole (every file with its mode, but each `.git`: the clone's own, not the
-//! tree's) and removed; the VFS mounts the tree where the load names it, cargo's
-//! `$CARGO_HOME/git/checkouts/...`. Nothing is written to the user's `$CARGO_HOME` and no lock
+//! tree's) and removed; the VFS mounts the tree where the load names it, in cargo's layout under
+//! blaze's own sources (`<sources>/git/checkouts/...`), and the daemon writes it there on disk
+//! ([`super::keep_on_disk`]). Nothing is written to the user's `$CARGO_HOME` and no lock
 //! is taken: the plane fetches each source once at a time, and no two fetches share a
 //! directory.
 
@@ -40,8 +42,7 @@ fn checkout<H: Http + 'static>(fetcher: &Fetcher<H>, fetch: &Fetch, commit: &str
     let url = url::Url::parse(&fetch.url).with_context(|| format!("invalid url `{}`", fetch.url))?;
     let id = SourceId::for_git(&url, GitReference::Rev(commit.to_owned()))?;
     let ident = id.git_ident();
-    let named = cargo_home(&fetch.at, &ident, commit)?;
-    let short = Path::new(&fetch.at).strip_prefix(named).expect("`cargo_home` is an ancestor").to_owned();
+    cargo_home(&fetch.at, &ident, commit)?;
     let home = Scratch::new(&fetcher.scratch, commit)?;
     let mut context = blaze_registry::Context::new(home.0.clone(), fetcher.http.clone());
     context.net.retry = fetcher.retry;
@@ -49,11 +50,14 @@ fn checkout<H: Http + 'static>(fetcher: &Fetcher<H>, fetch: &Fetch, commit: &str
     if !checkout.rev.eq_ignore_ascii_case(commit) {
         bail!("the repository gave commit `{}` for the locked `{commit}`", checkout.rev);
     }
-    if checkout.root != home.0.join(&short) {
+    // The scratch checkout is named as cargo names one (`<ident>/<short id>`); the load's `at`
+    // has the whole commit, and only the repository's directory must agree.
+    let checkouts = home.0.join("git").join("checkouts").join(&ident);
+    if checkout.root.parent() != Some(checkouts.as_path()) {
         bail!(
-            "the checkout of `{commit}` is at `{}`, not at `{}` as the load names it (`{}`)",
+            "the checkout of `{commit}` is at `{}`, not in `{}` as the load names it (`{}`)",
             checkout.root.display(),
-            home.0.join(&short).display(),
+            checkouts.display(),
             fetch.at
         );
     }

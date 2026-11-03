@@ -24,19 +24,23 @@ mod image;
 mod job;
 mod mounts;
 pub mod observe;
+/// The seed's one-shot build: this engine in the CLI's process, for its command alone.
+#[cfg(not(feature = "daemon"))]
+pub(crate) mod once;
 mod plane;
 pub(crate) mod signals;
+mod still;
 #[cfg(test)]
 mod tests;
 mod unit;
 pub mod why;
 mod work;
 
+#[cfg(feature = "daemon")]
+use std::{ffi::OsString, process::ExitCode};
 use std::{
-    ffi::OsString,
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::ExitCode,
     sync::Arc,
     time::Duration,
 };
@@ -49,6 +53,7 @@ pub use daemon::{Daemon, Options};
 /// What the line a daemon writes to its log once it listens starts with, then where and its
 /// pid: `blaze serve: listening on /run/blaze/v2.sock (pid 7)`. The client finds the daemon's
 /// last start by it, and harness/storelib.py's `LISTENING` that it listens.
+#[cfg(feature = "daemon")]
 pub const LISTENING: &str = "blaze serve: listening on ";
 
 /// Where the daemon is and what it runs.
@@ -56,7 +61,8 @@ pub const LISTENING: &str = "blaze serve: listening on ";
 pub struct Paths {
     /// Its state ([`state`]).
     pub state: PathBuf,
-    pub socket: PathBuf,
+    /// `None` for the one-shot build, which takes its own process's requests alone.
+    pub socket: Option<PathBuf>,
     /// blaze's own executable: the sandbox's launcher.
     pub launcher: PathBuf,
 }
@@ -85,8 +91,14 @@ pub fn builds() -> anyhow::Result<PathBuf> {
     Ok(blaze_manifest::home::builds(&root()?))
 }
 
-/// blaze's root of this process ([`blaze_manifest::home::root`]), which [`state`] and
-/// [`builds`] are under.
+/// Where the daemon keeps the packages it fetches, mounted and on disk: `sources` under blaze's
+/// root, beside [`state`] ([`blaze_manifest::home::sources`]). Never `$CARGO_HOME`.
+pub fn sources() -> anyhow::Result<PathBuf> {
+    Ok(blaze_manifest::home::sources(&root()?))
+}
+
+/// blaze's root of this process ([`blaze_manifest::home::root`]), which [`state`],
+/// [`builds`] and [`sources`] are under.
 fn root() -> anyhow::Result<PathBuf> {
     blaze_manifest::home::process_root()
         .map_err(anyhow::Error::msg)?
@@ -164,6 +176,7 @@ pub fn file_name(path: &Path) -> anyhow::Result<FileName> {
     FileName::new(rest.trim_end_matches('/')).with_context(|| format!("{text} has an empty, `.` or `..` part"))
 }
 
+#[cfg(feature = "daemon")]
 struct Args {
     socket: Option<PathBuf>,
     http: Option<SocketAddr>,
@@ -176,6 +189,7 @@ struct Args {
     stall: Option<std::time::Duration>,
 }
 
+#[cfg(feature = "daemon")]
 fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
     let mut parsed = Args { socket: None, http: None, activated: false, ready: None, stall: None };
     let mut args = args.into_iter();
@@ -224,7 +238,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
 
 /// The socket systemd or launchd passed `blaze serve --activated` (the units of
 /// `blaze daemon install`, [`blaze_api::units`]).
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 fn activated() -> anyhow::Result<blaze_api::activation::Passed> {
     use blaze_api::activation::{Manager, take};
     let manager = Manager::here().context(
@@ -384,7 +398,7 @@ fn say(ready: Option<&mut std::fs::File>, phase: Phase) {
 }
 
 /// The pipe of `blaze serve --ready-fd N`, made this process's: close-on-exec from here on.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "daemon"))]
 fn ready(fd: i32) -> anyhow::Result<std::fs::File> {
     use std::os::fd::FromRawFd as _;
     if fd < 3 {
@@ -400,6 +414,7 @@ fn ready(fd: i32) -> anyhow::Result<std::fs::File> {
 }
 
 /// `blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]`.
+#[cfg(feature = "daemon")]
 pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     match serve(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -410,6 +425,7 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     }
 }
 
+#[cfg(feature = "daemon")]
 fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     let args = parse(args)?;
     // First, before any thread starts: taking the passed socket reads and clears the
@@ -435,21 +451,73 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         Some(socket) => std::path::absolute(&socket).with_context(|| format!("the socket {}", socket.display()))?,
         None => socket()?,
     };
+    let mut ready = ready;
+    let serving = Serving {
+        socket: Some(socket),
+        http: args.http,
+        #[cfg(unix)]
+        activated,
+        stall: args.stall,
+    };
+    let engine = engine(serving, ready.as_mut())?;
+    let mut running = start(engine, "blaze serve", ready.as_mut())?;
+    let ran = listen(&mut running.daemon, ready);
+    // The daemon is gone, and with it the history's sender: its thread's last flush ends it.
+    running.end()?;
+    ran
+}
+
+/// Where the engine takes its requests, and the bound of its stall watchdog.
+pub(crate) struct Serving {
+    /// The socket `blaze serve` listens on; `None` for the one-shot build ([`once`]), which
+    /// takes its own process's requests alone.
+    pub(crate) socket: Option<PathBuf>,
+    /// HTTP too, with the bearer token in `BLAZE_API_TOKEN`.
+    pub(crate) http: Option<SocketAddr>,
+    /// The socket systemd or launchd passed, listened on at `socket`.
+    #[cfg(unix)]
+    pub(crate) activated: Option<blaze_api::activation::Passed>,
+    /// `--stall-bound SECS` ([`daemon::Options::stall`]); `None` is [`blaze_profile::Watchdog::BOUND`].
+    pub(crate) stall: Option<Duration>,
+}
+
+/// The engine `blaze serve` runs and the one-shot build runs in its own process: one setup
+/// for both ([`engine`]), so the one-shot build is the daemon's engine, never a second path.
+pub(crate) struct Engine {
+    options: Options,
+    steps: Arc<unit::Real>,
+    runner: plane::Runner<job::Step<unit::Real>>,
+    driver: blaze_core::Native,
+    keeper: observe::Keeper,
+    held: Held,
+}
+
+/// What the engine holds for its life: the state's lock, which the next engine on it waits on,
+/// and the lease of the shared standard library's store.
+struct Held {
+    #[cfg(unix)]
+    _lock: std::fs::File,
+    _std_lease: blaze_gc::lease::Lease,
+}
+
+/// The engine, its state found and held, its driver made, before it starts: `ready`, the pipe
+/// of `blaze serve --ready-fd`, hears if it waits for the engine before it on the same state.
+pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> anyhow::Result<Engine> {
     let state = state()?;
     std::fs::create_dir_all(&state).with_context(|| format!("making the daemon's state directory {}", state.display()))?;
+    // Held until the engine ends: the next one on this state waits on it.
     #[cfg(unix)]
-    let mut ready = ready;
-    // Held until this process ends: the next daemon on this state waits on it.
-    #[cfg(unix)]
-    let _held = hold(&state, ready.as_mut())?;
+    let lock = hold(&state, ready)?;
+    #[cfg(not(unix))]
+    let _ = ready;
     // Where a stall's trace is written (`daemon::Failed::Stalled`): by the loop, which makes no
     // directories.
     let stalls = state.join("stalls");
     std::fs::create_dir_all(&stalls).with_context(|| format!("making {}", stalls.display()))?;
-    if let Some(parent) = socket.parent() {
+    if let Some(parent) = serving.socket.as_deref().and_then(Path::parent) {
         std::fs::create_dir_all(parent).with_context(|| format!("making the socket's directory {}", parent.display()))?;
     }
-    let token = match args.http {
+    let token = match serving.http {
         Some(_) => Some(
             std::env::var("BLAZE_API_TOKEN")
                 .ok()
@@ -460,7 +528,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     };
     let paths = Paths {
         state,
-        socket,
+        socket: serving.socket,
         launcher: std::env::current_exe().context("the path of blaze itself, which launches the sandbox")?,
     };
     // dyn: the sandbox's `Confine`, asked once per spawn
@@ -479,7 +547,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     // Its lease, held for the daemon's life: no collector, this daemon's or another
     // process's, renames the shared store away while this daemon may read or write it
     // (docs/gc.md, "Leases"). Its record says when a daemon last started on it.
-    let _std_lease = blaze_gc::lease::Lease::hold(&std).map_err(|why| anyhow::anyhow!("the standard library's shared directory: {why}"))?;
+    let std_lease = blaze_gc::lease::Lease::hold(&std).map_err(|why| anyhow::anyhow!("the standard library's shared directory: {why}"))?;
     if let Some(why) = blaze_gc::record::touch(&std, None, &[], blaze_gc::record::now_ns()).map_err(|why| anyhow::anyhow!(why))? {
         tracing::warn!(target: "blaze", dir = %std.display(), "the shared store's record did not read and was written afresh: {why}");
     }
@@ -489,13 +557,21 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     // What kept expansions are keyed by: the whole blaze, as `unit::deps::build` is, since the
     // macro server and bridge that expand them are past the code generator's packages.
     let toolchain = build.id;
+    let sources = sources()?;
+    // A daemon that stopped mid-write left a package's half-written directory, which nothing
+    // reads: removed before any fetch writes beside it.
+    let swept = fetch::sweep_parts(&sources).map_err(|why| anyhow::anyhow!(why))?;
+    if let Some(first) = swept.first() {
+        tracing::info!(target: "blaze", removed = swept.len(), first = %first.display(), "half-written fetched packages removed");
+    }
     let options = Options {
         state: file_name(&paths.state)?,
         std: file_name(&std)?,
         builds: file_name(&builds()?)?,
+        sources: file_name(&sources)?,
         writer: writer_of(&paths.state)?,
-        socket: file_name(&paths.socket)?,
-        http: args.http.zip(token),
+        socket: paths.socket.as_deref().map(file_name).transpose()?,
+        http: serving.http.zip(token),
         budget: Some(blaze_graph::arena::machine_budget(1 << 30).context("the memory the daemon's tasks may hold")?),
         threads,
         io: 16,
@@ -512,9 +588,9 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         color: false,
         build,
         outside: blaze_vfs::outside::dirs(),
-        stall: args.stall.unwrap_or(blaze_profile::Watchdog::BOUND),
+        stall: serving.stall.unwrap_or(blaze_profile::Watchdog::BOUND),
         #[cfg(unix)]
-        activated,
+        activated: serving.activated,
         profiling: Some(profiling),
     };
     // A sampler that can't be made is no other path: every dump and history says it is off.
@@ -539,7 +615,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
              watchdog would not see query runs as progress"
         );
     }
-    let steps = Arc::new(unit::Real::new(&paths).map_err(|why| anyhow::anyhow!(why))?);
+    let steps = Arc::new(unit::Real::new(&paths, sources).map_err(|why| anyhow::anyhow!(why))?);
     let scratch = paths.state.join("spawn");
     let runner = plane::Runner::Threads(plane::Threads::new(options.io, options.threads));
     let driver = blaze_core::native(std::path::Path::new("/"), threads)
@@ -549,35 +625,71 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         .scratch(&scratch)
         // alloc: an error path
         .with_context(|| format!("making {}, where each sandboxed spawn gets its directory", scratch.display()))?;
-    let ran = run(driver, options, steps, runner, ready);
-    // The daemon is gone, and with it the history's sender: its thread's last flush ends it.
-    keeper.join().map_err(|why| anyhow::anyhow!(why))?;
-    ran
+    let held = Held {
+        #[cfg(unix)]
+        _lock: lock,
+        _std_lease: std_lease,
+    };
+    Ok(Engine { options, steps, runner, driver, keeper, held })
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-compile_error!("blaze serve runs on a native driver: io_uring (Linux), kqueue (macOS) or IOCP (Windows)");
+#[cfg(all(feature = "daemon", not(any(target_os = "linux", target_os = "macos", windows))))]
+compile_error!(
+    "blaze serve (blaze-cargo's `daemon` feature) runs on a native driver: io_uring (Linux), kqueue (macOS) or \
+     IOCP (Windows); the wasm seed is built without it (`--no-default-features --features seed`) and builds one-shot"
+);
 
-/// The loop over this target's native driver, its root `/`, until it stops.
-fn run(
+/// The engine started: its daemon, and what the engine holds until it ends ([`Running::end`]).
+pub(crate) struct Running {
+    pub(crate) daemon: Daemon<blaze_core::Native, unit::Real>,
+    keeper: observe::Keeper,
+    _held: Held,
+}
+
+impl Running {
+    /// The daemon gone, and with it the history's sender: its thread's last flush ends it.
+    pub(crate) fn end(self) -> anyhow::Result<()> {
+        let Running { daemon, keeper, _held } = self;
+        drop(daemon);
+        keeper.join().map_err(|why| anyhow::anyhow!(why))
+    }
+}
+
+/// The engine's daemon started over its state, its store installed and its collector set:
+/// what `who` (`blaze serve`, or the one-shot build's `blaze`) says of the start goes to
+/// stderr, and `ready` hears each phase.
+pub(crate) fn start(engine: Engine, who: &str, mut ready: Option<&mut std::fs::File>) -> anyhow::Result<Running> {
+    let Engine { options, steps, runner, driver, keeper, held } = engine;
+    match begin(driver, options, steps, runner, who, ready.as_deref_mut()) {
+        Ok(daemon) => Ok(Running { daemon, keeper, _held: held }),
+        Err(error) => {
+            // The daemon was never made, or is gone: the history's sender with it.
+            keeper.join().map_err(|why| anyhow::anyhow!(why))?;
+            Err(error)
+        }
+    }
+}
+
+fn begin(
     driver: blaze_core::Native,
     options: Options,
     steps: Arc<unit::Real>,
     runner: plane::Runner<job::Step<unit::Real>>,
-    mut ready: Option<std::fs::File>,
-) -> anyhow::Result<()> {
-    say(ready.as_mut(), Phase::State);
+    who: &str,
+    mut ready: Option<&mut std::fs::File>,
+) -> anyhow::Result<Daemon<blaze_core::Native, unit::Real>> {
+    say(ready.as_deref_mut(), Phase::State);
     let mut daemon = Daemon::start(driver, options, steps, runner)?;
-    say(ready.as_mut(), Phase::Setup);
+    say(ready, Phase::Setup);
     let started = daemon.started();
     if started.cold == Some(daemon::Cold::Interned) {
-        bail!("blaze serve: the daemon image's symbols: {}", daemon::Cold::Interned);
+        bail!("{who}: the daemon image's symbols: {}", daemon::Cold::Interned);
     }
     if let Some(restored) = &started.restored {
-        eprintln!("blaze serve: restored the daemon image {restored}");
+        eprintln!("{who}: restored the daemon image {restored}");
     }
     if !started.whole() {
-        eprintln!("blaze serve: started: {started}");
+        eprintln!("{who}: started: {started}");
     }
     daemon.install_store().map_err(|why| anyhow::anyhow!("the daemon's store: {why}"))?;
     // What blaze keeps on disk, collected in the background (docs/gc.md): the build dirs
@@ -585,7 +697,7 @@ fn run(
     let root = builds()?.parent().map(std::path::Path::to_path_buf).context("blaze's build directories have no root")?;
     // What no build dir may be or hold, made once here: one that does not make stops the start,
     // named (review round 6, C5).
-    job::protected(&root).map_err(|why| anyhow::anyhow!("blaze serve: {why}"))?;
+    job::protected(&root).map_err(|why| anyhow::anyhow!("{who}: {why}"))?;
     // `<root>/gc.json` sets the levels of free space and whether the daemon collects on its
     // own; one that does not read stops the start.
     let settings = blaze_gc::settings::GcSettings::read(&root, blaze_gc::pace::Levels::default()).map_err(|why| anyhow::anyhow!(why))?;
@@ -593,10 +705,16 @@ fn run(
         daemon.collect(gc::Gc::new(gc::areas(&root, &machine()?), &state()?, settings.levels));
     } else {
         eprintln!(
-            "blaze serve: {} sets \"auto\": false: the daemon collects nothing on its own (`blaze cache gc` still does when run)",
+            "{who}: {} sets \"auto\": false: the daemon collects nothing on its own (`blaze cache gc` still does when run)",
             root.join(blaze_gc::settings::SETTINGS).display()
         );
     }
+    Ok(daemon)
+}
+
+/// `blaze serve`'s loop: the daemon listens, answers until it stops, and says how it stopped.
+#[cfg(feature = "daemon")]
+fn listen(daemon: &mut Daemon<blaze_core::Native, unit::Real>, mut ready: Option<std::fs::File>) -> anyhow::Result<()> {
     // `start` bound the socket; a turn hears how the bind went, so a refused one stops here,
     // named, before the CLI is told it listens and connects at once.
     let turning = daemon.turn();

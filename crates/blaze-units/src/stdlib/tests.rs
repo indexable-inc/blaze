@@ -417,6 +417,7 @@ fn key(root: ContentId) -> StdKey {
         crates: vec!["std".to_owned()],
         features: vec!["panic-unwind".to_owned(), "backtrace".to_owned()],
         rustflags: Vec::new(),
+        codegen_backend: None,
     }
 }
 

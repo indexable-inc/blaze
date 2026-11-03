@@ -1,7 +1,8 @@
 //! The CLI's and CI's side of the API, blocking: requests out, each response back by its
 //! request's id, over the daemon's Unix socket or HTTP ([`crate::server`] says how each is
 //! spoken). Responses of other requests that come while one is waited for are kept for
-//! [`Client::receive`].
+//! [`Client::receive`]. Or in this same process, with no socket ([`Local`]): the seed's one-shot
+//! build, whose CLI runs the daemon's engine itself.
 
 use std::{
     collections::VecDeque,
@@ -93,6 +94,21 @@ impl From<io::Error> for ClientError {
     }
 }
 
+/// A daemon in this same process, spoken to in the Unix socket's frames with no socket: the
+/// seed's one-shot build (todo/bootstrap/plan.md), whose engine is the daemon's, taking this
+/// process's requests alone ([`crate::server::Config::local`]).
+pub trait Local {
+    /// Hands the daemon `frame`, a request's.
+    fn send(&mut self, frame: &[u8]) -> io::Result<()>;
+
+    /// Runs the daemon until it has replied, appending its replies' frames to `into`; appends
+    /// nothing once it has hung up.
+    fn receive(&mut self, into: &mut Vec<u8>) -> io::Result<()>;
+
+    /// Stops the daemon, what it keeps made durable first: the end of the command.
+    fn close(&mut self) -> io::Result<()>;
+}
+
 pub struct Client {
     link: Link,
     /// The daemon's bytes, as frames.
@@ -113,6 +129,7 @@ impl fmt::Debug for Client {
             #[cfg(unix)]
             Link::Unix(_) => "unix",
             Link::Http(_) => "http",
+            Link::Local(_) => "local",
         };
         f.debug_struct("Client").field("over", &over).field("next_id", &self.next_id).finish()
     }
@@ -122,6 +139,8 @@ enum Link {
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
     Http(HttpLink),
+    // dyn: the one-shot build's engine, one per command, called once per read.
+    Local(Box<dyn Local>),
 }
 
 struct HttpLink {
@@ -171,6 +190,23 @@ impl Client {
         })))
     }
 
+    /// A client of the daemon `local` runs in this process ([`Local`]).
+    // dyn: as `Link::Local`.
+    pub fn local(local: Box<dyn Local>) -> Client {
+        Client::over(Link::Local(local))
+    }
+
+    /// Ends the connection: a [`Local`] daemon is stopped, its state made durable, and how that
+    /// went is the result; a socket's is only hung up.
+    pub fn close(mut self) -> Result<(), ClientError> {
+        match &mut self.link {
+            Link::Local(local) => Ok(local.close()?),
+            #[cfg(unix)]
+            Link::Unix(_) => Ok(()),
+            Link::Http(_) => Ok(()),
+        }
+    }
+
     fn over(link: Link) -> Client {
         Client {
             link,
@@ -200,6 +236,11 @@ impl Client {
                 frames::encode_into(&mut self.writer, &mut self.out, &envelope)
                     .map_err(ClientError::Refused)?;
                 io::Write::write_all(stream, &self.out)?;
+            }
+            Link::Local(local) => {
+                frames::encode_into(&mut self.writer, &mut self.out, &envelope)
+                    .map_err(ClientError::Refused)?;
+                local.send(&self.out)?;
             }
             Link::Http(link) => {
                 self.writer.append(&mut self.out, &envelope).map_err(|error| {
@@ -312,21 +353,36 @@ impl Client {
         }
     }
 
-    /// Waits for the daemon to hang up this connection, at most `patience`; responses that
-    /// come first are kept for [`Client::receive`]. A daemon that stops hangs up every
-    /// connection last, once its state is durable: where a service manager keeps its socket
-    /// listening, this is how `blaze stop` knows it is gone. Only the Unix socket has it.
+    /// Waits for the daemon to hang up this connection, at most `patience` after the last
+    /// thing it said: each [`Response::Stopping`] (a step of its stop) begins the wait again,
+    /// and a wait that ends names the step it was in. Other responses that come first are
+    /// kept for [`Client::receive`]. A daemon that stops hangs up every connection last, once
+    /// its state is durable: where a service manager keeps its socket listening, this is how
+    /// `blaze stop` knows it is gone. Only the Unix socket has it.
     #[cfg(unix)]
     pub fn until_hung_up(&mut self, patience: std::time::Duration) -> Result<(), ClientError> {
-        let deadline = std::time::Instant::now() + patience;
-        let waited = || {
+        let mut deadline = std::time::Instant::now() + patience;
+        let mut doing: Option<String> = None;
+        let waited = |doing: &Option<String>| {
             // alloc: error path, called only once the wait is over.
-            let said = format!("the daemon still holds the connection after {} ms", patience.as_millis());
+            let said = match doing {
+                Some(doing) => format!(
+                    "the daemon still holds the connection {} ms after it said it was {doing}, and has said nothing since",
+                    patience.as_millis()
+                ),
+                None => format!("the daemon still holds the connection after {} ms, saying nothing of what it does", patience.as_millis()),
+            };
             ClientError::Io(io::Error::new(io::ErrorKind::TimedOut, said))
         };
         loop {
             while let Some(envelope) = self.next_envelope()? {
-                self.kept.push_back(envelope);
+                match envelope.body {
+                    Response::Stopping { doing: now } => {
+                        doing = Some(now);
+                        deadline = std::time::Instant::now() + patience;
+                    }
+                    _ => self.kept.push_back(envelope),
+                }
             }
             let Link::Unix(stream) = &mut self.link else {
                 let said = "a wait for the daemon to hang up is the Unix socket's: HTTP keeps no connection open for it";
@@ -335,7 +391,7 @@ impl Client {
             };
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                return Err(waited());
+                return Err(waited(&doing));
             }
             match stream.set_read_timeout(Some(left)) {
                 Ok(()) => {}
@@ -349,7 +405,10 @@ impl Client {
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
                 Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                    return Err(waited());
+                    if std::time::Instant::now() < deadline {
+                        continue;
+                    }
+                    return Err(waited(&doing));
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -406,6 +465,17 @@ impl Client {
                     let said = "the daemon hung up";
                     return Err(ClientError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, said)));
                 }
+                return Ok(true);
+            }
+            Link::Local(local) => {
+                // `out` is the request's, sent already: its room holds what is taken.
+                self.out.clear();
+                local.receive(&mut self.out)?;
+                if self.out.is_empty() {
+                    let said = "the daemon hung up";
+                    return Err(ClientError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, said)));
+                }
+                self.frames.push(&self.out);
                 return Ok(true);
             }
             Link::Http(link) => link,

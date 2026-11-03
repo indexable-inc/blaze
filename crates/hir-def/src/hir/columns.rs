@@ -523,7 +523,9 @@ fn block(low: u32, high: u32) -> Checked<Option<BlockId>> {
     match (low, high) {
         (0, 0) => Ok(None),
         (0, _) => Err("a block id of index 0"),
-        (_, 0) => Ok(Some(BlockId::from_id(blaze_query::db::Id::from_u32(low)))),
+        (_, 0) => blaze_query::db::Id::new(low)
+            .map(|id| Some(BlockId::from_id(id)))
+            .ok_or("a block id past `Id::MAX_U32`, which no query storage gives"),
         _ => Err("a block id past 32 bits"),
     }
 }

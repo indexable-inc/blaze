@@ -718,11 +718,12 @@ fn build_graph(request: &Request<'_>) -> anyhow::Result<schema::UnitGraph> {
     for &root in &roots {
         let row = state.units[root as usize];
         let target = state.target(row.key.pkg, row.key.target);
+        let host_only = !target.proc_macro && state.root_is_host_only(row.key.pkg)?;
         let unit_for = if row.key.mode.is_any_test() {
-            if target.proc_macro { UnitFor::new_host_test() } else { UnitFor::new_test() }
+            if target.proc_macro || host_only { UnitFor::new_host_test() } else { UnitFor::new_test() }
         } else if target.is_custom_build() {
             UnitFor::new_host(false)
-        } else if target.proc_macro {
+        } else if target.proc_macro || host_only {
             UnitFor::new_host(true)
         } else if target.for_host {
             UnitFor::new_compiler()
@@ -913,17 +914,62 @@ impl<'r, 'a> State<'r, 'a> {
         id
     }
 
-    fn features_of(&mut self, pkg: u32, features_for: FeaturesFor) -> u32 {
+    /// The features `pkg` is built with for `features_for`, interned. A pair the feature
+    /// resolve did not activate is an error naming the package, never a panic (rule 17):
+    /// [`State::root_is_host_only`] keeps the roots off such pairs, so reaching one is a bug
+    /// in the walk, said as one.
+    fn features_of(&mut self, pkg: u32, features_for: FeaturesFor) -> anyhow::Result<u32> {
         let slot = pkg as usize * 2 + usize::from(features_for == FeaturesFor::HostDep);
         let known = self.features_of[slot];
         if known != NONE {
-            return known;
+            return Ok(known);
         }
         let (features, id) = (self.request.features, self.pkgs[pkg as usize].id);
-        let on = external(|| features.activated_features(id, features_for));
+        let Some(on) = external(|| features.activated_features_unverified(id, features_for)) else {
+            let what = match features_for {
+                FeaturesFor::NormalOrDev => "the target",
+                FeaturesFor::HostDep => "the host (as a build dependency or under a proc macro)",
+            };
+            bail!(
+                "the unit graph asks for the features of `{id}` built for {what}, which the feature \
+                 resolve did not activate: no package the build selects reaches it that way"
+            );
+        };
         let set = self.features.intern(&on);
         self.features_of[slot] = set;
-        set
+        Ok(set)
+    }
+
+    /// The features a package's `required-features` are checked against (cargo's
+    /// `resolve_all_features`, which reads the target's): the host's for a package the build
+    /// reaches only as a host dependency ([`State::root_is_host_only`]).
+    fn own_features_for(&self, pkg: u32) -> anyhow::Result<FeaturesFor> {
+        Ok(FeaturesFor::from_for_host(self.root_is_host_only(pkg)?))
+    }
+
+    /// Whether a root of `pkg` (asked for with `-p`) is built for the host with its host
+    /// features: the package is not a member and the build reaches it only as a host
+    /// dependency (a build dependency, or under a proc macro), so the feature resolve has no
+    /// features for it on the target. cargo assumes a root is never a build dependency and
+    /// panics here (rust-lang/cargo#11105); blaze builds the package as the build already
+    /// uses it, the very unit the build script that depends on it links. A package reached
+    /// neither way (only as a dev-dependency of a build without dev units) is refused, naming
+    /// the package and the rule.
+    fn root_is_host_only(&self, pkg: u32) -> anyhow::Result<bool> {
+        let (features, id) = (self.request.features, self.pkgs[pkg as usize].id);
+        if features.is_activated(id, FeaturesFor::NormalOrDev) {
+            return Ok(false);
+        }
+        if features.is_activated(id, FeaturesFor::HostDep) {
+            return Ok(true);
+        }
+        bail!(
+            "`{id}` is asked for, but no package the build selects reaches it as a dependency for \
+             the target or the host, so its features are not resolved: under resolver 2 a \
+             dev-dependency's features are resolved only when tests, benches or examples are \
+             built (`blaze test -p {name}`, or `--all-targets`)",
+            name = id.name()
+        )
     }
 
     fn extern_names(&mut self, parent: u32, pkg: u32, target: u32) -> anyhow::Result<(u32, u32)> {
@@ -957,16 +1003,17 @@ impl<'r, 'a> State<'r, 'a> {
     }
 
     /// Whether `pkg` has every `required` feature (a target's `required-features`), as cargo's
-    /// `resolve_all_features` lists them: the package's own, and `dep/feature` for each feature
-    /// on in each of its dependencies.
+    /// `resolve_all_features` lists them: the package's own for `features_for`, and
+    /// `dep/feature` for each feature on in each of its dependencies.
     fn has_features(
         &mut self,
         pkg: u32,
+        features_for: FeaturesFor,
         has_dev_units: bool,
         kind: Kind,
         required: &[String],
     ) -> anyhow::Result<bool> {
-        let own = self.features_of(pkg, FeaturesFor::NormalOrDev);
+        let own = self.features_of(pkg, features_for)?;
         let (start, len) = self.dep_features(pkg, has_dev_units, kind)?;
         let own = self.features.get(own);
         let pairs = &self.dep_feature_pairs[start as usize..(start + len) as usize];
@@ -1034,13 +1081,16 @@ impl<'r, 'a> State<'r, 'a> {
     fn to_compile_mode(&self) -> Mode {
         match self.request.intent {
             Intent::Test | Intent::Bench => Mode::Test,
+            Intent::Doctest => Mode::Doctest,
             Intent::Build => Mode::Build,
             Intent::Check { test } => Mode::check(test),
             Intent::Doc { .. } => Mode::Check,
         }
     }
 
-    fn new_unit(&mut self, pkg: u32, at: u32, initial: Mode) -> u32 {
+    /// A root unit (cargo's `new_units`); `host_only` is [`State::root_is_host_only`]'s:
+    /// the root is built for the host as a build dependency is, with its host features.
+    fn new_unit(&mut self, pkg: u32, at: u32, initial: Mode, host_only: bool) -> anyhow::Result<u32> {
         let target = self.target(pkg, at);
         let mode = match initial {
             Mode::Test
@@ -1050,18 +1100,20 @@ impl<'r, 'a> State<'r, 'a> {
             }
             mode => mode,
         };
-        let features = self.features_of(pkg, FeaturesFor::from_for_host(target.proc_macro));
+        let features = self.features_of(pkg, FeaturesFor::from_for_host(target.proc_macro || host_only))?;
         let unit_for = if initial.is_any_test() {
-            UnitFor::new_test()
+            if host_only { UnitFor::new_host_test() } else { UnitFor::new_test() }
+        } else if host_only {
+            UnitFor::new_host(true)
         } else if target.for_host {
             UnitFor::new_compiler()
         } else {
             UnitFor::new_normal()
         };
-        let profile = self.profile(pkg, unit_for, Kind::Target);
-        let kind = self.kind_for(Kind::Target, target.for_host, target.proc_macro, mode);
+        let profile = self.profile(pkg, unit_for, if host_only { Kind::Host } else { Kind::Target });
+        let kind = self.kind_for(Kind::Target, target.for_host || host_only, target.proc_macro, mode);
         let class = self.profiles.class_of[profile as usize];
-        self.intern(Key { pkg, target: at, features, class, kind, mode }, profile)
+        Ok(self.intern(Key { pkg, target: at, features, class, kind, mode }, profile))
     }
 
     /// Proposes each of `packages`' targets `predicate` picks; how many.
@@ -1123,6 +1175,8 @@ impl<'r, 'a> State<'r, 'a> {
                         let picked = match self.request.intent {
                             Intent::Bench => t.benched,
                             Intent::Test => t.tested || is_example(t),
+                            // `--doc` is lib-only (`Filter::Only`): no default targets.
+                            Intent::Doctest => false,
                             Intent::Build | Intent::Check { .. } => t.is_bin() || t.is_lib(),
                             // cargo's: a binary named as its package's library is left out.
                             Intent::Doc { .. } => {
@@ -1155,7 +1209,20 @@ impl<'r, 'a> State<'r, 'a> {
             Filter::Only { all_targets, lib, bins, examples, tests, benches } => {
                 if *lib != LibRule::False {
                     let mode = self.to_compile_mode();
+                    let from = out.len();
                     let libs = self.filter_targets(packages, Target::is_lib, false, mode, out);
+                    // `test --doc`: a library whose examples are not tested (`doctest = false`,
+                    // or a crate type rustdoc can't test) has no doctest unit, as under `test`.
+                    if mode == Mode::Doctest {
+                        let mut at = from;
+                        while at < out.len() {
+                            let target = self.target(out[at].pkg, out[at].target);
+                            match target.doctest && target.doctestable() {
+                                true => at += 1,
+                                false => _ = out.remove(at),
+                            }
+                        }
+                    }
                     if !all_targets && libs == 0 && *lib == LibRule::True {
                         let names: Vec<String> =
                             // alloc: the error's text.
@@ -1205,12 +1272,18 @@ impl<'r, 'a> State<'r, 'a> {
         let mut units = Vec::with_capacity(proposals.len());
         for Proposal { pkg, target, requires_features, mode } in proposals {
             let t = self.target(pkg, target);
+            // A proc macro's root is the host's already, as cargo builds it.
+            let host_only = !t.proc_macro && self.root_is_host_only(pkg)?;
+            let (features_for, kind) = match host_only {
+                true => (FeaturesFor::HostDep, Kind::Host),
+                false => (FeaturesFor::NormalOrDev, kind),
+            };
             let available = match &t.required_features {
-                Some(required) => self.has_features(pkg, self.request.has_dev_units, kind, required)?,
+                Some(required) => self.has_features(pkg, features_for, self.request.has_dev_units, kind, required)?,
                 None => true,
             };
             if t.is_lib() || available {
-                units.push(self.new_unit(pkg, target, mode));
+                units.push(self.new_unit(pkg, target, mode, host_only)?);
             } else if requires_features {
                 let required = t.required_features.as_deref().unwrap_or_default();
                 // alloc: the error's text.
@@ -1340,7 +1413,7 @@ impl<'r, 'a> State<'r, 'a> {
                         let bin_at = self.target_lists[at as usize];
                         let bin = self.target(pkg, bin_at);
                         if let Some(required) = &bin.required_features
-                            && !self.has_features(pkg, false, row.key.kind, required)?
+                            && !self.has_features(pkg, self.own_features_for(pkg)?, false, row.key.kind, required)?
                         {
                             continue;
                         }
@@ -1403,7 +1476,7 @@ impl<'r, 'a> State<'r, 'a> {
         };
         let parent_pkg = self.units[parent as usize].key.pkg;
         let (extern_crate_name, dep_name) = self.extern_names(parent_pkg, pkg, target)?;
-        let features = self.features_of(pkg, features_for(unit_for));
+        let features = self.features_of(pkg, features_for(unit_for))?;
         let class = self.profiles.class_of[profile as usize];
         let unit = self.intern(Key { pkg, target, features, class, kind, mode }, profile);
         Ok(Dep { unit, extern_crate_name, dep_name, unit_for, public, dev: false })

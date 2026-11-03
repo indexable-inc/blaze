@@ -868,8 +868,9 @@ fn commented() {
     );
 }
 
-/// `fiber_boundary` over a `blaze_graph` whose `sched` has the fibers, a `corosensei`, and a
-/// crate `main` depending on both. A line of the crate linted says what it expects:
+/// `fiber_boundary` over a `blaze_graph` whose `sched` has the fibers and the stack layer's
+/// `Yielder::suspend` (the may-suspend check's root, which a graph without it is refused for), a
+/// `corosensei`, and a crate `main` depending on both. A line of the crate linted says what it expects:
 /// `//~ fiber` that the line names `blaze_graph::sched::fiber` outside `sched`, `//~ corosensei`
 /// that it names `corosensei`, `//~ driver` that it names the fiber driver.
 mod fiber_boundary {
@@ -889,6 +890,14 @@ mod fiber_boundary {
 
     const SCHED: &str = r#"
 pub mod sched {
+    pub mod stack {
+        pub struct Yielder(());
+        impl Yielder {
+            pub fn suspend(&self, value: u32) -> u32 {
+                value
+            }
+        }
+    }
     pub mod fiber {
         pub struct Driver;
         pub struct Carried;
@@ -1067,6 +1076,14 @@ pub fn make() -> corosensei::Coroutine { //~ corosensei
         check_fibers(
             r#"
 pub mod sched {
+    pub mod stack {
+        pub struct Yielder(());
+        impl Yielder {
+            pub fn suspend(&self, value: u32) -> u32 {
+                value
+            }
+        }
+    }
     pub mod fiber {
         pub struct Driver;
         pub struct Carried;
@@ -1106,6 +1123,14 @@ pub fn drive(it: blaze_graph::sched::Driver) -> Driver { //~ driver driver
         check_fibers(
             r#"
 pub mod sched {
+    pub mod stack {
+        pub struct Yielder(());
+        impl Yielder {
+            pub fn suspend(&self, value: u32) -> u32 {
+                value
+            }
+        }
+    }
     use corosensei::Coroutine;
     pub mod fiber {
         use corosensei::Coroutine;

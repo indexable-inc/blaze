@@ -79,6 +79,14 @@ pub struct Profile {
     pub packages: BTreeMap<String, Override>,
     /// `[profile.<name>.build-override]`.
     pub build_override: Override,
+    /// `codegen-backend = "stencil"` on the profile: every function of the build, the standard
+    /// library's and build-time code's too, is copy-and-patch stencils whatever its opt-level,
+    /// compiled as at opt-level 1. The build asks for it by name; nothing turns it on for a
+    /// blaze that lacks LLVM (rule 3). What the seed builds with (todo/bootstrap/plan.md, "std
+    /// and assembly in the seed"), whose output only has to be correct. Left out of the
+    /// serialized form when off, so [`Policy::id`] of every other build is the one it had.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stencils: bool,
 }
 
 /// Whose code an instance is, for its settings. One pointer and a tag: the walk copies it for
@@ -248,7 +256,8 @@ impl std::fmt::Display for PlanError {
             PlanError::NoLlvm { origin, level } => write!(
                 f,
                 "{origin:?} is compiled at opt-level {level:?}, which needs LLVM, and this blaze \
-                 was built without it (`--features llvm`)"
+                 was built without it (`--features llvm`): build with a blaze that has LLVM, or \
+                 ask for stencils at every level with `codegen-backend = \"stencil\"` on the profile"
             ),
             PlanError::NoStencils { origin, level, target } => write!(
                 f,
@@ -308,11 +317,18 @@ impl Policy {
             assertions = layer.debug_assertions.unwrap_or(assertions);
             debuginfo = layer.debuginfo.unwrap_or(debuginfo);
         }
+        // The profile asked for stencils at every level: a level of LLVM's is compiled as
+        // opt-level 1 is, whether or not this blaze has LLVM. Overflow checks, debug
+        // assertions and debug info stay the layers' (they are the program's behaviour).
+        let asked = level;
+        if profile.stencils && level.backend(true) != Some(Backend::Stencil) {
+            level = OptLevel::O1;
+        }
         let llvm = self.toolchain.llvm.is_some();
         // Only a member's code is edited, so only it is recompiled: the rest is compiled once
         // and can afford Cranelift's optimizer.
         let member = matches!(origin, Origin::Member(_));
-        let native = self.toolchain.arch != crate::Arch::Wasm32;
+        let native = !self.toolchain.arch.is_wasm();
         // wasm32 has one code producer, the lowering of the IR to wasm (`hir-ty-codegen`'s
         // `wasm::lower`, which `check_built` holds every wasm32 unit to): the level picks
         // no other, as LLVM writes no wasm32 for blaze (its pinned build has no WebAssembly
@@ -357,7 +373,7 @@ impl Policy {
         let stencils = counted || tiered || backend == Backend::Stencil;
         if stencils && self.toolchain.stencils.is_none() {
             // clone: an error names the target
-            return Err(PlanError::NoStencils { origin: *origin, level, target: self.toolchain.target.clone() });
+            return Err(PlanError::NoStencils { origin: *origin, level: asked, target: self.toolchain.target.clone() });
         }
         if counted {
             // Its tier-up is `blaze_stencil::tier`'s, by its counts: never a plan's `then`.
@@ -408,6 +424,7 @@ mod tests {
                 panic: Panic::Unwind,
                 packages: BTreeMap::new(),
                 build_override: Override::default(),
+                stencils: false,
             },
             mode,
             fold: false,
@@ -627,6 +644,40 @@ mod tests {
         let mut policy = policy(OptLevel::O3, Mode::Output);
         policy.toolchain.llvm = None;
         assert!(matches!(policy.choose(&member(), None), Err(PlanError::NoLlvm { .. })));
+    }
+
+    /// `codegen-backend = "stencil"` (the seed's builds): every level, std's O3 among them, is
+    /// stencils as at opt-level 1, with or without LLVM, and the program's settings stay.
+    #[test]
+    fn a_profile_that_asks_for_stencils_compiles_every_level_as_stencils() {
+        for llvm in [Some("23.1".to_owned()), None] {
+            let mut policy = policy(OptLevel::O3, Mode::Output);
+            policy.toolchain.llvm = llvm;
+            policy.profile.stencils = true;
+            policy.profile.packages.insert("*".to_owned(), Override { opt_level: Some(OptLevel::Z), ..Override::default() });
+            for origin in origins() {
+                let choice = policy.choose(&origin, None).unwrap();
+                assert_eq!(choice.first.backend, Backend::Stencil, "{origin:?}");
+                assert!(!choice.first.mir_inline && choice.then.is_none(), "{origin:?}");
+            }
+            let std = policy.choose(&Origin::Std, None).unwrap().first;
+            assert!(!std.overflow_checks && !std.debug_assertions);
+            assert!(policy.choose(&member(), None).unwrap().first.overflow_checks);
+            policy.toolchain.stencils = None;
+            assert_eq!(
+                policy.choose(&Origin::Std, None),
+                Err(PlanError::NoStencils {
+                    origin: Origin::Std,
+                    level: OptLevel::O3,
+                    target: "aarch64-unknown-linux-gnu".to_owned()
+                })
+            );
+        }
+        // Not asked for, a blaze without LLVM still refuses, naming the setting.
+        let mut policy = policy(OptLevel::O0, Mode::Output);
+        policy.toolchain.llvm = None;
+        let why = policy.choose(&Origin::Std, None).unwrap_err().to_string();
+        assert!(why.contains("codegen-backend = \"stencil\""), "{why}");
     }
 
     #[test]

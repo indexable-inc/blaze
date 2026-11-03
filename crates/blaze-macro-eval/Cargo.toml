@@ -26,6 +26,7 @@ blaze-format.workspace = true
 blaze-graph.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
+blaze-wasi.workspace = true
 blaze-profile.workspace = true
 blaze-usercode.workspace = true
 cfg.workspace = true

@@ -214,6 +214,7 @@ fn plan(db: &Database, dir: &str, view: ContentId, cargo_home: &str) -> Result<(
             library: stdlib::library_at(&library.commit),
             std: "/s/std".to_owned(),
             builds: "/s/build".to_owned(),
+            sources: "/s/sources".to_owned(),
         };
         let opened = db.open_with(View { root: view }, &config.encode());
         let planned = db.pin().get::<Plan>(opened, &()).map_err(|error| format!("planning {dir}: {error:?}"))?.get();

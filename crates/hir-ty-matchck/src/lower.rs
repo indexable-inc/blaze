@@ -876,6 +876,12 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                 }
                 Self::opaque(ty, pat)
             }
+            // A value of a pattern type (`NonZero`'s field, `pattern_type!(u8 is 1..)`): valtree
+            // construction takes it as its base type's, and `valtree_to_pat` keeps it a
+            // `PatKind::Constant` of the pattern type, which exhaustiveness takes as an opaque
+            // constructor (its constructor set is unlistable) and MIR building tests by
+            // comparing the two values transmuted to the base type.
+            TyKind::Pat(..) => Self::opaque(ty, pat),
             // A zero-sized valtree that `valtree_to_pat` makes no pattern of.
             TyKind::FnDef(..) => {
                 refusals.pat(refused, ConstPatternError::Invalid(ty.store()));

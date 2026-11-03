@@ -48,6 +48,7 @@ pub(crate) fn policy(level: OptLevel, mode: Mode) -> Policy {
             panic: Panic::Unwind,
             packages: BTreeMap::new(),
             build_override: Override::default(),
+            stencils: false,
         },
         mode,
         fold: false,

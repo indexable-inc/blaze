@@ -31,7 +31,8 @@ pub(crate) fn table(
     // clone: once per test binary linked, the names the table keeps
     let tests = tests.iter().map(|it| (it.name.clone(), it.root));
     // alloc: error path
-    ExecTable::new(built, spans, slots, slot_of, beside, tests).map_err(|why| format!("the execution table of `{binary}`: {why}"))
+    ExecTable::new(built, spans, slots, slot_of, beside, tests)
+        .map_err(|why| format!("the execution table of `{binary}`: {}", why.describe(built)))
 }
 
 /// `table` as a selector reads it. A slot an incremental link emptied ([`ExecTable::EMPTY`]) is

@@ -35,7 +35,7 @@ use db::TestDB;
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(fixture::db(text).into_db()));
-    (db, HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default()))))
+    (db, HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default()))
 }
 
 #[track_caller]
@@ -54,6 +54,7 @@ fn spec() -> Spec {
         crate::Arch::X86_64 => blaze_codegen::Arch::X86_64,
         crate::Arch::Aarch64 => blaze_codegen::Arch::Aarch64,
         crate::Arch::Wasm32 => blaze_codegen::Arch::Wasm32,
+        crate::Arch::Wasm64 => blaze_codegen::Arch::Wasm64,
     };
     let pic = crate::isa_for(crate::Target::for_fixtures()).expect("a code generator").flags().is_pic();
     Spec {
@@ -388,7 +389,7 @@ fn a_derived_method_is_reached_where_derives_are_expanded() {
     hir_def::nameres::set_expand_builtin_derives(&mut expanded, true);
     let db: &'static TestDB = Box::leak(Box::new(expanded));
     let expanding =
-        HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default())));
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default());
     let reached = reach(&expanding, expanding.root(function(db, "roots")));
     assert_reached(db, &reached, &["clone", "eq"]);
 
@@ -396,6 +397,52 @@ fn a_derived_method_is_reached_where_derives_are_expanded() {
     let root = frontend.root(function(db, "roots"));
     let refused = frontend.with(|db| walk(db, &root, Walking::plain(false))).expect_err("the call of `clone`");
     assert!(refused.contains("`Clone::clone` of") && refused.contains("#[derive(Clone)]"), "{refused}");
+}
+
+const DERIVED_DEBUG: &str = r#"
+//- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn, fmt, derive
+#[derive(Debug)]
+pub struct Unit;
+#[derive(Debug)]
+pub enum E { A, B }
+pub fn roots(f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let _ = core::fmt::Debug::fmt(&Unit, f);
+    core::fmt::Debug::fmt(&E::A, f)
+}
+"#;
+
+/// `#[derive(Debug)]` writes a unit struct's or unit variant's name with
+/// `Formatter::write_str`. Where derives are expanded, the derived `fmt` of each is reached
+/// and lowers (cp37's failure 4: the fixtures' `core` had no `write_str`, so the call had no
+/// function and the MIR of the derived `fmt` did not lower).
+#[test]
+fn a_derived_debug_of_a_unit_struct_and_a_unit_variant_lowers() {
+    let mut expanded = fixture::db(DERIVED_DEBUG).into_db();
+    hir_def::nameres::set_expand_builtin_derives(&mut expanded, true);
+    let db: &'static TestDB = Box::leak(Box::new(expanded));
+    let frontend = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default());
+    let reached = reach(&frontend, frontend.root(function(db, "roots")));
+    let fmts = names(db, &reached).iter().filter(|it| *it == "fmt").count();
+    assert_eq!(fmts, 2, "`Unit`'s and `E`'s derived `fmt`: {:?}", names(db, &reached));
+}
+
+const NO_FUNCTION: &str = r#"
+//- minicore: sized
+pub fn roots() -> u32 { g() }
+"#;
+
+/// A body whose MIR does not lower is refused naming the body by its path and, for a call with
+/// no function, the callee as written and where the call is (rule 16), never a bare
+/// `MissingFunctionDefinition(FunctionId(..), Expr ..)`.
+#[test]
+fn a_body_whose_mir_does_not_lower_is_refused_naming_it_and_the_call() {
+    let (db, frontend) = frontend(NO_FUNCTION);
+    let root = frontend.root(function(db, "roots"));
+    let refused = frontend.with(|db| walk(db, &root, Walking::plain(false))).expect_err("`g` resolves to nothing");
+    assert!(refused.contains("the MIR of `"), "the body is named: {refused}");
+    assert!(refused.contains("roots` did not lower: the call of `g` at "), "the body and the callee: {refused}");
+    assert!(refused.contains(" has no function: "), "{refused}");
+    assert!(!refused.contains("MissingFunctionDefinition"), "{refused}");
 }
 
 const SOFT_FLOATS: &str = r#"
@@ -616,13 +663,13 @@ fn extern_and_variadic_calls_list_their_symbols() {
             place_requests(db, &HashSource::ById(ById), None, &mut Placer::listed(Vec::new()), requests)
                 .expect("assembly that names nothing");
         }
-        // A blaze without LLVM refuses it, naming the block's target and the missing assembler,
-        // never assembling it some other way.
-        #[cfg(not(feature = "llvm"))]
+        // A blaze with no assembler refuses it, naming the block's target and the missing
+        // assembler, never assembling it some other way.
+        #[cfg(not(any(feature = "llvm", feature = "rsasm")))]
         {
-            let Err(e) = code else { panic!("a blaze without LLVM assembled `asm!`") };
+            let Err(e) = code else { panic!("a blaze with no assembler assembled `asm!`") };
             assert!(
-                e.contains("inline assembly for x86_64-") && e.contains("built without LLVM") && e.contains("--features llvm"),
+                e.contains("inline assembly for x86_64-") && e.contains("built with no assembler") && e.contains("--features llvm"),
                 "{e}"
             );
         }
@@ -740,9 +787,13 @@ pub fn broken() -> u32 { "not a number" }
 fn a_body_that_does_not_lower_is_an_error_naming_the_instance() {
     let (db, frontend) = frontend(BROKEN);
     let root = frontend.root(function(&db, "broken"));
-    let walked = frontend.with(|db| walk(db, &root, Walking::plain(false)));
+    let (walked, named) = frontend.with(|db| {
+        let named = super::super::Named(db, &root).to_string();
+        (walk(db, &root, Walking::plain(false)), named)
+    });
     let error = walked.expect_err("the walk of a body with a type error");
-    assert!(error.contains(&format!("{root:?}")), "{error}");
+    assert!(error.contains(&format!("the references of {named}: ")), "{error}");
+    assert!(named.contains("broken"), "{named}");
 }
 
 const VTABLES_APART_IN_LIFETIMES: &str = r#"

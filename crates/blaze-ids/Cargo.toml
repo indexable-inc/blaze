@@ -43,5 +43,10 @@ blake3-servil.workspace = true
 name = "blake3"
 harness = false
 
+[features]
+# blake3's SIMD128 code on wasm32 (Rust, no C); does nothing on other targets. The seed
+# profile's: native builds keep blake3-servil and blake3's assembly.
+wasm32-simd = ["blake3/wasm32_simd"]
+
 [lints]
 workspace = true

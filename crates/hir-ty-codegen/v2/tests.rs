@@ -42,7 +42,7 @@ fn held(db: TestDB) -> (&'static TestDB, HirFrontend<'static>) {
 fn held_as(db: TestDB, policy: &Policy) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(db));
     let frontend =
-        HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default())));
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default());
     (db, frontend.with_policy(policy))
 }
 
@@ -67,6 +67,7 @@ fn policy(level: OptLevel) -> Policy {
             panic: Panic::Unwind,
             packages: Default::default(),
             build_override: Override::default(),
+            stencils: false,
         },
         mode: Mode::Output,
         fold: false,
@@ -95,6 +96,7 @@ fn spec() -> Spec {
         crate::Arch::X86_64 => blaze_codegen::Arch::X86_64,
         crate::Arch::Aarch64 => blaze_codegen::Arch::Aarch64,
         crate::Arch::Wasm32 => blaze_codegen::Arch::Wasm32,
+        crate::Arch::Wasm64 => blaze_codegen::Arch::Wasm64,
     };
     let pic = crate::isa_for(crate::Target::for_fixtures()).expect("a code generator").flags().is_pic();
     Spec {
@@ -125,6 +127,23 @@ fn spec() -> Spec {
         fuel: false,
         heap_to_stack: false,
     }
+}
+
+/// How a unit at `opt-level = 3` builds its bodies: optimized and MIR-inlined, with
+/// [`spec`]'s other settings (no debug assertions, as a release build has).
+fn o3() -> Build {
+    Build::of(&Spec { backend: Backend::Llvm { opt: 3 }, mir_inline: true, ..spec() })
+}
+
+/// What the compile of `instance` under `build` built in, by code: its `Function::inlined`.
+fn inlined_by_build(db: &Db, hashes: &HashSource, instance: &HirInstance, build: Build) -> Vec<CodeHash> {
+    let code = built(db, instance, crate::Target::for_fixtures(), false, build)
+        .unwrap_or_else(|e| panic!("{instance:?}: {e}"));
+    let built_in = match &code {
+        super::Built::Ir(pending) => pending.built_in(),
+        super::Built::Assembled(..) => &[],
+    };
+    super::frontend::inlined(db, hashes, instance, built_in).expect("what its code builds in")
 }
 
 fn unit(spec: &Spec) -> Unit {
@@ -604,7 +623,7 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
     let (db, frontend) = frontend(SHARED);
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
     let options = |policy: &Policy| {
-        let build_time = std::sync::Arc::new(BuildTime(Default::default()));
+        let build_time = BuildTime::default();
         let frontend =
             HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time).with_policy(policy);
         frontend.body_options(&origin).expect("the options")
@@ -636,7 +655,7 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
     let checked = options(&checked);
     assert!(checked.other.contains(at(Debug, true, false)), "{checked:?}");
     let unplanned =
-        HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default())));
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default());
     assert!(unplanned.body_options(&origin).is_err_and(|e| e.contains("with_policy")));
 }
 
@@ -795,7 +814,14 @@ fn one_function_under_two_settings_builds_two_irs_in_one_database() {
         assert_eq!(unwinds_again, unwinds, "built after the aborting IR, the unwinding one is its own again");
         let HirInstance(Kind::Code(instance, env)) = &root else { panic!("{root:?} is no function") };
         let instance = crate::Instance { checked: false, ..*instance };
-        let direct = match crate::instance_code(db, instance, *env, crate::Detach::Unit, Some(aborting)) {
+        let direct = match crate::instance_code(
+            db,
+            instance,
+            *env,
+            crate::Detach::Unit,
+            Some(aborting),
+            &mut None,
+        ) {
             Ok(crate::Produced::Pending(pending)) => pending.func.display().to_string(),
             Ok(crate::Produced::Code(_)) => panic!("a unit's compile leaves its IR to the back end"),
             Err(e) => panic!("{root:?}: {e}"),
@@ -843,12 +869,12 @@ fn an_always_inline_callee_of_a_dependency_is_built_in() {
             matches!(it, FrontRef::Function(callee) if named(callee, "helper"))
         };
         assert!(walked.iter().any(calls_helper), "{walked:?}");
-        let inlined =
-            super::frontend::inlined(db, &HashSource::ById(ById), (&root, refs::Walking::plain(false))).expect("what is built in");
-        assert_eq!(inlined.len(), 2, "outer and twice: {inlined:?}");
         let mut code = built(db, &root, crate::Target::for_fixtures(), false, Build::of(&spec))
             .unwrap_or_else(|e| panic!("{root:?}: {e}"));
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
+        let inlined = super::frontend::inlined(db, &HashSource::ById(ById), &root, pending.built_in())
+            .expect("what is built in");
+        assert_eq!(inlined.len(), 2, "outer and twice: {inlined:?}");
         let mut placer = Placer::listed(walked);
         place_requests(db, &HashSource::ById(ById), compiled_in(db, &root), &mut placer, &mut pending.wants.requests)
             .expect("the IR asks only for what the walk lists");
@@ -866,6 +892,92 @@ pub fn roots() {
 }
 "#;
 
+const OVER_A_PATH_CRATE: &str = r#"
+//- minicore: sized
+//- /sys.rs crate:sys
+pub struct Ctx(pub u8);
+pub fn make() -> Ctx { Ctx(0) }
+//- /safe.rs crate:safe deps:sys library
+pub fn open() -> sys::Ctx { sys::make() }
+pub static OPEN: fn() -> sys::Ctx = open;
+//- /other.rs crate:other library
+pub fn plain() -> u8 { 1 }
+//- /main.rs crate:main deps:safe,other
+pub fn roots() {
+    safe::open();
+    other::plain();
+    (safe::OPEN)();
+}
+"#;
+
+/// The front end of a build that links a dependency image (`HirFrontend::with_image`), as a
+/// dev executable's is, over `db`.
+fn held_imaged(db: TestDB) -> (&'static TestDB, HirFrontend<'static>) {
+    let (db, frontend) = held_as(db, &policy(OptLevel::O0));
+    (db, frontend.with_image(true))
+}
+
+/// A registry crate over a path crate (`zstd-safe` over a `[patch]`ed `zstd-sys`) is the
+/// workspace's for the dependency image: an edit of the path crate reaches its code, and in
+/// the image it would call the path crate's functions, which are the workspace's. Its statics
+/// are the workspace's by the same rule, so one pointing at its own function does not refer
+/// to the workspace's code from the image. A registry crate over none stays the image's in a
+/// build that links one, and is the workspace's in one that links none.
+#[test]
+fn a_registry_crate_over_a_path_crate_is_the_workspaces() {
+    use blaze_codegen::{Owner, backend::Frontend as _};
+    let (db, frontend) = held_imaged(fixture::db(OVER_A_PATH_CRATE).into_db());
+    let root = frontend.root(function(&db, "roots"));
+    let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
+    hir_ty::attach_db(db, || {
+        let describe = |instance: &HirInstance| {
+            frontend.describe(instance, &origin).unwrap_or_else(|e| panic!("{instance:?}: {}", e.what))
+        };
+        let rooted = describe(&root);
+        let called = |name: &str| {
+            (rooted.refs.iter())
+                .find_map(|it| match it {
+                    FrontRef::Function(instance @ HirInstance(Kind::Code(called, _))) => match called.def {
+                        InstanceDef::Fn(func) if FunctionSignature::of(db, func).name.as_str() == name => {
+                            Some(instance.clone())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no `{name}` in {:?}", rooted.refs))
+        };
+        assert_eq!(describe(&called("open")).owner, Owner::Workspace, "`safe::open`, over the path crate `sys`");
+        assert_eq!(describe(&called("plain")).owner, Owner::Dependency, "`other::plain`, over no path crate");
+        let table = (rooted.refs.iter())
+            .find_map(|it| match it {
+                FrontRef::Static(value) => Some(*value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no `safe::OPEN` in {:?}", rooted.refs));
+        let table = frontend.describe_static(&table).unwrap_or_else(|e| panic!("`safe::OPEN`: {}", e.what));
+        let points_at_open = |it: &FrontRef<HirInstance, super::HirStatic>| match it {
+            FrontRef::Function(HirInstance(Kind::Code(called, _))) => {
+                matches!(called.def, InstanceDef::Fn(func) if FunctionSignature::of(db, func).name.as_str() == "open")
+            }
+            _ => false,
+        };
+        assert!(table.refs.iter().any(points_at_open), "`safe::OPEN` points at `safe::open`: {:?}", table.refs);
+        assert_eq!(table.owner, Owner::Workspace, "`safe::OPEN`, a static of `safe`, is its crate's as `safe::open` is");
+    });
+    let (db, frontend) = held_as(fixture::db(OVER_A_PATH_CRATE).into_db(), &policy(OptLevel::O0));
+    let root = frontend.root(function(&db, "roots"));
+    let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
+    hir_ty::attach_db(db, || {
+        let rooted = frontend.describe(&root, &origin).unwrap_or_else(|e| panic!("{root:?}: {}", e.what));
+        for it in &rooted.refs {
+            let FrontRef::Function(instance) = it else { continue };
+            let described = frontend.describe(instance, &origin).unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
+            assert_eq!(described.owner, Owner::Workspace, "a build that links no image: {instance:?}");
+        }
+    });
+}
+
 /// An `asm!` function is its asker's for the dependency image. The one a dependency's generic
 /// asks for, compiled as a member asks (core's `__isb::<SY>` for build-time `blaze-spin`), is
 /// the image's, or the image would refer to the workspace's; the member's own is the
@@ -873,7 +985,7 @@ pub fn roots() {
 #[test]
 fn an_asm_function_a_dependencys_generic_asks_for_is_the_images() {
     use blaze_codegen::{Owner, backend::Frontend as _};
-    let (db, frontend) = frontend(ASKED_BY_THE_IMAGE);
+    let (db, frontend) = held_imaged(fixture::db(ASKED_BY_THE_IMAGE).into_db());
     let root = frontend.root(function(&db, "roots"));
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
     hir_ty::attach_db(db, || {
@@ -992,6 +1104,8 @@ const ALLOCATORS: &str = r#"
 //- /std.rs crate:std
 #![feature(decl_macro, rustc_attrs)]
 pub mod alloc {
+    // The expansion's paths start at `$crate`, this crate, as std re-exports core's.
+    pub use core::alloc::{GlobalAlloc, Layout};
     pub struct System;
     unsafe impl core::alloc::GlobalAlloc for System {
         unsafe fn alloc(&self, _layout: core::alloc::Layout) -> *mut u8 { 0 as *mut u8 }
@@ -1437,7 +1551,7 @@ fn which_units_inline_is_the_policys() {
     let outer = function(db, "outer");
     let generic = frontend.with(|db| called(db, &root, outer)).remove(0);
     let inlines = |policy: &Policy, instance: &HirInstance| {
-        let build_time = std::sync::Arc::new(BuildTime(Default::default()));
+        let build_time = BuildTime::default();
         let frontend =
             HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time).with_policy(policy);
         frontend.with(|db| frontend.inlines(db, instance)).expect("the policy")
@@ -1457,7 +1571,7 @@ fn which_units_inline_is_the_policys() {
     // Other members and the library's crates still inline, and any of them may ask for it.
     assert!(inlines(&set_apart, &generic));
     let unwalked =
-        HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default())));
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default());
     let refused = unwalked.with(|db| unwalked.inlines(db, &root));
     assert!(refused.is_err_and(|e| e.contains("with_policy")));
 }
@@ -1527,7 +1641,7 @@ fn a_callee_inlined_twice_is_built_in_once() {
         assert_ne!(one, two);
         let of = |func| built_in.iter().any(|&at| is_call(&walked[at as usize], func));
         assert!(of(leaf) && of(mid), "{built_in:?} of {walked:?}");
-        let inlined = super::frontend::inlined(db, &HashSource::ById(ById), (&root, refs::Walking::plain(true))).expect("the code");
+        let inlined = inlined_by_build(db, &HashSource::ById(ById), &root, o3());
         assert_eq!(inlined.len(), 2, "leaf and mid: {inlined:?}");
     });
 }
@@ -2930,4 +3044,340 @@ fn an_instance_is_not_compiled_in_a_crate_that_misses_a_specializing_impl_its_as
             .collect()
     });
     assert_eq!(go, [dep], "`k::run` compiled in {:?} (`k` is {k:?}, `main` {main:?}) calls `go` of {go:?}", env.krate);
+}
+
+/// `generic::<u8>`, which `main` asks for and every unit may (walked for inlining, as an
+/// `opt-level = 3` member inlines), builds in `always`, `#[inline(always)]` of `dep`, which no
+/// MIR inliner takes. Built under the caller's settings, `always` has `leaf` MIR-inlined, as
+/// `winnow`'s `<&str as Stream>::eof_offset` has `<str>::as_bytes` in a `LocatingSlice`
+/// method; `dep`'s own units, at level 0, inline nothing.
+fn built_in_inlined(leaf: u32) -> String {
+    format!(
+        r#"
+//- minicore: sized, copy
+//- /dep.rs crate:dep library
+#[inline]
+pub fn leaf(x: u32) -> u32 {{ x ^ {leaf} }}
+#[inline(always)]
+#[rustc_no_mir_inline]
+pub fn always(x: u32) -> u32 {{ leaf(x) }}
+pub fn generic<T>(x: u32) -> u32 {{ always(x) }}
+//- /main.rs crate:main deps:dep
+pub fn roots(x: u32) -> u32 {{ dep::generic::<u8>(x) }}
+"#
+    )
+}
+
+/// What the MIR inliner put in the body of a callee a caller builds in is the caller's code,
+/// so the caller's template key holds it (rule 18): two `leaf`s are two keys. The key holds
+/// the code of what the caller's walk lists as built in and, as the driver closes it, what
+/// each of those lists as walked for its own units; `dep`'s units inline nothing, so only the
+/// caller's walk can name `leaf`. Without it both programs' `generic::<u8>` had one key, the
+/// key of `always` alone, and the build refused the compile that said it built `leaf` in.
+#[test]
+fn a_callers_key_holds_what_the_inliner_put_in_a_callee_it_builds_in() {
+    use base_db::{Crate, all_crates};
+    use blaze_codegen::backend::Frontend as _;
+    let program = |leaf: u32| {
+        let db: &'static TestDB = Box::leak(Box::new(fixture::db(&built_in_inlined(leaf)).into_db()));
+        let dep = (all_crates(db).iter().copied())
+            .find(|it: &Crate| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "dep"))
+            .expect("the crate `dep`");
+        let mut policy = policy(OptLevel::O3);
+        policy.profile.packages.insert("dep".to_owned(), Override { opt_level: Some(OptLevel::O0), ..Override::default() });
+        let hashes = super::ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned())));
+        let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), BuildTime::default())
+            .with_policy(&policy);
+        let root = frontend.root(function(db, "roots"));
+        let (generic, always) =
+            (hir_def::test_items::function(db, dep, "generic"), hir_def::test_items::function(db, dep, "always"));
+        let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(db)));
+        hir_ty::attach_db(db, || {
+            let [caller] = &frontend.with(|hir| called(hir, &root, generic))[..] else { panic!("one `generic::<u8>`") };
+            let described = |it: &HirInstance| frontend.describe(it, &origin).unwrap_or_else(|e| panic!("{it:?}: {}", e.what));
+            // What the driver closes the key over: each body built in, by its own description.
+            let (mut kept, mut queue, mut seen) = (Vec::new(), vec![caller.clone()], Vec::new());
+            while let Some(at) = queue.pop() {
+                let it = described(&at);
+                for &place in &it.built_in {
+                    let FrontRef::Function(callee) = &it.refs[place as usize] else { panic!("{:?}", it.refs[place as usize]) };
+                    if !seen.contains(callee) {
+                        seen.push(callee.clone());
+                        kept.push(described(callee).code);
+                        queue.push(callee.clone());
+                    }
+                }
+            }
+            kept.sort_unstable();
+            assert!(
+                seen.iter().any(|it| matches!(&it.0, Kind::Code(it, _) if it.def == InstanceDef::Fn(always))),
+                "the premise: `always` is built in: {seen:?}"
+            );
+            let walking = frontend.with(|hir| frontend.walking(hir, caller)).expect("the policy");
+            assert!(walking.inlined, "the premise: a generic is walked for inlining where any unit inlines");
+            let inlined = frontend.with(|hir| inlined_by_build(hir, &frontend.hashes, caller, o3()));
+            (kept, inlined)
+        })
+    };
+    let (seven, nine) = (program(7), program(9));
+    assert_ne!(seven.1, nine.1, "the premise: `leaf`'s body is in the caller's code");
+    for (kept, inlined) in [&seven, &nine] {
+        let unkept: Vec<_> = inlined.iter().filter(|it| !kept.contains(it)).collect();
+        assert!(unkept.is_empty(), "built in, not in the key: {unkept:?} (the key holds {kept:?})");
+    }
+    assert_ne!(seven.0, nine.0, "two codes of `generic::<u8>` under one key");
+}
+
+/// `dep::resize::<K>`, `#[inline(always)]`, takes `hasher: &dyn Fn(u32) -> u32`, as hashbrown's
+/// `RawTableInner::resize_inner` does, and `main`'s `roots` at `opt-level = 3` inlines it. `K`
+/// is `main`'s, so `resize::<K>` is the workspace's, and its own unit is built against the
+/// program's dyn facts.
+const DYN_FN_BUILT_IN: &str = r#"
+//- minicore: sized, copy, unsize, coerce_unsized, dispatch_from_dyn, fn
+//- /dep.rs crate:dep library
+#[inline(always)]
+pub fn resize<T>(x: u32, hasher: &dyn Fn(u32) -> u32) -> u32 { hasher(x) + 1 }
+//- /main.rs crate:main deps:dep
+pub struct K;
+pub fn roots(x: u32) -> u32 { dep::resize::<K>(x, &|y| y * 3) }
+"#;
+
+/// A callee whose own unit is built against the program's dyn facts, built into a caller,
+/// keeps a key that holds what the caller built in. Its own code hashes the facts its body
+/// read (`devirt::code`), but the copy built into the caller is built against none (the
+/// inliner devirtualizes no callee), so the caller's compile names it by its built-in code.
+/// A held body holds both ([`blaze_codegen::backend::Described::held_codes`]). Held by its own
+/// code alone, the build refused hashbrown's `reserve_rehash_inner`, which built in
+/// `resize_inner::<Global>` (sb-tplkey, Input 2).
+#[test]
+fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
+    use base_db::{Crate, all_crates};
+    use blaze_codegen::{backend::Frontend as _, plan::Origin};
+    let (db, frontend) = held_as(fixture::db(DYN_FN_BUILT_IN).into_db(), &policy(OptLevel::O3));
+    let main = fixture::test_crate(db);
+    let dep = (all_crates(db).iter().copied())
+        .find(|it: &Crate| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "dep"))
+        .expect("the crate `dep`");
+    let resize = hir_def::test_items::function(db, dep, "resize");
+    let origin = frontend.with(|hir| frontend.origin(hir, main));
+    let root = frontend.root(function(db, "roots"));
+    hir_ty::attach_db(db, || {
+        let described =
+            |it: &HirInstance, by: &Origin| frontend.describe(it, by).unwrap_or_else(|e| panic!("{it:?}: {}", e.what));
+        // The driver's first walk of the program: everything it reaches, then its dyn facts.
+        frontend.devirt.makes(super::RootKind::Executable, main);
+        let (mut reached, mut queue): (Vec<(HirInstance, Origin)>, _) = (Vec::new(), vec![(root.clone(), origin)]);
+        while let Some((at, by)) = queue.pop() {
+            if reached.iter().any(|(it, _)| *it == at) {
+                continue;
+            }
+            let it = described(&at, &by);
+            for it_ref in &it.refs {
+                if let FrontRef::Function(callee) = it_ref {
+                    queue.push((callee.clone(), it.origin));
+                }
+            }
+            reached.push((at, by));
+        }
+        frontend.reached(&reached, &[]);
+        assert!(frontend.closed().expect("the program's dyn facts"), "the premise: the program has a world");
+        let [callee] = &frontend.with(|hir| called(hir, &root, resize))[..] else { panic!("one `resize::<K>`") };
+        let node = described(callee, &origin);
+        assert_ne!(node.code, node.built_in_code, "the premise: `resize::<K>`'s own code read the program's dyn facts");
+        // What the driver closes the key over: each body built in, by its own description.
+        let (mut kept, mut queue, mut seen) = (Vec::new(), vec![root.clone()], Vec::new());
+        while let Some(at) = queue.pop() {
+            let it = described(&at, &origin);
+            for &place in &it.built_in {
+                let FrontRef::Function(built_in) = &it.refs[place as usize] else { panic!("{:?}", it.refs[place as usize]) };
+                if !seen.contains(built_in) {
+                    seen.push(built_in.clone());
+                    kept.extend(described(built_in, &origin).held_codes());
+                    queue.push(built_in.clone());
+                }
+            }
+        }
+        assert!(seen.contains(callee), "the premise: `resize::<K>` is built in: {seen:?}");
+        let walking = frontend.with(|hir| frontend.walking(hir, &root)).expect("the policy");
+        let build = Build { world: walking.world, ..o3() };
+        let inlined = frontend.with(|hir| inlined_by_build(hir, &frontend.hashes, &root, build));
+        assert!(inlined.contains(&node.built_in_code), "the premise: `resize::<K>` is built in as itself: {inlined:?}");
+        let unkept: Vec<_> = inlined.iter().filter(|it| !kept.contains(it)).collect();
+        assert!(unkept.is_empty(), "built in, not in the key: {unkept:?} (the key holds {kept:?})");
+    });
+}
+
+/// `reads` costs the MIR inliner more than it takes where its UB checks are on, a call at
+/// each `ub_checks()` branch, and less where they are off, which the cost model discounts
+/// (rustc's `CostChecker` at `UbChecks`): a unit with debug assertions calls it, a unit
+/// without (a `--release` one) inlines it, and its code then calls `leaf`, which only `reads`
+/// calls.
+const UB_CHECKED_CALLEE: &str = r#"
+//- minicore: sized, copy
+#[rustc_intrinsic]
+pub const fn ub_checks() -> bool;
+#[inline(never)]
+pub fn precondition(x: u32) -> u32 { x }
+#[inline(never)]
+pub fn leaf(x: u32) -> u32 { x ^ 5 }
+#[inline]
+pub fn reads(a: u32, b: u32, c: u32, d: u32) -> u32 {
+    if ub_checks() { precondition(a); }
+    if ub_checks() { precondition(b); }
+    if ub_checks() { precondition(c); }
+    if ub_checks() { precondition(d); }
+    leaf(a ^ b ^ c ^ d)
+}
+pub fn roots(a: u32, b: u32, c: u32, d: u32) -> u32 { reads(a, b, c, d) }
+"#;
+
+/// The walk lists what a unit without debug assertions asks for, though the walk with them
+/// inlines less: what the MIR inliner takes is not monotone in them (`Build::WALKS_INLINED`).
+/// Walked with them alone, `roots`' release unit asked for `leaf`, which its references did
+/// not list, as `blaze-mem`'s `os::reserve` at `--release` asked for core's `runtime`.
+#[test]
+fn a_walk_lists_what_a_unit_without_debug_assertions_inlines() {
+    let (db, frontend) = frontend(UB_CHECKED_CALLEE);
+    let root = frontend.root(function(db, "roots"));
+    let (reads, leaf) = (function(db, "reads"), function(db, "leaf"));
+    frontend.with(|db| {
+        let Kind::Code(instance, env) = &root.0 else { panic!("{root:?}") };
+        let inlines = |build: Build| {
+            crate::instance_body(db, instance, env.clone(), Some(build))
+                .unwrap_or_else(|e| panic!("{root:?} as {build:?}: {e}"))
+                .inlined
+                .callees
+                .iter()
+                .any(|it| it.body == hir_ty_mir::mir::InlinedBody::Fn(reads))
+        };
+        let release = Build { debug_assertions: false, ..o3() };
+        assert!(!inlines(Build::WALK_INLINED), "the premise: with UB checks, `reads` stays a call");
+        assert!(inlines(release), "the premise: without them, `reads` is inlined");
+        let walking = refs::Walking::plain(true);
+        let walked = refs::walk(db, &root, walking).expect("the walk");
+        assert!(walked.iter().any(|it| is_call(it, leaf)), "`leaf` is listed: {walked:?}");
+        let mut code = built(db, &root, crate::Target::for_fixtures(), false, release)
+            .unwrap_or_else(|e| panic!("{root:?}: {e}"));
+        let super::Built::Ir(pending) = &mut code else { panic!("asm") };
+        let mut placer = Placer::listed(walked);
+        place_requests(db, &HashSource::ById(ById), compiled_in(db, &root), &mut placer, &mut pending.wants.requests)
+            .expect("the release unit's IR asks only for what the walk lists");
+    });
+}
+
+/// A copy of a body built into its caller is built under one rule, whichever side builds it
+/// in: the code generator's always-inliner asks under `Build::built_in`, `hir-ty-mir`'s
+/// inliner under `MirOptions::built_in`, and for every unit's settings the two give one set
+/// of options, which read no dyn facts and move no allocation to the stack.
+#[test]
+fn a_copy_built_in_is_built_under_one_rule() {
+    use hir_ty_mir::mir::devirt::DevirtWorld;
+    let (db, frontend) = frontend(TWICE);
+    let krate = fixture::test_crate(db);
+    frontend.with(|db| {
+        for bits in 0..64u32 {
+            let bit = |at: u32| bits & (1 << at) != 0;
+            for world in [None, Some(DevirtWorld([7; 32]))] {
+                let build = Build {
+                    debug_assertions: bit(0),
+                    aborts: bit(1),
+                    optimized: bit(2),
+                    inlines: bit(3),
+                    bridged: bit(4),
+                    heap_to_stack: bit(5),
+                    world,
+                };
+                for generic in [false, true] {
+                    let copy = build.built_in().options(db, krate, generic);
+                    assert_eq!(copy, build.options(db, krate, generic).built_in(), "{build:?}");
+                    assert_eq!((copy.world, copy.heap_to_stack), (None, false), "{build:?}");
+                }
+            }
+        }
+    });
+}
+
+/// `lib::g::<D>` makes a `&dyn Debug` of `main`'s `D`, whose `Debug` is a builtin derive or a
+/// written impl.
+fn downstream_debug(derived: bool) -> String {
+    let d = match derived {
+        true => "#[derive(Debug)]\npub struct D;\n",
+        false => "pub struct D;\nimpl core::fmt::Debug for D {\n    \
+                  fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) }\n}\n",
+    };
+    format!(
+        r#"
+//- minicore: sized, coerce_unsized, dispatch_from_dyn, fmt, derive
+//- /lib.rs crate:lib library
+pub fn g<T: core::fmt::Debug>(t: &T) -> &dyn core::fmt::Debug {{ t }}
+//- /main.rs crate:main deps:lib
+{d}pub fn roots() {{ let _ = lib::g(&D); }}
+"#
+    )
+}
+
+/// sb-testkey's soundness argument for generic bodies (rule 20): an item's bound hash takes
+/// the impls of an object's trait only from the crates its own crate loads, so `lib::g`'s
+/// says nothing of `main`'s `impl Debug for D`. What covers it is the instance: the vtable
+/// `g::<D>` makes is among its refs (its slots through `callee`), which `exec::bound` binds by
+/// item. So swapping `D`'s derive for a written impl changes `g::<D>`'s exec bound through its
+/// refs alone, with its own description held as it was.
+#[test]
+fn a_downstream_impl_changes_its_generic_instances_exec_bound() {
+    use base_db::{Crate, all_crates};
+    use blaze_codegen::{InstanceKey, Target, backend::Frontend as _};
+    let program = |derived: bool| {
+        let mut db = fixture::db(&downstream_debug(derived)).into_db();
+        // As a build's database: builtin derives expanded, so `D`'s derived `Debug::fmt` has a body.
+        hir_def::nameres::set_expand_builtin_derives(&mut db, true);
+        let db: &'static TestDB = Box::leak(Box::new(db));
+        let lib = (all_crates(db).iter().copied())
+            .find(|it: &Crate| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().as_str() == "lib"))
+            .expect("the crate `lib`");
+        let hashes = super::ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned())));
+        let frontend = HirFrontend::new(Databases::new(db), HashSource::Items(hashes), BuildTime::default())
+            .with_policy(&policy(OptLevel::O0));
+        let root = frontend.root(function(db, "roots"));
+        let g = hir_def::test_items::function(db, lib, "g");
+        let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(db)));
+        hir_ty::attach_db(db, || {
+            let [instance] = &frontend.with(|hir| called(hir, &root, g))[..] else { panic!("one `g::<D>`") };
+            let described = |it: &HirInstance| frontend.describe(it, &origin).unwrap_or_else(|e| panic!("{it:?}: {}", e.what));
+            let it = described(instance);
+            // Each ref as the driver gives it to `exec::bound`: a function by a key of its
+            // place, which binds to its item. A static or a symbol is the same in both.
+            let mut items = Vec::new();
+            let targets: Vec<Target> = (it.refs.iter().enumerate())
+                .map(|(at, front)| match front {
+                    FrontRef::Function(callee) => {
+                        let key = InstanceKey(ContentId::of("test ref", &(at as u64).to_le_bytes()));
+                        items.push((key, described(callee).item));
+                        Target::Function(key)
+                    }
+                    FrontRef::Static(_) => Target::Extern(format!("static{at}")),
+                    FrontRef::Extern(name) => Target::Extern(name.clone()),
+                    FrontRef::Weak(name) => Target::Weak(name.clone()),
+                })
+                .collect();
+            (it.bound, targets, items)
+        })
+    };
+    let exec = |own: &Result<ContentId, String>, targets: &[Target], items: &[(InstanceKey, ItemKey)]| {
+        let item_of = |key: &InstanceKey| items.iter().find(|(it, _)| it == key).map(|(_, item)| *item);
+        blaze_codegen::exec::bound(own, targets, item_of).unwrap_or_else(|e| panic!("g::<D>: {e}"))
+    };
+    let (derived_own, derived_refs, derived_items) = program(true);
+    let (written_own, written_refs, written_items) = program(false);
+    assert!(derived_own.is_ok(), "the premise: `lib::g` has a bound hash: {derived_own:?}");
+    let derived = exec(&derived_own, &derived_refs, &derived_items);
+    assert_ne!(
+        derived,
+        exec(&written_own, &written_refs, &written_items),
+        "a derive swapped for a written impl leaves `g::<D>`'s exec bound"
+    );
+    assert_ne!(
+        derived,
+        exec(&derived_own, &written_refs, &written_items),
+        "under one description, the written impl's refs alone change the bound"
+    );
 }

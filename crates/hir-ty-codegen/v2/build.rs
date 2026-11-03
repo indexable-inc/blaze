@@ -72,6 +72,17 @@ impl Build {
         world: None,
     };
 
+    /// The walks for an instance some unit of which MIR-inlines ([`Self::WALK_INLINED`]):
+    /// with debug assertions and without, as a release unit builds. Unlike the rest of what
+    /// they decide, what the inliner takes is not monotone in them: a callee's UB checks
+    /// (`MirOptions::ub_checks`, its `debug_assertions` for a body of the caller's crate)
+    /// make it bigger, so without them a callee that stayed a call under [`Self::WALK_INLINED`]
+    /// may be inlined, and its code then asks for what it calls (`blaze-mem`'s `os::reserve`
+    /// at `--release` asked for core's `runtime`, which no walk listed). Each is walked, so
+    /// the references list what a unit under either asks for.
+    pub(crate) const WALKS_INLINED: [Build; 2] =
+        [Self::WALK_INLINED, Build { debug_assertions: false, ..Self::WALK_INLINED }];
+
     pub(crate) fn of(spec: &Spec) -> Self {
         Build {
             debug_assertions: spec.debug_assertions,
@@ -130,12 +141,12 @@ impl Build {
 }
 
 impl Build {
-    /// These settings for a body built into the body of its caller (`always_inlinable`): no
-    /// allocation of it moves to the stack. Its stack slots would be the caller's, and
-    /// `HeapToStack` keeps a promoted slot out of every frame that may recur (`hir-ty-mir`'s
-    /// `optimize/escape.rs`), which it can only tell of the body it runs on.
+    /// These settings for a body built into the body of its caller (`always_inlinable`): the
+    /// ones whose [`Self::options`] are [`MirOptions::built_in`] of these, the one rule for a
+    /// copy of a body in another, which `hir-ty-mir`'s inliner follows too. It reads no dyn
+    /// facts and moves no allocation to the stack.
     pub(crate) fn built_in(self) -> Build {
-        Build { heap_to_stack: false, ..self }
+        Build { world: None, heap_to_stack: false, ..self }
     }
 }
 

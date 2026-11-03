@@ -163,6 +163,27 @@ fn a_span_name_says_which_impl_const_block_and_build_script() {
     assert_eq!(by_macro.count(), 2, "each `nonzero!` impl is named by its call; the names are {all:?}");
 }
 
+/// A macro that calls itself writes each inner call at ordinal 0 of its own output, so its
+/// bodies are named by the whole chain of calls: the two `get`s are two names.
+#[test]
+fn bodies_of_nested_macro_calls_are_named_by_the_outer_call() {
+    let text = r#"
+//- /lib.rs crate:nested
+pub struct NonZero<T>(T);
+macro_rules! nonzero {
+    ($t:ty, outer) => { nonzero!($t); };
+    ($t:ty) => { impl NonZero<$t> { pub fn get(self) -> Self { self } } };
+}
+nonzero!(u32, outer);
+nonzero!(u64, outer);
+"#;
+    let fixture = fixture::db(text);
+    let db = fixture.db();
+    let named = names(db, fixture::test_crate(db), text);
+    let gets = named.keys().filter(|it| it.ends_with(">::get")).count();
+    assert_eq!(gets, 2, "the names are {:?}", named.keys().collect::<Vec<_>>());
+}
+
 /// The `function` each span was given, by a subscriber that records every span.
 #[derive(Default)]
 struct Named {
@@ -235,4 +256,23 @@ fn naming_a_span_reads_nothing_into_its_query() {
     for name in ["shapes::<impl#0>::swap_bytes", "shapes::_#1", "build_script[serde]::main"] {
         assert!(functions.iter().any(|it| it == name), "no span was named `{name}`: {functions:?}");
     }
+}
+
+/// A crate's label tells apart the builds of one package a profile would otherwise add up as
+/// one: a library, its `cfg(test)` copy, a binary's, a proc macro and a build script.
+#[test]
+fn a_crate_label_tells_a_library_from_its_test_copy() {
+    use base_db::TargetKind as K;
+    let lib = K::Lib { is_proc_macro: false };
+    let kinds = [
+        (lib, lib),
+        (K::Test, lib),
+        (K::Test, K::Bin),
+        (K::Test, K::Test),
+        (K::Bin, K::Bin),
+        (K::Lib { is_proc_macro: true }, K::Lib { is_proc_macro: true }),
+        (K::BuildScript, K::BuildScript),
+    ];
+    let labels: Vec<&str> = kinds.iter().map(|&(kind, manifest)| super::kind_label(kind, manifest)).collect();
+    assert_eq!(labels, ["lib", "lib-test", "bin-test", "test", "bin", "proc-macro", "build-script"]);
 }

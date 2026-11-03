@@ -147,7 +147,7 @@ impl<'db> Cx<'db> {
         let env = stored.as_ref(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
-        let roots = crate::root::roots(db, env.krate);
+        let roots: &[FunctionId] = &crate::root::roots(db, env.krate).found;
         Cx { db, interner, infcx, env, stored, lang: lang_items(db, env.krate), roots }
     }
 

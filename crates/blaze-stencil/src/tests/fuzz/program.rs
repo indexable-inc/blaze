@@ -132,7 +132,7 @@ pub(super) fn isa_of(target: &Target) -> Isa {
     match target.arch {
         blaze_codegen::Arch::X86_64 => Isa::X86_64,
         blaze_codegen::Arch::Aarch64 => Isa::Aarch64,
-        blaze_codegen::Arch::Wasm32 => panic!("wasm32 has no stencils to compare"),
+        blaze_codegen::Arch::Wasm32 | blaze_codegen::Arch::Wasm64 => panic!("wasm has no stencils to compare"),
     }
 }
 

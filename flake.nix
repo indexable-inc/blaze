@@ -315,6 +315,9 @@
           packages = scripts.packages ++ [ pkgs.rustup llvm z3 ];
           inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
           RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
+          # The pinned DuckDB that `blaze slow`, `blaze debug sql` and `blaze explain` run (blaze
+          # never looks for one on PATH), as the installed `blaze` wrapper sets it.
+          BLAZE_DUCKDB = "${duckdb}/bin/duckdb";
           # As in the bench shell: the wrapper's _FORTIFY_SOURCE fails configure probes at -O0 in
           # the C code of the projects the harnesses build.
           hardeningDisable = [ "all" ];

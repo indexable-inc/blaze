@@ -378,6 +378,87 @@ fn a_build_script_asking_cc_whether_a_flag_is_supported_builds() {
     assert_eq!(case.ok(&["run"]), "asked\n");
 }
 
+/// A crate both a build script and the program depend on, lowered alike (indexmap's
+/// `equivalent`, a build-dependency too): blaze-lower makes one front-end crate of the two
+/// units, and the code generator took the crate for build-time code in the program's build, so
+/// indexmap's `get_index_of`, in the dependency image, referred to `<str as
+/// Equivalent<String>>::equivalent` as the workspace's and the build refused ("the image would
+/// change with workspace code"; toml, parking_lot_core, getrandom in blaze's self-build).
+///
+/// Known red until the template-key blocker is fixed (G3 in the self-build survey, lane
+/// sb-tplkey; the refusal of #1612): it builds past the dependency image and stops at "built in
+/// the code .. which its template's key .. does not hold" (hashbrown's `reserve_rehash`). A
+/// failure there is that blocker, not a regression of this one. A `blaze run` of a program not
+/// over blaze's runtime links no dependency image, so no code here is split; the ownership a
+/// live build splits by is pinned in hir-ty-codegen (`a_registry_crate_over_a_path_crate_is_the_workspaces`).
+#[test]
+fn a_crate_a_build_script_and_the_program_share_is_the_programs() {
+    let case = Case::new("a_crate_a_build_script_and_the_program_share_is_the_programs");
+    assert_eq!(case.ok(&["run"]), "Some(1) None\n");
+}
+
+/// A registry crate over a `[patch.crates-io]`d path crate (indexmap over a path `equivalent`;
+/// zstd-safe over blaze's vendored zstd-sys): the registry crate's code was the dependency
+/// image's while the path crate's, which it calls, was the workspace's, so the build refused
+/// ("the image would change with workspace code"). Code over a crate an edit reaches is the
+/// workspace's too.
+///
+/// Known red until the template-key blocker is fixed (G3 in the self-build survey, lane
+/// sb-tplkey; the refusal of #1612): it builds past the dependency image and stops at "built in
+/// the code .. which its template's key .. does not hold" (hashbrown's `reserve_rehash`). A
+/// failure there is that blocker, not a regression of this one. A `blaze run` of a program not
+/// over blaze's runtime links no dependency image, so no code here is split; the ownership a
+/// live build splits by is pinned in hir-ty-codegen (`a_registry_crate_over_a_path_crate_is_the_workspaces`).
+#[test]
+fn a_registry_crate_over_a_patched_path_crate_builds() {
+    let case = Case::new("a_registry_crate_over_a_patched_path_crate_builds");
+    assert_eq!(case.ok(&["run"]), "Some(1) None\n");
+}
+
+/// An `opt-level = 3` caller that builds in `#[inline(always)] dep::resize::<K>`, which calls
+/// through the `&dyn Fn` it is given (hashbrown's `resize_inner` in `reserve_rehash_inner`):
+/// the callee's own unit is built against the program's dyn facts, so its code hashes what it
+/// read of them, while the copy built into `main` is built against none. The compile named it
+/// by its plain code, the key held its own, and the build refused `main` ("built in the code
+/// .. which its template's key .. does not hold"; blaze-query-macros in blaze's self-build).
+#[test]
+fn an_opt3_caller_building_in_a_dyn_fn_callee_builds() {
+    let case = Case::new("an_opt3_caller_building_in_a_dyn_fn_callee_builds");
+    assert_eq!(case.ok(&["run"]), "43\n");
+}
+
+/// arrow-buffer's `BitIndexIterator`: a library's `#[inline(always)]` `next` with a `?` on an
+/// `Option`, built by the code generator into core's `fold`, `try_fold` and `Map::next` of an
+/// `opt-level = 0` bin. The copy is built at its crate's level, where the `?`'s
+/// `FromResidual::from_residual` stays a call; the compile named what it built in by walking
+/// `next` again as a unit that MIR-inlines walks it, which inlines `from_residual`, and the build
+/// refused all three ("`fold` built in the code .. (`from_residual`), which its template's key
+/// .. does not hold"; arrow in ix-prof). The compile now names the bodies it built in itself.
+/// `bits` comes from a directory source: only a library's `#[inline(always)]` bodies are built in.
+#[test]
+fn an_always_inline_next_with_a_question_mark_built_into_fold_builds() {
+    let case = Case::new("an_always_inline_next_with_a_question_mark_built_into_fold_builds");
+    assert_eq!(case.ok(&["run"]), "195 4 None\n");
+}
+
+/// The same callee built into a caller at `opt-level = 0`, where the code generator builds it
+/// in itself (`built_in_body`) rather than the MIR inliner, while another package at level 3
+/// makes the build walk every generic for inlining (blaze's own workspace's shape).
+#[test]
+fn an_opt0_caller_building_in_a_dyn_fn_callee_builds() {
+    let case = Case::new("an_opt0_caller_building_in_a_dyn_fn_callee_builds");
+    assert_eq!(case.ok(&["run"]), "43\n");
+}
+
+/// The dyn callee reaches the caller through another callee: `main` inlines
+/// `dep::outer::<K>`, which builds in `dep::resize::<K>`, as hashbrown's `reserve_rehash`
+/// reaches `resize_inner` through `reserve_rehash_inner`.
+#[test]
+fn a_dyn_fn_callee_built_in_through_another_builds() {
+    let case = Case::new("a_dyn_fn_callee_built_in_through_another_builds");
+    assert_eq!(case.ok(&["run"]), "43\n");
+}
+
 /// A path dependency whose enum has a variant, and a macro's match an arm, under a `cfg` that is
 /// off (object's `#[cfg(feature = "elf")]` variants in `read/any.rs`): the names check of a
 /// local crate resolved the disabled variant's path and reported E0433 for its module.
@@ -393,6 +474,18 @@ fn a_crate_with_cfg_disabled_variants_builds() {
 #[test]
 fn a_program_calling_libc_links() {
     let case = Case::new("a_program_calling_libc_links");
+    assert_eq!(case.ok(&["run"]), "true\n");
+}
+
+/// A program reading an `extern_weak` static, with a call through a `dyn`: the program's dyn
+/// facts asked the static's value of `compiled_static`, which has none for a static of an
+/// `extern` block ("extern static without a rustc symbol"), so no executable that reached one
+/// built. psm's and llvm-sys's build scripts reach std's (`__cxa_thread_atexit_impl`, a
+/// thread-local's destructor on Linux), which blocked 75 packages of blaze's self-build. A
+/// weak static holds a foreign symbol's address, which makes no vtable.
+#[test]
+fn a_program_reading_an_extern_weak_static_builds() {
+    let case = Case::new("a_program_reading_an_extern_weak_static_builds");
     assert_eq!(case.ok(&["run"]), "true\n");
 }
 

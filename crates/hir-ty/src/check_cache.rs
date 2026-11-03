@@ -25,14 +25,15 @@ use blaze_ids::{ContentId, Domain, Hasher};
 use hir_def::{
     DefWithBodyId, HasModule,
     deps::{Held as _, ImageBuf, body_key, crate_name},
+    expr_store::Body,
 };
 
-pub(crate) use self::ids::{Relocate, id_bits, id_of, in_scope, outside};
+pub(crate) use self::ids::{IdRefused, Relocate, id_bits, id_of, in_scope, outside};
 use self::{
     ids::IdKind,
     part::{BodyRef, PartRef},
 };
-use crate::InferenceResult;
+use crate::{InferenceResult, infer::persist::Nodes};
 
 /// The domain of a bodies part's key.
 pub const BODIES_DOMAIN: &str = "blaze v2 dependency bodies 1";
@@ -125,8 +126,13 @@ pub fn served_passed(db: &Db, def: DefWithBodyId) -> bool {
 pub fn served_inference(db: &Db, def: DefWithBodyId) -> Option<InferenceResult<'_>> {
     let (krate, body) = served_body(db, def)?;
     let items = served_items(db, krate);
+    // The record's nodes are checked against the body's store, so a hit lowers the body
+    // (its macros expanded) even where nothing else needs it. The record's own type columns
+    // would cap the maps without it, but only if every resolved node has a type, which
+    // nothing here proves, and they bound the allocation, not that a node is the body's.
+    let nodes = Nodes::of(Body::of(db, def));
     let result = body
-        .inference(db, krate, items)
+        .inference(db, krate, items, nodes)
         .unwrap_or_else(|why| corrupt(db, krate, Some(def), &why));
     Some(result)
 }

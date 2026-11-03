@@ -4,7 +4,7 @@
 
 use arrow_array::RecordBatch;
 
-use super::{BuildFacts, Facts, Memory, MissGroup, QueryCount, Report, SpanKind, ThreadName, analyse};
+use super::{BuildFacts, Facts, Memory, MissGroup, QueryCount, Recorder, Report, SpanKind, ThreadName, analyse};
 use crate::time::{
     Model, TimeError,
     load::{Source, get, ints, query, texts, uints},
@@ -38,7 +38,30 @@ pub fn facts(source: &Source<'_>, build: u64, window: Option<(i64, i64)>) -> Res
         misses: misses(source, build)?,
         query_counts: query_counts(source, build)?,
         memory: memory(source, build, window)?,
+        recorder: recorder(source, window)?,
     })
+}
+
+/// What the recorder dropped in `window`: each counter's last value by its end (and the flush
+/// after it) less its last before its start, in the same process: they count from its start.
+fn recorder(source: &Source<'_>, window: Option<(i64, i64)>) -> Result<Recorder, TimeError> {
+    let Some((t0, t1)) = window else { return Ok(Recorder::default()) };
+    // The flush after the build's end has its rows; one flush is at most `history::EVERY` on.
+    let after = t1 + crate::history::EVERY.as_nanos() as i64;
+    let delta = |name: &str, column: &str| {
+        // alloc: a query's part, once a report
+        format!(
+            "CAST((SELECT arg_max(value, t_ns) FROM counters WHERE name = '{name}' AND t_ns BETWEEN {t0} AND {after}) - \
+             coalesce((SELECT arg_max(value, t_ns) FROM counters WHERE name = '{name}' AND t_ns < {t0} AND process = \
+             (SELECT arg_max(process, t_ns) FROM counters WHERE name = '{name}' AND t_ns BETWEEN {t0} AND {after})), 0) AS BIGINT) AS {column}"
+        )
+    };
+    // alloc: a query, once a report
+    let sql = format!("SELECT {}, {}", delta("profile spans lost", "spans_lost"), delta("profile rows skipped", "rows_skipped"));
+    let batches = query(source, &sql, "reading what the flight recorder dropped in the build's window")?;
+    let Some((batch, row)) = rows(&batches).next() else { return Ok(Recorder::default()) };
+    const T: &str = "counters";
+    Ok(Recorder { spans_lost: int(batch, T, "spans_lost", row)?, rows_skipped: int(batch, T, "rows_skipped", row)? })
 }
 
 fn rows(batches: &[RecordBatch]) -> impl Iterator<Item = (&RecordBatch, usize)> {

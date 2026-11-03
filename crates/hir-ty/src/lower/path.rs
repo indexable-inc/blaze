@@ -395,11 +395,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
     pub(crate) fn resolve_path_in_type_ns(&mut self) -> Option<(TypeNs, Option<usize>)> {
         let db = self.ctx.db;
         let (resolution, remaining_index, _, prefix_info, _) =
-            match self.ctx.resolver.resolve_path_in_type_ns_with_prefix_info(db, self.path) {
-                Some(it) => it,
-                None => Resolver::def_site(db, self.hygiene)?
-                    .resolve_path_in_type_ns_with_prefix_info(db, self.path)?,
-            };
+            self.ctx.resolver.resolve_path_in_type_ns_hygienic(db, self.path, self.hygiene)?;
 
         let segments = self.segments;
         if segments.is_empty() || matches!(self.path, Path::LangItem(..)) {

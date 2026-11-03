@@ -21,7 +21,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use blaze_api::{ApiError, LiveFrame, Reply, RequestRef, Response};
@@ -154,6 +154,7 @@ enum Step {
     Appending = 4,
     Flushing = 5,
     Closing = 6,
+    Draining = 7,
 }
 
 impl Doing {
@@ -168,7 +169,16 @@ impl Doing {
         let it = self.0.load(Ordering::Relaxed);
         let build = it & Self::BUILD;
         // alloc: error path, a `blaze why` past its deadline
-        let step = [Step::Opening, Step::Restoring, Step::Waiting, Step::Explaining, Step::Appending, Step::Flushing, Step::Closing]
+        let step = [
+            Step::Opening,
+            Step::Restoring,
+            Step::Waiting,
+            Step::Explaining,
+            Step::Appending,
+            Step::Flushing,
+            Step::Closing,
+            Step::Draining,
+        ]
             .into_iter()
             .find(|step| *step as u64 == it >> 56);
         match step {
@@ -180,6 +190,7 @@ impl Doing {
             Some(Step::Flushing) if build == 0 => "flushing the profile history on its timer".to_owned(),
             Some(Step::Flushing) => format!("flushing the profile history for build {build}"),
             Some(Step::Closing) => "writing blaze why's ledger whole as the daemon stops".to_owned(),
+            Some(Step::Draining) => "draining the flight recorder's rings into the next flush".to_owned(),
             None => format!("in step {}, which this blaze does not know", it >> 56),
         }
     }
@@ -306,9 +317,24 @@ impl std::fmt::Display for Claim {
     }
 }
 
-/// This process's claim on the history in `dir`, for as long as the file lives: an exclusive
-/// lock on its [`OWNER`] file, with the pid written in it for the next claimant to name.
-fn claim(dir: &Path) -> Result<fs::File, Claim> {
+/// A claim on a history ([`claim`]): its [`OWNER`] file, locked until this drops.
+#[derive(Debug)]
+struct Owner(fs::File);
+
+impl Drop for Owner {
+    /// Unlocks the file before it closes. A `flock` lock belongs to the open file, which a child
+    /// forked meanwhile shares until it execs or exits: closing this copy alone would leave the
+    /// history held by that child (a test's claim, dropped while another test spawned a
+    /// process, was refused as still held by this pid). An unlock through any copy lets it go.
+    fn drop(&mut self) {
+        _ = self.0.unlock();
+    }
+}
+
+/// This process's claim on the history in `dir`, for as long as the [`Owner`] lives: an
+/// exclusive lock on its [`OWNER`] file, with the pid written in it for the next claimant to
+/// name.
+fn claim(dir: &Path) -> Result<Owner, Claim> {
     let io = |path: &Path, doing| {
         let path = path.to_path_buf(); // alloc: error path
         move |error| Claim::Io { path, doing, error }
@@ -335,16 +361,18 @@ fn claim(dir: &Path) -> Result<fs::File, Claim> {
     use std::io::Write as _;
     file.set_len(0).map_err(io(&path, "writing the profile history's owner file"))?;
     write!(file, "{}", std::process::id()).map_err(io(&path, "writing the profile history's owner file"))?;
-    Ok(file)
+    Ok(Owner(file))
 }
 
-/// The history's loop: a flush every [`history::EVERY`], and one for each build as it ends,
-/// which writes its row and gives its spans its commit. A flush that fails is logged and told
-/// to the daemon, for `blaze daemon status`; the next one goes on.
+/// The history's loop: a drain of the rings every [`history::DRAIN`], a flush every
+/// [`history::EVERY`], and one for each build as it ends, which writes its row and gives its
+/// spans its commit. A flush that fails is logged and told to the daemon, for `blaze daemon
+/// status`; the next one goes on.
 fn keep(mut history: History, why: &mut File, rows: &Receiver<Finished>, failed: &Sender<String>, told: &Sender<Told>, doing: &Doing) {
+    let mut flushed_at = Instant::now();
     loop {
         doing.set(Step::Waiting, 0);
-        let (flushed, last) = match rows.recv_timeout(history::EVERY) {
+        let (flushed, last) = match rows.recv_timeout(history::DRAIN) {
             Ok(Finished { ended: Ended { mut row, links, crate_deps, misses }, query_counts }) => {
                 let build = row.build_id;
                 let ended_well = matches!(row.outcome, history::Outcome::Ok);
@@ -371,6 +399,11 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<Finished>, failed:
                 doing.set(Step::Flushing, build);
                 (history.flush(Some(build)), false)
             }
+            Err(RecvTimeoutError::Timeout) if flushed_at.elapsed() < history::EVERY => {
+                doing.set(Step::Draining, 0);
+                history.drain();
+                continue;
+            }
             Err(RecvTimeoutError::Timeout) => {
                 doing.set(Step::Flushing, 0);
                 (history.flush(None), false)
@@ -384,6 +417,7 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<Finished>, failed:
                 (history.flush(None), true)
             }
         };
+        flushed_at = Instant::now();
         if let Err(error) = flushed {
             tracing::error!("{error}");
             _ = failed.send(error.to_string());  // alloc: error path, a flush that failed
@@ -446,6 +480,7 @@ struct Answered {
 pub struct Observe {
     profiling: Option<Profiling>,
     /// The explorer, once asked for, and whether it accepts the page's development server.
+    #[cfg(feature = "explore")]
     explorer: Option<(bool, blaze_explore::Explorer)>,
     live: Vec<Subscriber>,
     /// When the subscribers are sent their next frames, on the driver's clock.
@@ -489,6 +524,7 @@ impl Observe {
         let answers = Answers::new(profiling.is_some());
         Observe {
             profiling,
+            #[cfg(feature = "explore")]
             explorer: None,
             live: Vec::new(),    // alloc: none until a subscriber
             querying: Vec::new(), // alloc: none until a query
@@ -564,6 +600,7 @@ impl Observe {
     /// differs from the one running (so turning it off stops accepting the development
     /// server's Origin), and its link. A start that fails fails the request and keeps none,
     /// so the next one tries again.
+    #[cfg(feature = "explore")]
     pub fn explore(&mut self, to: RequestRef, dev: bool, out: &mut Vec<Reply>) {
         let Some(profiling) = &self.profiling else {
             return fail(out, to, ApiError::new(NO_PROFILING, Some("blaze explore".to_owned())));  // alloc: error path
@@ -589,6 +626,16 @@ impl Observe {
         }
         let Some((_, explorer)) = &self.explorer else { return };
         answer(out, to, Response::Explored { link: explorer.link() });
+    }
+
+    /// `blaze explore` in a blaze built without the explorer: refused, naming the feature.
+    #[cfg(not(feature = "explore"))]
+    pub fn explore(&mut self, to: RequestRef, _dev: bool, out: &mut Vec<Reply>) {
+        let what = match self.profiling {
+            None => NO_PROFILING,
+            Some(_) => NO_EXPLORER,
+        };
+        fail(out, to, ApiError::new(what, Some("blaze explore".to_owned())));  // alloc: error path
     }
 
     /// `blaze debug live`: `to` is sent a frame every [`live::EVERY`] from the next tick on.
@@ -738,11 +785,21 @@ impl Observe {
         for querying in &self.querying {
             _ = querying.stop.try_send(());
         }
-        self.explorer = None;
+        #[cfg(feature = "explore")]
+        {
+            self.explorer = None;
+        }
     }
 }
 
 const NO_PROFILING: &str = "this daemon keeps no profile history (only `blaze serve`'s does)";
+
+/// What a blaze built without blaze-cargo's `explore` feature (the seed profile, which has no
+/// C: the explorer serves through Flecs and wtransport on ring) says to the explorer and to
+/// `blaze debug sql --live`'s Arrow IPC, whose encoder is the explorer's.
+#[cfg(not(feature = "explore"))]
+const NO_EXPLORER: &str = "this blaze is built without blaze-cargo's `explore` feature (the seed profile), so it has no \
+                           explorer and no Arrow IPC encoder";
 
 /// The error of a `blaze why` past its deadline: the build it still waits for (the oldest
 /// given whose reasons have not come back) and what the history's thread is doing.
@@ -785,6 +842,7 @@ fn sql_error(error: sql::SqlError) -> ApiError {
 }
 
 /// A query's batches as one Arrow IPC stream, and their rows; no bytes for no batches.
+#[cfg(feature = "explore")]
 fn ipc(batches: &[arrow_array::RecordBatch]) -> Result<(Vec<u8>, u64), ApiError> {
     let rows = batches.iter().map(|it| it.num_rows() as u64).sum();
     // alloc: a query's answer, once a query
@@ -794,6 +852,12 @@ fn ipc(batches: &[arrow_array::RecordBatch]) -> Result<(Vec<u8>, u64), ApiError>
             .map_err(|error| ApiError::new(format!("encoding a query's answer as Arrow IPC: {error}"), Some("sql".to_owned())))?;  // alloc: error path
     }
     Ok((out, rows))
+}
+
+/// [`NO_EXPLORER`]: the encoder is blaze-explore's.
+#[cfg(not(feature = "explore"))]
+fn ipc(_batches: &[arrow_array::RecordBatch]) -> Result<(Vec<u8>, u64), ApiError> {
+    Err(ApiError::new(NO_EXPLORER, Some("sql".to_owned())))  // alloc: error path
 }
 
 #[cfg(test)]

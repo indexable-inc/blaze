@@ -75,8 +75,9 @@ use serde::{Deserialize, Serialize};
 /// [`Response::UnitBegan`] and [`Response::TestReady`], which let `blaze test` run a test
 /// executable while the rest of the build goes on. 26: [`Request::Rebuilt`] and
 /// [`Response::Rebuilt`] (`blaze why`), grouped on the daemon. 27: [`Worked::placed`]. 28:
-/// [`Request::Launch`] and [`Response::Launched`].
-pub const SCHEMA: u32 = 28;
+/// [`Request::Launch`] and [`Response::Launched`]. 29: [`Response::Stopping`]. 30:
+/// [`UnitOf::doctest`].
+pub const SCHEMA: u32 = 30;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -237,7 +238,8 @@ pub enum Request {
     Open { view: ViewRef },
     Close { root: ContentId },
     /// What the change from `from` to `to` reaches (items, facts, functions compiled again,
-    /// tests), building nothing; answered with [`Response::Reached`].
+    /// tests), building only each view's proc macros and build scripts' runs, which its front
+    /// end applies before it reads as rustc compiles; answered with [`Response::Reached`].
     Reach { to: ViewRef, from: ViewRef, targets: Targets },
     /// Each candidate's ops applied to `base` as a what-if, checked (and tested, with `test`),
     /// all at once: each candidate's responses as [`Response::Of`], then [`Response::Ranked`].
@@ -267,12 +269,15 @@ pub enum Request {
     Stop,
     /// Edits by meaning, applied in the front end to `base` and committed to `head` as
     /// [`Request::Commit`] commits: answered with [`Response::Edited`], then
-    /// [`Response::Committed`] once durable.
+    /// [`Response::Committed`] once durable. The view's proc macros and build scripts' runs,
+    /// which its front end applies before it resolves a name as rustc would, are built first.
     Edit { base: ContentId, head: String, edits: Vec<Edit> },
     /// Declared intent: the tests `filter` selects in the view will be run soon. What they
     /// reach is built ahead at a priority below every request's, answered at once with
     /// [`Response::Announced`]. A request on the same root takes the work over; a newer intent
     /// of this connection, the connection's end, or `wait_ms` with no such request cancels it.
+    /// The view's proc macros and build scripts' runs, which its front end applies before it
+    /// lists a unit's tests, are built before the tests are chosen.
     WillTest { view: ViewRef, filter: Vec<String>, targets: Targets, wait_ms: u64 },
     /// Declared intent: `ops` will be committed to `head`. The what-if is checked (tested,
     /// with `test`) ahead as [`Request::WillTest`] builds ahead; a commit to `head` that makes
@@ -328,7 +333,7 @@ pub enum Request {
     /// needs to run on the daemon's code memory when `program` (the path the build linked it
     /// at) is a dev executable the daemon holds (docs/v2/plan/lanes/fastcompile/inproc.md).
     /// Answered with [`Response::Launched`] by the daemon's loop, which holds the programs.
-    Launch { program: String, pid: u32 },
+    Launch { pid: u32, program: String },
 }
 
 /// [`Request::Rebuilt`]'s answer.
@@ -651,7 +656,11 @@ pub enum Response {
     /// [`Request::Launch`]'s answer: `live` when the program runs on the daemon's code memory
     /// and takes the build's edits while it runs, with the variables `env` its process is
     /// started with; otherwise it runs its file as linked, and `env` is empty.
-    Launched { live: bool, env: Vec<(String, String)> },
+    Launched { env: Vec<(String, String)>, live: bool },
+    /// After a [`Request::Stop`]'s [`Response::Done`], each step the daemon takes before it
+    /// hangs up (making, writing and mapping its image), said as it begins: `blaze stop` waits
+    /// for each step in turn and, when one outlasts its patience, names it.
+    Stopping { doing: String },
 }
 
 /// What a [`Request::Doc`] documented.
@@ -708,6 +717,9 @@ pub struct UnitOf {
     /// `` `foo` (lib test) `` in "generated N warnings" and "could not compile".
     pub test: bool,
     pub target: UnitTarget,
+    /// The unit is a library's doc tests (cargo's `CompileMode::Doctest`), named
+    /// `` `foo` (lib doctest) `` in "could not compile", never as the library itself.
+    pub doctest: bool,
     pub package_id: String,
     pub manifest_path: String,
 }
@@ -887,6 +899,8 @@ pub struct Worked {
     pub links: Vec<Linked>,
     /// Queries executed.
     pub reran: u64,
+    /// How the files of the outputs it placed in the build dir got there.
+    pub placed: PlacedBytes,
     /// Each crate of the build that is not a workspace member, sorted by cargo package name:
     /// whether its check outcome and its bodies were served.
     pub served: Vec<ServedCrate>,
@@ -897,8 +911,6 @@ pub struct Worked {
     pub steps_us: Vec<(NodeKind, u64)>,
     /// The plane's critical path of the request.
     pub critical_path_us: u64,
-    /// How the files of the outputs it placed in the build dir got there.
-    pub placed: PlacedBytes,
 }
 
 /// How a build put its outputs' files into its build dir, in bytes (docs/cargo.md, "Where a
@@ -907,10 +919,10 @@ pub struct Worked {
 pub struct PlacedBytes {
     /// Cloned from the store, sharing its blocks: no new bytes on disk.
     pub cloned: u64,
-    /// Written into the store once, as the whole files later builds clone.
-    pub written: u64,
     /// Copied out of the store by writing: outputs too short to clone.
     pub copied: u64,
+    /// Written into the store once, as the whole files later builds clone.
+    pub written: u64,
 }
 
 /// A dependency crate of [`Worked::served`].
@@ -1311,7 +1323,8 @@ pub struct FactRead {
     pub what: String,
 }
 
-/// What a change from one view to another reaches, without building it.
+/// What a change from one view to another reaches, building only the proc macros and build
+/// scripts' runs each view's front end applies.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub struct Reach {
     /// The items whose hashes changed, each with the facts of it that changed.

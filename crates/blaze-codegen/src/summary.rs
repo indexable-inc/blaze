@@ -106,7 +106,9 @@ pub struct Call {
     pub args: Vec<Arg>,
 }
 
-const _: () = assert!(size_of::<Call>() == 64);
+// The callee's key and `count` (36 bytes) and a `Vec`, padded to a word: 64 bytes on a 64-bit
+// target.
+const _: () = assert!(size_of::<Call>() == (36 + size_of::<Vec<Arg>>()).next_multiple_of(align_of::<usize>()));
 
 // clone: the memo keeps one copy of each summary a build made for the builds after it (driver.rs, flight.rs)
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug, Clone)]

@@ -628,6 +628,48 @@ fn refutable_param((1, _): (u8, u8)) {}
     });
 }
 
+// cranelift-codegen's `match *self { Self::STACK_OVERFLOW => .., TrapCode(x) => .. }`: a
+// constant whose value holds a pattern type (`TrapCode(NonZeroU8)`, `NonZero`'s field being a
+// struct, structural by a manual `StructuralPartialEq`, around `pattern_type!(u8 is 1..)`) is a
+// pattern: `valtree_to_pat` keeps the pattern-typed part an opaque constant (rustc accepts it).
+#[test]
+fn a_constant_holding_a_pattern_type_is_a_pattern() {
+    check(
+        r#"
+//- minicore: derive, eq, pat, transmute, copy, clone, sized
+#![feature(pattern_types, pattern_type_macro, structural_match)]
+use core::marker::StructuralPartialEq;
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct Inner(core::pattern_type!(u8 is 1..));
+impl StructuralPartialEq for Inner {}
+impl PartialEq for Inner {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for Inner {}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+struct Code(Inner);
+
+const ONE: Code = unsafe { core::mem::transmute(1u8) };
+const TOP: Code = unsafe { core::mem::transmute(255u8) };
+
+fn name(c: Code) -> u8 {
+    match c {
+        ONE => 1,
+        TOP => 2,
+        Code(_) => 0,
+    }
+}
+"#,
+        &[],
+    );
+}
+
 #[test]
 fn erroneous_bodies_are_not_checked() {
     let fx = fixture::db(

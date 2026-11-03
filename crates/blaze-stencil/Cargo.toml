@@ -26,8 +26,8 @@ smallvec.workspace = true
 [build-dependencies]
 # The stencils are made by LLVM when blaze is built (docs/v2/plan/lanes/fastcompile/stencil.md,
 # "Why a build script"): the generator in `gen/` drives it through its C API.
-llvm-sys.workspace = true
-object.workspace = true
+llvm-sys = { workspace = true, optional = true }
+object = { workspace = true, optional = true }
 # `src/table/format.rs`'s sets and little-endian reads, as the patcher reads them, and the
 # library's id: the BLAKE3 hash of its bytes (`blaze_ids::b3`), which stencil units' settings carry.
 blaze-bytes.workspace = true
@@ -62,6 +62,13 @@ serde_json.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
+
+[features]
+default = ["llvm-stencils"]
+# The stencils are made by the pinned LLVM when blaze is built. Without it (the seed profile,
+# todo/bootstrap/plan.md) they come prebuilt: `BLAZE_STENCILS` names a directory holding the
+# libraries, whose bytes must be the ones `stencils.json` pins (build.rs).
+llvm-stencils = ["dep:llvm-sys", "dep:object"]
 
 [lints]
 workspace = true

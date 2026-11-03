@@ -55,14 +55,31 @@ fn library(n: usize) -> (Vec<Shape>, Vec<u8>) {
         }
         assert_eq!(writer.push_with_faults(*shape, &code, 5, &holes, &faults(i)), Ok(i as u32));
     }
-    let bytes = writer.finish(|bytes| {
-        let mut id = [0u8; 32];
-        for (at, byte) in bytes.iter().enumerate() {
-            id[at % 32] = id[at % 32].wrapping_mul(31).wrapping_add(*byte);
-        }
-        id
-    });
+    let bytes = writer.finish(toy_hash);
     (shapes, bytes.unwrap())
+}
+
+/// A stand-in for BLAKE3 as a library's id, which this crate's tests don't link.
+fn toy_hash(bytes: &[u8]) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    for (at, byte) in bytes.iter().enumerate() {
+        id[at % 32] = id[at % 32].wrapping_mul(31).wrapping_add(*byte);
+    }
+    id
+}
+
+/// What blaze-stencil's build script checks of every library it includes (S1 of the seedprof
+/// review): the id the header says is the hash of the bytes with it zeroed, so a stencil's bytes
+/// changed after the library was made are seen even when its header is left alone.
+#[test]
+fn a_library_whose_bytes_changed_no_longer_hashes_to_its_id() {
+    let (_, mut bytes) = library(50);
+    let reader = format::Reader::new(&bytes).unwrap();
+    assert_eq!(reader.hashed_id(toy_hash), reader.id());
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    let reader = format::Reader::new(&bytes).unwrap();
+    assert_ne!(reader.hashed_id(toy_hash), reader.id());
 }
 
 #[test]

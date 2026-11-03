@@ -68,6 +68,19 @@ builds:
     git clone https://github.com/indexable-inc/blaze && cd blaze
     cargo +"$(cat harness/toolchain)" build -p blaze-engine --release   # cargo +nightly-2026-10-27
 
+That is stage 0, `blaze 0.0.0-dev`. The root `Cargo.toml` pins a release of blaze
+(`[workspace.metadata.blaze] version`) for everyone who runs a released `blaze` here, and a
+build of the tree runs itself in any checkout of blaze's tree (told by
+`crates/blaze-engine/Cargo.toml` naming `blaze-engine`, not by path), whatever that pins, so
+stage 0 builds blaze with no flag:
+
+    target/release/blaze build -p blaze-engine --release   # stage 1, built by blaze
+
+That holds for a stage 0 built from another checkout or copy of the tree (a worktree, a VM's
+copy at another path, the wasm seed) too. Elsewhere, in a project that pins a release, a build
+of the tree runs that release, saying so on stderr; `blaze --ignore-pin <command>` runs the
+build itself ([cargo.md](cargo.md#pinning-a-release-of-blaze)).
+
 `crates/rustc_abi` is rustc's `rustc_abi` at the pinned nightly's commit, patched in for
 crates.io's `ra-ap-rustc_abi`, the same way. The fork repositories
 (indexable-inc/rust-analyzer, indexable-inc/rustc_abi) are archived.
@@ -364,6 +377,31 @@ archive for, run the workflow for it and add the `targets` entry its summary pri
 `ref`, `commit` and `version` in `llvm.json`, run the workflow, and write the `targets` its
 summary prints (`llvm.py pin`). LLVM's own release archives do not do: the macOS ones hold
 bitcode, and the Linux ones need zlib, zstd and libxml2.
+
+### The stencil pin
+
+`crates/blaze-stencil/stencils.json` pins the stencil libraries the way `llvm.json` pins LLVM:
+each library's file and its id, the BLAKE3 hash of its bytes with the id field zeroed.
+`blaze-stencil`'s build script checks every library it includes against the pin. It checks that
+the library hashes to the id in its header, and that this id is the pinned one:
+
+- A build with LLVM (the default `llvm-stencils` feature) makes the libraries and writes their
+  pin beside them, as `stencils.json` in blaze-stencil's `OUT_DIR`. When that differs from the
+  tree's pin, the build stops and names each id. When a change to the generator (`gen/`,
+  `src/shape.rs`, `src/enc.rs`, `src/table/format.rs`, LLVM) changes what it makes, pin the
+  result in the same change with the command the error prints:
+
+      cp <blaze-stencil's OUT_DIR>/stencils.json crates/blaze-stencil/stencils.json
+
+  If nothing the generator reads changed, the output isn't deterministic, which is a bug
+  (rule 22).
+- The seed profile (`blaze-engine --no-default-features --features seed`) has no LLVM. It copies
+  the libraries from the directory `BLAZE_STENCILS` names, for example blaze-stencil's `OUT_DIR`
+  from an LLVM build of the same tree. The variable only says where the files are. A library
+  whose bytes aren't the pinned ones is refused, and the error names the file, the pinned id
+  and the file's own id.
+
+The code identity (`blaze-codegen-code`) is keyed by the pinned ids.
 
 ## Credit
 

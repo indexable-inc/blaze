@@ -39,7 +39,7 @@ use crate::{
     clock,
     errors::{self, ErrorRow},
     facts::{self, CrateDepRow, LinkRow, MissRow, QueryCountRow},
-    flight::{self, Cursor, Read, SpanRow},
+    flight::{self, CounterRow, Cursor, Plot, Read, SpanRow},
     identity,
     sampler::{self, Sample},
     schema::{self, Column, Table, Type},
@@ -50,10 +50,14 @@ use crate::{
 /// takes compressed, days of a busy daemon.
 pub const CAP_BYTES: u64 = 1 << 30;
 
-/// How often the daemon flushes while a session runs. A thread's ring holds [`flight::CAP`]
-/// rows, so a thread writing more than `CAP / 5` rows a second between flushes loses the
-/// oldest, counted in [`Flushed::skipped`].
+/// How often the daemon flushes while a session runs.
 pub const EVERY: Duration = Duration::from_secs(5);
+
+/// How often the daemon drains the rings into the next flush ([`History::drain`]). A thread's
+/// ring holds [`flight::CAP`] rows, so only a thread writing more than `CAP * 4` rows a second
+/// loses the oldest, counted in [`Flushed::skipped`] and the `profile rows skipped` counter: at
+/// one read a flush, a self-build's busiest workers filled their rings (spans37).
+pub const DRAIN: Duration = Duration::from_millis(250);
 
 /// Rows a row group holds at most: DuckDB's own row group size, the unit its scans split
 /// across threads.
@@ -381,7 +385,12 @@ pub struct History {
     dir: PathBuf,
     cap: u64,
     cursor: Cursor,
+    /// The rows drained since the last flush: what the next one writes.
     read: Read,
+    /// Rows the rings wrote over before a drain read them, so far.
+    skipped: u64,
+    /// The spans lost and rows skipped the last flush wrote as counters.
+    told: (u64, u64),
     /// A flush's spans of other builds than the one it is for.
     others: Vec<SpanRow>,
     writer: Writer,
@@ -454,6 +463,8 @@ impl History {
             cap,
             cursor: Cursor::default(),
             read: Read::default(),
+            skipped: 0,
+            told: (0, 0),
             // alloc: once a history
             others: Vec::new(),
             writer,
@@ -554,8 +565,34 @@ impl History {
     /// 0). Then deletes the oldest files past the cap. A failed write is an error naming the
     /// file; the rows it held are not written again.
     pub fn flush(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
+        self.drain();
+        // The flight recorder's own losses, as counters: a query sees whether a stretch with
+        // no span is one the recorder dropped. Written with each build's flush and whenever
+        // they grew, so an idle daemon's timer writes no file for them.
+        self.skipped += self.read.skipped;
+        // Counted since the process began; the row of a build's flush carries the build.
+        let (t_ns, now) = (self.read.at_ns, (self.read.lost, self.skipped));
+        if build.is_some() || now != self.told {
+            self.told = now;
+            let build = build.and_then(|it| u32::try_from(it).ok()).unwrap_or(0);
+            self.read.counters.extend([(Plot::ProfileSpansLost, now.0), (Plot::ProfileRowsSkipped, now.1)].map(
+                |(plot, value)| CounterRow { build, plot, t_ns, value, fiber: None },
+            ));
+        }
+        let written = self.write(build);
+        // Written or not, the rows drained are this flush's: none goes to the next.
         self.read.clear();
+        written
+    }
+
+    /// Takes what the rings hold that is new since the last drain into the next flush, so a
+    /// ring that wraps between two flushes loses nothing ([`DRAIN`]).
+    pub fn drain(&mut self) {
         flight::read(&mut self.cursor, &mut self.read);
+    }
+
+    /// [`History::flush`] of the rows drained.
+    fn write(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
         let seq = self.seq;
         self.seq += 1;
         // The spans of `build` are given its commit; the rest (other builds', and none's) none.
@@ -733,7 +770,7 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     use super::*;
-    use crate::flight::{Allocated, CounterRow, FrameCopied, Plot};
+    use crate::flight::{Allocated, FrameCopied};
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("blaze-history-{}-{name}", std::process::id()));

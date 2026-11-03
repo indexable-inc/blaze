@@ -20,9 +20,10 @@
 use std::{
     cell::{Cell, RefCell},
     fmt::Write as _,
+    num::NonZeroUsize,
     sync::{
         OnceLock,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence},
+        atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering, fence},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -43,13 +44,18 @@ const WORDS: usize = 8;
 /// Spans a thread is inside that are named (the enter stack); deeper ones are counted.
 const OPEN_MAX: usize = 32;
 /// Spans a thread may have made and not yet closed. A span past them is not recorded, and
-/// counted as lost ([`Read::lost`]).
-const SLOTS_OPEN: usize = 64;
+/// counted as lost ([`Read::lost`]). A fiber parked with its enter stack keeps its spans open
+/// in the ring of the thread that made them, so one thread may hold the open spans of hundreds
+/// of parked fibers: 64 slots lost spans on most workers of a self-build (spans37).
+const SLOTS_OPEN: usize = 1 << SLOT_BITS;
+/// Slots a chunk of [`Ring::open`] holds: a chunk is allocated once a thread's open spans
+/// reach it, so a thread that holds few open spans holds one chunk.
+const CHUNK: usize = 256;
 
 // A span id: the ring of the thread that made it, its slot there, and the ring's count of
 // spans made, so no two spans of a process alive at once share an id.
 const RING_BITS: u32 = 12;
-const SLOT_BITS: u32 = 6;
+const SLOT_BITS: u32 = 14;
 const SEQ_BITS: u32 = 64 - RING_BITS - SLOT_BITS;
 const SEQ_MASK: u64 = (1 << SEQ_BITS) - 1;
 /// Rings a process may have: one per thread alive at once. Numbers run from 1; the highest
@@ -85,11 +91,23 @@ type Meta = tracing::Metadata<'static>;
 
 /// A callsite recorded, and which of the generic span columns its fields fill: bit `i` for
 /// the column at [`span::Said::get`]'s `i` ([`span::generic_of`]). The typed columns only a
-/// span kind fills ([`crate::span`]).
+/// span kind fills ([`crate::span`]). `held`: its spans are [`HELD_FIELD`] ones.
 struct Site {
     meta: &'static Meta,
     fields: u8,
+    held: bool,
 }
+
+/// The field that makes a callsite's spans held: open across the steps of a state machine
+/// (a build script's run on the daemon's loop, from its start to its end), entered only while
+/// one of its steps runs. A held span's `self_cpu_ns` counts its job's CPU while it is entered,
+/// not all the while it is open, which is the loop's other work.
+pub const HELD_FIELD: &str = "held";
+
+/// The bit of a slot's `what` (in its site's half, above [`SITE_BITS`]) that says its span is
+/// held.
+const HELD_BIT: u64 = 1 << 15;
+const _: () = assert!(SITE_BITS < 15, "the held bit is above a site");
 
 const _: () = assert!(span::GENERIC <= 8, "a callsite's generic fields are bits of a u8");
 
@@ -135,7 +153,8 @@ pub(crate) fn register(meta: &'static Meta) -> Option<u16> {
         at = (at + 1) % SLOTS;
     }
     let fields = meta.fields().iter().fold(0, |all, it| all | field_of(it.name()));
-    _ = SITES[at].set(Site { meta, fields });
+    let held = meta.fields().field(HELD_FIELD).is_some();
+    _ = SITES[at].set(Site { meta, fields, held });
     *taken += 1;
     Some(at as u16 + 1)
 }
@@ -306,10 +325,22 @@ pub enum Plot {
     MacroModuleStore,
     /// Proc-macro wasm modules the daemon compiled, so far.
     MacroModuleCompiled,
+    /// Spans the process made and could not record, so far ([`Read::lost`]): past the open
+    /// slots of a thread, the callsite table or the rings. Written by the history at each
+    /// flush; a wait or a stretch of work with no span is one of these when it is above 0.
+    ProfileSpansLost,
+    /// Rows the history's reader found written over before it read them, so far
+    /// ([`Read::skipped`]): a ring that wrapped between two drains.
+    ProfileRowsSkipped,
+    /// Bytes `blaze_mem` has committed in every region, whatever tag: [`Plot::Footprint`] less
+    /// this is what the process holds outside `blaze_mem` (the global heap, code, stacks).
+    CommittedBytes,
+    /// Bytes of address space every live `blaze_mem` region reserves.
+    ReservedBytes,
 }
 
 impl Plot {
-    pub const ALL: [Plot; 15] = [
+    pub const ALL: [Plot; 19] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -325,6 +356,10 @@ impl Plot {
         Plot::MacroModuleMemo,
         Plot::MacroModuleStore,
         Plot::MacroModuleCompiled,
+        Plot::ProfileSpansLost,
+        Plot::ProfileRowsSkipped,
+        Plot::CommittedBytes,
+        Plot::ReservedBytes,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -344,6 +379,10 @@ impl Plot {
             Plot::MacroModuleMemo => "macro modules from memo",
             Plot::MacroModuleStore => "macro modules from store",
             Plot::MacroModuleCompiled => "macro modules compiled",
+            Plot::ProfileSpansLost => "profile spans lost",
+            Plot::ProfileRowsSkipped => "profile rows skipped",
+            Plot::CommittedBytes => "committed bytes",
+            Plot::ReservedBytes => "reserved bytes",
         }
     }
 
@@ -500,9 +539,9 @@ static PARKED: Mutex<Parked> = Mutex::new(Parked { jobs: Vec::new(), free: Vec::
 
 /// Moves the parking job's enter stack and build off this thread, leaving it inside no span and
 /// working for no build: the `take` of `blaze_graph::sched::fiber::carry` ([`crate::install`]
-/// registers it). 0 for a job inside no span and of no build: nothing to move.
+/// registers it). `None` for a job inside no span and of no build: nothing to move.
 #[inline(never)]
-pub fn take_open() -> usize {
+pub fn take_open() -> Option<NonZeroUsize> {
     let build = BUILD.with(|it| it.replace(0));
     let ring = MINE.with(Cell::get);
     // Before the job's clock is taken: the segment's CPU is read on it.
@@ -514,7 +553,7 @@ pub fn take_open() -> usize {
     // The next job on this thread counts on a clock of its own.
     JOB_CPU.with(|it| it.set((0, 0)));
     if nothing {
-        return 0;
+        return None;
     }
     let mut carried = Carried { depth, build, entered: [0; OPEN_MAX], cpu_clock, cpu_at, job, running };
     if let Some(ring) = ring {
@@ -535,15 +574,15 @@ pub fn take_open() -> usize {
             parked.jobs.len() - 1
         }
     };
-    at + 1
+    NonZeroUsize::MIN.checked_add(at)
 }
 
 /// Puts what [`take_open`] took back on this thread, the one resuming the job: the `put` of
 /// `blaze_graph::sched::fiber::carry`. The thread was left inside no span by the job it ran
 /// before, so the job's stack replaces an empty one.
 #[inline(never)]
-pub fn put_open(taken: usize) {
-    let Some(at) = taken.checked_sub(1) else { return };
+pub fn put_open(taken: NonZeroUsize) {
+    let at = taken.get() - 1;
     let carried = {
         let mut parked = lock(&PARKED);
         let Some(&carried) = parked.jobs.get(at) else { return };
@@ -578,6 +617,19 @@ pub fn put_open(taken: usize) {
             to.store(*from, Ordering::Relaxed);
         }
         ring.depth.store(depth, Ordering::Release);
+    }
+}
+
+/// Frees the slot [`take_open`] gave a job that ended holding it (or whose parked record was
+/// dropped): the `end` of `blaze_graph::sched::fiber::carry`. Its open spans were closed by
+/// the job's own unwind, or are left unclosed, as a span a thread never exits is.
+#[inline(never)]
+pub fn end_open(taken: NonZeroUsize) {
+    let at = taken.get() - 1;
+    let mut parked = lock(&PARKED);
+    if at < parked.jobs.len() {
+        // alloc: none past the most jobs parked at once
+        parked.free.push(at);
     }
 }
 
@@ -701,6 +753,9 @@ struct Begun {
     spawner: u64,
     /// When it was given to the pool, in ticks; 0 when not said.
     given: u64,
+    /// The build the thread worked for before the job began: what it works for again once a
+    /// job that never joined the graph ran ([`Switched::Ran`]).
+    outer: u32,
 }
 
 thread_local! {
@@ -719,13 +774,26 @@ pub fn running_job() -> u64 {
     RUNNING.with(Cell::get).job
 }
 
+/// The build this thread works for now: the one [`building`] set, else the one its running job
+/// last worked for; 0 for none. What a pool job given now works for
+/// (`blaze_graph::sched::Given::build`).
+pub fn current_build() -> u32 {
+    match BUILD.with(Cell::get) {
+        0 => RUNNING.with(Cell::get).build,
+        build => build,
+    }
+}
+
 /// A pool job given to the pool by `spawner` at `given` (ticks, 0 for not said) begins on this
-/// thread. No row: its `started` or `ran` row says when (`since`) and how long it waited for a
-/// core (`queued`), so a job's life costs no row more than its switches.
-pub fn job_begins(spawner: u64, given: u64) {
+/// thread, working for `build`, the giver's ([`current_build`]): its spans and switches are the
+/// build's, wherever it runs, until it ends (a parked job carries it, [`take_open`]). No row:
+/// its `started` or `ran` row says when (`since`) and how long it waited for a core (`queued`),
+/// so a job's life costs no row more than its switches.
+pub fn job_begins(spawner: u64, given: u64, build: u32) {
     let unjoined = UNJOINED.fetch_add(1, Ordering::Relaxed) << 32 | UNJOINED_SLOT;
-    BEGUN.with(|it| it.set(Some(Begun { ticks: clock::ticks(), unjoined, spawner, given })));
-    RUNNING.with(|it| it.set(OnThread { job: unjoined, build: BUILD.with(Cell::get) }));
+    let outer = BUILD.with(|it| it.replace(build));
+    BEGUN.with(|it| it.set(Some(Begun { ticks: clock::ticks(), unjoined, spawner, given, outer })));
+    RUNNING.with(|it| it.set(OnThread { job: unjoined, build }));
 }
 
 /// The bits of a switch row's word 4 above its kind, wait and event bytes, and of its word 6
@@ -766,10 +834,15 @@ pub fn switched(switch: Switch) {
             let Some(begun) = BEGUN.with(Cell::take) else { return };
             (job, by, since, queued) = (begun.unjoined, begun.spawner, begun.ticks, queued_word(&begun));
             RUNNING.with(|it| it.set(OnThread::default()));
+            // It ran where it began, inside what the thread worked for before.
+            BUILD.with(|it| it.set(begun.outer));
         }
         Switched::Ended => {
             BEGUN.with(Cell::take);
             RUNNING.with(|it| it.set(OnThread::default()));
+            // As a parked job leaves its thread ([`take_open`]): working for no build, so the
+            // worker's own time after it is no build's.
+            BUILD.with(|it| it.set(0));
         }
         Switched::Ready => by = running.job,
         Switched::Parked | Switched::Resumed | Switched::Idle | Switched::Woke => {}
@@ -1003,6 +1076,8 @@ struct Slot {
     cpu_clock: AtomicU64,
     cpu: AtomicU64,
     cpu_under: AtomicU64,
+    /// A held span's job CPU reading when it was last entered, plus one (0: not entered).
+    cpu_entered: AtomicU64,
 }
 
 impl Slot {
@@ -1023,6 +1098,7 @@ impl Slot {
         cpu_clock: AtomicU64::new(0),
         cpu: AtomicU64::new(0),
         cpu_under: AtomicU64::new(0),
+        cpu_entered: AtomicU64::new(0),
     };
 }
 
@@ -1043,6 +1119,7 @@ struct Opened {
     cpu_clock: u64,
     cpu: u64,
     cpu_under: u64,
+    held: bool,
 }
 
 impl Opened {
@@ -1066,7 +1143,13 @@ pub(crate) struct Ring {
     /// Spans the thread is inside, the first [`OPEN_MAX`] of them in `entered`.
     depth: AtomicU32,
     entered: [AtomicU64; OPEN_MAX],
-    open: [Slot; SLOTS_OPEN],
+    /// The slots of the spans its thread made and has not closed, [`CHUNK`] a chunk: null
+    /// until the thread first needs one there, then never freed (rings live as long as the
+    /// process), so a published chunk may be read with no lock.
+    open: [AtomicPtr<Slot>; SLOTS_OPEN / CHUNK],
+    /// Which slots hold a span, a bit each: set by the ring's thread as it takes one, cleared
+    /// by the thread that closes the span, after it freed the slot.
+    taken: [AtomicU64; SLOTS_OPEN / 64],
     /// Whether a live thread holds it.
     live: AtomicBool,
     /// Threads that have held it: a span closed by the thread that began it closes on the
@@ -1102,7 +1185,8 @@ impl Ring {
             made: AtomicU64::new(0),
             depth: AtomicU32::new(0),
             entered: [const { AtomicU64::new(0) }; OPEN_MAX],
-            open: [Slot::FREE; SLOTS_OPEN],
+            open: [const { AtomicPtr::new(std::ptr::null_mut()) }; SLOTS_OPEN / CHUNK],
+            taken: [const { AtomicU64::new(0) }; SLOTS_OPEN / 64],
             live: AtomicBool::new(true),
             lease: AtomicU64::new(0),
             current: AtomicU64::new(0),
@@ -1151,19 +1235,52 @@ impl Ring {
         head
     }
 
-    /// A free slot for a span its thread makes: the one at `depth` when free, else the next
-    /// free one. Only the ring's thread takes slots; any thread frees them.
+    /// Takes a free slot for a span its thread makes, the lowest free one, allocating its
+    /// chunk when it has none yet; `None` once all [`SLOTS_OPEN`] hold a span. Only the ring's
+    /// thread takes slots; any thread frees them ([`Ring::free`]).
     #[inline]
-    fn free_slot(&self, depth: u32) -> Option<usize> {
-        let first = depth as usize % SLOTS_OPEN;
-        (0..SLOTS_OPEN)
-            .map(|it| (first + it) % SLOTS_OPEN)
-            .find(|&it| self.open[it].id.load(Ordering::Acquire) == 0)
+    fn take_slot(&self) -> Option<usize> {
+        let (word_at, bits) =
+            self.taken.iter().enumerate().map(|(at, it)| (at, it.load(Ordering::Acquire))).find(|(_, it)| *it != u64::MAX)?;
+        let bit = (!bits).trailing_zeros() as usize;
+        let at = word_at * 64 + bit;
+        let chunk = &self.open[at / CHUNK];
+        if chunk.load(Ordering::Acquire).is_null() {
+            // alloc: once per CHUNK slots a thread first holds open at once, for the process's life
+            let slots: Box<[Slot]> = std::iter::repeat_with(|| Slot::FREE).take(CHUNK).collect();
+            chunk.store(Box::leak(slots).as_mut_ptr(), Ordering::Release);
+        }
+        self.taken[word_at].fetch_or(1 << bit, Ordering::Relaxed);
+        Some(at)
+    }
+
+    /// Slot `at`, once its chunk is allocated.
+    #[inline]
+    fn slot(&self, at: usize) -> Option<&Slot> {
+        let chunk = self.open.get(at / CHUNK)?.load(Ordering::Acquire);
+        // SAFETY: a non-null chunk was published with release by `take_slot` after it was
+        // made whole: `CHUNK` slots, leaked, so it lives as long as the ring and is never
+        // written but through atomics; `at % CHUNK` is in it.
+        (!chunk.is_null()).then(|| unsafe { &*chunk.add(at % CHUNK) })
+    }
+
+    /// The slot of span `id`, whether or not `id` is still in it.
+    #[inline]
+    fn slot_of(&self, id: u64) -> Option<&Slot> {
+        self.slot(slot_of(id))
+    }
+
+    /// Frees the slot of span `id`, which held it: any thread may.
+    #[inline]
+    fn free(&self, slot: &Slot, id: u64) {
+        slot.id.store(0, Ordering::Release);
+        let at = slot_of(id);
+        self.taken[at / 64].fetch_and(!(1 << (at % 64)), Ordering::Release);
     }
 
     /// What the slot of span `id` holds, while `id` is in it.
     fn opened(&self, id: u64) -> Option<Opened> {
-        let slot = &self.open[slot_of(id)];
+        let slot = self.slot_of(id)?;
         if slot.id.load(Ordering::Acquire) != id {
             return None;
         }
@@ -1189,6 +1306,7 @@ impl Ring {
             cpu_clock: slot.cpu_clock.load(Ordering::Relaxed),
             cpu: slot.cpu.load(Ordering::Relaxed),
             cpu_under: slot.cpu_under.load(Ordering::Relaxed),
+            held: what & HELD_BIT != 0,
         };
         fence(Ordering::Acquire);
         (slot.id.load(Ordering::Relaxed) == id).then_some(opened)
@@ -1398,7 +1516,7 @@ fn began(site: u16, parent: Option<u64>, said: &Said) -> u64 {
         return UNRECORDED;
     };
     let depth = ring.depth.load(Ordering::Relaxed);
-    let Some(at) = ring.free_slot(depth) else {
+    let Some(at) = ring.take_slot() else {
         ring.lost.store(ring.lost.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
         return UNRECORDED;
     };
@@ -1408,21 +1526,33 @@ fn began(site: u16, parent: Option<u64>, said: &Said) -> u64 {
             .and_then(|top| ring.entered.get(top as usize))
             .map_or(0, |it| it.load(Ordering::Relaxed))
     });
-    let (cpu_clock, cpu) = job_cpu().map_or((0, 0), |(clock, at)| (clock, at.saturating_add(1)));
+    let held = SITES[usize::from(site) - 1].get().is_some_and(|it| it.held);
+    // A held span counts from nothing, while entered ([`held_cpu`]): its reading is its sum.
+    let (cpu_clock, cpu) = match job_cpu() {
+        Some((clock, _)) if held => (clock, 1),
+        Some((clock, at)) => (clock, at.saturating_add(1)),
+        None => (0, 0),
+    };
     let made = ring.made.load(Ordering::Relaxed) + 1;
     ring.made.store(made, Ordering::Relaxed);
     let id = u64::from(ring.number) << (SLOT_BITS + SEQ_BITS) | (at as u64) << SEQ_BITS | made & SEQ_MASK;
-    let slot = &ring.open[at];
+    let Some(slot) = ring.slot(at) else {
+        // `take_slot` made its chunk: unreachable, but a lost span is not a panic.
+        ring.lost.store(ring.lost.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        return UNRECORDED;
+    };
     let build = BUILD.with(Cell::get);
     let alloc = allocated().unwrap_or_default();
     let copied = frame_copied();
     slot.start.store(clock::ticks(), Ordering::Relaxed);
     slot.parent.store(parent, Ordering::Relaxed);
-    slot.what.store(u64::from(build) << 32 | u64::from(depth.min(0xffff)) << 16 | u64::from(site), Ordering::Relaxed);
+    let held_bit = if held { HELD_BIT } else { 0 };
+    slot.what.store(u64::from(build) << 32 | u64::from(depth.min(0xffff)) << 16 | held_bit | u64::from(site), Ordering::Relaxed);
     store_said(slot, said);
     slot.cpu_clock.store(cpu_clock, Ordering::Relaxed);
     slot.cpu.store(cpu, Ordering::Relaxed);
     slot.cpu_under.store(0, Ordering::Relaxed);
+    slot.cpu_entered.store(0, Ordering::Relaxed);
     slot.alloc_bytes.store(alloc.bytes, Ordering::Relaxed);
     slot.allocs.store(alloc.count, Ordering::Relaxed);
     slot.frame_copies.store(copied.copies, Ordering::Relaxed);
@@ -1447,8 +1577,7 @@ pub(crate) fn cloned(id: u64) {
     if id == UNRECORDED {
         return;
     }
-    if let Some(ring) = by_number(ring_of(id)) {
-        let slot = &ring.open[slot_of(id)];
+    if let Some(slot) = by_number(ring_of(id)).and_then(|ring| ring.slot_of(id)) {
         if slot.id.load(Ordering::Acquire) == id {
             slot.refs.fetch_add(1, Ordering::Relaxed);
         }
@@ -1470,7 +1599,9 @@ pub(crate) fn recorded(id: u64, values: &tracing::span::Record<'_>) {
     }
     let mut fields = Fields { wanted, said: opened.said() };
     values.record(&mut fields);
-    store_said(&ring.open[slot_of(id)], &fields.said);
+    if let Some(slot) = ring.slot_of(id) {
+        store_said(slot, &fields.said);
+    }
 }
 
 /// The span `id` of a kind, still open, says more as it ends ([`span::Ending::ended`]):
@@ -1483,7 +1614,9 @@ pub(crate) fn said_after(id: u64, say: impl FnOnce(&mut Said)) {
     let Some(opened) = ring.opened(id) else { return };
     let mut said = opened.said();
     say(&mut said);
-    store_said(&ring.open[slot_of(id)], &said);
+    if let Some(slot) = ring.slot_of(id) {
+        store_said(slot, &said);
+    }
 }
 
 /// The build of the open span `id`, 0 for none or a span closed already: atomics only, so the
@@ -1514,6 +1647,29 @@ pub(crate) fn entered(id: u64) {
         slot.store(id, Ordering::Relaxed);
     }
     ring.depth.store(depth + 1, Ordering::Release);
+    held_cpu(id, true);
+}
+
+/// A held span ([`HELD_FIELD`]) `id` entered (`entering`) or left on this thread: its CPU from
+/// here to its leaving is added to its sum when both are on the clock it began on. Nothing
+/// for any other span.
+#[inline]
+fn held_cpu(id: u64, entering: bool) {
+    let Some(slot) = by_number(ring_of(id)).and_then(|it| it.slot_of(id)) else { return };
+    if slot.what.load(Ordering::Relaxed) & HELD_BIT == 0 || slot.id.load(Ordering::Acquire) != id {
+        return;
+    }
+    let Some((_, now)) = job_cpu().filter(|(clock, _)| *clock == slot.cpu_clock.load(Ordering::Relaxed)) else {
+        slot.cpu_entered.store(0, Ordering::Relaxed);
+        return;
+    };
+    if entering {
+        slot.cpu_entered.store(now.saturating_add(1), Ordering::Relaxed);
+        return;
+    }
+    if let Some(began) = slot.cpu_entered.swap(0, Ordering::Relaxed).checked_sub(1) {
+        slot.cpu.fetch_add(now.saturating_sub(began), Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -1521,6 +1677,7 @@ pub(crate) fn exited(id: u64) {
     if id == UNRECORDED {
         return;
     }
+    held_cpu(id, false);
     let Some(ring) = ring() else { return };
     let depth = ring.depth.load(Ordering::Relaxed);
     let Some(top) = depth.checked_sub(1) else { return };
@@ -1548,12 +1705,12 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
         return None;
     }
     let made_by = by_number(ring_of(id))?;
-    let slot = &made_by.open[slot_of(id)];
+    let slot = made_by.slot_of(id)?;
     if slot.id.load(Ordering::Acquire) != id || slot.refs.fetch_sub(1, Ordering::AcqRel) > 1 {
         return None;
     }
     let opened = made_by.opened(id)?;
-    slot.id.store(0, Ordering::Release);
+    made_by.free(slot, id);
     let now = clock::ticks();
     // The allocations as their count plus one, so 0 is "not counted".
     let (allocs, bytes) = allocated().map_or((0, 0), |now| {
@@ -1624,9 +1781,9 @@ fn put_cols(ring: &Ring, now: u64, id: u64, cpu: u64, typed: &[u64; TYPED]) {
 fn self_cpu(opened: &Opened) -> u64 {
     let Some(began) = opened.cpu.checked_sub(1) else { return 0 };
     let Some((clock, now)) = job_cpu().filter(|(clock, _)| *clock == opened.cpu_clock) else { return 0 };
-    let whole = now.saturating_sub(began);
-    if let Some(parent) = by_number(ring_of(opened.parent)).filter(|_| opened.parent != 0) {
-        let slot = &parent.open[slot_of(opened.parent)];
+    // A held span's reading is the sum of its entered stretches ([`held_cpu`]).
+    let whole = if opened.held { began } else { now.saturating_sub(began) };
+    if let Some(slot) = by_number(ring_of(opened.parent)).filter(|_| opened.parent != 0).and_then(|it| it.slot_of(opened.parent)) {
         if slot.id.load(Ordering::Acquire) == opened.parent && slot.cpu_clock.load(Ordering::Relaxed) == clock {
             slot.cpu_under.fetch_add(whole, Ordering::Relaxed);
         }
@@ -2209,6 +2366,24 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
+    }
+
+    /// A thread holds the open spans of every fiber parked with spans it made: far past one
+    /// chunk, each slot its own, and a freed slot is the next taken.
+    #[test]
+    fn a_ring_holds_thousands_of_open_spans_and_reuses_a_freed_slot() {
+        let ring = Ring::new(1);
+        let taken: Vec<usize> = (0..3000).map(|_| ring.take_slot().expect("a free slot")).collect();
+        assert!(taken.iter().enumerate().all(|(i, at)| *at == i), "the lowest free slot first");
+        assert!(taken.iter().all(|&at| ring.slot(at).is_some()), "every taken slot's chunk is made");
+        assert!(ring.slot(3000 / CHUNK * CHUNK + CHUNK).is_none(), "no chunk before it is needed");
+        let id = u64::from(ring.number) << (SLOT_BITS + SEQ_BITS) | 700 << SEQ_BITS | 1;
+        let slot = ring.slot_of(id).unwrap();
+        slot.id.store(id, Ordering::Release);
+        ring.free(slot, id);
+        assert_eq!(ring.take_slot(), Some(700));
+        while ring.take_slot().is_some() {}
+        assert!(ring.taken.iter().all(|it| it.load(Ordering::Relaxed) == u64::MAX), "full at {SLOTS_OPEN}");
     }
 
     #[test]
@@ -2939,10 +3114,22 @@ mod tests {
                 let _inner = tracing::info_span!(target: "blaze", "cpu inner").entered();
                 spend(20);
             }
+            {
+                // Held across two steps of a state machine, with the loop's other work between.
+                let held = tracing::info_span!(target: "blaze", "cpu held", held = true);
+                spend(40);
+                held.in_scope(|| {
+                    spend(7);
+                    let _under = tracing::info_span!(target: "blaze", "cpu held under").entered();
+                    spend(2);
+                });
+                spend(40);
+                held.in_scope(|| spend(4));
+            }
             let _build = building(3);
             let parked = tracing::info_span!(target: "blaze", "cpu parked");
             spend(5);
-            let taken = take_open();
+            let taken = take_open().expect("a job inside a build has state to carry");
             // Another job runs on the thread while the first is parked.
             {
                 let _other = tracing::info_span!(target: "blaze", "cpu other job").entered();
@@ -2965,6 +3152,11 @@ mod tests {
         assert_eq!(row_named(&read, "cpu inner").self_cpu_ns, Some(20));
         assert_eq!(row_named(&read, "cpu outer").self_cpu_ns, Some(10), "less the 20 of the span under it");
         assert_eq!(row_named(&read, "cpu other job").self_cpu_ns, Some(100));
+        assert_eq!(
+            row_named(&read, "cpu held").self_cpu_ns,
+            Some(11),
+            "a held span counts its two entered steps' 7 and 4, less the 2 under it, never the 80 between"
+        );
         assert_eq!(
             row_named(&read, "cpu parked").self_cpu_ns,
             Some(8),

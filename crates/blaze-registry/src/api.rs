@@ -4,7 +4,7 @@
 
 use std::{fmt, sync::Arc};
 
-use hyper::{Method, StatusCode, header};
+use http::{Method, StatusCode, header};
 use serde::{Deserialize, Serialize};
 
 use crate::http::{HyperHttp, Response};

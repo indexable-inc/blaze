@@ -286,9 +286,11 @@ fn hidden_flags_that_point_elsewhere() {
         "`--debug` is the default for `cargo build`; instead `--release` is supported",
         "cargo build [OPTIONS]",
     );
-    let keep_going = "use `--no-fail-fast` to run as many tests as possible regardless of failure";
-    tip(&["test", "--keep-going"], "--keep-going", keep_going, "cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]");
-    tip(&["bench", "--keep-going"], "--keep-going", keep_going, "cargo bench [OPTIONS] [BENCHNAME] [-- [ARGS]...]");
+    // cargo refuses `--keep-going` on `test` and `bench`; blaze takes it and passes it on.
+    for command in ["test", "bench"] {
+        let asked = cargo(&[command, "--keep-going"]);
+        assert!(asked.flags.keep_going && asked.args == ["--keep-going"], "{command}");
+    }
     // `test`'s `-q` is its own, and it has no `-s`; `check` has no `--debug`.
     assert!(refused(&["test", "-s"]).starts_with("error: unexpected argument '-s' found\n\n  tip: to pass '-s'"));
     assert!(parse(os(&["check", "--debug"])).is_err());

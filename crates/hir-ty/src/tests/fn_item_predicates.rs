@@ -168,3 +168,51 @@ fn a_method_path_predicate_resolves_the_adaptors_methods() {
         assert!(failed.is_empty(), "{failed}");
     });
 }
+
+/// blaze-image's `Builder::finish` (build.rs:93): `&crate::serial` handed where a
+/// `&(dyn Fn(usize, &(dyn Fn(usize) + Sync)) + Sync)` is wanted. A parameter `&dyn Fn(usize)`
+/// leaves out one lifetime, the reference's: the lifetimes of `Fn(..)` are the sugar's own and the
+/// object's is its default, neither counted by rustc's elision. So the solver's signature of
+/// `serial` binds it, `for<'a> fn(usize, &'a (dyn Fn(usize) + Sync + 'a))`, and the function
+/// item meets `for<'a> Fn(usize, &'a (dyn Fn(usize) + Sync + 'a))`, as an unsizing to `dyn` and
+/// as a bound. With the parameter's lifetimes left unknown the signature kept an error region,
+/// and both were E0277, though `&usize` and an explicit `'x` passed.
+const DYN_FN_PARAM: &str = r#"
+//- minicore: sized, fn, coerce_unsized, sync
+//- /main.rs edition:2024
+pub type Jobs<'a> = &'a (dyn Fn(usize, &(dyn Fn(usize) + Sync)) + Sync);
+pub fn serial(_n: usize, _job: &(dyn Fn(usize) + Sync)) {}
+pub fn with_static(_n: usize, _job: &(dyn Fn(usize) + 'static)) {}
+pub fn returns_it(job: &dyn Fn(usize)) -> &dyn Fn(usize) { job }
+fn takes<F: Fn(usize, &(dyn Fn(usize) + Sync))>(_: F) {}
+fn finish_on(_jobs: Jobs<'_>) {}
+fn as_jobs() { finish_on(&serial) }
+fn as_dyn() { let _j: &dyn Fn(usize, &(dyn Fn(usize) + Sync)) = &serial; }
+fn as_static() { let _j: &dyn Fn(usize, &(dyn Fn(usize) + 'static)) = &with_static; }
+fn as_bound() { takes(serial) }
+fn through(job: &dyn Fn(usize)) { let _o: &dyn Fn(usize) = returns_it(job); }
+"#;
+
+#[test]
+fn a_fn_item_with_a_reference_to_dyn_fn_parameter_meets_fn_of_every_lifetime() {
+    let db = fixture::db(DYN_FN_PARAM).into_db();
+    crate::next_solver::attach_db(&db, || {
+        let mut failed = String::new();
+        let mut checked = Vec::new();
+        for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
+            for def in module.scope(&db).declarations() {
+                let ModuleDefId::FunctionId(func) = def else { continue };
+                let name = FunctionSignature::of(&db, func).name.as_str().to_owned();
+                let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)));
+                if !infer.diagnostics().is_empty() || infer.has_type_mismatches() || infer.is_erroneous() {
+                    failed.push_str(&format!("`{name}`: diagnostics {:?}\n", infer.diagnostics()));
+                }
+                checked.push(name);
+            }
+        }
+        for name in ["as_jobs", "as_dyn", "as_static", "as_bound", "through"] {
+            assert!(checked.iter().any(|it| it == name), "`{name}` was not checked: {checked:?}");
+        }
+        assert!(failed.is_empty(), "{failed}");
+    });
+}

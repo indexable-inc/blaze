@@ -62,6 +62,7 @@ fn lib_of(name: &str) -> UnitOf {
         manifest_path: format!("/w/{name}/Cargo.toml"),
         target: target("lib", name),
         test: false,
+        doctest: false,
     }
 }
 
@@ -300,6 +301,16 @@ fn a_unit_that_failed() {
     assert!(quiet.ends_with("`rustc --explain E0308`.\nerror: could not compile `foo` (lib) due to 1 previous error; 1 warning emitted\n"), "{quiet}");
 }
 
+/// A library's doc tests that fail to build are named as its doc tests, not as the library.
+#[test]
+fn failed_doctests_say_they_are_the_doctests() {
+    let doctests = UnitOf { id: 7, doctest: true, ..lib_of("foo") };
+    let error = diagnostic(Level::Error, "mismatched types", "error[E0308]: mismatched types\n\n", Some(doctests));
+    let responses = [Response::Diagnostic(error), Response::Done { ok: false }];
+    let (_, err) = printed(Shown { color: false, ..Shown::default() }, &responses, false);
+    assert!(err.ends_with("error: could not compile `foo` (lib doctest) due to 1 previous error\n"), "{err}");
+}
+
 #[test]
 fn levels_in_color_as_cargos_shell_writes_them() {
     let error = diagnostic(Level::Error, "mismatched types", "error[E0308]: mismatched types\n", Some(lib_of("foo")));
@@ -344,6 +355,37 @@ fn one_rendered_text_is_printed_once_with_or_without_its_newline() {
     let responses = [Response::Diagnostic(first), Response::Diagnostic(second), Response::Done { ok: true }];
     let (_, err) = printed(Shown::default(), &responses, true);
     assert_eq!(err, "warning: a\nwarning: `foo` (lib) generated 2 warnings (1 duplicate)\n");
+}
+
+/// Two units failing with one error of no span each print it (selfbuild2: psm's and
+/// llvm-sys's build scripts were refused in the same words, and the second printed only its
+/// "could not compile"); one spanned error of two units is printed once, as cargo does.
+#[test]
+fn every_unit_failing_with_the_same_words_prints_them() {
+    let refused = |name: &str| diagnostic(Level::Error, "refused", "error: refused\n", Some(lib_of(name)));
+    let responses = [Response::Diagnostic(refused("foo")), Response::Diagnostic(refused("bar")), Response::Done { ok: false }];
+    let (_, err) = printed(Shown::default(), &responses, true);
+    assert_eq!(err.matches("error: refused\n").count(), 2, "{err}");
+    let spanned = |name: &str| {
+        let mut it = diagnostic(Level::Error, "mismatched types", "error[E0308]: mismatched types\n", Some(lib_of(name)));
+        it.spans.push(Span {
+            file: "src/lib.rs".to_owned(),
+            line: 1,
+            column: 5,
+            end_line: 1,
+            end_column: 6,
+            label: None,
+            byte_start: 4,
+            byte_end: 5,
+            primary: true,
+            replacement: None,
+            applicability: None,
+        });
+        it
+    };
+    let responses = [Response::Diagnostic(spanned("foo")), Response::Diagnostic(spanned("bar")), Response::Done { ok: false }];
+    let (_, err) = printed(Shown::default(), &responses, true);
+    assert_eq!(err.matches("error[E0308]: mismatched types\n").count(), 1, "{err}");
 }
 
 #[test]

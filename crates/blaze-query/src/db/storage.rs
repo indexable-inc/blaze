@@ -16,7 +16,7 @@ use super::{
     Event, EventKind,
     admission::Eviction,
     counts,
-    dense::{Dense, Heap},
+    dense::{Dense, Heap, Zeroed},
     id::{Id, MAX_PAGES, PAGE_BITS, PAGE_LEN},
     ingredient::{self, Ingredient, MAX_INGREDIENTS},
     provenance::{Cause, restamp_run},
@@ -104,6 +104,62 @@ pub(crate) fn key_parts(key: u64) -> (u32, Id, u32) {
 pub(crate) type Summary = [u64; 2];
 pub(crate) const ALL: Summary = [u64::MAX; 2];
 
+/// A node of the dependency graph: what a walk reads of it (its color, summary and key) in one
+/// place, so a walk checks the node's index once and finds all of it in one cache line.
+#[repr(C, align(32))]
+pub(crate) struct NodeRow {
+    /// Its color ([`color`]).
+    color: AtomicU64,
+    /// Its input summary ([`Summary`]).
+    summary: [AtomicU64; 2],
+    /// Its key word ([`node_key`]).
+    key: AtomicU64,
+}
+
+// SAFETY: every field is an atomic integer, whose zero bytes are the value 0, and `Sync`; the
+// row has no padding (four 8-byte fields, 32-byte aligned).
+unsafe impl Zeroed for NodeRow {}
+
+impl NodeRow {
+    #[inline(always)]
+    pub(crate) fn color(&self) -> u64 {
+        self.color.load(Ordering::Acquire)
+    }
+
+    /// Its color under `&mut` (an input's setter): no reader races it.
+    #[inline(always)]
+    pub(crate) fn color_mut(&mut self) -> &mut u64 {
+        self.color.get_mut()
+    }
+
+    /// Paints it: colors only go up, so racing painters of one view end at its color.
+    #[inline]
+    pub(crate) fn paint(&self, color: u64) {
+        self.color.fetch_max(color, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub(crate) fn summary(&self) -> Summary {
+        let [a, b] = &self.summary;
+        // Relaxed: a summary is stored before its row's word or its node's color is published
+        // (release), which the reader acquired.
+        [a.load(Ordering::Relaxed), b.load(Ordering::Relaxed)]
+    }
+
+    /// Adds `summary`'s bits: a walk's, which racing walkers of a view agree on.
+    #[inline]
+    pub(crate) fn grow_summary(&self, summary: Summary) {
+        let [a, b] = &self.summary;
+        a.fetch_or(summary[0], Ordering::Relaxed);
+        b.fetch_or(summary[1], Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub(crate) fn key(&self) -> u64 {
+        self.key.load(Ordering::Relaxed)
+    }
+}
+
 /// Views of written-field masks kept: a memo verified further back walks.
 const HISTORY: usize = 64;
 
@@ -125,11 +181,28 @@ pub(crate) fn or(a: Summary, b: Summary) -> Summary {
 }
 
 /// Bytes of address space each storage reserves for row pages (committed as they are made).
+#[cfg(target_pointer_width = "64")]
 const HEAP: usize = 1 << 36;
+#[cfg(target_pointer_width = "64")]
 const INTERN_HEAP: usize = 1 << 35;
 /// Nodes and edges a storage may have.
+#[cfg(target_pointer_width = "64")]
 const NODES: usize = 1 << 28;
+#[cfg(target_pointer_width = "64")]
 const EDGES: usize = 1 << 32;
+
+/// The same on a 32-bit target (wasm32), where a reservation is memory taken whole and the
+/// whole address space is 4 GB, so each is a budget: 512 MB and 256 MB of row pages, 2^23
+/// nodes (320 MB of node columns) and 2^26 edges (256 MB). A storage that outgrows one stops
+/// with the error naming it, as on 64-bit.
+#[cfg(not(target_pointer_width = "64"))]
+const HEAP: usize = 512 << 20;
+#[cfg(not(target_pointer_width = "64"))]
+const INTERN_HEAP: usize = 256 << 20;
+#[cfg(not(target_pointer_width = "64"))]
+const NODES: usize = 1 << 23;
+#[cfg(not(target_pointer_width = "64"))]
+const EDGES: usize = 1 << 26;
 
 /// Every ingredient's rows, the dependency graph and the view of one database: `Send + Sync`,
 /// read by `&` from any number of tasks, written by `&mut`.
@@ -154,9 +227,7 @@ pub struct Storage {
     pub(crate) intern_heap: Heap,
     owners: Owners,
     next_page: AtomicU32,
-    pub(crate) colors: Dense<AtomicU64>,
-    pub(crate) summaries: Dense<[AtomicU64; 2]>,
-    pub(crate) keys: Dense<AtomicU64>,
+    pub(crate) nodes: Dense<NodeRow>,
     /// Each memo's last run: its view and [`Cause`], written by the run's flight holder.
     pub(crate) runs: Dense<AtomicU64>,
     next_node: AtomicU32,
@@ -211,14 +282,12 @@ impl Storage {
             making: Mutex::new(()),
             heap: Heap::new(HEAP, Tag::Query),
             intern_heap: Heap::new(INTERN_HEAP, Tag::Intern),
-            owners: Owners::committed(MAX_PAGES, Tag::Query),
+            owners: Owners::sparse(Tag::Query, "page owners"),
             next_page: AtomicU32::new(1),
-            colors: Dense::growing(NODES, Tag::Query),
-            summaries: Dense::growing(NODES, Tag::Query),
-            keys: Dense::growing(NODES, Tag::Query),
-            runs: Dense::growing(NODES, Tag::Query),
+            nodes: Dense::growing(NODES, Tag::Query, "nodes"),
+            runs: Dense::growing(NODES, Tag::Query, "node runs"),
             next_node: AtomicU32::new(1),
-            edges: Dense::growing(EDGES, Tag::Query),
+            edges: Dense::growing(EDGES, Tag::Query, "dependency edges"),
             edges_top: AtomicU64::new(0),
             edges_dead: AtomicU64::new(0),
             flights: Flights::new(),
@@ -257,29 +326,45 @@ impl Storage {
     /// Whether node `node`, verified in `verified`, read no input field written since: its
     /// summary shares no bit with the fields written in the views after `verified`.
     #[inline]
-    pub(crate) fn inputs_unchanged(&self, node: u32, verified: u32) -> bool {
+    pub(crate) fn inputs_unchanged(&self, node: &NodeRow, verified: u32) -> bool {
         let Some(back) = self.view.checked_sub(verified) else { return false };
         let Some(&written) = back.checked_sub(1).and_then(|at| self.written.get(at as usize))
         else {
             return back == 0;
         };
-        let summary = self.summary_of(node);
+        let summary = node.summary();
         (summary[0] & written[0]) | (summary[1] & written[1]) == 0
+    }
+
+    /// Node `node`: one check of its index for all it holds.
+    ///
+    /// # Panics
+    ///
+    /// When no node `node` was made, naming it ([`Dense::get`]).
+    #[inline(always)]
+    #[track_caller]
+    pub(crate) fn node(&self, node: u32) -> &NodeRow {
+        self.nodes.get(node as usize)
+    }
+
+    /// Node `node` under `&mut`, for a writer: [`Storage::node`] with no atomic load of the
+    /// bound.
+    #[inline(always)]
+    #[track_caller]
+    pub(crate) fn node_mut(&mut self, node: u32) -> &mut NodeRow {
+        self.nodes.get_mut(node as usize)
     }
 
     #[inline(always)]
     pub(crate) fn summary_of(&self, node: u32) -> Summary {
-        let [a, b] = self.summaries.get(node as usize);
-        // Relaxed: a summary is stored before its row's word or its node's color is published
-        // (release), which the reader acquired.
-        [a.load(Ordering::Relaxed), b.load(Ordering::Relaxed)]
+        self.node(node).summary()
     }
 
     /// Sets `node`'s summary, for its one writer (the run that holds its flight, an input's
     /// maker, a tracked struct's creator).
     #[inline]
     pub(crate) fn set_summary(&self, node: u32, summary: Summary) {
-        let [a, b] = self.summaries.get(node as usize);
+        let [a, b] = &self.node(node).summary;
         a.store(summary[0], Ordering::Relaxed);
         b.store(summary[1], Ordering::Relaxed);
     }
@@ -287,9 +372,7 @@ impl Storage {
     /// Adds `summary`'s bits to `node`'s: a walk's, which racing walkers of a view agree on.
     #[inline]
     pub(crate) fn grow_summary(&self, node: u32, summary: Summary) {
-        let [a, b] = self.summaries.get(node as usize);
-        a.fetch_or(summary[0], Ordering::Relaxed);
-        b.fetch_or(summary[1], Ordering::Relaxed);
+        self.node(node).grow_summary(summary);
     }
 
     /// The OR of the summaries of `edges`' nodes.
@@ -464,9 +547,6 @@ impl Storage {
     /// The ingredient that owns `id`'s page.
     #[inline]
     pub fn owner(&self, id: Id) -> Option<u32> {
-        if id.page() >= MAX_PAGES {
-            return None;
-        }
         match self.owners.get(id.page()).load(Ordering::Acquire) {
             0 => None,
             owner => Some(owner),
@@ -517,7 +597,7 @@ impl Storage {
         let page = self.next_page.fetch_add(1, Ordering::Relaxed) as usize;
         assert!(page < MAX_PAGES, "the query database ran out of ID pages ({MAX_PAGES})");
         // Release: whoever sees an ID of the page sees its owner.
-        self.owners.get(page).store(ingredient, Ordering::Release);
+        self.owners.get_to_write(page).store(ingredient, Ordering::Release);
         page
     }
 
@@ -531,9 +611,7 @@ impl Storage {
         let first = self.next_node.fetch_add(count, Ordering::Relaxed);
         let end = first as usize + count as usize;
         assert!(end <= NODES, "the query database ran out of nodes ({NODES})");
-        self.colors.ensure(end);
-        self.summaries.ensure(end);
-        self.keys.ensure(end);
+        self.nodes.ensure(end);
         self.runs.ensure(end);
         first
     }
@@ -545,28 +623,28 @@ impl Storage {
 
     #[inline(always)]
     pub(crate) fn color_of(&self, node: u32) -> u64 {
-        self.colors.get(node as usize).load(Ordering::Acquire)
+        self.node(node).color()
     }
 
     /// Paints `node`: colors only go up, so racing painters of one view end at its color.
     #[inline]
     pub(crate) fn paint(&self, node: u32, color: u64) {
-        self.colors.get(node as usize).fetch_max(color, Ordering::Release);
+        self.node(node).paint(color);
     }
 
     /// Sets `node`'s color outright, for its one writer (a field's setter, a cycle's reset).
     #[inline]
     pub(crate) fn repaint(&self, node: u32, color: u64) {
-        self.colors.get(node as usize).store(color, Ordering::Release);
+        self.node(node).color.store(color, Ordering::Release);
     }
 
     #[inline]
     pub(crate) fn key_of(&self, node: u32) -> u64 {
-        self.keys.get(node as usize).load(Ordering::Relaxed)
+        self.node(node).key()
     }
 
     pub(crate) fn set_key(&self, node: u32, key: u64) {
-        self.keys.get(node as usize).store(key, Ordering::Relaxed);
+        self.node(node).key.store(key, Ordering::Relaxed);
     }
 
     /// Records that memo `node` runs in this view because of `cause`: its flight holder's one
@@ -601,9 +679,9 @@ impl Storage {
         let end = start + len;
         assert!(end as usize <= EDGES, "the query database's edge array is full ({EDGES})");
         self.edges.ensure(end as usize);
-        for (at, &node) in edges.iter().enumerate() {
+        for (place, &node) in self.edges.slice(start as usize, edges.len()).iter().zip(edges) {
             // Relaxed: the span is published by the row's (or capture's) own release store.
-            self.edges.get(start as usize + at).store(node, Ordering::Relaxed);
+            place.store(node, Ordering::Relaxed);
         }
         span::pack(start, len)
     }
@@ -628,7 +706,7 @@ impl Storage {
         if top <= 2 * live.max(1 << 16) {
             return;
         }
-        let old = std::mem::replace(&mut self.edges, Dense::growing(EDGES, Tag::Query));
+        let old = std::mem::replace(&mut self.edges, Dense::growing(EDGES, Tag::Query, "dependency edges"));
         let mut moved = Relocate { old, top: 0 };
         for index in 1..=ingredient::registered() {
             if self.tables[index as usize].load(Ordering::Relaxed).is_null() {
@@ -652,10 +730,9 @@ impl Storage {
         let start = moved.top;
         moved.top += len;
         self.edges.ensure(moved.top as usize);
-        let from = span::start(span);
-        for at in 0..len {
-            let node = moved.old.get((from + at) as usize).load(Ordering::Relaxed);
-            self.edges.get((start + at) as usize).store(node, Ordering::Relaxed);
+        let from = moved.old.slice(span::start(span) as usize, len as usize);
+        for (to, from) in self.edges.slice(start as usize, len as usize).iter().zip(from) {
+            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
         }
         span::pack(start, len)
     }
@@ -672,7 +749,8 @@ impl Storage {
         self.hook.is_some()
     }
 
-    /// The row-page directory of ingredient `index`, null before its first use.
+    /// The row-page directory of ingredient `index`, null before its first use: once published,
+    /// a [`Pages::dir`], valid for every index below `MAX_PAGES`.
     #[inline(always)]
     pub(crate) fn dir(&self, index: u32) -> *const AtomicPtr<u8> {
         self.dirs[index as usize].load(Ordering::Acquire)
@@ -822,7 +900,7 @@ impl Ids {
     pub(crate) fn new(tag: Tag) -> Ids {
         Ids {
             next: AtomicU32::new(0),
-            pages: Dense::growing(MAX_PAGES, tag),
+            pages: Dense::growing(MAX_PAGES, tag, "an ingredient's ID pages"),
             making: Mutex::new(()),
         }
     }

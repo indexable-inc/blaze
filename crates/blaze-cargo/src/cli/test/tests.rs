@@ -22,6 +22,11 @@ impl Programs for Fake {
         let name = exec.program.file_name().unwrap().to_str().unwrap().to_owned();
         Ok(self.ends.iter().find(|(it, _)| *it == name).map_or(Ended::Code(0), |(_, ended)| *ended))
     }
+
+    /// No daemon: every program runs its file.
+    fn launch(&mut self, _: &Artifact, _: &mut Exec) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A package `foo` with a lib, a bin and a test `x`, each tested, and its doc tests; out of

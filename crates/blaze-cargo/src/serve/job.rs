@@ -40,6 +40,9 @@ mod tests;
 
 #[cfg(test)]
 thread_local! {
+    /// The command line of each build a row of the history was made for ([`Job::ended`]), on
+    /// the loop's thread: one a job's plane request, as a test counts them.
+    pub(super) static ENDED_ROWS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
     /// Each build script run node [`Jobs::run_script`] held for its program, on the loop's
     /// thread: what a test sees of the hold, which no response says.
     pub(super) static HELD_RUNS: std::cell::RefCell<Vec<NodeId>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
@@ -186,6 +189,8 @@ pub struct Setup {
     pub std: String,
     /// Where a workspace's build directory is when nothing names one: [`super::Options::builds`].
     pub builds: String,
+    /// Where the packages it fetches are kept: [`super::Options::sources`].
+    pub sources: String,
     /// The triple of the machine the daemon runs on.
     pub host: String,
     /// The daemon's `PATH` and `HOME`: an agent's invocation's whole environment.
@@ -541,6 +546,36 @@ fn lower_cost_key(checkout: &str) -> Key {
     Key(hasher.finish().0)
 }
 
+/// The units of `units` whose results a front end applies before it reads as rustc would
+/// compile: each proc macro's compile, whose expanders it is given (`Lowered::macros`), and
+/// each build script's run, whose cfgs, env and `OUT_DIR` files it is given (`Lowered::ran`).
+/// A build of them builds what they depend on, and nothing that depends on them.
+fn applied_units(units: &[blaze_units::schema::Unit]) -> Vec<u32> {
+    let applied = |unit: &blaze_units::schema::Unit| {
+        unit.mode == UnitMode::RunCustomBuild || (unit.mode == UnitMode::Build && unit.target.is_proc_macro())
+    };
+    // alloc: once per view of a reach, a place per proc macro or build script
+    (0u32..).zip(units).filter(|(_, unit)| applied(unit)).map(|(at, _)| at).collect()
+}
+
+/// The proc macros among the units `picked` of `units`, each `name version`, sorted, for the
+/// span of a reach that waits on them.
+fn macro_names(units: &Units, picked: &[u32]) -> String {
+    // alloc: once per view of a reach, for its span
+    let mut names: Vec<String> = picked
+        .iter()
+        .filter_map(|at| units.graph.units.get(*at as usize))
+        .filter(|unit| unit.target.is_proc_macro())
+        .map(|unit| match units.packages.iter().find(|it| it.id == unit.pkg_id) {
+            Some(package) => format!("{} {}", package.name, package.version),
+            None => unit.pkg_id.clone(), // clone: a span's name of a package the plan doesn't list
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.join(", ")
+}
+
 /// A job's place in [`Jobs::jobs`].
 fn key_of(id: JobId) -> slab::Key {
     slab::Key { slot: id.slot, generation: id.generation }
@@ -570,8 +605,10 @@ fn goal_of(work: &Work) -> Goal {
         Work::Test { ub: Some(_), .. } => Goal::Check,
         Work::Test { .. } | Work::Ahead { .. } => Goal::Test,
         Work::Run { .. } => Goal::Run,
-        Work::Reach { .. } => Goal::Reach,
-        Work::Check(_)
+        // A reach builds only the units its views' front ends apply, each as a check builds
+        // it, and so shares a check's records ([`reads_front_unbuilt`]).
+        Work::Reach { .. }
+        | Work::Check(_)
         | Work::Verify(_)
         | Work::Trace(_)
         | Work::Tables
@@ -582,18 +619,36 @@ fn goal_of(work: &Work) -> Goal {
     }
 }
 
-/// What a job was asked, as the history's `builds.command` says it: a command line's
-/// subcommand and arguments, or the work an agent asked for.
-fn command_line(work: &Work) -> String {
-    if let Some(cargo) = targets_of(work).and_then(|it| it.cargo.as_ref()) {
-        let mut line = cargo.command.clone(); // clone: once a build
-        for arg in &cargo.args {
-            line.push(' ');
-            line.push_str(arg);
-        }
-        return line;
+/// Whether `work` answers from its views' front ends without building their units first: a
+/// reach (item hashes), an edit (name resolution) and a build ahead's choice (the tests each
+/// test unit holds) read def maps, which a crate whose proc macros are not built, or whose
+/// build scripts' cfgs, env and `OUT_DIR` are not applied, gives only half expanded. Each view
+/// of such a job, once lowered, first builds the units its front end applies
+/// ([`applied_units`]) in the job's own plane request, and only then is read ([`Jobs::next`]):
+/// the one place that order is made, never a read of what a pending macro left out
+/// (no-fallback). Every other job builds every unit in order before it reads (a check, a
+/// build, a test, a run, a pack, the documentation) or reads no def map of the view (a trace
+/// and a verify walk the plan, the tables count, the codegen inputs read the units' records).
+fn reads_front_unbuilt(work: &Work) -> bool {
+    match work {
+        Work::Reach { .. } | Work::Edit(_) | Work::Ahead { .. } => true,
+        Work::Check(_)
+        | Work::Build(_)
+        | Work::Test { .. }
+        | Work::Run { .. }
+        | Work::Verify(_)
+        | Work::Snapshot
+        | Work::CodegenInputs(_)
+        | Work::Trace(_)
+        | Work::Tables
+        | Work::Pack { .. }
+        | Work::Doc { .. } => false,
     }
-    let what = match work {
+}
+
+/// The word naming what a job was asked, as the history and its spans name it.
+fn work_word(work: &Work) -> &'static str {
+    match work {
         Work::Check(_) => "check",
         Work::Build(_) => "build",
         Work::Test { .. } => "test",
@@ -608,8 +663,21 @@ fn command_line(work: &Work) -> String {
         Work::Doc { .. } => "doc",
         Work::Edit(_) => "edit",
         Work::Ahead { .. } => "ahead",
-    };
-    let mut line = what.to_owned();
+    }
+}
+
+/// What a job was asked, as the history's `builds.command` says it: a command line's
+/// subcommand and arguments, or the work an agent asked for.
+fn command_line(work: &Work) -> String {
+    if let Some(cargo) = targets_of(work).and_then(|it| it.cargo.as_ref()) {
+        let mut line = cargo.command.clone(); // clone: once a build
+        for arg in &cargo.args {
+            line.push(' ');
+            line.push_str(arg);
+        }
+        return line;
+    }
+    let mut line = work_word(work).to_owned();
     if let Some(targets) = targets_of(work) {
         for package in &targets.packages {
             line.push_str(" -p ");
@@ -798,6 +866,10 @@ struct Paths<S: Steps> {
     images: Vec<Option<Image<S>>>,
     /// How many of `images` are some.
     kept: u32,
+    /// The images a unit links beside its planned outputs (a library's doctests, each its own
+    /// program, under its runner's `.doctests` directory), by the unit's first output: taken
+    /// with that output's, so an edit relinks the one example it changed.
+    extras: HashMap<u32, Vec<u32>, Global>,
     /// The images of compiles that gave way, put back into `images` before any is taken: a
     /// compile posted again relinks the image it was given, never a new one.
     back: Arc<SegQueue<Image<S>>>,
@@ -812,6 +884,7 @@ impl<S: Steps> Paths<S> {
             placed: Vec::new(), // alloc: none until the first path
             images: Vec::new(), // alloc: none until the first path
             kept: 0,
+            extras: HashMap::new_in(Global),
             back: Arc::new(SegQueue::new()), // alloc: once for the daemon's life
         }
     }
@@ -858,7 +931,8 @@ impl<S: Steps> Paths<S> {
         if self.kept == 0 {
             return images;
         }
-        for &id in ids {
+        let extras = ids.first().and_then(|first| self.extras.get(first));
+        for &id in ids.iter().chain(extras.into_iter().flatten()) {
             if let Some(image) = self.images[id as usize].take() {
                 self.kept -= 1;
                 images.push(image);
@@ -875,7 +949,17 @@ impl<S: Steps> Paths<S> {
     }
 
     fn keep_one(&mut self, ids: &[u32], image: Image<S>) {
-        let id = self.find(ids, &image.path) as usize;
+        let id = self.find(ids, &image.path);
+        if let Some(&first) = ids.first()
+            && !ids.contains(&id)
+        {
+            // alloc: once per unit with images beside its outputs, its few ids
+            let extras = self.extras.entry(first).or_default();
+            if !extras.contains(&id) {
+                extras.push(id);
+            }
+        }
+        let id = id as usize;
         if self.images[id].replace(image).is_none() {
             self.kept += 1;
         }
@@ -988,6 +1072,21 @@ struct Build<S: Steps> {
     refused: Option<Refused>,
     /// Each unit's freshness by its place in the plan, once asked ([`Build::is_fresh`]).
     fresh: Vec<Option<bool>>,
+    /// Of a build of only the units a view's front end applies ([`Jobs::next`]): how far it
+    /// is, as its nodes settle; none for a build the job ends with.
+    applying: Option<Applying>,
+}
+
+/// A build of the units a view's front end applies, made in the job's one plane request
+/// ([`Jobs::next`]): the request stays open for the job's next view or its answer, so the
+/// build's end is its last node's settling ([`Jobs::settled`]), not the request's finish. One
+/// request a job, one row of the plane and the history, however many views it builds for
+/// and whether or not anything of them is made again.
+struct Applying {
+    /// Its nodes not yet settled.
+    left: u32,
+    /// One of them did not end well: failed, skipped or cancelled.
+    failed: bool,
 }
 
 /// The units of a build that depend on a write to its front end that failed or panicked
@@ -1130,6 +1229,14 @@ struct Job<S: Steps> {
     look: u64,
     /// The build waiting for that look: the units a build ahead picked, or none for all.
     awaiting: Option<Option<Vec<u32>>>,
+    /// Of a job that reads its views' front ends unbuilt ([`reads_front_unbuilt`]), how many
+    /// of `ready` have had the units their front end applies built (its proc macros and build
+    /// scripts' runs, [`applied_units`]) before anything reads it.
+    applied: usize,
+    /// While such a view builds those units, the span naming what the job's answer waits
+    /// for: the work, the view and its proc macros (every-wait-says-what). Closed as that
+    /// build ends ([`Jobs::applied`]); its build is one of the job's own plane request.
+    applying: Option<tracing::Span>,
     /// It put into the shared std store: flushed once it ends, for the other daemons.
     shared: bool,
     /// Its runs of user code that have not ended.
@@ -1209,6 +1316,86 @@ struct Lowering {
     on: Option<NodeId>,
     span: tracing::Span,
 }
+
+/// The jobs a client waits on, each with its stage and what it waits on there
+/// ([`Jobs::waited_on`]): what a stall names when no plane task of the build runs.
+pub struct WaitedOn<'a, S: Steps>(&'a Jobs<S>);
+
+impl<S: Steps> std::fmt::Display for WaitedOn<'_, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let jobs = self.0;
+        let waited = jobs.order.iter().filter_map(|id| Some((*id, jobs.jobs.get(key_of(*id))?))).filter(|(_, it)| !it.idle);
+        let count = waited.clone().count();
+        if count == 0 && jobs.asked.is_empty() {
+            return f.write_str("no job is under way");
+        }
+        write!(f, "{count} jobs under way")?;
+        if !jobs.asked.is_empty() {
+            write!(f, " and {} asked and not yet taken", jobs.asked.len())?;
+        }
+        for (at, (id, job)) in waited.enumerate() {
+            if at == JOBS_NAMED {
+                return write!(f, "; and {} more", count - at);
+            }
+            write!(f, "; job {id} ")?;
+            match &job.stage {
+                Stage::Library(node) => write!(f, "waits for the toolchain's library, node {}", node.0)?,
+                Stage::Plan(node, _) => write!(f, "waits for its plan, node {}", node.0)?,
+                Stage::Fetch(fetching) => write!(
+                    f,
+                    "waits for {} of its {} fetches, nodes from {}",
+                    fetching.left,
+                    fetching.fetches.len(),
+                    fetching.first.0
+                )?,
+                Stage::Lower(node, _, _) => write!(f, "waits for its lowering, node {}", node.0)?,
+                Stage::Units(build) => write!(f, "builds {} units, nodes from {}", build.units.len(), build.first.0)?,
+                Stage::Answer(node) => write!(f, "waits for its answer, node {}", node.0)?,
+                Stage::Ahead(node) => write!(f, "waits for the units to build ahead, node {}", node.0)?,
+                Stage::Runs(_) => f.write_str("runs its tests or its run")?,
+                Stage::Snapshot { ticket, .. } => write!(
+                    f,
+                    "waits for its snapshot's commit ({})",
+                    if ticket.is_some() { "the VFS's heads" } else { "the store's puts" }
+                )?,
+                Stage::Over => f.write_str("is over and waits to end")?,
+            }
+            match job.request {
+                Some(request) => write!(f, " (plane request {}", request.0)?,
+                None => f.write_str(" (no plane request")?,
+            }
+            if job.finished {
+                f.write_str(", finished")?;
+            }
+            if job.runs > 0 {
+                write!(f, ", {} runs of user code going", job.runs)?;
+            }
+            if job.placing > 0 {
+                write!(f, ", {} placements in flight", job.placing)?;
+            }
+            if !job.held.is_empty() {
+                write!(f, ", {} build script runs held for their programs", job.held.len())?;
+            }
+            if job.awaiting.is_some() {
+                f.write_str(", waiting for a look of the shared std store")?;
+            }
+            if job.storing.is_some() {
+                f.write_str(", its front end being stored")?;
+            }
+            if job.durable_since.is_some() {
+                f.write_str(", waiting for its puts to be durable")?;
+            }
+            if let Some((ok, _)) = &job.over {
+                write!(f, ", its outcome said ({})", if *ok { "ok" } else { "failed" })?;
+            }
+            f.write_str(")")?;
+        }
+        Ok(())
+    }
+}
+
+/// How many jobs a stall's report names one by one.
+const JOBS_NAMED: usize = 16;
 
 /// A lowering held for its root's kept front end to be stored, as a stall names it.
 #[derive(Debug)]
@@ -1603,7 +1790,12 @@ struct Run<S: Steps> {
 const _: () = assert!(std::mem::size_of::<JobId>() == 8);
 const _: () = assert!(std::mem::size_of::<Own>() <= 52);
 const _: () = assert!(std::mem::size_of::<Placing>() == 48);
-const _: () = assert!(std::mem::size_of::<Run<super::unit::Real>>() == 32);
+// The job, the node and `killed` (17 bytes) and a box, padded to its alignment: 32 bytes on a
+// 64-bit target.
+const _: () = assert!(
+    std::mem::size_of::<Run<super::unit::Real>>()
+        == (17 + size_of::<usize>()).next_multiple_of(align_of::<Run<super::unit::Real>>())
+);
 
 /// Whose each batch of nodes is, sorted by first id, a column each: the search reads `firsts`
 /// alone, O(log batches) with nothing kept per node.
@@ -1792,6 +1984,27 @@ impl<S: Steps> Jobs<S> {
         self.jobs.is_empty() && self.asked.is_empty()
     }
 
+    /// How many jobs a client waits on whose wait has no bound of its own: every job but a
+    /// speculative one not promoted (nothing waits on it) and one waiting for its puts to be
+    /// durable (which fails itself at [`DURABLE_WITHIN`]), with what was asked and not yet
+    /// taken. Work under way whether or not the plane runs a task of it, so a job left with
+    /// nothing that can move it (a node that never settles, a wait no completion ends) is a
+    /// stall the watchdog says, never a hang.
+    pub fn under_way(&self) -> usize {
+        self.asked.len() + self.jobs.values().filter(|job| !job.idle && job.durable_since.is_none()).count()
+    }
+
+    /// Whether a run of user code (a build script, a test, a run) of any job has not ended:
+    /// work under way though nothing of the build moves meanwhile.
+    pub fn runs_live(&self) -> bool {
+        self.jobs.values().any(|job| job.runs > 0)
+    }
+
+    /// The jobs a client waits on and what each waits on, as a stall says them.
+    pub fn waited_on(&self) -> WaitedOn<'_, S> {
+        WaitedOn(self)
+    }
+
     /// The database of the first root's front end kept now, whose library parses the next
     /// image stores ([`Parts::front`]); `None` while no front end is kept.
     pub fn front_db(&self) -> Option<&base_db::Db> {
@@ -1868,6 +2081,8 @@ impl<S: Steps> Jobs<S> {
             held: Vec::new(), // alloc: none until a run waits for its program
             look: 0,
             awaiting: None,
+            applied: 0,
+            applying: None,
             shared: false,
             runs: 0,
             durable: blaze_cas::Tickets::default(),
@@ -1981,6 +2196,7 @@ impl<S: Steps> Jobs<S> {
             library,
             std: self.setup.std.clone(), // clone: the config owns it, once per view
             builds: self.setup.builds.clone(), // clone: the config owns it, once per view
+            sources: self.setup.sources.clone(), // clone: the config owns it, once per view
         };
         let encoded = config.encode();
         let key = Hasher::new("blaze v2 serve last plan").id(&opened.view.root).part(&encoded).finish();
@@ -2110,6 +2326,20 @@ impl<S: Steps> Jobs<S> {
             while let Some(broke) = build.writer.broke() {
                 let error = build.refuse_after(&broke);
                 first.get_or_insert_with(|| error.what.clone()); // clone: an error, once
+                // A write that was part of making its unit (its harness or wasm macro glue)
+                // fails that unit: said as the unit's own error, as its compile's would be,
+                // so every unit refused this way is named, not only the job's first, and
+                // which one the build names never hangs on which became ready first.
+                if broke.itself {
+                    if !job.cancelled.load(Ordering::Acquire) {
+                        let what = format!("blaze could not make this unit: {}", error.what); // alloc: an error, once
+                        w.said.push(Said::Report(id, Response::Diagnostic(build.front.refused(broke.unit, what))));
+                        if let Some(unit) = unit_of(&build.input.units, broke.unit) {
+                            w.said.push(Said::Report(id, Response::UnitEnded(unit)));
+                        }
+                    }
+                    continue;
+                }
                 if !job.cancelled.load(Ordering::Acquire) {
                     job.over.get_or_insert((false, Some(error)));
                 }
@@ -2302,8 +2532,41 @@ impl<S: Steps> Jobs<S> {
             self.stored_kept(w, id, why);
             return;
         }
+        // A node of a build of the units a view's front end applies, made in the job's plane
+        // request, which stays open: the build ends as its last node settles, counted even once
+        // the job is over (something of it failed with the request still open), so that end is
+        // never left waiting for a finish the request can't give.
+        if let Stage::Units(build) = &mut job.stage
+            && build.unit(node).is_some()
+            && let Some(applying) = build.applying.as_mut()
+        {
+            applying.left = applying.left.saturating_sub(1);
+            applying.failed |= !ok;
+            if applying.left == 0 {
+                let ok = !applying.failed && job.over.is_none();
+                self.units_applied(w, id, ok);
+            }
+            return;
+        }
         if job.over.is_some() {
             job.take_value(node);
+            // A fetch that settles after another failed is still counted: once the last one
+            // settles the job ends with the failure. Left uncounted, a job whose fetches all
+            // failed (every one, in a blaze built without `net`) sat in its fetch stage with
+            // each fetch settled and nothing to move it, an idle engine that said nothing
+            // (lane seedmem, 2026-11-02).
+            let fetched = match &mut job.stage {
+                Stage::Fetch(fetching) if (node.0.wrapping_sub(fetching.first.0) as usize) < fetching.fetches.len() => {
+                    fetching.left -= 1;
+                    fetching.left == 0
+                }
+                _ => false,
+            };
+            if fetched {
+                job.stage = Stage::Over;
+                let error = job.over.take().and_then(|(_, error)| error);
+                self.end(w, id, false, error);
+            }
             return;
         }
         let why = why.unwrap_or_default();
@@ -2752,6 +3015,38 @@ impl<S: Steps> Jobs<S> {
     /// The next view to make ready, or the work once all are.
     fn next(&mut self, w: &mut World<'_, S>, id: JobId) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        // A job that reads a view's front end without building its units ([`reads_front_unbuilt`])
+        // first builds, once the view is lowered, the units that front end applies (its proc
+        // macros, whose expanders it is given, and its build scripts' runs, whose cfgs, env
+        // and `OUT_DIR` it is given; a lowering applies neither), through the same unit graph
+        // as a check (their records shared with one) and in the job's own plane request; only
+        // then is its next view made ready or its answer posted. The checks in the answers
+        // themselves (`unit::answer_macros_built`) stay as the backstop.
+        if reads_front_unbuilt(&job.work)
+            && job.applied < job.ready.len()
+            && let Some(view) = job.ready.last()
+        {
+            job.applied = job.ready.len();
+            let picked = applied_units(&view.input.units.graph.units);
+            if !picked.is_empty() {
+                let which = match (job.views.len(), job.applied) {
+                    (2, 1) => "from",
+                    (2, _) => "to",
+                    _ => "its view",
+                };
+                job.applying = Some(tracing::info_span!(
+                    target: "blaze",
+                    "the answer waits for the proc macros and build scripts its view applies",
+                    work = work_word(&job.work),
+                    view = which,
+                    root = %view.input.config.invocation.root,
+                    proc_macros = %macro_names(&view.input.units, &picked),
+                    units = picked.len(),
+                ));
+                self.build(w, id, Some(&picked));
+                return;
+            }
+        }
         if job.ready.len() < job.views.len() {
             self.prepare(w, id);
             return;
@@ -2795,6 +3090,9 @@ impl<S: Steps> Jobs<S> {
             return;
         };
         let cancelled = job.cancelled.clone(); // clone: a refcount, once per build
+        // A build of the units a view's front end applies ([`Jobs::next`]): the job's plane
+        // request stays open after it.
+        let applying = job.applying.is_some();
         let all = &input.units.graph.units;
         let picked = match picked {
             None => None,
@@ -2961,9 +3259,18 @@ impl<S: Steps> Jobs<S> {
             evaluation,
             refused: None,
             fresh: fresh_units,
+            applying: applying.then_some(Applying { left: count, failed: false }),
         }));
         if count > 0 {
             self.add(w, id, nodes, Some(work), true);
+        }
+        if applying {
+            // Its end is its last node's settling ([`Jobs::settled`]); a build of nothing has
+            // ended already.
+            if count == 0 {
+                self.units_applied(w, id, true);
+            }
+            return;
         }
         match select {
             Some((fresh, work)) => self.add(w, id, fresh, Some(work), true),
@@ -3606,6 +3913,8 @@ impl<S: Steps> Jobs<S> {
             (false, true) => profile_history::Outcome::Ok,
             (false, false) => profile_history::Outcome::Failed,
         };
+        #[cfg(test)]
+        ENDED_ROWS.with_borrow_mut(|it| it.push(command_line(&job.work))); // alloc: a test's record
         self.rows.push(job.ended(request, Some(stats), outcome));
         w.macros.flush();
         // The snapshot waits on the last ticket; a verdict the store refuses fails the job.
@@ -3631,6 +3940,23 @@ impl<S: Steps> Jobs<S> {
         let ok = ok && job.over.is_none();
         let runs = ok && matches!(job.work, Work::Test { ub: None, .. } | Work::Run { .. });
         let pack = ok && matches!(job.work, Work::Pack { .. } | Work::Doc { .. });
+        if let Stage::Units(build) = &job.stage
+            && build.applying.is_some()
+        {
+            // That build's request is left open until the job's answer is posted: a finish
+            // while it runs is a request closed or let go out of turn.
+            let root = &build.input.config.invocation.root;
+            // alloc: an error, once
+            let what = format!(
+                "the plane finished request {} of {} on {root} while its view still built the proc macros and build \
+                 scripts its front end applies, in that request",
+                request.0,
+                work_word(&job.work)
+            );
+            let error = ApiError::new(what, Some(root.clone())); // clone: an error, once
+            self.end(w, id, false, Some(error));
+            return;
+        }
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
         let Build { input, front, mut writer, artifacts, evaluation, root, units, .. } = *build;
         match writer.finished(ok, &units) {
@@ -3744,6 +4070,70 @@ impl<S: Steps> Jobs<S> {
                 }
             }
         }
+    }
+
+    /// The build of the units a view's front end applies ended ([`Jobs::next`]), `ok` whether
+    /// every one of them built: what its front end found wrong once all of it ran said, and the
+    /// view handed to [`Jobs::applied`].
+    fn units_applied(&mut self, w: &mut World<'_, S>, id: JobId, ok: bool) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
+        let Build { input, front, mut writer, root, units, .. } = *build;
+        match writer.finished(ok, &units) {
+            Ok(warnings) => {
+                for warning in warnings {
+                    w.said.push(Said::Report(id, Response::Diagnostic(warning)));
+                }
+            }
+            Err(error) => {
+                self.end(w, id, false, Some(error));
+                return;
+            }
+        }
+        self.applied(w, id, ok, Ready { input, root, front: Some(front), writer: Some(writer) });
+    }
+
+    /// A view `ready` with the units its front end applies built ([`Jobs::next`]), `ok` whether
+    /// all of them did: the wait's span closed, every write they asked for applied, and the view
+    /// ready again, the job going on, in the same plane request, to its next view or its answer.
+    /// A unit that did not build, or a write of one that did not apply, fails the job naming the
+    /// view: its answer would read what a macro that never ran left out, or a crate without its
+    /// build script's output.
+    fn applied(&mut self, w: &mut World<'_, S>, id: JobId, ok: bool, mut ready: Ready<S>) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        job.applying = None;
+        let work = work_word(&job.work);
+        let root = &ready.input.config.invocation.root;
+        let refused = |why: String| {
+            // alloc: an error, once
+            let what = format!(
+                "the {work}'s answer on the view of {root} can't be told: the proc macros and build scripts its \
+                 front end applies {why}"
+            );
+            ApiError::new(what, Some(root.clone())) // clone: an error, once
+        };
+        let error = match ready.writer.as_mut() {
+            _ if !ok => Some(refused("did not all build".to_owned())), // alloc: an error, once
+            None => Some(refused("were built with no writer of it".to_owned())), // alloc: an error, once
+            Some(writer) => match writer.apply() {
+                Err(error) => Some(refused(format!("did not apply: {}", error.what))),
+                Ok(false) => Some(refused("were built, and a reader of it outlived the build".to_owned())), // alloc: an error, once
+                Ok(true) => writer.broke().map(|broke| {
+                    let unit = match ready.input.units.graph.units.get(broke.unit) {
+                        Some(unit) => format!("{} of {}", unit.target.name, unit.pkg_id),
+                        None => format!("unit {}", broke.unit),
+                    };
+                    refused(format!("did not apply: {} of {unit}: {}", broke.what, broke.how))
+                }),
+            },
+        };
+        if let Some(error) = error {
+            self.end(w, id, false, Some(error));
+            return;
+        }
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        job.ready.push(ready);
+        self.next(w, id);
     }
 
     /// [`Work::Pack`]'s or [`Work::Doc`]'s check built: the pack or the documentation made by
@@ -3878,7 +4268,10 @@ impl<S: Steps> Jobs<S> {
             .iter()
             .copied()
             .filter(|id| {
-                jobs.get(key_of(*id)).is_some_and(|it| (it.request.is_some() && !it.finished) || it.storing.is_some())
+                // Any job a client waits on, with a plane request open or not: one a stall
+                // found with no task to run is ended too, never left waiting.
+                jobs.get(key_of(*id))
+                    .is_some_and(|it| !it.idle || (it.request.is_some() && !it.finished) || it.storing.is_some())
             })
             .collect(); // alloc: once a stall
         for id in stalled {
@@ -4415,6 +4808,7 @@ fn unit_of(units: &Units, at: usize) -> Option<UnitOf> {
     Some(UnitOf {
         id: u32::try_from(at).ok()?,
         test: matches!(unit.mode, UnitMode::Test) || (matches!(unit.mode, UnitMode::Check) && unit.checked_as_test),
+        doctest: matches!(unit.mode, UnitMode::Doctest),
         package_id: unit.pkg_id.clone(),               // clone: the report owns it, once per unit
         manifest_path: package.manifest_path.clone(), // clone: the report owns it, once per unit
         target: super::unit::unit_target(unit).ok()?,

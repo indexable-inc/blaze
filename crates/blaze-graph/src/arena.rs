@@ -66,11 +66,21 @@ thread_local! {
     static EXIT: Exit = const { Exit };
 }
 
+/// [`LOCAL`]'s one reader. Not inlined: the allocator counts through it from a job's code,
+/// which may wait and resume on another thread, and an inlined read would let the job keep
+/// the first thread's `Local` across the wait and count into it from the second, a data race
+/// on its cells (rule 24, as pool.rs's caches were in checkpoint 36). One direct call per
+/// allocation.
+#[inline(never)]
+fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
+    LOCAL.with(f)
+}
+
 struct Exit;
 
 impl Drop for Exit {
     fn drop(&mut self) {
-        LOCAL.with(exit_flush);
+        with_local(exit_flush);
     }
 }
 
@@ -97,7 +107,7 @@ fn add(local: &Local, bytes: i64) {
 /// atomic add is in [`flush`], once per [`BATCH`] bytes of drift.
 #[inline(always)]
 fn count(delta: i64) {
-    LOCAL.with(|local| {
+    with_local(|local| {
         let net = local.net.get().wrapping_add(delta);
         local.net.set(net);
         if net > local.peak.get() {
@@ -198,16 +208,16 @@ pub fn measure<R>(f: impl FnOnce() -> R) -> (R, u64) {
     impl Drop for Restore {
         // On a panic too: the outer measure still sees what `f` held.
         fn drop(&mut self) {
-            LOCAL.with(|local| local.peak.set(self.outer.max(local.peak.get())));
+            with_local(|local| local.peak.set(self.outer.max(local.peak.get())));
         }
     }
-    let (base, outer) = LOCAL.with(|local| {
+    let (base, outer) = with_local(|local| {
         let base = local.net.get();
         (base, local.peak.replace(base))
     });
     let restore = Restore { outer };
     let result = f();
-    let peak = LOCAL.with(|local| local.peak.get());
+    let peak = with_local(|local| local.peak.get());
     drop(restore);
     (result, u64::try_from(peak.saturating_sub(base)).unwrap_or(0))
 }
@@ -216,7 +226,7 @@ pub fn measure<R>(f: impl FnOnce() -> R) -> (R, u64) {
 /// allocator. One load: exact for what the calling thread did, within [`BATCH`] for each other
 /// thread.
 pub fn held() -> u64 {
-    let own = LOCAL.with(|local| local.unflushed.get());
+    let own = with_local(|local| local.unflushed.get());
     u64::try_from(HELD.0.load(Ordering::Relaxed).wrapping_add(own)).unwrap_or(0)
 }
 

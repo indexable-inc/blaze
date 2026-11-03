@@ -526,8 +526,10 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         }
 
         let crate_name = unit.target.name.replace('-', "_");
-        // clone: each plan owns its flags (`UnitPlan`), made once per package.
-        let (lints, check_cfg) = (package.lints.clone(), package.check_cfg.clone());
+        // clone: each plan owns its flags (`UnitPlan`), made once per package. A library's
+        // `[lints]` are its own code's: rustdoc builds none of its examples with them.
+        let lints = if it.mode == CompileMode::Doctest { Vec::new() } else { package.lints.clone() };
+        let check_cfg = package.check_cfg.clone();
 
         let out_dir = unit
             .dependencies
@@ -607,7 +609,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             links,
             unsandboxed,
             runner: match it.mode {
-                CompileMode::Test => runners[it.kind].clone(),
+                CompileMode::Test | CompileMode::Doctest => runners[it.kind].clone(),
                 CompileMode::Build if it.target_kind.is_executable() => runners[it.kind].clone(),
                 _ => Vec::new(),
             },

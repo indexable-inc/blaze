@@ -130,6 +130,10 @@ fn pool<G>() -> Pool<G> {
         .unwrap_or_else(|error| panic!("the trait solver's cache: {error}"))
 }
 
+/// How many generations past their grace a `replace` takes out of its table's limbo, to drop
+/// once it has let go of the lock: more than the one it retires, so the limbo drains.
+const PASSED: usize = 64;
+
 /// A slot and the generation it was seen to hold.
 type Held<K, S, T> = (usize, *mut Generation<K, S, T>);
 
@@ -346,22 +350,26 @@ where
                 .map(|won| &won.value));
         }
         self.hints[at].store(hint, Ordering::Release);
-        if let Some(held) = NonNull::new(held) {
+        let passed = NonNull::new(held).map(|held| {
             // SAFETY: every generation in a slot was published from `into_raw` of this table's
             // pool, and the swap above unlinked `held`: one swap alone can, so this is the one
-            // place that takes it back; the limbo drops it only after every task that may have
-            // loaded it has ended.
+            // place that takes it back; the limbo lets it go only after every task that may
+            // have loaded it has ended.
             slots.limbo.retire(unsafe { Pooled::from_raw(self.pool, held) });
-            // alloc: `Limbo::collect` gives slots back to the pool; it is not an iterator's.
-            slots.limbo.collect();
-        }
+            slots.limbo.take_passed::<PASSED>()
+        });
         drop(slots);
+        // The generations past their grace are dropped with the lock let go: a crate's cache is
+        // hundreds of megabytes of maps, and every other thread's first use of a scope waits on
+        // the lock (`a_retired_generation_is_dropped_outside_the_tables_lock`).
+        drop(passed);
         // SAFETY: published above; dropped only by the limbo, after the caller's guard is
         // dropped (see `of`).
         Ok(unsafe { &(*made.as_ptr()).value })
     }
 
-    /// Unlinks every generation.
+    /// Unlinks every generation, and drops those past their grace with the lock let go, as
+    /// `replace` does.
     fn clear(&self) {
         let mut slots = self.slots.lock();
         for (hint, slot) in self.hints.iter().zip(&self.generations) {
@@ -371,8 +379,16 @@ where
                 slots.limbo.retire(unsafe { Pooled::from_raw(self.pool, held) });
             }
         }
-        // alloc: `Limbo::collect` gives slots back to the pool; it is not an iterator's.
-        slots.limbo.collect();
+        drop(slots);
+        // Each batch taken moves the limbo's head past it, so this ends once the limbo holds
+        // none past its grace: at most its length over `PASSED` rounds.
+        loop {
+            let passed = self.slots.lock().limbo.take_passed::<PASSED>();
+            if passed.is_empty() {
+                break;
+            }
+            drop(passed);
+        }
     }
 }
 
@@ -765,6 +781,80 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(MARKED_DROPPED.load(Ordering::Relaxed), 1);
+    }
+
+    /// Once armed, its drop waits for another thread to make a value of its table: what a
+    /// crate's solver cache, hundreds of megabytes of maps, makes every other thread do while
+    /// it drops.
+    #[derive(Default)]
+    struct SlowDrop(std::sync::atomic::AtomicBool);
+
+    static SLOW_DROPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static SLOW_OTHER_MADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Rounds a wait of this test yields before it gives up: under the bound of the table's
+    /// spin lock (`blaze_spin`'s `1 << 24`), so a drop under the lock fails here, naming it,
+    /// before the waiter's spin panics.
+    const SLOW_ROUNDS: u32 = 1 << 22;
+
+    /// Yields until `done`, at most `SLOW_ROUNDS` rounds; whether it was.
+    fn yield_until(done: impl Fn() -> bool) -> bool {
+        for _ in 0..SLOW_ROUNDS {
+            if done() {
+                return true;
+            }
+            thread::yield_now();
+        }
+        done()
+    }
+
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            if !self.0.load(Ordering::Relaxed) {
+                return;
+            }
+            SLOW_DROPPING.store(true, Ordering::Release);
+            assert!(
+                yield_until(|| SLOW_OTHER_MADE.load(Ordering::Acquire)),
+                "a retired generation was dropped under the table's lock: another thread's first \
+                 use of a key waited on the drop"
+            );
+        }
+    }
+
+    /// The selfbuild2 test run's panic (`a wait for a SpinLock ... spun and yielded 16777216
+    /// rounds`, making tokio-macros): a new revision retires every crate's shared cache, and
+    /// the replace that found them past their grace dropped them all under the table's spin
+    /// lock, while every other thread's first use of a scope spun on it.
+    #[test]
+    fn a_retired_generation_is_dropped_outside_the_tables_lock() {
+        let table = table::<SlowDrop>(4);
+        let (dropped, other) = (key(), key());
+        {
+            let task = blaze_reclaim::enter();
+            table.of(&task, dropped, 0).0.store(true, Ordering::Relaxed);
+        }
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                assert!(yield_until(|| SLOW_DROPPING.load(Ordering::Acquire)), "the armed value was never dropped");
+                let task = blaze_reclaim::enter();
+                table.of(&task, other, 0);
+                SLOW_OTHER_MADE.store(true, Ordering::Release);
+            });
+            // Each state retires the last one's generation and drops those past their grace:
+            // the armed one, once no task of when it was retired is left (other tests' tasks
+            // may hold it a while).
+            for state in 1..10_000 {
+                if SLOW_DROPPING.load(Ordering::Acquire) {
+                    break;
+                }
+                let task = blaze_reclaim::enter();
+                table.of(&task, dropped, state);
+                drop(task);
+                thread::yield_now();
+            }
+        });
+        assert!(SLOW_OTHER_MADE.load(Ordering::Acquire));
     }
 
     /// The cache before the table: per thread, the last `KEPT` queries' goals, all dropped

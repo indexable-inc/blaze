@@ -60,7 +60,7 @@ blaze-profile.workspace = true
 ix-prof.workspace = true
 regex.workspace = true
 # `blaze explore`: the explorer's server, started in the daemon on the first request for it.
-blaze-explore.workspace = true
+blaze-explore = { workspace = true, optional = true }
 # The record batches of `blaze debug sql`, encoded in the daemon and printed by the CLI.
 arrow-array.workspace = true
 blaze-inproc.workspace = true
@@ -82,7 +82,9 @@ blaze-build-script.workspace = true
 paths.workspace = true
 syntax.workspace = true
 stdx.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "fs", "io-util", "signal", "sync", "time"] }
+# The toolchain's downloads (`toolchain.rs`): a current-thread runtime, its timers and channels,
+# each a feature tokio has on wasm too, so the seed builds the same.
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 futures-util = { workspace = true, features = ["std"] }
 url.workspace = true
 semver.workspace = true
@@ -92,7 +94,6 @@ tar = { workspace = true, features = ["default"] }
 zip = { workspace = true, features = ["deflate-flate2"] }
 # The `.tar.gz` files build scripts download (FFmpeg's source, `cargo/fetches.rs`).
 flate2 = { workspace = true, features = ["default"] }
-zstd = { workspace = true, features = ["default"] }
 # The `.tar.xz` files of blaze's own toolchain (`cargo/toolchain/own.rs`): in Rust, within 1.3x
 # of liblzma's time on rustc's 84 MB.
 lzma-rust2 = { workspace = true, features = ["std", "xz", "optimization"] }
@@ -112,16 +113,16 @@ blaze-usercode.workspace = true
 blaze-codegen.workspace = true
 blaze-store-check.workspace = true
 blaze-testsel.workspace = true
-blaze-lazy.workspace = true
+blaze-lazy = { workspace = true, features = ["daemon"] }
 blaze-link.workspace = true
 blaze-lower.workspace = true
 base-db.workspace = true
 crossbeam-channel.workspace = true
 crossbeam-queue.workspace = true
-# `cli/live.rs`: `blaze test`'s live view on a terminal, through crossterm.
-ratatui = { workspace = true, features = ["crossterm"] }
+# `cli/live.rs`: `blaze test`'s live view on a terminal, through crossterm with `tui`.
+ratatui.workspace = true
 # `extended`: the `mi_collect` binding.
-libmimalloc-sys = { workspace = true, features = ["extended"] }
+libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -142,8 +143,28 @@ uds_windows.workspace = true
 windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_System_Console"] }
 
 [features]
+default = ["llvm-stencils", "net", "explore", "mimalloc", "tui", "daemon", "pprof"]
+# The seed profile (todo/bootstrap/plan.md, "The seed has no C") is this crate with none of
+# these: each is a C, C++ or assembly dependency.
+# blaze-stencil's stencils made by LLVM at build time.
+llvm-stencils = ["hir-ty-codegen/llvm-stencils", "blaze-lazy/llvm-stencils", "blaze-link/llvm-stencils"]
+# Fetching over HTTPS (rustls on ring) and the global cache's client.
+net = ["blaze-registry/net", "blaze-global/net"]
+# `blaze explore` and `blaze debug sql`'s Arrow IPC (blaze-explore, on Flecs and wtransport).
+explore = ["dep:blaze-explore"]
+# The process's allocator is mimalloc: `raw::memory::purge_freed_pages` asks it.
+mimalloc = ["dep:libmimalloc-sys"]
+# `blaze test`'s live view drawn on the terminal through crossterm (`cli/live.rs`); without it a
+# run that would draw it is refused, naming this feature. Not C, but crossterm has no wasm32.
+tui = ["ratatui/crossterm"]
 # Profile jemalloc's heap and count its live bytes: see `memory.rs`. Not on Windows.
 heap-profile = ["dep:tikv-jemalloc-ctl", "tikv-jemalloc-sys/profiling"]
+# `blaze serve`, its socket (`socket.rs`) and the CLI's client of it (`cli/daemon.rs`). Without
+# it (the seed) each command runs the same engine in its own process for its one request and
+# exits (`serve/once.rs`), and `blaze serve`, `stop`, `status` and `units` are refused, naming it.
+daemon = []
+# `blaze pprof` (`cli/pprof.rs`), Unix-only in places; without it the command is refused, naming it.
+pprof = []
 
 # Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm` or a profile's `opt-level`.
 llvm = ["hir-ty-codegen/llvm"]

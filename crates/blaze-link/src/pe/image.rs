@@ -39,11 +39,11 @@ use smallvec::SmallVec;
 use super::coff::ImportName;
 use super::{
     DEBUG, EDATA, GRANULE, IDATA, OBJ_PDATA, PAGE, PDATA, Pe, RELOC, RSRC, START_HOOK, Segment, TLS_DIR, TLS_INDEX,
-    error, place, zeroed,
+    error, place,
 };
 use crate::cow::CowBytes;
 use crate::model::{
-    Class, Counts, Delta, Export, File, Function, Holds, Pages, Placed, Prot, Region, SymbolKind, View, WindowsUnwind,
+    Class, Counts, Delta, Export, File, Function, Holds, Pages, Placed, Prot, Region, SymbolKind, View, WindowsUnwind, zeroed,
 };
 use crate::{LinkError, OutputKind};
 

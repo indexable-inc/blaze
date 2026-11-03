@@ -32,7 +32,7 @@ use smallvec::SmallVec;
 
 use crate::{
     dispatch::{Cx, Instance, Target, Unseen, concrete_args, sites},
-    root::{roots, send_trait},
+    root::{MissingRoot, roots, send_trait},
     summary::{owner_of, path, summary, suspends},
 };
 
@@ -95,9 +95,57 @@ pub struct Broken {
 pub struct Found {
     pub held: Box<[Held]>,
     pub broken: Box<[Broken]>,
-    /// The crate graph parks fibers but has no `core::marker::Send`: nothing was checked, an
-    /// error of its own.
-    pub no_send: bool,
+    /// Why nothing was checked although the crate graph has `blaze_graph`: an error of its own.
+    pub unchecked: Option<Unchecked>,
+}
+
+/// Why the check of a crate graph that has `blaze_graph` checks nothing: an error, never an
+/// empty walk. [`unchecked`] says it, and every reader of the walk (this crate's
+/// [`suspend_check`], blaze-lints' fiber lints) refuses on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Unchecked {
+    /// A `blaze_graph` without its stack layer's `Yielder::suspend`, the root.
+    MissingRoot(MissingRoot),
+    /// The graph parks fibers but has no `core::marker::Send` to hold what lives across a park
+    /// to.
+    NoSend,
+}
+
+impl Unchecked {
+    /// The error as said to a person, naming the crate whose check it stops (and, for
+    /// [`Unchecked::MissingRoot`], which `blaze_graph`).
+    pub fn said(&self, db: &Db, krate: Crate) -> String {
+        let name = crate_said(db, krate);
+        match self {
+            // alloc: an error's message, once
+            Unchecked::MissingRoot(missing) => format!("{}; the check of {name} stops", missing.said(db)),
+            // alloc: as above
+            Unchecked::NoSend => format!(
+                "the crate graph of {name} parks fibers (it has `blaze_graph::sched::stack::Yielder::suspend`) but has no `core::marker::Send`: the may-suspend check can't say what may be held across a park, so it checks nothing and stops"
+            ),
+        }
+    }
+}
+
+/// `krate` as an error names it: its name and, when it has one, its version.
+fn crate_said(db: &Db, krate: Crate) -> String {
+    let extra = krate.extra_data(db);
+    let name = extra.display_name.as_ref().map(|it| it.crate_name().as_str());
+    match (name, &extra.version) {
+        (Some(name), Some(version)) => format!("`{name}` {version}"), // alloc: an error's name, once
+        (Some(name), None) => format!("`{name}`"),                    // alloc: as above
+        (None, _) => format!("the unnamed crate {krate:?}"),          // alloc: as above
+    }
+}
+
+/// Why `krate`'s crate graph goes unchecked although it has `blaze_graph`; `None` when it is
+/// checked, or has no `blaze_graph`, so nothing in it parks a fiber.
+pub fn unchecked(db: &Db, krate: Crate) -> Option<Unchecked> {
+    let roots = roots(db, krate);
+    if let Some(missing) = roots.missing {
+        return Some(Unchecked::MissingRoot(missing));
+    }
+    (!roots.found.is_empty() && send_trait(db, krate).is_none()).then_some(Unchecked::NoSend)
 }
 
 impl Held {
@@ -161,7 +209,7 @@ fn env_of(krate: Crate) -> StoredParamEnvAndCrate {
 
 #[blaze_query::tracked(returns(ref))]
 fn walk(db: &Db, krate: Crate) -> Walk {
-    if roots(db, krate).is_empty() || send_trait(db, krate).is_none() {
+    if roots(db, krate).found.is_empty() || send_trait(db, krate).is_none() {
         return Walk::default();
     }
     let env = env_of(krate);
@@ -194,14 +242,14 @@ fn walk(db: &Db, krate: Crate) -> Walk {
 }
 
 /// What the check finds in `krate`: nothing, and nothing walked, when its crate graph has no
-/// root.
+/// `blaze_graph`; the error [`Found::unchecked`] when it has one it can't check from.
 #[blaze_query::tracked(returns(ref))]
 pub fn suspend_check(db: &Db, krate: Crate) -> Found {
-    if roots(db, krate).is_empty() {
-        return Found::default();
+    if let Some(unchecked) = unchecked(db, krate) {
+        return Found { unchecked: Some(unchecked), ..Found::default() };
     }
-    if send_trait(db, krate).is_none() {
-        return Found { no_send: true, ..Found::default() };
+    if roots(db, krate).found.is_empty() {
+        return Found::default();
     }
     let env = env_of(krate);
     let mut held: Vec<Held> = Vec::new();
@@ -232,7 +280,7 @@ pub fn suspend_check(db: &Db, krate: Crate) -> Found {
             }
         }
     }
-    Found { held: held.into_boxed_slice(), broken: broken.into_boxed_slice(), no_send: false }
+    Found { held: held.into_boxed_slice(), broken: broken.into_boxed_slice(), unchecked: None }
 }
 
 /// Every call in `owner`'s body (its closures' and `async` blocks' included) that may park the

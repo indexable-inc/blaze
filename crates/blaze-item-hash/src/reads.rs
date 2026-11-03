@@ -402,7 +402,7 @@ fn apply(
             Some(krate) => match other {
                 Else::CrateRoot => Some(values::crate_root(db, krate)),
                 Else::WholeCrate => Some(whole_crate(db, krate)),
-                Else::Items => Goals.fact_of(db, read, name),
+                Else::Items => Goals.fact_of(db, Some(def.krate(db)), read, name),
             },
             None => None,
         },
@@ -411,7 +411,7 @@ fn apply(
         Rule::ModuleCrate => {
             arg::<ModuleId>(db, key).map(|module| whole_crate(db, module.krate(db)))
         }
-        Rule::Items => Goals.fact_of(db, read, name),
+        Rule::Items => Goals.fact_of(db, Some(def.krate(db)), read, name),
         Rule::Signature(of) => item_of(db, key, of).map(|item| signature(db, item)),
         Rule::Fields(of) => item_of(db, key, of).map(|item| values::fields(db, item)),
         Rule::Attrs(Of::Function) => {
@@ -434,7 +434,13 @@ fn apply(
                 object: FactObject::None,
             }),
         },
-        Rule::FactValue => arg::<FactRefKey<'_>>(db, key).map(|it| it.fact(db)),
+        // The body's value of the fact is its crate's (`Bodies::value`): a value another crate
+        // asked of which impls it sees may cover other crates. Any other fact is keyed by no
+        // asker (`goals::fact_ref_key`), its value one for every crate.
+        Rule::FactValue => match arg::<FactRefKey<'_>>(db, key) {
+            Some(it) if it.seen_by(db).is_none_or(|krate| krate == def.krate(db)) => Some(it.fact(db)),
+            _ => None,
+        },
         Rule::DepCrate(of) => match crate_of_args(db, key, of) {
             Some(krate) if krate == def.krate(db) => return Classified::Refused,
             krate => krate.map(|krate| whole_crate(db, krate)),

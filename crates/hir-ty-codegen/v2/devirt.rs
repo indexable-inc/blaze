@@ -8,17 +8,18 @@
 //! What makes an object's list of types closed: the program is an executable or a test (a
 //! `cdylib`'s every object is open: a program that loads it may make more), no code of a
 //! crate other than the library's names a dynamic loader (`dlopen`, `LoadLibrary`), no
-//! signature at the program's edge (a foreign function, or a definition with another ABI
-//! than Rust's) carries the object type, and every place that makes a vtable is visited: the
-//! walk's IR resolution makes each vtable the code of any reached instance or static can point
-//! to (`FunctionCx::vtable`), so its requests are all of them. An upcast hands the supertrait's
-//! object the subtrait's types, which may point to the subtrait's vtable (`Upcast::Same`), so
-//! the supertrait's list takes the subtrait's, and its openness.
+//! signature at the program's edge (a foreign function, a definition with another ABI than
+//! Rust's, or a static of an `extern` block) carries the object type, and every place that
+//! makes a vtable is visited: the walk's IR resolution makes each vtable the code of any
+//! reached instance or static can point to (`FunctionCx::vtable`), so its requests are all of
+//! them. An upcast hands the supertrait's object the subtrait's types, which may point to the
+//! subtrait's vtable (`Upcast::Same`), so the supertrait's list takes the subtrait's, and its
+//! openness.
 
 use std::alloc::Global;
 
 use base_db::{Crate, Db};
-use blaze_codegen::{CodegenError, InstanceKey, backend::FrontRef, plan::Origin};
+use blaze_codegen::{CodegenError, InstanceKey, Owner, backend::FrontRef, plan::Origin};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey};
 use hir_def::{CallableDefId, ItemContainerId, TraitId, signatures::TraitSignature};
@@ -52,8 +53,8 @@ pub(crate) struct Facts {
     pub(crate) vtables: Vec<(StoredTy, ObjectKey)>,
     /// The upcasts its IR makes, of the first object type to the second.
     pub(crate) upcasts: Vec<(ObjectKey, ObjectKey)>,
-    /// The object types a signature at the program's edge carries: code outside the program
-    /// may make or take them.
+    /// The object types a signature at the program's edge carries, or the type of a static
+    /// of an `extern` block it reads: code outside the program may make or take them.
     pub(crate) foreign: Vec<ObjectKey>,
 }
 
@@ -102,39 +103,68 @@ impl Facts {
 }
 
 /// The walk of an instance's body with the program's world (`refs::Walking`): `world` where
-/// `inlined` (only a body at MIR level 2 with the inliner on is devirtualized), the instance a
-/// function or closure of a crate other than the library's (whose bodies are one for every
-/// program), and its body calls through a `dyn` ([`has_sites`]); else the walk without one, so
-/// a body with nothing to devirtualize is walked and keyed as it is in every program.
+/// the body takes it ([`takes_world`]); else the walk without one, so a body with nothing to
+/// devirtualize is walked and keyed as it is in every program.
 pub(crate) fn walking(
     db: &Db,
     world: Option<DevirtWorld>,
     instance: &HirInstance,
     inlined: bool,
+    owner: impl FnOnce() -> Owner,
 ) -> Result<refs::Walking, String> {
     let plain = refs::Walking::plain(inlined);
-    let Some(world) = world.filter(|_| inlined) else { return Ok(plain) };
-    let Kind::Code(code, env) = &instance.0 else { return Ok(plain) };
-    let ours = matches!(code.def, InstanceDef::Fn(_) | InstanceDef::Closure(_))
-        && super::frontend::crate_of(db, &instance.0).is_some_and(|it| !it.data(db).origin.is_lang());
-    // clone: the query's keys by value, each a few `Copy` ids in a `Clone`-only type
-    match ours && has_sites(db, code.clone(), env.clone()).clone()? {
+    let Some(world) = world else { return Ok(plain) };
+    match takes_world(db, instance, inlined, owner)? {
         true => Ok(refs::Walking { inlined, world: Some(world) }),
         false => Ok(plain),
     }
 }
 
-/// Whether the body of `instance` as [`Build::WALK_INLINED`] builds it calls a trait method
-/// through a `dyn`: what `Devirtualize` looks at.
+/// Whether a body of `instance` is built against the program's world, the one rule for it:
+/// both what a walk takes ([`walking`]) and whether a program has a world to build at all
+/// ([`world_of`]). It is so when `inlined` (only a body at MIR level 2 with the inliner on is
+/// devirtualized), the instance is a function or closure of a crate other than the library's
+/// (whose bodies are one for every program), it is the workspace's (`owner`, asked only
+/// then: the dependency image's code is one for every program its dependencies build, and
+/// built against the world a call through a `dyn` made direct to the program's one type,
+/// hashbrown's `resize_inner` calling the `reserve_rehash` closure of a map keyed by a
+/// member's type, would refer to the workspace's code from the image; a build that links no
+/// image owns every crate but the library's), and its body calls through a `dyn`
+/// ([`has_sites`]).
+pub(crate) fn takes_world(
+    db: &Db,
+    instance: &HirInstance,
+    inlined: bool,
+    owner: impl FnOnce() -> Owner,
+) -> Result<bool, String> {
+    let Kind::Code(code, env) = &instance.0 else { return Ok(false) };
+    let ours = inlined
+        && matches!(code.def, InstanceDef::Fn(_) | InstanceDef::Closure(_))
+        && super::frontend::crate_of(db, &instance.0).is_some_and(|it| !it.data(db).origin.is_lang());
+    if !ours || owner() != Owner::Workspace {
+        return Ok(false);
+    }
+    // clone: the query's keys by value, each a few `Copy` ids in a `Clone`-only type
+    has_sites(db, code.clone(), env.clone()).clone()
+}
+
+/// Whether the body of `instance` as any of [`Build::WALKS_INLINED`] builds it calls a trait
+/// method through a `dyn`: what `Devirtualize` looks at.
 #[blaze_query::tracked]
 pub(crate) fn has_sites(
     db: &Db,
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Result<bool, String> {
-    let body = crate::instance_body(db, &instance, env, Some(Build::WALK_INLINED))
-        .map_err(|it| it.to_string())?;
-    Ok(sites(db, &body))
+    for build in Build::WALKS_INLINED {
+        // clone: the query's keys by value, two `Copy` ids in a `Clone`-only type
+        let body = crate::instance_body(db, &instance, env.clone(), Some(build))
+            .map_err(|it| it.to_string())?;
+        if sites(db, &body) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn sites(db: &Db, body: &MirBody<'_>) -> bool {
@@ -220,7 +250,7 @@ impl State {
         match (made, held) {
             (None, None) => Ok(false),
             (Some(world), None) => {
-                let held = devirt::give(world);
+                let held = devirt::give(world).map_err(|what| frontend.with(|db| refused(db, krate, kind, what)))?;
                 self.0.lock().held = Some(held);
                 Ok(true)
             }
@@ -284,7 +314,7 @@ fn world_of(
             continue;
         }
         let inlined = frontend.inlines_for(db, instance, requester)?;
-        sites |= walking(db, Some(DevirtWorld([0; 32])), instance, inlined)?.world.is_some();
+        sites |= takes_world(db, instance, inlined, || frontend.owner(db, &instance.0))?;
         let Some(facts) = refs::facts(db, instance, refs::Walking::plain(inlined))? else { continue };
         for (ty, key) in &facts.vtables {
             // clone: a reference count, once per vtable the program makes
@@ -314,7 +344,8 @@ fn world_of(
         return Ok(None);
     }
     for value in statics {
-        let compiled = crate::compiled_static(db, value.0).as_ref().map_err(|e| e.to_string())?;
+        // An `extern_weak` static holds a foreign symbol's address: no vtable of its value.
+        let super::statics::Source::Compiled(compiled) = super::statics::source(db, value.0)? else { continue };
         let mut facts = Facts::default();
         for request in &compiled.requests.datas {
             if let crate::fragment::DataRequest::Vtable { ty, trait_ref: Some((trait_, args)), .. } = request {

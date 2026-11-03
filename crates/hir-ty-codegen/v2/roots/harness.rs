@@ -376,7 +376,9 @@ fn text(tests: &[Test], test_type: &str, digest: &str, fork_server: &str) -> Str
     _ = writeln!(text, "{LISTED}{digest}");
     text.push_str("#[cfg(test)]\n#[doc(hidden)]\n#[allow(warnings, clippy::all)]\npub mod ");
     text.push_str(MODULE);
-    text.push_str(" {\n    extern crate test;\n");
+    // `std` by its own `extern crate`, as `test`: a `#![no_std]` crate's extern prelude has no
+    // `std`, so the fork server and `main` never name `::std`.
+    text.push_str(" {\n    extern crate test;\n    extern crate std;\n");
     text.push_str(fork_server);
     text.push_str(
         "\n    pub fn main() -> test::ExitCode {\n        \
@@ -387,7 +389,7 @@ fn text(tests: &[Test], test_type: &str, digest: &str, fork_server: &str) -> Str
     }
     text.push_str(
         "];\n        \
-         if let ::core::option::Option::Some(socket) = ::std::env::var_os(fork_server::SOCKET) {\n            \
+         if let ::core::option::Option::Some(socket) = std::env::var_os(fork_server::SOCKET) {\n            \
          fork_server::serve(TESTS, socket)\n        \
          }\n        \
          test::test_main_env_args(TESTS)\n    }\n",

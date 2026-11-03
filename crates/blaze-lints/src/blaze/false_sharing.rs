@@ -197,7 +197,7 @@ fn kind(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<Kind> {
 fn writers(cx: &Cx<'_, '_>, def: hir::Struct, fields: &mut [Contended]) {
     let db = cx.db();
     let adt = hir::Adt::Struct(def);
-    for imp in hir::Impl::all_for_type(db, adt.ty(db)) {
+    for imp in hir::Impl::all_for_type(db, cx.krate(), adt.ty(db)) {
         for item in imp.items(db) {
             let hir::AssocItem::Function(f) = item else { continue };
             let owner = hir::DefWithBody::from(f);

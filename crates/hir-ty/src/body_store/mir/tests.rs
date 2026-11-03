@@ -76,6 +76,22 @@ fn built_mir<'db>(db: &'db Db, ask: Ask) -> Result<MirBody<'db>, MirLowerError<'
     })
 }
 
+/// The MIR of `closures` with its first block's call returning to a block past the body's:
+/// written, it does not read back. What a lowering or writer bug would offer.
+#[blaze_query::tracked(returns(ref))]
+fn unreadable_mir<'db>(db: &'db Db, ask: Ask) -> Result<MirBody<'db>, MirLowerError<'db>> {
+    let owner = owner_of(db, ask);
+    built(db, owner, || {
+        let mut body = mir_of(db, owner);
+        let past = idx(body.basic_blocks.len() as u32);
+        match &mut body.basic_blocks[body.start_block].terminator {
+            Some(Terminator { kind: TerminatorKind::Call { target, .. }, .. }) => *target = Some(past),
+            _ => unreachable!("the test's first block ends in a call"),
+        }
+        Ok(body)
+    })
+}
+
 fn ran() -> u32 {
     RAN.with(|ran| ran.get())
 }
@@ -292,7 +308,7 @@ fn answer_of<'db>(memory: &Memory, s: &'db Session, owner: MirOwner<'db>) -> (bl
     let shape = ShapeRef::open(shape.bytes(), &base).unwrap();
     let mut key = AnswerKey::new(&shape_key);
     for fact in shape.facts() {
-        key.value(&s.facts.value(&s.db, fact).unwrap());
+        key.value(&s.facts.value(&s.db, def, fact).unwrap());
     }
     let answer_key = key.finish();
     (record::answer_at(Step::Mir, &answer_key), answer_key)
@@ -365,6 +381,24 @@ fn a_corrupt_answer_is_an_error_naming_the_body() {
     assert_eq!(*read, mir_of(&fresh.db, owner_of(&fresh.db, ask)));
     let error = fresh.installed.flush().expect_err("an answer that does not decode");
     assert!(error.contains(&format!("{def:?}")) && error.contains("MIR"), "{error}");
+}
+
+/// A body whose buffer does not read back is the build's error naming it, never a body
+/// quietly left unstored (debug builds read every body offered back).
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "the read-back runs only with debug assertions")]
+fn a_body_that_does_not_read_back_is_an_error_naming_it() {
+    let memory = Arc::new(Memory::default());
+    let s = session(db_of(FIXTURE), &memory, &Defs::default(), None, Mode::Serve);
+    let ask = ask(&s, false);
+    let def = ask.def(&s.db);
+    assert!(unreadable_mir(&s.db, ask).is_ok(), "the body is still the query's answer");
+    let error = s.installed.flush().expect_err("a body offered that does not read back");
+    assert!(
+        error.contains(&format!("{def:?}")) && error.contains("MIR") && error.contains("does not read back"),
+        "{error}"
+    );
+    assert_eq!(memory.len(), 0, "nothing of it is stored");
 }
 
 #[test]
@@ -571,7 +605,7 @@ fn a_location_constant_that_is_not_its_literals_is_refused() {
     };
     *operand = Operand { span: operand.span, ..Operand::from_bytes(Box::new([0; 4]), default_types().types.u32) };
     let error = encode(&s.db, &*s.facts, def, &body, &mut Vec::new()).expect_err("a line that is not the literal's");
-    assert!(error.contains("location"), "{error}");
+    assert!(error.to_string().contains("location"), "{error}");
 }
 
 #[test]
@@ -583,7 +617,7 @@ fn a_location_macro_in_a_pattern_is_refused() {
     body.owner = InferBodyId::DefWithBodyId(def);
     body.basic_blocks[body.start_block].statements.clear();
     let error = encode(&s.db, &*s.facts, def, &body, &mut Vec::new()).expect_err("a pattern's line has no slot");
-    assert!(error.contains("pattern"), "{error}");
+    assert!(error.to_string().contains("pattern"), "{error}");
 }
 
 #[test]

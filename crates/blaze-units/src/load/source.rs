@@ -5,10 +5,14 @@
 //!
 //! - `[source]` replacement is cargo 1.99's `SourceConfigMap` (`src/sources/config.rs`):
 //!   [`crate::sources::SourceMap`], made of blaze-manifest's reading of the configuration.
-//! - A registry package is its `.crate` unpacked at `$CARGO_HOME/registry/src/<dir>/<name>-<version>`
+//! - Fetched packages are where blaze keeps them, `<sources>` ([`crate::query::BuildConfig::sources`],
+//!   under blaze's root), laid out as cargo lays out its home, and never in `$CARGO_HOME`: a
+//!   registry package is its `.crate` unpacked at `<sources>/registry/src/<dir>/<name>-<version>`
 //!   (cargo's `RegistrySource`); a sparse index file is at
-//!   `$CARGO_HOME/registry/index/<dir>/.cache/<prefix path>`, as served; a git package is in its
-//!   checkout at `$CARGO_HOME/git/checkouts/<ident>/<short commit>` (cargo's `GitSource`).
+//!   `<sources>/registry/index/<dir>/.cache/<prefix path>`, as served; a git package is in its
+//!   checkout at `<sources>/git/checkouts/<ident>/<commit>` (cargo's `GitSource`, with the whole
+//!   commit where cargo takes a short one). The
+//!   daemon writes each package it fetches there on disk too, for a build script to read.
 //! - A `local-registry` and a `directory` source are read in place. A git index is not read:
 //!   blaze reads sparse indexes only.
 
@@ -34,8 +38,9 @@ pub(crate) use self::registry::Index;
 /// The sources a build reads packages from, as its configuration names them.
 pub(crate) struct Sources {
     map: SourceMap,
-    /// `$CARGO_HOME`, absolute, `/`-separated.
-    home: String,
+    /// Where fetched packages are kept ([`crate::query::BuildConfig::sources`]), absolute,
+    /// `/`-separated.
+    kept: String,
     offline: Option<&'static str>,
 }
 
@@ -59,13 +64,15 @@ pub(crate) enum IndexFile {
 
 impl Sources {
     /// From the configuration the workspace was read with: `[source]` replacements,
-    /// `[registries]`, `registry.index`, `registries.crates-io.protocol` (sparse by default),
-    /// `$CARGO_HOME` (`config.home()`). `offline` is `Some("--offline")` or `Some("--frozen")`
-    /// when the command line or `net.offline` makes the build offline.
-    pub(crate) fn new<F: Files>(config: &Config<F>, offline: Option<&'static str>) -> anyhow::Result<Sources> {
-        let home = normal(config.home())
-            .ok_or_else(|| anyhow!("`$CARGO_HOME` (`{}`) is not an absolute path", config.home().display()))?;
-        Ok(Sources { map: source_map(config)?, home, offline })
+    /// `[registries]`, `registry.index`, `registries.crates-io.protocol` (sparse by default).
+    /// `kept` is where the daemon keeps fetched packages ([`crate::query::BuildConfig::sources`]).
+    /// `offline` is `Some("--offline")` or `Some("--frozen")` when the command line or
+    /// `net.offline` makes the build offline.
+    pub(crate) fn new<F: Files>(config: &Config<F>, kept: &str, offline: Option<&'static str>) -> anyhow::Result<Sources> {
+        let kept = normal(std::path::Path::new(kept)).ok_or_else(|| {
+            anyhow!("the daemon names `{kept}`, no absolute directory, for where it keeps the packages it fetches")
+        })?;
+        Ok(Sources { map: source_map(config)?, kept, offline })
     }
 
     /// A package the resolve pins that is not a path package: where cargo has its `Cargo.toml`,
@@ -125,6 +132,15 @@ impl Sources {
     ) -> Result<anyhow::Result<Located>, Cancelled> {
         let name = id.name().as_str();
         let version = id.version().to_string();
+        // The name is a directory's name on disk, where the daemon writes the package before any
+        // sandbox runs: a lock file's `../..` never gets that far (cargo refuses such a name
+        // when it parses a manifest; a lock file's is checked here).
+        if let Err(error) = blaze_resolve::validate_package_name(name) {
+            return Ok(Err(error.context(format!(
+                "the lock file names the package `{name} v{version}`, whose name cargo refuses, so \
+                 blaze makes no directory of it"
+            ))));
+        }
         let at = self.package_dir(from, name, &version);
         if let Found::Here(_) = read_dir(cx, &at)? {
             return Ok(Ok(Located::Here { manifest: format!("{at}/Cargo.toml") }));
@@ -227,8 +243,18 @@ impl Sources {
                 id.version()
             )));
         };
-        let short = commit.get(..7).unwrap_or(commit);
-        let at = format!("{}/git/checkouts/{}/{short}", self.home, from.git_ident());
+        // The whole commit names its checkout, never a prefix: two commits of one repository
+        // that share a prefix are two directories. It is a directory's name on disk, so a lock
+        // file's fragment that is no object id (`../..`) is refused.
+        if commit.len() < 40 || !commit.bytes().all(|it| it.is_ascii_hexdigit()) {
+            return Ok(Err(anyhow!(
+                "Cargo.lock pins `{} v{}` to `{commit}` of the git source {source}, which is no \
+                 git object id (40 or 64 hex digits)",
+                id.name(),
+                id.version()
+            )));
+        }
+        let at = format!("{}/git/checkouts/{}/{commit}", self.kept, from.git_ident());
         if let Found::Here(_) = read_dir(cx, &at)? {
             return Ok(tree::checkout_package(cx, &at, id)?.map(|manifest| Located::Here { manifest }));
         }
@@ -340,14 +366,14 @@ impl Sources {
         self.map.is_replaced(source)
     }
 
-    /// `$CARGO_HOME/registry/src/<dir>/<name>-<version>`.
+    /// `<sources>/registry/src/<dir>/<name>-<version>`.
     fn package_dir(&self, from: SourceId, name: &str, version: &str) -> String {
-        format!("{}/registry/src/{}/{name}-{version}", self.home, from.registry_dir_name())
+        format!("{}/registry/src/{}/{name}-{version}", self.kept, from.registry_dir_name())
     }
 
-    /// `$CARGO_HOME/registry/index/<dir>`.
+    /// `<sources>/registry/index/<dir>`.
     fn index_dir(&self, from: SourceId) -> String {
-        format!("{}/registry/index/{}", self.home, from.registry_dir_name())
+        format!("{}/registry/index/{}", self.kept, from.registry_dir_name())
     }
 }
 

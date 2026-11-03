@@ -1,0 +1,7 @@
+# `bits` comes from a directory source, so it is a library no edit reaches, as a registry
+# crate is: only such a crate's `#[inline(always)]` bodies are built into their callers.
+[source.crates-io]
+replace-with = "vendored"
+
+[source.vendored]
+directory = "vendor"

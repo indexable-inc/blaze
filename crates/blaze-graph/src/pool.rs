@@ -617,6 +617,12 @@ struct Slot {
     sleeping: AtomicBool,
     group: u32,
     thread: OnceLock<Thread>,
+    /// How many jobs ended on this worker (ran to their end, not parked): written by its
+    /// worker alone, summed by [`Pool::ended`].
+    ended: AtomicU64,
+    /// Whether its worker runs a job's code now, from a fiber's resume to its yield or end:
+    /// written by its worker alone, counted by [`Pool::working`].
+    inside: AtomicBool,
 }
 
 /// How many workers search and how many sleep, in one word so a submit reads both at once.
@@ -795,6 +801,8 @@ impl Pool {
                 sleeping: AtomicBool::new(false),
                 group: cpu.group,
                 thread: OnceLock::new(),
+                ended: AtomicU64::new(0),
+                inside: AtomicBool::new(false),
             })
             // alloc: made once with the pool
             .collect();
@@ -915,6 +923,22 @@ impl Pool {
     /// How many of the pool's jobs are parked on a wait now.
     pub fn parked(&self) -> usize {
         self.shared.parked.load(Ordering::Acquire)
+    }
+
+    /// How many of the pool's jobs ran to their end so far: it grows only as jobs finish, never
+    /// as a worker searches, parks, checks for a stall or switches fibers, nor as a job parks
+    /// or resumes. What a stall watchdog counts as the pool's progress. 0 under the model
+    /// checker, whose jobs run on their worker's stack with no host to count them.
+    pub fn ended(&self) -> u64 {
+        self.shared.slots.iter().map(|slot| slot.ended.load(Ordering::Relaxed)).sum()
+    }
+
+    /// How many workers run a job's code now (a job resumed and not yet parked or ended): work
+    /// under way though no job ends, as one long compile is, which a stall watchdog counts as
+    /// moving. A job blocked outside the scheduler (a lock, a syscall) counts too; a worker
+    /// that searches, sleeps or switches fibers never does. 0 under the model checker.
+    pub fn working(&self) -> usize {
+        self.shared.slots.iter().filter(|slot| slot.inside.load(Ordering::Relaxed)).count()
     }
 
     /// Runs `run` on a worker near `group` (a group this pool does not have is no group), then
@@ -1726,6 +1750,8 @@ fn work(local: &Local) {
         shared.member.load(Ordering::Relaxed),
         u32::try_from(local.index).expect("a worker's index is a u32"),
         &shared.parked,
+        &shared.slots[local.index].ended,
+        &shared.slots[local.index].inside,
     );
     #[cfg(blaze_check)]
     let mut runner = Runner(PhantomData);
@@ -2151,28 +2177,27 @@ mod tests {
     }
 
     /// A waiting job frees its worker: two workers, 48 jobs each waiting on a later one, the
-    /// last on a key a client runs until every job has started, which no two workers could
+    /// last on a key a client runs until every job waits, parked, which no two workers could
     /// hold at once; then all finish, each with its key's value.
+    ///
+    /// The client ends its key only once all 48 are parked, never once they have only started:
+    /// a job that has started may still be on its way down the chain, and would reach the
+    /// client's key after it ended and find no one running it (the pre-2026-11-02 flake under
+    /// load, "the client runs the last key").
     #[test]
     fn a_waiting_job_frees_its_worker() {
         const JOBS: u32 = 48;
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
-        let started = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = unbounded::<(u32, Result<u32, Cancelled>)>();
         let last = flights.get_or_run(key(JOBS), || {
             for at in 0..JOBS {
-                let (flights, started, tx) = (Arc::clone(&flights), Arc::clone(&started), tx.clone());
-                pool.submit(
-                    None,
-                    move || {
-                        started.fetch_add(1, Ordering::SeqCst);
-                        chain(&flights, at, JOBS)
-                    },
-                    move |it| _ = tx.send((at, it.unwrap())),
-                );
+                let (flights, tx) = (Arc::clone(&flights), tx.clone());
+                pool.submit(None, move || chain(&flights, at, JOBS), move |it| _ = tx.send((at, it.unwrap())));
             }
-            until("every job to start", || started.load(Ordering::SeqCst) == JOBS as usize);
+            // Each job waits on a key another claimed, or the job holding key 47 on this one's:
+            // all of them park, and none can end before this key does.
+            until("every job to wait, parked", || pool.parked() == JOBS as usize);
             Ok(0)
         });
         assert_eq!(last, Ok(0));
@@ -2186,12 +2211,12 @@ mod tests {
         static MARK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    fn take_mark() -> usize {
-        MARK.replace(0)
+    fn take_mark() -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(MARK.replace(0))
     }
 
-    fn put_mark(taken: usize) {
-        MARK.set(taken);
+    fn put_mark(taken: std::num::NonZeroUsize) {
+        MARK.set(taken.get());
     }
 
     /// A job inside a frame task that waits resumes in its own frame, on whichever worker takes
@@ -2202,7 +2227,7 @@ mod tests {
     fn a_waiting_job_keeps_its_frame_on_any_worker() {
         use blaze_mem::{Tag, frame};
         static CARRIED: std::sync::Once = std::sync::Once::new();
-        CARRIED.call_once(|| crate::sched::carry(crate::sched::Carried { take: take_mark, put: put_mark }));
+        CARRIED.call_once(|| crate::sched::carry(crate::sched::Carried::word(take_mark, put_mark)));
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
         let mut moved = 0;
@@ -2440,6 +2465,52 @@ mod tests {
         assert!(said.contains("could not start job"), "{said}");
     }
 
+    /// The poolborrow stall (2026-11-02) went unseen for ten minutes as the daemon's watchdog
+    /// counted every span closed as progress, and a pool with a job parked goes on closing its
+    /// workers' `search`, `idle` and `switch` spans, its last sleeper checking for a stall every
+    /// [`STALL_AFTER`]. The pool's own count of progress, its jobs ended, stands still through
+    /// all that and moves by one for each job that ends.
+    #[test]
+    fn the_jobs_ended_count_moves_only_as_jobs_end_never_while_workers_idle() {
+        use crate::sched::{self, Wait};
+        let pool = Pool::new(&Topology::flat(2), false).unwrap();
+        let at = Key([0x5a; 32]);
+        assert!(sched::claim(at), "the key is new");
+        // Ends the key however the test ends, before the pool's drop waits for the parked job.
+        struct Done(Option<Key>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                if let Some(at) = self.0.take() {
+                    sched::key_done(at);
+                }
+            }
+        }
+        let mut done = Done(Some(at));
+        let (tx, rx) = unbounded::<bool>();
+        {
+            let tx = tx.clone();
+            pool.submit(None, move || sched::wait(Wait::Key(at)).is_ok(), move |it| _ = tx.send(it.unwrap_or(false)));
+        }
+        until("the job to park", || pool.parked() == 1);
+        let before = pool.ended();
+        // Past the pool's stall check: its workers search, park, check and park again.
+        assert!(rx.recv_timeout(STALL_AFTER * 2).is_err(), "the parked job ended while its key was held");
+        assert_eq!(pool.ended(), before, "the pool's idle workers moved its count of jobs ended");
+        if let Some(at) = done.0.take() {
+            sched::key_done(at);
+        }
+        assert_eq!(rx.recv_timeout(LONG), Ok(true), "the job ends once its key is done");
+        until("the job's end to be counted", || pool.ended() == before + 1);
+        for _ in 0..10 {
+            let tx = tx.clone();
+            pool.submit(None, || true, move |it| _ = tx.send(it.unwrap_or(false)));
+        }
+        for _ in 0..10 {
+            assert_eq!(rx.recv_timeout(LONG), Ok(true));
+        }
+        until("ten more jobs' ends to be counted", || pool.ended() == before + 11);
+    }
+
     /// A panic's message, as a job's `done` gets it.
     fn message(panic: &(dyn std::any::Any + Send)) -> String {
         panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|it| (*it).to_owned())).unwrap_or_default()
@@ -2499,13 +2570,13 @@ mod tests {
     /// The value of [`REFUSED`] whose put panics.
     const REFUSE: usize = usize::MAX;
 
-    fn take_refused() -> usize {
-        REFUSED.replace(0)
+    fn take_refused() -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(REFUSED.replace(0))
     }
 
-    fn put_refused(taken: usize) {
-        assert_ne!(taken, REFUSE, "a carried thread-local refused to move");
-        REFUSED.set(taken);
+    fn put_refused(taken: std::num::NonZeroUsize) {
+        assert_ne!(taken.get(), REFUSE, "a carried thread-local refused to move");
+        REFUSED.set(taken.get());
     }
 
     /// A job whose carried thread-local panics as it is put back on the thread the job resumes
@@ -2514,7 +2585,7 @@ mod tests {
     #[test]
     fn a_carried_put_that_panics_fails_its_job_and_the_pool_goes_on() {
         static CARRIED: std::sync::Once = std::sync::Once::new();
-        CARRIED.call_once(|| crate::sched::carry(crate::sched::Carried { take: take_refused, put: put_refused }));
+        CARRIED.call_once(|| crate::sched::carry(crate::sched::Carried::word(take_refused, put_refused)));
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
         for round in 0..10u32 {
@@ -2571,17 +2642,20 @@ mod tests {
             crate::sched::carry(crate::sched::Carried {
                 take: || stdx::lend::take_carried(&LENT, Option::is_none),
                 put: |it| stdx::lend::put_carried(&LENT, Option::is_none, it),
+                end: |it| stdx::lend::end_carried(&LENT, it),
             });
         });
     }
 
     /// Two jobs each lend a value to a carried thread-local ([`stdx::lend`]), park on a key and
-    /// resume, often on each other's worker, while each worker holds a value of its own in the
-    /// slot (left by a job that ended without taking it back). A job always comes on to an
-    /// empty slot, finds its own value after the wait, and the jobs after them find it empty:
-    /// a job's carried values are swapped with its worker's, never put over them.
+    /// resume, often on each other's worker, after a job on each worker ended holding a value
+    /// in the slot (ended with it, `go_off_ended`, so the worker's slot is empty again). A job
+    /// always comes on to an empty slot, finds its own value after the wait, and the jobs after
+    /// them find it empty: a value a job ends holding is ended, never left for the next job,
+    /// and none outlives its job. (A worker that holds a value of its own across jobs is
+    /// `sched::fiber_tests::a_workers_own_carried_value_is_set_aside_for_each_job_and_back_when_it_ends`.)
     #[test]
-    fn jobs_holding_lends_resume_crosswise_on_workers_whose_slots_are_held() {
+    fn jobs_holding_lends_resume_crosswise_after_jobs_that_ended_holding_one() {
         carry_lent();
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
@@ -2657,11 +2731,12 @@ mod tests {
         assert!(crossed > 0, "in 50 rounds no job resumed on the other worker");
     }
 
-    /// On a pool of one worker, whose own slot a job that ended left holding a value, two jobs
-    /// each lend the carried slot a value and park, the first on one key and the second on
-    /// another; the keys end in the other order, so they resume on the one thread swapped.
-    /// Each sees its own value after its wait, and the jobs after them an empty slot: between
-    /// jobs the slot is the worker's, set aside while a job runs and given back as it goes off.
+    /// On a pool of one worker, after a job ended holding a value in the carried slot (ended
+    /// with it), two jobs each lend the slot a value and park, the first on one key and the
+    /// second on another; the keys end in the other order, so they resume on the one thread
+    /// swapped. Each sees its own value after its wait, and the jobs after them an empty slot:
+    /// between jobs the slot is the worker's, set aside while a job runs and given back as it
+    /// goes off.
     #[test]
     fn jobs_holding_lends_resume_on_one_thread_in_swapped_order() {
         carry_lent();
@@ -2772,34 +2847,64 @@ mod tests {
         assert_eq!(rx.recv_timeout(LONG).unwrap(), "after the fire");
     }
 
-    /// On a pool of one worker, a job waits 20 ms on the pool's clock and holds no thread: the
-    /// worker runs another job meanwhile, then sleeps with nothing queued, and wakes for the
+    /// On a pool of one worker, a job waits on the pool's clock and holds no thread: it parks,
+    /// the worker runs another job meanwhile, then sleeps with nothing queued, and wakes for the
     /// deadline. The job goes on no earlier than it; a wait for a time gone by ends at once.
+    ///
+    /// The park is seen only while the wait lasts, and a test thread kept off its core longer
+    /// than that (a loaded machine) misses it: then the wait ended first, and the round is
+    /// tried again with a wait twice as long, never left polling a park that is over (the
+    /// pre-2026-11-02 flake, "timed out after 60s waiting for the timed job to park"). A job
+    /// that held its thread would never park in any round, and fails naming every wait tried.
     #[test]
     fn a_job_waiting_for_a_time_holds_no_thread_and_goes_on_once_it_is_due() {
         use crate::sched::{self, Wait};
+        const ROUNDS: u32 = 8;
         let pool = Pool::new(&Topology::flat(1), false).unwrap();
-        let (tx, rx) = unbounded::<Result<u64, String>>();
-        {
-            let tx = tx.clone();
-            pool.submit(
-                None,
-                || {
-                    let at = sched::now() + 20_000_000;
-                    sched::wait(Wait::Until(at)).unwrap();
-                    let late = sched::now().checked_sub(at).expect("the job went on before its deadline");
-                    sched::wait(Wait::Until(at)).unwrap();
-                    late
-                },
-                move |it| _ = tx.send(it.map_err(|it| message(&*it))),
-            );
+        for round in 0..ROUNDS {
+            let wait_ns = 20_000_000u64 << round;
+            let (tx, rx) = unbounded::<(&'static str, Result<u64, String>)>();
+            {
+                let tx = tx.clone();
+                pool.submit(
+                    None,
+                    move || {
+                        let at = sched::now() + wait_ns;
+                        sched::wait(Wait::Until(at)).unwrap();
+                        let late = sched::now().checked_sub(at).expect("the job went on before its deadline");
+                        sched::wait(Wait::Until(at)).unwrap();
+                        late
+                    },
+                    move |it| _ = tx.send(("timed", it.map_err(|it| message(&*it)))),
+                );
+            }
+            let seen = std::cell::Cell::new(false);
+            until("the timed job to park or end", || {
+                seen.set(pool.parked() == 1);
+                seen.get() || !rx.is_empty()
+            });
+            let parked = seen.get();
+            if parked {
+                pool.submit(None, || u64::MAX, move |it| _ = tx.send(("meanwhile", it.map_err(|it| message(&*it)))));
+            }
+            let first = rx.recv_timeout(LONG).expect("the pool's first job's end");
+            if first.0 == "timed" {
+                // The wait was over before this thread saw the park, or before the job given
+                // meanwhile ran: that one ends too, and the round goes again.
+                assert!(first.1.is_ok(), "round {round}: the timed job failed: {first:?}");
+                if parked {
+                    assert_eq!(rx.recv_timeout(LONG), Ok(("meanwhile", Ok(u64::MAX))), "round {round}: the job meanwhile");
+                }
+                continue;
+            }
+            assert_eq!(first, ("meanwhile", Ok(u64::MAX)), "round {round}: the job meanwhile");
+            let (_, late) = rx.recv_timeout(LONG).expect("the timed job's end");
+            let late = late.unwrap_or_else(|it| panic!("round {round}: the timed job failed: {it}"));
+            assert!(late < u64::try_from(LONG.as_nanos()).unwrap(), "the timed job went on {late} ns late");
+            assert_eq!(pool.parked(), 0);
+            return;
         }
-        until("the timed job to park", || pool.shared.parked.load(Ordering::SeqCst) == 1);
-        pool.submit(None, || u64::MAX, move |it| _ = tx.send(it.map_err(|it| message(&*it))));
-        assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(u64::MAX), "the job meanwhile");
-        let late = rx.recv_timeout(LONG).unwrap().unwrap();
-        assert!(late < u64::try_from(LONG.as_nanos()).unwrap(), "the timed job went on {late} ns late");
-        assert_eq!(pool.shared.parked.load(Ordering::SeqCst), 0);
+        panic!("in {ROUNDS} rounds, waits of 20 ms to {} ms, the timed job never parked while its wait lasted", 20u64 << (ROUNDS - 1));
     }
 
     /// A job's wait for a time past the pool's stall check, with every pool idle meanwhile: no
@@ -3456,6 +3561,8 @@ mod model {
                 sleeping: AtomicBool::new(false),
                 group: 0,
                 thread: OnceLock::new(),
+                ended: AtomicU64::new(0),
+                inside: AtomicBool::new(false),
             })
             .collect();
         let group = Group {

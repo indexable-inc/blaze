@@ -185,6 +185,13 @@ pub struct BuildConfig {
     /// directory of its root's id (`blaze_manifest::home::build_dir`). Nothing of a build is
     /// written into the checkout.
     pub builds: String,
+    /// Where the daemon keeps the packages it fetched, absolute: `sources` under blaze's root
+    /// (`blaze_manifest::home::sources`). A registry package is at
+    /// `<sources>/registry/src/<registry dir>/<name>-<version>` and a git package's checkout
+    /// at `<sources>/git/checkouts/<ident>/<commit>` (the whole commit): mounted there, and on
+    /// disk there for what reads it outside the VFS (a build script, the C compiler it runs).
+    /// Never cargo's `$CARGO_HOME`, where blaze keeps no packages.
+    pub sources: String,
 }
 
 impl BuildConfig {
@@ -617,6 +624,11 @@ pub struct StdKey {
     /// triple for the target's baseline. Two stds, never one directory; a release build's
     /// two are one.
     pub runs_here: bool,
+    /// The build's profile's `codegen-backend`: `stencil` compiles std's own functions as
+    /// copy-and-patch stencils too (blaze-codegen's `Profile::stencils`), not at the shipped
+    /// std's O3. Left out of the key's bytes when unset, so every other std's id stays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codegen_backend: Option<String>,
 }
 
 impl StdKey {
@@ -762,6 +774,7 @@ mod tests {
             library: "/rustc/0123/library".to_owned(),
             std: "/s/std".to_owned(),
             builds: "/s/build".to_owned(),
+            sources: "/s/sources".to_owned(),
         };
         assert_eq!(BuildConfig::decode(&config.encode()).unwrap(), config);
         assert!(BuildConfig::decode(b"\xff").is_err());
@@ -785,6 +798,7 @@ mod tests {
             profile_root: "dev".to_owned(),
             macro_wasm: false,
             runs_here: true,
+            codegen_backend: None,
         };
         let abort = StdKey { panic: "abort".to_owned(), ..key.clone() };
         assert_ne!(key.id(), abort.id());

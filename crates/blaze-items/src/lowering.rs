@@ -1,13 +1,15 @@
 //! A MIR lowering error in words a person reads, for the error a build stops with when an item
 //! has no hash ([`crate::Unhashable::describe`]) and for the evaluator's stops: a call with no
 //! function names its callee as written, where it is (`file:line:column`) and why inference
-//! resolved it to nothing; any other error is its `Debug`.
+//! resolved it to nothing; the body of a trait method written without one names the method;
+//! any other error is its `Debug`.
 
 use std::fmt::Write as _;
 
 use base_db::Db;
 use hir_def::{
     DefWithBodyId, HasModule,
+    signatures::TraitSignature,
     expr_store::{ExpressionStore, pretty::print_expr_hir},
     hir::{Expr, ExprId, ExprOrPatIdPacked},
     span_names,
@@ -26,6 +28,15 @@ pub fn write(db: &Db, error: &MirLowerError<'_>, out: &mut String) {
     match error {
         MirLowerError::MissingFunctionDefinition(owner, call) => {
             hir_ty::attach_db(db, || missing_function(db, *owner, *call, out));
+        }
+        MirLowerError::TraitFunctionDefinition(trait_, name) => {
+            let edition = DisplayTarget::from_crate(db, trait_.krate(db)).edition;
+            _ = write!(
+                out,
+                "the body of `{}::{}` was asked for, a trait method written without one",
+                TraitSignature::of(db, *trait_).name.display(db, edition),
+                name.display(db, edition),
+            );
         }
         other => _ = write!(out, "{other:?}"),
     }

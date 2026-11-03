@@ -163,7 +163,7 @@ impl PredicateEvaluationResult {
 }
 
 pub use crate::{
-    attrs::{AttrsWithOwner, HasAttrs, resolve_doc_path_on},
+    attrs::{AttrsOwner, AttrsWithOwner, HasAttrs, resolve_doc_path_on},
     body_analysis::BodyAnalysis,
     diagnostics::*,
     match_lints::{
@@ -3975,7 +3975,13 @@ impl Impl {
     /// blanket impls, and only does a shallow type constructor check. In fact, this should've probably been on `Adt`
     /// etc., and not on `Type`. If you would want to create a precise list of all impls applying to a type,
     /// you would need to include blanket impls, and try to prove to predicates for each candidate.
-    pub fn all_for_type<'db>(db: &'db Db, ty: Type<'db>) -> Vec<Impl> {
+    ///
+    /// The impls are those `krate` sees: its own and those of the crates it loads
+    /// (`method_resolution::loaded_crates`, rustc's crate store compiling it), with the blocks
+    /// around the type's definition. Never another crate of the graph: a sibling member or test
+    /// target, or one whose proc macros a build has not built yet when a job of `krate` asks,
+    /// whose impls would make the answer depend on which other units the build has reached.
+    pub fn all_for_type<'db>(db: &'db Db, krate: Crate, ty: Type<'db>) -> Vec<Impl> {
         let mut result = Vec::new(); // alloc: editor edge, the owned impl list callers take
         let interner = DbInterner::new_no_crate(db);
         let Some(simplified_ty) = fast_reject::simplify_type(
@@ -3991,7 +3997,7 @@ impl Impl {
         };
         method_resolution::with_incoherent_inherent_impls(
             db,
-            ty.krate(db),
+            krate.id,
             &simplified_ty,
             |impls| extend_with_impls(Either::Left(impls)),
         );
@@ -4005,15 +4011,9 @@ impl Impl {
             std::iter::successors(module.block(db), |block| block.module(db).block(db))
                 .filter_map(|block| TraitImpls::for_block(db, block))
                 .for_each(|impls| impls.for_self_ty(&simplified_ty, &mut extend_with_impls));
-            for &krate in &*all_crates(db) {
-                TraitImpls::for_crate(db, krate)
-                    .for_self_ty(&simplified_ty, &mut extend_with_impls);
-            }
-        } else {
-            for &krate in &*all_crates(db) {
-                TraitImpls::for_crate(db, krate)
-                    .for_self_ty(&simplified_ty, &mut extend_with_impls);
-            }
+        }
+        for &seen in method_resolution::loaded_crates(db, krate.id) {
+            TraitImpls::for_crate(db, seen).for_self_ty(&simplified_ty, &mut extend_with_impls);
         }
         // An impl in a block is one of its crate as well as of the block.
         let mut seen = HashSet::new_in(Global); // alloc: editor edge, sized by the impls found
@@ -4021,7 +4021,9 @@ impl Impl {
         result
     }
 
-    pub fn all_for_trait(db: &Db, trait_: Trait) -> Vec<Impl> {
+    /// The impls of `trait_` that `krate` sees: its own and those of the crates it loads (as
+    /// [`Impl::all_for_type`]), with the trait's block's.
+    pub fn all_for_trait(db: &Db, krate: Crate, trait_: Trait) -> Vec<Impl> {
         let module = trait_.module(db).id;
         let mut all = Vec::new(); // alloc: editor edge, the owned impl list callers take
         let mut handle_impls = |impls: &TraitImpls<'_>| {
@@ -4030,8 +4032,8 @@ impl Impl {
                 Either::Right(impls) => all.extend(impls.iter().copied().map(Impl::from)),
             });
         };
-        for krate in module.krate(db).transitive_rev_deps(db).iter().copied() {
-            handle_impls(TraitImpls::for_crate(db, krate));
+        for &seen in method_resolution::loaded_crates(db, krate.id) {
+            handle_impls(TraitImpls::for_crate(db, seen));
         }
         if let Some(block) = module.block(db)
             && let Some(impls) = TraitImpls::for_block(db, block)

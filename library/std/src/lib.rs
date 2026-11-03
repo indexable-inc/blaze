@@ -479,6 +479,13 @@ extern crate libc;
 #[allow(unused_extern_crates)]
 extern crate unwind;
 
+// blaze: the C runtime of a 64-bit WASI preview 1 target (library/wasi_rt), named here so every
+// program links it: it defines the libc symbols std calls there, in place of wasi-libc.
+#[doc(masked)]
+#[allow(unused_extern_crates)]
+#[cfg(all(target_os = "wasi", target_env = "p1", target_pointer_width = "64"))]
+extern crate wasi_rt;
+
 // FIXME: #94122 this extern crate definition only exist here to stop
 // miniz_oxide docs leaking into std docs. Find better way to do it.
 // Remove exclusion from tidy platform check when this removed.

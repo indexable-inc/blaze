@@ -129,7 +129,15 @@ impl<T> Values<T> {
     }
 
     fn slot(&self, index: usize) -> NonNull<T> {
-        debug_assert!(index < self.max);
+        // `index < max` in every build: then `index * SIZE < max * SIZE`, which `new` checked
+        // does not overflow, so the offset cannot wrap past `Region::at`'s check.
+        if index >= self.max {
+            stop(MemError::Exhausted {
+                tag: Tag::Store,
+                reserved: self.region.reserved(),
+                wanted: index.saturating_add(1).saturating_mul(Self::SIZE),
+            });
+        }
         self.region.at(index * Self::SIZE).cast::<T>()
     }
 

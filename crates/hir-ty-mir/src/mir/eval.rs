@@ -520,7 +520,8 @@ struct Address {
     align: u8,
 }
 
-const _: () = assert!(size_of::<Address>() == 16);
+// The offset and 8 bytes of provenance, space and alignment: 16 bytes on a 64-bit target.
+const _: () = assert!(size_of::<Address>() == size_of::<usize>() + 8);
 
 /// An address, to match on.
 enum At {

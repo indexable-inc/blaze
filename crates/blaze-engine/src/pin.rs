@@ -5,17 +5,131 @@
 //! A project pins blaze, and so the Rust blaze ships; Rust's own toolchain files are not read
 //! (docs/toolchain.md).
 //!
+//! A build of the source tree (`0.0.0-dev`) runs itself in blaze's own tree, whatever that pins,
+//! so the tree builds itself; anywhere else that pins it hands off to the pinned release as a
+//! release does, saying so in one line. `--ignore-pin` runs this blaze, release or not,
+//! whatever the workspace pins ([`choose`]).
+//!
 //! Asked before every command (`program.rs`), so it stays small and quick: std and `toml` only.
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+};
 
 /// The variable the launcher sets for the blaze it runs: the manifest that pinned it. A blaze
-/// started with it is the pinned one, and runs no other.
+/// started with it in that workspace is the pinned one, and runs no other; every process under
+/// it inherits it, so in another workspace (a test's temporary one) it says nothing
+/// ([`names`]).
 pub(crate) const PINNED_BY: &str = "BLAZE_PINNED_BY";
+
+/// The variable a blaze given [`IGNORE_PIN`] sets for every process under it: the root manifest
+/// the word applied to. A blaze run there by one of them (a test or build script running
+/// `$CARGO`, which is this blaze) runs itself as the word says; in another workspace it says
+/// nothing, so the word reaches no workspace it was not given in ([`ignores`]).
+pub(crate) const IGNORE_PIN_FOR: &str = "BLAZE_IGNORE_PIN_FOR";
+
+/// Whether `var` (the value of [`PINNED_BY`] or [`IGNORE_PIN_FOR`]) names `manifest`, the root
+/// manifest found now. The launcher and the blaze it runs find it from the same arguments in the
+/// same directory, so the same path names it; a process under it elsewhere finds another.
+pub(crate) fn names(var: Option<&OsStr>, manifest: &Path) -> bool {
+    var.is_some_and(|it| Path::new(it) == manifest)
+}
+
+/// Whether [`IGNORE_PIN`] applies where `manifest` is the root manifest: `given` here, or given
+/// to a blaze above this process for that same manifest ([`IGNORE_PIN_FOR`]).
+pub(crate) fn ignores(given: bool, manifest: &Path) -> bool {
+    given || names(std::env::var_os(IGNORE_PIN_FOR).as_deref(), manifest)
+}
 
 /// This blaze's version, as a pin names it: a release's `0.YYYYMMDD.N`, or `0.0.0-dev` for a
 /// build of the tree, which no pin names (build.rs, from `BLAZE_RELEASE`).
 pub(crate) const OURS: &str = env!("BLAZE_VERSION");
+
+/// The word that runs this blaze in a pinned workspace in place of the release the pin names,
+/// as the first word after `blaze` (`blaze --ignore-pin build`): how a blaze that is no
+/// release of this workspace's pin builds it, as when trying a build of blaze on a pinned
+/// project. It reaches the processes under it only for the workspace it was given in
+/// ([`IGNORE_PIN_FOR`]).
+pub(crate) const IGNORE_PIN: &str = "--ignore-pin";
+
+/// `args` (the program's, its name first) without [`IGNORE_PIN`] when it is the first word
+/// after the program's name (after `blaze` when cargo runs `cargo-blaze blaze ...`), and
+/// whether it was. Anywhere else it is the command's own (`blaze run --bin tool x --ignore-pin`
+/// gives it to `tool`, as blaze's parser hands a run program every word after its first) and
+/// stays.
+pub(crate) fn take_ignore_pin(args: impl Iterator<Item = OsString>) -> (Vec<OsString>, bool) {
+    let mut kept: Vec<OsString> = args.collect(); // alloc: the program's arguments, once per process
+    let at = if kept.get(1).is_some_and(|it| it == "blaze") { 2 } else { 1 };
+    let ignore = kept.get(at).is_some_and(|it| it == IGNORE_PIN);
+    if ignore {
+        kept.remove(at);
+    }
+    (kept, ignore)
+}
+
+/// Which blaze runs in a workspace whose root manifest pins another than this one.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Choice {
+    /// This one: the pin names it.
+    Pinned,
+    /// This one, as [`IGNORE_PIN`] says.
+    Ignored,
+    /// This one, a build of the source tree, in blaze's tree ([`is_blaze_tree`]).
+    OwnTree,
+    /// The release the pin names (or the channel names), run in this one's place: this one is
+    /// a release too, and hands off as Bazelisk does.
+    Release,
+    /// The release the pin names (or the channel names), run in this one's place: this one is
+    /// a build of the source tree outside blaze's tree, and hands off as a release does, saying
+    /// so in one line on stderr, since what runs is not the blaze that was built.
+    ReleaseForTree,
+}
+
+/// Which blaze runs where `manifest` pins `wanted` (a version or a channel), this one being
+/// `ours` ([`OURS`]), `ignore` when [`IGNORE_PIN`] was given. A build of the source tree runs
+/// itself in blaze's tree and hands off anywhere else, as a release does. `Err` is blaze's tree
+/// told by a blaze-engine manifest that can't be read.
+pub(crate) fn choose(
+    ours: &str,
+    manifest: &Path,
+    wanted: &str,
+    ignore: bool,
+) -> Result<Choice, PinError> {
+    if wanted == ours {
+        return Ok(Choice::Pinned);
+    }
+    if ignore {
+        return Ok(Choice::Ignored);
+    }
+    if is_version(ours) {
+        return Ok(Choice::Release);
+    }
+    if is_blaze_tree(manifest)? {
+        return Ok(Choice::OwnTree);
+    }
+    Ok(Choice::ReleaseForTree)
+}
+
+/// Whether the workspace whose root manifest is `manifest` is blaze's tree: beside it,
+/// `crates/blaze-engine/Cargo.toml` names its package `blaze-engine`. Told by what is there, not
+/// where it is, so every checkout of blaze is the tree (a worktree, a copy, a VM's, the source
+/// of a Nix build, a fork) and no build path is kept in the binary; no path is resolved (WASI,
+/// where the seed runs, has no `canonicalize`).
+pub(crate) fn is_blaze_tree(manifest: &Path) -> Result<bool, PinError> {
+    let dir = manifest.parent().unwrap_or(Path::new(""));
+    let engine = dir.join("crates").join("blaze-engine").join("Cargo.toml");
+    let Some(text) = manifest_text(&engine)? else { return Ok(false) };
+    let table = toml::from_str::<toml::Table>(&text)
+        .map_err(|error| PinError::NotToml { manifest: engine.clone(), error })?;
+    let name = table.get("package").and_then(|it| it.get("name")).and_then(toml::Value::as_str);
+    Ok(name == Some("blaze-engine"))
+}
+
+/// How a pin names what it pins, in a sentence: "blaze 0.20261030.1", "blaze's canary channel".
+pub(crate) fn pinned_text(wanted: &str) -> String {
+    if is_channel(wanted) { format!("blaze's {wanted} channel") } else { format!("blaze {wanted}") }
+}
 
 /// Where a command run with `args` in `cwd` starts looking for its workspace: the directory
 /// of `--manifest-path`, else `cwd`.
@@ -159,11 +273,18 @@ pub(crate) fn channel_known(file: &Path) -> Option<(String, bool)> {
     Some((version, age.is_ok_and(|age| age < CHANNEL_FRESH)))
 }
 
-/// Whether `version` is a release's version: numbers with dots between, so that it names a
-/// directory and an asset and nothing else.
+/// Whether `version` is a release's version, `0.YYYYMMDD.N`: `0`, a date of eight digits and
+/// a number, so that it names a directory and an asset and nothing else, and its date is always
+/// there to read (`versions::has_b3sums`).
 pub(crate) fn is_version(version: &str) -> bool {
-    !version.is_empty()
-        && version.split('.').all(|it| !it.is_empty() && it.bytes().all(|b| b.is_ascii_digit()))
+    let digits = |it: &str| !it.is_empty() && it.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = version.split('.');
+    let (Some("0"), Some(date), Some(n), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    date.len() == 8 && digits(date) && digits(n)
 }
 
 /// Where blaze keeps the releases a pin ran: `versions` in `BLAZE_HOME`, else in `.blaze` in
@@ -192,6 +313,20 @@ mod tests {
         assert!(!is_version("../0.1"));
         assert!(!is_version("nightly"));
         assert!(!is_version(""));
+        // Only `0.<8 digits>.<N>`: a date that is missing or of another length is no release's.
+        for not in ["5", "0.1.0", "0.99999999999.0", "1.20261027.0", "0.20261027.0.1", "0.2026102a.0"] {
+            assert!(!is_version(not), "{not}");
+        }
+    }
+
+    /// `BLAZE_PINNED_BY` and `BLAZE_IGNORE_PIN_FOR` say something only in the workspace they
+    /// name: a process under them in another workspace is not held to them.
+    #[test]
+    fn the_variables_hold_only_for_the_manifest_they_name() {
+        let here = Path::new("/w/a/Cargo.toml");
+        assert!(names(Some(OsStr::new("/w/a/Cargo.toml")), here));
+        assert!(!names(Some(OsStr::new("/tmp/test-ws/Cargo.toml")), here));
+        assert!(!names(None, here));
     }
 
     #[test]
@@ -244,6 +379,83 @@ mod tests {
         std::fs::write(&file, "../x\n").unwrap();
         assert_eq!(channel_known(&file), None);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A build of blaze's tree builds any checkout of that tree whatever it pins (the
+    /// bootstrap: stage 0 builds blaze), told by its blaze-engine manifest, not its path; in
+    /// another pinned workspace it hands off to the pinned release as a release does.
+    #[test]
+    fn a_tree_build_runs_itself_in_blazes_tree_and_hands_off_elsewhere() {
+        let root = std::env::temp_dir().join(format!("blaze-pin-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tree = |at: &str, name: &str| {
+            let engine = root.join(at).join("crates/blaze-engine");
+            std::fs::create_dir_all(&engine).unwrap();
+            std::fs::write(
+                root.join(at).join("Cargo.toml"),
+                "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.metadata.blaze]\nversion = \"0.20261030.1\"\n",
+            )
+            .unwrap();
+            std::fs::write(engine.join("Cargo.toml"), format!("[package]\nname = \"{name}\"\n"))
+                .unwrap();
+            root.join(at).join("Cargo.toml")
+        };
+        // Two checkouts of the tree (a worktree, a copy in a VM) are each the tree.
+        let own = tree("tree", "blaze-engine");
+        let copy = tree("lanes/worktree", "blaze-engine");
+        // A workspace with a crate at that path named otherwise is not.
+        let lookalike = tree("lookalike", "not-blaze-engine");
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(
+            root.join("other/Cargo.toml"),
+            "[workspace]\n\n[workspace.metadata.blaze]\nversion = \"canary\"\n",
+        )
+        .unwrap();
+        let other = root.join("other/Cargo.toml");
+        for manifest in [&own, &copy] {
+            assert_eq!(
+                choose("0.0.0-dev", manifest, "0.20261030.1", false).unwrap(),
+                Choice::OwnTree
+            );
+        }
+        assert_eq!(
+            choose("0.0.0-dev", &lookalike, "0.20261030.1", false).unwrap(),
+            Choice::ReleaseForTree
+        );
+        assert_eq!(choose("0.0.0-dev", &other, "canary", false).unwrap(), Choice::ReleaseForTree);
+        assert_eq!(choose("0.0.0-dev", &other, "canary", true).unwrap(), Choice::Ignored);
+        // A blaze-engine manifest that can't be read says so, naming it.
+        std::fs::write(root.join("lookalike/crates/blaze-engine/Cargo.toml"), "[package\n")
+            .unwrap();
+        let refused = choose("0.0.0-dev", &lookalike, "0.20261030.1", false).unwrap_err();
+        assert!(refused.to_string().contains("crates/blaze-engine/Cargo.toml"), "{refused}");
+        // A release hands off to the one pinned, in blaze's tree or not, unless told.
+        assert_eq!(choose("0.20261101.0", &own, "0.20261030.1", false).unwrap(), Choice::Release);
+        assert_eq!(choose("0.20261101.0", &own, "0.20261030.1", true).unwrap(), Choice::Ignored);
+        assert_eq!(choose("0.20261030.1", &own, "0.20261030.1", false).unwrap(), Choice::Pinned);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `--ignore-pin` is blaze's only as the first word after `blaze`; anywhere else it is the
+    /// command's, and a run program's argument reaches the program.
+    #[test]
+    fn ignore_pin_is_taken_only_as_the_first_word() {
+        let words = |line: &str| line.split(' ').map(OsString::from).collect::<Vec<_>>();
+        let taken = |line: &str| take_ignore_pin(words(line).into_iter());
+        assert_eq!(taken("blaze --ignore-pin build -p a"), (words("blaze build -p a"), true));
+        assert_eq!(
+            taken("cargo-blaze blaze --ignore-pin test"),
+            (words("cargo-blaze blaze test"), true)
+        );
+        for kept in [
+            "blaze run --bin tool x --ignore-pin",
+            "blaze run --ignore-pin",
+            "cargo-blaze blaze test --ignore-pin",
+            "blaze run -- --ignore-pin",
+            "blaze",
+        ] {
+            assert_eq!(taken(kept), (words(kept), false), "{kept}");
+        }
     }
 
     #[test]

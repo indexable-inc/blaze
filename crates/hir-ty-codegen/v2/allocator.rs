@@ -1,6 +1,8 @@
 //! The allocator shim rustc puts in a program: the entries of the global allocator that
 //! `alloc` calls by name (`__rust_alloc` and the rest), each going to the
-//! `#[global_allocator]`'s (the functions its expansion exports) or else to std's defaults.
+//! `#[global_allocator]`'s (the functions its expansion exports) or else to std's defaults,
+//! and `__rust_alloc_error_handler`, going to the `#[alloc_error_handler]`'s `__rg_oom` or else
+//! to alloc's `__rdl_alloc_error_handler`.
 //! Each entry is an instance of its own ([`Kind::Allocator`]), defined under its symbol.
 
 use base_db::{Db, Crate};
@@ -52,7 +54,7 @@ pub(super) fn shim(
     if let (Some(first), Some(other)) = (allocator, declared.next()) {
         return Err(two_allocators(db, first, other));
     }
-    let mut shim = Vec::with_capacity(2 * ALLOCATOR_ENTRIES.len() + 2);
+    let mut shim = Vec::with_capacity(2 * ALLOCATOR_ENTRIES.len() + 3);
     for (symbol, ours, params, returns) in ALLOCATOR_ENTRIES {
         let to = match allocator {
             Some(allocator) => {
@@ -69,9 +71,19 @@ pub(super) fn shim(
         let params = params as u8;
         shim.push(forward(Forward { symbol, to: Some(to), params, returns, krate }));
     }
+    // `__rust_alloc_error_handler` goes to the program's `#[alloc_error_handler]` (std has one)
+    // or else to alloc's default, as rustc's shim goes to `__rg_oom` or `__rdl_alloc_error_handler`.
     let handler = "__rust_alloc_error_handler";
-    let to = Some("__rdl_alloc_error_handler");
-    shim.push(forward(Forward { symbol: handler, to, params: 2, returns: false, krate }));
+    let mut handlers = program.iter().filter_map(|&it| Some((it, alloc_error_handler_export(db, it)?)));
+    let to = match (handlers.next(), handlers.next()) {
+        (Some((_, func)), None) => {
+            shim.push(root(func));
+            hir_expand::builtin::ALLOC_ERROR_HANDLER_EXPORT
+        }
+        (None, _) => "__rdl_alloc_error_handler",
+        (Some((first, _)), Some((other, _))) => return Err(two_alloc_error_handlers(db, first, other)),
+    };
+    shim.push(forward(Forward { symbol: handler, to: Some(to), params: 2, returns: false, krate }));
     let marker = "__rust_no_alloc_shim_is_unstable_v2";
     shim.push(forward(Forward { symbol: marker, to: None, params: 0, returns: false, krate }));
     Ok(shim)
@@ -89,6 +101,24 @@ fn two_allocators(db: &Db, a: Crate, b: Crate) -> String {
     let [first, second] = names;
     // alloc: the error's message
     format!("two `#[global_allocator]`s in one program, in crates `{first}` and `{second}`")
+}
+
+/// The function of `krate` its `#[alloc_error_handler]`'s expansion exports as `__rg_oom`
+/// (`hir_expand::builtin::ALLOC_ERROR_HANDLER_EXPORT`), when it declares one.
+#[blaze_query::tracked(returns(copy))]
+fn alloc_error_handler_export(db: &Db, krate: Crate) -> Option<hir_def::FunctionId> {
+    global_allocator_export(db, krate, hir_expand::builtin::ALLOC_ERROR_HANDLER_EXPORT)
+}
+
+/// The error of a program with two `#[alloc_error_handler]`s, `a`'s and `b`'s (rustc: "the
+/// `#[alloc_error_handler]` in {} conflicts with allocation error handler in: {}"), naming
+/// their crates in order of name.
+fn two_alloc_error_handlers(db: &Db, a: Crate, b: Crate) -> String {
+    let mut names = [crate::fncache::crate_name(db, a), crate::fncache::crate_name(db, b)];
+    names.sort_unstable();
+    let [first, second] = names;
+    // alloc: the error's message
+    format!("two `#[alloc_error_handler]`s in one program, in crates `{first}` and `{second}`")
 }
 
 /// Whether the program of `krate` observes none of its allocations: its global allocator is
@@ -205,7 +235,7 @@ pub(super) fn built(
     unit: Option<super::build::Build>,
 ) -> crate::Result<Produced> {
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: forward.krate };
-    compile_as(db, env, None, false, checked, true, unit, |fx| {
+    compile_as(db, env, None, false, checked, true, unit, &mut None, |fx| {
         let mut sig = Signature::new(fx.cg.isa.default_call_conv());
         let pointer = fx.cg.target.pointer();
         sig.params.extend((0..forward.params).map(|_| AbiParam::new(pointer)));

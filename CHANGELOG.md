@@ -11,6 +11,7 @@ since the release before and the title of each change merged since.
 
 ### Added
 
+- Pinning: a build of blaze's tree (`0.0.0-dev`) runs itself in any checkout of blaze's tree (told by `crates/blaze-engine/Cargo.toml`, not by the path it was built at), whatever it pins, so the tree builds itself; anywhere else that pins it hands off to the pinned release as a release does, saying so in one line. `blaze --ignore-pin <command>` (only as the first word) runs the blaze given in place of the pinned one. `blaze --version` answers in any workspace. A pinned release's fetch checks every list of sums the release publishes, so releases from before `B3SUMS` are fetched again, checked by their `SHA256SUMS`; one dated 2026-10-31 or later without `B3SUMS` is refused. Releases are fetched over HTTPS only (`BLAZE_RELEASES` as `http://` and redirects to plain HTTP are refused), and an asset over 1 GiB stops being read (docs/cargo.md, "Pinning a release of blaze").
 - promote.yaml: OpenAI's Codex CLI (rust-v0.165.0, its codex-rs workspace) in the gate to stable; smoke.py and bench.py take a project's `dir`, the workspace's place in its checkout.
 - `blaze build` writes a library's `staticlib` (dynamo's C API, #964): built as its `cdylib`
   would be, checked by linking that beside it, and archived with the standard library's object

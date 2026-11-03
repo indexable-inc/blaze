@@ -110,7 +110,7 @@ impl MemoHot {
     }
 }
 
-/// What only writers and collection read of a memo. 48 bytes.
+/// What only writers and collection read of a memo. 48 bytes (44 on a 32-bit target).
 struct MemoCold {
     key: QueryKey,
     /// The segment `MemoHot::edges` is in, with one hold on it; null for the image's.
@@ -121,7 +121,8 @@ struct MemoCold {
 }
 
 #[cfg(not(blaze_check))]
-const _: () = assert!(size_of::<MemoCold>() == 48);
+// The key and `born` (38 bytes) and a pointer, padded to the pointer: 48 on a 64-bit target.
+const _: () = assert!(size_of::<MemoCold>() == 40 + size_of::<usize>());
 
 // SAFETY: `edges` is only let go of, once, when the row is dropped.
 unsafe impl Send for MemoCold {}
@@ -136,7 +137,7 @@ impl Drop for MemoCold {
     }
 }
 
-/// Where a value's bytes are. 64 bytes.
+/// Where a value's bytes are. 64 bytes (52 on a 32-bit target).
 struct ValueRow {
     bytes: NonNull<u8>,
     len: usize,
@@ -155,7 +156,9 @@ struct ValueRow {
 }
 
 #[cfg(not(blaze_check))]
-const _: () = assert!(size_of::<ValueRow>() == 64);
+// The ID, `names` and the flags (38 bytes) and three pointer-sized fields, padded to the
+// pointer: 64 on a 64-bit target.
+const _: () = assert!(size_of::<ValueRow>() == 40 + 3 * size_of::<usize>());
 
 /// [`ValueRow::names`] of a shared row being retired: no memo may name it again.
 const DEAD: u32 = u32::MAX;
@@ -990,7 +993,9 @@ pub(crate) struct Slot {
     inline: [MemoId; INLINE],
 }
 
-const _: () = assert!(size_of::<Slot>() == 64);
+// `len` and the inline IDs (16 bytes) and two spans of three pointer-sized fields: 64 on a
+// 64-bit target.
+const _: () = assert!(size_of::<Slot>() == 16 + 6 * size_of::<usize>());
 
 impl Slot {
     pub(crate) fn empty() -> Slot {

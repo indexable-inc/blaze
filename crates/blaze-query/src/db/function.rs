@@ -89,6 +89,13 @@ pub trait Function: 'static {
     ) -> Self::Value;
     fn equal(old: &Self::Value, new: &Self::Value) -> bool;
     fn hash(value: &Self::Value) -> u64;
+    /// Writes `key` as an error about its row names it (rule 16): its value as its `Debug`
+    /// shows it, read through the attached database ([`super::attach`]), or its ID where its
+    /// type has none. Generated queries write their key's `Debug` (each argument's, for a key of
+    /// several); this default writes the ID.
+    fn write_key(key: Self::Key, out: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        write!(out, "{:?}", key.as_id())
+    }
 }
 
 /// A function's table: its rows, how many hold a value, and its `lru` cap (0: none) and
@@ -154,8 +161,8 @@ pub fn fetch<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
     let clock = storage.clock();
     let dir = storage.dir(F::ingredient().index());
     if !dir.is_null() {
-        // SAFETY: a published directory is committed whole for `MAX_PAGES` entries
-        // (`Pages::new`), and `id.page() < MAX_PAGES` (`Id`'s invariant); it lives as long
+        // SAFETY: a published directory is readable whole for `MAX_PAGES` entries
+        // (`Pages::dir`), and `id.page() < MAX_PAGES` (masked, `Id::page`); it lives as long
         // as the storage.
         let page = unsafe { &*dir.add(id.page()) }.load(Ordering::Acquire);
         if let Some(page) = NonNull::new(page) {
@@ -294,6 +301,9 @@ fn refresh<F: Function>(
             && (word & VALUE != 0 || !value)
         {
             return State::Current;
+        }
+        if let Some(steps) = local::with(local::Local::burn) {
+            super::out_of_fuel::<F>(db, steps, index, key);
         }
         let node = header.node.load(Ordering::Relaxed);
         if let Some(at) = local::with(|local| local.find(storage, node)) {
@@ -450,7 +460,7 @@ fn claimed<F: Function>(
         return None;
     }
     if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK)
-        || storage.inputs_unchanged(node, word & VIEW_MASK)
+        || storage.inputs_unchanged(storage.node(node), word & VIEW_MASK)
     {
         if mark(storage, header, word, node, index, id) && value && word & VALUE == 0 {
             storage.record_run(node, Cause::Evicted);
@@ -574,11 +584,12 @@ fn verify_claimed(
     let mut summary = [0; 2];
     for at in start..start + len {
         let node = storage.edge(at);
-        let mut seen = storage.color_of(node);
+        let row = storage.node(node);
+        let mut seen = row.color();
         let view = storage.view_bits();
         let painted = (seen >> 32) as u32;
         if painted < FIELD && painted != view {
-            let (index, id, _) = key_parts(storage.key_of(node));
+            let (index, id, _) = key_parts(row.key());
             let Some(verify) = ingredient::vtable(index).and_then(|it| it.verify) else {
                 return Some(node);
             };
@@ -587,12 +598,12 @@ fn verify_claimed(
             match unsafe { verify(db, storage, id) } {
                 Verified::Changed => return Some(node),
                 Verified::Assumed => {
-                    summary = or(summary, storage.summary_of(node));
+                    summary = or(summary, row.summary());
                     continue;
                 }
                 Verified::Current => {}
             }
-            seen = storage.color_of(node);
+            seen = row.color();
             if (seen >> 32) as u32 != view {
                 return Some(node);
             }
@@ -600,7 +611,7 @@ fn verify_claimed(
         if seen as u32 > verified {
             return Some(node);
         }
-        summary = or(summary, storage.summary_of(node));
+        summary = or(summary, row.summary());
     }
     storage.grow_summary(row_node, summary);
     None
@@ -720,7 +731,9 @@ fn member_header(storage: &Storage, member: Member) -> Option<&Header> {
     if dir.is_null() {
         return None;
     }
-    // SAFETY: as in `fetch`: a published directory, committed whole.
+    // SAFETY: a published directory is readable whole for `MAX_PAGES` entries
+    // (`Pages::dir`), and `id.page() < MAX_PAGES` (masked, `Id::page`); it lives as long as
+    // the storage.
     let page = NonNull::new(unsafe { &*dir.add(id.page()) }.load(Ordering::Acquire))?;
     // SAFETY: the page is the member function's, made with rows of `size` bytes.
     Some(unsafe { row::header_at(page, id.slot(), size) })

@@ -87,8 +87,6 @@ pub enum Goal {
     Build,
     Test,
     Run,
-    /// Builds nothing: [`Front::reach`].
-    Reach,
 }
 
 /// The tests a job runs, and how, as `blaze test` asked.
@@ -725,14 +723,19 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// On the loop, once every unit is built: `bin` (cargo's choice when none) run with
     /// `args`, reported as [`Response::Ran`].
     fn run(&self, built: &[Artifact], bin: Option<&str>, args: &[String], tags: u64) -> Result<S::Runs, ApiError>;
-    /// On a worker: what the change from `from`'s view to this one reaches, building nothing.
+    /// On a worker: what the change from `from`'s view to this one reaches, building nothing
+    /// more: both views' proc macros and build scripts' runs were built and applied before it
+    /// is posted (`Jobs::next`).
     fn reach(&self, reader: S::Reader, from: &Self, from_reader: S::Reader, changes: &[Change]) -> Result<Reach, Failed>;
     /// On a worker: `edits` made in the view's files (`blaze_intent::apply`), building
-    /// nothing: what they change, for the session to commit ([`Response::Edited`]).
+    /// nothing more: the view's proc macros and build scripts' runs were built and applied
+    /// before it is posted (`Jobs::next`). What they change, for the session to commit
+    /// ([`Response::Edited`]).
     fn edit(&self, reader: S::Reader, edits: &[Edit]) -> Result<Edited, Failed>;
     /// On a worker, for `Work::Ahead`: the units (by their place in the plan's graph) of the
     /// test binaries holding a test `filter` selects, as libtest selects, to build ahead of a
-    /// run that has not been asked for.
+    /// run that has not been asked for; the view's proc macros and build scripts' runs were
+    /// built and applied before it is posted (`Jobs::next`).
     fn ahead(&self, reader: S::Reader, filter: &[String]) -> Result<Vec<u32>, Failed>;
     /// On a worker: each codegen unit's inputs and output of the view's last build, as
     /// [`Response::CodegenInputs`] lists them.

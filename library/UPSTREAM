@@ -35,3 +35,16 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   the attribute path `blaze::contract_test` names in every crate. Unstable under
 #   `blaze_verify`; nothing else in library/ refers to it
 #   (docs/v2/plan/lanes/contracts.md, part 2).
+# - wasm64-blaze-wasip1 (64-bit WASI preview 1): vendor/wasip1-1.0.0/src/lib_generated.rs takes
+#   every pointer and witx `size` argument of the raw imports as `usize` and imports them from
+#   `wasi_snapshot_preview1` on 32-bit and `wasi_snapshot_preview1_64` on 64-bit (wasm32 is
+#   unchanged); vendor/libc-0.2.191/src/wasi/mod.rs gives 64-bit WASI musl's 64-bit
+#   `tm.__tm_gmtoff` (c_long), pthread type sizes and UTIME_NOW/UTIME_OMIT. Both vendored crates'
+#   .cargo-checksum.json are updated.
+# - wasi_rt/ (new): that target's C runtime in Rust, in place of wasi-libc (which has no
+#   memory64 build): entry point, malloc, errno, environment, preopens and cwd, files,
+#   directories, descriptors, clocks, single-threaded pthread, mem functions. std depends on it
+#   only under cfg(all(target_os = "wasi", target_env = "p1", target_pointer_width = "64"))
+#   (std/Cargo.toml) and names it with `extern crate wasi_rt;` under the same cfg
+#   (std/src/lib.rs); Cargo.lock has its package and std's dependency on it. Every other
+#   target's std is unchanged.

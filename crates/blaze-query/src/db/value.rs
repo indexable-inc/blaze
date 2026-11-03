@@ -1,11 +1,12 @@
 //! What generated code relies on besides the engine: the [`Value`] proof that a type may stay
 //! in a row across views, the borrowed lookups of interned constructors ([`Lookup`],
 //! [`HashEqLike`]), `ids_of`'s field dispatch, the return modes, and the stable
-//! value hash.
+//! value hash, and the key text of `write_key`.
 
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fmt,
     hash::Hash,
     marker::PhantomData,
     ops::Deref,
@@ -377,6 +378,42 @@ pub trait IdOfOther {
 impl<T: ?Sized> IdOfOther for IdsOf<'_, T> {
     #[inline]
     fn push_ids(&self, _: &mut Vec<Id>) {}
+}
+
+/// One argument of a query's key for its `write_key`: generated code calls
+/// `(&&&KeyText(&argument)).write_key(out)` with [`KeyTextDebug`], [`KeyTextId`] and
+/// [`KeyTextOther`] in scope, so method lookup picks the first that applies: the argument's
+/// `Debug` (an interned key's fields, through the attached database), its ID, or `_`.
+pub struct KeyText<'a, T: ?Sized>(pub &'a T);
+
+pub trait KeyTextDebug {
+    fn write_key(&self, out: &mut dyn fmt::Write) -> fmt::Result;
+}
+
+impl<T: fmt::Debug + ?Sized> KeyTextDebug for &&KeyText<'_, T> {
+    fn write_key(&self, out: &mut dyn fmt::Write) -> fmt::Result {
+        write!(out, "{:?}", self.0)
+    }
+}
+
+pub trait KeyTextId {
+    fn write_key(&self, out: &mut dyn fmt::Write) -> fmt::Result;
+}
+
+impl<T: AsId> KeyTextId for &KeyText<'_, T> {
+    fn write_key(&self, out: &mut dyn fmt::Write) -> fmt::Result {
+        write!(out, "{:?}", self.0.as_id())
+    }
+}
+
+pub trait KeyTextOther {
+    fn write_key(&self, out: &mut dyn fmt::Write) -> fmt::Result;
+}
+
+impl<T: ?Sized> KeyTextOther for KeyText<'_, T> {
+    fn write_key(&self, out: &mut dyn fmt::Write) -> fmt::Result {
+        out.write_str("_")
+    }
 }
 
 /// `returns(as_ref)`: `&Option<T>` as `Option<&T>`, `&Result<T, E>` as `Result<&T, &E>`.

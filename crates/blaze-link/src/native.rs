@@ -1331,12 +1331,10 @@ impl Refs {
     }
 }
 
-/// Whether a piece's references are Rust's, not the natives' or the linker's.
+/// Whether a piece's references are Rust's, not the natives' or the linker's
+/// ([`What::is_linkers_cell`]).
 fn counted(what: What) -> bool {
-    !matches!(
-        what,
-        What::Native { .. } | What::NativeFrame { .. } | What::Got { .. } | What::Plt { .. } | What::Common
-    )
+    !what.is_linkers_cell() && !matches!(what, What::Native { .. } | What::NativeFrame { .. } | What::Common)
 }
 
 /// What collection kept, over a [`Graph`]'s flat numbering.
@@ -2454,7 +2452,7 @@ impl<'a> Stage<'a> {
             SectionKind::Unwind(class) => (class, 0, true),
             SectionKind::Dropped | SectionKind::EhFrame => return Ok(()),
         };
-        let zeroed = crate::state::zeroed(class);
+        let zeroed = crate::model::zeroed(class);
         if zeroed && !matches!(s.data, Data::Zero(_)) {
             let name = &self.new.inputs[it.input as usize].name;
             // alloc: error path
@@ -3366,8 +3364,11 @@ impl<'a> Stage<'a> {
             import.library = (library != NONE).then(|| index[library as usize]).filter(|it| *it != NONE);
             current.insert(sym, import);
         }
-        // An import an incremental link no longer needs keeps its place (nothing binds to it),
-        // its library looked up again by name.
+        // An import an incremental link no longer needs keeps its index (nothing binds to it),
+        // its library looked up again by name, so no other import's index moves. Its GOT cell
+        // and stub go with it (`Stage::cells_of_removed`); on PE, where the GOT is the import
+        // address table, the cells after it move, and their readers are written again
+        // (`Stage::relay`).
         let mut order: Vec<(Sym, Import, bool)> = Vec::with_capacity(current.len() + old.imports.len());
         if !self.full {
             for (sym, import) in old.import_syms.iter().zip(old.imports.iter()) {

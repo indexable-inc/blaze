@@ -97,6 +97,26 @@ fn region_decommit_after_gives_pages_back_and_commits_again() {
 }
 
 #[test]
+fn a_sparse_region_reads_zero_everywhere_and_counts_only_what_its_owner_commits() {
+    let mut region = Region::reserve_sparse(8 << 20, Tag::Other).expect("reserve");
+    let at_start = if cfg!(windows) { region.reserved() } else { 0 };
+    assert_eq!(region.committed(), at_start, "a sparse region counts nothing before it is used");
+    let last = region.at(region.reserved() - 1).as_ptr();
+    // SAFETY: every byte of a sparse region is readable from the start.
+    assert_eq!(unsafe { last.read() }, 0, "a sparse region reads zero past what is committed");
+    region.ensure(100).expect("commit");
+    assert!(region.committed() >= 100);
+    if !cfg!(windows) {
+        assert!(region.committed() < 1 << 20, "a commit of 100 bytes counted {}", region.committed());
+    }
+    // SAFETY: committed just now; this test owns the region.
+    unsafe { region.at(0).as_ptr().write(9) };
+    // SAFETY: as above.
+    assert_eq!(unsafe { region.at(0).as_ptr().read() }, 9);
+    assert!(region.decommit_after(0).is_err(), "a sparse region refuses a decommit");
+}
+
+#[test]
 fn regions_grow_from_many_threads_at_once() {
     let region = Arc::new(Region::reserve(256 << 20, Tag::Other).expect("reserve"));
     let threads: Vec<_> = (0..8)

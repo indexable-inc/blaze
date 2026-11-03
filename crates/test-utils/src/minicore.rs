@@ -45,6 +45,7 @@
 //!     from: sized, result
 //!     future: pin
 //!     coroutine: pin
+//!     global_allocator: allocator_api, derive
 //!     dispatch_from_dyn: unsize, pin
 //!     hash: sized
 //!     include:
@@ -1520,6 +1521,11 @@ pub mod fmt {
         pub fn debug_struct(&mut self, _name: &str) -> DebugStruct {
             DebugStruct
         }
+
+        // What `#[derive(Debug)]` calls for a unit struct or variant.
+        pub fn write_str(&mut self, _data: &str) -> Result {
+            Ok(())
+        }
     }
 
     impl DebugTuple {
@@ -2557,6 +2563,13 @@ mod macros {
         pub macro derive_const($item:item) {
             /* compiler built-in */
         }
+
+        // region:global_allocator
+        #[rustc_builtin_macro]
+        pub macro global_allocator($item:item) {
+            /* compiler built-in */
+        }
+        // endregion:global_allocator
     }
     // endregion:derive
 
@@ -2884,6 +2897,14 @@ pub mod alloc {
     pub unsafe trait GlobalAlloc {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8;
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout);
+        // region:global_allocator
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            unsafe { self.alloc(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ptr
+        }
+        // endregion:global_allocator
     }
 }
 // endregion:allocator_api
@@ -2903,6 +2924,7 @@ pub mod prelude {
             hash::derive::Hash,                           // :hash, derive
             iter::{FromIterator, IntoIterator, Iterator}, // :iterator
             macros::builtin::{derive, derive_const},      // :derive
+            macros::builtin::global_allocator,            // :global_allocator
             macros::deref,                                // :deref_pat
             marker::Copy,                                 // :copy
             marker::Send,                                 // :send

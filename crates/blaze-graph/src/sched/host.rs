@@ -25,26 +25,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use corosensei::{
-    Coroutine, CoroutineResult, Yielder,
-    stack::{DefaultStack, Stack},
-};
-
 use super::{
     CounterId, Cycle, JobId, Suspend, Wait,
     fiber::{
-        Answer, Given, Global, HERE, Here, IdleReason, MAX_CARRIED, OwnIo, Panic, Stackful, SwitchEvent, Taken, UNREGISTERED,
+        Answer, Given, Global, HERE, Here, IdleReason, OwnIo, Panic, SwitchEvent, Taken, UNREGISTERED,
         carry_stack_limit, check_no_wait, clear, come_on, dispatch_global, global, go_off, go_off_ended, idled,
         observing, switched, switched_known, switched_unregistered,
     },
+    stack::{FIBER_STACK, Resumed, Stack, Stackful, Yielder},
 };
 use crate::{
     Key,
     pool::{DriverSpan, Driving, Header, Job},
 };
 
-/// A pool fiber's stack above its guard page; `stdx::ensure_sufficient_stack` grows past it.
-pub const FIBER_STACK: usize = 16 << 20;
 /// The idle fibers a worker keeps for its next jobs; one that ends past it is freed.
 const IDLE: usize = 32;
 /// The parked records a worker keeps for the next job to park.
@@ -130,16 +124,64 @@ static STALLED: crate::sync::atomic::AtomicUsize = crate::sync::atomic::AtomicUs
 /// A pool's last awake worker found it idle a while with jobs parked: if every pool is idle
 /// and no wait in the graph can end ([`World::stall`]), every waiting job wakes to fail with
 /// the [`super::Stalled`] naming each wait, rather than all of them waiting forever.
+///
+/// The threads on no fiber (the clients) may end what they claimed at any time, so a wait on
+/// one of those is no stall here; [`stall_while_quiet`] is the check for once they are still.
 pub(crate) fn check_stall() {
     let mut g = global();
-    if !g.own.iter().flatten().all(|io| io.idle.is_none_or(|idle| idle(io.ctx))) {
+    if !pools_idle(&g) {
         return;
     }
-    let woke = g.world.stall();
+    let clients = g.clients;
+    let woke = g.world.stall(clients, false);
+    woke_stalled(&mut g, woke);
+}
+
+/// Whether every pool's workers sleep with nothing queued, under the scheduler's lock.
+fn pools_idle(g: &Global) -> bool {
+    g.own.iter().flatten().all(|io| io.idle.is_none_or(|idle| idle(io.ctx)))
+}
+
+fn woke_stalled(g: &mut Global, woke: usize) {
     if woke != 0 {
         STALLED.fetch_add(woke, crate::sync::atomic::Ordering::Release);
-        dispatch_global(&mut g, None);
+        dispatch_global(g, None);
     }
+}
+
+/// Whether, once the threads outside the graph are still (the caller says so: the daemon's
+/// loop once nothing can move its build, no IO task running and no effect in flight), no wait
+/// of the graph can end: every pool idle, no driver running, and every waiting job waits on
+/// another job, a counter, or a key a job claimed, a client's included ([`Graph::stuck`]
+/// with `quiet`). A wait on an [`Event`] is never stuck. Reads only.
+pub fn stuck_while_quiet() -> bool {
+    let mut g = global();
+    let clients = g.clients;
+    pools_idle(&g) && g.world.stuck(clients, true)
+}
+
+/// As [`stuck_while_quiet`], and if so every waiting job wakes to fail with the stall naming
+/// each wait ([`super::Stalled`]): the waits it found, or `None` when nothing was stuck.
+pub fn stall_while_quiet() -> Option<super::Waits> {
+    let mut g = global();
+    if !pools_idle(&g) {
+        return None;
+    }
+    let clients = g.clients;
+    let woke = g.world.stall(clients, true);
+    if woke == 0 {
+        return None;
+    }
+    // alloc: a stall's report, once
+    let waits = super::Waits(g.world.stuck_waits().to_vec());
+    woke_stalled(&mut g, woke);
+    Some(waits)
+}
+
+/// Every job that waits in the graph now and what on, stuck or not: what a report of a build
+/// that stopped names, as a parked job's spans are on no thread (rule 13).
+pub fn waits_now() -> super::Waits {
+    global().world.waits()
 }
 
 /// A wait of `job` ended: if a stall ended it, the job fails with the stall, here.
@@ -151,7 +193,7 @@ fn fail_if_stalled(job: JobId) {
     let stalled = global().world.take_stall(job);
     if let Some((stalled, scope)) = stalled {
         STALLED.fetch_sub(1, crate::sync::atomic::Ordering::AcqRel);
-        SCOPE.set(scope.map_or(super::NONE, |it| it.0));
+        with_scope(|it| it.set(scope.map_or(super::NONE, |it| it.0)));
         panic!("{stalled}");
     }
 }
@@ -249,15 +291,26 @@ pub(crate) struct Host<'a> {
     spare: Vec<Box<Parked>>,
     /// The pool's jobs parked now, which it waits for before it stops.
     parked: &'a crate::sync::atomic::AtomicUsize,
+    /// The jobs that ended on this worker: written by it alone ([`crate::pool::Pool::ended`]).
+    ended: &'a crate::sync::atomic::AtomicU64,
+    /// Whether this worker runs a job's code now ([`crate::pool::Pool::working`]).
+    inside: &'a crate::sync::atomic::AtomicBool,
 }
 
 impl<'a> Host<'a> {
     /// The host of worker `core` of the pool of `member`; `parked` counts the pool's parked
-    /// jobs, and lives as long as the pool's workers do.
-    pub(crate) fn new(member: u32, core: u32, parked: &'a crate::sync::atomic::AtomicUsize) -> Host<'a> {
+    /// jobs, `ended` the jobs that ended on this worker and `inside` says whether it runs one
+    /// now; all live as long as the pool's workers do.
+    pub(crate) fn new(
+        member: u32,
+        core: u32,
+        parked: &'a crate::sync::atomic::AtomicUsize,
+        ended: &'a crate::sync::atomic::AtomicU64,
+        inside: &'a crate::sync::atomic::AtomicBool,
+    ) -> Host<'a> {
         CORE.set(core);
         // alloc: the worker's own, once
-        Host { member, idle: Vec::with_capacity(IDLE), spare: Vec::with_capacity(SPARE), parked }
+        Host { member, idle: Vec::with_capacity(IDLE), spare: Vec::with_capacity(SPARE), parked, ended, inside }
     }
 
     /// Runs `job` (one the pool was given, or a parked one given back) on a fiber until it ends
@@ -268,7 +321,7 @@ impl<'a> Host<'a> {
     /// Where no fiber's stack can be mapped, naming its size.
     #[allow(unsafe_code)]
     pub(crate) fn run(&mut self, job: Job) -> Option<Panic> {
-        let mut worker = [None; MAX_CARRIED];
+        let mut worker = Taken::EMPTY;
         let header = job.header();
         // SAFETY: a job's header lives until it has run, and running moves the `Job`.
         if unsafe { header.as_ref() }.runs(parked) {
@@ -278,14 +331,14 @@ impl<'a> Host<'a> {
             let mut record = unsafe { Box::from_raw(header.cast::<Parked>().as_ptr()) };
             self.parked.fetch_sub(1, crate::sync::atomic::Ordering::AcqRel);
             let fiber = record.fiber.take().expect("a parked record holds its fiber");
-            let answer = come_on(&mut worker, Some(&record.taken), record.failed.take());
+            let answer = come_on(&mut worker, Some(&mut record.taken), record.failed.take());
             if observing() {
                 switched(&global().world, SwitchEvent::Resumed, record.job, fiber.1, core());
             }
             if self.spare.len() < SPARE {
                 self.spare.push(record);
             }
-            return self.drive(fiber, In::Go(answer), &worker, None);
+            return self.drive(fiber, In::Go(answer), &mut worker, None);
         }
         let fiber = match self.idle.pop() {
             Some(fiber) => fiber,
@@ -298,20 +351,26 @@ impl<'a> Host<'a> {
             Answer::Raise(panic) => Some(panic),
             _ => None,
         };
-        self.drive(fiber, In::Start(job), &worker, stray)
+        self.drive(fiber, In::Start(job), &mut worker, stray)
     }
 
     /// Runs `fiber` from `input` until its job parks or ends, then gives the thread `worker`'s
     /// carried thread-locals back; `stray`, a panic of the worker's own as the job came on.
-    fn drive(&mut self, mut fiber: Fiber, mut input: In, worker: &Taken, stray: Option<Panic>) -> Option<Panic> {
+    fn drive(&mut self, mut fiber: Fiber, mut input: In, worker: &mut Taken, stray: Option<Panic>) -> Option<Panic> {
         loop {
-            let out = match fiber.0.resume(input) {
-                CoroutineResult::Yield(out) => out,
-                CoroutineResult::Return(()) => unreachable!("a fiber ends only when told to exit"),
+            self.inside.store(true, crate::sync::atomic::Ordering::Relaxed);
+            let resumed = fiber.0.resume(input);
+            self.inside.store(false, crate::sync::atomic::Ordering::Relaxed);
+            let out = match resumed {
+                Resumed::Yield(out) => out,
+                Resumed::Return => unreachable!("a fiber ends only when told to exit"),
             };
             clear();
             match out {
                 Out::Done(panicked) => {
+                    // This worker alone writes it: a load and a store, no read-modify-write.
+                    let ended = self.ended.load(crate::sync::atomic::Ordering::Relaxed);
+                    self.ended.store(ended + 1, crate::sync::atomic::Ordering::Relaxed);
                     let left = go_off_ended(worker);
                     let _switch = DriverSpan::open(Driving::Switch);
                     if self.idle.len() < IDLE {
@@ -343,7 +402,7 @@ impl<'a> Host<'a> {
                                 Box::new(Parked {
                                     header: Header::new(parked),
                                     fiber: None,
-                                    taken: [None; MAX_CARRIED],
+                                    taken: Taken::EMPTY,
                                     failed: None,
                                     job,
                                     generation: 0,
@@ -379,17 +438,16 @@ impl Drop for Host<'_> {
 /// Ends an idle fiber: its body returns, and its stack is unmapped.
 fn exit(mut fiber: Fiber) {
     match fiber.0.resume(In::Exit) {
-        CoroutineResult::Return(()) => {}
-        CoroutineResult::Yield(_) => unreachable!("an idle fiber told to exit returns"),
+        Resumed::Return => {}
+        Resumed::Yield(_) => unreachable!("an idle fiber told to exit returns"),
     }
 }
 
 fn new_fiber(member: u32) -> Fiber {
-    let stack = DefaultStack::new(FIBER_STACK).unwrap_or_else(|why| panic!("a pool fiber's stack of {FIBER_STACK} bytes: {why}"));
-    // The stack has at least `FIBER_STACK` bytes above its guard page, which `Stack::limit` counts in.
-    let limit = stack.base().get() - FIBER_STACK;
+    let stack = Stack::new(FIBER_STACK).unwrap_or_else(|why| panic!("a pool fiber's stack of {FIBER_STACK} bytes: {why}"));
+    let limit = stack.limit();
     let number = super::fiber::next_fiber();
-    Fiber(Stackful::new(Coroutine::with_stack(stack, move |yielder, first| body(member, number, limit, yielder, first))), number)
+    Fiber(Stackful::new(stack, number, move |yielder, first| body(member, number, limit, yielder, first)), number)
 }
 
 /// A fiber's life: run each job it is started with, end it in the graph if it joined, report
@@ -752,7 +810,7 @@ pub fn key_done(key: Key) {
 pub fn open_scope() -> CounterId {
     let job = job_here();
     let counter = global().world.open_scope(job);
-    SCOPE.set(counter.0);
+    with_scope(|it| it.set(counter.0));
     counter
 }
 
@@ -767,7 +825,7 @@ pub fn release(counter: CounterId) {
 pub fn close_scope(counter: CounterId) {
     let job = job_here();
     let outer = global().world.close_scope(job, counter);
-    SCOPE.set(outer.map_or(super::NONE, |it| it.0));
+    with_scope(|it| it.set(outer.map_or(super::NONE, |it| it.0)));
 }
 
 thread_local! {
@@ -776,18 +834,29 @@ thread_local! {
     static SCOPE: Cell<u32> = const { Cell::new(super::NONE) };
 }
 
+/// [`SCOPE`]'s one reader and writer. Not inlined: a job opens a scope, waits on it and closes
+/// it, maybe on another thread, so the thread-local's address is looked up anew at each call,
+/// never kept by an inlined caller across a wait (rule 24).
+#[inline(never)]
+fn with_scope<R>(f: impl FnOnce(&Cell<u32>) -> R) -> R {
+    SCOPE.with(f)
+}
+
 /// The innermost scope this thread's job has open ([`open_scope`]).
 pub fn innermost_scope() -> Option<CounterId> {
-    let scope = SCOPE.get();
+    let scope = with_scope(Cell::get);
     (scope != super::NONE).then_some(CounterId(scope))
 }
 
-pub(super) fn take_scope() -> usize {
-    SCOPE.replace(super::NONE) as usize
+/// The scope's counter id plus one, so a counter of id 0 is a value: `None` for no scope.
+pub(super) fn take_scope() -> Option<std::num::NonZeroUsize> {
+    let scope = with_scope(|it| it.replace(super::NONE));
+    (scope != super::NONE).then(|| std::num::NonZeroUsize::MIN.saturating_add(scope as usize))
 }
 
-pub(super) fn put_scope(taken: usize) {
-    SCOPE.set(u32::try_from(taken).expect("a scope taken is a counter's id"));
+pub(super) fn put_scope(taken: std::num::NonZeroUsize) {
+    let taken = u32::try_from(taken.get() - 1).expect("a scope taken is a counter's id");
+    with_scope(|it| it.set(taken));
 }
 
 /// This thread's job is a job of the scope of `counter`: counted towards it when it joins the

@@ -193,7 +193,7 @@ impl Store {
                     return None;
                 }
             };
-            let Some(answer_key) = self.answer_key_now(db, &shape_key, shape) else { continue };
+            let Some(answer_key) = self.answer_key_now(db, def, &shape_key, shape) else { continue };
             match self.images.get(&record::answer_at(step, &answer_key)) {
                 Ok(Some(found)) => return Some((found, answer_key)),
                 Ok(None) => {}
@@ -208,10 +208,16 @@ impl Store {
 
     /// The key the answer of the shape at `shape_key` has under its facts' values now; `None`
     /// when one of them cannot be hashed now.
-    fn answer_key_now(&self, db: &Db, shape_key: &ContentId, shape: ShapeRef<'_>) -> Option<ContentId> {
+    fn answer_key_now(
+        &self,
+        db: &Db,
+        def: DefWithBodyId,
+        shape_key: &ContentId,
+        shape: ShapeRef<'_>,
+    ) -> Option<ContentId> {
         let mut key = AnswerKey::new(shape_key);
         for fact in shape.facts() {
-            key.value(&self.facts.value(db, fact)?);
+            key.value(&self.facts.value(db, def, fact)?);
         }
         Some(key.finish())
     }
@@ -275,7 +281,7 @@ impl Store {
         scratch.facts.sort_unstable();
         scratch.facts.dedup();
         for &fact in &scratch.facts {
-            scratch.values.push(self.facts.value(db, fact).ok_or(Refusal::Unhashable)?);
+            scratch.values.push(self.facts.value(db, def, fact).ok_or(Refusal::Unhashable)?);
         }
         if let Err(why) = write(&*self.facts, &mut scratch.answer) {
             tracing::debug!(?def, step = what(step), %why, "a step's result with no stored form");
